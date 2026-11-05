@@ -48,6 +48,7 @@ from .config import ModelConfig
 from arctic_platform.model.implementations.moe.distributed.ep_backend import get_ep_comm_module, uses_dispatch_ep
 from arctic_platform.model.implementations.moe.conversion_cache import (
     WEIGHT_CONVERSION_CACHE_SCOPE_ENV,
+    begin_conversion_preparation,
     conversion_cache_attempt_id,
     conversion_cache_is_node_local,
     conversion_cache_ready,
@@ -509,7 +510,7 @@ def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
             buffer.data = buffer.data.to("cuda")
 
 
-@record_conversion_preparation_failure
+@record_conversion_preparation_failure(heartbeat=False)
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)
@@ -566,6 +567,8 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             node_local_cache = conversion_cache_is_node_local(snapshot_path)
             world = get_world()
             attempt_id, fresh_attempt = conversion_cache_attempt_id(shared=not node_local_cache)
+            if not conversion_cache_ready(snapshot_path):
+                begin_conversion_preparation()
             # Models whose snapshot cannot sit in host memory convert shard by shard.
             target_format = "prime" if dst_fmt == "PrimeRL" else "hf"
             stream_convert_fn = get_checkpoint_converter(model, target_format)

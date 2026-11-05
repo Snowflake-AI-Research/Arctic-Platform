@@ -27,7 +27,16 @@ _CACHE_HEARTBEAT_INTERVAL = 1
 _CACHE_HEARTBEAT_JOIN_TIMEOUT = 2
 _ABANDONED_CACHE_AGE = 60
 _ACTIVE_ATTEMPT = ContextVar("weight_conversion_attempt", default=None)
-_WORKSPACE_OBSERVATIONS: dict[Path, tuple[tuple, float]] = {}
+_PREPARATION_START = ContextVar("weight_conversion_preparation_start", default=None)
+_monotonic = time.monotonic
+_sleep = time.sleep
+_replace = os.replace
+_rename = os.rename
+_flock = fcntl.flock
+
+
+def _remove_cache_marker(path: Path) -> None:
+    path.unlink(missing_ok=True)
 
 
 def _preparation_marker_path(attempt_id: str, cache_root=None) -> Path:
@@ -52,15 +61,28 @@ def conversion_preparation_root(config, source_path: Path | None = None, *, mode
     return Path(HF_HUB_CACHE)
 
 
-def record_conversion_preparation_failure(function=None, *, distributed: bool = True):
+def begin_conversion_preparation() -> None:
+    """Start setup liveness only after the caller has selected a needed conversion."""
+    start = _PREPARATION_START.get()
+    if start is not None:
+        start()
+
+
+def record_conversion_preparation_failure(function=None, *, distributed: bool = True, heartbeat: bool = True):
     """Report setup liveness and failures before checkpoint discovery or model construction."""
     if function is None:
-        return lambda wrapped: record_conversion_preparation_failure(wrapped, distributed=distributed)
+        return lambda wrapped: record_conversion_preparation_failure(
+            wrapped, distributed=distributed, heartbeat=heartbeat
+        )
     parameters = signature(function)
 
     @wraps(function)
     def wrapped(*args, **kwargs):
         if _ACTIVE_ATTEMPT.get() is not None:
+            return function(*args, **kwargs)
+        arguments = parameters.bind_partial(*args, **kwargs).arguments
+        config = arguments.get("config", arguments.get("options"))
+        if getattr(getattr(config, "debug", None), "random_init", False):
             return function(*args, **kwargs)
         # All ranks agree before checkpoint inspection, model setup or source download can fail.
         attempt, fresh_attempt = conversion_cache_attempt_id(distributed=distributed)
@@ -69,27 +91,30 @@ def record_conversion_preparation_failure(function=None, *, distributed: bool = 
         stop = threading.Event()
         thread = None
         writer_id = uuid.uuid4().hex
+        start_context = None
         try:
-            arguments = parameters.bind_partial(*args, **kwargs).arguments
             rank = arguments.get("rank")
             if rank is None:
                 import torch.distributed as dist
 
                 rank = dist.get_rank() if dist.is_initialized() else 0
-            config = arguments.get("config", arguments.get("options"))
             if attempt and rank == 0:
                 root = conversion_preparation_root(
                     config, arguments.get("source_path"), model_name=arguments.get("model_name")
                 )
                 marker = _preparation_marker_path(attempt, root)
-            if marker is not None:
+            def start_heartbeat():
+                nonlocal thread
+                if marker is None or thread is not None:
+                    return
                 try:
-                    marker.with_suffix(".failed").unlink(missing_ok=True)
+                    _remove_cache_marker(marker.with_suffix(".failed"))
                 except OSError:
                     logger.info("Could not clear previous weight preparation failure", exc_info=True)
 
-                def heartbeat():
+                def refresh():
                     count = 0
+                    warned = False
                     while not stop.is_set():
                         try:
                             marker.parent.mkdir(parents=True, exist_ok=True)
@@ -98,17 +123,22 @@ def record_conversion_preparation_failure(function=None, *, distributed: bool = 
                                 dict(attempt_id=attempt, writer_id=writer_id, heartbeat=count),
                             )
                         except Exception:
-                            logger.warning("Could not record weight preparation liveness; retrying", exc_info=True)
+                            if not warned:
+                                logger.warning("Could not record weight preparation liveness; retrying", exc_info=True)
+                                warned = True
                         count += 1
                         if stop.wait(_CACHE_HEARTBEAT_INTERVAL):
                             break
 
-                thread = threading.Thread(target=heartbeat, daemon=True)
+                thread = threading.Thread(target=refresh, daemon=True)
                 thread.start()
+            start_context = _PREPARATION_START.set(start_heartbeat)
+            if heartbeat:
+                start_heartbeat()
             result = function(*args, **kwargs)
-            if marker is not None:
+            if marker is not None and thread is not None:
                 try:
-                    marker.with_suffix(".failed").unlink(missing_ok=True)
+                    _remove_cache_marker(marker.with_suffix(".failed"))
                 except OSError:
                     logger.info("Could not clear weight preparation failure after success", exc_info=True)
             return result
@@ -124,11 +154,13 @@ def record_conversion_preparation_failure(function=None, *, distributed: bool = 
             stop.set()
             if thread is not None:
                 thread.join(timeout=_CACHE_HEARTBEAT_JOIN_TIMEOUT)
-            if marker is not None and (thread is None or not thread.is_alive()):
+            if marker is not None and thread is not None and not thread.is_alive():
                 try:
-                    marker.with_suffix(".in-progress").unlink(missing_ok=True)
+                    _remove_cache_marker(marker.with_suffix(".in-progress"))
                 except OSError:
                     logger.info("Could not remove weight preparation progress marker", exc_info=True)
+            if start_context is not None:
+                _PREPARATION_START.reset(start_context)
             _ACTIVE_ATTEMPT.reset(context)
 
     return wrapped
@@ -141,15 +173,16 @@ def _conversion_writer_lock(path: Path, *, node_local: bool):
         yield
         return
     with open(path, "w", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        _flock(lock_file, fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            _flock(lock_file, fcntl.LOCK_UN)
 
 
 def _workspace_owner() -> dict:
-    return dict(host=socket.gethostname(), pid=os.getpid())
+    active = _ACTIVE_ATTEMPT.get()
+    return dict(host=socket.gethostname(), pid=os.getpid(), attempt_id=active[0] if active else None)
 
 
 def _workspace_is_abandoned(artifact: Path, owner: Path, *, node_local: bool) -> bool:
@@ -166,17 +199,9 @@ def _workspace_is_abandoned(artifact: Path, owner: Path, *, node_local: bool) ->
             return False
         else:
             return False
-    try:
-        stat = owner.stat() if owner.exists() else artifact.stat()
-    except FileNotFoundError:
-        return False
-    identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-    now = time.monotonic()
-    previous = _WORKSPACE_OBSERVATIONS.get(artifact)
-    if previous is None or previous[0] != identity:
-        _WORKSPACE_OBSERVATIONS[artifact] = (identity, now)
-        return False
-    return now - previous[1] > _ABANDONED_CACHE_AGE
+    # A remote writer can be alive while filesystem I/O or its heartbeat is stalled.
+    # Only durable failure evidence authorizes cross-host deletion; silence and mtimes do not.
+    return marker.get("state") == "failed"
 
 
 def _cleanup_abandoned_conversion_workspaces(path: Path, *, node_local: bool = False) -> None:
@@ -190,7 +215,6 @@ def _cleanup_abandoned_conversion_workspaces(path: Path, *, node_local: bool = F
             if _workspace_is_abandoned(workspace, owner, node_local=node_local):
                 shutil.rmtree(workspace)
                 owner.unlink(missing_ok=True)
-                _WORKSPACE_OBSERVATIONS.pop(workspace, None)
         except OSError:
             logger.info("Could not clean abandoned conversion workspace %s", workspace, exc_info=True)
     for artifact in (
@@ -198,12 +222,13 @@ def _cleanup_abandoned_conversion_workspaces(path: Path, *, node_local: bool = F
         *path.parent.glob(f"{path.name}.stale-*"),
     ):
         try:
+            if artifact.is_dir() and conversion_cache_ready(artifact):
+                continue
             if _workspace_is_abandoned(artifact, artifact, node_local=node_local):
                 if artifact.is_dir():
                     shutil.rmtree(artifact)
                 elif not artifact.with_suffix("").exists():
                     artifact.unlink(missing_ok=True)
-                _WORKSPACE_OBSERVATIONS.pop(artifact, None)
         except OSError:
             logger.info("Could not clean abandoned conversion artifact %s", artifact, exc_info=True)
 
@@ -288,7 +313,7 @@ def _write_cache_marker(path: Path, marker: dict) -> None:
     temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         temporary.write_text(json.dumps(dict(marker, generation=uuid.uuid4().hex)), encoding="utf-8", errors="replace")
-        os.replace(temporary, path)
+        _replace(temporary, path)
     finally:
         try:
             temporary.unlink(missing_ok=True)
@@ -319,7 +344,7 @@ def conversion_cache_attempt_id(*, shared: bool = False, distributed: bool = Tru
 
 
 def validate_standalone_conversion_attempt(config, source_path: Path | None = None) -> None:
-    """Reject unidentified shared-cache preparation before downloads, model construction or key scans."""
+    """Validate the launcher's identity for a caller that has already selected a needed conversion."""
     import torch.distributed as dist
 
     if (dist.is_initialized() and _ACTIVE_ATTEMPT.get() is None) or os.environ.get(WEIGHT_CONVERSION_ATTEMPT_ID_ENV):
@@ -349,6 +374,8 @@ def wait_for_conversion_cache(
     writer_start_timeout: float | None = None,
     fresh_attempt: bool = False,
     preparation_root: str | Path | None = None,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> None:
     """Observe attempt-scoped progress without shared-lock coherence or synchronized clocks.
 
@@ -357,20 +384,24 @@ def wait_for_conversion_cache(
     after a writer has already exited is bounded by the startup timeout; use fresh IDs for each launcher retry.
     Callers that guarantee a newly generated, never-reused attempt ID may set fresh_attempt to observe terminal
     failures published before the waiter starts.
-    Startup is separately bounded (300 seconds by default, configurable for slow independent launchers).
-    Preparation heartbeats cover checkpoint discovery and model setup before conversion starts.
+    Before conversion selection, only the overall timeout applies: independent model setup has no
+    filesystem liveness signal. A launcher may explicitly configure a shorter writer-start deadline.
+    Preparation heartbeats start after conversion selection, not for native or randomly initialized loads.
     Once observed, unchanged heartbeats bound killed-writer waits.
     """
     attempt_id = attempt_id or os.environ.get(WEIGHT_CONVERSION_ATTEMPT_ID_ENV)
     timeout = float(os.environ.get("DSS_WEIGHT_CONVERSION_TIMEOUT", "3600")) if timeout is None else timeout
     if writer_start_timeout is None:
-        writer_start_timeout = float(os.environ.get("DSS_WEIGHT_CONVERSION_WRITER_START_TIMEOUT", "300"))
+        configured_start = os.environ.get("DSS_WEIGHT_CONVERSION_WRITER_START_TIMEOUT")
+        writer_start_timeout = float(configured_start) if configured_start else None
     if timeout < 0 or poll_interval <= 0 or writer_idle_timeout <= 0:
         raise ValueError("cache timeout must be nonnegative and polling/idle intervals must be positive")
-    if writer_start_timeout <= 0:
+    if writer_start_timeout is not None and writer_start_timeout <= 0:
         raise ValueError("writer startup timeout must be positive")
-    started = time.monotonic()
-    deadline = time.monotonic() + timeout
+    clock = _monotonic if clock is None else clock
+    sleep = _sleep if sleep is None else sleep
+    started = clock()
+    deadline = clock() + timeout
     failure_path = path.with_name(f"{path.name}.failed")
     progress_path = path.with_name(f"{path.name}.in-progress")
     initial_failure = {} if fresh_attempt else _read_cache_marker(failure_path)
@@ -389,7 +420,7 @@ def wait_for_conversion_cache(
     ]
     baseline_context = f"; existing same-attempt failure: {'; '.join(baseline_errors)}" if baseline_errors else ""
     observed: dict[str, dict] = {}
-    last_progress = time.monotonic()
+    last_progress = clock()
     while not conversion_cache_ready(path):
         if preparation_path is not None and preparation_progress is not None:
             setup_failure = _read_cache_marker(preparation_path)
@@ -402,7 +433,7 @@ def wait_for_conversion_cache(
                 and setup_progress != observed.get("preparation")
             ):
                 observed["preparation"] = setup_progress
-                last_progress = time.monotonic()
+                last_progress = clock()
         failure = _read_cache_marker(failure_path)
         if (
             failure != initial_failure
@@ -415,21 +446,21 @@ def wait_for_conversion_cache(
         if token is not None and progress != initial_progress and (attempt_id is None or token == attempt_id):
             if progress != observed.get("conversion"):
                 observed["conversion"] = progress
-                last_progress = time.monotonic()
+                last_progress = clock()
             failure = _read_cache_marker(failure_path)
             if failure != initial_failure and failure.get("attempt_id") == token:
                 raise RuntimeError(f"Converted weight cache writer failed for {path}: {failure.get('error')}")
-        if observed and time.monotonic() - last_progress >= writer_idle_timeout:
+        if observed and clock() - last_progress >= writer_idle_timeout:
             raise RuntimeError(f"Converted weight cache writer stopped heartbeating without publishing: {path}")
-        remaining = deadline - time.monotonic()
+        remaining = deadline - clock()
         if remaining <= 0:
             raise TimeoutError(f"Converted weight cache did not become ready within {timeout}s: {path}{baseline_context}")
-        if not observed and time.monotonic() - started >= writer_start_timeout:
+        if writer_start_timeout is not None and not observed and clock() - started >= writer_start_timeout:
             raise TimeoutError(
                 f"Converted weight cache writer did not publish startup progress within {writer_start_timeout}s:"
                 f" {path}{baseline_context}"
             )
-        time.sleep(min(poll_interval, remaining))
+        sleep(min(poll_interval, remaining))
 
 
 def _write_conversion_cache(
@@ -467,7 +498,7 @@ def _write_conversion_cache(
             shutil.rmtree(tmp_path)
             return
         try:
-            os.replace(tmp_path, snapshot_path)
+            _replace(tmp_path, snapshot_path)
         except OSError:
             if conversion_cache_ready(snapshot_path):
                 shutil.rmtree(tmp_path)
@@ -479,30 +510,45 @@ def _write_conversion_cache(
                 return
             stale = snapshot_path.with_name(f"{snapshot_path.name}.stale-{uuid.uuid4().hex}")
             try:
-                os.rename(snapshot_path, stale)
+                _rename(snapshot_path, stale)
             except FileNotFoundError:
                 pass
+            if conversion_cache_ready(stale):
+                # It became ready after our pre-rename check. Restore that winner,
+                # and never delete its shards if a third publisher has taken the destination.
+                try:
+                    _rename(stale, snapshot_path)
+                except OSError:
+                    if not conversion_cache_ready(snapshot_path):
+                        raise
+                shutil.rmtree(tmp_path)
+                return
             try:
                 # Recheck after moving the incomplete generation: a competing publisher may have won.
                 if conversion_cache_ready(snapshot_path):
                     shutil.rmtree(tmp_path)
                     return
                 try:
-                    os.replace(tmp_path, snapshot_path)
+                    _replace(tmp_path, snapshot_path)
                 except OSError:
                     if not conversion_cache_ready(snapshot_path):
                         raise
                     shutil.rmtree(tmp_path)
             finally:
-                if stale.exists():
+                if stale.exists() and not conversion_cache_ready(stale):
                     shutil.rmtree(stale)
 
     def finish():
         stop.set()
         owner_thread.join(timeout=_CACHE_HEARTBEAT_JOIN_TIMEOUT)
-        owner_path.unlink(missing_ok=True)
         if not committed and tmp_path.exists():
-            shutil.rmtree(tmp_path)
+            try:
+                _write_cache_marker(owner_path, dict(_workspace_owner(), state="failed"))
+                shutil.rmtree(tmp_path)
+            except OSError:
+                logger.info("Could not clean failed conversion workspace %s", tmp_path, exc_info=True)
+                return
+        owner_path.unlink(missing_ok=True)
 
     logger.info(
         "Converting snapshot state dict from %s to %s and saving to %s on rank=%d local_rank=%d. "
@@ -644,7 +690,7 @@ def ensure_node_local_conversion_cache(
 
                 def heartbeat():
                     count = 0
-                    next_sweep = time.monotonic() + _ABANDONED_CACHE_AGE
+                    next_sweep = _monotonic() + _ABANDONED_CACHE_AGE
                     while not stop.wait(_CACHE_HEARTBEAT_INTERVAL):
                         count += 1
                         try:
@@ -657,9 +703,9 @@ def ensure_node_local_conversion_cache(
                                 snapshot_path,
                                 exc_info=True,
                             )
-                        if not node_local and time.monotonic() >= next_sweep:
+                        if not node_local and _monotonic() >= next_sweep:
                             _cleanup_abandoned_conversion_workspaces(snapshot_path)
-                            next_sweep = time.monotonic() + _ABANDONED_CACHE_AGE
+                            next_sweep = _monotonic() + _ABANDONED_CACHE_AGE
 
                 thread = threading.Thread(target=heartbeat, daemon=True)
                 thread.start()

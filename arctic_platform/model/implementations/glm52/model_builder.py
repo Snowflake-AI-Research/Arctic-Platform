@@ -19,6 +19,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, Pre
 
 from arctic_platform.model.implementations.moe.conversion_cache import (
     WEIGHT_CONVERSION_CACHE_SCOPE_ENV,
+    begin_conversion_preparation,
     conversion_cache_attempt_id,
     conversion_cache_is_node_local,
     conversion_cache_ready,
@@ -250,7 +251,7 @@ def _init_random_moe_weights(model: nn.Module, init_std: float) -> None:
         get_logger().info(f"Initialized {count} MoE/LatentMoE modules after random_init")
 
 
-@record_conversion_preparation_failure
+@record_conversion_preparation_failure(heartbeat=False)
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)
@@ -301,6 +302,8 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             node_local_cache = conversion_cache_is_node_local(snapshot_path)
             world = get_world()
             attempt_id, fresh_attempt = conversion_cache_attempt_id(shared=not node_local_cache)
+            if not conversion_cache_ready(snapshot_path):
+                begin_conversion_preparation()
             stream_convert_fn = get_checkpoint_converter(model, fmt)
             if node_local_cache:
                 ensure_node_local_conversion_cache(
