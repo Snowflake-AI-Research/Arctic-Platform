@@ -82,6 +82,9 @@ def test_expert_parallel_worker_builds_the_moe_spec_and_splits_expert_groups(mon
     monkeypatch.setattr(worker, "ds_training_config", lambda *args: {"train_micro_batch_size_per_gpu": 1})
 
     def build(spec):
+        # Spec validation imports kernels that query the real device, so fake it only afterwards.
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "get_device_properties", lambda gpu: SimpleNamespace(uuid="test"))
         observed["spec"] = spec
         return SimpleNamespace(model=model)
 
@@ -93,8 +96,6 @@ def test_expert_parallel_worker_builds_the_moe_spec_and_splits_expert_groups(mon
     monkeypatch.setattr(mod, "build_model", build)
     monkeypatch.setattr(mod, "initialize_training_engine", initialize)
     monkeypatch.setattr(mod, "get_accelerator", lambda: SimpleNamespace(device_name=lambda rank: "cuda:0"))
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda gpu: SimpleNamespace(uuid="test"))
 
     assert worker.initialize(
         "localhost",
