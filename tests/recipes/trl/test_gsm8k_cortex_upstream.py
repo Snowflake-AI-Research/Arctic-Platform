@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """CPU-only contracts for the recipe-local upstream-TRL Cortex bridge."""
 
 from __future__ import annotations
@@ -9,14 +24,13 @@ import torch
 
 from arctic_platform.common.utils.batch import unpack_batch
 
-
 RECIPE_ROOT = Path(__file__).resolve().parents[3] / "recipes" / "rl" / "trl" / "gsm8k_cortex"
 sys.path.insert(0, str(RECIPE_ROOT))
 
-from arctic_trl_cortex.upstream import CortexModelBridge
-from arctic_trl_cortex.upstream import _flatten_row
-from arctic_trl_cortex.upstream import _pad_rows
-from arctic_trl_cortex.client import engine_old_log_probs
+from arctic_trl_cortex.client import engine_old_log_probs  # noqa: E402
+from arctic_trl_cortex.upstream import CortexModelBridge  # noqa: E402
+from arctic_trl_cortex.upstream import _flatten_row  # noqa: E402
+from arctic_trl_cortex.upstream import _pad_rows  # noqa: E402
 
 
 class _Row:
@@ -61,9 +75,7 @@ def test_flattened_rows_select_completion_predictors() -> None:
 def test_cortex_backward_runs_once_for_upstream_autograd() -> None:
     batch = _pad_rows([_flatten_row(_Row(), pad_token_id=0)], num_processes=1, pad_token_id=0)
     client = _FakeCortexClient()
-    bridge = CortexModelBridge(
-        client, temperature=1.0, pad_token_id=0, rollout_n=8, max_token_len_per_gpu=16
-    )
+    bridge = CortexModelBridge(client, temperature=1.0, pad_token_id=0, rollout_n=8, max_token_len_per_gpu=16)
     bridge.set_anchor(torch.nn.Parameter(torch.ones(())))
     bridge.stage(batch, epsilon=0.2)
 
