@@ -1063,10 +1063,13 @@ def test_offloaded_snapshot_initialization_closes_on_io_error(monkeypatch, tmp_p
     assert files[0].closed
 
 
-@pytest.mark.parametrize("sync_bytes,expected", [(0, 1), (64, 4), (128, 2)])
+@pytest.mark.parametrize("sync_bytes,expected", [(None, 1), (0, 1), (64, 4), (128, 2)])
 def test_offloaded_snapshot_sync_frequency_is_configurable(monkeypatch, tmp_path, sync_bytes, expected):
     monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_TMPDIR", str(tmp_path))
-    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", str(sync_bytes))
+    if sync_bytes is None:
+        monkeypatch.delenv("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", raising=False)
+    else:
+        monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", str(sync_bytes))
     monkeypatch.setattr(deepspeed_engine, "_OFFLOADED_SNAPSHOT_CHUNK_BYTES", 64)
     original_sync = deepspeed_engine.os.fdatasync
     syncs = []

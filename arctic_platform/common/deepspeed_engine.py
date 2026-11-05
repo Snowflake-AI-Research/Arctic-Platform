@@ -182,9 +182,7 @@ class _OffloadedGradientStorage:
         self.staging = None
         self.snapshots = {}
         try:
-            self.sync_bytes = int(
-                os.environ.get("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", str(_OFFLOADED_SNAPSHOT_CHUNK_BYTES))
-            )
+            self.sync_bytes = int(os.environ.get("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", "0"))
         except ValueError as error:
             raise ValueError("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES must be a nonnegative integer") from error
         if self.sync_bytes < 0:
