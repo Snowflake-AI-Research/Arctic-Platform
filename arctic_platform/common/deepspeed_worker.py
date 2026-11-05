@@ -167,9 +167,9 @@ class DeepSpeedWorker:
 
         ds_worker_config = deepcopy(job_config.get("ds_worker_config") or {})
         ds_worker_config["world_size"] = self.world_size
-        if "sp_size" in ds_worker_config:
+        if ds_worker_config.get("sp_size") is not None:
             if (
-                "sequence_parallel" in ds_worker_config
+                ds_worker_config.get("sequence_parallel") is not None
                 and ds_worker_config["sequence_parallel"] != ds_worker_config["sp_size"]
             ):
                 raise ValueError("worker sp_size conflicts with sequence_parallel")

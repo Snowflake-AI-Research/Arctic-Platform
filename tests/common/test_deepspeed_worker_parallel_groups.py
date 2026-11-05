@@ -112,7 +112,15 @@ def test_worker_groups_invalid_degrees_or_engine_selector_fail(runtime, spec, co
     assert runtime.calls == []
 
 
-def test_worker_initialize_passes_native_groups_and_mpu_without_changing_request(runtime, monkeypatch):
+@pytest.mark.parametrize(
+    "aliases",
+    [
+        {"sp_size": 8},
+        {"sp_size": None, "sequence_parallel": 8},
+        {"sp_size": 8, "sequence_parallel": None},
+    ],
+)
+def test_worker_initialize_passes_native_groups_and_mpu_without_changing_request(runtime, monkeypatch, aliases):
     mod, worker = runtime.mod, runtime.worker
     model = torch.nn.Linear(1, 1)
     events = []
@@ -152,7 +160,7 @@ def test_worker_initialize_passes_native_groups_and_mpu_without_changing_request
     request = {
         "model_name": "synthetic",
         "job_type": "training",
-        "ds_worker_config": {"attn_implementation": "sparse_mla", "ep_size": 8, "sp_size": 8},
+        "ds_worker_config": {"attn_implementation": "sparse_mla", "ep_size": 8, **aliases},
         "ds_config": {"zero_optimization": {"stage": 2}, "bf16": {"enabled": True, "bf16_optimizer_states": True}},
     }
     original = deepcopy(request)
