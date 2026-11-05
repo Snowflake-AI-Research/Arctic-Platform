@@ -314,7 +314,7 @@ class _OffloadedGradientFile:
             if writing:
                 end = byte_offset + len(view)
                 if self.sync_bytes > 0 and end - synced_offset >= self.sync_bytes:
-                    # Bounded dirty pages by default; zero selects one sync per complete snapshot.
+                    # Zero (default) syncs once per snapshot; a positive value bounds dirty pages.
                     os.fdatasync(descriptor)
                     os.posix_fadvise(descriptor, synced_offset, end - synced_offset, os.POSIX_FADV_DONTNEED)
                     synced_offset = end
