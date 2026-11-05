@@ -69,7 +69,11 @@ def begin_conversion_preparation() -> None:
 
 
 def record_conversion_preparation_failure(function=None, *, distributed: bool = True, heartbeat: bool = True):
-    """Report setup liveness and failures before checkpoint discovery or model construction."""
+    """Report setup failures; distributed entry points require every process-group rank to call.
+
+    Establish the attempt before discovery so a rank-zero setup failure can reach waiting peers.
+    Rank-subset preparation must use distributed=False; that mode never introduces a collective.
+    """
     if function is None:
         return lambda wrapped: record_conversion_preparation_failure(
             wrapped, distributed=distributed, heartbeat=heartbeat
@@ -341,27 +345,6 @@ def conversion_cache_attempt_id(*, shared: bool = False, distributed: bool = Tru
     tokens = [uuid.uuid4().hex if dist.get_rank() == 0 else None]
     dist.broadcast_object_list(tokens, src=0)
     return tokens[0], True
-
-
-def validate_standalone_conversion_attempt(config, source_path: Path | None = None) -> None:
-    """Validate the launcher's identity for a caller that has already selected a needed conversion."""
-    import torch.distributed as dist
-
-    if (dist.is_initialized() and _ACTIVE_ATTEMPT.get() is None) or os.environ.get(WEIGHT_CONVERSION_ATTEMPT_ID_ENV):
-        return
-    root = resolve_conversion_cache_root(getattr(config, "weight_conversion_cache_dir", None))
-    if root and conversion_cache_is_node_local(Path(root)):
-        return
-    if source_path is None and not Path(getattr(config, "name", "")).is_dir():
-        # A hub ID is not a checkpoint directory; check readiness once its actual source is resolved.
-        return
-    source_path = Path(getattr(config, "name", "")) if source_path is None else source_path
-    if not root and conversion_cache_is_node_local(source_path):
-        return
-    for fmt in ("prime", "prime-dequantized", "hf"):
-        if conversion_cache_ready(resolve_conversion_cache_path(config, source_path, fmt)):
-            return
-    conversion_cache_attempt_id(shared=True)
 
 
 def wait_for_conversion_cache(

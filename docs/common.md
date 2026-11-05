@@ -163,6 +163,8 @@ Converted checkpoints are published as complete directories. Node-local caches u
 
 Shared-cache launchers should choose a new `DSS_WEIGHT_CONVERSION_ATTEMPT_ID` for every retry. Distributed loading establishes an identity collectively before checkpoint discovery when the launcher does not supply one.
 
+**Distributed weight loading requires every process-group rank.** The Qwen and GLM `load_dcp_from_hf` entry points use the default process group's barriers and distributed checkpoint reader, including for native checkpoints that need no conversion. Call these loaders on every rank, in the same order. A subset of ranks must not use these collective load entry points.
+
 Heartbeats start only after a conversion is selected. Before selection, independent source discovery and model setup are bounded by `DSS_WEIGHT_CONVERSION_TIMEOUT` (default 3600 seconds), not a separate startup deadline. A launcher with a known startup budget may set `DSS_WEIGHT_CONVERSION_WRITER_START_TIMEOUT` explicitly. After observing progress, a waiter fails if the writer stops publishing heartbeats for 120 seconds.
 
 Shared-cache cleanup reclaims workspaces with durable failure records or a confirmed dead owner on the current host. A remote hard-killed writer with no failure record cannot be distinguished from a live writer stalled in filesystem I/O; its workspace is retained. Remove that workspace only after confirming the owning attempt has terminated. Node-local retries reclaim old workspaces while holding their exclusive writer lock.

@@ -253,6 +253,11 @@ def _init_random_moe_weights(model: nn.Module, init_std: float) -> None:
 
 @record_conversion_preparation_failure(heartbeat=False)
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
+    """Collectively load weights; every rank in the default process group must call.
+
+    Native checkpoints and random initialization still use the existing barriers, and DCP loading
+    is collective. This entry point is not a rank-subset loading API.
+    """
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)
     torch.distributed.barrier()
