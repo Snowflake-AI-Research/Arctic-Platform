@@ -732,7 +732,7 @@ def test_iter_lora_weights_rejects_non_lora_trainables():
         list(iter_lora_weights(model, is_master=True, is_zero3=False))
 
 
-def _export_names(model, weight_format, monkeypatch):
+def _export_names(model, weight_format, monkeypatch, **kwargs):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
     return [
         name
@@ -741,8 +741,67 @@ def _export_names(model, weight_format, monkeypatch):
             weight_format,
             is_master=True,
             is_zero3=False,
+            **kwargs,
         )
     ]
+
+
+@pytest.mark.parametrize("weight_format", ["vllm", "hf"])
+def test_full_weight_sync_refuses_trainable_lora_parameters(weight_format, monkeypatch):
+    model = _Model(
+        [
+            ("base_model.model.proj.base_layer.weight", SimpleNamespace(requires_grad=False, data=torch.ones(1))),
+            ("base_model.model.proj.lora_A.default.weight", SimpleNamespace(requires_grad=True, data=torch.ones(1))),
+            ("base_model.model.proj.lora_B.default.weight", SimpleNamespace(requires_grad=True, data=torch.ones(1))),
+        ],
+        peft_config={"default": SimpleNamespace(r=8)},
+    )
+
+    with pytest.raises(ValueError, match=r"2 trainable LoRA parameter.*weight_format='lora'"):
+        _export_names(model, weight_format, monkeypatch)
+
+
+def test_hf_checkpoint_export_of_a_peft_model_writes_the_unmerged_base(monkeypatch):
+    from peft import LoraConfig
+    from peft import get_peft_model
+
+    class AdapterBase(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(4, 4, bias=False)
+            self.config = dict(model_type="test")
+
+    model = get_peft_model(AdapterBase(), LoraConfig(r=2, target_modules=["proj"]))
+    base_weight = model.base_model.model.proj.base_layer.weight
+
+    with pytest.raises(ValueError, match="weight_format='lora'"):
+        _export_names(model, "hf", monkeypatch)
+    exported = dict(iter_model_weights(model, "hf", is_master=True, is_zero3=False, include_skipped=True))
+
+    assert not any("lora_" in name for name in exported)
+    assert torch.equal(exported["proj.weight"], base_weight)
+
+
+@pytest.mark.parametrize("weight_format", ["vllm", "hf"])
+def test_full_weight_sync_accepts_frozen_lora_parameters(weight_format, monkeypatch):
+    model = _Model(
+        [
+            ("base_model.model.proj.base_layer.weight", SimpleNamespace(requires_grad=False, data=torch.ones(1))),
+            ("base_model.model.proj.lora_A.default.weight", SimpleNamespace(requires_grad=False, data=torch.ones(1))),
+            ("base_model.model.proj.lora_B.default.weight", SimpleNamespace(requires_grad=False, data=torch.ones(1))),
+        ],
+        peft_config={"default": SimpleNamespace(r=8)},
+    )
+
+    expected = ["proj.weight"] if weight_format == "hf" else [name for name, _ in model.named_parameters()]
+    assert _export_names(model, weight_format, monkeypatch) == expected
+
+
+@pytest.mark.parametrize("weight_format", ["vllm", "hf"])
+def test_full_weight_sync_accepts_dense_trainable_parameters(weight_format, monkeypatch):
+    model = _Model([("proj.weight", SimpleNamespace(requires_grad=True, data=torch.ones(1)))])
+
+    assert _export_names(model, weight_format, monkeypatch) == ["proj.weight"]
 
 
 def test_peft_wrapped_qwen3_moe_keeps_hf_family_export(monkeypatch):
@@ -778,7 +837,7 @@ def test_peft_wrapped_qwen3_moe_keeps_hf_family_export(monkeypatch):
     with pytest.raises(RuntimeError, match="convert_layer_to_hf"):
         build_iter_full_hf_weights(wrapped)
 
-    names = _export_names(wrapped, "hf", monkeypatch)
+    names = _export_names(wrapped, "hf", monkeypatch, include_skipped=True)
     assert "model.layers.0.mlp.gate.weight" in names
     assert any(name.startswith("model.layers.0.mlp.experts.") for name in names)
     assert not any("lora_" in name for name in names)
@@ -822,6 +881,7 @@ def test_peft_wrapped_qwen3_5_moe_keeps_vllm_family_export(monkeypatch):
     with pytest.raises(AssertionError, match="PeftModel"):
         _build_iter_full_vllm_weights(wrapped)
 
+    wrapped.requires_grad_(False)
     names = _export_names(wrapped, "vllm", monkeypatch)
     assert "model.layers.0.mlp.gate.weight" in names
     assert "model.layers.0.mlp.experts.w13_weight" in names
