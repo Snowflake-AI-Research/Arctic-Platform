@@ -357,6 +357,18 @@ def _request_signature(microbatches, meta, processing, loss_scales, device):
     return torch.cat((metadata, moments.view(torch.uint8)))
 
 
+class SequenceParallelPreflightError(Exception):
+    """Admission failed collectively before the request could mutate gradients."""
+
+
+class _PreflightValueError(SequenceParallelPreflightError, ValueError):
+    pass
+
+
+class _PreflightRuntimeError(SequenceParallelPreflightError, RuntimeError):
+    pass
+
+
 def validate_sequence_parallel_microbatches(
     microbatches: list[dict],
     *,
@@ -405,13 +417,13 @@ def validate_sequence_parallel_microbatches(
             signature = _request_signature(microbatches, meta, processing, loss_scales, device)
     except Exception as error:
         context = "request" if index is None else f"microbatch {index}"
-        failure_type = ValueError if isinstance(error, ValueError) else RuntimeError
+        failure_type = _PreflightValueError if isinstance(error, ValueError) else _PreflightRuntimeError
         failure = failure_type(f"SP {context}: {error}")
     if synchronize:
         flag = torch.tensor(int(failure is not None), dtype=torch.int32, device=device)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX)
         if flag.item() and failure is None:
-            failure = ValueError("SP request preflight failed on another logical-DP shard")
+            failure = _PreflightValueError("SP request preflight failed on another logical-DP shard")
     if failure is not None:
         raise failure
     if synchronize and signature is not None:
@@ -421,7 +433,7 @@ def validate_sequence_parallel_microbatches(
         flag = torch.tensor(int(mismatch), dtype=torch.int32, device=device)
         dist.all_reduce(flag, op=dist.ReduceOp.MAX)
         if flag.item():
-            raise ValueError("SP members must receive identical token rows and loss inputs")
+            raise _PreflightValueError("SP members must receive identical token rows and loss inputs")
     return membership
 
 

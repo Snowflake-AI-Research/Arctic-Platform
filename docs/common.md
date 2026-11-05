@@ -60,7 +60,7 @@ NCCL rendezvous is last.
 
 **Sequence parallelism is currently supported only by training engines using ZeRO stage 2.** The sequence-parallel degree (`sp_size`) may exceed one for the training job, but a separate `log_prob` or reference job must use `sp_size=1`. Do not reuse the actor's parallelism configuration for the reference engine. `JobConfig` rejects an unsupported reference configuration before creating workers.
 
-**A failed sequence-parallel training request terminates all training workers.** Cancelling a Ray request does not interrupt a worker blocked inside a distributed collective. The server kills the training actors without restart, retains the original request error, and rejects further training operations. Partial gradients cannot be reused; destroy the failed job and create a new job from the last completed checkpoint.
+**An execution failure in a sequence-parallel model request terminates all training workers.** Cancelling a Ray request does not interrupt a worker blocked inside a distributed collective. The server kills the training actors without restart, retains the original request error, and rejects further training operations. Collective preflight rejections and checkpoint or weight-transfer errors do not kill the actors. Partial gradients from a failed model request cannot be reused: destroy the failed job, create a replacement job from the last completed checkpoint, and obtain a new server proxy for its worker handles. Destroying the old training job clears its cached handles and failure flags; it does not attach the old proxy to the replacement workers.
 
 `checkpoint_path` is **required** for new training jobs (asserted at init and
 at save).

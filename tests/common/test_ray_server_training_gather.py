@@ -21,6 +21,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -97,6 +98,7 @@ def _server(workers):
     server._training_op_lock = asyncio.Lock()
     server._training_failed = False
     server._training_failure = None
+    server._training_workers_aborted = False
     server._weight_norm_disabled = None
     server.colocate = False
     return server
@@ -133,7 +135,7 @@ def _run_native_sp_worker_abort(rendezvous: str, ray_root: str) -> None:
 
         async def run():
             try:
-                await asyncio.wait_for(server._gather_training_refs(lambda: refs), timeout=15)
+                await asyncio.wait_for(server._gather_training_refs(lambda: refs, abort_on_failure=True), timeout=15)
             except RuntimeError as error:
                 assert "injected model forward failure" in str(error), error
                 assert server._training_failure is error
@@ -200,7 +202,7 @@ class TestGatherTrainingRefs(TestCasePlus):
             async def membership():
                 started.set()
                 await hold.wait()
-                return {"sp_size": 2}
+                return {"sp_size": 2, "sp_ranks": [0, 1]}
 
             server = _server([])
             workers = [SimpleNamespace(get_sequence_parallel_info=_Remote(membership)) for _ in range(2)]
@@ -217,8 +219,196 @@ class TestGatherTrainingRefs(TestCasePlus):
                 self.assertFalse(task.done())
                 hold.set()
                 _, _, info = await task
-                self.assertEqual(info, [{"sp_size": 2}, {"sp_size": 2}])
+                self.assertEqual(info, [{"sp_size": 2, "sp_ranks": [0, 1]}] * 2)
                 self.assertEqual(split.call_args.kwargs["worker_sp_info"], info)
+
+        asyncio.run(run())
+
+    def test_sp_preflight_rejection_drains_peers_and_preserves_workers(self):
+        from arctic_platform.model.implementations.gpu.sp.utils import _PreflightValueError
+
+        async def run():
+            server = _server([object(), object()])
+            server.jobs[1]["sp_size"] = 2
+            drained = []
+
+            async def reject(rank):
+                if rank == 1:
+                    await asyncio.sleep(0.02)
+                drained.append(rank)
+                raise _PreflightValueError("SP request: unknown field")
+
+            with patch("arctic_platform.common.ray_server.ray.kill") as kill:
+                with self.assertRaisesRegex(ValueError, "unknown field"):
+                    await server._gather_training_refs(lambda: [reject(0), reject(1)], abort_on_failure=True)
+                self.assertEqual(sorted(drained), [0, 1])
+                kill.assert_not_called()
+                self.assertFalse(server._training_failed)
+                self.assertFalse(server._training_workers_aborted)
+                self.assertEqual(await server._gather_training_refs(lambda: [asyncio.sleep(0, result="ok")]), ["ok"])
+
+        asyncio.run(run())
+
+    def test_sp_save_failure_does_not_abort_workers(self):
+        async def save(path, export_hf):
+            raise OSError("checkpoint disk unavailable")
+
+        async def run():
+            server = _server([SimpleNamespace(save_checkpoint=_Remote(save))])
+            server.jobs[1].update(sp_size=2, checkpoint_path=self.get_auto_remove_tmp_dir())
+            with patch("arctic_platform.common.ray_server.ray.kill") as kill:
+                with self.assertRaisesRegex(OSError, "checkpoint disk unavailable"):
+                    await server.save(1, {"step": 1})
+                kill.assert_not_called()
+                self.assertFalse(server._training_failed)
+                self.assertFalse(server._training_workers_aborted)
+
+        asyncio.run(run())
+
+    def test_sp_mixed_preflight_and_execution_failure_aborts_blocked_peer(self):
+        from arctic_platform.model.implementations.gpu.sp.utils import _PreflightValueError
+
+        async def run():
+            server = _server([object(), object(), object()])
+            server.jobs[1]["sp_size"] = 2
+            rejected = asyncio.Event()
+            stopped = asyncio.Event()
+
+            async def reject():
+                rejected.set()
+                raise _PreflightValueError("SP request: unknown field")
+
+            async def fail():
+                await rejected.wait()
+                await asyncio.sleep(0.02)
+                raise RuntimeError("model execution failed")
+
+            async def blocked():
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.set()
+
+            with patch("arctic_platform.common.ray_server.ray.kill") as kill:
+                with self.assertRaisesRegex(RuntimeError, "model execution failed"):
+                    await asyncio.wait_for(
+                        server._gather_training_refs(lambda: [reject(), fail(), blocked()], abort_on_failure=True),
+                        timeout=1,
+                    )
+                await asyncio.wait_for(stopped.wait(), timeout=1)
+                self.assertEqual(kill.call_count, 3)
+                self.assertTrue(server._training_failed)
+                self.assertTrue(server._training_workers_aborted)
+
+        asyncio.run(run())
+
+    def test_sp_cancelled_weight_transfer_does_not_abort_workers(self):
+        async def run():
+            server = _server([object(), object()])
+            server.jobs[1]["sp_size"] = 2
+            started = asyncio.Event()
+
+            async def transfer():
+                started.set()
+                await asyncio.Event().wait()
+
+            with patch("arctic_platform.common.ray_server.ray.kill") as kill:
+                task = asyncio.create_task(server._gather_training_refs(lambda: [transfer()]))
+                await started.wait()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                kill.assert_not_called()
+                self.assertFalse(server._training_workers_aborted)
+
+        asyncio.run(run())
+
+    def test_sp_sampler_failure_during_weight_sync_leaves_training_actors_alive(self):
+        async def run():
+            started, stopped = asyncio.Event(), asyncio.Event()
+
+            async def send():
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.set()
+
+            class Pool:
+                num_replicas = 1
+                tp_size = 1
+
+                async def sync_weights(self, **kwargs):
+                    await started.wait()
+                    raise OSError("sampler transfer failed")
+
+            class Schedule:
+                groups = [SimpleNamespace(group_id=0, sender_train_rank=0, world_size=2, replica_ids=[0])]
+
+                @classmethod
+                def build(cls, **kwargs):
+                    return cls()
+
+            worker = SimpleNamespace(
+                get_ip=_Remote(lambda: asyncio.sleep(0, result="127.0.0.1")),
+                send_weights=_Remote(send),
+            )
+            server = _server([worker])
+            server.jobs[1]["sp_size"] = 2
+            server.jobs[2] = {"job_type": "sampling"}
+            server.sampling_pool = Pool()
+            server.weight_sync_ready = True
+            server.weight_sync_bucket_size = 1024
+            server.arctic_rl_ray_server_state = SimpleNamespace(wake_inference=_Remote(lambda: asyncio.sleep(0)))
+            with (
+                patch("arctic_platform.common.ray_server._transfer_schedule_cls", return_value=Schedule),
+                patch("arctic_platform.common.ray_server.ray.kill") as kill,
+            ):
+                with self.assertRaisesRegex(OSError, "sampler transfer failed"):
+                    await server.weight_sync(1, {"source_sub_job_id": 1, "target_sub_job_ids": [2]})
+                await asyncio.wait_for(stopped.wait(), timeout=1)
+                kill.assert_not_called()
+                self.assertFalse(server._training_workers_aborted)
+
+        asyncio.run(run())
+
+    def test_sp_validation_yields_and_runs_once_per_logical_group(self):
+        async def run():
+            server = _server([])
+            payload = dict(batch={}, meta={}, processing=dict(loss_fn="grpo", post=["compute_logprobs"]))
+            infos = [dict(sp_size=2, sp_ranks=[0, 1])] * 2 + [dict(sp_size=2, sp_ranks=[2, 3])] * 2
+            workers = [
+                SimpleNamespace(get_sequence_parallel_info=_Remote(lambda info=info: asyncio.sleep(0, result=info)))
+                for info in infos
+            ]
+            started = threading.Event()
+            release = threading.Event()
+            loop_thread = threading.get_ident()
+
+            def validate(*args, **kwargs):
+                self.assertNotEqual(threading.get_ident(), loop_thread)
+                started.set()
+                self.assertTrue(release.wait(timeout=5))
+
+            with (
+                patch("arctic_platform.common.ray_server.ray_split_batch", return_value=([payload] * 4, None)),
+                patch(
+                    "arctic_platform.model.implementations.gpu.sp.utils.validate_sequence_parallel_microbatches",
+                    side_effect=validate,
+                ) as check,
+            ):
+                task = asyncio.create_task(server._split_model_batch(payload, workers, sp_size=2, backward=True))
+                try:
+                    for _ in range(100):
+                        if started.is_set():
+                            break
+                        await asyncio.sleep(0.01)
+                    self.assertTrue(started.is_set(), "batch validation did not start")
+                    self.assertFalse(task.done())
+                finally:
+                    release.set()
+                await task
+                self.assertEqual(check.call_count, 2)
 
         asyncio.run(run())
 
@@ -979,9 +1169,17 @@ class TestGatherTrainingRefs(TestCasePlus):
             result = await server.destroy(1, "training")
             self.assertEqual(result, {"status": "destroyed"})
             self.assertEqual(destroyed, [(1, "training")])
-            self.assertTrue(server._training_failed)
-            with self.assertRaisesRegex(RuntimeError, "refusing further training ops"):
-                await server.step(1)
+            self.assertFalse(server._training_failed)
+            self.assertFalse(server._training_workers_aborted)
+            self.assertIsNone(server._training_failure)
+            self.assertEqual(server.training_workers, [])
+            self.assertNotIn(1, server.jobs)
+            # A replacement job uses a new proxy, and must be independently abortable.
+            replacement = _server([object(), object()])
+            replacement.jobs[1]["sp_size"] = 2
+            with patch("arctic_platform.common.ray_server.ray.kill") as kill:
+                replacement._abort_sequence_parallel_workers(RuntimeError("new model failure"))
+                self.assertEqual(kill.call_count, 2)
 
         asyncio.run(_run())
 

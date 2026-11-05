@@ -773,6 +773,7 @@ class ArcticRLRayServer:
         self._training_op_lock = asyncio.Lock()
         self._training_failed = False
         self._training_failure: BaseException | None = None
+        self._training_workers_aborted = False
         # Set to the reason ``weight_norm`` stopped. A later call returns that reason and does not touch the workers.
         self._weight_norm_disabled: str | None = None
 
@@ -822,16 +823,18 @@ class ArcticRLRayServer:
                 # Keep the request's failure as the primary exception even if Ray is already disconnected.
                 logger.exception("could not terminate failed sequence-parallel worker")
 
-    async def _await_training_refs(self, submit_refs, *, latch: bool = True, check_failed: bool = True):
+    async def _await_training_refs(
+        self, submit_refs, *, latch: bool = True, check_failed: bool = True, abort_on_failure: bool = False
+    ):
         """Await refs. Caller must already hold ``_training_op_lock`` for training refs.
 
         The first failure cancels every ref still running, on the worker and in
         this process, and marks the workers failed. The step result is
         discarded, and a later training op is refused while a data-parallel
         collective may still be running. Cancelling this await (client
-        disconnect, timeout) does the same. Sequence-parallel failures also
-        terminate every training actor without restart, releasing blocked
-        collectives and discarding partial gradients.
+        disconnect, timeout) does the same. Only model requests with
+        ``abort_on_failure=True`` terminate SP actors after execution failures.
+        Collective admission rejections leave the actors and training state usable.
 
         ``latch=False`` is the sampling-worker path: a sampler error is raised
         and does not block later ``step`` / ``weight_sync``. ``check_failed=False``
@@ -850,6 +853,14 @@ class ArcticRLRayServer:
             paired.append((ref, asyncio.ensure_future(_consume())))
         tasks = [task for _, task in paired]
         cancelled_collective = False
+        preflight_rejected = False
+
+        def is_preflight(error):
+            from arctic_platform.model.implementations.gpu.sp.utils import SequenceParallelPreflightError
+
+            return isinstance(error, SequenceParallelPreflightError) or isinstance(
+                getattr(error, "cause", None), SequenceParallelPreflightError
+            )
 
         def _cancel_unfinished() -> None:
             nonlocal cancelled_collective
@@ -864,6 +875,19 @@ class ArcticRLRayServer:
             else:
                 done, pending = set(), set()
             errors = [task.exception() for task in done if not task.cancelled() and task.exception() is not None]
+            if errors and all(is_preflight(error) for error in errors):
+                # These workers have already completed the global admission collective.
+                # Drain rejections, but stop as soon as any peer reports an execution failure.
+                while pending and all(is_preflight(error) for error in errors):
+                    completed, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_EXCEPTION)
+                    errors.extend(
+                        task.exception() for task in completed if not task.cancelled() and task.exception() is not None
+                    )
+                preflight_rejected = not pending and all(is_preflight(error) for error in errors)
+                if preflight_rejected:
+                    raise errors[0]
+            # An execution failure must not be hidden by another rank's admission rejection.
+            errors.sort(key=is_preflight)
             if errors and pending:
                 _cancel_unfinished()
             if latch and (cancelled_collective or (errors and pending)):
@@ -874,16 +898,16 @@ class ArcticRLRayServer:
                 raise errors[0]
         except asyncio.CancelledError:
             cancelled_collective = True
-            if latch:
+            if latch and abort_on_failure and not preflight_rejected:
                 self._abort_sequence_parallel_workers(asyncio.CancelledError())
             raise
         except BaseException as error:
-            if latch:
+            if latch and abort_on_failure and not is_preflight(error):
                 self._abort_sequence_parallel_workers(error)
             raise
         finally:
             _cancel_unfinished()
-            if latch and cancelled_collective:
+            if latch and cancelled_collective and not preflight_rejected:
                 self._mark_training_failed(None)
         return [task.result() for _, task in paired]
 
@@ -891,7 +915,7 @@ class ArcticRLRayServer:
         """Await sampler refs. A sampler failure does not latch training workers."""
         return await self._await_training_refs(submit_refs, latch=False, check_failed=False)
 
-    async def _gather_training_refs(self, submit_refs):
+    async def _gather_training_refs(self, submit_refs, *, abort_on_failure: bool = False):
         """Submit and await worker ObjectRefs without blocking the transport loop.
 
         ``submit_refs`` runs inside the lock so one op's ``.remote()`` calls stay
@@ -900,7 +924,7 @@ class ArcticRLRayServer:
         self._raise_if_training_failed()
         async with self._training_op_lock:
             self._raise_if_training_failed()
-            return await self._await_training_refs(submit_refs)
+            return await self._await_training_refs(submit_refs, abort_on_failure=abort_on_failure)
 
     def _verify_job(self, job_id: int, expected_types: Union[str, list[str]]) -> None:
         info = self.jobs.get(job_id)
@@ -915,7 +939,17 @@ class ArcticRLRayServer:
         return {"status": "OK"}
 
     async def destroy(self, job_id: int, job_type: str) -> dict[str, Any]:
-        return await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
+        async with self._training_op_lock:
+            result = await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
+            if job_type == "training":
+                self.training_workers = []
+                self.jobs.pop(job_id, None)
+                self._training_failed = False
+                self._training_failure = None
+                self._training_workers_aborted = False
+                self._weight_norm_disabled = None
+                self.weight_sync_ready = False
+            return result
 
     async def _split_model_batch(self, batch: dict, workers, *, sp_size: int, backward: bool):
         worker_sp_info = None
@@ -923,17 +957,28 @@ class ArcticRLRayServer:
             _, _, meta, processing = unpack_batch(batch)
             validate_sequence_parallel_grpo(meta, processing, backward=backward)
             worker_sp_info = await asyncio.gather(*[worker.get_sequence_parallel_info.remote() for worker in workers])
-        shards, reorder = ray_split_batch(batch, len(workers), sp_size=sp_size, worker_sp_info=worker_sp_info)
-        if worker_sp_info is not None:
-            from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_microbatches
 
-            # Admit every logical-DP shard before dispatching any worker. Workers repeat
-            # this for their actual GAS slices before mutating accumulation state.
-            for shard, info in zip(shards, worker_sp_info):
-                _, shard_batch, _, _ = unpack_batch(shard)
-                validate_sequence_parallel_microbatches(
-                    shard_batch if isinstance(shard_batch, list) else [shard_batch], sp_info=info
-                )
+        def split_and_validate():
+            shards, reorder = ray_split_batch(batch, len(workers), sp_size=sp_size, worker_sp_info=worker_sp_info)
+            if worker_sp_info is not None:
+                from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_microbatches
+
+                groups = set()
+                for shard, info in zip(shards, worker_sp_info):
+                    group = tuple(info["sp_ranks"])
+                    if group in groups:
+                        continue
+                    groups.add(group)
+                    _, shard_batch, _, _ = unpack_batch(shard)
+                    validate_sequence_parallel_microbatches(
+                        shard_batch if isinstance(shard_batch, list) else [shard_batch], sp_info=info
+                    )
+            return shards, reorder
+
+        if sp_size > 1:
+            shards, reorder = await asyncio.to_thread(split_and_validate)
+        else:
+            shards, reorder = split_and_validate()
         return shards, reorder, worker_sp_info
 
     @staticmethod
@@ -1005,7 +1050,8 @@ class ArcticRLRayServer:
         prof = ProfilerContext(type=PROFILER_TYPE, name="GATHER")
         with prof():
             results = await self._gather_training_refs(
-                lambda: [w.forward_backward.remote(s) for w, s in zip(workers, shards)]
+                lambda: [w.forward_backward.remote(s) for w, s in zip(workers, shards)],
+                abort_on_failure=sp_size > 1,
             )
 
         timers.stop_and_print_elapsed(tname)
@@ -1070,7 +1116,7 @@ class ArcticRLRayServer:
             return [w.forward_no_grad.remote(s) for w, s in zip(workers, shards)]
 
         if job_type == "training":
-            results = await self._gather_training_refs(_submit_forward)
+            results = await self._gather_training_refs(_submit_forward, abort_on_failure=sp_size > 1)
         else:
             results = await asyncio.gather(*_submit_forward())
 
