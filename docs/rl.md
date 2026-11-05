@@ -210,6 +210,18 @@ and k3 continue linearly. The optional batch tensor `sampler_kl_weights`
 (finite, non-negative) is `w`, per token or, on a padded request, as one value
 per sequence (`[B]`, like `sequence_loss_weights`) that each of its tokens
 takes; under token-mean it is required to carry `sequence_loss_weights`.
+`score_centering: true` (default `false`) subtracts the sampler's expected
+score at every prefix from the CISPO policy term
+([arXiv 2609.20807](https://arxiv.org/abs/2609.20807)), which cancels the drift
+toward the sampler that a trainer–sampler mismatch adds to each update and is
+zero when the two agree. The request sends the sampler's top-k at each
+prediction as `sampler_topk_ids_shifted` (integer `[B, S, k]`, `-1` pads) and
+`sampler_topk_log_probs_shifted` (`[B, S, k]`), aligned like
+`old_log_probs_shifted`; the chunked LM head scores those ids
+(`group_log_probs`), and the tail outside the top-k is taken as the trainer's,
+rescaled to the sampler's tail mass. It needs `use_cispo_loss`, token-level
+ratios with the sampler as the proximal policy, and no M2PO, ratio masks,
+`nll_mask` or `kd_coef`.
 `ap_grpo` accepts only the baseline
 GRPO config keys (`_GRPO_CONFIG_DEFAULTS` in `grpo.py`) and the ratio-control
 keys below; the

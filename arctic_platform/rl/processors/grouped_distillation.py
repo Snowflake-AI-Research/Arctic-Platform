@@ -30,6 +30,7 @@ from arctic_platform.common.registry import BATCHING_CALLBACK_ATTR
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import METRICS_CALLBACK_ATTR
 from arctic_platform.common.registry import MODEL_CALL_COUNT_CALLBACK_ATTR
+from arctic_platform.common.registry import MODEL_FORWARD_CALLBACK_ATTR
 from arctic_platform.common.utils.batch import combine_metric_shards
 from arctic_platform.common.utils.batch import metric_is_summed
 
@@ -974,6 +975,23 @@ class GRPOGroupedDistillationLoss(_GroupedLossCallbacks, BaseLoss):
         callback = getattr(LOSS_FNS[self.name], MODEL_CALL_COUNT_CALLBACK_ATTR, None)
         if callback is not None:
             callback(model_call_counts, config)
+
+    def model_forward_callback(
+        self,
+        model_kwargs: dict,
+        context: dict,
+        config: dict,
+        output_keys: list[str],
+    ) -> None:
+        if self._distillation_enabled(config):
+            # Both terms read the grouped head, which takes one candidate set per position.
+            if config.get("score_centering") is True:
+                raise ValueError("score_centering cannot be combined with kd_coef > 0")
+            super().model_forward_callback(model_kwargs, context, config, output_keys)
+            return
+        callback = getattr(LOSS_FNS[self.name], MODEL_FORWARD_CALLBACK_ATTR, None)
+        if callback is not None:
+            callback(model_kwargs, context, _policy_config(config), output_keys)
 
     def metrics_callback(self, worker_metrics: Sequence[dict], metrics: dict) -> None:
         _aggregate_distillation_metrics(worker_metrics, metrics)

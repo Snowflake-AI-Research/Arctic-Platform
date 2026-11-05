@@ -29,6 +29,7 @@ BATCHING_CALLBACK_ATTR = "_arctic_batching_callback"
 VALIDATION_CALLBACK_ATTR = "_arctic_validation_callback"
 PACKED_LOSS_REDUCTION_ATTR = "_arctic_packed_loss_reduction"
 MODEL_CALL_COUNT_CALLBACK_ATTR = "_arctic_model_call_count_callback"
+MODEL_FORWARD_CALLBACK_ATTR = "_arctic_model_forward_callback"
 METRICS_CALLBACK_ATTR = "_arctic_metrics_callback"
 SUMMED_METRICS_ATTR = "_arctic_summed_metrics"
 LOSS_CAPABILITIES_ATTR = "_arctic_loss_capabilities"
@@ -107,6 +108,7 @@ def register_loss_fn(
     validation_callback: Callable | None = None,
     packed_loss_reduction: Callable | None = None,
     model_call_count_callback: Callable | None = None,
+    model_forward_callback: Callable | None = None,
     metrics_callback: Callable | None = None,
     summed_metrics: Iterable[str] = (),
 ):
@@ -118,6 +120,10 @@ def register_loss_fn(
     passes ``[gradient_accumulation_steps()]``, the same on every rank, so its
     check agrees across ranks. ``run_pipeline(pack=True)`` passes only its local
     token-budget microbatch count, which depends on that rank's data.
+
+    ``model_forward_callback(model_kwargs, context, config, output_keys)``
+    amends the model call and names extra model outputs the loss reads, as
+    :meth:`BaseLoss.model_forward_callback` does for class-based losses.
 
     ``metrics_callback`` derives objective-owned response metrics after generic
     worker aggregation.
@@ -149,6 +155,10 @@ def register_loss_fn(
             existing = getattr(fn, MODEL_CALL_COUNT_CALLBACK_ATTR, None)
             if existing is not None and existing is not model_call_count_callback:
                 raise ValueError(f"refusing to replace model_call_count_callback on registered {name!r}")
+        if model_forward_callback is not None:
+            existing = getattr(fn, MODEL_FORWARD_CALLBACK_ATTR, None)
+            if existing is not None and existing is not model_forward_callback:
+                raise ValueError(f"refusing to replace model_forward_callback on registered {name!r}")
         if metrics_callback is not None:
             existing = getattr(fn, METRICS_CALLBACK_ATTR, None)
             if existing is not None and existing is not metrics_callback:
@@ -164,6 +174,8 @@ def register_loss_fn(
             setattr(fn, PACKED_LOSS_REDUCTION_ATTR, packed_loss_reduction)
         if model_call_count_callback is not None:
             setattr(fn, MODEL_CALL_COUNT_CALLBACK_ATTR, model_call_count_callback)
+        if model_forward_callback is not None:
+            setattr(fn, MODEL_FORWARD_CALLBACK_ATTR, model_forward_callback)
         if metrics_callback is not None:
             setattr(fn, METRICS_CALLBACK_ATTR, metrics_callback)
         if declared:

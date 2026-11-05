@@ -29,6 +29,7 @@ from arctic_platform.common.registry import LOSS_CAPABILITIES_ATTR
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import METRICS_CALLBACK_ATTR
 from arctic_platform.common.registry import MODEL_CALL_COUNT_CALLBACK_ATTR
+from arctic_platform.common.registry import MODEL_FORWARD_CALLBACK_ATTR
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.registry import VALIDATION_CALLBACK_ATTR
 from arctic_platform.common.registry import resolve_fn
@@ -185,6 +186,17 @@ class _LegacyLossAdapter(BaseLoss):
         if callback is not None:
             callback(context, config)
 
+    def model_forward_callback(
+        self,
+        model_kwargs: dict,
+        context: dict,
+        config: dict,
+        output_keys: list[str],
+    ) -> None:
+        callback = getattr(self._loss_fn, MODEL_FORWARD_CALLBACK_ATTR, None)
+        if callback is not None:
+            callback(model_kwargs, context, config, output_keys)
+
     def model_call_count_callback(self, model_call_counts: Sequence[int | None], config: dict) -> None:
         callback = getattr(self._loss_fn, MODEL_CALL_COUNT_CALLBACK_ATTR, None)
         if callback is not None:
@@ -229,6 +241,7 @@ class _LegacyLossAdapter(BaseLoss):
 
     def output_callback(self, model_outputs: dict) -> None:
         model_outputs.pop("logits", None)
+        model_outputs.pop("group_log_probs", None)
 
     def loss(
         self,

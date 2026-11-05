@@ -244,6 +244,140 @@ def _resolve_sampler_kl(config: dict, context: dict) -> tuple[float, str, float]
     return coef, kind, float(cap)
 
 
+_SCORE_CENTERING_METRIC_NAMES = (
+    "score_centering_token_count",
+    "score_centering_sampler_head_mass_sum",
+    "score_centering_trainer_head_mass_sum",
+    "score_centering_coef_abs_sum",
+)
+
+
+def _resolve_score_centering(config: dict, context: dict) -> bool:
+    """Validated ``score_centering``; when on, the sampler's log-probs and its top-k must be in context."""
+    enabled = config.get("score_centering", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"score_centering must be a bool, got {enabled!r}")
+    if not enabled:
+        return False
+    if context.get("old_log_probs_shifted") is None:
+        raise ValueError("score_centering requires context 'old_log_probs_shifted' (the sampler's log-probs)")
+    ids = context.get("sampler_topk_ids_shifted")
+    log_probs = context.get("sampler_topk_log_probs_shifted")
+    if not torch.is_tensor(ids) or ids.dtype == torch.bool or ids.is_floating_point() or ids.is_complex():
+        raise ValueError("score_centering requires integer context 'sampler_topk_ids_shifted' [..., k], -1 padding")
+    if not torch.is_tensor(log_probs) or not log_probs.is_floating_point():
+        raise ValueError("score_centering requires floating-point context 'sampler_topk_log_probs_shifted' [..., k]")
+    if tuple(ids.shape) != tuple(log_probs.shape) or ids.ndim < 2 or ids.shape[-1] < 1:
+        raise ValueError(
+            "sampler_topk_ids_shifted and sampler_topk_log_probs_shifted must share one [..., k] shape with k >= 1, "
+            f"got {tuple(ids.shape)} and {tuple(log_probs.shape)}"
+        )
+    return True
+
+
+def _reject_unsupported_score_centering(values: dict, context: dict) -> None:
+    """Score centering is derived for one fixed token weight on the sampler ratio, ``-sg(w(p/q)) A log p``."""
+    if not values["use_cispo_loss"] or values["use_sapo_loss"]:
+        raise ValueError("score_centering composes with the CISPO policy term; it needs use_cispo_loss=True")
+    if values["importance_sampling_level"] != "token":
+        raise ValueError("score_centering needs importance_sampling_level='token'")
+    if values["prox_logp_method"] != PROX_LOGP_METHOD_RECOMPUTE or context.get("prox_logp_shifted") is not None:
+        raise ValueError("score_centering needs the sampler as the proximal policy (prox_logp_method='recompute')")
+    if values["m2_threshold"] is not None or values["ratio_masks"] is not None:
+        raise ValueError("score_centering does not support M2PO or ratio masks")
+    if context.get("nll_mask") is not None or context.get("rollout_is_weights") is not None:
+        raise ValueError("score_centering does not support nll_mask or rollout_is_weights")
+
+
+def _score_centering_weight_bounds(
+    eps_clip: float, eps_clip_higher: float | None, is_weight_clip_max: float | None
+) -> tuple[float, float]:
+    """The ``[low, high]`` clamp CISPO applies to the token ratio ``p/q``."""
+    if is_weight_clip_max is not None:
+        return 0.0, float(is_weight_clip_max)
+    return 1.0 - eps_clip, 1.0 + (eps_clip if eps_clip_higher is None else eps_clip_higher)
+
+
+def _score_centering_center(
+    group_log_probs: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sampler_topk_log_probs: torch.Tensor,
+    mask: torch.Tensor,
+    weight_low: float,
+    weight_high: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Per token ``Σ_{v∈H} sg[m_v - α p_v] log p_v``, the sampler-weighted expected score (arXiv 2609.20807).
+
+    ``H`` is the sampler's top-k at the prefix and the tail outside it is modeled as the trainer's, rescaled by
+    ``ρ = (1 - Σ_H q) / (1 - Σ_H p)``. Under the weight ``w(r) = clamp(r, low, high)`` on ``r = p/q``, the mass
+    ``q·w`` is ``m_v = clamp(p_v, low·q_v, high·q_v)`` on ``H`` and ``α p_v`` with ``α = clamp(1, low·ρ, high·ρ)``
+    on the tail, and ``Σ_v p_v ∇log p_v = 0`` folds the tail into the head. The term is zero when ``p = q``.
+    """
+    k = topk_ids.shape[-1]
+    head_log_p = group_log_probs[..., :k]
+    valid = (topk_ids >= 0) & torch.isfinite(sampler_topk_log_probs) & mask.unsqueeze(-1)
+    p = torch.where(valid, head_log_p.detach().float().exp(), 0.0)
+    q = torch.where(valid, sampler_topk_log_probs.float().exp(), 0.0)
+    rho = (1.0 - q.sum(-1)).clamp_min(0.0) / group_log_probs[..., k].detach().float().exp().clamp_min(1e-6)
+    # inf * 0 is NaN, so an unbounded side is expressed without the product.
+    high_q = q * weight_high if math.isfinite(weight_high) else torch.full_like(q, math.inf)
+    high_rho = rho * weight_high if math.isfinite(weight_high) else torch.full_like(rho, math.inf)
+    head_mass = torch.minimum(torch.maximum(p, weight_low * q), high_q)
+    alpha = torch.minimum(torch.maximum(torch.ones_like(rho), weight_low * rho), high_rho)
+    coef = torch.where(valid, head_mass - alpha.unsqueeze(-1) * p, 0.0)
+    center = (coef * torch.where(valid, head_log_p.float(), 0.0)).sum(-1)
+    metrics = {
+        "score_centering_token_count": float(mask.sum()),
+        "score_centering_sampler_head_mass_sum": float(q.double().sum()),
+        "score_centering_trainer_head_mass_sum": float(p.double().sum()),
+        "score_centering_coef_abs_sum": float(coef.double().abs().sum()),
+    }
+    return center, metrics
+
+
+def _score_centering_inputs(model_outputs: dict, context: dict, logprobs: torch.Tensor) -> dict:
+    """The trainer's grouped log-probs and the sampler's top-k in ``logprobs``' layout plus a candidate axis.
+
+    Padded calls carry ``[B, S, k]``; packed calls ``[1, T, k]`` or ``[T, k]`` next to 1-D ``[T]`` logprobs.
+    """
+    ids = context["sampler_topk_ids_shifted"]
+    sampler_log_probs = context["sampler_topk_log_probs_shifted"]
+    grouped = model_outputs.get("group_log_probs")
+    if grouped is None:
+        raise ValueError(
+            "score_centering requires model output 'group_log_probs'; configure a chunked logprob head "
+            "(fused_lm_head_token_chunk_size)"
+        )
+    k = ids.shape[-1]
+    positions = logprobs.numel()
+    if ids.numel() != positions * k or grouped.numel() != positions * (k + 1):
+        raise ValueError(
+            f"score_centering inputs do not cover the {tuple(logprobs.shape)} logprobs: sampler_topk_ids_shifted "
+            f"{tuple(ids.shape)}, group_log_probs {tuple(grouped.shape)} (expected k + 1 = {k + 1} candidates)"
+        )
+    shape = (*logprobs.shape, k)
+    return {
+        "group_log_probs": grouped.reshape(*logprobs.shape, k + 1),
+        "sampler_topk_ids": ids.to(logprobs.device).reshape(shape),
+        "sampler_topk_log_probs": sampler_log_probs.to(logprobs.device).reshape(shape),
+    }
+
+
+def _grpo_model_forward_callback(model_kwargs: dict, context: dict, config: dict, output_keys: list[str]) -> None:
+    """With ``score_centering``, ask the chunked head for full-vocabulary log-probs at the sampler's top-k."""
+    if config.get("score_centering") is not True or not model_kwargs.get("dss_compute_logprobs"):
+        return
+    ids = context.get("sampler_topk_ids_shifted")
+    if not torch.is_tensor(ids):
+        raise ValueError("score_centering requires integer context 'sampler_topk_ids_shifted' [..., k], -1 padding")
+    reference = context["input_ids"]
+    model_kwargs["group_token_ids"] = ids.to(device=reference.device, dtype=torch.long).reshape(
+        *reference.shape, ids.shape[-1]
+    )
+    if "group_log_probs" not in output_keys:
+        output_keys.append("group_log_probs")
+
+
 def _per_token_sampler_kl_weights(weights: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor | None:
     """``sampler_kl_weights`` per token of padded ``[B, S]`` ``like``: a ``[B]`` tensor gives each row's tokens its
     value. Packed calls hold it per token already (``ROW_BROADCAST_KEYS`` in ``arctic_platform.common.packing``)."""
@@ -400,6 +534,7 @@ def _internal_grpo_loss_fn(
     sampler_kl_coef: float = 0.0,
     sampler_kl_type: str = "k1",
     sampler_kl_ratio_cap: float = 5.0,
+    score_centering: bool = False,
     prompt_group_ids: torch.Tensor | None = None,
     prompt_token_counts: torch.Tensor | None = None,
     sequence_loss_weights: torch.Tensor | None = None,
@@ -496,6 +631,8 @@ def _internal_grpo_loss_fn(
             )
         if sampler_kl_coef > 0.0:
             metrics.update(sampler_kl_coef=sampler_kl_coef, sampler_kl_token_count=0.0, sampler_kl_sum=0.0)
+        if score_centering:
+            metrics.update(dict.fromkeys(_SCORE_CENTERING_METRIC_NAMES, 0.0))
         return zero_loss, metrics
 
     # Degenerate-shard logprob sanitization. Under Ulysses SP a short/padded batch
@@ -567,6 +704,8 @@ def _internal_grpo_loss_fn(
             metrics.update(nll_trainable_token_count=0.0, nll_sum=0.0)
         if sampler_kl_coef > 0.0:
             metrics.update(sampler_kl_coef=sampler_kl_coef, sampler_kl_token_count=0.0, sampler_kl_sum=0.0)
+        if score_centering:
+            metrics.update(dict.fromkeys(_SCORE_CENTERING_METRIC_NAMES, 0.0))
     else:
         if use_sapo_loss and use_cispo_loss:
             raise ValueError("use_sapo_loss and use_cispo_loss are mutually exclusive.")
@@ -713,6 +852,31 @@ def _internal_grpo_loss_fn(
             )
             loss = loss + sampler_kl_coef * sampler_kl_loss
 
+        score_centering_metrics: dict[str, float] = {}
+        if score_centering:
+            center, score_centering_metrics = _score_centering_center(
+                input_data["group_log_probs"],
+                input_data["sampler_topk_ids"],
+                input_data["sampler_topk_log_probs"],
+                loss_mask,
+                *_score_centering_weight_bounds(eps_clip, eps_clip_higher, is_weight_clip_max),
+            )
+            # -A (w log p_y - center): the policy term already holds -w A log p_y under the same aggregation.
+            score_centering_loss = agg_loss(
+                torch.where(loss_mask, advantages, 0.0) * center,
+                loss_mask,
+                loss_agg_mode=loss_agg_mode,
+                dp_size=dp_size,
+                batch_num_tokens=batch_num_tokens,
+                global_batch_size=global_batch_size,
+                loss_scale_factor=loss_scale_factor,
+                prompt_group_ids=prompt_group_ids,
+                prompt_token_counts=prompt_token_counts,
+                sequence_loss_weights=sequence_loss_weights,
+                cu_seqlens=input_data.get("cu_seqlens"),
+            )
+            loss = loss + score_centering_loss
+
         stats_mask = loss_mask if nll_mask is None else loss_mask & ~nll_mask
         sampler_kl_metrics = {}
         if sampler_kl_coef > 0.0:
@@ -732,6 +896,7 @@ def _internal_grpo_loss_fn(
         metrics["grpo_entropy_sum"] = float(torch.where(stats_mask, entropy.double(), 0.0).sum())
         metrics.update(stat.get("ratio_mask_metrics", {}))
         metrics.update(sampler_kl_metrics)
+        metrics.update(score_centering_metrics)
         if nll_mask is not None:
             metrics.update(
                 nll_trainable_token_count=float(nll_mask.sum()),
@@ -869,6 +1034,7 @@ _GRPO_CONFIG_DEFAULTS: dict[str, Any] = {
     "sampler_kl_coef": 0.0,
     "sampler_kl_type": "k1",
     "sampler_kl_ratio_cap": 5.0,
+    "score_centering": False,
 }
 _ECHO_CONFIG_DEFAULTS: dict[str, Any] = {
     "aux_ce_weight": None,
@@ -1007,6 +1173,9 @@ def _grpo_loss(
     )
     values["ratio_masks"] = RatioMasks.from_config(config)
     values["dp_size"] = _resolve_dp_size(values["dp_size"], values["batch_num_tokens"])
+    values["score_centering"] = _resolve_score_centering(config, context)
+    if values["score_centering"]:
+        _reject_unsupported_score_centering(values, context)
 
     logprobs = model_outputs.get("logprobs")
     if logprobs is None:
@@ -1126,6 +1295,8 @@ def _grpo_loss(
                 "teacher_log_probs_shifted must exactly match prediction-aligned logprobs shape, "
                 f"got {tuple(teacher_log_probs.shape)} and {tuple(logprobs.shape)}"
             )
+    if values["score_centering"]:
+        input_data.update(_score_centering_inputs(model_outputs, context, logprobs))
     sampler_kl_weights = _per_token_sampler_kl_weights(input_data["sampler_kl_weights"], logprobs)
     input_data["sampler_kl_weights"] = sampler_kl_weights
     if sampler_kl_weights is not None and sampler_kl_weights.shape != logprobs.shape:
@@ -1559,6 +1730,7 @@ def _grpo_registration(variant: _GrpoVariant, validator, *, mixed: bool = False,
         "validation_callback": partial(_grpo_validation_callback, validator=validator, variant=variant),
         "packed_loss_reduction": partial(_grpo_packed_loss_reduction, variant=variant, mixed=mixed, echo=echo),
         "model_call_count_callback": _grpo_model_call_count_callback,
+        "model_forward_callback": _grpo_model_forward_callback,
         "metrics_callback": _grpo_metrics_callback,
     }
 
