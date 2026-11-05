@@ -331,6 +331,35 @@ def test_prediction_export_wrappers_release_tensors_before_next_gather(monkeypat
     assert all(reference() is None for reference in references)
 
 
+def test_preserved_sidecar_releases_tensor_before_reading_next(monkeypatch):
+    import gc
+    import weakref
+    from types import SimpleNamespace
+
+    import torch
+
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+
+    references = []
+
+    def weights():
+        for index in range(2):
+            gc.collect()
+            assert all(reference() is None for reference in references), "sidecar retained the previous tensor"
+            tensor = torch.ones(4)
+            references.append(weakref.ref(tensor))
+            yield f"mtp.{index}", tensor
+            del tensor
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    preserved = SimpleNamespace(names=frozenset({"mtp.0", "mtp.1"}), weights=weights())
+    iterator = mtp_weights.finish_preserved_weight_export(preserved, set(), description="MTP")
+    for _, tensor in iterator:
+        del tensor
+    gc.collect()
+    assert all(reference() is None for reference in references)
+
+
 @pytest.mark.parametrize("family", ["generic", "qwen35", "qwen38"])
 def test_configured_mtp_is_exported_by_each_qwen_adapter(tmp_path, monkeypatch, family):
     import torch

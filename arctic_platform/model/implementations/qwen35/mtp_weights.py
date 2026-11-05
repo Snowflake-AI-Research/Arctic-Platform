@@ -208,6 +208,7 @@ def finish_preserved_weight_export(preserved, emitted: set[str], *, description:
         if is_master:
             for name, tensor in preserved.weights:
                 yield name, tensor
+                del tensor
     except BaseException as exc:
         cause = exc
         failure[0] = f"{type(exc).__name__}: sidecar export interrupted: {exc}"
