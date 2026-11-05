@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import sys
 import types
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 if "ray" not in sys.modules:
@@ -269,3 +271,38 @@ def test_bucket_transfer_chunks_and_reassembles_oversized_tensor(monkeypatch):
     torch.testing.assert_close(
         received["tail"], torch.tensor([10, 11], dtype=torch.uint8)
     )
+
+
+@pytest.mark.parametrize("direct", [False, True])
+def test_sender_lets_go_of_each_tensor_before_asking_for_the_next(monkeypatch, direct):
+    # An expert-parallel export gathers its next tensor when asked for it; the sender must not still hold this one.
+    monkeypatch.setattr(torch.cuda, "Event", _FakeEvent)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: _FakeStream())
+    sender = NCCLEngine.__new__(NCCLEngine)
+    sender.is_sender = True
+    sender.device = torch.device("cpu")
+    sender.bucket_size = 4
+    sender._port = 1234
+    sender._nccl_stream = _FakeStream()
+    sender._data_bufs = [torch.zeros(4, dtype=torch.uint8), torch.zeros(4, dtype=torch.uint8)]
+    sender.ensure_staging_buffers = lambda: None
+    sender._flush_bucket_send = lambda idx, meta, *, is_last, prev_idx: None
+    sender._send_one_direct = lambda name, w, stream: None
+    sender._write_meta = lambda idx, entries, *, is_last: None
+    sender._meta_bufs = [None]
+    sender._send_buf = lambda buf, stream: None
+    still_held = []
+
+    def gathered():
+        previous = None
+        for size in (10, 2, 10, 2):  # with a 4-byte bucket: chunked and packed tensors
+            if previous is not None:
+                still_held.append(previous() is not None)
+            tensor = torch.arange(size, dtype=torch.uint8)
+            previous = weakref.ref(tensor)
+            yield f"w{size}", tensor
+            del tensor
+
+    (sender.send_weights_direct if direct else sender.send_weights)(gathered())
+
+    assert still_held == [False, False, False]
