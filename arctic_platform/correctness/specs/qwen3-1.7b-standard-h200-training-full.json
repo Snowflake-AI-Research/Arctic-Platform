@@ -1,0 +1,61 @@
+{
+  "applicable_tests": [
+    "single-step-grads"
+  ],
+  "arms": [
+    {
+      "active_tokens": 34513,
+      "dss_microbatches": 1,
+      "global_batch_size": 8,
+      "max_seq_len": 8192,
+      "name": "gas1",
+      "pad_fraction": 0.4733734130859375,
+      "total_tokens": 65536
+    },
+    {
+      "active_tokens": 138065,
+      "dss_microbatches": 4,
+      "global_batch_size": 32,
+      "max_seq_len": 8192,
+      "name": "gas4",
+      "pad_fraction": 0.4733238220214844,
+      "total_tokens": 262144
+    }
+  ],
+  "attn_implementations": [
+    "flash_attention_3"
+  ],
+  "config_checksum": "fecc7d15d6d8b3b44b9080758e680b1a6b2157c3eda9b111144257b3f0a3286d",
+  "config_id": "qwen3-1.7b-standard-h200-training-full",
+  "config_path": "arctic_platform/correctness/configs/qwen3-1.7b/standard/h200-training-full.json",
+  "inapplicable": {},
+  "model": {
+    "cache_path": "/data-fast/base-models/synthetic/Qwen3-1.7B-4L",
+    "content_hash": "4239e04f254b448c",
+    "measured_reference_peak_gib": 4.243318557739258,
+    "num_hidden_layers": 4,
+    "param_count": 512510976,
+    "seed": 0,
+    "sized_against_gib": 100.0,
+    "source_checkpoint": "Qwen/Qwen3-1.7B",
+    "vision_depth": 2
+  },
+  "notes": [
+    "Single-GPU reference uses flash_attention_3 with 4 complete-cycle layers and peaks at 4.243 GiB."
+  ],
+  "param_name_map": {},
+  "test_settings": {},
+  "test_tolerances": {
+    "single-step-grads": {
+      "absolute": 0.009,
+      "calibration_runs": 8,
+      "computed_gate": 0.008525848388671875,
+      "minimum_gate": 0.001,
+      "multiplier": 4.0,
+      "raw_max_same_tensor_range": 0.0021314620971679688,
+      "rounding_quantum": 0.001,
+      "status": "calibrated from 8 nondeterministic reference executions per specification arm; 4x rounded upward in 1e-3 units",
+      "worst_tensor": "model.layers.0.self_attn.q_norm.weight"
+    }
+  }
+}

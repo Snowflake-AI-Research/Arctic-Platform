@@ -218,14 +218,14 @@ def _sampling_payload(ctx, model_path, token_budget: int) -> dict:
             tensor_parallel_size=tensor,
             pipeline_parallel_size=pipeline,
             enable_expert_parallel=_has_routed_experts(ctx),
-            extra_engine_kwargs={
-                "distributed_executor_backend": "ray",
-                "data_parallel_size": 1,
-                "prefill_context_parallel_size": 1,
-                "decode_context_parallel_size": 1,
-                "enable_eplb": False,
-                "enable_elastic_ep": False,
-            },
+        )
+        payload["inference_config"]["vllm_config"]["extra_engine_kwargs"].update(
+            distributed_executor_backend="ray",
+            data_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_eplb=False,
+            enable_elastic_ep=False,
         )
         if ctx.cfg.model_name == "Qwen/Qwen3.8-Flash-Next":
             payload["inference_config"]["vllm_config"]["extra_engine_kwargs"]["engram_config"] = {

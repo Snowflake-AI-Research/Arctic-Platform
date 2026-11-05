@@ -79,10 +79,10 @@ def test_worker_moe_spec_preserves_glm53_recipe_and_input(tmp_path, worker_confi
 @pytest.mark.parametrize(
     "relative",
     [
-        "glm5.3-flash-bf16/h200/train-sft-16gpus-sp16-256k.config",
-        "glm5.3-flash-bf16/h200/train-rl-32gpus-sp16-256k.config",
-        "glm5.3-flash/h200/train-sft-lora-8gpus-sp8-256k.config",
-        "glm5.3-flash/h200/train-rl-lora-16gpus-sp8-256k.config",
+        "glm-5.3-flash-bf16/long/h200-training-full.json",
+        "glm-5.3-flash-bf16/long/h200-training-full--rl-32gpus-sp16-256k.json",
+        "glm-5.3-flash/long/h200-training-lora.json",
+        "glm-5.3-flash/long/h200-training-lora--rl-16gpus-sp8-256k.json",
     ],
 )
 def test_worker_moe_spec_current_glm_recipes(tmp_path, relative):

@@ -84,7 +84,7 @@ config = {
     },
 }
 Path("./work/configs/tiny-qwen3-129m-one-h200.json").write_text(
-    json.dumps(config, indent=2) + "\n"
+    json.dumps(config, indent=2, sort_keys=True) + "\n"
 )
 PY
 ```
@@ -105,7 +105,7 @@ All subsequent commands run from the checkout root.
 python -m arctic_platform.correctness onboard --config ./work/configs/tiny-qwen3-129m-one-h200.json
 ```
 
-**Inspect the generated specification and onboarding summary before accepting the gates.** They are `arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.json` and `arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.onboarding.json`. The summary records each check's result and diagnostic directory, plus any combined-reference preparation error. Compact measurements default to `arctic_platform/correctness/reference_data`; no model or adapter tensors belong in Git. The new config name keeps this demo separate from existing 8B configs and their reference records.
+**Inspect the generated specification and onboarding summary before accepting the gates.** In this checkout, the migrated manifest retains `tiny-qwen3-129m-one-h200`, so the files are `arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.json` and `arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.onboarding.json`. Without that manifest entry, use the path-derived ID printed by onboarding. The imported config is `configs/tiny-qwen3-129m/standard/h200-training-full.json`, and compact measurements use `reference_data/tiny-qwen3-129m/standard/h200-training-full/<check-id>/...`. No model or adapter tensors belong in Git; moving placement does not remeasure historical records.
 
 **Onboarding numbers the queued checks: `### Onboarding 1/2: Single Step Grads ###`, then `### Onboarding 2/2: Single Step Optimizer ###` for this demo.** Inner phases retain `***` markers. A single selected check uses `1/1` when its fixture already exists; prerequisite gradient onboarding is included in the total when needed.
 
@@ -119,7 +119,7 @@ python -m arctic_platform.correctness onboard --config ./work/configs/tiny-qwen3
 
 **To onboard only one check, add `--test single-step-grads` or `--test single-step-optimizer`.** Missing fixture prerequisites are handled automatically. An RL config is reported as inapplicable for these two supervised-reference checks; onboarding does not manufacture SFT measurements for RL.
 
-**The supplied config is copied into the checkout first, with its filename unchanged.** External `.json` and `.config` files are imported byte for byte into `arctic_platform/correctness/configs/`, then treated as local configs. Identical copies are reused; different contents under an existing local filename are rejected without overwriting it. No automatic Git commit is made.
+**The supplied config is copied byte for byte into the checkout's hierarchical config tree.** Recipes below `cortex-training/model-catalog/models/` retain their complete relative path under `arctic_platform/correctness/configs/`. Other `.json` and `.config` files use `<model-name>/<standard|long>/<gpu>-<training|inference>-<full|lora>.json`; the [layout contract](hf-reference-onboarding.md#configuration-and-reference-layout) defines those components. Compact reference folders mirror that relative path without the extension. Identical copies are reused; different contents at the same destination are rejected without overwriting. No automatic Git commit is made.
 
 **Existing Cortex-training recipes with `sub_job_configs` are accepted directly, alongside native client configs.** Point the same onboarding command at the recipe JSON; do not flatten or rewrite it. Import preserves the original bytes, training topology, sequence limit, optimizer, offload settings and weight format. The first-two checks still use their reduced reference fixture and existing correctness token cap, not a full-model or maximum-sequence-length run. A recipe with training and sampling sub-jobs remains classified as RL and is inapplicable to these two supervised checks.
 
@@ -128,7 +128,7 @@ python -m arctic_platform.correctness onboard \
   --config ../cortex-training/model-catalog/models/qwen3.8-flash-next/long/h200-training-full.json
 ```
 
-**Use the recipe path present in your Cortex-training checkout.** The model catalog replaced `recipes/sft/configs/qwen38_flash_next.json`; the example above selects the Qwen3.8-Flash-Next full-training config for eight H200 GPUs and 256K context. Onboarding requires an existing file and does not resolve deleted recipe paths automatically. The imported filename is `h200-training-full.json`; use a distinct filename when importing a different recipe with that same basename.
+**Use the recipe path present in your Cortex-training checkout.** The model catalog replaced `recipes/sft/configs/qwen38_flash_next.json`; the example above selects the Qwen3.8-Flash-Next full-training config for eight H200 GPUs and 256K context. Onboarding requires an existing file and does not resolve deleted Cortex recipe paths automatically. Its imported path is `configs/qwen3.8-flash-next/long/h200-training-full.json`, so other models or sequence choices can retain the same recipe basename without colliding.
 
 ## Step 4. Run Config Tests
 
@@ -136,7 +136,7 @@ python -m arctic_platform.correctness onboard \
 
 ```bash
 python -m arctic_platform.correctness run \
-  --config ./work/configs/tiny-qwen3-129m-one-h200.json \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full.json \
   --out ./work/reports/output1
 ```
 
@@ -166,7 +166,8 @@ It shouldn't be needed for model archs that have already been onboarded in the p
 
 ```text
 Use skills/correctness/SKILL.md to fix onboarding for
-./work/configs/tiny-qwen3-129m-one-h200.json, then run its applicable tests.
+arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full.json,
+then run its applicable tests.
 Discover the environment, reports, logs and prepared artifacts yourself.
 ```
 
@@ -207,7 +208,7 @@ rm -r ./work/reports/output1/
 
 ```bash
 python -m arctic_platform.correctness run \
-  --config arctic_platform/correctness/configs/tiny-qwen3-129m-one-h200.json \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full.json \
   --out ./work/reports/output1
 ```
 

@@ -2,6 +2,28 @@
 
 **This guide describes maintained reference preparation and regression, not a particular fleet run.** Start with the [operator guide](running-tests.md) for setup and copyable commands. The [documentation index](../../../docs/correctness.md) lists the maintained guides. Local run history and numerical results belong in the uncommitted `correctness-progress.md` at the repository root, not in installation instructions.
 
+## Configuration And Reference Layout
+
+**Catalog imports preserve the entire recipe path below `cortex-training/model-catalog/models/`.** Replace that prefix with `arctic_platform/correctness/configs/`, keeping every remaining directory and the filename exactly. For example, `cortex-training/model-catalog/models/qwen3.5-2b/standard/h200-inference-lora.json` imports as `arctic_platform/correctness/configs/qwen3.5-2b/standard/h200-inference-lora.json`. Import recipe JSON, not the catalog's `model.json` metadata; copying a recipe must not rewrite fields, reformat JSON or otherwise change its bytes.
+
+**Only noncatalog configs use derived placement: `<model-name>/<standard|long>/<gpu>-<training|inference>-<full|lora>.json`.** Derive each component from the supplied recipe:
+
+- `<model-name>` is the lowercase model basename, without its repository owner: `Qwen/Qwen3-8B` becomes `qwen3-8b`. For a Hugging Face (HF) cache snapshot, use the model component, not the snapshot hash.
+- `long` requires an explicitly configured `max_tokens_per_mb >= 262144`, including a catalog-style training sub-job's `mb_spec.max_tokens_per_mb` or native `training.ds_worker_config.mb_spec.max_tokens_per_mb`. Missing or smaller budgets mean `standard`; `max_seq_len`, an old filename containing `256k`, and runtime defaults do not select `long`.
+- `training` takes precedence when training and sampling jobs both exist; a sampling-only job uses `inference`. Placement does not change whether a training-plus-sampling recipe is reinforcement learning (RL).
+- `lora` means the selected job has nonempty parameter-efficient fine-tuning (PEFT) settings for low-rank adaptation (LoRA); otherwise use `full`. Inspect the selected training or sampling job, not an unrelated sub-job.
+- `<gpu>` comes from explicit recipe hardware, an existing accelerator directory or filename, or the executing GPU. If none identifies the hardware, report the missing prerequisite rather than guess a GPU type.
+
+**Reference folders mirror the config-relative path with the extension removed.** A config at `configs/qwen3-8b/standard/h200-training-full.json` uses `reference_data/qwen3-8b/standard/h200-training-full/<check-id>/...`. An explicit `--reference-records-dir` changes only the root prefix; the model, sequence-choice and recipe-stem directories remain. Check-specific subdirectories and measurement filenames are unchanged.
+
+**The `arctic_platform/correctness/config-layout.json` manifest preserves existing frozen config IDs independently of placement.** Moving an existing config or its reference folder does not rename its specification, relabel recorded numerical identities, remeasure references or rewrite historical measurement bytes. Use the manifest-backed ID shown by `list` and the command's resolved config output; do not infer an existing ID from the new directory name. A placement-only move is not reference preparation and does not make a historically incompatible identity compatible.
+
+**Old correctness-config paths remain aliases only within their original config root.** Frozen specifications can still locate migrated configs through the manifest. A deleted source recipe under `cortex-training/model-catalog/models/` is not such an alias; importing that source still requires the recipe file to exist.
+
+**Distinct existing recipes retain explicit descriptive `--<variant>` filename suffixes when their derived placements collide.** For example, different training recipes may use `h200-training-full--sft-16gpus-sp16-256k.json` and `h200-training-full--rl-32gpus-sp16-256k.json`. Their reference folders include those suffixes, but their frozen IDs remain unchanged. New imports reuse an identical existing copy and error on conflicting bytes. For a noncatalog variant, append a lowercase descriptive suffix such as `--rl-16gpus` to the source filename stem before importing; the importer retains that suffix in the derived recipe filename. Catalog imports still retain their exact catalog-relative filenames.
+
+**Sampling-only recipes can be imported, but the existing correctness checks require training.** Preserve an inference-only catalog recipe's sampling settings and catalog placement. Import acceptance is not numerical onboarding or runtime validation: a training-based check must reject a recipe without a training sub-job before preparing model assets.
+
 ## Prepare Once
 
 ### Automatic Local Validation And Retry
@@ -14,7 +36,7 @@
 
 ### Automatic LoRA Initialization
 
-**First-two reference preparation detects LoRA settings directly from the supplied config.** Native `training.peft` or `training.ds_worker_config.peft_config` enables automatic generation; a config without LoRA settings remains full fine-tuning. Generation uses upstream PEFT's default initializer and seed `42`, with a metadata-only base architecture and CPU adapter factors. Production PEFT code does not call a correctness initializer. Cortex-training currently has no admitted shared-adapter target-loading route, so LoRA target onboarding and regression remain unsupported. [The operator guide](running-tests.md#lora-without-adapter-inputs) distinguishes reference generation from target support.
+**First-two reference preparation detects LoRA settings directly from the supplied config.** Native `training.peft` or `training.ds_worker_config.peft_config` enables automatic generation; a config without LoRA settings remains full fine-tuning. Onboarding and regression use upstream PEFT's default initializer with the explicit harness seed `1234`, a metadata-only base architecture and CPU adapter factors. Production PEFT code does not call a correctness initializer. Cortex-training currently has no admitted shared-adapter target-loading route, so LoRA target onboarding and regression remain unsupported. [The operator guide](running-tests.md#lora-without-adapter-inputs) distinguishes reference generation from target support.
 
 **Compact records bind generated values, not filesystem paths.** The initialization identity contains the recipe, exact dependency versions, topology, tensor shapes/dtypes and content hashes. Regression reconstructs those factors and requires the original reviewed reference identity; it never measures HF again to accommodate changed factors. Stage the config and reviewed specification only; compact measurements remain local and Git-ignored, while adapter, model and optimizer tensors stay on fast storage.
 
@@ -37,19 +59,19 @@ python -m arctic_platform.correctness onboard \
 - `single-step-optimizer`: step-one Adam first-moment, second-moment, and update-residual L2 norms, with canonical parameter names and shapes.
 - `e2e-sft-train-validate`: 100 training losses and gradient norms, optimizer-step count, held-out validation cross-entropy, and scored-answer-token count.
 
-**Each workload folder retains only its latest complete reference set.** Compact records default to the local, Git-ignored `arctic_platform/correctness/reference_data` directory; they are generated artifacts, not files to commit. Override the directory with `--reference-records-dir` on both onboarding and regression. Publication requires a location inside the checkout, not Git tracking. [storage.py](../harness/storage.py) uses readable filenames:
+**Each workload folder retains only its latest complete reference set.** Compact records default to the local, Git-ignored `arctic_platform/correctness/reference_data` directory; they are generated artifacts, not files to commit. Override the directory with `--reference-records-dir` on both onboarding and regression. Publication requires a location inside the checkout, not Git tracking. For `configs/qwen3-8b/standard/h200-training-full.json`, the readable filenames below are relative to that reference root:
 
 ```text
-<config-id>/single-step-grads/gradients-only/gas1.json
-<config-id>/single-step-grads/gradients-only/gas4.json
-<config-id>/single-step-grads/with-optimizer/gas1.json
-<config-id>/single-step-grads/with-optimizer/gas4.json
-<config-id>/single-step-optimizer/gas1.json
-<config-id>/single-step-optimizer/gas4.json
-<config-id>/e2e-sft-train-validate/trajectory.json
+qwen3-8b/standard/h200-training-full/single-step-grads/gradients-only/gas1.json
+qwen3-8b/standard/h200-training-full/single-step-grads/gradients-only/gas4.json
+qwen3-8b/standard/h200-training-full/single-step-grads/with-optimizer/gas1.json
+qwen3-8b/standard/h200-training-full/single-step-grads/with-optimizer/gas4.json
+qwen3-8b/standard/h200-training-full/single-step-optimizer/gas1.json
+qwen3-8b/standard/h200-training-full/single-step-optimizer/gas4.json
+qwen3-8b/standard/h200-training-full/e2e-sft-train-validate/trajectory.json
 ```
 
-**Replacement never deletes the previous set before preparation succeeds.** Preparation validates every selected arm and writes the complete replacement to a temporary directory. Under a per-configuration lock, publication renames the old configuration directory aside, renames the new directory into place, then deletes the old directory without automatic archival. The published layout uses ordinary directories, not symbolic links. Failed or incomplete staging leaves the previous set intact; a failed second rename restores the old directory. The next read or publication recovers an interrupted replacement and removes abandoned staging. Unselected workloads remain unchanged.
+**Replacement never deletes the previous set before preparation succeeds.** Preparation validates every selected arm and writes the complete replacement to a temporary directory. Under a per-configuration lock, publication renames the old recipe reference directory aside, renames the new directory into place, then deletes the old directory without automatic archival. The published layout uses ordinary directories, not symbolic links. Failed or incomplete staging leaves the previous set intact; a failed second rename restores the old directory. The next read or publication recovers an interrupted replacement and removes abandoned staging. Unselected workloads remain unchanged. This explicit preparation operation is separate from byte-preserving layout migration.
 
 **Readable filenames do not weaken reference validation.** Every JSON record retains its complete workload identity and measurement checksum. The identity binds the config, reference sources and dependency versions, model contents, initialization, input tensors and check-specific options, not machine-specific cache roots. Changed identities require explicit preparation; regression cannot regenerate references. Different measurements for an identical identity remain a publication conflict. Existing SHA-named records can be consumed only by exact identity; successful preparation removes validated legacy generations for the workloads being replaced.
 
@@ -59,15 +81,15 @@ python -m arctic_platform.correctness onboard \
 
 ```bash
 python -m arctic_platform.correctness onboard \
-  --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
+  --config arctic_platform/correctness/configs/qwen3-8b/standard/h200-training-full.json \
   --prepare-references --test-id single-step-grads
 
 python -m arctic_platform.correctness onboard \
-  --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
+  --config arctic_platform/correctness/configs/qwen3-8b/standard/h200-training-full.json \
   --prepare-references --test-id single-step-optimizer
 
 python -m arctic_platform.correctness onboard \
-  --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
+  --config arctic_platform/correctness/configs/qwen3-8b/standard/h200-training-full.json \
   --prepare-references --test-id e2e-sft-train-validate \
   --local-gateway-full-model
 ```
@@ -76,7 +98,7 @@ python -m arctic_platform.correctness onboard \
 
 ```bash
 python -m arctic_platform.correctness onboard \
-  --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
+  --config arctic_platform/correctness/configs/qwen3-8b/standard/h200-training-full.json \
   --prepare-references \
   --reference-tests single-step-grads single-step-optimizer
 ```
@@ -119,7 +141,7 @@ python -m arctic_platform.correctness onboard \
 
 ```bash
 python -m arctic_platform.correctness run \
-  --config arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config \
+  --config arctic_platform/correctness/configs/qwen3-8b/standard/h200-training-full.json \
   --test e2e-sft-train-validate --backend cortex-training \
   --base-url http://127.0.0.1:8003 --database dev --schema dev \
   --local-gateway-full-model --out ./work/reports/qwen3-8b-e2e

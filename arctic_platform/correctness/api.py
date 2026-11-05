@@ -31,8 +31,10 @@ from typing import Callable
 from typing import Sequence
 
 from .harness.config import config_id
+from .harness.config import config_paths
 from .harness.config import load_config
 from .harness.config import local_config_path
+from .harness.config import resolve_config_path
 from .harness.registry import TestOutcome
 from .harness.registry import TestResult
 from .harness.registry import registered_tests
@@ -103,7 +105,7 @@ def catalog(config_dir: Path | None = None) -> dict[str, Path]:
     """Active reviewed configurations, ordered by exact ID; archived files are excluded."""
     root = Path(config_dir) if config_dir is not None else PACKAGE_DIR / "configs"
     found = {}
-    paths = sorted(path for path in root.rglob("*") if path.is_file() and path.suffix in {".config", ".json"})
+    paths = config_paths(root)
     for path in paths:
         identifier = config_id(path)
         if {"archive", "specs"} & set(path.relative_to(root).parts):
@@ -131,7 +133,7 @@ def select(request: RunRequest) -> tuple[SelectedCase, ...]:
         selector = str(request.config)
         if selector in configs:
             paths = [configs[selector]]
-        elif Path(selector).is_file() and Path(selector).suffix in {".config", ".json"}:
+        elif resolve_config_path(selector).is_file() and Path(selector).suffix in {".config", ".json"}:
             paths = [local_config_path(selector, request.config_dir)]
         else:
             raise ValueError(f"unknown configuration: {selector}; use the list command or an existing config path")

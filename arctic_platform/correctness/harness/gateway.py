@@ -1574,11 +1574,13 @@ def sampling_payload(model_dir: str | Path, seed: int, *, dtype: str, n_gpus: in
             "vllm_config": {
                 "tensor_parallel_size": n_gpus,
                 "max_model_len": max_seq_len,
-                "dtype": dtype,
                 "trust_remote_code": True,
                 "gpu_memory_utilization": 0.85,
-                "disable_custom_all_reduce": True,
-                "enforce_eager": True,
+                "extra_engine_kwargs": {
+                    "dtype": dtype,
+                    "disable_custom_all_reduce": True,
+                    "enforce_eager": True,
+                },
             },
         },
     }

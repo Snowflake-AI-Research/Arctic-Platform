@@ -1241,6 +1241,8 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
 
 
 def _config_dir(ctx, identity: dict) -> Path:
+    from arctic_platform.correctness.harness.config import reference_config_subpath
+
     if (
         identity.get("check_id") not in CRITERIA
         or not isinstance(identity.get("config_id"), str)
@@ -1248,8 +1250,16 @@ def _config_dir(ctx, identity: dict) -> Path:
         or identity["config_id"] in {".", ".."}
     ):
         raise ReferencePrerequisiteError("invalid reference record config or check identity")
-    root = Path(getattr(ctx, "reference_records_dir", DEFAULT_RECORDS_DIR))
-    return root / identity["config_id"]
+    root = Path(getattr(ctx, "reference_records_dir", DEFAULT_RECORDS_DIR)).resolve()
+    config_path = getattr(getattr(ctx, "cfg", None), "path", None)
+    if config_path is None:
+        config_path = getattr(getattr(ctx, "spec", None), "config_path", None)
+    directory = root / reference_config_subpath(config_path, identity["config_id"])
+    if directory.is_symlink():
+        raise ReferencePrerequisiteError(f"reference directory must not be a symbolic link: {directory}")
+    if not directory.resolve().is_relative_to(root):
+        raise ReferencePrerequisiteError(f"reference destination must stay inside the reference root: {directory}")
+    return directory
 
 
 def _record_path(ctx, identity: dict) -> Path:
@@ -1432,7 +1442,7 @@ def _record_bytes(identity: dict, measurements: dict) -> bytes:
 
 def _remove_replaced_legacy_records(ctx, staged: Path, identities: list[dict]) -> None:
     replaced = {_record_path(ctx, identity).parent for identity in identities}
-    directory = _config_dir(ctx, identities[0])
+    expected_config_id = identities[0]["config_id"]
     for check_id in {identity["check_id"] for identity in identities}:
         for path in (staged / check_id).glob("*.json"):
             if re.fullmatch(r"[0-9a-f]{64}\.json", path.name) is None:
@@ -1441,7 +1451,7 @@ def _remove_replaced_legacy_records(ctx, staged: Path, identities: list[dict]) -
             identity = record["identity"]
             if (
                 record.get("schema") != SCHEMA_VERSION
-                or identity.get("config_id") != directory.name
+                or identity.get("config_id") != expected_config_id
                 or identity.get("check_id") != check_id
                 or path.name != _legacy_record_path(ctx, identity).name
                 or record.get("payload_sha256") != _digest(record.get("measurements"))
@@ -1463,7 +1473,7 @@ def publish_record_set(ctx, entries, *, expected_identities) -> dict[str, Path]:
     groups = {}
     for identity in expected:
         path = _record_path(ctx, identity)
-        if _config_dir(ctx, identity) != directory:
+        if identity["config_id"] != expected[0]["config_id"] or _config_dir(ctx, identity) != directory:
             raise ReferencePrerequisiteError("reference set must belong to one configuration")
         if path in prepared:
             raise ReferencePrerequisiteError("reference set has duplicate workload arms")

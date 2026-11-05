@@ -55,6 +55,7 @@ from .config import TestSpec
 from .config import arms_for
 from .config import config_checksum
 from .config import config_id
+from .config import config_paths
 from .config import load_config
 from .config import local_config_path
 from .config import local_gpu_type
@@ -83,7 +84,7 @@ def _resolve_configs(args, *, filter_by_local_gpu: bool = True) -> List[Path]:
     if getattr(args, "resolved_paths", None) is not None:
         return list(args.resolved_paths)
     if args.all_configs:
-        paths = sorted(Path(args.config_dir).rglob("*.config"))
+        paths = config_paths(Path(args.config_dir))
         if not filter_by_local_gpu or args.any_gpu:
             return paths
         gpu_type = local_gpu_type()

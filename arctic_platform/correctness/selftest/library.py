@@ -403,7 +403,7 @@ def test_cortex_recipe_import_preserves_bytes_settings_and_training_wire(tmp_pat
     raw = _cortex_recipe()
     if hardware is not None:
         raw["hardware"] = hardware
-    source = tmp_path / "external" / "qwen38_flash_next.json"
+    source = tmp_path / "external" / "h200-qwen38_flash_next.json"
     source.parent.mkdir()
     source.write_text(json.dumps(raw, indent=2) + "\n")
     imported = local_config_path(source, tmp_path / "configs")
@@ -418,8 +418,9 @@ def test_cortex_recipe_import_preserves_bytes_settings_and_training_wire(tmp_pat
     assert cfg.optimizer_dtype == "bfloat16"
     assert config_checksum(cfg) == config_checksum(load_config(source))
     client_config = training_client_config(cfg, CortexConfig(base_url="http://127.0.0.1:1"))
-    assert cfg.hardware == client_config.hardware == hardware
-    assert cfg.gpu_type == (hardware.lower() if hardware is not None else None)
+    assert cfg.hardware == hardware
+    assert client_config.hardware == (hardware or "H200")
+    assert cfg.gpu_type == (hardware.lower() if hardware is not None else "h200")
     wire = client_config.to_cortex()[0]
     assert wire["weight_format"] == "vllm"
     for key in ("sp_size", "ep_size", "ep_group_layout", "ac_config", "optimizer"):
@@ -533,7 +534,6 @@ def test_cortex_recipe_sampling_preserves_rl_classification(tmp_path):
         "empty",
         "nonlist",
         "nonobject",
-        "no_training",
         "duplicate",
         "bad_role",
         "no_model",
@@ -557,9 +557,6 @@ def test_cortex_recipe_invalid_inputs_fail_before_import(tmp_path, damage):
         raw["sub_job_configs"] = {}
     elif damage == "nonobject":
         raw["sub_job_configs"] = [None]
-    elif damage == "no_training":
-        sub["job_type"] = "sampling"
-        sub["inference_config"] = sub.pop("training_config")
     elif damage == "duplicate":
         raw["sub_job_configs"].append(sub)
     elif damage == "bad_role":
@@ -840,7 +837,8 @@ def test_config_gpu_attention_flash_next_rejects_generic_h200_attention(tmp_path
 
 def test_config_gpu_attention_flash_next_reviewed_recipe_keeps_training_settings() -> None:
     path = (
-        Path(__file__).resolve().parents[1] / "configs/qwen3.8-flash-next/h200/train-sft-full-16gpus-sp16-256k.config"
+        Path(__file__).resolve().parents[1]
+        / "configs/qwen3.8-flash-next/long/h200-training-full--sft-16gpus-sp16-256k.json"
     )
     config = load_config(path)
     validate_against_host(config, available_gpus=16, check_gpu_type=False)
@@ -875,7 +873,8 @@ def test_config_gpu_attention_flash_next_cortex_wire_preserves_all_training_fiel
     from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
 
     path = (
-        Path(__file__).resolve().parents[1] / "configs/qwen3.8-flash-next/h200/train-sft-full-16gpus-sp16-256k.config"
+        Path(__file__).resolve().parents[1]
+        / "configs/qwen3.8-flash-next/long/h200-training-full--sft-16gpus-sp16-256k.json"
     )
     native = load_config(path).native
     wire = CortexTrainingConfig.model_validate(native.model_dump(mode="json")).to_cortex()
@@ -906,11 +905,11 @@ def test_config_gpu_attention_flash_next_cortex_wire_preserves_all_training_fiel
 
 
 _FLASH_RECIPE_PATHS = {
-    "glm53-flash-bf16-rl-32gpus-256k": "glm5.3-flash-bf16/h200/train-rl-32gpus-sp16-256k.config",
-    "glm53-flash-bf16-sft-16gpus-256k": "glm5.3-flash-bf16/h200/train-sft-16gpus-sp16-256k.config",
-    "glm53-flash-lora-rl-16gpus-256k": "glm5.3-flash/h200/train-rl-lora-16gpus-sp8-256k.config",
-    "glm53-flash-lora-sft-8gpus-256k": "glm5.3-flash/h200/train-sft-lora-8gpus-sp8-256k.config",
-    "qwen38-flash-next-sft-16gpus-256k": "qwen3.8-flash-next/h200/train-sft-full-16gpus-sp16-256k.config",
+    "glm53-flash-bf16-rl-32gpus-256k": "glm-5.3-flash-bf16/long/h200-training-full--rl-32gpus-sp16-256k.json",
+    "glm53-flash-bf16-sft-16gpus-256k": "glm-5.3-flash-bf16/long/h200-training-full.json",
+    "glm53-flash-lora-rl-16gpus-256k": "glm-5.3-flash/long/h200-training-lora--rl-16gpus-sp8-256k.json",
+    "glm53-flash-lora-sft-8gpus-256k": "glm-5.3-flash/long/h200-training-lora.json",
+    "qwen38-flash-next-sft-16gpus-256k": "qwen3.8-flash-next/long/h200-training-full--sft-16gpus-sp16-256k.json",
 }
 
 
@@ -919,7 +918,7 @@ _FLASH_RECIPE_PATHS = {
     [
         *[(path, "sparse_mla", "sdpa") for recipe, path in _FLASH_RECIPE_PATHS.items() if recipe.startswith("glm53")],
         (_FLASH_RECIPE_PATHS["qwen38-flash-next-sft-16gpus-256k"], "qsa_flex", "qsa_flex"),
-        ("qwen3-8b/h200/train-sft-full-4gpus-64k.config", "flash_attention_3", "flash_attention_3"),
+        ("qwen3-8b/standard/h200-training-full.json", "flash_attention_3", "flash_attention_3"),
     ],
 )
 def test_reference_attention_preserves_native_recipe_and_target_backend(relative, target, reference):
@@ -1138,8 +1137,8 @@ def test_flash_recipe_qwen_rl_sampling16_tp8_cannot_use_single_engine_override()
 
 
 _CORRECTNESS_QWEN_FLASH_PATHS = {
-    "sft8": "qwen3.8-flash-next/h200/train-sft-full-8gpus-sp8-256k.config",
-    "rl32": "qwen3.8-flash-next/h200/train-rl-32gpus-sp16-256k.config",
+    "sft8": "qwen3.8-flash-next/long/h200-training-full.json",
+    "rl32": "qwen3.8-flash-next/long/h200-training-full--rl-32gpus-sp16-256k.json",
 }
 
 
@@ -2537,9 +2536,11 @@ def _dense_checkpoint_onboarding_cli(tmp_path):
     path = tmp_path / "dense-allocation.json"
     path.write_text(json.dumps(descriptor))
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    config_path = tmp_path / "dense.config"
+    config_path.write_text(json.dumps(_config_factory_native_config({"n_gpus": 16, "max_seq_len": 256})))
     argv = [
         "--config",
-        str(tmp_path / "dense.config"),
+        str(config_path),
         "--test",
         "single-step-optimizer",
         "--backend",
@@ -2755,11 +2756,13 @@ def _inference_export_allocation_cli(tmp_path):
     path = tmp_path / "allocation.json"
     path.write_text(json.dumps(descriptor))
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    config_path = tmp_path / "h200-external.config"
+    config_path.write_text(json.dumps(_config_factory_native_config({"n_gpus": 16, "max_seq_len": 256})))
     args = execution.parse_args(
         [
             "run",
             "--config",
-            str(tmp_path / "external.config"),
+            str(config_path),
             "--test",
             "inference-checkpoint-loss",
             "--backend",
@@ -2918,7 +2921,7 @@ def test_inference_export_allocation_execution_forwards_descriptor(_inference_ex
     args, descriptor = _inference_export_allocation_cli
     path = Path(args.config)
     native = _config_factory_native_config(
-        {"n_gpus": 16, "max_seq_len": 256, "attn_implementation": "sdpa"},
+        {"n_gpus": 16, "max_seq_len": 256, "attn_implementation": "flash_attention_3"},
         sampling={"n_gpus": 16, "max_seq_len": 256} if rl else None,
     )
     path.write_text(json.dumps(native))
@@ -3151,7 +3154,7 @@ def test_inference_initial_model_dir_execution_preserves_config_and_descriptor(
     args.inference_initial_model_dir = root
     path = Path(args.config)
     native = _config_factory_native_config(
-        {"n_gpus": 16, "max_seq_len": 256, "attn_implementation": "sdpa"},
+        {"n_gpus": 16, "max_seq_len": 256, "attn_implementation": "flash_attention_3"},
         sampling={"n_gpus": 16, "max_seq_len": 256} if rl else None,
     )
     path.write_text(json.dumps(native))
@@ -3252,7 +3255,8 @@ def test_inference_initial_model_dir_onboarding_keeps_absolute_root_across_calle
 
 
 _inference_forwarding_config = (
-    Path(__file__).resolve().parents[1] / "configs/qwen3.8-flash-next/h200/train-sft-full-16gpus-sp16-256k.config"
+    Path(__file__).resolve().parents[1]
+    / "configs/qwen3.8-flash-next/long/h200-training-full--sft-16gpus-sp16-256k.json"
 )
 
 
@@ -3442,7 +3446,8 @@ def test_inference_forwarding_execution_passes_same_private_spec_topology_and_fu
 
 
 _rl_inference_forwarding_config = (
-    Path(__file__).resolve().parents[1] / "configs/glm5.3-flash-bf16/h200/train-rl-32gpus-sp16-256k.config"
+    Path(__file__).resolve().parents[1]
+    / "configs/glm-5.3-flash-bf16/long/h200-training-full--rl-32gpus-sp16-256k.json"
 )
 
 
@@ -3732,7 +3737,7 @@ def test_checkpoint_training_placement_local_fixture_uses_exact_width_and_review
     from arctic_platform.correctness.harness.config import TestSpec
     from arctic_platform.correctness.harness.config import config_checksum
 
-    path = Path(__file__).resolve().parents[1] / f"configs/qwen3-8b/h200/train-sft-{kind}-4gpus-64k.config"
+    path = Path(__file__).resolve().parents[1] / f"configs/qwen3-8b/standard/h200-training-{kind}.json"
     original = path.read_bytes()
     cfg = execution.load_config(path)
     original_checksum = config_checksum(cfg)
@@ -3852,7 +3857,7 @@ def test_inference_training_placement_uses_real_width_without_mutating_reviewed_
     from arctic_platform.correctness.harness.config import TestSpec
     from arctic_platform.correctness.harness.config import config_checksum
 
-    path = Path(__file__).resolve().parents[1] / "configs/qwen3.6-35b-a3b/h200/train-sft-8gpus-64k.config"
+    path = Path(__file__).resolve().parents[1] / "configs/qwen3.6-35b-a3b/standard/h200-training-full.json"
     original = path.read_bytes()
     cfg = execution.load_config(path)
     original_checksum = config_checksum(cfg)
@@ -4452,7 +4457,7 @@ def test_operator_api_config_only_selects_each_applicable_test_once():
 
 @pytest.mark.parametrize("is_rl", [False, True])
 def test_operator_api_config_mode_selects_compatible_checks_without_a_backend(tmp_path, monkeypatch, is_rl):
-    config = tmp_path / "external.json"
+    config = tmp_path / "h200-external.json"
     config.write_text(
         json.dumps(
             _config_factory_native_config(
@@ -4476,7 +4481,7 @@ def test_operator_api_config_mode_selects_compatible_checks_without_a_backend(tm
     local_root = tmp_path / "checkout" / "configs"
     selected = api.select(api.RunRequest(config=config, config_dir=local_root))
     assert [case.test_id for case in selected] == (["rl-only", "shared"] if is_rl else ["gradients", "shared"])
-    assert all(case.config_path == local_root / config.name for case in selected)
+    assert all(case.config_path == local_root / "qwen3-8b/standard/h200-training-full.json" for case in selected)
     assert selected[0].config_path.read_bytes() == config.read_bytes()
     incompatible = "gradients" if is_rl else "rl-only"
     explicit = api.select(api.RunRequest(config=config, config_dir=local_root, tests=(incompatible,)))
@@ -4490,14 +4495,14 @@ def test_operator_external_config_copy_is_local_and_idempotent(tmp_path, suffix,
     from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.config import local_config_path
 
-    source = tmp_path / directory / f"Mixed-Case-model{suffix}"
+    source = tmp_path / directory / f"h200-Mixed-Case-model{suffix}"
     source.parent.mkdir(parents=True)
     source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16}), indent=2) + "\n")
     root = tmp_path / "checkout" / "configs"
     local = local_config_path(source, root)
-    assert local == root / source.name
+    assert local == root / "qwen3-8b/standard/h200-training-full.json"
     assert local.read_bytes() == source.read_bytes()
-    assert config_id(local) == source.stem
+    assert config_id(local) == "qwen3-8b-standard-h200-training-full"
     assert load_config(local).native == load_config(source).native
     modified = local.stat().st_mtime_ns
     assert local_config_path(source, root) == local
@@ -4509,7 +4514,7 @@ def test_operator_external_config_copy_is_local_and_idempotent(tmp_path, suffix,
 def test_operator_external_config_copy_preserves_local_recipe_on_collision(tmp_path):
     from arctic_platform.correctness.harness.config import local_config_path
 
-    source = tmp_path / "model.json"
+    source = tmp_path / "h200-model.json"
     source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16})))
     root = tmp_path / "checkout" / "configs"
     local = local_config_path(source, root)
@@ -4527,17 +4532,15 @@ def test_operator_external_config_copy_refuses_id_collision_instead_of_changing_
     from arctic_platform.correctness.harness.config import local_config_path
 
     root = tmp_path / "checkout" / "configs"
-    local = root / "model" / "h200" / "train.config"
+    local = root / "qwen3-8b" / "standard" / "h200-training-full.json"
     local.parent.mkdir(parents=True)
     local.write_text(json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16})))
-    source = tmp_path / "model-h200-train.json"
+    source = tmp_path / "qwen3-8b-standard-h200-training-full.json"
     source.write_bytes(local.read_bytes())
     assert config_id(source) == config_id(local)
-    with pytest.raises(ValueError, match="configuration ID.*already exists"):
-        local_config_path(source, root)
-    assert not (root / source.name).exists()
+    assert local_config_path(source, root) == local
     source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 8, "max_seq_len": 16})))
-    with pytest.raises(ValueError, match="configuration ID.*already exists"):
+    with pytest.raises(ValueError, match="different contents"):
         local_config_path(source, root)
     assert not (root / source.name).exists()
 
@@ -4557,7 +4560,7 @@ def test_operator_onboarding_uses_imported_config_before_preparation(tmp_path, m
     from arctic_platform.correctness.harness.config import local_config_path
     from arctic_platform.correctness.onboarding import onboard
 
-    source = tmp_path / "model.json"
+    source = tmp_path / "h200-model.json"
     source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 4, "max_seq_len": 16})))
     root = tmp_path / "checkout" / "configs"
     args = execution.parse_args(["onboard", "--config", str(source)])
@@ -4569,8 +4572,276 @@ def test_operator_onboarding_uses_imported_config_before_preparation(tmp_path, m
     used = []
     monkeypatch.setattr(onboard, "_onboard_configuration", lambda child: used.append(child.config) or 0)
     assert onboard.run(args) == 0
-    assert used == [root / source.name]
+    assert used == [root / "qwen3-8b/standard/h200-training-full.json"]
     assert used[0].read_bytes() == source.read_bytes()
+
+
+@pytest.mark.parametrize("mode", ["training", "inference"])
+@pytest.mark.parametrize("tuning", ["full", "lora"])
+def test_config_layout_catalog_import_preserves_relative_path_and_bytes(tmp_path, mode, tuning):
+    from arctic_platform.correctness.harness.config import config_id
+    from arctic_platform.correctness.harness.config import local_config_path
+    from arctic_platform.correctness.harness.config import reference_config_subpath
+
+    relative = Path(f"qwen3.5-2b/standard/h200-{mode}-{tuning}.json")
+    source = tmp_path / "cortex-training/model-catalog/models" / relative
+    raw = _cortex_recipe()
+    sub = raw["sub_job_configs"][0]
+    sub["model_name"] = "Qwen/Qwen3.5-2B"
+    if mode == "inference":
+        sub["job_type"] = "sampling"
+        sub["inference_config"] = sub.pop("training_config")
+    if tuning == "lora":
+        settings = sub["training_config" if mode == "training" else "inference_config"]
+        settings["peft_config"] = {"peft_type": "Lora", "r": 8, "target_modules": ["q_proj"]}
+    source.parent.mkdir(parents=True)
+    source.write_bytes((json.dumps(raw, indent=2).replace("\n", " \r\n") + "  ").encode())
+    root = tmp_path / "checkout/configs"
+    imported = local_config_path(source, root)
+    assert imported == root / relative
+    assert imported.read_bytes() == source.read_bytes()
+    assert local_config_path(source, root) == imported
+    loaded = load_config(imported)
+    assert loaded.has_training == (mode == "training")
+    assert loaded.gpu_type == "h200"
+    assert config_id(imported) == "-".join(relative.with_suffix("").parts)
+    assert reference_config_subpath(imported, loaded.config_id) == relative.with_suffix("")
+
+
+@pytest.mark.parametrize(
+    "root_name,relative,identifier",
+    [
+        (
+            "configs",
+            "my-model/standard/variants/long/h200-training-full.json",
+            "my-model-standard-variants-long-h200-training-full",
+        ),
+        (
+            "configs",
+            "my-model/standard/variants/configs/h200-training-full.json",
+            "my-model-standard-variants-configs-h200-training-full",
+        ),
+        (
+            "custom-recipes",
+            "my-model/standard/variants/long/h200-training-full.json",
+            "my-model-standard-variants-long-h200-training-full",
+        ),
+        ("custom-recipes", "my-model/standard/h200-training-full.json", "my-model-standard-h200-training-full"),
+        ("custom-recipes", "my-model/long/h200-training-full.json", "my-model-long-h200-training-full"),
+    ],
+)
+def test_config_layout_recipe_identity_and_references_retain_root_relative_path(
+    tmp_path, root_name, relative, identifier
+):
+    from arctic_platform.correctness.harness.config import config_id
+    from arctic_platform.correctness.harness.config import reference_config_subpath
+
+    relative = Path(relative)
+    path = tmp_path / root_name / relative
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(_config_factory_native_config({"n_gpus": 1}, model_name="Owner/My-Model")))
+    loaded = load_config(path)
+    assert loaded.config_id == config_id(path) == identifier
+    assert reference_config_subpath(path, identifier) == relative.with_suffix("")
+
+
+def test_config_layout_external_import_rejects_ancestor_symlink_before_writes(tmp_path):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    source = tmp_path / "h200-external.json"
+    source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 1}, model_name="Owner/My-Model")))
+    root = tmp_path / "configs"
+    root.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "retained.json"
+    sentinel.write_bytes(b"retained external evidence\n")
+    (root / "my-model").symlink_to(external, target_is_directory=True)
+    with pytest.raises(ValueError):
+        local_config_path(source, root)
+    assert list(external.rglob("*")) == [sentinel]
+    assert sentinel.read_bytes() == b"retained external evidence\n"
+
+
+def test_config_layout_missing_cortex_recipe_does_not_alias_migrated_correctness_config(tmp_path):
+    from arctic_platform.correctness.harness.config import local_config_path
+    from arctic_platform.correctness.harness.config import resolve_config_path
+
+    base = Path(__file__).resolve().parents[1]
+    previous = Path("qwen3-8b/h200/train-sft-full-4gpus-64k.config")
+    current = base / "configs/qwen3-8b/standard/h200-training-full.json"
+    cortex = tmp_path / "cortex-training/model-catalog/models" / previous
+    assert current.is_file()
+    assert not cortex.exists()
+    assert resolve_config_path(base / "configs" / previous) == current
+    assert resolve_config_path(cortex) == cortex
+    with pytest.raises(FileNotFoundError):
+        load_config(cortex)
+    root = tmp_path / "configs"
+    with pytest.raises(ValueError, match="existing"):
+        local_config_path(cortex, root)
+    assert not root.exists()
+
+
+@pytest.mark.parametrize(
+    "budget,sequence", [(None, "standard"), (262143, "standard"), (262144, "long"), (524288, "long")]
+)
+@pytest.mark.parametrize("native", [False, True])
+def test_config_layout_external_import_uses_explicit_budget_not_sequence_length(tmp_path, budget, sequence, native):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    training = {"n_gpus": 1, "max_seq_len": 1048576}
+    if budget is not None:
+        training["mb_spec"] = {"max_tokens_per_mb": budget}
+    raw = (
+        _config_factory_native_config(training, model_name="Owner/My-Model")
+        if native
+        else {
+            "hardware": "B200",
+            "sub_job_configs": [{"job_type": "training", "model_name": "Owner/My-Model", "training_config": training}],
+        }
+    )
+    source = tmp_path / "b200-external.json"
+    source.write_text(json.dumps(raw))
+    root = tmp_path / "checkout/configs"
+    imported = local_config_path(source, root)
+    assert imported == root / f"my-model/{sequence}/b200-training-full.json"
+    assert imported.read_bytes() == source.read_bytes()
+
+
+@pytest.mark.parametrize("inference_only", [False, True])
+def test_config_layout_external_import_selects_job_and_peft_mode(tmp_path, inference_only):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    raw = _cortex_recipe()
+    sub = raw["sub_job_configs"][0]
+    sub["model_name"] = "Owner/My-Model"
+    sub["training_config"]["peft_config"] = {"peft_type": "Lora", "r": 8, "target_modules": ["q_proj"]}
+    sampling = {
+        "job_type": "sampling",
+        "model_name": "Owner/My-Model",
+        "inference_config": {"n_gpus": 1, "max_seq_len": 16},
+    }
+    raw["hardware"] = "H200"
+    raw["sub_job_configs"] = [sampling] if inference_only else [sampling, sub]
+    source = tmp_path / "external.json"
+    source.write_text(json.dumps(raw))
+    root = tmp_path / "checkout/configs"
+    expected = (
+        "my-model/standard/h200-inference-full.json" if inference_only else "my-model/long/h200-training-lora.json"
+    )
+    imported = local_config_path(source, root)
+    assert imported == root / expected
+    assert load_config(imported).is_rl == (not inference_only)
+
+
+def test_config_layout_external_import_uses_hf_model_component_not_snapshot_hash(tmp_path):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    raw = _config_factory_native_config(
+        {"n_gpus": 1}, model_name="/checkpoint/hub/models--Qwen--Qwen3-0.6B/snapshots/abc123"
+    )
+    source = tmp_path / "h200-external.json"
+    source.write_text(json.dumps(raw))
+    root = tmp_path / "checkout/configs"
+    assert local_config_path(source, root) == root / "qwen3-0.6b/standard/h200-training-full.json"
+
+
+def test_config_layout_external_import_requires_hardware_without_a_gpu_host(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import config as config_module
+
+    monkeypatch.setattr(config_module, "local_gpu_type", lambda: None)
+    source = tmp_path / "external.json"
+    source.write_text(json.dumps(_config_factory_native_config({"n_gpus": 1})))
+    root = tmp_path / "checkout/configs"
+    with pytest.raises(ValueError, match="placement requires explicit hardware"):
+        config_module.local_config_path(source, root)
+    assert not root.exists()
+    monkeypatch.setattr(config_module, "local_gpu_type", lambda: "h200")
+    assert config_module.local_config_path(source, root) == root / "qwen3-8b/standard/h200-training-full.json"
+
+
+def test_config_layout_migration_preserves_config_bytes_ids_checksums_and_spec_locators():
+    from arctic_platform.correctness.harness.config import config_checksum
+    from arctic_platform.correctness.harness.config import config_id
+    from arctic_platform.correctness.harness.config import reference_config_subpath
+    from arctic_platform.correctness.harness.config import resolve_config_path
+
+    base = Path(__file__).resolve().parents[1]
+    entries = json.loads((base / "config-layout.json").read_text())
+    for relative, entry in entries.items():
+        current, previous = base / "configs" / relative, base / "configs" / entry["previous_path"]
+        assert current.is_file() and not previous.exists()
+        assert resolve_config_path(previous) == current
+        assert config_id(current) == config_id(previous) == entry["config_id"]
+        assert reference_config_subpath(previous, entry["config_id"]) == Path(relative).with_suffix("")
+        spec_path = base / "specs" / f"{entry['config_id']}.json"
+        if spec_path.exists():
+            spec = json.loads(spec_path.read_text())
+            assert config_checksum(load_config(current)) == spec["config_checksum"]
+            recorded = Path(spec["config_path"])
+            resolved = resolve_config_path(recorded).resolve()
+            if recorded.is_absolute() and not recorded.is_relative_to(base / "configs"):
+                assert resolved == recorded
+            else:
+                assert resolved == current
+
+
+def test_config_layout_catalog_metadata_is_not_a_recipe(tmp_path):
+    from arctic_platform.correctness.harness.config import local_config_path
+
+    source = tmp_path / "cortex-training/model-catalog/models/my-model/model.json"
+    source.parent.mkdir(parents=True)
+    source.write_text(json.dumps(_cortex_recipe()))
+    with pytest.raises(ValueError, match="not model metadata"):
+        local_config_path(source, tmp_path / "checkout/configs")
+
+
+def test_config_layout_discovery_lists_json_recipes_and_excludes_metadata(tmp_path):
+    from arctic_platform.correctness.harness.config import config_paths
+
+    root = tmp_path / "configs"
+    for relative in [
+        "my-model/standard/h200-training-full.json",
+        "legacy.config",
+        "my-model/model.json",
+        "archive/retired.json",
+        ".hidden/ignored.json",
+        "specs/test.json",
+    ]:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+    expected = [root / "legacy.config", root / "my-model/standard/h200-training-full.json"]
+    assert config_paths(root) == expected
+    args = SimpleNamespace(all_configs=True, config_dir=root, any_gpu=True)
+    assert execution._resolve_configs(args) == expected
+
+
+def test_config_layout_inference_onboarding_rejects_before_preparation(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness.config import local_config_path
+    from arctic_platform.correctness.onboarding import onboard
+
+    source = tmp_path / "configs/my-model/standard/h200-inference-full.json"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        json.dumps(
+            {
+                "sub_job_configs": [
+                    {"job_type": "sampling", "model_name": "Owner/My-Model", "inference_config": {"n_gpus": 1}}
+                ]
+            }
+        )
+    )
+    args = execution.parse_args(["onboard", "--config", str(source)])
+    monkeypatch.setattr(onboard, "_validate_storage", lambda *a: None)
+    monkeypatch.setattr(
+        "arctic_platform.correctness.harness.config.local_config_path",
+        lambda path: local_config_path(path, tmp_path / "configs"),
+    )
+    monkeypatch.setattr(onboard, "_onboard_configuration", lambda *a: pytest.fail("must reject before preparation"))
+    with pytest.raises(ValueError, match="inference-only"):
+        onboard.run(args)
 
 
 # Config-driven onboarding prerequisites.
@@ -4589,6 +4860,7 @@ def _onboarding_prerequisites(tmp_path, monkeypatch):
     args.reference_records_dir = tmp_path / "records"
     config = SimpleNamespace(
         config_id="synthetic",
+        has_training=True,
         is_rl=False,
         n_gpus=4,
         sp_size=1,
@@ -10972,7 +11244,7 @@ _prepared_reference_runner_WHOLE_CHECKS = ["checkpoint-resume-loss", "inference-
 
 @pytest.fixture
 def _prepared_reference_runner_prepared_runner(tmp_path, monkeypatch):
-    cfg = load_config(Path("arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config"))
+    cfg = load_config(Path("arctic_platform/correctness/configs/qwen3-8b/standard/h200-training-full.json"))
     spec = _applicable_tests_spec(_prepared_reference_runner_STEP_CHECKS.copy())
     spec.config_id = cfg.config_id
     spec.model.cache_path = str(tmp_path / "reviewed-model")
@@ -11256,9 +11528,9 @@ def test_reference_attention_runner_uses_same_glm_backend_in_measurement_and_ide
 @pytest.mark.parametrize(
     ("relative", "target", "override", "expected"),
     [
-        ("glm5.3-flash-bf16/h200/train-sft-16gpus-sp16-256k.config", "sparse_mla", None, "sdpa"),
-        ("glm5.3-flash-bf16/h200/train-sft-16gpus-sp16-256k.config", "sparse_mla", "eager", "eager"),
-        ("qwen3-8b/h200/train-sft-full-4gpus-64k.config", "eager", None, "eager"),
+        ("glm-5.3-flash-bf16/long/h200-training-full.json", "sparse_mla", None, "sdpa"),
+        ("glm-5.3-flash-bf16/long/h200-training-full.json", "sparse_mla", "eager", "eager"),
+        ("qwen3-8b/standard/h200-training-full.json", "eager", None, "eager"),
     ],
 )
 def test_reference_attention_e2e_command_and_options_preserve_target_and_explicit_overrides(
@@ -11743,6 +12015,76 @@ def test_reference_records_publish_load_compact_measurements_without_hf(
     assert set(json.loads(payload)) == {"schema", "identity", "measurements", "payload_sha256"}
     assert not list(_reference_records_ctx.reference_records_dir.rglob("*.pt"))
     assert not list(_reference_records_ctx.reference_records_dir.rglob(".prepare-*"))
+
+
+@pytest.mark.parametrize("config_locator", ["current", "previous", "spec-only", "id-only"])
+def test_config_layout_reference_publication_and_load_mirror_recipe_without_changing_identity(
+    _reference_records_ctx, _reference_records_identity, config_locator
+):
+    root = Path(__file__).resolve().parents[1]
+    relative = "qwen3-8b/standard/h200-training-full"
+    current = root / "configs" / f"{relative}.json"
+    previous = root / "configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config"
+    identifier = "qwen3-8b-h200-train-sft-full-4gpus-64k"
+    ctx = _reference_records_ctx
+    ctx.config_id = identifier
+    ctx.spec.config_path = str(previous) if config_locator == "spec-only" else None
+    if config_locator in {"current", "previous"}:
+        ctx.cfg.path = current if config_locator == "current" else previous
+    identity = deepcopy(_reference_records_identity)
+    identity["config_id"] = identifier
+    expected_identity = deepcopy(identity)
+    measurements = _reference_records_measurements()
+    path = records.publish_record(ctx, identity, measurements)
+    assert path == ctx.reference_records_dir / relative / _reference_records_GRADS / "gradients-only/gas1.json"
+    assert json.loads(path.read_text())["identity"] == expected_identity
+    assert identity == expected_identity
+    assert records.load_record(ctx, identity) == measurements
+    assert not (ctx.reference_records_dir / identifier).exists()
+
+
+def test_config_layout_reference_publication_rejects_mixed_ids_in_one_recipe_folder(
+    _reference_records_ctx, _reference_records_identity
+):
+    ctx = _reference_records_ctx
+    ctx.cfg.path = Path(__file__).resolve().parents[1] / "configs/qwen3-8b/standard/h200-training-full.json"
+    first = deepcopy(_reference_records_identity)
+    second = deepcopy(first)
+    second["config_id"] = "different-config"
+    second["arm"] = "gas4"
+    with pytest.raises(records.ReferencePrerequisiteError, match="one configuration"):
+        records.publish_record_set(
+            ctx,
+            [(first, _reference_records_measurements()), (second, _reference_records_measurements())],
+            expected_identities=[first, second],
+        )
+    assert not list(ctx.reference_records_dir.rglob("*.json"))
+
+
+def test_config_layout_reference_publication_rejects_ancestor_symlink_before_writes(
+    _reference_records_ctx, _reference_records_identity, tmp_path
+):
+    from arctic_platform.correctness.harness.config import config_id
+
+    ctx = _reference_records_ctx
+    path = tmp_path / "configs/my-model/standard/h200-training-full.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(_config_factory_native_config({"n_gpus": 1}, model_name="Owner/My-Model")))
+    ctx.cfg.path = path
+    ctx.config_id = config_id(path)
+    identity = deepcopy(_reference_records_identity)
+    identity["config_id"] = ctx.config_id
+    ctx.reference_records_dir.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "retained.json"
+    sentinel.write_bytes(b"retained external evidence\n")
+    (ctx.reference_records_dir / "my-model").symlink_to(external, target_is_directory=True)
+    with pytest.raises(records.ReferencePrerequisiteError):
+        records.publish_record(ctx, identity, _reference_records_measurements())
+    assert list(external.rglob("*")) == [sentinel]
+    assert sentinel.read_bytes() == b"retained external evidence\n"
+    assert ctx.reference_record_paths == {}
 
 
 def test_reference_records_missing_record_has_actionable_onboarding_command_without_hf(
@@ -13309,9 +13651,7 @@ def test_reference_execution_witness_cli_and_compact_record_preserve_provenance(
 
 _cortex_optimizer_capture_ROOT = Path(__file__).resolve().parents[1]
 
-_cortex_optimizer_capture_CONFIG = (
-    _cortex_optimizer_capture_ROOT / "configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config"
-)
+_cortex_optimizer_capture_CONFIG = _cortex_optimizer_capture_ROOT / "configs/qwen3-8b/standard/h200-training-full.json"
 
 _cortex_optimizer_capture_SPEC = _cortex_optimizer_capture_ROOT / "specs/qwen3-8b-h200-train-sft-full-4gpus-64k.json"
 
@@ -23982,7 +24322,7 @@ def test_staging_actual_config_and_consumers_agree_without_native_import(_lora_r
     _, options = _lora_request_staging_inputs
     root = Path(__file__).resolve().parents[3]
     cfg = load_config(
-        root / "arctic_platform/correctness/configs/glm5.3-flash/h200/train-rl-lora-16gpus-sp8-256k.config"
+        root / "arctic_platform/correctness/configs/glm-5.3-flash/long/h200-training-lora--rl-16gpus-sp8-256k.json"
     )
     monkeypatch.setattr(
         _lora_request_staging_helper,
@@ -35467,7 +35807,7 @@ def test_cortex_fixture_gradient_runner_loads_prepared_reference_and_routes_only
 
     spec, receipt, binding = _cortex_fixture_receipt(tmp_path)
     spec.test_tolerances["single-step-grads"] = Tolerance(absolute=0.01)
-    cfg = load_config(Path("arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config"))
+    cfg = load_config(Path("arctic_platform/correctness/configs/qwen3-8b/standard/h200-training-full.json"))
     backend = CortexConfig(base_url="http://cortex.test")
     events = []
 
@@ -35529,7 +35869,7 @@ def test_cortex_fixture_fixture_cli_uses_local_vocab_and_records_published_targe
     spec, receipt, binding = _cortex_fixture_receipt(tmp_path)
     captured = []
     metadata = {}
-    path = Path("arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config")
+    path = Path("arctic_platform/correctness/configs/qwen3-8b/standard/h200-training-full.json")
     monkeypatch.setattr(cli, "_frozen_spec", lambda cfg, path, arms, **k: (spec, arms))
     monkeypatch.setattr(cli, "_catalog_vocab_size", lambda *a: pytest.fail("must not resolve custom ID on HF Hub"))
 
@@ -35598,7 +35938,7 @@ def test_cortex_fixture_report_distinguishes_publication_from_worker_byte_verifi
 
 _local_cortex_full_27b_BASE = Path(__file__).resolve().parents[1]
 
-_local_cortex_full_27b_CONFIG = _local_cortex_full_27b_BASE / "configs/qwen3.8-27b/b200/train-sft-8gpus-2k.config"
+_local_cortex_full_27b_CONFIG = _local_cortex_full_27b_BASE / "configs/qwen3.8-27b/standard/b200-training-full.json"
 
 _local_cortex_full_27b_SPEC = _local_cortex_full_27b_BASE / "specs/qwen3.8-27b-b200-train-sft-8gpus-2k.json"
 
@@ -35852,7 +36192,7 @@ def test_local_cortex_full_27b_full_27b_inference_dispatch_never_runs_hf_referen
 _local_cortex_full_flashnext_BASE = Path(__file__).resolve().parents[1]
 
 _local_cortex_full_flashnext_CONFIG = (
-    _local_cortex_full_flashnext_BASE / "configs/qwen3.8-flash-next/h200/train-sft-full-16gpus-sp16-256k.config"
+    _local_cortex_full_flashnext_BASE / "configs/qwen3.8-flash-next/long/h200-training-full--sft-16gpus-sp16-256k.json"
 )
 
 _local_cortex_full_flashnext_SPEC = (
@@ -35971,10 +36311,8 @@ def _local_cortex_full_flashnext_validate(case):
 def test_local_cortex_full_flashnext_original_flashnext_is_admitted_header_only(
     _local_cortex_full_flashnext_full_model, source, placement
 ):
-    config = (
-        _local_cortex_full_flashnext_BASE
-        / f"configs/qwen3.8-flash-next/h200/train-sft-full-{placement}gpus-sp{placement}-256k.config"
-    )
+    recipe = "h200-training-full.json" if placement == 8 else "h200-training-full--sft-16gpus-sp16-256k.json"
+    config = _local_cortex_full_flashnext_BASE / "configs/qwen3.8-flash-next/long" / recipe
     spec = (
         _local_cortex_full_flashnext_BASE
         / f"specs/qwen3.8-flash-next-h200-train-sft-full-{placement}gpus-sp{placement}-256k.json"
@@ -36059,10 +36397,8 @@ def test_local_cortex_full_flashnext_original_flashnext_rejects_drift(
     _local_cortex_full_flashnext_full_model, failure, placement
 ):
     case = _local_cortex_full_flashnext_full_model
-    case.cfg = load_config(
-        _local_cortex_full_flashnext_BASE
-        / f"configs/qwen3.8-flash-next/h200/train-sft-full-{placement}gpus-sp{placement}-256k.config"
-    )
+    recipe = "h200-training-full.json" if placement == 8 else "h200-training-full--sft-16gpus-sp16-256k.json"
+    case.cfg = load_config(_local_cortex_full_flashnext_BASE / "configs/qwen3.8-flash-next/long" / recipe)
     case.spec = Spec.read(
         _local_cortex_full_flashnext_BASE
         / f"specs/qwen3.8-flash-next-h200-train-sft-full-{placement}gpus-sp{placement}-256k.json"
@@ -39679,7 +40015,7 @@ _fixed_tolerance_onboarding_RESUME_TEST = "checkpoint-resume-loss"
 
 
 def _fixed_tolerance_onboarding_write_config(tmp_path: Path) -> Path:
-    path = tmp_path / "configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config"
+    path = tmp_path / "configs/qwen3-8b/standard/h200-training-full.json"
     path.parent.mkdir(parents=True)
     path.write_text(
         json.dumps(
@@ -40093,7 +40429,8 @@ def test_rl_local_onboarding_admission_preserves_checks_and_combined_gpu_width(
 ):
     config_module = _fixed_tolerance_onboarding_SPEC
     config_path = (
-        Path(__file__).resolve().parents[1] / "configs/glm5.3-flash-bf16/h200/train-rl-32gpus-sp16-256k.config"
+        Path(__file__).resolve().parents[1]
+        / "configs/glm-5.3-flash-bf16/long/h200-training-full--rl-32gpus-sp16-256k.json"
     )
     cfg = load_config(config_path)
     before = cfg.native.model_dump()
@@ -40161,9 +40498,7 @@ def test_rl_local_onboarding_admission_preserves_checks_and_combined_gpu_width(
 def test_supervised_local_fixture_onboarding_admits_only_explicit_native_route(
     monkeypatch, tmp_path, test_id, backend, local_fixture, full_model, pool, base_url, error
 ):
-    config_path = (
-        Path(__file__).resolve().parents[1] / "configs/glm5.3-flash/h200/train-sft-lora-8gpus-sp8-256k.config"
-    )
+    config_path = Path(__file__).resolve().parents[1] / "configs/glm-5.3-flash/long/h200-training-lora.json"
     cfg = load_config(config_path)
     before = cfg.native.model_dump()
     args = SimpleNamespace(
@@ -40276,7 +40611,7 @@ def test_supervised_local_fixture_selector_rejects_preparation_only_modes(monkey
 
 _helper_storage_ROOT = Path(__file__).resolve().parents[1]
 
-_helper_storage_CONFIG = _helper_storage_ROOT / "configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config"
+_helper_storage_CONFIG = _helper_storage_ROOT / "configs/qwen3-8b/standard/h200-training-full.json"
 
 _helper_storage_SPEC = _helper_storage_ROOT / "specs/qwen3-8b-h200-train-sft-full-4gpus-64k.json"
 
@@ -40466,9 +40801,7 @@ def test_helper_storage_weights_save_keeps_public_framing_and_does_not_restrict_
 # Hf reference onboarding.
 
 
-_hf_reference_onboarding_CONFIG = Path(
-    "arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config"
-)
+_hf_reference_onboarding_CONFIG = Path("arctic_platform/correctness/configs/qwen3-8b/standard/h200-training-full.json")
 
 
 @pytest.fixture
@@ -40672,8 +41005,8 @@ def test_hf_reference_onboarding_runner_preparation_cannot_execute_normal_refere
 @pytest.mark.parametrize(
     "relative",
     [
-        "glm5.3-flash-bf16/h200/train-sft-16gpus-sp16-256k.config",
-        "glm5.3-flash/h200/train-sft-lora-8gpus-sp8-256k.config",
+        "glm-5.3-flash-bf16/long/h200-training-full.json",
+        "glm-5.3-flash/long/h200-training-lora.json",
     ],
 )
 def test_reference_attention_sizing_and_rendered_calibration_use_glm_sdpa(
@@ -40733,9 +41066,7 @@ def test_reference_attention_sizing_and_rendered_calibration_use_glm_sdpa(
 
 
 def test_reference_attention_sizing_note_records_upstream_backend(_onboarding_storage_fast_root, monkeypatch):
-    config_path = (
-        Path(__file__).resolve().parents[1] / "configs/glm5.3-flash-bf16/h200/train-sft-16gpus-sp16-256k.config"
-    )
+    config_path = Path(__file__).resolve().parents[1] / "configs/glm-5.3-flash-bf16/long/h200-training-full.json"
     spec = _applicable_tests_spec([])
     spec.notes = []
     written = []
@@ -42212,7 +42543,7 @@ def test_onboarding_storage_run_keeps_separate_small_spec_and_probe_reports_unre
         reference_records_dir=None,
     )
     args.config.parent.mkdir(parents=True)
-    args.config.write_text("{}")
+    args.config.write_text(json.dumps(_config_factory_native_config({"n_gpus": 1})))
     args.test_spec.write_text("{}")
     monkeypatch.setattr(_fixed_tolerance_onboarding_SPEC, "local_config_path", lambda path: path)
     monkeypatch.setattr(onboard, "_checkout_root", lambda config: tmp_path / "checkout")
@@ -43310,7 +43641,7 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
 
     from arctic_platform.correctness.harness.config import TestTolerance
 
-    config_path = Path(__file__).resolve().parents[1] / "configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config"
+    config_path = Path(__file__).resolve().parents[1] / "configs/qwen3-8b/standard/h200-training-full.json"
     parser = argparse.ArgumentParser()
     onboard.add_arguments(parser)
     args = parser.parse_args(
@@ -43529,7 +43860,16 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
         published = ConfigSpec.read(args.test_spec)
         assert published.tolerance_for("single-step-optimizer") == 0.004
         assert published.test_settings["single-step-optimizer"]["norm_gates_by_arm"] == {"gas1": 0.001, "gas4": 0.004}
-        assert len(list(args.reference_records_dir.glob(f"{cfg.config_id}/single-step-optimizer/*.json"))) == 2
+        assert (
+            len(
+                list(
+                    args.reference_records_dir.glob(
+                        "qwen3-8b/standard/h200-training-full/single-step-optimizer/*.json"
+                    )
+                )
+            )
+            == 2
+        )
         if state.failure == "validation":
             raise RuntimeError("validation failed")
         if state.failure == "interrupt":
@@ -43608,7 +43948,7 @@ def test_local_cortex_optimizer_scalar_norm_failure_restores_exact_spec_and_no_v
     assert list(state.args.reference_records_dir.glob(".optimizer-onboarding-*")) == []
     if failure in {"validation", "target-fail", "interrupt"}:
         assert state.events == ["calibration", "validation"]
-        assert len(list(state.args.reference_records_dir.glob("*/single-step-optimizer/*.json"))) == 2
+        assert len(list(state.args.reference_records_dir.rglob("single-step-optimizer/*.json"))) == 2
     else:
         assert state.events == ["calibration"]
 
@@ -47077,7 +47417,7 @@ _local_cortex_checkpoint_load_STAGE = {
 }
 
 _local_cortex_checkpoint_load_CONFIG = (
-    Path(__file__).resolve().parents[1] / "configs/qwen3.6-35b-a3b/h200/train-sft-full-8gpus-sp8-64k.config"
+    Path(__file__).resolve().parents[1] / "configs/qwen3.6-35b-a3b/standard/h200-training-full--sft-8gpus-sp8-64k.json"
 )
 
 
@@ -47379,7 +47719,7 @@ def test_native_checkpoint_transport_model_override_preserves_reviewed_configura
 
 @pytest.mark.parametrize("mode", ["best-effort", "off"])
 def test_native_checkpoint_transport_preserves_rl_sampling_placement(mode):
-    cfg = load_config(_local_cortex_checkpoint_load_CONFIG.parent / "train-rl-16gpus-64k.config")
+    cfg = load_config(_local_cortex_checkpoint_load_CONFIG.parent / "h200-training-full--rl-16gpus-64k.json")
     before = deepcopy(cfg.native.model_dump())
     backend = CortexConfig(base_url="http://127.0.0.1:8003")
     training_only = hosted.training_client_config(cfg, backend, determinism=mode)
@@ -48999,7 +49339,7 @@ def test_local_cortex_forward_full_model_e2e_existing_replay_routes_held_out_to_
     from arctic_platform.correctness.harness.config import load_config
 
     root = Path(__file__).resolve().parents[1]
-    config = load_config(root / "configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config")
+    config = load_config(root / "configs/qwen3-8b/standard/h200-training-full.json")
     ctx = SimpleNamespace(
         cfg=config,
         client_backend=_local_cortex_forward_client_config().backend,
@@ -50585,7 +50925,7 @@ def test_client_backends_remote_cli_checkpoint_uses_catalog_and_explicit_placeme
     assert [cfg.n_gpus for cfg, _ in measured] == [8, 16]
     assert all((isinstance(options["client_backend"], CortexConfig) for _, options in measured))
     assert all((options["vocab_size"] == 128 for _, options in measured))
-    assert metadata["model-h200-train"] == {
+    assert metadata["qwen3-8b-standard-h200-training-full"] == {
         "backend": "cortex",
         "requested_model_name": measured[0][0].model_name,
     }
@@ -51081,7 +51421,7 @@ def test_e2e_reduced_fixture_mtp_run_context_keeps_validated_binding(tmp_path, m
 
 _cortex_e2e_ROOT = Path(__file__).resolve().parents[1]
 
-_cortex_e2e_CONFIG = _cortex_e2e_ROOT / "configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config"
+_cortex_e2e_CONFIG = _cortex_e2e_ROOT / "configs/qwen3-8b/standard/h200-training-full.json"
 
 _cortex_e2e_FULL_SNAPSHOT = "/data-fast/tmp/e2e-full-test/hf/hub/models--Qwen--Qwen3-8B/snapshots/pinned"
 
@@ -51413,7 +51753,7 @@ def test_cortex_e2e_full_e2e_never_bypasses_hosted_or_non_gateway_guards(tmp_pat
 
 _cortex_model_identity_ROOT = Path(__file__).resolve().parents[1]
 
-_cortex_model_identity_CONFIG = _cortex_model_identity_ROOT / "configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config"
+_cortex_model_identity_CONFIG = _cortex_model_identity_ROOT / "configs/qwen3-8b/standard/h200-training-full.json"
 
 _cortex_model_identity_SPEC = _cortex_model_identity_ROOT / "specs/qwen3-8b-h200-train-sft-full-4gpus-64k.json"
 
@@ -51638,7 +51978,9 @@ def test_cortex_model_identity_cortex_e2e_without_published_identity_never_creat
 # Cortex port.
 
 _driver_reviewed_root = Path(__file__).resolve().parents[1]
-_driver_reviewed_rl_config = _driver_reviewed_root / "configs/qwen3.8-flash-next/h200/train-rl-32gpus-sp16-256k.config"
+_driver_reviewed_rl_config = (
+    _driver_reviewed_root / "configs/qwen3.8-flash-next/long/h200-training-full--rl-32gpus-sp16-256k.json"
+)
 
 
 def test_driver_reviewed_build_payload_forwards_top_level_moe_chunk_through_model_options():
@@ -51719,7 +52061,7 @@ def test_driver_reviewed_config_reads_canonical_lm_head_chunk_size(options):
 def test_driver_reviewed_build_payload_keeps_format_outside_worker_config(
     weight_format,
 ):
-    cfg = load_config(_driver_reviewed_root / "configs/qwen3.8-flash-next/h200/train-sft-full-8gpus-sp8-256k.config")
+    cfg = load_config(_driver_reviewed_root / "configs/qwen3.8-flash-next/long/h200-training-full.json")
     before = deepcopy(cfg.training)
     payload = dss_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed, weight_format=weight_format)
     assert payload.get("weight_format") == weight_format
@@ -52010,7 +52352,7 @@ def test_driver_reviewed_rejects_unsupported_format_before_gateway_runtime(monke
 
 _cortex_port_ROOT = Path(__file__).resolve().parents[1]
 
-_cortex_port_CONFIG = _cortex_port_ROOT / "configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config"
+_cortex_port_CONFIG = _cortex_port_ROOT / "configs/qwen3-8b/standard/h200-training-full.json"
 
 
 @pytest.fixture(autouse=False)
@@ -52448,7 +52790,7 @@ def test_cortex_port_sampling_config_forwards_checkpoint_identity_without_mutati
         "checkpoint_id": "cp_saved",
         "source_job_id": "source-parent",
     }
-    assert sub["inference_config"]["vllm_config"]["enforce_eager"] is True
+    assert sub["inference_config"]["vllm_config"]["extra_engine_kwargs"]["enforce_eager"] is True
     assert json.dumps(cfg.training, sort_keys=True) == before
 
 
@@ -56047,9 +56389,24 @@ def test_inference_checkpoint_loss_correctness_sampling_disables_cuda_graphs() -
     from arctic_platform.correctness.harness.gateway import sampling_payload
 
     payload = sampling_payload("/checkpoint", 42, dtype="bfloat16", n_gpus=1, max_seq_len=4096)
-    extra = payload["inference_config"]["vllm_config"]
+    extra = payload["inference_config"]["vllm_config"]["extra_engine_kwargs"]
     assert extra["enforce_eager"] is True
     assert extra["disable_custom_all_reduce"] is True
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32"])
+def test_inference_checkpoint_loss_sampling_payload_accepts_real_server_schema(dtype):
+    from arctic_platform.inference.server.config import ModelConfig
+
+    payload = sampling_payload("/checkpoint", 42, dtype=dtype, n_gpus=4, max_seq_len=4096)
+    engine_config = ModelConfig(model=payload["model_name"], **payload["inference_config"]["vllm_config"])
+    engine = engine_config.to_engine_kwargs()
+    assert payload["dtype"] == engine["dtype"] == dtype
+    assert engine["disable_custom_all_reduce"] is True
+    assert engine["enforce_eager"] is True
+    assert engine["tensor_parallel_size"] == 4
+    assert engine["max_model_len"] == 4096
+    assert engine["gpu_memory_utilization"] == 0.85
 
 
 def test_inference_checkpoint_loss_forward_request_asks_for_per_token_logprobs() -> None:
@@ -57021,9 +57378,7 @@ def test_inference_rendezvous_reload_error_does_not_allocate_an_alternate_port(
 def _reviewed_weight_format_callers_config(tmp_path, weight_format, *, lora=False):
     root = Path(__file__).resolve().parents[1] / "configs"
     relative = (
-        "qwen3-8b/h200/train-sft-lora-4gpus-64k.config"
-        if lora
-        else "qwen3.8-flash-next/h200/train-sft-full-8gpus-sp8-256k.config"
+        "qwen3-8b/standard/h200-training-lora.json" if lora else "qwen3.8-flash-next/long/h200-training-full.json"
     )
     source = root / relative
     recipe = json.loads(source.read_text())
@@ -57458,7 +57813,7 @@ def test_inference_export_cleanup_exited_leader_stubborn_descendant_is_killed_an
 
 @pytest.fixture
 def _inference_export_integration_runner(tmp_path):
-    cfg = load_config(Path(__file__).resolve().parents[1] / "configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config")
+    cfg = load_config(Path(__file__).resolve().parents[1] / "configs/qwen3-8b/standard/h200-training-full.json")
     spec = SimpleNamespace(
         applicable_tests=["inference-checkpoint-loss"],
         test_settings={},
@@ -58137,15 +58492,15 @@ def test_inference_export_locality_source_binding_expired_global_deadline_stops_
 _inference_sampling_topology_CONFIG_ROOT = Path(__file__).resolve().parents[1] / "configs"
 
 _inference_sampling_topology_FLASH_CONFIG = (
-    _inference_sampling_topology_CONFIG_ROOT / "qwen3.8-flash-next/h200/train-sft-full-16gpus-sp16-256k.config"
+    _inference_sampling_topology_CONFIG_ROOT / "qwen3.8-flash-next/long/h200-training-full--sft-16gpus-sp16-256k.json"
 )
 
 _inference_sampling_topology_ORDINARY_CONFIG = (
-    _inference_sampling_topology_CONFIG_ROOT / "qwen3-8b/h200/train-sft-full-4gpus-64k.config"
+    _inference_sampling_topology_CONFIG_ROOT / "qwen3-8b/standard/h200-training-full.json"
 )
 
 _inference_sampling_topology_GLM_CONFIG = (
-    _inference_sampling_topology_CONFIG_ROOT / "glm5.3-flash-bf16/h200/train-rl-32gpus-sp16-256k.config"
+    _inference_sampling_topology_CONFIG_ROOT / "glm-5.3-flash-bf16/long/h200-training-full--rl-32gpus-sp16-256k.json"
 )
 
 _inference_sampling_topology_FLASH_ID = "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k"
@@ -58155,7 +58510,7 @@ _inference_sampling_topology_TOPOLOGIES = [(8, 8, 1), (16, 8, 2)]
 _inference_sampling_topology_TOKEN_BUDGET = 10240
 
 _inference_sampling_topology_DENSE_B200_CONFIG = (
-    _inference_sampling_topology_CONFIG_ROOT / "qwen3.8-27b/b200/train-sft-8gpus-2k.config"
+    _inference_sampling_topology_CONFIG_ROOT / "qwen3.8-27b/standard/b200-training-full.json"
 )
 
 # Routed-expert fields of the full models these configs name, as their HF ``text_config`` declares them.
@@ -58245,7 +58600,10 @@ def test_inference_sampling_topology_glm_reviewed_sampler_survives_cortex_wire()
 
 @pytest.mark.parametrize("local", [False, True])
 def test_inference_sampling_topology_flashnext_replicas_survive_cortex_wire(monkeypatch, tmp_path, local):
-    path = _inference_sampling_topology_CONFIG_ROOT / "qwen3.8-flash-next/h200/train-rl-32gpus-sp16-256k.config"
+    path = (
+        _inference_sampling_topology_CONFIG_ROOT
+        / "qwen3.8-flash-next/long/h200-training-full--rl-32gpus-sp16-256k.json"
+    )
     ctx = _inference_sampling_topology_context(path, topology=(16, 8, 1))
     before = deepcopy(ctx.cfg)
     backend = CortexConfig(base_url="http://127.0.0.1:8003")
@@ -58270,7 +58628,10 @@ def test_inference_sampling_topology_flashnext_replicas_survive_cortex_wire(monk
 
 @pytest.mark.parametrize("replicas", [True, 2.0, 0, -1, None, 1, 3])
 def test_inference_sampling_topology_flashnext_rejects_invalid_or_inconsistent_replicas(replicas):
-    path = _inference_sampling_topology_CONFIG_ROOT / "qwen3.8-flash-next/h200/train-rl-32gpus-sp16-256k.config"
+    path = (
+        _inference_sampling_topology_CONFIG_ROOT
+        / "qwen3.8-flash-next/long/h200-training-full--rl-32gpus-sp16-256k.json"
+    )
     ctx = _inference_sampling_topology_context(path, topology=(16, 8, 1))
     inference = next(sub["inference_config"] for sub in ctx.cfg.sub_jobs if sub["job_type"] == "sampling")
     inference["num_replicas"] = replicas
@@ -58279,7 +58640,10 @@ def test_inference_sampling_topology_flashnext_rejects_invalid_or_inconsistent_r
 
 
 def test_inference_sampling_topology_flashnext_default_does_not_enable_replicas():
-    path = _inference_sampling_topology_CONFIG_ROOT / "qwen3.8-flash-next/h200/train-rl-32gpus-sp16-256k.config"
+    path = (
+        _inference_sampling_topology_CONFIG_ROOT
+        / "qwen3.8-flash-next/long/h200-training-full--rl-32gpus-sp16-256k.json"
+    )
     ctx = _inference_sampling_topology_context(path)
     payload = inference_rl_check._sampling_payload(ctx, "/saved-flashnext", 10240)
     assert inference_rl_check.sampling_gpu_count(ctx) == 1
@@ -58287,7 +58651,7 @@ def test_inference_sampling_topology_flashnext_default_does_not_enable_replicas(
 
 
 def test_inference_sampling_topology_lora_recipe_survives_payload_and_cortex_wire():
-    path = _inference_sampling_topology_CONFIG_ROOT / "glm5.3-flash/h200/train-rl-lora-16gpus-sp8-256k.config"
+    path = _inference_sampling_topology_CONFIG_ROOT / "glm-5.3-flash/long/h200-training-lora--rl-16gpus-sp8-256k.json"
     ctx = _inference_sampling_topology_context(path, topology=(8, 8, 1))
     before = deepcopy(ctx.cfg)
     payload = inference_rl_check._sampling_payload(ctx, "/saved/trained-glm", 10240)
@@ -58392,15 +58756,42 @@ def test_inference_sampling_topology_original_flashnext_request_separates_alloca
     assert inf["max_seq_len"] == _inference_sampling_topology_TOKEN_BUDGET + 1
     engine = inf["vllm_config"]
     assert engine["max_model_len"] == _inference_sampling_topology_TOKEN_BUDGET + 1
-    assert engine["dtype"] == "bfloat16"
-    assert engine["enforce_eager"] is True
-    assert engine["disable_custom_all_reduce"] is True
+    assert engine["extra_engine_kwargs"]["dtype"] == "bfloat16"
+    assert engine["extra_engine_kwargs"]["enforce_eager"] is True
+    assert engine["extra_engine_kwargs"]["disable_custom_all_reduce"] is True
     assert engine["gpu_memory_utilization"] == 0.85
     assert engine["trust_remote_code"] is True
     assert "model" not in engine
     assert "speculative_config" not in engine
     assert "speculative_config" not in engine["extra_engine_kwargs"]
     assert ctx.cfg == before
+
+
+@pytest.mark.parametrize(
+    "config,topology",
+    [
+        (_inference_sampling_topology_FLASH_CONFIG, (8, 8, 1)),
+        (_inference_sampling_topology_FLASH_CONFIG, (16, 8, 2)),
+        (_inference_sampling_topology_GLM_CONFIG, (16, 16, 1)),
+    ],
+)
+@pytest.mark.usefixtures("_inference_sampling_model_configs")
+def test_inference_sampling_topology_real_server_schema_keeps_engine_settings(config, topology):
+    from arctic_platform.inference.server.config import ModelConfig
+
+    ctx = _inference_sampling_topology_context(config, topology=topology)
+    payload = inference_rl_check._sampling_payload(ctx, "/saved/full-checkpoint", 10240)
+    request = payload["inference_config"]["vllm_config"]
+    engine = ModelConfig(model=payload["model_name"], **request).to_engine_kwargs()
+    assert engine["dtype"] == payload["dtype"] == "bfloat16"
+    assert engine["disable_custom_all_reduce"] is True
+    assert engine["enforce_eager"] is True
+    assert engine["tensor_parallel_size"] == topology[1]
+    assert engine["pipeline_parallel_size"] == topology[2]
+    assert engine["distributed_executor_backend"] == "ray"
+    assert engine["enable_expert_parallel"] is True
+    if config == _inference_sampling_topology_FLASH_CONFIG:
+        assert engine["engram_config"] == request["extra_engine_kwargs"]["engram_config"]
 
 
 @pytest.mark.parametrize(
@@ -59069,7 +59460,7 @@ def test_inference_text_projection_local_text_export_requires_one_original_snaps
 
 # Local cortex inference.
 
-_local_cortex_inference_CONFIG = "arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config"
+_local_cortex_inference_CONFIG = "arctic_platform/correctness/configs/qwen3-8b/standard/h200-training-full.json"
 
 _local_cortex_inference_FULL_CONFIG = {
     "model_type": "qwen3",
@@ -60746,7 +61137,7 @@ def test_inference_export_allocation_rl_checks_live_hostfile_before_work(
 
 _rl_config_ROOT = Path(__file__).resolve().parents[1]
 
-_rl_config_CONFIG = _rl_config_ROOT / "configs/qwen3.6-35b-a3b/h200/train-rl-16gpus-64k.config"
+_rl_config_CONFIG = _rl_config_ROOT / "configs/qwen3.6-35b-a3b/standard/h200-training-full--rl-16gpus-64k.json"
 
 _rl_config_SPEC = _rl_config_ROOT / "specs/qwen3.6-35b-a3b-h200-train-rl-16gpus-64k.json"
 
@@ -63342,13 +63733,16 @@ def test_durable_startup_error_new_binding_rejects_invalid_identity_or_collision
 _optimizer_compute_dtype_CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
 _optimizer_compute_dtype_FLASH_NEXT_BF16 = (
-    _optimizer_compute_dtype_CONFIG_DIR / "qwen3.8-flash-next" / "h200" / "train-sft-full-8gpus-sp8-256k.config"
+    _optimizer_compute_dtype_CONFIG_DIR / "qwen3.8-flash-next" / "long" / "h200-training-full.json"
 )
 _optimizer_compute_dtype_FLASH_NEXT_FP32 = (
-    _optimizer_compute_dtype_CONFIG_DIR / "qwen3.8-flash-next" / "h200" / "train-sft-full-16gpus-sp16-256k.config"
+    _optimizer_compute_dtype_CONFIG_DIR
+    / "qwen3.8-flash-next"
+    / "long"
+    / "h200-training-full--sft-16gpus-sp16-256k.json"
 )
 _optimizer_compute_dtype_GLM_BF16 = (
-    _optimizer_compute_dtype_CONFIG_DIR / "glm5.3-flash" / "h200" / "train-sft-lora-8gpus-sp8-256k.config"
+    _optimizer_compute_dtype_CONFIG_DIR / "glm-5.3-flash" / "long" / "h200-training-lora.json"
 )
 
 

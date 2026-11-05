@@ -155,6 +155,8 @@ def reference_tests() -> Dict[str, TestSpecEntry]:
 
 def workload_inapplicable_reason(test: TestSpecEntry, config) -> str | None:
     """Select workload-compatible checks before model or backend initialization."""
+    if not getattr(config, "has_training", True):
+        return "correctness checks require a training sub-job; this config is inference-only"
     if config.is_rl and test.compares_to_reference:
         return RL_INAPPLICABLE_REASON
     mode = "rl" if config.is_rl else "sft"
