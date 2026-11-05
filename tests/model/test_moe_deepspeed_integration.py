@@ -15,6 +15,7 @@
 
 import os
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 from types import ModuleType
@@ -962,15 +963,20 @@ def test_legacy_ep_resume_rejects_incompatible_layout_or_missing_rank(ep_checkpo
     assert engine.calls == []
 
 
-@pytest.mark.parametrize("expert,stage_three", [(True, True), (True, False), (False, True)])
+@pytest.mark.parametrize(
+    "expert,stage_three,ep_size", [(True, True, 2), (True, False, 2), (False, True, 2), (True, True, 1)]
+)
 def test_ap_expert_zero_three_is_rejected_before_native_model_setup(
-    ep_checkpoint_engine, monkeypatch, expert, stage_three
+    ep_checkpoint_engine, monkeypatch, expert, stage_three, ep_size
 ):
     engine = ep_checkpoint_engine
     engine_type = type(engine)
     engine.partition_weights = stage_three
     model = engine.module if expert else nn.Linear(2, 2)
     calls = []
+    monkeypatch.setattr(
+        common, "_ep_checkpoint_identity", lambda name: dict(group_name=name, ep_size=ep_size, ep_rank=0)
+    )
 
     def native(self, model):
         calls.append(True)
@@ -985,13 +991,26 @@ def test_ap_expert_zero_three_is_rejected_before_native_model_setup(
     monkeypatch.setattr(sys.modules["deepspeed.runtime"], "engine", module, raising=False)
     monkeypatch.setattr(sys.modules["deepspeed"], "runtime", sys.modules["deepspeed.runtime"], raising=False)
     common.patch_deepspeed_moe_detection()
-    if expert and stage_three:
+    if expert and stage_three and ep_size > 1:
         with pytest.raises(ValueError, match="use ZeRO stage 1 or 2"):
             engine._configure_distributed_model(model)
         assert calls == []
     else:
         engine._configure_distributed_model(model)
         assert calls == [True]
+        assert engine.has_moe_layers is (expert and not stage_three)
+
+
+def test_ep_one_zero_three_uses_native_checkpoint_paths(ep_checkpoint_engine, monkeypatch, tmp_path):
+    engine = ep_checkpoint_engine
+    engine.partition_weights = True
+    monkeypatch.setattr(common, "_ep_checkpoint_identity", lambda name: dict(group_name=name, ep_size=1, ep_rank=0))
+    assert common._ep_checkpoint_parameters(engine.module, partition_weights=True) == {}
+    engine._save_checkpoint(tmp_path, "native")
+    assert "expert" in engine.saved_checkpoint["module"]
+    assert engine.checkpoint_engine.saved_paths == []
+    engine._load_checkpoint(tmp_path, "native", load_optimizer_states=False)
+    assert engine.calls[-1][0] == "module"
 
 
 @pytest.mark.parametrize("verify", ["0", "1", "invalid"])
@@ -1198,6 +1217,40 @@ def test_ep_checkpoint_sweeps_other_tags_using_owner_liveness(tmp_path):
     assert other.exists()
 
 
+@pytest.mark.parametrize("operation", ["stat", "remove"])
+def test_ep_checkpoint_workspace_cleanup_failure_does_not_fail_save(tmp_path, monkeypatch, operation):
+    messages = []
+    monkeypatch.setattr(
+        common, "get_logger", lambda: SimpleNamespace(info=lambda message, *a, **k: messages.append(message))
+    )
+    stale = tmp_path / ".ap-ep-checkpoint-expert-stale"
+    stale.mkdir()
+    if operation == "stat":
+        native = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if path == stale:
+                raise PermissionError("stale workspace is inaccessible")
+            return native(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+    else:
+        stamp = time.time() - 61
+        os.utime(stale, (stamp, stamp))
+        native_remove = common.shutil.rmtree
+
+        def remove(path, *args, **kwargs):
+            if Path(path) == stale:
+                raise PermissionError("stale workspace cannot be removed")
+            return native_remove(path, *args, **kwargs)
+
+        monkeypatch.setattr(common.shutil, "rmtree", remove)
+    path = tmp_path / "expert.pt"
+    common._save_ep_checkpoint_shard(dict(module=dict(expert=torch.arange(8.0))), path)
+    torch_assert_equal(torch.load(path, weights_only=True)["module"]["expert"], torch.arange(8.0))
+    assert any("Could not" in message for message in messages)
+
+
 @pytest.mark.parametrize("interval,expected_syncs", [("0", 1), ("1", 3), ("33554432", 1)])
 def test_ep_checkpoint_configurable_sync_interval(tmp_path, monkeypatch, interval, expected_syncs):
     monkeypatch.setenv("ARCTIC_EXPERT_CHECKPOINT_SYNC_BYTES", interval)
@@ -1287,7 +1340,7 @@ def test_ep_checkpoint_native_deepspeed_save_load(monkeypatch, tmp_path, single_
         torch_assert_equal(parameter, target)
 
 
-def _native_legacy_ep_resume_worker(rank, rendezvous, directory):
+def _native_legacy_ep_resume_worker(rank, rendezvous, directory, legacy=True):
     import deepspeed
     import deepspeed.utils.groups as groups
     import torch.distributed as dist
@@ -1335,12 +1388,18 @@ def _native_legacy_ep_resume_worker(rank, rendezvous, directory):
             ),
         )
         expected = model.experts.weight.detach().clone()
-        # Reconstruct the historical ordinary save: rank-zero dense experts plus native rank-local ZeRO archives.
-        engine.has_moe_layers = False
+        # Legacy saves use rank-zero dense experts; AP saves must preserve both ranks' distinct shards.
+        if legacy:
+            engine.has_moe_layers = False
         assert engine.save_checkpoint(directory, tag="legacy")
         sidefile = common._ep_checkpoint_path(directory, "legacy", common._ep_checkpoint_identity(group_name))
-        sidefile.unlink()
-        if rank == 0:
+        shard = torch.load(sidefile, weights_only=True)
+        torch_assert_equal(shard["module"]["experts.weight"], expected.cpu())
+        assert shard["ep_rank"] == rank
+        assert shard["ep_size"] == 2
+        if legacy:
+            sidefile.unlink()
+        if rank == 0 and legacy:
             dense_path = engine._get_ckpt_name(directory, "legacy")
             dense = torch.load(dense_path, weights_only=False)
             dense["module"]["experts.weight"] = expected.cpu()
@@ -1367,6 +1426,17 @@ def test_legacy_ep_native_deepspeed_public_resume_restores_experts_before_step(t
     mp.spawn(
         _native_legacy_ep_resume_worker,
         args=((tmp_path / "legacy-rendezvous").as_uri(), str(tmp_path / "checkpoints")),
+        nprocs=2,
+        join=True,
+    )
+
+
+@require_torch_multi_gpu
+@require_deepspeed
+def test_ap_ep_native_deepspeed_two_rank_shard_round_trip(tmp_path):
+    mp.spawn(
+        _native_legacy_ep_resume_worker,
+        args=((tmp_path / "ap-rendezvous").as_uri(), str(tmp_path / "checkpoints"), False),
         nprocs=2,
         join=True,
     )

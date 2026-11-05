@@ -66,7 +66,9 @@ class MoEDeepSpeedAdapter:
 # Largest EP-group gather assembled on the master GPU in one piece during weight export.
 
 
-def _ep_checkpoint_parameters(model: nn.Module) -> dict[str, dict[str, nn.Parameter]]:
+def _ep_checkpoint_parameters(
+    model: nn.Module, *, partition_weights: bool = False
+) -> dict[str, dict[str, nn.Parameter]]:
     if not any(isinstance(module, (MoE, LatentMoE)) for module in model.modules()):
         return {}
     groups: dict[str, dict[str, nn.Parameter]] = {}
@@ -78,6 +80,11 @@ def _ep_checkpoint_parameters(model: nn.Module) -> dict[str, dict[str, nn.Parame
             if name in parameters:
                 raise ValueError(f"AP expert checkpoint has duplicate canonical parameter name: {name}")
             parameters[name] = parameter
+    if partition_weights:
+        if any(_ep_checkpoint_identity(name)["ep_size"] > 1 for name in groups):
+            raise ValueError("AP expert-parallel checkpoint shards do not support ZeRO stage 3; use ZeRO stage 1 or 2")
+        # EP=1 owns no rank-local experts: native ZeRO-3 saves and restores their partitions.
+        return {}
     return groups
 
 
@@ -195,17 +202,22 @@ def _validate_ep_checkpoint_storage_offsets(path: Path, tensors: dict, offsets: 
 def _ep_checkpoint_workspace(path: Path):
     prefix = f".ap-ep-checkpoint-{path.stem}-"
     # Sweep this rank's leftovers in every tag, without touching other ranks' active saves.
-    for tag in path.parent.parent.iterdir():
-        if not tag.is_dir():
-            continue
-        for workspace in tag.glob(f"{prefix}*"):
-            try:
-                owner = workspace / ".owner"
-                stamp = owner.stat().st_mtime if owner.exists() else workspace.stat().st_mtime
-                if workspace.is_dir() and time.time() - stamp > 60:
-                    shutil.rmtree(workspace)
-            except FileNotFoundError:
-                pass
+    try:
+        for tag in path.parent.parent.iterdir():
+            if tag.is_symlink() or not tag.is_dir():
+                continue
+            for workspace in tag.glob(f"{prefix}*"):
+                try:
+                    owner = workspace / ".owner"
+                    stamp = owner.stat().st_mtime if owner.exists() else workspace.stat().st_mtime
+                    if workspace.is_dir() and time.time() - stamp > 60:
+                        shutil.rmtree(workspace)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    get_logger().info("Could not clean expert checkpoint workspace %s", workspace, exc_info=True)
+    except OSError:
+        get_logger().info("Could not scan abandoned expert checkpoint workspaces", exc_info=True)
     with tempfile.TemporaryDirectory(prefix=prefix, dir=path.parent) as directory:
         owner = Path(directory) / ".owner"
         owner.touch()
@@ -421,7 +433,9 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
     def non_moe_state_dict(self, full_state_dict):
         state = original_non_moe_state_dict(self, full_state_dict)
         # Exclude AP's rank-local experts before DeepSpeed clones the dense checkpoint to CPU.
-        for named_parameters in _ep_checkpoint_parameters(self.module).values():
+        for named_parameters in _ep_checkpoint_parameters(
+            self.module, partition_weights=self.zero_optimization_partition_weights()
+        ).values():
             for name in named_parameters:
                 state.pop(canonical_parameter_name(name), None)
         return state
@@ -434,9 +448,9 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
             bound = save_signature.bind(self, *args, **kwargs)
             bound.apply_defaults()
             arguments = bound.arguments
-            parameters = _ep_checkpoint_parameters(self.module)
-            if len(parameters) > 0 and self.zero_optimization_partition_weights():
-                raise ValueError("AP expert-parallel checkpoint shards do not support ZeRO stage 3")
+            parameters = _ep_checkpoint_parameters(
+                self.module, partition_weights=self.zero_optimization_partition_weights()
+            )
             # Ordinary saves bypass _get_non_moe_state_dict; filter before their CPU clone too.
             previous_parameters = getattr(self, "_ap_ep_checkpoint_save_parameters", None)
             self._ap_ep_checkpoint_save_parameters = parameters
@@ -475,11 +489,11 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
         bound = load_signature.bind(self, *args, **kwargs)
         bound.apply_defaults()
         arguments = bound.arguments
-        parameters = _ep_checkpoint_parameters(self.module)
+        parameters = _ep_checkpoint_parameters(
+            self.module, partition_weights=self.zero_optimization_partition_weights()
+        )
         if len(parameters) == 0:
             return original_load(self, *args, **kwargs)
-        if self.zero_optimization_partition_weights():
-            raise ValueError("AP expert-parallel checkpoint shards do not support ZeRO stage 3")
         local_state = {}
         legacy_parameters = {}
         restore_legacy_masters = False
@@ -633,9 +647,11 @@ def patch_deepspeed_moe_detection() -> None:
     original = ds_engine.DeepSpeedEngine._configure_distributed_model
 
     def patched(self, model):
-        if self.zero_optimization_partition_weights() and _ep_checkpoint_parameters(model):
-            raise ValueError("AP expert-parallel models do not support ZeRO stage 3; use ZeRO stage 1 or 2")
+        partition_weights = self.zero_optimization_partition_weights()
+        _ep_checkpoint_parameters(model, partition_weights=partition_weights)
         original(self, model)
+        if partition_weights:
+            return
         if self.has_moe_layers:
             return
         for module in self.module.modules():
