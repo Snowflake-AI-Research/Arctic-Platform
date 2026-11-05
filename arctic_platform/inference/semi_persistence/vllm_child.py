@@ -4192,7 +4192,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 # which the vLLM plugin does not: without them extra_args'
                 # stop-token sequences are ignored, xgrammar can sample a
                 # stop token its grammar rejects, and dense prompt logprobs,
-                # spec-decode grammar checks and the DFlash2 NaN fixes are
+                # spec-decode grammar checks and the hybrid state fixes are
                 # missing. Every one is idempotent.
                 from arctic_platform.inference.vllm.required_patches import (
                     apply_required_vllm_patches)

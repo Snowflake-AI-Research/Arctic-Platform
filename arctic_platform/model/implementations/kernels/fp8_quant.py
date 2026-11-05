@@ -98,3 +98,63 @@ def per_token_group_quant_fp8(
         num_stages=1,
     )
     return x_q, x_s
+
+
+@triton.jit
+def _per_token_group_quant_fp8_mn_major(
+    y_ptr,
+    y_q_ptr,
+    y_s_ptr,
+    M,
+    y_row_stride,
+    s_group_stride,
+    eps,
+    fp8_min,
+    fp8_max,
+    GROUP: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    # One [BLOCK_M, GROUP] tile per program: coalesced row loads, and the BLOCK_M scales of one group are
+    # contiguous in the MN-major layout, so they store in one pass too.
+    rows = (tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    group = tl.program_id(1)
+    cols = group * GROUP + tl.arange(0, GROUP)
+    mask = rows < M
+    y = tl.load(y_ptr + rows[:, None] * y_row_stride + cols[None, :], mask=mask[:, None], other=0.0).to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(y), axis=1), eps) / fp8_max
+    y_q = tl.clamp(y / scale[:, None], fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    q_cols = tl.num_programs(1) * GROUP
+    tl.store(y_q_ptr + rows[:, None] * q_cols + cols[None, :], y_q, mask=mask[:, None])
+    tl.store(y_s_ptr + group * s_group_stride + rows, scale, mask=mask)
+
+
+def per_token_group_quant_fp8_mn_major(x: torch.Tensor, group_size: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+    """``per_token_group_quant_fp8`` with FP32 scales laid out MN-major and TMA-aligned (DeepGEMM's SM90 input).
+
+    Same values as the per-group kernel: ``scale = max(amax, eps) / 448`` per 1 x ``group_size`` group. The scales
+    come back as a ``[rows, groups]`` view of a ``[groups, aligned rows]`` buffer, the layout
+    ``deep_gemm.get_mn_major_tma_aligned_tensor`` would otherwise copy them into.
+    """
+    assert x.ndim == 2 and x.shape[-1] % group_size == 0 and x.stride(-1) == 1
+    rows, cols = x.shape
+    groups = cols // group_size
+    aligned = (rows + 3) // 4 * 4  # 16-byte TMA alignment of FP32 columns
+    x_q = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
+    x_s = torch.empty(groups, aligned, device=x.device, dtype=torch.float32)
+    if rows:
+        block_m = 32
+        _per_token_group_quant_fp8_mn_major[(triton.cdiv(rows, block_m), groups)](
+            x,
+            x_q,
+            x_s,
+            rows,
+            x.stride(0),
+            x_s.stride(0),
+            FP8_EPS,
+            FP8_MIN,
+            FP8_MAX,
+            GROUP=group_size,
+            BLOCK_M=block_m,
+            num_warps=4,
+        )
+    return x_q, x_s[:, :rows].t()

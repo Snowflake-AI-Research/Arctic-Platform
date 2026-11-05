@@ -49,6 +49,7 @@ from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.common.weight_checksum import tensor_l2_sq
 from arctic_platform.model import build_model
 from arctic_platform.model import ds_worker_dense_model_spec
+from arctic_platform.model import ds_worker_moe_model_spec
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
 
 logger = logging.getLogger(__name__)
@@ -167,24 +168,26 @@ class DeepSpeedWorker:
 
         pr0(f"ds_worker[after_modify]: {self.job_type=} {ds_config=} {ds_worker_config=}")
 
-        ep_size = int(ds_worker_config.get("ep_size", 1))
-        if ep_size != 1:
-            raise ValueError("on-prem expert-parallel loading is not wired; ep_size must be 1")
-        if self.sp_size != 1:
-            raise ValueError("on-prem sequence-parallel data dispatch is not wired; sp_size must be 1")
-        model_provider = ds_worker_config.get("model_provider", "huggingface")
-        if model_provider not in {"huggingface", "liger"}:
-            raise ValueError(f"on-prem dense training does not support model_provider={model_provider!r}")
         debug_config = job_config.get("training_config")
-        loaded = build_model(
-            ds_worker_dense_model_spec(
+        debug = gpu_memory_debug_config(debug_config if debug_config is not None else ds_worker_config)
+        ep_size = int(ds_worker_config.get("ep_size", 1))
+        # The MoE loader owns expert- and sequence-parallel layout, so only dense loading is gated here.
+        if ep_size > 1:
+            spec = ds_worker_moe_model_spec(model_name, {**ds_worker_config, "debug": debug})
+        else:
+            if self.sp_size != 1:
+                raise ValueError("on-prem sequence-parallel data dispatch is not wired; sp_size must be 1")
+            model_provider = ds_worker_config.get("model_provider", "huggingface")
+            if model_provider not in {"huggingface", "liger"}:
+                raise ValueError(f"on-prem dense training does not support model_provider={model_provider!r}")
+            spec = ds_worker_dense_model_spec(
                 model_name,
                 ds_worker_config,
                 dtype=str(job_config.get("dtype") or "bfloat16"),
                 sequence_parallel=self.sp_size,
-                debug=gpu_memory_debug_config(debug_config if debug_config is not None else ds_worker_config),
+                debug=debug,
             )
-        )
+        loaded = build_model(spec)
         model = loaded.model
         self._gpu_mem_preallocation = getattr(model, "_arctic_gpu_mem_preallocation", None)
 
@@ -192,11 +195,12 @@ class DeepSpeedWorker:
         self.dedup_actor_model_once_patcher = getattr(model, "_arctic_zorro_once_patcher", None)
 
         if self._has_optimizer:
+            # No mpu is passed, so DeepSpeed counts every rank as data-parallel.
             engine_spec = TrainingEngineSpec.from_deepspeed_config(
                 ds_config,
                 dtype=str(job_config.get("dtype") or "bfloat16"),
                 world_size=self.world_size,
-                sequence_parallel=self.sp_size,
+                sequence_parallel=1,
                 seed=job_config.get("seed"),
             )
             ds_config = build_deepspeed_config(engine_spec)
@@ -204,7 +208,7 @@ class DeepSpeedWorker:
                 model,
                 ds_config,
                 optimizer=engine_spec.optimizer,
-                ep_size=1,
+                ep_size=ep_size,
                 mpu=None,
                 model_path=model_name,
                 rank=self.rank,
@@ -317,7 +321,13 @@ class DeepSpeedWorker:
         )
         ds_config.setdefault("torch_autocast", {"enabled": True, "dtype": "bfloat16"})
         ds_config.setdefault("communication_data_type", "fp32")
-        ds_config.setdefault("data_types", {"grad_accum_dtype": "fp32"})
+        # DeepSpeed accumulates in the model dtype when ``grad_accum_dtype`` is unset, so the FP32 default belongs to
+        # the key, not the block: a supplied ``data_types`` without it still accumulates in FP32. ``None`` is how
+        # DeepSpeed spells unset. A new block is built so a caller's shared ``data_types`` dict is never mutated.
+        data_types = dict(ds_config.get("data_types") or {})
+        if data_types.get("grad_accum_dtype") is None:
+            data_types["grad_accum_dtype"] = "fp32"
+        ds_config["data_types"] = data_types
 
         return ds_config
 

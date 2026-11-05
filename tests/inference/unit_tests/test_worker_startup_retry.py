@@ -80,6 +80,43 @@ def test_is_address_in_use_error_walks_exception_chain():
     assert not worker_mod._is_address_in_use_error(RuntimeError("CUDA out of memory"))
 
 
+@pytest.mark.parametrize("synced, checkpoint", [(["kv_b_proj"], None), (["q_b_proj"], ["q_b_proj", "kv_b_proj"])])
+def test_initialize_rejects_kv_b_lora_on_mla_before_engine_start(monkeypatch, tmp_path, synced, checkpoint):
+    import json
+
+    class FakeEngineArgs:
+        def create_engine_config(self):
+            return types.SimpleNamespace(
+                model_config=types.SimpleNamespace(use_mla=True, architecture="Glm5NextForConditionalGeneration"),
+                structured_outputs_config=types.SimpleNamespace(enable_in_reasoning=False, reasoning_parser="deepseek_r1"),
+            )
+
+    class FakeAsyncLLM:
+        @classmethod
+        def from_vllm_config(cls, *args, **kwargs):
+            pytest.fail("engine started before rejecting an unservable LoRA target")
+
+    _install_fake_vllm(monkeypatch, FakeAsyncLLM)
+    for name in ("_ensure_arctic_vllm_patches", "_ensure_router_replay_vllm_patches",
+                 "ensure_xgrammar_stop_mask_fix", "ensure_spec_decode_grammar_fix"):
+        monkeypatch.setattr(worker_mod, name, lambda: None)
+    monkeypatch.setattr(worker_mod, "_create_async_engine_args", lambda *args, **kwargs: FakeEngineArgs())
+    kwargs = {"model": "test-model", "lora_peft_config": {"target_modules": synced}}
+    if checkpoint:
+        (tmp_path / "adapter_config.json").write_text(json.dumps({"target_modules": checkpoint}))
+        kwargs["lora_adapter_path"] = str(tmp_path)
+    worker = InferenceWorker.__ray_metadata__.modified_class()
+    with pytest.raises(ValueError, match="kv_b_proj.*absorbed"):
+        asyncio.run(worker.initialize(kwargs))
+
+
+@pytest.mark.parametrize("use_mla, targets", [(True, ["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj"]), (False, ["kv_b_proj"])])
+def test_mla_lora_guard_allows_servable_targets(use_mla, targets):
+    config = types.SimpleNamespace(use_mla=use_mla)
+    worker_mod._validate_mla_lora_targets(config, {"target_modules": targets})
+    worker_mod._validate_mla_lora_targets(config, None)
+
+
 def test_arctic_patch_fallback_stays_flag_independent(monkeypatch):
     from arctic_platform.inference.vllm import patches, required_patches
 
@@ -187,6 +224,7 @@ def test_initialize_drops_reasoning_parser_when_tokenizer_lacks_think_tokens(
     monkeypatch.setattr(worker_mod, "_ensure_arctic_vllm_patches", lambda: None)
     monkeypatch.setattr(worker_mod, "_ensure_router_replay_vllm_patches", lambda: None)
     monkeypatch.setattr(worker_mod, "ensure_xgrammar_stop_mask_fix", lambda: None)
+    monkeypatch.setattr(worker_mod, "ensure_spec_decode_grammar_fix", lambda: None)
     monkeypatch.setattr(
         worker_mod,
         "_create_async_engine_args",

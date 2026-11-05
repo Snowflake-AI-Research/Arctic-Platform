@@ -211,9 +211,19 @@ def test_ds_worker_config_selects_liger_provider_zorro_train_and_debug():
     assert spec.debug == {"gpu_mem_preallocate_gib": 2}
 
 
-def test_ds_worker_config_requires_attn_implementation():
+@pytest.mark.parametrize("flat", [{}, {"attn_implementation": None}])
+def test_ds_worker_config_requires_attn_implementation(flat):
     with pytest.raises(ValueError, match="requires attn_implementation"):
-        ds_worker_dense_model_spec("Qwen/Qwen3-8B", {}, dtype="bfloat16", sequence_parallel=1)
+        ds_worker_dense_model_spec("Qwen/Qwen3-8B", flat, dtype="bfloat16", sequence_parallel=1)
+
+
+@pytest.mark.parametrize("attn_implementation", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
+def test_ds_worker_config_accepts_any_flash_attention_backend(attn_implementation):
+    spec = ds_worker_dense_model_spec(
+        "Qwen/Qwen3-8B", {"attn_implementation": attn_implementation}, dtype="bfloat16", sequence_parallel=1
+    )
+
+    assert spec.attn_implementation == attn_implementation
 
 
 def test_ds_worker_config_rejects_zorro_train_with_sdpa():
