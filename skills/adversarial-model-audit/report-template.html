@@ -53,7 +53,7 @@ const AUDIT = {
   updated: "<timestamp>",
   // status: todo | running | done | ruled-out ; priority: lower runs first
   plan: [
-    {priority: 1, hypothesis: "Regression suite at tiny scale", experiment: "pytest tests/model_audit --audit-model <model>", cost: "minutes", status: "todo", evidence: ""},
+    {priority: 1, hypothesis: "Regression suite against the service", experiment: "pytest tests/model_audit --audit-model <model> --audit-refresh", cost: "one job", status: "todo", evidence: ""},
   ],
   // severity: critical | high | medium | low
   findings: [

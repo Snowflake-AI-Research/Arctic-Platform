@@ -16,15 +16,21 @@
 
 Opt-in (the root conftest skips this tree unless it is named)::
 
-    pytest -p no:xdist -sv tests/model_audit --audit-model glm-5.3-flash
-    AP_AUDIT_MODELS=glm-5.3-flash,qwen3-0.6b pytest -p no:xdist tests/model_audit -m "not vllm"
+    pytest -p no:xdist -sv tests/model_audit --audit-model qwen3-0.6b
+    AP_AUDIT_MODELS=qwen3-0.6b pytest -p no:xdist tests/model_audit -m "not vllm"
+
+The code under audit is a Cortex Training deployment, reached only through the ``cortex_training`` client: each
+probe of the trainer, optimizer, sampler or weight sync is a job on the service, started from the model-catalog
+configs the profile names (``AP_AUDIT_CATALOG`` is the ``model-catalog/models`` directory). The truth is a local
+fp32 reference on the same checkpoint, one GPU of this machine; checks whose reference does not fit skip. Checks
+that need state the client does not expose skip as coverage gaps.
 
 Every test carries ``@pytest.mark.audit_check("<id>")``. A profile's ``known_issues`` turns that check into a strict
 xfail linked to its issue (so a fix that lands shows up as XPASS and fails until the entry is removed), and
 ``not_applicable`` skips it with the profile's reason. Probes run once per session and are cached on disk under
-``$AP_MODEL_AUDIT_DIR`` keyed by the probe code, the tiny checkpoint and the arguments. Each check's outcome is
-appended to ``$AP_MODEL_AUDIT_DIR/results/<session>.jsonl`` for the audit report. ``$AP_AUDIT_SAMPLER_PYTHON``
-runs the sampler probe under another interpreter when the test env's vLLM is not the pinned one.
+``$AP_MODEL_AUDIT_DIR`` keyed by the probe code, the job body and the arguments; ``--audit-refresh`` reruns them
+(the service changes under a cached result). Each check's outcome is appended to
+``$AP_MODEL_AUDIT_DIR/results/<session>.jsonl`` for the audit report.
 """
 
 from __future__ import annotations
@@ -173,104 +179,137 @@ def record(request):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Tiny checkpoints and probes
+# Probes: the local reference and the service jobs
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="session")
-def tiny_ckpt(profile) -> Path:
-    return audit_lib.build_tiny_checkpoint(profile, seed=0)
-
-
-@pytest.fixture(scope="session")
-def tiny_ckpt_b(profile) -> Path:
-    """A second tiny checkpoint of the same config with different weights: the "trained" weights to sync."""
-    return audit_lib.build_tiny_checkpoint(profile, seed=1)
+_PROBE_CODE = {
+    "reference": (("audit_lib.py", "reference_probe.py", "deepseek_inference.py"), ("torch", "transformers"), ()),
+    "client": (
+        ("audit_lib.py", "client_probe.py"),
+        ("torch", "cortex-training"),
+        ("AP_AUDIT_CLIENT_CONNECTION", "CORTEX_TRAINING_HOST", "CORTEX_TRAINING_DATABASE"),
+    ),
+}
 
 
 @functools.cache
-def _code_hash() -> str:
+def _code_hash(kind: str) -> str:
+    """The probe's own code, its libraries and, for the service, which deployment it talks to."""
+    files, packages, env_vars = _PROBE_CODE[kind]
     digest = hashlib.sha256()
-    for name in ("audit_lib.py", "trainer_probe.py", "sampler_probe.py"):
+    for name in files:
         digest.update((audit_lib.AUDIT_DIR / name).read_bytes())
-    # The code under audit: a platform or library change must not replay a stale probe.
-    for path in sorted((_REPO_ROOT / "arctic_platform").rglob("*.py")):
-        stat = path.stat()
-        digest.update(f"{path.relative_to(_REPO_ROOT)}:{stat.st_size}:{stat.st_mtime_ns}".encode())
-    for package in ("torch", "transformers", "deepspeed", "vllm", "flashinfer-python", "liger-kernel"):
+    for package in packages:
         try:
             digest.update(f"{package}={importlib.metadata.version(package)}".encode())
         except importlib.metadata.PackageNotFoundError:
             pass
+    for var in env_vars:
+        digest.update(f"{var}={os.environ.get(var, '')}".encode())
     return digest.hexdigest()[:12]
 
 
-# Profile fields that only gate checks; editing them must not invalidate cached probe outputs.
-_GATING_KEYS = frozenset({"expect", "known_issues", "not_applicable", "tolerances"})
+def _probe_inputs(kind: str, profile) -> list:
+    """The profile fields a probe of ``kind`` reads besides its arguments."""
+    inputs = [profile.probe, profile.reference]
+    if kind == "reference":
+        try:
+            inputs.append(profile.launch_training())
+        except (LookupError, FileNotFoundError):
+            inputs.append(None)
+    return inputs
+
+
+def client_unavailable() -> str | None:
+    """Why no service job can run from here, or None."""
+    try:
+        import cortex_training  # noqa: F401
+    except ImportError:
+        return "cortex_training is not importable (install cortex-training or put its src on PYTHONPATH)"
+    if not os.environ.get("AP_AUDIT_CATALOG"):
+        return "AP_AUDIT_CATALOG (the model-catalog/models directory) is not set"
+    if os.environ.get("AP_AUDIT_CLIENT_CONNECTION"):
+        return None
+    missing = [
+        v for v in ("CORTEX_TRAINING_HOST", "CORTEX_TRAINING_PAT", "CORTEX_TRAINING_DATABASE") if not os.environ.get(v)
+    ]
+    return f"no service connection: set AP_AUDIT_CLIENT_CONNECTION or {', '.join(missing)}" if missing else None
 
 
 class ProbeRunner:
-    """Runs probe subprocesses on the first N visible GPUs and caches their outputs for the session."""
+    """Runs probe subprocesses, several at once when started ahead, and caches their outputs for the session."""
 
     def __init__(self, refresh: bool):
         self.refresh = refresh
         self.memo: dict[str, dict] = {}
+        self.pending: dict[str, tuple[subprocess.Popen, Path, Path, int]] = {}
 
-    def _visible(self) -> list[str]:
-        preset = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if preset:
-            return [g for g in preset.split(",") if g]
-        return [str(i) for i in range(torch.cuda.device_count())]
-
-    def _launch(self, kind, profile, ckpt, gpus, timeout, args, out, log) -> None:
-        out.unlink(missing_ok=True)
-        visible = self._visible()
-        if len(visible) < gpus:
-            pytest.skip(f"probe needs {gpus} GPU(s); {len(visible)} visible")
-        env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(visible[:gpus])}
-        env.pop("PYTEST_XDIST_WORKER", None)
-        # Another interpreter may have a different arctic_platform checkout installed.
-        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(_REPO_ROOT), env.get("PYTHONPATH")]))
-        script = audit_lib.AUDIT_DIR / f"{kind}_probe.py"
-        cli = ["--profile", str(profile.path), "--ckpt", str(ckpt), "--out", str(out)]
-        for name, value in args.items():
-            values = value if isinstance(value, list) else [value]
-            for v in values:
-                cli += [f"--{name.replace('_', '-')}", v if isinstance(v, str) else json.dumps(v)]
-        if kind == "trainer":
-            from arctic_platform.testing_utils import get_unique_port_number
-            from arctic_platform.testing_utils import reserve_free_port
-
-            port = reserve_free_port(get_unique_port_number() + 1, span=7)
-            cmd = [sys.executable, "-m", "torch.distributed.run", f"--nproc_per_node={gpus}"]
-            cmd += [f"--master_port={port}", str(script), *cli]
-        else:
-            cmd = [os.environ.get("AP_AUDIT_SAMPLER_PYTHON", sys.executable), str(script), *cli]
-        with log.open("w") as handle:
-            handle.write(" ".join(cmd) + "\n")
-            handle.flush()
-            proc = subprocess.run(cmd, env=env, stdout=handle, stderr=subprocess.STDOUT, timeout=timeout)
-        if not out.exists():
-            pytest.fail(f"{kind} probe exited {proc.returncode} without output; log: {log}")
-
-    def run(self, kind: str, profile, ckpt: Path, *, gpus: int = 1, timeout: int = 3600, **args) -> dict:
-        inputs = {k: v for k, v in profile.raw.items() if k not in _GATING_KEYS}
-        key_src = json.dumps([kind, inputs, str(ckpt), gpus, args, _code_hash()], sort_keys=True, default=str)
+    def _paths(self, kind: str, profile, ckpt: Path, name: str, args: dict) -> tuple[str, Path, Path]:
+        inputs = _probe_inputs(kind, profile)
+        key_src = json.dumps([kind, inputs, str(ckpt), args, _code_hash(kind)], sort_keys=True, default=str)
         key = hashlib.sha256(key_src.encode()).hexdigest()[:16]
-        if key in self.memo:
-            return self.memo[key]
         run_dir = audit_lib.audit_root() / "runs" / profile.name
         run_dir.mkdir(parents=True, exist_ok=True)
-        out = run_dir / f"{kind}-{args.get('mode', '')}-{key}.pt"
-        log = out.with_suffix(".log")
-        # A failed probe (e.g. a transient OOM) is not reused from disk.
-        result = None if self.refresh or not out.exists() else torch.load(out, weights_only=False)
-        if result is None or not result.get("status", {}).get("ok"):
-            self._launch(kind, profile, ckpt, gpus, timeout, args, out, log)
-            result = torch.load(out, weights_only=False)
+        out = run_dir / f"{kind}-{name}-{key}.pt"
+        return key, out, out.with_suffix(".log")
+
+    def start(self, kind: str, profile, ckpt: Path, *, name: str, timeout: int, **args) -> str:
+        """Launch the probe unless its output is cached or it is already running; returns its key."""
+        key, out, log = self._paths(kind, profile, ckpt, name, args)
+        if key in self.memo or key in self.pending:
+            return key
+        # A failed probe (e.g. a transient service error) is not reused from disk.
+        if not self.refresh and out.exists() and torch.load(out, weights_only=False).get("status", {}).get("ok"):
+            return key
+        out.unlink(missing_ok=True)
+        env = dict(os.environ)
+        env.pop("PYTEST_XDIST_WORKER", None)
+        cli = ["--profile", str(profile.path), "--ckpt", str(ckpt), "--out", str(out)]
+        for arg, value in args.items():
+            for v in value if isinstance(value, list) else [value]:
+                cli += [f"--{arg.replace('_', '-')}", v if isinstance(v, str) else json.dumps(v)]
+        if kind == "reference":
+            visible = [g for g in env.get("CUDA_VISIBLE_DEVICES", "").split(",") if g] or ["0"]
+            env["CUDA_VISIBLE_DEVICES"] = visible[0]
+        else:
+            env["CUDA_VISIBLE_DEVICES"] = ""
+        cmd = [sys.executable, str(audit_lib.AUDIT_DIR / f"{kind}_probe.py"), *cli]
+        handle = log.open("w")
+        handle.write(" ".join(cmd) + "\n")
+        handle.flush()
+        proc = subprocess.Popen(cmd, env=env, stdout=handle, stderr=subprocess.STDOUT)
+        self.pending[key] = (proc, out, log, timeout)
+        return key
+
+    def run(self, kind: str, profile, ckpt: Path, *, name: str, timeout: int = 3600, **args) -> dict:
+        key = self.start(kind, profile, ckpt, name=name, timeout=timeout, **args)
+        if key in self.memo:
+            return self.memo[key]
+        _, out, log = self._paths(kind, profile, ckpt, name, args)
+        if key in self.pending:
+            proc, out, log, timeout = self.pending.pop(key)
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                pytest.fail(f"{kind} probe {name} exceeded {timeout}s; log: {log}")
+            if not out.exists():
+                pytest.fail(f"{kind} probe {name} exited {proc.returncode} without output; log: {log}")
+        result = torch.load(out, weights_only=False)
         result["_log"] = str(log)
         self.memo[key] = result
         return result
+
+    def reference(self, profile, ckpt: Path) -> dict:
+        if not torch.cuda.is_available():
+            pytest.skip("the local reference needs a GPU")
+        # fp32 weights, gradients and two gradient accumulators, from a checkpoint stored in the launch dtype.
+        params = audit_lib.checkpoint_bytes(ckpt) / torch.finfo(getattr(torch, profile.dtype)).bits * 8
+        need, have = params * 16, torch.cuda.get_device_properties(0).total_memory
+        if need > 0.8 * have:
+            pytest.skip(f"the fp32 reference needs ~{need / 2**30:.0f} GiB, more than one local GPU has")
+        return self.run("reference", profile, ckpt, name=Path(ckpt).name)
 
 
 @pytest.fixture(scope="session")
@@ -286,56 +325,159 @@ def require_ok(result: dict, what: str) -> dict:
 
 
 @pytest.fixture(scope="session")
-def reference(probes, profile, tiny_ckpt):
-    return probes.run("trainer", profile, tiny_ckpt, mode="reference")
+def model_ckpt(profile) -> Path:
+    return audit_lib.local_checkpoint(profile)
 
 
 @pytest.fixture(scope="session")
-def trainer_forward(probes, profile, tiny_ckpt):
-    return probes.run("trainer", profile, tiny_ckpt, gpus=profile.baseline_gpus, mode="forward")
+def reference(probes, profile, model_ckpt):
+    return probes.reference(profile, model_ckpt)
 
 
-@pytest.fixture(scope="session")
-def baseline_step(probes, profile, tiny_ckpt):
-    """One production optimizer step at the audit lr on the baseline layout, with the engine-reduced gradients."""
-    return probes.run(
-        "trainer", profile, tiny_ckpt, gpus=profile.baseline_gpus, mode="step", parallelism=profile.tiny_parallelism()
+_CLIENT_TIMEOUT = 4 * 3600
+FORCED_CLIP = 1e-3
+
+
+def client_job(profile, name: str) -> dict:
+    """Body, step lr and sync formats of the service job ``name``."""
+    lr = profile.audit_lr
+    if name == "baseline":
+        return {"body": profile.job_body(training={}, sampling={}), "lr": lr, "sync_format": profile.sync_formats}
+    if name == "launch-lr":
+        return {"body": profile.job_body(training={}), "lr": profile.optimizer()["lr"], "forwards": "batch"}
+    if name == "forced-clip":
+        overrides = {"training_config": {"gradient_clipping": FORCED_CLIP}}
+        return {"body": profile.job_body(training=overrides), "lr": lr, "forwards": "batch"}
+    if name.startswith("layout-"):
+        layout = next(lay for lay in profile.layouts if lay["id"] == name[len("layout-") :])
+        overrides = {"training_config": layout["training_config"]}
+        return {"body": profile.job_body(training=overrides), "lr": lr, "forwards": "batch"}
+    if name.startswith("sampler-tp"):
+        tp = int(name[len("sampler-tp") :])
+        overrides = {"inference_config": {"n_gpus": tp, "vllm_config": {"tensor_parallel_size": tp}}}
+        return {"body": profile.job_body(sampling=overrides)}
+    raise KeyError(name)
+
+
+def launch_tp(profile) -> int:
+    return int(
+        profile.launch_sampling().get("inference_config", {}).get("vllm_config", {}).get("tensor_parallel_size", 1)
     )
 
 
-@pytest.fixture(scope="session")
-def sampler_run(probes, profile, tiny_ckpt):
-    return probes.run("sampler", profile, tiny_ckpt, gpus=profile.sampler_gpus)
+def _wanted_jobs(profile, items) -> list[str]:
+    """The service jobs the selected, runnable tests of ``profile`` read."""
+    wanted = []
+    for item in items:
+        params = getattr(getattr(item, "callspec", None), "params", {})
+        if getattr(params.get("profile"), "name", None) != profile.name or item.get_closest_marker("skip"):
+            continue
+        fixtures = set(item.fixturenames)
+        names = []
+        if fixtures & {"client_baseline", "trainer_forward", "baseline_step", "sampler_run"}:
+            names.append("baseline")
+        if "step_launch_lr" in fixtures:
+            names.append("launch-lr")
+        if "parallel_step" in fixtures and any(lay["id"] == params.get("layout") for lay in profile.layouts):
+            names.append(f"layout-{params['layout']}")
+        if "tp" in params and params["tp"] < launch_tp(profile):
+            names.append(f"sampler-tp{params['tp']}")
+        wanted += [n for n in names if n not in wanted]
+    return wanted
+
+
+class ClientJobs:
+    def __init__(self, probes: ProbeRunner, profile, ckpt: Path):
+        self.probes, self.profile, self.ckpt = probes, profile, ckpt
+        self.steps: dict[str, dict] = {}
+
+    def _spec(self, name: str) -> dict:
+        reason = client_unavailable()
+        if reason:
+            pytest.skip(reason)
+        try:
+            return client_job(self.profile, name)
+        except (LookupError, FileNotFoundError) as err:
+            pytest.skip(f"no service job for {self.profile.name}: {err}")
+
+    def start(self, name: str) -> None:
+        self.probes.start("client", self.profile, self.ckpt, name=name, timeout=_CLIENT_TIMEOUT, **self._spec(name))
+
+    def get(self, name: str) -> dict:
+        return self.probes.run(
+            "client", self.profile, self.ckpt, name=name, timeout=_CLIENT_TIMEOUT, **self._spec(name)
+        )
+
+    def step(self, name: str) -> dict:
+        """The optimizer step of job ``name`` as ``audit_lib.client_step`` reads it from the exports."""
+        if name not in self.steps:
+            run = self.get(name)
+            self.steps[name] = run
+            if run.get("status", {}).get("ok"):
+                self.steps[name] = {
+                    **audit_lib.client_step(self.profile, run),
+                    "status": run["status"],
+                    "_log": run["_log"],
+                }
+        return self.steps[name]
 
 
 @pytest.fixture(scope="session")
-def export_b(probes, profile, tiny_ckpt_b):
-    """Checkpoint B's production weight streams, in every format the production model exports."""
-    export_dir = audit_lib.audit_root() / "exports" / f"{profile.name}-{tiny_ckpt_b.name}"
-    export_dir.mkdir(parents=True, exist_ok=True)
-    return probes.run(
-        "trainer", profile, tiny_ckpt_b, gpus=profile.baseline_gpus, mode="export", export_dir=str(export_dir)
-    )
+def client(request, probes, profile, model_ckpt) -> ClientJobs:
+    jobs = ClientJobs(probes, profile, model_ckpt)
+    if client_unavailable() is None:
+        for name in _wanted_jobs(profile, request.session.items):
+            try:
+                jobs.start(name)
+            except pytest.skip.Exception:
+                pass
+    return jobs
 
 
 @pytest.fixture(scope="session")
-def fresh_b_ckpt(tiny_ckpt, tiny_ckpt_b, trainer_forward) -> Path:
-    """B, except that tensors the production model's full HF export lacks keep A's values.
-
-    The trainer holds no state for those, so training never changes them and a sampler synced from A keeps A's.
-    ``trainer.export_round_trip`` reports them.
-    """
-    held = set(require_ok(trainer_forward, "production forward")["exported"])
-    untrained = sorted(set(audit_lib.read_checkpoint_tensors(tiny_ckpt_b)) - held)
-    return audit_lib.with_tensors_from(tiny_ckpt_b, tiny_ckpt, untrained)
+def client_baseline(client):
+    return client.get("baseline")
 
 
 @pytest.fixture(scope="session")
-def sampler_fresh_b(probes, profile, fresh_b_ckpt):
-    return probes.run("sampler", profile, fresh_b_ckpt, gpus=profile.sampler_gpus)
+def trainer_forward(client_baseline):
+    run = client_baseline
+    if not run.get("status", {}).get("ok"):
+        return run
+    norms = run["step"]["reply"].get("gradient_norms_per_param") or {}
+    exported = audit_lib.read_checkpoint_tensors(Path(run["exports"]["initial"]))
+    return {
+        **run["forward"],
+        "loader": run["job"]["training"]["training_config"].get("model_provider"),
+        "spec": run["job"]["training"],
+        "exported": exported,
+        "no_grad_params": sorted(n for n in exported if not norms.get(n)),
+        "nonfinite_grad_params": sorted(
+            n for n, v in norms.items() if v is None or not torch.isfinite(torch.tensor(v))
+        ),
+        "status": run["status"],
+        "_log": run["_log"],
+    }
 
 
 @pytest.fixture(scope="session")
-def sampler_fresh_b_replica(probes, profile, fresh_b_ckpt):
-    """A second engine started on the same weights: a synced sampler is another engine, so it differs by this much."""
-    return probes.run("sampler", profile, fresh_b_ckpt, gpus=profile.sampler_gpus, replica=1)
+def baseline_step(client):
+    return client.step("baseline")
+
+
+@pytest.fixture(scope="session")
+def step_launch_lr(client):
+    return client.step("launch-lr")
+
+
+@pytest.fixture(scope="session")
+def forced_clip_step(client):
+    return client.step("forced-clip")
+
+
+@pytest.fixture(scope="session")
+def sampler_run(client_baseline):
+    run = client_baseline
+    if not run.get("status", {}).get("ok"):
+        return run
+    return {**run["sampler"], "exports": run.get("exports", {}), "status": run["status"], "_log": run["_log"]}

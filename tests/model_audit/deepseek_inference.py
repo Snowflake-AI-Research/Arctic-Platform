@@ -19,9 +19,6 @@ transformers has no implementation of these models, so the upstream code is the 
 kernels are replaced by plain torch: quantized weights are dequantized into ordinary bf16/fp32 linears, activation
 quantization is the identity (the trainer computes in bf16 too), and ``sparse_attn`` / ``hc_split_sinkhorn`` follow
 the kernels' math. Autograd runs through all of it, so the reference also supplies gradients.
-
-The same module writes the tiny checkpoints: its parameter names are the published tensor names, and each tensor is
-stored in the source checkpoint's dtype (FP8 blocks or packed MXFP4 with UE8M0 scales where the source has them).
 """
 
 from __future__ import annotations
@@ -30,19 +27,15 @@ import functools
 import importlib.util
 import json
 import math
-import re
 import sys
 import types
 from pathlib import Path
 
 import audit_lib
 import torch
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 _FP4_TABLE = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
-_FP8_MAX = 448.0
-_FP4_MAX = 6.0
 _ATTN_QUERY_CHUNK = 128
 
 # ModelArgs field -> HF text_config key, where the names differ; every other field has the same name in both.
@@ -241,32 +234,6 @@ def shipped_args_mismatches(checkpoint: str) -> dict:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _e8m0_scale(amax: torch.Tensor, qmax: float) -> torch.Tensor:
-    return torch.exp2(torch.ceil(torch.log2((amax / qmax).clamp_min(2.0**-126))))
-
-
-def quantize_fp8(weight: torch.Tensor, block: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor]:
-    """FP8 e4m3 blocks of ``block`` with a power-of-two UE8M0 scale each (the scale grid is ceil-divided)."""
-    rows, cols = weight.shape
-    br, bc = block
-    padded = F.pad(weight.float(), (0, -cols % bc, 0, -rows % br))
-    tiles = padded.unflatten(0, (-1, br)).unflatten(2, (-1, bc))  # [R, br, C, bc]
-    scale = _e8m0_scale(tiles.abs().amax(dim=(1, 3)), _FP8_MAX)  # [R, C]
-    q = (tiles / scale[:, None, :, None]).flatten(2).flatten(0, 1)[:rows, :cols]
-    return q.to(torch.float8_e4m3fn), scale.to(torch.float8_e8m0fnu)
-
-
-def quantize_mxfp4(weight: torch.Tensor, group: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """MXFP4: e2m1 per element, one UE8M0 scale per ``group`` along the last dim, two codes per int8 (low first)."""
-    rows, cols = weight.shape
-    groups = weight.float().unflatten(1, (-1, group))
-    scale = _e8m0_scale(groups.abs().amax(-1), _FP4_MAX)
-    scaled = (groups / scale.unsqueeze(-1)).flatten(1)
-    codes = (scaled.unsqueeze(-1) - _FP4_TABLE.to(scaled.device)).abs().argmin(-1).to(torch.uint8)
-    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
-    return packed.view(torch.int8), scale.to(torch.float8_e8m0fnu)
-
-
 def dequantize(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Inverse of the two quantizers, from the stored tensors alone."""
     if weight.dtype == torch.int8:
@@ -281,109 +248,10 @@ def dequantize(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return values * expanded
 
 
-def source_formats(checkpoint: str) -> dict[str, tuple[str, tuple[int, int] | None]]:
-    """Per abstracted tensor name: the stored dtype and, for quantized weights, the scale block (rows, cols)."""
-    from safetensors import safe_open
-
-    index_path = audit_lib._resolve_file(checkpoint, "model.safetensors.index.json")
-    weight_map = json.loads(Path(index_path).read_text())["weight_map"]
-    first: dict[str, str] = {}
-    for name in weight_map:
-        first.setdefault(_pattern(name), name)
-    handles: dict[str, object] = {}
-
-    def header(name):
-        filename = weight_map[name]
-        if filename not in handles:
-            handles[filename] = safe_open(audit_lib._resolve_file(checkpoint, filename), "pt")
-        piece = handles[filename].get_slice(name)
-        return piece.get_dtype(), piece.get_shape()
-
-    formats = {}
-    for pattern, name in first.items():
-        if name.endswith(".scale"):
-            continue
-        dtype, shape = header(name)
-        block = None
-        scale_name = name[: -len("weight")] + "scale" if name.endswith("weight") else None
-        if scale_name in weight_map:
-            _, scale_shape = header(scale_name)
-            cols = shape[1] * (2 if dtype == "I8" else 1)
-            block = (-(-shape[0] // scale_shape[0]), -(-cols // scale_shape[1]))
-            if block[0] > 1:
-                block = (2 ** round(math.log2(block[0])), 2 ** round(math.log2(block[1])))
-        formats[pattern] = (dtype, block)
-    return formats
-
-
-def _pattern(name: str) -> str:
-    return re.sub(r"\.\d+(?=\.|$)", ".N", name)
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Tiny checkpoints
-# ---------------------------------------------------------------------------------------------------------------------
-
-
 def _tokenizer(directory: str):
     import transformers
 
     return transformers.AutoTokenizer.from_pretrained(directory)
-
-
-def _random_init(model: torch.nn.Module, seed: int) -> None:
-    gen = torch.Generator().manual_seed(seed)
-    with torch.no_grad():
-        for name, param in model.named_parameters():
-            if param.dtype in (torch.float8_e8m0fnu,):
-                continue
-            leaf = name.rsplit(".", 1)[-1]
-            shape = param.shape
-            if re.search(r"norm\.weight$|^norm\.weight$", name) or leaf in ("q_weight", "k_weight"):
-                value = 1.0 + 0.1 * torch.randn(shape, generator=gen)
-            elif leaf == "attn_sink":
-                value = torch.randn(shape, generator=gen)
-            elif leaf in ("bias", "bias_vl"):
-                value = 0.1 * torch.randn(shape, generator=gen)
-            elif leaf.startswith("hc_") and leaf.endswith("_scale"):
-                value = 0.5 + 0.1 * torch.randn(shape, generator=gen)
-            elif leaf.startswith("hc_") and leaf.endswith("_base"):
-                value = torch.randn(shape, generator=gen)
-            else:
-                fan_in = shape[-1] if len(shape) > 1 else 1
-                value = torch.randn(shape, generator=gen) * min(0.02, fan_in**-0.5)
-            param.data = value.float()
-
-
-def build_tiny(checkpoint: str, config_dict: dict, out_dir: Path, seed: int) -> None:
-    """Random tiny weights written with the published names, dtypes and quantization blocks of ``checkpoint``."""
-    from safetensors.torch import save_file
-
-    module = load_module(checkpoint)
-    args = model_args(module, config_dict, quantized=False, max_seq_len=256)
-    with torch.device("cpu"), module.set_dtype(torch.bfloat16):
-        model = module.Transformer(args, tokenizer=_tokenizer(str(out_dir)))
-    _random_init(model, seed)
-    formats = source_formats(checkpoint)
-    tensors: dict[str, torch.Tensor] = {}
-    # named_parameters drops the MTP block's aliases of the shared embed and head.
-    for name, param in model.named_parameters():
-        value = param.detach()
-        if name.endswith(".scale"):
-            continue
-        pattern = _pattern(name)
-        assert pattern in formats, f"{name} has no counterpart in {checkpoint}"
-        dtype, block = formats[pattern]
-        if dtype == "F8_E4M3":
-            q, s = quantize_fp8(value, block)
-            tensors[name], tensors[name[: -len("weight")] + "scale"] = q, s
-        elif dtype == "I8":
-            assert block[0] == 1, (name, block)
-            q, s = quantize_mxfp4(value, block[1])
-            tensors[name], tensors[name[: -len("weight")] + "scale"] = q, s
-        else:
-            tensors[name] = value.to({"BF16": torch.bfloat16, "F32": torch.float32}[dtype]).contiguous()
-    save_file(tensors, str(out_dir / "model.safetensors"), metadata={"format": "pt"})
 
 
 # ---------------------------------------------------------------------------------------------------------------------

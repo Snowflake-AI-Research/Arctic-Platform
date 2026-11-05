@@ -12,27 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Model-agnostic pieces of the model audit: profiles, tiny checkpoints, inputs, metrics.
+"""Model-agnostic pieces of the model audit: profiles, client job bodies, inputs, checkpoint readers, metrics.
 
 Not collected by pytest. Imported by the tests and by the probe subprocesses, so it must not import CUDA-only or
-vLLM-only modules at import time.
+client-only modules at import time.
 
-A *profile* (``profiles/<name>.yaml``) is the only per-model input. It names the source checkpoint, the
-configuration we will launch first, how to shrink the config into a tiny random-init checkpoint that keeps every
-layer kind, the token positions where code paths switch, and the known issues that turn a check into a strict
-xfail. Everything else is derived from the checkpoint's own ``config.json``.
+A *profile* (``profiles/<name>.yaml``) is the only per-model input. It names the checkpoint, the model-catalog
+configs the service launches it with, the parallel layouts to compare, the token positions where code paths switch,
+and the known issues that turn a check into a strict xfail. Everything else is derived from the checkpoint's own
+``config.json`` and from what the service returns.
 """
 
 from __future__ import annotations
 
 import copy
 import dataclasses
-import hashlib
 import json
 import math
 import os
 import re
-import shutil
 import statistics
 import tempfile
 from pathlib import Path
@@ -43,22 +41,7 @@ import yaml
 AUDIT_DIR = Path(__file__).resolve().parent
 PROFILES_DIR = AUDIT_DIR / "profiles"
 
-_TOKENIZER_FILES = (
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "vocab.json",
-    "merges.txt",
-    "tokenizer.model",
-    "chat_template.jinja",
-    "generation_config.json",
-    "preprocessor_config.json",
-    "processor_config.json",
-    "video_preprocessor_config.json",
-)
 _EXPERT_COUNT_KEYS = ("n_routed_experts", "num_experts", "num_local_experts", "moe_num_experts")
-_EXPERT_TOPK_KEYS = ("num_experts_per_tok", "moe_topk", "top_k")
-_SUBCONFIG_DEPTH_KEYS = ("depth", "num_hidden_layers", "num_layers", "encoder_layers")
 # Config keys whose value is a token position where an attention or rotary code path changes.
 _THRESHOLD_KEYS = ("sliding_window", "attention_chunk_size", "original_max_position_embeddings")
 
@@ -94,12 +77,12 @@ class Profile:
         return os.path.expandvars(self.raw["checkpoint"])
 
     @property
-    def launch(self) -> dict:
-        return self.raw.get("launch", {})
+    def client(self) -> dict:
+        return self.raw.get("client", {})
 
     @property
-    def tiny(self) -> dict:
-        return self.raw.get("tiny", {})
+    def probe(self) -> dict:
+        return self.raw.get("probe", {})
 
     @property
     def expect(self) -> dict:
@@ -119,7 +102,7 @@ class Profile:
 
     @property
     def dtype(self) -> str:
-        return self.launch.get("dtype", "bfloat16")
+        return self.launch_training().get("dtype", "bfloat16")
 
     @property
     def reference(self) -> str:
@@ -132,47 +115,46 @@ class Profile:
     def not_applicable(self, check_id: str) -> str | None:
         return (self.raw.get("not_applicable") or {}).get(check_id)
 
-    def trainer_spec(self, *, model_path: str, tiny: bool = True, parallelism: dict | None = None) -> dict:
-        """``ModelSpec`` keyword arguments for the trainer, as the platform sends them for the launch config."""
-        spec = copy.deepcopy(self.launch.get("trainer", {}))
-        if tiny:
-            spec = _deep_merge(spec, self.tiny.get("trainer", {}))
-        if parallelism is not None:
-            spec["parallelism"] = {**spec.get("parallelism", {}), **parallelism}
-        spec["model_path_or_name"] = model_path
-        spec.setdefault("dtype", self.dtype)
-        return spec
+    def _catalog_sub_job(self, kind: str) -> dict:
+        root = os.environ.get("AP_AUDIT_CATALOG")
+        if not root:
+            raise LookupError("AP_AUDIT_CATALOG (the model-catalog/models directory) is not set")
+        path = Path(root, self.client["catalog"], self.client.get("variant", "standard"), f"{self.client[kind]}.json")
+        sub_jobs = json.loads(path.read_text())["sub_job_configs"]
+        assert len(sub_jobs) == 1, f"{path}: expected one sub-job config, found {len(sub_jobs)}"
+        return _deep_merge(sub_jobs[0], self.client.get("overrides", {}).get(kind, {}))
 
-    def engine(self) -> dict:
-        """``TrainingEngineSpec`` fields other than dtype, world size, SP degree and optimizer."""
-        return copy.deepcopy(self.launch.get("engine", {}))
+    def launch_training(self) -> dict:
+        """The training sub-job config the service launches this model with."""
+        return self._catalog_sub_job("training") if self.client.get("training") else {}
 
-    def tiny_parallelism(self) -> dict:
-        return self.trainer_spec(model_path="", tiny=True).get("parallelism", {})
+    def launch_sampling(self) -> dict:
+        return self._catalog_sub_job("sampling") if self.client.get("sampling") else {}
 
-    @property
-    def baseline_gpus(self) -> int:
-        """GPUs of the baseline layout: the smallest one the production loader builds (EP > 1 for most MoE models)."""
-        return layout_world(self.tiny_parallelism())
-
-    def sampler_args(self, *, tiny: bool = True) -> dict:
-        args = copy.deepcopy(self.launch.get("sampler", {}))
-        if tiny:
-            args = _deep_merge(args, self.tiny.get("sampler", {}))
-        return args
-
-    @property
-    def sampler_gpus(self) -> int:
-        return int(self.sampler_args().get("tensor_parallel_size", 1))
+    def job_body(self, *, training: dict | None = None, sampling: dict | None = None) -> dict:
+        """A create-job body: the launch sub-jobs with overrides; ``None`` leaves that sub-job out."""
+        for kind, wanted in (("training", training), ("sampling", sampling)):
+            if wanted is not None and not self.client.get(kind):
+                raise LookupError(f"{self.name} names no {kind} config in client.{kind}")
+        sub_jobs = []
+        if training is not None:
+            sub = _deep_merge(self.launch_training(), training)
+            # Without these the step reports no per-parameter norms and the gradient checks have nothing to read.
+            sub["training_config"]["debug"] = {"gradient_norms_per_param": True, "gradient_sample_max_numel": 0}
+            sub_jobs.append(sub)
+        if sampling is not None:
+            sub_jobs.append(_deep_merge(self.launch_sampling(), sampling))
+        return {"hardware": self.client.get("hardware", "H200"), "sub_job_configs": sub_jobs}
 
     def optimizer(self, lr: float | None = None) -> dict:
         """The launch optimizer; ``lr`` overrides the learning rate (the direction check uses a visible one)."""
+        launch = self.launch_training().get("training_config", {}).get("optimizer", {})
         settings = {
             "lr": 1e-6,
             "betas": [0.9, 0.999],
             "eps": 1e-8,
             "weight_decay": 0.0,
-            **self.launch.get("optimizer", {}),
+            **{k: v for k, v in launch.items() if k != "name"},
         }
         if lr is not None:
             settings["lr"] = lr
@@ -180,7 +162,16 @@ class Profile:
 
     @property
     def audit_lr(self) -> float:
-        return float(self.raw.get("probe", {}).get("audit_lr", 1e-3))
+        return float(self.probe.get("audit_lr", 1e-3))
+
+    @property
+    def layouts(self) -> list[dict]:
+        """Parallel layouts: ``{id, training_config}`` overrides of the launch training config."""
+        return list(self.client.get("layouts", []))
+
+    @property
+    def sync_formats(self) -> list[str]:
+        return list(self.client.get("sync_formats", ["vllm", "hf"]))
 
 
 def load_profile(name_or_path: str) -> Profile:
@@ -196,18 +187,6 @@ def all_profiles() -> list[Profile]:
     return [load_profile(str(p)) for p in sorted(PROFILES_DIR.glob("*.yaml"))]
 
 
-def layout_world(layout: dict) -> int:
-    """World size of a parallel layout; ``world_size`` adds data-parallel replicas beyond max(EP, SP)."""
-    return int(
-        layout.get("world_size", max(int(layout.get("expert_parallel", 1)), int(layout.get("sequence_parallel", 1))))
-    )
-
-
-def layout_id(layout: dict) -> str:
-    base = f"ep{layout.get('expert_parallel', 1)}-sp{layout.get('sequence_parallel', 1)}"
-    return base if "world_size" not in layout else f"{base}-w{layout['world_size']}"
-
-
 def _deep_merge(base: Any, override: Any) -> Any:
     if isinstance(base, dict) and isinstance(override, dict):
         merged = dict(base)
@@ -218,7 +197,7 @@ def _deep_merge(base: Any, override: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Source config and checkpoint index (never loads weights)
+# Checkpoints
 # ---------------------------------------------------------------------------------------------------------------------
 
 
@@ -243,288 +222,22 @@ def source_config(profile: Profile) -> dict:
     return json.loads(Path(path).read_text())
 
 
-def source_weight_names(profile: Profile) -> set[str]:
-    """Tensor names of the real checkpoint, from its safetensors index or header; no tensor data is read."""
-    index = _resolve_file(profile.checkpoint, "model.safetensors.index.json")
-    if index is not None:
-        return set(json.loads(Path(index).read_text())["weight_map"])
-    single = _resolve_file(profile.checkpoint, "model.safetensors")
-    assert single is not None, f"{profile.checkpoint} has neither model.safetensors.index.json nor model.safetensors"
-    from safetensors import safe_open
+def local_checkpoint(profile: Profile) -> Path:
+    """The checkpoint's config, tokenizer and weights on local disk (the HF cache for a hub id)."""
+    if Path(profile.checkpoint).is_dir():
+        return Path(profile.checkpoint)
+    from huggingface_hub import snapshot_download
 
-    with safe_open(single, framework="pt") as handle:
-        return set(handle.keys())
+    return Path(snapshot_download(profile.checkpoint, allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model"]))
+
+
+def checkpoint_bytes(path: Path) -> int:
+    return sum(f.stat().st_size for f in Path(path).glob("*.safetensors"))
 
 
 def text_config_of(config: dict) -> dict:
     text = config.get("text_config")
     return text if isinstance(text, dict) else config
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Shrinking a config into a tiny one that keeps every layer kind
-# ---------------------------------------------------------------------------------------------------------------------
-
-
-def _mtp_layers(text: dict) -> int:
-    return int(text.get("num_nextn_predict_layers") or 0)
-
-
-def _per_layer_lists(text: dict, num_layers: int) -> dict[str, list]:
-    """Per-layer lists; some configs append one entry per MTP layer after the backbone's."""
-    lengths = {num_layers, num_layers + _mtp_layers(text)}
-    return {
-        key: value
-        for key, value in text.items()
-        if isinstance(value, list) and len(value) in lengths and key not in ("eos_token_id",)
-    }
-
-
-def _layer_id_scalars(text: dict, num_layers: int) -> dict[str, int]:
-    """Single layer ids (e.g. ``candidate_source_layer_id``); a negative value means none."""
-    return {
-        key: value
-        for key, value in text.items()
-        if key.endswith("_layer_id") and isinstance(value, int) and not isinstance(value, bool) and value < num_layers
-    }
-
-
-def _layer_index_lists(text: dict, num_layers: int) -> list[tuple[tuple[str, ...], list[int]]]:
-    """Lists of layer indices inside nested dicts (e.g. ``linear_attn_config.kda_layers``)."""
-    found = []
-
-    def visit(node: Any, path: tuple[str, ...]) -> None:
-        if isinstance(node, dict):
-            for key, value in node.items():
-                visit(value, path + (key,))
-        elif (
-            isinstance(node, list)
-            and node
-            and "layer" in path[-1]
-            and all(isinstance(v, int) and not isinstance(v, bool) and 0 <= v < num_layers for v in node)
-            and len(node) != num_layers
-        ):
-            found.append((path, node))
-
-    for key, value in text.items():
-        if isinstance(value, dict):
-            visit(value, (key,))
-        elif isinstance(value, list) and key.endswith(("layers", "layer_ids")) and len(value) != num_layers:
-            visit(value, (key,))
-    return found
-
-
-def layer_signatures(text: dict) -> list[tuple]:
-    """One hashable signature per layer: every per-layer property the config declares."""
-    num_layers = int(text["num_hidden_layers"])
-    lists = _per_layer_lists(text, num_layers)
-    index_lists = _layer_index_lists(text, num_layers)
-    scalars = _layer_id_scalars(text, num_layers)
-    first_dense = text.get("first_k_dense_replace")
-    moe_freq = text.get("moe_layer_freq") if isinstance(text.get("moe_layer_freq"), int) else None
-    signatures = []
-    for i in range(num_layers):
-        sig = [(key, json.dumps(values[i], sort_keys=True)) for key, values in sorted(lists.items())]
-        sig += [(".".join(path), i in set(indices)) for path, indices in index_lists]
-        sig += [(key, i == value) for key, value in sorted(scalars.items())]
-        if isinstance(first_dense, int):
-            sig.append(("first_k_dense_replace", i < first_dense))
-        if moe_freq:
-            sig.append(("moe_layer_freq", i % moe_freq == 0))
-        signatures.append(tuple(sig))
-    return signatures
-
-
-def select_layers(text: dict, explicit: list[int] | None = None, min_layers: int = 2) -> list[int]:
-    """First layer of every distinct kind, in order; padded to ``min_layers`` with repeats of the commonest kind."""
-    if explicit:
-        return sorted(explicit)
-    signatures = layer_signatures(text)
-    keep: list[int] = []
-    seen: set[tuple] = set()
-    for i, sig in enumerate(signatures):
-        if sig not in seen:
-            seen.add(sig)
-            keep.append(i)
-    for i in range(len(signatures)):
-        if len(keep) >= min_layers:
-            break
-        if i not in keep:
-            keep.append(i)
-    return sorted(keep)
-
-
-def shrink_config(full: dict, tiny: dict) -> tuple[dict, list[int]]:
-    """Tiny config with one layer of every kind, fewer experts and the profile's explicit overrides."""
-    config = copy.deepcopy(full)
-    text = text_config_of(config)
-    num_layers = int(text["num_hidden_layers"])
-    keep = select_layers(text, tiny.get("layers"), tiny.get("min_layers", 2))
-    remap = {old: new for new, old in enumerate(keep)}
-
-    overrides = tiny.get("text_overrides") or {}
-    mtp = int(overrides.get("num_nextn_predict_layers", _mtp_layers(text)))
-    for key, values in _per_layer_lists(text, num_layers).items():
-        tail = values[num_layers : num_layers + mtp] if len(values) > num_layers else []
-        text[key] = [values[i] for i in keep] + tail
-    for key, value in _layer_id_scalars(text, num_layers).items():
-        text[key] = remap.get(value, -1)
-    for path, indices in _layer_index_lists(text, num_layers):
-        node = text
-        for part in path[:-1]:
-            node = node[part]
-        node[path[-1]] = [remap[i] for i in indices if i in remap]
-    if isinstance(text.get("first_k_dense_replace"), int):
-        text["first_k_dense_replace"] = sum(1 for i in keep if i < full_text(full)["first_k_dense_replace"])
-    text["num_hidden_layers"] = len(keep)
-
-    topk = next((int(text[k]) for k in _EXPERT_TOPK_KEYS if isinstance(text.get(k), int)), None)
-    for key in _EXPERT_COUNT_KEYS:
-        if isinstance(text.get(key), int) and text[key] > 1:
-            text[key] = int(tiny.get("experts", max(8, 2 * (topk or 1))))
-
-    for name, sub in config.items():
-        if name != "text_config" and isinstance(sub, dict) and name.endswith("_config"):
-            for key in _SUBCONFIG_DEPTH_KEYS:
-                if isinstance(sub.get(key), int):
-                    sub[key] = int(tiny.get("subconfig_layers", 1))
-
-    for key, value in (tiny.get("text_overrides") or {}).items():
-        text[key] = _deep_merge(text.get(key), value) if isinstance(value, dict) else value
-    for key, value in (tiny.get("config_overrides") or {}).items():
-        if value is None:
-            config.pop(key, None)
-            text.pop(key, None)
-            continue
-        config[key] = _deep_merge(config.get(key), value) if isinstance(value, dict) else value
-    return config, keep
-
-
-def full_text(full: dict) -> dict:
-    return text_config_of(full)
-
-
-def thresholds(profile: Profile, tiny_config: dict) -> list[dict]:
-    """Token positions where the tiny model switches code paths: declared by the profile plus generic config keys."""
-    text = text_config_of(tiny_config)
-    found = [dict(t) for t in profile.tiny.get("thresholds", [])]
-    rope = text.get("rope_scaling") or text.get("rope_parameters") or {}
-    for key in _THRESHOLD_KEYS:
-        value = text.get(key, rope.get(key) if isinstance(rope, dict) else None)
-        if isinstance(value, int) and value > 0:
-            found.append({"name": key, "position": value, "reason": f"config.{key}"})
-    unique = {t["position"]: t for t in found}
-    return [unique[p] for p in sorted(unique)]
-
-
-SHORT_ROW_LENGTHS = tuple(range(1, 9))
-
-
-def row_lengths(profile: Profile, tiny_config: dict) -> list[int]:
-    """Packed-row lengths: short rows plus rows that straddle every threshold, capped at ``tiny.max_row_len``."""
-    if profile.tiny.get("row_lengths"):
-        return list(profile.tiny["row_lengths"])
-    cap = int(profile.tiny.get("max_row_len", 2048))
-    lengths = [7, 61, 130]
-    for t in thresholds(profile, tiny_config):
-        if t["position"] + 64 <= cap:
-            lengths.append(t["position"] + 64)
-    return lengths
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Tiny checkpoints
-# ---------------------------------------------------------------------------------------------------------------------
-
-
-_TINY_FORMAT = 2
-
-
-def _config_hash(config: dict, seed: int, dtype: str, reference: str = "transformers") -> str:
-    import torch
-    import transformers
-
-    key = [config, seed, dtype, transformers.__version__, torch.__version__, _TINY_FORMAT]
-    payload = json.dumps(key if reference == "transformers" else [*key, reference], sort_keys=True)
-    return hashlib.sha256(payload.encode()).hexdigest()[:16]
-
-
-def tiny_config(profile: Profile) -> dict:
-    return shrink_config(source_config(profile), profile.tiny)[0]
-
-
-def build_tiny_checkpoint(profile: Profile, seed: int = 0) -> Path:
-    """Random-init tiny checkpoint saved the way ``save_pretrained`` writes it, plus the source tokenizer files.
-
-    ``config.json`` is the source's own, with the tiny overrides: transformers may re-serialize a config in a newer
-    schema than the checkpoint ships with, and production reads the shipped one.
-
-    Cached under ``audit_root()`` by config hash, so every probe of a session reads the same weights.
-    """
-    import torch
-    import transformers
-
-    config_dict = tiny_config(profile)
-    key = _config_hash(config_dict, seed, profile.dtype, profile.reference)
-    out = audit_root() / "checkpoints" / f"{profile.name}-{key}-s{seed}"
-    if (out / ".complete").exists():
-        _copy_tokenizer_files(profile, out)
-        return out
-    staging = Path(tempfile.mkdtemp(prefix=f"{out.name}.", dir=out.parent if out.parent.exists() else None))
-    try:
-        (staging / "config.json").write_text(json.dumps(config_dict, indent=2))
-        _copy_tokenizer_files(profile, staging)
-        if profile.reference == "deepseek_inference":
-            import deepseek_inference
-
-            deepseek_inference.build_tiny(profile.checkpoint, config_dict, staging, seed)
-        else:
-            config = transformers.AutoConfig.from_pretrained(str(staging))
-            arch = (config_dict.get("architectures") or [None])[0]
-            model_cls = getattr(transformers, arch, None) if arch else None
-            if model_cls is None:
-                model_cls = transformers.AutoModelForCausalLM._model_mapping[type(config)]
-            torch.manual_seed(seed)
-            with torch.device("cpu"):
-                model = model_cls._from_config(config, dtype=torch.float32)
-            _perturb_zero_init(model, seed)
-            model.to(getattr(torch, profile.dtype)).save_pretrained(str(staging), safe_serialization=True)
-        (staging / "config.json").write_text(json.dumps(config_dict, indent=2))
-        (staging / ".complete").write_text("")
-        out.parent.mkdir(parents=True, exist_ok=True)
-        if out.exists():
-            shutil.rmtree(out)
-        staging.rename(out)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-    return out
-
-
-def _copy_tokenizer_files(profile: Profile, directory: Path) -> None:
-    """Tokenizer and processor files from the source checkpoint; existing ones are kept."""
-    for name in _TOKENIZER_FILES:
-        if (directory / name).exists():
-            continue
-        src = _resolve_file(profile.checkpoint, name)
-        if src is not None:
-            shutil.copy(src, directory / name)
-
-
-def _perturb_zero_init(model, seed: int) -> None:
-    """Give zero- or one-initialized parameters (biases, norms, gates) random values so their bugs are visible."""
-    import torch
-
-    gen = torch.Generator().manual_seed(seed + 1)
-    with torch.no_grad():
-        for name, param in model.named_parameters():
-            if param.numel() == 0 or not param.is_floating_point():
-                continue
-            if bool((param == param.flatten()[0]).all()):
-                noise = torch.randn(param.shape, generator=gen, dtype=param.dtype) * 0.02
-                param.add_(noise)
-        for name, buf in model.named_buffers():
-            if buf.is_floating_point() and buf.numel() > 1 and "bias" in name and bool((buf == 0).all()):
-                buf.add_(torch.randn(buf.shape, generator=gen, dtype=buf.dtype) * 0.02)
 
 
 def read_checkpoint_tensors(path: Path) -> dict:
@@ -536,36 +249,76 @@ def read_checkpoint_tensors(path: Path) -> dict:
     return tensors
 
 
-def with_tensors_from(base: Path, donor: Path, names: list[str]) -> Path:
-    """A copy of checkpoint ``base`` whose tensors ``names`` hold ``donor``'s values (cached next to ``base``)."""
-    from safetensors.torch import save_file
+def zero_checkpoint(path: Path) -> dict:
+    """fp32 master weights and Adam moments of a DeepSpeed ZeRO-1/2 checkpoint, merged across ranks, by name."""
+    import torch
 
-    if not names:
-        return base
-    key = hashlib.sha256(json.dumps([donor.name, sorted(names)]).encode()).hexdigest()[:12]
-    out = base.parent / f"{base.name}-from-{key}"
-    if (out / ".complete").exists():
-        return out
-    tensors, given = read_checkpoint_tensors(base), read_checkpoint_tensors(donor)
-    tensors.update({name: given[name] for name in names})
-    staging = Path(tempfile.mkdtemp(prefix=f"{out.name}.", dir=base.parent))
-    try:
-        for file in base.iterdir():
-            if file.is_file() and file.suffix != ".safetensors" and not file.name.endswith(".index.json"):
-                shutil.copy(file, staging / file.name)
-        save_file(tensors, str(staging / "model.safetensors"), metadata={"format": "pt"})
-        (staging / ".complete").write_text("")
-        if out.exists():
-            shutil.rmtree(out)
-        staging.rename(out)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-    return out
+    path = Path(path)
+    shapes = torch.load(next(path.glob("*mp_rank_00_model_states.pt")), map_location="cpu", weights_only=False)
+    shapes = shapes["param_shapes"]
+    rank_files = sorted(
+        path.glob("*zero_pp_rank_*_mp_rank_00_optim_states.pt"),
+        key=lambda f: int(re.search(r"zero_pp_rank_(\d+)_", f.name).group(1)),
+    )
+    assert rank_files, f"{path} holds no ZeRO optimizer partitions"
+    pieces: dict[str, dict[str, list]] = {"masters": {}, "exp_avg": {}, "exp_avg_sq": {}}
+    hyper = None
+    for file in rank_files:
+        state = torch.load(file, map_location="cpu", weights_only=False)["optimizer_state_dict"]
+        base = state["base_optimizer_state"]
+        hyper = hyper or {k: v for k, v in base["param_groups"][0].items() if k != "params"}
+        for group, mapping in enumerate(state["param_slice_mappings"]):
+            flats = {
+                "masters": state["single_partition_of_fp32_groups"][group],
+                "exp_avg": base["state"][group]["exp_avg"],
+                "exp_avg_sq": base["state"][group]["exp_avg_sq"],
+            }
+            for name, fragment in mapping.items():
+                for kind, flat in flats.items():
+                    pieces[kind].setdefault(name, []).append(flat[fragment.start : fragment.start + fragment.numel])
+        del state
+    names = {name: shape for group in shapes for name, shape in group.items()}
+    out = {
+        kind: {n: torch.cat(parts).view(names[n]) for n, parts in by_name.items()} for kind, by_name in pieces.items()
+    }
+    return {**out, "hyper": hyper}
 
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Inputs
 # ---------------------------------------------------------------------------------------------------------------------
+
+
+def thresholds(profile: Profile, config: dict) -> list[dict]:
+    """Token positions where the model switches code paths: declared by the profile plus generic config keys."""
+    text = text_config_of(config)
+    found = [dict(t) for t in profile.probe.get("thresholds", [])]
+    rope = text.get("rope_scaling") or text.get("rope_parameters") or {}
+    for key in _THRESHOLD_KEYS:
+        value = text.get(key, rope.get(key) if isinstance(rope, dict) else None)
+        if isinstance(value, int) and value > 0:
+            found.append({"name": key, "position": value, "reason": f"config.{key}"})
+    unique = {t["position"]: t for t in found}
+    return [unique[p] for p in sorted(unique)]
+
+
+def position_cuts(profile: Profile) -> list[int]:
+    return [t["position"] for t in thresholds(profile, source_config(profile))]
+
+
+SHORT_ROW_LENGTHS = tuple(range(1, 9))
+
+
+def row_lengths(profile: Profile, config: dict) -> list[int]:
+    """Row lengths: short rows plus rows that straddle every threshold, capped at ``probe.max_row_len``."""
+    if profile.probe.get("row_lengths"):
+        return list(profile.probe["row_lengths"])
+    cap = int(profile.probe.get("max_row_len", 2048))
+    lengths = [7, 61, 130]
+    for t in thresholds(profile, config):
+        if t["position"] + 64 <= cap:
+            lengths.append(t["position"] + 64)
+    return lengths
 
 
 def make_rows(vocab_size: int, lengths: list[int], seed: int = 0) -> list[list[int]]:
@@ -577,10 +330,7 @@ def make_rows(vocab_size: int, lengths: list[int], seed: int = 0) -> list[list[i
 
 
 def pack_rows(rows: list[list[int]], pad_to_multiple: int = 1, pad_token_id: int = 0):
-    """One packed row: ``input_ids``/``position_ids`` ``[1, T]`` and next-token ``labels`` (-100 at row ends).
-
-    Padding matches ``pad_packed_microbatch``: position 0 per pad token, so each reads as its own sequence.
-    """
+    """One packed row: ``input_ids``/``position_ids`` ``[1, T]`` and next-token ``labels`` (-100 at row ends)."""
     import torch
 
     ids, pos, labels = [], [], []
@@ -597,11 +347,25 @@ def pack_rows(rows: list[list[int]], pad_to_multiple: int = 1, pad_token_id: int
     return as_tensor(ids), as_tensor(pos), as_tensor(labels)
 
 
+def pack_logprobs(rows: list[list[int]], per_row, pad_to_multiple: int = 1):
+    """Per-row log-probs laid out like ``pack_rows(rows)``, zero at row ends and padding."""
+    import torch
+
+    flat = []
+    for row, lp in zip(rows, per_row):
+        lp = torch.as_tensor(lp, dtype=torch.float32)[: len(row)].clone()
+        lp[len(row) - 1 :] = 0.0
+        flat.append(lp)
+    packed = torch.cat(flat)
+    pad = (-packed.numel()) % pad_to_multiple
+    return torch.cat([packed, torch.zeros(pad)]).unsqueeze(0)
+
+
 def probe_inputs(profile: Profile, ckpt: str) -> tuple[dict, list[list[int]], int]:
-    """The tiny config, the audit rows and the packing multiple; identical in every probe."""
+    """The model config, the audit rows and the packing multiple; identical in every probe."""
     config = json.loads(Path(ckpt, "config.json").read_text())
     rows = make_rows(int(text_config_of(config)["vocab_size"]), row_lengths(profile, config), seed=0)
-    return config, rows, int(profile.raw.get("probe", {}).get("pad_to_multiple", 8))
+    return config, rows, int(profile.probe.get("pad_to_multiple", 8))
 
 
 def row_slices(rows: list[list[int]]) -> list[slice]:
@@ -610,6 +374,83 @@ def row_slices(rows: list[list[int]]) -> list[slice]:
         out.append(slice(start, start + len(row)))
         start += len(row)
     return out
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# One optimizer step, as the service's exports record it
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def clip_coefficient(norm: float, max_norm: float) -> float:
+    """DeepSpeed's global-norm clipping: the gradient is divided by ``(norm + 1e-6) / max_norm`` when that exceeds 1."""
+    if max_norm <= 0:
+        return 1.0
+    return min(1.0, max_norm / (norm + 1e-6))
+
+
+def adamw_agreement(before, after, grads, opt: dict, lowp, clip: float, grad_dtype) -> dict[str, float]:
+    """Per tensor, the fraction of elements whose stored update equals one AdamW step on the gradient.
+
+    First step with bias correction: ``m_hat = g`` and ``v_hat = g**2``, so the step is ``g / (|g| + eps)`` on the
+    clipped gradient, stored in ``grad_dtype``. The expectation is rounded to the stored dtype the same way the
+    weights are.
+    """
+    import torch
+
+    out = {}
+    for name, grad in grads.items():
+        if name not in before or name not in after or bool(torch.isnan(grad).any()):
+            continue
+        w0 = before[name].float()
+        grad = (grad * clip).to(grad_dtype).float()
+        ideal = w0 - opt["lr"] * (grad / (grad.abs() + opt["eps"]) + opt["weight_decay"] * w0)
+        expected = ideal.to(lowp).float() - w0
+        out[name] = float((after[name].float() - w0 == expected).float().mean())
+    return out
+
+
+def client_step(profile: Profile, run: dict) -> dict:
+    """What one service step did, from the step reply and the weights-only and resumable exports around it.
+
+    ZeRO keeps Adam's first moment in fp32, and after one step it is ``(1 - beta1)`` times the clipped gradient the
+    optimizer consumed; dividing by the clip coefficient of the norm the engine reported gives the reduced gradient.
+    """
+    import torch
+
+    reply, exports = run["step"]["reply"], run["exports"]
+    before = read_checkpoint_tensors(Path(exports["initial"]))
+    after = read_checkpoint_tensors(Path(exports["after_step"]))
+    zero = zero_checkpoint(Path(exports["resumable"]))
+    hyper = zero["hyper"]
+    consumed = {n: m / (1 - hyper["betas"][0]) for n, m in zero["exp_avg"].items()}
+    norms = reply.get("gradient_norms_per_param") or {}
+    max_norm = float(run["job"]["training"]["training_config"].get("gradient_clipping") or 0.0)
+    clip_norm = reply.get("grad_norm")
+    exact = clip_coefficient(float(clip_norm), max_norm) if clip_norm is not None else 1.0
+    reduced_norm = math.sqrt(sum(float(v) ** 2 for v in norms.values())) if norms else None
+    consumed_norm = math.sqrt(sum(float(g.double().pow(2).sum()) for g in consumed.values()))
+    opt = {"lr": float(run["step"]["lr"]), "eps": hyper["eps"], "weight_decay": hyper["weight_decay"]}
+    lowp = getattr(torch, profile.dtype)
+    return {
+        "lr": opt["lr"],
+        "loss": run["step"].get("loss"),
+        "packed_logprobs": run["forward"]["packed_logprobs"],
+        "reduced_grads": {n: g / exact for n, g in consumed.items()},
+        "gradient_norms_per_param": norms,
+        "update": {n: after[n].float() - before[n].float() for n in after if n in before},
+        "master_update": {n: w - before[n].float() for n, w in zero["masters"].items() if n in before},
+        "frozen_params": sorted(set(before) - set(consumed)),
+        "frozen_changed": sorted(
+            n for n in set(before) - set(consumed) if n in after and not torch.equal(after[n], before[n])
+        ),
+        "gradient_clipping": max_norm,
+        "clip_norm": None if clip_norm is None else float(clip_norm),
+        "reduced_grad_norm": reduced_norm,
+        "clip_coefficients": {"exact": exact, "grad_dtype": float(torch.tensor(exact).to(lowp))},
+        "clip_applied_measured": consumed_norm / reduced_norm if reduced_norm else None,
+        "adamw_agreement": adamw_agreement(before, after, consumed, opt, lowp, 1.0, torch.float32),
+        "optimizer_hyper": hyper,
+    }
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -670,7 +511,7 @@ _EXPERT_SLICE = re.compile(r"\[\d+\]$")
 
 
 def _expert_count(profile: Profile) -> int | None:
-    text = text_config_of(tiny_config(profile))
+    text = text_config_of(source_config(profile))
     return next((int(text[k]) for k in _EXPERT_COUNT_KEYS if text.get(k)), None)
 
 

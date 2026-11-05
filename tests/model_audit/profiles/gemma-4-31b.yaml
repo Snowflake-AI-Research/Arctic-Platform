@@ -1,52 +1,21 @@
-# Gemma-4-31B-it RL. No AP family: the stock transformers loader, as for any dense HF model. Launch target: bf16 full
-# fine-tune, DP trainer, TP4 sampler.
+# Gemma-4-31B-it RL. No AP family: the stock transformers loader, as for any dense HF model.
 name: gemma-4-31b
 checkpoint: google/gemma-4-31B-it
 
-launch:
-  dtype: bfloat16
-  max_seq_len: 32768
-  trainer:
-    loader: huggingface
-    # Full-attention layers have head_dim 512, past FlashAttention's 256.
-    attn_implementation: sdpa
-    parallelism: {expert_parallel: 1, sequence_parallel: 1}
-  engine: {gradient_clipping: 1.0, fp32_masters: false}
-  sampler:
-    tensor_parallel_size: 4
-    max_model_len: 32768
-    enable_prefix_caching: true
-  optimizer: {lr: 1.0e-6, betas: [0.9, 0.999], eps: 1.0e-8, weight_decay: 0.0}
+client:
+  catalog: gemma-4-31b-it
+  training: h200-training-full
+  sampling: h200-inference-full
 
 probe:
-  pass_labels: false
+  max_row_len: 2048
+  thresholds:
+    - {name: sliding_window, position: 1024, reason: "sliding layers stop attending to keys more than sliding_window back"}
 
 tolerances:
   # Fresh engines on the same weights settle into one of a few numeric states up to 0.004 apart (each exactly
   # repeatable), so one replica can match the reference and measure 0.
   engine_noise: 0.004
-
-tiny:
-  # Head dims stay real: they pick the sampler's attention kernels, and the full layers' 512 is their edge case.
-  text_overrides:
-    hidden_size: 512
-    intermediate_size: 1024
-    num_attention_heads: 4
-    num_key_value_heads: 2
-    num_global_key_value_heads: 1
-  config_overrides:
-    vision_config: {hidden_size: 144, intermediate_size: 256, num_attention_heads: 2, num_key_value_heads: 2}
-  max_row_len: 2048
-  thresholds:
-    - {name: sliding_window, position: 1024, reason: "sliding layers stop attending to keys more than sliding_window back"}
-  # No SP layout: DeepSpeed's Ulysses attention reads one global head_dim and Gemma 4's is per-layer, so SP > 1
-  # fails at setup.
-  parallel:
-    - {expert_parallel: 1, sequence_parallel: 1, world_size: 2}
-  sampler:
-    tensor_parallel_size: 4
-    max_model_len: 4096
-    gpu_memory_utilization: 0.3
 
 expect:
   loader: huggingface
@@ -65,18 +34,5 @@ known_issues:
     summary: >-
       with bf16_master_weights_and_grads, DeepSpeed ZeRO-2 unscale_and_clip_grads does grad.mul_(1 / combined_scale)
       with a 0-dim fp32 tensor, so the clip coefficient is rounded to bf16 (0.30% low here, up to 0.39%)
-  optimizer.update_lands_at_launch_lr:
-    issue: launch config (fp32_masters)
-    summary: "engine default bf16 master weights drop ~99% of a 1e-6 AdamW step; fp32_masters: true keeps it"
-  sampler.weight_sync_matches_fresh_load[hf-file]:
-    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/398
-    summary: >-
-      the CPU-file sync's strict name check (on by default) compares the shipped checkpoint names with
-      compute_expected_hf_param_names(model), which returns vLLM's module names for this model
-      (language_model.model.* for model.language_model.*), so it rejects a correct HF export before loading. The
-      NCCL placement passes
-  sampler.weight_sync_matches_fresh_load[vllm-file]:
-    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/398
-    summary: "same strict CPU-file name check as [hf-file]; the generic vLLM export ships the same names"
 
 not_applicable: {}
