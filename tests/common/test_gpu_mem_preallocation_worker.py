@@ -29,6 +29,7 @@ def worker_module():
     return deepspeed_worker
 
 
+@pytest.mark.parametrize("job_type", ["train", "log_prob"])
 @pytest.mark.parametrize(
     "training",
     [
@@ -36,7 +37,7 @@ def worker_module():
         {"prime_rl": {"debug": {"gpu_mem_preallocate_gib": 20}}},
     ],
 )
-def test_training_margin_reaches_model_and_survives_engine_initialization(monkeypatch, training):
+def test_training_margin_reaches_model_and_survives_engine_initialization(monkeypatch, training, job_type):
     mod = worker_module()
     cls = mod.DeepSpeedWorker.__ray_metadata__.modified_class
     worker = object.__new__(cls)
@@ -51,6 +52,7 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
     monkeypatch.setattr(mod, "pr0", lambda *args: None)
     monkeypatch.setattr(mod, "sp_size_from_job_config", lambda config: 1)
     monkeypatch.setattr(worker, "ds_training_config", lambda *args: {})
+    monkeypatch.setattr(worker, "ds_inference_config", lambda *args: {})
     monkeypatch.setattr(mod, "release_offloaded_grad_partitions", installed_hooks.append)
 
     def build(spec):
@@ -60,6 +62,7 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
     def initialize(**kwargs):
         assert worker._gpu_mem_preallocation is reserve
         assert kwargs["model"] is model
+        assert ("model_parameters" in kwargs) is (job_type == "train")
         return SimpleNamespace(local_rank=0, global_steps=0), optimizer, None, None
 
     monkeypatch.setattr(mod, "build_model", build)
@@ -71,14 +74,14 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
         "localhost",
         {
             "model_name": "x",
-            "job_type": "train",
+            "job_type": job_type,
             "training_config": training,
             "ds_worker_config": {"attn_implementation": "sdpa"},
         },
     )
     assert observed == [{"gpu_mem_preallocate_gib": 20}]
     assert worker._gpu_mem_preallocation is reserve
-    assert installed_hooks == [optimizer]
+    assert installed_hooks == ([optimizer] if job_type == "train" else [])
 
 
 def test_destroy_retains_buffer_through_sender_and_communicator_teardown(monkeypatch):

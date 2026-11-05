@@ -17,10 +17,14 @@
 from __future__ import annotations
 
 import json
+import os
+import time
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 import torch
+import torch.multiprocessing as mp
 from torch.utils.checkpoint import checkpoint
 
 import arctic_platform.common.deepspeed_engine as deepspeed_engine
@@ -35,6 +39,7 @@ from arctic_platform.common.deepspeed_engine import optimizer_implementation
 from arctic_platform.common.deepspeed_engine import resolve_optimizer_name
 from arctic_platform.testing_utils import require_deepspeed
 from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import require_torch_multi_gpu
 from arctic_platform.testing_utils import set_seed
 from arctic_platform.testing_utils import torch_assert_equal
 
@@ -800,6 +805,8 @@ def test_offloaded_release_validates_settings_before_installing_hooks(monkeypatc
     optimizer._wait_for_offload_copies = lambda: None
     optimizer.finalize_gradient_accumulation_boundary = lambda: None
     optimizer._use_compact_grad_partition_buffer = lambda group: True
+    optimizer._get_compact_grad_partition_buffer = lambda group: None
+    optimizer._get_param_group_idx = lambda param: 0
     monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", value)
     with pytest.raises(ValueError, match="ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES"):
         deepspeed_engine.release_offloaded_grad_partitions(optimizer)
@@ -819,6 +826,8 @@ def test_offloaded_small_partitions_do_not_require_disk_scratch(monkeypatch, tmp
     optimizer.params_already_reduced = {}
     optimizer._offload_accumulated_param_ids = set()
     optimizer._use_compact_grad_partition_buffer = lambda group: True
+    optimizer._get_compact_grad_partition_buffer = lambda group: None
+    optimizer._get_param_group_idx = lambda param: 0
     optimizer._wait_for_offload_copies = lambda: None
     optimizer.finalize_gradient_accumulation_boundary = lambda: None
     if preferred == "override":
@@ -835,11 +844,135 @@ def test_offloaded_small_partitions_do_not_require_disk_scratch(monkeypatch, tmp
         monkeypatch.setattr(Path, "mkdir", missing_data_fast)
     monkeypatch.setattr(deepspeed_engine.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setattr(deepspeed_engine, "_scratch_filesystem_type", lambda path: "tmpfs")
+    original = dict(vars(optimizer))
     if large:
-        with pytest.raises(ValueError, match="tmpfs"):
-            deepspeed_engine.release_offloaded_grad_partitions(optimizer)
+        assert not deepspeed_engine.release_offloaded_grad_partitions(optimizer)
+        assert vars(optimizer) == original
     else:
         assert deepspeed_engine.release_offloaded_grad_partitions(optimizer)
+
+
+@pytest.mark.parametrize("enabled", ["0", "invalid"])
+def test_offloaded_release_opt_out_preserves_native_optimizer(monkeypatch, enabled):
+    from types import SimpleNamespace
+
+    optimizer = SimpleNamespace(cpu_offload=True)
+    original = dict(vars(optimizer))
+    monkeypatch.setenv("ARCTIC_OFFLOADED_GRADIENT_RELEASE", enabled)
+    if enabled == "0":
+        assert not deepspeed_engine.release_offloaded_grad_partitions(optimizer)
+    else:
+        with pytest.raises(ValueError, match="ARCTIC_OFFLOADED_GRADIENT_RELEASE"):
+            deepspeed_engine.release_offloaded_grad_partitions(optimizer)
+    assert vars(optimizer) == original
+
+
+def _two_rank_offloaded_partition_worker(rank, rendezvous, directory, stage):
+    import inspect
+
+    import deepspeed
+    import torch.distributed as dist
+    from deepspeed.utils import safe_get_full_grad
+
+    torch.cuda.set_device(rank)
+    os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="2")
+    deepspeed.init_distributed(
+        dist_backend="nccl",
+        auto_mpi_discovery=False,
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=90),
+    )
+    try:
+        engines = []
+        # An odd, >32 MiB FP32 group exercises nonzero partition ownership, padding and real file storage.
+        width = 3073
+        for release in ("0", "1"):
+            set_seed(0)
+            model = torch.nn.Linear(width, width, bias=False)
+            spec = TrainingEngineSpec(
+                dtype="bfloat16",
+                world_size=2,
+                fp32_masters=True,
+                gradient_clipping=0,
+                ds_overrides=dict(
+                    zero_optimization=dict(stage=stage, offload_optimizer=dict(device="cpu", pin_memory=False)),
+                    data_types=dict(grad_accum_dtype="fp32"),
+                ),
+            )
+            os.environ["ARCTIC_OFFLOADED_GRADIENT_RELEASE"] = release
+            os.environ["ARCTIC_OFFLOADED_GRADIENT_TMPDIR"] = directory
+            engine, _, _ = initialize_training_engine(
+                model,
+                build_deepspeed_config(spec),
+                optimizer=OptimizerSettings(name="AdamW", lr=1e-3),
+                ep_size=1,
+                mpu=None,
+                model_path="unused",
+                rank=rank,
+            )
+            engines.append(engine)
+        baseline, evicted = engines
+        assert evicted.module.weight.numel() % 2 == 1
+        assert dist.get_rank(evicted.optimizer.real_dp_process_group[0]) == rank
+        assert max(evicted.optimizer.partition_size) * 4 > deepspeed_engine._OFFLOADED_SNAPSHOT_CHUNK_BYTES
+        retained = inspect.getclosurevars(evicted.optimizer.step).nonlocals["retained"]
+        descriptors = None
+        elapsed = [0.0, 0.0]
+        for window in range(2):
+            for microstep in range(2):
+                inputs = torch.full((2, width), 0.02 * (rank + microstep + window + 1), device="cuda").bfloat16()
+                losses = []
+                for index, engine in enumerate(engines):
+                    started = time.monotonic()
+                    engine.set_gradient_accumulation_boundary(microstep == 1)
+                    loss = engine(inputs).float().square().mean()
+                    losses.append(loss.detach())
+                    engine.backward(loss)
+                    torch.cuda.synchronize()
+                    elapsed[index] += time.monotonic() - started
+                torch_assert_equal(*losses)
+                assert all(partition is None for partition in evicted.optimizer.averaged_gradients.values())
+            assert all(isinstance(snapshot, deepspeed_engine._OffloadedGradientFile) for snapshot in retained.values())
+            current = {index: snapshot.file.fileno() for index, snapshot in retained.items()}
+            if descriptors is not None:
+                assert current == descriptors
+            descriptors = current
+            torch_assert_equal(safe_get_full_grad(baseline.module.weight), safe_get_full_grad(evicted.module.weight))
+            for engine in engines:
+                engine.step()
+            assert retained == {}
+            torch_assert_equal(baseline.module.weight, evicted.module.weight)
+            torch_assert_equal(
+                torch.as_tensor(baseline.optimizer._global_grad_norm),
+                torch.as_tensor(evicted.optimizer._global_grad_norm),
+            )
+            actual = evicted.optimizer.optimizer.state_dict()["state"]
+            expected = baseline.optimizer.optimizer.state_dict()["state"]
+            assert actual.keys() == expected.keys()
+            for key in actual:
+                for field in ("exp_avg", "exp_avg_sq"):
+                    torch_assert_equal(actual[key][field], expected[key][field])
+        print(
+            f"TWO_RANK_OFFLOAD_PASS stage={stage} rank={rank} "
+            f"native_backward_seconds={elapsed[0]:.6f} release_backward_seconds={elapsed[1]:.6f}",
+            flush=True,
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+@require_torch_multi_gpu
+@require_deepspeed
+@pytest.mark.parametrize("stage", [1, 2])
+def test_offloaded_real_two_rank_padded_file_partition_parity(tmp_path, stage):
+    mp.spawn(
+        _two_rank_offloaded_partition_worker,
+        args=((tmp_path / "rendezvous").as_uri(), str(tmp_path), stage),
+        nprocs=2,
+        join=True,
+    )
 
 
 def test_offloaded_missing_private_capability_preserves_native_optimizer(monkeypatch, caplog):

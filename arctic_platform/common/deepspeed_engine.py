@@ -171,6 +171,10 @@ def _scratch_filesystem_type(directory: Path) -> str:
     return selected[1]
 
 
+class _OffloadedGradientScratchUnavailable(ValueError):
+    """Disk-backed snapshots are unavailable; native DeepSpeed retention remains valid."""
+
+
 class _OffloadedGradientStorage:
     """Reuse bounded staging when FP32 offload snapshots outgrow a small CPU tensor."""
 
@@ -200,7 +204,7 @@ class _OffloadedGradientStorage:
         directory.mkdir(exist_ok=True)
         filesystem = _scratch_filesystem_type(directory)
         if filesystem in {"tmpfs", "ramfs"} and not self.allow_memory:
-            raise ValueError(
+            raise _OffloadedGradientScratchUnavailable(
                 f"Offloaded gradient scratch {directory} is on {filesystem}; choose disk-backed "
                 "ARCTIC_OFFLOADED_GRADIENT_TMPDIR or explicitly set ARCTIC_OFFLOADED_GRADIENT_ALLOW_MEMORY_BACKED=1"
             )
@@ -342,10 +346,15 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
     submitted for update; native updates are not transactional. Optimizers without CPU offload keep their methods.
     Native CPU accumulator ownership and cleanup are unchanged.
     """
-    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
-
     if not getattr(optimizer, "cpu_offload", False):
         return False
+    enabled = os.environ.get("ARCTIC_OFFLOADED_GRADIENT_RELEASE", "1")
+    if enabled not in {"0", "1"}:
+        raise ValueError("ARCTIC_OFFLOADED_GRADIENT_RELEASE must be 0 or 1")
+    if enabled == "0":
+        return False
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+
     if type(optimizer) is not DeepSpeedZeroOptimizer:
         logger.warning("Offloaded partition release does not support optimizer type %s", type(optimizer).__qualname__)
         return False
@@ -381,11 +390,15 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
         return False
     retained: dict[int, Any] = {}
     # Small partitions never touch scratch storage, including its filesystem requirements.
-    storage = (
-        _OffloadedGradientStorage()
-        if max(optimizer.partition_size[index] * 4 for index in compact_groups) > _OFFLOADED_SNAPSHOT_CHUNK_BYTES
-        else None
-    )
+    try:
+        storage = (
+            _OffloadedGradientStorage()
+            if max(optimizer.partition_size[index] * 4 for index in compact_groups) > _OFFLOADED_SNAPSHOT_CHUNK_BYTES
+            else None
+        )
+    except (OSError, _OffloadedGradientScratchUnavailable) as error:
+        logger.info("Offloaded partition release disabled: %s; retaining native DeepSpeed gradients", error)
+        return False
     copy_grads_in_partition = optimizer.copy_grads_in_partition
     compact_grad_partition_buffer = optimizer._get_compact_grad_partition_buffer
     step = optimizer.step
