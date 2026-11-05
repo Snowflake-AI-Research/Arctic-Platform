@@ -30,6 +30,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from harbor_rl.check import check_first_task
+from harbor_rl.check import task_check_skipped
 from harbor_rl.swe_smith_tasks import materialize_harbor_task_from_row
 from openhands_localization import reward as localization_reward_module
 from openhands_localization.config import validate_openhands_cfg
@@ -58,6 +60,10 @@ def harbor_env_kwargs() -> dict[str, Any]:
     if not isinstance(kwargs, dict):
         raise ValueError(f"HARBOR_ENV_KWARGS must be a JSON object, got {raw!r}")
     return kwargs
+
+
+def _prepare_task_fn() -> Any:
+    return functools.partial(materialize_harbor_task_from_row, reward_file=Path(localization_reward_module.__file__))
 
 
 def _max_model_len(cfg: Any) -> int:
@@ -118,9 +124,7 @@ def _experiment_cls():
                 max_turns=max_turns,
                 skills=skills,
                 env_kwargs=harbor_env_kwargs(),
-                prepare_task_fn=functools.partial(
-                    materialize_harbor_task_from_row, reward_file=Path(localization_reward_module.__file__)
-                ),
+                prepare_task_fn=_prepare_task_fn(),
             )
             self.harbor_adapter = adapter
 
@@ -210,10 +214,11 @@ def check_harbor_env() -> None:
 
     env = resolve_env(os.environ.get("HARBOR_ENV") or DEFAULT_HARBOR_ENV)
     kwargs = harbor_env_kwargs()
-    if env == SNOWFLAKE_HARBOR_ENV and not (kwargs.get("image_repo") or kwargs.get("prebuilt_image")):
+    if env == SNOWFLAKE_HARBOR_ENV and not any(kwargs.get(k) for k in ("image_repo", "prebuilt_image", "base_image")):
         raise SystemExit(
-            "ERROR: HARBOR_ENV=snowflake needs somewhere to mirror task images. Set, for example,\n        "
-            ' HARBOR_ENV_KWARGS=\'{"image_repo": "DB.SCHEMA.REPO", "connection": "MY_CONN", "role": "MY_ROLE"}\''
+            "ERROR: HARBOR_ENV=snowflake needs to know which image tasks run on. To replay each task's Dockerfile\n"
+            "       on the sandbox catalog image, set\n        "
+            ' HARBOR_ENV_KWARGS=\'{"base_image": "sandbox-base", "connection": "MY_CONN", "role": "MY_ROLE"}\''
         )
     if env == HOST_HARBOR_ENV and not host_exec_allowed(kwargs.get("allow_host_exec")):
         raise SystemExit(
@@ -251,6 +256,14 @@ def main() -> None:
         cfg.trainer.arctic_rl = ArcticRLTrainerConfig()
     validate_openhands_cfg(cfg)
     validate_cfg(cfg)
+    if not task_check_skipped():
+        check_first_task(
+            cfg.data.train_data[0],
+            env=resolve_env(os.environ.get("HARBOR_ENV") or DEFAULT_HARBOR_ENV),
+            env_kwargs=harbor_env_kwargs(),
+            rollouts=int(cfg.trainer.train_batch_size) * int(cfg.generator.n_samples_per_prompt),
+            prepare_task_fn=_prepare_task_fn(),
+        )
     launch_driver(
         cfg,
         _run_remote,
