@@ -194,7 +194,7 @@ sft = [
     "ray",
     "safetensors",
     "tensordict",
-    "torch",
+    "torch>=2.9",  # checkpoint(early_stop=...) and CPU grouped matrix multiplication
     # GLM-5.3-Flash and Qwen3.8-Flash-Next need the Transformers 5.17 model modules.
     "transformers>=5.17,<5.18",
 ]

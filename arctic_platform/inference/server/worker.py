@@ -879,6 +879,7 @@ class InferenceWorker(StreamingWorkerMixin):
         self._active_lora_int_id: int | None = None
         self._active_lora_name: str | None = None
         self._active_lora_is_3d: bool = False
+        self._served_checkpoint_lora_dir: tempfile.TemporaryDirectory | None = None
 
     def _active_lora_request(self) -> Any | None:
         """LoRARequest for the synced adapter, or None (base serving).
@@ -1117,17 +1118,48 @@ class InferenceWorker(StreamingWorkerMixin):
         request = LoRARequest(
             lora_name="default",
             lora_int_id=1,
-            lora_path=lora_path,
+            lora_path=await self._served_checkpoint_lora_path(lora_path),
             load_inplace=True,
             is_3d_lora_weight=is_3d,
         )
         added = await self.llm.add_lora(request)
         if not added:
             raise RuntimeError(f"vLLM failed to load LoRA adapter from {lora_path}")
+        # vLLM only checks leaf names on load; a module that matches no served layer is silently dropped.
+        unbound_per_rank = await self.llm.collective_rpc("unbound_lora_modules", args=(1,))
+        never_bound = set.intersection(*(set(names) for names in unbound_per_rank)) if unbound_per_rank else set()
+        if never_bound:
+            raise RuntimeError(
+                f"LoRA adapter {lora_path} has {len(never_bound)} module(s) that match no served module, "
+                f"e.g. {sorted(never_bound)[:3]}"
+            )
         self._active_lora_int_id = 1
         self._active_lora_name = "default"
         self._active_lora_is_3d = is_3d
         logger.info("Loaded checkpoint LoRA adapter from %s (3d=%s)", lora_path, is_3d)
+
+    async def _served_checkpoint_lora_path(self, lora_path: str) -> str:
+        """``lora_path``, or a copy whose tensor names use the served module tree (as LoRA weight sync remaps them)."""
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+
+        weights_path = os.path.join(lora_path, "adapter_model.safetensors")
+        if not os.path.isfile(weights_path):
+            return lora_path
+        with safe_open(weights_path, framework="pt") as handle:
+            names = list(handle.keys())
+            served = (await self.llm.collective_rpc("served_lora_names", args=(names,)))[0]
+            if served == names:
+                return lora_path
+            tensors = {served_name: handle.get_tensor(name) for name, served_name in zip(names, served)}
+            metadata = handle.metadata()
+        # vLLM may reload the adapter from this path after an LRU eviction, so it lives as long as the worker.
+        self._served_checkpoint_lora_dir = tempfile.TemporaryDirectory(prefix="arctic-checkpoint-lora-")
+        served_dir = self._served_checkpoint_lora_dir.name
+        shutil.copy(os.path.join(lora_path, "adapter_config.json"), served_dir)
+        save_file(tensors, os.path.join(served_dir, "adapter_model.safetensors"), metadata=metadata)
+        logger.info("Remapped checkpoint LoRA adapter %s to served module names under %s", lora_path, served_dir)
+        return served_dir
 
     def _maybe_init_reasoning_parser(self, reasoning_parser_name: str | None) -> None:
         if not reasoning_parser_name:

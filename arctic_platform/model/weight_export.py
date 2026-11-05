@@ -21,6 +21,7 @@ import json
 import logging
 import os
 from collections.abc import Callable
+from collections.abc import Iterable
 from collections.abc import Iterator
 from dataclasses import dataclass
 from tempfile import TemporaryDirectory
@@ -416,6 +417,8 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
     adapter_dir = os.path.join(checkpoint_dir, PEFT_ADAPTER_DIRNAME)
     os.makedirs(adapter_dir, exist_ok=True)
     model.save_pretrained(adapter_dir, state_dict=state, safe_serialization=True, save_embedding_layers=False)
+    # The sampler loads this pack into vLLM as is, so families whose served module names differ rename here.
+    rename = getattr(type(_family_model_for_export(model)), "vllm_lora_name", None) or (lambda name: name)
     # PEFT must select against live wrapped names before we make the pack portable.
     for adapter_name in model.peft_config:
         output_dir = adapter_dir if adapter_name == "default" else os.path.join(adapter_dir, adapter_name)
@@ -424,19 +427,38 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
             metadata = handle.metadata()
             saved_names = list(handle.keys())
             portable = {}
+            renamed = False
             for name in saved_names:
-                export_name = strip_activation_checkpoint_segments(name)
+                unwrapped = strip_activation_checkpoint_segments(name)
+                export_name = rename(unwrapped)
+                renamed = renamed or export_name != unwrapped
                 if export_name in portable:
                     raise ValueError(f"PEFT checkpoint names collide after unwrapping: {export_name}")
                 portable[export_name] = handle.get_tensor(name)
         if len(portable) == 0:
             raise ValueError(f"PEFT saved an empty adapter: {adapter_name}")
-        if all(strip_activation_checkpoint_segments(name) == name for name in saved_names):
+        if list(portable) == saved_names:
             continue
         with TemporaryDirectory(prefix=".adapter-", dir=output_dir) as temporary_dir:
             temporary_path = os.path.join(temporary_dir, "adapter_model.safetensors")
             save_file(portable, temporary_path, metadata=metadata)
             os.replace(temporary_path, weights_path)
+        if renamed:
+            _rewrite_adapter_target_modules(output_dir, portable)
+
+
+def _rewrite_adapter_target_modules(output_dir: str, names: Iterable[str]) -> None:
+    config_path = os.path.join(output_dir, "adapter_config.json")
+    with open(config_path) as f:
+        config = json.load(f)
+    config["target_modules"] = sorted(
+        {name.split(".lora_", 1)[0].rsplit(".", 1)[-1] for name in names if ".lora_" in name}
+    )
+    with TemporaryDirectory(prefix=".adapter-", dir=output_dir) as temporary_dir:
+        temporary_path = os.path.join(temporary_dir, "adapter_config.json")
+        with open(temporary_path, "w") as f:
+            json.dump(config, f, indent=2, sort_keys=True)
+        os.replace(temporary_path, config_path)
 
 
 def save_hf_pretrained(model: nn.Module, output_dir: str) -> None:

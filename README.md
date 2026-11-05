@@ -60,6 +60,7 @@ client = create_arctic_rl_client(config)
 ### Integrated
 
 1. [SkyRL](https://github.com/NovaSky-AI/SkyRL/pull/1837). [Documentation](https://github.com/NovaSky-AI/SkyRL/tree/main/integrations/arctic_rl)
+2. TRL on Cortex. GSM8K GRPO from a CPU driver: [recipes/rl/trl/gsm8k_cortex](recipes/rl/trl/gsm8k_cortex).
 
 ### Integration is done but not yet merged
 
