@@ -911,44 +911,86 @@ def test_prepare_moe_weights_converts_from_a_meta_model_with_the_load_config():
 
 
 def _prepare_subset_rank_process(rank, rendezvous, source, family, result):
-    import torch
-    import torch.distributed as dist
-    from safetensors.torch import save_file
+    from dataclasses import replace
+    from datetime import timedelta
 
-    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.moe.deepspeed_integration import prepare_moe_weights
+    from arctic_platform.model.implementations.moe.distributed import ep_backend
+    from arctic_platform.model.implementations.moe.weights import load_state_dict
+    from arctic_platform.model.loaders.glm_moe_dsa import GlmMoeDsaOptions
+    from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+    from arctic_platform.testing_utils import torch_assert_equal
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
         if rank == 0:
-            builder = importlib.import_module(f"arctic_platform.model.implementations.{family}.model_builder")
-            builder.PreTrainedModelPrimeRL = _FakePrimeModel
+            implementation = "glm52" if family == "glm_moe_dsa" else "qwen35"
+            module = importlib.import_module(
+                f"arctic_platform.model.implementations.{implementation}.deepspeed_integration"
+            )
+            builder = importlib.import_module(f"arctic_platform.model.implementations.{implementation}.model_builder")
+            adapter = module._adapter() if family == "glm_moe_dsa" else module._generic_adapter()
 
-            class Model(_FakePrimeModel):
-                def stream_convert_to_prime(self, source_path, destination):
-                    destination.mkdir()
-                    save_file({"model.layers.0.mlp.experts.w1": torch.ones(1)}, destination / "weights.safetensors")
-                    (destination / "model.safetensors.index.json").write_text(
-                        json.dumps(dict(weight_map={"model.layers.0.mlp.experts.w1": "weights.safetensors"}))
-                    )
+            # Only the unused native GPU dispatch runtime is substituted; construction and conversion stay real.
+            def backend(name):
+                return SimpleNamespace(configure_num_sms=lambda count: None)
 
-            config = SimpleNamespace(name=str(source), weight_conversion_cache_dir="", dequantize_checkpoint=False)
-            destination = builder.prepare_weight_conversion(Model(), config, source, rank=0, local_rank=0)
+            ep_backend.get_ep_comm_module = backend
+            if implementation == "qwen35":
+                builder.get_ep_comm_module = backend
+            options_type = GlmMoeDsaOptions if family == "glm_moe_dsa" else Qwen3_5MoeOptions
+            options = options_type(
+                weight_conversion_cache_dir="",
+                moe_use_grouped_mm=False,
+                fused_cross_entropy=False,
+            )
+            build_config = adapter.build_model_config
+            adapter = replace(
+                adapter,
+                build_model_config=lambda *args: replace(build_config(*args), fsdp_cpu_offload=True),
+            )
+            destination = prepare_moe_weights(
+                adapter,
+                model_name=str(source),
+                optimization_dtype="float32",
+                attn_implementation="sdpa",
+                ep_size=1,
+                world_size=2,
+                options=options,
+                rank=0,
+                local_rank=0,
+            )
+            expected = _tiny_preparation_model(family).convert_to_prime(load_state_dict(source))
+            actual = load_state_dict(destination)
+            assert actual.keys() == expected.keys()
+            for name, weight in expected.items():
+                torch_assert_equal(actual[name], weight, msg=name)
             result.put(str(destination))
         dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("family", ["qwen35", "glm52"])
+@pytest.mark.parametrize("family", ["generic_moe", "glm_moe_dsa"])
 def test_preparation_on_subset_of_initialized_group_has_no_collectives(monkeypatch, tmp_path, family):
     import multiprocessing
 
     import torch
-    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe.weights import save_state_dict
 
     monkeypatch.delenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", raising=False)
     monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", "node-local")
     source = tmp_path / "source"
-    source.mkdir()
-    save_file({"model.layers.0.mlp.experts.0.gate_proj.weight": torch.ones(1)}, source / "weights.safetensors")
+    model = _tiny_preparation_model(family)
+    weights = {
+        name: torch.arange(value.numel(), dtype=torch.float32).reshape(value.shape).to(value.dtype)
+        for name, value in model.state_dict().items()
+    }
+    save_state_dict(model.convert_to_hf(weights), source)
+    model.config.save_pretrained(source)
     context = multiprocessing.get_context("spawn")
     result = context.Queue()
     processes = [
@@ -960,7 +1002,7 @@ def test_preparation_on_subset_of_initialized_group_has_no_collectives(monkeypat
     try:
         for process in processes:
             process.start()
-        assert result.get(timeout=30) == str(source / "prime")
+        assert result.get(timeout=60) == str(source / "prime")
         for process in processes:
             process.join(timeout=10)
             assert process.exitcode == 0
@@ -1395,8 +1437,6 @@ def test_shared_prepare_requires_identity_only_for_needed_conversion(monkeypatch
 def test_standalone_ready_shared_cache_does_not_require_attempt_identity(monkeypatch, tmp_path, family):
     import torch.distributed as dist
 
-    from arctic_platform.model.implementations.moe import conversion_cache as cache
-
     builder = importlib.import_module(f"arctic_platform.model.implementations.{family}.model_builder")
     source = tmp_path / "source"
     source.mkdir()
@@ -1414,7 +1454,6 @@ def test_standalone_ready_shared_cache_does_not_require_attempt_identity(monkeyp
         builder, "load_state_dict_keys", lambda path: ["model.layers.0.mlp.experts.0.gate_proj.weight"]
     )
     config = SimpleNamespace(name=str(source), dequantize_checkpoint=False, weight_conversion_cache_dir=tmp_path)
-    cache.validate_standalone_conversion_attempt(config)
     assert builder.prepare_weight_conversion(_FakePrimeModel(), config, source, rank=1, local_rank=1) == destination
 
 
