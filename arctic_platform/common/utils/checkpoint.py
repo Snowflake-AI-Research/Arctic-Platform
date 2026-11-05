@@ -24,6 +24,19 @@ import re
 import shutil
 
 
+def resolve_checkpoint_save_paths(root: str, step: int | None) -> tuple[str, str]:
+    """Return ``(save_dir, prune_root)`` for a training checkpoint save.
+
+    ``prune_root`` is the job checkpoint directory (the parent of ``checkpoint-*``
+    children). It is always ``root``, including when ``step`` is omitted.
+    """
+    if step is not None:
+        save_dir = os.path.join(root, f"checkpoint-{int(step)}")
+    else:
+        save_dir = root
+    return save_dir, root
+
+
 def prune_checkpoint_dirs(parent_dir: str, keep: int) -> int:
     """Keep the newest ``keep`` ``checkpoint-*`` dirs under ``parent_dir``; remove older.
 

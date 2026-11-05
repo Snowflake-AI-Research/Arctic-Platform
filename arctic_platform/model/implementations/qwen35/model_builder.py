@@ -36,11 +36,17 @@ from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.tensor import DTensor, distribute_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, PretrainedConfig
 
-from .gpu.activation_offload import install_activation_offload
-from .gpu.router_replay_recompute import install_self_router_replay
+from arctic_platform.model.config import ActivationCheckpointConfig
+from arctic_platform.model.implementations.gpu.activation_offload import install_activation_offload
+from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
+from arctic_platform.model.implementations.gpu.router_replay_recompute import install_self_router_replay
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import repeat_query_key_for_value_heads
+from arctic_platform.model.implementations.debug.determinism import CHECKPOINT_PRESERVE_RNG_STATE
+from arctic_platform.model.implementations.moe.weights import hf_export_param_name
 
-from .config import ActivationCheckpointConfig, ModelConfig
-from .conversion_cache import (
+from .config import ModelConfig
+from arctic_platform.model.implementations.moe.distributed.ep_backend import get_ep_comm_module, uses_dispatch_ep
+from arctic_platform.model.implementations.moe.conversion_cache import (
     WEIGHT_CONVERSION_CACHE_SCOPE_ENV,
     conversion_cache_is_node_local,
     conversion_cache_ready,
@@ -48,24 +54,24 @@ from .conversion_cache import (
     resolve_conversion_cache_path,
     _write_conversion_cache,
 )
-from .logging_utils import get_logger
+from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from .models import (
     AutoModelForCausalLMPrimeRL,
     PreTrainedModelPrimeRL,
+    get_custom_impl_import_error,
     get_custom_vlm_cls,
     supports_custom_impl,
 )
-from .models.layers.checkpointing import (
+from arctic_platform.model.implementations.moe.layers.checkpointing import (
     get_supported_targets,
     set_selective_activation_checkpointing,
     supports_selective_activation_checkpointing,
 )
-from .models.layers.moe import LatentMoE, MoE
-from .parallel_dims import ParallelDims
-from .gpu.router_replay_recompute import install_self_router_replay
-from .vlm import get_language_model, is_vlm_architecture
-from .weights import load_state_dict, load_state_dict_keys, save_state_dict
-from .world import get_world
+from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, MoE, install_combine_replay
+from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
+from arctic_platform.model.implementations.moe.vlm import get_language_model, is_vlm_architecture
+from arctic_platform.model.implementations.moe.weights import load_state_dict, load_state_dict_keys, save_state_dict
+from arctic_platform.model.implementations.moe.world import get_world
 
 
 def _patch_qwen3_5_moe_conversion_mapping():
@@ -170,9 +176,9 @@ def _patch_qwen3_5_linear_attn_varlen():
 
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+        query, key = repeat_query_key_for_value_heads(
+            query, key, self.num_k_heads, self.num_v_heads, self.chunk_gated_delta_rule
+        )
 
         core_attn_out, _ = self.chunk_gated_delta_rule(
             query,
@@ -251,12 +257,7 @@ def _patch_qwen3_5_linear_attn_varlen():
         attn_impl = getattr(self.config, "_attn_implementation", None)
         cu_seqlens = None
         if attn_impl in ("flash_attention_2", "flash_attention_3", "flash_attention_4") and position_ids is not None:
-            pids = position_ids
-            if pids.ndim == 3:
-                pids = pids[0]
-            flat = pids.view(-1)
-            seqlens = torch.cat([flat[0:1], flat[:-1][(flat == 0)[1:]] + 1, flat[-1:] + 1])
-            cu_seqlens = seqlens.cumsum(dim=0, dtype=torch.int32)
+            cu_seqlens = cu_seqlens_from_position_ids(position_ids)
         kwargs["cu_seqlens"] = cu_seqlens
         return _text_orig(
             self,
@@ -288,8 +289,32 @@ DTYPE_MAP = {
 torch._dynamo.config.recompile_limit = 16  # default: 8
 
 
+def _resolve_model_impl(
+    model_config: PretrainedConfig,
+    requested_impl: str,
+    *,
+    is_vlm_arch: bool,
+    custom_vlm_cls: type | None,
+) -> str:
+    """Resolve auto selection and reject an unavailable explicit custom implementation."""
+    custom_available = custom_vlm_cls is not None if is_vlm_arch else supports_custom_impl(model_config)
+    if requested_impl == "auto":
+        return "custom" if custom_available else "hf"
+    if requested_impl != "custom" or custom_available:
+        return requested_impl
+
+    message = (
+        "custom model implementation was explicitly requested but is unavailable "
+        f"for model_type={getattr(model_config, 'model_type', None)!r}"
+    )
+    import_error = get_custom_impl_import_error()
+    if import_error is not None:
+        raise RuntimeError(message) from import_error
+    raise RuntimeError(message)
+
+
 def strip_lora_from_state_dict(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-    """Drop LoRA adapter keys and unwrap base-layer prefixes.
+    """Drop LoRA adapter keys and normalize PEFT-wrapped base parameter names.
 
     On the DSS path no LoRA is applied, so this is a no-op for plain models.
     """
@@ -297,9 +322,9 @@ def strip_lora_from_state_dict(state_dict: dict[str, Tensor]) -> dict[str, Tenso
         return state_dict
     cleaned: dict[str, Tensor] = {}
     for key, value in state_dict.items():
-        if "lora_A" in key or "lora_B" in key:
-            continue
-        cleaned[key.replace(".base_layer.", ".")] = value
+        export_name = hf_export_param_name(key)
+        if export_name is not None:
+            cleaned[export_name] = value
     return cleaned
 
 
@@ -309,14 +334,14 @@ def is_moe_model(model: nn.Module) -> bool:
 
 def configure_moe_ep_backend(model: nn.Module, config: ModelConfig) -> None:
     backend = config.ep_comm_backend
-    if backend == "deepep":
-        from .distributed.deepep import configure_num_sms
-
-        configure_num_sms(config.deepep_num_sms)
+    if uses_dispatch_ep(backend):
+        get_ep_comm_module(backend).configure_num_sms(config.deepep_num_sms)
     language_model = get_language_model(model)
     for transformer_block in language_model.layers:
         if not isinstance(transformer_block.mlp, (MoE, LatentMoE)):
             continue
+        if isinstance(transformer_block.mlp, MoE):
+            transformer_block.mlp.set_use_sonicmoe(config.moe_use_sonicmoe)
         transformer_block.mlp.set_ep_comm_backend(backend)
         transformer_block.mlp.set_deepep_token_chunk_size(config.deepep_token_chunk_size)
 
@@ -329,11 +354,6 @@ def get_model(
         f"Loading model config (name={config.name}, attn={config.attn}, trust_remote_code={config.trust_remote_code})"
     )
 
-    if "Qwen3.5" in config.name or "qwen3_5" in config.name.lower():
-        _patch_qwen3_5_text_position_ids()
-        _patch_qwen3_5_moe_conversion_mapping()
-        _patch_qwen3_5_linear_attn_varlen()
-
     model_config = cast(
         PretrainedConfig,
         AutoConfig.from_pretrained(
@@ -341,6 +361,8 @@ def get_model(
         ),
     )
     model_config.use_cache = False
+    if config.dequantize_checkpoint and hasattr(model_config, "quantization_config"):
+        del model_config.quantization_config
     is_vlm_arch = is_vlm_architecture(model_config)
 
     # Fallback Qwen3.5 patch detection from loaded config model_type
@@ -353,6 +375,12 @@ def get_model(
         if subconfig is not None and hasattr(subconfig, "use_cache"):
             subconfig.use_cache = False
     model_config.use_grouped_mm = config.moe_use_grouped_mm
+    # Read by the custom Qwen3.5-MoE decoder, which a composite model builds from its text config.
+    model_config.fp32_parity = config.fp32_parity
+    model_config.fp32_routed_weighting = config.fp32_routed_weighting
+    if getattr(model_config, "text_config", None) is not None:
+        model_config.text_config.fp32_parity = config.fp32_parity
+        model_config.text_config.fp32_routed_weighting = config.fp32_routed_weighting
 
     # Ensure pad_token_id is set (some models like Qwen3MoE don't have it).
     # In transformers v5, token IDs moved from PretrainedConfig to GenerationConfig.
@@ -390,14 +418,14 @@ def get_model(
 
     # Determine the implementation to use
     custom_vlm_cls = get_custom_vlm_cls(model_config) if is_vlm_arch else None
+    impl_to_use = _resolve_model_impl(
+        model_config,
+        config.impl,
+        is_vlm_arch=is_vlm_arch,
+        custom_vlm_cls=custom_vlm_cls,
+    )
     if config.impl == "auto":
-        if is_vlm_arch:
-            impl_to_use = "custom" if custom_vlm_cls is not None else "hf"
-        else:
-            impl_to_use = "custom" if supports_custom_impl(model_config) else "hf"
         logger.info(f"Auto-selected implementation: {impl_to_use}")
-    else:
-        impl_to_use = config.impl
 
     with device:
         if impl_to_use == "custom" and custom_vlm_cls is not None:
@@ -522,6 +550,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
 
         if conversion is not None:
             fmt, convert_fn, src_fmt, dst_fmt = conversion
+            if fmt == "prime" and config.dequantize_checkpoint and any(k.endswith(".scale") for k in snapshot_keys):
+                # Packed and dequantized conversions of one checkpoint must not share a cache.
+                fmt = "prime-dequantized"
             logger.warning(
                 f"Found {src_fmt} weight format in snapshot state dict and {dst_fmt} weight format in model "
                 "state dict. Trying to auto-convert..."
@@ -529,6 +560,8 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
             node_local_cache = conversion_cache_is_node_local(snapshot_path)
             world = get_world()
+            # Models whose snapshot cannot sit in host memory convert shard by shard.
+            stream_convert_fn = getattr(model, "stream_convert_to_prime", None) if dst_fmt == "PrimeRL" else None
             if node_local_cache:
                 ensure_node_local_conversion_cache(
                     source_path,
@@ -540,6 +573,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    stream_convert_fn=stream_convert_fn,
                 )
             elif not conversion_cache_ready(snapshot_path) and world.is_master:
                 _write_conversion_cache(
@@ -552,6 +586,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    stream_convert_fn=stream_convert_fn,
                 )
 
     # All ranks wait for master rank to finish conversion
@@ -638,31 +673,20 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
     model_supported_targets: set[str] = set()
 
     if ac_config.offload_config.enabled:
-        if ac_config.mode == "selective":
-            raise ValueError(
-                f"Activation-checkpoint CPU offload (ac_config.offload_config.enabled=True) requires "
-                f"ac_config.mode='full', but the active mode is '{ac_config.mode}'. "
-                f"mode selects what the backward pass recomputes: 'full' recheckpoints each whole "
-                f"transformer block, so the only saved activation is the block input -- a single boundary "
-                f"that can be streamed to CPU; 'selective' keeps chosen intermediate activations on GPU and "
-                f"has no such offloadable boundary. Both live in the job's training_config.ac_config -- set "
-                f"mode='full', or set offload_config.enabled=False to keep mode='{ac_config.mode}'."
-            )
-        install_activation_offload(
-            model,
-            keep_last_n=ac_config.offload_config.keep_last_n,
-            use_streams=ac_config.offload_config.use_streams,
-            tensor_size_threshold=ac_config.offload_config.tensor_size_threshold,
-        )
+        install_activation_offload(model, config=ac_config.offload_config)
         logger.info(
             "Activation CPU offload enabled (saved-tensor hooks, "
             f"keep_last_n={ac_config.offload_config.keep_last_n}, "
             f"streams={ac_config.offload_config.use_streams}, "
-            f"tensor_size_threshold={ac_config.offload_config.tensor_size_threshold})"
+            f"tensor_size_threshold={ac_config.offload_config.tensor_size_threshold}, "
+            f"pin_memory_enabled={ac_config.offload_config.pin_memory_enabled}, "
+            f"pin_memory_max_size_gib={ac_config.offload_config.pin_memory_max_size_gib}, "
+            f"pin_memory_bucket_size_mib={ac_config.offload_config.pin_memory_bucket_size_mib})"
         )
 
+    ac_config.check_layers_exist(len(language_model.layers))
     for layer_id, (layer_name, transformer_block) in enumerate(language_model.layers.named_children()):
-        if layer_id % ac_config.freq != 0:
+        if not ac_config.checkpoints(layer_id):
             continue
 
         if ac_config.mode == "selective" and supports_selective_activation_checkpointing(transformer_block):
@@ -676,7 +700,16 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
                 # Install before the checkpoint wrap so only checkpointed blocks capture; see
                 # router_replay_recompute.py.
                 replay_wrapped_routers += install_self_router_replay(transformer_block)
-            transformer_block = checkpoint_wrapper(transformer_block, preserve_rng_state=False)
+            # Recompute the whole block: an early-stopped recompute skips the end of the MoE (sync_combine) and
+            # leaves the EP backend's pending combines and dispatch handles, with their tensors, alive.
+            # The recompute runs past the combine, so it would run the EP all-to-all a second time just to
+            # rebuild the tensors saved after it. Replay keeps that output instead; turning it off spends the
+            # all-to-all again and drops the saved tensor.
+            if ac_config.combine_replay:
+                install_combine_replay(transformer_block)
+            transformer_block = checkpoint_wrapper(
+                transformer_block, preserve_rng_state=CHECKPOINT_PRESERVE_RNG_STATE, early_stop=False
+            )
             full_layers += 1
 
         language_model.layers.register_module(layer_name, transformer_block)
@@ -695,13 +728,14 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
             )
         logger.info(
             "Applied selective activation checkpointing "
-            f"(freq={ac_config.freq}, targets={target_list}, selective_layers={selective_layers}, "
+            f"(freq={ac_config.freq}, layers={ac_config.layers}, targets={target_list}, selective_layers={selective_layers}, "
             f"full_fallback_layers={full_layers})"
         )
         return
 
     logger.info(
-        f"Applied activation checkpointing (freq={ac_config.freq}, full_layers={full_layers}, "
+        f"Applied activation checkpointing (freq={ac_config.freq}, layers={ac_config.layers}, full_layers={full_layers}, "
         f"router_replay_recompute={ac_config.router_replay_recompute}, "
+        f"combine_replay={ac_config.combine_replay}, "
         f"replay_wrapped_routers={replay_wrapped_routers})"
     )

@@ -4,6 +4,8 @@ on:
   pull_request:
     branches:
       - main
+  merge_group:
+    types: [checks_requested]
   push:
     branches:
       - main
@@ -53,17 +55,19 @@ jobs:
           echo "$VIRTUAL_ENV/bin" >> $GITHUB_PATH
           echo "VIRTUAL_ENV=$VIRTUAL_ENV" >> $GITHUB_ENV
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
-          # [rl] declares arctic-inference and vllm, so this resolves the whole stack.
-          # ArcticInference builds a native nanobind extension via CMake. actions/setup-python exports
-          # Python(3)_ROOT_DIR/pythonLocation pointing at the tool-cache interpreter (no nanobind); CMake's
-          # find_package(Python) honors those hints and fails to find nanobind. Unset them so CMake uses uv's
-          # build-env interpreter, which has nanobind from ArcticInference's build-system.requires.
-          env -u Python_ROOT_DIR -u Python2_ROOT_DIR -u Python3_ROOT_DIR -u pythonLocation \
-            uv pip install ".[testing,rl]"
+          uv pip install ".[sft,testing]"
       - name: Environment print
         run: |
           uv pip list
       - name: Unit Tests
         run: |
           cd tests
-          python -m pytest -s -v
+          python -m pytest -s -v --ignore=inference
+      # Own pytest process: the streaming stand-ins put a fake vllm in
+      # sys.modules, which would leak into the main suite.
+      - name: Streaming Tests
+        timeout-minutes: 10  # the suite takes ~1 min; guards against a hung Ray actor
+        # Ray actor processes import cpu_support too, so conftest.py's sys.path fix isn't enough.
+        run: |
+          PYTHONPATH=$PWD:$PWD/tests/inference/streaming python -m pytest -v -m "not gpu" \
+            -c tests/inference/streaming/pytest.ini tests/inference/streaming

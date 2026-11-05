@@ -16,40 +16,38 @@
 """TEMPORARY: SFT train → sync_weights → generate smoke (A6).
 
 Topology matches RL e2e: training_gpus=1, sampling_gpus=1, colocate=True.
-Client stays CPU-blanked.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 
 from transformers import AutoTokenizer
 
+from arctic_platform.client import ArcticSFTClientConfig
+from arctic_platform.client import OnPremConfig
+from arctic_platform.client import SamplingConfig
+from arctic_platform.client import TrainingConfig
 from arctic_platform.sft import ArcticSFTClient
-from arctic_platform.sft import ArcticSFTClientConfig
-from arctic_platform.sft.examples.run_sft_http_demo import ATTN
-from arctic_platform.sft.examples.run_sft_http_demo import LR
-from arctic_platform.sft.examples.run_sft_http_demo import MODEL
-from arctic_platform.sft.examples.run_sft_http_demo import SEED
-from arctic_platform.sft.examples.run_sft_http_demo import _build_batch
-from arctic_platform.sft.examples.run_sft_http_demo import _load_examples
-from arctic_platform.sft.examples.run_sft_http_demo import _metric
+from arctic_platform.sft.examples.run_sft_demo import ATTN
+from arctic_platform.sft.examples.run_sft_demo import LR
+from arctic_platform.sft.examples.run_sft_demo import MODEL
+from arctic_platform.sft.examples.run_sft_demo import SEED
+from arctic_platform.sft.examples.run_sft_demo import _build_batch
+from arctic_platform.sft.examples.run_sft_demo import _load_examples
+from arctic_platform.sft.examples.run_sft_demo import _metric
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default=MODEL)
-    ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--checkpoint-dir", required=True)
-    ap.add_argument("--server-cuda-visible-devices", default="0")
     ap.add_argument("--steps", type=int, default=1)
     args = ap.parse_args()
 
     ckpt = Path(args.checkpoint_dir)
     ckpt.mkdir(parents=True, exist_ok=True)
-    print(f"client CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')!r}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token_id is None:
@@ -59,39 +57,36 @@ def main() -> None:
     prompt = tokenizer.decode(batch["batch"]["input_ids"][0, :32], skip_special_tokens=True)
 
     config = ArcticSFTClientConfig(
-        backend="onprem",
-        comm_protocol="http",
         model_name=args.model,
         seed=SEED,
         training_gpus=1,
         sampling_gpus=1,
-        colocate=True,
-        vllm_config={"tensor_parallel_size": 1, "max_model_len": 512, "gpu_memory_utilization": 0.35},
-        host="localhost",
-        port=args.port,
-        launch_local_server=True,
-        server_cuda_visible_devices=args.server_cuda_visible_devices,
-        checkpoint_path=str(ckpt),
-        job_ready_timeout=900.0,
-        ds_config={
-            "train_micro_batch_size_per_gpu": 1,
-            "train_batch_size": 1,
-            "gradient_accumulation_steps": 1,
-            "zero_optimization": {
-                "stage": 2,
-                "offload_optimizer": {"device": "none"},
-                "offload_param": {"device": "none"},
+        backend=OnPremConfig(colocate=True),
+        sampling=SamplingConfig(
+            vllm={"tensor_parallel_size": 1, "max_model_len": 512, "gpu_memory_utilization": 0.35}
+        ),
+        training=TrainingConfig(
+            checkpoint_path=str(ckpt),
+            ds_config={
+                "train_micro_batch_size_per_gpu": 1,
+                "train_batch_size": 1,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                    "stage": 2,
+                    "offload_optimizer": {"device": "none"},
+                    "offload_param": {"device": "none"},
+                },
+                "optimizer": {
+                    "type": "AdamW",
+                    "params": {"lr": LR, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
+                },
             },
-            "optimizer": {
-                "type": "AdamW",
-                "params": {"lr": LR, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
+            ds_worker_config={
+                "attn_implementation": ATTN,
+                "enable_gradient_checkpointing": False,
+                "zorro_train_enable": False,
             },
-        },
-        ds_worker_config={
-            "attn_implementation": ATTN,
-            "enable_gradient_checkpointing": False,
-            "zorro_train_enable": False,
-        },
+        ),
     )
 
     client = ArcticSFTClient(config)

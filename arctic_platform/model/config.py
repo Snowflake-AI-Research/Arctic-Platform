@@ -16,19 +16,125 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from typing import Any
+from typing import Literal
+
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import NonNegativeInt
+from pydantic import PositiveInt
+from pydantic import StrictBool
 from pydantic import field_validator
 from pydantic import model_validator
 from typing_extensions import Self
+
+from arctic_platform.common.config import resolve_sp_size
+from arctic_platform.common.config import validate_peft_config
+from arctic_platform.model.implementations.debug.gpu_memory import gpu_mem_preallocate_bytes
+from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
+
+PinMemoryMaxSize = float | Literal["auto"]
+
+
+class ActivationOffloadConfig(BaseModel):
+    """Serializable activation CPU-offload configuration."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    enabled: bool = Field(False, description="Stream checkpointed block boundaries to CPU.")
+    keep_last_n: int = Field(1, ge=0, description="Boundaries to leave resident on GPU.")
+    use_streams: bool = Field(True, description="Overlap offload copies on side streams.")
+    tensor_size_threshold: int = Field(1 << 20, ge=0, description="Minimum saved-tensor size in bytes to offload.")
+    pin_memory_enabled: bool = Field(True, description="Use pinned host memory for activation offload.")
+    pin_memory_max_size_gib: PinMemoryMaxSize = Field(
+        "auto", description='Retained pinned-memory cache cap in GiB; "auto" sizes it from observed usage.'
+    )
+    pin_memory_bucket_size_mib: PositiveInt = Field(
+        64, description="Pinned-buffer allocation bucket size in MiB for reuse across variable sequence lengths."
+    )
+
+    @field_validator("pin_memory_max_size_gib")
+    @classmethod
+    def _validate_pin_memory_max_size_gib(cls, value: PinMemoryMaxSize) -> PinMemoryMaxSize:
+        if value == "auto":
+            return value
+        if value < 0:
+            raise ValueError("pin_memory_max_size_gib must be 'auto' or non-negative")
+        return value
+
+    @property
+    def pin_memory_bucket_size_bytes(self) -> int:
+        return self.pin_memory_bucket_size_mib * (1 << 20)
+
+    @property
+    def pin_memory_hard_max_size_bytes(self) -> int | None:
+        if self.pin_memory_max_size_gib == "auto":
+            return None
+        return int(self.pin_memory_max_size_gib * (1 << 30))
+
+
+class ActivationOffloadPatch(ActivationOffloadConfig):
+    """Activation offload settings whose presence enables the patch."""
+
+    enabled: Literal[True] = Field(True, description="Activation offload patches are always enabled.")
+
+
+class ActivationCheckpointConfig(BaseModel):
+    """MoE activation checkpointing and optional CPU offload."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    mode: Literal["full", "selective"] = Field("full", description="Recompute whole blocks or selected targets.")
+    freq: PositiveInt = Field(1, description="Checkpoint every Nth block.")
+    layers: list[NonNegativeInt] | None = Field(
+        None, description="Checkpoint exactly these block indices instead of every freq-th block."
+    )
+    targets: list[str] = Field(default_factory=lambda: ["norm"], description="Submodules to checkpoint (selective).")
+    offload_config: ActivationOffloadConfig = Field(
+        default_factory=ActivationOffloadConfig, description="CPU offload of checkpointed boundaries."
+    )
+    router_replay_recompute: bool = Field(True, description="Deterministic MoE routing across recompute.")
+    combine_replay: bool = Field(
+        False,
+        description=(
+            "On a fully checkpointed block, keep the MoE combine output and return it to the recompute instead of "
+            "repeating the expert-parallel all-to-all. Costs one local-tokens-by-hidden tensor per checkpointed "
+            "layer until that layer's backward."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_offload_mode(self) -> Self:
+        if self.offload_config.enabled and self.mode != "full":
+            raise ValueError("activation offload requires activation checkpointing mode='full'")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_layers(self) -> Self:
+        if self.layers is not None and self.freq != 1:
+            raise ValueError("set ac_config.layers or ac_config.freq, not both")
+        if self.layers is not None and len(set(self.layers)) != len(self.layers):
+            raise ValueError(f"ac_config.layers lists a block twice: {self.layers}")
+        return self
+
+    def checkpoints(self, layer_id: int) -> bool:
+        """Whether block ``layer_id`` is checkpointed: listed in ``layers`` when given, else every ``freq``-th."""
+        return layer_id in self.layers if self.layers is not None else layer_id % self.freq == 0
+
+    def check_layers_exist(self, num_layers: int) -> None:
+        """Refuse ``layers`` naming a block the model does not have, rather than silently checkpointing fewer."""
+        missing = [layer for layer in self.layers or () if layer >= num_layers]
+        if missing:
+            raise ValueError(f"ac_config.layers {missing} are past the model's {num_layers} blocks")
 
 
 class ParallelismConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
-    expert_parallel: int = Field(1, description="Expert-parallel degree.")
-    sequence_parallel: int = Field(1, description="Ulysses sequence-parallel degree.")
+    expert_parallel: int = Field(1, ge=1, description="Expert-parallel degree.")
+    sequence_parallel: int = Field(1, ge=1, description="Ulysses sequence-parallel degree.")
 
 
 class ZorroTrainPatch(BaseModel):
@@ -48,14 +154,69 @@ class ZorroTrainPatch(BaseModel):
     logits_compute_in_fp32: bool = Field(False, description="Compute logits in fp32.")
 
 
+class CompilePatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    fullgraph: bool = Field(False, description="Require each transformer layer to compile as a full graph.")
+
+
+class LmHeadPatch(BaseModel):
+    """Optional precision and chunking changes to a causal LM head."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    fp32: bool = Field(False, description="Compute the LM-head projection in fp32.")
+    token_chunk_size: PositiveInt | None = Field(
+        None, description="Token tile size for chunked per-token logprob projection."
+    )
+    vocab_chunk_size: PositiveInt = Field(
+        8192, description="Vocabulary tile size for chunked per-token logprob projection."
+    )
+
+    @model_validator(mode="after")
+    def _require_enabled_feature(self) -> Self:
+        if not self.fp32 and self.token_chunk_size is None:
+            raise ValueError("lm_head patch requires fp32 or token_chunk_size")
+        return self
+
+
+class TiledMlpPatch(BaseModel):
+    """Recompute dense MLPs in token tiles."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    token_chunk_size: PositiveInt = Field(..., description="Maximum tokens per recomputed dense-MLP tile.")
+
+
 class Patches(BaseModel):
     """Optional features applied to the model after it is loaded."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     liger: bool = Field(False, description="Apply Liger kernels.")
+    gradient_checkpointing: StrictBool | PositiveInt = Field(
+        False,
+        description="False disables; True checkpoints every layer; an integer checkpoints every Nth layer.",
+    )
+    activation_offload: ActivationOffloadPatch | None = Field(
+        None, description="CPU offload for activations saved by checkpointed layers."
+    )
+    compile: CompilePatch | None = Field(None, description="Per-transformer-layer torch.compile settings.")
+    tiled_mlp: TiledMlpPatch | None = Field(None, description="Recompute dense MLPs in token tiles.")
+    lm_head: LmHeadPatch | None = Field(None, description="LM-head precision and chunking.")
     zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
-    gradient_checkpointing: bool = Field(False, description="HF gradient checkpointing.")
+    peft: dict | None = Field(None, description="PEFT config; wrap after other patches, before the optimizer.")
+
+    _validate_peft = field_validator("peft")(validate_peft_config)
+
+    @model_validator(mode="after")
+    def _validate_patch_combinations(self) -> Self:
+        if self.activation_offload is not None:
+            if self.gradient_checkpointing is False:
+                raise ValueError("activation_offload requires gradient_checkpointing")
+        if self.tiled_mlp is not None and self.compile is not None and self.compile.fullgraph:
+            raise ValueError("compile.fullgraph cannot be combined with tiled_mlp")
+        return self
 
 
 class ModelSpec(BaseModel):
@@ -68,6 +229,10 @@ class ModelSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     model_path_or_name: str = Field(..., description="HF model path or hub name.")
+    text_config_overrides: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Merged text config overrides; YaRN must explicitly set original_max_position_embeddings.",
+    )
     dtype: str = Field("bfloat16", description="Parameter dtype.")
     attn_implementation: str | None = Field(None, description="Attention implementation to request from HF.")
     loader: str | None = Field(None, description="Loader name; auto-resolved at construction when not set.")
@@ -75,6 +240,7 @@ class ModelSpec(BaseModel):
         default_factory=ParallelismConfig, description="Loader-specific parallelism."
     )
     patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
+    debug: dict = Field(default_factory=dict, description="Runtime GPU capacity guard, separate from loader debug.")
     loader_options: dict = Field(default_factory=dict, description="JSON-only loader-specific extras.")
 
     @classmethod
@@ -87,12 +253,79 @@ class ModelSpec(BaseModel):
         """
         cfg = ds_worker_config or {}
 
-        # Require an explicit attention backend. ZoRRo Train needs a flash-attention
-        # implementation; do not invent a second default here (ModelSpec leaves it None).
+        # Require an explicit attention backend. Packed varlen / ZoRRo Train need
+        # some flash-attention implementation (FA2 / FA3 / FA4); do not invent a
+        # default here (ModelSpec leaves it None).
         if "attn_implementation" not in cfg or cfg["attn_implementation"] is None:
             raise ValueError(
-                "from_ds_worker_config requires attn_implementation (ZoRRo Train needs a flash-attention backend)."
+                "from_ds_worker_config requires attn_implementation "
+                "(flash_attention_2 / flash_attention_3 / flash_attention_4)."
             )
+
+        parallelism = ParallelismConfig.model_validate(
+            dict(
+                **({"expert_parallel": cfg["ep_size"]} if "ep_size" in cfg else {}),
+                sequence_parallel=resolve_sp_size({"ds_worker_config": cfg}),
+            )
+        )
+        if parallelism.expert_parallel > 1:
+            from arctic_platform.model.moe_spec import moe_model_spec
+
+            if cfg.get("zorro_train_enable") or cfg.get("use_liger") or cfg.get("enable_gradient_checkpointing"):
+                raise ValueError("expert-parallel workers require loader-owned forward/checkpointing options")
+            options = deepcopy(cfg.get("prime_rl") or {})
+            for key in ("ac_config", "tiled_mlp_token_chunk_size", "weight_conversion_cache_dir"):
+                if key in cfg:
+                    if key in options and options[key] != cfg[key]:
+                        raise ValueError(f"conflicting worker and prime_rl {key}")
+                    options[key] = deepcopy(cfg[key])
+            checkpointing = cfg.get("activation_checkpointing")
+            if checkpointing is False and options.get("ac_config") is not None:
+                raise ValueError("activation_checkpointing=False conflicts with ac_config")
+            if checkpointing is True and options.get("ac_config") is None:
+                options["ac_config"] = ActivationCheckpointConfig().model_dump()
+            model_options = cfg.get("model_options") or {}
+            if set(model_options) - {"lm_head", "moe"}:
+                raise ValueError("unsupported expert-parallel worker model_options")
+            lm_head = model_options.get("lm_head") or {}
+            head_keys = {
+                "cross_entropy": "fused_cross_entropy",
+                "token_chunk_size": "fused_lm_head_token_chunk_size",
+                "fp32": "fp32_lm_head",
+            }
+            if set(lm_head) - head_keys.keys():
+                raise ValueError("unsupported expert-parallel worker lm_head options")
+            for key, value in lm_head.items():
+                target = head_keys[key]
+                if target in options and options[target] != value:
+                    raise ValueError(f"conflicting model_options.lm_head.{key} and prime_rl.{target}")
+                options[target] = value
+            moe = model_options.get("moe") or {}
+            moe_keys = {
+                "comm_backend": "ep_comm_backend",
+                "comm_sms": "deepep_num_sms",
+                "comm_token_chunk": "deepep_token_chunk_size",
+                "grouped_mm": "moe_use_grouped_mm",
+            }
+            if set(moe) - moe_keys.keys():
+                raise ValueError("unsupported expert-parallel worker moe options")
+            for key, value in moe.items():
+                target = moe_keys[key]
+                if target in options and options[target] != value:
+                    raise ValueError(f"conflicting model_options.moe.{key} and prime_rl.{target}")
+                options[target] = value
+            if "attn" in options and options["attn"] != cfg["attn_implementation"]:
+                raise ValueError("conflicting prime_rl.attn and attn_implementation")
+            options["attn"] = cfg["attn_implementation"]
+            spec = moe_model_spec(
+                model_name=model_name,
+                ep_size=parallelism.expert_parallel,
+                sp_size=parallelism.sequence_parallel,
+                loader_options=options,
+                peft_config=cfg.get("peft_config"),
+            )
+            spec.debug = {**spec.debug, **gpu_memory_debug_config(cfg)}
+            return spec
 
         zorro_train_patch = None
         if cfg.get("zorro_train_enable", False):
@@ -117,10 +350,12 @@ class ModelSpec(BaseModel):
             model_path_or_name=model_name,
             dtype="bfloat16",
             attn_implementation=cfg["attn_implementation"],
+            debug=gpu_memory_debug_config(cfg),
             patches=Patches(
                 liger=cfg.get("use_liger", False),
                 zorro_train=zorro_train_patch,
                 gradient_checkpointing=cfg.get("enable_gradient_checkpointing", True),
+                peft=cfg.get("peft_config"),
             ),
         )
 
@@ -138,6 +373,17 @@ class ModelSpec(BaseModel):
         from arctic_platform.model.loader import is_registered_loader
         from arctic_platform.model.loader import resolve_loader_name
 
+        # Existing DSS loaders carry AP controls in loader_options.debug.
+        legacy_debug = self.loader_options.get("debug")
+        if isinstance(legacy_debug, dict) and "gpu_mem_preallocate_gib" in legacy_debug:
+            if "gpu_mem_preallocate_gib" not in self.debug:
+                self.debug = {**self.debug, "gpu_mem_preallocate_gib": legacy_debug["gpu_mem_preallocate_gib"]}
+            self.loader_options = {
+                **self.loader_options,
+                "debug": {key: value for key, value in legacy_debug.items() if key != "gpu_mem_preallocate_gib"},
+            }
+        gpu_mem_preallocate_bytes({"debug": self.debug})
+
         if self.loader is None:
             self.loader = resolve_loader_name(self)
         else:
@@ -148,4 +394,7 @@ class ModelSpec(BaseModel):
         options_model = get_loader_options_model(self.loader)
         if options_model is not None:
             self.loader_options = options_model.model_validate(self.loader_options).model_dump()
+        from arctic_platform.model.loader import validate_loader_spec
+
+        validate_loader_spec(self.loader, self)
         return self

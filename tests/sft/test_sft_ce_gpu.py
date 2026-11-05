@@ -17,9 +17,8 @@
 These exercise the real server-side CE path on CUDA. They skip when no GPU is
 visible (``@require_torch_gpu``) — run them via autorun on the GPU box.
 
-HTTP e2e: client process uses ``CUDA_VISIBLE_DEVICES=`` empty; the launched server
-gets ``--server-cuda-visible-devices``. Do **not** force the torch CE fallback
-here: whatever kernel the server has (flash-attn or torch) is what production uses.
+Do **not** force the torch CE fallback in the e2e: whatever kernel the server
+has (flash-attn or torch) is what production uses.
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ import sys
 import pytest
 import torch
 
+from arctic_platform.common.chunked_cross_entropy import chunked_causal_lm_loss
 from arctic_platform.sft.processor import sft_ce_sum_from_hidden
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
@@ -92,6 +92,45 @@ class TestParseStepMetrics(TestCasePlus):
 
 
 @require_torch_gpu
+class TestChunkedHFCausalLossGPU(TestCasePlus):
+    def test_masked_loss_and_gradient_match_hf(self):
+        from transformers.loss.loss_utils import ForCausalLMLoss
+
+        set_seed(37)
+        for dtype in (torch.float32, torch.bfloat16):
+            base = torch.randn(2, 257, 4096, device="cuda", dtype=dtype)
+            labels = torch.randint(0, 4096, (2, 257), device="cuda")
+            labels[:, ::3] = -100
+            original = base.clone().requires_grad_(True)
+            candidate = base.clone().requires_grad_(True)
+            expected = ForCausalLMLoss(original, labels, 4096)
+            actual = chunked_causal_lm_loss(candidate, labels, 4096, chunk_rows=31)
+            expected.backward()
+            actual.backward()
+            torch_assert_close(actual, expected, rtol=0, atol=1e-6)
+            torch_assert_close(candidate.grad, original.grad, rtol=0, atol=1e-7)
+            torch_assert_close(candidate.grad.float().norm(), original.grad.float().norm(), rtol=0, atol=1e-6)
+
+    def test_explicit_shift_and_fractional_denominator(self):
+        from transformers.loss.loss_utils import ForCausalLMLoss
+
+        set_seed(41)
+        original = torch.randn(2, 17, 4096, device="cuda", requires_grad=True)
+        candidate = original.detach().clone().requires_grad_(True)
+        labels = torch.randint(0, 4096, (2, 17), device="cpu")
+        shifted = labels.clone()
+        shifted[:, ::3] = -100
+        options = {"num_items_in_batch": torch.tensor(0.5), "shift_labels": shifted}
+        expected = ForCausalLMLoss(original, labels, 4096, **options)
+        actual = chunked_causal_lm_loss(candidate, labels, 4096, chunk_rows=7, **options)
+        (expected * 0.7).backward()
+        (actual * 0.7).backward()
+        # Chunk summation changes only fp32 reduction ordering of the scalar.
+        torch_assert_close(actual, expected, rtol=0, atol=1e-4)
+        torch_assert_close(candidate.grad, original.grad, rtol=0, atol=1e-7)
+
+
+@require_torch_gpu
 class TestSftCeSumFromHiddenParityGPU(TestCasePlus):
     """Numeric + gradient parity for ``compute`` / ``memory`` vs full-logits CE."""
 
@@ -140,13 +179,12 @@ class TestSftCeSumFromHiddenParityGPU(TestCasePlus):
 
 @require_torch_gpu
 @pytest.mark.gpu_serial
-class TestSftCeHttpE2EModesGPU(TestCasePlus):
-    """End-to-end: CPU-blanked client + local GPU server, all three sft_ce modes.
+class TestSftCeE2EModesGPU(TestCasePlus):
+    """End-to-end over the Ray transport, all three sft_ce modes.
 
-    Matches production topology: client ``CUDA_VISIBLE_DEVICES=`` empty, server
-    child sees GPUs via ``server_cuda_visible_devices``. Per-step ``loss`` and
-    ``grad_norm`` must match exactly across ``none`` / ``compute`` / ``memory``
-    on the same batch (same math, same seeds — not "close enough").
+    Per-step ``loss`` and ``grad_norm`` must match exactly across ``none`` /
+    ``compute`` / ``memory`` on the same batch (same math, same seeds — not
+    "close enough").
     """
 
     def test_modes_match_loss_and_grad_norm_curves(self):
@@ -156,19 +194,14 @@ class TestSftCeHttpE2EModesGPU(TestCasePlus):
 
         for mode in ("none", "compute", "memory"):
             env = self.get_env()
-            env["CUDA_VISIBLE_DEVICES"] = ""  # client blank
+            env["CUDA_VISIBLE_DEVICES"] = "0"
             env["WANDB_DISABLED"] = "true"
             env.setdefault("HF_HOME", "/data-fast/huggingface")
-            # HTTP port from this worker's block; DeepSpeed rendezvous uses a second probe.
-            http_port = reserve_free_port(_PORT_BASE + 1, span=3)
-            env["MASTER_PORT"] = str(reserve_free_port(_PORT_BASE + 4, span=4))
+            env["MASTER_PORT"] = str(reserve_free_port(_PORT_BASE + 1, span=7))
             cmd = [
                 sys.executable,
                 "-m",
-                "arctic_platform.sft.examples.run_sft_http_demo",
-                "--launch-local-server",
-                "--server-cuda-visible-devices",
-                "0",
+                "arctic_platform.sft.examples.run_sft_demo",
                 "--training-gpus",
                 "1",
                 "--steps",
@@ -177,8 +210,6 @@ class TestSftCeHttpE2EModesGPU(TestCasePlus):
                 "sft_ce",
                 "--logits-optimization",
                 mode,
-                "--port",
-                str(http_port),
                 "--checkpoint-dir",
                 str(ckpt / mode),
             ]

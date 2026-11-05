@@ -1,0 +1,123 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Cortex ``compute_logprobs`` post: chunked log-softmax + gather.
+
+Registered as ``compute_logprobs``. AP's tiled / FlashAttn + entropy
+path stays ``compute_entropy_and_logprobs`` / ``ap_compute_logprobs``.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+
+import torch
+
+from arctic_platform.common.registry import register_post_processor
+
+# Target fp32 slice size for the chunked log_softmax. Peak memory of the fp32
+# intermediate is chunk_tokens * V * 4 bytes; deriving the shard count from this
+# budget keeps the slice size constant as V varies across models.
+_LOGPROB_SLICE_BYTES = 1 * (2**30)  # 1 GiB
+
+
+def _eager_log_softmax_gather(logits_chunk: torch.Tensor, labels_chunk: torch.Tensor) -> torch.Tensor:
+    """Upcast to fp32 and return log_softmax over vocab at the label column."""
+    # Not torch.log_softmax: it sums the argmax's own exp(0) = 1, rounding a near-certain label's logprob and gradient
+    # to exactly 0 (https://jonbarron.info/softmaxfix/; arXiv:2610.36427 for the log1p below).
+    logits = logits_chunk.float()
+    peak, top = logits.max(-1, keepdim=True)
+    labels = labels_chunk.unsqueeze(-1)
+    # An exact zero at the argmax avoids cancellation in its backward pass.
+    label_logits = torch.where(labels == top, 0.0, logits.gather(-1, labels) - peak).squeeze(-1)
+    others = (logits - peak).scatter_(-1, top, float("-inf")).exp_().sum(-1)
+    # log1p preserves tiny probabilities and finite gradients when every other logit is -inf.
+    return label_logits - torch.log1p(others)
+
+
+_compiled_log_softmax_gather = None
+
+
+def _log_softmax_gather(logits_chunk: torch.Tensor, labels_chunk: torch.Tensor) -> torch.Tensor:
+    """Eager on CPU; Cortex ``torch.compile`` fuse when CUDA is available."""
+    global _compiled_log_softmax_gather
+    if os.environ.get("DSS_LOGPROB_COMPILE", "1") != "0" and torch.cuda.is_available():
+        if _compiled_log_softmax_gather is None:
+            _compiled_log_softmax_gather = torch.compile(_eager_log_softmax_gather)
+        return _compiled_log_softmax_gather(logits_chunk, labels_chunk)
+    return _eager_log_softmax_gather(logits_chunk, labels_chunk)
+
+
+@register_post_processor("compute_logprobs")
+def compute_logprobs_post(model_outputs: dict, batch: dict, meta: dict, device: str) -> dict:
+    """Compute per-token log-probs from logits using the Cortex kernel.
+
+    Peak memory is dominated by the fp32 log_softmax intermediate. Shard the
+    token axis so each slice fits ``_LOGPROB_SLICE_BYTES``. Prefer request
+    ``labels`` (SP-aligned) over ``roll(input_ids)``. Zero ignore_index=-100
+    positions. Pass through when the model already returned ``logprobs``.
+    """
+    del device
+    logprobs = model_outputs.get("logprobs")
+    if logprobs is not None:
+        return {"logprobs": logprobs}
+
+    logits = model_outputs.get("logits")
+    if logits is None:
+        raise ValueError("compute_logprobs requires model outputs containing either 'logprobs' or 'logits'")
+
+    context = {**meta, **batch}
+    labels = context.get("labels")
+    if labels is None:
+        input_ids = context.get("input_ids")
+        if input_ids is None:
+            raise ValueError(
+                "compute_logprobs requires 'labels' or 'input_ids' in batch/meta when model outputs contain logits"
+            )
+        input_ids = input_ids.to(logits.device)
+        if input_ids.ndim < logits.ndim:
+            input_ids = input_ids.view(logits.shape[:-1])
+        labels = torch.roll(input_ids, shifts=-1, dims=-1)
+    else:
+        labels = labels.to(logits.device)
+        if labels.ndim < logits.ndim:
+            if labels.numel() != math.prod(logits.shape[:-1]):
+                raise ValueError(
+                    "context labels are incompatible with logits shape: "
+                    f"labels={tuple(labels.shape)} logits={tuple(logits.shape)}"
+                )
+            labels = labels.view(logits.shape[:-1])
+
+    valid_labels = labels != -100
+    safe_labels = labels.masked_fill(~valid_labels, 0)
+
+    logits_2d = logits.reshape(-1, logits.shape[-1])
+    labels_1d = safe_labels.reshape(-1)
+    n_tokens, vocab_size = logits_2d.shape
+    if n_tokens == 0:
+        return {"logprobs": torch.empty_like(labels, dtype=logits.dtype)}
+
+    bytes_per_token_fp32 = vocab_size * 4
+    num_shards = math.ceil(n_tokens * bytes_per_token_fp32 / _LOGPROB_SLICE_BYTES)
+    num_shards = max(1, min(num_shards, n_tokens))
+
+    logit_shards = torch.chunk(logits_2d, num_shards, dim=0)
+    label_shards = torch.chunk(labels_1d, num_shards, dim=0)
+    out = [_log_softmax_gather(ls, ys) for ls, ys in zip(logit_shards, label_shards)]
+
+    logprobs = torch.cat(out).view_as(labels)
+    logprobs = torch.where(valid_labels, logprobs, torch.zeros_like(logprobs))
+    return {"logprobs": logprobs}

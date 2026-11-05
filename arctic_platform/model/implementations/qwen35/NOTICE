@@ -7,8 +7,8 @@ License, Version 2.0:
     https://github.com/PrimeIntellect-ai/prime-rl
     Copyright (c) Prime Intellect, Inc.
 
-Some files additionally derive from torchtitan (Copyright (c) Meta Platforms, Inc.),
-also under the Apache License, Version 2.0, and retain their original per-file headers.
+Some files additionally derive from torchtitan (Copyright (c) Meta Platforms, Inc.)
+and retain their original per-file headers.
 
 This code has been modified (for example: adapting the model to run with DeepSpeed,
 adjusted import paths, and slimming to the Qwen3.5-MoE model provider). See the

@@ -23,16 +23,25 @@ import torch.nn as nn
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 
-# Mutates the model in place. A patch reads its own settings (and any sibling
+# Mutates in place or returns a replacement. Reads its settings (and any sibling
 # patches it cares about) off ctx.spec.patches.
-Patch = Callable[[nn.Module, LoaderContext], None]
+Patch = Callable[[nn.Module, LoaderContext], nn.Module | None]
 
 
 # Canonical order (every registered patch must appear here).
-# liger → zorro_train (replaces forward) → gradient_checkpointing (before DS wrap).
+# Kernel swaps run first, model features before forward replacement, and PEFT wraps last.
 # Note: ZoRRo's patched forward does not call `_gradient_checkpointing_func`, so GC
 # under ZoRRo is a no-op for activation savings (same as the old inline worker path).
-PATCH_ORDER: tuple[str, ...] = ("liger", "zorro_train", "gradient_checkpointing")
+PATCH_ORDER: tuple[str, ...] = (
+    "liger",
+    "gradient_checkpointing",
+    "activation_offload",
+    "compile",
+    "tiled_mlp",
+    "lm_head",
+    "zorro_train",
+    "peft",
+)
 
 _PATCHES: dict[str, Patch] = {}
 
@@ -41,8 +50,10 @@ def register_patch(name: str) -> Callable[[Patch], Patch]:
     """Register a patch by name (must match a ``Patches`` field and be in PATCH_ORDER)."""
 
     def decorator(fn: Patch) -> Patch:
-        assert name in PATCH_ORDER, f"patch {name!r} missing from PATCH_ORDER"
-        assert name not in _PATCHES, f"patch {name!r} already registered"
+        if name not in PATCH_ORDER:
+            raise RuntimeError(f"patch {name!r} missing from PATCH_ORDER")
+        if name in _PATCHES:
+            raise RuntimeError(f"patch {name!r} already registered")
         _PATCHES[name] = fn
         return fn
 
@@ -60,6 +71,13 @@ def apply_patches(loaded: LoadedModel, ctx: LoaderContext) -> None:
             continue
         if not getattr(ctx.spec.patches, name, None):
             continue
-        _PATCHES[name](loaded.model, ctx)
+        previous = loaded.model
+        replacement = _PATCHES[name](previous, ctx)
+        if replacement is not None:
+            loaded.model = replacement
+            if replacement is not previous:
+                from arctic_platform.model.weight_export import transfer_weight_export
+
+                transfer_weight_export(previous, replacement)
         applied.add(name)
     loaded.applied_patches = frozenset(applied)

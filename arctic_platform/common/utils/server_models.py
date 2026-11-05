@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared request models and inference config helpers for HTTP and Ray RL servers."""
+"""Request models and inference config helpers for the Ray RL server."""
 
 from __future__ import annotations
 
@@ -22,6 +22,27 @@ from typing import Any
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import field_validator
+from pydantic import model_validator
+
+from arctic_platform.common.config import SP_SIZE_PATHS
+from arctic_platform.common.config import resolve_parallelism_degree
+from arctic_platform.common.config import resolve_sp_size
+
+DEFAULT_SEED = 42
+
+__all__ = [
+    "SP_SIZE_PATHS",
+    "resolve_parallelism_degree",
+    "resolve_sp_size",
+    "JobConfig",
+    "sp_size_from_job_config",
+    "GenerateRequest",
+    "LogProbsRequest",
+    "WeightSyncRequest",
+    "parse_arctic_inference_rollout",
+    "build_model_config",
+]
 
 
 class JobConfig(BaseModel):
@@ -38,15 +59,53 @@ class JobConfig(BaseModel):
     checkpoint_path: str | None = None
     arctic_inference_config: dict | None = None
     full_determinism: bool = False
-    seed: int = 42
+    seed: int = DEFAULT_SEED
     # Weight-sync strategy for the source (training) job. A WeightSyncRequest may override either field for one call.
     # Meaningful only on a training job.
     cuda_ipc: bool = False
     low_memory: bool = False
 
+    @field_validator("seed", mode="before")
+    @classmethod
+    def _coerce_null_seed(cls, value: Any) -> Any:
+        return DEFAULT_SEED if value is None else value
+
+    @model_validator(mode="after")
+    def _validate_sp_size(self) -> "JobConfig":
+        # Resolve at input time so a bad or self-contradicting parallel degree
+        # fails when the job is created, not deep inside a worker.
+        resolve_sp_size(self.model_dump())
+        return self
+
+    @property
+    def sp_size(self) -> int:
+        """Sequence-parallel degree declared by this job, or 1 when unset.
+
+        The nested config blobs are free-form dicts from several clients, so the
+        degree is derived here instead of being re-read at each call site. Not a
+        ``computed_field``: ``model_dump()`` is forwarded verbatim to workers and
+        must keep the wire shape the client sent.
+        """
+        return resolve_sp_size(self.model_dump())
+
+
+def sp_size_from_job_config(job_config: Any) -> int:
+    """``JobConfig.sp_size``, also accepting the serialized dict a worker receives."""
+    if job_config is None:
+        return 1
+    if isinstance(job_config, JobConfig):
+        return job_config.sp_size
+    if hasattr(job_config, "model_dump"):
+        job_config = job_config.model_dump()
+    if not isinstance(job_config, dict):
+        raise TypeError(f"job_config must be a dict or JobConfig; got {type(job_config).__name__}")
+    return resolve_sp_size(job_config)
+
 
 class GenerateRequest(BaseModel):
-    prompts: list[str]
+    # Token-id prompts are what the TRL rollout sends, so the server does not
+    # tokenize the text a second time and insert specials the training row lacks.
+    prompts: list[str | list[int]]
     sampling_params: dict[str, Any] | None = None
     routing_key: Any = None
     strict: bool = False
@@ -58,34 +117,6 @@ class LogProbsRequest(BaseModel):
     top_k: int = 1
 
 
-class StepRequest(BaseModel):
-    learning_rate: float | None = None
-
-
-class SaveRequest(BaseModel):
-    # On-prem saves to the job's configured checkpoint_path; these mirror
-    # Cortex's `save(checkpoint_id, checkpoint_type)` and are accepted (unused).
-    checkpoint_id: str | None = None
-    checkpoint_type: str = "resumable"
-    # SFT extras (optional path/step override, HF export, rotation, stage metadata).
-    path: str | None = None
-    step: int | None = None
-    export_hf: bool = False
-    save_total_limit: int | None = None
-    stage_info: dict[str, Any] | None = None
-
-
-class LoadCheckpointRequest(BaseModel):
-    path: str | None = None
-    step: int | None = None
-
-
-class ResetPrefixCacheRequest(BaseModel):
-    drain: bool = True
-    timeout_s: float = 60.0
-    retry_interval_s: float = 0.1
-
-
 class WeightSyncRequest(BaseModel):
     # Matches Cortex's `weight_sync(source_sub_job_id, target_sub_job_ids)`.
     # On-prem treats a sub_job_id as its plain job id.
@@ -94,22 +125,6 @@ class WeightSyncRequest(BaseModel):
     target_sub_job_ids: list[int]
     cuda_ipc: bool | None = None
     low_memory: bool | None = None
-
-
-class OperationRequest(BaseModel):
-    # Generic data-plane envelope, matching Cortex's /{job_id}/operation. On-prem
-    # dispatches on operation_type; sub_job_id/sub_job_type are accepted for
-    # parity (unused, since on-prem addresses jobs by the job_id query param).
-    # sub_job_id is int on-prem (plain job id) and may be str on Cortex — accept both.
-    operation_type: str
-    sub_job_id: int | str | None = None
-    sub_job_type: str | None = None
-    payload: dict[str, Any] = Field(default_factory=dict)
-
-
-class WeightNormRequest(BaseModel):
-    training_job_id: int
-    sampling_job_id: int
 
 
 def parse_arctic_inference_rollout(arctic_inference_config, model_config_fields=None):
@@ -144,7 +159,7 @@ def build_model_config(
     ModelConfig, which expands them into real engine kwargs in
     ``ModelConfig.to_engine_kwargs()``.
     """
-    from arctic_inference.server.config import ModelConfig
+    from arctic_platform.inference.server.config import ModelConfig
 
     cfg = dict(vllm_config or {})
     cfg["model"] = model_name

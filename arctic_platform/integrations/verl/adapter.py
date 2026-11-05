@@ -39,11 +39,11 @@ from transformers import AutoTokenizer
 from verl.remote_backend.base import RemoteBackend
 from verl.remote_backend.base import RemoteBackendRegistry
 
-from arctic_platform.client import ArcticRLClientConfig
+from arctic_platform.client import ArcticClientConfig
+from arctic_platform.client import AsyncArcticRLClient
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
-from arctic_platform.client import create_arctic_rl_client
 from arctic_platform.rl.ray_server import ArcticRLRayServerState
 
 _ARCTIC_METRIC_REDUCTION_FN = {
@@ -130,7 +130,7 @@ def _prepare_padded_arctic_batch_dict(data, pad_token_id, *, drop_position_ids: 
 
 @RemoteBackendRegistry.register("arctic")
 class ArcticRLClientWrapper(RemoteBackend):
-    """Arctic backend: a thin wrapper around ArcticRL's ``ArcticRLClient``.
+    """Arctic backend: a thin wrapper around ArcticRL's ``AsyncArcticRLClient``.
 
     Implements the generic :class:`verl.remote_backend.RemoteBackend`
     interface. Registered under the name ``"arctic"`` so
@@ -182,7 +182,7 @@ class ArcticRLClientWrapper(RemoteBackend):
     ) -> "ArcticRLClientWrapper":
         """Sole public constructor.
 
-        * ``handle=None`` (driver path): build a fresh ``ArcticRLClient``
+        * ``handle=None`` (driver path): build a fresh ``AsyncArcticRLClient``
           and the underlying Ray actors.
         * ``handle=<reconnect_handle()>``: re-attach to the existing
           driver-side instance (used by forwarder workers and
@@ -202,13 +202,10 @@ class ArcticRLClientWrapper(RemoteBackend):
         to this same backend instance.
 
         Ray transport shares an in-process ``server_state`` actor handle.
-        HTTP reconnects via job ids in ``reconnect_config`` only
-        (``rl_server_state=None``).
         """
-        get_state = getattr(self._client.transport, "get_server_state", None)
         return {
             "rl_client_reconnect_config": self.reconnect_config(),
-            "rl_server_state": get_state() if get_state is not None else None,
+            "rl_server_state": self._client.get_server_state(),
         }
 
     # Parallelism contract --------------------------------------------- #
@@ -298,6 +295,10 @@ class ArcticRLClientWrapper(RemoteBackend):
             batch["position_ids"] = position_ids
         if actor_config.use_kl_loss:
             batch["ref_log_prob"] = data["ref_log_prob"]
+        # Batch-dim: must live in ``batch`` so ``_split_batch`` shards it with
+        # advantages / logprobs. In ``meta`` it is replicated to every DP rank.
+        if data.get("rollout_is_weights") is not None:
+            batch["rollout_is_weights"] = data["rollout_is_weights"]
 
         per_step_global_bsz = self.config.actor_rollout_ref.actor.ppo_mini_batch_size * rollout_n
         meta = dict(
@@ -341,7 +342,6 @@ class ArcticRLClientWrapper(RemoteBackend):
             f"actor.ppo_mini_batch_size={self.config.actor_rollout_ref.actor.ppo_mini_batch_size})"
         )
         chunk_rows = total_rows // num_minibatches
-        rollout_is_weights_full = data.get("rollout_is_weights", None)
 
         agg_metrics: dict = {}
         loss_list: list = []
@@ -356,14 +356,6 @@ class ArcticRLClientWrapper(RemoteBackend):
                 meta_chunk = dict(meta)
                 meta_chunk["global_batch_size"] = per_step_global_bsz
                 meta_chunk["batch_num_tokens"] = batch_chunk["response_mask"].sum()
-                if rollout_is_weights_full is not None:
-                    meta_chunk["rollout_is_weights"] = (
-                        rollout_is_weights_full[lo:hi]
-                        if isinstance(rollout_is_weights_full, torch.Tensor)
-                        else rollout_is_weights_full
-                    )
-                else:
-                    meta_chunk["rollout_is_weights"] = None
 
                 payload = dict(batch=batch_chunk, meta=meta_chunk)
                 response = await self._send_update_actor(payload)
@@ -478,10 +470,10 @@ class ArcticRLClientWrapper(RemoteBackend):
     ):
         if rl_server_state is not None:
             # Reattach to the driver's already-running in-process Ray server.
-            return create_arctic_rl_client(reconnect_job_config, server_state=rl_server_state)
+            return AsyncArcticRLClient(reconnect_job_config, server_state=rl_server_state)
 
         if reconnect_job_config is not None:
-            return create_arctic_rl_client(reconnect_job_config)
+            return AsyncArcticRLClient(reconnect_job_config)
 
         model_name = self.config.actor_rollout_ref.model.path
         n_training_gpus = self._backend_config.get("training_gpus", self.config.trainer.n_gpus_per_node)
@@ -587,32 +579,19 @@ class ArcticRLClientWrapper(RemoteBackend):
 
         log_prob_ds_config = None if n_log_prob_gpus == 0 else self._create_ds_config(n_log_prob_gpus)
 
-        protocol = self._backend_config.comms.protocol
-        onprem_kwargs: dict[str, Any] = {
-            "protocol": protocol,
-            "colocate": colocate,
-        }
-        # host/port only matter for the HTTP transport; the in-process Ray path
-        # never dials them. Auto-spawn the local HTTP server when using HTTP so
-        # recipes do not need a separately started arctic_platform.rl.http_server.
-        if protocol != "ray":
-            onprem_kwargs["host"] = "localhost"
-            onprem_kwargs["port"] = 7000
-            onprem_kwargs["launch_local_server"] = True
-
         # attn_implementation also lives on ds_worker_config; keep it there for
         # the DeepSpeed worker (matches recipe/rl-correctness).
         ds_worker_config = self._create_ds_worker_config()
         ds_worker_config.setdefault("attn_implementation", attn_implementation)
 
-        rl_config = ArcticRLClientConfig(
+        rl_config = ArcticClientConfig(
             model_name=model_name,
             seed=self._backend_config.train.determinism.get("seed", 42),
             max_seq_len=max_length,
             training_gpus=n_training_gpus,
             sampling_gpus=n_sampling_gpus,
             log_prob_gpus=n_log_prob_gpus,
-            backend=OnPremConfig(**onprem_kwargs),
+            backend=OnPremConfig(colocate=colocate),
             training=TrainingConfig(
                 full_determinism=self._backend_config.train.determinism.get("full", False),
                 checkpoint_path=self.config.trainer.default_local_dir,
@@ -629,7 +608,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             ),
         )
 
-        # ArcticRLClient is constructed as a ray remote actor with num_gpus=0,
+        # AsyncArcticRLClient is constructed as a ray remote actor with num_gpus=0,
         # which causes CUDA_VISIBLE_DEVICES to be empty.
         if colocate:
             num_visible = n_training_gpus + n_sampling_gpus + n_log_prob_gpus
@@ -637,7 +616,7 @@ class ArcticRLClientWrapper(RemoteBackend):
             num_visible = rl_config.training_gpus + rl_config.sampling_gpus + rl_config.log_prob_gpus
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_visible))
 
-        return create_arctic_rl_client(rl_config)
+        return AsyncArcticRLClient(rl_config)
 
     _default_sampling_params = {
         "temperature": 0.0,

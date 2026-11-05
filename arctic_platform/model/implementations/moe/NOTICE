@@ -1,0 +1,16 @@
+NOTICE
+
+Portions of this directory (arctic_platform/model/implementations/moe) are copied
+and adapted from prime-rl, developed by Prime Intellect and licensed under the
+Apache License, Version 2.0:
+
+    https://github.com/PrimeIntellect-ai/prime-rl
+    Copyright (c) Prime Intellect, Inc.
+
+Some files additionally derive from torchtitan (Copyright (c) Meta Platforms,
+Inc.) and retain their original per-file headers.
+
+This code has been modified in DSS and Arctic Platform, including DeepSpeed
+integration, shared Qwen/GLM support, and adjusted import paths. See
+INTERNAL_COMMIT.txt for the DSS source snapshot and the repository-root LICENSE
+for the full Apache License, Version 2.0 terms.

@@ -16,7 +16,7 @@
 
 Canonical nesting (shared across backends)::
 
-    ArcticRLClientConfig
+    ArcticClientConfig
     ├── model_name, seed, dtype, max_seq_len
     ├── training_gpus / sampling_gpus / log_prob_gpus
     ├── training     # DeepSpeed engine (ds_config owns optimizer/scheduler/batch) + checkpoint
@@ -29,66 +29,109 @@ servers accept this canonical shape directly.
 
 from __future__ import annotations
 
-import os
+from copy import deepcopy
 from typing import Any
 from typing import Literal
 
+from pydantic import AliasChoices
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import SecretStr
+from pydantic import field_validator
 from pydantic import model_validator
+from pydantic_settings import BaseSettings
+from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
+
+from arctic_platform.common.config import validate_peft_config
 
 JobId = int | str
 
 
 class OnPremConfig(BaseModel):
-    """Backend-specific settings for the on-prem server (HTTP + in-process Ray)."""
+    """Backend-specific settings for the on-prem in-process Ray server."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     type: Literal["onprem"] = "onprem"
-    protocol: Literal["http", "ray"] = Field("http", description="onprem transport: HTTP or in-process Ray.")
-    host: str = Field("localhost", description="onprem: server host.")
-    port: int = Field(8000, description="onprem: server port.")
     colocate: bool = Field(False, description="onprem: colocate job types on shared GPUs.")
-    launch_local_server: bool = Field(False, description="onprem: spawn a local server before connecting.")
-    server_cuda_visible_devices: str | None = Field(
-        None,
-        description=(
-            "CUDA_VISIBLE_DEVICES for the local server subprocess when launch_local_server=True. "
-            "Use this when the client process itself has CUDA_VISIBLE_DEVICES= (empty) so the "
-            "server child still sees GPUs. None = inherit the client's environment."
-        ),
-    )
-    startup_timeout: float = Field(
-        600.0, description="onprem: seconds to wait for a launched server to become healthy."
-    )
 
 
-class CortexConfig(BaseModel):
+class CortexConfig(BaseSettings):
     """Cortex protocol settings for the remote backend.
 
-    Provide `base_url` for a direct/mock URL (no auth), or `host` + a PAT in the
-    env var for Snowflake programmatic-access auth.
+    Provide `base_url` for a direct/mock URL (no auth), or `host` + `pat` for
+    Snowflake programmatic-access auth.
+
+    Every field also reads from an ``ARCTIC_CORTEX_``-prefixed env var
+    (``ARCTIC_CORTEX_HOST``, ``ARCTIC_CORTEX_PAT``, ``ARCTIC_CORTEX_DATABASE``,
+    ``ARCTIC_CORTEX_SCHEMA``, ...), so `CortexConfig()` with no arguments is a
+    complete config on a configured shell. Constructor and YAML values win over
+    the environment.
     """
 
-    model_config = ConfigDict(extra="forbid", validate_default=True)
+    model_config = SettingsConfigDict(
+        extra="forbid",
+        validate_default=True,
+        env_prefix="ARCTIC_CORTEX_",
+        # An exported-but-empty var is how a shell says "unset"; without this it
+        # would beat the default and fail validation as a present empty string.
+        env_ignore_empty=True,
+        populate_by_name=True,
+    )
 
     type: Literal["remote"] = "remote"
     protocol: Literal["cortex"] = Field("cortex", description="remote transport protocol.")
+    # Present so callers can read `backend.colocate` uniformly across backends.
+    # Cortex always splits training and sampling into separate SnowAPI sub-jobs,
+    # so it can only ever be False.
+    colocate: Literal[False] = Field(False, description="cortex: colocation not supported.")
     base_url: str | None = Field(None, description="cortex: direct/mock GS URL; bypasses PAT auth.")
     host: str | None = Field(None, description="cortex: Snowflake host for PAT auth.")
-    pat: str | None = Field(None, description="cortex: PAT value passed directly; overrides pat_env_var when set.")
-    pat_env_var: str = Field("CORTEX_PAT", description="cortex: env var holding the PAT when `pat` is unset.")
+    # SecretStr so the token cannot ride along into a log line or a serialized
+    # config: repr and model_dump render it as `**********`, and reading it
+    # takes an explicit `.get_secret_value()`.
+    pat: SecretStr | None = Field(None, description="cortex: PAT; also read from ARCTIC_CORTEX_PAT.")
     database: str = Field("", description="cortex: Snowflake database.")
-    schema_: str = Field("", alias="schema", description="cortex: Snowflake schema.")
+    # `schema` shadows a BaseModel attribute, hence the trailing underscore. An
+    # explicit alias opts the field out of `env_prefix`, so the env name has to
+    # be spelled out or ARCTIC_CORTEX_SCHEMA is silently ignored.
+    schema_: str = Field(
+        "",
+        validation_alias=AliasChoices("schema", "schema_", "ARCTIC_CORTEX_SCHEMA"),
+        serialization_alias="schema",
+        description="cortex: Snowflake schema.",
+    )
     endpoint: str = Field("cortex-training", description="cortex: SnowAPI endpoint name.")
+    verify_ssl: bool = Field(True, description="cortex: verify HTTPS certificates.")
     max_retries: int = Field(10, ge=0, description="cortex: transient-failure retries per HTTP request (tenacity).")
-
-    def resolve_pat(self) -> str | None:
-        """The PAT for host/PAT auth: explicit `pat`, else the `pat_env_var` value."""
-        return self.pat if self.pat is not None else os.environ.get(self.pat_env_var)
+    request_timeout: float = Field(1800.0, gt=0, description="Maximum seconds allowed for one Cortex HTTP request.")
+    poll_timeout: float = Field(
+        1800.0, gt=0, description="Maximum total seconds to poll a submitted Cortex operation."
+    )
+    job_ready_timeout: float = Field(
+        1800.0, gt=0, description="Maximum total seconds to wait for a Cortex job to reach RUNNING."
+    )
+    # Every job on a shared account has the same submitter, so put a person or
+    # run name here. Existing launchers export CORTEX_JOB_COMMENT.
+    job_comment: str | None = Field(
+        None,
+        validation_alias=AliasChoices("job_comment", "ARCTIC_CORTEX_JOB_COMMENT", "CORTEX_JOB_COMMENT"),
+        description="cortex: comment stored on the job at create time.",
+    )
+    # The server reclaims a job nobody is using, so a client that is killed
+    # outright still releases its GPUs. None keeps the server default (30 min).
+    idle_timeout_seconds: int | None = Field(
+        None,
+        description="cortex: seconds a job may sit idle before the server reclaims it; 0 disables, else 300-604800.",
+    )
+    pending_timeout_seconds: int | None = Field(
+        None,
+        ge=300,
+        le=604_800,
+        description="cortex: seconds a job may wait for capacity before the server fails it (default 24h).",
+    )
 
     @model_validator(mode="after")
     def _check(self) -> Self:
@@ -97,8 +140,11 @@ class CortexConfig(BaseModel):
         if self.host and not self.base_url:
             if not (self.database and self.schema_):
                 raise ValueError("cortex: database + schema required for host/PAT auth.")
-            if not self.resolve_pat():
-                raise ValueError(f"cortex: no PAT — set `pat` or the '{self.pat_env_var}' env var for host auth.")
+            if not (self.pat and self.pat.get_secret_value()):
+                raise ValueError("cortex: no PAT — set `pat` or ARCTIC_CORTEX_PAT for host auth.")
+        idle = self.idle_timeout_seconds
+        if idle is not None and idle != 0 and not 300 <= idle <= 604_800:
+            raise ValueError("cortex: idle_timeout_seconds must be 0 or between 300 and 604800.")
         return self
 
 
@@ -106,7 +152,7 @@ class SamplingConfig(BaseModel):
     """Sampling / log-prob engine settings shared by every backend.
 
     Engine knobs live under ``vllm`` — never flattened next to ``max_seq_len`` /
-    ``n_gpus``. Those allocation fields stay on ``ArcticRLClientConfig``.
+    ``n_gpus``. Those allocation fields stay on ``ArcticClientConfig``.
     """
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
@@ -159,6 +205,14 @@ class TrainingConfig(BaseModel):
         None,
         description="DeepSpeed worker knobs (attn_implementation, use_liger, enable_gradient_checkpointing, ...).",
     )
+    peft: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "PEFT adapter config (peft_type, r, lora_alpha, lora_dropout, bias, target_modules). "
+            "None = dense fine-tuning; an empty config is invalid. On-prem supports training; "
+            "Cortex also configures the sampling engine to serve the adapter."
+        ),
+    )
     cuda_ipc: bool = Field(
         False,
         description=(
@@ -175,8 +229,20 @@ class TrainingConfig(BaseModel):
         ),
     )
 
+    _validate_peft = field_validator("peft")(validate_peft_config)
 
-class ArcticRLClientConfig(BaseModel):
+    @model_validator(mode="after")
+    def _resolve_worker_peft(self) -> Self:
+        worker_peft = (self.ds_worker_config or {}).get("peft_config")
+        validate_peft_config(worker_peft)
+        if worker_peft is not None:
+            if self.peft is not None and self.peft != worker_peft:
+                raise ValueError("training.peft conflicts with training.ds_worker_config.peft_config")
+            self.peft = worker_peft
+        return self
+
+
+class ArcticClientConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     model_name: str = Field(..., description="HF model id to train/serve.")
@@ -189,11 +255,6 @@ class ArcticRLClientConfig(BaseModel):
     sampling_gpus: int = 0
     log_prob_gpus: int = 0
 
-    # Shared across backends.
-    job_ready_timeout: float = Field(1800.0, description="Seconds to wait for a created job to reach RUNNING.")
-    request_timeout: float = Field(
-        1800.0, description="Per-request timeout (seconds) applied to every call. Generous for long ops."
-    )
     training: TrainingConfig = Field(default_factory=TrainingConfig, description="Training job settings.")
     sampling: SamplingConfig = Field(
         default_factory=SamplingConfig, description="Sampling / log-prob engine settings."
@@ -209,6 +270,19 @@ class ArcticRLClientConfig(BaseModel):
     sampling_job_id: JobId | None = None
     log_prob_job_id: JobId | None = None
 
+    @model_validator(mode="after")
+    def _check_backend_supports_peft(self) -> Self:
+        if (
+            self.training.peft is not None
+            and self.backend.type == "onprem"
+            and (self.sampling_gpus > 0 or self.sampling_job_id is not None)
+        ):
+            raise ValueError(
+                "On-prem PEFT supports training only; adapter sync to sampling is not implemented. "
+                "Use sampling_gpus=0 without a sampling_job_id, or switch to CortexConfig."
+            )
+        return self
+
     def gpus_for(self, job_type: str) -> int:
         """GPU count allocated to a job type (0 == the job type is disabled)."""
         return getattr(self, f"{job_type}_gpus")
@@ -218,17 +292,23 @@ class ArcticRLClientConfig(BaseModel):
     # this nesting (training / sampling.vllm) directly.
 
     def to_onprem(self, job_type: str) -> dict[str, Any]:
-        """Translate into one on-prem ``/initialize`` payload (see ArcticRLHTTPClient)."""
+        """Translate into one on-prem ``initialize`` payload."""
         tc, sc = self.training, self.sampling
-        payload: dict[str, Any] = {"model_name": self.model_name, "job_type": job_type, "seed": self.seed}
+        payload: dict[str, Any] = {"model_name": self.model_name, "job_type": job_type}
+        if self.seed is not None:
+            payload["seed"] = self.seed
         # log-prob runs on DeepSpeed only when asked; otherwise it's a vLLM engine.
         use_deepspeed = job_type == "training" or (job_type == "log_prob" and sc.log_prob_engine == "deepspeed")
         if use_deepspeed:
             payload["full_determinism"] = tc.full_determinism
             if tc.ds_config:
                 payload["ds_config"] = tc.ds_config
-            if tc.ds_worker_config:
-                payload["ds_worker_config"] = tc.ds_worker_config
+            worker = dict(tc.ds_worker_config or {})
+            worker.pop("peft_config", None)
+            if job_type == "training" and tc.peft is not None:
+                worker["peft_config"] = dict(tc.peft)
+            if worker:
+                payload["ds_worker_config"] = worker
             if job_type == "training":
                 if tc.checkpoint_path:
                     payload["checkpoint_path"] = tc.checkpoint_path
@@ -275,11 +355,39 @@ class ArcticRLClientConfig(BaseModel):
             training["optimizer"] = optimizer
         if "enable_gradient_checkpointing" in worker:
             training["activation_checkpointing"] = worker["enable_gradient_checkpointing"]
-        provider = worker.get("model_provider") or ("liger" if worker.get("use_liger") else None)
+        provider = worker.get("model_provider")
+        if provider == "liger":
+            raise ValueError(
+                "ds_worker_config.model_provider='liger' is not accepted. "
+                "Set use_liger=true to apply Liger kernels on a huggingface model."
+            )
+        if provider == "prime_rl":
+            provider = "arctic"
+        if provider and provider not in {"huggingface", "arctic"}:
+            raise ValueError(f"ds_worker_config.model_provider must be 'huggingface' or 'arctic', got {provider!r}.")
+        if worker.get("use_liger") and provider == "arctic":
+            raise ValueError(
+                "use_liger applies to huggingface models. On the arctic provider, "
+                "set model_options.lm_head.cross_entropy."
+            )
         if provider:
             training["model_provider"] = provider
+        if "model_options" in worker:
+            training["model_options"] = deepcopy(worker["model_options"])
+        if worker.get("use_liger"):
+            options = dict(training.get("model_options") or {})
+            options["liger"] = True
+            training["model_options"] = options
         if worker.get("attn_implementation"):
             training["attn_implementation"] = worker["attn_implementation"]
+        # Neutrino-only engine knobs ride along in ds_worker_config; on-prem ignores them.
+        for key in ("ep_size", "mb_spec", "router_replay"):
+            if key in worker:
+                training[key] = deepcopy(worker[key])
+        if ds:
+            training["ds_config"] = _without_noop_offload(ds)
+        if self.training.peft:
+            training["peft_config"] = self.training.peft
         return self._cortex_sub_job("training", {"training_config": training})
 
     def _cortex_inference_sub_job(self, job_type: str, n_gpus: int) -> dict[str, Any]:
@@ -287,10 +395,15 @@ class ArcticRLClientConfig(BaseModel):
         # flattening them onto inference_config is silently ignored (extra="allow").
         vllm = dict(self.sampling.vllm)
         vllm.pop("max_model_len", None)  # owned by top-level max_seq_len
-        vllm.pop("tensor_parallel_size", None)  # owned by n_gpus on this wire
-        inference: dict[str, Any] = {"max_seq_len": self.max_seq_len, "n_gpus": n_gpus}
+        inference: dict[str, Any] = {
+            **(self.sampling.arctic_inference_config or {}),
+            "max_seq_len": self.max_seq_len,
+            "n_gpus": n_gpus,
+        }
         if vllm:
             inference["vllm_config"] = vllm
+        if self.training.peft:
+            inference["peft_config"] = self.training.peft
         return self._cortex_sub_job(job_type, {"inference_config": inference})
 
     def _cortex_sub_job(self, job_type: str, extra: dict[str, Any]) -> dict[str, Any]:
@@ -308,3 +421,32 @@ def _neutrino_optimizer(ds_optimizer: Any) -> dict[str, Any] | None:
         return None
     params = ds_optimizer.get("params") or {}
     return {"name": ds_optimizer.get("type", "AdamW"), **params}
+
+
+def _without_noop_offload(ds_config: dict[str, Any]) -> dict[str, Any]:
+    """Drop ``offload_optimizer/offload_param: {device: none}`` from a ds_config.
+
+    To DeepSpeed, ``device: none`` and an absent key mean the same thing; to
+    Cortex they don't. It builds the optimizer from the typed ``optimizer``
+    field lifted above and settles on ``DeepSpeedCPUAdam``, so forwarding an
+    explicit no-op offload block moves only the parameters onto the GPU and the
+    first ``step()`` dies with::
+
+        AssertionError: CPUAdam param is on cuda:0 and must be 'cpu'
+
+    SkyRL's arctic_rl config spells the no-op out while the standalone recipes
+    omit it, which is why only the framework path hits this. A real
+    ``device: cpu`` request is left alone.
+    """
+    zero = ds_config.get("zero_optimization")
+    if not isinstance(zero, dict):
+        return ds_config
+    kept = {
+        key: value
+        for key, value in zero.items()
+        if key not in ("offload_optimizer", "offload_param")
+        or not (isinstance(value, dict) and str(value.get("device", "none")).lower() == "none")
+    }
+    if len(kept) == len(zero):
+        return ds_config
+    return {**ds_config, "zero_optimization": kept}

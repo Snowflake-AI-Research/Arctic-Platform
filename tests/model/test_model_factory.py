@@ -23,6 +23,7 @@ import types
 import pytest
 import torch.nn as nn
 from pydantic import ValidationError
+from transformers.loss.loss_utils import ForCausalLMLoss
 
 from arctic_platform.model import LoadedModel
 from arctic_platform.model import LoaderContext
@@ -56,7 +57,13 @@ def _restore_registries():
 def _ctx(**patch_flags) -> LoaderContext:
     """A LoaderContext whose spec exposes only the patch flags a test cares about."""
     patches = types.SimpleNamespace(**patch_flags)
-    return LoaderContext(spec=types.SimpleNamespace(patches=patches))
+    parallelism = types.SimpleNamespace(sequence_parallel=1)
+    return LoaderContext(
+        spec=types.SimpleNamespace(
+            patches=patches,
+            parallelism=parallelism,
+        )
+    )
 
 
 def _register(name, *, matches=None, default=False):
@@ -121,21 +128,47 @@ class TestLoaderSelection:
     def test_build_model_runs_resolved_loader_then_patches(self, monkeypatch):
         """build_model builds via the resolved loader and hands the result to the patch pipeline."""
         built = nn.Linear(1, 1)
+        calls = []
 
         @register_loader("fake")
         def _fake(ctx: LoaderContext) -> LoadedModel:
             return LoadedModel(model=built)
 
-        patched = []
-        monkeypatch.setattr(factory_mod, "apply_patches", lambda loaded, ctx: patched.append(loaded))
+        monkeypatch.setattr(
+            factory_mod,
+            "apply_patches",
+            lambda loaded, ctx: calls.append(("patch", loaded)),
+        )
+        monkeypatch.setattr(
+            factory_mod,
+            "freeze_fp8_weights_and_scales",
+            lambda model: calls.append(("finalize", model)),
+        )
 
         loaded = build_model(ModelSpec(model_path_or_name="x", loader="fake"))
 
         assert loaded.model is built
-        assert patched == [loaded]
+        assert calls == [("patch", loaded), ("finalize", built)]
 
 
 class TestPatchPipeline:
+    def test_replacement_is_passed_to_later_patches(self, monkeypatch):
+        monkeypatch.setattr(patch_mod, "PATCH_ORDER", ("wrap", "after"))
+        original = nn.Identity()
+        wrapped = nn.Sequential(original)
+        seen = []
+        patch_mod._PATCHES["wrap"] = lambda model, ctx: wrapped
+        patch_mod._PATCHES["after"] = lambda model, ctx: seen.append(model)
+        loaded = LoadedModel(model=original)
+        ctx = _ctx(wrap=True, after=True)
+
+        apply_patches(loaded, ctx)
+        apply_patches(loaded, ctx)
+
+        assert loaded.model is wrapped
+        assert seen == [wrapped]
+        assert loaded.applied_patches == frozenset({"wrap", "after"})
+
     def test_registry_matches_config_and_order(self):
         """Built-in patches line up: PATCH_ORDER == Patches fields == registered patches."""
         from arctic_platform.model.config import Patches
@@ -146,7 +179,7 @@ class TestPatchPipeline:
 
     def test_register_requires_order_membership(self):
         """A patch missing from PATCH_ORDER cannot be registered."""
-        with pytest.raises(AssertionError, match="missing from PATCH_ORDER"):
+        with pytest.raises(RuntimeError, match="missing from PATCH_ORDER"):
 
             @register_patch("not_in_order")
             def _patch(model, ctx) -> None:
@@ -190,6 +223,78 @@ class TestPatchPipeline:
         assert calls == ["a"]
 
 
+class TestHuggingFaceLoader:
+    def test_qwen3_resolves_to_default_loader(self, monkeypatch):
+        fake_config = types.SimpleNamespace(model_type="qwen3")
+        monkeypatch.setattr(
+            "transformers.AutoConfig.from_pretrained",
+            lambda *args, **kwargs: fake_config,
+        )
+        loader_mod._load_hf_config.cache_clear()
+
+        spec = ModelSpec(model_path_or_name="qwen")
+
+        assert spec.loader == "huggingface"
+
+    def test_unreadable_config_is_not_treated_as_a_missing_model(self, tmp_path):
+        loader_mod._load_hf_config.cache_clear()
+        (tmp_path / "config.json").write_text("{")
+        with pytest.raises(OSError, match="not a valid JSON file"):
+            loader_mod._load_hf_config(str(tmp_path))
+
+    def test_directory_without_config_is_not_an_hf_model(self, tmp_path):
+        loader_mod._load_hf_config.cache_clear()
+        assert loader_mod._load_hf_config(str(tmp_path)) is None
+
+    def test_sequence_parallel_requires_runtime_group(self):
+        from arctic_platform.model import ParallelismConfig
+        from arctic_platform.model.loaders.huggingface import load_huggingface
+
+        spec = ModelSpec(
+            model_path_or_name="qwen",
+            loader="huggingface",
+            parallelism=ParallelismConfig(sequence_parallel=2),
+        )
+        with pytest.raises(ValueError, match="requires parallel_groups"):
+            load_huggingface(LoaderContext(spec=spec))
+
+    @pytest.mark.parametrize(("loader_options", "fp32_beta"), [({}, True), ({"fp32_parity": False}, False)])
+    def test_loader_applies_required_sequence_parallel_setup(self, monkeypatch, loader_options, fp32_beta):
+        from arctic_platform.model import ParallelismConfig
+        from arctic_platform.model.loaders.huggingface import load_huggingface
+
+        model = nn.Module()
+        model.config = types.SimpleNamespace(model_type="qwen3", use_cache=True)
+        model.loss_function = ForCausalLMLoss
+        configured = []
+        monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: model)
+        monkeypatch.setattr(
+            "arctic_platform.model.implementations.gpu.sp.transformers.apply_gated_delta_net_sequence_parallelism",
+            lambda configured_model, group, *, fp32_beta: configured.append((configured_model, group, fp32_beta)) or 0,
+        )
+        spec = ModelSpec(
+            model_path_or_name="qwen",
+            loader="huggingface",
+            parallelism=ParallelismConfig(sequence_parallel=2),
+            loader_options=loader_options,
+        )
+        group = object()
+
+        load_huggingface(LoaderContext(spec=spec, parallel_groups={"sp_group": group}))
+
+        assert model.config.use_cache is False
+        # The loader's fp32_parity option decides the beta gate of the GatedDeltaNet layers the wrapper adapts.
+        assert configured == [(model, group, fp32_beta)]
+
+    def test_loader_options_default_and_reject_unknown_keys(self):
+        from pydantic import ValidationError
+
+        spec = ModelSpec(model_path_or_name="qwen", loader="huggingface")
+        assert spec.loader_options == {"fp32_parity": True, "fp32_residual": False}
+        with pytest.raises(ValidationError, match="not_an_option"):
+            ModelSpec(model_path_or_name="qwen", loader="huggingface", loader_options={"not_an_option": 1})
+
+
 class TestFromDsWorkerConfig:
     def test_defaults_preserve_worker_behavior(self):
         spec = ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {"attn_implementation": "flash_attention_2"})
@@ -204,6 +309,13 @@ class TestFromDsWorkerConfig:
     def test_requires_attn_implementation(self):
         with pytest.raises(ValueError, match="requires attn_implementation"):
             ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {})
+        with pytest.raises(ValueError, match="requires attn_implementation"):
+            ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {"attn_implementation": None})
+
+    def test_accepts_any_flash_attention_backend(self):
+        for impl in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
+            spec = ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {"attn_implementation": impl})
+            assert spec.attn_implementation == impl
 
     def test_generic_patches_default_gc_off(self):
         from arctic_platform.model.config import Patches
@@ -268,6 +380,190 @@ class TestFromDsWorkerConfig:
         assert z.logits_optimization_peak_mem_size_in_gib == defaults.logits_optimization_peak_mem_size_in_gib
         assert z.logits_compute_from_fp32_inputs == defaults.logits_compute_from_fp32_inputs
         assert z.logits_compute_in_fp32 == defaults.logits_compute_in_fp32
+
+
+class TestLigerPatch:
+    def test_architecture_owns_rotary_selection(self, monkeypatch):
+        from arctic_platform.model.patches.liger import apply_liger
+
+        captured = {}
+        fake_monkey_patch = types.ModuleType("liger_kernel.transformers.monkey_patch")
+        fake_monkey_patch._apply_liger_kernel_to_instance = lambda **kwargs: captured.update(kwargs)
+        monkeypatch.setitem(sys.modules, "liger_kernel", types.ModuleType("liger_kernel"))
+        monkeypatch.setitem(sys.modules, "liger_kernel.transformers", types.ModuleType("liger_kernel.transformers"))
+        monkeypatch.setitem(sys.modules, "liger_kernel.transformers.monkey_patch", fake_monkey_patch)
+
+        model = nn.Identity()
+        apply_liger(model, _ctx(liger=True))
+
+        assert captured == {
+            "model": model,
+            "cross_entropy": False,
+            "fused_linear_cross_entropy": True,
+            "rms_norm": True,
+            "swiglu": True,
+        }
+
+
+class TestModelFeaturePatches:
+    class _Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fullgraph = None
+
+        def compile(self, *, fullgraph=False):
+            self.fullgraph = fullgraph
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(model_type="qwen3", use_cache=True)
+            self.model = nn.Module()
+            self.model.layers = nn.ModuleList([TestModelFeaturePatches._Layer(), TestModelFeaturePatches._Layer()])
+            self.gradient_checkpointing_kwargs = None
+            self.input_grads_enabled = False
+
+        def gradient_checkpointing_enable(self, *, gradient_checkpointing_kwargs):
+            self.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
+
+        def enable_input_require_grads(self):
+            self.input_grads_enabled = True
+
+    def test_checkpointing_and_compile_are_independent(self):
+        from arctic_platform.model.config import CompilePatch
+        from arctic_platform.model.patches.compile import apply_compile
+        from arctic_platform.model.patches.gradient_checkpointing import apply_gradient_checkpointing
+
+        model = self._Model()
+        apply_gradient_checkpointing(model, _ctx(gradient_checkpointing=True))
+        apply_compile(model, _ctx(compile=CompilePatch(fullgraph=True)))
+
+        assert model.config.use_cache is False
+        assert model.gradient_checkpointing_kwargs == {"use_reentrant": False}
+        assert model.input_grads_enabled is True
+        assert [layer.fullgraph for layer in model.model.layers] == [True, True]
+
+    def test_periodic_checkpointing_disables_non_qwen_cache(self):
+        from arctic_platform.model.patches.gradient_checkpointing import apply_gradient_checkpointing
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.text_config = types.SimpleNamespace(model_type="llama", use_cache=True)
+                self.config = types.SimpleNamespace(
+                    model_type="llama",
+                    use_cache=True,
+                    get_text_config=lambda: self.text_config,
+                )
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+
+        model = _Model()
+        apply_gradient_checkpointing(model, _ctx(gradient_checkpointing=2))
+
+        assert model.config.use_cache is False
+        assert model.text_config.use_cache is False
+        assert type(model.model.layers[0]).__name__ == "CheckpointWrapper"
+        assert type(model.model.layers[1]).__name__ == "Linear"
+
+    def test_rejects_fullgraph_with_tiling(self):
+        from arctic_platform.model.config import Patches
+
+        with pytest.raises(
+            ValueError,
+            match="fullgraph cannot be combined",
+        ):
+            Patches(
+                compile={"fullgraph": True},
+                tiled_mlp={"token_chunk_size": 32},
+            )
+
+    def test_rejects_offload_without_checkpointing(self):
+        from arctic_platform.model.config import Patches
+
+        with pytest.raises(ValueError, match="activation_offload requires"):
+            Patches(
+                gradient_checkpointing=False,
+                activation_offload={"enabled": True},
+            )
+
+    def test_applies_tiled_mlp(self, monkeypatch):
+        from arctic_platform.model.config import TiledMlpPatch
+        from arctic_platform.model.patches.tiled_mlp import apply_tiled_mlp
+
+        tiled = {}
+        monkeypatch.setattr(
+            "arctic_platform.model.patches.tiled_mlp.apply_dense_tiled_mlp",
+            lambda model, *, token_chunk_size: tiled.update(
+                model=model,
+                token_chunk_size=token_chunk_size,
+            ),
+        )
+        model = self._Model()
+
+        apply_tiled_mlp(model, _ctx(tiled_mlp=TiledMlpPatch(token_chunk_size=32)))
+
+        assert tiled == {"model": model, "token_chunk_size": 32}
+
+    def test_applies_offload_and_lm_head_settings(self, monkeypatch):
+        from arctic_platform.model.config import ActivationOffloadPatch
+        from arctic_platform.model.config import LmHeadPatch
+        from arctic_platform.model.patches.activation_offload import apply_activation_offload
+        from arctic_platform.model.patches.lm_head import apply_lm_head
+
+        calls = []
+        manager = object()
+        monkeypatch.setattr(
+            "arctic_platform.model.implementations.gpu.activation_offload.install_activation_offload",
+            lambda model, **kwargs: calls.append(("offload", model, kwargs)) or manager,
+        )
+        monkeypatch.setattr(
+            "arctic_platform.model.implementations.gpu.lm_head.enable_fp32_lm_head",
+            lambda model: calls.append(("fp32", model)),
+        )
+        monkeypatch.setattr(
+            "arctic_platform.model.implementations.gpu.lm_head.enable_chunked_lm_head_logprobs",
+            lambda model, **kwargs: calls.append(("chunked", model, kwargs)),
+        )
+
+        model = self._Model()
+        model.base_model = model.model
+        offload = ActivationOffloadPatch(
+            keep_last_n=2,
+            use_streams=False,
+        )
+        lm_head = LmHeadPatch(
+            fp32=True,
+            token_chunk_size=128,
+            vocab_chunk_size=4096,
+        )
+        apply_activation_offload(model, _ctx(activation_offload=offload))
+        apply_lm_head(model, _ctx(lm_head=lm_head))
+
+        assert calls[0][0:2] == ("offload", model)
+        assert calls[0][2]["config"].keep_last_n == 2
+        assert calls[0][2]["config"].use_streams is False
+        assert calls[1] == (
+            "offload",
+            model.model,
+            {"config": calls[0][2]["config"], "manager": manager},
+        )
+        assert calls[2] == ("fp32", model)
+        assert calls[3] == (
+            "chunked",
+            model,
+            {
+                "token_chunk_size": 128,
+                "vocab_chunk_size": 4096,
+                "fp32_lm_head": True,
+            },
+        )
+
+    def test_lm_head_patch_requires_a_feature(self):
+        from arctic_platform.model.config import LmHeadPatch
+
+        with pytest.raises(ValueError, match="requires fp32 or token_chunk_size"):
+            LmHeadPatch()
 
 
 class TestZorroAndGcPatches:

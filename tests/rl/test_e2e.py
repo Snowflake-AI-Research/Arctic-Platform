@@ -28,18 +28,18 @@ sync_weights (cuda_ipc=False) after the loop.
 Exercises every ``arctic_platform/rl/ray_client.py`` method reachable from this topology: generate, fwd_no_grad,
 fwd_bwd, step, sync_weights (CUDA-IPC bulk + low_memory streaming, and the CPU-file path), sleep/wake_inference,
 reset_prefix_cache, sleep_training (all / non_lp / lp_params modes) / wake_training, empty_training_cache,
-sleep/wake_log_prob (graceful no-ops -- no log-prob job here), save_checkpoint, weight_norm (after the final sync,
-asserting the training and sampling engines hold identical weights and produce agreeing log-probs), reconnect_config
+sleep/wake_log_prob (graceful no-ops -- no log-prob job here), save_checkpoint, the weight-sync transport checksum
+on every sync (each sampler rank received the trainer's bytes, and the final sync shipped weights that moved from a
+baseline sync of the untrained ones), weight_norm (a TP-1 placement cross-check after the final sync), agreeing
+log-probs after the final sync, reconnect_config
 / get_server_state (a second client re-attaches to the live jobs without re-initializing), save_weights (raises
-``NotImplementedError`` on the ray client; a graceful warn-on-error disk-reload stub on the http client),
-shutdown (via the session). Not exercised: ``log_probs``
+``NotImplementedError`` on the ray client), shutdown (via the session). Not exercised: ``log_probs``
 (needs a log-prob engine; this 2-GPU training+sampling topology has none -- covered by test_log_prob_engine).
 ``test_sync_weights_nccl``
 additionally proves a weight update actually propagates to the sampler over the NCCL path. Real prompts go through
 generate; the update uses fake ``advantages`` but real ``old_log_probs`` (recomputed from the policy each step via
-fwd_no_grad), so the clipped ratio starts at 1.0 and every step makes a real gradient step. Covers each transport
-once (``ray``/``http``); the forward path is numerically certified elsewhere, so this trades the full 4-cell
-matrix for a 2-cell diagonal. Heavyweight GPU test; shared infra lives in ``rl_harness``::
+fwd_no_grad), so the clipped ratio starts at 1.0 and every step makes a real gradient step. Runs one ZoRRO cell;
+the forward path is numerically certified elsewhere. Heavyweight GPU test; shared infra lives in ``rl_harness``::
 
     pytest tests/rl/test_e2e.py -s
 
@@ -50,14 +50,15 @@ with the other vLLM tests (never scheduled against them); ``-m "not vllm"`` drop
 from __future__ import annotations
 
 import asyncio
+import math
 
 import pytest
-from parameterized import parameterized
 from rl_harness import arctic_rl_client_session
 from rl_harness import assert_finite_logprobs
 from rl_harness import assert_generations
 from rl_harness import assert_positive_grad_norm
 from rl_harness import assert_weight_norms_match
+from rl_harness import assert_weight_sync_checksum
 from rl_harness import build_compute_log_prob_payload
 from rl_harness import build_response_logprob_batch
 from rl_harness import build_update_actor_payload
@@ -66,7 +67,6 @@ from rl_harness import finite_metric
 from rl_harness import inference_response_logprobs
 from rl_harness import logprob_kl
 from rl_harness import make_fake_batch
-from rl_harness import parameterized_custom_name_func
 from rl_harness import response_region
 from rl_harness import skip_if_unsupported
 from rl_harness import tokenize_prompts
@@ -91,21 +91,18 @@ colocate = True
 
 num_steps = 2
 
-# A large LR so the update_actor steps move the weights well clear of the initial checkpoint. The post-sync exactness
-# check (_assert_weight_sync) only catches a no-op / stale sync if the trainer has diverged from the sampler's
-# starting weights by MORE than the norm-equality rtol -- otherwise a sync that did nothing would leave the stale
-# sampler within tolerance of the (barely-moved) trainer and pass silently. We additionally assert the realized
-# movement exceeds weight_movement_min_rel so this property is enforced, not assumed.
+# A large LR so the update_actor steps move the weights well clear of the initial checkpoint. The transport checksum
+# (_assert_weight_sync) proves the sampler received what the trainer sent; comparing the final sync's sent checksum
+# with a baseline sync of the untrained weights proves what was sent is the updated policy, not the initial one.
 e2e_lr = 1e-2
 
-# Minimum relative weight movement (vs the initial checkpoint) required of the trainer before the final sync, so the
-# equal-norms check has teeth. Comfortably above the norm-equality rtol (1e-3); the observed move at e2e_lr is ~1e-2.
+# Minimum relative movement of the shipped weights' L2 norm (vs the baseline sync) required before the final sync, so
+# the movement check is far above any checksum noise and the KL check compares a genuinely updated policy. The
+# observed move at e2e_lr is ~1e-2.
 weight_movement_min_rel = 5e-3
 
-# This is integration coverage; the ZoRRO/non-ZoRRO forward is numerically certified by test_train_engine over the
-# full matrix. What differs at the e2e level is the transport (separate ray_server / http_server lifecycle code), so
-# cover each transport once, paired diagonally with one forward path.
-e2e_params = [("ray", True), ("http", False)]
+# This is integration coverage; the ZoRRO/non-ZoRRO forward is numerically certified by test_train_engine.
+zorro_enable = True
 
 # Real prompts for the sampling engine; small max_tokens keeps the rollout within the tiny max_model_len
 # (prompt_len + response_len).
@@ -114,10 +111,11 @@ gen_sampling_params = {"temperature": 0.0, "max_tokens": 6}
 
 # enable_sleep_mode so sleep/wake_inference work; enable_prefix_caching so reset_prefix_cache is meaningful.
 vllm_overrides = {"enable_sleep_mode": True, "enable_prefix_caching": True}
+# rl_harness starts the sampler at tensor_parallel_size=1 unless vllm_overrides says otherwise.
+sampling_tp_size = vllm_overrides.get("tensor_parallel_size", 1)
 
 # test_sync_weights_nccl: a large LR over a few steps moves the policy well clear of the initial checkpoint, so the
-# post-sync exactness check has teeth (a no-op NCCL push would leave the stale sampler mismatched against the
-# updated trainer).
+# final sync's sent checksum clearly differs from the baseline sync's.
 sync_test_lr = 0.01
 sync_test_steps = 3
 
@@ -146,9 +144,9 @@ class TestE2E(TestCasePlus):
     async def _drive_grpo(self, client, batch: dict, zorro_enable: bool, tag: str) -> None:
         cl_payload = build_compute_log_prob_payload(batch, zorro_enable, rollout_n, prompt_len, response_len)
 
-        # Initial (untrained) norm: both engines are freshly initialized and identical here, so this is the baseline
-        # the post-sync check measures movement against to prove the update + sync actually changed the weights.
-        initial_norm = (await client.weight_norm())["training_norm"]
+        # Baseline sync of the untrained weights (the CPU-file path, which needs nothing offloaded first). Its sent
+        # checksum is what the post-training sync must move away from to prove the update + sync changed the weights.
+        initial_sent = assert_weight_sync_checksum(await client.sync_weights(cuda_ipc=False), f"{tag}/initial")
 
         for step in range(num_steps):
             step_tag = f"{tag}/step{step}"
@@ -192,6 +190,7 @@ class TestE2E(TestCasePlus):
             else:
                 sync = await client.sync_weights(cuda_ipc=False)
             self.assertIsInstance(sync, dict, f"{step_tag}: sync_weights non-dict")
+            assert_weight_sync_checksum(sync, f"{step_tag}/{'low_memory' if low_memory else 'bulk'}")
 
             # Offload everything between steps.
             await client.sleep_training(mode="all")
@@ -206,36 +205,39 @@ class TestE2E(TestCasePlus):
             cpu_sync = await client.sync_weights(cuda_ipc=False)
             self.assertIsInstance(cpu_sync, dict, f"{tag}: cpu-file sync_weights non-dict")
             # Training is awake (save_checkpoint above) and the sampler just received the same weights -> verify the
-            # sync actually landed: identical weights on both engines, and agreeing log-probs.
-            await self._assert_weight_sync(client, zorro_enable, tag, initial_norm)
+            # sync actually landed: the trainer's bytes on every sampler rank, moved weights, and agreeing log-probs.
+            await self._assert_weight_sync(client, zorro_enable, tag, cpu_sync, initial_sent)
 
-    async def _assert_weight_sync(self, client, zorro_enable: bool, tag: str, initial_norm=None) -> None:
-        """After a weight sync the training and sampling engines hold identical weights -- prove it three ways.
+    async def _assert_weight_sync(self, client, zorro_enable: bool, tag: str, sync: dict, initial_sent: float) -> None:
+        """After a weight sync the sampling engine holds the training engine's updated weights -- prove it.
 
-        1. Global L2 weight norm of both engines must match (layout-invariant, so comparable across DeepSpeed's
-           ZeRO-3 sharding and vLLM's fused params).
-        2. If ``initial_norm`` (the pre-training baseline) is given, the synced norm must have moved away from it by
-           more than ``weight_movement_min_rel`` -- otherwise the matching norms in (1) could be a no-op sync agreeing
-           with a barely-trained trainer. This is what makes the equality check able to catch a stale/no-op sync.
-        3. Greedy-decode a few tokens on the sampler (capturing its per-token log-probs), recompute those exact
+        1. The sync's transport checksum: every sampler TP rank received the full tensors the trainer sent, squared
+           before vLLM shards them, so this holds at any tensor_parallel_size.
+        2. The weights the sync shipped moved away from the baseline sync of the untrained weights by more than
+           ``weight_movement_min_rel`` -- otherwise (1) could be a faithful copy of weights that never changed.
+        3. At tensor_parallel_size=1 the debug ``weight_norm`` of vLLM's live parameters also matches the trainer's,
+           which covers placement after the transport.
+        4. Greedy-decode a few tokens on the sampler (capturing its per-token log-probs), recompute those exact
            tokens' log-probs on the training engine, and require a tiny KL -- direct evidence the synced weights
            produce the same policy. The recompute uses the engine's own forward path (``zorro_enable`` matches the
            cell, since the training engine is patched accordingly at init); the two prompts are distinct, so no
            shared-prompt dedup and the zorro first-response-token alignment is exercised on single-rollout groups.
         """
-        norms = await client.weight_norm()
-        training_norm, sampling_norm = assert_weight_norms_match(norms, tag)
-        print(f"[e2e] {tag}: weight_norm training={training_norm:.4f} sampling={sampling_norm:.4f}")
+        sent = assert_weight_sync_checksum(sync, tag)
+        print(f"[e2e] {tag}: weight sync checksum sent={sent:.6e} recv={sync['recv_l2_sq']}")
 
-        if initial_norm is not None:
-            rel_move = abs(sampling_norm - initial_norm) / initial_norm
-            print(f"[e2e] {tag}: weight movement rel={rel_move:.4e} (initial={initial_norm:.4f})")
-            self.assertGreater(
-                rel_move,
-                weight_movement_min_rel,
-                f"{tag}: trainer barely moved (rel={rel_move:.2e} <= {weight_movement_min_rel:.0e}); a no-op sync "
-                "would pass the equal-norms check undetected -- raise the LR / step count",
-            )
+        rel_move = abs(math.sqrt(sent) - math.sqrt(initial_sent)) / math.sqrt(initial_sent)
+        print(f"[e2e] {tag}: weight movement rel={rel_move:.4e} (initial sent_l2_sq={initial_sent:.6e})")
+        self.assertGreater(
+            rel_move,
+            weight_movement_min_rel,
+            f"{tag}: trainer barely moved (rel={rel_move:.2e} <= {weight_movement_min_rel:.0e}); the sync would prove "
+            "only that unchanged weights were copied -- raise the LR / step count",
+        )
+
+        if sampling_tp_size == 1:
+            training_norm, sampling_norm = assert_weight_norms_match(await client.weight_norm(), tag)
+            print(f"[e2e] {tag}: weight_norm training={training_norm:.4f} sampling={sampling_norm:.4f}")
 
         gen = await client.generate(gen_prompts, {"temperature": 0.0, "max_tokens": kl_max_tokens, "logprobs": 0})
         gen_token_ids, inference_logprobs = inference_response_logprobs(gen)
@@ -257,11 +259,12 @@ class TestE2E(TestCasePlus):
         print(f"[e2e] {tag}: train/infer logprob KL={kl:.4e} mean|delta|={mean_abs_diff:.4e} over {num_tokens} tokens")
         self.assertLess(kl, kl_threshold, f"{tag}: train/infer logprob KL too large after sync: {kl}")
 
-    def _run_e2e(self, comm_protocol: str, zorro_enable: bool) -> None:
+    def test_e2e(self):
+        """Run the full GRPO loop for 2 steps over one live client."""
+        skip_if_unsupported(training_gpus, sampling_gpus, log_prob_gpus, colocate)
         batch, _, _ = make_fake_batch(model_name, num_unique_prompts, rollout_n, prompt_len, response_len)
-        tag = cell_tag(comm_protocol, zorro_enable)
+        tag = cell_tag(zorro_enable)
         with arctic_rl_client_session(
-            comm_protocol,
             zorro_enable,
             model_name,
             attn_implementation,
@@ -276,9 +279,9 @@ class TestE2E(TestCasePlus):
             lr=e2e_lr,
         ) as client:
             asyncio.run(self._drive_grpo(client, batch, zorro_enable, tag))
-            asyncio.run(self._assert_client_guards(client, comm_protocol, tag))
+            asyncio.run(self._assert_client_guards(client, tag))
 
-    async def _assert_client_guards(self, client, comm_protocol: str, tag: str) -> None:
+    async def _assert_client_guards(self, client, tag: str) -> None:
         """Reconnect contract + intentionally-unimplemented surface, checked on the live client (no new spinup)."""
         # reconnect_config() must round-trip the live job ids -- the serializable handle the verl wrapper passes
         # across process boundaries to re-attach without re-running /initialize.
@@ -286,45 +289,34 @@ class TestE2E(TestCasePlus):
         self.assertEqual(rc.training_job_id, client.training_job_id, f"{tag}: reconnect_config lost training_job_id")
         self.assertEqual(rc.sampling_job_id, client.sampling_job_id, f"{tag}: reconnect_config lost sampling_job_id")
 
-        if comm_protocol == "ray":
-            # A second client built from reconnect_config + the live server state attaches to the SAME jobs without
-            # spinning up new engines.
-            client2 = create_arctic_rl_client(rc, client.get_server_state())
-            self.assertEqual(client2.training_job_id, client.training_job_id, f"{tag}: reconnect attached wrong job")
-            self.assertIsInstance(await client2.empty_training_cache(), dict, f"{tag}: reconnected client op failed")
+        # A second client built from reconnect_config + the live server state attaches to the SAME jobs without
+        # spinning up new engines.
+        client2 = create_arctic_rl_client(rc, client.get_server_state())
+        self.assertEqual(client2.training_job_id, client.training_job_id, f"{tag}: reconnect attached wrong job")
+        self.assertIsInstance(await client2.empty_training_cache(), dict, f"{tag}: reconnected client op failed")
 
-            # Disk-based weight reload is deliberately unimplemented on the ray client.
-            with self.assertRaises(NotImplementedError):
-                await client.save_weights("/tmp/unused")
-        else:
-            # The http client implements disk-based save_weights as a graceful warn-on-error stub (server-side
-            # reload is not fully implemented), so it posts to /weight-sync and must return without raising.
-            await client.save_weights("/tmp/arl_unused_ckpt")
-
-    @parameterized.expand(e2e_params, name_func=parameterized_custom_name_func)
-    def test_e2e(self, comm_protocol, zorro_enable):
-        """Run the full GRPO loop for 2 steps over one live client (one case per transport)."""
-        skip_if_unsupported(training_gpus, sampling_gpus, log_prob_gpus, colocate)
-        self._run_e2e(comm_protocol, zorro_enable)
+        # Disk-based weight reload is deliberately unimplemented on the ray client.
+        with self.assertRaises(NotImplementedError):
+            await client.save_weights("/tmp/unused")
 
     async def _perturb_sync_and_verify(self, client, payload: dict) -> None:
-        initial_norm = (await client.weight_norm())["training_norm"]
+        # NCCL push to the sampling engine (non-colocate); wakes inference internally.
+        initial_sent = assert_weight_sync_checksum(await client.sync_weights(), "nccl/initial")
         await client.wake_inference()
         for _ in range(sync_test_steps):  # move the policy well clear of the initial checkpoint
             await client.fwd_bwd(payload)
             await client.step()
-        await client.sync_weights()  # NCCL push to the sampling engine (non-colocate); wakes inference internally
-        await self._assert_weight_sync(client, False, "nccl", initial_norm)
+        sync = await client.sync_weights()
+        await self._assert_weight_sync(client, False, "nccl", sync, initial_sent)
 
     def test_sync_weights_nccl(self):
         """sync_weights over NCCL (non-colocate) makes the sampler an exact copy of the updated trainer.
 
-        Runs several large-LR update actor steps to move the policy well clear of the initial weights, NCCL-syncs to
-        the sampler, then applies the same exactness checks as the main loop (``_assert_weight_sync``): equal global
-        weight norms + a tiny train/infer log-prob KL. The large LR is what gives this teeth -- a no-op / stale sync
-        would leave the (heavily updated) trainer and the unchanged sampler with clearly different norms, failing the
-        equality check. This is the dedicated separate-GPU / NCCL path; the colocate CUDA-IPC + CPU-file sync paths
-        are covered by the main e2e loop (colocate=True), so this test runs non-colocate.
+        NCCL-syncs the untrained weights as a baseline, runs several large-LR update actor steps to move the policy
+        well clear of them, NCCL-syncs again, then applies the same checks as the main loop (``_assert_weight_sync``):
+        the transport checksum on every sampler rank, movement from the baseline's sent checksum, and a tiny
+        train/infer log-prob KL. This is the dedicated separate-GPU / NCCL path; the colocate CUDA-IPC + CPU-file sync
+        paths are covered by the main e2e loop (colocate=True), so this test runs non-colocate.
 
         This test is separate, rather than adding non-colocate to the e2e options matrix, since it's much lighter and
         only tests the unique code path not already covered by the colocate e2e path.
@@ -333,7 +325,6 @@ class TestE2E(TestCasePlus):
         batch, _, _ = make_fake_batch(model_name, num_unique_prompts, rollout_n, prompt_len, response_len)
         payload = build_update_actor_payload(batch, False, rollout_n, prompt_len, response_len)
         with arctic_rl_client_session(
-            "ray",
             False,
             model_name,
             attn_implementation,

@@ -19,7 +19,19 @@ from typing import Any
 # import itertools
 import torch
 
-from arctic_platform import wire
+from arctic_platform.common.registry import is_declared_summed_metric
+
+from .server_models import resolve_parallelism_degree
+
+
+def dp_sp_world_size(world_size: int, sp_size: int = 1) -> int:
+    """DP degree under SP: ``world_size // sp_size`` (each SP group is one DP replica)."""
+    sp_size = resolve_parallelism_degree(sp_size, "sp_size")
+    if world_size < 1:
+        raise ValueError(f"world_size must be >= 1; got {world_size!r}")
+    if world_size % sp_size != 0:
+        raise ValueError(f"world_size ({world_size}) must be divisible by sp_size ({sp_size})")
+    return world_size // sp_size
 
 
 def shard_token_stats(batch_data: dict, meta_data: dict | None = None) -> dict[str, int]:
@@ -62,24 +74,194 @@ def log_dp_shard_tokens(rank: int, tag: str, batch_data: dict, meta_data: dict |
     print(f"[{rank}] [DP-shard] {tag}: {parts}", flush=True)
 
 
-def unpack_batch(batch: dict) -> tuple:
-    """Support both ``{"args": ..., "kwargs": ...}`` and flat-dict formats.
+# Cortex ``context`` / AP ``meta`` keys whose dim 0 is the batch. ``_split_batch``
+# shards ``batch`` and replicates ``meta``, so these must live in ``batch``.
+BATCH_DIM_CONTEXT_KEYS = frozenset(
+    {
+        "advantages",
+        "old_log_probs",
+        "old_log_probs_shifted",
+        "loss_mask",
+        "response_mask",
+        "ref_log_prob",
+        "ref_log_probs",
+        "ref_log_probs_shifted",
+        "prox_logp",
+        "prox_logp_shifted",
+        "labels",
+        "sft_mask",
+        "echo_observation_mask",
+        "echo_observation_token_counts",
+        "nll_mask",
+        "teacher_log_probs_shifted",
+        "sampler_kl_weights",
+        "versions",
+        "prompt_group_ids",
+        "prompt_token_counts",
+        "sequence_loss_weights",
+        "rollout_is_weights",
+        "teacher_token_ids",
+        "teacher_log_probs",
+        "teacher_tail_log_prob",
+        "kd_mask",
+        "logprob_weights_shifted",
+    }
+)
 
-    Returns ``(args, kwargs, context, processing)``.
+# Forward scalars carried on ``meta`` only. ``meta`` is replicated to every
+# data-parallel rank, so these must be one value, never a per-token tensor.
+META_FWD_SCALAR_KEYS = frozenset({"temperature", "calculate_entropy"})
+
+
+def _bag_values_equal(left, right) -> bool:
+    """Whether two bag values are the same object contents.
+
+    Tensors compare with ``torch.equal``. A bare ``==`` on ``input_ids`` is a
+    tensor, and using it as a boolean raises.
     """
-    return {}, batch["batch"], batch["meta"], batch["processing"]
+    if torch.is_tensor(left) and torch.is_tensor(right):
+        return left.shape == right.shape and left.dtype == right.dtype and bool(torch.equal(left, right))
+    if torch.is_tensor(left) or torch.is_tensor(right):
+        return False
+    if isinstance(left, (dict, list, tuple)) or isinstance(right, (dict, list, tuple)):
+        return False
+    return left == right
+
+
+def _assert_disjoint_bags(batch_data: dict, meta_data: dict, where: str) -> None:
+    overlap = sorted(set(batch_data) & set(meta_data))
+    if overlap:
+        raise ValueError(
+            f"{where}: keys {overlap!r} are on both batch and meta; send each key on exactly one bag "
+            "(batch is sharded across DP ranks, meta is replicated to every rank)"
+        )
+
+
+def _reject_meta_fwd_scalars_on_batch(batch_data: dict, where: str) -> None:
+    present = sorted(META_FWD_SCALAR_KEYS & set(batch_data))
+    if present:
+        raise ValueError(
+            f"{where}: {present!r} are forward scalars and must be sent on meta as one value, not on batch"
+        )
+
+
+def _resolve_cortex_overlap(batch_data: dict, meta_data: dict) -> None:
+    """Drop a Cortex duplicate that carries the same value on both bags.
+
+    Model inputs stay on ``kwargs`` (sharded). ``temperature`` and
+    ``calculate_entropy`` stay on ``context`` (replicated).
+    """
+    for key in sorted(set(batch_data) & set(meta_data)):
+        if not _bag_values_equal(batch_data[key], meta_data[key]):
+            raise ValueError(f"kwargs and context disagree on {key!r}; a key sent on both must carry the same value")
+        if key in META_FWD_SCALAR_KEYS:
+            del batch_data[key]
+        else:
+            del meta_data[key]
+
+
+def promote_batch_dim_to_batch(batch_data: dict, meta_data: dict) -> tuple[dict, dict]:
+    """Move batch-dim tensors from ``meta``/Cortex ``context`` into ``batch``.
+
+    ``unpack_batch`` rejects a key that is already on both bags. The branch that
+    drops a meta tensor when ``batch`` already has the key remains for direct
+    callers. Non-tensor values (e.g. SkyRL ``rollout_is_weights: None``) stay
+    on ``meta`` so later ``v.shape`` debug loops and DP split do not see a None
+    batch field.
+    """
+    batch_data = dict(batch_data)
+    meta_data = dict(meta_data)
+    for key in BATCH_DIM_CONTEXT_KEYS:
+        if key not in meta_data:
+            continue
+        value = meta_data[key]
+        if not torch.is_tensor(value):
+            continue
+        if key not in batch_data:
+            batch_data[key] = value
+        del meta_data[key]
+    return batch_data, meta_data
+
+
+def _promote_list_batch(batch_list: list, meta_data: dict) -> tuple[list, dict]:
+    """Promote labels onto each GAS microbatch, or raise."""
+    meta_data = dict(meta_data)
+    promoted: list[dict] = []
+    meta_labels = meta_data.get("labels") if "labels" in meta_data else None
+    for index, microbatch in enumerate(batch_list):
+        if not isinstance(microbatch, dict):
+            raise TypeError(f"gas microbatch must be a dict of tensors, got {type(microbatch).__name__}")
+        microbatch = dict(microbatch)
+        if "labels" not in microbatch:
+            if isinstance(meta_labels, list):
+                if index >= len(meta_labels):
+                    raise ValueError(
+                        f"meta labels list has {len(meta_labels)} entries but batch has {len(batch_list)} microbatches"
+                    )
+                microbatch["labels"] = meta_labels[index]
+            elif "labels" in meta_data:
+                raise ValueError(
+                    "labels on meta cannot be applied to a list-shaped batch; "
+                    "put per-microbatch labels on each element"
+                )
+        promoted.append(microbatch)
+    if "labels" in meta_data:
+        if all("labels" in microbatch for microbatch in promoted):
+            del meta_data["labels"]
+        else:
+            raise ValueError("labels remain on meta for a list-shaped batch")
+    return promoted, meta_data
+
+
+def unpack_batch(batch: dict) -> tuple:
+    """Return ``(args, batch, meta, processing)``.
+
+    Accepts AP ``{"batch", "meta", "processing"}`` and Cortex
+    ``{"kwargs", "context", "processing"}``. Batch-dim keys in ``context`` /
+    ``meta`` are moved onto ``batch`` before DP split. ``temperature`` and
+    ``calculate_entropy`` stay on ``meta``.
+    """
+    if "kwargs" in batch:
+        batch_data = dict(batch.get("kwargs") or {})
+        meta_data = dict(batch.get("context") or {})
+        processing = batch.get("processing") or {}
+        _resolve_cortex_overlap(batch_data, meta_data)
+        _reject_meta_fwd_scalars_on_batch(batch_data, "unpack_batch")
+    else:
+        batch_data = batch["batch"]
+        meta_data = dict(batch["meta"])
+        processing = batch["processing"]
+        if isinstance(batch_data, dict):
+            batch_data = dict(batch_data)
+            _reject_meta_fwd_scalars_on_batch(batch_data, "unpack_batch")
+            _assert_disjoint_bags(batch_data, meta_data, "unpack_batch")
+        elif isinstance(batch_data, list):
+            for index, microbatch in enumerate(batch_data):
+                if not isinstance(microbatch, dict):
+                    continue
+                where = f"gas microbatch {index}"
+                _reject_meta_fwd_scalars_on_batch(microbatch, where)
+                _assert_disjoint_bags(microbatch, meta_data, where)
+
+    if isinstance(batch_data, list):
+        batch_data, meta_data = _promote_list_batch(batch_data, meta_data)
+    elif isinstance(batch_data, dict):
+        batch_data, meta_data = promote_batch_dim_to_batch(batch_data, meta_data)
+    return {}, batch_data, meta_data, processing
 
 
 def _split_value(val, num_chunks: int):
     """Split a tensor or list along the batch (first) dimension."""
     if isinstance(val, torch.Tensor):
+        if val.ndim == 0:
+            return [val] * num_chunks
         if val.shape[0] < num_chunks:
             raise ValueError(
                 f"Batch dimension {val.shape[0]} is smaller than num_workers "
                 f"{num_chunks}. The client must send at least one sample per "
                 "DP worker."
             )
-        return list(torch.chunk(val, num_chunks, dim=0))
+        return list(torch.tensor_split(val, num_chunks, dim=0))
     if isinstance(val, list):
         if len(val) < num_chunks:
             raise ValueError(
@@ -119,8 +301,14 @@ def reconstruct_position_ids_(batch_data: dict) -> None:
     batch_data["position_ids"] = (attention_mask_long.cumsum(dim=-1) - 1).clamp_(min=0) * attention_mask_long
 
 
-def _split_batch(batch: dict, num_workers: int) -> list[dict]:
-    """Split a batch across DP workers.
+def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
+    """Split a batch across workers and stamp the DP loss scale.
+
+    The cutter produces ``num_workers`` disjoint row shards and stamps
+    ``dp_size=num_workers``. Sequence-parallel replication (one logical DP
+    shard copied across an SP group, then token-sharded) is not implemented,
+    so ``sp_size > 1`` is rejected rather than silently mixing samples.
+    ``zip(workers, shards)`` stays 1:1.
 
     Supports two wire shapes for ``batch["batch"]``:
       * **dict** of tensors (legacy / demos): one concatenated mini-batch, later
@@ -133,6 +321,14 @@ def _split_batch(batch: dict, num_workers: int) -> list[dict]:
 
     reorder_indices = None
     meta_data = dict(meta_data)
+    sp_size = resolve_parallelism_degree(sp_size, "sp_size")
+    if sp_size > 1:
+        raise ValueError(
+            "sequence-parallel data-plane is not implemented: _split_batch still "
+            "cuts one disjoint shard per worker. Refuse sp_size>1 until shards "
+            f"are replicated across an SP group. Got sp_size={sp_size}."
+        )
+    dp_sp_world_size(num_workers, sp_size)
     meta_data.update(dp_size=num_workers)
 
     if isinstance(batch_data, list):
@@ -158,7 +354,7 @@ def _split_batch(batch: dict, num_workers: int) -> list[dict]:
         reconstruct_position_ids_(batch_data)
 
     # ZoRRO Load balancer. Import lazily: a top-level import of zorro_train pulls
-    # in rl/__init__.py → common.http_server → common.utils while this package is
+    # in rl/__init__.py → common.utils while this package is
     # still initializing (circular after the rl→common move).
     if meta_data.get("load_balancer", False):
         from arctic_platform.rl.zorro_train.seqlen_balancing import reorg_global_batch
@@ -181,38 +377,6 @@ def _split_batch(batch: dict, num_workers: int) -> list[dict]:
 
 
 ray_split_batch = _split_batch
-
-
-def http_split_batch(batch_bytes: bytes, num_workers: int) -> list[bytes]:
-    """Deserialize a global batch, split across DP workers, re-serialize each shard."""
-    # if num_workers <= 1:
-    #     return [batch_bytes]
-    batch = wire.loads(batch_bytes)
-
-    shards, reorder_indices = _split_batch(batch, num_workers)
-
-    # _, batch_data, meta_data, processing = unpack_batch(batch)
-    # batch_data_shards = split_dict(batch_data, num_workers)
-    # shards = []
-    # meta_data.update(**dict(dp_size=num_workers))
-    # for i in range(num_workers):
-    #     shard = dict(
-    #         batch=batch_data_shards[i],
-    #         meta=meta_data,
-    #         processing=processing,
-    #     )
-    #     buf = io.BytesIO()
-    #     torch.save(shard, buf)
-    #     shards.append(buf.getvalue())
-
-    # DO NOT DELETE:
-    # at the moment must not recode back to bytes since we use ray to continue within the http_server - but it could be different later with DSS
-    # for i in range(len(shards)):
-    #     buf = io.BytesIO()
-    #     torch.save(shards[i], buf)
-    #     shards[i] = buf.getvalue()
-
-    return shards, reorder_indices
 
 
 def dump_dict_payload(payload: dict, tag: str):
@@ -250,6 +414,26 @@ def merge_dict_shards(shards_list: list[dict]) -> dict:
 
 _METRIC_PAIR_SUM_SUFFIX = ".sum"
 _METRIC_PAIR_TOKENS_SUFFIX = ".tokens"
+_SUMMED_METRIC_PREFIXES = ("loss_term_",)
+_SUMMED_METRIC_SUFFIXES = ("_sum", "_count")
+
+
+def metric_is_summed(key: str) -> bool:
+    """Whether a scalar metric is additive across microbatches and DP ranks.
+
+    A loss fn declares its additive metrics at registration
+    (``register_loss_fn(..., summed_metrics=...)``). Undeclared keys fall back
+    to the naming convention: objective-term contributions (``loss_term_*``)
+    and token/sequence counts (``*_count``, ``*_sum``) are SUMMED. Averaging
+    them misreports totals whenever a call splits across packed microbatches,
+    GAS, or DP ranks.
+
+    SFT pairing uses ``{name}.sum`` / ``{name}.tokens`` via the combiners below
+    and is not this helper.
+    """
+    if is_declared_summed_metric(key):
+        return True
+    return key.startswith(_SUMMED_METRIC_PREFIXES) or key.endswith(_SUMMED_METRIC_SUFFIXES)
 
 
 def combine_metric_shards(shards_list: list[dict]) -> dict:
@@ -326,6 +510,9 @@ def combine_metric_shards(shards_list: list[dict]) -> dict:
             if base in paired_bases:
                 continue
         if k in out:
+            continue
+        if metric_is_summed(k):
+            out[k] = total
             continue
         count = numeric_counts.get(k, 1)
         out[k] = total / count if count > 0 else total
@@ -404,7 +591,7 @@ def combine_metric_microbatches(per_microbatch_metric_dicts: list[dict]) -> dict
 
     out: dict = {}
     for k, total in numeric_totals.items():
-        if k in paired_keys:
+        if k in paired_keys or metric_is_summed(k):
             out[k] = total
         else:
             count = numeric_counts.get(k, 1)

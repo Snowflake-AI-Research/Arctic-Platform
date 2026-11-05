@@ -14,14 +14,11 @@
 # limitations under the License.
 """Cortex (cortex-training) transport over SnowAPI.
 
-SnowAPI is async: every op submits and returns a ``request_id`` that is polled to
-completion. So an op is just submit + poll -> final result dict, the same
-contract the on-prem transports expose. `call` runs it over ``requests``; `acall`
-runs the identical flow over ``aiohttp`` for the async client. The only Cortex
-specifics live in `_submit`, because SnowAPI is not uniform: forward-backward and
-generate carry DSSST1 octet bodies (byte-chunked), while step/save/operation post
-their JSON body as-is (the client assembles the full `/operation` envelope, incl.
-sub-job routing). Unsupported ops (`forward`, `log-probs`) raise NotImplementedError.
+Each op is one `_Route`: its URL, how its body becomes HTTP sends, whether it
+polls, whether it may be replayed, and how its reply is normalized. The
+transport only executes those sends, on its own event loop, so sync and async
+callers share one implementation. Cortex-specific request and response shapes
+are translated here until the servers share one API. Log-probs is unsupported.
 """
 
 from __future__ import annotations
@@ -31,86 +28,433 @@ import base64
 import contextlib
 import hashlib
 import json
+import logging
+import threading
 import time
+from collections.abc import Callable
+from collections.abc import Sequence
+from concurrent.futures import Future
+from dataclasses import dataclass
+from dataclasses import replace
 from typing import Any
 from typing import Iterator
+from urllib.parse import quote
 
-import requests
 from tenacity import AsyncRetrying
-from tenacity import Retrying
 from tenacity import retry_if_exception
 from tenacity import stop_after_attempt
 from tenacity import wait_exponential_jitter
-from urllib3.exceptions import NewConnectionError
 
 from arctic_platform import wire
-from arctic_platform.client.config import ArcticRLClientConfig
+from arctic_platform.client.config import ArcticClientConfig
+from arctic_platform.client.config import CortexConfig
+from arctic_platform.client.config import JobId
+from arctic_platform.client.requests import cancel_job_request
+from arctic_platform.client.requests import get_job_request
 from arctic_platform.client.transport import JOB_TYPES
 from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
+
+logger = logging.getLogger(__name__)
 
 _MAX_OCTET_BYTES = 60 * 1024 * 1024  # matches the SnowAPI per-request cap
 # HTTP statuses worth retrying: the request was well-formed, so the same call may
 # succeed once transient load/infra clears (429 rate-limit, 5xx, plus 404/409 seen
 # while GS/ZMD restart). Other 4xx are client errors that won't fix themselves.
 _TRANSIENT_STATUSES = {429, 500, 502, 503, 504, 404, 409}
-# SnowAPI requires DSSST1 octet bodies for these ops. This is a wire requirement of
-# the endpoint, not payload binary-ness (generate carries no tensors), so it lives in
-# the transport rather than on Request.binary.
-_OCTET_OPS = {"forward-backward", "generate"}
 _OCTET_HEADERS = {"Content-Type": "application/octet-stream"}
-# Ops whose chunked frame can be re-posted from scratch on a chunk-group error.
-# forward-backward carries the large gradient frame; a mid-stream chunk-group
-# desync (GS restart) is recoverable only by re-posting the whole group.
-_GROUP_RESTART_OPS = {"forward-backward"}
+_CHUNKED_RESULTS = {"response_options": {"format": "dssst1", "delivery": "chunked"}}
+# `forward` has no octet endpoint on SnowAPI, so it travels as an /operation RPC
+# whose payload is the base64'd DSSST1 frame. The control plane's REST surface
+# marshals that RPC as JSON, so the frame inflates 4/3 on the way in and the
+# budget below is a JSON-body budget, not a frame budget. 16 MiB is dss_client's
+# conservative default, not a measured server limit.
+_OPERATION_MAX_JSON_BYTES = 16 * 1024 * 1024
+# Room for the envelope's keys, the operation type and the sub-job token.
+_OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
-_JOB_TERMINAL = ("failed", "done", "cancelled", "canceled")
+_JOB_NOT_FOUND_CODE = "517601"
+_JOB_TERMINAL = ("failed", "done", "cancelled", "canceled", "terminated")
 _REQUEST_DONE = ("completed", "done", "succeeded")
 _REQUEST_FAILED = ("failed", "cancelled", "canceled")
 # JobHandles role -> Cortex sub-job job_type name.
 _SUB_JOB_KEY = {"training": "training", "sampling": "sampling", "log_prob": "log_probability"}
 
+Send = dict[str, Any]  # keyword arguments for one HTTP request
+
+
+def _parent_id(job_id: JobId) -> str:
+    return str(job_id).split(":", 1)[0]
+
+
+# ── encoders: a filtered body -> the HTTP sends that deliver it ─────────────
+def _no_body(request: Request, body: dict) -> list[Send]:
+    return [{}]
+
+
+def _json(request: Request, body: dict) -> list[Send]:
+    return [{"json": body}]
+
+
+def _query(request: Request, body: dict) -> list[Send]:
+    return [{"params": body}]
+
+
+def _capacity_query(request: Request, body: dict) -> list[Send]:
+    breakdown = body.get("breakdown")
+    if breakdown is not None and not isinstance(breakdown, str):
+        body = {**body, "breakdown": ",".join(breakdown)}
+    return _query(request, body)
+
+
+def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dict], list[Send]]:
+    """DSSST1 octet bodies, one send per chunk; ``wire_op`` labels the chunk envelope."""
+
+    def encode(request: Request, body: dict) -> list[Send]:
+        frame = _training_frame(body) if wire_op == "fwd-bwd" else wire.dumps(body, metadata=_CHUNKED_RESULTS)
+        chunks = wire.encode_byte_chunks(
+            frame, kind="request", operation=wire_op, max_bytes=_MAX_OCTET_BYTES, force_chunk=force_chunk
+        )
+        return [{"data": chunk, "headers": _OCTET_HEADERS} for chunk in chunks]
+
+    return encode
+
+
+def _generate_body(body: dict) -> dict:
+    return {**body, "prompts": wire.pack_token_prompts(body["prompts"])}
+
+
+_generate_octet = _octet("generate")
+
+
+def _generate(request: Request, body: dict) -> list[Send]:
+    return _generate_octet(request, _generate_body(body))
+
+
+def _unchunked_octet(request: Request, body: dict) -> list[Send]:
+    """One DSSST1 octet body; the route has no chunk reassembly, so an oversized frame is refused."""
+    frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
+    if len(frame) > _MAX_OCTET_BYTES:
+        raise ValueError(
+            f"cortex {request.op} body is {len(frame) / 2**20:.1f} MiB, over the "
+            f"{_MAX_OCTET_BYTES // 2**20} MiB cap; send fewer or shorter prompts"
+        )
+    return [{"data": frame, "headers": _OCTET_HEADERS}]
+
+
+def _generate_stream(request: Request, body: dict) -> list[Send]:
+    return _unchunked_octet(request, _generate_body(body))
+
+
+def _status_query(request: Request, body: dict) -> list[Send]:
+    return [{"params": {"max_events": body["max_events"]}}]
+
+
+def _operation_chunk_max_bytes(max_json_bytes: int) -> int:
+    return max(1, (max_json_bytes - _OPERATION_ENVELOPE_OVERHEAD_BYTES) * 3 // 4)
+
+
+def _operation_body_json_bytes(body: dict) -> int:
+    payload = body.get("payload")
+    raw = payload.get("payload_b64") if isinstance(payload, dict) else None
+    if not isinstance(raw, str):
+        return len(json.dumps(body).encode())
+    empty = {**body, "payload": {**payload, "payload_b64": ""}}
+    return len(json.dumps(empty).encode()) + len(raw)
+
+
+def _forward(request: Request, body: dict) -> list[Send]:
+    """One /operation envelope per slice of the forward frame.
+
+    Unlike the octet routes, chunking here happens *inside* the envelope: each
+    POST is a complete, valid `/operation` call whose payload is one slice of
+    the frame, and the zone stages them until the last one arrives. Only that
+    final POST answers with a request_id -- the earlier ones report the chunk
+    was cached -- so they must be posted in order and the last reply kept.
+    """
+    frame = _training_frame(body)
+    max_json_bytes = _OPERATION_MAX_JSON_BYTES
+    chunks = wire.encode_byte_chunks(
+        frame,
+        kind="request",
+        operation="forward",
+        max_bytes=_operation_chunk_max_bytes(max_json_bytes),
+    )
+    sends = [
+        {
+            "json": {
+                "operation_type": "forward",
+                "sub_job_id": str(request.job_id),
+                "payload": {
+                    "content_type": "application/octet-stream",
+                    "payload_b64": base64.b64encode(chunk).decode("ascii"),
+                },
+            }
+        }
+        for chunk in chunks
+    ]
+    if any(_operation_body_json_bytes(send["json"]) > max_json_bytes for send in sends):
+        raise ValueError(f"cortex forward operation body exceeds the {max_json_bytes}-byte JSON limit")
+    return sends
+
+
+def _save(request: Request, body: dict) -> list[Send]:
+    payload = {key: body[key] for key in ("checkpoint_id", "checkpoint_type") if key in body}
+    return [{"json": payload}]
+
+
+# ── normalizers: a Cortex reply -> the canonical result ─────────────────────
+def _identity(value: Any) -> Any:
+    return value
+
+
+def _capacity_result(result: dict) -> dict:
+    totals = {
+        "has_reservation": bool(result.get("has_reservation", False)),
+        "max_total_gpus": int(result.get("max_total_gpus", 0)),
+        "reserved_gpus": int(result.get("reserved_gpus", 0)),
+        "in_use_gpus": int(result.get("in_use_gpus", 0)),
+        "pending_gpus": int(result.get("pending_gpus", 0)),
+        "available_gpus": int(result.get("available_gpus", 0)),
+    }
+    return {**result, **totals}
+
+
+def _fwd_bwd_result(result: dict) -> dict:
+    if "post_process_outputs" not in result:
+        return result
+    if "batch" in result:
+        raise ValueError("Cortex fwd-bwd returned both 'batch' and 'post_process_outputs'")
+
+    import torch
+
+    batch = dict(result["post_process_outputs"] or {})
+    for key in ("logprobs", "entropy"):
+        if key in batch and batch[key] is not None:
+            batch[key] = torch.as_tensor(batch[key])
+    canonical = dict(result)
+    canonical.pop("post_process_outputs")
+    canonical["batch"] = batch
+    return canonical
+
+
+def _request_status(status: dict) -> dict:
+    """A poll reply -> ``{"state": "running"|"done"|"failed", "error", "events"}`` with results decoded."""
+    state = _short(status.get("status"))
+    events = [
+        {**event, "result": _to_python(_decode_result(event["result"]))} if event.get("type") == "result" else event
+        for event in status.get("events") or []
+    ]
+    return {
+        "state": "done" if state in _REQUEST_DONE else "failed" if state in _REQUEST_FAILED else "running",
+        "error": status.get("error", ""),
+        "events": events,
+    }
+
+
+def _to_python(obj: Any) -> Any:
+    import torch
+
+    if torch.is_tensor(obj):
+        return obj.cpu().tolist()
+    if isinstance(obj, dict):
+        return {k: _to_python(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_python(v) for v in obj]
+    return obj
+
 
 def _is_transient(exc: BaseException) -> bool:
     """Retry connection/timeout errors and transient HTTP statuses (safe for reads)."""
-    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
-        return True
-    if isinstance(exc, requests.exceptions.HTTPError):
-        resp = exc.response
-        return resp is not None and resp.status_code in _TRANSIENT_STATUSES
-    return False
-
-
-def _is_transient_async(exc: BaseException) -> bool:
-    """`_is_transient` for the aiohttp path (different exception hierarchy)."""
     import aiohttp
 
     if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError)):
         return True
     if isinstance(exc, aiohttp.ClientResponseError):
+        if _is_job_not_found(exc):
+            return False
         return exc.status in _TRANSIENT_STATUSES
     return False
 
 
+def _is_job_not_found(exc: BaseException) -> bool:
+    import aiohttp
+
+    return isinstance(exc, aiohttp.ClientResponseError) and getattr(exc, "error_code", None) == _JOB_NOT_FOUND_CODE
+
+
+def _tail_logs_eof(request: Request, exc: BaseException) -> dict | None:
+    if request.body.get("operation_type") == "tail-logs" and _is_job_not_found(exc):
+        return {"entries": [], "next_cursor": None, "eof": True}
+    return None
+
+
+def _is_transient_during_job_visibility(exc: BaseException) -> bool:
+    return _is_job_not_found(exc) or _is_transient(exc)
+
+
 def _is_connect_error(exc: BaseException) -> bool:
     """Only failures proving the request never reached the server (safe for mutating POSTs)."""
-    if isinstance(exc, requests.exceptions.ConnectTimeout):
-        return True
-    if isinstance(exc, requests.exceptions.ConnectionError):
-        cause = exc.args[0] if exc.args else None
-        reason = getattr(cause, "reason", None)
-        return isinstance(cause, NewConnectionError) or isinstance(reason, NewConnectionError)
-    return False
+    import aiohttp
+
+    return isinstance(exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError))
+
+
+@dataclass(frozen=True)
+class _SendPolicy:
+    retry_on: Callable[[BaseException], bool] = _is_transient
+    max_retries: int | None = None  # None: config.max_retries
+    timeout: float | None = None  # caps config.request_timeout
+
+
+_DEFAULT = _SendPolicy()
+# Only failures before the request reached the server; a replay would duplicate it.
+_NO_REPLAY = _SendPolicy(retry_on=_is_connect_error)
+# Control-plane read: answer fast or fail, as cortex-training does.
+_QUICK_READ = _SendPolicy(max_retries=0, timeout=30.0)
+# A newly created job may briefly be absent from the read path.
+_JOB_VISIBILITY_READ = _SendPolicy(retry_on=_is_transient_during_job_visibility)
+
+
+@dataclass(frozen=True, kw_only=True)
+class _Route:
+    method: str
+    # Under the prefix. `{job}` is the parent of request.job_id; other fields come from the body.
+    path: str
+    encode: Callable[[Request, dict], list[Send]] = _json
+    poll: bool = False
+    policy: _SendPolicy = _DEFAULT
+    # Re-post the whole chunk group once on `chunk_group_restart_required`. Only endpoints
+    # that stage chunks on the job's actor (forward-backward) send that code; it is not a
+    # general retry flag.
+    restartable: bool = False
+    # `operation_type`s that may answer in the POST reply instead of with a request_id.
+    inline_types: frozenset[str] = frozenset()
+    normalize: Callable[[Any], Any] = _identity
+    recover: Callable[[Request, BaseException], dict | None] | None = None
+
+    def prepare(self, prefix: str, request: Request) -> tuple[str, list[Send]]:
+        body = {k: v for k, v in request.body.items() if v is not None}
+        job = None if request.job_id is None else _parent_id(request.job_id)
+        return prefix + self.path.format_map(body | {"job": job}), self.encode(request, body)
+
+    def submitted(self, request: Request, reply: dict) -> str | dict:
+        """The request_id to poll, or the reply itself for an inline type.
+
+        A missing request_id anywhere else raises: it would otherwise read as a
+        finished op that was never waited on.
+        """
+        if reply.get("request_id") is not None:
+            return str(reply["request_id"])
+        operation_type = request.body.get("operation_type")
+        if operation_type in self.inline_types:
+            return reply
+        raise RuntimeError(f"cortex {operation_type or request.op} response carried no request_id: {reply}")
+
+    def finish(self, chunks: list[bytes], result: dict) -> Any:
+        return self.normalize(_decode_result(result, chunks))
+
+
+class _NoopRoute(_Route):
+    """Sends nothing and answers `{}`, whatever the body's shape."""
+
+    def prepare(self, prefix: str, request: Request) -> tuple[str, list[Send]]:
+        return "", []
+
+
+# Neutrino never colocates training and sampling on the same GPUs, so it exposes no
+# sleep/wake surface. These send nothing rather than erroring, which keeps shared
+# client flows like sync_weights() (wake → operation → wake → reset) portable.
+_NOOP = _NoopRoute(method="NOOP", path="")
+
+_ROUTES = {
+    "sleep-inference": _NOOP,
+    "wake-inference": _NOOP,
+    "sleep-training": _NOOP,
+    "wake-training": _NOOP,
+    # A replayed create would spawn a second job.
+    "create-job": _Route(method="POST", path="", policy=_NO_REPLAY),
+    "list-jobs": _Route(method="GET", path="", encode=_query, normalize=lambda reply: reply.get("jobs", [])),
+    "get-job": _Route(method="GET", path="/{job}", encode=_no_body),
+    "get-experiment-run": _Route(method="GET", path="/{job}/experiment-run", encode=_no_body),
+    "cancel-job": _Route(method="POST", path="/{job}:cancel", encode=_no_body),
+    "capacity": _Route(
+        method="GET", path="/capacity", encode=_capacity_query, policy=_QUICK_READ, normalize=_capacity_result
+    ),
+    "list-checkpoints": _Route(
+        method="GET",
+        path="/{job}/checkpoints",
+        encode=_no_body,
+        normalize=lambda reply: reply.get("checkpoints", []),
+    ),
+    "export-checkpoint": _Route(method="POST", path="/{job}/checkpoints/{checkpoint_id}:export", encode=_no_body),
+    # A replayed delete answers 404 for a checkpoint the first send already removed.
+    "delete-checkpoint": _Route(
+        method="DELETE", path="/{job}/checkpoints/{checkpoint_id}", encode=_no_body, policy=_NO_REPLAY
+    ),
+    # forward-backward always carries a chunk envelope, even when the frame fits: its
+    # chunk_group_id is the server's idempotency key. A mid-stream chunk-group desync
+    # (GS restart) is recoverable only by re-posting the whole group.
+    "forward-backward": _Route(
+        method="POST",
+        path="/{job}/forward-backward",
+        encode=_octet("fwd-bwd", force_chunk=True),
+        poll=True,
+        restartable=True,
+        normalize=_fwd_bwd_result,
+    ),
+    # SnowAPI requires DSSST1 octet bodies here even though generate carries no tensors.
+    "generate": _Route(method="POST", path="/{job}/generate", encode=_generate, poll=True, normalize=_to_python),
+    # Answers {request_id, count} at once; events are read with request-status. A replay
+    # would start a second generation nobody reads.
+    "generate-stream": _Route(
+        method="POST", path="/{job}/generate-stream", encode=_generate_stream, policy=_NO_REPLAY
+    ),
+    # Each poll drains the events it returns from the server.
+    "request-status": _Route(
+        method="GET", path="/{job}/requests/{request_id}", encode=_status_query, normalize=_request_status
+    ),
+    # An /operation that is never polled: its acknowledgement may name the cancelled request.
+    "cancel-request": _Route(method="POST", path="/{job}/operation"),
+    "forward": _Route(method="POST", path="/{job}/operation", encode=_forward, poll=True),
+    "step": _Route(method="POST", path="/{job}/step", poll=True),
+    "save": _Route(method="POST", path="/{job}/save", encode=_save, poll=True),
+    "load-checkpoint": _Route(method="POST", path="/{job}/load", poll=True),
+    # /operation is polymorphic: weight-sync is polled, the rest answer inline.
+    "operation": _Route(
+        method="POST",
+        path="/{job}/operation",
+        poll=True,
+        inline_types=frozenset(
+            {"reset-prefix-cache", "tail-logs", "bootstrap-router-replay", "router-replay-discard"}
+        ),
+        recover=_tail_logs_eof,
+    ),
+}
+
+
+def _route(op: str) -> _Route:
+    if op not in _ROUTES:
+        raise NotImplementedError(f"cortex has no {op}")
+    return _ROUTES[op]
 
 
 class _ChunkGroupError(Exception):
-    """A SnowAPI chunk-group error (missing/conflict/restart) — never retried per-chunk."""
+    """A SnowAPI chunk-group error (missing/conflict/restart).
+
+    No retry predicate matches it: re-posting one chunk cannot fix the group,
+    only re-posting the whole group can.
+    """
 
     def __init__(self, detail: dict) -> None:
-        super().__init__(detail.get("code", "chunk_group_error"))
+        super().__init__(f"cortex chunk group error: {detail}")
         self.detail = detail
+
+    @property
+    def restart_required(self) -> bool:
+        return self.detail["code"] == _CHUNK_GROUP_RESTART_REQUIRED
 
 
 def _iter_error_dicts(value: Any, *, depth: int = 0) -> Iterator[dict]:
@@ -148,320 +492,347 @@ def _chunk_group_detail(body: Any) -> dict | None:
     return None
 
 
-def _is_chunk_post_transient(exc: BaseException) -> bool:
-    """`_is_transient`, but never retry a single chunk on a chunk-group error — the
-    whole group must be re-posted instead (see `_submit_octet`)."""
-    if (
-        isinstance(exc, requests.exceptions.HTTPError)
-        and _chunk_group_detail(_response_json(exc.response)) is not None
-    ):
-        return False
-    return _is_transient(exc)
+def _response_error_code(body: Any) -> str | None:
+    for candidate in _iter_error_dicts(body):
+        code = candidate.get("code") or candidate.get("error_code")
+        if code is not None:
+            return str(code)
+    return None
 
 
-def _response_json(resp: requests.Response | None) -> Any:
-    if resp is None:
-        return None
-    try:
-        return resp.json()
-    except ValueError:
-        return None
+def _response_error_message(body: Any) -> str | None:
+    for candidate in _iter_error_dicts(body):
+        message = candidate.get("message")
+        if isinstance(message, str) and message.strip():
+            return message
+    return None
 
 
-async def _aread_json(resp: Any) -> Any:
-    try:
-        return await resp.json(content_type=None)
-    except Exception:
-        return None
+async def _raise_for_status(resp: Any) -> None:
+    """Raise for an error response, keeping the server's error body in the message.
+
+    GS explains a 4xx in the response body; the stock error shows only the status
+    line, which turns an actionable rejection into a guessing game. Stays a
+    `ClientResponseError` (carrying `status`) so `_is_transient` keeps classifying
+    it. A chunk-group error raises `_ChunkGroupError` instead.
+
+    The error also carries the body's ``error_code`` and ``error_message``, so a
+    caller can report the server's explanation without the request URL.
+    """
+    import aiohttp
+
+    body = (await resp.text()).strip()
+    detail = _chunk_group_detail(body)
+    if detail is not None:
+        raise _ChunkGroupError(detail)
+    message = f"{resp.reason}: {body[:2000]}" if body else (resp.reason or "")
+    error = aiohttp.ClientResponseError(
+        resp.request_info,
+        resp.history,
+        status=resp.status,
+        message=message,
+        headers=resp.headers,
+    )
+    error.error_code = _response_error_code(body)
+    error.error_message = _response_error_message(body)
+    raise error
+
+
+def job_create_payload(sub_job_configs: list[dict], config: CortexConfig) -> dict:
+    """Job-create body. Unset fields and an empty comment are omitted."""
+    payload: dict[str, Any] = {"sub_job_configs": sub_job_configs}
+    if config.job_comment is not None and config.job_comment != "":
+        payload["comment"] = config.job_comment
+    for key in ("idle_timeout_seconds", "pending_timeout_seconds"):
+        value = getattr(config, key)
+        if value is not None:
+            payload[key] = value
+    return payload
 
 
 class CortexTransport(Transport):
-    def __init__(self, config: ArcticRLClientConfig) -> None:
+    def __init__(self, config: CortexConfig) -> None:
         self.config = config
         self.jobs = JobHandles()
         self.job_id: str | None = None
-        self.request_timeout = config.request_timeout
-        self.max_retries = config.backend.max_retries
+        self._roles: list[str] = []
+        self._owns_job = False
+        self._awaiting_job_visibility = False
+        self._router_replay_sampling_ids: dict[tuple[str, str], str] = {}
         self.poll_interval = 0.5
-        self.poll_timeout = config.job_ready_timeout
-        self.session = self._build_session()
-        self._asession = None  # aiohttp.ClientSession, lazy on first acall
-        self._asession_loop = None  # the event loop that session is bound to
+        self._start_loop()
+
+    # Every HTTP exchange runs on this transport's own loop thread, so sync and async
+    # callers share one implementation and one aiohttp session. Encoding (`prepare`)
+    # and decoding (`finish`) stay on the caller's thread so a large frame never
+    # stalls the loop for other callers.
+    def _start_loop(self) -> None:
+        self._session = None  # aiohttp.ClientSession, built on the loop at first send
+        self._loop = asyncio.new_event_loop()
+        threading.Thread(target=self._loop.run_forever, name="cortex-transport", daemon=True).start()
+
+    def _on_loop(self, coro) -> Future:
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    # A loop and its thread are not picklable; the receiving side starts its own.
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        del state["_loop"], state["_session"]
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._start_loop()
 
     # ── lifecycle ──────────────────────────────────────────────────────────
-    def initialize(self) -> JobHandles:
-        cfg = self.config
-        reconnect = JobHandles.from_config(cfg)
+    def initialize(self, client_config: ArcticClientConfig) -> JobHandles:
+        self.start(client_config)
+        return self.wait_until_ready()
+
+    def start(self, client_config: ArcticClientConfig) -> JobHandles:
+        self._roles = [role for role in JOB_TYPES if client_config.gpus_for(role) > 0]
+        reconnect = JobHandles.from_config(client_config)
         if reconnect.any_set:  # reattach; a sub-job token embeds its parent job id
-            token = next(t for t in (reconnect.training, reconnect.sampling, reconnect.log_prob) if t is not None)
-            self.job_id = str(token).split(":", 1)[0]
+            self.job_id = _parent_id(reconnect.require_any())
         else:
-            # A mutating create: only retry when the request provably never landed,
-            # so we can't spawn duplicate jobs (matches the neutrino client).
-            created = self._send(
-                "POST", self._prefix, retry_on=_is_connect_error, json={"sub_job_configs": self._sub_job_configs()}
-            )
-            self.job_id = created["job_id"]
+            body = job_create_payload(client_config.to_cortex(), self.config)
+            self.job_id = self.call(Request("create-job", body=body))["job_id"]
+            self._owns_job = True
+            self._awaiting_job_visibility = True
+            # Logged before the wait: a job can stay PLACING for a long time.
+            logger.info("created cortex job %s", self.job_id)
+        return self.jobs
+
+    def wait_until_ready(self) -> JobHandles:
         self._wait_running()
         sub_jobs = self._capture_sub_jobs()
         # JobHandles holds each role's sub-job token, so the client's op bodies
         # (e.g. weight-sync source/target) already carry Cortex-correct ids with no
         # transport-side rewrite -- exactly as on-prem does with plain job ids.
-        for role in JOB_TYPES:
-            if cfg.gpus_for(role) > 0:
-                self.jobs.set(role, sub_jobs[_SUB_JOB_KEY[role]])
+        for role in self._roles:
+            self.jobs.set(role, sub_jobs[_SUB_JOB_KEY[role]])
         return self.jobs
 
     def shutdown(self) -> None:
-        if self.job_id is None:
-            return
-        # GS uses colon-action syntax: /{job_id}:cancel. Best-effort teardown routed
-        # through _send (retry + auth), tolerating failure (the job may be gone).
-        with contextlib.suppress(requests.exceptions.RequestException):
-            self._send("POST", f"{self._prefix}/{self.job_id}:cancel")
+        import aiohttp
 
-    # ── deliver one op: submit + poll to completion ──────────────────────────
-    def call(self, request: Request) -> dict:
-        result = self._poll(self._submit(request))
-        # generate returns token ids as DSSST1 tensors; on-prem returns plain
-        # lists, so match that contract.
-        return _to_python(result) if request.op == "generate" else result
+        if self._owns_job and self.job_id is not None:
+            # Best-effort teardown, tolerating failure (the job may be gone).
+            with contextlib.suppress(aiohttp.ClientError, asyncio.TimeoutError):
+                self.call(cancel_job_request(self.job_id))
+            self.job_id = None
+            self._owns_job = False
+            self._awaiting_job_visibility = False
+        self._on_loop(self._close_session()).result()
 
-    async def acall(self, request: Request) -> dict:
-        result = await self._apoll(await self._asubmit(request))
-        return _to_python(result) if request.op == "generate" else result
+    # ── deliver one op ───────────────────────────────────────────────────────
+    def call(self, request: Request) -> Any:
+        return self._call(request)
 
-    def _submit(self, request: Request) -> str:
-        # Same shape as on-prem's call: build the url, then pick the wire. Octet ops
-        # (forward-backward, generate) go DSSST1; the rest post JSON as-is. The client
-        # assembles the full /operation envelope (incl. sub-job routing hints), so
-        # `operation` is just another JSON post. `forward`/`log-probs` don't exist here.
-        op = request.op
-        body = {k: v for k, v in request.body.items() if v is not None}
-        url = f"{self._prefix}/{self.job_id}/{op}"
-        if op in _OCTET_OPS:
-            return self._submit_octet(url, op, body)
-        if op in ("step", "save", "operation"):
-            return self._send("POST", url, json=body)["request_id"]
-        raise NotImplementedError(f"cortex has no {op}")
+    def _call(self, request: Request, route: _Route | None = None) -> Any:
+        route, future = self._submit(request, route)
+        return self._finish(request, route, *future.result())
 
-    def _octet_chunks(self, body: dict, op: str) -> list[bytes]:
-        frame = wire.dumps(body, metadata={"response_options": {"format": "dssst1", "delivery": "chunked"}})
-        return list(wire.encode_byte_chunks(frame, kind="request", operation=op, max_bytes=_MAX_OCTET_BYTES))
+    async def acall(self, request: Request) -> Any:
+        route, future = self._submit(request)
+        return self._finish(request, route, *await asyncio.wrap_future(future))
 
-    def _submit_octet(self, url: str, op: str, body: dict) -> str:
-        # Post the frame chunk-by-chunk. Transient blips retry per-chunk; a
-        # chunk-group desync (only forward-backward) re-posts the whole group once.
-        chunks = self._octet_chunks(body, op)
-        allow_restart = op in _GROUP_RESTART_OPS
-        retry_on = _is_chunk_post_transient if allow_restart else _is_transient
-        restarts = idx = 0
-        final: dict = {}
-        while idx < len(chunks):
-            try:
-                final = self._send("POST", url, retry_on=retry_on, data=chunks[idx], headers=_OCTET_HEADERS)
-            except requests.exceptions.HTTPError as exc:
-                detail = _chunk_group_detail(_response_json(exc.response))
-                if not (allow_restart and restarts < 1 and detail and detail["code"] == _CHUNK_GROUP_RESTART_REQUIRED):
-                    raise
-                restarts, idx, final = restarts + 1, 0, {}
-                continue
-            idx += 1
-        return final["request_id"]
+    def _submit(self, request: Request, route: _Route | None = None) -> tuple[_Route, Future]:
+        route = route or _route(request.op)
+        request = self._router_replay_request(request)
+        url, sends = route.prepare(self._prefix, request)
+        return route, self._on_loop(self._deliver(route, request, url, sends))
 
-    async def _asubmit(self, request: Request) -> str:
-        op = request.op
-        body = {k: v for k, v in request.body.items() if v is not None}
-        url = f"{self._prefix}/{self.job_id}/{op}"
-        if op in _OCTET_OPS:
-            return await self._asubmit_octet(url, op, body)
-        if op in ("step", "save", "operation"):
-            return (await self._asend("POST", url, json=body))["request_id"]
-        raise NotImplementedError(f"cortex has no {op}")
+    async def _deliver(self, route: _Route, request: Request, url: str, sends: list[Send]) -> tuple[list[bytes], dict]:
+        try:
+            reply = await self._send_group(route, url, sends)
+            if not route.poll:
+                return [], reply
+            return await self._poll(route.submitted(request, reply))
+        except Exception as exc:
+            recovered = route.recover(request, exc) if route.recover is not None else None
+            if recovered is None:
+                raise
+            return [], recovered
 
-    async def _asubmit_octet(self, url: str, op: str, body: dict) -> str:
-        chunks = self._octet_chunks(body, op)
-        allow_restart = op in _GROUP_RESTART_OPS
-        restarts = idx = 0
-        final: dict = {}
-        while idx < len(chunks):
-            try:
-                final = await self._apost_octet_chunk(url, chunks[idx], allow_restart=allow_restart)
-            except _ChunkGroupError as exc:
-                if not (restarts < 1 and exc.detail["code"] == _CHUNK_GROUP_RESTART_REQUIRED):
-                    raise
-                restarts, idx, final = restarts + 1, 0, {}
-                continue
-            idx += 1
-        return final["request_id"]
+    async def _send_group(self, route: _Route, url: str, sends: list[Send]) -> dict:
+        try:
+            return await self._send_each(route, url, sends)
+        except _ChunkGroupError as exc:
+            if not (route.restartable and exc.restart_required):
+                raise
+        return await self._send_each(route, url, sends)
 
-    async def _apost_octet_chunk(self, url: str, chunk: bytes, *, allow_restart: bool) -> dict:
-        # aiohttp's ClientResponseError drops the body, so read it here to spot a
-        # chunk-group error (surfaced as _ChunkGroupError, never retried per-chunk).
-        session = await self._ensure_asession()
-
-        async def attempt() -> dict:
-            async with session.post(url, data=chunk, headers=_OCTET_HEADERS) as resp:
-                if resp.status >= 400:
-                    detail = _chunk_group_detail(await _aread_json(resp)) if allow_restart else None
-                    if detail is not None:
-                        raise _ChunkGroupError(detail)
-                    resp.raise_for_status()
-                return await resp.json(content_type=None)
-
-        retryer = AsyncRetrying(
-            retry=retry_if_exception(_is_transient_async),
-            stop=stop_after_attempt(1 + self.max_retries),
-            wait=wait_exponential_jitter(initial=0.5, max=10.0),
-            reraise=True,
-        )
-        return await retryer(attempt)
+    async def _send_each(self, route: _Route, url: str, sends: list[Send]) -> dict:
+        """Post every send in order; the last reply is the op's answer."""
+        reply: dict = {}
+        for index, kwargs in enumerate(sends):
+            reply = await self._send(route.method, url, policy=route.policy, **kwargs)
+            if index < len(sends) - 1 and reply.get("request_id") is not None:
+                raise RuntimeError(f"cortex chunk {index} unexpectedly returned request_id")
+        return reply
 
     def _request_url(self, request_id: str, cursor: str | None) -> tuple[str, dict | None]:
         url = f"{self._prefix}/{self.job_id}/requests/{request_id}"
         return url, ({"cursor": cursor} if cursor else None)
 
-    def _poll(self, request_id: str) -> dict:
-        deadline = time.monotonic() + self.poll_timeout
+    async def _poll(self, submitted: str | dict) -> tuple[list[bytes], dict]:
+        """The finished request's result chunks and inline result, left for the caller to decode."""
+        # Inline types (`_Route.inline_types`) return their body from POST.
+        if isinstance(submitted, dict):
+            return [], submitted
+        request_id = submitted
+        deadline = time.monotonic() + self.config.poll_timeout
         delay = self.poll_interval
         chunks: list[bytes] = []
         cursor: str | None = None
         while time.monotonic() < deadline:
             url, params = self._request_url(request_id, cursor)
-            action, value = _poll_progress(self._send("GET", url, params=params), chunks, request_id)
+            action, value = _poll_progress(await self._send("GET", url, params=params), chunks, request_id)
             if action == "done":
-                return value
+                return chunks, value
             if action == "drain":
                 cursor = value  # more result chunks queued; re-poll without backing off
                 continue
-            time.sleep(delay)
-            delay = _next_delay(delay)
-        raise TimeoutError(f"cortex request {request_id} did not complete within {self.poll_timeout}s")
-
-    async def _apoll(self, request_id: str) -> dict:
-        deadline = time.monotonic() + self.poll_timeout
-        delay = self.poll_interval
-        chunks: list[bytes] = []
-        cursor: str | None = None
-        while time.monotonic() < deadline:
-            url, params = self._request_url(request_id, cursor)
-            action, value = _poll_progress(await self._asend("GET", url, params=params), chunks, request_id)
-            if action == "done":
-                return value
-            if action == "drain":
-                cursor = value
-                continue
             await asyncio.sleep(delay)
             delay = _next_delay(delay)
-        raise TimeoutError(f"cortex request {request_id} did not complete within {self.poll_timeout}s")
+        raise TimeoutError(f"cortex request {request_id} did not complete within {self.config.poll_timeout}s")
 
     def _wait_running(self) -> None:
-        deadline = time.monotonic() + self.poll_timeout
+        deadline = time.monotonic() + self.config.job_ready_timeout
         delay = self.poll_interval
+        started = time.monotonic()
+        announced: str | None = None
+        last_note = 0.0
         while time.monotonic() < deadline:
-            state = _short(self._job().get("status"))
+            job = self._job()
+            state = _short(job.get("status")) or "pending"
+            elapsed = time.monotonic() - started
+            if state != announced:
+                announced = state
+                last_note = elapsed
+                if state == "running":
+                    logger.info("Cortex job is running (%s).", _clock(elapsed))
+                else:
+                    logger.info(
+                        "Cortex job is %s. Workers are starting and loading the model.",
+                        state,
+                    )
+            elif state != "running" and elapsed - last_note >= 15:
+                last_note = elapsed
+                logger.info("Still %s (%s).", state, _clock(elapsed))
             if state == "running":
                 return
             if state in _JOB_TERMINAL:
-                raise RuntimeError(f"cortex job {self.job_id} reached terminal state '{state}'")
+                # Surface the server-side reason and any per-sub-job status so
+                # callers can distinguish rate limits, allowlist rejections,
+                # capacity exhaustion, and genuine sub-job crashes.
+                reason = job.get("reason") or "(no reason)"
+                sub_states = ", ".join(
+                    f"{_short(sj.get('job_type', ''), 'job_type_')}={_short(sj.get('status'))}"
+                    for sj in (job.get("sub_jobs") or [])
+                )
+                detail = f" reason={reason!r}"
+                if sub_states:
+                    detail += f" sub_jobs=[{sub_states}]"
+                raise RuntimeError(f"cortex job {self.job_id} reached terminal state '{state}';{detail}")
             time.sleep(delay)
             delay = _next_delay(delay)
-        raise TimeoutError(f"cortex job {self.job_id} did not become running within {self.poll_timeout}s")
+        raise TimeoutError(f"cortex job {self.job_id} did not become running within {self.config.job_ready_timeout}s")
 
     def _capture_sub_jobs(self) -> dict[str, str]:
-        job = self._job()
-        job = job.get("job", job)
         sub_jobs: dict[str, str] = {}
-        for sub in job.get("sub_jobs", []) or []:
+        for sub in self._job().get("sub_jobs", []) or []:
             sub_jobs[_short(sub.get("job_type"), "job_type_")] = str(sub["sub_job_id"])
         for role in _SUB_JOB_KEY.values():
             sub_jobs.setdefault(role, f"{self.job_id}:{role}:0")
         return sub_jobs
 
-    # ── create-job body (SubJobConfig wire shape) ────────────────────────────
-    def _sub_job_configs(self) -> list[dict]:
-        return self.config.to_cortex()
-
     # ── HTTP + auth ──────────────────────────────────────────────────────────
     @property
     def _prefix(self) -> str:
-        cfg = self.config
-        cx = cfg.backend
+        cx = self.config
         base = (cx.base_url or f"https://{cx.host}").rstrip("/")
-        return f"{base}/api/v2/databases/{cx.database}/schemas/{cx.schema_}/{cx.endpoint}"
+        database, schema = quote(cx.database, safe="$"), quote(cx.schema_, safe="$")
+        return f"{base}/api/v2/databases/{database}/schemas/{schema}/{cx.endpoint}"
 
     def _auth_headers(self) -> dict[str, str]:
-        cx = self.config.backend
+        cx = self.config
         if cx.base_url is not None:  # local/dev host: no PAT auth
             return {}
-        return {  # config validated resolve_pat() is present for host/PAT auth
-            "Authorization": f"Bearer {cx.resolve_pat()}",
+        return {  # config validated the PAT is present for host/PAT auth
+            "Authorization": f"Bearer {cx.pat.get_secret_value()}",
             "X-Snowflake-Authorization-Token-Type": "PROGRAMMATIC_ACCESS_TOKEN",
         }
 
-    def _build_session(self) -> requests.Session:
-        session = requests.Session()
-        session.headers.update(self._auth_headers())
-        return session
-
     def _job(self) -> dict:
-        return self._send("GET", f"{self._prefix}/{self.job_id}")
+        route = replace(_route("get-job"), policy=_JOB_VISIBILITY_READ) if self._awaiting_job_visibility else None
+        job = self._call(get_job_request(self.job_id), route)
+        self._awaiting_job_visibility = False
+        return job
 
-    def _send(self, method: str, url: str, *, retry_on=None, **kwargs: Any) -> dict:
+    async def _send(self, method: str, url: str, *, policy: _SendPolicy = _DEFAULT, **kwargs: Any) -> dict:
         # Every SnowAPI call goes through here so transient 429/5xx/connection blips
         # are retried with exponential-jitter backoff (the neutrino client's policy).
-        def attempt() -> dict:
-            resp = self.session.request(method, url, timeout=self.request_timeout, **kwargs)
-            resp.raise_for_status()
-            return resp.json()
+        import aiohttp
 
-        retryer = Retrying(
-            retry=retry_if_exception(retry_on or _is_transient),
-            stop=stop_after_attempt(1 + self.max_retries),
-            wait=wait_exponential_jitter(initial=0.5, max=10.0),
-            reraise=True,
-        )
-        return retryer(attempt)
-
-    async def _ensure_asession(self):
-        # A ClientSession is bound to the loop it's built on; reuse it only on that
-        # same loop. On a new loop (e.g. a fresh asyncio.run) rebuild -- the stale
-        # one can't be awaited closed from here.
-        loop = asyncio.get_running_loop()
-        if self._asession is None or self._asession.closed or self._asession_loop is not loop:
-            import aiohttp
-
-            self._asession = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.request_timeout),
-                headers=self._auth_headers(),
-            )
-            self._asession_loop = loop
-        return self._asession
-
-    async def _asend(self, method: str, url: str, *, retry_on=None, **kwargs: Any) -> dict:
-        session = await self._ensure_asession()
+        if self._session is None:
+            connector = aiohttp.TCPConnector(ssl=self.config.verify_ssl)
+            self._session = aiohttp.ClientSession(headers=self._auth_headers(), connector=connector)
+        session = self._session
+        retries = self.config.max_retries if policy.max_retries is None else policy.max_retries
+        timeout = min(self.config.request_timeout, policy.timeout or self.config.request_timeout)
+        kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout)
 
         async def attempt() -> dict:
             async with session.request(method, url, **kwargs) as resp:
-                resp.raise_for_status()
-                return await resp.json(content_type=None)
+                if resp.status >= 400:
+                    await _raise_for_status(resp)
+                body = await resp.read()
+                # `:cancel` answers 200 with an empty body. Decoding that as JSON
+                # would report an already-completed release as a failure.
+                return json.loads(body) if body.strip() else {}
 
         retryer = AsyncRetrying(
-            retry=retry_if_exception(retry_on or _is_transient_async),
-            stop=stop_after_attempt(1 + self.max_retries),
+            retry=retry_if_exception(policy.retry_on),
+            stop=stop_after_attempt(1 + retries),
             wait=wait_exponential_jitter(initial=0.5, max=10.0),
             reraise=True,
         )
         return await retryer(attempt)
 
-    async def aclose(self) -> None:
-        # Only the loop that owns the session can close it; on any other loop just
-        # drop the reference (matches the on-prem HTTP transport).
-        if self._asession is not None:
-            if not self._asession.closed and self._asession_loop is asyncio.get_running_loop():
-                await self._asession.close()
-            self._asession = None
-            self._asession_loop = None
+    async def _close_session(self) -> None:
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+
+    def _finish(self, request: Request, route: _Route, chunks: list[bytes], result: dict) -> Any:
+        reply = route.finish(chunks, result)
+        if request.op == "operation" and request.body.get("operation_type") == "bootstrap-router-replay":
+            sampling_id = reply.get("sampling_job_id")
+            if sampling_id:
+                payload = request.body["payload"]
+                pair = (str(payload["target_sub_job_id"]), str(payload["source_sub_job_id"]))
+                self._router_replay_sampling_ids[pair] = str(sampling_id)
+        return reply
+
+    def _router_replay_request(self, request: Request) -> Request:
+        if request.op not in {"forward-backward", "forward"}:
+            return request
+        replay = request.body.get("router_replay")
+        if not isinstance(replay, dict) or not replay.get("sampling_job_id"):
+            return request
+        pair = (str(request.job_id), str(replay["sampling_job_id"]))
+        sampling_id = self._router_replay_sampling_ids.get(pair)
+        if sampling_id is None:
+            return request
+        # Bootstrap resolves public Cortex tokens to zone IDs; the frame must use that same pair.
+        return replace(request, body={**request.body, "router_replay": {**replay, "sampling_job_id": sampling_id}})
+
+
+def _clock(seconds: float) -> str:
+    total = int(seconds)
+    return f"{total // 60}:{total % 60:02d}"
 
 
 def _next_delay(delay: float) -> float:
@@ -473,15 +844,16 @@ def _poll_progress(status: dict, chunks: list[bytes], request_id: str) -> tuple[
     """Fold one poll response into an action, mutating `chunks` with any result chunks.
 
     Returns ``("drain", next_cursor)`` (more chunks queued — re-poll now),
-    ``("done", result)`` (finished, decoded result), or ``("wait", None)`` (still
-    running — back off). Raises ``RuntimeError`` if the request ended failed.
+    ``("done", inline_result)`` (finished; `chunks` holds any chunked result), or
+    ``("wait", None)`` (still running — back off). Raises ``RuntimeError`` if the
+    request ended failed.
     """
     chunks.extend(c for c in map(_result_chunk, status.get("events") or []) if c is not None)
     if status.get("next_cursor"):
         return "drain", status["next_cursor"]
     state = _short(status.get("status"))
     if state in _REQUEST_DONE:
-        return "done", (wire.decode_result_chunks(chunks) if chunks else _decode_result(status.get("result") or {}))
+        return "done", status.get("result") or {}
     if state in _REQUEST_FAILED:
         raise RuntimeError(f"cortex request {request_id} ended '{state}': {status.get('error', '')}")
     return "wait", None
@@ -503,20 +875,29 @@ def _result_chunk(event: Any) -> bytes | None:
     return payload
 
 
-def _decode_result(result: dict) -> dict:
-    """Decode a small inline result: a base64 DSSST1 frame, else pass-through JSON."""
-    if isinstance(result, dict) and result.get("wire_format") == wire.WIRE_FORMAT_VERSION:
-        return wire.loads(base64.b64decode(result["payload_b64"]))
-    return result
+def _decode_result(result: dict, chunks: Sequence[bytes] = ()) -> Any:
+    """A result envelope plus any result chunks -> the decoded result; plain JSON passes through.
+
+    The zone attaches its own transport metrics (router-replay tx stats) to the
+    JSON envelope instead of re-encoding the DSSST1 frame, so they are folded
+    into the payload's `metrics` here; envelope keys win.
+    """
+    if chunks:
+        decoded = wire.decode_result_chunks(chunks)
+    elif result.get("wire_format") == wire.WIRE_FORMAT_VERSION:
+        decoded = wire.loads(base64.b64decode(result["payload_b64"]))
+    else:
+        return result
+    if "metrics" in result:
+        decoded["metrics"] = {**decoded.get("metrics", {}), **result["metrics"]}
+    return decoded
 
 
-def _to_python(obj: Any) -> Any:
-    import torch
-
-    if torch.is_tensor(obj):
-        return obj.cpu().tolist()
-    if isinstance(obj, dict):
-        return {k: _to_python(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_to_python(v) for v in obj]
-    return obj
+def _training_frame(body: dict) -> bytes:
+    """Keep replay coordination in the metadata the zone reads, outside the model batch."""
+    batch = dict(body)
+    metadata = dict(_CHUNKED_RESULTS)
+    replay = batch.pop("router_replay", None)
+    if replay is not None:
+        metadata["router_replay"] = replay
+    return wire.dumps(batch, metadata=metadata)

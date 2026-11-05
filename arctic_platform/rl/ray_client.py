@@ -13,11 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ArcticRLClient -- unified HTTP client for RL training.
-
-Works identically against a remote dss-platform deployment or a local
-``server.py`` instance -- the only differences are ``base_url`` and whether the
-client launches the server.
+"""ArcticRLRayClient -- in-process Ray client for RL training.
 
 All jobs (training, sampling, log-prob) are initialized automatically at
 construction time.
@@ -29,6 +25,7 @@ import logging
 from typing import Any
 
 import ray
+from ray.util.placement_group import remove_placement_group
 
 from arctic_platform.rl.config import ArcticRLClientConfig
 from arctic_platform.rl.ray_server import ArcticRLRayServer
@@ -50,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 class ArcticRLRayClient:
-    """HTTP client for RL training against dss-platform or a local server.
+    """In-process Ray client for RL training.
 
     Jobs are created automatically during ``__init__`` for each engine type.
 
@@ -63,20 +60,21 @@ class ArcticRLRayClient:
     def __init__(self, config: ArcticRLClientConfig, rl_server_state: ArcticRLRayServerState) -> None:
         self.config = config
 
-        assert config.backend == "local", "ArcticRLRayClient only supports local backend"
-
         pr0(f"[ArcticRLRayClient] entry: config: {config=} {rl_server_state=}")
 
         if config.training_job_id is not None:
             # Reconnect mode: attach to pre-existing jobs without calling /initialize.
             # Populated by reconnect_config(); used when passing a client across Ray
             # process boundaries where the live object cannot be serialized.
+            # The other process owns the state actor and its placement group.
+            self._owns_server_state = False
             self._training_job_id = config.training_job_id
             self._sampling_job_id = config.sampling_job_id
             self._log_prob_job_id = config.log_prob_job_id
 
             self._arctic_rl_ray_server_state = rl_server_state
         else:
+            self._owns_server_state = True
             self._training_job_id: int | None = None
             self._sampling_job_id: int | None = None
             self._log_prob_job_id: int | None = None
@@ -87,7 +85,16 @@ class ArcticRLRayClient:
                 log_prob_engine=config.log_prob_engine,
                 colocate=config.colocate,
             )
-            self._initialize_jobs(config)
+            try:
+                self._initialize_jobs(config)
+            except BaseException:
+                try:
+                    self._cleanup_failed_initialization()
+                except BaseException:
+                    # Initialization's exception is the actionable root cause.
+                    # Cleanup is best-effort and must never replace it.
+                    logger.warning("Unexpected partial-state cleanup failure", exc_info=True)
+                raise
 
         self._arctic_rl_ray_server = ArcticRLRayServer(self._arctic_rl_ray_server_state)
         pr0(
@@ -100,8 +107,7 @@ class ArcticRLRayClient:
 
         The returned config can be passed to ``ArcticRLClient()`` in another
         process (e.g. a Ray actor) to connect to the same jobs without calling
-        ``/initialize`` again.  ``backend`` is always ``"dss-platform"`` since
-        the server is already running.
+        ``initialize`` again.
 
         Example::
 
@@ -113,12 +119,10 @@ class ArcticRLRayClient:
             actor_client = ArcticRLClient(rc)   # reconnects, no /initialize
         """
         return ArcticRLClientConfig(
-            backend="local",
             model_name=self.config.model_name,
             training_job_id=self._training_job_id,
             sampling_job_id=self._sampling_job_id,
             log_prob_job_id=self._log_prob_job_id,
-            comm_protocol="ray",
         )
 
     def get_server_state(self) -> ArcticRLRayServerState:
@@ -183,6 +187,28 @@ class ArcticRLRayClient:
         resp = ray.get(self._arctic_rl_ray_server_state.initialize.remote(job_config))
         return resp
 
+    def _cleanup_failed_initialization(self) -> None:
+        """Release state resources when construction fails after actor creation."""
+        server_pg = None
+        try:
+            server_pg = ray.get(self._arctic_rl_ray_server_state.get_server_placement_group.remote())
+        except BaseException:
+            logger.warning("Failed to read partial Ray server placement group", exc_info=True)
+        try:
+            ray.get(self._arctic_rl_ray_server_state.shutdown.remote())
+        except BaseException:
+            logger.warning("Failed to clean up partially initialized Ray server state", exc_info=True)
+        finally:
+            try:
+                ray.kill(self._arctic_rl_ray_server_state)
+            except Exception:
+                logger.warning("Failed to kill partially initialized Ray server state", exc_info=True)
+            if server_pg is not None:
+                try:
+                    remove_placement_group(server_pg)
+                except Exception:
+                    logger.warning("Failed to remove partial Ray server placement group", exc_info=True)
+
     async def _destroy_job(self, job_id: int, job_type: str) -> None:
         response = await self._arctic_rl_ray_server.destroy(job_id, job_type)
         print(f"[ArcticRLRayClient] destroy_job OUTPUT: {response.keys()=}")
@@ -221,16 +247,17 @@ class ArcticRLRayClient:
         Parameters
         ----------
         batch:
-            Dict with ``args`` and ``kwargs`` (model inputs). When using the
-            pluggable loss pattern, also include ``context`` (RL tensors) here
-            or let ``processing`` drive the dispatch.
+            AP ``{"batch", "meta", "processing"}``. Model inputs and batch-dim
+            RL tensors (``advantages``, ``loss_mask``, shifted log-probs, …)
+            live in ``batch`` so DP shards them. Scalars stay in ``meta``.
+            Cortex ``{"kwargs", "context"}`` is accepted and rewritten at unpack.
 
             **Log-prob convention (``_shifted`` suffix contract):**
-            All log-prob tensors in ``context`` must follow the roll(-1)
+            All log-prob tensors in ``batch`` must follow the roll(-1)
             convention — ``tensor[i]`` is the log-prob of *the next token*
             (``input_ids[i+1]``), matching how the server computes current
             log-probs (``labels = torch.roll(input_ids, shifts=-1)``).
-            The ``_shifted`` suffix in context key names encodes this:
+            The ``_shifted`` suffix encodes this:
 
             - ``old_log_probs_shifted`` — behavioral policy log-probs after roll
             - ``prox_logp_shifted``     — proximal log-probs after roll
@@ -404,7 +431,12 @@ class ArcticRLRayClient:
     # Weight sync
     # ------------------------------------------------------------------
 
-    async def sync_weights(self, cuda_ipc: bool | None = None, low_memory: bool | None = None) -> dict[str, Any]:
+    async def sync_weights(
+        self,
+        cuda_ipc: bool | None = None,
+        low_memory: bool | None = None,
+        strict_checksum: bool = True,
+    ) -> dict[str, Any]:
         """Sync training model weights to the sampling engine.
 
         In non-colocated mode, uses NCCL.  In colocated mode:
@@ -416,6 +448,11 @@ class ArcticRLRayClient:
         the whole model (avoids OOM on big models, at the cost of round-trips).
 
         ``cuda_ipc`` / ``low_memory`` default to the training job's config; pass a value to override this call.
+
+        ``checksum_match`` in the response says whether every sampler rank received the trainer's weights (see
+        ``ArcticRLRayServer.weight_sync``). ``strict_checksum`` (default ``True``) raises when it is ``False``: a
+        sampler with stale or corrupt weights must not keep training silently. Pass ``False`` to only get the dict
+        back (see ``checksum_error``) and decide for yourself.
         """
         request: dict[str, Any] = dict(
             source_sub_job_id=self.training_job_id,
@@ -427,13 +464,21 @@ class ArcticRLRayClient:
             request["low_memory"] = low_memory
         response = await self._arctic_rl_ray_server.weight_sync(self.training_job_id, request)
         pr0(f"[ArcticRLClient] sync_weights OUTPUT: {response.keys()=}")
+        if strict_checksum and response.get("checksum_match") is False:
+            raise RuntimeError(
+                "weight sync did not prove delivery: "
+                f"{response.get('checksum_error', 'no detail reported')} "
+                f"(sent={response.get('sent_l2_sq')!r} recv={response.get('recv_l2_sq')!r})"
+            )
         return response
 
     async def weight_norm(self) -> dict[str, Any]:
         """Global L2 weight norm of the training and sampling engines.
 
-        Returns ``{"training_norm", "sampling_norm", ...}``. After a weight sync the two norms must match (the metric
-        is invariant to each engine's parameter sharding/fusion). Intended for tests verifying sync correctness.
+        Returns ``{"training_norm", "sampling_norm", ...}``. A debug check: ``sync_weights``'s ``checksum_match`` is
+        what verifies a sync. A structural refusal or a mismatch disables the check on this client: the response then
+        contains ``error_code`` and ``error`` and no norm fields, and a later call returns that without recomputing.
+        A sleeping sampler or a raised worker error is reported the same way and the next call tries again.
         """
         response = await self._arctic_rl_ray_server.weight_norm(self.training_job_id, self.sampling_job_id)
         pr0(f"[ArcticRLClient] weight_norm OUTPUT: {response=}")
@@ -466,15 +511,27 @@ class ArcticRLRayClient:
     # ------------------------------------------------------------------
 
     async def shutdown(self) -> None:
-        """Destroy all jobs and stop the local server if applicable."""
-        for job_type, job_id in [
-            ("training", self._training_job_id),
-            ("sampling", self._sampling_job_id),
-            ("log_prob", self._log_prob_job_id),
-        ]:
-            if job_id is not None:
-                await self._destroy_job(job_id, job_type)
+        """Destroy this client's jobs. Only the owner releases the state actor.
 
-        self._training_job_id = None
-        self._sampling_job_id = None
-        self._log_prob_job_id = None
+        A reconnected client (``config.training_job_id`` set) attaches to a state
+        actor another process created. ``destroy`` on that client still tears down
+        the jobs, but killing the actor or removing its scheduler placement group
+        would take the owner's server down mid-run.
+        """
+        try:
+            for job_type, job_id in [
+                ("training", self._training_job_id),
+                ("sampling", self._sampling_job_id),
+                ("log_prob", self._log_prob_job_id),
+            ]:
+                if job_id is not None:
+                    await self._destroy_job(job_id, job_type)
+        finally:
+            try:
+                if self._owns_server_state:
+                    await self._arctic_rl_ray_server.shutdown()
+            finally:
+                self._owns_server_state = False
+                self._training_job_id = None
+                self._sampling_job_id = None
+                self._log_prob_job_id = None

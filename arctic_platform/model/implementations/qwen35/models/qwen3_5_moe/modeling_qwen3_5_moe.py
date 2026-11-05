@@ -1,30 +1,45 @@
 import functools
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional
+from typing import Union
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor, nn
+from torch import Tensor
+from torch import nn
 from transformers.cache_utils import Cache
 from transformers.configuration_utils import PretrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import MoeModelOutputWithPast
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, logging
+from transformers.utils import TransformersKwargs
+from transformers.utils import logging
+
+from arctic_platform.model.implementations.debug.determinism import resolve_flash_attention_determinism
+from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
+from arctic_platform.model.implementations.fp8 import make_linear
+from arctic_platform.model.implementations.gpu.action_masks import slice_action_masks_for_logits_to_keep
+from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
+from arctic_platform.model.implementations.gpu.lm_head import slice_temperature_for_logits_to_keep
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import head_parallel_gated_delta_net
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import repeat_query_key_for_value_heads
+from arctic_platform.model.implementations.gpu.vllm_rounding import FusedAddRMSNorm as _FusedAddRMSNorm
+from arctic_platform.model.implementations.gpu.vllm_rounding import rope_rotary_slice_fp32 as _rope_rotary_slice_fp32
+from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
+from arctic_platform.model.implementations.moe.layers.moe import FeedForward
+from arctic_platform.model.implementations.moe.layers.moe import MoE
+from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 
 from ..base import PreTrainedModelPrimeRL
-from ..layers.lm_head import PrimeLmOutput
-from ..layers.moe import FeedForward, MoE, MoEArgs
-from ..layers.rotary_emb import RotaryEmbedding, RotaryEmbeddingConfig, apply_rotary_pos_emb
-
+from ..layers.rotary_emb import RotaryEmbedding
+from ..layers.rotary_emb import RotaryEmbeddingConfig
+from ..layers.rotary_emb import apply_rotary_pos_emb
 from .configuration_qwen3_5_moe import Qwen3_5MoeConfig
-from .converting_qwen3_5_moe import (
-    convert_hf_layer_to_tt,
-    convert_hf_to_tt_moe,
-    convert_tt_layer_to_hf,
-    convert_tt_to_hf_moe,
-)
+from .converting_qwen3_5_moe import convert_hf_layer_to_tt
+from .converting_qwen3_5_moe import convert_hf_to_tt_moe
+from .converting_qwen3_5_moe import convert_tt_layer_to_hf
+from .converting_qwen3_5_moe import convert_tt_to_hf_moe
 
 # Optional VLM vision encoder. Text-only loading must work even when the
 # composite VLM vision class is not present in the installed transformers.
@@ -54,13 +69,10 @@ except ImportError:
 
 try:
     from fla.modules import FusedRMSNormGated
-    from fla.ops.cp import FLACPContext, build_cp_context
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 except ImportError:
     chunk_gated_delta_rule = None  # type: ignore
     FusedRMSNormGated = None  # type: ignore
-    FLACPContext = None  # type: ignore
-    build_cp_context = None  # type: ignore
 
 logger = logging.get_logger(__name__)
 
@@ -71,7 +83,12 @@ logger = logging.get_logger(__name__)
 
 
 class Qwen3_5MoeRMSNorm(nn.Module):
-    """RMSNorm with (1+weight) parameterization. Weight initialized to zeros."""
+    """RMSNorm with (1+weight) parameterization. Weight initialized to zeros.
+
+    Called with one tensor, it normalizes that tensor and returns the result. Called with ``residual``, it adds
+    the residual in fp32, normalizes the fp32 sum (see :class:`_FusedAddRMSNorm`) and returns
+    ``(normalized, residual_out)``, where ``residual_out`` is the sum in the input dtype.
+    """
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -81,10 +98,16 @@ class Qwen3_5MoeRMSNorm(nn.Module):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward(self, x):
-        output = self._norm(x.float())
-        output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            output = self._norm(x.float())
+            output = output * (1.0 + self.weight.float())
+            return output.type_as(x)
+        return _FusedAddRMSNorm.apply(x, residual, self.weight, self.eps)
 
 
 class Qwen3_5MoeRMSNormGated(nn.Module):
@@ -232,31 +255,22 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         else:
             self.norm = Qwen3_5MoeRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
 
-        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+        # Block-FP8 checkpoints quantize these three projections; in_proj_a/b stay BF16.
+        fp8_block_size = getattr(config, "fp8_block_size", None)
+        self.out_proj = make_linear(self.value_dim, self.hidden_size, fp8_block_size=fp8_block_size)
 
         # Input projections
-        self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
-        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+        self.in_proj_qkv = make_linear(
+            self.hidden_size, self.key_dim * 2 + self.value_dim, fp8_block_size=fp8_block_size
+        )
+        self.in_proj_z = make_linear(self.hidden_size, self.value_dim, fp8_block_size=fp8_block_size)
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.fp32_parity = config.fp32_parity
 
         # Select best available kernel
         self._causal_conv1d_fn = causal_conv1d_fn
         self._chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
-
-    def _build_cp_context(self, local_seq_len: int, device: torch.device) -> "FLACPContext | None":
-        """Build fla CP context from the local (sharded) sequence length."""
-        cp_group = getattr(self, "cp_group", None)
-        if cp_group is None or build_cp_context is None:
-            return None
-        # Reconstruct global cu_seqlens: single contiguous sequence across all CP ranks
-        global_seq_len = local_seq_len * self.cp_world_size
-        global_cu_seqlens = torch.tensor([0, global_seq_len], dtype=torch.int32, device=device)
-        return build_cp_context(
-            cu_seqlens=global_cu_seqlens,
-            group=cp_group,
-            conv1d_kernel_size=self.conv_kernel_size,
-        )
 
     def forward(
         self,
@@ -265,69 +279,84 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+        mixed_qkv = self.in_proj_qkv(hidden_states)
         z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
+        query, key, value = torch.split(
+            mixed_qkv,
+            [self.key_dim, self.key_dim, self.value_dim],
+            dim=-1,
+        )
+        query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
-        # Causal conv1d — must reset at sequence boundaries for packed batches,
-        # otherwise the kernel-1 left pad leaks state across sequences.
-        if self._causal_conv1d_fn is not None:
-            seq_idx = None
-            if cu_seqlens is not None:
-                seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-                seq_idx = torch.repeat_interleave(
-                    torch.arange(seg_lens.numel(), dtype=torch.int32, device=hidden_states.device),
-                    seg_lens,
-                ).unsqueeze(0)
-            mixed_qkv = self._causal_conv1d_fn(
-                x=mixed_qkv,
-                weight=self.conv1d.weight.squeeze(1),
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                seq_idx=seq_idx,
-            )
-        elif cu_seqlens is not None:
-            cu = cu_seqlens.tolist()
-            conv_outs = []
-            for i in range(len(cu) - 1):
-                s, e = cu[i], cu[i + 1]
-                if s == e:
-                    continue
-                conv_outs.append(self.conv1d(mixed_qkv[:, :, s:e])[:, :, : e - s])
-            mixed_qkv = F.silu(torch.cat(conv_outs, dim=-1))
-        else:
-            mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
-
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-        query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-        # Use fla's native CP when available, otherwise fall back to PyTorch kernel
-        cp_context = self._build_cp_context(seq_len, hidden_states.device)
-        if cp_context is not None:
-            cu_seqlens = cp_context.cu_seqlens
-            core_attn_out, _ = self._chunk_gated_delta_rule(
+        if getattr(self, "cp_group", None) is not None:
+            global_cu_seqlens = getattr(self, "_dss_sp_global_cu_seqlens", None)
+            if not torch.is_tensor(global_cu_seqlens):
+                raise RuntimeError("head-parallel GatedDeltaNet requires global packed cu_seqlens")
+            core_attn_out, _ = head_parallel_gated_delta_net(
+                self._causal_conv1d_fn,
+                self._chunk_gated_delta_rule,
                 query,
                 key,
                 value,
-                g=g,
-                beta=beta,
+                b,
+                a,
+                convolution_weight=self.conv1d.weight.squeeze(1),
+                convolution_bias=self.conv1d.bias,
+                convolution_activation=self.activation,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                process_group=self.cp_group,
+                global_cu_seqlens=global_cu_seqlens,
+                num_key_heads=self.num_k_heads,
+                num_value_heads=self.num_v_heads,
+                fp32_beta=self.fp32_parity,
+                initial_state=None,
+                output_final_state=False,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
-                cp_context=cp_context,
             )
         else:
+            mixed_qkv = mixed_qkv.transpose(1, 2)
+            if self._causal_conv1d_fn is not None:
+                seq_idx = None
+                if cu_seqlens is not None:
+                    seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+                    seq_idx = torch.repeat_interleave(
+                        torch.arange(seg_lens.numel(), dtype=torch.int32, device=hidden_states.device),
+                        seg_lens,
+                    ).unsqueeze(0)
+                mixed_qkv = self._causal_conv1d_fn(
+                    x=mixed_qkv,
+                    weight=self.conv1d.weight.squeeze(1),
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    seq_idx=seq_idx,
+                )
+            elif cu_seqlens is not None:
+                cu = cu_seqlens.tolist()
+                conv_outs = []
+                for start, stop in zip(cu[:-1], cu[1:], strict=True):
+                    if start == stop:
+                        continue
+                    conv_outs.append(self.conv1d(mixed_qkv[:, :, start:stop])[:, :, : stop - start])
+                mixed_qkv = F.silu(torch.cat(conv_outs, dim=-1))
+            else:
+                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+            mixed_qkv = mixed_qkv.transpose(1, 2)
+            query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+            query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+            key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+            value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+            # vLLM evaluates the beta gate as a sigmoid of fp32 ``b`` and keeps it in fp32; a sigmoid of
+            # low-precision ``b`` would round the gate before the kernel reads it.
+            beta = b.float().sigmoid() if self.fp32_parity else b.sigmoid()
+            g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+            query, key = repeat_query_key_for_value_heads(
+                query, key, self.num_k_heads, self.num_v_heads, self._chunk_gated_delta_rule
+            )
             core_attn_out, _ = self._chunk_gated_delta_rule(
                 query,
                 key,
@@ -363,6 +392,8 @@ class Qwen3_5MoeGatedAttentionConfig:
     rms_norm_eps: float
     attention_bias: bool = False
     attention_dropout: float = 0.0
+    fp32_parity: bool = True
+    fp8_block_size: int | None = None
 
 
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -383,21 +414,27 @@ class Qwen3_5MoeGatedAttentionBase(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
+        self.fp32_parity = config.fp32_parity
         self.attention_dropout = config.attention_dropout
 
         # Q projects 2x: query + gate
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim * 2, bias=config.attention_bias)
-        self.k_proj = nn.Linear(
-            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+        linear = functools.partial(make_linear, bias=config.attention_bias, fp8_block_size=config.fp8_block_size)
+        self.q_proj = linear(config.hidden_size, self.num_heads * self.head_dim * 2)
+        self.k_proj = linear(config.hidden_size, self.num_key_value_heads * self.head_dim)
+        self.v_proj = linear(config.hidden_size, self.num_key_value_heads * self.head_dim)
+        self.o_proj = linear(self.num_heads * self.head_dim, config.hidden_size)
 
         # QK normalization with (1+weight) parameterization
         self.q_norm = Qwen3_5MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3_5MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+    def _rotate(
+        self, query_states: torch.Tensor, key_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply the partial rotary embedding to ``[batch, heads, seq, head_dim]`` queries and keys."""
+        if self.fp32_parity:
+            return _rope_rotary_slice_fp32(query_states, cos, sin), _rope_rotary_slice_fp32(key_states, cos, sin)
+        return apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
     def output_proj(
         self,
@@ -433,7 +470,7 @@ class Qwen3_5MoeGatedSDPAAttention(Qwen3_5MoeGatedAttentionBase):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = self._rotate(query_states, key_states, cos, sin)
 
         return query_states, key_states, value_states, gate
 
@@ -480,18 +517,34 @@ class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
         if self.func is None:
             raise ImportError(
                 f"flash-attn v{flash_attn_version} varlen entry point is not importable; "
-                f"install the matching flash-attn package (v3 -> flash_attn_interface, "
-                f"v4 -> flash_attn.cute)."
+                "install the matching flash-attn package (v3 -> flash_attn_interface, "
+                "v4 -> flash_attn.cute)."
             )
         self._flash_attn_call = self.func
+        # This model calls the varlen entry point directly rather than through the attention integration that
+        # consumes FLASH_ATTENTION_DETERMINISTIC, so a determinism request has no reader on this path unless it is
+        # read here. Resolving it at construction means a request the installed kernel cannot honour at this head
+        # dimension refuses before any training runs.
+        self._deterministic = resolve_flash_attention_determinism(
+            self.func, config.head_dim, f"flash_attention_{flash_attn_version}"
+        )
 
     def _compute_attention(self, q, k, v, cu_seqlens, max_seqlen):
         # Keyword args work for all FA versions; positional differs (FA4 inserts `qv` at arg 4).
+        # `deterministic` is passed only when it was asked for, so a job that did not ask calls the entry point
+        # with the arguments it always did, and a build whose signature lacks the keyword is reached only by a
+        # request that has already been checked against it.
+        deterministic = {"deterministic": True} if self._deterministic else {}
         out = self._flash_attn_call(
-            q, k, v,
-            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
             causal=True,
+            **deterministic,
         )
         if isinstance(out, tuple):
             out = out[0]
@@ -527,7 +580,7 @@ class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = self._rotate(query_states, key_states, cos, sin)
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
 
@@ -574,6 +627,8 @@ def _get_gated_attention(config: Qwen3_5MoeConfig) -> nn.Module:
         rms_norm_eps=config.rms_norm_eps,
         attention_bias=config.attention_bias,
         attention_dropout=config.attention_dropout,
+        fp32_parity=config.fp32_parity,
+        fp8_block_size=getattr(config, "fp8_block_size", None),
     )
 
     attn_impl = config._attn_implementation
@@ -588,6 +643,24 @@ def _get_gated_attention(config: Qwen3_5MoeConfig) -> nn.Module:
         )
 
     return QWEN35MOE_ATTN_IMPL2CLASS[attn_impl](attn_config)
+
+
+def _shared_expert_gate(
+    hidden_states: torch.Tensor,
+    gate: nn.Linear,
+) -> torch.Tensor:
+    """Compute the scalar shared-expert gate without BF16 GEMM-shape rounding.
+
+    Sequence parallelism changes the token dimension of this ``D -> 1``
+    projection. cuBLAS can select a different BF16 kernel for the sharded
+    matrix, and a one-ULP gate change is amplified by later residual layers.
+    Keeping the reduction and sigmoid in FP32 makes the token-local result
+    stable without gathering sequence shards.
+    """
+    bias = gate.bias.float() if gate.bias is not None else None
+    with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+        logits = F.linear(hidden_states.float(), gate.weight.float(), bias)
+        return torch.sigmoid(logits).to(dtype=hidden_states.dtype)
 
 
 class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
@@ -613,29 +686,73 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
             top_k=config.num_experts_per_tok,
             use_grouped_mm=config.use_grouped_mm,
             load_balance_coeff=config.load_balance_coeff,
+            fp8_block_size=getattr(config, "fp8_block_size", None),
         )
         self.mlp = MoE(moe_args, dim=config.hidden_size, hidden_dim=config.moe_intermediate_size)
 
         # Separate gated shared expert
-        self.shared_expert = FeedForward(dim=config.hidden_size, hidden_dim=config.shared_expert_intermediate_size)
+        self.shared_expert = FeedForward(
+            dim=config.hidden_size,
+            hidden_dim=config.shared_expert_intermediate_size,
+            fp8_block_size=getattr(config, "fp8_block_size", None),
+        )
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
 
         # Layer norms with (1+weight) parameterization
         self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fp32_parity = config.fp32_parity
 
     def forward(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         cu_seqlens: torch.LongTensor | None = None,
         max_seqlen: int | None = None,
         routed_experts: Optional[torch.LongTensor] = None,
-    ) -> torch.FloatTensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return ``(branch_output, residual)``.
 
-        # Token mixer
+        With ``fp32_parity`` each residual add is deferred into the next norm, which performs it in fp32 (see
+        :class:`_FusedAddRMSNorm`). ``hidden_states`` is the previous layer's MLP output, or the embeddings for
+        the first layer, which receives ``residual=None`` because there is nothing to add yet. The returned
+        ``branch_output`` is this layer's MLP output, not yet added to the returned ``residual``; the next
+        layer's input norm, or the model's final norm, adds them.
+
+        Without ``fp32_parity`` the layer adds its residuals itself, in the input dtype, and returns
+        ``(hidden_states, None)``, so the next norm takes its single-tensor path and a checkpointed layer
+        boundary holds one tensor.
+        """
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        hidden_states = self._token_mixer(hidden_states, position_embeddings, cu_seqlens, max_seqlen)
+
+        # MLP: routed experts + gated shared expert
+        if self.fp32_parity:
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+
+        routed_output, shared_output = self._experts(hidden_states, routed_experts)
+        if self.fp32_parity:
+            return routed_output + shared_output, residual
+        hidden_states = residual + routed_output + shared_output
+        return hidden_states, None
+
+    def _token_mixer(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+        cu_seqlens: torch.LongTensor | None,
+        max_seqlen: int | None,
+    ) -> torch.Tensor:
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(hidden_states, cu_seqlens=cu_seqlens)
         elif self.layer_type == "full_attention":
@@ -645,25 +762,19 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )
+        return hidden_states
 
-        hidden_states = residual + hidden_states
-
-        # MLP: routed experts + gated shared expert
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-
-        # Routed experts
+    def _experts(
+        self, hidden_states: torch.Tensor, routed_experts: Optional[torch.LongTensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the routed experts' output and the gated shared expert's output."""
         routed_output = self.mlp(hidden_states, routed_experts=routed_experts)
 
-        # Gated shared expert
         bs, slen, dim = hidden_states.shape
         hidden_flat = hidden_states.view(-1, dim)
         shared_output = self.shared_expert(hidden_flat)
-        shared_output = F.sigmoid(self.shared_expert_gate(hidden_flat)) * shared_output
-        shared_output = shared_output.view(bs, slen, dim)
-
-        hidden_states = residual + routed_output + shared_output
-        return hidden_states
+        shared_output = _shared_expert_gate(hidden_flat, self.shared_expert_gate) * shared_output
+        return routed_output, shared_output.view(bs, slen, dim)
 
 
 # ---------------------------------------------------------------------------
@@ -772,14 +883,10 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             is_segment_start[0] = True
             start_indices = torch.nonzero(is_segment_start, as_tuple=False).flatten()
             total_length = flat_position_ids.shape[0]
-            boundaries = torch.cat(
-                [start_indices, start_indices.new_tensor([total_length])]
-            )
+            boundaries = torch.cat([start_indices, start_indices.new_tensor([total_length])])
             segment_lengths = (boundaries[1:] - boundaries[:-1]).to(torch.int32)
             max_seqlen = int(segment_lengths.max().item())
-            cu_seqlens = torch.cat(
-                [segment_lengths.new_zeros(1), segment_lengths.cumsum(dim=0, dtype=torch.int32)]
-            )
+            cu_seqlens = torch.cat([segment_lengths.new_zeros(1), segment_lengths.cumsum(dim=0, dtype=torch.int32)])
             torch._dynamo.mark_dynamic(cu_seqlens, 0)
         else:
             max_seqlen = None
@@ -788,17 +895,24 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        # With fp32_parity the residual is threaded between layers so that every residual add, including the last
+        # one, happens in fp32 inside a norm. Without it every layer returns a residual of None.
+        residual = None
         for layer_idx, decoder_layer in enumerate(self.layers):
             routed_experts_layer = routed_experts[:, :, layer_idx, :] if routed_experts is not None else None
-            hidden_states = decoder_layer(
+            hidden_states, residual = decoder_layer(
                 hidden_states,
+                residual,
                 position_embeddings=position_embeddings,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 routed_experts=routed_experts_layer,
             )
 
-        hidden_states = self.norm(hidden_states)
+        if residual is None:
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
         return MoeModelOutputWithPast(last_hidden_state=hidden_states)
 
 
@@ -911,6 +1025,12 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
     def __init__(self, config, **kwargs):
         super().__init__(config, **kwargs)
         self._is_vlm = hasattr(config, "vision_config")
+        # Fine-grained FP8 checkpoints keep their e4m3 weights and FP32 block scales: the text layers read
+        # ``fp8_block_size`` and build block-FP8 projections and experts for the modules the checkpoint quantizes.
+        fp8_block_size = fp8_weight_block_size(config)
+        if getattr(config, "quantization_config", None) and fp8_block_size is None:
+            raise NotImplementedError("Qwen3.5-MoE training only supports BF16 or fine-grained FP8 checkpoints")
+        (config.text_config if self._is_vlm else config).fp8_block_size = fp8_block_size
 
         if self._is_vlm:
             self.model = Qwen3_5MoeVLMModel(config)
@@ -1012,7 +1132,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        temperature: Union[torch.Tensor, None] = None,
+        temperature: Union[float, torch.Tensor, None] = None,
         action_masks: Optional[object] = None,
         routed_experts: Optional[torch.LongTensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
@@ -1046,11 +1166,22 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             )
 
         hidden_states = outputs.last_hidden_state
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        # Action-mask positions index the full sequence, so they have to move into the kept columns' space
+        # before the hidden states, labels and temperatures are narrowed to it.
+        action_masks = slice_action_masks_for_logits_to_keep(
+            action_masks,
+            batch_size=int(hidden_states.shape[0]),
+            original_seq_len=int(hidden_states.shape[1]),
+            logits_to_keep=logits_to_keep,
+        )
+        if isinstance(logits_to_keep, int):
+            slice_indices = slice(-logits_to_keep, None) if logits_to_keep > 0 else slice(None)
+        else:
+            slice_indices = logits_to_keep
         return self.lm_head(
             hidden_states[:, slice_indices, :],
-            labels[:, slice_indices] if labels is not None else None,
-            temperature=temperature,
+            inherit_lm_head_target_validation(labels, labels[:, slice_indices]) if labels is not None else None,
+            temperature=slice_temperature_for_logits_to_keep(temperature, slice_indices),
             action_masks=action_masks,
         )
 

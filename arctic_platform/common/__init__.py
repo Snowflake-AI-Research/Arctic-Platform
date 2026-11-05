@@ -17,16 +17,12 @@
 
 Protocol-specific code lives under ``arctic_platform.rl`` (GRPO/RL); a
 forthcoming SFT package will share this stack. This package holds the DeepSpeed
-worker, HTTP/Ray servers, Ray cluster helpers, and low-level utils.
+worker, Ray server, Ray cluster helpers, and low-level utils.
 """
 
 from __future__ import annotations
 
 from typing import Any
-
-from arctic_platform._dependency_groups import require_any_dep_group
-
-require_any_dep_group("sft", "rl")
 
 __all__ = [
     "DeepSpeedWorker",
@@ -44,12 +40,19 @@ _LAZY = {
 }
 
 
+def _require_training_extras() -> None:
+    from arctic_platform._dependency_groups import require_any_dep_group
+
+    require_any_dep_group("sft", "rl")
+
+
 def __getattr__(name: str) -> Any:
     target = _LAZY.get(name)
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     import importlib
 
+    _require_training_extras()
     module = importlib.import_module(target[0])
     return getattr(module, target[1])
 

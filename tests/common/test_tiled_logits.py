@@ -53,7 +53,7 @@ class TestLogitsChunkRows(TestCasePlus):
 
 
 class TestLmHeadTemperatureLayout(TestCasePlus):
-    """#1: ``temperature != 1`` must not change logits rank."""
+    """``temperature != 1`` must not change logits rank."""
 
     def _model(self, hidden_size, vocab_size, device="cpu"):
         return make_tied_lm_head_model(hidden_size, vocab_size, device=device)
@@ -105,6 +105,7 @@ class TestLmHeadTemperatureLayout(TestCasePlus):
             False,
             n,
             [model.lm_head.weight],
+            True,
         )
         self.assertEqual(tuple(logprobs.shape), tuple(labels.shape))
 
@@ -142,6 +143,7 @@ class TestPerTokenLogprobParityGPU(TestCasePlus):
             False,
             num_shards,
             [model.lm_head.weight],
+            True,
         )
 
         # Same fp32 CE math across modes → float noise only (rtol=0). Widening

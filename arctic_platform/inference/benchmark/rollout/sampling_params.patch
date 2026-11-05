@@ -1,0 +1,31 @@
+--- /tmp/rebase_rollout/orig/sampling_params.py	2026-05-29 02:14:16.691095091 +0000
++++ /tmp/rebase_rollout/new/sampling_params.py	2026-05-29 02:14:40.701059559 +0000
+@@ -174,6 +174,12 @@
+         are generated and streamed cumulatively per request. To see all `n`
+         outputs upon completion, use `output_kind=RequestOutputKind.FINAL_ONLY`
+         in `SamplingParams`."""
++    max_tokens_n: list[int] | None = None
++    """Per-child override of `max_tokens` when `n > 1`. If set, must be a
++    list of length `n`; child sample `i` will use `max_tokens=max_tokens_n[i]`
++    instead of the request-level `max_tokens`. Used by rollout-replay
++    benchmarks to force each generation to emit a specific number of
++    tokens. Has no effect when `n == 1`."""
+     presence_penalty: float = 0.0
+     """Penalizes new tokens based on whether they appear in the generated text
+     so far. Values > 0 encourage the model to use new tokens, while values < 0
+@@ -293,6 +299,7 @@
+     @staticmethod
+     def from_optional(
+         n: int | None = 1,
++        max_tokens_n: list[int] | None = None,
+         presence_penalty: float | None = 0.0,
+         frequency_penalty: float | None = 0.0,
+         repetition_penalty: float | None = 1.0,
+@@ -331,6 +338,7 @@
+ 
+         return SamplingParams(
+             n=1 if n is None else n,
++            max_tokens_n=max_tokens_n,
+             presence_penalty=0.0 if presence_penalty is None else presence_penalty,
+             frequency_penalty=0.0 if frequency_penalty is None else frequency_penalty,
+             repetition_penalty=1.0

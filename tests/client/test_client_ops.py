@@ -12,11 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The op surface of ArcticRLClient / SyncArcticRLClient must lower to one
-canonical Request each.
+"""The op surface of the unified client must lower to one canonical Request each.
 
 A FakeTransport records the Request every op produces so we can assert the
-mapping (target job, body, binary flag) with no live backend or GPUs.
+mapping (target job, body, binary flag) with no live backend or GPUs. The shared
+ops are driven across all three frontends (async RL, sync RL, SFT) so a subclass
+cannot silently diverge from the base; op-registry coverage and log_probs stay on
+the RL clients, and SFT's loss-fn defaulting is asserted in tests/sft.
 """
 
 from __future__ import annotations
@@ -25,37 +27,40 @@ import asyncio
 import inspect
 
 import pytest
+from pydantic import ValidationError
 
 from arctic_platform.client import OPS
+from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import ArcticRLClient
-from arctic_platform.client import ArcticRLClientConfig
+from arctic_platform.client import ArcticSFTClient
+from arctic_platform.client import AsyncArcticRLClient
 from arctic_platform.client import JobHandles
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import Request
-from arctic_platform.client import SyncArcticRLClient
 from arctic_platform.client import Transport
-from arctic_platform.client import client as client_module
-from arctic_platform.client import create_arctic_rl_client
+from arctic_platform.client import base as base_module
+from arctic_platform.client import requests as cluster_requests
 from arctic_platform.client import unresolved_ops
+from arctic_platform.client.transport import CLUSTER_OPS
 from arctic_platform.client.transport import method_name
 
 TRAINING, SAMPLING, LOG_PROB = 1, 2, 3
 
 
 class FakeTransport(Transport):
-    def __init__(self, config: ArcticRLClientConfig, server_state=None) -> None:
+    def __init__(self, config: ArcticClientConfig, server_state=None) -> None:
         self.config = config
         self.server_state = server_state
         self.jobs = JobHandles()
         self.calls: list[Request] = []
 
-    def initialize(self) -> JobHandles:
+    def initialize(self, client_config: ArcticClientConfig) -> JobHandles:
         self.jobs = JobHandles(training=TRAINING, sampling=SAMPLING, log_prob=LOG_PROB)
         return self.jobs
 
     def call(self, request: Request) -> dict:
         self.calls.append(request)
-        return {"results": ["ok"], "loss": 0.0}
+        return {"results": ["ok"], "loss": 0.0, "request_id": "req", "state": "running", "events": [{}]}
 
     async def acall(self, request: Request) -> dict:
         return self.call(request)
@@ -72,14 +77,38 @@ def _call(client, method: str, *args, **kwargs):
     return result
 
 
-@pytest.fixture(params=[ArcticRLClient, SyncArcticRLClient], ids=["async", "sync"])
-def client(monkeypatch, request) -> ArcticRLClient | SyncArcticRLClient:
-    monkeypatch.setattr(client_module, "make_transport", FakeTransport)
-    cfg = ArcticRLClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1)
-    return request.param(cfg)
+def _stop_stream_after_one_event(stream) -> None:
+    """Read one event from a sync or async stream, then close it early."""
+    if not inspect.isasyncgen(stream):
+        next(stream)
+        stream.close()
+        return
+
+    async def drive():
+        await anext(stream)
+        await stream.aclose()
+
+    asyncio.run(drive())
 
 
-def _last(client: ArcticRLClient | SyncArcticRLClient) -> Request:
+def _build(monkeypatch, cls):
+    monkeypatch.setattr(base_module, "make_transport", FakeTransport)
+    return cls(ArcticClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1))
+
+
+@pytest.fixture(params=[AsyncArcticRLClient, ArcticRLClient, ArcticSFTClient], ids=["async", "sync", "sft"])
+def client(monkeypatch, request):
+    """Every frontend, for the ops they all share."""
+    return _build(monkeypatch, request.param)
+
+
+@pytest.fixture(params=[AsyncArcticRLClient, ArcticRLClient], ids=["async", "sync"])
+def rl_client(monkeypatch, request) -> AsyncArcticRLClient | ArcticRLClient:
+    """RL-only surface (log_probs) and full op-registry coverage."""
+    return _build(monkeypatch, request.param)
+
+
+def _last(client) -> Request:
     return client.transport.calls[-1]
 
 
@@ -108,10 +137,10 @@ class TestOpMapping:
         assert req.job_id == TRAINING
         assert req.binary is True
 
-    def test_fwd_no_grad_reference_targets_log_prob(self, client):
+    def test_fwd_no_grad_reference_targets_log_prob(self, rl_client):
         """fwd_no_grad(reference_model=True) -> log_prob job (reference log-probs)."""
-        _call(client, "fwd_no_grad", {"input_ids": [1]}, reference_model=True)
-        req = _last(client)
+        _call(rl_client, "fwd_no_grad", {"input_ids": [1]}, reference_model=True)
+        req = _last(rl_client)
         assert req.op == "forward"
         assert req.job_id == LOG_PROB
         assert req.binary is True
@@ -139,7 +168,7 @@ class TestOpMapping:
         req = _last(client)
         assert req.op == "load-checkpoint"
         assert req.job_id == TRAINING
-        assert req.body == {"path": "/tmp/x", "step": 2}
+        assert req.body == {"path": "/tmp/x", "step": 2, "checkpoint_id": None, "source_job_id": None}
 
     def test_generate_targets_sampling_and_unwraps_results(self, client):
         """generate -> sampling job; returns the 'results' list."""
@@ -150,13 +179,17 @@ class TestOpMapping:
         assert req.body == {"prompts": ["hi"], "sampling_params": {"n": 1}, "routing_key": "k", "strict": True}
         assert out == ["ok"]
 
-    def test_log_probs_targets_log_prob(self, client):
-        """log_probs -> log_prob job."""
-        _call(client, "log_probs", ["hi"], completions=["there"], top_k=3)
-        req = _last(client)
+    def test_log_probs_targets_log_prob(self, rl_client):
+        """log_probs -> log_prob job. RL-only: SFT never allocates a log-prob engine."""
+        _call(rl_client, "log_probs", ["hi"], completions=["there"], top_k=3)
+        req = _last(rl_client)
         assert req.op == "log-probs"
         assert req.job_id == LOG_PROB
         assert req.body == {"prompts": ["hi"], "completions": ["there"], "top_k": 3}
+
+    def test_sft_client_has_no_log_probs(self, monkeypatch):
+        """log_probs stays on the RL subclass, not the shared base."""
+        assert not hasattr(_build(monkeypatch, ArcticSFTClient), "log_probs")
 
     def test_reset_prefix_cache_targets_sampling(self, client):
         """reset_prefix_cache -> sampling job via the operation envelope."""
@@ -210,6 +243,50 @@ class TestOpMapping:
         assert _last(client).op == "wake-training"
 
 
+class TestSyncWeightsChecksum:
+    """``sync_weights``'s ``checksum_match`` must be acted on, not only logged (see ``ArcticRLRayServer.weight_sync``)."""
+
+    class _MismatchTransport(FakeTransport):
+        """A transport whose weight-sync op reports a failed checksum; every other op is a plain no-op."""
+
+        def call(self, request: Request) -> dict:
+            self.calls.append(request)
+            if request.op == "operation" and request.body.get("operation_type") == "weight-sync":
+                return {
+                    "sent_l2_sq": 32.5,
+                    "recv_l2_sq": {"sampling replica 0 rank 0": 27.5},
+                    "checksum_rtol": 1e-9,
+                    "checksum_match": False,
+                    "checksum_error": "received {'sampling replica 0 rank 0': 27.5}, sent 32.5",
+                }
+            return {"results": ["ok"], "loss": 0.0, "request_id": "req", "state": "running", "events": [{}]}
+
+        async def acall(self, request: Request) -> dict:
+            return self.call(request)
+
+    def _build_mismatch(self, monkeypatch, cls):
+        monkeypatch.setattr(base_module, "make_transport", self._MismatchTransport)
+        return cls(ArcticClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1))
+
+    @pytest.mark.parametrize("cls", [AsyncArcticRLClient, ArcticRLClient], ids=["async", "sync"])
+    def test_sync_weights_raises_on_checksum_mismatch(self, monkeypatch, cls):
+        client = self._build_mismatch(monkeypatch, cls)
+        with pytest.raises(RuntimeError, match="did not prove delivery"):
+            _call(client, "sync_weights")
+
+    @pytest.mark.parametrize("cls", [AsyncArcticRLClient, ArcticRLClient], ids=["async", "sync"])
+    def test_sync_weights_strict_checksum_false_returns_the_dict_instead(self, monkeypatch, cls):
+        client = self._build_mismatch(monkeypatch, cls)
+        out = _call(client, "sync_weights", strict_checksum=False)
+        assert out["checksum_match"] is False
+        assert out["checksum_error"]
+
+    def test_sync_weights_missing_checksum_does_not_raise(self, client):
+        """A transport that never computed a checksum (the default ``FakeTransport``) is not a reported failure."""
+        out = _call(client, "sync_weights")
+        assert "checksum_match" not in out
+
+
 class TestLifecycle:
     def test_reconnect_config_copies_job_ids(self, client):
         """reconnect_config bakes the live job ids into a fresh config."""
@@ -222,6 +299,12 @@ class TestLifecycle:
         """JobHandles.require guards against calling an op before its job exists."""
         with pytest.raises(ValueError, match="No training job"):
             JobHandles().require("training")
+
+    def test_require_any_returns_the_first_live_job(self):
+        """require_any picks any initialized job and fails when none exists."""
+        assert JobHandles(sampling=SAMPLING, log_prob=LOG_PROB).require_any() == SAMPLING
+        with pytest.raises(ValueError, match="No job initialized"):
+            JobHandles().require_any()
 
 
 class TestServerState:
@@ -241,13 +324,13 @@ class TestServerState:
             def get_server_state(self):
                 return sentinel
 
-        monkeypatch.setattr(client_module, "make_transport", StatefulTransport)
-        cfg = ArcticRLClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1)
-        assert ArcticRLClient(cfg).get_server_state() is sentinel
+        monkeypatch.setattr(base_module, "make_transport", StatefulTransport)
+        cfg = ArcticClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1)
+        assert AsyncArcticRLClient(cfg).get_server_state() is sentinel
 
     def test_create_client_forwards_server_state_for_reconnect(self, monkeypatch):
-        """create_arctic_rl_client(cfg, server_state=...) reattaches via the Ray transport."""
-        import arctic_platform.client.transports.onprem_ray as ray_mod
+        """AsyncArcticRLClient(cfg, server_state=...) reattaches via the on-prem transport."""
+        import arctic_platform.client.transports.onprem as onprem_mod
 
         sentinel = object()
 
@@ -257,16 +340,15 @@ class TestServerState:
                 self.server_state = server_state
                 self.jobs = JobHandles(training=TRAINING, sampling=SAMPLING, log_prob=LOG_PROB)
 
-            def initialize(self):
+            def initialize(self, client_config):
                 return self.jobs
 
             def get_server_state(self):
                 return self.server_state
 
-        monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
-        cfg = ArcticRLClientConfig(
+        monkeypatch.setattr(onprem_mod, "OnPremTransport", DummyRay)
+        cfg = ArcticClientConfig(
             model_name="m",
-            backend=OnPremConfig(protocol="ray"),
             training_gpus=1,
             sampling_gpus=1,
             log_prob_gpus=1,
@@ -274,7 +356,7 @@ class TestServerState:
             sampling_job_id=SAMPLING,
             log_prob_job_id=LOG_PROB,
         )
-        client = create_arctic_rl_client(cfg, server_state=sentinel)
+        client = AsyncArcticRLClient(cfg, server_state=sentinel)
         assert client.transport.server_state is sentinel
         assert client.get_server_state() is sentinel
 
@@ -283,25 +365,26 @@ class TestOpRegistry:
     """Contract: the client's op vocabulary and OPS stay in lockstep, and a
     transport's op coverage is checkable without a live backend."""
 
-    def test_client_emits_exactly_the_registered_ops(self, client):
+    def test_client_emits_exactly_the_registered_ops(self, rl_client):
         """Driving every client op must cover the canonical OPS set."""
-        _call(client, "fwd_bwd", {"input_ids": [1]})
-        _call(client, "fwd_no_grad", {"input_ids": [1]})
-        _call(client, "step")
-        _call(client, "save_checkpoint")
-        _call(client, "load_checkpoint")
-        _call(client, "generate", ["hi"])
-        _call(client, "log_probs", ["hi"])
+        _call(rl_client, "fwd_bwd", {"input_ids": [1]})
+        _call(rl_client, "fwd_no_grad", {"input_ids": [1]})
+        _call(rl_client, "step")
+        _call(rl_client, "save_checkpoint")
+        _call(rl_client, "load_checkpoint")
+        _call(rl_client, "generate", ["hi"])
+        _stop_stream_after_one_event(rl_client.generate_stream(["hi"]))  # submit, poll, cancel
+        _call(rl_client, "log_probs", ["hi"])
         # sync_weights expands to wake + operation + wake + reset(operation)
-        n_before = len(client.transport.calls)
-        _call(client, "sync_weights")
-        assert {"wake-inference", "operation"} <= {r.op for r in client.transport.calls[n_before:]}
-        _call(client, "reset_prefix_cache")
-        _call(client, "sleep_inference")
-        _call(client, "wake_inference")
-        _call(client, "sleep_training")
-        _call(client, "wake_training")
-        assert {req.op for req in client.transport.calls} == OPS
+        n_before = len(rl_client.transport.calls)
+        _call(rl_client, "sync_weights")
+        assert {"wake-inference", "operation"} <= {r.op for r in rl_client.transport.calls[n_before:]}
+        _call(rl_client, "reset_prefix_cache")
+        _call(rl_client, "sleep_inference")
+        _call(rl_client, "wake_inference")
+        _call(rl_client, "sleep_training")
+        _call(rl_client, "wake_training")
+        assert {req.op for req in rl_client.transport.calls} == OPS
 
     def test_unresolved_ops_flags_a_missing_method(self):
         """A target missing one op's method is reported (renamed/dropped op -> caught early)."""
@@ -326,47 +409,148 @@ class TestOpRegistry:
         assert unresolved_ops(server) == []
 
 
+class TestClusterRequestBuilders:
+    @pytest.mark.parametrize(
+        ("actual", "expected"),
+        [
+            (cluster_requests.list_jobs_request("running"), Request("list-jobs", body={"status": "running"})),
+            (cluster_requests.get_job_request("job-1"), Request("get-job", "job-1")),
+            (
+                cluster_requests.get_experiment_run_request("job-1"),
+                Request("get-experiment-run", "job-1"),
+            ),
+            (cluster_requests.cancel_job_request("job-1"), Request("cancel-job", "job-1")),
+            (cluster_requests.capacity_request("H100"), Request("capacity", body={"hardware": "H100"})),
+            (
+                cluster_requests.capacity_request("H200", ("job_type", "submitted_by")),
+                Request(
+                    "capacity",
+                    body={"hardware": "H200", "breakdown": ("job_type", "submitted_by")},
+                ),
+            ),
+            (cluster_requests.list_checkpoints_request("job-1"), Request("list-checkpoints", "job-1")),
+            (
+                cluster_requests.export_checkpoint_request("job-1", "step-1"),
+                Request("export-checkpoint", "job-1", {"checkpoint_id": "step-1"}),
+            ),
+            (
+                cluster_requests.delete_checkpoint_request("job-1", "step-1"),
+                Request("delete-checkpoint", "job-1", {"checkpoint_id": "step-1"}),
+            ),
+            (
+                cluster_requests.download_artifacts_request("job-1", "stdout", "/tmp/logs"),
+                Request("download-artifacts", "job-1", {"kind": "stdout", "output_dir": "/tmp/logs"}),
+            ),
+        ],
+    )
+    def test_context_free_request_shape(self, actual, expected):
+        """Cluster builders lower arguments without client or transport state."""
+        assert actual == expected
+
+    def test_optional_filters_are_omitted(self):
+        """Absent account filters do not become explicit null query values."""
+        assert cluster_requests.list_jobs_request().body == {}
+        assert cluster_requests.capacity_request().body == {}
+
+    def test_cluster_vocabulary_is_separate_from_live_ops(self):
+        """Cluster builders have their own registry and do not expand on-prem coverage."""
+        requests = (
+            cluster_requests.list_jobs_request(),
+            cluster_requests.get_job_request("job"),
+            cluster_requests.get_experiment_run_request("job"),
+            cluster_requests.cancel_job_request("job"),
+            cluster_requests.capacity_request(),
+            cluster_requests.list_checkpoints_request("job"),
+            cluster_requests.export_checkpoint_request("job", "checkpoint"),
+            cluster_requests.delete_checkpoint_request("job", "checkpoint"),
+            cluster_requests.download_artifacts_request("job", "stdout", "/tmp/logs"),
+        )
+        assert {request.op for request in requests} == CLUSTER_OPS
+        assert CLUSTER_OPS.isdisjoint(OPS)
+
+
+class TestClusterClientMethods:
+    def test_account_ops_use_the_given_arguments(self, client):
+        """Account-level ops need no stored handle."""
+        _call(client, "list_jobs", "running")
+        assert _last(client) == cluster_requests.list_jobs_request("running")
+        _call(client, "capacity", "H200", breakdown=("job_type",))
+        assert _last(client) == cluster_requests.capacity_request("H200", ("job_type",))
+        _call(client, "cancel_job", "job-9")
+        assert _last(client) == cluster_requests.cancel_job_request("job-9")
+
+    def test_get_job_targets_a_stored_handle(self, client):
+        _call(client, "get_job")
+        assert _last(client) == cluster_requests.get_job_request(TRAINING)
+
+    def test_checkpoint_ops_target_the_training_job(self, client):
+        _call(client, "list_checkpoints")
+        assert _last(client) == cluster_requests.list_checkpoints_request(TRAINING)
+        _call(client, "export_checkpoint", "cp-1")
+        assert _last(client) == cluster_requests.export_checkpoint_request(TRAINING, "cp-1")
+        _call(client, "delete_checkpoint", "cp-1")
+        assert _last(client) == cluster_requests.delete_checkpoint_request(TRAINING, "cp-1")
+
+    def test_onprem_rejects_cluster_ops(self):
+        """On-prem has no job persistence, so cluster ops fail instead of reaching the Ray server."""
+        from arctic_platform.client.transports.onprem import OnPremTransport
+
+        transport = OnPremTransport(OnPremConfig())
+        with pytest.raises(NotImplementedError, match="list-jobs"):
+            transport.call(cluster_requests.list_jobs_request())
+
+
 class TestTransportSelection:
-    def test_make_transport_selects_ray(self, monkeypatch):
-        """onprem + ray routes to RayTransport (constructed lazily, so patch it)."""
-        import arctic_platform.client.transports.onprem_ray as ray_mod
+    def test_make_transport_passes_cortex_config(self, monkeypatch):
+        """Stateful clients pass the complete Cortex transport config unchanged."""
+        pytest.importorskip("tenacity")
+        import arctic_platform.client.transports.cortex as cortex_mod
+
+        class DummyCortex:
+            def __init__(self, config):
+                self.config = config
+
+        monkeypatch.setattr(cortex_mod, "CortexTransport", DummyCortex)
+        from arctic_platform.client import CortexConfig
+
+        backend = CortexConfig(base_url="http://mock")
+        cfg = ArcticClientConfig(
+            model_name="m",
+            backend=backend,
+        )
+        transport = base_module.make_transport(cfg)
+        assert isinstance(transport, DummyCortex)
+        assert transport.config is backend
+
+    def test_make_transport_selects_onprem(self, monkeypatch):
+        """onprem routes to OnPremTransport (constructed lazily, so patch it)."""
+        import arctic_platform.client.transports.onprem as onprem_mod
 
         class DummyRay:
             def __init__(self, config, server_state=None):
                 self.config = config
                 self.server_state = server_state
 
-        monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
-        cfg = ArcticRLClientConfig(model_name="m", backend=OnPremConfig(protocol="ray"), training_gpus=1)
-        assert isinstance(client_module.make_transport(cfg), DummyRay)
+        monkeypatch.setattr(onprem_mod, "OnPremTransport", DummyRay)
+        cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(), training_gpus=1)
+        transport = base_module.make_transport(cfg)
+        assert isinstance(transport, DummyRay)
+        assert transport.config is cfg.backend
 
-    def test_make_transport_selects_http_for_onprem(self):
-        """onprem + http (the default) routes to HttpTransport."""
-        from arctic_platform.client.transports.onprem_http import HttpTransport
-
-        cfg = ArcticRLClientConfig(model_name="m", backend=OnPremConfig(protocol="http"), training_gpus=1)
-        assert isinstance(client_module.make_transport(cfg), HttpTransport)
-
-    def test_make_transport_forwards_server_state_to_ray(self, monkeypatch):
-        """make_transport threads server_state into the Ray transport (reconnect path)."""
-        import arctic_platform.client.transports.onprem_ray as ray_mod
+    def test_make_transport_forwards_server_state_to_onprem(self, monkeypatch):
+        """make_transport threads server_state into the on-prem transport (reconnect path)."""
+        import arctic_platform.client.transports.onprem as onprem_mod
 
         class DummyRay:
             def __init__(self, config, server_state=None):
                 self.config = config
                 self.server_state = server_state
 
-        monkeypatch.setattr(ray_mod, "RayTransport", DummyRay)
+        monkeypatch.setattr(onprem_mod, "OnPremTransport", DummyRay)
         sentinel = object()
-        cfg = ArcticRLClientConfig(model_name="m", backend=OnPremConfig(protocol="ray"), training_gpus=1)
-        transport = client_module.make_transport(cfg, server_state=sentinel)
+        cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(), training_gpus=1)
+        transport = base_module.make_transport(cfg, server_state=sentinel)
         assert transport.server_state is sentinel
-
-    def test_make_transport_rejects_server_state_for_http(self):
-        """server_state reconnect is Ray-only; HTTP transport must reject it."""
-        cfg = ArcticRLClientConfig(model_name="m", backend=OnPremConfig(protocol="http"), training_gpus=1)
-        with pytest.raises(ValueError, match="server_state reconnect"):
-            client_module.make_transport(cfg, server_state=object())
 
 
 class TestWeightSyncStrategyInit:
@@ -376,7 +560,7 @@ class TestWeightSyncStrategyInit:
     def test_training_init_payload_carries_strategy(self):
         from arctic_platform.client import TrainingConfig
 
-        cfg = ArcticRLClientConfig(
+        cfg = ArcticClientConfig(
             model_name="m",
             training_gpus=1,
             training=TrainingConfig(checkpoint_path="/tmp/c", cuda_ipc=True, low_memory=True),
@@ -386,7 +570,588 @@ class TestWeightSyncStrategyInit:
         assert payload["low_memory"] is True
 
     def test_non_training_init_payload_omits_strategy(self):
-        cfg = ArcticRLClientConfig(model_name="m", sampling_gpus=1)
+        cfg = ArcticClientConfig(model_name="m", sampling_gpus=1)
         payload = cfg.to_onprem("sampling")
         assert "cuda_ipc" not in payload
         assert "low_memory" not in payload
+
+
+@pytest.fixture(autouse=True)
+def _isolate_arctic_env(monkeypatch):
+    """Clear ``ARCTIC_CORTEX_*`` before each test.
+
+    ``CortexConfig`` is a ``BaseSettings``, so it reads the ambient environment
+    at construction; a var leaked in from the developer's shell would otherwise
+    decide the outcome of these tests.
+    """
+    import os
+
+    for k in list(os.environ):
+        if k.startswith("ARCTIC_CORTEX_"):
+            monkeypatch.delenv(k, raising=False)
+
+
+class TestCortexConfigReadsEnv:
+    """``CortexConfig`` hydrates from ``ARCTIC_CORTEX_*`` via pydantic-settings,
+    and explicit values still win over the environment."""
+
+    def test_base_url_only_bypasses_pat(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
+        from arctic_platform.client import CortexConfig
+
+        cfg = CortexConfig()
+        assert cfg.base_url == "http://mock"
+        assert cfg.host is None
+
+    def test_host_path_requires_db_schema_pat(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_HOST", "acct.snowflakecomputing.com")
+        monkeypatch.setenv("ARCTIC_CORTEX_DATABASE", "db")
+        monkeypatch.setenv("ARCTIC_CORTEX_SCHEMA", "sch")
+        monkeypatch.setenv("ARCTIC_CORTEX_PAT", "pat-value")
+        from arctic_platform.client import CortexConfig
+
+        cfg = CortexConfig()
+        assert cfg.host == "acct.snowflakecomputing.com"
+        assert cfg.database == "db"
+        assert cfg.schema_ == "sch"
+        assert cfg.pat.get_secret_value() == "pat-value"
+
+    def test_missing_pat_on_host_auth_is_refused(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_HOST", "acct.snowflakecomputing.com")
+        monkeypatch.setenv("ARCTIC_CORTEX_DATABASE", "db")
+        monkeypatch.setenv("ARCTIC_CORTEX_SCHEMA", "sch")
+        from arctic_platform.client import CortexConfig
+
+        with pytest.raises(ValidationError, match="ARCTIC_CORTEX_PAT"):
+            CortexConfig()
+
+    def test_explicit_override_wins(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://env")
+        from arctic_platform.client import CortexConfig
+
+        cfg = CortexConfig(base_url="http://explicit")
+        assert cfg.base_url == "http://explicit"
+
+    def test_pat_is_not_rendered_anywhere(self, monkeypatch):
+        """The PAT must not ride along into a log line or a serialized config.
+
+        Configs get printed, and the whole point of hydrating `pat` from the
+        environment is that the token is now a materialized field rather than
+        something fetched on demand — so it would otherwise land in every repr.
+        """
+        monkeypatch.setenv("ARCTIC_CORTEX_HOST", "acct.snowflakecomputing.com")
+        monkeypatch.setenv("ARCTIC_CORTEX_DATABASE", "db")
+        monkeypatch.setenv("ARCTIC_CORTEX_SCHEMA", "sch")
+        monkeypatch.setenv("ARCTIC_CORTEX_PAT", "SUPERSECRET123")
+        from arctic_platform.client import CortexConfig
+
+        cfg = CortexConfig()
+        assert "SUPERSECRET123" not in repr(cfg)
+        assert "SUPERSECRET123" not in str(cfg.model_dump())
+        assert "SUPERSECRET123" not in cfg.model_dump_json()
+        # ...but it is still readable where it is actually needed.
+        assert cfg.pat.get_secret_value() == "SUPERSECRET123"
+
+    def test_exported_but_empty_reads_as_unset(self, monkeypatch):
+        """A shell that exports ARCTIC_CORTEX_ENDPOINT= means "unset", not "".
+
+        Without ``env_ignore_empty`` the empty string would beat the default and
+        the endpoint would silently become invalid.
+        """
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
+        monkeypatch.setenv("ARCTIC_CORTEX_ENDPOINT", "")
+        from arctic_platform.client import CortexConfig
+
+        assert CortexConfig().endpoint == "cortex-training"
+
+
+class TestUnifiedConfigDoesNotReadEnv:
+    """Only ``CortexConfig`` reads the environment, and only for its own fields.
+
+    Which backend you get is decided by the caller — for SkyRL, by which
+    entrypoint the recipe names — never by an ambient variable. A stray
+    ``ARCTIC_CORTEX_HOST`` must not turn an on-prem run into a Cortex one.
+    """
+
+    def test_cortex_env_does_not_promote_an_onprem_backend(self, monkeypatch):
+        monkeypatch.setenv("ARCTIC_CORTEX_HOST", "acct.snowflakecomputing.com")
+        cfg = ArcticClientConfig(model_name="m", backend=OnPremConfig(), training_gpus=1)
+        assert cfg.backend.type == "onprem"
+
+
+class TestCortexModelOptions:
+    def test_liger_merges_with_forwarded_options_without_mutating_input(self):
+        cfg = ArcticClientConfig(
+            model_name="model",
+            training_gpus=1,
+            training={"ds_worker_config": {"use_liger": True, "model_options": {"moe": {"comm_token_chunk": 1024}}}},
+        )
+        before = cfg.model_dump()
+        training = cfg._cortex_training_sub_job()["training_config"]
+        assert training["model_options"] == {"moe": {"comm_token_chunk": 1024}, "liger": True}
+        training["model_options"]["moe"]["comm_token_chunk"] = 2048
+        assert cfg.model_dump() == before
+
+    def test_training_options_use_the_supported_server_channel(self):
+        from arctic_platform.client import CortexConfig
+
+        options = {
+            "moe": {"comm_token_chunk": 1024},
+            "lm_head": {"token_chunk_size": 1024, "fp32": False, "cross_entropy": False},
+        }
+        cfg = ArcticClientConfig(
+            model_name="model",
+            max_seq_len=262144,
+            training_gpus=8,
+            sampling_gpus=8,
+            backend=CortexConfig(base_url="http://mock"),
+            training={"ds_worker_config": {"ep_size": 8, "model_options": options}},
+        )
+        before = cfg.model_dump()
+        sub_jobs = cfg.to_cortex()
+        assert [sub["job_type"] for sub in sub_jobs] == ["sampling", "training"]
+        assert sub_jobs[0]["inference_config"]["n_gpus"] == 8
+        training = sub_jobs[1]["training_config"]
+        assert training["model_options"] == options
+        assert training["max_seq_len"] == 262144
+        assert training["ep_size"] == 8
+        assert "prime_rl" not in training
+        assert cfg.model_dump() == before
+        training["model_options"]["moe"]["comm_token_chunk"] = 2048
+        assert cfg.model_dump() == before
+
+    def test_absent_options_do_not_add_a_transport_block(self):
+        cfg = ArcticClientConfig(model_name="model", training_gpus=1)
+        training = cfg._cortex_training_sub_job()["training_config"]
+        assert "model_options" not in training
+        assert "prime_rl" not in training
+
+
+class TestCortexNoopOffload:
+    """``to_cortex`` drops ``offload_*: {device: none}`` from the forwarded
+    ds_config. Cortex builds the optimizer from the lifted typed ``optimizer``
+    and lands on DeepSpeedCPUAdam, so an explicit no-op offload block moves only
+    the parameters to GPU and ``step()`` asserts "CPUAdam param is on cuda:0"."""
+
+    @staticmethod
+    def _zero_block(ds_config: dict) -> dict:
+        from arctic_platform.client import CortexConfig
+
+        cfg = ArcticClientConfig(
+            model_name="m",
+            training_gpus=1,
+            backend=CortexConfig(base_url="https://x", pat="y"),
+            training={"ds_config": ds_config},
+        )
+        return cfg._cortex_training_sub_job()["training_config"]["ds_config"]["zero_optimization"]
+
+    def test_drops_noop_offload(self):
+        # verbatim from the ds_config SkyRL sent on the job that failed to provision
+        block = self._zero_block(
+            {
+                "zero_optimization": {
+                    "offload_optimizer": {"device": "none"},
+                    "offload_param": {"device": "none"},
+                    "stage": 0,
+                },
+                "optimizer": {"type": "AdamW", "params": {"lr": 1e-6}},
+            }
+        )
+        assert block == {"stage": 0}
+
+    def test_keeps_a_real_cpu_offload_request(self):
+        block = self._zero_block({"zero_optimization": {"offload_optimizer": {"device": "cpu"}, "stage": 2}})
+        assert block == {"offload_optimizer": {"device": "cpu"}, "stage": 2}
+
+    def test_leaves_untouched_when_nothing_to_drop(self):
+        assert self._zero_block({"zero_optimization": {"stage": 2}}) == {"stage": 2}
+
+
+class TestCortexSamplingSubJob:
+    def test_forwards_tensor_parallel_size(self):
+        """Neutrino's sampler reads TP from vllm_config and defaults to 1; n_gpus does not set it."""
+        from arctic_platform.client import CortexConfig
+
+        cfg = ArcticClientConfig(
+            model_name="m",
+            sampling_gpus=16,
+            backend=CortexConfig(base_url="https://x", pat="y"),
+            sampling={"vllm": {"tensor_parallel_size": 16}},
+        )
+        (sampling,) = [sub for sub in cfg.to_cortex() if "inference_config" in sub]
+        assert sampling["inference_config"]["vllm_config"]["tensor_parallel_size"] == 16
+
+
+class TestCortexBackendOnlyConstruction:
+    def test_backend_config_does_not_initialize_jobs(self):
+        """A bare CortexConfig builds transport plumbing but cannot create a job."""
+        pytest.importorskip("tenacity")
+        from arctic_platform.client import CortexConfig
+        from arctic_platform.client.transports.cortex import CortexTransport
+
+        backend = CortexConfig(
+            base_url="http://mock",
+            database="db",
+            schema="schema",
+        )
+        transport = CortexTransport(backend)
+        assert transport.config is backend
+        assert transport._prefix == "http://mock/api/v2/databases/db/schemas/schema/cortex-training"
+        assert transport.jobs == JobHandles()
+        assert transport.job_id is None
+
+    def test_parent_id_normalizes_sub_job_tokens(self):
+        """Cluster routes can address a parent from either parent or sub-job IDs."""
+        pytest.importorskip("tenacity")
+        from arctic_platform.client.transports.cortex import _parent_id
+
+        assert _parent_id("job-1") == "job-1"
+        assert _parent_id("job-1:training:0") == "job-1"
+        assert _parent_id(42) == "42"
+
+
+class TestCortexTransportNoopOps:
+    """``wake_*`` / ``sleep_*`` short-circuit in the Cortex transport so the
+    shim doesn't have to wrap each call — including the ones ``sync_weights``
+    invokes internally."""
+
+    def test_call_returns_empty_for_noop_op(self, monkeypatch):
+        # CortexTransport pulls in tenacity, which lives in the `cortex` extra;
+        # CI's unit-tests job installs `.[testing,rl]` only.
+        pytest.importorskip("tenacity")
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
+        from arctic_platform.client import CortexConfig
+        from arctic_platform.client.transport import Request
+        from arctic_platform.client.transports.cortex import CortexTransport
+
+        cfg = ArcticClientConfig(model_name="m", backend=CortexConfig(), training_gpus=1, sampling_gpus=1)
+        t = CortexTransport(cfg.backend)
+        # Would normally raise NotImplementedError on the transport; the noop
+        # short-circuit means the shim never has to guard these calls.
+        assert t.call(Request("wake-inference", 1, None)) == {}
+        assert t.call(Request("sleep-training", 1, {"mode": "all"})) == {}
+
+    def test_wake_inference_tag_list_is_a_noop(self, monkeypatch):
+        """sync_weights wakes with a bare tag list as the body; it must not be read as a dict."""
+        pytest.importorskip("tenacity")
+        from arctic_platform.client import CortexConfig
+        from arctic_platform.client.transports.cortex import CortexTransport
+
+        t = CortexTransport(CortexConfig(base_url="http://mock"))
+        assert t.call(cluster_requests.wake_inference_request(JobHandles(sampling=SAMPLING), ["weights"])) == {}
+        assert asyncio.run(t.acall(Request("wake-inference", SAMPLING, ["kv_cache"]))) == {}
+
+
+class TestCortexCancelToleratesEmptyBody:
+    """``:cancel`` answers 200 with no body. Decoding that as JSON reported a
+    release that had in fact succeeded as ``could not release <id>``, which
+    points the operator at the GPU cap instead of at their freed GPUs."""
+
+    def test_cancel_request_accepts_empty_response(self, monkeypatch):
+        pytest.importorskip("tenacity")
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
+        from arctic_platform.client import CortexConfig
+        from arctic_platform.client.transports.cortex import CortexTransport
+
+        t = CortexTransport(CortexConfig())
+
+        class _EmptyResp:
+            status = 200
+
+            async def read(self):
+                return b""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return None
+
+        sent = {}
+
+        class _Session:
+            def request(self, method, url, **kwargs):
+                sent["method"], sent["url"] = method, url
+                return _EmptyResp()
+
+        t._session = _Session()
+
+        t.call(cluster_requests.cancel_job_request("job-abc"))
+
+        assert sent["method"] == "POST"
+        assert sent["url"].endswith("/job-abc:cancel")
+
+
+class TestCortexSharedHelper:
+    """``to_cortex_fwd_bwd_payload`` lives under ``arctic_platform.integrations``
+    so the reshape rule sits next to the dispatch shim that uses it."""
+
+    def test_reshape_matches_cortex_wire_shape(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        attn = torch.ones((2, 10), dtype=torch.int64)
+        adv = torch.zeros((2, 10))
+        resp_mask = torch.ones((2, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": adv,
+                    "response_mask": resp_mask,
+                },
+                "meta": {},
+            },
+        )
+        assert out["args"] == ()
+        assert torch.equal(out["kwargs"]["input_ids"], ids)
+        assert torch.equal(out["kwargs"]["attention_mask"], attn)
+        # Server-side GRPO reads these from context for its preflight.
+        assert torch.equal(out["context"]["input_ids"], ids)
+        assert "advantages" in out["context"]
+        assert "loss_mask" in out["context"]
+        assert out["processing"]["loss_fn"] == "grpo"
+        assert "old_log_probs" not in out["kwargs"]
+        assert "old_log_probs_shifted" not in out["context"]
+
+    def test_left_pads_are_rewritten_to_trailing_pads(self):
+        """SkyRL left-pads to the batch's longest sequence; Cortex's packer
+        rejects that outright ("packing requires left-aligned rows")."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        # Row 0 is full width; row 1 carries two leading pad columns.
+        ids = torch.tensor([[1, 2, 3, 4], [0, 0, 7, 8]])
+        attn = torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1]])
+        adv = torch.tensor([[0.0, 0.0, 0.5, 0.5], [0.0, 0.0, -0.25, -0.25]])
+        resp_mask = torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]])
+
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": adv,
+                    "response_mask": resp_mask,
+                },
+                "meta": {},
+            },
+        )
+
+        assert torch.equal(out["kwargs"]["input_ids"], torch.tensor([[1, 2, 3, 4], [7, 8, 0, 0]]))
+        assert torch.equal(out["kwargs"]["attention_mask"], torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]]))
+        # The scored tokens and their advantages must have moved with the ids.
+        loss_mask, moved_adv = out["context"]["loss_mask"], out["context"]["advantages"]
+        assert out["kwargs"]["input_ids"][1][loss_mask[1]].tolist() == [7, 8]
+        assert moved_adv[1][loss_mask[1]].tolist() == [-0.25, -0.25]
+        # Row 0 was already aligned and must be untouched.
+        assert out["kwargs"]["input_ids"][0].tolist() == [1, 2, 3, 4]
+        assert moved_adv[0][loss_mask[0]].tolist() == [0.5, 0.5]
+        # No advantage may survive on a padding column.
+        assert torch.equal((moved_adv != 0), loss_mask)
+
+    def test_explicit_old_log_probs_ride_the_alignment(self):
+        """A caller-supplied pi_old has to move with the tokens it scored."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.tensor([[1, 2, 3, 4], [0, 0, 7, 8]])
+        attn = torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1]])
+        resp_mask = torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]])
+        old = torch.tensor([[0.0, 0.0, -0.1, -0.2], [0.0, 0.0, -0.7, -0.8]], dtype=torch.float64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": resp_mask.to(torch.float32),
+                    "response_mask": resp_mask,
+                    "old_log_probs": torch.full((2, 4), -9.0),
+                },
+                "meta": {"temperature": 0.7, "calculate_entropy": True},
+            },
+            old_log_probs_shifted=old,
+        )
+        sent = out["context"]["old_log_probs_shifted"]
+        assert sent.dtype == torch.float32
+        assert out["context"]["temperature"] == 0.7
+        assert out["context"]["calculate_entropy"] is True
+        assert "temperature" not in out["kwargs"]
+        assert "calculate_entropy" not in out["kwargs"]
+        loss_mask = out["context"]["loss_mask"]
+        assert sent[1][loss_mask[1]].tolist() == pytest.approx([-0.7, -0.8])
+        assert sent[0][loss_mask[0]].tolist() == pytest.approx([-0.1, -0.2])
+        # The batch's own ``old_log_probs`` are still dropped.
+        assert "old_log_probs" not in out["kwargs"]
+
+    def test_already_aligned_batch_is_passed_through(self):
+        """An already-conformant batch must not pay for
+        a gather -- and must not be perturbed by one."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
+        attn = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]])
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": torch.zeros((2, 4)),
+                    "response_mask": torch.tensor([[0, 0, 1, 0], [0, 1, 0, 0]]),
+                },
+                "meta": {},
+            },
+        )
+
+        assert out["kwargs"]["input_ids"] is ids
+        assert out["kwargs"]["attention_mask"] is attn
+
+    def test_processing_matches_jae_cookbook_contract(self):
+        """The wire contract mirrors ``cortex-client/recipes/rl_loop.py``:
+        loss_agg_mode / entropy_coeff / eps_clip explicit, no dp_size."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                    "advantages": torch.zeros((2, 10)),
+                    "response_mask": torch.ones((2, 10), dtype=torch.int64),
+                },
+                "meta": {},
+            },
+        )
+        cfg = out["processing"]["config"]
+        assert cfg["loss_agg_mode"] == "token-mean"
+        assert cfg["entropy_coeff"] == 0.0
+        assert cfg["eps_clip"] == 0.2
+        # dp_size / prox_logp_method are NOT in Jae's cookbook and must not
+        # leak into the wire: dp_size acts as an extra LR divisor at scale.
+        assert "dp_size" not in cfg
+        assert "prox_logp_method" not in cfg
+
+    def test_caller_loss_config_wins_but_loss_fn_stays_pinned(self):
+        """Recipe-supplied loss knobs propagate to the server, but ``loss_fn``
+        does not: this lowering builds a payload the server's ``grpo`` loss can
+        read, so honouring a caller's alias would hand those tensors to a loss
+        that expects a different contract."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                    "advantages": torch.zeros((2, 10)),
+                    "response_mask": torch.ones((2, 10), dtype=torch.int64),
+                },
+                "meta": {"global_batch_size": 128},
+            },
+            processing={
+                "loss_fn": "some_other_grpo",
+                "config": {"eps_clip": 0.3, "loss_agg_mode": "seq-mean-token-sum", "entropy_coeff": 0.01},
+            },
+        )
+        cfg = out["processing"]["config"]
+        assert cfg["eps_clip"] == 0.3
+        assert cfg["loss_agg_mode"] == "seq-mean-token-sum"
+        assert cfg["entropy_coeff"] == 0.01
+        assert out["processing"]["loss_fn"] == "grpo"
+        assert cfg["global_batch_size"] == 128  # meta fallback still applied
+
+    def test_missing_response_mask_fails_loud(self):
+        """Falling back to ``attention_mask`` would silently train on prompt
+        tokens; refuse instead of producing a wrong-but-plausible gradient."""
+        import pytest
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        with pytest.raises(ValueError, match="loss_mask.*response_mask"):
+            to_cortex_fwd_bwd_payload(
+                {
+                    "batch": {
+                        "input_ids": torch.zeros((2, 10), dtype=torch.int64),
+                        "attention_mask": torch.ones((2, 10), dtype=torch.int64),
+                        "advantages": torch.zeros((2, 10)),
+                    },
+                    "meta": {},
+                },
+            )
+
+
+class TestCortexShimSaveWeightsFailsLoud:
+    """``save_weights`` raises ``NotImplementedError`` — Cortex sub-jobs don't
+    share disk, so a silent no-op would leave sampling on stale weights."""
+
+    def test_save_weights_raises(self, monkeypatch):
+        import asyncio
+
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://mock")
+        from arctic_platform.integrations._cortex_dispatch import _CortexClientShim
+        from arctic_platform.rl.config import ArcticRLClientConfig as Legacy
+
+        # Left at SkyRL's own default: the shim is reached by the recipe naming
+        # the Cortex entrypoint, not by anything in this config.
+        legacy = Legacy(model_name="m", training_gpus=1, sampling_gpus=1)
+
+        # Skip the real ArcticRLClient constructor (needs live transport init).
+        shim = _CortexClientShim.__new__(_CortexClientShim)
+        shim._legacy_config = legacy
+        shim._unified_config = None
+        shim._client = None
+
+        with pytest.raises(NotImplementedError, match="Cortex has no disk-based"):
+            asyncio.run(shim.save_weights("/tmp/w"))
+
+
+class TestCortexShimRefusesReferenceLogProbs:
+    """``fwd_no_grad`` zero-fills the policy snapshot but must refuse a
+    reference-model request.
+
+    Zeros are harmless as ``old_log_probs`` (the lowering drops them and the
+    server re-derives π_old), but as π_ref they would turn a KL term into a
+    function of π_new alone — a wrong gradient with no error.
+    """
+
+    @staticmethod
+    def _shim():
+        from arctic_platform.integrations._cortex_dispatch import _CortexClientShim
+
+        shim = _CortexClientShim.__new__(_CortexClientShim)
+        shim._legacy_config = shim._unified_config = shim._client = None
+        return shim
+
+    @staticmethod
+    def _batch():
+        import torch
+
+        return {"batch": {"input_ids": torch.zeros((2, 5), dtype=torch.long)}}
+
+    def test_reference_model_request_raises(self):
+        import asyncio
+
+        with pytest.raises(NotImplementedError, match="reference-model log-probs"):
+            asyncio.run(self._shim().fwd_no_grad(self._batch(), reference_model=True))
+
+    def test_policy_snapshot_still_zero_fills(self):
+        """The path SkyRL actually uses must keep working."""
+        import asyncio
+
+        out = asyncio.run(self._shim().fwd_no_grad(self._batch(), reference_model=False))
+        assert out["batch"]["logprobs"].shape == (2, 5)
+        assert out["batch"]["logprobs"].abs().sum() == 0

@@ -13,16 +13,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unified SFT training example across the on-prem backends.
+"""SFT training example on the on-prem (in-process Ray) backend.
 
-    python -m arctic_platform.sft.examples.sft_example --backend onprem-http
-    python -m arctic_platform.sft.examples.sft_example --backend onprem-ray
+    python -m arctic_platform.sft.examples.sft_example
 
-Both backends follow the *same* pathway: build config -> ArcticSFTClient ->
-loop(fwd_bwd + step) -> save_checkpoint -> shutdown. The client + transports
-hide all wire/protocol differences. GPU work runs on the server; keep the
-client CPU-only with ``CUDA_VISIBLE_DEVICES=`` (and pass
-``--server-cuda-visible-devices`` when colocating a local server).
+Pathway: build config -> ArcticSFTClient -> loop(fwd_bwd + step) ->
+save_checkpoint -> shutdown.
 """
 
 from __future__ import annotations
@@ -33,8 +29,9 @@ import tempfile
 
 from transformers import AutoTokenizer
 
+from arctic_platform.client import ArcticSFTClientConfig
+from arctic_platform.client import TrainingConfig
 from arctic_platform.sft import ArcticSFTClient
-from arctic_platform.sft import ArcticSFTClientConfig
 
 STEPS = 20
 SEED = 42
@@ -80,68 +77,43 @@ def _build_batch(tokenizer, n: int, pad_token_id: int, loss_fn: str) -> dict:
     }
 
 
-def _config(
-    stack: contextlib.ExitStack,
-    comm_protocol: str,
-    launch_local_server: bool,
-    training_gpus: int,
-    loss_fn: str,
-    server_cuda_visible_devices: str | None,
-) -> ArcticSFTClientConfig:
+def _config(stack: contextlib.ExitStack, training_gpus: int) -> ArcticSFTClientConfig:
     ckpt = stack.enter_context(tempfile.TemporaryDirectory(prefix="arl_sft_ckpt_"))
     return ArcticSFTClientConfig(
-        backend="onprem",
-        comm_protocol=comm_protocol,
-        launch_local_server=launch_local_server,
-        server_cuda_visible_devices=server_cuda_visible_devices,
         model_name=MODEL,
         seed=SEED,
         training_gpus=training_gpus,
-        checkpoint_path=ckpt,  # server requires this for training jobs
-        job_ready_timeout=600.0,
-        ds_config={
-            "train_micro_batch_size_per_gpu": 1,
-            "train_batch_size": training_gpus,
-            "gradient_accumulation_steps": 1,
-            "zero_optimization": {
-                "stage": 2,
-                "offload_optimizer": {"device": "none"},
-                "offload_param": {"device": "none"},
+        training=TrainingConfig(
+            checkpoint_path=ckpt,  # server requires this for training jobs
+            ds_config={
+                "train_micro_batch_size_per_gpu": 1,
+                "train_batch_size": training_gpus,
+                "gradient_accumulation_steps": 1,
+                "zero_optimization": {
+                    "stage": 2,
+                    "offload_optimizer": {"device": "none"},
+                    "offload_param": {"device": "none"},
+                },
+                "optimizer": {
+                    "type": "AdamW",
+                    "params": {"lr": LR, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
+                },
             },
-            "optimizer": {
-                "type": "AdamW",
-                "params": {"lr": LR, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
+            ds_worker_config={
+                "attn_implementation": ATTN,
+                "enable_gradient_checkpointing": False,
+                "zorro_train_enable": False,
             },
-        },
-        ds_worker_config={
-            "attn_implementation": ATTN,
-            "enable_gradient_checkpointing": False,
-            "zorro_train_enable": False,
-        },
+        ),
     )
-
-
-BACKENDS = {
-    # (comm_protocol, launch_local_server)
-    "onprem-http": ("http", True),
-    "onprem-ray": ("ray", False),
-}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--backend", choices=list(BACKENDS), default="onprem-http")
     ap.add_argument("--training-gpus", type=int, default=2)
     ap.add_argument("--steps", type=int, default=STEPS)
     ap.add_argument("--loss-fn", choices=["sft", "sft_ce"], default="sft")
-    ap.add_argument(
-        "--server-cuda-visible-devices",
-        default=None,
-        help="GPUs for a locally launched server subprocess (e.g. '0,1').",
-    )
     args = ap.parse_args()
-
-    comm_protocol, launch_local_server = BACKENDS[args.backend]
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
@@ -150,28 +122,19 @@ def main() -> None:
     n = max(args.training_gpus, 2)  # at least one sample per DP rank
 
     with contextlib.ExitStack() as stack:
-        config = _config(
-            stack,
-            comm_protocol,
-            launch_local_server,
-            args.training_gpus,
-            args.loss_fn,
-            args.server_cuda_visible_devices,
-        )
+        config = _config(stack, args.training_gpus)
         batch = _build_batch(tokenizer, n, pad_token_id, args.loss_fn)
 
         client = ArcticSFTClient(config)
         print(f"training job: {client.jobs.training}")
         try:
             for step in range(args.steps):
-                out = client.fwd_bwd(batch)
-                step_out = client.step()
+                out = client.train_step(batch)
                 metrics = out.get("metrics") or {}
                 loss = metrics.get("loss", out.get("avg_loss"))
                 line = f"step {step + 1}/{args.steps} loss={_metric(loss):.4g}"
-                grad_norm = (step_out or {}).get("metrics", {}).get("grad_norm")
-                if grad_norm is not None:
-                    line += f" grad_norm={_metric(grad_norm):.4g}"
+                if "grad_norm" in metrics:
+                    line += f" grad_norm={_metric(metrics['grad_norm']):.4g}"
                 print(line)
             client.save_checkpoint()
         finally:

@@ -15,10 +15,8 @@
 
 """Arctic RL package.
 
-Heavy imports (HTTP client/server, weight sync) are lazy so
-``python -m arctic_platform.common.http_server`` (or the back-compat
-``python -m arctic_platform.rl.http_server``) can start a training-only
-server without pulling arctic_inference / vLLM at package import time.
+Heavy imports (client/server, weight sync) are lazy so a training-only
+server can start without pulling arctic_inference / vLLM at package import time.
 
 SFT symbols remain lazily re-exported for back-compat; prefer
 ``arctic_platform.sft``.
@@ -42,6 +40,8 @@ __all__ = [
     "run_pipeline",
     "run_sft_pipeline",
     "register_loss_fn",
+    "BaseLoss",
+    "resolve_loss",
     "register_post_processor",
     "grpo_loss",
     "sft_loss",
@@ -57,6 +57,8 @@ _LAZY: dict[str, tuple[str, str]] = {
     "run_pipeline": ("arctic_platform.rl.processors", "run_pipeline"),
     "run_sft_pipeline": ("arctic_platform.sft", "run_sft_pipeline"),
     "register_loss_fn": ("arctic_platform.rl.processors", "register_loss_fn"),
+    "BaseLoss": ("arctic_platform.rl.processors", "BaseLoss"),
+    "resolve_loss": ("arctic_platform.rl.processors", "resolve_loss"),
     "register_post_processor": ("arctic_platform.rl.processors", "register_post_processor"),
     "grpo_loss": ("arctic_platform.rl.processors", "grpo_loss"),
     "sft_loss": ("arctic_platform.sft", "sft_loss"),
