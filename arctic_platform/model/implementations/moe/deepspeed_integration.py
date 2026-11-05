@@ -20,7 +20,6 @@ from arctic_platform.model.implementations.gpu.tiled_mlp import enable_tiled_mlp
 
 from .distributed.ep_backend import uses_dispatch_ep
 from .conversion_cache import record_conversion_preparation_failure
-from .conversion_cache import validate_standalone_conversion_attempt
 from .distributed.expert_parallel import DeepEPExpertParallel
 from .distributed.expert_parallel import DeepEPShardParallel
 from .layers.moe import LatentMoE
@@ -365,7 +364,7 @@ def load_moe_model_for_deepspeed(
     return model
 
 
-@record_conversion_preparation_failure(distributed=False)
+@record_conversion_preparation_failure(distributed=False, heartbeat=False)
 def prepare_moe_weights(
     adapter: MoEDeepSpeedAdapter,
     *,
@@ -406,9 +405,7 @@ def prepare_moe_weights(
     )
     if model_config.debug.random_init:
         return None
-    validate_standalone_conversion_attempt(model_config)
     source_path = adapter.resolve_weight_source(model_config)
-    validate_standalone_conversion_attempt(model_config, source_path)
     model = adapter.get_model(
         model_config,
         device=torch.device("meta"),

@@ -19,6 +19,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, Pre
 
 from arctic_platform.model.implementations.moe.conversion_cache import (
     WEIGHT_CONVERSION_CACHE_SCOPE_ENV,
+    begin_conversion_preparation,
     conversion_cache_attempt_id,
     conversion_cache_is_node_local,
     conversion_cache_ready,
@@ -27,7 +28,6 @@ from arctic_platform.model.implementations.moe.conversion_cache import (
     get_checkpoint_converter,
     record_conversion_preparation_failure,
     resolve_conversion_cache_path,
-    validate_standalone_conversion_attempt,
     wait_for_conversion_cache,
 )
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
@@ -262,7 +262,7 @@ def resolve_weight_source(config: ModelConfig) -> Path:
     return Path(config.name)
 
 
-@record_conversion_preparation_failure
+@record_conversion_preparation_failure(distributed=False, heartbeat=False)
 def prepare_weight_conversion(
     model: nn.Module, config: ModelConfig, source_path: Path, *, rank: int, local_rank: int
 ) -> Path | None:
@@ -273,14 +273,14 @@ def prepare_weight_conversion(
     lock; other ranks wait for publication under ``DSS_WEIGHT_CONVERSION_TIMEOUT`` (default 3600 seconds).
     Before a process group exists, shared-cache launchers must set the same ``DSS_WEIGHT_CONVERSION_ATTEMPT_ID``
     for every process and choose a new value on retry. Distributed loads broadcast an attempt ID automatically.
-    Startup is bounded by ``DSS_WEIGHT_CONVERSION_WRITER_START_TIMEOUT`` (default 300 seconds); an observed
-    writer that stops heartbeating fails within 120 seconds.
+    Before conversion selection, the overall timeout covers independent setup. Launchers may explicitly set
+    ``DSS_WEIGHT_CONVERSION_WRITER_START_TIMEOUT`` for a shorter startup limit. Once conversion is selected,
+    an observed writer that stops heartbeating fails within 120 seconds.
     For node-local caches, the file lock chooses whichever local process arrives first as writer.
     A returned path is ready to load.
     """
     if not isinstance(model, PreTrainedModelPrimeRL):
         return None
-    validate_standalone_conversion_attempt(config, source_path)
     snapshot_keys = dict.fromkeys(load_state_dict_keys(source_path))
     model_keys = dict.fromkeys(model.state_dict().keys())
     if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
@@ -300,6 +300,8 @@ def prepare_weight_conversion(
     attempt_id, fresh_attempt = conversion_cache_attempt_id(
         shared=not node_local and not conversion_cache_ready(snapshot_path)
     )
+    if not conversion_cache_ready(snapshot_path):
+        begin_conversion_preparation()
     if node_local or rank == 0:
         ensure_node_local_conversion_cache(
             source_path,
@@ -327,7 +329,7 @@ def prepare_weight_conversion(
     return snapshot_path
 
 
-@record_conversion_preparation_failure
+@record_conversion_preparation_failure(heartbeat=False)
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)

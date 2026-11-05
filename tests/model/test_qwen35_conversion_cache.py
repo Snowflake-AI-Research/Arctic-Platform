@@ -20,6 +20,62 @@ from pathlib import Path
 import pytest
 
 
+@pytest.mark.parametrize("random_init", [False, True])
+def test_production_load_without_conversion_never_touches_readonly_cache(monkeypatch, tmp_path, random_init):
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+    from arctic_platform.model.implementations.qwen35 import model_builder as builder
+
+    class Model:
+        config = SimpleNamespace(tie_word_embeddings=False)
+
+        def to_empty(self, *, device):
+            pass
+
+        def state_dict(self):
+            return {"prime": None}
+
+        def is_hf_state_dict(self, state):
+            return "hf" in state
+
+        def is_prime_state_dict(self, state):
+            return "prime" in state
+
+        def init_buffers_post_meta(self):
+            pass
+
+    writes, warnings = [], []
+
+    def denied(path, value):
+        writes.append(path)
+        raise PermissionError("read-only cache")
+
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "no-conversion")
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "barrier", lambda: None)
+    monkeypatch.setattr(cache, "_write_cache_marker", denied)
+    monkeypatch.setattr(cache.logger, "warning", lambda *args, **kwargs: warnings.append(args))
+    monkeypatch.setattr(builder, "PreTrainedModelPrimeRL", Model)
+    monkeypatch.setattr(builder, "load_state_dict_keys", lambda path: ["prime"])
+    monkeypatch.setattr(builder, "dcp_load", lambda *args, **kwargs: None)
+    monkeypatch.setattr(builder, "HuggingFaceStorageReader", lambda **kwargs: None)
+    monkeypatch.setattr(builder, "_random_init_deterministic", lambda *args: None)
+    monkeypatch.setattr(builder, "_move_buffers_to_cuda", lambda *args: None)
+    config = SimpleNamespace(
+        name=str(tmp_path),
+        fsdp_cpu_offload=True,
+        debug=SimpleNamespace(random_init=random_init),
+        weight_conversion_cache_dir=str(tmp_path / "read-only"),
+    )
+    builder.load_dcp_from_hf(Model(), config, SimpleNamespace())
+    assert writes == []
+    assert len(warnings) <= 1
+    assert not (tmp_path / "read-only").exists()
+
+
 def test_conversion_cache_ready_requires_index_and_referenced_shards(tmp_path):
     from arctic_platform.model import conversion_cache_ready
 
@@ -170,7 +226,7 @@ def test_failed_node_local_conversion_removes_tmp_cache(tmp_path, monkeypatch, s
 def test_forced_node_local_ready_sibling_does_not_write_or_lock(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
-    from arctic_platform.model.implementations.qwen35 import conversion_cache
+    from arctic_platform.model.implementations.moe import conversion_cache
 
     source_path = tmp_path / "source"
     source_path.mkdir()
@@ -198,7 +254,7 @@ def test_forced_node_local_ready_sibling_does_not_write_or_lock(monkeypatch, tmp
 
     monkeypatch.setattr(conversion_cache, "open", guarded_open, raising=False)
     monkeypatch.setattr(Path, "mkdir", unexpected_call)
-    monkeypatch.setattr(conversion_cache.fcntl, "flock", unexpected_call)
+    monkeypatch.setattr(conversion_cache, "_flock", unexpected_call)
 
     conversion_cache.ensure_node_local_conversion_cache(
         source_path,
@@ -470,7 +526,7 @@ def test_conversion_marker_write_failure_removes_only_its_own_temporary_file(mon
     def fail(*args):
         raise OSError("marker rename failed")
 
-    monkeypatch.setattr(conversion_cache.os, "replace", fail)
+    monkeypatch.setattr(conversion_cache, "_replace", fail)
     with pytest.raises(OSError, match="marker rename failed"):
         conversion_cache._write_cache_marker(tmp_path / "prime.in-progress", dict(attempt_id="this-attempt"))
     assert list(tmp_path.iterdir()) == [other]
@@ -573,24 +629,19 @@ def test_conversion_cache_real_heartbeat_recovers_while_waiter_observes_progress
     assert not cache.with_name("prime.in-progress").exists()
 
 
-def test_shared_conversion_sweeps_observed_dead_workspace_during_conversion(monkeypatch, tmp_path):
-    import time
-
+def test_shared_conversion_sweeps_durably_failed_workspace_before_conversion(monkeypatch, tmp_path):
     from arctic_platform.model.implementations.moe import conversion_cache as cache
 
     destination = tmp_path / "prime"
     orphan = destination.with_name("prime.tmp-rank0-pid123-old")
     orphan.mkdir()
     owner = orphan.with_name(f"{orphan.name}.owner")
-    cache._write_cache_marker(owner, dict(host="another-node", pid=123))
+    cache._write_cache_marker(owner, dict(host="another-node", pid=123, state="failed"))
     monkeypatch.setattr(cache, "_ABANDONED_CACHE_AGE", 0.02)
     monkeypatch.setattr(cache, "_CACHE_HEARTBEAT_INTERVAL", 0.01)
 
     def convert(source, output):
-        deadline = time.monotonic() + 2
-        while orphan.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert not orphan.exists(), "shared cleanup never made a second liveness observation"
+        assert not orphan.exists(), "durable failure must be reclaimed before allocating the next copy"
         assert not owner.exists()
         _write_ready_cache(output)
 
@@ -610,7 +661,7 @@ def test_shared_conversion_sweeps_observed_dead_workspace_during_conversion(monk
     assert cache.conversion_cache_ready(destination)
 
 
-def test_shared_workspace_cleanup_observes_generations_not_server_clock(monkeypatch, tmp_path):
+def test_shared_workspace_cleanup_preserves_unconfirmed_remote_writer_despite_clock_skew(monkeypatch, tmp_path):
     import os
 
     from arctic_platform.model.implementations.moe import conversion_cache as cache
@@ -623,18 +674,13 @@ def test_shared_workspace_cleanup_observes_generations_not_server_clock(monkeypa
     owner = live.with_name(f"{live.name}.owner")
     cache._write_cache_marker(owner, dict(host="other-node", pid=123, heartbeat=0))
     os.utime(owner, ns=(1, 1))
-    clock = [0]
-    monkeypatch.setattr(cache.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(cache.time, "time", lambda: pytest.fail("server and client clocks are not comparable"))
-    monkeypatch.setattr(cache, "_WORKSPACE_OBSERVATIONS", {})
     cache._cleanup_abandoned_conversion_workspaces(destination)
     assert live.exists() and dead.exists()
-    clock[0] = cache._ABANDONED_CACHE_AGE + 1
     cache._write_cache_marker(owner, dict(host="other-node", pid=123, heartbeat=1))
     os.utime(owner, ns=(1, 1))
     cache._cleanup_abandoned_conversion_workspaces(destination)
     assert live.exists()
-    assert not dead.exists()
+    assert dead.exists(), "unknown remote ownership is not proof that a writer is dead"
 
 
 def test_node_local_locked_retry_reclaims_old_format_workspace_immediately(tmp_path):
@@ -649,6 +695,53 @@ def test_node_local_locked_retry_reclaims_old_format_workspace_immediately(tmp_p
     assert not workspace.exists()
 
 
+def _failed_cache_workspace_process(destination, action):
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    destination = Path(destination)
+    workspace = destination.with_name("prime.tmp-rank0-pid123-old")
+    owner = workspace.with_name(f"{workspace.name}.owner")
+    if action == "record":
+        workspace.mkdir()
+        (workspace / "partial-shard").write_bytes(b"interrupted conversion")
+        cache._write_cache_marker(owner, dict(host="other-host", pid=123, state="failed"))
+    else:
+        cache._cleanup_abandoned_conversion_workspaces(destination)
+        assert not workspace.exists()
+        assert not owner.exists()
+
+
+def test_shared_failed_workspace_is_reclaimed_by_a_fresh_process(tmp_path):
+    import multiprocessing
+
+    context = multiprocessing.get_context("spawn")
+    for action in ("record", "reclaim"):
+        process = context.Process(target=_failed_cache_workspace_process, args=(str(tmp_path / "prime"), action))
+        try:
+            process.start()
+            process.join(timeout=30)
+            assert process.exitcode == 0
+        finally:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+
+
+def test_lazy_preparation_does_not_impose_a_default_startup_deadline(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    monkeypatch.delenv("DSS_WEIGHT_CONVERSION_WRITER_START_TIMEOUT", raising=False)
+    clock = [0]
+    monkeypatch.setattr(cache, "conversion_cache_ready", lambda path: clock[0] >= 301)
+    cache.wait_for_conversion_cache(
+        tmp_path / "prime",
+        timeout=600,
+        clock=lambda: clock[0],
+        sleep=lambda delay: clock.__setitem__(0, clock[0] + delay),
+    )
+    assert clock[0] == 301
+
+
 @pytest.mark.parametrize("live", [False, True])
 def test_preparation_heartbeat_covers_slow_setup_and_detects_dead_setup(monkeypatch, tmp_path, live):
     from arctic_platform.model.implementations.moe import conversion_cache as cache
@@ -656,7 +749,7 @@ def test_preparation_heartbeat_covers_slow_setup_and_detects_dead_setup(monkeypa
     marker = cache._preparation_marker_path("launch", tmp_path).with_suffix(".in-progress")
     destination = tmp_path / "prime"
     clock = [0]
-    monkeypatch.setattr(cache.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cache, "_monotonic", lambda: clock[0])
 
     def sleep(delay):
         clock[0] += delay
@@ -669,7 +762,7 @@ def test_preparation_heartbeat_covers_slow_setup_and_detects_dead_setup(monkeypa
                 json.dumps(dict(weight_map=dict(weight="weights.safetensors")))
             )
 
-    monkeypatch.setattr(cache.time, "sleep", sleep)
+    monkeypatch.setattr(cache, "_sleep", sleep)
     arguments = dict(
         timeout=10,
         poll_interval=1,
