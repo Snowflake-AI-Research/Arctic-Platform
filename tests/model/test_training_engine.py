@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 
@@ -128,8 +130,54 @@ def test_default_adamw_is_fused_without_offload_and_cpu_adam_with_offload():
 
 def test_explicit_optimizer_names_are_honored_under_offload():
     assert resolve_optimizer_name("fused_adam", _OFFLOAD) == "fused_adam"
-    assert resolve_optimizer_name("torch_adamw", _OFFLOAD) == "torch_adamw"
+    assert resolve_optimizer_name("torch_adamw", _OFFLOAD) == "torch_cpu_adamw"
+    assert resolve_optimizer_name("torch_adamw", _ZERO2) == "torch_adamw"
     assert resolve_optimizer_name("cpu_adam", _ZERO2) == "deepspeed_cpu_adam"
+
+
+def test_nonfused_generic_offload_names_select_standard_cpu_arithmetic():
+    for name in ("", "Adam", "AdamW"):
+        assert resolve_optimizer_name(name, _OFFLOAD, fused=False) == "torch_cpu_adamw"
+    assert resolve_optimizer_name("torch_adamw", _OFFLOAD) == "torch_cpu_adamw"
+    assert resolve_optimizer_name("cpu_adam", _OFFLOAD, fused=False) == "deepspeed_cpu_adam"
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("cpu_offload", [False, True])
+@pytest.mark.parametrize("name", ["", " ", "adam", " AdamW "])
+def test_default_optimizer_resolution_preserves_offload_and_fused_policy(name, cpu_offload, fused):
+    ds_config = _OFFLOAD if cpu_offload else _ZERO2
+    if not cpu_offload:
+        expected = "fused_adam"
+    elif fused:
+        expected = "deepspeed_cpu_adam"
+    else:
+        expected = "torch_cpu_adamw"
+    assert resolve_optimizer_name(name, ds_config, fused=fused) == expected
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("cpu_offload", [False, True])
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("fusedadam", "fused_adam"),
+        (" Fused-Adam ", "fused_adam"),
+        ("torch_adamw", "torch_adamw"),
+        (" Torch-AdamW ", "torch_adamw"),
+        ("deepspeed_cpu_adam", "deepspeed_cpu_adam"),
+        ("deepspeedcpuadam", "deepspeed_cpu_adam"),
+        ("cpu_adam", "deepspeed_cpu_adam"),
+        ("cpuadam", "deepspeed_cpu_adam"),
+        ("deep_speed_cpu_adam", "deepspeed_cpu_adam"),
+        (" Deep-Speed-CPU-Adam ", "deepspeed_cpu_adam"),
+    ],
+)
+def test_explicit_optimizer_aliases_preserve_selection_and_cpu_placement(name, expected, cpu_offload, fused):
+    ds_config = _OFFLOAD if cpu_offload else _ZERO2
+    if expected == "torch_adamw" and cpu_offload:
+        expected = "torch_cpu_adamw"
+    assert resolve_optimizer_name(name, ds_config, fused=fused) == expected
 
 
 def test_unknown_optimizer_names_are_rejected():
@@ -180,7 +228,31 @@ def test_cpu_adam_uses_fp32_states_unless_bf16_optimizer_states_are_enabled():
             OptimizerSettings(),
             _ZERO2,
             False,
-            ("torch_adamw", "FusedAdam isn't supported for this model, so standard AdamW ran"),
+            ("torch_adamw", "you set 'optimizer.fused' to false, so standard AdamW ran"),
+        ),
+        (
+            OptimizerSettings(fused=False),
+            _OFFLOAD,
+            False,
+            (
+                "deepspeed_cpu_adam_nonfused",
+                "optimizer state is offloaded to CPU, with standard non-fused AdamW arithmetic",
+            ),
+        ),
+        (
+            OptimizerSettings(),
+            _OFFLOAD,
+            False,
+            (
+                "deepspeed_cpu_adam_nonfused",
+                "optimizer state is offloaded to CPU, with standard non-fused AdamW arithmetic",
+            ),
+        ),
+        (
+            OptimizerSettings(name="cpu_adam", fused=False),
+            _OFFLOAD,
+            False,
+            ("deepspeed_cpu_adam", "optimizer state is offloaded to CPU, so the CPU implementation (CPUAdam) ran"),
         ),
     ],
 )
@@ -193,6 +265,79 @@ def test_optimizer_choice_matches_the_class_built(optimizer, ds_config, fused, e
 def test_optimizer_implementation_rejects_unknown_names():
     with pytest.raises(AssertionError, match="Unhandled optimizer"):
         optimizer_implementation("sgd", fused=True)
+
+
+@pytest.mark.parametrize("fused,expected", [(True, "deepspeed_cpu_adam"), (False, "torch_cpu_adamw")])
+def test_cpu_optimizer_log_names_the_selected_implementation(monkeypatch, caplog, fused, expected):
+    class Adam:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr("deepspeed.ops.adam.DeepSpeedCPUAdam", Adam)
+    monkeypatch.setattr("arctic_platform.common.cpu_adam.configure_nonfused_cpu_adam", lambda optimizer: optimizer)
+    with caplog.at_level("INFO", logger="arctic_platform.common.deepspeed_engine"):
+        build_training_optimizer(torch.nn.Linear(2, 2), OptimizerSettings(), _OFFLOAD, fused=fused)
+    assert f"using optimizer='{expected}'" in caplog.text
+
+
+def test_build_training_optimizer_disables_decay_on_every_qwen38_norm():
+    pytest.importorskip("transformers.models.qwen4_exp")
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM
+
+    # A GatedDeltaNet layer with PLE and a QSA layer: every RMSNorm the model family has.
+    model = Qwen4ExpForCausalLM(
+        Qwen4ExpTextConfig(
+            vocab_size=32,
+            hidden_size=16,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            linear_conv_kernel_dim=2,
+            moe_intermediate_size=8,
+            shared_expert_intermediate_size=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            layer_types=["linear_attention", "full_attention"],
+            hc_count=2,
+            hc_lowrank=4,
+            ple_layer_ids=[1],
+            ple_embed_dim=8,
+            ple_conv_kernel_size=2,
+            ngram_size=3,
+            heads_per_ngram=1,
+            ngram_vocab_size_base=11,
+            make_ngram_vocab_size_divisible_by=4,
+            split_ngram_parts=2,
+            indexer_n_heads=1,
+            indexer_kv_heads=1,
+            indexer_head_dim=4,
+            indexer_budget=4,
+            indexer_compress_ratio=2,
+            eos_token_id=1,
+            pad_token_id=0,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000, "partial_rotary_factor": 0.5},
+        )
+    )
+
+    optimizer = build_training_optimizer(
+        model, OptimizerSettings(name="torch_adamw", weight_decay=0.1), _ZERO2, fused=False
+    )
+
+    decayed = {id(param) for group in optimizer.param_groups if group["weight_decay"] for param in group["params"]}
+    decayed_norms = [
+        name
+        for module_name, module in model.named_modules()
+        if "Norm" in type(module).__name__
+        for name, param in module.named_parameters(prefix=module_name, recurse=False)
+        if id(param) in decayed
+    ]
+    assert not decayed_norms, f"norm weights in the weight-decay group: {decayed_norms}"
 
 
 def test_build_training_optimizer_disables_decay_on_bias_and_norm(monkeypatch):
@@ -261,6 +406,48 @@ def test_parameters_kept_in_fp32_get_their_own_optimizer_groups(monkeypatch):
     assert groups == [(0.1, {torch.bfloat16}, 1), (0.1, {torch.float32}, 1), (0.0, {torch.bfloat16}, 2)]
 
 
+def test_build_training_optimizer_keeps_flattened_weights_16_byte_aligned():
+    model = torch.nn.Module()
+    model.first = torch.nn.Linear(16, 16, bias=False)
+    model.scale = torch.nn.Parameter(torch.ones(3))  # 3 elements, in the same group as the weights
+    model.second = torch.nn.Linear(16, 16, bias=False)
+
+    optimizer = build_training_optimizer(model, OptimizerSettings(name="torch_adamw"), _ZERO2, fused=False)
+
+    (group,) = optimizer.param_groups
+    # ZeRO places each parameter at the running sum of the sizes before it.
+    assert [param.numel() for param in group["params"]] == [256, 256, 3]
+    assert group["params"][0] is model.first.weight and group["params"][1] is model.second.weight
+
+
+def test_build_training_optimizer_aligns_each_kept_fp32_group():
+    from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = torch.nn.Linear(16, 16, bias=False, dtype=torch.bfloat16)
+            self.odd = torch.nn.Parameter(torch.ones(3, dtype=torch.bfloat16))
+            self.second = torch.nn.Linear(16, 16, bias=False, dtype=torch.bfloat16)
+            self.scale = torch.nn.Parameter(torch.ones(3))
+            self.base = torch.nn.Parameter(torch.ones(24))
+
+        @classmethod
+        def keeps_fp32_parameter(cls, name):
+            return name in ("scale", "base")
+
+    model = _Model()
+    assert preserve_fp8_params_through_ds_cast(model) == (0, 2)
+
+    optimizer = build_training_optimizer(model, OptimizerSettings(name="torch_adamw"), _ZERO2, fused=False)
+
+    groups = [[(param.dtype, param.numel()) for param in group["params"]] for group in optimizer.param_groups]
+    assert groups == [
+        [(torch.bfloat16, 256), (torch.bfloat16, 256), (torch.bfloat16, 3)],
+        [(torch.float32, 24), (torch.float32, 3)],
+    ]
+
+
 def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypatch):
     sentinel = object()
     calls = {}
@@ -277,7 +464,6 @@ def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypa
 
     monkeypatch.setattr(deepspeed_engine, "build_training_optimizer", _build)
     monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
-    monkeypatch.setattr(deepspeed_engine, "is_glm_moe_model", lambda path: False)
     monkeypatch.setattr("deepspeed.initialize", _initialize)
     model = torch.nn.Linear(1, 1)
     ds_config = {"train_micro_batch_size_per_gpu": 1}
@@ -324,7 +510,8 @@ def test_initialize_without_an_optimizer_omits_it_and_the_mpu(monkeypatch):
     assert calls["kwargs"] == {}
 
 
-def test_initialize_splits_expert_groups_and_leaves_fused_adam_off_for_glm(monkeypatch):
+@pytest.mark.parametrize("model_type", ["glm_moe_dsa", "glm5_next_text"])
+def test_initialize_splits_expert_groups_and_fuses_adam_for_glm(monkeypatch, tmp_path, model_type):
     calls = {}
 
     class _Adam:
@@ -337,7 +524,6 @@ def test_initialize_splits_expert_groups_and_leaves_fused_adam_off_for_glm(monke
 
     monkeypatch.setattr("deepspeed.ops.adam.FusedAdam", _Adam)
     monkeypatch.setattr("torch.optim.AdamW", _Adam)
-    monkeypatch.setattr(deepspeed_engine, "is_glm_moe_model", lambda path: True)
     monkeypatch.setattr(deepspeed_engine, "split_expert_param_groups", _split)
     monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
 
@@ -347,6 +533,7 @@ def test_initialize_splits_expert_groups_and_leaves_fused_adam_off_for_glm(monke
 
     monkeypatch.setattr("deepspeed.initialize", _initialize)
     model = torch.nn.Linear(2, 2, bias=False)
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
 
     engine, optimizer, choice = initialize_training_engine(
         model,
@@ -354,12 +541,254 @@ def test_initialize_splits_expert_groups_and_leaves_fused_adam_off_for_glm(monke
         optimizer=OptimizerSettings(),
         ep_size=2,
         mpu=None,
-        model_path="glm",
+        model_path=str(tmp_path),
         rank=0,
     )
 
     assert engine == "engine"
     assert optimizer is calls["optimizer"]
-    assert choice["implementation"] == "torch_adamw"
+    assert choice["implementation"] == "fused_adam"
     assert calls["split"]
     assert optimizer.param_groups == [{"params": [], "name": "experts"}]
+
+
+@pytest.mark.parametrize("force_cpu_optimizer", [None, True, False])
+def test_initialize_cpu_offload_honors_explicit_nonfused_policy(monkeypatch, force_cpu_optimizer):
+    calls = {}
+
+    class _CPUAdam(torch.optim.Optimizer):
+        def __init__(self, param_groups, **kwargs):
+            super().__init__(param_groups, {})
+            self.adam_w_mode = kwargs["adamw_mode"]
+            self.fp32_optimizer_states = kwargs["fp32_optimizer_states"]
+            self.ds_opt_adam = object()
+
+    def _initialize(*, model, config, **kwargs):
+        calls["config"] = config
+        calls["optimizer"] = kwargs["optimizer"]
+        return "engine", kwargs["optimizer"], None, None
+
+    monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
+    monkeypatch.setattr("deepspeed.initialize", _initialize)
+    monkeypatch.setattr("deepspeed.ops.adam.DeepSpeedCPUAdam", _CPUAdam)
+    ds_config = {"zero_optimization": {"stage": 2, "offload_optimizer": {"device": "cpu"}}}
+    if force_cpu_optimizer is not None:
+        ds_config["zero_force_ds_cpu_optimizer"] = force_cpu_optimizer
+
+    _, optimizer, choice = initialize_training_engine(
+        torch.nn.Linear(2, 2, bias=False),
+        ds_config,
+        optimizer=OptimizerSettings(fused=False),
+        ep_size=1,
+        mpu=None,
+        model_path="glm",
+        rank=0,
+    )
+
+    assert isinstance(optimizer, _CPUAdam)
+    assert choice["implementation"] == "deepspeed_cpu_adam_nonfused"
+    assert calls["optimizer"] is optimizer
+    assert calls["config"] is ds_config
+    if force_cpu_optimizer is not None:
+        assert calls["config"]["zero_force_ds_cpu_optimizer"] is force_cpu_optimizer
+    assert "zero_allow_untested_optimizer" not in calls["config"]
+    if force_cpu_optimizer is None:
+        assert "zero_force_ds_cpu_optimizer" not in ds_config
+
+
+def test_build_training_optimizer_keeps_explicit_cpu_adam_when_nonfused(monkeypatch):
+    captured = {}
+
+    class _CPUAdam:
+        def __init__(self, param_groups, **kwargs):
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("deepspeed.ops.adam.DeepSpeedCPUAdam", _CPUAdam)
+    optimizer = build_training_optimizer(
+        torch.nn.Linear(2, 2, bias=False),
+        OptimizerSettings(name="cpu_adam", fused=False),
+        _OFFLOAD,
+        fused=False,
+    )
+
+    assert isinstance(optimizer, _CPUAdam)
+    assert captured["kwargs"]["adamw_mode"] is True
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("weight_decay", [0.0, 0.1])
+def test_nonfused_cpu_adam_kernel_matches_torch_adamw_across_steps(dtype, weight_decay):
+    from arctic_platform.common.cpu_adam import _NonfusedAdamWOps
+
+    initial = torch.linspace(-0.25, 0.25, 17, dtype=dtype)
+    actual = initial.clone()
+    expected = torch.nn.Parameter(initial.clone())
+    baseline = torch.optim.AdamW(
+        [expected],
+        lr=0.003,
+        betas=(0.8, 0.95),
+        eps=1e-6,
+        weight_decay=weight_decay,
+        foreach=False,
+        fused=False,
+    )
+    moments = [torch.zeros_like(actual), torch.zeros_like(actual)]
+    ops = _NonfusedAdamWOps(None)
+    for step in range(1, 5):
+        gradient = torch.linspace(-0.3, 0.4, 17, dtype=dtype) / step
+        expected.grad = gradient.clone()
+        baseline.step()
+        ops.adam_update(
+            0,
+            step,
+            0.003,
+            0.8,
+            0.95,
+            1e-6,
+            weight_decay,
+            True,
+            actual,
+            gradient,
+            *moments,
+        )
+        torch.testing.assert_close(actual, expected.detach(), rtol=0, atol=0)
+        for key, value in zip(("exp_avg", "exp_avg_sq"), moments):
+            torch.testing.assert_close(value, baseline.state[expected][key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "parameter_dtype, state_dtype",
+    [
+        (torch.float32, torch.float32),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+    ],
+)
+@pytest.mark.parametrize("weight_decay", [0.0, 0.1])
+def test_nonfused_cpu_adam_native_counter_and_checkpoint_resume(parameter_dtype, state_dtype, weight_decay):
+    from copy import deepcopy
+
+    from deepspeed.ops.adam import DeepSpeedCPUAdam
+    from torch.optim.adamw import adamw
+
+    from arctic_platform.common.cpu_adam import configure_nonfused_cpu_adam
+
+    initial = torch.linspace(-0.25, 0.25, 17, dtype=parameter_dtype)
+    parameter = torch.nn.Parameter(initial.clone())
+    expected = initial.clone()
+    expected_moments = [torch.zeros_like(expected, dtype=state_dtype) for _ in range(2)]
+    expected_step = torch.tensor(0.0)
+
+    def build(value):
+        return configure_nonfused_cpu_adam(
+            DeepSpeedCPUAdam(
+                [value],
+                lr=0.003,
+                betas=(0.8, 0.95),
+                eps=1e-6,
+                weight_decay=weight_decay,
+                adamw_mode=True,
+                fp32_optimizer_states=state_dtype == torch.float32,
+            )
+        )
+
+    optimizer = build(parameter)
+    for step in range(1, 5):
+        gradient = torch.linspace(-0.3, 0.4, 17, dtype=parameter_dtype) / step
+        parameter.grad = gradient.clone()
+        optimizer.step()
+        with torch.no_grad():
+            adamw(
+                [expected],
+                [gradient.to(state_dtype)],
+                [expected_moments[0]],
+                [expected_moments[1]],
+                [],
+                [expected_step],
+                amsgrad=False,
+                beta1=0.8,
+                beta2=0.95,
+                lr=0.003,
+                weight_decay=weight_decay,
+                eps=1e-6,
+                maximize=False,
+                foreach=False,
+                capturable=False,
+                differentiable=False,
+                fused=False,
+            )
+        state = optimizer.state[parameter]
+        assert type(optimizer) is DeepSpeedCPUAdam
+        assert type(state["step"]) is int
+        assert state["step"] == step
+        torch.testing.assert_close(parameter.detach(), expected, rtol=0, atol=0)
+        for key, value in zip(("exp_avg", "exp_avg_sq"), expected_moments):
+            assert state[key].dtype == state_dtype
+            torch.testing.assert_close(state[key], value, rtol=0, atol=0)
+        if step == 2:
+            checkpoint = deepcopy(optimizer.state_dict())
+            parameter = torch.nn.Parameter(parameter.detach().clone())
+            optimizer = build(parameter)
+            optimizer.load_state_dict(checkpoint)
+            restored = optimizer.state[parameter]
+            assert type(restored["step"]) is int
+            assert restored["step"] == step
+            for key, value in zip(("exp_avg", "exp_avg_sq"), expected_moments):
+                assert restored[key].dtype == state_dtype
+                torch.testing.assert_close(restored[key], value, rtol=0, atol=0)
+
+
+def test_cpu_adam_checkpoint_hooks_preserve_mixed_groups_without_aliasing_saved_moments():
+    from copy import deepcopy
+
+    from arctic_platform.common.cpu_adam import _CpuAdamCheckpointState
+
+    parameters = [
+        torch.nn.Parameter(torch.zeros(3, dtype=torch.bfloat16)),
+        torch.nn.Parameter(torch.zeros(3, dtype=torch.float32)),
+    ]
+    optimizer = torch.optim.AdamW([{"params": [parameter]} for parameter in parameters])
+    optimizer.fp32_optimizer_states = True
+    checkpoint_state = _CpuAdamCheckpointState()
+    optimizer.register_load_state_dict_pre_hook(checkpoint_state.before_load)
+    optimizer.register_load_state_dict_post_hook(checkpoint_state.after_load)
+    for parameter in parameters:
+        optimizer.state[parameter] = {
+            "step": torch.tensor(2.0),
+            "exp_avg": torch.tensor([0.123456, 0.234567, 0.345678]),
+            "exp_avg_sq": torch.tensor([0.012345, 0.023456, 0.034567]),
+        }
+    checkpoint = deepcopy(optimizer.state_dict())
+    for _ in range(2):
+        optimizer.load_state_dict(checkpoint)
+        assert checkpoint_state.moments == []
+        for index, parameter in enumerate(parameters):
+            for name in ("exp_avg", "exp_avg_sq"):
+                assert optimizer.state[parameter][name].dtype == torch.float32
+                torch.testing.assert_close(
+                    optimizer.state[parameter][name], checkpoint["state"][index][name], rtol=0, atol=0
+                )
+        saved_moment = checkpoint["state"][0]["exp_avg"].clone()
+        optimizer.state[parameters[0]]["exp_avg"].add_(1)
+        torch.testing.assert_close(checkpoint["state"][0]["exp_avg"], saved_moment, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("invalid_groups", [None, [], [{"params": []}]])
+def test_cpu_adam_checkpoint_hooks_keep_empty_state_and_native_group_validation(invalid_groups):
+    from arctic_platform.common.cpu_adam import _CpuAdamCheckpointState
+
+    parameter = torch.nn.Parameter(torch.zeros(3, dtype=torch.bfloat16))
+    optimizer = torch.optim.AdamW([parameter])
+    optimizer.fp32_optimizer_states = True
+    checkpoint_state = _CpuAdamCheckpointState()
+    optimizer.register_load_state_dict_pre_hook(checkpoint_state.before_load)
+    optimizer.register_load_state_dict_post_hook(checkpoint_state.after_load)
+    checkpoint = optimizer.state_dict()
+    if invalid_groups is None:
+        optimizer.load_state_dict(checkpoint)
+    else:
+        checkpoint["param_groups"] = invalid_groups
+        with pytest.raises(ValueError, match="parameter group"):
+            optimizer.load_state_dict(checkpoint)
+    assert not optimizer.state
+    assert checkpoint_state.moments == []

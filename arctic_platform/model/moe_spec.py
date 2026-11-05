@@ -23,6 +23,7 @@ from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
 from arctic_platform.model.implementations.moe.config_validation import effective_fused_cross_entropy
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
+from arctic_platform.model.loader import model_type_family
 
 
 def _omit_none(value: Any) -> Any:
@@ -44,7 +45,7 @@ def hf_text_model_type(model_path: str) -> str:
 
 
 def is_glm_moe_model(model_path: str) -> bool:
-    return hf_text_model_type(model_path) == "glm_moe_dsa"
+    return model_type_family(hf_text_model_type(model_path)) in {"glm_moe_dsa", "glm5_next"}
 
 
 def build_moe_model(

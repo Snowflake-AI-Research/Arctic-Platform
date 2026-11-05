@@ -1,14 +1,20 @@
-.. _dflash2-nan-fix:
+.. _hybrid-state-fixes:
 
-DFlash2 NaNs on GDN-backed models
-=================================
+Stale recurrent state on hybrid models
+======================================
 
-ArcticInference carries a temporary compatibility fix for NaNs observed with
-DFlash2 speculative decoding on ``Qwen3.8-27B`` under concurrent, long-running
-decode workloads with prefix caching enabled. The failure is recorded in the
-`DSS issue tracker <https://github.com/Snowflake-AI-Research/DSS-Issue-Tracker/blob/main/issues/2026-09-25-dflash-speculative-decoding-on-qwen3-8-27b-turns-running-seq-882babc67dc040c3a33d67f36d06c331/ISSUE.md>`__.
+ArcticInference carries temporary fixes for two vLLM defects that can leave
+GDN/KDA-backed hybrid models reading or writing stale recurrent state. They
+were found while investigating NaNs with DFlash2 speculative decoding on
+``Qwen3.8-27B`` under concurrent, long-running decode workloads with prefix
+caching enabled, recorded in the
+`DSS issue tracker <https://github.com/Snowflake-AI-Research/DSS-Issue-Tracker/blob/main/issues/2026-09-25-dflash-speculative-decoding-on-qwen3-8-27b-turns-running-seq-882babc67dc040c3a33d67f36d06c331/ISSUE.md>`__,
+but are not specific to DFlash2. The other NaN causes found in that
+investigation are fixed separately: vLLM PR #51565 (see below) and
+tensor-parallel ranks drifting apart during speculative decoding
+(`Arctic-Platform PR #318 <https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/318>`__).
 
-Two independent vLLM defects combine to produce the corruption:
+The two defects:
 
 * A discarded asynchronous speculative step can leave
   ``num_accepted_tokens == 0``. GDN state lookup subtracts one from this value,

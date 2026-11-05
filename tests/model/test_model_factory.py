@@ -23,6 +23,7 @@ import types
 import pytest
 import torch.nn as nn
 from pydantic import ValidationError
+from transformers.loss.loss_utils import ForCausalLMLoss
 
 from arctic_platform.model import LoadedModel
 from arctic_platform.model import LoaderContext
@@ -264,6 +265,7 @@ class TestHuggingFaceLoader:
 
         model = nn.Module()
         model.config = types.SimpleNamespace(model_type="qwen3", use_cache=True)
+        model.loss_function = ForCausalLMLoss
         configured = []
         monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: model)
         monkeypatch.setattr(
@@ -307,6 +309,13 @@ class TestFromDsWorkerConfig:
     def test_requires_attn_implementation(self):
         with pytest.raises(ValueError, match="requires attn_implementation"):
             ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {})
+        with pytest.raises(ValueError, match="requires attn_implementation"):
+            ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {"attn_implementation": None})
+
+    def test_accepts_any_flash_attention_backend(self):
+        for impl in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
+            spec = ModelSpec.from_ds_worker_config("Qwen/Qwen3-1.7B", {"attn_implementation": impl})
+            assert spec.attn_implementation == impl
 
     def test_generic_patches_default_gc_off(self):
         from arctic_platform.model.config import Patches

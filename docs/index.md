@@ -33,6 +33,7 @@ live in the [project README](../README.md).
 - **SFT smoke (colocated):** see [sft.md § Quick start](sft.md#quick-start)
 - **RL starter recipe:** [`recipes/rl/verl/simple/`](../recipes/rl/verl/)
 - **SkyRL recipes:** [`recipes/rl/skyrl/`](../recipes/rl/skyrl/)
+- **TRL recipes:** [`recipes/rl/trl/`](../recipes/rl/trl/) — on-prem GSM8K and [GSM8K on Cortex](../recipes/rl/trl/gsm8k_cortex/README.md)
 - **verl plugin:** [`arctic_platform/integrations/verl/`](../arctic_platform/integrations/verl/)
 - **ZoRRo Train design:** [`arctic_platform/rl/zorro_train/README.md`](../arctic_platform/rl/zorro_train/README.md)
 
