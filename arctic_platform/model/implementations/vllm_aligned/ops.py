@@ -145,6 +145,41 @@ class _RMSNorm(torch.autograd.Function):
         return grad_x, grad_weight, None, None
 
 
+def gemma_rms_norm_kernel(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, residual: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """vLLM's ``GemmaRMSNorm`` (``x * (1 + w)``) without autograd, as its native IR op runs under batch invariance.
+
+    With ``residual``, the input is ``x + residual`` summed in fp32; the returned residual is that sum rounded to
+    the input dtype, while the norm reads the unrounded fp32 sum. The mean is vLLM's batch-invariant Triton mean,
+    which replaces ``aten::mean.dim`` in a batch-invariant sampler.
+    """
+    batch_invariant = _batch_invariant()
+    orig_dtype = x.dtype
+    gemma_weight = weight.float() + 1.0
+    hidden = x.to(torch.float32)
+    new_residual = None
+    if residual is not None:
+        hidden = hidden + residual.to(torch.float32)
+        new_residual = hidden.to(orig_dtype)
+    variance = batch_invariant.mean_batch_invariant(hidden.pow(2), [-1], True)
+    hidden = hidden * torch.rsqrt(variance + eps)
+    hidden = hidden.to(gemma_weight.dtype) * gemma_weight
+    return hidden.to(orig_dtype), new_residual
+
+
+def silu_and_mul_kernel(x: torch.Tensor) -> torch.Tensor:
+    """The forward of :func:`silu_and_mul` without autograd."""
+    out = torch.empty(x.shape[:-1] + (x.shape[-1] // 2,), dtype=x.dtype, device=x.device)
+    _silu_and_mul_kernel(out, x.contiguous())
+    return out
+
+
+def linear_kernel(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+    """The forward of :func:`linear` without autograd."""
+    return _batch_invariant().linear_batch_invariant(x, weight, bias)
+
+
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float, *, fused: bool) -> torch.Tensor:
     """RMSNorm of ``x`` over its last dimension with the kernel the sampler runs at this position.
 
@@ -347,40 +382,47 @@ def _trainer_flash_attn_varlen_func():
     return call_fa4
 
 
+def paged_attention_kernel(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, layout: PackedLayout, scale: float, fa_version: int
+) -> torch.Tensor:
+    """The forward of :func:`paged_attention` without autograd."""
+    fa_utils = _fa_utils()
+    num_kv_heads, head_size = key.shape[1], key.shape[2]
+    cache_shape = (layout.num_blocks * layout.block_size, num_kv_heads, head_size)
+    key_cache = key.new_zeros(cache_shape).index_copy_(0, layout.slots, key)
+    value_cache = value.new_zeros(cache_shape).index_copy_(0, layout.slots, value)
+    paged_shape = (layout.num_blocks, layout.block_size, num_kv_heads, head_size)
+    num_seqs = int(layout.seq_lens.numel())
+    unit_scale = torch.ones((), dtype=torch.float32, device=query.device).expand(num_seqs, num_kv_heads)
+    return fa_utils.flash_attn_varlen_func(
+        q=query,
+        k=key_cache.view(paged_shape),
+        v=value_cache.view(paged_shape),
+        out=torch.empty_like(query),
+        cu_seqlens_q=layout.cu_seqlens,
+        max_seqlen_q=layout.max_seqlen,
+        seqused_k=layout.seq_lens,
+        max_seqlen_k=layout.max_seqlen,
+        softmax_scale=scale,
+        causal=True,
+        alibi_slopes=None,
+        window_size=None,
+        block_table=layout.block_table,
+        softcap=0,
+        scheduler_metadata=None,
+        fa_version=fa_version,
+        q_descale=unit_scale if fa_utils.flash_attn_supports_quant_query_input() else None,
+        k_descale=unit_scale,
+        v_descale=unit_scale,
+        num_splits=1,
+        s_aux=None,
+    )
+
+
 class _PagedAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query, key, value, layout: PackedLayout, scale: float, fa_version: int):
-        fa_utils = _fa_utils()
-        num_kv_heads, head_size = key.shape[1], key.shape[2]
-        cache_shape = (layout.num_blocks * layout.block_size, num_kv_heads, head_size)
-        key_cache = key.new_zeros(cache_shape).index_copy_(0, layout.slots, key)
-        value_cache = value.new_zeros(cache_shape).index_copy_(0, layout.slots, value)
-        paged_shape = (layout.num_blocks, layout.block_size, num_kv_heads, head_size)
-        num_seqs = int(layout.seq_lens.numel())
-        unit_scale = torch.ones((), dtype=torch.float32, device=query.device).expand(num_seqs, num_kv_heads)
-        out = fa_utils.flash_attn_varlen_func(
-            q=query,
-            k=key_cache.view(paged_shape),
-            v=value_cache.view(paged_shape),
-            out=torch.empty_like(query),
-            cu_seqlens_q=layout.cu_seqlens,
-            max_seqlen_q=layout.max_seqlen,
-            seqused_k=layout.seq_lens,
-            max_seqlen_k=layout.max_seqlen,
-            softmax_scale=scale,
-            causal=True,
-            alibi_slopes=None,
-            window_size=None,
-            block_table=layout.block_table,
-            softcap=0,
-            scheduler_metadata=None,
-            fa_version=fa_version,
-            q_descale=unit_scale if fa_utils.flash_attn_supports_quant_query_input() else None,
-            k_descale=unit_scale,
-            v_descale=unit_scale,
-            num_splits=1,
-            s_aux=None,
-        )
+        out = paged_attention_kernel(query, key, value, layout, scale, fa_version)
         ctx.save_for_backward(query, key, value, layout.cu_seqlens)
         ctx.max_seqlen = layout.max_seqlen
         ctx.scale = scale
@@ -436,22 +478,35 @@ def _token_logprobs_kernel(logits: torch.Tensor, token_ids: torch.Tensor) -> tor
     return compute_token_logprobs(logits, token_ids[:, None])[:, 0]
 
 
+def lm_head_logprobs_kernel(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float,
+    token_chunk_size: int,
+    vocab_padding: int,
+) -> torch.Tensor:
+    """The forward of :func:`lm_head_logprobs` without autograd; ``labels`` must be valid token ids."""
+    batch_invariant = _batch_invariant()
+    vocab_size = weight.shape[0]
+    padded = _padded_vocab(vocab_size, vocab_padding)
+    lm_weight = weight
+    if padded != vocab_size:
+        lm_weight = torch.cat((weight, weight.new_zeros(padded - vocab_size, weight.shape[1])))
+    out = torch.empty(hidden.shape[0], dtype=torch.float32, device=hidden.device)
+    for start in range(0, hidden.shape[0], token_chunk_size):
+        stop = min(start + token_chunk_size, hidden.shape[0])
+        logits = batch_invariant.linear_batch_invariant(hidden[start:stop], lm_weight)[:, :vocab_size]
+        if temperature != 1.0:
+            logits = logits.float() / torch.tensor(temperature, dtype=torch.float32, device=logits.device)
+        out[start:stop] = _token_logprobs_kernel(logits, labels[start:stop])
+    return out
+
+
 class _LMHeadLogprobs(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, labels, temperature, token_chunk_size, vocab_padding):
-        batch_invariant = _batch_invariant()
-        vocab_size = weight.shape[0]
-        padded = _padded_vocab(vocab_size, vocab_padding)
-        lm_weight = weight
-        if padded != vocab_size:
-            lm_weight = torch.cat((weight, weight.new_zeros(padded - vocab_size, weight.shape[1])))
-        out = torch.empty(hidden.shape[0], dtype=torch.float32, device=hidden.device)
-        for start in range(0, hidden.shape[0], token_chunk_size):
-            stop = min(start + token_chunk_size, hidden.shape[0])
-            logits = batch_invariant.linear_batch_invariant(hidden[start:stop], lm_weight)[:, :vocab_size]
-            if temperature != 1.0:
-                logits = logits.float() / torch.tensor(temperature, dtype=torch.float32, device=logits.device)
-            out[start:stop] = _token_logprobs_kernel(logits, labels[start:stop])
+        out = lm_head_logprobs_kernel(hidden, weight, labels, temperature, token_chunk_size, vocab_padding)
         ctx.save_for_backward(hidden, weight, labels)
         ctx.temperature = temperature
         ctx.token_chunk_size = token_chunk_size

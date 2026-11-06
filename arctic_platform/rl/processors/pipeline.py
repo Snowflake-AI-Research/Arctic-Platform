@@ -113,6 +113,8 @@ _ENGINE_FWD_KEYS = frozenset(
         "max_length_k",
         # Packed-row ids: without them a hybrid model's GatedDeltaNet convolution runs across packed rows.
         "seq_idx",
+        # The trained positions, for a vLLM-aligned hybrid that has to tell prefilled tokens from decoded ones.
+        "vllm_aligned_loss_mask",
     }
 )
 # Blocked even if listed in ``fwd_meta_keys``. ``labels`` stays on the allowlist
