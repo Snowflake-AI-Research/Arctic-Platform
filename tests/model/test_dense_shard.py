@@ -30,7 +30,8 @@ whose blocks hold norms, biases, a 3-element parameter, a projection run under n
 indexer) and an expert-parallel weight (EP = the world, as GLM-5.3 at EP64). DeepSpeed ZeRO-2 in BF16 with FP32
 masters, weight decay, gradient clipping at 1.0 and two micro-batches per step, built by ``initialize_training_engine``
 as the training job does; without and with a sequence-parallel group of the node (SP 4, the job's SP8 x DP8 layout),
-and with DSS's streamed optimizer-state swap when ``dss`` is importable. The sharded run's losses, gradient norms and
+and with DeepSpeed's streamed optimizer-state swap (``zero_optimization.optimizer_state_swap``) when the DeepSpeed has
+it. The sharded run's losses, gradient norms and
 weights after three steps match the replicated run's, and each GPU holds about a quarter of the dense weights.
 
     python -m pytest -q tests/model/test_dense_shard.py
@@ -39,7 +40,6 @@ weights after three steps match the replicated run's, and each GPU holds about a
 from __future__ import annotations
 
 import os
-from typing import Any
 
 import pytest
 import torch
@@ -268,29 +268,27 @@ def _train(rank: int, shard: bool, dtype: torch.dtype, sp: int, mpu, swap_config
                 "gradient_accumulation_steps": GAS,
                 "train_batch_size": GAS * WORLD // sp,
                 # Small buckets: many reductions per backward, and the LM head is reduced on its own.
-                "zero_optimization": {"stage": 2, "overlap_comm": True, "reduce_bucket_size": 1 << 16},
+                "zero_optimization": {
+                    "stage": 2,
+                    "overlap_comm": True,
+                    "reduce_bucket_size": 1 << 16,
+                    **({"optimizer_state_swap": swap_config} if swap_config is not None else {}),
+                },
             },
         )
     )
     _force_moe_detection()
-    swap_mod: Any = None
-    split: Any = contextlib.nullcontext()
-    if swap_config is not None:
-        import importlib
-
-        swap_mod = importlib.import_module("dss.ray_dss.jobs.gpu.optimizer_state_swap")
-        split = swap_mod.param_group_split(swap_config)
-    with split:
-        engine, _, _ = initialize_training_engine(
-            model,
-            ds_config,
-            optimizer=OptimizerSettings(lr=2e-3, weight_decay=0.1),
-            ep_size=WORLD,
-            mpu=mpu,
-            model_path="test",
-            rank=rank,
-        )
-    swap = swap_mod.maybe_install(engine.optimizer, swap_config) if swap_mod is not None else None
+    engine, _, _ = initialize_training_engine(
+        model,
+        ds_config,
+        optimizer=OptimizerSettings(lr=2e-3, weight_decay=0.1),
+        ep_size=WORLD,
+        mpu=mpu,
+        model_path="test",
+        rank=rank,
+    )
+    swap = engine.optimizer._optimizer_state_swap if swap_config is not None else None
+    assert swap_config is None or swap is not None
     groups = [
         (group.get("name"), bool(group.get("moe")), group["weight_decay"], sum(p.numel() for p in group["params"]))
         for group in engine.optimizer.optimizer.param_groups
@@ -345,11 +343,7 @@ def _worker(rank: int, port: int, dtype: torch.dtype, sp: int, swap: bool, resul
     swap_config = None
     if swap:
         # 1 MiB of FP32 master per slice: several slices per group, each fetched and evicted around its step.
-        swap_config = {
-            "optimizer_state_swap_fraction": 1.0,
-            "optimizer_state_swap_stream": True,
-            "optimizer_state_swap_group_gib": 1 / 1024,
-        }
+        swap_config = {"fraction": 1.0, "stream": True, "group_gib": 1 / 1024}
     replicated = _train(rank, False, dtype, sp, mpu, swap_config)
     sharded = _train(rank, True, dtype, sp, mpu, swap_config)
     import deepspeed.utils.groups as ds_groups
@@ -465,7 +459,12 @@ def test_sharded_bf16_weights_train_as_replicated_ones(sp, swap):
     agrees to ~1e-5 and the losses to the BF16 noise of the forward; the updates differ only in elements whose
     gradient nearly cancels (Adam's first steps move each element by about lr times its gradient's sign)."""
     if swap:
-        pytest.importorskip("dss.ray_dss.jobs.gpu.optimizer_state_swap")
+        from deepspeed.runtime.zero.config import DeepSpeedZeroConfig
+
+        if "optimizer_state_swap" not in DeepSpeedZeroConfig.model_fields:
+            pytest.skip(
+                "this DeepSpeed has no zero_optimization.optimizer_state_swap (DeepSpeed jaelee/h200-zero-memory)"
+            )
     results = _run(torch.bfloat16, sp, swap)
     _report(f"bf16 sp={sp} swap={swap}", results)
     for rank, r in results.items():
@@ -841,7 +840,10 @@ def _run_cpu(case, *args, monkeypatch) -> dict:
     from arctic_platform.testing_utils import get_unique_port_number
     from arctic_platform.testing_utils import reserve_free_port
 
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")  # on a GPU node too: the workers' DeepSpeed runs on its CPU
+    # On a GPU node too: the workers see no GPU, and their DeepSpeed takes its CPU accelerator (tests/conftest.py sets
+    # DS_ACCELERATOR=cuda in this process when it sees one).
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setenv("DS_ACCELERATOR", "cpu")
     port = reserve_free_port(get_unique_port_number() + 3, span=5)
     with mp.Manager() as manager:
         results = manager.dict()
