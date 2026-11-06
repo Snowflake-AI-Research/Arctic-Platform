@@ -26,6 +26,7 @@ from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
 from arctic_platform.model import Patches
 from arctic_platform.model import build_model
+from arctic_platform.model import ds_worker_moe_model_spec
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
@@ -220,7 +221,7 @@ def test_reduced_fixture_mtp_roundtrips_prime_rl_worker_options_to_qwen_runtime_
         "prime_rl": {"debug": {"reduced_fixture_mtp": descriptor}},
     }
 
-    spec = ModelSpec.from_ds_worker_config(str(tmp_path), worker_config)
+    spec = ds_worker_moe_model_spec(str(tmp_path), worker_config)
     options = Qwen3_5MoeOptions.model_validate(spec.loader_options)
     runtime = _build_model_config(str(tmp_path), 2, 1, "bfloat16", "sdpa", options)
 
