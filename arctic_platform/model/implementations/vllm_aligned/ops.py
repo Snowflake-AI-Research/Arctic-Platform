@@ -310,9 +310,41 @@ def _fa_utils():
 
 
 def _trainer_flash_attn_varlen_func():
-    from flash_attn import flash_attn_varlen_func
+    """The trainer's differentiable FlashAttention varlen call: FA3 on Hopper, else FA2, else FA4.
 
-    return flash_attn_varlen_func
+    The returned function takes ``(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale=,
+    causal=)`` and returns the attention output alone, whichever package provides it.
+    """
+    try:
+        from flash_attn_interface import flash_attn_varlen_func as fa3
+    except ImportError:
+        fa3 = None
+    if fa3 is not None:
+
+        def call_fa3(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale=None, causal=False):
+            out = fa3(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale=softmax_scale, causal=causal)
+            return out[0] if isinstance(out, tuple) else out
+
+        return call_fa3
+    try:
+        from flash_attn import flash_attn_varlen_func as fa2
+
+        return fa2
+    except ImportError:
+        pass
+    try:
+        from flash_attn.cute import flash_attn_varlen_func as fa4
+    except ImportError as error:
+        raise ImportError(
+            "the vLLM-aligned attention backward needs flash_attn_interface (FA3), flash_attn (FA2) or "
+            "flash_attn.cute (FA4)"
+        ) from error
+
+    def call_fa4(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale=None, causal=False):
+        out = fa4(q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, softmax_scale=softmax_scale, causal=causal)
+        return out[0] if isinstance(out, tuple) else out
+
+    return call_fa4
 
 
 class _PagedAttention(torch.autograd.Function):
