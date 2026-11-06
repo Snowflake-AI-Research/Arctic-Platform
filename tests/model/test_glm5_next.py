@@ -26,6 +26,7 @@ from arctic_platform.model.implementations.glm53.converting_glm5_next import con
 from arctic_platform.model.implementations.glm53.vllm_weights import convert_glm5_next_layer_to_vllm
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import tiny_glm5_next_config
 from arctic_platform.testing_utils import torch_assert_close
 from arctic_platform.testing_utils import torch_assert_equal
 
@@ -35,67 +36,6 @@ def _checkpoint(tmp_path, model_type: str) -> str:
     path.mkdir()
     (path / "config.json").write_text(json.dumps({"model_type": model_type}))
     return str(path)
-
-
-def _tiny_config():
-    pytest.importorskip("transformers.models.glm5_next")
-    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextConfig
-    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
-    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextVisionConfig
-
-    text = Glm5NextTextConfig(
-        vocab_size=32,
-        pad_token_id=0,
-        eos_token_id=1,
-        hidden_size=16,
-        intermediate_size=32,
-        moe_intermediate_size=8,
-        num_hidden_layers=4,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        n_shared_experts=1,
-        n_routed_experts=4,
-        num_experts_per_tok=2,
-        q_lora_rank=8,
-        kv_lora_rank=4,
-        qk_rope_head_dim=0,
-        qk_nope_head_dim=4,
-        v_head_dim=4,
-        index_n_heads=2,
-        index_head_dim=4,
-        index_topk=4,
-        index_kpool=2,
-        linear_num_heads=2,
-        linear_head_dim=4,
-        hc_mult=2,
-        layer_types=[
-            "linear_attention",
-            "linear_attention",
-            "linear_attention",
-            "deepseek_sparse_attention",
-        ],
-        mlp_layer_types=["dense", "dense", "dense", "sparse"],
-    )
-    vision = Glm5NextVisionConfig(
-        depth=1,
-        hidden_size=8,
-        intermediate_size=16,
-        num_heads=2,
-        out_hidden_size=16,
-        projection_intermediate_size=16,
-        image_size=14,
-        patch_size=14,
-    )
-    return Glm5NextConfig(
-        text_config=text.to_dict(),
-        vision_config=vision.to_dict(),
-        image_token_id=2,
-        video_token_id=3,
-        image_start_token_id=4,
-        image_end_token_id=5,
-        video_start_token_id=6,
-        video_end_token_id=7,
-    )
 
 
 def test_glm53_flash_family_dispatch_uses_model_type(tmp_path):
@@ -116,7 +56,7 @@ def test_glm53_custom_model_replaces_only_sparse_moe():
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
     from arctic_platform.model.implementations.moe.layers.moe import MoE
 
-    config = _tiny_config()
+    config = tiny_glm5_next_config()
     config.use_grouped_mm = False
     with torch.device("meta"):
         model = Glm5NextForConditionalGenerationPrimeRL(config)
@@ -140,7 +80,7 @@ def test_glm53_decoder_forwards_its_physical_layer_routes():
         self.routed_experts = routed_experts
         return torch.zeros_like(hidden_states)
 
-    config = _tiny_config()
+    config = tiny_glm5_next_config()
     config.use_grouped_mm = False
     model = Glm5NextForConditionalGenerationPrimeRL(config)
     layer = model.model.language_model.layers[3]
@@ -179,7 +119,7 @@ def test_glm53_vlm_registry_selects_custom_model_and_language_stack():
     from arctic_platform.model.implementations.moe.vlm import get_language_model
     from arctic_platform.model.implementations.moe.vlm import is_vlm_architecture
 
-    config = _tiny_config()
+    config = tiny_glm5_next_config()
     assert is_vlm_architecture(config)
 
     with torch.device("meta"):
@@ -191,7 +131,7 @@ def test_glm53_reinitializes_vision_rotary_buffer_after_meta_load():
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
 
     with torch.device("meta"):
-        model = Glm5NextForConditionalGenerationPrimeRL(_tiny_config())
+        model = Glm5NextForConditionalGenerationPrimeRL(tiny_glm5_next_config())
     model.to_empty(device="cpu")
     model.init_buffers_post_meta()
 
@@ -212,7 +152,7 @@ def test_glm53_weight_sync_includes_router_bias_buffer():
     from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
 
     with torch.device("meta"):
-        model = Glm5NextForConditionalGenerationPrimeRL(_tiny_config())
+        model = Glm5NextForConditionalGenerationPrimeRL(tiny_glm5_next_config())
 
     names = {name for name, _ in named_weight_sync_tensors(model)}
     prefix = "model.language_model.layers.3.mlp"
@@ -376,7 +316,7 @@ def test_glm53_native_fp8_training_builds_quantized_modules():
     from arctic_platform.model.implementations.fp8 import BlockFp8Linear
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
 
-    config = _tiny_config()
+    config = tiny_glm5_next_config()
     config.quantization_config = {
         "quant_method": "fp8",
         "weight_block_size": [128, 128],
@@ -586,10 +526,12 @@ def test_glm53_sparse_indices_are_padded_for_flashmla():
 
 
 def test_glm53_sparse_mla_full_forward_backward_without_sdpa():
+    from arctic_platform.model.implementations.glm53.context_parallel import _select_sparse_indices
     from arctic_platform.model.implementations.glm53.context_parallel import apply_context_parallelism
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
 
-    config = _tiny_config()
+    set_seed(0)
+    config = tiny_glm5_next_config()
     config.use_cache = False
     config.text_config.use_cache = False
     model = Glm5NextForConditionalGenerationPrimeRL(config)
@@ -597,15 +539,71 @@ def test_glm53_sparse_mla_full_forward_backward_without_sdpa():
     apply_context_parallelism(model, cp_size=1, cp_group=None)
     sparse_attention = language_model.layers[-1].self_attn
     hidden_states = torch.randn(1, 4, config.text_config.hidden_size)
-    output, _, _ = sparse_attention(
+    attention_mask = torch.ones(1, 4, dtype=torch.bool)
+    q_resid = sparse_attention.q_a_layernorm(sparse_attention.q_a_proj(hidden_states))
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+    expected_indices = _select_sparse_indices(
+        sparse_attention.indexer,
         hidden_states,
-        attention_mask=torch.ones(1, 4, dtype=torch.bool),
+        q_resid,
+        attention_mask,
+        cu_seqlens,
+        cp_group=None,
+        cp_rank=0,
     )
-    output.square().sum().backward()
+    torch_assert_equal(sparse_attention.indexer(hidden_states, q_resid, attention_mask, cu_seqlens), expected_indices)
 
+    calls = []
+    handle = sparse_attention.indexer.register_forward_hook(
+        lambda module, args, indices: calls.append((args, indices))
+    )
+    try:
+        output, _, _ = sparse_attention(hidden_states, attention_mask=attention_mask)
+        output.square().sum().backward()
+    finally:
+        handle.remove()
+
+    assert len(calls) == 1
+    assert calls[0][0][0] is hidden_states
+    torch_assert_equal(calls[0][1], expected_indices)
+    assert not calls[0][1].is_floating_point() and not calls[0][1].requires_grad
     assert sparse_attention.q_a_proj.weight.grad is not None
     assert sparse_attention.kv_a_proj_with_mqa.weight.grad is not None
-    assert sparse_attention.indexer.wq_b.weight.grad is None
+    assert all(parameter.grad is None for parameter in sparse_attention.indexer.parameters())
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_glm53_indexer_module_forward_keeps_context_parallel_identity(monkeypatch, rank):
+    from arctic_platform.model.implementations.glm53 import context_parallel as cp
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+
+    model = Glm5NextForConditionalGenerationPrimeRL(tiny_glm5_next_config())
+    group = object()
+    monkeypatch.setattr(
+        cp.dist, "get_world_size", lambda selected: 2 if selected is group else pytest.fail("wrong group")
+    )
+    monkeypatch.setattr(
+        cp.dist, "get_rank", lambda selected: rank if selected is group else pytest.fail("wrong group")
+    )
+    cp.apply_context_parallelism(model, cp_size=2, cp_group=group)
+    indexer = model.model.language_model.layers[-1].self_attn.indexer
+    expected = torch.tensor([[[0, 1]]], dtype=torch.int32)
+    observed = []
+
+    def select(module, *args, cp_group, cp_rank):
+        observed.append((module, args, cp_group, cp_rank))
+        return expected
+
+    monkeypatch.setattr(cp, "_select_sparse_indices", select)
+    inputs = (torch.zeros(1, 2, 16), torch.zeros(1, 2, 8), torch.ones(1, 2), torch.tensor([0, 4]))
+    hooks = []
+    handle = indexer.register_forward_hook(lambda module, args, output: hooks.append((module, args, output)))
+    try:
+        assert indexer(*inputs) is expected
+    finally:
+        handle.remove()
+    assert observed == [(indexer, inputs, group, rank)]
+    assert hooks == [(indexer, inputs, expected)]
 
 
 def test_glm53_sparse_mla_applies_kv_b_proj_lora():
@@ -617,7 +615,7 @@ def test_glm53_sparse_mla_applies_kv_b_proj_lora():
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
 
     set_seed(0)
-    config = _tiny_config()
+    config = tiny_glm5_next_config()
     config.use_cache = False
     config.text_config.use_cache = False
     model = Glm5NextForConditionalGenerationPrimeRL(config)
@@ -648,7 +646,7 @@ def test_glm53_fused_indexer_selects_the_general_paths_keys():
 
     from arctic_platform.model.implementations.glm53.context_parallel import _select_sparse_indices
 
-    config = _tiny_config().text_config
+    config = tiny_glm5_next_config().text_config
     config.hidden_size, config.q_lora_rank = 64, 32
     config.index_n_heads, config.index_head_dim, config.index_topk, config.index_kpool = 4, 128, 64, 4
     config.index_kpool_always_select_tail = True
@@ -776,7 +774,7 @@ def test_glm53_packed_hf_state_loads_strictly_into_native_model():
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
 
     set_seed(0)
-    config = _tiny_config()
+    config = tiny_glm5_next_config()
     source = Glm5NextForConditionalGeneration(config)
     native = Glm5NextForConditionalGenerationPrimeRL(config)
     state = convert_hf_to_prime(source.state_dict())
