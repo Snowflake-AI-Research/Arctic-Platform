@@ -205,9 +205,6 @@ class _GroupedPolicyEngine:
         self.parameter = torch.tensor(float(value), requires_grad=True)
         self.group_shapes = []
 
-    def gradient_accumulation_steps(self):
-        return 1
-
     def train(self):
         pass
 
@@ -251,6 +248,7 @@ def _cpu_worker(engine):
     worker.world_size = 1
     worker.sp_size = 1
     worker.engine = engine
+    worker.num_micro_batches = 1
     worker._device = torch.device("cpu")
     worker.cpu_device = torch.device("cpu")
     return worker

@@ -43,6 +43,8 @@ import torch
 from arctic_platform.client import ArcticClient
 from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import CortexConfig
+from arctic_platform.client import MicroBatchSpec
+from arctic_platform.client import OptimizerSettings
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
 
@@ -278,8 +280,11 @@ def client_config(
     dtype: str,
     training_gpus: int,
     lora_rank: int,
+    optimizer: OptimizerSettings,
     ds_config: dict[str, Any],
     ds_worker_config: dict[str, Any],
+    gradient_clipping: float = 1.0,
+    mb_spec: MicroBatchSpec | None = None,
     sampling_gpus: int = 0,
     gpu_memory_utilization: float | None = None,
     job_ready_timeout: float = 3600.0,
@@ -287,7 +292,7 @@ def client_config(
 ) -> ArcticClientConfig:
     """Assemble the one config both recipes hand to `running_client`.
 
-    ``to_cortex()`` lifts the Neutrino-typed fields out of ``ds_config`` /
+    ``to_cortex()`` lifts the Neutrino-typed model fields out of
     ``ds_worker_config``; the sampling sub-job is created only when
     ``sampling_gpus > 0``.
     """
@@ -303,6 +308,9 @@ def client_config(
         backend=backend.model_copy(update={"job_ready_timeout": job_ready_timeout}),
         training=TrainingConfig(
             peft=lora_config(lora_rank),
+            optimizer=optimizer,
+            gradient_clipping=gradient_clipping,
+            mb_spec=mb_spec,
             ds_config=ds_config,
             ds_worker_config=ds_worker_config,
         ),

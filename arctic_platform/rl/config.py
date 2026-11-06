@@ -17,12 +17,19 @@
 
 from __future__ import annotations
 
+from typing import Any
 from typing import Literal
 from typing import Optional
 
 from pydantic import BaseModel
 from pydantic import Field
 from pydantic import model_validator
+
+from arctic_platform.common.optimizer import OptimizerSettings
+from arctic_platform.common.training_settings import MicroBatchSpec
+from arctic_platform.common.training_settings import WorkerTrainingSettings
+
+_LEGACY_OPTIMIZER_KEYS = ("lr", "betas", "beta1", "beta2", "eps", "weight_decay")
 
 
 class ArcticRLClientConfig(BaseModel):
@@ -108,10 +115,85 @@ class ArcticRLClientConfig(BaseModel):
             )
         return self
 
+    def training_settings(self) -> WorkerTrainingSettings:
+        """The typed engine settings for ``ds_config`` plus the legacy ``training_config``.
+
+        ``training_config`` wins over the same setting in ``ds_config``. Its ``lr_scheduler`` over
+        ``training_horizon`` steps becomes a DeepSpeed ``scheduler``. Unset clipping stays off.
+        """
+        ds = dict(self.ds_config)
+        optimizer = ds.pop("optimizer", None)
+        num_micro_batches = ds.pop("gradient_accumulation_steps", None)
+        gradient_clipping = ds.pop("gradient_clipping", None)
+        ds.pop("train_micro_batch_size_per_gpu", None)
+        ds.pop("train_batch_size", None)
+        tc = self.training_config or {}
+        legacy_optimizer = tc.get("optimizer")
+        if legacy_optimizer is not None:
+            for key in ("torch_adam", "adam_w_mode"):
+                if key in legacy_optimizer:
+                    raise ValueError(f"training_config.optimizer.{key} is no longer supported")
+            optimizer = {
+                key: legacy_optimizer[key] for key in _LEGACY_OPTIMIZER_KEYS if legacy_optimizer.get(key) is not None
+            }
+            for clip in (
+                legacy_optimizer.get("gradient_clipping"),
+                tc.get("gradient_clipping"),
+                legacy_optimizer.get("max_grad_norm"),
+            ):
+                if clip is not None:
+                    gradient_clipping = clip
+                    break
+        elif tc.get("gradient_clipping") is not None:
+            gradient_clipping = tc["gradient_clipping"]
+        optimizer = OptimizerSettings.model_validate(optimizer or {})
+        num_micro_batches = tc.get("gradient_accumulation_steps", num_micro_batches)
+        scheduler = _legacy_scheduler(tc.get("lr_scheduler"), int(tc.get("training_horizon") or 0), optimizer.lr)
+        if scheduler is not None:
+            ds["scheduler"] = scheduler
+        return WorkerTrainingSettings(
+            optimizer=optimizer,
+            gradient_clipping=float(gradient_clipping or 0.0),
+            mb_spec=MicroBatchSpec(num_micro_batches=int(num_micro_batches)) if num_micro_batches else None,
+            ds_config=ds or None,
+        )
+
     @property
     def comm_protocol(self) -> str:
         """Read by SkyRL's Arctic entrypoint. On Cortex ``get_server_state`` returns ``None`` either way."""
         return "ray"
+
+
+def _legacy_scheduler(scheduler: Optional[dict], horizon: int, lr: float) -> Optional[dict[str, Any]]:
+    if scheduler is None or horizon <= 0:
+        return None
+    # DeepSpeed's WarmupLR/WarmupCosineLR require an integer warmup_num_steps.
+    if "warmup_steps" in scheduler:
+        warmup_steps = round(float(scheduler["warmup_steps"]))
+    else:
+        warmup_steps = round(scheduler.get("warmup_ratio", 0.0) * horizon)
+    if scheduler.get("type", "constant") == "cosine":
+        return {
+            "type": "WarmupCosineLR",
+            "params": {
+                "total_num_steps": horizon,
+                "warmup_num_steps": warmup_steps,
+                "warmup_min_ratio": 0.0,
+                "cos_min_ratio": scheduler.get("min_lr_ratio") or 0.0,
+                "warmup_type": "linear",
+            },
+        }
+    if warmup_steps > 0:
+        return {
+            "type": "WarmupLR",
+            "params": {
+                "warmup_min_lr": 0.0,
+                "warmup_max_lr": lr,
+                "warmup_num_steps": warmup_steps,
+                "warmup_type": "linear",
+            },
+        }
+    return None
 
 
 class WeightSyncConfig(BaseModel):

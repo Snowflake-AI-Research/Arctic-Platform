@@ -95,10 +95,10 @@ def build_client(
     sampling_gpus: int,
     tensor_parallel_size: int,
     seed: int,
-    grad_accum_steps: int = 1,
 ):
     from arctic_platform.client import ArcticClientConfig
     from arctic_platform.client import ArcticRLClient
+    from arctic_platform.client import OptimizerSettings
     from arctic_platform.client.config import SamplingConfig
     from arctic_platform.client.config import TrainingConfig
 
@@ -109,12 +109,7 @@ def build_client(
     # 0.6B 1-GPU matches on-prem TRL / Jae's rl_loop: ZeRO-1, no optimizer offload.
     zero_stage = int(os.environ.get("ARCTIC_ZERO_STAGE", "1"))
     ds_config = {
-        "train_micro_batch_size_per_gpu": 1,
-        # train_batch_size = micro_bs * gas * world_size (on-prem 1.7B recipe).
-        "train_batch_size": training_gpus * grad_accum_steps,
-        "gradient_accumulation_steps": grad_accum_steps,
         "zero_optimization": {"stage": zero_stage, "reduce_scatter": True},
-        "optimizer": {"type": "AdamW", "params": {"lr": 1e-6, "betas": [0.9, 0.999], "weight_decay": 0.0}},
         "bf16": {"enabled": True},
     }
     ds_worker_config = dict(
@@ -140,7 +135,12 @@ def build_client(
         training_gpus=training_gpus,
         sampling_gpus=sampling_gpus,
         log_prob_gpus=0,
-        training=TrainingConfig(ds_config=ds_config, ds_worker_config=ds_worker_config, checkpoint_path=ckpt_dir),
+        training=TrainingConfig(
+            optimizer=OptimizerSettings(lr=1e-6, betas=[0.9, 0.999], weight_decay=0.0),
+            ds_config=ds_config,
+            ds_worker_config=ds_worker_config,
+            checkpoint_path=ckpt_dir,
+        ),
         sampling=SamplingConfig(
             vllm={
                 "tensor_parallel_size": tensor_parallel_size,
@@ -249,7 +249,6 @@ def main() -> None:
             sampling_gpus=args.sampling_gpus,
             tensor_parallel_size=args.tensor_parallel,
             seed=args.seed,
-            grad_accum_steps=args.grad_accum,
         )
         print(f"[e2e] client ready; jobs={client.jobs}", flush=True)
 
@@ -280,7 +279,7 @@ def main() -> None:
             output_dir=out_dir,
             save_strategy="no",
             per_device_train_batch_size=args.per_device_bsz,
-            # TRL GAS=1 (full batch per forward_backward); DeepSpeed GAS is args.grad_accum.
+            # TRL GAS=1 (full batch per forward_backward); Cortex splits it by token budget.
             gradient_accumulation_steps=1,
             seed=args.seed,
             bf16=False,

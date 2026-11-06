@@ -29,6 +29,8 @@ from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import Request
 from arctic_platform.client.transport import Transport
 from arctic_platform.client.transport import unresolved_ops
+from arctic_platform.common.optimizer import OptimizerSettings
+from arctic_platform.common.training_settings import MicroBatchSpec
 
 __all__ = [
     "OPS",
@@ -41,7 +43,9 @@ __all__ = [
     "AsyncArcticRLClient",
     "CortexConfig",
     "JobHandles",
+    "MicroBatchSpec",
     "OnPremConfig",
+    "OptimizerSettings",
     "Request",
     "SamplingConfig",
     "TrainingConfig",

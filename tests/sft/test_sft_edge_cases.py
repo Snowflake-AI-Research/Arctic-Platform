@@ -341,13 +341,11 @@ class TestPerfFixesUnit(TestCasePlus):
     def test_h7_worker_sets_gas_accumulation_boundary(self):
         worker_path = Path(__file__).resolve().parents[2] / "arctic_platform" / "common" / "deepspeed_worker.py"
         src = worker_path.read_text()
-        self.assertIn("set_gradient_accumulation_boundary", src)
-        # Bound immediately before run_sft_pipeline in the SFT microbatch loop.
-        idx_boundary = src.index("set_gradient_accumulation_boundary")
-        idx_sft_run = src.index("run_sft_pipeline(", idx_boundary)
-        self.assertLess(idx_sft_run - idx_boundary, 250)
-        window = src[max(0, idx_boundary - 500) : idx_boundary]
-        self.assertIn("if use_sft_pipeline:", window)
+        # Bound once per microbatch, immediately before the SFT / packed-pipeline branch, so both paths get it.
+        idx_boundary = src.index("set_gradient_accumulation_boundary(i == num_micro_batches - 1)")
+        idx_branch = src.index("if use_sft_pipeline:", idx_boundary)
+        self.assertLess(idx_branch - idx_boundary, 100)
+        self.assertEqual(src.count("set_gradient_accumulation_boundary("), 1)
 
     def test_h4_move_batch_uses_non_blocking(self):
         worker_path = Path(__file__).resolve().parents[2] / "arctic_platform" / "common" / "deepspeed_worker.py"

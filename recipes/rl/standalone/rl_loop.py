@@ -37,6 +37,8 @@ import chz
 from tinker_cookbook.utils import ml_log
 
 from arctic_platform.client import ArcticRLClient
+from arctic_platform.client import MicroBatchSpec
+from arctic_platform.client import OptimizerSettings
 from recipes.recipe_utils import TrainSequence
 from recipes.recipe_utils import build_renderer
 from recipes.recipe_utils import client_config
@@ -196,7 +198,6 @@ class Config:
     training_gpus: int = 4
     sampling_gpus: int = 4
     gpu_memory_utilization: float = 0.4
-    micro_batch_size: int = 1
     zero_stage: int = 2
     attn_implementation: str = "flash_attention_3"
     dtype: str = "bfloat16"
@@ -210,7 +211,6 @@ class Config:
     top_p: float = 1.0
     format_coef: float = FORMAT_COEF
 
-    train_batch_size: int = 8
     max_tokens_per_mb: int = 10240
     learning_rate: float = 2e-5
     weight_decay: float = 0.0
@@ -218,7 +218,8 @@ class Config:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     adam_eps: float = 1e-8
-    gradient_clipping: float | None = 1.0
+    # 0 disables clipping.
+    gradient_clipping: float = 1.0
     max_steps: int | None = None  # full epoch (~188 batches at batch=64)
     eps_clip: float = 0.2
     loss_agg_mode: str = "token-mean"
@@ -242,33 +243,6 @@ class Config:
 
 
 def build_config(config: Config):
-    per_step = config.micro_batch_size * config.training_gpus
-    if config.train_batch_size % per_step != 0:
-        raise ValueError(
-            f"train_batch_size ({config.train_batch_size}) must be a multiple of "
-            f"micro_batch_size * training_gpus ({config.micro_batch_size} * "
-            f"{config.training_gpus} = {per_step})"
-        )
-
-    ds_config: dict[str, Any] = {
-        "train_batch_size": config.train_batch_size,
-        "train_micro_batch_size_per_gpu": config.micro_batch_size,
-        "gradient_accumulation_steps": config.train_batch_size // per_step,
-        "zero_optimization": {"stage": config.zero_stage, "reduce_scatter": True},
-        "bf16": {"enabled": True},
-        "optimizer": {
-            "type": "AdamW",
-            "params": {
-                "lr": config.learning_rate,
-                "weight_decay": config.weight_decay,
-                "betas": [config.adam_beta1, config.adam_beta2],
-                "eps": config.adam_eps,
-            },
-        },
-    }
-    if config.gradient_clipping is not None:
-        ds_config["gradient_clipping"] = config.gradient_clipping
-
     return client_config(
         backend=load_backend(config.config),
         model_name=config.model_name,
@@ -279,11 +253,21 @@ def build_config(config: Config):
         sampling_gpus=config.sampling_gpus,
         gpu_memory_utilization=config.gpu_memory_utilization,
         lora_rank=config.lora_rank,
-        ds_config=ds_config,
+        optimizer=OptimizerSettings(
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+            betas=[config.adam_beta1, config.adam_beta2],
+            eps=config.adam_eps,
+        ),
+        gradient_clipping=config.gradient_clipping,
+        mb_spec=MicroBatchSpec(max_tokens_per_mb=config.max_tokens_per_mb),
+        ds_config={
+            "zero_optimization": {"stage": config.zero_stage, "reduce_scatter": True},
+            "bf16": {"enabled": True},
+        },
         ds_worker_config={
             "attn_implementation": config.attn_implementation,
             "model_provider": "huggingface",
-            "mb_spec": {"max_tokens_per_mb": config.max_tokens_per_mb},
         },
         job_id=config.job_id,
     )

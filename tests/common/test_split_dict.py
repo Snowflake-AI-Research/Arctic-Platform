@@ -217,7 +217,7 @@ class TestDpSizeDividesBySp(TestCasePlus):
         self.assertEqual(shards[0]["meta"]["dp_size"], 8)
 
     def test_sp_size_from_verl_ds_config(self):
-        self.assertEqual(sp_size_from_job_config({"ds_config": {"sequence_parallel_size": 2}}), 2)
+        self.assertEqual(sp_size_from_job_config({"training_config": {"ds_config": {"sequence_parallel_size": 2}}}), 2)
 
     def test_sp_size_from_training_config(self):
         self.assertEqual(sp_size_from_job_config({"training_config": {"sp_size": 4}}), 4)
@@ -228,15 +228,10 @@ class TestDpSizeDividesBySp(TestCasePlus):
 
     def test_sp_size_conflict_raises(self):
         with self.assertRaises(ValueError):
-            sp_size_from_job_config(
-                {
-                    "training_config": {"sp_size": 2},
-                    "ds_config": {"sequence_parallel_size": 4},
-                }
-            )
+            sp_size_from_job_config({"training_config": {"sp_size": 2, "ds_config": {"sequence_parallel_size": 4}}})
 
     def test_job_config_exposes_sp_size(self):
-        job_config = JobConfig(model_name="m", ds_config={"sequence_parallel_size": 2})
+        job_config = JobConfig(model_name="m", training_config={"ds_config": {"sequence_parallel_size": 2}})
         self.assertEqual(job_config.sp_size, 2)
         self.assertEqual(sp_size_from_job_config(job_config), 2)
         self.assertEqual(JobConfig(model_name="m").sp_size, 1)
@@ -247,41 +242,37 @@ class TestDpSizeDividesBySp(TestCasePlus):
         with self.assertRaises(ValueError):
             JobConfig(
                 model_name="m",
-                training_config={"sp_size": 2},
-                ds_config={"sequence_parallel_size": 4},
+                training_config={"sp_size": 2, "ds_config": {"sequence_parallel_size": 4}},
             )
 
     def test_job_config_dump_keeps_client_wire_shape(self):
         # model_dump() is forwarded verbatim to workers; sp_size is derived, not a field.
-        dumped = JobConfig(model_name="m", ds_config={"sequence_parallel_size": 2}).model_dump()
+        dumped = JobConfig(model_name="m", training_config={"ds_config": {"sequence_parallel_size": 2}}).model_dump()
         self.assertNotIn("sp_size", dumped)
         self.assertEqual(sp_size_from_job_config(dumped), 2)
 
-    def test_log_prob_job_ignores_training_ds_config_when_log_prob_declares_sp(self):
+    def test_log_prob_job_ignores_training_config_sp(self):
         job_config = JobConfig(
             model_name="m",
             job_type="log_prob",
-            ds_config={"sequence_parallel_size": 2},
+            training_config={"ds_config": {"sequence_parallel_size": 2}},
             log_prob_config={"sequence_parallel_size": 1},
         )
         self.assertEqual(job_config.sp_size, 1)
-
-    def test_log_prob_job_falls_back_to_ds_config_when_log_prob_omits_sp(self):
-        job_config = JobConfig(
-            model_name="m",
-            job_type="log_prob",
-            ds_config={"sequence_parallel_size": 2},
-        )
-        self.assertEqual(job_config.sp_size, 2)
+        self.assertEqual(JobConfig(model_name="m", job_type="log_prob", log_prob_config={}).sp_size, 1)
 
     def test_training_job_ignores_log_prob_config_sp(self):
         job_config = JobConfig(
             model_name="m",
             job_type="training",
-            ds_config={"sequence_parallel_size": 2},
+            training_config={"ds_config": {"sequence_parallel_size": 2}},
             log_prob_config={"sequence_parallel_size": 4},
         )
         self.assertEqual(job_config.sp_size, 2)
+
+    def test_job_config_rejects_top_level_ds_config(self):
+        with self.assertRaisesRegex(ValueError, "set training_config.ds_config"):
+            JobConfig(model_name="m", ds_config={"sequence_parallel_size": 2})
 
     def test_parallelism_degree_rejects_bool_and_float(self):
         from arctic_platform.common.utils.server_models import resolve_parallelism_degree

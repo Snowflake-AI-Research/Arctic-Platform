@@ -158,20 +158,17 @@ class ArcticRLRayClient:
         )
 
         if use_deepspeed:
-            if self.config.ds_config:
-                job_config["ds_config"] = self.config.ds_config
-            if job_type == "training" and self.config.training_config is not None:
-                job_config["training_config"] = self.config.training_config
-                job_config["ds_config"] = self.config.ds_config
-            elif job_type == "log_prob":
-                # Treat log_prob like training: send the base ds_config plus a
-                # dedicated log_prob_config. The worker builds a forward-only
-                # (no-optimizer) engine from log_prob_config.
-                job_config["ds_config"] = self.config.ds_config
-                if self.config.log_prob_ds_config is not None:
-                    job_config["log_prob_config"] = self.config.log_prob_ds_config
+            if job_type == "training":
+                job_config["training_config"] = self.config.training_settings().model_dump()
             else:
-                job_config["ds_config"] = self.config.ds_config
+                # The worker builds a forward-only (no-optimizer) engine from log_prob_config,
+                # which inherits the training SP degree unless it sets its own.
+                log_prob_config = dict(self.config.log_prob_ds_config or {})
+                if "sequence_parallel_size" in self.config.ds_config:
+                    log_prob_config.setdefault(
+                        "sequence_parallel_size", self.config.ds_config["sequence_parallel_size"]
+                    )
+                job_config["log_prob_config"] = log_prob_config
             # this config is usually the same for any DeepspeedWorker job type - e.g. activating zorro - but it could be made job-type-specific as well, similar to do `ds_config`
             job_config["ds_worker_config"] = self.config.ds_worker_config
             if job_type == "training":

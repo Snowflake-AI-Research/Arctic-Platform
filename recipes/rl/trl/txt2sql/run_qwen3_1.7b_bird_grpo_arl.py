@@ -77,21 +77,18 @@ def build_client(
 ):
     from arctic_platform.client import ArcticClientConfig
     from arctic_platform.client import ArcticRLClient
+    from arctic_platform.client import MicroBatchSpec
     from arctic_platform.client import OnPremConfig
+    from arctic_platform.client import OptimizerSettings
     from arctic_platform.client import SamplingConfig
     from arctic_platform.client import TrainingConfig
 
     ds_config = {
-        "train_micro_batch_size_per_gpu": 1,
-        # train_batch_size = micro_bs * gas * world_size; worker split_dict's each DP shard.
-        "train_batch_size": training_gpus * grad_accum_steps,
-        "gradient_accumulation_steps": grad_accum_steps,
         "zero_optimization": {
             "stage": 3,
             "offload_optimizer": {"device": "none"},
             "offload_param": {"device": "none"},
         },
-        "optimizer": {"type": "AdamW", "params": {"lr": 1e-6, "betas": [0.9, 0.999], "weight_decay": 0.0}},
         "bf16": {"enabled": True},
     }
     logits_opt = _logits_opt_from_env()
@@ -127,7 +124,15 @@ def build_client(
         training_gpus=training_gpus,
         sampling_gpus=sampling_gpus,
         log_prob_gpus=0,
-        training=TrainingConfig(ds_config=ds_config, ds_worker_config=ds_worker_config, checkpoint_path=ckpt_dir),
+        # The worker splits each DP shard into grad_accum_steps microbatches.
+        training=TrainingConfig(
+            optimizer=OptimizerSettings(lr=1e-6, betas=[0.9, 0.999], weight_decay=0.0),
+            gradient_clipping=0.0,
+            mb_spec=MicroBatchSpec(num_micro_batches=grad_accum_steps),
+            ds_config=ds_config,
+            ds_worker_config=ds_worker_config,
+            checkpoint_path=ckpt_dir,
+        ),
         sampling=SamplingConfig(vllm=vllm),
         backend=OnPremConfig(colocate=colocate),
     )

@@ -30,6 +30,7 @@ import tempfile
 from transformers import AutoTokenizer
 
 from arctic_platform.client import ArcticSFTClientConfig
+from arctic_platform.client import OptimizerSettings
 from arctic_platform.client import TrainingConfig
 from arctic_platform.sft import ArcticSFTClient
 
@@ -85,18 +86,13 @@ def _config(stack: contextlib.ExitStack, training_gpus: int) -> ArcticSFTClientC
         training_gpus=training_gpus,
         training=TrainingConfig(
             checkpoint_path=ckpt,  # server requires this for training jobs
+            optimizer=OptimizerSettings(lr=LR, betas=[0.9, 0.999], eps=1e-8, weight_decay=0.0),
+            gradient_clipping=0.0,
             ds_config={
-                "train_micro_batch_size_per_gpu": 1,
-                "train_batch_size": training_gpus,
-                "gradient_accumulation_steps": 1,
                 "zero_optimization": {
                     "stage": 2,
                     "offload_optimizer": {"device": "none"},
                     "offload_param": {"device": "none"},
-                },
-                "optimizer": {
-                    "type": "AdamW",
-                    "params": {"lr": LR, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
                 },
             },
             ds_worker_config={

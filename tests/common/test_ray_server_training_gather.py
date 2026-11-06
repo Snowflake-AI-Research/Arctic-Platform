@@ -45,8 +45,9 @@ class _Worker:
         self.step = _Remote(self._step)
         self.offload_to_cpu = _Remote(self._offload)
 
-    async def _step(self):
+    async def _step(self, learning_rate=None):
         self._calls += 1
+        self.learning_rate = learning_rate
         self._log.append(f"step-{self._calls}")
         if self._fail_once and self._calls == 1:
             raise RuntimeError("worker failed")
@@ -107,6 +108,17 @@ class TestGatherTrainingRefs(TestCasePlus):
 
         out = asyncio.run(_run())
         self.assertEqual(out["job_id"], 1)
+
+    def test_step_forwards_the_client_learning_rate_to_every_worker(self):
+        hold = asyncio.Event()
+        hold.set()
+        workers = [_Worker([], hold), _Worker([], hold)]
+        server = _server(workers)
+
+        asyncio.run(server.step(1, {"learning_rate": 3e-6}))
+        self.assertEqual([w.learning_rate for w in workers], [3e-6, 3e-6])
+        asyncio.run(server.step(1))
+        self.assertEqual([w.learning_rate for w in workers], [None, None])
 
     def test_lock_keeps_training_ops_single_flight(self):
         hold = asyncio.Event()
@@ -204,7 +216,7 @@ class TestGatherTrainingRefs(TestCasePlus):
             def __init__(self):
                 self.step = _Remote(self._step)
 
-            async def _step(self):
+            async def _step(self, learning_rate=None):
                 log.append("fail")
                 raise RuntimeError("boom")
 
@@ -212,7 +224,7 @@ class TestGatherTrainingRefs(TestCasePlus):
             def __init__(self):
                 self.step = _Remote(self._step)
 
-            async def _step(self):
+            async def _step(self, learning_rate=None):
                 log.append("hang")
                 await asyncio.Event().wait()
 
@@ -237,14 +249,14 @@ class TestGatherTrainingRefs(TestCasePlus):
             def __init__(self):
                 self.step = _Remote(self._step)
 
-            async def _step(self):
+            async def _step(self, learning_rate=None):
                 raise RuntimeError("boom")
 
         class _Stubborn:
             def __init__(self):
                 self.step = _Remote(self._step)
 
-            async def _step(self):
+            async def _step(self, learning_rate=None):
                 log.append("stubborn")
                 try:
                     await asyncio.Event().wait()
@@ -282,7 +294,7 @@ class TestGatherTrainingRefs(TestCasePlus):
             def __init__(self, ref):
                 self._ref = ref
 
-            def remote(self):
+            def remote(self, *args):
                 return self._ref
 
         refs = [_Ref(), _Ref()]
@@ -319,7 +331,7 @@ class TestGatherTrainingRefs(TestCasePlus):
         started = []
 
         class _Slow:
-            def remote(self):
+            def remote(self, *args):
                 async def _run():
                     started.append("ran")
                     return {"metrics": {}, "batch": {}}
@@ -807,7 +819,7 @@ class TestGatherTrainingRefs(TestCasePlus):
             def __init__(self):
                 self.step = _Remote(self._step)
 
-            async def _step(self):
+            async def _step(self, learning_rate=None):
                 log.append("fail")
                 raise RuntimeError("boom")
 
@@ -815,7 +827,7 @@ class TestGatherTrainingRefs(TestCasePlus):
             def __init__(self):
                 self.step = _Remote(self._step)
 
-            async def _step(self):
+            async def _step(self, learning_rate=None):
                 log.append("hang")
                 await asyncio.Event().wait()
 

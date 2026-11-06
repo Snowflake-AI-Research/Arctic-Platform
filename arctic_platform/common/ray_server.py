@@ -454,7 +454,7 @@ class ArcticRLRayServerState(ArcticRLServerState):
             # pass, so it does not contend for VRAM with training/sampling.
             lp_bundle_offset = 0
 
-            if job_config.ds_config is not None:
+            if job_config.log_prob_config is not None:
                 if self.log_prob_workers:
                     raise ValueError("Log-prob job already running")
                 # Prefer driver-captured port (see training branch); default 29501
@@ -1036,9 +1036,11 @@ class ArcticRLRayServer:
         return merged
 
     async def step(self, job_id: int, body: dict[str, Any] | None = None) -> dict[str, Any]:
-        # `body` is unused; accepted so the client can call with (job_id, body).
         self._verify_job(job_id, "training")
-        results = await self._gather_training_refs(lambda: [w.step.remote() for w in self.training_workers])
+        learning_rate = (body or {}).get("learning_rate")
+        results = await self._gather_training_refs(
+            lambda: [w.step.remote(learning_rate) for w in self.training_workers]
+        )
         merged = dict(
             job_id=job_id,
             metrics=merge_dict_shards([r["metrics"] for r in results]),

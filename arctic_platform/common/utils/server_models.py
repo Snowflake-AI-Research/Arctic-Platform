@@ -70,6 +70,16 @@ class JobConfig(BaseModel):
     def _coerce_null_seed(cls, value: Any) -> Any:
         return DEFAULT_SEED if value is None else value
 
+    @field_validator("ds_config")
+    @classmethod
+    def _reject_top_level_ds_config(cls, value: dict | None) -> dict | None:
+        if value is not None:
+            raise ValueError(
+                "ds_config is not read at the top level; set training_config.ds_config for training "
+                "and log_prob_config for a DeepSpeed log-prob engine"
+            )
+        return value
+
     @model_validator(mode="after")
     def _validate_sp_size(self) -> "JobConfig":
         # Resolve at input time so a bad or self-contradicting parallel degree

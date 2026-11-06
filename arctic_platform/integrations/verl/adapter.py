@@ -44,6 +44,8 @@ from arctic_platform.client import AsyncArcticRLClient
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
+from arctic_platform.common.optimizer import OptimizerSettings
+from arctic_platform.common.training_settings import MicroBatchSpec
 from arctic_platform.rl.ray_server import ArcticRLRayServerState
 
 _ARCTIC_METRIC_REDUCTION_FN = {
@@ -534,25 +536,23 @@ class ArcticRLClientWrapper(RemoteBackend):
             OmegaConf.to_container(rollout_inference_cfg, resolve=True) if rollout_inference_cfg is not None else None
         )
 
-        # Forward grad_clip to the DeepSpeed engine so it clips global grad-norm
-        # to the same threshold verl applies in the FSDP path (otherwise DS
-        # defaults to no clipping -> trajectory divergence vs verl baseline).
-        # Fold optimizer + LR scheduler into ds_config (canonical nested shape
-        # from #59: DeepSpeed owns these knobs inside ds_config, not a separate
-        # training_config wire field).
+        # Clip global grad-norm to the threshold verl applies in the FSDP path; 0 disables clipping, as verl does
+        # when grad_clip is unset. Each PPO mini-batch is one fwd-bwd, split into the microbatches DeepSpeed's
+        # accumulation count used to imply.
         ds_config = self._create_ds_config(n_training_gpus)
-        opt_params = {
-            "lr": optim_cfg.lr,
-            "weight_decay": optim_cfg.weight_decay,
-            "betas": list(optim_cfg.betas),
-            "eps": 1e-8,
-        }
-        ds_config["optimizer"] = {"type": "AdamW", "params": opt_params}
+        num_micro_batches = ds_config.pop("gradient_accumulation_steps")
+        ds_config.pop("train_micro_batch_size_per_gpu")
+        ds_config.pop("train_batch_size")
+        optimizer = OptimizerSettings(
+            lr=optim_cfg.lr,
+            weight_decay=optim_cfg.weight_decay,
+            betas=list(optim_cfg.betas),
+            eps=1e-8,
+        )
         grad_clip = optim_cfg.get("clip_grad", None)
         if grad_clip is None:
             grad_clip = actor_cfg.get("grad_clip", None)
-        if grad_clip is not None and float(grad_clip) > 0:
-            ds_config["gradient_clipping"] = float(grad_clip)
+        gradient_clipping = float(grad_clip) if grad_clip is not None and float(grad_clip) > 0 else 0.0
 
         warmup_steps = round(optim_cfg.lr_warmup_steps_ratio * training_horizon)
         if lr_scheduler_type == "cosine":
@@ -595,6 +595,9 @@ class ArcticRLClientWrapper(RemoteBackend):
             training=TrainingConfig(
                 full_determinism=self._backend_config.train.determinism.get("full", False),
                 checkpoint_path=self.config.trainer.default_local_dir,
+                optimizer=optimizer,
+                gradient_clipping=gradient_clipping,
+                mb_spec=MicroBatchSpec(num_micro_batches=num_micro_batches),
                 ds_config=ds_config,
                 ds_worker_config=ds_worker_config,
                 cuda_ipc=self.cuda_ipc_weight_sync,

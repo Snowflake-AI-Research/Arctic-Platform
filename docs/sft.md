@@ -37,7 +37,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m arctic_platform.sft.examples.run_sft_demo --t
 Or drive the client yourself:
 
 ```python
-from arctic_platform.client import TrainingConfig
+from arctic_platform.client import OptimizerSettings, TrainingConfig
 from arctic_platform.sft import ArcticSFTClient, ArcticSFTClientConfig
 
 config = ArcticSFTClientConfig(
@@ -45,17 +45,8 @@ config = ArcticSFTClientConfig(
     training_gpus=2,
     training=TrainingConfig(
         checkpoint_path="/data-fast/my-run/ckpt",  # required for new jobs
-        ds_config={
-            "train_micro_batch_size_per_gpu": 1,
-            "train_batch_size": 2,
-            "gradient_accumulation_steps": 1,
-            "zero_optimization": {"stage": 2},
-            "bf16": {"enabled": True},
-            "optimizer": {
-                "type": "AdamW",
-                "params": {"lr": 1e-5, "betas": [0.9, 0.999], "weight_decay": 0.0},
-            },
-        },
+        optimizer=OptimizerSettings(lr=1e-5, betas=[0.9, 0.999], weight_decay=0.0),
+        ds_config={"zero_optimization": {"stage": 2}},
     ),
 )
 
@@ -121,7 +112,7 @@ the client must not touch CUDA.
             "labels": LongTensor[B, S_i],          # -100 = ignore (prompt / pad)
             "position_ids": LongTensor[B, S_i],    # required for sample packing
         },
-        # ... len(list) == gradient_accumulation_steps
+        # ... len(list) == training.mb_spec.num_micro_batches
     ],
     "meta": {
         "pad_token_id": int,
@@ -140,9 +131,7 @@ Constraints:
 
 - Each microbatch's `B` must be ≥ `training_gpus` and divisible by it — the
   server DP-shards **each** microbatch independently.
-- `train_micro_batch_size_per_gpu` in `ds_config` is the **per-rank** size
-  after that shard (`B / training_gpus`).
-- `len(batch)` must equal the server's `gradient_accumulation_steps`.
+- `len(batch)` must equal `training.mb_spec.num_micro_batches` (default 1).
 - Missing `labels` raises a clear `ValueError`. All-masked labels
   (`labels == -100`) contribute `(loss.sum=0, loss.tokens=0)` so they cancel
   cleanly in the global token-mean.

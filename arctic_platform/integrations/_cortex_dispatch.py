@@ -65,17 +65,16 @@ def placement_timeout(job_ready_timeout: float, startup_timeout: float | None) -
 
 
 def _to_unified_config(legacy: _LegacyConfig):
-    """Legacy config -> unified client config. Optimizer is merged into
-    ``training.ds_config`` so Cortex's sub-job builder can lift it."""
+    """Legacy config -> unified client config. Cortex packs microbatches by
+    ``ds_worker_config.mb_spec``'s token budget, not the legacy accumulation count."""
     from arctic_platform.client.config import ArcticClientConfig as U
     from arctic_platform.client.config import CortexConfig
     from arctic_platform.client.config import SamplingConfig
     from arctic_platform.client.config import TrainingConfig
 
-    ds_config = dict(legacy.ds_config or {})
-    tc_in = dict(legacy.training_config or {})
-    if "optimizer" in tc_in and "optimizer" not in ds_config:
-        ds_config["optimizer"] = tc_in["optimizer"]
+    settings = legacy.training_settings()
+    worker = dict(legacy.ds_worker_config or {})
+    mb_spec = worker.pop("mb_spec", None)
 
     fields: dict[str, Any] = {
         "model_name": legacy.model_name,
@@ -85,8 +84,9 @@ def _to_unified_config(legacy: _LegacyConfig):
         "log_prob_gpus": legacy.log_prob_gpus,
         "backend": CortexConfig(job_ready_timeout=legacy.job_ready_timeout),
         "training": TrainingConfig(
-            ds_config=ds_config or None,
-            ds_worker_config=legacy.ds_worker_config or None,
+            **settings.model_dump(exclude={"mb_spec"}),
+            mb_spec=mb_spec,
+            ds_worker_config=worker or None,
             checkpoint_path=legacy.checkpoint_path,
             full_determinism=legacy.full_determinism,
         ),

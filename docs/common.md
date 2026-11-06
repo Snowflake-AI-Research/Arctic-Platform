@@ -131,7 +131,7 @@ Forwarded in the `initialize` payload (`JobConfig`):
 
 ### Gradient Accumulation Precision
 
-**The AP DeepSpeed worker accumulates gradients in FP32 unless `data_types.grad_accum_dtype` says otherwise.** `DeepSpeedWorker.ds_training_config()` sets `grad_accum_dtype` to `"fp32"` when the key is missing or `null`, whether the `data_types` block is absent, empty, or carries only other fields. Every other field of a supplied block is kept, and the caller's block is not mutated.
+**The AP DeepSpeed worker accumulates gradients in FP32 unless `data_types.grad_accum_dtype` says otherwise.** `onprem_deepspeed_config()` sets `grad_accum_dtype` to `"fp32"` when the key is missing or `null`, whether the `data_types` block is absent, empty, or carries only other fields. Every other field of a supplied block is kept, and the caller's block is not mutated.
 
 **Set `data_types.grad_accum_dtype` explicitly to select a different accumulation precision.** An explicit value always wins; the FP32 default written out in full is:
 

@@ -20,6 +20,7 @@ import torch
 
 from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
 from arctic_platform.common.deepspeed_engine import build_deepspeed_config
+from arctic_platform.common.training_settings import WorkerTrainingSettings
 from arctic_platform.testing_utils import get_unique_port_number
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import reserve_free_port
@@ -27,36 +28,32 @@ from arctic_platform.testing_utils import set_seed
 from arctic_platform.testing_utils import torch_assert_equal
 
 
-@pytest.fixture
-def worker():
-    from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
+def _onprem_config(ds_config=None, **settings):
+    from arctic_platform.common.deepspeed_worker import onprem_deepspeed_config
 
-    return object.__new__(DeepSpeedWorker.__ray_metadata__.modified_class)
+    training = WorkerTrainingSettings(ds_config=ds_config, **settings)
+    return onprem_deepspeed_config(training, dtype="bfloat16", world_size=1)
 
 
-@pytest.mark.parametrize("job_config", [{}, {"training_config": {}}])
-def test_missing_data_types_retains_worker_fp32_accumulation_default(worker, job_config):
-    config = {}
-    assert worker.ds_training_config(job_config, config, {}) is config
-    assert config["data_types"] == {"grad_accum_dtype": "fp32"}
+@pytest.mark.parametrize("ds_config", [None, {}])
+def test_missing_data_types_retains_worker_fp32_accumulation_default(ds_config):
+    assert _onprem_config(ds_config)["data_types"] == {"grad_accum_dtype": "fp32"}
 
 
 @pytest.mark.parametrize(
     "data_types", [{"grad_accum_dtype": "bf16"}, {"grad_accum_dtype": "fp32", "other_setting": True}]
 )
-def test_explicit_accumulation_precision_is_preserved(worker, data_types):
+def test_explicit_accumulation_precision_is_preserved(data_types):
     supplied = deepcopy(data_types)
-    config = {"data_types": supplied}
-    worker.ds_training_config({}, config, {})
+    config = _onprem_config({"data_types": supplied})
     assert config["data_types"] == data_types
     assert supplied == data_types
 
 
 @pytest.mark.parametrize("data_types", [None, {}, {"other_setting": True}, {"grad_accum_dtype": None}])
-def test_supplied_block_without_accumulation_precision_gets_worker_fp32_default(worker, data_types):
+def test_supplied_block_without_accumulation_precision_gets_worker_fp32_default(data_types):
     supplied = deepcopy(data_types)
-    config = {"data_types": supplied}
-    worker.ds_training_config({}, config, {})
+    config = _onprem_config({"data_types": supplied})
     assert config["data_types"] == {**(data_types or {}), "grad_accum_dtype": "fp32"}
     assert supplied == data_types
 
@@ -105,7 +102,7 @@ def test_deepspeed_resolves_explicit_float32_accumulation_without_changing_model
 
 
 @require_torch_gpu
-def test_worker_default_matches_explicit_fp32_loss_and_gradient_norm(worker):
+def test_worker_default_matches_explicit_fp32_loss_and_gradient_norm():
     """The worker default, with or without a supplied ``data_types`` block, matches explicit FP32 exactly."""
     import deepspeed
     import torch.distributed as dist
@@ -125,19 +122,18 @@ def test_worker_default_matches_explicit_fp32_loss_and_gradient_norm(worker):
         for label in ("worker_default", "block_without_dtype", "explicit_fp32"):
             set_seed(17)
             model = torch.nn.Linear(16, 8, bias=False, device="cuda", dtype=torch.bfloat16)
-            config = dict(
-                train_micro_batch_size_per_gpu=1,
-                gradient_accumulation_steps=4,
-                bf16=dict(enabled=True),
-                zero_optimization=dict(stage=2),
-                gradient_clipping=0.0,
-                steps_per_print=1000,
-            )
+            overrides = dict(steps_per_print=1000)
             if label == "explicit_fp32":
-                config["data_types"] = dict(grad_accum_dtype="fp32")
+                overrides["data_types"] = dict(grad_accum_dtype="fp32")
             elif label == "block_without_dtype":
-                config["data_types"] = {}
-            worker.ds_training_config({"training_config": {"optimizer": {"torch_adam": True, "lr": 0.01}}}, config, {})
+                overrides["data_types"] = {}
+            config = _onprem_config(overrides, gradient_clipping=0.0, fp32_masters=True)
+            # DeepSpeed's own accumulation loop, so its accumulation buffer is what gets measured.
+            config.update(
+                gradient_accumulation_steps=4,
+                train_batch_size=4,
+                optimizer={"type": "AdamW", "params": {"lr": 0.01, "torch_adam": True}},
+            )
             engine, *_ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
             assert engine.get_data_types() == (torch.bfloat16, torch.float32)
             losses = []

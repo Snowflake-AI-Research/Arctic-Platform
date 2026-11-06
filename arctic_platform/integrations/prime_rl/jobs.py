@@ -52,10 +52,8 @@ def training_sub_job(config: CortexRLConfig) -> dict[str, Any]:
     model = config.trainer.model
     optim = config.trainer.optim
     training = config.cortex.training
-    dp_size = training.num_gpus // training.sp_size
     training_config: dict[str, Any] = {
         "max_seq_len": model.seq_len,
-        "train_batch_size": dp_size,
         "n_gpus": training.num_gpus,
         "mb_spec": {"max_tokens_per_mb": training.max_tokens_per_mb or model.seq_len},
         "optimizer": {
@@ -66,9 +64,6 @@ def training_sub_job(config: CortexRLConfig) -> dict[str, Any]:
             "eps": ADAMW_EPS,
         },
         "ds_config": {
-            "train_micro_batch_size_per_gpu": 1,
-            "train_batch_size": dp_size,
-            "gradient_accumulation_steps": 1,
             "bf16": {"enabled": True},
             "zero_optimization": {"stage": 1, "reduce_scatter": True},
         },

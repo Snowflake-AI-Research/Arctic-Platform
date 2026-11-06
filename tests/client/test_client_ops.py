@@ -746,7 +746,7 @@ class TestCortexNoopOffload:
         return cfg._cortex_training_sub_job()["training_config"]["ds_config"]["zero_optimization"]
 
     def test_drops_noop_offload(self):
-        # verbatim from the ds_config SkyRL sent on the job that failed to provision
+        # verbatim from the zero block SkyRL sent on the job that failed to provision
         block = self._zero_block(
             {
                 "zero_optimization": {
@@ -754,7 +754,6 @@ class TestCortexNoopOffload:
                     "offload_param": {"device": "none"},
                     "stage": 0,
                 },
-                "optimizer": {"type": "AdamW", "params": {"lr": 1e-6}},
             }
         )
         assert block == {"stage": 0}
