@@ -226,7 +226,7 @@ def _status(fn) -> str:
         lps = fn()
         return "ok" if all(bool(torch.isfinite(lp[:-1]).all()) for lp in lps) else "non-finite log-probs"
     except Exception as err:  # noqa: BLE001
-        lines = [line for line in str(err).strip().splitlines() if "TORCHDYNAMO_VERBOSE" not in line]
+        lines = [line for line in str(err).strip().splitlines() if line.strip() and "TORCHDYNAMO_VERBOSE" not in line]
         return f"{type(err).__name__}: {lines[-1][:300] if lines else ''}"
 
 
