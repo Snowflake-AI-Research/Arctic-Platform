@@ -425,3 +425,96 @@ def test_stamped_group_ids_keep_left_padded_rows_together_onprem():
     )
     assert {0, 1} in _rank_sets(reorder, 2)
     assert {2, 3} in _rank_sets(reorder, 2)
+
+
+_TWO_PROMPT_LENGTHS = [90, 85, 80, 75, 20, 15, 10, 5]
+_TWO_PROMPT_IDS = [0, 0, 0, 0, 1, 1, 1, 1]
+
+
+def test_sample_balance_keeps_each_prompt_group_on_one_rank():
+    from arctic_platform.common.utils.balanced_batch import assign_balanced_batch
+
+    ids = torch.tensor(_TWO_PROMPT_IDS)
+    from_batch = assign_balanced_batch(2, {}, lengths=_TWO_PROMPT_LENGTHS, prompt_group_ids=ids)
+    from_meta = assign_balanced_batch(2, {"prompt_group_ids": ids}, lengths=_TWO_PROMPT_LENGTHS)
+    assert from_batch == from_meta == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    for rows in from_batch:
+        assert len({_TWO_PROMPT_IDS[row] for row in rows}) == 1
+
+
+def test_prompt_mean_loss_matches_one_rank_after_the_split():
+    from arctic_platform.rl.processors.functional import agg_loss
+
+    lengths = _TWO_PROMPT_LENGTHS
+    width = max(lengths)
+    attention_mask = (torch.arange(width).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)).long()
+    loss_mat = torch.linspace(-1.0, 1.0, len(lengths) * width).view(len(lengths), width)
+    ids = torch.tensor(_TWO_PROMPT_IDS)
+    shards, reorder = _split_batch(
+        {
+            "batch": {
+                "input_ids": torch.arange(len(lengths) * width).view(len(lengths), width),
+                "attention_mask": attention_mask.clone(),
+                "loss_mat": loss_mat.clone(),
+                "prompt_group_ids": ids.clone(),
+            },
+            "meta": {},
+            "processing": {"loss_fn": "grpo"},
+        },
+        num_workers=2,
+    )
+    assert reorder is not None
+    shard_ids = [shard["batch"]["prompt_group_ids"] for shard in shards]
+    assert sum(int(torch.unique(rank_ids).numel()) for rank_ids in shard_ids) == 2
+
+    expected = agg_loss(loss_mat, attention_mask, "prompt-mean", global_batch_size=2, prompt_group_ids=ids)
+    # DeepSpeed averages the per-rank losses, and each rank scales by dp_size.
+    per_rank = [
+        agg_loss(
+            shard["batch"]["loss_mat"],
+            shard["batch"]["attention_mask"],
+            "prompt-mean",
+            dp_size=2,
+            global_batch_size=2,
+            prompt_group_ids=shard["batch"]["prompt_group_ids"],
+        )
+        for shard in shards
+    ]
+    torch.testing.assert_close(sum(per_rank) / 2, expected, rtol=0, atol=1e-6)
+
+
+def test_prompt_groups_balance_whole_groups_by_cost():
+    from arctic_platform.common.utils.balanced_batch import assign_balanced_batch
+
+    lengths = [10, 10, 9, 9, 1, 1, 2, 2]
+    ids = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
+    assert assign_balanced_batch(2, {}, lengths=lengths, prompt_group_ids=ids) == [[0, 1, 4, 5], [2, 3, 6, 7]]
+
+
+def test_interleaved_prompt_group_rows_stay_together():
+    from arctic_platform.common.utils.balanced_batch import assign_balanced_batch
+
+    ids = [0, 1, 0, 1, 2, 3, 2, 3]
+    assignment = assign_balanced_batch(2, {}, lengths=[9, 1, 8, 2, 7, 3, 6, 4], prompt_group_ids=torch.tensor(ids))
+    assert sorted(_flat(assignment)) == list(range(8))
+    for rows in assignment:
+        assert len(rows) == 4
+        for group_id in {ids[row] for row in rows}:
+            assert {row for row, other in enumerate(ids) if other == group_id} <= set(rows)
+
+
+def test_prompt_groups_that_cannot_fill_equal_ranks_keep_arrival_order():
+    from arctic_platform.common.utils.balanced_batch import assign_balanced_batch
+
+    three_pairs = torch.tensor([0, 0, 1, 1, 2, 2])
+    assert assign_balanced_batch(2, {}, lengths=[6, 5, 4, 3, 2, 1], prompt_group_ids=three_pairs) is None
+    odd_rows = torch.tensor([0, 0, 1, 1, 2])
+    assert assign_balanced_batch(2, {}, lengths=[5, 4, 3, 2, 1], prompt_group_ids=odd_rows) is None
+
+
+def test_unusable_prompt_group_ids_keep_arrival_order():
+    from arctic_platform.common.utils.balanced_batch import assign_balanced_batch
+
+    lengths = [4, 3, 2, 1]
+    assert assign_balanced_batch(2, {}, lengths=lengths, prompt_group_ids=torch.tensor([0, 0, 1])) is None
+    assert assign_balanced_batch(2, {}, lengths=lengths, prompt_group_ids=torch.tensor([[0, 0], [1, 1]])) is None

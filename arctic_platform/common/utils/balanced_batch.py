@@ -16,7 +16,7 @@
 """Rank assignment shared by the on-prem server and Cortex.
 
 ``assign_balanced_batch`` is the splitter entry point. It keeps arrival order,
-balances sample lengths, or balances whole ZoRRo prompt groups. The functions
+balances sample lengths, or balances whole prompt groups. The functions
 return row indices and do not mutate the batch. This module does not import
 the RL package.
 """
@@ -41,18 +41,21 @@ def assign_balanced_batch(
     ``balance_batch`` false keeps arrival order (``None``). ``True`` and a missing
     key both balance. Legacy ``load_balancer`` keys are ignored: a caller that
     wants arrival order sends ``balance_batch`` false. ZoRRo balances whole
-    prompt groups. Every other request balances individual sample lengths, using
+    prompt groups. Every other request balances sample lengths, using
     ``lengths`` when the caller measured them and ``attention_mask`` otherwise.
+    With ``prompt_group_ids`` (batch or meta) it balances whole groups instead,
+    because ``prompt-mean`` averages each prompt on one rank.
     """
     if _balance_disabled(meta):
         return None
+    group_ids = prompt_group_ids if prompt_group_ids is not None else meta.get("prompt_group_ids")
     if meta.get("zorro_train_enable") is True:
         return _assign_prompt_groups(
             num_shards,
             meta,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            prompt_group_ids=prompt_group_ids if prompt_group_ids is not None else meta.get("prompt_group_ids"),
+            prompt_group_ids=group_ids,
         )
     measured = lengths
     if measured is None:
@@ -60,7 +63,42 @@ def assign_balanced_batch(
     if measured is None or len(measured) < num_shards:
         return None
     costs = [int(length) * int(length) for length in measured]
-    return assign_row_lpt(costs, num_shards)
+    if group_ids is None:
+        return assign_row_lpt(costs, num_shards)
+    return _assign_whole_groups(costs, group_ids, num_shards)
+
+
+def _assign_whole_groups(costs: Sequence[int], prompt_group_ids, num_shards: int) -> Optional[list[list[int]]]:
+    """Pack whole ``prompt_group_ids`` groups, or keep arrival order (``None``).
+
+    A group's cost is the sum of its row costs. Arrival order is kept when the
+    ids do not give one value per row, or when the groups cannot fill equal
+    rank bins. A group is never split across ranks here.
+    """
+    groups = _id_groups(prompt_group_ids, len(costs))
+    if groups is None:
+        return None
+    group_costs = [sum(costs[row] for row in group) for group in groups]
+    try:
+        return assign_zorro_groups(groups, group_costs, num_shards, len(costs))
+    except ValueError:
+        return None
+
+
+def _id_groups(prompt_group_ids, num_rows: int) -> Optional[list[list[int]]]:
+    """Rows per id in first-seen order, or ``None`` unless the ids are one per row."""
+    import torch
+
+    if (
+        not torch.is_tensor(prompt_group_ids)
+        or prompt_group_ids.ndim != 1
+        or int(prompt_group_ids.shape[0]) != num_rows
+    ):
+        return None
+    grouped: dict[int, list[int]] = {}
+    for row, group_id in enumerate(prompt_group_ids.tolist()):
+        grouped.setdefault(int(group_id), []).append(row)
+    return list(grouped.values())
 
 
 def _balance_disabled(meta: dict) -> bool:
@@ -316,17 +354,8 @@ def prompt_groups(
     if response_length < 0 or response_length > seq_len:
         raise ValueError(f"response_length={response_length} is outside sequence width {seq_len}")
     prompt_len = seq_len - response_length
-    ids_ok = (
-        torch.is_tensor(prompt_group_ids)
-        and prompt_group_ids.ndim == 1
-        and int(prompt_group_ids.shape[0]) == batch_size
-    )
-    if ids_ok:
-        grouped: dict[int, list[int]] = {}
-        for row, group_id in enumerate(prompt_group_ids.reshape(-1).tolist()):
-            grouped.setdefault(int(group_id), []).append(row)
-        groups = list(grouped.values())
-    else:
+    groups = _id_groups(prompt_group_ids, int(batch_size))
+    if groups is None:
         prompts = input_ids[:, :prompt_len]
         grouped_prompts: dict[tuple, list[int]] = {}
         for row in range(batch_size):
