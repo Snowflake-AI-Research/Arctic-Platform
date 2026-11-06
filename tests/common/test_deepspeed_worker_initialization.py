@@ -116,3 +116,40 @@ def test_expert_parallel_worker_builds_the_moe_spec_and_splits_expert_groups(mon
     assert observed["engine"]["ep_size"] == 8
     assert observed["engine"]["mpu"] is None
     assert observed["ds_config"]["train_batch_size"] == 8
+
+
+def test_forward_only_worker_skips_training_engine_initialization(monkeypatch):
+    pytest.importorskip("ray")
+    pytest.importorskip("deepspeed")
+    from arctic_platform.common import deepspeed_worker as mod
+
+    worker = object.__new__(mod.DeepSpeedWorker.__ray_metadata__.modified_class)
+    worker.rank, worker.world_size, worker.master_port = 0, 1, 12345
+    model = torch.nn.Identity()
+    spec = SimpleNamespace(parallelism=SimpleNamespace(expert_parallel=1, sequence_parallel=1))
+    calls = []
+    monkeypatch.setattr(mod.deepspeed, "init_distributed", lambda: None)
+    monkeypatch.setattr(mod, "pr0", lambda *args: None)
+    monkeypatch.setattr(mod, "ds_worker_dense_model_spec", lambda *args, **kwargs: spec)
+    monkeypatch.setattr(mod, "build_model", lambda selected: SimpleNamespace(model=model))
+    monkeypatch.setattr(
+        mod, "initialize_training_engine", lambda *args, **kwargs: pytest.fail("unexpected training engine")
+    )
+
+    def initialize(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(local_rank=0, global_steps=0), None, None, None
+
+    monkeypatch.setattr(mod.deepspeed, "initialize", initialize)
+    monkeypatch.setattr(mod, "get_accelerator", lambda: SimpleNamespace(device_name=lambda rank: "cpu"))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda gpu: SimpleNamespace(uuid="test"))
+
+    assert worker.initialize(
+        "localhost",
+        {"model_name": "unused", "job_type": "log_prob", "ds_worker_config": {"attn_implementation": "sdpa"}},
+    )
+    assert len(calls) == 1
+    assert calls[0]["model"] is model
+    assert set(calls[0]) == {"model", "config"}
+    assert "optimizer" not in calls[0]["config"]
