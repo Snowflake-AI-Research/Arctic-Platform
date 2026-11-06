@@ -126,8 +126,13 @@ def to_cortex_fwd_bwd_payload(
     Requires ``loss_mask`` or ``response_mask``; falling back to
     ``attention_mask`` would train on prompt tokens.
 
-    Rows are left-aligned on the way out (see :func:`_left_align_batch`) --
-    Cortex's packer rejects any other layout.
+    Non-ZoRRo rows are left-aligned on the way out (see :func:`_left_align_batch`).
+    Cortex's packer rejects any other layout. ZoRRo rows stay in the client
+    layout: left-aligning them moves response tokens into the prompt slice the
+    unpacked worker reads. A packed job that asks for ZoRRo is refused. ZoRRo
+    sends ``prompt_group_ids`` derived from the original ``prompts`` block.
+    Both paths drop ``old_log_probs``. The server re-derives π_old. Only a
+    real ``True`` selects the ZoRRo path.
     """
     import torch
 
@@ -162,6 +167,17 @@ def to_cortex_fwd_bwd_payload(
         raise ValueError("cortex fwd_bwd requires 'advantages' [B, S]")
     tensors.pop("old_log_probs", None)
 
+    if meta.get("zorro_train_enable") is True:
+        return _to_cortex_zorro_fwd_bwd(
+            tensors,
+            meta,
+            processing_in,
+            input_ids,
+            attention_mask,
+            advantages,
+            loss_mask,
+        )
+
     forwarded = {"input_ids": input_ids}
     for k in ("position_ids", "labels"):
         if k in tensors:
@@ -188,6 +204,97 @@ def to_cortex_fwd_bwd_payload(
         if k not in proc_config and k in meta:
             proc_config[k] = int(meta[k])
 
+    from arctic_platform.common.balance_metadata import apply_balance_metadata
+
+    _copy_batch_prompt_group_ids(meta, tensors)
+    apply_balance_metadata(context, meta, input_ids, tensors.get("prompts"))
+
+    return {
+        "args": (),
+        "kwargs": kwargs_out,
+        "context": context,
+        "processing": {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": proc_config},
+    }
+
+
+def _copy_batch_prompt_group_ids(meta: dict, tensors: dict) -> None:
+    """Keep a caller-supplied id vector when meta does not already have one."""
+    import torch
+
+    if torch.is_tensor(meta.get("prompt_group_ids")):
+        return
+    group_ids = tensors.get("prompt_group_ids")
+    if torch.is_tensor(group_ids):
+        meta["prompt_group_ids"] = group_ids
+
+
+def _prompt_row_group_ids(prompts):
+    """One id per row, shared by identical prompt rows, in first-seen order."""
+    import torch
+
+    ids = []
+    seen: dict[tuple, int] = {}
+    for row in prompts:
+        key = tuple(row.tolist())
+        if key not in seen:
+            seen[key] = len(seen)
+        ids.append(seen[key])
+    return torch.tensor(ids, dtype=torch.int64)
+
+
+def _to_cortex_zorro_fwd_bwd(
+    tensors: dict,
+    meta: dict,
+    processing_in: dict | None,
+    input_ids,
+    attention_mask,
+    advantages,
+    loss_mask,
+) -> dict:
+    """ZoRRo wire shape. Rows stay in the client layout.
+
+    The unpacked worker slices the response at ``max_prompt_len``. Left-aligning
+    a shorter prompt moves response tokens into that slice and drops them from
+    the loss, so rows are sent as the client built them. A packed job that asks
+    for ZoRRo is refused before this runs. ``prompts`` is the original prompt
+    block. When the caller did not send ``prompt_group_ids``, they are derived
+    from that block. ``old_log_probs`` is dropped, and the server re-derives π_old.
+    """
+    import torch
+
+    prompts = tensors.get("prompts")
+    if not torch.is_tensor(prompts) or prompts.ndim != 2 or int(prompts.shape[1]) == 0:
+        raise ValueError("ZoRRo fwd_bwd requires batch['prompts'] with width max_prompt_len")
+    response_mask = tensors.get("response_mask", loss_mask)
+    kwargs_out: dict[str, Any] = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "prompts": prompts,
+        "response_mask": response_mask,
+    }
+    if torch.is_tensor(tensors.get("position_ids")):
+        kwargs_out["position_ids"] = tensors["position_ids"]
+    if torch.is_tensor(tensors.get("labels")):
+        kwargs_out["labels"] = tensors["labels"]
+
+    caller_config = dict((processing_in or {}).get("config") or {})
+    proc_config: dict[str, Any] = {**_DEFAULT_PROC_CONFIG, **caller_config}
+    for k in ("global_batch_size", "batch_num_tokens"):
+        if k not in proc_config and k in meta:
+            proc_config[k] = int(meta[k])
+
+    context: dict[str, Any] = {
+        "input_ids": input_ids,
+        "advantages": advantages,
+        "loss_mask": loss_mask,
+        **{key: meta[key] for key in ("temperature", "calculate_entropy") if key in meta},
+    }
+    from arctic_platform.common.balance_metadata import apply_balance_metadata
+
+    _copy_batch_prompt_group_ids(meta, tensors)
+    if meta.get("balance_batch") is not False and not torch.is_tensor(meta.get("prompt_group_ids")):
+        meta["prompt_group_ids"] = _prompt_row_group_ids(prompts)
+    apply_balance_metadata(context, meta, input_ids, prompts)
     return {
         "args": (),
         "kwargs": kwargs_out,
