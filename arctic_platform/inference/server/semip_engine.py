@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import glob
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -246,6 +247,15 @@ _INCOMING_NAME = ".incoming"
 # which is why this order is spelled out here rather than reusing the
 # publisher's SKELETON_DIRS, whose order is only its upload order.
 _COPY_SUBDIRS = (_COMPILATION_DIR, _IMAGE_DIR)
+
+# How those directories are copied. Unset is "local": a parallel ranged copy
+# from the mirror with O_DIRECT writes, ~4 s for GLM-5.3's 79 GB where copytree
+# takes ~20. "peers" pulls the ranges from every node's model-cache daemon
+# instead, "off" is copytree. See semip_gather.py.
+_GATHER_ENV = "SEMIP_GATHER"
+# The ranged copy plans from the daemon's manifest, which every verified mirror
+# directory carries; a source without one is copied with copytree.
+_DAEMON_MANIFEST = "_neutrino_manifest.json"
 
 # Written by _semip_save_weights beside the shards it indexes; TP>1 fans out
 # into rank<N>/ subdirectories with one of these each.
@@ -950,10 +960,7 @@ def _resolve_model_dir(vllm_config: dict[str, Any],
     if nnodes > 1:
         model_dir = os.path.join(model_dir, f"{_NODE_DIR_PREFIX}{node_rank}")
 
-    raw_source = os.environ.get(_IMAGE_SOURCE_ENV)
-    if raw_source is None:
-        raw_source = _DEFAULT_IMAGE_SOURCE
-    source_root = raw_source.strip().rstrip("/")
+    source_root = _image_source_root()
     if source_root == root:
         # The mirror is read-only and the cache is written to, so one path
         # cannot be both. Copying a directory onto itself would at best waste
@@ -997,6 +1004,14 @@ def _resolve_model_dir(vllm_config: dict[str, Any],
     return _ImagePaths(model_dir, key, skeleton_root, weight_root,
                        image_ref, driver, slot, count, key_dir, nnodes,
                        node_rank)
+
+
+def _image_source_root() -> str:
+    """The mirror root, or "" when the job turned the mirror off."""
+    raw_source = os.environ.get(_IMAGE_SOURCE_ENV)
+    if raw_source is None:
+        raw_source = _DEFAULT_IMAGE_SOURCE
+    return raw_source.strip().rstrip("/")
 
 
 def _model_slug(model: Any) -> str:
@@ -1669,21 +1684,39 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
     incoming = os.path.join(model_dir, _INCOMING_NAME)
     t0 = time.perf_counter()
     files = total = 0
+    gathered = None
     try:
         shutil.rmtree(incoming, ignore_errors=True)
         for sub in _COPY_SUBDIRS:
             src = os.path.join(source_dir, sub)
             if not os.path.isdir(src):
                 raise RuntimeError(f"{src} is missing from the published image")
-            # copytree defaults to copy2, which preserves mode. Necessary but
-            # not sufficient: CRIU re-validates the recorded mode of every path
-            # it re-maps, and `src` is downstream of S3, which carries no POSIX
-            # mode -- so these bytes arrive already flattened to the mirroring
-            # daemon's umask and there is nothing left here to preserve.
-            # _apply_recorded_modes repairs that after the flip. Do not shell
-            # out to `cp -a` instead -- it implies -p, tries to chown as a
-            # non-root user, and returns non-zero after copying fine.
-            shutil.copytree(src, os.path.join(incoming, sub))
+        # By name rather than `from ... import`: the tests load this module
+        # from its file, without the package, and register the gather in
+        # sys.modules the same way.
+        planned = os.path.isfile(os.path.join(verified_dir or source_dir,
+                                              _DAEMON_MANIFEST))
+        semip_gather = (importlib.import_module(
+            "arctic_platform.inference.server.semip_gather")
+            if planned and os.environ.get(_GATHER_ENV, "").strip().lower()
+            != "off" else None)
+        if semip_gather is not None and semip_gather.enabled():
+            gathered = semip_gather.gather(
+                source_dir, verified_dir or source_dir, incoming,
+                _COPY_SUBDIRS, _image_source_root())
+        else:
+            for sub in _COPY_SUBDIRS:
+                # copytree defaults to copy2, which preserves mode. Necessary
+                # but not sufficient: CRIU re-validates the recorded mode of
+                # every path it re-maps, and the source is downstream of S3,
+                # which carries no POSIX mode -- so these bytes arrive already
+                # flattened to the mirroring daemon's umask and there is
+                # nothing left here to preserve. _apply_recorded_modes repairs
+                # that after the flip. Do not shell out to `cp -a` instead --
+                # it implies -p, tries to chown as a non-root user, and returns
+                # non-zero after copying fine.
+                shutil.copytree(os.path.join(source_dir, sub),
+                                os.path.join(incoming, sub))
         files, total = _dir_bytes(incoming)
 
         for sub in _COPY_SUBDIRS:
@@ -1722,11 +1755,19 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
         shutil.rmtree(incoming, ignore_errors=True)
 
     elapsed = time.perf_counter() - t0
+    how = ""
+    if gathered is not None:
+        how = (f"; gathered {gathered.peer_bytes / 2**30:.2f} GiB from "
+               f"{gathered.peers - gathered.failed_peers}/{gathered.peers} "
+               f"peer(s) and {gathered.local_bytes / 2**30:.2f} GiB "
+               f"({gathered.local_ranges} range(s)) from the local mirror "
+               f"over {gathered.flows} flow(s)"
+               f"{', O_DIRECT' if gathered.direct else ''}")
     logger.info(
         "semi_p: materialized %s from %s: %d file(s), %.2f GiB in %.1fs "
-        "(%.0f MB/s); weights stay on the mirror",
+        "(%.0f MB/s); weights stay on the mirror%s",
         model_dir, source_dir, files, total / 2**30, elapsed,
-        total / 1e6 / elapsed if elapsed > 0 else 0.0)
+        total / 1e6 / elapsed if elapsed > 0 else 0.0, how)
     return True
 
 

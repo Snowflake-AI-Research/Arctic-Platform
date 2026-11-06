@@ -216,7 +216,16 @@ def restore_keepgraph_patch() -> None:
     _kg["orig"] = None
 
 
-_fiar_probe = {"active": False, "orig": {}, "fired": False, "suppress": False}
+_fiar_probe = {"active": False, "orig": {}, "fired": False, "suppress": False, "latched": []}
+
+# vLLM's own "workspace creation failed" flags. With one set, the matching
+# getter returns None before it resolves a backend -- and resolving the backend
+# is a CPU-group collective (``_node_count``). Wrapping the getter cannot reach
+# a caller that imported it by name before the wrap: 0.32's eager
+# ``fused_allreduce_rms_norm`` does exactly that and calls it on every forward.
+# Job 198ef66e hung on it with TP0 alone in that collective while TP1-7 took
+# the wrapper. The flags are read by every caller, however it was imported.
+_FIAR_FAILED_FLAGS = ("_fi_ar_workspace_failed", "_fi_ar_quant_workspace_failed")
 
 # Every name in ``flashinfer_all_reduce`` that can reach the allocator. Patching
 # one of them was not enough: the first attempt wrapped ``_create_workspace``
@@ -266,7 +275,7 @@ def install_fi_ar_workspace_probe() -> dict:
     """
     import os
     import traceback
-    out = {"patched": [], "missing": [], "suppress": False, "err": None}
+    out = {"patched": [], "missing": [], "suppress": False, "latched": [], "err": None}
     if _fiar_probe["active"]:
         # Report the live state, not the defaults. This is now called from two
         # places (see ``_semip_worker``) and a second call that said
@@ -274,6 +283,7 @@ def install_fi_ar_workspace_probe() -> dict:
         # log of exactly the kind this probe exists to stop telling.
         out["patched"] = sorted(_fiar_probe["orig"])
         out["suppress"] = _fiar_probe["suppress"]
+        out["latched"] = list(_fiar_probe["latched"])
         return out
     try:
         from vllm.distributed.device_communicators import (
@@ -284,6 +294,12 @@ def install_fi_ar_workspace_probe() -> dict:
     suppress = os.environ.get(_FIAR_SUPPRESS_ENV, "") not in ("", "0")
     out["suppress"] = suppress
     _fiar_probe["suppress"] = suppress
+    if suppress:
+        for flag in _FIAR_FAILED_FLAGS:
+            if hasattr(fiar, flag):
+                setattr(fiar, flag, True)
+                out["latched"].append(flag)
+        _fiar_probe["latched"] = list(out["latched"])
 
     def _wrap(name, orig):
         def _probed(*args, **kwargs):
@@ -315,7 +331,12 @@ def install_fi_ar_workspace_probe() -> dict:
 
 def restore_fi_ar_workspace_probe() -> None:
     """Put every patched name back. Scoped by the caller so no monkey-patched
-    vLLM private rides into the CRIU image."""
+    vLLM private rides into the CRIU image.
+
+    The failed-flags latched by the suppress switch stay set: an eager model
+    asks for the workspace on every forward, after this window closes, and a
+    workspace built then would ride into the image just the same -- or be
+    built after a restore, where its multicast mapping cannot work."""
     if not _fiar_probe["active"]:
         return
     try:
@@ -1308,6 +1329,7 @@ def _collect_graph_entries(worker=None):
     diag = {"n_wrappers": 0, "n_entries": 0, "n_managers": 0, "err": None,
             "n_entries_without_graph": 0, "n_wrapper_graphs": 0,
             "n_manager_graphs": 0, "n_gc_fallback_graphs": 0,
+            "gc_scanned": False,
             "complete": False, "incomplete_why": None}
     try:
         import torch
@@ -1390,6 +1412,9 @@ def _collect_graph_entries(worker=None):
                                           f"gc fallback failed: "
                                           f"{type(ex).__name__}: {ex}")
             else:
+                # A clean scan of the whole heap: an empty result after this
+                # is the absence of graphs (eager), not a blind spot.
+                diag["gc_scanned"] = True
                 diag["n_gc_fallback_graphs"] = len(entries) - n_before
                 if entries:
                     diag["complete"], diag["incomplete_why"] = True, None
