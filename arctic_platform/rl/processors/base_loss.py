@@ -36,6 +36,8 @@ from arctic_platform.registry import RegistryMeta
 from arctic_platform.registry import RegistryValidationError
 from arctic_platform.registry import get_registered_class
 
+# Delegate a whole worker shard to packed scheduling and one summed backward.
+USES_TOKEN_BUDGET_PIPELINE = "uses_token_budget_pipeline"
 REQUIRES_ALIGNED_TOKEN_LOGPROBS = "requires_aligned_token_logprobs"
 REQUIRES_TOKEN_LOGPROBS = "requires_token_logprobs"
 PRESERVES_EXPLICIT_LOSS_SCALE_CONFIG = "preserves_explicit_loss_scale_config"
@@ -115,6 +117,9 @@ class BaseLoss(ABC, metaclass=RegistryMeta):
         output_keys: list[str],
     ) -> None:
         """Amend model kwargs and name objective-owned model outputs."""
+
+    def backward_validation_callback(self, loss) -> None:
+        """Validate the combined connected loss before native backward."""
 
     def packed_reduction_callback(
         self,
