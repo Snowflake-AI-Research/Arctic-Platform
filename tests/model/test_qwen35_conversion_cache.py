@@ -139,8 +139,9 @@ def test_publication_restores_ready_cache_that_wins_before_stale_rename(monkeypa
     assert not (destination / "candidate.safetensors").exists()
 
 
+@pytest.mark.parametrize("remote", [False, True])
 @pytest.mark.parametrize("random_init", [False, True])
-def test_production_load_without_conversion_never_touches_readonly_cache(monkeypatch, tmp_path, random_init):
+def test_production_load_without_conversion_never_touches_readonly_cache(monkeypatch, tmp_path, random_init, remote):
     from types import SimpleNamespace
 
     import torch.distributed as dist
@@ -183,14 +184,28 @@ def test_production_load_without_conversion_never_touches_readonly_cache(monkeyp
     monkeypatch.setattr(builder, "HuggingFaceStorageReader", lambda **kwargs: None)
     monkeypatch.setattr(builder, "_random_init_deterministic", lambda *args: None)
     monkeypatch.setattr(builder, "_move_buffers_to_cuda", lambda *args: None)
+    downloads = []
+
+    def download(**kwargs):
+        assert remote
+        assert kwargs == {
+            "repo_id": "Qwen/test-checkpoint",
+            "repo_type": "model",
+            "allow_patterns": ["*.safetensors", "*.safetensors.index.json"],
+        }
+        downloads.append(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr(builder, "snapshot_download", download)
     config = SimpleNamespace(
-        name=str(tmp_path),
+        name="Qwen/test-checkpoint" if remote else str(tmp_path),
         fsdp_cpu_offload=True,
         debug=SimpleNamespace(random_init=random_init),
         weight_conversion_cache_dir=str(tmp_path / "read-only"),
     )
     builder.load_dcp_from_hf(Model(), config, SimpleNamespace())
     assert writes == []
+    assert len(downloads) == int(remote and not random_init)
     assert len(warnings) <= 1
     assert not (tmp_path / "read-only").exists()
 

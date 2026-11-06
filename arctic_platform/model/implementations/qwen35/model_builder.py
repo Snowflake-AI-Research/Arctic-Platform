@@ -539,7 +539,13 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         return
 
     if not Path(config.name).exists():
-        snapshot_path = Path(snapshot_download(repo_id=config.name, repo_type="model"))
+        snapshot_path = Path(
+            snapshot_download(
+                repo_id=config.name,
+                repo_type="model",
+                allow_patterns=["*.safetensors", "*.safetensors.index.json"],
+            )
+        )
     else:
         logger.info(
             f"Loading model weights from path {config.name}, skipping snapshot download. If this is not expected, "
