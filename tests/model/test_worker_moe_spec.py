@@ -17,7 +17,6 @@
 
 import json
 from copy import deepcopy
-from pathlib import Path
 
 import pytest
 
@@ -79,17 +78,17 @@ def test_worker_moe_spec_preserves_glm53_recipe_and_input(tmp_path, worker_confi
 
 
 @pytest.mark.parametrize(
-    "relative",
-    [
-        "glm-5.3-flash-bf16/long/h200-training-full.json",
-        "glm-5.3-flash-bf16/long/h200-training-full--rl-32gpus-sp16-256k.json",
-        "glm-5.3-flash/long/h200-training-lora.json",
-        "glm-5.3-flash/long/h200-training-lora--rl-16gpus-sp8-256k.json",
-    ],
+    ("sp_size", "lora"),
+    [(16, False), (8, False), (16, True), (8, True)],
 )
-def test_worker_moe_spec_current_glm_recipes(tmp_path, relative):
-    root = Path(__file__).resolve().parents[2] / "arctic_platform/correctness/configs"
-    config = json.loads((root / relative).read_text())
+def test_worker_moe_spec_isolated_glm_recipes(tmp_path, worker_config, sp_size, lora):
+    configured_worker = deepcopy(worker_config)
+    peft = configured_worker.pop("peft_config") if lora else None
+    configured_worker.pop("peft_config", None)
+    configured_worker.update(ep_size=sp_size, sp_size=sp_size)
+    config = {"training": {"ds_worker_config": configured_worker}}
+    if peft is not None:
+        config["training"]["peft"] = deepcopy(peft)
     worker = deepcopy(config["training"]["ds_worker_config"])
     peft = config["training"].get("peft")
     if peft is not None:
