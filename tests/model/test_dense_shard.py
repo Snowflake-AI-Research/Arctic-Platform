@@ -21,8 +21,8 @@ exports the unsharded model's tensors, bit for bit, under the same names and in 
 unit's whole weights at a time on rank 0. Its state dict is the unsharded model's (inside ``full_state_dict``; outside,
 both directions refuse), and loads back into a fresh sharded model, one sharded over another group size and an unsharded
 one. DeepSpeed ZeRO-2 in BF16 with FP32 masters saves it and loads it back through its non-MoE checkpoint path inside
-``full_state_dict``, and the next step is the uninterrupted run's, bit for bit; outside it, DeepSpeed's and dss's
-resumable checkpoints refuse.
+``full_state_dict``, and the next step is the uninterrupted run's, bit for bit; outside it, and through DeepSpeed's MoE
+checkpoint path inside it, DeepSpeed's checkpoints refuse on every rank (dss's own tests drive its checkpointer).
 
 GPU (8): two "nodes" of 4 ranks (shard group 4; ZeRO then reduces each shard over the 2 ranks at its position), a model
 of embedding, three blocks (one recomputed with early stop, one without, one not recomputed) and an untied LM head,
@@ -792,20 +792,18 @@ def _resume_case(rank: int, ckpt_dir: str) -> dict:
     checkpoint(engine, model, engine.save_checkpoint, ckpt_dir, tag="step2")
     want_losses, want_norm = step(engine, batches[2])
     want = _full_weights(model)
-    # Outside the context, DeepSpeed's and dss's resumable saves refuse on every rank; inside it, DeepSpeed's MoE
-    # path (the module state of data-parallel rank 0 alone) refuses too.
-    for refused in _resumable_saves(engine, ckpt_dir):
-        with pytest.raises(RuntimeError, match="Resumable checkpoints .* are not supported"):
-            refused()
+    # Outside the context, DeepSpeed's saves refuse on every rank; inside it, DeepSpeed's MoE path (the module state
+    # of data-parallel rank 0 alone) refuses too.
+    with pytest.raises(RuntimeError, match=r"Resumable checkpoints .*go through it"):
+        engine.save_checkpoint(ckpt_dir, tag="refused")
     with dense_shard.full_state_dict(model), pytest.raises(RuntimeError, match="must take the non-MoE path"):
         engine.save_checkpoint(ckpt_dir, tag="moe-path")
     engine.destroy()
     del engine, model
 
     model, engine = build(1)
-    for refused in _resumable_loads(engine, ckpt_dir):
-        with pytest.raises(RuntimeError, match="Resumable checkpoints .* are not supported"):
-            refused()
+    with pytest.raises(RuntimeError, match=r"Resumable checkpoints .*go through it"):
+        engine.load_checkpoint(ckpt_dir, tag="step2")
     path, _ = checkpoint(engine, model, engine.load_checkpoint, ckpt_dir, tag="step2")
     assert path is not None and engine.global_steps == 2, (path, engine.global_steps)
     got_losses, got_norm = step(engine, batches[2])
@@ -816,24 +814,6 @@ def _resume_case(rank: int, ckpt_dir: str) -> dict:
     for name, value in want.items():
         assert torch.equal(got[name], value), name
     return {"losses": got_losses, "norm": got_norm}
-
-
-def _resumable_saves(engine, ckpt_dir: str) -> list:
-    saves = [lambda: engine.save_checkpoint(ckpt_dir, tag="refused")]
-    try:
-        from dss.ray_dss.jobs.checkpointing.expert_parallel import ExpertParallelCheckpointer
-    except ImportError:
-        return saves
-    return saves + [lambda: ExpertParallelCheckpointer().save_resumable(engine, ckpt_dir, "refused-dss")]
-
-
-def _resumable_loads(engine, ckpt_dir: str) -> list:
-    loads = [lambda: engine.load_checkpoint(ckpt_dir, tag="step2")]
-    try:
-        from dss.ray_dss.jobs.checkpointing.expert_parallel import ExpertParallelCheckpointer
-    except ImportError:
-        return loads
-    return loads + [lambda: ExpertParallelCheckpointer().load_resumable(engine, ckpt_dir, "step2")]
 
 
 def _cpu_worker(rank: int, port: int, case, args: tuple, results) -> None:
@@ -857,10 +837,11 @@ def _cpu_worker(rank: int, port: int, case, args: tuple, results) -> None:
     dist.destroy_process_group()
 
 
-def _run_cpu(case, *args) -> dict:
+def _run_cpu(case, *args, monkeypatch) -> dict:
     from arctic_platform.testing_utils import get_unique_port_number
     from arctic_platform.testing_utils import reserve_free_port
 
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")  # on a GPU node too: the workers' DeepSpeed runs on its CPU
     port = reserve_free_port(get_unique_port_number() + 3, span=5)
     with mp.Manager() as manager:
         results = manager.dict()
@@ -868,11 +849,11 @@ def _run_cpu(case, *args) -> dict:
         return dict(results)
 
 
-def test_a_sharded_model_exports_the_unsharded_models_weights():
+def test_a_sharded_model_exports_the_unsharded_models_weights(monkeypatch):
     """HF (as a weights-only checkpoint saves it, skipped tensors included) and vLLM (as the weight sync streams it):
     the same names in the same order, the same tensors bit for bit. Rank 0 holds at most one export unit's whole
     weights beyond what the unsharded export holds."""
-    results = _run_cpu(_export_case)
+    results = _run_cpu(_export_case, monkeypatch=monkeypatch)
     r = results[0]
     for weight_format in ("hf", "vllm"):
         unsharded_peak, sharded_peak = r[weight_format]["peaks"]
@@ -884,11 +865,11 @@ def test_a_sharded_model_exports_the_unsharded_models_weights():
         assert 0 < sharded_peak - unsharded_peak <= r["largest_unit"] < r["dense"], r
 
 
-def test_the_state_dict_is_the_unsharded_models_and_loads_back():
-    results = _run_cpu(_state_dict_case)
+def test_the_state_dict_is_the_unsharded_models_and_loads_back(monkeypatch):
+    results = _run_cpu(_state_dict_case, monkeypatch=monkeypatch)
     assert all(r["keys"] == results[0]["keys"] for r in results.values()), results
 
 
-def test_a_resumable_checkpoint_continues_the_run_exactly(tmp_path):
-    results = _run_cpu(_resume_case, str(tmp_path))
+def test_a_resumable_checkpoint_continues_the_run_exactly(tmp_path, monkeypatch):
+    results = _run_cpu(_resume_case, str(tmp_path), monkeypatch=monkeypatch)
     print(f"\nthird step after the load: losses {results[0]['losses']}, grad norm {results[0]['norm']}")

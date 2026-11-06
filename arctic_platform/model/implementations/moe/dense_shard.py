@@ -61,11 +61,12 @@ rank, and raise outside it.
 
 DeepSpeed's ``save_checkpoint`` / ``load_checkpoint`` of a sharded model refuse on every rank, before any collective,
 outside the context, and inside it through DeepSpeed's MoE path (``has_moe_layers``), which takes the module state on
-data-parallel rank 0 alone. So dss's resumable checkpoints refuse: its expert-parallel checkpointer would take the shards
-(``allreduce=False`` + ``group_name``) for experts and key its per-EP-rank expert files on the first one's group, the
-node's, losing the experts of every node but the first. ZeRO-1/2 itself checkpoints a sharded model right through its
-non-MoE path inside the context (the whole weights in the model states, each rank's partition of its shards' FP32
-masters and moments in its optimizer file), for the same world size, group size and EP.
+data-parallel rank 0 alone. Through its non-MoE path inside the context, ZeRO-1/2 checkpoints a sharded model right (the
+whole weights in the model states, each rank's partition of its shards' FP32 masters and moments in its optimizer
+file), for the same world size, group size and EP. The checkpointer around it must also keep the shards
+(``allreduce=False`` + ``group_name``) out of any per-EP-rank expert files: dss's ExpertParallelCheckpointer does so,
+and refuses optimizer state saved with another shard layout; before it did, it would have keyed those files on the
+first such parameter's group, the node's, and lost the experts of every node but the first.
 """
 
 from __future__ import annotations
@@ -225,10 +226,11 @@ def _refuse_state_dict(module: nn.Module) -> None:
         f"{type(module).__name__}'s trainable replicated weights are sharded over the node (moe.shard_dense / "
         f"{SHARD_DENSE_ENV}): its state_dict and load_state_dict hold them whole only inside "
         "arctic_platform.model.implementations.moe.dense_shard.full_state_dict(model), entered on every rank. "
-        "Resumable checkpoints (DeepSpeed save_checkpoint / load_checkpoint) of a sharded model are not supported: "
-        "dss's ExpertParallelCheckpointer takes the node shards for experts (allreduce=False + group_name) and keys "
-        "its per-EP-rank expert files on the node group, losing the experts of every node but the first. Save a "
-        "weights-only checkpoint (the HF export) instead, or run without shard_dense."
+        "Resumable checkpoints (DeepSpeed save_checkpoint / load_checkpoint) of a sharded model go through it, by a "
+        "checkpointer that keeps the node shards (allreduce=False + group_name) out of its per-EP-rank expert files, "
+        "as dss's ExpertParallelCheckpointer does once it supports moe.shard_dense (an older one would lose the "
+        "experts of every node but the first). Otherwise save a weights-only checkpoint (the HF export), or run "
+        "without shard_dense."
     )
 
 
