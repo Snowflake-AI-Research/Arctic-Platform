@@ -186,6 +186,4 @@ onboarding_reports/
 /.codex-run-state/
 /correctness-progress.md
 /local-correctness-records/
-/arctic_platform/correctness/configs/
 /arctic_platform/correctness/specs/
-/arctic_platform/correctness/reference_data/

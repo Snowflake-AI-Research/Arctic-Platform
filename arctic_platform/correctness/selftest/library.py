@@ -2941,21 +2941,25 @@ def test_onboarding_prerequisites_fail_before_workdir_fixture_or_weights(
         "correctness_workdir",
         lambda *a: pytest.fail("preflight created scratch"),
     )
-    with pytest.raises(ValueError, match="prerequisites failed before model work") as caught:
-        state.onboard._onboard_configuration(state.args)
-    assert "head" in str(caught.value) and sys.executable in str(caught.value)
-    assert "flash_attention_3" in str(caught.value)
-    assert len(state.calls) == 1
+    assert state.onboard._onboard_configuration(state.args) == 1
+    summary = json.loads(state.args.test_spec.with_suffix(".onboarding.json").read_text())
+    requested = ["single-step-grads", "single-step-optimizer"] if selection == "all" else [selection]
+    for test_id in requested:
+        result = summary["results"][test_id]
+        assert result["status"] == "failed"
+        assert "head" in result["reason"] and sys.executable in result["reason"]
+        assert "flash_attention_3" in result["reason"]
+    assert len(state.calls) == len(requested)
     assert not state.args.output_dir.exists() and not state.args.test_spec.exists()
     assert not getattr(state.args, "_prerequisites_checked", False)
 
 
-def test_onboarding_prerequisites_run_once_before_all_selected_checks(_onboarding_prerequisites, monkeypatch, capsys):
+def test_onboarding_prerequisites_run_independently_before_each_check(_onboarding_prerequisites, monkeypatch, capsys):
     state = _onboarding_prerequisites
     seen = []
 
     def parent(child):
-        assert child._prerequisites_checked and len(state.calls) == 1
+        assert child._prerequisites_checked and len(state.calls) == len(seen) + 1
         seen.append(child.test_id)
         child.test_spec.write_text("{}")
         return 0
@@ -2988,14 +2992,438 @@ def test_onboarding_numbering_includes_only_queued_checks(_onboarding_prerequisi
     monkeypatch.setattr(state.onboard, "_parent", parent)
     assert state.onboard._onboard_configuration(state.args) == 0
     output = capsys.readouterr().out
-    if has_spec:
-        assert seen == ["single-step-optimizer"]
-        assert "### Onboarding 1/1: Single Step Optimizer ###" in output
-        assert "Single Step Grads ###" not in output
-    else:
-        assert seen == ["single-step-grads", "single-step-optimizer"]
-        assert "### Onboarding 1/2: Single Step Grads ###" in output
-        assert "### Onboarding 2/2: Single Step Optimizer ###" in output
+    assert seen == ["single-step-optimizer"]
+    assert "### Onboarding 1/1: Single Step Optimizer ###" in output
+    assert "Single Step Grads ###" not in output
+
+
+@pytest.fixture
+def _incremental_onboarding(_onboarding_prerequisites, monkeypatch):
+    from arctic_platform.correctness.harness import config as config_module
+    from arctic_platform.correctness.harness import registry
+
+    state = _onboarding_prerequisites
+    state.config.native = None
+    state.config.hardware = None
+    state.config.path = state.args.config
+    state.args.config.write_text(json.dumps(state.config.sub_job))
+    state.args._resume_root = state.args.config.parent / "onboarding-state"
+    spec = config_module.TestSpec(
+        config_id=state.config.config_id,
+        config_path=str(state.args.config),
+        config_checksum=config_module.config_checksum(state.config),
+        model=config_module.ModelSpec(
+            source_checkpoint=state.config.model_name,
+            num_hidden_layers=4,
+            vision_depth=None,
+            seed=0,
+            param_count=128,
+            cache_path=str(state.args.cache_root / "fixture"),
+            content_hash="fixture",
+            sized_against_gib=1.0,
+        ),
+        arms=[config_module.ArmSpec("gas1", 4, 128, 512, 256, 1, 0.5)],
+        attn_implementations=[state.config.attention_implementation],
+        applicable_tests=[],
+    )
+    spec.write(state.args.test_spec)
+    state.executed = []
+    state.prepared = []
+    state.failures = set()
+    state.parent = state.onboard._parent
+
+    def parent(child):
+        state.executed.append(child.test_id)
+        if child.test_id in state.failures:
+            return 1
+        current = config_module.TestSpec.read(child.test_spec)
+        current.applicable_tests = list(dict.fromkeys([*current.applicable_tests, child.test_id]))
+        current.test_tolerances[child.test_id] = config_module.TestTolerance(absolute=0.001)
+        current.write(child.test_spec)
+        return 0
+
+    monkeypatch.setattr(state.onboard, "_parent", parent)
+    monkeypatch.setattr(
+        state.onboard, "_prepare_references", lambda child: state.prepared.append(child.reference_tests) or 0
+    )
+    monkeypatch.setattr(state.onboard, "_validate_storage", lambda *a: None)
+    monkeypatch.setattr(config_module, "local_config_path", lambda path: path)
+    state.tests = registry.registered_tests()
+    state.config_module = config_module
+    return state
+
+
+@pytest.fixture
+def _independent_onboarding(_incremental_onboarding, monkeypatch):
+    from arctic_platform.correctness.onboarding import synth_model
+
+    state = _incremental_onboarding
+    initial = state.config_module.TestSpec.read(state.args.test_spec)
+    state.args.test_spec.unlink()
+    state.config.max_tokens_per_mb = 256
+    state.config.path = state.args.config
+    state.args.local_cortex_fixture = True
+    state.args.base_url = "http://127.0.0.1:1"
+    state.validations = []
+    monkeypatch.setattr(state.onboard, "_parent", state.parent)
+    monkeypatch.setattr(state.onboard, "_configure_fixture_target", lambda *a: None)
+    monkeypatch.setattr(state.config_module, "validate_against_host", lambda *a: None)
+    monkeypatch.setattr(dss_driver, "available_gpus", lambda: state.config.n_gpus)
+    monkeypatch.setattr(workdir, "ensure_no_interrupted_builds", lambda: None)
+    monkeypatch.setattr(state.onboard, "_checkout_root", lambda *a: state.args.config.parent)
+    monkeypatch.setattr(state.onboard, "_model_shape", lambda *a: (32, 1, 4))
+    monkeypatch.setattr(state.onboard, "_resume_setup", lambda *a: None)
+    monkeypatch.setattr(state.onboard, "_resume_phase", lambda args, phase, operation: operation())
+    monkeypatch.setattr(state.onboard, "_run_probe", lambda *a: {"status": "fit", "layers": 4, "peak_gib": 1.0})
+    monkeypatch.setattr(state.onboard, "_write_initial_spec", lambda args, *a: initial.write(args.test_spec))
+    monkeypatch.setattr(state.onboard, "_optimizer_reference_model", lambda *a: (Path(initial.model.cache_path), 4))
+    monkeypatch.setattr(synth_model, "materialize_pretrained", lambda *a, **k: initial.model)
+
+    def calibrate(child, *a):
+        state.executed.append(child.test_id)
+        spec = state.config_module.TestSpec.read(child.test_spec)
+        spec.applicable_tests = list(dict.fromkeys([*spec.applicable_tests, child.test_id]))
+        spec.test_tolerances[child.test_id] = state.config_module.TestTolerance(absolute=0.001)
+        spec.write(child.test_spec)
+        destination = child.output_dir / "calibration.json"
+        destination.write_text(
+            json.dumps(
+                {
+                    "criterion": "optimizer-state-l2-norm-v1",
+                    "arms": {},
+                    "tolerance": {"selected_gate": 0.001},
+                }
+            )
+        )
+        return destination
+
+    def validate(child, *a):
+        state.validations.append(child.test_id)
+        return {
+            "status": "failed" if child.test_id in state.failures else "pass",
+            "report": "synthetic-report",
+            "log": "synthetic-log",
+            "reason": "numerical mismatch" if child.test_id in state.failures else None,
+        }
+
+    monkeypatch.setattr(state.onboard, "_render_and_run_calibration", calibrate)
+    monkeypatch.setattr(state.onboard, "_run_local_optimizer_calibration", calibrate)
+    monkeypatch.setattr(state.onboard, "_run_final_regression", validate)
+    return state
+
+
+def test_independent_onboarding_gradient_failure_preserves_fixture_for_optimizer(_independent_onboarding, capsys):
+    state = _independent_onboarding
+    state.failures.add("single-step-grads")
+    assert state.onboard.run(state.args) == 1
+    assert state.executed == state.validations == ["single-step-grads", "single-step-optimizer"]
+    spec = state.config_module.TestSpec.read(state.args.test_spec)
+    assert spec.applicable_tests == ["single-step-optimizer"]
+    assert set(spec.test_tolerances) == {"single-step-optimizer"}
+    summary = json.loads(state.args.test_spec.with_suffix(".onboarding.json").read_text())
+    assert summary["results"]["single-step-grads"]["status"] == "failed"
+    assert summary["results"]["single-step-optimizer"]["status"] == "onboarded"
+    assert "Summary: 1 succeeded, 1 failed" in capsys.readouterr().out
+
+
+def test_independent_onboarding_optimizer_only_prepares_fixture_without_gradients(_independent_onboarding):
+    state = _independent_onboarding
+    state.args.test_id = "single-step-optimizer"
+    assert state.onboard.run(state.args) == 0
+    assert state.executed == state.validations == ["single-step-optimizer"]
+    spec = state.config_module.TestSpec.read(state.args.test_spec)
+    assert spec.applicable_tests == ["single-step-optimizer"]
+    assert set(spec.test_tolerances) == {"single-step-optimizer"}
+    summary = json.loads(state.args.test_spec.with_suffix(".onboarding.json").read_text())
+    assert set(summary["results"]) == {"single-step-optimizer"}
+
+
+def test_independent_onboarding_check_preflight_failure_does_not_skip_other_checks(
+    _incremental_onboarding, monkeypatch
+):
+    state = _incremental_onboarding
+    preflights = []
+
+    def preflight(child, config, selection):
+        preflights.extend(selection)
+        if selection == ["single-step-grads"]:
+            raise ValueError("gradient capture dependency missing")
+
+    monkeypatch.setattr(state.onboard, "_onboarding_preflight", preflight)
+    assert state.onboard.run(state.args) == 1
+    assert preflights == ["single-step-grads", "single-step-optimizer"]
+    assert state.executed == ["single-step-optimizer"]
+    summary = json.loads(state.args.test_spec.with_suffix(".onboarding.json").read_text())
+    assert "gradient capture dependency missing" in summary["results"]["single-step-grads"]["reason"]
+    assert summary["results"]["single-step-optimizer"]["status"] == "onboarded"
+
+
+def test_independent_onboarding_unsafe_cleanup_reports_unrun_checks(_incremental_onboarding, monkeypatch, capsys):
+    from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
+
+    state = _incremental_onboarding
+
+    def fail(child):
+        state.executed.append(child.test_id)
+        raise UnsafeCleanupError("owned workers are still alive")
+
+    monkeypatch.setattr(state.onboard, "_parent", fail)
+    assert state.onboard.run(state.args) == 1
+    assert state.executed == ["single-step-grads"]
+    summary = json.loads(state.args.test_spec.with_suffix(".onboarding.json").read_text())
+    assert summary["results"]["single-step-grads"]["status"] == "failed"
+    assert summary["results"]["single-step-optimizer"]["status"] == "not_run"
+    assert "unsafe worker cleanup" in summary["results"]["single-step-optimizer"]["reason"]
+    assert "Summary: 0 succeeded, 1 failed, 0 already onboarded, 1 inapplicable, 1 not run" in capsys.readouterr().out
+
+
+def test_independent_onboarding_combined_cleanup_failure_retains_final_summary(
+    _incremental_onboarding, monkeypatch, capsys
+):
+    from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
+
+    state = _incremental_onboarding
+
+    def fail(child):
+        raise UnsafeCleanupError("reference cleanup failed")
+
+    monkeypatch.setattr(state.onboard, "_prepare_references", fail)
+    assert state.onboard.run(state.args) == 1
+    summary = json.loads(state.args.test_spec.with_suffix(".onboarding.json").read_text())
+    assert summary["combined_reference_error"] == "unsafe worker cleanup: reference cleanup failed"
+    assert summary["results"]["single-step-grads"]["status"] == "onboarded"
+    assert summary["results"]["single-step-optimizer"]["status"] == "onboarded"
+    assert "Summary: 2 succeeded, 0 failed" in capsys.readouterr().out
+
+
+def test_independent_onboarding_interruption_propagates_without_starting_other_checks(
+    _incremental_onboarding, monkeypatch
+):
+    state = _incremental_onboarding
+
+    def interrupt(child):
+        state.executed.append(child.test_id)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(state.onboard, "_parent", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        state.onboard.run(state.args)
+    assert state.executed == ["single-step-grads"]
+
+
+def test_incremental_onboarding_repeated_config_skips_completed_checks(_incremental_onboarding, monkeypatch, capsys):
+    state = _incremental_onboarding
+    assert state.onboard.run(state.args) == 0
+    before = state.args.test_spec.read_bytes()
+    summary_path = state.args.test_spec.with_suffix(".onboarding.json")
+    completed = json.loads(summary_path.read_text())["results"]
+    state.executed.clear()
+    state.prepared.clear()
+    state.calls.clear()
+    monkeypatch.setattr(state.onboard, "_configure_fixture_target", lambda *a: pytest.fail("skip started a target"))
+
+    assert state.onboard.run(state.args) == 0
+    assert state.executed == state.prepared == state.calls == []
+    assert state.args.test_spec.read_bytes() == before
+    summary = json.loads(summary_path.read_text())
+    assert summary["results"] == completed
+    assert summary["skipped_tests"] == ["single-step-grads", "single-step-optimizer"]
+    assert "already onboarded" in capsys.readouterr().out
+
+
+def test_incremental_onboarding_partial_failure_retries_only_failed_check(_incremental_onboarding):
+    state = _incremental_onboarding
+    state.failures.add("single-step-optimizer")
+    assert state.onboard.run(state.args) == 1
+    state.failures.clear()
+    state.executed.clear()
+
+    assert state.onboard.run(state.args) == 0
+    assert state.executed == ["single-step-optimizer"]
+    assert state.prepared == [["single-step-grads", "single-step-optimizer"]]
+    summary = json.loads(state.args.test_spec.with_suffix(".onboarding.json").read_text())
+    assert summary["results"]["single-step-grads"]["status"] == "onboarded"
+    assert summary["results"]["single-step-optimizer"]["status"] == "onboarded"
+
+
+def test_incremental_onboarding_explicit_checks_preserve_each_others_success(_incremental_onboarding):
+    state = _incremental_onboarding
+    state.args.test_id = "single-step-grads"
+    assert state.onboard.run(state.args) == 0
+    state.args.test_id = "single-step-optimizer"
+    assert state.onboard.run(state.args) == 0
+    state.executed.clear()
+    state.args.test_id = "single-step-grads"
+    assert state.onboard.run(state.args) == 0
+    state.args.test_id = "single-step-optimizer"
+    assert state.onboard.run(state.args) == 0
+    assert state.executed == []
+    results = json.loads(state.args.test_spec.with_suffix(".onboarding.json").read_text())["results"]
+    assert set(results) == {"single-step-grads", "single-step-optimizer"}
+    assert all(result["status"] == "onboarded" for result in results.values())
+
+
+def test_incremental_onboarding_applicability_without_success_does_not_skip(_incremental_onboarding):
+    state = _incremental_onboarding
+    spec = state.config_module.TestSpec.read(state.args.test_spec)
+    spec.applicable_tests = ["single-step-grads", "single-step-optimizer"]
+    spec.write(state.args.test_spec)
+    assert state.onboard.run(state.args) == 0
+    assert state.executed == ["single-step-grads", "single-step-optimizer"]
+
+
+@pytest.mark.parametrize("change", ["config", "model", "gate", "options", "missing-spec", "corrupt-summary"])
+def test_incremental_onboarding_changed_workload_is_not_skipped(_incremental_onboarding, monkeypatch, change):
+    state = _incremental_onboarding
+    state.args.test_id = "single-step-grads"
+    assert state.onboard.run(state.args) == 0
+    state.executed.clear()
+    spec = state.config_module.TestSpec.read(state.args.test_spec)
+    if change == "config":
+        state.config.sub_job["dtype"] = "float32"
+    elif change == "model":
+        spec.model.content_hash = "changed"
+    elif change == "gate":
+        spec.test_tolerances["single-step-grads"].absolute = 0.002
+    elif change == "options":
+        state.args.tokens = 64
+    elif change == "corrupt-summary":
+        state.args.test_spec.with_suffix(".onboarding.json").write_text("{")
+    spec.write(state.args.test_spec)
+    if change == "missing-spec":
+        state.args.test_spec.unlink()
+
+        def bootstrap(child):
+            state.executed.append(child.test_id)
+            spec.write(child.test_spec)
+            return 0
+
+        monkeypatch.setattr(state.onboard, "_parent", bootstrap)
+    assert state.onboard.run(state.args) == 0
+    assert state.executed == ["single-step-grads"]
+
+
+def test_incremental_onboarding_recovers_old_explicit_validation(_incremental_onboarding):
+    state = _incremental_onboarding
+    assert state.onboard.run(state.args) == 0
+    spec = state.args.test_spec.read_text()
+    summary_path = state.args.test_spec.with_suffix(".onboarding.json")
+    summary = json.loads(summary_path.read_text())
+    summary["results"].pop("single-step-optimizer")
+    summary["results"]["single-step-grads"].pop("spec_identity")
+    summary_path.write_text(json.dumps(summary))
+    for test_id in ("single-step-grads", "single-step-optimizer"):
+        phase = state.args._resume_root / state.config.config_id / test_id / "original" / "validation.json"
+        phase.parent.mkdir(parents=True)
+        phase.write_text(json.dumps({"result": {"status": "pass"}, "spec": spec}))
+    state.executed.clear()
+    state.prepared.clear()
+
+    assert state.onboard.run(state.args) == 0
+    assert state.executed == state.prepared == []
+    results = json.loads(summary_path.read_text())["results"]
+    assert all(
+        result["validation_checkpoint"].endswith("validation.json")
+        for result in results.values()
+        if result["status"] == "onboarded"
+    )
+
+
+def test_incremental_onboarding_recovers_catalog_validation_from_separate_log_root(
+    _incremental_onboarding, monkeypatch
+):
+    state = _incremental_onboarding
+    assert state.onboard.run(state.args) == 0
+    state.args.test_spec.with_suffix(".onboarding.json").unlink()
+    monkeypatch.chdir(state.args.config.parent)
+    for test_id in ("single-step-grads", "single-step-optimizer"):
+        phase = (
+            Path("work/logs/catalog-original/onboarding-state")
+            / state.config.config_id
+            / test_id
+            / "request"
+            / "validation.json"
+        )
+        phase.parent.mkdir(parents=True)
+        phase.write_text(json.dumps({"result": {"status": "pass"}, "spec": state.args.test_spec.read_text()}))
+    state.executed.clear()
+    state.prepared.clear()
+    assert state.onboard.run(state.args) == 0
+    assert state.executed == state.prepared == []
+
+
+@pytest.mark.parametrize("invalid", ["failed", "changed-spec", "corrupt", "non-object"])
+def test_incremental_onboarding_does_not_recover_invalid_old_validation(_incremental_onboarding, invalid):
+    state = _incremental_onboarding
+    state.args.test_id = "single-step-grads"
+    assert state.onboard.run(state.args) == 0
+    state.args.test_spec.with_suffix(".onboarding.json").unlink()
+    phase = state.args._resume_root / state.config.config_id / state.args.test_id / "old" / "validation.json"
+    phase.parent.mkdir(parents=True)
+    spec = json.loads(state.args.test_spec.read_text())
+    spec["model"]["content_hash"] = "wrong" if invalid == "changed-spec" else spec["model"]["content_hash"]
+    phase.write_text(
+        "{"
+        if invalid == "corrupt"
+        else json.dumps(
+            {
+                "result": {"status": "failed" if invalid == "failed" else "pass"},
+                "spec": json.dumps([] if invalid == "non-object" else spec),
+            }
+        )
+    )
+    state.executed.clear()
+    assert state.onboard.run(state.args) == 0
+    assert state.executed == ["single-step-grads"]
+
+
+def test_incremental_onboarding_explicit_failure_preserves_other_successes(_incremental_onboarding, monkeypatch):
+    state = _incremental_onboarding
+    assert state.onboard.run(state.args) == 0
+    state.args.test_id = "single-step-optimizer"
+    state.args.reference_token_budget = 32
+
+    def fail(child):
+        raise RuntimeError("target failed")
+
+    monkeypatch.setattr(state.onboard, "_parent", fail)
+    with pytest.raises(RuntimeError, match="target failed"):
+        state.onboard.run(state.args)
+    results = json.loads(state.args.test_spec.with_suffix(".onboarding.json").read_text())["results"]
+    assert results["single-step-grads"]["status"] == "onboarded"
+    assert results["single-step-optimizer"]["status"] == "failed"
+
+
+def test_incremental_onboarding_reference_only_request_is_never_skipped(_incremental_onboarding):
+    state = _incremental_onboarding
+    assert state.onboard.run(state.args) == 0
+    state.prepared.clear()
+    state.executed.clear()
+    state.args.prepare_references = True
+    state.args.reference_tests = ["single-step-grads", "single-step-optimizer"]
+
+    assert state.onboard.run(state.args) == 0
+    assert state.prepared == [["single-step-grads", "single-step-optimizer"]]
+    assert state.executed == []
+
+
+def test_incremental_onboarding_combined_preparation_failure_retries_without_recalibration(
+    _incremental_onboarding, monkeypatch
+):
+    state = _incremental_onboarding
+
+    def fail(child):
+        raise RuntimeError("reference preparation failed")
+
+    monkeypatch.setattr(state.onboard, "_prepare_references", fail)
+    assert state.onboard.run(state.args) == 1
+    state.executed.clear()
+    monkeypatch.setattr(
+        state.onboard, "_prepare_references", lambda child: state.prepared.append(child.reference_tests) or 0
+    )
+    assert state.onboard.run(state.args) == 0
+    assert state.executed == []
+    assert state.prepared == [["single-step-grads", "single-step-optimizer"]]
 
 
 def test_onboarding_numbering_scales_beyond_two_checks(_onboarding_prerequisites, monkeypatch, capsys):
@@ -5009,7 +5437,16 @@ def test_onboarding_automatic_gateway_uses_upstream_server_and_closes_owned_proc
     process.poll.return_value = None
     process.wait.return_value = 0
     start = Mock(return_value=process)
-    monkeypatch.setattr(onboard.subprocess, "Popen", start)
+    original_popen = onboard.subprocess.Popen
+    monkeypatch.setattr(
+        onboard.subprocess,
+        "Popen",
+        lambda command, *args, **kwargs: (
+            start(command, *args, **kwargs)
+            if command[:3] == [sys.executable, "-m", "arctic_platform.debug.training"]
+            else original_popen(command, *args, **kwargs)
+        ),
+    )
     monkeypatch.setattr(dss_driver, "_allocation_hostfile", lambda: Path("/job/hostfile") if job_hostfile else None)
     is_file = Path.is_file
     monkeypatch.setattr(
@@ -6456,6 +6893,9 @@ def test_onboarding_resume_config_only_command_retries_failed_optimizer(tmp_path
     config = config_module.load_config(config_path)
     spec_path = tmp_path / "spec.json"
     model_path = tmp_path / "model"
+    model_path.mkdir()
+    (model_path / "config.json").write_text("{}")
+    (model_path / "model.safetensors").write_bytes(b"synthetic checkpoint identity")
     calls = []
     entries = registry.registered_tests()
     monkeypatch.setattr(
@@ -6470,18 +6910,24 @@ def test_onboarding_resume_config_only_command_retries_failed_optimizer(tmp_path
     monkeypatch.setattr(onboard, "correctness_workdir", lambda prefix: tmp_path / "scratch")
     monkeypatch.setattr(onboard, "_model_shape", lambda path: (36, 1, 4))
     monkeypatch.setattr(onboard, "_optimizer_reference_model", lambda *args: (model_path, 4))
-    spec = SimpleNamespace(
+    spec = config_module.TestSpec(
         config_id=config.config_id,
+        config_path=str(config_path),
         config_checksum=config_module.config_checksum(config),
-        applicable_tests=list(onboard.CALIBRATED_TEST_IDS),
-        model=SimpleNamespace(
+        applicable_tests=[],
+        model=config_module.ModelSpec(
             source_checkpoint="synthetic/model",
             cache_path=str(model_path),
             num_hidden_layers=4,
             vision_depth=0,
+            seed=0,
+            param_count=128,
+            content_hash="fixture",
+            sized_against_gib=1.0,
         ),
+        arms=[config_module.ArmSpec("gas1", 4, 128, 512, 256, 1, 0.5)],
+        attn_implementations=["sdpa"],
     )
-    monkeypatch.setattr(config_module.TestSpec, "read", lambda path: spec)
 
     def probe(args, layers):
         calls.append("sizing")
@@ -6489,7 +6935,7 @@ def test_onboarding_resume_config_only_command_retries_failed_optimizer(tmp_path
 
     def fixture(args, selected, first_oom):
         calls.append("fixture")
-        args.test_spec.write_text('{"tests": ["single-step-grads"]}')
+        spec.write(args.test_spec)
 
     def calibrate(args, *rest):
         calls.append(f"{args.test_id}:calibration")
@@ -6503,8 +6949,10 @@ def test_onboarding_resume_config_only_command_retries_failed_optimizer(tmp_path
                 }
             )
         )
-        if args.test_id == "single-step-optimizer":
-            args.test_spec.write_text('{"tests": ["single-step-grads", "single-step-optimizer"]}')
+        current = config_module.TestSpec.read(args.test_spec)
+        current.applicable_tests = list(dict.fromkeys([*current.applicable_tests, args.test_id]))
+        current.test_tolerances[args.test_id] = config_module.TestTolerance(absolute=0.005)
+        current.write(args.test_spec)
         return destination
 
     def prepare(args):
@@ -6540,14 +6988,14 @@ def test_onboarding_resume_config_only_command_retries_failed_optimizer(tmp_path
         str(tmp_path / "records"),
     ]
     assert execution.cmd_onboard(execution.parse_args(command)) == 1
-    assert json.loads(spec_path.read_text())["tests"] == ["single-step-grads"]
+    assert config_module.TestSpec.read(spec_path).applicable_tests == ["single-step-grads"]
     first_calls = calls[:]
     assert execution.cmd_onboard(execution.parse_args(command)) == 0
     assert calls == first_calls + [
         "single-step-optimizer:validation",
         "single-step-grads:references",
     ]
-    assert json.loads(spec_path.read_text())["tests"] == list(onboard.CALIBRATED_TEST_IDS)
+    assert config_module.TestSpec.read(spec_path).applicable_tests == list(onboard.CALIBRATED_TEST_IDS)
     logs = list((tmp_path / "work" / "logs").glob("onboarding-*/onboarding.log"))
     assert len(logs) == 2
     assert any("Traceback" in path.read_text() and "regression error" in path.read_text() for path in logs)
@@ -8046,17 +8494,16 @@ def test_onboarding_module_entrypoint_follows_timing_helpers():
         assert helpers[name].end_lineno < entrypoint.lineno
 
 
-def test_onboarding_dependency_skip_does_not_record_execution_time(_onboarding_prerequisites, monkeypatch):
+def test_onboarding_independent_failures_record_each_execution_time(_onboarding_prerequisites, monkeypatch):
     state = _onboarding_prerequisites
     monkeypatch.setattr(state.onboard, "_parent", lambda child: 1)
     assert state.onboard._onboard_configuration(state.args) == 1
     summary = json.loads(state.args.test_spec.with_suffix(".onboarding.json").read_text())
     assert "elapsed_seconds" in summary["results"]["single-step-grads"]
-    assert summary["results"]["single-step-optimizer"] == {
-        "status": "failed",
-        "reason": "gradient fixture onboarding failed",
-    }
-    assert set(state.args._onboarding_times) == {"single-step-grads"}
+    assert summary["results"]["single-step-optimizer"]["status"] == "failed"
+    assert summary["results"]["single-step-optimizer"]["exit_code"] == 1
+    assert "elapsed_seconds" in summary["results"]["single-step-optimizer"]
+    assert set(state.args._onboarding_times) == {"single-step-grads", "single-step-optimizer"}
 
 
 @pytest.mark.parametrize("prepare_references", [False, True])
@@ -34050,6 +34497,7 @@ def test_supervised_local_fixture_onboarding_admits_only_explicit_native_route(
         source_checkpoint="/data-fast/base-models/glm-original",
         tokens=None,
         reference_token_budget=None,
+        cache_root=tmp_path / "cache",
         output_dir=tmp_path / "onboarding",
         test_spec=tmp_path / "candidate.json",
         reuse_sizing=None,
@@ -34057,6 +34505,11 @@ def test_supervised_local_fixture_onboarding_admits_only_explicit_native_route(
     monkeypatch.setattr(onboard, "_validate_storage", lambda *a: None)
     monkeypatch.setattr(onboard, "_checkout_root", lambda *a: tmp_path)
     monkeypatch.setattr(config_module, "load_config", lambda *a: cfg)
+    monkeypatch.setattr(
+        preflight,
+        "onboarding_node_prerequisites",
+        lambda request: {"host": "synthetic", "python": sys.executable, "gpu_count": 8, "versions": {}, "errors": []},
+    )
 
     def unexpected(*args, **kwargs):
         pytest.fail("local fixture admission must not probe the author host or start a model")
@@ -34073,14 +34526,11 @@ def test_supervised_local_fixture_onboarding_admits_only_explicit_native_route(
         raise RuntimeError("admitted without preparing a model")
 
     monkeypatch.setattr(onboard, "_model_shape", admitted)
-    monkeypatch.setattr(onboard, "_onboard_optimizer_test", lambda *a: reached.append(True) or 0)
+    monkeypatch.setattr(onboard, "_onboard_optimizer_test", unexpected)
     if error is not None:
         with pytest.raises(ValueError, match=error):
             onboard._parent(args)
         assert reached == []
-    elif test_id == "single-step-optimizer":
-        assert onboard._parent(args) == 0
-        assert reached == [True]
     else:
         with pytest.raises(RuntimeError, match="admitted without preparing"):
             onboard._parent(args)
@@ -34355,14 +34805,26 @@ def test_helper_storage_weights_save_keeps_public_framing_and_does_not_restrict_
 def _hf_reference_onboarding_prepared_args(tmp_path, monkeypatch):
     parser = argparse.ArgumentParser()
     onboard.add_arguments(parser)
-    config_path = _onboarding_config(tmp_path)
+    import_config = config_module.local_config_path
+    monkeypatch.setattr(
+        config_module,
+        "local_config_path",
+        lambda path: import_config(path, tmp_path / "reviewed" / "configs"),
+    )
+    config_path = config_module.local_config_path(_onboarding_config(tmp_path))
     args = parser.parse_args(["--config", str(config_path), "--prepare-references"])
     cfg = load_config(config_path)
     spec = _applicable_tests_spec(list(reference_records.CRITERIA))
     spec.config_id = cfg.config_id
+    spec.config_path = str(config_path)
     spec.config_checksum = config_checksum(cfg)
     spec.model.cache_path = str(tmp_path / "external-model")
     monkeypatch.setattr(ConfigSpec, "read", lambda path: spec)
+    monkeypatch.setattr(
+        preflight,
+        "onboarding_node_prerequisites",
+        lambda request: {"host": "synthetic", "python": sys.executable, "gpu_count": 8, "versions": {}, "errors": []},
+    )
     monkeypatch.setattr(
         transformers.AutoConfig,
         "from_pretrained",
@@ -36042,7 +36504,7 @@ def test_onboarding_storage_run_keeps_separate_small_spec_and_probe_reports_unre
         reference_records_dir=None,
     )
     args.config.parent.mkdir(parents=True)
-    args.config.write_text("{}")
+    args.config.write_text(_onboarding_config(tmp_path).read_text())
     args.test_spec.write_text("{}")
     monkeypatch.setattr(_fixed_tolerance_onboarding_SPEC, "local_config_path", lambda path: path)
     monkeypatch.setattr(onboard, "_checkout_root", lambda config: tmp_path / "checkout")
@@ -36291,6 +36753,7 @@ def _onboarding_config(tmp_path: Path, *, gpus: int = 4, glm: bool = False, lora
         "attn_implementation": "sparse_mla" if glm else "flash_attention_3",
         "train_batch_size": gpus,
         "optimizer": {"lr": 2e-05},
+        "ds_config": {"data_types": {"grad_accum_dtype": "fp32"}},
     }
     if lora:
         training["peft_config"] = {
@@ -36363,6 +36826,11 @@ def _local_cortex_reference_publication(tmp_path, monkeypatch):
     monkeypatch.setattr(onboard, "_run_probe", lambda *a: state.selected)
     monkeypatch.setattr(_fixed_tolerance_onboarding_SPEC, "validate_against_host", lambda *a: None)
     monkeypatch.setattr(dss_driver, "available_gpus", lambda: 8)
+    monkeypatch.setattr(
+        preflight,
+        "onboarding_node_prerequisites",
+        lambda request: {"host": "synthetic", "python": sys.executable, "gpu_count": 8, "versions": {}, "errors": []},
+    )
     monkeypatch.setattr(workdir, "ensure_no_interrupted_builds", lambda: None)
 
     def initial(actual, selected, first_oom):
@@ -42457,6 +42925,8 @@ _SELFTEST_FIXTURES = (
     "_external_operator_catalog",
     "_dense_checkpoint_onboarding_cli",
     "_onboarding_prerequisites",
+    "_incremental_onboarding",
+    "_independent_onboarding",
     "_node_prerequisites",
     "_native_optimizer_scope_runner",
     "_onboarding_retry_sources",
@@ -42699,7 +43169,7 @@ _SELFTEST_GROUPS = {
         "test_operator_external_config_copy_rejects_invalid_input_before_import",
         "test_operator_onboarding_uses_imported_config_before_preparation",
         "test_onboarding_prerequisites_fail_before_workdir_fixture_or_weights",
-        "test_onboarding_prerequisites_run_once_before_all_selected_checks",
+        "test_onboarding_prerequisites_run_independently_before_each_check",
         "test_onboarding_numbering_includes_only_queued_checks",
         "test_onboarding_numbering_scales_beyond_two_checks",
         "test_onboarding_recovers_orphan_before_reference_prerequisites_and_reports_config",
@@ -42860,7 +43330,7 @@ _SELFTEST_GROUPS = {
         "test_owned_gateway_real_process_sigkill_automatically_cleans_without_next_command",
         "test_onboarding_reports_each_attempt_time_and_separates_shared_preparation",
         "test_onboarding_module_entrypoint_follows_timing_helpers",
-        "test_onboarding_dependency_skip_does_not_record_execution_time",
+        "test_onboarding_independent_failures_record_each_execution_time",
         "test_onboarding_explicit_single_test_with_existing_spec_is_timed",
         "test_onboarding_final_timing_survives_interruption_or_unsafe_cleanup",
         "test_onboarding_retry_per_test_timing_preserves_only_unchanged_preparation",
@@ -44462,12 +44932,16 @@ def test_onboarding_requires_explicit_fp32_accumulation_before_any_work(
         dss_driver, "recover_local_cortex_gateway", lambda: pytest.fail("precision prerequisite recovered gateway")
     )
 
-    with pytest.raises(ValueError, match="Set data_types.grad_accum_dtype") as caught:
-        state.onboard._onboard_configuration(state.args)
-
-    assert str(state.args.config.resolve()) in str(caught.value)
-    assert '"fp32"' in str(caught.value)
-    assert "does not change this setting" in str(caught.value)
+    assert state.onboard._onboard_configuration(state.args) == 1
+    summary = json.loads(state.args.test_spec.with_suffix(".onboarding.json").read_text())
+    requested = ["single-step-grads", "single-step-optimizer"] if selection == "all" else [selection]
+    for test_id in requested:
+        result = summary["results"][test_id]
+        assert result["status"] == "failed"
+        assert "Set data_types.grad_accum_dtype" in result["reason"]
+        assert str(state.args.config.resolve()) in result["reason"]
+        assert '"fp32"' in result["reason"]
+        assert "does not change this setting" in result["reason"]
     assert state.calls == []
     assert state.config.training == original
     assert state.args.config.read_text() == contents

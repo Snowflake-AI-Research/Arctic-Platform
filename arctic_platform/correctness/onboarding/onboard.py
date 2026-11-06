@@ -1072,6 +1072,45 @@ def _write_initial_spec(args: argparse.Namespace, selected: dict, first_oom: dic
     spec.write(args.test_spec)
 
 
+def _prepare_onboarding_fixture(args: argparse.Namespace, config) -> tuple[dict, int, int]:
+    """Freeze shared model and inputs without declaring any check successfully onboarded."""
+    from arctic_platform.correctness.harness.config import TestSpec
+    from arctic_platform.correctness.harness.config import config_checksum
+
+    full_layers, period, representative_layers = _model_shape(str(args.source_checkpoint))
+    with _phase("Phase 1/3", "Representative Fixture Preparation"):
+        if args.test_spec.exists():
+            spec = TestSpec.read(args.test_spec)
+            if spec.config_id != config.config_id or spec.config_checksum != config_checksum(config):
+                raise ValueError("the existing fixture specification does not match the supplied configuration")
+            selected = {
+                "status": "fit",
+                "layers": spec.model.num_hidden_layers,
+                "peak_gib": spec.model.measured_reference_peak_gib or 0.0,
+            }
+            print(f"Reusing frozen model and inputs from {args.test_spec}", flush=True)
+        else:
+            if getattr(args, "reuse_sizing", None) is not None:
+                selected = _resume_phase(args, "sizing", lambda: _reuse_sizing(args, representative_layers))
+            else:
+                selected = _resume_phase(args, "sizing", lambda: _run_probe(args, representative_layers))
+            if selected["status"] == "oom":
+                raise RuntimeError(f"the minimum representative configuration ({representative_layers} layers) OOMs")
+            if selected["status"] != "fit":
+                raise RuntimeError(
+                    f"unexpected sizing status {selected['status']!r} for {representative_layers} layers"
+                )
+            _stage("Reference", "Fixture Preparation", "Writing the shared fixture specification and frozen inputs.")
+            _resume_phase(args, "fixture", lambda: _write_initial_spec(args, selected, None))
+            spec = TestSpec.read(args.test_spec)
+            spec.applicable_tests = []
+            spec.test_tolerances = {}
+            spec.test_settings = {}
+            spec.write(args.test_spec)
+        print(f"phase 1/3 complete: selected={selected['layers']} layers peak={selected['peak_gib']:.3f} GiB")
+    return selected, full_layers, period
+
+
 def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = None) -> Path | None:
     from arctic_platform.correctness.harness.lora import shared_adapter_identity as adapter_identity
 
@@ -1752,37 +1791,33 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
 
 
 def _onboard_optimizer_test(args: argparse.Namespace, config) -> int:
-    """Add Test 2 with its own reduced reference while preserving Test 1 and its materialized cases."""
+    """Calibrate and validate optimizer state independently, preserving the shared fixture."""
     from arctic_platform.correctness.harness.config import TestSpec
     from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
 
     if not args.test_spec.exists():
-        raise ValueError("Test 2 requires an existing Test 1 spec so both tests reuse the same inputs")
+        raise ValueError("optimizer onboarding requires a prepared fixture specification and frozen inputs")
     previous_spec = args.test_spec.read_bytes()
     spec = TestSpec.read(args.test_spec)
     if spec.config_id != config.config_id:
         raise ValueError(f"spec {spec.config_id!r} does not describe config {config.config_id!r}")
     if spec.config_checksum != config_checksum(config):
-        raise ValueError("the existing spec does not match the config; onboard Test 1 before Test 2")
+        raise ValueError("the existing fixture specification does not match the supplied configuration")
     args._admitted_optimizer_validation_bootstrap = _optimizer_validation_bootstrap(args)
     optimizer_model_path, optimizer_layers = _optimizer_reference_model(spec, args.cache_root)
     local_fixture = getattr(args, "local_cortex_fixture", False)
-    if local_fixture and "single-step-grads" not in spec.applicable_tests:
-        raise ValueError("local optimizer onboarding requires a reviewed Test 1 fixture and inputs")
     if local_fixture and (
         optimizer_model_path.resolve() != Path(spec.model.cache_path).resolve()
         or optimizer_layers != spec.model.num_hidden_layers
     ):
-        raise ValueError(
-            "local optimizer fixture must match the frozen Test 1 model; a separate fixture is unsupported"
-        )
+        raise ValueError("local optimizer fixture must match the frozen model; a separate fixture is unsupported")
     args.optimizer_model_path = optimizer_model_path
     args.optimizer_layers = optimizer_layers
     with _phase(
         "Phase 1/3",
         "Optimizer Reference Fixture",
-        f"using the minimum representative {optimizer_layers}-layer prefix and the frozen Test 1 cases",
+        f"using the minimum representative {optimizer_layers}-layer prefix and the frozen input cases",
     ):
         if not local_fixture:
             materialize_pretrained(
@@ -1904,45 +1939,25 @@ def _parent(args: argparse.Namespace) -> int:
     args.reference_token_budget = min(requested_reference_budget, GAS1_TOKEN_CAP)
     _resume_setup(args)
     if kind == "single-step-optimizer":
+        if not args.test_spec.exists():
+            _prepare_onboarding_fixture(args, config)
         return _onboard_optimizer_test(args, config)
 
-    full_layers, period, representative_layers = _model_shape(str(args.source_checkpoint))
-    sizing_started = time.monotonic()
-    if getattr(args, "reuse_sizing", None) is not None:
-        with _phase(
-            "Phase 1/3",
-            "Retained Sizing",
-            "Admitting the source-bound result without HF sizing replay.",
-        ):
-            selected = _resume_phase(args, "sizing", lambda: _reuse_sizing(args, representative_layers))
-    else:
-        with _phase(
-            "Phase 1/3",
-            "Representative Fixture Sizing",
-            f"Validating the minimum representative HF configuration at {args.tokens:,} tokens; "
-            f"selected {representative_layers} of {full_layers} source layers, attention period {period}",
-        ):
-            selected = _resume_phase(args, "sizing", lambda: _run_probe(args, representative_layers))
-    observations = [selected]
-    if selected["status"] == "oom":
-        raise RuntimeError(f"the minimum representative configuration ({representative_layers} layers) OOMs")
-    if selected["status"] != "fit":
-        raise RuntimeError(f"unexpected sizing status {selected['status']!r} for {representative_layers} layers")
-    print(
-        f"phase 1/3 complete: selected={selected['layers']} layers "
-        f"peak={selected['peak_gib']:.3f} GiB elapsed={time.monotonic() - sizing_started:.1f}s",
-        flush=True,
-    )
+    from arctic_platform.correctness.harness.config import TestSpec
 
-    previous_spec = args.test_spec.read_bytes() if args.test_spec.exists() else None
+    selected, full_layers, period = _prepare_onboarding_fixture(args, config)
+    observations = [selected]
+
+    previous_spec = args.test_spec.read_bytes()
     try:
         with _phase(
             "Phase 2/3",
             "Gradient Calibration",
             f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference runs per GAS arm.",
         ):
-            _stage("Reference", "Fixture Preparation", "Writing the fixture specification and frozen inputs.")
-            _resume_phase(args, "fixture", lambda: _write_initial_spec(args, selected, None))
+            spec = TestSpec.read(args.test_spec)
+            spec.applicable_tests = list(dict.fromkeys([*spec.applicable_tests, args.test_id]))
+            spec.write(args.test_spec)
             calibration_json = Path(
                 _resume_phase(
                     args,
@@ -1962,10 +1977,7 @@ def _parent(args: argparse.Namespace) -> int:
             validation = _resume_phase(args, "validation", lambda: _run_final_regression(args, selected))
             _require_validation_pass(validation, f"final {selected['layers']}-layer regression")
     except BaseException:
-        if previous_spec is None:
-            args.test_spec.unlink(missing_ok=True)
-        else:
-            args.test_spec.write_bytes(previous_spec)
+        args.test_spec.write_bytes(previous_spec)
         raise
 
     manifest = {
@@ -2147,6 +2159,127 @@ def _prepare_references(args: argparse.Namespace) -> int:
     return 0
 
 
+def _onboarding_spec_identity(spec: dict, test_id: str) -> str | None:
+    """Adding another check must not invalidate this check's reviewed workload."""
+    if (
+        not isinstance(spec, dict)
+        or test_id not in spec.get("applicable_tests", [])
+        or not spec.get("config_checksum")
+    ):
+        return None
+    fields = ("config_id", "config_checksum", "model", "arms", "attn_implementations", "param_name_map")
+    projection = {name: spec.get(name) for name in fields}
+    projection["test_tolerance"] = spec.get("test_tolerances", {}).get(test_id)
+    projection["test_settings"] = spec.get("test_settings", {}).get(test_id)
+    return hashlib.sha256(json.dumps(projection, sort_keys=True).encode()).hexdigest()
+
+
+def _onboarding_options(args: argparse.Namespace) -> dict:
+    names = (
+        "tokens",
+        "reference_token_budget",
+        "source_checkpoint",
+        "peft_adapter",
+    )
+    return json.loads(json.dumps({name: getattr(args, name, None) for name in names}, default=str))
+
+
+def _onboarding_state(args: argparse.Namespace, config, spec_path: Path) -> tuple[dict, dict]:
+    from arctic_platform.correctness.harness.config import TestSpec
+    from arctic_platform.correctness.harness.config import config_checksum
+
+    spec = {}
+    try:
+        candidate = json.loads(TestSpec.read(spec_path).to_json())
+        if candidate["config_id"] == config.config_id and candidate["config_checksum"] == config_checksum(config):
+            spec = candidate
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    summary = {}
+    try:
+        candidate = json.loads(spec_path.with_suffix(".onboarding.json").read_text())
+        if candidate["config_id"] == config.config_id and isinstance(candidate["results"], dict):
+            summary = candidate
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return spec, summary
+
+
+def _completed_onboarding(args: argparse.Namespace, spec: dict, summary: dict, test_id: str) -> dict | None:
+    identity = _onboarding_spec_identity(spec, test_id)
+    if identity is None:
+        return None
+    saved = summary.get("results", {}).get(test_id, {})
+    if not isinstance(saved, dict):
+        saved = {}
+    options = _onboarding_options(args)
+    if (
+        saved.get("status") == "onboarded"
+        and saved.get("exit_code") == 0
+        and saved.get("spec_identity") == identity
+        and saved.get("options") == options
+    ):
+        return dict(saved)
+    # Older explicit-check runs did not update the summary. Recover only a passing
+    # validation with a matching frozen spec, never applicability alone.
+    if (
+        saved.get("status") == "failed"
+        or saved.get("spec_identity") is not None
+        or not hasattr(args, "_resume_root")
+        or any(options.values())
+    ):
+        return None
+    relative = Path(spec["config_id"]) / test_id
+    paths = set((args._resume_root / relative).glob("*/validation.json"))
+    for log_root in {args._resume_root.parent, Path.cwd() / "work" / "logs"}:
+        paths.update(log_root.glob(f"*/onboarding-state/{relative}/*/validation.json"))
+    for path in sorted(paths):
+        try:
+            phase = json.loads(path.read_text())
+            if (
+                phase["result"]["status"] == "pass"
+                and _onboarding_spec_identity(json.loads(phase["spec"]), test_id) == identity
+            ):
+                return {
+                    "status": "onboarded",
+                    "exit_code": 0,
+                    "spec_identity": identity,
+                    "options": options,
+                    "validation_checkpoint": str(path),
+                }
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return None
+
+
+def _save_onboarding_summary(args: argparse.Namespace, config, spec_path: Path, results: dict, **details) -> dict:
+    _, previous = _onboarding_state(args, config, spec_path)
+    summary = {
+        **previous,
+        "config_id": config.config_id,
+        "config": str(args.config),
+        "test_spec": str(spec_path),
+        "results": results,
+        **details,
+    }
+    destination = spec_path.with_suffix(".onboarding.json")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=destination.parent, prefix=f".{destination.name}-", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        temporary.replace(destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    if hasattr(args, "_diagnostics_dir"):
+        (args._diagnostics_dir / "onboarding.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    return summary
+
+
 def run(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.config import config_id
     from arctic_platform.correctness.harness.config import load_config
@@ -2214,15 +2347,52 @@ def run(args: argparse.Namespace) -> int:
         sys.path.insert(0, str(args.checkout_root))
         args.probe_output = args.probe_output.resolve()
         return _probe_worker(args)
-    if (
-        args.test_id == "all"
-        or not (
-            args.test_spec or Path(__file__).resolve().parents[1] / "specs" / f"{config_id(args.config)}.json"
-        ).exists()
-    ):
+    spec_path = Path(
+        args.test_spec or Path(__file__).resolve().parents[1] / "specs" / f"{config_id(args.config)}.json"
+    ).resolve()
+    if args.test_id == "all" or not spec_path.exists():
         return _onboard_configuration(args)
-    with _onboarding_test_time(args, args.test_id):
-        return _parent(args)
+    spec, summary = _onboarding_state(args, config, spec_path)
+    completed = _completed_onboarding(args, spec, summary, args.test_id)
+    if completed is not None:
+        print(f"skip {args.test_id}: already onboarded for {config.config_id}", flush=True)
+        results = {**summary.get("results", {}), args.test_id: completed}
+        _save_onboarding_summary(args, config, spec_path, results, skipped_tests=[args.test_id])
+        if hasattr(args, "_diagnostics_dir"):
+            report = args._diagnostics_dir / "report.md"
+            report.write_text(
+                f"# Onboarding Report\n\nConfig: `{config.config_id}`\n\n"
+                f"Skipped `{args.test_id}`: already onboarded for the matching frozen workload.\n\n"
+                "No calibration or target validation was run in this attempt.\n",
+                encoding="utf-8",
+            )
+            print(f"Report: {report}", flush=True)
+        return 0
+    options = _onboarding_options(args)
+    try:
+        with _onboarding_test_time(args, args.test_id):
+            code = _parent(args)
+    except Exception as exc:
+        _save_onboarding_summary(
+            args,
+            config,
+            spec_path,
+            {**summary.get("results", {}), args.test_id: {"status": "failed", "reason": str(exc)}},
+        )
+        raise
+    spec, _ = _onboarding_state(args, config, spec_path)
+    result = {
+        "status": "onboarded" if code == 0 else "failed",
+        "exit_code": code,
+        "output_dir": str(getattr(args, "output_dir", None)),
+        "elapsed_seconds": args._onboarding_times[args.test_id],
+        "spec_identity": _onboarding_spec_identity(spec, args.test_id) if code == 0 else None,
+        "options": options,
+    }
+    _save_onboarding_summary(
+        args, config, spec_path, {**summary.get("results", {}), args.test_id: result}, skipped_tests=[]
+    )
+    return code
 
 
 def _onboard_configuration(args: argparse.Namespace) -> int:
@@ -2248,65 +2418,92 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
             print(f"skip {test_id}: {reason}", flush=True)
         else:
             selected.append(test_id)
-    selected.sort(
-        key=lambda test_id: (
-            (
-                0
-                if test_id == "single-step-grads"
-                else 1 if test_id == "single-step-optimizer" else 3 if test_id == "checkpoint-resume-loss" else 2
-            ),
-            test_id,
-        )
-    )
+    selected.sort(key=lambda test_id: (test_id != "single-step-grads", test_id))
     spec_path = (
         Path(args.test_spec).resolve()
         if args.test_spec is not None
         else Path(__file__).resolve().parents[1] / "specs" / f"{config.config_id}.json"
     )
-    _onboarding_preflight(args, config, selected)
-    output = (
-        (Path(args.output_dir) if args.output_dir is not None else correctness_workdir("config-onboarding-"))
-        if selected
-        else None
-    )
+    spec, previous = _onboarding_state(args, config, spec_path)
+    retained = dict(previous.get("results", {}))
+    pending = []
+    skipped = []
+    for test_id in selected:
+        completed = _completed_onboarding(args, spec, previous, test_id)
+        if completed is None:
+            pending.append(test_id)
+        else:
+            results[test_id] = completed
+            skipped.append(test_id)
+            print(f"skip {test_id}: already onboarded for {config.config_id}", flush=True)
+    selected = pending
+    output = Path(args.output_dir) if args.output_dir is not None else None
     queue = list(selected)
-    if selected and not config.is_rl and not spec_path.exists() and "single-step-grads" not in queue:
-        queue.insert(0, "single-step-grads")
-        print("preparing the gradient fixture required by the selected check", flush=True)
+    unsafe_cleanup = None
     for index, test_id in enumerate(queue, start=1):
-        if test_id != "single-step-grads" and not config.is_rl and not spec_path.exists():
-            results[test_id] = {"status": "failed", "reason": "gradient fixture onboarding failed"}
+        if unsafe_cleanup:
+            results[test_id] = {"status": "not_run", "reason": f"unsafe worker cleanup: {unsafe_cleanup}"}
             continue
         child = argparse.Namespace(
             **{
                 **vars(args),
                 "test_id": test_id,
                 "test_spec": spec_path,
-                "output_dir": output / test_id,
+                "output_dir": output / test_id if output is not None else None,
             }
         )
-        if hasattr(args, "_diagnostics_dir"):
-            child._diagnostics_dir = args._diagnostics_dir / test_id
-            child._diagnostics_dir.mkdir(parents=True, exist_ok=True)
         _stage(f"Onboarding {index}/{len(queue)}", test_id.replace("-", " "), f"Config: {config.config_id}")
+        options = _onboarding_options(child)
         with _onboarding_test_time(child, test_id):
             try:
+                _onboarding_preflight(child, config, [test_id])
+                if output is None:
+                    output = correctness_workdir("config-onboarding-")
+                child.output_dir = output / test_id
+                if hasattr(args, "_diagnostics_dir"):
+                    child._diagnostics_dir = args._diagnostics_dir / test_id
+                    child._diagnostics_dir.mkdir(parents=True, exist_ok=True)
                 code = _parent(child)
                 results[test_id] = {
                     "status": "onboarded" if code == 0 else "failed",
                     "exit_code": code,
                     "output_dir": str(child.output_dir),
                 }
-            except UnsafeCleanupError:
-                raise
+            except UnsafeCleanupError as exc:
+                unsafe_cleanup = str(exc)
+                results[test_id] = {"status": "failed", "reason": str(exc), "exit_code": 1}
+                traceback.print_exc()
+                _onboarding_failure(f"{test_id}: {exc}")
             except Exception as exc:
-                results[test_id] = {"status": "failed", "reason": str(exc)}
+                results[test_id] = {"status": "failed", "reason": str(exc), "exit_code": 1}
                 traceback.print_exc()
                 _onboarding_failure(f"{test_id}: {exc}")
         results[test_id]["elapsed_seconds"] = args._onboarding_times[test_id]
-    references = [test_id for test_id in selected if test_id in CRITERIA and results[test_id]["status"] == "onboarded"]
-    preparation_error = None
-    if len(references) > 1:
+        if results[test_id]["status"] == "onboarded":
+            current_spec, _ = _onboarding_state(args, config, spec_path)
+            results[test_id]["spec_identity"] = _onboarding_spec_identity(current_spec, test_id)
+            results[test_id]["options"] = options
+        _save_onboarding_summary(args, config, spec_path, {**retained, **results})
+        current_spec, _ = _onboarding_state(args, config, spec_path)
+        for completed_id in list(skipped):
+            if _completed_onboarding(args, current_spec, {"results": results}, completed_id) is None:
+                skipped.remove(completed_id)
+                results.pop(completed_id)
+                queue.append(completed_id)
+                print(f"rebuilding {completed_id}: its frozen workload changed during onboarding", flush=True)
+    references = [
+        test_id for test_id in requested if test_id in CRITERIA and results[test_id]["status"] == "onboarded"
+    ]
+    preparation_error = previous.get("combined_reference_error")
+    if (
+        not unsafe_cleanup
+        and len(references) > 1
+        and (any(test_id in references for test_id in queue) or preparation_error)
+    ):
+        if output is None:
+            output = (
+                Path(args.output_dir) if args.output_dir is not None else correctness_workdir("config-onboarding-")
+            )
         preparation = argparse.Namespace(
             **{
                 **vars(args),
@@ -2316,29 +2513,48 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
                 "output_dir": output / "combined-references",
             }
         )
+        preparation_error = None
         with _onboarding_test_time(args, "combined reference preparation"):
             try:
                 _prepare_references(preparation)
-            except UnsafeCleanupError:
-                raise
+            except UnsafeCleanupError as exc:
+                unsafe_cleanup = str(exc)
+                preparation_error = f"unsafe worker cleanup: {exc}"
+                traceback.print_exc()
+                _onboarding_failure(f"combined reference preparation: {preparation_error}")
             except Exception as exc:
                 preparation_error = str(exc)
                 traceback.print_exc()
                 _onboarding_failure(f"combined reference preparation: {exc}")
-    summary = {
-        "config_id": config.config_id,
-        "config": str(args.config),
-        "test_spec": str(spec_path),
-        "results": results,
-        "combined_reference_error": preparation_error,
-        "combined_reference_elapsed_seconds": args._onboarding_times.get("combined reference preparation"),
+    summary = _save_onboarding_summary(
+        args,
+        config,
+        spec_path,
+        {**retained, **results},
+        skipped_tests=skipped,
+        combined_reference_error=preparation_error,
+        combined_reference_elapsed_seconds=args._onboarding_times.get("combined reference preparation"),
+    )
+    destination = spec_path.with_suffix(".onboarding.json")
+    print("\nOnboarding results:", flush=True)
+    for test_id in requested:
+        result = results[test_id]
+        status = "already onboarded (skipped)" if test_id in skipped else result["status"]
+        print(f"  {test_id}: {status}", flush=True)
+        if result.get("reason"):
+            print(f"    {result['reason']}", flush=True)
+    counts = {
+        status: sum(result["status"] == status for result in results.values())
+        for status in ("onboarded", "failed", "inapplicable", "not_run")
     }
-    destination = spec_path.with_name(f"{spec_path.stem}.onboarding.json")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    tally = (
+        f"{counts['onboarded'] - len(skipped)} succeeded, {counts['failed']} failed, "
+        f"{len(skipped)} already onboarded, {counts['inapplicable']} inapplicable, {counts['not_run']} not run"
+    )
+    print(f"Summary: {tally}", flush=True)
     if hasattr(args, "_diagnostics_dir"):
         (args._diagnostics_dir / "onboarding.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-        lines = ["# Onboarding Report", "", f"Config: `{config.config_id}`", ""]
+        lines = ["# Onboarding Report", "", f"Config: `{config.config_id}`", "", f"Summary: {tally}", ""]
         for test_id, result in results.items():
             lines.extend(
                 [
@@ -2347,9 +2563,13 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
                     f"Status: {result['status']}",
                     "",
                     (
-                        f"Onboarding time: {total_duration(result['elapsed_seconds'])}"
-                        if "elapsed_seconds" in result
-                        else "Onboarding time: not run"
+                        "Onboarding time: not run (already onboarded)"
+                        if test_id in skipped
+                        else (
+                            f"Onboarding time: {total_duration(result['elapsed_seconds'])}"
+                            if "elapsed_seconds" in result
+                            else "Onboarding time: not run"
+                        )
                     ),
                     "",
                     result.get("reason", f"Exit code: {result.get('exit_code', 'not run')}"),

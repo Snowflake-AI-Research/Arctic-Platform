@@ -1146,3 +1146,81 @@ def test_reduced_fixture_mtp_distributed_local_failure_is_gathered_before_raise(
     with pytest.raises(RuntimeError, match="local fixture bytes differ"):
         reduced_fixture_mtp.maybe_capture_reduced_fixture_mtp(model, source, config)
     assert gathered == [("ValueError: local fixture bytes differ", False)]
+
+
+def test_node_local_conversion_uses_stream_callback_and_reuses_ready_cache(tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "cache" / "prime"
+    converted = []
+
+    def unexpected_bulk_call(*args):
+        raise AssertionError("checkpoint conversion must not load the entire state dict")
+
+    def convert_checkpoint(source_path, temporary_path):
+        assert source_path == source
+        assert temporary_path.parent == destination.parent
+        assert not destination.exists()
+        converted.append(temporary_path)
+        _write_ready_cache(temporary_path)
+
+    for _ in range(2):
+        conversion_cache.ensure_node_local_conversion_cache(
+            source,
+            destination,
+            unexpected_bulk_call,
+            "HF",
+            "PrimeRL",
+            unexpected_bulk_call,
+            unexpected_bulk_call,
+            rank=0,
+            local_rank=0,
+            stream_convert_fn=convert_checkpoint,
+        )
+
+    assert len(converted) == 1
+    assert not converted[0].exists()
+    assert conversion_cache.conversion_cache_ready(destination)
+
+
+@pytest.mark.parametrize("failure", ["exception", "missing-index", "missing-shard"])
+def test_stream_callback_failure_never_publishes_cache(tmp_path, failure):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "cache" / "prime"
+
+    def unexpected_bulk_call(*args):
+        raise AssertionError("checkpoint callback must bypass bulk conversion")
+
+    def convert_checkpoint(source_path, temporary_path):
+        assert source_path == source
+        temporary_path.mkdir()
+        if failure == "exception":
+            raise RuntimeError("injected checkpoint conversion failure")
+        if failure == "missing-index":
+            (temporary_path / "model.safetensors").write_bytes(b"partial")
+        else:
+            (temporary_path / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"weight": "missing.safetensors"}})
+            )
+
+    with pytest.raises(RuntimeError, match="conversion failure|complete checkpoint"):
+        conversion_cache.ensure_node_local_conversion_cache(
+            source,
+            destination,
+            unexpected_bulk_call,
+            "HF",
+            "PrimeRL",
+            unexpected_bulk_call,
+            unexpected_bulk_call,
+            rank=0,
+            local_rank=0,
+            stream_convert_fn=convert_checkpoint,
+        )
+
+    assert not destination.exists()
+    assert not list(destination.parent.glob("prime.tmp-*"))

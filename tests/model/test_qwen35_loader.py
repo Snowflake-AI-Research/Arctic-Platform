@@ -220,7 +220,9 @@ def test_reduced_fixture_mtp_roundtrips_prime_rl_worker_options_to_qwen_runtime_
         "prime_rl": {"debug": {"reduced_fixture_mtp": descriptor}},
     }
 
-    spec = ModelSpec.from_ds_worker_config(str(tmp_path), worker_config)
+    from arctic_platform.model import ds_worker_moe_model_spec
+
+    spec = ds_worker_moe_model_spec(str(tmp_path), worker_config)
     options = Qwen3_5MoeOptions.model_validate(spec.loader_options)
     runtime = _build_model_config(str(tmp_path), 2, 1, "bfloat16", "sdpa", options)
 
