@@ -282,12 +282,21 @@ def conversion_cache_ready(path: Path) -> bool:
     try:
         with open(index_path, "r", encoding="utf-8") as f:
             index = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return False
-    weight_map = index.get("weight_map")
+    weight_map = index.get("weight_map") if isinstance(index, dict) else None
     if not isinstance(weight_map, dict) or not weight_map:
         return False
-    return all((path / str(shard)).is_file() for shard in set(weight_map.values()))
+    for name, shard in weight_map.items():
+        if not isinstance(name, str) or not isinstance(shard, str) or not shard:
+            return False
+        # Match indexed readers: constrain filenames, not hub symlink targets.
+        if Path(shard).is_absolute() or ".." in Path(shard).parts:
+            return False
+    try:
+        return all((path / shard).is_file() for shard in set(weight_map.values()))
+    except (OSError, ValueError):
+        return False
 
 
 def conversion_cache_is_node_local(path: Path) -> bool:
