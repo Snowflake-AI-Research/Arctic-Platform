@@ -12,10 +12,10 @@ Nothing is distributed: every node still holds every file. So any range a peer
 does not deliver (refused, timed out, short, gone, or simply never assigned
 because there were no peers) is read from the local mirror and written at the
 same offset. There is no S3 path and no retry against another peer, and a
-gather with no reachable peer is a parallel local copy -- which is also what
-``SEMIP_GATHER=local`` asks for outright. On p5en that local copy alone runs at
-~11 GB/s against copytree's ~3.9, the same ceiling three peers reached: the
-destination's buffered writes are the bound, not the network.
+gather with no reachable peer is a parallel local copy -- which is also the
+default mode, ``local``. On p5en that local copy with O_DIRECT writes moves
+GLM-5.3's 79 GB in ~4.2 s against copytree's ~20; three peers took ~4.9 s, since
+the destination disk, not the network, is the bound.
 
 Standard library only, like ``semip_engine``: the tests load both straight from
 their files, without the packages that pull in ray and torch.
@@ -40,9 +40,9 @@ from typing import NamedTuple
 
 logger = logging.getLogger("arctic_platform.inference.server.semip")
 
-# "peers" gathers from every node's daemon; "local" is the same ranged, parallel
-# copy with no peers, from this node's mirror alone. Unset, "" or "off" keeps
-# shutil.copytree.
+# "local" (the default, unset or "") is a ranged, parallel copy from this
+# node's mirror alone; "peers" gathers the same ranges from every node's
+# daemon; "off" keeps shutil.copytree.
 MODE_ENV = "SEMIP_GATHER"
 MODES = ("peers", "local")
 # host:port of the daemons, or several comma-separated. A hostname resolves to
@@ -53,14 +53,16 @@ THREADS_ENV = "SEMIP_GATHER_THREADS"
 # "size" trusts the range accounting; "sha256" also hashes every gathered file
 # against the manifest.
 VERIFY_ENV = "SEMIP_GATHER_VERIFY"
-# "1" writes through O_DIRECT wherever offset and length are block-aligned,
-# which skips the page cache -- and so also leaves the gathered files out of
-# it for the restore that reads them next.
+# On by default ("0" turns it off): write through O_DIRECT wherever offset and
+# length are block-aligned. Buffered writes cap at ~11 GB/s on ~45 cores of
+# kernel time on p5en; O_DIRECT reaches the disk's ~19 GB/s on ~5. Leaving the
+# gathered files out of the page cache cost the restore's read of image/
+# nothing measurable (10-11 s either way).
 DIRECT_ENV = "SEMIP_GATHER_DIRECT"
 
 DEFAULT_SERVICE = "neutrino-model-cache.neutrino.svc.cluster.local:8081"
 DEFAULT_CHUNK = 128 * 2**20
-DEFAULT_THREADS = 64
+DEFAULT_THREADS = 32
 
 # The daemon's per-directory manifest. Paths in it are relative to the
 # directory that holds it, which for a multi-replica skeleton is the key
@@ -122,10 +124,8 @@ class _PeerFailed(Exception):
 
 def mode() -> str:
     """One of MODES, or "off"."""
-    raw = os.environ.get(MODE_ENV, "").strip().lower()
-    if raw in ("", "off"):
-        return "off"
-    if raw in MODES:
+    raw = os.environ.get(MODE_ENV, "").strip().lower() or "local"
+    if raw == "off" or raw in MODES:
         return raw
     logger.warning("semi_p: %s=%r is not one of off, %s; copying with "
                    "copytree", MODE_ENV, raw, ", ".join(MODES))
@@ -200,10 +200,13 @@ def plan(source_dir: str, verified_dir: str, incoming: str,
 
     rel = os.path.relpath(source_dir, verified_dir)
     prefix = "" if rel == "." else rel.replace(os.sep, "/") + "/"
-    url_base = os.path.relpath(verified_dir, source_root).replace(os.sep, "/")
-    if url_base == ".." or url_base.startswith("../"):
-        raise RuntimeError(f"{verified_dir} is not under the image source "
-                           f"{source_root}, so peers cannot address it")
+    # Empty URLs when the source is not under the image source root: peers
+    # cannot address it, but the local mirror can still copy it.
+    url_base = None
+    if source_root:
+        rel_root = os.path.relpath(verified_dir, source_root).replace(os.sep, "/")
+        if rel_root != ".." and not rel_root.startswith("../"):
+            url_base = rel_root
 
     files = []
     for entry in entries:
@@ -214,7 +217,8 @@ def plan(source_dir: str, verified_dir: str, incoming: str,
                 files.append(_File(
                     src=os.path.join(verified_dir, path),
                     dest=os.path.join(incoming, sub, path[len(head):]),
-                    url=_URL_PREFIX + urllib.parse.quote(f"{url_base}/{path}"),
+                    url=(_URL_PREFIX + urllib.parse.quote(f"{url_base}/{path}")
+                         if url_base is not None else ""),
                     size=int(entry.get("size_bytes") or 0),
                     sha256=str(entry.get("sha256") or "").lower()))
                 break
@@ -398,12 +402,16 @@ def gather(source_dir: str, verified_dir: str, incoming: str,
     chunk = -(-chunk // _ALIGN) * _ALIGN
     threads = _env_int(THREADS_ENV, DEFAULT_THREADS)
     verify = _verify_mode()
-    direct = (os.environ.get(DIRECT_ENV, "").strip() == "1"
+    direct = (os.environ.get(DIRECT_ENV, "").strip() != "0"
               and hasattr(os, "O_DIRECT"))
 
     files = plan(source_dir, verified_dir, incoming, subdirs, source_root)
     peers: list[tuple[str, int]] = []
-    if mode() == "peers":
+    if mode() == "peers" and files and not files[0].url:
+        logger.warning("semi_p: %s is not under the image source %s, so peers "
+                       "cannot address it; reading every range from the local "
+                       "mirror", verified_dir, source_root)
+    elif mode() == "peers":
         peers = resolve_peers(os.environ.get(SERVICE_ENV, "").strip()
                               or DEFAULT_SERVICE)
         if not peers:
