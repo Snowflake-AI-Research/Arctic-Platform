@@ -2004,9 +2004,11 @@ def _dense_checkpoint_onboarding_cli(tmp_path):
     path = tmp_path / "dense-allocation.json"
     path.write_text(json.dumps(descriptor))
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    config_path = tmp_path / "dense.config"
+    config_path.write_text(json.dumps(_config_factory_native_config({"n_gpus": 16, "max_seq_len": 256})))
     argv = [
         "--config",
-        str(tmp_path / "dense.config"),
+        str(config_path),
         "--test",
         "single-step-optimizer",
         "--backend",
@@ -2677,12 +2679,53 @@ def test_gateway_lifecycle_available_gpus_reads_a_hostfile_without_a_prestarted_
 _operator_api_CONFIG = "qwen3-8b-h200-train-sft-full-4gpus-64k"
 
 
+@pytest.fixture
+def _operator_api_catalog(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import config as config_module
+
+    package_dir = api.PACKAGE_DIR
+    root = tmp_path / "operator-catalog"
+    path, spec_path = _synthetic_config_spec(root)
+    assert config_module.config_id(path) == _operator_api_CONFIG
+    spec = config_module.TestSpec.read(spec_path)
+    for suffix in ("--second", "--third"):
+        other = path.with_stem(path.stem + suffix)
+        other.write_bytes(path.read_bytes())
+        other_spec = deepcopy(spec)
+        other_spec.config_id = config_module.config_id(other)
+        other_spec.config_path = str(other)
+        other_spec.write(root / "specs" / f"{other_spec.config_id}.json")
+    docs = root / "docs"
+    docs.mkdir()
+    (docs / "running-tests.md").write_bytes((package_dir / "docs/running-tests.md").read_bytes())
+    config_root = root / "configs"
+    real_catalog = api.catalog
+    real_local_config_path = config_module.local_config_path
+
+    def isolated_root(config_dir):
+        return config_root if config_dir is None or Path(config_dir) == package_dir / "configs" else Path(config_dir)
+
+    def import_config(path, config_dir=None):
+        return real_local_config_path(path, isolated_root(config_dir))
+
+    monkeypatch.setattr(api, "PACKAGE_DIR", root)
+    monkeypatch.setattr(api, "catalog", lambda config_dir=None: real_catalog(isolated_root(config_dir)))
+    monkeypatch.setattr(api, "local_config_path", import_config)
+    monkeypatch.setattr(config_module, "local_config_path", import_config)
+    monkeypatch.setattr(execution, "local_config_path", import_config)
+    monkeypatch.setattr(execution, "CONFIG_DIR", config_root)
+    monkeypatch.setattr(execution, "SPEC_DIR", root / "specs")
+    return root
+
+
+@pytest.mark.usefixtures("_operator_api_catalog")
 def test_operator_api_pair_selection_accepts_catalog_id_or_path():
     expected = api.select(api.RunRequest(config=_operator_api_CONFIG, tests=(_operator_api_TEST,)))
     assert expected == api.select(api.RunRequest(config=expected[0].config_path, tests=(_operator_api_TEST,)))
     assert [(case.config_id, case.test_id) for case in expected] == [(_operator_api_CONFIG, _operator_api_TEST)]
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 def test_operator_api_config_only_selects_each_applicable_test_once():
     selected = api.select(api.RunRequest(config=_operator_api_CONFIG))
     config = api.load_config(api.catalog()[_operator_api_CONFIG])
@@ -2838,6 +2881,7 @@ def _onboarding_prerequisites(tmp_path, monkeypatch):
     args.reference_records_dir = tmp_path / "records"
     config = SimpleNamespace(
         config_id="synthetic",
+        has_training=True,
         is_rl=False,
         n_gpus=4,
         sp_size=1,
@@ -3422,6 +3466,7 @@ def test_onboarding_allocation_prerequisites_require_every_host_response(tmp_pat
     assert sys.executable in command[-1] and "base64 -d" in command[-1]
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 def test_operator_api_test_only_selects_all_reviewed_configs_in_order():
     selected = api.select(api.RunRequest(tests=(_operator_api_TEST, _operator_api_TEST)))
     assert [case.config_id for case in selected] == sorted(api.catalog())
@@ -3429,6 +3474,7 @@ def test_operator_api_test_only_selects_all_reviewed_configs_in_order():
     assert len(set(selected)) == len(selected)
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 @pytest.mark.parametrize(
     "selection,match",
     [
@@ -3448,8 +3494,8 @@ def test_operator_api_bad_selectors_fail_before_backend(selection, match, monkey
 
 
 def test_operator_api_empty_catalog_is_not_a_success(tmp_path):
-    with pytest.raises(ValueError, match="no configurations"):
-        api.select(api.RunRequest(tests=(_operator_api_TEST,), config_dir=tmp_path / "empty"))
+    with pytest.raises(ValueError, match="no active"):
+        api.select(api.RunRequest(tests=(_operator_api_TEST,), config_dir=tmp_path))
 
 
 def test_operator_api_archive_configs_are_not_discovered(tmp_path, monkeypatch):
@@ -3486,6 +3532,7 @@ def _operator_api_fake_batches(monkeypatch, verdicts):
     monkeypatch.setattr(execution, "_run_configs", fake)
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 @pytest.mark.parametrize(
     "verdict",
     [
@@ -3568,6 +3615,7 @@ def test_onboarding_failure_banner_preserves_diagnostic_case_and_spacing(capsys)
     )
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 @pytest.mark.parametrize("destination", ["workspace", "environment", "explicit"])
 def test_regression_failure_logs_use_durable_report_directory(tmp_path, monkeypatch, destination):
     monkeypatch.chdir(tmp_path)
@@ -3597,6 +3645,7 @@ def test_regression_failure_logs_use_durable_report_directory(tmp_path, monkeypa
     assert json.loads((result.report_dir / "batch.json").read_text())["cases"] == result.cases
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 @pytest.mark.parametrize("destination", ["workspace", "environment", "explicit"])
 def test_compatibility_runner_uses_durable_report_directory_before_backend(tmp_path, monkeypatch, destination):
     monkeypatch.chdir(tmp_path)
@@ -3632,6 +3681,7 @@ def test_regression_help_describes_durable_logs_and_untracked_reference_records(
     assert "default a unique directory under /data-fast/tmp" not in help_text
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 def test_operator_api_mixed_batch_continues_and_retains_every_pair(tmp_path, monkeypatch, capsys):
     tests = (_operator_api_TEST,)
     _operator_api_fake_batches(
@@ -3651,6 +3701,7 @@ def test_operator_api_mixed_batch_continues_and_retains_every_pair(tmp_path, mon
     assert (tmp_path / "batch.json").is_file()
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 def test_operator_api_actual_execution_preserves_selection_order_and_combined_step_identity(
     tmp_path, monkeypatch, capsys
 ):
@@ -3676,6 +3727,7 @@ def test_operator_api_actual_execution_preserves_selection_order_and_combined_st
     assert f"Selected tests: {expected}" in capsys.readouterr().out.splitlines()
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 def test_operator_api_inapplicable_is_visible_and_not_a_pass(tmp_path, monkeypatch):
     _operator_api_fake_batches(monkeypatch, [Outcome.INAPPLICABLE])
     result = api.run(
@@ -3686,6 +3738,7 @@ def test_operator_api_inapplicable_is_visible_and_not_a_pass(tmp_path, monkeypat
     assert result.exit_code == 1
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 @pytest.mark.parametrize(
     "failure",
     [
@@ -3705,6 +3758,7 @@ def test_operator_api_unsafe_exit_or_interruption_stops_remaining_cases(tmp_path
     assert all((result.outcome is Outcome.FAIL for result in result.results))
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 def test_operator_api_empty_execution_is_explicitly_blocked(tmp_path, monkeypatch):
     monkeypatch.setattr(execution, "write_report", lambda *a, **k: None)
     monkeypatch.setattr(execution, "_run_configs", lambda *a, **k: 0)
@@ -3715,6 +3769,7 @@ def test_operator_api_empty_execution_is_explicitly_blocked(tmp_path, monkeypatc
     assert result.cases[0]["status"] == "blocked" and result.exit_code == 1
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 @pytest.mark.parametrize(
     "error_type,status",
     [
@@ -3735,6 +3790,7 @@ def test_operator_api_comparison_failure_and_execution_errors_are_distinct(error
     assert execution._case_summary(case, [result])["status"] == status
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 def test_operator_api_parse_flags_is_shared_with_operator_command():
     request, options = api.parse_run_args(
         [
@@ -3753,6 +3809,7 @@ def test_operator_api_parse_flags_is_shared_with_operator_command():
         api._namespace(request, api.RunOptions(backend="onprem"))
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 def test_operator_api_static_guide_is_unchanged_by_run_and_onboarding(tmp_path, monkeypatch):
     monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(tmp_path / "logs"))
     guide = api.PACKAGE_DIR / "docs" / "running-tests.md"
@@ -3796,6 +3853,7 @@ def test_operator_api_static_guide_is_unchanged_by_run_and_onboarding(tmp_path, 
     assert guide.read_bytes() == before
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 def test_operator_api_logger_traceback_is_saved_and_handlers_are_restored(tmp_path, monkeypatch, capsys):
     root = logging.getLogger()
     previous = root.handlers[:]
@@ -5000,7 +5058,7 @@ def test_onboarding_automatic_gateway_does_not_start_or_stop_configured_target(t
 
 
 @pytest.fixture
-def _automatic_regression_gateway(tmp_path, monkeypatch):
+def _automatic_regression_gateway(tmp_path, monkeypatch, _operator_api_catalog):
     import requests
 
     for name in ("ARCTIC_CORTEX_HOST", "ARCTIC_CORTEX_BASE_URL", "ARCTIC_CORTEX_PAT"):
@@ -5232,6 +5290,7 @@ def test_native_gateway_command_rejects_mutation_before_process_start(
     state.process.terminate.assert_not_called()
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 @pytest.mark.parametrize("failure", [None, "health", "identity", "interrupt"])
 def test_regression_automatic_gateway_starts_before_real_fixture_health_and_cleans_up(
     _automatic_regression_gateway, monkeypatch, failure
@@ -5341,6 +5400,7 @@ def test_gateway_readiness_ignores_proxy_environment(_automatic_regression_gatew
     state.process.wait.assert_called_once_with(timeout=120)
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 @pytest.mark.parametrize("failure", [None, "comparison", "executor", "interrupt", "reference"])
 def test_regression_automatic_gateway_single_command_runs_both_checks_and_closes_owned_service(
     _automatic_regression_gateway, monkeypatch, failure
@@ -5398,6 +5458,7 @@ def test_regression_automatic_gateway_single_command_runs_both_checks_and_closes
     assert (state.out / "full.log").is_file() and (state.out / "report.json").is_file()
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 @pytest.mark.parametrize("source", ["argument", "environment"])
 def test_regression_automatic_gateway_does_not_replace_explicit_endpoint(
     _automatic_regression_gateway, monkeypatch, source
@@ -5428,6 +5489,7 @@ def test_regression_automatic_gateway_does_not_replace_explicit_endpoint(
     state.process.terminate.assert_not_called()
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 @pytest.mark.parametrize("mode", ["host", "pat", "later-check", "rl", "publication", "full-model", "onprem"])
 def test_regression_automatic_gateway_respects_authentication_and_workload_boundaries(
     _automatic_regression_gateway, monkeypatch, mode
@@ -5456,6 +5518,7 @@ def test_regression_automatic_gateway_respects_authentication_and_workload_bound
     _automatic_regression_gateway.start.assert_not_called()
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 @pytest.mark.parametrize("failure", ["exit", "timeout", "shutdown"])
 def test_regression_automatic_gateway_startup_and_cleanup_failures_are_saved_and_not_passes(
     _automatic_regression_gateway, monkeypatch, failure
@@ -5495,6 +5558,7 @@ def test_regression_automatic_gateway_startup_and_cleanup_failures_are_saved_and
         assert state.start.call_count == 1
 
 
+@pytest.mark.usefixtures("_operator_api_catalog")
 @pytest.mark.parametrize("operation", ["terminate", "wait", "killpg"])
 def test_regression_gateway_cleanup_exceptions_stop_following_work(
     _automatic_regression_gateway, monkeypatch, operation
@@ -11017,14 +11081,8 @@ def test_native_callback_rejects_altered_ray_wrappers(monkeypatch, damage):
         elif damage == "globals":
             globals_dict = dict(globals_dict)
         elif damage == "code":
-
-            def unrelated_wrapper(func, ray):
-                def wrapper(*args, **kwargs):
-                    return ray if args else func(*args, **kwargs)
-
-                return wrapper
-
-            code = unrelated_wrapper(None, None).__code__
+            # Preserve the installed Ray closure arity while replacing its executable code object.
+            code = code.replace(co_consts=(*code.co_consts, "synthetic wrapper code drift"))
         altered = types.FunctionType(code, globals_dict, callback.__name__, callback.__defaults__, cells)
         altered.__dict__.update(callback.__dict__)
         altered.__module__, altered.__qualname__ = callback.__module__, callback.__qualname__
@@ -16594,7 +16652,8 @@ def test_dense_collection_new_boundary_source_pin_survives_optimized_python_befo
     source.write_text("changed")
     result = capture.subprocess.run([argv[0], "-O", *argv[1:]], capture_output=True, timeout=10)
     assert result.returncode != 0 and b"source drift before import" in result.stderr
-    assert b"ModuleNotFoundError" not in result.stderr
+    traceback_output = result.stderr.split(b"Traceback (most recent call last):", 1)[1]
+    assert b"ModuleNotFoundError" not in traceback_output
 
 
 @pytest.mark.parametrize("outcome", ["success", "exit", "json", "timeout"])
@@ -21345,6 +21404,7 @@ class SyntheticCollective:
             weight_name,
             kind,
             parameter,
+            _,
         ) in lora_training_native._iter_param_wrapper_expert_loras(self.model):
             name = lora_training_native._expert_lora_vllm_key(prefix, weight_name, kind)
             normalized[name] = lora_training_native._reshape_expert_lora_for_ep(

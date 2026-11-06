@@ -96,7 +96,7 @@ class Qwen3_5MoeOptions(BaseModel):
 def _matches(ctx: LoaderContext) -> bool:
     if ctx.spec.parallelism.expert_parallel <= 1:
         return False
-    return ctx.hf_model_type in ("qwen3_5_moe", "qwen3_5_moe_text") or ctx.hf_text_model_type == "qwen3_5_moe_text"
+    return ctx.hf_model_family == "qwen3_5_moe"
 
 
 def _validate_spec(spec: ModelSpec) -> None:

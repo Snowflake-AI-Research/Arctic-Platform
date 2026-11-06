@@ -1498,7 +1498,7 @@ def prepare_collective_lora_weights(
                 or list(module.lora_B) != list(configs)
             ):
                 raise ValueError("native expert adapter bucket selection is ambiguous")
-        for prefix, weight_name, kind, parameter in native._iter_param_wrapper_expert_loras(model):
+        for prefix, weight_name, kind, parameter, _ in native._iter_param_wrapper_expert_loras(model):
             if id(parameter) in expert_ids:
                 raise ValueError("native expert LoRA iterator selected an adapter twice")
             expert_ids.add(id(parameter))

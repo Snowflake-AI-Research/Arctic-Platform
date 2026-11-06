@@ -21,6 +21,7 @@ import pytest
 _DSS_COMPARISON_ADAPTERS = {
     "correctness/harness/gateway.py",
     "correctness/harness/lora.py",
+    "correctness/harness/native_optimizer.py",
     "correctness/harness/storage.py",
     "debug/training.py",
 }

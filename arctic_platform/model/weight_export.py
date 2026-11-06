@@ -21,6 +21,7 @@ import json
 import logging
 import os
 from collections.abc import Callable
+from collections.abc import Iterable
 from collections.abc import Iterator
 from dataclasses import dataclass
 from tempfile import TemporaryDirectory
@@ -235,6 +236,11 @@ def requires_hf_weight_sync(model: nn.Module, checkpoint_dir: str | None = None)
     contract = weight_export_contract(model)
     if contract is not None and contract.vllm is not None:
         return False
+    # Composite VLMs (Gemma 4) load without renames, but vLLM serves model.language_model.* as language_model.model.*.
+    for name, _ in model.named_parameters():
+        export_name = hf_export_parameter_name(name)
+        if export_name is not None and export_name.startswith("model.language_model."):
+            return True
     return bool(hf_sync_name_map(model, checkpoint_dir))
 
 
@@ -411,6 +417,8 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
     adapter_dir = os.path.join(checkpoint_dir, PEFT_ADAPTER_DIRNAME)
     os.makedirs(adapter_dir, exist_ok=True)
     model.save_pretrained(adapter_dir, state_dict=state, safe_serialization=True, save_embedding_layers=False)
+    # The sampler loads this pack into vLLM as is, so families whose served module names differ rename here.
+    rename = getattr(type(_family_model_for_export(model)), "vllm_lora_name", None) or (lambda name: name)
     # PEFT must select against live wrapped names before we make the pack portable.
     for adapter_name in model.peft_config:
         output_dir = adapter_dir if adapter_name == "default" else os.path.join(adapter_dir, adapter_name)
@@ -419,19 +427,38 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
             metadata = handle.metadata()
             saved_names = list(handle.keys())
             portable = {}
+            renamed = False
             for name in saved_names:
-                export_name = strip_activation_checkpoint_segments(name)
+                unwrapped = strip_activation_checkpoint_segments(name)
+                export_name = rename(unwrapped)
+                renamed = renamed or export_name != unwrapped
                 if export_name in portable:
                     raise ValueError(f"PEFT checkpoint names collide after unwrapping: {export_name}")
                 portable[export_name] = handle.get_tensor(name)
         if len(portable) == 0:
             raise ValueError(f"PEFT saved an empty adapter: {adapter_name}")
-        if all(strip_activation_checkpoint_segments(name) == name for name in saved_names):
+        if list(portable) == saved_names:
             continue
         with TemporaryDirectory(prefix=".adapter-", dir=output_dir) as temporary_dir:
             temporary_path = os.path.join(temporary_dir, "adapter_model.safetensors")
             save_file(portable, temporary_path, metadata=metadata)
             os.replace(temporary_path, weights_path)
+        if renamed:
+            _rewrite_adapter_target_modules(output_dir, portable)
+
+
+def _rewrite_adapter_target_modules(output_dir: str, names: Iterable[str]) -> None:
+    config_path = os.path.join(output_dir, "adapter_config.json")
+    with open(config_path) as f:
+        config = json.load(f)
+    config["target_modules"] = sorted(
+        {name.split(".lora_", 1)[0].rsplit(".", 1)[-1] for name in names if ".lora_" in name}
+    )
+    with TemporaryDirectory(prefix=".adapter-", dir=output_dir) as temporary_dir:
+        temporary_path = os.path.join(temporary_dir, "adapter_config.json")
+        with open(temporary_path, "w") as f:
+            json.dump(config, f, indent=2, sort_keys=True)
+        os.replace(temporary_path, config_path)
 
 
 def save_hf_pretrained(model: nn.Module, output_dir: str) -> None:
@@ -478,11 +505,7 @@ def validate_lora_sync_trainable_parameters(model: nn.Module) -> None:
 
 
 def validate_full_weight_sync_source(model: nn.Module, weight_format: WeightFormat) -> None:
-    """Refuse a full-weight sync stream from a model that trains LoRA adapters.
-
-    A ``"vllm"`` or ``"hf"`` receiver writes tensors onto vLLM parameters by name. The sampler keeps adapters in its
-    LoRA manager, so the adapter factors reach no parameter and the sampler keeps serving the base model.
-    """
+    """Refuse full-weight synchronization when the model trains LoRA adapters."""
     from arctic_platform.model.patches.peft import is_peft_lora_param
 
     adapters = [name for name, parameter in model.named_parameters() if is_peft_lora_param(name, parameter)]
@@ -687,9 +710,8 @@ def iter_model_weights(
     ``"vllm"`` (direct copy), and in the checkpoint's layout for ``"hf"`` (see
     :func:`hf_sync_name_map`, which uses ``checkpoint_dir`` when given).
 
-    ``include_skipped=True`` is the weights-only checkpoint export, which writes the unmerged base of a PEFT model
-    beside its separately saved adapter pack. Every other ``"hf"`` or ``"vllm"`` stream feeds a sampler, so a model
-    with trainable LoRA parameters is refused there (see :func:`validate_full_weight_sync_source`).
+    ``include_skipped=True`` exports the unmerged PEFT base for a weights-only checkpoint.
+    Other full-weight streams refuse trainable LoRA adapters; synchronize those with ``weight_format="lora"``.
     """
     if weight_format not in ("hf", "vllm", "lora"):
         raise ValueError(f"weight_format must be 'hf', 'vllm', or 'lora'; got {weight_format!r}")

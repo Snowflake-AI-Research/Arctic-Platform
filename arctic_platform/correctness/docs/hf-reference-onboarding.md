@@ -18,11 +18,13 @@
 
 **The `arctic_platform/correctness/config-layout.json` manifest preserves migrated frozen config IDs independently of placement.** Moving an existing config or its reference folder does not rename its specification, relabel recorded numerical identities, remeasure references or rewrite historical measurement bytes. A placement-only move is not reference preparation and does not make a historically incompatible identity compatible.
 
-**Configs without a manifest entry derive new IDs from their config-relative paths.** The [config identity helper](../harness/config.py) joins the relative path components, without the extension, with `-`. For example, `tiny-qwen3-129m/standard/h200-training-full.json` derives `tiny-qwen3-129m-standard-h200-training-full` when no manifest entry exists; a migrated entry for that path retains `tiny-qwen3-129m-one-h200`. Specifications remain `specs/<config-id>.json` and summaries remain `specs/<config-id>.onboarding.json`. Use the resolved ID printed by the command or `list`, not the source filename or a guess based on the new folder.
+**Configs without a manifest entry derive new IDs from their config-relative paths.** The [config identity helper](../harness/config.py) joins the relative path components, without the extension, with `-`. The new demo variant `tiny-qwen3-129m/standard/h200-training-full--fp32.json` derives `tiny-qwen3-129m-standard-h200-training-full--fp32`. The historical unsuffixed path retains the manifest-frozen `tiny-qwen3-129m-one-h200` ID and its unchanged recipe, specifications and reference bytes. Specifications remain `specs/<config-id>.json` and summaries remain `specs/<config-id>.onboarding.json`. Use the resolved ID printed by the command or `list`, not the source filename or a guess based on the new folder.
 
 **Old correctness-config paths remain aliases only within their original config root.** Frozen specifications can still locate migrated configs through the manifest. A deleted source recipe under `cortex-training/model-catalog/models/` is not such an alias; importing that source still requires the recipe file to exist.
 
 **Distinct existing recipes retain explicit descriptive `--<variant>` filename suffixes when their derived placements collide.** For example, different training recipes may use `h200-training-full--sft-16gpus-sp16-256k.json` and `h200-training-full--rl-32gpus-sp16-256k.json`. Their reference folders include those suffixes, but their frozen IDs remain unchanged. New imports reuse an identical existing copy and error on conflicting bytes. For a noncatalog variant, append a lowercase descriptive suffix such as `--rl-16gpus` to the source filename stem before importing; the importer retains that suffix in the derived recipe filename. Catalog imports still retain their exact catalog-relative filenames.
+
+**The P1 demo's explicit FP32 accumulation makes it a new recipe variant.** Its external filename is `tiny-qwen3-129m-one-h200--fp32.json`, and its imported path is `configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json`. P1's BF16 admission gate requires `training.ds_config.data_types.grad_accum_dtype: "fp32"` before model preparation. That setting differs from the historical tiny recipe; onboard fresh compatible specifications and references for the variant rather than editing the old recipe or reusing its frozen identity.
 
 **Sampling-only recipes can be imported, but P1's two correctness checks require training.** Preserve an inference-only catalog recipe's sampling settings and catalog placement. Import acceptance is not numerical onboarding or runtime validation: a training-based check must reject a recipe without a training sub-job before preparing model assets.
 
@@ -34,10 +36,10 @@
 
 ```bash
 python -m arctic_platform.correctness onboard \
-  --config ./work/configs/tiny-qwen3-129m-one-h200.json
+  --config ./work/configs/tiny-qwen3-129m-one-h200--fp32.json
 ```
 
-**Default-all onboarding prepares gradients followed by optimizer state, then their combined reference selection.** Inspect `arctic_platform/correctness/specs/<config-id>.json` and the adjacent `<config-id>.onboarding.json` summary before accepting the gates, using the resolved ID printed by onboarding. The demo retains `tiny-qwen3-129m-one-h200` only when the layout manifest freezes that migrated ID; without an entry, its ID is `tiny-qwen3-129m-standard-h200-training-full`. To select only one check, add `--test single-step-grads` or `--test single-step-optimizer`; missing fixture prerequisites are automatic. Both checks are inapplicable to RL configs.
+**Default-all onboarding prepares gradients followed by optimizer state, then their combined reference selection.** Inspect `arctic_platform/correctness/specs/tiny-qwen3-129m-standard-h200-training-full--fp32.json` and the adjacent `.onboarding.json` summary before accepting the gates, confirming the resolved ID printed by onboarding. This new variant does not use the historical manifest-frozen ID. To select only one check, add `--test single-step-grads` or `--test single-step-optimizer`; missing fixture prerequisites are automatic. Both checks are inapplicable to RL configs.
 
 **Repeating a failed command resumes verified completed preparation.** Recovery records under `./work/logs/onboarding-state/` bind configuration, options, source, code and dependency versions to retained artifacts. Missing or changed artifacts invalidate the affected phase and its successors; failed phases are not completion checkpoints. An optimizer validation failure can therefore retry without recalibrating its compatible references. See [diagnostics and retry](running-tests.md#onboarding) for retained reports.
 
@@ -46,7 +48,7 @@ python -m arctic_platform.correctness onboard \
 ```bash
 # Prepare the identity used by a regression selecting both checks.
 python -m arctic_platform.correctness onboard \
-  --config ./work/configs/tiny-qwen3-129m-one-h200.json \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
   --prepare-references \
   --reference-tests single-step-grads single-step-optimizer
 ```
@@ -57,15 +59,15 @@ python -m arctic_platform.correctness onboard \
 
 **Records bind measurements to the exact workload.** Identity includes configuration checksum, check and arm, model asset contents, reference source and dependency identities, adapter initialization where applicable, input tensor semantics, and check-specific settings. Records use readable arm filenames; integrity hashes remain inside each compact JSON record. They do not contain model or optimizer tensors.
 
-**Each workload folder retains only its latest complete reference set.** Publication stages and validates the complete replacement, renames the previous set aside, installs the new set, and removes the previous directory. Failed publication restores the previous complete set; regression never replaces references. For the imported demo config `configs/tiny-qwen3-129m/standard/h200-training-full.json`, the maintained filenames below are relative to the reference root, regardless of whether its ID is migrated or newly derived:
+**Each workload folder retains only its latest complete reference set.** Publication stages and validates the complete replacement, renames the previous set aside, installs the new set, and removes the previous directory. Failed publication restores the previous complete set; regression never replaces references. For the new demo config `configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json`, the maintained filenames below are relative to the reference root and separate from the historical unsuffixed recipe's records:
 
 ```text
-tiny-qwen3-129m/standard/h200-training-full/single-step-grads/gradients-only/gas1.json
-tiny-qwen3-129m/standard/h200-training-full/single-step-grads/gradients-only/gas4.json
-tiny-qwen3-129m/standard/h200-training-full/single-step-grads/with-optimizer/gas1.json
-tiny-qwen3-129m/standard/h200-training-full/single-step-grads/with-optimizer/gas4.json
-tiny-qwen3-129m/standard/h200-training-full/single-step-optimizer/gas1.json
-tiny-qwen3-129m/standard/h200-training-full/single-step-optimizer/gas4.json
+tiny-qwen3-129m/standard/h200-training-full--fp32/single-step-grads/gradients-only/gas1.json
+tiny-qwen3-129m/standard/h200-training-full--fp32/single-step-grads/gradients-only/gas4.json
+tiny-qwen3-129m/standard/h200-training-full--fp32/single-step-grads/with-optimizer/gas1.json
+tiny-qwen3-129m/standard/h200-training-full--fp32/single-step-grads/with-optimizer/gas4.json
+tiny-qwen3-129m/standard/h200-training-full--fp32/single-step-optimizer/gas1.json
+tiny-qwen3-129m/standard/h200-training-full--fp32/single-step-optimizer/gas4.json
 ```
 
 **Compact records are generated local artifacts, not files to commit.** They default to the Git-ignored `arctic_platform/correctness/reference_data` directory. Retain them for later regression; regression cannot regenerate missing HF measurements. The publisher validates containment under the executing library's Git root, not Git tracking or merely the shell's current directory. An unrelated sibling records directory is rejected. No measurements are bundled. To override the default, pass the same `--reference-records-dir` inside the checkout to preparation and regression. Model weights and adapter tensors do not belong in this directory or in Git.
@@ -120,7 +122,7 @@ tiny-qwen3-129m/standard/h200-training-full/single-step-optimizer/gas4.json
 
 ```bash
 python -m arctic_platform.correctness run \
-  --config ./work/configs/tiny-qwen3-129m-one-h200.json \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
   --out ./work/reports/both
 ```
 

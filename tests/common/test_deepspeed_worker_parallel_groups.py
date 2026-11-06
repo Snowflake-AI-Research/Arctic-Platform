@@ -56,22 +56,23 @@ def _spec(ep=8, sp=8):
 
 
 @pytest.mark.parametrize("job_config", [{}, {"training_config": {}}])
-def test_worker_training_config_does_not_insert_accumulation_precision(runtime, job_config):
-    config = {}
+def test_worker_training_config_defaults_zero2_accumulation_to_fp32(runtime, job_config):
+    config = {"zero_optimization": {"stage": 2}}
 
     result = runtime.worker.ds_training_config(job_config, config, {})
 
     assert result is config
-    assert "data_types" not in result
+    assert result["data_types"] == {"grad_accum_dtype": "fp32"}
 
 
 @pytest.mark.parametrize("data_types", [{}, {"grad_accum_dtype": "bf16"}, {"grad_accum_dtype": "fp32"}])
-def test_worker_training_config_preserves_explicit_accumulation_precision(runtime, data_types):
-    config = {"data_types": deepcopy(data_types)}
+def test_worker_training_config_defaults_unset_and_preserves_explicit_accumulation_precision(runtime, data_types):
+    config = {"zero_optimization": {"stage": 2}, "data_types": deepcopy(data_types)}
 
     result = runtime.worker.ds_training_config({}, config, {})
 
-    assert result["data_types"] == data_types
+    assert result["data_types"] == {"grad_accum_dtype": "fp32", **data_types}
+    assert config["data_types"] is not data_types
 
 
 def test_worker_groups_derive_actual_host_blocks_and_forward_layout(runtime):

@@ -101,7 +101,7 @@ config = {
         "schema": "dev",
     },
 }
-Path("./work/configs/tiny-qwen3-129m-one-h200.json").write_text(
+Path("./work/configs/tiny-qwen3-129m-one-h200--fp32.json").write_text(
     json.dumps(config, indent=2) + "\n"
 )
 PY
@@ -117,13 +117,15 @@ PY
 
 **Catalog recipes keep their complete path below `cortex-training/model-catalog/models/`.** Replace that prefix with `arctic_platform/correctness/configs/`, preserving every remaining directory and filename. For example, `qwen3.5-2b/standard/h200-inference-lora.json` retains that relative path even though the recipe is inference-only. Import recipe JSON, not the catalog's `model.json` metadata.
 
-**Noncatalog configs use `<model-name>/<standard|long>/<gpu>-<training|inference>-<full|lora>.json`.** The model name is the lowercase model basename without the repository owner; an HF cache snapshot uses the model component, not the snapshot hash. Only an explicit `max_tokens_per_mb >= 262144` selects `long`, including a training sub-job's `mb_spec` or native `training.ds_worker_config.mb_spec`; missing or smaller budgets select `standard`, regardless of `max_seq_len` or runtime defaults. Training takes precedence over sampling when both exist, and `lora` comes from the selected job's nonempty parameter-efficient fine-tuning (PEFT) settings; otherwise use `full`. Resolve the GPU from explicit recipe hardware, an existing accelerator directory or filename, or the executing GPU; missing hardware identity is not permission to guess. The demo therefore imports as `configs/tiny-qwen3-129m/standard/h200-training-full.json`, regardless of its source filename.
+**Noncatalog configs use `<model-name>/<standard|long>/<gpu>-<training|inference>-<full|lora>.json` with any explicit `--<variant>` suffix.** The model name is the lowercase model basename without the repository owner; an HF cache snapshot uses the model component, not the snapshot hash. Only an explicit `max_tokens_per_mb >= 262144` selects `long`, including a training sub-job's `mb_spec` or native `training.ds_worker_config.mb_spec`; missing or smaller budgets select `standard`, regardless of `max_seq_len` or runtime defaults. Training takes precedence over sampling when both exist, and `lora` comes from the selected job's nonempty parameter-efficient fine-tuning (PEFT) settings; otherwise use `full`. Resolve the GPU from explicit recipe hardware, an existing accelerator directory or filename, or the executing GPU; missing hardware identity is not permission to guess. The demo imports as `configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json`, retaining the source filename's explicit `--fp32` suffix.
 
-**Reference folders mirror the imported config path without its extension.** The demo's compact records use `arctic_platform/correctness/reference_data/tiny-qwen3-129m/standard/h200-training-full/<check-id>/...`. `--reference-records-dir` changes only the root prefix. Existing check-specific subdirectories and measurement filenames remain unchanged; see the [reference layout](hf-reference-onboarding.md#configuration-and-reference-layout) for examples.
+**Reference folders mirror the imported config path without its extension.** The new demo's compact records use `arctic_platform/correctness/reference_data/tiny-qwen3-129m/standard/h200-training-full--fp32/<check-id>/...`. `--reference-records-dir` changes only the root prefix. Existing check-specific subdirectories and measurement filenames remain unchanged; see the [reference layout](hf-reference-onboarding.md#configuration-and-reference-layout) for examples.
 
-**Migrated config IDs remain frozen through `arctic_platform/correctness/config-layout.json`; new IDs derive from relative paths when no manifest entry exists.** New IDs join the config-relative path components, without the extension, with `-`. For the demo that yields `tiny-qwen3-129m-standard-h200-training-full`, unless a migrated manifest entry retains `tiny-qwen3-129m-one-h200`. Specifications remain `specs/<config-id>.json` and summaries remain `specs/<config-id>.onboarding.json`; use the resolved ID printed by the command or `list`, not the original filename. Historical measurement bytes and recorded identities are not rewritten or remeasured.
+**Migrated config IDs remain frozen through `arctic_platform/correctness/config-layout.json`; new IDs derive from relative paths when no manifest entry exists.** New IDs join the config-relative path components, without the extension, with `-`. The new demo derives `tiny-qwen3-129m-standard-h200-training-full--fp32`; the historical unsuffixed tiny config keeps the manifest-frozen `tiny-qwen3-129m-one-h200` ID. Specifications remain `specs/<config-id>.json` and summaries remain `specs/<config-id>.onboarding.json`; use the resolved ID printed by the command or `list`, not the original filename. Historical measurement bytes and recorded identities are not rewritten or remeasured.
 
 **Recipe variants distinguish different bytes at the same derived placement.** Distinct migrated recipes retain descriptive `--<variant>` filename suffixes and their frozen IDs. For a new noncatalog variant, append a lowercase descriptive suffix such as `--sft-4gpus` to the source filename stem before importing; changing the source basename alone does not distinguish recipes. Catalog imports retain their exact relative filenames, and conflicting bytes at that destination are rejected.
+
+**The P1 demo uses a new explicit FP32 variant rather than changing the historical tiny recipe.** BF16 reference comparisons require `training.ds_config.data_types.grad_accum_dtype: "fp32"` before fixture creation or calibration. The example includes that setting and uses `tiny-qwen3-129m-one-h200--fp32.json`; its specifications and references must be prepared for the new derived ID. Keep the old unsuffixed config, manifest entry, specs and reference bytes unchanged.
 
 ## Onboarding
 
@@ -135,7 +137,7 @@ PY
 
 ```bash
 python -m arctic_platform.correctness onboard \
-  --config ./work/configs/tiny-qwen3-129m-one-h200.json
+  --config ./work/configs/tiny-qwen3-129m-one-h200--fp32.json
 ```
 
 **No manual gateway startup or fixture flag is needed for this onboarding command.** With no Cortex host or base URL configured, onboarding selects the reduced local fixture, starts the installed `dss.ray_dss.gateway_server` on loopback for target validation, and closes its owned gateway afterwards. An existing loopback gateway can be supplied with `--base-url`; onboarding does not start or stop that external service. Hosted Cortex account endpoints cannot use this reduced-fixture onboarding mode.
@@ -150,12 +152,20 @@ python -m arctic_platform.correctness onboard \
 
 **Existing Cortex-training recipe JSON can be supplied without converting it to the native client schema.** Import accepts `sub_job_configs` and preserves the original bytes and engine settings, including sampling-only recipes. P1's two supervised checks still require exactly one training sub-job and reject an inference-only recipe before model preparation; import acceptance does not make a recipe eligible for numerical onboarding. Training plus sampling remains an RL configuration, not supervised training. The first-two checks still select a reduced fixture and apply their existing correctness token cap; acceptance by the loader does not establish full-model runtime support.
 
+**Import this catalog recipe separately from onboarding.** The existing config helper copies only the recipe bytes and prints the local path; it does not prepare models, specifications or references, or run target validation. Identical existing copies are reused; conflicting bytes are rejected.
+
 ```bash
-python -m arctic_platform.correctness onboard \
-  --config ../cortex-training/model-catalog/models/qwen3.8-flash-next/long/h200-training-full.json
+python - <<'PY'
+from arctic_platform.correctness.harness.config import local_config_path
+
+recipe = "../cortex-training/model-catalog/models/qwen3.8-flash-next/long/h200-training-full.json"
+print(local_config_path(recipe))
+PY
 ```
 
-**Use the recipe path present in your Cortex-training checkout.** The imported path is `arctic_platform/correctness/configs/qwen3.8-flash-next/long/h200-training-full.json`; another model or sequence directory can contain the same filename without conflict. Different bytes at that exact relative path require a distinct variant. Deleted Cortex source paths have no automatic replacement; old migrated correctness-config paths remain aliases only within their original config root through `config-layout.json`.
+**This catalog import is not an eligible P1 BF16 onboarding example.** The current recipe declares BF16 but omits `training_config.ds_config.data_types.grad_accum_dtype: "fp32"`, so P1 onboarding rejects it before fixture creation or calibration. Import acceptance does not apply that setting or establish numerical support. Continue with the tiny FP32 demo above; do not edit catalog or migrated recipe bytes, specifications or historical references to bypass admission. A different precision workload needs a separate explicit noncatalog variant and fresh compatible onboarding.
+
+**Use the recipe path present in your Cortex-training checkout.** The current recipe declares 32 H200 GPUs and 256K context. The imported path is `arctic_platform/correctness/configs/qwen3.8-flash-next/long/h200-training-full.json`; another model or sequence directory can contain the same filename without conflict. Different bytes at that exact relative path require a distinct variant. Deleted Cortex source paths have no automatic replacement; old migrated correctness-config paths remain aliases only within their original config root through `config-layout.json`.
 
 **Calibration automatically uses the visible GPUs on one node, capped at eight concurrent HF workers.** Eight samples require one wave of eight per GAS arm when eight or more local GPUs are visible, even if sixteen GPUs are visible. A node with fewer GPUs needs more waves; this demo runs serially if only one GPU is visible. `--reference-calibration-workers` accepts an explicit override from one to eight available local GPUs. The target's GPU count does not limit calibration concurrency.
 
@@ -169,7 +179,7 @@ python -m arctic_platform.correctness onboard \
 
 ```bash
 python -m arctic_platform.correctness run \
-  --config ./work/configs/tiny-qwen3-129m-one-h200.json \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
   --out ./work/reports/both
 ```
 
@@ -197,7 +207,7 @@ Read `./work/reports/both/report.md`, `report.json`, and `full.log`. Every run e
 
 ```bash
 python -m arctic_platform.correctness onboard \
-  --config ./work/configs/tiny-qwen3-129m-one-h200.json \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
   --prepare-references \
   --reference-tests single-step-grads single-step-optimizer
 ```
@@ -211,18 +221,18 @@ python -m arctic_platform.correctness onboard \
 ```bash
 # One config and one check.
 python -m arctic_platform.correctness run \
-  --config ./work/configs/tiny-qwen3-129m-one-h200.json \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
   --test single-step-grads \
   --out ./work/reports/grads
 
 python -m arctic_platform.correctness run \
-  --config ./work/configs/tiny-qwen3-129m-one-h200.json \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
   --test single-step-optimizer \
   --out ./work/reports/optimizer
 
 # One config and both checks, using the combined records prepared above.
 python -m arctic_platform.correctness run \
-  --config ./work/configs/tiny-qwen3-129m-one-h200.json \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
   --out ./work/reports/config
 ```
 
@@ -266,7 +276,7 @@ python -m arctic_platform.correctness run \
 ```bash
 python -m arctic_platform.correctness.diagnostics list
 python -m arctic_platform.correctness.diagnostics run lm_head_chunking \
-  --config ./work/configs/tiny-qwen3-129m-one-h200.json \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
   --test single-step-grads
 ```
 
@@ -293,7 +303,8 @@ python -m arctic_platform.correctness selftest
 
 ```text
 Use skills/correctness/SKILL.md to fix onboarding for
-./work/configs/tiny-qwen3-129m-one-h200.json, then run its applicable tests.
+arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json,
+then run both single-step-grads and single-step-optimizer.
 Discover the environment, reports, logs and prepared artifacts yourself.
 ```
 
@@ -301,12 +312,13 @@ For a regression-only failure, say "run both checks" or name the desired check I
 
 ## Add To Repo
 
-**For a real config addition, review and stage the imported config and reviewed specifications after onboarding and regression succeed.** The demo does not require a commit. The harness imports the config into `configs/`; `specs/` contains the reviewed gates and onboarding summary. Those directories are ignored by default on P1, so staging them deliberately requires `-f`. Review all contents of `configs/` and `specs/` before adding those directories, especially in a checkout with other local recipes.
+**For a real config addition, review and stage the imported config and reviewed specifications after onboarding and regression succeed.** The demo does not require a commit. The paths below select only this demo's new FP32 variant; for another recipe, substitute its resolved imported path and config ID. Configs and specs are ignored by default on P1, so staging them deliberately requires `-f`. Review the selected files without staging other local recipes or historical evidence.
 
 ```bash
 git add -f -- \
-  arctic_platform/correctness/configs/ \
-  arctic_platform/correctness/specs/
+  arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
+  arctic_platform/correctness/specs/tiny-qwen3-129m-standard-h200-training-full--fp32.json \
+  arctic_platform/correctness/specs/tiny-qwen3-129m-standard-h200-training-full--fp32.onboarding.json
 git diff --cached --stat
 ```
 
@@ -317,7 +329,7 @@ git diff --cached --stat
 **Clean up only local checkout files after both commands succeed and you have reviewed their results.** Remove the duplicate original config under `./work/configs/`, keeping the imported config, reviewed specification and local compact references for later regression. Allocation scratch is left untouched and will be removed automatically on job reset.
 
 ```bash
-rm ./work/configs/tiny-qwen3-129m-one-h200.json
+rm ./work/configs/tiny-qwen3-129m-one-h200--fp32.json
 ```
 
 **Optionally remove these two explicit directories once you no longer need the diagnostic evidence.** `./work/logs/correctness-demo/` contains this demo's onboarding logs and retry state; `./work/reports/both/` contains its regression reports. Keep both while investigating a failure; deleting retry state may require preparation again on a later onboarding attempt. Run from the checkout root. These literal paths do not use environment variables or wildcards and do not select other runs' log directories or reusable regression inputs.
@@ -331,6 +343,6 @@ rm -r ./work/reports/both/
 
 ```bash
 python -m arctic_platform.correctness run \
-  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full.json \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
   --out ./work/reports/both
 ```

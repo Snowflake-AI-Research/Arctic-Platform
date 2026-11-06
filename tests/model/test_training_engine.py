@@ -228,7 +228,7 @@ def test_cpu_adam_uses_fp32_states_unless_bf16_optimizer_states_are_enabled():
             OptimizerSettings(),
             _ZERO2,
             False,
-            ("torch_adamw", "FusedAdam isn't supported for this model, so standard AdamW ran"),
+            ("torch_adamw", "you set 'optimizer.fused' to false, so standard AdamW ran"),
         ),
         (
             OptimizerSettings(fused=False),
@@ -265,6 +265,19 @@ def test_optimizer_choice_matches_the_class_built(optimizer, ds_config, fused, e
 def test_optimizer_implementation_rejects_unknown_names():
     with pytest.raises(AssertionError, match="Unhandled optimizer"):
         optimizer_implementation("sgd", fused=True)
+
+
+@pytest.mark.parametrize("fused,expected", [(True, "deepspeed_cpu_adam"), (False, "torch_cpu_adamw")])
+def test_cpu_optimizer_log_names_the_selected_implementation(monkeypatch, caplog, fused, expected):
+    class Adam:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr("deepspeed.ops.adam.DeepSpeedCPUAdam", Adam)
+    monkeypatch.setattr("arctic_platform.common.cpu_adam.configure_nonfused_cpu_adam", lambda optimizer: optimizer)
+    with caplog.at_level("INFO", logger="arctic_platform.common.deepspeed_engine"):
+        build_training_optimizer(torch.nn.Linear(2, 2), OptimizerSettings(), _OFFLOAD, fused=fused)
+    assert f"using optimizer='{expected}'" in caplog.text
 
 
 def test_build_training_optimizer_disables_decay_on_every_qwen38_norm():
@@ -540,7 +553,7 @@ def test_initialize_splits_expert_groups_and_fuses_adam_for_glm(monkeypatch, tmp
 
 
 @pytest.mark.parametrize("force_cpu_optimizer", [None, True, False])
-def test_initialize_glm_cpu_offload_honors_nonfused_policy(monkeypatch, force_cpu_optimizer):
+def test_initialize_cpu_offload_honors_explicit_nonfused_policy(monkeypatch, force_cpu_optimizer):
     calls = {}
 
     class _CPUAdam(torch.optim.Optimizer):
@@ -555,7 +568,6 @@ def test_initialize_glm_cpu_offload_honors_nonfused_policy(monkeypatch, force_cp
         calls["optimizer"] = kwargs["optimizer"]
         return "engine", kwargs["optimizer"], None, None
 
-    monkeypatch.setattr(deepspeed_engine, "is_glm_moe_model", lambda path: True)
     monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
     monkeypatch.setattr("deepspeed.initialize", _initialize)
     monkeypatch.setattr("deepspeed.ops.adam.DeepSpeedCPUAdam", _CPUAdam)
@@ -566,7 +578,7 @@ def test_initialize_glm_cpu_offload_honors_nonfused_policy(monkeypatch, force_cp
     _, optimizer, choice = initialize_training_engine(
         torch.nn.Linear(2, 2, bias=False),
         ds_config,
-        optimizer=OptimizerSettings(),
+        optimizer=OptimizerSettings(fused=False),
         ep_size=1,
         mpu=None,
         model_path="glm",
@@ -942,7 +954,6 @@ def test_engine_initializes_once_inside_optional_trace(monkeypatch, with_optimiz
     monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
     built = object()
     monkeypatch.setattr(deepspeed_engine, "build_training_optimizer", lambda *args, **kwargs: built)
-    monkeypatch.setattr(deepspeed_engine, "is_glm_moe_model", lambda path: False)
     ds_config = {"zero_optimization": {"stage": 2}}
     if trace_enabled:
         ds_config[deepspeed_zero_initialization.TRAINING_OPTION] = {
@@ -977,7 +988,7 @@ def test_engine_initializes_once_inside_optional_trace(monkeypatch, with_optimiz
         return initialize_training_engine(
             model,
             ds_config,
-            optimizer=OptimizerSettings() if with_optimizer else None,
+            optimizer=OptimizerSettings(fused=True) if with_optimizer else None,
             ep_size=1,
             mpu=mpu,
             model_path="unused",
@@ -1016,16 +1027,3 @@ def test_zero_initialization_trace_rejects_invalid_request(option, rank):
             {deepspeed_zero_initialization.TRAINING_OPTION: option}, rank
         ):
             pytest.fail("invalid trace entered initialization context")
-
-
-@pytest.mark.parametrize("fused,expected", [(True, "deepspeed_cpu_adam"), (False, "torch_cpu_adamw")])
-def test_cpu_optimizer_log_names_the_selected_implementation(monkeypatch, caplog, fused, expected):
-    class Adam:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    monkeypatch.setattr("deepspeed.ops.adam.DeepSpeedCPUAdam", Adam)
-    monkeypatch.setattr("arctic_platform.common.cpu_adam.configure_nonfused_cpu_adam", lambda optimizer: optimizer)
-    with caplog.at_level("INFO", logger="arctic_platform.common.deepspeed_engine"):
-        build_training_optimizer(torch.nn.Linear(2, 2), OptimizerSettings(), _OFFLOAD, fused=fused)
-    assert f"using optimizer='{expected}'" in caplog.text
