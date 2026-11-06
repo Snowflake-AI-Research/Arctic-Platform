@@ -707,7 +707,7 @@ def test_preserved_export_failure_reaches_every_rank_before_ordinary_collectives
     if family == "qwen":
         builder = qwen._build_iter_full_hf_weights_with_mtp
     else:
-        from test_glm5_next import _auxiliary_model
+        from tests.model.test_glm5_next import _auxiliary_model
 
         model = _auxiliary_model()
         builder = glm._build_iter_full_hf_weights_with_auxiliary
@@ -721,7 +721,7 @@ def test_preserved_export_failure_reaches_every_rank_before_ordinary_collectives
             mtp_weights.capture_mtp_weights(model, source)
             shard = getattr(model, mtp_weights._STATE_ATTRIBUTE)[0].path
         else:
-            from test_glm5_next import _auxiliary_payload
+            from tests.model.test_glm5_next import _auxiliary_payload
 
             tensors = _auxiliary_payload()
             save_file(tensors, tmp_path / "original.safetensors")
