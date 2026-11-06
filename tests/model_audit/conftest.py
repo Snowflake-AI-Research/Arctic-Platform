@@ -360,6 +360,14 @@ def client_job(profile, name: str) -> dict:
     if name == "forced-clip":
         overrides = {"training_config": {"gradient_clipping": FORCED_CLIP}}
         return {"body": profile.job_body(training=overrides), "lr": lr, "forwards": "batch"}
+    if name == "noop-offload":
+        noop = {"zero_optimization": {"offload_optimizer": {"device": "none"}}}
+        body = profile.job_body(training={"training_config": {"ds_config": noop}})
+        launch = profile.launch_training()["training_config"].get("ds_config", {})
+        device = (launch.get("zero_optimization", {}).get("offload_optimizer") or {}).get("device", "none")
+        if device != "none":
+            raise LookupError(f"the launch config offloads the optimizer to {device}")
+        return {"body": body, "lr": lr, "forwards": "step"}
     if name.startswith("layout-"):
         layout = next(lay for lay in profile.layouts if lay["id"] == name[len("layout-") :])
         overrides = {"training_config": layout["training_config"]}
@@ -377,19 +385,24 @@ def launch_tp(profile) -> int:
     )
 
 
-def _wanted_jobs(profile, items) -> list[str]:
+def _wanted_jobs(profile, items, ckpt: Path) -> list[str]:
     """The service jobs the selected, runnable tests of ``profile`` read."""
+    no_reference = reference_unavailable(profile, ckpt) is not None
     wanted = []
     for item in items:
         params = getattr(getattr(item, "callspec", None), "params", {})
         if getattr(params.get("profile"), "name", None) != profile.name or item.get_closest_marker("skip"):
             continue
         fixtures = set(item.fixturenames)
+        if no_reference and "reference" in fixtures:
+            continue
         names = []
         if fixtures & {"client_baseline", "trainer_forward", "baseline_step", "sampler_run"}:
             names.append("baseline")
         if "step_launch_lr" in fixtures:
             names.append("launch-lr")
+        if "noop_offload_step" in fixtures:
+            names.append("noop-offload")
         if "parallel_step" in fixtures and any(lay["id"] == params.get("layout") for lay in profile.layouts):
             names.append(f"layout-{params['layout']}")
         if "tp" in params and params["tp"] < launch_tp(profile):
@@ -439,7 +452,7 @@ class ClientJobs:
 def client(request, probes, profile, model_ckpt) -> ClientJobs:
     jobs = ClientJobs(probes, profile, model_ckpt)
     if client_unavailable() is None:
-        for name in _wanted_jobs(profile, request.session.items):
+        for name in _wanted_jobs(profile, request.session.items, model_ckpt):
             try:
                 jobs.start(name)
             except pytest.skip.Exception:
@@ -494,6 +507,11 @@ def step_launch_lr(client):
 @pytest.fixture(scope="session")
 def forced_clip_step(client):
     return client.step("forced-clip")
+
+
+@pytest.fixture(scope="session")
+def noop_offload_step(client):
+    return client.get("noop-offload")
 
 
 @pytest.fixture(scope="session")

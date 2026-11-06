@@ -105,7 +105,7 @@ def test_job_runs_sent_config(profile, client_baseline, record):
     echoed = run["job"]["training"]
     changed = _changed(sent, echoed)
     unechoed = sorted(set(sent.get("training_config", {})) - set(echoed.get("training_config", {})))
-    record(changed=changed, not_echoed=unechoed)
+    record(image_tag=run["job"].get("image_tag"), changed=changed, not_echoed=unechoed)
     assert not changed, f"settings the training sub-job reports differently from the body: {changed}"
 
 

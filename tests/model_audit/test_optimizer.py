@@ -49,6 +49,10 @@ FROZEN = audit_lib.register_check("optimizer.frozen_unchanged", "frozen paramete
 POLICY = audit_lib.register_check(
     "optimizer.implementation_policy", "the engine runs the optimizer implementation the profile expects"
 )
+NOOP_OFFLOAD = audit_lib.register_check(
+    "optimizer.noop_offload_steps",
+    "a ds_config spelling DeepSpeed's no-op optimizer offload (device: none) steps like one that omits it",
+)
 
 
 @pytest.mark.audit_check(DIRECTION)
@@ -109,6 +113,13 @@ def test_frozen_unchanged(profile, baseline_step, record):
     step = require_ok(baseline_step, "training job step")
     record(frozen=len(step["frozen_params"]), changed=step["frozen_changed"][:20])
     assert not step["frozen_changed"], f"frozen parameters modified by the step: {step['frozen_changed'][:20]}"
+
+
+@pytest.mark.audit_check(NOOP_OFFLOAD)
+def test_noop_offload_steps(profile, noop_offload_step, record):
+    step = require_ok(noop_offload_step, "training job with offload_optimizer.device=none")["step"]
+    record(step=step)
+    assert "error" not in step, f"the step failed: {step.get('error', '')[-600:]}"
 
 
 @pytest.mark.audit_check(POLICY)

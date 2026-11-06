@@ -214,8 +214,18 @@ def run(profile, ckpt: str, body: dict, lr: float, sync_formats: list[str], forw
     if len(rows) < dp:
         raise ValueError(f"{len(rows)} audit rows cannot fill a request to {dp} data-parallel ranks")
     job = Job(connect(), body, log)
-    result: dict = {"job": {"id": job.id, **{k: v for k, v in job.subs.items()}}, "rows": rows}
+    result: dict = {
+        "job": {"id": job.id, "image_tag": job.info.get("image_tag"), **{k: v for k, v in job.subs.items()}},
+        "rows": rows,
+    }
     try:
+        if "training" in job.subs and forwards == "step":
+            job.forward_backward(rows)
+            try:
+                result["step"] = {"lr": lr, "reply": job.step(lr)}
+            except Exception as err:  # noqa: BLE001
+                result["step"] = {"lr": lr, "error": f"{type(err).__name__}: {str(err).strip()[-2000:]}"}
+            return result
         if "training" in job.subs:
             fwd = {
                 "labels": audit_lib.pack_rows(rows, pad)[2],
@@ -278,7 +288,9 @@ def main() -> None:
     parser.add_argument("--body", required=True, help="JSON create-job body")
     parser.add_argument("--lr", type=float, default=None, help="step learning rate; defaults to the audit lr")
     parser.add_argument("--sync-format", action="append", default=[], help="weight-sync format, repeatable")
-    parser.add_argument("--forwards", choices=("all", "batch"), default="all")
+    parser.add_argument(
+        "--forwards", choices=("all", "batch", "step"), default="all", help="step: one step, no exports"
+    )
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
