@@ -519,6 +519,10 @@ def _is_userspace_spin(pid):
     yield loop never ends. Measured 2026-09-22 across 29 restores: that
     inequality predicted quiescence failure every time, 29 for 29.
 
+    TP workers now install ``spin_clock`` before the dump, which times that
+    loop on the wall clock, so images dumped since then restore idle. This
+    stays for images dumped before it.
+
     Conservative on error. If either file cannot be read the answer is False,
     which keeps the old behaviour of failing the restore.
     """
