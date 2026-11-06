@@ -571,3 +571,23 @@ def test_check_supported_config_rejects(overrides, message):
 def test_check_supported_config_rejects_other_model_types():
     with pytest.raises(ValueError, match="qwen3_5_text"):
         qwen3_5.check_supported_config(types.SimpleNamespace(model_type="qwen3"))
+
+
+@pytest.mark.parametrize("temperature", [1.0, 0.7])
+def test_lm_head_backward_over_vocabulary_slices_matches_autograd(fake_vllm, monkeypatch, temperature):
+    monkeypatch.setattr(ops, "_LM_HEAD_VOCAB_CHUNK", 7)
+    torch.manual_seed(5)
+    hidden = torch.randn(10, 16, dtype=torch.float64, requires_grad=True)
+    weight = torch.randn(30, 16, dtype=torch.float64, requires_grad=True)
+    labels = torch.randint(0, 30, (10,))
+    labels[3] = -100
+    upstream = torch.linspace(-1.0, 2.0, 10, dtype=torch.float64)
+    out = ops.lm_head_logprobs(hidden, weight, labels, temperature=temperature, token_chunk_size=4, vocab_padding=8)
+    (out * upstream).sum().backward()
+
+    h, w = hidden.detach().clone().requires_grad_(True), weight.detach().clone().requires_grad_(True)
+    logprobs = torch.log_softmax((h @ w.t()) / temperature, dim=-1).gather(1, labels.clamp_min(0)[:, None]).squeeze(1)
+    (logprobs.masked_fill(labels == -100, 0.0) * upstream).sum().backward()
+    # The backward forms its logits in fp32 whatever the input dtype.
+    torch.testing.assert_close(hidden.grad, h.grad, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(weight.grad, w.grad, rtol=1e-4, atol=1e-5)

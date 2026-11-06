@@ -40,8 +40,8 @@ completion is computed here as decoded, so a multi-turn sample does not match fr
 The backward follows the Qwen3 path: each operator's forward is vLLM's kernel, and its backward is the trainer's
 math for the same function at the saved inputs. vLLM's GatedDeltaNet kernels have no backward, so that layer's
 backward recomputes it with the trainer's chunked gated delta rule (``fla``) over whole sequences and
-differentiates that; the prompt/decode split does not change the function, only its rounding. Every decoder layer
-after the first is checkpointed when gradients are enabled.
+differentiates that; the prompt/decode split does not change the function, only its rounding. The decoder layers
+after the first are checkpointed in pairs when gradients are enabled.
 """
 
 from __future__ import annotations
@@ -57,6 +57,9 @@ from arctic_platform.model.implementations.vllm_aligned import ops
 
 SUPPORTED_MODEL_TYPES = frozenset({"qwen3_5_text"})
 LOSS_MASK_KWARG = "vllm_aligned_loss_mask"
+# A checkpoint boundary holds both the hidden stream and the residual, so layers are checkpointed in pairs to keep the
+# saved activations at the size of a stock per-layer checkpoint.
+_LAYERS_PER_CHECKPOINT = 2
 _KERNEL_BLOCK_ALIGNMENT = 16
 
 
@@ -546,6 +549,12 @@ def _decoder_layer(layer: Any, hidden: torch.Tensor, residual: torch.Tensor | No
     return _mlp(layer.mlp, hidden), residual
 
 
+def _decoder_layers(layers: list, hidden: torch.Tensor, residual: torch.Tensor, ctx: _ForwardContext):
+    for layer in layers:
+        hidden, residual = _decoder_layer(layer, hidden, residual, ctx)
+    return hidden, residual
+
+
 def _cos_sin_cache(backbone: Any, geometry: _Geometry, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     cache = getattr(backbone, "_vllm_aligned_cos_sin_cache", None)
     if cache is None or cache.device != device or cache.dtype != dtype:
@@ -572,7 +581,7 @@ def aligned_logprobs(
 ) -> torch.Tensor:
     """The sampler's logprob of each ``labels`` token, ``[tokens]`` in fp32, differentiable; -100 scores 0.
 
-    With gradients enabled every decoder layer after the first is checkpointed; its recompute reruns the same
+    With gradients enabled the decoder layers after the first are checkpointed in pairs; a recompute reruns the same
     kernels, so it reproduces the forward exactly.
     """
     backbone = model.model
@@ -590,14 +599,16 @@ def aligned_logprobs(
         cos_sin_cache=_cos_sin_cache(backbone, geometry, hidden.dtype, positions.device),
         fa_version=ops.flash_attn_version(geometry.head_dim),
     )
-    residual = None
-    for layer in backbone.layers:
-        if residual is not None and torch.is_grad_enabled():
+    layers = list(backbone.layers)
+    hidden, residual = _decoder_layer(layers[0], hidden, None, ctx)
+    for start in range(1, len(layers), _LAYERS_PER_CHECKPOINT):
+        group = layers[start : start + _LAYERS_PER_CHECKPOINT]
+        if torch.is_grad_enabled():
             hidden, residual = torch.utils.checkpoint.checkpoint(
-                _decoder_layer, layer, hidden, residual, ctx, use_reentrant=False
+                _decoder_layers, group, hidden, residual, ctx, use_reentrant=False
             )
         else:
-            hidden, residual = _decoder_layer(layer, hidden, residual, ctx)
+            hidden, residual = _decoder_layers(group, hidden, residual, ctx)
     hidden, _ = ops.gemma_rms_norm(hidden, backbone.norm.weight, geometry.eps, residual)
     return ops.lm_head_logprobs(
         hidden,

@@ -522,6 +522,9 @@ def _padded_vocab(vocab_size: int, padding: int) -> int:
     return -(-vocab_size // padding) * padding
 
 
+_LM_HEAD_VOCAB_CHUNK = 32768
+
+
 def _token_logprobs_kernel(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
     from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
 
@@ -566,25 +569,46 @@ class _LMHeadLogprobs(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         hidden, weight, labels = ctx.saved_tensors
-        grad_hidden = torch.empty_like(hidden)
-        grad_weight = torch.zeros(weight.shape, dtype=torch.float32, device=weight.device)
+        tokens, vocab = hidden.shape[0], weight.shape[0]
         compute_dtype = torch.float32 if ctx.fp32_backward else weight.dtype
-        matmul_weight = weight.to(compute_dtype)
-        for start in range(0, hidden.shape[0], ctx.token_chunk_size):
-            stop = min(start + ctx.token_chunk_size, hidden.shape[0])
-            hidden_chunk = hidden[start:stop].to(compute_dtype)
-            logits = (hidden_chunk @ matmul_weight.t()).float()
-            if ctx.temperature != 1.0:
-                logits = logits / ctx.temperature
-            grad = grad_out[start:stop].float()
-            grad_logits = torch.softmax(logits, dim=-1).mul_(-grad[:, None])
-            grad_logits.scatter_add_(1, labels[start:stop, None], grad[:, None])
-            if ctx.temperature != 1.0:
-                grad_logits = grad_logits / ctx.temperature
-            grad_logits = grad_logits.to(compute_dtype)
-            grad_hidden[start:stop] = (grad_logits @ matmul_weight).to(hidden.dtype)
-            grad_weight.add_((grad_logits.t() @ hidden_chunk).float())
-        return grad_hidden, grad_weight.to(weight.dtype), None, None, None, None, None
+        inv_temperature = 1.0 / ctx.temperature
+        token_chunks = [(t, min(t + ctx.token_chunk_size, tokens)) for t in range(0, tokens, ctx.token_chunk_size)]
+        vocab_chunks = [(v, min(v + _LM_HEAD_VOCAB_CHUNK, vocab)) for v in range(0, vocab, _LM_HEAD_VOCAB_CHUNK)]
+        grad = grad_out.float()
+
+        def chunk_logits(t0, t1, w):
+            return (hidden[t0:t1].to(compute_dtype) @ w.t()).float().mul_(inv_temperature)
+
+        # Pass 1: each token's logsumexp, one vocabulary slice at a time.
+        lse = torch.empty(tokens, dtype=torch.float32, device=hidden.device)
+        for t0, t1 in token_chunks:
+            running_max = torch.full((t1 - t0,), float("-inf"), dtype=torch.float32, device=hidden.device)
+            running_sum = torch.zeros(t1 - t0, dtype=torch.float32, device=hidden.device)
+            for v0, v1 in vocab_chunks:
+                logits = chunk_logits(t0, t1, weight[v0:v1].to(compute_dtype))
+                new_max = torch.maximum(running_max, logits.max(dim=-1).values)
+                running_sum = running_sum * torch.exp(running_max - new_max) + torch.exp(
+                    logits - new_max[:, None]
+                ).sum(dim=-1)
+                running_max = new_max
+            lse[t0:t1] = running_max + torch.log(running_sum)
+
+        # Pass 2: d(logprob)/d(logit) = onehot(label) - softmax, per vocabulary slice.
+        grad_hidden = torch.zeros(hidden.shape, dtype=torch.float32, device=hidden.device)
+        grad_weight = torch.empty_like(weight)
+        for v0, v1 in vocab_chunks:
+            w = weight[v0:v1].to(compute_dtype)
+            grad_w = torch.zeros(w.shape, dtype=torch.float32, device=weight.device)
+            for t0, t1 in token_chunks:
+                grad_logits = torch.exp(chunk_logits(t0, t1, w) - lse[t0:t1, None]).mul_(-grad[t0:t1, None])
+                local = labels[t0:t1] - v0
+                rows = torch.nonzero((local >= 0) & (local < v1 - v0), as_tuple=True)[0]
+                grad_logits[rows, local[rows]] += grad[t0:t1][rows]
+                grad_logits = grad_logits.mul_(inv_temperature).to(compute_dtype)
+                grad_hidden[t0:t1] += (grad_logits @ w).float()
+                grad_w += (grad_logits.t() @ hidden[t0:t1].to(compute_dtype)).float()
+            grad_weight[v0:v1] = grad_w.to(weight.dtype)
+        return grad_hidden.to(hidden.dtype), grad_weight, None, None, None, None, None
 
 
 def lm_head_logprobs(
