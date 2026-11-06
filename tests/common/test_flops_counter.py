@@ -197,8 +197,9 @@ def test_deepseek_v4_matches_the_reported_per_token_cost():
     short = FlopsCounter(config, 0, enable_gradient_checkpointing=True).estimate_tflos([1024])
     long = FlopsCounter(config, 0, enable_gradient_checkpointing=True).estimate_tflos([1024, 2048])
     assert long > short
+    # Without recompute: 6 per activated parameter and 7 of flash's 9 attention matmuls.
     no_recompute = tflops_per_token(config, 65536, enable_gradient_checkpointing=False)
-    assert abs(no_recompute - 0.14061 * 6 / 8) < 5e-5
+    assert abs(no_recompute - 0.10642) < 5e-5
 
 
 def _glm53_flash():
@@ -242,3 +243,110 @@ def test_glm53_flash_matches_the_reported_attention_terms():
     assert abs(tflops_per_token(config, 262144) - 0.24688) < 5e-5
     outer = _Config(model_type="glm5_next", text_config=config)
     assert tflops_per_token(outer, 65536) == tflops_per_token(config, 65536)
+
+
+def _qwen3_5_dense():
+    config = _qwen3_moe()
+    config.model_type = "qwen3_5_text"
+    config.intermediate_size = 48
+    return config
+
+
+def test_qwen3_5_dense_matches_the_hybrid_moe_count_with_one_expert():
+    dense = _qwen3_5_dense()
+    moe = _qwen3_moe()
+    moe.model_type = "qwen3_5_moe_text"
+    moe.num_experts_per_tok = 1
+    moe.num_experts = 0
+    for checkpoint in (False, True):
+        got = FlopsCounter(dense, 0, enable_gradient_checkpointing=checkpoint).estimate_tflos([32, 40])
+        expected = FlopsCounter(moe, 0, enable_gradient_checkpointing=checkpoint).estimate_tflos([32, 40])
+        assert got == expected
+    outer = _Config(model_type="qwen3_5", text_config=dense)
+    assert tflops_per_token(outer, 64) == tflops_per_token(dense, 64)
+
+
+def test_qwen3_5_full_attention_layers_come_from_layer_types():
+    interval = _qwen3_5_dense()
+    listed = _qwen3_5_dense()
+    del listed.full_attention_interval
+    listed.layer_types = ["linear_attention", "full_attention"] * 2
+    assert tflops_per_token(listed, 4096) == tflops_per_token(interval, 4096)
+    lora = _lora(targets=("q_proj", "out_proj"))
+    assert (
+        FlopsCounter(listed, 0, peft_config=lora).lora_params
+        == FlopsCounter(interval, 0, peft_config=lora).lora_params
+    )
+
+
+def _lora(r=8, targets=("q_proj", "o_proj", "down_proj")):
+    return {"peft_type": "Lora", "r": r, "target_modules": list(targets)}
+
+
+@pytest.mark.parametrize("make_config", [_llama, _qwen3_5_dense, _glm53_flash])
+def test_lora_drops_only_the_frozen_weight_gradients(make_config):
+    config = make_config()
+    # Attention has no weights, so the LoRA saving per token does not depend on the sequence length.
+    saved = [
+        tflops_per_token(config, seq_len, 1000) - tflops_per_token(config, seq_len, 1000, peft_config=_lora())
+        for seq_len in (64, 4096)
+    ]
+    assert saved[0] > 0
+    assert saved[0] == pytest.approx(saved[1], rel=1e-9)
+
+
+@pytest.mark.parametrize("make_config", [_llama, _qwen3_5_dense, _glm53_flash])
+def test_lora_adapters_count_as_trainable_weights(make_config):
+    config = make_config()
+    adapters = FlopsCounter(config, 0, peft_config=_lora(r=8)).lora_params
+    assert adapters > 0
+    # Doubling the rank adds the same adapters again: 8 per parameter-token checkpointed, 6 without, 2 forward.
+    for checkpoint, multiplier in ((True, 8), (False, 6)):
+        r8, r16 = (
+            FlopsCounter(config, 0, enable_gradient_checkpointing=checkpoint, peft_config=_lora(r=r)) for r in (8, 16)
+        )
+        extra = r16.estimate_tflos([64]) - r8.estimate_tflos([64])
+        assert extra == pytest.approx(multiplier * adapters * 64 / 1e12, rel=1e-9)
+        forward = r16.estimate_tflos([64], forward_only=True) - r8.estimate_tflos([64], forward_only=True)
+        assert forward == pytest.approx(2 * adapters * 64 / 1e12, rel=1e-9)
+
+
+def test_lora_adapters_follow_the_qwen3_8_27b_layout():
+    config = _Config(
+        model_type="qwen3_5_text",
+        hidden_size=5120,
+        num_hidden_layers=64,
+        num_attention_heads=24,
+        num_key_value_heads=4,
+        head_dim=256,
+        intermediate_size=17408,
+        full_attention_interval=4,
+        attn_output_gate=True,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_num_key_heads=16,
+        linear_num_value_heads=48,
+    )
+    targets = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+    # 16 gated full-attention layers and 64 MLPs, at rank 32.
+    attention = 16 * ((5120 + 12288) + 2 * (5120 + 1024) + (6144 + 5120))
+    mlp = 64 * 3 * (5120 + 17408)
+    assert FlopsCounter(config, 0, peft_config=_lora(r=32, targets=targets)).lora_params == 32 * (attention + mlp)
+
+
+def test_lora_rejects_targets_it_cannot_count():
+    with pytest.raises(ValueError, match="match no"):
+        FlopsCounter(_llama(), 0, peft_config=_lora(targets=("q_proj", "experts")))
+    with pytest.raises(ValueError, match="no LoRA module layout"):
+        FlopsCounter(_deepseek_v4_flash(), 0, peft_config=_lora())
+
+
+@pytest.mark.parametrize("make_config", [_llama, _qwen3_5_dense, _glm53_flash])
+def test_partial_checkpointing_interpolates(make_config):
+    config = make_config()
+    off, half, on = (
+        tflops_per_token(config, 4096, 1000, enable_gradient_checkpointing=fraction) for fraction in (False, 0.5, True)
+    )
+    assert half == pytest.approx((off + on) / 2, rel=1e-12)
+    with pytest.raises(ValueError):
+        FlopsCounter(config, 1000, enable_gradient_checkpointing=1.5)
