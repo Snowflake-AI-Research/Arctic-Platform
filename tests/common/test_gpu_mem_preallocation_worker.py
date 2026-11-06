@@ -53,8 +53,11 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
     monkeypatch.setattr(mod.deepspeed, "init_distributed", lambda: None)
     monkeypatch.setattr(mod, "pr0", lambda *args: None)
     monkeypatch.setattr(mod, "sp_size_from_job_config", lambda config: 1)
-    monkeypatch.setattr(worker, "ds_training_config", lambda *args: {"optimizer": {"type": "SGD", "params": {}}})
+    monkeypatch.setattr(
+        worker, "ds_training_config", lambda *args: {"optimizer": {"type": "AdamW", "params": {"torch_adam": True}}}
+    )
     monkeypatch.setattr(worker, "ds_inference_config", lambda *args: {})
+    monkeypatch.setattr(deepspeed_engine, "build_training_optimizer", lambda *args, **kwargs: optimizer)
     monkeypatch.setattr(deepspeed_engine, "release_offloaded_grad_partitions", installed_hooks.append)
 
     def build(spec):
@@ -64,7 +67,8 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
     def initialize(**kwargs):
         assert worker._gpu_mem_preallocation is reserve
         assert kwargs["model"] is model
-        assert ("model_parameters" in kwargs) is (job_type == "train")
+        assert "model_parameters" not in kwargs
+        assert kwargs.get("optimizer") is (optimizer if job_type == "train" else None)
         return SimpleNamespace(local_rank=0, global_steps=0), optimizer, None, None
 
     monkeypatch.setattr(mod, "build_model", build)
