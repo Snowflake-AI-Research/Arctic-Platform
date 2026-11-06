@@ -1110,6 +1110,186 @@ def test_offloaded_real_two_rank_padded_file_partition_parity(tmp_path, stage):
     )
 
 
+def _two_rank_offloaded_resource_worker(rank, rendezvous, directory, stage, release, width, layers, windows):
+    import hashlib
+    import inspect
+    import threading
+
+    import deepspeed
+    import psutil
+    import torch.distributed as dist
+    from deepspeed.utils import safe_get_full_grad
+
+    torch.cuda.set_device(rank)
+    os.environ.update(
+        RANK=str(rank),
+        LOCAL_RANK=str(rank),
+        WORLD_SIZE="2",
+        ARCTIC_OFFLOADED_GRADIENT_RELEASE=release,
+        ARCTIC_OFFLOADED_GRADIENT_TMPDIR=directory,
+    )
+    deepspeed.init_distributed(
+        dist_backend="nccl",
+        auto_mpi_discovery=False,
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=120),
+    )
+    stopped = threading.Event()
+    peak_rss = [0]
+    process = psutil.Process()
+
+    def sample():
+        while not stopped.is_set():
+            peak_rss[0] = max(peak_rss[0], process.memory_info().rss)
+            stopped.wait(0.01)
+
+    sampler = threading.Thread(target=sample, daemon=True)
+    sampler.start()
+
+    def fingerprint(tensor):
+        digest = hashlib.sha256()
+        raw = tensor.detach().contiguous().view(-1).view(torch.uint8)
+        for start in range(0, raw.numel(), 16 * 1024 * 1024):
+            chunk = raw[start : start + 16 * 1024 * 1024].cpu()
+            digest.update(memoryview(chunk.numpy()))
+        return digest.hexdigest()
+
+    try:
+        set_seed(0)
+        model = torch.nn.Sequential(*(torch.nn.Linear(width, width, bias=False) for _ in range(layers)))
+        spec = TrainingEngineSpec(
+            dtype="bfloat16",
+            world_size=2,
+            fp32_masters=True,
+            gradient_clipping=1,
+            ds_overrides=dict(
+                zero_optimization=dict(stage=stage, offload_optimizer=dict(device="cpu")),
+                data_types=dict(grad_accum_dtype="fp32"),
+            ),
+        )
+        engine, _, _ = initialize_training_engine(
+            model,
+            build_deepspeed_config(spec),
+            optimizer=OptimizerSettings(name="AdamW", lr=1e-3),
+            ep_size=1,
+            mpu=None,
+            model_path="unused",
+            rank=rank,
+        )
+        local_bytes = sum(engine.optimizer.partition_size) * 4
+        assert local_bytes > deepspeed_engine._OFFLOADED_SNAPSHOT_CHUNK_BYTES
+        retained = inspect.getclosurevars(engine.optimizer.step).nonlocals["retained"] if release == "1" else {}
+        records = []
+        timings = []
+        boundary_bytes = []
+        torch.cuda.reset_peak_memory_stats()
+        for window in range(windows):
+            losses = []
+            elapsed = 0.0
+            for microstep in range(2):
+                inputs = torch.full((2, width), 0.02 * (rank + microstep + window + 1), device="cuda").bfloat16()
+                engine.set_gradient_accumulation_boundary(microstep == 1)
+                torch.cuda.synchronize()
+                started = time.monotonic()
+                loss = engine(inputs).float().square().mean()
+                engine.backward(loss)
+                torch.cuda.synchronize()
+                elapsed += time.monotonic() - started
+                losses.append(loss.item())
+                resident = sum(
+                    partition.flat_partition.numel() * 4
+                    for partition in engine.optimizer.averaged_gradients.values()
+                    if partition is not None
+                )
+                boundary_bytes.append(resident)
+                assert resident == (0 if release == "1" else local_bytes)
+            gradients = {
+                name: fingerprint(safe_get_full_grad(parameter))
+                for name, parameter in engine.module.named_parameters()
+            }
+            snapshot_bytes = sum(snapshot.size for snapshot in retained.values())
+            assert snapshot_bytes == (local_bytes if release == "1" else 0)
+            torch.cuda.synchronize()
+            started = time.monotonic()
+            engine.step()
+            torch.cuda.synchronize()
+            elapsed += time.monotonic() - started
+            timings.append(elapsed)
+            state = engine.optimizer.optimizer.state_dict()["state"]
+            records.append(
+                dict(
+                    losses=losses,
+                    grad_norm=float(engine.optimizer._global_grad_norm),
+                    gradients=gradients,
+                    parameters={name: fingerprint(parameter) for name, parameter in engine.module.named_parameters()},
+                    moments={
+                        str(key): {
+                            field: fingerprint(value) for field, value in values.items() if torch.is_tensor(value)
+                        }
+                        for key, values in state.items()
+                    },
+                )
+            )
+        report = dict(
+            rank=rank,
+            release=release,
+            stage=stage,
+            width=width,
+            layers=layers,
+            windows=windows,
+            parameters=width * width * layers,
+            local_fp32_partition_bytes=local_bytes,
+            measured_step_seconds_excluding_parity_probes=timings[1:],
+            warmup_step_seconds=timings[0],
+            peak_process_rss_bytes_including_parity_probes=peak_rss[0],
+            peak_gpu_allocated_bytes_including_parity_probes=torch.cuda.max_memory_allocated(),
+            retained_boundary_gpu_bytes=boundary_bytes,
+            sync_bytes=os.environ.get("ARCTIC_OFFLOADED_GRADIENT_SYNC_BYTES", "0"),
+            records=records,
+        )
+        (Path(directory) / f"resource-{release}-rank-{rank}.json").write_text(json.dumps(report, indent=2) + "\n")
+        print(
+            "OFFLOAD_RESOURCE_REPORT " + json.dumps({key: value for key, value in report.items() if key != "records"}),
+            flush=True,
+        )
+    finally:
+        stopped.set()
+        sampler.join()
+        dist.destroy_process_group()
+
+
+@require_torch_multi_gpu
+@require_deepspeed
+@pytest.mark.parametrize("stage", [1, 2])
+def test_offloaded_real_two_rank_isolated_resource_probe(tmp_path, stage):
+    width = int(os.environ.get("ARCTIC_OFFLOAD_TEST_WIDTH", "3073"))
+    layers = int(os.environ.get("ARCTIC_OFFLOAD_TEST_LAYERS", "1"))
+    windows = int(os.environ.get("ARCTIC_OFFLOAD_TEST_WINDOWS", "3"))
+    assert width >= 3073 and width % 2 == 1 and layers >= 1 and windows >= 2
+    # Fresh child processes isolate baseline/release RSS and allocator peaks; this is a synthetic dense workload.
+    for release in ("0", "1"):
+        mp.spawn(
+            _two_rank_offloaded_resource_worker,
+            args=(
+                (tmp_path / f"resource-rendezvous-{release}").as_uri(),
+                str(tmp_path),
+                stage,
+                release,
+                width,
+                layers,
+                windows,
+            ),
+            nprocs=2,
+            join=True,
+        )
+    for rank in range(2):
+        baseline = json.loads((tmp_path / f"resource-0-rank-{rank}.json").read_text())
+        candidate = json.loads((tmp_path / f"resource-1-rank-{rank}.json").read_text())
+        assert candidate["records"] == baseline["records"]
+
+
 def test_offloaded_missing_private_capability_preserves_native_optimizer(monkeypatch, caplog):
     from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 
@@ -1855,7 +2035,7 @@ def test_partition_reset_preserves_native_noncompact_accumulators(monkeypatch, c
 @require_deepspeed
 @pytest.mark.parametrize("boundary", [False, True])
 @pytest.mark.parametrize("file_snapshots", [False, True])
-@pytest.mark.parametrize("failure_phase", [None, "native", "wait"])
+@pytest.mark.parametrize("failure_phase", [None, "native", "wait", "reuse-write"])
 @pytest.mark.parametrize("release_mode", ["epilogue", "copy"])
 def test_partition_epilogue_waits_for_partial_copies_and_restores_snapshot(
     monkeypatch, boundary, file_snapshots, failure_phase, release_mode
@@ -1969,6 +2149,27 @@ def test_partition_epilogue_waits_for_partial_copies_and_restores_snapshot(
     rebuilt = optimizer._get_compact_grad_partition_buffer(0)
     assert rebuilt is not native_partition
     torch_assert_equal(rebuilt.flat_partition, torch.tensor([3.0, 4.0]))
+    if failure_phase == "reuse-write" and file_snapshots:
+        import errno
+
+        def fail(*args):
+            raise OSError(errno.ENOSPC, "injected repeated snapshot write failure")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(deepspeed_engine.os, "pwritev", fail)
+            with pytest.raises(OSError, match="repeated snapshot"):
+                reduce()
+        assert snapshot.file.closed
+        assert retained == {}
+        assert snapshot.storage.snapshots == {}
+        assert optimizer.averaged_gradients[0] is rebuilt
+        torch_assert_equal(rebuilt.flat_partition, torch.tensor([5.0, 6.0]))
+        reduce()
+        assert retained[0] is not snapshot
+        torch_assert_equal(optimizer._get_compact_grad_partition_buffer(0).flat_partition, torch.tensor([7.0, 8.0]))
+        optimizer.reset_cpu_buffers()
+        assert retained == {}
+        return
     optimizer.independent_gradient_partition_epilogue()
     assert retained[0] is snapshot
     torch_assert_equal(optimizer._get_compact_grad_partition_buffer(0).flat_partition, torch.tensor([5.0, 6.0]))

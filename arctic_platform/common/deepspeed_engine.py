@@ -468,7 +468,15 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
                 else source.to(device="cpu", non_blocking=False)
             )
         else:
-            snapshot.copy_(partition.flat_partition.detach())
+            try:
+                snapshot.copy_(partition.flat_partition.detach())
+            except BaseException:
+                # A partial overwrite is no longer a valid accumulated sum; keep the live GPU partition.
+                retained.pop(group_idx, None)
+                if isinstance(snapshot, _OffloadedGradientFile):
+                    snapshot.file.close()
+                    snapshot.storage.snapshots.pop(group_idx, None)
+                raise
         optimizer.averaged_gradients[group_idx] = None
 
     def copy_then_release(param, group_idx=None):
