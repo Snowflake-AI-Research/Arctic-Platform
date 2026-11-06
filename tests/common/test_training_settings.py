@@ -298,8 +298,11 @@ def test_legacy_cortex_dispatch_sends_typed_settings_and_the_token_budget(monkey
     unified = _to_unified_config(_skyrl_legacy())
 
     assert unified.training.mb_spec == MicroBatchSpec(max_tokens_per_mb=4096)
-    assert unified.training.ds_worker_config == {"attn_implementation": "sdpa"}
+    assert unified.training.ds_worker_config is None
+    assert unified.training.attn_implementation == "sdpa"
     training = unified._cortex_training_sub_job()["training_config"]
+    assert training["attn_implementation"] == "sdpa"
+    assert "activation_checkpointing" not in training
     assert training["optimizer"]["lr"] == 2e-6
     assert training["gradient_clipping"] == 0.5
     assert training["mb_spec"] == {"max_tokens_per_mb": 4096}

@@ -96,11 +96,9 @@ def _config(stack: contextlib.ExitStack, training_gpus: int) -> ArcticSFTClientC
                     "offload_param": {"device": "none"},
                 },
             },
-            ds_worker_config={
-                "attn_implementation": ATTN,
-                "enable_gradient_checkpointing": False,
-                "zorro_train_enable": False,
-            },
+            attn_implementation=ATTN,
+            activation_checkpointing=False,
+            ds_worker_config={"zorro_train_enable": False},
         ),
     )
 

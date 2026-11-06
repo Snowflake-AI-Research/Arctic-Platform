@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from pydantic import Field
 from pydantic import model_validator
 
+from arctic_platform.common.model_settings import worker_config_model_keys
 from arctic_platform.common.optimizer import OptimizerSettings
 from arctic_platform.common.training_settings import MicroBatchSpec
 from arctic_platform.common.training_settings import WorkerTrainingSettings
@@ -115,8 +116,23 @@ class ArcticRLClientConfig(BaseModel):
             )
         return self
 
+    def model_settings(self) -> dict[str, Any]:
+        """The model settings ``ds_worker_config`` carries, under their ``ModelSettings`` names."""
+        worker = self.ds_worker_config or {}
+        settings = {field: worker[key] for key, field in worker_config_model_keys(worker).items()}
+        if settings.get("model_provider") == "liger":
+            del settings["model_provider"]
+            settings["use_liger"] = True
+        return settings
+
+    def worker_runtime_config(self) -> Optional[dict]:
+        """``ds_worker_config`` without the model settings, which travel in ``training_config``."""
+        moved = worker_config_model_keys(self.ds_worker_config)
+        worker = {key: value for key, value in (self.ds_worker_config or {}).items() if key not in moved}
+        return worker or None
+
     def training_settings(self) -> WorkerTrainingSettings:
-        """The typed engine settings for ``ds_config`` plus the legacy ``training_config``.
+        """The typed engine settings for ``ds_config`` plus the legacy ``training_config``, and ``model_settings``.
 
         ``training_config`` wins over the same setting in ``ds_config``. Its ``lr_scheduler`` over
         ``training_horizon`` steps becomes a DeepSpeed ``scheduler``. Unset clipping stays off.
@@ -158,6 +174,7 @@ class ArcticRLClientConfig(BaseModel):
             fp32_masters=fp32_masters,
             mb_spec=MicroBatchSpec(num_micro_batches=int(num_micro_batches)) if num_micro_batches else None,
             ds_config=ds or None,
+            **self.model_settings(),
         )
 
     @property

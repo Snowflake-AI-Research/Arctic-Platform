@@ -33,7 +33,7 @@ def worker_module():
     "training, worker_config",
     [
         ({"debug": {"gpu_mem_preallocate_gib": 20, "gradient_norms_per_param": True}}, {}),
-        ({}, {"prime_rl": {"debug": {"gpu_mem_preallocate_gib": 20}}}),
+        ({"prime_rl": {"debug": {"gpu_mem_preallocate_gib": 20}}}, {}),
     ],
 )
 def test_training_margin_reaches_model_and_survives_engine_initialization(monkeypatch, training, worker_config):
@@ -68,8 +68,8 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
         {
             "model_name": "x",
             "job_type": "train",
-            "training_config": training,
-            "ds_worker_config": {"attn_implementation": "sdpa", **worker_config},
+            "training_config": {"attn_implementation": "sdpa", **training},
+            "ds_worker_config": worker_config,
         },
     )
     assert observed == [{"gpu_mem_preallocate_gib": 20}]

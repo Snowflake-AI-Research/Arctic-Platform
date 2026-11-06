@@ -110,9 +110,6 @@ def build_client(
     zero_stage = int(os.environ.get("ARCTIC_ZERO_STAGE", "1"))
     ds_config = {"zero_optimization": {"stage": zero_stage, "reduce_scatter": True}}
     ds_worker_config = dict(
-        use_liger=False,
-        enable_gradient_checkpointing=False,
-        attn_implementation=attn,
         zorro_train_enable=False,
         response_len=response_len,
         max_token_len=MAX_TOKEN_LEN_PER_GPU,
@@ -137,6 +134,9 @@ def build_client(
             fp32_masters=True,
             ds_config=ds_config,
             ds_worker_config=ds_worker_config,
+            use_liger=False,
+            activation_checkpointing=False,
+            attn_implementation=attn,
             checkpoint_path=ckpt_dir,
         ),
         sampling=SamplingConfig(

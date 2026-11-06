@@ -263,10 +263,7 @@ def build_config(config: Config):
         fp32_masters=True,
         mb_spec=MicroBatchSpec(max_tokens_per_mb=config.max_tokens_per_mb),
         ds_config={"zero_optimization": {"stage": config.zero_stage, "reduce_scatter": True}},
-        ds_worker_config={
-            "attn_implementation": config.attn_implementation,
-            "model_provider": "huggingface",
-        },
+        model_settings={"attn_implementation": config.attn_implementation, "model_provider": "huggingface"},
         job_id=config.job_id,
     )
 

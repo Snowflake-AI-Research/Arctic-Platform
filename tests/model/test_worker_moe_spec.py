@@ -23,7 +23,6 @@ from copy import deepcopy
 import pytest
 
 from arctic_platform.common.utils import sp_size_from_job_config
-from arctic_platform.model import ds_worker_dense_model_spec
 from arctic_platform.model import ds_worker_moe_model_spec
 
 
@@ -121,30 +120,6 @@ def test_worker_moe_spec_explicit_checkpointing_without_overrides(tmp_path, work
     assert spec.loader_options["ac_config"]["mode"] == "full"
     assert spec.loader_options["ac_config"]["freq"] == 1
     assert spec.loader_options["ac_config"]["offload_config"]["enabled"] is False
-
-
-def test_worker_moe_spec_dense_bridge_keeps_generic_patches():
-    spec = ds_worker_dense_model_spec("unused", {"attn_implementation": "sdpa"}, dtype="bfloat16", sequence_parallel=1)
-    assert spec.parallelism.expert_parallel == spec.parallelism.sequence_parallel == 1
-    assert spec.patches.gradient_checkpointing is True
-    assert spec.loader == "huggingface"
-
-
-@pytest.mark.parametrize(
-    "sp",
-    [
-        {"sp_size": 2},
-        {"sequence_parallel": 2},
-        {"sequence_parallel_size": 2},
-        {"parallelism": {"sequence_parallel": 2}},
-    ],
-)
-def test_worker_moe_spec_dense_bridge_does_not_enable_loader_sp(sp):
-    spec = ds_worker_dense_model_spec(
-        "unused", {"attn_implementation": "sdpa", "ep_size": 1, **sp}, dtype="bfloat16", sequence_parallel=1
-    )
-    assert spec.parallelism.expert_parallel == spec.parallelism.sequence_parallel == 1
-    assert spec.loader == "huggingface"
 
 
 @pytest.mark.parametrize("key", ["sequence_parallel", "sequence_parallel_size", "parallelism"])

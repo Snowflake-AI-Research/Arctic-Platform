@@ -680,17 +680,21 @@ class TestUnifiedConfigDoesNotReadEnv:
 
 
 class TestCortexModelOptions:
-    def test_liger_merges_with_forwarded_options_without_mutating_input(self):
+    def test_typed_model_settings_are_sent_rewritten_without_mutating_input(self):
         cfg = ArcticClientConfig(
             model_name="model",
             training_gpus=1,
-            training={"ds_worker_config": {"use_liger": True, "model_options": {"moe": {"comm_token_chunk": 1024}}}},
+            training={"use_liger": True, "model_options": {"lm_head": {"fp32": True}}},
         )
         before = cfg.model_dump()
         training = cfg._cortex_training_sub_job()["training_config"]
-        assert training["model_options"] == {"moe": {"comm_token_chunk": 1024}, "liger": True}
-        training["model_options"]["moe"]["comm_token_chunk"] = 2048
+        assert training["use_liger"] is True
+        assert training["model_options"] == {"lm_head": {"fp32": True}}
+        assert training["fp32_lm_head"] is True
+        assert "attn_implementation" not in training
+        training["model_options"]["lm_head"]["fp32"] = False
         assert cfg.model_dump() == before
+        assert ArcticClientConfig.model_validate_json(cfg.model_dump_json()) == cfg
 
     def test_training_options_use_the_supported_server_channel(self):
         from arctic_platform.client import CortexConfig
@@ -705,7 +709,7 @@ class TestCortexModelOptions:
             training_gpus=8,
             sampling_gpus=8,
             backend=CortexConfig(base_url="http://mock"),
-            training={"ds_worker_config": {"ep_size": 8, "model_options": options}},
+            training={"ep_size": 8, "model_options": options},
         )
         before = cfg.model_dump()
         sub_jobs = cfg.to_cortex()
@@ -715,10 +719,30 @@ class TestCortexModelOptions:
         assert training["model_options"] == options
         assert training["max_seq_len"] == 262144
         assert training["ep_size"] == 8
-        assert "prime_rl" not in training
+        assert training["prime_rl"]["deepep_token_chunk_size"] == 1024
+        assert training["prime_rl_request_entries"] == []
         assert cfg.model_dump() == before
         training["model_options"]["moe"]["comm_token_chunk"] = 2048
         assert cfg.model_dump() == before
+
+    def test_unknown_model_options_fail_on_the_client(self):
+        with pytest.raises(ValueError, match="lm_head.bogus is not a known model option"):
+            ArcticClientConfig(
+                model_name="model", training_gpus=1, training={"model_options": {"lm_head": {"bogus": 1}}}
+            )
+
+    @pytest.mark.parametrize(
+        ("worker", "hint"),
+        [
+            ({"use_liger": True}, "training.use_liger instead of use_liger"),
+            ({"enable_gradient_checkpointing": False}, "training.activation_checkpointing instead of enable_gradient"),
+            ({"peft_config": {"peft_type": "Lora"}}, "training.peft instead of peft_config"),
+            ({"ep_size": 8}, "training.ep_size instead of ep_size"),
+        ],
+    )
+    def test_model_keys_in_ds_worker_config_name_the_typed_field(self, worker, hint):
+        with pytest.raises(ValueError, match=hint):
+            ArcticClientConfig(model_name="model", training_gpus=1, training={"ds_worker_config": worker})
 
     def test_absent_options_do_not_add_a_transport_block(self):
         cfg = ArcticClientConfig(model_name="model", training_gpus=1)

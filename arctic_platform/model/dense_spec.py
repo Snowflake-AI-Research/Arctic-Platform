@@ -14,14 +14,15 @@
 # limitations under the License.
 """Build the ModelSpec used to load a dense Hugging Face model.
 
-``dense_model_spec`` is the one translation from dense training options to a ``ModelSpec``. DSS calls it
-with its ``training_config``; the on-prem worker calls it through ``ds_worker_dense_model_spec``.
+``dense_model_spec`` is the one translation from dense training options to a ``ModelSpec``. Both servers call
+it through ``settings_dense_model_spec`` with the job's validated ``ModelSettings``.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from arctic_platform.common.model_settings import ModelSettings
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
@@ -110,42 +111,48 @@ def dense_model_spec(
     )
 
 
-def ds_worker_dense_model_spec(
-    model_name: str,
-    ds_worker_config: dict[str, Any],
+def settings_dense_model_spec(
+    settings: ModelSettings,
     *,
+    model_path: str,
     dtype: str,
     sequence_parallel: int,
+    zorro_train: dict | None = None,
     debug: dict | None = None,
 ) -> ModelSpec:
-    """``dense_model_spec`` for the on-prem worker's flat ``ds_worker_config``.
+    """``dense_model_spec`` for a job's typed ``ModelSettings``, which both servers validate the same way.
 
-    Only the flat config's own names are mapped here: gradient checkpointing is
-    ``enable_gradient_checkpointing`` and defaults on, Liger is either
-    ``model_provider="liger"`` or ``use_liger``, ``fp32_parity`` and
-    ``fp32_residual`` are loader options, and ``zorro_train_enable`` selects the
-    ZoRRo Train keys.
+    ``fp32_parity`` and ``fp32_residual`` are loader options; everything else is a patch or a spec field.
     """
-    cfg = ds_worker_config or {}
-    attn_implementation = cfg.get("attn_implementation")
-    if attn_implementation is None:
-        raise ValueError("ds_worker_config requires attn_implementation")
-    training_options = {key: value for key, value in cfg.items() if key not in _LOADER_OPTION_KEYS_IN_TRAINING}
-    training_options["activation_checkpointing"] = cfg.get("enable_gradient_checkpointing", True)
-    zorro_train = None
-    if cfg.get("zorro_train_enable", False):
-        # The ZoRRo Train attention patcher handles eager and flash attention only.
-        if attn_implementation == "sdpa":
-            raise ValueError("ZoRRo Train does not support attn_implementation='sdpa'; use eager or flash attention")
-        zorro_train = {key: cfg[key] for key in _ZORRO_TRAIN_KEYS if key in cfg}
-    return dense_model_spec(
-        model_path=model_name,
+    training_options = settings.model_dump(
+        exclude={*_LOADER_OPTION_KEYS_IN_TRAINING, "model_options", "prime_rl_request_entries"}
+    )
+    spec = dense_model_spec(
+        model_path=model_path,
         dtype=dtype,
-        attn_implementation=attn_implementation,
+        attn_implementation=settings.resolved_attn_implementation(),
         sequence_parallel=sequence_parallel,
-        liger=cfg.get("model_provider") == "liger" or bool(cfg.get("use_liger")),
+        liger=bool(settings.use_liger),
         training_options=training_options,
-        loader_options={key: cfg[key] for key in _LOADER_OPTION_KEYS_IN_TRAINING if key in cfg},
+        loader_options={
+            key: getattr(settings, key)
+            for key in _LOADER_OPTION_KEYS_IN_TRAINING
+            if getattr(settings, key) is not None
+        },
         zorro_train=zorro_train,
         debug=debug,
     )
+    if settings.text_config_overrides is not None:
+        spec.text_config_overrides = settings.text_config_overrides
+    return spec
+
+
+def ds_worker_zorro_train(ds_worker_config: dict[str, Any], attn_implementation: str | None) -> dict | None:
+    """The ZoRRo Train patch options ``zorro_train_enable`` selects from the on-prem ``ds_worker_config``."""
+    cfg = ds_worker_config or {}
+    if not cfg.get("zorro_train_enable", False):
+        return None
+    # The ZoRRo Train attention patcher handles eager and flash attention only.
+    if attn_implementation == "sdpa":
+        raise ValueError("ZoRRo Train does not support attn_implementation='sdpa'; use eager or flash attention")
+    return {key: cfg[key] for key in _ZORRO_TRAIN_KEYS if key in cfg}

@@ -72,8 +72,9 @@ def _to_unified_config(legacy: _LegacyConfig):
     from arctic_platform.client.config import SamplingConfig
     from arctic_platform.client.config import TrainingConfig
 
-    settings = legacy.training_settings()
-    worker = dict(legacy.ds_worker_config or {})
+    settings = legacy.training_settings().model_dump(exclude={"mb_spec"}, exclude_unset=True)
+    peft = settings.pop("peft_config", None)
+    worker = dict(legacy.worker_runtime_config() or {})
     mb_spec = worker.pop("mb_spec", None)
 
     fields: dict[str, Any] = {
@@ -84,8 +85,9 @@ def _to_unified_config(legacy: _LegacyConfig):
         "log_prob_gpus": legacy.log_prob_gpus,
         "backend": CortexConfig(job_ready_timeout=legacy.job_ready_timeout),
         "training": TrainingConfig(
-            **settings.model_dump(exclude={"mb_spec"}),
+            **settings,
             mb_spec=mb_spec,
+            peft=peft,
             ds_worker_config=worker or None,
             checkpoint_path=legacy.checkpoint_path,
             full_determinism=legacy.full_determinism,

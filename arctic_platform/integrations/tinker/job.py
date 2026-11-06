@@ -196,10 +196,8 @@ def client_config(cfg: TinkerJobConfig) -> Any:
             fp32_masters=True,
             mb_spec=MicroBatchSpec(max_tokens_per_mb=cfg.max_tokens_per_mb),
             ds_config={"zero_optimization": {"stage": cfg.zero_stage}},
-            ds_worker_config={
-                "attn_implementation": cfg.attn_implementation,
-                "model_provider": "huggingface",
-            },
+            attn_implementation=cfg.attn_implementation,
+            model_provider="huggingface",
             peft=_peft_config(cfg),
         ),
         sampling=SamplingConfig(vllm={"gpu_memory_utilization": cfg.gpu_memory_utilization}),

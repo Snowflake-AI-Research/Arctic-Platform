@@ -14,7 +14,8 @@
 # limitations under the License.
 """The training-engine settings a job sets, shared by the on-prem worker and Cortex.
 
-Imports nothing beyond Pydantic, so config validation can use it without loading model code.
+Imports nothing beyond Pydantic and the option registry, so config validation can use it without loading model
+code.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from pydantic import field_validator
 from pydantic import model_validator
 from typing_extensions import Self
 
+from arctic_platform.common.model_settings import ModelSettings
 from arctic_platform.common.optimizer import OptimizerSettings
 
 # The engine steps once per ``step`` call with one microbatch per accumulation boundary, so these
@@ -86,8 +88,8 @@ class MicroBatchSpec(BaseModel):
         return self
 
 
-class WorkerTrainingSettings(TrainingEngineSettings):
-    """``TrainingEngineSettings`` plus the worker's microbatching and debug options.
+class WorkerTrainingSettings(TrainingEngineSettings, ModelSettings):
+    """``TrainingEngineSettings`` and ``ModelSettings`` plus the worker's microbatching and debug options.
 
     ``ds_config`` may not set what a typed field or the engine owns.
     """

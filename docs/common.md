@@ -114,9 +114,9 @@ Forwarded in the `initialize` payload (`JobConfig`):
 |-----|---------|---------|
 | `model_name` | all | HF model id |
 | `job_type` | init | `training` / `sampling` / `log_prob` |
-| `training_config` | training | `optimizer`, `gradient_clipping`, `fp32_masters`, `zero_bucket_size`, `mb_spec`, and a `ds_config` DeepSpeed passthrough (ZeRO, scheduler, …) |
+| `training_config` | training / log_prob (DS) | Engine settings (`optimizer`, `gradient_clipping`, `fp32_masters`, `zero_bucket_size`, `mb_spec`, and a `ds_config` DeepSpeed passthrough), and model settings under the names Cortex reads (`attn_implementation`, `activation_checkpointing`, `use_liger`, `ep_size`, `peft_config`, `model_options`, …). A log-prob job reads only the model settings |
 | `log_prob_config` | log_prob (DS) | Forward-only DS settings |
-| `ds_worker_config` | training / log_prob (DS) | `attn_implementation`, `zorro_train_enable`, checkpointing, … |
+| `ds_worker_config` | training / log_prob (DS) | Worker runtime knobs: `zorro_train_enable` and its keys, `use_autocast`, `logits_optimization`, … Model settings here are rejected |
 | `vllm_config` | sampling / log_prob (vLLM) | vLLM engine config |
 | `arctic_inference_config` | sampling / log_prob (vLLM) | ZoRRo Inference, speculative decoding |
 | `checkpoint_path` | training | Checkpoint directory |

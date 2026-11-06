@@ -91,10 +91,12 @@ def build_client(
         },
     }
     logits_opt = _logits_opt_from_env()
-    ds_worker_config = dict(
+    model_settings = dict(
         use_liger=os.environ.get("USE_LIGER", "0") not in ("0", "false", "False"),
         # FA2 required: varlen packing uses block-diagonal cu_seqlens.
         attn_implementation=os.environ.get("ARCTIC_ATTN_IMPL", "flash_attention_2"),
+    )
+    ds_worker_config = dict(
         zorro_train_enable=zorro_train_enable,
         response_len=response_len,
         max_token_len=MAX_TOKEN_LEN_PER_GPU,
@@ -131,6 +133,7 @@ def build_client(
             mb_spec=MicroBatchSpec(num_micro_batches=grad_accum_steps),
             ds_config=ds_config,
             ds_worker_config=ds_worker_config,
+            **model_settings,
             checkpoint_path=ckpt_dir,
         ),
         sampling=SamplingConfig(vllm=vllm),
@@ -421,7 +424,7 @@ def main() -> None:
             f"zorro_load_balancer={args.zorro_load_balancer} ds_gas={args.grad_accum} trl_gas=1 "
             f"prefix_cache={prefix_cache} generate_group_batch={generate_group_batch} "
             f"liger={os.environ.get('USE_LIGER', '0')} logits_opt={os.environ.get('ARCTIC_LOGITS_OPT', 'none')} "
-            "gc=ds_worker_default(True unless enable_gradient_checkpointing set)",
+            "gc=activation_checkpointing default (True)",
             flush=True,
         )
         rollout_worker = ArcticRolloutWorker(

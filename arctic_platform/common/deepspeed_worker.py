@@ -34,6 +34,7 @@ from deepspeed.accelerator import get_accelerator
 from arctic_platform.common.deepspeed_engine import build_deepspeed_config
 from arctic_platform.common.deepspeed_engine import initialize_training_engine
 from arctic_platform.common.deepspeed_engine import training_engine_spec
+from arctic_platform.common.model_settings import ModelSettings
 from arctic_platform.common.ray_cluster import primary_ip
 from arctic_platform.common.training_settings import WorkerTrainingSettings
 from arctic_platform.common.utils import combine_metric_microbatches
@@ -49,9 +50,11 @@ from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.common.weight_checksum import tensor_l2_sq
 from arctic_platform.model import build_model
-from arctic_platform.model import ds_worker_dense_model_spec
 from arctic_platform.model import ds_worker_moe_model_spec
+from arctic_platform.model import ds_worker_zorro_train
+from arctic_platform.model import settings_dense_model_spec
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
+from arctic_platform.model.option_profile import check_model_options_profile
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +190,7 @@ class DeepSpeedWorker:
         training = None
         if self.job_type == "log_prob":
             ds_config = self.ds_inference_config(job_config.get("log_prob_config") or {}, ds_worker_config)
+            model_settings = ModelSettings.model_validate(job_config.get("training_config") or {})
         else:
             training = WorkerTrainingSettings.model_validate(job_config.get("training_config") or {})
             if training.optimizer is None:
@@ -201,28 +205,44 @@ class DeepSpeedWorker:
             ds_config = onprem_deepspeed_config(
                 training, dtype=dtype, world_size=self.world_size, seed=job_config.get("seed")
             )
+            model_settings = training
         self._has_optimizer = training is not None
 
         pr0(f"ds_worker[ds_config]: {self.job_type=} {ds_config=} {ds_worker_config=}")
 
         debug = gpu_memory_debug_config(
-            {"debug": training.debug} if training is not None and training.debug is not None else ds_worker_config
+            {
+                "debug": training.debug if training is not None else ds_worker_config.get("debug"),
+                "prime_rl": model_settings.prime_rl,
+            }
         )
-        ep_size = int(ds_worker_config.get("ep_size", 1))
+        attn_implementation = model_settings.resolved_attn_implementation()
+        if attn_implementation is None:
+            raise ValueError("on-prem training requires training_config.attn_implementation")
+        ep_size = model_settings.ep_size or 1
+        check_model_options_profile(model_settings.model_dump(), model_path=model_name, sp_size=self.sp_size)
         # The MoE loader owns expert- and sequence-parallel layout, so only dense loading is gated here.
         if ep_size > 1:
-            spec = ds_worker_moe_model_spec(model_name, {**ds_worker_config, "debug": debug})
+            model_options = model_settings.model_dump(
+                include=set(ModelSettings.model_fields) - {"prime_rl_request_entries"}, exclude_unset=True
+            )
+            spec = ds_worker_moe_model_spec(
+                model_name,
+                {**ds_worker_config, **model_options, "attn_implementation": attn_implementation, "debug": debug},
+            )
         else:
             if self.sp_size != 1:
                 raise ValueError("on-prem sequence-parallel data dispatch is not wired; sp_size must be 1")
-            model_provider = ds_worker_config.get("model_provider", "huggingface")
-            if model_provider not in {"huggingface", "liger"}:
-                raise ValueError(f"on-prem dense training does not support model_provider={model_provider!r}")
-            spec = ds_worker_dense_model_spec(
-                model_name,
-                ds_worker_config,
+            if model_settings.model_provider != "huggingface":
+                raise ValueError(
+                    f"on-prem dense training does not support model_provider={model_settings.model_provider!r}"
+                )
+            spec = settings_dense_model_spec(
+                model_settings,
+                model_path=model_name,
                 dtype=dtype,
                 sequence_parallel=self.sp_size,
+                zorro_train=ds_worker_zorro_train(ds_worker_config, attn_implementation),
                 debug=debug,
             )
         loaded = build_model(spec)

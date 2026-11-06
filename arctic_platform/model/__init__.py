@@ -29,7 +29,8 @@ from arctic_platform.model.config import Patches
 from arctic_platform.model.config import TiledMlpPatch
 from arctic_platform.model.config import ZorroTrainPatch
 from arctic_platform.model.dense_spec import dense_model_spec
-from arctic_platform.model.dense_spec import ds_worker_dense_model_spec
+from arctic_platform.model.dense_spec import ds_worker_zorro_train
+from arctic_platform.model.dense_spec import settings_dense_model_spec
 from arctic_platform.model.factory import build_model
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import mark_keep_fp32
@@ -100,7 +101,7 @@ __all__ = [
     "conversion_cache_is_node_local",
     "conversion_cache_ready",
     "dense_model_spec",
-    "ds_worker_dense_model_spec",
+    "ds_worker_zorro_train",
     "ds_worker_moe_model_spec",
     "effective_fused_cross_entropy",
     "freeze_fp8_weights_and_scales",
@@ -134,6 +135,7 @@ __all__ = [
     "requires_hf_weight_sync",
     "save_hf_pretrained",
     "save_peft_adapters",
+    "settings_dense_model_spec",
     "supports_weight_format",
     "TiledMlpPatch",
     "ZorroTrainPatch",

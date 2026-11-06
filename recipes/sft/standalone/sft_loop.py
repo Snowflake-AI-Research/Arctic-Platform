@@ -86,12 +86,12 @@ def build_config(config: Config):
         if config.n_gpus % config.ep_size != 0:
             raise ValueError(f"n_gpus ({config.n_gpus}) must be a multiple of ep_size ({config.ep_size})")
 
-    worker: dict[str, Any] = {
+    model_settings: dict[str, Any] = {
         "attn_implementation": config.attn_implementation,
         "model_provider": config.model_provider,
     }
     if config.ep_size is not None:
-        worker["ep_size"] = config.ep_size
+        model_settings["ep_size"] = config.ep_size
 
     return client_config(
         backend=load_backend(config.config),
@@ -106,7 +106,7 @@ def build_config(config: Config):
         ),
         fp32_masters=True,
         ds_config={"zero_optimization": {"stage": config.zero_stage}},
-        ds_worker_config=worker,
+        model_settings=model_settings,
         job_id=config.job_id,
     )
 

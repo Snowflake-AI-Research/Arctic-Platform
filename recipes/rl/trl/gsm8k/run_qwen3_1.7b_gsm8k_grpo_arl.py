@@ -104,15 +104,17 @@ def build_client(
             "offload_param": {"device": "none"},
         },
     }
-    ds_worker_config = dict(
+    model_settings = dict(
         use_liger=False,
-        enable_gradient_checkpointing=False,
+        activation_checkpointing=False,
         # flash_attention_2 is REQUIRED for correctness here, not just speed: the server packs each forward
         # varlen-style (multiple sequences concatenated into one [1, T] row with per-sequence position_ids resets).
         # FA2 turns those resets into block-diagonal cu_seqlens so sequences stay separated; sdpa does NOT, so the
         # packed rows attend across sequence boundaries and corrupt per-token log probs (old AND new), which blows
         # up the importance ratio. (flash-attn is built against this env's torch in setup; keep it installed.)
         attn_implementation=os.environ.get("ARCTIC_ATTN_IMPL", "flash_attention_2"),
+    )
+    ds_worker_config = dict(
         zorro_train_enable=zorro_train_enable,
         response_len=response_len,
         max_token_len=MAX_TOKEN_LEN_PER_GPU,
@@ -150,6 +152,7 @@ def build_client(
             mb_spec=MicroBatchSpec(num_micro_batches=grad_accum_steps),
             ds_config=ds_config,
             ds_worker_config=ds_worker_config,
+            **model_settings,
             checkpoint_path=ckpt_dir,
         ),
         sampling=SamplingConfig(vllm=vllm),

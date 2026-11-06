@@ -282,7 +282,7 @@ def client_config(
     lora_rank: int,
     optimizer: OptimizerSettings,
     ds_config: dict[str, Any],
-    ds_worker_config: dict[str, Any],
+    model_settings: dict[str, Any],
     gradient_clipping: float = 1.0,
     fp32_masters: bool = False,
     mb_spec: MicroBatchSpec | None = None,
@@ -293,8 +293,8 @@ def client_config(
 ) -> ArcticClientConfig:
     """Assemble the one config both recipes hand to `running_client`.
 
-    ``to_cortex()`` lifts the Neutrino-typed model fields out of
-    ``ds_worker_config``; the sampling sub-job is created only when
+    ``model_settings`` are ``TrainingConfig`` model fields (attn_implementation,
+    model_provider, ep_size, ...); the sampling sub-job is created only when
     ``sampling_gpus > 0``.
     """
     roles = ("training", "sampling") if sampling_gpus > 0 else ("training",)
@@ -314,7 +314,7 @@ def client_config(
             fp32_masters=fp32_masters,
             mb_spec=mb_spec,
             ds_config=ds_config,
-            ds_worker_config=ds_worker_config,
+            **model_settings,
         ),
         sampling=SamplingConfig(vllm=vllm),
         **reconnect_ids(job_id, *roles),

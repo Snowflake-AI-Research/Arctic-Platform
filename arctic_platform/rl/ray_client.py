@@ -159,8 +159,11 @@ class ArcticRLRayClient:
 
         if use_deepspeed:
             if job_type == "training":
-                job_config["training_config"] = self.config.training_settings().model_dump()
+                job_config["training_config"] = self.config.training_settings().model_dump(exclude_unset=True)
             else:
+                job_config["training_config"] = {
+                    key: value for key, value in self.config.model_settings().items() if key != "peft_config"
+                }
                 # The worker builds a forward-only (no-optimizer) engine from log_prob_config,
                 # which inherits the training SP degree unless it sets its own.
                 log_prob_config = dict(self.config.log_prob_ds_config or {})
@@ -170,7 +173,7 @@ class ArcticRLRayClient:
                     )
                 job_config["log_prob_config"] = log_prob_config
             # this config is usually the same for any DeepspeedWorker job type - e.g. activating zorro - but it could be made job-type-specific as well, similar to do `ds_config`
-            job_config["ds_worker_config"] = self.config.ds_worker_config
+            job_config["ds_worker_config"] = self.config.worker_runtime_config()
             if job_type == "training":
                 job_config["checkpoint_path"] = self.config.checkpoint_path
                 job_config["cuda_ipc"] = self.config.cuda_ipc

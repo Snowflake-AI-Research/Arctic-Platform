@@ -432,15 +432,16 @@ class ArcticRLClientWrapper(RemoteBackend):
     def get_server_state(self):
         return self._client.get_server_state()
 
+    def _create_model_settings(self) -> dict:
+        model = self.config.actor_rollout_ref.model
+        return dict(
+            use_liger=bool(self.use_liger),
+            activation_checkpointing=model.enable_gradient_checkpointing,
+            attn_implementation=model.override_config.get("attn_implementation", "flash_attention_2"),
+        )
+
     def _create_ds_worker_config(self):
-        attn_implementation = self.config.actor_rollout_ref.model.override_config.get(
-            "attn_implementation", "flash_attention_2"
-        )
-        ds_worker_config = dict(
-            use_liger=self.use_liger,
-            enable_gradient_checkpointing=self.config.actor_rollout_ref.model.enable_gradient_checkpointing,
-            attn_implementation=attn_implementation,
-        )
+        ds_worker_config = {}
 
         if self.zorro_train_enable:
             # XXX: can't find where it's configured
@@ -482,7 +483,6 @@ class ArcticRLClientWrapper(RemoteBackend):
         n_sampling_gpus = self._backend_config.get("sampling_gpus", self.config.trainer.n_gpus_per_node)
         n_log_prob_gpus = self._backend_config.get("log_prob_gpus", self.config.trainer.n_gpus_per_node)
         colocate = self._backend_config.get("colocate", True)
-        attn_implementation = self.config.actor_rollout_ref.model.override_config.get("attn_implementation", "eager")
 
         actor_cfg = self.config.actor_rollout_ref.actor
         optim_cfg = actor_cfg.optim
@@ -579,10 +579,7 @@ class ArcticRLClientWrapper(RemoteBackend):
 
         log_prob_ds_config = None if n_log_prob_gpus == 0 else self._create_ds_config(n_log_prob_gpus)
 
-        # attn_implementation also lives on ds_worker_config; keep it there for
-        # the DeepSpeed worker (matches recipe/rl-correctness).
         ds_worker_config = self._create_ds_worker_config()
-        ds_worker_config.setdefault("attn_implementation", attn_implementation)
 
         rl_config = ArcticClientConfig(
             model_name=model_name,
@@ -599,7 +596,8 @@ class ArcticRLClientWrapper(RemoteBackend):
                 gradient_clipping=gradient_clipping,
                 mb_spec=MicroBatchSpec(num_micro_batches=num_micro_batches),
                 ds_config=ds_config,
-                ds_worker_config=ds_worker_config,
+                ds_worker_config=ds_worker_config or None,
+                **self._create_model_settings(),
                 cuda_ipc=self.cuda_ipc_weight_sync,
                 low_memory=self.low_memory_weight_sync,
             ),

@@ -243,7 +243,8 @@ vLLM settings on `sampling`.
 | `training.optimizer` / `training.gradient_clipping` | AdamW / `1.0` | `OptimizerSettings`; clipping `0` turns it off |
 | `training.fp32_masters` | `false` | fp32 master weights and optimizer states for a bf16 job; bf16 itself follows `dtype` |
 | `training.ds_config` | `null` | DeepSpeed passthrough (ZeRO, scheduler, …); `zero_optimization` is merged into the built block. `bf16`, `fp16`, `optimizer`, clipping and batch-size keys are rejected |
-| `training.ds_worker_config` | `null` | e.g. `attn_implementation`, `enable_gradient_checkpointing` |
+| `training.attn_implementation` / `training.activation_checkpointing` | `null` / `true` | Model settings; on-prem requires `attn_implementation`. `use_liger`, `ep_size`, `model_options`, … are typed fields too |
+| `training.ds_worker_config` | `null` | On-prem worker runtime knobs (`zorro_train_enable`, …); model settings here are rejected |
 | `training.peft` | `null` | PEFT adapter config; `null` selects dense training, `{}` is invalid. On-prem supports training; Cortex also supports adapter sampling/sync |
 | `training.cuda_ipc` / `training.low_memory` | `false` / `false` | Colocated weight-sync strategy (only with `sampling_gpus > 0`), set on the training job at init; `sync_weights(cuda_ipc=…, low_memory=…)` overrides one call |
 | `sampling_gpus` / `sampling.vllm` | `0` / `{}` | Optional vLLM sampling job for `generate` / `sync_weights` |
@@ -264,7 +265,7 @@ from arctic_platform.client import TrainingConfig
 
 training = TrainingConfig(
     checkpoint_path="/data-fast/checkpoints/qwen-lora",
-    ds_worker_config={"attn_implementation": "flash_attention_3"},
+    attn_implementation="flash_attention_3",
     peft={
         "peft_type": "LORA",
         "task_type": "CAUSAL_LM",
