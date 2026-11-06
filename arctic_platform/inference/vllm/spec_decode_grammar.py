@@ -124,8 +124,12 @@ def mask_unvalidated_drafts_v2(grammar_output: Any, input_batch: Any) -> Any:
     if not rows:
         return input_batch
     input_ids = input_batch.input_ids.clone()
-    positions = input_batch.logits_indices[torch.tensor(rows, device=input_ids.device)]
-    input_ids[positions] = -1
+    # Stage indices in pinned memory so the grammar guard does not wait for CUDA.
+    row_indices = torch.tensor(
+        rows, dtype=torch.long, device="cpu", pin_memory=input_ids.is_cuda
+    ).to(input_ids.device, non_blocking=True)
+    positions = input_batch.logits_indices[row_indices]
+    input_ids.index_fill_(0, positions, -1)
     return replace(input_batch, input_ids=input_ids)
 
 
