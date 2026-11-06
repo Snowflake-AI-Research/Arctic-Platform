@@ -1,0 +1,13 @@
+{
+  "poll": true,
+  "prompts": [
+    "Explain mixture-of-experts routing in one concise paragraph.",
+    "Give one practical reason to use sparse expert models for large-scale inference."
+  ],
+  "sampling_params": {
+    "max_tokens": 96,
+    "temperature": 0.2,
+    "top_p": 0.9
+  },
+  "strict": false
+}
