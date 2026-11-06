@@ -139,7 +139,7 @@ def test_worker_initialize_passes_native_groups_and_mpu_without_changing_request
     spec = _spec()
     monkeypatch.setattr(mod.deepspeed, "init_distributed", lambda: events.append("distributed"))
     monkeypatch.setattr(mod, "pr0", lambda *args: None)
-    monkeypatch.setattr(mod.ModelSpec, "from_ds_worker_config", lambda *args: spec)
+    monkeypatch.setattr(mod, "ds_worker_moe_model_spec", lambda *args: spec)
     monkeypatch.setattr(worker, "ds_training_config", lambda job, config, worker_config: config)
 
     def setup(*args):
@@ -152,19 +152,19 @@ def test_worker_initialize_passes_native_groups_and_mpu_without_changing_request
         assert parallel_groups == {"ep_group": runtime.ep, "sp_group": runtime.sp}
         return SimpleNamespace(model=model)
 
-    def initialize(**kwargs):
+    def initialize(selected_model, config, **kwargs):
         events.append("engine")
-        assert kwargs["model"] is model
-        assert list(kwargs["model_parameters"]) == list(model.parameters())
+        assert selected_model is model
+        assert kwargs["optimizer"] is None
         assert kwargs["mpu"] is runtime.mpu
-        assert kwargs["config"]["sequence_parallel_size"] == 8
-        assert kwargs["config"]["bf16"] == {"enabled": True, "bf16_optimizer_states": True}
-        return SimpleNamespace(local_rank=0, global_steps=0), None, None, None
+        assert config["sequence_parallel_size"] == 8
+        assert config["bf16"] == {"enabled": True, "bf16_optimizer_states": True}
+        assert config["train_batch_size"] == 2
+        return SimpleNamespace(local_rank=0, global_steps=0), None, None
 
     monkeypatch.setattr(worker, "_setup_model_parallel_groups", setup)
     monkeypatch.setattr(mod, "build_model", build)
-    monkeypatch.setattr(mod, "preserve_fp8_params_through_ds_cast", lambda selected: events.append("preserve"))
-    monkeypatch.setattr(mod.deepspeed, "initialize", initialize)
+    monkeypatch.setattr(mod, "initialize_training_engine", initialize)
     monkeypatch.setattr(mod, "get_accelerator", lambda: SimpleNamespace(device_name=lambda rank: "cpu"))
     monkeypatch.setattr(mod.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(mod.torch.cuda, "get_device_properties", lambda device: SimpleNamespace(uuid="synthetic"))
@@ -177,7 +177,7 @@ def test_worker_initialize_passes_native_groups_and_mpu_without_changing_request
     original = deepcopy(request)
     assert worker.initialize("localhost", request)
     assert request == original
-    assert events == ["distributed", "groups", "model", "preserve", "engine"]
+    assert events == ["distributed", "groups", "model", "engine"]
 
 
 @pytest.mark.parametrize(

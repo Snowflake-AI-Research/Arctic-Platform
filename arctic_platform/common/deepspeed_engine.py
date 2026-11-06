@@ -16,12 +16,9 @@
 
 Builds the DeepSpeed config, constructs the optimizer, and calls
 ``deepspeed.initialize``. This is separate from model construction. The
-on-prem RL worker in ``arctic_platform.common.deepspeed_worker`` still builds
-its own config in ``ds_training_config`` and calls ``deepspeed.initialize``
-itself.
-
-TODO: combine this module with ``deepspeed_worker`` once both callers share
-one engine-construction path.
+on-prem RL worker in ``arctic_platform.common.deepspeed_worker`` translates
+its config through ``TrainingEngineSpec`` and uses the same initialization
+path.
 """
 
 from __future__ import annotations
@@ -34,6 +31,7 @@ from typing import Any
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
+from pydantic import Field
 
 from arctic_platform.common.optimizer import OptimizerSettings
 from arctic_platform.debug.deepspeed_zero_initialization import maybe_trace_zero_initialization
@@ -81,22 +79,64 @@ class TrainingEngineSpec(BaseModel):
     dtype: str = "bfloat16"
     world_size: int
     sequence_parallel: int = 1
-    gradient_clipping: float = 1.0
+    train_micro_batch_size_per_gpu: int = Field(1, ge=1)
+    gradient_accumulation_steps: int = Field(1, ge=1)
+    train_batch_size: int | None = Field(None, ge=1)
+    zero_stage: int | None = Field(2, ge=0, le=3)
+    gradient_clipping: float | None = 1.0
     seed: int | None = None
     ds_overrides: dict[str, Any] | None = None
     fp32_masters: bool = False
     zero_bucket_size: int | None = None
     optimizer: OptimizerSettings | None = None
+    adam_w_mode: bool = True
+
+    @classmethod
+    def from_deepspeed_config(
+        cls,
+        config: dict[str, Any],
+        *,
+        dtype: str,
+        world_size: int,
+        sequence_parallel: int = 1,
+        seed: int | None = None,
+    ) -> "TrainingEngineSpec":
+        """Represent an existing DeepSpeed config without dropping native blocks.
+
+        Supported AdamW optimizer dictionaries become ``OptimizerSettings``;
+        scheduler dictionaries remain in ``ds_overrides`` so DeepSpeed binds
+        them to the explicit optimizer.
+        """
+        source = dict(config)
+        zero = source.get("zero_optimization")
+        zero_stage = int(zero.get("stage", 0)) if isinstance(zero, dict) else None
+        optimizer_config = source.pop("optimizer", None)
+        optimizer = _optimizer_settings_from_deepspeed(optimizer_config)
+        return cls(
+            dtype=dtype,
+            world_size=world_size,
+            sequence_parallel=sequence_parallel,
+            train_micro_batch_size_per_gpu=int(source.get("train_micro_batch_size_per_gpu", 1)),
+            gradient_accumulation_steps=int(source.get("gradient_accumulation_steps", 1)),
+            train_batch_size=source.get("train_batch_size"),
+            zero_stage=zero_stage,
+            gradient_clipping=(
+                float(source["gradient_clipping"]) if source.get("gradient_clipping") is not None else None
+            ),
+            seed=seed,
+            ds_overrides=source,
+            optimizer=optimizer,
+            adam_w_mode=_adam_w_mode_from_deepspeed(optimizer_config),
+        )
 
 
 def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
     """Build the config dict consumed by ``deepspeed.initialize``.
 
-    The caller steps after each microbatch, so the microbatch size and the
-    accumulation count are both 1. Sequence parallelism reduces the
-    data-parallel degree, and therefore ``train_batch_size``, to
-    ``world_size // sequence_parallel``. Gradients accumulate in FP32 unless the
-    merged config says otherwise; see ``apply_default_grad_accum_dtype``.
+    Sequence parallelism reduces the data-parallel degree used to derive
+    ``train_batch_size`` when the caller does not provide it explicitly.
+    Gradients accumulate in FP32 unless the merged config says otherwise;
+    see ``apply_default_grad_accum_dtype``.
     """
     dtype = (spec.dtype or "bfloat16").lower()
     is_bf16 = dtype in ("bfloat16", "bf16")
@@ -104,21 +144,28 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
     # bf16 master weights match FusedAdam's training dynamics. fp32 masters
     # are the opt-in that disables them.
     bf16_masters = is_bf16 and not spec.fp32_masters
+    train_batch_size = spec.train_batch_size or (
+        _data_parallel_size(spec.world_size, spec.sequence_parallel)
+        * spec.train_micro_batch_size_per_gpu
+        * spec.gradient_accumulation_steps
+    )
     ds_config: dict[str, Any] = {
-        "train_micro_batch_size_per_gpu": 1,
-        "train_batch_size": _data_parallel_size(spec.world_size, spec.sequence_parallel),
-        "gradient_accumulation_steps": 1,
-        "gradient_clipping": spec.gradient_clipping,
+        "train_micro_batch_size_per_gpu": spec.train_micro_batch_size_per_gpu,
+        "train_batch_size": train_batch_size,
+        "gradient_accumulation_steps": spec.gradient_accumulation_steps,
         "bf16": {
             "enabled": is_bf16,
             "bf16_master_weights_and_grads": bf16_masters,
             "bf16_optimizer_states": bf16_masters,
         },
         "fp16": {"enabled": is_fp16},
-        "zero_optimization": {"stage": 2},
         # NCCL bf16 all-reduce is not accumulated in fp32 internally.
         "communication_data_type": "fp32" if is_bf16 else None,
     }
+    if spec.gradient_clipping is not None:
+        ds_config["gradient_clipping"] = spec.gradient_clipping
+    if spec.zero_stage is not None:
+        ds_config["zero_optimization"] = {"stage": spec.zero_stage}
     if spec.seed is not None:
         ds_config["seed"] = int(spec.seed)
     if spec.sequence_parallel > 1:
@@ -126,7 +173,7 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         # without it DeepSpeed checks ``train_batch_size`` against the full world size and asserts.
         ds_config["sequence_parallel_size"] = spec.sequence_parallel
     if spec.zero_bucket_size is not None:
-        zero_config = ds_config["zero_optimization"]
+        zero_config = ds_config.setdefault("zero_optimization", {"stage": spec.zero_stage or 0})
         zero_config["reduce_bucket_size"] = spec.zero_bucket_size
         zero_config["allgather_bucket_size"] = spec.zero_bucket_size
     if spec.ds_overrides:
@@ -408,6 +455,7 @@ def initialize_training_engine(
     mpu,
     model_path: str,
     rank: int,
+    adam_w_mode: bool = True,
 ):
     """Build the optimizer, keep FP8 storage, and call ``deepspeed.initialize``.
 
@@ -426,8 +474,8 @@ def initialize_training_engine(
         fused = optimizer.fused
         if fused is None:
             fused = _optimizer_cpu_offload_enabled(ds_config) or not is_glm_moe_model(model_path)
-        built = build_training_optimizer(model, optimizer, ds_config, fused=fused)
-        choice = optimizer_choice(optimizer, ds_config, fused=fused)
+        built = build_training_optimizer(model, optimizer, ds_config, fused=fused, adam_w_mode=adam_w_mode)
+        choice = optimizer_choice(optimizer, ds_config, fused=fused, adam_w_mode=adam_w_mode)
         if ep_size > 1:
             built.param_groups[:] = split_expert_param_groups(list(built.param_groups))
     if preserved or marked_fp32:
@@ -448,8 +496,9 @@ def initialize_training_engine(
         if built is not None:
             engine, built, _, _ = deepspeed.initialize(model=model, optimizer=built, config=init_config, **init_kwargs)
         else:
-            engine, *_ = deepspeed.initialize(model=model, config=init_config, **init_kwargs)
-            built = None
+            if init_config.get("optimizer") is not None:
+                init_kwargs["model_parameters"] = model.parameters()
+            engine, built, _, _ = deepspeed.initialize(model=model, config=init_config, **init_kwargs)
     if built is not None:
         release_offloaded_grad_partitions(built)
     return engine, built, choice
@@ -477,7 +526,7 @@ def resolve_optimizer_name(name: str, ds_config: dict, *, fused: bool = True) ->
     return optimizer_name
 
 
-def optimizer_implementation(optimizer_name: str, *, fused: bool) -> str:
+def optimizer_implementation(optimizer_name: str, *, fused: bool, adam_w_mode: bool = True) -> str:
     """The class ``build_training_optimizer`` constructs for a resolved name."""
     if optimizer_name == "fused_adam" and fused:
         return "fused_adam"
@@ -486,14 +535,16 @@ def optimizer_implementation(optimizer_name: str, *, fused: bool) -> str:
     if optimizer_name == "torch_cpu_adamw":
         return "deepspeed_cpu_adam_nonfused"
     if optimizer_name in ("torch_adamw", "fused_adam"):
-        return "torch_adamw"
+        return "torch_adamw" if adam_w_mode else "torch_adam"
     raise AssertionError(f"Unhandled optimizer {optimizer_name!r}")
 
 
-def optimizer_choice(optimizer: OptimizerSettings, ds_config: dict, *, fused: bool) -> dict[str, str]:
+def optimizer_choice(
+    optimizer: OptimizerSettings, ds_config: dict, *, fused: bool, adam_w_mode: bool = True
+) -> dict[str, str]:
     """The implementation a job runs and the customer-facing reason."""
     optimizer_name = resolve_optimizer_name(optimizer.name, ds_config, fused=fused)
-    implementation = optimizer_implementation(optimizer_name, fused=fused)
+    implementation = optimizer_implementation(optimizer_name, fused=fused, adam_w_mode=adam_w_mode)
     if implementation == "deepspeed_cpu_adam_nonfused":
         reason = "optimizer state is offloaded to CPU, with standard non-fused AdamW arithmetic"
     elif implementation == "deepspeed_cpu_adam":
@@ -503,7 +554,13 @@ def optimizer_choice(optimizer: OptimizerSettings, ds_config: dict, *, fused: bo
             else f"you selected '{optimizer.name}'"
         )
     elif implementation == "fused_adam":
-        reason = "AdamW ran as the faster fused GPU implementation (FusedAdam)"
+        reason = (
+            "FusedAdam ran in Adam mode because you disabled AdamW mode"
+            if not adam_w_mode
+            else "AdamW ran as the faster fused GPU implementation (FusedAdam)"
+        )
+    elif implementation == "torch_adam":
+        reason = "you disabled AdamW mode, so standard Adam ran"
     elif optimizer_name == "torch_adamw":
         reason = f"you selected '{optimizer.name}'"
     elif optimizer.fused is False:
@@ -520,7 +577,9 @@ def cpu_adam_fp32_optimizer_states(ds_config: dict) -> bool:
     return True
 
 
-def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dict, *, fused: bool):
+def build_training_optimizer(
+    model, optimizer: OptimizerSettings, ds_config: dict, *, fused: bool, adam_w_mode: bool = True
+):
     """Build AdamW with decay disabled on bias and norm parameters.
 
     Generic AdamW uses fused implementations unless the model or caller disables
@@ -551,7 +610,7 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
     ]
     param_groups = [group for group in param_groups if group["params"]]
     betas = (optimizer.betas[0], optimizer.betas[1])
-    implementation = optimizer_implementation(optimizer_name, fused=fused)
+    implementation = optimizer_implementation(optimizer_name, fused=fused, adam_w_mode=adam_w_mode)
     if implementation == "fused_adam":
         from deepspeed.ops.adam import FusedAdam
 
@@ -560,7 +619,7 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
             lr=optimizer.lr,
             betas=betas,
             eps=optimizer.eps,
-            adam_w_mode=True,
+            adam_w_mode=adam_w_mode,
         )
     if implementation in ("deepspeed_cpu_adam", "deepspeed_cpu_adam_nonfused"):
         from deepspeed.ops.adam import DeepSpeedCPUAdam
@@ -570,7 +629,7 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
             lr=optimizer.lr,
             betas=betas,
             eps=optimizer.eps,
-            adamw_mode=True,
+            adamw_mode=adam_w_mode,
             fp32_optimizer_states=cpu_adam_fp32_optimizer_states(ds_config),
         )
         if implementation == "deepspeed_cpu_adam_nonfused":
@@ -580,12 +639,46 @@ def build_training_optimizer(model, optimizer: OptimizerSettings, ds_config: dic
         return built
     import torch
 
-    return torch.optim.AdamW(
+    optimizer_class = torch.optim.AdamW if adam_w_mode else torch.optim.Adam
+    return optimizer_class(
         param_groups,
         lr=optimizer.lr,
         betas=betas,
         eps=optimizer.eps,
     )
+
+
+def _optimizer_settings_from_deepspeed(config: Any) -> OptimizerSettings | None:
+    if config is None:
+        return None
+    if not isinstance(config, dict):
+        raise ValueError("DeepSpeed optimizer config must be a dictionary")
+    optimizer_type = str(config.get("type") or "AdamW")
+    if optimizer_type.lower() not in {"adam", "adamw"}:
+        raise ValueError(f"Unsupported DeepSpeed optimizer type {optimizer_type!r}; only Adam/AdamW are supported")
+    params = config.get("params") or {}
+    if not isinstance(params, dict):
+        raise ValueError("DeepSpeed optimizer params must be a dictionary")
+    if params.get("lr") is None:
+        raise ValueError("DeepSpeed optimizer params must set lr")
+    betas = params.get("betas", [params.get("beta1", 0.9), params.get("beta2", 0.999)])
+    torch_adam = bool(params.get("torch_adam", False))
+    return OptimizerSettings(
+        name="torch_adamw" if torch_adam else "AdamW",
+        lr=float(params["lr"]),
+        weight_decay=float(params.get("weight_decay", 0.0)),
+        betas=list(betas),
+        eps=float(params.get("eps", 1e-8)),
+        fused=False if torch_adam else None,
+    )
+
+
+def _adam_w_mode_from_deepspeed(config: Any) -> bool:
+    if not isinstance(config, dict):
+        return True
+    params = config.get("params") or {}
+    # DeepSpeed runs AdamW for type AdamW whatever adam_w_mode says.
+    return str(config.get("type") or "AdamW").lower() == "adamw" or bool(params.get("adam_w_mode", True))
 
 
 def _data_parallel_size(world_size: int, sequence_parallel: int) -> int:
