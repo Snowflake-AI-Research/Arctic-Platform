@@ -191,6 +191,48 @@ def test_worker_sp_alias_conflicts_fail_before_model(runtime, monkeypatch, worke
     assert runtime.calls == []
 
 
+def test_forward_only_moe_keeps_dtype_guard_and_groups_without_optimizer(runtime, monkeypatch):
+    mod, worker = runtime.mod, runtime.worker
+    model = torch.nn.Linear(1, 1)
+    events = []
+    monkeypatch.setattr(mod.deepspeed, "init_distributed", lambda: None)
+    monkeypatch.setattr(mod, "pr0", lambda *args: None)
+    monkeypatch.setattr(worker, "ds_inference_config", lambda *args: {})
+    monkeypatch.setattr(mod, "ds_worker_moe_model_spec", lambda *args: _spec(ep=8, sp=1))
+
+    def build(spec, *, parallel_groups):
+        assert parallel_groups == {"ep_group": runtime.ep, "sp_group": None}
+        return SimpleNamespace(model=model)
+
+    def preserve(selected):
+        assert selected is model
+        events.append("preserve")
+
+    def initialize(**kwargs):
+        assert kwargs["model"] is model
+        assert "optimizer" not in kwargs and "model_parameters" not in kwargs
+        assert "mpu" not in kwargs
+        events.append("engine")
+        return SimpleNamespace(local_rank=0, global_steps=0), None, None, None
+
+    monkeypatch.setattr(mod, "build_model", build)
+    monkeypatch.setattr(mod, "preserve_fp8_params_through_ds_cast", preserve)
+    monkeypatch.setattr(mod.deepspeed, "initialize", initialize)
+    monkeypatch.setattr(mod, "initialize_training_engine", lambda *args, **kwargs: pytest.fail("training engine"))
+    monkeypatch.setattr(mod, "get_accelerator", lambda: SimpleNamespace(device_name=lambda rank: "cpu"))
+    monkeypatch.setattr(mod.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(mod.torch.cuda, "get_device_properties", lambda device: SimpleNamespace(uuid="synthetic"))
+    request = {
+        "model_name": "synthetic",
+        "job_type": "log_prob",
+        "ds_worker_config": {"attn_implementation": "sparse_mla", "ep_size": 8, "sp_size": 1},
+    }
+    original = deepcopy(request)
+    assert worker.initialize("localhost", request)
+    assert request == original
+    assert events == ["preserve", "engine"]
+
+
 @pytest.fixture
 def routing_worker(runtime, monkeypatch):
     worker = runtime.worker
