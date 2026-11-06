@@ -157,6 +157,16 @@ Forwarded in the `initialize` payload (`JobConfig`):
 
 **Backend execution errors propagate rather than switching kernels.** Device eligibility is checked before layout and package eligibility; CUDA classification and compute capability are cached once per concrete device per process. Compute-capability major 9 means Hopper and major 10 means datacenter Blackwell. Backend execution is logged once per sparse layer. See [the dispatch implementation](../arctic_platform/model/implementations/glm53/context_parallel.py).
 
+## Weight Conversion Cache
+
+Converted checkpoints are published as complete directories. Node-local caches use a writer lock; shared caches use global rank 0 as the writer. Standalone preparation never starts a distributed collective.
+
+For standalone shared-cache conversion, set the same `DSS_WEIGHT_CONVERSION_ATTEMPT_ID` on every process and choose a new value for every retry. Native-format checkpoints and ready converted caches do not need this variable. Distributed loading establishes an identity collectively before checkpoint discovery.
+
+Heartbeats start only after a conversion is selected. Before selection, independent source discovery and model setup are bounded by `DSS_WEIGHT_CONVERSION_TIMEOUT` (default 3600 seconds), not a separate startup deadline. A launcher with a known startup budget may set `DSS_WEIGHT_CONVERSION_WRITER_START_TIMEOUT` explicitly. After observing progress, a waiter fails if the writer stops publishing heartbeats for 120 seconds.
+
+Shared-cache cleanup reclaims workspaces with durable failure records or a confirmed dead owner on the current host. A remote hard-killed writer with no failure record cannot be distinguished from a live writer stalled in filesystem I/O; its workspace is retained. Remove that workspace only after confirming the owning attempt has terminated. Node-local retries reclaim old workspaces while holding their exclusive writer lock.
+
 ## Metric aggregation
 
 Workers emit paired metrics `{name}.sum` / `{name}.tokens`:
