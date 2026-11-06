@@ -122,7 +122,7 @@ def test_hf_export_non_master_waits_after_every_gather(monkeypatch, events):
 
     assert list(deepspeed_integration.build_iter_full_hf_weights(_model((4, 2), (3, 2)))()) == []
 
-    # HF export gathers fp32 rows as bytes.
+    # HF export gathers bounded flat byte chunks into CPU storage.
     assert events == [("all_gather", (32,)), ("wait", (32,)), ("all_gather", (24,)), ("wait", (24,))]
 
 

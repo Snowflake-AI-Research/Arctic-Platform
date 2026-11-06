@@ -379,6 +379,102 @@ def test_load_batched_tracks_many_sources_to_one_destination():
     assert loaded_param_l2 == {"fused_weight": 42.0}
 
 
+@pytest.mark.parametrize("buffer_dtype", [torch.int64, torch.float32])
+def test_load_batched_buffer_bytes_do_not_enter_parameter_norms(buffer_dtype):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(2))
+            self.register_buffer("lookup", torch.zeros(2, dtype=buffer_dtype))
+
+        def load_weights(self, weights):
+            destinations = set()
+            for name, tensor in weights:
+                getattr(self, name).data.copy_(tensor)
+                destinations.add(name)
+            return destinations
+
+    model = Model()
+    source_weight = torch.tensor([3.0, 4.0])
+    source_buffer = torch.tensor([100, 200], dtype=buffer_dtype)
+    loaded, received, applied, mappings, skipped = WeightSyncExtension._load_batched(
+        SimpleNamespace(device=torch.device("cpu")),
+        model,
+        _FakeEngine([("weight", source_weight), ("lookup", source_buffer)]),
+    )
+    assert loaded == 2
+    assert received == 50025.0
+    assert applied == 25.0
+    assert mappings == {"weight": ["weight"], "lookup": ["lookup"]}
+    assert skipped == []
+    assert torch.equal(model.lookup, source_buffer)
+    full, subset, parameters, loaded_parameters = _model_parameter_l2(
+        model, torch.device("cpu"), _loaded_destination_names(mappings), collect=True
+    )
+    assert full == subset == applied
+    assert parameters == loaded_parameters == {"weight": 25.0}
+
+
+@pytest.mark.parametrize("orphan", [False, True])
+def test_load_direct_uses_multimodal_loader_and_rejects_orphans(monkeypatch, orphan):
+    import arctic_platform.inference.server.weight_sync.utils as utils
+
+    def reject_direct_writer(*args):
+        pytest.fail("multimodal weights require the model's authoritative loader")
+
+    monkeypatch.setattr(utils, "_DirectParamWriter", reject_direct_writer)
+
+    class Model(nn.Module):
+        hf_to_vllm_mapper = object()
+
+        def __init__(self):
+            super().__init__()
+            self.visual = nn.Linear(2, 1, bias=False)
+            self.fused_weight = nn.Parameter(torch.zeros(4))
+            self.calls = []
+
+        def load_weights(self, weights):
+            destinations = set()
+            for name, tensor in weights:
+                self.calls.append(name)
+                if name == "model.visual.weight":
+                    self.visual.weight.data.copy_(tensor)
+                    destinations.add("visual.weight")
+                elif name == "model.language_model.part_a":
+                    self.fused_weight.data[:2].copy_(tensor)
+                    destinations.add("fused_weight")
+                elif name == "model.language_model.part_b":
+                    self.fused_weight.data[2:].copy_(tensor)
+                    destinations.add("fused_weight")
+            return destinations
+
+    model = Model()
+    receiver = WeightSyncExtension()
+    receiver.device = torch.device("cpu")
+    weights = [
+        ("model.visual.weight", torch.tensor([[2.0, 3.0]])),
+        ("model.language_model.part_a", torch.tensor([1.0, 4.0])),
+        ("model.language_model.part_b", torch.tensor([5.0, 0.0])),
+    ]
+    if orphan:
+        weights.append(("unknown.weight", torch.ones(1)))
+        with pytest.raises(AssertionError, match="unknown.weight"):
+            receiver._load_direct(model, _FakeEngine(weights))
+    else:
+        loaded, received_l2, applied_l2, mappings, skipped = receiver._load_direct(model, _FakeEngine(weights))
+        assert loaded == 3
+        assert received_l2 == applied_l2 == 55.0
+        assert skipped == []
+        assert mappings == {
+            "model.visual.weight": ["visual.weight"],
+            "model.language_model.part_a": ["fused_weight"],
+            "model.language_model.part_b": ["fused_weight"],
+        }
+        assert torch.equal(model.visual.weight, torch.tensor([[2.0, 3.0]]))
+        assert torch.equal(model.fused_weight, torch.tensor([1.0, 4.0, 5.0, 0.0]))
+    assert model.calls == [name for name, _ in weights]
+
+
 def test_model_parameter_l2_excludes_receiver_only_composite_parameters():
     class CompositeModel(nn.Module):
         def __init__(self):
@@ -400,6 +496,45 @@ def test_model_parameter_l2_excludes_receiver_only_composite_parameters():
         "vision_tower": 58.0,
     }
     assert loaded_param_l2 == {"language_model": 42.0}
+
+
+@pytest.mark.parametrize("collect", [False, True])
+@pytest.mark.parametrize("parameter_loaded", [False, True])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_model_parameter_l2_accepts_registered_buffers_without_counting_them(collect, parameter_loaded, persistent):
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.tensor([3.0, 4.0]))
+    model.ple = nn.Module()
+    model.ple.register_buffer(
+        "layer_multipliers",
+        torch.tensor([100, 200], dtype=torch.int64),
+        persistent=persistent,
+    )
+    destinations = {"ple.layer_multipliers"}
+    if parameter_loaded:
+        destinations.add("weight")
+
+    full, loaded_subset, param_l2, loaded_param_l2 = _model_parameter_l2(
+        model, torch.device("cpu"), destinations, collect=collect
+    )
+
+    assert full == 25.0
+    assert loaded_subset == (25.0 if parameter_loaded else 0.0)
+    assert param_l2 == ({"weight": 25.0} if collect else None)
+    assert loaded_param_l2 == (({"weight": 25.0} if parameter_loaded else {}) if collect else None)
+
+
+def test_model_parameter_l2_still_rejects_unknown_names_with_registered_buffers():
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.tensor([3.0, 4.0]))
+    model.register_buffer("layer_multipliers", torch.tensor([100], dtype=torch.int64))
+
+    with pytest.raises(RuntimeError, match="unknown.weight"):
+        _model_parameter_l2(
+            model,
+            torch.device("cpu"),
+            {"weight", "layer_multipliers", "unknown.weight"},
+        )
 
 
 def _expected_tensor_l2_sq(tensor: torch.Tensor) -> torch.Tensor:
@@ -902,7 +1037,7 @@ def test_broadcast_reports_loaded_validation_applicability(
         model_runner=SimpleNamespace(model=model),
         model_config=SimpleNamespace(quantization=quantization),
         _get_or_create_broadcast_engine=lambda *args: object(),
-        _load_batched=lambda model, engine: (
+        _load_batched=lambda model, engine, *, verifier=None: (
             1,
             4.0,
             4.0,
@@ -952,7 +1087,7 @@ def test_broadcast_distinguishes_full_and_loaded_parameter_traces(monkeypatch):
         model_runner=SimpleNamespace(model=model),
         model_config=SimpleNamespace(quantization=None),
         _get_or_create_broadcast_engine=lambda *args: object(),
-        _load_batched=lambda model, engine: (
+        _load_batched=lambda model, engine, *, verifier=None: (
             2,
             13.0,
             4.0,
@@ -1066,7 +1201,7 @@ def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, tmp_path, ent
             update_in_place()
             return names
 
-    def load_batched(model, engine):
+    def load_batched(model, engine, *, verifier=None):
         update_in_place()
         return 4, 0.0, 0.0, {}, []
 

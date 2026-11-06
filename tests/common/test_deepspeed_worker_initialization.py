@@ -81,11 +81,12 @@ def test_expert_parallel_worker_builds_the_moe_spec_and_splits_expert_groups(mon
     monkeypatch.setattr(mod, "pr0", lambda *args: None)
     monkeypatch.setattr(worker, "ds_training_config", lambda *args: {"train_micro_batch_size_per_gpu": 1})
 
-    def build(spec):
+    def build(spec, *, parallel_groups):
         # Spec validation imports kernels that query the real device, so fake it only afterwards.
         monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
         monkeypatch.setattr(torch.cuda, "get_device_properties", lambda gpu: SimpleNamespace(uuid="test"))
         observed["spec"] = spec
+        assert parallel_groups == {"ep_group": "experts", "sp_group": None}
         return SimpleNamespace(model=model)
 
     def initialize(model, ds_config, **kwargs):
@@ -94,6 +95,12 @@ def test_expert_parallel_worker_builds_the_moe_spec_and_splits_expert_groups(mon
         return SimpleNamespace(local_rank=0, global_steps=0), None, None
 
     monkeypatch.setattr(mod, "build_model", build)
+
+    def setup(*args):
+        worker.mpu = "mpu"
+        return {"ep_group": "experts", "sp_group": None}
+
+    monkeypatch.setattr(worker, "_setup_model_parallel_groups", setup)
     monkeypatch.setattr(mod, "initialize_training_engine", initialize)
     monkeypatch.setattr(mod, "get_accelerator", lambda: SimpleNamespace(device_name=lambda rank: "cuda:0"))
 
@@ -114,5 +121,5 @@ def test_expert_parallel_worker_builds_the_moe_spec_and_splits_expert_groups(mon
     assert observed["spec"].loader == "glm5_next"
     assert observed["spec"].parallelism.expert_parallel == observed["spec"].parallelism.sequence_parallel == 8
     assert observed["engine"]["ep_size"] == 8
-    assert observed["engine"]["mpu"] is None
-    assert observed["ds_config"]["train_batch_size"] == 8
+    assert observed["engine"]["mpu"] == "mpu"
+    assert observed["ds_config"]["train_batch_size"] == 1
