@@ -52,6 +52,7 @@ from arctic_platform.model import ModelSpec
 from arctic_platform.model import build_model
 from arctic_platform.model import ds_worker_dense_model_spec
 from arctic_platform.model import ds_worker_moe_model_spec
+from arctic_platform.model import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
 from arctic_platform.model.implementations.gpu.sp.utils import run_sequence_parallel_grpo
 from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_microbatches
@@ -235,6 +236,8 @@ class DeepSpeedWorker:
             )
         else:
             # Forward-only/log-prob remains a separate no-optimizer contract.
+            if ep_size > 1:
+                preserve_fp8_params_through_ds_cast(model)
             init_kwargs = {"mpu": self.mpu} if self.mpu is not None else {}
             self.engine, _, _, _ = deepspeed.initialize(model=model, config=ds_config, **init_kwargs)
         self._device = get_accelerator().device_name(self.engine.local_rank)
