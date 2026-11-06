@@ -321,6 +321,52 @@ def test_cpu_file_load_reports_the_received_checksum(cpu_cuda):
     assert result["update_path"] == "cpu_to_gpu"
 
 
+class _RenamingModel(nn.Module):
+    """A loader that maps checkpoint names onto differently named modules, as vLLM's multimodal models do."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.language_model = nn.Linear(2, 1, bias=False)
+
+    def load_weights(self, weights):
+        loaded = set()
+        for name, tensor in weights:
+            if name == "model.language_model.weight":
+                self.language_model.weight.data.copy_(tensor)
+                loaded.add("language_model.weight")
+        return loaded
+
+
+def test_cpu_file_load_accepts_names_the_loader_renames(cpu_cuda):
+    model = _RenamingModel()
+    ext = _extension(model)
+    del ext._validate_weight_sync_names
+
+    result = ext._load_cpu_weights_into_model([("model.language_model.weight", torch.tensor([[1.0, 2.0]]))])
+
+    assert torch.equal(model.language_model.weight, torch.tensor([[1.0, 2.0]]))
+    assert result["skipped_source_count"] == 0
+
+
+def test_cpu_file_load_rejects_a_name_the_loader_places_nowhere(cpu_cuda, monkeypatch):
+    monkeypatch.delenv("ARCTIC_WEIGHT_SYNC_STRICT_NAMES", raising=False)
+    weights = [("model.language_model.weight", torch.ones(1, 2)), ("model.lm_head.weight", torch.ones(1, 2))]
+
+    with pytest.raises(RuntimeError, match=r"did not load: model\.lm_head\.weight"):
+        _extension(_RenamingModel())._load_cpu_weights_into_model(weights)
+
+
+def test_cpu_file_load_only_warns_on_skips_under_expert_parallel(cpu_cuda, caplog):
+    ext = _extension(_RenamingModel())
+    ext.model_runner.parallel_config = SimpleNamespace(enable_expert_parallel=True)
+
+    with caplog.at_level(logging.WARNING, logger="arctic_platform.inference.server.weight_sync.receiver"):
+        result = ext._load_cpu_weights_into_model([("model.layers.0.mlp.experts.1.w1.weight", torch.ones(1, 2))])
+
+    assert result["skipped_source_count"] == 1
+    assert "did not load" in caplog.text
+
+
 class _Engine:
     def __init__(self, weights):
         self._weights = weights
