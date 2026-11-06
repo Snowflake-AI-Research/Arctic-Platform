@@ -1183,6 +1183,155 @@ class TestGatherTrainingRefs(TestCasePlus):
 
         asyncio.run(_run())
 
+    def test_non_sp_destroy_waits_for_inflight_step_without_killing_workers(self):
+        async def run():
+            hold, started = asyncio.Event(), asyncio.Event()
+            log = []
+
+            async def step():
+                started.set()
+                await hold.wait()
+                log.append("step-finished")
+                return {"metrics": {}, "batch": {}}
+
+            async def destroy(job_id, job_type):
+                log.append("destroy")
+                return {"job_id": job_id}
+
+            server = _server([SimpleNamespace(step=_Remote(step))])
+            server.weight_sync_ready = True
+            server.arctic_rl_ray_server_state = SimpleNamespace(destroy=_Remote(destroy))
+            with patch("arctic_platform.common.ray_server.ray.kill") as kill:
+                inflight = asyncio.create_task(server.step(1))
+                await started.wait()
+                removal = asyncio.create_task(server.destroy(1, "training"))
+                await asyncio.sleep(0)
+                self.assertFalse(removal.done())
+                self.assertEqual(log, [])
+                hold.set()
+                await inflight
+                self.assertEqual(await removal, {"job_id": 1})
+                kill.assert_not_called()
+            self.assertEqual(log, ["step-finished", "destroy"])
+            self.assertEqual(server.training_workers, [])
+            self.assertNotIn(1, server.jobs)
+            self.assertFalse(server.weight_sync_ready)
+
+        asyncio.run(run())
+
+    def test_sampling_destroy_does_not_wait_for_unrelated_training(self):
+        async def run():
+            calls = []
+
+            async def destroy(job_id, job_type):
+                calls.append((job_id, job_type))
+                return {"job_id": job_id}
+
+            server = _server([])
+            server.jobs[2] = {"job_type": "sampling"}
+            server.arctic_rl_ray_server_state = SimpleNamespace(destroy=_Remote(destroy))
+            async with server._training_op_lock:
+                result = await asyncio.wait_for(server.destroy(2, "sampling"), timeout=0.2)
+            self.assertEqual(result, {"job_id": 2})
+            self.assertEqual(calls, [(2, "sampling")])
+            self.assertIn(1, server.jobs)
+            self.assertNotIn(2, server.jobs)
+
+        asyncio.run(run())
+
+    def test_queued_training_step_is_rejected_after_destroy(self):
+        async def run():
+            calls = []
+
+            async def step():
+                calls.append("step")
+                return {"metrics": {}, "batch": {}}
+
+            async def destroy(job_id, job_type):
+                return {"job_id": job_id}
+
+            server = _server([SimpleNamespace(step=_Remote(step))])
+            server.arctic_rl_ray_server_state = SimpleNamespace(destroy=_Remote(destroy))
+            await server._training_op_lock.acquire()
+            removal = asyncio.create_task(server.destroy(1, "training"))
+            await asyncio.sleep(0)
+            queued = asyncio.create_task(server.step(1))
+            await asyncio.sleep(0)
+            server._training_op_lock.release()
+            await removal
+            with self.assertRaisesRegex(ValueError, "Job 1 not found"):
+                await queued
+            self.assertEqual(calls, [])
+
+        asyncio.run(run())
+
+    def test_destroy_rejects_job_type_mismatch_without_dispatch_or_reset(self):
+        async def run():
+            async def destroy(*args):
+                self.fail("mismatched destroy reached the state actor")
+
+            server = _server([object()])
+            server.jobs[2] = {"job_type": "sampling"}
+            server.weight_sync_ready = True
+            server.arctic_rl_ray_server_state = SimpleNamespace(destroy=_Remote(destroy))
+            for job_id, job_type in ((1, "sampling"), (2, "training")):
+                with self.subTest(job_id=job_id), self.assertRaises(ValueError):
+                    await server.destroy(job_id, job_type)
+            self.assertEqual(len(server.training_workers), 1)
+            self.assertEqual(set(server.jobs), {1, 2})
+            self.assertTrue(server.weight_sync_ready)
+
+        asyncio.run(run())
+
+    def test_failed_training_destroy_preserves_local_workers_and_job(self):
+        async def run():
+            async def destroy(*args):
+                raise RuntimeError("state cleanup failed")
+
+            worker = object()
+            server = _server([worker])
+            server.weight_sync_ready = True
+            server.arctic_rl_ray_server_state = SimpleNamespace(destroy=_Remote(destroy))
+            with self.assertRaisesRegex(RuntimeError, "state cleanup failed"):
+                await server.destroy(1, "training")
+            self.assertEqual(server.training_workers, [worker])
+            self.assertIn(1, server.jobs)
+            self.assertTrue(server.weight_sync_ready)
+
+        asyncio.run(run())
+
+    def test_queued_worker_lifecycle_operations_revalidate_destroyed_job(self):
+        async def run(operation):
+            async def unexpected(*args):
+                self.fail(f"{operation} dispatched after destruction")
+
+            async def destroy(job_id, job_type):
+                return {"job_id": job_id}
+
+            worker = SimpleNamespace(
+                offload_to_cpu=_Remote(unexpected),
+                backload_to_gpu=_Remote(unexpected),
+                load_checkpoint=_Remote(unexpected),
+            )
+            server = _server([worker])
+            server.jobs[1]["checkpoint_path"] = "unused-checkpoint"
+            server.arctic_rl_ray_server_state = SimpleNamespace(
+                destroy=_Remote(destroy), _empty_training_cache=_Remote(unexpected)
+            )
+            await server._training_op_lock.acquire()
+            removal = asyncio.create_task(server.destroy(1, "training"))
+            await asyncio.sleep(0)
+            queued = asyncio.create_task(getattr(server, operation)(1))
+            await asyncio.sleep(0)
+            server._training_op_lock.release()
+            await removal
+            with self.assertRaisesRegex(ValueError, "Job 1 not found"):
+                await queued
+
+        for operation in ("sleep_training", "wake_training", "load_checkpoint", "empty_training_cache"):
+            with self.subTest(operation=operation):
+                asyncio.run(run(operation))
+
     def test_save_refuses_after_the_training_latch_without_advancing_latest(self):
         saved = []
 

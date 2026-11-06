@@ -915,7 +915,7 @@ class ArcticRLRayServer:
         """Await sampler refs. A sampler failure does not latch training workers."""
         return await self._await_training_refs(submit_refs, latch=False, check_failed=False)
 
-    async def _gather_training_refs(self, submit_refs, *, abort_on_failure: bool = False):
+    async def _gather_training_refs(self, submit_refs, *, abort_on_failure: bool = False, job_id: int | None = None):
         """Submit and await worker ObjectRefs without blocking the transport loop.
 
         ``submit_refs`` runs inside the lock so one op's ``.remote()`` calls stay
@@ -923,6 +923,8 @@ class ArcticRLRayServer:
         """
         self._raise_if_training_failed()
         async with self._training_op_lock:
+            if job_id is not None:
+                self._verify_job(job_id, "training")
             self._raise_if_training_failed()
             return await self._await_training_refs(submit_refs, abort_on_failure=abort_on_failure)
 
@@ -939,16 +941,21 @@ class ArcticRLRayServer:
         return {"status": "OK"}
 
     async def destroy(self, job_id: int, job_type: str) -> dict[str, Any]:
-        async with self._training_op_lock:
+        self._verify_job(job_id, job_type)
+        if job_type != "training":
             result = await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
-            if job_type == "training":
-                self.training_workers = []
-                self.jobs.pop(job_id, None)
-                self._training_failed = False
-                self._training_failure = None
-                self._training_workers_aborted = False
-                self._weight_norm_disabled = None
-                self.weight_sync_ready = False
+            self.jobs.pop(job_id, None)
+            return result
+        async with self._training_op_lock:
+            self._verify_job(job_id, "training")
+            result = await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
+            self.training_workers = []
+            self.jobs.pop(job_id, None)
+            self._training_failed = False
+            self._training_failure = None
+            self._training_workers_aborted = False
+            self._weight_norm_disabled = None
+            self.weight_sync_ready = False
             return result
 
     async def _split_model_batch(self, batch: dict, workers, *, sp_size: int, backward: bool):
@@ -1052,6 +1059,7 @@ class ArcticRLRayServer:
             results = await self._gather_training_refs(
                 lambda: [w.forward_backward.remote(s) for w, s in zip(workers, shards)],
                 abort_on_failure=sp_size > 1,
+                job_id=job_id,
             )
 
         timers.stop_and_print_elapsed(tname)
@@ -1116,7 +1124,7 @@ class ArcticRLRayServer:
             return [w.forward_no_grad.remote(s) for w, s in zip(workers, shards)]
 
         if job_type == "training":
-            results = await self._gather_training_refs(_submit_forward, abort_on_failure=sp_size > 1)
+            results = await self._gather_training_refs(_submit_forward, abort_on_failure=sp_size > 1, job_id=job_id)
         else:
             results = await asyncio.gather(*_submit_forward())
 
@@ -1144,7 +1152,9 @@ class ArcticRLRayServer:
     async def step(self, job_id: int, body: dict[str, Any] | None = None) -> dict[str, Any]:
         # `body` is unused; accepted so the client can call with (job_id, body).
         self._verify_job(job_id, "training")
-        results = await self._gather_training_refs(lambda: [w.step.remote() for w in self.training_workers])
+        results = await self._gather_training_refs(
+            lambda: [w.step.remote() for w in self.training_workers], job_id=job_id
+        )
         merged = dict(
             job_id=job_id,
             metrics=merge_dict_shards([r["metrics"] for r in results]),
@@ -1157,6 +1167,7 @@ class ArcticRLRayServer:
         self._verify_job(job_id, "training")
         workers = self.training_workers
         async with self._training_op_lock:
+            self._verify_job(job_id, "training")
             results = (
                 await self._await_training_refs(
                     lambda: [self.arctic_rl_ray_server_state._empty_training_cache.remote(workers)]
@@ -1180,6 +1191,7 @@ class ArcticRLRayServer:
         export_hf = bool(body.get("export_hf", False))
         limit = body.get("save_total_limit")
         async with self._training_op_lock:
+            self._verify_job(job_id, "training")
             results = await self._await_training_refs(
                 lambda: [w.save_checkpoint.remote(path, export_hf) for w in self.training_workers],
             )
@@ -1212,7 +1224,7 @@ class ArcticRLRayServer:
                 except ValueError:
                     pass
         steps = await self._gather_training_refs(
-            lambda: [w.load_checkpoint.remote(path) for w in self.training_workers]
+            lambda: [w.load_checkpoint.remote(path) for w in self.training_workers], job_id=job_id
         )
         return {"job_id": job_id, "path": path, "global_step": int(steps[0]) if steps else 0}
 
@@ -1290,11 +1302,17 @@ class ArcticRLRayServer:
             mode = "all"
         workers = self.training_workers
         if mode == "non_lp":
-            results = await self._gather_training_refs(lambda: [w.offload_non_lp_states.remote() for w in workers])
+            results = await self._gather_training_refs(
+                lambda: [w.offload_non_lp_states.remote() for w in workers], job_id=job_id
+            )
         elif mode == "lp_params":
-            results = await self._gather_training_refs(lambda: [w.offload_lp_params.remote() for w in workers])
+            results = await self._gather_training_refs(
+                lambda: [w.offload_lp_params.remote() for w in workers], job_id=job_id
+            )
         else:
-            results = await self._gather_training_refs(lambda: [w.offload_to_cpu.remote() for w in workers])
+            results = await self._gather_training_refs(
+                lambda: [w.offload_to_cpu.remote() for w in workers], job_id=job_id
+            )
         logger.info("Offload training (mode=%s): %s", mode, results)
         return {"job_id": job_id, "workers": results}
 
@@ -1302,7 +1320,9 @@ class ArcticRLRayServer:
         """Reload all training state to GPU (wake training workers)."""
         self._verify_job(job_id, "training")
         workers = self.training_workers
-        results = await self._gather_training_refs(lambda: [w.backload_to_gpu.remote() for w in workers])
+        results = await self._gather_training_refs(
+            lambda: [w.backload_to_gpu.remote() for w in workers], job_id=job_id
+        )
         logger.info("Wake training: %s", results)
         return {"job_id": job_id, "workers": results}
 
@@ -1387,6 +1407,8 @@ class ArcticRLRayServer:
         )
 
         async with self._training_op_lock:
+            self._verify_job(training_job_id, "training")
+            self._verify_job(sampling_job_id, "sampling")
             self._raise_if_training_failed()
             if colocate:
                 lp_pool = self.log_prob_pool
