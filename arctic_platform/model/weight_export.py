@@ -501,6 +501,19 @@ def validate_lora_sync_trainable_parameters(model: nn.Module) -> None:
         )
 
 
+def validate_full_weight_sync_source(model: nn.Module, weight_format: WeightFormat) -> None:
+    """Refuse full-weight synchronization when the model trains LoRA adapters."""
+    from arctic_platform.model.patches.peft import is_peft_lora_param
+
+    adapters = [name for name, parameter in model.named_parameters() if is_peft_lora_param(name, parameter)]
+    if adapters:
+        raise ValueError(
+            f"weight_format={weight_format!r} cannot sync a model with {len(adapters)} trainable LoRA parameter(s) "
+            f"(e.g. {adapters[0]}): the sampler serves adapters through its LoRA manager, so they would reach no "
+            "parameter and the sampler would keep the base model. Sync a PEFT model with weight_format='lora'."
+        )
+
+
 def _peft_lora_parameter_to_vllm_name(name: str) -> str:
     parts = strip_activation_checkpoint_segments(name).split(".")
     if len(parts) >= 3 and parts[-1] == "weight" and parts[-3] in ("lora_A", "lora_B"):
@@ -693,11 +706,16 @@ def iter_model_weights(
     Models without a family contract stream ``named_parameters()``: unchanged for
     ``"vllm"`` (direct copy), and in the checkpoint's layout for ``"hf"`` (see
     :func:`hf_sync_name_map`, which uses ``checkpoint_dir`` when given).
+
+    ``include_skipped=True`` exports the unmerged PEFT base for a weights-only checkpoint.
+    Other full-weight streams refuse trainable LoRA adapters; synchronize those with ``weight_format="lora"``.
     """
     if weight_format not in ("hf", "vllm", "lora"):
         raise ValueError(f"weight_format must be 'hf', 'vllm', or 'lora'; got {weight_format!r}")
     if include_skipped and weight_format != "hf":
         raise ValueError("include_skipped is only supported for weight_format='hf'")
+    if weight_format != "lora" and not include_skipped:
+        validate_full_weight_sync_source(model, weight_format)
     if weight_format == "lora":
         yield from iter_lora_weights(model, is_master=is_master, is_zero3=is_zero3)
         return
