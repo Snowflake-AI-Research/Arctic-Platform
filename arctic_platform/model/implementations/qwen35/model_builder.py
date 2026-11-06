@@ -52,6 +52,7 @@ from arctic_platform.model.implementations.moe.conversion_cache import (
     conversion_cache_ready,
     ensure_node_local_conversion_cache,
     resolve_conversion_cache_path,
+    resolve_ready_conversion_cache_path,
     _write_conversion_cache,
 )
 from arctic_platform.model.implementations.moe.hf_loader import load_hf_weights, supports_direct_hf_loading
@@ -547,7 +548,11 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         source_path = snapshot_path
         if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
             if supports_direct_hf_loading(model):
-                direct_hf_load = True
+                cache_path = resolve_ready_conversion_cache_path(config, source_path, "prime")
+                if cache_path is None:
+                    direct_hf_load = True
+                else:
+                    snapshot_path = cache_path
             else:
                 conversion = ("prime", model.convert_to_prime, "HF", "PrimeRL")
         elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(model_keys):

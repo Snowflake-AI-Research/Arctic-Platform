@@ -354,7 +354,10 @@ def test_direct_load_vlm_names_and_export_roundtrip(tmp_path):
 
 
 @pytest.mark.parametrize("builder_name", ["qwen35", "glm52"])
-def test_builder_load_expert_step_and_native_resume(tmp_path, monkeypatch, builder_name, single_rank_group):
+@pytest.mark.parametrize("cache_location", ["missing", "sibling", "hashed", "incomplete"])
+def test_builder_load_expert_step_and_native_resume(
+    tmp_path, monkeypatch, builder_name, single_rank_group, cache_location
+):
     from arctic_platform.model.implementations.moe.layers.lm_head import inject_prime_lm_head
     from arctic_platform.model.implementations.moe.layers.moe import _run_experts_for_loop_impl
     from arctic_platform.model.implementations.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
@@ -393,18 +396,50 @@ def test_builder_load_expert_step_and_native_resume(tmp_path, monkeypatch, build
     model_cls.convert_to_hf(source)
     checkpoint = tmp_path / "hf"
     _write_checkpoint(checkpoint, source)
+    from arctic_platform.model.convert_hf_to_primerl import convert_checkpoint
+    from arctic_platform.model.implementations.moe.conversion_cache import hashed_conversion_cache_path
+
+    config.save_pretrained(checkpoint)
+    cache_root = tmp_path / "cache"
+    if cache_location == "sibling":
+        convert_checkpoint(checkpoint)
+    elif cache_location == "hashed":
+        convert_checkpoint(checkpoint, dest=hashed_conversion_cache_path(cache_root, checkpoint, "prime"))
+    elif cache_location == "incomplete":
+        incomplete = checkpoint / "prime"
+        incomplete.mkdir()
+        (incomplete / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"missing": "missing.safetensors"}})
+        )
+    files_before = sorted(checkpoint.rglob("*"))
+    cache_files_before = sorted(cache_root.rglob("*"))
+    direct_calls = []
+    direct_load = builder.load_hf_weights
+
+    def track_direct(*args):
+        direct_calls.append(True)
+        return direct_load(*args)
+
+    def reject_conversion(*args, **kwargs):
+        raise AssertionError("Training startup must not create a conversion cache")
+
+    monkeypatch.setattr(builder, "load_hf_weights", track_direct)
+    monkeypatch.setattr(builder, "ensure_node_local_conversion_cache", reject_conversion)
+    monkeypatch.setattr(builder, "_write_conversion_cache", reject_conversion)
     loaded = new_model("meta")
     # Keep this CPU test independent of the offload path's CUDA buffer placement.
     monkeypatch.setattr(builder, "_move_buffers_to_cuda", lambda *_args: None)
-    builder.load_dcp_from_hf(loaded, ModelConfig(name=str(checkpoint), fsdp_cpu_offload=True), None)
+    builder.load_dcp_from_hf(
+        loaded,
+        ModelConfig(name=str(checkpoint), fsdp_cpu_offload=True, weight_conversion_cache_dir=str(cache_root)),
+        None,
+    )
     for module in loaded.modules():
         if hasattr(module, "tokens_per_expert"):
             module.tokens_per_expert.zero_()
-    assert sorted(path.name for path in checkpoint.iterdir()) == [
-        "model-0.safetensors",
-        "model-1.safetensors",
-        "model.safetensors.index.json",
-    ]
+    assert bool(direct_calls) == (cache_location in {"missing", "incomplete"})
+    assert sorted(checkpoint.rglob("*")) == files_before
+    assert sorted(cache_root.rglob("*")) == cache_files_before
     assert [name for name, _ in loaded.named_parameters()] == [name for name, _ in reference.named_parameters()]
     optim_ref = torch.optim.AdamW(reference.parameters(), lr=1e-3)
     optim_loaded = torch.optim.AdamW(loaded.parameters(), lr=1e-3)
@@ -550,3 +585,57 @@ def test_direct_load_rejects_incomplete_or_incompatible_weights(tmp_path, failur
         match="missing training tensors|shape mismatch|expert ids|Non-contiguous",
     ):
         load_hf_weights(targets, checkpoint, converter.convert_layer_to_prime)
+
+
+@pytest.mark.parametrize("family", ["qwen3_moe", "glm5_next"])
+def test_offline_conversion_preserves_real_family_weights(tmp_path, family):
+    from arctic_platform.model.convert_hf_to_primerl import convert_checkpoint
+    from arctic_platform.model.implementations.moe.weights import load_state_dict
+
+    source = _source(family)
+    expected = _converted(source, _converter(family))
+    checkpoint = tmp_path / "hf"
+    _write_checkpoint(checkpoint, source)
+    (checkpoint / "config.json").write_text(json.dumps({"model_type": family}))
+    cache = convert_checkpoint(checkpoint)
+    actual = load_state_dict(cache)
+    assert actual.keys() == expected.keys()
+    for name, tensor in expected.items():
+        torch_assert_equal(actual[name], tensor)
+
+
+def _check_cache_readiness(rank, world_size, root, rendezvous):
+    from types import SimpleNamespace
+
+    from arctic_platform.model.implementations.moe.conversion_cache import resolve_ready_conversion_cache_path
+
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world_size,
+        init_method=f"file://{rendezvous}",
+        timeout=timedelta(seconds=45),
+    )
+    try:
+        source = Path(root) / f"rank-{rank}"
+        source.mkdir()
+        config = SimpleNamespace(weight_conversion_cache_dir=str(Path(root) / "cache"))
+        if rank == 0:
+            _write_checkpoint(source / "prime", {"weight": torch.ones(2, 2)})
+        dist.barrier()
+        assert resolve_ready_conversion_cache_path(config, source, "prime") is None
+        if rank == 1:
+            _write_checkpoint(source / "prime", {"weight": torch.ones(2, 2)})
+        dist.barrier()
+        assert resolve_ready_conversion_cache_path(config, source, "prime") == source / "prime"
+    finally:
+        dist.destroy_process_group()
+
+
+def test_prepared_cache_requires_readiness_on_every_rank(tmp_path):
+    mp.start_processes(
+        _check_cache_readiness,
+        args=(2, str(tmp_path), str(tmp_path / "rendezvous")),
+        nprocs=2,
+        start_method="spawn",
+    )
