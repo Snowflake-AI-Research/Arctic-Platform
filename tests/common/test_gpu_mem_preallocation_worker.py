@@ -54,7 +54,9 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
     monkeypatch.setattr(mod, "pr0", lambda *args: None)
     monkeypatch.setattr(mod, "sp_size_from_job_config", lambda config: 1)
     monkeypatch.setattr(
-        worker, "ds_training_config", lambda *args: {"optimizer": {"type": "AdamW", "params": {"torch_adam": True}}}
+        worker,
+        "ds_training_config",
+        lambda *args: {"optimizer": {"type": "AdamW", "params": {"lr": 0.001, "torch_adam": True}}},
     )
     monkeypatch.setattr(worker, "ds_inference_config", lambda *args: {})
     monkeypatch.setattr(deepspeed_engine, "build_training_optimizer", lambda *args, **kwargs: optimizer)
