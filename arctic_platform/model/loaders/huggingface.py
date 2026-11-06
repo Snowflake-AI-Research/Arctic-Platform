@@ -70,9 +70,9 @@ class HuggingfaceOptions(BaseModel):
             " batch-invariant vLLM sampler runs (VLLM_BATCH_INVARIANT=1, enforce_eager, tensor parallelism 1, the"
             " FLASH_ATTN backend, Model Runner V2, KV-cache page size 16, the trainer's vLLM version), so the"
             " trainer's logprobs equal the sampler's bitwise at the same weights. The backward is the ordinary math"
-            " and is not bitwise. For the dense Qwen3.5 family (GatedDeltaNet hybrids), the logprobs are computed"
-            " with the sampler's kernels and carry the stock forward's gradient; the sampler also needs"
-            " ARCTIC_GDN_BATCH_INVARIANT=1, the Triton GDN prefill backend and"
+            " and is not bitwise; patches.lm_head.fp32 makes the LM head's backward fp32 while its forward stays the"
+            " sampler's bf16 one. The dense Qwen3.5 family (GatedDeltaNet hybrids) is covered too; its sampler also"
+            " needs ARCTIC_GDN_BATCH_INVARIANT=1, the Triton GDN prefill backend and"
             " VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0 (see"
             " arctic_platform.model.implementations.vllm_aligned.qwen3_5). Requires patches.lm_head.token_chunk_size,"
             " which bounds the LM-head rows held at once, and rejects the other kernel patches and sequence"
@@ -87,10 +87,11 @@ class HuggingfaceOptions(BaseModel):
         return self
 
 
-def _check_vllm_aligned_spec(ctx: LoaderContext) -> tuple[str, int]:
+def _check_vllm_aligned_spec(ctx: LoaderContext) -> tuple[str, int, bool]:
     """Fail before the weights load when a job asks for the vLLM-aligned forward with something it cannot honour.
 
-    Returns the aligned model family, ``"qwen3"`` or ``"qwen3_5"``, and the LM-head token chunk size it uses.
+    Returns the aligned model family, ``"qwen3"`` or ``"qwen3_5"``, the LM-head token chunk size, and whether the
+    LM head's gradient is computed in fp32 (``patches.lm_head.fp32``; the logprobs stay the sampler's bf16 ones).
     """
     from arctic_platform.model.implementations.vllm_aligned import qwen3
     from arctic_platform.model.implementations.vllm_aligned import qwen3_5
@@ -126,11 +127,7 @@ def _check_vllm_aligned_spec(ctx: LoaderContext) -> tuple[str, int]:
             "vllm_aligned computes logprobs inside the model and needs patches.lm_head.token_chunk_size, which also"
             " makes the trainer ask the model for logprobs"
         )
-    if patches.lm_head.fp32:
-        raise ValueError(
-            "vllm_aligned evaluates the LM head as the sampler does, in the model dtype; unset lm_head.fp32"
-        )
-    return family, patches.lm_head.token_chunk_size
+    return family, patches.lm_head.token_chunk_size, bool(patches.lm_head.fp32)
 
 
 def _is_local_qwen3_5_dense(model_path_or_name: str) -> bool:
@@ -211,18 +208,17 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
 
         configure_transformers_sequence_parallel_model(model, groups["sp_group"], fp32_beta=options.fp32_parity)
     if vllm_aligned is not None:
-        family, token_chunk_size = vllm_aligned
+        family, token_chunk_size, lm_head_fp32_backward = vllm_aligned
         if family == "qwen3_5":
             from arctic_platform.model.implementations.vllm_aligned.qwen3_5 import apply_vllm_aligned_qwen3_5
-            from arctic_platform.model.patches.lm_head import apply_lm_head
 
-            # The aligned forward wraps the chunked LM-head forward, which supplies its gradient.
-            apply_lm_head(model, ctx)
-            apply_vllm_aligned_qwen3_5(model, token_chunk_size=token_chunk_size)
+            apply_vllm_aligned_qwen3_5(
+                model, token_chunk_size=token_chunk_size, lm_head_fp32_backward=lm_head_fp32_backward
+            )
         else:
             from arctic_platform.model.implementations.vllm_aligned.qwen3 import apply_vllm_aligned
 
-            apply_vllm_aligned(model, token_chunk_size=token_chunk_size)
+            apply_vllm_aligned(model, token_chunk_size=token_chunk_size, lm_head_fp32_backward=lm_head_fp32_backward)
         # The aligned forward computes logprobs itself; the chunked LM-head patch would wrap it with its own head.
         return LoadedModel(model=model, applied_patches=frozenset({"lm_head"}))
     return LoadedModel(model=model)

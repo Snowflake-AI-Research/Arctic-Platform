@@ -279,6 +279,7 @@ def _causal_lm_forward(
             labels_flat,
             temperature=_scalar_temperature(temperature),
             token_chunk_size=self._vllm_aligned_token_chunk_size,
+            fp32_backward=getattr(self, "_vllm_aligned_lm_head_fp32_backward", False),
         )
         return {"logprobs": logprobs.view(batch_size, kept)}
 
@@ -289,11 +290,14 @@ def _causal_lm_forward(
     return CausalLMOutputWithPast(loss=loss, logits=logits)
 
 
-def apply_vllm_aligned(model: nn.Module, *, kv_block_size: int = 16, token_chunk_size: int = 1024) -> None:
+def apply_vllm_aligned(
+    model: nn.Module, *, kv_block_size: int = 16, token_chunk_size: int = 1024, lm_head_fp32_backward: bool = False
+) -> None:
     """Make a loaded transformers ``Qwen3ForCausalLM`` compute vLLM's numbers; see the module docstring.
 
     ``kv_block_size`` is the sampler's KV-cache page size. ``token_chunk_size`` bounds the rows of the LM-head
-    logits held at once when the forward returns log-probabilities.
+    logits held at once when the forward returns log-probabilities. ``lm_head_fp32_backward`` computes the LM head's
+    gradient from fp32 logits.
     """
     config = _text_config(model)
     check_supported_config(config)
@@ -312,5 +316,6 @@ def apply_vllm_aligned(model: nn.Module, *, kv_block_size: int = 16, token_chunk
         layer._vllm_aligned_index = index
         layer.forward = types.MethodType(_decoder_layer_forward, layer)
     model._vllm_aligned_token_chunk_size = int(token_chunk_size)
+    model._vllm_aligned_lm_head_fp32_backward = bool(lm_head_fp32_backward)
     model.forward = types.MethodType(_causal_lm_forward, model)
     model._vllm_aligned = True

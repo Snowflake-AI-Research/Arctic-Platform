@@ -168,6 +168,56 @@ def gemma_rms_norm_kernel(
     return hidden.to(orig_dtype), new_residual
 
 
+def _rms_norm_backward_fp32(hidden: torch.Tensor, weight: torch.Tensor, eps: float, grad: torch.Tensor):
+    """``(grad_hidden, grad_weight)`` in fp32 for ``hidden * rsqrt(mean(hidden**2) + eps) * weight``."""
+    inv_rms = torch.rsqrt(hidden.pow(2).mean(-1, keepdim=True) + eps)
+    normed = hidden * inv_rms
+    weighted_grad = grad.float() * weight
+    grad_hidden = inv_rms * (weighted_grad - normed * (weighted_grad * normed).mean(-1, keepdim=True))
+    grad_weight = (grad.float() * normed).reshape(-1, hidden.shape[-1]).sum(0)
+    return grad_hidden, grad_weight
+
+
+class _GemmaRMSNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, eps):
+        ctx.save_for_backward(x, weight)
+        ctx.eps = eps
+        return gemma_rms_norm_kernel(x, weight, eps)[0]
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, weight = ctx.saved_tensors
+        grad_x, grad_weight = _rms_norm_backward_fp32(x.float(), weight.float() + 1.0, ctx.eps, grad_out)
+        return grad_x.to(x.dtype), grad_weight.to(weight.dtype), None
+
+
+class _GemmaFusedAddRMSNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, residual, weight, eps):
+        ctx.save_for_backward(x, residual, weight)
+        ctx.eps = eps
+        return gemma_rms_norm_kernel(x, weight, eps, residual)
+
+    @staticmethod
+    def backward(ctx, grad_out, grad_residual):
+        x, residual, weight = ctx.saved_tensors
+        hidden = x.float() + residual.float()
+        grad_hidden, grad_weight = _rms_norm_backward_fp32(hidden, weight.float() + 1.0, ctx.eps, grad_out)
+        if grad_residual is not None:
+            grad_hidden = grad_hidden + grad_residual.float()
+        return grad_hidden.to(x.dtype), grad_hidden.to(residual.dtype), grad_weight.to(weight.dtype), None
+
+
+def gemma_rms_norm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, residual: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """:func:`gemma_rms_norm_kernel` with an fp32 backward; with ``residual`` both outputs carry gradients."""
+    if residual is None:
+        return _GemmaRMSNorm.apply(x, weight, eps), None
+    return _GemmaFusedAddRMSNorm.apply(x, residual, weight, eps)
+
+
 def silu_and_mul_kernel(x: torch.Tensor) -> torch.Tensor:
     """The forward of :func:`silu_and_mul` without autograd."""
     out = torch.empty(x.shape[:-1] + (x.shape[-1] // 2,), dtype=x.dtype, device=x.device)
@@ -505,11 +555,12 @@ def lm_head_logprobs_kernel(
 
 class _LMHeadLogprobs(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight, labels, temperature, token_chunk_size, vocab_padding):
+    def forward(ctx, hidden, weight, labels, temperature, token_chunk_size, vocab_padding, fp32_backward):
         out = lm_head_logprobs_kernel(hidden, weight, labels, temperature, token_chunk_size, vocab_padding)
         ctx.save_for_backward(hidden, weight, labels)
         ctx.temperature = temperature
         ctx.token_chunk_size = token_chunk_size
+        ctx.fp32_backward = fp32_backward
         return out
 
     @staticmethod
@@ -517,10 +568,12 @@ class _LMHeadLogprobs(torch.autograd.Function):
         hidden, weight, labels = ctx.saved_tensors
         grad_hidden = torch.empty_like(hidden)
         grad_weight = torch.zeros(weight.shape, dtype=torch.float32, device=weight.device)
+        compute_dtype = torch.float32 if ctx.fp32_backward else weight.dtype
+        matmul_weight = weight.to(compute_dtype)
         for start in range(0, hidden.shape[0], ctx.token_chunk_size):
             stop = min(start + ctx.token_chunk_size, hidden.shape[0])
-            hidden_chunk = hidden[start:stop]
-            logits = (hidden_chunk @ weight.t()).float()
+            hidden_chunk = hidden[start:stop].to(compute_dtype)
+            logits = (hidden_chunk @ matmul_weight.t()).float()
             if ctx.temperature != 1.0:
                 logits = logits / ctx.temperature
             grad = grad_out[start:stop].float()
@@ -528,10 +581,10 @@ class _LMHeadLogprobs(torch.autograd.Function):
             grad_logits.scatter_add_(1, labels[start:stop, None], grad[:, None])
             if ctx.temperature != 1.0:
                 grad_logits = grad_logits / ctx.temperature
-            grad_logits = grad_logits.to(weight.dtype)
-            grad_hidden[start:stop] = grad_logits @ weight
+            grad_logits = grad_logits.to(compute_dtype)
+            grad_hidden[start:stop] = (grad_logits @ matmul_weight).to(hidden.dtype)
             grad_weight.add_((grad_logits.t() @ hidden_chunk).float())
-        return grad_hidden, grad_weight.to(weight.dtype), None, None, None, None
+        return grad_hidden, grad_weight.to(weight.dtype), None, None, None, None, None
 
 
 def lm_head_logprobs(
@@ -542,6 +595,7 @@ def lm_head_logprobs(
     temperature: float = 1.0,
     token_chunk_size: int = 1024,
     vocab_padding: int = 64,
+    fp32_backward: bool = False,
 ) -> torch.Tensor:
     """Log-probability of ``labels`` (``[tokens]``) under the logits of ``hidden`` (``[tokens, hidden]``).
 
@@ -550,11 +604,12 @@ def lm_head_logprobs(
     temperature when it is not 1. The logprob of each label is then the value Model Runner V2's sampler reports,
     from its ``compute_token_logprobs`` kernel: ``logit - max - log(sum(exp(logit - max)))`` in fp32, which rounds
     differently from a full log-softmax followed by a gather. Rows are independent, so chunking them changes nothing.
-    A label of -100 scores 0 and receives no gradient.
+    A label of -100 scores 0 and receives no gradient. ``fp32_backward`` recomputes the logits for the gradient
+    from fp32 copies of ``hidden`` and ``weight``; the returned values stay the sampler's.
     """
     ignored = labels == -100
     safe_labels = labels.masked_fill(ignored, 0).to(torch.long)
     logprobs = _LMHeadLogprobs.apply(
-        hidden, weight, safe_labels, float(temperature), int(token_chunk_size), int(vocab_padding)
+        hidden, weight, safe_labels, float(temperature), int(token_chunk_size), int(vocab_padding), bool(fp32_backward)
     )
     return logprobs.masked_fill(ignored, 0.0)

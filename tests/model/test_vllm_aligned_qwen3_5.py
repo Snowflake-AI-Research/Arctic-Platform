@@ -18,7 +18,7 @@ Bitwise agreement with a sampler can only be shown on a GPU against vLLM. These 
 with its formula, so the aligned logprobs of packed sequences have to match stock transformers Qwen3.5 run one
 sequence at a time. That checks the fused projection orders, the q/gate interleave, the partial and multimodal rotary
 inputs, the residual carry, the conv input layout, the prefill/decode split with its state handoff, the gated norm and
-the LM head. The gradient tests check that the returned values carry the stock forward's gradient.
+the LM head. The gradient test checks that the per-operator backward gives the stock model's gradient.
 """
 
 from __future__ import annotations
@@ -115,6 +115,14 @@ class _FakeFaUtils:
             values = v[blocks].reshape(-1, v.shape[2], v.shape[3])[:length]
             out[start:stop] = _causal_attention(q[start:stop], keys, values, softmax_scale)
         return out
+
+
+def _fake_trainer_flash_attn(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale=None, causal=False):
+    assert causal and torch.equal(cu_q, cu_k)
+    bounds = cu_q.tolist()
+    return torch.cat(
+        [_causal_attention(q[a:b], k[a:b], v[a:b], softmax_scale) for a, b in zip(bounds[:-1], bounds[1:])]
+    )
 
 
 def _fake_silu_and_mul(out, x):
@@ -260,6 +268,24 @@ class _FakeFlaOps:
         return out[None], initial_state
 
 
+def _fake_reference_gated_delta_rule(
+    q, k, v, *, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel, cu_seqlens
+):
+    """fla's chunked rule as a differentiable recurrence; ``q``/``k`` already carry the value heads."""
+    assert initial_state is None and not output_final_state and use_qk_l2norm_in_kernel
+    query, key = _l2norm(q[0].float()), _l2norm(k[0].float())
+    bounds = cu_seqlens.tolist()
+    outputs = []
+    for start, stop in zip(bounds[:-1], bounds[1:]):
+        state = torch.zeros(v.shape[2], v.shape[3], q.shape[3], dtype=torch.float32)
+        out, _ = _recurrence(
+            query[start:stop], key[start:stop], v[0, start:stop].float(), g[0, start:stop], beta[0, start:stop].float(),
+            state,
+        )  # fmt: skip
+        outputs.append(out)
+    return torch.cat(outputs)[None].to(v.dtype), None
+
+
 def _fake_rmsnorm_fn(x, weight, bias, *, z, eps, group_size, norm_before_gate, activation):
     assert bias is None and group_size is None and norm_before_gate and activation == "silu"
     return (_rms(x.float(), weight.float(), eps) * F.silu(z.float())).to(x.dtype)
@@ -270,12 +296,14 @@ def fake_vllm(monkeypatch):
     monkeypatch.setattr(ops, "_batch_invariant", lambda: _FakeBatchInvariant)
     monkeypatch.setattr(ops, "_fa_utils", lambda: _FakeFaUtils)
     monkeypatch.setattr(ops, "_silu_and_mul_kernel", _fake_silu_and_mul)
+    monkeypatch.setattr(ops, "_trainer_flash_attn_varlen_func", lambda: _fake_trainer_flash_attn)
     monkeypatch.setattr(ops, "_token_logprobs_kernel", _fake_token_logprobs)
     monkeypatch.setattr(qwen3_5, "_fused_qk_rmsnorm_rope_gate", lambda: _fake_fused_qk_rmsnorm_rope_gate)
     monkeypatch.setattr(qwen3_5, "_causal_conv1d_fn", lambda: _fake_causal_conv1d_fn)
     monkeypatch.setattr(qwen3_5, "_fla_ops", lambda: _FakeFlaOps)
     monkeypatch.setattr(qwen3_5, "_gated_rms_norm", lambda: _fake_rmsnorm_fn)
     monkeypatch.setattr(qwen3_5, "_pin_gdn_kernels", lambda: None)
+    monkeypatch.setattr(qwen3_5, "_reference_gated_delta_rule", lambda: _fake_reference_gated_delta_rule)
     monkeypatch.setenv(ops.BATCH_INVARIANT_ENV, "1")
     _FakeFlaOps.decoded_tokens = 0
 
@@ -335,11 +363,8 @@ def _stock_logprobs(model, ids):
     return torch.log_softmax(logits[:-1], dim=-1).gather(1, ids[1:, None]).squeeze(1)
 
 
-def _enable_aligned(model, monkeypatch):
-    from arctic_platform.model.implementations.gpu.lm_head import enable_chunked_lm_head_logprobs
-
-    enable_chunked_lm_head_logprobs(model, token_chunk_size=8, vocab_chunk_size=32, fp32_lm_head=False)
-    qwen3_5.apply_vllm_aligned_qwen3_5(model, token_chunk_size=8)
+def _enable_aligned(model, monkeypatch, **kwargs):
+    qwen3_5.apply_vllm_aligned_qwen3_5(model, token_chunk_size=8, **kwargs)
 
 
 def _packed(sequences, first_trained):
@@ -436,52 +461,80 @@ def test_labels_decide_the_decoded_tokens_without_a_loss_mask(fake_vllm, monkeyp
     assert out[:3].abs().max().item() == 0.0
 
 
-def test_values_are_aligned_and_gradient_is_stock(fake_vllm, monkeypatch):
-    model = _model()
-    _enable_aligned(model, monkeypatch)
+def _stock_weighted_loss(model, sequences, weights):
+    total = 0.0
+    for seq, w in zip(sequences, weights):
+        logits = model(input_ids=seq[None]).logits[0].float()
+        logprobs = torch.log_softmax(logits[:-1], dim=-1).gather(1, seq[1:, None]).squeeze(1)
+        total = total + (logprobs * w[: seq.numel() - 1]).sum()
+    return total
+
+
+def test_gradient_is_the_stock_models_gradient_on_packed_sequences(fake_vllm, monkeypatch):
+    import transformers.models.qwen3_5.modeling_qwen3_5 as modeling
+
+    # The stock chunked rule's fp32 algorithm moves the tiny A_log/dt_bias gradients by ~0.2%; its recurrent form
+    # computes the same function the way the fake kernels do.
+    monkeypatch.setattr(modeling, "torch_chunk_gated_delta_rule", modeling.torch_recurrent_gated_delta_rule)
+    stock = _model()
+    aligned = _model()
+    _enable_aligned(aligned, monkeypatch)
     torch.manual_seed(3)
-    seq = torch.randint(0, 97, (12,))
-    input_ids, labels, positions, _cu_seqlens, loss_mask = _packed([seq], [5])
-    kwargs = {
-        "input_ids": input_ids,
-        "position_ids": positions,
-        "labels": labels,
-        "dss_compute_logprobs": True,
+    sequences = [torch.randint(0, 97, (n,)) for n in (11, 7, 9)]
+    weights = [torch.linspace(0.5, 1.5, seq.numel()) for seq in sequences]
+    input_ids, labels, positions, cu_seqlens, loss_mask = _packed(sequences, [4, None, 1])
+
+    _stock_weighted_loss(stock, sequences, weights).backward()
+    out = aligned(
+        input_ids=input_ids,
+        position_ids=positions,
+        labels=labels,
+        dss_compute_logprobs=True,
+        cu_seq_lens_q=cu_seqlens,
+        vllm_aligned_loss_mask=loss_mask,
+    )["logprobs"][0]
+    assert out.requires_grad
+    (out * torch.cat(weights)).sum().backward()
+
+    stock_grads = {name: p.grad for name, p in stock.named_parameters() if p.grad is not None}
+    aligned_grads = {name: p.grad for name, p in aligned.named_parameters() if p.grad is not None}
+    assert aligned_grads.keys() == stock_grads.keys() and len(stock_grads) > 20
+    worst = {
+        name: float((aligned_grads[name] - grad).abs().max() / grad.abs().max().clamp_min(1e-12))
+        for name, grad in stock_grads.items()
     }
-
-    sentinel = torch.full_like(labels, 7.0, dtype=torch.float32)
-    monkeypatch.setattr(qwen3_5, "aligned_logprobs", lambda *args, **kw: sentinel.reshape(-1))
-    weights = torch.linspace(0.5, 1.5, labels.numel()).view_as(labels)
-    out = model(**kwargs, vllm_aligned_loss_mask=loss_mask)["logprobs"]
-    assert torch.equal(out, sentinel)
-    (out * weights).sum().backward()
-    aligned_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
-    model.zero_grad(set_to_none=True)
-
-    stock = model._vllm_aligned_stock_forward(**kwargs)["logprobs"]
-    (stock * weights).sum().backward()
-    stock_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
-    assert aligned_grads.keys() == stock_grads.keys() and len(stock_grads) > 0
-    for name, grad in stock_grads.items():
-        assert torch.equal(aligned_grads[name], grad), name
+    assert max(worst.values()) < 1e-4, sorted(worst.items(), key=lambda kv: -kv[1])[:5]
 
 
-def test_no_grad_skips_the_stock_forward(fake_vllm, monkeypatch):
+def test_no_grad_forward_builds_no_graph(fake_vllm, monkeypatch):
     model = _model()
     _enable_aligned(model, monkeypatch)
-
-    def fail(**_):
-        raise AssertionError("the stock forward ran without gradients")
-
-    model._vllm_aligned_stock_forward = fail
     seq = torch.randint(0, 97, (6,))
     with torch.no_grad():
-        model(
+        out = model(
             input_ids=seq[None],
             position_ids=torch.arange(6)[None],
             labels=torch.cat((seq[1:], torch.tensor([-100])))[None],
             dss_compute_logprobs=True,
-        )
+        )["logprobs"]
+    assert not out.requires_grad
+
+
+def test_lm_head_fp32_backward_keeps_the_values_and_changes_only_the_gradient(fake_vllm):
+    torch.manual_seed(4)
+    hidden = torch.randn(10, 16, dtype=torch.bfloat16)
+    weight = torch.randn(32, 16, dtype=torch.bfloat16)
+    labels = torch.randint(0, 32, (10,))
+    results = {}
+    for fp32 in (False, True):
+        h, w = hidden.clone().requires_grad_(True), weight.clone().requires_grad_(True)
+        out = ops.lm_head_logprobs(h, w, labels, token_chunk_size=4, vocab_padding=8, fp32_backward=fp32)
+        out.sum().backward()
+        results[fp32] = (out.detach(), h.grad, w.grad)
+    h32, w32 = hidden.float().requires_grad_(True), weight.float().requires_grad_(True)
+    torch.log_softmax(h32 @ w32.t(), dim=-1).gather(1, labels[:, None]).sum().backward()
+    assert torch.equal(results[False][0], results[True][0])
+    assert (results[True][1].float() - h32.grad).abs().max() <= (results[False][1].float() - h32.grad).abs().max()
 
 
 def test_without_dss_compute_logprobs_the_stock_forward_runs(fake_vllm, monkeypatch):
@@ -492,11 +545,6 @@ def test_without_dss_compute_logprobs_the_stock_forward_runs(fake_vllm, monkeypa
         logits = model(input_ids=seq[None]).logits
     assert logits.shape == (1, 6, 97)
     assert _FakeFlaOps.decoded_tokens == 0
-
-
-def test_apply_requires_the_chunked_lm_head(fake_vllm):
-    with pytest.raises(ValueError, match="chunked LM-head patch"):
-        qwen3_5.apply_vllm_aligned_qwen3_5(_model(), token_chunk_size=8)
 
 
 @pytest.mark.parametrize(
