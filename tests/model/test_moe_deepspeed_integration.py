@@ -31,6 +31,7 @@ from arctic_platform.model.implementations.moe import deepspeed_integration as c
 from arctic_platform.testing_utils import require_deepspeed
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import require_torch_multi_gpu
+from arctic_platform.testing_utils import set_seed
 from arctic_platform.testing_utils import torch_assert_equal
 
 
@@ -166,6 +167,10 @@ def test_selective_checkpointing_falls_back_for_glm():
 
 @pytest.fixture
 def ep_checkpoint_engine(monkeypatch):
+    return _make_ep_checkpoint_engine(monkeypatch)
+
+
+def _make_ep_checkpoint_engine(monkeypatch):
     class FixtureMoE(nn.Module):
         def __init__(self):
             super().__init__()
@@ -356,6 +361,63 @@ def ep_checkpoint_engine(monkeypatch):
     monkeypatch.setattr(common, "_save_ep_checkpoint_shard", save_shard)
     common._patch_deepspeed_ep_checkpoints(Engine)
     return engine
+
+
+def _ep_checkpoint_write_failure_worker(rank, rendezvous, directory, failing_rank, nonwriter):
+    import errno
+
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=20))
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            engine = _make_ep_checkpoint_engine(patch)
+            patch.setattr(sys.modules["deepspeed.utils.groups"], "_get_expert_parallel_rank", lambda name: rank)
+            engine.checkpoint_engine.writer = not nonwriter or rank == failing_rank
+
+            def save(tag):
+                engine._save_moe_checkpoint(directory, tag)
+                # Reproduce the native commit/latest/barrier order after the patched private save.
+                if rank == 0:
+                    (Path(directory) / "latest").write_text(tag)
+                dist.barrier()
+
+            save("good")
+            original = common.os.pwritev
+
+            def fail(descriptor, buffers, offset):
+                if rank == failing_rank:
+                    raise OSError(errno.ENOSPC, "injected rank-local shard write failure")
+                return original(descriptor, buffers, offset)
+
+            with patch.context() as failure:
+                failure.setattr(common.os, "pwritev", fail)
+                expected = OSError if rank == failing_rank else RuntimeError
+                message = "rank-local shard write failure" if rank == failing_rank else "another rank"
+                with pytest.raises(expected, match=message):
+                    save("failed")
+            dist.barrier()
+            assert (Path(directory) / "latest").read_text() == "good"
+            assert not hasattr(engine, "_ap_ep_checkpoint_save_parameters")
+            assert not list((Path(directory) / "failed").glob(".ap-ep-checkpoint-*"))
+            save("retry")
+            assert (Path(directory) / "latest").read_text() == "retry"
+            print(
+                f"EP_WRITE_FAILURE_GLOO_PASS rank={rank} failing_rank={failing_rank} nonwriter={nonwriter}", flush=True
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("failing_rank", [0, 1])
+@pytest.mark.parametrize("nonwriter", [False, True])
+def test_ep_checkpoint_one_rank_write_failure_aborts_all_ranks_without_commit(tmp_path, failing_rank, nonwriter):
+    mp.spawn(
+        _ep_checkpoint_write_failure_worker,
+        args=((tmp_path / "failure-rendezvous").as_uri(), str(tmp_path / "checkpoints"), failing_rank, nonwriter),
+        nprocs=2,
+        join=True,
+    )
 
 
 @pytest.mark.parametrize("save_method", ["_save_moe_checkpoint", "_save_checkpoint"])
@@ -1340,10 +1402,13 @@ def test_ep_checkpoint_native_deepspeed_save_load(monkeypatch, tmp_path, single_
         torch_assert_equal(parameter, target)
 
 
-def _native_legacy_ep_resume_worker(rank, rendezvous, directory, legacy=True):
+def _native_legacy_ep_resume_worker(rank, rendezvous, directory, legacy=True, write_failure=False):
+    import errno
+
     import deepspeed
     import deepspeed.utils.groups as groups
     import torch.distributed as dist
+    from deepspeed.utils import safe_get_full_grad
 
     torch.cuda.set_device(rank)
     os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE="2")
@@ -1362,6 +1427,7 @@ def _native_legacy_ep_resume_worker(rank, rendezvous, directory, legacy=True):
             group = dist.new_group([peer])
             if peer == rank:
                 groups._EXPERT_DATA_PARALLEL_GROUP[group_name] = group
+        set_seed(17)
         model = nn.Module()
         model.dense = nn.Linear(2, 2, bias=False)
         model.experts = common.MoE.__new__(common.MoE)
@@ -1370,6 +1436,8 @@ def _native_legacy_ep_resume_worker(rank, rendezvous, directory, legacy=True):
         model.experts.weight = nn.Parameter(torch.full((2, 2), 11.0 + rank))
         model.experts.weight.allreduce = False
         model.experts.weight.group_name = group_name
+        # Exercise native EP optimizer ownership without importing an expert-routing kernel.
+        model.forward = lambda inputs: model.dense(inputs) + torch.nn.functional.linear(inputs, model.experts.weight)
         model.cuda()
         common.patch_deepspeed_moe_detection()
         optimizer = torch.optim.AdamW(
@@ -1387,11 +1455,45 @@ def _native_legacy_ep_resume_worker(rank, rendezvous, directory, legacy=True):
                 zero_optimization=dict(stage=2),
             ),
         )
+        inputs = torch.tensor([[0.25, -0.5], [0.75, 0.125]], device="cuda") * (rank + 1)
+
+        def train_step():
+            loss = engine(inputs).square().mean()
+            engine.backward(loss)
+            gradients = {name: safe_get_full_grad(parameter).clone() for name, parameter in model.named_parameters()}
+            engine.step()
+            return loss.detach(), gradients, torch.as_tensor(engine.optimizer._global_grad_norm).clone()
+
+        train_step()
+        expected_parameters = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
         expected = model.experts.weight.detach().clone()
         # Legacy saves use rank-zero dense experts; AP saves must preserve both ranks' distinct shards.
         if legacy:
             engine.has_moe_layers = False
         assert engine.save_checkpoint(directory, tag="legacy")
+        if write_failure:
+            original_write = common.os.pwritev
+
+            def fail(descriptor, buffers, offset):
+                if rank == 1:
+                    raise OSError(errno.ENOSPC, "injected native rank-local shard write failure")
+                return original_write(descriptor, buffers, offset)
+
+            common.os.pwritev = fail
+            try:
+                with pytest.raises(
+                    OSError if rank == 1 else RuntimeError,
+                    match="rank-local shard write failure" if rank == 1 else "another rank",
+                ):
+                    engine.save_checkpoint(directory, tag="failed")
+            finally:
+                common.os.pwritev = original_write
+            dist.barrier()
+            assert (Path(directory) / "latest").read_text() == "legacy"
+            assert not list((Path(directory) / "failed").glob(".ap-ep-checkpoint-*"))
+            assert engine.save_checkpoint(directory, tag="retry")
+            print(f"EP_WRITE_FAILURE_NATIVE_PASS rank={rank}", flush=True)
+            return
         sidefile = common._ep_checkpoint_path(directory, "legacy", common._ep_checkpoint_identity(group_name))
         shard = torch.load(sidefile, weights_only=True)
         torch_assert_equal(shard["module"]["experts.weight"], expected.cpu())
@@ -1405,17 +1507,42 @@ def _native_legacy_ep_resume_worker(rank, rendezvous, directory, legacy=True):
             dense["module"]["experts.weight"] = expected.cpu()
             torch.save(dense, dense_path)
         dist.barrier()
+        steps = engine.global_steps
+        reference = train_step()
+        reference_parameters = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+        reference_state = {
+            key: {field: value.clone() if torch.is_tensor(value) else value for field, value in state.items()}
+            for key, state in engine.optimizer.optimizer.state_dict()["state"].items()
+        }
         with torch.no_grad():
-            model.experts.weight.add_(100)
+            for parameter in model.parameters():
+                parameter.add_(100)
             for master in engine.optimizer.single_partition_of_fp32_groups:
                 master.add_(200)
-        steps = engine.global_steps
         loaded, _ = engine.load_checkpoint(directory, tag="legacy", load_optimizer_states=True)
         assert loaded is not None
         assert engine.global_steps == steps
         torch_assert_equal(model.experts.weight, expected)
+        for name, parameter in model.named_parameters():
+            torch_assert_equal(parameter, expected_parameters[name])
         assert not hasattr(engine, "_ap_ep_restore_legacy_masters")
-        print(f"LEGACY_EP_NATIVE_PRE_STEP_RESTORE_PASS rank={rank}", flush=True)
+        actual = train_step()
+        torch_assert_equal(actual[0], reference[0])
+        torch_assert_equal(actual[2], reference[2])
+        for name, gradient in actual[1].items():
+            torch_assert_equal(gradient, reference[1][name])
+            torch_assert_equal(dict(model.named_parameters())[name], reference_parameters[name])
+        actual_state = engine.optimizer.optimizer.state_dict()["state"]
+        assert actual_state.keys() == reference_state.keys()
+        for key, state in actual_state.items():
+            assert state.keys() == reference_state[key].keys()
+            for field, value in state.items():
+                if torch.is_tensor(value):
+                    torch_assert_equal(value, reference_state[key][field])
+                else:
+                    assert value == reference_state[key][field]
+        assert engine.global_steps == steps + 1
+        print(f"EP_NATIVE_RESUME_STEP_PARITY_PASS rank={rank} legacy={legacy}", flush=True)
     finally:
         dist.destroy_process_group()
 
@@ -1437,6 +1564,17 @@ def test_ap_ep_native_deepspeed_two_rank_shard_round_trip(tmp_path):
     mp.spawn(
         _native_legacy_ep_resume_worker,
         args=((tmp_path / "ap-rendezvous").as_uri(), str(tmp_path / "checkpoints"), False),
+        nprocs=2,
+        join=True,
+    )
+
+
+@require_torch_multi_gpu
+@require_deepspeed
+def test_ap_ep_native_deepspeed_one_rank_write_failure_no_hang(tmp_path):
+    mp.spawn(
+        _native_legacy_ep_resume_worker,
+        args=((tmp_path / "native-failure-rendezvous").as_uri(), str(tmp_path / "checkpoints"), False, True),
         nprocs=2,
         join=True,
     )

@@ -461,25 +461,38 @@ def _patch_deepspeed_ep_checkpoints(engine_type) -> None:
                     del self._ap_ep_checkpoint_save_parameters
                 else:
                     self._ap_ep_checkpoint_save_parameters = previous_parameters
-            for group_name, named_parameters in parameters.items():
-                data_rank = ds_groups._get_expert_data_parallel_rank(group_name)
-                if not self.checkpoint_engine.is_data_parallel_writer(data_rank):
-                    continue
-                identity = _ep_checkpoint_identity(group_name)
-                state = {
-                    name: parameter.detach()
-                    for name, parameter in named_parameters.items()
-                    if parameter.requires_grad or not arguments["exclude_frozen_parameters"]
-                }
-                _save_ep_checkpoint_shard(
-                    dict(
-                        version=1,
-                        **identity,
-                        exclude_frozen_parameters=arguments["exclude_frozen_parameters"],
-                        module=state,
-                    ),
-                    _ep_checkpoint_path(arguments["save_dir"], arguments["tag"], identity),
-                )
+            error = None
+            try:
+                for group_name, named_parameters in parameters.items():
+                    data_rank = ds_groups._get_expert_data_parallel_rank(group_name)
+                    if not self.checkpoint_engine.is_data_parallel_writer(data_rank):
+                        continue
+                    identity = _ep_checkpoint_identity(group_name)
+                    state = {
+                        name: parameter.detach()
+                        for name, parameter in named_parameters.items()
+                        if parameter.requires_grad or not arguments["exclude_frozen_parameters"]
+                    }
+                    _save_ep_checkpoint_shard(
+                        dict(
+                            version=1,
+                            **identity,
+                            exclude_frozen_parameters=arguments["exclude_frozen_parameters"],
+                            module=state,
+                        ),
+                        _ep_checkpoint_path(arguments["save_dir"], arguments["tag"], identity),
+                    )
+            except Exception as caught:
+                error = caught
+            if parameters and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                # Every rank, including nonwriters, must fail before native ZeRO saves, commit and final barrier.
+                device = self.device if torch.distributed.get_backend() == "nccl" else torch.device("cpu")
+                failed = torch.tensor(int(error is not None), dtype=torch.int32, device=device)
+                torch.distributed.all_reduce(failed, op=torch.distributed.ReduceOp.MAX)
+                if failed.item() and error is None:
+                    raise RuntimeError("AP expert checkpoint shard write failed on another rank; save aborted")
+            if error is not None:
+                raise error
             return result
 
         return save
