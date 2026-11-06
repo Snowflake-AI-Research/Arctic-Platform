@@ -195,8 +195,7 @@ class DeepSpeedWorker:
                 sequence_parallel=self.sp_size,
                 debug=debug,
             )
-        parallel_groups = None
-        maybe_admit_worker_construction(self, spec, ds_config, parallel_groups, build_model, deepspeed.initialize)
+        maybe_admit_worker_construction(self, spec, ds_config, None, build_model, deepspeed.initialize)
         loaded = build_model(spec)
         model = loaded.model
         self._gpu_mem_preallocation = getattr(model, "_arctic_gpu_mem_preallocation", None)
