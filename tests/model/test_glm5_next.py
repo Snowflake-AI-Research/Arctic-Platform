@@ -608,6 +608,39 @@ def test_glm53_sparse_mla_full_forward_backward_without_sdpa():
     assert sparse_attention.indexer.wq_b.weight.grad is None
 
 
+def test_glm53_sparse_mla_applies_kv_b_proj_lora():
+    """The absorbed sparse path must see a kv_b_proj LoRA exactly as if it were merged into the weight."""
+    from peft import LoraConfig
+    from peft import get_peft_model
+
+    from arctic_platform.model.implementations.glm53.context_parallel import apply_context_parallelism
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+
+    set_seed(0)
+    config = _tiny_config()
+    config.use_cache = False
+    config.text_config.use_cache = False
+    model = Glm5NextForConditionalGenerationPrimeRL(config)
+    apply_context_parallelism(model, cp_size=1, cp_group=None)
+    model = get_peft_model(model, LoraConfig(r=2, lora_alpha=2, target_modules=["kv_b_proj"]))
+    sparse_attention = model.base_model.model.model.language_model.layers[-1].self_attn
+    kv_b_proj = sparse_attention.kv_b_proj
+    torch.nn.init.normal_(kv_b_proj.lora_B["default"].weight)
+    hidden_states = torch.randn(1, 4, config.text_config.hidden_size)
+    mask = torch.ones(1, 4, dtype=torch.bool)
+
+    output, _, _ = sparse_attention(hidden_states, attention_mask=mask)
+    output.square().sum().backward()
+    assert kv_b_proj.lora_A["default"].weight.grad.abs().sum() > 0
+    assert kv_b_proj.lora_B["default"].weight.grad.abs().sum() > 0
+
+    with torch.no_grad():
+        kv_b_proj.base_layer.weight.add_(kv_b_proj.get_delta_weight("default"))
+        kv_b_proj.lora_B["default"].weight.zero_()
+        merged, _, _ = sparse_attention(hidden_states, attention_mask=mask)
+    torch_assert_close(output.detach(), merged)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused indexer path runs on CUDA")
 def test_glm53_fused_indexer_selects_the_general_paths_keys():
     """One packed row takes the fused path; a batch of two identical rows takes the general path."""
@@ -689,3 +722,137 @@ def test_glm53_nope_sparse_mla_matches_reference_through_the_kernels():
     assert rel(out, out_ref) < 1e-2
     assert rel(q.grad, q_ref.grad) < 1e-2
     assert rel(kv.grad[:, :keys], kv_ref.grad[:, :keys]) < 1e-2
+
+
+@pytest.mark.parametrize("suffix", ["", ".weight"])
+def test_glm53_packed_hf_experts_convert_without_losing_weights(suffix):
+    prefix = "model.language_model.layers.3.mlp"
+    gate_up = torch.arange(48, dtype=torch.float32).reshape(2, 6, 4)
+    down = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+    router = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    bias = torch.tensor([0.25, 0.5])
+    shared = {
+        name: torch.full(shape, value)
+        for name, shape, value in (
+            ("gate_proj", (3, 4), 1.0),
+            ("down_proj", (4, 3), 2.0),
+            ("up_proj", (3, 4), 3.0),
+        )
+    }
+    state = {
+        f"{prefix}.experts.gate_up_proj{suffix}": gate_up.clone(),
+        f"{prefix}.experts.down_proj{suffix}": down.clone(),
+        f"{prefix}.gate.weight": router.clone(),
+        f"{prefix}.gate.e_score_correction_bias": bias.clone(),
+        **{f"{prefix}.shared_experts.{name}.weight": weight.clone() for name, weight in shared.items()},
+    }
+
+    convert_hf_layer_to_prime(state, 3)
+
+    expected = {
+        f"{prefix}.experts.w1": gate_up[:, :3],
+        f"{prefix}.experts.w2": down,
+        f"{prefix}.experts.w3": gate_up[:, 3:],
+        f"{prefix}.router.gate.weight": router,
+        f"{prefix}.expert_bias": bias,
+        **{
+            f"{prefix}.shared_expert.{prime}": shared[hf]
+            for prime, hf in (
+                ("w1", "gate_proj"),
+                ("w2", "down_proj"),
+                ("w3", "up_proj"),
+            )
+        },
+    }
+    assert state.keys() == expected.keys()
+    for name, weight in expected.items():
+        torch_assert_equal(state[name], weight)
+
+
+def test_glm53_packed_hf_state_loads_strictly_into_native_model():
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextForConditionalGeneration
+
+    from arctic_platform.model.implementations.glm53.converting_glm5_next import convert_hf_to_prime
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+
+    set_seed(0)
+    config = _tiny_config()
+    source = Glm5NextForConditionalGeneration(config)
+    native = Glm5NextForConditionalGenerationPrimeRL(config)
+    state = convert_hf_to_prime(source.state_dict())
+
+    native.load_state_dict(state, strict=True)
+
+    for name, weight in native.state_dict().items():
+        torch_assert_equal(weight, state[name])
+
+
+@pytest.mark.parametrize("suffix", ["", ".weight"])
+def test_glm53_recognizes_packed_hf_checkpoint(suffix):
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+
+    keys = dict.fromkeys([f"model.language_model.layers.3.mlp.experts.gate_up_proj{suffix}"])
+    assert Glm5NextForConditionalGenerationPrimeRL.is_hf_state_dict(keys)
+    assert not Glm5NextForConditionalGenerationPrimeRL.is_prime_state_dict(keys)
+
+
+@pytest.mark.parametrize("suffix", ["", ".weight"])
+def test_glm53_packed_hf_fp8_scales_and_other_layers_are_preserved(suffix):
+    prefix = "model.language_model.layers.3.mlp"
+    gate_up = torch.arange(48, dtype=torch.float32).reshape(2, 6, 4).to(torch.float8_e4m3fn)
+    down = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3).to(torch.float8_e4m3fn)
+    gate_up_scale = torch.arange(12, dtype=torch.float32).reshape(2, 6, 1) + 1
+    down_scale = torch.arange(8, dtype=torch.float32).reshape(2, 4, 1) + 1
+    shared_scale = torch.full((1, 1), 0.5)
+    untouched = {
+        "model.language_model.layers.13.mlp.experts.gate_up_proj": gate_up.clone(),
+        "model.language_model.layers.3.self_attn.q_proj.weight": torch.ones(4, 4),
+        "model.language_model.embed_tokens.weight": torch.ones(8, 4),
+    }
+    state = {
+        **untouched,
+        f"{prefix}.experts.gate_up_proj{suffix}": gate_up,
+        f"{prefix}.experts.gate_up_proj.weight_scale_inv": gate_up_scale,
+        f"{prefix}.experts.down_proj{suffix}": down,
+        f"{prefix}.experts.down_proj.weight_scale_inv": down_scale,
+        f"{prefix}.gate.weight": torch.ones(2, 4),
+        f"{prefix}.gate.e_score_correction_bias": torch.ones(2),
+    }
+    for name, shape in (("gate_proj", (3, 4)), ("down_proj", (4, 3)), ("up_proj", (3, 4))):
+        state[f"{prefix}.shared_experts.{name}.weight"] = torch.ones(shape).to(torch.float8_e4m3fn)
+        state[f"{prefix}.shared_experts.{name}.weight_scale_inv"] = shared_scale.clone()
+
+    convert_hf_layer_to_prime(state, 3)
+
+    for name, expected in untouched.items():
+        assert state[name] is expected
+    for projection, weight, scale in (
+        ("w1", gate_up[:, :3], gate_up_scale[:, :3]),
+        ("w2", down, down_scale),
+        ("w3", gate_up[:, 3:], gate_up_scale[:, 3:]),
+    ):
+        assert state[f"{prefix}.experts.{projection}"].dtype == torch.float8_e4m3fn
+        torch_assert_equal(state[f"{prefix}.experts.{projection}"].float(), weight.float())
+        torch_assert_equal(state[f"{prefix}.experts.{projection}_scale_inv"], scale)
+        torch_assert_equal(state[f"{prefix}.shared_expert.{projection}_scale_inv"], shared_scale)
+    assert not any(name.startswith(f"{prefix}.experts.gate_up_proj") for name in state)
+
+
+@pytest.mark.parametrize("missing_projection", ["gate_up_proj", "down_proj"])
+def test_glm53_packed_hf_fp8_rejects_missing_scales(missing_projection):
+    prefix = "model.language_model.layers.3.mlp"
+    state = {
+        f"{prefix}.experts.gate_up_proj": torch.ones(2, 6, 4).to(torch.float8_e4m3fn),
+        f"{prefix}.experts.gate_up_proj.weight_scale_inv": torch.ones(2, 6, 1),
+        f"{prefix}.experts.down_proj": torch.ones(2, 4, 3).to(torch.float8_e4m3fn),
+        f"{prefix}.experts.down_proj.weight_scale_inv": torch.ones(2, 4, 1),
+        f"{prefix}.gate.weight": torch.ones(2, 4),
+        f"{prefix}.gate.e_score_correction_bias": torch.ones(2),
+        f"{prefix}.shared_experts.gate_proj.weight": torch.ones(3, 4),
+        f"{prefix}.shared_experts.down_proj.weight": torch.ones(4, 3),
+        f"{prefix}.shared_experts.up_proj.weight": torch.ones(3, 4),
+    }
+    del state[f"{prefix}.experts.{missing_projection}.weight_scale_inv"]
+
+    with pytest.raises(ValueError, match="missing its scale"):
+        convert_hf_layer_to_prime(state, 3)

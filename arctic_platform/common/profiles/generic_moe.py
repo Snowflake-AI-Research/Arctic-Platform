@@ -39,6 +39,7 @@ def register(registry: Registry) -> None:
             "lm_head.token_chunk_size",
             "lm_head.cross_entropy",
             "moe.grouped_mm",
+            "moe.sonicmoe",
             "moe.comm_backend",
             "moe.comm_sms",
             "moe.comm_token_chunk",
@@ -49,6 +50,7 @@ def register(registry: Registry) -> None:
         unsupported={
             "numerics.fp32_parity": "no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp",
             "numerics.fp32_residual": "this loader has no fp32_residual option; only huggingface has one",
+            "numerics.fp32_routed_weighting": "no fp32_routed_weighting option; see glm5_next, qwen4_exp",
             "lm_head.vocab_chunk_size": "no equivalent option",
             "liger": "the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead",
             "compile.fullgraph": "the loader rejects `patches.compile`",

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import types
 from typing import Any
@@ -33,6 +34,35 @@ from .collectives import sequence_head_all_to_all
 logger = logging.getLogger(__name__)
 
 _CP_CONTEXT_ATTRIBUTE = "_dss_gated_delta_net_cp_context"
+
+
+def kernel_groups_value_heads(rule: Callable[..., Any] | None) -> bool:
+    """Whether ``rule`` applies grouped value attention when there are more value heads than key heads.
+
+    FLA's chunk rule does: value head ``hv`` reads key head ``hv // (HV // H)``, the assignment
+    ``repeat_interleave`` would build, and it sums dq/dk in fp32. The pure-PyTorch fallback assumes one head
+    count for q, k, v, beta and g, so q and k still have to be expanded for it.
+    """
+    fn = getattr(rule, "__func__", rule)
+    fn = getattr(fn, "__wrapped__", fn)
+    return str(getattr(fn, "__module__", "")).startswith("fla.")
+
+
+def repeat_query_key_for_value_heads(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    num_key_heads: int,
+    num_value_heads: int,
+    rule: Callable[..., Any] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand q and k to the value-head count unless ``rule`` groups value heads itself."""
+    replication = num_value_heads // num_key_heads
+    if replication > 1 and not kernel_groups_value_heads(rule):
+        query = query.repeat_interleave(replication, dim=2)
+        key = key.repeat_interleave(replication, dim=2)
+    return query, key
+
+
 # Set by the model's SP wrapper before the layer loop; see qwen35/sequence_parallel.py.
 _GLOBAL_CU_SEQLENS_ATTRIBUTE = "_dss_sp_global_cu_seqlens"
 
@@ -448,10 +478,7 @@ def head_parallel_gated_delta_net(
     beta = exchanged["b"].float().sigmoid() if fp32_beta else exchanged["b"].sigmoid()
     g = -local_A_log.float().exp() * F.softplus(exchanged["a"].float() + local_dt_bias)
 
-    replication = num_value_heads // num_key_heads
-    if replication > 1:
-        query = query.repeat_interleave(replication, dim=2)
-        key = key.repeat_interleave(replication, dim=2)
+    query, key = repeat_query_key_for_value_heads(query, key, local_key_heads, local_value_heads, gated_delta_rule)
 
     if rule_kwargs.get("initial_state") is not None:
         raise RuntimeError("head-parallel GatedDeltaNet training does not support an initial recurrent state")
@@ -630,6 +657,38 @@ def _is_gated_delta_net_module(module: nn.Module) -> bool:
         and _has_gated_delta_net_kernel_slot(module, "causal_conv1d_fn")
         and _has_gated_delta_net_kernel_slot(module, "chunk_gated_delta_rule")
     )
+
+
+def validate_packed_gated_delta_net_kernels(model: nn.Module) -> None:
+    """Reject HF hybrid fallbacks that silently ignore packed boundaries."""
+    found = False
+    for name, module in model.named_modules():
+        if not _is_gated_delta_net_module(module):
+            continue
+        found = True
+        for attribute, boundary in (
+            ("causal_conv1d_fn", "seq_idx"),
+            ("chunk_gated_delta_rule", "cu_seqlens"),
+        ):
+            kernel = _resolve_gated_delta_net_kernel(module, attribute)
+            try:
+                parameters = inspect.signature(kernel).parameters if callable(kernel) else {}
+            except (TypeError, ValueError):
+                parameters = {}
+            # The HF torch fallback accepts **kwargs but ignores cu_seqlens.
+            # Require the explicit boundary argument of the supported kernels.
+            if boundary not in parameters:
+                raise RuntimeError(
+                    f"Packed hybrid attention requires boundary-aware {attribute} "
+                    f"with explicit {boundary} at {name or '<root>'}. Install the "
+                    "supported causal-conv1d and flash-linear-attention kernels; "
+                    "the Hugging Face torch fallbacks do not isolate packed rows."
+                )
+    if not found:
+        raise RuntimeError(
+            "model configuration contains linear_attention layers, but no "
+            "compatible packed GatedDeltaNet modules were found"
+        )
 
 
 def _hidden_states_from_call(args: tuple, kwargs: dict) -> torch.Tensor:
