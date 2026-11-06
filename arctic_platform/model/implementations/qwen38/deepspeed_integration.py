@@ -25,13 +25,12 @@ from arctic_platform.model.implementations.moe.deepspeed_integration import MoED
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
 from arctic_platform.model.implementations.qwen35.config import ModelConfig
+from arctic_platform.model.implementations.qwen38 import QWEN38_ATTN_BACKEND
+from arctic_platform.model.implementations.qwen38 import QWEN38_NUM_EXPERTS
 from arctic_platform.model.implementations.qwen38.context_parallel import apply_context_parallelism
 from arctic_platform.model.implementations.qwen38.qsa_flex import apply_qsa_flex
 from arctic_platform.model.implementations.qwen38.qsa_flex import register_qsa_flex_backend
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
-
-QWEN38_NUM_EXPERTS = 512
-QWEN38_ATTN_BACKEND = "qsa_flex"
 
 
 def _build_model_config(
