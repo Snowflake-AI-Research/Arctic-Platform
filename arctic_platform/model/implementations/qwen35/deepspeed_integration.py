@@ -21,6 +21,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from .config import DebugModelConfig, ModelConfig
 from .sequence_parallel import apply_sequence_parallelism
 from .mtp_weights import iter_preserved_mtp_weights
+from .mtp_weights import iter_preserved_weights_collectively
 from .model_builder import (
     DTYPE_MAP,
     _reset_runtime_moe_buffers,
@@ -218,18 +219,15 @@ def _build_iter_full_hf_weights_with_mtp(model: nn.Module):
     ordinary = _build_iter_full_hf_weights(model)
 
     def iterator(*, include_skipped: bool = False):
-        import torch.distributed as dist
-
         names: set[str] = set()
         for name, tensor in ordinary(include_skipped=include_skipped):
             names.add(name)
             yield name, tensor
         # Finish all ordinary collectives before the serializer-only sidecar.
-        if include_skipped and dist.get_rank() == 0:
-            for name, tensor in iter_preserved_mtp_weights(model):
-                if name in names:
-                    raise RuntimeError(f"Original MTP tensor collides with live HF export: {name}")
-                yield name, tensor
+        if include_skipped:
+            yield from iter_preserved_weights_collectively(
+                model, iter_preserved_mtp_weights, names, description="Original MTP"
+            )
 
     return iterator
 

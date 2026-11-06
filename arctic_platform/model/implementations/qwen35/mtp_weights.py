@@ -251,3 +251,27 @@ def iter_preserved_mtp_weights(model: nn.Module):
         ):
             raise RuntimeError(f"Preserved original MTP tensor changed layout or dtype: {weight.name}")
         yield weight.name, tensor
+
+
+def iter_preserved_weights_collectively(model: nn.Module, iterator, emitted: set[str], *, description: str):
+    """Validate retained CPU tensors on the serializer rank and report failures to every drained peer."""
+    distributed = dist.is_initialized()
+    is_master = dist.get_rank() == 0
+    preserved = ()
+    failure: list[str | None] = [None]
+    cause = None
+    if is_master:
+        try:
+            # Materialize references, not new tensor copies, before publishing any sidecar.
+            preserved = tuple(iterator(model))
+            for name, _ in preserved:
+                if name in emitted:
+                    raise RuntimeError(f"{description} tensor collides with live HF export: {name}")
+        except Exception as exc:
+            cause = exc
+            failure[0] = f"{type(exc).__name__}: {exc}"
+    if distributed:
+        dist.broadcast_object_list(failure, src=0)
+    if failure[0] is not None:
+        raise RuntimeError(f"Cannot export preserved {description}: {failure[0]}") from cause
+    yield from preserved

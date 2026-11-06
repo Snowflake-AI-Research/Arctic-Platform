@@ -28,6 +28,7 @@ from arctic_platform.model.implementations.moe.layers.moe import BCFeedForward
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
 from arctic_platform.model.implementations.qwen35.config import ModelConfig
+from arctic_platform.model.implementations.qwen35.mtp_weights import iter_preserved_weights_collectively
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
 from .auxiliary_weights import iter_preserved_auxiliary_weights
@@ -83,11 +84,10 @@ def _build_iter_full_hf_weights_with_auxiliary(model: nn.Module):
         for name, tensor in ordinary(include_skipped=include_skipped):
             emitted.add(name)
             yield name, tensor
-        if include_skipped and torch.distributed.get_rank() == 0:
-            for name, tensor in iter_preserved_auxiliary_weights(model):
-                if name in emitted:
-                    raise RuntimeError(f"GLM prediction tensor collides with a live HF weight: {name}")
-                yield name, tensor
+        if include_skipped:
+            yield from iter_preserved_weights_collectively(
+                model, iter_preserved_auxiliary_weights, emitted, description="GLM prediction"
+            )
 
     return iterator
 
