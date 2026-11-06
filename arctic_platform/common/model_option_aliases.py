@@ -190,7 +190,7 @@ def moe_route(ep_size: int) -> bool:
 
 
 # ``TrainingConfig.ep_size``'s own type, so the rewrite reads a raw value exactly as the field will.
-_EP_SIZE = TypeAdapter(Optional[int])
+_EP_SIZE: TypeAdapter[Optional[int]] = TypeAdapter(Optional[int])
 
 
 def _moe_route(config: Mapping[str, Any]) -> bool:
@@ -915,8 +915,9 @@ def describe_resolved(config: Mapping[str, Any], *, location: str) -> str | None
     parts = []
     for key, value in sorted(options.items()):
         try:
-            alias = ALIASES[key]
-            writes = alias.writer(location)(value, config, options)
+            writer = ALIASES[key].writer(location)
+            assert writer is not None
+            writes = writer(value, config, options)
             fields = ", ".join(f"{path}={_value_at(config, path)!r}" for path, _ in writes) or "no field"
         except Exception:  # noqa: BLE001 - a log line must not stop the job
             fields = "fields not resolved"

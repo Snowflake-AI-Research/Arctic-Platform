@@ -111,7 +111,7 @@ class ModelSettings(BaseModel):
     def _require_strict_positive_chunk_size(cls, value: Any, info: ValidationInfo) -> Any:
         if value is None:
             return None
-        return _require_strict_positive_integer(value, field_name=info.field_name)
+        return _require_strict_positive_integer(value, field_name=str(info.field_name))
 
     @field_validator("prime_rl", mode="before")
     @classmethod
