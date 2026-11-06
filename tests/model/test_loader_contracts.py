@@ -275,6 +275,18 @@ def test_freeze_fp8_weights_and_scales():
     assert freeze_fp8_weights_and_scales(model) == 0
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_model_parallelism_metadata_kda_fallback_does_not_enable_linear_attention(nested):
+    text_config = dict(num_attention_heads=4, linear_attn_config=dict(num_heads=4))
+    config = dict(text_config=text_config) if nested else text_config
+
+    metadata = model_parallelism_metadata_from_config(config)
+
+    assert metadata.has_linear_attention is False
+    assert metadata.linear_num_key_heads == 4
+    assert metadata.linear_num_value_heads == 4
+
+
 class TestQwen3BoundedLossLoader(TestCasePlus):
     def test_loss_import_does_not_load_training_services(self):
         result = execute_subprocess_async(
