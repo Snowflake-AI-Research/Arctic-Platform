@@ -28,7 +28,7 @@ def single_rank_group():
         yield group
 
 
-def build_tiny_glm_sparse_model(*, kv_lora_rank=4, with_linear_attention=False):
+def build_tiny_glm_sparse_model(*, kv_lora_rank=4, with_linear_attention=False, index_head_dim=4, index_kpool=2):
     """Build the sparse GLM model shared by packed-row and attention-backend tests."""
     configuration = pytest.importorskip("transformers.models.glm5_next.configuration_glm5_next")
     modeling = pytest.importorskip("transformers.models.glm5_next.modeling_glm5_next")
@@ -58,9 +58,9 @@ def build_tiny_glm_sparse_model(*, kv_lora_rank=4, with_linear_attention=False):
         indexer_types=["full"] * len(layer_types),
         mlp_layer_types=["dense"] * len(layer_types),
         index_topk=4,
-        index_head_dim=4,
+        index_head_dim=index_head_dim,
         index_n_heads=2,
-        index_kpool=2,
+        index_kpool=index_kpool,
         linear_head_dim=128,
         linear_num_heads=2,
         linear_conv_kernel_dim=4,
