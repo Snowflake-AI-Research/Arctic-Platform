@@ -199,13 +199,17 @@ def test_plan_takes_one_replicas_subdirs_from_the_key_manifest(tmp_path):
     assert all(f.src.startswith(str(key / "replica1")) for f in files)
 
 
-def test_plan_refuses_a_skeleton_outside_the_image_source(tmp_path):
-    key = tmp_path / "elsewhere"
-    key.mkdir()
-    (key / sg._MANIFEST).write_text(json.dumps({"files": []}))
-    with pytest.raises(RuntimeError, match="not under the image source"):
-        sg.plan(str(key), str(key), "/inc", se._COPY_SUBDIRS,
-                str(tmp_path / "mirror"))
+def test_a_skeleton_outside_the_image_source_is_copied_locally(
+        tmp_path, monkeypatch, peers):
+    """Peers cannot address it, so even peer mode reads it all from the mirror."""
+    source = _published(tmp_path, str(tmp_path / "cache" / "k"))
+    started = peers(str(tmp_path / "mirror"), "ok")
+    _use(monkeypatch, started)
+    incoming = str(tmp_path / "incoming")
+    stats = _gather(source, incoming, str(tmp_path / "elsewhere"))
+    _same_subdirs(source, incoming)
+    assert started[0].requests == 0 and stats.peers == 0
+    assert stats.local_bytes == stats.total_bytes
 
 
 def test_ranges_are_dealt_round_robin_largest_first():
@@ -223,12 +227,18 @@ def test_chunk_accepts_binary_suffixes(monkeypatch):
     assert sg._env_int(sg.CHUNK_ENV, 7, sg._parse_bytes) == 7
 
 
-def test_mode_is_off_unless_peers_or_local(monkeypatch):
-    for raw, want in (("", "off"), ("off", "off"), ("peers", "peers"),
+def test_mode_defaults_to_local(monkeypatch):
+    monkeypatch.delenv(sg.MODE_ENV, raising=False)
+    assert sg.mode() == "local"
+    for raw, want in (("", "local"), ("off", "off"), ("peers", "peers"),
                       ("PEERS", "peers"), ("local", "local"), ("s3", "off")):
         monkeypatch.setenv(sg.MODE_ENV, raw)
         assert sg.mode() == want
         assert sg.enabled() is (want != "off")
+
+
+def test_engine_and_gather_name_the_same_manifest():
+    assert se._DAEMON_MANIFEST == sg._MANIFEST
 
 
 def test_direct_writes_only_aligned_heads(tmp_path, monkeypatch):
@@ -365,18 +375,39 @@ def test_materialize_gathers_when_asked(tmp_path, monkeypatch, peers, caplog):
     assert "from 2/2 peer(s)" in line and "0.00 GiB (0 range(s))" in line
 
 
-def test_materialize_without_the_switch_copies_as_before(tmp_path, monkeypatch,
-                                                         caplog):
-    model_dir = _fresh_model_dir(str(tmp_path))
-    source = _published(tmp_path, model_dir)
-    monkeypatch.delenv(sg.MODE_ENV, raising=False)
+def _materialized_line(caplog, source, model_dir):
     with caplog.at_level(logging.INFO, logger=se.logger.name):
         assert se._materialize_from_source(
             source, model_dir, _weight_root(source), _weight_hash_of(source))
     _same_subdirs(source, model_dir)
-    line = next(r.getMessage() for r in caplog.records
+    return next(r.getMessage() for r in caplog.records
                 if "semi_p: materialized" in r.getMessage())
-    assert "gathered" not in line
+
+
+def test_materialize_copies_locally_by_default(tmp_path, monkeypatch, caplog):
+    model_dir = _fresh_model_dir(str(tmp_path))
+    source = _published(tmp_path, model_dir)
+    for name in (sg.MODE_ENV, sg.SERVICE_ENV, sg.CHUNK_ENV, sg.THREADS_ENV):
+        monkeypatch.delenv(name, raising=False)
+    line = _materialized_line(caplog, source, model_dir)
+    assert "from 0/0 peer(s)" in line and "over " in line
+
+
+def test_materialize_off_copies_with_copytree(tmp_path, monkeypatch, caplog):
+    model_dir = _fresh_model_dir(str(tmp_path))
+    source = _published(tmp_path, model_dir)
+    monkeypatch.setenv(sg.MODE_ENV, "off")
+    assert "gathered" not in _materialized_line(caplog, source, model_dir)
+
+
+def test_materialize_without_a_manifest_copies_with_copytree(tmp_path,
+                                                             monkeypatch,
+                                                             caplog):
+    model_dir = _fresh_model_dir(str(tmp_path))
+    source = _published(tmp_path, model_dir)
+    os.remove(os.path.join(source, sg._MANIFEST))
+    monkeypatch.delenv(sg.MODE_ENV, raising=False)
+    assert "gathered" not in _materialized_line(caplog, source, model_dir)
 
 
 def test_a_failed_gather_is_a_cold_start_unless_strict(tmp_path, monkeypatch,
