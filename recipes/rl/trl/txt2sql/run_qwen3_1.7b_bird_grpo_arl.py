@@ -243,7 +243,7 @@ def main() -> None:
             new_bsz = max(lb_unit, -(-args.per_device_bsz // lb_unit) * lb_unit)
             print(
                 f"[e2e] zorro_load_balancer: per_device_bsz={args.per_device_bsz} is not a positive multiple of "
-                f"num_generations*training_gpus={lb_unit}; rounding UP to {new_bsz} so reorg_global_batch can hand "
+                f"num_generations*training_gpus={lb_unit}; rounding UP to {new_bsz} so balance_batch can hand "
                 f"whole prompt groups to each of {args.training_gpus} DP workers (else 'shouldn't reach here').",
                 flush=True,
             )
