@@ -175,6 +175,7 @@ def build_iter_full_hf_weights(model: nn.Module):
     import torch.distributed as dist
 
     from arctic_platform.model.implementations.moe.weights import hf_export_param_name
+    from arctic_platform.model.weight_export import materialized_parameters
     from arctic_platform.model.weight_export import wait_for_export_collective
 
     def layer_index(name: str) -> int:
@@ -270,10 +271,9 @@ def build_iter_full_hf_weights(model: nn.Module):
             if hf_name is not None:
                 by_layer.setdefault(layer_index(hf_name), []).append((hf_name, tensor))
 
-        ordered_layers = ([-1] if -1 in by_layer else []) + sorted(index for index in by_layer if index >= 0)
-        for index in ordered_layers:
+        def export_layer(index: int, tensors: list[tuple[str, torch.Tensor]]):
             layer_state: dict[str, torch.Tensor] = {}
-            for name, tensor in by_layer[index]:
+            for name, tensor in tensors:
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
                     # Only the master consumes the export: gather its EP group's shards straight into one output
@@ -290,12 +290,19 @@ def build_iter_full_hf_weights(model: nn.Module):
                     layer_state[name] = tensor.data
 
             if not is_master:
-                continue
+                return
             layer_state = {
                 name.replace("._checkpoint_wrapped_module", ""): tensor for name, tensor in layer_state.items()
             }
             convert_layer_to_hf(layer_state, index)
             yield from layer_state.items()
+
+        ordered_layers = ([-1] if -1 in by_layer else []) + sorted(index for index in by_layer if index >= 0)
+        for index in ordered_layers:
+            # Parameters the model holds elsewhere (moe/dense_shard.py's node shards) are whole only for this layer;
+            # its tensors live in export_layer's frame, which ends before the next layer is materialized.
+            with materialized_parameters(model, [tensor for _, tensor in by_layer[index]]):
+                yield from export_layer(index, by_layer[index])
 
     return iterator
 
