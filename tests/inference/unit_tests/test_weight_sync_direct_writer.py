@@ -379,6 +379,102 @@ def test_load_batched_tracks_many_sources_to_one_destination():
     assert loaded_param_l2 == {"fused_weight": 42.0}
 
 
+@pytest.mark.parametrize("buffer_dtype", [torch.int64, torch.float32])
+def test_load_batched_buffer_bytes_do_not_enter_parameter_norms(buffer_dtype):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(2))
+            self.register_buffer("lookup", torch.zeros(2, dtype=buffer_dtype))
+
+        def load_weights(self, weights):
+            destinations = set()
+            for name, tensor in weights:
+                getattr(self, name).data.copy_(tensor)
+                destinations.add(name)
+            return destinations
+
+    model = Model()
+    source_weight = torch.tensor([3.0, 4.0])
+    source_buffer = torch.tensor([100, 200], dtype=buffer_dtype)
+    loaded, received, applied, mappings, skipped = WeightSyncExtension._load_batched(
+        SimpleNamespace(device=torch.device("cpu")),
+        model,
+        _FakeEngine([("weight", source_weight), ("lookup", source_buffer)]),
+    )
+    assert loaded == 2
+    assert received == 50025.0
+    assert applied == 25.0
+    assert mappings == {"weight": ["weight"], "lookup": ["lookup"]}
+    assert skipped == []
+    assert torch.equal(model.lookup, source_buffer)
+    full, subset, parameters, loaded_parameters = _model_parameter_l2(
+        model, torch.device("cpu"), _loaded_destination_names(mappings), collect=True
+    )
+    assert full == subset == applied
+    assert parameters == loaded_parameters == {"weight": 25.0}
+
+
+@pytest.mark.parametrize("orphan", [False, True])
+def test_load_direct_uses_multimodal_loader_and_rejects_orphans(monkeypatch, orphan):
+    import arctic_platform.inference.server.weight_sync.utils as utils
+
+    def reject_direct_writer(*args):
+        pytest.fail("multimodal weights require the model's authoritative loader")
+
+    monkeypatch.setattr(utils, "_DirectParamWriter", reject_direct_writer)
+
+    class Model(nn.Module):
+        hf_to_vllm_mapper = object()
+
+        def __init__(self):
+            super().__init__()
+            self.visual = nn.Linear(2, 1, bias=False)
+            self.fused_weight = nn.Parameter(torch.zeros(4))
+            self.calls = []
+
+        def load_weights(self, weights):
+            destinations = set()
+            for name, tensor in weights:
+                self.calls.append(name)
+                if name == "model.visual.weight":
+                    self.visual.weight.data.copy_(tensor)
+                    destinations.add("visual.weight")
+                elif name == "model.language_model.part_a":
+                    self.fused_weight.data[:2].copy_(tensor)
+                    destinations.add("fused_weight")
+                elif name == "model.language_model.part_b":
+                    self.fused_weight.data[2:].copy_(tensor)
+                    destinations.add("fused_weight")
+            return destinations
+
+    model = Model()
+    receiver = WeightSyncExtension()
+    receiver.device = torch.device("cpu")
+    weights = [
+        ("model.visual.weight", torch.tensor([[2.0, 3.0]])),
+        ("model.language_model.part_a", torch.tensor([1.0, 4.0])),
+        ("model.language_model.part_b", torch.tensor([5.0, 0.0])),
+    ]
+    if orphan:
+        weights.append(("unknown.weight", torch.ones(1)))
+        with pytest.raises(AssertionError, match="unknown.weight"):
+            receiver._load_direct(model, _FakeEngine(weights))
+    else:
+        loaded, received_l2, applied_l2, mappings, skipped = receiver._load_direct(model, _FakeEngine(weights))
+        assert loaded == 3
+        assert received_l2 == applied_l2 == 55.0
+        assert skipped == []
+        assert mappings == {
+            "model.visual.weight": ["visual.weight"],
+            "model.language_model.part_a": ["fused_weight"],
+            "model.language_model.part_b": ["fused_weight"],
+        }
+        assert torch.equal(model.visual.weight, torch.tensor([[2.0, 3.0]]))
+        assert torch.equal(model.fused_weight, torch.tensor([1.0, 4.0, 5.0, 0.0]))
+    assert model.calls == [name for name, _ in weights]
+
+
 def test_model_parameter_l2_excludes_receiver_only_composite_parameters():
     class CompositeModel(nn.Module):
         def __init__(self):
@@ -400,6 +496,45 @@ def test_model_parameter_l2_excludes_receiver_only_composite_parameters():
         "vision_tower": 58.0,
     }
     assert loaded_param_l2 == {"language_model": 42.0}
+
+
+@pytest.mark.parametrize("collect", [False, True])
+@pytest.mark.parametrize("parameter_loaded", [False, True])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_model_parameter_l2_accepts_registered_buffers_without_counting_them(collect, parameter_loaded, persistent):
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.tensor([3.0, 4.0]))
+    model.ple = nn.Module()
+    model.ple.register_buffer(
+        "layer_multipliers",
+        torch.tensor([100, 200], dtype=torch.int64),
+        persistent=persistent,
+    )
+    destinations = {"ple.layer_multipliers"}
+    if parameter_loaded:
+        destinations.add("weight")
+
+    full, loaded_subset, param_l2, loaded_param_l2 = _model_parameter_l2(
+        model, torch.device("cpu"), destinations, collect=collect
+    )
+
+    assert full == 25.0
+    assert loaded_subset == (25.0 if parameter_loaded else 0.0)
+    assert param_l2 == ({"weight": 25.0} if collect else None)
+    assert loaded_param_l2 == (({"weight": 25.0} if parameter_loaded else {}) if collect else None)
+
+
+def test_model_parameter_l2_still_rejects_unknown_names_with_registered_buffers():
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.tensor([3.0, 4.0]))
+    model.register_buffer("layer_multipliers", torch.tensor([100], dtype=torch.int64))
+
+    with pytest.raises(RuntimeError, match="unknown.weight"):
+        _model_parameter_l2(
+            model,
+            torch.device("cpu"),
+            {"weight", "layer_multipliers", "unknown.weight"},
+        )
 
 
 def _expected_tensor_l2_sq(tensor: torch.Tensor) -> torch.Tensor:
@@ -447,14 +582,17 @@ def test_load_batched_counts_empty_loader_result_as_rank_skip(caplog):
             return set()
 
     result = WeightSyncExtension._load_batched(
-        SimpleNamespace(device=torch.device("cpu")),
+        SimpleNamespace(
+            device=torch.device("cpu"),
+            parallel_config=SimpleNamespace(enable_expert_parallel=True, pipeline_parallel_size=1),
+        ),
         Model(),
         _FakeEngine(
             [
                 ("weight", torch.tensor([2.0])),
                 ("non_local.weight", torch.tensor([3.0])),
             ]
-        )
+        ),
     )
 
     loaded, recv_l2_sq, applied_l2_sq, mappings, skipped = result
@@ -467,6 +605,99 @@ def test_load_batched_counts_empty_loader_result_as_rank_skip(caplog):
         caplog.records[-1]
     ]
     assert "skipped 1/2" in caplog.records[-1].getMessage()
+
+
+class _PlacesOnlyWeight(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(1))
+
+    def load_weights(self, weights):
+        name, tensor = next(iter(weights))
+        if name == "weight":
+            self.weight.data.copy_(tensor)
+            return {"weight"}
+        return set()
+
+
+@pytest.mark.parametrize(
+    "parallel_config", [None, SimpleNamespace(enable_expert_parallel=False, pipeline_parallel_size=1)]
+)
+def test_load_batched_rejects_sources_without_destination_under_tensor_parallelism(parallel_config):
+    receiver = SimpleNamespace(device=torch.device("cpu"), parallel_config=parallel_config)
+    engine = _FakeEngine([("weight", torch.tensor([2.0])), ("model.layers.0.extra.weight", torch.tensor([3.0]))])
+
+    with pytest.raises(AssertionError, match="dropped on the floor") as raised:
+        WeightSyncExtension._load_batched(receiver, _PlacesOnlyWeight(), engine)
+
+    assert "received 1/2" in str(raised.value)
+    assert "model.layers.0.extra.weight" in str(raised.value)
+    assert "LoRA" not in str(raised.value)
+
+
+def test_load_batched_names_lora_route_for_unplaced_adapter_factors():
+    receiver = SimpleNamespace(device=torch.device("cpu"))
+    adapters = [
+        "model.layers.0.self_attn.q_a_proj.lora_A.default.weight",
+        "model.layers.0.self_attn.q_a_proj.lora_B.default.weight",
+    ]
+    engine = _FakeEngine([("weight", torch.tensor([2.0]))] + [(name, torch.ones(1)) for name in adapters])
+
+    with pytest.raises(AssertionError, match="2 of them are LoRA adapter tensors") as raised:
+        WeightSyncExtension._load_batched(receiver, _PlacesOnlyWeight(), engine)
+
+    assert "weight_format='lora'" in str(raised.value)
+    assert all(name in str(raised.value) for name in adapters)
+
+
+@pytest.mark.parametrize(
+    ("enable_expert_parallel", "pipeline_parallel_size"), [(True, 1), (False, 2)], ids=["expert", "pipeline"]
+)
+def test_load_batched_returns_rank_skips_when_the_rank_holds_part_of_the_model(
+    enable_expert_parallel, pipeline_parallel_size
+):
+    receiver = SimpleNamespace(
+        device=torch.device("cpu"),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=enable_expert_parallel, pipeline_parallel_size=pipeline_parallel_size
+        ),
+    )
+    engine = _FakeEngine([("weight", torch.tensor([2.0])), ("other_rank.weight", torch.tensor([3.0]))])
+
+    *_, skipped = WeightSyncExtension._load_batched(receiver, _PlacesOnlyWeight(), engine)
+
+    assert skipped == ["other_rank.weight"]
+
+
+@pytest.mark.parametrize(
+    ("enable_expert_parallel", "pipeline_parallel_size"), [(True, 1), (False, 2)], ids=["expert", "pipeline"]
+)
+def test_mapped_direct_loading_preserves_native_rank_skips(enable_expert_parallel, pipeline_parallel_size):
+    model = _PlacesOnlyWeight()
+    model.hf_to_vllm_mapper = SimpleNamespace(orig_to_new_stacked={})
+    receiver = WeightSyncExtension()
+    receiver.device = torch.device("cpu")
+    receiver.parallel_config = SimpleNamespace(
+        enable_expert_parallel=enable_expert_parallel, pipeline_parallel_size=pipeline_parallel_size
+    )
+    engine = _FakeEngine([("weight", torch.tensor([2.0])), ("other_rank.weight", torch.tensor([3.0]))])
+
+    result = receiver._load_direct(model, engine)
+
+    assert result == (2, 13.0, 4.0, {"weight": ["weight"]}, ["other_rank.weight"])
+    torch.testing.assert_close(model.weight, torch.tensor([2.0]), rtol=0, atol=0)
+
+
+def test_mapped_direct_loading_keeps_fully_represented_rank_strict():
+    model = _PlacesOnlyWeight()
+    model.hf_to_vllm_mapper = SimpleNamespace(orig_to_new_stacked={})
+    receiver = WeightSyncExtension()
+    receiver.device = torch.device("cpu")
+    receiver.parallel_config = SimpleNamespace(enable_expert_parallel=False, pipeline_parallel_size=1)
+    engine = _FakeEngine([("weight", torch.tensor([2.0])), ("other_rank.weight", torch.tensor([3.0]))])
+
+    with pytest.raises(AssertionError, match="dropped on the floor"):
+        receiver._load_direct(model, engine)
 
 
 def test_hf_sync_of_declared_export_buffers_passes_loaded_destination_check(monkeypatch):
@@ -543,8 +774,9 @@ def test_load_direct_still_rejects_orphan_sources(monkeypatch):
 def test_load_fp8_tracks_all_received_bytes(monkeypatch):
     class FakeUpdater:
         pending = 0
+        unplaced = ()
 
-        def __init__(self, model, dtype, device) -> None:
+        def __init__(self, model, dtype, device, *, source_config=None) -> None:
             self.names = []
 
         def feed(self, name, tensor):
@@ -574,9 +806,9 @@ def test_load_fp8_tracks_all_received_bytes(monkeypatch):
 def test_fp8_updater_uses_native_weight_loader_for_tp_sharding(monkeypatch):
     from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
 
-    linear_module = types.ModuleType("vllm.model_executor.layers.linear")
+    linear_module = _install_fp8_vllm_stubs(monkeypatch)
 
-    class RowParallelLinear:
+    class RowParallelLinear(linear_module.RowParallelLinear):
         tp_rank = 3
         tp_size = 4
 
@@ -584,24 +816,17 @@ def test_fp8_updater_uses_native_weight_loader_for_tp_sharding(monkeypatch):
             param.data.copy_(loaded.narrow(1, 6, 2))
 
     linear_module.RowParallelLinear = RowParallelLinear
-    monkeypatch.setitem(
-        sys.modules, "vllm.model_executor.layers.linear", linear_module
-    )
 
     target = nn.Parameter(
         torch.zeros((4, 2), dtype=torch.float8_e4m3fn),
         requires_grad=False,
     )
     target_scale = nn.Parameter(torch.zeros((2, 1)), requires_grad=False)
-    module = RowParallelLinear()
-    updater = _FP8InplaceUpdater.__new__(_FP8InplaceUpdater)
-    updater._params = {
-        "layer.down_proj.weight": target,
-        "layer.down_proj.weight_scale_inv": target_scale,
-    }
-    updater._fp8_modules = {"layer.down_proj": module}
-    updater._bufs = {}
-    updater._shards_left = {}
+    model = nn.Module()
+    model.layer = nn.Module()
+    model.layer.down_proj = RowParallelLinear(target, tp_rank=3, tp_size=4)
+    model.layer.down_proj.weight_scale_inv = target_scale
+    updater = _FP8InplaceUpdater(model, torch.bfloat16, "cpu")
 
     full = torch.arange(32, dtype=torch.float32).reshape(4, 8).to(
         torch.float8_e4m3fn
@@ -620,6 +845,8 @@ def _install_fp8_vllm_stubs(monkeypatch):
         def __init__(self, weight, *, tp_rank=0, tp_size=1, output_partition_sizes=None):
             super().__init__()
             self.weight = weight
+            if callable(getattr(self, "weight_loader", None)):
+                self.weight.weight_loader = self.weight_loader
             self.tp_rank = tp_rank
             self.tp_size = tp_size
             if output_partition_sizes is not None:
@@ -664,10 +891,18 @@ def _frozen(tensor):
     return nn.Parameter(tensor, requires_grad=False)
 
 
-@pytest.mark.parametrize("layer", ["row", "column", "merged"])
-def test_fp8_updater_shards_scales_from_the_full_tensor(monkeypatch, layer):
+def _updater_for_layer(module, scale):
     from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
 
+    model = nn.Module()
+    model.layer = nn.Module()
+    model.layer.proj = module
+    module.weight_scale_inv = scale
+    return _FP8InplaceUpdater(model, torch.bfloat16, "cpu")
+
+
+@pytest.mark.parametrize("layer", ["row", "column", "merged"])
+def test_fp8_updater_shards_scales_from_the_full_tensor(monkeypatch, layer):
     linear = _install_fp8_vllm_stubs(monkeypatch)
     full_scale = torch.arange(48, dtype=torch.float32).reshape(8, 6)
     weight = _frozen(torch.zeros((2, 2), dtype=torch.float8_e4m3fn))
@@ -683,9 +918,7 @@ def test_fp8_updater_shards_scales_from_the_full_tensor(monkeypatch, layer):
         )
         expected = torch.cat([full_scale[2:4], full_scale[6:8]])
     target_scale = _frozen(torch.zeros(expected.T.shape))
-    updater = _FP8InplaceUpdater.__new__(_FP8InplaceUpdater)
-    updater._params = {"layer.proj.weight_scale_inv": target_scale}
-    updater._fp8_modules = {"layer.proj": module}
+    updater = _updater_for_layer(module, target_scale)
 
     updater.feed("layer.proj.weight_scale_inv", full_scale)
 
@@ -693,13 +926,9 @@ def test_fp8_updater_shards_scales_from_the_full_tensor(monkeypatch, layer):
 
 
 def test_fp8_updater_rejects_scales_that_do_not_split_across_tp(monkeypatch):
-    from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
-
     linear = _install_fp8_vllm_stubs(monkeypatch)
     weight = _frozen(torch.zeros((2, 2), dtype=torch.float8_e4m3fn))
-    updater = _FP8InplaceUpdater.__new__(_FP8InplaceUpdater)
-    updater._params = {"layer.proj.weight_scale_inv": _frozen(torch.zeros(1, 1))}
-    updater._fp8_modules = {"layer.proj": linear.RowParallelLinear(weight, tp_size=2)}
+    updater = _updater_for_layer(linear.RowParallelLinear(weight, tp_size=2), _frozen(torch.zeros(1, 1)))
 
     with pytest.raises(ValueError, match="does not split"):
         updater.feed("layer.proj.weight_scale_inv", torch.zeros(1, 3))
@@ -736,6 +965,342 @@ def test_fp8_updater_requantizes_bf16_and_copies_unquantized_layers(monkeypatch)
         model.mlp.gate_up_proj.weight_scale.data, torch.tensor([2.0])
     )
     torch.testing.assert_close(model.mlp.down_proj.weight.data, down)
+
+
+class _Fp8RoutedExperts(nn.Module):
+    """``RoutedExperts`` with block-FP8 weights; its loader records every call and copies one expert's shard."""
+
+    def __init__(self, experts=2, inter=2, hidden=4):
+        super().__init__()
+        self.w13_weight = _frozen(torch.zeros((experts, 2 * inter, hidden), dtype=torch.float8_e4m3fn))
+        self.w2_weight = _frozen(torch.zeros((experts, hidden, inter), dtype=torch.float8_e4m3fn))
+        self.w13_weight_scale_inv = _frozen(torch.zeros((experts, 2, 2)))
+        self.w2_weight_scale_inv = _frozen(torch.zeros((experts, 2, 1)))
+        self.calls = []
+
+    def _map_global_expert_id_to_local_expert_id(self, expert_id):
+        return expert_id
+
+    def weight_loader(self, param, loaded, weight_name, shard_id, expert_id, return_success=False):
+        self.calls.append((weight_name, shard_id, expert_id, tuple(loaded.shape)))
+        rows = param.shape[1] // 2
+        target = param.data[expert_id]
+        if shard_id == "w1":
+            target = target.narrow(0, 0, rows)
+        elif shard_id == "w3":
+            target = target.narrow(0, rows, rows)
+        target.copy_(loaded)
+        return True
+
+
+def test_fp8_updater_loads_lora_wrapped_fp8_experts_and_scales(monkeypatch):
+    from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+
+    _install_fp8_vllm_stubs(monkeypatch)
+    model = nn.Module()
+    model.mlp = nn.Module()
+    model.mlp.experts = nn.Module()
+    model.mlp.experts.base_layer = nn.Module()
+    experts = model.mlp.experts.base_layer.routed_experts = _Fp8RoutedExperts()
+    updater = _FP8InplaceUpdater(model, torch.bfloat16, "cpu")
+    w13 = torch.arange(32, dtype=torch.float32).reshape(2, 4, 4).to(torch.float8_e4m3fn)
+    w2 = (torch.arange(16, dtype=torch.float32).reshape(2, 4, 2) + 1).to(torch.float8_e4m3fn)
+    w13_scale = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2) + 1
+    w2_scale = torch.arange(4, dtype=torch.float32).reshape(2, 2, 1) + 1
+
+    for name, tensor in (
+        ("mlp.experts.w13_weight", w13),
+        ("mlp.experts.w2_weight", w2),
+        ("mlp.experts.w13_weight_scale_inv", w13_scale),
+        ("mlp.experts.w2_weight_scale_inv", w2_scale),
+    ):
+        updater.feed(name, tensor)
+
+    assert updater.unplaced == []
+    assert [(weight_name, shard_id) for weight_name, shard_id, _, _ in experts.calls] == [
+        *[("w13_weight", "w1"), ("w13_weight", "w3")] * 2,
+        *[("w2_weight", "w2")] * 2,
+        *[("w13_weight_scale_inv", "w1"), ("w13_weight_scale_inv", "w3")] * 2,
+        *[("w2_weight_scale_inv", "w2")] * 2,
+    ]
+    assert torch.equal(experts.w13_weight.view(torch.uint8), w13.view(torch.uint8))
+    assert torch.equal(experts.w2_weight.view(torch.uint8), w2.view(torch.uint8))
+    torch.testing.assert_close(experts.w13_weight_scale_inv.data, w13_scale)
+    torch.testing.assert_close(experts.w2_weight_scale_inv.data, w2_scale)
+
+
+def test_fused_writer_refines_block_scales_behind_a_lora_modular_quant_method():
+    from arctic_platform.inference.server.weight_sync.utils import _ShardAwareFusedWriter
+
+    experts = _Fp8RoutedExperts()
+    experts.w13_weight_scale_inv = _frozen(torch.zeros((2, 4, 2)))
+    experts.w13_weight_scale_inv.quant_method = "block"
+    # vLLM's LoRA wrapper swaps in a modular quant method that keeps the refine factor on the method it wraps.
+    experts.quant_method = SimpleNamespace(old_quant_method=SimpleNamespace(weight_scale_refine=(2, 1)))
+    model = nn.Module()
+    model.mlp = nn.Module()
+    model.mlp.experts = experts
+    writer = _ShardAwareFusedWriter(model, torch.device("cpu"))
+    scale = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
+
+    assert writer.feed("mlp.experts.w13_weight_scale_inv", scale)
+
+    torch.testing.assert_close(experts.w13_weight_scale_inv.data, scale.repeat_interleave(2, dim=1))
+
+
+@pytest.mark.parametrize("scale_first", [False, True])
+def test_fp8_dequant_staging_copies_both_transport_halves(monkeypatch, scale_first):
+    from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+
+    _install_fp8_vllm_stubs(monkeypatch)
+    model = nn.Module()
+    model.config = SimpleNamespace(quantization_config={"weight_block_size": [2, 2]})
+    model.layer = nn.Module()
+    model.layer.proj = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+    updater = _FP8InplaceUpdater(model, torch.bfloat16, "cpu")
+    weight = torch.arange(16, dtype=torch.float32).reshape(4, 4).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    expected = weight.float() * scale.repeat_interleave(2, 0).repeat_interleave(2, 1)
+    parts = [("layer.proj.weight", weight), ("layer.proj.weight_scale_inv", scale)]
+    if scale_first:
+        parts.reverse()
+    updater.feed(*parts[0])
+    parts[0][1].zero_()
+    assert updater.pending == 1
+    assert updater.unplaced == [parts[0][0]]
+    updater.feed(*parts[1])
+    parts[1][1].zero_()
+
+    assert updater.pending == 0
+    assert updater.unplaced == []
+    torch.testing.assert_close(model.layer.proj.weight, expected.to(torch.bfloat16), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("part", ["weight", "weight_scale_inv"])
+def test_fp8_dequant_rejects_duplicate_halves(monkeypatch, part):
+    from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+
+    _install_fp8_vllm_stubs(monkeypatch)
+    model = nn.Module()
+    model.layer = nn.Module()
+    model.layer.proj = nn.Linear(4, 4, bias=False)
+    updater = _FP8InplaceUpdater(model, torch.bfloat16, "cpu")
+    tensor = torch.ones(4, 4).to(torch.float8_e4m3fn) if part == "weight" else torch.ones(2, 2)
+    updater.feed(f"layer.proj.{part}", tensor)
+    with pytest.raises(ValueError, match="arrived twice"):
+        updater.feed(f"layer.proj.{part}", tensor)
+
+
+@pytest.mark.parametrize("shape", [(0, 0), (2, 0), (0, 2), (2,), (1, 1, 1), (3, 2)])
+def test_fp8_dequant_rejects_invalid_scale_layout(shape):
+    from arctic_platform.inference.server.weight_sync.utils import _dequant_fp8_block
+
+    weight = torch.ones(4, 4).to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="scale shape"):
+        _dequant_fp8_block(weight, torch.ones(shape), torch.bfloat16, block_size=(2, 2))
+
+
+@pytest.mark.parametrize("shape", [(4, 5), (5, 4), (5, 5)], ids=["input-tail", "output-tail", "both-tails"])
+def test_fp8_dequant_uses_declared_block_shape_for_partial_axes(shape):
+    from arctic_platform.inference.server.weight_sync.utils import _dequant_fp8_block
+
+    weight = torch.arange(shape[0] * shape[1], dtype=torch.float32).reshape(shape).to(torch.float8_e4m3fn)
+    scale = torch.arange(1, -(-shape[0] // 2) * -(-shape[1] // 2) + 1, dtype=torch.float32).reshape(
+        -(-shape[0] // 2), -(-shape[1] // 2)
+    )
+    expected = weight.float() * scale.repeat_interleave(2, 0).repeat_interleave(2, 1)[: shape[0], : shape[1]]
+
+    actual = _dequant_fp8_block(weight, scale, torch.bfloat16, block_size=(2, 2))
+
+    torch.testing.assert_close(actual, expected.to(torch.bfloat16), rtol=0, atol=0)
+
+
+def test_fp8_dequant_input_tail_flows_from_model_checkpoint_contract(monkeypatch):
+    from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+
+    _install_fp8_vllm_stubs(monkeypatch)
+    model = nn.Module()
+    model.config = SimpleNamespace(quantization_config={"weight_block_size": [2, 2]})
+    model.proj = nn.Linear(5, 4, bias=False, dtype=torch.bfloat16)
+    updater = _FP8InplaceUpdater(model, torch.bfloat16, "cpu")
+    weight = torch.arange(20, dtype=torch.float32).reshape(4, 5).to(torch.float8_e4m3fn)
+    scale = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
+    expected = weight.float() * scale.repeat_interleave(2, 0).repeat_interleave(2, 1)[:, :5]
+
+    updater.feed("proj.weight_scale_inv", scale)
+    updater.feed("proj.weight", weight)
+
+    assert updater.pending == 0
+    assert updater.unplaced == []
+    torch.testing.assert_close(model.proj.weight, expected.to(torch.bfloat16), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("block_size", [None, [], [2], [2, 0], [True, 2], [2.0, 2], "2,2"])
+def test_fp8_dequant_requires_valid_declared_block_contract(block_size):
+    from arctic_platform.inference.server.weight_sync.utils import _dequant_fp8_block
+
+    with pytest.raises(ValueError, match="declared positive two-axis"):
+        _dequant_fp8_block(torch.ones(4, 5), torch.ones(2, 3), torch.bfloat16, block_size=block_size)
+
+
+def test_fp8_dequant_preserves_rectangular_checkpoint_block_contract():
+    from arctic_platform.inference.server.weight_sync.utils import _dequant_fp8_block
+
+    weight = torch.ones(5, 7).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
+    expected = scale.repeat_interleave(2, 0).repeat_interleave(3, 1)[:5, :7]
+
+    actual = _dequant_fp8_block(weight, scale, torch.bfloat16, block_size=(2, 3))
+
+    torch.testing.assert_close(actual, expected.to(torch.bfloat16), rtol=0, atol=0)
+
+
+def test_fp8_receiver_passes_original_hf_checkpoint_block_contract(monkeypatch):
+    from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+
+    _install_fp8_vllm_stubs(monkeypatch)
+    model = nn.Module()
+    model.proj = nn.Linear(5, 4, bias=False, dtype=torch.bfloat16)
+    receiver = SimpleNamespace(
+        device=torch.device("cpu"),
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            hf_config=SimpleNamespace(text_config=SimpleNamespace(quantization_config={"weight_block_size": [2, 2]})),
+        ),
+    )
+    # Only the receiver's source-bound config has this metadata; the model is a served unquantized projection.
+    assert not hasattr(model, "config")
+    weight = torch.ones(4, 5).to(torch.float8_e4m3fn)
+    scale = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
+
+    loaded, _ = WeightSyncExtension._load_fp8(
+        receiver, model, _FakeEngine([("proj.weight", weight), ("proj.weight_scale_inv", scale)])
+    )
+
+    assert loaded == 2
+    torch.testing.assert_close(
+        model.proj.weight,
+        scale.repeat_interleave(2, 0).repeat_interleave(2, 1)[:, :5].to(torch.bfloat16),
+        rtol=0,
+        atol=0,
+    )
+    assert _FP8InplaceUpdater(model, torch.bfloat16, "cpu").pending == 0
+
+
+def test_fp8_dequant_loads_fused_projection_and_zero_pads_omitted_nope_rows(monkeypatch):
+    from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+
+    linear = _install_fp8_vllm_stubs(monkeypatch)
+    model = nn.Module()
+    model.config = SimpleNamespace(quantization_config={"weight_block_size": [2, 2]})
+    model.attn = nn.Module()
+    module = model.attn.fused_qkv_a_proj = linear.MergedColumnParallelLinear(_frozen(torch.zeros(8, 4)))
+    module.output_sizes = [4, 4]
+    updater = _FP8InplaceUpdater(model, torch.bfloat16, "cpu")
+    q = torch.ones(4, 4).to(torch.float8_e4m3fn)
+    kv = torch.full((2, 4), 3.0).to(torch.float8_e4m3fn)
+    for name, tensor in [
+        ("attn.q_a_proj.weight_scale_inv", torch.full((2, 2), 2.0)),
+        ("attn.q_a_proj.weight", q),
+        ("attn.kv_a_proj_with_mqa.weight", kv),
+        ("attn.kv_a_proj_with_mqa.weight_scale_inv", torch.full((1, 2), 4.0)),
+    ]:
+        updater.feed(name, tensor)
+
+    expected = torch.cat([torch.full((4, 4), 2.0), torch.full((2, 4), 12.0), torch.zeros(2, 4)])
+    torch.testing.assert_close(module.weight, expected, rtol=0, atol=0)
+    assert updater.pending == 0
+    assert updater.unplaced == []
+
+
+def test_fused_writer_refuses_ambiguous_canonical_wrapper_aliases():
+    from arctic_platform.inference.server.weight_sync.utils import _ShardAwareFusedWriter
+
+    model = nn.Module()
+    model.mlp = nn.Module()
+    model.mlp.experts = nn.Module()
+    model.mlp.experts.base_layer = _Fp8RoutedExperts()
+    model.mlp.experts._checkpoint_wrapped_module = _Fp8RoutedExperts()
+    writer = _ShardAwareFusedWriter(model, "cpu")
+
+    assert writer.family("mlp.experts.w13_weight") is None
+    assert not writer.feed("mlp.experts.w13_weight", torch.zeros(2, 4, 4))
+    assert writer.destination_name("mlp.experts.base_layer.w13_weight") == "mlp.experts.base_layer.w13_weight"
+
+
+def test_fused_writer_resolves_checkpoint_wrapped_gdn_parent(monkeypatch):
+    from arctic_platform.inference.server.weight_sync.utils import _ShardAwareFusedWriter
+
+    linear = _install_fp8_vllm_stubs(monkeypatch)
+
+    class GatedDeltaNetAttention(nn.Module):
+        pass
+
+    class Projection(linear.MergedColumnParallelLinear):
+        def weight_loader(self, param, tensor):
+            param.data.copy_(tensor)
+
+    gdn_module = types.ModuleType("vllm.model_executor.layers.mamba.gdn.base")
+    gdn_module.GatedDeltaNetAttention = GatedDeltaNetAttention
+    monkeypatch.setitem(sys.modules, gdn_module.__name__, gdn_module)
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Module()])
+    layer = model.layers[0]._checkpoint_wrapped_module = nn.Module()
+    layer.self_attn = GatedDeltaNetAttention()
+    projection = layer.self_attn.in_proj_ba = Projection(_frozen(torch.zeros(4, 4)))
+    writer = _ShardAwareFusedWriter(model, "cpu")
+    tensor = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+
+    assert writer.feed("layers.0.self_attn.in_proj_ba.weight", tensor)
+    torch.testing.assert_close(projection.weight, tensor, rtol=0, atol=0)
+
+
+def test_load_fp8_rejects_incomplete_requantization(monkeypatch):
+    import arctic_platform.inference.server.weight_sync.utils as utils
+
+    class IncompleteUpdater:
+        pending = 1
+        unplaced = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def feed(self, *args):
+            pass
+
+    monkeypatch.setattr(utils, "_FP8InplaceUpdater", IncompleteUpdater)
+    with pytest.raises(RuntimeError, match="incomplete"):
+        WeightSyncExtension._load_fp8(
+            SimpleNamespace(device="cpu", model_config=SimpleNamespace(dtype=torch.bfloat16)),
+            object(),
+            _FakeEngine([("layer.gate_proj.weight", torch.ones(2, 2))]),
+        )
+
+
+def test_load_fp8_rejects_tensors_that_reach_no_parameter(monkeypatch):
+    class FakeUpdater:
+        pending = 0
+
+        def __init__(self, model, dtype, device, *, source_config=None) -> None:
+            self.unplaced = []
+
+        def feed(self, name, tensor):
+            self.unplaced.append(name)
+
+    import arctic_platform.inference.server.weight_sync.utils as utils
+
+    monkeypatch.setattr(utils, "_FP8InplaceUpdater", FakeUpdater)
+    with pytest.raises(RuntimeError, match="1 of them are LoRA adapter tensors"):
+        WeightSyncExtension._load_fp8(
+            SimpleNamespace(device=torch.device("cpu"), model_config=SimpleNamespace(dtype=torch.bfloat16)),
+            object(),
+            _FakeEngine(
+                [
+                    ("layer.o_proj.lora_A.default.weight", torch.ones(2)),
+                    ("layer.missing.weight", torch.ones(1)),
+                ]
+            ),
+        )
 
 
 def test_fused_writer_reports_canonical_moe_destination():
