@@ -32,6 +32,9 @@ from weakref import WeakKeyDictionary
 import torch
 import torch.nn as nn
 
+from arctic_platform.debug.weight_sync import maybe_bind_broadcast_trainer_inventory
+from arctic_platform.debug.weight_sync import maybe_complete_broadcast_trainer_inventory
+
 WeightFormat = Literal["hf", "vllm", "lora"]
 WeightIterator = Iterator[tuple[str, torch.Tensor]]
 WeightIteratorBuilder = Callable[[nn.Module], Callable[..., WeightIterator]]
@@ -502,7 +505,11 @@ def validate_lora_sync_trainable_parameters(model: nn.Module) -> None:
 
 
 def validate_full_weight_sync_source(model: nn.Module, weight_format: WeightFormat) -> None:
-    """Refuse full-weight synchronization when the model trains LoRA adapters."""
+    """Refuse a full-weight sync stream from a model that trains LoRA adapters.
+
+    A ``"vllm"`` or ``"hf"`` receiver writes tensors onto vLLM parameters by name. The sampler keeps adapters in its
+    LoRA manager, so the adapter factors reach no parameter and the sampler keeps serving the base model.
+    """
     from arctic_platform.model.patches.peft import is_peft_lora_param
 
     adapters = [name for name, parameter in model.named_parameters() if is_peft_lora_param(name, parameter)]
@@ -707,8 +714,9 @@ def iter_model_weights(
     ``"vllm"`` (direct copy), and in the checkpoint's layout for ``"hf"`` (see
     :func:`hf_sync_name_map`, which uses ``checkpoint_dir`` when given).
 
-    ``include_skipped=True`` exports the unmerged PEFT base for a weights-only checkpoint.
-    Other full-weight streams refuse trainable LoRA adapters; synchronize those with ``weight_format="lora"``.
+    ``include_skipped=True`` is the weights-only checkpoint export, which writes the unmerged base of a PEFT model
+    beside its separately saved adapter pack. Every other ``"hf"`` or ``"vllm"`` stream feeds a sampler, so a model
+    with trainable LoRA parameters is refused there (see :func:`validate_full_weight_sync_source`).
     """
     if weight_format not in ("hf", "vllm", "lora"):
         raise ValueError(f"weight_format must be 'hf', 'vllm', or 'lora'; got {weight_format!r}")
@@ -716,8 +724,10 @@ def iter_model_weights(
         raise ValueError("include_skipped is only supported for weight_format='hf'")
     if weight_format != "lora" and not include_skipped:
         validate_full_weight_sync_source(model, weight_format)
+    maybe_bind_broadcast_trainer_inventory(model, is_master=is_master, is_zero3=is_zero3)
     if weight_format == "lora":
         yield from iter_lora_weights(model, is_master=is_master, is_zero3=is_zero3)
+        maybe_complete_broadcast_trainer_inventory(model, is_master=is_master)
         return
 
     contract = weight_export_contract(model)
@@ -727,6 +737,7 @@ def iter_model_weights(
             raise NotImplementedError(f"weight_format={weight_format!r} does not support ZeRO-3")
         iterator = builder(_family_model_for_export(model))
         yield from (iterator(include_skipped=True) if weight_format == "hf" and include_skipped else iterator())
+        maybe_complete_broadcast_trainer_inventory(model, is_master=is_master)
         return
 
     if weight_format == "vllm" and contract is not None:
@@ -738,3 +749,4 @@ def iter_model_weights(
         is_zero3=is_zero3,
         checkpoint_dir=checkpoint_dir,
     )
+    maybe_complete_broadcast_trainer_inventory(model, is_master=is_master)

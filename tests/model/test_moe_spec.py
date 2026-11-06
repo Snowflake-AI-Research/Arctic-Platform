@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 from types import SimpleNamespace
 
@@ -44,6 +45,17 @@ def test_text_model_type_reads_a_nested_glm_config(tmp_path):
         {"model_type": "glm4v_moe", "text_config": {"model_type": "glm_moe_dsa"}},
     )
     assert hf_text_model_type(checkpoint) == "glm_moe_dsa"
+    assert is_glm_moe_model(checkpoint)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_glm53_uses_the_glm_moe_training_policy(tmp_path, nested):
+    payload = {"model_type": "glm5_next_text"}
+    if nested:
+        payload = {"model_type": "glm5_next", "text_config": payload}
+    checkpoint = _write_config(tmp_path / "glm53", payload)
+
+    assert hf_text_model_type(checkpoint) == "glm5_next_text"
     assert is_glm_moe_model(checkpoint)
 
 
@@ -180,6 +192,62 @@ def test_flash_moe_text_config_preserves_training_options(tmp_path, family, atte
     assert spec.loader_options["debug"]["full_determinism"] is True
 
 
+@pytest.mark.parametrize(
+    "attention,ep_size,error",
+    [
+        (None, 16, None),
+        ("qsa_flex", 16, None),
+        ("flex_attention", 16, None),
+        ("sdpa", 16, "requires QSA FlexAttention"),
+        ("qsa_flex", 3, "must divide 512"),
+    ],
+)
+def test_qwen38_spec_validation_does_not_import_training(tmp_path, monkeypatch, attention, ep_size, error):
+    checkpoint = _write_config(tmp_path / "qwen38", {"model_type": "qwen4_exp"})
+    original_import = builtins.__import__
+
+    def reject_training_import(name, *args, **kwargs):
+        if name.startswith("arctic_platform.model.implementations.qwen38.deepspeed_integration"):
+            raise AssertionError("Qwen3.8 spec validation must not import the training implementation")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_training_import)
+    options = {} if attention is None else {"attn": attention}
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            moe_model_spec(model_name=checkpoint, ep_size=ep_size, loader_options=options)
+    else:
+        spec = moe_model_spec(model_name=checkpoint, ep_size=ep_size, loader_options=options)
+        assert spec.attn_implementation == ("qsa_flex" if attention is None else attention)
+        assert spec.parallelism.expert_parallel == ep_size
+
+
+@pytest.mark.parametrize("attention", [None, "sparse_mla", "flashinfer", "flashmla", "sdpa"])
+def test_glm53_spec_validation_does_not_import_training(tmp_path, monkeypatch, attention):
+    checkpoint = _write_config(tmp_path / "glm53", {"model_type": "glm5_next"})
+    original_import = builtins.__import__
+
+    def reject_training_import(name, *args, **kwargs):
+        if name.startswith(
+            (
+                "arctic_platform.model.implementations.glm53.deepspeed_integration",
+                "arctic_platform.model.implementations.glm53.context_parallel",
+            )
+        ):
+            raise AssertionError("GLM-5.3 spec validation must not import the training implementation")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_training_import)
+    options = {} if attention is None else {"attn": attention}
+    if attention == "sdpa":
+        with pytest.raises(ValueError, match="requires sparse MLA"):
+            moe_model_spec(model_name=checkpoint, ep_size=16, sp_size=16, loader_options=options)
+    else:
+        spec = moe_model_spec(model_name=checkpoint, ep_size=16, sp_size=16, loader_options=options)
+        assert spec.attn_implementation == ("sparse_mla" if attention is None else attention)
+        assert spec.parallelism.expert_parallel == spec.parallelism.sequence_parallel == 16
+
+
 def test_qwen_spec_lifts_dtype_attention_and_parallelism(tmp_path):
     checkpoint = _write_config(tmp_path / "qwen", {"model_type": "qwen3_5_moe"})
     spec = moe_model_spec(
@@ -252,14 +320,3 @@ def test_glm_spec_rejects_sequence_parallelism(tmp_path):
     checkpoint = _write_config(tmp_path / "glm", {"model_type": "glm_moe_dsa"})
     with pytest.raises(ValueError, match="glm_moe_dsa does not support sequence parallelism"):
         moe_model_spec(model_name=checkpoint, ep_size=8, sp_size=2)
-
-
-@pytest.mark.parametrize("nested", [False, True])
-def test_glm53_uses_the_glm_moe_training_policy(tmp_path, nested):
-    payload = {"model_type": "glm5_next_text"}
-    if nested:
-        payload = {"model_type": "glm5_next", "text_config": payload}
-    checkpoint = _write_config(tmp_path / "glm53", payload)
-
-    assert hf_text_model_type(checkpoint) == "glm5_next_text"
-    assert is_glm_moe_model(checkpoint)

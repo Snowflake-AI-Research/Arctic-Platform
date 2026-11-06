@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import types
 
 import pytest
 import torch
@@ -22,6 +21,7 @@ from arctic_platform.testing_utils import get_unique_port_number
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import require_torch_multi_gpu
 from arctic_platform.testing_utils import reserve_free_port
+from arctic_platform.testing_utils import unfused_causal_conv1d_module
 
 pytest.importorskip("transformers.models.glm5_next")
 
@@ -253,23 +253,6 @@ def test_glm53_head_parallel_kda_requires_global_cu_seqlens(tiny_glm_sparse_mode
         cp._linear_attention_forward(attention, hidden_states)
 
 
-def _unfused_causal_conv1d_module(global_cu_seqlens):
-    from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _fallback_depthwise_causal_convolution
-
-    def causal_conv1d_fn(x, weight, bias, activation, seq_idx):
-        return _fallback_depthwise_causal_convolution(
-            x,
-            weight=weight,
-            bias=bias,
-            activation=activation,
-            global_cu_seqlens=global_cu_seqlens,
-        )
-
-    module = types.ModuleType("causal_conv1d")
-    module.causal_conv1d_fn = causal_conv1d_fn
-    return module
-
-
 def _head_parallel_kda_worker(rank, world_size, rendezvous, fallback_convolution):
     import sys
     from datetime import timedelta
@@ -278,7 +261,7 @@ def _head_parallel_kda_worker(rank, world_size, rendezvous, fallback_convolution
     import torch.distributed as dist
 
     from arctic_platform.model.implementations.glm53 import context_parallel as cp
-    from tests.model.conftest import build_tiny_glm_sparse_model
+    from arctic_platform.testing_utils import build_tiny_glm_sparse_model
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -314,7 +297,7 @@ def _head_parallel_kda_worker(rank, world_size, rendezvous, fallback_convolution
 
         # The fallback case must not need a loadable causal_conv1d, including for the local reference.
         reference_modules = (
-            {"causal_conv1d": _unfused_causal_conv1d_module(global_cu_seqlens)} if fallback_convolution else {}
+            {"causal_conv1d": unfused_causal_conv1d_module(global_cu_seqlens)} if fallback_convolution else {}
         )
         with patch.dict(sys.modules, reference_modules):
             local_output, local_input_gradient, local_gradients = run(

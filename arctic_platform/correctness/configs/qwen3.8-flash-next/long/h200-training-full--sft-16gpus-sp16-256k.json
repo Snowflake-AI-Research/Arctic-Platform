@@ -1,0 +1,74 @@
+{
+  "model_name": "Qwen/Qwen3.8-Flash-Next",
+  "dtype": "bfloat16",
+  "seed": 42,
+  "max_seq_len": 262144,
+  "training_gpus": 16,
+  "sampling_gpus": 0,
+  "log_prob_gpus": 0,
+  "training": {
+    "ds_config": {
+      "train_batch_size": 1,
+      "train_micro_batch_size_per_gpu": 1,
+      "gradient_accumulation_steps": 1,
+      "gradient_clipping": 1.0,
+      "optimizer": {
+        "type": "AdamW",
+        "params": {
+          "lr": 2e-05,
+          "weight_decay": 0.0,
+          "betas": [0.9, 0.999],
+          "eps": 1e-08
+        }
+      },
+      "zero_optimization": {
+        "stage": 2,
+        "offload_optimizer": {
+          "device": "cpu",
+          "pin_memory": false
+        }
+      },
+      "bf16": {
+        "enabled": true
+      }
+    },
+    "ds_worker_config": {
+      "model_provider": "prime_rl",
+      "attn_implementation": "qsa_flex",
+      "cuda_allocator_conf": "expandable_segments:True",
+      "activation_checkpointing": true,
+      "sp_size": 16,
+      "ep_size": 8,
+      "ep_group_layout": "auto",
+      "mb_spec": {
+        "max_tokens_per_mb": 262144
+      },
+      "ac_config": {
+        "mode": "full",
+        "freq": 1,
+        "router_replay_recompute": true,
+        "offload_config": {
+          "enabled": false,
+          "keep_last_n": 1,
+          "use_streams": true,
+          "pin_memory_enabled": true,
+          "pin_memory_max_size_gib": "auto",
+          "pin_memory_bucket_size_mib": 64
+        }
+      },
+      "tiled_mlp_token_chunk_size": null,
+      "deepep_token_chunk_size": 8192,
+      "fp32_lm_head": false,
+      "step_peak_memory_log": true,
+      "training_memory_telemetry": false
+    }
+  },
+  "sampling": {},
+  "backend": {
+    "type": "remote",
+    "protocol": "cortex",
+    "base_url": "http://127.0.0.1:8003",
+    "database": "dev",
+    "schema": "dev"
+  }
+}

@@ -20,6 +20,7 @@ import functools
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
+from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -76,6 +77,11 @@ def model_parallelism_metadata_from_config(
         text_config = config
 
     linear_attn_config = text_config.get("linear_attn_config")
+    linear_num_heads = text_config.get("linear_num_heads")
+    if linear_num_heads is None and text_config is not config:
+        linear_num_heads = config.get("linear_num_heads")
+    if isinstance(linear_attn_config, Mapping) and linear_attn_config.get("num_heads") is not None:
+        linear_num_heads = linear_attn_config["num_heads"]
 
     def positive_int(
         name: str,
@@ -104,6 +110,7 @@ def model_parallelism_metadata_from_config(
         "linear_attention" in layer_types
         or "linear_num_key_heads" in text_config
         or "linear_num_value_heads" in text_config
+        or linear_num_heads is not None
     )
     num_attention_heads = positive_int("num_attention_heads", required=True)
     assert num_attention_heads is not None
@@ -115,12 +122,12 @@ def model_parallelism_metadata_from_config(
         linear_num_key_heads=positive_int(
             "linear_num_key_heads",
             required=has_linear_attention,
-            fallback=(linear_attn_config.get("num_heads") if isinstance(linear_attn_config, Mapping) else None),
+            fallback=linear_num_heads,
         ),
         linear_num_value_heads=positive_int(
             "linear_num_value_heads",
             required=has_linear_attention,
-            fallback=(linear_attn_config.get("num_heads") if isinstance(linear_attn_config, Mapping) else None),
+            fallback=linear_num_heads,
         ),
     )
 
@@ -225,6 +232,8 @@ class LoadedModel:
 Loader = Callable[[LoaderContext], LoadedModel]
 Matcher = Callable[[LoaderContext], bool]
 SpecValidator = Callable[[ModelSpec], None]
+# ``(spec, *, world_size, rank, local_rank) -> converted-weight cache dir | None``
+WeightPreparer = Callable[..., Path | None]
 
 
 @dataclass
@@ -233,6 +242,7 @@ class _LoaderEntry:
     matches: Matcher | None
     options: type[BaseModel] | None = None
     validate_spec: SpecValidator | None = None
+    prepare_weights: WeightPreparer | None = None
 
 
 _LOADERS: dict[str, _LoaderEntry] = {}
@@ -245,11 +255,14 @@ def register_loader(
     default: bool = False,
     options: type[BaseModel] | None = None,
     validate_spec: SpecValidator | None = None,
+    prepare_weights: WeightPreparer | None = None,
 ) -> Callable[[Loader], Loader]:
     """Register a loader by name.
 
     Optionally give it a ``matches`` predicate, mark it the ``default``, or attach an
     ``options`` pydantic model used to validate ``ModelSpec.loader_options``.
+    ``prepare_weights`` converts the checkpoint into the loader's cache without a process group; see
+    ``prepare_model_weights``.
     """
 
     def decorator(fn: Loader) -> Loader:
@@ -263,6 +276,7 @@ def register_loader(
             matches=matches,
             options=options,
             validate_spec=validate_spec,
+            prepare_weights=prepare_weights,
         )
         return fn
 
@@ -296,6 +310,21 @@ def resolve_loader_name(spec: ModelSpec) -> str:
 
     assert _DEFAULT_LOADER is not None, "no default loader registered"
     return _DEFAULT_LOADER
+
+
+def prepare_model_weights(spec: ModelSpec, *, world_size: int, rank: int, local_rank: int) -> Path | None:
+    """Fill the converted-weight cache ``build_model(spec)`` will load from, on this node, without a process group.
+
+    ``world_size`` is the training job's process count; ``rank`` and ``local_rank`` name the process the cache
+    writer is chosen by (rank 0 for a shared cache, local rank 0 for a node-local one). Returns the cache path, or
+    None when the spec's loader converts nothing.
+    """
+    name = spec.loader
+    assert name is not None, "spec.loader must be resolved before prepare_model_weights"
+    prepare = _LOADERS[name].prepare_weights
+    if prepare is None:
+        return None
+    return prepare(spec, world_size=world_size, rank=rank, local_rank=local_rank)
 
 
 def select_loader(ctx: LoaderContext) -> Loader:

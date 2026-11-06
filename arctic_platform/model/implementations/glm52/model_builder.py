@@ -15,41 +15,42 @@ from huggingface_hub import snapshot_download
 from torch import Tensor
 from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
 from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
-from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, PretrainedConfig
+from transformers import AutoConfig
+from transformers import AutoModelForCausalLM
+from transformers import GenerationConfig
+from transformers import PretrainedConfig
 
-from arctic_platform.model.implementations.moe.conversion_cache import (
-    WEIGHT_CONVERSION_CACHE_SCOPE_ENV,
-    conversion_cache_is_node_local,
-    conversion_cache_ready,
-    ensure_node_local_conversion_cache,
-    resolve_conversion_cache_path,
-    _write_conversion_cache,
-)
-from arctic_platform.model.implementations.moe.logging_utils import get_logger
-from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
-from arctic_platform.model.implementations.moe.layers.checkpointing import (
-    get_supported_targets,
-    set_selective_activation_checkpointing,
-    supports_selective_activation_checkpointing,
-)
-from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, MoE, install_combine_replay
-from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
-from arctic_platform.model.implementations.moe.vlm import get_language_model, is_vlm_architecture
-from arctic_platform.model.implementations.moe.weights import load_state_dict, load_state_dict_keys, save_state_dict
-from arctic_platform.model.implementations.moe.world import get_world
 from arctic_platform.model.implementations.debug.determinism import CHECKPOINT_PRESERVE_RNG_STATE
-
-from .config import ActivationCheckpointConfig, ModelConfig
+from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
+from arctic_platform.model.implementations.moe.conversion_cache import WEIGHT_CONVERSION_CACHE_SCOPE_ENV
+from arctic_platform.model.implementations.moe.conversion_cache import _write_conversion_cache
+from arctic_platform.model.implementations.moe.conversion_cache import conversion_cache_is_node_local
+from arctic_platform.model.implementations.moe.conversion_cache import conversion_cache_ready
+from arctic_platform.model.implementations.moe.conversion_cache import ensure_node_local_conversion_cache
+from arctic_platform.model.implementations.moe.conversion_cache import resolve_conversion_cache_path
 from arctic_platform.model.implementations.moe.distributed.ep_backend import uses_dispatch_ep
-from .models import (
-    AutoModelForCausalLMPrimeRL,
-    get_custom_vlm_cls,
-    supports_custom_impl,
-)
-from .models.glm_moe_dsa.debug_overrides import (
-    apply_glm_moe_dsa_debug_overrides,
-    estimate_glm_moe_dsa_params,
-)
+from arctic_platform.model.implementations.moe.layers.checkpointing import get_supported_targets
+from arctic_platform.model.implementations.moe.layers.checkpointing import set_selective_activation_checkpointing
+from arctic_platform.model.implementations.moe.layers.checkpointing import supports_selective_activation_checkpointing
+from arctic_platform.model.implementations.moe.layers.moe import LatentMoE
+from arctic_platform.model.implementations.moe.layers.moe import MoE
+from arctic_platform.model.implementations.moe.layers.moe import install_combine_replay
+from arctic_platform.model.implementations.moe.logging_utils import get_logger
+from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
+from arctic_platform.model.implementations.moe.vlm import get_language_model
+from arctic_platform.model.implementations.moe.vlm import is_vlm_architecture
+from arctic_platform.model.implementations.moe.weights import load_state_dict
+from arctic_platform.model.implementations.moe.weights import load_state_dict_keys
+from arctic_platform.model.implementations.moe.weights import save_state_dict
+from arctic_platform.model.implementations.moe.world import get_world
+
+from .config import ActivationCheckpointConfig
+from .config import ModelConfig
+from .models import AutoModelForCausalLMPrimeRL
+from .models import get_custom_vlm_cls
+from .models import supports_custom_impl
+from .models.glm_moe_dsa.debug_overrides import apply_glm_moe_dsa_debug_overrides
+from .models.glm_moe_dsa.debug_overrides import estimate_glm_moe_dsa_params
 
 DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
@@ -78,14 +79,10 @@ def configure_moe_ep_backend(model: nn.Module, config: ModelConfig) -> None:
 
 
 def configure_sparse_mla_backend(config: ModelConfig) -> None:
-    from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import (
-        set_sparse_mla_backend,
-    )
+    from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import set_sparse_mla_backend
 
     resolved = set_sparse_mla_backend(config.sparse_mla_backend)
-    get_logger().info(
-        f"Sparse MLA backend: {resolved} (requested={config.sparse_mla_backend})"
-    )
+    get_logger().info(f"Sparse MLA backend: {resolved} (requested={config.sparse_mla_backend})")
 
 
 def get_model(
@@ -116,7 +113,11 @@ def get_model(
         pad_token_id = next(
             (
                 v
-                for v in [gen_config.pad_token_id, gen_config.eos_token_id, getattr(model_config, "eos_token_id", None)]
+                for v in [
+                    gen_config.pad_token_id,
+                    gen_config.eos_token_id,
+                    getattr(model_config, "eos_token_id", None),
+                ]
                 if v is not None
             ),
             None,
@@ -134,9 +135,7 @@ def get_model(
     apply_glm_moe_dsa_debug_overrides(target_config, config.debug, logger=logger)
     is_glm_moe_dsa = getattr(target_config, "model_type", None) == "glm_moe_dsa"
     if is_glm_moe_dsa and (
-        config.debug.hidden_size is not None
-        or config.debug.num_layers is not None
-        or config.debug.random_init
+        config.debug.hidden_size is not None or config.debug.num_layers is not None or config.debug.random_init
     ):
         est_b = estimate_glm_moe_dsa_params(target_config) / 1e9
         logger.info(
@@ -205,9 +204,9 @@ def get_model(
             )
         logger.debug(f"Loaded model {config.name} in {time.perf_counter() - load_model_start_time:.2f} seconds")
 
-    assert model.lm_head.weight.dtype == dtype, (
-        f"LM head dtype wasnt loaded correctly {model.lm_head.weight.dtype} != {dtype}"
-    )
+    assert (
+        model.lm_head.weight.dtype == dtype
+    ), f"LM head dtype wasnt loaded correctly {model.lm_head.weight.dtype} != {dtype}"
     return model
 
 
@@ -219,7 +218,9 @@ def fix_model_post_empty(model: nn.Module):
             rope_init_fn = rotary_emb.rope_init_fn
         else:
             rope_init_fn = rotary_emb._init_rope
-        inv_freq, _ = rope_init_fn(rotary_emb.config, rotary_emb.inv_freq.device if rotary_emb.inv_freq is not None else None)
+        inv_freq, _ = rope_init_fn(
+            rotary_emb.config, rotary_emb.inv_freq.device if rotary_emb.inv_freq is not None else None
+        )
         rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
 
 
@@ -246,6 +247,71 @@ def _init_random_moe_weights(model: nn.Module, init_std: float) -> None:
         get_logger().info(f"Initialized {count} MoE/LatentMoE modules after random_init")
 
 
+def resolve_weight_source(config: ModelConfig) -> Path:
+    """Return the local checkpoint directory ``config.name`` loads from."""
+    if not Path(config.name).exists():
+        return Path(snapshot_download(repo_id=config.name, repo_type="model"))
+    get_logger().info(
+        f"Loading model weights from path {config.name}, skipping snapshot download. If this is not expected, "
+        f"please remove the directory {config.name} and run again"
+    )
+    return Path(config.name)
+
+
+def prepare_weight_conversion(
+    model: nn.Module, config: ModelConfig, source_path: Path, *, rank: int, local_rank: int
+) -> Path | None:
+    """Fill the converted-weight cache ``model`` loads from and return its path, or None when no conversion applies.
+
+    The distributed load and the per-node preparation that may run before it both call this, so they resolve the
+    same cache path. ``rank`` 0 writes a shared (not node-local) cache; ``local_rank`` 0 writes a node-local one.
+    """
+    if not isinstance(model, PreTrainedModelPrimeRL):
+        return None
+    snapshot_keys = dict.fromkeys(load_state_dict_keys(source_path))
+    model_keys = dict.fromkeys(model.state_dict().keys())
+    if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
+        fmt, convert_fn, src_fmt, dst_fmt = "prime", model.convert_to_prime, "HF", "PrimeRL"
+    elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(model_keys):
+        fmt, convert_fn, src_fmt, dst_fmt = "hf", model.convert_to_hf, "PrimeRL", "HF"
+    else:
+        return None
+
+    convert_checkpoint_fn = getattr(model, f"convert_to_{fmt}_checkpoint", None)
+    get_logger().warning(
+        f"Found {src_fmt} weight format in snapshot state dict and {dst_fmt} weight format in model "
+        "state dict. Trying to auto-convert..."
+    )
+    snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
+    if conversion_cache_is_node_local(snapshot_path):
+        ensure_node_local_conversion_cache(
+            source_path,
+            snapshot_path,
+            convert_fn,
+            src_fmt,
+            dst_fmt,
+            load_state_dict,
+            save_state_dict,
+            rank=rank,
+            local_rank=local_rank,
+            convert_checkpoint_fn=convert_checkpoint_fn,
+        )
+    elif not conversion_cache_ready(snapshot_path) and rank == 0:
+        _write_conversion_cache(
+            source_path,
+            snapshot_path,
+            convert_fn,
+            src_fmt,
+            dst_fmt,
+            load_state_dict,
+            save_state_dict,
+            rank=rank,
+            local_rank=local_rank,
+            convert_checkpoint_fn=convert_checkpoint_fn,
+        )
+    return snapshot_path
+
+
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)
@@ -266,68 +332,21 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         _move_buffers_to_cuda(model, config)
         return
 
-    if not Path(config.name).exists():
-        snapshot_path = Path(snapshot_download(repo_id=config.name, repo_type="model"))
-    else:
-        logger.info(
-            f"Loading model weights from path {config.name}, skipping snapshot download. If this is not expected, "
-            f"please remove the directory {config.name} and run again"
-        )
-        snapshot_path = Path(config.name)
-
-    conversion = None
-    if isinstance(model, PreTrainedModelPrimeRL):
-        snapshot_keys = dict.fromkeys(load_state_dict_keys(snapshot_path))
-        model_keys = dict.fromkeys(model.state_dict().keys())
-
-        source_path = snapshot_path
-        if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
-            conversion = ("prime", model.convert_to_prime, "HF", "PrimeRL")
-        elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(model_keys):
-            conversion = ("hf", model.convert_to_hf, "PrimeRL", "HF")
-
-        if conversion is not None:
-            fmt, convert_fn, src_fmt, dst_fmt = conversion
-            logger.warning(
-                f"Found {src_fmt} weight format in snapshot state dict and {dst_fmt} weight format in model "
-                "state dict. Trying to auto-convert..."
-            )
-            snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
-            node_local_cache = conversion_cache_is_node_local(snapshot_path)
-            world = get_world()
-            if node_local_cache:
-                ensure_node_local_conversion_cache(
-                    source_path,
-                    snapshot_path,
-                    convert_fn,
-                    src_fmt,
-                    dst_fmt,
-                    load_state_dict,
-                    save_state_dict,
-                    rank=world.rank,
-                    local_rank=world.local_rank,
-                )
-            elif not conversion_cache_ready(snapshot_path) and world.is_master:
-                _write_conversion_cache(
-                    source_path,
-                    snapshot_path,
-                    convert_fn,
-                    src_fmt,
-                    dst_fmt,
-                    load_state_dict,
-                    save_state_dict,
-                    rank=world.rank,
-                    local_rank=world.local_rank,
-                )
+    snapshot_path = resolve_weight_source(config)
+    world = get_world()
+    converted_path = prepare_weight_conversion(
+        model, config, snapshot_path, rank=world.rank, local_rank=world.local_rank
+    )
 
     torch.distributed.barrier()
-    if conversion is not None and not conversion_cache_ready(snapshot_path):
-        world = get_world()
+    if converted_path is not None and not conversion_cache_ready(converted_path):
         raise FileNotFoundError(
             "Converted weight cache is missing or incomplete after conversion barrier: "
-            f"path={snapshot_path}, rank={world.rank}, local_rank={world.local_rank}, "
+            f"path={converted_path}, rank={world.rank}, local_rank={world.local_rank}, "
             f"scope={os.environ.get(WEIGHT_CONVERSION_CACHE_SCOPE_ENV, 'auto')}"
         )
+    if converted_path is not None:
+        snapshot_path = converted_path
 
     logger.info(f"Loading weights using HF DCP from {snapshot_path}")
     load_dcp_start_time = time.perf_counter()

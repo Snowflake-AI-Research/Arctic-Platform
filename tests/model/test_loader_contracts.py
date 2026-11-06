@@ -113,6 +113,70 @@ def test_model_parallelism_metadata_uses_glm_kda_head_fallback():
     assert metadata.linear_num_value_heads == 16
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_model_parallelism_metadata_uses_glm_next_shared_heads(nested):
+    text_config = dict(
+        num_attention_heads=4,
+        layer_types=["linear_attention", "deepseek_sparse_attention"],
+        linear_num_heads=2,
+    )
+    config = dict(text_config=text_config) if nested else text_config
+
+    metadata = model_parallelism_metadata_from_config(config)
+
+    assert metadata.has_linear_attention is True
+    assert metadata.linear_num_key_heads == 2
+    assert metadata.linear_num_value_heads == 2
+
+
+def test_model_parallelism_metadata_preserves_explicit_linear_heads():
+    metadata = model_parallelism_metadata_from_config(
+        dict(
+            num_attention_heads=8,
+            layer_types=["linear_attention"],
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            linear_num_heads=8,
+            linear_attn_config=dict(num_heads=16),
+        )
+    )
+
+    assert metadata.linear_num_key_heads == 2
+    assert metadata.linear_num_value_heads == 4
+
+
+def test_model_parallelism_metadata_shared_heads_fall_back_to_root():
+    metadata = model_parallelism_metadata_from_config(
+        dict(
+            linear_num_heads=2,
+            text_config=dict(num_attention_heads=4, layer_types=["linear_attention"]),
+        )
+    )
+
+    assert metadata.linear_num_key_heads == 2
+    assert metadata.linear_num_value_heads == 2
+
+
+def test_model_parallelism_metadata_detects_shared_linear_heads():
+    metadata = model_parallelism_metadata_from_config(dict(num_attention_heads=4, linear_num_heads=2))
+
+    assert metadata.has_linear_attention is True
+    assert metadata.linear_num_key_heads == 2
+    assert metadata.linear_num_value_heads == 2
+
+
+@pytest.mark.parametrize("heads", [None, 0, -1, True, "2"])
+def test_model_parallelism_metadata_rejects_invalid_shared_linear_heads(heads):
+    with pytest.raises(ValueError, match="linear_num_key_heads must be a positive integer"):
+        model_parallelism_metadata_from_config(
+            dict(
+                num_attention_heads=4,
+                layer_types=["linear_attention"],
+                linear_num_heads=heads,
+            )
+        )
+
+
 def test_model_parallelism_metadata_detects_linear_head_fields():
     metadata = model_parallelism_metadata_from_config(
         {
