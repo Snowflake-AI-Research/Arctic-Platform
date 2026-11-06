@@ -261,9 +261,20 @@ def make_tied_lm_head_model(hidden_size: int, vocab_size: int, device: str = "cu
     """
     from types import SimpleNamespace
 
+    embed = torch.nn.Embedding(vocab_size, hidden_size).to(device)
     lm_head = torch.nn.Linear(hidden_size, vocab_size, bias=False).to(device)
-    lm_head.weight.ds_grad_is_ready = True
-    return SimpleNamespace(lm_head=lm_head, config=SimpleNamespace(vocab_size=vocab_size))
+    lm_head.weight = embed.weight
+    embed.weight.ds_grad_is_ready = True
+
+    def get_input_embeddings():
+        return embed
+
+    return SimpleNamespace(
+        lm_head=lm_head,
+        embed_tokens=embed,
+        config=SimpleNamespace(vocab_size=vocab_size, tie_word_embeddings=True),
+        get_input_embeddings=get_input_embeddings,
+    )
 
 
 def torch_assert_equal(actual, expected, **kwargs):
