@@ -44,16 +44,41 @@ the in-node FP32 sum (the shard's gradient has the shard's dtype). ZeRO's gradie
 expert-parallel group once over the whole world and its expert average is then a no-op, so the norm, and the
 clipping, are the replicated run's.
 
-A sharded model cannot be saved or exported: ``state_dict``, ``load_state_dict`` and the HF / vLLM weight export raise.
+The HF and vLLM weight export (``weight_export.iter_model_weights``: a weights-only checkpoint's HF tree, the weight
+sync) sees the unsharded model. ``weight_export.export_named_parameters`` lists the original parameters under their
+names and in their order, each the original ``nn.Parameter`` without data, and the shared export builders
+(``build_iter_full_hf_weights``, ``build_iter_full_vllm_weights``) fill them one export unit at a time (a decoder layer;
+the embedding, final norm and LM head together): the unit's shards are gathered onto rank 0 over its node, the other
+nodes take no part, and the unit's whole weights are dropped before the next one is gathered. The exported tensors are
+the unsharded model's, bit for bit, under the same names. A family builder that reads ``model.named_parameters()``
+instead is refused.
+
+``state_dict`` and ``load_state_dict`` hold the original parameters whole, under their own names, and never the shards:
+the state dict is the unsharded model's, and loads into a model sharded over any group size or into an unsharded one.
+Taking it all-gathers each module's shards over its node in turn into host memory (collective); loading writes each
+rank's slice of the whole values into its shard. Both work only inside ``full_state_dict(model)``, entered on every
+rank, and raise outside it.
+
+DeepSpeed's ``save_checkpoint`` / ``load_checkpoint`` of a sharded model refuse on every rank, before any collective,
+outside the context, and inside it through DeepSpeed's MoE path (``has_moe_layers``), which takes the module state on
+data-parallel rank 0 alone. So dss's resumable checkpoints refuse: its expert-parallel checkpointer would take the shards
+(``allreduce=False`` + ``group_name``) for experts and key its per-EP-rank expert files on the first one's group, the
+node's, losing the experts of every node but the first. ZeRO-1/2 itself checkpoints a sharded model right through its
+non-MoE path inside the context (the whole weights in the model states, each rank's partition of its shards' FP32
+masters and moments in its optimizer file), for the same world size, group size and EP.
 """
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import os
 import socket
 from collections import Counter
 from dataclasses import dataclass
 from typing import Iterable
+from typing import Iterator
+from typing import Sequence
 
 import torch
 import torch.distributed as dist
@@ -105,12 +130,16 @@ def is_dense_shard(param: torch.Tensor) -> bool:
     return bool(getattr(param, DENSE_SHARD_ATTR, False))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class _Member:
-    """One original parameter: where it sits in the flat layout, and the owners' slots it fills during a call."""
+    """One original parameter: where it sits in the flat layout, the owners' slots it fills during a call, its keys
+    in the sharded module's state dict (one per path to an owner), and the parameter itself, without data between
+    exports (the weight export's placeholder: it keeps the parameter's attributes)."""
 
     name: str
+    keys: tuple[str, ...]
     slots: tuple[tuple[nn.Module, str], ...]
+    param: nn.Parameter
     shape: torch.Size
     offset: int
     numel: int
@@ -178,26 +207,53 @@ class _GatherShards(torch.autograd.Function):
 
 
 class _ShardParams(nn.Module):
-    """Holds a module's shard parameters (``shard_<k>``); never called."""
+    """Holds a module's shard parameters (``shard_<k>``); never called. The shards are not in the state dict, which
+    holds the whole parameters instead (``ShardedModule``)."""
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        pass
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        if strict:
+            unexpected_keys.extend(key for key in state_dict if key.startswith(prefix))
 
 
-def _refuse_state_dict(module, *args, **kwargs):
+def _refuse_state_dict(module: nn.Module) -> None:
     raise RuntimeError(
         f"{type(module).__name__}'s trainable replicated weights are sharded over the node (moe.shard_dense / "
-        f"{SHARD_DENSE_ENV}): its state dict would hold shards instead of its parameters. Saving, loading and "
-        "exporting a sharded model are not supported; run without shard_dense to save checkpoints."
+        f"{SHARD_DENSE_ENV}): its state_dict and load_state_dict hold them whole only inside "
+        "arctic_platform.model.implementations.moe.dense_shard.full_state_dict(model), entered on every rank. "
+        "Resumable checkpoints (DeepSpeed save_checkpoint / load_checkpoint) of a sharded model are not supported: "
+        "dss's ExpertParallelCheckpointer takes the node shards for experts (allreduce=False + group_name) and keys "
+        "its per-EP-rank expert files on the node group, losing the experts of every node but the first. Save a "
+        "weights-only checkpoint (the HF export) instead, or run without shard_dense."
     )
 
 
 class ShardedModule:
-    """A module whose trainable replicated parameters are held as ``1 / world`` shards per rank of ``group``."""
+    """A module whose trainable replicated parameters are held as ``1 / world`` shards per rank of ``group``.
 
-    def __init__(self, module: nn.Module, buckets: list[_Bucket], group: dist.ProcessGroup) -> None:
+    ``owners``: each module whose ``_parameters`` held members, once, with its parameter names before sharding (the
+    state dict lists them in that order).
+    """
+
+    def __init__(
+        self,
+        module: nn.Module,
+        buckets: list[_Bucket],
+        group: dist.ProcessGroup,
+        owners: list[tuple[nn.Module, tuple[str, ...]]],
+    ) -> None:
         self.module = module
         self.buckets = buckets
         self.group = group
         self.world = dist.get_world_size(group)
+        self.rank = dist.get_rank(group)
+        self.owners = owners
         self.gathered = False
+        self.whole_state_dict = 0  # depth of full_state_dict contexts around this module
 
     @property
     def members(self) -> Iterable[_Member]:
@@ -220,16 +276,120 @@ class ShardedModule:
                 owner._parameters.pop(name, None)
         self.gathered = False
 
+    def _all_gather(self, bucket: _Bucket) -> torch.Tensor:
+        shard = bucket.shard.detach().contiguous()
+        full = torch.empty(bucket.total, dtype=shard.dtype, device=shard.device)
+        dist.all_gather_into_tensor(full, shard, group=self.group)
+        return full
+
     def full_parameters(self) -> dict[str, torch.Tensor]:
         """Each member's whole tensor, by its name in the model (collective over the shard group)."""
         out = {}
         for bucket in self.buckets:
-            shard = bucket.shard.detach().contiguous()
-            full = torch.empty(bucket.total, dtype=shard.dtype, device=shard.device)
-            dist.all_gather_into_tensor(full, shard, group=self.group)
+            full = self._all_gather(bucket)
             for member in bucket.members:
                 out[member.name] = full.narrow(0, member.offset, member.numel).view(member.shape)
         return out
+
+    # -- weight export: the members' placeholders --
+
+    def fill_placeholders(self) -> None:
+        """Each member's placeholder holds its whole value on global rank 0, gathered there over the shard group
+        (collective over it). A group without rank 0 does nothing: only rank 0 exports."""
+        from arctic_platform.model.weight_export import wait_for_export_collective
+
+        if 0 not in dist.get_process_group_ranks(self.group):
+            return
+        exporting = dist.get_rank() == 0
+        for bucket in self.buckets:
+            shard = bucket.shard.detach().contiguous()
+            full = torch.empty(bucket.total, dtype=shard.dtype, device=shard.device) if exporting else None
+            parts = list(full.view(self.world, -1).unbind(0)) if full is not None else None
+            dist.gather(shard, parts, dst=0, group=self.group)
+            if full is None:
+                wait_for_export_collective(shard)
+                continue
+            for member in bucket.members:
+                member.param.data = full.narrow(0, member.offset, member.numel).view(member.shape)
+
+    def clear_placeholders(self) -> None:
+        for bucket in self.buckets:
+            for member in bucket.members:
+                member.param.data = torch.empty(0, dtype=bucket.shard.dtype, device=bucket.shard.device)
+
+    # -- state dict: the members whole, never the shards (inside full_state_dict) --
+
+    def _check_whole_state_dict(self) -> None:
+        if not self.whole_state_dict:
+            _refuse_state_dict(self.module)
+
+    def _place(self, values: dict[_Member, torch.Tensor]) -> None:
+        """Put each member's value into its owners' slots, in the place the unsharded owner holds it."""
+        placed = {(id(owner), name): values[member] for member in self.members for owner, name in member.slots}
+        for owner, names in self.owners:
+            current = owner._parameters
+            ordered = {}
+            for name in names:
+                if (id(owner), name) in placed:
+                    ordered[name] = placed[(id(owner), name)]
+                elif name in current:
+                    ordered[name] = current[name]
+            ordered.update((name, value) for name, value in current.items() if name not in ordered)
+            current.clear()
+            current.update(ordered)
+        self.gathered = True  # release() takes them out again
+
+    def state_dict_pre_hook(self, module, prefix, keep_vars) -> None:
+        """Before ``module``'s state dict is taken: its members whole in their owners' slots, in host memory (each
+        bucket gathered on the shards' device, then moved, so one module's whole weights are there at a time)."""
+        self._check_whole_state_dict()
+        self.release()
+        values = {}
+        for bucket in self.buckets:
+            full = self._all_gather(bucket).cpu()
+            for member in bucket.members:
+                values[member] = full.narrow(0, member.offset, member.numel).view(member.shape)
+        self._place(values)
+
+    def load_state_dict_pre_hook(
+        self, module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ) -> None:
+        """Write this rank's slice of each member's whole value in ``state_dict`` into its shard. The member keys are
+        taken out of ``state_dict`` (``module``'s own copy), so the owners never see them; a missing or malformed one
+        is reported as ``nn.Module`` reports it, and its slice is left as it is."""
+        self._check_whole_state_dict()
+        self.release()
+        values = {}
+        for member in self.members:
+            for key in (prefix + key for key in member.keys):
+                if key not in state_dict:
+                    if strict:
+                        missing_keys.append(key)
+                    continue
+                value = state_dict.pop(key)
+                if not torch.overrides.is_tensor_like(value):
+                    error_msgs.append(
+                        f'While copying the parameter named "{key}", expected torch.Tensor or Tensor-like object '
+                        f"from checkpoint but received {type(value)}"
+                    )
+                elif value.shape != member.shape:
+                    error_msgs.append(
+                        f"size mismatch for {key}: copying a param with shape {value.shape} from checkpoint, the "
+                        f"shape in current model is {member.shape}."
+                    )
+                else:
+                    values[member] = value  # a member under several keys: the last, as nn.Module loads them
+        with torch.no_grad():
+            for bucket in self.buckets:
+                size = bucket.total // self.world
+                low = self.rank * size
+                shard = bucket.shard.detach()
+                for member in bucket.members:
+                    value = values.get(member)
+                    first, last = max(low, member.offset), min(low + size, member.offset + member.numel)
+                    if value is not None and first < last:
+                        flat = value.reshape(-1)[first - member.offset : last - member.offset]
+                        shard[first - low : last - low].copy_(flat)
 
     def full_bytes(self) -> int:
         return sum(m.numel * b.shard.element_size() for b in self.buckets for m in b.members)
@@ -291,6 +451,18 @@ def shard_module(
     if not by_class:
         return None
 
+    # Each member's keys in the module's state dict: one per path to an owner, as nn.Module.state_dict lists them.
+    keys: dict[int, list[str]] = {}
+    owners: dict[int, tuple[nn.Module, tuple[str, ...]]] = {}
+    for path, owner in module.named_modules(remove_duplicate=False):
+        for name, param in owner._parameters.items():
+            if param is not None:
+                keys.setdefault(id(param), []).append(f"{path}.{name}" if path else name)
+    for params in by_class.values():
+        for _, param_slots in params:
+            for owner, _ in param_slots:
+                owners.setdefault(id(owner), (owner, tuple(owner._parameters)))
+
     holder = _ShardParams()
     buckets = []
     for (dtype, no_decay), params in by_class.items():
@@ -298,7 +470,17 @@ def shard_module(
         members = []
         offset = 0
         for param, param_slots in params:
-            members.append(_Member(names[id(param)], tuple(param_slots), param.shape, offset, param.numel()))
+            members.append(
+                _Member(
+                    names[id(param)],
+                    tuple(keys[id(param)]),
+                    tuple(param_slots),
+                    param,
+                    param.shape,
+                    offset,
+                    param.numel(),
+                )
+            )
             offset = (offset + param.numel() + align - 1) // align * align
         total = (offset + world * align - 1) // (world * align) * (world * align)
         size = total // world
@@ -318,13 +500,19 @@ def shard_module(
         buckets.append(_Bucket(members, shard, total))
         for member in members:
             for owner, name in member.slots:
-                del owner._parameters[name]
+                owner._parameters.pop(name, None)  # a slot repeats for an owner reached by two paths
+            # The original parameter stays as the export's placeholder, without data. An owner's opt-out of the
+            # weight sync (read from the owner's parameters, which no longer hold it) moves onto it.
+            if any(getattr(owner, "_dss_skip_weight_sync", False) for owner, _ in member.slots):
+                member.param._dss_skip_weight_sync = True
+            member.param.data = torch.empty(0, dtype=dtype, device=member.param.device)
     module.add_module("dense_shard", holder)
-    sharded = ShardedModule(module, buckets, group)
+    sharded = ShardedModule(module, buckets, group, list(owners.values()))
     module.register_forward_pre_hook(lambda _module, _args: sharded.gather(), prepend=True)
     module.register_forward_hook(lambda _module, _args, _output: sharded.release())
-    module.register_state_dict_pre_hook(_refuse_state_dict)
-    module.register_load_state_dict_pre_hook(_refuse_state_dict)
+    module.register_state_dict_pre_hook(sharded.state_dict_pre_hook)
+    module.register_state_dict_post_hook(lambda _module, _state_dict, _prefix, _metadata: sharded.release())
+    module.register_load_state_dict_pre_hook(sharded.load_state_dict_pre_hook)
     module._ap_dense_shards = sharded
     return sharded
 
@@ -377,20 +565,158 @@ def install_dense_shards(
     group, name, _ = node_shard_group(group_size)
     if group is None:
         return []
+    unsharded_names = [parameter_name for parameter_name, _ in root.named_parameters()]
     slots, names = _parameter_slots(root)
     sharded = [s for s in (shard_module(m, group, name, slots, names) for m in modules) if s is not None]
+    if not sharded:
+        return []
 
+    from arctic_platform.model.weight_export import HeldParameters
     from arctic_platform.model.weight_export import WeightExportContract
+    from arctic_platform.model.weight_export import register_held_parameters
     from arctic_platform.model.weight_export import register_weight_export
+    from arctic_platform.model.weight_export import weight_export_contract
 
-    def refuse_export(model):
-        _refuse_state_dict(model)
+    held = _HeldShards(sharded, unsharded_names)
+    register_held_parameters(
+        root, HeldParameters(named_parameters=held.named_parameters, materialize=held.materialize)
+    )
+    contract = weight_export_contract(root)
+    if contract is not None:
+        register_weight_export(
+            root,
+            WeightExportContract(hf=_export_builder(contract.hf, "hf"), vllm=_export_builder(contract.vllm, "vllm")),
+        )
 
-    register_weight_export(root, WeightExportContract(hf=refuse_export, vllm=refuse_export))
-    root.register_state_dict_pre_hook(_refuse_state_dict)
+    def check(module, *args):
+        # Before anything is taken or loaded: the context covers every sharded module, or nothing happens.
+        if not all(s.whole_state_dict for s in sharded):
+            _refuse_state_dict(module)
+
+    root.register_state_dict_pre_hook(check)
+    root.register_load_state_dict_pre_hook(check)
+    _guard_deepspeed_checkpoints()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()  # the originals' blocks
     return sharded
+
+
+class _HeldShards:
+    """The members of a model's sharded modules as its weight export sees them (``weight_export.HeldParameters``).
+
+    ``names``: the model's parameter names before sharding, in ``named_parameters`` order. Holds no reference to the
+    model (the export registry is keyed weakly by it).
+    """
+
+    def __init__(self, sharded: list[ShardedModule], names: list[str]) -> None:
+        self.names = names
+        self.placeholders = {m.name: m.param for s in sharded for m in s.members}
+        self.owner = {id(m.param): s for s in sharded for m in s.members}
+
+    def named_parameters(self, model: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
+        live = {
+            name: param
+            for name, param in model.named_parameters()
+            if not is_dense_shard(param) and name not in self.placeholders  # nor a call's gathered weight
+        }
+        for name in self.names:
+            if name in self.placeholders:
+                yield name, self.placeholders[name]
+            elif name in live:
+                yield name, live.pop(name)
+        yield from live.items()
+
+    @contextlib.contextmanager
+    def materialize(self, tensors: Sequence[torch.Tensor]) -> Iterator[None]:
+        """The placeholders among ``tensors`` whole on rank 0: each sharded module that owns one, in the order of
+        ``tensors``, gathered over its node (every rank passes the same tensors)."""
+        owners = list(dict.fromkeys(self.owner[id(t)] for t in tensors if id(t) in self.owner))
+        filled = []
+        try:
+            for sharded in owners:
+                filled.append(sharded)
+                sharded.fill_placeholders()
+            yield
+        finally:
+            for sharded in filled:
+                sharded.clear_placeholders()
+
+
+def _export_builder(builder, weight_format: str):
+    """``builder`` when it reads held parameters through ``weight_export.export_named_parameters`` and
+    ``materialized_parameters``; else one that refuses, on every rank before any collective."""
+    from .deepspeed_integration import build_iter_full_hf_weights
+    from .vllm_weights import build_iter_full_vllm_weights
+
+    if builder is None or builder in (build_iter_full_hf_weights, build_iter_full_vllm_weights):
+        return builder
+    label = getattr(builder, "__qualname__", repr(builder))
+
+    def refuse(model):
+        raise NotImplementedError(
+            f"weight_format={weight_format!r} with moe.shard_dense: {label} reads model.named_parameters(), which "
+            "holds node shards instead of the weights; it must read them through weight_export."
+            "export_named_parameters and materialized_parameters, as build_iter_full_hf_weights does"
+        )
+
+    return refuse
+
+
+def _check_deepspeed_checkpoint(engine) -> None:
+    """Refuse, on every rank before any collective, a DeepSpeed checkpoint of a sharded model that would hang or
+    refuse on some ranks only: outside ``full_state_dict``, or through DeepSpeed's MoE checkpoint path, which takes
+    the module state on data-parallel rank 0 alone while its shards are on every rank of the node."""
+    sharded = [s for s in (getattr(m, "_ap_dense_shards", None) for m in engine.module.modules()) if s is not None]
+    if not sharded:
+        return
+    if not all(s.whole_state_dict for s in sharded):
+        _refuse_state_dict(engine.module)
+    if engine.has_moe_layers:
+        raise RuntimeError(
+            "a DeepSpeed checkpoint of a model with moe.shard_dense must take the non-MoE path (has_moe_layers "
+            "off, as dss's ExpertParallelCheckpointer sets it): the MoE path takes the module state on data-parallel "
+            "rank 0 only, which gathers the node's shards and would wait forever for the other ranks"
+        )
+
+
+def _guard_deepspeed_checkpoints() -> None:
+    try:
+        from deepspeed.runtime.engine import DeepSpeedEngine
+    except ImportError:
+        return
+    if getattr(DeepSpeedEngine, "_ap_dense_shard_checkpoint_guard", False):
+        return
+    for method in ("save_checkpoint", "load_checkpoint"):
+        original = getattr(DeepSpeedEngine, method)
+
+        @functools.wraps(original)
+        def guarded(self, *args, _original=original, **kwargs):
+            _check_deepspeed_checkpoint(self)
+            return _original(self, *args, **kwargs)
+
+        setattr(DeepSpeedEngine, method, guarded)
+    DeepSpeedEngine._ap_dense_shard_checkpoint_guard = True
+
+
+@contextlib.contextmanager
+def full_state_dict(model: nn.Module) -> Iterator[None]:
+    """Inside, ``model.state_dict()`` holds its sharded parameters whole under their own names, never the shards (the
+    unsharded model's state dict, in host memory for the sharded ones), and ``load_state_dict`` writes each rank's
+    slice of whole values into its shard.
+
+    Enter it on every rank. Taking the state dict is collective: each sharded module all-gathers its shards over its
+    node in turn, so every rank must take it at the same point, as DeepSpeed's non-MoE checkpoint path does (its MoE
+    path, which takes it on data-parallel rank 0 only, refuses); a ``save_pretrained`` on rank 0 alone would wait
+    forever. Loading is local to each rank.
+    """
+    sharded = [s for s in (getattr(m, "_ap_dense_shards", None) for m in model.modules()) if s is not None]
+    for s in sharded:
+        s.whole_state_dict += 1
+    try:
+        yield
+    finally:
+        for s in sharded:
+            s.whole_state_dict -= 1
 
 
 def _inner(module: nn.Module) -> nn.Module:

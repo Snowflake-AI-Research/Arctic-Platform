@@ -14,7 +14,15 @@
 # limitations under the License.
 """Trainable replicated weights sharded over the GPUs of a node (moe/dense_shard.py) train as the replicated ones do.
 
-CPU: the option's environment fallback, the PEFT refusal, the weight-decay marker.
+CPU: the option's environment fallback, the PEFT refusal, the weight-decay marker. Four gloo processes as two "nodes"
+of 2, a model of the MoE families' layout (``model.layers.<i>``, one block recomputed, an untied LM head, an
+expert-parallel weight per block, EP = the world) exported through the shared HF and vLLM builders: the sharded model
+exports the unsharded model's tensors, bit for bit, under the same names and in the same order, holding one export
+unit's whole weights at a time on rank 0. Its state dict is the unsharded model's (inside ``full_state_dict``; outside,
+both directions refuse), and loads back into a fresh sharded model, one sharded over another group size and an unsharded
+one. DeepSpeed ZeRO-2 in BF16 with FP32 masters saves it and loads it back through its non-MoE checkpoint path inside
+``full_state_dict``, and the next step is the uninterrupted run's, bit for bit; outside it, DeepSpeed's and dss's
+resumable checkpoints refuse.
 
 GPU (8): two "nodes" of 4 ranks (shard group 4; ZeRO then reduces each shard over the 2 ranks at its position), a model
 of embedding, three blocks (one recomputed with early stop, one without, one not recomputed) and an untied LM head,
@@ -125,7 +133,7 @@ class _Norm(nn.Module):
 
 
 class _Block(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, world=WORLD, expert=True):
         super().__init__()
         self.norm = _Norm(dim)
         self.q = nn.Linear(dim, dim, bias=True)
@@ -133,9 +141,10 @@ class _Block(nn.Module):
         self.down = nn.Linear(2 * dim, dim, bias=False)
         self.indexer = nn.Linear(dim, 8, bias=False)  # trainable, under no_grad: never gets a gradient
         self.mix = nn.Parameter(torch.tensor([1.0, 0.5, 0.0]))  # 3 elements: the members after it are re-aligned
-        self.expert = nn.Parameter(torch.zeros(dim, dim))
-        self.expert.allreduce = False
-        self.expert.group_name = f"ep_size_{WORLD}"
+        self.expert = nn.Parameter(torch.zeros(dim, dim)) if expert else None
+        if expert:
+            self.expert.allreduce = False
+            self.expert.group_name = f"ep_size_{world}"
 
     def forward(self, x):
         h = self.norm(x)
@@ -143,7 +152,8 @@ class _Block(nn.Module):
             gate = self.indexer(h).sigmoid().mean(-1, keepdim=True)
         h = self.q(h) * (0.5 + gate)
         h = h + self.down(F.silu(self.up(h)))
-        h = h * self.mix[0] + (h @ self.expert) * self.mix[1] + self.mix[2]
+        routed = h @ self.expert if self.expert is not None else h.flip(-1)
+        h = h * self.mix[0] + routed * self.mix[1] + self.mix[2]
         return x + h
 
 
@@ -478,3 +488,407 @@ def test_sharded_bf16_weights_train_as_replicated_ones(sp, swap):
         if swap:
             # Some groups split into slices (3 and 4 groups without the swap), all their state off the GPU.
             assert len(r["groups"][0]) > 3 and len(r["groups"][1]) > 4 and r["offloaded"] == (1.0, 1.0), r
+
+
+# -- CPU (gloo): export, state dict, resumable checkpoint --
+
+CPU_WORLD, CPU_NODE = 4, 2
+
+
+class _Body(nn.Module):
+    def __init__(self, expert: bool):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+        super().__init__()
+        self.embed_tokens = nn.Embedding(VOCAB, DIM)
+        self.layers = nn.ModuleList(
+            [
+                checkpoint_wrapper(_Block(DIM, CPU_WORLD, expert), early_stop=False),
+                _Block(DIM, CPU_WORLD, expert),
+            ]
+        )
+        self.norm = _Norm(DIM)
+
+
+class _CausalLM(nn.Module):
+    """The MoE families' layout (``model.layers.<i>``, an untied LM head), which the shared export builders group by
+    layer: the embedding, final norm and LM head are one export unit, each block another."""
+
+    def __init__(self, expert: bool = True):
+        super().__init__()
+        self.model = _Body(expert)
+        self.lm_head = nn.Linear(DIM, VOCAB, bias=False)
+
+    def forward(self, ids, labels):
+        h = self.model.embed_tokens(ids)
+        for layer in self.model.layers:
+            h = layer(h)
+        logits = self.lm_head(self.model.norm(h)).float()
+        return 8 * F.cross_entropy(logits.view(-1, VOCAB), labels.view(-1))
+
+    def convert_layer_to_hf(self, state, layer_index):
+        """A conversion that reads the values: each block's up and down projections fused into one tensor."""
+        if layer_index >= 0:
+            prefix = f"model.layers.{layer_index}."
+            up, down = state.pop(prefix + "up.weight"), state.pop(prefix + "down.weight")
+            state[prefix + "mlp.weight"] = torch.cat([up, down.t()])
+
+
+def _build_cpu(rank: int, group_size: int | None, seed: int = 0, expert: bool = True) -> _CausalLM:
+    """The model in BF16 with the MoE families' export contract; sharded over ``group_size`` ranks when given."""
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+    from arctic_platform.model.implementations.moe.vllm_weights import build_iter_full_vllm_weights
+    from arctic_platform.model.weight_export import WeightExportContract
+    from arctic_platform.model.weight_export import register_weight_export
+
+    set_seed(seed)
+    model = _CausalLM(expert)
+    nn.init.normal_(model.model.embed_tokens.weight, std=0.02)
+    if expert:
+        generator = torch.Generator().manual_seed(100 + 10 * seed + rank)  # each EP rank holds its own experts
+        for layer in model.model.layers:
+            _inner(layer).expert.data.normal_(0, DIM**-0.5, generator=generator)
+    model = model.to(torch.bfloat16)
+    register_weight_export(
+        model, WeightExportContract(hf=build_iter_full_hf_weights, vllm=build_iter_full_vllm_weights)
+    )
+    if group_size is not None:
+        assert dense_shard.install_model_dense_shards(model, group_size)
+    return model
+
+
+def _sharded_modules(model) -> list:
+    return [m._ap_dense_shards for m in model.modules() if getattr(m, "_ap_dense_shards", None) is not None]
+
+
+class _PeakAllocatedBytes:
+    """Peak bytes of the storages allocated while active and still alive: max_memory_allocated() for CPU tensors."""
+
+    def __init__(self):
+        from torch.utils._python_dispatch import TorchDispatchMode
+        from torch.utils._pytree import tree_leaves
+
+        tracker = self
+
+        class Mode(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                out = func(*args, **(kwargs or {}))
+                inputs = {id(t.untyped_storage()) for t in tree_leaves((args, kwargs)) if isinstance(t, torch.Tensor)}
+                for tensor in tree_leaves(out):
+                    if isinstance(tensor, torch.Tensor):
+                        tracker._track(tensor.untyped_storage(), inputs)
+                return out
+
+        self.mode = Mode()
+        self.live = self.peak = 0
+        self.tracked: set[int] = set()
+
+    def _track(self, storage, inputs) -> None:
+        import weakref
+
+        key = id(storage)
+        if key in inputs or key in self.tracked:
+            return
+        self.tracked.add(key)
+        self.live += storage.nbytes()
+        self.peak = max(self.peak, self.live)
+        weakref.finalize(storage, self._release, key, storage.nbytes())
+
+    def _release(self, key: int, nbytes: int) -> None:
+        self.tracked.discard(key)
+        self.live -= nbytes
+
+
+def _export_and_compare(model, weight_format: str, kwargs: dict, want: list | None) -> tuple[int, int]:
+    """Drain ``model``'s export on every rank; on rank 0, check each tensor against ``want`` (when given) as it comes
+    and drop it, under a peak-memory probe. Returns (tensors, peak bytes allocated during the export)."""
+    import torch.distributed as dist
+
+    from arctic_platform.model import iter_model_weights
+
+    weights = iter_model_weights(model, weight_format, is_master=dist.get_rank() == 0, is_zero3=False, **kwargs)
+    if dist.get_rank() != 0:
+        assert next(weights, None) is None  # only rank 0 receives tensors
+        return 0, 0
+    probe = _PeakAllocatedBytes()
+    count = 0
+    with probe.mode:
+        for item in weights:
+            if want is not None:
+                _check_exported(weight_format, count, item, want[count])
+            count += 1
+            # Nothing here outlives the item: a tensor kept while the next unit is gathered would keep the whole
+            # buffer of its own unit's bucket (a consumer that keeps the last tensor of each unit, as a for loop's
+            # variable does, holds that much more).
+            del item
+    return count, probe.peak
+
+
+def _check_exported(weight_format: str, index: int, item: tuple, want: tuple) -> None:
+    (name, tensor), (want_name, want_tensor) = item, want
+    assert name == want_name, (weight_format, index, name, want_name)
+    assert tensor.dtype == want_tensor.dtype and torch.equal(tensor, want_tensor), (weight_format, name)
+
+
+def _export_case(rank: int) -> dict:
+    unsharded = _build_cpu(rank, None)
+    sharded = _build_cpu(rank, CPU_NODE)
+    names = [name for name, _ in sharded.named_parameters()]
+    modules = _sharded_modules(sharded)
+    unit_bytes = [sum(b.total * b.shard.element_size() for b in s.buckets) for s in modules]
+    # The export units: the embedding with the LM head (and the final norm, whole), then each block.
+    by_name = {type(s.module).__name__: b for s, b in zip(modules, unit_bytes)}
+    blocks = [b for s, b in zip(modules, unit_bytes) if isinstance(s.module, _Block)]
+    largest_unit = max(by_name["Embedding"] + by_name["Linear"], *blocks)
+    out = {"largest_unit": largest_unit, "dense": sum(unit_bytes)}
+    for weight_format, kwargs in (("hf", {"include_skipped": True}), ("vllm", {})):
+        import torch.distributed as dist
+
+        from arctic_platform.model import iter_model_weights
+
+        want = [
+            (name, tensor.clone())
+            for name, tensor in iter_model_weights(
+                unsharded, weight_format, is_master=rank == 0, is_zero3=False, **kwargs
+            )
+        ]
+        assert bool(want) == (dist.get_rank() == 0)
+        count, unsharded_peak = _export_and_compare(unsharded, weight_format, kwargs, want if rank == 0 else None)
+        got, sharded_peak = _export_and_compare(sharded, weight_format, kwargs, want if rank == 0 else None)
+        assert got == count == len(want), (weight_format, got, count, len(want))
+        out[weight_format] = {"tensors": count, "peaks": (unsharded_peak, sharded_peak)}
+        if rank == 0 and weight_format == "hf":
+            assert any(name.endswith("mlp.weight") for name, _ in want)  # the conversion ran on gathered values
+    # The export left the model as it was: the shards in place, the placeholders empty, and a forward is the
+    # unsharded model's.
+    assert [name for name, _ in sharded.named_parameters()] == names
+    assert all(m.param.numel() == 0 for s in modules for m in s.members)
+    ids = torch.randint(0, VOCAB, (1, 64), generator=torch.Generator().manual_seed(rank))
+    assert torch.equal(sharded(ids, ids.roll(-1, 1)), unsharded(ids, ids.roll(-1, 1)))
+    return out
+
+
+def _state_dict_case(rank: int) -> dict:
+    import torch.distributed as dist
+
+    def check_equal(got: dict, want: dict) -> None:
+        assert list(got) == list(want), (list(got), list(want))
+        for key, value in want.items():
+            assert got[key].dtype == value.dtype and torch.equal(got[key], value), key
+
+    unsharded = _build_cpu(rank, None)
+    sharded = _build_cpu(rank, CPU_NODE)
+    want = unsharded.state_dict()
+    for refused in (sharded.state_dict, lambda: sharded.load_state_dict(want)):
+        with pytest.raises(RuntimeError, match=r"sharded over the node .*full_state_dict\(model\)"):
+            refused()
+    with dense_shard.full_state_dict(sharded.model.layers[1]):  # one module inside: the model as a whole refuses
+        with pytest.raises(RuntimeError, match="full_state_dict"):
+            sharded.state_dict()
+        check_equal(sharded.model.layers[1].state_dict(), unsharded.model.layers[1].state_dict())
+    with dense_shard.full_state_dict(sharded):
+        got = sharded.state_dict()
+    check_equal(got, want)
+    assert not any("dense_shard" in key for key in got)
+    shards = {name: p.detach().clone() for name, p in sharded.named_parameters() if dense_shard.is_dense_shard(p)}
+
+    # Into a fresh sharded model, initialized otherwise: its shards become this one's.
+    fresh = _build_cpu(rank, CPU_NODE, seed=1)
+    assert any(not torch.equal(p, shards[n]) for n, p in fresh.named_parameters() if n in shards)
+    with dense_shard.full_state_dict(fresh):
+        result = fresh.load_state_dict(got)
+        assert not result.missing_keys and not result.unexpected_keys, result
+        check_equal(fresh.state_dict(), want)
+    for name, p in fresh.named_parameters():
+        if dense_shard.is_dense_shard(p):
+            assert torch.equal(p, shards[name]), name
+    # Into a model sharded over the whole world (another layout of the shards) and into an unsharded one.
+    wider = _build_cpu(rank, CPU_WORLD, seed=1)
+    plain = _build_cpu(rank, None, seed=1)
+    with dense_shard.full_state_dict(wider):
+        wider.load_state_dict(got)
+        check_equal(wider.state_dict(), want)
+    plain.load_state_dict(got)
+    check_equal(plain.state_dict(), want)
+
+    # Missing, unexpected and malformed keys, as nn.Module reports them for the unsharded model.
+    partial = {key: value for key, value in got.items() if key not in ("model.layers.0.q.weight", "lm_head.weight")}
+    partial["model.layers.1.dense_shard.shard_0"] = torch.zeros(3)
+    want_result = plain.load_state_dict(partial, strict=False)
+    assert want_result.missing_keys and want_result.unexpected_keys, want_result
+    with dense_shard.full_state_dict(fresh):
+        result = fresh.load_state_dict(partial, strict=False)
+        assert result == want_result, (result, want_result)
+        with pytest.raises(RuntimeError, match=r"(?s)Missing key\(s\) in state_dict: .*Unexpected key\(s\)"):
+            fresh.load_state_dict(partial)
+        with pytest.raises(RuntimeError, match="size mismatch for model.layers.1.up.weight"):
+            fresh.load_state_dict({**got, "model.layers.1.up.weight": torch.zeros(3, 3)})
+    # Taking the state dict left the model as it was: a forward is the unsharded model's.
+    ids = torch.randint(0, VOCAB, (1, 64), generator=torch.Generator().manual_seed(rank))
+    assert torch.equal(sharded(ids, ids.roll(-1, 1)), unsharded(ids, ids.roll(-1, 1)))
+    return {"keys": len(got), "rank": dist.get_rank()}
+
+
+def _resume_case(rank: int, ckpt_dir: str) -> dict:
+    """Two steps, a resumable save, a third step; then a fresh engine on a model initialized otherwise loads the save
+    and takes the third step. DeepSpeed's non-MoE checkpoint path (the one dss's ExpertParallelCheckpointer forces:
+    has_moe_layers off) inside full_state_dict. The model has no expert weights: their per-rank files are dss's."""
+    from arctic_platform.common.deepspeed_engine import OptimizerSettings
+    from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
+    from arctic_platform.common.deepspeed_engine import build_deepspeed_config
+    from arctic_platform.common.deepspeed_engine import initialize_training_engine
+
+    generator = torch.Generator().manual_seed(1000 + rank)
+    batches = [[torch.randint(0, VOCAB, (1, 64), generator=generator) for _ in range(GAS)] for _ in range(3)]
+
+    def build(seed: int):
+        model = _build_cpu(rank, CPU_NODE, seed=seed, expert=False)
+        ds_config = build_deepspeed_config(
+            TrainingEngineSpec(
+                dtype="bfloat16",
+                world_size=CPU_WORLD,
+                gradient_clipping=1.0,
+                fp32_masters=True,
+                ds_overrides={
+                    "gradient_accumulation_steps": GAS,
+                    "train_batch_size": GAS * CPU_WORLD,
+                    "zero_optimization": {"stage": 2, "reduce_bucket_size": 1 << 16},
+                },
+            )
+        )
+        _force_moe_detection()
+        engine, _, _ = initialize_training_engine(
+            model,
+            ds_config,
+            optimizer=OptimizerSettings(lr=2e-3, weight_decay=0.1),
+            ep_size=1,
+            mpu=None,
+            model_path="test",
+            rank=rank,
+        )
+        assert engine.has_moe_layers  # the shards are reduced over their expert-data-parallel groups
+        return model, engine
+
+    def step(engine, batch) -> tuple[list[float], float]:
+        losses = []
+        for ids in batch:
+            loss = engine(ids, ids.roll(-1, dims=1))
+            engine.backward(loss)
+            engine.step()
+            losses.append(loss.item())
+        return losses, float(engine.get_global_grad_norm())
+
+    def checkpoint(engine, model, action, *args, **kwargs):
+        engine.has_moe_layers = False  # as dss's ExpertParallelCheckpointer saves and loads
+        try:
+            with dense_shard.full_state_dict(model):
+                return action(*args, **kwargs)
+        finally:
+            engine.has_moe_layers = True
+
+    model, engine = build(0)
+    for batch in batches[:2]:
+        step(engine, batch)
+    checkpoint(engine, model, engine.save_checkpoint, ckpt_dir, tag="step2")
+    want_losses, want_norm = step(engine, batches[2])
+    want = _full_weights(model)
+    # Outside the context, DeepSpeed's and dss's resumable saves refuse on every rank; inside it, DeepSpeed's MoE
+    # path (the module state of data-parallel rank 0 alone) refuses too.
+    for refused in _resumable_saves(engine, ckpt_dir):
+        with pytest.raises(RuntimeError, match="Resumable checkpoints .* are not supported"):
+            refused()
+    with dense_shard.full_state_dict(model), pytest.raises(RuntimeError, match="must take the non-MoE path"):
+        engine.save_checkpoint(ckpt_dir, tag="moe-path")
+    engine.destroy()
+    del engine, model
+
+    model, engine = build(1)
+    for refused in _resumable_loads(engine, ckpt_dir):
+        with pytest.raises(RuntimeError, match="Resumable checkpoints .* are not supported"):
+            refused()
+    path, _ = checkpoint(engine, model, engine.load_checkpoint, ckpt_dir, tag="step2")
+    assert path is not None and engine.global_steps == 2, (path, engine.global_steps)
+    got_losses, got_norm = step(engine, batches[2])
+    got = _full_weights(model)
+    engine.destroy()
+    assert got_losses == want_losses and got_norm == want_norm, (want_losses, got_losses, want_norm, got_norm)
+    assert got.keys() == want.keys()
+    for name, value in want.items():
+        assert torch.equal(got[name], value), name
+    return {"losses": got_losses, "norm": got_norm}
+
+
+def _resumable_saves(engine, ckpt_dir: str) -> list:
+    saves = [lambda: engine.save_checkpoint(ckpt_dir, tag="refused")]
+    try:
+        from dss.ray_dss.jobs.checkpointing.expert_parallel import ExpertParallelCheckpointer
+    except ImportError:
+        return saves
+    return saves + [lambda: ExpertParallelCheckpointer().save_resumable(engine, ckpt_dir, "refused-dss")]
+
+
+def _resumable_loads(engine, ckpt_dir: str) -> list:
+    loads = [lambda: engine.load_checkpoint(ckpt_dir, tag="step2")]
+    try:
+        from dss.ray_dss.jobs.checkpointing.expert_parallel import ExpertParallelCheckpointer
+    except ImportError:
+        return loads
+    return loads + [lambda: ExpertParallelCheckpointer().load_resumable(engine, ckpt_dir, "step2")]
+
+
+def _cpu_worker(rank: int, port: int, case, args: tuple, results) -> None:
+    import deepspeed
+    import torch.distributed as dist
+
+    os.environ.update(
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT=str(port),
+        RANK=str(rank),
+        WORLD_SIZE=str(CPU_WORLD),
+        LOCAL_RANK=str(rank),
+    )
+    torch.set_num_threads(2)
+    deepspeed.init_distributed(dist_backend="gloo")
+    from arctic_platform.model.parallel.groups import setup_parallel_groups
+
+    setup_parallel_groups(1, CPU_WORLD, world_size=CPU_WORLD, gpus_per_node=CPU_NODE)
+    results[rank] = case(rank, *args)
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def _run_cpu(case, *args) -> dict:
+    from arctic_platform.testing_utils import get_unique_port_number
+    from arctic_platform.testing_utils import reserve_free_port
+
+    port = reserve_free_port(get_unique_port_number() + 3, span=5)
+    with mp.Manager() as manager:
+        results = manager.dict()
+        mp.spawn(_cpu_worker, args=(port, case, args, results), nprocs=CPU_WORLD, join=True)
+        return dict(results)
+
+
+def test_a_sharded_model_exports_the_unsharded_models_weights():
+    """HF (as a weights-only checkpoint saves it, skipped tensors included) and vLLM (as the weight sync streams it):
+    the same names in the same order, the same tensors bit for bit. Rank 0 holds at most one export unit's whole
+    weights beyond what the unsharded export holds."""
+    results = _run_cpu(_export_case)
+    r = results[0]
+    for weight_format in ("hf", "vllm"):
+        unsharded_peak, sharded_peak = r[weight_format]["peaks"]
+        print(
+            f"\n{weight_format}: {r[weight_format]['tensors']} tensors; rank 0 export peak {unsharded_peak} B"
+            f" unsharded, {sharded_peak} B sharded; largest unit {r['largest_unit']} B of {r['dense']} B of dense"
+            " weights"
+        )
+        assert 0 < sharded_peak - unsharded_peak <= r["largest_unit"] < r["dense"], r
+
+
+def test_the_state_dict_is_the_unsharded_models_and_loads_back():
+    results = _run_cpu(_state_dict_case)
+    assert all(r["keys"] == results[0]["keys"] for r in results.values()), results
+
+
+def test_a_resumable_checkpoint_continues_the_run_exactly(tmp_path):
+    results = _run_cpu(_resume_case, str(tmp_path))
+    print(f"\nthird step after the load: losses {results[0]['losses']}, grad norm {results[0]['norm']}")

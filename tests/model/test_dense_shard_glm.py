@@ -24,6 +24,10 @@ gradient norms agree to the BF16 rounding of each node's partial sums (see test_
 itself not deterministic (the sparse MLA backward adds dKV atomically): two invocations of it differed by 1.2e-5 in
 the first gradient norm and 0.4-0.55% in the next two, as much as the sharded run differs from it.
 
+The same model, engine built, before any step: the sharded model's HF export (as a weights-only checkpoint writes it,
+GLM's own layer conversion included) and its state dict (inside ``full_state_dict``) are the replicated model's, bit
+for bit, and the export holds one unit's whole dense weights at a time on rank 0.
+
     python -m pytest -q -s tests/model/test_dense_shard_glm.py
 """
 
@@ -89,7 +93,8 @@ def _full_weights(model) -> dict[str, torch.Tensor]:
     return out
 
 
-def _train(rank: int, model_dir: str, shard: bool):
+def _build_engine(rank: int, model_dir: str, shard: bool):
+    """The model through the loader and its DeepSpeed engine, as the training job builds them."""
     import deepspeed.utils.groups as ds_groups
 
     from arctic_platform.common.deepspeed_engine import OptimizerSettings
@@ -97,7 +102,6 @@ def _train(rank: int, model_dir: str, shard: bool):
     from arctic_platform.common.deepspeed_engine import build_deepspeed_config
     from arctic_platform.common.deepspeed_engine import initialize_training_engine
     from arctic_platform.model.implementations.glm52 import load_glm_moe_dsa_model
-    from arctic_platform.model.implementations.moe import dense_shard
     from arctic_platform.model.loaders.glm_moe_dsa import GlmMoeDsaOptions
 
     options = GlmMoeDsaOptions(
@@ -142,6 +146,13 @@ def _train(rank: int, model_dir: str, shard: bool):
         rank=rank,
     )
     torch.cuda.synchronize()
+    return model, engine
+
+
+def _train(rank: int, model_dir: str, shard: bool):
+    from arctic_platform.model.implementations.moe import dense_shard
+
+    model, engine = _build_engine(rank, model_dir, shard)
     dense = sum(
         p.numel() * p.element_size()
         for p in model.parameters()
@@ -180,6 +191,39 @@ class _nullcontext:
         return False
 
 
+def _export(rank: int, model_dir: str, shard: bool) -> dict:
+    """With the engine built, before any step: the HF export as a weights-only checkpoint writes it (rank 0 keeps a
+    host copy of each tensor and drops the tensor), the GPU memory it adds on rank 0, and the state dict (host)."""
+    from arctic_platform.model import iter_model_weights
+    from arctic_platform.model.implementations.moe import dense_shard
+
+    model, engine = _build_engine(rank, model_dir, shard)
+    units: dict[int, int] = {}  # the export units' whole dense bytes: each layer, and the rest together (-1)
+    for sharded in (m._ap_dense_shards for m in model.modules() if hasattr(m, "_ap_dense_shards")):
+        name = next(iter(sharded.members)).name
+        index = int(name.split(".")[2]) if name.startswith("model.layers.") else -1
+        units[index] = units.get(index, 0) + sum(b.total * b.shard.element_size() for b in sharded.buckets)
+    base = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    exported = []
+    for item in iter_model_weights(model, "hf", is_master=rank == 0, is_zero3=False, include_skipped=True):
+        exported.append(_host_copy(item))
+        del item
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - base
+    with dense_shard.full_state_dict(model) if shard else _nullcontext():
+        state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+    engine.destroy()
+    del engine, model
+    torch.cuda.empty_cache()
+    return {"exported": exported, "peak": peak, "state": state, "units": units}
+
+
+def _host_copy(item: tuple) -> tuple:
+    name, tensor = item
+    return name, tensor.detach().cpu()
+
+
 def _worker(rank: int, port: int, model_dir: str, results) -> None:
     import deepspeed
     import torch.distributed as dist
@@ -201,6 +245,38 @@ def _worker(rank: int, port: int, model_dir: str, results) -> None:
     for run in (replicated, sharded):
         del run["first"]
     results[rank] = {"replicated": replicated, "sharded": sharded, "first_differ": first_differ}
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def _export_worker(rank: int, port: int, model_dir: str, results) -> None:
+    import deepspeed
+    import torch.distributed as dist
+
+    os.environ.update(
+        MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE=str(WORLD), LOCAL_RANK=str(rank)
+    )
+    torch.cuda.set_device(rank)
+    deepspeed.init_distributed(dist_backend="nccl")
+    from arctic_platform.model.parallel.groups import setup_parallel_groups
+
+    setup_parallel_groups(1, WORLD, world_size=WORLD, gpus_per_node=NODE)
+    replicated = _export(rank, model_dir, False)
+    sharded = _export(rank, model_dir, True)
+    assert bool(replicated["exported"]) == (rank == 0) and bool(sharded["exported"]) == (rank == 0)
+    assert [name for name, _ in sharded["exported"]] == [name for name, _ in replicated["exported"]]
+    for (name, got), (_, want) in zip(sharded["exported"], replicated["exported"]):
+        assert got.dtype == want.dtype and torch.equal(got, want), name
+    assert list(sharded["state"]) == list(replicated["state"])
+    assert not any("dense_shard" in key for key in sharded["state"])
+    for key, want in replicated["state"].items():
+        assert sharded["state"][key].dtype == want.dtype and torch.equal(sharded["state"][key], want), key
+    results[rank] = {
+        "tensors": len(replicated["exported"]),
+        "keys": len(replicated["state"]),
+        "peaks": (replicated["peak"], sharded["peak"]),
+        "units": sharded["units"],
+    }
     dist.barrier()
     dist.destroy_process_group()
 
@@ -251,3 +327,29 @@ def test_glm_with_sharded_dense_weights_trains_as_the_replicated_model(tmp_path)
         assert _rel(got["norms"], want["norms"]) < 5e-2, (rank, want["norms"], got["norms"])
         assert _rel(got["losses"], want["losses"]) < 1e-2, (rank, want["losses"], got["losses"])
         assert got["dense"] < 0.26 * want["dense"], (want["dense"], got["dense"])
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < WORLD, reason=f"needs {WORLD} GPUs")
+def test_glm_with_sharded_dense_weights_exports_and_saves_the_replicated_weights(tmp_path):
+    """The HF export (as a weights-only checkpoint writes it) and the state dict of the sharded model are the
+    replicated model's, bit for bit, under the same names in the same order; rank 0 holds one export unit's whole
+    dense weights at a time beyond what the replicated export holds."""
+    pytest.importorskip("deep_ep")
+    from arctic_platform.testing_utils import get_unique_port_number
+    from arctic_platform.testing_utils import reserve_free_port
+
+    (tmp_path / "config.json").write_text(json.dumps(_CONFIG))
+    port = reserve_free_port(get_unique_port_number() + 3, span=5)
+    with mp.Manager() as manager:
+        results = manager.dict()
+        mp.spawn(_export_worker, args=(port, str(tmp_path), results), nprocs=WORLD, join=True)
+        results = dict(results)
+    r = results[0]
+    (replicated, sharded), units = r["peaks"], r["units"]
+    print(
+        f"\n{r['tensors']} exported tensors, {r['keys']} state dict keys; rank 0 export peak {replicated / 2**20:.1f} "
+        f"MiB replicated, {sharded / 2**20:.1f} MiB sharded; export units {units} B"
+    )
+    # The caching allocator rounds each block up (2 MiB for the large ones).
+    assert sharded - replicated <= max(units.values()) + 4 * 2**20, (r["peaks"], units)
+    assert sharded - replicated < sum(units.values()), (r["peaks"], units)

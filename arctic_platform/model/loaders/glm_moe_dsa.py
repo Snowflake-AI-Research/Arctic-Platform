@@ -79,7 +79,8 @@ class GlmMoeDsaOptions(MoeRuntimeOptions):
             "Full fine-tuning: shard the trainable weights every GPU holds whole (each decoder layer's attention, DSA "
             "indexer, shared experts, dense MLP, router and norms; the embedding; the LM head) over the GPUs of each "
             "node, all-gathered around each call of the layer and reduce-scattered in its backward "
-            "(moe/dense_shard.py). Not with LoRA. Unset: ARL_SHARD_DENSE."
+            "(moe/dense_shard.py). The weight export (weights-only checkpoints, weight sync) holds the whole weights; "
+            "resumable checkpoints are refused. Not with LoRA. Unset: ARL_SHARD_DENSE."
         ),
     )
     shard_dense_group_size: int | None = Field(
