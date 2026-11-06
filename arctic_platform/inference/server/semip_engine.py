@@ -248,11 +248,14 @@ _INCOMING_NAME = ".incoming"
 # publisher's SKELETON_DIRS, whose order is only its upload order.
 _COPY_SUBDIRS = (_COMPILATION_DIR, _IMAGE_DIR)
 
-# "peers" assembles those directories from byte ranges served by the
-# model-cache daemons on every node, with any range they do not deliver read
-# from the local mirror; "local" is the same parallel ranged copy from the
-# local mirror alone. See semip_gather.py; unset keeps copytree.
+# How those directories are copied. Unset is "local": a parallel ranged copy
+# from the mirror with O_DIRECT writes, ~4 s for GLM-5.3's 79 GB where copytree
+# takes ~20. "peers" pulls the ranges from every node's model-cache daemon
+# instead, "off" is copytree. See semip_gather.py.
 _GATHER_ENV = "SEMIP_GATHER"
+# The ranged copy plans from the daemon's manifest, which every verified mirror
+# directory carries; a source without one is copied with copytree.
+_DAEMON_MANIFEST = "_neutrino_manifest.json"
 
 # Written by _semip_save_weights beside the shards it indexes; TP>1 fans out
 # into rank<N>/ subdirectories with one of these each.
@@ -1688,12 +1691,15 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
             src = os.path.join(source_dir, sub)
             if not os.path.isdir(src):
                 raise RuntimeError(f"{src} is missing from the published image")
-        # Only when asked for, and by name rather than `from ... import`: the
-        # tests load this module from its file, without the package, and
-        # register the gather in sys.modules the same way.
+        # By name rather than `from ... import`: the tests load this module
+        # from its file, without the package, and register the gather in
+        # sys.modules the same way.
+        planned = os.path.isfile(os.path.join(verified_dir or source_dir,
+                                              _DAEMON_MANIFEST))
         semip_gather = (importlib.import_module(
             "arctic_platform.inference.server.semip_gather")
-            if os.environ.get(_GATHER_ENV, "").strip() else None)
+            if planned and os.environ.get(_GATHER_ENV, "").strip().lower()
+            != "off" else None)
         if semip_gather is not None and semip_gather.enabled():
             gathered = semip_gather.gather(
                 source_dir, verified_dir or source_dir, incoming,
