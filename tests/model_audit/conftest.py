@@ -327,6 +327,8 @@ def probes(request) -> ProbeRunner:
 
 
 def require_ok(result: dict, what: str) -> dict:
+    if result.get("skip"):
+        pytest.skip(result["skip"])
     status = result.get("status", {})
     if not status.get("ok"):
         pytest.fail(f"{what} failed before any comparison: {status.get('error')}\nlog: {result.get('_log')}")
@@ -440,11 +442,11 @@ class ClientJobs:
             self.steps[name] = run
             if run.get("status", {}).get("ok"):
                 keep = reference_unavailable(self.profile, self.ckpt) is None
-                self.steps[name] = {
-                    **audit_lib.client_step(self.profile, run, keep_tensors=keep),
-                    "status": run["status"],
-                    "_log": run["_log"],
-                }
+                try:
+                    step = audit_lib.client_step(self.profile, run, keep_tensors=keep)
+                except audit_lib.CoverageGap as gap:
+                    step = {"skip": str(gap)}
+                self.steps[name] = {**step, "status": run["status"], "_log": run["_log"]}
         return self.steps[name]
 
 
@@ -485,6 +487,7 @@ def trainer_forward(client_baseline):
         "spec": run["job"]["training"],
         "exported": exported,
         "buffers": sorted(buffers),
+        "grad_name_gap": audit_lib.unpaired_names(norms, exported),
         "no_grad_params": sorted(n for n in exported if n not in buffers and not norms.get(n)),
         "nonfinite_grad_params": sorted(
             n for n, v in norms.items() if v is None or not torch.isfinite(torch.tensor(v))

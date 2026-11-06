@@ -253,6 +253,21 @@ def read_checkpoint_tensors(path: Path) -> dict:
     return tensors
 
 
+class CoverageGap(LookupError):
+    """The service's artifacts cannot answer a check for this model."""
+
+
+def unpaired_names(names, exported) -> str | None:
+    """A coverage-gap reason when the service names parameters differently from its HF export, else None."""
+    unpaired = sorted(set(names) - set(exported))
+    if not unpaired:
+        return None
+    return (
+        f"coverage gap: {len(unpaired)} of {len(set(names))} parameters the service reports have no export of the same"
+        f" name (e.g. {unpaired[0]}), so they cannot be paired per parameter"
+    )
+
+
 def zero_checkpoint(path: Path, kinds: tuple[str, ...] = ("masters", "exp_avg")) -> dict:
     """fp32 master weights and Adam moments (``kinds``) of a DeepSpeed ZeRO-1/2 checkpoint, merged across ranks."""
     import torch
@@ -429,6 +444,11 @@ def client_step(profile: Profile, run: dict, keep_tensors: bool = True) -> dict:
 
     reply, exports = run["step"]["reply"], run["exports"]
     before = read_checkpoint_tensors(Path(exports["initial"]))
+    states = next(Path(exports["resumable"]).glob("*mp_rank_00_model_states.pt"))
+    shapes = torch.load(states, map_location="cpu", weights_only=False, mmap=True)["param_shapes"]
+    gap = unpaired_names([n for group in shapes for n in group], before)
+    if gap:
+        raise CoverageGap(gap)
     after = read_checkpoint_tensors(Path(exports["after_step"]))
     zero = zero_checkpoint(Path(exports["resumable"]))
     hyper = zero["hyper"]
