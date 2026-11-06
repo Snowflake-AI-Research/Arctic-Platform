@@ -244,6 +244,7 @@ def _resolve_sampler_kl(config: dict, context: dict) -> tuple[float, str, float]
     return coef, kind, float(cap)
 
 
+_SCORE_CENTERING_TAIL_RESOLUTION = 1e-5
 _SCORE_CENTERING_METRIC_NAMES = (
     "score_centering_token_count",
     "score_centering_sampler_head_mass_sum",
@@ -338,7 +339,17 @@ def _score_centering_center(
     valid = (topk_ids >= 0) & torch.isfinite(sampler_topk_log_probs) & mask.unsqueeze(-1)
     p = torch.where(valid, head_log_p.detach().float().exp(), 0.0)
     q = torch.where(valid, sampler_topk_log_probs.float().exp(), 0.0)
-    rho = (1.0 - q.sum(-1)).clamp_min(0.0) / group_log_probs[..., k].detach().float().exp().clamp_min(1e-6)
+    # A float32 sampler resolves its tail only to ~1e-6: at a near-certain prefix its top-k log-probs can sum
+    # past 1 (the top log-prob rounds toward 0), which would zero ρ. Tails that agree to that resolution are
+    # taken as equal; the gradient this changes is bounded by the tail mass itself.
+    sampler_log_head = torch.where(valid, sampler_topk_log_probs.double(), -math.inf).logsumexp(-1)
+    sampler_tail = (-torch.expm1(sampler_log_head)).clamp_min(0.0)
+    trainer_tail = group_log_probs[..., k].detach().double().exp()
+    rho = torch.where(
+        (sampler_tail - trainer_tail).abs() <= _SCORE_CENTERING_TAIL_RESOLUTION,
+        1.0,
+        sampler_tail / trainer_tail.clamp_min(torch.finfo(torch.float64).tiny),
+    ).float()
     # inf * 0 is NaN, so an unbounded side is expressed without the product.
     high_q = q * weight_high if math.isfinite(weight_high) else torch.full_like(q, math.inf)
     high_rho = rho * weight_high if math.isfinite(weight_high) else torch.full_like(rho, math.inf)

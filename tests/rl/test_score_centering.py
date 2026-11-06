@@ -116,6 +116,25 @@ class TestScoreCentering(TestCasePlus):
         self.assertLess(metrics["score_centering_coef_abs_sum"], 1e-5)
         self.assertEqual(metrics["score_centering_token_count"], float(context["loss_mask"].sum()))
 
+    def test_near_certain_positions_where_the_sampler_is_the_trainer_get_no_correction(self):
+        # A top-1 margin of ~20 nats leaves ~1e-8 outside the top-K: 1 - Σ q rounds to zero in float32.
+        logits, _, _, tokens, context = _setup(seed=13)
+        logits = logits.clone()
+        logits[..., 0] += 22.0
+        tokens = torch.zeros_like(tokens)
+        log_p = logits.log_softmax(-1)
+        ids = logits.topk(K, -1).indices
+        on_policy = dict(
+            context,
+            old_log_probs_shifted=log_p[..., 0],
+            sampler_topk_ids_shifted=ids.to(torch.int32),
+            sampler_topk_log_probs_shifted=log_p.gather(-1, ids),
+        )
+        _, grad, metrics = _loss_grad("grpo", logits, ids, tokens, on_policy, {**CAP, "score_centering": True})
+        _, base_grad, _ = _loss_grad("grpo", logits, ids, tokens, on_policy, CAP)
+        torch_assert_close(grad, base_grad, rtol=0, atol=1e-7)
+        self.assertLess(metrics["score_centering_coef_abs_sum"], 1e-5)
+
     def test_matches_exact_centering_under_both_cispo_weights(self):
         for config, (low, high) in ((CAP, (0.0, 5.0)), (BAND, (0.8, 1.2))):
             for name in ("grpo", "ap_grpo"):
