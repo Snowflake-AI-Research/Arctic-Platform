@@ -326,7 +326,7 @@ def test_cpu_adam_uses_fp32_states_unless_bf16_optimizer_states_are_enabled():
             OptimizerSettings(),
             _ZERO2,
             False,
-            ("torch_adamw", "the model's default optimizer policy selected standard AdamW"),
+            ("torch_adamw", "you set 'optimizer.fused' to false, so standard AdamW ran"),
         ),
         (
             OptimizerSettings(fused=False),
@@ -572,7 +572,6 @@ def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypa
         return "engine", kwargs.get("optimizer"), None, None
 
     monkeypatch.setattr(deepspeed_engine, "build_training_optimizer", _build)
-    monkeypatch.setattr(deepspeed_engine, "is_glm_moe_model", lambda path: False)
     monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
     monkeypatch.setattr("deepspeed.initialize", _initialize)
     model = torch.nn.Linear(1, 1)
@@ -648,9 +647,19 @@ def test_initialize_native_deepspeed_optimizer_forwards_model_parameters(monkeyp
 
 
 @pytest.mark.parametrize("model_type", ["glm_moe_dsa", "glm5_next_text"])
-@pytest.mark.parametrize("fused,expected", [(None, "torch_adamw"), (False, "torch_adamw"), (True, "fused_adam")])
+@pytest.mark.parametrize(
+    "name,fused,expected",
+    [
+        ("AdamW", None, "fused_adam"),
+        ("AdamW", False, "torch_adamw"),
+        ("AdamW", True, "fused_adam"),
+        ("FusedAdam", None, "fused_adam"),
+        ("fused_adam", None, "fused_adam"),
+        ("torch_adamw", None, "torch_adamw"),
+    ],
+)
 def test_initialize_splits_expert_groups_and_respects_glm_optimizer_choice(
-    monkeypatch, tmp_path, model_type, fused, expected
+    monkeypatch, tmp_path, model_type, name, fused, expected
 ):
     calls = {}
 
@@ -678,7 +687,7 @@ def test_initialize_splits_expert_groups_and_respects_glm_optimizer_choice(
     engine, optimizer, choice = initialize_training_engine(
         model,
         _ZERO2,
-        optimizer=OptimizerSettings(fused=fused),
+        optimizer=OptimizerSettings(name=name, fused=fused),
         ep_size=2,
         mpu=None,
         model_path=str(tmp_path),
@@ -703,9 +712,7 @@ def test_initialize_splits_expert_groups_and_respects_glm_optimizer_choice(
         ("cpu_adam", False, "deepspeed_cpu_adam"),
     ],
 )
-def test_glm_gpu_fallback_preserves_cpu_offload_optimizer_choice(
-    monkeypatch, tmp_path, model_type, name, fused, expected
-):
+def test_glm_preserves_cpu_offload_optimizer_choice(monkeypatch, tmp_path, model_type, name, fused, expected):
     native_ops = object()
     calls = {}
 

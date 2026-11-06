@@ -36,7 +36,6 @@ from pydantic import Field
 from arctic_platform.common.optimizer import OptimizerSettings
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
-from arctic_platform.model.moe_spec import is_glm_moe_model
 
 logger = logging.getLogger(__name__)
 
@@ -208,21 +207,20 @@ def apply_default_grad_accum_dtype(ds_config: dict[str, Any]) -> None:
 
 def _deepspeed_accepts_fp32_grad_accumulation(ds_config: dict[str, Any]) -> bool:
     """Whether DeepSpeed's optimizer sanity check accepts an explicit FP32 accumulation dtype."""
-    bf16_config = ds_config.get("bf16")
-    if bf16_config is None:
-        bf16_config = ds_config.get("bfloat16")
-    fp16_config = ds_config.get("fp16")
-    bf16 = isinstance(bf16_config, dict) and bool(bf16_config.get("enabled"))
-    fp16 = isinstance(fp16_config, dict) and bool(fp16_config.get("enabled"))
-    zero_config = ds_config.get("zero_optimization")
-    if not isinstance(zero_config, dict):
-        zero_config = {}
-    stage = int(zero_config.get("stage") or 0)
-    if stage == 0:
+    from deepspeed.runtime.precision_config import get_bfloat16_config
+    from deepspeed.runtime.precision_config import get_float16_config
+    from deepspeed.runtime.zero.config import ZeroStageEnum
+    from deepspeed.runtime.zero.config import get_zero_config
+    from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
+
+    # Use the same typed parsers as DeepSpeedConfig, including "auto" and deprecated fields.
+    zero = get_zero_config(ds_config)
+    bf16 = get_bfloat16_config(ds_config).enabled
+    fp16 = get_float16_config(ds_config).enabled
+    if zero.stage == ZeroStageEnum.disabled:
         return not (bf16 or fp16)
-    offload = zero_config.get("offload_optimizer")
-    cpu_offload = isinstance(offload, dict) and offload.get("device") == "cpu"
-    if stage == 1 and bf16 and not cpu_offload and zero_config.get("compute_grad_norm", True) is False:
+    cpu_offload = zero.offload_optimizer is not None and zero.offload_optimizer.device == OffloadDeviceEnum.cpu
+    if zero.stage == ZeroStageEnum.optimizer_states and bf16 and not cpu_offload and not zero.compute_grad_norm:
         return False
     return True
 
@@ -265,9 +263,7 @@ def initialize_training_engine(
     # Marks first: the optimizer groups split on them.
     preserved, marked_fp32 = preserve_fp8_params_through_ds_cast(model)
     if optimizer is not None:
-        fused = optimizer.fused
-        if fused is None:
-            fused = _optimizer_cpu_offload_enabled(ds_config) or not is_glm_moe_model(model_path)
+        fused = optimizer.fused is not False
         built = build_training_optimizer(model, optimizer, ds_config, fused=fused, adam_w_mode=adam_w_mode)
         choice = optimizer_choice(optimizer, ds_config, fused=fused, adam_w_mode=adam_w_mode)
         if ep_size > 1:
@@ -354,10 +350,8 @@ def optimizer_choice(
         reason = "you disabled AdamW mode, so standard Adam ran"
     elif optimizer_name == "torch_adamw":
         reason = f"you selected '{optimizer.name}'"
-    elif optimizer.fused is False:
-        reason = "you set 'optimizer.fused' to false, so standard AdamW ran"
     else:
-        reason = "the model's default optimizer policy selected standard AdamW"
+        reason = "you set 'optimizer.fused' to false, so standard AdamW ran"
     return {"implementation": implementation, "reason": reason}
 
 

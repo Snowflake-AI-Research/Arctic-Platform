@@ -168,6 +168,142 @@ def test_default_is_written_exactly_where_deepspeed_accepts_fp32_accumulation(ze
         assert defaulted["data_types"] == {"grad_accum_dtype": "fp32"}
 
 
+def _resolved_engine(config):
+    from deepspeed.runtime.config import DeepSpeedConfig
+    from deepspeed.runtime.engine import DeepSpeedEngine
+
+    engine = DeepSpeedEngine.__new__(DeepSpeedEngine)
+    torch.nn.Module.__init__(engine)
+    object.__setattr__(engine, "_config", DeepSpeedConfig(config))
+    object.__setattr__(engine, "pipeline_parallelism", False)
+    object.__setattr__(engine, "global_rank", 0)
+    engine.optimizer = None
+    engine.checkpoint_engine = None
+    return engine
+
+
+@pytest.mark.parametrize(
+    "raw_boolean, resolved_boolean",
+    [(True, True), (False, False), ("true", True), ("false", False), (1, True), (0, False)],
+)
+@pytest.mark.parametrize("entry_point", ["builder", "worker"])
+def test_typed_grad_norm_policy_matches_real_deepspeed_sanity_check(
+    worker, raw_boolean, resolved_boolean, entry_point
+):
+    from deepspeed.runtime.zero.config import get_zero_config
+
+    zero = {"stage": 1, "compute_grad_norm": raw_boolean}
+    overrides = {
+        "zero_optimization": zero,
+        "gradient_clipping": 0.0,
+        "zero_allow_untested_optimizer": True,
+    }
+    assert get_zero_config(overrides).compute_grad_norm is resolved_boolean
+    if entry_point == "builder":
+        defaulted = build_deepspeed_config(
+            TrainingEngineSpec(world_size=1, fp32_masters=True, ds_overrides=deepcopy(overrides))
+        )
+    else:
+        defaulted = worker.ds_training_config({}, deepcopy(overrides), {})
+    assert ("data_types" in defaulted) is resolved_boolean
+    engine = _resolved_engine(defaulted)
+    assert engine._config.zero_config.compute_grad_norm is resolved_boolean
+    assert engine.get_data_types() == (torch.bfloat16, torch.float32 if resolved_boolean else torch.bfloat16)
+    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(8))])
+    engine._do_optimizer_sanity_check(optimizer)
+    explicit_engine = _resolved_engine({**defaulted, "data_types": {"grad_accum_dtype": "fp32"}})
+    if resolved_boolean:
+        explicit_engine._do_optimizer_sanity_check(optimizer)
+    else:
+        with pytest.raises(ValueError, match="compute_grad_norm=false"):
+            explicit_engine._do_optimizer_sanity_check(optimizer)
+
+
+@pytest.mark.parametrize(
+    "raw_boolean, resolved_boolean",
+    [(True, True), (False, False), ("true", True), ("false", False), (1, True), (0, False)],
+)
+@pytest.mark.parametrize("precision", ["bf16", "bfloat16", "fp16"])
+def test_typed_precision_policy_matches_real_deepspeed_parser(precision, raw_boolean, resolved_boolean):
+    config = {
+        "train_micro_batch_size_per_gpu": 1,
+        "zero_optimization": {"stage": 0},
+        precision: {"enabled": raw_boolean},
+    }
+    apply_default_grad_accum_dtype(config)
+    assert ("data_types" in config) is not resolved_boolean
+    engine = _resolved_engine(config)
+    parsed = engine._config.float16_config if precision == "fp16" else engine._config.bfloat16_config
+    assert parsed.enabled is resolved_boolean
+    model_dtype = torch.float16 if precision == "fp16" else torch.bfloat16
+    expected_dtype = model_dtype if resolved_boolean else torch.float32
+    assert engine.get_data_types() == (expected_dtype, expected_dtype)
+    engine._do_optimizer_sanity_check(torch.optim.AdamW([torch.nn.Parameter(torch.zeros(8))]))
+
+
+@pytest.mark.parametrize("entry_point", ["builder", "worker"])
+@pytest.mark.parametrize(
+    "zero, resolved_stage, cpu_offload, fp32",
+    [
+        ({"stage": "auto"}, 0, False, False),
+        (True, 1, False, True),
+        (False, 0, False, False),
+        ({"stage": 1, "compute_grad_norm": False, "cpu_offload": True}, 1, True, True),
+        ({"stage": 1, "compute_grad_norm": "false", "cpu_offload": "true"}, 1, True, True),
+        ({"stage": 1, "compute_grad_norm": 0, "cpu_offload": 1}, 1, True, True),
+        ({"stage": 1, "compute_grad_norm": False, "cpu_offload": False}, 1, False, False),
+        ({"stage": 1, "compute_grad_norm": "false", "cpu_offload": "false"}, 1, False, False),
+        ({"stage": 1, "compute_grad_norm": 0, "cpu_offload": 0}, 1, False, False),
+    ],
+)
+def test_auto_and_legacy_zero_policy_matches_real_deepspeed_parser(
+    worker, entry_point, zero, resolved_stage, cpu_offload, fp32
+):
+    from deepspeed.runtime.zero.config import get_zero_config
+
+    overrides = {
+        "zero_optimization": deepcopy(zero),
+        "gradient_clipping": 0.0,
+        "zero_allow_untested_optimizer": True,
+    }
+    original = deepcopy(overrides)
+    parsed = get_zero_config(overrides)
+    assert parsed.stage == resolved_stage
+    assert (parsed.offload_optimizer is not None) is cpu_offload
+    if cpu_offload:
+        assert parsed.offload_optimizer.device == "cpu"
+    if entry_point == "builder":
+        defaulted = build_deepspeed_config(TrainingEngineSpec(world_size=1, fp32_masters=True, ds_overrides=overrides))
+        assert overrides == original
+    else:
+        defaulted = worker.ds_training_config({}, overrides, {})
+    assert defaulted["zero_optimization"] == zero
+    assert ("data_types" in defaulted) is fp32
+    engine = _resolved_engine(defaulted)
+    assert engine._config.zero_config.stage == resolved_stage
+    assert engine.zero_cpu_offload() is cpu_offload
+    assert engine.get_data_types() == (torch.bfloat16, torch.float32 if fp32 else torch.bfloat16)
+    engine._do_optimizer_sanity_check(torch.optim.AdamW([torch.nn.Parameter(torch.zeros(8))]))
+
+
+@pytest.mark.parametrize("entry_point", ["helper", "builder"])
+def test_malformed_stage_retains_deepspeed_structured_validation_error(entry_point):
+    from deepspeed.runtime.zero.config import get_zero_config
+    from pydantic import ValidationError
+
+    config = {"zero_optimization": {"stage": "invalid"}}
+    original = deepcopy(config)
+    with pytest.raises(ValidationError) as native:
+        get_zero_config(config)
+    with pytest.raises(ValidationError) as candidate:
+        if entry_point == "helper":
+            apply_default_grad_accum_dtype(config)
+        else:
+            build_deepspeed_config(TrainingEngineSpec(world_size=1, ds_overrides=config))
+    assert candidate.value.errors() == native.value.errors()
+    assert config == original
+
+
 @pytest.mark.parametrize("data_types", ["invalid", [], 17])
 def test_invalid_accumulation_blocks_are_left_for_deepspeed_validation(data_types):
     config = {**deepcopy(_ZERO2), "data_types": data_types}
