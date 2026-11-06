@@ -44,6 +44,8 @@ from arctic_platform.client import AsyncArcticRLClient
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client import SamplingConfig
 from arctic_platform.client import TrainingConfig
+from arctic_platform.common.balance_metadata import prompt_rows_for_balance
+from arctic_platform.common.balance_metadata import stamp_client_balance
 from arctic_platform.rl.ray_server import ArcticRLRayServerState
 
 _ARCTIC_METRIC_REDUCTION_FN = {
@@ -118,7 +120,7 @@ def _prepare_padded_arctic_batch_dict(data, pad_token_id, *, drop_position_ids: 
     batch_dict = dict(
         input_ids=input_ids,
         attention_mask=data["attention_mask"],
-        prompts=data["prompts"],
+        prompts=prompt_rows_for_balance(data.get("prompts"), input_ids, max_prompt_len),
     )
     if not drop_position_ids:
         position_ids, _, _ = _no_padding_2_padding_prompt_response(
@@ -159,8 +161,14 @@ class ArcticRLClientWrapper(RemoteBackend):
         self.logits_optimization_peak_mem_size_in_gib = _logits_cfg.get("optimization_peak_mem_size_in_gib", 4)
         self.logits_compute_in_fp32 = _logits_cfg.get("compute_in_fp32", False)
         self.logits_compute_from_fp32_inputs = _logits_cfg.get("compute_from_fp32_inputs", False)
-        # Zorro-group load balancer (zorro-agnostic): server reorgs the global batch when set.
-        self.load_balancer = _train_cfg.get("load_balancer", True)
+        # False keeps arrival order. True balances sample lengths, or whole ZoRRo prompt groups.
+        # ``load_balancer`` is the previous key. An explicit false still opts out.
+        if _train_cfg.get("balance_batch", None) is not None:
+            self.balance_batch = bool(_train_cfg.get("balance_batch"))
+        elif _train_cfg.get("load_balancer", None) is not None:
+            self.balance_batch = bool(_train_cfg.get("load_balancer"))
+        else:
+            self.balance_batch = True
         # CUDA-IPC bypasses NCCL for weight sync; only valid when colocate=True.
         self.cuda_ipc_weight_sync = self._backend_config.weight_sync.cuda_ipc
         self.low_memory_weight_sync = self._backend_config.weight_sync.low_memory
@@ -238,7 +246,6 @@ class ArcticRLClientWrapper(RemoteBackend):
         meta = dict(
             zorro_train_enable=self.zorro_train_enable,
             zorro_train_max_rollouts=self.zorro_train_max_rollouts,
-            load_balancer=self.load_balancer,
             rollout_n=rollout_n,
             max_prompt_len=max_prompt_len,
             max_response_len=max_response_len,
@@ -250,6 +257,13 @@ class ArcticRLClientWrapper(RemoteBackend):
             logits_optimization=self.logits_optimization,
             logits_optimization_peak_mem_size_in_gib=self.logits_optimization_peak_mem_size_in_gib,
             logits_compute_in_fp32=self.logits_compute_in_fp32,
+        )
+        # Log-probs are read by position, so this call keeps arrival order.
+        stamp_client_balance(
+            meta,
+            balance_batch=False,
+            zorro_train_enable=self.zorro_train_enable,
+            rollout_n=rollout_n,
         )
         payload = dict(batch=batch, meta=meta)
 
@@ -279,11 +293,15 @@ class ArcticRLClientWrapper(RemoteBackend):
             tensor=data["input_ids"], data=data, pad_token_id=pad_token_id
         )
 
+        prompts = prompt_rows_for_balance(data.get("prompts"), input_ids, max_prompt_len)
+        responses = data["responses"]
+        if not torch.is_tensor(responses) or responses.is_nested or responses.ndim != 2:
+            responses = input_ids[:, max_prompt_len:]
         batch = dict(
             input_ids=input_ids,
             attention_mask=data["attention_mask"],
-            prompts=data["prompts"],
-            responses=data["responses"],
+            prompts=prompts,
+            responses=responses,
             response_mask=data["response_mask"],
             old_log_probs=data["old_log_probs"],
             advantages=data["advantages"],
@@ -304,7 +322,6 @@ class ArcticRLClientWrapper(RemoteBackend):
         meta = dict(
             zorro_train_enable=self.zorro_train_enable,
             zorro_train_max_rollouts=self.zorro_train_max_rollouts,
-            load_balancer=self.load_balancer,
             rollout_n=rollout_n,
             max_prompt_len=max_prompt_len,
             max_response_len=max_response_len,
@@ -356,6 +373,15 @@ class ArcticRLClientWrapper(RemoteBackend):
                 meta_chunk = dict(meta)
                 meta_chunk["global_batch_size"] = per_step_global_bsz
                 meta_chunk["batch_num_tokens"] = batch_chunk["response_mask"].sum()
+                stamp_client_balance(
+                    meta_chunk,
+                    balance_batch=self.balance_batch,
+                    zorro_train_enable=self.zorro_train_enable,
+                    rollout_n=rollout_n,
+                    prompts=batch_chunk.get("prompts"),
+                    input_ids=batch_chunk["input_ids"],
+                    max_prompt_len=max_prompt_len,
+                )
 
                 payload = dict(batch=batch_chunk, meta=meta_chunk)
                 response = await self._send_update_actor(payload)
