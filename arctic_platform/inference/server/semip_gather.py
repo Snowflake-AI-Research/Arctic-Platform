@@ -12,7 +12,10 @@ Nothing is distributed: every node still holds every file. So any range a peer
 does not deliver (refused, timed out, short, gone, or simply never assigned
 because there were no peers) is read from the local mirror and written at the
 same offset. There is no S3 path and no retry against another peer, and a
-gather with no reachable peer is a parallel local copy.
+gather with no reachable peer is a parallel local copy -- which is also what
+``SEMIP_GATHER=local`` asks for outright. On p5en that local copy alone runs at
+~11 GB/s against copytree's ~3.9, the same ceiling three peers reached: the
+destination's buffered writes are the bound, not the network.
 
 Standard library only, like ``semip_engine``: the tests load both straight from
 their files, without the packages that pull in ray and torch.
@@ -24,6 +27,7 @@ import hashlib
 import http.client
 import json
 import logging
+import mmap
 import os
 import queue
 import re
@@ -36,8 +40,11 @@ from typing import NamedTuple
 
 logger = logging.getLogger("arctic_platform.inference.server.semip")
 
-# "peers" turns the gather on; unset, "" or "off" keeps shutil.copytree.
+# "peers" gathers from every node's daemon; "local" is the same ranged, parallel
+# copy with no peers, from this node's mirror alone. Unset, "" or "off" keeps
+# shutil.copytree.
 MODE_ENV = "SEMIP_GATHER"
+MODES = ("peers", "local")
 # host:port of the daemons, or several comma-separated. A hostname resolves to
 # every address it carries, which for the headless Service is every ready node.
 SERVICE_ENV = "SEMIP_GATHER_SERVICE"
@@ -46,6 +53,10 @@ THREADS_ENV = "SEMIP_GATHER_THREADS"
 # "size" trusts the range accounting; "sha256" also hashes every gathered file
 # against the manifest.
 VERIFY_ENV = "SEMIP_GATHER_VERIFY"
+# "1" writes through O_DIRECT wherever offset and length are block-aligned,
+# which skips the page cache -- and so also leaves the gathered files out of
+# it for the restore that reads them next.
+DIRECT_ENV = "SEMIP_GATHER_DIRECT"
 
 DEFAULT_SERVICE = "neutrino-model-cache.neutrino.svc.cluster.local:8081"
 DEFAULT_CHUNK = 128 * 2**20
@@ -68,6 +79,10 @@ _DEADLINE_S = 120.0
 _CONNECT_TIMEOUT_S = 2.0
 _READ_TIMEOUT_S = 10.0
 _BUF_BYTES = 8 * 2**20
+# O_DIRECT wants offset, length and buffer address all aligned to the logical
+# block size; 4 KiB covers every block device here. Ranges start on multiples
+# of the chunk, which is rounded up to this.
+_ALIGN = 4096
 
 _SIZE_SUFFIXES = {"": 1, "k": 10**3, "m": 10**6, "g": 10**9,
                   "ki": 2**10, "mi": 2**20, "gi": 2**30}
@@ -82,6 +97,7 @@ class GatherStats(NamedTuple):
     failed_peers: int
     flows: int
     local_ranges: int
+    direct: bool
     elapsed_s: float
 
 
@@ -104,15 +120,20 @@ class _PeerFailed(Exception):
     pass
 
 
-def enabled() -> bool:
+def mode() -> str:
+    """One of MODES, or "off"."""
     raw = os.environ.get(MODE_ENV, "").strip().lower()
     if raw in ("", "off"):
-        return False
-    if raw == "peers":
-        return True
-    logger.warning("semi_p: %s=%r is not one of off, peers; copying from the "
-                   "local mirror", MODE_ENV, raw)
-    return False
+        return "off"
+    if raw in MODES:
+        return raw
+    logger.warning("semi_p: %s=%r is not one of off, %s; copying with "
+                   "copytree", MODE_ENV, raw, ", ".join(MODES))
+    return "off"
+
+
+def enabled() -> bool:
+    return mode() != "off"
 
 
 def _parse_bytes(raw: str) -> int:
@@ -211,10 +232,67 @@ def _ranges(files: list[_File], chunk: int,
             for i, (f, start, end) in enumerate(pieces)]
 
 
-def _fetch(rng: _Range, buf: memoryview) -> None:
-    """GET ``rng`` from its peer and ``pwrite`` it in place. _PeerFailed on any fault."""
+def _pwrite_all(fd: int, view: memoryview, offset: int) -> None:
+    written = 0
+    while written < len(view):
+        written += os.pwrite(fd, view[written:], offset + written)
+
+
+class _Writer:
+    """``pwrite`` into one file, through O_DIRECT wherever alignment allows.
+
+    Only a file's tail is ever unaligned, since every range starts on a chunk
+    boundary and every write but a range's last fills the whole buffer; that
+    tail goes through an ordinary descriptor onto pages no direct write touches.
+    """
+
+    def __init__(self, path: str, direct: bool):
+        self.fd = os.open(path, os.O_WRONLY)
+        self.dfd = None
+        if direct:
+            try:
+                self.dfd = os.open(path, os.O_WRONLY | os.O_DIRECT)
+            except OSError:
+                pass
+
+    def write(self, view: memoryview, offset: int) -> None:
+        head = len(view) - len(view) % _ALIGN
+        if self.dfd is not None and head and offset % _ALIGN == 0:
+            written = os.pwrite(self.dfd, view[:head], offset)
+            if written < len(view):
+                _pwrite_all(self.fd, view[written:], offset + written)
+        else:
+            _pwrite_all(self.fd, view, offset)
+
+    def close(self) -> None:
+        os.close(self.fd)
+        if self.dfd is not None:
+            os.close(self.dfd)
+
+
+def _transfer(rng: _Range, buf: memoryview, read_into, direct: bool) -> None:
+    """Fill ``buf`` from ``read_into(view, offset) -> n`` and write it out, to ``rng.end``."""
+    out = _Writer(rng.file.dest, direct)
+    try:
+        offset = rng.start
+        while offset < rng.end:
+            want = min(len(buf), rng.end - offset)
+            filled = 0
+            while filled < want:
+                got = read_into(buf[filled:want], offset + filled)
+                if not got:
+                    raise EOFError(f"{offset + filled - rng.start} of "
+                                   f"{rng.end - rng.start} bytes")
+                filled += got
+            out.write(buf[:want], offset)
+            offset += want
+    finally:
+        out.close()
+
+
+def _fetch(rng: _Range, buf: memoryview, direct: bool = False) -> None:
+    """GET ``rng`` from its peer and write it in place. _PeerFailed on any fault."""
     host, port = rng.peer
-    length = rng.end - rng.start
     conn = http.client.HTTPConnection(host, port, timeout=_CONNECT_TIMEOUT_S)
     try:
         conn.connect()
@@ -226,44 +304,23 @@ def _fetch(rng: _Range, buf: memoryview) -> None:
         if resp.status != 206 or resp.getheader("Content-Range") != expected:
             raise _PeerFailed(f"HTTP {resp.status} "
                               f"{resp.getheader('Content-Range')!r} for {expected}")
-        fd = os.open(rng.file.dest, os.O_WRONLY)
-        try:
-            offset = rng.start
-            while offset < rng.end:
-                got = resp.readinto(buf[:min(len(buf), rng.end - offset)])
-                if not got:
-                    raise _PeerFailed(f"short body at {offset - rng.start} of "
-                                      f"{length} bytes")
-                written = 0
-                while written < got:
-                    written += os.pwrite(fd, buf[written:got], offset + written)
-                offset += got
-        finally:
-            os.close(fd)
+        _transfer(rng, buf, lambda view, _: resp.readinto(view), direct)
+    except EOFError as exc:
+        raise _PeerFailed(f"short body at {exc}") from exc
     except (OSError, http.client.HTTPException) as exc:
         raise _PeerFailed(f"{type(exc).__name__}: {exc}") from exc
     finally:
         conn.close()
 
 
-def _copy_local(rng: _Range, buf: memoryview) -> None:
+def _copy_local(rng: _Range, buf: memoryview, direct: bool = False) -> None:
     src = os.open(rng.file.src, os.O_RDONLY)
     try:
-        dest = os.open(rng.file.dest, os.O_WRONLY)
-        try:
-            offset = rng.start
-            while offset < rng.end:
-                got = os.preadv(src, [buf[:min(len(buf), rng.end - offset)]],
-                                offset)
-                if not got:
-                    raise RuntimeError(f"{rng.file.src} ended at {offset} of "
-                                       f"{rng.file.size} bytes on the mirror")
-                written = 0
-                while written < got:
-                    written += os.pwrite(dest, buf[written:got], offset + written)
-                offset += got
-        finally:
-            os.close(dest)
+        _transfer(rng, buf, lambda view, offset: os.preadv(src, [view], offset),
+                  direct)
+    except EOFError as exc:
+        raise RuntimeError(f"{rng.file.src} ended early on the mirror, at "
+                           f"{exc}") from exc
     finally:
         os.close(src)
 
@@ -338,15 +395,20 @@ def gather(source_dir: str, verified_dir: str, incoming: str,
     """
     t0 = time.perf_counter()
     chunk = _env_int(CHUNK_ENV, DEFAULT_CHUNK, _parse_bytes)
+    chunk = -(-chunk // _ALIGN) * _ALIGN
     threads = _env_int(THREADS_ENV, DEFAULT_THREADS)
     verify = _verify_mode()
+    direct = (os.environ.get(DIRECT_ENV, "").strip() == "1"
+              and hasattr(os, "O_DIRECT"))
 
     files = plan(source_dir, verified_dir, incoming, subdirs, source_root)
-    peers = resolve_peers(os.environ.get(SERVICE_ENV, "").strip()
-                          or DEFAULT_SERVICE)
-    if not peers:
-        logger.warning("semi_p: no gather peers; reading every range of %s "
-                       "from the local mirror", source_dir)
+    peers: list[tuple[str, int]] = []
+    if mode() == "peers":
+        peers = resolve_peers(os.environ.get(SERVICE_ENV, "").strip()
+                              or DEFAULT_SERVICE)
+        if not peers:
+            logger.warning("semi_p: no gather peers; reading every range of "
+                           "%s from the local mirror", source_dir)
     _preallocate(files, incoming, subdirs)
 
     work: queue.Queue[_Range] = queue.Queue()
@@ -359,7 +421,8 @@ def gather(source_dir: str, verified_dir: str, incoming: str,
     errors: list[BaseException] = []
 
     def worker() -> None:
-        buf = memoryview(bytearray(_BUF_BYTES))
+        # Page-aligned, as O_DIRECT requires of the buffer address.
+        buf = memoryview(mmap.mmap(-1, _BUF_BYTES))
         while not errors:
             try:
                 rng = work.get_nowait()
@@ -369,7 +432,7 @@ def gather(source_dir: str, verified_dir: str, incoming: str,
                 if (rng.peer is not None and rng.peer not in failed
                         and time.perf_counter() < deadline):
                     try:
-                        _fetch(rng, buf)
+                        _fetch(rng, buf, direct)
                         with lock:
                             counts["peer"] += rng.end - rng.start
                         continue
@@ -382,7 +445,7 @@ def gather(source_dir: str, verified_dir: str, incoming: str,
                                     "(%s); its ranges come from the local "
                                     "mirror", rng.peer[0], rng.peer[1],
                                     rng.file.url, exc)
-                _copy_local(rng, buf)
+                _copy_local(rng, buf, direct)
                 with lock:
                     counts["local"] += rng.end - rng.start
                     counts["local_ranges"] += 1
@@ -420,5 +483,5 @@ def gather(source_dir: str, verified_dir: str, incoming: str,
         files=len(files), total_bytes=total, peer_bytes=counts["peer"],
         local_bytes=counts["local"], peers=len(peers),
         failed_peers=len(failed), flows=flows,
-        local_ranges=counts["local_ranges"],
+        local_ranges=counts["local_ranges"], direct=direct,
         elapsed_s=time.perf_counter() - t0)
