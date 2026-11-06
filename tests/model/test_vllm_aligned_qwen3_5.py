@@ -298,6 +298,7 @@ def fake_vllm(monkeypatch):
     monkeypatch.setattr(ops, "_silu_and_mul_kernel", _fake_silu_and_mul)
     monkeypatch.setattr(ops, "_trainer_flash_attn_varlen_func", lambda: _fake_trainer_flash_attn)
     monkeypatch.setattr(ops, "_token_logprobs_kernel", _fake_token_logprobs)
+    monkeypatch.setattr(ops, "_fp32_logits_linear", lambda: lambda x, w: x.float() @ w.float().t())
     monkeypatch.setattr(qwen3_5, "_fused_qk_rmsnorm_rope_gate", lambda: _fake_fused_qk_rmsnorm_rope_gate)
     monkeypatch.setattr(qwen3_5, "_causal_conv1d_fn", lambda: _fake_causal_conv1d_fn)
     monkeypatch.setattr(qwen3_5, "_fla_ops", lambda: _FakeFlaOps)
@@ -520,21 +521,20 @@ def test_no_grad_forward_builds_no_graph(fake_vllm, monkeypatch):
     assert not out.requires_grad
 
 
-def test_lm_head_fp32_backward_keeps_the_values_and_changes_only_the_gradient(fake_vllm):
+def test_lm_head_fp32_computes_fp32_logits_and_their_gradient(fake_vllm):
     torch.manual_seed(4)
     hidden = torch.randn(10, 16, dtype=torch.bfloat16)
     weight = torch.randn(32, 16, dtype=torch.bfloat16)
     labels = torch.randint(0, 32, (10,))
-    results = {}
-    for fp32 in (False, True):
-        h, w = hidden.clone().requires_grad_(True), weight.clone().requires_grad_(True)
-        out = ops.lm_head_logprobs(h, w, labels, token_chunk_size=4, vocab_padding=8, fp32_backward=fp32)
-        out.sum().backward()
-        results[fp32] = (out.detach(), h.grad, w.grad)
+    h, w = hidden.clone().requires_grad_(True), weight.clone().requires_grad_(True)
+    out = ops.lm_head_logprobs(h, w, labels, token_chunk_size=4, vocab_padding=8, fp32=True)
+    out.sum().backward()
     h32, w32 = hidden.float().requires_grad_(True), weight.float().requires_grad_(True)
-    torch.log_softmax(h32 @ w32.t(), dim=-1).gather(1, labels[:, None]).sum().backward()
-    assert torch.equal(results[False][0], results[True][0])
-    assert (results[True][1].float() - h32.grad).abs().max() <= (results[False][1].float() - h32.grad).abs().max()
+    expected = torch.log_softmax(h32 @ w32.t(), dim=-1).gather(1, labels[:, None]).squeeze(1)
+    expected.sum().backward()
+    torch.testing.assert_close(out, expected.detach())
+    torch.testing.assert_close(h.grad.float(), h32.grad, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(w.grad.float(), w32.grad, rtol=1e-2, atol=1e-2)
 
 
 def test_without_dss_compute_logprobs_the_stock_forward_runs(fake_vllm, monkeypatch):

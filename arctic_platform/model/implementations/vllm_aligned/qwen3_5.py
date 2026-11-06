@@ -616,7 +616,7 @@ def aligned_logprobs(
         labels.reshape(-1),
         temperature=temperature,
         token_chunk_size=model._vllm_aligned_token_chunk_size,
-        fp32_backward=model._vllm_aligned_lm_head_fp32_backward,
+        fp32=model._vllm_aligned_lm_head_fp32,
     )
 
 
@@ -675,12 +675,12 @@ def apply_vllm_aligned_qwen3_5(
     *,
     token_chunk_size: int,
     kv_block_size: int | None = None,
-    lm_head_fp32_backward: bool = False,
+    lm_head_fp32: bool = False,
 ) -> None:
     """Make a transformers ``Qwen3_5ForCausalLM``'s ``dss_compute_logprobs`` forward compute vLLM's logprobs.
 
-    ``kv_block_size`` defaults to :func:`hybrid_kv_block_size`. ``lm_head_fp32_backward`` computes the LM head's
-    gradient from fp32 logits; the logprobs stay the sampler's bf16 ones.
+    ``kv_block_size`` defaults to :func:`hybrid_kv_block_size`. ``lm_head_fp32`` computes fp32
+    logits as the sampler's batch-invariant fp32 LM head does, with an fp32 gradient.
     """
     from arctic_platform.model.implementations.vllm_aligned.qwen3 import _text_config
 
@@ -698,7 +698,7 @@ def apply_vllm_aligned_qwen3_5(
     block_size = hybrid_kv_block_size(config) if kv_block_size is None else int(kv_block_size)
     model._vllm_aligned_geometry = _Geometry.from_config(config, kv_block_size=block_size)
     model._vllm_aligned_token_chunk_size = int(token_chunk_size)
-    model._vllm_aligned_lm_head_fp32_backward = bool(lm_head_fp32_backward)
+    model._vllm_aligned_lm_head_fp32 = bool(lm_head_fp32)
     model._vllm_aligned_stock_forward = model.forward
     model._vllm_aligned_takes_loss_mask = True
     model.forward = types.MethodType(_causal_lm_forward, model)

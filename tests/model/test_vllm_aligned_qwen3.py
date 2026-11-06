@@ -351,12 +351,12 @@ def test_the_loader_installs_the_aligned_forward_and_owns_the_lm_head_patch(tmp_
     assert loaded.applied_patches == frozenset({"lm_head"})
     assert loaded.model._vllm_aligned is True
     assert loaded.model._vllm_aligned_token_chunk_size == 8
-    assert loaded.model._vllm_aligned_lm_head_fp32_backward is False
+    assert loaded.model._vllm_aligned_lm_head_fp32 is False
     stock_keys = set(_tiny_qwen3(vocab_size=128).state_dict())
     assert set(loaded.model.state_dict()) == stock_keys
 
 
-def test_lm_head_fp32_makes_only_the_backward_fp32(tmp_path, monkeypatch):
+def test_lm_head_fp32_selects_the_fp32_head(tmp_path, monkeypatch):
     from arctic_platform.model.loader import LoaderContext
     from arctic_platform.model.loaders.huggingface import load_huggingface
 
@@ -364,7 +364,7 @@ def test_lm_head_fp32_makes_only_the_backward_fp32(tmp_path, monkeypatch):
     path = _saved_tiny_qwen3(tmp_path)
     lm_head = {"fp32": True, "token_chunk_size": 8, "vocab_chunk_size": 64}
     loaded = load_huggingface(LoaderContext(spec=_spec(path, lm_head=lm_head)))
-    assert loaded.model._vllm_aligned_lm_head_fp32_backward is True
+    assert loaded.model._vllm_aligned_lm_head_fp32 is True
 
 
 _HAS_CUDA_AND_VLLM = torch.cuda.is_available() and importlib.util.find_spec("vllm") is not None

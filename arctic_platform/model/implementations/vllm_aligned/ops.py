@@ -531,6 +531,12 @@ def _token_logprobs_kernel(logits: torch.Tensor, token_ids: torch.Tensor) -> tor
     return compute_token_logprobs(logits, token_ids[:, None])[:, 0]
 
 
+def _fp32_logits_linear():
+    from arctic_platform.inference.vllm.batch_invariant_fp32_logits import linear_fp32_out
+
+    return linear_fp32_out
+
+
 def lm_head_logprobs_kernel(
     hidden: torch.Tensor,
     weight: torch.Tensor,
@@ -538,9 +544,10 @@ def lm_head_logprobs_kernel(
     temperature: float,
     token_chunk_size: int,
     vocab_padding: int,
+    fp32: bool = False,
 ) -> torch.Tensor:
     """The forward of :func:`lm_head_logprobs` without autograd; ``labels`` must be valid token ids."""
-    batch_invariant = _batch_invariant()
+    head = _fp32_logits_linear() if fp32 else _batch_invariant().linear_batch_invariant
     vocab_size = weight.shape[0]
     padded = _padded_vocab(vocab_size, vocab_padding)
     lm_weight = weight
@@ -549,7 +556,7 @@ def lm_head_logprobs_kernel(
     out = torch.empty(hidden.shape[0], dtype=torch.float32, device=hidden.device)
     for start in range(0, hidden.shape[0], token_chunk_size):
         stop = min(start + token_chunk_size, hidden.shape[0])
-        logits = batch_invariant.linear_batch_invariant(hidden[start:stop], lm_weight)[:, :vocab_size]
+        logits = head(hidden[start:stop], lm_weight)[:, :vocab_size]
         if temperature != 1.0:
             logits = logits.float() / torch.tensor(temperature, dtype=torch.float32, device=logits.device)
         out[start:stop] = _token_logprobs_kernel(logits, labels[start:stop])
@@ -558,19 +565,19 @@ def lm_head_logprobs_kernel(
 
 class _LMHeadLogprobs(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight, labels, temperature, token_chunk_size, vocab_padding, fp32_backward):
-        out = lm_head_logprobs_kernel(hidden, weight, labels, temperature, token_chunk_size, vocab_padding)
+    def forward(ctx, hidden, weight, labels, temperature, token_chunk_size, vocab_padding, fp32):
+        out = lm_head_logprobs_kernel(hidden, weight, labels, temperature, token_chunk_size, vocab_padding, fp32)
         ctx.save_for_backward(hidden, weight, labels)
         ctx.temperature = temperature
         ctx.token_chunk_size = token_chunk_size
-        ctx.fp32_backward = fp32_backward
+        ctx.fp32 = fp32
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
         hidden, weight, labels = ctx.saved_tensors
         tokens, vocab = hidden.shape[0], weight.shape[0]
-        compute_dtype = torch.float32 if ctx.fp32_backward else weight.dtype
+        compute_dtype = torch.float32 if ctx.fp32 else weight.dtype
         inv_temperature = 1.0 / ctx.temperature
         token_chunks = [(t, min(t + ctx.token_chunk_size, tokens)) for t in range(0, tokens, ctx.token_chunk_size)]
         vocab_chunks = [(v, min(v + _LM_HEAD_VOCAB_CHUNK, vocab)) for v in range(0, vocab, _LM_HEAD_VOCAB_CHUNK)]
@@ -619,7 +626,7 @@ def lm_head_logprobs(
     temperature: float = 1.0,
     token_chunk_size: int = 1024,
     vocab_padding: int = 64,
-    fp32_backward: bool = False,
+    fp32: bool = False,
 ) -> torch.Tensor:
     """Log-probability of ``labels`` (``[tokens]``) under the logits of ``hidden`` (``[tokens, hidden]``).
 
@@ -628,12 +635,13 @@ def lm_head_logprobs(
     temperature when it is not 1. The logprob of each label is then the value Model Runner V2's sampler reports,
     from its ``compute_token_logprobs`` kernel: ``logit - max - log(sum(exp(logit - max)))`` in fp32, which rounds
     differently from a full log-softmax followed by a gather. Rows are independent, so chunking them changes nothing.
-    A label of -100 scores 0 and receives no gradient. ``fp32_backward`` recomputes the logits for the gradient
-    from fp32 copies of ``hidden`` and ``weight``; the returned values stay the sampler's.
+    A label of -100 scores 0 and receives no gradient. ``fp32`` computes fp32 logits from the bf16 operands by
+    vLLM's batch-invariant persistent matmul, as the sampler's fp32 LM head does in batch-invariant mode
+    (:mod:`arctic_platform.inference.vllm.batch_invariant_fp32_logits`), and takes the gradient in fp32.
     """
     ignored = labels == -100
     safe_labels = labels.masked_fill(ignored, 0).to(torch.long)
     logprobs = _LMHeadLogprobs.apply(
-        hidden, weight, safe_labels, float(temperature), int(token_chunk_size), int(vocab_padding), bool(fp32_backward)
+        hidden, weight, safe_labels, float(temperature), int(token_chunk_size), int(vocab_padding), bool(fp32)
     )
     return logprobs.masked_fill(ignored, 0.0)
