@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 
 import pytest
 import torch
@@ -325,7 +326,7 @@ def test_cpu_adam_uses_fp32_states_unless_bf16_optimizer_states_are_enabled():
             OptimizerSettings(),
             _ZERO2,
             False,
-            ("torch_adamw", "you set 'optimizer.fused' to false, so standard AdamW ran"),
+            ("torch_adamw", "the model's default optimizer policy selected standard AdamW"),
         ),
         (
             OptimizerSettings(fused=False),
@@ -571,6 +572,7 @@ def test_initialize_forwards_the_built_optimizer_and_skips_expert_split(monkeypa
         return "engine", kwargs.get("optimizer"), None, None
 
     monkeypatch.setattr(deepspeed_engine, "build_training_optimizer", _build)
+    monkeypatch.setattr(deepspeed_engine, "is_glm_moe_model", lambda path: False)
     monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
     monkeypatch.setattr("deepspeed.initialize", _initialize)
     model = torch.nn.Linear(1, 1)
@@ -646,7 +648,10 @@ def test_initialize_native_deepspeed_optimizer_forwards_model_parameters(monkeyp
 
 
 @pytest.mark.parametrize("model_type", ["glm_moe_dsa", "glm5_next_text"])
-def test_initialize_splits_expert_groups_and_fuses_adam_for_glm(monkeypatch, tmp_path, model_type):
+@pytest.mark.parametrize("fused,expected", [(None, "torch_adamw"), (False, "torch_adamw"), (True, "fused_adam")])
+def test_initialize_splits_expert_groups_and_respects_glm_optimizer_choice(
+    monkeypatch, tmp_path, model_type, fused, expected
+):
     calls = {}
 
     class _Adam:
@@ -673,7 +678,7 @@ def test_initialize_splits_expert_groups_and_fuses_adam_for_glm(monkeypatch, tmp
     engine, optimizer, choice = initialize_training_engine(
         model,
         _ZERO2,
-        optimizer=OptimizerSettings(),
+        optimizer=OptimizerSettings(fused=fused),
         ep_size=2,
         mpu=None,
         model_path=str(tmp_path),
@@ -682,9 +687,65 @@ def test_initialize_splits_expert_groups_and_fuses_adam_for_glm(monkeypatch, tmp
 
     assert engine == "engine"
     assert optimizer is calls["optimizer"]
-    assert choice["implementation"] == "fused_adam"
+    assert choice["implementation"] == expected
     assert calls["split"]
     assert optimizer.param_groups == [{"params": [], "name": "experts"}]
+
+
+@pytest.mark.parametrize("model_type", ["glm_moe_dsa", "glm5_next_text"])
+@pytest.mark.parametrize(
+    "name,fused,expected",
+    [
+        ("AdamW", None, "deepspeed_cpu_adam"),
+        ("AdamW", True, "deepspeed_cpu_adam"),
+        ("AdamW", False, "deepspeed_cpu_adam_nonfused"),
+        ("torch_adamw", None, "deepspeed_cpu_adam_nonfused"),
+        ("cpu_adam", False, "deepspeed_cpu_adam"),
+    ],
+)
+def test_glm_gpu_fallback_preserves_cpu_offload_optimizer_choice(
+    monkeypatch, tmp_path, model_type, name, fused, expected
+):
+    native_ops = object()
+    calls = {}
+
+    class _CPUAdam(torch.optim.Optimizer):
+        def __init__(self, param_groups, **kwargs):
+            super().__init__(param_groups, {})
+            self.adam_w_mode = kwargs["adamw_mode"]
+            self.fp32_optimizer_states = kwargs["fp32_optimizer_states"]
+            self.ds_opt_adam = native_ops
+
+    def _initialize(*, model, config, **kwargs):
+        calls["config"] = config
+        calls["optimizer"] = kwargs["optimizer"]
+        return "engine", kwargs["optimizer"], None, None
+
+    monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
+    monkeypatch.setattr("deepspeed.initialize", _initialize)
+    monkeypatch.setattr("deepspeed.ops.adam.DeepSpeedCPUAdam", _CPUAdam)
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    ds_config = deepcopy(_OFFLOAD)
+    supplied_config = deepcopy(ds_config)
+
+    _, optimizer, choice = initialize_training_engine(
+        torch.nn.Linear(2, 2, bias=False),
+        ds_config,
+        optimizer=OptimizerSettings(name=name, fused=fused),
+        ep_size=1,
+        mpu=None,
+        model_path=str(tmp_path),
+        rank=0,
+    )
+
+    assert choice["implementation"] == expected
+    assert calls["optimizer"] is optimizer
+    assert calls["config"] is ds_config
+    assert ds_config == supplied_config
+    if expected == "deepspeed_cpu_adam":
+        assert optimizer.ds_opt_adam is native_ops
+    else:
+        assert optimizer.ds_opt_adam.native_ops is native_ops
 
 
 @pytest.mark.parametrize("force_cpu_optimizer", [None, True, False])

@@ -36,6 +36,7 @@ from pydantic import Field
 from arctic_platform.common.optimizer import OptimizerSettings
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
+from arctic_platform.model.moe_spec import is_glm_moe_model
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,8 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
 
     Sequence parallelism reduces the data-parallel degree used to derive
     ``train_batch_size`` when the caller does not provide it explicitly.
+    Unspecified gradient accumulation uses FP32 where DeepSpeed supports it;
+    explicit accumulation dtypes are preserved.
     """
     dtype = (spec.dtype or "bfloat16").lower()
     is_bf16 = dtype in ("bfloat16", "bf16")
@@ -172,6 +175,7 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         zero_config["allgather_bucket_size"] = spec.zero_bucket_size
     if spec.ds_overrides:
         ds_config.update(spec.ds_overrides)
+    apply_default_grad_accum_dtype(ds_config)
     _require_fp32_gradient_reduction(ds_config)
     logger.info(
         "Resolved DeepSpeed precision: bf16=%s fp16=%s communication_data_type=%s",
@@ -180,6 +184,47 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         ds_config.get("communication_data_type"),
     )
     return ds_config
+
+
+def apply_default_grad_accum_dtype(ds_config: dict[str, Any]) -> None:
+    """Default an unspecified accumulation dtype to FP32 without mutating a caller-owned block.
+
+    DeepSpeed uses the model dtype when ``grad_accum_dtype`` is absent or ``None``. Preserve other ``data_types``
+    fields and explicit dtypes, and leave invalid blocks to DeepSpeed's config validation.
+
+    Mixed-precision ZeRO0 rejects FP32 accumulation. BF16 ZeRO1 without CPU offload selects DeepSpeed's BF16
+    optimizer when gradient norms are disabled, and that optimizer refuses this configuration. Leave the native
+    default in those cases instead of making a previously accepted job fail initialization.
+    """
+    data_types = ds_config.get("data_types")
+    if data_types is not None and not isinstance(data_types, dict):
+        return
+    if (data_types or {}).get("grad_accum_dtype") is not None:
+        return
+    if not _deepspeed_accepts_fp32_grad_accumulation(ds_config):
+        return
+    ds_config["data_types"] = {**(data_types or {}), "grad_accum_dtype": "fp32"}
+
+
+def _deepspeed_accepts_fp32_grad_accumulation(ds_config: dict[str, Any]) -> bool:
+    """Whether DeepSpeed's optimizer sanity check accepts an explicit FP32 accumulation dtype."""
+    bf16_config = ds_config.get("bf16")
+    if bf16_config is None:
+        bf16_config = ds_config.get("bfloat16")
+    fp16_config = ds_config.get("fp16")
+    bf16 = isinstance(bf16_config, dict) and bool(bf16_config.get("enabled"))
+    fp16 = isinstance(fp16_config, dict) and bool(fp16_config.get("enabled"))
+    zero_config = ds_config.get("zero_optimization")
+    if not isinstance(zero_config, dict):
+        zero_config = {}
+    stage = int(zero_config.get("stage") or 0)
+    if stage == 0:
+        return not (bf16 or fp16)
+    offload = zero_config.get("offload_optimizer")
+    cpu_offload = isinstance(offload, dict) and offload.get("device") == "cpu"
+    if stage == 1 and bf16 and not cpu_offload and zero_config.get("compute_grad_norm", True) is False:
+        return False
+    return True
 
 
 def split_expert_param_groups(param_groups: list) -> list:
@@ -220,7 +265,9 @@ def initialize_training_engine(
     # Marks first: the optimizer groups split on them.
     preserved, marked_fp32 = preserve_fp8_params_through_ds_cast(model)
     if optimizer is not None:
-        fused = optimizer.fused is not False
+        fused = optimizer.fused
+        if fused is None:
+            fused = _optimizer_cpu_offload_enabled(ds_config) or not is_glm_moe_model(model_path)
         built = build_training_optimizer(model, optimizer, ds_config, fused=fused, adam_w_mode=adam_w_mode)
         choice = optimizer_choice(optimizer, ds_config, fused=fused, adam_w_mode=adam_w_mode)
         if ep_size > 1:
@@ -307,8 +354,10 @@ def optimizer_choice(
         reason = "you disabled AdamW mode, so standard Adam ran"
     elif optimizer_name == "torch_adamw":
         reason = f"you selected '{optimizer.name}'"
-    else:
+    elif optimizer.fused is False:
         reason = "you set 'optimizer.fused' to false, so standard AdamW ran"
+    else:
+        reason = "the model's default optimizer policy selected standard AdamW"
     return {"implementation": implementation, "reason": reason}
 
 
