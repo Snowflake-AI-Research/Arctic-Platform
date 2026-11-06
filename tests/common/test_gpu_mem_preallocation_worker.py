@@ -39,6 +39,8 @@ def worker_module():
 )
 def test_training_margin_reaches_model_and_survives_engine_initialization(monkeypatch, training, job_type):
     mod = worker_module()
+    from arctic_platform.common import deepspeed_engine
+
     cls = mod.DeepSpeedWorker.__ray_metadata__.modified_class
     worker = object.__new__(cls)
     worker.rank, worker.world_size, worker.master_port = 0, 1, 12345
@@ -51,9 +53,9 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
     monkeypatch.setattr(mod.deepspeed, "init_distributed", lambda: None)
     monkeypatch.setattr(mod, "pr0", lambda *args: None)
     monkeypatch.setattr(mod, "sp_size_from_job_config", lambda config: 1)
-    monkeypatch.setattr(worker, "ds_training_config", lambda *args: {})
+    monkeypatch.setattr(worker, "ds_training_config", lambda *args: {"optimizer": {"type": "SGD", "params": {}}})
     monkeypatch.setattr(worker, "ds_inference_config", lambda *args: {})
-    monkeypatch.setattr(mod, "release_offloaded_grad_partitions", installed_hooks.append)
+    monkeypatch.setattr(deepspeed_engine, "release_offloaded_grad_partitions", installed_hooks.append)
 
     def build(spec):
         observed.append(spec.debug)
