@@ -154,7 +154,7 @@ cortex = [
     "requests",
     "safetensors",
     "tenacity",
-    "torch",
+    "torch>=2.7",
     "urllib3",
 ]
 
