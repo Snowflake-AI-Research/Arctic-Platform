@@ -591,3 +591,71 @@ def test_lm_head_backward_over_vocabulary_slices_matches_autograd(fake_vllm, mon
     # The backward forms its logits in fp32 whatever the input dtype.
     torch.testing.assert_close(hidden.grad, h.grad, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(weight.grad, w.grad, rtol=1e-4, atol=1e-5)
+
+
+def test_row_parallel_linear_adds_rounded_rank_partials_in_rank_order(fake_vllm):
+    torch.manual_seed(6)
+    x = torch.randn(5, 16, dtype=torch.bfloat16)
+    weight = torch.randn(7, 16, dtype=torch.bfloat16)
+    partials = [F.linear(x[:, 4 * r : 4 * r + 4], weight[:, 4 * r : 4 * r + 4]).float() for r in range(4)]
+    expected = (((partials[0] + partials[1]) + partials[2]) + partials[3]).to(torch.bfloat16)
+    assert torch.equal(ops.row_parallel_linear_kernel(x, weight, 4), expected)
+
+    xg, wg = x.float().requires_grad_(True), weight.float().requires_grad_(True)
+    ops.row_parallel_linear(xg, wg, 4).sum().backward()
+    xr, wr = x.float().requires_grad_(True), weight.float().requires_grad_(True)
+    F.linear(xr, wr).sum().backward()
+    torch.testing.assert_close(xg.grad, xr.grad)
+    torch.testing.assert_close(wg.grad, wr.grad)
+
+
+def test_tensor_parallel_emulation_keeps_the_stock_function_and_gradient(fake_vllm, monkeypatch):
+    import transformers.models.qwen3_5.modeling_qwen3_5 as modeling
+
+    monkeypatch.setattr(modeling, "torch_chunk_gated_delta_rule", modeling.torch_recurrent_gated_delta_rule)
+    stock = _model()
+    aligned = _model()
+    _enable_aligned(aligned, monkeypatch, tensor_parallel=2)
+    assert aligned._vllm_aligned_geometry.tensor_parallel == 2
+    torch.manual_seed(7)
+    sequences = [torch.randint(0, 97, (n,)) for n in (9, 6)]
+    weights = [torch.linspace(0.5, 1.5, seq.numel()) for seq in sequences]
+    input_ids, labels, positions, cu_seqlens, loss_mask = _packed(sequences, [3, 1])
+    _stock_weighted_loss(stock, sequences, weights).backward()
+    out = aligned(
+        input_ids=input_ids,
+        position_ids=positions,
+        labels=labels,
+        dss_compute_logprobs=True,
+        cu_seq_lens_q=cu_seqlens,
+        vllm_aligned_loss_mask=loss_mask,
+    )["logprobs"][0]
+    (out * torch.cat(weights)).sum().backward()
+    for start, seq in zip(cu_seqlens.tolist()[:-1], sequences):
+        torch.testing.assert_close(
+            out[start : start + seq.numel() - 1].detach(), _stock_logprobs(stock, seq), rtol=1e-4, atol=1e-4
+        )
+    for name, param in stock.named_parameters():
+        grad, other = param.grad, dict(aligned.named_parameters())[name].grad
+        assert float((other - grad).abs().max() / grad.abs().max().clamp_min(1e-12)) < 1e-4, name
+
+
+def test_tensor_parallel_must_divide_the_heads():
+    with pytest.raises(ValueError, match="does not split"):
+        qwen3_5._check_tensor_parallel(_config(), 3)
+
+
+def test_hybrid_kv_block_size_per_rank_for_qwen3_8_27b_tp4():
+    config = types.SimpleNamespace(
+        hidden_size=5120,
+        num_attention_heads=24,
+        num_key_value_heads=4,
+        head_dim=256,
+        linear_num_key_heads=16,
+        linear_num_value_heads=48,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        mamba_ssm_dtype="float32",
+    )
+    assert qwen3_5.hybrid_kv_block_size(config, tensor_parallel=4) == 784

@@ -49,6 +49,19 @@ def _text_config(model: nn.Module):
     return config.get_text_config() if hasattr(config, "get_text_config") else config
 
 
+def _check_tensor_parallel(config, tensor_parallel: int) -> None:
+    """Refuse a tensor-parallel size the sampler could not shard this config into, or one with row-parallel biases."""
+    if tensor_parallel < 1:
+        raise ValueError("tensor_parallel must be positive")
+    if tensor_parallel == 1:
+        return
+    for name in ("num_attention_heads", "intermediate_size"):
+        if getattr(config, name) % tensor_parallel:
+            raise ValueError(f"config.{name}={getattr(config, name)} does not split across {tensor_parallel} ranks")
+    if getattr(config, "attention_bias", False):
+        raise ValueError("tensor-parallel emulation does not cover a biased o_proj")
+
+
 def _rope_theta(config) -> float | int:
     parameters = getattr(config, "rope_parameters", None) or {}
     rope_type = parameters.get("rope_type", "default")
@@ -79,7 +92,7 @@ def check_supported_config(config) -> None:
 
 
 class _Geometry:
-    def __init__(self, config, *, kv_block_size: int):
+    def __init__(self, config, *, kv_block_size: int, tensor_parallel: int = 1):
         self.num_heads = int(config.num_attention_heads)
         self.num_kv_heads = int(config.num_key_value_heads)
         self.head_dim = int(getattr(config, "head_dim", None) or config.hidden_size // self.num_heads)
@@ -90,6 +103,8 @@ class _Geometry:
         self.rope_theta = _rope_theta(config)
         self.max_position = int(config.max_position_embeddings)
         self.kv_block_size = int(kv_block_size)
+        self.tensor_parallel = int(tensor_parallel)
+        _check_tensor_parallel(config, self.tensor_parallel)
         self._cos_sin_cache: torch.Tensor | None = None
         self._fa_version: int | None = None
 
@@ -160,12 +175,14 @@ def _decoder_layer_forward(
         scale=geometry.scale,
         fa_version=geometry.fa_version(),
     )
-    attn_out = ops.linear(attn_out.reshape(num_tokens, geometry.q_size), attn.o_proj.weight, attn.o_proj.bias)
+    attn_out = ops.row_parallel_linear(
+        attn_out.reshape(num_tokens, geometry.q_size), attn.o_proj.weight, geometry.tensor_parallel
+    )
     residual = hidden_states + attn_out
 
     x = ops.rms_norm(residual, self.post_attention_layernorm.weight, geometry.eps, fused=True)
     gate_up = ops.linear(x, torch.cat((mlp.gate_proj.weight, mlp.up_proj.weight), dim=0))
-    mlp_out = ops.linear(ops.silu_and_mul(gate_up), mlp.down_proj.weight)
+    mlp_out = ops.row_parallel_linear(ops.silu_and_mul(gate_up), mlp.down_proj.weight, geometry.tensor_parallel)
     return residual + mlp_out
 
 
@@ -191,7 +208,9 @@ def _model_forward(
     if (input_ids is None) == (inputs_embeds is None):
         raise ValueError("pass exactly one of input_ids or inputs_embeds")
     if inputs_embeds is None:
-        inputs_embeds = self.embed_tokens(input_ids)
+        inputs_embeds = ops.tensor_parallel_embedding(
+            self.embed_tokens(input_ids), self._vllm_aligned_geometry.tensor_parallel
+        )
     batch_size, seq_len, hidden_size = inputs_embeds.shape
     if position_ids is None:
         position_ids = torch.arange(seq_len, device=inputs_embeds.device).expand(batch_size, seq_len)
@@ -291,13 +310,19 @@ def _causal_lm_forward(
 
 
 def apply_vllm_aligned(
-    model: nn.Module, *, kv_block_size: int = 16, token_chunk_size: int = 1024, lm_head_fp32: bool = False
+    model: nn.Module,
+    *,
+    kv_block_size: int = 16,
+    token_chunk_size: int = 1024,
+    lm_head_fp32: bool = False,
+    tensor_parallel: int = 1,
 ) -> None:
     """Make a loaded transformers ``Qwen3ForCausalLM`` compute vLLM's numbers; see the module docstring.
 
     ``kv_block_size`` is the sampler's KV-cache page size. ``token_chunk_size`` bounds the rows of the LM-head
     logits held at once when the forward returns log-probabilities. ``lm_head_fp32`` computes fp32 logits as the
-    sampler's batch-invariant fp32 LM head does, with an fp32 gradient.
+    sampler's batch-invariant fp32 LM head does, with an fp32 gradient. ``tensor_parallel`` is the sampler's
+    tensor-parallel size: the row-parallel projections then add per-rank partials as its all-reduce does.
     """
     config = _text_config(model)
     check_supported_config(config)
@@ -308,7 +333,7 @@ def apply_vllm_aligned(
         raise ValueError("kv_block_size and token_chunk_size must be positive")
     ops.require_batch_invariant_env()
 
-    geometry = _Geometry(config, kv_block_size=kv_block_size)
+    geometry = _Geometry(config, kv_block_size=kv_block_size, tensor_parallel=tensor_parallel)
     backbone._vllm_aligned_geometry = geometry
     backbone.forward = types.MethodType(_model_forward, backbone)
     for index, layer in enumerate(backbone.layers):

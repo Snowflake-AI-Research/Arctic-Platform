@@ -80,6 +80,21 @@ class HuggingfaceOptions(BaseModel):
         ),
     )
 
+    vllm_aligned_tensor_parallel: int = Field(
+        1,
+        ge=1,
+        description=(
+            "Experimental. The sampler's tensor-parallel size for vllm_aligned: the row-parallel projections add"
+            " per-rank partials in fp32 in rank order, as vLLM's batch-invariant custom all-reduce does."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _tensor_parallel_needs_vllm_aligned(self) -> HuggingfaceOptions:
+        if self.vllm_aligned_tensor_parallel != 1 and not self.vllm_aligned:
+            raise ValueError("vllm_aligned_tensor_parallel requires vllm_aligned")
+        return self
+
     @model_validator(mode="after")
     def _fp32_residual_needs_fp32_parity(self) -> HuggingfaceOptions:
         if self.fp32_residual and not self.fp32_parity:
@@ -212,11 +227,21 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
         if family == "qwen3_5":
             from arctic_platform.model.implementations.vllm_aligned.qwen3_5 import apply_vllm_aligned_qwen3_5
 
-            apply_vllm_aligned_qwen3_5(model, token_chunk_size=token_chunk_size, lm_head_fp32=lm_head_fp32)
+            apply_vllm_aligned_qwen3_5(
+                model,
+                token_chunk_size=token_chunk_size,
+                lm_head_fp32=lm_head_fp32,
+                tensor_parallel=options.vllm_aligned_tensor_parallel,
+            )
         else:
             from arctic_platform.model.implementations.vllm_aligned.qwen3 import apply_vllm_aligned
 
-            apply_vllm_aligned(model, token_chunk_size=token_chunk_size, lm_head_fp32=lm_head_fp32)
+            apply_vllm_aligned(
+                model,
+                token_chunk_size=token_chunk_size,
+                lm_head_fp32=lm_head_fp32,
+                tensor_parallel=options.vllm_aligned_tensor_parallel,
+            )
         # The aligned forward computes logprobs itself; the chunked LM-head patch would wrap it with its own head.
         return LoadedModel(model=model, applied_patches=frozenset({"lm_head"}))
     return LoadedModel(model=model)

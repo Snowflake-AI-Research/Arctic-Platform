@@ -126,6 +126,60 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = No
     return _Linear.apply(x, weight, bias)
 
 
+def row_parallel_linear_kernel(x: torch.Tensor, weight: torch.Tensor, tp_size: int) -> torch.Tensor:
+    """vLLM's ``RowParallelLinear`` at ``tp_size`` ranks, on one device, without autograd.
+
+    Rank ``r`` multiplies its slice of the input columns by its slice of the weight's columns and rounds the result
+    to the model dtype; vLLM's batch-invariant custom all-reduce then adds the ranks' partials in fp32 in rank order
+    and rounds once. ``tp_size=1`` is :func:`linear_kernel`.
+    """
+    if tp_size == 1:
+        return linear_kernel(x, weight)
+    in_features = x.shape[-1]
+    if in_features % tp_size:
+        raise ValueError(f"{in_features} input features do not split across {tp_size} tensor-parallel ranks")
+    shard = in_features // tp_size
+    total = None
+    for rank in range(tp_size):
+        columns = slice(rank * shard, (rank + 1) * shard)
+        partial = linear_kernel(x[..., columns].contiguous(), weight[:, columns].contiguous()).float()
+        total = partial if total is None else total + partial
+    return total.to(x.dtype)
+
+
+class _RowParallelLinear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, tp_size):
+        ctx.save_for_backward(x, weight)
+        return row_parallel_linear_kernel(x, weight, tp_size)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, weight = ctx.saved_tensors
+        grad_2d = grad_out.reshape(-1, grad_out.shape[-1])
+        grad_x = (grad_2d @ weight).view(x.shape) if ctx.needs_input_grad[0] else None
+        grad_weight = grad_2d.t() @ x.reshape(-1, x.shape[-1]) if ctx.needs_input_grad[1] else None
+        return grad_x, grad_weight, None
+
+
+def row_parallel_linear(x: torch.Tensor, weight: torch.Tensor, tp_size: int = 1) -> torch.Tensor:
+    """:func:`row_parallel_linear_kernel` with the ordinary linear backward."""
+    if tp_size == 1:
+        return linear(x, weight)
+    return _RowParallelLinear.apply(x, weight, tp_size)
+
+
+def tensor_parallel_embedding(hidden: torch.Tensor, tp_size: int) -> torch.Tensor:
+    """An embedding lookup as vLLM's ``VocabParallelEmbedding`` returns it at ``tp_size`` ranks.
+
+    One rank holds each row and the others contribute zeros to an all-reduce, which only turns ``-0.0`` into
+    ``+0.0``; the addition of ``+0.0`` does the same and keeps the gradient.
+    """
+    if tp_size == 1:
+        return hidden
+    return (hidden.float() + 0.0).to(hidden.dtype)
+
+
 class _RMSNorm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps, fused):

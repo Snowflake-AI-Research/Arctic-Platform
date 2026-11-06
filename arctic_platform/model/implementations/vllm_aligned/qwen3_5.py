@@ -85,22 +85,32 @@ def check_supported_config(config) -> None:
         raise ValueError("the vLLM-aligned Qwen3.5 forward needs config.layer_types")
 
 
-def hybrid_kv_block_size(config) -> int:
+def _check_tensor_parallel(config, tensor_parallel: int) -> None:
+    """Refuse a tensor-parallel size the sampler could not shard this config into."""
+    if tensor_parallel < 1:
+        raise ValueError("tensor_parallel must be positive")
+    names = ("num_attention_heads", "intermediate_size", "linear_num_key_heads", "linear_num_value_heads")
+    for name in names:
+        if getattr(config, name) % tensor_parallel:
+            raise ValueError(f"config.{name}={getattr(config, name)} does not split across {tensor_parallel} ranks")
+
+
+def hybrid_kv_block_size(config, tensor_parallel: int = 1) -> int:
     """The attention page size vLLM 0.32 sets for this hybrid, so that one page holds a GatedDeltaNet state.
 
     vLLM's ``_align_hybrid_block_size`` with the FLASH_ATTN backend, a bf16 KV cache and the ``mamba_ssm_dtype`` of the
-    config: 16 tokens times the number of 16-token attention pages a conv state plus a recurrent state fills. The
-    sampler logs the value as "Setting attention block size to N tokens".
+    config, on one rank's shard: 16 tokens times the number of 16-token attention pages a conv state plus a recurrent
+    state fills. The sampler logs the value as "Setting attention block size to N tokens".
     """
     head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-    attn_bytes_per_token = 2 * config.num_key_value_heads * head_dim * 2
-    key_dim = config.linear_num_key_heads * config.linear_key_head_dim
-    value_dim = config.linear_num_value_heads * config.linear_value_head_dim
+    kv_heads = max(config.num_key_value_heads // tensor_parallel, 1)
+    attn_bytes_per_token = 2 * kv_heads * head_dim * 2
+    key_dim = config.linear_num_key_heads // tensor_parallel * config.linear_key_head_dim
+    value_heads = config.linear_num_value_heads // tensor_parallel
+    value_dim = value_heads * config.linear_value_head_dim
     conv_bytes = (2 * key_dim + value_dim) * (config.linear_conv_kernel_dim - 1) * 2
     ssm_itemsize = 4 if str(getattr(config, "mamba_ssm_dtype", "float32")).endswith("float32") else 2
-    ssm_bytes = (
-        config.linear_num_value_heads * config.linear_value_head_dim * config.linear_key_head_dim * ssm_itemsize
-    )
+    ssm_bytes = value_heads * config.linear_value_head_dim * config.linear_key_head_dim * ssm_itemsize
     pages = math.ceil((conv_bytes + ssm_bytes) / (_KERNEL_BLOCK_ALIGNMENT * attn_bytes_per_token))
     return _KERNEL_BLOCK_ALIGNMENT * pages
 
@@ -116,9 +126,10 @@ class _Geometry:
     mrope_section: tuple[int, ...] | None
     max_position: int
     kv_block_size: int
+    tensor_parallel: int = 1
 
     @classmethod
-    def from_config(cls, config, *, kv_block_size: int) -> _Geometry:
+    def from_config(cls, config, *, kv_block_size: int, tensor_parallel: int = 1) -> _Geometry:
         rope = _rope_parameters(config)
         head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
         partial = rope.get("partial_rotary_factor", getattr(config, "partial_rotary_factor", 1.0))
@@ -133,6 +144,7 @@ class _Geometry:
             mrope_section=tuple(mrope_section) if mrope_section else None,
             max_position=int(config.max_position_embeddings),
             kv_block_size=int(kv_block_size),
+            tensor_parallel=int(tensor_parallel),
         )
 
 
@@ -491,7 +503,7 @@ class _ForwardContext:
     fa_version: int
 
 
-def _gated_delta_net(layer: Any, hidden: torch.Tensor, gdn: GdnLayout) -> torch.Tensor:
+def _gated_delta_net(layer: Any, hidden: torch.Tensor, gdn: GdnLayout, tensor_parallel: int) -> torch.Tensor:
     dims = _GdnDims(layer.num_k_heads, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim, layer.activation)
     tokens = hidden.shape[0]
     mixed_qkvz = ops.linear(hidden, torch.cat((layer.in_proj_qkv.weight, layer.in_proj_z.weight)))
@@ -503,7 +515,7 @@ def _gated_delta_net(layer: Any, hidden: torch.Tensor, gdn: GdnLayout) -> torch.
         mixed_qkv, a.contiguous(), b.contiguous(), layer.A_log, layer.dt_bias, layer.conv1d.weight, dims, gdn
     )
     normed = _GatedRMSNorm.apply(core, z, layer.norm.weight, layer.layer_norm_epsilon)
-    return ops.linear(normed.flatten(-2), layer.out_proj.weight)
+    return ops.row_parallel_linear(normed.flatten(-2), layer.out_proj.weight, tensor_parallel)
 
 
 def _full_attention(attn: Any, hidden: torch.Tensor, ctx: _ForwardContext) -> torch.Tensor:
@@ -525,12 +537,12 @@ def _full_attention(attn: Any, hidden: torch.Tensor, ctx: _ForwardContext) -> to
         fa_version=ctx.fa_version,
     ).view(tokens, q_size)
     out = out * torch.sigmoid(gate)
-    return ops.linear(out, attn.o_proj.weight)
+    return ops.row_parallel_linear(out, attn.o_proj.weight, geometry.tensor_parallel)
 
 
-def _mlp(mlp: Any, hidden: torch.Tensor) -> torch.Tensor:
+def _mlp(mlp: Any, hidden: torch.Tensor, tensor_parallel: int) -> torch.Tensor:
     gate_up = ops.linear(hidden, torch.cat((mlp.gate_proj.weight, mlp.up_proj.weight)))
-    return ops.linear(ops.silu_and_mul(gate_up), mlp.down_proj.weight)
+    return ops.row_parallel_linear(ops.silu_and_mul(gate_up), mlp.down_proj.weight, tensor_parallel)
 
 
 def _decoder_layer(layer: Any, hidden: torch.Tensor, residual: torch.Tensor | None, ctx: _ForwardContext):
@@ -542,11 +554,11 @@ def _decoder_layer(layer: Any, hidden: torch.Tensor, residual: torch.Tensor | No
     else:
         hidden, residual = ops.gemma_rms_norm(hidden, layer.input_layernorm.weight, eps, residual)
     if layer.block_type == "linear_attention":
-        mixer_out = _gated_delta_net(layer.linear_attn, hidden, ctx.gdn)
+        mixer_out = _gated_delta_net(layer.linear_attn, hidden, ctx.gdn, ctx.geometry.tensor_parallel)
     else:
         mixer_out = _full_attention(layer.self_attn, hidden, ctx)
     hidden, residual = ops.gemma_rms_norm(mixer_out, layer.post_attention_layernorm.weight, eps, residual)
-    return _mlp(layer.mlp, hidden), residual
+    return _mlp(layer.mlp, hidden, ctx.geometry.tensor_parallel), residual
 
 
 def _decoder_layers(layers: list, hidden: torch.Tensor, residual: torch.Tensor, ctx: _ForwardContext):
@@ -590,7 +602,7 @@ def aligned_logprobs(
         position_ids = position_ids[0]
     layout = ops.PackedLayout.build(position_ids, block_size=geometry.kv_block_size, cu_seqlens=cu_seqlens)
     positions = layout.positions
-    hidden = backbone.embed_tokens(input_ids.reshape(-1))
+    hidden = ops.tensor_parallel_embedding(backbone.embed_tokens(input_ids.reshape(-1)), geometry.tensor_parallel)
     ctx = _ForwardContext(
         geometry=geometry,
         layout=layout,
@@ -676,11 +688,15 @@ def apply_vllm_aligned_qwen3_5(
     token_chunk_size: int,
     kv_block_size: int | None = None,
     lm_head_fp32: bool = False,
+    tensor_parallel: int = 1,
 ) -> None:
     """Make a transformers ``Qwen3_5ForCausalLM``'s ``dss_compute_logprobs`` forward compute vLLM's logprobs.
 
     ``kv_block_size`` defaults to :func:`hybrid_kv_block_size`. ``lm_head_fp32`` computes fp32
-    logits as the sampler's batch-invariant fp32 LM head does, with an fp32 gradient.
+    logits as the sampler's batch-invariant fp32 LM head does, with an fp32 gradient. ``tensor_parallel`` is the
+    sampler's tensor-parallel size: the row-parallel projections then add per-rank partials as its all-reduce does.
+    The column-parallel projections and the per-head kernels give the same bits sharded or not, with the GDN
+    autotuners pinned.
     """
     from arctic_platform.model.implementations.vllm_aligned.qwen3 import _text_config
 
@@ -695,8 +711,11 @@ def apply_vllm_aligned_qwen3_5(
             raise ValueError("the vLLM-aligned Qwen3.5 forward expects a GatedDeltaNet conv without a bias")
     ops.require_batch_invariant_env()
     _pin_gdn_kernels()
-    block_size = hybrid_kv_block_size(config) if kv_block_size is None else int(kv_block_size)
-    model._vllm_aligned_geometry = _Geometry.from_config(config, kv_block_size=block_size)
+    block_size = hybrid_kv_block_size(config, tensor_parallel) if kv_block_size is None else int(kv_block_size)
+    _check_tensor_parallel(config, tensor_parallel)
+    model._vllm_aligned_geometry = _Geometry.from_config(
+        config, kv_block_size=block_size, tensor_parallel=tensor_parallel
+    )
     model._vllm_aligned_token_chunk_size = int(token_chunk_size)
     model._vllm_aligned_lm_head_fp32 = bool(lm_head_fp32)
     model._vllm_aligned_stock_forward = model.forward
