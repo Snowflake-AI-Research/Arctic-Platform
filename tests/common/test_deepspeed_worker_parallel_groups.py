@@ -15,13 +15,27 @@
 
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""New CPU-only worker construction controls, with no native ranks or model loads."""
+"""Worker group wiring, including tiny native CPU/Gloo engine controls.
 
+The native controls exercise worker group setup and the maintained engine adapter,
+not Ray GPU-worker startup, expert dispatch kernels, or full-model numerics.
+"""
+
+import os
+import sys
 from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import execute_subprocess_async
+from arctic_platform.testing_utils import get_unique_port_number
+from arctic_platform.testing_utils import require_deepspeed
+from arctic_platform.testing_utils import reserve_free_port
+from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import torch_assert_close
 
 
 @pytest.fixture
@@ -284,3 +298,143 @@ def test_worker_sp_routing_rejects_uninitialized_or_inconsistent_membership(rout
         monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [0] * 8)
     with pytest.raises(RuntimeError):
         worker.get_sequence_parallel_info()
+
+
+class TestNativeWorkerParallelGroups(TestCasePlus):
+    @require_deepspeed
+    def test_cpu_dense_engine_batch_gradients_and_norm(self):
+        self._check_topology(1, 1)
+
+    @require_deepspeed
+    def test_cpu_ep_only_engine_batch_gradients_and_norm(self):
+        self._check_topology(2, 1)
+
+    @require_deepspeed
+    def test_cpu_sp_only_engine_batch_gradients_and_norm(self):
+        self._check_topology(1, 2)
+
+    def _check_topology(self, ep_size, sp_size):
+        pytest.importorskip("ray")
+        env = self.get_env()
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        env["DS_ACCELERATOR"] = "cpu"
+        env["OMP_NUM_THREADS"] = "1"
+        env["NATIVE_WORKER_EP"] = str(ep_size)
+        env["NATIVE_WORKER_SP"] = str(sp_size)
+        port = reserve_free_port(get_unique_port_number() + 1, span=7)
+        execute_subprocess_async(
+            [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--nnodes=1",
+                "--nproc-per-node=4",
+                "--master-addr=127.0.0.1",
+                f"--master-port={port}",
+                __file__,
+                "--native-worker-groups",
+            ],
+            env=env,
+            timeout=180,
+        )
+
+
+def _native_worker_parallel_groups():
+    import deepspeed
+    import torch.distributed as dist
+    from deepspeed.runtime.config import DeepSpeedConfig
+    from deepspeed.utils import safe_get_full_grad
+
+    from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
+    from arctic_platform.common.deepspeed_engine import build_deepspeed_config
+    from arctic_platform.common.deepspeed_engine import initialize_training_engine
+    from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
+    from arctic_platform.common.optimizer import OptimizerSettings
+
+    deepspeed.init_distributed("gloo", auto_mpi_discovery=False)
+    try:
+        rank, world = dist.get_rank(), dist.get_world_size()
+        ep_size, sp_size = int(os.environ["NATIVE_WORKER_EP"]), int(os.environ["NATIVE_WORKER_SP"])
+        assert world == 4 and not torch.cuda.is_available()
+        dp_size = world // sp_size
+        worker = object.__new__(DeepSpeedWorker.__ray_metadata__.modified_class)
+        worker.rank, worker.world_size = rank, world
+        setup_config = {"zero_optimization": {"stage": 2}}
+        parallel_groups = worker._setup_model_parallel_groups(_spec(ep=ep_size, sp=sp_size), setup_config, {})
+        assert (worker.mpu is None) == (sp_size == 1)
+        if ep_size > 1:
+            assert dist.get_world_size(worker.ep_group) == ep_size
+            assert parallel_groups["ep_group"] is worker.ep_group
+        if sp_size > 1:
+            assert dist.get_world_size(worker.sp_group) == sp_size
+            assert worker.mpu.get_sequence_data_parallel_world_size() == world
+        for gas in (1, 3):
+            set_seed(7)
+            model = torch.nn.Linear(1, 1)
+            reference = deepcopy(model)
+            spec = TrainingEngineSpec(
+                dtype="float32",
+                world_size=world,
+                sequence_parallel=sp_size,
+                train_micro_batch_size_per_gpu=2,
+                gradient_accumulation_steps=gas,
+                gradient_clipping=0,
+                optimizer=OptimizerSettings(name="torch_adamw", lr=0.001, fused=False),
+                ds_overrides={
+                    "zero_allow_untested_optimizer": True,
+                    "zero_optimization": {"stage": 2, "reduce_scatter": True},
+                },
+            )
+            config = build_deepspeed_config(spec)
+            expected_batch = dp_size * 2 * gas
+            assert config["train_batch_size"] == expected_batch
+            assert DeepSpeedConfig(config, mpu=worker.mpu).world_size == dp_size
+            engine, _, _ = initialize_training_engine(
+                model,
+                config,
+                optimizer=spec.optimizer,
+                ep_size=ep_size,
+                mpu=worker.mpu,
+                model_path="tiny-cpu-policy",
+                rank=rank,
+            )
+            assert engine.seq_dp_world_size // engine.sequence_parallel_size == dp_size
+            if sp_size == 1:
+                assert engine.dp_world_size == world
+            assert engine.train_batch_size() == expected_batch
+            assert engine.gradient_accumulation_steps() == gas
+            assert engine.train_micro_batch_size_per_gpu() == 2
+            # Distinct logical-DP rows; SP ranks hold disjoint tokens of the same rows.
+            inputs = torch.arange(expected_batch * 4, dtype=torch.float32).reshape(dp_size, gas, 2, 4, 1) / 32
+            expected_loss = reference(inputs).square().mean()
+            expected_loss.backward()
+            replica = rank // sp_size
+            local_rank = worker.sp_rank
+            observed_loss = torch.zeros(())
+            for micro in range(gas):
+                tokens = inputs[replica, micro, :, local_rank * (4 // sp_size) : (local_rank + 1) * (4 // sp_size)]
+                loss = engine(tokens).square().sum() / (2 * 4)
+                observed_loss += loss.detach() / (gas * dp_size)
+                engine.backward(loss)
+                if micro + 1 < gas:
+                    engine.step()
+            dist.all_reduce(observed_loss)
+            # FP32 collective ordering can differ from the full-batch reference.
+            torch_assert_close(observed_loss, expected_loss.detach(), rtol=0, atol=1e-6)
+            for parameter, expected in zip(model.parameters(), reference.parameters()):
+                torch_assert_close(safe_get_full_grad(parameter), expected.grad, rtol=0, atol=1e-6)
+            expected_norm = torch.linalg.vector_norm(torch.cat([p.grad.flatten() for p in reference.parameters()]))
+            engine.step()
+            torch_assert_close(torch.as_tensor(engine.get_global_grad_norm()), expected_norm, rtol=0, atol=1e-6)
+            if rank == 0:
+                print(
+                    f"NATIVE_WORKER_GROUPS_PASS ep={ep_size} sp={sp_size} dp={dp_size} "
+                    f"gas={gas} batch={expected_batch} loss={observed_loss.item()} norm={expected_norm.item()}",
+                    flush=True,
+                )
+    finally:
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__" and "--native-worker-groups" in sys.argv:
+    _native_worker_parallel_groups()
