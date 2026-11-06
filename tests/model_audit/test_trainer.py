@@ -46,6 +46,9 @@ ORDER = audit_lib.register_check(
 SHORT = audit_lib.register_check(
     "trainer.short_rows_supported", "a request whose last row has any length from 1 token up runs and stays finite"
 )
+ONE_TOKEN = audit_lib.register_check(
+    "trainer.one_token_per_rank", "a request that leaves each rank one token runs and stays finite"
+)
 GRAD_COMPLETE = audit_lib.register_check(
     "trainer.gradients_complete", "every trainable parameter gets a finite, nonzero gradient unless declared"
 )
@@ -153,6 +156,9 @@ def _per_row(profile, rows, packed, other, floor, fp32, record, label):
 @pytest.mark.audit_check(PACKED)
 def test_packed_rows_isolated(profile, reference, trainer_forward, record):
     ref, fwd = require_ok(reference, "local reference"), require_ok(trainer_forward, "training job")
+    assert (
+        "isolated_error" not in fwd
+    ), f"a forward of one row alone failed: {fwd.get('isolated_error', '').strip().splitlines()[-1:]}"
     if "isolated_logprobs" not in fwd:
         pytest.skip(ISOLATION_GAP)
     _per_row(
@@ -192,6 +198,13 @@ def test_short_rows_supported(profile, trainer_forward, record):
     record(short_rows=fwd["short_rows"])
     bad = {length: status for length, status in fwd["short_rows"].items() if status != "ok"}
     assert not bad, f"requests ending in a row of these lengths fail: {bad}"
+
+
+@pytest.mark.audit_check(ONE_TOKEN)
+def test_one_token_per_rank(profile, trainer_forward, record):
+    status = require_ok(trainer_forward, "training job")["one_token_per_rank"]
+    record(status=status)
+    assert status == "ok", f"a request of sp_size tokens per data-parallel rank fails: {status}"
 
 
 @pytest.mark.audit_check(GRAD_COMPLETE)

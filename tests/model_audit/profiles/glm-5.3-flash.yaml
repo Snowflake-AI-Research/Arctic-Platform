@@ -26,9 +26,6 @@ known_issues:
     summary: >-
       a packed sample of 2-3 tokens (under one index_kpool) asks FlashInfer top-k for k=0 and crashes the fused
       indexer
-  trainer.deterministic:
-    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/366
-    summary: "MoE combine is nondeterministic by default (#366 adds opt-in debug.full_determinism); routing amplifies it to ~0.2 log-prob"
   sampler.tensor_parallel_matches_reference[tp1]:
     issue: upstream (vLLM)
     summary: >-

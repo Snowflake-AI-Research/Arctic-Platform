@@ -119,7 +119,7 @@ def test_frozen_unchanged(profile, baseline_step, record):
 def test_noop_offload_steps(profile, noop_offload_step, record):
     step = require_ok(noop_offload_step, "training job with offload_optimizer.device=none")["step"]
     record(step=step)
-    assert "error" not in step, f"the step failed: {step.get('error', '')[-600:]}"
+    assert "error" not in step, f"the step failed: {step.get('error', '').strip().splitlines()[-1:]}"
 
 
 @pytest.mark.audit_check(POLICY)

@@ -176,9 +176,31 @@ class Job:
         return {"saved": _without_urls(saved), "files": _without_urls(exported["files"]), "path": str(dest)}
 
     @staticmethod
-    def _fetch(url: str, target: Path) -> str:
-        urllib.request.urlretrieve(url, target)
-        return target.name
+    def _fetch(url: str, target: Path, attempts: int = 5) -> str:
+        """Download ``url``, resuming with a Range request when a transfer of a large file stops short."""
+        total = None
+        for attempt in range(attempts):
+            have = target.stat().st_size if target.exists() else 0
+            if total is not None and have >= total:
+                return target.name
+            request = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
+            try:
+                with urllib.request.urlopen(request, timeout=600) as response:
+                    resumed = response.status == 206
+                    span = response.headers.get("Content-Range")
+                    total = (
+                        int(span.rsplit("/", 1)[1]) if resumed and span else int(response.headers["Content-Length"])
+                    )
+                    with open(target, "ab" if resumed else "wb") as out:
+                        shutil.copyfileobj(response, out, 1 << 24)
+            except (OSError, ValueError) as err:
+                if attempt == attempts - 1:
+                    raise
+                print(f"[{time.strftime('%H:%M:%S')}] {target.name}: {type(err).__name__}, resuming", flush=True)
+                continue
+            if target.stat().st_size == total:
+                return target.name
+        raise OSError(f"{target.name}: got {target.stat().st_size} of {total} bytes after {attempts} attempts")
 
     def generate(self, rows: list[list[int]]) -> list[torch.Tensor]:
         params = {"max_tokens": 1, "temperature": 1.0, "prompt_logprobs": 0, "logprobs": 0}
@@ -204,7 +226,8 @@ def _status(fn) -> str:
         lps = fn()
         return "ok" if all(bool(torch.isfinite(lp[:-1]).all()) for lp in lps) else "non-finite log-probs"
     except Exception as err:  # noqa: BLE001
-        return f"{type(err).__name__}: {str(err).strip().splitlines()[-1][:300] if str(err).strip() else ''}"
+        lines = [line for line in str(err).strip().splitlines() if "TORCHDYNAMO_VERBOSE" not in line]
+        return f"{type(err).__name__}: {lines[-1][:300] if lines else ''}"
 
 
 def run(profile, ckpt: str, body: dict, lr: float, sync_formats: list[str], forwards: str, out_dir: Path, log) -> dict:
@@ -235,8 +258,13 @@ def run(profile, ckpt: str, body: dict, lr: float, sync_formats: list[str], forw
             if forwards == "all":
                 reversed_rows = list(reversed(rows))
                 fwd["reversed_logprobs"] = audit_lib.pack_logprobs(reversed_rows, job.forward(reversed_rows), pad)
+                sp = int(training["training_config"].get("sp_size", 1))
+                fwd["one_token_per_rank"] = _status(lambda: job.forward([r[:sp] for r in sorted(rows, key=len)[-dp:]]))
                 if dp == 1:
-                    fwd["isolated_logprobs"] = [job.forward([row])[0] for row in rows]
+                    try:
+                        fwd["isolated_logprobs"] = [job.forward([row])[0] for row in rows]
+                    except Exception as err:  # noqa: BLE001
+                        fwd["isolated_error"] = f"{type(err).__name__}: {str(err).strip()[-1500:]}"
                 company = rows[1 : max(dp, 2)]
                 fwd["short_rows"] = {
                     n: _status(lambda n=n: job.forward(company + [rows[0][:n]])) for n in audit_lib.SHORT_ROW_LENGTHS

@@ -7,6 +7,11 @@ client:
   variant: long
   training: h200-training-full
   sampling: h200-inference-full
+  overrides:
+    training:
+      # At ep_size > 1 the launch defaults to a fused Liger head, which returns only a scalar loss; the probes'
+      # causal_cross_entropy step needs per-token log-probs, and the service rejects it otherwise.
+      training_config: {model_options: {lm_head: {cross_entropy: false}}}
 
 probe:
   max_row_len: 4224

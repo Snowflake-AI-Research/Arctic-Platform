@@ -90,6 +90,9 @@ def _against(profile, ref, actual_per_row, expected_packed, record, label):
 def test_matches_trainer(profile, reference, trainer_forward, sampler_run, record):
     ref, fwd = require_ok(reference, "local reference"), require_ok(trainer_forward, "training job")
     sampler = require_ok(sampler_run, "sampler")
+    assert (
+        "isolated_error" not in fwd
+    ), f"a forward of one row alone failed: {fwd.get('isolated_error', '').strip().splitlines()[-1:]}"
     if "isolated_logprobs" not in fwd:
         pytest.skip(ISOLATION_GAP)
     trainer_packed = torch.cat(fwd["isolated_logprobs"]).unsqueeze(0)

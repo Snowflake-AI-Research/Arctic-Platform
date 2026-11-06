@@ -17,9 +17,6 @@ expect:
     - {pattern: "self_attn\\.indexer\\.", reason: "the DSA indexer only selects keys; the reference runs it under no_grad"}
 
 known_issues:
-  trainer.deterministic:
-    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/366
-    summary: "MoE combine is nondeterministic by default (#366 adds opt-in debug.full_determinism)"
   sampler.repeatable:
     issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/401
     summary: >-
