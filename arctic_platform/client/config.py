@@ -302,6 +302,8 @@ class ArcticClientConfig(BaseModel):
         payload: dict[str, Any] = {"model_name": self.model_name, "job_type": job_type}
         if self.seed is not None:
             payload["seed"] = self.seed
+        if self.dtype is not None:
+            payload["dtype"] = self.dtype
         # log-prob runs on DeepSpeed only when asked; otherwise it's a vLLM engine.
         use_deepspeed = job_type == "training" or (job_type == "log_prob" and sc.log_prob_engine == "deepspeed")
         if use_deepspeed:

@@ -50,6 +50,7 @@ class JobConfig(BaseModel):
 
     model_name: str
     job_type: str = Field(default="training")
+    dtype: str | None = None
     num_devices: int | None = None
     ds_config: dict | None = None
     training_config: dict | None = None
