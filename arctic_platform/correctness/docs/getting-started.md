@@ -187,17 +187,18 @@ For a regression-only failure, say "run both checks" or name the desired check I
 
 You don't need to do it for the demo, but for the real config addition
 
-**For a real config addition, review and stage the imported config and reviewed specifications after onboarding and regression succeed.** The demo does not require a commit. The paths below select only this demo's new FP32 variant; for another recipe, substitute its resolved imported path and config ID. Configs and specs are ignored by default on P1, so staging them deliberately requires `-f`. Review the selected files without staging other local recipes or historical evidence.
+**Keep imported configs and compact references local until specific files are selected for publication.** Configs and `reference_data/` are untracked and are not ignored. The demo does not require a commit. When a config addition is explicitly selected after successful onboarding and regression, use its resolved imported path and config ID. Only `specs/` remains ignored on P1 and requires `-f`. Review the selected files without staging other local recipes or historical evidence.
 
 ```bash
+git add -- \
+  arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json
 git add -f -- \
-  arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
   arctic_platform/correctness/specs/tiny-qwen3-129m-standard-h200-training-full--fp32.json \
   arctic_platform/correctness/specs/tiny-qwen3-129m-standard-h200-training-full--fp32.onboarding.json
 git diff --cached --stat
 ```
 
-**Do not stage `reference_data/`, `work/`, logs, model weights, adapter tensors, optimizer snapshots or fast-storage scratch.** Compact HF records in `reference_data/` are generated local artifacts, not files to commit. Retain those records alongside the Hugging Face source cache and reduced fixtures for later regression; deleting the records requires explicit reference preparation before regression can run again.
+**Do not stage unselected `reference_data/` records, `work/`, logs, model weights, adapter tensors, optimizer snapshots or fast-storage scratch.** Compact HF records remain local unless explicitly selected for a later commit. Retain those records alongside the Hugging Face source cache and reduced fixtures for later regression; deleting the records requires explicit reference preparation before regression can run again.
 
 ## Step 6. Optional Cleanup
 
