@@ -1,8 +1,10 @@
 import asyncio
 import logging
 import os
+import signal
 import subprocess
 import sys
+import time
 import traceback
 import types
 from pathlib import Path
@@ -487,3 +489,349 @@ def test_engine_startup_error_converts_only_a_plain_runtime_error(tmp_path, exc)
     assert str(worker_mod._engine_startup_error(RuntimeError("generic"), str(tmp_path))) == (
         "generic\nRoot cause in EngineCore: RuntimeError: x"
     )
+
+
+# An EngineCore as vLLM leaves it after a CUDA illegal memory access in warmup:
+# it records "EngineCore failed to start." and then hangs on the way out
+# instead of exiting, so the front end's wait for it never ends.
+_HUNG_ENGINE_PROCESS = _ENGINE_PROCESS + "import time\ntime.sleep(600)\n"
+_SLEEP = "import time\ntime.sleep(600)\n"
+
+
+def _titled(title, script):
+    """``script`` run under a process title, set the way vLLM sets it."""
+    return f"import setproctitle\nsetproctitle.setproctitle({title!r})\n" + script
+
+
+# Every process a test here starts, so the fixture below can reap it.
+_SPAWNED: list = []
+
+
+def _spawn(argv, **kwargs):
+    proc = subprocess.Popen(argv, **kwargs)
+    _SPAWNED.append(proc)
+    return proc
+
+
+@pytest.fixture(autouse=True)
+def _reap_spawned_processes():
+    """Kill and wait on every process a test started, and their descendants,
+    even when the test fails: a leftover ``VLLM::`` process would be seen,
+    and killed, by a later test's kill pass."""
+    import psutil
+
+    yield
+    procs = []
+    for popen in _SPAWNED:
+        try:
+            root = psutil.Process(popen.pid)
+            procs.extend(root.children(recursive=True))
+            procs.append(root)
+        except psutil.Error:
+            pass
+    for proc in procs:
+        try:
+            proc.kill()
+        except psutil.Error:
+            pass
+    psutil.wait_procs(procs, timeout=10)
+    for popen in _SPAWNED:
+        popen.kill()
+        popen.wait()
+    _SPAWNED.clear()
+    # When pytest is a subreaper (e.g. PID 1 in a container), a grandchild
+    # orphaned by an engine's kill is reparented here; reap it.
+    for child in psutil.Process().children():
+        try:
+            if child.status() == psutil.STATUS_ZOMBIE:
+                os.waitpid(child.pid, os.WNOHANG)
+        except (psutil.Error, ChildProcessError):
+            pass
+
+
+def _spawn_engine_core(script, *args):
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [_REPO_ROOT, os.environ.get("PYTHONPATH")]))}
+    return _spawn([sys.executable, "-c", _titled("VLLM::EngineCore", script), *args], env=env)
+
+
+def _spawn_child(title, script, *args):
+    """Source for the engine process to start a titled child of its own; it writes the child's pid to argv[-1]."""
+    return (
+        "import subprocess, sys\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {_titled(title, script)!r}, *{list(args)!r}])\n"
+        "open(sys.argv[-1], 'w').write(str(child.pid))\n"
+    )
+
+
+def _wait_for_engine_core(proc):
+    """What vLLM's wait_for_engine_startup does without a READY: wait for the EngineCore to exit."""
+    proc.wait()
+    raise RuntimeError(
+        f"Engine core initialization failed. See root cause above. Failed core proc(s): {{'EngineCore': {proc.returncode}}}"
+    )
+
+
+def _gone(pid):
+    import psutil
+
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True
+
+
+def _wait_gone(pid, timeout_s=10):
+    deadline = time.monotonic() + timeout_s
+    while not _gone(pid):
+        assert time.monotonic() < deadline, f"pid {pid} is still running"
+        time.sleep(0.05)
+
+
+def _watchdog_threads():
+    import threading
+
+    return [thread for thread in threading.enumerate() if thread.name == "ArcticEngineStartupWatchdog"]
+
+
+def _run_attempt(monkeypatch, tmp_path, spawn):
+    procs = []
+
+    def attempt():
+        procs.append(spawn())
+        _wait_for_engine_core(procs[-1])
+
+    start = time.monotonic()
+    try:
+        exc, _ = _initialize_with_engine_attempts(monkeypatch, tmp_path, [attempt])
+    finally:
+        for proc in procs:
+            proc.kill()
+            proc.wait()
+    return exc, procs[0], time.monotonic() - start
+
+
+def test_engine_that_records_its_failure_and_hangs_is_killed(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", "0.5")
+    root = "Worker failed with error 'Triton Error [CUDA]: an illegal memory access was encountered'"
+
+    exc, engine, elapsed = _run_attempt(
+        monkeypatch, tmp_path, lambda: _spawn_engine_core(_HUNG_ENGINE_PROCESS, "EngineCore failed to start.", root)
+    )
+
+    assert elapsed < 10
+    assert engine.returncode == -signal.SIGKILL
+    assert type(exc) is RuntimeError
+    assert f"Root cause in MainProcess: ValueError: {root}" in str(exc)
+    assert any(f"watchdog killed engine processes [{engine.pid}]" in note for note in exc.__notes__)
+    assert _watchdog_threads() == []
+
+
+def test_hung_engine_kill_takes_its_tp_workers_too(monkeypatch, tmp_path):
+    """A TP worker wedged on the GPU records nothing; killing only the
+    EngineCore would orphan it with the GPU memory it holds."""
+    monkeypatch.setenv("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", "0.5")
+    pid_file = tmp_path / "tp_worker.pid"
+    script = _spawn_child("VLLM::Worker_TP1", _SLEEP) + _HUNG_ENGINE_PROCESS
+
+    exc, engine, _ = _run_attempt(
+        monkeypatch,
+        tmp_path,
+        lambda: _spawn_engine_core(script, "EngineCore failed to start.", "illegal memory access", str(pid_file)),
+    )
+
+    assert engine.returncode == -signal.SIGKILL
+    assert "illegal memory access" in str(exc)
+    _wait_gone(int(pid_file.read_text()))
+
+
+def test_unrecorded_engine_core_is_killed_by_its_title(monkeypatch, tmp_path):
+    """Only a TP worker recorded a failure; the EngineCore the front end waits on
+    recorded nothing and hangs. It is found by vLLM's title."""
+    monkeypatch.setenv("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", "0.5")
+    pid_file = tmp_path / "tp_worker.pid"
+    worker = _ENGINE_PROCESS.replace("sys.argv[1]", "'WorkerProc failed to start.'").replace(
+        "sys.argv[2]", "'Triton Error [CUDA]: an illegal memory access was encountered'"
+    )
+    script = _spawn_child("VLLM::Worker_TP0", worker) + "child.wait()\n" + _SLEEP
+
+    exc, engine, elapsed = _run_attempt(
+        monkeypatch, tmp_path, lambda: _spawn_engine_core(script, str(pid_file))
+    )
+
+    assert elapsed < 10
+    assert engine.returncode == -signal.SIGKILL
+    assert "Root cause in MainProcess: ValueError: Triton Error [CUDA]: an illegal memory access" in str(exc)
+
+
+def test_slow_engine_startup_without_a_record_is_left_alone(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", "0")
+    procs = []
+    done = ValueError("engine came up")
+
+    def attempt():
+        procs.append(_spawn_engine_core("import time; time.sleep(2.5)"))
+        procs[-1].wait()
+        raise done
+
+    exc, _ = _initialize_with_engine_attempts(monkeypatch, tmp_path, [attempt])
+
+    assert exc is done
+    assert procs[0].returncode == 0
+    assert _watchdog_threads() == []
+
+
+def test_engine_that_exits_after_recording_its_failure_is_not_killed(monkeypatch, tmp_path):
+    # Shorter than the default so a kill would have time to land, longer than the exit takes.
+    monkeypatch.setenv("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", "2")
+
+    exc, engine, _ = _run_attempt(
+        monkeypatch,
+        tmp_path,
+        lambda: _spawn_engine_core(
+            _ENGINE_PROCESS + "import time\ntime.sleep(1)\n", "EngineCore failed to start.", "CUDA out of memory."
+        ),
+    )
+
+    assert engine.returncode == 0
+    assert "Root cause in MainProcess: ValueError: CUDA out of memory." in str(exc)
+    assert not any("watchdog killed" in note for note in getattr(exc, "__notes__", []))
+
+
+def test_kill_failed_engine_processes_spares_other_children():
+    import psutil
+
+    engine = _spawn_engine_core(_SLEEP)
+    bystander = _spawn([sys.executable, "-c", _SLEEP])
+    try:
+        deadline = time.monotonic() + 10
+        while not psutil.Process(engine.pid).name().startswith("VLLM::"):
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        # A recorded pid that is not a descendant (here pid 1) is never signalled.
+        # Asserted only about this test's own processes: anything else under
+        # vLLM's title in this process tree would be killed too, by design.
+        killed = worker_mod._kill_failed_engine_processes({1})
+        assert engine.pid in killed
+        assert bystander.pid not in killed and 1 not in killed
+        assert engine.wait(timeout=10) == -signal.SIGKILL
+        assert bystander.poll() is None
+    finally:
+        engine.kill()
+        bystander.kill()
+        engine.wait()
+        bystander.wait()
+
+
+def test_kill_does_not_read_cmdline(monkeypatch, tmp_path):
+    """Reading /proc/<pid>/cmdline can block on a wedged process, and psutil's
+    name() falls back to it for vLLM's 15-char titles; the kill must not touch it."""
+    import psutil
+
+    def no_cmdline(self):
+        raise AssertionError("cmdline() read")
+
+    monkeypatch.setattr(psutil.Process, "cmdline", no_cmdline)
+    monkeypatch.setenv("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", "0.5")
+    pid_file = tmp_path / "tp_worker.pid"
+    script = _spawn_child("VLLM::Worker_TP1", _SLEEP) + _HUNG_ENGINE_PROCESS
+
+    exc, engine, elapsed = _run_attempt(
+        monkeypatch,
+        tmp_path,
+        lambda: _spawn_engine_core(script, "EngineCore failed to start.", "illegal memory access", str(pid_file)),
+    )
+
+    assert elapsed < 10
+    assert engine.returncode == -signal.SIGKILL
+    _wait_gone(int(pid_file.read_text()))
+
+
+def test_watchdog_retries_the_kill_while_vllm_has_not_raised(monkeypatch, tmp_path):
+    monkeypatch.setenv("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", "0.5")
+    real_kill = worker_mod._kill_failed_engine_processes
+    calls = []
+
+    def kill_on_second_try(failed, stop=None):
+        calls.append(sorted(failed))
+        return [] if len(calls) == 1 else real_kill(failed, stop)
+
+    monkeypatch.setattr(worker_mod, "_kill_failed_engine_processes", kill_on_second_try)
+
+    exc, engine, elapsed = _run_attempt(
+        monkeypatch, tmp_path, lambda: _spawn_engine_core(_HUNG_ENGINE_PROCESS, "EngineCore failed to start.", "x")
+    )
+
+    assert len(calls) == 2
+    assert engine.returncode == -signal.SIGKILL
+    assert elapsed < 15
+
+
+def test_stuck_watchdog_does_not_hold_startup(monkeypatch, tmp_path, caplog):
+    import threading
+
+    caplog.set_level(logging.WARNING, logger=worker_mod.logger.name)
+    release = threading.Event()
+
+    def stuck(directory):
+        release.wait(30)  # like a read of a wedged process's /proc entry
+        return set()
+
+    monkeypatch.setattr(worker_mod, "recorded_pids", stuck)
+    monkeypatch.setattr(worker_mod, "_WATCHDOG_JOIN_SLACK_S", 0.2)
+    try:
+        start = time.monotonic()
+        with worker_mod._FailedStartupWatchdog(str(tmp_path), grace_s=0.0, poll_s=0.05):
+            time.sleep(0.2)
+        assert time.monotonic() - start < 2
+        assert "watchdog did not stop" in caplog.text
+    finally:
+        release.set()
+
+
+def test_kill_pass_signals_nothing_once_the_watchdog_is_stopped():
+    """A watchdog that outlived its attempt must not kill a later attempt's engine."""
+    import threading
+
+    import psutil
+
+    engine = _spawn_engine_core(_SLEEP)
+    try:
+        deadline = time.monotonic() + 10
+        while not psutil.Process(engine.pid).name().startswith("VLLM::"):
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        stop = threading.Event()
+        stop.set()
+        assert worker_mod._kill_failed_engine_processes({engine.pid}, stop) == []
+        time.sleep(0.2)
+        assert engine.poll() is None
+    finally:
+        engine.kill()
+        engine.wait()
+
+
+def test_kill_pass_skips_zombie_descendants():
+    """Under a subreaper, an exited engine process can sit here as a zombie
+    descendant; it holds nothing and is not reported as killed."""
+    import ctypes
+
+    import psutil
+
+    pr_set_child_subreaper = 36
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(pr_set_child_subreaper, 1, 0, 0, 0) != 0:
+        pytest.skip("needs prctl(PR_SET_CHILD_SUBREAPER)")
+    try:
+        # The parent exits at once, leaving its titled child, which exits too,
+        # reparented to this (subreaper) process as an unreaped zombie.
+        parent = _spawn([sys.executable, "-c", _spawn_child("VLLM::Worker_TP0", "import time; time.sleep(0.5)"), "/dev/null"])
+        parent.wait()
+        deadline = time.monotonic() + 10
+        while not [c for c in psutil.Process().children() if c.status() == psutil.STATUS_ZOMBIE
+                   and c.pid != parent.pid]:
+            assert time.monotonic() < deadline, "no zombie descendant appeared"
+            time.sleep(0.05)
+
+        assert worker_mod._kill_failed_engine_processes(set()) == []
+    finally:
+        libc.prctl(pr_set_child_subreaper, 0, 0, 0, 0)

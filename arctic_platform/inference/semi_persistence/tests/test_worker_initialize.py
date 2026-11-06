@@ -28,6 +28,7 @@ import pytest
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _INFERENCE = os.path.dirname(os.path.dirname(_HERE))
 _WORKER = os.path.join(_INFERENCE, "server", "worker.py")
+_STARTUP_ERROR = os.path.join(_INFERENCE, "vllm", "startup_error.py")
 
 _RING = object()
 _ADDRESS_IN_USE = RuntimeError("DistNetworkError: EADDRINUSE address already in use")
@@ -36,6 +37,13 @@ _ADDRESS_IN_USE = RuntimeError("DistNetworkError: EADDRINUSE address already in 
 def _remote(cls):
     cls.__ray_metadata__ = types.SimpleNamespace(modified_class=cls)
     return cls
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _module(name, **attrs):
@@ -123,9 +131,10 @@ def env(monkeypatch):
             take_dense=noop),
         "arctic_platform.inference.vllm.spec_decode_grammar": _module(
             "spec", ensure_spec_decode_grammar_fix=noop),
-        "arctic_platform.inference.vllm.startup_error": _module(
-            "startup_error", ENV_VAR="ARCTIC_ENGINE_STARTUP_ERROR_DIR",
-            earliest_startup_error=noop),
+        # The real module: it is stdlib-only, and a stub falls behind what
+        # worker.py imports from it.
+        "arctic_platform.inference.vllm.startup_error": _load(
+            "arctic_platform.inference.vllm.startup_error", _STARTUP_ERROR),
         "arctic_platform.inference.vllm.xgrammar_stop_mask": _module(
             "xgrammar", ensure_xgrammar_stop_mask_fix=noop),
         "arctic_platform.inference.utils": _module(
