@@ -43,7 +43,7 @@ def test_selection_uses_model_type(tmp_path, composite):
     assert spec.loader == "glm_moe_dsa"
 
 
-@pytest.mark.parametrize("backend", ["deepep", "uccl"])
+@pytest.mark.parametrize("backend", ["deepep", "deepep_v2", "uccl"])
 def test_loader_preserves_options_and_process_group(monkeypatch, backend):
     from arctic_platform.model.implementations.glm52 import deepspeed_integration as glm
 
