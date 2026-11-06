@@ -223,11 +223,37 @@ def test_chunk_accepts_binary_suffixes(monkeypatch):
     assert sg._env_int(sg.CHUNK_ENV, 7, sg._parse_bytes) == 7
 
 
-def test_mode_is_off_unless_peers(monkeypatch):
-    for raw, want in (("", False), ("off", False), ("peers", True),
-                      ("PEERS", True), ("s3", False)):
+def test_mode_is_off_unless_peers_or_local(monkeypatch):
+    for raw, want in (("", "off"), ("off", "off"), ("peers", "peers"),
+                      ("PEERS", "peers"), ("local", "local"), ("s3", "off")):
         monkeypatch.setenv(sg.MODE_ENV, raw)
-        assert sg.enabled() is want
+        assert sg.mode() == want
+        assert sg.enabled() is (want != "off")
+
+
+def test_direct_writes_only_aligned_heads(tmp_path, monkeypatch):
+    """O_DIRECT gets whole blocks at block offsets; the file's tail does not."""
+    dest = tmp_path / "f"
+    dest.write_bytes(bytes(3 * sg._ALIGN + 100))
+    out = sg._Writer(str(dest), direct=False)
+    out.dfd = os.open(dest, os.O_WRONLY)
+    calls = []
+    real = os.pwrite
+
+    def pwrite(fd, view, offset):
+        calls.append(("direct" if fd == out.dfd else "plain", len(view), offset))
+        return real(fd, view, offset)
+
+    monkeypatch.setattr(sg.os, "pwrite", pwrite)
+    data = os.urandom(2 * sg._ALIGN + 100)
+    out.write(memoryview(data), sg._ALIGN)
+    out.write(memoryview(data[:10]), 7)
+    out.close()
+    assert calls == [("direct", 2 * sg._ALIGN, sg._ALIGN),
+                     ("plain", 100, 3 * sg._ALIGN),
+                     ("plain", 10, 7)]
+    body = dest.read_bytes()
+    assert body[sg._ALIGN:] == data and body[7:17] == data[:10]
 
 
 # --------------------------------------------------------------------------
@@ -276,6 +302,24 @@ def test_no_reachable_peer_is_a_local_copy(tmp_path, monkeypatch):
     _same_subdirs(source, incoming)
     assert stats.peers == 0 and stats.peer_bytes == 0
     assert stats.local_bytes == stats.total_bytes
+
+
+def test_local_mode_never_asks_a_peer(tmp_path, monkeypatch, peers):
+    mirror = str(tmp_path / "mirror")
+    source = _published(tmp_path, str(tmp_path / "cache" / "k"))
+    started = peers(mirror, "ok")
+    _use(monkeypatch, started, chunk="1000")
+    monkeypatch.setenv(sg.MODE_ENV, "local")
+    incoming = str(tmp_path / "incoming")
+    stats = _gather(source, incoming, mirror)
+    _same_subdirs(source, incoming)
+    assert started[0].requests == 0
+    assert stats.peers == 0 and stats.local_bytes == stats.total_bytes
+    # 1000 rounds up to one 4 KiB block per range.
+    assert stats.local_ranges == sum(
+        -(-os.path.getsize(os.path.join(d, n)) // sg._ALIGN)
+        for sub in se._COPY_SUBDIRS
+        for d, _, names in os.walk(os.path.join(source, sub)) for n in names)
 
 
 def test_past_the_deadline_ranges_come_from_the_local_mirror(

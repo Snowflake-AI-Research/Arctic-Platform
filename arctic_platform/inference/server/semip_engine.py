@@ -250,7 +250,8 @@ _COPY_SUBDIRS = (_COMPILATION_DIR, _IMAGE_DIR)
 
 # "peers" assembles those directories from byte ranges served by the
 # model-cache daemons on every node, with any range they do not deliver read
-# from the local mirror. See semip_gather.py; unset keeps the local copy.
+# from the local mirror; "local" is the same parallel ranged copy from the
+# local mirror alone. See semip_gather.py; unset keeps copytree.
 _GATHER_ENV = "SEMIP_GATHER"
 
 # Written by _semip_save_weights beside the shards it indexes; TP>1 fans out
@@ -1752,9 +1753,10 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
     if gathered is not None:
         how = (f"; gathered {gathered.peer_bytes / 2**30:.2f} GiB from "
                f"{gathered.peers - gathered.failed_peers}/{gathered.peers} "
-               f"peer(s) over {gathered.flows} flow(s) and "
-               f"{gathered.local_bytes / 2**30:.2f} GiB "
-               f"({gathered.local_ranges} range(s)) from the local mirror")
+               f"peer(s) and {gathered.local_bytes / 2**30:.2f} GiB "
+               f"({gathered.local_ranges} range(s)) from the local mirror "
+               f"over {gathered.flows} flow(s)"
+               f"{', O_DIRECT' if gathered.direct else ''}")
     logger.info(
         "semi_p: materialized %s from %s: %d file(s), %.2f GiB in %.1fs "
         "(%.0f MB/s); weights stay on the mirror%s",
