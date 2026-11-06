@@ -586,9 +586,11 @@ def test_glm53_sparse_indices_are_padded_for_flashmla():
 
 
 def test_glm53_sparse_mla_full_forward_backward_without_sdpa():
+    from arctic_platform.model.implementations.glm53.context_parallel import _select_sparse_indices
     from arctic_platform.model.implementations.glm53.context_parallel import apply_context_parallelism
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
 
+    set_seed(0)
     config = _tiny_config()
     config.use_cache = False
     config.text_config.use_cache = False
@@ -597,15 +599,71 @@ def test_glm53_sparse_mla_full_forward_backward_without_sdpa():
     apply_context_parallelism(model, cp_size=1, cp_group=None)
     sparse_attention = language_model.layers[-1].self_attn
     hidden_states = torch.randn(1, 4, config.text_config.hidden_size)
-    output, _, _ = sparse_attention(
+    attention_mask = torch.ones(1, 4, dtype=torch.bool)
+    q_resid = sparse_attention.q_a_layernorm(sparse_attention.q_a_proj(hidden_states))
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+    expected_indices = _select_sparse_indices(
+        sparse_attention.indexer,
         hidden_states,
-        attention_mask=torch.ones(1, 4, dtype=torch.bool),
+        q_resid,
+        attention_mask,
+        cu_seqlens,
+        cp_group=None,
+        cp_rank=0,
     )
-    output.square().sum().backward()
+    torch_assert_equal(sparse_attention.indexer(hidden_states, q_resid, attention_mask, cu_seqlens), expected_indices)
 
+    calls = []
+    handle = sparse_attention.indexer.register_forward_hook(
+        lambda module, args, indices: calls.append((args, indices))
+    )
+    try:
+        output, _, _ = sparse_attention(hidden_states, attention_mask=attention_mask)
+        output.square().sum().backward()
+    finally:
+        handle.remove()
+
+    assert len(calls) == 1
+    assert calls[0][0][0] is hidden_states
+    torch_assert_equal(calls[0][1], expected_indices)
+    assert not calls[0][1].is_floating_point() and not calls[0][1].requires_grad
     assert sparse_attention.q_a_proj.weight.grad is not None
     assert sparse_attention.kv_a_proj_with_mqa.weight.grad is not None
-    assert sparse_attention.indexer.wq_b.weight.grad is None
+    assert all(parameter.grad is None for parameter in sparse_attention.indexer.parameters())
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_glm53_indexer_module_forward_keeps_context_parallel_identity(monkeypatch, rank):
+    from arctic_platform.model.implementations.glm53 import context_parallel as cp
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+
+    model = Glm5NextForConditionalGenerationPrimeRL(_tiny_config())
+    group = object()
+    monkeypatch.setattr(
+        cp.dist, "get_world_size", lambda selected: 2 if selected is group else pytest.fail("wrong group")
+    )
+    monkeypatch.setattr(
+        cp.dist, "get_rank", lambda selected: rank if selected is group else pytest.fail("wrong group")
+    )
+    cp.apply_context_parallelism(model, cp_size=2, cp_group=group)
+    indexer = model.model.language_model.layers[-1].self_attn.indexer
+    expected = torch.tensor([[[0, 1]]], dtype=torch.int32)
+    observed = []
+
+    def select(module, *args, cp_group, cp_rank):
+        observed.append((module, args, cp_group, cp_rank))
+        return expected
+
+    monkeypatch.setattr(cp, "_select_sparse_indices", select)
+    inputs = (torch.zeros(1, 2, 16), torch.zeros(1, 2, 8), torch.ones(1, 2), torch.tensor([0, 4]))
+    hooks = []
+    handle = indexer.register_forward_hook(lambda module, args, output: hooks.append((module, args, output)))
+    try:
+        assert indexer(*inputs) is expected
+    finally:
+        handle.remove()
+    assert observed == [(indexer, inputs, group, rank)]
+    assert hooks == [(indexer, inputs, expected)]
 
 
 def test_glm53_sparse_mla_applies_kv_b_proj_lora():
