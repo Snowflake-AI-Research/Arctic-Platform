@@ -134,8 +134,10 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
 
     Sequence parallelism reduces the data-parallel degree used to derive
     ``train_batch_size`` when the caller does not provide it explicitly.
-    An unmanaged engine runs one DeepSpeed micro-step per boundary, so the
-    caller's loop owns accumulation and DeepSpeed's accumulation count is 1.
+    The micro-batch size, accumulation count, and ``train_batch_size`` fields
+    apply only to managed accumulation. An unmanaged engine takes one DeepSpeed
+    micro-step per boundary (micro-batch 1, accumulation 1), because the caller's
+    token budget sets the packet count and the loop count.
     """
     dtype = (spec.dtype or "bfloat16").lower()
     is_bf16 = dtype in ("bfloat16", "bf16")
@@ -143,15 +145,17 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
     # bf16 master weights match FusedAdam's training dynamics. fp32 masters
     # are the opt-in that disables them.
     bf16_masters = is_bf16 and not spec.fp32_masters
-    # An unmanaged engine has one DeepSpeed micro-step per boundary; its caller runs the accumulation loop.
-    accumulation_steps = spec.gradient_accumulation_steps if spec.managed_gradient_accumulation else 1
-    train_batch_size = spec.train_batch_size or (
-        _data_parallel_size(spec.world_size, spec.sequence_parallel)
-        * spec.train_micro_batch_size_per_gpu
-        * accumulation_steps
-    )
+    data_parallel = _data_parallel_size(spec.world_size, spec.sequence_parallel)
+    if spec.managed_gradient_accumulation:
+        micro_batch_size = spec.train_micro_batch_size_per_gpu
+        accumulation_steps = spec.gradient_accumulation_steps
+        train_batch_size = spec.train_batch_size or (data_parallel * micro_batch_size * accumulation_steps)
+    else:
+        micro_batch_size = 1
+        accumulation_steps = 1
+        train_batch_size = data_parallel
     ds_config: dict[str, Any] = {
-        "train_micro_batch_size_per_gpu": spec.train_micro_batch_size_per_gpu,
+        "train_micro_batch_size_per_gpu": micro_batch_size,
         "train_batch_size": train_batch_size,
         "gradient_accumulation_steps": accumulation_steps,
         "bf16": {
