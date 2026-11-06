@@ -63,10 +63,8 @@ def training_sub_job(config: CortexRLConfig) -> dict[str, Any]:
             "betas": [optim.betas1, optim.betas2],
             "eps": ADAMW_EPS,
         },
-        "ds_config": {
-            "bf16": {"enabled": True},
-            "zero_optimization": {"stage": 1, "reduce_scatter": True},
-        },
+        "fp32_masters": True,
+        "ds_config": {"zero_optimization": {"stage": 1, "reduce_scatter": True}},
     }
     if model.attn != "auto":
         training_config["attn_implementation"] = model.attn

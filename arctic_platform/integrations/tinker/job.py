@@ -193,11 +193,9 @@ def client_config(cfg: TinkerJobConfig) -> Any:
                 weight_decay=cfg.weight_decay,
             ),
             gradient_clipping=cfg.grad_clip_norm,
+            fp32_masters=True,
             mb_spec=MicroBatchSpec(max_tokens_per_mb=cfg.max_tokens_per_mb),
-            ds_config={
-                "bf16": {"enabled": cfg.dtype == "bfloat16"},
-                "zero_optimization": {"stage": cfg.zero_stage},
-            },
+            ds_config={"zero_optimization": {"stage": cfg.zero_stage}},
             ds_worker_config={
                 "attn_implementation": cfg.attn_implementation,
                 "model_provider": "huggingface",

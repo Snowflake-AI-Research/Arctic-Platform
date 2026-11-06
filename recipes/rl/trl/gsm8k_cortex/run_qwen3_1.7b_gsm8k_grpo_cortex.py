@@ -108,10 +108,7 @@ def build_client(
     # ZeRO-3 + offload none trips CPUAdam-on-cuda on this Cortex image.
     # 0.6B 1-GPU matches on-prem TRL / Jae's rl_loop: ZeRO-1, no optimizer offload.
     zero_stage = int(os.environ.get("ARCTIC_ZERO_STAGE", "1"))
-    ds_config = {
-        "zero_optimization": {"stage": zero_stage, "reduce_scatter": True},
-        "bf16": {"enabled": True},
-    }
+    ds_config = {"zero_optimization": {"stage": zero_stage, "reduce_scatter": True}}
     ds_worker_config = dict(
         use_liger=False,
         enable_gradient_checkpointing=False,
@@ -137,6 +134,7 @@ def build_client(
         log_prob_gpus=0,
         training=TrainingConfig(
             optimizer=OptimizerSettings(lr=1e-6, betas=[0.9, 0.999], weight_decay=0.0),
+            fp32_masters=True,
             ds_config=ds_config,
             ds_worker_config=ds_worker_config,
             checkpoint_path=ckpt_dir,

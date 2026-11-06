@@ -40,6 +40,8 @@ from arctic_platform.rl.config import ArcticRLClientConfig
         ("gradient_accumulation_steps", "set training.mb_spec.num_micro_batches"),
         ("train_micro_batch_size_per_gpu", "set training.mb_spec.num_micro_batches"),
         ("train_batch_size", "the engine derives it from the data-parallel size"),
+        ("bf16", "set dtype, and training.fp32_masters"),
+        ("fp16", "set dtype"),
     ],
 )
 def test_ds_config_may_not_set_what_the_engine_owns(key, hint):
@@ -205,9 +207,9 @@ def test_legacy_config_translates_to_typed_settings():
     assert settings.optimizer == OptimizerSettings(lr=2e-6, weight_decay=0.01, betas=[0.9, 0.95])
     assert settings.gradient_clipping == 0.5
     assert settings.mb_spec == MicroBatchSpec(num_micro_batches=16)
+    assert settings.fp32_masters is True
     assert settings.ds_config == {
         "sequence_parallel_size": 2,
-        "bf16": {"enabled": True},
         "zero_optimization": {"stage": 2, "offload_optimizer": {"device": "none"}},
         "scheduler": {
             "type": "WarmupCosineLR",
@@ -231,6 +233,7 @@ def test_legacy_ds_config_alone_translates_and_unset_clipping_stays_off():
 
     assert settings.optimizer == OptimizerSettings(lr=3e-5)
     assert settings.gradient_clipping == 0.0
+    assert settings.fp32_masters is True
     assert settings.ds_config is None
 
     warmup = _skyrl_legacy(
@@ -239,6 +242,25 @@ def test_legacy_ds_config_alone_translates_and_unset_clipping_stays_off():
     assert warmup.ds_config["scheduler"]["type"] == "WarmupLR"
     assert warmup.ds_config["scheduler"]["params"]["warmup_num_steps"] == 2
     assert warmup.gradient_clipping == 1.0
+
+
+def test_legacy_bf16_block_becomes_fp32_masters():
+    def fp32_masters(bf16):
+        return (
+            ArcticRLClientConfig(model_name="m", training_gpus=1, ds_config={"bf16": bf16})
+            .training_settings()
+            .fp32_masters
+        )
+
+    assert fp32_masters({"enabled": True}) is True
+    assert fp32_masters({"enabled": True, "bf16_master_weights_and_grads": True}) is True
+    assert fp32_masters({"bf16_master_weights_and_grads": True, "bf16_optimizer_states": True}) is False
+    with pytest.raises(ValueError, match="may only enable bf16"):
+        fp32_masters({"enabled": False})
+    with pytest.raises(ValueError, match="may only enable bf16"):
+        ArcticRLClientConfig(
+            model_name="m", training_gpus=1, ds_config={"fp16": {"enabled": True}}
+        ).training_settings()
 
 
 def test_legacy_torch_adam_is_rejected():

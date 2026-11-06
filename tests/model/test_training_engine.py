@@ -88,18 +88,27 @@ def test_sequence_parallel_must_divide_the_world():
         build_deepspeed_config(_spec(world_size=4, sequence_parallel=3))
 
 
-def test_seed_and_zero_bucket_are_written_before_client_overrides():
+def test_client_zero_block_merges_into_the_built_one():
     ds_config = build_deepspeed_config(
         _spec(
             seed=7,
             zero_bucket_size=50_000_000,
-            ds_overrides={"zero_optimization": {"stage": 1}, "gradient_clipping": 2.0},
+            ds_overrides={"zero_optimization": {"stage": 1, "reduce_bucket_size": 10}, "gradient_clipping": 2.0},
         )
     )
 
     assert ds_config["seed"] == 7
     assert ds_config["gradient_clipping"] == 2.0
-    assert ds_config["zero_optimization"] == {"stage": 1}
+    assert ds_config["zero_optimization"] == {
+        "stage": 1,
+        "reduce_bucket_size": 10,
+        "allgather_bucket_size": 50_000_000,
+    }
+    offload = {"offload_optimizer": {"device": "cpu"}}
+    assert build_deepspeed_config(_spec(ds_overrides={"zero_optimization": offload}))["zero_optimization"] == {
+        "stage": 2,
+        **offload,
+    }
 
 
 @pytest.mark.parametrize("lowered", ["bf16", "bfloat16", "BF16", "fp16"])

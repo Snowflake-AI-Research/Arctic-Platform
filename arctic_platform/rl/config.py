@@ -127,6 +127,7 @@ class ArcticRLClientConfig(BaseModel):
         gradient_clipping = ds.pop("gradient_clipping", None)
         ds.pop("train_micro_batch_size_per_gpu", None)
         ds.pop("train_batch_size", None)
+        fp32_masters = _legacy_fp32_masters(ds.pop("bf16", None), ds.pop("fp16", None))
         tc = self.training_config or {}
         legacy_optimizer = tc.get("optimizer")
         if legacy_optimizer is not None:
@@ -154,6 +155,7 @@ class ArcticRLClientConfig(BaseModel):
         return WorkerTrainingSettings(
             optimizer=optimizer,
             gradient_clipping=float(gradient_clipping or 0.0),
+            fp32_masters=fp32_masters,
             mb_spec=MicroBatchSpec(num_micro_batches=int(num_micro_batches)) if num_micro_batches else None,
             ds_config=ds or None,
         )
@@ -162,6 +164,15 @@ class ArcticRLClientConfig(BaseModel):
     def comm_protocol(self) -> str:
         """Read by SkyRL's Arctic entrypoint. On Cortex ``get_server_state`` returns ``None`` either way."""
         return "ray"
+
+
+def _legacy_fp32_masters(bf16: Optional[dict], fp16: Optional[dict]) -> bool:
+    # The on-prem worker filled in ``bf16: {enabled: true}``, and DeepSpeed keeps fp32 masters unless the block
+    # asks for bf16 ones.
+    bf16 = bf16 or {}
+    if (fp16 or {}).get("enabled") or bf16.get("enabled") is False:
+        raise ValueError("ds_config may only enable bf16; fp16 and fp32 jobs set the job dtype instead")
+    return not (bf16.get("bf16_master_weights_and_grads") and bf16.get("bf16_optimizer_states"))
 
 
 def _legacy_scheduler(scheduler: Optional[dict], horizon: int, lr: float) -> Optional[dict[str, Any]]:

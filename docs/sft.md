@@ -240,7 +240,9 @@ vLLM settings on `sampling`.
 | `max_seq_len` | `8192` | Max sequence length (training + sampling) |
 | `backend.colocate` | `false` | Share GPUs between training and sampling |
 | `training.checkpoint_path` | **required** for new jobs | Server-side checkpoint dir |
-| `training.ds_config` | `null` | DeepSpeed config (optimizer, scheduler, micro-batch, ZeRO, bf16, …) |
+| `training.optimizer` / `training.gradient_clipping` | AdamW / `1.0` | `OptimizerSettings`; clipping `0` turns it off |
+| `training.fp32_masters` | `false` | fp32 master weights and optimizer states for a bf16 job; bf16 itself follows `dtype` |
+| `training.ds_config` | `null` | DeepSpeed passthrough (ZeRO, scheduler, …); `zero_optimization` is merged into the built block. `bf16`, `fp16`, `optimizer`, clipping and batch-size keys are rejected |
 | `training.ds_worker_config` | `null` | e.g. `attn_implementation`, `enable_gradient_checkpointing` |
 | `training.peft` | `null` | PEFT adapter config; `null` selects dense training, `{}` is invalid. On-prem supports training; Cortex also supports adapter sampling/sync |
 | `training.cuda_ipc` / `training.low_memory` | `false` / `false` | Colocated weight-sync strategy (only with `sampling_gpus > 0`), set on the training job at init; `sync_weights(cuda_ipc=…, low_memory=…)` overrides one call |

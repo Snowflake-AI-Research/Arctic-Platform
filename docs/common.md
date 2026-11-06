@@ -114,8 +114,7 @@ Forwarded in the `initialize` payload (`JobConfig`):
 |-----|---------|---------|
 | `model_name` | all | HF model id |
 | `job_type` | init | `training` / `sampling` / `log_prob` |
-| `ds_config` | training, log_prob (DS) | DeepSpeed JSON (micro-batch, ZeRO, bf16, …) |
-| `training_config` | training | Optimizer, LR schedule, `training_horizon`, `max_length`, GAS |
+| `training_config` | training | `optimizer`, `gradient_clipping`, `fp32_masters`, `zero_bucket_size`, `mb_spec`, and a `ds_config` DeepSpeed passthrough (ZeRO, scheduler, …) |
 | `log_prob_config` | log_prob (DS) | Forward-only DS settings |
 | `ds_worker_config` | training / log_prob (DS) | `attn_implementation`, `zorro_train_enable`, checkpointing, … |
 | `vllm_config` | sampling / log_prob (vLLM) | vLLM engine config |

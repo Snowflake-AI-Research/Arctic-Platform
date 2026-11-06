@@ -104,10 +104,8 @@ def build_config(config: Config):
         optimizer=OptimizerSettings(
             lr=config.learning_rate, weight_decay=config.weight_decay, betas=[0.9, 0.999], eps=1e-8
         ),
-        ds_config={
-            "zero_optimization": {"stage": config.zero_stage},
-            "bf16": {"enabled": True},
-        },
+        fp32_masters=True,
+        ds_config={"zero_optimization": {"stage": config.zero_stage}},
         ds_worker_config=worker,
         job_id=config.job_id,
     )

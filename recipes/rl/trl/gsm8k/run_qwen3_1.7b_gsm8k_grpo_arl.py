@@ -103,7 +103,6 @@ def build_client(
             "offload_optimizer": {"device": "none"},
             "offload_param": {"device": "none"},
         },
-        "bf16": {"enabled": True},
     }
     ds_worker_config = dict(
         use_liger=False,
@@ -147,6 +146,7 @@ def build_client(
         training=TrainingConfig(
             optimizer=OptimizerSettings(lr=1e-6, betas=[0.9, 0.999], weight_decay=0.0),
             gradient_clipping=0.0,
+            fp32_masters=True,
             mb_spec=MicroBatchSpec(num_micro_batches=grad_accum_steps),
             ds_config=ds_config,
             ds_worker_config=ds_worker_config,

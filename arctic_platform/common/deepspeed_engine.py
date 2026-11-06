@@ -62,8 +62,9 @@ class TrainingEngineSpec(BaseModel):
     """Engine inputs that do not depend on a training service.
 
     ``fp32_masters`` and ``zero_bucket_size`` come from the caller's job config.
-    ``ds_overrides`` is shallow-merged last, matching a client DeepSpeed
-    override block.
+    ``ds_overrides`` is merged last: one level deep for ``zero_optimization``,
+    so a client ZeRO block keeps the default stage and bucket sizes it does
+    not set, and replacing every other top-level key.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -142,7 +143,13 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         zero_config["reduce_bucket_size"] = spec.zero_bucket_size
         zero_config["allgather_bucket_size"] = spec.zero_bucket_size
     if spec.ds_overrides:
-        ds_config.update(spec.ds_overrides)
+        overrides = dict(spec.ds_overrides)
+        zero_overrides = overrides.pop("zero_optimization", None)
+        ds_config.update(overrides)
+        if isinstance(zero_overrides, dict):
+            ds_config["zero_optimization"] = {**ds_config["zero_optimization"], **zero_overrides}
+        elif zero_overrides is not None:
+            ds_config["zero_optimization"] = zero_overrides
     _require_fp32_gradient_reduction(ds_config)
     logger.info(
         "Resolved DeepSpeed precision: bf16=%s fp16=%s communication_data_type=%s",
@@ -382,7 +389,7 @@ def _require_fp32_gradient_reduction(ds_config: dict[str, Any]) -> None:
 
     ``communication_data_type`` is the dtype gradient partials are summed in
     when they cross a rank. A bfloat16 job sets it to fp32 here, and a
-    shallow client override can lower it afterwards. DeepSpeed's own default
+    client override can lower it afterwards. DeepSpeed's own default
     is the parameter dtype, so dropping the key is the same hazard as setting
     bfloat16. Anything other than fp32 is refused.
     """

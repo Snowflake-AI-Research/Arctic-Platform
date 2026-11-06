@@ -39,13 +39,16 @@ _ENGINE_OWNED_DS_KEYS = {
     "gradient_accumulation_steps": "set training.mb_spec.num_micro_batches",
     "train_micro_batch_size_per_gpu": "set training.mb_spec.num_micro_batches",
     "train_batch_size": "the engine derives it from the data-parallel size",
+    "bf16": "set dtype, and training.fp32_masters for fp32 master weights",
+    "fp16": "set dtype",
 }
 
 
 class TrainingEngineSettings(BaseModel):
     """Optimizer and DeepSpeed settings that ``training_engine_spec`` turns into a ``TrainingEngineSpec``.
 
-    ``optimizer=None`` is a frozen model. ``ds_config`` is shallow-merged over the built DeepSpeed config.
+    ``optimizer=None`` is a frozen model. ``ds_config`` is merged over the built DeepSpeed config, one level
+    deep for ``zero_optimization`` and replacing every other top-level key.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -60,7 +63,7 @@ class TrainingEngineSettings(BaseModel):
     )
     ds_config: dict[str, Any] | None = Field(
         None,
-        description="DeepSpeed config-json shallow-merged over the built config (zero_optimization, scheduler, ...).",
+        description="DeepSpeed config-json merged over the built config (zero_optimization, scheduler, ...).",
     )
 
 

@@ -172,6 +172,7 @@ def main() -> None:
             checkpoint_path=ckpt,
             optimizer=OptimizerSettings(lr=LR, betas=[0.9, 0.999], eps=1e-8, weight_decay=0.0),
             gradient_clipping=0.0,
+            fp32_masters=True,
             ds_config={
                 "zero_optimization": {
                     "stage": 2,
