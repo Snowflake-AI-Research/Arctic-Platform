@@ -1273,3 +1273,218 @@ def execute_subprocess_async(cmd, env=None, stdin=None, timeout=180, quiet=False
         raise RuntimeError(f"'{cmd_str}' produced no output.")
 
     return result
+
+
+def tiny_glm5_next_config():
+    """A four-layer GLM-5.3 (``glm5_next``) config small enough for CPU and single-GPU model tests."""
+    import pytest
+
+    pytest.importorskip("transformers.models.glm5_next")
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextConfig
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextVisionConfig
+
+    text = Glm5NextTextConfig(
+        vocab_size=32,
+        pad_token_id=0,
+        eos_token_id=1,
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=8,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        n_shared_experts=1,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        q_lora_rank=8,
+        kv_lora_rank=4,
+        qk_rope_head_dim=0,
+        qk_nope_head_dim=4,
+        v_head_dim=4,
+        index_n_heads=2,
+        index_head_dim=4,
+        index_topk=4,
+        index_kpool=2,
+        linear_num_heads=2,
+        linear_head_dim=4,
+        hc_mult=2,
+        layer_types=[
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "deepseek_sparse_attention",
+        ],
+        mlp_layer_types=["dense", "dense", "dense", "sparse"],
+    )
+    vision = Glm5NextVisionConfig(
+        depth=1,
+        hidden_size=8,
+        intermediate_size=16,
+        num_heads=2,
+        out_hidden_size=16,
+        projection_intermediate_size=16,
+        image_size=14,
+        patch_size=14,
+    )
+    return Glm5NextConfig(
+        text_config=text.to_dict(),
+        vision_config=vision.to_dict(),
+        image_token_id=2,
+        video_token_id=3,
+        image_start_token_id=4,
+        image_end_token_id=5,
+        video_start_token_id=6,
+        video_end_token_id=7,
+    )
+
+
+def tiny_qwen4_exp_config():
+    """A two-layer Qwen3.8-Flash-Next (``qwen4_exp``) config small enough for CPU and single-GPU model tests."""
+    import pytest
+
+    pytest.importorskip("transformers.models.qwen4_exp")
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
+
+    text_config = {
+        "vocab_size": 32,
+        "hidden_size": 16,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 8,
+        "linear_key_head_dim": 4,
+        "linear_value_head_dim": 4,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 2,
+        "linear_conv_kernel_dim": 2,
+        "moe_intermediate_size": 8,
+        "shared_expert_intermediate_size": 8,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "layer_types": ["linear_attention", "full_attention"],
+        "hc_count": 2,
+        "hc_lowrank": 4,
+        "ple_layer_ids": [1],
+        "ple_embed_dim": 8,
+        "ple_conv_kernel_size": 2,
+        "ngram_size": 3,
+        "heads_per_ngram": 1,
+        "ngram_vocab_size_base": 11,
+        "make_ngram_vocab_size_divisible_by": 4,
+        "split_ngram_parts": 2,
+        "indexer_n_heads": 1,
+        "indexer_kv_heads": 1,
+        "indexer_head_dim": 4,
+        "indexer_budget": 4,
+        "indexer_compress_ratio": 2,
+        "output_gate_type": "sigmoid",
+        "eos_token_id": 1,
+        "pad_token_id": 0,
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10_000.0,
+            "partial_rotary_factor": 0.5,
+            "mrope_section": [1, 1, 0],
+            "mrope_interleaved": True,
+        },
+    }
+    vision_config = {
+        "depth": 1,
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_heads": 2,
+        "out_hidden_size": 16,
+        "patch_size": 2,
+        "spatial_merge_size": 1,
+        "temporal_patch_size": 1,
+        "num_position_embeddings": 16,
+    }
+    config = Qwen4ExpConfig(
+        text_config=text_config,
+        vision_config=vision_config,
+        image_token_id=29,
+        video_token_id=30,
+        vision_start_token_id=27,
+        vision_end_token_id=28,
+    )
+    config.use_grouped_mm = False
+    return config
+
+
+def build_tiny_glm_sparse_model(*, kv_lora_rank=4, with_linear_attention=False):
+    """Build the sparse GLM model shared by packed-row and attention-backend tests."""
+    import pytest
+    import torch
+    from torch import nn
+
+    configuration = pytest.importorskip("transformers.models.glm5_next.configuration_glm5_next")
+    modeling = pytest.importorskip("transformers.models.glm5_next.modeling_glm5_next")
+    from arctic_platform.model.implementations.glm53.context_parallel import apply_context_parallelism
+
+    hidden_size = 256 if with_linear_attention else 16
+    layer_types = (
+        ["deepseek_sparse_attention", "linear_attention"] if with_linear_attention else ["deepseek_sparse_attention"]
+    )
+    config = configuration.Glm5NextTextConfig(
+        vocab_size=64,
+        pad_token_id=0,
+        hidden_size=hidden_size,
+        intermediate_size=128 if with_linear_attention else 32,
+        moe_intermediate_size=16,
+        num_hidden_layers=len(layer_types),
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        n_routed_experts=2,
+        num_experts_per_tok=1,
+        kv_lora_rank=kv_lora_rank,
+        q_lora_rank=8,
+        qk_rope_head_dim=0,
+        v_head_dim=4,
+        qk_nope_head_dim=4,
+        layer_types=layer_types,
+        indexer_types=["full"] * len(layer_types),
+        mlp_layer_types=["dense"] * len(layer_types),
+        index_topk=4,
+        index_head_dim=4,
+        index_n_heads=2,
+        index_kpool=2,
+        linear_head_dim=128,
+        linear_num_heads=2,
+        linear_conv_kernel_dim=4,
+        hc_mult=1,
+        max_position_embeddings=32,
+    )
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = modeling.Glm5NextTextModel(config)
+            self.config = type("TextConfig", (), {"model_type": "test"})()
+
+        def forward(self, **kwargs):
+            return self.model(**kwargs)
+
+    model = Model().to(torch.bfloat16).eval()
+    apply_context_parallelism(model, 1, None)
+    return model
+
+
+def unfused_causal_conv1d_module(global_cu_seqlens):
+    """A ``causal_conv1d`` module stand-in backed by the unfused depthwise convolution, honouring ``global_cu_seqlens``."""
+    import types
+
+    from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _fallback_depthwise_causal_convolution
+
+    def causal_conv1d_fn(x, weight, bias, activation, seq_idx):
+        return _fallback_depthwise_causal_convolution(
+            x,
+            weight=weight,
+            bias=bias,
+            activation=activation,
+            global_cu_seqlens=global_cu_seqlens,
+        )
+
+    module = types.ModuleType("causal_conv1d")
+    module.causal_conv1d_fn = causal_conv1d_fn
+    return module
