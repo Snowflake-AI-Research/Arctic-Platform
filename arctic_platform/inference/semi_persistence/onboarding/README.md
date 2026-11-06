@@ -317,7 +317,20 @@ The command exits non-zero if any model failed.
   `SEMIP_MATCH_COLLECTIVES`, so only the environment and `pass_config` were
   matched. Use a backend image that supports it.
 - **`on_miss` "did not cold-start"**: it found a local image on its node; pass
-  `miss_image_cache` so it uses a fresh root.
+  `miss_image_cache` so it uses a fresh root. With `miss_image_cache` set, see
+  the next entry.
+- **The sub-job log stops partway through a pod-spanning restore** (known issue,
+  seen on GLM-5.3 TP=16, cause not found): the service's `tail-logs` returns an
+  empty page at a cursor a few seconds into the restore, though the job keeps
+  logging. Neither log size nor the content of the lines at that point explains it,
+  and the archived execution logs miss the same lines. `publish` then never sees
+  `semi_p: published`, waits until the job idles out and records the model as
+  `FAILED` (a 409 once the job is gone) even when the image was uploaded; `onboard`
+  reports no key-to-ready time and can call a forced miss "did not cold-start". The
+  job's head-pod console has the whole log: fetch it with `ct download-log JOB_ID
+  --log-type stdout`, check it for the `semi_p: published` line, and add that model's
+  entry to `summary.json` from `publish.publish_outcome` of its lines; for
+  `onboard`, read the timings from the GPU pod logs (`log_files_on`, or `rereport`).
 - **`403 Forbidden`**: the connection's PAT expired or the network cannot reach
   the account; refresh the PAT or reconnect.
 - **`max_gpus cannot fit`**: a model's jobs need their GPUs at once; raise
