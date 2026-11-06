@@ -29,7 +29,8 @@ from arctic_platform.model.config import Patches
 from arctic_platform.model.config import TiledMlpPatch
 from arctic_platform.model.config import ZorroTrainPatch
 from arctic_platform.model.dense_spec import dense_model_spec
-from arctic_platform.model.dense_spec import ds_worker_dense_model_spec
+from arctic_platform.model.dense_spec import ds_worker_zorro_train
+from arctic_platform.model.dense_spec import settings_dense_model_spec
 from arctic_platform.model.factory import build_model
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import mark_keep_fp32
@@ -55,10 +56,11 @@ from arctic_platform.model.loader import model_parallelism_metadata_from_config
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loader import select_loader
 from arctic_platform.model.moe_spec import build_moe_model
-from arctic_platform.model.moe_spec import ds_worker_moe_model_spec
 from arctic_platform.model.moe_spec import hf_text_model_type
 from arctic_platform.model.moe_spec import is_glm_moe_model
 from arctic_platform.model.moe_spec import moe_model_spec
+from arctic_platform.model.moe_spec import settings_moe_loader_options
+from arctic_platform.model.moe_spec import settings_moe_model_spec
 from arctic_platform.model.parallel.validation import validate_expert_parallel
 from arctic_platform.model.parallel.validation import validate_sequence_parallel
 from arctic_platform.model.patch import apply_patches
@@ -100,8 +102,7 @@ __all__ = [
     "conversion_cache_is_node_local",
     "conversion_cache_ready",
     "dense_model_spec",
-    "ds_worker_dense_model_spec",
-    "ds_worker_moe_model_spec",
+    "ds_worker_zorro_train",
     "effective_fused_cross_entropy",
     "freeze_fp8_weights_and_scales",
     "gather_peft_adapter_state_dict",
@@ -134,6 +135,9 @@ __all__ = [
     "requires_hf_weight_sync",
     "save_hf_pretrained",
     "save_peft_adapters",
+    "settings_dense_model_spec",
+    "settings_moe_loader_options",
+    "settings_moe_model_spec",
     "supports_weight_format",
     "TiledMlpPatch",
     "ZorroTrainPatch",

@@ -408,7 +408,7 @@ class ArcticTrainingClient:
 
 
 class ArcticOptimizer(torch.optim.Optimizer):
-    """Calls ``client.step()``; clip/LR live in the server's ``ds_config``."""
+    """Calls ``client.step()``; clip and LR live in the job's training config."""
 
     def __init__(self, client: Any, params: Any, lr: float = 1e-6) -> None:
         super().__init__(params, {"lr": lr})  # scheduler/logging only; real LR is on the server

@@ -114,10 +114,9 @@ Forwarded in the `initialize` payload (`JobConfig`):
 |-----|---------|---------|
 | `model_name` | all | HF model id |
 | `job_type` | init | `training` / `sampling` / `log_prob` |
-| `ds_config` | training, log_prob (DS) | DeepSpeed JSON (micro-batch, ZeRO, bf16, …) |
-| `training_config` | training | Optimizer, LR schedule, `training_horizon`, `max_length`, GAS |
+| `training_config` | training / log_prob (DS) | Engine settings (`optimizer`, `gradient_clipping`, `fp32_masters`, `zero_bucket_size`, `mb_spec`, and a `ds_config` DeepSpeed passthrough), and model settings under the names Cortex reads (`attn_implementation`, `activation_checkpointing`, `use_liger`, `ep_size`, `peft_config`, `model_options`, …). A log-prob job reads only the model settings |
 | `log_prob_config` | log_prob (DS) | Forward-only DS settings |
-| `ds_worker_config` | training / log_prob (DS) | `attn_implementation`, `zorro_train_enable`, checkpointing, … |
+| `ds_worker_config` | training / log_prob (DS) | Worker runtime knobs: `zorro_train_enable` and its keys, `use_autocast`, `logits_optimization`, … Model settings here are rejected |
 | `vllm_config` | sampling / log_prob (vLLM) | vLLM engine config |
 | `arctic_inference_config` | sampling / log_prob (vLLM) | ZoRRo Inference, speculative decoding |
 | `checkpoint_path` | training | Checkpoint directory |
@@ -131,7 +130,7 @@ Forwarded in the `initialize` payload (`JobConfig`):
 
 ### Gradient Accumulation Precision
 
-**The AP DeepSpeed worker accumulates gradients in FP32 unless `data_types.grad_accum_dtype` says otherwise.** `DeepSpeedWorker.ds_training_config()` sets `grad_accum_dtype` to `"fp32"` when the key is missing or `null`, whether the `data_types` block is absent, empty, or carries only other fields. Every other field of a supplied block is kept, and the caller's block is not mutated.
+**The AP DeepSpeed worker accumulates gradients in FP32 unless `data_types.grad_accum_dtype` says otherwise.** `onprem_deepspeed_config()` sets `grad_accum_dtype` to `"fp32"` when the key is missing or `null`, whether the `data_types` block is absent, empty, or carries only other fields. Every other field of a supplied block is kept, and the caller's block is not mutated.
 
 **Set `data_types.grad_accum_dtype` explicitly to select a different accumulation precision.** An explicit value always wins; the FP32 default written out in full is:
 

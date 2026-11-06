@@ -120,8 +120,8 @@ def step_request(jobs: JobHandles, learning_rate: float | None = None) -> Reques
     # TODO(unify-backends): converge the server-side fwd_bwd/step *responses*
     # on ONE schema (loss + metrics) so callers never key on backend.
     #
-    # LR is server-authoritative (the DeepSpeed schedule set at init), so an
-    # unset learning_rate is omitted rather than sent as an explicit null.
+    # A set learning_rate overrides the server's DeepSpeed schedule for this
+    # step; an unset one is omitted rather than sent as an explicit null.
     body = {} if learning_rate is None else {"learning_rate": learning_rate}
     return Request("step", jobs.require("training"), body)
 

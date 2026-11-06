@@ -37,7 +37,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m arctic_platform.sft.examples.run_sft_demo --t
 Or drive the client yourself:
 
 ```python
-from arctic_platform.client import TrainingConfig
+from arctic_platform.client import OptimizerSettings, TrainingConfig
 from arctic_platform.sft import ArcticSFTClient, ArcticSFTClientConfig
 
 config = ArcticSFTClientConfig(
@@ -45,17 +45,8 @@ config = ArcticSFTClientConfig(
     training_gpus=2,
     training=TrainingConfig(
         checkpoint_path="/data-fast/my-run/ckpt",  # required for new jobs
-        ds_config={
-            "train_micro_batch_size_per_gpu": 1,
-            "train_batch_size": 2,
-            "gradient_accumulation_steps": 1,
-            "zero_optimization": {"stage": 2},
-            "bf16": {"enabled": True},
-            "optimizer": {
-                "type": "AdamW",
-                "params": {"lr": 1e-5, "betas": [0.9, 0.999], "weight_decay": 0.0},
-            },
-        },
+        optimizer=OptimizerSettings(lr=1e-5, betas=[0.9, 0.999], weight_decay=0.0),
+        ds_config={"zero_optimization": {"stage": 2}},
     ),
 )
 
@@ -121,7 +112,7 @@ the client must not touch CUDA.
             "labels": LongTensor[B, S_i],          # -100 = ignore (prompt / pad)
             "position_ids": LongTensor[B, S_i],    # required for sample packing
         },
-        # ... len(list) == gradient_accumulation_steps
+        # ... len(list) == training.mb_spec.num_micro_batches
     ],
     "meta": {
         "pad_token_id": int,
@@ -140,9 +131,7 @@ Constraints:
 
 - Each microbatch's `B` must be ≥ `training_gpus` and divisible by it — the
   server DP-shards **each** microbatch independently.
-- `train_micro_batch_size_per_gpu` in `ds_config` is the **per-rank** size
-  after that shard (`B / training_gpus`).
-- `len(batch)` must equal the server's `gradient_accumulation_steps`.
+- `len(batch)` must equal `training.mb_spec.num_micro_batches` (default 1).
 - Missing `labels` raises a clear `ValueError`. All-masked labels
   (`labels == -100`) contribute `(loss.sum=0, loss.tokens=0)` so they cancel
   cleanly in the global token-mean.
@@ -251,8 +240,11 @@ vLLM settings on `sampling`.
 | `max_seq_len` | `8192` | Max sequence length (training + sampling) |
 | `backend.colocate` | `false` | Share GPUs between training and sampling |
 | `training.checkpoint_path` | **required** for new jobs | Server-side checkpoint dir |
-| `training.ds_config` | `null` | DeepSpeed config (optimizer, scheduler, micro-batch, ZeRO, bf16, …) |
-| `training.ds_worker_config` | `null` | e.g. `attn_implementation`, `enable_gradient_checkpointing` |
+| `training.optimizer` / `training.gradient_clipping` | AdamW / `1.0` | `OptimizerSettings`; clipping `0` turns it off |
+| `training.fp32_masters` | `false` | fp32 master weights and optimizer states for a bf16 job; bf16 itself follows `dtype` |
+| `training.ds_config` | `null` | DeepSpeed passthrough (ZeRO, scheduler, …); `zero_optimization` is merged into the built block. `bf16`, `fp16`, `optimizer`, clipping and batch-size keys are rejected |
+| `training.attn_implementation` / `training.activation_checkpointing` | `null` / `true` | Model settings; on-prem requires `attn_implementation`. `use_liger`, `ep_size`, `model_options`, … are typed fields too. With `ep_size > 1`, `ac_config` (or `model_options.checkpointing.*`) turns activation checkpointing on and `activation_checkpointing` is not read |
+| `training.ds_worker_config` | `null` | On-prem worker runtime knobs (`zorro_train_enable`, …); model settings here are rejected |
 | `training.peft` | `null` | PEFT adapter config; `null` selects dense training, `{}` is invalid. On-prem supports training; Cortex also supports adapter sampling/sync |
 | `training.cuda_ipc` / `training.low_memory` | `false` / `false` | Colocated weight-sync strategy (only with `sampling_gpus > 0`), set on the training job at init; `sync_weights(cuda_ipc=…, low_memory=…)` overrides one call |
 | `sampling_gpus` / `sampling.vllm` | `0` / `{}` | Optional vLLM sampling job for `generate` / `sync_weights` |
@@ -273,7 +265,7 @@ from arctic_platform.client import TrainingConfig
 
 training = TrainingConfig(
     checkpoint_path="/data-fast/checkpoints/qwen-lora",
-    ds_worker_config={"attn_implementation": "flash_attention_3"},
+    attn_implementation="flash_attention_3",
     peft={
         "peft_type": "LORA",
         "task_type": "CAUSAL_LM",

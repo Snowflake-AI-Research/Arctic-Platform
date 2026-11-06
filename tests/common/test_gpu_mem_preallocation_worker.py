@@ -30,13 +30,13 @@ def worker_module():
 
 
 @pytest.mark.parametrize(
-    "training",
+    "training, worker_config",
     [
-        {"debug": {"gpu_mem_preallocate_gib": 20, "gradient_norms_per_param": True}},
-        {"prime_rl": {"debug": {"gpu_mem_preallocate_gib": 20}}},
+        ({"debug": {"gpu_mem_preallocate_gib": 20, "gradient_norms_per_param": True}}, {}),
+        ({"prime_rl": {"debug": {"gpu_mem_preallocate_gib": 20}}}, {}),
     ],
 )
-def test_training_margin_reaches_model_and_survives_engine_initialization(monkeypatch, training):
+def test_training_margin_reaches_model_and_survives_engine_initialization(monkeypatch, training, worker_config):
     mod = worker_module()
     cls = mod.DeepSpeedWorker.__ray_metadata__.modified_class
     worker = object.__new__(cls)
@@ -48,19 +48,18 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
     monkeypatch.setattr(mod.deepspeed, "init_distributed", lambda: None)
     monkeypatch.setattr(mod, "pr0", lambda *args: None)
     monkeypatch.setattr(mod, "sp_size_from_job_config", lambda config: 1)
-    monkeypatch.setattr(worker, "ds_training_config", lambda *args: {})
 
     def build(spec):
         observed.append(spec.debug)
         return SimpleNamespace(model=model)
 
-    def initialize(**kwargs):
+    def initialize(engine_model, ds_config, **kwargs):
         assert worker._gpu_mem_preallocation is reserve
-        assert kwargs["model"] is model
-        return SimpleNamespace(local_rank=0, global_steps=0), None, None, None
+        assert engine_model is model
+        return SimpleNamespace(local_rank=0, global_steps=0), None, None
 
     monkeypatch.setattr(mod, "build_model", build)
-    monkeypatch.setattr(mod.deepspeed, "initialize", initialize)
+    monkeypatch.setattr(mod, "initialize_training_engine", initialize)
     monkeypatch.setattr(mod, "get_accelerator", lambda: SimpleNamespace(device_name=lambda rank: "cuda:0"))
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda gpu: SimpleNamespace(uuid="test"))
@@ -69,8 +68,8 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
         {
             "model_name": "x",
             "job_type": "train",
-            "training_config": training,
-            "ds_worker_config": {"attn_implementation": "sdpa"},
+            "training_config": {"attn_implementation": "sdpa", **training},
+            "ds_worker_config": worker_config,
         },
     )
     assert observed == [{"gpu_mem_preallocate_gib": 20}]

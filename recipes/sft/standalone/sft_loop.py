@@ -31,6 +31,7 @@ from tinker_cookbook import renderers
 from tinker_cookbook.utils import ml_log
 
 from arctic_platform.client import ArcticClient
+from arctic_platform.client import OptimizerSettings
 from recipes.recipe_utils import build_renderer
 from recipes.recipe_utils import client_config
 from recipes.recipe_utils import collate
@@ -52,7 +53,6 @@ class Config:
 
     model_name: str = "Qwen/Qwen3-8B"
     n_gpus: int = 8
-    micro_batch_size: int = 1
     zero_stage: int = 2
     attn_implementation: str = "flash_attention_3"
     dtype: str = "bfloat16"
@@ -80,24 +80,18 @@ class Config:
 
 
 def build_config(config: Config):
-    per_step = config.micro_batch_size * config.n_gpus
-    if config.batch_size % per_step != 0:
-        raise ValueError(
-            f"batch_size ({config.batch_size}) must be a multiple of "
-            f"micro_batch_size * n_gpus ({config.micro_batch_size} * {config.n_gpus} = {per_step})"
-        )
     if config.ep_size is not None:
         if config.ep_size <= 0:
             raise ValueError(f"ep_size must be positive, got {config.ep_size}")
         if config.n_gpus % config.ep_size != 0:
             raise ValueError(f"n_gpus ({config.n_gpus}) must be a multiple of ep_size ({config.ep_size})")
 
-    worker: dict[str, Any] = {
+    model_settings: dict[str, Any] = {
         "attn_implementation": config.attn_implementation,
         "model_provider": config.model_provider,
     }
     if config.ep_size is not None:
-        worker["ep_size"] = config.ep_size
+        model_settings["ep_size"] = config.ep_size
 
     return client_config(
         backend=load_backend(config.config),
@@ -107,23 +101,12 @@ def build_config(config: Config):
         dtype=config.dtype,
         training_gpus=config.n_gpus,
         lora_rank=config.lora_rank,
-        ds_config={
-            "train_batch_size": config.batch_size,
-            "train_micro_batch_size_per_gpu": config.micro_batch_size,
-            "gradient_accumulation_steps": config.batch_size // per_step,
-            "zero_optimization": {"stage": config.zero_stage},
-            "bf16": {"enabled": True},
-            "optimizer": {
-                "type": "AdamW",
-                "params": {
-                    "lr": config.learning_rate,
-                    "weight_decay": config.weight_decay,
-                    "betas": [0.9, 0.999],
-                    "eps": 1e-8,
-                },
-            },
-        },
-        ds_worker_config=worker,
+        optimizer=OptimizerSettings(
+            lr=config.learning_rate, weight_decay=config.weight_decay, betas=[0.9, 0.999], eps=1e-8
+        ),
+        fp32_masters=True,
+        ds_config={"zero_optimization": {"stage": config.zero_stage}},
+        model_settings=model_settings,
         job_id=config.job_id,
     )
 

@@ -26,6 +26,7 @@ from pathlib import Path
 from transformers import AutoTokenizer
 
 from arctic_platform.client import ArcticSFTClientConfig
+from arctic_platform.client import OptimizerSettings
 from arctic_platform.client import TrainingConfig
 from arctic_platform.sft import ArcticSFTClient
 from arctic_platform.sft.examples.run_sft_demo import ATTN
@@ -85,25 +86,19 @@ def main() -> None:
         training_gpus=args.training_gpus,
         training=TrainingConfig(
             checkpoint_path=str(ckpt_root),
+            optimizer=OptimizerSettings(lr=LR, betas=[0.9, 0.999], eps=1e-8, weight_decay=0.0),
+            gradient_clipping=0.0,
+            fp32_masters=True,
             ds_config={
-                "train_micro_batch_size_per_gpu": 1,
-                "train_batch_size": args.training_gpus,
-                "gradient_accumulation_steps": 1,
                 "zero_optimization": {
                     "stage": 2,
                     "offload_optimizer": {"device": "none"},
                     "offload_param": {"device": "none"},
                 },
-                "optimizer": {
-                    "type": "AdamW",
-                    "params": {"lr": LR, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
-                },
             },
-            ds_worker_config={
-                "attn_implementation": ATTN,
-                "enable_gradient_checkpointing": False,
-                "zorro_train_enable": False,
-            },
+            attn_implementation=ATTN,
+            activation_checkpointing=False,
+            ds_worker_config={"zorro_train_enable": False},
         ),
     )
 
