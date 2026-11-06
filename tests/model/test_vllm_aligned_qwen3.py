@@ -59,10 +59,6 @@ class _FakeBatchInvariant:
     def rms_norm_batch_invariant(x, weight, eps):
         return _rms(x, weight, eps)
 
-    @staticmethod
-    def log_softmax(x, dim=-1):
-        return torch.log_softmax(x, dim=dim)
-
 
 class _FakeCustomOps:
     @staticmethod
@@ -120,6 +116,10 @@ def _fake_trainer_flash_attn(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale=No
     )
 
 
+def _fake_token_logprobs(logits, token_ids):
+    return torch.log_softmax(logits.float(), dim=-1).gather(1, token_ids[:, None]).squeeze(1)
+
+
 def _fake_silu_and_mul(out, x):
     half = x.shape[-1] // 2
     out.copy_(F.silu(x[..., :half]) * x[..., half:])
@@ -131,6 +131,7 @@ def fake_vllm(monkeypatch):
     monkeypatch.setattr(ops, "_custom_ops", lambda: _FakeCustomOps)
     monkeypatch.setattr(ops, "_fa_utils", lambda: _FakeFaUtils)
     monkeypatch.setattr(ops, "_silu_and_mul_kernel", _fake_silu_and_mul)
+    monkeypatch.setattr(ops, "_token_logprobs_kernel", _fake_token_logprobs)
     monkeypatch.setattr(ops, "_trainer_flash_attn_varlen_func", lambda: _fake_trainer_flash_attn)
     monkeypatch.setenv(ops.BATCH_INVARIANT_ENV, "1")
     _FakeFaUtils.calls.clear()

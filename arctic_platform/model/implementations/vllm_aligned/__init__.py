@@ -15,5 +15,5 @@
 """Trainer forwards that call a batch-invariant vLLM sampler's kernels, so trainer and sampler logprobs are bitwise equal.
 
 The sampler must run with ``VLLM_BATCH_INVARIANT=1``, ``enforce_eager=True``, tensor parallelism 1, the FLASH_ATTN
-backend and the KV-cache page size the trainer uses, and the same vLLM version as the trainer.
+backend, Model Runner V2 and the KV-cache page size the trainer uses, and the same vLLM version as the trainer.
 """

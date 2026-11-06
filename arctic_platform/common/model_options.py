@@ -218,8 +218,8 @@ def register(registry: Registry) -> None:
             "Experimental. For the dense Qwen3 family, run a training forward whose operators call the kernels a"
             " batch-invariant vLLM sampler runs, so trainer and sampler logprobs are bitwise equal at the same"
             " weights. The sampler must run with VLLM_BATCH_INVARIANT=1, enforce_eager, tensor parallelism 1, the"
-            " FLASH_ATTN backend and KV-cache page size 16. Requires lm_head.token_chunk_size and rejects liger,"
-            " compile, tiled_mlp, activation offload, PEFT, ZoRRo Train and sequence parallelism."
+            " FLASH_ATTN backend, Model Runner V2 and KV-cache page size 16. Requires lm_head.token_chunk_size and"
+            " rejects liger, compile, tiled_mlp, activation offload, PEFT, ZoRRo Train and sequence parallelism."
         ),
         remove_when="trainer-sampler bitwise parity is the default forward, or GPU runs show it brings no benefit",
         source="`loader_options.vllm_aligned`",

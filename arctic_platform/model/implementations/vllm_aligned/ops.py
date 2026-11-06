@@ -30,7 +30,7 @@ Each forward calls the function vLLM 0.32 calls for the same operator on CUDA wi
   size, ``num_splits=1`` and no scheduler metadata. vLLM asserts in ``test_decode_logprobs_match_prefill_logprobs``
   that a prefill over the full sequence reproduces each decode step bitwise in this mode, which is what lets one
   full-sequence call here stand for the sampler's token-by-token decode;
-* log-softmax: vLLM's Triton ``log_softmax``, which the sampler reaches through its ``aten::_log_softmax`` override.
+* the sampled token's logprob: Model Runner V2's ``compute_token_logprobs`` kernel, vLLM 0.32's default runner.
 
 The backward of every operator is the ordinary math in the training dtype or fp32. It is not bitwise to anything;
 attention's backward recomputes the forward with the trainer's FlashAttention, so its gradient is that of a forward
@@ -398,6 +398,12 @@ def _padded_vocab(vocab_size: int, padding: int) -> int:
     return -(-vocab_size // padding) * padding
 
 
+def _token_logprobs_kernel(logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+    from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
+
+    return compute_token_logprobs(logits, token_ids[:, None])[:, 0]
+
+
 class _LMHeadLogprobs(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, labels, temperature, token_chunk_size, vocab_padding):
@@ -410,11 +416,10 @@ class _LMHeadLogprobs(torch.autograd.Function):
         out = torch.empty(hidden.shape[0], dtype=torch.float32, device=hidden.device)
         for start in range(0, hidden.shape[0], token_chunk_size):
             stop = min(start + token_chunk_size, hidden.shape[0])
-            logits = batch_invariant.linear_batch_invariant(hidden[start:stop], lm_weight)[:, :vocab_size].float()
+            logits = batch_invariant.linear_batch_invariant(hidden[start:stop], lm_weight)[:, :vocab_size]
             if temperature != 1.0:
-                logits = logits / torch.tensor(temperature, dtype=torch.float32, device=logits.device)
-            logprobs = batch_invariant.log_softmax(logits, dim=-1)
-            out[start:stop] = logprobs.gather(1, labels[start:stop, None]).squeeze(1)
+                logits = logits.float() / torch.tensor(temperature, dtype=torch.float32, device=logits.device)
+            out[start:stop] = _token_logprobs_kernel(logits, labels[start:stop])
         ctx.save_for_backward(hidden, weight, labels)
         ctx.temperature = temperature
         ctx.token_chunk_size = token_chunk_size
@@ -454,9 +459,11 @@ def lm_head_logprobs(
     """Log-probability of ``labels`` (``[tokens]``) under the logits of ``hidden`` (``[tokens, hidden]``).
 
     The logits are vLLM's: the LM-head matmul over the vocabulary padded to a multiple of ``vocab_padding`` (vLLM's
-    ``ParallelLMHead`` padding, which sets the matmul's ``N``), rounded to the model dtype, upcast to fp32, divided by
-    the temperature when it is not 1, and normalized by vLLM's log-softmax. Rows are independent, so chunking them
-    changes nothing. A label of -100 scores 0 and receives no gradient.
+    ``ParallelLMHead`` padding, which sets the matmul's ``N``), in the model dtype, divided in fp32 by the
+    temperature when it is not 1. The logprob of each label is then the value Model Runner V2's sampler reports,
+    from its ``compute_token_logprobs`` kernel: ``logit - max - log(sum(exp(logit - max)))`` in fp32, which rounds
+    differently from a full log-softmax followed by a gather. Rows are independent, so chunking them changes nothing.
+    A label of -100 scores 0 and receives no gradient.
     """
     ignored = labels == -100
     safe_labels = labels.masked_fill(ignored, 0).to(torch.long)

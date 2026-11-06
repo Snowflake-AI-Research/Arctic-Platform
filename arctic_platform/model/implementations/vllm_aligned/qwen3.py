@@ -26,8 +26,8 @@ What the sampler does, and what is reproduced here:
   ``fused_add_rms_norm``, whose residual sum is an add rounded to the model dtype, which a plain add reproduces;
 * q and k are normalized per head, then rotated with a cos/sin cache built as vLLM builds it;
 * attention reads a paged KV cache through the sampler's FlashAttention entry point with ``num_splits=1``;
-* the log-probability of each label comes from the LM-head matmul over vLLM's padded vocabulary and vLLM's
-  log-softmax.
+* the log-probability of each label comes from the LM-head matmul over vLLM's padded vocabulary and Model Runner
+  V2's token-logprob kernel.
 
 This holds for one sampler rank: a sampler with tensor parallelism splits and all-reduces the matmuls differently.
 """

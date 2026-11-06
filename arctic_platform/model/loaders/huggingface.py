@@ -68,10 +68,10 @@ class HuggingfaceOptions(BaseModel):
         description=(
             "Experimental. For the dense Qwen3 family, replace the training forward with one that calls the kernels a"
             " batch-invariant vLLM sampler runs (VLLM_BATCH_INVARIANT=1, enforce_eager, tensor parallelism 1, the"
-            " FLASH_ATTN backend, KV-cache page size 16, the trainer's vLLM version), so the trainer's logprobs equal"
-            " the sampler's bitwise at the same weights. The backward is the ordinary math and is not bitwise."
-            " Requires patches.lm_head.token_chunk_size, which bounds the LM-head rows held at once, and rejects the"
-            " other kernel patches and sequence parallelism."
+            " FLASH_ATTN backend, Model Runner V2, KV-cache page size 16, the trainer's vLLM version), so the"
+            " trainer's logprobs equal the sampler's bitwise at the same weights. The backward is the ordinary math"
+            " and is not bitwise. Requires patches.lm_head.token_chunk_size, which bounds the LM-head rows held at"
+            " once, and rejects the other kernel patches and sequence parallelism."
         ),
     )
 
