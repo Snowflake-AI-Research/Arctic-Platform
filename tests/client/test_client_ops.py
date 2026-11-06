@@ -917,6 +917,30 @@ class TestCortexSharedHelper:
         assert "old_log_probs" not in out["kwargs"]
         assert "old_log_probs_shifted" not in out["context"]
 
+    def test_balance_stamp_rides_the_wire(self):
+        """True and False both reach context. A missing switch stays missing."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        attn = torch.ones((2, 10), dtype=torch.int64)
+        batch = {
+            "input_ids": ids,
+            "attention_mask": attn,
+            "advantages": torch.zeros((2, 10)),
+            "response_mask": torch.ones((2, 10), dtype=torch.int64),
+        }
+        opted_out = to_cortex_fwd_bwd_payload(
+            {"batch": batch, "meta": {"balance_batch": False, "load_balancer": True}}
+        )
+        assert opted_out["context"]["balance_batch"] is False
+        assert "load_balancer" not in opted_out["context"]
+        opted_in = to_cortex_fwd_bwd_payload({"batch": batch, "meta": {"balance_batch": True}})
+        assert opted_in["context"]["balance_batch"] is True
+        absent = to_cortex_fwd_bwd_payload({"batch": batch, "meta": {}})
+        assert "balance_batch" not in absent["context"]
+
     def test_left_pads_are_rewritten_to_trailing_pads(self):
         """SkyRL left-pads to the batch's longest sequence; Cortex's packer
         rejects that outright ("packing requires left-aligned rows")."""
@@ -1092,6 +1116,45 @@ class TestCortexSharedHelper:
                     "meta": {},
                 },
             )
+
+    def test_zorro_fwd_bwd_keeps_client_layout_and_names_prompt_groups(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.tensor([[0, 5, 6, 7, 8], [0, 1, 2, 3, 4]])
+        attn = torch.tensor([[0, 1, 1, 1, 1], [0, 1, 1, 1, 1]])
+        prompts = torch.tensor([[0, 5, 6], [0, 1, 2]])
+        old = torch.arange(10, dtype=torch.float32).reshape(2, 5)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": torch.zeros((2, 5)),
+                    "response_mask": torch.tensor([[0, 0, 0, 1, 1], [0, 0, 0, 1, 1]]),
+                    "prompts": prompts,
+                    "old_log_probs": old,
+                },
+                "meta": {
+                    "zorro_train_enable": True,
+                    "max_prompt_len": 3,
+                    "balance_batch": True,
+                    "temperature": 0.7,
+                    "calculate_entropy": True,
+                },
+            }
+        )
+        assert torch.equal(out["kwargs"]["input_ids"], ids)
+        assert torch.equal(out["kwargs"]["attention_mask"], attn)
+        assert torch.equal(out["kwargs"]["prompts"], prompts)
+        assert torch.equal(out["kwargs"]["response_mask"], torch.tensor([[0, 0, 0, 1, 1], [0, 0, 0, 1, 1]]))
+        assert "old_log_probs" not in out["kwargs"]
+        assert out["context"]["zorro_train_enable"] is True
+        assert out["context"]["max_prompt_len"] == 3
+        assert out["context"]["temperature"] == 0.7
+        assert out["context"]["calculate_entropy"] is True
+        assert out["context"]["prompt_group_ids"].tolist() == [0, 1]
 
 
 class TestCortexShimSaveWeightsFailsLoud:
