@@ -142,6 +142,8 @@ Unlike SFT's flat labels batch, RL `fwd_bwd` typically carries:
         "max_prompt_len": int,
         "max_response_len": int,
         "zorro_train_enable": bool,   # optional per-call override
+        "balance_batch": bool,        # false keeps arrival order; missing balances
+        "prompt_group_ids": Tensor,   # optional; see Prompt-deduplicated packets
         ...
     },
     "processing": {
@@ -465,6 +467,99 @@ On both, the summed metric `weighted_cross_entropy_objective_sum` is
 `L_surrogate`, and `weighted_cross_entropy_weighted_token_count` counts the
 nonzero weights.
 
+## Prompt-deduplicated packets
+
+A prompt-deduplicated packet is a dense GRPO batch in which every row of a
+prompt group shares the same prompt columns. The server then forwards each
+shared prompt once (ZoRRo Train) and keeps the group on one rank when
+balancing. This is the wire shape the server accepts. It is not a prefix trie
+and it is not TRL tree attention.
+
+### Layout
+
+Each row is `[max_prompt_len + max_response_len]`:
+
+- prompts are **left-padded** so a group's prompt columns are byte-identical
+  (`torch.equal` on `input_ids[:, :max_prompt_len]`, or on the `prompts`
+  tensor Cortex sends);
+- responses are **right-padded** to a fixed width (`max_response_len` /
+  `response_len`);
+- `attention_mask` is 0 on both pad regions;
+- `position_ids` may be omitted (`drop_position_ids`); the server rebuilds
+  them from the mask.
+
+ZoRRo rows stay in this client layout. Left-aligning a shorter prompt would
+move response tokens into the prompt slice the unpacked worker reads. Non-ZoRRo
+Cortex rows are left-aligned on the way out. A packed job (`cu_seqlens`) that
+asks for ZoRRo is refused.
+
+### Group identity
+
+The balancer and `prompt-mean` both key on `prompt_group_ids` (one int per
+row). Groups are produced in two ways:
+
+| Path | Who writes the ids | Fallback if they are missing |
+|---|---|---|
+| ZoRRo (`zorro_train_enable is True`) | In-tree clients stamp them from rollout blocks (`row // rollout_n`) when balancing is on and every contiguous block of `rollout_n` prompt rows is identical. Cortex derives them from the `prompts` block when the caller did not send them. | The assigner groups by identical prompt columns. |
+| Non-ZoRRo | The caller. In-tree clients do not stamp ids on this path. Cortex copies a caller-supplied tensor from the batch if meta does not already have one. | Per-row length balancing. |
+
+`prompt-mean` without `sequence_loss_weights` raises unless the ids are
+present. Each rank averages the responses it holds for a prompt, then
+all-reduces the prompt count, so a split prompt is counted twice and averaged
+over half its responses. A request that carries ids therefore packs **whole
+groups**, ZoRRo or not. If the ids are not one per row, or the groups cannot
+fill equal rank bins (for example three pairs on two ranks), the request
+keeps arrival order.
+
+ZoRRo with `zorro_train_max_rollouts < rollout_n` still splits a group into
+chunks for the forward. Combining that setting with `prompt-mean` can put one
+prompt on two ranks.
+
+### Group size
+
+The ZoRRo packer assumes every group has exactly `rollout_n` (or
+`zorro_train_max_rollouts`) rows, and that the batch size divides the number
+of ranks. TRL's async buffer can drop stale samples mid-group. When
+`zorro_load_balancer` is on, the TRL client raises if a group's size is not
+`rollout_n`. Fixes: raise `max_staleness` so groups are not split, keep
+`per_device_bsz` a multiple of `rollout_n * training_gpus`, or leave
+`zorro_load_balancer` off (`balance_batch: false`).
+
+### Balancing
+
+A missing `balance_batch` balances. `balance_batch: false` is the only
+arrival-order opt-out. The legacy keys `load_balancer`, `zorro_load_balancer`,
+and `zorro_train_load_balancer` are ignored; the VeRL adapter warns if a
+config still sets `load_balancer`. Per-row outputs are restored to request
+order before they are returned. Paths that concatenate shards without that
+restore (local DeepSpeed `log_probs`, VeRL log-prob calls) send
+`balance_batch: false`.
+
+### TRL tree rows
+
+TRL `AsyncGRPOTrainer` now folds each DP rank's samples into a prefix trie
+(`TreeRow`: unique tokens, `tree_kv_index`, `tree_cu_seqlens_*`). Arctic's
+TRL client **undoes** that fold: `_FlatRolloutCollator` concatenates every
+sample's full token list into a packed `[1, T]` row, then the ZoRRo path
+rebuilds the dense layout above. Tree attention stays inside TRL. Do not send
+the trie tensors to Arctic; they are not a ZoRRo packet.
+
+Until the client accepts the tree layout, a TRL caller that wants prompt
+dedup on the server still sends the dense left-padded rows, not the trie.
+
+### Client checklist
+
+1. Build dense `[B, max_prompt_len + max_response_len]` rows, left-padded
+   prompts, fixed-width responses.
+2. Set `zorro_train_enable: True` only when the worker is patched for ZoRRo
+   and the rows use that layout. Packed `cu_seqlens` batches cannot.
+3. If the loss is `prompt-mean` (without `sequence_loss_weights`), send
+   `prompt_group_ids` with one int per row. The balancer will keep each id on
+   one rank.
+4. Send `balance_batch: false` when groups cannot fill equal rank bins, or
+   when a downstream step concatenates shards without restoring request order.
+5. Do not rely on `load_balancer` / `zorro_load_balancer` meta keys.
+
 ## ZoRRo Train
 
 **What:** Prompt deduplication during RL forward/backward. Shared prompts are
@@ -474,6 +569,8 @@ long/shared prompts.
 
 **Code:** `arctic_platform/rl/zorro_train/` (design + supported models:
 [zorro_train/README.md](../arctic_platform/rl/zorro_train/README.md)).
+The wire shape, group ids, and TRL flattening are in
+[Prompt-deduplicated packets](#prompt-deduplicated-packets).
 
 **Enable (direct client / server)** — flat key on the worker config:
 
