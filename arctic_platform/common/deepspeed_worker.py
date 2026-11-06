@@ -50,9 +50,9 @@ from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.common.weight_checksum import tensor_l2_sq
 from arctic_platform.model import build_model
-from arctic_platform.model import ds_worker_moe_model_spec
 from arctic_platform.model import ds_worker_zorro_train
 from arctic_platform.model import settings_dense_model_spec
+from arctic_platform.model import settings_moe_model_spec
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
 from arctic_platform.model.option_profile import check_model_options_profile
 
@@ -223,12 +223,15 @@ class DeepSpeedWorker:
         check_model_options_profile(model_settings.model_dump(), model_path=model_name, sp_size=self.sp_size)
         # The MoE loader owns expert- and sequence-parallel layout, so only dense loading is gated here.
         if ep_size > 1:
-            model_options = model_settings.model_dump(
-                include=set(ModelSettings.model_fields) - {"prime_rl_request_entries"}, exclude_unset=True
-            )
-            spec = ds_worker_moe_model_spec(
-                model_name,
-                {**ds_worker_config, **model_options, "attn_implementation": attn_implementation, "debug": debug},
+            if ds_worker_config.get("zorro_train_enable"):
+                raise ValueError("expert-parallel workers do not support ZoRRo Train")
+            spec = settings_moe_model_spec(
+                model_settings,
+                model_path=model_name,
+                sequence_parallel=self.sp_size,
+                seq_len=job_config.get("max_seq_len"),
+                weight_conversion_cache_dir=ds_worker_config.get("weight_conversion_cache_dir"),
+                debug=debug,
             )
         else:
             if self.sp_size != 1:

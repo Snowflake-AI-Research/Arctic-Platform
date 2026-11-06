@@ -243,7 +243,7 @@ vLLM settings on `sampling`.
 | `training.optimizer` / `training.gradient_clipping` | AdamW / `1.0` | `OptimizerSettings`; clipping `0` turns it off |
 | `training.fp32_masters` | `false` | fp32 master weights and optimizer states for a bf16 job; bf16 itself follows `dtype` |
 | `training.ds_config` | `null` | DeepSpeed passthrough (ZeRO, scheduler, …); `zero_optimization` is merged into the built block. `bf16`, `fp16`, `optimizer`, clipping and batch-size keys are rejected |
-| `training.attn_implementation` / `training.activation_checkpointing` | `null` / `true` | Model settings; on-prem requires `attn_implementation`. `use_liger`, `ep_size`, `model_options`, … are typed fields too |
+| `training.attn_implementation` / `training.activation_checkpointing` | `null` / `true` | Model settings; on-prem requires `attn_implementation`. `use_liger`, `ep_size`, `model_options`, … are typed fields too. With `ep_size > 1`, `ac_config` (or `model_options.checkpointing.*`) turns activation checkpointing on and `activation_checkpointing` is not read |
 | `training.ds_worker_config` | `null` | On-prem worker runtime knobs (`zorro_train_enable`, …); model settings here are rejected |
 | `training.peft` | `null` | PEFT adapter config; `null` selects dense training, `{}` is invalid. On-prem supports training; Cortex also supports adapter sampling/sync |
 | `training.cuda_ipc` / `training.low_memory` | `false` / `false` | Colocated weight-sync strategy (only with `sampling_gpus > 0`), set on the training job at init; `sync_weights(cuda_ipc=…, low_memory=…)` overrides one call |

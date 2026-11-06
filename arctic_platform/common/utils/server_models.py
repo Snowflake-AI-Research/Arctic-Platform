@@ -52,6 +52,7 @@ class JobConfig(BaseModel):
     model_name: str
     job_type: str = Field(default="training")
     dtype: str | None = None
+    max_seq_len: int | None = Field(default=None, ge=1)
     num_devices: int | None = None
     ds_config: dict | None = None
     training_config: dict | None = None

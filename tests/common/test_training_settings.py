@@ -95,6 +95,7 @@ def test_onprem_payload_sends_typed_training_settings():
         model_name="m",
         training_gpus=2,
         dtype="float32",
+        max_seq_len=16384,
         training=TrainingConfig(
             optimizer=OptimizerSettings(lr=2e-5),
             gradient_clipping=0.0,
@@ -112,6 +113,7 @@ def test_onprem_payload_sends_typed_training_settings():
     assert training.mb_spec.num_micro_batches == 4
     assert JobConfig.model_validate(payload).sp_size == 2
     assert JobConfig.model_validate(payload).model_dump()["dtype"] == "float32"
+    assert JobConfig.model_validate(payload).model_dump()["max_seq_len"] == 16384
 
 
 def test_onprem_log_prob_inherits_the_training_sp_degree_unless_it_sets_one():

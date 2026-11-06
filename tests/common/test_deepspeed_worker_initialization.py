@@ -99,6 +99,7 @@ def test_expert_parallel_worker_builds_the_moe_spec_and_splits_expert_groups(mon
         {
             "model_name": str(model_path),
             "job_type": "train",
+            "max_seq_len": 16384,
             "training_config": {"model_provider": "arctic", "attn_implementation": "sparse_mla", "ep_size": 8},
             "ds_worker_config": {"sp_size": 8},
         },
@@ -106,6 +107,7 @@ def test_expert_parallel_worker_builds_the_moe_spec_and_splits_expert_groups(mon
 
     assert observed["spec"].loader == "glm5_next"
     assert observed["spec"].parallelism.expert_parallel == observed["spec"].parallelism.sequence_parallel == 8
+    assert observed["spec"].loader_options["seq_len"] == 16384
     assert observed["engine"]["ep_size"] == 8
     assert observed["engine"]["mpu"] is None
     assert observed["ds_config"]["train_batch_size"] == 8

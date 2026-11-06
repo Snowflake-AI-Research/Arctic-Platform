@@ -327,6 +327,7 @@ class ArcticClientConfig(BaseModel):
         # log-prob runs on DeepSpeed only when asked; otherwise it's a vLLM engine.
         use_deepspeed = job_type == "training" or (job_type == "log_prob" and sc.log_prob_engine == "deepspeed")
         if use_deepspeed:
+            payload["max_seq_len"] = self.max_seq_len
             payload["full_determinism"] = tc.full_determinism
             if tc.ds_worker_config:
                 payload["ds_worker_config"] = dict(tc.ds_worker_config)

@@ -12,19 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Build the ModelSpec used to load an expert-parallel MoE."""
+"""Build the ModelSpec used to load an expert-parallel MoE.
+
+``moe_model_spec`` is the one translation from MoE loader options to a ``ModelSpec``. Both servers call it through
+``settings_moe_model_spec`` with the job's validated ``ModelSettings``.
+"""
 
 from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any
 
-from arctic_platform.common.config import resolve_sp_size
-from arctic_platform.model.config import ActivationCheckpointConfig
+from arctic_platform.common import model_option_aliases as aliases
+from arctic_platform.common.model_settings import ModelSettings
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
-from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
 from arctic_platform.model.implementations.moe.config_validation import effective_fused_cross_entropy
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.loader import model_type_family
@@ -116,76 +119,61 @@ def moe_model_spec(
     )
 
 
-def ds_worker_moe_model_spec(model_name: str, ds_worker_config: dict) -> ModelSpec:
-    """``moe_model_spec`` for the on-prem worker's flat ``ds_worker_config`` when ``ep_size > 1``.
+def settings_moe_loader_options(
+    settings: ModelSettings,
+    *,
+    seq_len: int | None = None,
+    trust_remote_code: bool | None = None,
+    weight_conversion_cache_dir: str | None = None,
+) -> dict[str, Any]:
+    """The expert-parallel loaders' options for a job's typed ``ModelSettings``, as ``moe_model_spec`` takes them.
 
-    The loader owns the forward and checkpointing options, so worker-level ZoRRo Train, Liger, and
-    gradient checkpointing are refused. ``model_options`` and the flat checkpointing keys fold into
-    the ``prime_rl`` loader options, and a key given twice must agree.
+    On this route an ``ac_config`` block alone turns activation checkpointing on; ``activation_checkpointing`` and
+    the dense-route fields are not read. The ``prime_rl`` block overrides ``ac_config`` and ``seq_len``, and the
+    job-level keys override the block.
     """
-    cfg = ds_worker_config or {}
-    if cfg.get("attn_implementation") is None:
-        raise ValueError("ds_worker_config requires attn_implementation")
-    parallelism = ParallelismConfig.model_validate(
-        dict(
-            **({"expert_parallel": cfg["ep_size"]} if "ep_size" in cfg else {}),
-            sequence_parallel=resolve_sp_size({"ds_worker_config": cfg}),
-        )
-    )
-    if parallelism.expert_parallel <= 1:
-        raise ValueError("ds_worker_moe_model_spec requires ep_size > 1")
-    if cfg.get("zorro_train_enable") or cfg.get("use_liger") or cfg.get("enable_gradient_checkpointing"):
-        raise ValueError("expert-parallel workers require loader-owned forward/checkpointing options")
-    options = deepcopy(cfg.get("prime_rl") or {})
-    for key in ("ac_config", "tiled_mlp_token_chunk_size", "weight_conversion_cache_dir"):
-        if key in cfg:
-            if key in options and options[key] != cfg[key]:
-                raise ValueError(f"conflicting worker and prime_rl {key}")
-            options[key] = deepcopy(cfg[key])
-    checkpointing = cfg.get("activation_checkpointing")
-    if checkpointing is False and options.get("ac_config") is not None:
-        raise ValueError("activation_checkpointing=False conflicts with ac_config")
-    if checkpointing is True and options.get("ac_config") is None:
-        options["ac_config"] = ActivationCheckpointConfig().model_dump()
-    model_options = cfg.get("model_options") or {}
-    if set(model_options) - {"lm_head", "moe"}:
-        raise ValueError("unsupported expert-parallel worker model_options")
-    lm_head = model_options.get("lm_head") or {}
-    head_keys = {
-        "cross_entropy": "fused_cross_entropy",
-        "token_chunk_size": "fused_lm_head_token_chunk_size",
-        "fp32": "fp32_lm_head",
-    }
-    if set(lm_head) - head_keys.keys():
-        raise ValueError("unsupported expert-parallel worker lm_head options")
-    for key, value in lm_head.items():
-        target = head_keys[key]
-        if target in options and options[target] != value:
-            raise ValueError(f"conflicting model_options.lm_head.{key} and prime_rl.{target}")
-        options[target] = value
-    moe = model_options.get("moe") or {}
-    moe_keys = {
-        "comm_backend": "ep_comm_backend",
-        "comm_sms": "deepep_num_sms",
-        "comm_token_chunk": "deepep_token_chunk_size",
-        "grouped_mm": "moe_use_grouped_mm",
-    }
-    if set(moe) - moe_keys.keys():
-        raise ValueError("unsupported expert-parallel worker moe options")
-    for key, value in moe.items():
-        target = moe_keys[key]
-        if target in options and options[target] != value:
-            raise ValueError(f"conflicting model_options.moe.{key} and prime_rl.{target}")
-        options[target] = value
-    if "attn" in options and options["attn"] != cfg["attn_implementation"]:
-        raise ValueError("conflicting prime_rl.attn and attn_implementation")
-    options["attn"] = cfg["attn_implementation"]
+    options: dict[str, Any] = {"ac_config": deepcopy(settings.ac_config)}
+    if seq_len is not None:
+        options["seq_len"] = seq_len
+    options.update(deepcopy(settings.prime_rl or {}))
+    options["attn"] = settings.resolved_attn_implementation()
+    if trust_remote_code is not None:
+        options["trust_remote_code"] = trust_remote_code
+    if weight_conversion_cache_dir is not None:
+        options["weight_conversion_cache_dir"] = weight_conversion_cache_dir
+    return options
+
+
+def settings_moe_model_spec(
+    settings: ModelSettings,
+    *,
+    model_path: str,
+    sequence_parallel: int,
+    seq_len: int | None = None,
+    trust_remote_code: bool | None = None,
+    weight_conversion_cache_dir: str | None = None,
+    debug: dict | None = None,
+) -> ModelSpec:
+    """``moe_model_spec`` for a job's typed ``ModelSettings`` with ``ep_size > 1``, which both servers validate the
+    same way."""
+    ep_size = settings.ep_size or 1
+    if not aliases.moe_route(ep_size):
+        raise ValueError("settings_moe_model_spec requires ep_size > 1")
+    if settings.model_provider != "arctic":
+        raise ValueError("ep_size>1 (expert parallelism) is only supported for the arctic model provider")
     spec = moe_model_spec(
-        model_name=model_name,
-        ep_size=parallelism.expert_parallel,
-        sp_size=parallelism.sequence_parallel,
-        loader_options=options,
-        peft_config=cfg.get("peft_config"),
+        model_name=model_path,
+        ep_size=ep_size,
+        sp_size=sequence_parallel,
+        loader_options=settings_moe_loader_options(
+            settings,
+            seq_len=seq_len,
+            trust_remote_code=trust_remote_code,
+            weight_conversion_cache_dir=weight_conversion_cache_dir,
+        ),
+        tiled_mlp_token_chunk_size=settings.tiled_mlp_token_chunk_size,
+        peft_config=settings.peft_config,
     )
-    spec.debug = {**spec.debug, **gpu_memory_debug_config(cfg)}
+    if debug:
+        spec.debug = {**spec.debug, **debug}
     return spec
