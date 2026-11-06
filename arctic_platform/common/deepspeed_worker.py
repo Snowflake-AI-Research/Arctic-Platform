@@ -32,6 +32,9 @@ import torch
 import torch.distributed as dist
 from deepspeed.accelerator import get_accelerator
 
+from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
+from arctic_platform.common.deepspeed_engine import build_deepspeed_config
+from arctic_platform.common.deepspeed_engine import initialize_training_engine
 from arctic_platform.common.ray_cluster import primary_ip
 from arctic_platform.common.utils import combine_metric_microbatches
 from arctic_platform.common.utils import dp_sp_world_size
@@ -47,7 +50,8 @@ from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.common.weight_checksum import tensor_l2_sq
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import build_model
-from arctic_platform.model import preserve_fp8_params_through_ds_cast
+from arctic_platform.model import ds_worker_dense_model_spec
+from arctic_platform.model import ds_worker_moe_model_spec
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
 
 logger = logging.getLogger(__name__)
@@ -65,19 +69,6 @@ else:
     from arctic_platform.common.utils.debug import SynchronizedWallClockTimerSimpleDummy
 
     timers = SynchronizedWallClockTimerSimpleDummy(wall_clock_breakdown=True)
-
-
-def make_model_gradient_checkpointing_compatible(model):
-    # Taken from arctic_platform/model/hf_factory.py
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
-    elif hasattr(model, "get_input_embeddings"):
-
-        def make_inputs_require_grad(module, input, output):
-            output.requires_grad_(True)
-
-        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-    return model
 
 
 # ---------------------------------------------------------------------------
@@ -190,12 +181,25 @@ class DeepSpeedWorker:
 
         pr0(f"ds_worker[after_modify]: {self.job_type=} {ds_config=} {ds_worker_config=}")
 
-        # HF load + patches via ModelSpec (world_size already injected above).
-        model_config = dict(ds_worker_config)
-        model_config["sp_size"] = self.sp_size
-        if job_config.get("training_config") is not None:
-            model_config["debug"] = gpu_memory_debug_config(job_config["training_config"])
-        spec = ModelSpec.from_ds_worker_config(model_name, model_config)
+        debug_config = job_config.get("training_config")
+        debug = gpu_memory_debug_config(debug_config if debug_config is not None else ds_worker_config)
+        ep_size = int(ds_worker_config.get("ep_size", 1))
+        # The MoE loader owns expert- and sequence-parallel layout, so only dense loading is gated here.
+        if ep_size > 1:
+            spec = ds_worker_moe_model_spec(model_name, {**ds_worker_config, "debug": debug})
+        else:
+            if self.sp_size != 1:
+                raise ValueError("on-prem sequence-parallel data dispatch is not wired; sp_size must be 1")
+            model_provider = ds_worker_config.get("model_provider", "huggingface")
+            if model_provider not in {"huggingface", "liger"}:
+                raise ValueError(f"on-prem dense training does not support model_provider={model_provider!r}")
+            spec = ds_worker_dense_model_spec(
+                model_name,
+                ds_worker_config,
+                dtype=str(job_config.get("dtype") or "bfloat16"),
+                sequence_parallel=self.sp_size,
+                debug=debug,
+            )
         if spec.parallelism.sequence_parallel != self.sp_size:
             raise ValueError("worker sp_size disagrees with the resolved ModelSpec")
         parallel_groups = self._setup_model_parallel_groups(spec, ds_config, ds_worker_config)
@@ -208,16 +212,29 @@ class DeepSpeedWorker:
         zorro_train_enable = ds_worker_config.get("zorro_train_enable", False)
         self.dedup_actor_model_once_patcher = getattr(model, "_arctic_zorro_once_patcher", None)
 
-        init_kwargs = dict(model=model, config=ds_config)
-        if self.mpu is not None:
-            init_kwargs["mpu"] = self.mpu
         if self._has_optimizer:
-            # Forward-only (log-prob) engines are initialized without an
-            # optimizer so DeepSpeed allocates no optimizer state.
-            init_kwargs["model_parameters"] = model.parameters()
-        if spec.parallelism.expert_parallel > 1:
-            preserve_fp8_params_through_ds_cast(model)
-        self.engine, _, _, _ = deepspeed.initialize(**init_kwargs)
+            engine_spec = TrainingEngineSpec.from_deepspeed_config(
+                ds_config,
+                dtype=str(job_config.get("dtype") or "bfloat16"),
+                world_size=self.world_size,
+                sequence_parallel=self.sp_size,
+                seed=job_config.get("seed"),
+            )
+            ds_config = build_deepspeed_config(engine_spec)
+            self.engine, _, self.optimizer_choice = initialize_training_engine(
+                model,
+                ds_config,
+                optimizer=engine_spec.optimizer,
+                ep_size=ep_size,
+                mpu=self.mpu,
+                model_path=model_name,
+                rank=self.rank,
+                adam_w_mode=engine_spec.adam_w_mode,
+            )
+        else:
+            # Forward-only/log-prob remains a separate no-optimizer contract.
+            init_kwargs = {"mpu": self.mpu} if self.mpu is not None else {}
+            self.engine, _, _, _ = deepspeed.initialize(model=model, config=ds_config, **init_kwargs)
         self._device = get_accelerator().device_name(self.engine.local_rank)
 
         gpu_id = torch.cuda.current_device()
