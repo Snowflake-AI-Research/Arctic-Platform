@@ -1185,25 +1185,22 @@ def _tiny_preparation_model(family):
     import torch
 
     if family == "glm5_next":
-        from test_glm5_next import _tiny_config
-
         from arctic_platform.model.implementations.glm53.modeling_glm5_next import (
             Glm5NextForConditionalGenerationPrimeRL,
         )
+        from tests.model.test_glm5_next import _tiny_config
 
         config, model_type = _tiny_config(), Glm5NextForConditionalGenerationPrimeRL
     elif family == "qwen4_exp":
-        from test_qwen4_exp import _tiny_config
-
         from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import (
             Qwen4ExpForConditionalGenerationPrimeRL,
         )
+        from tests.model.test_qwen4_exp import _tiny_config
 
         config, model_type = _tiny_config(), Qwen4ExpForConditionalGenerationPrimeRL
     elif family == "qwen3_5_moe":
-        from test_qwen35_moe_numerics import _tiny_config
-
         from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe import Qwen3_5MoeForCausalLM
+        from tests.model.test_qwen35_moe_numerics import _tiny_config
 
         config, model_type = _tiny_config(), Qwen3_5MoeForCausalLM
     else:

@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any
 from typing import Literal
 
@@ -30,10 +29,8 @@ from pydantic import field_validator
 from pydantic import model_validator
 from typing_extensions import Self
 
-from arctic_platform.common.config import resolve_sp_size
 from arctic_platform.common.config import validate_peft_config
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_mem_preallocate_bytes
-from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
 
 PinMemoryMaxSize = float | Literal["auto"]
 
@@ -242,122 +239,6 @@ class ModelSpec(BaseModel):
     patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
     debug: dict = Field(default_factory=dict, description="Runtime GPU capacity guard, separate from loader debug.")
     loader_options: dict = Field(default_factory=dict, description="JSON-only loader-specific extras.")
-
-    @classmethod
-    def from_ds_worker_config(cls, model_name: str, ds_worker_config: dict) -> "ModelSpec":
-        """Transitional bridge: map flat verl ``ds_worker_config`` into a ``ModelSpec``.
-
-        Callers (adapter / SFT demos) own the knobs on the flat dict today. Longer-term,
-        ``ModelSpec`` should be constructed upstream as part of the main client config
-        instead of being inferred here.
-        """
-        cfg = ds_worker_config or {}
-
-        # Require an explicit attention backend. Packed varlen / ZoRRo Train need
-        # some flash-attention implementation (FA2 / FA3 / FA4); do not invent a
-        # default here (ModelSpec leaves it None).
-        if "attn_implementation" not in cfg or cfg["attn_implementation"] is None:
-            raise ValueError(
-                "from_ds_worker_config requires attn_implementation "
-                "(flash_attention_2 / flash_attention_3 / flash_attention_4)."
-            )
-
-        parallelism = ParallelismConfig.model_validate(
-            dict(
-                **({"expert_parallel": cfg["ep_size"]} if "ep_size" in cfg else {}),
-                sequence_parallel=resolve_sp_size({"ds_worker_config": cfg}),
-            )
-        )
-        if parallelism.expert_parallel > 1:
-            from arctic_platform.model.moe_spec import moe_model_spec
-
-            if cfg.get("zorro_train_enable") or cfg.get("use_liger") or cfg.get("enable_gradient_checkpointing"):
-                raise ValueError("expert-parallel workers require loader-owned forward/checkpointing options")
-            options = deepcopy(cfg.get("prime_rl") or {})
-            for key in ("ac_config", "tiled_mlp_token_chunk_size", "weight_conversion_cache_dir"):
-                if key in cfg:
-                    if key in options and options[key] != cfg[key]:
-                        raise ValueError(f"conflicting worker and prime_rl {key}")
-                    options[key] = deepcopy(cfg[key])
-            checkpointing = cfg.get("activation_checkpointing")
-            if checkpointing is False and options.get("ac_config") is not None:
-                raise ValueError("activation_checkpointing=False conflicts with ac_config")
-            if checkpointing is True and options.get("ac_config") is None:
-                options["ac_config"] = ActivationCheckpointConfig().model_dump()
-            model_options = cfg.get("model_options") or {}
-            if set(model_options) - {"lm_head", "moe"}:
-                raise ValueError("unsupported expert-parallel worker model_options")
-            lm_head = model_options.get("lm_head") or {}
-            head_keys = {
-                "cross_entropy": "fused_cross_entropy",
-                "token_chunk_size": "fused_lm_head_token_chunk_size",
-                "fp32": "fp32_lm_head",
-            }
-            if set(lm_head) - head_keys.keys():
-                raise ValueError("unsupported expert-parallel worker lm_head options")
-            for key, value in lm_head.items():
-                target = head_keys[key]
-                if target in options and options[target] != value:
-                    raise ValueError(f"conflicting model_options.lm_head.{key} and prime_rl.{target}")
-                options[target] = value
-            moe = model_options.get("moe") or {}
-            moe_keys = {
-                "comm_backend": "ep_comm_backend",
-                "comm_sms": "deepep_num_sms",
-                "comm_token_chunk": "deepep_token_chunk_size",
-                "grouped_mm": "moe_use_grouped_mm",
-            }
-            if set(moe) - moe_keys.keys():
-                raise ValueError("unsupported expert-parallel worker moe options")
-            for key, value in moe.items():
-                target = moe_keys[key]
-                if target in options and options[target] != value:
-                    raise ValueError(f"conflicting model_options.moe.{key} and prime_rl.{target}")
-                options[target] = value
-            if "attn" in options and options["attn"] != cfg["attn_implementation"]:
-                raise ValueError("conflicting prime_rl.attn and attn_implementation")
-            options["attn"] = cfg["attn_implementation"]
-            spec = moe_model_spec(
-                model_name=model_name,
-                ep_size=parallelism.expert_parallel,
-                sp_size=parallelism.sequence_parallel,
-                loader_options=options,
-                peft_config=cfg.get("peft_config"),
-            )
-            spec.debug = {**spec.debug, **gpu_memory_debug_config(cfg)}
-            return spec
-
-        zorro_train_patch = None
-        if cfg.get("zorro_train_enable", False):
-            # Only forward keys present in cfg; ZorroTrainPatch pydantic defaults fill the rest.
-            zorro_keys = (
-                "response_len",
-                "max_token_len",
-                "rollout_n",
-                "temperature",
-                "use_unpad",
-                "world_size",
-                "logits_optimization",
-                "logits_optimization_peak_mem_size_in_gib",
-                "logits_compute_from_fp32_inputs",
-                "logits_compute_in_fp32",
-            )
-            zorro_train_patch = ZorroTrainPatch(**{k: cfg[k] for k in zorro_keys if k in cfg})
-
-        # Worker bridge defaults GC on (historical DeepSpeedWorker behavior). Generic
-        # ``Patches.gradient_checkpointing`` stays False for direct ModelSpec users.
-        return cls(
-            model_path_or_name=model_name,
-            dtype="bfloat16",
-            attn_implementation=cfg["attn_implementation"],
-            debug=gpu_memory_debug_config(cfg),
-            patches=Patches(
-                liger=cfg.get("use_liger", False),
-                zorro_train=zorro_train_patch,
-                gradient_checkpointing=cfg.get("enable_gradient_checkpointing", True),
-                peft=cfg.get("peft_config"),
-            ),
-        )
 
     @field_validator("dtype")
     @classmethod
