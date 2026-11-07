@@ -29,6 +29,7 @@ def worker_module():
     return deepspeed_worker
 
 
+@pytest.mark.parametrize("job_type", ["train", "log_prob"])
 @pytest.mark.parametrize(
     "training",
     [
@@ -36,8 +37,10 @@ def worker_module():
         {"prime_rl": {"debug": {"gpu_mem_preallocate_gib": 20}}},
     ],
 )
-def test_training_margin_reaches_model_and_survives_engine_initialization(monkeypatch, training):
+def test_training_margin_reaches_model_and_survives_engine_initialization(monkeypatch, training, job_type):
     mod = worker_module()
+    from arctic_platform.common import deepspeed_engine
+
     cls = mod.DeepSpeedWorker.__ray_metadata__.modified_class
     worker = object.__new__(cls)
     worker.rank, worker.world_size, worker.master_port = 0, 1, 12345
@@ -45,10 +48,19 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
     model = torch.nn.Identity()
     model._arctic_gpu_mem_preallocation = reserve
     observed = []
+    optimizer = SimpleNamespace(cpu_offload=True)
+    installed_hooks = []
     monkeypatch.setattr(mod.deepspeed, "init_distributed", lambda: None)
     monkeypatch.setattr(mod, "pr0", lambda *args: None)
     monkeypatch.setattr(mod, "sp_size_from_job_config", lambda config: 1)
-    monkeypatch.setattr(worker, "ds_training_config", lambda *args: {})
+    monkeypatch.setattr(
+        worker,
+        "ds_training_config",
+        lambda *args: {"optimizer": {"type": "AdamW", "params": {"lr": 0.001, "torch_adam": True}}},
+    )
+    monkeypatch.setattr(worker, "ds_inference_config", lambda *args: {})
+    monkeypatch.setattr(deepspeed_engine, "build_training_optimizer", lambda *args, **kwargs: optimizer)
+    monkeypatch.setattr(deepspeed_engine, "release_offloaded_grad_partitions", installed_hooks.append)
 
     def build(spec):
         observed.append(spec.debug)
@@ -57,7 +69,9 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
     def initialize(**kwargs):
         assert worker._gpu_mem_preallocation is reserve
         assert kwargs["model"] is model
-        return SimpleNamespace(local_rank=0, global_steps=0), None, None, None
+        assert "model_parameters" not in kwargs
+        assert kwargs.get("optimizer") is (optimizer if job_type == "train" else None)
+        return SimpleNamespace(local_rank=0, global_steps=0), optimizer, None, None
 
     monkeypatch.setattr(mod, "build_model", build)
     monkeypatch.setattr(mod.deepspeed, "initialize", initialize)
@@ -68,13 +82,14 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
         "localhost",
         {
             "model_name": "x",
-            "job_type": "train",
+            "job_type": job_type,
             "training_config": training,
             "ds_worker_config": {"attn_implementation": "sdpa"},
         },
     )
     assert observed == [{"gpu_mem_preallocate_gib": 20}]
     assert worker._gpu_mem_preallocation is reserve
+    assert installed_hooks == ([optimizer] if job_type == "train" else [])
 
 
 def test_destroy_retains_buffer_through_sender_and_communicator_teardown(monkeypatch):
