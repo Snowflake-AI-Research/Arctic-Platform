@@ -29,6 +29,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch import nn
 
 from arctic_platform.model.implementations.deepseek_v41 import DeepseekV41Config
 from arctic_platform.model.implementations.deepseek_v41 import DeepseekV41ForCausalLM
@@ -305,3 +306,61 @@ def _ep_export_worker(rank, stream, placed):
 @pytest.mark.parametrize("stream", [False, True], ids=["device-gather", "host-stream"])
 def test_ep_export_restores_the_published_checkpoint(tmp_path, stream, placed):
     assert all(_run(_ep_export_worker, tmp_path, stream, placed).values())
+
+
+def test_hf_export_config_follows_the_models_own_quantization():
+    from arctic_platform.model import hf_export_config
+
+    quantization = {"quant_method": "fp8", "weight_block_size": [32, 32], "expert_dtype": "fp4"}
+    source = {"model_type": "deepseek_v41", "quantization_config": quantization, "text_config": {}}
+    source["text_config"]["quantization_config"] = quantization
+    # Full FT dequantizes at load (the builder deletes the config's quantization), so the export is BF16.
+    full_ft = DeepseekV41ForCausalLM(_config())
+    assert hf_export_config(full_ft, source) == {"model_type": "deepseek_v41", "text_config": {}}
+    assert source["quantization_config"] == quantization  # not modified
+    # Packed experts frozen under LoRA keep the published MXFP4 layout, so the export keeps the source's config.
+    packed = DeepseekV41ForCausalLM(
+        _config(quantization_config=quantization, hidden_size=64, moe_intermediate_size=32)
+    )
+    assert hf_export_config(packed, source) == source
+
+
+def test_hf_export_copies_the_vision_tower_the_text_model_drops(tmp_path):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model import iter_hf_source_tensors
+    from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import (
+        DEFERRED_CHECKPOINT_NAMESPACES,
+    )
+    from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import EXPORT_SOURCE_NAMESPACES
+
+    assert set(EXPORT_SOURCE_NAMESPACES) == set(DEFERRED_CHECKPOINT_NAMESPACES) - {"mtp."}
+    generator = torch.Generator().manual_seed(0)
+    shards = {
+        "model-00001-of-00002.safetensors": {
+            "vision.blocks.0.attn.qkv.weight": torch.randn(6, 4, generator=generator).bfloat16(),
+            "layers.0.attn_norm.weight": torch.ones(4).bfloat16(),
+            "mtp.0.attn_norm.weight": torch.ones(4).bfloat16(),
+        },
+        "model-00002-of-00002.safetensors": {
+            "aligner.fc1.weight": torch.randn(4, 4, generator=generator).bfloat16(),
+            "image_newline": torch.randn(4, generator=generator).bfloat16(),
+        },
+    }
+    weight_map = {}
+    for file, tensors in shards.items():
+        save_file(tensors, str(tmp_path / file))
+        weight_map.update(dict.fromkeys(tensors, file))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
+    model = DeepseekV41ForCausalLM(_config())
+
+    got = dict(iter_hf_source_tensors(model, str(tmp_path)))
+    assert sorted(got) == ["aligner.fc1.weight", "image_newline", "vision.blocks.0.attn.qkv.weight"]
+    for name, tensor in got.items():
+        file = weight_map[name]
+        assert tensor.dtype == torch.bfloat16 and torch.equal(tensor, shards[file][name]), name
+    assert sorted(dict(iter_hf_source_tensors(model, str(tmp_path), skip={"image_newline"}))) == [
+        "aligner.fc1.weight",
+        "vision.blocks.0.attn.qkv.weight",
+    ]
+    assert list(iter_hf_source_tensors(nn.Linear(1, 1), str(tmp_path))) == []  # families without the attribute

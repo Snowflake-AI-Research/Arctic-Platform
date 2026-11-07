@@ -68,8 +68,10 @@ from arctic_platform.model.weight_export import WeightExportContract
 from arctic_platform.model.weight_export import checkpoint_peft_adapter_dir
 from arctic_platform.model.weight_export import gather_peft_adapter_state_dict
 from arctic_platform.model.weight_export import hf_checkpoint_name_map
+from arctic_platform.model.weight_export import hf_export_config
 from arctic_platform.model.weight_export import hf_export_parameter_name
 from arctic_platform.model.weight_export import hf_sync_name_map
+from arctic_platform.model.weight_export import iter_hf_source_tensors
 from arctic_platform.model.weight_export import iter_lora_weights
 from arctic_platform.model.weight_export import iter_model_weights
 from arctic_platform.model.weight_export import pretrained_config_of
@@ -145,6 +147,8 @@ __all__ = [
     "resolve_conversion_cache_path",
     "ROUTER_REPLAY_FRESH",
     "save_exported_state_dict",
+    "hf_export_config",
+    "iter_hf_source_tensors",
     "select_loader",
     "validate_lora_sync_trainable_parameters",
     "validate_expert_parallel",

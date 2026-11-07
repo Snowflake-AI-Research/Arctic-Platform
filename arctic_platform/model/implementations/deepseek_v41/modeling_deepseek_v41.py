@@ -37,6 +37,7 @@ from arctic_platform.model.implementations.deepseek_v41.attention import Deepsee
 from arctic_platform.model.implementations.deepseek_v41.attention import SharedAttentionState
 from arctic_platform.model.implementations.deepseek_v41.attention import build_packed
 from arctic_platform.model.implementations.deepseek_v41.configuration_deepseek_v41 import DeepseekV41Config
+from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import EXPORT_SOURCE_NAMESPACES
 from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import conversion_chain
 from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import log_deferred_checkpoint_keys
 from arctic_platform.model.implementations.deepseek_v41.dequantize import dequantize_state_dict_
@@ -152,6 +153,8 @@ class DeepseekV41PreTrainedModel(PreTrainedModelPrimeRL):
     _can_compile_fullgraph = False
     _supports_attention_backend = True
     _can_record_outputs = {"hidden_states": DeepseekV41DecoderLayer}
+    # Published tensors the text model does not build that an HF export copies from the source checkpoint.
+    hf_export_source_prefixes = EXPORT_SOURCE_NAMESPACES
 
     @classmethod
     def cp_blocker(cls, config, cp: int) -> str | None:
