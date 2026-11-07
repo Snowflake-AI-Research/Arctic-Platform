@@ -47,6 +47,16 @@ GRAD_MATCH = audit_lib.register_check(
     "trainer.gradients_match_reference",
     "every HF-named gradient the optimizer receives, after the engine's reductions, matches the fp32 reference",
 )
+FP32_GRAD = audit_lib.register_check(
+    "trainer.fp32_gradients_keep_precision",
+    "the reduced gradient of a tensor the checkpoint stores in FP32 is not rounded to bf16 on the way to the"
+    " optimizer",
+)
+TILED_GRAD = audit_lib.register_check(
+    "trainer.tiled_mlp_gradients_match_untiled",
+    "at the launch's tokens per rank and tile count, each tiled MLP weight gradient is its tiles' gradients summed in "
+    "fp32 and rounded once, not rounded again per tile",
+)
 HEAD_GRAD = audit_lib.register_check(
     "trainer.head_gradient_matches_unfused",
     "the output head's input gradient, contracted with its input over tokens, is as close to fp64 as an unfused head "
@@ -184,6 +194,72 @@ def test_gradients_complete(profile, trainer_forward, record):
 def test_gradients_match_reference(profile, reference, baseline_step, record):
     ref, step = require_ok(reference, "reference"), require_ok(baseline_step, "production step")
     audit_lib.assert_gradients_match(profile, step["reduced_grads"], ref, record)
+
+
+@pytest.mark.audit_check(FP32_GRAD)
+def test_fp32_gradients_keep_precision(profile, tiny_ckpt, reference, baseline_step, record):
+    fp32 = [n for n, t in audit_lib.read_checkpoint_tensors(tiny_ckpt).items() if str(t.dtype) == "torch.float32"]
+    if not fp32:
+        pytest.skip("the checkpoint stores no tensor in FP32")
+    ref, step = require_ok(reference, "reference"), require_ok(baseline_step, "production step")
+    compared, rounded = [], []
+    for name in sorted(fp32):
+        grad, ref_grad = step["reduced_grads"].get(name), ref["fp32_grads"].get(name)
+        if grad is None or ref_grad is None or bool(grad.isnan().any()):
+            continue
+        # A gradient bf16 represents exactly cannot show rounding; one element in 2**16 is, by chance.
+        if bool((ref_grad.bfloat16().float() == ref_grad).all()) or not bool((grad != 0).any()):
+            continue
+        compared.append(name)
+        if bool((grad.bfloat16().float() == grad).all()):
+            rounded.append(name)
+    record(fp32_tensors=len(fp32), compared=compared[:40], rounded=rounded[:40])
+    if not compared:
+        pytest.skip("no FP32 tensor receives a gradient")
+    assert not rounded, f"{len(rounded)}/{len(compared)} FP32 tensors get a bf16-rounded gradient: {rounded[:5]}"
+
+
+@pytest.fixture(scope="session")
+def tiled_mlp(probes, profile, tiny_ckpt):
+    """The production model's tiled MLPs at the launch's tile count, on the launch's tokens per rank."""
+    trainer = profile.launch.get("trainer", {})
+    chunk = trainer.get("loader_options", {}).get("tiled_mlp_token_chunk_size")
+    if not chunk:
+        pytest.skip("the launch does not tile MLPs (loader_options.tiled_mlp_token_chunk_size)")
+    tokens = int(profile.launch["max_seq_len"]) // trainer.get("parallelism", {}).get("sequence_parallel", 1)
+    return probes.run(
+        "trainer",
+        profile,
+        tiny_ckpt,
+        gpus=profile.baseline_gpus,
+        mode="tiled_mlp",
+        tokens=tokens,
+        token_chunk_size=int(chunk),
+    )
+
+
+@pytest.mark.audit_check(TILED_GRAD)
+def test_tiled_mlp_gradients_match_untiled(profile, tiled_mlp, record):
+    result = require_ok(tiled_mlp, "tiled MLP probe")
+    tiled, summed = result["tiled"], result["summed"]
+    worst = []
+    for name in sorted(tiled):
+        ulps = audit_lib.bf16_ulp_distance(tiled[name], summed[name])
+        worst.append((float((ulps > 1).float().mean()), float(ulps.max()), name))
+    worst.sort(reverse=True)
+    allowed = float(profile.tolerances.get("max_tiled_grad_ulp_fraction", 0.001))
+    bad = [(n, round(f, 4), round(m, 1)) for f, m, n in worst if f > allowed]
+    record(
+        tiles=result["tiles"],
+        modules=result["modules"],
+        allowed_fraction=allowed,
+        most_off=[(n, round(f, 4), round(m, 1)) for f, m, n in worst[:15]],
+    )
+    assert worst, "the tiled MLP probe found no tiled module"
+    assert not bad, (
+        f"{len(bad)}/{len(worst)} tiled weight gradients differ from their {result['tiles']} tiles summed in fp32 by"
+        f" more than one bf16 spacing in over {allowed:.1%} of elements (tensor, fraction, max spacings): {bad[:5]}"
+    )
 
 
 @pytest.mark.audit_check(HEAD_GRAD)

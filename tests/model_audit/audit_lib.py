@@ -256,6 +256,45 @@ def source_weight_names(profile: Profile) -> set[str]:
         return set(handle.keys())
 
 
+def layout_pattern(name: str) -> str:
+    """``name`` with its layer and expert indices abstracted, so tiny and real checkpoints compare by pattern."""
+    return re.sub(r"\.\d+(?=\.|$)", ".N", name)
+
+
+def source_weight_dtypes(profile: Profile) -> dict[str, str] | None:
+    """Safetensors dtype (``F32``, ``BF16``, ...) of every real-checkpoint tensor, read from the shard headers.
+
+    None when a shard is not available locally; only the headers are read.
+    """
+    index = _resolve_file(profile.checkpoint, "model.safetensors.index.json")
+    files = sorted(set(json.loads(Path(index).read_text())["weight_map"].values())) if index else ["model.safetensors"]
+    dtypes = {}
+    for name in files:
+        path = _local_file(profile.checkpoint, name)
+        if path is None:
+            return None
+        with open(path, "rb") as handle:
+            header = json.loads(handle.read(int.from_bytes(handle.read(8), "little")))
+        dtypes.update({k: v["dtype"] for k, v in header.items() if k != "__metadata__"})
+    return dtypes
+
+
+def _local_file(checkpoint: str, filename: str) -> str | None:
+    if Path(checkpoint).is_dir():
+        path = Path(checkpoint, filename)
+        return str(path) if path.is_file() else None
+    from huggingface_hub import try_to_load_from_cache
+
+    path = try_to_load_from_cache(checkpoint, filename)
+    return path if isinstance(path, str) else None
+
+
+def source_fp32_patterns(profile: Profile) -> set[str]:
+    """Layout patterns of the tensors the real checkpoint stores in FP32."""
+    dtypes = source_weight_dtypes(profile) or {}
+    return {layout_pattern(name) for name, dtype in dtypes.items() if dtype == "F32"}
+
+
 def text_config_of(config: dict) -> dict:
     text = config.get("text_config")
     return text if isinstance(text, dict) else config
@@ -437,7 +476,28 @@ def row_lengths(profile: Profile, tiny_config: dict) -> list[int]:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-_TINY_FORMAT = 2
+_TINY_FORMAT = 3
+
+
+def _restore_fp32(out: Path, fp32_dir: Path, patterns: set[str]) -> None:
+    """Put back the FP32 values of the tensors the real checkpoint stores in FP32.
+
+    Matched by saved (checkpoint) name, since save_pretrained renames modules. The values come from the FP32 model,
+    so they are not representable in the launch dtype and a path that rounds them shows.
+    """
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    originals = {}
+    for path in fp32_dir.glob("*.safetensors"):
+        with safe_open(str(path), "pt") as handle:
+            originals.update({k: handle.get_tensor(k) for k in handle.keys() if layout_pattern(k) in patterns})
+    for path in out.glob("*.safetensors"):
+        with safe_open(str(path), "pt") as handle:
+            metadata = handle.metadata()
+            tensors = {k: originals.get(k, handle.get_tensor(k)) for k in handle.keys()}
+        save_file(tensors, str(path), metadata=metadata)
+    shutil.rmtree(fp32_dir)
 
 
 def _config_hash(config: dict, seed: int, dtype: str, reference: str = "transformers") -> str:
@@ -488,7 +548,12 @@ def build_tiny_checkpoint(profile: Profile, seed: int = 0) -> Path:
             with torch.device("cpu"):
                 model = model_cls._from_config(config, dtype=torch.float32)
             _perturb_zero_init(model, seed)
+            fp32 = source_fp32_patterns(profile)
+            if fp32:
+                model.save_pretrained(str(staging / "fp32"), safe_serialization=True)
             model.to(getattr(torch, profile.dtype)).save_pretrained(str(staging), safe_serialization=True)
+            if fp32:
+                _restore_fp32(staging, staging / "fp32", fp32)
         (staging / "config.json").write_text(json.dumps(config_dict, indent=2))
         (staging / ".complete").write_text("")
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -595,6 +660,16 @@ def pack_rows(rows: list[list[int]], pad_to_multiple: int = 1, pad_token_id: int
         labels += [-100] * pad
     as_tensor = lambda x: torch.tensor([x], dtype=torch.long)  # noqa: E731
     return as_tensor(ids), as_tensor(pos), as_tensor(labels)
+
+
+def bf16_ulp_distance(a, b):
+    """``|a - b|`` in units of the bf16 spacing at ``max(|a|, |b|)``, elementwise."""
+    import torch
+
+    scale = torch.maximum(a.abs(), b.abs()).float()
+    _, exponent = torch.frexp(scale)
+    ulp = torch.ldexp(torch.ones_like(scale), exponent - 8).clamp(min=torch.finfo(torch.bfloat16).tiny)
+    return (a.float() - b.float()).abs() / ulp
 
 
 def probe_inputs(profile: Profile, ckpt: str) -> tuple[dict, list[list[int]], int]:

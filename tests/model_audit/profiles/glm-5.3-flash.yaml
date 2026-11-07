@@ -15,6 +15,7 @@ launch:
       fused_cross_entropy: false
       fused_lm_head_token_chunk_size: 4096
       reduce_dtype: float32
+      tiled_mlp_token_chunk_size: 1024
   # TrainingEngineSpec fields (arctic_platform.common.deepspeed_engine).
   engine: {gradient_clipping: 0.0, fp32_masters: false}
   sampler:
@@ -87,7 +88,28 @@ known_issues:
     summary: "MoE combine is nondeterministic by default (#366 adds opt-in debug.full_determinism); routing amplifies it to ~0.2 log-prob"
   optimizer.update_lands_at_launch_lr:
     issue: launch config (fp32_masters)
-    summary: "engine default bf16 master weights drop ~98% of a 1e-6 AdamW step; fp32_masters: true keeps it"
+    summary: >-
+      engine default bf16 master weights drop ~98% of a 1e-6 AdamW step; fp32_masters: true keeps it, but at full
+      scale that configuration OOMs in weight sync (client check sampler.weight_sync_with_fp32_masters)
+  optimizer.fp32_params_survive_step:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/465
+    summary: >-
+      bf16 ZeRO-2 masters hold the protected FP32 mHC base/scale and KDA A_log/dt_bias in bf16 and copy them back,
+      so an lr=0 step rounds all 16 to bf16 (dt_bias moves by up to 0.016)
+  trainer.fp32_gradients_keep_precision:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/465
+    summary: "the protected FP32 parameters' gradients are staged in bf16 before the reduction: 16/16 arrive bf16-rounded"
+  optimizer.update_is_adamw:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/465
+    summary: "the protected FP32 parameters step in bf16 (the two issues above), so none of their updates is the FP32 AdamW step"
+  parallel.update_is_adamw:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/465
+    summary: "the protected FP32 parameters step in bf16 under every layout, as on the baseline"
+  trainer.tiled_mlp_gradients_match_untiled:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/466
+    summary: >-
+      DeepSpeed's TiledMLP backpropagates each tile into the bf16 param.grad, rounding once per tile: at the launch's
+      32 tiles ~37% of shared-expert weight-gradient elements are over one bf16 spacing from the fp32 tile sum
   sampler.tensor_parallel_matches_reference[tp1]:
     issue: upstream (vLLM)
     summary: >-

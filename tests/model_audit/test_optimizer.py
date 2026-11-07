@@ -50,6 +50,24 @@ FROZEN = audit_lib.register_check("optimizer.frozen_unchanged", "frozen paramete
 POLICY = audit_lib.register_check(
     "optimizer.implementation_policy", "the engine runs the optimizer implementation the profile expects"
 )
+FP32_KEPT = audit_lib.register_check(
+    "optimizer.fp32_params_survive_step",
+    "tensors the checkpoint stores in FP32 keep their exact values through an lr=0 step, in the stored weights and "
+    "the optimizer's master copy",
+)
+
+
+@pytest.fixture(scope="session")
+def step_lr0(probes, profile, tiny_ckpt):
+    return probes.run(
+        "trainer",
+        profile,
+        tiny_ckpt,
+        gpus=profile.baseline_gpus,
+        mode="step",
+        parallelism=profile.tiny_parallelism(),
+        lr=0.0,
+    )
 
 
 @pytest.fixture(scope="session")
@@ -135,6 +153,30 @@ def test_frozen_unchanged(profile, baseline_step, record):
     step = require_ok(baseline_step, "production step")
     record(frozen=len(step["frozen_params"]), changed=step["frozen_changed"][:20])
     assert not step["frozen_changed"], f"frozen parameters modified by the step: {step['frozen_changed'][:20]}"
+
+
+@pytest.mark.audit_check(FP32_KEPT)
+def test_fp32_params_survive_step(request, profile, tiny_ckpt, record):
+    source = audit_lib.read_checkpoint_tensors(tiny_ckpt)
+    source = {n: t.float() for n, t in source.items() if str(t.dtype) == "torch.float32"}
+    if not source:
+        pytest.skip("the checkpoint stores no tensor in FP32")
+    step = require_ok(request.getfixturevalue("step_lr0"), "production step at lr=0")
+    changed = {}
+    for kind in ("fp32_after", "fp32_master_after"):
+        for name, value in sorted(step[kind].items()):
+            if bool((value != source[name]).any()):
+                changed.setdefault(kind, []).append((name, float((value - source[name]).abs().max())))
+    record(
+        fp32_tensors=len(source),
+        stored_compared=len(step["fp32_after"]),
+        masters_compared=len(step["fp32_master_after"]),
+        stored_changed=changed.get("fp32_after", [])[:20],
+        masters_changed=changed.get("fp32_master_after", [])[:20],
+    )
+    assert not changed, "an lr=0 step changed FP32 tensors: " + "; ".join(
+        f"{len(v)} {kind} (e.g. {v[:3]})" for kind, v in changed.items()
+    )
 
 
 @pytest.mark.audit_check(POLICY)

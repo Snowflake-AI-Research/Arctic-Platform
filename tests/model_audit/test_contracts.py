@@ -37,7 +37,8 @@ LAYER_KINDS = audit_lib.register_check(
 )
 TINY_LAYOUT = audit_lib.register_check(
     "contract.tiny_layout_matches_source",
-    "the tiny checkpoint has the real checkpoint's tensor-name layout, so loading it exercises the real conversion",
+    "the tiny checkpoint has the real checkpoint's tensor-name layout and FP32 tensors, so loading it exercises the "
+    "real conversion and precision policy",
 )
 
 REFERENCE_CONFIG = audit_lib.register_check(
@@ -108,19 +109,42 @@ def _layout(names, keep: list[int] | None = None) -> set[str]:
 def test_tiny_layout_matches_source(profile, tiny_ckpt, record):
     full = audit_lib.source_config(profile)
     _, keep = audit_lib.shrink_config(full, profile.tiny)
+    tensors = audit_lib.read_checkpoint_tensors(tiny_ckpt)
     source = _layout(audit_lib.source_weight_names(profile), keep)
-    tiny = _layout(audit_lib.read_checkpoint_tensors(tiny_ckpt).keys())
+    tiny = _layout(tensors.keys())
     ignore = [re.compile(p) for p in profile.expect.get("layout_ignore", [])]
     if full.get("tie_word_embeddings", audit_lib.text_config_of(full).get("tie_word_embeddings")):
         ignore.append(re.compile(r"(^|\.)lm_head\.weight$"))
     source = {n for n in source if not any(p.search(n) for p in ignore)}
     tiny = {n for n in tiny if not any(p.search(n) for p in ignore)}
     only_source, only_tiny = sorted(source - tiny), sorted(tiny - source)
-    record(only_in_source=only_source[:40], only_in_tiny=only_tiny[:40])
+    dtypes = audit_lib.source_weight_dtypes(profile)
+    source_fp32 = _layout([n for n, d in (dtypes or {}).items() if d == "F32"], keep)
+    tiny_fp32 = _layout(n for n, t in tensors.items() if str(t.dtype) == "torch.float32")
+    fp32_lowered = sorted((source & tiny & source_fp32) - tiny_fp32)
+    fp32_added = sorted((source & tiny & tiny_fp32) - source_fp32) if dtypes is not None else []
+    bf16_exact = sorted(
+        {n for n, t in tensors.items() if str(t.dtype) == "torch.float32" and bool((t.bfloat16().float() == t).all())}
+    )
+    record(
+        only_in_source=only_source[:40],
+        only_in_tiny=only_tiny[:40],
+        source_dtypes_read=dtypes is not None,
+        fp32_in_source_only=fp32_lowered[:40],
+        fp32_in_tiny_only=fp32_added[:40],
+        fp32_bf16_exact=bf16_exact[:40],
+    )
     assert not only_source and not only_tiny, (
         f"{len(only_source)} name pattern(s) only in the real checkpoint (e.g. {only_source[:5]}), "
         f"{len(only_tiny)} only in the tiny one (e.g. {only_tiny[:5]})"
     )
+    assert not fp32_lowered and not fp32_added, (
+        f"FP32 in the real checkpoint but not the tiny one: {fp32_lowered[:5]}; FP32 only in the tiny one:"
+        f" {fp32_added[:5]}"
+    )
+    assert (
+        not bf16_exact
+    ), f"FP32 tensors whose values are all bf16-representable, so rounding is invisible: {bf16_exact[:5]}"
 
 
 @pytest.mark.audit_check(REFERENCE_CONFIG)

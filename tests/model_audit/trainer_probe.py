@@ -33,6 +33,7 @@ import argparse
 import contextlib
 import functools
 import json
+import math
 import os
 import sys
 import traceback
@@ -92,11 +93,12 @@ def _parallel_groups(parallelism: dict, spec) -> dict:
     }
 
 
-def _build_production_model(profile, ckpt: str, parallelism: dict | None):
+def _build_production_model(profile, ckpt: str, parallelism: dict | None, spec_overrides: dict | None = None):
     from arctic_platform.model import ModelSpec
     from arctic_platform.model import build_model
 
-    spec = ModelSpec(**profile.trainer_spec(model_path=ckpt, parallelism=parallelism))
+    spec = profile.trainer_spec(model_path=ckpt, parallelism=parallelism)
+    spec = ModelSpec(**audit_lib._deep_merge(spec, spec_overrides or {}))
     groups = _parallel_groups(spec.parallelism.model_dump(), spec)
     model = build_model(spec, parallel_groups={"ep_group": groups["ep_group"], "sp_group": groups["sp_group"]}).model
     device = torch.device("cuda", torch.cuda.current_device())
@@ -395,6 +397,47 @@ def _config_changes(before: dict, after: dict, prefix: str = "") -> dict:
     return out
 
 
+def run_tiled_mlp(profile, ckpt: str, tokens: int, token_chunk_size: int) -> dict:
+    """Weight gradients of every tiled MLP of the production model, tiled as built and as the same tiles summed in fp32.
+
+    The production tiling runs ``ceil(tokens / token_chunk_size)`` tiles; the comparison runs each of those tiles
+    through the module on its own (one tile, so untiled) and sums the tile gradients in fp32, rounding once.
+    """
+    from arctic_platform.model.implementations.gpu.tiled_mlp import _PEFT_PARAM_WRAPPERS
+
+    overrides = {"loader_options": {"tiled_mlp_token_chunk_size": token_chunk_size}}
+    model, _, _ = _build_production_model(profile, ckpt, profile.tiny_parallelism(), overrides)
+    model.train()
+    hidden = int(audit_lib.text_config_of(json.loads(Path(ckpt, "config.json").read_text()))["hidden_size"])
+    device = torch.device("cuda", torch.cuda.current_device())
+    shards = math.ceil(tokens / token_chunk_size)
+    padded = math.ceil(tokens / shards) * shards
+    modules = [(n, m) for n, m in model.named_modules() if hasattr(m, _PEFT_PARAM_WRAPPERS)]
+    tiled, summed = {}, {}
+    for name, module in modules:
+        params = {n: p for n, p in module.named_parameters() if p.requires_grad}
+        dtype = next(iter(params.values())).dtype
+        generator = torch.Generator(device=device).manual_seed(0)
+        # TiledMLP takes the weights as a list, so only an input that requires grad gives its output a grad_fn.
+        x = torch.randn(tokens, hidden, device=device, dtype=dtype, generator=generator).requires_grad_()
+        grad_out = torch.randn(tokens, hidden, device=device, dtype=dtype, generator=generator)
+        for p in params.values():
+            p.grad = None
+        module(x).backward(grad_out)
+        tiled.update({f"{name}.{n}": p.grad.float().cpu() for n, p in params.items()})
+        pad = torch.zeros(padded - tokens, hidden, device=device, dtype=dtype)
+        total = {n: torch.zeros_like(p, dtype=torch.float32) for n, p in params.items()}
+        x_tiles = torch.cat((x.detach(), pad)).chunk(shards)
+        for x_tile, g_tile in zip(x_tiles, torch.cat((grad_out, pad)).chunk(shards)):
+            for p in params.values():
+                p.grad = None
+            module(x_tile.requires_grad_()).backward(g_tile)
+            for n, p in params.items():
+                total[n] += p.grad.float()
+        summed.update({f"{name}.{n}": total[n].to(params[n].dtype).float().cpu() for n in params})
+    return {"modules": [n for n, _ in modules], "tiles": shards, "tiled": tiled, "summed": summed}
+
+
 def run_step(profile, ckpt: str, parallelism: dict, lr: float, engine_overrides: dict | None = None) -> dict:
     from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
     from arctic_platform.common.deepspeed_engine import build_deepspeed_config
@@ -486,10 +529,13 @@ def run_step(profile, ckpt: str, parallelism: dict, lr: float, engine_overrides:
         ),
     }
     if dist.get_rank() == 0:
+        fp32 = {n for n, t in audit_lib.read_checkpoint_tensors(ckpt).items() if t.dtype == torch.float32}
         result["reduced_grads"] = reduced_grads
         result["update"] = {name: after[name] - before[name] for name in after if name in before}
         # The optimizer's own copy: with fp32 masters a step below the launch dtype's resolution survives here.
         result["master_update"] = {name: master_after[name] - before[name] for name in master_after if name in before}
+        result["fp32_after"] = {n: after[n].cpu() for n in fp32 if n in after}
+        result["fp32_master_after"] = {n: master_after[n].cpu() for n in fp32 if n in master_after}
         max_norm = float(engine_spec.gradient_clipping or 0.0)
         result["gradient_clipping"] = max_norm
         result["reduced_grad_norm"] = norm
@@ -507,6 +553,7 @@ def run_step(profile, ckpt: str, parallelism: dict, lr: float, engine_overrides:
                 getattr(torch, spec.dtype or profile.dtype),
                 clip,
                 grad_dtype,
+                fp32,
             )
             for kind, clip in coefficients.items()
         }
@@ -551,23 +598,32 @@ def _clip_coefficient(norm: float, max_norm: float) -> float:
 
 
 def _adamw_agreement(
-    before, after, grads, opt: dict, lowp: torch.dtype, clip: float, grad_dtype: torch.dtype
+    before, after, grads, opt: dict, lowp: torch.dtype, clip: float, grad_dtype: torch.dtype, fp32: set[str]
 ) -> dict[str, float]:
     """Per tensor, the fraction of elements whose stored update equals one AdamW step on the reduced gradient.
 
     First step with bias correction: ``m_hat = g`` and ``v_hat = g**2``, so the step is ``g / (|g| + eps)`` on the
     clipped gradient, stored in ``grad_dtype`` (clipping only matters where ``|g|`` is near ``eps``). The expectation
-    is rounded to the stored dtype the same way the weights are.
+    is rounded to the stored dtype the same way the weights are; tensors the checkpoint stores in FP32 (``fp32``)
+    keep FP32 gradients and weights, where the optimizer's own FP32 arithmetic may land one FP32 spacing (of the
+    weight or the step, whichever is larger) away.
     """
     out = {}
     for name, grad in grads.items():
         if name not in before or name not in after or bool(torch.isnan(grad).any()):
             continue
         w0 = before[name]
-        grad = (grad * clip).to(grad_dtype).float()
+        stored, accumulated = (torch.float32, torch.float32) if name in fp32 else (lowp, grad_dtype)
+        grad = (grad * clip).to(accumulated).float()
         ideal = w0 - opt["lr"] * (grad / (grad.abs() + opt["eps"]) + opt["weight_decay"] * w0)
-        expected = ideal.to(lowp).float() - w0
-        out[name] = float((after[name] - w0 == expected).float().mean())
+        expected = ideal.to(stored).float() - w0
+        if name in fp32:
+            scale = torch.maximum(torch.maximum(ideal.abs(), w0.abs()), expected.abs())
+            spacing = torch.ldexp(torch.ones_like(scale), torch.frexp(scale)[1] - 24)
+            agree = (after[name] - w0 - expected).abs() <= spacing
+        else:
+            agree = after[name] - w0 == expected
+        out[name] = float(agree.float().mean())
     return out
 
 
@@ -598,11 +654,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", required=True)
     parser.add_argument("--ckpt", required=True)
-    parser.add_argument("--mode", choices=("reference", "forward", "step", "export"), required=True)
+    parser.add_argument("--mode", choices=("reference", "forward", "step", "export", "tiled_mlp"), required=True)
     parser.add_argument("--export-dir", default=None)
     parser.add_argument("--parallelism", default="{}")
     parser.add_argument("--lr", type=float, default=None, help="step mode; defaults to the profile's audit_lr")
     parser.add_argument("--engine-overrides", default="{}", help="step mode; JSON TrainingEngineSpec fields")
+    parser.add_argument("--tokens", type=int, default=None, help="tiled_mlp mode; tokens per rank")
+    parser.add_argument("--token-chunk-size", type=int, default=None, help="tiled_mlp mode; tokens per tile")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -616,6 +674,8 @@ def main() -> None:
             result = run_forward(profile, args.ckpt)
         elif args.mode == "export":
             result = run_export(profile, args.ckpt, args.export_dir)
+        elif args.mode == "tiled_mlp":
+            result = run_tiled_mlp(profile, args.ckpt, args.tokens, args.token_chunk_size)
         else:
             lr = profile.audit_lr if args.lr is None else args.lr
             overrides = json.loads(args.engine_overrides)

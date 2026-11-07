@@ -109,7 +109,9 @@ def pytest_collection_modifyitems(config, items):
             continue
         issue = _profile_entry(profile.known_issue, check, variant)
         if issue:
-            item.add_marker(pytest.mark.xfail(strict=True, reason=f"{issue.get('issue')} {issue.get('summary', '')}"))
+            # Only a failed comparison is the known issue; a probe that fails first (pytest.fail) still fails.
+            reason = f"{issue.get('issue')} {issue.get('summary', '')}"
+            item.add_marker(pytest.mark.xfail(strict=True, raises=AssertionError, reason=reason))
         gpus = item.get_closest_marker("audit_gpus")
         if gpus and torch.cuda.device_count() < gpus.args[0]:
             item.add_marker(pytest.mark.skip(reason=f"needs {gpus.args[0]} GPU(s); have {torch.cuda.device_count()}"))
