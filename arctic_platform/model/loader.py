@@ -181,6 +181,11 @@ def _model_type(config: Any) -> str:
     return str(getattr(config, "model_type", "") or "")
 
 
+def model_type_family(model_type: str) -> str:
+    """Normalize a standalone text model type to its family name."""
+    return model_type.removesuffix("_text")
+
+
 @dataclass
 class LoaderContext:
     """Everything a loader needs to build a model."""
@@ -202,6 +207,11 @@ class LoaderContext:
         config = self.hf_config
         text_config = config.get("text_config") if isinstance(config, dict) else getattr(config, "text_config", None)
         return _model_type(text_config)
+
+    @property
+    def hf_model_family(self) -> str:
+        """The nested text family, or the root family for a standalone config."""
+        return model_type_family(self.hf_text_model_type or self.hf_model_type)
 
 
 @dataclass
