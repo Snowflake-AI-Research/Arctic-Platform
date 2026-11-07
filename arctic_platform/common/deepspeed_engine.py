@@ -34,6 +34,9 @@ from pydantic import ConfigDict
 from pydantic import Field
 
 from arctic_platform.common.optimizer import OptimizerSettings
+from arctic_platform.common.zero_fp32_groups import protect_fp32_parameter_groups
+from arctic_platform.common.zero_fp32_groups import require_fp32_grad_accumulation
+from arctic_platform.common.zero_fp32_groups import requires_fp32_grad_accumulation
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 
@@ -237,6 +240,13 @@ def initialize_training_engine(
             int(bool(getattr(DeepSpeedEngine, "_ap_fp8_param_cast_guard", False))),
         )
     import deepspeed
+    import torch
+
+    if requires_fp32_grad_accumulation(ds_config) and any(
+        param.requires_grad and keeps_fp32(param) and param.dtype == torch.float32 for param in model.parameters()
+    ):
+        ds_config = require_fp32_grad_accumulation(ds_config)
+        logger.info("model holds FP32 parameters; gradient accumulation runs in FP32 (data_types.grad_accum_dtype)")
 
     init_kwargs = {"mpu": mpu} if mpu is not None else {}
     if built is not None:
@@ -245,6 +255,7 @@ def initialize_training_engine(
         if ds_config.get("optimizer") is not None:
             init_kwargs["model_parameters"] = model.parameters()
         engine, built, _, _ = deepspeed.initialize(model=model, config=ds_config, **init_kwargs)
+    protect_fp32_parameter_groups(engine)
     return engine, built, choice
 
 
