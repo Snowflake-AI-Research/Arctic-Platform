@@ -342,25 +342,64 @@ def segment_starts(cu_seqlens: torch.Tensor, seq_len: int, batch: int = 1) -> to
     return starts.view(1, -1).expand(batch, -1).contiguous()
 
 
-class _CausalAttentionHD512(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, query, key, value, softmax_scale, seg_start):
-        query, key, value = (tensor.contiguous() for tensor in (query, key, value))
-        forward, _, _, _ = _kernels(*_shape(query, key), float(softmax_scale))
-        output, lse = forward(query, key, value, seg_start)
-        ctx.save_for_backward(query, key, value, output, lse, seg_start)
-        ctx.softmax_scale = float(softmax_scale)
-        return output
+@torch.library.custom_op("arctic_hd512::forward", mutates_args=())
+def _forward_op(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, seg_start: torch.Tensor, softmax_scale: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(output [B, S, H, D], log2-sum-exp [B, H, S]) for contiguous inputs. A torch op, so a selective-checkpoint
+    policy can keep its outputs (``FORWARD_OP``)."""
+    forward, _, _, _ = _kernels(*_shape(query, key), softmax_scale)
+    output, lse = forward(query, key, value, seg_start)
+    return output, lse
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        query, key, value, output, lse, seg_start = ctx.saved_tensors
-        _, delta, dkdv, dq = _kernels(*_shape(query, key), ctx.softmax_scale)
-        grad_output = grad_output.contiguous()
-        row_delta = delta(output, grad_output)
-        grad_key, grad_value = dkdv(query, key, value, grad_output, lse, row_delta, seg_start)
-        grad_query = dq(query, key, value, grad_output, lse, row_delta, seg_start)
-        return grad_query, grad_key, grad_value, None, None
+
+@_forward_op.register_fake
+def _forward_fake(query, key, value, seg_start, softmax_scale):
+    batch, heads, seq_len, dim = query.shape
+    return query.new_empty(batch, seq_len, heads, dim), query.new_empty(batch, heads, seq_len, dtype=torch.float32)
+
+
+@torch.library.custom_op("arctic_hd512::backward", mutates_args=())
+def _backward_op(
+    grad_output: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    seg_start: torch.Tensor,
+    softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _, delta, dkdv, dq = _kernels(*_shape(query, key), softmax_scale)
+    row_delta = delta(output, grad_output)
+    grad_key, grad_value = dkdv(query, key, value, grad_output, lse, row_delta, seg_start)
+    grad_query = dq(query, key, value, grad_output, lse, row_delta, seg_start)
+    return grad_query, grad_key, grad_value
+
+
+@_backward_op.register_fake
+def _backward_fake(grad_output, query, key, value, output, lse, seg_start, softmax_scale):
+    return torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
+
+
+def _setup_context(ctx, inputs, output):
+    query, key, value, seg_start, softmax_scale = inputs
+    ctx.save_for_backward(query, key, value, output[0], output[1], seg_start)
+    ctx.softmax_scale = softmax_scale
+
+
+def _backward(ctx, grad_output, grad_lse):
+    query, key, value, output, lse, seg_start = ctx.saved_tensors
+    grad_query, grad_key, grad_value = _backward_op(
+        grad_output.contiguous(), query, key, value, output, lse, seg_start, ctx.softmax_scale
+    )
+    return grad_query, grad_key, grad_value, None, None
+
+
+_forward_op.register_autograd(_backward, setup_context=_setup_context)
+
+#: The forward op, for selective activation checkpointing policies that keep attention outputs.
+FORWARD_OP = torch.ops.arctic_hd512.forward.default
 
 
 def causal_gqa_attention_hd512(
@@ -384,4 +423,6 @@ def causal_gqa_attention_hd512(
         seg_start = torch.zeros(batch, seq_len, device=query.device, dtype=torch.int32)
     else:
         seg_start = segment_starts(cu_seqlens.to(query.device), int(seq_len), int(batch))
-    return _CausalAttentionHD512.apply(query, key, value, softmax_scale, seg_start)
+    query, key, value = (tensor.contiguous() for tensor in (query, key, value))
+    output, _ = _forward_op(query, key, value, seg_start, float(softmax_scale))
+    return output

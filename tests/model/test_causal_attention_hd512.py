@@ -122,3 +122,48 @@ def test_segment_starts():
     assert starts.tolist() == [[0, 0, 2, 2, 2]] * 2
     with pytest.raises(ValueError, match="from 0 to the sequence length 6"):
         hd512.segment_starts(torch.tensor([0, 2, 5]), 6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the TileLang kernels need CUDA")
+def test_selective_checkpointing_can_keep_the_forward_op(monkeypatch):
+    """Under a policy that saves ``FORWARD_OP``, the recompute reuses the kernel's outputs: one forward per layer,
+    and the same gradients as plain checkpointing."""
+    from torch.utils.checkpoint import CheckpointPolicy
+    from torch.utils.checkpoint import checkpoint
+    from torch.utils.checkpoint import create_selective_checkpoint_contexts
+
+    query, key, value, grad = _inputs(8, 2, 256, "cuda")
+    weight = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16) * 0.05
+    calls = []
+    kernels = hd512._kernels
+
+    def counting(*args):
+        forward, delta, dkdv, dq = kernels(*args)
+
+        def counted_forward(*tensors):
+            calls.append(1)
+            return forward(*tensors)
+
+        return counted_forward, delta, dkdv, dq
+
+    monkeypatch.setattr(hd512, "_kernels", counting)
+
+    def layer(q, k, v):
+        return hd512.causal_gqa_attention_hd512(q @ weight, k @ weight, v @ weight, 1.0)
+
+    def policy(ctx, op, *args, **kwargs):
+        return CheckpointPolicy.MUST_SAVE if op is hd512.FORWARD_OP else CheckpointPolicy.PREFER_RECOMPUTE
+
+    results = []
+    for context_fn in (None, lambda: create_selective_checkpoint_contexts(policy)):
+        leaves = [tensor.clone().requires_grad_(True) for tensor in (query, key, value)]
+        calls.clear()
+        kwargs = {"context_fn": context_fn} if context_fn is not None else {}
+        output = checkpoint(layer, *leaves, use_reentrant=False, **kwargs)
+        output.backward(grad)
+        results.append((len(calls), output.detach(), [leaf.grad for leaf in leaves]))
+    (plain_calls, plain_out, plain_grads), (kept_calls, kept_out, kept_grads) = results
+    assert (plain_calls, kept_calls) == (2, 1)
+    assert torch.equal(plain_out, kept_out)
+    for plain, kept in zip(plain_grads, kept_grads):
+        assert torch.equal(plain, kept)
