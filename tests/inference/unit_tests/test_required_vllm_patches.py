@@ -3,6 +3,7 @@ from arctic_platform.inference.vllm import config
 from arctic_platform.inference.vllm import deepseek_v41_lora
 from arctic_platform.inference.vllm import dense_prompt_logprobs
 from arctic_platform.inference.vllm import gdn_batch_invariance
+from arctic_platform.inference.vllm import glm5_batch_invariance
 from arctic_platform.inference.vllm import glm5next_lora
 from arctic_platform.inference.vllm import hybrid_state_fixes
 from arctic_platform.inference.vllm import kv_group_size
@@ -77,6 +78,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
     )
 
     monkeypatch.setattr(
+        glm5_batch_invariance,
+        "ensure_glm5_batch_invariance",
+        lambda: calls.append("glm5_batch_invariance"),
+    )
+    monkeypatch.setattr(
         gdn_batch_invariance,
         "ensure_gdn_batch_invariance",
         lambda: calls.append("gdn_batch_invariance"),
@@ -109,6 +115,7 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "mrope_yarn",
         "mamba_completion_refresh",
         "deepseek_v41_lora",
+        "glm5_batch_invariance",
         "gdn_batch_invariance",
         "aligned_prefill_chunks",
         "prefill_chunk_report",
