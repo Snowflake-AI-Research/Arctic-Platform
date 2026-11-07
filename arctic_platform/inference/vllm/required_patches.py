@@ -27,6 +27,7 @@ def apply_required_vllm_patches() -> None:
     from arctic_platform.inference.vllm.glm5next_lora import ensure_glm5next_lora
     from arctic_platform.inference.vllm.hybrid_state_fixes import apply_hybrid_state_fixes
     from arctic_platform.inference.vllm.kv_group_size import ensure_kv_group_size_patch
+    from arctic_platform.inference.vllm.layer_digest import ensure_layer_digest
     from arctic_platform.inference.vllm.mamba_completion_refresh import ensure_mamba_completion_refresh
     from arctic_platform.inference.vllm.mrope_yarn import ensure_mrope_yarn_fix
     from arctic_platform.inference.vllm.router_replay import ensure_router_replay_vllm_patches
@@ -50,3 +51,4 @@ def apply_required_vllm_patches() -> None:
     ensure_gdn_batch_invariance()
     ensure_aligned_prefill_chunks()
     ensure_prefill_chunk_report()
+    ensure_layer_digest()

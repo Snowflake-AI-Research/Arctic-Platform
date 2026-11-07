@@ -7,6 +7,7 @@ from arctic_platform.inference.vllm import glm5_batch_invariance
 from arctic_platform.inference.vllm import glm5next_lora
 from arctic_platform.inference.vllm import hybrid_state_fixes
 from arctic_platform.inference.vllm import kv_group_size
+from arctic_platform.inference.vllm import layer_digest
 from arctic_platform.inference.vllm import mamba_completion_refresh
 from arctic_platform.inference.vllm import mrope_yarn
 from arctic_platform.inference.vllm import prefill_chunk_report
@@ -100,6 +101,8 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         lambda: calls.append("prefill_chunk_report"),
     )
 
+    monkeypatch.setattr(layer_digest, "ensure_layer_digest", lambda: calls.append("layer_digest"))
+
     required_patches.apply_required_vllm_patches()
 
     assert calls == [
@@ -119,4 +122,5 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "gdn_batch_invariance",
         "aligned_prefill_chunks",
         "prefill_chunk_report",
+        "layer_digest",
     ]
