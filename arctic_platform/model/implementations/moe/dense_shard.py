@@ -186,7 +186,7 @@ class _GatherShards(torch.autograd.Function):
     def forward(ctx, sharded: "ShardedModule", *shards: torch.Tensor):
         ctx.sharded = sharded
         ctx.set_materialize_grads(False)  # an unused parameter's gradient stays None, not a full-size zero
-        outputs = []
+        outputs: list[torch.Tensor] = []
         for bucket, shard in zip(sharded.buckets, shards):
             full = torch.empty(bucket.total, dtype=shard.dtype, device=shard.device)
             dist.all_gather_into_tensor(full, shard, group=sharded.group)
@@ -466,7 +466,7 @@ def shard_module(
                 owners.setdefault(id(owner), (owner, tuple(owner._parameters)))
 
     holder = _ShardParams()
-    buckets = []
+    buckets: list[_Bucket] = []
     for (dtype, no_decay), params in by_class.items():
         align = max(1, _ALIGN_BYTES // params[0][0].element_size())
         members = []
