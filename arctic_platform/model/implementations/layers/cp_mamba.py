@@ -152,6 +152,8 @@ def mamba_cp_forward(
     """
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
+    from arctic_platform.model.implementations.gpu.core_replay import keep_core
+
     batch_size, seq_len, _ = hidden_states.shape  # seq_len = S/cp here
 
     # ── 1. in_proj (token-parallel, no communication needed) ──
@@ -240,7 +242,9 @@ def mamba_cp_forward(
         else _seq_idx_from_cu_seqlens(cu_seqlens, full_seq_len, hidden_states_local.device)
     )
 
-    scan_output, _ = mamba_chunk_scan_combined(
+    scan_output, _ = keep_core(
+        getattr(mixer, "_arl_core_replay", None),
+        mamba_chunk_scan_combined,
         hidden_states_local.view(batch_size, full_seq_len, local_num_heads, mixer.head_dim),
         time_step,
         local_A,

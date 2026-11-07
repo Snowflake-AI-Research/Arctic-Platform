@@ -18,6 +18,7 @@ from transformers.utils import auto_docstring, logging
 
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.layers.attn import ATTN_IMPL2CLASS, AttentionConfig
+from arctic_platform.model.implementations.gpu.core_replay import keep_core
 from arctic_platform.model.implementations.layers.cp_mamba import mamba_cp_forward
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
 from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, NemotronHRouter, NonGatedGroupedExperts
@@ -124,7 +125,9 @@ def _patch_mamba2_use_triton_ssd():
                 seq_idx[s:e] = i
         seq_idx = seq_idx.unsqueeze(0)  # (1, L)
 
-        scan_output = _mamba_chunk_scan_combined(
+        scan_output = keep_core(
+            getattr(self, "_arl_core_replay", None),
+            _mamba_chunk_scan_combined,
             hidden_states.view(batch_size, seq_len, -1, self.head_dim),
             time_step,
             A,
@@ -206,6 +209,8 @@ class NemotronHMambaLayer(GradientCheckpointingLayer):
         _ensure_zamba2_compat(config)
         self.norm = RMSNorm(RMSNormConfig(hidden_size=config.hidden_size, eps=config.layer_norm_epsilon))
         self.mamba = _nemotron_h_mamba2_mixer_cls()(config, layer_idx=layer_idx)
+        # The chunked scan is this layer's core kernel for ac_config.core_replay (gpu/core_replay.py).
+        self.mamba._arl_keeps_core = True
         self.mlp = None  # No MoE in this layer type
 
     def set_context_parallel_attributes(self, cp_group: dist.ProcessGroup, cp_rank: int, cp_world_size: int) -> None:

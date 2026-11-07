@@ -102,6 +102,16 @@ class ActivationCheckpointConfig(BaseModel):
             "layer until that layer's backward."
         ),
     )
+    core_replay: bool | Literal["attention"] = Field(
+        False,
+        description=(
+            "On a fully checkpointed block, keep the token mixer's core kernel from the forward for the recompute "
+            "instead of running it again (gpu/core_replay.py): FlashAttention-3's output and log-sum-exp, and the "
+            "linear-attention / state-space scans with their saved tensors. Costs those tensors per checkpointed "
+            "layer until that layer's backward. 'attention' keeps FlashAttention only, for when the scans' saved "
+            "tensors do not fit."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_offload_mode(self) -> Self:
