@@ -2023,6 +2023,13 @@ def maybe_bind_broadcast_loader(verifier, writer):
         verify_sources(verifier.sources)
 
 
+def maybe_run_broadcast_load(loader, model, engine, verifier):
+    """Pass debug evidence only when enabled, preserving ordinary loader arguments."""
+    if verifier is None:
+        return loader(model, engine)
+    return loader(model, engine, verifier=verifier)
+
+
 @contextmanager
 def maybe_observe_broadcast_tensor(verifier, loader, name, value):
     if verifier is None:
@@ -2081,7 +2088,7 @@ def _fp8_staging(verifier, updater):
         staged = [(buffer, (f"{module}.weight", f"{module}.weight_scale")) for module, buffer in updater._bufs.items()]
         staged.extend(
             (entry[part], (entry["destination"],))
-            for entry in updater._dequant.values()
+            for entry in getattr(updater, "_dequant", {}).values()
             for part in ("weight", "scale")
             if part in entry
         )

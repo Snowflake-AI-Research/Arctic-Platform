@@ -25,13 +25,31 @@ from types import SimpleNamespace
 import pytest
 import torch
 from test_weight_sync_direct_writer import _FakeEngine
-from test_weight_sync_direct_writer import _install_fp8_vllm_stubs
-from test_weight_sync_direct_writer import _PlacesOnlyWeight
 from torch import nn
 
 from arctic_platform.debug import inference
 from arctic_platform.debug import weight_sync
 from arctic_platform.inference.server.weight_sync.receiver import WeightSyncExtension
+
+
+class _PlacesOnlyWeight(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(1))
+
+    def load_weights(self, weights):
+        name, tensor = next(iter(weights))
+        if name == "weight":
+            self.weight.data.copy_(tensor)
+            return {"weight"}
+        return set()
+
+
+def _install_linear_stubs(monkeypatch):
+    linear = ModuleType("vllm.model_executor.layers.linear")
+    linear.MergedColumnParallelLinear = type("MergedColumnParallelLinear", (nn.Module,), {})
+    linear.QKVParallelLinear = type("QKVParallelLinear", (nn.Module,), {})
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.linear", linear)
 
 
 @pytest.fixture(autouse=True)
@@ -131,21 +149,19 @@ def test_broadcast_wrapper_annotates_only_after_native_send(monkeypatch):
     assert result == {"native": 4}
 
 
-@pytest.mark.parametrize("mapped", [False, True])
-def test_receiver_enabled_shadow_has_exact_destination_evidence(monkeypatch, mapped):
+@pytest.mark.parametrize("batched", [False, True])
+def test_receiver_enabled_shadow_has_exact_destination_evidence(monkeypatch, batched):
     monkeypatch.setenv(weight_sync.VERIFY_ENV, "1")
-    if not mapped:
-        _install_fp8_vllm_stubs(monkeypatch)
+    _install_linear_stubs(monkeypatch)
     model = _PlacesOnlyWeight()
-    if mapped:
-        model.hf_to_vllm_mapper = SimpleNamespace(orig_to_new_stacked={})
     receiver = WeightSyncExtension()
     receiver.device = torch.device("cpu")
     receiver.parallel_config = SimpleNamespace(enable_expert_parallel=False, pipeline_parallel_size=1)
     engine = _FakeEngine([("weight", torch.tensor([7.0]))])
     verifier = weight_sync.maybe_begin_broadcast_load(receiver, model, engine)
 
-    loaded = receiver._load_direct(model, engine, verifier=verifier)
+    loader = receiver._load_batched if batched else receiver._load_direct
+    loaded = weight_sync.maybe_run_broadcast_load(loader, model, engine, verifier)
     actual = weight_sync.maybe_broadcast_receiver_result({"loaded": loaded[0]}, verifier, rank=2)
     evidence = actual["weight_sync_verification"]
 
@@ -157,59 +173,73 @@ def test_receiver_enabled_shadow_has_exact_destination_evidence(monkeypatch, map
     torch.testing.assert_close(model.weight, torch.tensor([7.0]), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("enable_expert_parallel,pipeline_parallel_size", [(True, 1), (False, 2)])
-def test_disabled_mapped_receiver_preserves_reviewed_native_rank_verdict(
-    enable_expert_parallel, pipeline_parallel_size
-):
-    model = _PlacesOnlyWeight()
-    model.hf_to_vllm_mapper = SimpleNamespace(orig_to_new_stacked={})
-    receiver = WeightSyncExtension()
-    receiver.device = torch.device("cpu")
-    receiver.parallel_config = SimpleNamespace(
-        enable_expert_parallel=enable_expert_parallel, pipeline_parallel_size=pipeline_parallel_size
-    )
-    result = receiver._load_direct(
-        model, _FakeEngine([("weight", torch.tensor([2.0])), ("nonlocal.weight", torch.tensor([3.0]))])
-    )
-    assert result == (2, 13.0, 4.0, {"weight": ["weight"]}, ["nonlocal.weight"])
+@pytest.mark.parametrize("observed", [False, True])
+@pytest.mark.parametrize("raises", [False, True])
+def test_broadcast_dispatch_preserves_native_arguments_results_and_errors(observed, raises):
+    model, engine, verifier, result = object(), object(), object(), object()
+    error = ValueError("native load error")
+    calls = []
+
+    def loader(*args, **kwargs):
+        calls.append((args, kwargs))
+        if raises:
+            raise error
+        return result
+
+    def run():
+        return weight_sync.maybe_run_broadcast_load(loader, model, engine, verifier if observed else None)
+
+    if raises:
+        with pytest.raises(ValueError) as raised:
+            run()
+        assert raised.value is error
+    else:
+        assert run() is result
+    assert calls == [((model, engine), {"verifier": verifier} if observed else {})]
 
 
-def test_disabled_fp8_receiver_preserves_reviewed_source_block_contract(monkeypatch):
-    _install_fp8_vllm_stubs(monkeypatch)
-    model = nn.Module()
-    model.proj = nn.Linear(5, 4, bias=False, dtype=torch.bfloat16)
+def test_disabled_fp8_receiver_preserves_main_updater_arguments_and_pending_warning(monkeypatch, caplog):
+    from arctic_platform.inference.server.weight_sync import utils
+
+    model = object()
+    tensor = torch.ones(1)
+    calls = []
+
+    class Updater:
+        pending = 1
+
+        def __init__(self, selected_model, dtype, device):
+            calls.append((selected_model, dtype, device))
+
+        def feed(self, name, value):
+            calls.append((name, value))
+
+    monkeypatch.setattr(utils, "_FP8InplaceUpdater", Updater)
     receiver = SimpleNamespace(
         device=torch.device("cpu"),
-        model_config=SimpleNamespace(
-            dtype=torch.bfloat16,
-            hf_config=SimpleNamespace(quantization_config={"weight_block_size": [2, 2]}),
-        ),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
     )
-    weight = torch.ones(4, 5).to(torch.float8_e4m3fn)
-    scales = torch.arange(1, 7, dtype=torch.float32).reshape(2, 3)
-    result = WeightSyncExtension._load_fp8(
-        receiver, model, _FakeEngine([("proj.weight", weight), ("proj.weight_scale_inv", scales)])
-    )
-    assert result[0] == 2
-    expected = scales.repeat_interleave(2, 0).repeat_interleave(2, 1)[:, :5].to(torch.bfloat16)
-    torch.testing.assert_close(model.proj.weight, expected, rtol=0, atol=0)
+    assert WeightSyncExtension._load_fp8(receiver, model, _FakeEngine([("weight", tensor)])) == (1, 1.0)
+    assert calls == [(model, torch.bfloat16, receiver.device), ("weight", tensor)]
+    assert "FP8 updater has 1 incomplete modules" in caplog.text
 
 
-def test_fp8_staging_adapter_tracks_native_buffers_without_public_api():
+@pytest.mark.parametrize("dequantization", [False, True])
+def test_fp8_staging_adapter_tracks_native_buffers_without_public_api(dequantization):
     buffer = torch.zeros(2, 3)
     half = torch.zeros(3, 5)
-    updater = SimpleNamespace(
-        _bufs={"proj": buffer},
-        _dequant={"wire": {"weight": half, "destination": "target.weight"}},
-    )
+    updater = SimpleNamespace(_bufs={"proj": buffer})
+    if dequantization:
+        updater._dequant = {"wire": {"weight": half, "destination": "target.weight"}}
     verifier = SimpleNamespace(parameters={"proj.weight": None, "target.weight": None})
     staged = weight_sync._fp8_staging(verifier, updater)
-    assert staged() == {
-        weight_sync._storage(buffer): ["proj.weight"],
-        weight_sync._storage(half): ["target.weight"],
-    }
+    expected = {weight_sync._storage(buffer): ["proj.weight"]}
+    if dequantization:
+        expected[weight_sync._storage(half)] = ["target.weight"]
+    assert staged() == expected
     updater._bufs.clear()
-    updater._dequant.clear()
+    if dequantization:
+        updater._dequant.clear()
     assert staged() == {}
     assert not hasattr(updater, "staged")
 

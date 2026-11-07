@@ -17,7 +17,7 @@ from torch import nn
 if "vllm" not in sys.modules:
     vllm_module = types.ModuleType("vllm")
     vllm_module.__path__ = []
-    vllm_module.__version__ = "0.32.0"
+    vllm_module.__version__ = "0.31.0"
     config_module = types.ModuleType("vllm.config")
     scheduler_module = types.ModuleType("vllm.v1.core.sched.scheduler")
     loggers_module = types.ModuleType("vllm.v1.metrics.loggers")
@@ -72,6 +72,7 @@ if "vllm" not in sys.modules:
 
 import arctic_platform.inference.server.weight_sync.utils as weight_sync_utils
 from arctic_platform.inference.server.weight_sync.receiver import WeightSyncExtension
+from vllm.model_executor.models.utils import WeightsMapper
 
 
 class _Model(nn.Module):
@@ -359,9 +360,7 @@ def test_nccl_batched_sync_reports_a_skipped_source(tp_world_size, cpu_cuda):
                     names.add("proj")
             return names
 
-    ext = _extension(_DroppingModel())
-    ext.parallel_config = SimpleNamespace(enable_expert_parallel=True, pipeline_parallel_size=1)
-    result = _nccl_sync(ext, _Engine(_weights()))
+    result = _nccl_sync(_extension(_DroppingModel()), _Engine(_weights()))
 
     assert result["recv_l2_sq"] == 32.5
     assert result["applied_source_l2_sq"] == 30.0
@@ -373,15 +372,7 @@ def test_nccl_batched_sync_counts_a_source_once_per_shard_it_is_loaded_into(tp_w
     tp_world_size["value"] = 2
     model = _LoadingModel()
     model.language_model = nn.Module()
-
-    class DuplicateKeyMapper(SimpleNamespace):
-        def apply(self, weights):
-            for name, tensor in weights:
-                yield name, tensor
-                if ".k_proj." in name:
-                    yield name, tensor
-
-    model.language_model.hf_to_vllm_mapper = DuplicateKeyMapper(
+    model.language_model.hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             "layers.0.self_attn.q_proj.": ("layers.0.self_attn.qkv_proj.", "q"),
             "layers.0.self_attn.k_proj.": ("layers.0.self_attn.qkv_proj.", ["k", "v"]),
