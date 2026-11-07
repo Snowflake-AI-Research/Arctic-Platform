@@ -68,6 +68,12 @@ from .groups import split_microbatches
 from .groups import token_budget_groups
 from .groups import token_budget_microbatch_groups
 from .groups import token_validity_mask
+from .mrope import IMAGE_TOKEN_TYPE
+from .mrope import MROPE_CHANNELS
+from .mrope import TEXT_TOKEN_TYPE
+from .mrope import VIDEO_TOKEN_TYPE
+from .mrope import mrope_position_ids
+from .mrope import vision_position_ids
 from .pack import IGNORE_INDEX
 from .pack import ROW_BROADCAST_KEYS
 from .pack import PackMetadata
@@ -88,6 +94,8 @@ __all__ = [
     "DROP",
     "cu_seqlens_from_position_ids",
     "IGNORE_INDEX",
+    "IMAGE_TOKEN_TYPE",
+    "MROPE_CHANNELS",
     "MicrobatchSplit",
     "PackMetadata",
     "ROW_BROADCAST_KEYS",
@@ -98,6 +106,7 @@ __all__ = [
     "batch_tensor",
     "costliest_first",
     "map_batch_values",
+    "mrope_position_ids",
     "pack_microbatch",
     "packed_token_index",
     "pad_packed_microbatch",
@@ -107,12 +116,15 @@ __all__ = [
     "sequence_pad_value",
     "singleton_microbatch_groups",
     "split_microbatches",
+    "TEXT_TOKEN_TYPE",
     "token_budget_groups",
     "token_budget_microbatch_groups",
     "token_shard",
     "token_validity_mask",
     "token_window",
     "unpack_output",
+    "VIDEO_TOKEN_TYPE",
+    "vision_position_ids",
     "window_cu_seqlens",
     "window_row_pieces",
 ]
