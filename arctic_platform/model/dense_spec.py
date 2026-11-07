@@ -23,6 +23,20 @@ from arctic_platform.model.config import Patches
 _LOADER_OPTION_KEYS_IN_TRAINING = ("fp32_parity", "fp32_residual")
 
 
+def _gradient_checkpointing(training_options: dict):
+    """``activation_checkpointing``, or with it on, the explicit layer list ``ac_config.layers`` when one is given."""
+    value = training_options.get("activation_checkpointing", False)
+    layers = (training_options.get("ac_config") or {}).get("layers")
+    if layers is None:
+        return value
+    if value is not True:
+        raise ValueError(
+            "ac_config.layers on the dense route lists the checkpointed layers; set activation_checkpointing to true "
+            f"with it, got {value!r}"
+        )
+    return list(layers)
+
+
 def dense_model_spec(
     *,
     model_path: str,
@@ -75,7 +89,7 @@ def dense_model_spec(
         patches=Patches(
             liger=liger,
             fused_qk_norm_rope=training_options.get("fused_qk_norm_rope", False),
-            gradient_checkpointing=training_options.get("activation_checkpointing", False),
+            gradient_checkpointing=_gradient_checkpointing(training_options),
             checkpoint_keep_attention=training_options.get("checkpoint_keep_attention", False),
             activation_offload=activation_offload,
             compile=training_options.get("compile"),
