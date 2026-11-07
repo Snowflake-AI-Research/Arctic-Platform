@@ -370,6 +370,14 @@ def client_job(profile, name: str) -> dict:
         if device != "none":
             raise LookupError(f"the launch config offloads the optimizer to {device}")
         return {"body": body, "lr": lr, "forwards": "step"}
+    if name == "fp32-masters-sync":
+        masters = {"bf16": {"bf16_master_weights_and_grads": False, "bf16_optimizer_states": False}}
+        body = profile.job_body(training={"training_config": {"ds_config": masters}}, sampling={})
+        # Per-parameter norm debugging allocates on its own; the launch does not run it.
+        for sub in body["sub_job_configs"]:
+            sub.get("training_config", {}).pop("debug", None)
+        lr = profile.optimizer()["lr"]
+        return {"body": body, "lr": lr, "sync_format": profile.sync_formats, "forwards": "sync"}
     if name.startswith("layout-"):
         layout = next(lay for lay in profile.layouts if lay["id"] == name[len("layout-") :])
         overrides = {"training_config": layout["training_config"]}
@@ -405,6 +413,8 @@ def _wanted_jobs(profile, items, ckpt: Path) -> list[str]:
             names.append("launch-lr")
         if "noop_offload_step" in fixtures:
             names.append("noop-offload")
+        if "fp32_masters_sync" in fixtures:
+            names.append("fp32-masters-sync")
         if "parallel_step" in fixtures and any(lay["id"] == params.get("layout") for lay in profile.layouts):
             names.append(f"layout-{params['layout']}")
         if "tp" in params and params["tp"] < launch_tp(profile):
@@ -515,6 +525,11 @@ def forced_clip_step(client):
 @pytest.fixture(scope="session")
 def noop_offload_step(client):
     return client.get("noop-offload")
+
+
+@pytest.fixture(scope="session")
+def fp32_masters_sync(client):
+    return client.get("fp32-masters-sync")
 
 
 @pytest.fixture(scope="session")

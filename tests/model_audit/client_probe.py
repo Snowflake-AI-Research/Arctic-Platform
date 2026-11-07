@@ -55,6 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import audit_lib  # noqa: E402
 
 _WEIGHT_SUFFIXES = (".safetensors", ".json")
+_JOB_START_TIMEOUT = int(os.environ.get("AP_AUDIT_JOB_START_TIMEOUT", 7200))
 
 
 def connect():
@@ -121,7 +122,16 @@ class Job:
         self.log = log
         self.id = client.create_job_from_body(body)["job_id"]
         log(f"created job {self.id}")
-        self.info = client.wait_for_job(self.id)
+        # A large job can queue for longer than a request may take; a job that never starts is cancelled, not leaked.
+        request_timeout, client.poll_timeout = client.poll_timeout, float(_JOB_START_TIMEOUT)
+        try:
+            self.info = client.wait_for_job(self.id)
+        except BaseException:
+            self.cancel()
+            log(f"cancelled job {self.id}")
+            raise
+        finally:
+            client.poll_timeout = request_timeout
         log(f"job {self.id} is {self.info.get('status')}")
         self.subs = {sj["job_type"].lower(): sj for sj in self.info.get("sub_jobs", [])}
 
@@ -249,6 +259,21 @@ def run(profile, ckpt: str, body: dict, lr: float, sync_formats: list[str], forw
             except Exception as err:  # noqa: BLE001
                 result["step"] = {"lr": lr, "error": f"{type(err).__name__}: {str(err).strip()[-2000:]}"}
             return result
+        if "training" in job.subs and forwards == "sync":
+            # Short rows give one-token sequence-parallel shards, a separate crash (trainer.one_token_per_rank).
+            job.forward_backward([max(rows, key=len)] * dp)
+            result["step"] = {"lr": lr, "reply": job.step(lr)}
+            result["sync"] = {}
+            for fmt in sync_formats:
+                try:
+                    job.weight_sync(fmt)
+                    scored = [job.generate([row])[0] for row in rows]
+                    finite = all(bool(torch.isfinite(lp[:-1]).all()) for lp in scored)
+                    result["sync"][fmt] = "ok" if finite else "non-finite log-probs after the sync"
+                except Exception as err:  # noqa: BLE001
+                    result["sync"][fmt] = f"{type(err).__name__}: {str(err).strip()[-2000:]}"
+                log(f"sync {fmt}: {result['sync'][fmt][:200]}")
+            return result
         if "training" in job.subs:
             fwd = {
                 "labels": audit_lib.pack_rows(rows, pad)[2],
@@ -317,7 +342,10 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=None, help="step learning rate; defaults to the audit lr")
     parser.add_argument("--sync-format", action="append", default=[], help="weight-sync format, repeatable")
     parser.add_argument(
-        "--forwards", choices=("all", "batch", "step"), default="all", help="step: one step, no exports"
+        "--forwards",
+        choices=("all", "batch", "step", "sync"),
+        default="all",
+        help="step: one step, no exports; sync: one step, then a weight sync in every format, no exports",
     )
     parser.add_argument("--out", required=True)
     args = parser.parse_args()

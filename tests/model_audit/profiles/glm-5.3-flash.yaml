@@ -26,6 +26,12 @@ known_issues:
     summary: >-
       a packed sample of 2-3 tokens (under one index_kpool) asks FlashInfer top-k for k=0 and crashes the fused
       indexer
+  sampler.weight_sync_with_fp32_masters:
+    issue: DSS ray_dss/jobs/gpu/training.py _measured_iter
+    summary: >-
+      with FP32 masters the step runs, but the vLLM weight sync's diagnostic norm (tensor.float().pow(2).sum() on
+      each full tensor in broadcast_send_weights) asks for 18 GiB with 3.3 GiB free and OOMs; the HF sync then hits
+      the aborted NCCL communicator
   sampler.tensor_parallel_matches_reference[tp1]:
     issue: upstream (vLLM)
     summary: >-

@@ -50,6 +50,10 @@ TP = audit_lib.register_check(
     "sampler.tensor_parallel_matches_reference",
     "sampler log-probs at TP degrees below launch match the fp32 reference",
 )
+FP32_MASTERS_SYNC = audit_lib.register_check(
+    "sampler.weight_sync_with_fp32_masters",
+    "with FP32 master weights (bf16_master_weights_and_grads off) a step and a weight sync in every format succeed",
+)
 
 
 def _packed(rows, per_row) -> torch.Tensor:
@@ -156,6 +160,17 @@ def test_weight_sync_matches_reference(profile, probes, sampler_run, sync_format
     record(before_sync_buckets=unsynced)
     assert moved, "the synced weights score like the sampler's previous ones, so a sync that does nothing would pass"
     _against(profile, synced, sampler[f"after_sync_{sync_format}"], synced["fp32_logprobs"], record, "synced_vs_fp32")
+
+
+@pytest.mark.audit_check(FP32_MASTERS_SYNC)
+def test_weight_sync_with_fp32_masters(profile, fp32_masters_sync, record):
+    run = require_ok(fp32_masters_sync, "training + sampling job with FP32 masters")
+    record(job=run["job"], step=run["step"], sync=run["sync"])
+    failed = {fmt: status for fmt, status in run["sync"].items() if status != "ok"}
+    assert run["sync"], "no weight-sync format to try"
+    assert not failed, "weight sync with FP32 masters fails: " + "; ".join(
+        f"{fmt}: {status.strip().splitlines()[-1][:300]}" for fmt, status in failed.items()
+    )
 
 
 @pytest.mark.audit_check(TP)
