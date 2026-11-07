@@ -20,7 +20,9 @@ token as its own one-token sequence over its top-k cached tokens, the same call 
 batch-dependent choice is FA3's split-KV heuristic, which ``num_splits=1`` turns off, as vLLM's dense FlashAttention
 backend does in this mode. The KDA layers use the GatedDeltaNet backend (allowed by
 :mod:`arctic_platform.inference.vllm.gdn_batch_invariance`) and their own autotuned Triton kernels, pinned here to
-one config. With ``ARCTIC_GLM5_BATCH_INVARIANT=1`` both are applied; the GDN patch is applied too.
+one config. The sparse indexer's backends (its fp8 key cache and kpool tail) are allowed as well: their kernels have
+no autotuning, and whether their top-k selection is batch-invariant is measured, not assumed. With
+``ARCTIC_GLM5_BATCH_INVARIANT=1`` all of this is applied; the GDN patch is applied too.
 """
 
 from __future__ import annotations
@@ -80,8 +82,14 @@ def ensure_glm5_batch_invariance() -> None:
     ensure_gdn_batch_invariance()
 
     from vllm.v1.attention.backends.mla import flashattn_mla_sparse
+    from vllm.v1.attention.backends.mla import indexer
 
-    flashattn_mla_sparse.FlashAttnMLASparseBackend.supports_batch_invariance = classmethod(lambda cls: True)
+    for backend in (
+        flashattn_mla_sparse.FlashAttnMLASparseBackend,
+        indexer.Glm5NextIndexerBackend,
+        indexer.KpoolTailBackend,
+    ):
+        backend.supports_batch_invariance = classmethod(lambda cls: True)
     flashattn_mla_sparse.flash_attn_varlen_func = _single_split(flashattn_mla_sparse.flash_attn_varlen_func)
     pin_kda_kernels()
     _APPLIED = True
