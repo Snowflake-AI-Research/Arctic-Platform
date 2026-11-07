@@ -136,6 +136,8 @@ CHAT_MODELS = MappingProxyType(
         "AfmoeForCausalLM": ChatModel(None, "hermes", thinking_optional=True),
         # Nemotron 3 Nano and Super.
         "NemotronHForCausalLM": ChatModel("nemotron_v3", "qwen3_coder", thinking_optional=True),
+        "InklingForCausalLM": ChatModel("inkling", "inkling", thinking_optional=True),
+        "InklingForConditionalGeneration": ChatModel("inkling", "inkling", thinking_optional=True),
     }
 )
 
@@ -431,6 +433,22 @@ class RenderedChat:
     starts_in_reasoning: bool = False
 
 
+@functools.cache
+def inkling_chat_parser():
+    from vllm.parser.inkling import InklingParser
+
+    class InklingChatParser(InklingParser):
+        def __init__(self, tokenizer, tools=None, **kwargs):
+            super().__init__(tokenizer, tools, **kwargs)
+            self.skip_tool_parsing = not bool(tools)
+
+        @property
+        def reasoning_parser(self):
+            return self
+
+    return InklingChatParser
+
+
 class ChatEngine:
     """vLLM's chat front end bound to one worker's engine."""
 
@@ -453,6 +471,9 @@ class ChatEngine:
         self.tokenizer = llm.renderer.get_tokenizer()
         # The renderer's own unified Parser class, so rendering and parsing agree.
         self.parser_cls = self.online.parser
+        # Inkling's block closers still need parsing after the first content block.
+        if chat_model.reasoning_parser == "inkling" and chat_model.tool_call_parser in (None, "inkling"):
+            self.parser_cls = inkling_chat_parser()
         # Set by probe().
         self.guard = None
         self._probe_task = None
