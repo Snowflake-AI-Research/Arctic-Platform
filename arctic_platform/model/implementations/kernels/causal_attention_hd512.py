@@ -1,0 +1,328 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Causal grouped-query attention for head size 512 (Gemma 4 full-attention layers), forward and backward, in TileLang.
+
+FlashAttention 3 and the fused torch SDPA backends stop at head size 256, and cuDNN runs 512 only forward. Compiled flex
+attention covers it at 37-150 TF/s forward and 44-59 TF/s backward on an H200. These kernels follow FlashMLA's layout for
+a 512-wide head: two warpgroups split the 64 x N score tile and the 64 x 512 output tile along N, so the fp32 output
+accumulator is 128 registers per thread.
+
+* forward: one CTA per (64-query block, query head); the score tile goes through shared memory into the P @ V GEMM.
+* backward: Delta = rowsum(O * dO); then dK / dV per 32-row KV block, accumulated transposed ([512, 32], so the head
+  axis is the GEMM's M) over every later query block of every query head in the group, so no atomics; and dQ per
+  64-query block. Seven score-sized GEMMs instead of five; the 512 x 32 / 64 x 512 accumulators fit in registers.
+
+Layouts: ``query`` [B, H, S, D], ``key`` / ``value`` [B, HK, S, D] (what Ulysses hands its core attention), output
+[B, S, H, D] (what HF's attention interface returns). The log-sum-exp is kept in log2 units.
+"""
+
+# No ``from __future__ import annotations``: TileLang reads the prim_funcs' tensor annotations, which name closure
+# variables (heads, kv_heads, ...); as strings they would not be captured.
+
+# TileLang's libcudart stub needs the real runtime loaded globally first (see kernels/deepseek_v4/dsv4_sparse_attn.py).
+import ctypes as _ctypes
+
+try:
+    _ctypes.CDLL("libcudart.so", mode=_ctypes.RTLD_GLOBAL)
+except OSError:  # CPU-only machines
+    pass
+
+import functools
+
+import torch
+
+HEAD_DIM = 512
+SEQ_TILE = 64
+_LOG2E = 1.44269504
+
+
+def unsupported_reason(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> str | None:
+    """Why these inputs cannot take the kernels, or ``None`` when they can."""
+    if not query.is_cuda:
+        return "the kernels need CUDA tensors"
+    if any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
+        return "the kernels take bfloat16 only"
+    if query.ndim != 4 or key.shape != value.shape or key.ndim != 4:
+        return f"expected [B, H, S, D] query and matching key / value, got {tuple(query.shape)} {tuple(key.shape)}"
+    batch, heads, seq_len, dim = query.shape
+    if dim != HEAD_DIM or key.shape[-1] != HEAD_DIM:
+        return f"the kernels are built for head size {HEAD_DIM}, got {dim}"
+    if key.shape[0] != batch or key.shape[2] != seq_len:
+        return f"query {tuple(query.shape)} and key {tuple(key.shape)} differ in batch or sequence"
+    if heads % key.shape[1]:
+        return f"{heads} query heads do not group over {key.shape[1]} KV heads"
+    if seq_len % SEQ_TILE:
+        return f"sequence length {seq_len} is not a multiple of the {SEQ_TILE}-token tile"
+    return None
+
+
+@functools.cache
+def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale: float):
+    """The four kernels for one shape, compiled on first use (about a minute; cached on disk by TileLang after that).
+
+    The sequence length is static: with ``T.dynamic`` the backward ran 2.3x slower at 64K (2,932 ms against 1,250 ms).
+    """
+    import tilelang
+    import tilelang.language as T
+
+    pass_configs = {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True}
+    dim = HEAD_DIM
+    groups = heads // kv_heads
+    scale = float(softmax_scale * _LOG2E)
+    sm_scale = float(softmax_scale)
+    dtype = T.bfloat16
+    accum = T.float32
+    threads = 256
+
+    @tilelang.jit(out_idx=[3, 4], pass_configs=pass_configs)
+    def forward(block_M=64, block_N=64):
+        @T.prim_func
+        def main(
+            Q: T.Tensor([batch, heads, seq_len, dim], dtype),
+            K: T.Tensor([batch, kv_heads, seq_len, dim], dtype),
+            V: T.Tensor([batch, kv_heads, seq_len, dim], dtype),
+            Output: T.Tensor([batch, seq_len, heads, dim], dtype),
+            Lse: T.Tensor([batch, heads, seq_len], accum),
+        ):
+            with T.Kernel(T.ceildiv(seq_len, block_M), heads, batch, threads=threads) as (bx, by, bz):
+                Q_shared = T.alloc_shared([block_M, dim], dtype)
+                K_shared = T.alloc_shared([block_N, dim], dtype)
+                V_shared = T.alloc_shared([block_N, dim], dtype)
+                S_shared = T.alloc_shared([block_M, block_N], dtype)
+                acc_s = T.alloc_fragment([block_M, block_N], accum)
+                acc_o = T.alloc_fragment([block_M, dim], accum)
+                scores_max = T.alloc_fragment([block_M], accum)
+                scores_max_prev = T.alloc_fragment([block_M], accum)
+                scores_scale = T.alloc_fragment([block_M], accum)
+                scores_sum = T.alloc_fragment([block_M], accum)
+                logsum = T.alloc_fragment([block_M], accum)
+
+                qb = T.ceildiv(seq_len, block_M) - 1 - bx  # the longest (latest) query blocks first
+                kvh = by // groups
+                T.copy(Q[bz, by, qb * block_M : (qb + 1) * block_M, :], Q_shared)
+                T.fill(acc_o, 0)
+                T.fill(logsum, 0)
+                T.fill(scores_max, -T.infinity(accum))
+                for k in T.Pipelined(T.ceildiv((qb + 1) * block_M, block_N), num_stages=1):
+                    T.copy(K[bz, kvh, k * block_N : (k + 1) * block_N, :], K_shared)
+                    for i, j in T.Parallel(block_M, block_N):
+                        acc_s[i, j] = T.if_then_else(qb * block_M + i >= k * block_N + j, 0, -T.infinity(accum))
+                    T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+                    T.copy(V[bz, kvh, k * block_N : (k + 1) * block_N, :], V_shared)
+                    T.copy(scores_max, scores_max_prev)
+                    T.fill(scores_max, -T.infinity(accum))
+                    T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+                    for i in T.Parallel(block_M):
+                        scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+                    for i in T.Parallel(block_M):
+                        scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+                    for i, j in T.Parallel(block_M, block_N):
+                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+                    T.reduce_sum(acc_s, scores_sum, dim=1)
+                    for i in T.Parallel(block_M):
+                        logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+                    T.copy(acc_s, S_shared)
+                    for i, j in T.Parallel(block_M, dim):
+                        acc_o[i, j] *= scores_scale[i]
+                    T.gemm(S_shared, V_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
+                for i, j in T.Parallel(block_M, dim):
+                    acc_o[i, j] /= logsum[i]
+                T.copy(acc_o, Output[bz, qb * block_M : (qb + 1) * block_M, by, :])
+                for i in T.Parallel(block_M):
+                    logsum[i] = T.log2(logsum[i]) + scores_max[i] * scale
+                T.copy(logsum, Lse[bz, by, qb * block_M : (qb + 1) * block_M])
+
+        return main
+
+    @tilelang.jit(out_idx=[2], pass_configs=pass_configs)
+    def delta(blk=32):
+        @T.prim_func
+        def main(
+            O: T.Tensor([batch, seq_len, heads, dim], dtype),
+            dO: T.Tensor([batch, seq_len, heads, dim], dtype),
+            Delta: T.Tensor([batch, heads, seq_len], accum),
+        ):
+            with T.Kernel(heads, T.ceildiv(seq_len, blk), batch) as (bx, by, bz):
+                o = T.alloc_fragment([blk, blk], dtype)
+                do = T.alloc_fragment([blk, blk], dtype)
+                acc = T.alloc_fragment([blk, blk], accum)
+                row = T.alloc_fragment([blk], accum)
+                T.clear(acc)
+                for k in range(T.ceildiv(dim, blk)):
+                    T.copy(O[bz, by * blk : (by + 1) * blk, bx, k * blk : (k + 1) * blk], o)
+                    T.copy(dO[bz, by * blk : (by + 1) * blk, bx, k * blk : (k + 1) * blk], do)
+                    for i, j in T.Parallel(blk, blk):
+                        acc[i, j] += o[i, j] * do[i, j]
+                T.reduce_sum(acc, row, 1)
+                T.copy(row, Delta[bz, bx, by * blk : (by + 1) * blk])
+
+        return main
+
+    @tilelang.jit(out_idx=[6, 7], pass_configs=pass_configs)
+    def dkdv(block_M=64, block_N=32):
+        @T.prim_func
+        def main(
+            Q: T.Tensor([batch, heads, seq_len, dim], dtype),
+            K: T.Tensor([batch, kv_heads, seq_len, dim], dtype),
+            V: T.Tensor([batch, kv_heads, seq_len, dim], dtype),
+            dO: T.Tensor([batch, seq_len, heads, dim], dtype),
+            Lse: T.Tensor([batch, heads, seq_len], accum),
+            Delta: T.Tensor([batch, heads, seq_len], accum),
+            dK: T.Tensor([batch, kv_heads, seq_len, dim], dtype),
+            dV: T.Tensor([batch, kv_heads, seq_len, dim], dtype),
+        ):
+            with T.Kernel(T.ceildiv(seq_len, block_N), kv_heads, batch, threads=threads) as (bx, by, bz):
+                K_shared = T.alloc_shared([block_N, dim], dtype)
+                V_shared = T.alloc_shared([block_N, dim], dtype)
+                q_shared = T.alloc_shared([block_M, dim], dtype)
+                do_shared = T.alloc_shared([block_M, dim], dtype)
+                p_shared = T.alloc_shared([block_M, block_N], dtype)
+                ds_shared = T.alloc_shared([block_M, block_N], dtype)
+                lse_shared = T.alloc_shared([block_M], accum)
+                delta_shared = T.alloc_shared([block_M], accum)
+                s = T.alloc_fragment([block_M, block_N], accum)
+                dp = T.alloc_fragment([block_M, block_N], accum)
+                dvT = T.alloc_fragment([dim, block_N], accum)
+                dkT = T.alloc_fragment([dim, block_N], accum)
+                dvT_shared = T.alloc_shared([dim, block_N], dtype)
+                dkT_shared = T.alloc_shared([dim, block_N], dtype)
+
+                kb = bx  # early KV blocks meet the most query blocks: launch them first
+                T.copy(K[bz, by, kb * block_N : (kb + 1) * block_N, :], K_shared)
+                T.copy(V[bz, by, kb * block_N : (kb + 1) * block_N, :], V_shared)
+                T.clear(dvT)
+                T.clear(dkT)
+                loop_st = T.floordiv(kb * block_N, block_M)
+                n_q = T.ceildiv(seq_len, block_M) - loop_st
+                for it in T.Pipelined(groups * n_q, num_stages=0):
+                    h = by * groups + it // n_q
+                    qb = loop_st + it % n_q
+                    T.copy(Q[bz, h, qb * block_M : (qb + 1) * block_M, :], q_shared)
+                    T.clear(s)
+                    T.gemm(q_shared, K_shared, s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+                    T.copy(Lse[bz, h, qb * block_M : (qb + 1) * block_M], lse_shared)
+                    for i, j in T.Parallel(block_M, block_N):
+                        s[i, j] = T.if_then_else(
+                            qb * block_M + i >= kb * block_N + j, T.exp2(s[i, j] * scale - lse_shared[i]), 0
+                        )
+                    T.copy(dO[bz, qb * block_M : (qb + 1) * block_M, h, :], do_shared)
+                    T.clear(dp)
+                    T.gemm(do_shared, V_shared, dp, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+                    T.copy(s, p_shared)
+                    # TileLang 0.1.12 computes a transpose_A GEMM wrong under FullRow with two warpgroups; Square is right.
+                    T.gemm(do_shared, p_shared, dvT, transpose_A=True, policy=T.GemmWarpPolicy.Square)
+                    T.copy(Delta[bz, h, qb * block_M : (qb + 1) * block_M], delta_shared)
+                    for i, j in T.Parallel(block_M, block_N):
+                        dp[i, j] = s[i, j] * (dp[i, j] - delta_shared[i]) * sm_scale
+                    T.copy(dp, ds_shared)
+                    T.gemm(q_shared, ds_shared, dkT, transpose_A=True, policy=T.GemmWarpPolicy.Square)
+                T.copy(dvT, dvT_shared)
+                T.copy(dkT, dkT_shared)
+                for i, j in T.Parallel(block_N, dim):
+                    dV[bz, by, kb * block_N + i, j] = dvT_shared[j, i]
+                for i, j in T.Parallel(block_N, dim):
+                    dK[bz, by, kb * block_N + i, j] = dkT_shared[j, i]
+
+        return main
+
+    @tilelang.jit(out_idx=[6], pass_configs=pass_configs)
+    def dq(block_M=64, block_N=32):
+        @T.prim_func
+        def main(
+            Q: T.Tensor([batch, heads, seq_len, dim], dtype),
+            K: T.Tensor([batch, kv_heads, seq_len, dim], dtype),
+            V: T.Tensor([batch, kv_heads, seq_len, dim], dtype),
+            dO: T.Tensor([batch, seq_len, heads, dim], dtype),
+            Lse: T.Tensor([batch, heads, seq_len], accum),
+            Delta: T.Tensor([batch, heads, seq_len], accum),
+            dQ: T.Tensor([batch, heads, seq_len, dim], dtype),
+        ):
+            with T.Kernel(T.ceildiv(seq_len, block_M), heads, batch, threads=threads) as (bx, by, bz):
+                q_shared = T.alloc_shared([block_M, dim], dtype)
+                do_shared = T.alloc_shared([block_M, dim], dtype)
+                K_shared = T.alloc_shared([block_N, dim], dtype)
+                V_shared = T.alloc_shared([block_N, dim], dtype)
+                ds_shared = T.alloc_shared([block_M, block_N], dtype)
+                lse_shared = T.alloc_shared([block_M], accum)
+                delta_shared = T.alloc_shared([block_M], accum)
+                s = T.alloc_fragment([block_M, block_N], accum)
+                dp = T.alloc_fragment([block_M, block_N], accum)
+                acc_dq = T.alloc_fragment([block_M, dim], accum)
+
+                qb = T.ceildiv(seq_len, block_M) - 1 - bx
+                kvh = by // groups
+                T.copy(Q[bz, by, qb * block_M : (qb + 1) * block_M, :], q_shared)
+                T.copy(dO[bz, qb * block_M : (qb + 1) * block_M, by, :], do_shared)
+                T.copy(Lse[bz, by, qb * block_M : (qb + 1) * block_M], lse_shared)
+                T.copy(Delta[bz, by, qb * block_M : (qb + 1) * block_M], delta_shared)
+                T.clear(acc_dq)
+                for k in T.Pipelined(T.ceildiv((qb + 1) * block_M, block_N), num_stages=0):
+                    T.copy(K[bz, kvh, k * block_N : (k + 1) * block_N, :], K_shared)
+                    T.clear(s)
+                    T.gemm(q_shared, K_shared, s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+                    T.copy(V[bz, kvh, k * block_N : (k + 1) * block_N, :], V_shared)
+                    T.clear(dp)
+                    T.gemm(do_shared, V_shared, dp, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+                    for i, j in T.Parallel(block_M, block_N):
+                        s[i, j] = T.if_then_else(
+                            qb * block_M + i >= k * block_N + j, T.exp2(s[i, j] * scale - lse_shared[i]), 0
+                        )
+                    for i, j in T.Parallel(block_M, block_N):
+                        dp[i, j] = s[i, j] * (dp[i, j] - delta_shared[i]) * sm_scale
+                    T.copy(dp, ds_shared)
+                    T.gemm(ds_shared, K_shared, acc_dq, policy=T.GemmWarpPolicy.FullCol)
+                T.copy(acc_dq, dQ[bz, by, qb * block_M : (qb + 1) * block_M, :])
+
+        return main
+
+    return forward(), delta(), dkdv(), dq()
+
+
+def _shape(query: torch.Tensor, key: torch.Tensor) -> tuple[int, int, int, int]:
+    return int(query.shape[0]), int(query.shape[1]), int(key.shape[1]), int(query.shape[2])
+
+
+class _CausalAttentionHD512(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query, key, value, softmax_scale):
+        query, key, value = (tensor.contiguous() for tensor in (query, key, value))
+        forward, _, _, _ = _kernels(*_shape(query, key), float(softmax_scale))
+        output, lse = forward(query, key, value)
+        ctx.save_for_backward(query, key, value, output, lse)
+        ctx.softmax_scale = float(softmax_scale)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        query, key, value, output, lse = ctx.saved_tensors
+        _, delta, dkdv, dq = _kernels(*_shape(query, key), ctx.softmax_scale)
+        grad_output = grad_output.contiguous()
+        row_delta = delta(output, grad_output)
+        grad_key, grad_value = dkdv(query, key, value, grad_output, lse, row_delta)
+        grad_query = dq(query, key, value, grad_output, lse, row_delta)
+        return grad_query, grad_key, grad_value, None
+
+
+def causal_gqa_attention_hd512(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, softmax_scale: float
+) -> torch.Tensor:
+    """``softmax(scale * Q K^T + causal) V`` for [B, H, S, 512] ``query`` over [B, HK, S, 512] ``key`` / ``value``.
+
+    Returns [B, S, H, 512]. Raises ``ValueError`` for inputs ``unsupported_reason`` rejects.
+    """
+    reason = unsupported_reason(query, key, value)
+    if reason is not None:
+        raise ValueError(reason)
+    return _CausalAttentionHD512.apply(query, key, value, softmax_scale)
