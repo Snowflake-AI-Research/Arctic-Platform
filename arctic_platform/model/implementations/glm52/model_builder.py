@@ -17,6 +17,7 @@ from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
 from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, PretrainedConfig
 
+from arctic_platform.debug.lora import maybe_observe_checkpoint_reader
 from arctic_platform.model.implementations.moe.conversion_cache import (
     WEIGHT_CONVERSION_CACHE_SCOPE_ENV,
     conversion_cache_is_node_local,
@@ -337,7 +338,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         del state_dict["lm_head.weight"]
     dcp_load(
         state_dict,
-        storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
+        storage_reader=maybe_observe_checkpoint_reader(
+            HuggingFaceStorageReader(path=snapshot_path.as_posix()), model, state_dict, config, parallel_dims
+        ),
     )
     if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:
         model.tie_weights()
