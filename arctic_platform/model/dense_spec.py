@@ -74,6 +74,7 @@ def dense_model_spec(
         parallelism=ParallelismConfig(sequence_parallel=sequence_parallel),
         patches=Patches(
             liger=liger,
+            fused_qk_norm_rope=training_options.get("fused_qk_norm_rope", False),
             gradient_checkpointing=training_options.get("activation_checkpointing", False),
             checkpoint_keep_attention=training_options.get("checkpoint_keep_attention", False),
             activation_offload=activation_offload,
