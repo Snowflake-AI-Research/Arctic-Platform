@@ -56,6 +56,8 @@ from typing import Any
 
 import torch
 
+from arctic_platform.model.implementations.gpu.sp.collectives import gather_sequence
+from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 from arctic_platform.model.implementations.vllm_aligned import ops
 from arctic_platform.model.implementations.vllm_aligned.turn_plan import PLAN_KWARG
 from arctic_platform.model.implementations.vllm_aligned.turn_plan import build_turn_layout
@@ -98,6 +100,16 @@ def _check_tensor_parallel(config, tensor_parallel: int) -> None:
     for name in names:
         if getattr(config, name) % tensor_parallel:
             raise ValueError(f"config.{name}={getattr(config, name)} does not split across {tensor_parallel} ranks")
+
+
+def _check_sequence_parallel(config, sp_size: int) -> None:
+    """Refuse a sequence-parallel size whose head shards the mixers cannot use."""
+    for name in ("num_attention_heads", "linear_num_key_heads", "linear_num_value_heads"):
+        if getattr(config, name) % sp_size:
+            raise ValueError(f"config.{name}={getattr(config, name)} does not split across {sp_size} SP ranks")
+    kv_heads = config.num_key_value_heads
+    if kv_heads % sp_size and sp_size % kv_heads:
+        raise ValueError(f"{kv_heads} key/value heads neither split across nor divide {sp_size} SP ranks")
 
 
 def hybrid_kv_block_size(config, tensor_parallel: int = 1) -> int:
@@ -714,9 +726,25 @@ class _ForwardContext:
     rope_positions: torch.Tensor
     cos_sin_cache: torch.Tensor
     fa_version: int
+    sp_group: Any = None
 
 
-def _gated_delta_net(layer: Any, hidden: torch.Tensor, gdn: GdnLayout, tensor_parallel: int) -> torch.Tensor:
+def _to_heads(group, x: torch.Tensor) -> torch.Tensor:
+    """``[shard tokens, heads, ...]`` to ``[all tokens, heads / sp, ...]`` across the sequence-parallel group."""
+    return x if group is None else sequence_head_all_to_all(group, x[None], scatter_dim=2, gather_dim=1)[0]
+
+
+def _to_tokens(group, x: torch.Tensor) -> torch.Tensor:
+    """The inverse of :func:`_to_heads`."""
+    return x if group is None else sequence_head_all_to_all(group, x[None], scatter_dim=1, gather_dim=2)[0]
+
+
+def _gated_delta_net(layer: Any, hidden: torch.Tensor, ctx: _ForwardContext) -> torch.Tensor:
+    """The GatedDeltaNet mixer; under sequence parallelism the conv and recurrence see all tokens and a head shard.
+
+    A rank's shard holds the same heads and channels a tensor-parallel sampler rank holds: query, key and value
+    channels of its key heads and value heads, in that order, with their conv channels, ``A_log`` and ``dt_bias``.
+    """
     dims = _GdnDims(layer.num_k_heads, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim, layer.activation)
     tokens = hidden.shape[0]
     mixed_qkvz = ops.linear(hidden, torch.cat((layer.in_proj_qkv.weight, layer.in_proj_z.weight)))
@@ -724,11 +752,34 @@ def _gated_delta_net(layer: Any, hidden: torch.Tensor, gdn: GdnLayout, tensor_pa
     mixed_qkv, z = mixed_qkvz.split([2 * dims.key_dim + dims.value_dim, dims.value_dim], dim=-1)
     z = z.reshape(tokens, dims.num_v_heads, dims.head_v_dim)
     b, a = ba.chunk(2, dim=-1)
-    core = _GatedDeltaNetCore.apply(
-        mixed_qkv, a.contiguous(), b.contiguous(), layer.A_log, layer.dt_bias, layer.conv1d.weight, dims, gdn
-    )
+    a, b = a.contiguous(), b.contiguous()
+    A_log, dt_bias, conv_weight = layer.A_log, layer.dt_bias, layer.conv1d.weight
+    group = ctx.sp_group
+    if group is not None:
+        sp_size, rank = torch.distributed.get_world_size(group), torch.distributed.get_rank(group)
+        query, key, value = mixed_qkv.split([dims.key_dim, dims.key_dim, dims.value_dim], dim=-1)
+        query = _to_heads(group, query.reshape(tokens, dims.num_k_heads, dims.head_k_dim))
+        key = _to_heads(group, key.reshape(tokens, dims.num_k_heads, dims.head_k_dim))
+        value = _to_heads(group, value.reshape(tokens, dims.num_v_heads, dims.head_v_dim))
+        mixed_qkv = torch.cat((query.flatten(1), key.flatten(1), value.flatten(1)), dim=-1)
+        a, b = _to_heads(group, a[..., None])[..., 0].contiguous(), _to_heads(group, b[..., None])[..., 0].contiguous()
+        k_dim, v_dim = dims.key_dim // sp_size, dims.value_dim // sp_size
+        heads = slice(rank * (dims.num_v_heads // sp_size), (rank + 1) * (dims.num_v_heads // sp_size))
+        conv_weight = torch.cat(
+            (
+                conv_weight[rank * k_dim : (rank + 1) * k_dim],
+                conv_weight[dims.key_dim + rank * k_dim : dims.key_dim + (rank + 1) * k_dim],
+                conv_weight[2 * dims.key_dim + rank * v_dim : 2 * dims.key_dim + (rank + 1) * v_dim],
+            )
+        )
+        A_log, dt_bias = A_log[heads], dt_bias[heads]
+        dims = _GdnDims(
+            dims.num_k_heads // sp_size, dims.num_v_heads // sp_size, dims.head_k_dim, dims.head_v_dim, dims.activation
+        )
+    core = _GatedDeltaNetCore.apply(mixed_qkv, a, b, A_log, dt_bias, conv_weight, dims, ctx.gdn)
+    core = _to_tokens(group, core)
     normed = _GatedRMSNorm.apply(core, z, layer.norm.weight, layer.layer_norm_epsilon)
-    return ops.row_parallel_linear(normed.flatten(-2), layer.out_proj.weight, tensor_parallel)
+    return ops.row_parallel_linear(normed.flatten(-2), layer.out_proj.weight, ctx.geometry.tensor_parallel)
 
 
 def _full_attention(attn: Any, hidden: torch.Tensor, ctx: _ForwardContext) -> torch.Tensor:
@@ -741,14 +792,18 @@ def _full_attention(attn: Any, hidden: torch.Tensor, ctx: _ForwardContext) -> to
     query, key, gate = _QKNormRopeGate.apply(
         q_gate, key, attn.q_norm.weight, attn.k_norm.weight, ctx.cos_sin_cache, ctx.rope_positions, geometry
     )
-    out = ops.paged_attention(
-        query.view(tokens, geometry.num_heads, geometry.head_dim),
-        key.view(tokens, geometry.num_kv_heads, geometry.head_dim),
-        value.view(tokens, geometry.num_kv_heads, geometry.head_dim),
-        ctx.layout,
-        scale=geometry.head_dim**-0.5,
-        fa_version=ctx.fa_version,
-    ).view(tokens, q_size)
+    query = query.view(tokens, geometry.num_heads, geometry.head_dim)
+    key = key.view(tokens, geometry.num_kv_heads, geometry.head_dim)
+    value = value.view(tokens, geometry.num_kv_heads, geometry.head_dim)
+    if ctx.sp_group is not None:
+        sp_size = torch.distributed.get_world_size(ctx.sp_group)
+        if geometry.num_kv_heads < sp_size:
+            # Each rank needs the key/value head its query heads read; the gradient sums the copies back.
+            key = key.repeat_interleave(sp_size // geometry.num_kv_heads, dim=1)
+            value = value.repeat_interleave(sp_size // geometry.num_kv_heads, dim=1)
+        query, key, value = (_to_heads(ctx.sp_group, x) for x in (query, key, value))
+    out = ops.paged_attention(query, key, value, ctx.layout, scale=geometry.head_dim**-0.5, fa_version=ctx.fa_version)
+    out = _to_tokens(ctx.sp_group, out).reshape(tokens, q_size)
     out = out * torch.sigmoid(gate)
     return ops.row_parallel_linear(out, attn.o_proj.weight, geometry.tensor_parallel)
 
@@ -767,7 +822,7 @@ def _decoder_layer(layer: Any, hidden: torch.Tensor, residual: torch.Tensor | No
     else:
         hidden, residual = ops.gemma_rms_norm(hidden, layer.input_layernorm.weight, eps, residual)
     if layer.block_type == "linear_attention":
-        mixer_out = _gated_delta_net(layer.linear_attn, hidden, ctx.gdn, ctx.geometry.tensor_parallel)
+        mixer_out = _gated_delta_net(layer.linear_attn, hidden, ctx)
     else:
         mixer_out = _full_attention(layer.self_attn, hidden, ctx)
     hidden, residual = ops.gemma_rms_norm(mixer_out, layer.post_attention_layernorm.weight, eps, residual)
@@ -814,11 +869,21 @@ def aligned_logprobs(
     """
     backbone = model.model
     geometry: _Geometry = model._vllm_aligned_geometry
+    sp_group = getattr(model, "_vllm_aligned_sp_group", None)
+    sp_size = 1 if sp_group is None else torch.distributed.get_world_size(sp_group)
+    sp_rank = 0 if sp_group is None else torch.distributed.get_rank(sp_group)
     if position_ids.dim() == 3:
         position_ids = position_ids[0]
+    local_tokens = int(input_ids.numel())
+    if sp_size > 1:
+        input_ids, position_ids, labels, trained = (
+            _gathered(sp_group, tensor.reshape(1, -1)) for tensor in (input_ids, position_ids, labels, trained)
+        )
+        plan = None if plan is None else _gathered(sp_group, plan.reshape(1, -1, *plan.shape[-2:]))
+        cu_seqlens = None
     layout = ops.PackedLayout.build(position_ids, block_size=geometry.kv_block_size, cu_seqlens=cu_seqlens)
     token_ids, labels = input_ids.reshape(-1), labels.reshape(-1)
-    turns = None
+    output_index = None
     if plan is not None:
         turns = build_turn_layout(
             plan.reshape(-1, *plan.shape[-2:]),
@@ -826,13 +891,21 @@ def aligned_logprobs(
             block_size=geometry.kv_block_size,
             conv_width=geometry.conv_width,
             device=token_ids.device,
+            pad_multiple=sp_size,
         )
-        token_ids, labels = token_ids[turns.expand_index], labels[turns.expand_index]
+        output_index = turns.output_index
+        scored = torch.zeros(turns.expand_index.numel(), dtype=torch.bool, device=token_ids.device)
+        scored[output_index[output_index >= 0]] = True
+        token_ids = token_ids[turns.expand_index]
+        labels = torch.where(scored, labels[turns.expand_index], -100)
         layout, gdn = turns.attention, turns.gdn
     else:
         gdn = GdnLayout.build(layout.cu_seqlens, trained, geometry.prefill_chunk, geometry.conv_width)
-    positions = layout.positions
-    hidden = ops.tensor_parallel_embedding(backbone.embed_tokens(token_ids), geometry.tensor_parallel)
+    if token_ids.numel() % sp_size:
+        raise ValueError(f"{token_ids.numel()} tokens do not split across {sp_size} sequence-parallel ranks")
+    shard = slice(sp_rank * (token_ids.numel() // sp_size), (sp_rank + 1) * (token_ids.numel() // sp_size))
+    positions = layout.positions[shard]
+    hidden = ops.tensor_parallel_embedding(backbone.embed_tokens(token_ids[shard]), geometry.tensor_parallel)
     ctx = _ForwardContext(
         geometry=geometry,
         layout=layout,
@@ -840,6 +913,7 @@ def aligned_logprobs(
         rope_positions=positions.unsqueeze(0).expand(3, -1) if geometry.mrope_section else positions,
         cos_sin_cache=_cos_sin_cache(backbone, geometry, hidden.dtype, positions.device),
         fa_version=ops.flash_attn_version(geometry.head_dim),
+        sp_group=sp_group if sp_size > 1 else None,
     )
     layers = list(backbone.layers)
     hidden, residual = _decoder_layer(layers[0], hidden, None, ctx)
@@ -852,17 +926,28 @@ def aligned_logprobs(
         else:
             hidden, residual = _decoder_layers(group, hidden, residual, ctx)
     hidden, _ = ops.gemma_rms_norm(hidden, backbone.norm.weight, geometry.eps, residual)
-    if turns is not None:
-        scored = turns.output_index.clamp(min=0)
-        hidden, labels = hidden[scored], torch.where(turns.output_index >= 0, labels[scored], -100)
-    return ops.lm_head_logprobs(
+    logprobs = ops.lm_head_logprobs(
         hidden,
         model.lm_head.weight,
-        labels,
+        labels[shard],
         temperature=temperature,
         token_chunk_size=model._vllm_aligned_token_chunk_size,
         fp32=model._vllm_aligned_lm_head_fp32,
     )
+    if sp_size > 1:
+        logprobs = gather_sequence(logprobs[None], sp_group)[0]
+    if output_index is not None:
+        logprobs = torch.where(output_index >= 0, logprobs[output_index.clamp(min=0)], 0.0)
+    return logprobs[sp_rank * local_tokens : (sp_rank + 1) * local_tokens]
+
+
+def _gathered(group, tensor: torch.Tensor) -> torch.Tensor:
+    """The sequence-parallel ranks' ``[1, shard, ...]`` pieces of an input, concatenated in rank order."""
+    dtype = tensor.dtype
+    tensor = tensor.to(torch.uint8) if dtype == torch.bool else tensor
+    parts = [torch.empty_like(tensor) for _ in range(torch.distributed.get_world_size(group))]
+    torch.distributed.all_gather(parts, tensor.contiguous(), group=group)
+    return torch.cat(parts, dim=1).to(dtype)
 
 
 def _causal_lm_forward(
@@ -925,8 +1010,15 @@ def apply_vllm_aligned_qwen3_5(
     lm_head_fp32: bool = False,
     tensor_parallel: int = 1,
     prefill_chunk: int = 0,
+    sp_group: Any = None,
 ) -> None:
     """Make a transformers ``Qwen3_5ForCausalLM``'s ``dss_compute_logprobs`` forward compute vLLM's logprobs.
+
+    ``sp_group`` runs the forward sequence-parallel (Ulysses): each rank gets a contiguous shard of the packed
+    tokens, runs the per-token operators on its share of them and the attention and GatedDeltaNet mixers on all
+    tokens for a shard of the heads. vLLM's per-head kernels give the same bits on a head shard (the sampler's own
+    tensor parallelism relies on it) and the batch-invariant matmul gives each row the same bits however many rows
+    a call has, so the logprobs do not depend on the sequence-parallel size.
 
     ``kv_block_size`` defaults to :func:`hybrid_kv_block_size`. ``lm_head_fp32`` computes fp32
     logits as the sampler's batch-invariant fp32 LM head does, with an fp32 gradient. ``tensor_parallel`` is the
@@ -955,6 +1047,9 @@ def apply_vllm_aligned_qwen3_5(
     model._vllm_aligned_geometry = _Geometry.from_config(
         config, kv_block_size=block_size, tensor_parallel=tensor_parallel, prefill_chunk=prefill_chunk
     )
+    if sp_group is not None and torch.distributed.get_world_size(sp_group) > 1:
+        _check_sequence_parallel(config, torch.distributed.get_world_size(sp_group))
+        model._vllm_aligned_sp_group = sp_group
     model._vllm_aligned_token_chunk_size = int(token_chunk_size)
     model._vllm_aligned_lm_head_fp32 = bool(lm_head_fp32)
     model._vllm_aligned_stock_forward = model.forward

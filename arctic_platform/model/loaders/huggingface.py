@@ -135,8 +135,8 @@ def _check_vllm_aligned_spec(ctx: LoaderContext) -> tuple[str, int, bool]:
         qwen3.check_supported_config(text_config)
     if spec.dtype != "bfloat16":
         raise ValueError(f"vllm_aligned requires dtype bfloat16, the sampler's, got {spec.dtype!r}")
-    if spec.parallelism.sequence_parallel != 1:
-        raise ValueError("vllm_aligned does not support sequence parallelism")
+    if spec.parallelism.sequence_parallel != 1 and family != "qwen3_5":
+        raise ValueError("vllm_aligned supports sequence parallelism for the Qwen3.5 family only")
     patches = spec.patches
     unsupported = {
         "liger": patches.liger,
@@ -245,6 +245,7 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
                 lm_head_fp32=lm_head_fp32,
                 tensor_parallel=options.vllm_aligned_tensor_parallel,
                 prefill_chunk=options.vllm_aligned_prefill_chunk,
+                sp_group=groups.get("sp_group") if parallelism.sequence_parallel > 1 else None,
             )
         else:
             from arctic_platform.model.implementations.vllm_aligned.qwen3 import apply_vllm_aligned

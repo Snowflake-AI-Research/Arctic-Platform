@@ -141,9 +141,18 @@ class TurnLayout:
 
 
 def build_turn_layout(
-    plan: torch.Tensor, cu_seqlens: torch.Tensor, *, block_size: int, conv_width: int, device: torch.device
+    plan: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    block_size: int,
+    conv_width: int,
+    device: torch.device,
+    pad_multiple: int = 1,
 ) -> TurnLayout:
-    """Spans for every row of the packed ``[tokens, K, 3]`` plan whose rows ``cu_seqlens`` bounds."""
+    """Spans for every row of the packed ``[tokens, K, 3]`` plan whose rows ``cu_seqlens`` bounds.
+
+    ``pad_multiple`` appends a span of padding (token 0, scoring nothing) so the span tokens split evenly.
+    """
     from arctic_platform.model.implementations.vllm_aligned import ops
     from arctic_platform.model.implementations.vllm_aligned.qwen3_5 import GdnLayout
     from arctic_platform.model.implementations.vllm_aligned.qwen3_5 import GdnSpan
@@ -159,21 +168,31 @@ def build_turn_layout(
             row_spans = [TurnSpan(row, 0, 0, row_end - row_start, ((False, 0, row_end - row_start),), (), None, ())]
         spans += row_spans
         row_starts += [row_start] * len(row_spans)
+    pad = -sum(span.end - span.start for span in spans) % pad_multiple
+    if pad:
+        spans.append(TurnSpan(-1, 0, 0, pad, ((False, 0, pad),), (), None, ()))
+        row_starts.append(None)
 
     span_id = {(span.row, span.column): i for i, span in enumerate(spans)}
     lengths = [span.end - span.start for span in spans]
     starts = torch.cumsum(torch.tensor([0] + lengths), 0).tolist()
     expand_index = torch.cat(
-        [torch.arange(row_start + span.start, row_start + span.end) for span, row_start in zip(spans, row_starts)]
-    )
+        [
+            torch.zeros(span.end, dtype=torch.long) if row_start is None
+            else torch.arange(row_start + span.start, row_start + span.end)
+            for span, row_start in zip(spans, row_starts)
+        ]
+    )  # fmt: skip
     positions = torch.cat([torch.arange(span.start, span.end) for span in spans])
 
     output_index = torch.full((num_tokens,), -1, dtype=torch.long)
     for i in reversed(range(len(spans))):
         span, row_start = spans[i], row_starts[i]
+        if row_start is None:
+            continue
         output_index[row_start + span.start : row_start + span.end] = torch.arange(starts[i], starts[i] + lengths[i])
     for i, (span, row_start) in enumerate(zip(spans, row_starts)):
-        if span.outputs:
+        if span.outputs and row_start is not None:
             outputs = torch.tensor(span.outputs)
             output_index[row_start + outputs] = starts[i] + outputs - span.start
 

@@ -859,3 +859,90 @@ def test_multi_turn_replay_keeps_the_stock_function_and_gradient(fake_vllm, monk
     for name, param in stock.named_parameters():
         grad, mine = param.grad, dict(aligned.named_parameters())[name].grad
         assert float((mine - grad).abs().max() / grad.abs().max().clamp_min(1e-12)) < 1e-4, name
+
+
+def _install_fakes():
+    """The ``fake_vllm`` fixture for a process that has no pytest ``monkeypatch``."""
+    import os
+
+    ops._batch_invariant = lambda: _FakeBatchInvariant
+    ops._fa_utils = lambda: _FakeFaUtils
+    ops._silu_and_mul_kernel = _fake_silu_and_mul
+    ops._trainer_flash_attn_varlen_func = lambda: _fake_trainer_flash_attn
+    ops._token_logprobs_kernel = _fake_token_logprobs
+    ops._fp32_logits_linear = lambda: lambda x, w: x.float() @ w.float().t()
+    qwen3_5._fused_qk_rmsnorm_rope_gate = lambda: _fake_fused_qk_rmsnorm_rope_gate
+    qwen3_5._causal_conv1d_fn = lambda: _fake_causal_conv1d_fn
+    qwen3_5._fla_ops = lambda: _FakeFlaOps
+    qwen3_5._gated_rms_norm = lambda: _fake_rmsnorm_fn
+    qwen3_5._pin_gdn_kernels = lambda: None
+    qwen3_5._reference_gated_delta_rule = lambda: _fake_reference_gated_delta_rule
+    os.environ[ops.BATCH_INVARIANT_ENV] = "1"
+
+
+def _sp_cases():
+    torch.manual_seed(12)
+    sequences = [torch.randint(0, 97, (n,)) for n in (12, 7, 9)]
+    input_ids, labels, positions, cu_seqlens, loss_mask = _packed(sequences, [4, None, 1])
+    packed = dict(input_ids=input_ids, labels=labels, position_ids=positions, vllm_aligned_loss_mask=loss_mask)
+    seq, row_labels, plan = _turn_inputs(13)
+    other = torch.randint(0, 97, (8,))
+    other_plan = torch.zeros((8, 3, 3), dtype=torch.int32)
+    other_plan[:, 0, 0] = 1
+    turns = dict(
+        input_ids=torch.cat((seq, other))[None],
+        labels=torch.cat((row_labels, other[1:], torch.tensor([-100])))[None],
+        position_ids=torch.cat((torch.arange(30), torch.arange(8)))[None],
+        vllm_aligned_plan=torch.cat((plan, other_plan))[None],
+    )
+    return [packed, turns]
+
+
+def _sp_worker(rank, world_size, port):
+    import os
+
+    import torch.distributed as dist
+
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        _install_fakes()
+        group = dist.new_group(list(range(world_size)))
+        for case in _sp_cases():
+            tokens = case["input_ids"].shape[1]
+            weights = torch.linspace(0.5, 1.5, tokens)
+            reference = _model()
+            qwen3_5.apply_vllm_aligned_qwen3_5(reference, token_chunk_size=8, kv_block_size=_PAGE)
+            expected = reference(dss_compute_logprobs=True, **case)["logprobs"][0]
+            (expected * weights).sum().backward()
+
+            sharded = _model()
+            qwen3_5.apply_vllm_aligned_qwen3_5(sharded, token_chunk_size=8, kv_block_size=_PAGE, sp_group=group)
+            local = slice(rank * tokens // world_size, (rank + 1) * tokens // world_size)
+            shard = {k: v[:, local] for k, v in case.items()}
+            out = sharded(dss_compute_logprobs=True, **shard)["logprobs"][0]
+            torch.testing.assert_close(out.detach(), expected[local].detach(), rtol=1e-5, atol=1e-5)
+            (out * weights[local]).sum().backward()
+            for name, param in sharded.named_parameters():
+                grad = param.grad.clone()
+                dist.all_reduce(grad, group=group)
+                want = dict(reference.named_parameters())[name].grad
+                assert float((grad - want).abs().max() / want.abs().max().clamp_min(1e-12)) < 1e-4, name
+    finally:
+        dist.destroy_process_group()
+
+
+def test_sequence_parallel_logprobs_and_gradients_match_one_rank():
+    import socket
+
+    import torch.multiprocessing as mp
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_sp_worker, args=(2, port), nprocs=2, join=True)
+
+
+def test_sequence_parallel_needs_head_counts_it_can_shard():
+    with pytest.raises(ValueError, match="does not split across 3 SP ranks"):
+        qwen3_5._check_sequence_parallel(_config(), 3)
