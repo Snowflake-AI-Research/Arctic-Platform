@@ -62,8 +62,8 @@ if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     fi
 fi
 
-# 2. Torch/system CUDA mismatch. DeepSpeed JIT-builds CPUAdam under ZeRO-3
-#    optimizer offload and refuses if `nvcc --version` doesn't match torch's
+# 2. Torch/system CUDA mismatch. DeepSpeed JIT-builds CPUAdam when the optimizer
+#    is offloaded to CPU and refuses if `nvcc --version` doesn't match torch's
 #    build CUDA. In multi-CUDA container images (`/usr/local/cuda -> cuda-13`
 #    while torch is cu129) users need `CUDA_HOME=/usr/local/cuda-12.9`.
 _torch_cuda=$(python -c "import torch; print(torch.version.cuda or '')" 2>/dev/null || true)
@@ -219,7 +219,7 @@ python3 -m verl.trainer.main_ppo \
     remote_backend.rollout.speculative_decoding.model=Snowflake/Arctic-LSTM-Speculator-Qwen3-32B-bird \
     remote_backend.train.zorro_train.enable=True \
     remote_backend.train.zorro_train.max_rollouts=16 \
-    remote_backend.train.deepspeed.zero_optimization.stage=3 \
+    remote_backend.train.deepspeed.zero_optimization.stage=2 \
     remote_backend.train.deepspeed.zero_optimization.offload_optimizer.device=cpu \
     remote_backend.train.deepspeed.zero_optimization.offload_param.device=none \
     "$@" 2>&1 | tee "${LOG_FILE}"

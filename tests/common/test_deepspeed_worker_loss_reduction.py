@@ -161,7 +161,7 @@ def test_native_worker_applies_local_mean_scales_with_one_stateful_loss_object()
                 "reduction_weight": torch.tensor(1.0),
             },
         ],
-        "meta": {"pad_token_id": 0},
+        "meta": {"pad_token_id": 0, "drop_position_ids": True},
         "processing": {
             "loss_fn": _StatefulWeightedLoss.name,
             "config": {},
@@ -278,7 +278,7 @@ def test_native_worker_honors_class_precedence_for_sft_name(monkeypatch):
             "input_ids": torch.ones(1, 1, dtype=torch.long),
             "attention_mask": torch.ones(1, 1, dtype=torch.long),
         },
-        "meta": {"pad_token_id": 0},
+        "meta": {"pad_token_id": 0, "drop_position_ids": True},
         "processing": {"loss_fn": "sft", "config": {}},
     }
     worker = _worker(_SingleGASScoreEngine())
@@ -307,7 +307,7 @@ def test_native_worker_sums_globally_normalized_gas_losses_without_rescaling_gra
                 "kd_mask": torch.tensor([[1.0, 0.0]]),
             },
         ],
-        "meta": {"pad_token_id": 0},
+        "meta": {"pad_token_id": 0, "drop_position_ids": True},
         "processing": {
             "loss_fn": "grouped_distillation",
             "config": {"kd_coef": 0.0},

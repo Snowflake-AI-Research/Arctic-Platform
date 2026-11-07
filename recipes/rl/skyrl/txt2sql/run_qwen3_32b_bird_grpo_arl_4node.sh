@@ -66,7 +66,7 @@ NUM_ENGINES=$((NUM_GPUS / TP_SIZE))
 
 # FA3 on Hopper; set flash_attention_2 for A100/L40S.
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_3}"
-ARCTIC_ZERO_STAGE=3
+ARCTIC_ZERO_STAGE=2
 OFFLOAD_OPTIMIZER="${OFFLOAD_OPTIMIZER:-true}"
 
 # 128 prompts x 16 samples = 2048 trajectories/step. Constraints:

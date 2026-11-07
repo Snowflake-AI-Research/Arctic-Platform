@@ -26,9 +26,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from deepspeed.utils import groups
 
+from arctic_platform.common.unpacked_gas import run_unpacked_gas
 from arctic_platform.rl.processors.grpo import grpo_loss
 from arctic_platform.rl.processors.packed_reduction import resolve_packed_loss_reduction
-from arctic_platform.rl.processors.pipeline import run_pipeline
 
 # Two rows of lengths 1 and 3 with different per-token advantages, so per-row and per-pack means differ.
 LENGTHS = (1, 3)
@@ -101,10 +101,14 @@ class _Engine:
     def train(self):
         pass
 
+    def backward(self, loss, scale_wrt_gas=True):
+        assert scale_wrt_gas is False
+        loss.backward()
+
 
 @pytest.mark.parametrize("contract", ["grpo", "grpo_echo_v1"])
 @pytest.mark.parametrize("mode", ["seq-mean-token-mean", "seq-mean-token-sum"])
-def test_packing_width_does_not_change_the_loss(contract, mode):
+def test_gas_split_does_not_change_the_loss(contract, mode):
     ids = torch.tensor([[0, 0, 0], [1, 2, 3]])
     mask = torch.tensor([[True, False, False], [True, True, True]])
     context = dict(old_log_probs_shifted=OLD[ids], advantages=ADVANTAGES[ids], loss_mask=mask)
@@ -123,21 +127,21 @@ def test_packing_width_does_not_change_the_loss(contract, mode):
             echo_observation_token_counts=torch.zeros(2),
         )
     results = []
-    for width in (4, 3):
+    for gas in (1, 2):
         engine = _Engine()
-        result = run_pipeline(
+        result = run_unpacked_gas(
             engine,
-            (),
-            dict(input_ids=ids, attention_mask=mask),
-            context,
-            dict(loss_fn=contract, config=config),
-            "cpu",
-            backward="loss_only",
-            max_tokens_per_mb=width,
+            gas=gas,
+            batch_data=dict(input_ids=ids, attention_mask=mask, **context),
+            meta_data=dict(pad_token_id=0, drop_position_ids=True),
+            processing=dict(loss_fn=contract, config=config),
+            backward=True,
+            device="cpu",
             return_tensors=True,
+            step_fn=lambda: None,
         )
-        (grad,) = torch.autograd.grad(result["loss_tensor"], engine.logprobs)
-        results.append((result["loss_tensor"].detach(), grad))
+        # avg_loss is the reduction-weighted sum of the call losses, the value the summed loss_tensor carried.
+        results.append((torch.tensor(result["avg_loss"], dtype=torch.float32), engine.logprobs.grad))
     torch.testing.assert_close(results[0], results[1])
 
 
