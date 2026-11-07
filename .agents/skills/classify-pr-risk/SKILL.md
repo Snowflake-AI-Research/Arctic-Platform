@@ -26,7 +26,7 @@ Input: a PR URL or number in `Snowflake-AI-Research/Arctic-Platform`.
 
 ## Labels (choose exactly one)
 
-Rubric version: **2**. Bump this number whenever the rules in this section
+Rubric version: **3**. Bump this number whenever the rules in this section
 change, so automation re-evaluates PRs that were classified under older rules.
 
 Most PRs should land on `risk:low` or `risk:medium`. `risk:high` is the
@@ -39,8 +39,14 @@ docs, tests, and renames on them do not.
 
 - Model loading, conversion caches, and HF checkpoint export/save under
   `arctic_platform/model`.
-- Distributed collectives, rank coordination, and weight synchronization
-  (`arctic_platform/rl`, `arctic_platform/inference`, `arctic_platform/sft`).
+- Distributed collectives, rank coordination, and weight synchronization,
+  including context- and expert-parallel collectives (`arctic_platform/rl`,
+  `arctic_platform/inference`, `arctic_platform/sft`, and the parallelism code
+  under `arctic_platform/model/implementations`).
+- Training numerics: loss computation, gradient accumulation and reduction,
+  optimizer and ZeRO engine setup, and precision or dtype defaults
+  (`arctic_platform/common`, `arctic_platform/rl`, `arctic_platform/sft`, and
+  the MoE layers under `arctic_platform/model/implementations/moe`).
 - Client transports and the wire format (`arctic_platform/client`,
   `arctic_platform/wire.py`, the Cortex transport).
 - Release, CI gating, and packaging: `.github/workflows`, `scripts/release.sh`,
