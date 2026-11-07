@@ -27,11 +27,21 @@ from arctic_platform.correctness.harness import config as config_module
 from arctic_platform.correctness.harness import execution
 from arctic_platform.correctness.harness import gateway
 from arctic_platform.correctness.harness import runner
+from arctic_platform.correctness.harness import storage
 from arctic_platform.correctness.harness.registry import TestOutcome
 from arctic_platform.correctness.onboarding import onboard
 
 MISSING = object()
 CHECKS = ["single-step-grads", "single-step-optimizer"]
+
+
+@pytest.fixture
+def fast_storage(tmp_path, monkeypatch):
+    """Exercise the real storage validator without requiring a host /data-fast mount."""
+    root = tmp_path / "data-fast"
+    root.mkdir()
+    monkeypatch.setattr(storage, "_DATA_FAST_ROOT", root)
+    return root
 
 
 @pytest.fixture(params=["native", "cortex"])
@@ -160,9 +170,13 @@ def test_bf16_still_requires_fp32_gradient_accumulation(recipe, monkeypatch):
 
 
 @pytest.mark.parametrize("operation", ["calibration", "reference-preparation", "probe", "completed-summary"])
-def test_onboarding_run_refuses_fp32_before_preparation_or_completion_shortcuts(recipe, monkeypatch, operation):
+def test_onboarding_run_refuses_fp32_before_preparation_or_completion_shortcuts(
+    recipe, monkeypatch, operation, fast_storage
+):
     config = recipe("float32")
-    args = execution.parse_args(["onboard", "--config", str(config.path), "--test-id", CHECKS[0]])
+    args = execution.parse_args(
+        ["onboard", "--config", str(config.path), "--test-id", CHECKS[0], "--cache-root", str(fast_storage / "models")]
+    )
     if operation == "reference-preparation":
         args.prepare_references = True
         args.reference_tests = CHECKS
@@ -179,9 +193,11 @@ def test_onboarding_run_refuses_fp32_before_preparation_or_completion_shortcuts(
     assert untouched(config) == before
 
 
-def test_onboarding_run_admits_bf16_fp32_accumulator_without_changing_recipe(recipe, monkeypatch):
+def test_onboarding_run_admits_bf16_fp32_accumulator_without_changing_recipe(recipe, monkeypatch, fast_storage):
     config = recipe()
-    args = execution.parse_args(["onboard", "--config", str(config.path)])
+    args = execution.parse_args(
+        ["onboard", "--config", str(config.path), "--cache-root", str(fast_storage / "models")]
+    )
     monkeypatch.setattr(config_module, "local_config_path", lambda path: Path(path))
     monkeypatch.setattr(onboard, "_onboard_configuration", lambda args: 23)
     before = untouched(config)
