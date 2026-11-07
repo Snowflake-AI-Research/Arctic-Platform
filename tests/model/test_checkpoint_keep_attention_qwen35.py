@@ -60,7 +60,9 @@ class _CountKernels(TorchDispatchMode):
 def _ctx(gradient_checkpointing) -> LoaderContext:
     return LoaderContext(
         spec=types.SimpleNamespace(
-            patches=types.SimpleNamespace(gradient_checkpointing=gradient_checkpointing),
+            patches=types.SimpleNamespace(
+                gradient_checkpointing=gradient_checkpointing, checkpoint_keep_attention=True
+            ),
             parallelism=types.SimpleNamespace(sequence_parallel=1),
         )
     )
