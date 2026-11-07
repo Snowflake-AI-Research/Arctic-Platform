@@ -196,6 +196,14 @@ class Patches(BaseModel):
         False,
         description="False disables; True checkpoints every layer; an integer checkpoints every Nth layer.",
     )
+    checkpoint_keep_attention: StrictBool = Field(
+        False,
+        description=(
+            "With gradient_checkpointing, keep each checkpointed layer's attention-kernel outputs (the attention"
+            " output and its log-sum-exp) from the forward pass, so the backward recompute runs everything in the"
+            " layer except the attention kernel. Costs one attention output per checkpointed layer."
+        ),
+    )
     activation_offload: ActivationOffloadPatch | None = Field(
         None, description="CPU offload for activations saved by checkpointed layers."
     )
@@ -212,6 +220,8 @@ class Patches(BaseModel):
         if self.activation_offload is not None:
             if self.gradient_checkpointing is False:
                 raise ValueError("activation_offload requires gradient_checkpointing")
+        if self.checkpoint_keep_attention and self.gradient_checkpointing is False:
+            raise ValueError("checkpoint_keep_attention requires gradient_checkpointing")
         if self.tiled_mlp is not None and self.compile is not None and self.compile.fullgraph:
             raise ValueError("compile.fullgraph cannot be combined with tiled_mlp")
         return self
