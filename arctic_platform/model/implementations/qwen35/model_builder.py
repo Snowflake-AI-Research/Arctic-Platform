@@ -346,8 +346,7 @@ def configure_moe_ep_backend(model: nn.Module, config: ModelConfig) -> None:
     for transformer_block in language_model.layers:
         if not isinstance(transformer_block.mlp, (MoE, LatentMoE)):
             continue
-        if isinstance(transformer_block.mlp, MoE):
-            transformer_block.mlp.set_use_sonicmoe(config.moe_use_sonicmoe)
+        transformer_block.mlp.set_use_sonicmoe(config.moe_use_sonicmoe)
         transformer_block.mlp.set_ep_comm_backend(backend)
         transformer_block.mlp.set_deepep_token_chunk_size(config.deepep_token_chunk_size)
 
