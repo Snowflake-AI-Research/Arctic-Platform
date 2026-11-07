@@ -20,10 +20,15 @@ from __future__ import annotations
 from typing import Any
 from typing import Dict
 from typing import List
+from typing import Optional
 
 import torch
 
+from .groups import batch_tensor
+from .media import split_media
+from .media import window_media
 from .pack import PackMetadata
+from .pack import is_mrope_position_ids
 from .walk import map_batch_values
 
 
@@ -48,16 +53,26 @@ def token_shard(
     metadata: PackMetadata,
     shard_count: int,
     shard_index: int,
+    *,
+    spatial_merge_size: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Slice a packed ``[1, T, ...]`` call down to one shard's contiguous token window.
 
     Concatenating the shards' windows in index order reproduces the packed sequence exactly, which is what the
     provider adapters rely on when they all-gather ``position_ids`` to rebuild global varlen boundaries.
+    Multimodal ``[channels, 1, T]`` positions are cut on their token axis the same way.
+
+    Media is not cut: a window gets every image or video whose tokens overlap it, whole, plus the slice of its
+    embeddings that lands in the window (``window_media``). Finding those tokens takes the call's packed
+    ``mm_token_type_ids`` and the model's ``spatial_merge_size``, which a call carrying media must pass.
     """
     start, end = token_window(metadata.padded_tokens, shard_count, shard_index)
     unpadded_tokens = int(metadata.cu_seqlens[-1])
+    packed, media = split_media(packed)
 
     def sliced(key: str, value):
+        if is_mrope_position_ids(key, value, metadata.padded_tokens):
+            return value[:, :, start:end].contiguous()
         if torch.is_tensor(value) and value.ndim >= 2:
             token_count = int(value.shape[1])
             if token_count == metadata.padded_tokens:
@@ -70,7 +85,18 @@ def token_shard(
                 )
         return value
 
-    return map_batch_values(packed, sliced)
+    window = map_batch_values(packed, sliced)
+    if media:
+        window.update(
+            window_media(
+                media,
+                batch_tensor(packed, "mm_token_type_ids", min_dims=2),
+                metadata.cu_seqlens,
+                (start, end),
+                spatial_merge_size=spatial_merge_size,
+            )
+        )
+    return window
 
 
 def window_cu_seqlens(
