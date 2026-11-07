@@ -379,6 +379,11 @@ class PackedLayout:
     The sampler stores a sequence's keys and values in pages of ``block_size`` tokens and attends through a block
     table. The layout here gives every sequence its own run of pages, so a full-sequence attention call reads the
     cache the way the sampler's prefill and decode do.
+
+    A sequence may also be the tail of a longer one, as a request that resumes from cached pages is: its tokens are
+    the queries, ``key_lens`` counts its keys, and its block table starts with pages other sequences wrote.
+    ``key_index`` then lists, sequence by sequence, the token that wrote each key, and ``key_cu_seqlens`` bounds
+    those lists; both are ``None`` when every sequence's keys are its own tokens.
     """
 
     positions: torch.Tensor
@@ -389,6 +394,10 @@ class PackedLayout:
     block_table: torch.Tensor
     slots: torch.Tensor
     num_blocks: int
+    key_lens: torch.Tensor | None = None
+    max_key_len: int | None = None
+    key_index: torch.Tensor | None = None
+    key_cu_seqlens: torch.Tensor | None = None
 
     @property
     def num_tokens(self) -> int:
@@ -505,8 +514,8 @@ def paged_attention_kernel(
         out=torch.empty_like(query),
         cu_seqlens_q=layout.cu_seqlens,
         max_seqlen_q=layout.max_seqlen,
-        seqused_k=layout.seq_lens,
-        max_seqlen_k=layout.max_seqlen,
+        seqused_k=layout.seq_lens if layout.key_lens is None else layout.key_lens,
+        max_seqlen_k=layout.max_seqlen if layout.max_key_len is None else layout.max_key_len,
         softmax_scale=scale,
         causal=True,
         alibi_slopes=None,
@@ -527,23 +536,31 @@ class _PagedAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query, key, value, layout: PackedLayout, scale: float, fa_version: int):
         out = paged_attention_kernel(query, key, value, layout, scale, fa_version)
-        ctx.save_for_backward(query, key, value, layout.cu_seqlens)
-        ctx.max_seqlen = layout.max_seqlen
+        ctx.save_for_backward(query, key, value)
+        ctx.layout = layout
         ctx.scale = scale
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
         flash_attn_varlen_func = _trainer_flash_attn_varlen_func()
-        query, key, value, cu_seqlens = ctx.saved_tensors
+        query, key, value = ctx.saved_tensors
+        layout: PackedLayout = ctx.layout
         with torch.enable_grad():
             inputs = tuple(t.detach().requires_grad_(True) for t in (query, key, value))
+            keys, values = inputs[1], inputs[2]
+            key_cu, max_key = layout.cu_seqlens, layout.max_seqlen
+            if layout.key_index is not None:
+                keys, values = keys[layout.key_index], values[layout.key_index]
+                key_cu, max_key = layout.key_cu_seqlens, layout.max_key_len
             out = flash_attn_varlen_func(
-                *inputs,
-                cu_seqlens,
-                cu_seqlens,
-                ctx.max_seqlen,
-                ctx.max_seqlen,
+                inputs[0],
+                keys,
+                values,
+                layout.cu_seqlens,
+                key_cu,
+                layout.max_seqlen,
+                max_key,
                 softmax_scale=ctx.scale,
                 causal=True,
             )

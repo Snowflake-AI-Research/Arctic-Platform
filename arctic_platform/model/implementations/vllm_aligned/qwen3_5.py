@@ -15,11 +15,12 @@
 """vLLM-aligned logprobs for the dense Qwen3.5 family, the GatedDeltaNet hybrids such as Qwen3.8-27B.
 
 The logprobs the forward returns are computed by the functions vLLM 0.32 runs for ``Qwen3_5ForConditionalGeneration``
-on text, on CUDA, with ``VLLM_BATCH_INVARIANT=1``, ``enforce_eager=True``, tensor parallelism 1, the FLASH_ATTN
-backend, ``additional_config={"gdn_prefill_backend": "triton"}``, ``VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0``, no
-prefix caching, no speculative decoding, every prompt prefilled in one step, and
-:mod:`arctic_platform.inference.vllm.gdn_batch_invariance` enabled (``ARCTIC_GDN_BATCH_INVARIANT=1``). The trainer
-pins the same GDN kernel configs. Per decoder layer:
+on text, on CUDA, with ``VLLM_BATCH_INVARIANT=1``, the FLASH_ATTN backend,
+``additional_config={"gdn_prefill_backend": "triton"}``, ``VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0`` and
+:mod:`arctic_platform.inference.vllm.gdn_batch_invariance` enabled (``ARCTIC_GDN_BATCH_INVARIANT=1``); the trainer
+pins the same GDN kernel configs. Tensor parallelism, chunked prefill and prefix caching are reproduced as
+:func:`apply_vllm_aligned_qwen3_5` and :mod:`~arctic_platform.model.implementations.vllm_aligned.turn_plan` describe.
+Per decoder layer:
 
 * norms: ``GemmaRMSNorm`` as vLLM's native IR op, with the residual carried as vLLM carries it;
 * full attention: the concatenated q/k/v projection, ``fused_qk_rmsnorm_rope_gate``, FlashAttention over a paged KV
@@ -35,7 +36,9 @@ A GatedDeltaNet layer does not compute a prompt token and a decoded token the sa
 which tokens the sampler decoded. They are the tokens after the first position the loss trains on, the prompt's last
 token, whose logits come from the prefill. The trained positions come from ``vllm_aligned_loss_mask`` when the
 trainer passes it, and from ``labels != -100`` otherwise. A later prompt turn that the sampler prefilled after a
-completion is computed here as decoded, so a multi-turn sample does not match from that turn on.
+completion is computed that way as decoded, so a multi-turn row needs ``vllm_aligned_plan``
+(:mod:`~arctic_platform.model.implementations.vllm_aligned.turn_plan`): each turn is then replayed as the request
+that computed it, resuming from the prefix-cache pages and state the sampler reused.
 
 The backward follows the Qwen3 path: each operator's forward is vLLM's kernel, and its backward is the trainer's
 math for the same function at the saved inputs. vLLM's GatedDeltaNet kernels have no backward, so that layer's
@@ -54,6 +57,8 @@ from typing import Any
 import torch
 
 from arctic_platform.model.implementations.vllm_aligned import ops
+from arctic_platform.model.implementations.vllm_aligned.turn_plan import PLAN_KWARG
+from arctic_platform.model.implementations.vllm_aligned.turn_plan import build_turn_layout
 
 SUPPORTED_MODEL_TYPES = frozenset({"qwen3_5_text"})
 LOSS_MASK_KWARG = "vllm_aligned_loss_mask"
@@ -128,6 +133,7 @@ class _Geometry:
     kv_block_size: int
     tensor_parallel: int = 1
     prefill_chunk: int = 0
+    conv_width: int = 4
 
     @classmethod
     def from_config(cls, config, *, kv_block_size: int, tensor_parallel: int = 1, prefill_chunk: int = 0) -> _Geometry:
@@ -147,6 +153,7 @@ class _Geometry:
             kv_block_size=int(kv_block_size),
             tensor_parallel=int(tensor_parallel),
             prefill_chunk=int(prefill_chunk),
+            conv_width=int(config.linear_conv_kernel_dim),
         )
 
 
@@ -181,99 +188,227 @@ def _pin_gdn_kernels() -> None:
 
 
 @dataclass(frozen=True)
-class PrefillRound:
-    """One chunked-scan call: the ``k``-th prefill chunk of every sequence that has one.
+class GdnSpan:
+    """One sequence of GatedDeltaNet tokens as the sampler computed it, for :meth:`GdnLayout.from_spans`.
 
-    ``index`` holds the chunks' tokens in sequence order, ``cu_seqlens`` their boundaries and ``seqs`` the
-    sequence each chunk belongs to; a chunk resumes from the state its sequence's previous chunk left.
+    The span holds packed tokens ``[start, start + length)``. ``segments`` are its kernel calls in order, as
+    ``(decode, lo, hi)`` offsets into the span: a prefill chunk runs the chunked scan and a decode run the recurrent
+    update, each resuming from the state the previous one left. ``resume = (span, offset)`` starts the span from
+    the conv and recurrent state another span had after its first ``offset`` tokens, as a request resumes from a
+    prefix-cache hit; that offset must end one of the other span's segments.
     """
 
+    start: int
+    length: int
+    segments: tuple[tuple[bool, int, int], ...]
+    resume: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class GdnStep:
+    """One kernel call: a segment of each of several spans.
+
+    ``index`` holds the segments' tokens, ``cu_seqlens`` their boundaries and ``spans`` the span of each. A span's
+    state is in slot ``span + 1``; a decode call reads it from its run's first state index and writes the final
+    state back through its last. After the call the states of ``export_src`` are copied to ``export_dst``.
+    """
+
+    decode: bool
     index: torch.Tensor
     cu_seqlens: torch.Tensor
-    seqs: torch.Tensor
+    spans: torch.Tensor
+    state_indices: torch.Tensor | None = None
+    export_src: torch.Tensor | None = None
+    export_dst: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
 class GdnLayout:
-    """How the sampler computed each packed sequence's GatedDeltaNet layers, and the state slots it used.
+    """How the sampler computed the GatedDeltaNet layers of a packed batch, and the state slots it used.
 
-    A sequence is prefilled up to and including its first trained position and decoded after it. With a prefill
-    chunk size ``C`` the prompt is prefilled ``C`` tokens at a time from the sequence start, each chunk resuming
-    from the previous one's state. A one-token chunk is a decode step in vLLM (its query is one token long), so a
-    one-token tail of the prompt is decoded here too. Slot 0 of each state buffer is a scratch slot; sequence ``i``
-    uses slot ``i + 1``.
+    ``steps`` are the sampler's kernel calls in dependency order. ``reference_steps`` compute the same function in
+    the trainer's chunked rule, one call per stretch between the positions other spans resume from. ``prev_index``
+    gives, for each token and each of the conv's ``width - 1`` earlier taps, the token whose input that tap reads
+    (``-1`` for zero), across a resume into the span it resumes from. ``conv_init_spans`` start from those
+    earlier inputs: their conv states are ``conv_init_index``'s tokens.
     """
 
     seq_cu: torch.Tensor
     cache_indices: torch.Tensor
     has_initial_state: torch.Tensor
-    prefill_rounds: tuple[PrefillRound, ...]
-    decode_index: torch.Tensor
-    decode_cu: torch.Tensor
-    decode_state_indices: torch.Tensor
-    offset_in_seq: torch.Tensor
+    steps: tuple[GdnStep, ...]
+    reference_steps: tuple[GdnStep, ...]
+    prev_index: torch.Tensor
+    conv_init_spans: torch.Tensor
+    conv_init_index: torch.Tensor
 
     @property
     def num_seqs(self) -> int:
         return int(self.seq_cu.numel()) - 1
 
+    @property
+    def resumes(self) -> bool:
+        return bool(self.has_initial_state.any().item())
+
     @classmethod
-    def build(cls, cu_seqlens: torch.Tensor, trained: torch.Tensor, prefill_chunk: int = 0) -> GdnLayout:
+    def build(
+        cls, cu_seqlens: torch.Tensor, trained: torch.Tensor, prefill_chunk: int = 0, conv_width: int = 4
+    ) -> GdnLayout:
+        """One span per packed sequence, prefilled through its first trained position and decoded after it.
+
+        With a prefill chunk size ``C`` the prompt is prefilled ``C`` tokens at a time from the sequence start. A
+        one-token chunk is a decode step in vLLM (its query is one token long), so a one-token tail of the prompt
+        is decoded too.
+        """
         device = trained.device
-        seq_cu = cu_seqlens.to(device=device, dtype=torch.int32)
         num_tokens = int(trained.numel())
-        num_seqs = int(seq_cu.numel()) - 1
-        starts = seq_cu[:-1].to(torch.long)
-        ends = seq_cu[1:].to(torch.long)
-        seq_of_token = torch.repeat_interleave(torch.arange(num_seqs, device=device), ends - starts)
-        token = torch.arange(num_tokens, device=device)
-        trained = trained.reshape(-1).to(torch.bool)
-        first = torch.full((num_seqs,), num_tokens, dtype=torch.long, device=device)
-        first = first.scatter_reduce(0, seq_of_token[trained], token[trained], reduce="amin", include_self=True)
-        prompt_ends = torch.minimum(first + 1, ends).tolist()
+        bounds = cu_seqlens.to(torch.long).tolist()
+        trained_positions = torch.nonzero(trained.reshape(-1).to(torch.bool), as_tuple=False).flatten().tolist()
+        spans = []
+        cursor = 0
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            while cursor < len(trained_positions) and trained_positions[cursor] < start:
+                cursor += 1
+            first = trained_positions[cursor] if cursor < len(trained_positions) else num_tokens
+            prompt_end = min(first + 1, end) - start
+            chunk = prefill_chunk if prefill_chunk > 0 else max(prompt_end, 1)
+            cuts = list(range(0, prompt_end, chunk)) + [prompt_end]
+            segments = [(False, lo, hi) for lo, hi in zip(cuts[:-1], cuts[1:])]
+            spans.append(GdnSpan(start, end - start, tuple(segments) + ((True, prompt_end, end - start),)))
+        return cls.from_spans(spans, num_tokens=num_tokens, conv_width=conv_width, device=device)
 
-        rounds: list[list[tuple[int, int, int]]] = []
-        decode_starts = []
-        for seq, (seq_start, prompt_end) in enumerate(zip(starts.tolist(), prompt_ends)):
-            chunk = prefill_chunk if prefill_chunk > 0 else max(prompt_end - seq_start, 1)
-            cuts = list(range(seq_start, prompt_end, chunk)) + [prompt_end]
-            chunks = list(zip(cuts[:-1], cuts[1:]))
-            if chunks and chunks[-1][1] - chunks[-1][0] == 1:
-                decode_starts.append(chunks.pop()[0])
-            else:
-                decode_starts.append(prompt_end)
-            for k, (lo, hi) in enumerate(chunks):
-                if len(rounds) <= k:
-                    rounds.append([])
-                rounds[k].append((seq, lo, hi))
+    @classmethod
+    def from_spans(cls, spans: list[GdnSpan], *, num_tokens: int, conv_width: int, device: torch.device) -> GdnLayout:
+        spans = [_normalized_span(span) for span in spans]
+        levels = _span_levels(spans)
+        exports: dict[tuple[int, int], list[int]] = {}
+        for index, span in enumerate(spans):
+            if span.resume is not None:
+                provider, offset = span.resume
+                if offset < conv_width - 1 or offset not in {hi for _, _, hi in spans[provider].segments}:
+                    raise ValueError(f"span {index} resumes at offset {offset}, which no segment of {provider} ends")
+                exports.setdefault((provider, offset), []).append(index)
 
-        zero = torch.zeros(1, dtype=torch.int32, device=device)
-        prefill_rounds = []
-        for chunks in rounds:
-            lengths = torch.tensor([hi - lo for _, lo, hi in chunks], dtype=torch.int32, device=device)
-            prefill_rounds.append(
-                PrefillRound(
-                    index=torch.cat([torch.arange(lo, hi, device=device) for _, lo, hi in chunks]),
-                    cu_seqlens=torch.cat((zero, torch.cumsum(lengths, 0, dtype=torch.int32))),
-                    seqs=torch.tensor([seq for seq, _, _ in chunks], dtype=torch.long, device=device),
-                )
-            )
-        decode_start = torch.tensor(decode_starts, dtype=torch.long, device=device)
-        decoded = token >= decode_start[seq_of_token]
-        decode_lens = (ends - decode_start).to(torch.int32)
-        max_decode = max(int(decode_lens.max().item()) if num_seqs else 0, 1)
-        decode_state_indices = torch.zeros((num_seqs, max_decode), dtype=torch.int32, device=device)
-        decode_state_indices[:, 0] = torch.arange(1, num_seqs + 1, dtype=torch.int32, device=device)
+        steps: list[GdnStep] = []
+        reference_steps: list[GdnStep] = []
+        for level in range(max(levels, default=-1) + 1):
+            members = [i for i, value in enumerate(levels) if value == level]
+            for k in range(max(len(spans[i].segments) for i in members)):
+                for decode in (False, True):
+                    pieces = [
+                        (i, lo, hi) for i in members if k < len(spans[i].segments)
+                        for seg_decode, lo, hi in (spans[i].segments[k],) if seg_decode == decode
+                    ]  # fmt: skip
+                    if pieces:
+                        steps.append(_gdn_step(spans, pieces, exports, decode, device))
+            reference_pieces = {i: _reference_pieces(i, spans[i], exports) for i in members}
+            for k in range(max(len(pieces) for pieces in reference_pieces.values())):
+                pieces = [(i, *reference_pieces[i][k]) for i in members if k < len(reference_pieces[i])]
+                reference_steps.append(_gdn_step(spans, pieces, exports, False, device))
+
+        token_span = torch.empty(num_tokens, dtype=torch.long)
+        offset = torch.empty(num_tokens, dtype=torch.long)
+        for index, span in enumerate(spans):
+            token_span[span.start : span.start + span.length] = index
+            offset[span.start : span.start + span.length] = torch.arange(span.length)
+        prev_index = torch.full((num_tokens, max(conv_width - 1, 0)), -1, dtype=torch.long)
+        for shift in range(1, conv_width):
+            prev_index[:, shift - 1] = _earlier_token(spans, token_span, offset, shift)
+        init_spans = [i for i, span in enumerate(spans) if span.resume is not None]
+        init_index = [
+            [spans[spans[i].resume[0]].start + spans[i].resume[1] - conv_width + 1 + tap for tap in range(conv_width - 1)]
+            for i in init_spans
+        ]  # fmt: skip
+        lengths = torch.tensor([span.length for span in spans], dtype=torch.int32)
         return cls(
-            seq_cu=seq_cu,
-            cache_indices=torch.arange(1, num_seqs + 1, dtype=torch.int32, device=device),
-            has_initial_state=torch.zeros(num_seqs, dtype=torch.bool, device=device),
-            prefill_rounds=tuple(prefill_rounds),
-            decode_index=torch.nonzero(decoded, as_tuple=False).flatten(),
-            decode_cu=torch.cat((zero, torch.cumsum(decode_lens, 0, dtype=torch.int32))),
-            decode_state_indices=decode_state_indices,
-            offset_in_seq=token - starts[seq_of_token],
+            seq_cu=torch.cat((torch.zeros(1, dtype=torch.int32), torch.cumsum(lengths, 0, dtype=torch.int32))).to(
+                device
+            ),
+            cache_indices=torch.arange(1, len(spans) + 1, dtype=torch.int32, device=device),
+            has_initial_state=torch.tensor(
+                [span.resume is not None for span in spans], dtype=torch.bool, device=device
+            ),
+            steps=tuple(steps),
+            reference_steps=tuple(reference_steps),
+            prev_index=prev_index.to(device),
+            conv_init_spans=torch.tensor(init_spans, dtype=torch.long, device=device),
+            conv_init_index=torch.tensor(init_index, dtype=torch.long, device=device).reshape(
+                -1, max(conv_width - 1, 0)
+            ),
         )
+
+
+def _normalized_span(span: GdnSpan) -> GdnSpan:
+    """Drop empty segments, run a one-token prefill chunk as the decode step vLLM makes of it, merge decode runs."""
+    segments: list[tuple[bool, int, int]] = []
+    for decode, lo, hi in span.segments:
+        if hi <= lo:
+            continue
+        decode = decode or hi - lo == 1
+        if segments and segments[-1][0] and decode and segments[-1][2] == lo:
+            segments[-1] = (True, segments[-1][1], hi)
+        else:
+            segments.append((decode, lo, hi))
+    covered = [lo for _, lo, _ in segments] + [span.length]
+    if (segments and segments[0][1] != 0) or any(hi != nxt for (_, _, hi), nxt in zip(segments, covered[1:])):
+        raise ValueError(f"segments {span.segments} do not tile a span of {span.length} tokens")
+    return GdnSpan(span.start, span.length, tuple(segments), span.resume)
+
+
+def _span_levels(spans: list[GdnSpan]) -> list[int]:
+    """Each span's distance from a span that starts fresh, following ``resume``."""
+    levels: list[int | None] = [None] * len(spans)
+
+    def level(index: int, seen: frozenset) -> int:
+        if levels[index] is None:
+            resume = spans[index].resume
+            if resume is not None and resume[0] in seen | {index}:
+                raise ValueError(f"span {index} resumes in a cycle")
+            levels[index] = 0 if resume is None else level(resume[0], seen | {index}) + 1
+        return levels[index]
+
+    return [level(i, frozenset()) for i in range(len(spans))]
+
+
+def _reference_pieces(index: int, span: GdnSpan, exports: dict) -> list[tuple[int, int]]:
+    cuts = sorted({0, span.length} | {offset for provider, offset in exports if provider == index})
+    return [(lo, hi) for lo, hi in zip(cuts[:-1], cuts[1:]) if hi > lo]
+
+
+def _gdn_step(spans, pieces, exports, decode: bool, device) -> GdnStep:
+    lengths = torch.tensor([hi - lo for _, lo, hi in pieces], dtype=torch.int32)
+    index = torch.cat([torch.arange(spans[i].start + lo, spans[i].start + hi) for i, lo, hi in pieces])
+    state_indices = None
+    if decode:
+        state_indices = torch.zeros((len(pieces), int(lengths.max())), dtype=torch.int32)
+        for row, ((i, _, _), length) in enumerate(zip(pieces, lengths.tolist())):
+            state_indices[row, 0] = state_indices[row, length - 1] = i + 1
+    pairs = [(i, dst) for i, _, hi in pieces for dst in exports.get((i, hi), ())]
+    return GdnStep(
+        decode=decode,
+        index=index.to(device),
+        cu_seqlens=torch.cat((torch.zeros(1, dtype=torch.int32), torch.cumsum(lengths, 0, dtype=torch.int32))).to(
+            device
+        ),
+        spans=torch.tensor([i for i, _, _ in pieces], dtype=torch.long, device=device),
+        state_indices=None if state_indices is None else state_indices.to(device),
+        export_src=torch.tensor([s for s, _ in pairs], dtype=torch.long, device=device) if pairs else None,
+        export_dst=torch.tensor([d for _, d in pairs], dtype=torch.long, device=device) if pairs else None,
+    )
+
+
+def _earlier_token(spans: list[GdnSpan], token_span: torch.Tensor, offset: torch.Tensor, shift: int) -> torch.Tensor:
+    """The token ``shift`` places before each token in its lineage, or ``-1`` before the lineage starts."""
+    out = torch.full_like(token_span, -1)
+    for index, span in enumerate(spans):
+        rows = slice(span.start, span.start + span.length)
+        back = offset[rows] - shift
+        own = back >= 0
+        out[rows][own] = span.start + back[own]
+        if span.resume is not None and bool((~own).any()):
+            provider, resume_offset = span.resume
+            out[rows][~own] = spans[provider].start + resume_offset + back[~own]
+    return out
 
 
 def _split_qkv(
@@ -300,18 +435,18 @@ def _reference_gated_delta_rule():
     return chunk_gated_delta_rule
 
 
-def _reference_causal_conv(x: torch.Tensor, weight: torch.Tensor, offset_in_seq: torch.Tensor) -> torch.Tensor:
+def _reference_causal_conv(x: torch.Tensor, weight: torch.Tensor, prev_index: torch.Tensor) -> torch.Tensor:
     """Depthwise causal convolution and SiLU over packed sequences, differentiable.
 
-    ``x`` is ``[tokens, channels]``, ``weight`` ``[channels, width]``; a tap that would read before a token's own
-    sequence start reads zero.
+    ``x`` is ``[tokens, channels]``, ``weight`` ``[channels, width]``; tap ``s`` of a token reads the token
+    ``prev_index[:, s - 1]``, or zero where that is ``-1``.
     """
-    tokens, width = x.shape[0], weight.shape[1]
+    width = weight.shape[1]
     out = x * weight[:, width - 1]
     for shift in range(1, width):
-        shifted = torch.nn.functional.pad(x, (0, 0, shift, 0))[:tokens]
-        valid = (offset_in_seq >= shift).to(x.dtype)[:, None]
-        out = out + shifted * valid * weight[:, width - 1 - shift]
+        source = prev_index[:, shift - 1]
+        valid = (source >= 0).to(x.dtype)[:, None]
+        out = out + x[source.clamp(min=0)] * valid * weight[:, width - 1 - shift]
     return torch.nn.functional.silu(out)
 
 
@@ -340,6 +475,8 @@ def _gated_delta_net_core_kernel(mixed_qkv, a, b, A_log, dt_bias, conv_weight, d
     a_log = A_log.to(torch.float32)
     conv_weight = conv_weight.view(conv_dim, conv_weight.shape[-1])
     conv_states = mixed_qkv.new_zeros((gdn.num_seqs + 1, conv_dim, conv_weight.shape[-1] - 1))
+    if gdn.conv_init_spans.numel() > 0:
+        conv_states[gdn.conv_init_spans + 1] = mixed_qkv[gdn.conv_init_index].transpose(1, 2)
     conv_out = _causal_conv1d_fn()(
         mixed_qkv.transpose(0, 1),
         conv_weight,
@@ -353,55 +490,56 @@ def _gated_delta_net_core_kernel(mixed_qkv, a, b, A_log, dt_bias, conv_weight, d
 
     core = torch.zeros((tokens, dims.num_v_heads, dims.head_v_dim), dtype=mixed_qkv.dtype, device=mixed_qkv.device)
     state_shape = (dims.num_v_heads, dims.head_v_dim, dims.head_k_dim)
-    final_state = torch.zeros((gdn.num_seqs, *state_shape), dtype=torch.float32, device=mixed_qkv.device)
-    for prefill in gdn.prefill_rounds:
-        query, key, value, g, beta = fla_ops.fused_post_conv_prep(
-            conv_output=conv_out[prefill.index],
-            a=a[prefill.index],
-            b=b[prefill.index],
-            A_log=a_log,
-            dt_bias=dt_bias,
-            num_k_heads=dims.num_k_heads,
-            head_k_dim=dims.head_k_dim,
-            head_v_dim=dims.head_v_dim,
-            apply_l2norm=True,
-            output_g_exp=False,
-        )
-        out, round_state = fla_ops.chunk_gated_delta_rule(
-            q=query.unsqueeze(0),
-            k=key.unsqueeze(0),
-            v=value.unsqueeze(0),
-            g=g.unsqueeze(0),
-            beta=beta.unsqueeze(0),
-            initial_state=final_state[prefill.seqs].contiguous(),
-            output_final_state=True,
-            cu_seqlens=prefill.cu_seqlens,
-            use_qk_l2norm_in_kernel=False,
-        )
-        core[prefill.index] = out.squeeze(0).to(core.dtype)
-        final_state[prefill.seqs] = round_state.to(torch.float32)
-
-    if gdn.decode_index.numel() > 0:
-        state = torch.zeros((gdn.num_seqs + 1, *state_shape), dtype=torch.float32, device=mixed_qkv.device)
-        state[1:] = final_state.to(torch.float32)
-        query, key, value = _split_qkv(
-            conv_out[gdn.decode_index], dims.key_dim, dims.value_dim, dims.num_k_heads, dims.num_v_heads
-        )
-        decode_out, _ = fla_ops.fused_sigmoid_gating_delta_rule_update(
-            A_log=a_log,
-            a=a[gdn.decode_index],
-            b=b[gdn.decode_index],
-            dt_bias=dt_bias,
-            q=query,
-            k=key,
-            v=value,
-            initial_state=state,
-            inplace_final_state=True,
-            cu_seqlens=gdn.decode_cu,
-            ssm_state_indices=gdn.decode_state_indices,
-            use_qk_l2norm_in_kernel=True,
-        )
-        core[gdn.decode_index] = decode_out.reshape(-1, dims.num_v_heads, dims.head_v_dim).to(core.dtype)
+    state = torch.zeros((gdn.num_seqs + 1, *state_shape), dtype=torch.float32, device=mixed_qkv.device)
+    for step in gdn.steps:
+        slots = step.spans + 1
+        if not step.decode:
+            query, key, value, g, beta = fla_ops.fused_post_conv_prep(
+                conv_output=conv_out[step.index],
+                a=a[step.index],
+                b=b[step.index],
+                A_log=a_log,
+                dt_bias=dt_bias,
+                num_k_heads=dims.num_k_heads,
+                head_k_dim=dims.head_k_dim,
+                head_v_dim=dims.head_v_dim,
+                apply_l2norm=True,
+                output_g_exp=False,
+            )
+            out, step_state = fla_ops.chunk_gated_delta_rule(
+                q=query.unsqueeze(0),
+                k=key.unsqueeze(0),
+                v=value.unsqueeze(0),
+                g=g.unsqueeze(0),
+                beta=beta.unsqueeze(0),
+                initial_state=state[slots].contiguous(),
+                output_final_state=True,
+                cu_seqlens=step.cu_seqlens,
+                use_qk_l2norm_in_kernel=False,
+            )
+            core[step.index] = out.squeeze(0).to(core.dtype)
+            state[slots] = step_state.to(torch.float32)
+        else:
+            query, key, value = _split_qkv(
+                conv_out[step.index], dims.key_dim, dims.value_dim, dims.num_k_heads, dims.num_v_heads
+            )
+            out, _ = fla_ops.fused_sigmoid_gating_delta_rule_update(
+                A_log=a_log,
+                a=a[step.index],
+                b=b[step.index],
+                dt_bias=dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                initial_state=state,
+                inplace_final_state=True,
+                cu_seqlens=step.cu_seqlens,
+                ssm_state_indices=step.state_indices,
+                use_qk_l2norm_in_kernel=True,
+            )
+            core[step.index] = out.reshape(-1, dims.num_v_heads, dims.head_v_dim).to(core.dtype)
+        if step.export_src is not None:
+            state[step.export_dst + 1] = state[step.export_src + 1]
     return core
 
 
@@ -409,25 +547,56 @@ def _gated_delta_net_core_reference(mixed_qkv, a, b, A_log, dt_bias, conv_weight
     """The same function as :func:`_gated_delta_net_core_kernel`, in the trainer's differentiable kernels."""
     tokens = mixed_qkv.shape[0]
     conv_weight = conv_weight.reshape(conv_weight.shape[0], conv_weight.shape[-1])
-    conv_out = _reference_causal_conv(mixed_qkv.float(), conv_weight.float(), gdn.offset_in_seq).to(mixed_qkv.dtype)
+    conv_out = _reference_causal_conv(mixed_qkv.float(), conv_weight.float(), gdn.prev_index).to(mixed_qkv.dtype)
     query, key, value = conv_out.split([dims.key_dim, dims.key_dim, dims.value_dim], dim=-1)
     groups = dims.num_v_heads // dims.num_k_heads
-    query = query.reshape(1, tokens, dims.num_k_heads, dims.head_k_dim).repeat_interleave(groups, dim=2)
-    key = key.reshape(1, tokens, dims.num_k_heads, dims.head_k_dim).repeat_interleave(groups, dim=2)
-    value = value.reshape(1, tokens, dims.num_v_heads, dims.head_v_dim)
+    query = query.reshape(tokens, dims.num_k_heads, dims.head_k_dim).repeat_interleave(groups, dim=1)
+    key = key.reshape(tokens, dims.num_k_heads, dims.head_k_dim).repeat_interleave(groups, dim=1)
+    value = value.reshape(tokens, dims.num_v_heads, dims.head_v_dim)
     g = -A_log.float().exp() * torch.nn.functional.softplus(a.float() + dt_bias.float())
-    out, _ = _reference_gated_delta_rule()(
-        query,
-        key,
-        value,
-        g=g.unsqueeze(0),
-        beta=b.sigmoid().unsqueeze(0),
-        initial_state=None,
-        output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
-        cu_seqlens=gdn.seq_cu.to(torch.long),
-    )
-    return out.reshape(tokens, dims.num_v_heads, dims.head_v_dim)
+    beta = b.sigmoid()
+    rule = _reference_gated_delta_rule()
+    if not gdn.resumes and len(gdn.reference_steps) == 1:
+        out, _ = rule(
+            query[None],
+            key[None],
+            value[None],
+            g=g[None],
+            beta=beta[None],
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=gdn.seq_cu.to(torch.long),
+        )
+        return out.reshape(tokens, dims.num_v_heads, dims.head_v_dim)
+
+    # fla's state is [value heads, head_k_dim, head_v_dim]; it only flows between the reference's own calls.
+    states: list[torch.Tensor | None] = [None] * gdn.num_seqs
+    zero = mixed_qkv.new_zeros((dims.num_v_heads, dims.head_k_dim, dims.head_v_dim), dtype=torch.float32)
+    pieces, rows = [], []
+    for step in gdn.reference_steps:
+        spans = step.spans.tolist()
+        index = step.index
+        out, final = rule(
+            query[index][None],
+            key[index][None],
+            value[index][None],
+            g=g[index][None],
+            beta=beta[index][None],
+            initial_state=torch.stack([zero if states[i] is None else states[i] for i in spans]),
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=step.cu_seqlens.to(torch.long),
+        )
+        pieces.append(out[0])
+        rows.append(index)
+        for position, i in enumerate(spans):
+            states[i] = final[position]
+        if step.export_src is not None:
+            for src, dst in zip(step.export_src.tolist(), step.export_dst.tolist()):
+                states[dst] = states[src]
+    core = torch.cat(pieces)[torch.argsort(torch.cat(rows))]
+    return core.reshape(tokens, dims.num_v_heads, dims.head_v_dim)
 
 
 class _GatedDeltaNetCore(torch.autograd.Function):
@@ -634,23 +803,40 @@ def aligned_logprobs(
     *,
     cu_seqlens: torch.Tensor | None,
     temperature: float,
+    plan: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The sampler's logprob of each ``labels`` token, ``[tokens]`` in fp32, differentiable; -100 scores 0.
 
-    With gradients enabled the decoder layers after the first are checkpointed in pairs; a recompute reruns the same
-    kernels, so it reproduces the forward exactly.
+    ``plan`` is a :mod:`~arctic_platform.model.implementations.vllm_aligned.turn_plan` plan, ``[..., tokens, K,
+    3]``: each row is then replayed request by request, and ``trained`` is not used. With gradients enabled the
+    decoder layers after the first are checkpointed in pairs; a recompute reruns the same kernels, so it
+    reproduces the forward exactly.
     """
     backbone = model.model
     geometry: _Geometry = model._vllm_aligned_geometry
     if position_ids.dim() == 3:
         position_ids = position_ids[0]
     layout = ops.PackedLayout.build(position_ids, block_size=geometry.kv_block_size, cu_seqlens=cu_seqlens)
+    token_ids, labels = input_ids.reshape(-1), labels.reshape(-1)
+    turns = None
+    if plan is not None:
+        turns = build_turn_layout(
+            plan.reshape(-1, *plan.shape[-2:]),
+            layout.cu_seqlens,
+            block_size=geometry.kv_block_size,
+            conv_width=geometry.conv_width,
+            device=token_ids.device,
+        )
+        token_ids, labels = token_ids[turns.expand_index], labels[turns.expand_index]
+        layout, gdn = turns.attention, turns.gdn
+    else:
+        gdn = GdnLayout.build(layout.cu_seqlens, trained, geometry.prefill_chunk, geometry.conv_width)
     positions = layout.positions
-    hidden = ops.tensor_parallel_embedding(backbone.embed_tokens(input_ids.reshape(-1)), geometry.tensor_parallel)
+    hidden = ops.tensor_parallel_embedding(backbone.embed_tokens(token_ids), geometry.tensor_parallel)
     ctx = _ForwardContext(
         geometry=geometry,
         layout=layout,
-        gdn=GdnLayout.build(layout.cu_seqlens, trained, geometry.prefill_chunk),
+        gdn=gdn,
         rope_positions=positions.unsqueeze(0).expand(3, -1) if geometry.mrope_section else positions,
         cos_sin_cache=_cos_sin_cache(backbone, geometry, hidden.dtype, positions.device),
         fa_version=ops.flash_attn_version(geometry.head_dim),
@@ -666,10 +852,13 @@ def aligned_logprobs(
         else:
             hidden, residual = _decoder_layers(group, hidden, residual, ctx)
     hidden, _ = ops.gemma_rms_norm(hidden, backbone.norm.weight, geometry.eps, residual)
+    if turns is not None:
+        scored = turns.output_index.clamp(min=0)
+        hidden, labels = hidden[scored], torch.where(turns.output_index >= 0, labels[scored], -100)
     return ops.lm_head_logprobs(
         hidden,
         model.lm_head.weight,
-        labels.reshape(-1),
+        labels,
         temperature=temperature,
         token_chunk_size=model._vllm_aligned_token_chunk_size,
         fp32=model._vllm_aligned_lm_head_fp32,
@@ -694,6 +883,7 @@ def _causal_lm_forward(
     from arctic_platform.model.implementations.vllm_aligned.qwen3 import _scalar_temperature
 
     loss_mask = kwargs.pop(LOSS_MASK_KWARG, None)
+    plan = kwargs.pop(PLAN_KWARG, None)
     if not dss_compute_logprobs:
         return self._vllm_aligned_stock_forward(
             input_ids=input_ids,
@@ -722,6 +912,7 @@ def _causal_lm_forward(
         trained.to(input_ids.device),
         cu_seqlens=kwargs.get("cu_seq_lens_q"),
         temperature=_scalar_temperature(temperature),
+        plan=plan,
     )
     return {"logprobs": logprobs.view(input_ids.shape)}
 

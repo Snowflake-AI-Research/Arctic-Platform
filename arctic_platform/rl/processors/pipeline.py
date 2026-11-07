@@ -115,6 +115,8 @@ _ENGINE_FWD_KEYS = frozenset(
         "seq_idx",
         # The trained positions, for a vLLM-aligned hybrid that has to tell prefilled tokens from decoded ones.
         "vllm_aligned_loss_mask",
+        # How a prefix-caching sampler computed each turn of a multi-turn row, for the same model.
+        "vllm_aligned_plan",
     }
 )
 # Blocked even if listed in ``fwd_meta_keys``. ``labels`` stays on the allowlist

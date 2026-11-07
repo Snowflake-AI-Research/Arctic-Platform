@@ -20,6 +20,11 @@ sampler's numbers needs every chunk's boundaries, and with prefix caching also w
 cache. With ``ARCTIC_REPORT_PREFILL_CHUNKS=1`` the scheduler records ``[start, end)`` of every prefill chunk it
 schedules for a request and returns them, with whether the request was preempted, in the finished request's
 ``kv_transfer_params`` under :data:`KEY`. The first chunk's start is the cache-hit length.
+
+The report also names the blocks the request held when it finished, for the first full-attention and the first
+Mamba KV cache group (``attention_blocks``, ``mamba_blocks``): a later request whose hit holds the same block id
+read what this request wrote there, unless another request rewrote it in between. That is how a client finds which
+earlier request computed each cached page and state of a multi-turn conversation.
 """
 
 from __future__ import annotations
@@ -54,7 +59,23 @@ def chunk_report(request: Any) -> dict[str, Any] | None:
     chunks = getattr(request, "_arctic_prefill_chunks", None)
     if chunks is None:
         return None
-    return {"chunks": [list(chunk) for chunk in chunks], "preempted": bool(getattr(request, "_arctic_preempted", False))}
+    report = {
+        "chunks": [list(chunk) for chunk in chunks],
+        "preempted": bool(getattr(request, "_arctic_preempted", False)),
+    }
+    report.update(getattr(request, "_arctic_blocks", None) or {})
+    return report
+
+
+def group_blocks(kv_cache_groups: Any, block_ids: tuple) -> dict[str, list[int]]:
+    """The block ids of the first full-attention group and the first Mamba group, by the groups' spec types."""
+    out: dict[str, list[int]] = {}
+    for group, ids in zip(kv_cache_groups, block_ids):
+        names = {cls.__name__ for cls in type(group.kv_cache_spec).__mro__}
+        key = "mamba_blocks" if "MambaSpec" in names else "attention_blocks" if "FullAttentionSpec" in names else None
+        if key is not None and key not in out:
+            out[key] = [int(block) for block in ids]
+    return out
 
 
 def ensure_prefill_chunk_report() -> None:
@@ -74,6 +95,9 @@ def ensure_prefill_chunk_report() -> None:
         return original_update(self, scheduler_output)
 
     def _free_request(self, request, delay_free_blocks: bool = False):
+        if getattr(request, "_arctic_prefill_chunks", None) is not None:
+            block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
+            request._arctic_blocks = group_blocks(self.kv_cache_config.kv_cache_groups, block_ids)
         kv_params, ec_params = original_free(self, request, delay_free_blocks)
         report = chunk_report(request)
         if report is not None:

@@ -42,3 +42,26 @@ def test_a_restarted_prefill_is_reported_as_preempted():
 
 def test_no_report_for_a_request_that_never_prefilled():
     assert chunk_report(_request(10, 5)) is None
+
+
+def test_reports_the_first_attention_and_mamba_groups_blocks():
+    from arctic_platform.inference.vllm.prefill_chunk_report import group_blocks
+
+    class FullAttentionSpec:
+        pass
+
+    class MambaSpec:
+        pass
+
+    class GdnSpec(MambaSpec):
+        pass
+
+    groups = [types.SimpleNamespace(kv_cache_spec=spec()) for spec in (GdnSpec, FullAttentionSpec, GdnSpec)]
+    assert group_blocks(groups, ([3, 0, 9], [4, 5, 6], [7, 0, 8])) == {
+        "mamba_blocks": [3, 0, 9],
+        "attention_blocks": [4, 5, 6],
+    }
+    request = _request(0, 10)
+    record_scheduled_chunk(request, 10)
+    request._arctic_blocks = {"attention_blocks": [1]}
+    assert chunk_report(request) == {"chunks": [[0, 10]], "preempted": False, "attention_blocks": [1]}

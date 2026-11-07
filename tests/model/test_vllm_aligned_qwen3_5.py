@@ -49,8 +49,8 @@ def _causal_attention(query, key, value, scale):
     key = key.repeat_interleave(groups, dim=1)
     value = value.repeat_interleave(groups, dim=1)
     scores = torch.einsum("qhd,khd->hqk", query, key) * scale
-    length = query.shape[0]
-    mask = torch.ones(length, length, dtype=torch.bool).triu(1)
+    queries, keys = query.shape[0], key.shape[0]
+    mask = torch.ones(queries, keys, dtype=torch.bool).triu(keys - queries + 1)
     probs = torch.softmax(scores.masked_fill(mask, float("-inf")), dim=-1)
     return torch.einsum("hqk,khd->qhd", probs, value)
 
@@ -118,10 +118,13 @@ class _FakeFaUtils:
 
 
 def _fake_trainer_flash_attn(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale=None, causal=False):
-    assert causal and torch.equal(cu_q, cu_k)
-    bounds = cu_q.tolist()
+    assert causal
+    q_bounds, k_bounds = cu_q.tolist(), cu_k.tolist()
     return torch.cat(
-        [_causal_attention(q[a:b], k[a:b], v[a:b], softmax_scale) for a, b in zip(bounds[:-1], bounds[1:])]
+        [
+            _causal_attention(q[a:b], k[c:d], v[c:d], softmax_scale)
+            for a, b, c, d in zip(q_bounds[:-1], q_bounds[1:], k_bounds[:-1], k_bounds[1:])
+        ]
     )
 
 
@@ -181,13 +184,16 @@ def _fake_causal_conv1d_fn(
     query_start_loc,
     **_,
 ):
-    assert activation == "silu" and not bool(has_initial_state.any())
+    assert activation == "silu"
     assert x.stride(0) == 1, "the sampler passes the projection transposed, channel-last"
     width = weight.shape[1]
     out = torch.empty_like(x)
     bounds = query_start_loc.tolist()
-    for start, stop in itertools.pairwise(bounds):
-        padded = F.pad(x[:, start:stop], (width - 1, 0))
+    for seq, (start, stop) in enumerate(itertools.pairwise(bounds)):
+        if bool(has_initial_state[seq]):
+            padded = torch.cat((conv_states[int(cache_indices[seq])], x[:, start:stop]), dim=1)
+        else:
+            padded = F.pad(x[:, start:stop], (width - 1, 0))
         out[:, start:stop] = F.silu(F.conv1d(padded[None], weight[:, None, :], bias, groups=weight.shape[0])[0])
     return out
 
@@ -260,30 +266,39 @@ class _FakeFlaOps:
         out = torch.zeros_like(v[0])
         bounds = cu_seqlens.tolist()
         for index, (start, stop) in enumerate(itertools.pairwise(bounds)):
-            slot = int(ssm_state_indices[index, 0])
-            out[start:stop], initial_state[slot] = _recurrence(
+            slot, final_slot = int(ssm_state_indices[index, 0]), int(ssm_state_indices[index, stop - start - 1])
+            out[start:stop], final = _recurrence(
                 query[start:stop], key[start:stop], v[0, start:stop], g[start:stop], beta[start:stop],
                 initial_state[slot],
             )  # fmt: skip
+            if final_slot > 0:
+                initial_state[final_slot] = final
         return out[None], initial_state
 
 
 def _fake_reference_gated_delta_rule(
     q, k, v, *, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel, cu_seqlens
 ):
-    """fla's chunked rule as a differentiable recurrence; ``q``/``k`` already carry the value heads."""
-    assert initial_state is None and not output_final_state and use_qk_l2norm_in_kernel
+    """fla's chunked rule as a differentiable recurrence; ``q``/``k`` already carry the value heads.
+
+    The state is fla's ``[heads, head_k_dim, head_v_dim]``.
+    """
+    assert use_qk_l2norm_in_kernel
     query, key = _l2norm(q[0].float()), _l2norm(k[0].float())
     bounds = cu_seqlens.tolist()
-    outputs = []
-    for start, stop in zip(bounds[:-1], bounds[1:]):
-        state = torch.zeros(v.shape[2], v.shape[3], q.shape[3], dtype=torch.float32)
-        out, _ = _recurrence(
+    outputs, finals = [], []
+    for index, (start, stop) in enumerate(zip(bounds[:-1], bounds[1:])):
+        if initial_state is None:
+            state = torch.zeros(v.shape[2], v.shape[3], q.shape[3], dtype=torch.float32)
+        else:
+            state = initial_state[index].transpose(-1, -2)
+        out, final = _recurrence(
             query[start:stop], key[start:stop], v[0, start:stop].float(), g[0, start:stop], beta[0, start:stop].float(),
             state,
         )  # fmt: skip
         outputs.append(out)
-    return torch.cat(outputs)[None].to(v.dtype), None
+        finals.append(final.transpose(-1, -2))
+    return torch.cat(outputs)[None].to(v.dtype), torch.stack(finals) if output_final_state else None
 
 
 def _fake_rmsnorm_fn(x, weight, bias, *, z, eps, group_size, norm_before_gate, activation):
@@ -412,14 +427,17 @@ def test_layout_prefills_through_the_first_trained_position():
     trained[2:4] = True  # sequence 0: prompt 0..2, decode 3..4
     trained[11] = True  # sequence 2: its last token is the first trained one, so nothing is decoded
     layout = qwen3_5.GdnLayout.build(cu_seqlens, trained)
-    (prefill,) = layout.prefill_rounds
-    assert prefill.index.tolist() == [0, 1, 2, 5, 6, 7, 8, 9, 10, 11]
-    assert prefill.cu_seqlens.tolist() == [0, 3, 7, 10]
-    assert prefill.seqs.tolist() == [0, 1, 2]
-    assert layout.decode_index.tolist() == [3, 4]
-    assert layout.decode_cu.tolist() == [0, 2, 2, 2]
-    assert layout.decode_state_indices[:, 0].tolist() == [1, 2, 3]
+    assert _steps(layout) == [
+        (False, [0, 1, 2, 5, 6, 7, 8, 9, 10, 11], [0, 3, 7, 10], [0, 1, 2]),
+        (True, [3, 4], [0, 2], [0]),
+    ]
+    assert layout.steps[1].state_indices.tolist() == [[1, 1]]
     assert layout.cache_indices.tolist() == [1, 2, 3]
+    assert not layout.resumes and len(layout.reference_steps) == 1
+
+
+def _steps(layout):
+    return [(s.decode, s.index.tolist(), s.cu_seqlens.tolist(), s.spans.tolist()) for s in layout.steps]
 
 
 def test_layout_cuts_prompts_into_chunks_and_decodes_a_one_token_tail():
@@ -428,21 +446,54 @@ def test_layout_cuts_prompts_into_chunks_and_decodes_a_one_token_tail():
     trained[6:9] = True  # sequence 0: prompt 0..6 (7 tokens), decode 7..9
     trained[15] = True  # sequence 1: prompt 10..15 (6 tokens), decode 16
     layout = qwen3_5.GdnLayout.build(cu_seqlens, trained, prefill_chunk=3)
-    rounds = [(r.index.tolist(), r.cu_seqlens.tolist(), r.seqs.tolist()) for r in layout.prefill_rounds]
     # Sequence 0: chunks [0,3) and [3,6); its tail [6,7) is one token, so vLLM decodes it.
     # Sequence 1: chunks [10,13) and [13,16).
-    assert rounds == [
-        ([0, 1, 2, 10, 11, 12], [0, 3, 6], [0, 1]),
-        ([3, 4, 5, 13, 14, 15], [0, 3, 6], [0, 1]),
+    assert _steps(layout) == [
+        (False, [0, 1, 2, 10, 11, 12], [0, 3, 6], [0, 1]),
+        (False, [3, 4, 5, 13, 14, 15], [0, 3, 6], [0, 1]),
+        (True, [6, 7, 8, 9, 16], [0, 4, 5], [0, 1]),
     ]
-    assert layout.decode_index.tolist() == [6, 7, 8, 9, 16]
-    assert layout.decode_cu.tolist() == [0, 4, 5]
 
 
 def test_a_one_token_prompt_is_decoded():
     layout = qwen3_5.GdnLayout.build(torch.tensor([0, 4], dtype=torch.int32), torch.tensor([1, 1, 1, 0]).bool())
-    assert layout.prefill_rounds == ()
-    assert layout.decode_index.tolist() == [0, 1, 2, 3]
+    assert _steps(layout) == [(True, [0, 1, 2, 3], [0, 4], [0])]
+
+
+def test_resumed_spans_take_state_and_conv_inputs_from_their_provider():
+    spans = [
+        qwen3_5.GdnSpan(0, 10, ((False, 0, 4), (False, 4, 8), (True, 8, 10))),
+        qwen3_5.GdnSpan(10, 5, ((False, 0, 3), (True, 3, 5)), resume=(0, 8)),
+        qwen3_5.GdnSpan(15, 3, ((False, 0, 3),), resume=(1, 3)),
+    ]
+    layout = qwen3_5.GdnLayout.from_spans(spans, num_tokens=18, conv_width=4, device=torch.device("cpu"))
+    steps = [(s.decode, s.index.tolist(), s.spans.tolist()) for s in layout.steps]
+    assert steps == [
+        (False, list(range(0, 4)), [0]),
+        (False, list(range(4, 8)), [0]),
+        (True, [8, 9], [0]),
+        (False, [10, 11, 12], [1]),
+        (True, [13, 14], [1]),
+        (False, [15, 16, 17], [2]),
+    ]
+    assert layout.steps[1].export_src.tolist() == [0] and layout.steps[1].export_dst.tolist() == [1]
+    assert layout.steps[3].export_src.tolist() == [1] and layout.steps[3].export_dst.tolist() == [2]
+    assert layout.conv_init_spans.tolist() == [1, 2]
+    assert layout.conv_init_index.tolist() == [[5, 6, 7], [10, 11, 12]]
+    assert layout.prev_index[10].tolist() == [7, 6, 5] and layout.prev_index[11].tolist() == [10, 7, 6]
+    assert layout.prev_index[15].tolist() == [12, 11, 10] and layout.prev_index[2].tolist() == [1, 0, -1]
+    reference = [(s.index.tolist(), s.spans.tolist()) for s in layout.reference_steps]
+    assert reference == [(list(range(0, 8)), [0]), ([8, 9], [0]), (list(range(10, 13)), [1]), ([13, 14], [1]),
+                         ([15, 16, 17], [2])]  # fmt: skip
+
+
+def test_a_resume_must_land_on_a_segment_end():
+    spans = [
+        qwen3_5.GdnSpan(0, 10, ((False, 0, 10),)),
+        qwen3_5.GdnSpan(10, 4, ((False, 0, 4),), resume=(0, 8)),
+    ]
+    with pytest.raises(ValueError, match="no segment"):
+        qwen3_5.GdnLayout.from_spans(spans, num_tokens=14, conv_width=4, device=torch.device("cpu"))
 
 
 def test_chunked_prefill_keeps_the_stock_function_and_gradient(fake_vllm, monkeypatch):
@@ -714,3 +765,97 @@ def test_hybrid_kv_block_size_per_rank_for_qwen3_8_27b_tp4():
         mamba_ssm_dtype="float32",
     )
     assert qwen3_5.hybrid_kv_block_size(config, tensor_parallel=4) == 784
+
+
+_PAGE = 4
+
+# A three-turn conversation of 30 tokens with 4-token pages. Turn 0 prefills [0, 9) in chunks ending at 4, 8 and 9
+# (the last one token long, so decoded) and decodes to 14. Turn 1 resumes at 8 from turn 0's state and pages,
+# prefills its prompt [8, 20) in chunks ending at 12, 16 and 20 and decodes to 25. Turn 2 resumes at 16 from turn 1's
+# state, reads pages 0-2 from turn 0 (page 2 holds tokens turn 0 decoded) and page 3 from turn 1, and decodes to 30.
+_TURNS = [
+    dict(start=0, chunk_ends=[4, 8, 9], prompt_end=9, end=14, outputs=range(8, 13)),
+    dict(start=8, chunk_ends=[12, 16, 20], prompt_end=20, end=25, outputs=range(19, 24)),
+    dict(start=16, chunk_ends=[20, 24, 27], prompt_end=27, end=30, outputs=range(26, 29)),
+]
+
+
+def _turn_inputs(seed):
+    from arctic_platform.model.implementations.vllm_aligned import turn_plan
+
+    torch.manual_seed(seed)
+    seq = torch.randint(0, 97, (30,))
+    labels = torch.cat((seq[1:], torch.tensor([-100])))
+    plan = turn_plan.encode_turns(30, _TURNS, block_size=_PAGE)
+    return seq, labels, plan
+
+
+def test_turn_plan_lays_out_each_request_with_the_pages_and_state_it_read():
+    from arctic_platform.model.implementations.vllm_aligned import turn_plan
+
+    _, _, plan = _turn_inputs(0)
+    spans = turn_plan.parse_row(plan, row=0, block_size=_PAGE)
+    assert [(s.start, s.end, s.page_columns, s.resume_column) for s in spans] == [
+        (0, 14, (), None),
+        (8, 25, (0, 0), 0),
+        (16, 30, (0, 0, 0, 1), 1),
+    ]
+    assert spans[0].segments == ((False, 0, 4), (False, 4, 8), (False, 8, 9), (True, 9, 14))
+    layout = turn_plan.build_turn_layout(
+        plan, torch.tensor([0, 30]), block_size=_PAGE, conv_width=4, device=torch.device("cpu")
+    )
+    # Spans hold 14, 17 and 14 tokens: pages 0-3, 4-8 and 9-12.
+    assert layout.attention.block_table.tolist() == [
+        [0, 1, 2, 3, 0, 0, 0, 0],
+        [0, 1, 4, 5, 6, 7, 8, 0],
+        [0, 1, 2, 5, 9, 10, 11, 12],
+    ]
+    assert layout.attention.key_lens.tolist() == [14, 25, 30]
+    # Turn 2's keys follow turn 0's 14 and turn 1's 25; its positions 12-13 are turn 1's tokens 4-5.
+    assert layout.attention.key_index[39 + 12 : 39 + 14].tolist() == [14 + 4, 14 + 5]
+    assert layout.attention.key_index[39 + 8 : 39 + 10].tolist() == [8, 9]
+    assert layout.output_index[[8, 19, 26, 13, 14]].tolist() == [8, 14 + 11, 31 + 10, 13, 14 + 6]
+    steps = [(s.decode, s.spans.tolist(), s.export_dst) for s in layout.gdn.steps]
+    assert [d for d, _, _ in steps] == [False, False, True, False, False, False, True, False, False, False, True]
+
+
+def test_turn_plan_rejects_a_page_its_writer_did_not_compute():
+    from arctic_platform.model.implementations.vllm_aligned import turn_plan
+
+    turns = [
+        dict(start=0, chunk_ends=[4, 6], prompt_end=6, end=7),
+        dict(start=8, prompt_end=10, end=12, pages=[0, 0], resume=0),
+    ]
+    plan = turn_plan.encode_turns(12, turns, block_size=_PAGE)
+    with pytest.raises(ValueError, match="did not compute page 1"):
+        turn_plan.parse_row(plan, row=0, block_size=_PAGE)
+
+
+def test_multi_turn_replay_keeps_the_stock_function_and_gradient(fake_vllm, monkeypatch):
+    import transformers.models.qwen3_5.modeling_qwen3_5 as modeling
+
+    monkeypatch.setattr(modeling, "torch_chunk_gated_delta_rule", modeling.torch_recurrent_gated_delta_rule)
+    stock = _model()
+    aligned = _model()
+    _enable_aligned(aligned, monkeypatch, kv_block_size=_PAGE)
+    seq, labels, plan = _turn_inputs(9)
+    other = torch.randint(0, 97, (7,))
+    weights = torch.linspace(0.5, 1.5, 30)
+    _stock_weighted_loss(stock, [seq, other], [weights, torch.ones(7)]).backward()
+    other_plan = torch.zeros((7, 3, 3), dtype=torch.int32)
+    other_plan[:7, 0, 0] = 1
+    out = aligned(
+        input_ids=torch.cat((seq, other))[None],
+        position_ids=torch.cat((torch.arange(30), torch.arange(7)))[None],
+        labels=torch.cat((labels, other[1:], torch.tensor([-100])))[None],
+        dss_compute_logprobs=True,
+        cu_seq_lens_q=torch.tensor([0, 30, 37], dtype=torch.int32),
+        vllm_aligned_plan=torch.cat((plan, other_plan))[None],
+    )["logprobs"][0]
+    assert _FakeFlaOps.decoded_tokens == _LINEAR_LAYERS * (6 + 5 + 3)
+    torch.testing.assert_close(out[:29].detach(), _stock_logprobs(stock, seq), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(out[30:36].detach(), _stock_logprobs(stock, other), rtol=1e-4, atol=1e-4)
+    (out * torch.cat((weights, torch.ones(7)))).sum().backward()
+    for name, param in stock.named_parameters():
+        grad, mine = param.grad, dict(aligned.named_parameters())[name].grad
+        assert float((mine - grad).abs().max() / grad.abs().max().clamp_min(1e-12)) < 1e-4, name
