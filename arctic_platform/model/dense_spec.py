@@ -82,6 +82,7 @@ def dense_model_spec(
             tiled_mlp=tiled_mlp,
             lm_head=lm_head,
             peft=training_options.get("peft_config"),
+            fused_lora_linear=training_options.get("fused_lora_linear", False),
         ),
         **({"loader_options": loader_options} if loader_options else {}),
     )

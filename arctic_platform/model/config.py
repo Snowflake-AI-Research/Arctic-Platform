@@ -219,6 +219,13 @@ class Patches(BaseModel):
     lm_head: LmHeadPatch | None = Field(None, description="LM-head precision and chunking.")
     zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
     peft: dict | None = Field(None, description="PEFT config; wrap after other patches, before the optimizer.")
+    fused_lora_linear: StrictBool = Field(
+        False,
+        description=(
+            "With a LoRA peft config, add each LoRA linear's low-rank update to the base output inside the lora_B"
+            " GEMM (one addmm) instead of PEFT's separate scale and add."
+        ),
+    )
 
     _validate_peft = field_validator("peft")(validate_peft_config)
 
@@ -229,6 +236,8 @@ class Patches(BaseModel):
                 raise ValueError("activation_offload requires gradient_checkpointing")
         if self.checkpoint_keep_attention and self.gradient_checkpointing is False:
             raise ValueError("checkpoint_keep_attention requires gradient_checkpointing")
+        if self.fused_lora_linear and self.peft is None:
+            raise ValueError("fused_lora_linear requires a peft config")
         if self.tiled_mlp is not None and self.compile is not None and self.compile.fullgraph:
             raise ValueError("compile.fullgraph cannot be combined with tiled_mlp")
         return self
