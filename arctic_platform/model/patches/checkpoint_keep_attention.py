@@ -89,19 +89,66 @@ def attention_kernel_ops() -> frozenset:
     return frozenset(ops | _REGISTERED_KERNEL_OPS)
 
 
-def keep_attention_checkpoint_fn():
-    """``torch.utils.checkpoint.checkpoint`` (non-reentrant) with the keep-attention selective policy."""
+def resolve_kernel_op_names(names) -> frozenset:
+    """The op overloads ``names`` select: ``"namespace::name"`` (every overload) or ``"namespace::name.overload"``.
+
+    Each name must resolve to a dispatcher op registered by now (import the module that defines a custom op before
+    the patch is applied); a name that does not resolve raises, so a typo cannot silently keep nothing.
+    """
+    import torch
+
+    ops = set()
+    for full in names:
+        namespace, sep, rest = str(full).partition("::")
+        name, _, overload = rest.partition(".")
+        packet = None
+        if sep and namespace and name:
+            try:
+                packet = getattr(getattr(torch.ops, namespace), name)
+            except (AttributeError, RuntimeError):
+                packet = None
+        if packet is None:
+            raise ValueError(
+                f"checkpoint_keep_attention names op {full!r}, which is not a registered dispatcher op "
+                "(expected 'namespace::name' or 'namespace::name.overload')"
+            )
+        if overload:
+            if overload not in packet.overloads():
+                raise ValueError(f"checkpoint_keep_attention: op {namespace}::{name} has no overload {overload!r}")
+            ops.add(getattr(packet, overload))
+        else:
+            ops.update(getattr(packet, o) for o in packet.overloads())
+    return frozenset(ops)
+
+
+def keep_attention_checkpoint_fn(selection=True):
+    """``torch.utils.checkpoint.checkpoint`` (non-reentrant) with the keep-attention selective policy.
+
+    ``selection`` True keeps every known attention-kernel op (``attention_kernel_ops``, including registered ones);
+    a list of op names keeps only those (``resolve_kernel_op_names``) and recomputes every other kernel.
+    """
     from torch.utils.checkpoint import CheckpointPolicy
     from torch.utils.checkpoint import checkpoint
     from torch.utils.checkpoint import create_selective_checkpoint_contexts
 
-    kernels = attention_kernel_ops()
-    if not kernels:
-        raise RuntimeError("checkpoint_keep_attention found no attention-kernel op to keep")
+    if selection is True:
+        kernels = attention_kernel_ops()
+        if not kernels:
+            raise RuntimeError("checkpoint_keep_attention found no attention-kernel op to keep")
+
+        def keeps(op):
+            return op in kernels or op in _REGISTERED_KERNEL_OPS
+
+    else:
+        kernels = resolve_kernel_op_names(selection)
+        if not kernels:
+            raise ValueError("checkpoint_keep_attention lists no op to keep")
+
+        def keeps(op):
+            return op in kernels
 
     def policy(ctx, op, *args, **kwargs):
-        keep = op in kernels or op in _REGISTERED_KERNEL_OPS
-        return CheckpointPolicy.MUST_SAVE if keep else CheckpointPolicy.PREFER_RECOMPUTE
+        return CheckpointPolicy.MUST_SAVE if keeps(op) else CheckpointPolicy.PREFER_RECOMPUTE
 
     return functools.partial(
         checkpoint,
@@ -114,7 +161,7 @@ def keep_attention_checkpoint_fn():
 def apply_checkpoint_keep_attention(model: nn.Module, ctx: LoaderContext) -> None:
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
-    checkpoint_fn = keep_attention_checkpoint_fn()
+    checkpoint_fn = keep_attention_checkpoint_fn(ctx.spec.patches.checkpoint_keep_attention)
     rearmed = 0
     for module in model.modules():
         if isinstance(module, CheckpointWrapper):

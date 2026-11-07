@@ -206,12 +206,15 @@ class Patches(BaseModel):
             " indices checkpoints exactly those layers."
         ),
     )
-    checkpoint_keep_attention: StrictBool = Field(
+    checkpoint_keep_attention: StrictBool | list[str] = Field(
         False,
         description=(
             "With gradient_checkpointing, keep each checkpointed layer's attention-kernel outputs (the attention"
             " output and its log-sum-exp) from the forward pass, so the backward recompute runs everything in the"
-            " layer except the attention kernel. Costs one attention output per checkpointed layer."
+            " layer except the attention kernel. Costs one attention output per checkpointed layer. True keeps every"
+            " known attention kernel (FlashAttention 3 / 2, SDPA's kernels, and ops registered with"
+            " register_attention_kernel_op); a list of op names ('namespace::name' or 'namespace::name.overload')"
+            " keeps only those kernels and recomputes the others."
         ),
     )
     activation_offload: ActivationOffloadPatch | None = Field(
@@ -243,6 +246,8 @@ class Patches(BaseModel):
                 raise ValueError("activation_offload requires gradient_checkpointing")
         if self.checkpoint_keep_attention and self.gradient_checkpointing is False:
             raise ValueError("checkpoint_keep_attention requires gradient_checkpointing")
+        if isinstance(self.checkpoint_keep_attention, list) and not self.checkpoint_keep_attention:
+            raise ValueError("checkpoint_keep_attention lists no op; use false to keep none")
         if self.fused_lora_linear and self.peft is None:
             raise ValueError("fused_lora_linear requires a peft config")
         if self.tiled_mlp is not None and self.compile is not None and self.compile.fullgraph:

@@ -43,10 +43,12 @@ transformers = pytest.importorskip("transformers")
 LAYERS = 2
 
 
-def _ctx(gradient_checkpointing) -> LoaderContext:
+def _ctx(gradient_checkpointing, keep=True) -> LoaderContext:
     return LoaderContext(
         spec=types.SimpleNamespace(
-            patches=types.SimpleNamespace(gradient_checkpointing=gradient_checkpointing),
+            patches=types.SimpleNamespace(
+                gradient_checkpointing=gradient_checkpointing, checkpoint_keep_attention=keep
+            ),
             parallelism=types.SimpleNamespace(sequence_parallel=1),
         )
     )
@@ -208,3 +210,41 @@ def test_a_registered_kernel_op_is_kept():
         torch.testing.assert_close(a, b, rtol=0, atol=0)
     with pytest.raises(TypeError, match="OpOverload"):
         register_attention_kernel_op(layer)
+
+
+def test_a_named_selection_keeps_only_those_kernels():
+    # checkpoint_keep_attention as a list keeps the named kernels and recomputes every other one.
+    base = _model("cpu", torch.float32, "sdpa")
+    torch.manual_seed(1)
+    input_ids = torch.randint(0, 128, (1, 96))
+    plain = copy.deepcopy(base)
+    apply_gradient_checkpointing(plain, _ctx(True))
+    _, plain_grads, plain_calls = _train_step(plain, input_ids)
+
+    named = copy.deepcopy(base)
+    apply_gradient_checkpointing(named, _ctx(True))
+    apply_checkpoint_keep_attention(named, _ctx(True, ["aten::_scaled_dot_product_flash_attention_for_cpu"]))
+    _, named_grads, named_calls = _train_step(named, input_ids)
+
+    other = copy.deepcopy(base)
+    apply_gradient_checkpointing(other, _ctx(True))
+    apply_checkpoint_keep_attention(other, _ctx(True, ["arctic_test_keep_attention::scaled_scores.default"]))
+    _, other_grads, other_calls = _train_step(other, input_ids)
+
+    assert plain_calls == 2 * LAYERS and named_calls == LAYERS and other_calls == 2 * LAYERS
+    for name, grad in plain_grads.items():
+        torch.testing.assert_close(named_grads[name], grad, rtol=0, atol=0, msg=name)
+        torch.testing.assert_close(other_grads[name], grad, rtol=0, atol=0, msg=name)
+
+
+def test_a_named_selection_must_resolve():
+    model = _model("cpu", torch.float32, "sdpa")
+    apply_gradient_checkpointing(model, _ctx(True))
+    for bad in (["flash_attn_3::no_such_kernel"], ["not-an-op-name"], ["aten::mm.no_such_overload"]):
+        with pytest.raises(ValueError, match="checkpoint_keep_attention"):
+            apply_checkpoint_keep_attention(model, _ctx(True, bad))
+    with pytest.raises(ValueError, match="lists no op"):
+        Patches(gradient_checkpointing=True, checkpoint_keep_attention=[])
+    assert Patches(gradient_checkpointing=True, checkpoint_keep_attention=["aten::mm"]).checkpoint_keep_attention == [
+        "aten::mm"
+    ]
