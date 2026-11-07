@@ -23,6 +23,9 @@ accumulator is 128 registers per thread.
 * backward: Delta = rowsum(O * dO); then dK / dV per 32-row KV block, accumulated transposed ([512, 32], so the head
   axis is the GEMM's M) over every later query block of every query head in the group, so no atomics; and dQ per
   64-query block. Seven score-sized GEMMs instead of five; the 512 x 32 / 64 x 512 accumulators fit in registers.
+* packed rows: per-token segment starts (from the packer's ``cu_seqlens``) mask each score, so a token sees only its
+  own row; the forward's KV loop also starts at its block's first segment start. The backward loops keep their
+  causal bounds (bounds read from memory made TileLang predicate every load), so packing saves no backward work.
 
 Layouts: ``query`` [B, H, S, D], ``key`` / ``value`` [B, HK, S, D] (what Ulysses hands its core attention), output
 [B, S, H, D] (what HF's attention interface returns). The log-sum-exp is kept in log2 units.
@@ -86,13 +89,14 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
     accum = T.float32
     threads = 256
 
-    @tilelang.jit(out_idx=[3, 4], pass_configs=pass_configs)
+    @tilelang.jit(out_idx=[4, 5], pass_configs=pass_configs)
     def forward(block_M=64, block_N=64):
         @T.prim_func
         def main(
             Q: T.Tensor([batch, heads, seq_len, dim], dtype),
             K: T.Tensor([batch, kv_heads, seq_len, dim], dtype),
             V: T.Tensor([batch, kv_heads, seq_len, dim], dtype),
+            SegStart: T.Tensor([batch, seq_len], T.int32),
             Output: T.Tensor([batch, seq_len, heads, dim], dtype),
             Lse: T.Tensor([batch, heads, seq_len], accum),
         ):
@@ -108,6 +112,7 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
                 scores_scale = T.alloc_fragment([block_M], accum)
                 scores_sum = T.alloc_fragment([block_M], accum)
                 logsum = T.alloc_fragment([block_M], accum)
+                max_safe = T.alloc_fragment([block_M], accum)
 
                 qb = T.ceildiv(seq_len, block_M) - 1 - bx  # the longest (latest) query blocks first
                 kvh = by // groups
@@ -115,10 +120,21 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
                 T.fill(acc_o, 0)
                 T.fill(logsum, 0)
                 T.fill(scores_max, -T.infinity(accum))
-                for k in T.Pipelined(T.ceildiv((qb + 1) * block_M, block_N), num_stages=1):
+                # The block's first row starts the earliest segment any of its rows attends to. The segment starts
+                # are read from global memory in the mask: staging them through shared memory deadlocked the
+                # warp-specialized pipeline in TileLang 0.1.12.
+                k_first = SegStart[bz, qb * block_M] // block_N
+                n_k = T.ceildiv(T.min((qb + 1) * block_M, seq_len), block_N) - k_first
+                for t in T.Pipelined(n_k, num_stages=1):
+                    k = k_first + t
                     T.copy(K[bz, kvh, k * block_N : (k + 1) * block_N, :], K_shared)
                     for i, j in T.Parallel(block_M, block_N):
-                        acc_s[i, j] = T.if_then_else(qb * block_M + i >= k * block_N + j, 0, -T.infinity(accum))
+                        acc_s[i, j] = T.if_then_else(
+                            (qb * block_M + i >= k * block_N + j)
+                            & (k * block_N + j >= SegStart[bz, qb * block_M + i]),
+                            0,
+                            -T.infinity(accum),
+                        )
                     T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
                     T.copy(V[bz, kvh, k * block_N : (k + 1) * block_N, :], V_shared)
                     T.copy(scores_max, scores_max_prev)
@@ -126,10 +142,14 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
                     T.reduce_max(acc_s, scores_max, dim=1, clear=False)
                     for i in T.Parallel(block_M):
                         scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+                    # A row of a later packed segment can have no visible key in this block yet: keep its
+                    # exponents at exp2(-inf) = 0 instead of -inf - -inf.
                     for i in T.Parallel(block_M):
-                        scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+                        max_safe[i] = T.if_then_else(scores_max[i] == -T.infinity(accum), 0, scores_max[i])
+                    for i in T.Parallel(block_M):
+                        scores_scale[i] = T.exp2(scores_max_prev[i] * scale - max_safe[i] * scale)
                     for i, j in T.Parallel(block_M, block_N):
-                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - max_safe[i] * scale)
                     T.reduce_sum(acc_s, scores_sum, dim=1)
                     for i in T.Parallel(block_M):
                         logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
@@ -170,7 +190,7 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
 
         return main
 
-    @tilelang.jit(out_idx=[6, 7], pass_configs=pass_configs)
+    @tilelang.jit(out_idx=[7, 8], pass_configs=pass_configs)
     def dkdv(block_M=64, block_N=32):
         @T.prim_func
         def main(
@@ -180,6 +200,7 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
             dO: T.Tensor([batch, seq_len, heads, dim], dtype),
             Lse: T.Tensor([batch, heads, seq_len], accum),
             Delta: T.Tensor([batch, heads, seq_len], accum),
+            SegStart: T.Tensor([batch, seq_len], T.int32),
             dK: T.Tensor([batch, kv_heads, seq_len, dim], dtype),
             dV: T.Tensor([batch, kv_heads, seq_len, dim], dtype),
         ):
@@ -192,6 +213,7 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
                 ds_shared = T.alloc_shared([block_M, block_N], dtype)
                 lse_shared = T.alloc_shared([block_M], accum)
                 delta_shared = T.alloc_shared([block_M], accum)
+                seg_shared = T.alloc_shared([block_M], T.int32)
                 s = T.alloc_fragment([block_M, block_N], accum)
                 dp = T.alloc_fragment([block_M, block_N], accum)
                 dvT = T.alloc_fragment([dim, block_N], accum)
@@ -205,6 +227,8 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
                 T.clear(dvT)
                 T.clear(dkT)
                 loop_st = T.floordiv(kb * block_N, block_M)
+                # The loop bounds stay affine in the block index: bounds read from the segment ends made TileLang
+                # predicate every load and the backward 2.3x slower. Packed rows are kept apart by the mask alone.
                 n_q = T.ceildiv(seq_len, block_M) - loop_st
                 for it in T.Pipelined(groups * n_q, num_stages=0):
                     h = by * groups + it // n_q
@@ -213,9 +237,12 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
                     T.clear(s)
                     T.gemm(q_shared, K_shared, s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
                     T.copy(Lse[bz, h, qb * block_M : (qb + 1) * block_M], lse_shared)
+                    T.copy(SegStart[bz, qb * block_M : (qb + 1) * block_M], seg_shared)
                     for i, j in T.Parallel(block_M, block_N):
                         s[i, j] = T.if_then_else(
-                            qb * block_M + i >= kb * block_N + j, T.exp2(s[i, j] * scale - lse_shared[i]), 0
+                            (qb * block_M + i >= kb * block_N + j) & (kb * block_N + j >= seg_shared[i]),
+                            T.exp2(s[i, j] * scale - lse_shared[i]),
+                            0,
                         )
                     T.copy(dO[bz, qb * block_M : (qb + 1) * block_M, h, :], do_shared)
                     T.clear(dp)
@@ -237,7 +264,7 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
 
         return main
 
-    @tilelang.jit(out_idx=[6], pass_configs=pass_configs)
+    @tilelang.jit(out_idx=[7], pass_configs=pass_configs)
     def dq(block_M=64, block_N=32):
         @T.prim_func
         def main(
@@ -247,6 +274,7 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
             dO: T.Tensor([batch, seq_len, heads, dim], dtype),
             Lse: T.Tensor([batch, heads, seq_len], accum),
             Delta: T.Tensor([batch, heads, seq_len], accum),
+            SegStart: T.Tensor([batch, seq_len], T.int32),
             dQ: T.Tensor([batch, heads, seq_len, dim], dtype),
         ):
             with T.Kernel(T.ceildiv(seq_len, block_M), heads, batch, threads=threads) as (bx, by, bz):
@@ -260,6 +288,7 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
                 s = T.alloc_fragment([block_M, block_N], accum)
                 dp = T.alloc_fragment([block_M, block_N], accum)
                 acc_dq = T.alloc_fragment([block_M, dim], accum)
+                seg_shared = T.alloc_shared([block_M], T.int32)
 
                 qb = T.ceildiv(seq_len, block_M) - 1 - bx
                 kvh = by // groups
@@ -267,6 +296,7 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
                 T.copy(dO[bz, qb * block_M : (qb + 1) * block_M, by, :], do_shared)
                 T.copy(Lse[bz, by, qb * block_M : (qb + 1) * block_M], lse_shared)
                 T.copy(Delta[bz, by, qb * block_M : (qb + 1) * block_M], delta_shared)
+                T.copy(SegStart[bz, qb * block_M : (qb + 1) * block_M], seg_shared)
                 T.clear(acc_dq)
                 for k in T.Pipelined(T.ceildiv((qb + 1) * block_M, block_N), num_stages=0):
                     T.copy(K[bz, kvh, k * block_N : (k + 1) * block_N, :], K_shared)
@@ -277,7 +307,9 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
                     T.gemm(do_shared, V_shared, dp, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
                     for i, j in T.Parallel(block_M, block_N):
                         s[i, j] = T.if_then_else(
-                            qb * block_M + i >= k * block_N + j, T.exp2(s[i, j] * scale - lse_shared[i]), 0
+                            (qb * block_M + i >= k * block_N + j) & (k * block_N + j >= seg_shared[i]),
+                            T.exp2(s[i, j] * scale - lse_shared[i]),
+                            0,
                         )
                     for i, j in T.Parallel(block_M, block_N):
                         dp[i, j] = s[i, j] * (dp[i, j] - delta_shared[i]) * sm_scale
@@ -294,35 +326,62 @@ def _shape(query: torch.Tensor, key: torch.Tensor) -> tuple[int, int, int, int]:
     return int(query.shape[0]), int(query.shape[1]), int(key.shape[1]), int(query.shape[2])
 
 
+def segment_starts(cu_seqlens: torch.Tensor, seq_len: int, batch: int = 1) -> torch.Tensor:
+    """Per-token start of the packed row each token belongs to, int32 [batch, seq_len].
+
+    ``cu_seqlens`` is the packer's ``[0, len_0, len_0 + len_1, ..., seq_len]`` over the flattened tokens; the same
+    segments repeat on every batch row.
+    """
+    cu = cu_seqlens.to(torch.int64).flatten()
+    if cu.numel() < 2 or int(cu[0]) != 0 or int(cu[-1]) != seq_len:
+        raise ValueError(f"cu_seqlens must run from 0 to the sequence length {seq_len}, got {cu.tolist()[:8]}...")
+    lengths = cu[1:] - cu[:-1]
+    if bool((lengths < 0).any()):
+        raise ValueError("cu_seqlens must be non-decreasing")
+    starts = torch.repeat_interleave(cu[:-1], lengths).to(torch.int32)
+    return starts.view(1, -1).expand(batch, -1).contiguous()
+
+
 class _CausalAttentionHD512(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, query, key, value, softmax_scale):
+    def forward(ctx, query, key, value, softmax_scale, seg_start):
         query, key, value = (tensor.contiguous() for tensor in (query, key, value))
         forward, _, _, _ = _kernels(*_shape(query, key), float(softmax_scale))
-        output, lse = forward(query, key, value)
-        ctx.save_for_backward(query, key, value, output, lse)
+        output, lse = forward(query, key, value, seg_start)
+        ctx.save_for_backward(query, key, value, output, lse, seg_start)
         ctx.softmax_scale = float(softmax_scale)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        query, key, value, output, lse = ctx.saved_tensors
+        query, key, value, output, lse, seg_start = ctx.saved_tensors
         _, delta, dkdv, dq = _kernels(*_shape(query, key), ctx.softmax_scale)
         grad_output = grad_output.contiguous()
         row_delta = delta(output, grad_output)
-        grad_key, grad_value = dkdv(query, key, value, grad_output, lse, row_delta)
-        grad_query = dq(query, key, value, grad_output, lse, row_delta)
-        return grad_query, grad_key, grad_value, None
+        grad_key, grad_value = dkdv(query, key, value, grad_output, lse, row_delta, seg_start)
+        grad_query = dq(query, key, value, grad_output, lse, row_delta, seg_start)
+        return grad_query, grad_key, grad_value, None, None
 
 
 def causal_gqa_attention_hd512(
-    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, softmax_scale: float
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    softmax_scale: float,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``softmax(scale * Q K^T + causal) V`` for [B, H, S, 512] ``query`` over [B, HK, S, 512] ``key`` / ``value``.
 
-    Returns [B, S, H, 512]. Raises ``ValueError`` for inputs ``unsupported_reason`` rejects.
+    ``cu_seqlens`` (the packer's row boundaries over S, shared by every batch row) keeps packed rows apart: a token
+    attends only to earlier tokens of its own row. Returns [B, S, H, 512]. Raises ``ValueError`` for inputs
+    ``unsupported_reason`` rejects.
     """
     reason = unsupported_reason(query, key, value)
     if reason is not None:
         raise ValueError(reason)
-    return _CausalAttentionHD512.apply(query, key, value, softmax_scale)
+    batch, _, seq_len, _ = query.shape
+    if cu_seqlens is None:  # one row: no host round trip for the bounds
+        seg_start = torch.zeros(batch, seq_len, device=query.device, dtype=torch.int32)
+    else:
+        seg_start = segment_starts(cu_seqlens.to(query.device), int(seq_len), int(batch))
+    return _CausalAttentionHD512.apply(query, key, value, softmax_scale, seg_start)

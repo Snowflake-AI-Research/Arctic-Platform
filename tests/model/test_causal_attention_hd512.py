@@ -75,3 +75,50 @@ def test_softmax_scale_is_applied():
         query.float(), key.float(), value.float(), is_causal=True, scale=512**-0.5, enable_gqa=True
     ).transpose(1, 2)
     assert torch.max(torch.abs(output.float() - expected)) / torch.max(torch.abs(expected)) < 1e-2
+
+
+def _segmented_reference(query, key, value, cu_seqlens, scale):
+    """fp32 causal attention of each packed row on its own, concatenated: [B, S, H, D]."""
+    pieces = []
+    bounds = cu_seqlens.tolist()
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        pieces.append(
+            torch.nn.functional.scaled_dot_product_attention(
+                query[:, :, start:end],
+                key[:, :, start:end],
+                value[:, :, start:end],
+                is_causal=True,
+                scale=scale,
+                enable_gqa=True,
+            )
+        )
+    return torch.cat(pieces, dim=2).transpose(1, 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the TileLang kernels need CUDA")
+@pytest.mark.parametrize("bounds", [[0, 300, 700, 1024], [0, 64, 128, 1024], [0, 1, 1023, 1024], [0, 1024]])
+def test_packed_rows_attend_only_within_their_row(bounds):
+    query, key, value, grad = _inputs(8, 2, 1024, "cuda")
+    cu_seqlens = torch.tensor(bounds, device="cuda", dtype=torch.int32)
+    leaves = [tensor.clone().requires_grad_(True) for tensor in (query, key, value)]
+    output = hd512.causal_gqa_attention_hd512(*leaves, 1.0, cu_seqlens=cu_seqlens)
+    output.backward(grad)
+
+    references = [tensor.float().requires_grad_(True) for tensor in (query, key, value)]
+    expected = _segmented_reference(*references, cu_seqlens, 1.0)
+    expected.backward(grad.float())
+
+    def relative_error(mine, reference):
+        return (torch.max(torch.abs(mine.float() - reference)) / torch.max(torch.abs(reference))).item()
+
+    assert torch.isfinite(output).all()
+    assert relative_error(output.detach(), expected.detach()) < 1e-2
+    for name, leaf, reference in zip("qkv", leaves, references):
+        assert relative_error(leaf.grad, reference.grad) < 2e-2, name
+
+
+def test_segment_starts():
+    starts = hd512.segment_starts(torch.tensor([0, 2, 5]), 5, batch=2)
+    assert starts.tolist() == [[0, 0, 2, 2, 2]] * 2
+    with pytest.raises(ValueError, match="from 0 to the sequence length 6"):
+        hd512.segment_starts(torch.tensor([0, 2, 5]), 6)
