@@ -184,7 +184,9 @@ def _kernels(batch: int, heads: int, kv_heads: int, seq_len: int, softmax_scale:
                     T.copy(O[bz, by * blk : (by + 1) * blk, bx, k * blk : (k + 1) * blk], o)
                     T.copy(dO[bz, by * blk : (by + 1) * blk, bx, k * blk : (k + 1) * blk], do)
                     for i, j in T.Parallel(blk, blk):
-                        acc[i, j] += o[i, j] * do[i, j]
+                        # Multiply in fp32: a bf16 product rounds every term of the row sum, and Delta - dP
+                        # cancels where one key takes the whole softmax (an attention sink).
+                        acc[i, j] += T.cast(o[i, j], accum) * T.cast(do[i, j], accum)
                 T.reduce_sum(acc, row, 1)
                 T.copy(row, Delta[bz, bx, by * blk : (by + 1) * blk])
 
