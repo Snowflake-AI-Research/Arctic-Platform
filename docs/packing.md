@@ -34,6 +34,16 @@ Invariants to preserve:
 - Anything aligned against a token's neighbour -- a shift, a roll -- happens before packing. After packing, a row's neighbour is the next row.
 - A `ROW_BROADCAST_KEYS` leaf (`sampler_kl_weights`) may arrive as one value per row, `[B]`; packing writes that value on each of the row's tokens. It cannot wait for the loss: a window can hold as many tokens as rows, and then its 1-D leaves no longer say which they count.
 
+## Multimodal positions
+
+Qwen vision-language models rotate each token by temporal, height and width positions (M-RoPE). `mrope_position_ids(mm_token_type_ids, cu_seqlens, spatial_merge_size=..., image_grid_thw=..., video_grid_thw=...)` builds them for a packed call as `[4, 1, T]`:
+
+- Channel 0 is the plain text position, `0 .. len - 1` within each packed row. `cu_seqlens_from_position_ids` reads a 3-D tensor's channel 0, so varlen boundaries still derive from the positions.
+- Channels 1-3 are temporal, height and width. Text advances all three together; a run of image tokens lays out its merged patch grid from the current position, and the text after it resumes at the current position plus the grid's largest side. A video is `t` frames of `[1, h, w]`, each placed like an image.
+- Each row restarts at 0, so a packed row gets the positions it would get alone. Tail padding is 0 on every channel. A media run may not cross a row boundary, and every grid row must be used.
+
+Token types are 0 text, 1 image, 2 video; grids are `[t, h, w]` in patches before the spatial merge, in packed order.
+
 ## Cost
 
 One index and one kernel per tensor, not per row. `packed_token_index(valid_lengths, cu_seqlens, sequence_length)` gives every packed token's position in the flattened `[B * S, ...]` batch; packing is an `index_select` against it and unpacking an `index_copy_`, for any trailing shape and any number of leaves. The index is built once per call and reused for every leaf, so cost tracks tokens rather than rows: on an H200, packing six `[B, S]` leaves plus a `[B, S, 512]` leaf takes 0.36 ms at 8, 32 and 128 rows.
