@@ -1499,6 +1499,7 @@ class NonGatedGroupedExperts(nn.Module):
         w1 = _maybe_to_local(self.w1)
         w2 = _maybe_to_local(self.w2)
         w3 = _maybe_to_local(self.w3)
+        w1, w2 = _with_replica_slots(self, w1, w2)  # online replicas' spare slots after the native experts
         if self.use_grouped_mm:
             return _run_nongated_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert)
         return _run_nongated_experts_for_loop_impl(w1, w2, w3, x, num_tokens_per_expert)
@@ -1660,6 +1661,10 @@ class LatentMoE(nn.Module):
         # As on MoE: SonicMoE on the receive buffer (relu^2 epilogue), and the combine replayed on a full recompute.
         self.use_sonicmoe = False
         self.combine_replay: CombineReplay | None = None
+        # Online redundant experts (moe/expert_replicas.py), as on MoE: registered on the first forward.
+        self._replica_index = -1
+        self._replica_manager: ExpertReplicaManager | None = None
+        self._replica_counts: torch.Tensor | None = None
 
         if latent_dim is not None:
             self.fc1_latent_proj = nn.Linear(dim, latent_dim, bias=False)
@@ -1727,6 +1732,7 @@ class LatentMoE(nn.Module):
         x: torch.Tensor,
         selected_experts_indices: torch.Tensor,
         top_scores: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor | None = None,
     ) -> torch.Tensor:
         ep_comm = get_ep_comm_module(self.ep_comm_backend)
         combine_tokens = ep_comm.combine_tokens
@@ -1740,6 +1746,21 @@ class LatentMoE(nn.Module):
 
         experts = _unwrap_experts(self.experts)
         group = get_ep_group(experts)
+        num_experts = experts.num_experts
+        from ..ultraep_replicas import ultraep_spares
+
+        if ultraep_spares() and group is not None:
+            raise NotImplementedError(
+                "UltraEP's spare slots serve GroupedExperts; Nemotron-H's LatentMoE takes Arctic's online replicas "
+                "(moe.expert_replicas)"
+            )
+        # Arctic's online replicas (moe/expert_replicas.py) through MoE's planner: tokens go to physical slots, and
+        # the experts extend w1 / w2 with the spares' current weights once per call (_ReplicaCall).
+        plan = MoE._expert_replica_plan(self, experts, group, selected_experts_indices, num_tokens_per_expert)
+        if plan is not None:
+            selected_experts_indices = plan.remap(selected_experts_indices)
+            num_experts = plan.num_slots
+            experts._arl_replica_call = _ReplicaCall(plan, group)
         # Project before dispatch so DeepEP communicates the smaller latent activations.
         latent_x = self.fc1_latent_proj(x)
         chunk_size = self.deepep_token_chunk_size or latent_x.shape[0]
@@ -1762,7 +1783,7 @@ class LatentMoE(nn.Module):
                 latent_x[start:end],
                 selected_experts_indices[start:end],
                 top_scores[start:end],
-                num_experts=experts.num_experts,
+                num_experts=num_experts,
                 group=group,
                 score_before_experts=False,
             )
@@ -1796,6 +1817,7 @@ class LatentMoE(nn.Module):
             routed_outputs.append(run_pending_chunk(pending_state))
             pending_state = next_pending_state
         routed_outputs.append(run_pending_chunk(pending_state))
+        experts._arl_replica_call = None
 
         shared_output = self.shared_expert(x)
         sync_combine()
@@ -1816,7 +1838,9 @@ class LatentMoE(nn.Module):
             self.tokens_per_expert.add_(num_tokens_per_expert)
 
         if uses_dispatch_ep(self.ep_comm_backend):
-            routed_output = self._run_deepep_routed_experts(x_flat, selected_experts_indices, top_scores)
+            routed_output = self._run_deepep_routed_experts(
+                x_flat, selected_experts_indices, top_scores, num_tokens_per_expert
+            )
             return routed_output.reshape(bs, slen, dim)
 
         (
