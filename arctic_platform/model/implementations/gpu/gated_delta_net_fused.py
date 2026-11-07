@@ -24,8 +24,9 @@ their own head count when the rule groups value heads itself (FLA's: value head 
 shapes, and so their accumulation tiling, differ.
 
 ``apply_fused_gated_delta_net`` replaces the forward of every stock dense ``Qwen3_5GatedDeltaNet`` of a model without
-sequence parallelism (the head-parallel forward of ``sp/gated_delta_net.py`` uses ``project_gated_delta_net_inputs``
-itself). A projection that is not a plain bias-free ``nn.Linear``, such as one a PEFT adapter wraps, is called on its
+sequence parallelism, which projects in two GEMMs (``project_dense_gated_delta_net_inputs``: ``in_proj_qkv`` alone,
+whose output the causal convolution saves, and ``z | b | a``); the head-parallel forward of ``sp/gated_delta_net.py``
+packs its projections for the all-to-all and uses the one-GEMM ``project_gated_delta_net_inputs``. A projection that is not a plain bias-free ``nn.Linear``, such as one a PEFT adapter wraps, is called on its
 own, as in the stock forward. A call with a cache (generation) runs the stock forward.
 """
 
@@ -81,6 +82,27 @@ def project_gated_delta_net_inputs(
     return tuple(torch.split(mixed, [int(w.shape[0]) for w in weights], dim=-1))  # type: ignore[return-value]
 
 
+def project_dense_gated_delta_net_inputs(
+    module: nn.Module, hidden_states: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The four projections as two GEMMs: ``in_proj_qkv`` on its own and ``z | b | a`` in one ``ConcatLinear``.
+
+    Without sequence parallelism the causal convolution saves its input for backward. A view of one fused
+    ``qkv | z | b | a`` output would keep the z, b and a columns alive with it, z a second time next to the copy the
+    gated norm saves (+0.25-0.5 GiB per layer at 64K tokens); its own GEMM output is the tensor the stock forward
+    saves there. The small b and a GEMMs stay merged into z's.
+    """
+    projections = (module.in_proj_z, module.in_proj_b, module.in_proj_a)
+    if (
+        not all(_plain_linear(projection) for projection in projections)
+        or len({p.weight.dtype for p in projections}) != 1
+    ):
+        return project_gated_delta_net_inputs(module, hidden_states)
+    weights = [projection.weight for projection in projections]
+    z, b, a = torch.split(ConcatLinear.apply(hidden_states, *weights), [int(w.shape[0]) for w in weights], dim=-1)
+    return module.in_proj_qkv(hidden_states), z, b, a
+
+
 def _dense_forward(self, hidden_states: torch.Tensor, cache_params=None, attention_mask=None, **kwargs):
     """The stock forward's training path (no cache) with one input projection and grouped value heads."""
     from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
@@ -93,7 +115,7 @@ def _dense_forward(self, hidden_states: torch.Tensor, cache_params=None, attenti
         )
     hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
     batch_size, seq_len, _ = hidden_states.shape
-    mixed_qkv, z, b, a = project_gated_delta_net_inputs(self, hidden_states)
+    mixed_qkv, z, b, a = project_dense_gated_delta_net_inputs(self, hidden_states)
     mixed_qkv = self._arctic_causal_conv1d_fn(
         mixed_qkv.transpose(1, 2),
         self.conv1d.weight.squeeze(1),

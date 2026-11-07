@@ -192,3 +192,22 @@ def test_fused_forward_matches_stock_gpu_bf16(heads):
     for name in expected[2]:
         stock_error = _max_error(expected[2][name], exact[2][name])
         assert _max_error(got[2][name], exact[2][name]) <= 1.5 * stock_error + 1e-6, name
+
+
+def test_dense_convolution_input_is_its_own_tensor(torch_kernels):
+    # The convolution saves its input for backward; it must not be a view that keeps z, b and a alive.
+    config = _config()
+    fused = _module(config, torch.float32, "cpu")
+    apply_fused_gated_delta_net(fused, fp32_beta=True)
+    seen = []
+    convolution = fused._arctic_causal_conv1d_fn
+
+    def spy(x, *args, **kwargs):
+        seen.append(x.untyped_storage().nbytes())
+        return convolution(x, *args, **kwargs)
+
+    fused._arctic_causal_conv1d_fn = spy
+    hidden = torch.randn(1, 16, config.hidden_size, generator=torch.Generator().manual_seed(4))
+    fused(hidden)
+    qkv_bytes = 16 * (2 * config.linear_num_key_heads * 8 + config.linear_num_value_heads * 8) * 4
+    assert seen == [qkv_bytes]
