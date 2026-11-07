@@ -38,6 +38,45 @@ _DEFAULT_PROC_CONFIG: dict[str, Any] = {
 }
 
 
+# What a Cortex zone registers for a forward-only log-prob call. Its entropy
+# processor (`compute_entropy_and_logprobs`) is not registered, so entropy cannot
+# be returned here.
+_FORWARD_POST_PROCESSORS = ("compute_logprobs",)
+
+
+def _forward_processing(processing: Any, meta: dict) -> dict:
+    """Validate a forward-only request and return the processing block Cortex runs.
+
+    Requests the zone cannot serve are refused before anything is sent, instead of
+    being dropped: a caller that asked for entropy or a loss must not get log-probs
+    back in its place.
+    """
+    if processing is None:
+        processing = {}
+    if not isinstance(processing, dict):
+        raise ValueError(f"forward processing must be a dict, got {type(processing).__name__}")
+    unknown = set(processing) - {"post", "loss_fn", "config"}
+    if unknown:
+        raise ValueError(f"forward processing has unsupported keys {sorted(unknown)}")
+    if processing.get("loss_fn") is not None or processing.get("config") is not None:
+        raise ValueError(
+            "forward-only log-prob calls take no loss; set processing.loss_fn and processing.config to None, "
+            f"got loss_fn={processing.get('loss_fn')!r}"
+        )
+    post = list(processing.get("post") or _FORWARD_POST_PROCESSORS)
+    if tuple(post) != _FORWARD_POST_PROCESSORS:
+        raise ValueError(
+            f"Cortex forward-only log-prob calls support post={list(_FORWARD_POST_PROCESSORS)}, got {post}. "
+            "Cortex zones register only identity and compute_logprobs."
+        )
+    if meta.get("calculate_entropy"):
+        raise ValueError(
+            "Cortex forward-only log-prob calls do not return entropy: its processor is not registered on "
+            "Cortex zones. Set calculate_entropy to false."
+        )
+    return {"post": list(_FORWARD_POST_PROCESSORS), "loss_fn": None}
+
+
 def to_cortex_fwd_payload(batch: dict) -> dict:
     """On-prem SkyRL ``{batch, meta}`` → Cortex ``{args, kwargs, context, processing}``.
 
@@ -46,11 +85,14 @@ def to_cortex_fwd_payload(batch: dict) -> dict:
     row tensors (including ``prompts``). Those scalars stay on context. ZoRRo
     rows stay in the layout the client built. Every other request is
     left-aligned, because Cortex's packer rejects leading padding.
+
+    The caller's ``processing`` is validated, not forwarded: only log-prob
+    processing with no loss is accepted (see ``_forward_processing``).
     """
     import torch
 
     payload = dict(batch)
-    payload.pop("processing", None)
+    processing = payload.pop("processing", None)
     payload.pop("router_replay", None)
     if "batch" in payload and isinstance(payload["batch"], dict):
         tensors = dict(payload["batch"])
@@ -58,6 +100,7 @@ def to_cortex_fwd_payload(batch: dict) -> dict:
     else:
         tensors = dict(payload)
         meta = dict(tensors.pop("context", None) or {})
+    forward_processing = _forward_processing(processing, meta)
 
     input_ids = tensors.get("input_ids")
     attention_mask = tensors.get("attention_mask")
@@ -89,7 +132,7 @@ def to_cortex_fwd_payload(batch: dict) -> dict:
         "args": (),
         "kwargs": kwargs,
         "context": context,
-        "processing": {"post": ["compute_logprobs"], "loss_fn": None},
+        "processing": forward_processing,
     }
 
 

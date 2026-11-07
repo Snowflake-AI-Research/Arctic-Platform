@@ -1235,6 +1235,50 @@ class TestCortexShimForwardsLikeOnPrem:
         with pytest.raises(NotImplementedError, match="reference-model log-probs"):
             asyncio.run(self._shim().fwd_no_grad(self._batch(), reference_model=True))
 
+    @pytest.mark.parametrize(
+        "processing, meta_extra, match",
+        [
+            ({"post": ["compute_entropy_and_logprobs"], "loss_fn": None}, {}, "support post="),
+            ({"post": ["apply_temperature", "compute_logprobs"]}, {}, "support post="),
+            ({"post": ["compute_logprobs"], "loss_fn": "grpo"}, {}, "take no loss"),
+            ({"post": ["compute_logprobs"], "config": {"clip": 0.2}}, {}, "take no loss"),
+            ({"post": ["compute_logprobs"], "extra": 1}, {}, "unsupported keys"),
+            (None, {"calculate_entropy": True}, "do not return entropy"),
+        ],
+    )
+    def test_unsupported_forward_requests_are_refused_before_sending(self, processing, meta_extra, match):
+        import asyncio
+
+        class Client:
+            async def fwd_no_grad(self, payload):
+                raise AssertionError("a refused request must not reach the server")
+
+        batch = self._batch()
+        batch["meta"].update(meta_extra)
+        if processing is not None:
+            batch["processing"] = processing
+        with pytest.raises(ValueError, match=match):
+            asyncio.run(self._shim(Client()).fwd_no_grad(batch, reference_model=False))
+
+    def test_compute_logprobs_and_no_processing_are_sent_as_the_zone_registers_them(self):
+        import asyncio
+
+        import torch
+
+        sent = []
+
+        class Client:
+            async def fwd_no_grad(self, payload):
+                sent.append(payload)
+                return {"logprobs": torch.zeros((2, 5))}
+
+        for processing in (None, {}, {"post": ["compute_logprobs"], "loss_fn": None}):
+            batch = self._batch()
+            if processing is not None:
+                batch["processing"] = processing
+            asyncio.run(self._shim(Client()).fwd_no_grad(batch, reference_model=False))
+        assert [payload["processing"] for payload in sent] == [{"post": ["compute_logprobs"], "loss_fn": None}] * 3
+
     def test_zorro_forward_sends_the_client_layout(self):
         import asyncio
 
@@ -1261,7 +1305,7 @@ class TestCortexShimForwardsLikeOnPrem:
                 "max_response_len": 2,
                 "pad_token_id": 151643,
             },
-            "processing": {"post": ["compute_entropy_and_logprobs"], "loss_fn": None},
+            "processing": {"post": ["compute_logprobs"], "loss_fn": None},
         }
         out = asyncio.run(self._shim(Client()).fwd_no_grad(batch, reference_model=False))
         sent = seen["payload"]
@@ -1269,7 +1313,7 @@ class TestCortexShimForwardsLikeOnPrem:
         assert sent["context"]["zorro_train_enable"] is True
         assert sent["context"]["max_prompt_len"] == 2
         assert sent["context"]["pad_token_id"] == 151643
-        assert sent["processing"]["loss_fn"] is None
+        assert sent["processing"] == {"post": ["compute_logprobs"], "loss_fn": None}
         assert torch.equal(out["batch"]["logprobs"], out["batch"]["log_probs"])
         assert out["batch"]["logprobs"].shape == (2, 4)
 
