@@ -533,8 +533,11 @@ class _CausalLM(nn.Module):
             state[prefix + "mlp.weight"] = torch.cat([up, down.t()])
 
 
-def _build_cpu(rank: int, group_size: int | None, seed: int = 0, expert: bool = True) -> _CausalLM:
-    """The model in BF16 with the MoE families' export contract; sharded over ``group_size`` ranks when given."""
+def _build_cpu(
+    rank: int, group_size: int | None, seed: int = 0, expert: bool = True, contract: bool = True
+) -> _CausalLM:
+    """The model in BF16 with the MoE families' export contract (``contract``; without it, the generic export of the
+    huggingface route); sharded over ``group_size`` ranks when given."""
     from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
     from arctic_platform.model.implementations.moe.vllm_weights import build_iter_full_vllm_weights
     from arctic_platform.model.weight_export import WeightExportContract
@@ -548,9 +551,10 @@ def _build_cpu(rank: int, group_size: int | None, seed: int = 0, expert: bool = 
         for layer in model.model.layers:
             _inner(layer).expert.data.normal_(0, DIM**-0.5, generator=generator)
     model = model.to(torch.bfloat16)
-    register_weight_export(
-        model, WeightExportContract(hf=build_iter_full_hf_weights, vllm=build_iter_full_vllm_weights)
-    )
+    if contract:
+        register_weight_export(
+            model, WeightExportContract(hf=build_iter_full_hf_weights, vllm=build_iter_full_vllm_weights)
+        )
     if group_size is not None:
         assert dense_shard.install_model_dense_shards(model, group_size)
     return model
@@ -664,6 +668,54 @@ def _export_case(rank: int) -> dict:
     assert all(m.param.numel() == 0 for s in modules for m in s.members)
     ids = torch.randint(0, VOCAB, (1, 64), generator=torch.Generator().manual_seed(rank))
     assert torch.equal(sharded(ids, ids.roll(-1, 1)), unsharded(ids, ids.roll(-1, 1)))
+    return out
+
+
+def _generic_export_case(rank: int) -> dict:
+    """The huggingface route's export (no family contract): the unsharded model's parameters, names and order, then
+    with ``include_skipped`` its persistent buffers; the shards gathered one sharded module at a time."""
+    import torch.distributed as dist
+
+    from arctic_platform.model import iter_model_weights
+
+    def build(group_size):
+        model = _build_cpu(rank, group_size, expert=False, contract=False)
+        for index, layer in enumerate(model.model.layers):  # one inside a checkpoint wrapper, one not
+            _inner(layer).register_buffer("scalar", torch.full((1,), 0.25 * (index + 1), dtype=torch.bfloat16))
+            _inner(layer).register_buffer("scratch", torch.zeros(2), persistent=False)
+        return model
+
+    unsharded, sharded = build(None), build(CPU_NODE)
+    modules = _sharded_modules(sharded)
+    out = {
+        "largest_unit": max(sum(b.total * b.shard.element_size() for b in s.buckets) for s in modules),
+        "dense": sum(sum(b.total * b.shard.element_size() for b in s.buckets) for s in modules),
+    }
+    for weight_format, kwargs in (("hf", {"include_skipped": True}), ("hf", {}), ("vllm", {})):
+        want = [
+            (name, tensor.clone())
+            for name, tensor in iter_model_weights(
+                unsharded, weight_format, is_master=rank == 0, is_zero3=False, **kwargs
+            )
+        ]
+        assert bool(want) == (dist.get_rank() == 0)
+        count, unsharded_peak = _export_and_compare(unsharded, weight_format, kwargs, want if rank == 0 else None)
+        got, sharded_peak = _export_and_compare(sharded, weight_format, kwargs, want if rank == 0 else None)
+        assert got == count == len(want), (weight_format, got, count, len(want))
+        label = weight_format + ("+skipped" if kwargs else "")
+        out[label] = {"tensors": count, "peaks": (unsharded_peak, sharded_peak)}
+        if rank == 0:
+            names = [name for name, _ in want]
+            buffers = ["model.layers.0.scalar", "model.layers.1.scalar"]
+            if kwargs:  # the persistent buffers, after the parameters; the non-persistent ones never
+                assert names[-2:] == buffers and not any("scratch" in name for name in names), names
+            else:
+                assert not any(name in names for name in buffers), names
+            assert not any("dense_shard" in name or "_checkpoint_wrapped_module" in name for name in names), names
+    # The model is left as it was, and a model with experts and no contract is still refused.
+    assert all(m.param.numel() == 0 for s in modules for m in s.members)
+    with pytest.raises(RuntimeError, match="EP-sharded models require an AP weight-export contract"):
+        next(iter_model_weights(_build_cpu(rank, CPU_NODE, contract=False), "hf", is_master=True, is_zero3=False))
     return out
 
 
@@ -865,6 +917,22 @@ def test_a_sharded_model_exports_the_unsharded_models_weights(monkeypatch):
             " weights"
         )
         assert 0 < sharded_peak - unsharded_peak <= r["largest_unit"] < r["dense"], r
+
+
+def test_a_sharded_model_without_an_export_contract_exports_the_unsharded_models_weights(monkeypatch):
+    """The huggingface route's export (no family contract), as a weights-only checkpoint (persistent buffers
+    included) and the weight sync stream it: the unsharded model's tensors, names and order, bit for bit. Rank 0
+    holds at most one sharded module's whole weights beyond what the unsharded export holds."""
+    results = _run_cpu(_generic_export_case, monkeypatch=monkeypatch)
+    r = results[0]
+    for label in ("hf+skipped", "hf", "vllm"):
+        unsharded_peak, sharded_peak = r[label]["peaks"]
+        print(
+            f"\n{label}: {r[label]['tensors']} tensors; rank 0 export peak {unsharded_peak} B unsharded, "
+            f"{sharded_peak} B sharded; largest sharded module {r['largest_unit']} B of {r['dense']} B"
+        )
+        assert 0 < sharded_peak - unsharded_peak <= r["largest_unit"] < r["dense"], r
+    assert r["hf+skipped"]["tensors"] == r["hf"]["tensors"] + 2
 
 
 def test_the_state_dict_is_the_unsharded_models_and_loads_back(monkeypatch):

@@ -27,6 +27,11 @@ It runs last, after the patches that wrap or replace modules (Liger, gradient ch
 activation offload), before the optimizer and DeepSpeed are built, and once the weights are loaded. It refuses PEFT
 (the frozen base is not sharded here) and the tiled MLP (which reads the MLP's weights again in its backward, after
 the layer released them).
+
+The model has no family export contract, so its weight export (a weights-only checkpoint, the weight sync) is the
+generic one, which gathers the shards onto rank 0 one sharded module at a time and yields the unsharded model's
+tensors under their names (``weight_export.iter_model_weights``). Its resumable checkpoints take DeepSpeed's non-MoE
+path inside ``full_state_dict`` (dss's checkpointer for ``shard_dense``).
 """
 
 from __future__ import annotations

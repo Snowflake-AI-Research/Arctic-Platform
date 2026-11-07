@@ -48,10 +48,11 @@ The HF and vLLM weight export (``weight_export.iter_model_weights``: a weights-o
 sync) sees the unsharded model. ``weight_export.export_named_parameters`` lists the original parameters under their
 names and in their order, each the original ``nn.Parameter`` without data, and the shared export builders
 (``build_iter_full_hf_weights``, ``build_iter_full_vllm_weights``) fill them one export unit at a time (a decoder layer;
-the embedding, final norm and LM head together): the unit's shards are gathered onto rank 0 over its node, the other
-nodes take no part, and the unit's whole weights are dropped before the next one is gathered. The exported tensors are
-the unsharded model's, bit for bit, under the same names. A family builder that reads ``model.named_parameters()``
-instead is refused.
+the embedding, final norm and LM head together), as the generic export of a model without a family contract (the
+huggingface route, ``patches/dense_shard.py``) does one sharded module at a time: the unit's shards are gathered onto
+rank 0 over its node, the other nodes take no part, and the unit's whole weights are dropped before the next one is
+gathered. The exported tensors are the unsharded model's, bit for bit, under the same names. A family builder that
+reads ``model.named_parameters()`` instead is refused.
 
 ``state_dict`` and ``load_state_dict`` hold the original parameters whole, under their own names, and never the shards:
 the state dict is the unsharded model's, and loads into a model sharded over any group size or into an unsharded one.
@@ -581,7 +582,7 @@ def install_dense_shards(
 
     held = _HeldShards(sharded, unsharded_names)
     register_held_parameters(
-        root, HeldParameters(named_parameters=held.named_parameters, materialize=held.materialize)
+        root, HeldParameters(named_parameters=held.named_parameters, materialize=held.materialize, unit=held.unit)
     )
     contract = weight_export_contract(root)
     if contract is not None:
@@ -627,6 +628,10 @@ class _HeldShards:
             elif name in live:
                 yield name, live.pop(name)
         yield from live.items()
+
+    def unit(self, tensor: torch.Tensor) -> ShardedModule | None:
+        """The sharded module a placeholder is gathered with, None for a tensor no sharded module holds."""
+        return self.owner.get(id(tensor))
 
     @contextlib.contextmanager
     def materialize(self, tensors: Sequence[torch.Tensor]) -> Iterator[None]:
