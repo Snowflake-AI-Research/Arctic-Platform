@@ -65,6 +65,16 @@ from .groups import split_microbatches
 from .groups import token_budget_groups
 from .groups import token_budget_microbatch_groups
 from .groups import token_validity_mask
+from .media import IMAGE_MEDIA
+from .media import MEDIA_KEYS
+from .media import MEDIA_KINDS
+from .media import VIDEO_MEDIA
+from .media import MediaKind
+from .media import check_media
+from .media import media_token_spans
+from .media import select_media_rows
+from .media import split_media
+from .media import window_media
 from .mrope import IMAGE_TOKEN_TYPE
 from .mrope import MROPE_CHANNELS
 from .mrope import TEXT_TOKEN_TYPE
@@ -91,7 +101,11 @@ __all__ = [
     "DROP",
     "cu_seqlens_from_position_ids",
     "IGNORE_INDEX",
+    "IMAGE_MEDIA",
     "IMAGE_TOKEN_TYPE",
+    "MEDIA_KEYS",
+    "MEDIA_KINDS",
+    "MediaKind",
     "MROPE_CHANNELS",
     "MicrobatchSplit",
     "PackMetadata",
@@ -101,14 +115,18 @@ __all__ = [
     "batch_position_ids",
     "batch_seqlen",
     "batch_tensor",
+    "check_media",
     "map_batch_values",
+    "media_token_spans",
     "mrope_position_ids",
     "pack_microbatch",
     "packed_token_index",
     "pad_packed_microbatch",
+    "select_media_rows",
     "select_rows",
     "shard_valid_lengths",
     "split_groups_to_count",
+    "split_media",
     "sequence_pad_value",
     "singleton_microbatch_groups",
     "split_microbatches",
@@ -119,8 +137,10 @@ __all__ = [
     "token_validity_mask",
     "token_window",
     "unpack_output",
+    "VIDEO_MEDIA",
     "VIDEO_TOKEN_TYPE",
     "vision_position_ids",
     "window_cu_seqlens",
+    "window_media",
     "window_row_pieces",
 ]

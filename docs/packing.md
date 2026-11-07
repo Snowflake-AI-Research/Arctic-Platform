@@ -44,6 +44,20 @@ Qwen vision-language models rotate each token by temporal, height and width posi
 
 Token types are 0 text, 1 image, 2 video; grids are `[t, h, w]` in patches before the spatial merge, in packed order.
 
+## Media
+
+A batch carries images as three top-level leaves: `pixel_values` (`[patches, patch_dim]`, every image's patches concatenated), `image_grid_thw` (`[images, 3]`) and `image_row_ids` (`[images]`, the row each image belongs to, non-decreasing). Video uses `pixel_values_videos`, `video_grid_thw` and `video_row_ids`. Image `i` owns `prod(grid_i)` consecutive patches and `prod(grid_i) / merge**2` consecutive tokens of its row. Code: `media.py`.
+
+These leaves are matched by key, never by shape. Their leading dimension counts patches or images, so the row and token rules above would mis-slice them whenever a count happened to equal the row count or the token width.
+
+- `select_rows` moves each row's media with it and renumbers the row ids to the new order.
+- `pack_microbatch` checks the media against the rows and passes it through: packing keeps rows in order, so a row id still names its row in the packed call.
+- `pad_packed_microbatch` leaves media alone.
+- `token_shard(..., spatial_merge_size=...)` gives each window every image whose tokens overlap it, whole (a vision tower encodes complete images), plus `image_window_token_ranges` (`[images, 2]`): the `[first, end)` slice of that image's merged embeddings whose tokens are in the window. Across a call's windows, each embedding lands in exactly one window. Locating the tokens takes the packed `mm_token_type_ids` and the merge size, so a call carrying media must pass both; an image whose tokens are not in its own row, or grids that disagree with the token count, are refused.
+- Multimodal `[4, 1, T]` `position_ids` are padded with zeros and cut on their token axis like any token leaf, so gathering the windows' positions still rebuilds the call's boundaries.
+
+Media leaves ride at the top level only; one inside `context` is refused.
+
 ## Cost
 
 One index and one kernel per tensor, not per row. `packed_token_index(valid_lengths, cu_seqlens, sequence_length)` gives every packed token's position in the flattened `[B * S, ...]` batch; packing is an `index_select` against it and unpacking an `index_copy_`, for any trailing shape and any number of leaves. The index is built once per call and reused for every leaf, so cost tracks tokens rather than rows: on an H200, packing six `[B, S]` leaves plus a `[B, S, 512]` leaf takes 0.36 ms at 8, 32 and 128 rows.

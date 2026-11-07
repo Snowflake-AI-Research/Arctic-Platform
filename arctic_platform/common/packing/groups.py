@@ -26,6 +26,8 @@ from typing import Sequence
 
 import torch
 
+from .media import select_media_rows
+from .media import split_media
 from .walk import map_batch_values
 
 
@@ -104,15 +106,21 @@ def select_rows(batch: Dict[str, Any], index: torch.Tensor, n_rows: int) -> Dict
     """Take the rows named by ``index``, in that order, from every row-aligned leaf of ``batch``.
 
     A leaf counts as row-aligned when its first dimension is ``n_rows``; anything else -- a scalar, a config
-    value, a tensor of another shape -- is carried through untouched.
+    value, a tensor of another shape -- is carried through untouched. Media leaves (``pixel_values`` and the
+    rest, see ``media.py``) are matched by key instead, since their first dimension counts patches or images:
+    each row's media follows it, and the row ids are renumbered to the new order.
     """
+    rest, media = split_media(batch)
 
     def selected(_key: str, value: Any) -> Any:
         if torch.is_tensor(value) and value.ndim >= 1 and int(value.shape[0]) == n_rows:
             return value.index_select(0, index.to(value.device))
         return value
 
-    return map_batch_values(batch, selected)
+    result = map_batch_values(rest, selected)
+    if media:
+        result.update(select_media_rows(media, index, n_rows))
+    return result
 
 
 def singleton_microbatch_groups(n_rows: int) -> List[List[int]]:
