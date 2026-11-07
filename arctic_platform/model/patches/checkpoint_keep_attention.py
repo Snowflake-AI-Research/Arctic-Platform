@@ -31,6 +31,29 @@ import torch.nn as nn
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.patch import register_patch
 
+# Attention-kernel ops other modules register (register_attention_kernel_op), e.g. a model's own TileLang kernel.
+_REGISTERED_KERNEL_OPS: set = set()
+
+
+def register_attention_kernel_op(op) -> None:
+    """Have the keep-attention policy save the outputs of ``op`` as well: an attention kernel's forward op, given as
+    an ``OpOverload`` or as an ``OpOverloadPacket`` (all of its overloads), e.g. ``torch.ops.mylib.attn_fwd``.
+
+    The op must be a dispatcher op (``torch.library.custom_op`` or a registered C++ op) whose outputs are everything
+    its backward reads besides its recomputable inputs; a plain Python function is invisible to the policy. Takes
+    effect for checkpoint functions installed before or after the call.
+    """
+    import torch
+
+    if isinstance(op, torch._ops.OpOverloadPacket):
+        _REGISTERED_KERNEL_OPS.update(getattr(op, overload) for overload in op.overloads())
+    elif isinstance(op, torch._ops.OpOverload):
+        _REGISTERED_KERNEL_OPS.add(op)
+    else:
+        raise TypeError(
+            f"register_attention_kernel_op takes an OpOverload or OpOverloadPacket, got {type(op).__name__}"
+        )
+
 
 def attention_kernel_ops() -> frozenset:
     """The forward attention-kernel ops whose outputs the policy saves: FlashAttention 3 and 2, and SDPA's kernels.
@@ -63,7 +86,7 @@ def attention_kernel_ops() -> frozenset:
             continue
         for overload in packet.overloads():
             ops.add(getattr(packet, overload))
-    return frozenset(ops)
+    return frozenset(ops | _REGISTERED_KERNEL_OPS)
 
 
 def keep_attention_checkpoint_fn():
@@ -77,7 +100,8 @@ def keep_attention_checkpoint_fn():
         raise RuntimeError("checkpoint_keep_attention found no attention-kernel op to keep")
 
     def policy(ctx, op, *args, **kwargs):
-        return CheckpointPolicy.MUST_SAVE if op in kernels else CheckpointPolicy.PREFER_RECOMPUTE
+        keep = op in kernels or op in _REGISTERED_KERNEL_OPS
+        return CheckpointPolicy.MUST_SAVE if keep else CheckpointPolicy.PREFER_RECOMPUTE
 
     return functools.partial(
         checkpoint,

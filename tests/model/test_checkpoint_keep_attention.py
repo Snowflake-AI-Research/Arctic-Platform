@@ -34,6 +34,8 @@ from arctic_platform.model import LoaderContext
 from arctic_platform.model.config import Patches
 from arctic_platform.model.patches.checkpoint_keep_attention import apply_checkpoint_keep_attention
 from arctic_platform.model.patches.checkpoint_keep_attention import attention_kernel_ops
+from arctic_platform.model.patches.checkpoint_keep_attention import keep_attention_checkpoint_fn
+from arctic_platform.model.patches.checkpoint_keep_attention import register_attention_kernel_op
 from arctic_platform.model.patches.gradient_checkpointing import apply_gradient_checkpointing
 
 transformers = pytest.importorskip("transformers")
@@ -158,3 +160,51 @@ def test_layer_list_checkpoints_exactly_those_layers():
         apply_gradient_checkpointing(_model("cpu", torch.float32, "sdpa"), _ctx([0, 5]))
     with pytest.raises(ValueError, match="lists a layer twice"):
         Patches(gradient_checkpointing=[1, 1])
+
+
+_CUSTOM_KERNEL_CALLS = []
+
+
+@torch.library.custom_op("arctic_test_keep_attention::scaled_scores", mutates_args=())
+def _scaled_scores(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    _CUSTOM_KERNEL_CALLS.append(1)
+    return torch.softmax(q @ k.transpose(-1, -2), dim=-1)
+
+
+def _scaled_scores_backward(ctx, grad):
+    q, k, p = ctx.saved_tensors
+    ds = p * (grad - (grad * p).sum(-1, keepdim=True))
+    return ds @ k, ds.transpose(-1, -2) @ q
+
+
+def _scaled_scores_setup(ctx, inputs, output):
+    ctx.save_for_backward(*inputs, output)
+
+
+_scaled_scores.register_autograd(_scaled_scores_backward, setup_context=_scaled_scores_setup)
+
+
+def test_a_registered_kernel_op_is_kept():
+    # A model's own attention op, registered by its module: the recompute reuses its output instead of rerunning it.
+    torch.manual_seed(2)
+    q = torch.randn(4, 8, requires_grad=True)
+    k = torch.randn(4, 8, requires_grad=True)
+
+    def layer(q, k):
+        return torch.ops.arctic_test_keep_attention.scaled_scores(torch.tanh(q), k).sin().sum()
+
+    def run():
+        _CUSTOM_KERNEL_CALLS.clear()
+        out = keep_attention_checkpoint_fn()(layer, q, k)
+        grads = torch.autograd.grad(out, (q, k))
+        return len(_CUSTOM_KERNEL_CALLS), grads
+
+    unregistered_calls, unregistered_grads = run()
+    register_attention_kernel_op(torch.ops.arctic_test_keep_attention.scaled_scores)
+    assert torch.ops.arctic_test_keep_attention.scaled_scores.default in attention_kernel_ops()
+    registered_calls, registered_grads = run()
+    assert unregistered_calls == 2 and registered_calls == 1
+    for a, b in zip(registered_grads, unregistered_grads):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    with pytest.raises(TypeError, match="OpOverload"):
+        register_attention_kernel_op(layer)
