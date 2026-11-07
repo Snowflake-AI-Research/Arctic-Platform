@@ -35,6 +35,7 @@ The arithmetic is unchanged: the backward reads the forward's own outputs rather
 
 from __future__ import annotations
 
+import functools
 import logging
 import weakref
 from collections import deque
@@ -132,6 +133,19 @@ def keep_core(replay: CoreReplay | None, fn: Callable[..., Any], *args, **kwargs
         out = fn(*args, **kwargs)
     replay.keep(out)
     return out
+
+
+def kept(replay: CoreReplay | None, fn: Callable[..., Any]) -> Callable[..., Any]:
+    """``fn`` called through ``keep_core(replay, fn, ...)``; ``fn`` itself without a replay. The wrapper carries
+    ``fn`` as ``__wrapped__`` (callers that pick a path by the kernel's module read through it)."""
+    if replay is None:
+        return fn
+
+    @functools.wraps(fn)
+    def call(*args, **kwargs):
+        return keep_core(replay, fn, *args, **kwargs)
+
+    return call
 
 
 class _FlashAttn3VarlenKept(torch.autograd.Function):
@@ -264,7 +278,7 @@ def kept_flash_attn_3_varlen(replay: CoreReplay) -> Callable[..., torch.Tensor]:
 def install_core_replay(block: nn.Module, scans: bool = True) -> int:
     """Keep the core kernels of ``block`` (about to be fully checkpointed) out of its recompute; returns the number
     of modules that keep one: FlashAttention-3 layers (``_flash_attn_call``) and, with ``scans``, modules that call
-    ``keep_core`` with their ``_arl_core_replay`` (Mamba-2 mixers)."""
+    ``keep_core`` with their ``_arl_core_replay`` (Mamba-2 mixers, Gated DeltaNet)."""
     installed = 0
     for module in block.modules():
         if getattr(module, "_arl_core_replay", None) is not None:
