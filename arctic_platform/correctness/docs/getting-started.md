@@ -29,7 +29,7 @@ python -m arctic_platform.correctness list
 
 First let's create a simple config that will onboarded:
 
-**Use a new `--fp32` recipe variant for this P1 demo.** P1 requires explicit `training.ds_config.data_types.grad_accum_dtype: "fp32"` for BF16 reference comparisons. That setting differs from the historical tiny recipe, so the filename below carries `--fp32` into the imported config, derived ID and reference folder. Keep the historical recipe, manifest entry, specifications and reference bytes unchanged; the new variant needs its own onboarding.
+**Use a new `--fp32` recipe variant for this P1 demo.** The explicit `training.ds_config.data_types.grad_accum_dtype: "fp32"` makes this example independent of the installed runtime's accumulation default. That setting differs from the historical tiny recipe, so the filename below carries `--fp32` into the imported config, derived ID and reference folder. Keep the historical recipe, manifest entry, specifications and reference bytes unchanged; the new variant needs its own onboarding.
 
 ```bash
 mkdir -p ./work/configs ./work/reports ./work/logs
@@ -151,7 +151,7 @@ print(local_config_path(recipe))
 PY
 ```
 
-**This catalog import is not an eligible P1 BF16 onboarding example.** The current recipe declares BF16 but omits `training_config.ds_config.data_types.grad_accum_dtype: "fp32"`, so P1 onboarding rejects it before fixture creation or calibration. Import acceptance does not apply that setting or establish numerical support. Continue with the tiny FP32 demo above; do not edit catalog or migrated recipe bytes, specifications or historical references to bypass admission. A different precision workload needs a separate explicit noncatalog variant and fresh compatible onboarding.
+**This 32-GPU catalog example demonstrates import, not numerical onboarding.** The recipe omits `training_config.ds_config.data_types.grad_accum_dtype`. Omitted accumulation is accepted only when the automatically owned local DSS service's actual engine builder resolves FP32 accumulation and selects local workers; multi-node and supplied-service defaults cannot be verified by this check. Import never applies an accumulation override or establishes numerical support. Continue with the explicitly configured tiny demo above, and preserve catalog bytes and historical references.
 
 **Use the recipe path present in your Cortex-training checkout.** The model catalog replaced `recipes/sft/configs/qwen38_flash_next.json`; the import-only example above selects the current Qwen3.8-Flash-Next full-training config for 32 H200 GPUs and 256K context. The source file must exist; deleted Cortex recipe paths have no automatic replacement. Its imported path is `configs/qwen3.8-flash-next/long/h200-training-full.json`, so other models or sequence choices can retain the same recipe basename without colliding. Old migrated correctness-config paths remain aliases only within their original config root through `config-layout.json`.
 

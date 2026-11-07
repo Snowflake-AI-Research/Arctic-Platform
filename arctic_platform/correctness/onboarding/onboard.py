@@ -36,6 +36,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextlib import nullcontext
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -201,7 +202,7 @@ def _configure_fixture_target(args: argparse.Namespace, config, selection: list[
     )
     if not configured:
         args._automatic_cortex_gateway = True
-        # This URL is only a configuration placeholder; validation supplies the owned server's port.
+        # Admission uses a placeholder; the validation command starts its own gateway.
         args.base_url = "http://127.0.0.1:1"
     try:
         require_local_cortex_gateway(_client_backend(args))
@@ -550,22 +551,18 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
     if not selection:
         return
     validate_first_two_model_dtype(config)
-    if not config.is_rl and any(tests[test_id].compares_to_reference for test_id in selection):
-        ds_config = config.training.get("ds_config") or {}
-        dtype = str(config.sub_job.get("dtype") or config.training.get("dtype") or "bfloat16").lower()
-        bf16 = ds_config.get("bf16")
-        bf16_enabled = bool(bf16.get("enabled", False)) if isinstance(bf16, dict) else dtype in ("bf16", "bfloat16")
-        if bf16_enabled:
-            data_types = ds_config.get("data_types")
-            accumulation = data_types.get("grad_accum_dtype") if isinstance(data_types, dict) else None
-            if accumulation != "fp32":
-                raise ValueError(
-                    f"{args.config.resolve()}: BF16 correctness comparisons use FP32 HF gradient accumulation. "
-                    'Set data_types.grad_accum_dtype to "fp32" in the supplied configuration\'s training.ds_config '
-                    "(training_config.ds_config for Cortex recipes) before onboarding; "
-                    f"got {accumulation!r}. Onboarding does not change this setting."
-                )
+    compares = not config.is_rl and any(tests[test_id].compares_to_reference for test_id in selection)
+    if compares:
+        from arctic_platform.correctness.harness.engine_admission import validate_reference_accumulation
+
+        data_types = (config.training.get("ds_config") or {}).get("data_types") or {}
+        if not isinstance(data_types, dict) or data_types.get("grad_accum_dtype") is not None:
+            validate_reference_accumulation(config)
     _configure_fixture_target(args, config, selection)
+    if compares:
+        validate_reference_accumulation(
+            config, automatically_owned_local=getattr(args, "_automatic_cortex_gateway", False)
+        )
     if getattr(args, "_prerequisites_checked", False):
         return
     if config.n_gpus < 1 or config.sp_size < 1 or config.n_gpus % config.sp_size:
@@ -1475,6 +1472,7 @@ def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
 
 def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: str = "Validation") -> dict:
     """Run the frozen config exactly as future regression runs will execute it."""
+    automatic_gateway = getattr(args, "_automatic_cortex_gateway", False)
     bootstrap = _optimizer_validation_bootstrap(args)
     if bootstrap != getattr(args, "_admitted_optimizer_validation_bootstrap", bootstrap):
         raise ValueError("optimizer validation bootstrap/config changed after pre-calibration admission")
@@ -1507,6 +1505,8 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
         "pat_file",
         "gpu_pool",
     ):
+        if name == "base_url" and automatic_gateway:
+            continue
         value = getattr(args, name, None)
         if value is not None:
             command += ["--" + name.replace("_", "-"), str(value)]
@@ -1539,7 +1539,10 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
     description = selected.get("model_description", f"frozen {layers}-layer regression")
     _stage(phase, "Target Run", description)
     lines: list[str] = []
-    with _validation_gateway(args) as gateway_url, log_path.open("w") as log:
+    # Let the child establish ownership through its normal CLI, rather than
+    # passing the parent's service as an apparently unverified supplied endpoint.
+    gateway_context = nullcontext(None) if automatic_gateway else _validation_gateway(args)
+    with gateway_context as gateway_url, log_path.open("w") as log:
         if gateway_url is not None:
             command += ["--base-url", gateway_url]
         env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}

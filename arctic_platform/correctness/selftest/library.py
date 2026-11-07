@@ -260,7 +260,7 @@ def _config_factory_native_config(
 
 
 def _synthetic_config_spec(root: Path, *, lora: bool = False):
-    """Small native config/spec inputs; no bundled catalog or model assets."""
+    """Small explicit-FP32 config/spec inputs; no installed DSS runtime or model assets."""
     from arctic_platform.correctness.harness.config import ArmSpec
     from arctic_platform.correctness.harness.config import TestTolerance
     from arctic_platform.correctness.harness.config import arms_for
@@ -286,6 +286,7 @@ def _synthetic_config_spec(root: Path, *, lora: bool = False):
             "train_batch_size": 4,
             "zero_optimization": {"stage": 2},
             "bf16": {"enabled": True},
+            "data_types": {"grad_accum_dtype": "fp32"},
         },
         "optimizer": {"name": "AdamW", "lr": 0.0001, "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0},
     }
@@ -2000,7 +2001,9 @@ def _cli_config_selection_write_config(root: Path, gpu_type: str) -> Path:
 
     path = root / "model" / gpu_type / f"model-{gpu_type}-train.config"
     path.parent.mkdir(parents=True)
-    native_config = _config_factory_native_config({"n_gpus": 8, "sp_size": 8})
+    native_config = _config_factory_native_config(
+        {"n_gpus": 8, "sp_size": 8, "ds_config": {"data_types": {"grad_accum_dtype": "fp32"}}}
+    )
     native_config["backend"] = {"type": "onprem"}
     native = ReviewedClientConfig.model_validate(native_config)
     config = {"hardware": gpu_type.upper(), "sub_job_configs": native.to_cortex()}
@@ -14473,7 +14476,11 @@ def test_native_optimizer_owner_split_cli_guarded_forwarding(
         is_rl=False,
         attention_implementation="sdpa",
         sub_job={"dtype": "bfloat16"},
-        training={"dtype": "bfloat16", "ep_size": ep_size},
+        training={
+            "dtype": "bfloat16",
+            "ep_size": ep_size,
+            "ds_config": {"data_types": {"grad_accum_dtype": "fp32"}},
+        },
     )
     config.at_gpu_width = lambda width: SimpleNamespace(
         config_id=config.config_id, n_gpus=width, sub_job=dict(config.sub_job), training=dict(config.training)
@@ -35442,12 +35449,10 @@ def test_onboarding_loaded_config_requires_preset_accumulation_without_mutation(
         onboard._onboarding_preflight(args, config)
         assert calls == ["fixture"]
     else:
-        with pytest.raises(ValueError, match="Set data_types.grad_accum_dtype") as caught:
+        message = "unverified defaults" if accumulation is None else "Set data_types.grad_accum_dtype"
+        with pytest.raises(ValueError, match=message):
             onboard._onboarding_preflight(args, config)
-        assert str(source) in str(caught.value)
-        assert "training.ds_config" in str(caught.value)
-        assert "training_config.ds_config" in str(caught.value)
-        assert calls == []
+        assert calls == (["fixture"] if accumulation is None else [])
     assert source.read_text() == contents
     assert config.sub_job == original
     assert (config.native.model_dump() if config.native is not None else None) == native
@@ -35476,7 +35481,8 @@ def test_onboarding_requires_explicit_fp32_accumulation_before_any_work(
     original = copy.deepcopy(state.config.training)
     contents = json.dumps({"training": original}) + "\n"
     state.args.config.write_text(contents)
-    for name in ("_configure_fixture_target", "_parent", "correctness_workdir"):
+    monkeypatch.setattr(state.onboard, "_configure_fixture_target", lambda *a: None)
+    for name in ("_parent", "correctness_workdir"):
         monkeypatch.setattr(
             state.onboard, name, lambda *a: pytest.fail("precision prerequisite reached setup or model work")
         )
@@ -35490,10 +35496,12 @@ def test_onboarding_requires_explicit_fp32_accumulation_before_any_work(
     for test_id in requested:
         result = summary["results"][test_id]
         assert result["status"] == "failed"
-        assert "Set data_types.grad_accum_dtype" in result["reason"]
-        assert str(state.args.config.resolve()) in result["reason"]
-        assert '"fp32"' in result["reason"]
-        assert "does not change this setting" in result["reason"]
+        if (ds_config.get("data_types") or {}).get("grad_accum_dtype") is None:
+            assert "unverified defaults" in result["reason"]
+        else:
+            assert "Set data_types.grad_accum_dtype" in result["reason"]
+            assert '"fp32"' in result["reason"]
+            assert "does not change this setting" in result["reason"]
     assert state.calls == []
     assert state.config.training == original
     assert state.args.config.read_text() == contents
@@ -35644,7 +35652,9 @@ def test_onboarding_float32_is_rejected_before_accumulation_or_fixture_work(_onb
 def test_onboarding_accumulation_prerequisite_honors_bf16_override(_onboarding_prerequisites, dtype, bf16, required):
     state = _onboarding_prerequisites
     state.config.sub_job["dtype"] = dtype
-    ds_config = {} if bf16 is None else {"bf16": bf16}
+    ds_config = {"data_types": {"grad_accum_dtype": "fp32"}}
+    if bf16 is not None:
+        ds_config["bf16"] = bf16
     state.config.training["ds_config"] = copy.deepcopy(ds_config)
 
     if dtype == "float32":

@@ -16,14 +16,19 @@
 """CPU admission controls; no model, reference subprocess or gateway is started."""
 
 import copy
+import io
 import json
+import sys
 from pathlib import Path
+from types import ModuleType
+from types import SimpleNamespace
 
 import pytest
 
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.correctness.harness import config as config_module
+from arctic_platform.correctness.harness import engine_admission
 from arctic_platform.correctness.harness import execution
 from arctic_platform.correctness.harness import gateway
 from arctic_platform.correctness.harness import runner
@@ -297,4 +302,185 @@ def test_training_dtype_override_is_rejected_before_target_work(recipe, dtype):
     before = untouched(config)
     with pytest.raises(ValueError, match="training_config.dtype"):
         config_module.validate_first_two_model_dtype(config)
+    assert untouched(config) == before
+
+
+@pytest.mark.parametrize("accumulation", ["fp32", "bf16", None])
+@pytest.mark.parametrize("automatic", [False, True])
+def test_runtime_default_admission_preserves_explicit_settings_and_recipe(
+    recipe, monkeypatch, accumulation, automatic
+):
+    config = recipe(accumulation=accumulation)
+    before = untouched(config)
+    calls = []
+
+    def resolved(config, *, automatically_owned_local):
+        calls.append(automatically_owned_local)
+        return {"bf16": {"enabled": True}, "data_types": {"grad_accum_dtype": "fp32"}}
+
+    monkeypatch.setattr(engine_admission, "_owned_local_engine_config", resolved)
+    if accumulation == "bf16":
+        with pytest.raises(ValueError, match="requires grad_accum_dtype='fp32'"):
+            engine_admission.validate_reference_accumulation(config, automatically_owned_local=automatic)
+    elif accumulation is None and not automatic:
+        with pytest.raises(ValueError, match="unverified defaults"):
+            engine_admission.validate_reference_accumulation(config)
+    else:
+        engine_admission.validate_reference_accumulation(config, automatically_owned_local=automatic)
+    assert calls == ([True] if accumulation is None and automatic else [])
+    assert untouched(config) == before
+
+
+@pytest.mark.parametrize(
+    "resolved, message",
+    [
+        ({"bf16": {"enabled": True}}, "not FP32"),
+        ({"bf16": {"enabled": True}, "data_types": {"grad_accum_dtype": None}}, "not FP32"),
+        ({"bf16": {"enabled": True}, "data_types": {"grad_accum_dtype": "bf16"}}, "not FP32"),
+        ({"bf16": {"enabled": False}}, "requires BF16"),
+        ({"bf16": {"enabled": True}, "fp16": {"enabled": True}}, "without FP16"),
+        ({"bf16": {"enabled": True}, "torch_autocast": {"enabled": True}}, "without FP16 or autocast"),
+        (
+            {"bf16": {"enabled": True}, "data_types": {"param_dtype": "fp32", "grad_accum_dtype": "fp32"}},
+            "BF16 model parameters",
+        ),
+    ],
+)
+def test_runtime_default_admission_refuses_incompatible_resolved_config(recipe, monkeypatch, resolved, message):
+    config = recipe(accumulation=None)
+    before = untouched(config)
+    monkeypatch.setattr(
+        engine_admission, "_owned_local_engine_config", lambda *args, **kwargs: copy.deepcopy(resolved)
+    )
+    with pytest.raises(ValueError, match=message):
+        engine_admission.validate_reference_accumulation(config, automatically_owned_local=True)
+    assert untouched(config) == before
+
+
+@pytest.fixture
+def installed_runtime(monkeypatch):
+    """Use portable schema/builder doubles without importing a separately installed DSS service."""
+    import torch
+
+    calls = []
+    schema = ModuleType("dss.ray_dss.models")
+
+    class JobConfig:
+        @staticmethod
+        def model_validate(payload):
+            calls.append(("payload", copy.deepcopy(payload)))
+            return SimpleNamespace(to_engine_dict=lambda name: {"name": name, "submitted": payload})
+
+    schema.JobConfig = JobConfig
+    runtime = ModuleType("dss.ray_dss.jobs.gpu.training")
+
+    def build(config, width, sp_size):
+        calls.append(("builder", config, width, sp_size))
+        return {"bf16": {"enabled": True}, "data_types": {"grad_accum_dtype": "fp32"}}
+
+    runtime._build_ds_config = build
+    monkeypatch.setitem(sys.modules, schema.__name__, schema)
+    monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(gateway, "_allocation_hostfile", lambda: None)
+    return SimpleNamespace(runtime=runtime, calls=calls)
+
+
+def test_owned_runtime_resolution_uses_submitted_payload_without_overrides(recipe, installed_runtime):
+    config = recipe(accumulation=None)
+    before = untouched(config)
+    resolved = engine_admission._owned_local_engine_config(config, automatically_owned_local=True)
+    expected = gateway.training_client_config(config, CortexConfig(base_url="http://127.0.0.1:1")).to_cortex()[0]
+    assert installed_runtime.calls[0] == ("payload", expected)
+    assert installed_runtime.calls[1][2:] == (config.n_gpus, config.sp_size)
+    assert expected["training_config"]["ds_config"]["data_types"]["grad_accum_dtype"] is None
+    assert resolved["data_types"]["grad_accum_dtype"] == "fp32"
+    assert untouched(config) == before
+
+
+@pytest.mark.parametrize("fault", ["unowned", "missing-builder", "nonlocal-width", "builder-error"])
+def test_owned_runtime_resolution_fails_closed(recipe, installed_runtime, monkeypatch, fault):
+    config = recipe(accumulation=None)
+    before = untouched(config)
+    message = {
+        "unowned": "automatically owned local",
+        "missing-builder": "does not expose _build_ds_config",
+        "nonlocal-width": "nonlocal DSS worker installation",
+        "builder-error": "synthetic builder failure",
+    }[fault]
+    if fault == "missing-builder":
+        del installed_runtime.runtime._build_ds_config
+    elif fault == "nonlocal-width":
+        import torch
+
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    elif fault == "builder-error":
+
+        def broken(*args):
+            raise RuntimeError("synthetic builder failure")
+
+        installed_runtime.runtime._build_ds_config = broken
+    with pytest.raises(ValueError, match=message):
+        engine_admission._owned_local_engine_config(config, automatically_owned_local=fault != "unowned")
+    assert untouched(config) == before
+
+
+@pytest.mark.parametrize("local, gpu", [(False, 0), (True, 1)])
+def test_owned_runtime_resolution_refuses_unverified_hostfile_placement(
+    recipe, installed_runtime, monkeypatch, tmp_path, local, gpu
+):
+    config = recipe(accumulation=None)
+    before = untouched(config)
+    placement = ModuleType("dss.ray_dss.placement.local")
+    placement.LocalPlacementBackend = lambda **kwargs: SimpleNamespace(
+        _pick_hosts=lambda width: [SimpleNamespace(host="selected-worker", gpu_ids=[gpu])]
+    )
+    utilities = ModuleType("dss.ray_dss.utils")
+    utilities.is_local = lambda host: local
+    monkeypatch.setitem(sys.modules, placement.__name__, placement)
+    monkeypatch.setitem(sys.modules, utilities.__name__, utilities)
+    monkeypatch.setattr(gateway, "_allocation_hostfile", lambda: tmp_path / "hostfile")
+    with pytest.raises(ValueError, match="nonlocal DSS worker installation"):
+        engine_admission._owned_local_engine_config(config, automatically_owned_local=True)
+    assert installed_runtime.calls == []
+    assert untouched(config) == before
+
+
+@pytest.mark.parametrize("test_id", CHECKS)
+@pytest.mark.parametrize("automatic", [False, True])
+def test_onboarding_validation_child_retains_its_gateway_ownership(recipe, monkeypatch, tmp_path, test_id, automatic):
+    config = recipe()
+    before = untouched(config)
+    monkeypatch.setattr(execution, "_resolve_configs", lambda *args, **kwargs: [config.path])
+    monkeypatch.delenv("ARCTIC_CORTEX_HOST", raising=False)
+    monkeypatch.delenv("ARCTIC_CORTEX_BASE_URL", raising=False)
+    monkeypatch.delenv("ARCTIC_CORTEX_PAT", raising=False)
+    arguments = ["onboard", "--config", str(config.path), "--test-id", test_id]
+    if not automatic:
+        arguments += ["--base-url", "http://127.0.0.1:8123"]
+    args = execution.parse_args(arguments)
+    args.output_dir = tmp_path / "validation"
+    args.checkout_root = Path(__file__).resolve().parents[2]
+    onboard._configure_fixture_target(args, config, [test_id])
+    assert bool(getattr(args, "_automatic_cortex_gateway", False)) == automatic
+    commands = []
+    if automatic:
+        monkeypatch.setattr(onboard, "_validation_gateway", forbidden)
+
+    def child(command, **kwargs):
+        commands.append(command)
+        parsed = execution.parse_args(command[3:])
+        assert parsed.test == [test_id]
+        assert parsed.local_cortex_fixture
+        assert parsed.base_url == (None if automatic else args.base_url)
+        parsed = execution._configure_regression_target(parsed)
+        assert bool(getattr(parsed, "_automatic_cortex_gateway", False)) == automatic
+        output = Path(command[command.index("--out") + 1])
+        (output / "report.json").write_text(json.dumps({"totals": {"pass": 2, "fail": 0}}))
+        return SimpleNamespace(stdout=io.StringIO("controlled child result\n"), wait=lambda: 0)
+
+    monkeypatch.setattr(onboard, "subprocess", SimpleNamespace(Popen=child, PIPE=-1, STDOUT=-2))
+    assert onboard._run_final_regression(args, {"layers": 4})["status"] == "pass"
+    assert len(commands) == 1
+    assert ("--base-url" in commands[0]) is not automatic
     assert untouched(config) == before

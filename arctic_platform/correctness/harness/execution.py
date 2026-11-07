@@ -414,6 +414,12 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         try:
             cfg = load_config(path)
             validate_first_two_model_dtype(cfg)
+            if any(tests[test_id].compares_to_reference for test_id in (args.test or tests)):
+                from .engine_admission import validate_reference_accumulation
+
+                validate_reference_accumulation(
+                    cfg, automatically_owned_local=getattr(args, "_automatic_cortex_gateway", False)
+                )
             execution[cfg.config_id] = {
                 "backend": "cortex" if remote else "onprem",
                 **({"requested_model_name": cfg.model_name} if remote else {}),
