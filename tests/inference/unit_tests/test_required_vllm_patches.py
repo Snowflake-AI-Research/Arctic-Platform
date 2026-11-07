@@ -8,6 +8,7 @@ from arctic_platform.inference.vllm import hybrid_state_fixes
 from arctic_platform.inference.vllm import kv_group_size
 from arctic_platform.inference.vllm import mamba_completion_refresh
 from arctic_platform.inference.vllm import mrope_yarn
+from arctic_platform.inference.vllm import prefill_chunk_report
 from arctic_platform.inference.vllm import required_patches
 from arctic_platform.inference.vllm import router_replay
 from arctic_platform.inference.vllm import spec_decode_grammar
@@ -87,6 +88,12 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         lambda: calls.append("aligned_prefill_chunks"),
     )
 
+    monkeypatch.setattr(
+        prefill_chunk_report,
+        "ensure_prefill_chunk_report",
+        lambda: calls.append("prefill_chunk_report"),
+    )
+
     required_patches.apply_required_vllm_patches()
 
     assert calls == [
@@ -104,4 +111,5 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "deepseek_v41_lora",
         "gdn_batch_invariance",
         "aligned_prefill_chunks",
+        "prefill_chunk_report",
     ]
