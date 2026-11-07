@@ -619,6 +619,75 @@ def test_initialize_without_an_optimizer_omits_it_and_the_mpu(monkeypatch):
     assert calls["kwargs"] == {}
 
 
+def _initialized_config(monkeypatch, model, ds_config):
+    calls = {}
+
+    def _initialize(*, model, config, **kwargs):
+        calls["config"] = config
+        return "engine", None, None, None
+
+    monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
+    monkeypatch.setattr("deepspeed.initialize", _initialize)
+    initialize_training_engine(model, ds_config, optimizer=None, ep_size=1, mpu=None, model_path="unused", rank=0)
+    return calls["config"]
+
+
+def _model_with_fp32_parameter(*, trainable=True):
+    from arctic_platform.model.implementations.fp8 import mark_keep_fp32
+
+    model = torch.nn.Linear(1, 1)
+    model.fp32 = mark_keep_fp32(torch.nn.Parameter(torch.zeros(3), requires_grad=trainable))
+    return model
+
+
+def test_initialize_accumulates_in_fp32_when_the_model_holds_trainable_fp32_parameters(monkeypatch):
+    ds_config = build_deepspeed_config(_spec(world_size=1))
+
+    config = _initialized_config(monkeypatch, _model_with_fp32_parameter(), ds_config)
+
+    assert config["data_types"] == {"grad_accum_dtype": "fp32"}
+    assert "data_types" not in ds_config
+
+
+def test_initialize_keeps_other_data_types_when_accumulating_in_fp32(monkeypatch):
+    ds_config = build_deepspeed_config(_spec(world_size=1, ds_overrides={"data_types": {"other": 1}}))
+
+    config = _initialized_config(monkeypatch, _model_with_fp32_parameter(), ds_config)
+
+    assert config["data_types"] == {"other": 1, "grad_accum_dtype": "fp32"}
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "bfloat16", "float16"])
+def test_initialize_refuses_lower_precision_accumulation_for_fp32_parameters(monkeypatch, dtype):
+    ds_config = build_deepspeed_config(_spec(world_size=1, ds_overrides={"data_types": {"grad_accum_dtype": dtype}}))
+
+    with pytest.raises(ValueError, match="grad_accum_dtype"):
+        _initialized_config(monkeypatch, _model_with_fp32_parameter(), ds_config)
+
+
+@pytest.mark.parametrize(
+    "model", [torch.nn.Linear(1, 1), _model_with_fp32_parameter(trainable=False)], ids=["none", "frozen"]
+)
+def test_initialize_leaves_gradient_accumulation_alone_without_trainable_fp32_parameters(monkeypatch, model):
+    ds_config = build_deepspeed_config(_spec(world_size=1, ds_overrides={"data_types": {"grad_accum_dtype": "bf16"}}))
+
+    assert _initialized_config(monkeypatch, model, ds_config) == ds_config
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"zero_optimization": {"stage": 3}}, {"zero_optimization": {"stage": 0}}, {}],
+    ids=["zero3", "zero0", "default_zero2"],
+)
+def test_fp32_accumulation_is_required_only_for_bf16_zero_1_and_2(overrides):
+    from arctic_platform.common.zero_fp32_groups import requires_fp32_grad_accumulation
+
+    assert requires_fp32_grad_accumulation(build_deepspeed_config(_spec(ds_overrides=overrides or None))) is (
+        not overrides
+    )
+    assert not requires_fp32_grad_accumulation(build_deepspeed_config(_spec(dtype="float32")))
+
+
 def test_initialize_native_deepspeed_optimizer_forwards_model_parameters(monkeypatch):
     calls = {}
 
