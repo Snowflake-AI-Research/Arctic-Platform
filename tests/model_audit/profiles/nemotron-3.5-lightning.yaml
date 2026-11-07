@@ -1,0 +1,49 @@
+# Nemotron-3.5-Lightning RL at 262144 tokens (model catalog long).
+name: nemotron-3.5-lightning
+checkpoint: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+
+client:
+  catalog: nvidia-nemotron-3.5-lightning-30b-a3b-bf16
+  variant: long
+  training: h200-training-full
+  sampling: h200-inference-full
+  overrides:
+    training:
+      # At ep_size > 1 the launch defaults to a fused Liger head, which returns only a scalar loss; the probes'
+      # causal_cross_entropy step needs per-token log-probs, and the service rejects it otherwise.
+      training_config: {model_options: {lm_head: {cross_entropy: false}}}
+
+probe:
+  max_row_len: 4224
+  thresholds:
+    - {name: mamba_chunk, position: 128, reason: "Mamba2 SSD switches from intra-chunk to carried inter-chunk state"}
+
+expect:
+  loader: arctic
+  no_grad_params:
+    - {pattern: "\\.experts\\.w3$", reason: "relu2 experts are not gated; the expert-parallel wrapper keeps an empty w3"}
+  export_up_to_shift:
+    - pattern: "mixer\\.gate\\.e_score_correction_bias$"
+      reason: >-
+        the loader subtracts each router's minimum so bf16 can resolve the ~0.04 spread at ~57; top-k of
+        scores + bias is shift-invariant and the routing weights come from the unbiased scores
+
+known_issues:
+  trainer.export_round_trip:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/399
+    summary: >-
+      the HF export (DSS save_weights_only for EP models) drops every mixer.gate.e_score_correction_bias: the
+      router keeps it as a plain buffer, which named_weight_sync_tensors skips. vLLM loads the saved checkpoint
+      without it (torch.empty bias) and routes wrongly; the real model's bias spans 36.93-37.03 across experts
+  optimizer.clip_scale_exact:
+    issue: https://github.com/deepspeedai/DeepSpeed/pull/8970
+    summary: >-
+      with bf16_master_weights_and_grads, DeepSpeed ZeRO-2 unscale_and_clip_grads does grad.mul_(1 / combined_scale)
+      with a 0-dim fp32 tensor, so the clip coefficient is rounded to bf16 (0.33% low here, up to 0.39%)
+  sampler.batch_invariant:
+    issue: upstream (vLLM; VLLM_BATCH_INVARIANT=1 opts in)
+    summary: >-
+      vLLM scores a row batched and alone with different bf16 rounding, which flips near-tied top-6 routing in
+      single tokens (max 0.08 log-prob mid-row; mean error within the noise floor)
+
+not_applicable: {}

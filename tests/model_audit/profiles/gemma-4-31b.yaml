@@ -1,0 +1,22 @@
+# Gemma-4-31B-it RL. No AP family: the stock transformers loader, as for any dense HF model.
+name: gemma-4-31b
+checkpoint: google/gemma-4-31B-it
+
+client:
+  catalog: gemma-4-31b-it
+  training: h200-training-full
+  sampling: h200-inference-full
+
+probe:
+  max_row_len: 2048
+  thresholds:
+    - {name: sliding_window, position: 1024, reason: "sliding layers stop attending to keys more than sliding_window back"}
+
+expect:
+  loader: huggingface
+  no_grad_params:
+    - {pattern: "vision_tower\\.|embed_vision\\.", reason: "text-only RL does not run the vision tower"}
+
+known_issues: {}
+
+not_applicable: {}
