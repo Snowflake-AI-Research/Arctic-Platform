@@ -127,9 +127,10 @@ class _Geometry:
     max_position: int
     kv_block_size: int
     tensor_parallel: int = 1
+    prefill_chunk: int = 0
 
     @classmethod
-    def from_config(cls, config, *, kv_block_size: int, tensor_parallel: int = 1) -> _Geometry:
+    def from_config(cls, config, *, kv_block_size: int, tensor_parallel: int = 1, prefill_chunk: int = 0) -> _Geometry:
         rope = _rope_parameters(config)
         head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
         partial = rope.get("partial_rotary_factor", getattr(config, "partial_rotary_factor", 1.0))
@@ -145,6 +146,7 @@ class _Geometry:
             max_position=int(config.max_position_embeddings),
             kv_block_size=int(kv_block_size),
             tensor_parallel=int(tensor_parallel),
+            prefill_chunk=int(prefill_chunk),
         )
 
 
@@ -179,18 +181,33 @@ def _pin_gdn_kernels() -> None:
 
 
 @dataclass(frozen=True)
-class GdnLayout:
-    """Which tokens of each packed sequence the sampler prefilled and which it decoded, and the state slots it used.
+class PrefillRound:
+    """One chunked-scan call: the ``k``-th prefill chunk of every sequence that has one.
 
-    A sequence is prefilled up to and including its first trained position and decoded after it. Slot 0 of each state
-    buffer is a scratch slot; sequence ``i`` uses slot ``i + 1``.
+    ``index`` holds the chunks' tokens in sequence order, ``cu_seqlens`` their boundaries and ``seqs`` the
+    sequence each chunk belongs to; a chunk resumes from the state its sequence's previous chunk left.
+    """
+
+    index: torch.Tensor
+    cu_seqlens: torch.Tensor
+    seqs: torch.Tensor
+
+
+@dataclass(frozen=True)
+class GdnLayout:
+    """How the sampler computed each packed sequence's GatedDeltaNet layers, and the state slots it used.
+
+    A sequence is prefilled up to and including its first trained position and decoded after it. With a prefill
+    chunk size ``C`` the prompt is prefilled ``C`` tokens at a time from the sequence start, each chunk resuming
+    from the previous one's state. A one-token chunk is a decode step in vLLM (its query is one token long), so a
+    one-token tail of the prompt is decoded here too. Slot 0 of each state buffer is a scratch slot; sequence ``i``
+    uses slot ``i + 1``.
     """
 
     seq_cu: torch.Tensor
     cache_indices: torch.Tensor
     has_initial_state: torch.Tensor
-    prefill_index: torch.Tensor
-    prefill_cu: torch.Tensor
+    prefill_rounds: tuple[PrefillRound, ...]
     decode_index: torch.Tensor
     decode_cu: torch.Tensor
     decode_state_indices: torch.Tensor
@@ -201,7 +218,7 @@ class GdnLayout:
         return int(self.seq_cu.numel()) - 1
 
     @classmethod
-    def build(cls, cu_seqlens: torch.Tensor, trained: torch.Tensor) -> GdnLayout:
+    def build(cls, cu_seqlens: torch.Tensor, trained: torch.Tensor, prefill_chunk: int = 0) -> GdnLayout:
         device = trained.device
         seq_cu = cu_seqlens.to(device=device, dtype=torch.int32)
         num_tokens = int(trained.numel())
@@ -213,11 +230,37 @@ class GdnLayout:
         trained = trained.reshape(-1).to(torch.bool)
         first = torch.full((num_seqs,), num_tokens, dtype=torch.long, device=device)
         first = first.scatter_reduce(0, seq_of_token[trained], token[trained], reduce="amin", include_self=True)
-        boundary = torch.minimum(first + 1, ends)
-        decoded = token >= boundary[seq_of_token]
+        prompt_ends = torch.minimum(first + 1, ends).tolist()
+
+        rounds: list[list[tuple[int, int, int]]] = []
+        decode_starts = []
+        for seq, (seq_start, prompt_end) in enumerate(zip(starts.tolist(), prompt_ends)):
+            chunk = prefill_chunk if prefill_chunk > 0 else max(prompt_end - seq_start, 1)
+            cuts = list(range(seq_start, prompt_end, chunk)) + [prompt_end]
+            chunks = list(zip(cuts[:-1], cuts[1:]))
+            if chunks and chunks[-1][1] - chunks[-1][0] == 1:
+                decode_starts.append(chunks.pop()[0])
+            else:
+                decode_starts.append(prompt_end)
+            for k, (lo, hi) in enumerate(chunks):
+                if len(rounds) <= k:
+                    rounds.append([])
+                rounds[k].append((seq, lo, hi))
+
         zero = torch.zeros(1, dtype=torch.int32, device=device)
-        prefill_lens = (boundary - starts).to(torch.int32)
-        decode_lens = (ends - boundary).to(torch.int32)
+        prefill_rounds = []
+        for chunks in rounds:
+            lengths = torch.tensor([hi - lo for _, lo, hi in chunks], dtype=torch.int32, device=device)
+            prefill_rounds.append(
+                PrefillRound(
+                    index=torch.cat([torch.arange(lo, hi, device=device) for _, lo, hi in chunks]),
+                    cu_seqlens=torch.cat((zero, torch.cumsum(lengths, 0, dtype=torch.int32))),
+                    seqs=torch.tensor([seq for seq, _, _ in chunks], dtype=torch.long, device=device),
+                )
+            )
+        decode_start = torch.tensor(decode_starts, dtype=torch.long, device=device)
+        decoded = token >= decode_start[seq_of_token]
+        decode_lens = (ends - decode_start).to(torch.int32)
         max_decode = max(int(decode_lens.max().item()) if num_seqs else 0, 1)
         decode_state_indices = torch.zeros((num_seqs, max_decode), dtype=torch.int32, device=device)
         decode_state_indices[:, 0] = torch.arange(1, num_seqs + 1, dtype=torch.int32, device=device)
@@ -225,8 +268,7 @@ class GdnLayout:
             seq_cu=seq_cu,
             cache_indices=torch.arange(1, num_seqs + 1, dtype=torch.int32, device=device),
             has_initial_state=torch.zeros(num_seqs, dtype=torch.bool, device=device),
-            prefill_index=torch.nonzero(~decoded, as_tuple=False).flatten(),
-            prefill_cu=torch.cat((zero, torch.cumsum(prefill_lens, 0, dtype=torch.int32))),
+            prefill_rounds=tuple(prefill_rounds),
             decode_index=torch.nonzero(decoded, as_tuple=False).flatten(),
             decode_cu=torch.cat((zero, torch.cumsum(decode_lens, 0, dtype=torch.int32))),
             decode_state_indices=decode_state_indices,
@@ -310,32 +352,34 @@ def _gated_delta_net_core_kernel(mixed_qkv, a, b, A_log, dt_bias, conv_weight, d
     ).transpose(0, 1)
 
     core = torch.zeros((tokens, dims.num_v_heads, dims.head_v_dim), dtype=mixed_qkv.dtype, device=mixed_qkv.device)
-    query, key, value, g, beta = fla_ops.fused_post_conv_prep(
-        conv_output=conv_out[gdn.prefill_index],
-        a=a[gdn.prefill_index],
-        b=b[gdn.prefill_index],
-        A_log=a_log,
-        dt_bias=dt_bias,
-        num_k_heads=dims.num_k_heads,
-        head_k_dim=dims.head_k_dim,
-        head_v_dim=dims.head_v_dim,
-        apply_l2norm=True,
-        output_g_exp=False,
-    )
     state_shape = (dims.num_v_heads, dims.head_v_dim, dims.head_k_dim)
-    initial_state = torch.zeros((gdn.num_seqs, *state_shape), dtype=torch.float32, device=mixed_qkv.device)
-    prefill_out, final_state = fla_ops.chunk_gated_delta_rule(
-        q=query.unsqueeze(0),
-        k=key.unsqueeze(0),
-        v=value.unsqueeze(0),
-        g=g.unsqueeze(0),
-        beta=beta.unsqueeze(0),
-        initial_state=initial_state,
-        output_final_state=True,
-        cu_seqlens=gdn.prefill_cu,
-        use_qk_l2norm_in_kernel=False,
-    )
-    core[gdn.prefill_index] = prefill_out.squeeze(0).to(core.dtype)
+    final_state = torch.zeros((gdn.num_seqs, *state_shape), dtype=torch.float32, device=mixed_qkv.device)
+    for prefill in gdn.prefill_rounds:
+        query, key, value, g, beta = fla_ops.fused_post_conv_prep(
+            conv_output=conv_out[prefill.index],
+            a=a[prefill.index],
+            b=b[prefill.index],
+            A_log=a_log,
+            dt_bias=dt_bias,
+            num_k_heads=dims.num_k_heads,
+            head_k_dim=dims.head_k_dim,
+            head_v_dim=dims.head_v_dim,
+            apply_l2norm=True,
+            output_g_exp=False,
+        )
+        out, round_state = fla_ops.chunk_gated_delta_rule(
+            q=query.unsqueeze(0),
+            k=key.unsqueeze(0),
+            v=value.unsqueeze(0),
+            g=g.unsqueeze(0),
+            beta=beta.unsqueeze(0),
+            initial_state=final_state[prefill.seqs].contiguous(),
+            output_final_state=True,
+            cu_seqlens=prefill.cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+        )
+        core[prefill.index] = out.squeeze(0).to(core.dtype)
+        final_state[prefill.seqs] = round_state.to(torch.float32)
 
     if gdn.decode_index.numel() > 0:
         state = torch.zeros((gdn.num_seqs + 1, *state_shape), dtype=torch.float32, device=mixed_qkv.device)
@@ -606,7 +650,7 @@ def aligned_logprobs(
     ctx = _ForwardContext(
         geometry=geometry,
         layout=layout,
-        gdn=GdnLayout.build(layout.cu_seqlens, trained),
+        gdn=GdnLayout.build(layout.cu_seqlens, trained, geometry.prefill_chunk),
         rope_positions=positions.unsqueeze(0).expand(3, -1) if geometry.mrope_section else positions,
         cos_sin_cache=_cos_sin_cache(backbone, geometry, hidden.dtype, positions.device),
         fa_version=ops.flash_attn_version(geometry.head_dim),
@@ -689,6 +733,7 @@ def apply_vllm_aligned_qwen3_5(
     kv_block_size: int | None = None,
     lm_head_fp32: bool = False,
     tensor_parallel: int = 1,
+    prefill_chunk: int = 0,
 ) -> None:
     """Make a transformers ``Qwen3_5ForCausalLM``'s ``dss_compute_logprobs`` forward compute vLLM's logprobs.
 
@@ -696,7 +741,8 @@ def apply_vllm_aligned_qwen3_5(
     logits as the sampler's batch-invariant fp32 LM head does, with an fp32 gradient. ``tensor_parallel`` is the
     sampler's tensor-parallel size: the row-parallel projections then add per-rank partials as its all-reduce does.
     The column-parallel projections and the per-head kernels give the same bits sharded or not, with the GDN
-    autotuners pinned.
+    autotuners pinned. ``prefill_chunk`` is the sampler's ``ARCTIC_PREFILL_CHUNK_ALIGN``: prompts are then
+    prefilled that many tokens at a time from the sequence start, as the sampler's chunked prefill cuts them.
     """
     from arctic_platform.model.implementations.vllm_aligned.qwen3 import _text_config
 
@@ -713,8 +759,10 @@ def apply_vllm_aligned_qwen3_5(
     _pin_gdn_kernels()
     block_size = hybrid_kv_block_size(config, tensor_parallel) if kv_block_size is None else int(kv_block_size)
     _check_tensor_parallel(config, tensor_parallel)
+    if prefill_chunk < 0:
+        raise ValueError("prefill_chunk must be non-negative")
     model._vllm_aligned_geometry = _Geometry.from_config(
-        config, kv_block_size=block_size, tensor_parallel=tensor_parallel
+        config, kv_block_size=block_size, tensor_parallel=tensor_parallel, prefill_chunk=prefill_chunk
     )
     model._vllm_aligned_token_chunk_size = int(token_chunk_size)
     model._vllm_aligned_lm_head_fp32 = bool(lm_head_fp32)

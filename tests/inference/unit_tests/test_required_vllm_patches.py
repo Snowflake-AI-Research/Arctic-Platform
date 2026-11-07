@@ -1,3 +1,4 @@
+from arctic_platform.inference.vllm import aligned_prefill_chunks
 from arctic_platform.inference.vllm import config
 from arctic_platform.inference.vllm import deepseek_v41_lora
 from arctic_platform.inference.vllm import dense_prompt_logprobs
@@ -80,6 +81,12 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         lambda: calls.append("gdn_batch_invariance"),
     )
 
+    monkeypatch.setattr(
+        aligned_prefill_chunks,
+        "ensure_aligned_prefill_chunks",
+        lambda: calls.append("aligned_prefill_chunks"),
+    )
+
     required_patches.apply_required_vllm_patches()
 
     assert calls == [
@@ -96,4 +103,5 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "mamba_completion_refresh",
         "deepseek_v41_lora",
         "gdn_batch_invariance",
+        "aligned_prefill_chunks",
     ]

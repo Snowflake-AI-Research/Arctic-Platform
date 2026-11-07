@@ -89,10 +89,22 @@ class HuggingfaceOptions(BaseModel):
         ),
     )
 
+    vllm_aligned_prefill_chunk: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Experimental. The sampler's ARCTIC_PREFILL_CHUNK_ALIGN for vllm_aligned: prompts are prefilled that"
+            " many tokens at a time from the sequence start, as that sampler's chunked prefill cuts them. 0 means"
+            " each prompt is prefilled in one step."
+        ),
+    )
+
     @model_validator(mode="after")
     def _tensor_parallel_needs_vllm_aligned(self) -> HuggingfaceOptions:
         if self.vllm_aligned_tensor_parallel != 1 and not self.vllm_aligned:
             raise ValueError("vllm_aligned_tensor_parallel requires vllm_aligned")
+        if self.vllm_aligned_prefill_chunk and not self.vllm_aligned:
+            raise ValueError("vllm_aligned_prefill_chunk requires vllm_aligned")
         return self
 
     @model_validator(mode="after")
@@ -232,6 +244,7 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
                 token_chunk_size=token_chunk_size,
                 lm_head_fp32=lm_head_fp32,
                 tensor_parallel=options.vllm_aligned_tensor_parallel,
+                prefill_chunk=options.vllm_aligned_prefill_chunk,
             )
         else:
             from arctic_platform.model.implementations.vllm_aligned.qwen3 import apply_vllm_aligned

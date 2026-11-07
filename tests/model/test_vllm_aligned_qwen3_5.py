@@ -412,12 +412,67 @@ def test_layout_prefills_through_the_first_trained_position():
     trained[2:4] = True  # sequence 0: prompt 0..2, decode 3..4
     trained[11] = True  # sequence 2: its last token is the first trained one, so nothing is decoded
     layout = qwen3_5.GdnLayout.build(cu_seqlens, trained)
-    assert layout.prefill_index.tolist() == [0, 1, 2, 5, 6, 7, 8, 9, 10, 11]
-    assert layout.prefill_cu.tolist() == [0, 3, 7, 10]
+    (prefill,) = layout.prefill_rounds
+    assert prefill.index.tolist() == [0, 1, 2, 5, 6, 7, 8, 9, 10, 11]
+    assert prefill.cu_seqlens.tolist() == [0, 3, 7, 10]
+    assert prefill.seqs.tolist() == [0, 1, 2]
     assert layout.decode_index.tolist() == [3, 4]
     assert layout.decode_cu.tolist() == [0, 2, 2, 2]
     assert layout.decode_state_indices[:, 0].tolist() == [1, 2, 3]
     assert layout.cache_indices.tolist() == [1, 2, 3]
+
+
+def test_layout_cuts_prompts_into_chunks_and_decodes_a_one_token_tail():
+    cu_seqlens = torch.tensor([0, 10, 17], dtype=torch.int32)
+    trained = torch.zeros(17, dtype=torch.bool)
+    trained[6:9] = True  # sequence 0: prompt 0..6 (7 tokens), decode 7..9
+    trained[15] = True  # sequence 1: prompt 10..15 (6 tokens), decode 16
+    layout = qwen3_5.GdnLayout.build(cu_seqlens, trained, prefill_chunk=3)
+    rounds = [(r.index.tolist(), r.cu_seqlens.tolist(), r.seqs.tolist()) for r in layout.prefill_rounds]
+    # Sequence 0: chunks [0,3) and [3,6); its tail [6,7) is one token, so vLLM decodes it.
+    # Sequence 1: chunks [10,13) and [13,16).
+    assert rounds == [
+        ([0, 1, 2, 10, 11, 12], [0, 3, 6], [0, 1]),
+        ([3, 4, 5, 13, 14, 15], [0, 3, 6], [0, 1]),
+    ]
+    assert layout.decode_index.tolist() == [6, 7, 8, 9, 16]
+    assert layout.decode_cu.tolist() == [0, 4, 5]
+
+
+def test_a_one_token_prompt_is_decoded():
+    layout = qwen3_5.GdnLayout.build(torch.tensor([0, 4], dtype=torch.int32), torch.tensor([1, 1, 1, 0]).bool())
+    assert layout.prefill_rounds == ()
+    assert layout.decode_index.tolist() == [0, 1, 2, 3]
+
+
+def test_chunked_prefill_keeps_the_stock_function_and_gradient(fake_vllm, monkeypatch):
+    import transformers.models.qwen3_5.modeling_qwen3_5 as modeling
+
+    monkeypatch.setattr(modeling, "torch_chunk_gated_delta_rule", modeling.torch_recurrent_gated_delta_rule)
+    stock = _model()
+    aligned = _model()
+    _enable_aligned(aligned, monkeypatch, prefill_chunk=3)
+    torch.manual_seed(8)
+    sequences = [torch.randint(0, 97, (n,)) for n in (12, 9)]
+    weights = [torch.linspace(0.5, 1.5, seq.numel()) for seq in sequences]
+    input_ids, labels, positions, cu_seqlens, loss_mask = _packed(sequences, [7, 6])
+    _stock_weighted_loss(stock, sequences, weights).backward()
+    out = aligned(
+        input_ids=input_ids,
+        position_ids=positions,
+        labels=labels,
+        dss_compute_logprobs=True,
+        cu_seq_lens_q=cu_seqlens,
+        vllm_aligned_loss_mask=loss_mask,
+    )["logprobs"][0]
+    (out * torch.cat(weights)).sum().backward()
+    for start, seq in zip(cu_seqlens.tolist()[:-1], sequences):
+        torch.testing.assert_close(
+            out[start : start + seq.numel() - 1].detach(), _stock_logprobs(stock, seq), rtol=1e-4, atol=1e-4
+        )
+    for name, param in stock.named_parameters():
+        grad, other = param.grad, dict(aligned.named_parameters())[name].grad
+        assert float((other - grad).abs().max() / grad.abs().max().clamp_min(1e-12)) < 1e-4, name
 
 
 def test_aligned_logprobs_match_stock_per_sequence(fake_vllm, monkeypatch):
