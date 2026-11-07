@@ -27,6 +27,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from ..gated_delta_net_fused import project_gated_delta_net_inputs
 from ..packing import cu_seqlens_from_position_ids
 from .collectives import sequence_head_all_to_all
 
@@ -737,15 +738,13 @@ def _adapt_gated_delta_net_module(module: nn.Module, process_group, *, fp32_beta
             )
 
         batch_size, local_sequence_length, _ = hidden_states.shape
-        mixed_qkv = self.in_proj_qkv(hidden_states)
-        z = self.in_proj_z(hidden_states).reshape(
+        mixed_qkv, z, b, a = project_gated_delta_net_inputs(self, hidden_states)
+        z = z.reshape(
             batch_size,
             local_sequence_length,
             num_value_heads,
             int(self.head_v_dim),
         )
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
         key_dim = num_key_heads * int(self.head_k_dim)
         value_dim = num_value_heads * int(self.head_v_dim)
         query, key, value = torch.split(

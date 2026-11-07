@@ -54,6 +54,7 @@ from arctic_platform.model import Patches
 from arctic_platform.model.implementations.gpu import activation_offload
 from arctic_platform.model.implementations.gpu import qwen3_5_dense_parity as hf_dense_parity
 from arctic_platform.model.implementations.gpu.activation_offload import ActivationOffloadManager
+from arctic_platform.model.implementations.gpu.gated_delta_net_fused import apply_fused_gated_delta_net
 from arctic_platform.model.implementations.gpu.vllm_rounding import round_gated_norms_once
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.patches.gradient_checkpointing import apply_gradient_checkpointing
@@ -851,10 +852,16 @@ def test_loader_applies_the_patch_only_when_the_option_is_on(monkeypatch, loader
     assert loaded.model is model
     assert getattr(model.model, "_arctic_fp32_parity", False) is patched
     if not patched:
-        # Off installs nothing but the output norms that round once: the model is otherwise the stock one.
-        assert _instance_forwards(model) == [f"model.layers.{i}.linear_attn.norm" for i in range(3)]
+        # Off installs nothing but the output norms that round once and the fused-projection GatedDeltaNet forward
+        # (test_gated_delta_net_fused.py), which keeps the stock beta: the model is otherwise the stock one.
+        assert _instance_forwards(model) == sorted(
+            [f"model.layers.{i}.linear_attn" for i in range(3)]
+            + [f"model.layers.{i}.linear_attn.norm" for i in range(3)]
+        )
         assert _beta_hooks(model) == 0
-        expected_output, expected_grads = _forward_backward(_rounded_norms(_tiny_model()))
+        reference = _rounded_norms(_tiny_model())
+        assert apply_fused_gated_delta_net(reference, fp32_beta=False) == 3
+        expected_output, expected_grads = _forward_backward(reference)
         _assert_same_run(*_forward_backward(model), expected_output, expected_grads)
 
 
