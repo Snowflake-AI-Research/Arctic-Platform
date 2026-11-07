@@ -262,6 +262,18 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "shard_dense",
+        runs_in="trainer",
+        goal="memory",
+        why=(
+            "Full fine-tuning of a Hugging Face model: the decoder layers' and the input embedding's trainable weights"
+            " sharded over the GPUs of each node, gathered around each layer call and reduce-scattered in its"
+            " backward; the LM head stays whole."
+        ),
+        source="`patches.dense_shard`",
+        registry=registry,
+    )
+    register_option(
         "attention.backend",
         runs_in="trainer",
         goal="speed",

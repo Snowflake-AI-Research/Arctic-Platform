@@ -78,6 +78,7 @@ EXPECTED_KEYS = {
     "moe.expert_placement": ("trainer", "speed"),
     "moe.w8a8_experts": ("trainer", "speed"),
     "moe.shard_dense": ("trainer", "memory"),
+    "shard_dense": ("trainer", "memory"),
 }
 EXPECTED_PROFILES = {
     "huggingface",
@@ -544,7 +545,7 @@ class TestCommandLine(TestCasePlus):
     def test_check_passes_on_real_data(self):
         out = self._run("check")
         assert len(out) == 1
-        assert out[0].startswith("check passed: 35 options x 9 profiles = 315 cells, ")
+        assert out[0].startswith("check passed: 36 options x 9 profiles = 324 cells, ")
 
     def test_matrix_write_reproduces_committed_file(self):
         tmp_dir = Path(self.get_auto_remove_tmp_dir())

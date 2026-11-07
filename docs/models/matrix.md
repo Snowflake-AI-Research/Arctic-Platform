@@ -43,6 +43,7 @@ each loader's own validation. The reasons follow the table.
 | `numerics.optimization_dtype` | trainer | parity | yes | yes | yes | yes | yes | yes | no | yes | yes |
 | `numerics.reduce_dtype` | trainer | parity | yes | yes | no | yes | yes | yes | no | yes | yes |
 | `peft` | trainer | mode | no | no | no | no | no | no | yes | no | no |
+| `shard_dense` | trainer | memory | no | no | no | no | no | no | yes | no | no |
 | `tiled_mlp.token_chunk_size` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes |
 | `zorro_train` | trainer | mode | no | no | no | no | no | no | yes | no | no |
 
@@ -81,6 +82,7 @@ each loader's own validation. The reasons follow the table.
 - `numerics.optimization_dtype`: The dtype the trainer keeps and optimizes the weights in: bfloat16 or float32. Today: `ModelSpec.dtype` on the custom MoE loaders.
 - `numerics.reduce_dtype`: The dtype gradients are reduced in. Today: `loader_options.reduce_dtype`.
 - `peft`: Train adapters (LoRA) instead of the full weights. Today: `patches.peft`.
+- `shard_dense`: Full fine-tuning of a Hugging Face model: the decoder layers' and the input embedding's trainable weights sharded over the GPUs of each node, gathered around each layer call and reduce-scattered in its backward; the LM head stays whole. Today: `patches.dense_shard`.
 - `tiled_mlp.token_chunk_size`: Recompute the MLP in token tiles of this size. Today: `patches.tiled_mlp.token_chunk_size`; `loader_options.tiled_mlp_token_chunk_size`.
 - `zorro_train`: Replace the forward with the ZoRRo Train log-prob and entropy path. Today: `patches.zorro_train`.
 
@@ -88,7 +90,7 @@ each loader's own validation. The reasons follow the table.
 
 Extends `generic_moe`.
 
-9 of 35 options unsupported.
+10 of 36 options unsupported.
 
 - `attention.sparse_mla` (n/a): DeepSeek V4 runs its own fused sparse attention kernel, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -99,13 +101,14 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `shard_dense` (no): the huggingface loader's option; the MoE loaders shard their replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `deepseek_v41`
 
 Extends `generic_moe`.
 
-9 of 35 options unsupported.
+10 of 36 options unsupported.
 
 - `attention.sparse_mla` (n/a): DeepSeek V4.1 runs its own fused sparse attention kernel, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -116,11 +119,12 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `shard_dense` (no): the huggingface loader's option; the MoE loaders shard their replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `dflash2`
 
-17 of 35 options unsupported.
+18 of 36 options unsupported.
 
 - `attention.sparse_mla` (n/a): neither the DFlash2 draft nor the target it reads uses sparse MLA attention
 - `checkpointing.freq` (no): the loader rejects `patches.gradient_checkpointing`
@@ -153,12 +157,13 @@ Extends `generic_moe`.
 - `numerics.fp32_routed_weighting` (no): the draft has no routed experts
 - `numerics.reduce_dtype` (no): no equivalent option
 - `peft` (no): the loader rejects `patches.peft`: the draft is trained in full
+- `shard_dense` (no): the dflash2 loader trains only its draft; dense_shard is the huggingface loader's
 - `tiled_mlp.token_chunk_size` (no): the loader rejects `patches.tiled_mlp`
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `generic_moe`
 
-9 of 35 options unsupported.
+10 of 36 options unsupported.
 
 - `attention.sparse_mla` (n/a): no model family behind this loader uses sparse MLA attention
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -169,13 +174,14 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `shard_dense` (no): the huggingface loader's option; the MoE loaders shard their replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `glm5_next`
 
 Extends `generic_moe`.
 
-7 of 35 options unsupported.
+8 of 36 options unsupported.
 
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
@@ -183,11 +189,12 @@ Extends `generic_moe`.
 - `moe.shard_dense` (no): only the glm_moe_dsa loader shards the replicated weights
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `shard_dense` (no): the huggingface loader's option; the MoE loaders shard their replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `glm_moe_dsa`
 
-8 of 35 options unsupported.
+9 of 36 options unsupported.
 
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
@@ -196,11 +203,12 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `shard_dense` (no): the huggingface loader's option; this loader shards its replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `huggingface`
 
-7 of 35 options unsupported.
+7 of 36 options unsupported.
 
 - `attention.sparse_mla` (no): no equivalent option; sparse MLA is used only by the GLM loaders glm_moe_dsa and glm5_next
 - `checkpointing.mode` (no): no equivalent option; `patches.gradient_checkpointing` always recomputes whole layers
@@ -227,7 +235,7 @@ Extends `generic_moe`.
 
 ## `qwen3_5_moe`
 
-8 of 35 options unsupported.
+9 of 36 options unsupported.
 
 - `attention.sparse_mla` (n/a): Qwen3.5-MoE has no sparse MLA attention
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -237,13 +245,14 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `shard_dense` (no): the huggingface loader's option; the MoE loaders shard their replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `qwen4_exp`
 
 Extends `generic_moe`.
 
-7 of 35 options unsupported.
+8 of 36 options unsupported.
 
 - `attention.sparse_mla` (n/a): Qwen3.8-Flash-Next uses QSA attention, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -252,4 +261,5 @@ Extends `generic_moe`.
 - `moe.shard_dense` (no): only the glm_moe_dsa loader shards the replicated weights
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `shard_dense` (no): the huggingface loader's option; the MoE loaders shard their replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
