@@ -472,21 +472,28 @@ def test_patched_attention_uses_the_fp32_rotation(monkeypatch):
     torch_assert_equal(actual, expected)
 
 
-def test_gated_delta_net_beta_is_a_sigmoid_of_fp32_b(monkeypatch):
+@pytest.mark.parametrize("cached_decode", [False, True])
+def test_gated_delta_net_beta_is_a_sigmoid_of_fp32_b(monkeypatch, cached_decode):
     model = _patched(_tiny_model())
     gated_delta_net = model.model.layers[0].linear_attn
     captured = {}
-    stock_rule = modeling_qwen3_5.torch_chunk_gated_delta_rule
+    rule_name = "torch_recurrent_gated_delta_rule" if cached_decode else "torch_chunk_gated_delta_rule"
+    stock_rule = getattr(modeling_qwen3_5, rule_name)
 
     def recording_rule(query, key, value, g, beta, **kwargs):
         captured["beta"] = beta
         return stock_rule(query, key, value, g=g, beta=beta, **kwargs)
 
-    monkeypatch.setattr(modeling_qwen3_5, "torch_chunk_gated_delta_rule", recording_rule)
+    monkeypatch.setattr(modeling_qwen3_5, rule_name, recording_rule)
     set_seed(0)
     hidden = torch.randn(1, _SEQ, 32).to(torch.bfloat16)
     with torch.no_grad():
-        gated_delta_net(hidden_states=hidden)
+        cache = None
+        if cached_decode:
+            cache = modeling_qwen3_5.DynamicCache(config=model.model.config)
+            gated_delta_net(hidden_states=hidden[:, :-1], cache_params=cache)
+            hidden = hidden[:, -1:]
+        gated_delta_net(hidden_states=hidden, cache_params=cache)
         b = F.linear(hidden, gated_delta_net.in_proj_b.weight)
     assert captured["beta"].dtype == torch.float32
     torch_assert_equal(captured["beta"], b.float().sigmoid())
@@ -958,6 +965,16 @@ def test_a_class_level_replacement_is_named_with_its_source(monkeypatch):
     assert f"Qwen3_5DecoderLayer.forward by {__name__}._replacement_forward has replaced the stock code" in message
     assert "has different source" not in message
     assert _instance_forwards(model) == []
+
+
+def test_a_verified_alternative_cannot_replace_the_installed_forward(monkeypatch):
+    name = "Qwen3_5GatedDeltaNet.forward"
+    digest = hf_dense_parity._digest(inspect.getsource(_replacement_forward))
+    alternatives = (*hf_dense_parity._STOCK_SOURCE_SHA256_ALTERNATIVES.get(name, ()), digest)
+    monkeypatch.setitem(hf_dense_parity._STOCK_SOURCE_SHA256_ALTERNATIVES, name, alternatives)
+    monkeypatch.setattr(modeling_qwen3_5.Qwen3_5GatedDeltaNet, "forward", _replacement_forward)
+    with pytest.raises(RuntimeError, match="Qwen3_5GatedDeltaNet.forward.*has replaced the stock code"):
+        hf_dense_parity.check_stock_classes()
 
 
 def test_the_custom_moe_builders_class_patch_is_named():

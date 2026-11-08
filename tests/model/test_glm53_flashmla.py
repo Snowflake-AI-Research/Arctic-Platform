@@ -386,7 +386,11 @@ def test_missing_optional_kernels_use_reference(monkeypatch):
 def test_sp1_patches_each_sparse_layer_with_requested_backend(tiny_glm_sparse_model, backend):
     model = tiny_glm_sparse_model()
     context_parallel.apply_context_parallelism(model, 1, None, attn_implementation=backend)
-    sparse = [layer.self_attn for layer in model.model.layers if layer.block_type == "deepseek_sparse_attention"]
+    sparse = [
+        layer.self_attn
+        for layer in model.model.layers
+        if layer.block_type in ("deepseek_sparse_attention", "indexed_attention")
+    ]
     assert sparse
     assert all(attention._ap_sparse_mla_backend == backend for attention in sparse)
 
@@ -676,7 +680,9 @@ def test_glm53_rope_free_model_executes_flashmla(tiny_glm_sparse_model):
     _require_flashmla_kernel()
     set_seed(42)
     model = tiny_glm_sparse_model(kv_lora_rank=512).to(device="cuda", dtype=torch.bfloat16).train()
-    sparse_layers = sum(layer.block_type == "deepseek_sparse_attention" for layer in model.model.layers)
+    sparse_layers = sum(
+        layer.block_type in ("deepseek_sparse_attention", "indexed_attention") for layer in model.model.layers
+    )
     assert sparse_layers > 0
     tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
     with patch.object(context_parallel, "_flashinfer_available", return_value=False):
@@ -705,7 +711,9 @@ def test_glm53_rope_free_model_prefers_installed_flashinfer(tiny_glm_sparse_mode
         pytest.skip("FlashInfer FA3 MLA requires Hopper")
     set_seed(42)
     model = tiny_glm_sparse_model(kv_lora_rank=512).to(device="cuda", dtype=torch.bfloat16).train()
-    sparse_layers = sum(layer.block_type == "deepseek_sparse_attention" for layer in model.model.layers)
+    sparse_layers = sum(
+        layer.block_type in ("deepseek_sparse_attention", "indexed_attention") for layer in model.model.layers
+    )
     assert sparse_layers > 0
     tokens = torch.tensor([[1, 2, 3, 4]], device="cuda")
     # With the fused TileLang backward installed, FlashMLA's forward and that backward take precedence.

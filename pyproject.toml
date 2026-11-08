@@ -173,6 +173,7 @@ sft = [
     # [rl], [onprem] and [verl] include [sft], so a training install gets SonicMoE with the rest of the stack.
     "arctic_platform[sonicmoe]",
     "deepspeed>=0.19.9",  # preserve grads #8949
+    "huggingface-hub>=2.0,<3",
     "liger-kernel>=0.8.5", # more patches than earlier
     "numpy",
     "nvidia-ml-py",
@@ -184,7 +185,7 @@ sft = [
     "tensordict",
     "torch>=2.9",  # checkpoint(early_stop=...) and CPU grouped matrix multiplication
     # GLM-5.3-Flash and Qwen3.8-Flash-Next need the Transformers 5.17 model modules.
-    "transformers>=5.17,<5.18",
+    "transformers>=5.17,<5.23",
 ]
 
 # Sampling stack that lives in arctic_platform.inference. Not referenced by
