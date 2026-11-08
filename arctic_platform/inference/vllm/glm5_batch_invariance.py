@@ -231,10 +231,28 @@ def _per_request_decode_indexer_logits() -> None:
     original = deep_gemm.fp8_fp4_paged_mqa_logits
     log = logging.getLogger(__name__)
 
+    def record_inputs(values, kv_cache, weights, context_lens, block_tables) -> None:
+        """Debug: digest what each row's scores read (query, head weights, its full cache blocks)."""
+        from arctic_platform.inference.vllm.layer_digest import record_numbered
+        from arctic_platform.inference.vllm.layer_digest import row_digest
+
+        batch = values.shape[0]
+        record_numbered("ix_wrapped", torch.ones(batch, 1, dtype=torch.int64))
+        record_numbered("ix_q", values.reshape(batch, -1))
+        record_numbered("ix_w", weights.reshape(batch, -1))
+        block = kv_cache.shape[1]
+        lengths = context_lens.reshape(-1).tolist()
+        blocks = [row_digest(kv_cache[block_tables[b, : lengths[b] // block].long()].reshape(1, -1), 1)
+                  for b in range(batch)]  # fmt: skip
+        record_numbered("ix_kv", torch.cat([d if d is not None else torch.zeros(1, dtype=torch.int64) for d in blocks])
+                        .view(batch, 1))  # fmt: skip
+
     def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, schedule_metadata,
                                  max_model_len, clean_logits, indices=None):  # fmt: skip
         values, scales = q
         batch, next_n = values.shape[0], values.shape[1]
+        if os.environ.get("ARCTIC_LAYER_DIGEST_DIR") and next_n == 1:
+            record_inputs(values, kv_cache, weights, context_lens, block_tables)
         if batch == 1 or next_n != 1:
             if batch > 1:
                 log.warning("ARCTIC_GLM5_BATCH_INVARIANT: batched indexer logits with next_n=%d are not "
