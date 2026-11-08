@@ -172,7 +172,8 @@ tinker = [
 sft = [
     # [rl], [onprem] and [verl] include [sft], so a training install gets SonicMoE with the rest of the stack.
     "arctic_platform[sonicmoe]",
-    "deepspeed>=0.19.9",  # preserve grads #8949
+    # preserve grads #8949: merged after 0.19.9 and in no release yet; move back to a version floor once one ships it
+    "deepspeed @ git+https://github.com/deepspeedai/DeepSpeed.git@dc046b15d7a58f6c8dacba435508b52b1ebc620c",
     "liger-kernel>=0.8.5", # more patches than earlier
     "numpy",
     "nvidia-ml-py",
