@@ -63,10 +63,12 @@ def _record(name: str, output) -> None:
             digests[f"{name}.{i}"] = digest
 
 
-def _wrap(cls, method: str, name_of):
+def _wrap(cls, method: str, name_of, inputs: bool = False):
     original = getattr(cls, method)
 
     def wrapped(self, *args, **kwargs):
+        if inputs:
+            _record(f"{name_of(self)}.in", [*args, *kwargs.values()])
         out = original(self, *args, **kwargs)
         _record(name_of(self), out)
         return out
@@ -110,7 +112,7 @@ def ensure_layer_digest() -> None:
     layer = lambda self: f"L{self.layer_idx:02d}"  # noqa: E731
     _wrap(glm5.Glm5NextDecoderLayer, "forward", lambda self: f"{layer(self)}.out")
     for op in _LAYER_OPS:
-        _wrap(glm5.Glm5NextDecoderLayer, op, lambda self, op=op: f"{layer(self)}.{op}")
+        _wrap(glm5.Glm5NextDecoderLayer, op, lambda self, op=op: f"{layer(self)}.{op}", inputs=True)
     for cls in (glm5.Glm5NextMoE, glm5.Glm5NextMLP):
         _wrap(cls, "forward", lambda self, cls=cls: f"{cls.__name__}@{id(self):x}")
     from vllm.models.glm5next.common.attention import Glm5NextMLAAttention

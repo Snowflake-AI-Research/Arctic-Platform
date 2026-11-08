@@ -107,6 +107,9 @@ def ensure_glm5_batch_invariance() -> None:
     if _APPLIED or not glm5_batch_invariance_requested():
         return
     os.environ.setdefault("ARCTIC_GDN_BATCH_INVARIANT", "1")
+    # The fused grouped top-k CUDA kernel's routing weights depend on the step; vLLM's torch path sorts for batch
+    # invariance.
+    os.environ.setdefault("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "0")
     from arctic_platform.inference.vllm.gdn_batch_invariance import ensure_gdn_batch_invariance
 
     ensure_gdn_batch_invariance()
