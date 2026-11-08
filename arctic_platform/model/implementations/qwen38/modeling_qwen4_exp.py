@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -365,7 +366,41 @@ class Qwen4ExpModelPrimeRL(Qwen4ExpModel):
     def forward(self, input_ids=None, attention_mask=None, position_ids=None, *args, **kwargs):
         if position_ids is not None:
             kwargs["ple_position_ids"] = position_ids if position_ids.ndim == 2 else position_ids[0]
-        return super().forward(input_ids, attention_mask, position_ids, *args, **kwargs)
+        if not self._needs_dummy_vision_forward(kwargs):
+            return super().forward(input_ids, attention_mask, position_ids, *args, **kwargs)
+
+        # A trainable vision tower must take part in every microbatch's backward, so that every rank produces
+        # (zero) gradients for its parameters and ZeRO's bucketed gradient reduction stays in lockstep.
+        zero = self._dummy_vision_forward().sum() * 0
+
+        def add_zero(_module, args, language_model_kwargs):
+            language_model_kwargs["inputs_embeds"] = language_model_kwargs["inputs_embeds"] + zero.to(
+                language_model_kwargs["inputs_embeds"].dtype
+            )
+            return args, language_model_kwargs
+
+        handle = self.language_model.register_forward_pre_hook(add_zero, with_kwargs=True)
+        try:
+            return super().forward(input_ids, attention_mask, position_ids, *args, **kwargs)
+        finally:
+            handle.remove()
+
+    def _needs_dummy_vision_forward(self, kwargs) -> bool:
+        if not (self.training and torch.is_grad_enabled()):
+            return False
+        if kwargs.get("pixel_values") is not None or kwargs.get("pixel_values_videos") is not None:
+            return False
+        return any(parameter.requires_grad for parameter in self.visual.parameters())
+
+    def _dummy_vision_forward(self) -> Tensor:
+        """Run the vision tower on its smallest valid input: one frame of one spatial-merge window of patches."""
+        vision: Any = self.config.vision_config
+        merge = vision.spatial_merge_size
+        patch_dim = vision.in_channels * vision.temporal_patch_size * vision.patch_size**2
+        reference = next(self.visual.parameters())
+        pixel_values = torch.zeros(merge * merge, patch_dim, device=reference.device, dtype=reference.dtype)
+        grid_thw = torch.tensor([[1, merge, merge]], device=reference.device)
+        return self.visual(pixel_values, grid_thw=grid_thw, return_dict=True).pooler_output
 
 
 def _fp32_output(_module: nn.Module, _args, output: Tensor) -> Tensor:
