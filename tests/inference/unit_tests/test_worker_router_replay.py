@@ -148,31 +148,29 @@ def test_result_from_output_rejects_capture_length_mismatch_before_cache_write()
     assert cache.put_news == []
 
 
-def _turn_output(prompt, tokens, routes):
-    # vLLM returns one numpy row per captured position; here every layer/top-k slot of a position holds one label.
-    routed = np.repeat(np.asarray(routes, dtype=np.uint8).reshape(-1, 1, 1), 2, axis=2)
-    choice = SimpleNamespace(text="ok", token_ids=tokens, finish_reason="stop", logprobs=None)
-    return SimpleNamespace(
-        outputs=[choice], prompt_token_ids=prompt, num_cached_tokens=0, prompt_logprobs=None, routed_experts=routed
-    )
-
-
 def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positions_it_covers():
     # Turn 1: prompt 3 ids, decodes 2 (capture rows 0-3, decode routes 12, 13 at 2-3). Turn 2 re-prefills rows 2-3,
     # whose block turn 1 never completed, so its engine capture holds its own prefill routes 22, 23 there.
     cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
     worker = InferenceWorker.__ray_metadata__.modified_class()
     worker.state, worker._router_replay_tx, worker._replica_label = WorkerLifecycleState.READY, cache, "replica-a"
-    outputs, engine_params = [], []
-
-    async def fake_generate_once(_prompt, params, _request_id, **_kwargs):
-        engine_params.append(params)
-        return outputs.pop(0)
-
-    worker._generate_once = fake_generate_once
+    engine_params = []
 
     def generate(prompt, tokens, routes, replay_id, **extra_args):
-        outputs.append(_turn_output(prompt, tokens, routes))
+        async def fake_generate_once(_prompt, params, _request_id, **_kwargs):
+            engine_params.append(params)
+            # vLLM returns one numpy row per captured position.
+            routed = np.repeat(np.asarray(routes, dtype=np.uint8).reshape(-1, 1, 1), 2, axis=2)
+            choice = SimpleNamespace(text="ok", token_ids=tokens, finish_reason="stop", logprobs=None)
+            return SimpleNamespace(
+                outputs=[choice],
+                prompt_token_ids=prompt,
+                num_cached_tokens=0,
+                prompt_logprobs=None,
+                routed_experts=routed,
+            )
+
+        worker._generate_once = fake_generate_once
         params = dict(max_tokens=4, dss_sample_id="trajectory", dss_router_replay_id=replay_id, extra_args=extra_args)
         return asyncio.run(worker.generate(prompt, params))["router_replay"]
 
@@ -181,8 +179,7 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
 
     turn1 = generate([1, 2, 3], [4, 5], [10, 11, 12, 13], "rr1:turn-1")
     turn2 = generate(
-        [1, 2, 3, 4, 5, 6, 7], [8], [10, 11, 22, 23, 24, 25, 26], "rr1:turn-2",
-        dss_router_replay_prefix_id="rr1:turn-1",
+        [1, 2, 3, 4, 5, 6, 7], [8], [10, 11, 22, 23, 24, 25, 26], "rr1:turn-2", dss_router_replay_prefix_id="rr1:turn-1"
     )
     assert cached("rr1:turn-2") == [10, 11, 12, 13, 24, 25, 26]
     assert (turn1["prefix_len"], turn2["prefix_len"], turn2["capture_len"]) == (0, 4, 7)
@@ -199,8 +196,8 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
     with pytest.raises(ValueError, match="must end inside the prompt"):
         generate([1, 2, 3, 4, 5, 6], [7], [0] * 6, "rr1:turn-4", dss_router_replay_prefix_id="rr1:turn-2")
     assert "rr1:turn-4" not in cache and "rr1:turn-2" in cache
+    prefix_only = dict(max_tokens=1, extra_args=dict(dss_router_replay_prefix_id="rr1:turn-2"))
     with pytest.raises(ValueError, match="dss_router_replay_prefix_id requires dss_router_replay_id"):
-        prefix_only = dict(max_tokens=1, extra_args=dict(dss_router_replay_prefix_id="rr1:turn-2"))
         asyncio.run(worker.generate([1], prefix_only))
 
 
