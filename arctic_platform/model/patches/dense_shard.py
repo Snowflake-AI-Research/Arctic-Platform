@@ -41,29 +41,7 @@ import torch.nn as nn
 
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.patch import register_patch
-
-
-def text_decoder(model: nn.Module) -> nn.Module:
-    """The model's text decoder: the module holding the decoder layers (``layers``) and the input embedding.
-
-    ``get_decoder()`` when it returns one (a multimodal model returns its language model), else the one module with
-    both a ``layers`` ModuleList and ``embed_tokens``.
-    """
-    get_decoder = getattr(model, "get_decoder", None)
-    decoder = get_decoder() if callable(get_decoder) else None
-    if decoder is not None and isinstance(getattr(decoder, "layers", None), nn.ModuleList):
-        return decoder
-    found = [
-        module
-        for module in model.modules()
-        if isinstance(getattr(module, "layers", None), nn.ModuleList) and hasattr(module, "embed_tokens")
-    ]
-    if len(found) != 1:
-        raise ValueError(
-            f"dense_shard: found {len(found)} modules with decoder layers and an input embedding; it shards the text "
-            "decoder of a causal LM"
-        )
-    return found[0]
+from arctic_platform.model.patches.utils import text_decoder
 
 
 @register_patch("dense_shard")
@@ -76,7 +54,7 @@ def apply_dense_shard(model: nn.Module, ctx: LoaderContext) -> None:
         raise RuntimeError("dense_shard needs torch.distributed: it shards over the GPUs of each node")
     value = ctx.spec.patches.dense_shard
     group_size = None if value is True else int(value)
-    decoder = text_decoder(model)
+    decoder = text_decoder(model, patch_name="dense_shard")
     layers = list(decoder.layers)
     modules: list[nn.Module] = [getattr(layer, "_checkpoint_wrapped_module", layer) for layer in layers]
     embedding = model.get_input_embeddings()
