@@ -94,7 +94,7 @@ LOADER_OPTION_FIELDS: dict[str, str | None] = {
     "numerics.reduce_dtype": "reduce_dtype",
     "numerics.fp32_parity": "fp32_parity",
     "numerics.fp32_residual": None,
-    "numerics.vllm_aligned": None,
+    "numerics.vllm_aligned": "vllm_aligned",
     "numerics.fp32_routed_weighting": "fp32_routed_weighting",
     "numerics.optimization_dtype": "ModelSpec.dtype",
     "compile.fullgraph": None,

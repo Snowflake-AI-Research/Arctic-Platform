@@ -33,6 +33,6 @@ def register(registry: Registry) -> None:
     register_profile(
         "glm5_next",
         extends="generic_moe",
-        supports=["attention.sparse_mla", "numerics.fp32_parity", "numerics.fp32_routed_weighting"],
+        supports=["attention.sparse_mla", "numerics.fp32_parity", "numerics.fp32_routed_weighting", "numerics.vllm_aligned"],
         registry=registry,
     )

@@ -58,8 +58,24 @@ class FlashMoeOptions(GenericMoeOptions):
     )
 
 
+class Glm5NextOptions(FlashMoeOptions):
+    """Validated ``loader_options`` for GLM-5.3-Flash."""
+
+    vllm_aligned: bool = Field(
+        False,
+        description=(
+            "Experimental, GLM-5.3-Flash only. Compute dss_compute_logprobs with the kernels the batch-invariant vLLM"
+            " sampler runs (VLLM_BATCH_INVARIANT=1, ARCTIC_GLM5_BATCH_INVARIANT=1, enforce_eager, tensor parallelism"
+            " 1), so trainer and sampler logprobs are bitwise equal at the same weights; the backward recomputes the"
+            " stock layers. Covers prompts prefilled whole, up to index_topk tokens, for now (see"
+            " arctic_platform.model.implementations.vllm_aligned.glm5_next)."
+        ),
+    )
+
+
 class _FlashLoadOptions(Qwen3_5MoeOptions):
     fp32_routed_weighting: bool = False
+    vllm_aligned: bool = False
 
 
 def _matches(family: str):
@@ -157,13 +173,22 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
 @register_loader(
     "glm5_next",
     matches=_matches("glm5_next"),
-    options=FlashMoeOptions,
+    options=Glm5NextOptions,
     validate_spec=_validate_glm5_next,
 )
 def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.glm53.deepspeed_integration import load_glm5_next_model
 
-    return _load(ctx, load_glm5_next_model)
+    loaded = _load(ctx, load_glm5_next_model)
+    options = _FlashLoadOptions.model_validate(ctx.spec.loader_options)
+    if options.vllm_aligned:
+        from arctic_platform.model.implementations.vllm_aligned.glm5_next import apply_vllm_aligned_glm5_next
+
+        chunk = options.fused_lm_head_token_chunk_size
+        apply_vllm_aligned_glm5_next(
+            loaded.model, token_chunk_size=chunk if isinstance(chunk, int) else 1024, lm_head_fp32=options.fp32_lm_head
+        )
+    return loaded
 
 
 @register_loader(

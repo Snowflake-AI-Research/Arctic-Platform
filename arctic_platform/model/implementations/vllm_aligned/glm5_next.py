@@ -303,7 +303,14 @@ def shared_expert_mlp(ffn: Any, x: torch.Tensor, swiglu_limit: float) -> torch.T
     return fp8_block_linear(hidden, ffn.w2, ffn.w2_scale_inv)
 
 
-_MOE_KERNELS: dict = {}
+def _full(tensor: torch.Tensor) -> torch.Tensor:
+    """An expert-parallel ``DTensor``'s full value (all experts); a plain tensor as is.
+
+    vLLM at TP 1 sums a token's top-k expert outputs in one kernel; splitting that sum over expert-parallel ranks
+    would round differently, so every rank runs all of a token's experts on the gathered weights.
+    """
+    full_tensor = getattr(tensor, "full_tensor", None)
+    return full_tensor() if callable(full_tensor) else tensor
 
 
 def _triton_experts(num_experts: int, top_k: int, hidden: int, intermediate: int, swiglu_limit: float, w13_scale,
@@ -371,16 +378,15 @@ def moe(mlp: Any, x: torch.Tensor, config: Any) -> torch.Tensor:
         e_score_correction_bias=mlp.expert_bias,
     )
     experts = mlp.experts
-    w13 = torch.cat([experts.w1, experts.w3], dim=1)
-    w13_scale = torch.cat([experts.w1_scale_inv, experts.w3_scale_inv], dim=1)
-    num_experts, intermediate, hidden = experts.w1.shape
-    key = (id(experts), x.device)
-    if key not in _MOE_KERNELS:
-        _MOE_KERNELS[key] = _triton_experts(num_experts, config.num_experts_per_tok, hidden, intermediate,
-                                            config.swiglu_limit, w13_scale, experts.w2_scale_inv, x.device)  # fmt: skip
-    kernel, activation = _MOE_KERNELS[key]
+    w1, w2, w3 = (_full(t) for t in (experts.w1, experts.w2, experts.w3))
+    s1, s2, s3 = (_full(t) for t in (experts.w1_scale_inv, experts.w2_scale_inv, experts.w3_scale_inv))
+    w13, w13_scale = torch.cat([w1, w3], dim=1), torch.cat([s1, s3], dim=1)
+    num_experts, intermediate, hidden = w1.shape
+    # The kernel captures the scales in its quant config, so it is rebuilt for every call (cheap, host-side only).
+    kernel, activation = _triton_experts(num_experts, config.num_experts_per_tok, hidden, intermediate,
+                                         config.swiglu_limit, w13_scale, s2, x.device)  # fmt: skip
     routed = kernel.apply(
-        x.contiguous(), w13, experts.w2, weights, ids, activation=activation, global_num_experts=num_experts,
+        x.contiguous(), w13, w2, weights, ids, activation=activation, global_num_experts=num_experts,
         expert_map=None, apply_router_weight_on_input=False,
     )  # fmt: skip
     return shared_expert_mlp(mlp.shared_expert, x, config.swiglu_limit) + routed
