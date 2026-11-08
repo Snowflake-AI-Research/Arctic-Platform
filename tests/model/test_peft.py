@@ -403,3 +403,61 @@ def test_peft_patch_allows_trainables_outside_lora_export(peft_config):
     trainable = [name for name, param in wrapped.named_parameters() if param.requires_grad]
     assert trainable
     assert any("lora_A" not in name and "lora_B" not in name for name in trainable)
+
+
+def _adapter_names(model):
+    return sorted(name for name, _ in model.named_parameters() if "lora_" in name)
+
+
+@pytest.mark.parametrize("exclude_modules", [None, ["v_proj"], r".*\.layers\.0\..*"])
+def test_text_only_adapters_unchanged_by_vision_policy(exclude_modules):
+    config = {"peft_type": "LORA", "r": 4, "target_modules": "all-linear", "exclude_modules": exclude_modules}
+    set_seed(0)
+    expected = get_peft_model(_tiny_qwen(), LoraConfig(**{k: v for k, v in config.items() if k != "peft_type"}))
+    set_seed(0)
+    actual = apply_peft(_tiny_qwen(), config)
+
+    assert _adapter_names(actual) == _adapter_names(expected)
+    assert _adapter_names(actual)
+    assert actual.peft_config["default"].exclude_modules == expected.peft_config["default"].exclude_modules
+
+
+class _TinyVLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="qwen3_vl")
+        self.model = nn.Module()
+        self.model.visual = nn.Module()
+        self.model.visual.proj = nn.Linear(4, 4)
+        self.model.visual.down = nn.Linear(4, 4)
+        self.model.language_model = nn.Module()
+        self.model.language_model.proj = nn.Linear(4, 4)
+        self.model.language_model.down = nn.Linear(4, 4)
+
+
+@pytest.mark.parametrize("exclude_modules", [None, ["down"], {"down", "other"}, r".*\.down"])
+def test_vision_policy_merges_caller_exclusions(exclude_modules):
+    config = {"peft_type": "LORA", "r": 2, "target_modules": ["proj", "down"], "exclude_modules": exclude_modules}
+    model = apply_peft(_TinyVLM(), config)
+
+    adapted = {name.split(".lora_")[0].removeprefix("base_model.model.") for name in _adapter_names(model)}
+    expected = {"model.language_model.proj"}
+    if exclude_modules is None:
+        expected.add("model.language_model.down")
+    assert adapted == expected
+    assert config["exclude_modules"] == exclude_modules
+    if isinstance(exclude_modules, set):
+        assert model.peft_config["default"].exclude_modules.endswith(r"|(?:(?:.*\.)?down)|(?:(?:.*\.)?other)")
+
+
+def test_vision_policy_covers_target_parameters():
+    targets = ["proj.weight", "model.language_model.down.weight"]
+    config = {"peft_type": "LORA", "r": 2, "target_modules": [], "target_parameters": targets}
+    model = apply_peft(_TinyVLM(), config)
+
+    adapted = {name.split(".lora_")[0].removeprefix("base_model.model.") for name in _adapter_names(model)}
+    assert adapted == {"model.language_model.proj", "model.language_model.down"}
+    assert config["target_parameters"] == targets
+
+    with pytest.raises(ValueError, match="only match the frozen vision tower"):
+        apply_peft(_TinyVLM(), {**config, "target_parameters": ["visual.proj.weight"]})
