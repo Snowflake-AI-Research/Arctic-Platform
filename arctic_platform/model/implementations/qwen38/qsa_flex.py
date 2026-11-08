@@ -274,7 +274,9 @@ def _qsa_indexer_forward(
     global_raw_key = _gather_sequence_no_grad(raw_key, cp_group)
     global_cos = _gather_sequence_no_grad(local_cos[:, -local_sequence_length:].expand(batch_size, -1, -1), cp_group)
     global_sin = _gather_sequence_no_grad(local_sin[:, -local_sequence_length:].expand(batch_size, -1, -1), cp_group)
-    global_positions = _gather_sequence_no_grad(position_ids.expand(batch_size, -1), cp_group)
+    # Packed M-RoPE ids carry the row positions in channel 0; gather those so the windows join on the token axis.
+    text_positions = position_ids[0] if position_ids.ndim == 3 else position_ids
+    global_positions = _gather_sequence_no_grad(text_positions.expand(batch_size, -1), cp_group)
     if cu_seqlens is not None:
         cu_seqlens = _normalize_packed_cu_seqlens(
             cu_seqlens,
