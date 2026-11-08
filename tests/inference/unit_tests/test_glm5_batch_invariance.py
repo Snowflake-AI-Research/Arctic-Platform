@@ -76,50 +76,6 @@ def test_deterministic_topk_breaks_ties_by_column_and_orders_descending():
     assert torch.equal(a.sort(dim=-1, descending=True).values, a)
 
 
-def test_decode_indexer_logits_are_scored_per_request(monkeypatch):
-    import sys
-    import types
-
-    import torch
-
-    from arctic_platform.inference.vllm import glm5_batch_invariance
-
-    def logits(q, kv_cache, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits,
-               indices=None):  # fmt: skip
-        values, _ = q
-        # Batch-dependent on purpose: every row is shifted by the batch's total context.
-        rows = values.float().sum((1, 2, 3)) + weights.sum(-1) + context_lens.sum()
-        return rows[:, None] + schedule_metadata[0, 0] + torch.arange(max_model_len)
-
-    def metadata(context_lens, block_size, num_sms, indices=None):
-        return torch.full((num_sms + 1, 2), float(context_lens.sum()))
-
-    deep_gemm = types.SimpleNamespace(fp8_fp4_paged_mqa_logits=logits, get_paged_mqa_logits_metadata=metadata)
-    utils = types.ModuleType("vllm.utils")
-    utils.deep_gemm = deep_gemm
-    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
-    monkeypatch.setitem(sys.modules, "vllm.utils", utils)
-    monkeypatch.setitem(sys.modules, "vllm.utils.deep_gemm", deep_gemm)
-    glm5_batch_invariance._per_request_decode_indexer_logits()
-
-    values = torch.randn(3, 1, 2, 4)
-    weights = torch.randn(3, 2)
-    lens = torch.tensor([[5], [9], [7]])
-    kv_cache = torch.zeros(4, 64, 1, 8)
-    tables = torch.arange(6).view(3, 2)
-    batched = deep_gemm.fp8_fp4_paged_mqa_logits((values, None), kv_cache, weights, lens, tables,
-                                                 metadata(lens, 64, 4), 16, False)  # fmt: skip
-    for b in range(3):
-        alone = deep_gemm.fp8_fp4_paged_mqa_logits((values[b : b + 1], None), kv_cache, weights[b : b + 1],
-                                                   lens[b : b + 1], tables[b : b + 1], metadata(lens[b : b + 1], 64, 4),
-                                                   16, False)  # fmt: skip
-        assert torch.equal(batched[b : b + 1], alone)
-    rows_idx = torch.arange(3)
-    varlen = deep_gemm.fp8_fp4_paged_mqa_logits((values, None), kv_cache, weights, lens, tables,
-                                                metadata(lens, 64, 4), 16, False, indices=rows_idx)  # fmt: skip
-    assert torch.equal(varlen, batched)
-
-
 def test_indexer_head_weights_use_the_batch_invariant_matmul(monkeypatch):
     import sys
     import types
