@@ -1317,6 +1317,62 @@ class TestCortexShimForwardsLikeOnPrem:
         assert torch.equal(out["batch"]["logprobs"], out["batch"]["log_probs"])
         assert out["batch"]["logprobs"].shape == (2, 4)
 
+    def test_zorro_forward_round_trip_keeps_step_zero_ratio_one(self):
+        """ZoRRo's token-scored frame must reach Cortex GRPO without a shift.
+
+        SkyRL calls ``_align_predict_next_log_probs`` only for non-ZoRRo
+        forwards. Cortex then renames ZoRRo's plain ``old_log_probs`` to the
+        generic GRPO processor's ``old_log_probs_shifted`` context key. Exercise
+        that whole contract: shifting this snapshot would make the first
+        response token's step-0 PPO ratio differ from one.
+        """
+        import asyncio
+
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        live_logprobs = torch.tensor([[0.0, 0.0, -0.3, -0.7, -1.1]])
+
+        class Client:
+            async def fwd_no_grad(self, payload):
+                assert payload["context"]["zorro_train_enable"] is True
+                return {"logprobs": live_logprobs.clone()}
+
+        ids = torch.tensor([[0, 10, 11, 20, 21]])
+        response_mask = torch.tensor([[0, 0, 0, 1, 1]], dtype=torch.bool)
+        batch = {
+            "batch": {
+                "input_ids": ids,
+                "attention_mask": torch.tensor([[0, 1, 1, 1, 1]]),
+                "prompts": ids[:, :3],
+                "response_mask": response_mask,
+                "advantages": response_mask.to(torch.float32),
+            },
+            "meta": {
+                "zorro_train_enable": True,
+                "max_prompt_len": 3,
+                "max_response_len": 2,
+                "pad_token_id": 0,
+            },
+            "processing": {"post": ["compute_logprobs"], "loss_fn": None},
+        }
+
+        forward = asyncio.run(self._shim(Client()).fwd_no_grad(batch, reference_model=False))
+        # This is the ZoRRo branch at SkyRL's alignment call site: unlike a
+        # stock predict-next forward, the token-scored output is already in the
+        # frame consumed by the ZoRRo update.
+        old_log_probs = forward["batch"]["logprobs"]
+        update_batch = {
+            "batch": {**batch["batch"], "old_log_probs": old_log_probs},
+            "meta": batch["meta"],
+        }
+        payload = to_cortex_fwd_bwd_payload(update_batch)
+        sent_old = payload["context"]["old_log_probs_shifted"]
+
+        ratio = torch.exp(live_logprobs - sent_old)
+        assert torch.equal(ratio[response_mask], torch.ones(2))
+
     def test_forward_returns_the_server_logprobs_on_the_caller_columns(self):
         import asyncio
 
