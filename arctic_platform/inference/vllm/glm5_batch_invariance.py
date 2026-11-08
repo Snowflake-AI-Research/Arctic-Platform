@@ -96,6 +96,118 @@ def _batch_invariant_fp8_block_linear() -> None:
     linear.choose_scaled_mm_linear_kernel = choose
 
 
+def _ordered_sum(x: torch.Tensor) -> torch.Tensor:
+    """Sum over the last dimension adding one column at a time, so the order does not depend on the row count."""
+    total = x[..., 0]
+    for i in range(1, x.shape[-1]):
+        total = total + x[..., i]
+    return total.unsqueeze(-1)
+
+
+def grouped_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+    scoring_func: str = "softmax",
+    routed_scaling_factor: float = 1.0,
+    e_score_correction_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """vLLM's torch grouped top-k with sorted selection and every sum in a fixed order."""
+    if scoring_func == "softmax":
+        scores = torch.softmax(gating_output, dim=-1)
+    elif scoring_func == "sigmoid":
+        scores = gating_output.sigmoid()
+    else:
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+    num_token = scores.size(0)
+    if e_score_correction_bias is not None:
+        original_scores = scores
+        scores = scores + e_score_correction_bias.unsqueeze(0)
+        top2 = scores.view(num_token, num_expert_group, -1).topk(2, dim=-1, sorted=True)[0]
+        group_scores = top2[..., 0] + top2[..., 1]
+    else:
+        group_scores = scores.view(num_token, num_expert_group, -1).max(dim=-1).values
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=True)[1]
+    group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_token, num_expert_group, scores.size(-1) // num_expert_group)
+        .reshape(num_token, -1)
+    )
+    tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))
+    if e_score_correction_bias is not None:
+        topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=True)[1]
+        topk_weights = original_scores.gather(1, topk_ids)
+    else:
+        topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=True)
+    if renormalize:
+        topk_weights = topk_weights / _ordered_sum(topk_weights)
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def _split_mixed_kda_steps() -> None:
+    """Run a mixed step's decode requests through KDA's decode path, as a decode-only step runs them.
+
+    With any prefill in the step, ``Glm5NextLinearAttention`` runs every request (decodes included) through the
+    chunked prefill kernels; in a decode-only step it runs the recurrent kernel. A decoded token's value would
+    then depend on whether another request was prefilling. vLLM orders decodes first, and the metadata builder
+    already keeps the prefill requests' own boundaries, states and initial-state flags.
+    """
+    import dataclasses
+
+    from vllm.forward_context import get_forward_context
+    from vllm.models.glm5next.common.kda import Glm5NextLinearAttention
+    from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+
+    original = Glm5NextLinearAttention._forward
+
+    def _forward(self, qkv_proj_states, g1, beta, core_attn_out):
+        raw = get_forward_context().attn_metadata
+        md = raw.get(self.prefix) if isinstance(raw, dict) else None
+        if md is None or md.spec_sequence_masks is not None or not (md.num_prefills > 0 and md.num_decodes > 0):
+            return original(self, qkv_proj_states, g1, beta, core_attn_out)
+        d, n = md.num_decode_tokens, md.num_actual_tokens
+        decode = dataclasses.replace(
+            md,
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_actual_tokens=d,
+            has_initial_state=None,
+            non_spec_query_start_loc=md.non_spec_query_start_loc[: md.num_decodes + 1],
+            non_spec_state_indices_tensor=md.non_spec_state_indices_tensor[: md.num_decodes],
+        )
+        prefill_cu = md.prefill_query_start_loc
+        nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
+            prefill_cu.cpu(), device=prefill_cu.device
+        )
+        prefill = dataclasses.replace(
+            md,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_actual_tokens=n - d,
+            has_initial_state=md.prefill_has_initial_state,
+            non_spec_query_start_loc=prefill_cu,
+            non_spec_state_indices_tensor=md.prefill_state_indices,
+            nums_dict=nums_dict,
+            batch_ptr=batch_ptr,
+            token_chunk_offset_ptr=token_chunk_offset_ptr,
+        )
+        try:
+            raw[self.prefix] = decode
+            original(self, qkv_proj_states[:d], g1[:, :d], beta[:, :d], core_attn_out[:, :d])
+            raw[self.prefix] = prefill
+            original(self, qkv_proj_states[d:n], g1[:, d:n], beta[:, d:n], core_attn_out[:, d:n])
+        finally:
+            raw[self.prefix] = md
+
+    Glm5NextLinearAttention._forward = _forward
+
+
 def _batch_invariant_router_gate() -> None:
     """Compute the MoE router's fp32 logits with the batch-invariant matmul.
 
@@ -121,10 +233,31 @@ def _batch_invariant_router_gate() -> None:
     GateLinear.forward = forward
 
 
+PROXY_ENV_VAR = "ARCTIC_GLM5_PROXY_LAYERS"
+
+
+def _load_proxy_layers_only(num_layers: int) -> None:
+    """Debug: let a model served with ``num_hidden_layers=N`` skip the checkpoint's weights for layers N and up."""
+    import re
+
+    from vllm.models.glm5next.common.model import Glm5NextModel
+
+    original = Glm5NextModel.load_weights
+    layer = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+    def load_weights(self, weights):
+        kept = ((name, w) for name, w in weights if not ((m := layer.search(name)) and int(m.group(1)) >= num_layers))
+        return original(self, kept)
+
+    Glm5NextModel.load_weights = load_weights
+
+
 def ensure_glm5_batch_invariance() -> None:
     global _APPLIED
     if _APPLIED or not glm5_batch_invariance_requested():
         return
+    if os.environ.get(PROXY_ENV_VAR):
+        _load_proxy_layers_only(int(os.environ[PROXY_ENV_VAR]))
     os.environ.setdefault("ARCTIC_GDN_BATCH_INVARIANT", "1")
     # The fused grouped top-k CUDA kernel's routing weights depend on the step; vLLM's torch path sorts for batch
     # invariance.
@@ -155,5 +288,9 @@ def ensure_glm5_batch_invariance() -> None:
     tilelang_kernels.mhc_fused_post_pre_split_config = lambda *args, **kwargs: None
     _batch_invariant_router_gate()
     _batch_invariant_fp8_block_linear()
+    _split_mixed_kda_steps()
+    from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
+
+    grouped_topk_router.grouped_topk = grouped_topk
     pin_kda_kernels()
     _APPLIED = True
