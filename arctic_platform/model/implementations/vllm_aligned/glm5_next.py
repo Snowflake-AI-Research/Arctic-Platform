@@ -107,9 +107,62 @@ class _AlignedLayer(torch.autograd.Function):
         return (replay.grad if streams.requires_grad else None), None, None
 
 
+KDA_O_NORM_EPS = 1e-5  # vLLM builds the gated output norm with FusedRMSNormGated's default eps, not rms_norm_eps
+
+
+def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any) -> torch.Tensor:
+    """vLLM's ``Glm5NextLinearAttention`` on whole prompts (no initial state), FlashKDA prefill backend.
+
+    ``x`` is ``[tokens, hidden]`` (the layer input after the hyper-connection pre-norm), ``cu_seqlens`` the int32
+    prompt boundaries. The merged ``[q; k; v; b; f_a; g_a]`` projection, the merged q|k|v causal conv with vLLM's fp32
+    conv weights, FlashKDA on the raw gate and beta logits, the sigmoid-gated RMSNorm and ``o_proj``.
+    """
+    import vllm._flashkda_C  # noqa: F401
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
+    from vllm.third_party.flash_linear_attention.ops.fused_norm_gate import rms_norm_gated
+
+    heads, head_dim = attn.num_heads, attn.head_dim
+    projection = heads * head_dim
+    tokens, num_seqs = x.shape[0], cu_seqlens.numel() - 1
+    gate = attn.forget_gate
+    weight = torch.cat([attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight, attn.b_proj.weight,
+                        gate.f_a_proj.weight, attn.g_a_proj.weight])  # fmt: skip
+    projected = ops.linear_kernel(x, weight)
+    qkv, beta, f_a, g_a = projected.split([3 * projection, heads, head_dim, head_dim], dim=-1)
+    g1 = ops.linear_kernel(f_a, gate.f_b_proj.weight).reshape(1, tokens, heads, head_dim)
+    g2 = ops.linear_kernel(g_a, attn.g_b_proj.weight).reshape(tokens, heads, head_dim)
+
+    conv_weight = attn.conv1d.weight.float().reshape(3 * projection, -1)
+    conv_states = x.new_zeros((num_seqs, 3 * projection, conv_weight.shape[-1] - 1))
+    conv = causal_conv1d_fn(
+        qkv.transpose(0, 1),
+        conv_weight,
+        None,
+        activation="silu",
+        conv_states=conv_states,
+        has_initial_state=torch.zeros(num_seqs, dtype=torch.bool, device=x.device),
+        cache_indices=torch.arange(num_seqs, dtype=torch.int32, device=x.device),
+        query_start_loc=cu_seqlens,
+    ).transpose(0, 1)
+    q, k, v = (t.reshape(1, tokens, heads, head_dim).contiguous() for t in conv.split(projection, dim=-1))
+
+    state = torch.zeros((num_seqs, heads, head_dim, head_dim), dtype=torch.float32, device=x.device)
+    final_state = torch.empty_like(state)
+    workspace = torch.empty(torch.ops._flashkda_C.get_workspace_size(tokens, heads, num_seqs), dtype=torch.uint8,
+                            device=x.device)  # fmt: skip
+    core = torch.empty((1, tokens, heads, head_dim), dtype=x.dtype, device=x.device)
+    torch.ops._flashkda_C.fwd(
+        q, k, v, g1.contiguous(), beta.unsqueeze(0), head_dim**-0.5, core, workspace,
+        gate.A_log.float().view(-1), gate.dt_bias.float().view(-1, head_dim), config.linear_lower_bound,
+        state, final_state, cu_seqlens.contiguous(), None, None,
+    )  # fmt: skip
+    core = rms_norm_gated(core, g2, attn.o_norm.weight, None, "sigmoid", eps=KDA_O_NORM_EPS)
+    return ops.linear_kernel(core.reshape(tokens, -1), attn.o_proj.weight)
+
+
 def _mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     if layer.block_type == "linear_attention":
-        raise NotImplementedError("vLLM-aligned GLM-5.3-Flash: KDA (FlashKDA prefill, recurrent decode) is not in yet")
+        return kda_prefill(layer.self_attn, x, ctx.cu_seqlens, ctx.config)
     raise NotImplementedError("vLLM-aligned GLM-5.3-Flash: the sparse indexer and sparse MLA are not in yet")
 
 
