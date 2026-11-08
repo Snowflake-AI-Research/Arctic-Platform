@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Load the official text backbone directly into local expert shards."""
+"""Official Inkling checkpoint loading and serving export."""
 
 from __future__ import annotations
 
@@ -28,6 +28,69 @@ from safetensors import safe_open
 from torch.distributed.tensor import DTensor
 
 from arctic_platform.model.loader import canonical_parameter_name
+
+
+def build_iter_vllm_weights(model):
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+
+    native_weights = build_iter_full_hf_weights(model)
+
+    def serving_name(name):
+        if name == "lm_head.weight":
+            return "model.llm.unembed.weight"
+        name = name.replace("model.embed_tokens.", "model.embed.")
+        for source, target in (
+            (".self_attn.q_proj.", ".attn.wq_du."),
+            (".self_attn.k_proj.", ".attn.wk_dv."),
+            (".self_attn.v_proj.", ".attn.wv_dv."),
+            (".self_attn.r_proj.", ".attn.wr_du."),
+            (".self_attn.o_proj.", ".attn.wo_ud."),
+            (".self_attn.", ".attn."),
+            (".input_layernorm.", ".attn_norm."),
+            (".post_attention_layernorm.", ".mlp_norm."),
+            (".gate.e_score_correction_bias", ".gate.bias"),
+            (".conv1d.weight", ".weight"),
+            (".mlp.experts.down_proj", ".mlp.experts.w2_weight"),
+            (".mlp.shared_experts.down_proj", ".mlp.shared_experts.shared_w2_weight"),
+            (".mlp.down_proj.weight", ".mlp.w2_md.weight"),
+        ):
+            name = name.replace(source, target)
+        return name.replace("model.", "model.llm.", 1)
+
+    def iterator():
+        pending = {}
+        for name, tensor in native_weights(include_skipped=True):
+            if name.endswith(".mlp.experts.gate_up_proj"):
+                gate, up = tensor.chunk(2, dim=1)
+                tensor = torch.stack((gate, up), dim=2).flatten(1, 2)
+                name = name.removesuffix("gate_up_proj") + "w13_weight"
+            elif name.endswith(
+                (
+                    ".mlp.gate_proj.weight",
+                    ".mlp.up_proj.weight",
+                    ".mlp.shared_experts.gate_proj",
+                    ".mlp.shared_experts.up_proj",
+                )
+            ):
+                prefix, projection = name.removesuffix(".weight").rsplit(".", 1)
+                pair = pending.setdefault(prefix, {})
+                pair[projection] = tensor
+                if len(pair) != 2:
+                    continue
+                gate, up = pair["gate_proj"], pair["up_proj"]
+                if prefix.endswith("shared_experts"):
+                    shape = (model.config.n_shared_experts, -1, gate.shape[-1])
+                    tensor = torch.stack((gate.reshape(shape), up.reshape(shape)), dim=2).flatten(1, 2)
+                    name = prefix + ".shared_w13_weight"
+                else:
+                    tensor = torch.stack((gate, up), dim=1).flatten(0, 1)
+                    name = prefix + ".w13_dn.weight"
+                del pending[prefix]
+            yield serving_name(name), tensor
+        if pending:
+            raise ValueError(f"Incomplete Inkling gate/up projections: {sorted(pending)}")
+
+    return iterator
 
 
 def weight_targets(name: str) -> list[tuple[str, int | Literal["gate", "up"] | None]]:
