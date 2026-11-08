@@ -16,12 +16,14 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import torch
 from torch import nn
 
 from arctic_platform.common.config import validate_peft_config
+from arctic_platform.model.implementations.moe.vlm import get_vision_encoder
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.patch import register_patch
 
@@ -135,6 +137,46 @@ def _resolve_peft_config_class(peft_module: Any, peft_config: dict[str, Any]) ->
     return getattr(peft_module, config_class_name)
 
 
+def exclude_vision_encoder(model: nn.Module, peft_config: dict[str, Any]) -> dict[str, Any]:
+    """Return ``peft_config`` with the vision encoder's modules added to PEFT's ``exclude_modules``.
+
+    Adapters train the language model only; the vision tower stays frozen whatever the targets. Text-only models
+    get ``peft_config`` back unchanged. PEFT matches a string ``exclude_modules`` as a full-name regex and a list by
+    name suffix, so a caller's exclusion is folded into one regex alongside the vision prefix. PEFT does not apply
+    ``exclude_modules`` to ``target_parameters``, so a suffix that also matches vision parameters is replaced by the
+    full names of its language-model matches.
+    """
+    vision = get_vision_encoder(model)
+    if vision is None:
+        return peft_config
+    prefix = next((name for name, module in model.named_modules() if module is vision), None)
+    if not prefix:
+        return peft_config
+    patterns = [rf"{re.escape(prefix)}(?:\..*)?"]
+    excluded = peft_config.get("exclude_modules")
+    if isinstance(excluded, str):
+        patterns.append(excluded)
+    elif excluded:
+        # ``LoraConfig.to_dict()`` gives a set; sort it so every rank builds (and saves) the same regex.
+        names = sorted(excluded) if isinstance(excluded, (set, frozenset)) else excluded
+        patterns.extend(rf"(?:.*\.)?{re.escape(name)}" for name in names)
+    peft_config = {**peft_config, "exclude_modules": "|".join(f"(?:{pattern})" for pattern in patterns)}
+    targets = peft_config.get("target_parameters")
+    if targets:
+        # PEFT's own match for target_parameters: the full name, or a suffix after a dot.
+        matched = [
+            name
+            for name, _ in model.named_parameters()
+            if any(name == target or name.endswith(f".{target}") for target in targets)
+        ]
+        kept = [name for name in matched if not name.startswith(f"{prefix}.")]
+        if len(kept) < len(matched):
+            if not kept:
+                raise ValueError(f"peft.target_parameters={list(targets)} only match the frozen vision tower {prefix}")
+            peft_config["target_parameters"] = kept
+    return peft_config
+
+
 def apply_peft(
     model: nn.Module,
     peft_config: dict[str, Any] | None,
@@ -146,6 +188,7 @@ def apply_peft(
     ``peft_type`` accepts PEFT's canonical registry names (e.g. ``LORA``) and
     legacy config-class names (e.g. ``Lora``). FP8 bases disable PEFT's adapter autocast and cast all trainable
     tensors to ``optimization_dtype`` (default bf16) before optimizer flat buffers are built.
+    A model with a vision encoder gets no adapters on it, whatever the targets (see ``exclude_vision_encoder``).
     Expert integration is installed by the registered patch after PEFT wraps the
     fully transformed model.
     """
@@ -155,6 +198,7 @@ def apply_peft(
 
     import peft
 
+    peft_config = exclude_vision_encoder(model, peft_config)
     config = _resolve_peft_config_class(peft, peft_config)(**peft_config)
     if model_has_fp8_weights(model):
         model = peft.get_peft_model(model, config, autocast_adapter_dtype=False)
