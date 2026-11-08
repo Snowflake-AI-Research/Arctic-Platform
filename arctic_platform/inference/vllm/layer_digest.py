@@ -124,6 +124,19 @@ def ensure_layer_digest() -> None:
     from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
+    from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
+    from vllm.v1.attention.backends.mla.flashattn_mla_sparse import FlashAttnMLASparseImpl
+
+    original_indexer = SparseAttnIndexerKpool.forward_cuda
+
+    def indexer_forward(self, *args, **kwargs):
+        out = original_indexer(self, *args, **kwargs)
+        if _state["digests"] is not None and torch.is_tensor(out):
+            _record(f"indexer_topk@{id(self):x}", out[: _state["rows"]])
+        return out
+
+    SparseAttnIndexerKpool.forward_cuda = indexer_forward
+    _wrap(FlashAttnMLASparseImpl, "forward_mqa", lambda self: f"sparse_mla@{id(self):x}")
     _wrap(GateLinear, "forward", lambda self: f"gate@{id(self):x}")
     _wrap(FusedMoERouter, "select_experts", lambda self: f"select_experts@{id(self):x}")
     _wrap(MoERunner, "_apply_quant_method", lambda self: f"moe_apply@{id(self):x}")
