@@ -47,7 +47,7 @@ def _worker(rank, rendezvous):
     dist.init_process_group(
         "gloo", init_method=rendezvous, rank=rank, world_size=_WORLD, timeout=timedelta(seconds=120)
     )
-    os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE=str(_WORLD), DS_ACCELERATOR="cpu")
+    os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE=str(_WORLD))
     importlib.import_module("deepspeed.comm.torch").build_shm_op = lambda: None  # a compiled CPU collective
     ds_config = build_deepspeed_config(
         TrainingEngineSpec(
@@ -96,5 +96,6 @@ def _worker(rank, rendezvous):
     dist.destroy_process_group()
 
 
-def test_split_requests_apply_the_sum_of_their_model_calls(tmp_path):
+def test_split_requests_apply_the_sum_of_their_model_calls(tmp_path, monkeypatch):
+    monkeypatch.setenv("DS_ACCELERATOR", "cpu")
     mp.spawn(_worker, args=((tmp_path / "rendezvous").as_uri(),), nprocs=_WORLD, join=True)
