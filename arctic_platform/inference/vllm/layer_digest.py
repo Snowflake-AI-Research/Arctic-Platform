@@ -63,6 +63,19 @@ def _record(name: str, output) -> None:
             digests[f"{name}.{i}"] = digest
 
 
+def record_numbered(prefix: str, tensor: torch.Tensor) -> None:
+    """Record ``tensor`` (one row per token of the step) as ``prefix#n``, n counting this step's calls."""
+    digests = _state["digests"]
+    if digests is None:
+        return
+    counts = _state.setdefault("counts", {})
+    n = counts.get(prefix, 0)
+    counts[prefix] = n + 1
+    digest = row_digest(tensor, _state["rows"])
+    if digest is not None:
+        digests[f"{prefix}#{n}"] = digest
+
+
 def _wrap(cls, method: str, name_of, inputs: bool = False):
     original = getattr(cls, method)
 
@@ -90,9 +103,10 @@ def ensure_layer_digest() -> None:
     def forward(self, input_ids, positions, *args, **kwargs):
         record = _state["step"] < max_steps and get_tensor_model_parallel_rank() == 0
         if record:
-            _state["digests"], _state["rows"] = {}, int(positions.shape[-1])
+            _state["digests"], _state["rows"], _state["counts"] = {}, int(positions.shape[-1]), {}
         try:
             out = original_forward(self, input_ids, positions, *args, **kwargs)
+            _record("model_out", out)
         finally:
             if record:
                 os.makedirs(directory, exist_ok=True)
@@ -109,6 +123,18 @@ def ensure_layer_digest() -> None:
         return out
 
     glm5.Glm5NextModel.forward = forward
+    original_logits = glm5.Glm5NextForCausalLM.compute_logits
+
+    def compute_logits(self, hidden_states):
+        logits = original_logits(self, hidden_states)
+        if _state["step"] <= max_steps and get_tensor_model_parallel_rank() == 0 and torch.is_tensor(logits):
+            # One row per sampled request, in the step's request order; the forward's step file is already written.
+            rows = int(logits.shape[0])
+            torch.save({"logits": row_digest(logits, rows), "hidden": row_digest(hidden_states, rows)},
+                       os.path.join(directory, f"logits{_state['step'] - 1:05d}.pt"))  # fmt: skip
+        return logits
+
+    glm5.Glm5NextForCausalLM.compute_logits = compute_logits
     layer = lambda self: f"L{self.layer_idx:02d}"  # noqa: E731
     _wrap(glm5.Glm5NextDecoderLayer, "forward", lambda self: f"{layer(self)}.out")
     for op in _LAYER_OPS:

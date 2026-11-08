@@ -204,6 +204,11 @@ def _deterministic_indexer_topk() -> None:
             if next_n != 1:
                 raise NotImplementedError("deterministic indexer top-k covers decode without speculative tokens")
             lengths = seq_lens.reshape(-1)[: logits.shape[0]].to(torch.int64)
+            if os.environ.get("ARCTIC_LAYER_DIGEST_DIR"):
+                from arctic_platform.inference.vllm.layer_digest import record_numbered
+
+                col = torch.arange(logits.shape[1], device=logits.device)
+                record_numbered("indexer_logits", torch.where(col[None, :] < lengths[:, None], logits, 0))
             deterministic_topk(logits, torch.zeros_like(lengths), lengths, k, out)
 
         return run
