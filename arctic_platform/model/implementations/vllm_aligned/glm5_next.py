@@ -113,8 +113,56 @@ def _mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     raise NotImplementedError("vLLM-aligned GLM-5.3-Flash: the sparse indexer and sparse MLA are not in yet")
 
 
+FP8_BLOCK = 128
+
+
+def fp8_block_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale_inv: torch.Tensor) -> torch.Tensor:
+    """vLLM's block-FP8 linear (``TritonFp8BlockScaledMMKernel``): per-128-group activation quant, Triton GEMM."""
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+    from vllm.platforms import current_platform
+
+    x2d = x.reshape(-1, x.shape[-1])
+    q, scale = fp8_utils.per_token_group_quant_fp8(
+        x2d,
+        group_size=FP8_BLOCK,
+        column_major_scales=False,
+        tma_aligned_scales=False,
+        dtype=current_platform.fp8_dtype(),
+        use_ue8m0=False,
+    )
+    out = torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
+        q, weight, scale, weight_scale_inv, [FP8_BLOCK, FP8_BLOCK], x.dtype
+    )
+    return out.view(*x.shape[:-1], weight.shape[0])
+
+
+def silu_and_mul_with_clamp(x: torch.Tensor, limit: float) -> torch.Tensor:
+    """vLLM's ``SiluAndMulWithClamp``: ``silu(min(gate, limit)) * clamp(up, -limit, limit)`` on ``[gate | up]``."""
+    ops._custom_ops()
+    out = torch.empty(*x.shape[:-1], x.shape[-1] // 2, dtype=x.dtype, device=x.device)
+    torch.ops._C.silu_and_mul_with_clamp(out, x.contiguous(), float(limit), 1.0, 0.0)
+    return out
+
+
+def _merged_fp8(*linears: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """vLLM's merged column-parallel FP8 weight and block scales: the pieces stacked along the output rows."""
+    for linear in linears[:-1]:
+        if linear.weight.shape[0] % FP8_BLOCK:
+            raise ValueError(f"merging FP8 projections needs {FP8_BLOCK}-row pieces, got {linear.weight.shape[0]}")
+    return torch.cat([linear.weight for linear in linears]), torch.cat([linear.weight_scale_inv for linear in linears])
+
+
+def dense_mlp(mlp: Any, x: torch.Tensor) -> torch.Tensor:
+    """vLLM's ``Glm5NextMLP``: merged FP8 ``gate_up``, the clamped SwiGLU, FP8 ``down``."""
+    weight, scale = _merged_fp8(mlp.gate_proj, mlp.up_proj)
+    hidden = silu_and_mul_with_clamp(fp8_block_linear(x, weight, scale), mlp.swiglu_limit)
+    return fp8_block_linear(hidden, mlp.down_proj.weight, mlp.down_proj.weight_scale_inv)
+
+
 def _mlp(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
-    raise NotImplementedError("vLLM-aligned GLM-5.3-Flash: the dense MLP and the MoE are not in yet")
+    if hasattr(layer.mlp, "gate_proj"):
+        return dense_mlp(layer.mlp, x)
+    raise NotImplementedError("vLLM-aligned GLM-5.3-Flash: the MoE (TritonExperts modular kernel) is not in yet")
 
 
 def aligned_layer(layer: Any, streams: torch.Tensor, config: Any, ctx: Any) -> torch.Tensor:

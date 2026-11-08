@@ -57,3 +57,20 @@ def test_aligned_layers_chain_like_checkpointed_layers():
     assert torch.equal(x.grad, y.grad)
     for clone, layer in zip(clones, layers):
         assert torch.equal(clone.weight.grad, layer.weight.grad)
+
+
+def test_merged_fp8_stacks_weights_and_block_scales():
+    import types
+
+    import pytest
+
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import _merged_fp8
+
+    def linear(rows, cols, fill):
+        return types.SimpleNamespace(weight=torch.full((rows, cols), fill), weight_scale_inv=torch.full((rows // 128, 1), fill))
+
+    weight, scale = _merged_fp8(linear(256, 128, 1.0), linear(128, 128, 2.0))
+    assert weight.shape == (384, 128) and scale.shape == (3, 1)
+    assert scale[:, 0].tolist() == [1.0, 1.0, 2.0]
+    with pytest.raises(ValueError):
+        _merged_fp8(linear(100, 128, 1.0), linear(128, 128, 2.0))
