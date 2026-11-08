@@ -103,6 +103,37 @@ class TestInklingTraining(TestCasePlus):
         self.assertEqual(spec.loader, "inkling")
         self.assertNotIn("fused_cross_entropy", spec.loader_options)
 
+    def test_lora_export_uses_sampling_projection_names(self):
+        from pathlib import Path
+
+        from safetensors.torch import load_file
+
+        from arctic_platform.model import iter_model_weights
+        from arctic_platform.model import save_peft_adapters
+
+        model = apply_peft(
+            InklingForCausalLMPrimeRL(tiny_config()).float(),
+            dict(peft_type="LORA", task_type="CAUSAL_LM", r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"]),
+        )
+        exported = dict(iter_model_weights(model, "lora", is_master=True, is_zero3=False))
+        expected = {}
+        for index, layer in enumerate(model.base_model.model.model.layers):
+            for projection, served_name in ((layer.self_attn.q_proj, "wq_du"), (layer.self_attn.v_proj, "wv_dv")):
+                for kind in ("A", "B"):
+                    name = f"base_model.model.model.layers.{index}.attn.{served_name}.lora_{kind}.weight"
+                    expected[name] = getattr(projection, f"lora_{kind}")["default"].weight
+        self.assertEqual(exported.keys(), expected.keys())
+        for name, tensor in expected.items():
+            torch_assert_equal(exported[name], tensor)
+        path = Path(self.get_auto_remove_tmp_dir())
+        save_peft_adapters(model, str(path))
+        saved = load_file(path / "default" / "adapter_model.safetensors")
+        self.assertEqual(saved.keys(), expected.keys())
+        for name, tensor in expected.items():
+            torch_assert_equal(saved[name], tensor)
+        config = json.loads((path / "default" / "adapter_config.json").read_text())
+        self.assertEqual(config["target_modules"], ["wq_du", "wv_dv"])
+
     def test_lora_steps_match_native_loss_and_gradients(self):
         set_seed(42)
         reference = InklingForCausalLM(tiny_config()).float()

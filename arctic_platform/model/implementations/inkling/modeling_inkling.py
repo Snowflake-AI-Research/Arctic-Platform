@@ -76,6 +76,18 @@ class InklingForCausalLMPrimeRL(InklingForCausalLM, PreTrainedModelPrimeRL):
     def keeps_fp32_parameter(name):
         return any(f".{part}." in name for part in ("attn_sconv", "mlp_sconv", "k_sconv", "v_sconv"))
 
+    @staticmethod
+    def vllm_lora_name(name):
+        for source, target in (
+            ("q_proj", "wq_du"),
+            ("k_proj", "wk_dv"),
+            ("v_proj", "wv_dv"),
+            ("r_proj", "wr_du"),
+            ("o_proj", "wo_ud"),
+        ):
+            name = name.replace(f".self_attn.{source}.", f".attn.{target}.")
+        return name
+
     def init_buffers_post_meta(self):
         for module in self.modules():
             if isinstance(module, InklingMoE):
