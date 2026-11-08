@@ -31,13 +31,6 @@ pytest.importorskip("deepspeed")
 _WORLD, _DIM = 2, 64
 
 
-def _call(name, rank):
-    g = torch.Generator().manual_seed(1000 * sum(map(ord, name)) + rank)
-    return torch.randn(8, _DIM, generator=g).to(torch.bfloat16), (
-        0.0 if name == "ping" else float(torch.randn(1, generator=g))
-    )
-
-
 def _worker(rank, rendezvous):
     from arctic_platform.common.deepspeed_engine import OptimizerSettings
     from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
@@ -81,7 +74,9 @@ def _worker(rank, rendezvous):
         """Each request's last call is an accumulation boundary; returns the master gradient step() applies."""
         for calls in requests:
             for k, name in enumerate(calls):
-                x, w = _call(name, rank)
+                g = torch.Generator().manual_seed(1000 * sum(map(ord, name)) + rank)
+                x = torch.randn(8, _DIM, generator=g).to(torch.bfloat16)
+                w = 0.0 if name == "ping" else float(torch.randn(1, generator=g))
                 engine.set_gradient_accumulation_boundary(k == len(calls) - 1)
                 engine.backward(engine(x).float().square().mean() * w)
         master = engine.optimizer.single_partition_of_fp32_groups[0].grad.clone()
