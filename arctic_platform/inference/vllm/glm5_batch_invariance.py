@@ -235,20 +235,22 @@ def _per_request_decode_indexer_logits() -> None:
                                  max_model_len, clean_logits, indices=None):  # fmt: skip
         values, scales = q
         batch, next_n = values.shape[0], values.shape[1]
-        if batch == 1 or next_n != 1 or indices is not None:
+        if batch == 1 or next_n != 1:
             if batch > 1:
-                log.warning("ARCTIC_GLM5_BATCH_INVARIANT: batched indexer logits (next_n=%d, varlen=%s) are not "
-                            "batch-invariant", next_n, indices is not None)  # fmt: skip
+                log.warning("ARCTIC_GLM5_BATCH_INVARIANT: batched indexer logits with next_n=%d are not "
+                            "batch-invariant", next_n)  # fmt: skip
             return original(q, kv_cache, weights, context_lens, block_tables, schedule_metadata, max_model_len,
                             clean_logits, indices=indices)  # fmt: skip
         num_sms = schedule_metadata.shape[0] - 1
+        # With varlen rows (vLLM's plain decode), a step holding one request has the single row index 0.
+        index = None if indices is None else torch.zeros_like(indices[:1])
         rows = []
         for b in range(batch):
             lens = context_lens[b : b + 1]
-            metadata = deep_gemm.get_paged_mqa_logits_metadata(lens, kv_cache.shape[1], num_sms)
+            metadata = deep_gemm.get_paged_mqa_logits_metadata(lens, kv_cache.shape[1], num_sms, indices=index)
             one = (values[b : b + 1], None if scales is None else scales[b : b + 1])
             rows.append(original(one, kv_cache, weights[b : b + 1], lens, block_tables[b : b + 1], metadata,
-                                 max_model_len, clean_logits))  # fmt: skip
+                                 max_model_len, clean_logits, indices=index))  # fmt: skip
         return torch.cat(rows)
 
     deep_gemm.fp8_fp4_paged_mqa_logits = fp8_fp4_paged_mqa_logits

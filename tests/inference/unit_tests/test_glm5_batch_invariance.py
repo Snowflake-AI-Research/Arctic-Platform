@@ -114,3 +114,7 @@ def test_decode_indexer_logits_are_scored_per_request(monkeypatch):
                                                    lens[b : b + 1], tables[b : b + 1], metadata(lens[b : b + 1], 64, 4),
                                                    16, False)  # fmt: skip
         assert torch.equal(batched[b : b + 1], alone)
+    rows_idx = torch.arange(3)
+    varlen = deep_gemm.fp8_fp4_paged_mqa_logits((values, None), kv_cache, weights, lens, tables,
+                                                metadata(lens, 64, 4), 16, False, indices=rows_idx)  # fmt: skip
+    assert torch.equal(varlen, batched)
