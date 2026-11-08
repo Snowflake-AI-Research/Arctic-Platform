@@ -77,6 +77,25 @@ def _single_split(flash_attn_varlen_func):
     return call
 
 
+def _batch_invariant_fp8_block_linear() -> None:
+    """Run every block-FP8 linear layer on vLLM's Triton block-scaled GEMM.
+
+    On CUDA vLLM picks ``FlashInferFp8DeepGEMMDynamicBlockScaledKernel``, which runs FlashInfer below 32 tokens and
+    DeepGEMM from 32 on, so a token's projection depends on the step's size. The Triton kernel uses one fixed tile
+    config under ``VLLM_BATCH_INVARIANT`` (vLLM already forces it on ROCm for that reason).
+    """
+    from vllm.model_executor.kernels import linear
+
+    original = linear.choose_scaled_mm_linear_kernel
+
+    def choose(config, possible_kernels, compute_capability=None, force_kernel=None, *, quantization):
+        if quantization == "fp8_block_w8a8" and force_kernel is None:
+            force_kernel = linear.TritonFp8BlockScaledMMKernel
+        return original(config, possible_kernels, compute_capability, force_kernel, quantization=quantization)
+
+    linear.choose_scaled_mm_linear_kernel = choose
+
+
 def _batch_invariant_router_gate() -> None:
     """Compute the MoE router's fp32 logits with the batch-invariant matmul.
 
@@ -135,5 +154,6 @@ def ensure_glm5_batch_invariance() -> None:
     # Small steps would take a fused post + pre-norm kernel with its own split; every step takes the split-free path.
     tilelang_kernels.mhc_fused_post_pre_split_config = lambda *args, **kwargs: None
     _batch_invariant_router_gate()
+    _batch_invariant_fp8_block_linear()
     pin_kda_kernels()
     _APPLIED = True
