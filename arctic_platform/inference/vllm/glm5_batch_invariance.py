@@ -274,6 +274,36 @@ def _per_request_decode_indexer_logits() -> None:
     deep_gemm.fp8_fp4_paged_mqa_logits = fp8_fp4_paged_mqa_logits
 
 
+def _batch_invariant_indexer_head_weights() -> None:
+    """Compute the sparse indexer's fp32 per-head weights with the batch-invariant matmul.
+
+    ``Glm5NextIndexer`` computes them as ``torch.mm(hidden_states.float(), wp_fp32)``. On Hopper
+    ``VLLM_BATCH_INVARIANT`` keeps cuBLAS and only disables split-K, but cuBLAS still picks another fp32 kernel by row
+    count (it changes at 16 decode rows), so a request's weights, and then its pool scores, depend on its
+    batch-mates. Both operands hold bf16 values (the hidden state, and the bf16 projection weight upcast once), whose
+    products are exact in fp32, so the bf16-operand, fp32-accumulating batch-invariant matmul loses no precision.
+    That ``torch.mm`` is the module's only one.
+    """
+    import types
+
+    from vllm.models.glm5next.common import attention
+
+    from arctic_platform.inference.vllm.batch_invariant_fp32_logits import matmul_fp32_out
+
+    def mm(a, b, *args, **kwargs):
+        if args or kwargs or a.dtype != torch.float32 or b.dtype != torch.float32 or a.dim() != 2:
+            return torch.mm(a, b, *args, **kwargs)
+        return matmul_fp32_out(a.to(torch.bfloat16), b.to(torch.bfloat16))
+
+    class _Torch(types.ModuleType):
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
+    proxy = _Torch("torch")
+    proxy.mm = mm
+    attention.torch = proxy
+
+
 def _split_mixed_kda_steps() -> None:
     """Run a mixed step's decode requests through KDA's decode path, as a decode-only step runs them.
 
@@ -415,6 +445,7 @@ def ensure_glm5_batch_invariance() -> None:
     _split_mixed_kda_steps()
     _deterministic_indexer_topk()
     _per_request_decode_indexer_logits()
+    _batch_invariant_indexer_head_weights()
     from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
 
     grouped_topk_router.grouped_topk = grouped_topk

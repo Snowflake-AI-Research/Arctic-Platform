@@ -118,3 +118,39 @@ def test_decode_indexer_logits_are_scored_per_request(monkeypatch):
     varlen = deep_gemm.fp8_fp4_paged_mqa_logits((values, None), kv_cache, weights, lens, tables,
                                                 metadata(lens, 64, 4), 16, False, indices=rows_idx)  # fmt: skip
     assert torch.equal(varlen, batched)
+
+
+def test_indexer_head_weights_use_the_batch_invariant_matmul(monkeypatch):
+    import sys
+    import types
+
+    import torch
+
+    from arctic_platform.inference.vllm import batch_invariant_fp32_logits
+    from arctic_platform.inference.vllm import glm5_batch_invariance
+
+    calls = []
+
+    def matmul_fp32_out(a, b):
+        calls.append((a.dtype, b.dtype))
+        return a.float() @ b.float()
+
+    attention = types.ModuleType("vllm.models.glm5next.common.attention")
+    attention.torch = torch
+    common = types.ModuleType("vllm.models.glm5next.common")
+    common.attention = attention
+    for name, module in (("vllm", types.ModuleType("vllm")), ("vllm.models", types.ModuleType("vllm.models")),
+                         ("vllm.models.glm5next", types.ModuleType("vllm.models.glm5next")),
+                         ("vllm.models.glm5next.common", common),
+                         ("vllm.models.glm5next.common.attention", attention)):  # fmt: skip
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(batch_invariant_fp32_logits, "matmul_fp32_out", matmul_fp32_out)
+    glm5_batch_invariance._batch_invariant_indexer_head_weights()
+
+    hidden = torch.randn(5, 8, dtype=torch.bfloat16)
+    weight = torch.randn(8, 3, dtype=torch.bfloat16).float()
+    out = attention.torch.mm(hidden.float(), weight)
+    assert calls == [(torch.bfloat16, torch.bfloat16)]
+    assert torch.equal(out, hidden.float() @ weight)
+    assert attention.torch.mm(hidden, hidden.t()).dtype == torch.bfloat16 and len(calls) == 1
+    assert attention.torch.float32 is torch.float32 and attention.torch.Tensor is torch.Tensor
