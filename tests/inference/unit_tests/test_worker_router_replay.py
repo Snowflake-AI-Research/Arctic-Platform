@@ -181,7 +181,8 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
 
     turn1 = generate([1, 2, 3], [4, 5], [10, 11, 12, 13], "rr1:turn-1")
     turn2 = generate(
-        [1, 2, 3, 4, 5, 6, 7], [8], [10, 11, 22, 23, 24, 25, 26], "rr1:turn-2", dss_router_replay_prefix_id="rr1:turn-1"
+        [1, 2, 3, 4, 5, 6, 7], [8], [10, 11, 22, 23, 24, 25, 26], "rr1:turn-2",
+        dss_router_replay_prefix_id="rr1:turn-1",
     )
     assert cached("rr1:turn-2") == [10, 11, 12, 13, 24, 25, 26]
     assert (turn1["prefix_len"], turn2["prefix_len"], turn2["capture_len"]) == (0, 4, 7)
@@ -189,15 +190,18 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
     assert engine_params[-1].extra_args is None  # the key never reaches vLLM
 
     # Another replica served the previous request: the capture stays as the engine computed it.
-    elsewhere = generate([1, 2, 3, 4, 5], [6], [10, 11, 32, 33, 34], "rr1:turn-3", dss_router_replay_prefix_id="rr1:other")
+    elsewhere = generate(
+        [1, 2, 3, 4, 5], [6], [10, 11, 32, 33, 34], "rr1:turn-3", dss_router_replay_prefix_id="rr1:other"
+    )
     assert elsewhere["prefix_len"] == 0 and cached("rr1:turn-3") == [10, 11, 32, 33, 34]
 
     # A prefix capture must end before the prompt does; the request is refused before anything is cached.
-    with pytest.raises(ValueError, match="does not lie inside the prompt"):
+    with pytest.raises(ValueError, match="must end inside the prompt"):
         generate([1, 2, 3, 4, 5, 6], [7], [0] * 6, "rr1:turn-4", dss_router_replay_prefix_id="rr1:turn-2")
     assert "rr1:turn-4" not in cache and "rr1:turn-2" in cache
     with pytest.raises(ValueError, match="dss_router_replay_prefix_id requires dss_router_replay_id"):
-        asyncio.run(worker.generate([1], dict(max_tokens=1, extra_args=dict(dss_router_replay_prefix_id="rr1:turn-2"))))
+        prefix_only = dict(max_tokens=1, extra_args=dict(dss_router_replay_prefix_id="rr1:turn-2"))
+        asyncio.run(worker.generate([1], prefix_only))
 
 
 def test_router_replay_cache_device_is_popped_and_validated_before_engine_start():

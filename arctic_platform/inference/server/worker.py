@@ -747,7 +747,7 @@ def _maybe_cache_routed_experts(
             f"capture_len={capture_len} expected_capture_len={expected_capture_len} "
             f"capture_shape={list(routed.shape)}"
         )
-    # This request re-prefills the positions the prefix capture holds; keep the routes the earlier request sampled with.
+    # This request re-prefills the prefix capture's positions; keep the routes the earlier request sampled with.
     prefix_len = 0
     if prefix_replay_id is not None:
         try:
@@ -757,7 +757,7 @@ def _maybe_cache_routed_experts(
         if prefix is not None:
             if prefix.shape[0] >= prompt_len or tuple(prefix.shape[1:]) != tuple(routed.shape[1:]):
                 raise ValueError(
-                    "router-replay prefix capture does not lie inside the prompt "
+                    "router-replay prefix capture must end inside the prompt, with the same layer/top-k shape "
                     f"trajectory_id={sample_id!r} replay_id={replay_id!r} prefix_replay_id={prefix_replay_id!r} "
                     f"prefix_shape={list(prefix.shape)} prompt_len={prompt_len} capture_shape={list(routed.shape)}"
                 )
