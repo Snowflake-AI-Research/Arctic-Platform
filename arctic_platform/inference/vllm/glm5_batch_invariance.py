@@ -216,6 +216,44 @@ def _deterministic_indexer_topk() -> None:
     sparse_indexer.get_indexer_topk = decode_topk
 
 
+def _per_request_decode_indexer_logits() -> None:
+    """Score each decode request's indexer logits on its own, as a decode step holding only that request would.
+
+    DeepGEMM's paged MQA logits kernel spreads the whole batch's KV blocks over the SMs by schedule metadata built
+    from every request's length, so a request's scores change in the low bits with its batch-mates, and a near-tie
+    at the top-k boundary then picks different pools. One launch per request, each with its own metadata, gives
+    every request the scores it gets alone.
+    """
+    import logging
+
+    from vllm.utils import deep_gemm
+
+    original = deep_gemm.fp8_fp4_paged_mqa_logits
+    log = logging.getLogger(__name__)
+
+    def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, schedule_metadata,
+                                 max_model_len, clean_logits, indices=None):  # fmt: skip
+        values, scales = q
+        batch, next_n = values.shape[0], values.shape[1]
+        if batch == 1 or next_n != 1 or indices is not None:
+            if batch > 1:
+                log.warning("ARCTIC_GLM5_BATCH_INVARIANT: batched indexer logits (next_n=%d, varlen=%s) are not "
+                            "batch-invariant", next_n, indices is not None)  # fmt: skip
+            return original(q, kv_cache, weights, context_lens, block_tables, schedule_metadata, max_model_len,
+                            clean_logits, indices=indices)  # fmt: skip
+        num_sms = schedule_metadata.shape[0] - 1
+        rows = []
+        for b in range(batch):
+            lens = context_lens[b : b + 1]
+            metadata = deep_gemm.get_paged_mqa_logits_metadata(lens, kv_cache.shape[1], num_sms)
+            one = (values[b : b + 1], None if scales is None else scales[b : b + 1])
+            rows.append(original(one, kv_cache, weights[b : b + 1], lens, block_tables[b : b + 1], metadata,
+                                 max_model_len, clean_logits))  # fmt: skip
+        return torch.cat(rows)
+
+    deep_gemm.fp8_fp4_paged_mqa_logits = fp8_fp4_paged_mqa_logits
+
+
 def _split_mixed_kda_steps() -> None:
     """Run a mixed step's decode requests through KDA's decode path, as a decode-only step runs them.
 
@@ -356,6 +394,7 @@ def ensure_glm5_batch_invariance() -> None:
     _batch_invariant_fp8_block_linear()
     _split_mixed_kda_steps()
     _deterministic_indexer_topk()
+    _per_request_decode_indexer_logits()
     from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
 
     grouped_topk_router.grouped_topk = grouped_topk
