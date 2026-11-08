@@ -613,6 +613,7 @@ def _qsa_attention_forward(
 def apply_qsa_flex(model: nn.Module, *, fp32_parity: bool = True) -> None:
     """Route every QSA layer through FlexAttention; ``fp32_parity`` rounds rotary, P·V and the gate as vLLM does."""
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextAttention
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpVisionAttention
 
     from arctic_platform.model.implementations.moe.vlm import get_language_model
 
@@ -635,6 +636,10 @@ def apply_qsa_flex(model: nn.Module, *, fp32_parity: bool = True) -> None:
     register_qsa_flex_backend()
     patched = 0
     for module in model.modules():
+        if isinstance(module, Qwen4ExpVisionAttention) and module.config._attn_implementation == _BACKEND:
+            # The config setter copies the QSA backend into the vision config too, but QSA is text-only: the vision
+            # tower runs non-causal full attention per image chunk, and SDPA needs no extra package for that.
+            module.config._attn_implementation = "sdpa"
         if not isinstance(module, Qwen4ExpTextAttention):
             continue
         module.indexer.requires_grad_(False)

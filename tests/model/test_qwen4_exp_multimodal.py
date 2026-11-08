@@ -491,3 +491,39 @@ def test_video_batch_runs_the_vision_tower_once():
 
     assert len(calls) == 1
     assert all(parameter.grad is not None for parameter in model.model.visual.parameters())
+
+
+def _vision_attention_backends(model):
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpVisionAttention
+
+    modules = model.modules()
+    return {module.config._attn_implementation for module in modules if isinstance(module, Qwen4ExpVisionAttention)}
+
+
+def test_qsa_flex_moves_the_vision_tower_to_sdpa():
+    from arctic_platform.model.implementations.qwen38.qsa_flex import apply_qsa_flex
+    from arctic_platform.model.implementations.qwen38.qsa_flex import register_qsa_flex_backend
+
+    model = _model()
+    register_qsa_flex_backend()
+    # Training sets the backend on the top config; the setter copies it into the vision config.
+    model.config._attn_implementation = "qsa_flex"
+    assert _vision_attention_backends(model) == {"qsa_flex"}
+
+    apply_qsa_flex(model)
+
+    assert _vision_attention_backends(model) == {"sdpa"}
+    with torch.no_grad():
+        model.model.visual(_pixel_values(model), grid_thw=IMAGE_GRID_THW)
+
+
+def test_qsa_flex_leaves_another_vision_backend_alone():
+    from arctic_platform.model.implementations.qwen38.qsa_flex import apply_qsa_flex
+
+    model = _model()
+    model.config.vision_config._attn_implementation = "eager"
+    assert _vision_attention_backends(model) == {"eager"}
+
+    apply_qsa_flex(model)
+
+    assert _vision_attention_backends(model) == {"eager"}
