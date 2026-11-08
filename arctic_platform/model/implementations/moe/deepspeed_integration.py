@@ -438,11 +438,7 @@ def _gather_ep_weight_on_master(tensor: torch.Tensor, ep_group, *, is_master: bo
 
     local = tensor.detach().contiguous()
     world = dist.get_world_size(group=ep_group)
-    full = (
-        torch.empty((world * local.shape[0], *local.shape[1:]), dtype=local.dtype, device=local.device)
-        if is_master
-        else None
-    )
+    full = local.new_empty((world * local.shape[0], *local.shape[1:])) if is_master else None
     outputs = list(full.view(torch.uint8).view(world, -1).unbind(0)) if full is not None else None
     dist.gather(local.view(torch.uint8).view(-1), outputs, dst=0, group=ep_group)
     if not is_master:
