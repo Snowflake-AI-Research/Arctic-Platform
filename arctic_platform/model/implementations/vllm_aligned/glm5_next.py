@@ -418,15 +418,104 @@ def aligned_hidden(backbone: Any, input_ids: torch.Tensor, config: Any, ctx: Any
 
 
 def check_supported_config(config: Any) -> None:
-    for name in ("hc_mult", "hc_sinkhorn_iters", "hc_eps", "layer_types"):
+    for name in ("hc_mult", "hc_sinkhorn_iters", "hc_eps", "layer_types", "index_topk", "index_kpool"):
         if getattr(config, name, None) is None:
             raise ValueError(f"the vLLM-aligned GLM-5.3-Flash forward needs config.{name}")
+    if getattr(config, "qk_rope_head_dim", 0):
+        raise ValueError("the vLLM-aligned GLM-5.3-Flash forward covers NoPE sparse MLA (qk_rope_head_dim == 0)")
 
 
-def apply_vllm_aligned_glm5_next(model: Any, **_kwargs) -> None:
-    """Placeholder entry point: the aligned forward is incomplete, so this refuses rather than train on it."""
-    del model
-    raise NotImplementedError("the vLLM-aligned GLM-5.3-Flash forward is work in progress (mixers and MoE missing)")
+def _stock_layer_runner(backbone: Any, input_ids: torch.Tensor, position_ids: torch.Tensor, kwargs: dict) -> Callable:
+    """``run_stock(layer, streams)``: the stock decoder layer on ``[tokens, hc_mult, hidden]`` streams, packed as the
+    stock model forward packs them (one row, the attention-mask mapping and the packing kwargs it passes down)."""
+    config = backbone.config
+    mask = torch.ones(1, input_ids.numel(), dtype=torch.bool, device=input_ids.device)
+    masks = {"deepseek_sparse_attention": mask, "linear_attention": mask}
+
+    def run(layer: Any, streams: torch.Tensor) -> torch.Tensor:
+        out, _ = layer(
+            streams.unsqueeze(0),
+            attention_mask=masks[config.layer_types[layer.layer_idx]],
+            position_ids=position_ids.reshape(1, -1),
+            position_embeddings=None,
+            input_ids=input_ids.reshape(1, -1),
+            prev_topk_indices=None,
+            **kwargs,
+        )
+        return out.squeeze(0)
+
+    return run
+
+
+def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Tensor, labels: torch.Tensor,
+                     cu_seqlens: torch.Tensor | None, temperature: float, kwargs: dict) -> torch.Tensor:  # fmt: skip
+    """The sampler's logprob of each ``labels`` token (``[tokens]``, fp32); prompts prefilled whole."""
+    import types
+
+    backbone = model.model.language_model
+    config = backbone.config
+    if position_ids.dim() == 3:
+        position_ids = position_ids[0]
+    layout = ops.PackedLayout.build(position_ids, block_size=1, cu_seqlens=cu_seqlens)
+    ctx = types.SimpleNamespace(config=config, positions=layout.positions, cu_seqlens=layout.cu_seqlens.to(torch.int32))
+    run_stock = _stock_layer_runner(backbone, input_ids, position_ids, kwargs)
+    hidden = aligned_hidden(backbone, input_ids, config, ctx, run_stock)
+    return ops.lm_head_logprobs(
+        hidden,
+        model.lm_head.weight,
+        labels.reshape(-1),
+        temperature=temperature,
+        token_chunk_size=model._vllm_aligned_token_chunk_size,
+        fp32=model._vllm_aligned_lm_head_fp32,
+    )
+
+
+def _causal_lm_forward(self, input_ids=None, attention_mask=None, position_ids=None, labels=None, temperature=None,
+                       dss_compute_logprobs: bool = False, **kwargs):  # fmt: skip
+    from arctic_platform.model.implementations.vllm_aligned.qwen3 import _scalar_temperature
+
+    if not dss_compute_logprobs:
+        return self._vllm_aligned_stock_forward(
+            input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, labels=labels, **kwargs
+        )
+    if labels is None or input_ids is None:
+        raise ValueError("dss_compute_logprobs requires input_ids and labels")
+    if position_ids is None:
+        position_ids = torch.arange(input_ids.shape[-1], device=input_ids.device).expand_as(input_ids)
+    logprobs = aligned_logprobs(
+        self,
+        input_ids,
+        position_ids,
+        labels.to(input_ids.device),
+        kwargs.get("cu_seq_lens_q"),
+        _scalar_temperature(temperature),
+        kwargs,
+    )
+    return {"logprobs": logprobs.view(input_ids.shape)}
+
+
+def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_fp32: bool = False) -> None:
+    """Make a GLM-5.3-Flash model's ``dss_compute_logprobs`` forward compute the batch-invariant sampler's logprobs.
+
+    Covers prompts prefilled whole at TP 1 (milestone 1); decoded tokens and the indexer for prompts longer than
+    ``index_topk`` are not in yet.
+    """
+    import types
+
+    from arctic_platform.inference.vllm.glm5_batch_invariance import ensure_glm5_batch_invariance
+
+    config = model.model.language_model.config
+    check_supported_config(config)
+    ops.require_batch_invariant_env()
+    import os
+
+    os.environ.setdefault("ARCTIC_GLM5_BATCH_INVARIANT", "1")
+    ensure_glm5_batch_invariance()
+    model._vllm_aligned_token_chunk_size = int(token_chunk_size)
+    model._vllm_aligned_lm_head_fp32 = bool(lm_head_fp32)
+    model._vllm_aligned_stock_forward = model.forward
+    model.forward = types.MethodType(_causal_lm_forward, model)
+    model._vllm_aligned = True
 
 
 __all__ = ["aligned_hidden", "aligned_layer", "apply_vllm_aligned_glm5_next", "hc_post", "hc_pre"]
