@@ -444,7 +444,8 @@ def ensure_glm5_batch_invariance() -> None:
     _batch_invariant_fp8_block_linear()
     _split_mixed_kda_steps()
     _deterministic_indexer_topk()
-    _per_request_decode_indexer_logits()
+    if os.environ.get("ARCTIC_GLM5_PER_REQUEST_INDEXER_LOGITS", "1") == "1":
+        _per_request_decode_indexer_logits()
     _batch_invariant_indexer_head_weights()
     from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
 
