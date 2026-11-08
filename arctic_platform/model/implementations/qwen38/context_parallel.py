@@ -17,8 +17,10 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import types
+from typing import cast
 
 import torch
 import torch.distributed as dist
@@ -26,11 +28,14 @@ import torch.distributed.nn as dist_nn
 from torch import nn
 from torch.utils.checkpoint import set_checkpoint_early_stop
 
+from arctic_platform.common.packing import token_window
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.sp.collectives import gather_packed_positions
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import build_gated_delta_net_cp_context
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
+from arctic_platform.model.implementations.moe.vlm import _unwrap_peft_model
 from arctic_platform.model.implementations.moe.vlm import get_language_model
+from arctic_platform.model.implementations.moe.vlm import get_vision_encoder
 from arctic_platform.model.implementations.qwen38.qsa_flex import _normalize_packed_cu_seqlens
 
 # Keep asynchronous EP backward from overtaking FLA collectives on other ranks.
@@ -275,6 +280,88 @@ def _wrap_backbone_forward(backbone: nn.Module, linear_modules: list[nn.Module],
     backbone.forward = types.MethodType(forward, backbone)
 
 
+_MEDIA_KEYS = ("pixel_values", "pixel_values_videos")
+_WINDOW_RANGES_KEYS = ("image_window_token_ranges", "video_window_token_ranges")
+# Language-model inputs that carry the packed call's tokens on dim 1; routed_experts is [B, T, layers, top_k].
+_TOKEN_AXIS_KEYS = ("inputs_embeds", "ple_input_ids", "ple_position_ids", "attention_mask", "routed_experts")
+# Model-call keyword that marks a media call as whole on every rank, to be sharded after the vision merge.
+SHARD_AFTER_VISION_MERGE_KWARG = "cp_shard_after_vision_merge"
+
+
+def _shard_merged_call(_module, args, kwargs, *, process_group):
+    """Cut a whole packed call's language-model inputs down to this rank's token window.
+
+    Runs as a forward pre-hook on the language model, so the vision tower and the merge have already seen the
+    whole call: the window of ``inputs_embeds`` holds the merged image and video features, ``ple_input_ids`` keep
+    the raw placeholder ids the PLE n-gram hashing reads, and M-RoPE ``position_ids`` are cut on their token axis.
+    """
+    padded_tokens = int(kwargs["inputs_embeds"].shape[1])
+    start, end = token_window(padded_tokens, dist.get_world_size(process_group), dist.get_rank(process_group))
+    for key in _TOKEN_AXIS_KEYS:
+        value = kwargs.get(key)
+        if value is None:
+            continue
+        if not torch.is_tensor(value) or value.ndim < 2 or value.shape[1] != padded_tokens:
+            raise ValueError(
+                f"Qwen3.8 context parallelism cannot shard {key!r} of a media call on its token axis: "
+                f"{type(value).__name__} {tuple(getattr(value, 'shape', ()))}, packed tokens {padded_tokens}"
+            )
+        kwargs[key] = value[:, start:end]
+    position_ids = kwargs.get("position_ids")
+    if not torch.is_tensor(position_ids) or position_ids.ndim != 3 or position_ids.shape[0] != 4:
+        # Positions the forward computes itself are [3, B, T] M-RoPE ids with no row channel, from which the
+        # backbone could not rebuild the packed rows' boundaries.
+        raise ValueError(
+            "Qwen3.8 context parallelism needs a media call's packed [4, batch, sequence] M-RoPE position_ids "
+            f"(row positions on channel 0), got {tuple(getattr(position_ids, 'shape', ()))}"
+        )
+    # A whole packed call opens with a row, at position 0; a window cut mid-row (already sharded) does not. A
+    # window that opens a row cannot be told apart here, which is why the caller must mark the call whole.
+    first_positions = position_ids[0, :, 0]
+    if position_ids.shape[-1] != padded_tokens or (first_positions != 0).any():
+        raise ValueError(
+            "Qwen3.8 context parallelism needs a media call's position_ids for the whole packed call, "
+            f"got {tuple(position_ids.shape)} for {padded_tokens} tokens, first positions {first_positions.tolist()}"
+        )
+    kwargs["position_ids"] = position_ids[..., start:end]
+    return args, kwargs
+
+
+def _wrap_multimodal_forward(multimodal_model: nn.Module, backbone: nn.Module, process_group) -> None:
+    """Shard a media call after the vision merge when the caller marks it whole; pass every other call through.
+
+    Two dispatches feed a CP rank. Windowed (the default, what the trainers send today): the rank gets its
+    ``token_shard`` window with the whole media items in it and their ``*_window_token_ranges``; the call is
+    already sharded and passes through unchanged. After the vision merge (opt-in, prime-rl #3916): the call
+    passes ``cp_shard_after_vision_merge=True`` and every rank gets the whole packed call with all its media,
+    runs the vision tower and the merge, then keeps its own window before the language model runs.
+    """
+    original_forward = multimodal_model.forward
+    shard = functools.partial(_shard_merged_call, process_group=process_group)
+
+    def forward(self, *args, **kwargs):
+        if not kwargs.pop(SHARD_AFTER_VISION_MERGE_KWARG, False):
+            return original_forward(*args, **kwargs)
+        windowed = [key for key in _WINDOW_RANGES_KEYS if kwargs.get(key) is not None]
+        if windowed:
+            raise ValueError(
+                f"a call marked {SHARD_AFTER_VISION_MERGE_KWARG}=True must be the whole packed call, but it "
+                f"carries {windowed}, which only a token_shard window has"
+            )
+        if all(kwargs.get(key) is None for key in _MEDIA_KEYS):
+            raise ValueError(
+                f"{SHARD_AFTER_VISION_MERGE_KWARG}=True marks a media call; a text-only call is sharded before "
+                "the model and passes without it"
+            )
+        handle = backbone.register_forward_pre_hook(shard, with_kwargs=True, prepend=True)
+        try:
+            return original_forward(*args, **kwargs)
+        finally:
+            handle.remove()
+
+    multimodal_model.forward = types.MethodType(forward, multimodal_model)
+
+
 def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
     if cp_size == 1:
         return
@@ -322,6 +409,8 @@ def apply_context_parallelism(model: nn.Module, cp_size: int, cp_group) -> None:
             f"found {len(qsa_modules)} and {len(linear_modules)}"
         )
     _wrap_backbone_forward(backbone, linear_modules, model_cp_group)
+    if get_vision_encoder(model) is not None:
+        _wrap_multimodal_forward(cast(nn.Module, _unwrap_peft_model(model).model), backbone, model_cp_group)
     get_logger().info(
         "Applied Qwen3.8 context parallelism (cp_size=%d): %d QSA, %d GatedDeltaNet, %d PLE layers",
         world_size,

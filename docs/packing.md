@@ -58,6 +58,13 @@ These leaves are matched by key, never by shape. Their leading dimension counts 
 
 Media leaves ride at the top level only; one inside `context` is refused.
 
+### Media under context parallelism
+
+A CP rank's model call takes a media call in one of two modes. The Qwen3.8 CP wrapper (`qwen38/context_parallel.py`) tells them apart only by an explicit flag on the model call, never by the call's shape: rank 0's window opens a row at position 0 and divides evenly, just like a whole call.
+
+- **Windowed** (the default, and what every dispatch sends today: dss's data plane and `run_pipeline`). Each rank gets `token_shard`'s window with the whole media items in it and their `*_window_token_ranges`; an item that straddles windows is refused upstream. The call is already sharded, so the wrapper passes it through unchanged, as it does any call not marked whole, text-only calls included.
+- **After the vision merge** (prime-rl #3916, opt-in). The caller passes the whole packed call, with all its media, to every rank and `cp_shard_after_vision_merge=True`. Each rank runs the vision tower and the merge on the whole call, then a pre-hook on the language model keeps the rank's `token_window` of `inputs_embeds`, the raw `ple_input_ids`, `ple_position_ids`, `attention_mask`, `routed_experts` and the `[4, B, T]` positions. A call so marked is refused if it carries `*_window_token_ranges`, has no media, does not divide by the CP size, or has positions that are not the whole call's. No dispatch uses this mode yet; it is what a later one could use to lift the straddle refusal, since no rank then needs an item cut at a window edge.
+
 ## Cost
 
 One index and one kernel per tensor, not per row. `packed_token_index(valid_lengths, cu_seqlens, sequence_length)` gives every packed token's position in the flattened `[B * S, ...]` batch; packing is an `index_select` against it and unpacking an `index_copy_`, for any trailing shape and any number of leaves. The index is built once per call and reused for every leaf, so cost tracks tokens rather than rows: on an H200, packing six `[B, S]` leaves plus a `[B, S, 512]` leaf takes 0.36 ms at 8, 32 and 128 rows.
