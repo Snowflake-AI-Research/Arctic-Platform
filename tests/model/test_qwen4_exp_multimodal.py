@@ -23,8 +23,8 @@ the language model only. The PR's own test files could not be read from the host
 written on, so the cases follow the PR's description and the media research plan, re-expressed against
 ``Qwen4ExpForConditionalGenerationPrimeRL``; no prime-rl code is copied.
 
-Cases Arctic already satisfies pass. Cases that need trainer code not yet ported are
-``xfail(strict=True)`` with the missing piece in the reason, so they flip to failures once it lands.
+Every case now passes; the last ``xfail(strict=True)``, context-parallel sharding after the vision merge, is
+covered in more depth by ``test_qwen38_cp_media.py``.
 
 CPU only, on the tiny random-weight config of ``test_qwen4_exp.py``. The DSS MoE router counts tokens with
 ``torch.histc`` on integer ids, which has no CPU kernel, so every decoder layer's MoE is swapped for a dense
@@ -429,13 +429,6 @@ def test_image_batch_runs_the_vision_tower_once_and_is_unchanged():
         torch_assert_equal(vision_grads[name].grad, parameter.grad, msg=name)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "needs #3916 port: context-parallel sharding after the vision merge; each rank takes the full packed row "
-        "with its images, merges image features, then keeps its own slice of embeddings, raw PLE ids and positions"
-    ),
-)
 def test_context_parallel_shards_after_the_vision_merge(monkeypatch):
     from arctic_platform.model.implementations.qwen38 import context_parallel
 
@@ -466,7 +459,8 @@ def test_context_parallel_shards_after_the_vision_merge(monkeypatch):
     context_parallel.apply_context_parallelism(model, 2, object())
     sharded, _ = _capture_language_model_inputs(model, stop=True)
     with pytest.raises(_StopForward), torch.no_grad():
-        model(**inputs)
+        # The whole call reaches this rank, marked so; a call without the flag is taken to be a window already.
+        model(**inputs, cp_shard_after_vision_merge=True)
 
     torch_assert_equal(sharded["inputs_embeds"], unsharded["inputs_embeds"][:, local])
     torch_assert_equal(sharded["ple_input_ids"], input_ids[:, local])
