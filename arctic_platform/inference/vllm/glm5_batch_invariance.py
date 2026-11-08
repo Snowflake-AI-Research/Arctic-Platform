@@ -122,11 +122,13 @@ def ensure_glm5_batch_invariance() -> None:
         backend.supports_batch_invariance = classmethod(lambda cls: True)
     flashattn_mla_sparse.flash_attn_varlen_func = _single_split(flashattn_mla_sparse.flash_attn_varlen_func)
     from vllm.model_executor.kernels.mhc import tilelang_kernels
+    from vllm.model_executor.kernels.mhc import warmup
 
-    # The hyper-connection pre-norm GEMM splits its reduction by the step's token count; callers import these at
-    # call time.
-    tilelang_kernels.compute_num_split = lambda *args, **kwargs: 1
-    tilelang_kernels.compute_mhc_pre_num_splits = lambda *args, **kwargs: 1
+    # The hyper-connection pre-norm GEMM splits its reduction by the step's token count; callers import these from
+    # both modules at call time.
+    for module in (tilelang_kernels, warmup):
+        module.compute_num_split = lambda *args, **kwargs: 1
+        module.compute_mhc_pre_num_splits = lambda *args, **kwargs: 1
     # Small steps would take a fused post + pre-norm kernel with its own split; every step takes the split-free path.
     tilelang_kernels.mhc_fused_post_pre_split_config = lambda *args, **kwargs: None
     _batch_invariant_router_gate()

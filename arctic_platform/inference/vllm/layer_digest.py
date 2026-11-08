@@ -118,4 +118,11 @@ def ensure_layer_digest() -> None:
 
     for cls in (Glm5NextMLAAttention, Glm5NextLinearAttention):
         _wrap(cls, "forward", lambda self, cls=cls: f"{cls.__name__}@{id(self):x}")
+    from vllm.model_executor.layers.fused_moe.router.fused_moe_router import FusedMoERouter
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    _wrap(GateLinear, "forward", lambda self: f"gate@{id(self):x}")
+    _wrap(FusedMoERouter, "select_experts", lambda self: f"select_experts@{id(self):x}")
+    _wrap(MoERunner, "_apply_quant_method", lambda self: f"moe_apply@{id(self):x}")
     _APPLIED = True
