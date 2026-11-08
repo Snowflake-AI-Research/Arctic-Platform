@@ -21,7 +21,9 @@ batch-dependent choice is FA3's split-KV heuristic, which ``num_splits=1`` turns
 backend does in this mode. The KDA layers use the GatedDeltaNet backend (allowed by
 :mod:`arctic_platform.inference.vllm.gdn_batch_invariance`) and their own autotuned Triton kernels, pinned here to
 one config. The sparse indexer's backends (its fp8 key cache and kpool tail) are allowed as well: their kernels have
-no autotuning, and whether their top-k selection is batch-invariant is measured, not assumed. With
+no autotuning, and whether their top-k selection is batch-invariant is measured, not assumed. The hyper-connection
+pre-norm GEMM (DeepGEMM ``tf32_hc_prenorm_gemm``) splits its reduction over more blocks the fewer tokens a step has;
+it runs one split here. With
 ``ARCTIC_GLM5_BATCH_INVARIANT=1`` all of this is applied; the GDN patch is applied too.
 """
 
@@ -91,5 +93,11 @@ def ensure_glm5_batch_invariance() -> None:
     ):
         backend.supports_batch_invariance = classmethod(lambda cls: True)
     flashattn_mla_sparse.flash_attn_varlen_func = _single_split(flashattn_mla_sparse.flash_attn_varlen_func)
+    from vllm.model_executor.kernels.mhc import tilelang_kernels
+
+    # The hyper-connection pre-norm GEMM splits its reduction by the step's token count; callers import these at
+    # call time.
+    tilelang_kernels.compute_num_split = lambda *args, **kwargs: 1
+    tilelang_kernels.compute_mhc_pre_num_splits = lambda *args, **kwargs: 1
     pin_kda_kernels()
     _APPLIED = True
