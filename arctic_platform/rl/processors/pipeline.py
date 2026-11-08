@@ -56,6 +56,13 @@ from numbers import Real
 from typing import Any
 
 import torch
+import torch.nn.functional as F
+
+from arctic_platform.common.packing import MEDIA_KINDS
+from arctic_platform.common.packing import check_media
+from arctic_platform.common.packing import mrope_position_ids
+from arctic_platform.common.packing import select_media_rows
+from arctic_platform.common.packing import split_media
 
 # Shared registries live in arctic_platform.common.registry (used by RL + SFT).
 from arctic_platform.common.registry import LOSS_FNS  # noqa: F401  # re-exported
@@ -105,6 +112,10 @@ _ENGINE_FWD_KEYS = frozenset(
         "routed_experts",
         "pixel_values",
         "image_grid_thw",
+        "pixel_values_videos",
+        "video_grid_thw",
+        # Token types locate image and video placeholders; positions are built from them below.
+        "mm_token_type_ids",
         "dss_compute_logprobs",
         # Packed/varlen flash-attn aliases (``cu_seqlens`` itself stays blocked).
         "cu_seq_lens_q",
@@ -215,6 +226,81 @@ def _engine_forward_kwargs(batch: dict, meta: dict) -> dict:
         )
     kwargs = {key: batch[key] for key in _ENGINE_FWD_KEYS if key in batch}
     kwargs.update({key: meta[key] for key in META_FWD_SCALAR_KEYS if key in meta})
+    return kwargs
+
+
+def _has_media(media: dict) -> bool:
+    return any(media.get(kind.values_key) is not None for kind in MEDIA_KINDS)
+
+
+def _media_with_row_ids(media: dict, n_rows: int) -> dict:
+    """``media`` with each kind's row ids; a one-row batch may omit them, since every item is that row's."""
+    media = dict(media)
+    for kind in MEDIA_KINDS:
+        values = media.get(kind.values_key)
+        if values is None or media.get(kind.row_ids_key) is not None:
+            continue
+        if n_rows != 1 or media.get(kind.grid_key) is None:
+            raise ValueError(f"{kind.values_key} on a {n_rows}-row batch needs {kind.row_ids_key}")
+        media[kind.row_ids_key] = torch.zeros(media[kind.grid_key].shape[0], dtype=torch.long)
+    check_media(media, n_rows)
+    return media
+
+
+def _spatial_merge_size(engine) -> int:
+    module = getattr(engine, "module", engine)
+    vision_config = getattr(getattr(module, "config", None), "vision_config", None)
+    merge = getattr(vision_config, "spatial_merge_size", None)
+    if merge is None:
+        raise ValueError("a batch with media needs a model whose config.vision_config has spatial_merge_size")
+    return int(merge)
+
+
+def _check_media_rows(media: dict, kind, token_types: torch.Tensor, cu_seqlens: list, spatial_merge_size: int):
+    """Every row holds exactly the ``kind`` tokens its own items expand to.
+
+    Counted per row rather than per item span (``media_token_spans``): the Qwen3-VL processor puts each video
+    frame's timestamp text between frames, so a video's tokens are not one contiguous run.
+    """
+    grid, row_ids = media[kind.grid_key], media[kind.row_ids_key].to(torch.long).cpu()
+    item_tokens = grid.to(torch.long).prod(dim=1).cpu() // (spatial_merge_size**2)
+    expected = torch.zeros(len(cu_seqlens) - 1, dtype=torch.long).index_add_(0, row_ids, item_tokens)
+    is_kind = (token_types == kind.token_type).to(torch.long).cpu()
+    found = torch.stack([is_kind[start:end].sum() for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])])
+    if not torch.equal(found, expected):
+        raise ValueError(
+            f"rows hold {found.tolist()} {kind.name} tokens but their {kind.grid_key} by {kind.row_ids_key} "
+            f"expand to {expected.tolist()} at spatial_merge_size {spatial_merge_size}"
+        )
+
+
+def _packed_media_kwargs(media: dict, mm_token_type_ids, cu_seqlens: torch.Tensor, spatial_merge_size: int) -> dict:
+    """Model inputs for row-owned ``media`` in one packed call: its pixels, grids and M-RoPE ``position_ids``.
+
+    Each row must hold the tokens of exactly the items its row ids give it. A kind with no item in the call is
+    left out, so a text-only microbatch of a media batch runs no vision forward. ``position_ids`` is
+    ``[4, 1, T]`` and every row restarts at 0, which is what the row gets alone.
+    """
+    if mm_token_type_ids is None:
+        raise ValueError("a batch with media needs mm_token_type_ids to place image and video tokens")
+    token_types = mm_token_type_ids.reshape(-1)
+    boundaries = [int(value) for value in cu_seqlens.tolist()]
+    kwargs = {}
+    for kind in MEDIA_KINDS:
+        grid = media.get(kind.grid_key)
+        if media.get(kind.values_key) is None:
+            continue
+        _check_media_rows(media, kind, token_types, boundaries, spatial_merge_size)
+        if grid.shape[0]:
+            kwargs[kind.values_key] = media[kind.values_key]
+            kwargs[kind.grid_key] = grid
+    kwargs["position_ids"] = mrope_position_ids(
+        mm_token_type_ids,
+        cu_seqlens,
+        spatial_merge_size=spatial_merge_size,
+        image_grid_thw=kwargs.get("image_grid_thw"),
+        video_grid_thw=kwargs.get("video_grid_thw"),
+    )
     return kwargs
 
 
@@ -512,6 +598,7 @@ def run_pipeline(
 
     # --- forward ---
     pack_with_unpad = True  # XXX: make configurable?
+    unpadded_media_rows = False
     already_packed = "cu_seqlens" in meta
     if already_packed:
         # Inner packing call and pack_for_dss already flattened sequences.
@@ -548,7 +635,21 @@ def run_pipeline(
             )
         pad_token = meta["pad_token_id"]
         attention_mask_2d_bool = batch["attention_mask"].bool()
+        # Media leaves count patches and items, not tokens: keep them out of the shape-based flatten.
+        batch, media = split_media(batch)
         batch = padded_tensor_2d_dict_to_unpadded_tensor_1d_dict(batch, attention_mask_2d_bool)
+        if _has_media(media):
+            media = _media_with_row_ids(media, attention_mask_2d_bool.shape[0])
+            lens = attention_mask_2d_bool.sum(dim=1, dtype=torch.int32)
+            cu_seqlens = F.pad(torch.cumsum(lens, dim=0, dtype=torch.int32), (1, 0)).cpu()
+            batch.update(
+                _packed_media_kwargs(media, batch.get("mm_token_type_ids"), cu_seqlens, _spatial_merge_size(engine))
+            )
+            # As on the packed path: with a cache, qwen4_exp's PLE ignores the row restarts in position_ids.
+            batch.setdefault("use_cache", False)
+            unpadded_media_rows = True
+        else:
+            batch.update(media)
 
     log_dp_shard_tokens(
         rank,
@@ -564,6 +665,10 @@ def run_pipeline(
         # Zorro reads calculate_entropy from engine kwargs. Loss tensors stay
         # on batch and meta for posts and losses.
         fwd_kwargs = _engine_forward_kwargs(batch, meta)
+        if unpadded_media_rows:
+            # The unpadded [1, N] mask is all ones. Passed on, it stops the model from reading the row restarts
+            # in position_ids, and rows attend across each other; the packed path forwards no mask either.
+            fwd_kwargs.pop("attention_mask", None)
         output_keys = ["logits", "logprobs", "entropy", "loss"]
         if loss_object is not None:
             context = {**meta, **batch}
@@ -712,11 +817,24 @@ def _run_pipeline_with_packing(
     from .packing import pack_sequences
     from .packing import unpack_sequences
 
-    # Combine for splitting — meta tensors are split the same way as batch
-    all_input = {**meta, **batch}  # batch takes priority on key collision
+    # Combine for splitting — meta tensors are split the same way as batch.
+    # Media leaves count patches and items, not tokens, so the shape-based
+    # splitter would hand every microbatch all of them (or mis-slice them):
+    # each microbatch takes the media its rows own instead. Like every model
+    # input, media reaches the engine only from batch.
+    all_input, media = split_media({**meta, **batch})  # batch takes priority on key collision
+    media = {key: value for key, value in media.items() if key in batch}
+    n_rows = int(batch["attention_mask"].shape[0]) if "attention_mask" in batch else 0
+    has_media = _has_media(media)
+    if has_media:
+        media = _media_with_row_ids(media, n_rows)
+        spatial_merge_size = _spatial_merge_size(engine)
     mb_spec = MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb)
     mb_list = split_padded_tensor_dict_into_mb_list(all_input, mb_spec)
     n_mbs = len(mb_list.mbs)
+    mb_row_starts = [0]
+    for mb in mb_list.mbs:
+        mb_row_starts.append(mb_row_starts[-1] + int(mb["attention_mask"].shape[0]))
     if loss_object is not None:
         loss_object.model_call_count_callback([n_mbs], processing.get("config") or {})
 
@@ -754,6 +872,17 @@ def _run_pipeline_with_packing(
                 mb_kwargs[key] = packed[key]
         if "position_ids" in packed:
             mb_kwargs["position_ids"] = packed["position_ids"]
+        if has_media:
+            # Rows of this microbatch, in packed order, as indices into the original batch.
+            rows = torch.as_tensor(mb_list.forward_indices[mb_row_starts[i] : mb_row_starts[i + 1]], dtype=torch.long)
+            mb_kwargs.update(
+                _packed_media_kwargs(
+                    select_media_rows(media, rows, n_rows),
+                    packed.get("mm_token_type_ids"),
+                    packed["cu_seqlens"],
+                    spatial_merge_size,
+                )
+            )
 
         if backward is True and hasattr(engine, "set_gradient_accumulation_boundary"):
             engine.set_gradient_accumulation_boundary(i == n_mbs - 1)
