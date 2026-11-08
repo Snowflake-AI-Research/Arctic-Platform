@@ -76,6 +76,39 @@ def record_numbered(prefix: str, tensor: torch.Tensor) -> None:
         digests[f"{prefix}#{n}"] = digest
 
 
+def kernel_inventory(model: torch.nn.Module) -> dict[str, dict[str, str]]:
+    """For every submodule that dispatches to a kernel, the class of what it dispatches to (debug)."""
+    inventory: dict[str, dict[str, str]] = {}
+    for name, module in model.named_modules():
+        entry: dict[str, str] = {"module": type(module).__name__}
+        for attr in ("quant_method", "_quant_method", "impl", "attn_backend", "kernel", "act_fn"):
+            value = getattr(module, attr, None)
+            if value is not None and not isinstance(value, (str, int, float, bool)):
+                entry[attr] = value.__name__ if isinstance(value, type) else type(value).__name__
+        quant = getattr(module, "quant_method", None) or getattr(module, "_quant_method", None)
+        for attr in ("kernel", "fp8_linear", "moe_kernel", "fused_experts"):
+            value = getattr(quant, attr, None)
+            if value is not None:
+                entry[f"quant.{attr}"] = type(value).__name__
+                experts = getattr(value, "fused_experts", None)
+                if experts is not None:
+                    entry[f"quant.{attr}.fused_experts"] = type(experts).__name__
+                    config = getattr(experts, "activation_config", None)
+                    if config is not None:
+                        entry["activation_config"] = repr(config)
+        if len(entry) > 1:
+            inventory[name] = entry
+    return inventory
+
+
+def _write_inventory(model: torch.nn.Module, directory: str) -> None:
+    import json
+
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, "inventory.json"), "w") as f:
+        json.dump(kernel_inventory(model), f, indent=1, default=str)
+
+
 def _wrap(cls, method: str, name_of, inputs: bool = False):
     original = getattr(cls, method)
 
@@ -102,6 +135,9 @@ def ensure_layer_digest() -> None:
 
     def forward(self, input_ids, positions, *args, **kwargs):
         record = _state["step"] < max_steps and get_tensor_model_parallel_rank() == 0
+        if record and not _state.get("inventory"):
+            _state["inventory"] = True
+            _write_inventory(self, directory)
         if record:
             _state["digests"], _state["rows"], _state["counts"] = {}, int(positions.shape[-1]), {}
         try:
