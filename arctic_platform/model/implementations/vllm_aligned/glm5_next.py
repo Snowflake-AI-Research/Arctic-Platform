@@ -29,6 +29,19 @@ vLLM defers a layer's last hyper-connection post into the next layer's fused pos
 off (as the batch-invariant sampler runs it) that op is the standalone post kernel followed by the pre-norm GEMM and
 the pre kernel on the same per-token data, so materializing the residual streams at every layer boundary, as the
 stock layers carry them, gives the same bits.
+
+Kernels the sampler runs (its kernel inventory, ``layer_digest.kernel_inventory``, on the 8-layer proxy at TP1):
+
+* every unquantized linear (all KDA projections, MLA ``fused_qkv_a``/``q_b``/``kv_b``, the indexer's ``wq_b`` and
+  ``wk_weights_proj``, every ``o_proj``): ``linear_batch_invariant``, whose tile is chosen by ``(N, K)``, so the
+  trainer passes vLLM's merged weights (KDA's ``[q; k; v; b; f_a; g_a]``, MLA's ``[q_a; kv_a]``);
+* dense MLP and shared-expert ``gate_up``/``down``: block-FP8 ``TritonFp8BlockScaledMMKernel`` (activations
+  quantized per 128-group, row-major scales, no UE8M0) with ``SiluAndMulWithClamp``;
+* routed experts: ``FusedMoEKernel`` with ``TritonExperts`` (clamp limit 10), routing by the batch-invariant
+  grouped top-k on fp32 gate logits, ``routed_scaling_factor`` applied to the routed output;
+* sparse attention ``FlashAttnMLASparseImpl`` (FA3, one split); KDA prefill FlashKDA, decode ``fused_recurrent_kda``;
+* direct ``F.linear``/``torch.mm`` calls in model code (the indexer's kpool gate and head weights) bypass the linear
+  layers; the head weights go through the batch-invariant matmul in the sampler patch.
 """
 
 from __future__ import annotations
