@@ -16,6 +16,7 @@
 """Non-master ranks finish each EP export collective before queuing the next (CPU, faked collectives)."""
 
 import sys
+import weakref
 from types import ModuleType
 from types import SimpleNamespace
 
@@ -132,6 +133,23 @@ def test_hf_export_non_master_waits_after_every_gather(monkeypatch, events, incl
 
     # HF export gathers fp32 rows as bytes.
     assert events == expected
+
+
+@pytest.mark.parametrize("include_skipped", [False, True])
+def test_hf_export_releases_previous_layer_before_gather(monkeypatch, events, include_skipped):
+    _set_rank(monkeypatch, 0)
+    model = _model((3, 2))
+    model.model.layers.append(_model((3, 2)).model.layers[0])
+    stream = deepspeed_integration.build_iter_full_hf_weights(model)(include_skipped=include_skipped)
+    previous = weakref.ref(next(stream)[1])
+    gather = torch.distributed.gather if not include_skipped else torch.distributed.all_gather
+
+    def checked_gather(*args, **kwargs):
+        assert previous() is None
+        return gather(*args, **kwargs)
+
+    monkeypatch.setattr(torch.distributed, "gather" if not include_skipped else "all_gather", checked_gather)
+    assert len(list(stream)) == 1
 
 
 def test_hf_export_non_master_waits_after_every_row_slice(monkeypatch, events):

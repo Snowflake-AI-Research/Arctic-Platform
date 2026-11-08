@@ -259,6 +259,7 @@ def build_iter_full_hf_weights(model: nn.Module):
                         full = _gather_ep_weight_on_master(tensor, ep_group, is_master=is_master)
                     if is_master:
                         layer_state[name] = full
+                    del full
                 elif is_master:
                     layer_state[name] = tensor.data
 
