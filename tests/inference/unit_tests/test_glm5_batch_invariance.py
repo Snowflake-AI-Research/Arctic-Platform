@@ -49,3 +49,28 @@ def test_grouped_topk_is_row_invariant_and_matches_the_reference_math():
     for row in range(7):
         alone_w, alone_ids = grouped_topk(None, logits[row : row + 1], **kwargs)
         assert torch.equal(alone_w[0], weights[row]) and torch.equal(alone_ids[0], ids[row])
+
+
+def test_deterministic_topk_breaks_ties_by_column_and_orders_descending():
+    import torch
+
+    from arctic_platform.inference.vllm.glm5_batch_invariance import deterministic_topk
+
+    logits = torch.tensor(
+        [
+            [0.5, 2.0, 2.0, -1.0, 2.0, 0.0],  # ties at columns 1, 2, 4; window [0, 6)
+            [9.0, -3.0, -0.0, 0.0, -2.0, 7.0],  # window [1, 5): columns 1..4
+            [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],  # window [4, 6): fewer valid columns than k
+        ]
+    )
+    starts, ends = torch.tensor([0, 1, 4]), torch.tensor([6, 5, 6])
+    out = torch.empty(3, 3, dtype=torch.int32)
+    deterministic_topk(logits, starts, ends, 3, out)
+    assert out.tolist() == [[4, 2, 1], [3, 2, 1], [1, 0, -1]]
+    torch.manual_seed(0)
+    big = torch.randn(5, 300).round(decimals=1)  # many ties
+    zeros, ends = torch.zeros(5, dtype=torch.long), torch.full((5,), 300)
+    a = deterministic_topk(big, zeros, ends, 64, torch.empty(5, 64, dtype=torch.int32))
+    b = deterministic_topk(big[2:3], zeros[:1], ends[:1], 64, torch.empty(1, 64, dtype=torch.int32))
+    assert torch.equal(a[2:3], b)
+    assert torch.equal(a.sort(dim=-1, descending=True).values, a)

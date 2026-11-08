@@ -150,6 +150,67 @@ def grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+def deterministic_topk(
+    logits: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor, k: int, out: torch.Tensor
+) -> torch.Tensor:
+    """Write each row's top ``k`` columns of ``logits`` within ``[start, end)`` into ``out``, as ``column - start``.
+
+    Every score is made unique by its column, so equal scores go to the later column and the selected set never
+    depends on thread scheduling; the selection is written in descending order with ``-1`` for missing entries.
+    """
+    rows, cols = logits.shape
+    col = torch.arange(cols, device=logits.device)
+    valid = (col[None, :] >= starts[:, None].long()) & (col[None, :] < ends[:, None].long())
+    bits = logits.float().contiguous().view(torch.int32).to(torch.int64)
+    ordered = torch.where(bits >= 0, bits, bits ^ 0x7FFFFFFF)
+    key = torch.where(valid, (ordered << 32) | col[None, :], torch.iinfo(torch.int64).min)
+    take = min(k, cols)
+    top = torch.topk(key, take, dim=-1, sorted=False).indices
+    picked = torch.where(valid.gather(1, top), top - starts[:, None].long(), -1)
+    out[:, :take] = picked.sort(dim=-1, descending=True).values.to(out.dtype)
+    out[:, take:] = -1
+    return out
+
+
+def _deterministic_indexer_topk() -> None:
+    """Replace GLM-5.3-Flash's sparse-indexer top-k (prefill and decode) by :func:`deterministic_topk`.
+
+    The prefill kernel breaks score ties by thread scheduling and the decode dispatcher picks a kernel by batch
+    size, so the pools a token attends to could change from run to run and with its batch-mates.
+    """
+    import logging
+
+    from vllm.models.glm5next.nvidia import sparse_indexer
+
+    log = logging.getLogger(__name__)
+    original_prefill = torch.ops._C.top_k_per_row_prefill
+    checks = {"left": 3}
+
+    def top_k_per_row_prefill(logits, ks, ke, out, num_rows, stride0, stride1, k):
+        reference = None
+        if checks["left"] > 0:  # the kernel's own selection, to confirm the index convention matches
+            checks["left"] -= 1
+            reference = torch.empty_like(out)
+            original_prefill(logits, ks, ke, reference, num_rows, stride0, stride1, k)
+        deterministic_topk(logits[:num_rows], ks[:num_rows], ke[:num_rows], k, out)
+        if reference is not None:
+            same = (reference.sort(dim=-1).values == out.sort(dim=-1).values).all(dim=-1).float().mean().item()
+            log.warning("ARCTIC_GLM5_BATCH_INVARIANT indexer top-k: %.4f of rows select the kernel's set", same)
+
+    torch.ops._C.top_k_per_row_prefill = top_k_per_row_prefill
+
+    def decode_topk(backend):
+        def run(logits, seq_lens, next_n, out, k, max_seq_len):
+            if next_n != 1:
+                raise NotImplementedError("deterministic indexer top-k covers decode without speculative tokens")
+            lengths = seq_lens.reshape(-1)[: logits.shape[0]].to(torch.int64)
+            deterministic_topk(logits, torch.zeros_like(lengths), lengths, k, out)
+
+        return run
+
+    sparse_indexer.get_indexer_topk = decode_topk
+
+
 def _split_mixed_kda_steps() -> None:
     """Run a mixed step's decode requests through KDA's decode path, as a decode-only step runs them.
 
@@ -289,6 +350,7 @@ def ensure_glm5_batch_invariance() -> None:
     _batch_invariant_router_gate()
     _batch_invariant_fp8_block_linear()
     _split_mixed_kda_steps()
+    _deterministic_indexer_topk()
     from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
 
     grouped_topk_router.grouped_topk = grouped_topk
