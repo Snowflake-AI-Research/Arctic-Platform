@@ -109,7 +109,30 @@ def _write_inventory(model: torch.nn.Module, directory: str) -> None:
         json.dump(kernel_inventory(model), f, indent=1, default=str)
 
 
-def _wrap(cls, method: str, name_of, inputs: bool = False):
+DUMP_ROWS_ENV = "ARCTIC_LAYER_DUMP_ROWS"
+
+
+def _dump(name: str, args, out) -> None:
+    """Debug: keep the full input and output tensors of a call in steps of at most ``ARCTIC_LAYER_DUMP_ROWS`` rows."""
+    dump = _state.get("dump")
+    if dump is None:
+        return
+    counts = _state.setdefault("dump_counts", {})
+    base = f"L{_state.get('layer', -1):02d}.{name}"
+    name = f"{base}#{counts.get(base, 0)}"
+    counts[base] = counts.get(base, 0) + 1
+
+    def cpu(value):
+        if torch.is_tensor(value):
+            return value.detach().cpu()
+        if isinstance(value, (tuple, list)):
+            return type(value)(cpu(v) for v in value)
+        return None
+
+    dump[name] = {"args": cpu(list(args)), "out": cpu(out)}
+
+
+def _wrap(cls, method: str, name_of, inputs: bool = False, dump: bool = False):
     original = getattr(cls, method)
 
     def wrapped(self, *args, **kwargs):
@@ -117,6 +140,8 @@ def _wrap(cls, method: str, name_of, inputs: bool = False):
             _record(f"{name_of(self)}.in", [*args, *kwargs.values()])
         out = original(self, *args, **kwargs)
         _record(name_of(self), out)
+        if dump:
+            _dump(name_of(self), [*args, *kwargs.values()], out)
         return out
 
     setattr(cls, method, wrapped)
@@ -140,6 +165,9 @@ def ensure_layer_digest() -> None:
             _write_inventory(self, directory)
         if record:
             _state["digests"], _state["rows"], _state["counts"] = {}, int(positions.shape[-1]), {}
+            dump_rows = int(os.environ.get(DUMP_ROWS_ENV, "0"))
+            _state["dump"] = {} if 0 < _state["rows"] <= dump_rows else None
+            _state["dump_counts"] = {}
         try:
             out = original_forward(self, input_ids, positions, *args, **kwargs)
             _record("model_out", out)
@@ -154,6 +182,13 @@ def ensure_layer_digest() -> None:
                     },
                     os.path.join(directory, f"step{_state['step']:05d}.pt"),
                 )
+                if _state.get("dump"):
+                    torch.save(
+                        {"input_ids": None if input_ids is None else input_ids.detach().cpu(),
+                         "positions": positions.detach().cpu(), "calls": _state["dump"]},
+                        os.path.join(directory, f"dump{_state['step']:05d}.pt"),
+                    )  # fmt: skip
+                _state["dump"] = None
                 _state["step"] += 1
                 _state["digests"] = None
         return out
@@ -172,16 +207,25 @@ def ensure_layer_digest() -> None:
 
     glm5.Glm5NextForCausalLM.compute_logits = compute_logits
     layer = lambda self: f"L{self.layer_idx:02d}"  # noqa: E731
+    original_layer_forward = glm5.Glm5NextDecoderLayer.forward
+
+    def layer_forward(self, *args, **kwargs):
+        _state["layer"] = self.layer_idx
+        return original_layer_forward(self, *args, **kwargs)
+
+    glm5.Glm5NextDecoderLayer.forward = layer_forward
     _wrap(glm5.Glm5NextDecoderLayer, "forward", lambda self: f"{layer(self)}.out")
     for op in _LAYER_OPS:
         _wrap(glm5.Glm5NextDecoderLayer, op, lambda self, op=op: f"{layer(self)}.{op}", inputs=True)
     for cls in (glm5.Glm5NextMoE, glm5.Glm5NextMLP):
         _wrap(cls, "forward", lambda self, cls=cls: f"{cls.__name__}@{id(self):x}")
+        _wrap(cls, "forward", lambda self, cls=cls: cls.__name__, dump=True)
     from vllm.models.glm5next.common.attention import Glm5NextMLAAttention
     from vllm.models.glm5next.common.kda import Glm5NextLinearAttention
 
     for cls in (Glm5NextMLAAttention, Glm5NextLinearAttention):
         _wrap(cls, "forward", lambda self, cls=cls: f"{cls.__name__}@{id(self):x}")
+        _wrap(cls, "forward", lambda self, cls=cls: cls.__name__, dump=True)
     from vllm.model_executor.layers.fused_moe.router.fused_moe_router import FusedMoERouter
     from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
