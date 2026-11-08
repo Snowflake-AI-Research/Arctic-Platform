@@ -22,14 +22,17 @@ backend does in this mode. The KDA layers use the GatedDeltaNet backend (allowed
 :mod:`arctic_platform.inference.vllm.gdn_batch_invariance`) and their own autotuned Triton kernels, pinned here to
 one config. The sparse indexer's backends (its fp8 key cache and kpool tail) are allowed as well: their kernels have
 no autotuning, and whether their top-k selection is batch-invariant is measured, not assumed. The hyper-connection
-pre-norm GEMM (DeepGEMM ``tf32_hc_prenorm_gemm``) splits its reduction over more blocks the fewer tokens a step has;
-it runs one split here. With
+pre-norm GEMM (DeepGEMM ``tf32_hc_prenorm_gemm``) splits its reduction over more blocks the fewer tokens a step has,
+and small steps take a fused post + pre-norm kernel instead; every step runs the one-split unfused path here. The MoE
+router's fp32 logits go through vLLM's batch-invariant matmul instead of a kernel chosen by token count. With
 ``ARCTIC_GLM5_BATCH_INVARIANT=1`` all of this is applied; the GDN patch is applied too.
 """
 
 from __future__ import annotations
 
 import os
+
+import torch
 
 ENV_VAR = "ARCTIC_GLM5_BATCH_INVARIANT"
 _KDA_MODULES = (
@@ -74,6 +77,31 @@ def _single_split(flash_attn_varlen_func):
     return call
 
 
+def _batch_invariant_router_gate() -> None:
+    """Compute the MoE router's fp32 logits with the batch-invariant matmul.
+
+    ``GateLinear`` picks a kernel by token count (a CuteDSL kernel up to 16 tokens, a specialized one up to 32, then
+    cuBLAS ``mm(out_dtype=fp32)``, which batch-invariant mode does not replace), so a token's routing scores depend
+    on how many tokens share the step.
+    """
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+
+    from arctic_platform.inference.vllm.batch_invariant_fp32_logits import linear_fp32_out
+
+    original = GateLinear.forward
+
+    def forward(self, x):
+        if self.out_dtype != torch.float32 or getattr(self, "bias", None) is not None:
+            return original(self, x)
+        if self.weight.dtype == torch.float32:
+            output = torch.mm(x.float(), self.weight.t())
+        else:
+            output = linear_fp32_out(x.to(self.weight.dtype), self.weight)
+        return self._return(output)
+
+    GateLinear.forward = forward
+
+
 def ensure_glm5_batch_invariance() -> None:
     global _APPLIED
     if _APPLIED or not glm5_batch_invariance_requested():
@@ -99,5 +127,8 @@ def ensure_glm5_batch_invariance() -> None:
     # call time.
     tilelang_kernels.compute_num_split = lambda *args, **kwargs: 1
     tilelang_kernels.compute_mhc_pre_num_splits = lambda *args, **kwargs: 1
+    # Small steps would take a fused post + pre-norm kernel with its own split; every step takes the split-free path.
+    tilelang_kernels.mhc_fused_post_pre_split_config = lambda *args, **kwargs: None
+    _batch_invariant_router_gate()
     pin_kda_kernels()
     _APPLIED = True
