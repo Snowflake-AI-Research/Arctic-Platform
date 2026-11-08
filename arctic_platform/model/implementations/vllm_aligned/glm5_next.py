@@ -159,10 +159,103 @@ def dense_mlp(mlp: Any, x: torch.Tensor) -> torch.Tensor:
     return fp8_block_linear(hidden, mlp.down_proj.weight, mlp.down_proj.weight_scale_inv)
 
 
+def shared_expert_mlp(ffn: Any, x: torch.Tensor, swiglu_limit: float) -> torch.Tensor:
+    """vLLM's shared-expert ``Glm5NextMLP`` on the trainer's ``BCFeedForward`` (``w1`` gate, ``w3`` up, ``w2`` down)."""
+    weight = torch.cat([ffn.w1, ffn.w3])
+    scale = torch.cat([ffn.w1_scale_inv, ffn.w3_scale_inv])
+    if ffn.w1.shape[0] % FP8_BLOCK:
+        raise ValueError(f"merging FP8 projections needs {FP8_BLOCK}-row pieces, got {ffn.w1.shape[0]}")
+    hidden = silu_and_mul_with_clamp(fp8_block_linear(x, weight, scale), swiglu_limit)
+    return fp8_block_linear(hidden, ffn.w2, ffn.w2_scale_inv)
+
+
+_MOE_KERNELS: dict = {}
+
+
+def _triton_experts(num_experts: int, top_k: int, hidden: int, intermediate: int, swiglu_limit: float, w13_scale,
+                    w2_scale, device):  # fmt: skip
+    """vLLM's routed-expert kernel for block-FP8 GLM-5.3-Flash at TP 1: ``FusedMoEKernel`` with ``TritonExperts``."""
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
+    from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+    from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+    from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import make_fp8_moe_quant_config
+    from vllm.model_executor.layers.fused_moe.all2all_utils import maybe_make_prepare_finalize
+
+    moe_config = FusedMoEConfig(
+        num_experts=num_experts,
+        experts_per_token=top_k,
+        hidden_dim=hidden,
+        intermediate_size=intermediate,
+        num_local_experts=num_experts,
+        num_logical_experts=num_experts,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        activation=MoEActivation.SILU,
+        in_dtype=torch.bfloat16,
+        device=device,
+        routing_method=RoutingMethodType.DeepSeekV3,
+        swiglu_limit=swiglu_limit,
+    )
+    quant_config = make_fp8_moe_quant_config(
+        fp8_backend=Fp8MoeBackend.TRITON,
+        w1_scale=w13_scale,
+        w2_scale=w2_scale,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=[FP8_BLOCK, FP8_BLOCK],
+        swiglu_limit=swiglu_limit,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        layer=None,
+    )
+    prepare = maybe_make_prepare_finalize(
+        moe=moe_config, quant_config=quant_config, allow_new_interface=True, use_monolithic=False
+    )
+    return FusedMoEKernel(prepare, TritonExperts(moe_config, quant_config)), MoEActivation.SILU
+
+
+def moe(mlp: Any, x: torch.Tensor, config: Any) -> torch.Tensor:
+    """vLLM's ``Glm5NextMoE`` at TP 1 on the trainer's ``MoE``: fp32 router logits by the batch-invariant matmul, the
+    batch-invariant grouped top-k (renormalized and scaled by ``routed_scaling_factor`` there, as vLLM's router does
+    when the runner does not scale the output), the Triton routed experts, then ``shared + routed`` in bf16."""
+    from arctic_platform.inference.vllm.batch_invariant_fp32_logits import linear_fp32_out
+    from arctic_platform.inference.vllm.glm5_batch_invariance import grouped_topk
+
+    logits = linear_fp32_out(x, mlp.router.gate.weight)
+    weights, ids = grouped_topk(
+        x,
+        logits,
+        topk=config.num_experts_per_tok,
+        renormalize=config.norm_topk_prob,
+        num_expert_group=config.n_group,
+        topk_group=config.topk_group,
+        scoring_func=config.scoring_func,
+        routed_scaling_factor=config.routed_scaling_factor,
+        e_score_correction_bias=mlp.expert_bias,
+    )
+    experts = mlp.experts
+    w13 = torch.cat([experts.w1, experts.w3], dim=1)
+    w13_scale = torch.cat([experts.w1_scale_inv, experts.w3_scale_inv], dim=1)
+    num_experts, intermediate, hidden = experts.w1.shape
+    key = (id(experts), x.device)
+    if key not in _MOE_KERNELS:
+        _MOE_KERNELS[key] = _triton_experts(num_experts, config.num_experts_per_tok, hidden, intermediate,
+                                            config.swiglu_limit, w13_scale, experts.w2_scale_inv, x.device)  # fmt: skip
+    kernel, activation = _MOE_KERNELS[key]
+    routed = kernel.apply(
+        x.contiguous(), w13, experts.w2, weights, ids, activation=activation, global_num_experts=num_experts,
+        expert_map=None, apply_router_weight_on_input=False,
+    )  # fmt: skip
+    return shared_expert_mlp(mlp.shared_expert, x, config.swiglu_limit) + routed
+
+
 def _mlp(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     if hasattr(layer.mlp, "gate_proj"):
         return dense_mlp(layer.mlp, x)
-    raise NotImplementedError("vLLM-aligned GLM-5.3-Flash: the MoE (TritonExperts modular kernel) is not in yet")
+    return moe(layer.mlp, x, ctx.config)
 
 
 def aligned_layer(layer: Any, streams: torch.Tensor, config: Any, ctx: Any) -> torch.Tensor:
