@@ -160,10 +160,91 @@ def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
     return ops.linear_kernel(core.reshape(tokens, -1), attn.o_proj.weight)
 
 
+SPARSE_TOPK_BLOCK = 128  # sparse MLA tiles the top-k index buffer in 128 columns
+
+
+def topk_buffer_width(config: Any) -> int:
+    """vLLM's top-k index buffer width: ``index_topk`` plus the incomplete pool tail, rounded up to 128."""
+    width = config.index_topk + (config.index_kpool - 1 if config.index_kpool > 1 else 0)
+    return -(-width // SPARSE_TOPK_BLOCK) * SPARSE_TOPK_BLOCK
+
+
+def causal_topk(positions: torch.Tensor, width: int) -> torch.Tensor:
+    """vLLM's short-prefill top-k: every earlier token of the request, ``-1`` past the query's position."""
+    columns = torch.arange(width, device=positions.device, dtype=torch.int32)
+    rows = columns.expand(positions.shape[0], width).clone()
+    rows[columns[None, :] > positions.to(torch.int32)[:, None]] = -1
+    return rows
+
+
+def mla_kv_up_weights(kv_b_proj: Any, config: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """vLLM's absorbed MLA weights from ``kv_b_proj``: ``W_UK_T [N, P, L]`` and ``W_UV [N, L, V]``."""
+    heads, latent = config.num_attention_heads, config.kv_lora_rank
+    nope, value = config.qk_nope_head_dim, config.v_head_dim
+    weight = kv_b_proj.weight.t().reshape(latent, heads, nope + value)
+    w_uk, w_uv = weight.split([nope, value], dim=-1)
+    return w_uk.permute(1, 2, 0).contiguous(), w_uv.transpose(0, 1).contiguous()
+
+
+def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlens: torch.Tensor,
+                  config: Any) -> torch.Tensor:  # fmt: skip
+    """vLLM's ``Glm5NextMLAAttention`` (sparse MLA, NoPE) on prompts no longer than ``index_topk``.
+
+    Such prompts take vLLM's short-prefill path: every token attends to all earlier tokens of its request, with no
+    indexer scoring. The merged ``[q_a; kv_a]`` projection, the fused q/kv RMSNorm, ``q_b_proj``, the query absorbed
+    into the latent space by ``W_UK_T``, FA3 sparse attention over one-token pages of the ``kv_c`` rows (QV form,
+    zero 64-wide rope query), the value up-projection by ``W_UV`` and ``o_proj``.
+    """
+    from vllm.models.common.ops import fused_q_kv_rmsnorm
+    from vllm.v1.attention.backends.mla import flashattn_mla_sparse
+
+    if config.qk_rope_head_dim:
+        raise NotImplementedError("vLLM-aligned sparse MLA covers the NoPE configuration (qk_rope_head_dim == 0)")
+    starts, lengths = cu_seqlens[:-1], cu_seqlens[1:] - cu_seqlens[:-1]
+    if int(lengths.max()) > config.index_topk:
+        raise NotImplementedError("vLLM-aligned sparse MLA: prompts longer than index_topk need the indexer (not in)")
+    heads, latent = config.num_attention_heads, config.kv_lora_rank
+    nope, value = config.qk_nope_head_dim, config.v_head_dim
+    tokens = x.shape[0]
+
+    qkv_lora = ops.linear_kernel(x, torch.cat([attn.q_a_proj.weight, attn.kv_a_proj_with_mqa.weight]))
+    q_c, kv_c = qkv_lora.split([config.q_lora_rank, latent], dim=-1)
+    q_c, kv_c = fused_q_kv_rmsnorm(q_c, kv_c, attn.q_a_layernorm.weight, attn.kv_a_layernorm.weight,
+                                   attn.q_a_layernorm.variance_epsilon)  # fmt: skip
+    q = ops.linear_kernel(q_c, attn.q_b_proj.weight).view(tokens, heads, nope)
+
+    w_uk_t, w_uv = mla_kv_up_weights(attn.kv_b_proj, config)
+    q_latent = q.new_empty((tokens, heads, latent))
+    torch.bmm(q.transpose(0, 1), w_uk_t, out=q_latent.transpose(0, 1))
+
+    seq_of_token = torch.repeat_interleave(torch.arange(starts.numel(), device=x.device), lengths)
+    topk = causal_topk(positions, topk_buffer_width(config))
+    rows = torch.where(topk >= 0, topk + starts.to(torch.int32)[seq_of_token, None], topk)
+    valid = (topk >= 0).sum(-1).to(torch.int32)
+    v_cache = kv_c.contiguous().unsqueeze(1).unsqueeze(1)
+    out = flashattn_mla_sparse.flash_attn_varlen_func(
+        q=q.new_zeros((tokens, heads, 64)),
+        k=v_cache[..., :64],
+        v=v_cache,
+        q_v=q_latent,
+        max_seqlen_q=1,
+        cu_seqlens_q=torch.arange(tokens + 1, dtype=torch.int32, device=x.device),
+        max_seqlen_k=rows.shape[1],
+        seqused_k=valid,
+        block_table=rows,
+        softmax_scale=attn.scaling,
+        causal=True,
+        fa_version=3,
+    )
+    up = out.new_empty((tokens, heads, value))
+    torch.bmm(out.view(-1, heads, latent).transpose(0, 1), w_uv, out=up.transpose(0, 1))
+    return ops.linear_kernel(up.view(tokens, heads * value), attn.o_proj.weight)
+
+
 def _mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     if layer.block_type == "linear_attention":
         return kda_prefill(layer.self_attn, x, ctx.cu_seqlens, ctx.config)
-    raise NotImplementedError("vLLM-aligned GLM-5.3-Flash: the sparse indexer and sparse MLA are not in yet")
+    return mla_attention(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config)
 
 
 FP8_BLOCK = 128

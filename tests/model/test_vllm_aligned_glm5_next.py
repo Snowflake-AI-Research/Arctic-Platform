@@ -74,3 +74,28 @@ def test_merged_fp8_stacks_weights_and_block_scales():
     assert scale[:, 0].tolist() == [1.0, 1.0, 2.0]
     with pytest.raises(ValueError):
         _merged_fp8(linear(100, 128, 1.0), linear(128, 128, 2.0))
+
+
+def test_causal_topk_and_buffer_width_follow_vllm():
+    import types
+
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import causal_topk
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import topk_buffer_width
+
+    assert topk_buffer_width(types.SimpleNamespace(index_topk=2048, index_kpool=4)) == 2176
+    rows = causal_topk(torch.tensor([0, 2]), 4)
+    assert rows.tolist() == [[0, -1, -1, -1], [0, 1, 2, -1]]
+
+
+def test_mla_kv_up_weights_split_kv_b_proj_per_head():
+    import types
+
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import mla_kv_up_weights
+
+    config = types.SimpleNamespace(num_attention_heads=2, kv_lora_rank=3, qk_nope_head_dim=4, v_head_dim=5)
+    weight = torch.arange(2 * 9 * 3, dtype=torch.float32).view(2 * 9, 3)
+    w_uk_t, w_uv = mla_kv_up_weights(types.SimpleNamespace(weight=weight), config)
+    assert w_uk_t.shape == (2, 4, 3) and w_uv.shape == (2, 3, 5)
+    per_head = weight.view(2, 9, 3)
+    assert torch.equal(w_uk_t[1], per_head[1, :4])
+    assert torch.equal(w_uv[1], per_head[1, 4:].t())
