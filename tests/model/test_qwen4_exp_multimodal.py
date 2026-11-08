@@ -332,13 +332,6 @@ def test_lora_on_language_projections_leaves_the_vision_tower_frozen():
     assert not any(parameter.requires_grad for parameter in vision.parameters())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "needs #3916 port: LoRA on the language model only; a broad target (all-linear) must not put adapters "
-        "on the vision tower, which stays frozen"
-    ),
-)
 def test_all_linear_lora_skips_the_vision_tower():
     model = _lora(_model(), "all-linear")
 
