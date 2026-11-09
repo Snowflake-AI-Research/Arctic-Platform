@@ -22,8 +22,9 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from arctic_platform.inference.vllm.plugin import arctic_inference_plugin
 
 
+@pytest.mark.parametrize("positions_factor", [1, 4])
 @pytest.mark.parametrize("factor", [1.5, 2.0])
-def test_mrope_yarn_matches_transformers(monkeypatch, factor):
+def test_mrope_yarn_matches_transformers(monkeypatch, factor, positions_factor):
     monkeypatch.setenv("ARCTIC_INFERENCE_ENABLED", "0")
     arctic_inference_plugin()
     rope_parameters = dict(
@@ -49,10 +50,11 @@ def test_mrope_yarn_matches_transformers(monkeypatch, factor):
             max_position=int(262144 * factor),
             rope_parameters=dict(rope_parameters),
             dtype=torch.float32,
+            mrope_positions_factor=positions_factor,
         )
     positions = torch.cat((torch.arange(4096), torch.arange(262140, 262150)))
     freqs = torch.outer(positions.float(), inv_freq)
     expected = torch.cat((freqs.cos(), freqs.sin()), dim=-1) * attention_scaling
-    assert rope.cos_sin_cache.shape[0] == int(262144 * 4 * factor)
+    assert rope.cos_sin_cache.shape[0] == int(262144 * positions_factor * factor)
     # Both implementations calculate the same float32 frequencies and cache.
     torch.testing.assert_close(rope.cos_sin_cache[positions], expected, rtol=0, atol=0)

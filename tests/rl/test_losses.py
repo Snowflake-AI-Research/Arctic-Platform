@@ -35,6 +35,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from arctic_platform.common.packing import pack_microbatch
+from arctic_platform.common.packing import pad_packed_microbatch
+from arctic_platform.common.packing import select_rows
+from arctic_platform.common.packing import token_shard
+from arctic_platform.common.packing import window_cu_seqlens
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.utils.batch import combine_metric_shards
@@ -62,7 +67,9 @@ from arctic_platform.rl.processors.grpo import _resolve_proximal_logp
 from arctic_platform.rl.processors.grpo import _sampler_kl
 from arctic_platform.rl.processors.grpo import compute_prox_logp_approximations
 from arctic_platform.rl.processors.grpo import grpo_loss
+from arctic_platform.rl.processors.packing import pack_sequences
 from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import set_seed
 from arctic_platform.testing_utils import torch_assert_close
 
 
@@ -1321,6 +1328,73 @@ class TestMigratedGrpo(TestCasePlus):
                 torch_assert_close(runs[0.25][0] - runs[0.0][0], torch.full((1, 4), -0.25 / 4))
                 self.assertEqual(runs[0.25][1]["sampler_kl_token_count"], 4.0)
 
+    def test_sampler_kl_per_sequence_weights_train_like_their_per_token_expansion(self):
+        # Rows of 7, 3 and 6 real tokens, one weight per row, through every layout a worker's loss receives.
+        set_seed(0)
+        valid = torch.arange(8) < torch.tensor([[7], [3], [6]])
+        rows = {
+            "input_ids": torch.randint(1, 100, (3, 8)),
+            "position_ids": torch.arange(8).expand(3, 8),
+            "logprobs": -torch.rand((3, 8)) - 0.1,
+            "old_log_probs_shifted": -torch.rand((3, 8)) - 0.1,
+            "advantages": torch.randn((3, 8)),
+            "loss_mask": valid & (torch.arange(8) > 0),
+        }
+        row_weights = torch.tensor([0.5, 0.0, 2.0])
+        config = {"sampler_kl_coef": 0.25, "sampler_kl_type": "k3"}
+
+        def squeezed(call):
+            return {
+                k: v.squeeze(0) if torch.is_tensor(v) and v.ndim == 2 and v.shape[0] == 1 else v
+                for k, v in call.items()
+            }
+
+        def model_calls(weights):
+            batch = {**rows, "sampler_kl_weights": weights}
+            context = {k: v for k, v in batch.items() if k not in ("input_ids", "position_ids")}
+            resolve_loss("ap_grpo").batching_callback(
+                {
+                    "input_ids": rows["input_ids"],
+                    "processing": {"loss_fn": "ap_grpo", "config": config},
+                    "context": context,
+                }
+            )
+            yield "padded", batch
+            packed = pack_sequences({**batch, "attention_mask": valid})
+            packed.pop("_pack_meta")
+            yield "pack_sequences", squeezed(packed)
+            # Dispatch: one DP shard / microbatch holding rows 2 and 0, packed, then cut into SP windows; at sp=8 a
+            # window holds 2 tokens, as many as the shard has rows.
+            index = torch.tensor([2, 0])
+            shard = select_rows(
+                {"input_ids": rows["input_ids"], "position_ids": rows["position_ids"], "context": context}, index, 3
+            )
+            shard["attention_mask"] = valid.index_select(0, index)
+            for sp in (1, 2, 4, 8):
+                call, metadata = pad_packed_microbatch(*pack_microbatch(shard), sp)
+                for rank in range(sp):
+                    window = token_shard(call, metadata, sp, rank)
+                    flat = {"input_ids": window["input_ids"], **window["context"]}
+                    yield f"sp={sp} rank={rank}", {
+                        **squeezed(flat),
+                        "cu_seqlens": window_cu_seqlens(metadata, sp, rank),
+                    }
+
+        def trained(call):
+            call = dict(call)
+            logprobs = call.pop("logprobs").clone().requires_grad_()
+            resolve_loss("ap_grpo").validation_callback(call, config)
+            loss, _ = grpo_loss({"logprobs": logprobs}, call, {}, config, "cpu")
+            loss.backward()
+            return loss.detach(), logprobs.grad
+
+        per_token = row_weights[:, None].expand(3, 8).contiguous()
+        for (name, per_sequence_call), (_, per_token_call) in zip(model_calls(row_weights), model_calls(per_token)):
+            with self.subTest(layout=name):
+                expected, actual = trained(per_token_call), trained(per_sequence_call)
+                torch_assert_close(actual[0], expected[0], rtol=0, atol=0)
+                torch_assert_close(actual[1], expected[1], rtol=0, atol=0)
+
     def test_sampler_kl_estimators_give_the_kl_gradient_in_expectation_and_cap_their_tails(self):
         # Exact expectation over a categorical sampler q: E_q[d k(log p - log q) / dz] vs d KL(q || p) / dz = p - q.
         q = torch.tensor([0.5, 0.3, 0.15, 0.05])
@@ -1482,3 +1556,82 @@ class TestMigratedGrpo(TestCasePlus):
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(metrics["ratio_trainable_token_count"], 1.0)
         self.assertEqual(metrics["echo_contract_version"], 1.0)
+
+
+class TestWeightedLogprobSum(TestCasePlus):
+    def test_sum_of_weighted_logprobs(self):
+        from arctic_platform.rl.processors.weighted_logprob import weighted_logprob_sum
+
+        logprobs = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        weights = torch.tensor([[1.0, 0.5, 0.0], [0.0, 1.0, 2.0]])
+        loss, metrics = weighted_logprob_sum(
+            {"logprobs": logprobs},
+            {"logprob_weights_shifted": weights},
+            {},
+            {},
+            "cpu",
+        )
+        self.assertAlmostEqual(loss.item(), (1.0 + 1.0 + 0.0 + 0.0 + 5.0 + 12.0), places=5)
+        self.assertAlmostEqual(metrics["loss"].item(), loss.item(), places=5)
+
+    def test_loss_mask_zeros_weights(self):
+        from arctic_platform.rl.processors.weighted_logprob import weighted_logprob_sum
+
+        logprobs = torch.ones(1, 3)
+        weights = torch.ones(1, 3)
+        mask = torch.tensor([[1.0, 0.0, 1.0]])
+        loss, _ = weighted_logprob_sum(
+            {"logprobs": logprobs},
+            {"logprob_weights_shifted": weights, "loss_mask": mask},
+            {},
+            {},
+            "cpu",
+        )
+        self.assertAlmostEqual(loss.item(), 2.0, places=5)
+
+    def test_two_microbatches_sum_to_the_single_window(self):
+        from types import SimpleNamespace
+
+        from arctic_platform.rl.processors.pipeline import run_pipeline
+        from arctic_platform.rl.processors.weighted_logprob import weighted_logprob_sum
+
+        self.assertIsNotNone(getattr(weighted_logprob_sum, PACKED_LOSS_REDUCTION_ATTR))
+
+        batch = {
+            "input_ids": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]),
+            "attention_mask": torch.ones(2, 4, dtype=torch.long),
+            "logprob_weights_shifted": torch.tensor([[1.0, 0.5, 0.0, 2.0], [1.0, 1.0, 0.0, 0.5]]),
+        }
+        meta = {"pad_token_id": 0}
+        processing = {"loss_fn": "weighted_logprob_sum", "post": []}
+
+        class Engine:
+            def __init__(self):
+                self.backward_losses = []
+                self.global_rank = 0
+
+            def train(self):
+                pass
+
+            def eval(self):
+                pass
+
+            def __call__(self, *args, **kwargs):
+                ids = kwargs["input_ids"]
+                logprobs = -ids.float()
+                return SimpleNamespace(logprobs=logprobs)
+
+            def backward(self, loss, scale_wrt_gas=True):
+                self.backward_losses.append((float(loss.detach()), scale_wrt_gas))
+
+        one = run_pipeline(
+            Engine(), (), batch, meta, processing, "cpu", backward=True, pack=True, max_tokens_per_mb=16
+        )
+        split_engine = Engine()
+        two = run_pipeline(
+            split_engine, (), batch, meta, processing, "cpu", backward=True, pack=True, max_tokens_per_mb=4
+        )
+        self.assertGreater(len(split_engine.backward_losses), 1)
+        self.assertAlmostEqual(one["avg_loss"], two["avg_loss"], places=5)
+        self.assertAlmostEqual(sum(loss for loss, _ in split_engine.backward_losses), one["avg_loss"], places=5)
+        self.assertTrue(all(scale is False for _, scale in split_engine.backward_losses))

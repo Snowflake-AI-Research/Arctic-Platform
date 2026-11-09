@@ -173,4 +173,4 @@ Offline
    :caption: Known Issues
    :hidden:
 
-   dflash2-nan-fix
+   hybrid-state-fixes

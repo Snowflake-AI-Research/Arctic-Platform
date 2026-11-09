@@ -243,6 +243,50 @@ class TestOpMapping:
         assert _last(client).op == "wake-training"
 
 
+class TestSyncWeightsChecksum:
+    """``sync_weights``'s ``checksum_match`` must be acted on, not only logged (see ``ArcticRLRayServer.weight_sync``)."""
+
+    class _MismatchTransport(FakeTransport):
+        """A transport whose weight-sync op reports a failed checksum; every other op is a plain no-op."""
+
+        def call(self, request: Request) -> dict:
+            self.calls.append(request)
+            if request.op == "operation" and request.body.get("operation_type") == "weight-sync":
+                return {
+                    "sent_l2_sq": 32.5,
+                    "recv_l2_sq": {"sampling replica 0 rank 0": 27.5},
+                    "checksum_rtol": 1e-9,
+                    "checksum_match": False,
+                    "checksum_error": "received {'sampling replica 0 rank 0': 27.5}, sent 32.5",
+                }
+            return {"results": ["ok"], "loss": 0.0, "request_id": "req", "state": "running", "events": [{}]}
+
+        async def acall(self, request: Request) -> dict:
+            return self.call(request)
+
+    def _build_mismatch(self, monkeypatch, cls):
+        monkeypatch.setattr(base_module, "make_transport", self._MismatchTransport)
+        return cls(ArcticClientConfig(model_name="m", training_gpus=1, sampling_gpus=1, log_prob_gpus=1))
+
+    @pytest.mark.parametrize("cls", [AsyncArcticRLClient, ArcticRLClient], ids=["async", "sync"])
+    def test_sync_weights_raises_on_checksum_mismatch(self, monkeypatch, cls):
+        client = self._build_mismatch(monkeypatch, cls)
+        with pytest.raises(RuntimeError, match="did not prove delivery"):
+            _call(client, "sync_weights")
+
+    @pytest.mark.parametrize("cls", [AsyncArcticRLClient, ArcticRLClient], ids=["async", "sync"])
+    def test_sync_weights_strict_checksum_false_returns_the_dict_instead(self, monkeypatch, cls):
+        client = self._build_mismatch(monkeypatch, cls)
+        out = _call(client, "sync_weights", strict_checksum=False)
+        assert out["checksum_match"] is False
+        assert out["checksum_error"]
+
+    def test_sync_weights_missing_checksum_does_not_raise(self, client):
+        """A transport that never computed a checksum (the default ``FakeTransport``) is not a reported failure."""
+        out = _call(client, "sync_weights")
+        assert "checksum_match" not in out
+
+
 class TestLifecycle:
     def test_reconnect_config_copies_job_ids(self, client):
         """reconnect_config bakes the live job ids into a fresh config."""
@@ -635,6 +679,54 @@ class TestUnifiedConfigDoesNotReadEnv:
         assert cfg.backend.type == "onprem"
 
 
+class TestCortexModelOptions:
+    def test_liger_merges_with_forwarded_options_without_mutating_input(self):
+        cfg = ArcticClientConfig(
+            model_name="model",
+            training_gpus=1,
+            training={"ds_worker_config": {"use_liger": True, "model_options": {"moe": {"comm_token_chunk": 1024}}}},
+        )
+        before = cfg.model_dump()
+        training = cfg._cortex_training_sub_job()["training_config"]
+        assert training["model_options"] == {"moe": {"comm_token_chunk": 1024}, "liger": True}
+        training["model_options"]["moe"]["comm_token_chunk"] = 2048
+        assert cfg.model_dump() == before
+
+    def test_training_options_use_the_supported_server_channel(self):
+        from arctic_platform.client import CortexConfig
+
+        options = {
+            "moe": {"comm_token_chunk": 1024},
+            "lm_head": {"token_chunk_size": 1024, "fp32": False, "cross_entropy": False},
+        }
+        cfg = ArcticClientConfig(
+            model_name="model",
+            max_seq_len=262144,
+            training_gpus=8,
+            sampling_gpus=8,
+            backend=CortexConfig(base_url="http://mock"),
+            training={"ds_worker_config": {"ep_size": 8, "model_options": options}},
+        )
+        before = cfg.model_dump()
+        sub_jobs = cfg.to_cortex()
+        assert [sub["job_type"] for sub in sub_jobs] == ["sampling", "training"]
+        assert sub_jobs[0]["inference_config"]["n_gpus"] == 8
+        training = sub_jobs[1]["training_config"]
+        assert training["model_options"] == options
+        assert training["max_seq_len"] == 262144
+        assert training["ep_size"] == 8
+        assert "prime_rl" not in training
+        assert cfg.model_dump() == before
+        training["model_options"]["moe"]["comm_token_chunk"] = 2048
+        assert cfg.model_dump() == before
+
+    def test_absent_options_do_not_add_a_transport_block(self):
+        cfg = ArcticClientConfig(model_name="model", training_gpus=1)
+        training = cfg._cortex_training_sub_job()["training_config"]
+        assert "model_options" not in training
+        assert "prime_rl" not in training
+
+
 class TestCortexNoopOffload:
     """``to_cortex`` drops ``offload_*: {device: none}`` from the forwarded
     ds_config. Cortex builds the optimizer from the lifted typed ``optimizer``
@@ -673,6 +765,21 @@ class TestCortexNoopOffload:
 
     def test_leaves_untouched_when_nothing_to_drop(self):
         assert self._zero_block({"zero_optimization": {"stage": 2}}) == {"stage": 2}
+
+
+class TestCortexSamplingSubJob:
+    def test_forwards_tensor_parallel_size(self):
+        """Neutrino's sampler reads TP from vllm_config and defaults to 1; n_gpus does not set it."""
+        from arctic_platform.client import CortexConfig
+
+        cfg = ArcticClientConfig(
+            model_name="m",
+            sampling_gpus=16,
+            backend=CortexConfig(base_url="https://x", pat="y"),
+            sampling={"vllm": {"tensor_parallel_size": 16}},
+        )
+        (sampling,) = [sub for sub in cfg.to_cortex() if "inference_config" in sub]
+        assert sampling["inference_config"]["vllm_config"]["tensor_parallel_size"] == 16
 
 
 class TestCortexBackendOnlyConstruction:
@@ -809,6 +916,30 @@ class TestCortexSharedHelper:
         assert out["processing"]["loss_fn"] == "grpo"
         assert "old_log_probs" not in out["kwargs"]
         assert "old_log_probs_shifted" not in out["context"]
+
+    def test_balance_stamp_rides_the_wire(self):
+        """True and False both reach context. A missing switch stays missing."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.zeros((2, 10), dtype=torch.int64)
+        attn = torch.ones((2, 10), dtype=torch.int64)
+        batch = {
+            "input_ids": ids,
+            "attention_mask": attn,
+            "advantages": torch.zeros((2, 10)),
+            "response_mask": torch.ones((2, 10), dtype=torch.int64),
+        }
+        opted_out = to_cortex_fwd_bwd_payload(
+            {"batch": batch, "meta": {"balance_batch": False, "load_balancer": True}}
+        )
+        assert opted_out["context"]["balance_batch"] is False
+        assert "load_balancer" not in opted_out["context"]
+        opted_in = to_cortex_fwd_bwd_payload({"batch": batch, "meta": {"balance_batch": True}})
+        assert opted_in["context"]["balance_batch"] is True
+        absent = to_cortex_fwd_bwd_payload({"batch": batch, "meta": {}})
+        assert "balance_batch" not in absent["context"]
 
     def test_left_pads_are_rewritten_to_trailing_pads(self):
         """SkyRL left-pads to the batch's longest sequence; Cortex's packer
@@ -986,6 +1117,64 @@ class TestCortexSharedHelper:
                 },
             )
 
+    def test_non_zorro_forward_left_aligns_leading_pads(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_payload
+
+        ids = torch.tensor([[0, 0, 1, 2], [5, 6, 7, 8]])
+        attn = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
+        out = to_cortex_fwd_payload(
+            {
+                "batch": {"input_ids": ids, "attention_mask": attn, "prompt_group_ids": torch.tensor([0, 0])},
+                "meta": {"zorro_train_enable": False, "balance_batch": True},
+            }
+        )
+        assert out["kwargs"]["input_ids"][0].tolist() == [1, 2, 0, 0]
+        assert out["kwargs"]["attention_mask"][0].tolist() == [1, 1, 0, 0]
+        assert out["context"]["balance_batch"] is False
+        assert "prompt_group_ids" not in out["context"]
+
+    def test_zorro_fwd_bwd_keeps_client_layout_and_names_prompt_groups(self):
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.tensor([[0, 5, 6, 7, 8], [0, 1, 2, 3, 4]])
+        attn = torch.tensor([[0, 1, 1, 1, 1], [0, 1, 1, 1, 1]])
+        prompts = torch.tensor([[0, 5, 6], [0, 1, 2]])
+        old = torch.arange(10, dtype=torch.float32).reshape(2, 5)
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": torch.zeros((2, 5)),
+                    "response_mask": torch.tensor([[0, 0, 0, 1, 1], [0, 0, 0, 1, 1]]),
+                    "prompts": prompts,
+                    "old_log_probs": old,
+                },
+                "meta": {
+                    "zorro_train_enable": True,
+                    "max_prompt_len": 3,
+                    "balance_batch": True,
+                    "temperature": 0.7,
+                    "calculate_entropy": True,
+                },
+            }
+        )
+        assert torch.equal(out["kwargs"]["input_ids"], ids)
+        assert torch.equal(out["kwargs"]["attention_mask"], attn)
+        assert torch.equal(out["kwargs"]["prompts"], prompts)
+        assert torch.equal(out["kwargs"]["response_mask"], torch.tensor([[0, 0, 0, 1, 1], [0, 0, 0, 1, 1]]))
+        assert "old_log_probs" not in out["kwargs"]
+        assert torch.equal(out["context"]["old_log_probs_shifted"], old)
+        assert out["context"]["zorro_train_enable"] is True
+        assert out["context"]["max_prompt_len"] == 3
+        assert out["context"]["temperature"] == 0.7
+        assert out["context"]["calculate_entropy"] is True
+        assert out["context"]["prompt_group_ids"].tolist() == [0, 1]
+
 
 class TestCortexShimSaveWeightsFailsLoud:
     """``save_weights`` raises ``NotImplementedError`` — Cortex sub-jobs don't
@@ -1012,28 +1201,33 @@ class TestCortexShimSaveWeightsFailsLoud:
             asyncio.run(shim.save_weights("/tmp/w"))
 
 
-class TestCortexShimRefusesReferenceLogProbs:
-    """``fwd_no_grad`` zero-fills the policy snapshot but must refuse a
-    reference-model request.
+class TestCortexShimForwardsLikeOnPrem:
+    """``fwd_no_grad`` sends the on-prem payload and returns its logprobs.
 
-    Zeros are harmless as ``old_log_probs`` (the lowering drops them and the
-    server re-derives π_old), but as π_ref they would turn a KL term into a
-    function of π_new alone — a wrong gradient with no error.
+    A reference-model request is still refused: zeros there would turn a KL
+    term into a function of the live policy.
     """
 
     @staticmethod
-    def _shim():
+    def _shim(client=None):
         from arctic_platform.integrations._cortex_dispatch import _CortexClientShim
 
         shim = _CortexClientShim.__new__(_CortexClientShim)
-        shim._legacy_config = shim._unified_config = shim._client = None
+        shim._legacy_config = shim._unified_config = None
+        shim._client = client
         return shim
 
     @staticmethod
     def _batch():
         import torch
 
-        return {"batch": {"input_ids": torch.zeros((2, 5), dtype=torch.long)}}
+        return {
+            "batch": {
+                "input_ids": torch.zeros((2, 5), dtype=torch.long),
+                "attention_mask": torch.ones((2, 5), dtype=torch.long),
+            },
+            "meta": {"pad_token_id": 0, "zorro_train_enable": False},
+        }
 
     def test_reference_model_request_raises(self):
         import asyncio
@@ -1041,10 +1235,214 @@ class TestCortexShimRefusesReferenceLogProbs:
         with pytest.raises(NotImplementedError, match="reference-model log-probs"):
             asyncio.run(self._shim().fwd_no_grad(self._batch(), reference_model=True))
 
-    def test_policy_snapshot_still_zero_fills(self):
-        """The path SkyRL actually uses must keep working."""
+    @pytest.mark.parametrize(
+        "processing, meta_extra, match",
+        [
+            ({"post": ["compute_entropy_and_logprobs"], "loss_fn": None}, {}, "support post="),
+            ({"post": ["apply_temperature", "compute_logprobs"]}, {}, "support post="),
+            ({"post": ["compute_logprobs"], "loss_fn": "grpo"}, {}, "take no loss"),
+            ({"post": ["compute_logprobs"], "config": {"clip": 0.2}}, {}, "take no loss"),
+            ({"post": ["compute_logprobs"], "extra": 1}, {}, "unsupported keys"),
+            (None, {"calculate_entropy": True}, "do not return entropy"),
+        ],
+    )
+    def test_unsupported_forward_requests_are_refused_before_sending(self, processing, meta_extra, match):
         import asyncio
 
-        out = asyncio.run(self._shim().fwd_no_grad(self._batch(), reference_model=False))
-        assert out["batch"]["logprobs"].shape == (2, 5)
-        assert out["batch"]["logprobs"].abs().sum() == 0
+        class Client:
+            async def fwd_no_grad(self, payload):
+                raise AssertionError("a refused request must not reach the server")
+
+        batch = self._batch()
+        batch["meta"].update(meta_extra)
+        if processing is not None:
+            batch["processing"] = processing
+        with pytest.raises(ValueError, match=match):
+            asyncio.run(self._shim(Client()).fwd_no_grad(batch, reference_model=False))
+
+    def test_compute_logprobs_and_no_processing_are_sent_as_the_zone_registers_them(self):
+        import asyncio
+
+        import torch
+
+        sent = []
+
+        class Client:
+            async def fwd_no_grad(self, payload):
+                sent.append(payload)
+                return {"logprobs": torch.zeros((2, 5))}
+
+        for processing in (None, {}, {"post": ["compute_logprobs"], "loss_fn": None}):
+            batch = self._batch()
+            if processing is not None:
+                batch["processing"] = processing
+            asyncio.run(self._shim(Client()).fwd_no_grad(batch, reference_model=False))
+        assert [payload["processing"] for payload in sent] == [{"post": ["compute_logprobs"], "loss_fn": None}] * 3
+
+    def test_zorro_forward_sends_the_client_layout(self):
+        import asyncio
+
+        import torch
+
+        seen = {}
+
+        class Client:
+            async def fwd_no_grad(self, payload):
+                seen["payload"] = payload
+                return {"logprobs": torch.arange(8, dtype=torch.float32).reshape(2, 4)}
+
+        ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+        batch = {
+            "batch": {
+                "input_ids": ids,
+                "attention_mask": torch.ones(2, 4, dtype=torch.long),
+                "prompts": ids[:, :2],
+                "position_ids": torch.arange(4).repeat(2, 1),
+            },
+            "meta": {
+                "zorro_train_enable": True,
+                "max_prompt_len": 2,
+                "max_response_len": 2,
+                "pad_token_id": 151643,
+            },
+            "processing": {"post": ["compute_logprobs"], "loss_fn": None},
+        }
+        out = asyncio.run(self._shim(Client()).fwd_no_grad(batch, reference_model=False))
+        sent = seen["payload"]
+        assert torch.equal(sent["kwargs"]["prompts"], ids[:, :2])
+        assert sent["context"]["zorro_train_enable"] is True
+        assert sent["context"]["max_prompt_len"] == 2
+        assert sent["context"]["pad_token_id"] == 151643
+        assert sent["processing"] == {"post": ["compute_logprobs"], "loss_fn": None}
+        assert torch.equal(out["batch"]["logprobs"], out["batch"]["log_probs"])
+        assert out["batch"]["logprobs"].shape == (2, 4)
+
+    def test_zorro_forward_round_trip_keeps_step_zero_ratio_one(self):
+        """ZoRRo's token-scored frame must reach Cortex GRPO without a shift.
+
+        SkyRL calls ``_align_predict_next_log_probs`` only for non-ZoRRo
+        forwards. Cortex then renames ZoRRo's plain ``old_log_probs`` to the
+        generic GRPO processor's ``old_log_probs_shifted`` context key. Exercise
+        that whole contract: shifting this snapshot would make the first
+        response token's step-0 PPO ratio differ from one.
+        """
+        import asyncio
+
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        live_logprobs = torch.tensor([[0.0, 0.0, -0.3, -0.7, -1.1]])
+
+        class Client:
+            async def fwd_no_grad(self, payload):
+                assert payload["context"]["zorro_train_enable"] is True
+                return {"logprobs": live_logprobs.clone()}
+
+        ids = torch.tensor([[0, 10, 11, 20, 21]])
+        response_mask = torch.tensor([[0, 0, 0, 1, 1]], dtype=torch.bool)
+        batch = {
+            "batch": {
+                "input_ids": ids,
+                "attention_mask": torch.tensor([[0, 1, 1, 1, 1]]),
+                "prompts": ids[:, :3],
+                "response_mask": response_mask,
+                "advantages": response_mask.to(torch.float32),
+            },
+            "meta": {
+                "zorro_train_enable": True,
+                "max_prompt_len": 3,
+                "max_response_len": 2,
+                "pad_token_id": 0,
+            },
+            "processing": {"post": ["compute_logprobs"], "loss_fn": None},
+        }
+
+        forward = asyncio.run(self._shim(Client()).fwd_no_grad(batch, reference_model=False))
+        # This is the ZoRRo branch at SkyRL's alignment call site: unlike a
+        # stock predict-next forward, the token-scored output is already in the
+        # frame consumed by the ZoRRo update.
+        old_log_probs = forward["batch"]["logprobs"]
+        update_batch = {
+            "batch": {**batch["batch"], "old_log_probs": old_log_probs},
+            "meta": batch["meta"],
+        }
+        payload = to_cortex_fwd_bwd_payload(update_batch)
+        sent_old = payload["context"]["old_log_probs_shifted"]
+
+        ratio = torch.exp(live_logprobs - sent_old)
+        assert torch.equal(ratio[response_mask], torch.ones(2))
+
+    def test_forward_returns_the_server_logprobs_on_the_caller_columns(self):
+        import asyncio
+
+        import torch
+
+        class Client:
+            async def fwd_no_grad(self, payload):
+                sent = payload["kwargs"]["input_ids"]
+                # Distinct value per aligned column, including the padding tail.
+                return {"logprobs": torch.arange(1, sent.numel() + 1, dtype=torch.float32).reshape_as(sent)}
+
+        ids = torch.tensor([[0, 0, 1, 2], [5, 6, 7, 8]])
+        attn = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
+        batch = {
+            "batch": {"input_ids": ids, "attention_mask": attn},
+            "meta": {"pad_token_id": 0, "zorro_train_enable": False},
+        }
+        out = asyncio.run(self._shim(Client()).fwd_no_grad(batch, reference_model=False))
+        # The aligned row is [1, 2, 0, 0], so the server's [1, 2, 3, 4] puts
+        # 1 and 2 on the caller's real columns and 0 on its padding.
+        assert out["batch"]["logprobs"][0].tolist() == [0, 0, 1, 2]
+        assert out["batch"]["logprobs"][1].tolist() == [5, 6, 7, 8]
+        assert torch.equal(out["batch"]["logprobs"], out["batch"]["log_probs"])
+
+    def test_forward_returns_predict_next_logprobs_on_the_caller_columns(self):
+        import asyncio
+
+        import torch
+
+        class Client:
+            async def fwd_no_grad(self, payload):
+                sent = payload["kwargs"]["input_ids"]
+                # Column t of a compute_logprobs response scores token t + 1.
+                return {"logprobs": torch.roll(sent, -1, dims=1).to(torch.float32)}
+
+        ids = torch.tensor([[0, 0, 1, 2], [5, 6, 7, 8]])
+        attn = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
+        batch = {
+            "batch": {"input_ids": ids, "attention_mask": attn},
+            "meta": {"pad_token_id": 0, "zorro_train_enable": False},
+        }
+        out = asyncio.run(self._shim(Client()).fwd_no_grad(batch, reference_model=False))
+        logprobs = out["batch"]["logprobs"]
+        # Every real column except the last scores the next caller token.
+        # The last real column is the roll wrap, and padding is 0.
+        assert logprobs[0].tolist() == [0, 0, 2, 0]
+        assert logprobs[1].tolist() == [6, 7, 8, 5]
+
+    def test_flat_zorro_forward_keeps_the_server_columns(self):
+        import asyncio
+
+        import torch
+
+        class Client:
+            async def fwd_no_grad(self, payload):
+                sent = payload["kwargs"]["input_ids"]
+                return {"logprobs": torch.arange(sent.numel(), dtype=torch.float32).reshape_as(sent)}
+
+        ids = torch.tensor([[0, 0, 1, 2], [5, 6, 7, 8]])
+        attn = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
+        batch = {
+            "input_ids": ids,
+            "attention_mask": attn,
+            "prompts": ids[:, :2],
+            "context": {
+                "zorro_train_enable": True,
+                "max_prompt_len": 2,
+                "max_response_len": 2,
+                "pad_token_id": 0,
+            },
+        }
+        out = asyncio.run(self._shim(Client()).fwd_no_grad(batch, reference_model=False))
+        assert out["batch"]["logprobs"].tolist() == [[0, 1, 2, 3], [4, 5, 6, 7]]

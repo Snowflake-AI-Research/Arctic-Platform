@@ -22,6 +22,7 @@ from typing import Literal
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import NonNegativeInt
 from pydantic import PositiveInt
 from pydantic import StrictBool
 from pydantic import field_validator
@@ -30,7 +31,6 @@ from typing_extensions import Self
 
 from arctic_platform.common.config import validate_peft_config
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_mem_preallocate_bytes
-from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
 
 PinMemoryMaxSize = float | Literal["auto"]
 
@@ -85,17 +85,46 @@ class ActivationCheckpointConfig(BaseModel):
 
     mode: Literal["full", "selective"] = Field("full", description="Recompute whole blocks or selected targets.")
     freq: PositiveInt = Field(1, description="Checkpoint every Nth block.")
+    layers: list[NonNegativeInt] | None = Field(
+        None, description="Checkpoint exactly these block indices instead of every freq-th block."
+    )
     targets: list[str] = Field(default_factory=lambda: ["norm"], description="Submodules to checkpoint (selective).")
     offload_config: ActivationOffloadConfig = Field(
         default_factory=ActivationOffloadConfig, description="CPU offload of checkpointed boundaries."
     )
     router_replay_recompute: bool = Field(True, description="Deterministic MoE routing across recompute.")
+    combine_replay: bool = Field(
+        False,
+        description=(
+            "On a fully checkpointed block, keep the MoE combine output and return it to the recompute instead of "
+            "repeating the expert-parallel all-to-all. Costs one local-tokens-by-hidden tensor per checkpointed "
+            "layer until that layer's backward."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_offload_mode(self) -> Self:
         if self.offload_config.enabled and self.mode != "full":
             raise ValueError("activation offload requires activation checkpointing mode='full'")
         return self
+
+    @model_validator(mode="after")
+    def _validate_layers(self) -> Self:
+        if self.layers is not None and self.freq != 1:
+            raise ValueError("set ac_config.layers or ac_config.freq, not both")
+        if self.layers is not None and len(set(self.layers)) != len(self.layers):
+            raise ValueError(f"ac_config.layers lists a block twice: {self.layers}")
+        return self
+
+    def checkpoints(self, layer_id: int) -> bool:
+        """Whether block ``layer_id`` is checkpointed: listed in ``layers`` when given, else every ``freq``-th."""
+        return layer_id in self.layers if self.layers is not None else layer_id % self.freq == 0
+
+    def check_layers_exist(self, num_layers: int) -> None:
+        """Refuse ``layers`` naming a block the model does not have, rather than silently checkpointing fewer."""
+        missing = [layer for layer in self.layers or () if layer >= num_layers]
+        if missing:
+            raise ValueError(f"ac_config.layers {missing} are past the model's {num_layers} blocks")
 
 
 class ParallelismConfig(BaseModel):
@@ -210,55 +239,6 @@ class ModelSpec(BaseModel):
     patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
     debug: dict = Field(default_factory=dict, description="Runtime GPU capacity guard, separate from loader debug.")
     loader_options: dict = Field(default_factory=dict, description="JSON-only loader-specific extras.")
-
-    @classmethod
-    def from_ds_worker_config(cls, model_name: str, ds_worker_config: dict) -> "ModelSpec":
-        """Transitional bridge: map flat verl ``ds_worker_config`` into a ``ModelSpec``.
-
-        Callers (adapter / SFT demos) own the knobs on the flat dict today. Longer-term,
-        ``ModelSpec`` should be constructed upstream as part of the main client config
-        instead of being inferred here.
-        """
-        cfg = ds_worker_config or {}
-
-        # Require an explicit attention backend. ZoRRo Train needs a flash-attention
-        # implementation; do not invent a second default here (ModelSpec leaves it None).
-        if "attn_implementation" not in cfg or cfg["attn_implementation"] is None:
-            raise ValueError(
-                "from_ds_worker_config requires attn_implementation (ZoRRo Train needs a flash-attention backend)."
-            )
-
-        zorro_train_patch = None
-        if cfg.get("zorro_train_enable", False):
-            # Only forward keys present in cfg; ZorroTrainPatch pydantic defaults fill the rest.
-            zorro_keys = (
-                "response_len",
-                "max_token_len",
-                "rollout_n",
-                "temperature",
-                "use_unpad",
-                "world_size",
-                "logits_optimization",
-                "logits_optimization_peak_mem_size_in_gib",
-                "logits_compute_from_fp32_inputs",
-                "logits_compute_in_fp32",
-            )
-            zorro_train_patch = ZorroTrainPatch(**{k: cfg[k] for k in zorro_keys if k in cfg})
-
-        # Worker bridge defaults GC on (historical DeepSpeedWorker behavior). Generic
-        # ``Patches.gradient_checkpointing`` stays False for direct ModelSpec users.
-        return cls(
-            model_path_or_name=model_name,
-            dtype="bfloat16",
-            attn_implementation=cfg["attn_implementation"],
-            debug=gpu_memory_debug_config(cfg),
-            patches=Patches(
-                liger=cfg.get("use_liger", False),
-                zorro_train=zorro_train_patch,
-                gradient_checkpointing=cfg.get("enable_gradient_checkpointing", True),
-                peft=cfg.get("peft_config"),
-            ),
-        )
 
     @field_validator("dtype")
     @classmethod

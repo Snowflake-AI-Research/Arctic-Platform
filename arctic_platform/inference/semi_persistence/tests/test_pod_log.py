@@ -9,9 +9,13 @@ from __future__ import annotations
 import ast
 import logging
 import os
+import select
 import stat
 import sys
 import tempfile
+import threading
+
+import pytest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG = os.path.dirname(_HERE)
@@ -98,6 +102,126 @@ def test_the_default_target_is_pid_1_stdout():
     finally:
         if saved is not None:
             os.environ["SEMIP_LOG_TARGET"] = saved
+
+
+# --------------------------------------------------------------------------
+# The copy to Ray (tee_tree_to_ray)
+# --------------------------------------------------------------------------
+
+def _copy(chunks, dests, monkeypatch):
+    """Run _copy_lines over *chunks* to EOF; return its writes per destination."""
+    writes = []
+    monkeypatch.setattr(semip_logging, "_write_all",
+                        lambda fd, data: writes.append((fd, bytes(data))))
+    r, w = os.pipe()
+
+    def feed():  # in a thread: more than a pipe's capacity would block here
+        for chunk in chunks:
+            os.write(w, chunk)
+        os.close(w)
+
+    feeder = threading.Thread(target=feed)
+    feeder.start()
+    semip_logging._copy_lines(r, dests)
+    feeder.join()
+    return writes
+
+
+def test_a_line_written_in_pieces_is_copied_whole(monkeypatch):
+    """One write per whole line is what keeps replicas apart in the pod log."""
+    writes = _copy([b"ab", b"c\nde", b"f\n"], [7, 8], monkeypatch)
+    assert writes == [(7, b"abc\n"), (8, b"abc\n"), (7, b"def\n"), (8, b"def\n")]
+
+
+def test_a_trailing_partial_line_is_delivered_at_eof(monkeypatch):
+    writes = _copy([b"a\nno newline"], [7], monkeypatch)
+    assert writes == [(7, b"a\n"), (7, b"no newline")]
+
+
+def test_a_line_that_never_ends_is_passed_on_in_pieces(monkeypatch):
+    writes = _copy([b"x" * 70000 + b"\n"], [7], monkeypatch)
+    assert [len(data) for _, data in writes] == [65536, 70001 - 65536]
+
+
+def test_a_dead_destination_is_dropped_and_the_other_keeps_every_line():
+    dead_r, dead_w = os.pipe()
+    os.close(dead_r)                     # writes now fail with EPIPE
+    live_r, live_w = os.pipe()
+    r, w = os.pipe()
+    os.write(w, b"one\ntwo\n")
+    os.close(w)
+    try:
+        semip_logging._copy_lines(r, [dead_w, live_w])
+        os.close(live_w)
+        out = b""
+        while chunk := os.read(live_r, 4096):
+            out += chunk
+    finally:
+        os.close(dead_w)
+        os.close(live_r)
+    assert out.endswith(b"one\ntwo\n")
+    assert b"dropped it" in out
+
+
+def test_the_off_switch_leaves_the_target_alone(monkeypatch):
+    monkeypatch.setenv("SEMIP_LOG_TO_RAY", "0")
+    monkeypatch.setenv("SEMIP_LOG_TARGET", "/proc/1/fd/1")
+    semip_logging.tee_tree_to_ray()
+    assert os.environ["SEMIP_LOG_TARGET"] == "/proc/1/fd/1"
+    assert semip_logging._tee_write_fd is None
+
+
+def _read_within(fd, timeout=5.0):
+    ready, _, _ = select.select([fd], [], [], timeout)
+    return os.read(fd, 65536) if ready else b""
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="opens the pipe through /proc")
+def test_the_tree_and_semip_loggers_reach_both_and_the_engine_logger_once(
+        monkeypatch):
+    monkeypatch.delenv("SEMIP_LOG_TO_RAY", raising=False)
+    names = ("semip.inst.tee_test", semip_logging._ENGINE_LOGGER + ".tee_test")
+    with tempfile.TemporaryDirectory() as tmp:
+        fifo = os.path.join(tmp, "stdout")
+        os.mkfifo(fifo)
+        pod_r = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        ray_r, ray_w = os.pipe()
+        monkeypatch.setenv("SEMIP_LOG_TARGET", fifo)
+        semip_logging._warned_target = False
+        try:
+            semip_logging.tee_tree_to_ray(ray_fd=ray_w)
+            target = os.environ["SEMIP_LOG_TARGET"]
+            assert target.startswith(f"/proc/{os.getpid()}/fd/")
+
+            # What the worker and the child do at startup.
+            fd = semip_logging.open_pod_log()
+            assert stat.S_ISFIFO(os.fstat(fd).st_mode)
+            os.write(fd, b"from the tree\n")
+            os.close(fd)
+            assert _read_within(ray_r) == b"from the tree\n"
+            assert _read_within(pod_r) == b"from the tree\n"
+
+            semip_logging.attach_pod_log(list(names))
+            logging.getLogger(names[0]).info("semip record")
+            assert b"semip record" in _read_within(ray_r)
+            assert b"semip record" in _read_within(pod_r)
+
+            logging.getLogger(names[1]).info("engine record")
+            assert b"engine record" in _read_within(pod_r)
+            assert _read_within(ray_r, timeout=0.5) == b""
+        finally:
+            for name in names:
+                logger = logging.getLogger(name)
+                logger.handlers[:] = [h for h in logger.handlers
+                                      if not getattr(h, "_semip_pod_log", False)]
+            semip_logging._pod_log_stream = None
+            semip_logging._direct_stream = None
+            semip_logging._tee_write_fd = None
+            semip_logging._tee_pod_log_fd = None
+            os.close(pod_r)
+            os.close(ray_r)
+            os.close(ray_w)
 
 
 # --------------------------------------------------------------------------

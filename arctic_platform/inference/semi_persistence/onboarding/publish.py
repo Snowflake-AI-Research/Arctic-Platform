@@ -126,7 +126,9 @@ class Publisher:
         self.ledger = self.out / "jobs.jsonl"
         self.live: dict[str, str] = {}
         self.lock = threading.Lock()
-        self.results: dict[str, dict] = {}
+        # A re-run of some models keeps the others' entries, which onboard reads.
+        summary = self.out / "summary.json"
+        self.results: dict[str, dict] = json.loads(summary.read_text()) if summary.exists() else {}
 
     def note(self, entry: dict) -> None:
         with self.lock, self.ledger.open("a") as f:

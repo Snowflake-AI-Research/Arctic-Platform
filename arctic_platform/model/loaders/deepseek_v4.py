@@ -92,6 +92,8 @@ def _load(ctx: LoaderContext) -> LoadedModel:
         sp_group=groups.get("sp_group"),
         ep_group=groups["ep_group"],
         options=options,
+        # Packed FP8/MXFP4 weights are frozen, so only LoRA trains on them as published.
+        dequantize_checkpoint=ctx.spec.patches.peft is None,
     )
     return LoadedModel(model=model)
 

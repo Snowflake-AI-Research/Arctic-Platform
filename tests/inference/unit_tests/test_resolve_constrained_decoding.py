@@ -248,7 +248,11 @@ def test_action_mask_cache_stats_reach_scheduler_metrics(monkeypatch):
     import arctic_platform.inference.server.worker as worker_module
     from arctic_platform.inference.server.scheduler import Scheduler
 
-    collector = SimpleNamespace(drain_snapshots=lambda: [{"timestamp": 1.0}])
+    collector = SimpleNamespace(
+        drain_snapshots=lambda: [{"timestamp": 1.0}],
+        totals=lambda: {},
+        spec_decoding_totals=lambda: {},
+    )
     monkeypatch.setattr(worker_module, "get_collector", lambda: collector)
     WorkerClass = worker_module.InferenceWorker.__ray_metadata__.modified_class
     worker = _new_worker(WorkerClass)
@@ -1255,8 +1259,12 @@ def test_worker_does_not_inject_resolve_reasoning_parser_plugin(monkeypatch):
         def create_engine_config(self):
             return SimpleNamespace(
                 parallel_config=SimpleNamespace(data_parallel_rank=0),
-                structured_outputs_config=SimpleNamespace(enable_in_reasoning=False),
-                model_config=SimpleNamespace(skip_tokenizer_init=True),
+                structured_outputs_config=SimpleNamespace(
+                    enable_in_reasoning=False, reasoning_parser="qwen3"
+                ),
+                model_config=SimpleNamespace(
+                    skip_tokenizer_init=True, architecture="Qwen3ForCausalLM",
+                ),
             )
 
     captured = {}

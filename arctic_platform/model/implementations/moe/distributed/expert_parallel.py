@@ -31,8 +31,17 @@ class DeepEPExpertParallel(ParallelStyle):
 
     @staticmethod
     def _partition_fn(name: str, mod: nn.Module, device_mesh: DeviceMesh) -> None:
+        del name
         for param_name, param in mod.named_parameters(recurse=False):
-            mod.register_parameter(param_name, nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)])))
+            distributed = nn.Parameter(
+                distribute_tensor(param, device_mesh, [Shard(0)]),
+                requires_grad=param.requires_grad,
+            )
+            if getattr(param, "_dss_keep_fp32", False):
+                distributed._dss_keep_fp32 = True
+            if getattr(param, "_dss_skip_weight_sync", False):
+                distributed._dss_skip_weight_sync = True
+            mod.register_parameter(param_name, distributed)
         mod._ep_group = device_mesh.get_group()
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:

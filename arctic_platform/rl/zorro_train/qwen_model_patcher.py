@@ -43,6 +43,7 @@ from arctic_platform.common.utils.tiled_logits import TiledLogProbEntropy
 from arctic_platform.common.utils.tiled_logits import (
     chunked_logprobs_entropy_from_hidden as chunked_entropy_and_logprobs_with_temperature_from_logits,
 )
+from arctic_platform.common.utils.tiled_logits import deepspeed_lm_head_compute_params
 from arctic_platform.common.utils.tiled_logits import logits_chunk_rows as _logits_chunk_rows
 from arctic_platform.common.utils.tiled_logits import (
     tiled_logprobs_entropy_from_hidden as tiled_entropy_and_logprobs_with_temperature_from_logits,
@@ -634,7 +635,7 @@ class Qwen3ModelOncePatcher:
                     num_shards = local_num_shards.item()
                     # pr0(f"synced {num_shards=}")
 
-                compute_params = [model.lm_head.weight]  # tied with self.model.embed_tokens.weight
+                compute_params, defer_compute_params_to_outer_graph = deepspeed_lm_head_compute_params(model)
                 # bind the fp32 upcast flags so they flow through TiledLogProbEntropy's forward and (replayed)
                 # backward without changing its signature.
                 logprobs, entropy = TiledLogProbEntropy.apply(
@@ -650,6 +651,7 @@ class Qwen3ModelOncePatcher:
                     calculate_entropy,
                     num_shards,
                     compute_params,
+                    defer_compute_params_to_outer_graph,
                 )
             elif logits_optimization == "compute":
                 # `compute`: manifest the full logits once, but run the softmax/entropy follow-up in chunks so
