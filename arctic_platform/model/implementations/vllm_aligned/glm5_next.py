@@ -137,7 +137,8 @@ def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
     g2 = ops.linear_kernel(g_a, attn.g_b_proj.weight).reshape(tokens, heads, head_dim)
 
     conv_weight = attn.conv1d.weight.float().reshape(3 * projection, -1)
-    conv_states = x.new_zeros((num_seqs, 3 * projection, conv_weight.shape[-1] - 1))
+    # State slot 0 is vLLM's null block, which the conv kernel treats as padding, so the slots start at 1.
+    conv_states = x.new_zeros((num_seqs + 1, 3 * projection, conv_weight.shape[-1] - 1))
     conv = causal_conv1d_fn(
         qkv.transpose(0, 1),
         conv_weight,
@@ -145,11 +146,12 @@ def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
         activation="silu",
         conv_states=conv_states,
         has_initial_state=torch.zeros(num_seqs, dtype=torch.bool, device=x.device),
-        cache_indices=torch.arange(num_seqs, dtype=torch.int32, device=x.device),
+        cache_indices=torch.arange(1, num_seqs + 1, dtype=torch.int32, device=x.device),
         query_start_loc=cu_seqlens,
     ).transpose(0, 1)
     q, k, v = (t.reshape(1, tokens, heads, head_dim).contiguous() for t in conv.split(projection, dim=-1))
-    trace.update(conv_in=qkv.transpose(0, 1), conv_out=conv, q=q, k=k, v=v, g=g1, beta=beta.unsqueeze(0))
+    trace.update(conv_in=qkv.transpose(0, 1), conv_weight=conv_weight, conv_out=conv, q=q, k=k, v=v, g=g1,
+                 beta=beta.unsqueeze(0))  # fmt: skip
 
     state = torch.zeros((num_seqs, heads, head_dim, head_dim), dtype=torch.float32, device=x.device)
     final_state = torch.empty_like(state)
