@@ -161,7 +161,7 @@ class TestSFTOpMapping:
         req = _last(client)
         assert req.op == "load-checkpoint"
         assert req.job_id == TRAINING
-        assert req.body == {"path": "/tmp/ckpt", "step": 3}
+        assert req.body == {"path": "/tmp/ckpt", "step": 3, "checkpoint_id": None, "source_job_id": None}
 
     def test_generate_targets_sampling(self, sampling_client):
         out = sampling_client.generate(["hi"], sampling_params={"max_tokens": 8})

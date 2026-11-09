@@ -12,9 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# Copyright 2025 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
 """A Cortex client behind the surface SkyRL's Arctic integration expects.
 
 Translates the ``arctic_platform.rl`` config SkyRL hands us into a unified
@@ -36,7 +33,35 @@ from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payloa
 from arctic_platform.integrations._cortex_shared import zero_logprobs_like
 from arctic_platform.rl.config import ArcticRLClientConfig as _LegacyConfig
 
-__all__ = ["create_cortex_client"]
+__all__ = ["create_cortex_client", "legacy_max_seq_len", "placement_timeout"]
+
+
+def legacy_max_seq_len(legacy: Any) -> int | None:
+    """Sequence length for the unified client, or ``None`` to keep its default.
+
+    ``to_cortex`` sizes both sub-jobs from ``max_seq_len`` and drops vLLM's
+    ``max_model_len``, so SkyRL's length is carried over here. ``max_model_len``
+    wins and the training ``max_length`` is the fallback.
+    """
+    vllm = getattr(legacy, "vllm_config", None) or {}
+    training = getattr(legacy, "training_config", None) or {}
+    length = vllm.get("max_model_len")
+    if length is None:
+        length = training.get("max_length")
+    if length is None:
+        return None
+    return int(length)
+
+
+def placement_timeout(job_ready_timeout: float, startup_timeout: float | None) -> float:
+    """SkyRL's ``startup_timeout`` when it is longer than the client default.
+
+    The client waits ``job_ready_timeout`` (600s). SkyRL's own knob defaults
+    lower than that, so a shorter value must not shrink GSM8K's wait.
+    """
+    if startup_timeout is not None and float(startup_timeout) > float(job_ready_timeout):
+        return float(startup_timeout)
+    return float(job_ready_timeout)
 
 
 def _to_unified_config(legacy: _LegacyConfig):
@@ -74,6 +99,9 @@ def _to_unified_config(legacy: _LegacyConfig):
         v = getattr(legacy, k, None)
         if v is not None:
             fields[k] = v
+    max_seq_len = legacy_max_seq_len(legacy)
+    if max_seq_len is not None:
+        fields["max_seq_len"] = max_seq_len
     return U(**fields)
 
 
@@ -82,13 +110,13 @@ class _CortexClientShim:
     Unified-client calls are delegated via ``__getattr__``; only the two
     shape mismatches and ``reconnect_config()`` live here."""
 
-    def __init__(self, legacy_config: _LegacyConfig) -> None:
+    def __init__(self, legacy_config: _LegacyConfig, *, wait: bool = True) -> None:
         # Must be the async client: this shim's callers await every op.
         from arctic_platform.client import AsyncArcticRLClient
 
         self._legacy_config = legacy_config
         self._unified_config = _to_unified_config(legacy_config)
-        self._client = AsyncArcticRLClient(self._unified_config)
+        self._client = AsyncArcticRLClient(self._unified_config, wait=wait)
 
     @property
     def config(self) -> _LegacyConfig:
@@ -162,5 +190,5 @@ class _CortexClientShim:
         )
 
 
-def create_cortex_client(config: _LegacyConfig) -> _CortexClientShim:
-    return _CortexClientShim(config)
+def create_cortex_client(config: _LegacyConfig, *, wait: bool = True) -> _CortexClientShim:
+    return _CortexClientShim(config, wait=wait)

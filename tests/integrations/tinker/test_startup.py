@@ -61,6 +61,7 @@ def test_shutdown_closes_the_session():
 
 
 def test_initialize_preserves_job_comment_with_client_config(monkeypatch):
+    monkeypatch.setenv("CORTEX_JOB_COMMENT", "tinker-test")
     config = ArcticClientConfig(
         backend=CortexConfig(base_url="http://mock"),
         model_name="test-model",
@@ -73,7 +74,6 @@ def test_initialize_preserves_job_comment_with_client_config(monkeypatch):
         sent.update(kwargs["json"])
         return {"job_id": "job-123"}
 
-    monkeypatch.setenv("CORTEX_JOB_COMMENT", "tinker-test")
     monkeypatch.setattr(transport, "_send", send)
     monkeypatch.setattr(transport, "_wait_running", lambda: None)
     monkeypatch.setattr(transport, "_capture_sub_jobs", lambda: {"training": "job-123:training"})

@@ -149,21 +149,15 @@ def _pack_and_exchange_head_tensors(
 
     exchanged: dict[str, torch.Tensor] = {}
     for fields in grouped.values():
-        destination_chunks = []
         widths: dict[str, int] = {}
-        for destination in range(world_size):
-            packed_fields = []
-            for name, tensor in fields:
-                local_heads, _tail_shape = specs[name]
-                start = destination * local_heads
-                stop = start + local_heads
-                part = tensor[:, :, start:stop]
-                width = part[0, 0].numel()
-                widths[name] = width
-                packed_fields.append(part.reshape(batch_size, local_sequence_length, width))
-            destination_chunks.append(torch.cat(packed_fields, dim=-1))
-
-        packed = torch.stack(destination_chunks, dim=2)
+        views = []
+        for name, tensor in fields:
+            # Each destination's heads are contiguous, so ``[B, T, world, width]`` is a view of the
+            # field; one cat packs every field, and its backward is views rather than one
+            # zero-filled full-size gradient per destination.
+            widths[name] = tensor[0, 0].numel() // world_size
+            views.append(tensor.reshape(batch_size, local_sequence_length, world_size, widths[name]))
+        packed = torch.cat(views, dim=-1)
         packed = sequence_head_all_to_all(
             process_group,
             packed,
@@ -171,19 +165,16 @@ def _pack_and_exchange_head_tensors(
             gather_dim=1,
         ).squeeze(2)
 
-        offset = 0
         global_sequence_length = local_sequence_length * world_size
-        for name, _tensor in fields:
-            width = widths[name]
+        # split, not slicing: its backward is one cat instead of a zero-filled packed-size gradient per field.
+        for (name, _tensor), field in zip(fields, torch.split(packed, [widths[name] for name, _ in fields], dim=-1)):
             local_heads, tail_shape = specs[name]
-            field = packed[:, :, offset : offset + width]
             exchanged[name] = field.reshape(
                 batch_size,
                 global_sequence_length,
                 local_heads,
                 *tail_shape,
             )
-            offset += width
     return exchanged
 
 
@@ -317,9 +308,13 @@ def head_parallel_gated_delta_net(
     global_cu_seqlens: torch.Tensor,
     num_key_heads: int,
     num_value_heads: int,
+    fp32_beta: bool,
     **rule_kwargs,
 ):
     """Run convolution and recurrence on a full-sequence GDN head shard.
+
+    ``fp32_beta`` evaluates the beta gate as a sigmoid of fp32 ``b``; ``False`` evaluates it in ``b``'s own dtype. It
+    has no default, so every caller chooses.
 
     The first all-to-all exchanges native projected Q/K/V and gate preactivations
     from local-sequence/all-heads to full-sequence/local-heads. The depthwise
@@ -444,7 +439,11 @@ def head_parallel_gated_delta_net(
         num_value_heads=num_value_heads,
         process_group=process_group,
     )
-    beta = exchanged["b"].sigmoid()
+    # vLLM evaluates the beta gate as a sigmoid of fp32 ``b`` and keeps it in fp32; a sigmoid of low-precision
+    # ``b`` would round the gate before the recurrence reads it. This function is shared by the custom Qwen3.5-MoE
+    # model and by the generic transformers wrapper (``_adapt_gated_delta_net_module``); each passes its loader's
+    # ``fp32_parity`` setting.
+    beta = exchanged["b"].float().sigmoid() if fp32_beta else exchanged["b"].sigmoid()
     g = -local_A_log.float().exp() * F.softplus(exchanged["a"].float() + local_dt_bias)
 
     replication = num_value_heads // num_key_heads
@@ -652,7 +651,12 @@ def _module_head_counts(module: nn.Module) -> tuple[int, int]:
     return num_key_heads, num_value_heads
 
 
-def _adapt_gated_delta_net_module(module: nn.Module, process_group) -> None:
+def _adapt_gated_delta_net_module(module: nn.Module, process_group, *, fp32_beta: bool) -> None:
+    """Replace ``module.forward`` with the head-parallel forward.
+
+    ``fp32_beta`` is passed to :func:`head_parallel_gated_delta_net`: ``True`` evaluates the beta gate as a sigmoid of
+    fp32 ``b``, ``False`` as ``b.sigmoid()`` in ``b``'s own dtype, which is what the stock transformers forward does.
+    """
     required_attributes = (
         "in_proj_qkv",
         "in_proj_z",
@@ -758,6 +762,7 @@ def _adapt_gated_delta_net_module(module: nn.Module, process_group) -> None:
             global_cu_seqlens=global_cu_seqlens,
             num_key_heads=num_key_heads,
             num_value_heads=num_value_heads,
+            fp32_beta=fp32_beta,
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
@@ -811,8 +816,11 @@ def _install_global_boundary_wrapper(model: nn.Module, modules: list, process_gr
     model.forward = forward
 
 
-def apply_gated_delta_net_sequence_parallelism(model: nn.Module, process_group) -> int:
-    """Adapt every HF-style GatedDeltaNet module in ``model`` and return the count."""
+def apply_gated_delta_net_sequence_parallelism(model: nn.Module, process_group, *, fp32_beta: bool) -> int:
+    """Adapt every HF-style GatedDeltaNet module in ``model`` and return the count.
+
+    ``fp32_beta`` selects the beta gate's precision in every adapted module (see ``_adapt_gated_delta_net_module``).
+    """
     if process_group is None:
         return 0
 
@@ -824,7 +832,7 @@ def apply_gated_delta_net_sequence_parallelism(model: nn.Module, process_group) 
         compatible_modules += 1
         if getattr(module, "_dss_gated_delta_net_sequence_parallel", False):
             continue
-        _adapt_gated_delta_net_module(module, process_group)
+        _adapt_gated_delta_net_module(module, process_group, fp32_beta=fp32_beta)
         adapted.append(module)
     adapted_modules = len(adapted)
     if adapted:

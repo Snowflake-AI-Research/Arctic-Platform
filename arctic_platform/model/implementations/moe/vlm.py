@@ -33,12 +33,23 @@ VLM_REGISTRY: dict[str, VLMModelInfo] = {
 DEFAULT_LAYER_PREFIX = "model.layers."
 
 
+def _unwrap_peft_model(model: nn.Module) -> nn.Module:
+    """Return the pretrained model beneath a PEFT wrapper."""
+    peft_config = getattr(model, "peft_config", None)
+    get_base_model = getattr(model, "get_base_model", None)
+    if isinstance(peft_config, dict) and peft_config and callable(get_base_model):
+        return get_base_model()
+    return model
+
+
 def get_vision_encoder(model: nn.Module, override: str | None = None) -> nn.Module | None:
     """Get the vision encoder module.
 
     Checks: config override -> registry. Returns None if not found.
-    Raises ValueError on a bad config override.
+    Raises ValueError on a bad config override. An override is a path on the
+    pretrained model. A PEFT wrapper is removed first.
     """
+    model = _unwrap_peft_model(model)
     if override is not None:
         result = _resolve_attr(model, override)
         if result is None:
@@ -56,8 +67,10 @@ def get_language_model(model: nn.Module, override: str | None = None) -> nn.Modu
     """Get the language model module (the part with transformer layers).
 
     Checks: config override -> registry -> model.model (text-only default).
-    Raises ValueError on a bad config override.
+    Raises ValueError on a bad config override. An override is a path on the
+    pretrained model. A PEFT wrapper is removed first.
     """
+    model = _unwrap_peft_model(model)
     if override is not None:
         result = _resolve_attr(model, override)
         if result is None:
