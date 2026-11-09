@@ -31,15 +31,13 @@ reset_prefix_cache, sleep_training (all / non_lp / lp_params modes) / wake_train
 sleep/wake_log_prob (graceful no-ops -- no log-prob job here), save_checkpoint, weight_norm (after the final sync,
 asserting the training and sampling engines hold identical weights and produce agreeing log-probs), reconnect_config
 / get_server_state (a second client re-attaches to the live jobs without re-initializing), save_weights (raises
-``NotImplementedError`` on the ray client; a graceful warn-on-error disk-reload stub on the http client),
-shutdown (via the session). Not exercised: ``log_probs``
+``NotImplementedError`` on the ray client), shutdown (via the session). Not exercised: ``log_probs``
 (needs a log-prob engine; this 2-GPU training+sampling topology has none -- covered by test_log_prob_engine).
 ``test_sync_weights_nccl``
 additionally proves a weight update actually propagates to the sampler over the NCCL path. Real prompts go through
 generate; the update uses fake ``advantages`` but real ``old_log_probs`` (recomputed from the policy each step via
-fwd_no_grad), so the clipped ratio starts at 1.0 and every step makes a real gradient step. Covers each transport
-once (``ray``/``http``); the forward path is numerically certified elsewhere, so this trades the full 4-cell
-matrix for a 2-cell diagonal. Heavyweight GPU test; shared infra lives in ``rl_harness``::
+fwd_no_grad), so the clipped ratio starts at 1.0 and every step makes a real gradient step. Runs one ZoRRO cell;
+the forward path is numerically certified elsewhere. Heavyweight GPU test; shared infra lives in ``rl_harness``::
 
     pytest tests/rl/test_e2e.py -s
 
@@ -52,7 +50,6 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from parameterized import parameterized
 from rl_harness import arctic_rl_client_session
 from rl_harness import assert_finite_logprobs
 from rl_harness import assert_generations
@@ -66,7 +63,6 @@ from rl_harness import finite_metric
 from rl_harness import inference_response_logprobs
 from rl_harness import logprob_kl
 from rl_harness import make_fake_batch
-from rl_harness import parameterized_custom_name_func
 from rl_harness import response_region
 from rl_harness import skip_if_unsupported
 from rl_harness import tokenize_prompts
@@ -102,10 +98,8 @@ e2e_lr = 1e-2
 # equal-norms check has teeth. Comfortably above the norm-equality rtol (1e-3); the observed move at e2e_lr is ~1e-2.
 weight_movement_min_rel = 5e-3
 
-# This is integration coverage; the ZoRRO/non-ZoRRO forward is numerically certified by test_train_engine over the
-# full matrix. What differs at the e2e level is the transport (separate ray_server / http_server lifecycle code), so
-# cover each transport once, paired diagonally with one forward path.
-e2e_params = [("ray", True), ("http", False)]
+# This is integration coverage; the ZoRRO/non-ZoRRO forward is numerically certified by test_train_engine.
+zorro_enable = True
 
 # Real prompts for the sampling engine; small max_tokens keeps the rollout within the tiny max_model_len
 # (prompt_len + response_len).
@@ -257,11 +251,12 @@ class TestE2E(TestCasePlus):
         print(f"[e2e] {tag}: train/infer logprob KL={kl:.4e} mean|delta|={mean_abs_diff:.4e} over {num_tokens} tokens")
         self.assertLess(kl, kl_threshold, f"{tag}: train/infer logprob KL too large after sync: {kl}")
 
-    def _run_e2e(self, comm_protocol: str, zorro_enable: bool) -> None:
+    def test_e2e(self):
+        """Run the full GRPO loop for 2 steps over one live client."""
+        skip_if_unsupported(training_gpus, sampling_gpus, log_prob_gpus, colocate)
         batch, _, _ = make_fake_batch(model_name, num_unique_prompts, rollout_n, prompt_len, response_len)
-        tag = cell_tag(comm_protocol, zorro_enable)
+        tag = cell_tag(zorro_enable)
         with arctic_rl_client_session(
-            comm_protocol,
             zorro_enable,
             model_name,
             attn_implementation,
@@ -276,9 +271,9 @@ class TestE2E(TestCasePlus):
             lr=e2e_lr,
         ) as client:
             asyncio.run(self._drive_grpo(client, batch, zorro_enable, tag))
-            asyncio.run(self._assert_client_guards(client, comm_protocol, tag))
+            asyncio.run(self._assert_client_guards(client, tag))
 
-    async def _assert_client_guards(self, client, comm_protocol: str, tag: str) -> None:
+    async def _assert_client_guards(self, client, tag: str) -> None:
         """Reconnect contract + intentionally-unimplemented surface, checked on the live client (no new spinup)."""
         # reconnect_config() must round-trip the live job ids -- the serializable handle the verl wrapper passes
         # across process boundaries to re-attach without re-running /initialize.
@@ -286,26 +281,15 @@ class TestE2E(TestCasePlus):
         self.assertEqual(rc.training_job_id, client.training_job_id, f"{tag}: reconnect_config lost training_job_id")
         self.assertEqual(rc.sampling_job_id, client.sampling_job_id, f"{tag}: reconnect_config lost sampling_job_id")
 
-        if comm_protocol == "ray":
-            # A second client built from reconnect_config + the live server state attaches to the SAME jobs without
-            # spinning up new engines.
-            client2 = create_arctic_rl_client(rc, client.get_server_state())
-            self.assertEqual(client2.training_job_id, client.training_job_id, f"{tag}: reconnect attached wrong job")
-            self.assertIsInstance(await client2.empty_training_cache(), dict, f"{tag}: reconnected client op failed")
+        # A second client built from reconnect_config + the live server state attaches to the SAME jobs without
+        # spinning up new engines.
+        client2 = create_arctic_rl_client(rc, client.get_server_state())
+        self.assertEqual(client2.training_job_id, client.training_job_id, f"{tag}: reconnect attached wrong job")
+        self.assertIsInstance(await client2.empty_training_cache(), dict, f"{tag}: reconnected client op failed")
 
-            # Disk-based weight reload is deliberately unimplemented on the ray client.
-            with self.assertRaises(NotImplementedError):
-                await client.save_weights("/tmp/unused")
-        else:
-            # The http client implements disk-based save_weights as a graceful warn-on-error stub (server-side
-            # reload is not fully implemented), so it posts to /weight-sync and must return without raising.
-            await client.save_weights("/tmp/arl_unused_ckpt")
-
-    @parameterized.expand(e2e_params, name_func=parameterized_custom_name_func)
-    def test_e2e(self, comm_protocol, zorro_enable):
-        """Run the full GRPO loop for 2 steps over one live client (one case per transport)."""
-        skip_if_unsupported(training_gpus, sampling_gpus, log_prob_gpus, colocate)
-        self._run_e2e(comm_protocol, zorro_enable)
+        # Disk-based weight reload is deliberately unimplemented on the ray client.
+        with self.assertRaises(NotImplementedError):
+            await client.save_weights("/tmp/unused")
 
     async def _perturb_sync_and_verify(self, client, payload: dict) -> None:
         initial_norm = (await client.weight_norm())["training_norm"]
@@ -333,7 +317,6 @@ class TestE2E(TestCasePlus):
         batch, _, _ = make_fake_batch(model_name, num_unique_prompts, rollout_n, prompt_len, response_len)
         payload = build_update_actor_payload(batch, False, rollout_n, prompt_len, response_len)
         with arctic_rl_client_session(
-            "ray",
             False,
             model_name,
             attn_implementation,

@@ -10,7 +10,7 @@ import time
 
 import pytest
 import requests
-from vllm.entrypoints.openai.api_server import (
+from vllm.entrypoints.launchers.cli_args import (
     make_arg_parser, validate_parsed_serve_args)
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 

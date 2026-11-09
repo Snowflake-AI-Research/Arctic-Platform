@@ -186,11 +186,16 @@ class _FP8InplaceUpdater:
             if not isinstance(mod, self._linear_types):
                 continue
             w = getattr(mod, "weight", None)
-            if w is not None and not isinstance(w, BasevLLMParameter):
+            if (
+                w is not None
+                and w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                and not isinstance(w, BasevLLMParameter)
+            ):
                 self._fp8_modules[name] = mod
 
         self._bufs: dict[str, nn.Parameter] = {}
         self._shards_left: dict[str, int] = {}
+        self._fused_writer = _ShardAwareFusedWriter(model, device)
 
     def _ensure_buf(self, mod_path: str) -> nn.Parameter:
         if mod_path in self._bufs:
@@ -229,6 +234,86 @@ class _FP8InplaceUpdater:
         else:
             param.data.copy_(tensor)
 
+    def _copy_native_fp8_param(
+        self, module: nn.Module, param: nn.Parameter, tensor: torch.Tensor
+    ) -> None:
+        loader = getattr(module, "weight_loader", None)
+        if loader is None or tensor.ndim != 2 or param.ndim != 2:
+            param.data.copy_(tensor)
+            return
+
+        from vllm.model_executor.layers.linear import RowParallelLinear
+
+        if isinstance(module, RowParallelLinear):
+            logical_shape = (tensor.shape[0], param.numel() // tensor.shape[0])
+            shard_dim = "input_dim"
+            shard_axis = 1
+        else:
+            logical_shape = (param.numel() // tensor.shape[1], tensor.shape[1])
+            shard_dim = "output_dim"
+            shard_axis = 0
+
+        local = nn.Parameter(
+            torch.empty(logical_shape, dtype=tensor.dtype, device=tensor.device),
+            requires_grad=False,
+        )
+        setattr(local, shard_dim, shard_axis)
+        loader(local, tensor)
+        if param.shape == local.shape:
+            param.data.copy_(local)
+        elif param.shape == local.T.shape:
+            param.data.copy_(local.T.contiguous())
+        else:
+            raise ValueError(
+                f"native FP8 local shape {tuple(local.shape)} cannot be copied "
+                f"to vLLM parameter shape {tuple(param.shape)}"
+            )
+
+    def _copy_native_fp8_scale(
+        self, module: nn.Module, param: nn.Parameter, tensor: torch.Tensor
+    ) -> None:
+        from vllm.model_executor.layers.linear import RowParallelLinear
+
+        # Shard from the full tensor: ``param`` may be stored transposed.
+        tp_rank, tp_size = module.tp_rank, module.tp_size
+        if isinstance(module, RowParallelLinear):
+            if tensor.shape[1] % tp_size:
+                raise ValueError(
+                    f"native FP8 scale shape {tuple(tensor.shape)} does not "
+                    f"split across {tp_size} input shards"
+                )
+            shard_size = tensor.shape[1] // tp_size
+            local = tensor.narrow(1, tp_rank * shard_size, shard_size)
+        else:
+            output_sizes = getattr(module, "output_partition_sizes", None) or (1,)
+            total = sum(output_sizes)
+            offset = 0
+            shards = []
+            for output_size in output_sizes:
+                scale_rows, rows_rem = divmod(tensor.shape[0] * output_size, total)
+                if rows_rem or scale_rows % tp_size:
+                    raise ValueError(
+                        f"native FP8 scale shape {tuple(tensor.shape)} does not "
+                        f"split into output sizes {list(output_sizes)} across "
+                        f"{tp_size} shards"
+                    )
+                shard_size = scale_rows // tp_size
+                shards.append(
+                    tensor.narrow(0, offset + tp_rank * shard_size, shard_size)
+                )
+                offset += scale_rows
+            local = torch.cat(shards, dim=0)
+
+        if param.shape == local.shape:
+            param.data.copy_(local)
+        elif param.shape == local.T.shape:
+            param.data.copy_(local.T.contiguous())
+        else:
+            raise ValueError(
+                f"native FP8 scale local shape {tuple(local.shape)} cannot be "
+                f"copied to vLLM parameter shape {tuple(param.shape)}"
+            )
+
     def _quant_and_copy(self, param: nn.Parameter, tensor: torch.Tensor,
                         scale_param: nn.Parameter | None = None):
         """FP8-quantize a BF16 tensor and copy into an FP8-transposed param."""
@@ -260,6 +345,17 @@ class _FP8InplaceUpdater:
             mod_candidate = sf_key[: -len(".weight")]
             prefix, _, leaf = mod_candidate.rpartition(".")
 
+            param = self._params.get(sf_key)
+            if (
+                tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                and param is not None
+                and mod_candidate in self._fp8_modules
+            ):
+                self._copy_native_fp8_param(
+                    self._fp8_modules[mod_candidate], param, tensor
+                )
+                return
+
             merged = _STACKED_PARAMS.get(leaf)
             if merged and prefix:
                 mod_path = f"{prefix}.{merged}"
@@ -270,6 +366,21 @@ class _FP8InplaceUpdater:
             if mod_candidate in self._fp8_modules:
                 self._feed_fp8_module(mod_candidate, tensor)
                 return
+
+        if sf_key.endswith(".weight_scale_inv"):
+            mod_candidate = sf_key[: -len(".weight_scale_inv")]
+            param = self._params.get(sf_key)
+            if param is not None and mod_candidate in self._fp8_modules:
+                self._copy_native_fp8_scale(
+                    self._fp8_modules[mod_candidate], param, tensor
+                )
+                return
+
+        if (
+            tensor.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and self._fused_writer.feed(sf_key, tensor)
+        ):
+            return
 
         param = self._params.get(sf_key)
         if param is not None:
@@ -451,6 +562,7 @@ class _ShardAwareFusedWriter:
         self._handlers: dict[str, dict] = {}
 
         self._register_gdn(modules)
+        self._register_sparse_indexer(modules)
         self._register_moe(modules)
 
     # -- registration ------------------------------------------------------
@@ -480,6 +592,31 @@ class _ShardAwareFusedWriter:
             parent_path = mod_path.rsplit(".", 1)[0] if "." in mod_path else ""
             parent = modules.get(parent_path)
             if parent is None or not isinstance(parent, GatedDeltaNetAttention):
+                continue
+            wname = f"{mod_path}.weight"
+            param = self._params.get(wname)
+            if param is None:
+                continue
+            self._handlers[wname] = {
+                "family": "gdn_merged",
+                "module": mod,
+                "param": param,
+                "destination": wname,
+            }
+
+    def _register_sparse_indexer(self, modules: dict[str, nn.Module]) -> None:
+        try:
+            from vllm.model_executor.layers.linear import (
+                MergedColumnParallelLinear,
+            )
+        except Exception:
+            return
+
+        for mod_path, mod in modules.items():
+            if not (
+                isinstance(mod, MergedColumnParallelLinear)
+                and mod_path.endswith(".indexer.wk_weights_proj")
+            ):
                 continue
             wname = f"{mod_path}.weight"
             param = self._params.get(wname)
@@ -548,6 +685,22 @@ class _ShardAwareFusedWriter:
         module = handler["module"]
 
         if family == "gdn_merged":
+            replicated_shard_ids = getattr(module, "replicated_shard_ids", None)
+            if replicated_shard_ids:
+                output_dim = getattr(param, "output_dim", 0)
+                offset = 0
+                for shard_id, output_size in enumerate(module.output_sizes):
+                    if shard_id in replicated_shard_ids:
+                        output_size //= module.tp_size
+                    loaded_shard = tensor.narrow(output_dim, offset, output_size)
+                    module.weight_loader(param, loaded_shard, shard_id)
+                    offset += output_size
+                if offset != tensor.shape[output_dim]:
+                    raise ValueError(
+                        f"Fused GDN tensor has {tensor.shape[output_dim]} rows, "
+                        f"but registered shards consume {offset}"
+                    )
+                return True
             # MergedColumnParallelLinear.weight_loader(param, full_weight,
             # loaded_shard_id=None) splits the full fused tensor by
             # ``output_sizes`` ([q,k,v,z] / [b,a]) and TP-narrows each shard
@@ -556,23 +709,34 @@ class _ShardAwareFusedWriter:
             return True
 
         if family == "moe_w13":
-            # Fused vLLM w13 is [w1(gate) | w3(up)] on the intermediate dim.
-            # Feed each per-expert 2-D shard through the expert loader, which
-            # maps the (global) expert id to local and TP-narrows intermediate.
+            # Gated FusedMoE w13 is [w1(gate) | w3(up)] on the intermediate dim.
+            # Non-gated MoE (Nemotron-H) stores only w1 in w13_weight; splitting
+            # in half then loading shard_id=w3 does expert_data.narrow(shard_size)
+            # past the TP-local intermediate (e.g. 672/672 on Super TP=4).
             # NOTE: RoutedExperts.weight_loader routes by *substring* of
             # ``weight_name``; the model-weight copy branch only runs when it
             # contains "weight" (and none of scale/zero/offset/g_idx/shape), so
             # we pass the param's own name ("w13_weight") like vLLM's oracle.
-            inter = tensor.shape[1] // 2
+            moe_config = getattr(module, "moe_config", None)
+            gated = True if moe_config is None else bool(
+                getattr(moe_config, "is_act_and_mul", True)
+            )
             for expert_id in range(tensor.shape[0]):
-                module.weight_loader(
-                    param, tensor[expert_id, :inter, :],
-                    "w13_weight", "w1", expert_id, return_success=True,
-                )
-                module.weight_loader(
-                    param, tensor[expert_id, inter:, :],
-                    "w13_weight", "w3", expert_id, return_success=True,
-                )
+                if gated:
+                    inter = tensor.shape[1] // 2
+                    module.weight_loader(
+                        param, tensor[expert_id, :inter, :],
+                        "w13_weight", "w1", expert_id, return_success=True,
+                    )
+                    module.weight_loader(
+                        param, tensor[expert_id, inter:, :],
+                        "w13_weight", "w3", expert_id, return_success=True,
+                    )
+                else:
+                    module.weight_loader(
+                        param, tensor[expert_id],
+                        "w13_weight", "w1", expert_id, return_success=True,
+                    )
             return True
 
         if family == "moe_w2":

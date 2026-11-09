@@ -37,10 +37,13 @@ on AWS p5en.48xlarge (192 vCPU, 2 TiB host memory, 8x H200) with vLLM v0.18.0.*
 
 - Linux with NVIDIA GPUs, and a driver providing `cuda-checkpoint`.
 - vLLM and ArcticInference installed (see the [repository README](../../README.md)).
-- CRIU 4.2 with the CUDA plugin. The empty plugin directory it needs,
-  `/usr/lib/criu/empty`, is created by the dump if missing.
-- Passwordless `sudo`: checkpoint and restore shell out to `cuda-checkpoint`
-  and `criu`, which need root.
+- CRIU 4.2 with the CUDA plugin.
+- Root, **or** an unprivileged user on a node granting
+  `CAP_CHECKPOINT_RESTORE + CAP_SYS_PTRACE` with `SEMIP_UNPRIVILEGED=1` and
+  the capabilities set on the binary:
+  `setcap cap_sys_ptrace,cap_checkpoint_restore,cap_setpcap,cap_setgid+eip /usr/sbin/criu`.
+  Dump and restore must run as the same uid. CUDA checkpoint/restore goes
+  through the driver API, so the `cuda-checkpoint` CLI is not needed.
 
 Full setup, including a from-source CRIU build for hosts that cannot reach the
 Ubuntu PPA, is in [`skills/INSTALL.md`](skills/INSTALL.md).

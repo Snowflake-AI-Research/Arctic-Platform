@@ -39,6 +39,29 @@ class DeepEPExpertParallel(ParallelStyle):
         return distribute_module(module, device_mesh, partition_fn=self._partition_fn)
 
 
+class DeepEPShardParallel(ParallelStyle):
+    """Shard direct parameters on dim 0 across an expert-parallel mesh."""
+
+    @staticmethod
+    def _partition_fn(name: str, mod: nn.Module, device_mesh: DeviceMesh) -> None:
+        del name
+        for param_name, param in mod.named_parameters(recurse=False):
+            distributed = nn.Parameter(
+                distribute_tensor(param, device_mesh, [Shard(0)]),
+                requires_grad=param.requires_grad,
+            )
+            if getattr(param, "_dss_skip_weight_sync", False):
+                distributed._dss_skip_weight_sync = True
+            mod.register_parameter(param_name, distributed)
+        mod._ep_group = device_mesh.get_group()
+        mod._ep_rank = device_mesh.get_local_rank()
+        mod._ep_world_size = device_mesh.size()
+        mod._dss_ep_sharded = True
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        return distribute_module(module, device_mesh, partition_fn=self._partition_fn)
+
+
 def get_ep_group(experts: nn.Module) -> ProcessGroup:
     if _deepspeed_ep_group_name is not None:
         import deepspeed.utils.groups as ds_groups

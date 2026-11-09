@@ -8,7 +8,10 @@ Run as two collectives with no out-of-band coordination:
     B (local, pure)          every rank derives the same plan; if any
                              needed sid has no sender, every rank raises
                              RouterReplayMissingError identically and the
-                             data collective is skipped.
+                             data collective is skipped -- unless every
+                             receiver needing a missing sid set
+                             ``allow_missing``, in which case those sids are
+                             dropped from the plan on every rank.
     C (GPU, group_start/send|recv/group_end)
                              one fused NCCL op transfers all (sid -> recv).
 
@@ -37,7 +40,9 @@ from arctic_platform.inference.server.router_replay.cache import (
 logger = logging.getLogger(__name__)
 
 # Dtype stored/transferred for routed_experts. Qwen3.6 MoE has 256 experts,
-# so ids are in [0, 255] and fit in uint8. Training widens to int64 at the
+# so ids are in [0, 255] and fit in uint8; models with more experts keep vLLM's
+# uint16 capture, and senders advertise each tensor's dtype. NCCL has no 16-bit
+# integer type, so tensors travel as raw bytes. Training widens to int64 at the
 # model boundary where torch gather/DeepEP dispatch require long indices.
 _ROUTED_EXPERTS_DTYPE = ROUTER_REPLAY_CACHE_DTYPE
 
@@ -48,8 +53,13 @@ Role = Literal["sender", "receiver"]
 class _PerRankManifest:
     """One rank's Phase-A contribution.
 
-    Senders fill ``held`` + ``shapes``; receivers fill ``needed``. ``role``
-    is in-band so the planner needs no out-of-band role table.
+    Senders fill ``held`` + ``shapes`` + ``dtypes``; receivers fill ``needed``.
+    ``role`` is in-band so the planner needs no out-of-band role table.
+    ``dtypes`` is ``None`` from an older sender, whose cache held uint8 only.
+    ``allow_missing`` lets a receiver tolerate needed sids no sender holds.
+    ``supports_allow_missing`` is the capability handshake: this code always
+    sets it, while a manifest from a rank running an older planner (which
+    raises on any missing sid) unpickles with the ``False`` class default.
     """
 
     role: Role
@@ -57,7 +67,10 @@ class _PerRankManifest:
     held: list[str] = field(default_factory=list)
     needed: list[str] = field(default_factory=list)
     shapes: dict[str, list[int]] = field(default_factory=dict)
+    dtypes: dict[str, torch.dtype] | None = None
     discard: bool = True
+    allow_missing: bool = False
+    supports_allow_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -67,6 +80,7 @@ class _TransferOp:
     sample_id: str
     shape: tuple[int, ...]
     discard: bool = True
+    dtype: torch.dtype = _ROUTED_EXPERTS_DTYPE
 
 
 def _compute_plan(
@@ -82,6 +96,7 @@ def _compute_plan(
     owner: dict[str, int] = {}
     owners: dict[str, list[int]] = {}
     shape_by_sid: dict[str, tuple[int, ...]] = {}
+    dtype_by_sid: dict[str, torch.dtype] = {}
     for m in sorted(manifests, key=lambda x: x.rank):
         if m.role != "sender":
             continue
@@ -91,6 +106,7 @@ def _compute_plan(
                 continue  # earlier (lower-rank) sender already owns it
             owner[sid] = m.rank
             shape_by_sid[sid] = tuple(m.shapes[sid])
+            dtype_by_sid[sid] = _ROUTED_EXPERTS_DTYPE if m.dtypes is None else m.dtypes[sid]
 
     duplicate_exact = sorted(
         sid for sid, sender_ranks in owners.items()
@@ -131,9 +147,29 @@ def _compute_plan(
                     sample_id=sid,
                     shape=shape_by_sid[sid],
                     discard=m.discard,
+                    dtype=dtype_by_sid[sid],
                 )
             )
     return plan, missing
+
+
+def _missing_is_tolerated(
+    manifests: Sequence[_PerRankManifest],
+    missing: set[str],
+) -> bool:
+    """True iff every receiver needing a missing sid set ``allow_missing``
+    and every rank runs a planner that tolerates missing sids.
+
+    Pure function of the gathered manifests, so every rank -- senders
+    included -- reaches the same verdict and either all proceed or all raise.
+    A rank on an older planner always raises on a missing sid, so its peers
+    must raise too or they would block in the data collective without it.
+    """
+    return all(m.supports_allow_missing for m in manifests) and all(
+        m.allow_missing
+        for m in manifests
+        if m.role == "receiver" and not missing.isdisjoint(m.needed)
+    )
 
 
 class RouterReplayGroup:
@@ -190,7 +226,7 @@ class RouterReplayGroup:
             raise RuntimeError(f"send() called on role={self.role!r}")
         snapshot = cache_tx.snapshot()
         manifest = self._build_send_manifest(snapshot)
-        plan = self._exchange_manifest(manifest)  # raises on missing
+        plan, _ = self._exchange_manifest(manifest)  # raises on untolerated missing
         n_sent = self._run_data_exchange_send(plan, snapshot)
         discard_sample_ids = [
             op.sample_id
@@ -209,6 +245,7 @@ class RouterReplayGroup:
         *,
         needed_sample_ids: Sequence[str],
         discard: bool = True,
+        allow_missing: bool = False,
     ) -> dict[str, Any]:
         """Receiver-side per-step call; pairs with :meth:`send`.
 
@@ -219,6 +256,12 @@ class RouterReplayGroup:
         sender evicts these ``needed_sample_ids`` from its TX cache after a
         successful send (consume-once); pass ``False`` to keep them for
         replay / multi-consumer scenarios.
+
+        ``allow_missing`` is advertised in the same manifest: when every
+        receiver needing a sid no sender holds set it, the exchange proceeds
+        without those sids and they are returned as ``dropped_sample_ids``
+        (this rank's, in ``needed_sample_ids`` order) instead of raising
+        :class:`RouterReplayMissingError`.
         """
         if self._closed:
             raise RuntimeError("RouterReplayGroup is closed")
@@ -230,16 +273,25 @@ class RouterReplayGroup:
                 "router-replay: cleared %d stale RX entries before exchange "
                 "(prior step likely crashed between recv and fwd_bwd)", stale,
             )
-        manifest = self._build_recv_manifest(needed_sample_ids, discard=discard)
+        manifest = self._build_recv_manifest(
+            needed_sample_ids, discard=discard, allow_missing=allow_missing,
+        )
         try:
-            plan = self._exchange_manifest(manifest)
+            plan, missing = self._exchange_manifest(manifest)
         except RouterReplayMissingError:
             self._n_missing_raises += 1
             raise
+        dropped = list(dict.fromkeys(sid for sid in needed_sample_ids if sid in missing))
+        if len(dropped) > 0:
+            logger.info(
+                "router-replay: dropped %d of %d needed sample_id(s) with no "
+                "sender (allow_missing) ids_head=%s",
+                len(dropped), len(needed_sample_ids), dropped[:8],
+            )
         n_recv = self._run_data_exchange_recv(plan, cache_rx)
         self._n_exchanges += 1
         self._n_tensors_recv += n_recv
-        return {"tensors_recv": n_recv}
+        return {"tensors_recv": n_recv, "dropped_sample_ids": dropped}
 
     def close(self) -> None:
         """Tear down the NCCL comm + stateless PG. Idempotent.
@@ -273,34 +325,58 @@ class RouterReplayGroup:
 
     def _build_send_manifest(self, snapshot: dict[str, torch.Tensor]) -> _PerRankManifest:
         shapes = {}
+        dtypes = {}
         for sid, tensor in snapshot.items():
             shapes[sid] = list(tensor.shape)
+            dtypes[sid] = tensor.dtype
         return _PerRankManifest(
             role="sender",
             rank=self.rank,
             held=list(shapes.keys()),
             shapes=shapes,
+            dtypes=dtypes,
+            supports_allow_missing=True,
         )
 
     def _build_recv_manifest(
-        self, needed_sample_ids: Sequence[str], *, discard: bool = True,
+        self,
+        needed_sample_ids: Sequence[str],
+        *,
+        discard: bool = True,
+        allow_missing: bool = False,
     ) -> _PerRankManifest:
         return _PerRankManifest(
             role="receiver",
             rank=self.rank,
             needed=list(needed_sample_ids),
             discard=discard,
+            allow_missing=allow_missing,
+            supports_allow_missing=True,
         )
 
-    def _exchange_manifest(self, mine: _PerRankManifest) -> list[_TransferOp]:
-        """Phase A + Phase B: gather manifests, compute plan, raise if missing."""
+    def _exchange_manifest(
+        self, mine: _PerRankManifest,
+    ) -> tuple[list[_TransferOp], set[str]]:
+        """Phase A + Phase B: gather manifests, compute plan, raise if missing.
+
+        Returns the plan and the tolerated missing set (empty unless every
+        receiver needing a missing sid set ``allow_missing``).
+        """
         all_manifests: list[_PerRankManifest] = self.pg.all_gather_obj(mine)
         plan, missing = _compute_plan(all_manifests)
-        if missing:
+        if len(missing) > 0 and not _missing_is_tolerated(all_manifests, missing):
+            legacy_ranks = sorted(
+                m.rank for m in all_manifests if not m.supports_allow_missing
+            )
+            if mine.allow_missing and len(legacy_ranks) > 0:
+                logger.info(
+                    "router-replay: allow_missing refused; ranks %s run a "
+                    "planner without missing-sid tolerance", legacy_ranks[:16],
+                )
             # Every rank raises identically (same input -> same missing set),
             # so the data collective never runs and no rank blocks.
             raise RouterReplayMissingError(sorted(missing))
-        return plan
+        return plan, missing
 
     # ------------------------------------------------------------------
     # Phase C: data exchange
@@ -329,7 +405,7 @@ class RouterReplayGroup:
                     f"router-replay: cache.get({op.sample_id!r}) failed during send "
                     f"despite manifest claim; snapshot is inconsistent"
                 ) from e
-            tensors_by_op.append((op, t.contiguous()))
+            tensors_by_op.append((op, t.contiguous().view(torch.uint8)))
         self.nccl.group_start()
         for op, t in tensors_by_op:
             self.nccl.send(t, dst=op.recv_rank)
@@ -351,12 +427,12 @@ class RouterReplayGroup:
         dests: list[tuple[_TransferOp, torch.Tensor]] = []
         for op in my_ops:
             dest = torch.empty(
-                op.shape, dtype=_ROUTED_EXPERTS_DTYPE, device=self.device,
+                op.shape, dtype=op.dtype, device=self.device,
             )
             dests.append((op, dest))
         self.nccl.group_start()
         for op, dest in dests:
-            self.nccl.recv(dest, src=op.sender_rank)
+            self.nccl.recv(dest.view(torch.uint8), src=op.sender_rank)
         self.nccl.group_end()
         # Sync so subsequent cache.put copies observe fully-landed data.
         torch.cuda.current_stream(self.device).synchronize()

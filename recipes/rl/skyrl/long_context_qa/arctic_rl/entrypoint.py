@@ -93,7 +93,7 @@ def main() -> None:
     logger.info("Pre-initializing ArcticRL jobs (before ray.init)…")
     pre_client = create_arctic_rl_client(rl_config)
     reconnect_cfg = pre_client.reconnect_config()
-    server_state = pre_client.get_server_state() if rl_config.comm_protocol == "ray" else None
+    server_state = pre_client.get_server_state()
     logger.info(
         f"ArcticRL jobs ready — training={pre_client.training_job_id}, "
         f"sample={pre_client.sampling_job_id}, log_prob={pre_client.log_prob_job_id}"

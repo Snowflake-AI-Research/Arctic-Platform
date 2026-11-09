@@ -17,7 +17,7 @@
 
 Protocol-specific code lives under ``arctic_platform.rl`` (GRPO/RL); a
 forthcoming SFT package will share this stack. This package holds the DeepSpeed
-worker, HTTP/Ray servers, Ray cluster helpers, and low-level utils.
+worker, Ray server, Ray cluster helpers, and low-level utils.
 """
 
 from __future__ import annotations

@@ -118,3 +118,21 @@ def test_model_config_defaults_inductor_to_eager_precision_casts():
     assert ModelConfig(model="m", extra_engine_kwargs=opt_out).to_engine_kwargs()["compilation_config"] == {
         "inductor_compile_config": {"emulate_precision_casts": False},
     }
+
+
+def test_model_config_clear_cache_on_weight_sync_defaults_on():
+    ModelConfig = _model_config_cls()
+    config = ModelConfig(model="m")
+
+    assert config.clear_cache_on_weight_sync is True
+    assert "clear_cache_on_weight_sync" not in config.to_engine_kwargs()
+    assert "clear_cache_on_weight_sync" not in config.model_dump()
+
+
+def test_model_config_accepts_clear_cache_on_weight_sync_opt_out():
+    ModelConfig = _model_config_cls()
+    config = ModelConfig(model="m", clear_cache_on_weight_sync=False)
+
+    assert config.clear_cache_on_weight_sync is False
+    assert "clear_cache_on_weight_sync" not in config.to_engine_kwargs()
+    assert "clear_cache_on_weight_sync" not in config.model_dump()

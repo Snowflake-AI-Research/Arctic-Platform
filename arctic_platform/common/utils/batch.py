@@ -19,7 +19,6 @@ from typing import Any
 # import itertools
 import torch
 
-from arctic_platform import wire
 from arctic_platform.common.registry import is_declared_summed_metric
 
 from .server_models import resolve_parallelism_degree
@@ -95,6 +94,7 @@ BATCH_DIM_CONTEXT_KEYS = frozenset(
         "echo_observation_token_counts",
         "nll_mask",
         "teacher_log_probs_shifted",
+        "sampler_kl_weights",
         "versions",
         "prompt_group_ids",
         "prompt_token_counts",
@@ -107,13 +107,66 @@ BATCH_DIM_CONTEXT_KEYS = frozenset(
     }
 )
 
+# Forward scalars carried on ``meta`` only. ``meta`` is replicated to every
+# data-parallel rank, so these must be one value, never a per-token tensor.
+META_FWD_SCALAR_KEYS = frozenset({"temperature", "calculate_entropy"})
+
+
+def _bag_values_equal(left, right) -> bool:
+    """Whether two bag values are the same object contents.
+
+    Tensors compare with ``torch.equal``. A bare ``==`` on ``input_ids`` is a
+    tensor, and using it as a boolean raises.
+    """
+    if torch.is_tensor(left) and torch.is_tensor(right):
+        return left.shape == right.shape and left.dtype == right.dtype and bool(torch.equal(left, right))
+    if torch.is_tensor(left) or torch.is_tensor(right):
+        return False
+    if isinstance(left, (dict, list, tuple)) or isinstance(right, (dict, list, tuple)):
+        return False
+    return left == right
+
+
+def _assert_disjoint_bags(batch_data: dict, meta_data: dict, where: str) -> None:
+    overlap = sorted(set(batch_data) & set(meta_data))
+    if overlap:
+        raise ValueError(
+            f"{where}: keys {overlap!r} are on both batch and meta; send each key on exactly one bag "
+            "(batch is sharded across DP ranks, meta is replicated to every rank)"
+        )
+
+
+def _reject_meta_fwd_scalars_on_batch(batch_data: dict, where: str) -> None:
+    present = sorted(META_FWD_SCALAR_KEYS & set(batch_data))
+    if present:
+        raise ValueError(
+            f"{where}: {present!r} are forward scalars and must be sent on meta as one value, not on batch"
+        )
+
+
+def _resolve_cortex_overlap(batch_data: dict, meta_data: dict) -> None:
+    """Drop a Cortex duplicate that carries the same value on both bags.
+
+    Model inputs stay on ``kwargs`` (sharded). ``temperature`` and
+    ``calculate_entropy`` stay on ``context`` (replicated).
+    """
+    for key in sorted(set(batch_data) & set(meta_data)):
+        if not _bag_values_equal(batch_data[key], meta_data[key]):
+            raise ValueError(f"kwargs and context disagree on {key!r}; a key sent on both must carry the same value")
+        if key in META_FWD_SCALAR_KEYS:
+            del batch_data[key]
+        else:
+            del meta_data[key]
+
 
 def promote_batch_dim_to_batch(batch_data: dict, meta_data: dict) -> tuple[dict, dict]:
     """Move batch-dim tensors from ``meta``/Cortex ``context`` into ``batch``.
 
-    No-op for keys already on ``batch`` (``batch`` wins; the ``meta`` copy is dropped).
-    Non-tensor values (e.g. SkyRL ``rollout_is_weights: None``) stay on ``meta``
-    so later ``v.shape`` debug loops and DP split do not see a None batch field.
+    ``unpack_batch`` rejects a key that is already on both bags. The branch that
+    drops a meta tensor when ``batch`` already has the key remains for direct
+    callers. Non-tensor values (e.g. SkyRL ``rollout_is_weights: None``) stay
+    on ``meta`` so later ``v.shape`` debug loops and DP split do not see a None
+    batch field.
     """
     batch_data = dict(batch_data)
     meta_data = dict(meta_data)
@@ -129,25 +182,69 @@ def promote_batch_dim_to_batch(batch_data: dict, meta_data: dict) -> tuple[dict,
     return batch_data, meta_data
 
 
+def _promote_list_batch(batch_list: list, meta_data: dict) -> tuple[list, dict]:
+    """Promote labels onto each GAS microbatch, or raise."""
+    meta_data = dict(meta_data)
+    promoted: list[dict] = []
+    meta_labels = meta_data.get("labels") if "labels" in meta_data else None
+    for index, microbatch in enumerate(batch_list):
+        if not isinstance(microbatch, dict):
+            raise TypeError(f"gas microbatch must be a dict of tensors, got {type(microbatch).__name__}")
+        microbatch = dict(microbatch)
+        if "labels" not in microbatch:
+            if isinstance(meta_labels, list):
+                if index >= len(meta_labels):
+                    raise ValueError(
+                        f"meta labels list has {len(meta_labels)} entries but batch has {len(batch_list)} microbatches"
+                    )
+                microbatch["labels"] = meta_labels[index]
+            elif "labels" in meta_data:
+                raise ValueError(
+                    "labels on meta cannot be applied to a list-shaped batch; "
+                    "put per-microbatch labels on each element"
+                )
+        promoted.append(microbatch)
+    if "labels" in meta_data:
+        if all("labels" in microbatch for microbatch in promoted):
+            del meta_data["labels"]
+        else:
+            raise ValueError("labels remain on meta for a list-shaped batch")
+    return promoted, meta_data
+
+
 def unpack_batch(batch: dict) -> tuple:
     """Return ``(args, batch, meta, processing)``.
 
     Accepts AP ``{"batch", "meta", "processing"}`` and Cortex
     ``{"kwargs", "context", "processing"}``. Batch-dim keys in ``context`` /
-    ``meta`` are moved onto ``batch`` before DP split.
+    ``meta`` are moved onto ``batch`` before DP split. ``temperature`` and
+    ``calculate_entropy`` stay on ``meta``.
     """
     if "kwargs" in batch:
         batch_data = dict(batch.get("kwargs") or {})
         meta_data = dict(batch.get("context") or {})
         processing = batch.get("processing") or {}
+        _resolve_cortex_overlap(batch_data, meta_data)
+        _reject_meta_fwd_scalars_on_batch(batch_data, "unpack_batch")
     else:
         batch_data = batch["batch"]
         meta_data = dict(batch["meta"])
         processing = batch["processing"]
         if isinstance(batch_data, dict):
             batch_data = dict(batch_data)
+            _reject_meta_fwd_scalars_on_batch(batch_data, "unpack_batch")
+            _assert_disjoint_bags(batch_data, meta_data, "unpack_batch")
+        elif isinstance(batch_data, list):
+            for index, microbatch in enumerate(batch_data):
+                if not isinstance(microbatch, dict):
+                    continue
+                where = f"gas microbatch {index}"
+                _reject_meta_fwd_scalars_on_batch(microbatch, where)
+                _assert_disjoint_bags(microbatch, meta_data, where)
 
-    if isinstance(batch_data, dict):
+    if isinstance(batch_data, list):
+        batch_data, meta_data = _promote_list_batch(batch_data, meta_data)
+    elif isinstance(batch_data, dict):
         batch_data, meta_data = promote_batch_dim_to_batch(batch_data, meta_data)
     return {}, batch_data, meta_data, processing
 
@@ -155,6 +252,8 @@ def unpack_batch(batch: dict) -> tuple:
 def _split_value(val, num_chunks: int):
     """Split a tensor or list along the batch (first) dimension."""
     if isinstance(val, torch.Tensor):
+        if val.ndim == 0:
+            return [val] * num_chunks
         if val.shape[0] < num_chunks:
             raise ValueError(
                 f"Batch dimension {val.shape[0]} is smaller than num_workers "
@@ -254,7 +353,7 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
         reconstruct_position_ids_(batch_data)
 
     # ZoRRO Load balancer. Import lazily: a top-level import of zorro_train pulls
-    # in rl/__init__.py → common.http_server → common.utils while this package is
+    # in rl/__init__.py → common.utils while this package is
     # still initializing (circular after the rl→common move).
     if meta_data.get("load_balancer", False):
         from arctic_platform.rl.zorro_train.seqlen_balancing import reorg_global_batch
@@ -277,42 +376,6 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
 
 
 ray_split_batch = _split_batch
-
-
-def http_split_batch(
-    batch_bytes: bytes | dict,
-    num_workers: int,
-    sp_size: int = 1,
-) -> tuple[list[dict], list[int] | None]:
-    """Deserialize a global batch when needed, then split it across DP workers."""
-    # if num_workers <= 1:
-    #     return [batch_bytes]
-    batch = batch_bytes if isinstance(batch_bytes, dict) else wire.loads(batch_bytes)
-
-    shards, reorder_indices = _split_batch(batch, num_workers, sp_size=sp_size)
-
-    # _, batch_data, meta_data, processing = unpack_batch(batch)
-    # batch_data_shards = split_dict(batch_data, num_workers)
-    # shards = []
-    # meta_data.update(**dict(dp_size=num_workers))
-    # for i in range(num_workers):
-    #     shard = dict(
-    #         batch=batch_data_shards[i],
-    #         meta=meta_data,
-    #         processing=processing,
-    #     )
-    #     buf = io.BytesIO()
-    #     torch.save(shard, buf)
-    #     shards.append(buf.getvalue())
-
-    # DO NOT DELETE:
-    # at the moment must not recode back to bytes since we use ray to continue within the http_server - but it could be different later with DSS
-    # for i in range(len(shards)):
-    #     buf = io.BytesIO()
-    #     torch.save(shards[i], buf)
-    #     shards[i] = buf.getvalue()
-
-    return shards, reorder_indices
 
 
 def dump_dict_payload(payload: dict, tag: str):
