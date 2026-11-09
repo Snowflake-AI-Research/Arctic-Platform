@@ -433,7 +433,11 @@ def _optimizer_cpu_offload_enabled(ds_config: dict) -> bool:
     zero_config = ds_config.get("zero_optimization")
     if not isinstance(zero_config, dict):
         return False
-    return bool(zero_config.get("offload_optimizer"))
+    offload = zero_config.get("offload_optimizer")
+    if isinstance(offload, dict):
+        # {"device": "none"} means offload is off, not on (SkyRL and the recipes write it).
+        return str(offload.get("device", "cpu")).lower() not in ("none", "")
+    return bool(offload)
 
 
 def _aligned_first(params: list) -> list:
