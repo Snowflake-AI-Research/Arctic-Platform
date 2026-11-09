@@ -31,11 +31,11 @@ from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
-import torch.distributed.nn as dist_nn
 from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
 from torch.nn.attention.flex_attention import flex_attention
 
+from arctic_platform.model.implementations.gpu.sp.collectives import gather_sequence
 from arctic_platform.model.implementations.gpu.vllm_rounding import rope_rotary_slice_fp32
 
 _BACKEND = "qsa_flex"
@@ -48,12 +48,6 @@ def _cp_info(module) -> tuple[object | None, int, int]:
     if group is None:
         return None, 0, 1
     return group, dist.get_rank(group), dist.get_world_size(group)
-
-
-def _gather_sequence(tensor: torch.Tensor, group) -> torch.Tensor:
-    if group is None or dist.get_world_size(group) == 1:
-        return tensor
-    return torch.cat(dist_nn.all_gather(tensor.contiguous(), group=group), dim=1)
 
 
 @torch.no_grad()
@@ -164,16 +158,24 @@ def select_qsa_token_ids(
     tail_offsets = torch.arange(compress_ratio - 1, device=index_queries.device)
     first_sparse_position = (block_budget + 1) * compress_ratio - 1
 
+    from arctic_platform.model.implementations.qwen38.qsa_index_scores import fused_index_scores_supported
+    from arctic_platform.model.implementations.qwen38.qsa_index_scores import qsa_index_scores
+    from arctic_platform.model.implementations.qwen38.qsa_index_scores import top_block_indices
+
+    fused = fused_index_scores_supported(index_queries)
     for batch_idx, logical_length_tensor in enumerate(sequence_lengths):
         logical_length = int(logical_length_tensor)
         available_blocks = logical_length // compress_ratio
         local_valid_length = min(max(logical_length - query_offset, 0), sequence_length)
         if local_valid_length == 0:
             continue
-        keys = compressed_keys[batch_idx, :available_blocks, 0].float()
+        keys = compressed_keys[batch_idx, :available_blocks, 0]
+        if not fused:
+            keys = keys.float()
         topk_width = min(block_budget, available_blocks)
         chunk_rows = _query_chunk_rows(
-            num_heads=num_heads,
+            # The fused kernel sums the heads in registers: its score block has no head dimension.
+            num_heads=1 if fused else num_heads,
             num_blocks=max(available_blocks, 1),
             rows=local_valid_length,
         )
@@ -194,7 +196,11 @@ def select_qsa_token_ids(
                 top_blocks = candidate_blocks.unsqueeze(0).expand(rows, -1)
                 valid_blocks = candidate_blocks.unsqueeze(0) < visible_blocks.unsqueeze(1)
                 sparse_start = min(max(first_sparse_position - query_offset - query_start, 0), rows)
-                if sparse_start < rows:
+                if sparse_start < rows and fused:
+                    queries = index_queries[batch_idx, query_start + sparse_start : query_end]
+                    scores = qsa_index_scores(queries, keys, visible_blocks[sparse_start:])
+                    sparse_top_blocks = top_block_indices(scores, block_budget)
+                elif sparse_start < rows:
                     queries = index_queries[batch_idx, query_start + sparse_start : query_end].float()
                     scores = torch.einsum("qhd,pd->qhp", queries, keys)
                     scores = torch.relu(scores).sum(dim=1) / math.sqrt(head_dim)
@@ -204,6 +210,7 @@ def select_qsa_token_ids(
                         -torch.inf,
                     )
                     sparse_top_blocks = torch.topk(scores, k=block_budget, dim=-1).indices
+                if sparse_start < rows:
                     top_blocks = torch.cat([top_blocks[:sparse_start], sparse_top_blocks], dim=0)
                     valid_blocks = torch.cat(
                         [
@@ -464,8 +471,9 @@ class _SparseGQAAttention(torch.autograd.Function):
         grad_query = torch.empty_like(query)
         # Sum in at least fp32: a key selected by N queries gets N scatter-adds, and bf16 atomics round after each.
         accumulate_dtype = torch.promote_types(key.dtype, torch.float32)
-        grad_key = torch.zeros_like(key, dtype=accumulate_dtype)
-        grad_value = torch.zeros_like(value, dtype=accumulate_dtype)
+        # Contiguous so that flatten(2) below is a view: at sp 1, K arrives as a transpose of RoPE's output.
+        grad_key = torch.zeros_like(key, dtype=accumulate_dtype, memory_format=torch.contiguous_format)
+        grad_value = torch.zeros_like(value, dtype=accumulate_dtype, memory_format=torch.contiguous_format)
         flattened_grad_key = grad_key.flatten(2)
         flattened_grad_value = grad_value.flatten(2)
         kv_width = flattened_grad_key.shape[-1]
@@ -524,6 +532,11 @@ def flex_sparse_gqa_attention(
 ) -> torch.Tensor:
     if not query.is_cuda or any(tensor.dtype != torch.bfloat16 for tensor in (query, key, value)):
         raise RuntimeError("Qwen3.8 QSA FlexAttention requires CUDA BF16 Q/K/V tensors")
+    from arctic_platform.model.implementations.qwen38.qsa_sparse_gqa import fused_sparse_gqa_attention
+    from arctic_platform.model.implementations.qwen38.qsa_sparse_gqa import fused_sparse_gqa_supported
+
+    if fused_sparse_gqa_supported(query, key):
+        return fused_sparse_gqa_attention(query, key, value, selected_token_ids, softmax_scale)
     return _SparseGQAAttention.apply(
         query,
         key,
@@ -579,8 +592,8 @@ def _qsa_attention_forward(
     if past_key_values is not None and past_key_values.get_seq_length() > 0:
         raise NotImplementedError("Qwen3.8 QSA FlexAttention cache decoding is handled by the inference backend")
     cp_group, _, _ = _cp_info(self)
-    key_states = _gather_sequence(key_states.transpose(1, 2), cp_group)
-    value_states = _gather_sequence(value_states.transpose(1, 2), cp_group)
+    key_states = gather_sequence(key_states.transpose(1, 2), cp_group)
+    value_states = gather_sequence(value_states.transpose(1, 2), cp_group)
     attention_output = flex_sparse_gqa_attention(
         query_states.transpose(1, 2),
         key_states,

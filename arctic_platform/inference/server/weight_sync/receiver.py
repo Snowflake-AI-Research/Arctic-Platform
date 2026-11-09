@@ -131,6 +131,32 @@ def _canonicalize_destinations(
     )
 
 
+def _shard_duplicating_mappers(model) -> list:
+    """Every ``hf_to_vllm_mapper`` in ``model`` that loads one source into several shards.
+
+    vLLM marks those with a list of shard ids (Gemma 4 ``attention_k_eq_v`` loads K into K and V). Inner models
+    apply their own mapper inside ``load_weights``, so the root's alone is not enough.
+    """
+    seen: set[int] = set()
+    mappers = []
+    for _, module in model.named_modules():
+        mapper = getattr(module, "hf_to_vllm_mapper", None)
+        if mapper is None or id(mapper) in seen:
+            continue
+        seen.add(id(mapper))
+        stacked = getattr(mapper, "orig_to_new_stacked", None) or {}
+        if any(isinstance(shard_ids, list) for _, shard_ids in stacked.values()):
+            mappers.append(mapper)
+    return mappers
+
+
+def _loaded_copies(mappers: list, name: str) -> int:
+    copies = 1
+    for mapper in mappers:
+        copies *= max(1, sum(1 for _ in mapper.apply([(name, torch.empty(0))])))
+    return copies
+
+
 def _loaded_destination_names(
     source_to_destinations: dict[str, list[str]],
 ) -> set[str]:
@@ -557,6 +583,7 @@ class WeightSyncExtension:
                     f"{tuple(tensor.shape)} and dtype {tensor.dtype}"
                 ) from exc
             loaded += 1
+            del tensor  # a rebuilt oversized tensor must not outlive its load
         if updater.pending:
             logger.warning(
                 "FP8 updater has %d incomplete modules", updater.pending,
@@ -618,6 +645,7 @@ class WeightSyncExtension:
             else:
                 orphans.append(name)
             loaded += 1
+            del tensor  # a rebuilt oversized tensor must not outlive its load
 
         if orphans:
             sample = "\n".join(f"  - {n}" for n in orphans[:10])
@@ -667,6 +695,7 @@ class WeightSyncExtension:
         )
 
         writer = _ShardAwareFusedWriter(model, self.device)
+        duplicating_mappers = _shard_duplicating_mappers(model)
         loaded = 0
         source_to_destinations: dict[str, list[str]] = {}
         skipped_source_names: list[str] = []
@@ -679,10 +708,12 @@ class WeightSyncExtension:
             source_l2_sq = _tensor_l2_sq(tensor)
             recv_l2_sq.add_(source_l2_sq)
             destination = writer.destination_name(name)
+            copies = 1
             if destination is not None:
                 writer.feed(name, tensor)
                 destinations = [destination]
             else:
+                copies = _loaded_copies(duplicating_mappers, name)
                 loaded_names = model.load_weights([(name, tensor)])
                 if isinstance(loaded_names, str):
                     destinations = [loaded_names]
@@ -691,10 +722,11 @@ class WeightSyncExtension:
             destinations = _canonicalize_destinations(destinations, param_names)
             if destinations:
                 source_to_destinations[name] = destinations
-                applied_source_l2_sq.add_(source_l2_sq)
+                applied_source_l2_sq.add_(source_l2_sq * copies)
             else:
                 skipped_source_names.append(name)
             loaded += 1
+            del tensor  # a rebuilt oversized tensor must not outlive its load
         if skipped_source_names:
             logger.warning(
                 "Weight sync skipped %d/%d received source tensor(s) because "
@@ -914,6 +946,19 @@ class WeightSyncExtension:
         if adapter_manager is None:
             raise RuntimeError("vLLM LoRA manager not created (model not loaded yet?).")
         return adapter_manager
+
+    def served_lora_names(self, names: list[str]) -> list[str]:
+        """Rename trainer adapter tensors the way LoRA weight sync does before building a ``LoRAModel``."""
+        prefix = _served_lm_module_prefix(getattr(self.model_runner, "model", None))
+        return [_remap_lora_key(name, prefix) for name in names]
+
+    def unbound_lora_modules(self, lora_int_id: int) -> list[str]:
+        """Modules of a registered adapter that no served LoRA layer will read."""
+        adapter_manager = self._lora_adapter_manager()
+        lora_model = adapter_manager.get_adapter(lora_int_id)
+        if lora_model is None:
+            raise RuntimeError(f"LoRA adapter id {lora_int_id} is not registered")
+        return sorted(set(lora_model.loras) - set(adapter_manager.modules))
 
     def sync_lora_weights_broadcast(
         self,
