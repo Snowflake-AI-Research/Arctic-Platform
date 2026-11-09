@@ -28,8 +28,7 @@ from arctic_platform.inference.utils import require_supported_vllm_version
 from arctic_platform.inference.vllm.args import EngineArgsPatch, AsyncEngineArgsPatch
 from arctic_platform.inference.vllm.config import (ParallelConfigPatch,
                                           SpeculativeConfigPatch,
-                                          VllmConfigPatch,
-                                          MLPSpeculatorConfigPatch)
+                                          VllmConfigPatch)
 from arctic_platform.inference.vllm.fp32_lm_head import (
     apply_fp32_lm_head_patches, set_fp32_lm_head_enabled)
 from arctic_platform.inference.vllm.stats import (SpecDecodingStatsPatch,
@@ -453,6 +452,11 @@ def apply_arctic_patches():
 
     # Register SwiftKV model configurations to transformers.
     AutoConfig.register("llama_swiftkv", LlamaSwiftKVConfig)
+    from arctic_platform.inference.vllm.spec_dec.config import MLPSpeculatorConfig
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
+
+    AutoConfig.register("mlp_speculator", MLPSpeculatorConfig, exist_ok=True)
+    _CONFIG_REGISTRY["mlp_speculator"] = MLPSpeculatorConfig
 
     from vllm import ModelRegistry
 
@@ -487,7 +491,6 @@ def apply_arctic_patches():
     SpecDecodingLoggingPatch.apply_patch()
     VllmConfigPatch.apply_patch()
     XgrammarBackendPatch.apply_patch()
-    MLPSpeculatorConfigPatch.apply_patch()
 
     # Forest Cascade Attention backend (always registered; runtime-gated
     # by --forest-cascade-attn-configs).
