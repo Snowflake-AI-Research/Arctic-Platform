@@ -186,6 +186,14 @@ class TiledMlpPatch(BaseModel):
     token_chunk_size: PositiveInt = Field(..., description="Maximum tokens per recomputed dense-MLP tile.")
 
 
+class TiledRematPatch(BaseModel):
+    """Recompute packed attention and linear-attention mixers in token tiles of whole samples."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    token_budget: PositiveInt = Field(4096, description="Maximum tokens per packed mixer tile.")
+
+
 class Patches(BaseModel):
     """Optional features applied to the model after it is loaded."""
 
@@ -201,6 +209,9 @@ class Patches(BaseModel):
     )
     compile: CompilePatch | None = Field(None, description="Per-transformer-layer torch.compile settings.")
     tiled_mlp: TiledMlpPatch | None = Field(None, description="Recompute dense MLPs in token tiles.")
+    tiled_remat: TiledRematPatch | None = Field(
+        None, description="Recompute packed mixers in whole-sample tiles. None disables."
+    )
     lm_head: LmHeadPatch | None = Field(None, description="LM-head precision and chunking.")
     zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
     peft: dict | None = Field(None, description="PEFT config; wrap after other patches, before the optimizer.")
@@ -277,6 +288,28 @@ class ModelSpec(BaseModel):
             )
             zorro_train_patch = ZorroTrainPatch(**{k: cfg[k] for k in zorro_keys if k in cfg})
 
+        tiled_mlp_patch = None
+        tiled_mlp_token_chunk_size = cfg.get("tiled_mlp_token_chunk_size")
+        if tiled_mlp_token_chunk_size is not None:
+            tiled_mlp_patch = TiledMlpPatch(token_chunk_size=tiled_mlp_token_chunk_size)
+
+        tiled_remat_patch = None
+        tiled_remat_token_budget = cfg.get("tiled_remat_token_budget")
+        if tiled_remat_token_budget is not None:
+            tiled_remat_patch = TiledRematPatch(token_budget=tiled_remat_token_budget)
+
+        activation_offload_patch = None
+        if cfg.get("enable_activation_offload", False):
+            offload_keys = (
+                "keep_last_n",
+                "use_streams",
+                "tensor_size_threshold",
+                "pin_memory_enabled",
+                "pin_memory_max_size_gib",
+                "pin_memory_bucket_size_mib",
+            )
+            activation_offload_patch = ActivationOffloadPatch(**{k: cfg[k] for k in offload_keys if k in cfg})
+
         # Worker bridge defaults GC on (historical DeepSpeedWorker behavior). Generic
         # ``Patches.gradient_checkpointing`` stays False for direct ModelSpec users.
         return cls(
@@ -288,6 +321,9 @@ class ModelSpec(BaseModel):
                 liger=cfg.get("use_liger", False),
                 zorro_train=zorro_train_patch,
                 gradient_checkpointing=cfg.get("enable_gradient_checkpointing", True),
+                tiled_mlp=tiled_mlp_patch,
+                tiled_remat=tiled_remat_patch,
+                activation_offload=activation_offload_patch,
                 peft=cfg.get("peft_config"),
             ),
         )

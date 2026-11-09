@@ -361,6 +361,46 @@ class TestFromDsWorkerConfig:
         assert z.logits_compute_from_fp32_inputs is True
         assert z.logits_compute_in_fp32 is True
 
+    def test_tiled_mlp_token_chunk_size_maps(self):
+        spec = ModelSpec.from_ds_worker_config(
+            "x",
+            {"attn_implementation": "flash_attention_3", "tiled_mlp_token_chunk_size": 4096},
+        )
+        assert spec.patches.tiled_mlp is not None
+        assert spec.patches.tiled_mlp.token_chunk_size == 4096
+
+    def test_tiled_remat_token_budget_maps(self):
+        spec = ModelSpec.from_ds_worker_config(
+            "x",
+            {"attn_implementation": "flash_attention_3", "tiled_remat_token_budget": 4096},
+        )
+        assert spec.patches.tiled_remat is not None
+        assert spec.patches.tiled_remat.token_budget == 4096
+
+    def test_activation_offload_flag_maps_defaults(self):
+        from arctic_platform.model.config import ActivationOffloadPatch
+
+        spec = ModelSpec.from_ds_worker_config(
+            "x",
+            {
+                "attn_implementation": "flash_attention_3",
+                "enable_activation_offload": True,
+                "enable_gradient_checkpointing": True,
+            },
+        )
+        defaults = ActivationOffloadPatch()
+        assert spec.patches.activation_offload is not None
+        assert spec.patches.activation_offload.enabled is True
+        assert spec.patches.activation_offload.keep_last_n == defaults.keep_last_n
+        assert spec.patches.activation_offload.pin_memory_max_size_gib == defaults.pin_memory_max_size_gib
+
+    def test_activation_offload_absent_when_flag_false(self):
+        spec = ModelSpec.from_ds_worker_config(
+            "x",
+            {"attn_implementation": "flash_attention_3", "enable_activation_offload": False},
+        )
+        assert spec.patches.activation_offload is None
+
     def test_zorro_uses_pydantic_defaults_for_omitted_fields(self):
         from arctic_platform.model.config import ZorroTrainPatch
 

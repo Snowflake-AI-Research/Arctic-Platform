@@ -71,6 +71,14 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "tiled_remat.token_budget",
+        runs_in="trainer",
+        goal="memory",
+        why="Recompute packed attention and linear-attention mixers in whole-sample tiles of this many tokens.",
+        source="`patches.tiled_remat.token_budget`",
+        registry=registry,
+    )
+    register_option(
         "lm_head.fp32",
         runs_in="both",
         goal="parity",

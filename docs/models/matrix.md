@@ -34,6 +34,7 @@ each loader's own validation. The reasons follow the table.
 | `numerics.reduce_dtype` | trainer | parity | yes | yes | no | yes | yes | yes | no | yes | yes |
 | `peft` | trainer | mode | no | no | no | no | no | no | yes | no | no |
 | `tiled_mlp.token_chunk_size` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes |
+| `tiled_remat.token_budget` | trainer | memory | no | no | no | no | no | no | yes | no | no |
 | `zorro_train` | trainer | mode | no | no | no | no | no | no | yes | no | no |
 
 ## Options
@@ -62,13 +63,14 @@ each loader's own validation. The reasons follow the table.
 - `numerics.reduce_dtype`: The dtype gradients are reduced in. Today: `loader_options.reduce_dtype`.
 - `peft`: Train adapters (LoRA) instead of the full weights. Today: `patches.peft`.
 - `tiled_mlp.token_chunk_size`: Recompute the MLP in token tiles of this size. Today: `patches.tiled_mlp.token_chunk_size`; `loader_options.tiled_mlp_token_chunk_size`.
+- `tiled_remat.token_budget`: Recompute packed attention and linear-attention mixers in whole-sample tiles of this many tokens. Today: `patches.tiled_remat.token_budget`.
 - `zorro_train`: Replace the forward with the ZoRRo Train log-prob and entropy path. Today: `patches.zorro_train`.
 
 ## `deepseek_v4`
 
 Extends `generic_moe`.
 
-8 of 25 options unsupported.
+9 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): DeepSeek V4 runs its own fused sparse attention kernel, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -78,13 +80,14 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `tiled_remat.token_budget` (no): packed mixer tiling is only on the huggingface SFT path
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `deepseek_v41`
 
 Extends `generic_moe`.
 
-8 of 25 options unsupported.
+9 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): DeepSeek V4.1 runs its own fused sparse attention kernel, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -94,11 +97,12 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `tiled_remat.token_budget` (no): packed mixer tiling is only on the huggingface SFT path
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `dflash2`
 
-17 of 25 options unsupported.
+18 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): neither the DFlash2 draft nor the target it reads uses sparse MLA attention
 - `checkpointing.freq` (no): the loader rejects `patches.gradient_checkpointing`
@@ -122,11 +126,12 @@ Extends `generic_moe`.
 - `numerics.reduce_dtype` (no): no equivalent option
 - `peft` (no): the loader rejects `patches.peft`: the draft is trained in full
 - `tiled_mlp.token_chunk_size` (no): the loader rejects `patches.tiled_mlp`
+- `tiled_remat.token_budget` (no): packed mixer tiling is only on the huggingface SFT path
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `generic_moe`
 
-8 of 25 options unsupported.
+9 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): no model family behind this loader uses sparse MLA attention
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -136,24 +141,26 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `tiled_remat.token_budget` (no): packed mixer tiling is only on the huggingface SFT path
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `glm5_next`
 
 Extends `generic_moe`.
 
-6 of 25 options unsupported.
+7 of 26 options unsupported.
 
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
 - `lm_head.vocab_chunk_size` (no): no equivalent option
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `tiled_remat.token_budget` (no): packed mixer tiling is only on the huggingface SFT path
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `glm_moe_dsa`
 
-8 of 25 options unsupported.
+9 of 26 options unsupported.
 
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
 - `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
@@ -162,11 +169,12 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `tiled_remat.token_budget` (no): packed mixer tiling is only on the huggingface SFT path
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `huggingface`
 
-7 of 25 options unsupported.
+7 of 26 options unsupported.
 
 - `attention.sparse_mla` (no): no equivalent option; sparse MLA is used only by the GLM loaders glm_moe_dsa and glm5_next
 - `checkpointing.mode` (no): no equivalent option; `patches.gradient_checkpointing` always recomputes whole layers
@@ -183,7 +191,7 @@ Extends `generic_moe`.
 
 ## `qwen3_5_moe`
 
-7 of 25 options unsupported.
+8 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): Qwen3.5-MoE has no sparse MLA attention
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -192,13 +200,14 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `tiled_remat.token_budget` (no): packed mixer tiling is only on the huggingface SFT path
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `qwen4_exp`
 
 Extends `generic_moe`.
 
-6 of 25 options unsupported.
+7 of 26 options unsupported.
 
 - `attention.sparse_mla` (n/a): Qwen3.8-Flash-Next uses QSA attention, not sparse MLA
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
@@ -206,4 +215,5 @@ Extends `generic_moe`.
 - `lm_head.vocab_chunk_size` (no): no equivalent option
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
+- `tiled_remat.token_budget` (no): packed mixer tiling is only on the huggingface SFT path
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
