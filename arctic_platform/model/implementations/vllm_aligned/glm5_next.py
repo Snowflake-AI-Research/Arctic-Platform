@@ -349,7 +349,7 @@ def bf16_weight(linear: Any) -> torch.Tensor:
 
 
 def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlens: torch.Tensor,
-                  config: Any, prompt_lens: torch.Tensor | None = None) -> torch.Tensor:  # fmt: skip
+                  config: Any, prompt_lens: torch.Tensor | None = None, record: dict | None = None) -> torch.Tensor:  # fmt: skip
     """vLLM's ``Glm5NextMLAAttention`` (sparse MLA with ``mla_use_nope``) on prompts no longer than ``index_topk``.
 
     Such prompts take vLLM's short-prefill path: every token attends to all earlier tokens of its request, with no
@@ -388,6 +388,8 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     seq_of_token = torch.repeat_interleave(torch.arange(starts.numel(), device=x.device), lengths)
     topk = indexer_topk(attn.indexer, x, q_c, positions, cu_seqlens, config, topk_buffer_width(config), prompt_lens)
     rows = torch.where(topk >= 0, topk + starts.to(torch.int32)[seq_of_token, None], topk)
+    if record is not None:
+        record["topk"] = rows
     valid = (topk >= 0).sum(-1).to(torch.int32)
     kv_rows = torch.cat([kv_c, k_pe], dim=-1)
     v_cache = kv_rows[:, :latent].unsqueeze(1).unsqueeze(1)
@@ -418,7 +420,8 @@ def _mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     prompt_lens = getattr(ctx, "prompt_lens", None)
     if layer.block_type == "linear_attention":
         return kda_forward(layer.self_attn, x, ctx.cu_seqlens, ctx.config, prompt_lens)
-    return mla_attention(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config, prompt_lens)
+    return mla_attention(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config, prompt_lens,
+                         _record(ctx, layer))  # fmt: skip
 
 
 def fp8_block_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale_inv: torch.Tensor) -> torch.Tensor:
@@ -541,7 +544,7 @@ def _triton_experts(num_experts: int, top_k: int, hidden: int, intermediate: int
     return FusedMoEKernel(prepare, TritonExperts(moe_config, quant_config)), MoEActivation.SILU
 
 
-def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None) -> torch.Tensor:
+def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None, record: dict | None = None) -> torch.Tensor:
     """vLLM's ``Glm5NextMoE`` at TP 1 on the trainer's ``MoE``: fp32 router logits by the batch-invariant matmul, the
     batch-invariant grouped top-k (renormalized and scaled by ``routed_scaling_factor`` there, as vLLM's router does
     when the runner does not scale the output), the Triton routed experts, then ``shared + routed`` in bf16."""
@@ -565,6 +568,8 @@ def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None) -> torch.T
         routed_scaling_factor=config.routed_scaling_factor,
         e_score_correction_bias=mlp.expert_bias,
     )
+    if record is not None:
+        record["experts"] = ids.to(torch.int64)
     experts = mlp.experts
     total = config.n_routed_experts
     w1, w2, w3 = (_full(t, total, ep_group) for t in (experts.w1, experts.w2, experts.w3))
@@ -584,7 +589,13 @@ def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None) -> torch.T
 def _mlp(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     if hasattr(layer.mlp, "gate_proj"):
         return dense_mlp(layer.mlp, x)
-    return moe(layer.mlp, x, ctx.config, getattr(ctx, "ep_group", None))
+    return moe(layer.mlp, x, ctx.config, getattr(ctx, "ep_group", None), _record(ctx, layer))
+
+
+def _record(ctx: Any, layer: Any) -> dict | None:
+    """Where the forward keeps ``layer``'s discrete choices (expert ids, sparse top-k rows) for the stock recompute."""
+    replay = getattr(ctx, "replay", None)
+    return None if replay is None else replay.setdefault(id(layer), {})
 
 
 def aligned_layer(layer: Any, streams: torch.Tensor, config: Any, ctx: Any) -> torch.Tensor:
@@ -620,22 +631,76 @@ def check_supported_config(config: Any) -> None:
         raise ValueError("the vLLM-aligned GLM-5.3-Flash forward covers sparse MLA with mla_use_nope")
 
 
-def _stock_layer_runner(backbone: Any, input_ids: torch.Tensor, position_ids: torch.Tensor, kwargs: dict) -> Callable:
+REPLAY_TOPK_ATTR = "_ap_replay_topk_indices"
+# The block-FP8 projections vLLM dequantizes to bf16 at load (see ``bf16_weight``); the trainer runs them W8A8.
+MLA_DEQUANTIZED_PROJECTIONS = ("q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj")
+
+
+def _bf16_linear_forward(self, x: torch.Tensor) -> torch.Tensor:
+    """A ``BlockFp8Linear`` as vLLM serves it: a bf16 matmul on the dequantized weight (plus a LoRA delta)."""
+    from arctic_platform.model.implementations.fp8 import original_param_and_lora_delta
+
+    weight, delta = original_param_and_lora_delta(self, "weight")
+    weight = dequant_fp8_block(weight, self.weight_scale_inv, self.block_size)
+    if delta is not None:
+        weight = weight + delta.to(weight.dtype)
+    return torch.nn.functional.linear(x, weight.to(x.dtype))
+
+
+def _stock_layer_runner(backbone: Any, input_ids: torch.Tensor, position_ids: torch.Tensor, kwargs: dict,
+                        replay: dict | None = None, vllm_mla_weights: bool = True) -> Callable:  # fmt: skip
     """``run_stock(layer, streams)``: the stock decoder layer on ``[tokens, hc_mult, hidden]`` streams, packed as the
-    stock model forward packs them (one row, the attention-mask mapping and the packing kwargs it passes down)."""
+    stock model forward packs them (one row, the attention-mask mapping and the packing kwargs it passes down).
+
+    With ``replay`` (the aligned forward's records), the stock layer reuses the forward's discrete choices instead of
+    making its own: its router takes the forward's expert ids (router replay) and its sparse attention the forward's
+    top-k rows, so the backward differentiates the selection the forward computed. With ``vllm_mla_weights``, the
+    sparse-attention projections vLLM serves dequantized run as bf16 matmuls instead of the trainer's W8A8 GEMMs.
+    """
+    import types as _types
+
     mask = torch.ones(1, input_ids.numel(), dtype=torch.bool, device=input_ids.device)
     masks = {"deepseek_sparse_attention": mask, "linear_attention": mask}
 
     def run(layer: Any, streams: torch.Tensor) -> torch.Tensor:
-        out, _ = layer(
-            streams.unsqueeze(0),
-            attention_mask=masks[layer.block_type],
-            position_ids=position_ids.reshape(1, -1),
-            position_embeddings=None,
-            input_ids=input_ids.reshape(1, -1),
-            prev_topk_indices=None,
-            **kwargs,
-        )
+        swapped = []
+        if vllm_mla_weights and layer.block_type == "deepseek_sparse_attention":
+            for name in MLA_DEQUANTIZED_PROJECTIONS:
+                module = getattr(layer.self_attn, name, None)
+                if module is not None and getattr(module, "weight_scale_inv", None) is not None:
+                    module.forward = _types.MethodType(_bf16_linear_forward, module)
+                    swapped.append(module)
+        try:
+            return _run(layer, streams)
+        finally:
+            for module in swapped:
+                del module.forward
+
+    def _run(layer: Any, streams: torch.Tensor) -> torch.Tensor:
+        record = {} if replay is None else replay.get(id(layer), {})
+        extra = {}
+        experts = record.get("experts")
+        if experts is not None and kwargs.get("routed_experts") is None:
+            index = layer._replay_layer_idx
+            routes = experts.new_zeros((1, experts.shape[0], index + 1, experts.shape[1]))
+            routes[0, :, index] = experts
+            extra["routed_experts"] = routes
+        topk = record.get("topk")
+        if topk is not None:
+            setattr(layer.self_attn, REPLAY_TOPK_ATTR, topk.unsqueeze(0))
+        try:
+            out, _ = layer(
+                streams.unsqueeze(0),
+                attention_mask=masks[layer.block_type],
+                position_ids=position_ids.reshape(1, -1),
+                position_embeddings=None,
+                input_ids=input_ids.reshape(1, -1),
+                prev_topk_indices=None,
+                **{**kwargs, **extra},
+            )
+        finally:
+            if topk is not None:
+                delattr(layer.self_attn, REPLAY_TOPK_ATTR)
         return out.squeeze(0)
 
     return run
@@ -672,8 +737,9 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
     cu = layout.cu_seqlens.to(torch.int32)
     ctx = types.SimpleNamespace(config=config, positions=layout.positions, cu_seqlens=cu,
                                 prompt_lens=prompt_lengths(trained, cu),
+                                replay={} if torch.is_grad_enabled() else None,
                                 ep_group=getattr(model, "_vllm_aligned_ep_group", None))  # fmt: skip
-    run_stock = _stock_layer_runner(backbone, input_ids, position_ids, kwargs)
+    run_stock = _stock_layer_runner(backbone, input_ids, position_ids, kwargs, ctx.replay)
     hidden = aligned_hidden(backbone, input_ids, config, ctx, run_stock)
     return ops.lm_head_logprobs(
         hidden,

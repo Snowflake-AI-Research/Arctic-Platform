@@ -122,3 +122,51 @@ def test_prompt_lengths_run_through_the_first_trained_position():
     trained[[2, 3]] = True  # request 0: prompt of 3 tokens, then decoded
     trained[5] = True  # request 1: trained from its first token
     assert prompt_lengths(trained, cu).tolist() == [3, 1, 4]
+
+
+def test_stock_recompute_replays_the_forward_choices_and_vllm_mla_weights():
+    import types
+
+    import torch
+
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next
+
+    class Projection(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+            self.weight_scale_inv = torch.nn.Parameter(torch.ones(1, 1), requires_grad=False)
+            self.block_size = 128
+
+        def forward(self, x):
+            return "fp8"
+
+    seen = {}
+
+    class Layer(torch.nn.Module):
+        block_type = "deepseek_sparse_attention"
+        _replay_layer_idx = 2
+
+        def __init__(self):
+            super().__init__()
+            self.self_attn = types.SimpleNamespace(q_a_proj=Projection(), kv_a_proj_with_mqa=Projection(),
+                                                   q_b_proj=Projection(), o_proj=Projection())  # fmt: skip
+
+        def forward(self, streams, **kwargs):
+            seen["routes"] = kwargs.get("routed_experts")
+            seen["topk"] = getattr(self.self_attn, glm5_next.REPLAY_TOPK_ATTR, None)
+            seen["projection"] = self.self_attn.q_a_proj.forward
+            return streams, None
+
+    layer = Layer()
+    experts = torch.tensor([[1, 2], [3, 4], [5, 6]])
+    topk = torch.tensor([[0, -1], [0, 1], [0, 1]], dtype=torch.int32)
+    replay = {id(layer): {"experts": experts, "topk": topk}}
+    run = glm5_next._stock_layer_runner(None, torch.zeros(1, 3, dtype=torch.long), torch.arange(3)[None], {}, replay)
+    run(layer, torch.zeros(3, 4, 8))
+
+    assert seen["routes"].shape == (1, 3, 3, 2) and torch.equal(seen["routes"][0, :, 2], experts)
+    assert torch.equal(seen["topk"][0], topk)
+    assert seen["projection"].__func__ is glm5_next._bf16_linear_forward
+    assert not hasattr(layer.self_attn, glm5_next.REPLAY_TOPK_ATTR)
+    assert layer.self_attn.q_a_proj(torch.zeros(1)) == "fp8"
