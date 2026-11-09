@@ -42,33 +42,52 @@ def get_model(config, device=torch.device("cpu"), dtype=torch.bfloat16):
     text["use_grouped_mm"] = config.moe_use_grouped_mm and dtype == torch.bfloat16
     text["tie_word_embeddings"] = False
     text["_attn_implementation"] = "eager"
+    text["inkling_mlp_token_chunk_size"] = getattr(config, "tiled_mlp_token_chunk_size", None)
     text["_name_or_path"] = config.name
     hf_config = InklingTextConfig(**text)
     if hf_config.n_routed_experts % config.ep:
         raise ValueError("Inkling expert count must be divisible by expert_parallel")
     with device:
-        return InklingForCausalLMPrimeRL.from_config(hf_config, dtype=dtype, attn_implementation="eager")
+        model = InklingForCausalLMPrimeRL.from_config(hf_config, dtype=dtype, attn_implementation="eager")
+    if getattr(config, "attn", "eager") == "flex_attention":
+        from arctic_platform.model.implementations.inkling.attention import enable_flex_attention
+
+        enable_flex_attention(model, query_chunk_size=getattr(config, "attention_query_chunk_size", 2048))
+        model.config._attn_implementation = "flex_attention"
+    return model
 
 
-def _keep_native_lm_head(model, **kwargs):
-    pass
+def _configure_lm_head(model, *, chunk_size, fused_cross_entropy, fp32_lm_head):
+    model._inkling_lm_head_token_chunk_size = chunk_size
+    model._inkling_fp32_lm_head = fp32_lm_head
+    model._dss_chunked_lm_head_logprobs = chunk_size is not None
+    if fp32_lm_head and chunk_size is None:
+        from arctic_platform.model.implementations.gpu.lm_head import enable_fp32_lm_head
+
+        enable_fp32_lm_head(model)
 
 
-def _adapter_for_inkling():
+def _adapter_for_inkling(options=None):
+    def configured_model(config, **kwargs):
+        if options is not None:
+            config.attention_query_chunk_size = options.attention_query_chunk_size
+            config.tiled_mlp_token_chunk_size = options.tiled_mlp_token_chunk_size
+        return get_model(config, **kwargs)
+
     return replace(
         _adapter(),
-        get_model=get_model,
-        inject_lm_head=_keep_native_lm_head,
+        get_model=configured_model,
+        inject_lm_head=_configure_lm_head,
         load_dcp_from_hf=load_weights,
         vllm_weight_export=build_iter_vllm_weights,
     )
 
 
 def load_inkling_model(**kwargs):
-    kwargs["options"] = Qwen3_5MoeOptions.model_validate(
-        {**kwargs["options"].model_dump(), "fused_cross_entropy": False, "fused_lm_head_token_chunk_size": "disabled"}
-    )
-    adapter = _adapter_for_inkling()
+    options = kwargs["options"]
+    values = options.model_dump(exclude={"attention_query_chunk_size", "tiled_mlp_token_chunk_size"})
+    kwargs["options"] = Qwen3_5MoeOptions.model_validate({**values, "fused_cross_entropy": False})
+    adapter = _adapter_for_inkling(options)
 
     def family_loader(*args, **options):
         return load_moe_model_for_deepspeed(adapter, *args, **options)

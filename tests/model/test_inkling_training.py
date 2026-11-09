@@ -70,7 +70,280 @@ def tiny_config():
     )
 
 
+def initialized_prime_model(config):
+    native = InklingForCausalLM(config)
+    state = dict(native.state_dict())
+    for index, kind in enumerate(config.mlp_layer_types):
+        if kind == "sparse":
+            prefix = f"model.layers.{index}.mlp.experts."
+            state[prefix + "w1"], state[prefix + "w3"] = state.pop(prefix + "gate_up_proj").chunk(2, dim=1)
+            state[prefix + "w2"] = state.pop(prefix + "down_proj")
+    model = InklingForCausalLMPrimeRL(config)
+    model.load_state_dict(state, strict=True)
+    return model
+
+
 class TestInklingTraining(TestCasePlus):
+    @require_torch_gpu
+    def test_flex_chunked_full_and_lora_steps_with_activation_offload(self):
+        import copy
+
+        from arctic_platform.model import ActivationCheckpointConfig
+        from arctic_platform.model.implementations.inkling.attention import enable_flex_attention
+        from arctic_platform.model.implementations.inkling.deepspeed_integration import _configure_lm_head
+        from arctic_platform.model.implementations.qwen35.model_builder import apply_ac
+
+        set_seed(947)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        config = tiny_config()
+        config.head_dim = config.swa_head_dim = 16
+        initial = initialized_prime_model(config).cuda().float()
+        for module in initial.modules():
+            if isinstance(module, InklingMoE):
+                module.ep_comm_backend = "local"
+        ids = torch.randint(0, 60, (2, 259), device="cuda")
+        labels = ids.clone()
+        labels[:, :3] = -100
+        batch = dict(input_ids=ids, labels=labels)
+        for lora in (False, True):
+            with self.subTest(lora=lora):
+                reference = copy.deepcopy(initial)
+                actual = copy.deepcopy(initial)
+                if lora:
+                    options = dict(
+                        peft_type="LORA", task_type="CAUSAL_LM", r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"]
+                    )
+                    set_seed(42)
+                    reference = apply_peft(reference, options)
+                    set_seed(42)
+                    actual = apply_peft(actual, options)
+                base = actual.base_model.model if lora else actual
+                enable_flex_attention(base, query_chunk_size=128)
+                _configure_lm_head(base, chunk_size=64, fused_cross_entropy=False, fp32_lm_head=False)
+                for module in base.modules():
+                    if hasattr(module, "token_chunk_size"):
+                        module.token_chunk_size = 64
+                apply_ac(
+                    base,
+                    ActivationCheckpointConfig(
+                        router_replay_recompute=False,
+                        offload_config=dict(enabled=True, tensor_size_threshold=0, keep_last_n=0),
+                    ),
+                )
+                optimizers = [
+                    torch.optim.AdamW([p for p in m.parameters() if p.requires_grad], lr=1e-4)
+                    for m in (reference, actual)
+                ]
+                for _ in range(3):
+                    records = []
+                    for model, optimizer in zip((reference, actual), optimizers):
+                        optimizer.zero_grad()
+                        loss = model(**batch).loss
+                        loss.backward()
+                        grads = [p.grad.clone() for p in model.parameters() if p.requires_grad]
+                        norm = torch.stack([g.square().sum() for g in grads]).sum().sqrt()
+                        records.append((loss.detach(), norm, grads))
+                        optimizer.step()
+                    expected, result = records
+                    torch_assert_close(result[0], expected[0], atol=1e-6, rtol=0)
+                    torch_assert_close(result[1], expected[1], atol=1e-6, rtol=0)
+                    for grad, baseline in zip(result[2], expected[2]):
+                        torch_assert_close(grad, baseline, atol=1e-6, rtol=0)
+
+    @require_torch_gpu
+    def test_flex_training_matches_eager_across_query_chunks(self):
+        import copy
+
+        from arctic_platform.model.implementations.inkling.attention import enable_flex_attention
+
+        set_seed(42)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        config = tiny_config()
+        config.head_dim = config.swa_head_dim = 16
+        config.log_scaling_n_floor = 128
+        config.log_scaling_alpha = 0.1
+        reference = initialized_prime_model(config).cuda().float()
+        for module in reference.modules():
+            if isinstance(module, InklingMoE):
+                module.ep_comm_backend = "local"
+        actual = copy.deepcopy(reference)
+        enable_flex_attention(actual, query_chunk_size=128)
+        ids = torch.randint(0, 60, (2, 259), device="cuda")
+        mask = torch.ones_like(ids)
+        mask[1, -3:] = 0
+        labels = ids.clone()
+        labels[:, :3] = -100
+        labels[mask == 0] = -100
+        batch = dict(input_ids=ids, attention_mask=mask, labels=labels)
+        baseline = reference(**batch)
+        baseline.loss.backward()
+        result = actual(**batch)
+        result.loss.backward()
+        torch_assert_close(result.logits, baseline.logits, atol=1e-6, rtol=0)
+        torch_assert_close(result.loss, baseline.loss, atol=1e-6, rtol=0)
+        expected_norm = (
+            torch.stack([p.grad.square().sum() for p in reference.parameters() if p.requires_grad]).sum().sqrt()
+        )
+        norm = torch.stack([p.grad.square().sum() for p in actual.parameters() if p.requires_grad]).sum().sqrt()
+        torch_assert_close(norm, expected_norm, atol=1e-6, rtol=0)
+        for (name, parameter), (expected_name, expected) in zip(
+            actual.named_parameters(), reference.named_parameters()
+        ):
+            self.assertEqual(name, expected_name)
+            if not parameter.requires_grad:
+                continue
+            torch_assert_close(parameter.grad, expected.grad, atol=1e-6, rtol=0, msg=name)
+
+    @require_torch_gpu
+    def test_flex_bf16_padding_and_packed_sequence_parity(self):
+        import copy
+
+        from arctic_platform.model.implementations.inkling.attention import enable_flex_attention
+        from arctic_platform.model.implementations.inkling.deepspeed_integration import _configure_lm_head
+
+        set_seed(947)
+        config = tiny_config()
+        config.head_dim = config.swa_head_dim = 16
+        config.log_scaling_n_floor = 128
+        config.log_scaling_alpha = 0.1
+        initial = initialized_prime_model(config).cuda().bfloat16()
+        for module in initial.modules():
+            if isinstance(module, InklingMoE):
+                module.ep_comm_backend = "local"
+        ids = torch.randint(0, 60, (2, 259), device="cuda")
+        for layout in ("right", "left", "packed"):
+            with self.subTest(layout=layout):
+                reference, actual = (copy.deepcopy(initial), copy.deepcopy(initial))
+                enable_flex_attention(actual, query_chunk_size=128)
+                _configure_lm_head(actual, chunk_size=64, fused_cross_entropy=False, fp32_lm_head=False)
+                mask = torch.ones_like(ids)
+                labels = ids.clone()
+                positions = torch.arange(ids.shape[1], device="cuda")[None].expand_as(ids).clone()
+                if layout == "right":
+                    mask[1, -3:] = 0
+                elif layout == "left":
+                    mask[1, :3] = 0
+                    labels[1, 3] = -100
+                else:
+                    positions[:, 131:] -= 131
+                    labels[:, 131] = -100
+                labels[mask == 0] = -100
+                batch = dict(input_ids=ids, labels=labels, attention_mask=mask, position_ids=positions)
+                baseline = reference(**batch)
+                baseline.loss.backward()
+                result = actual(**batch)
+                result.loss.backward()
+                # BF16 eager scores round between matmul and softmax; Flex fuses those operations.
+                torch_assert_close(result.loss, baseline.loss, atol=1e-3, rtol=0)
+                records = []
+                for model in (reference, actual):
+                    gradients = [p.grad.float() for p in model.parameters() if p.requires_grad]
+                    self.assertTrue(all(torch.isfinite(g).all() for g in gradients))
+                    records.append(torch.stack([g.square().sum() for g in gradients]).sum().sqrt())
+                torch_assert_close(records[1], records[0], atol=1e-3, rtol=0)
+                for (name, parameter), expected in zip(actual.named_parameters(), reference.parameters()):
+                    if parameter.requires_grad:
+                        torch_assert_close(parameter.grad, expected.grad, atol=1e-3, rtol=0, msg=name)
+
+    @require_torch_gpu
+    def test_chunked_head_preserves_sft_loss_gradients_and_logprobs(self):
+        import copy
+
+        from arctic_platform.model.implementations.inkling.deepspeed_integration import _configure_lm_head
+
+        set_seed(947)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        reference = initialized_prime_model(tiny_config()).cuda().float()
+        for module in reference.modules():
+            if isinstance(module, InklingMoE):
+                module.ep_comm_backend = "local"
+        actual = copy.deepcopy(reference)
+        _configure_lm_head(actual, chunk_size=4, fused_cross_entropy=False, fp32_lm_head=False)
+        ids = torch.randint(0, 60, (2, 9), device="cuda")
+        labels = ids.clone()
+        labels[:, :3] = -100
+        baseline = reference(input_ids=ids, labels=labels)
+        baseline.loss.backward()
+        result = actual(input_ids=ids, labels=labels)
+        result.loss.backward()
+        self.assertIsNone(result.logits)
+        torch_assert_close(result.loss, baseline.loss, atol=1e-6, rtol=0)
+        for (name, parameter), expected in zip(actual.named_parameters(), reference.parameters()):
+            if not parameter.requires_grad:
+                continue
+            torch_assert_close(parameter.grad, expected.grad, atol=1e-6, rtol=0, msg=name)
+        expected_logprobs = baseline.logits.float().log_softmax(-1).gather(-1, ids[:, :, None]).squeeze(-1)
+        logprobs = actual(input_ids=ids, labels=ids, dss_compute_logprobs=True)["logprobs"]
+        torch_assert_close(logprobs, expected_logprobs, atol=1e-6, rtol=0)
+        last = actual(input_ids=ids, labels=ids, dss_compute_logprobs=True, logits_to_keep=3)["logprobs"]
+        torch_assert_close(last, expected_logprobs[:, -3:], atol=1e-6, rtol=0)
+
+    @require_torch_gpu
+    def test_flex_checkpoint_resume_reproduces_next_full_and_lora_update(self):
+        import copy
+
+        from arctic_platform.model.implementations.inkling.attention import enable_flex_attention
+        from arctic_platform.model.implementations.inkling.deepspeed_integration import _configure_lm_head
+
+        set_seed(947)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        config = tiny_config()
+        config.head_dim = config.swa_head_dim = 16
+        initial = initialized_prime_model(config).cuda().float()
+        for module in initial.modules():
+            if isinstance(module, InklingMoE):
+                module.ep_comm_backend = "local"
+        ids = torch.randint(0, 60, (2, 259), device="cuda")
+        for lora in (False, True):
+            with self.subTest(lora=lora):
+
+                def build():
+                    model = copy.deepcopy(initial)
+                    if lora:
+                        set_seed(42)
+                        model = apply_peft(
+                            model,
+                            dict(
+                                peft_type="LORA",
+                                task_type="CAUSAL_LM",
+                                r=2,
+                                lora_alpha=4,
+                                target_modules=["q_proj", "v_proj"],
+                            ),
+                        )
+                    base = model.base_model.model if lora else model
+                    enable_flex_attention(base, query_chunk_size=128)
+                    _configure_lm_head(base, chunk_size=64, fused_cross_entropy=False, fp32_lm_head=False)
+                    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
+                    return model, optimizer
+
+                def step(model, optimizer):
+                    optimizer.zero_grad()
+                    loss = model(input_ids=ids, labels=ids).loss
+                    loss.backward()
+                    norm = (
+                        torch.stack([p.grad.square().sum() for p in model.parameters() if p.requires_grad])
+                        .sum()
+                        .sqrt()
+                    )
+                    optimizer.step()
+                    return loss.detach(), norm
+
+                model, optimizer = build()
+                step(model, optimizer)
+                checkpoint = dict(
+                    model=copy.deepcopy(model.state_dict()), optimizer=copy.deepcopy(optimizer.state_dict())
+                )
+                expected = step(model, optimizer)
+                resumed, resumed_optimizer = build()
+                resumed.load_state_dict(checkpoint["model"], strict=True)
+                resumed_optimizer.load_state_dict(checkpoint["optimizer"])
+                actual = step(resumed, resumed_optimizer)
+                for value, baseline in zip(actual, expected):
+                    torch_assert_close(value, baseline, atol=1e-6, rtol=0)
+                for name, parameter in model.state_dict().items():
+                    torch_assert_close(resumed.state_dict()[name], parameter, atol=1e-6, rtol=0, msg=name)
+
     def checkpoint_config(self, **text):
         from pathlib import Path
 
@@ -91,6 +364,38 @@ class TestInklingTraining(TestCasePlus):
         path = self.checkpoint_config()
         with self.assertRaisesRegex(ValueError, "relative-position bias"):
             ModelSpec(model_path_or_name=path, attn_implementation="sdpa")
+
+    def test_flex_loader_routes_chunking_options(self):
+        from arctic_platform.model.implementations.inkling.attention import InklingFlexAttention
+        from arctic_platform.model.implementations.inkling.deepspeed_integration import _adapter_for_inkling
+        from arctic_platform.model.loaders.inkling import InklingOptions
+
+        path = self.checkpoint_config(**tiny_config().to_dict())
+        options = InklingOptions(
+            attention_query_chunk_size=128, tiled_mlp_token_chunk_size=64, fused_lm_head_token_chunk_size=32
+        )
+        spec = ModelSpec(
+            model_path_or_name=path, attn_implementation="flex_attention", loader_options=options.model_dump()
+        )
+        self.assertEqual(spec.attn_implementation, "flex_attention")
+        runtime = SimpleNamespace(name=path, ep=1, moe_use_grouped_mm=False, attn="flex_attention")
+        model = _adapter_for_inkling(options).get_model(runtime, device=torch.device("meta"), dtype=torch.float32)
+        for layer in model.model.layers:
+            self.assertIsInstance(layer.self_attn, InklingFlexAttention)
+            self.assertEqual(layer.self_attn.config.inkling_attention_query_chunk_size, 128)
+        self.assertEqual(model.model.layers[0].mlp.token_chunk_size, 64)
+        self.assertEqual(model.model.layers[1].mlp.shared_experts.token_chunk_size, 64)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            InklingOptions(fused_lm_head_token_chunk_size=0)
+
+    def test_flex_rejects_torch_without_differentiable_score_buffers(self):
+        from unittest.mock import patch
+
+        from arctic_platform.model.implementations.inkling.attention import enable_flex_attention
+
+        with patch.object(torch, "__version__", "2.12.0"):
+            with self.assertRaisesRegex(ValueError, "PyTorch 2.13"):
+                enable_flex_attention(None)
 
     def test_rejects_sequence_parallelism(self):
         path = self.checkpoint_config()

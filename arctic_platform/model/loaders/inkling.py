@@ -22,6 +22,7 @@ from typing import Literal
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import field_validator
 from pydantic import model_validator
 
 from arctic_platform.model.config import ActivationCheckpointConfig
@@ -40,7 +41,18 @@ class InklingOptions(BaseModel):
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
     moe_use_grouped_mm: bool = True
     deepep_token_chunk_size: int | None = Field(None, gt=0)
+    attention_query_chunk_size: int = Field(2048, gt=0, multiple_of=128)
+    fused_lm_head_token_chunk_size: int | Literal["disabled"] = "disabled"
+    fp32_lm_head: bool = False
+    tiled_mlp_token_chunk_size: int | None = Field(None, gt=0)
     ac_config: ActivationCheckpointConfig | None = None
+
+    @field_validator("fused_lm_head_token_chunk_size")
+    @classmethod
+    def _positive_head_chunk(cls, value):
+        if isinstance(value, int) and value <= 0:
+            raise ValueError("fused_lm_head_token_chunk_size must be positive or disabled")
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -58,8 +70,8 @@ def _matches(ctx: LoaderContext) -> bool:
 def _validate_spec(spec: ModelSpec) -> None:
     if spec.attn_implementation is None:
         spec.attn_implementation = "eager"
-    if spec.attn_implementation != "eager":
-        raise ValueError("Inkling training requires eager attention to preserve its relative-position bias")
+    if spec.attn_implementation not in {"eager", "flex_attention"}:
+        raise ValueError("Inkling training requires eager or flex_attention to preserve its relative-position bias")
     if spec.parallelism.sequence_parallel != 1:
         raise ValueError("Inkling training does not support sequence parallelism")
     if spec.dtype not in {"bfloat16", "float32"}:
