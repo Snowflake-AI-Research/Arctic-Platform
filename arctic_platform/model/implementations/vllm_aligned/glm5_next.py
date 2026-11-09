@@ -53,6 +53,8 @@ import torch
 
 from arctic_platform.model.implementations.vllm_aligned import ops
 
+FP8_BLOCK = 128  # block-FP8 weight block (rows and columns)
+
 
 def _mhc_constants():
     from vllm.models.glm5next.common.model import _MHC_POST_MULT_VALUE
@@ -186,45 +188,74 @@ def mla_kv_up_weights(kv_b_proj: Any, config: Any) -> tuple[torch.Tensor, torch.
     return w_uk.permute(1, 2, 0).contiguous(), w_uv.transpose(0, 1).contiguous()
 
 
+def dequant_fp8_block(weight: torch.Tensor, scale_inv: torch.Tensor, block: int = FP8_BLOCK) -> torch.Tensor:
+    """vLLM's load-time dequantization of a block-FP8 weight it keeps in bf16 (``_dequant_fp8_block``)."""
+    rows, cols = weight.shape
+    padded = torch.nn.functional.pad(weight, (0, (-cols) % block, 0, (-rows) % block))
+    scale = scale_inv.to(torch.float32).repeat_interleave(block, 0).repeat_interleave(block, 1)
+    return (padded.to(torch.float32) * scale).to(torch.bfloat16)[:rows, :cols].contiguous()
+
+
+def bf16_weight(linear: Any) -> torch.Tensor:
+    """A projection's weight as vLLM serves it in bf16: dequantized if the trainer holds it in block FP8."""
+    scale_inv = getattr(linear, "weight_scale_inv", None)
+    if linear.weight.element_size() == 1 and scale_inv is not None:
+        return dequant_fp8_block(linear.weight, scale_inv)
+    return linear.weight
+
+
 def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlens: torch.Tensor,
                   config: Any) -> torch.Tensor:  # fmt: skip
-    """vLLM's ``Glm5NextMLAAttention`` (sparse MLA, NoPE) on prompts no longer than ``index_topk``.
+    """vLLM's ``Glm5NextMLAAttention`` (sparse MLA with ``mla_use_nope``) on prompts no longer than ``index_topk``.
 
     Such prompts take vLLM's short-prefill path: every token attends to all earlier tokens of its request, with no
-    indexer scoring. The merged ``[q_a; kv_a]`` projection, the fused q/kv RMSNorm, ``q_b_proj``, the query absorbed
-    into the latent space by ``W_UK_T``, FA3 sparse attention over one-token pages of the ``kv_c`` rows (QV form,
-    zero 64-wide rope query), the value up-projection by ``W_UV`` and ``o_proj``.
+    indexer scoring. With ``mla_use_nope`` vLLM skips the rotary embedding and pads ``kv_a_proj_with_mqa`` with
+    zero rows up to ``kv_lora_rank + qk_rope_head_dim``, so the rope part of every key is zero. The block-FP8
+    ``q_a``/``kv_a``/``q_b``/``o`` projections are dequantized to bf16 as vLLM does at load. Then: the merged
+    ``[q_a; kv_a]`` projection, the fused q/kv RMSNorm, ``q_b_proj``, the query absorbed into the latent space by
+    ``W_UK_T``, FA3 sparse attention over one-token pages of ``[kv_c | k_pe]`` rows (QV form), the value
+    up-projection by ``W_UV`` and ``o_proj``.
     """
     from vllm.models.common.ops import fused_q_kv_rmsnorm
     from vllm.v1.attention.backends.mla import flashattn_mla_sparse
 
-    if config.qk_rope_head_dim:
-        raise NotImplementedError("vLLM-aligned sparse MLA covers the NoPE configuration (qk_rope_head_dim == 0)")
+    if not getattr(config, "mla_use_nope", True) and config.qk_rope_head_dim:
+        raise NotImplementedError("vLLM-aligned sparse MLA covers mla_use_nope (no rotary embedding)")
     starts, lengths = cu_seqlens[:-1], cu_seqlens[1:] - cu_seqlens[:-1]
     if int(lengths.max()) > config.index_topk:
         raise NotImplementedError("vLLM-aligned sparse MLA: prompts longer than index_topk need the indexer (not in)")
-    heads, latent = config.num_attention_heads, config.kv_lora_rank
+    heads, latent, rope = config.num_attention_heads, config.kv_lora_rank, config.qk_rope_head_dim
     nope, value = config.qk_nope_head_dim, config.v_head_dim
     tokens = x.shape[0]
 
-    qkv_lora = ops.linear_kernel(x, torch.cat([attn.q_a_proj.weight, attn.kv_a_proj_with_mqa.weight]))
-    q_c, kv_c = qkv_lora.split([config.q_lora_rank, latent], dim=-1)
+    kv_a = bf16_weight(attn.kv_a_proj_with_mqa)
+    if kv_a.shape[0] == latent and rope:
+        kv_a = torch.cat([kv_a, kv_a.new_zeros((rope, kv_a.shape[1]))])
+    qkv_lora = ops.linear_kernel(x, torch.cat([bf16_weight(attn.q_a_proj), kv_a]))
+    q_c, kv_lora = qkv_lora.split([config.q_lora_rank, latent + rope], dim=-1)
+    kv_c, k_pe = kv_lora.split([latent, rope], dim=-1)
     q_c, kv_c = fused_q_kv_rmsnorm(q_c, kv_c, attn.q_a_layernorm.weight, attn.kv_a_layernorm.weight,
                                    attn.q_a_layernorm.variance_epsilon)  # fmt: skip
-    q = ops.linear_kernel(q_c, attn.q_b_proj.weight).view(tokens, heads, nope)
+    q = ops.linear_kernel(q_c, bf16_weight(attn.q_b_proj)).view(tokens, heads, nope + rope)
+    q_nope, q_pe = q.split([nope, rope], dim=-1)
 
     w_uk_t, w_uv = mla_kv_up_weights(attn.kv_b_proj, config)
     q_latent = q.new_empty((tokens, heads, latent))
-    torch.bmm(q.transpose(0, 1), w_uk_t, out=q_latent.transpose(0, 1))
+    torch.bmm(q_nope.transpose(0, 1), w_uk_t, out=q_latent.transpose(0, 1))
 
     seq_of_token = torch.repeat_interleave(torch.arange(starts.numel(), device=x.device), lengths)
     topk = causal_topk(positions, topk_buffer_width(config))
     rows = torch.where(topk >= 0, topk + starts.to(torch.int32)[seq_of_token, None], topk)
     valid = (topk >= 0).sum(-1).to(torch.int32)
-    v_cache = kv_c.contiguous().unsqueeze(1).unsqueeze(1)
+    kv_rows = torch.cat([kv_c, k_pe], dim=-1)
+    v_cache = kv_rows[:, :latent].unsqueeze(1).unsqueeze(1)
+    if rope:
+        k_cache, q_rope = kv_rows[:, latent:].unsqueeze(1).unsqueeze(1), q_pe
+    else:  # FA3's QV path needs a 64-wide Q/K: a zero query against the first 64 latent columns
+        k_cache, q_rope = v_cache[..., :64], q.new_zeros((tokens, heads, 64))
     out = flashattn_mla_sparse.flash_attn_varlen_func(
-        q=q.new_zeros((tokens, heads, 64)),
-        k=v_cache[..., :64],
+        q=q_rope,
+        k=k_cache,
         v=v_cache,
         q_v=q_latent,
         max_seqlen_q=1,
@@ -232,22 +263,19 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
         max_seqlen_k=rows.shape[1],
         seqused_k=valid,
         block_table=rows,
-        softmax_scale=attn.scaling,
+        softmax_scale=(nope + rope) ** -0.5,
         causal=True,
         fa_version=3,
     )
     up = out.new_empty((tokens, heads, value))
     torch.bmm(out.view(-1, heads, latent).transpose(0, 1), w_uv, out=up.transpose(0, 1))
-    return ops.linear_kernel(up.view(tokens, heads * value), attn.o_proj.weight)
+    return ops.linear_kernel(up.view(tokens, heads * value), bf16_weight(attn.o_proj))
 
 
 def _mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     if layer.block_type == "linear_attention":
         return kda_prefill(layer.self_attn, x, ctx.cu_seqlens, ctx.config)
     return mla_attention(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config)
-
-
-FP8_BLOCK = 128
 
 
 def fp8_block_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale_inv: torch.Tensor) -> torch.Tensor:
@@ -432,8 +460,8 @@ def check_supported_config(config: Any) -> None:
     for name in ("hc_mult", "hc_sinkhorn_iters", "hc_eps", "layer_types", "index_topk", "index_kpool"):
         if getattr(config, name, None) is None:
             raise ValueError(f"the vLLM-aligned GLM-5.3-Flash forward needs config.{name}")
-    if getattr(config, "qk_rope_head_dim", 0):
-        raise ValueError("the vLLM-aligned GLM-5.3-Flash forward covers NoPE sparse MLA (qk_rope_head_dim == 0)")
+    if getattr(config, "qk_rope_head_dim", 0) and not getattr(config, "mla_use_nope", False):
+        raise ValueError("the vLLM-aligned GLM-5.3-Flash forward covers sparse MLA with mla_use_nope")
 
 
 def _stock_layer_runner(backbone: Any, input_ids: torch.Tensor, position_ids: torch.Tensor, kwargs: dict) -> Callable:

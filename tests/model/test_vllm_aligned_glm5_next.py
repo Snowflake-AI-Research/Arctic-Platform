@@ -99,3 +99,14 @@ def test_mla_kv_up_weights_split_kv_b_proj_per_head():
     per_head = weight.view(2, 9, 3)
     assert torch.equal(w_uk_t[1], per_head[1, :4])
     assert torch.equal(w_uv[1], per_head[1, 4:].t())
+
+
+def test_dequant_fp8_block_matches_vllm_formula_with_partial_blocks():
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import dequant_fp8_block
+
+    torch.manual_seed(2)
+    weight = torch.randn(200, 130).to(torch.float8_e4m3fn)
+    scale = torch.rand(2, 2) + 0.5
+    got = dequant_fp8_block(weight, scale)
+    full = scale.repeat_interleave(128, 0).repeat_interleave(128, 1)[:200, :130]
+    assert got.dtype == torch.bfloat16 and torch.equal(got, (weight.float() * full).to(torch.bfloat16))
