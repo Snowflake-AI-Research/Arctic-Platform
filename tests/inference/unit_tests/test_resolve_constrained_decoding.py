@@ -1259,8 +1259,12 @@ def test_worker_does_not_inject_resolve_reasoning_parser_plugin(monkeypatch):
         def create_engine_config(self):
             return SimpleNamespace(
                 parallel_config=SimpleNamespace(data_parallel_rank=0),
-                structured_outputs_config=SimpleNamespace(enable_in_reasoning=False),
-                model_config=SimpleNamespace(skip_tokenizer_init=True),
+                structured_outputs_config=SimpleNamespace(
+                    enable_in_reasoning=False, reasoning_parser="qwen3"
+                ),
+                model_config=SimpleNamespace(
+                    skip_tokenizer_init=True, architecture="Qwen3ForCausalLM",
+                ),
             )
 
     captured = {}

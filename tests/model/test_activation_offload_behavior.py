@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
+from copy import deepcopy
 
 import pytest
 import torch
@@ -35,6 +36,9 @@ from arctic_platform.model.implementations.gpu.activation_offload import PoolKey
 from arctic_platform.model.implementations.gpu.activation_offload import activation_offload_stats
 from arctic_platform.model.implementations.gpu.activation_offload import host_pin_reserved_bytes
 from arctic_platform.model.implementations.gpu.activation_offload import install_activation_offload
+from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import torch_assert_equal
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="activation CPU-offload requires a GPU")
 
@@ -227,6 +231,77 @@ def test_small_tensors_are_passed_through_not_offloaded():
     y.backward()
     assert manager.stats.offloaded_tensors == 0
     assert manager.stats.passed_small > 0
+
+
+@require_torch_gpu
+@pytest.mark.parametrize("use_streams", [False, True])
+@pytest.mark.parametrize("frozen", [False, True])
+@pytest.mark.parametrize("rebind_storage", [False, True])
+def test_persistent_weight_views_stay_resident_without_changing_gradients(use_streams, frozen, rebind_storage):
+    class SquaredLinear(nn.Linear):
+        def forward(self, inputs):
+            return super().forward(inputs).square()
+
+    set_seed(17)
+    baseline = SquaredLinear(512, 512, bias=False).cuda()
+    baseline.weight.requires_grad_(not frozen)
+    offloaded = deepcopy(baseline)
+    manager = install_activation_offload(offloaded, keep_last_n=0, use_streams=use_streams, tensor_size_threshold=1024)
+    observed = []
+    original_pack = manager.pack
+
+    def track_pack(tensor):
+        payload = original_pack(tensor)
+        observed.append(
+            (tensor.untyped_storage().data_ptr() == offloaded.weight.untyped_storage().data_ptr(), payload[0])
+        )
+        return payload
+
+    manager.pack = track_pack
+    for step in range(2):
+        if step == 1 and rebind_storage:
+            # ZeRO replaces parameter data with views of its flattened buffers.
+            offloaded.weight.data = offloaded.weight.detach().clone().flatten().view_as(offloaded.weight)
+        baseline.zero_grad(set_to_none=True)
+        offloaded.zero_grad(set_to_none=True)
+        observed.clear()
+        manager.reset_stats()
+        source = torch.randn(16, 512, device="cuda")
+        reference_input = source.clone().requires_grad_()
+        actual_input = source.clone().requires_grad_()
+        reference_loss = baseline(reference_input).sum()
+        actual_loss = offloaded(actual_input).sum()
+        reference_loss.backward()
+        actual_loss.backward()
+        torch.cuda.synchronize()
+
+        torch_assert_equal(actual_loss, reference_loss)
+        torch_assert_equal(actual_input.grad, reference_input.grad)
+        if not frozen:
+            torch_assert_equal(offloaded.weight.grad, baseline.weight.grad)
+        assert any(is_weight for is_weight, _ in observed), "control did not save a persistent weight view"
+        assert all(not offload for is_weight, offload in observed if is_weight)
+        assert manager.stats.offloaded_bytes > 0, "independent activations must still offload"
+        assert len(manager._slots) == 0
+
+
+@require_torch_gpu
+def test_persistent_buffer_views_are_not_copied_to_host():
+    class BufferedLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight", torch.ones(64, 64, device="cuda"))
+
+        def forward(self, inputs):
+            return inputs @ self.weight.t()
+
+    model = BufferedLinear()
+    manager = install_activation_offload(model, keep_last_n=0, use_streams=False, tensor_size_threshold=1024)
+    inputs = torch.ones(2, 64, device="cuda", requires_grad=True)
+    model(inputs).sum().backward()
+
+    torch_assert_equal(inputs.grad, torch.full_like(inputs, 64))
+    assert manager.stats.offloaded_bytes == 0
 
 
 class _FakeSlot:
