@@ -434,7 +434,8 @@ def _without_noop_offload(ds_config: dict[str, Any]) -> dict[str, Any]:
 
         AssertionError: CPUAdam param is on cuda:0 and must be 'cpu'
 
-    Callers used to spell the no-op out as ``{"device": "none"}``. A real
+    SkyRL's arctic_rl config spells the no-op out while the standalone recipes
+    omit it, which is why only the framework path hits this. A real
     ``device: cpu`` request is left alone.
     """
     zero = ds_config.get("zero_optimization")

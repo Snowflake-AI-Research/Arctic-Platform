@@ -88,6 +88,8 @@ def build_client(
         "gradient_accumulation_steps": grad_accum_steps,
         "zero_optimization": {
             "stage": 3,
+            "offload_optimizer": {"device": "none"},
+            "offload_param": {"device": "none"},
         },
         "optimizer": {"type": "AdamW", "params": {"lr": 1e-6, "betas": [0.9, 0.999], "weight_decay": 0.0}},
         "bf16": {"enabled": True},

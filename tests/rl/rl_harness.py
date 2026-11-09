@@ -548,6 +548,8 @@ def build_config(
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "zero_optimization": {
             "stage": 3,
+            "offload_optimizer": {"device": "none"},
+            "offload_param": {"device": "none"},
         },
     }
     training_config = {
