@@ -119,7 +119,7 @@ def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
     """
     import vllm._flashkda_C  # noqa: F401
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
-    from vllm.third_party.flash_linear_attention.ops.fused_norm_gate import rms_norm_gated
+    from vllm.third_party.flash_linear_attention.ops.kda import rms_norm_gated
 
     heads, head_dim = attn.num_heads, attn.head_dim
     projection = heads * head_dim
