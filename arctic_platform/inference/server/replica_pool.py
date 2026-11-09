@@ -1217,3 +1217,942 @@ class ReplicaPool:
         return clear_cache
 
     async def _pause_workers(self, method: str, **kwargs: Any) -> None:
+        pause_results = await asyncio.gather(
+            *[
+                getattr(worker, method).remote(**kwargs)
+                for worker in self._workers
+            ],
+            return_exceptions=True,
+        )
+        failed_workers = _failed_worker_indices(pause_results)
+        if failed_workers:
+            await asyncio.gather(
+                *[worker.resume_generation.remote() for worker in self._workers],
+                return_exceptions=True,
+            )
+            raise RuntimeError(
+                f"Failed to pause inference workers {failed_workers}: "
+                f"{_worker_error_messages(pause_results, failed_workers)}"
+            )
+
+    async def _resume_generation_after_weight_sync(self) -> None:
+        resume_results = await asyncio.gather(
+            *[worker.resume_generation.remote() for worker in self._workers],
+            return_exceptions=True,
+        )
+        failed_workers = _failed_worker_indices(resume_results)
+        if failed_workers:
+            raise RuntimeError(
+                f"Failed to resume inference workers {failed_workers}: "
+                f"{_worker_error_messages(resume_results, failed_workers)}"
+            )
+
+    async def _reset_prefix_cache_after_weight_sync(
+        self,
+        *,
+        require_success: bool,
+    ) -> dict[str, Any]:
+        timeout_s = (
+            _env_float("ARCTIC_INFERENCE_WEIGHT_SYNC_PREFIX_RESET_TIMEOUT_S", 30.0)
+            if require_success
+            else 0.0
+        )
+        retry_interval_s = _env_float(
+            "ARCTIC_INFERENCE_WEIGHT_SYNC_PREFIX_RESET_RETRY_INTERVAL_S",
+            0.1,
+            minimum=0.01,
+        )
+        results = await asyncio.gather(
+            *[
+                worker.reset_prefix_cache.remote(timeout_s, retry_interval_s)
+                for worker in self._workers
+            ],
+            return_exceptions=True,
+        )
+        per_worker = [
+            {"status": "error", "message": str(result)}
+            if isinstance(result, Exception)
+            else result
+            for result in results
+        ]
+        reset_ok = all(
+            isinstance(result, dict) and bool(result.get("reset_ok"))
+            for result in per_worker
+        )
+        payload = {"reset_ok": reset_ok, "workers": per_worker}
+        if require_success and not reset_ok:
+            raise RuntimeError(
+                "Prefix-cache reset failed after weight sync; refusing to resume "
+                "generation with stale prefix blocks."
+            )
+        if not reset_ok:
+            logger.warning(
+                "Prefix-cache reset did not fully complete after pause-mode weight sync; "
+                "continuing because keep mode can retain running request KV blocks. "
+                "reset_result=%s",
+                payload,
+            )
+        return payload
+
+    async def reset_prefix_cache(
+        self,
+        model_id: str | None = None,
+        *,
+        drain: bool = True,
+        timeout_s: float = 60.0,
+        retry_interval_s: float = 0.1,
+    ) -> dict[str, Any]:
+        self._check_model_id(model_id)
+        if self._scheduler is None:
+            raise RuntimeError("ReplicaPool not initialized")
+        async with self._stream_lifecycle():
+            if drain:
+                self._scheduler.pause()
+                await self._scheduler.drain()
+            try:
+                results = await asyncio.gather(
+                    *[
+                        worker.reset_prefix_cache.remote(timeout_s, retry_interval_s)
+                        for worker in self._workers
+                    ],
+                    return_exceptions=True,
+                )
+            finally:
+                if drain:
+                    self._scheduler.resume()
+            per_worker = [
+                {"status": "error", "message": str(result)}
+                if isinstance(result, Exception)
+                else result
+                for result in results
+            ]
+            return {
+                "status": "ok" if all(
+                    isinstance(result, dict) and bool(result.get("reset_ok"))
+                    for result in per_worker
+                ) else "failed",
+                "reset_ok": all(
+                    isinstance(result, dict) and bool(result.get("reset_ok"))
+                    for result in per_worker
+                ),
+                "workers": per_worker,
+            }
+
+    async def init_router_replay(
+        self,
+        master_addr: str,
+        master_port: int,
+        rank_offset: int,
+        world_size: int,
+        is_server: bool = False,
+    ) -> dict[str, Any]:
+        if self._workers is None:
+            raise RuntimeError("ReplicaPool not initialized")
+        results = await asyncio.gather(
+            *[
+                worker.init_router_replay.remote(
+                    master_addr=master_addr,
+                    master_port=master_port,
+                    rank=rank_offset + idx,
+                    world_size=world_size,
+                    is_server=is_server and idx == 0,
+                )
+                for idx, worker in enumerate(self._workers)
+            ],
+            return_exceptions=True,
+        )
+        return {
+            "n_replicas": len(self._workers),
+            "workers": [
+                {"status": "error", "message": str(result)}
+                if isinstance(result, Exception)
+                else result
+                for result in results
+            ],
+        }
+
+    async def send_router_replay(self) -> dict[str, Any]:
+        if self._scheduler is None:
+            raise RuntimeError("ReplicaPool not initialized")
+
+        async with self._lock:
+            scheduler = self._scheduler
+            if scheduler is None:
+                raise RuntimeError("ReplicaPool not initialized")
+
+            scheduler_was_paused = scheduler.paused
+            scheduler.pause()
+            generation_frozen = False
+            replay_send: asyncio.Future | None = None
+            try:
+                # Hold in-flight requests in place (vLLM keep mode) rather than
+                # draining them: no engine step runs on the sampling GPUs during
+                # the send, and the send does not wait for the longest decode.
+                await self._pause_workers("freeze_generation")
+                generation_frozen = True
+                replay_send = asyncio.gather(
+                    *[
+                        worker.send_router_replay.remote()
+                        for worker in self._workers
+                    ],
+                    return_exceptions=True,
+                )
+                try:
+                    results = await asyncio.shield(replay_send)
+                except asyncio.CancelledError:
+                    # Ray actor work continues after the local await is
+                    # cancelled. Keep the lifecycle lock and scheduler pause
+                    # until every started collective has reached a known state.
+                    while not replay_send.done():
+                        try:
+                            await asyncio.shield(replay_send)
+                        except asyncio.CancelledError:
+                            continue
+                    raise
+            finally:
+                if replay_send is None or replay_send.done():
+                    if generation_frozen:
+                        await self._resume_generation_after_weight_sync()
+                    if not scheduler_was_paused:
+                        scheduler.resume()
+
+        return {
+            "n_replicas": len(self._workers),
+            "workers": [
+                {"status": "error", "message": str(result)}
+                if isinstance(result, Exception)
+                else result
+                for result in results
+            ],
+        }
+
+    async def discard_router_replay(self, sample_ids: list[str]) -> dict[str, Any]:
+        if self._workers is None:
+            raise RuntimeError("ReplicaPool not initialized")
+        results = await asyncio.gather(
+            *[
+                worker.discard_router_replay.remote(sample_ids)
+                for worker in self._workers
+            ],
+            return_exceptions=True,
+        )
+        removed = 0
+        workers = []
+        for result in results:
+            if isinstance(result, Exception):
+                workers.append({"status": "error", "message": str(result)})
+            else:
+                workers.append(result)
+                removed += int(result.get("removed", 0))
+        return {"requested": len(sample_ids), "removed": removed, "workers": workers}
+
+    async def close_router_replay(self) -> dict[str, Any]:
+        if self._workers is None:
+            return {"status": "no_workers"}
+        results = await asyncio.gather(
+            *[worker.close_router_replay.remote() for worker in self._workers],
+            return_exceptions=True,
+        )
+        return {
+            "n_replicas": len(self._workers),
+            "workers": [
+                {"status": "error", "message": str(result)}
+                if isinstance(result, Exception)
+                else result
+                for result in results
+            ],
+        }
+
+    async def sync_weights(
+        self,
+        groups: list[dict[str, Any]] | None = None,
+        bucket_size: int = 256 * 1024 * 1024,
+        strategy: str = "pause",
+        pause_mode: str = "keep",
+        clear_cache: bool = False,
+        engine_only: bool = False,
+        direct_mode: bool = False,
+        reverse: bool = False,
+        model_id: str | None = None,
+        master_addr: str | None = None,
+        master_port: int | None = None,
+        world_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Receive weights from sender(s) and load into all replicas.
+
+        Accepts either ``groups`` or legacy flat fields (``master_addr``,
+        ``master_port``, ``world_size``).  The *strategy* controls how
+        in-flight requests are handled:
+
+          - **pause**: pause scheduler admission, pause vLLM generation,
+            sync, reset prefix cache, resume.
+          - **drain**: pause scheduler, wait for in-flight to finish, sync, resume.
+          - **skip**: mark workers unavailable, cancel in-flight, sync, re-enable.
+          - **hotswap**: sync while serving continues. Unsafe during active generation.
+
+        With **pause** and ``pause_mode="keep"``, the pause also clears the
+        prefix cache when ``clear_cache`` is true or the run's
+        ``ModelConfig.clear_cache_on_weight_sync`` is true (the default). A
+        request can force clearing on but not off; a run opts out by setting
+        ``clear_cache_on_weight_sync: false`` in its ``vllm_config``. Other
+        pause modes use ``clear_cache`` as given, and the other strategies
+        issue no pause. The response's ``clear_cache`` is the value sent to
+        the workers' pause, or ``False`` when no pause was issued.
+        """
+        self._validate_weight_sync_strategy(strategy, pause_mode)
+        self._check_model_id(model_id)
+        if self._scheduler is None:
+            raise RuntimeError("ReplicaPool not initialized")
+
+        if groups is None:
+            if master_addr is None or master_port is None:
+                raise ValueError(
+                    "Provide either 'groups' or legacy flat fields "
+                    "(master_addr, master_port, world_size)"
+                )
+            n = self.num_replicas
+            tp = self.tp_size
+            groups = [{
+                "group_id": 0,
+                "master_addr": master_addr,
+                "master_port": master_port,
+                "world_size": world_size or (1 + n * tp),
+                "replica_ids": list(range(n)),
+            }]
+
+        effective_strategy = "hotswap" if engine_only else strategy
+
+        async with self._stream_lifecycle():
+            t0 = time.time()
+            n = len(self._workers)
+            scheduler_was_paused = self._scheduler.paused
+            available_workers = [
+                index for index in range(n)
+                if self._scheduler.is_worker_available(index)
+            ]
+            scheduler_paused = False
+            skipped_workers = False
+            generation_paused = False
+            pause_clear_cache = False
+            weight_update_started = False
+            update_succeeded = False
+            prefix_cache_reset: dict[str, Any] | None = None
+            results: list[Any] = []
+
+            try:
+                if effective_strategy in {"pause", "drain"}:
+                    self._scheduler.pause()
+                    scheduler_paused = True
+                elif effective_strategy == "skip":
+                    skipped_workers = True
+                    for i in range(n):
+                        self._scheduler.mark_worker_unavailable(i)
+                await self._scheduler.abort_streams()
+                if effective_strategy == "pause":
+                    pause_clear_cache = await self._pause_generation_for_weight_sync(
+                        pause_mode, clear_cache
+                    )
+                    generation_paused = True
+                    if pause_mode == "abort":
+                        await self._scheduler.drain()
+                elif effective_strategy == "drain":
+                    await self._scheduler.drain()
+                elif effective_strategy == "skip":
+                    for i in range(n):
+                        self._scheduler.cancel_worker_inflight(i)
+
+                tp = self.tp_size
+                replica_to_group: dict[int, dict[str, Any]] = {}
+                for g in groups:
+                    base_port = g["master_port"]
+                    for rid in g["replica_ids"]:
+                        replica_to_group[rid] = {
+                            "master_addr": g["master_addr"],
+                            "master_port": base_port + rid * tp,
+                            "world_size": 2,
+                            "rank_offset": 1,
+                        }
+
+                self._updating_workers = set(range(n))
+
+                tasks = []
+                for i, worker in enumerate(self._workers):
+                    gcfg = replica_to_group.get(i)
+                    if gcfg is None:
+                        raise RuntimeError(
+                            f"Replica {i} not assigned to any group. "
+                            f"Groups cover replicas: {[g['replica_ids'] for g in groups]}"
+                        )
+                    weight_update_started = True
+                    tasks.append(
+                        worker.sync_weights.remote(
+                            gcfg["master_addr"], gcfg["master_port"],
+                            gcfg["rank_offset"], gcfg["world_size"],
+                            bucket_size, engine_only, direct_mode, reverse,
+                        )
+                    )
+
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                failed_workers = _failed_worker_indices(results)
+                if failed_workers:
+                    raise RuntimeError(
+                        f"Weight sync failed on workers {failed_workers}: "
+                        f"{_worker_error_messages(results, failed_workers)}"
+                    )
+                if effective_strategy == "pause":
+                    prefix_cache_reset = await self._reset_prefix_cache_after_weight_sync(
+                        require_success=pause_mode == "abort",
+                    )
+                update_succeeded = True
+            finally:
+                self._updating_workers.clear()
+                can_restore_scheduling = update_succeeded or not weight_update_started
+                if effective_strategy == "pause":
+                    if generation_paused and update_succeeded:
+                        await self._resume_generation_after_weight_sync()
+                    if scheduler_paused and (update_succeeded or not generation_paused):
+                        if not scheduler_was_paused:
+                            self._scheduler.resume()
+                    elif scheduler_paused:
+                        logger.error(
+                            "Weight sync failed after vLLM generation was paused; "
+                            "leaving scheduler and workers paused for operator recovery."
+                        )
+                elif scheduler_paused and can_restore_scheduling and not scheduler_was_paused:
+                    self._scheduler.resume()
+                if skipped_workers and can_restore_scheduling:
+                    for index in available_workers:
+                        self._scheduler.mark_worker_available(index)
+
+
+            per_worker = [
+                {"status": "error", "message": str(r)} if isinstance(r, Exception) else r
+                for r in results
+            ]
+            elapsed = time.time() - t0
+            logger.info(f"Weight sync: {n} workers, {len(groups)} group(s) in {elapsed:.2f}s")
+            response = {
+                "elapsed": elapsed,
+                "num_groups": len(groups),
+                "strategy": strategy,
+                "pause_mode": pause_mode,
+                "clear_cache": pause_clear_cache,
+                "strategy_elapsed": elapsed,
+                "workers": per_worker,
+            }
+            if prefix_cache_reset is not None:
+                response["prefix_cache_reset"] = prefix_cache_reset
+            return response
+
+    async def _run_broadcast_weight_sync(
+        self,
+        *,
+        build_tasks,
+        strategy: str,
+        pause_mode: str,
+        clear_cache: bool,
+        engine_only: bool,
+        model_id: str | None,
+        fail_label: str,
+        log_extra: str = "",
+        extra_response: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Shared pause/resume lifecycle for broadcast weight syncs.
+
+        Only the broadcast payload differs between full-weight and LoRA syncs:
+        ``build_tasks(n, tp, world_size)`` returns the per-worker ``.remote(...)``
+        handles. ``extra_response`` is merged into the returned dict.
+        """
+        self._validate_weight_sync_strategy(strategy, pause_mode)
+        self._check_model_id(model_id)
+        if self._scheduler is None:
+            raise RuntimeError("ReplicaPool not initialized")
+
+        effective_strategy = "hotswap" if engine_only else strategy
+
+        async with self._stream_lifecycle():
+            t0 = time.time()
+            n = len(self._workers)
+            tp = self.tp_size
+            world_size = 1 + n * tp
+            scheduler_was_paused = self._scheduler.paused
+            available_workers = [
+                index for index in range(n)
+                if self._scheduler.is_worker_available(index)
+            ]
+            scheduler_paused = False
+            skipped_workers = False
+            generation_paused = False
+            pause_clear_cache = False
+            weight_update_started = False
+            update_succeeded = False
+            prefix_cache_reset: dict[str, Any] | None = None
+            results: list[Any] = []
+
+            try:
+                if effective_strategy in {"pause", "drain"}:
+                    self._scheduler.pause()
+                    scheduler_paused = True
+                elif effective_strategy == "skip":
+                    skipped_workers = True
+                    for i in range(n):
+                        self._scheduler.mark_worker_unavailable(i)
+                await self._scheduler.abort_streams()
+                if effective_strategy == "pause":
+                    pause_clear_cache = await self._pause_generation_for_weight_sync(
+                        pause_mode, clear_cache
+                    )
+                    generation_paused = True
+                    if pause_mode == "abort":
+                        await self._scheduler.drain()
+                elif effective_strategy == "drain":
+                    await self._scheduler.drain()
+                elif effective_strategy == "skip":
+                    for i in range(n):
+                        self._scheduler.cancel_worker_inflight(i)
+
+                self._updating_workers = set(range(n))
+                weight_update_started = True
+                results = await asyncio.gather(
+                    *build_tasks(n, tp, world_size), return_exceptions=True
+                )
+                failed_workers = _failed_worker_indices(results)
+                if failed_workers:
+                    raise RuntimeError(
+                        f"{fail_label} failed on workers {failed_workers}: "
+                        f"{_worker_error_messages(results, failed_workers)}"
+                    )
+                if effective_strategy == "pause":
+                    prefix_cache_reset = await self._reset_prefix_cache_after_weight_sync(
+                        require_success=pause_mode == "abort",
+                    )
+                update_succeeded = True
+            finally:
+                self._updating_workers.clear()
+                can_restore_scheduling = update_succeeded or not weight_update_started
+                if effective_strategy == "pause":
+                    if generation_paused and update_succeeded:
+                        await self._resume_generation_after_weight_sync()
+                    if scheduler_paused and (update_succeeded or not generation_paused):
+                        if not scheduler_was_paused:
+                            self._scheduler.resume()
+                    elif scheduler_paused:
+                        logger.error(
+                            f"{fail_label} failed after vLLM generation was paused; "
+                            "leaving scheduler and workers paused for operator recovery."
+                        )
+                elif scheduler_paused and can_restore_scheduling and not scheduler_was_paused:
+                    self._scheduler.resume()
+                if skipped_workers and can_restore_scheduling:
+                    for index in available_workers:
+                        self._scheduler.mark_worker_available(index)
+
+            per_worker = [
+                {"status": "error", "message": str(r)} if isinstance(r, Exception) else r
+                for r in results
+            ]
+            elapsed = time.time() - t0
+            logger.info(
+                "%s: %d replicas (world_size=%d)%s in %.2fs",
+                fail_label, n, world_size, log_extra, elapsed,
+            )
+            response = {
+                "elapsed": elapsed,
+                "world_size": world_size,
+                "strategy": strategy,
+                "pause_mode": pause_mode,
+                "clear_cache": pause_clear_cache,
+                "workers": per_worker,
+            }
+            if extra_response:
+                response.update(extra_response)
+            if prefix_cache_reset is not None:
+                response["prefix_cache_reset"] = prefix_cache_reset
+            return response
+
+    async def sync_weights_broadcast(
+        self,
+        master_addr: str,
+        master_port: int,
+        bucket_size: int = 256 * 1024 * 1024,
+        strategy: str = "pause",
+        pause_mode: str = "keep",
+        clear_cache: bool = False,
+        engine_only: bool = False,
+        model_id: str | None = None,
+        weight_format: str = "vllm",
+    ) -> dict[str, Any]:
+        """Join one NCCL broadcast group (rank 0 = trainer) and load weights into all replicas."""
+        def build_tasks(n, tp, world_size):
+            return [
+                worker.sync_weights_broadcast.remote(
+                    master_addr, master_port,
+                    rank_offset=1 + i * tp,
+                    world_size=world_size,
+                    bucket_size=bucket_size,
+                    engine_only=engine_only,
+                    weight_format=weight_format,
+                )
+                for i, worker in enumerate(self._workers)
+            ]
+
+        return await self._run_broadcast_weight_sync(
+            build_tasks=build_tasks,
+            strategy=strategy,
+            pause_mode=pause_mode,
+            clear_cache=clear_cache,
+            engine_only=engine_only,
+            model_id=model_id,
+            fail_label="Broadcast weight sync",
+        )
+
+    async def sync_lora_weights_broadcast(
+        self,
+        master_addr: str,
+        master_port: int,
+        lora_config: dict[str, Any],
+        bucket_size: int = 256 * 1024 * 1024,
+        strategy: str = "pause",
+        pause_mode: str = "keep",
+        clear_cache: bool = False,
+        engine_only: bool = False,
+        model_id: str | None = None,
+        lora_name_prefix: str = "policy",
+    ) -> dict[str, Any]:
+        """Join the NCCL broadcast group (rank 0 = trainer) and install a LoRA
+        adapter into every replica's LoRA manager.
+
+        Adapter-only payload over :meth:`sync_weights_broadcast`'s lifecycle.
+        Every sync replaces the same adapter id and name so paused requests
+        continue to reference the resident adapter when generation resumes.
+        """
+        if self._synced_lora_name is None:
+            lora_name = lora_name_prefix
+            if not engine_only:
+                self._synced_lora_name = lora_name
+        else:
+            lora_name = self._synced_lora_name
+            if not engine_only and lora_name_prefix != lora_name:
+                raise ValueError(
+                    "The synced LoRA adapter name must remain stable across "
+                    f"updates: expected {lora_name!r}, got {lora_name_prefix!r}"
+                )
+        lora_int_id = _SYNCED_LORA_ADAPTER_ID
+        evict_first = strategy != "hotswap"
+
+        def build_tasks(n, tp, world_size):
+            return [
+                worker.sync_lora_weights_broadcast.remote(
+                    master_addr, master_port,
+                    rank_offset=1 + i * tp,
+                    world_size=world_size,
+                    lora_int_id=lora_int_id,
+                    lora_name=lora_name,
+                    lora_config=lora_config,
+                    bucket_size=bucket_size,
+                    engine_only=engine_only,
+                    staging=self.config.lora_sync_staging,
+                    evict_first=evict_first,
+                )
+                for i, worker in enumerate(self._workers)
+            ]
+
+        return await self._run_broadcast_weight_sync(
+            build_tasks=build_tasks,
+            strategy=strategy,
+            pause_mode=pause_mode,
+            clear_cache=clear_cache,
+            engine_only=engine_only,
+            model_id=model_id,
+            fail_label="LoRA weight sync",
+            log_extra=f" lora_int_id={lora_int_id}",
+            extra_response={
+                "weight_format": "lora",
+                "lora_int_id": lora_int_id,
+                "lora_name": lora_name,
+                "lora_sync_staging": self.config.lora_sync_staging,
+                "lora_evict_first": evict_first,
+            },
+        )
+
+    def get_spec_weights_info(self, model_id: str | None = None) -> list[dict]:
+        """Return weight metadata for the spec (drafter) model."""
+        self._check_model_id(model_id)
+        if self._config is None:
+            raise RuntimeError("ReplicaPool not initialized")
+        spec_model = getattr(self._config, "speculative_model", None)
+        if not spec_model:
+            raise RuntimeError("No speculative_model configured")
+        if self._cached_spec_weights_info is None:
+            from arctic_platform.inference.server.weight_sync import build_weights_info
+            infos = build_weights_info(spec_model)
+            self._cached_spec_weights_info = [wi.to_dict() for wi in infos]
+        return self._cached_spec_weights_info
+
+    async def sync_spec_weights(
+        self,
+        groups: list[dict[str, Any]] | None = None,
+        bucket_size: int = 256 * 1024 * 1024,
+        strategy: str = "hotswap",
+        engine_only: bool = False,
+        reverse: bool = False,
+        model_id: str | None = None,
+        master_addr: str | None = None,
+        master_port: int | None = None,
+        world_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Receive spec (drafter) weights from sender(s) and load into all replicas.
+
+        Same semantics as :meth:`sync_weights` but targets the drafter model.
+        """
+        self._check_model_id(model_id)
+        if self._scheduler is None:
+            raise RuntimeError("ReplicaPool not initialized")
+
+        if groups is None:
+            if master_addr is None or master_port is None:
+                raise ValueError(
+                    "Provide either 'groups' or legacy flat fields "
+                    "(master_addr, master_port, world_size)"
+                )
+            n = self.num_replicas
+            tp = self.tp_size
+            groups = [{
+                "group_id": 0,
+                "master_addr": master_addr,
+                "master_port": master_port,
+                "world_size": world_size or (1 + n * tp),
+                "replica_ids": list(range(n)),
+            }]
+
+        async with self._stream_lifecycle():
+            t0 = time.time()
+            n = len(self._workers)
+
+            scheduler_was_paused = self._scheduler.paused
+            available_workers = [
+                index for index in range(n)
+                if self._scheduler.is_worker_available(index)
+            ]
+            if strategy == "drain":
+                self._scheduler.pause()
+            elif strategy == "skip":
+                for i in range(n):
+                    self._scheduler.mark_worker_unavailable(i)
+            elif strategy != "hotswap":
+                raise ValueError(
+                    f"Unknown strategy: {strategy!r}. "
+                    "Use: drain, skip, hotswap"
+                )
+
+            try:
+                await self._scheduler.abort_streams()
+                if strategy == "drain":
+                    await self._scheduler.drain()
+                elif strategy == "skip":
+                    for i in range(n):
+                        self._scheduler.cancel_worker_inflight(i)
+            except BaseException:
+                if strategy == "drain" and not scheduler_was_paused:
+                    self._scheduler.resume()
+                elif strategy == "skip":
+                    for index in available_workers:
+                        self._scheduler.mark_worker_available(index)
+                raise
+
+            tp = self.tp_size
+            replica_to_group: dict[int, dict[str, Any]] = {}
+            for g in groups:
+                base_port = g["master_port"]
+                for rid in g["replica_ids"]:
+                    replica_to_group[rid] = {
+                        "master_addr": g["master_addr"],
+                        "master_port": base_port + rid * tp,
+                        "world_size": 2,
+                        "rank_offset": 1,
+                    }
+
+            tasks = []
+            for i, worker in enumerate(self._workers):
+                gcfg = replica_to_group.get(i)
+                if gcfg is None:
+                    raise RuntimeError(
+                        f"Replica {i} not assigned to any group. "
+                        f"Groups cover replicas: "
+                        f"{[g['replica_ids'] for g in groups]}"
+                    )
+                tasks.append(
+                    worker.sync_spec_weights.remote(
+                        gcfg["master_addr"], gcfg["master_port"],
+                        gcfg["rank_offset"], gcfg["world_size"],
+                        bucket_size, engine_only, reverse,
+                    )
+                )
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            if strategy == "drain" and not scheduler_was_paused:
+                self._scheduler.resume()
+            elif strategy == "skip":
+                for index in available_workers:
+                    self._scheduler.mark_worker_available(index)
+
+            per_worker = [
+                {"status": "error", "message": str(r)}
+                if isinstance(r, Exception) else r
+                for r in results
+            ]
+            elapsed = time.time() - t0
+            logger.info(
+                "Spec weight sync: %d workers, %d group(s) in %.2fs",
+                n, len(groups), elapsed,
+            )
+            return {
+                "elapsed": elapsed,
+                "num_groups": len(groups),
+                "strategy": strategy,
+                "strategy_elapsed": elapsed,
+                "workers": per_worker,
+            }
+
+    async def close_weight_sync(self, model_id: str | None = None) -> dict[str, Any]:
+        self._check_model_id(model_id)
+        async with self._stream_lifecycle():
+            results = await asyncio.gather(*[w.close_weight_sync.remote() for w in self._workers])
+            return {"status": "ok", "workers": list(results)}
+
+    # ------------------------------------------------------------------
+    # Health monitoring
+    # ------------------------------------------------------------------
+
+    async def _monitor_health(self) -> None:
+        while not self._stop_monitoring:
+            await asyncio.sleep(10)
+            for i, w in enumerate(self._workers):
+                if i in self._updating_workers:
+                    continue
+                if self._scheduler is not None and not self._scheduler.is_worker_available(i):
+                    continue
+                try:
+                    healthy = await asyncio.wait_for(w.is_healthy.remote(), timeout=30)
+                except Exception as exc:
+                    logger.warning(
+                        "Worker %d health check failed; %s: %s",
+                        i,
+                        type(exc).__name__,
+                        exc,
+                        exc_info=True,
+                    )
+                    continue
+                if not healthy:
+                    logger.warning("Worker %d unhealthy", i)
+                    continue
+
+    async def _restart_worker(self, idx: int) -> None:
+        old = self._workers[idx]
+        if self._scheduler is not None:
+            self._scheduler.mark_worker_unavailable(idx)
+
+        engine_kwargs = self._engine_kwargs()
+        extra_env = self._config.extra_env or None
+
+        # The old slot, so a semi-p replica restores its own image again. The
+        # old tree is killed first, so the ids that image records are free.
+        preferred = self._slots[idx][1] if idx < len(self._slots) else idx
+        node = None
+        if not self._is_multi_node():
+            try:
+                ray.kill(old)
+            except Exception:
+                pass
+            new_worker = self._make_worker()
+            try:
+                node, slot, count = await self._place_new_worker(
+                    new_worker, preferred=preferred, replacing=idx)
+                await new_worker.initialize.remote(
+                    engine_kwargs,
+                    self._worker_env(slot, count, extra_env),
+                    self._model_id,
+                )
+            except BaseException:
+                try:
+                    ray.kill(new_worker)
+                except Exception:
+                    pass
+                raise
+        else:
+            # vLLM's Ray child actors may release PG bundles asynchronously.
+            # Ask the coordinator to shut down first, then retry creation until
+            # the placement-group restart deadline expires.
+            await self._shutdown_workers([old])
+            slot = 0
+            new_worker = await self._restart_placement_worker(
+                engine_kwargs,
+                self._worker_env(slot, 1, extra_env),
+            )
+
+        self._workers[idx] = new_worker
+        if idx < len(self._slots):
+            self._slots[idx] = (node, slot)
+
+        if self._scheduler is not None:
+            self._scheduler.update_worker_handle(idx, new_worker)
+            self._scheduler.mark_worker_available(idx)
+
+        logger.info(f"Worker {idx} restarted successfully")
+
+    async def _restart_placement_worker(
+        self,
+        engine_kwargs: dict[str, Any],
+        extra_env: dict[str, str] | None,
+    ) -> ray.actor.ActorHandle:
+        total_timeout = _env_float(
+            "ARCTIC_WORKER_RESTART_TIMEOUT_S", 600.0, minimum=0.001
+        )
+        retry_s = _env_float(
+            "ARCTIC_WORKER_RESTART_RETRY_S", 1.0, minimum=0.0
+        )
+        deadline = time.monotonic() + total_timeout
+        attempt = 0
+
+        while True:
+            attempt += 1
+            new_worker = None
+            try:
+                new_worker = self._make_worker()
+                remaining = max(deadline - time.monotonic(), 0.001)
+                await asyncio.wait_for(
+                    _await_maybe(
+                        new_worker.initialize.remote(
+                            engine_kwargs,
+                            extra_env,
+                            self._model_id,
+                        )
+                    ),
+                    timeout=remaining,
+                )
+                return new_worker
+            except asyncio.CancelledError:
+                if new_worker is not None:
+                    try:
+                        ray.kill(new_worker)
+                    except Exception:
+                        pass
+                raise
+            except Exception:
+                if new_worker is not None:
+                    try:
+                        ray.kill(new_worker)
+                    except Exception:
+                        pass
+                if not self._is_multi_node() or time.monotonic() >= deadline:
+                    raise
+                delay = min(retry_s, max(deadline - time.monotonic(), 0.0))
+                logger.warning(
+                    "Placement-group worker restart attempt %d failed; "
+                    "retrying in %.3fs",
+                    attempt,
+                    delay,
+                    exc_info=True,
+                )
+                await asyncio.sleep(delay)
