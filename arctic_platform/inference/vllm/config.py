@@ -30,21 +30,27 @@ logger = logging.getLogger(__name__)
 
 @config(config=ConfigDict(extra="forbid"))
 class ArcticParallelConfig(ParallelConfig):
+
     ulysses_sequence_parallel_size: int = 1
     enable_shift_parallel: bool = False
     shift_parallel_threshold: int = 512
 
     def __post_init__(self, *args, **kwargs):
-        if self.enable_shift_parallel and self.ulysses_sequence_parallel_size == 1:
-            raise ValueError("ulysses_sequence_parallel_size must be > 1 when enable_shift_parallel is True.")
+        if (self.enable_shift_parallel
+                and self.ulysses_sequence_parallel_size == 1):
+            raise ValueError("ulysses_sequence_parallel_size must be > 1 "
+                             "when enable_shift_parallel is True.")
         super().__post_init__(*args, **kwargs)
         # ParallelConfig.__post_init__ sets world_size to pipeline_parallel_size *
         # tensor_parallel_size; override to PP * TP * ulysses_sequence_parallel_size.
-        self.world_size = self.pipeline_parallel_size * self.tensor_parallel_size * self.ulysses_sequence_parallel_size
+        self.world_size = (self.pipeline_parallel_size *
+                           self.tensor_parallel_size *
+                           self.ulysses_sequence_parallel_size)
 
 
 @config(config=ConfigDict(extra="forbid"))
 class ArcticSpeculativeConfig(SpeculativeConfig):
+
     method: str | None = None
     disable_by_batch_size: int | None = None
     enable_suffix_decoding: bool = False
@@ -57,26 +63,31 @@ class ArcticSpeculativeConfig(SpeculativeConfig):
 
 
 class ParallelConfigPatch(ArcticPatch[ParallelConfig]):
+
     def __new__(cls, *args, **kwargs):
         # Override __new__ to return an ArcticParallelConfig instead of a
         # ParallelConfig when creating a new instance of the class.
         if cls is ParallelConfig:
-            return ArcticParallelConfig.__new__(ArcticParallelConfig, *args, **kwargs)
+            return ArcticParallelConfig.__new__(ArcticParallelConfig, *args,
+                                                **kwargs)
         return super(ParallelConfig, cls).__new__(cls)
 
 
 class SpeculativeConfigPatch(ArcticPatch[SpeculativeConfig]):
+
     _orig_post_init = SpeculativeConfig.__post_init__
 
     def __new__(cls, *args, **kwargs):
         if cls is SpeculativeConfig:
-            return ArcticSpeculativeConfig.__new__(ArcticSpeculativeConfig, *args, **kwargs)
+            return ArcticSpeculativeConfig.__new__(ArcticSpeculativeConfig,
+                                                   *args, **kwargs)
         return super(SpeculativeConfig, cls).__new__(cls)
 
     def __post_init__(self):
         is_arctic_method = self.method in ("arctic", "mlp_speculator")
-        use_suffix = (self.method == "suffix") or (self.method is None and self.enable_suffix_decoding)
-        use_hybrid = self.method == "arctic" and self.enable_suffix_decoding
+        use_suffix = (self.method == "suffix") or (self.method is None
+                                                   and self.enable_suffix_decoding)
+        use_hybrid = (self.method == "arctic" and self.enable_suffix_decoding)
 
         if (use_suffix or is_arctic_method) and self.disable_by_batch_size is None:
             logger.info("Defaulting disable_by_batch_size to 64")
@@ -191,12 +202,12 @@ def ensure_dflash_max_position_patch() -> None:
 
 
 class VllmConfigPatch(ArcticPatch[VllmConfig]):
+
     _orig_str = VllmConfig.__str__
     _orig_post_init = VllmConfig.__post_init__
     _orig_get_v2_unsupported = VllmConfig._get_v2_model_runner_unsupported_features
 
     from typing import Literal
-
     OldEagleModelTypes = vllm.config.speculative.EagleModelTypes
     NewEagleModelTypes = Literal["arctic", "mlp_speculator", "suffix", OldEagleModelTypes]
 
@@ -216,7 +227,6 @@ class VllmConfigPatch(ArcticPatch[VllmConfig]):
     def __post_init__(self, *args, **kwargs):
         import sys
         from typing import Literal, get_args
-
         target_module = sys.modules[VllmConfig.__module__]
         original_types = getattr(target_module, "EagleModelTypes")
         NewEagleModelTypes = Literal["arctic", "mlp_speculator", "suffix", original_types]
