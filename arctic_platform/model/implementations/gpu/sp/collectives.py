@@ -19,6 +19,9 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
+# Bounds the fp32 packed gradient each gather backward reduce-scatters at once.
+_GATHER_BACKWARD_CHUNK_BYTES = 256 * 1024 * 1024
+
 
 class _SeqAllToAll(torch.autograd.Function):
     """Swap a sharded tensor dimension for another dimension across an SP group."""
@@ -61,3 +64,38 @@ class _SeqAllToAll(torch.autograd.Function):
 def sequence_head_all_to_all(group, tensor, *, scatter_dim: int, gather_dim: int):
     """Apply an autograd-aware all-to-all between sequence and head dimensions."""
     return _SeqAllToAll.apply(group, tensor, scatter_dim, gather_dim)
+
+
+class _GatherSequence(torch.autograd.Function):
+    """All-gather along dim 1; the backward sums the ranks' gradients in fp32 and rounds once."""
+
+    @staticmethod
+    def forward(ctx, group, tensor):
+        ctx.group = group
+        tensor = tensor.contiguous()
+        parts = [torch.empty_like(tensor) for _ in range(dist.get_world_size(group))]
+        dist.all_gather(parts, tensor, group=group)
+        return torch.cat(parts, dim=1)
+
+    @staticmethod
+    def backward(ctx, grad):
+        # torch's own all_gather backward reduce-scatters in the gradient's dtype, and a bf16 ring rounds each partial sum.
+        accumulate_dtype = torch.promote_types(grad.dtype, torch.float32)
+        parts = grad.unflatten(1, (dist.get_world_size(ctx.group), -1)).movedim(1, 0)
+        grad_input = grad.new_empty(parts.shape[1:])
+        row_bytes = parts[:, :, :1].numel() * accumulate_dtype.itemsize
+        rows = max(1, _GATHER_BACKWARD_CHUNK_BYTES // max(row_bytes, 1))
+        for start in range(0, parts.shape[2], rows):
+            packed = parts[:, :, start : start + rows].to(accumulate_dtype, memory_format=torch.contiguous_format)
+            summed = packed.new_empty(packed.shape[1:])
+            dist.reduce_scatter_tensor(summed, packed.flatten(0, 1), group=ctx.group)
+            grad_input[:, start : start + rows] = summed
+            del packed, summed
+        return None, grad_input
+
+
+def gather_sequence(tensor: torch.Tensor, group) -> torch.Tensor:
+    """All-gather ``tensor`` along the sequence dimension (dim 1) across an SP group, autograd-aware."""
+    if group is None or dist.get_world_size(group) == 1:
+        return tensor
+    return _GatherSequence.apply(group, tensor)
