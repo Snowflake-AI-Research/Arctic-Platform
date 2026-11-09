@@ -61,8 +61,8 @@ def _ref_weights():
 
 
 def _build_fused_moe(device, prefix):
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-    return FusedMoE(
+    from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+    return FusedMoEFactory(
         num_experts=NUM_EXPERTS,
         top_k=TOP_K,
         hidden_size=HIDDEN,
@@ -71,7 +71,7 @@ def _build_fused_moe(device, prefix):
         renormalize=True,
         quant_config=None,
         prefix=prefix,
-    ).to(device)
+    ).routed_experts.to(device)
 
 
 class _FakeBroadcastEngine:

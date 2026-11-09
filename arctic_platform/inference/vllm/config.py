@@ -14,7 +14,9 @@
 # limitations under the License.
 
 import logging
+from functools import wraps
 
+import torch
 import vllm
 from pydantic import ConfigDict
 from vllm.config import ParallelConfig, SpeculativeConfig, VllmConfig
@@ -125,6 +127,49 @@ class SpeculativeConfigPatch(ArcticPatch[SpeculativeConfig]):
                 self.num_speculative_tokens = getattr(self, "num_lookahead_slots", 1)
         else:
             self._orig_post_init()
+
+
+_DFLASH_PATCHED = False
+
+
+def ensure_dflash_max_position_patch() -> None:
+    global _DFLASH_PATCHED
+    if _DFLASH_PATCHED:
+        return
+    original = SpeculativeConfig.__post_init__
+
+    @wraps(original)
+    def post_init(self):
+        result = original(self)
+        if self.method == "dflash":
+            # DFlash queries the draft up to num_speculative_tokens past the last target position, unclamped.
+            self._maybe_override_draft_max_position_embeddings(
+                self.draft_model_config.hf_config,
+                self.target_model_config.max_model_len + self.num_speculative_tokens,
+            )
+        return result
+
+    SpeculativeConfig.__post_init__ = post_init
+    SpeculativeConfigPatch._orig_post_init = post_init
+
+    from vllm.model_executor.layers.rotary_embedding import YaRNScalingRotaryEmbedding
+    from vllm.model_executor.models import qwen3_dflash
+
+    get_rope = qwen3_dflash.get_rope
+
+    @wraps(get_rope)
+    def get_draft_rope(*args, max_position, **kwargs):
+        rope = get_rope(*args, max_position=max_position, **kwargs)
+        if isinstance(rope, YaRNScalingRotaryEmbedding) and rope.cos_sin_cache.shape[0] < max_position:
+            # YaRN sizes its table original x factor, ignoring max_position; extend it with YaRN's own formula.
+            t = torch.arange(max_position, dtype=torch.float32)
+            freqs = torch.einsum("i,j -> ij", t, rope._compute_inv_freq(rope.scaling_factor))
+            cache = torch.cat((freqs.cos() * rope.mscale, freqs.sin() * rope.mscale), dim=-1)
+            rope.cos_sin_cache = cache.to(rope.cos_sin_cache)
+        return rope
+
+    qwen3_dflash.get_rope = get_draft_rope
+    _DFLASH_PATCHED = True
 
 
 class VllmConfigPatch(ArcticPatch[VllmConfig]):

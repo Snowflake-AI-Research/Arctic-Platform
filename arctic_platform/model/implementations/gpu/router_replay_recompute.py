@@ -45,30 +45,38 @@ _thread_local = threading.local()
 
 
 def _in_recompute() -> bool:
-    return getattr(_thread_local, "depth", 0) > 0
+    thread_local = getattr(_ckpt, "_recompute_thread_local", _thread_local)
+    return getattr(thread_local, "depth", 0) > 0
 
 
 def _install_recompute_detector() -> None:
     """Wrap ``torch.utils.checkpoint._recomputation_hook`` so a module forward can tell whether it is running
     the original pass or the backward recompute. The non-reentrant checkpoint resolves that name as a module
-    global at call time, so patching it here is picked up by all subsequent checkpoint calls."""
+    global at call time, so patching it here is picked up by all subsequent checkpoint calls.
+
+    The hook class closes over a thread_local captured here (not the module global) and that same object is
+    stashed on _ckpt, so a second import of this module (e.g. resolved under a different module path) finds
+    the canonical thread_local via _ckpt instead of racing to install its own detector against a different
+    thread_local that the already-installed hook never touches."""
     if getattr(_ckpt, "_recompute_detector_installed", False):
         return
 
+    thread_local = _thread_local
     _BaseRecomputationHook = _ckpt._recomputation_hook
 
     class _DetectingRecomputationHook(_BaseRecomputationHook):  # type: ignore[misc, valid-type]
         def __enter__(self):
-            _thread_local.depth = getattr(_thread_local, "depth", 0) + 1
+            thread_local.depth = getattr(thread_local, "depth", 0) + 1
             return super().__enter__()
 
         def __exit__(self, *exc):
             try:
                 return super().__exit__(*exc)
             finally:
-                _thread_local.depth = max(0, getattr(_thread_local, "depth", 1) - 1)
+                thread_local.depth = max(0, getattr(thread_local, "depth", 1) - 1)
 
     _ckpt._recomputation_hook = _DetectingRecomputationHook
+    _ckpt._recompute_thread_local = thread_local
     _ckpt._recompute_detector_installed = True
 
 
@@ -84,6 +92,8 @@ def _router_supports_routed_experts(router: object) -> bool:
 
 
 def _wrap_router(router) -> bool:
+    # ``_self_replay_wrapped`` (set below) is also read by trainers to verify that a checkpointed router is
+    # protected before they enable fresh routing on it; keep the name stable.
     if getattr(router, "_self_replay_wrapped", False):
         return False
     if not _router_supports_routed_experts(router):
@@ -91,14 +101,40 @@ def _wrap_router(router) -> bool:
 
     original = router.forward
     router._self_replay_queue = collections.deque()
+    # Contract read by forward below: a router that never opts into fresh routing (only
+    # TokenChoiceTopKRouter.enable_fresh_replay_routing does) keeps gather-only replay, so production replay
+    # defers to it.
+    if not hasattr(router, "fresh_replay_routing"):
+        router.fresh_replay_routing = False
 
     @wraps(original)
     def forward(x, expert_bias=None, routed_experts=None):
+        replay_queue = router._self_replay_queue
+
         # Production replay (sampler-sourced routing) already feeds routed_experts to both passes; defer to it.
-        if routed_experts is not None:
+        if routed_experts is not None and not router.fresh_replay_routing:
             return original(x, expert_bias, routed_experts=routed_experts)
 
-        replay_queue = router._self_replay_queue
+        # An opted-in router picks experts by topk for tokens marked ROUTER_REPLAY_FRESH, so the experts the
+        # original forward actually selected are captured and replayed verbatim on recompute. The router's
+        # fresh-routing path saves the same tensors whichever experts it is handed, so no extra off-graph pass
+        # is needed.
+        if routed_experts is not None:
+            if _in_recompute():
+                if len(replay_queue) == 0:
+                    # Falling back to routed_experts would re-topk the fresh tokens and diverge from the forward.
+                    raise RuntimeError(
+                        "router-replay recompute found no captured experts for a fresh-routing replay forward"
+                    )
+                return original(x, expert_bias, routed_experts=replay_queue.popleft())
+            out = original(x, expert_bias, routed_experts=routed_experts)
+            if torch.is_grad_enabled():
+                # Each graph-building forward is recomputed before this router's next one, so anything still
+                # queued belongs to a forward whose backward never ran (an aborted step); replaying it would hand
+                # this forward's recompute another step's experts.
+                replay_queue.clear()
+                replay_queue.append(out[1].detach())
+            return out
 
         # Forward and recompute must save the same tensors, so both passes take the gather path
         # (routed_experts=expert_indices). The discrete topk decision is made once off the autograd graph

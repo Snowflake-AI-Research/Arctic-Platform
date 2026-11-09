@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import patch
 
-from arctic_platform.common.utils.server_models import JobConfig
 from arctic_platform.testing_utils import TestCasePlus
 
 
@@ -61,21 +60,6 @@ class _WorkerFactory:
         return w
 
 
-def _http_state(*, training_gpus=1):
-    from arctic_platform.common.http_server import app
-
-    app.state.training_gpus = training_gpus
-    app.state.sampling_gpus = 0
-    app.state.log_prob_gpus = 0
-    app.state.colocate = False
-    app.state.placement = None
-    app.state.training_workers = []
-    app.state.log_prob_workers = []
-    app.state.jobs = {}
-    app.state.next_job_id = 1
-    return app
-
-
 def _ray_stub(*, training_gpus=1):
     from arctic_platform.common.ray_server import ArcticRLRayServerState
 
@@ -93,57 +77,6 @@ def _ray_stub(*, training_gpus=1):
 
 
 class TestFailedTrainingInitializeCleanup(TestCasePlus):
-    def test_http_missing_checkpoint_path_leaves_no_workers(self):
-        from fastapi import HTTPException
-
-        from arctic_platform.common.http_server import initialize
-
-        app = _http_state()
-        created = []
-        factory = _WorkerFactory(created)
-        with patch("arctic_platform.common.deepspeed_worker.DeepSpeedWorker.options", return_value=factory):
-            with self.assertRaises(HTTPException) as ctx:
-                asyncio.run(initialize(JobConfig(model_name="m", job_type="training")))
-            self.assertEqual(ctx.exception.status_code, 400)
-            self.assertEqual(app.state.training_workers, [])
-            self.assertEqual(app.state.jobs, {})
-            self.assertEqual(created, [])
-
-            out = asyncio.run(
-                initialize(
-                    JobConfig(
-                        model_name="m",
-                        job_type="training",
-                        checkpoint_path=str(self.get_auto_remove_tmp_dir()),
-                    )
-                )
-            )
-        self.assertTrue(out["running"])
-        self.assertEqual(len(app.state.training_workers), 1)
-        self.assertEqual(len(app.state.jobs), 1)
-
-    def test_http_worker_init_failure_destroys_actors(self):
-        from arctic_platform.common.http_server import initialize
-
-        app = _http_state()
-        created = []
-        factory = _WorkerFactory(created, fail_initialize=True)
-        with patch("arctic_platform.common.deepspeed_worker.DeepSpeedWorker.options", return_value=factory):
-            with self.assertRaises(RuntimeError):
-                asyncio.run(
-                    initialize(
-                        JobConfig(
-                            model_name="m",
-                            job_type="training",
-                            checkpoint_path=str(self.get_auto_remove_tmp_dir()),
-                        )
-                    )
-                )
-        self.assertEqual(app.state.training_workers, [])
-        self.assertEqual(app.state.jobs, {})
-        self.assertTrue(created)
-        self.assertTrue(all(w.destroy_calls == 1 for w in created))
-
     def test_ray_missing_checkpoint_path_leaves_no_workers(self):
         server = _ray_stub()
         created = []

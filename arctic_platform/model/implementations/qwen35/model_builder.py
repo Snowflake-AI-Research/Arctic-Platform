@@ -370,6 +370,10 @@ def get_model(
         if subconfig is not None and hasattr(subconfig, "use_cache"):
             subconfig.use_cache = False
     model_config.use_grouped_mm = config.moe_use_grouped_mm
+    # Read by the custom Qwen3.5-MoE decoder, which a composite model builds from its text config.
+    model_config.fp32_parity = config.fp32_parity
+    if getattr(model_config, "text_config", None) is not None:
+        model_config.text_config.fp32_parity = config.fp32_parity
 
     # Ensure pad_token_id is set (some models like Qwen3MoE don't have it).
     # In transformers v5, token IDs moved from PretrainedConfig to GenerationConfig.

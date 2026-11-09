@@ -127,18 +127,27 @@ class TestLoaderSelection:
     def test_build_model_runs_resolved_loader_then_patches(self, monkeypatch):
         """build_model builds via the resolved loader and hands the result to the patch pipeline."""
         built = nn.Linear(1, 1)
+        calls = []
 
         @register_loader("fake")
         def _fake(ctx: LoaderContext) -> LoadedModel:
             return LoadedModel(model=built)
 
-        patched = []
-        monkeypatch.setattr(factory_mod, "apply_patches", lambda loaded, ctx: patched.append(loaded))
+        monkeypatch.setattr(
+            factory_mod,
+            "apply_patches",
+            lambda loaded, ctx: calls.append(("patch", loaded)),
+        )
+        monkeypatch.setattr(
+            factory_mod,
+            "freeze_fp8_weights_and_scales",
+            lambda model: calls.append(("finalize", model)),
+        )
 
         loaded = build_model(ModelSpec(model_path_or_name="x", loader="fake"))
 
         assert loaded.model is built
-        assert patched == [loaded]
+        assert calls == [("patch", loaded), ("finalize", built)]
 
 
 class TestPatchPipeline:
@@ -248,7 +257,8 @@ class TestHuggingFaceLoader:
         with pytest.raises(ValueError, match="requires parallel_groups"):
             load_huggingface(LoaderContext(spec=spec))
 
-    def test_loader_applies_required_sequence_parallel_setup(self, monkeypatch):
+    @pytest.mark.parametrize(("loader_options", "fp32_beta"), [({}, True), ({"fp32_parity": False}, False)])
+    def test_loader_applies_required_sequence_parallel_setup(self, monkeypatch, loader_options, fp32_beta):
         from arctic_platform.model import ParallelismConfig
         from arctic_platform.model.loaders.huggingface import load_huggingface
 
@@ -258,19 +268,29 @@ class TestHuggingFaceLoader:
         monkeypatch.setattr("transformers.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: model)
         monkeypatch.setattr(
             "arctic_platform.model.implementations.gpu.sp.transformers.apply_gated_delta_net_sequence_parallelism",
-            lambda configured_model, group: configured.append((configured_model, group)) or 0,
+            lambda configured_model, group, *, fp32_beta: configured.append((configured_model, group, fp32_beta)) or 0,
         )
         spec = ModelSpec(
             model_path_or_name="qwen",
             loader="huggingface",
             parallelism=ParallelismConfig(sequence_parallel=2),
+            loader_options=loader_options,
         )
         group = object()
 
         load_huggingface(LoaderContext(spec=spec, parallel_groups={"sp_group": group}))
 
         assert model.config.use_cache is False
-        assert configured == [(model, group)]
+        # The loader's fp32_parity option decides the beta gate of the GatedDeltaNet layers the wrapper adapts.
+        assert configured == [(model, group, fp32_beta)]
+
+    def test_loader_options_default_and_reject_unknown_keys(self):
+        from pydantic import ValidationError
+
+        spec = ModelSpec(model_path_or_name="qwen", loader="huggingface")
+        assert spec.loader_options == {"fp32_parity": True, "fp32_residual": False}
+        with pytest.raises(ValidationError, match="not_an_option"):
+            ModelSpec(model_path_or_name="qwen", loader="huggingface", loader_options={"not_an_option": 1})
 
 
 class TestFromDsWorkerConfig:
@@ -413,6 +433,29 @@ class TestModelFeaturePatches:
         assert model.gradient_checkpointing_kwargs == {"use_reentrant": False}
         assert model.input_grads_enabled is True
         assert [layer.fullgraph for layer in model.model.layers] == [True, True]
+
+    def test_periodic_checkpointing_disables_non_qwen_cache(self):
+        from arctic_platform.model.patches.gradient_checkpointing import apply_gradient_checkpointing
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.text_config = types.SimpleNamespace(model_type="llama", use_cache=True)
+                self.config = types.SimpleNamespace(
+                    model_type="llama",
+                    use_cache=True,
+                    get_text_config=lambda: self.text_config,
+                )
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+
+        model = _Model()
+        apply_gradient_checkpointing(model, _ctx(gradient_checkpointing=2))
+
+        assert model.config.use_cache is False
+        assert model.text_config.use_cache is False
+        assert type(model.model.layers[0]).__name__ == "CheckpointWrapper"
+        assert type(model.model.layers[1]).__name__ == "Linear"
 
     def test_rejects_fullgraph_with_tiling(self):
         from arctic_platform.model.config import Patches

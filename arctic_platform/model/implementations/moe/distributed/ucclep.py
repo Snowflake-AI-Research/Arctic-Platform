@@ -1,10 +1,13 @@
 """UCCL-EP dispatch/combine via ``uccl.ep`` (not the DeepEP drop-in wrapper)."""
 
+import os
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from ..routing_weights import apply_routing_weights
 from ..token_combine import sum_rows_by_token
 from .uccl_ep import Buffer
 from .uccl_ep import EventOverlap
@@ -16,6 +19,8 @@ _handle_counter = 0
 _pending_combine_events: list[EventOverlap] = []
 _ucclep_cuda_ops_registered = False
 _ucclep_cuda_lib: torch.library.Library | None = None
+_backward_barrier_group: ProcessGroup | None = None
+_backward_barrier_source_group: ProcessGroup | None = None
 
 
 def _get_next_handle_id() -> torch.Tensor:
@@ -29,6 +34,28 @@ def _new_event_overlap() -> EventOverlap:
     # UCCL's no-argument constructor records CUDA stream 0, which lets the
     # communication stream race tensors produced on PyTorch's current stream.
     return Buffer.capture()
+
+
+def _configure_backward_barrier(group: ProcessGroup) -> None:
+    global _backward_barrier_group, _backward_barrier_source_group
+    if os.environ.get("ARCTIC_UCCLEP_BACKWARD_BARRIER") != "1":
+        return
+    if _backward_barrier_source_group is group:
+        return
+    _backward_barrier_group = dist.new_group(
+        ranks=dist.get_process_group_ranks(group),
+        backend="gloo",
+        use_local_synchronization=True,
+    )
+    _backward_barrier_source_group = group
+
+
+def _finish_backward_event(after_event: EventOverlap) -> None:
+    after_event.current_stream_wait()
+    if _backward_barrier_group is None:
+        return
+    torch.cuda.current_stream().synchronize()
+    dist.barrier(group=_backward_barrier_group)
 
 
 def register_ucclep_cuda_ops() -> None:
@@ -113,7 +140,7 @@ def _dispatch_backward(
         async_finish=True,
         allocate_on_comm_stream=True,
     )
-    after_event.current_stream_wait()
+    _finish_backward_event(after_event)
 
     grad_x = grad_x.to(ctx.input_dtype)
     grad_topk_weights = grad_scores.to(ctx.input_dtype) if grad_scores is not None else None
@@ -163,7 +190,7 @@ class _UcclEPCombine(torch.autograd.Function):
             async_finish=True,
             allocate_on_comm_stream=True,
         )
-        after_event.current_stream_wait()
+        _finish_backward_event(after_event)
         return grad_x, None
 
 
@@ -198,6 +225,7 @@ def get_hidden_bytes(x: torch.Tensor) -> int:
 def get_buffer(group: ProcessGroup, hidden_bytes: int) -> Buffer:
     global _buffer
 
+    _configure_backward_barrier(group)
     num_nvl_bytes, num_rdma_bytes = 0, 0
     for config in (Buffer.get_dispatch_config(group.size()), Buffer.get_combine_config(group.size())):
         num_nvl_bytes = max(config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes)
@@ -315,9 +343,7 @@ def finalize_dispatch_tokens(
     num_tokens_per_expert = pending_state.num_tokens_per_expert.to(hidden_states.device)
 
     if pending_state.score_before_experts and permuted_scores is not None:
-        hidden_states = (hidden_states.to(torch.float32) * permuted_scores.to(torch.float32).reshape(-1, 1)).to(
-            hidden_states.dtype
-        )
+        hidden_states = apply_routing_weights(hidden_states, permuted_scores)
         permuted_scores_for_state = None
     else:
         permuted_scores_for_state = permuted_scores
@@ -333,9 +359,7 @@ def finalize_dispatch_tokens(
 
 def combine_tokens(hidden_states: torch.Tensor, state: _DispatchState) -> torch.Tensor:
     if state.permuted_scores is not None:
-        hidden_states = (hidden_states.to(torch.float32) * state.permuted_scores.to(torch.float32).reshape(-1, 1)).to(
-            hidden_states.dtype
-        )
+        hidden_states = apply_routing_weights(hidden_states, state.permuted_scores)
     hidden_states = _unpermute_tokens(hidden_states, state.permuted_indices, state.num_recv_tokens)
     return _UcclEPCombine.apply(hidden_states, state.handle_id)
 

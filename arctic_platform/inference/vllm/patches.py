@@ -30,7 +30,6 @@ from arctic_platform.inference.vllm.config import (ParallelConfigPatch,
                                           SpeculativeConfigPatch,
                                           VllmConfigPatch,
                                           MLPSpeculatorConfigPatch)
-from arctic_platform.inference.vllm.dflash2_nan_fix import apply_dflash2_nan_fixes
 from arctic_platform.inference.vllm.fp32_lm_head import (
     apply_fp32_lm_head_patches, set_fp32_lm_head_enabled)
 from arctic_platform.inference.vllm.stats import (SpecDecodingStatsPatch,
@@ -473,8 +472,6 @@ def apply_arctic_patches():
     ModelRegistry.register_model("MLPVariantSpeculatorPreTrainedModel",
                                  ArcticLSTMSpeculator)
 
-    # Patches that make later patches work properly.
-    apply_dflash2_nan_fixes()
     WorkerBasePatch.apply_patch()
 
     # Async scheduler patches for spec decode (disable_by_batch_size

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
 import time
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 import ray
+from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
+from arctic_platform.inference.server.token_prompts import is_token_tensor
 
 from arctic_platform.inference.server.metrics import (
     ConcurrencyHistory,
@@ -47,7 +50,7 @@ def _env_bool(name: str, default: bool) -> bool:
 @dataclass
 class _Request:
     id: int
-    prompt: str | list[int]
+    prompt: Any  # str, list[int], 1-D integer tensor, or ChatPrompt
     sampling_params: dict[str, Any]
     future: asyncio.Future
     worker_idx: int | None = None
@@ -98,10 +101,22 @@ RoutingFn = Callable[[_Request, list[WorkerState]], int]
 ConcurrencyFn = Callable[[list[WorkerState]], list[int]]
 
 
-def _compute_prefix_hash(prompt: str | list[int]) -> int:
-    """Hash the full prompt for affinity routing."""
+def _compute_prefix_hash(prompt: Any) -> int:
+    """Hash the full prompt for affinity routing.
+
+    A tensor prompt hashes its int32 bytes, so the same tokens route the same
+    way whatever integer dtype they arrive in. It hashes differently from the
+    same tokens sent as a list.
+    """
+    if isinstance(prompt, ChatPrompt):
+        # Already validated as plain JSON.
+        return hash(json.dumps(asdict(prompt), sort_keys=True))
     if isinstance(prompt, str):
         return hash(prompt)
+    if is_token_tensor(prompt):
+        import torch
+
+        return hash(prompt.to(torch.int32).contiguous().numpy().tobytes())
     return hash(tuple(prompt))
 
 
@@ -253,6 +268,8 @@ class Scheduler:
         self._next_id = 0
         self._streams = {}
         self._stream_retired = OrderedDict()
+        # Retired streams whose engine cleanup never confirmed; pruned with _stream_retired.
+        self._stream_retired_unconfirmed = set()
         self._paused = False
         self._pause_event = asyncio.Event()
         self._pause_event.set()
@@ -292,7 +309,7 @@ class Scheduler:
 
     def submit(
         self,
-        prompt: str | list[int],
+        prompt: Any,
         sampling_params: dict[str, Any],
         routing_key: str | None = None,
         strict: bool = False,
@@ -300,6 +317,8 @@ class Scheduler:
         """Submit a single prompt for generation.
 
         Args:
+            prompt: Text, ``list[int]``, or a 1-D integer CPU tensor of token
+                ids; a tensor is sent to the worker as is.
             routing_key: Optional opaque string used as the affinity key for
                 routing. By default, the first request for a key is assigned
                 to the least-loaded worker and later requests for the same
@@ -379,10 +398,13 @@ class Scheduler:
             oldest = next(iter(self._stream_retired.values()))
             if oldest > cutoff and len(self._stream_retired) <= 100000:
                 break
-            self._stream_retired.popitem(last=False)
+            request_id, _ = self._stream_retired.popitem(last=False)
+            self._stream_retired_unconfirmed.discard(request_id)
 
-    def _retire_stream(self, request_id):
+    def _retire_stream(self, request_id, cleanup_unconfirmed=False):
         self._stream_retired[request_id] = time.monotonic()
+        if cleanup_unconfirmed:
+            self._stream_retired_unconfirmed.add(request_id)
         self._stream_retired.move_to_end(request_id)
         self._prune_retired_streams()
 
@@ -391,6 +413,8 @@ class Scheduler:
         stream = self._streams.get(request_id)
         if stream is not None:
             return await stream.abort()
+        if request_id in self._stream_retired_unconfirmed:
+            return {"status": "cleanup_unconfirmed"}
         return {"status": "already_terminal" if request_id in self._stream_retired else "not_found"}
 
     async def abort_streams(self, worker_idx=None):
@@ -469,6 +493,18 @@ class Scheduler:
     def is_worker_available(self, idx: int) -> bool:
         self._check_idx(idx)
         return self._workers[idx].schedulable
+
+    async def wait_for_schedulable_worker(self, timeout: float) -> ray.actor.ActorHandle:
+        """A worker that takes requests, waiting up to ``timeout`` seconds for one."""
+        deadline = time.monotonic() + timeout
+        while not self._stopped:
+            for ws in self._workers:
+                if ws.schedulable:
+                    return ws.handle
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"No schedulable worker within {timeout:g}s")
+            await asyncio.sleep(0.05)
+        raise RuntimeError("Scheduler stopped")
 
     def mark_worker_unavailable(self, idx: int) -> None:
         self._check_idx(idx)
