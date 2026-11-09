@@ -338,14 +338,26 @@ def shared_expert_mlp(ffn: Any, x: torch.Tensor, swiglu_limit: float) -> torch.T
     return fp8_block_linear(hidden, ffn.w2, ffn.w2_scale_inv)
 
 
-def _full(tensor: torch.Tensor) -> torch.Tensor:
-    """An expert-parallel ``DTensor``'s full value (all experts); a plain tensor as is.
+def _full(tensor: torch.Tensor, num_experts: int, ep_group: Any = None) -> torch.Tensor:
+    """All ``num_experts`` experts of an expert-parallel weight: a ``DTensor``'s full value, or the ranks' local
+    slices (contiguous expert blocks, as DeepSpeed holds them) gathered in rank order over ``ep_group``.
 
     vLLM at TP 1 sums a token's top-k expert outputs in one kernel; splitting that sum over expert-parallel ranks
     would round differently, so every rank runs all of a token's experts on the gathered weights.
     """
     full_tensor = getattr(tensor, "full_tensor", None)
-    return full_tensor() if callable(full_tensor) else tensor
+    if callable(full_tensor):
+        return full_tensor()
+    if tensor.shape[0] == num_experts:
+        return tensor
+    if ep_group is None:
+        raise ValueError(f"the aligned MoE needs the expert-parallel group to gather {num_experts} experts")
+    world = torch.distributed.get_world_size(ep_group)
+    if tensor.shape[0] * world != num_experts:
+        raise ValueError(f"{tensor.shape[0]} local experts on {world} ranks do not make {num_experts}")
+    gathered = tensor.new_empty((num_experts, *tensor.shape[1:]))
+    torch.distributed.all_gather_into_tensor(gathered, tensor.contiguous(), group=ep_group)
+    return gathered
 
 
 def _triton_experts(num_experts: int, top_k: int, hidden: int, intermediate: int, swiglu_limit: float, w13_scale,
@@ -393,7 +405,7 @@ def _triton_experts(num_experts: int, top_k: int, hidden: int, intermediate: int
     return FusedMoEKernel(prepare, TritonExperts(moe_config, quant_config)), MoEActivation.SILU
 
 
-def moe(mlp: Any, x: torch.Tensor, config: Any) -> torch.Tensor:
+def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None) -> torch.Tensor:
     """vLLM's ``Glm5NextMoE`` at TP 1 on the trainer's ``MoE``: fp32 router logits by the batch-invariant matmul, the
     batch-invariant grouped top-k (renormalized and scaled by ``routed_scaling_factor`` there, as vLLM's router does
     when the runner does not scale the output), the Triton routed experts, then ``shared + routed`` in bf16."""
@@ -418,8 +430,9 @@ def moe(mlp: Any, x: torch.Tensor, config: Any) -> torch.Tensor:
         e_score_correction_bias=mlp.expert_bias,
     )
     experts = mlp.experts
-    w1, w2, w3 = (_full(t) for t in (experts.w1, experts.w2, experts.w3))
-    s1, s2, s3 = (_full(t) for t in (experts.w1_scale_inv, experts.w2_scale_inv, experts.w3_scale_inv))
+    total = config.n_routed_experts
+    w1, w2, w3 = (_full(t, total, ep_group) for t in (experts.w1, experts.w2, experts.w3))
+    s1, s2, s3 = (_full(t, total, ep_group) for t in (experts.w1_scale_inv, experts.w2_scale_inv, experts.w3_scale_inv))
     w13, w13_scale = torch.cat([w1, w3], dim=1), torch.cat([s1, s3], dim=1)
     num_experts, intermediate, hidden = w1.shape
     # The kernel captures the scales in its quant config, so it is rebuilt for every call (cheap, host-side only).
@@ -435,7 +448,7 @@ def moe(mlp: Any, x: torch.Tensor, config: Any) -> torch.Tensor:
 def _mlp(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     if hasattr(layer.mlp, "gate_proj"):
         return dense_mlp(layer.mlp, x)
-    return moe(layer.mlp, x, ctx.config)
+    return moe(layer.mlp, x, ctx.config, getattr(ctx, "ep_group", None))
 
 
 def aligned_layer(layer: Any, streams: torch.Tensor, config: Any, ctx: Any) -> torch.Tensor:
@@ -503,7 +516,8 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
     if position_ids.dim() == 3:
         position_ids = position_ids[0]
     layout = ops.PackedLayout.build(position_ids, block_size=1, cu_seqlens=cu_seqlens)
-    ctx = types.SimpleNamespace(config=config, positions=layout.positions, cu_seqlens=layout.cu_seqlens.to(torch.int32))
+    ctx = types.SimpleNamespace(config=config, positions=layout.positions, cu_seqlens=layout.cu_seqlens.to(torch.int32),
+                                ep_group=getattr(model, "_vllm_aligned_ep_group", None))  # fmt: skip
     run_stock = _stock_layer_runner(backbone, input_ids, position_ids, kwargs)
     hidden = aligned_hidden(backbone, input_ids, config, ctx, run_stock)
     return ops.lm_head_logprobs(
@@ -540,7 +554,8 @@ def _causal_lm_forward(self, input_ids=None, attention_mask=None, position_ids=N
     return {"logprobs": logprobs.view(input_ids.shape)}
 
 
-def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_fp32: bool = False) -> None:
+def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_fp32: bool = False,
+                                 ep_group: Any = None) -> None:  # fmt: skip
     """Make a GLM-5.3-Flash model's ``dss_compute_logprobs`` forward compute the batch-invariant sampler's logprobs.
 
     Covers prompts prefilled whole at TP 1 (milestone 1); decoded tokens and the indexer for prompts longer than
@@ -557,6 +572,7 @@ def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_f
 
     os.environ.setdefault("ARCTIC_GLM5_BATCH_INVARIANT", "1")
     ensure_glm5_batch_invariance()
+    model._vllm_aligned_ep_group = ep_group
     model._vllm_aligned_token_chunk_size = int(token_chunk_size)
     model._vllm_aligned_lm_head_fp32 = bool(lm_head_fp32)
     model._vllm_aligned_stock_forward = model.forward

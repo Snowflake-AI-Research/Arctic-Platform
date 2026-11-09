@@ -186,7 +186,10 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
 
         chunk = options.fused_lm_head_token_chunk_size
         apply_vllm_aligned_glm5_next(
-            loaded.model, token_chunk_size=chunk if isinstance(chunk, int) else 1024, lm_head_fp32=options.fp32_lm_head
+            loaded.model,
+            token_chunk_size=chunk if isinstance(chunk, int) else 1024,
+            lm_head_fp32=options.fp32_lm_head,
+            ep_group=(ctx.parallel_groups or {}).get("ep_group"),
         )
     return loaded
 
