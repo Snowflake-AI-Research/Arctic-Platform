@@ -28,15 +28,6 @@ from arctic_platform.inference.patching import ArcticPatch
 _PATCHED = False
 
 
-def check_kpool_chunk_alignment(cache_config, index_kpool: int) -> None:
-    if index_kpool > 1 and cache_config.mamba_cache_mode != "align":
-        raise ValueError(
-            f"GLM-5.3-Flash's pooled indexer (index_kpool={index_kpool}) needs pool-aligned prefill chunks, which "
-            f"vLLM schedules only with mamba_cache_mode='align' (got {cache_config.mamba_cache_mode!r}): "
-            "set enable_prefix_caching=True."
-        )
-
-
 def apply_glm5next_kpool_chunk_align_check() -> None:
     global _PATCHED
     if _PATCHED:
@@ -48,7 +39,12 @@ def apply_glm5next_kpool_chunk_align_check() -> None:
 
     class Glm5NextIndexerCacheAlignPatch(ArcticPatch[Glm5NextIndexerCache]):
         def __init__(self, *args, cache_config, index_kpool, **kwargs):
-            check_kpool_chunk_alignment(cache_config, index_kpool)
+            if index_kpool > 1 and cache_config.mamba_cache_mode != "align":
+                raise ValueError(
+                    f"GLM-5.3-Flash's pooled indexer (index_kpool={index_kpool}) needs pool-aligned prefill chunks, which "
+                    f"vLLM schedules only with mamba_cache_mode='align' (got {cache_config.mamba_cache_mode!r}): "
+                    "set enable_prefix_caching=True."
+                )
             original_init(self, *args, cache_config=cache_config, index_kpool=index_kpool, **kwargs)
 
     Glm5NextIndexerCacheAlignPatch.apply_patch()
