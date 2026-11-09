@@ -506,6 +506,30 @@ class TestInklingTraining(TestCasePlus):
             {group["params"][0].dtype for group in optimizer.param_groups}, {torch.float32, torch.bfloat16}
         )
 
+    @require_deepspeed
+    def test_deepspeed_preserves_fp32_lora_parameters(self):
+        from deepspeed.runtime.engine import DeepSpeedEngine
+
+        from arctic_platform.common.deepspeed_engine import build_training_optimizer
+        from arctic_platform.common.optimizer import OptimizerSettings
+        from arctic_platform.model import preserve_fp8_params_through_ds_cast
+
+        model = apply_peft(
+            initialized_prime_model(tiny_config()).bfloat16(),
+            dict(peft_type="LORA", task_type="CAUSAL_LM", r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"]),
+        )
+        parameters = {name: p for name, p in model.named_parameters() if p.requires_grad}
+        expected = {name: p.detach().clone() for name, p in parameters.items()}
+        preserve_fp8_params_through_ds_cast(model)
+        DeepSpeedEngine._cast_module_mixed_precision(SimpleNamespace(module=model), torch.bfloat16, None, False)
+        for name, parameter in parameters.items():
+            self.assertEqual(parameter.dtype, torch.float32)
+            torch_assert_equal(parameter, expected[name])
+        optimizer = build_training_optimizer(model, OptimizerSettings(name="torch_adamw"), {}, fused=False)
+        self.assertTrue(optimizer.param_groups)
+        for group in optimizer.param_groups:
+            self.assertEqual({p.dtype for p in group["params"]}, {torch.float32})
+
     @require_torch_gpu
     def test_bf16_full_and_lora_backward_with_fp32_routing(self):
         set_seed(42)

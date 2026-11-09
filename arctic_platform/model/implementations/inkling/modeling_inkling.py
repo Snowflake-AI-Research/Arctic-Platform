@@ -176,7 +176,7 @@ class InklingForCausalLMPrimeRL(InklingForCausalLM, PreTrainedModelPrimeRL):
             else:
                 layer.mlp = InklingMLP(config)
         for name, module in self.named_modules():
-            if name.endswith(("attn_sconv", "mlp_sconv", "k_sconv", "v_sconv")):
+            if name.endswith(("attn_sconv", "mlp_sconv", "k_sconv", "v_sconv", "lora_A", "lora_B")):
                 module.float()
         for name, parameter in self.named_parameters():
             if self.keeps_fp32_parameter(name):
@@ -281,7 +281,7 @@ class InklingForCausalLMPrimeRL(InklingForCausalLM, PreTrainedModelPrimeRL):
     @staticmethod
     def keeps_fp32_parameter(name):
         return name.endswith((".gate.global_scale", ".gate.e_score_correction_bias")) or any(
-            f".{part}." in name for part in ("attn_sconv", "mlp_sconv", "k_sconv", "v_sconv")
+            f".{part}." in name for part in ("attn_sconv", "mlp_sconv", "k_sconv", "v_sconv", "lora_A", "lora_B")
         )
 
     @staticmethod
