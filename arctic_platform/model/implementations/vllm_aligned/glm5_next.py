@@ -112,13 +112,15 @@ class _AlignedLayer(torch.autograd.Function):
 KDA_O_NORM_EPS = 1e-5  # vLLM builds the gated output norm with FusedRMSNormGated's default eps, not rms_norm_eps
 
 
-def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any) -> torch.Tensor:
+def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, trace: dict | None = None) -> torch.Tensor:
     """vLLM's ``Glm5NextLinearAttention`` on whole prompts (no initial state), FlashKDA prefill backend.
 
     ``x`` is ``[tokens, hidden]`` (the layer input after the hyper-connection pre-norm), ``cu_seqlens`` the int32
     prompt boundaries. The merged ``[q; k; v; b; f_a; g_a]`` projection, the merged q|k|v causal conv with vLLM's fp32
-    conv weights, FlashKDA on the raw gate and beta logits, the sigmoid-gated RMSNorm and ``o_proj``.
+    conv weights, FlashKDA on the raw gate and beta logits, the sigmoid-gated RMSNorm and ``o_proj``. ``trace``
+    (debug) collects the intermediate tensors.
     """
+    trace = {} if trace is None else trace
     import vllm._flashkda_C  # noqa: F401
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
     from vllm.third_party.flash_linear_attention.ops.kda import rms_norm_gated
@@ -147,6 +149,7 @@ def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
         query_start_loc=cu_seqlens,
     ).transpose(0, 1)
     q, k, v = (t.reshape(1, tokens, heads, head_dim).contiguous() for t in conv.split(projection, dim=-1))
+    trace.update(conv_in=qkv.transpose(0, 1), conv_out=conv, q=q, k=k, v=v, g=g1, beta=beta.unsqueeze(0))
 
     state = torch.zeros((num_seqs, heads, head_dim, head_dim), dtype=torch.float32, device=x.device)
     final_state = torch.empty_like(state)
@@ -158,7 +161,9 @@ def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
         gate.A_log.float().view(-1), gate.dt_bias.float().view(-1, head_dim), config.linear_lower_bound,
         state, final_state, cu_seqlens.contiguous(), None, None,
     )  # fmt: skip
+    trace.update(core=core, g2=g2)
     core = rms_norm_gated(core, g2, attn.o_norm.weight, None, "sigmoid", eps=KDA_O_NORM_EPS)
+    trace.update(normed=core)
     return ops.linear_kernel(core.reshape(tokens, -1), attn.o_proj.weight)
 
 
