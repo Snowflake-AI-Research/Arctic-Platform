@@ -367,10 +367,19 @@ def grouped_divergence(
             flat_weights.eq(0).chunk(shard_count),
         )
         student = torch.cat([checkpoint(_student_groups_from_logits, *rows, use_reentrant=False) for rows in slices])
-    log_student = _selected_rows(student, index, positions, width + 1, "group_log_probs")
+    student_rows = _selected_rows(student, index, positions, width + 1, "group_log_probs")
     log_teacher, log_student = (
-        value.double().masked_fill(padding.to(value.device), -math.inf) for value in (log_teacher, log_student)
+        value.double().masked_fill(padding.to(value.device), -math.inf) for value in (log_teacher, student_rows)
     )
+    if log_student.requires_grad:
+        # Over distinct ids the buckets are a log-softmax, so this leaves the logit gradient unchanged; summing to
+        # zero in float64 keeps the head's float32 q * sum(grad) from cancelling near-certain buckets' gradients.
+        # Autograd keeps no copy of log_student, so the hook rebuilds q from the float32 rows.
+        def zero_sum(grad):
+            probs = torch.softmax(student_rows.detach().double().masked_fill(padding.to(grad.device), -math.inf), -1)
+            return grad - probs * grad.sum(-1, keepdim=True)
+
+        log_student.register_hook(zero_sum)
 
     teacher_mass = log_teacher.logsumexp(-1, keepdim=True)
     student_mass = log_student.detach().logsumexp(-1, keepdim=True)

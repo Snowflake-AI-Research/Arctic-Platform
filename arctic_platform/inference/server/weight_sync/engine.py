@@ -196,6 +196,7 @@ class NCCLEngine:
                         offset = 0
                         n_buckets += 1
                 n_params += 1
+                del weight, w, w_bytes  # a gathered export allocates its next tensor while we hold this one
                 continue
 
             entry = {
@@ -237,6 +238,7 @@ class NCCLEngine:
             bucket_meta.append(entry)
             offset += nbytes
             n_params += 1
+            del weight, w, w_bytes
 
         self._flush_bucket_send(pack_idx, bucket_meta, is_last=True,
                                 prev_idx=prev_idx)
@@ -271,7 +273,7 @@ class NCCLEngine:
         self._send_pair(idx, nccl_s)
         self._send_events[idx].record(nccl_s)
 
-    @torch.no_grad()
+    # Not @torch.no_grad(): its generator wrapper holds the last yield through the next rebuild (no autograd here).
     def receive_weights(self) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Pipelined receive: prefetch next bucket while caller processes current.
 
@@ -369,6 +371,8 @@ class NCCLEngine:
                 if end == tensor_nbytes:
                     del partial_tensors[name]
                     yield name, tensor
+                    # Holding the rebuilt tensor here would keep it alive through the next rebuild: two full copies.
+                    tensor = state = None
                 else:
                     partial_tensors[name] = (tensor, end, tensor_nbytes)
 
@@ -415,6 +419,7 @@ class NCCLEngine:
             w = weight.contiguous()
             self._send_one_direct(name, w, nccl_s)
             n_params += 1
+            del weight, w
 
         self._write_meta(0, [], is_last=True)
         self._send_buf(self._meta_bufs[0], nccl_s)

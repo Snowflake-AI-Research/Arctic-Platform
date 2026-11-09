@@ -69,6 +69,7 @@ def register(registry: Registry) -> None:
                 "no equivalent option; sparse MLA is used only by the GLM loaders glm_moe_dsa and glm5_next"
             ),
             "numerics.reduce_dtype": "no equivalent option",
+            "numerics.fp32_routed_weighting": "no equivalent option; only glm5_next and qwen4_exp have one",
             "numerics.optimization_dtype": (
                 "the key has no effect on this route: the job sets the model dtype, not this key"
             ),

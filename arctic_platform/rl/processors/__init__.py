@@ -34,6 +34,7 @@ from .compute_logprobs import compute_logprobs_post
 from .cortex_grpo import cortex_grpo_echo_v1_loss
 from .cortex_grpo import cortex_grpo_loss
 from .cortex_grpo import cortex_grpo_mixed_v1_loss
+from .dflash2 import DFlash2Loss
 
 # Functional math
 from .functional import _compute_sequence_level_ratio_and_advantages
@@ -131,6 +132,12 @@ from .stats_tracker import scope
 from .stats_tracker import stat
 from .verl_grpo import verl_grpo_loss
 
+# Signed weighted log-likelihood (importing registers weighted_cross_entropy)
+from .weighted_cross_entropy import weighted_cross_entropy_loss
+
+# Generic client-side surrogate (importing registers "weighted_logprob_sum")
+from .weighted_logprob import weighted_logprob_sum
+
 __all__ = [
     # pipeline
     "POST_PROCESSORS",
@@ -155,6 +162,7 @@ __all__ = [
     "resolve_packed_loss_reduction",
     "local_mean_packed_loss_reduction",
     "causal_cross_entropy_loss",
+    "weighted_cross_entropy_loss",
     "GroupedDistillationLoss",
     "GRPOGroupedDistillationLoss",
     "grouped_divergence",
@@ -212,7 +220,9 @@ __all__ = [
     "grpo_echo_v1_loss",
     "cortex_grpo_loss",
     "cortex_grpo_mixed_v1_loss",
+    "DFlash2Loss",
     "cortex_grpo_echo_v1_loss",
+    "weighted_logprob_sum",
     "sft_loss",
     "sft_ce_loss",
     "LOGIT_LOSS_FNS",
