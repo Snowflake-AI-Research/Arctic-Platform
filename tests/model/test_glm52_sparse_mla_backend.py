@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
@@ -83,7 +84,7 @@ def test_sparse_backends_keep_expected_masks_and_inf_grad_merge_flag():
     flash = (kernels / "sparse_mla_flashmla.py").read_text()
     assert "mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] < sentinel" in fwd
     assert "max_kv_i = q_i" not in fwd
-    assert "mask[bi_i] = Indices[by, s_i, bz // NH, i_i * BS + bi_i] < sentinel" in bwd
+    assert "mask[bi_i] = idx_shared[i_i * BS + bi_i] < sentinel" in bwd
     assert "max_kv_i" not in bwd
     assert "TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: False" in bwd
     assert "flash_indices == sentinel_idx" in flash
@@ -228,3 +229,47 @@ def test_flashmla_matches_ref_forward_and_backward():
     torch.testing.assert_close(out_fm, out_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(q_fm.grad, q_ref.grad, atol=4e-2, rtol=4e-2)
     torch.testing.assert_close(kv_fm.grad, kv_ref.grad, atol=4e-2, rtol=4e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused TileLang backward runs on CUDA")
+@pytest.mark.parametrize("width", [576, 512], ids=["latent-plus-rope-576", "rope-free-512"])
+def test_fused_sparse_mla_backward_matches_fp32_reference(width):
+    """GLM-5.3's 512 latent + 64 rope channels, and GLM-5.3-Flash's rope-free 512 without a padded tail."""
+    from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_bwd import sparse_mla_bwd
+
+    torch.manual_seed(0)
+    queries, keys, heads, topk, scale = 128, 512, 64, 256, 576**-0.5
+    q = (torch.randn(1, queries, heads, width, device="cuda") * 0.5).bfloat16()
+    kv = (torch.randn(1, keys + 1, 1, width, device="cuda") * 0.5).bfloat16()
+    kv[:, keys] = 0
+    # The last CP shard of the keys; slots past a query's position point at the zero sentinel row.
+    positions = torch.arange(keys - queries, keys, device="cuda")
+    indices = torch.randint(0, keys, (queries, topk), device="cuda")
+    indices = torch.where(indices <= positions[:, None], indices, keys).sort(-1).values.int()
+
+    q_ref, kv_ref = q.float().requires_grad_(True), kv.float().requires_grad_(True)
+    selected = kv_ref[0, indices.long(), 0]
+    scores = torch.einsum("qhd,qkd->qhk", q_ref[0], selected) * scale
+    scores = scores.masked_fill((indices == keys)[:, None, :], float("-inf"))
+    lse = torch.logsumexp(scores, dim=-1)
+    out = torch.einsum("qhk,qkd->qhd", torch.softmax(scores, dim=-1), selected[..., :512])
+    grad = torch.randn_like(out)
+    out.backward(grad)
+
+    dq, dkv = sparse_mla_bwd(
+        q,
+        kv,
+        out.detach().bfloat16().unsqueeze(0).contiguous(),
+        grad.bfloat16().unsqueeze(0).contiguous(),
+        indices.view(1, queries, 1, topk).contiguous(),
+        (lse.detach() * math.log2(math.e)).unsqueeze(0).contiguous(),
+        sm_scale=scale,
+    )
+
+    def rel(a, b):
+        return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+    assert torch.isfinite(dq).all() and torch.isfinite(dkv).all()
+    assert rel(dq, q_ref.grad) < 1e-2
+    assert rel(dkv[:, :keys], kv_ref.grad[:, :keys]) < 1e-2
+    assert torch.all(dkv[:, keys] == 0)

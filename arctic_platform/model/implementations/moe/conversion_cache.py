@@ -110,6 +110,8 @@ def _write_conversion_cache(
     if stream_convert_fn is not None:
         try:
             stream_convert_fn(source_path, tmp_path)
+            if not conversion_cache_ready(tmp_path):
+                raise RuntimeError(f"Weight conversion did not publish a complete checkpoint: {tmp_path}")
             os.replace(tmp_path, snapshot_path)
             committed = True
         finally:
@@ -133,6 +135,8 @@ def _write_conversion_cache(
         save_state_dict_fn(snapshot_state_dict, tmp_path)
         t_save = time.perf_counter()
         del snapshot_state_dict
+        if not conversion_cache_ready(tmp_path):
+            raise RuntimeError(f"Weight conversion did not publish a complete checkpoint: {tmp_path}")
         os.replace(tmp_path, snapshot_path)
         committed = True
     finally:
