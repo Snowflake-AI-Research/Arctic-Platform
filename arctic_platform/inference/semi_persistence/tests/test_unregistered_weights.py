@@ -16,9 +16,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-import json
 import os
-import shutil
 import sys
 import time
 import types
@@ -31,8 +29,7 @@ torch = pytest.importorskip("torch")
 _PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _NAMES = ("_semip_weight_pool_ranges", "_semip_unregistered_storages",
           "_semip_param_tensors", "_semip_layout", "_semip_attach", "_semip_stage",
-          "_semip_restore_weights", "_semip_lora_manager", "_semip_lora_views",
-          "_semip_check_host_copy_covers_model", "_semip_save_weights")
+          "_semip_restore_weights", "_semip_lora_manager", "_semip_lora_views")
 GiB = 2**30
 
 
@@ -112,11 +109,7 @@ def child(monkeypatch):
     funcs = [n for n in tree.body
              if isinstance(n, ast.FunctionDef) and n.name in _NAMES]
     assert {f.name for f in funcs} == set(_NAMES)
-    ns = {"torch": _Torch(), "ThreadPoolExecutor": ThreadPoolExecutor, "time": time,
-          "os": os, "shutil": shutil, "json": json,
-          "_WEIGHTS_SHARD_BYTES": 2 * GiB, "_WEIGHTS_IO_WORKERS": 2,
-          "_WEIGHTS_MIN_LOADED_FRACTION": 0.8,
-          "_semip_tp_size": lambda worker: 1}
+    ns = {"torch": _Torch(), "ThreadPoolExecutor": ThreadPoolExecutor, "time": time}
     exec(compile(ast.Module(body=funcs, type_ignores=[]), path, "exec"), ns)
 
     allocator = _Allocator()
@@ -260,41 +253,3 @@ def test_a_sleep_that_discards_the_experts_is_undone_by_restore(child):
 
     assert out["loaded"] == n_entries
     assert all(torch.equal(a, b) for a, b in zip(before, [*unregistered, *params]))
-
-
-def test_the_guard_refuses_the_gpt_oss_host_copy_and_passes_the_others(child):
-    worker, _ = _gpt_oss(child.allocator)
-    runner = worker.model_runner
-    # (per-rank bytes saved, "Model loading took" GiB) from the 2026-11-06 publish.
-    runner.model_memory_usage = int(8.26 * GiB)
-    with pytest.raises(RuntimeError, match="a restore would serve without them"):
-        child._semip_check_host_copy_covers_model(worker, 4983289344 // 8)
-    for saved, loaded in [(58.97 / 8, 7.45), (66.39 / 8, 8.83), (65.39, 69.03),
-                          (304.80 / 8, 39.02), (56.94 / 4, 14.25)]:
-        runner.model_memory_usage = int(loaded * GiB)
-        child._semip_check_host_copy_covers_model(worker, int(saved * GiB))
-
-
-def test_the_guard_does_not_count_lora_slots_against_the_host_copy(child):
-    worker, _ = _gpt_oss(child.allocator, lora=True)
-    lora = sum(v.numel() for v in child._semip_lora_views(worker))
-    worker.model_runner.model_memory_usage = 100 + lora
-    child._semip_check_host_copy_covers_model(worker, 80)
-    with pytest.raises(RuntimeError):
-        child._semip_check_host_copy_covers_model(worker, 79)
-
-
-def test_the_guard_stands_aside_when_vllm_reports_no_load(child):
-    worker, _ = _gpt_oss(child.allocator)
-    child._semip_check_host_copy_covers_model(worker, 0)
-
-
-def test_save_weights_refuses_before_writing_anything(child, tmp_path):
-    worker, _ = _gpt_oss(child.allocator)
-    worker._semip_buf = torch.zeros(10, dtype=torch.uint8)
-    worker._semip_index = {}
-    worker.model_runner.model_memory_usage = 1000
-    weights_dir = tmp_path / "weight"
-    with pytest.raises(RuntimeError):
-        child._semip_save_weights(worker, str(weights_dir))
-    assert not weights_dir.exists()

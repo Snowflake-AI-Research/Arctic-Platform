@@ -298,9 +298,6 @@ attributes, so the table also carries every storage in the cumem
 parameter, buffer or LoRA slot owns, keyed `"main:s:<path>"` /
 `"drafter:s:<path>"` as a flat uint8 view.  These follow all parameters,
 so a model without any keeps its layout and weight hash.
-`save_weights` also refuses a host copy below 80% of vLLM's
-`model_memory_usage` (less LoRA slots): what the copy misses, the
-level-2 sleep discards and nothing restores.
 
 `named_buffers()` are intentionally not staged.  Main buffers ride
 stock vLLM's `_sleep_saved_buffers` snapshot; drafter buffers ride
