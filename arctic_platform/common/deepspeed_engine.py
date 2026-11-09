@@ -435,9 +435,11 @@ def _optimizer_cpu_offload_enabled(ds_config: dict) -> bool:
         return False
     offload = zero_config.get("offload_optimizer")
     if isinstance(offload, dict):
-        # DeepSpeed and ``_without_noop_offload`` treat a missing device as none.
-        # Only an explicit cpu (or other non-empty, non-none) device is offload on.
-        return str(offload.get("device", "none")).lower() not in ("none", "")
+        from deepspeed.runtime.zero.offload_config import DeepSpeedZeroOffloadOptimizerConfig
+        from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
+
+        # Same default as DeepSpeed: missing device is none. Extra keys raise.
+        return DeepSpeedZeroOffloadOptimizerConfig(**offload).device != OffloadDeviceEnum.none
     return bool(offload)
 
 

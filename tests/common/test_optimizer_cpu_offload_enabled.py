@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``{"device": "none"}`` must not count as CPU optimizer offload."""
+"""CPU optimizer offload follows DeepSpeedZeroOffloadOptimizerConfig."""
 
 import pytest
+from pydantic import ValidationError
 
 from arctic_platform.client.config import _without_noop_offload
 from arctic_platform.common.deepspeed_engine import _optimizer_cpu_offload_enabled
@@ -30,23 +31,16 @@ def _stripper_keeps_optimizer_offload(ds_config: dict) -> bool:
     return "offload_optimizer" in zero
 
 
-@pytest.mark.parametrize(
-    "offload",
-    [
-        {"device": "none"},
-        {"device": "None"},
-        {"device": "NONE"},
-        {"device": ""},
-        {},
-        {"pin_memory": True},
-    ],
-)
+@pytest.mark.parametrize("offload", [{"device": "none"}, {}, {"pin_memory": True}])
 def test_device_none_or_missing_is_offload_off(offload):
     assert _optimizer_cpu_offload_enabled(_cfg(offload)) is False
 
 
-@pytest.mark.parametrize("offload", [{"device": "cpu"}, {"device": "cpu", "pin_memory": False}])
-def test_real_cpu_offload_is_on(offload):
+@pytest.mark.parametrize(
+    "offload",
+    [{"device": "cpu"}, {"device": "cpu", "pin_memory": False}, {"device": "nvme"}],
+)
+def test_real_cpu_or_nvme_offload_is_on(offload):
     assert _optimizer_cpu_offload_enabled(_cfg(offload)) is True
 
 
@@ -57,6 +51,12 @@ def test_falsy_offload_is_off(offload):
 
 def test_missing_zero_block_is_off():
     assert _optimizer_cpu_offload_enabled({}) is False
+
+
+@pytest.mark.parametrize("offload", [{"device": "None"}, {"device": ""}, {"foo": 1}])
+def test_invalid_offload_dict_raises(offload):
+    with pytest.raises(ValidationError):
+        _optimizer_cpu_offload_enabled(_cfg(offload))
 
 
 @pytest.mark.parametrize(
