@@ -168,3 +168,31 @@ def test_tokens_that_fit_in_index_topk_get_causal_indices_beside_longer_sequence
     assert out is buffer
     assert buffer[:3].tolist() == [[0, -1, -1, -1], [0, 1, 2, -1], [0, 1, 2, 3]]
     assert buffer[3].tolist() == [7, 7, 7, 7]
+
+
+def test_indexer_key_norm_runs_eagerly_with_the_reference_math(monkeypatch):
+    import sys
+    import types
+
+    import torch
+    import torch.nn.functional as F
+
+    from arctic_platform.inference.vllm import glm5_batch_invariance
+
+    attention = types.ModuleType("vllm.models.glm5next.common.attention")
+    attention._fused_indexer_k_norm = "compiled"
+    common = types.ModuleType("vllm.models.glm5next.common")
+    common.attention = attention
+    for name, module in (("vllm", types.ModuleType("vllm")), ("vllm.models", types.ModuleType("vllm.models")),
+                         ("vllm.models.glm5next", types.ModuleType("vllm.models.glm5next")),
+                         ("vllm.models.glm5next.common", common),
+                         ("vllm.models.glm5next.common.attention", attention)):  # fmt: skip
+        monkeypatch.setitem(sys.modules, name, module)
+    glm5_batch_invariance._eager_indexer_k_norm()
+
+    x = torch.randn(16, 128, dtype=torch.bfloat16)
+    weight, bias = torch.randn(128), torch.randn(128)
+    out = attention._fused_indexer_k_norm(x, weight, bias, 128, 1e-6)
+    assert out.dtype == torch.bfloat16
+    assert torch.equal(out, F.layer_norm(x.float(), (128,), weight, bias, 1e-6).to(torch.bfloat16))
+    assert torch.equal(attention._fused_indexer_k_norm(x[3:4], weight, bias, 128, 1e-6), out[3:4])
