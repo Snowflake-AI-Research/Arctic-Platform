@@ -249,6 +249,23 @@ def _causal_indices_per_token() -> None:
     sparse_indexer.sparse_attn_indexer_kpool = sparse_attn_indexer_kpool
 
 
+def _eager_indexer_k_norm() -> None:
+    """Run the indexer's key LayerNorm eagerly.
+
+    ``_fused_indexer_k_norm`` is a ``torch.compile(dynamic=True)`` leaf, and Inductor still specializes a size-1
+    dimension: a step with one token runs a different reduction than a step with several, and now and then a key
+    rounds to a different bf16 value. The key is stashed in the kpool tail and compressed into a pool, so the pool's
+    scores change for every later token.
+    """
+    import torch.nn.functional as F
+    from vllm.models.glm5next.common import attention
+
+    def _fused_indexer_k_norm(x, weight, bias, dim, eps):
+        return F.layer_norm(x.float(), (dim,), weight, bias, eps).type_as(x)
+
+    attention._fused_indexer_k_norm = _fused_indexer_k_norm
+
+
 def _batch_invariant_indexer_head_weights() -> None:
     """Compute the sparse indexer's fp32 per-head weights with the batch-invariant matmul.
 
@@ -434,6 +451,7 @@ def ensure_glm5_batch_invariance() -> None:
     _split_mixed_kda_steps()
     _deterministic_indexer_topk()
     _causal_indices_per_token()
+    _eager_indexer_k_norm()
     _batch_invariant_indexer_head_weights()
     from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
 
