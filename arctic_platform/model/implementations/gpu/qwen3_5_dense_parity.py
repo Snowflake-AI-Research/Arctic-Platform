@@ -62,7 +62,7 @@ from arctic_platform.model.implementations.gpu.vllm_rounding import FusedAddRMSN
 from arctic_platform.model.implementations.gpu.vllm_rounding import FusedAddRMSNormFp32Residual
 from arctic_platform.model.implementations.gpu.vllm_rounding import rope_rotary_slice_fp32
 
-VERIFIED_TRANSFORMERS_VERSION = "5.17.0, 5.20.2 and 5.22.2"
+VERIFIED_TRANSFORMERS_VERSION = "5.20.2"
 
 # The Hugging Face model types of the dense Qwen3.5 family, for a loader that checks before loading weights.
 QWEN3_5_DENSE_MODEL_TYPES = ("qwen3_5", "qwen3_5_text")
@@ -78,11 +78,6 @@ _STOCK_SOURCE_SHA256: dict[str, str] = {
     "apply_rotary_pos_emb": "ab8feb64f19555713efc4c559ce306b35205b1197f8431784585999d9a5b6662",
     "Qwen3_5GatedDeltaNet.forward": "bd25761e1031fff0f6b24115dff8175ee9c8fb585287a4026b73a12bb0b5d816",
     "Qwen3_5RMSNorm.forward": "350041feaa40063352594579e212741fdff004594990c36162458d778dae1a9e",
-}
-
-# 5.22 reads recurrent state through Cache accessors; the beta gate still uses only b.sigmoid().
-_STOCK_SOURCE_SHA256_ALTERNATIVES: dict[str, tuple[str, ...]] = {
-    "Qwen3_5GatedDeltaNet.forward": ("43718d6c3e7255e63fc7a79d60c242912b48dbe00f351b9d80814ca0fb603037",),
 }
 
 _PATCHED_ATTRIBUTE = "_arctic_fp32_parity"
@@ -140,16 +135,12 @@ def _check_functions(functions: dict[str, Callable[..., Any]]) -> None:
     import transformers
 
     sources = _file_sources()
-    changed = [
-        name
-        for name, digest in _STOCK_SOURCE_SHA256.items()
-        if _digest(sources.get(name, "")) not in (digest, *_STOCK_SOURCE_SHA256_ALTERNATIVES.get(name, ()))
-    ]
+    changed = [name for name in _STOCK_SOURCE_SHA256 if _digest(sources.get(name, "")) != _STOCK_SOURCE_SHA256[name]]
     if len(changed) > 0:
         _fail(f"the installed transformers {transformers.__version__} has different source for {', '.join(changed)}")
     replaced = []
     for name, function in sorted(functions.items()):
-        if _digest(inspect.getsource(function)) != _digest(sources[name]):
+        if _digest(inspect.getsource(function)) != _STOCK_SOURCE_SHA256[name]:
             original = inspect.unwrap(function)
             replaced.append(f"{name} by {original.__module__}.{original.__qualname__}")
     if len(replaced) > 0:

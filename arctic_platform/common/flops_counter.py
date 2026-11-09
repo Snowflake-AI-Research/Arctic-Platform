@@ -387,8 +387,8 @@ def _glm5_next_checkpointed_flops_per_token(config, batch_seqlens) -> list[float
     hidden = config.hidden_size
     heads = config.num_attention_heads
     layers = list(config.layer_types)
-    sparse = ("deepseek_sparse_attention", "indexed_attention")
-    n_sparse = sum(layer in sparse for layer in layers)
+    sparse = "indexed_attention"
+    n_sparse = sum(layer == sparse for layer in layers)
     n_linear = sum(layer == "linear_attention" for layer in layers)
     mlp_types = list(getattr(config, "mlp_layer_types", None) or [])
     if mlp_types:
@@ -400,7 +400,7 @@ def _glm5_next_checkpointed_flops_per_token(config, batch_seqlens) -> list[float
     indexer_types = list(getattr(config, "indexer_types", None) or [])
     n_indexer = 0
     for index, layer in enumerate(layers):
-        if layer not in sparse:
+        if layer != sparse:
             continue
         kind = indexer_types[index] if index < len(indexer_types) else "full"
         if kind != "shared":

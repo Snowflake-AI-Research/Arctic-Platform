@@ -228,18 +228,14 @@ def _glm53_flash():
         linear_num_heads=64,
         linear_head_dim=128,
         linear_conv_kernel_dim=4,
-        layer_types=["deepseek_sparse_attention" if i in sparse else "linear_attention" for i in range(45)],
+        layer_types=["indexed_attention" if i in sparse else "linear_attention" for i in range(45)],
         mlp_layer_types=["dense"] * 3 + ["sparse"] * 42,
         indexer_types=["full"] * 45,
     )
 
 
-@pytest.mark.parametrize("sparse_layer_type", ["deepseek_sparse_attention", "indexed_attention"])
-def test_glm53_flash_matches_the_reported_attention_terms(sparse_layer_type):
+def test_glm53_flash_matches_the_reported_attention_terms():
     config = _glm53_flash()
-    config.layer_types = [
-        sparse_layer_type if layer == "deepseek_sparse_attention" else layer for layer in config.layer_types
-    ]
     # 8 x 16.742B activated parameters, plus 11 sparse layers. The H200 tables
     # rounded that activated count to 18B (0.17722 at 64K, 0.25694 at 256K).
     assert abs(tflops_per_token(config, 65536) - 0.16715) < 5e-5
