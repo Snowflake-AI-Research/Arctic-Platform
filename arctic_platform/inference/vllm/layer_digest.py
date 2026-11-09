@@ -226,6 +226,21 @@ def ensure_layer_digest() -> None:
     for cls in (Glm5NextMLAAttention, Glm5NextLinearAttention):
         _wrap(cls, "forward", lambda self, cls=cls: f"{cls.__name__}@{id(self):x}")
         _wrap(cls, "forward", lambda self, cls=cls: cls.__name__, dump=True)
+    # KDA sub-steps, so a trainer-side mismatch can be located stage by stage.
+    _wrap(Glm5NextLinearAttention, "_flashkda_prefill", lambda self: "kda.flashkda", dump=True)
+    from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
+
+    _wrap(FusedRMSNormGated, "forward", lambda self: "kda.o_norm", dump=True)
+    from vllm.models.glm5next.common import kda as kda_module
+
+    original_conv = kda_module.causal_conv1d_fn
+
+    def causal_conv1d_fn(*args, **kwargs):
+        out = original_conv(*args, **kwargs)
+        _dump("kda.conv", [*args, *(v for k, v in kwargs.items() if k in ("conv_states", "query_start_loc"))], out)
+        return out
+
+    kda_module.causal_conv1d_fn = causal_conv1d_fn
     from vllm.model_executor.layers.fused_moe.router.fused_moe_router import FusedMoERouter
     from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
