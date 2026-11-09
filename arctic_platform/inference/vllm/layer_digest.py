@@ -156,6 +156,36 @@ def _wrap(cls, method: str, name_of, inputs: bool = False, dump: bool = False):
     setattr(cls, method, wrapped)
 
 
+def _wrap_kpool_decode_update() -> None:
+    """Record each decode row's tail ring before the kpool update and the pool entry it writes (``kpool.*``)."""
+    from vllm.models.glm5next.nvidia.ops import kpool_compress
+
+    original = kpool_compress.kpool_decode_update_and_maybe_write_cache_batched
+
+    def update(kv_cache, tail_kv_cache, tail_slot_mapping, key, slot_score, ape, slot_mapping, positions, *args,
+               **kwargs):  # fmt: skip
+        rows = key.shape[0] * key.shape[1]
+        if _state["digests"] is None or rows != _state["rows"]:
+            return original(kv_cache, tail_kv_cache, tail_slot_mapping, key, slot_score, ape, slot_mapping,
+                            positions, *args, **kwargs)  # fmt: skip
+        ring = tail_kv_cache.shape[2]
+        blocks = tail_slot_mapping.reshape(-1).clamp(min=0).long() // ring
+        record_numbered("kpool.tail_ring", tail_kv_cache[blocks].reshape(rows, -1))
+        record_numbered("kpool.key", key.reshape(rows, -1))
+        out = original(kv_cache, tail_kv_cache, tail_slot_mapping, key, slot_score, ape, slot_mapping, positions,
+                       *args, **kwargs)  # fmt: skip
+        head_dim, page_size = key.shape[-1], kv_cache.shape[1]
+        pages = kv_cache.as_strided((kv_cache.shape[0], kv_cache.stride(0)), (kv_cache.stride(0), 1))
+        loc = slot_mapping.reshape(-1).long()
+        safe = loc.clamp(min=0)
+        cols = (safe % page_size)[:, None] * head_dim + torch.arange(head_dim, device=loc.device)
+        entry = pages[(safe // page_size)[:, None], cols]
+        record_numbered("kpool.pool_entry", torch.where(loc[:, None] >= 0, entry, torch.zeros_like(entry)))
+        return out
+
+    kpool_compress.kpool_decode_update_and_maybe_write_cache_batched = update
+
+
 def ensure_layer_digest() -> None:
     global _APPLIED
     directory = os.environ.get(DIR_ENV)
@@ -266,6 +296,7 @@ def ensure_layer_digest() -> None:
         return out
 
     SparseAttnIndexerKpool.forward_cuda = indexer_forward
+    _wrap_kpool_decode_update()
     _wrap(FlashAttnMLASparseImpl, "forward_mqa", lambda self: f"sparse_mla@{id(self):x}")
     _wrap(GateLinear, "forward", lambda self: f"gate@{id(self):x}")
     _wrap(FusedMoERouter, "select_experts", lambda self: f"select_experts@{id(self):x}")
