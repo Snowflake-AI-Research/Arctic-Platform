@@ -20,12 +20,16 @@ from __future__ import annotations
 from functools import lru_cache
 
 import torch
+import torch.distributed as dist
 from packaging.version import Version
 from torch.nn.attention.flex_attention import BlockMask
 from torch.nn.attention.flex_attention import flex_attention
 from torch.utils.checkpoint import checkpoint
 from transformers.models.inkling.modeling_inkling import InklingAttention as NativeInklingAttention
 from transformers.models.inkling.modeling_inkling import InklingTextModel as NativeInklingTextModel
+
+from arctic_platform.model.implementations.gpu.sp.collectives import gather_sequence
+from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 
 
 @lru_cache(maxsize=32)
@@ -128,7 +132,7 @@ class InklingFlexAttention(NativeInklingAttention):
 
         def key_projection(hidden):
             key = self.k_sconv(self.k_proj(hidden), conv_mask=conv_mask)
-            return self.k_norm(key.view(batch, length, self.num_key_value_heads, self.head_dim))
+            return self.k_norm(key.view(batch, hidden.shape[1], self.num_key_value_heads, self.head_dim))
 
         def value_projection(hidden):
             return self.v_sconv(self.v_proj(hidden), conv_mask=conv_mask)
@@ -143,6 +147,19 @@ class InklingFlexAttention(NativeInklingAttention):
         key = key.transpose(1, 2).contiguous()
         value = value.view(batch, length, self.num_key_value_heads, self.head_dim).transpose(1, 2).contiguous()
         relative = self.r_proj(hidden_states).view(batch, length, self.num_heads, -1)
+        group = getattr(self, "_sp_group", None)
+        if group is not None:
+            size = dist.get_world_size(group)
+            query = sequence_head_all_to_all(group, query.transpose(1, 2), scatter_dim=2, gather_dim=1)
+            relative = sequence_head_all_to_all(group, relative, scatter_dim=2, gather_dim=1)
+            key, value = key.transpose(1, 2), value.transpose(1, 2)
+            if size > self.num_key_value_heads:
+                repeats = size // self.num_key_value_heads
+                key, value = key.repeat_interleave(repeats, dim=2), value.repeat_interleave(repeats, dim=2)
+            key = sequence_head_all_to_all(group, key, scatter_dim=2, gather_dim=1).transpose(1, 2).contiguous()
+            value = sequence_head_all_to_all(group, value, scatter_dim=2, gather_dim=1).transpose(1, 2).contiguous()
+            query = query.transpose(1, 2).contiguous()
+            length = query.shape[2]
         padding_mask, sequence_ids = attention_mask if attention_mask is not None else (None, None)
         chunks = []
         for start in range(0, length, chunk_size):
@@ -184,7 +201,10 @@ class InklingFlexAttention(NativeInklingAttention):
             else:
                 output = attend(*args)
             chunks.append(output.transpose(1, 2))
-        output = torch.cat(chunks, dim=1).reshape(batch, length, -1)
+        output = torch.cat(chunks, dim=1)
+        if group is not None:
+            output = sequence_head_all_to_all(group, output, scatter_dim=1, gather_dim=2)
+        output = output.reshape(batch, hidden_states.shape[1], -1)
         return self.o_proj(output), None
 
 
@@ -204,16 +224,19 @@ class InklingFlexTextModel(NativeInklingTextModel):
         if attention_mask is not None and (not torch.is_tensor(attention_mask) or attention_mask.ndim != 2):
             raise ValueError("Inkling FlexAttention requires a two-dimensional padding mask")
         padding = attention_mask.bool() if attention_mask is not None else None
+        group = getattr(self, "_sp_group", None)
+        global_padding = gather_sequence(padding, group) if padding is not None else None
+        global_positions = gather_sequence(position_ids, group) if position_ids is not None else None
         sequence_ids = None
-        if position_ids is not None:
-            resets = position_ids[:, 1:] != position_ids[:, :-1] + 1
+        if global_positions is not None:
+            resets = global_positions[:, 1:] != global_positions[:, :-1] + 1
             sequence_ids = torch.nn.functional.pad(resets.to(torch.int64).cumsum(-1), (1, 0))
             if sequence_ids.shape[0] == 1:
                 size = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
                 sequence_ids = sequence_ids.expand(size, -1)
         masks = {
-            "full_attention": (padding, sequence_ids),
-            "sliding_attention": (padding, sequence_ids),
+            "full_attention": (global_padding, sequence_ids),
+            "sliding_attention": (global_padding, sequence_ids),
             "linear_attention": padding,
         }
         return super().forward(

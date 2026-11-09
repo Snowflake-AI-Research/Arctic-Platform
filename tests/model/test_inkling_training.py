@@ -85,6 +85,35 @@ def initialized_prime_model(config):
 
 class TestInklingTraining(TestCasePlus):
     @require_torch_gpu
+    def test_router_is_invariant_to_sequence_shard_length(self):
+        from arctic_platform.model.implementations.inkling.modeling_inkling import InklingTopkRouter
+
+        set_seed(947)
+        config = tiny_config()
+        config.hidden_size = 4096
+        config.n_routed_experts = 256
+        config.num_experts_per_tok = 6
+        config.n_shared_experts = 4
+        config.inkling_mlp_token_chunk_size = 128
+        router = InklingTopkRouter(config).cuda().float()
+        torch.nn.init.normal_(router.weight, std=0.02)
+        hidden = torch.randn(2, 520, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        expected = [value.view(2, 520, -1) for value in router(hidden)]
+        for size in (2, 4):
+            actual = [
+                torch.cat(parts, dim=1)
+                for parts in zip(
+                    *[
+                        [value.view(2, 520 // size, -1) for value in router(shard)]
+                        for shard in hidden.chunk(size, dim=1)
+                    ],
+                    strict=True,
+                )
+            ]
+            for value, baseline in zip(actual, expected, strict=True):
+                torch_assert_equal(value, baseline)
+
+    @require_torch_gpu
     def test_flex_chunked_full_and_lora_steps_with_activation_offload(self):
         import copy
 
@@ -428,10 +457,16 @@ class TestInklingTraining(TestCasePlus):
             with self.assertRaisesRegex(ValueError, "PyTorch 2.13"):
                 enable_flex_attention(None)
 
-    def test_rejects_sequence_parallelism(self):
+    def test_sequence_parallelism_requires_flex(self):
         path = self.checkpoint_config()
         with self.assertRaisesRegex(ValueError, "sequence parallelism"):
             ModelSpec(model_path_or_name=path, parallelism=ParallelismConfig(sequence_parallel=2))
+        spec = ModelSpec(
+            model_path_or_name=path,
+            attn_implementation="flex_attention",
+            parallelism=ParallelismConfig(sequence_parallel=2),
+        )
+        self.assertEqual(spec.parallelism.sequence_parallel, 2)
 
     def test_worker_uses_native_head_by_default(self):
         from arctic_platform.model import ds_worker_moe_model_spec

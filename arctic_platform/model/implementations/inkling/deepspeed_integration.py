@@ -24,6 +24,7 @@ from transformers import PretrainedConfig
 from transformers.models.inkling.configuration_inkling import InklingTextConfig
 
 from arctic_platform.model.implementations.inkling.modeling_inkling import InklingForCausalLMPrimeRL
+from arctic_platform.model.implementations.inkling.sequence_parallel import apply_sequence_parallelism
 from arctic_platform.model.implementations.inkling.weights import build_iter_vllm_weights
 from arctic_platform.model.implementations.inkling.weights import load_weights
 from arctic_platform.model.implementations.moe.deepspeed_integration import load_moe_model
@@ -78,6 +79,7 @@ def _adapter_for_inkling(options=None):
         _adapter(),
         get_model=configured_model,
         inject_lm_head=_configure_lm_head,
+        apply_sequence_parallelism=apply_sequence_parallelism,
         load_dcp_from_hf=load_weights,
         vllm_weight_export=build_iter_vllm_weights,
     )

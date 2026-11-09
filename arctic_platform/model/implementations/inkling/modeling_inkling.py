@@ -35,6 +35,7 @@ from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 class InklingTopkRouter(NativeInklingTopkRouter):
     def __init__(self, config):
         super().__init__(config)
+        self.token_chunk_size = getattr(config, "inkling_mlp_token_chunk_size", None) or 2048
         # DeepSpeed's parameter cast guard preserves the constant selection bias too.
         bias = self.e_score_correction_bias
         del self.e_score_correction_bias
@@ -43,6 +44,15 @@ class InklingTopkRouter(NativeInklingTopkRouter):
 
     def forward(self, hidden_states):
         flat = hidden_states.reshape(-1, self.hidden_dim)
+        chunks = []
+        for shard in flat.split(self.token_chunk_size):
+            tokens = shard.shape[0]
+            # Fix GEMM geometry so SP does not change FP32 routing weights.
+            padded = F.pad(shard, (0, 0, 0, self.token_chunk_size - tokens))
+            chunks.append(tuple(value[:tokens] for value in self._forward(padded)))
+        return tuple(torch.cat(parts, dim=0) for parts in zip(*chunks, strict=True))
+
+    def _forward(self, flat):
         logits = F.linear(flat.float(), self.weight.float())
         routed, shared = logits.split([self.num_experts, self.n_shared_experts], dim=-1)
         indices = torch.topk(routed.sigmoid() + self.e_score_correction_bias, self.top_k, dim=-1, sorted=False)[1]
