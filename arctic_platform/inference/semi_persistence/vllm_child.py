@@ -14,8 +14,9 @@ to accept new generate requests (and other commands) while the engine
 is actively decoding, enabling concurrent request handling without
 asyncio or extra threads.
 
-Attach allocates CPU memory sized to model.named_parameters().  Stage
-snapshots the post-processed GPU parameters into that buffer.
+Attach allocates CPU memory sized to model.named_parameters() plus any
+weight-pool storage they do not cover (see _semip_param_tensors).  Stage
+snapshots the post-processed GPU weights into that buffer.
 plan_restore_weights walks the param index once and caches a chunk plan
 (chunk_lo, chunk_hi, members) bounded by max_buffer_bytes.  If the host
 buffer is pageable it also forms a small pinned double buffer (buffer_bytes
@@ -167,6 +168,13 @@ def _truncate_for_display(value, limit=200):
 # Shard size / parallelism for save_weights + load_weights disk I/O.
 _WEIGHTS_SHARD_BYTES = 2 * 2**30   # 2 GiB per shard
 _WEIGHTS_IO_WORKERS = 8            # thread pool size for shard I/O
+
+# The least a rank's host copy may hold of what vLLM reports loading
+# (``model_runner.model_memory_usage``, the "Model loading took" figure)
+# before save_weights refuses to write it.  Every model published through
+# 2026-11 lands between 0.94 and 1.0 -- the gap is buffers, which vLLM's own
+# level-2 sleep keeps -- and gpt-oss-120b, whose experts were missing, at 0.07.
+_WEIGHTS_MIN_LOADED_FRACTION = 0.8
 
 # Fraction of *measured* free VRAM the restore staging buffer may claim.
 # The budget that reaches this file is predicted on the host from
@@ -551,31 +559,124 @@ def _cuda_restore_probe(worker):
 #
 # Param names are namespaced ``main:p:`` / ``drafter:p:`` to match the layout
 # built at attach so stage/restore dispatch each entry to the right tensor.
+#
+# Parameters are not all of the weights.  vLLM's triton_kernels MXFP4 MoE
+# backends (gpt-oss on sm90) delete the expert Parameters in
+# process_weights_after_loading and keep the swizzled experts as plain layer
+# attributes, their scales in the quant method's PrecisionConfig.  A level-2
+# sleep discards those with the rest of the "weights" pool, and wake_up maps
+# memory under them that nothing refills.  So every storage in that pool which
+# no parameter or buffer owns, and which a module reaches through its
+# attributes, travels in the host copy too, as a ``main:s:`` / ``drafter:s:``
+# entry: a flat uint8 view of the whole storage.  They follow every parameter,
+# so a model that has none keeps the layout -- and the weight hash -- it had.
 # ---------------------------------------------------------------------------
-def _semip_layout(worker):
-    layout = []
-    mr = worker.model_runner
-    for name, p in mr.model.named_parameters():
-        d = p.data
-        layout.append((f"main:p:{name}", d.nbytes, d.dtype, tuple(d.shape)))
-    drafter = getattr(mr, "drafter", None)
-    dm = getattr(drafter, "model", None) if drafter is not None else None
-    if dm is not None:
-        for name, p in dm.named_parameters():
-            d = p.data
-            layout.append((f"drafter:p:{name}", d.nbytes, d.dtype, tuple(d.shape)))
-    return layout
+def _semip_weight_pool_ranges():
+    """Sorted ``(start, end)`` of every CuMemAllocator allocation tagged "weights".
+
+    Asleep allocations count: attach runs before wake_up_weights on a restore,
+    and only addresses are compared, never contents.  ``None`` without vLLM's
+    allocator, which semi-p always enables through sleep mode.
+    """
+    try:
+        from vllm.device_allocator.cumem import CuMemAllocator
+    except Exception:  # noqa: BLE001
+        return None
+    allocator = CuMemAllocator.instance
+    if allocator is None:
+        return None
+    return sorted((int(ptr), int(ptr) + int(data.handle[1]))
+                  for ptr, data in allocator.pointer_to_data.items()
+                  if data.tag == "weights")
+
+
+def _semip_unregistered_storages(module, prefix, excluded, ranges, max_depth=8):
+    """``(name, uint8 view)`` of each weight-pool storage ``module`` reaches
+    through attributes that is not in ``excluded``, named by its shortest path.
+
+    The walk enters containers, dataclasses and plain objects (triton_kernels
+    wraps its tensors in both), but not modules: ``named_modules`` visits those
+    in the tree, and anything outside it is not this model's.  Breadth first,
+    so the depth cap never hides an object a shorter path also reaches.
+    """
+    import bisect
+    import collections
+    import inspect
+    starts = [lo for lo, _ in ranges]
+
+    def in_pool(ptr):
+        i = bisect.bisect_right(starts, ptr) - 1
+        return i >= 0 and ptr < ranges[i][1]
+
+    queue = collections.deque()
+    for mod_name, mod in module.named_modules():
+        for attr, value in vars(mod).items():
+            if attr not in ("_parameters", "_buffers", "_modules"):
+                queue.append((f"{mod_name}.{attr}" if mod_name else attr, value, 1))
+    found, seen, visited = [], set(excluded), set()
+    while queue:
+        path, value, depth = queue.popleft()
+        if isinstance(value, torch.Tensor):
+            if not value.is_cuda:
+                continue
+            try:
+                storage = value.untyped_storage()
+                ptr = storage.data_ptr()
+            except (RuntimeError, NotImplementedError):  # fake / meta tensors
+                continue
+            if storage.nbytes() and ptr not in seen and in_pool(ptr):
+                seen.add(ptr)
+                found.append((f"{prefix}{path}", torch.empty(
+                    0, dtype=torch.uint8, device=value.device).set_(storage)))
+            continue
+        if (depth >= max_depth or id(value) in visited
+                or isinstance(value, (torch.nn.Module, type, str, bytes))
+                or inspect.ismodule(value) or inspect.isroutine(value)):
+            continue
+        if isinstance(value, dict):
+            items = [(str(k), v) for k, v in value.items()]
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            items = list(enumerate(value))
+        elif hasattr(value, "__dict__"):
+            items = list(vars(value).items())
+        else:
+            continue
+        visited.add(id(value))
+        queue.extend((f"{path}.{key}", item, depth + 1) for key, item in items)
+    return found
 
 
 def _semip_param_tensors(worker):
+    """Every tensor the host copy holds, by namespaced name, in layout order."""
     mr = worker.model_runner
-    t = {f"main:p:{n}": p.data for n, p in mr.model.named_parameters()}
+    models = [("main", mr.model)]
     drafter = getattr(mr, "drafter", None)
     dm = getattr(drafter, "model", None) if drafter is not None else None
     if dm is not None:
-        for n, p in dm.named_parameters():
-            t[f"drafter:p:{n}"] = p.data
+        models.append(("drafter", dm))
+    t = {}
+    for ns, model in models:
+        for n, p in model.named_parameters():
+            t[f"{ns}:p:{n}"] = p.data
+    ranges = _semip_weight_pool_ranges()
+    if not ranges:
+        return t
+    # Buffers ride vLLM's own level-2 sleep snapshot and LoRA state its own
+    # host copy (_semip_stage_lora), so neither is taken twice.
+    excluded = {x.untyped_storage().data_ptr()
+                for _, model in models
+                for x in [*model.parameters(), *model.buffers()]}
+    excluded |= {v.untyped_storage().data_ptr() for v in _semip_lora_views(worker)}
+    for ns, model in models:
+        for name, view in _semip_unregistered_storages(model, f"{ns}:s:", excluded, ranges):
+            excluded.add(view.untyped_storage().data_ptr())
+            t[name] = view
     return t
+
+
+def _semip_layout(worker):
+    return [(name, d.nbytes, d.dtype, tuple(d.shape))
+            for name, d in _semip_param_tensors(worker).items()]
 
 
 def _semip_attach(worker):
@@ -591,7 +692,8 @@ def _semip_attach(worker):
     worker._semip_chunk_plan = None
     worker._semip_chunk_size = None
     worker._semip_pinned = False
-    return (total_size, len(layout))
+    storages = [nb for name, nb, _, _ in layout if ":s:" in name]
+    return (total_size, len(layout), len(storages), sum(storages))
 
 
 def _semip_stage(worker):
@@ -932,9 +1034,31 @@ def _semip_restore_lora(worker):
     return sum(v.numel() for v in views)
 
 
+def _semip_check_host_copy_covers_model(worker, host_bytes):
+    """Refuse a host copy far smaller than what vLLM loaded onto this rank.
+
+    Whatever the copy misses is discarded by the level-2 sleep and comes back
+    as fresh memory, so the restored engine runs -- and the post-restore
+    generations pass -- on weights that are not the model's.  LoRA slots count
+    toward the load but have a host copy of their own.
+    """
+    loaded = getattr(worker.model_runner, "model_memory_usage", None)
+    if not loaded:
+        return
+    lora_bytes = sum(v.numel() for v in _semip_lora_views(worker))
+    expected = int(loaded) - lora_bytes
+    if host_bytes < _WEIGHTS_MIN_LOADED_FRACTION * expected:
+        raise RuntimeError(
+            f"host copy holds {host_bytes / 2**30:.2f} GiB but vLLM loaded "
+            f"{expected / 2**30:.2f} GiB of weights on this rank (below "
+            f"{_WEIGHTS_MIN_LOADED_FRACTION:.0%}): weights live in tensors "
+            f"semi-p does not stage, and a restore would serve without them")
+
+
 def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
     buf = worker._semip_buf
     index = worker._semip_index
+    _semip_check_host_copy_covers_model(worker, buf.numel())
     shard_bytes = int(shard_bytes or _WEIGHTS_SHARD_BYTES)
     workers = int(io_workers or _WEIGHTS_IO_WORKERS)
     # TP1 keeps the flat weights/ layout; TP>1 fans out per-rank shards into
@@ -4374,6 +4498,11 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 info["max_pinned_bytes_per_worker"] = max(worker_bytes, default=0)
                 log.info("  attached %.2f GiB across %d worker(s)",
                          total_size / 2**30, len(results))
+                if any(r[2] for r in results):
+                    log.info("  of it %.2f GiB in %d weight storage(s) outside "
+                             "named_parameters()",
+                             sum(r[3] for r in results) / 2**30,
+                             sum(r[2] for r in results))
 
             elif cmd == "attach_pinned":
                 raise RuntimeError(
