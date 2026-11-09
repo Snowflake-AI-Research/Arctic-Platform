@@ -245,6 +245,8 @@ def _chunk_key(kind: str) -> str:
 
 
 def _bytes_to_tensor(data: bytes) -> torch.Tensor:
+    if not data:
+        return torch.empty(0, dtype=torch.uint8)  # torch.frombuffer rejects an empty buffer
     # bytearray makes the buffer writable; clone detaches from the temporary.
     return torch.frombuffer(bytearray(data), dtype=torch.uint8).clone()
 
@@ -262,6 +264,7 @@ def _tensor_to_bytes(tensor: Any) -> bytes:
 def _make_byte_chunk_frame(
     frame: bytes,
     *,
+    frame_sha256: str,
     kind: str,
     operation: str | None,
     group_id: str | None,
@@ -274,7 +277,7 @@ def _make_byte_chunk_frame(
     desc: dict[str, Any] = {
         "chunk_idx": chunk_idx,
         "total_chunks": total_chunks,
-        "frame_sha256": hashlib.sha256(frame).hexdigest(),
+        "frame_sha256": frame_sha256,
         "frame_size_bytes": len(frame),
     }
     if group_id is not None:
@@ -307,6 +310,12 @@ def encode_byte_chunks(
     frame = bytes(frame)
     if not force_chunk and (max_bytes <= 0 or len(frame) <= max_bytes):
         return [frame]
+    if 0 < max_bytes <= _DEFAULT_CHUNK_OVERHEAD_BYTES:
+        raise WireError(f"max_bytes must exceed {_DEFAULT_CHUNK_OVERHEAD_BYTES} bytes")
+
+    # Hash once: every chunk carries the same whole-frame digest, and the sizing
+    # loop may rebuild the chunk list more than once.
+    frame_sha256 = hashlib.sha256(frame).hexdigest()
 
     group_id = chunk_group_id if kind == "request" else None
     if kind == "request" and not group_id:
@@ -318,6 +327,7 @@ def encode_byte_chunks(
         return [
             _make_byte_chunk_frame(
                 frame,
+                frame_sha256=frame_sha256,
                 kind=kind,
                 operation=operation,
                 group_id=group_id,
@@ -328,13 +338,16 @@ def encode_byte_chunks(
             )
         ]
 
-    payload_size = max(1, max_bytes - _DEFAULT_CHUNK_OVERHEAD_BYTES)
+    payload_size = max_bytes - _DEFAULT_CHUNK_OVERHEAD_BYTES
     while True:
-        ranges = [(start, min(start + payload_size, len(frame))) for start in range(0, len(frame), payload_size)]
+        ranges = [(start, min(start + payload_size, len(frame))) for start in range(0, len(frame), payload_size)] or [
+            (0, 0)
+        ]
         total = len(ranges)
         chunks = [
             _make_byte_chunk_frame(
                 frame,
+                frame_sha256=frame_sha256,
                 kind=kind,
                 operation=operation,
                 group_id=group_id,

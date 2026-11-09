@@ -179,7 +179,9 @@ def launch_driver(
     python_path = [skyrl_root, os.environ.get("PYTHONPATH", "")]
     env_vars["PYTHONPATH"] = os.pathsep.join(part for part in python_path if part != "")
     runtime_env = dict(env_vars=env_vars)
-    remote = ray.remote(num_cpus=num_cpus)(remote_fn)
+    # A retry would restart training from step 0 on the same Cortex jobs, and Ray retries
+    # a task its memory monitor kills without limit unless max_retries is 0. Fail instead.
+    remote = ray.remote(num_cpus=num_cpus, max_retries=0)(remote_fn)
 
     with _releasing_created_jobs():
         logger.info("Provisioning Cortex training and sampling jobs")

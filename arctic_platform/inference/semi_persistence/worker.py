@@ -8,7 +8,7 @@ child process tree to disk and restoring it with new PIDs.
 Command protocol:  (cmd, kwargs)
 Result protocol:   (cmd, elapsed, error, info)
 """
-import glob, json, os, shutil, signal, stat, subprocess, sys, tempfile, time, ctypes, threading, queue, struct
+import contextlib, fcntl, glob, json, os, shutil, signal, stat, subprocess, sys, tempfile, time, ctypes, threading, queue, struct
 
 import pynvml
 import torch.multiprocessing as mp
@@ -426,6 +426,22 @@ def _reinit_timeout_s():
     return _env_seconds(_REINIT_TIMEOUT_ENV, _REINIT_TIMEOUT_DEFAULT_S)
 
 
+# What a single-node child takes from the restoring job at reinit_nccl: the
+# NCCL and aws-ofi-nccl settings a communicator to another pod (a trainer's
+# weight sync) is built with. NCCL_DEBUG_FILE names a FILE* that did not
+# survive the dump, NVLS stays off for the restore's own reasons, and a
+# /proc/self/fd path means this process's fd, not the child's.
+_JOB_NCCL_ENV_PREFIXES = ("NCCL_", "OFI_NCCL_", "FI_")
+_JOB_NCCL_ENV_SKIP = frozenset({"NCCL_DEBUG_FILE", "NCCL_NVLS_ENABLE"})
+
+
+def _job_nccl_env():
+    """This job's NCCL, aws-ofi-nccl and libfabric settings."""
+    return {k: v for k, v in os.environ.items()
+            if k.startswith(_JOB_NCCL_ENV_PREFIXES) and k not in _JOB_NCCL_ENV_SKIP
+            and not v.startswith("/proc/self/fd/")}
+
+
 def _settle_timeout_s():
     """How long to wait for a CRIU-restored tree to quiesce, in seconds.
 
@@ -659,6 +675,60 @@ def _helper_argv_expr(criu_argv):
     return f"[a.replace('@LOGFD@', str(LFD)) for a in {criu_argv!r}]"
 
 
+# Every pod on a node runs criu as the same uid, which may hold at most
+# fs.pipe-user-pages-soft (64 MiB) of pipes across the node without
+# CAP_SYS_RESOURCE.  A dump holds 8 MiB of page pipes, and once the budget is
+# spent criu cannot size the copy of a pipe it saves ("Unable to set a pipe
+# size"), so eight dumps at once can fail one.  A slot is an flock on one of
+# SEMIP_CONCURRENT_DUMPS files in the pod's /data-fast, which the kernel
+# releases if the holder dies.  Pods sharing a node do not share slots.
+_DUMP_SLOTS_DIR = "/data-fast/.semip-dump-slots"
+
+
+@contextlib.contextmanager
+def _dump_slot():
+    """Hold one of the pod's ``SEMIP_CONCURRENT_DUMPS`` (default 2; 0 = no
+    limit) dump slots, waiting for one to free up."""
+    n = int(os.environ.get("SEMIP_CONCURRENT_DUMPS", "2"))
+    if n <= 0:
+        yield
+        return
+    fds = []
+    try:
+        os.makedirs(_DUMP_SLOTS_DIR, exist_ok=True)
+        for k in range(n):
+            fds.append(os.open(os.path.join(_DUMP_SLOTS_DIR, f"slot{k}"),
+                               os.O_RDWR | os.O_CREAT, 0o666))
+    except OSError as e:
+        for fd in fds:
+            os.close(fd)
+        print(f"[semip] WARNING: no dump slots in {_DUMP_SLOTS_DIR} ({e}); "
+              f"dumping without a limit", flush=True)
+        yield
+        return
+    t0 = time.monotonic()
+    try:
+        while True:
+            for fd in fds:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    continue
+            else:
+                time.sleep(0.2)
+                continue
+            break
+        waited = time.monotonic() - t0
+        if waited >= 1:
+            print(f"[semip] waited {waited:.1f}s for one of the pod's {n} "
+                  f"dump slots", flush=True)
+        yield
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
 def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
                       meta_extra=None):
     """Dump the vLLM child process tree to disk via CRIU (destructive).
@@ -781,7 +851,8 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
     for ext in external_unix:
         cmd.extend(["--external", ext])
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        with _dump_slot():
+            result = subprocess.run(cmd, capture_output=True, text=True)
     finally:
         shutil.rmtree(empty_libdir, ignore_errors=True)
     if result.returncode != 0:
@@ -1982,6 +2053,10 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
     # cuda_restore succeeds (or the worker is torn down).
     cuda_broken = False
     cuda_broken_reason = None
+    # Set by a failed `sleep`, cleared by a later one that succeeds.  An
+    # engine that did not sleep still holds its weights and KV cache, so a
+    # checkpoint would capture all of it; refuse instead.
+    sleep_error = None
 
     while True:
         cmd, kwargs = _get_next_command()
@@ -1999,6 +2074,13 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
             _kill_process_tree(child_pid)
             log.info("exited")
             break
+
+        if cmd in ("cuda_checkpoint", "criu_dump") and sleep_error is not None:
+            log.error("<<< %s FAILED (the engine failed to sleep: %s)",
+                      cmd, sleep_error)
+            _emit_result(cmd, 0.0,
+                         f"refused: the engine failed to sleep ({sleep_error})", {})
+            continue
 
         if cmd == "cuda_checkpoint":
             _drain_pipe_generates()
@@ -2290,6 +2372,9 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
                 # Resolve the budget here, where the environment is live, and
                 # hand it over as a kwarg.
                 kwargs = dict(kwargs, timeout_s=_reinit_timeout_s())
+            if cmd == "reinit_nccl" and "job_nccl_env" not in kwargs:
+                # Likewise for the NCCL settings the child applies there.
+                kwargs = dict(kwargs, job_nccl_env=_job_nccl_env())
             pipe.send((cmd, kwargs))
             result = _recv_sync()
         except (BrokenPipeError, ConnectionResetError, EOFError) as _pipe_err:
@@ -2313,6 +2398,8 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
         # Track child pause state so `_drain_pipe_generates` can no-op
         # for the duration of the pause/save/restore/resume cycle.
         _result_cmd, _, _result_error, _ = result
+        if _result_cmd == "sleep":
+            sleep_error = _result_error
         if _result_error is None:
             if _result_cmd == "pause":
                 _worker_paused = True

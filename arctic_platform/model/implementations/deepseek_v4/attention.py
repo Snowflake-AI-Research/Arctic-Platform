@@ -138,7 +138,19 @@ from arctic_platform.model.implementations.kernels.deepseek_v4.dsv4_kv_fake_quan
 )
 from arctic_platform.model.implementations.kernels.deepseek_v4.dsv4_rope import dsv4_q_norm_rope, dsv4_rope
 from arctic_platform.model.implementations.kernels.fp8_indexer import fp8_indexer
+from arctic_platform.model.implementations.layers.grouped_linear import BlockFp8GroupedLinear
 from arctic_platform.model.implementations.layers.grouped_linear import GroupedLinear
+
+
+def _dense_proj(config: DeepseekV4Config, in_features: int, out_features: int) -> nn.Module:
+    """BF16 linear, or block FP8 when the checkpoint is the official quantized snapshot."""
+    from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
+    from arctic_platform.model.implementations.fp8 import make_linear
+
+    block = fp8_weight_block_size(config)
+    if block is None:
+        return nn.Linear(in_features, out_features, bias=False)
+    return make_linear(in_features, out_features, fp8_block_size=block)
 from arctic_platform.model.implementations.layers.norms import RMSNorm, RMSNormConfig
 from arctic_platform.model.implementations.deepseek_v4.cp import CPContext, gather_for_cp
 from arctic_platform.model.implementations.deepseek_v4.sequence import get_cu_seqlens_from_seq_lens
@@ -518,7 +530,7 @@ class DeepseekV4Indexer(nn.Module):
             n_series=2,
             rotary_emb=rotary_emb,
         )
-        self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+        self.q_b_proj = _dense_proj(config, config.q_lora_rank, self.num_heads * self.head_dim)
         self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
 
     @torch.no_grad()  # Returns non-differentiable integer indices.
@@ -684,18 +696,22 @@ class DeepseekV4Attention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.scaling = self.head_dim**-0.5
 
-        self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
+        self.q_a_proj = _dense_proj(config, config.hidden_size, config.q_lora_rank)
         self.q_a_norm = RMSNorm(RMSNormConfig(hidden_size=config.q_lora_rank, eps=config.rms_norm_eps))
-        self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+        self.q_b_proj = _dense_proj(config, config.q_lora_rank, self.num_heads * self.head_dim)
         self.q_b_norm = DeepseekV4UnweightedRMSNorm(eps=config.rms_norm_eps, out_dtype=torch.float32)
-        self.kv_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.kv_proj = _dense_proj(config, config.hidden_size, self.head_dim)
         self.kv_norm = RMSNorm(RMSNormConfig(hidden_size=self.head_dim, eps=config.rms_norm_eps))
-        self.o_a_proj = GroupedLinear(
-            self.num_heads * self.head_dim // config.o_groups,
-            config.o_groups * config.o_lora_rank,
-            config.o_groups,
-        )
-        self.o_b_proj = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
+        o_a_in = self.num_heads * self.head_dim // config.o_groups
+        o_a_out = config.o_groups * config.o_lora_rank
+        from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
+
+        block = fp8_weight_block_size(config)
+        if block is None:
+            self.o_a_proj = GroupedLinear(o_a_in, o_a_out, config.o_groups)
+        else:
+            self.o_a_proj = BlockFp8GroupedLinear(o_a_in, o_a_out, config.o_groups, block_size=block)
+        self.o_b_proj = _dense_proj(config, config.o_groups * config.o_lora_rank, config.hidden_size)
         self.sinks = nn.Parameter(torch.zeros(self.num_heads))
         self.rotary_emb = rotary_emb
         # Raised here rather than from the first forward, where it would surface as an ImportError

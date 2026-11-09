@@ -41,7 +41,7 @@ from arctic_platform.inference.semi_persistence.onboarding.report import verdict
 logger = logging.getLogger(__name__)
 
 RESTORE_STEPS = ["criu_restore", "cuda_restore", "reinit_nccl", "load_weights", "wake_up_weights", "repin",
-                 "restore_weights", "wake_up_kv_cache", "rebind_graphs", "recapture_graphs"]
+                 "restore_weights", "wake_up_kv_cache", "rebind_graphs", "recapture_graphs", "serve_core"]
 VLLM_PHASES = [("load_weights_s", "load weights"), ("model_loading_s", "model loading"),
                ("torch_compile_s", "torch.compile"), ("profiling_s", "profiling"),
                ("graph_capture_s", "graph capture"), ("engine_init_s", "engine init")]
@@ -108,18 +108,21 @@ def plain_cold_start(vl: dict) -> tuple[float | None, bool]:
 
 def startup_table(runs: list[dict]) -> list[str]:
     out = ["## Start-up", "",
-           "semi_p times are the slowest replica's, from key resolution to a serving engine. The plain cold "
+           "semi_p times are the slowest replica's, from key resolution to a serving engine. Attach is the "
+           "AsyncLLM front end's (`-` in runs from before it). The plain cold "
            "start is vLLM's model loading plus its engine init (profiling, KV cache, compile, graph capture); "
            "`>=` marks rows whose log lacked the loading line. Speedup = plain cold start / semi_p key to ready.", "",
-           "| model config | image copy (s) | restore (s) | semi_p key to ready (s) | plain cold start (s) | speedup "
-           "| submit to running, semi_p / plain (s) | restored from |",
-           "|---|---|---|---|---|---|---|---|"]
+           "| model config | image copy (s) | restore (s) | attach (s) | semi_p key to ready (s) | plain cold start (s) "
+           "| speedup | submit to running, semi_p / plain (s) | restored from |",
+           "|---|---|---|---|---|---|---|---|---|"]
     for r in runs:
         st = r.get("startup") or {}
         sp, vl = st.get("semi_p") or {}, st.get("vllm_off") or {}
         reps = [i for i in (sp.get("replicas") or {}).values() if not i.get("partition_agent")]
         copy = max((i.get("materialize_s") or 0.0 for i in reps), default=None)
         restore = max((i.get("restore_s") or 0.0 for i in reps), default=None)
+        attaches = [i["attach_s"] for i in reps if i.get("attach_s") is not None]
+        attach = max(attaches) if attaches else None
         k2r = sp.get("key_to_ready_s")
         cold, complete = plain_cold_start(vl)
         mark = "" if complete or cold is None else ">= "
@@ -127,7 +130,7 @@ def startup_table(runs: list[dict]) -> list[str]:
         on_t, off_t = st.get("on_timeline") or {}, st.get("off_timeline") or {}
         source = ("published image" if sp.get("restored") else "cold start (cache miss)" if sp.get("cache_miss")
                   else "not confirmed")
-        out.append(f"| {r['model']['name']} | {_f(copy)} | {_f(restore)} | {_f(k2r)} | {mark}{_f(cold)} | "
+        out.append(f"| {r['model']['name']} | {_f(copy)} | {_f(restore)} | {_f(attach)} | {_f(k2r)} | {mark}{_f(cold)} | "
                    f"{mark}{_f(speedup, 1, 'x')} | {_f(on_t.get('submit_to_running_s'), 0)} / "
                    f"{_f(off_t.get('submit_to_running_s'), 0)} | {source} ({len(reps)} replica(s)) |")
     return out + [""]

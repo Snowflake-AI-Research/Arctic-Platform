@@ -209,8 +209,10 @@ def test_qwen_ngram_module_declares_all_persistent_export_buffers():
     )
 
 
-@pytest.mark.parametrize("weight_format", ("hf", "vllm"))
-def test_export_iterators_include_persistent_buffers_without_casting(monkeypatch, weight_format):
+@pytest.mark.parametrize(("weight_format", "checkpoint_export"), (("hf", True), ("hf", False), ("vllm", False)))
+def test_checkpoint_export_keeps_persistent_buffers_and_weight_sync_omits_them(
+    monkeypatch, weight_format, checkpoint_export
+):
     from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
     from arctic_platform.model.implementations.moe.vllm_weights import build_iter_full_vllm_weights
 
@@ -230,9 +232,10 @@ def test_export_iterators_include_persistent_buffers_without_casting(monkeypatch
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
     build_iterator = build_iter_full_hf_weights if weight_format == "hf" else build_iter_full_vllm_weights
 
-    exported = list(build_iterator(model)())
+    iterator = build_iterator(model)
+    exported = list(iterator(include_skipped=True) if checkpoint_export else iterator())
     expected = list(model.named_parameters()) + [
-        (name, tensor) for name, tensor in model.named_buffers() if ".transient." not in name
+        (name, tensor) for name, tensor in model.named_buffers() if checkpoint_export and ".transient." not in name
     ]
 
     assert [name for name, _ in exported] == [name.replace("._checkpoint_wrapped_module", "") for name, _ in expected]
