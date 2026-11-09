@@ -362,9 +362,14 @@ def moe(mlp: Any, x: torch.Tensor, config: Any) -> torch.Tensor:
     """vLLM's ``Glm5NextMoE`` at TP 1 on the trainer's ``MoE``: fp32 router logits by the batch-invariant matmul, the
     batch-invariant grouped top-k (renormalized and scaled by ``routed_scaling_factor`` there, as vLLM's router does
     when the runner does not scale the output), the Triton routed experts, then ``shared + routed`` in bf16."""
+    from vllm.v1.worker.workspace import init_workspace_manager
+    from vllm.v1.worker.workspace import is_workspace_manager_initialized
+
     from arctic_platform.inference.vllm.batch_invariant_fp32_logits import linear_fp32_out
     from arctic_platform.inference.vllm.glm5_batch_invariance import grouped_topk
 
+    if not is_workspace_manager_initialized():  # the fused-MoE kernels take their scratch from vLLM's workspace
+        init_workspace_manager(x.device)
     logits = linear_fp32_out(x, mlp.router.gate.weight)
     weights, ids = grouped_topk(
         x,
