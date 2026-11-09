@@ -216,6 +216,39 @@ def _deterministic_indexer_topk() -> None:
     sparse_indexer.get_indexer_topk = decode_topk
 
 
+def _causal_indices_per_token() -> None:
+    """Give every token whose sequence fits in ``index_topk`` its causal indices, whatever its batch-mates' lengths.
+
+    The indexer fills causal indices instead of scoring only when the longest sequence in the step fits in
+    ``index_topk``. A short prompt batched with a long one was scored instead: the same pools, in score order, which
+    changes the attention's accumulation order.
+    """
+    import inspect
+
+    from vllm.models.glm5next.common.sparse_indexer import _fill_causal_indices
+    from vllm.models.glm5next.nvidia import sparse_indexer
+
+    original = sparse_indexer.sparse_attn_indexer_kpool
+    signature = inspect.signature(original)
+
+    def sparse_attn_indexer_kpool(*args, **kwargs):
+        out = original(*args, **kwargs)
+        bound = signature.bind(*args, **kwargs).arguments
+        positions = bound.get("positions")
+        if positions is None or positions.numel() == 0:
+            return out
+        buffer = bound["topk_indices_buffer"]
+        positions = positions[: buffer.shape[0]]
+        rows = torch.nonzero(positions < bound["topk_tokens"]).flatten()
+        if rows.numel():
+            causal = buffer[rows]
+            _fill_causal_indices(causal, positions[rows])
+            buffer[rows] = causal
+        return out
+
+    sparse_indexer.sparse_attn_indexer_kpool = sparse_attn_indexer_kpool
+
+
 def _batch_invariant_indexer_head_weights() -> None:
     """Compute the sparse indexer's fp32 per-head weights with the batch-invariant matmul.
 
@@ -400,6 +433,7 @@ def ensure_glm5_batch_invariance() -> None:
     _batch_invariant_fp8_block_linear()
     _split_mixed_kda_steps()
     _deterministic_indexer_topk()
+    _causal_indices_per_token()
     _batch_invariant_indexer_head_weights()
     from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
 
