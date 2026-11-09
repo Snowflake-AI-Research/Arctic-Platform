@@ -99,19 +99,23 @@ class TestInklingTraining(TestCasePlus):
         torch.nn.init.normal_(router.weight, std=0.02)
         hidden = torch.randn(2, 520, config.hidden_size, device="cuda", dtype=torch.bfloat16)
         expected = [value.view(2, 520, -1) for value in router(hidden)]
-        for size in (2, 4):
-            actual = [
-                torch.cat(parts, dim=1)
-                for parts in zip(
-                    *[
-                        [value.view(2, 520 // size, -1) for value in router(shard)]
-                        for shard in hidden.chunk(size, dim=1)
-                    ],
-                    strict=True,
-                )
-            ]
-            for value, baseline in zip(actual, expected, strict=True):
-                torch_assert_equal(value, baseline)
+        for chunk_size in (128, 256, 2048):
+            config.inkling_mlp_token_chunk_size = chunk_size
+            candidate = InklingTopkRouter(config).cuda().float()
+            candidate.load_state_dict(router.state_dict())
+            for size in (1, 2, 4):
+                actual = [
+                    torch.cat(parts, dim=1)
+                    for parts in zip(
+                        *[
+                            [value.view(2, 520 // size, -1) for value in candidate(shard)]
+                            for shard in hidden.chunk(size, dim=1)
+                        ],
+                        strict=True,
+                    )
+                ]
+                for value, baseline in zip(actual, expected, strict=True):
+                    torch_assert_equal(value, baseline)
 
     @require_torch_gpu
     def test_flex_chunked_full_and_lora_steps_with_activation_offload(self):

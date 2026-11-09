@@ -35,7 +35,7 @@ from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 class InklingTopkRouter(NativeInklingTopkRouter):
     def __init__(self, config):
         super().__init__(config)
-        self.token_chunk_size = getattr(config, "inkling_mlp_token_chunk_size", None) or 2048
+        self.token_chunk_size = 2048
         # DeepSpeed's parameter cast guard preserves the constant selection bias too.
         bias = self.e_score_correction_bias
         del self.e_score_correction_bias
