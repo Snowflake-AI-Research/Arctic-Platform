@@ -75,6 +75,10 @@ from .media import media_token_spans
 from .media import select_media_rows
 from .media import split_media
 from .media import window_media
+from .media_spec import QWEN_VL_MEDIA_SPEC
+from .media_spec import MediaSpec
+from .media_spec import media_spec_for
+from .media_spec import register_media_spec
 from .mrope import IMAGE_TOKEN_TYPE
 from .mrope import MROPE_CHANNELS
 from .mrope import TEXT_TOKEN_TYPE
@@ -106,9 +110,11 @@ __all__ = [
     "MEDIA_KEYS",
     "MEDIA_KINDS",
     "MediaKind",
+    "MediaSpec",
     "MROPE_CHANNELS",
     "MicrobatchSplit",
     "PackMetadata",
+    "QWEN_VL_MEDIA_SPEC",
     "ROW_BROADCAST_KEYS",
     "batch_input_ids",
     "batch_num_rows",
@@ -117,11 +123,13 @@ __all__ = [
     "batch_tensor",
     "check_media",
     "map_batch_values",
+    "media_spec_for",
     "media_token_spans",
     "mrope_position_ids",
     "pack_microbatch",
     "packed_token_index",
     "pad_packed_microbatch",
+    "register_media_spec",
     "select_media_rows",
     "select_rows",
     "shard_valid_lengths",
