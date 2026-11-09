@@ -110,3 +110,15 @@ def test_dequant_fp8_block_matches_vllm_formula_with_partial_blocks():
     got = dequant_fp8_block(weight, scale)
     full = scale.repeat_interleave(128, 0).repeat_interleave(128, 1)[:200, :130]
     assert got.dtype == torch.bfloat16 and torch.equal(got, (weight.float() * full).to(torch.bfloat16))
+
+
+def test_prompt_lengths_run_through_the_first_trained_position():
+    import torch
+
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import prompt_lengths
+
+    cu = torch.tensor([0, 5, 8, 12], dtype=torch.int32)
+    trained = torch.zeros(12, dtype=torch.bool)
+    trained[[2, 3]] = True  # request 0: prompt of 3 tokens, then decoded
+    trained[5] = True  # request 1: trained from its first token
+    assert prompt_lengths(trained, cu).tolist() == [3, 1, 4]

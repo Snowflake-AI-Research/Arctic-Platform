@@ -112,13 +112,50 @@ class _AlignedLayer(torch.autograd.Function):
 KDA_O_NORM_EPS = 1e-5  # vLLM builds the gated output norm with FusedRMSNormGated's default eps, not rms_norm_eps
 
 
+def _kda_decode(core, qkv, g1, beta, conv_states, recurrent, conv_weight, gate, starts, prompt_lens, lengths, slots,
+                heads: int, head_dim: int, config: Any) -> None:  # fmt: skip
+    """Write the decoded tokens' KDA core output into ``core``, one decode step at a time over every request still
+    decoding, as vLLM's plain decode step runs them: ``causal_conv1d_update`` on the request's conv state slot, then
+    ``fused_recurrent_kda`` (gate and beta sigmoid in the kernel) updating its fp32 recurrent state slot in place."""
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
+    from vllm.models.glm5next.nvidia.ops.third_party.kda import fused_recurrent_kda
+
+    projection = heads * head_dim
+    a_log = gate.A_log.float().reshape(1, 1, heads, 1)
+    g_bias = gate.dt_bias.float().reshape(-1)
+    steps = lengths - prompt_lens
+    for step in range(int(steps.max())):
+        active = torch.nonzero(steps > step).flatten()
+        rows = starts[active] + prompt_lens[active] + step
+        batch = rows.numel()
+        conv = causal_conv1d_update(qkv[rows], conv_states, conv_weight, None, activation="silu",
+                                    conv_state_indices=slots[active])  # fmt: skip
+        q, k, v = (t.reshape(1, batch, heads, head_dim) for t in conv.split(projection, dim=-1))
+        out, _ = fused_recurrent_kda(
+            q=q, k=k, v=v, g=g1[:, rows], beta=beta[rows].unsqueeze(0), initial_state=recurrent,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=torch.arange(batch + 1, dtype=torch.int32, device=qkv.device),
+            ssm_state_indices=slots[active], sigmoid_beta=True, a_log=a_log, g_bias=g_bias, compute_gate=True,
+            lower_bound=config.linear_lower_bound,
+        )  # fmt: skip
+        core[:, rows] = out.to(core.dtype)
+
+
 def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, trace: dict | None = None) -> torch.Tensor:
-    """vLLM's ``Glm5NextLinearAttention`` on whole prompts (no initial state), FlashKDA prefill backend.
+    """:func:`kda_forward` with every token prefilled."""
+    return kda_forward(attn, x, cu_seqlens, config, trace=trace)
+
+
+def kda_forward(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any,
+                prompt_lens: torch.Tensor | None = None, trace: dict | None = None) -> torch.Tensor:  # fmt: skip
+    """vLLM's ``Glm5NextLinearAttention`` on packed requests: each prompt prefilled whole, then the rest decoded.
 
     ``x`` is ``[tokens, hidden]`` (the layer input after the hyper-connection pre-norm), ``cu_seqlens`` the int32
-    prompt boundaries. The merged ``[q; k; v; b; f_a; g_a]`` projection, the merged q|k|v causal conv with vLLM's fp32
-    conv weights, FlashKDA on the raw gate and beta logits, the sigmoid-gated RMSNorm and ``o_proj``. ``trace``
-    (debug) collects the intermediate tensors.
+    request boundaries and ``prompt_lens`` how many leading tokens of each request were prefilled (all by default).
+    The merged ``[q; k; v; b; f_a; g_a]`` projection; over each prompt the merged q|k|v causal conv with vLLM's fp32
+    conv weights and FlashKDA on the raw gate and beta logits; over each later token, one decode step at a time, the
+    conv update and the recurrent kernel from the conv state and the fp32 recurrent state the request has reached;
+    then the sigmoid-gated RMSNorm and ``o_proj``. ``trace`` (debug) collects the prefill's intermediate tensors.
     """
     trace = {} if trace is None else trace
     import vllm._flashkda_C  # noqa: F401
@@ -128,6 +165,16 @@ def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
     heads, head_dim = attn.num_heads, attn.head_dim
     projection = heads * head_dim
     tokens, num_seqs = x.shape[0], cu_seqlens.numel() - 1
+    starts, lengths = cu_seqlens[:-1].long(), (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+    prompt_lens = lengths if prompt_lens is None else prompt_lens.long()
+    decoded = bool((prompt_lens < lengths).any())
+    if decoded:
+        seq_of_token = torch.repeat_interleave(torch.arange(num_seqs, device=x.device), lengths)
+        in_prompt = torch.arange(tokens, device=x.device) - starts[seq_of_token] < prompt_lens[seq_of_token]
+        prompt_rows = torch.nonzero(in_prompt).flatten()
+        prompt_cu = torch.cat([cu_seqlens.new_zeros(1), torch.cumsum(prompt_lens, 0).to(cu_seqlens.dtype)])
+    else:
+        prompt_rows, prompt_cu = None, cu_seqlens
     gate = attn.forget_gate
     weight = torch.cat([attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight, attn.b_proj.weight,
                         gate.f_a_proj.weight, attn.g_a_proj.weight])  # fmt: skip
@@ -138,31 +185,45 @@ def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
 
     conv_weight = attn.conv1d.weight.float().reshape(3 * projection, -1)
     # State slot 0 is vLLM's null block, which the conv kernel treats as padding, so the slots start at 1.
+    slots = torch.arange(1, num_seqs + 1, dtype=torch.int32, device=x.device)
     conv_states = x.new_zeros((num_seqs + 1, 3 * projection, conv_weight.shape[-1] - 1))
+    qkv_p = qkv if prompt_rows is None else qkv[prompt_rows]
+    g1_p = g1 if prompt_rows is None else g1[:, prompt_rows]
+    beta_p = beta if prompt_rows is None else beta[prompt_rows]
+    prompt_tokens = qkv_p.shape[0]
     conv = causal_conv1d_fn(
-        qkv.transpose(0, 1),
+        qkv_p.transpose(0, 1),
         conv_weight,
         None,
         activation="silu",
         conv_states=conv_states,
         has_initial_state=torch.zeros(num_seqs, dtype=torch.bool, device=x.device),
-        cache_indices=torch.arange(1, num_seqs + 1, dtype=torch.int32, device=x.device),
-        query_start_loc=cu_seqlens,
+        cache_indices=slots,
+        query_start_loc=prompt_cu,
     ).transpose(0, 1)
-    q, k, v = (t.reshape(1, tokens, heads, head_dim).contiguous() for t in conv.split(projection, dim=-1))
-    trace.update(conv_in=qkv.transpose(0, 1), conv_weight=conv_weight, conv_out=conv, q=q, k=k, v=v, g=g1,
-                 beta=beta.unsqueeze(0))  # fmt: skip
+    q, k, v = (t.reshape(1, prompt_tokens, heads, head_dim).contiguous() for t in conv.split(projection, dim=-1))
+    trace.update(conv_in=qkv_p.transpose(0, 1), conv_weight=conv_weight, conv_out=conv, q=q, k=k, v=v, g=g1_p,
+                 beta=beta_p.unsqueeze(0))  # fmt: skip
 
     state = torch.zeros((num_seqs, heads, head_dim, head_dim), dtype=torch.float32, device=x.device)
     final_state = torch.empty_like(state)
-    workspace = torch.empty(torch.ops._flashkda_C.get_workspace_size(tokens, heads, num_seqs), dtype=torch.uint8,
-                            device=x.device)  # fmt: skip
-    core = torch.empty((1, tokens, heads, head_dim), dtype=x.dtype, device=x.device)
+    workspace = torch.empty(torch.ops._flashkda_C.get_workspace_size(prompt_tokens, heads, num_seqs),
+                            dtype=torch.uint8, device=x.device)  # fmt: skip
+    core_p = torch.empty((1, prompt_tokens, heads, head_dim), dtype=x.dtype, device=x.device)
     torch.ops._flashkda_C.fwd(
-        q, k, v, g1.contiguous(), beta.unsqueeze(0), head_dim**-0.5, core, workspace,
+        q, k, v, g1_p.contiguous(), beta_p.unsqueeze(0), head_dim**-0.5, core_p, workspace,
         gate.A_log.float().view(-1), gate.dt_bias.float().view(-1, head_dim), config.linear_lower_bound,
-        state, final_state, cu_seqlens.contiguous(), None, None,
+        state, final_state, prompt_cu.contiguous(), None, None,
     )  # fmt: skip
+    if prompt_rows is None:
+        core = core_p
+    else:
+        core = torch.empty((1, tokens, heads, head_dim), dtype=x.dtype, device=x.device)
+        core[:, prompt_rows] = core_p
+        recurrent = torch.zeros((num_seqs + 1, heads, head_dim, head_dim), dtype=torch.float32, device=x.device)
+        recurrent[1:] = final_state
+        _kda_decode(core, qkv, g1, beta, conv_states, recurrent, conv_weight, gate, starts, prompt_lens, lengths,
+                    slots, heads, head_dim, config)  # fmt: skip
     trace.update(core=core, g2=g2)
     core = rms_norm_gated(core, g2, attn.o_norm.weight, None, "sigmoid", eps=KDA_O_NORM_EPS)
     trace.update(normed=core)
@@ -191,7 +252,7 @@ INDEXER_PADDED_HEADS = 32
 
 
 def indexer_topk(indexer: Any, x: torch.Tensor, q_c: torch.Tensor, positions: torch.Tensor, cu_seqlens: torch.Tensor,
-                 config: Any, width: int) -> torch.Tensor:  # fmt: skip
+                 config: Any, width: int, prompt_lens: torch.Tensor | None = None) -> torch.Tensor:  # fmt: skip
     """vLLM's kpool sparse-indexer top-k for whole prompts: ``[tokens, width]`` request-relative token ids, ``-1`` padded.
 
     A token whose position is below ``index_topk`` gets its causal row (every earlier token). The others score the
@@ -213,6 +274,8 @@ def indexer_topk(indexer: Any, x: torch.Tensor, q_c: torch.Tensor, positions: to
     long_rows = torch.nonzero(positions >= topk_tokens).flatten()
     if long_rows.numel() == 0:
         return out
+    if prompt_lens is not None and bool((positions[long_rows] >= prompt_lens[_sequence_of_tokens(cu_seqlens)[long_rows]]).any()):
+        raise NotImplementedError("vLLM-aligned sparse indexer: decoded tokens at or past index_topk (not in yet)")
     if getattr(config, "index_rope_head_dim", 0) or getattr(config, "qk_rope_head_dim", 0):
         raise NotImplementedError("vLLM-aligned sparse indexer covers mla_use_nope (no rotary embedding)")
     tokens = x.shape[0]
@@ -286,7 +349,7 @@ def bf16_weight(linear: Any) -> torch.Tensor:
 
 
 def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlens: torch.Tensor,
-                  config: Any) -> torch.Tensor:  # fmt: skip
+                  config: Any, prompt_lens: torch.Tensor | None = None) -> torch.Tensor:  # fmt: skip
     """vLLM's ``Glm5NextMLAAttention`` (sparse MLA with ``mla_use_nope``) on prompts no longer than ``index_topk``.
 
     Such prompts take vLLM's short-prefill path: every token attends to all earlier tokens of its request, with no
@@ -323,7 +386,7 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     torch.bmm(q_nope.transpose(0, 1), w_uk_t, out=q_latent.transpose(0, 1))
 
     seq_of_token = torch.repeat_interleave(torch.arange(starts.numel(), device=x.device), lengths)
-    topk = indexer_topk(attn.indexer, x, q_c, positions, cu_seqlens, config, topk_buffer_width(config))
+    topk = indexer_topk(attn.indexer, x, q_c, positions, cu_seqlens, config, topk_buffer_width(config), prompt_lens)
     rows = torch.where(topk >= 0, topk + starts.to(torch.int32)[seq_of_token, None], topk)
     valid = (topk >= 0).sum(-1).to(torch.int32)
     kv_rows = torch.cat([kv_c, k_pe], dim=-1)
@@ -352,9 +415,10 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
 
 
 def _mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
+    prompt_lens = getattr(ctx, "prompt_lens", None)
     if layer.block_type == "linear_attention":
-        return kda_prefill(layer.self_attn, x, ctx.cu_seqlens, ctx.config)
-    return mla_attention(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config)
+        return kda_forward(layer.self_attn, x, ctx.cu_seqlens, ctx.config, prompt_lens)
+    return mla_attention(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config, prompt_lens)
 
 
 def fp8_block_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale_inv: torch.Tensor) -> torch.Tensor:
@@ -577,9 +641,27 @@ def _stock_layer_runner(backbone: Any, input_ids: torch.Tensor, position_ids: to
     return run
 
 
+def _sequence_of_tokens(cu_seqlens: torch.Tensor) -> torch.Tensor:
+    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+    return torch.repeat_interleave(torch.arange(lengths.numel(), device=cu_seqlens.device), lengths)
+
+
+def prompt_lengths(trained: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """How many leading tokens of each packed request the sampler prefilled: through its first trained position, whose
+    logits come from the prefill (every token when nothing is trained); the tokens after it were decoded."""
+    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+    seq = _sequence_of_tokens(cu_seqlens)
+    offset = torch.arange(seq.numel(), device=seq.device) - cu_seqlens[:-1].long()[seq]
+    first = torch.where(trained.reshape(-1).bool(), offset, lengths[seq])
+    first = torch.full_like(lengths, torch.iinfo(torch.long).max).scatter_reduce(0, seq, first, "amin")
+    return torch.minimum(first + 1, lengths)
+
+
 def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Tensor, labels: torch.Tensor,
-                     cu_seqlens: torch.Tensor | None, temperature: float, kwargs: dict) -> torch.Tensor:  # fmt: skip
-    """The sampler's logprob of each ``labels`` token (``[tokens]``, fp32); prompts prefilled whole."""
+                     trained: torch.Tensor, cu_seqlens: torch.Tensor | None, temperature: float,
+                     kwargs: dict) -> torch.Tensor:  # fmt: skip
+    """The sampler's logprob of each ``labels`` token (``[tokens]``, fp32): each request's prompt prefilled whole
+    through its first ``trained`` position, the tokens after it decoded."""
     import types
 
     backbone = model.model.language_model
@@ -587,7 +669,9 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
     if position_ids.dim() == 3:
         position_ids = position_ids[0]
     layout = ops.PackedLayout.build(position_ids, block_size=1, cu_seqlens=cu_seqlens)
-    ctx = types.SimpleNamespace(config=config, positions=layout.positions, cu_seqlens=layout.cu_seqlens.to(torch.int32),
+    cu = layout.cu_seqlens.to(torch.int32)
+    ctx = types.SimpleNamespace(config=config, positions=layout.positions, cu_seqlens=cu,
+                                prompt_lens=prompt_lengths(trained, cu),
                                 ep_group=getattr(model, "_vllm_aligned_ep_group", None))  # fmt: skip
     run_stock = _stock_layer_runner(backbone, input_ids, position_ids, kwargs)
     hidden = aligned_hidden(backbone, input_ids, config, ctx, run_stock)
@@ -604,7 +688,12 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
 def _causal_lm_forward(self, input_ids=None, attention_mask=None, position_ids=None, labels=None, temperature=None,
                        dss_compute_logprobs: bool = False, **kwargs):  # fmt: skip
     from arctic_platform.model.implementations.vllm_aligned.qwen3 import _scalar_temperature
+    from arctic_platform.model.implementations.vllm_aligned.qwen3_5 import LOSS_MASK_KWARG
+    from arctic_platform.model.implementations.vllm_aligned.turn_plan import PLAN_KWARG
 
+    loss_mask = kwargs.pop(LOSS_MASK_KWARG, None)
+    if kwargs.pop(PLAN_KWARG, None) is not None:
+        raise NotImplementedError("the vLLM-aligned GLM-5.3-Flash forward covers single-turn rows (no turn plan)")
     if not dss_compute_logprobs:
         return self._vllm_aligned_stock_forward(
             input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, labels=labels, **kwargs
@@ -613,11 +702,14 @@ def _causal_lm_forward(self, input_ids=None, attention_mask=None, position_ids=N
         raise ValueError("dss_compute_logprobs requires input_ids and labels")
     if position_ids is None:
         position_ids = torch.arange(input_ids.shape[-1], device=input_ids.device).expand_as(input_ids)
+    labels = labels.to(input_ids.device)
+    trained = loss_mask if loss_mask is not None else labels != -100
     logprobs = aligned_logprobs(
         self,
         input_ids,
         position_ids,
-        labels.to(input_ids.device),
+        labels,
+        trained.to(input_ids.device),
         kwargs.get("cu_seq_lens_q"),
         _scalar_temperature(temperature),
         kwargs,
@@ -649,6 +741,7 @@ def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_f
     model._vllm_aligned_stock_forward = model.forward
     model.forward = types.MethodType(_causal_lm_forward, model)
     model._vllm_aligned = True
+    model._vllm_aligned_reads_loss_mask = True
 
 
 __all__ = ["aligned_hidden", "aligned_layer", "apply_vllm_aligned_glm5_next", "hc_post", "hc_pre"]
