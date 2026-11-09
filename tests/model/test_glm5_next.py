@@ -327,9 +327,13 @@ def test_glm53_vllm_packer_fuses_fp8_moe_scale_inv():
     sw1_scale = torch.rand(1, 1)
     sw3_scale = torch.rand(1, 1)
     sw2_scale = torch.rand(1, 1)
+    q_a_scale = torch.rand(1, 1)
+    kv_a_scale = torch.rand(1, 1)
     state = {
         f"{attn}.q_a_proj.weight": torch.randn(3, 4),
         f"{attn}.kv_a_proj_with_mqa.weight": torch.randn(2, 4),
+        f"{attn}.q_a_proj.weight_scale_inv": q_a_scale.clone(),
+        f"{attn}.kv_a_proj_with_mqa.weight_scale_inv": kv_a_scale.clone(),
         f"{attn}.indexer.wk.weight": torch.randn(5, 4),
         f"{attn}.indexer.weights_proj.weight": torch.randn(2, 4),
         f"{prefix}.mlp.router.gate.weight": torch.randn(2, 4),
@@ -370,6 +374,11 @@ def test_glm53_vllm_packer_fuses_fp8_moe_scale_inv():
         state[f"{prefix}.mlp.shared_experts.down_proj.weight_scale_inv"],
         sw2_scale,
     )
+    torch.testing.assert_close(
+        state[f"{attn}.fused_qkv_a_proj.weight_scale_inv"],
+        torch.cat([q_a_scale, kv_a_scale], dim=0),
+    )
+    assert f"{attn}.q_a_proj.weight_scale_inv" not in state
 
 
 def test_glm53_native_fp8_training_builds_quantized_modules():
