@@ -44,6 +44,7 @@ from dataclasses import field
 import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.placement_group import placement_group
+from ray.util.placement_group import remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 logger = logging.getLogger(__name__)
@@ -178,7 +179,15 @@ def create_colocate_placement(
         pg_sizes = [gpus_per_node] * (n_bundles // gpus_per_node)
 
     pgs = [placement_group([dict(resources)] * sz, strategy="STRICT_PACK") for sz in pg_sizes]
-    ray.get([pg.ready() for pg in pgs])
+    try:
+        ray.get([pg.ready() for pg in pgs])
+    except BaseException:
+        for pg in pgs:
+            try:
+                remove_placement_group(pg)
+            except Exception:
+                logger.warning("Failed to remove partially created colocate placement group", exc_info=True)
+        raise
     logger.info(
         "Created colocate placement: %d PG(s) STRICT_PACK, sizes=%s, gpus_per_node=%d, n_bundles=%d",
         len(pgs),

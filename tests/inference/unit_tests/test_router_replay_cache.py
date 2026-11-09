@@ -29,6 +29,18 @@ def test_tx_cache_default_ttl_is_24_hours(monkeypatch):
     assert cache.ttl_s == 24 * 60 * 60
 
 
+@pytest.mark.parametrize("as_numpy", [True, False])
+def test_host_tx_cache_owns_its_entry_rather_than_the_callers_buffer(as_numpy):
+    source = torch.arange(16, dtype=torch.uint8).reshape(4, 2, 2)
+    expected = source.clone()
+    cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
+
+    cache.put("rr1:a", source.numpy() if as_numpy else source)
+    source.fill_(0)
+
+    assert torch.equal(cache.get("rr1:a"), expected)
+
+
 def test_tx_cache_evicts_lru_when_full(monkeypatch):
     monkeypatch.setenv("ARCTIC_ROUTER_REPLAY_TX_EVICT_MIN_AGE_S", "0")
     one = _tensor(seq_len=4)

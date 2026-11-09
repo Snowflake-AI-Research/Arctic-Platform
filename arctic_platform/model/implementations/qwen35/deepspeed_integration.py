@@ -138,6 +138,8 @@ def _build_iter_full_vllm_weights(model: nn.Module):
     import torch
     import torch.distributed as dist
 
+    from arctic_platform.model.weight_export import wait_for_export_collective
+
     is_vlm = bool(getattr(model, "_is_vlm", False))
     layer_prefix_pattern = "model.language_model.layers.{i}" if is_vlm else "model.layers.{i}"
 
@@ -184,6 +186,8 @@ def _build_iter_full_vllm_weights(model: nn.Module):
                     dist.all_gather(shards, local, group=ep_pg)
                     if is_master:
                         layer_sd[name] = torch.cat(shards, dim=0)
+                    else:
+                        wait_for_export_collective(local)
                 elif is_master:
                     layer_sd[name] = param.data
 
@@ -238,10 +242,12 @@ def _build_model_config(
         optimization_dtype=optimization_dtype,
         reduce_dtype=options.reduce_dtype,
         moe_use_grouped_mm=options.moe_use_grouped_mm,
+        moe_use_sonicmoe=options.moe_use_sonicmoe,
         ac=options.ac_config,
         fused_lm_head_token_chunk_size=options.fused_lm_head_token_chunk_size,
         fp32_lm_head=options.fp32_lm_head,
         fp32_parity=options.fp32_parity,
+        fp32_routed_weighting=getattr(options, "fp32_routed_weighting", False),
         debug=DebugModelConfig(**options.debug.model_dump()) if options.debug is not None else DebugModelConfig(),
     )
 

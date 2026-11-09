@@ -32,6 +32,7 @@ Invariants to preserve:
 - Token validity comes from `position_ids` unless an `attention_mask` is present. Requests normally ship positions only. `token_validity_mask` is the single answer to it: DP balancing measures its rows with the same function, so a row cannot be assigned to a rank as one length and then billed to that rank's token budget as another. A batch that states neither signal is refused here, because a packed call built from guessed lengths puts pad tokens through the model; balancing, whose assignment is only a heuristic, falls back to a proxy instead.
 - A window's varlen boundaries hold one segment per packed row, empty for rows the shard does not reach, because loss reductions weight per rollout and index those segments by row. Tail padding joins the last segment: its `IGNORE_INDEX` labels and zero weight contribute nothing, and the boundaries still cover the window exactly.
 - Anything aligned against a token's neighbour -- a shift, a roll -- happens before packing. After packing, a row's neighbour is the next row.
+- A `ROW_BROADCAST_KEYS` leaf (`sampler_kl_weights`) may arrive as one value per row, `[B]`; packing writes that value on each of the row's tokens. It cannot wait for the loss: a window can hold as many tokens as rows, and then its 1-D leaves no longer say which they count.
 
 ## Cost
 

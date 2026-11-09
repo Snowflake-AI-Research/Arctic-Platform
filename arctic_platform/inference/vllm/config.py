@@ -22,7 +22,6 @@ import vllm
 from pydantic import ConfigDict
 from vllm.config import ParallelConfig, SpeculativeConfig, VllmConfig
 from vllm.config.utils import config
-from vllm.transformers_utils.configs.mlp_speculator import MLPSpeculatorConfig
 
 from arctic_platform.inference.patching import ArcticPatch
 
@@ -102,12 +101,12 @@ class SpeculativeConfigPatch(ArcticPatch[SpeculativeConfig]):
             return
 
         if is_arctic_method:
-            # The Arctic speculator uses an MLPSpeculatorConfig-based model.
-            # Upstream vLLM handles mlp_speculator correctly: creates
-            # draft_model_config, detects TP=1, and sets draft_parallel_config.
-            # Temporarily set method="mlp_speculator" to leverage this.
+            # vLLM 0.33 removed mlp_speculator. Use its draft config loading
+            # with TP=1; GPUModelRunnerPatch owns the Arctic drafter.
             saved_method = self.method
-            self.method = "mlp_speculator"
+            self.method = "draft_model"
+            if self.draft_tensor_parallel_size is None:
+                self.draft_tensor_parallel_size = 1
             try:
                 self._orig_post_init()
             finally:
@@ -147,8 +146,10 @@ def ensure_dflash_max_position_patch() -> None:
             draft.max_position_embeddings = int(native * rope["factor"])
         if self.method == "dflash":
             # DFlash queries the draft up to num_speculative_tokens past the last target position, unclamped.
-            self._maybe_override_draft_max_position_embeddings(
-                self.draft_model_config.hf_config, self.target_model_config.max_model_len + self.num_speculative_tokens
+            draft = self.draft_model_config.hf_config
+            draft.max_position_embeddings = max(
+                draft.max_position_embeddings,
+                self.target_model_config.max_model_len + self.num_speculative_tokens,
             )
         return result
 
@@ -201,9 +202,8 @@ class VllmConfigPatch(ArcticPatch[VllmConfig]):
 
     def _get_v2_model_runner_unsupported_features(self):
         unsupported = list(self._orig_get_v2_unsupported())
-        spec = self.speculative_config
-        if spec is not None and spec.method == "arctic":
-            unsupported.append("speculative method 'arctic'")
+        # vLLM 0.33 defaults to V2, but Arctic patches the V1 GPUModelRunner.
+        unsupported.append("Arctic Inference model runner")
         return unsupported
 
     def __str__(self, *args, **kwargs):
@@ -225,24 +225,3 @@ class VllmConfigPatch(ArcticPatch[VllmConfig]):
             self._orig_post_init(*args, **kwargs)
         finally:
             setattr(target_module, "EagleModelTypes", original_types)
-
-
-class MLPSpeculatorConfigPatch(ArcticPatch[MLPSpeculatorConfig]):
-    _orig_init = MLPSpeculatorConfig.__init__
-
-    def __init__(self, *args, **kwargs):
-        self.base_model_arch = kwargs.pop("base_model_arch", "")
-        self._orig_init(*args, **kwargs)
-
-        # Inject dummy attributes required by vLLM's ModelArchConfigConvertor
-        # The convertor tries to calculate head_size = hidden_size // num_attention_heads
-        if not hasattr(self, "num_attention_heads"):
-            self.num_attention_heads = 1
-
-        if not hasattr(self, "hidden_size"):
-            # Fallback to n_embd if present, otherwise default to a safe dummy value
-            self.hidden_size = getattr(self, "n_embd", 1024)
-
-        # Ensure hidden_size is an integer to prevent TypeError during division
-        if hasattr(self, "hidden_size"):
-            self.hidden_size = int(self.hidden_size)
