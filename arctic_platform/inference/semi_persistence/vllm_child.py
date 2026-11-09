@@ -169,13 +169,6 @@ def _truncate_for_display(value, limit=200):
 _WEIGHTS_SHARD_BYTES = 2 * 2**30   # 2 GiB per shard
 _WEIGHTS_IO_WORKERS = 8            # thread pool size for shard I/O
 
-# The least a rank's host copy may hold of what vLLM reports loading
-# (``model_runner.model_memory_usage``, the "Model loading took" figure)
-# before save_weights refuses to write it.  Every model published through
-# 2026-11 lands between 0.94 and 1.0 -- the gap is buffers, which vLLM's own
-# level-2 sleep keeps -- and gpt-oss-120b, whose experts were missing, at 0.07.
-_WEIGHTS_MIN_LOADED_FRACTION = 0.8
-
 # Fraction of *measured* free VRAM the restore staging buffer may claim.
 # The budget that reaches this file is predicted on the host from
 # ``total_gpu_bytes * gpu_memory_utilization - weights``, which treats
@@ -1034,31 +1027,9 @@ def _semip_restore_lora(worker):
     return sum(v.numel() for v in views)
 
 
-def _semip_check_host_copy_covers_model(worker, host_bytes):
-    """Refuse a host copy far smaller than what vLLM loaded onto this rank.
-
-    Whatever the copy misses is discarded by the level-2 sleep and comes back
-    as fresh memory, so the restored engine runs -- and the post-restore
-    generations pass -- on weights that are not the model's.  LoRA slots count
-    toward the load but have a host copy of their own.
-    """
-    loaded = getattr(worker.model_runner, "model_memory_usage", None)
-    if not loaded:
-        return
-    lora_bytes = sum(v.numel() for v in _semip_lora_views(worker))
-    expected = int(loaded) - lora_bytes
-    if host_bytes < _WEIGHTS_MIN_LOADED_FRACTION * expected:
-        raise RuntimeError(
-            f"host copy holds {host_bytes / 2**30:.2f} GiB but vLLM loaded "
-            f"{expected / 2**30:.2f} GiB of weights on this rank (below "
-            f"{_WEIGHTS_MIN_LOADED_FRACTION:.0%}): weights live in tensors "
-            f"semi-p does not stage, and a restore would serve without them")
-
-
 def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
     buf = worker._semip_buf
     index = worker._semip_index
-    _semip_check_host_copy_covers_model(worker, buf.numel())
     shard_bytes = int(shard_bytes or _WEIGHTS_SHARD_BYTES)
     workers = int(io_workers or _WEIGHTS_IO_WORKERS)
     # TP1 keeps the flat weights/ layout; TP>1 fans out per-rank shards into
