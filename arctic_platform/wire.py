@@ -32,6 +32,9 @@ one small surface:
 3. Byte chunking -- ``encode_byte_chunks`` splits an oversized DSSST1 frame into
    self-describing byte-range frames. ``decode_byte_chunks`` reassembles them.
 
+4. Token prompts -- ``pack_token_prompts`` moves pre-tokenized generation
+   prompts into the tensor section without changing string prompts.
+
 Wire layout of one frame is just a safetensors blob::
 
     [ u64 header_len | JSON header (__metadata__: {dss: <structure>, op: <metadata>}) | tensor bytes ]
@@ -65,6 +68,29 @@ _ZIP_SIGNATURE = b"PK\x03\x04"
 
 class WireError(ValueError):
     """Raised for malformed or incompatible wire payloads."""
+
+
+def _token_tensor(tokens: list[int]) -> torch.Tensor:
+    try:
+        return torch.tensor(tokens, dtype=torch.int32)
+    except (RuntimeError, OverflowError):
+        return torch.tensor(tokens, dtype=torch.int64)
+
+
+def pack_token_prompts(prompts: Any) -> Any:
+    """Pack integer token prompts as tensors while leaving every other shape unchanged."""
+    if not isinstance(prompts, list) or not prompts:
+        return prompts
+    if all(type(token) is int for token in prompts):
+        return _token_tensor(prompts)
+    return [
+        (
+            _token_tensor(prompt)
+            if isinstance(prompt, list) and prompt and all(type(token) is int for token in prompt)
+            else prompt
+        )
+        for prompt in prompts
+    ]
 
 
 def _is_tensor(obj: Any) -> bool:

@@ -33,6 +33,9 @@ from arctic_platform.client.transport import unresolved_ops
 
 logger = logging.getLogger(__name__)
 
+# The server answers generate inline, so it has no request to poll or cancel.
+_UNSUPPORTED_OPS = frozenset({"generate-stream", "request-status", "cancel-request"})
+
 
 class OnPremTransport(Transport):
     """The server splits into a ``state`` actor (job creation) and an
@@ -104,7 +107,7 @@ class OnPremTransport(Transport):
         from arctic_platform.rl.ray_server import ArcticRLRayServer
 
         self._server = ArcticRLRayServer(self._state)
-        missing = unresolved_ops(self._server)
+        missing = [op for op in unresolved_ops(self._server) if op not in _UNSUPPORTED_OPS]
         if missing:
             logger.warning("%s cannot resolve ops (they will fail if called): %s", type(self).__name__, missing)
 
@@ -120,6 +123,8 @@ class OnPremTransport(Transport):
     def _resolve(self, request: Request):
         if request.op in CLUSTER_OPS:
             raise NotImplementedError(f"on-prem does not support cluster operation {request.op!r}")
+        if request.op in _UNSUPPORTED_OPS:
+            raise NotImplementedError(f"on-prem does not support job operation {request.op!r}")
         method = getattr(self._server, method_name(request.op))
         # Pass job_id only when set (ops omitting it call method(body)), then the body.
         args = (request.body,) if request.job_id is None else (request.job_id, request.body)

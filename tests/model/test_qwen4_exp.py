@@ -154,6 +154,21 @@ def test_qwen38_replaces_moe_and_shards_ple_embedding():
     assert embedding.weight._dss_skip_weight_sync
 
 
+def test_qwen38_gated_delta_net_output_norms_round_once():
+    _require()
+    from arctic_platform.model.implementations.gpu import vllm_rounding
+    from arctic_platform.model.implementations.moe.vlm import get_language_model
+
+    language_model = get_language_model(Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config()))
+    norms = [layer.linear_attn.norm for layer in language_model.layers if layer.layer_type == "linear_attention"]
+
+    # The rounding of each stock class is checked in test_gated_norm_rounding.py; here, that every norm uses it.
+    assert len(norms) == 1
+    for norm in norms:
+        assert vars(norm)["forward"].__func__ is vllm_rounding._rms_norm_gated_once_forward
+        assert norm.activation == "sigmoid"
+
+
 def test_qwen38_decoder_forwards_its_physical_layer_routes():
     _require()
     from arctic_platform.model.implementations.moe.vlm import get_language_model

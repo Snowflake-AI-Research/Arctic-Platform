@@ -7,6 +7,10 @@ from torch import nn
 from transformers.integrations import use_kernel_forward_from_hub
 
 
+def get_quack_rmsnorm():
+    return _get_quack_rmsnorm()
+
+
 @lru_cache(maxsize=1)
 def _get_quack_rmsnorm():
     """Lazy-load quack rmsnorm. Returns None if unavailable or GPU is pre-Hopper."""

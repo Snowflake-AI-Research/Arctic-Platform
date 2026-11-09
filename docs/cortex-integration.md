@@ -54,14 +54,18 @@ constrains what runs correctly here:
   anyway. Reproduced twice at `TRAIN_BSZ=1024`, which is why the GSM8K recipe
   ships a smaller default. Tracked as
   [#99](https://github.com/Snowflake-AI-Research/Arctic-Platform/issues/99).
-* **A job holds its GPUs until something explicitly cancels it, and nothing
-  does.** `shutdown()` cancels, but SkyRL never calls it when training ends, so
-  a run that completes its final step keeps all 8 GPUs just as a killed one
-  does; the next launch then fails the per-account cap. The driver additionally
-  ignores SIGINT and SIGTERM, Ray having installed handlers, so there is no
-  graceful stop to trigger it either. Callers must cancel explicitly — the
-  GSM8K recipe's launcher does this on every exit path through the reusable
-  cluster request builders and `CortexTransport.call()`.
+* **A job holds its GPUs until it is cancelled or the server reclaims it.**
+  SkyRL never calls `shutdown()`, so the Cortex entrypoint cancels the jobs its
+  driver created when the driver exits: on completion, on an exception, on
+  Ctrl-C, and on SIGTERM, including during the placement wait. A driver killed
+  outright (`kill -9`, OOM, a lost pod) cannot cancel anything. The server
+  reclaims that job once it has been idle for `backend.idle_timeout_seconds`,
+  30 minutes by default. `list_jobs_request()` / `cancel_job_request()` sent
+  through `CortexTransport.call()` release it sooner.
+* **Holding a job across a long placement wait.** `ArcticClient(config,
+  wait=False)` returns once the job is requested; `wait_until_ready()` blocks
+  until it runs. The caller holds the client for the whole wait, so a `with`
+  block or `try`/`finally` around both cancels the job however the wait ends.
 
 ## What's provided
 

@@ -171,7 +171,7 @@ dss-neutrino submit examples/sampling.json
 ```
 
 That file creates a training sub-job for `Qwen/Qwen3.6-35B-A3B` with
-`training_config.model_provider` set to `prime_rl`.
+`training_config.model_provider` set to `arctic`.
 
 #### Debug options (internal only)
 

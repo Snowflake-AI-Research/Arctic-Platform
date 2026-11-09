@@ -29,14 +29,16 @@ import contextlib
 import hashlib
 import json
 import logging
-import os
 import threading
 import time
 from collections.abc import Callable
+from collections.abc import Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
+from dataclasses import replace
 from typing import Any
 from typing import Iterator
+from urllib.parse import quote
 
 from tenacity import AsyncRetrying
 from tenacity import retry_if_exception
@@ -66,13 +68,14 @@ _CHUNKED_RESULTS = {"response_options": {"format": "dssst1", "delivery": "chunke
 # `forward` has no octet endpoint on SnowAPI, so it travels as an /operation RPC
 # whose payload is the base64'd DSSST1 frame. The control plane's REST surface
 # marshals that RPC as JSON, so the frame inflates 4/3 on the way in and the
-# budget below is a JSON-body budget, not a frame budget. These mirror
-# dss_client's constants so both clients split at the same boundary.
+# budget below is a JSON-body budget, not a frame budget. 16 MiB is dss_client's
+# conservative default, not a measured server limit.
 _OPERATION_MAX_JSON_BYTES = 16 * 1024 * 1024
 # Room for the envelope's keys, the operation type and the sub-job token.
 _OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
+_JOB_NOT_FOUND_CODE = "517601"
 _JOB_TERMINAL = ("failed", "done", "cancelled", "canceled")
 _REQUEST_DONE = ("completed", "done", "succeeded")
 _REQUEST_FAILED = ("failed", "cancelled", "canceled")
@@ -99,6 +102,13 @@ def _query(request: Request, body: dict) -> list[Send]:
     return [{"params": body}]
 
 
+def _capacity_query(request: Request, body: dict) -> list[Send]:
+    breakdown = body.get("breakdown")
+    if breakdown is not None and not isinstance(breakdown, str):
+        body = {**body, "breakdown": ",".join(breakdown)}
+    return _query(request, body)
+
+
 def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dict], list[Send]]:
     """DSSST1 octet bodies, one send per chunk; ``wire_op`` labels the chunk envelope."""
 
@@ -112,6 +122,49 @@ def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dic
     return encode
 
 
+def _generate_body(body: dict) -> dict:
+    return {**body, "prompts": wire.pack_token_prompts(body["prompts"])}
+
+
+_generate_octet = _octet("generate")
+
+
+def _generate(request: Request, body: dict) -> list[Send]:
+    return _generate_octet(request, _generate_body(body))
+
+
+def _unchunked_octet(request: Request, body: dict) -> list[Send]:
+    """One DSSST1 octet body; the route has no chunk reassembly, so an oversized frame is refused."""
+    frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
+    if len(frame) > _MAX_OCTET_BYTES:
+        raise ValueError(
+            f"cortex {request.op} body is {len(frame) / 2**20:.1f} MiB, over the "
+            f"{_MAX_OCTET_BYTES // 2**20} MiB cap; send fewer or shorter prompts"
+        )
+    return [{"data": frame, "headers": _OCTET_HEADERS}]
+
+
+def _generate_stream(request: Request, body: dict) -> list[Send]:
+    return _unchunked_octet(request, _generate_body(body))
+
+
+def _status_query(request: Request, body: dict) -> list[Send]:
+    return [{"params": {"max_events": body["max_events"]}}]
+
+
+def _operation_chunk_max_bytes(max_json_bytes: int) -> int:
+    return max(1, (max_json_bytes - _OPERATION_ENVELOPE_OVERHEAD_BYTES) * 3 // 4)
+
+
+def _operation_body_json_bytes(body: dict) -> int:
+    payload = body.get("payload")
+    raw = payload.get("payload_b64") if isinstance(payload, dict) else None
+    if not isinstance(raw, str):
+        return len(json.dumps(body).encode())
+    empty = {**body, "payload": {**payload, "payload_b64": ""}}
+    return len(json.dumps(empty).encode()) + len(raw)
+
+
 def _forward(request: Request, body: dict) -> list[Send]:
     """One /operation envelope per slice of the forward frame.
 
@@ -122,22 +175,34 @@ def _forward(request: Request, body: dict) -> list[Send]:
     was cached -- so they must be posted in order and the last reply kept.
     """
     frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
-    # The budget is on the JSON body, and base64 costs 4 bytes per 3, so the
-    # frame slice has to be the smaller 3/4 share of what is left.
-    max_payload = max(1, (_OPERATION_MAX_JSON_BYTES - _OPERATION_ENVELOPE_OVERHEAD_BYTES) * 3 // 4)
-    return [
+    max_json_bytes = _OPERATION_MAX_JSON_BYTES
+    chunks = wire.encode_byte_chunks(
+        frame,
+        kind="request",
+        operation="forward",
+        max_bytes=_operation_chunk_max_bytes(max_json_bytes),
+    )
+    sends = [
         {
             "json": {
                 "operation_type": "forward",
                 "sub_job_id": str(request.job_id),
                 "payload": {
                     "content_type": "application/octet-stream",
-                    "payload_b64": base64.b64encode(frame[at : at + max_payload]).decode("ascii"),
+                    "payload_b64": base64.b64encode(chunk).decode("ascii"),
                 },
             }
         }
-        for at in range(0, len(frame), max_payload)
+        for chunk in chunks
     ]
+    if any(_operation_body_json_bytes(send["json"]) > max_json_bytes for send in sends):
+        raise ValueError(f"cortex forward operation body exceeds the {max_json_bytes}-byte JSON limit")
+    return sends
+
+
+def _save(request: Request, body: dict) -> list[Send]:
+    payload = {key: body[key] for key in ("checkpoint_id", "checkpoint_type") if key in body}
+    return [{"json": payload}]
 
 
 # ── normalizers: a Cortex reply -> the canonical result ─────────────────────
@@ -146,7 +211,7 @@ def _identity(value: Any) -> Any:
 
 
 def _capacity_result(result: dict) -> dict:
-    return {
+    totals = {
         "has_reservation": bool(result.get("has_reservation", False)),
         "max_total_gpus": int(result.get("max_total_gpus", 0)),
         "reserved_gpus": int(result.get("reserved_gpus", 0)),
@@ -154,6 +219,7 @@ def _capacity_result(result: dict) -> dict:
         "pending_gpus": int(result.get("pending_gpus", 0)),
         "available_gpus": int(result.get("available_gpus", 0)),
     }
+    return {**result, **totals}
 
 
 def _fwd_bwd_result(result: dict) -> dict:
@@ -174,19 +240,18 @@ def _fwd_bwd_result(result: dict) -> dict:
     return canonical
 
 
-def _unwrap_forward_payload(result: dict) -> dict:
-    """Unwrap forward's DSSST1 frame from the JSON result envelope.
-
-    The zone base64s `wire.dumps({job_id, logprobs})` into `payload_b64`, but
-    without the `wire_format` marker `_decode_result` keys off, so the generic
-    path passes the envelope through and the caller gets a base64 string where
-    the tensors should be. Nothing between here and the zone unwraps it: the
-    only code that does is the standalone dev gateway, which the Cortex path
-    does not go through.
-    """
-    if not isinstance(result, dict) or not isinstance(result.get("payload_b64"), str):
-        return result
-    return wire.loads(base64.b64decode(result["payload_b64"]))
+def _request_status(status: dict) -> dict:
+    """A poll reply -> ``{"state": "running"|"done"|"failed", "error", "events"}`` with results decoded."""
+    state = _short(status.get("status"))
+    events = [
+        {**event, "result": _to_python(_decode_result(event["result"]))} if event.get("type") == "result" else event
+        for event in status.get("events") or []
+    ]
+    return {
+        "state": "done" if state in _REQUEST_DONE else "failed" if state in _REQUEST_FAILED else "running",
+        "error": status.get("error", ""),
+        "events": events,
+    }
 
 
 def _to_python(obj: Any) -> Any:
@@ -208,8 +273,26 @@ def _is_transient(exc: BaseException) -> bool:
     if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError)):
         return True
     if isinstance(exc, aiohttp.ClientResponseError):
+        if _is_job_not_found(exc):
+            return False
         return exc.status in _TRANSIENT_STATUSES
     return False
+
+
+def _is_job_not_found(exc: BaseException) -> bool:
+    import aiohttp
+
+    return isinstance(exc, aiohttp.ClientResponseError) and getattr(exc, "error_code", None) == _JOB_NOT_FOUND_CODE
+
+
+def _tail_logs_eof(request: Request, exc: BaseException) -> dict | None:
+    if request.body.get("operation_type") == "tail-logs" and _is_job_not_found(exc):
+        return {"entries": [], "next_cursor": None, "eof": True}
+    return None
+
+
+def _is_transient_during_job_visibility(exc: BaseException) -> bool:
+    return _is_job_not_found(exc) or _is_transient(exc)
 
 
 def _is_connect_error(exc: BaseException) -> bool:
@@ -231,6 +314,8 @@ _DEFAULT = _SendPolicy()
 _NO_REPLAY = _SendPolicy(retry_on=_is_connect_error)
 # Control-plane read: answer fast or fail, as cortex-training does.
 _QUICK_READ = _SendPolicy(max_retries=0, timeout=30.0)
+# A newly created job may briefly be absent from the read path.
+_JOB_VISIBILITY_READ = _SendPolicy(retry_on=_is_transient_during_job_visibility)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -248,6 +333,7 @@ class _Route:
     # `operation_type`s that may answer in the POST reply instead of with a request_id.
     inline_types: frozenset[str] = frozenset()
     normalize: Callable[[Any], Any] = _identity
+    recover: Callable[[Request, BaseException], dict | None] | None = None
 
     def prepare(self, prefix: str, request: Request) -> tuple[str, list[Send]]:
         body = {k: v for k, v in request.body.items() if v is not None}
@@ -268,7 +354,7 @@ class _Route:
         raise RuntimeError(f"cortex {operation_type or request.op} response carried no request_id: {reply}")
 
     def finish(self, chunks: list[bytes], result: dict) -> Any:
-        return self.normalize(wire.decode_result_chunks(chunks) if chunks else _decode_result(result))
+        return self.normalize(_decode_result(result, chunks))
 
 
 class _NoopRoute(_Route):
@@ -292,8 +378,11 @@ _ROUTES = {
     "create-job": _Route(method="POST", path="", policy=_NO_REPLAY),
     "list-jobs": _Route(method="GET", path="", encode=_query, normalize=lambda reply: reply.get("jobs", [])),
     "get-job": _Route(method="GET", path="/{job}", encode=_no_body),
+    "get-experiment-run": _Route(method="GET", path="/{job}/experiment-run", encode=_no_body),
     "cancel-job": _Route(method="POST", path="/{job}:cancel", encode=_no_body),
-    "capacity": _Route(method="GET", path="/capacity", encode=_query, policy=_QUICK_READ, normalize=_capacity_result),
+    "capacity": _Route(
+        method="GET", path="/capacity", encode=_capacity_query, policy=_QUICK_READ, normalize=_capacity_result
+    ),
     "list-checkpoints": _Route(
         method="GET",
         path="/{job}/checkpoints",
@@ -317,17 +406,31 @@ _ROUTES = {
         normalize=_fwd_bwd_result,
     ),
     # SnowAPI requires DSSST1 octet bodies here even though generate carries no tensors.
-    "generate": _Route(
-        method="POST", path="/{job}/generate", encode=_octet("generate"), poll=True, normalize=_to_python
+    "generate": _Route(method="POST", path="/{job}/generate", encode=_generate, poll=True, normalize=_to_python),
+    # Answers {request_id, count} at once; events are read with request-status. A replay
+    # would start a second generation nobody reads.
+    "generate-stream": _Route(
+        method="POST", path="/{job}/generate-stream", encode=_generate_stream, policy=_NO_REPLAY
     ),
-    "forward": _Route(
-        method="POST", path="/{job}/operation", encode=_forward, poll=True, normalize=_unwrap_forward_payload
+    # Each poll drains the events it returns from the server.
+    "request-status": _Route(
+        method="GET", path="/{job}/requests/{request_id}", encode=_status_query, normalize=_request_status
     ),
+    # An /operation that is never polled: its acknowledgement may name the cancelled request.
+    "cancel-request": _Route(method="POST", path="/{job}/operation"),
+    "forward": _Route(method="POST", path="/{job}/operation", encode=_forward, poll=True),
     "step": _Route(method="POST", path="/{job}/step", poll=True),
-    "save": _Route(method="POST", path="/{job}/save", poll=True),
-    # /operation is polymorphic: weight-sync is polled, reset-prefix-cache answers inline.
+    "save": _Route(method="POST", path="/{job}/save", encode=_save, poll=True),
+    "load-checkpoint": _Route(method="POST", path="/{job}/load", poll=True),
+    # /operation is polymorphic: weight-sync is polled, the rest answer inline.
     "operation": _Route(
-        method="POST", path="/{job}/operation", poll=True, inline_types=frozenset({"reset-prefix-cache"})
+        method="POST",
+        path="/{job}/operation",
+        poll=True,
+        inline_types=frozenset(
+            {"reset-prefix-cache", "tail-logs", "bootstrap-router-replay", "router-replay-discard"}
+        ),
+        recover=_tail_logs_eof,
     ),
 }
 
@@ -389,6 +492,14 @@ def _chunk_group_detail(body: Any) -> dict | None:
     return None
 
 
+def _response_error_code(body: Any) -> str | None:
+    for candidate in _iter_error_dicts(body):
+        code = candidate.get("code") or candidate.get("error_code")
+        if code is not None:
+            return str(code)
+    return None
+
+
 async def _raise_for_status(resp: Any) -> None:
     """Raise for an error response, keeping the server's error body in the message.
 
@@ -404,13 +515,27 @@ async def _raise_for_status(resp: Any) -> None:
     if detail is not None:
         raise _ChunkGroupError(detail)
     message = f"{resp.reason}: {body[:2000]}" if body else (resp.reason or "")
-    raise aiohttp.ClientResponseError(
+    error = aiohttp.ClientResponseError(
         resp.request_info,
         resp.history,
         status=resp.status,
         message=message,
         headers=resp.headers,
     )
+    error.error_code = _response_error_code(body)
+    raise error
+
+
+def job_create_payload(sub_job_configs: list[dict], config: CortexConfig) -> dict:
+    """Job-create body. Unset fields and an empty comment are omitted."""
+    payload: dict[str, Any] = {"sub_job_configs": sub_job_configs}
+    if config.job_comment is not None and config.job_comment != "":
+        payload["comment"] = config.job_comment
+    for key in ("idle_timeout_seconds", "pending_timeout_seconds"):
+        value = getattr(config, key)
+        if value is not None:
+            payload[key] = value
+    return payload
 
 
 class CortexTransport(Transport):
@@ -418,6 +543,9 @@ class CortexTransport(Transport):
         self.config = config
         self.jobs = JobHandles()
         self.job_id: str | None = None
+        self._roles: list[str] = []
+        self._owns_job = False
+        self._awaiting_job_visibility = False
         self.poll_interval = 0.5
         self._start_loop()
 
@@ -445,57 +573,73 @@ class CortexTransport(Transport):
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def initialize(self, client_config: ArcticClientConfig) -> JobHandles:
+        self.start(client_config)
+        return self.wait_until_ready()
+
+    def start(self, client_config: ArcticClientConfig) -> JobHandles:
+        self._roles = [role for role in JOB_TYPES if client_config.gpus_for(role) > 0]
         reconnect = JobHandles.from_config(client_config)
         if reconnect.any_set:  # reattach; a sub-job token embeds its parent job id
             self.job_id = _parent_id(reconnect.require_any())
         else:
-            body: dict = {"sub_job_configs": client_config.to_cortex()}
-            # Shared schema reports submitted_by=ADMIN; the comment is the ownership signal.
-            comment = os.environ.get("CORTEX_JOB_COMMENT")
-            if comment:
-                body["comment"] = comment
+            body = job_create_payload(client_config.to_cortex(), self.config)
             self.job_id = self.call(Request("create-job", body=body))["job_id"]
-            # Logged before the wait: a job can stay PLACING for a long time, and its id
-            # is the only way to cancel it if this process stops first.
-            logger.info("created cortex job %s; waiting for it to run", self.job_id)
+            self._owns_job = True
+            self._awaiting_job_visibility = True
+            # Logged before the wait: a job can stay PLACING for a long time.
+            logger.info("created cortex job %s", self.job_id)
+        return self.jobs
+
+    def wait_until_ready(self) -> JobHandles:
         self._wait_running()
         sub_jobs = self._capture_sub_jobs()
         # JobHandles holds each role's sub-job token, so the client's op bodies
         # (e.g. weight-sync source/target) already carry Cortex-correct ids with no
         # transport-side rewrite -- exactly as on-prem does with plain job ids.
-        for role in JOB_TYPES:
-            if client_config.gpus_for(role) > 0:
-                self.jobs.set(role, sub_jobs[_SUB_JOB_KEY[role]])
+        for role in self._roles:
+            self.jobs.set(role, sub_jobs[_SUB_JOB_KEY[role]])
         return self.jobs
 
     def shutdown(self) -> None:
         import aiohttp
 
-        if self.job_id is not None:
+        if self._owns_job and self.job_id is not None:
             # Best-effort teardown, tolerating failure (the job may be gone).
             with contextlib.suppress(aiohttp.ClientError, asyncio.TimeoutError):
                 self.call(cancel_job_request(self.job_id))
+            self.job_id = None
+            self._owns_job = False
+            self._awaiting_job_visibility = False
         self._on_loop(self._close_session()).result()
 
     # ── deliver one op ───────────────────────────────────────────────────────
     def call(self, request: Request) -> Any:
-        route, future = self._submit(request)
+        return self._call(request)
+
+    def _call(self, request: Request, route: _Route | None = None) -> Any:
+        route, future = self._submit(request, route)
         return route.finish(*future.result())
 
     async def acall(self, request: Request) -> Any:
         route, future = self._submit(request)
         return route.finish(*await asyncio.wrap_future(future))
 
-    def _submit(self, request: Request) -> tuple[_Route, Future]:
-        route = _route(request.op)
+    def _submit(self, request: Request, route: _Route | None = None) -> tuple[_Route, Future]:
+        route = route or _route(request.op)
         url, sends = route.prepare(self._prefix, request)
         return route, self._on_loop(self._deliver(route, request, url, sends))
 
     async def _deliver(self, route: _Route, request: Request, url: str, sends: list[Send]) -> tuple[list[bytes], dict]:
-        reply = await self._send_group(route, url, sends)
-        if not route.poll:
-            return [], reply
-        return await self._poll(route.submitted(request, reply))
+        try:
+            reply = await self._send_group(route, url, sends)
+            if not route.poll:
+                return [], reply
+            return await self._poll(route.submitted(request, reply))
+        except Exception as exc:
+            recovered = route.recover(request, exc) if route.recover is not None else None
+            if recovered is None:
+                raise
+            return [], recovered
 
     async def _send_group(self, route: _Route, url: str, sends: list[Send]) -> dict:
         try:
@@ -508,8 +652,10 @@ class CortexTransport(Transport):
     async def _send_each(self, route: _Route, url: str, sends: list[Send]) -> dict:
         """Post every send in order; the last reply is the op's answer."""
         reply: dict = {}
-        for kwargs in sends:
+        for index, kwargs in enumerate(sends):
             reply = await self._send(route.method, url, policy=route.policy, **kwargs)
+            if index < len(sends) - 1 and reply.get("request_id") is not None:
+                raise RuntimeError(f"cortex chunk {index} unexpectedly returned request_id")
         return reply
 
     def _request_url(self, request_id: str, cursor: str | None) -> tuple[str, dict | None]:
@@ -593,7 +739,8 @@ class CortexTransport(Transport):
     def _prefix(self) -> str:
         cx = self.config
         base = (cx.base_url or f"https://{cx.host}").rstrip("/")
-        return f"{base}/api/v2/databases/{cx.database}/schemas/{cx.schema_}/{cx.endpoint}"
+        database, schema = quote(cx.database, safe="$"), quote(cx.schema_, safe="$")
+        return f"{base}/api/v2/databases/{database}/schemas/{schema}/{cx.endpoint}"
 
     def _auth_headers(self) -> dict[str, str]:
         cx = self.config
@@ -605,7 +752,10 @@ class CortexTransport(Transport):
         }
 
     def _job(self) -> dict:
-        return self.call(get_job_request(self.job_id))
+        route = replace(_route("get-job"), policy=_JOB_VISIBILITY_READ) if self._awaiting_job_visibility else None
+        job = self._call(get_job_request(self.job_id), route)
+        self._awaiting_job_visibility = False
+        return job
 
     async def _send(self, method: str, url: str, *, policy: _SendPolicy = _DEFAULT, **kwargs: Any) -> dict:
         # Every SnowAPI call goes through here so transient 429/5xx/connection blips
@@ -613,7 +763,8 @@ class CortexTransport(Transport):
         import aiohttp
 
         if self._session is None:
-            self._session = aiohttp.ClientSession(headers=self._auth_headers())
+            connector = aiohttp.TCPConnector(ssl=self.config.verify_ssl)
+            self._session = aiohttp.ClientSession(headers=self._auth_headers(), connector=connector)
         session = self._session
         retries = self.config.max_retries if policy.max_retries is None else policy.max_retries
         timeout = min(self.config.request_timeout, policy.timeout or self.config.request_timeout)
@@ -687,8 +838,19 @@ def _result_chunk(event: Any) -> bytes | None:
     return payload
 
 
-def _decode_result(result: dict) -> dict:
-    """Decode a small inline result: a base64 DSSST1 frame, else pass-through JSON."""
-    if isinstance(result, dict) and result.get("wire_format") == wire.WIRE_FORMAT_VERSION:
-        return wire.loads(base64.b64decode(result["payload_b64"]))
-    return result
+def _decode_result(result: dict, chunks: Sequence[bytes] = ()) -> Any:
+    """A result envelope plus any result chunks -> the decoded result; plain JSON passes through.
+
+    The zone attaches its own transport metrics (router-replay tx stats) to the
+    JSON envelope instead of re-encoding the DSSST1 frame, so they are folded
+    into the payload's `metrics` here; envelope keys win.
+    """
+    if chunks:
+        decoded = wire.decode_result_chunks(chunks)
+    elif result.get("wire_format") == wire.WIRE_FORMAT_VERSION:
+        decoded = wire.loads(base64.b64decode(result["payload_b64"]))
+    else:
+        return result
+    if "metrics" in result:
+        decoded["metrics"] = {**decoded.get("metrics", {}), **result["metrics"]}
+    return decoded

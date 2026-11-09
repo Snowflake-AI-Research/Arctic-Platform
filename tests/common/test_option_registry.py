@@ -41,7 +41,7 @@ from arctic_platform.common.option_registry import settle
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
 
-# The real registry: the 23 keys with where they run and their goal, and the six loaders.
+# The real registry: the 23 keys with where they run and their goal, and the registered loaders.
 EXPECTED_KEYS = {
     "checkpointing.mode": ("trainer", "memory"),
     "checkpointing.freq": ("trainer", "memory"),
@@ -67,7 +67,15 @@ EXPECTED_KEYS = {
     "peft": ("trainer", "mode"),
     "zorro_train": ("trainer", "mode"),
 }
-EXPECTED_PROFILES = {"huggingface", "qwen3_5_moe", "glm_moe_dsa", "generic_moe", "glm5_next", "qwen4_exp"}
+EXPECTED_PROFILES = {
+    "huggingface",
+    "qwen3_5_moe",
+    "glm_moe_dsa",
+    "generic_moe",
+    "glm5_next",
+    "qwen4_exp",
+    "deepseek_v4",
+}
 
 SYNTHETIC_KEYS = ("lm_head.fp32", "moe.grouped_mm", "moe.comm_backend", "liger")
 
@@ -522,7 +530,7 @@ class TestCommandLine(TestCasePlus):
     def test_check_passes_on_real_data(self):
         out = self._run("check")
         assert len(out) == 1
-        assert out[0].startswith("check passed: 23 options x 6 profiles = 138 cells, ")
+        assert out[0].startswith("check passed: 23 options x 7 profiles = 161 cells, ")
 
     def test_matrix_write_reproduces_committed_file(self):
         tmp_dir = Path(self.get_auto_remove_tmp_dir())

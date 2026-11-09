@@ -23,7 +23,8 @@ attention of models with two full-attention layers, and with stock and patched m
 with fp32 weights under bf16 autocast. The
 experimental ``fp32_residual`` setting, which carries the residual stream in fp32 between decoder layers, is checked
 against the same reference loop and under the same checkpointing, offload and compile paths.
-The huggingface loader's ``fp32_parity`` set to false installs nothing, so the model is the stock one. The copied stock
+The huggingface loader's ``fp32_parity`` set to false installs nothing but the GatedDeltaNet output norms that round
+once, which the loader installs whatever the option is (``test_gated_norm_rounding.py``). The copied stock
 forward is pinned against the stock source of the verified transformers version, and the patch is applied only to the
 dense Qwen3.5 text model, once, and can be removed.
 
@@ -53,6 +54,7 @@ from arctic_platform.model import Patches
 from arctic_platform.model.implementations.gpu import activation_offload
 from arctic_platform.model.implementations.gpu import qwen3_5_dense_parity as hf_dense_parity
 from arctic_platform.model.implementations.gpu.activation_offload import ActivationOffloadManager
+from arctic_platform.model.implementations.gpu.vllm_rounding import round_gated_norms_once
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.patches.gradient_checkpointing import apply_gradient_checkpointing
 from arctic_platform.testing_utils import set_seed
@@ -143,6 +145,12 @@ def _patched(model: nn.Module, *, sequence_parallel: bool = False, fp32_residual
     assert (
         hf_dense_parity.apply_fp32_parity(model, sequence_parallel=sequence_parallel, fp32_residual=fp32_residual) == 1
     )
+    return model
+
+
+def _rounded_norms(model: nn.Module) -> nn.Module:
+    """``model`` with the GatedDeltaNet output norms the huggingface loader installs, as a loaded model has them."""
+    assert round_gated_norms_once(model) == 3
     return model
 
 
@@ -843,10 +851,10 @@ def test_loader_applies_the_patch_only_when_the_option_is_on(monkeypatch, loader
     assert loaded.model is model
     assert getattr(model.model, "_arctic_fp32_parity", False) is patched
     if not patched:
-        # Off installs nothing: the model is the stock one.
-        assert _instance_forwards(model) == []
+        # Off installs nothing but the output norms that round once: the model is otherwise the stock one.
+        assert _instance_forwards(model) == [f"model.layers.{i}.linear_attn.norm" for i in range(3)]
         assert _beta_hooks(model) == 0
-        expected_output, expected_grads = _forward_backward(_tiny_model())
+        expected_output, expected_grads = _forward_backward(_rounded_norms(_tiny_model()))
         _assert_same_run(*_forward_backward(model), expected_output, expected_grads)
 
 
@@ -907,7 +915,7 @@ def test_the_custom_moe_builders_class_patch_is_named():
 # ---------------------------------------------------------------------------
 
 
-def _cpu_liger(monkeypatch) -> list[int]:
+def _cpu_liger(monkeypatch) -> list[nn.Module]:
     """Let Liger's patched modules run on CPU, count its RMSNorm calls, and restore what its patch rebinds.
 
     Liger's kernels need a GPU. Its RMSNorm forward is replaced by the stock formula and its SwiGLU kernel by the stock
@@ -919,7 +927,7 @@ def _cpu_liger(monkeypatch) -> list[int]:
     calls = []
 
     def rms_norm_forward(self, hidden_states):
-        calls.append(1)
+        calls.append(self)
         output = hidden_states.float()
         output = output * torch.rsqrt(output.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
         return (output * (self.offset + self.weight.float())).type_as(hidden_states)
@@ -941,9 +949,9 @@ def _build(monkeypatch, model: nn.Module, **patches):
     return build_model(ModelSpec(model_path_or_name="tiny", loader="huggingface", patches=Patches(**patches))).model
 
 
-def test_liger_patch_with_the_default_runs_liger_rmsnorm_only_in_the_first_input_norm(monkeypatch):
+def test_liger_patch_with_the_default_runs_only_the_first_input_and_attention_qk_norms(monkeypatch):
     liger_calls = _cpu_liger(monkeypatch)
-    reference = _patched(_tiny_model())
+    reference = _rounded_norms(_patched(_tiny_model()))
     model = _build(monkeypatch, copy.deepcopy(_tiny_model()), liger=True)
 
     assert getattr(model.model, "_arctic_fp32_parity", False)
@@ -952,8 +960,9 @@ def test_liger_patch_with_the_default_runs_liger_rmsnorm_only_in_the_first_input
         output = model.model(input_ids=_input_ids()).last_hidden_state
         expected = reference.model(input_ids=_input_ids()).last_hidden_state
     # Every residual add and the norm after it are one fused fp32 operation, which reads the norm's weight and
-    # epsilon; only the first layer's input norm is called on one tensor.
-    assert len(liger_calls) == 1
+    # epsilon. Liger also patches q_norm and k_norm, which normalize single tensors rather than residual adds.
+    attention = model.model.layers[3].self_attn
+    assert liger_calls == [model.model.layers[0].input_layernorm, attention.q_norm, attention.k_norm]
     torch_assert_equal(output, expected)
 
 
@@ -961,7 +970,7 @@ def test_a_dense_model_built_after_a_liger_patch_loads_with_the_default(monkeypa
     from arctic_platform.model.loaders.huggingface import load_huggingface
 
     liger_calls = _cpu_liger(monkeypatch)
-    stock = _patched(_tiny_model())
+    stock = _rounded_norms(_patched(_tiny_model()))
     _build(monkeypatch, _tiny_model(), liger=True)
     # The liger patch replaced the module's norm class, so this second model is built with Liger's norm.
     second = _tiny_model()
@@ -978,8 +987,9 @@ def test_a_dense_model_built_after_a_liger_patch_loads_with_the_default(monkeypa
             second.model(input_ids=_input_ids()).last_hidden_state,
             stock.model(input_ids=_input_ids()).last_hidden_state,
         )
-    # Built with Liger's class, the attention's q and k norms run it too: the first input norm, q_norm and k_norm.
-    assert len(liger_calls) == 3
+    # The second model must use the same three norms, not the fused decoder or final norms.
+    attention = second.model.layers[3].self_attn
+    assert liger_calls == [second.model.layers[0].input_layernorm, attention.q_norm, attention.k_norm]
 
 
 def test_a_norm_that_is_no_1_plus_weight_rmsnorm_is_refused():

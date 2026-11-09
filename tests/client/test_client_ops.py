@@ -60,7 +60,7 @@ class FakeTransport(Transport):
 
     def call(self, request: Request) -> dict:
         self.calls.append(request)
-        return {"results": ["ok"], "loss": 0.0}
+        return {"results": ["ok"], "loss": 0.0, "request_id": "req", "state": "running", "events": [{}]}
 
     async def acall(self, request: Request) -> dict:
         return self.call(request)
@@ -75,6 +75,20 @@ def _call(client, method: str, *args, **kwargs):
     if inspect.isawaitable(result):
         return asyncio.run(result)
     return result
+
+
+def _stop_stream_after_one_event(stream) -> None:
+    """Read one event from a sync or async stream, then close it early."""
+    if not inspect.isasyncgen(stream):
+        next(stream)
+        stream.close()
+        return
+
+    async def drive():
+        await anext(stream)
+        await stream.aclose()
+
+    asyncio.run(drive())
 
 
 def _build(monkeypatch, cls):
@@ -154,7 +168,7 @@ class TestOpMapping:
         req = _last(client)
         assert req.op == "load-checkpoint"
         assert req.job_id == TRAINING
-        assert req.body == {"path": "/tmp/x", "step": 2}
+        assert req.body == {"path": "/tmp/x", "step": 2, "checkpoint_id": None, "source_job_id": None}
 
     def test_generate_targets_sampling_and_unwraps_results(self, client):
         """generate -> sampling job; returns the 'results' list."""
@@ -315,6 +329,7 @@ class TestOpRegistry:
         _call(rl_client, "save_checkpoint")
         _call(rl_client, "load_checkpoint")
         _call(rl_client, "generate", ["hi"])
+        _stop_stream_after_one_event(rl_client.generate_stream(["hi"]))  # submit, poll, cancel
         _call(rl_client, "log_probs", ["hi"])
         # sync_weights expands to wake + operation + wake + reset(operation)
         n_before = len(rl_client.transport.calls)
@@ -356,8 +371,19 @@ class TestClusterRequestBuilders:
         [
             (cluster_requests.list_jobs_request("running"), Request("list-jobs", body={"status": "running"})),
             (cluster_requests.get_job_request("job-1"), Request("get-job", "job-1")),
+            (
+                cluster_requests.get_experiment_run_request("job-1"),
+                Request("get-experiment-run", "job-1"),
+            ),
             (cluster_requests.cancel_job_request("job-1"), Request("cancel-job", "job-1")),
             (cluster_requests.capacity_request("H100"), Request("capacity", body={"hardware": "H100"})),
+            (
+                cluster_requests.capacity_request("H200", ("job_type", "submitted_by")),
+                Request(
+                    "capacity",
+                    body={"hardware": "H200", "breakdown": ("job_type", "submitted_by")},
+                ),
+            ),
             (cluster_requests.list_checkpoints_request("job-1"), Request("list-checkpoints", "job-1")),
             (
                 cluster_requests.export_checkpoint_request("job-1", "step-1"),
@@ -387,6 +413,7 @@ class TestClusterRequestBuilders:
         requests = (
             cluster_requests.list_jobs_request(),
             cluster_requests.get_job_request("job"),
+            cluster_requests.get_experiment_run_request("job"),
             cluster_requests.cancel_job_request("job"),
             cluster_requests.capacity_request(),
             cluster_requests.list_checkpoints_request("job"),
@@ -403,8 +430,8 @@ class TestClusterClientMethods:
         """Account-level ops need no stored handle."""
         _call(client, "list_jobs", "running")
         assert _last(client) == cluster_requests.list_jobs_request("running")
-        _call(client, "capacity", "H200")
-        assert _last(client) == cluster_requests.capacity_request("H200")
+        _call(client, "capacity", "H200", breakdown=("job_type",))
+        assert _last(client) == cluster_requests.capacity_request("H200", ("job_type",))
         _call(client, "cancel_job", "job-9")
         assert _last(client) == cluster_requests.cancel_job_request("job-9")
 
