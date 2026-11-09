@@ -242,7 +242,7 @@ def _online_logsumexp_and_weighted_update(
     # Each row's target is left out of both sums: a near-certain target's exp(0) = 1 would absorb the rest in fp32.
     chunk_exp[target_rows, target_columns] = 0.0
     # t sums exp(x - m) * (x - m), relative to the running max, so a near-certain row's entropy keeps its tail.
-    shift = torch.where(torch.isfinite(m), m - m_new, torch.zeros_like(m))
+    shift = torch.where(torch.isfinite(m), m - m_new, 0.0)
     s_new = s * exp_old + chunk_exp.sum(dim=-1)
     t_new = (t + shift * s) * exp_old + (chunk_exp * shifted).sum(dim=-1)
     return m_new, s_new, t_new
