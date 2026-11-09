@@ -273,3 +273,25 @@ def validate_loader_spec(name: str, spec: ModelSpec) -> None:
         raise ValueError(f"{name} loader does not support text_config_overrides")
     if spec.yarn_factors and name != "huggingface":
         raise ValueError(f"{name} loader does not support yarn_factors")
+    validator = _LOADERS[name].validate_spec
+    if validator is not None:
+        validator(spec)
+
+
+def resolve_loader_name(spec: ModelSpec) -> str:
+    """Resolve which loader a spec should use: single matching predicate, else the default."""
+    ctx = LoaderContext(spec=spec)
+    matched = [name for name, entry in _LOADERS.items() if entry.matches is not None and entry.matches(ctx)]
+    assert len(matched) <= 1, f"multiple loaders match: {matched}; set spec.loader to disambiguate"
+    if len(matched) == 1:
+        return matched[0]
+
+    assert _DEFAULT_LOADER is not None, "no default loader registered"
+    return _DEFAULT_LOADER
+
+
+def select_loader(ctx: LoaderContext) -> Loader:
+    """Return the loader for a spec whose ``loader`` has already been resolved."""
+    name = ctx.spec.loader
+    assert name is not None, "spec.loader must be resolved before select_loader"
+    return _LOADERS[name].fn

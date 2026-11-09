@@ -93,3 +93,130 @@ class ModelConfig(BaseModel):
     # compute.
     semi_p: bool = False
 
+    extra_engine_kwargs: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    extra_env: dict[str, str] = Field(default_factory=dict, exclude=True)
+    ray_num_gpus: float | None = Field(default=None, exclude=True)
+    lora_sync_staging: Literal["cpu", "gpu"] = Field(default="cpu", exclude=True)
+    # Clear the prefix cache when a weight sync pauses generation with
+    # strategy="pause", pause_mode="keep", so requests after the sync never
+    # read KV computed under the old weights. A request's clear_cache=True
+    # still forces clearing; set this to False for the run to opt out.
+    # Clearing preempts in-flight requests (they re-prefill) and discards
+    # reusable prefix KV; False leaves clearing to the best-effort post-load
+    # reset, so the cache may be kept across syncs at the cost of possibly
+    # reading KV computed under the old weights.
+    # pause_mode="abort" is unaffected (it already requires the post-load
+    # reset), and drain/skip/hotswap/engine_only syncs issue no pause, so
+    # this has no effect on them either. Not an AsyncEngineArgs field.
+    clear_cache_on_weight_sync: bool = Field(default=True, exclude=True)
+
+    @model_validator(mode="after")
+    def validate_sequence_parallelism(self) -> ModelConfig:
+        requested = {
+            "ulysses_sequence_parallel_size": self.ulysses_sequence_parallel_size,
+            "extra_engine_kwargs.ulysses_sequence_parallel_size": self.extra_engine_kwargs.get(
+                "ulysses_sequence_parallel_size", 1
+            ),
+        }
+        for source, value in requested.items():
+            if isinstance(value, str):
+                if value.strip() != "1":
+                    raise ValueError(
+                        f"{source} must be the integer 1, got {value!r}; "
+                        "sequence parallelism must be 1"
+                    )
+                size = 1
+            else:
+                try:
+                    size = int(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"{source} must be the integer 1, got {value!r}; "
+                        "sequence parallelism must be 1"
+                    ) from exc
+                if isinstance(value, bool) or size != value:
+                    raise ValueError(
+                        f"{source} must be the integer 1, got {value!r}; "
+                        "sequence parallelism must be 1"
+                    )
+            if size != 1:
+                raise ValueError(
+                    f"{source}={size} is unsupported by the ArcticInference "
+                    "server; sequence parallelism must be 1"
+                )
+        return self
+
+    def to_engine_kwargs(self) -> dict[str, Any]:
+        kwargs = {k: v for k, v in self.model_dump().items() if v is not None}
+        kwargs.update(self.extra_engine_kwargs)
+        if self.yarn_factors:
+            kwargs["additional_config"] = {
+                **kwargs.get("additional_config", {}), "yarn_factors": self.yarn_factors
+            }
+        if len(self.text_config_overrides) > 0:
+            if "hf_overrides" in self.extra_engine_kwargs:
+                raise ValueError("text_config_overrides cannot be combined with extra_engine_kwargs.hf_overrides")
+            # Resolved in the worker: the coordinator calling this may not have the model files.
+            kwargs["text_config_overrides"] = self.text_config_overrides
+        if not arctic_inference_effective_enabled(self.extra_env):
+            kwargs.pop("forest_cascade_attn_configs", None)
+        return kwargs
+
+    @classmethod
+    def from_registry(
+        cls,
+        name: str,
+        gpu_type: GPUType,
+        max_model_len: int = 32768,
+    ) -> ModelConfig:
+        key = normalize_model_name(name)
+        if gpu_type not in MODEL_CONFIGS or key not in MODEL_CONFIGS[gpu_type]:
+            raise ValueError(f"No config for model={key!r} on gpu={gpu_type.value}")
+        return cls(max_model_len=max_model_len, **MODEL_CONFIGS[gpu_type][key])
+
+
+MODEL_CONFIGS: dict[GPUType, dict[str, dict[str, Any]]] = {
+    GPUType.H200: {
+        "Qwen3-30B-A3B": dict(
+            model="Qwen/Qwen3-30B-A3B",
+            tensor_parallel_size=1,
+            quantization="fp8",
+        ),
+        "Qwen3-30B-A3B-Instruct-2507": dict(
+            model="Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+            tensor_parallel_size=1,
+            quantization="fp8",
+        ),
+        "Qwen3-235B-A22B-Instruct-2507": dict(
+            model="Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
+            tensor_parallel_size=2,
+        ),
+        "Qwen3-Coder-480B-A35B-Instruct": dict(
+            model="Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+            tensor_parallel_size=4,
+        ),
+    },
+    GPUType.B200: {
+        "Qwen3-30B-A3B": dict(
+            model="Qwen/Qwen3-30B-A3B",
+            quantization="fp8",
+            kv_cache_dtype="fp8",
+            enable_expert_parallel=True,
+            extra_engine_kwargs={
+                "compilation_config": {
+                    "pass_config": {
+                        "enable_fi_allreduce_fusion": True,
+                        "enable_noop": True,
+                    }
+                }
+            },
+        ),
+        "Qwen3-235B-A22B-Instruct-2507": dict(
+            model="Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
+            tensor_parallel_size=2,
+            kv_cache_dtype="fp8",
+            enable_expert_parallel=True,
+            extra_env={"VLLM_USE_FLASHINFER_MOE_FP8": "1"},
+        ),
+    },
+}

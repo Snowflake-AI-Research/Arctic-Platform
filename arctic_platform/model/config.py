@@ -202,3 +202,101 @@ class ModelSpec(BaseModel):
         description="Merged text config overrides; YaRN must explicitly set original_max_position_embeddings.",
     )
     yarn_factors: list[float] = Field(default_factory=list)
+    dtype: str = Field("bfloat16", description="Parameter dtype.")
+    attn_implementation: str | None = Field(None, description="Attention implementation to request from HF.")
+    loader: str | None = Field(None, description="Loader name; auto-resolved at construction when not set.")
+    parallelism: ParallelismConfig = Field(
+        default_factory=ParallelismConfig, description="Loader-specific parallelism."
+    )
+    patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
+    debug: dict = Field(default_factory=dict, description="Runtime GPU capacity guard, separate from loader debug.")
+    loader_options: dict = Field(default_factory=dict, description="JSON-only loader-specific extras.")
+
+    @classmethod
+    def from_ds_worker_config(cls, model_name: str, ds_worker_config: dict) -> "ModelSpec":
+        """Transitional bridge: map flat verl ``ds_worker_config`` into a ``ModelSpec``.
+
+        Callers (adapter / SFT demos) own the knobs on the flat dict today. Longer-term,
+        ``ModelSpec`` should be constructed upstream as part of the main client config
+        instead of being inferred here.
+        """
+        cfg = ds_worker_config or {}
+
+        # Require an explicit attention backend. ZoRRo Train needs a flash-attention
+        # implementation; do not invent a second default here (ModelSpec leaves it None).
+        if "attn_implementation" not in cfg or cfg["attn_implementation"] is None:
+            raise ValueError(
+                "from_ds_worker_config requires attn_implementation (ZoRRo Train needs a flash-attention backend)."
+            )
+
+        zorro_train_patch = None
+        if cfg.get("zorro_train_enable", False):
+            # Only forward keys present in cfg; ZorroTrainPatch pydantic defaults fill the rest.
+            zorro_keys = (
+                "response_len",
+                "max_token_len",
+                "rollout_n",
+                "temperature",
+                "use_unpad",
+                "world_size",
+                "logits_optimization",
+                "logits_optimization_peak_mem_size_in_gib",
+                "logits_compute_from_fp32_inputs",
+                "logits_compute_in_fp32",
+            )
+            zorro_train_patch = ZorroTrainPatch(**{k: cfg[k] for k in zorro_keys if k in cfg})
+
+        # Worker bridge defaults GC on (historical DeepSpeedWorker behavior). Generic
+        # ``Patches.gradient_checkpointing`` stays False for direct ModelSpec users.
+        return cls(
+            model_path_or_name=model_name,
+            dtype="bfloat16",
+            attn_implementation=cfg["attn_implementation"],
+            debug=gpu_memory_debug_config(cfg),
+            patches=Patches(
+                liger=cfg.get("use_liger", False),
+                zorro_train=zorro_train_patch,
+                gradient_checkpointing=cfg.get("enable_gradient_checkpointing", True),
+                peft=cfg.get("peft_config"),
+            ),
+        )
+
+    @field_validator("dtype")
+    @classmethod
+    def _validate_dtype(cls, value: str) -> str:
+        import torch
+
+        assert value == "auto" or isinstance(getattr(torch, value, None), torch.dtype), f"unknown dtype {value!r}"
+        return value
+
+    @model_validator(mode="after")
+    def _resolve_loader(self) -> Self:
+        from arctic_platform.model.loader import get_loader_options_model
+        from arctic_platform.model.loader import is_registered_loader
+        from arctic_platform.model.loader import resolve_loader_name
+
+        # Existing DSS loaders carry AP controls in loader_options.debug.
+        legacy_debug = self.loader_options.get("debug")
+        if isinstance(legacy_debug, dict) and "gpu_mem_preallocate_gib" in legacy_debug:
+            if "gpu_mem_preallocate_gib" not in self.debug:
+                self.debug = {**self.debug, "gpu_mem_preallocate_gib": legacy_debug["gpu_mem_preallocate_gib"]}
+            self.loader_options = {
+                **self.loader_options,
+                "debug": {key: value for key, value in legacy_debug.items() if key != "gpu_mem_preallocate_gib"},
+            }
+        gpu_mem_preallocate_bytes({"debug": self.debug})
+
+        if self.loader is None:
+            self.loader = resolve_loader_name(self)
+        else:
+            assert is_registered_loader(self.loader), f"unknown loader {self.loader!r}"
+
+        # Validate loader_options against the resolved loader's schema (if it has one),
+        # storing the fully-defaulted dict back so the spec records the effective values.
+        options_model = get_loader_options_model(self.loader)
+        if options_model is not None:
+            self.loader_options = options_model.model_validate(self.loader_options).model_dump()
+        from arctic_platform.model.loader import validate_loader_spec
+
+        validate_loader_spec(self.loader, self)
+        return self
