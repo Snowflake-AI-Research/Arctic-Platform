@@ -184,9 +184,33 @@ Complication 9).
 **Fix (dump side):** In `prepare_criu_dump` (child process), delete
 the `/dev/shm/sem.*` files before the dump.  The live process retains
 its existing mmap (the kernel keeps the inode alive).  CRIU then
-captures the mapping as anonymous memory — no file reference, no ghost,
-no `link_remap`.  Each TP rank does the same for vLLM's message-queue
-segments (`/dev/shm/psm_*`, `psm2_*`) in `_prepare_worker_dump`.
+carries the deleted file inside the image as a **ghost file**
+(`remap-fpath` GHOST + `ghost-file-*.img`) and recreates it at restore —
+no reference to a pod-local path, no `link_remap`.  Each TP rank does the
+same for vLLM's message-queue segments (`/dev/shm/psm_*`, `psm2_*`) in
+`_prepare_worker_dump`.
+
+**Ghost size limit.** CRIU refuses a ghost whose allocated size
+(`st_blocks * 512`) exceeds `--ghost-limit`, 1 MiB by default:
+
+```
+Error (criu/files-reg.c:1031): Can't dump ghost file /dev/shm/psm_1f1d89c7 of 1228800 size, increase limit
+Error (criu/cr-dump.c:1440): Collect mappings (pid: 100016) failed with -1
+```
+
+A semaphore is one page, but a message-queue ring is not: vLLM 0.32's
+response ring (`MessageQueue(1, 1)`) is 10 × 24 MiB chunks, sparse, with
+as much allocated as the largest messages it has carried.  With router
+replay, rank 0's `ModelRunnerOutput` carries every token's routed experts
+(`aux_output_connector_output`), so DeepSeek-V4.1-Flash passed 1 MiB on
+the cold-start dump while models without it stayed below.  The engine-core
+child is the process CRIU names because it maps every rank's response ring
+as a reader.  `_worker_criu_save` therefore passes
+`--ghost-limit` = the largest extent of any deleted `/dev/shm` mapping in
+the tree, rounded up to 2 MiB (`_shm_ghost_limit`), never below the
+default.  Ghosts are copied by `SEEK_DATA`, so the image grows by the
+allocated bytes only, and the limit is a dump-time check: restore reads
+whatever ghost the image holds.
 
 **Side effect:** At process exit, Python's multiprocessing finalizers
 try to `sem_unlink()` the already-removed files, producing harmless
