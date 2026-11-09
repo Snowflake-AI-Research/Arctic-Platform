@@ -55,11 +55,11 @@ name = "arctic_platform"
 version = "0.2.1.dev0"
 description = "Snowflake LLM training library w/ RL"
 authors = [
-    {author = "Tunji Ruwase", email = "tunji.ruwase@snowflake.com"},
-    {author = "Stas Bekman", email = "stas.bekman@snowflake.com"},
-    {author = "Michael Wyatt", email = "michael.wyatt@snowflake.com"},
-    {author = "Jeff Rasley", email = "jeff.rasley@snowflake.com"},
-    {author = "Samyam Rajbhandari", email = "samyam.rajbhandari@snowflake.com"},
+    {name = "Tunji Ruwase", email = "tunji.ruwase@snowflake.com"},
+    {name = "Stas Bekman", email = "stas.bekman@snowflake.com"},
+    {name = "Michael Wyatt", email = "michael.wyatt@snowflake.com"},
+    {name = "Jeff Rasley", email = "jeff.rasley@snowflake.com"},
+    {name = "Samyam Rajbhandari", email = "samyam.rajbhandari@snowflake.com"},
 ]
 license = "Apache-2.0"
 readme = "README.md"
@@ -197,7 +197,7 @@ inference = [
     "ray",
     "tqdm",
     "uvicorn",
-    "vllm==0.32.0",
+    "vllm==0.33.0",
     "xgrammar==0.2.8",
 ]
 
