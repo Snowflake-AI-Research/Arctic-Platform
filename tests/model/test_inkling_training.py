@@ -195,6 +195,37 @@ class TestInklingTraining(TestCasePlus):
             torch_assert_close(parameter.grad, expected.grad, atol=1e-6, rtol=0, msg=name)
 
     @require_torch_gpu
+    def test_flex_variable_lengths_preserve_parity_without_recompile_failure(self):
+        import copy
+
+        from arctic_platform.model.implementations.inkling.attention import enable_flex_attention
+
+        set_seed(947)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        config = tiny_config()
+        config.head_dim = config.swa_head_dim = 16
+        reference = initialized_prime_model(config).cuda().float()
+        for module in reference.modules():
+            if isinstance(module, InklingMoE):
+                module.ep_comm_backend = "local"
+        actual = copy.deepcopy(reference)
+        enable_flex_attention(actual, query_chunk_size=128)
+        for length in range(17, 38):
+            ids = torch.randint(0, 60, (1, length), device="cuda")
+            records = []
+            for model in (reference, actual):
+                model.zero_grad(set_to_none=True)
+                loss = model(input_ids=ids, labels=ids).loss
+                loss.backward()
+                grads = [p.grad.clone() for p in model.parameters() if p.requires_grad]
+                norm = torch.stack([g.square().sum() for g in grads]).sum().sqrt()
+                records.append((loss.detach(), norm, grads))
+            for value, expected in zip(records[1][:2], records[0][:2]):
+                torch_assert_close(value, expected, atol=1e-6, rtol=0)
+            for value, expected in zip(records[1][2], records[0][2]):
+                torch_assert_close(value, expected, atol=1e-6, rtol=0)
+
+    @require_torch_gpu
     def test_flex_bf16_padding_and_packed_sequence_parity(self):
         import copy
 

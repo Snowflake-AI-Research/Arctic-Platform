@@ -28,9 +28,14 @@ from transformers.models.inkling.modeling_inkling import InklingAttention as Nat
 from transformers.models.inkling.modeling_inkling import InklingTextModel as NativeInklingTextModel
 
 
-@lru_cache(maxsize=1)
-def _compiled_attention():
-    return torch.compile(flex_attention, fullgraph=True, dynamic=False)
+@lru_cache(maxsize=32)
+def _compiled_attention(geometry):
+    def run(*args, **kwargs):
+        return flex_attention(*args, **kwargs)
+
+    # Separate Dynamo caches for dtype, head geometry, and mask structure.
+    run.__code__ = run.__code__.replace(co_name=f"inkling_flex_{geometry}")
+    return torch.compile(run, fullgraph=True, dynamic=True)
 
 
 def relative_attention(
@@ -95,7 +100,8 @@ def relative_attention(
         mask_mod=mask_mod,
         seq_lengths=(q_len, kv_len),
     )
-    return _compiled_attention()(
+    geometry = (query.dtype, heads, key.shape[1], dim, window, padding_mask is not None, sequence_ids is not None)
+    return _compiled_attention(geometry)(
         query,
         key,
         value,
