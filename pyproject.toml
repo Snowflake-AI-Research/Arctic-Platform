@@ -147,7 +147,7 @@ tinker = [
 # this install can serve training without vLLM.
 sft = [
     "deepspeed>=0.19.2",  # fix the static buffers in mixed precision
-    "liger-kernel>=0.8.0",
+    "liger-kernel>=0.8.5", # more patches than earlier
     "numpy",
     "nvidia-ml-py",
     # 0.20+ imports EmbeddingParallel only when a tensor-parallel LoRA module is present.

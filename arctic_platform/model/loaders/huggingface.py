@@ -16,47 +16,7 @@
 
 from __future__ import annotations
 
-from transformers import AutoConfig
-from transformers import AutoModelForCausalLM
-
-from arctic_platform.common.text_config_overrides import apply_text_config_overrides
-from arctic_platform.model.loader import LoadedModel
-from arctic_platform.model.loader import LoaderContext
-from arctic_platform.model.loader import register_loader
-
-
-@register_loader("huggingface", default=True)
-def load_huggingface(ctx: LoaderContext) -> LoadedModel:
-    parallelism = ctx.spec.parallelism
-    if parallelism.expert_parallel != 1:
-        raise ValueError(
-            "huggingface loader does not support expert parallelism "
-            f"(got expert_parallel={parallelism.expert_parallel})"
-        )
-    groups = ctx.parallel_groups or {}
-    if parallelism.sequence_parallel > 1 and groups.get("sp_group") is None:
-        raise ValueError("huggingface sequence parallelism requires parallel_groups['sp_group']")
-
-    kwargs = {}
-    if len(ctx.spec.text_config_overrides) > 0:
-        config = AutoConfig.from_pretrained(ctx.spec.model_path_or_name)
-        apply_text_config_overrides(config, ctx.spec.text_config_overrides)
-        kwargs["config"] = config
-
-    model = AutoModelForCausalLM.from_pretrained(
-        ctx.spec.model_path_or_name,
-        attn_implementation=ctx.spec.attn_implementation,
-        dtype=ctx.spec.dtype,
-        **kwargs,
-    )
-    if ctx.spec.yarn_factors:
-        from arctic_platform.model.yarn_factors import install_yarn_factors
-
-        install_yarn_factors(model, ctx.spec.yarn_factors)
-    if parallelism.sequence_parallel > 1:
-        from arctic_platform.model.implementations.gpu.sp.transformers import (
-            configure_transformers_sequence_parallel_model,
-        )
-
-        configure_transformers_sequence_parallel_model(model, groups["sp_group"])
-    return LoadedModel(model=model)
+from pydantic import BaseModel
+from pydantic import ConfigDict
+from pydantic import Field
+from pydantic import model_validator

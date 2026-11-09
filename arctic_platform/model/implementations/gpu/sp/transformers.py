@@ -19,7 +19,7 @@ from __future__ import annotations
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import apply_gated_delta_net_sequence_parallelism
 
 
-def configure_transformers_sequence_parallel_model(model, process_group) -> int:
+def configure_transformers_sequence_parallel_model(model, process_group, *, fp32_beta: bool) -> int:
     model_config = getattr(model, "config", None)
     get_text_config = getattr(model_config, "get_text_config", None)
     text_config = get_text_config() if callable(get_text_config) else model_config
@@ -27,4 +27,4 @@ def configure_transformers_sequence_parallel_model(model, process_group) -> int:
         if config is not None and hasattr(config, "use_cache"):
             config.use_cache = False
 
-    return apply_gated_delta_net_sequence_parallelism(model, process_group)
+    return apply_gated_delta_net_sequence_parallelism(model, process_group, fp32_beta=fp32_beta)

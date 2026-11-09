@@ -234,9 +234,15 @@ class NemotronHMambaLayer(GradientCheckpointingLayer):
         hidden_states = self.norm(hidden_states)
 
         if self.cp_enabled:
-            # TODO: This path doesnt support cu_seqlens so packing makes it wrong
+            # Global boundaries. The cu_seqlens argument is this rank's shard, which does not
+            # index the sequence gathered by the context-parallel all-to-all.
             hidden_states = mamba_cp_forward(
-                self.mamba, hidden_states, self._cp_group, self._cp_rank, self._cp_world_size
+                self.mamba,
+                hidden_states,
+                self._cp_group,
+                self._cp_rank,
+                self._cp_world_size,
+                cu_seqlens=getattr(self, "_sp_cu_seqlens", None),
             )
         else:
             hidden_states = self.mamba(hidden_states, cu_seqlens=cu_seqlens)

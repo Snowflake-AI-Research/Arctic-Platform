@@ -41,6 +41,7 @@ LOADER_ARCHITECTURES = {
     },
     "glm5_next": {"Glm5NextForConditionalGeneration"},
     "qwen4_exp": {"Qwen4ExpForConditionalGeneration"},
+    "deepseek_v4": {"DeepseekV4ForCausalLM"},
 }
 # Trainable architectures deliberately left without chat mode, with the reason.
 TRAINED_WITHOUT_CHAT: dict[str, str] = {}
