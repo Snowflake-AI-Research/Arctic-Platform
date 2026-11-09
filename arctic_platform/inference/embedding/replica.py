@@ -30,7 +30,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.usage.usage_lib import UsageContext
 from vllm.inputs import TokensPrompt
 from vllm.pooling_params import PoolingParams
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 # Ensure we're using vLLM v0 for embedding support
 os.environ["VLLM_USE_V1"] = "0"
