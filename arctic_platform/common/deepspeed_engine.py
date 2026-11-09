@@ -35,8 +35,6 @@ from pydantic import Field
 
 from arctic_platform.common.optimizer import OptimizerSettings
 from arctic_platform.debug.deepspeed_zero_initialization import maybe_trace_zero_initialization
-from arctic_platform.debug.training import maybe_configure_router_replay_trace
-from arctic_platform.debug.weight_sync import maybe_configure_broadcast_training
 from arctic_platform.model.implementations.fp8 import keeps_fp32
 from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
 
@@ -218,8 +216,6 @@ def initialize_training_engine(
     ``mpu`` is forwarded only when it is set, so ZeRO reduces sequence-parallel
     gradients over the sequence-data-parallel group.
     """
-    ds_config = maybe_configure_broadcast_training(ds_config)
-    ds_config = maybe_configure_router_replay_trace(ds_config, model, rank)
     built = None
     choice = None
     # Marks first: the optimizer groups split on them.

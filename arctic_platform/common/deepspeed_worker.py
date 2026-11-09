@@ -47,11 +47,6 @@ from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.common.weight_checksum import tensor_l2_sq
-from arctic_platform.debug.lora import maybe_admit_worker_construction
-from arctic_platform.debug.lora import maybe_lora_training_worker
-from arctic_platform.debug.lora import maybe_record_lora_sender
-from arctic_platform.debug.lora import maybe_release_lora_worker
-from arctic_platform.debug.lora import maybe_verify_worker_engine
 from arctic_platform.debug.weight_sync import maybe_annotate_weight_sync_result
 from arctic_platform.debug.weight_sync import maybe_observe_weight_send
 from arctic_platform.model import build_model
@@ -100,7 +95,6 @@ async def spawn_and_initialize_workers(gpus, master_port, config_dict, actor_opt
 
 
 @ray.remote
-@maybe_lora_training_worker
 class DeepSpeedWorker:
     """Single-GPU worker for DeepSpeed training."""
 
@@ -195,7 +189,6 @@ class DeepSpeedWorker:
                 sequence_parallel=self.sp_size,
                 debug=debug,
             )
-        maybe_admit_worker_construction(self, spec, ds_config, None, build_model, deepspeed.initialize)
         loaded = build_model(spec)
         model = loaded.model
         self._gpu_mem_preallocation = getattr(model, "_arctic_gpu_mem_preallocation", None)
@@ -226,7 +219,6 @@ class DeepSpeedWorker:
         else:
             # Forward-only/log-prob remains a separate no-optimizer contract.
             self.engine, _, _, _ = deepspeed.initialize(model=model, config=ds_config)
-        maybe_verify_worker_engine(self)
         self._device = get_accelerator().device_name(self.engine.local_rank)
 
         gpu_id = torch.cuda.current_device()
@@ -776,7 +768,6 @@ class DeepSpeedWorker:
             device=torch.device(self._device),
             bucket_size=bucket_size,
         )
-        maybe_record_lora_sender(self, group, schedule, base_port)
         return True
 
     def get_weights(self) -> list[tuple[str, torch.Tensor]]:
@@ -1261,7 +1252,6 @@ class DeepSpeedWorker:
         return {"gpu_mb": mem_mb}
 
     def destroy(self) -> bool:
-        maybe_release_lora_worker(self)
         if self._weight_sender is not None:
             self._weight_sender.destroy()
             self._weight_sender = None

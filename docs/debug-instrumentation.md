@@ -1,25 +1,23 @@
-# Opt-In Debug Instrumentation
+# Essential Onboarding Debug Instrumentation
 
-The `arctic_platform.debug` libraries observe training initialization, model materialization, checkpoint readers, router replay and weight transfer. Native entry points call descriptive `maybe_...` helpers. With their options absent, the helpers leave native arguments, objects, tensor iteration and cleanup behavior unchanged.
+These are the essentials needed for debugging most config onboardings: ZeRO initialization allocation tracing and observation of the tensors handed to the native weight sender. Both are opt-in. With the options absent, native arguments, results and tensor lists are unchanged.
 
 ## Initialization Traces
 
-Set the DeepSpeed configuration option `arctic_platform_zero_initialization_trace` to an object with `request_id` and `output_dir`. The request ID must contain only letters, digits, underscores or hyphens, and the evidence directory must resolve under `/data-fast`. The initialization context removes this private option from the configuration sent to DeepSpeed.
+Set the DeepSpeed configuration option `arctic_platform_zero_initialization_trace` to an object with `request_id` and `output_dir`. The request ID must contain only letters, digits, underscores or hyphens, and the evidence directory must resolve under `/data-fast`. The initialization context removes this private option from the configuration sent to DeepSpeed without mutating the original recipe.
 
-The trace binds the installed ZeRO optimizer's source SHA256, rank, process and allocation events. Its request-scoped observer does not replace `torch.zeros` globally, and it restores the optimizer method after success or failure. A trace is observation, not a capacity guarantee or numerical result.
+The trace records the installed ZeRO optimizer's source SHA256, rank, process and allocation events. Its request-scoped observer does not replace `torch.zeros` globally, and it restores the optimizer method after success or failure. A trace helps locate allocation stalls or failures; it is not a capacity guarantee or numerical result.
 
-## Dependency Boundaries
+## Weight Sender Observation
 
-Enabled routes require their actual native implementations and source identities. Debug41 does not supply replacement training or sampling implementations:
+Set `ARCTIC_INFERENCE_WEIGHT_SYNC_VERIFY=1` in the training worker's environment to record exact SHA256 manifests of the tensors passed to its existing `WeightSender.send`. The observer hashes bounded chunks of logical tensor bytes before and after the single native send and reports a mutation if those bytes change. It also hashes and rechecks the source files of the selected sender and export method.
 
-- Initialization-capacity verification uses the sequence-topology API from #436 and the parallel-group implementation from #439. Main without that API rejects enabled verification and runs owned cleanup.
-- Participation capture requires the correctness harness's LoRA and optimizer modules plus the DSS training/gateway services. An AP-only installation does not supply those services. The ownership test explicitly allows only its two function-local DSS imports in `debug/training.py`; ordinary modules and eager debug imports still cannot import DSS.
-- Selected external sampler routes require the explicitly bound `arctic_inference` receiver and vLLM sources. Installing bundled `arctic_platform.inference` does not satisfy that different source contract.
-- Reduced prediction-fixture authentication requires the native auxiliary/MTP capture libraries from #437/#438. Its absent-option route is a no-op. When composing those fixes, retain ordinary strict native capture; the debug hook must not replace or suppress it for an ordinary checkpoint.
-- Receiver loading observation composes with fix38's ordinary loading helpers. It does not introduce those native loading changes into this branch.
+The send result gains `sent_manifest`, `trainer_parameters` and `evidence_sources`. No extra send, receiver replay, sampler replacement or collective is introduced. This sender-only evidence does not prove receiver correctness. Enabled observation rejects ZeRO-3 post-gather views and expert-parallel parameter holdings because a single sender cannot prove their complete inventory. Hashing adds overhead and is intended for diagnosis, not ordinary training.
 
-The initialization-memory arithmetic lives in `arctic_platform.debug.initialization_memory`. Native model inventory is imported lazily when enabled. Unresolved memory terms remain unresolved; unit-test success does not admit a real allocation.
+## Scope
+
+Config-specific LoRA admission, reduced-MTP fixtures, model-capacity projections, router replay, participation capture, receiver shadow replay and custom inference startup or warmup diagnostics are excluded. The retained libraries import training dependencies only inside enabled implementations and work without the correctness harness.
 
 ## Validation
 
-CPU controls check disabled imports, native argument/result identity, actor bindings, cancellation, source hashes and trace restoration. They do not establish GPU kernel, distributed topology, external receiver or large-model capacity correctness. Enabled execution must separately admit the complete native dependency closure and exact selected source bytes.
+CPU tests cover disabled import and identity behavior, native call order, exact manifests, mutation detection and trace restoration. GPU-hidden full-suite results are reported separately in the PR description; these controls do not claim a numerical onboarding result or distributed receiver verification.
