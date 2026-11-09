@@ -329,6 +329,19 @@ def _batch_invariant_router_gate() -> None:
     GateLinear.forward = forward
 
 
+def _sparse_mla_always_mqa() -> None:
+    """Run every sparse MLA token through the absorbed ``forward_mqa`` path.
+
+    A request with more than the backend's reorder threshold of query tokens (256 at 64 heads) is a prefill, and a
+    prefill batch whose longest sequence fits in ``index_topk`` takes dense ``forward_mha`` (``kv_b_proj``
+    up-projection, then causal attention) instead. Which path a prompt takes therefore depends on the longest prompt it
+    is batched with. This is ``attention_config.sparse_mla_force_mqa``, applied without a config change.
+    """
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+
+    MLAAttention._use_sparse_mha = lambda self, attn_metadata: False
+
+
 PROXY_ENV_VAR = "ARCTIC_GLM5_PROXY_LAYERS"
 
 
@@ -383,6 +396,7 @@ def ensure_glm5_batch_invariance() -> None:
     # Small steps would take a fused post + pre-norm kernel with its own split; every step takes the split-free path.
     tilelang_kernels.mhc_fused_post_pre_split_config = lambda *args, **kwargs: None
     _batch_invariant_router_gate()
+    _sparse_mla_always_mqa()
     _batch_invariant_fp8_block_linear()
     _split_mixed_kda_steps()
     _deterministic_indexer_topk()

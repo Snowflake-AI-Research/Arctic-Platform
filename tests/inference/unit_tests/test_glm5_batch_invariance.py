@@ -110,3 +110,23 @@ def test_indexer_head_weights_use_the_batch_invariant_matmul(monkeypatch):
     assert torch.equal(out, hidden.float() @ weight)
     assert attention.torch.mm(hidden, hidden.t()).dtype == torch.bfloat16 and len(calls) == 1
     assert attention.torch.float32 is torch.float32 and attention.torch.Tensor is torch.Tensor
+
+
+def test_sparse_mla_prefill_always_takes_the_mqa_path(monkeypatch):
+    import sys
+    import types
+
+    from arctic_platform.inference.vllm import glm5_batch_invariance
+
+    class MLAAttention:
+        def _use_sparse_mha(self, attn_metadata):
+            return True
+
+    mla_attention = types.ModuleType("vllm.model_executor.layers.attention.mla_attention")
+    mla_attention.MLAAttention = MLAAttention
+    for name in ("vllm", "vllm.model_executor", "vllm.model_executor.layers", "vllm.model_executor.layers.attention"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, mla_attention.__name__, mla_attention)
+    glm5_batch_invariance._sparse_mla_always_mqa()
+
+    assert MLAAttention()._use_sparse_mha(object()) is False
