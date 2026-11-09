@@ -34,7 +34,7 @@ def sort_topk_ids(ids: torch.Tensor) -> torch.Tensor:
     """Each row's ids ascending, with the -1 padding last."""
     pad = torch.iinfo(ids.dtype).max
     ordered = torch.where(ids < 0, pad, ids).sort(dim=-1).values
-    return torch.where(ordered == pad, -1, ordered)
+    return ordered.masked_fill_(ordered == pad, -1)
 
 
 def apply_sparse_topk_order_fix() -> None:
