@@ -487,14 +487,13 @@ def check_supported_config(config: Any) -> None:
 def _stock_layer_runner(backbone: Any, input_ids: torch.Tensor, position_ids: torch.Tensor, kwargs: dict) -> Callable:
     """``run_stock(layer, streams)``: the stock decoder layer on ``[tokens, hc_mult, hidden]`` streams, packed as the
     stock model forward packs them (one row, the attention-mask mapping and the packing kwargs it passes down)."""
-    config = backbone.config
     mask = torch.ones(1, input_ids.numel(), dtype=torch.bool, device=input_ids.device)
     masks = {"deepseek_sparse_attention": mask, "linear_attention": mask}
 
     def run(layer: Any, streams: torch.Tensor) -> torch.Tensor:
         out, _ = layer(
             streams.unsqueeze(0),
-            attention_mask=masks[config.layer_types[layer.layer_idx]],
+            attention_mask=masks[layer.block_type],
             position_ids=position_ids.reshape(1, -1),
             position_embeddings=None,
             input_ids=input_ids.reshape(1, -1),
