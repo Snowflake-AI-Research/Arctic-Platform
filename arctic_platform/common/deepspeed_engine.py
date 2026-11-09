@@ -435,8 +435,9 @@ def _optimizer_cpu_offload_enabled(ds_config: dict) -> bool:
         return False
     offload = zero_config.get("offload_optimizer")
     if isinstance(offload, dict):
-        # {"device": "none"} means offload is off, not on (SkyRL and the recipes write it).
-        return str(offload.get("device", "cpu")).lower() not in ("none", "")
+        # DeepSpeed and ``_without_noop_offload`` treat a missing device as none.
+        # Only an explicit cpu (or other non-empty, non-none) device is offload on.
+        return str(offload.get("device", "none")).lower() not in ("none", "")
     return bool(offload)
 
 

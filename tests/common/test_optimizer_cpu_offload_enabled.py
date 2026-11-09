@@ -17,6 +17,7 @@
 
 import pytest
 
+from arctic_platform.client.config import _without_noop_offload
 from arctic_platform.common.deepspeed_engine import _optimizer_cpu_offload_enabled
 
 
@@ -24,15 +25,27 @@ def _cfg(offload):
     return {"zero_optimization": {"stage": 2, "offload_optimizer": offload}}
 
 
+def _stripper_keeps_optimizer_offload(ds_config: dict) -> bool:
+    zero = _without_noop_offload(ds_config).get("zero_optimization") or {}
+    return "offload_optimizer" in zero
+
+
 @pytest.mark.parametrize(
     "offload",
-    [{"device": "none"}, {"device": "None"}, {"device": "NONE"}, {"device": ""}],
+    [
+        {"device": "none"},
+        {"device": "None"},
+        {"device": "NONE"},
+        {"device": ""},
+        {},
+        {"pin_memory": True},
+    ],
 )
-def test_device_none_is_offload_off(offload):
+def test_device_none_or_missing_is_offload_off(offload):
     assert _optimizer_cpu_offload_enabled(_cfg(offload)) is False
 
 
-@pytest.mark.parametrize("offload", [{"device": "cpu"}, {"device": "cpu", "pin_memory": False}, {}])
+@pytest.mark.parametrize("offload", [{"device": "cpu"}, {"device": "cpu", "pin_memory": False}])
 def test_real_cpu_offload_is_on(offload):
     assert _optimizer_cpu_offload_enabled(_cfg(offload)) is True
 
@@ -44,3 +57,18 @@ def test_falsy_offload_is_off(offload):
 
 def test_missing_zero_block_is_off():
     assert _optimizer_cpu_offload_enabled({}) is False
+
+
+@pytest.mark.parametrize(
+    "offload, enabled",
+    [
+        ({}, False),
+        ({"pin_memory": True}, False),
+        ({"device": "none"}, False),
+        ({"device": "cpu"}, True),
+    ],
+)
+def test_engine_and_client_stripper_agree(offload, enabled):
+    ds_config = _cfg(offload)
+    assert _optimizer_cpu_offload_enabled(ds_config) is enabled
+    assert _stripper_keeps_optimizer_offload(ds_config) is enabled
