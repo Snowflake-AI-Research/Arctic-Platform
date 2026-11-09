@@ -186,6 +186,7 @@ class Glm5NextForConditionalGenerationPrimeRL(
                     route_scale=text_config.routed_scaling_factor,
                     score_before_experts=False,
                     fp32_router_logits=fp32_parity,
+                    fp32_routed_weighting=getattr(config, "fp32_routed_weighting", False),
                     top_k=text_config.num_experts_per_tok,
                     load_balance_coeff=getattr(
                         text_config,
@@ -215,7 +216,11 @@ class Glm5NextForConditionalGenerationPrimeRL(
 
     @classmethod
     def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
-        return any(".mlp.experts.0.gate_proj.weight" in name for name in state_dict)
+        return any(
+            ".mlp.experts.0.gate_proj.weight" in name
+            or name.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.gate_up_proj.weight"))
+            for name in state_dict
+        )
 
     @classmethod
     def is_prime_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:

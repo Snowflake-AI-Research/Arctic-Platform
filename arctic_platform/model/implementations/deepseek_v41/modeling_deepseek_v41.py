@@ -136,6 +136,7 @@ KEEP_IN_FP32_MODULES = (
     "post_attention_layernorm",
     "norm",
 )
+FP32_PARAMETERS = ("attn_hc", "ffn_hc", "sinks")
 
 
 class DeepseekV41PreTrainedModel(PreTrainedModelPrimeRL):
@@ -174,6 +175,10 @@ class DeepseekV41PreTrainedModel(PreTrainedModelPrimeRL):
     @classmethod
     def keep_in_fp32_for_weight_transfer(cls, name: str) -> bool:
         return any(module_name in name for module_name in KEEP_IN_FP32_MODULES)
+
+    @classmethod
+    def keeps_fp32_parameter(cls, name: str) -> bool:
+        return any(module_name in name for module_name in FP32_PARAMETERS)
 
     @classmethod
     def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
@@ -216,6 +221,12 @@ class DeepseekV41PreTrainedModel(PreTrainedModelPrimeRL):
 
     def convert_to_hf(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:  # type: ignore[override]
         return apply_prime_to_hf(state_dict, self.conversion_chain(self.config))
+
+    def convert_layer_to_hf(self, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:  # type: ignore[override]
+        # The chain skips keys a group does not hold, so one decoder layer or the
+        # top-level group (``layer_idx == -1``) goes through it whole. No layer has a hash router to restore.
+        del layer_idx
+        return self.convert_to_hf(state_dict)
 
     def stream_convert_to_prime(self, source_path: Path, output_path: Path) -> None:
         """Write the converted cache shard by shard. The full snapshot never sits in memory."""
@@ -384,6 +395,11 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
+        # The checkpoint stores these in FP32 and the load copies into each parameter's dtype,
+        # so they have to be FP32 before it, whatever dtype the model is built in.
+        for name, param in self.named_parameters():
+            if param.is_floating_point() and self.keeps_fp32_parameter(name):
+                param.data = param.data.float()
 
     def get_decoder(self):
         return self.model
