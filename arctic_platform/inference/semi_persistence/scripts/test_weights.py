@@ -42,12 +42,7 @@ def load(inst: Instance, gpu=0):
     inst.load_weights()
     inst.wake_up_weights()
     inst.repin()
-    # Force a small (4 GiB) weight-restore staging buffer.  This image was
-    # dumped before the empty_cache() fix, so its checkpointed
-    # restore_weights leaves the staging buffer in torch's caching allocator
-    # (not returned to the driver); a large chunk would then starve
-    # wake_up_kv_cache and OOM.  A small chunk stays negligible.
-    inst.plan_restore_weights(max_buffer_bytes=4 * 1024**3)
+    inst.plan_restore_weights()
     inst.restore_weights()
     inst.wake_up_kv_cache()
     inst.generate(conversation, sampling_params)

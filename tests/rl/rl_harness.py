@@ -62,6 +62,8 @@ from transformers import AutoConfig
 from transformers import AutoModelForCausalLM
 from transformers import AutoTokenizer
 
+from arctic_platform.common.ray_server import _WEIGHT_NORM_RTOL
+from arctic_platform.common.weight_checksum import WEIGHT_CHECKSUM_RTOL
 from arctic_platform.rl import ArcticRLClientConfig
 from arctic_platform.rl import create_arctic_rl_client
 from arctic_platform.rl import ray_cluster
@@ -385,7 +387,35 @@ def response_region(logprobs: torch.Tensor, zorro_enable: bool, prompt_len: int,
     return logprobs[:, prompt_len - 1 : prompt_len + response_len - 1]
 
 
-def assert_weight_norms_match(norms: dict, tag: str = "", rtol: float = 1e-3) -> tuple[float, float]:
+def assert_weight_sync_checksum(sync: dict, tag: str = "") -> float:
+    """Every sampler TP rank received exactly the full tensors the trainer sent. Returns ``sent_l2_sq``.
+
+    ``sent_l2_sq`` / ``recv_l2_sq`` square the same tensors with the same kernel on both sides, so the server's
+    ``checksum_rtol`` only covers float64 summation order. Each value is re-checked here rather than trusting the flag.
+    """
+    assert sync.get("checksum_match") is True, (
+        f"{tag}: weight sync did not prove delivery -- {sync.get('checksum_error')} "
+        f"(sent={sync.get('sent_l2_sq')} recv={sync.get('recv_l2_sq')})"
+    )
+    assert sync["checksum_rtol"] == WEIGHT_CHECKSUM_RTOL, f"{tag}: checksum_rtol {sync['checksum_rtol']}"
+    sent = sync["sent_l2_sq"]
+    assert math.isfinite(sent) and sent > 0, f"{tag}: bad sent_l2_sq {sent}"
+    received = sync["recv_l2_sq"]
+    assert received, f"{tag}: no sampler rank reported recv_l2_sq"
+    for rank, value in received.items():
+        assert math.isclose(
+            value, sent, rel_tol=WEIGHT_CHECKSUM_RTOL, abs_tol=0.0
+        ), f"{tag}: {rank} received {value!r}, trainer sent {sent!r}"
+    return sent
+
+
+def assert_weight_norms_available(norms: dict, tag: str = "") -> dict:
+    """``weight_norm`` reports an unavailable diagnostic as ``{error_code, error}``, without norm fields."""
+    assert "error_code" not in norms, f"{tag}: weight norm unavailable -- {norms['error_code']}: {norms.get('error')}"
+    return norms
+
+
+def assert_weight_norms_match(norms: dict, tag: str = "", rtol: float = _WEIGHT_NORM_RTOL) -> tuple[float, float]:
     """A weight sync makes the two engines bit-identical, so their global L2 norms must agree.
 
     The norm is sqrt of the sum of squares over all params -- invariant to how each engine sublays/fuses its weights
@@ -393,6 +423,7 @@ def assert_weight_norms_match(norms: dict, tag: str = "", rtol: float = 1e-3) ->
     The engines legitimately report different ``num_params`` (vLLM fuses QKV / gate_up), so the counts are surfaced
     in the failure message but intentionally not asserted equal. Returns ``(training_norm, sampling_norm)``.
     """
+    assert_weight_norms_available(norms, tag)
     training = norms["training_norm"]
     sampling = norms["sampling_norm"]
     assert math.isfinite(training) and training > 0, f"{tag}: bad training_norm {training}"

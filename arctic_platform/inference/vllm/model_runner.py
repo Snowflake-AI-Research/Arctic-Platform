@@ -115,6 +115,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
     _orig_sample_tokens = GPUModelRunner.sample_tokens
     _orig_initialize_kv_cache = GPUModelRunner.initialize_kv_cache
     _orig_reload_weights = GPUModelRunner.reload_weights
+    _orig_determine_batch_execution_and_padding = (
+        GPUModelRunner._determine_batch_execution_and_padding
+    )
 
     def init_routed_experts_capturer(self):
         from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -168,8 +171,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         )
         if ulysses_sequence_parallel_size > 1:
             self.use_ulysses = True
+            # vLLM 0.32 removed the torch.compile sequence-parallel pass, and
+            # with it PassConfig.enable_sp. Keep the guard for a config that
+            # still carries the flag.
             pass_config = vllm_config.compilation_config.pass_config
-            if pass_config.enable_sp:
+            if getattr(pass_config, "enable_sp", False):
                 raise ValueError(
                     "Ulysses sequence parallelism is incompatible with native "
                     "sequence parallelism. Set enable_sequence_parallelism "
@@ -196,6 +202,15 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             self.speculative_config = arctic_speculative_config
             self.num_spec_tokens = getattr(self.speculative_config,
                                            "num_speculative_tokens", 0)
+            self.prev_num_spec_tokens = self.num_spec_tokens
+            self.use_async_spec_decode = (
+                self.use_async_scheduling and self.num_spec_tokens > 0
+            )
+            draft_config = self.speculative_config.draft_model_config
+            self.effective_drafter_max_model_len = (
+                draft_config.max_model_len if draft_config is not None
+                else self.max_model_len
+            )
             self.uniform_decode_query_len = 1 + self.num_spec_tokens
 
             if not hasattr(self, "draft_token_ids_cpu") or self.draft_token_ids_cpu is None:
@@ -228,7 +243,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 else:
                     raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
-                self.rejection_sampler = RejectionSampler(self.sampler)
+                self.rejection_sampler = RejectionSampler(
+                    self.sampler, self.speculative_config, self.device
+                )
 
         if (self.speculative_config is not None and
                 getattr(self.speculative_config, "enable_suffix_decoding", False)):
@@ -391,11 +408,20 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         return attn_metadata, spec_decode_common_attn_metadata
 
-    # set padding for SP here
+    # vLLM 0.32 removed GPUModelRunner._pad_for_sequence_parallelism when it
+    # dropped the torch.compile sequence-parallel pass. Ulysses still needs
+    # the token count rounded up to the SP size before cudagraph dispatch,
+    # including eager batches that are not padded to a capture size.
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
         sp_size = getattr(self.parallel_config, "ulysses_sequence_parallel_size", 1)
         num_input_tokens = round_up(num_scheduled_tokens, sp_size)
         return num_input_tokens
+
+    def _determine_batch_execution_and_padding(self, num_tokens: int, *args, **kwargs):
+        num_tokens = self._pad_for_sequence_parallelism(num_tokens)
+        return self._orig_determine_batch_execution_and_padding(
+            num_tokens, *args, **kwargs
+        )
 
     def profile_run(self, randomize_inputs: bool = False) -> None:
         self._orig_profile_run(randomize_inputs=randomize_inputs)
@@ -1352,7 +1378,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             sampler_output.sampled_token_ids, scheduler_output)
 
         self._draft_token_ids = None
+        self._draft_probs = None
+        self._draft_prob_req_ids = None
         self._draft_token_req_ids = None
+        self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(
@@ -1748,7 +1777,12 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         return async_output
 
-    def load_model(self, load_dummy_weights: bool = False) -> None:
+    def load_model(
+        self,
+        load_dummy_weights: bool = False,
+        *,
+        model=None,
+    ) -> None:
         load_shift_model = bool(
             getattr(self.vllm_config.parallel_config, "enable_shift_parallel", False)
         )
@@ -1756,7 +1790,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         if load_shift_model:
             shift_config = copy.deepcopy(self.vllm_config)
 
-        self._orig_load_model(load_dummy_weights)
+        self._orig_load_model(load_dummy_weights, model=model)
 
         if getattr(self.parallel_config, "ulysses_sequence_parallel_size", 1) > 1:
             self.monkeypatch_forward()

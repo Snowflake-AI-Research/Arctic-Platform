@@ -228,7 +228,7 @@ def _glm53_flash():
         linear_num_heads=64,
         linear_head_dim=128,
         linear_conv_kernel_dim=4,
-        layer_types=["deepseek_sparse_attention" if i in sparse else "linear_attention" for i in range(45)],
+        layer_types=["indexed_attention" if i in sparse else "linear_attention" for i in range(45)],
         mlp_layer_types=["dense"] * 3 + ["sparse"] * 42,
         indexer_types=["full"] * 45,
     )

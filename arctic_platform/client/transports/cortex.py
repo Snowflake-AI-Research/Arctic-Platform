@@ -76,7 +76,7 @@ _OPERATION_ENVELOPE_OVERHEAD_BYTES = 4096
 _CHUNK_GROUP_RESTART_REQUIRED = "chunk_group_restart_required"
 _CHUNK_GROUP_ERROR_CODES = {_CHUNK_GROUP_RESTART_REQUIRED, "chunk_group_conflict", "chunk_group_missing_chunks"}
 _JOB_NOT_FOUND_CODE = "517601"
-_JOB_TERMINAL = ("failed", "done", "cancelled", "canceled")
+_JOB_TERMINAL = ("failed", "done", "cancelled", "canceled", "terminated")
 _REQUEST_DONE = ("completed", "done", "succeeded")
 _REQUEST_FAILED = ("failed", "cancelled", "canceled")
 # JobHandles role -> Cortex sub-job job_type name.
@@ -113,7 +113,7 @@ def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dic
     """DSSST1 octet bodies, one send per chunk; ``wire_op`` labels the chunk envelope."""
 
     def encode(request: Request, body: dict) -> list[Send]:
-        frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
+        frame = _training_frame(body) if wire_op == "fwd-bwd" else wire.dumps(body, metadata=_CHUNKED_RESULTS)
         chunks = wire.encode_byte_chunks(
             frame, kind="request", operation=wire_op, max_bytes=_MAX_OCTET_BYTES, force_chunk=force_chunk
         )
@@ -174,7 +174,7 @@ def _forward(request: Request, body: dict) -> list[Send]:
     final POST answers with a request_id -- the earlier ones report the chunk
     was cached -- so they must be posted in order and the last reply kept.
     """
-    frame = wire.dumps(body, metadata=_CHUNKED_RESULTS)
+    frame = _training_frame(body)
     max_json_bytes = _OPERATION_MAX_JSON_BYTES
     chunks = wire.encode_byte_chunks(
         frame,
@@ -500,6 +500,14 @@ def _response_error_code(body: Any) -> str | None:
     return None
 
 
+def _response_error_message(body: Any) -> str | None:
+    for candidate in _iter_error_dicts(body):
+        message = candidate.get("message")
+        if isinstance(message, str) and message.strip():
+            return message
+    return None
+
+
 async def _raise_for_status(resp: Any) -> None:
     """Raise for an error response, keeping the server's error body in the message.
 
@@ -507,6 +515,9 @@ async def _raise_for_status(resp: Any) -> None:
     line, which turns an actionable rejection into a guessing game. Stays a
     `ClientResponseError` (carrying `status`) so `_is_transient` keeps classifying
     it. A chunk-group error raises `_ChunkGroupError` instead.
+
+    The error also carries the body's ``error_code`` and ``error_message``, so a
+    caller can report the server's explanation without the request URL.
     """
     import aiohttp
 
@@ -523,6 +534,7 @@ async def _raise_for_status(resp: Any) -> None:
         headers=resp.headers,
     )
     error.error_code = _response_error_code(body)
+    error.error_message = _response_error_message(body)
     raise error
 
 
@@ -546,6 +558,7 @@ class CortexTransport(Transport):
         self._roles: list[str] = []
         self._owns_job = False
         self._awaiting_job_visibility = False
+        self._router_replay_sampling_ids: dict[tuple[str, str], str] = {}
         self.poll_interval = 0.5
         self._start_loop()
 
@@ -618,14 +631,15 @@ class CortexTransport(Transport):
 
     def _call(self, request: Request, route: _Route | None = None) -> Any:
         route, future = self._submit(request, route)
-        return route.finish(*future.result())
+        return self._finish(request, route, *future.result())
 
     async def acall(self, request: Request) -> Any:
         route, future = self._submit(request)
-        return route.finish(*await asyncio.wrap_future(future))
+        return self._finish(request, route, *await asyncio.wrap_future(future))
 
     def _submit(self, request: Request, route: _Route | None = None) -> tuple[_Route, Future]:
         route = route or _route(request.op)
+        request = self._router_replay_request(request)
         url, sends = route.prepare(self._prefix, request)
         return route, self._on_loop(self._deliver(route, request, url, sends))
 
@@ -792,6 +806,29 @@ class CortexTransport(Transport):
             await self._session.close()
             self._session = None
 
+    def _finish(self, request: Request, route: _Route, chunks: list[bytes], result: dict) -> Any:
+        reply = route.finish(chunks, result)
+        if request.op == "operation" and request.body.get("operation_type") == "bootstrap-router-replay":
+            sampling_id = reply.get("sampling_job_id")
+            if sampling_id:
+                payload = request.body["payload"]
+                pair = (str(payload["target_sub_job_id"]), str(payload["source_sub_job_id"]))
+                self._router_replay_sampling_ids[pair] = str(sampling_id)
+        return reply
+
+    def _router_replay_request(self, request: Request) -> Request:
+        if request.op not in {"forward-backward", "forward"}:
+            return request
+        replay = request.body.get("router_replay")
+        if not isinstance(replay, dict) or not replay.get("sampling_job_id"):
+            return request
+        pair = (str(request.job_id), str(replay["sampling_job_id"]))
+        sampling_id = self._router_replay_sampling_ids.get(pair)
+        if sampling_id is None:
+            return request
+        # Bootstrap resolves public Cortex tokens to zone IDs; the frame must use that same pair.
+        return replace(request, body={**request.body, "router_replay": {**replay, "sampling_job_id": sampling_id}})
+
 
 def _clock(seconds: float) -> str:
     total = int(seconds)
@@ -854,3 +891,13 @@ def _decode_result(result: dict, chunks: Sequence[bytes] = ()) -> Any:
     if "metrics" in result:
         decoded["metrics"] = {**decoded.get("metrics", {}), **result["metrics"]}
     return decoded
+
+
+def _training_frame(body: dict) -> bytes:
+    """Keep replay coordination in the metadata the zone reads, outside the model batch."""
+    batch = dict(body)
+    metadata = dict(_CHUNKED_RESULTS)
+    replay = batch.pop("router_replay", None)
+    if replay is not None:
+        metadata["router_replay"] = replay
+    return wire.dumps(batch, metadata=metadata)
