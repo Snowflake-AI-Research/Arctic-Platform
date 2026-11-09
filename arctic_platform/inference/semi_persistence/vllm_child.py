@@ -2870,8 +2870,9 @@ def _prepare_worker_dump(worker):
     # PSM (IB/EFA) shm: do NOT munmap -- the mapping may still be referenced by
     # a live provider thread even after NCCL teardown, so munmap SIGSEGVs the
     # worker.  Instead unlink the /dev/shm/psm_* file while keeping the mapping;
-    # the inode stays alive so the worker is unaffected, and CRIU then captures
-    # the mapping as anonymous memory (no file to reopen on restore).
+    # the inode stays alive so the worker is unaffected, and CRIU then carries
+    # the file inside the image as a ghost (no file to reopen on restore).  The
+    # ghost must fit criu's --ghost-limit; see _shm_ghost_limit in worker.py.
     removed_psm = _unlink_paths(own_psm)
     return {"closed_fds": closed_fds, "unmapped": unmapped,
             "removed_psm": removed_psm,

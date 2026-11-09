@@ -733,6 +733,56 @@ def _dump_slot():
             os.close(fd)
 
 
+# criu's own default for --ghost-limit (DEFAULT_GHOST_LIMIT in cr_options.h).
+_CRIU_DEFAULT_GHOST_LIMIT = 1 << 20
+# tmpfs may back a file with 2 MiB huge pages, so its st_blocks can run past
+# the last mapped 4 KiB page up to the next 2 MiB boundary.
+_GHOST_LIMIT_ALIGN = 2 << 20
+
+
+def _shm_ghost_limit(pids, proc="/proc"):
+    """The ``--ghost-limit`` that lets criu carry every deleted ``/dev/shm``
+    file *pids* still map.
+
+    prepare_criu_dump unlinks the tree's ``sem.*`` and each rank its ``psm_*``
+    while the mappings stay, and criu stores a deleted file that is mapped
+    ``MAP_SHARED`` as a ghost file inside the image -- the only form that
+    restores on another pod, since nothing else keeps a copy.  criu refuses a
+    ghost whose allocated size (``st_blocks * 512``) exceeds the limit, 1 MiB
+    by default ("Can't dump ghost file ... increase limit").  vLLM's response
+    rings are ten 24 MiB chunks each, and their allocated part grows with the
+    largest message a rank has sent: with router replay, rank 0's outputs
+    carry every token's routed experts and pass 1 MiB.
+
+    No file can have more allocated than its mapped extent, rounded up to a
+    huge page, so the largest extent bounds every ghost these unlinks create.
+    criu copies a ghost by SEEK_DATA, so the image carries only what is
+    allocated, not the extent.
+    """
+    extent = 0
+    for pid in pids:
+        try:
+            with open(f"{proc}/{pid}/maps") as handle:
+                for line in handle:
+                    parts = line.split(None, 5)
+                    if len(parts) < 6:
+                        continue
+                    path = parts[5].strip()
+                    if not (path.startswith("/dev/shm/")
+                            and path.endswith("(deleted)")):
+                        continue
+                    try:
+                        start, end = (int(x, 16) for x in parts[0].split("-"))
+                        offset = int(parts[2], 16)
+                    except ValueError:
+                        continue
+                    extent = max(extent, offset + end - start)
+        except OSError:
+            continue
+    extent = -(-extent // _GHOST_LIMIT_ALIGN) * _GHOST_LIMIT_ALIGN
+    return max(_CRIU_DEFAULT_GHOST_LIMIT, extent)
+
+
 def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
                       meta_extra=None):
     """Dump the vLLM child process tree to disk via CRIU (destructive).
@@ -773,7 +823,8 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
     # live one back with --inherit-fd under this name.
     stdout_resource = _resolve_fd_resource(child_pid, 1)
     stray_stdio = []
-    for scan_pid in _get_descendant_pids(child_pid) + [child_pid]:
+    tree_pids = _get_descendant_pids(child_pid) + [child_pid]
+    for scan_pid in tree_pids:
         proc_fd_dir = f"/proc/{scan_pid}/fd"
         try:
             fd_names = os.listdir(proc_fd_dir)
@@ -842,6 +893,7 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
         "--tcp-close",
         "--ext-unix-sk",
         "--link-remap",
+        "--ghost-limit", str(_shm_ghost_limit(tree_pids)),
         "--libdir", empty_libdir,
         "-v4",
     ]
