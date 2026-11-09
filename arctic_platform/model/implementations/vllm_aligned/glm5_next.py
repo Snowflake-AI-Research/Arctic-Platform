@@ -186,6 +186,80 @@ def causal_topk(positions: torch.Tensor, width: int) -> torch.Tensor:
     return rows
 
 
+INDEXER_K_NORM_EPS = 1e-6
+INDEXER_PADDED_HEADS = 32
+
+
+def indexer_topk(indexer: Any, x: torch.Tensor, q_c: torch.Tensor, positions: torch.Tensor, cu_seqlens: torch.Tensor,
+                 config: Any, width: int) -> torch.Tensor:  # fmt: skip
+    """vLLM's kpool sparse-indexer top-k for whole prompts: ``[tokens, width]`` request-relative token ids, ``-1`` padded.
+
+    A token whose position is below ``index_topk`` gets its causal row (every earlier token). The others score the
+    request's complete pools (``(pos + 1) // index_kpool`` of them) as the sampler's prefill does: ``wq_b`` and the
+    fused ``[wk; weights_proj]`` projection by the batch-invariant matmul, the fp32 head weights by the bf16-operand
+    batch-invariant matmul, the key LayerNorm, the Hadamard-rotated FP8 query, the softmax(gate + ape)-weighted pool
+    compression to FP8, DeepGEMM's FP8 MQA logits, the deterministic top ``index_topk // index_kpool`` pools, and
+    their expansion to tokens with the incomplete pool's tail appended.
+    """
+    import torch.nn.functional as F
+    from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
+    from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
+
+    from arctic_platform.inference.vllm.batch_invariant_fp32_logits import matmul_fp32_out
+    from arctic_platform.inference.vllm.glm5_batch_invariance import deterministic_topk
+
+    topk_tokens, kpool = config.index_topk, config.index_kpool
+    out = causal_topk(positions, width)
+    long_rows = torch.nonzero(positions >= topk_tokens).flatten()
+    if long_rows.numel() == 0:
+        return out
+    if getattr(config, "index_rope_head_dim", 0) or getattr(config, "qk_rope_head_dim", 0):
+        raise NotImplementedError("vLLM-aligned sparse indexer covers mla_use_nope (no rotary embedding)")
+    tokens = x.shape[0]
+    head_dim, n_head = indexer.wk.weight.shape[0], indexer.weights_proj.weight.shape[0]
+
+    q = ops.linear_kernel(q_c, indexer.wq_b.weight).view(tokens, n_head, head_dim)
+    kw = ops.linear_kernel(x, torch.cat([indexer.wk.weight, indexer.weights_proj.weight]))
+    weights = matmul_fp32_out(x, indexer.weights_proj.weight.t().contiguous())
+    k = F.layer_norm(kw[:, :head_dim].float(), (head_dim,), indexer.k_norm.weight.float(),
+                     indexer.k_norm.bias.float(), INDEXER_K_NORM_EPS).to(kw.dtype)  # fmt: skip
+    q_fp8, q_scale = kpool_ops.fwht128_quant_fp8(q.reshape(-1, head_dim))
+    q_fp8, q_scale = q_fp8.view(tokens, n_head, head_dim), q_scale.view(tokens, n_head, 1)
+    weights = (weights.unsqueeze(-1) * q_scale * (head_dim**-0.5 * n_head**-0.5)).squeeze(-1)
+    gate_score = F.linear(x, indexer.index_kpool_compress_gate)
+    if n_head < INDEXER_PADDED_HEADS:
+        pad = INDEXER_PADDED_HEADS - n_head
+        q_fp8 = torch.cat([q_fp8, q_fp8.new_zeros(tokens, pad, head_dim)], dim=1)
+        weights = torch.cat([weights, weights.new_zeros(tokens, pad)], dim=1)
+
+    starts, lengths = cu_seqlens[:-1].long(), (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+    pools = lengths // kpool
+    pool_starts = torch.cumsum(pools, 0) - pools
+    seq = torch.repeat_interleave(torch.arange(pools.numel(), device=x.device), pools)
+    first = starts[seq] + kpool * (torch.arange(int(pools.sum()), device=x.device) - pool_starts[seq])
+    slots = first[:, None] + torch.arange(kpool, device=x.device)[None, :]
+    k_pool, k_scale = kpool_ops.kpool_compress_and_write_cache(
+        torch.empty((1, 64, head_dim + 4), dtype=torch.uint8, device=x.device),
+        k[slots], gate_score[slots], indexer.index_kpool_compress_ape.float(),
+        torch.zeros(slots.shape[0], dtype=torch.int64, device=x.device), pool_size=kpool, head_dim=head_dim,
+        round_scale=True, return_compressed=True, write_cache=False,
+    )  # fmt: skip
+
+    seq_of_token = torch.repeat_interleave(torch.arange(lengths.numel(), device=x.device), lengths)[long_rows]
+    ks = pool_starts[seq_of_token].to(torch.int32)
+    ke = ks + ((positions[long_rows] + 1) // kpool).to(torch.int32)
+    logits = fp8_fp4_mqa_logits((q_fp8[long_rows], None), (k_pool, k_scale), weights[long_rows], ks, ke,
+                                clean_logits=False)  # fmt: skip
+    pool_topk = torch.empty((long_rows.numel(), topk_tokens // kpool), dtype=torch.int32, device=x.device)
+    deterministic_topk(logits, ks, ke, topk_tokens // kpool, pool_topk)
+    expanded = kpool_ops.expand_pools_and_append_tail(pool_topk.to(torch.int64),
+                                                      (positions[long_rows] + 1).to(torch.int32), kpool)  # fmt: skip
+    rows = torch.full((long_rows.numel(), width), -1, dtype=torch.int32, device=x.device)
+    rows[:, : expanded.shape[-1]] = expanded.to(torch.int32)
+    out[long_rows] = rows
+    return out
+
+
 def mla_kv_up_weights(kv_b_proj: Any, config: Any) -> tuple[torch.Tensor, torch.Tensor]:
     """vLLM's absorbed MLA weights from ``kv_b_proj``: ``W_UK_T [N, P, L]`` and ``W_UV [N, L, V]``."""
     heads, latent = config.num_attention_heads, config.kv_lora_rank
@@ -229,8 +303,6 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     if not getattr(config, "mla_use_nope", True) and config.qk_rope_head_dim:
         raise NotImplementedError("vLLM-aligned sparse MLA covers mla_use_nope (no rotary embedding)")
     starts, lengths = cu_seqlens[:-1], cu_seqlens[1:] - cu_seqlens[:-1]
-    if int(lengths.max()) > config.index_topk:
-        raise NotImplementedError("vLLM-aligned sparse MLA: prompts longer than index_topk need the indexer (not in)")
     heads, latent, rope = config.num_attention_heads, config.kv_lora_rank, config.qk_rope_head_dim
     nope, value = config.qk_nope_head_dim, config.v_head_dim
     tokens = x.shape[0]
@@ -251,7 +323,7 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     torch.bmm(q_nope.transpose(0, 1), w_uk_t, out=q_latent.transpose(0, 1))
 
     seq_of_token = torch.repeat_interleave(torch.arange(starts.numel(), device=x.device), lengths)
-    topk = causal_topk(positions, topk_buffer_width(config))
+    topk = indexer_topk(attn.indexer, x, q_c, positions, cu_seqlens, config, topk_buffer_width(config))
     rows = torch.where(topk >= 0, topk + starts.to(torch.int32)[seq_of_token, None], topk)
     valid = (topk >= 0).sum(-1).to(torch.int32)
     kv_rows = torch.cat([kv_c, k_pe], dim=-1)
