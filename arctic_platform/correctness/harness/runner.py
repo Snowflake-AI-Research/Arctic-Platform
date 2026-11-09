@@ -22,6 +22,7 @@ and reconstructed inputs before allocating any target GPUs. Normal-workload refe
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -69,6 +70,26 @@ from .config import validate_first_two_model_dtype
 from .registry import TestOutcome
 from .registry import TestResult
 from .registry import registered_tests
+
+
+def supports_dense_checkpoint_allocation(cfg: LoadedConfig) -> bool:
+    ds_config = cfg.training.get("ds_config") or {}
+    expert = ds_config.get("expert_parallel") or {}
+    tensor = ds_config.get("tensor_parallel") or {}
+    return bool(
+        not cfg.is_rl
+        and not cfg.training.get("peft_config")
+        and cfg.sp_size == 1
+        and cfg.dp_size == cfg.n_gpus
+        and cfg.training.get("ep_size", 1) == 1
+        and isinstance(expert, dict)
+        and not expert.get("enabled", False)
+        and expert.get("ep_size", 1) == 1
+        and expert.get("autoep_size", 1) == 1
+        and not ds_config.get("moe")
+        and isinstance(tensor, dict)
+        and tensor.get("tp_size", 1) == 1
+    )
 
 
 @dataclass
@@ -456,27 +477,14 @@ def execute(
         from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
         from arctic_platform.correctness.harness.optimizer import validate_dense_checkpoint_allocation
 
-        ds_config = cfg.training.get("ds_config") or {}
-        expert = ds_config.get("expert_parallel") or {}
-        tensor = ds_config.get("tensor_parallel") or {}
         if (
             not local_cortex_fixture
             or prepare_references
-            or cfg.is_rl
-            or cfg.training.get("peft_config")
+            or not supports_dense_checkpoint_allocation(cfg)
             or not isinstance(client_backend, CortexConfig)
             or not select
             or "single-step-optimizer" not in select
             or not set(select) <= {"single-step-grads", "single-step-optimizer"}
-            or cfg.sp_size != 1
-            or cfg.dp_size != cfg.n_gpus
-            or not isinstance(expert, dict)
-            or expert.get("enabled", False)
-            or expert.get("ep_size", 1) != 1
-            or expert.get("autoep_size", 1) != 1
-            or ds_config.get("moe")
-            or not isinstance(tensor, dict)
-            or tensor.get("tp_size", 1) != 1
             or native_optimizer_scope is not None
             or native_optimizer_scope_source is not None
             or native_optimizer_supplier_source is not None
@@ -1005,6 +1013,18 @@ def execute(
                         "minimum_gate": 0.001,
                     },
                 }
+                reviewed_gate = optimizer_settings.get("reviewed_absolute_gate")
+                if reviewed_gate is not None:
+                    if (
+                        type(reviewed_gate) not in {int, float}
+                        or not math.isfinite(reviewed_gate)
+                        or reviewed_gate <= 0
+                    ):
+                        raise ValueError("reviewed optimizer absolute gate must be positive and finite")
+                    compact["optimizer_norm_gate"]["absolute"] = reviewed_gate
+                    compact["optimizer_norm_gate"]["provenance"].update(
+                        calibrated_gate=absolute, reviewed_absolute_gate=reviewed_gate
+                    )
             for test_id, identity in identities.items():
                 if test_id not in records:
                     records[test_id] = compact

@@ -1451,6 +1451,234 @@ def test_placement_widths_a_multiple_below_one_is_refused() -> None:
         scaled_for_placement(arms_for(8192, 4), 0)
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"is_rl": True},
+        {"peft_config": {"r": 8}},
+        {"sp_size": 2},
+        {"dp_size": 8},
+        {"ep_size": 2},
+        {"ds_config": {"expert_parallel": {"enabled": True}}},
+        {"ds_config": {"expert_parallel": {"ep_size": 2}}},
+        {"ds_config": {"expert_parallel": {"autoep_size": 2}}},
+        {"ds_config": {"expert_parallel": "invalid"}},
+        {"ds_config": {"tensor_parallel": {"tp_size": 2}}},
+        {"ds_config": {"tensor_parallel": "invalid"}},
+        {"ds_config": {"moe": {"enabled": True}}},
+    ],
+)
+def test_automatic_dense_placement_excludes_every_runner_layout(change):
+    from arctic_platform.correctness.harness.runner import supports_dense_checkpoint_allocation
+
+    cfg = SimpleNamespace(is_rl=False, sp_size=1, dp_size=16, n_gpus=16, training={"ds_config": {}})
+    for key, value in change.items():
+        if key in {"peft_config", "ep_size", "ds_config"}:
+            cfg.training[key] = value
+        else:
+            setattr(cfg, key, value)
+    assert not supports_dense_checkpoint_allocation(cfg)
+
+
+def test_automatic_dense_placement_accepts_only_ordinary_full_width_dense():
+    from arctic_platform.correctness.harness.runner import supports_dense_checkpoint_allocation
+
+    for width in (8, 16):
+        cfg = SimpleNamespace(is_rl=False, sp_size=1, dp_size=width, n_gpus=width, training={"ds_config": {}})
+        assert supports_dense_checkpoint_allocation(cfg)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "arctic_platform.common.deepspeed_engine",
+        "deepspeed.runtime.constants",
+        "deepspeed.runtime.engine",
+        "loaded_callables",
+    ],
+)
+def test_owned_runtime_admission_requires_shared_defaults_and_engine_inventory(missing):
+    from arctic_platform.correctness.harness import engine_admission
+
+    sources = {
+        name: {"path": "/runtime/" + name + ".py", "sha256": "a" * 64} for name in engine_admission._RUNTIME_MODULES
+    }
+    sources["loaded_callables"] = {name: "b" * 64 for name in engine_admission._RUNTIME_CALLABLES}
+    engine_admission._validate_runtime_sources(sources)
+    del sources[missing]
+    with pytest.raises(ValueError, match="complete runtime source"):
+        engine_admission._validate_runtime_sources(sources)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("RANK", "16"),
+        ("WORLD_SIZE", "8"),
+        ("DSS_RANK_HOST", "other"),
+        ("DSS_RANK_GPU_ID", "7"),
+        ("CUDA_VISIBLE_DEVICES", "0,1"),
+    ],
+)
+def test_owned_runtime_admission_rejects_actual_worker_rank_drift(monkeypatch, field, value):
+    from arctic_platform.correctness.harness import engine_admission
+
+    for key, item in {
+        "RANK": "0",
+        "WORLD_SIZE": "16",
+        "DSS_RANK_HOST": "head",
+        "DSS_RANK_GPU_ID": "0",
+        "CUDA_VISIBLE_DEVICES": "0",
+    }.items():
+        monkeypatch.setenv(key, item)
+    monkeypatch.setenv(field, value)
+    monkeypatch.setattr(
+        engine_admission, "verify_runtime_node", lambda *args: pytest.fail("drift must precede import")
+    )
+    admission = {"nodes": [{"host": "head", "slots": 8}]}
+    with pytest.raises(ValueError, match="actual worker rank"):
+        engine_admission.verify_worker_runtime({"job_id": "native-child"}, admission, [("head", 0)] * 16, 16, 1)
+
+
+def test_owned_runtime_admission_rejection_precedes_native_worker_constructor(monkeypatch):
+    from arctic_platform.correctness.harness import engine_admission
+
+    events = []
+
+    class NativeWorker:
+        def __init__(self, cfg):
+            events.append("native")
+
+    def reject(*args):
+        events.append("admission")
+        raise ValueError("runtime drift")
+
+    monkeypatch.setattr(engine_admission, "verify_worker_runtime", reject)
+    worker = decoder.participation_worker_class(
+        NativeWorker, runtime_admission={"nodes": []}, runtime_ranks=[], runtime_world_size=16, runtime_sp_size=1
+    )
+    with pytest.raises(ValueError, match="runtime drift"):
+        worker({"job_id": "native-child"})
+    assert events == ["admission"]
+
+
+@pytest.mark.parametrize("change", ["width", "sp", "child", "payload"])
+def test_owned_runtime_admission_final_request_rejects_drift(change):
+    from arctic_platform.correctness.harness import engine_admission
+
+    cfg = {
+        "job_id": "native-child",
+        "training_config": {"ds_config": {"checkpoint": {"use_node_local_storage": True}}},
+    }
+    admission = {
+        "training_child_id": "native-child",
+        "runtime_request": {"payload": deepcopy(cfg), "n_gpus": 16, "sp_size": 1},
+    }
+    width, sp_size = 16, 1
+    if change == "width":
+        width = 8
+    elif change == "sp":
+        sp_size = 2
+    elif change == "child":
+        cfg["job_id"] = "other-child"
+    else:
+        cfg["training_config"]["ds_config"]["checkpoint"]["use_node_local_storage"] = False
+    with pytest.raises(ValueError, match="final native request"):
+        engine_admission.verify_final_runtime_request(cfg, admission, width, sp_size)
+
+
+def test_owned_runtime_admission_final_request_keeps_only_native_runtime_metadata_outside_identity():
+    from arctic_platform.correctness.harness import engine_admission
+
+    payload = {"job_id": "native-child", "training_config": {"ds_config": {"bf16": {"enabled": True}}}}
+    admission = {
+        "training_child_id": "native-child",
+        "runtime_request": {"payload": deepcopy(payload), "n_gpus": 8, "sp_size": 1},
+    }
+    cfg = {
+        **deepcopy(payload),
+        "master_addr": "allocation-head",
+        "master_port": 12345,
+        "zone_id": "training-zone",
+        "_sp_model_parallelism_metadata": {"ep_size": 1},
+    }
+    cfg["training_config"]["debug"] = {engine_admission.RUNTIME_ADMISSION_KEY: admission}
+    engine_admission.verify_final_runtime_request(cfg, admission, 8, 1)
+    assert engine_admission.runtime_request_from_config(cfg) == admission
+    assert cfg["training_config"]["debug"][engine_admission.RUNTIME_ADMISSION_KEY] == admission
+
+
+@pytest.mark.parametrize("change", [None, "rank", "config", "builder", "missing", "second"])
+def test_owned_runtime_admission_initializer_is_checked_before_engine_creation(monkeypatch, change):
+    from arctic_platform.correctness.harness import engine_admission
+
+    events = []
+
+    def initialize(model, ds_config, *, rank):
+        events.append("engine")
+        return "initialized"
+
+    namespace = {"initialize_training_engine": initialize}
+    training = SimpleNamespace(
+        _DeepSpeedWorker=SimpleNamespace(__init__=SimpleNamespace(__globals__=namespace)),
+        _build_ds_config=object(),
+        TrainingEngineSpec=object(),
+    )
+    monkeypatch.setattr(engine_admission.importlib, "import_module", lambda name: training)
+    monkeypatch.setattr(engine_admission, "_RUNTIME_MODULES", ())
+    monkeypatch.setattr(engine_admission, "_validate_engine_config", lambda cfg: events.append("parsers"))
+    receipt = {"rank": 3, "resolved": {"bf16": {"enabled": True}}, "sources": {}}
+
+    def run():
+        with engine_admission.runtime_engine_scope(receipt):
+            if change == "missing":
+                return
+            if change == "builder":
+                training._build_ds_config = object()
+            rank = 4 if change == "rank" else 3
+            config = {} if change == "config" else deepcopy(receipt["resolved"])
+            assert namespace["initialize_training_engine"](None, config, rank=rank) == "initialized"
+            if change == "second":
+                namespace["initialize_training_engine"](None, config, rank=rank)
+
+    if change is None:
+        run()
+        assert events == ["parsers", "engine"]
+    else:
+        with pytest.raises(ValueError, match="engine initializ"):
+            run()
+        assert events == (["parsers", "engine"] if change == "second" else [])
+    assert namespace["initialize_training_engine"] is initialize
+
+
+def test_owned_runtime_admission_fixture_supervisor_forwards_the_incoming_stream(monkeypatch):
+    from arctic_platform.correctness.harness import cortex
+    from arctic_platform.correctness.harness import inference
+
+    incoming = io.BytesIO(b'{"files":[]}\nfixture bytes')
+    monkeypatch.setattr(cortex.sys, "stdin", SimpleNamespace(buffer=incoming))
+    calls = []
+
+    class Receiver:
+        returncode = 0
+
+        def communicate(self, timeout):
+            assert timeout > 0
+            return b'{"files":[]}', b""
+
+    def launch(argv, **kwargs):
+        calls.append(kwargs)
+        assert kwargs["stdin"] is incoming
+        assert kwargs["stdin"].read().endswith(b"fixture bytes")
+        return Receiver()
+
+    monkeypatch.setattr(cortex.subprocess, "Popen", launch)
+    monkeypatch.setattr(cortex, "_fixture_worker_argv", lambda *args: ["receiver"])
+    monkeypatch.setattr(inference, "_stop_local_children", lambda children: None)
+    cortex._fixture_worker("supervise", {"timeout_s": 30, "deadline_epoch": time.time() + 30})
+    assert len(calls) == 1
+
+
 # Spec.
 
 
@@ -10251,12 +10479,15 @@ def test_reference_observability_keeps_successful_process_logs_when_result_json_
     assert output.read_text() == "{not valid JSON}"
 
 
+@pytest.mark.parametrize("reviewed_gate", [None, 0.001])
 def test_reference_observability_calibration_consumes_completed_runs_without_changing_records(
-    _prepared_reference_runner_prepared_runner, monkeypatch, capsys
+    _prepared_reference_runner_prepared_runner, monkeypatch, capsys, reviewed_gate
 ):
     from arctic_platform.correctness.checks import optimizer_state
 
     control = _prepared_reference_runner_prepared_runner
+    if reviewed_gate is not None:
+        control.spec.test_settings.setdefault("single-step-optimizer", {})["reviewed_absolute_gate"] = reviewed_gate
     control.missing.add(("single-step-optimizer", "gas1"))
     control.record_overrides["single-step-grads", "gas1"] = {"grad_norms": {"layer.weight": 9.0}, "loss": 9.0}
     original_cfg = deepcopy(control.cfg.training)
@@ -10344,7 +10575,7 @@ def test_reference_observability_calibration_consumes_completed_runs_without_cha
     assert measurements["loss"] == 3.0
     assert measurements["grad_norms"] == {"layer.weight": 3.0}
     assert "optimizer_state_manifest" not in measurements
-    assert measurements["optimizer_norm_gate"] == {
+    expected_gate = {
         "criterion": "optimizer-state-l2-norm-v1",
         "absolute": 0.009,
         "status": "reviewed",
@@ -10357,6 +10588,10 @@ def test_reference_observability_calibration_consumes_completed_runs_without_cha
             "minimum_gate": 0.001,
         },
     }
+    if reviewed_gate is not None:
+        expected_gate["absolute"] = reviewed_gate
+        expected_gate["provenance"].update(calibrated_gate=0.009, reviewed_absolute_gate=reviewed_gate)
+    assert measurements["optimizer_norm_gate"] == expected_gate
     cached = control.contexts[0]._reference_by_check["gas1"]
     assert cached["single-step-grads"]["loss"] == 9.0
     assert cached["single-step-grads"]["grad_norms"] == {"layer.weight": 9.0}
@@ -14440,14 +14675,14 @@ def test_local_cortex_optimizer_cli_local_fixture_never_expands_declared_four_gp
     def execute(run_cfg, run_spec, arms, **kwargs):
         assert kwargs["local_cortex_fixture"] is True and kwargs["client_backend"] is backend
         assert run_spec is spec
-        assert arms[0].global_batch_size == 4
+        assert arms[0].global_batch_size == run_cfg.n_gpus
         widths.append(run_cfg.n_gpus)
         return []
 
     monkeypatch.setattr(cli, "execute", execute)
     monkeypatch.setattr(cli, "_finish", lambda *args, **kwargs: 0)
     assert cli.cmd_run(args) == 0
-    assert widths == [cfg.n_gpus] == [4]
+    assert widths == [cfg.n_gpus, 2 * cfg.n_gpus] == [4, 8]
 
 
 @pytest.mark.parametrize(
@@ -14546,9 +14781,9 @@ def test_native_optimizer_owner_split_cli_guarded_forwarding(
     for test_id in selected or []:
         arguments.extend(["--test", test_id])
     assert cli.main(arguments) == 0
-    assert [run_cfg.n_gpus for run_cfg, _ in calls] == ([4] if local_fixture else [4, 8])
+    assert [run_cfg.n_gpus for run_cfg, _ in calls] == [4, 8]
     if expect_native:
-        assert len(owners) == len(calls) == 1
+        assert len(owners) == len(calls) == 2
         for (owner_cfg, bundle), (run_cfg, kwargs) in zip(owners, calls):
             assert owner_cfg is run_cfg
             assert all(kwargs[name] is value for name, value in bundle.items())
@@ -31400,6 +31635,90 @@ def test_onboarding_cached_validation_still_reports_phase_runtime(
     assert output.count("Phase 3/3 run time:") == 1
 
 
+@pytest.mark.parametrize("gate", [0.001, 0.008])
+@pytest.mark.parametrize("failed", [False, True])
+def test_local_cortex_onboarding_retry_preserves_reviewed_gradient_gate(
+    _local_cortex_reference_publication, monkeypatch, gate, failed
+):
+    state = _local_cortex_reference_publication
+    state.spec.applicable_tests = ["single-step-grads"]
+    state.spec.test_tolerances["single-step-grads"] = _fixed_tolerance_onboarding_SPEC.TestTolerance(
+        absolute=gate, calibration_runs=8, status="reviewed original calibration"
+    )
+    state.spec.write(state.args.test_spec)
+    state.frozen = state.args.test_spec.read_bytes()
+    state.failure = "validation" if failed else None
+    monkeypatch.setattr(
+        onboard, "_render_and_run_calibration", lambda *args: pytest.fail("a retry must not recalibrate its gate")
+    )
+
+    def prepare(args):
+        state.events.append("publication")
+        assert args.test_spec.read_bytes() == state.frozen
+        state.record.write_text('{"synthetic": true}')
+        return 0
+
+    monkeypatch.setattr(onboard, "_prepare_references", prepare)
+    if failed:
+        with pytest.raises(RuntimeError, match="validation failed"):
+            onboard._parent(state.args)
+    else:
+        assert onboard._parent(state.args) == 0
+        manifest = json.loads((state.args.output_dir / "onboarding.json").read_text())
+        assert manifest["selected_gate"] == gate
+        calibration = json.loads(Path(manifest["calibration"]).read_text())
+        assert calibration["reused_spec_tolerance"] == json.loads(state.frozen)["test_tolerances"]["single-step-grads"]
+    assert state.events == ["publication", "validation"]
+    assert state.args.test_spec.read_bytes() == state.frozen
+
+
+@pytest.mark.parametrize("gate", [0.001, 0.008])
+def test_local_cortex_fresh_calibration_retains_explicit_reviewed_gate(
+    _local_cortex_reference_publication, monkeypatch, gate
+):
+    state = _local_cortex_reference_publication
+    state.args.reviewed_gate = [("single-step-grads", gate)]
+
+    def prepare(args):
+        state.events.append("publication")
+        spec = ConfigSpec.read(args.test_spec)
+        assert spec.tolerance_for("single-step-grads") == gate
+        assert spec.test_tolerances["single-step-grads"].calibration_runs == onboard.CALIBRATION_RUNS
+        state.frozen = args.test_spec.read_bytes()
+        state.record.write_text('{"synthetic": true}')
+        return 0
+
+    monkeypatch.setattr(onboard, "_prepare_references", prepare)
+    assert onboard._parent(state.args) == 0
+    assert state.events == ["spec", "calibration", "publication", "validation"]
+    manifest = json.loads((state.args.output_dir / "onboarding.json").read_text())
+    calibration = json.loads(Path(manifest["calibration"]).read_text())
+    assert calibration["tolerance"] == {
+        "selected_gate": gate,
+        "calibrated_gate": 0.005,
+        "reviewed_absolute_gate": gate,
+    }
+    assert "reused_spec_tolerance" not in calibration
+
+
+@pytest.mark.parametrize(
+    "value", ["single-step-grads=0", "single-step-grads=nan", "single-step-grads=inf", "other=.001"]
+)
+def test_onboarding_reviewed_gate_rejects_invalid_values(value):
+    with pytest.raises(argparse.ArgumentTypeError):
+        onboard._reviewed_gate_argument(value)
+
+
+def test_onboarding_reviewed_gate_duplicate_and_placement_identity():
+    args = argparse.Namespace(reviewed_gate=[("single-step-grads", 0.008)], gpu_pool=16)
+    assert onboard._reviewed_gate(args, "single-step-grads") == 0.008
+    assert onboard._onboarding_options(args)["gpu_pool"] == 16
+    assert onboard._onboarding_options(args)["reviewed_gate"] == [["single-step-grads", 0.008]]
+    args.reviewed_gate.append(("single-step-grads", 0.016))
+    with pytest.raises(ValueError, match="only one"):
+        onboard._reviewed_gate(args, "single-step-grads")
+
+
 def test_gradient_calibration_announces_expensive_steps_before_starting(_calibration_driver, capsys):
     namespace = _calibration_driver
     original_reference = namespace["run_reference"]
@@ -35954,6 +36273,51 @@ def test_automatic_participation_worker_factory_does_not_allow_second_step():
     with pytest.raises(ValueError):
         worker.step()
     assert all(not parameter._backward_hooks for parameter in worker._engine.module.parameters())
+
+
+@pytest.mark.parametrize("node_local", [False, True])
+@pytest.mark.parametrize("failed", [False, True])
+def test_ordinary_optimizer_save_selects_one_model_writer_and_preserves_all_rank_saves(node_local, failed):
+    calls = []
+    stage_info = object()
+
+    class Worker:
+        def save(self, stage_info, path=None, checkpoint_type="resumable"):
+            calls.append((self.rank, self._engine.save_non_zero_checkpoint, stage_info, path, checkpoint_type))
+            if failed:
+                raise RuntimeError("save failed")
+            return {"version": 0}
+
+    selected = decoder.participation_worker_class(Worker)
+    for rank in range(8):
+        worker = selected()
+        worker.rank, worker.local_rank = rank, rank % 4
+        worker._engine = SimpleNamespace(use_node_local_storage=lambda: node_local, save_non_zero_checkpoint=True)
+        if failed:
+            with pytest.raises(RuntimeError, match="save failed"):
+                worker.save(stage_info, path="/data-fast/checkpoint")
+        else:
+            assert worker.save(stage_info, path="/data-fast/checkpoint") == {"version": 0}
+        assert worker._engine.save_non_zero_checkpoint is True
+    assert calls == [
+        (rank, rank % 4 == 0 if node_local else True, stage_info, "/data-fast/checkpoint", "resumable")
+        for rank in range(8)
+    ]
+
+
+def test_ordinary_optimizer_weights_only_save_keeps_native_writer_selection():
+    stage_info = object()
+    calls = []
+
+    class Worker:
+        def save(self, stage_info, path=None, checkpoint_type="resumable"):
+            calls.append((stage_info, path, checkpoint_type))
+            return {"version": 1}
+
+    worker = decoder.participation_worker_class(Worker)()
+    # Weights-only saves do not require a DeepSpeed engine or the resumable writer predicate.
+    assert worker.save(stage_info, path="/data-fast/weights", checkpoint_type="weights-only") == {"version": 1}
+    assert calls == [(stage_info, "/data-fast/weights", "weights-only")]
 
 
 def test_maintained_native_optimizer_keeps_ordinary_participation_receipts_out_of_native_decode(

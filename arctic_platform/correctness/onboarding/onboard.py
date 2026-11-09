@@ -63,6 +63,24 @@ GATE_SAFETY_FACTOR = 4.0
 OOM_EXIT = 42
 
 
+def _reviewed_gate_argument(value: str) -> tuple[str, float]:
+    try:
+        test_id, raw = value.split("=", 1)
+        gate = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected TEST=positive-finite-absolute-gate") from exc
+    if test_id not in CALIBRATED_TEST_IDS or not math.isfinite(gate) or gate <= 0:
+        raise argparse.ArgumentTypeError("reviewed gate requires a supported test and positive finite value")
+    return test_id, gate
+
+
+def _reviewed_gate(args: argparse.Namespace, test_id: str) -> float | None:
+    gates = getattr(args, "reviewed_gate", None) or []
+    if len(dict(gates)) != len(gates):
+        raise ValueError("each test may have only one --reviewed-gate")
+    return dict(gates).get(test_id)
+
+
 def _stage(phase: str, name: str, detail: str = "") -> None:
     marker = "###" if phase.split()[0].casefold() == "onboarding" else "***"
     print(f"\n{marker} {phase.title()}: {name.title()} {marker}", flush=True)
@@ -1660,6 +1678,9 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
         "optimizer_dtype": config.optimizer_dtype,
         "calibration_metric": criterion,
     }
+    reviewed_gate = _reviewed_gate(args, test_id)
+    if reviewed_gate is not None:
+        spec.test_settings[test_id]["reviewed_absolute_gate"] = reviewed_gate
     spec.applicable_tests = list(dict.fromkeys([*spec.applicable_tests, test_id]))
     ctx = SimpleNamespace(config_id=config.config_id, cfg=config, spec=spec)
     arm_receipts = {}
@@ -1855,6 +1876,8 @@ def _onboard_optimizer_test(args: argparse.Namespace, config) -> int:
             calibration_json = Path(
                 _resume_phase(args, "calibration", lambda: str(_run_local_optimizer_calibration(args, config, spec)))
             )
+            if (getattr(args, "gpu_pool", None) or config.n_gpus) >= 2 * config.n_gpus:
+                _resume_phase(args, "references", lambda: _prepare_references(args))
         selected = {"layers": optimizer_layers}
         with _phase("Phase 3/3", "Target Validation", f"Validating the frozen {optimizer_layers}-layer fixture."):
             validation = _resume_phase(args, "validation", lambda: _run_final_regression(args, selected))
@@ -1967,23 +1990,59 @@ def _parent(args: argparse.Namespace) -> int:
     observations = [selected]
 
     previous_spec = args.test_spec.read_bytes()
+    spec = TestSpec.read(args.test_spec)
+    frozen_tolerance = spec.test_tolerances.get(args.test_id)
     try:
         with _phase(
             "Phase 2/3",
             "Gradient Calibration",
-            f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference runs per GAS arm.",
+            (
+                f"Preserving reviewed tolerance {frozen_tolerance.absolute:.9e} from the frozen specification."
+                if frozen_tolerance is not None
+                else f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference runs per GAS arm."
+            ),
         ):
-            spec = TestSpec.read(args.test_spec)
             spec.applicable_tests = list(dict.fromkeys([*spec.applicable_tests, args.test_id]))
             spec.write(args.test_spec)
-            calibration_json = Path(
-                _resume_phase(
-                    args,
-                    "calibration",
-                    lambda: str(_render_and_run_calibration(args, selected)),
+            if frozen_tolerance is None:
+                calibration_json = Path(
+                    _resume_phase(
+                        args,
+                        "calibration",
+                        lambda: str(_render_and_run_calibration(args, selected)),
+                    )
                 )
-            )
+            else:
+                calibration_json = getattr(args, "_diagnostics_dir", args.output_dir) / "reference-repeatability.json"
+                calibration_json.write_text(
+                    json.dumps(
+                        {
+                            "tolerance": {"selected_gate": frozen_tolerance.absolute},
+                            "reused_spec_tolerance": json.loads(previous_spec)["test_tolerances"][args.test_id],
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
             calibration = json.loads(calibration_json.read_text())
+            reviewed_gate = _reviewed_gate(args, args.test_id)
+            if reviewed_gate is not None:
+                calibrated_gate = calibration["tolerance"]["selected_gate"]
+                if frozen_tolerance is not None and reviewed_gate != frozen_tolerance.absolute:
+                    raise ValueError("a reviewed gate cannot replace an existing frozen gradient gate")
+                calibrated_spec = TestSpec.read(args.test_spec)
+                tolerance = calibrated_spec.test_tolerances[args.test_id]
+                tolerance.absolute = reviewed_gate
+                if frozen_tolerance is None:
+                    tolerance.status += "; acceptance uses the explicitly reviewed absolute gate"
+                calibrated_spec.write(args.test_spec)
+                calibration["tolerance"].update(
+                    calibrated_gate=calibrated_gate,
+                    reviewed_absolute_gate=reviewed_gate,
+                    selected_gate=reviewed_gate,
+                )
+                calibration_json.write_text(json.dumps(calibration, indent=2, sort_keys=True) + "\n")
             if local_fixture:
                 _stage(
                     "Reference",
@@ -2084,6 +2143,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--reference-calibration-runs", type=int, default=CALIBRATION_RUNS)
     parser.add_argument(
+        "--reviewed-gate",
+        action="append",
+        type=_reviewed_gate_argument,
+        help="TEST=absolute gate retained during fresh calibration; repeat once per selected test",
+    )
+    parser.add_argument(
         "--dense-checkpoint-allocation", type=Path, help="same-job local dense optimizer allocation JSON"
     )
     parser.add_argument(
@@ -2134,6 +2199,8 @@ def _prepare_references(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.config import TestSpec
     from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.config import load_config
+    from arctic_platform.correctness.harness.config import placement_widths
+    from arctic_platform.correctness.harness.config import scaled_for_placement
     from arctic_platform.correctness.harness.execution import _client_backend
     from arctic_platform.correctness.harness.runner import execute
     from arctic_platform.correctness.harness.storage import require_git_records_dir
@@ -2159,21 +2226,22 @@ def _prepare_references(args: argparse.Namespace) -> int:
     # Reference-only execution needs the Cortex record format, not a reachable target service.
     backend = _client_backend(args) if configured else CortexConfig(base_url="http://127.0.0.1:1")
     arms = [ArmDefinition(arm.name, arm.global_batch_size, arm.max_seq_len) for arm in spec.arms]
-    execute(
-        config,
-        spec,
-        arms,
-        vocab_size=vocab_size,
-        select=selection,
-        reference_token_budget=args.reference_token_budget,
-        workdir=args.output_dir,
-        prepare_references=True,
-        reference_records_dir=args.reference_records_dir,
-        reference_calibration_runs=args.reference_calibration_runs,
-        reference_calibration_workers=args.reference_calibration_workers,
-        client_backend=backend,
-        peft_adapter=_shared_adapter(args, config),
-    )
+    for width in placement_widths(config.n_gpus, getattr(args, "gpu_pool", None) or config.n_gpus):
+        execute(
+            config.at_gpu_width(width),
+            spec,
+            scaled_for_placement(arms, width // config.n_gpus),
+            vocab_size=vocab_size,
+            select=selection,
+            reference_token_budget=args.reference_token_budget,
+            workdir=args.output_dir / f"gpu{width}" if args.output_dir is not None else None,
+            prepare_references=True,
+            reference_records_dir=args.reference_records_dir,
+            reference_calibration_runs=args.reference_calibration_runs,
+            reference_calibration_workers=args.reference_calibration_workers,
+            client_backend=backend,
+            peft_adapter=_shared_adapter(args, config),
+        )
     return 0
 
 
@@ -2198,6 +2266,8 @@ def _onboarding_options(args: argparse.Namespace) -> dict:
         "reference_token_budget",
         "source_checkpoint",
         "peft_adapter",
+        "gpu_pool",
+        "reviewed_gate",
     )
     return json.loads(json.dumps({name: getattr(args, name, None) for name in names}, default=str))
 
@@ -2318,6 +2388,8 @@ def run(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.config import local_config_path
 
+    for test_id in CALIBRATED_TEST_IDS:
+        _reviewed_gate(args, test_id)
     if args.test_id == "all" and (getattr(args, "prepare_references", False) or args.probe_layers is not None):
         args.test_id = "single-step-grads"
     if args.test_id != "all":

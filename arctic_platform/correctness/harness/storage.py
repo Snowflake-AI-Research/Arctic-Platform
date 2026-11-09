@@ -917,6 +917,9 @@ def workload_identity(ctx, check_id: str, recipe: dict) -> dict:
         "python": platform.python_version(),
         "recipe": recipe,
     }
+    base_width = getattr(ctx.cfg, "placement_base_gpus", None)
+    if base_width is not None and ctx.cfg.n_gpus != base_width:
+        identity["placement_gpus"] = ctx.cfg.n_gpus
     if check_id == "single-step-grads":
         identity["gate"] = asdict(ctx.spec.test_tolerances[check_id])
     elif check_id == "single-step-optimizer":
@@ -1016,6 +1019,11 @@ def _config_dir(ctx, identity: dict) -> Path:
 
 def _record_path(ctx, identity: dict) -> Path:
     directory = _config_dir(ctx, identity) / identity["check_id"]
+    width = identity.get("placement_gpus")
+    if width is not None:
+        if type(width) is not int or width < 1:
+            raise ReferencePrerequisiteError("invalid reference placement width")
+        directory /= f"gpu{width}"
     if identity["check_id"] == "e2e-sft-train-validate":
         return directory / "trajectory.json"
     recipe = identity.get("recipe", {})

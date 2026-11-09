@@ -281,6 +281,7 @@ def local_cortex_gateway(
     *,
     gateway_module: str = "dss.ray_dss.gateway_server",
     allocation_members: dict | None = None,
+    runtime_admission: dict | None = None,
     gateway_command_builder=None,
     gateway_command_source: dict | None = None,
 ) -> Iterator[str]:
@@ -293,6 +294,10 @@ def local_cortex_gateway(
     if allocation_members is not None and gateway_module != "arctic_platform.correctness.harness.gateway":
         raise ValueError("explicit allocation identities require the correctness gateway")
     options = {} if allocation_members is None else {"allocation_members": allocation_members}
+    if runtime_admission is not None:
+        if gateway_module != "arctic_platform.correctness.harness.gateway":
+            raise ValueError("runtime admission requires the correctness-owned gateway")
+        options["runtime_admission"] = deepcopy(runtime_admission)
     if gateway_command_builder is not None or gateway_command_source is not None:
         from arctic_platform.correctness.harness.optimizer import verify_native_callback
 
@@ -315,6 +320,7 @@ def _started_local_cortex_gateway(
     *,
     gateway_module: str = "dss.ray_dss.gateway_server",
     allocation_members: dict | None = None,
+    runtime_admission: dict | None = None,
     gateway_command_builder=None,
     gateway_command_source: dict | None = None,
 ) -> Iterator[str]:
@@ -332,6 +338,8 @@ def _started_local_cortex_gateway(
         prepared = _prepare_gateway_scratch(directory, hostfile, **options)
         os.environ["DSS_CORRECTNESS_TMPDIR"] = prepared["path"]
     command_options = {}
+    if runtime_admission is not None:
+        command_options["runtime_admission"] = runtime_admission
     if gateway_command_builder is not None or gateway_command_source is not None:
         command_options.update(
             gateway_command_builder=gateway_command_builder,
@@ -932,6 +940,7 @@ def _launch_local_cortex_gateway(
     gateway_module: str,
     gateway_command_builder=None,
     gateway_command_source: dict | None = None,
+    runtime_admission: dict | None = None,
 ) -> Iterator[str]:
     import requests
 
@@ -988,6 +997,13 @@ def _launch_local_cortex_gateway(
                     or list(command[-len(options) :]) != options
                 ):
                     raise ValueError("native gateway command builder must preserve interpreter and runtime options")
+            from .engine_admission import RUNTIME_ADMISSION_ENV
+
+            admission_env = (
+                {RUNTIME_ADMISSION_ENV: json.dumps(runtime_admission, sort_keys=True, allow_nan=False)}
+                if runtime_admission is not None
+                else {}
+            )
             process = subprocess.Popen(
                 command,
                 stdout=log,
@@ -998,6 +1014,7 @@ def _launch_local_cortex_gateway(
                     **os.environ,
                     "DSS_CORRECTNESS_GATEWAY_OWNER": token,
                     "SPT_NOENV": "1",
+                    **admission_env,
                 },
             )
             owner = _gateway_process_identity(os.getpid())
@@ -2259,6 +2276,7 @@ def install_checkpoint_routes(gw, store) -> None:
 def main() -> None:
     gateway_server = importlib.import_module("dss.ray_dss.gateway_server")
 
+    from arctic_platform.correctness.harness.engine_admission import gateway_runtime_scope
     from arctic_platform.correctness.harness.lora import gateway_scope
     from arctic_platform.correctness.harness.native_optimizer import install_gateway_route
     from arctic_platform.correctness.harness.storage import NativeCheckpointStore
@@ -2272,7 +2290,7 @@ def main() -> None:
     store = NativeCheckpointStore(Path(hostfiles[0]))
     install_checkpoint_routes(gateway_server, store)
     install_gateway_route(gateway_server)
-    with gateway_scope(gateway_server):
+    with gateway_scope(gateway_server), gateway_runtime_scope(gateway_server, Path(hostfiles[0])):
         gateway_server.main()
 
 

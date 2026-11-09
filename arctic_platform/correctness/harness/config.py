@@ -284,6 +284,7 @@ class LoadedConfig:
     sub_jobs: List[Dict[str, Any]] = field(default_factory=list)
     native: ArcticClientConfig | None = None
     hardware: Literal["H200", "B200", "B300"] | None = None
+    placement_base_gpus: int | None = None
 
     @property
     def training(self) -> Dict[str, Any]:
@@ -430,7 +431,13 @@ class LoadedConfig:
                 update={"training_gpus": gpus, "training": native_training},
                 deep=True,
             )
-        return replace(self, sub_job=sub_job, sub_jobs=sub_jobs, native=native)
+        return replace(
+            self,
+            sub_job=sub_job,
+            sub_jobs=sub_jobs,
+            native=native,
+            placement_base_gpus=self.placement_base_gpus or self.n_gpus,
+        )
 
     @property
     def sp_size(self) -> int:

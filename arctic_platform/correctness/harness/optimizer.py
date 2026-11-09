@@ -911,13 +911,54 @@ def participation_coordinator_class(training):
 
     native_lora = importlib.import_module("arctic_platform.correctness.harness.lora")
     sources = {"training": native_lora._source(training._DeepSpeedWorker.__init__)}
-    ParticipationWorker = participation_worker_class(training._DeepSpeedWorker)
     coordinator_base = participation_step_class(training.GPUTrainingJob.__ray_metadata__.modified_class)
 
     class ParticipationCoordinator(coordinator_base):
         async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
-            native_training = importlib.import_module("dss.ray_dss.jobs.gpu.training")
+            from .engine_admission import runtime_request_from_config
 
+            native_training = importlib.import_module("dss.ray_dss.jobs.gpu.training")
+            admission = runtime_request_from_config(cfg)
+            runtime_sp_size = native_training.sp.sp_size_of(cfg.get("training_config") or {}) if admission else None
+            runtime_receipts = None
+            if admission is not None:
+                from .engine_admission import verify_runtime_node
+
+                selected_hosts = list(dict.fromkeys(host for host, _ in ranks))
+                admitted_slots = {node["host"]: node["slots"] for node in admission["nodes"]}
+                if (
+                    len(ranks) != self._world_size
+                    or len(set(ranks)) != len(ranks)
+                    or [list(rank) for rank in ranks] != admission["ranks"]
+                    or self._info.job_id != admission["training_child_id"]
+                    or self._info.zone_id != admission["zone_id"]
+                    or any(host not in admitted_slots or not 0 <= gpu < admitted_slots[host] for host, gpu in ranks)
+                ):
+                    raise ValueError("final native worker placement differs from admitted allocation")
+                check = ray.remote(num_cpus=1, num_gpus=0)(verify_runtime_node)
+                receipts = await asyncio.wait_for(
+                    asyncio.gather(
+                        *(
+                            check.options(resources={f"node:{host}": 0.001}).remote(
+                                cfg, admission, host, self._world_size, runtime_sp_size
+                            )
+                            for host in selected_hosts
+                        )
+                    ),
+                    timeout=180,
+                )
+                runtime_receipts = dict(zip(selected_hosts, receipts))
+                if any(receipt["host"] != host for host, receipt in runtime_receipts.items()):
+                    raise ValueError("final native runtime check ran on an unexpected node")
+                print("CORRECTNESS_FINAL_RUNTIME " + json.dumps(receipts), flush=True)
+            ParticipationWorker = participation_worker_class(
+                training._DeepSpeedWorker,
+                runtime_admission=admission,
+                runtime_ranks=ranks,
+                runtime_world_size=self._world_size if admission is not None else None,
+                runtime_sp_size=runtime_sp_size,
+                runtime_receipts=runtime_receipts,
+            )
             native_spawn = super()._spawn_workers
             namespace, original_worker = native_lora._spawn_worker_binding(native_spawn, native_training, sources)
             namespace["_DeepSpeedWorker"] = ParticipationWorker
@@ -1048,10 +1089,41 @@ def merge_worker_receipts(receipts, *, job_id, world_size):
     return {**participation, "training_child_id": job_id, "rank_receipts": deepcopy(receipts)}
 
 
-def participation_worker_class(worker_base):
+def participation_worker_class(
+    worker_base,
+    *,
+    runtime_admission=None,
+    runtime_ranks=None,
+    runtime_world_size=None,
+    runtime_sp_size=None,
+    runtime_receipts=None,
+):
     """Capture participation for the single completed optimizer step admitted by P1."""
 
     class ParticipationWorker(worker_base):
+        def __init__(self, *args, **kwargs):
+            if runtime_admission is not None:
+                from .engine_admission import runtime_engine_scope
+                from .engine_admission import verify_worker_runtime
+
+                cfg = args[0] if args else kwargs["cfg"]
+                self._correctness_runtime_admission = verify_worker_runtime(
+                    cfg, runtime_admission, runtime_ranks, runtime_world_size, runtime_sp_size
+                )
+                expected = runtime_receipts[self._correctness_runtime_admission["host"]]
+                if self._correctness_runtime_admission["resolved"] != expected["resolved"]:
+                    raise ValueError("actual worker engine configuration differs from precreation admission")
+                print("CORRECTNESS_WORKER_RUNTIME " + json.dumps(self._correctness_runtime_admission), flush=True)
+                with runtime_engine_scope(self._correctness_runtime_admission):
+                    super().__init__(*args, **kwargs)
+            else:
+                super().__init__(*args, **kwargs)
+            if runtime_admission is not None:
+                import torch
+
+                if self._engine.get_data_types() != (torch.bfloat16, torch.float32):
+                    raise ValueError("actual initialized worker is not BF16 with FP32 accumulation")
+
         def fwd_bwd(self, batch):
             if self._engine.global_steps != 0:
                 raise ValueError("participation capture requires exactly the first optimizer step")
@@ -1077,6 +1149,12 @@ def participation_worker_class(worker_base):
 
         def correctness_participation_receipt(self):
             return deepcopy(self._correctness_participation_receipt)
+
+        def save(self, stage_info, path=None, checkpoint_type="resumable"):
+            if checkpoint_type != "resumable":
+                return super().save(stage_info, path=path, checkpoint_type=checkpoint_type)
+            with node_local_model_state_writer(self._engine, self.local_rank):
+                return super().save(stage_info, path=path, checkpoint_type=checkpoint_type)
 
         def destroy(self, remove_checkpoint_scratch=False):
             capture = getattr(self, "_correctness_participation", None)
@@ -4581,9 +4659,9 @@ def node_local_model_state_writer(engine, node_rank: int):
 
     DeepSpeed selects the node-local model-state writer by ``engine.local_rank``, read from ``LOCAL_RANK``. DSS starts
     every Ray worker with ``LOCAL_RANK=0`` and one visible GPU, so with ``checkpoint.use_node_local_storage`` every
-    rank writes its own module state to the same path. Under expert parallelism those states hold different experts,
-    and the file left on a node is whichever rank wrote it last, not the rank-zero state the expert sidefile check
-    and the collector receipts attribute it to. ``node_rank`` is the worker's rank within its node.
+    rank writes its own module state to the same path, which can corrupt the archive even for replicated dense
+    weights. Under expert parallelism those states also hold different experts, so the last writer need not match
+    the rank-zero state attributed by collector receipts. ``node_rank`` is the worker's rank within its node.
     """
     if type(node_rank) is not int or node_rank < 0:
         raise ValueError("node-local model-state writer requires the worker's nonnegative rank within its node")

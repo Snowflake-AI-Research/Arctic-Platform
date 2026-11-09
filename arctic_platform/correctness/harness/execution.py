@@ -411,6 +411,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         raise SystemExit(f"unknown check(s): {', '.join(unknown)}")
 
     for path in config_paths:
+        automatic_allocation = None
         try:
             cfg = load_config(path)
             validate_first_two_model_dtype(cfg)
@@ -433,7 +434,16 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
             # Both are read from the config as written. The cases belong to the reviewed spec and do not
             # move with the placement, so every width measures the same work on a different topology.
             arm_defs = arms_for(cfg.max_seq_len, cfg.n_gpus)
-            widths = [cfg.n_gpus] if local_fixture else placement_widths(cfg.n_gpus, pool)
+            widths = placement_widths(cfg.n_gpus, pool)
+            if getattr(args, "_automatic_cortex_gateway", False):
+                for width in widths:
+                    validate_reference_accumulation(cfg.at_gpu_width(width), automatically_owned_local=True)
+                import torch
+
+                if local_fixture and max(widths) > torch.cuda.device_count():
+                    from .engine_admission import owned_allocation_admission
+
+                    automatic_allocation = owned_allocation_admission(cfg.at_gpu_width(max(widths)))
         except (ValueError, KeyError) as exc:
             results.append(
                 TestResult(
@@ -499,7 +509,11 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 fixture_stage_path=published_fixture["publication"]["stage_path"],
             )
         managed_gateway = (
-            local_cortex_gateway(Path(args.out), gateway_module="arctic_platform.correctness.harness.gateway")
+            local_cortex_gateway(
+                Path(args.out),
+                gateway_module="arctic_platform.correctness.harness.gateway",
+                **({"runtime_admission": automatic_allocation} if automatic_allocation is not None else {}),
+            )
             if getattr(args, "_automatic_cortex_gateway", False)
             else nullcontext(None)
         )
@@ -508,9 +522,14 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 backend.base_url = gateway_url
                 execution[cfg.config_id]["gateway_url"] = gateway_url
             if local_fixture:
+                from arctic_platform.correctness.harness.cortex import distribute_local_fixture
                 from arctic_platform.correctness.harness.cortex import load_local_fixture
 
                 try:
+                    if automatic_allocation is not None:
+                        execution[cfg.config_id]["fixture_locality"] = distribute_local_fixture(
+                            spec, automatic_allocation
+                        )
                     published_fixture = load_local_fixture(backend, spec)
                 except ValueError as exc:
                     results.extend(
@@ -550,6 +569,18 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 if len(widths) > 1:
                     print(f"--- {cfg.config_id} on {width} GPU(s) ---", flush=True)
                 native_optimizer = {}
+                run_dense_allocation = dense_checkpoint_allocation
+                from .runner import supports_dense_checkpoint_allocation
+
+                if (
+                    run_dense_allocation is None
+                    and automatic_allocation is not None
+                    and "single-step-optimizer" in args.test
+                    and supports_dense_checkpoint_allocation(run_cfg)
+                    and set(args.test) <= {"single-step-grads", "single-step-optimizer"}
+                    and sum(node["slots"] for node in automatic_allocation["nodes"]) == run_cfg.dp_size
+                ):
+                    run_dense_allocation = automatic_allocation
                 if (
                     local_fixture
                     and "single-step-optimizer" in args.test
@@ -572,8 +603,8 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                         attn=args.attn[0] if args.attn else None,
                         client_backend=backend,
                         **(
-                            {"dense_checkpoint_allocation": copy.deepcopy(dense_checkpoint_allocation)}
-                            if dense_checkpoint_allocation is not None
+                            {"dense_checkpoint_allocation": copy.deepcopy(run_dense_allocation)}
+                            if run_dense_allocation is not None
                             else {}
                         ),
                         **({"cortex_fixture": fixture_path} if fixture_path is not None else {}),
