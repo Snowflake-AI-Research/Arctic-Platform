@@ -776,12 +776,14 @@ def test_chunked_inkling_dispatch_bounds_pending_combines(monkeypatch, full_chec
     set_seed(115)
     initial = initialized_prime_model(tiny_config()).model.layers[1].mlp.float()
     assert initial.sync_combine_per_chunk
+    assert initial.checkpoint_dispatch_chunks
     initial.set_deepep_token_chunk_size(4)
     hidden = torch.randn(2, 9, 16)
     records = []
     for bounded in (False, True):
         layer = copy.deepcopy(initial)
         layer.sync_combine_per_chunk = bounded
+        layer.checkpoint_dispatch_chunks = bounded
         dispatch = Dispatch()
         monkeypatch.setattr(moe, "get_ep_comm_module", lambda backend: dispatch)
         inputs = hidden.clone().requires_grad_(True)
