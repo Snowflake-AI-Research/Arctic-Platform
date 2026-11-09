@@ -89,15 +89,8 @@ train:
       # 2 for optim + grad sharding; 3 also shards weights
       stage: 0
 
-      offload_optimizer:
-
-        # `none` keeps the optimizer state on GPU; `cpu` offloads it
-        device: none
-
-      offload_param:
-
-        # `none` keeps params on GPU; `cpu` offloads them
-        device: none
+      # Omit offload_* unless device is cpu. {"device": none} is a truthy
+      # dict and Arctic Platform's CPUAdam selector treats it as offload on.
 
     # DeepSpeed engine log level
     log_level: INFO

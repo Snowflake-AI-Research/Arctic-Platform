@@ -91,8 +91,6 @@ def _config(stack: contextlib.ExitStack, training_gpus: int) -> ArcticSFTClientC
                 "gradient_accumulation_steps": 1,
                 "zero_optimization": {
                     "stage": 2,
-                    "offload_optimizer": {"device": "none"},
-                    "offload_param": {"device": "none"},
                 },
                 "optimizer": {
                     "type": "AdamW",

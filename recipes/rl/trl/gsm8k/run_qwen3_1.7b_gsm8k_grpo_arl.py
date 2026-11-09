@@ -103,8 +103,6 @@ def build_client(
         "zero_optimization": {
             # 1 = optimizer-sharded DDP (bf16 + fp32 master grads). 1.7B does not need ZeRO-3.
             "stage": zero_stage,
-            "offload_optimizer": {"device": "none"},
-            "offload_param": {"device": "none"},
         },
         # Optimizer folded into ds_config (the unified client drops training_config on the wire).
         "optimizer": {"type": "AdamW", "params": {"lr": 1e-6, "betas": [0.9, 0.999], "weight_decay": 0.0}},
