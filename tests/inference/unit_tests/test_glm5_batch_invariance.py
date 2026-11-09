@@ -130,3 +130,41 @@ def test_sparse_mla_prefill_always_takes_the_mqa_path(monkeypatch):
     glm5_batch_invariance._sparse_mla_always_mqa()
 
     assert MLAAttention()._use_sparse_mha(object()) is False
+
+
+def test_tokens_that_fit_in_index_topk_get_causal_indices_beside_longer_sequences(monkeypatch):
+    import sys
+    import types
+
+    import torch
+
+    from arctic_platform.inference.vllm import glm5_batch_invariance
+
+    def _fill_causal_indices(rows, positions):
+        causal_range = torch.arange(rows.shape[1], dtype=torch.int32)
+        rows[:] = causal_range[None, :]
+        rows[causal_range[None, :] > positions[:, None].to(torch.int32)] = -1
+
+    def sparse_attn_indexer_kpool(hidden_states, topk_tokens, topk_indices_buffer, positions=None):
+        topk_indices_buffer[: hidden_states.shape[0]] = 7  # stands in for scored selections
+        return topk_indices_buffer
+
+    common = types.ModuleType("vllm.models.glm5next.common.sparse_indexer")
+    common._fill_causal_indices = _fill_causal_indices
+    nvidia = types.ModuleType("vllm.models.glm5next.nvidia.sparse_indexer")
+    nvidia.sparse_attn_indexer_kpool = sparse_attn_indexer_kpool
+    for name in ("vllm", "vllm.models", "vllm.models.glm5next", "vllm.models.glm5next.common",
+                 "vllm.models.glm5next.nvidia"):  # fmt: skip
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, common.__name__, common)
+    monkeypatch.setitem(sys.modules, nvidia.__name__, nvidia)
+    sys.modules["vllm.models.glm5next.nvidia"].sparse_indexer = nvidia
+    glm5_batch_invariance._causal_indices_per_token()
+
+    buffer = torch.full((4, 4), -2, dtype=torch.int32)
+    positions = torch.tensor([0, 2, 3, 9])
+    out = nvidia.sparse_attn_indexer_kpool(torch.zeros(4, 1), 4, buffer, positions=positions)
+
+    assert out is buffer
+    assert buffer[:3].tolist() == [[0, -1, -1, -1], [0, 1, 2, -1], [0, 1, 2, 3]]
+    assert buffer[3].tolist() == [7, 7, 7, 7]
