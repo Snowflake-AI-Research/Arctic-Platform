@@ -132,6 +132,8 @@ class InklingMoE(MoE):
         del self.router
         self.gate = InklingTopkRouter(config)
         self.shared_experts = InklingSharedExperts(config)
+        # UCCL combine events retain their receive buffers until the stream wait.
+        self.sync_combine_per_chunk = True
 
     def _run_local_routed_experts(self, hidden_states, counts, scores=None):
         if self.deepep_token_chunk_size is not None and torch.is_grad_enabled():

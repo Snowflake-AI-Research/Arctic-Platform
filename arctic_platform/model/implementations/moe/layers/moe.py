@@ -764,6 +764,7 @@ class MoE(nn.Module):
         self.experts.set_ep_comm_backend(self.ep_comm_backend)
         # Set by full activation checkpointing (see CombineReplay); the EP backends replay the combine on recompute.
         self.combine_replay: CombineReplay | None = None
+        self.sync_combine_per_chunk = False
         self.use_sonicmoe = moe_args.use_sonicmoe
         self.router = TokenChoiceTopKRouter(
             dim=dim,
@@ -938,6 +939,8 @@ class MoE(nn.Module):
         for chunk_start, chunk_end in chunk_bounds[1:]:
             next_pending_state = dispatch_chunk(chunk_start, chunk_end)
             routed_outputs.append(run_pending_chunk(pending_state))
+            if self.sync_combine_per_chunk:
+                sync_combine()
             pending_state = next_pending_state
 
         routed_outputs.append(run_pending_chunk(pending_state))

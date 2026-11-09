@@ -744,3 +744,54 @@ class TestInklingTraining(TestCasePlus):
 )
 def test_official_weight_names(name, expected):
     assert weight_targets(name) == expected
+
+
+@pytest.mark.parametrize("full_checkpoint", [False, True])
+def test_chunked_inkling_dispatch_bounds_pending_combines(monkeypatch, full_checkpoint):
+    import copy
+
+    from torch.utils.checkpoint import checkpoint
+
+    from arctic_platform.model.implementations.moe.distributed import expert_parallel
+    from arctic_platform.model.implementations.moe.layers import moe
+    from tests.model.test_flash_trainer_rounding import _OneRankDispatch
+
+    class Dispatch(_OneRankDispatch):
+        def __init__(self):
+            super().__init__()
+            self.pending = []
+            self.peak_pending = 0
+
+        def combine_tokens(self, rows, state):
+            output = super().combine_tokens(rows, state)
+            self.pending.append(rows)
+            self.peak_pending = max(self.peak_pending, len(self.pending))
+            return output
+
+        def sync_combine(self):
+            self.pending.clear()
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(expert_parallel, "get_ep_group", lambda experts: None)
+    set_seed(115)
+    initial = initialized_prime_model(tiny_config()).model.layers[1].mlp.float()
+    assert initial.sync_combine_per_chunk
+    initial.set_deepep_token_chunk_size(4)
+    hidden = torch.randn(2, 9, 16)
+    records = []
+    for bounded in (False, True):
+        layer = copy.deepcopy(initial)
+        layer.sync_combine_per_chunk = bounded
+        dispatch = Dispatch()
+        monkeypatch.setattr(moe, "get_ep_comm_module", lambda backend: dispatch)
+        inputs = hidden.clone().requires_grad_(True)
+        output = checkpoint(layer, inputs, use_reentrant=False, early_stop=False) if full_checkpoint else layer(inputs)
+        loss = output.square().sum()
+        loss.backward()
+        grads = [p.grad for p in layer.parameters() if p.requires_grad]
+        norm = torch.stack([grad.square().sum() for grad in grads]).sum().sqrt()
+        records.append((output, loss, norm, inputs.grad, *grads))
+        assert not dispatch.pending
+        assert dispatch.peak_pending == (1 if bounded else 5)
+    for actual, expected in zip(records[1], records[0], strict=True):
+        torch_assert_close(actual, expected, atol=1e-6, rtol=0)
