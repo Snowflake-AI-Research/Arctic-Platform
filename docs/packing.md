@@ -58,6 +58,18 @@ These leaves are matched by key, never by shape. Their leading dimension counts 
 
 Media leaves ride at the top level only; one inside `context` is refused.
 
+### Media spec per model
+
+Everything above is the Qwen-VL layout. `media_spec_for(model_type)` (`media_spec.py`) returns the `MediaSpec` that states it for one model family, or `None` for a model with no registered media:
+
+- `kinds` / `modalities`: the media the model takes, each a `MediaKind` with its values, grid and row-id leaf names and its token type;
+- `placeholder_ids(config)`: `{modality: token id}` read from the model config (Qwen-VL: `image_token_id`, `video_token_id`);
+- `tokens_per_item(grid_row, spatial_merge_size)`: an item's token count in its row (Qwen-VL: `t * h * w / merge**2`);
+- `positions`: `"mrope"` (`[4, 1, T]`) or `"1d"`;
+- `item_prefix_tokens`: text tokens just before an item that belong to it, such as a begin marker (Qwen-VL: 0).
+
+The Qwen-VL entry is registered for `qwen3_vl`, `qwen3_vl_moe`, `qwen3_5`, `qwen3_5_moe` and `qwen4_exp`. A family with another layout adds its own with `register_media_spec(model_type, spec)`; a model type registered twice is refused. The code in this package still uses the Qwen-VL constants directly; the spec is where a caller reads them instead of assuming them.
+
 ### Media under context parallelism
 
 A CP rank's model call takes a media call in one of two modes. The Qwen3.8 CP wrapper (`qwen38/context_parallel.py`) tells them apart only by an explicit flag on the model call, never by the call's shape: rank 0's window opens a row at position 0 and divides evenly, just like a whole call.
