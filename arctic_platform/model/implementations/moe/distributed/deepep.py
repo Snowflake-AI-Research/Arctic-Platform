@@ -1,3 +1,4 @@
+import weakref
 from dataclasses import dataclass
 
 import torch
@@ -78,6 +79,9 @@ def _dispatch_op_impl(
     handle_id = _get_next_handle_id()
     _handle_cache[handle_id.item()] = handle
     _pending_dispatch_events[handle_id.item()] = after_event
+    # Checkpoint recomputation can discard a dispatch before reaching combine.
+    finalizer = weakref.finalize(handle_id, _release_dispatch_handle, handle_id.item())
+    finalizer.atexit = False
     recv_num_tokens_per_expert = torch.tensor(recv_num_tokens_per_expert_list, dtype=torch.int32, device="cpu")
     return recv_x, recv_indices, recv_scores, recv_num_tokens_per_expert, handle_id
 
@@ -193,6 +197,11 @@ def _sync_dispatch(handle_id: torch.Tensor | int) -> None:
     pending_event = _pending_dispatch_events.pop(handle_key, None)
     if pending_event is not None:
         pending_event.current_stream_wait()
+
+
+def _release_dispatch_handle(handle_key: int) -> None:
+    _sync_dispatch(handle_key)
+    _handle_cache.pop(handle_key, None)
 
 
 def configure_num_sms(num_sms: int) -> None:

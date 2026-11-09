@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -116,6 +118,28 @@ def test_materialize_swe_smith_localization_harbor_task(tmp_path: Path) -> None:
     assert truth["file_changes"][0]["file"] == "src/foo.py"
 
 
+def test_swe_smith_export_needs_only_the_standard_library(tmp_path: Path) -> None:
+    harbor_recipe = Path(__file__).resolve().parents[3] / "recipes" / "rl" / "harbor"
+    row = dict(instance_id="owner__repo.123", repo="owner/repo", base_commit="abc1234", problem_statement="Fix it")
+    script = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {str(harbor_recipe)!r})\n"
+        "from harbor_rl.swe_smith_tasks import materialize_harbor_task_from_row\n"
+        "from pathlib import Path\n"
+        f"task = materialize_harbor_task_from_row(json.loads(sys.argv[1]), Path({str(tmp_path / 'tasks')!r}))\n"
+        "print(task)\n"
+    )
+    # -I -S: no site-packages, so neither Arctic Platform nor the training dependencies are importable,
+    # matching prepare_data.py run as a `uv run` script.
+    out = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", script, json.dumps(row)], capture_output=True, text=True, check=True
+    )
+    task_dir = Path(out.stdout.strip())
+    reward = harbor_recipe.parent / "openhands" / "code_localization" / "openhands_localization" / "reward.py"
+    assert (task_dir / "tests" / "localization_reward.py").read_text() == reward.read_text()
+    assert (task_dir / "tests" / "test.sh").is_file()
+
+
 def test_harbor_trial_adapter_and_grader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     task_dir = _make_sample_harbor_task(tmp_path, "sample-task")
 
@@ -197,3 +221,60 @@ def test_snowflake_sandbox_shell_and_detached_exec_reattach(tmp_path: Path, monk
     )
     assert lost.returncode == LOST_EXIT
     assert "lost track" in lost.stderr
+
+
+@pytest.mark.parametrize("started_before_the_drop", [False, True])
+def test_a_dropped_exec_stream_runs_the_command_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, started_before_the_drop: bool
+) -> None:
+    pytest.importorskip("snowflake.sandbox")
+    import asyncio
+
+    from harbor.models.task.config import EnvironmentConfig
+    from harbor.models.trial.paths import TrialPaths
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    monkeypatch.setattr(sf_shell, "EXEC_ROOT", str(tmp_path / "harbor-exec"))
+    calls: list[list[str]] = []
+
+    class Stream:
+        def __init__(self, argv: list[str]) -> None:
+            calls.append(argv)
+            dropped = len(calls) == 1
+            if dropped and not started_before_the_drop:
+                self.lines, self.exit_code = [], None
+                return
+            proc = subprocess.run(argv, capture_output=True, text=True)
+            if dropped:
+                self.lines, self.exit_code = [], None
+                return
+            out = [SimpleNamespace(stream="stdout", data=line) for line in proc.stdout.splitlines()]
+            err = [SimpleNamespace(stream="stderr", data=line) for line in proc.stderr.splitlines()]
+            self.lines, self.exit_code = out + err, proc.returncode
+
+        def __aiter__(self):
+            return self._lines()
+
+        async def _lines(self):
+            for line in self.lines:
+                yield line
+
+    (tmp_path / "environment").mkdir()
+    (tmp_path / "trial").mkdir()
+    env = sf_env.SnowflakeSandboxEnvironment(
+        environment_dir=tmp_path / "environment",
+        environment_name="task",
+        session_id="session",
+        trial_paths=TrialPaths(trial_dir=tmp_path / "trial"),
+        task_env_config=EnvironmentConfig(),
+        prebuilt_image="/db/schema/repo/image:tag",
+    )
+    env._sandbox = SimpleNamespace(exec_stream=lambda argv, timeout: Stream(argv))
+    marker = tmp_path / "count"
+
+    result = asyncio.run(env.exec(f"echo x >> {marker}; echo done", user="root"))
+
+    assert (result.return_code, result.stdout) == (0, "done\n")
+    assert marker.read_text() == "x\n"
+    assert len(calls) == (2 if started_before_the_drop else 3)

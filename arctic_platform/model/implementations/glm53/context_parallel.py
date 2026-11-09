@@ -24,7 +24,6 @@ import types
 
 import torch
 import torch.distributed as dist
-import torch.distributed.nn as dist_nn
 import torch.nn.functional as F
 from torch import nn
 
@@ -37,7 +36,9 @@ from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_a
 )
 from arctic_platform.model.implementations.glm52.models.kernels import fp8_indexer
 from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import flash_mla_available
+from arctic_platform.model.implementations.glm53 import SPARSE_MLA_BACKENDS
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
+from arctic_platform.model.implementations.gpu.sp.collectives import gather_sequence
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _fallback_depthwise_causal_convolution
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import _pack_and_exchange_head_tensors
@@ -53,13 +54,6 @@ _REFERENCE_SPARSE_MLA_TILE_BYTES = 1 << 30
 _INDEXER_SCORE_CHUNK_BYTES = 512 * 1024 * 1024
 # Query rows per fused-scorer chunk keep the FP32 [rows, pools] score block near 1 GiB.
 _SCORE_BUDGET_BYTES = 1 << 30
-SPARSE_MLA_BACKENDS = ("sparse_mla", "flashinfer", "flashmla")
-
-
-def _gather_sequence(tensor: torch.Tensor, group) -> torch.Tensor:
-    if group is None or dist.get_world_size(group) == 1:
-        return tensor
-    return torch.cat(dist_nn.all_gather(tensor.contiguous(), group=group), dim=1)
 
 
 @torch.no_grad()
@@ -594,8 +588,8 @@ def _sparse_attention_forward(
         dim=-1,
     )
     kv_pass = self.kv_a_layernorm(kv_pass)
-    kv_pass_full = _gather_sequence(kv_pass, self._cp_group)
-    k_position_full = _gather_sequence(k_position, self._cp_group)
+    kv_pass_full = gather_sequence(kv_pass, self._cp_group)
+    k_position_full = gather_sequence(k_position, self._cp_group)
 
     if self.indexer is not None:
         global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
@@ -979,7 +973,7 @@ def apply_context_parallelism(
         attention._cp_group = cp_group
         attention._cp_rank = cp_rank
         attention._cp_world_size = cp_world_size
-        if layer.block_type == "deepseek_sparse_attention":
+        if layer.block_type == "indexed_attention":
             attention._ap_sparse_mla_backend = attn_implementation
             attention.forward = types.MethodType(
                 _sparse_attention_forward,

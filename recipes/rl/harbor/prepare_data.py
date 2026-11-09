@@ -121,12 +121,12 @@ def export_swe_smith_harbor_tasks(
     out_dir: Path,
     *,
     source_parquet_dir: Path | None = None,
-    max_train_tasks: int = 256,
+    max_train_tasks: int = 800,
     max_eval_tasks: int = 32,
 ) -> tuple[Path, Path]:
     """Export SWE-smith code-localization rows into ``out_dir/train`` and ``out_dir/eval`` Harbor task directories."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from harbor_rl.entrypoint import materialize_harbor_task_from_row
+    from harbor_rl.swe_smith_tasks import materialize_harbor_task_from_row
 
     if source_parquet_dir is not None and (source_parquet_dir / "train.parquet").is_file():
         train_df = pd.read_parquet(source_parquet_dir / "train.parquet")
@@ -198,7 +198,12 @@ def main() -> None:
         default=None,
         help="Optional existing SWE-smith parquet directory to export from without downloading.",
     )
-    parser.add_argument("--max-train-tasks", type=int, default=256)
+    parser.add_argument(
+        "--max-train-tasks",
+        type=int,
+        default=800,
+        help="SWE-smith training tasks to export (default: 800). A run makes one pass over them: 100 steps of 8.",
+    )
     parser.add_argument("--max-eval-tasks", type=int, default=32)
     parser.add_argument("--out", type=Path, default=Path.home() / "data" / "harbor-rl")
     args = parser.parse_args()
