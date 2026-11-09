@@ -1,6 +1,6 @@
 # HF Reference Onboarding
 
-**Prepare independent Hugging Face (HF) references explicitly before regression.** The two supported checks are `single-step-grads` and `single-step-optimizer`. Onboarding runs on an already prepared allocation and publishes compact JSON measurements; regression consumes those measurements without falling back to fresh HF computation.
+**Config-only onboarding prepares independent Hugging Face (HF) references automatically.** The two supported checks are `single-step-grads` and `single-step-optimizer`. Onboarding runs on an already prepared allocation and publishes compact JSON measurements for individual and combined selections in the same invocation; no separate reference-preparation command is required. Regression consumes those measurements without falling back to fresh HF computation.
 
 ## Configuration And Reference Layout
 
@@ -45,7 +45,9 @@ python -m arctic_platform.correctness onboard \
 
 **Repeating a failed command resumes verified completed preparation.** Recovery records under `./work/logs/onboarding-state/` bind configuration, options, source, code and dependency versions to retained artifacts. Missing or changed artifacts invalidate the affected phase and its successors; failed phases are not completion checkpoints. An optimizer validation failure can therefore retry without recalibrating its compatible references. See [diagnostics and retry](running-tests.md#onboarding) for retained reports.
 
-**Use an existing reviewed spec for preparation-only runs.** `--prepare-references` does not resize the fixture or rewrite an existing numerical gate.
+**Fresh calibration can retain separately reviewed absolute acceptance gates.** Supply `--reviewed-gate single-step-grads=0.008 --reviewed-gate single-step-optimizer=0.001` only when those limits have already been reviewed for the requested workload. With a fresh specification, fixture/cache and log directory, onboarding measures calibration again and records both the newly computed gate and the explicit acceptance gate; no prior calibration provenance is copied. Optimizer records retain the explicit gate at every selected placement and for combined selections. These inputs do not themselves force fresh preparation: preserve prior artifacts separately before a requested restart, and do not use them to widen an existing frozen gradient gate.
+
+**Preparation-only mode is optional, not a prerequisite for config-only onboarding.** Use `--prepare-references` only when intentionally preparing or repairing records from an existing reviewed spec without target execution. This mode does not resize the fixture or rewrite an existing numerical gate.
 
 ```bash
 # Prepare the identity used by a regression selecting both checks.
@@ -55,7 +57,7 @@ python -m arctic_platform.correctness onboard \
   --reference-tests single-step-grads single-step-optimizer
 ```
 
-**Single-check and combined-check workloads have different identities.** Use `--test-id single-step-grads` or `--test-id single-step-optimizer` to prepare a single-check selection. Use both IDs with `--reference-tests` when regression selects both. Optimizer selection changes the measured step and frozen token/model settings, so separately prepared single-check records are not interchangeable with a combined selection.
+**Single-check and combined-check workloads have different identities.** Default-all onboarding handles both identities automatically. In preparation-only mode, use `--test-id single-step-grads` or `--test-id single-step-optimizer` for a single-check selection, or both IDs with `--reference-tests` when regression selects both. Optimizer selection changes the measured step and frozen token/model settings, so separately prepared single-check records are not interchangeable with a combined selection.
 
 ## Record Identity
 
