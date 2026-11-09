@@ -76,6 +76,12 @@ def model_parallelism_metadata_from_config(
         text_config = config
 
     linear_attn_config = text_config.get("linear_attn_config")
+    linear_num_heads = text_config.get("linear_num_heads")
+    if linear_num_heads is None and text_config is not config:
+        linear_num_heads = config.get("linear_num_heads")
+    linear_head_fallback = linear_num_heads
+    if isinstance(linear_attn_config, Mapping) and linear_attn_config.get("num_heads") is not None:
+        linear_head_fallback = linear_attn_config["num_heads"]
 
     def positive_int(
         name: str,
@@ -104,6 +110,7 @@ def model_parallelism_metadata_from_config(
         "linear_attention" in layer_types
         or "linear_num_key_heads" in text_config
         or "linear_num_value_heads" in text_config
+        or linear_num_heads is not None
     )
     num_attention_heads = positive_int("num_attention_heads", required=True)
     assert num_attention_heads is not None
@@ -115,12 +122,12 @@ def model_parallelism_metadata_from_config(
         linear_num_key_heads=positive_int(
             "linear_num_key_heads",
             required=has_linear_attention,
-            fallback=(linear_attn_config.get("num_heads") if isinstance(linear_attn_config, Mapping) else None),
+            fallback=linear_head_fallback,
         ),
         linear_num_value_heads=positive_int(
             "linear_num_value_heads",
             required=has_linear_attention,
-            fallback=(linear_attn_config.get("num_heads") if isinstance(linear_attn_config, Mapping) else None),
+            fallback=linear_head_fallback,
         ),
     )
 
@@ -181,6 +188,11 @@ def _model_type(config: Any) -> str:
     return str(getattr(config, "model_type", "") or "")
 
 
+def model_type_family(model_type: str) -> str:
+    """Normalize a standalone text model type to its family name."""
+    return model_type.removesuffix("_text")
+
+
 @dataclass
 class LoaderContext:
     """Everything a loader needs to build a model."""
@@ -202,6 +214,11 @@ class LoaderContext:
         config = self.hf_config
         text_config = config.get("text_config") if isinstance(config, dict) else getattr(config, "text_config", None)
         return _model_type(text_config)
+
+    @property
+    def hf_model_family(self) -> str:
+        """The nested text family, or the root family for a standalone config."""
+        return model_type_family(self.hf_text_model_type or self.hf_model_type)
 
 
 @dataclass
