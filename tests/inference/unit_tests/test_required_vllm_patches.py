@@ -64,3 +64,19 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "ensure_mamba_completion_refresh",
         lambda: calls.append("mamba_completion_refresh"),
     )
+
+    required_patches.apply_required_vllm_patches()
+
+    assert calls == [
+        "router",
+        "xgrammar",
+        "dense_prompt_logprobs",
+        "spec_decode_grammar",
+        "dflash2",
+        "glm5next_indexer_page",
+        "dflash_max_position",
+        "kv_group_size",
+        "dflash_max_position",
+        "mrope_yarn",
+        "mamba_completion_refresh",
+    ]
