@@ -16,13 +16,14 @@ import importlib
 import os
 import sys
 
-__all__ = ["Instance", "Orchestrator", "OrchestratorClient"]
+__all__ = ["Instance", "MultiNode", "Orchestrator", "OrchestratorClient"]
 
 # ``Slots`` is deliberately absent: the orchestrator owns the allocator
 # (``Orchestrator.init`` calls ``Slots.init``), so it is an implementation
 # detail rather than part of the public surface.
 _EXPORTS = {
     "Instance": ("instance", "Instance"),
+    "MultiNode": ("multinode", "MultiNode"),
     "Orchestrator": ("orchestrator", "Orchestrator"),
     "OrchestratorClient": ("client", "OrchestratorClient"),
 }

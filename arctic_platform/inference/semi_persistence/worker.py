@@ -8,7 +8,7 @@ child process tree to disk and restoring it with new PIDs.
 Command protocol:  (cmd, kwargs)
 Result protocol:   (cmd, elapsed, error, info)
 """
-import json, os, shutil, signal, subprocess, sys, time, ctypes, threading, queue, struct
+import glob, json, os, shutil, signal, stat, subprocess, sys, tempfile, time, ctypes, threading, queue, struct
 
 import pynvml
 import torch.multiprocessing as mp
@@ -17,13 +17,25 @@ import semip_logging
 
 
 def _unprivileged():
-    """CRIU runs unprivileged (dump + restore add ``--unprivileged``, and
-    restore skips the private PID namespace) when SEMIP_UNPRIVILEGED=1.
+    """Single switch for running dump and restore on a non-privileged pod
+    that grants only CAP_CHECKPOINT_RESTORE + CAP_SYS_PTRACE (no
+    CAP_SYS_ADMIN).  SEMIP_UNPRIVILEGED=1 changes exactly three things:
 
-    This is the single switch for running dump and restore on a
-    non-privileged pod that grants only CAP_CHECKPOINT_RESTORE +
-    CAP_SYS_PTRACE (no CAP_SYS_ADMIN).  See the "Reduced-capability
-    restore" section below for the capability rationale.
+    1. ``--unprivileged`` is added to criu's argv, on dump and restore
+       alike, so it skips the netns kerndat probe that needs CAP_SYS_ADMIN.
+    2. The spawned child sheds its capabilities before importing torch
+       (``_SEMIP_CHILD_DROP_CAPS``), so every task in the image records an
+       empty cap set.  This one is NOT a runtime difference -- it changes
+       what is written to disk, which is why an image's capability level is
+       fixed at dump time and the two configurations are not
+       interchangeable after the fact.
+    3. ``criu_restore`` takes _worker_criu_load_lowcap instead of
+       _worker_criu_load, dropping the private PID namespace -- and with it
+       the ``sudo``, the reaper, and the guarantee that recorded task ids
+       are free.  Hence the collision preflight on that path.
+
+    See the "Reduced-capability restore" section below for the capability
+    rationale, and Complication 11 in skills/CRIU_PLUMBING.md.
     """
     return os.environ.get("SEMIP_UNPRIVILEGED") == "1"
 
@@ -163,6 +175,64 @@ def _get_descendant_pids(pid):
     return filtered
 
 
+_TCP_STATES = {"01": "ESTABLISHED", "06": "TIME_WAIT", "08": "CLOSE_WAIT",
+               "0A": "LISTEN"}
+
+
+def _inet_census(pids):
+    """Every TCP socket in *pids* whose local address is not loopback.
+
+    Loopback exists identically in every pod; anything else names the dump
+    pod's address, which a restore elsewhere cannot re-bind.
+    """
+    import socket as _sock
+    import struct as _struct
+
+    def _addr(hexaddr):
+        ip_hex, port_hex = hexaddr.split(":")
+        raw = bytes.fromhex(ip_hex)
+        if len(raw) == 4:
+            ip = _sock.inet_ntop(_sock.AF_INET, _struct.pack("<I", int(ip_hex, 16)))
+        else:
+            words = _struct.unpack("<4I", raw)
+            ip = _sock.inet_ntop(_sock.AF_INET6, _struct.pack(">4I", *words))
+        return ip, int(port_hex, 16)
+
+    by_inode = {}
+    for table in ("tcp", "tcp6"):
+        try:
+            with open(f"/proc/net/{table}") as f:
+                next(f)
+                for line in f:
+                    parts = line.split()
+                    by_inode[parts[9]] = (_addr(parts[1]), _addr(parts[2]),
+                                          _TCP_STATES.get(parts[3], parts[3]))
+        except OSError:
+            continue
+    rows = []
+    for pid in pids:
+        try:
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                link = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if not link.startswith("socket:["):
+                continue
+            entry = by_inode.get(link[8:-1])
+            if entry is None:
+                continue
+            (lip, lport), (rip, rport), state = entry
+            if lip.startswith("127.") or lip in ("::1", "::ffff:127.0.0.1"):
+                continue
+            rows.append({"pid": pid, "fd": int(fd), "state": state,
+                         "local": f"{lip}:{lport}", "remote": f"{rip}:{rport}"})
+    return rows
+
+
 def _kill_process_tree(pid):
     """SIGKILL a process and all its descendants (leaves first)."""
     import signal as _sig
@@ -179,51 +249,36 @@ def _kill_process_tree(pid):
 
 _is_root = os.geteuid() == 0
 
-# Handed to `criu dump --libdir` so CRIU's plugin loader finds nothing there.
-# It must exist: CRIU opens it during plugin init and dies otherwise.
-_CRIU_EMPTY_LIBDIR = "/usr/lib/criu/empty"
-
-
-def _run_cuda_checkpoint(action, pid, ignore_state_err=False, device_map=None):
-    """Run sudo cuda-checkpoint --action <action> --pid <pid>."""
-    cmd = ["sudo", "cuda-checkpoint", "--action", action, "--pid", str(pid)]
-    if device_map:
-        cmd.extend(["--device-map", device_map])
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        err_msg = (r.stderr or r.stdout or "")
-        if ignore_state_err and "present state" in err_msg.lower():
-            return
-        raise RuntimeError(f"cuda-checkpoint {action}({pid}) failed: {err_msg}")
+# The dump invokes criu directly rather than through sudo (see
+# _worker_criu_save), so resolve the binary here instead of relying on sudo's
+# secure_path to cover /usr/sbin.
+_CRIU_BIN = shutil.which("criu") or "/usr/sbin/criu"
 
 
 def _worker_checkpoint(child_pid, unlock=True):
     """Checkpoint the vLLM child and all its GPU-holding descendants.
 
-    If unlock=False, leaves processes in CUDA 'checkpointed' state
-    (for a subsequent CRIU dump — the CRIU CUDA plugin will skip the
-    redundant lock+checkpoint cycle when it sees the process is already
-    checkpointed).
+    If unlock=False, leaves processes in CUDA 'checkpointed' state for a
+    subsequent CRIU dump, which is what lets that dump find no GPU state to
+    handle: _worker_criu_save points --libdir at an empty directory, so no
+    CRIU plugin (the CUDA one included) is loaded at dump time at all, and
+    prepare_criu_dump has already closed every /dev/nvidia* fd.  The restore
+    is the asymmetric half -- it passes no --libdir and so does load
+    /usr/lib/criu/cuda_plugin.so.
 
-    Uses driver API directly when running as root, falls back to the
-    cuda-checkpoint CLI via sudo otherwise.
+    Always uses the CUDA driver API, including from an unprivileged caller:
+    cuCheckpointProcess* needs ptrace permission over the target, which a
+    parent has over its own same-uid child, not root.
     """
     descendant_pids = _get_descendant_pids(child_pid)
     all_pids = descendant_pids + [child_pid]
-    if _is_root:
-        cu = _get_cu()
-        for pid in all_pids:
-            _check_cu(f"Lock({pid})", cu.cuCheckpointProcessLock(pid, None))
-            _check_cu(f"Checkpoint({pid})", cu.cuCheckpointProcessCheckpoint(pid, None))
-            if unlock:
-                _check_cu(f"Unlock({pid})", cu.cuCheckpointProcessUnlock(pid, None),
-                          ignore=_CU_CHECKPOINT_ALREADY_DONE)
-    else:
-        for pid in all_pids:
-            _run_cuda_checkpoint("lock", pid)
-            _run_cuda_checkpoint("checkpoint", pid)
-            if unlock:
-                _run_cuda_checkpoint("unlock", pid, ignore_state_err=True)
+    cu = _get_cu()
+    for pid in all_pids:
+        _check_cu(f"Lock({pid})", cu.cuCheckpointProcessLock(pid, None))
+        _check_cu(f"Checkpoint({pid})", cu.cuCheckpointProcessCheckpoint(pid, None))
+        if unlock:
+            _check_cu(f"Unlock({pid})", cu.cuCheckpointProcessUnlock(pid, None),
+                      ignore=_CU_CHECKPOINT_ALREADY_DONE)
     return all_pids
 
 
@@ -239,6 +294,25 @@ def _gpu_uuids():
     return uuids
 
 
+_DEVICE_GLOBS = ("/dev/nvidia[0-9]*", "/dev/infiniband/uverbs[0-9]*")
+
+
+def _visible_device_nodes():
+    """Sorted basenames of the GPU and EFA device nodes present in this pod.
+
+    Deliberately the device *nodes* rather than PCI addresses or UUIDs: the
+    constraint is whether the path a captured context refers to can be opened
+    again, and on an unprivileged, scheduled pod only the pod's own allocation
+    appears under /dev at all. The other NICs are still visible in /sys, which
+    is why /sys is no use for this.
+    """
+    names = set()
+    for pattern in _DEVICE_GLOBS:
+        for path in glob.glob(pattern):
+            names.add(os.path.basename(path))
+    return sorted(names)
+
+
 def _gpu_migration_permutation(old_gpus, new_gpus, n):
     """Full ``n``-GPU bijection that pins ``old_gpus[k] -> new_gpus[k]``.
 
@@ -252,30 +326,44 @@ def _gpu_migration_permutation(old_gpus, new_gpus, n):
     return [perm[i] if i in perm else next(spare) for i in range(n)]
 
 
-def _build_full_device_map(old_gpus, new_gpus, old_uuids=None):
-    """Build the ``oldUuid=newUuid,...`` device map for cuda-checkpoint.
+def _placement_changed(old_gpus, new_gpus, old_uuids, new_uuids):
+    """Whether this restore needs a device map, i.e. the placement moved.
 
-    cuda-checkpoint requires a bijective mapping of ALL visible GPUs, not
-    just the ones being swapped.  ``old_uuids`` are the capture node's GPU
-    UUIDs (from meta.json, the "old" side); the "new" side is read from the
-    local restore node, which is what makes cross-node migration work.
+    Two ways it can move, and both need the map:
+
+    * **Different indices**, on this node or any other.  The original case.
+    * **The same indices on a different node.**  The checkpoint bakes the
+      capture node's GPU UUIDs, which do not exist here, and only the map
+      rewrites them -- without it ``cuCheckpointProcessRestore`` fails with
+      ``CUDA_ERROR_INVALID_VALUE``.
+
+    The second case used to be unreachable, which is why the index comparison
+    alone was enough: an image lived and died in the pod that dumped it, so
+    "same indices" implied "same node".  A distributed image cache breaks that
+    implication -- every node mounts the cache at one path, so an image
+    restores under its own ``model_dir`` anywhere, and Ray is as likely to
+    assign the dumped index as any other.  On an 8-GPU node that was a
+    one-in-eight hard failure.
+
+    ``old_uuids`` missing means an image dumped before they were recorded; such
+    an image can only be restored on its capture node, and there is nothing
+    here that can detect that, so it reports no change and leaves the old
+    behaviour exactly as it was.
     """
-    if not old_uuids:
-        raise ValueError(
-            "image is missing 'gpu_uuids' in meta.json; recapture with the "
-            "updated worker so the capture node's GPU UUIDs are recorded")
-    new_uuids = _gpu_uuids()
-    perm = _gpu_migration_permutation(old_gpus, new_gpus, len(new_uuids))
-    return ",".join(f"{old_uuids[i]}={new_uuids[perm[i]]}"
-                    for i in range(len(new_uuids)))
+    if not old_gpus or not new_gpus:
+        return False
+    if list(old_gpus) != list(new_gpus):
+        return True
+    return bool(old_uuids) and list(old_uuids) != list(new_uuids)
 
 
-def _build_restore_args(old_gpus, new_gpus, old_uuids=None):
+def _build_restore_args(old_gpus, new_gpus, old_uuids=None, new_uuids=None):
     """Build a CUcheckpointRestoreArgs ctypes buffer for GPU migration.
 
     Layout (64-bit): gpuPairs* (8), gpuPairsCount (4), reserved (52 zeroed).
     Each CUcheckpointGpuPair is oldUuid(16) + newUuid(16).  ``old_uuids`` are
-    the capture node's GPU UUIDs (from meta.json); the "new" side is local.
+    the capture node's GPU UUIDs (from meta.json); the "new" side is local, and
+    is read here unless the caller already has it.
     """
     if not old_uuids:
         raise ValueError(
@@ -286,8 +374,16 @@ def _build_restore_args(old_gpus, new_gpus, old_uuids=None):
         return [bytes.fromhex(u.replace("GPU-", "").replace("-", ""))
                 for u in us]
 
-    new_uuids = _gpu_uuids()
+    new_uuids = list(new_uuids) if new_uuids else _gpu_uuids()
     n = len(new_uuids)
+    if len(old_uuids) != n:
+        # Named here rather than as the IndexError the pairing loop would
+        # raise: the map is a bijection over every visible GPU, so a capture
+        # node with a different GPU count cannot be mapped onto this one.
+        raise ValueError(
+            f"image recorded {len(old_uuids)} GPU UUID(s) but this node has "
+            f"{n}; the cuda-checkpoint device map is a bijection over every "
+            f"visible GPU, so the counts must match")
     perm = _gpu_migration_permutation(old_gpus, new_gpus, n)
     old_bytes = _to_bytes(old_uuids)
     new_bytes = _to_bytes(new_uuids)
@@ -305,51 +401,190 @@ def _build_restore_args(old_gpus, new_gpus, old_uuids=None):
     return args_buf, pairs_buf
 
 
+_SETTLE_TIMEOUT_ENV = "SEMIP_SETTLE_TIMEOUT_S"
+_SETTLE_TIMEOUT_DEFAULT_S = 30.0
+_SETTLE_POLL_S = 0.05
+_REINIT_TIMEOUT_ENV = "SEMIP_REINIT_NCCL_TIMEOUT_S"
+_REINIT_TIMEOUT_DEFAULT_S = 300.0
+
+
+def _env_seconds(name, default):
+    """A positive float from the environment, or ``default``.
+
+    Unusable values fall back rather than raising: these are diagnostics
+    budgets, and a typo in one should not be what takes a restore down.
+    """
+    try:
+        value = float(os.environ.get(name) or "")
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _reinit_timeout_s():
+    """How long ``reinit_nccl`` may run in the child before it is called hung."""
+    return _env_seconds(_REINIT_TIMEOUT_ENV, _REINIT_TIMEOUT_DEFAULT_S)
+
+
+def _settle_timeout_s():
+    """How long to wait for a CRIU-restored tree to quiesce, in seconds.
+
+    Tunable because the right value is not known. What is known is that a
+    healthy tree settles well inside a second, and that a tree which is going
+    to hang blows any budget we have tried. This process is the Ray actor, not
+    a restored one, so it has a live ``environ`` and ``extra_env`` reaches it
+    normally -- which means retuning this costs a job, not an image rebuild.
+
+    The effective number is named in the failure message this feeds, so a typo
+    shows up there rather than taking the restore down with it.
+    """
+    return _env_seconds(_SETTLE_TIMEOUT_ENV, _SETTLE_TIMEOUT_DEFAULT_S)
+
+
+def _proc_state(pid):
+    """The one-line ``State:`` field of ``/proc/<pid>/status``, or None if gone."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("State:"):
+                    return line.split("\t", 1)[1].strip()
+    except OSError:
+        return None
+    return None
+
+
+def _proc_wchan(pid):
+    """``/proc/<pid>/wchan``: the kernel symbol the task sleeps in, else None.
+
+    ``0`` means it is not blocked on one.
+    """
+    try:
+        with open(f"/proc/{pid}/wchan") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _proc_syscall(pid):
+    """First field of ``/proc/<pid>/syscall``: a syscall number, or ``running``.
+
+    ``running`` means the task is executing userspace instructions rather than
+    sitting in a syscall.
+    """
+    try:
+        with open(f"/proc/{pid}/syscall") as f:
+            return f.read().split(maxsplit=1)[0]
+    except (OSError, IndexError):
+        return None
+
+
+def _is_userspace_spin(pid):
+    """Whether ``pid`` is burning CPU in userspace rather than working.
+
+    ``wchan == 0`` says the task is not blocked on a kernel symbol and
+    ``syscall == running`` says it is not inside a syscall, so it is executing
+    userspace instructions and nothing else.
+
+    Why this is safe to treat as settled, which is the whole point of the
+    quiescence wait: the wait exists so that ``cuCheckpointProcessRestore`` is
+    not called on a task in the middle of a kernel or driver operation. At this
+    point in the sequence the ranks have been CRIU-restored and have *no* CUDA
+    context yet -- restoring it is the next phase -- so a rank spinning here
+    cannot be doing GPU work. It can only be spinning on the CPU.
+
+    And it is: vLLM's ``SpinCondition.wait`` in ``shm_broadcast.py`` compares
+    ``time.monotonic()`` against ``self.last_read + busy_loop_s`` and calls
+    ``sched_yield()`` while that holds. A restore cannot preserve
+    ``CLOCK_MONOTONIC`` here -- that needs a time namespace, which needs
+    ``CAP_SYS_ADMIN``, and the pod runs with ``CapEff: 0000000000000000`` under
+    ``SEMIP_UNPRIVILEGED=1`` -- so ``last_read`` still holds a reading from the
+    *dump* host's clock. When the restore host booted later than the dump host
+    by more than the dump-to-restore gap, the comparison stays true and the
+    yield loop never ends. Measured 2026-09-22 across 29 restores: that
+    inequality predicted quiescence failure every time, 29 for 29.
+
+    Conservative on error. If either file cannot be read the answer is False,
+    which keeps the old behaviour of failing the restore.
+    """
+    return _proc_wchan(pid) == "0" and _proc_syscall(pid) == "running"
+
+
+def _wait_for_quiescence(pids, timeout_s=None):
+    """Wait for every pid to reach 'S' (sleeping) or 'T' (stopped).
+
+    Returns ``(unsettled_pids, states)``. A pid that disappears counts as
+    settled -- there is nothing left to restore for it.
+
+    Polled against a *single* deadline for the whole set rather than per pid.
+    The per-pid form this replaced cost ``timeout x len(pids)`` in the bad
+    case, so a TP=8 tree spent 45 s discovering a failure that a TP=2 tree
+    reported in 10 s -- and the elapsed time of this phase, rather than any
+    error, was the only way to tell the failure had happened at all.
+    """
+    if timeout_s is None:
+        timeout_s = _settle_timeout_s()
+    deadline = time.monotonic() + timeout_s
+    pending = list(pids)
+    states = {}
+    while True:
+        still = []
+        for pid in pending:
+            state = _proc_state(pid)
+            if state is None:
+                continue        # exited: nothing to restore
+            states[pid] = state
+            if state.startswith("S") or state.startswith("T"):
+                continue
+            still.append(pid)
+        pending = still
+        if not pending or time.monotonic() >= deadline:
+            return pending, states
+        time.sleep(_SETTLE_POLL_S)
+
+
 def _worker_restore(pids, old_gpus=None, new_gpus=None, old_uuids=None):
     """Restore CUDA context on pids.
 
     State machine: checkpointed → restore → locked → unlock → running
 
-    Uses driver API directly when running as root, falls back to the
-    cuda-checkpoint CLI via sudo otherwise.
+    Always uses the CUDA driver API, including from an unprivileged caller,
+    for the same reason as _worker_checkpoint.
 
     ``old_gpus`` / ``new_gpus`` are the capture and restore GPU lists.  When
-    they differ, a device-map bijection remaps ``old_gpus[k] -> new_gpus[k]``
-    (TP1 and TP>1).  ``old_uuids`` (from meta.json) are the "old" side, so
-    the capture and restore nodes need not be the same machine.
+    the placement moved -- different indices, *or* the same indices on another
+    node -- a device-map bijection remaps ``old_gpus[k] -> new_gpus[k]`` (TP1
+    and TP>1).  ``old_uuids`` (from meta.json) are the "old" side, so the
+    capture and restore nodes need not be the same machine.  See
+    ``_placement_changed``.
 
     Two-pass: restore ALL pids, THEN unlock ALL pids.  With a TP process tree
     an unlocked worker could otherwise touch a still-locked sibling (NCCL/IPC)
     and race; restoring the whole tree before unlocking any avoids that.
     """
-    migrate = bool(old_gpus and new_gpus and list(old_gpus) != list(new_gpus))
+    # NVML is only read when the indices match and the image recorded UUIDs to
+    # compare against -- the one case where the index test cannot answer the
+    # question.  Every other path costs exactly what it did before.
+    new_uuids = None
+    if old_gpus and new_gpus and old_uuids and list(old_gpus) == list(new_gpus):
+        new_uuids = _gpu_uuids()
+    migrate = _placement_changed(old_gpus, new_gpus, old_uuids, new_uuids)
     ordered = list(reversed(pids))
-    if _is_root:
-        cu = _get_cu()
-        args_ptr = None
-        _kept_alive = None
-        if migrate:
-            args_buf, pairs_buf = _build_restore_args(
-                old_gpus, new_gpus, old_uuids)
-            args_ptr = ctypes.cast(args_buf, ctypes.c_void_p)
-            _kept_alive = (args_buf, pairs_buf)
-        for pid in ordered:
-            _check_cu(f"Restore({pid})",
-                      cu.cuCheckpointProcessRestore(pid, args_ptr),
-                      ignore=_CU_CHECKPOINT_ALREADY_DONE)
-        for pid in ordered:
-            _check_cu(f"Unlock({pid})",
-                      cu.cuCheckpointProcessUnlock(pid, None),
-                      ignore=_CU_CHECKPOINT_ALREADY_DONE)
-    else:
-        device_map = None
-        if migrate:
-            device_map = _build_full_device_map(
-                old_gpus, new_gpus, old_uuids)
-        for pid in ordered:
-            _run_cuda_checkpoint("restore", pid, device_map=device_map)
-        for pid in ordered:
-            _run_cuda_checkpoint("unlock", pid, ignore_state_err=True)
+    cu = _get_cu()
+    args_ptr = None
+    _kept_alive = None
+    if migrate:
+        args_buf, pairs_buf = _build_restore_args(
+            old_gpus, new_gpus, old_uuids, new_uuids=new_uuids)
+        args_ptr = ctypes.cast(args_buf, ctypes.c_void_p)
+        _kept_alive = (args_buf, pairs_buf)
+    for pid in ordered:
+        _check_cu(f"Restore({pid})",
+                  cu.cuCheckpointProcessRestore(pid, args_ptr),
+                  ignore=_CU_CHECKPOINT_ALREADY_DONE)
+    for pid in ordered:
+        _check_cu(f"Unlock({pid})",
+                  cu.cuCheckpointProcessUnlock(pid, None),
+                  ignore=_CU_CHECKPOINT_ALREADY_DONE)
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +595,68 @@ def _resolve_fd_resource(pid, fd):
     """Read /proc/<pid>/fd/<fd> to determine the CRIU resource identifier."""
     link = os.readlink(f"/proc/{pid}/fd/{fd}")
     return link
+
+
+def _stdout_inherit(meta):
+    """``(fd, argv)`` that hand this pod's log back to a restored tree.
+
+    The dumped tree's fd 1/2 are a pipe whose reader was the dumping pod's
+    container runtime, which CRIU cannot recreate. Restored without
+    ``--inherit-fd`` it comes back as a fresh pipe with no reader, and the first
+    write fails with ``EPIPE``; so the restore refuses rather than produce a
+    tree that dies the first time it logs. ``fd`` is a write end on this pod's
+    log for the caller to pass into the criu helper and close afterwards;
+    ``argv`` names it with the ``@LOGFD@`` placeholder the helper fills in.
+
+    A tree dumped outside a pod records ``/dev/null``, which CRIU reopens by
+    path and needs neither.
+    """
+    resource = meta.get("stdout_resource")
+    if not resource:
+        raise RuntimeError(
+            "image records no stdout_resource, so it predates the pod-log "
+            "stdout and its fd 1/2 name a /tmp/inst<N>.log that nothing "
+            "creates any more; re-dump it")
+    if not resource.startswith("pipe:"):
+        return None, []
+    fd = semip_logging.open_pod_log()
+    if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise RuntimeError(
+            f"image's stdout is the pipe {resource}, but "
+            f"{semip_logging.pod_log_target()} is not a writable pipe here; "
+            f"restoring would leave the tree writing into a pipe with no "
+            f"reader")
+    return fd, ["--inherit-fd", f"fd[@LOGFD@]:{resource}"]
+
+
+# Helper-side fd plumbing shared by both restore paths. The helper receives the
+# command pipe and (optionally) the pod log over SCM_RIGHTS, puts the pipe at the
+# number criu's argv names, moves the log above it, and fills @LOGFD@ in. F_DUPFD
+# runs first so neither dup2 can clobber the other fd.
+def _helper_fd_prologue(sock_path, new_pipe_fd):
+    return (
+        "import os, socket, array, fcntl\n"
+        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        f"s.connect({sock_path!r})\n"
+        "msg, ancdata, _, _ = s.recvmsg(1, socket.CMSG_SPACE(8))\n"
+        "fds = array.array('i')\n"
+        "for cl, ct, cd in ancdata:\n"
+        "    if cl == socket.SOL_SOCKET and ct == socket.SCM_RIGHTS:\n"
+        "        fds.frombytes(cd[:len(cd) - len(cd) % fds.itemsize])\n"
+        "s.close()\n"
+        "LFD = None\n"
+        "if len(fds) > 1:\n"
+        f"    LFD = fcntl.fcntl(fds[1], fcntl.F_DUPFD, {new_pipe_fd + 1})\n"
+        "    os.close(fds[1])\n"
+        f"os.dup2(fds[0], {new_pipe_fd})\n"
+        f"if fds[0] != {new_pipe_fd}: os.close(fds[0])\n"
+    )
+
+
+def _helper_argv_expr(criu_argv):
+    """Python source for criu's argv with ``@LOGFD@`` filled from ``LFD``."""
+    return f"[a.replace('@LOGFD@', str(LFD)) for a in {criu_argv!r}]"
 
 
 def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
@@ -375,25 +672,19 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
     """
     # Clear any stale dump in the target directory so leftover files from a
     # prior criu_dump() (which CRIU may not overwrite) cannot corrupt the new
-    # image.  Files from a previously aborted dump may be root-owned, so fall
-    # back to `sudo rm -rf` (sudo is already required for criu dump).
+    # image.  Files owned by another uid (an earlier root-run capture of the
+    # same model) are not ours to remove: dump and restore must share one uid,
+    # which Instance.criu_restore already enforces, so name the collision
+    # rather than trying to elevate past it.
     if os.path.exists(image_dir):
         try:
             shutil.rmtree(image_dir)
-        except PermissionError:
-            subprocess.run(["sudo", "rm", "-rf", image_dir], check=True)
+        except PermissionError as e:
+            raise RuntimeError(
+                f"cannot clear stale image at {image_dir}: {e}. It holds files "
+                f"from a run under a different uid; dump and restore must share "
+                f"one uid, so remove it by hand as that user and re-dump") from e
     os.makedirs(image_dir, exist_ok=True)
-
-    # Neither the CRIU PPA nor the source build creates the --libdir target,
-    # and criu dies at plugin init without it ("Unable to open directory
-    # /usr/lib/criu/empty", criu/plugin.c), so create it here instead of
-    # requiring a manual mkdir per node.  Under /usr/lib, so root-only.
-    if not os.path.isdir(_CRIU_EMPTY_LIBDIR):
-        try:
-            os.makedirs(_CRIU_EMPTY_LIBDIR, exist_ok=True)
-        except OSError:
-            subprocess.run(["sudo", "mkdir", "-p", _CRIU_EMPTY_LIBDIR],
-                           check=True)
 
     # At TP>1 the child spawns worker subprocesses whose Unix-domain IPC
     # sockets (multiproc-executor rpc / shm-broadcast) must be declared
@@ -402,6 +693,12 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
     external_unix = []
     nvidia_fds = {}
     seen_inodes = set()
+    # What the tree's stdout is: the pod-log pipe (see
+    # semip_logging.redirect_stdio_to_pod_log), whose reader is outside the
+    # tree, so CRIU records it as an external pipe and the restore must hand a
+    # live one back with --inherit-fd under this name.
+    stdout_resource = _resolve_fd_resource(child_pid, 1)
+    stray_stdio = []
     for scan_pid in _get_descendant_pids(child_pid) + [child_pid]:
         proc_fd_dir = f"/proc/{scan_pid}/fd"
         try:
@@ -411,6 +708,10 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
         for fd_name in fd_names:
             try:
                 link = os.readlink(f"{proc_fd_dir}/{fd_name}")
+                if fd_name in ("1", "2"):
+                    if link != stdout_resource:
+                        stray_stdio.append(f"{scan_pid}:fd{fd_name}={link}")
+                    continue
                 if link.startswith("socket:["):
                     ino = link.split("[")[1].rstrip("]")
                     if ino not in seen_inodes:
@@ -420,10 +721,43 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
                     nvidia_fds[int(fd_name)] = link
             except OSError:
                 pass
+    if stray_stdio:
+        # Only stdout_resource is handed back at restore; another external
+        # target on fd 1/2 would come back as a pipe with no reader, and the
+        # first write to it fails with EPIPE.
+        print(f"[semip] WARNING: stdio outside {stdout_resource} in the "
+              f"dumped tree: {', '.join(stray_stdio)}", flush=True)
 
+    # criu runs at this worker's own uid, never through sudo: it reads every
+    # rlimit of its target with prlimit(), and check_prlimit_permission() grants
+    # a cross-uid read only to CAP_SYS_RESOURCE -- outside a cap-prod pod's
+    # bounding set, so not even sudo can acquire it.  A root criu against an
+    # unprivileged child therefore dies at cr-dump.c:389 ("Can't get rlimit 0:
+    # Operation not permitted") before writing any image.  The target is this
+    # worker's own child, so matching its uid just means not elevating: a root
+    # worker is already root, and an unprivileged one takes criu's capabilities
+    # from the binary instead --
+    #   sudo setcap cap_sys_ptrace,cap_checkpoint_restore,cap_setpcap,cap_setgid+eip \
+    #       /usr/sbin/criu
+    # The dump needs only the first two; cap_setpcap and cap_setgid are for the
+    # restore's restore_creds() (see _worker_criu_load_lowcap).  Keep the +e:
+    # without it a real-uid-0 execve lands with an empty effective set, which
+    # would break a root worker.
+    #
+    # criu's --libdir is its plugin directory (default /usr/lib/criu, which
+    # holds cuda_plugin.so).  Point the dump at an EMPTY one so no plugin
+    # loads: cuda_checkpoint() has already driven cuCheckpointProcess* through
+    # the driver API, and prepare_criu_dump closed every /dev/nvidia* fd, so
+    # there is nothing for the CUDA plugin to do here.  The restore, which does
+    # want it, passes no --libdir and gets the real one.  The whole contract is
+    # "exists, holds no .so", so make a private one per dump rather than a fixed
+    # path under /usr/lib that only root can create.  mkdtemp is fresh (so
+    # guaranteed empty -- a stray .so in a long-lived directory would be loaded
+    # by a binary carrying file capabilities), mode 0700 from creation, and
+    # race-free for the concurrent dumps a cold start issues.
+    empty_libdir = tempfile.mkdtemp(prefix="semip-criu-noplugins-")
     cmd = [
-        "sudo",
-        "criu", "dump",
+        _CRIU_BIN, "dump",
         "-t", str(child_pid),
         "-D", image_dir,
         "-o", "dump.log",
@@ -434,7 +768,7 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
         "--tcp-close",
         "--ext-unix-sk",
         "--link-remap",
-        "--libdir", _CRIU_EMPTY_LIBDIR,
+        "--libdir", empty_libdir,
         "-v4",
     ]
     # SEMIP_UNPRIVILEGED=1: skip CRIU's network-namespace kerndat probe (which
@@ -446,11 +780,16 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
         cmd.append("--unprivileged")
     for ext in external_unix:
         cmd.extend(["--external", ext])
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    subprocess.run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", image_dir],
-                   capture_output=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    finally:
+        shutil.rmtree(empty_libdir, ignore_errors=True)
     if result.returncode != 0:
-        detail = result.stderr or result.stdout or "(no output)"
+        # Both streams: criu's pre-log refusals (check_caps among them) go to
+        # stdout via pr_msg, while stderr carries only its run id.
+        detail = "\n".join(
+            s.strip() for s in (result.stderr, result.stdout)
+            if s and s.strip()) or "(no output)"
         log_path = os.path.join(image_dir, "dump.log")
         if os.path.exists(log_path):
             with open(log_path) as f:
@@ -463,6 +802,7 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
         "child_pid": child_pid,
         "pipe_fd": pipe_fd,
         "pipe_resource": pipe_resource,
+        "stdout_resource": stdout_resource,
         "nvidia_fds": {str(k): v for k, v in nvidia_fds.items()},
         "rank": gpus[0] if gpus else 0,
         "gpus": gpus,
@@ -473,6 +813,19 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
         # the "new" side.  Without this, cross-node restore fails with
         # CUDA_ERROR_INVALID_VALUE (CUresult=1).
         "gpu_uuids": _gpu_uuids(),
+        # The device nodes that existed in this pod when the image was taken.
+        # A TP>1 image only restores into a pod whose /dev holds every device
+        # its captured state references, and on the scheduled path a pod is
+        # given only its allocated slice of /dev -- so an image dumped on
+        # GPUs 2,3 is unrestorable in a pod holding 0,1. Recording the set is
+        # what lets the restore say so instead of failing inside NCCL with
+        # "unhandled system error".  See _check_device_visibility.
+        "device_nodes": _visible_device_nodes(),
+        # Identity of the dumped tree.  The restored child keeps it, so the
+        # image is only restorable by the same user; Instance.criu_restore
+        # rejects the mix up front.  See the uid check there.
+        "uid": os.getuid(),
+        "gid": os.getgid(),
     }
     if meta_extra:
         meta.update(meta_extra)
@@ -547,6 +900,25 @@ def _is_pid_collision(exc_or_text):
     return any(sig in text for sig in _PID_COLLISION_SIGNATURES)
 
 
+_PORT_COLLISION_MARKER = "semi_p listening-port collision"
+_PORT_COLLISION_SIGNATURES = (
+    "Can't bind inet socket",
+    "Address already in use",
+)
+
+
+def _is_port_collision(exc_or_text):
+    """True when a restore failure is a recorded listening-port collision.
+
+    Deliberately NOT added to the retry signatures.  A task id can be freed by
+    a zombie being reaped, which is what makes retrying PID collisions worth
+    it; a listening port is held by a live socket that outlives the restore.
+    Seven consecutive attempts have been observed failing on the same port.
+    """
+    text = str(exc_or_text)
+    return any(sig in text for sig in _PORT_COLLISION_SIGNATURES)
+
+
 def _criu_log_excerpt(log_path, tail_chars=1200):
     """The lines that explain a criu failure, not just the last N bytes.
 
@@ -580,11 +952,9 @@ def _image_recorded_tids(image_dir):
     pstree = os.path.join(image_dir, "pstree.img")
     if not os.path.exists(pstree):
         return None, None
-    cmd = ["crit", "decode", "-i", pstree]
-    if os.geteuid() != 0:
-        cmd = ["sudo", "-n"] + cmd
     try:
-        res = subprocess.run(cmd, capture_output=True, timeout=60)
+        res = subprocess.run(["crit", "decode", "-i", pstree],
+                             capture_output=True, timeout=60)
         if res.returncode != 0:
             return None, None
         doc = json.loads(res.stdout.decode("utf-8", "replace"))
@@ -635,11 +1005,63 @@ def _own_ancestry():
     return chain
 
 
-def _pid_collision_report(image_dir):
-    """Describe recorded task ids that are occupied right now, or ``None``.
+def _pid_group_references(wanted):
+    """Which live processes reference each of ``wanted`` as a pgid or sid.
 
-    Grouped by occupying process, because a single 200-thread process accounts
-    for hundreds of ids and the operator can only act on the process.
+    Resolving occupancy from ``/proc/<pid>/task`` alone is not enough, and the
+    gap is not academic -- it is the dev-cluster restore failure.  A pid is a
+    refcounted ``struct pid`` in the namespace's IDR, and references come from
+    the task itself *and* from every process using it as a process-group or
+    session id, since a group is named by its leader's pid.  An unreaped
+    zombie keeps those links.  So an id can be unused by any task and still be
+    unallocatable: ``clone3(set_tid=N)``, which is how CRIU places a restored
+    task, fails ``EEXIST`` while ``/proc`` shows nothing at ``N``, because
+    ``/proc`` lists tasks.
+
+    Returns ``{id: [(pid, comm, state, kind), ...]}``.  A process referencing
+    its *own* id is skipped: that is a task collision, which ``_live_task_ids``
+    already reports with the occupant named.
+    """
+    refs = {}
+    if not wanted:
+        return refs
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        # comm (field 2) is parenthesised and may itself contain parens and
+        # spaces, so split after the last ')': index 0 is then field 3.
+        # Fields 5 and 6 -- pgrp and session -- are what /proc/<pid>/task
+        # cannot show.
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                head, _, tail = f.read().rpartition(")")
+            fields = tail.split()
+            comm = head.partition("(")[2] or "?"
+            state, pgrp, sid = fields[0], int(fields[2]), int(fields[3])
+        except (OSError, IndexError, ValueError):
+            continue  # exited while we walked it
+        pid = int(entry)
+        for rid in {pgrp, sid}:
+            if rid not in wanted or rid == pid:
+                continue
+            kind = "+".join(k for k, v in (("pgid", pgrp), ("sid", sid))
+                            if v == rid)
+            refs.setdefault(rid, []).append((pid, comm, state, kind))
+    return refs
+
+
+def _pid_collision_report(image_dir):
+    """Describe recorded task ids that are unavailable right now, or ``None``.
+
+    Covers both ways an id can be held: by a live task, and -- with no task at
+    all -- by a process group or session reference (``_pid_group_references``).
+    Reporting only the first is what let this preflight answer "no collisions"
+    through a restore that then failed on the very first id it tried.
+
+    Task occupancy is grouped by occupying process, because a single
+    200-thread process accounts for hundreds of ids and the operator can only
+    act on the process.  Reference occupancy is grouped by held id, because
+    the action there is to reap the holders.
     """
     _leaders, tids = _image_recorded_tids(image_dir)
     if not tids:
@@ -648,7 +1070,10 @@ def _pid_collision_report(image_dir):
     taken_by = {}
     for tid in sorted(tids.intersection(live)):
         taken_by.setdefault(live[tid], []).append(tid)
-    if not taken_by:
+    # Only ids with no task of their own: an id whose leader is live is
+    # already named above, and saying it twice helps nobody.
+    refs = _pid_group_references(tids.difference(live))
+    if not taken_by and not refs:
         return None
     mine = _own_ancestry()
     parts = []
@@ -663,10 +1088,126 @@ def _pid_collision_report(image_dir):
         span = (str(taken[0]) if len(taken) == 1
                 else f"{len(taken)} ids in {taken[0]}-{taken[-1]}")
         parts.append(f"pid {owner} ({comm}): {span}")
-    return (f"{_PID_COLLISION_MARKER}: the image needs {len(tids)} task id(s) "
-            f"in {min(tids)}-{max(tids)}, occupied by " + "; ".join(parts)
-            + f". Free them, or advance this PID namespace's counter past "
-              f"{max(tids)} before launching -- see scripts/pidcheck.py")
+    ref_parts = []
+    for rid, holders in sorted(refs.items()):
+        who = []
+        for hpid, hcomm, hstate, hkind in holders[:4]:
+            label = f"pid {hpid} ({hcomm}"
+            if hstate == "Z":
+                label += ", zombie"
+            if hpid in mine:
+                label += ", an ancestor of this restore"
+            who.append(f"{label}) as its {hkind}")
+        if len(holders) > 4:
+            who.append(f"and {len(holders) - 4} more")
+        ref_parts.append(f"{rid} by " + ", ".join(who))
+    msg = (f"{_PID_COLLISION_MARKER}: the image needs {len(tids)} task id(s) "
+           f"in {min(tids)}-{max(tids)}")
+    if parts:
+        msg += "; occupied by " + "; ".join(parts)
+    if ref_parts:
+        msg += ("; held with no task of its own -- " + "; ".join(ref_parts)
+                + " -- so the id stays allocated until every member of that "
+                  "group or session is reaped, and CRIU gets EEXIST on an id "
+                  "/proc shows as free")
+    return msg + (f". Free them, or advance this PID namespace's counter past "
+                  f"{max(tids)} before launching -- see scripts/pidcheck.py")
+
+
+def _ephemeral_port_range():
+    """``(low, high)`` from ``ip_local_port_range``, or ``(None, None)``."""
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            lo, hi = f.read().split()[:2]
+        return int(lo), int(hi)
+    except (OSError, ValueError):
+        return None, None
+
+
+def _tcp_listen_holder(port):
+    """``pid N (comm)`` for whoever holds ``port`` in TCP_LISTEN, or ``None``.
+
+    Two hops, because neither half is enough on its own: ``/proc/net/tcp``
+    knows the port and the socket inode but no pid, and ``/proc/<pid>/fd``
+    knows the inode but not the port.
+    """
+    inodes = set()
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path) as f:
+                lines = f.read().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 10 or fields[3] != "0A":   # 0A = TCP_LISTEN
+                continue
+            try:
+                if int(fields[1].split(":")[1], 16) != port:
+                    continue
+            except (IndexError, ValueError):
+                continue
+            inodes.add(fields[9])
+    if not inodes:
+        return None
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                link = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if link.startswith("socket:[") and link[8:-1] in inodes:
+                try:
+                    with open(f"/proc/{pid}/comm") as f:
+                        comm = f.read().strip()
+                except OSError:
+                    comm = "?"
+                return f"pid {pid} ({comm})"
+    # Listening in this netns but owned from a pid namespace we cannot see.
+    return f"an unreachable process (socket inode {sorted(inodes)[0]})"
+
+
+def _port_collision_report(excerpt):
+    """Describe the listening port CRIU could not re-bind, or ``None``.
+
+    The inet analogue of ``_pid_collision_report``.  CRIU reports only
+    "Address already in use" plus an in-image socket id, and neither
+    identifies the occupant, so without this the failure arrives as an opaque
+    log excerpt and the port has to be recovered by hand.
+    """
+    import re
+    port = None
+    # The last port CRIU announced restoring is the one that failed: the
+    # "Restore: ... state TCP_LISTEN" line immediately precedes the error.
+    for m in re.finditer(r"port (\d+)\s+state TCP_LISTEN", excerpt):
+        port = int(m.group(1))
+    if port is None:
+        m = re.search(r"Can't bind inet socket \(id (\d+)\)", excerpt)
+        return (f"{_PORT_COLLISION_MARKER}: CRIU could not bind recorded "
+                f"socket id {m.group(1)}, but the port is not in the excerpt"
+                if m else None)
+    msg = (f"{_PORT_COLLISION_MARKER}: the image records a listening socket "
+           f"on port {port}, which CRIU has to re-bind to restore")
+    holder = _tcp_listen_holder(port)
+    if holder:
+        msg += f"; it is already held by {holder}"
+    lo, hi = _ephemeral_port_range()
+    if lo is not None and lo <= port <= hi:
+        msg += (f". {port} is inside this host's ephemeral range {lo}-{hi}, "
+                f"so the kernel can hand it to any process in this pod")
+    # Unconditional: this is the actionable half, and gating it on a sysctl
+    # read would drop it exactly where /proc is unavailable.
+    msg += (". Retrying will not help -- the holder outlives the restore -- so "
+            "this image cannot restore in this pod until the port is free. An "
+            "image built after the prepare_criu_dump listener close should "
+            "record no such port at all; if it does, it predates that fix")
+    return msg
 
 
 def _proc_starttime(pid):
@@ -735,8 +1276,12 @@ def _kill_restored_tree(ident, log=None):
 
     Takes the ``_tree_identity`` snapshot taken at restore, not a bare pid.
     Used by the reduced-capability restore path, which has no PID namespace
-    to collapse.  The restored tasks are root-owned (restored via ``sudo
-    criu``), so kills go through ``sudo``.
+    to collapse.  The restored tasks carry the image's uid, which equals this
+    worker's -- dump and restore must share one uid, which
+    ``Instance.criu_restore`` enforces -- so ``os.kill`` reaches every one of
+    them without elevating.  A failure is logged rather than swallowed: an
+    unkilled task holds GPU memory and squats on the task ids the next restore
+    needs.
 
     This must never signal a negative pid.  The previous implementation
     ended with ``kill -9 -<root_pid>`` to catch tasks that had reparented
@@ -786,7 +1331,15 @@ def _kill_restored_tree(ident, log=None):
         log.info("  killing restored tree root=%s victims=%s",
                  root_pid, sorted(victims))
     for pid in sorted(victims, reverse=True):     # leaves first
-        subprocess.run(["sudo", "kill", "-9", str(pid)], capture_output=True)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass                    # exited between the snapshot check and here
+        except PermissionError:
+            if log is not None:
+                log.error("  cannot kill restored task pid=%s: not permitted. "
+                          "It holds GPU memory and its recorded task ids will "
+                          "block the next restore; kill it by hand.", pid)
 
 
 def _kill_pidns_holder(holder, log=None):
@@ -857,9 +1410,14 @@ def _worker_criu_load(image_dir, new_pipe_fd):
     if pipe_inode.startswith("socket:["):
         pipe_inode = pipe_inode.split("[")[1].rstrip("]")
 
-    # sudo closes all FDs >= 3, so we pass the pipe fd to the child via
-    # a Unix domain socket (SCM_RIGHTS) bound to a temp path that sudo
-    # can connect to.
+    # Opened here, in the host PID namespace: inside the helper's private one,
+    # /proc/1 is the reaper rather than the container's PID 1.
+    log_fd, log_argv = _stdout_inherit(meta)
+    send_fds = [new_pipe_fd] + ([log_fd] if log_fd is not None else [])
+
+    # sudo closes all FDs >= 3, so we pass the pipe fd (and the pod log) to
+    # the child via a Unix domain socket (SCM_RIGHTS) bound to a temp path
+    # that sudo can connect to.
     import socket as _socket, tempfile, array, threading
 
     sock_path = os.path.join(tempfile.gettempdir(),
@@ -877,7 +1435,7 @@ def _worker_criu_load(image_dir, new_pipe_fd):
         conn.sendmsg(
             [b"\x00"],
             [(_socket.SOL_SOCKET, _socket.SCM_RIGHTS,
-              array.array("i", [new_pipe_fd]))]
+              array.array("i", send_fds))]
         )
         conn.close()
         srv.close()
@@ -895,8 +1453,7 @@ def _worker_criu_load(image_dir, new_pipe_fd):
         # restore inside the private PID namespace.
         "--tcp-close",
         "--inherit-fd", f"fd[{new_pipe_fd}]:{pipe_resource}",
-        "--inherit-fd", "fd[1]:stdout",
-        "--inherit-fd", "fd[2]:stderr",
+        *log_argv,
         "--pidfile", pidfile,
         "--link-remap",
         "-d",
@@ -933,22 +1490,13 @@ def _worker_criu_load(image_dir, new_pipe_fd):
     # records criu's exit code, and reaps forever so the namespace (and
     # the detached restored tree) survives.
     helper_script = (
-        "import os, socket, array, ctypes, signal, sys, time\n"
+        "import ctypes, signal, sys, time\n"
         "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n"
         "CLONE_NEWPID = 0x20000000\n"
         "CLONE_NEWNS = 0x00020000\n"
         "MS_REC = 0x4000\n"
         "MS_PRIVATE = 0x40000\n"
-        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
-        f"s.connect({sock_path!r})\n"
-        "msg, ancdata, _, _ = s.recvmsg(1, socket.CMSG_LEN(4))\n"
-        "received = None\n"
-        "for cl, ct, cd in ancdata:\n"
-        "    if cl == socket.SOL_SOCKET and ct == socket.SCM_RIGHTS:\n"
-        "        fds = array.array('i'); fds.frombytes(cd); received = fds[0]\n"
-        "s.close()\n"
-        f"os.dup2(received, {new_pipe_fd})\n"
-        f"if received != {new_pipe_fd}: os.close(received)\n"
+        + _helper_fd_prologue(sock_path, new_pipe_fd) +
         "if libc.unshare(CLONE_NEWPID) != 0:\n"
         "    e = ctypes.get_errno()\n"
         "    sys.stderr.write('unshare(CLONE_NEWPID): %s\\n' % os.strerror(e))\n"
@@ -960,6 +1508,7 @@ def _worker_criu_load(image_dir, new_pipe_fd):
         # PID 1's host pid; block so this process (and the sudo handle)
         # lives as long as the namespace.
         f"    os.close({new_pipe_fd})\n"
+        "    if LFD is not None: os.close(LFD)\n"
         f"    open({reaper_pidfile!r}, 'w').write(str(pid1) + '\\n')\n"
         "    try:\n"
         "        os.waitpid(pid1, 0)\n"
@@ -972,9 +1521,10 @@ def _worker_criu_load(image_dir, new_pipe_fd):
         "    libc.mount(b'proc', b'/proc', b'proc', 0, None)\n"
         "criu_pid = os.fork()\n"
         "if criu_pid == 0:\n"
-        f"    os.execvp({criu_argv[0]!r}, {criu_argv!r})\n"
+        f"    os.execvp({criu_argv[0]!r}, {_helper_argv_expr(criu_argv)})\n"
         "    os._exit(127)\n"
         f"os.close({new_pipe_fd})\n"
+        "if LFD is not None: os.close(LFD)\n"
         "_, status = os.waitpid(criu_pid, 0)\n"
         "rc = os.waitstatus_to_exitcode(status)\n"
         "try:\n"
@@ -1001,9 +1551,7 @@ def _worker_criu_load(image_dir, new_pipe_fd):
     try:
         # stdout -> /dev/null: criu logs to restore.log (via -o) and we
         # signal completion through files, so nothing must be drained from
-        # stdout; the restored process transiently inherits fd 1 there
-        # (rebind_log repoints it right after) and an undrained pipe could
-        # otherwise fill and block it.  Keep stderr for helper diagnostics.
+        # stdout.  Keep stderr for helper diagnostics.
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE, text=True)
 
@@ -1053,7 +1601,12 @@ def _worker_criu_load(image_dir, new_pipe_fd):
             detail = f"rc={rc}"
             log_path = os.path.join(image_dir, "restore.log")
             if os.path.exists(log_path):
-                detail += "\n" + _criu_log_excerpt(log_path)
+                excerpt = _criu_log_excerpt(log_path)
+                detail += "\n" + excerpt
+                if _is_port_collision(excerpt):
+                    clash = _port_collision_report(excerpt)
+                    if clash:
+                        detail += f"\n--- {clash}"
             raise RuntimeError(f"criu restore failed ({detail})")
 
         # The restored root lives in the private namespace, so the
@@ -1067,6 +1620,9 @@ def _worker_criu_load(image_dir, new_pipe_fd):
     except BaseException:
         _kill_pidns_holder(holder)
         raise
+    finally:
+        if log_fd is not None:
+            os.close(log_fd)
 
     return new_pid, meta, holder
 
@@ -1165,8 +1721,11 @@ def _worker_criu_load_lowcap(image_dir, new_pipe_fd):
     if pipe_inode.startswith("socket:["):
         pipe_inode = pipe_inode.split("[")[1].rstrip("]")
 
-    # sudo strips fds >= 3, so hand the pipe fd to the (root) helper over a
-    # Unix socket via SCM_RIGHTS, same as the namespace path.
+    log_fd, log_argv = _stdout_inherit(meta)
+    send_fds = [new_pipe_fd] + ([log_fd] if log_fd is not None else [])
+
+    # subprocess closes fds >= 3, so hand the pipe fd (and the pod log) to the
+    # helper over a Unix socket via SCM_RIGHTS, same as the namespace path.
     sock_path = os.path.join(tempfile.gettempdir(),
                              f"criu_fd_{os.getpid()}_{new_pipe_fd}.sock")
     if os.path.exists(sock_path):
@@ -1182,7 +1741,7 @@ def _worker_criu_load_lowcap(image_dir, new_pipe_fd):
             conn.sendmsg(
                 [b"\x00"],
                 [(_socket.SOL_SOCKET, _socket.SCM_RIGHTS,
-                  array.array("i", [new_pipe_fd]))])
+                  array.array("i", send_fds))])
             conn.close()
         finally:
             srv.close()
@@ -1191,13 +1750,12 @@ def _worker_criu_load_lowcap(image_dir, new_pipe_fd):
     sender.start()
 
     criu_argv = [
-        "criu", "restore",
+        _CRIU_BIN, "restore",
         "-D", image_dir,
         "-o", "restore.log",
         "--tcp-close",
         "--inherit-fd", f"fd[{new_pipe_fd}]:{pipe_resource}",
-        "--inherit-fd", "fd[1]:stdout",
-        "--inherit-fd", "fd[2]:stderr",
+        *log_argv,
         "--pidfile", pidfile,
         "--link-remap",
         "-d",
@@ -1210,33 +1768,49 @@ def _worker_criu_load_lowcap(image_dir, new_pipe_fd):
     # low-capability nodes this path exists for.
     criu_argv.append("--unprivileged")
 
-    # Helper (root via sudo): re-receive the pipe fd, dup2 it to the number
-    # criu expects, then exec `criu restore -d` DIRECTLY -- no unshare, no
-    # new namespaces.  With -d, criu detaches the restored tree (reparented
-    # to the nearest subreaper) and exits with the restore rc, so the sudo
-    # process's exit code IS criu's rc; no long-lived reaper is required.
+    # Helper: re-receive the pipe fd, dup2 it to the number criu expects, then
+    # exec `criu restore -d` DIRECTLY -- no unshare, no new namespaces.  With
+    # -d, criu detaches the restored tree (reparented to the nearest subreaper)
+    # and exits with the restore rc, so the helper's exit code IS criu's rc; no
+    # long-lived reaper is required.  It stays a separate process even without
+    # sudo because subprocess closes fds >= 3, so the fd still arrives over the
+    # SCM_RIGHTS socket rather than by inheritance.
     helper_script = (
-        "import os, socket, array\n"
-        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
-        f"s.connect({sock_path!r})\n"
-        "msg, ancdata, _, _ = s.recvmsg(1, socket.CMSG_LEN(4))\n"
-        "received = None\n"
-        "for cl, ct, cd in ancdata:\n"
-        "    if cl == socket.SOL_SOCKET and ct == socket.SCM_RIGHTS:\n"
-        "        fds = array.array('i'); fds.frombytes(cd); received = fds[0]\n"
-        "s.close()\n"
-        f"os.dup2(received, {new_pipe_fd})\n"
-        f"if received != {new_pipe_fd}: os.close(received)\n"
-        f"os.execvp({criu_argv[0]!r}, {criu_argv!r})\n"
+        _helper_fd_prologue(sock_path, new_pipe_fd)
+        + f"os.execvp({criu_argv[0]!r}, {_helper_argv_expr(criu_argv)})\n"
     )
-    cmd = ["sudo", "python3", "-c", helper_script]
+    # Restore at the worker's own uid, never through sudo -- the mirror of the
+    # dump (see _worker_criu_save), and required for two independent reasons.
+    #
+    # Credentials: the image's uid must equal ours (Instance.criu_restore
+    # asserts it), so restoring at that uid means restore_creds() has no
+    # setresuid to do -- which it could not perform unprivileged.
+    #
+    # It does NOT follow that PR_CAPBSET_DROP has nothing to do, as this
+    # comment claimed until 2026-09-14.  criu drops every capability absent
+    # from the image's recorded cap_bnd without checking whether it is already
+    # absent here, and the kernel tests CAP_SETPCAP first, so each call returns
+    # EPERM even when there is nothing to drop.  What makes that survivable is
+    # a dump-side property: the child records no_new_privs, which is criu's own
+    # licence to demote the EPERM to a warning.  See Complication 11.
+    #
+    # Pipe sizes: CRIU recreates each pipe at its recorded capacity with
+    # F_SETPIPE_SZ, which needs CAP_SYS_RESOURCE once the *creating uid* is
+    # over fs.pipe-user-pages-soft.  That capability is outside a cap-prod
+    # pod's bounding set, so sudo cannot supply it, and uid 0 is the account
+    # most likely to be over the limit (every root-run tree on the node shares
+    # one budget).  Measured 2026-09-10: a root pipe came back at 8 KiB and
+    # F_SETPIPE_SZ failed outright, while the same call as uid 1000 succeeded:
+    #   Error (criu/pipes.c:165): Can't restore pipe size: Operation not permitted
+    #   Error (criu/files.c:1221): Unable to open fd=3 id=0x1b3
+    cmd = [sys.executable or "python3", "-c", helper_script]
 
     holder = None
     try:
         # stdout/stderr -> /dev/null: criu logs everything to restore.log
-        # (via -o).  These must NOT be pipes -- with -d the restored process
-        # inherits fd 1/2 and holds them open after criu exits, so a pipe
-        # would never EOF and draining it (subprocess.run) would deadlock.
+        # (via -o).  These must NOT be pipes we drain -- criu's -d children
+        # can hold them open after criu exits, so a pipe would never EOF and
+        # draining it (subprocess.run) would deadlock.
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
 
@@ -1245,9 +1819,6 @@ def _worker_criu_load_lowcap(image_dir, new_pipe_fd):
             os.remove(sock_path)
         except OSError:
             pass
-        subprocess.run(["sudo", "chown", "-R",
-                        f"{os.getuid()}:{os.getgid()}", image_dir],
-                       capture_output=True)
 
         if result.returncode != 0:
             detail = f"rc={result.returncode}"
@@ -1260,6 +1831,10 @@ def _worker_criu_load_lowcap(image_dir, new_pipe_fd):
                 # re-resolve rather than assume the preflight covered it.
                 if _is_pid_collision(excerpt):
                     clash = _pid_collision_report(image_dir)
+                    if clash:
+                        detail += f"\n--- {clash}"
+                if _is_port_collision(excerpt):
+                    clash = _port_collision_report(excerpt)
                     if clash:
                         detail += f"\n--- {clash}"
             raise RuntimeError(f"criu restore failed ({detail})")
@@ -1283,6 +1858,9 @@ def _worker_criu_load_lowcap(image_dir, new_pipe_fd):
     except BaseException:
         _kill_pidns_holder(holder)
         raise
+    finally:
+        if log_fd is not None:
+            os.close(log_fd)
 
     return new_pid, meta, holder
 
@@ -1293,7 +1871,8 @@ def _worker_criu_load_lowcap(image_dir, new_pipe_fd):
 
 def _child_thread(instance_id, gpus, child_pid, pipe,
                   child_queue, result_queue, completed_counter,
-                  initial_state="alive", capture_gpu_uuids=None):
+                  initial_state="alive", capture_gpu_uuids=None,
+                  child_proc=None):
     """Thread that owns the single child.  Pulls commands from child_queue,
     executes them serially, puts results on result_queue.
 
@@ -1301,6 +1880,11 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
     "old" side of a later migration); single-element at TP=1.
     ``capture_gpu_uuids`` are the capture node's GPU UUIDs from meta.json,
     needed to build the restore device map across nodes.
+
+    ``child_proc`` is the ``Process`` handle when this worker spawned the
+    child, so ``criu_dump`` can reap the corpse it leaves behind and free its
+    task ids (see ``_reap_dumped_child``).  ``None`` on the restore path: criu
+    detached that child and it reparented away, so it is not ours to reap.
 
     Generate commands are fire-and-forget on the pipe.  The child sends
     back ("generate_done", ...) when done (new async child) or
@@ -1448,40 +2032,69 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
                 if state == "alive":
                     checkpointed_pids = _get_descendant_pids(child_pid) + [child_pid]
                     log.info("  process is alive, checkpointing before restore...")
-                    if _is_root:
-                        cu = _get_cu()
-                        for _p in checkpointed_pids:
-                            _check_cu(f"Lock({_p})", cu.cuCheckpointProcessLock(_p, None))
-                            _check_cu(f"Checkpoint({_p})", cu.cuCheckpointProcessCheckpoint(_p, None))
-                    else:
-                        for _p in checkpointed_pids:
-                            _run_cuda_checkpoint("lock", _p)
-                            _run_cuda_checkpoint("checkpoint", _p)
+                    cu = _get_cu()
+                    for _p in checkpointed_pids:
+                        _check_cu(f"Lock({_p})", cu.cuCheckpointProcessLock(_p, None))
+                        _check_cu(f"Checkpoint({_p})", cu.cuCheckpointProcessCheckpoint(_p, None))
                     state = "checkpointed"
                 if checkpointed_pids is None:
                     raise RuntimeError("restore called but no checkpointed PIDs stored")
-                _all_settled = True
-                for _wp in checkpointed_pids:
-                    _settled = False
-                    for _wi in range(50):
-                        try:
-                            with open(f"/proc/{_wp}/status") as _sf:
-                                _st = _sf.read()
-                            if "State:\tS" in _st or "State:\tT" in _st:
-                                _settled = True
-                                break
-                        except Exception:
-                            break
-                        time.sleep(0.1)
-                    if not _settled:
-                        _all_settled = False
-                if _all_settled:
-                    _worker_restore(checkpointed_pids,
-                                    old_gpus=gpus,
-                                    new_gpus=target_gpus,
-                                    old_uuids=capture_gpu_uuids)
-                else:
-                    log.info("  process still running after CRIU restore, skipping CUDA restore")
+                _t_settle = time.monotonic()
+                _unsettled, _states = _wait_for_quiescence(checkpointed_pids)
+                _settle_s = time.monotonic() - _t_settle
+                # A pid that missed the window is not necessarily a problem. The
+                # wait exists to keep cuCheckpointProcessRestore away from a task
+                # inside a kernel or driver operation; a task spinning on the CPU
+                # in userspace is not that, and here it cannot be, because the
+                # ranks have no CUDA context until the next phase. Root-caused
+                # 2026-09-22: the spin is vLLM's SpinCondition busy-loop running
+                # against a CLOCK_MONOTONIC that the restore could not preserve,
+                # so it can last indefinitely and no budget will outlast it. See
+                # _is_userspace_spin.
+                _spinning = [_p for _p in _unsettled if _is_userspace_spin(_p)]
+                _blocked = [_p for _p in _unsettled if _p not in _spinning]
+                if _blocked:
+                    # Never skip and carry on. Skipping leaves the ranks with
+                    # no GPU device fds at all, and the very next phase
+                    # (reinit_nccl) then deadlocks in futex with no diagnostic
+                    # -- a job wedged for its full 45-minute idle timeout. This
+                    # used to log and fall through to `<<< cuda_restore OK`,
+                    # which is why it went unnoticed across twelve debugging
+                    # sessions. Report the states too: a pid that misses the
+                    # window is in *some* state, and that is the only clue to
+                    # why it never quiesced.
+                    raise RuntimeError(
+                        "CUDA restore skipped: %d of %d pid(s) never quiesced "
+                        "within %.1fs of the CRIU restore and are blocked in "
+                        "the kernel, so the ranks would come up with no GPUs "
+                        "and reinit_nccl would hang. States: %s"
+                        % (len(_blocked), len(checkpointed_pids),
+                           _settle_timeout_s(),
+                           ", ".join(f"{_p}={_states.get(_p, 'gone')}"
+                                     for _p in _blocked)))
+                if _spinning:
+                    # Logged rather than passed over in silence: this is the
+                    # only signal that a restore hit the clock bug, and without
+                    # it a working fix and an absent bug look identical.
+                    log.info("  %d pid(s) accepted as userspace spins after "
+                             "%.1fs (wchan=0, syscall=running, no CUDA context "
+                             "yet, so not GPU work): %s",
+                             len(_spinning), _settle_timeout_s(),
+                             ", ".join(str(_p) for _p in _spinning))
+                # Logged separately from the phase total because the two answer
+                # different questions and only their sum was ever visible.
+                # Measured 2026-09-20 at TP=2: the wait is the bulk of it, and
+                # the ranks that miss a short budget report State R (running) --
+                # busy, not blocked -- so this is a duration to calibrate
+                # against, not a wedge. Sitting at 4.0-5.0s against the 5s
+                # per-pid budget the old code used is the whole explanation for
+                # why the hangs looked intermittent.
+                log.info("  %d pid(s) quiesced in %.3fs (budget %.1fs)",
+                         len(checkpointed_pids), _settle_s, _settle_timeout_s())
+                _worker_restore(checkpointed_pids,
+                                old_gpus=gpus,
+                                new_gpus=target_gpus,
+                                old_uuids=capture_gpu_uuids)
                 log.info("  restored pids: %s", checkpointed_pids)
                 info["gpu"] = target_gpu
                 info["gpus"] = list(target_gpus)
@@ -1523,11 +2136,66 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
                 if _pr_error is not None:
                     log.warning("  prepare_criu_dump failed: %s", _pr_error)
                 else:
-                    log.info("  prepare_criu_dump: fds=%s, unmapped=%s",
+                    log.info("  prepare_criu_dump: fds=%s, unmapped=%s, "
+                             "reaped_strays=%s, closed_listeners=%s",
                              pr_info.get('closed_fds', []),
-                             pr_info.get('unmapped', []))
+                             pr_info.get('unmapped', []),
+                             pr_info.get('reaped_strays', []),
+                             pr_info.get('closed_listeners', []))
+                    log.info("  prepare_criu_dump: driver listener gate=%s",
+                             pr_info.get('listener_diag', {}))
+                    # At TP>1 every listener in the image belongs to a rank, and
+                    # none of them is closed -- torch retires its own before the
+                    # dump, and what survives is NCCL's RAS socket, which has to
+                    # ride in.  So this line is a census of what the image
+                    # carries, not a report of work done.
+                    if 'worker_listener_diag' in pr_info:
+                        log.info("  prepare_criu_dump: per-rank listeners "
+                                 "recorded into the image (none closed at "
+                                 "TP>1): %s",
+                                 pr_info.get('worker_listener_diag', []))
+                        # Called out separately because a rank with no ephemeral
+                        # row is the shape that used to mean "RAS's socket was
+                        # closed", and that regression is only visible a restore
+                        # later.  Non-empty here is the healthy reading.
+                        _eph = [d.get('recorded_ephemeral')
+                                for d in pr_info.get('worker_listener_diag', [])
+                                if isinstance(d, dict)]
+                        if not all(_eph):
+                            log.warning(
+                                "  prepare_criu_dump: a rank recorded no "
+                                "ephemeral loopback listener (%s). At TP>1 that "
+                                "socket is NCCL RAS's and should be present; "
+                                "its absence is what preceded the post-restore "
+                                "EBADF spin. See CRIU_PLUMBING.md "
+                                "Complication 15.", _eph)
+
+                _park = pr_info.get("mq_park") if _pr_error is None else None
+                if _park is not None and not _park.get("ok"):
+                    raise RuntimeError(
+                        "message-queue park failed, so the tree still holds "
+                        f"live queue sockets: {_park.get('error')}")
 
                 pipe_resource = _resolve_fd_resource(child_pid, child_pipe_fd)
+
+                _census = _inet_census(
+                    [child_pid] + _get_descendant_pids(child_pid))
+                info["inet_census"] = _census
+                log.info("  inet sockets off loopback going into the image: "
+                         "%d %s", len(_census), _census)
+                _vcfg = (kwargs.get("meta_extra") or {}).get("vllm_config") or {}
+                if int(_vcfg.get("nnodes", 1) or 1) > 1:
+                    # A connection needs TCP repair to restore and names the
+                    # dump pod's address, and so does a listener bound to a
+                    # specific one; only a wildcard listener restores anywhere.
+                    _bad = [r for r in _census
+                            if r["state"] != "LISTEN"
+                            or r["local"].rsplit(":", 1)[0] not in ("::",
+                                                                    "0.0.0.0")]
+                    if _bad:
+                        raise RuntimeError(
+                            f"{len(_bad)} inet socket(s) would go into a "
+                            f"multi-node image: {_bad}")
 
                 meta = _worker_criu_save(
                     child_pid, image_dir, child_pipe_fd, pipe_resource, gpus,
@@ -1540,6 +2208,21 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
             except Exception as e:
                 import traceback; traceback.print_exc()
                 error = f"{type(e).__name__}: {e}"
+            if error is None:
+                # Deliberately outside the try above: the image is already on
+                # disk by here, so a reap problem must degrade to "the ids may
+                # still be taken" and never turn a good dump into a failed one.
+                try:
+                    _reap_dumped_child(child_proc, child_pid, log)
+                    # Strictly after the child's own reap: the sweep waits on
+                    # -1, so running it first would consume the status
+                    # multiprocessing needs and leave child_proc.exitcode None
+                    # forever.  The grandchildren it collects are what hold
+                    # the leader's pgid and sid.
+                    _reap_orphaned_descendants(log)
+                except Exception as reap_exc:
+                    log.warning("  reaping dumped tree failed: %s: %s",
+                                type(reap_exc).__name__, reap_exc)
             elapsed = time.perf_counter() - t0
             log.info("<<< criu_dump %s (%.3fs)",
                      'OK' if error is None else 'FAILED', elapsed)
@@ -1601,6 +2284,12 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
             # drain), so its skip is redundant but harmless.
             if cmd not in ("pause", "resume"):
                 _drain_pipe_generates()
+            if cmd == "reinit_nccl" and "timeout_s" not in kwargs:
+                # The child is a restored process, so its environ is the
+                # dump's and nothing set on *this* job would be visible to it.
+                # Resolve the budget here, where the environment is live, and
+                # hand it over as a kwarg.
+                kwargs = dict(kwargs, timeout_s=_reinit_timeout_s())
             pipe.send((cmd, kwargs))
             result = _recv_sync()
         except (BrokenPipeError, ConnectionResetError, EOFError) as _pipe_err:
@@ -1635,6 +2324,156 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
 
 
 # ---------------------------------------------------------------------------
+# Reaping the dumped tree
+# ---------------------------------------------------------------------------
+#
+# A destructive dump leaves the whole tree dead but *unreaped*, and an unreaped
+# task holds pids two different ways.  Both have to be collected, because
+# restore_and_wrap's cache-miss path restores the image it has just dumped a
+# few seconds later and needs every recorded task id back, the leader's
+# included.  Measured on the dev cluster: the restore began 4.8s after the dump and still
+# could not have the leader's id, then exhausted its retry budget ~9.4s in.
+#
+# 1. Its own task id, while it is a zombie.  _reap_dumped_child covers this:
+#    the dump worker is the child's parent, so it can waitpid() it directly.
+#
+# 2. The pid that names its process group and session -- which is the dumped
+#    leader's, since the child setsid()s at startup.  A pid is a refcounted
+#    struct pid in the namespace's IDR, and every member of a group or session
+#    holds a reference on the id naming it, zombies included.  So the leader's
+#    id can be unused by any task and still be unallocatable: clone3(set_tid),
+#    which is how CRIU places a restored task, fails EEXIST on it while /proc
+#    shows nothing there, because /proc lists tasks.  Those members are the
+#    worker's *grand*children, so waitpid() cannot see them until
+#    _set_child_subreaper makes us their reaper; _reap_orphaned_descendants
+#    then collects them.
+#
+# Whether any of this is visible depends on what PID 1 is in the pod.  Under a
+# shell (`bash -c '... sleep infinity'`, the research pods) PID 1 sits in
+# waitpid(-1) and reaps anything reparented to it within milliseconds, so
+# nobody noticed.  A DSS zone pod runs `dss-zone-worker` as PID 1 -- an
+# ordinary application that never wait()s -- and there the corpses, and the
+# references they hold, stay for the life of the pod.
+
+# Bounded so a wedged child cannot strand the dump.  On expiry the ids are
+# still taken and the restore's own collision preflight reports it, which is a
+# better failure than hanging here.
+_DUMP_REAP_TIMEOUT_S = 60.0
+
+# The sweep's own bound, far shorter: by the time it runs the tree has already
+# been SIGKILLed, so anything still alive is wedged rather than slow.
+_ORPHAN_SWEEP_TIMEOUT_S = 10.0
+
+# prctl(2).  Absent from the stdlib; Linux 3.4+, and needs no privilege.
+_PR_SET_CHILD_SUBREAPER = 36
+
+
+def _reap_dumped_child(child_proc, child_pid, log):
+    """Reap the child ``criu dump`` just killed, releasing its task ids.
+
+    ``waitpid`` on a thread group leader returns only once every thread in the
+    group has exited, so this frees the whole recorded id set rather than just
+    the leader's -- which is what the restore needs.
+    """
+    if child_proc is None:
+        # A restored child was detached by criu and reparented away, so it is
+        # not ours to reap.  Only the spawn path (the one a cache-miss dump
+        # takes) has a Process handle here.
+        return
+    try:
+        child_proc.join(timeout=_DUMP_REAP_TIMEOUT_S)
+    except Exception as e:
+        log.warning("  reaping dumped child %s failed: %s", child_pid, e)
+        return
+    if child_proc.exitcode is None:
+        log.warning(
+            "  dumped child %s not reapable after %.0fs; its task ids stay "
+            "taken and may collide with the restore that follows",
+            child_pid, _DUMP_REAP_TIMEOUT_S)
+    else:
+        log.info("  reaped dumped child %s (exit %s)", child_pid,
+                 child_proc.exitcode)
+
+
+def _set_child_subreaper(log):
+    """Become the reaper for this worker's orphaned descendants.
+
+    Without it an orphan reparents to PID 1, which in a DSS zone pod is an
+    application that never ``wait()``s, so the corpse -- and the process-group
+    and session references it holds on the dumped leader's pid -- outlive the
+    pod's every restore.  As a subreaper we adopt those orphans instead, which
+    is the only thing that brings them within ``waitpid``'s reach: they are the
+    worker's grandchildren, so before this ``waitpid`` answers ``ECHILD``.
+
+    Set once at worker start, before any child is spawned.  The flag is
+    consulted when a descendant is orphaned, not when it is forked, so this
+    covers the whole subtree for the life of the worker.
+
+    Best-effort: ``prctl`` needs no privilege, but if it fails the cost is a
+    sweep that finds nothing, which must never stop a worker from starting.
+    """
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        if libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(),
+                          os.strerror(ctypes.get_errno()))
+    except (OSError, AttributeError) as e:
+        log.warning("not a child subreaper (%s); descendants orphaned by a "
+                    "dump will reparent to PID 1, and if it does not reap "
+                    "them their pgid/sid references will hold the leader's "
+                    "id against the restore", e)
+        return False
+    return True
+
+
+def _reap_orphaned_descendants(log, timeout_s=_ORPHAN_SWEEP_TIMEOUT_S):
+    """Collect every orphaned descendant, dropping the pgid/sid references
+    that keep the dumped leader's id allocated.
+
+    Pairs with ``_set_child_subreaper``: these tasks are the worker's
+    grandchildren, adopted only because that flag is set.  Each reap drops a
+    reference on the id naming their process group and session -- the dumped
+    leader's -- and the last one frees it.
+
+    Runs until ``waitpid`` reports no children left, since that is the only
+    answer that means the tree is fully collected.  Bounded, because by the
+    time this runs the tree has been SIGKILLed: a task still alive is wedged,
+    and must not strand a dump whose image is already on disk.
+
+    Returns the pids reaped.  Never raises.
+    """
+    reaped = []
+    t0 = time.monotonic()
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break                      # no children left: fully collected
+        except OSError as e:
+            log.warning("  orphan sweep failed: %s", e)
+            break
+        if pid == 0:
+            # Children exist but none has exited yet -- the tree is still on
+            # its way down.  Poll rather than block: WNOHANG is the whole
+            # point, so a wedged task costs the deadline and nothing more.
+            if time.monotonic() - t0 >= timeout_s:
+                log.warning(
+                    "  orphan sweep gave up after %.0fs with a live "
+                    "descendant left; it may still reference recorded ids",
+                    timeout_s)
+                break
+            time.sleep(0.02)
+            continue
+        reaped.append(pid)
+    if reaped:
+        shown = ", ".join(str(p) for p in reaped[:12])
+        if len(reaped) > 12:
+            shown += ", ..."
+        log.info("  reaped %d orphaned descendant(s): %s", len(reaped), shown)
+    return reaped
+
+
+# ---------------------------------------------------------------------------
 # Worker main loop
 # ---------------------------------------------------------------------------
 
@@ -1646,6 +2485,10 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
     TP=1; a bare int is still accepted).  ``model_dir`` is threaded to the
     vLLM child so it can point its compile cache at
     ``<model_dir>/compilation``.
+
+    Node identity for a multi-node TP group arrives as the ``init`` command's
+    ``multinode`` kwarg and is handed to the child at spawn; see the ``init``
+    branch below.
     """
     if isinstance(gpus, int):
         gpus = [gpus]
@@ -1653,12 +2496,11 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
     rank = gpus[0]
     # Capture-node GPU UUIDs, hydrated from meta.json on the restore path.
     capture_gpu_uuids = None
-    semip_logging.init_process()
+    semip_logging.init_process(role="worker")
     log = semip_logging.worker(instance_id, rank)
     # Route everything this process emits (worker.N records, prints,
-    # tracebacks) into the shared per-instance file.  The parent
-    # truncated it at Instance() construction; we just append.
-    semip_logging.redirect_stdio_to_instance_file(instance_id)
+    # tracebacks) to the pod log, which the child it spawns inherits too.
+    semip_logging.redirect_stdio_to_pod_log()
 
     child_pid = None
     child_proc = None
@@ -1677,6 +2519,11 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
     import atexit
     atexit.register(lambda: _kill_pidns_holder(ns_holder, log))
 
+    # Before any child exists, so every descendant this worker ever orphans is
+    # ours to reap rather than PID 1's to ignore.  See "Reaping the dumped
+    # tree" above for why that decides whether a dump frees its ids.
+    _set_child_subreaper(log)
+
     log.info("started")
 
     while True:
@@ -1693,8 +2540,14 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
             spawn_ctx = mp.get_context("spawn")
             child_proc = spawn_ctx.Process(
                 target=vllm_child_loop,
-                args=(pipe_child, instance_id, list(gpus), model_dir),
+                args=(pipe_child, instance_id, list(gpus), model_dir,
+                      kwargs.get("multinode")),
             )
+            # ``multinode`` is a spawn argument rather than an ``init`` kwarg
+            # alone because the child pins its NCCL/gloo interface, VLLM_HOST_IP
+            # and the pinned aws-ofi-nccl values before it imports vLLM -- which
+            # happens at module scope in the child, long before the ``init``
+            # command is read off the pipe.
             # In unprivileged mode (SEMIP_UNPRIVILEGED=1), ask ONLY the spawned
             # child to drop its Linux capabilities (at its module import,
             # before torch) so the CRIU image records an empty cap set and
@@ -1703,8 +2556,9 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
             # that adds --unprivileged to dump and picks the lowcap restore.
             # _SEMIP_CHILD_DROP_CAPS is an internal signal (leading underscore),
             # NOT a user flag: set it only across start() so it lands in the
-            # child's environment; the worker itself must keep its caps to run
-            # `sudo criu` (it also imports vllm_child, which drops on the flag).
+            # child's environment.  The worker must not drop its own caps --
+            # it imports vllm_child too, and it has to stay able to run criu
+            # and signal the tree.
             _drop_caps = _unprivileged()
             _prev_child_flag = os.environ.get("_SEMIP_CHILD_DROP_CAPS")
             if _drop_caps:
@@ -1724,6 +2578,7 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
                 target=_child_thread,
                 args=(instance_id, list(gpus), child_pid, pipe_parent,
                       child_queue, result_queue, completed_counter),
+                kwargs={"child_proc": child_proc},
                 daemon=True,
             )
             child_thread_obj.start()
@@ -1795,22 +2650,6 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
                 # device map when the restore node is not the capture node.
                 capture_gpu_uuids = meta.get("gpu_uuids")
 
-                # CRIU restored fd 1/2 onto the path that was open at dump
-                # time, which encodes the instance_id the model had then --
-                # not necessarily the one we have now.  Tell the child to
-                # re-dup2 onto /tmp/inst{instance_id}.log before any other
-                # command flows through the pipe.  Safe to do here because
-                # _child_thread hasn't been started yet, so the worker
-                # still owns the pipe.
-                pipe_parent.send(("rebind_log",
-                                  {"instance_id": instance_id}))
-                ack = pipe_parent.recv()
-                if (not isinstance(ack, tuple) or len(ack) != 4
-                        or ack[0] != "rebind_log" or ack[2] is not None):
-                    raise RuntimeError(f"rebind_log failed: {ack!r}")
-                log.info("  rebound child stdio to %s",
-                         ack[3].get("path"))
-
                 child_queue = queue.Queue()
                 child_thread_obj = threading.Thread(
                     target=_child_thread,
@@ -1825,8 +2664,6 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
                 info["rank"] = old_rank
                 info["gpus"] = list(old_gpus)
                 info["image_dir"] = image_dir
-                info["child_log_path"] = semip_logging.instance_log_path(
-                    instance_id)
                 log.info("  CRIU restored pid=%s (checkpointed, awaiting restore)",
                          new_pid)
             except Exception as e:
@@ -1853,6 +2690,15 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
                     child_proc.join(timeout=5)
             _kill_pidns_holder(ns_holder, log)
             ns_holder = None
+            # Being a subreaper, we have adopted the corpses of the tree this
+            # teardown just killed -- including a restored one, which criu
+            # detached from us but whose descendants still reparent here.
+            # Collect them while we still can: once this worker exits they go
+            # to PID 1, and if it does not reap they hold their ids, and the
+            # ids naming their group and session, for the life of the pod.
+            # Shorter bound than the dump's: teardown latency is visible to
+            # the orchestrator, and the tree has already been SIGKILLed.
+            _reap_orphaned_descendants(log, timeout_s=5.0)
             break
 
         if cmd == "exit":
@@ -1868,6 +2714,7 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
                     child_proc.join(timeout=5)
             _kill_pidns_holder(ns_holder, log)
             ns_holder = None
+            _reap_orphaned_descendants(log, timeout_s=5.0)
             result_queue.put(("exit", 0.0, None, {}))
             break
 

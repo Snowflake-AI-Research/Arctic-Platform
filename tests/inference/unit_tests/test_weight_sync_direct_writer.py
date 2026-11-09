@@ -35,7 +35,7 @@ if "ray" not in sys.modules:
 if "vllm" not in sys.modules:
     vllm_module = types.ModuleType("vllm")
     vllm_module.__path__ = []
-    vllm_module.__version__ = "0.30.0"
+    vllm_module.__version__ = "0.31.0"
     config_module = types.ModuleType("vllm.config")
     scheduler_module = types.ModuleType("vllm.v1.core.sched.scheduler")
     loggers_module = types.ModuleType("vllm.v1.metrics.loggers")
@@ -521,6 +521,173 @@ def test_load_fp8_tracks_all_received_bytes(monkeypatch):
 
     assert loaded == 2
     assert recv_l2_sq == 14.0
+
+
+def test_fp8_updater_uses_native_weight_loader_for_tp_sharding(monkeypatch):
+    from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+
+    linear_module = types.ModuleType("vllm.model_executor.layers.linear")
+
+    class RowParallelLinear:
+        tp_rank = 3
+        tp_size = 4
+
+        def weight_loader(self, param, loaded):
+            param.data.copy_(loaded.narrow(1, 6, 2))
+
+    linear_module.RowParallelLinear = RowParallelLinear
+    monkeypatch.setitem(
+        sys.modules, "vllm.model_executor.layers.linear", linear_module
+    )
+
+    target = nn.Parameter(
+        torch.zeros((4, 2), dtype=torch.float8_e4m3fn),
+        requires_grad=False,
+    )
+    target_scale = nn.Parameter(torch.zeros((2, 1)), requires_grad=False)
+    module = RowParallelLinear()
+    updater = _FP8InplaceUpdater.__new__(_FP8InplaceUpdater)
+    updater._params = {
+        "layer.down_proj.weight": target,
+        "layer.down_proj.weight_scale_inv": target_scale,
+    }
+    updater._fp8_modules = {"layer.down_proj": module}
+    updater._bufs = {}
+    updater._shards_left = {}
+
+    full = torch.arange(32, dtype=torch.float32).reshape(4, 8).to(
+        torch.float8_e4m3fn
+    )
+    updater.feed("layer.down_proj.weight", full)
+    full_scale = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    updater.feed("layer.down_proj.weight_scale_inv", full_scale)
+
+    torch.testing.assert_close(target.data.float(), full[:, 6:8].float())
+    torch.testing.assert_close(target_scale, full_scale[:, 3:4])
+    assert updater.pending == 0
+
+
+def _install_fp8_vllm_stubs(monkeypatch):
+    class _Linear(nn.Module):
+        def __init__(self, weight, *, tp_rank=0, tp_size=1, output_partition_sizes=None):
+            super().__init__()
+            self.weight = weight
+            self.tp_rank = tp_rank
+            self.tp_size = tp_size
+            if output_partition_sizes is not None:
+                self.output_partition_sizes = output_partition_sizes
+
+    class ColumnParallelLinear(_Linear):
+        pass
+
+    class MergedColumnParallelLinear(ColumnParallelLinear):
+        def weight_loader(self, param, loaded, shard_id=None):
+            rows = loaded.shape[0]
+            param.data.narrow(0, shard_id * rows, rows).copy_(loaded)
+
+    class QKVParallelLinear(ColumnParallelLinear):
+        pass
+
+    class RowParallelLinear(_Linear):
+        pass
+
+    class BasevLLMParameter(nn.Parameter):
+        pass
+
+    linear = types.ModuleType("vllm.model_executor.layers.linear")
+    linear.ColumnParallelLinear = ColumnParallelLinear
+    linear.MergedColumnParallelLinear = MergedColumnParallelLinear
+    linear.QKVParallelLinear = QKVParallelLinear
+    linear.RowParallelLinear = RowParallelLinear
+    parameter = types.ModuleType("vllm.model_executor.parameter")
+    parameter.BasevLLMParameter = BasevLLMParameter
+    custom_ops = types.ModuleType("vllm._custom_ops")
+    custom_ops.scaled_fp8_quant = lambda tensor, scale=None: (
+        tensor.to(torch.float8_e4m3fn),
+        torch.tensor([2.0]),
+    )
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.layers.linear", linear)
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.parameter", parameter)
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", custom_ops)
+    return linear
+
+
+def _frozen(tensor):
+    return nn.Parameter(tensor, requires_grad=False)
+
+
+@pytest.mark.parametrize("layer", ["row", "column", "merged"])
+def test_fp8_updater_shards_scales_from_the_full_tensor(monkeypatch, layer):
+    from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+
+    linear = _install_fp8_vllm_stubs(monkeypatch)
+    full_scale = torch.arange(48, dtype=torch.float32).reshape(8, 6)
+    weight = _frozen(torch.zeros((2, 2), dtype=torch.float8_e4m3fn))
+    if layer == "row":
+        module = linear.RowParallelLinear(weight, tp_rank=1, tp_size=2)
+        expected = full_scale[:, 3:6]
+    elif layer == "column":
+        module = linear.ColumnParallelLinear(weight, tp_rank=1, tp_size=2)
+        expected = full_scale[4:8]
+    else:
+        module = linear.MergedColumnParallelLinear(
+            weight, tp_rank=1, tp_size=2, output_partition_sizes=[2, 2]
+        )
+        expected = torch.cat([full_scale[2:4], full_scale[6:8]])
+    target_scale = _frozen(torch.zeros(expected.T.shape))
+    updater = _FP8InplaceUpdater.__new__(_FP8InplaceUpdater)
+    updater._params = {"layer.proj.weight_scale_inv": target_scale}
+    updater._fp8_modules = {"layer.proj": module}
+
+    updater.feed("layer.proj.weight_scale_inv", full_scale)
+
+    torch.testing.assert_close(target_scale.data, expected.T)
+
+
+def test_fp8_updater_rejects_scales_that_do_not_split_across_tp(monkeypatch):
+    from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+
+    linear = _install_fp8_vllm_stubs(monkeypatch)
+    weight = _frozen(torch.zeros((2, 2), dtype=torch.float8_e4m3fn))
+    updater = _FP8InplaceUpdater.__new__(_FP8InplaceUpdater)
+    updater._params = {"layer.proj.weight_scale_inv": _frozen(torch.zeros(1, 1))}
+    updater._fp8_modules = {"layer.proj": linear.RowParallelLinear(weight, tp_size=2)}
+
+    with pytest.raises(ValueError, match="does not split"):
+        updater.feed("layer.proj.weight_scale_inv", torch.zeros(1, 3))
+
+
+def test_fp8_updater_requantizes_bf16_and_copies_unquantized_layers(monkeypatch):
+    from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+
+    linear = _install_fp8_vllm_stubs(monkeypatch)
+    model = nn.Module()
+    model.mlp = nn.Module()
+    model.mlp.gate_up_proj = linear.MergedColumnParallelLinear(
+        _frozen(torch.zeros((4, 6), dtype=torch.float8_e4m3fn))
+    )
+    model.mlp.gate_up_proj.weight_scale = _frozen(torch.zeros(1))
+    model.mlp.down_proj = linear.RowParallelLinear(
+        _frozen(torch.zeros((4, 6), dtype=torch.bfloat16))
+    )
+    updater = _FP8InplaceUpdater(model, torch.bfloat16, "cpu")
+    gate = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+    up = gate + 12
+    down = torch.ones((4, 6), dtype=torch.bfloat16)
+
+    updater.feed("mlp.gate_proj.weight", gate)
+    updater.feed("mlp.up_proj.weight", up)
+    updater.feed("mlp.down_proj.weight", down)
+
+    assert updater.pending == 0
+    torch.testing.assert_close(
+        model.mlp.gate_up_proj.weight.data.float(),
+        torch.cat([gate, up]).T.to(torch.float8_e4m3fn).float(),
+    )
+    torch.testing.assert_close(
+        model.mlp.gate_up_proj.weight_scale.data, torch.tensor([2.0])
+    )
+    torch.testing.assert_close(model.mlp.down_proj.weight.data, down)
 
 
 def test_fused_writer_reports_canonical_moe_destination():

@@ -18,6 +18,7 @@ from arctic_platform.inference.server.scheduler import (
     Scheduler,
     prefix_affinity_routing,
 )
+from arctic_platform.inference.server.token_prompts import compact_token_tensor, is_token_tensor
 from arctic_platform.inference.server.worker import InferenceWorker
 
 logger = logging.getLogger("arctic_platform.inference.server")
@@ -87,6 +88,47 @@ async def _await_maybe(value: Any) -> Any:
     return value
 
 
+def _node_slots(node_ids: list[Any]) -> list[tuple[int, int]]:
+    """``(slot, replicas in that pod)`` for each worker, in worker order.
+
+    ``node_ids`` are Ray node ids, and each pod runs one Ray node, so slots
+    number the replicas *within* a pod, in worker order; in a single pod they
+    equal the worker indices. They are what a replica's semi-p image directory
+    and VLLM_PORT range are keyed on: both are per pod, and Ray does not place
+    actors in index order across pods, so a global index taken modulo the
+    per-pod count could put two replicas of one pod on one slot.
+    """
+    counts: dict[Any, int] = {}
+    slots = []
+    for node in node_ids:
+        slots.append(counts.get(node, 0))
+        counts[node] = counts.get(node, 0) + 1
+    return [(slot, counts[node]) for slot, node in zip(slots, node_ids)]
+
+
+def _free_slot(taken: set[int], preferred: int | None = None) -> int:
+    """``preferred`` if it is not ``taken``, else the lowest free slot."""
+    if preferred is not None and preferred not in taken:
+        return preferred
+    slot = 0
+    while slot in taken:
+        slot += 1
+    return slot
+
+
+async def _worker_node_id(worker: Any) -> Any:
+    """The Ray node (pod) a worker actor landed on, or ``None`` if it cannot say."""
+    getter = getattr(worker, "get_node_id", None)
+    if getter is None:
+        return None
+    try:
+        return await _await_maybe(getter.remote())
+    except Exception:
+        logger.warning("could not read a worker's Ray node id; numbering it as "
+                       "if it shared a pod with the others", exc_info=True)
+        return None
+
+
 def ensure_ray() -> int:
     """Initialize Ray and return the total number of GPUs in the cluster."""
     ray.init(ignore_reinit_error=True, log_to_driver=True)
@@ -135,6 +177,12 @@ class ReplicaPool:
         self._config: ModelConfig | None = None
         self._model_id: str | None = None
         self._workers: list[ray.actor.ActorHandle] = []
+        # The non-leader node-partitions of a semi-p engine that spans pods. Empty in
+        # every other configuration, including single-pod semi-p.
+        self._semip_agents: list[ray.actor.ActorHandle] = []
+        # ``(node_id, slot)`` per worker, parallel to ``_workers``. See
+        # ``_node_slots``.
+        self._slots: list[tuple[Any, int]] = []
         self._scheduler: Scheduler | None = None
         self._lock = asyncio.Lock()
         self._stream_admission_blocked = False
@@ -150,7 +198,7 @@ class ReplicaPool:
         self._cached_spec_weights_info: list[dict] | None = None
         self._sleeping = False
         self._synced_lora_name: str | None = None
-        # Cross-node placement group for a node-spanning engine, built and
+        # Cross-node placement group for a pod-spanning engine, built and
         # owned by the caller (dss-platform) and threaded in via initialize().
         # When set, this pool runs the multi-node path: a single 0-GPU
         # coordinator actor is scheduled into this PG (bundle 0) and vLLM's Ray
@@ -203,14 +251,75 @@ class ReplicaPool:
     # ------------------------------------------------------------------
 
     def _is_multi_node(self) -> bool:
-        """True when this engine runs the node-spanning path.
+        """True when this engine runs the pod-spanning path.
 
-        The caller (dss-platform) decides node-spanning by building a cross-node
+        The caller (dss-platform) decides pod-spanning by building a cross-node
         placement group and passing it to :meth:`initialize`. The pool simply
         keys off that PG's presence: when set, it schedules a 0-GPU coordinator
         into the PG; when ``None`` it takes the single-node path.
         """
         return self._engine_pg is not None
+
+    def _is_semip_per_node(self) -> bool:
+        """Whether this pool is one semi-p engine spread over whole pods.
+
+        Two conditions, and both matter. ``semi_p`` because only a restored
+        engine works this way -- a cold vLLM engine across pods uses the Ray
+        executor and the 0-GPU coordinator above. A bundle count below the
+        world size because that is what distinguishes a per-pod placement
+        group (``nnodes`` bundles, each holding one pod's GPUs) from the
+        per-rank one (``world_size`` bundles of 1).
+        """
+        if self._engine_pg is None:
+            return False
+        if not bool(getattr(self._config, "semi_p", False)):
+            return False
+        bundles = getattr(self._engine_pg, "bundle_specs", None) or []
+        return 0 < len(bundles) < self.world_size
+
+    def _nnodes(self) -> int:
+        bundles = getattr(self._engine_pg, "bundle_specs", None) or []
+        return len(bundles)
+
+    def _local_gpus(self) -> int:
+        """GPUs one pod of a per-pod placement holds."""
+        return self.world_size // max(self._nnodes(), 1)
+
+    def _node_bundle_options(self, bundle_index: int,
+                             num_gpus: int) -> dict[str, Any]:
+        """Actor options pinning a node-partition to its own pod's bundle.
+
+        ``capture_child_tasks`` is deliberately absent: this actor's children
+        are the semi-p worker and the vLLM child, which are plain processes on
+        this pod rather than Ray tasks, and capturing would scope them to a
+        bundle they do not draw resources from.
+        """
+        options: dict[str, Any] = dict(
+            num_gpus=num_gpus,
+            max_concurrency=2048,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=self._engine_pg,
+                placement_group_bundle_index=bundle_index,
+            ),
+        )
+        worker_env = {
+            k: str(v) for k, v in (self._config.extra_env or {}).items()
+        }
+        if worker_env:
+            options["runtime_env"] = {"env_vars": worker_env}
+        return options
+
+    def _make_semip_agents(self) -> list[ray.actor.ActorHandle]:
+        """One agent per non-leader pod, each owning that pod's GPUs."""
+        from arctic_platform.inference.server.semip_agent import SemipNodeAgent
+
+        local = self._local_gpus()
+        return [
+            SemipNodeAgent.options(
+                **self._node_bundle_options(k, local)
+            ).remote()
+            for k in range(1, self._nnodes())
+        ]
 
     def _make_worker(self) -> ray.actor.ActorHandle:
         """Create one inference-worker actor.
@@ -219,7 +328,18 @@ class ReplicaPool:
         vLLM engine (unchanged). Multi-node: the actor is a 0-GPU coordinator
         pinned into a cross-node PG; vLLM inherits that PG via
         ``get_current_placement_group()`` and schedules one rank per bundle.
+
+        Semi-p across pods is neither. Its engine is restored from a CRIU image
+        rather than constructed, so there is no vLLM Ray executor to inherit a
+        PG and no per-rank actor to schedule: the leader owns a real
+        ``Instance`` driving this pod's whole GPU set, and a ``SemipNodeAgent``
+        owns the other pod's. So the leader reserves ``world_size / nnodes``
+        GPUs in bundle 0 and keeps the mp backend.
         """
+        if self._is_semip_per_node():
+            return self._worker_cls.options(
+                **self._node_bundle_options(0, self._local_gpus())
+            ).remote()
         if self._is_multi_node():
             options: dict[str, Any] = dict(
                 num_gpus=0,
@@ -274,6 +394,30 @@ class ReplicaPool:
             raise ValueError(
                 "caller-provided placement group must expose bundle_specs"
             )
+        total_gpus = sum(float(b.get("GPU", 0)) for b in bundle_specs)
+        per_node = (bool(getattr(config, "semi_p", False))
+                    and len(bundle_specs) != expected
+                    and total_gpus == expected)
+        if per_node:
+            # Semi-p across pods places whole pods, not ranks: `nnodes`
+            # bundles whose GPUs sum to the world size. The engine is restored
+            # from an image rather than built by vLLM's Ray executor, so there
+            # is no per-rank actor for a per-rank bundle to hold.
+            if expected % len(bundle_specs):
+                raise ValueError(
+                    f"semi_p placement group has {len(bundle_specs)} bundles "
+                    f"for a world size of {expected}, which does not divide "
+                    f"evenly; the node-partitions would hold different rank counts and "
+                    f"deadlock in their first collective"
+                )
+            sizes = {float(b.get("GPU", 0)) for b in bundle_specs}
+            if len(sizes) != 1:
+                raise ValueError(
+                    f"semi_p placement group bundles hold different GPU "
+                    f"counts ({sorted(sizes)}); every pod of one engine must "
+                    f"hold the same number of ranks"
+                )
+            return
         if len(bundle_specs) != expected:
             raise ValueError(
                 "caller-provided placement group has "
@@ -294,6 +438,16 @@ class ReplicaPool:
     ) -> dict[str, Any]:
         """Build engine kwargs and enforce the multi-node Ray executor."""
         kwargs = config.to_engine_kwargs()
+        if multi_node and bool(getattr(config, "semi_p", False)):
+            # A semi-p engine is restored, not constructed, so there is no Ray
+            # executor to place: each node-partition runs its own mp-backed executor
+            # over its pod's GPUs, and the leader's spans all of them once NCCL is
+            # re-initialized. Forcing "ray" here would hand vLLM a backend it
+            # never gets to use and override the mp backend the image was
+            # dumped with -- which has to match, because criu_restore compares
+            # the config byte for byte.
+            kwargs.setdefault("distributed_executor_backend", "mp")
+            return kwargs
         if multi_node:
             backend = kwargs.get("distributed_executor_backend")
             if backend not in (None, "ray"):
@@ -352,6 +506,7 @@ class ReplicaPool:
 
     def _reset_lifecycle_state(self) -> None:
         self._workers.clear()
+        self._slots.clear()
         # The engine PG is owned by the caller (dss-platform); we only drop our
         # reference to it here and never remove it.
         self._engine_pg = None
@@ -451,6 +606,51 @@ class ReplicaPool:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
 
+    def _worker_env(
+        self,
+        slot: int,
+        count: int,
+        extra_env: dict[str, str] | None,
+    ) -> dict[str, str]:
+        """The env one worker initializes with, for its pod-local ``slot``.
+
+        ``SEMIP_REPLICA_ID`` and ``SEMIP_NUM_REPLICAS`` tell a semi-p engine
+        which per-pod image directory is its own; harmless otherwise.
+        """
+        worker_env = dict(extra_env or {})
+        # The per-replica VLLM_PORT pin only exists to keep multiple single-pod
+        # replicas in one pod from colliding, so it keys on the pod-local
+        # slot. A pod-spanning engine has a single replica whose vLLM Ray
+        # executor derives its torch.distributed rendezvous port from
+        # VLLM_PORT; pinning it collides with the co-located EngineCore
+        # (EADDRINUSE). Let vLLM pick free ports instead.
+        if not self._is_multi_node():
+            port_base = _env_int("ARCTIC_VLLM_PORT_BASE", 8000, minimum=1)
+            port_stride = _env_int("ARCTIC_VLLM_PORT_STRIDE", 100, minimum=1)
+            worker_env["VLLM_PORT"] = str(port_base + slot * port_stride)
+        worker_env["SEMIP_REPLICA_ID"] = str(slot)
+        worker_env["SEMIP_NUM_REPLICAS"] = str(count)
+        return worker_env
+
+    async def _place_new_worker(
+        self,
+        worker: ray.actor.ActorHandle,
+        preferred: int | None = None,
+        replacing: int | None = None,
+    ) -> tuple[Any, int, int]:
+        """``(node, slot, count)`` for a worker joining an initialized pool.
+
+        ``replacing`` is the index whose slot is being handed over (a restart);
+        its old slot is ``preferred`` when the new actor lands in the same pod.
+        """
+        node = None if self._is_multi_node() else await _worker_node_id(worker)
+        taken = {
+            slot for i, (other, slot) in enumerate(self._slots)
+            if other == node and i != replacing
+        }
+        slot = _free_slot(taken, preferred)
+        return node, slot, len(taken) + 1
+
     async def _initialize_workers(
         self,
         engine_kwargs: dict[str, Any],
@@ -468,24 +668,31 @@ class ReplicaPool:
                 stagger_s,
             )
 
-        port_base = _env_int("ARCTIC_VLLM_PORT_BASE", 8000, minimum=1)
-        port_stride = _env_int("ARCTIC_VLLM_PORT_STRIDE", 100, minimum=1)
-        # The per-replica VLLM_PORT pin only exists to keep multiple single-node
-        # replicas on one host from colliding. A node-spanning engine has a
-        # single replica whose vLLM Ray executor derives its torch.distributed
-        # rendezvous port from VLLM_PORT; pinning it collides with the
-        # co-located EngineCore (EADDRINUSE). Let vLLM pick free ports instead.
-        pin_vllm_port = not self._is_multi_node()
+        if self._is_multi_node():
+            node_ids: list[Any] = [None] * n
+        else:
+            node_ids = list(await asyncio.gather(
+                *[_worker_node_id(w) for w in self._workers]))
+        slots = _node_slots(node_ids)
+        self._slots = [(node, slot) for node, (slot, _) in zip(node_ids, slots)]
+
+        if self._semip_agents:
+            # The leader drives the other node-partitions from inside restore_and_wrap,
+            # so the handles have to reach it. They travel in engine_kwargs
+            # beside the semi_p flag itself, and InferenceWorker.initialize
+            # pops both before AsyncEngineArgs ever sees them.
+            engine_kwargs = {**engine_kwargs,
+                             "semi_p_agents": list(self._semip_agents)}
 
         for start in range(0, n, concurrency):
             batch = self._workers[start : start + concurrency]
             refs = []
             for offset, worker in enumerate(batch):
                 worker_idx = start + offset
-                logger.info("Initializing worker %d/%d", worker_idx + 1, n)
-                worker_env = dict(extra_env or {})
-                if pin_vllm_port:
-                    worker_env["VLLM_PORT"] = str(port_base + worker_idx * port_stride)
+                slot, count = slots[worker_idx]
+                logger.info("Initializing worker %d/%d (slot %d of %d in its "
+                            "pod)", worker_idx + 1, n, slot, count)
+                worker_env = self._worker_env(slot, count, extra_env)
                 refs.append(worker.initialize.remote(engine_kwargs, worker_env, self._model_id))
                 if stagger_s > 0 and offset + 1 < len(batch):
                     await asyncio.sleep(stagger_s)
@@ -506,11 +713,11 @@ class ReplicaPool:
             num_replicas: Number of replicas. If ``None``, uses all
                 available GPUs (``total_gpus // world_size`` where
                 world_size = tensor_parallel_size * pipeline_parallel_size).
-                Ignored when ``placement_group`` is given (a node-spanning
+                Ignored when ``placement_group`` is given (a pod-spanning
                 engine is a single replica bound to that one PG).
             placement_group: Optional pre-built cross-node Ray placement group
                 from the caller (dss-platform). When given, this pool runs the
-                node-spanning path: one 0-GPU coordinator actor is scheduled
+                pod-spanning path: one 0-GPU coordinator actor is scheduled
                 into the PG (bundle 0) and vLLM's Ray executor inherits it via
                 capture_child_tasks. The pool does not create or remove the PG.
                 ``None`` keeps the single-node path (the pool reserves
@@ -537,7 +744,7 @@ class ReplicaPool:
         self._engine_pg = placement_group
 
         if self._engine_pg is not None:
-            # A node-spanning engine occupies its whole PG as a single replica;
+            # A pod-spanning engine occupies its whole PG as a single replica;
             # the caller sized the PG to exactly this engine's world_size.
             num_replicas = 1
         elif num_replicas is None:
@@ -552,15 +759,32 @@ class ReplicaPool:
 
         n = num_replicas
         multi_node = self._is_multi_node()
+        per_node = self._is_semip_per_node()
+        if per_node:
+            shape = (f"semi_p across {self._nnodes()} pods: leader + "
+                     f"{self._nnodes() - 1} agent(s), "
+                     f"{self._local_gpus()} GPUs each")
+        elif multi_node:
+            shape = "multi-node: 0-GPU coordinator + cross-node PG"
+        else:
+            shape = "single-node"
         logger.info(
             f"Creating {n} workers (TP={self.tp_size}, PP={self.pp_size}, "
-            f"world_size={self.world_size}, "
-            f"{'multi-node: 0-GPU coordinator + cross-node PG' if multi_node else 'single-node'})"
+            f"world_size={self.world_size}, {shape})"
+        )
+        logger.info(
+            "clear_cache_on_weight_sync=%s (applies to strategy='pause', "
+            "pause_mode='keep' weight syncs)",
+            self._config.clear_cache_on_weight_sync,
         )
 
         extra_env = self._config.extra_env or None
         try:
             self._workers = []
+            if per_node:
+                # Created before the leader initializes: its restore_and_wrap
+                # drives them, so they have to exist by the time it runs.
+                self._semip_agents = self._make_semip_agents()
             for _ in range(n):
                 self._workers.append(self._make_worker())
             await self._initialize_workers(engine_kwargs, extra_env)
@@ -646,8 +870,10 @@ class ReplicaPool:
         """Generate completions for one or more prompts.
 
         Args:
-            prompts: A single prompt (``str`` or token-id ``list[int]``) or a
-                batch of prompts (``list[str | list[int]]``).
+            prompts: A single prompt (``str``, token-id ``list[int]``, or a 1-D
+                integer CPU tensor of token ids) or a batch of prompts (a list
+                of those, or a 2-D integer tensor with one prompt per row).
+                Tensors reach the worker as tensors; see ``token_prompts``.
             sampling_params: vLLM sampling parameters (dict or SamplingParams).
             model_id: Ignored in single-model mode.
             routing_key: Optional per-batch affinity key. A single string
@@ -697,6 +923,18 @@ class ReplicaPool:
                 )
             return params[0] or {}
 
+        if is_token_tensor(prompts):
+            if prompts.dim() == 1:
+                return [self._scheduler.submit(
+                    compact_token_tensor(prompts), _single_params(),
+                    routing_key=_single_key(), strict=strict,
+                )]
+            if prompts.dim() != 2:
+                raise ValueError(
+                    "A token-id tensor must be 1-D (one prompt) or 2-D (a batch), "
+                    f"got shape {tuple(prompts.shape)}"
+                )
+            prompts = list(prompts)
         if isinstance(prompts, str):
             return [self._scheduler.submit(
                 prompts, _single_params(), routing_key=_single_key(), strict=strict,
@@ -705,6 +943,7 @@ class ReplicaPool:
             return [self._scheduler.submit(
                 prompts, _single_params(), routing_key=_single_key(), strict=strict,
             )]
+        prompts = [compact_token_tensor(p) if is_token_tensor(p) else p for p in prompts]
         if isinstance(routing_key, list):
             if len(routing_key) != len(prompts):
                 raise ValueError(
@@ -752,6 +991,8 @@ class ReplicaPool:
                     await self._scheduler.drain_worker(idx)
                 finally:
                     worker = self._workers.pop()
+                    if len(self._slots) > len(self._workers):
+                        self._slots.pop()
                     try:
                         ray.kill(worker)
                     except Exception:
@@ -780,7 +1021,12 @@ class ReplicaPool:
             while len(self._workers) < target_count:
                 worker = self._make_worker()
                 try:
-                    await worker.initialize.remote(engine_kwargs, extra_env, self._model_id)
+                    node, slot, count = await self._place_new_worker(worker)
+                    await worker.initialize.remote(
+                        engine_kwargs,
+                        self._worker_env(slot, count, extra_env),
+                        self._model_id,
+                    )
                 except asyncio.CancelledError:
                     try:
                         ray.kill(worker)
@@ -808,6 +1054,7 @@ class ReplicaPool:
                     return
 
                 self._workers.append(worker)
+                self._slots.append((node, slot))
                 self._scheduler.add_worker(
                     worker,
                     concurrency_limit=self._worker_concurrency_limit(),
@@ -892,6 +1139,23 @@ class ReplicaPool:
             "replica_states": list(states),
         }
 
+    async def get_chat_support(
+        self, model_id: str | None = None, *, timeout: float = 600.0
+    ) -> dict[str, bool]:
+        """Report ``{"chat_prompt": bool, "thinking_optional": bool}`` for the loaded model.
+
+        ``chat_prompt``: streams take a ``ChatPrompt``. ``thinking_optional``:
+        ``reasoning_effort="none"`` turns thinking off. Waits up to ``timeout``
+        seconds for a worker the scheduler can route to, as a restarting
+        worker is not initialized yet.
+        """
+        self._check_model_id(model_id)
+        if self._scheduler is None:
+            raise RuntimeError("ReplicaPool not initialized")
+        # Every replica loads the same model with the same engine kwargs.
+        worker = await self._scheduler.wait_for_schedulable_worker(timeout)
+        return await worker.get_chat_support.remote()
+
     # ------------------------------------------------------------------
     # Metrics
     # ------------------------------------------------------------------
@@ -942,922 +1206,14 @@ class ReplicaPool:
         self,
         pause_mode: str,
         clear_cache: bool,
-    ) -> None:
+    ) -> bool:
+        """Pause generation on every worker; return the clear_cache value sent."""
+        clear_cache = clear_cache or (
+            self.config.clear_cache_on_weight_sync and pause_mode == "keep"
+        )
         await self._pause_workers(
             "pause_generation", mode=pause_mode, clear_cache=clear_cache
         )
+        return clear_cache
 
     async def _pause_workers(self, method: str, **kwargs: Any) -> None:
-        pause_results = await asyncio.gather(
-            *[
-                getattr(worker, method).remote(**kwargs)
-                for worker in self._workers
-            ],
-            return_exceptions=True,
-        )
-        failed_workers = _failed_worker_indices(pause_results)
-        if failed_workers:
-            await asyncio.gather(
-                *[worker.resume_generation.remote() for worker in self._workers],
-                return_exceptions=True,
-            )
-            raise RuntimeError(
-                f"Failed to pause inference workers {failed_workers}: "
-                f"{_worker_error_messages(pause_results, failed_workers)}"
-            )
-
-    async def _resume_generation_after_weight_sync(self) -> None:
-        resume_results = await asyncio.gather(
-            *[worker.resume_generation.remote() for worker in self._workers],
-            return_exceptions=True,
-        )
-        failed_workers = _failed_worker_indices(resume_results)
-        if failed_workers:
-            raise RuntimeError(
-                f"Failed to resume inference workers {failed_workers}: "
-                f"{_worker_error_messages(resume_results, failed_workers)}"
-            )
-
-    async def _reset_prefix_cache_after_weight_sync(
-        self,
-        *,
-        require_success: bool,
-    ) -> dict[str, Any]:
-        timeout_s = (
-            _env_float("ARCTIC_INFERENCE_WEIGHT_SYNC_PREFIX_RESET_TIMEOUT_S", 30.0)
-            if require_success
-            else 0.0
-        )
-        retry_interval_s = _env_float(
-            "ARCTIC_INFERENCE_WEIGHT_SYNC_PREFIX_RESET_RETRY_INTERVAL_S",
-            0.1,
-            minimum=0.01,
-        )
-        results = await asyncio.gather(
-            *[
-                worker.reset_prefix_cache.remote(timeout_s, retry_interval_s)
-                for worker in self._workers
-            ],
-            return_exceptions=True,
-        )
-        per_worker = [
-            {"status": "error", "message": str(result)}
-            if isinstance(result, Exception)
-            else result
-            for result in results
-        ]
-        reset_ok = all(
-            isinstance(result, dict) and bool(result.get("reset_ok"))
-            for result in per_worker
-        )
-        payload = {"reset_ok": reset_ok, "workers": per_worker}
-        if require_success and not reset_ok:
-            raise RuntimeError(
-                "Prefix-cache reset failed after weight sync; refusing to resume "
-                "generation with stale prefix blocks."
-            )
-        if not reset_ok:
-            logger.warning(
-                "Prefix-cache reset did not fully complete after pause-mode weight sync; "
-                "continuing because keep mode can retain running request KV blocks. "
-                "reset_result=%s",
-                payload,
-            )
-        return payload
-
-    async def reset_prefix_cache(
-        self,
-        model_id: str | None = None,
-        *,
-        drain: bool = True,
-        timeout_s: float = 60.0,
-        retry_interval_s: float = 0.1,
-    ) -> dict[str, Any]:
-        self._check_model_id(model_id)
-        if self._scheduler is None:
-            raise RuntimeError("ReplicaPool not initialized")
-        async with self._stream_lifecycle():
-            if drain:
-                self._scheduler.pause()
-                await self._scheduler.drain()
-            try:
-                results = await asyncio.gather(
-                    *[
-                        worker.reset_prefix_cache.remote(timeout_s, retry_interval_s)
-                        for worker in self._workers
-                    ],
-                    return_exceptions=True,
-                )
-            finally:
-                if drain:
-                    self._scheduler.resume()
-            per_worker = [
-                {"status": "error", "message": str(result)}
-                if isinstance(result, Exception)
-                else result
-                for result in results
-            ]
-            return {
-                "status": "ok" if all(
-                    isinstance(result, dict) and bool(result.get("reset_ok"))
-                    for result in per_worker
-                ) else "failed",
-                "reset_ok": all(
-                    isinstance(result, dict) and bool(result.get("reset_ok"))
-                    for result in per_worker
-                ),
-                "workers": per_worker,
-            }
-
-    async def init_router_replay(
-        self,
-        master_addr: str,
-        master_port: int,
-        rank_offset: int,
-        world_size: int,
-        is_server: bool = False,
-    ) -> dict[str, Any]:
-        if self._workers is None:
-            raise RuntimeError("ReplicaPool not initialized")
-        results = await asyncio.gather(
-            *[
-                worker.init_router_replay.remote(
-                    master_addr=master_addr,
-                    master_port=master_port,
-                    rank=rank_offset + idx,
-                    world_size=world_size,
-                    is_server=is_server and idx == 0,
-                )
-                for idx, worker in enumerate(self._workers)
-            ],
-            return_exceptions=True,
-        )
-        return {
-            "n_replicas": len(self._workers),
-            "workers": [
-                {"status": "error", "message": str(result)}
-                if isinstance(result, Exception)
-                else result
-                for result in results
-            ],
-        }
-
-    async def send_router_replay(self) -> dict[str, Any]:
-        if self._scheduler is None:
-            raise RuntimeError("ReplicaPool not initialized")
-
-        async with self._lock:
-            scheduler = self._scheduler
-            if scheduler is None:
-                raise RuntimeError("ReplicaPool not initialized")
-
-            scheduler_was_paused = scheduler.paused
-            scheduler.pause()
-            generation_frozen = False
-            replay_send: asyncio.Future | None = None
-            try:
-                # Hold in-flight requests in place (vLLM keep mode) rather than
-                # draining them: no engine step runs on the sampling GPUs during
-                # the send, and the send does not wait for the longest decode.
-                await self._pause_workers("freeze_generation")
-                generation_frozen = True
-                replay_send = asyncio.gather(
-                    *[
-                        worker.send_router_replay.remote()
-                        for worker in self._workers
-                    ],
-                    return_exceptions=True,
-                )
-                try:
-                    results = await asyncio.shield(replay_send)
-                except asyncio.CancelledError:
-                    # Ray actor work continues after the local await is
-                    # cancelled. Keep the lifecycle lock and scheduler pause
-                    # until every started collective has reached a known state.
-                    while not replay_send.done():
-                        try:
-                            await asyncio.shield(replay_send)
-                        except asyncio.CancelledError:
-                            continue
-                    raise
-            finally:
-                if replay_send is None or replay_send.done():
-                    if generation_frozen:
-                        await self._resume_generation_after_weight_sync()
-                    if not scheduler_was_paused:
-                        scheduler.resume()
-
-        return {
-            "n_replicas": len(self._workers),
-            "workers": [
-                {"status": "error", "message": str(result)}
-                if isinstance(result, Exception)
-                else result
-                for result in results
-            ],
-        }
-
-    async def discard_router_replay(self, sample_ids: list[str]) -> dict[str, Any]:
-        if self._workers is None:
-            raise RuntimeError("ReplicaPool not initialized")
-        results = await asyncio.gather(
-            *[
-                worker.discard_router_replay.remote(sample_ids)
-                for worker in self._workers
-            ],
-            return_exceptions=True,
-        )
-        removed = 0
-        workers = []
-        for result in results:
-            if isinstance(result, Exception):
-                workers.append({"status": "error", "message": str(result)})
-            else:
-                workers.append(result)
-                removed += int(result.get("removed", 0))
-        return {"requested": len(sample_ids), "removed": removed, "workers": workers}
-
-    async def close_router_replay(self) -> dict[str, Any]:
-        if self._workers is None:
-            return {"status": "no_workers"}
-        results = await asyncio.gather(
-            *[worker.close_router_replay.remote() for worker in self._workers],
-            return_exceptions=True,
-        )
-        return {
-            "n_replicas": len(self._workers),
-            "workers": [
-                {"status": "error", "message": str(result)}
-                if isinstance(result, Exception)
-                else result
-                for result in results
-            ],
-        }
-
-    async def sync_weights(
-        self,
-        groups: list[dict[str, Any]] | None = None,
-        bucket_size: int = 256 * 1024 * 1024,
-        strategy: str = "pause",
-        pause_mode: str = "keep",
-        clear_cache: bool = False,
-        engine_only: bool = False,
-        direct_mode: bool = False,
-        reverse: bool = False,
-        model_id: str | None = None,
-        master_addr: str | None = None,
-        master_port: int | None = None,
-        world_size: int | None = None,
-    ) -> dict[str, Any]:
-        """Receive weights from sender(s) and load into all replicas.
-
-        Accepts either ``groups`` or legacy flat fields (``master_addr``,
-        ``master_port``, ``world_size``).  The *strategy* controls how
-        in-flight requests are handled:
-
-          - **pause**: pause scheduler admission, pause vLLM generation,
-            sync, reset prefix cache, resume.
-          - **drain**: pause scheduler, wait for in-flight to finish, sync, resume.
-          - **skip**: mark workers unavailable, cancel in-flight, sync, re-enable.
-          - **hotswap**: sync while serving continues. Unsafe during active generation.
-        """
-        self._validate_weight_sync_strategy(strategy, pause_mode)
-        self._check_model_id(model_id)
-        if self._scheduler is None:
-            raise RuntimeError("ReplicaPool not initialized")
-
-        if groups is None:
-            if master_addr is None or master_port is None:
-                raise ValueError(
-                    "Provide either 'groups' or legacy flat fields "
-                    "(master_addr, master_port, world_size)"
-                )
-            n = self.num_replicas
-            tp = self.tp_size
-            groups = [{
-                "group_id": 0,
-                "master_addr": master_addr,
-                "master_port": master_port,
-                "world_size": world_size or (1 + n * tp),
-                "replica_ids": list(range(n)),
-            }]
-
-        effective_strategy = "hotswap" if engine_only else strategy
-
-        async with self._stream_lifecycle():
-            t0 = time.time()
-            n = len(self._workers)
-            scheduler_was_paused = self._scheduler.paused
-            available_workers = [
-                index for index in range(n)
-                if self._scheduler.is_worker_available(index)
-            ]
-            scheduler_paused = False
-            skipped_workers = False
-            generation_paused = False
-            weight_update_started = False
-            update_succeeded = False
-            prefix_cache_reset: dict[str, Any] | None = None
-            results: list[Any] = []
-
-            try:
-                if effective_strategy in {"pause", "drain"}:
-                    self._scheduler.pause()
-                    scheduler_paused = True
-                elif effective_strategy == "skip":
-                    skipped_workers = True
-                    for i in range(n):
-                        self._scheduler.mark_worker_unavailable(i)
-                await self._scheduler.abort_streams()
-                if effective_strategy == "pause":
-                    await self._pause_generation_for_weight_sync(pause_mode, clear_cache)
-                    generation_paused = True
-                    if pause_mode == "abort":
-                        await self._scheduler.drain()
-                elif effective_strategy == "drain":
-                    await self._scheduler.drain()
-                elif effective_strategy == "skip":
-                    for i in range(n):
-                        self._scheduler.cancel_worker_inflight(i)
-
-                tp = self.tp_size
-                replica_to_group: dict[int, dict[str, Any]] = {}
-                for g in groups:
-                    base_port = g["master_port"]
-                    for rid in g["replica_ids"]:
-                        replica_to_group[rid] = {
-                            "master_addr": g["master_addr"],
-                            "master_port": base_port + rid * tp,
-                            "world_size": 2,
-                            "rank_offset": 1,
-                        }
-
-                self._updating_workers = set(range(n))
-
-                tasks = []
-                for i, worker in enumerate(self._workers):
-                    gcfg = replica_to_group.get(i)
-                    if gcfg is None:
-                        raise RuntimeError(
-                            f"Replica {i} not assigned to any group. "
-                            f"Groups cover replicas: {[g['replica_ids'] for g in groups]}"
-                        )
-                    weight_update_started = True
-                    tasks.append(
-                        worker.sync_weights.remote(
-                            gcfg["master_addr"], gcfg["master_port"],
-                            gcfg["rank_offset"], gcfg["world_size"],
-                            bucket_size, engine_only, direct_mode, reverse,
-                        )
-                    )
-
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                failed_workers = _failed_worker_indices(results)
-                if failed_workers:
-                    raise RuntimeError(
-                        f"Weight sync failed on workers {failed_workers}: "
-                        f"{_worker_error_messages(results, failed_workers)}"
-                    )
-                if effective_strategy == "pause":
-                    prefix_cache_reset = await self._reset_prefix_cache_after_weight_sync(
-                        require_success=pause_mode == "abort",
-                    )
-                update_succeeded = True
-            finally:
-                self._updating_workers.clear()
-                can_restore_scheduling = update_succeeded or not weight_update_started
-                if effective_strategy == "pause":
-                    if generation_paused and update_succeeded:
-                        await self._resume_generation_after_weight_sync()
-                    if scheduler_paused and (update_succeeded or not generation_paused):
-                        if not scheduler_was_paused:
-                            self._scheduler.resume()
-                    elif scheduler_paused:
-                        logger.error(
-                            "Weight sync failed after vLLM generation was paused; "
-                            "leaving scheduler and workers paused for operator recovery."
-                        )
-                elif scheduler_paused and can_restore_scheduling and not scheduler_was_paused:
-                    self._scheduler.resume()
-                if skipped_workers and can_restore_scheduling:
-                    for index in available_workers:
-                        self._scheduler.mark_worker_available(index)
-
-
-            per_worker = [
-                {"status": "error", "message": str(r)} if isinstance(r, Exception) else r
-                for r in results
-            ]
-            elapsed = time.time() - t0
-            logger.info(f"Weight sync: {n} workers, {len(groups)} group(s) in {elapsed:.2f}s")
-            response = {
-                "elapsed": elapsed,
-                "num_groups": len(groups),
-                "strategy": strategy,
-                "pause_mode": pause_mode,
-                "strategy_elapsed": elapsed,
-                "workers": per_worker,
-            }
-            if prefix_cache_reset is not None:
-                response["prefix_cache_reset"] = prefix_cache_reset
-            return response
-
-    async def _run_broadcast_weight_sync(
-        self,
-        *,
-        build_tasks,
-        strategy: str,
-        pause_mode: str,
-        clear_cache: bool,
-        engine_only: bool,
-        model_id: str | None,
-        fail_label: str,
-        log_extra: str = "",
-        extra_response: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Shared pause/resume lifecycle for broadcast weight syncs.
-
-        Only the broadcast payload differs between full-weight and LoRA syncs:
-        ``build_tasks(n, tp, world_size)`` returns the per-worker ``.remote(...)``
-        handles. ``extra_response`` is merged into the returned dict.
-        """
-        self._validate_weight_sync_strategy(strategy, pause_mode)
-        self._check_model_id(model_id)
-        if self._scheduler is None:
-            raise RuntimeError("ReplicaPool not initialized")
-
-        effective_strategy = "hotswap" if engine_only else strategy
-
-        async with self._stream_lifecycle():
-            t0 = time.time()
-            n = len(self._workers)
-            tp = self.tp_size
-            world_size = 1 + n * tp
-            scheduler_was_paused = self._scheduler.paused
-            available_workers = [
-                index for index in range(n)
-                if self._scheduler.is_worker_available(index)
-            ]
-            scheduler_paused = False
-            skipped_workers = False
-            generation_paused = False
-            weight_update_started = False
-            update_succeeded = False
-            prefix_cache_reset: dict[str, Any] | None = None
-            results: list[Any] = []
-
-            try:
-                if effective_strategy in {"pause", "drain"}:
-                    self._scheduler.pause()
-                    scheduler_paused = True
-                elif effective_strategy == "skip":
-                    skipped_workers = True
-                    for i in range(n):
-                        self._scheduler.mark_worker_unavailable(i)
-                await self._scheduler.abort_streams()
-                if effective_strategy == "pause":
-                    await self._pause_generation_for_weight_sync(pause_mode, clear_cache)
-                    generation_paused = True
-                    if pause_mode == "abort":
-                        await self._scheduler.drain()
-                elif effective_strategy == "drain":
-                    await self._scheduler.drain()
-                elif effective_strategy == "skip":
-                    for i in range(n):
-                        self._scheduler.cancel_worker_inflight(i)
-
-                self._updating_workers = set(range(n))
-                weight_update_started = True
-                results = await asyncio.gather(
-                    *build_tasks(n, tp, world_size), return_exceptions=True
-                )
-                failed_workers = _failed_worker_indices(results)
-                if failed_workers:
-                    raise RuntimeError(
-                        f"{fail_label} failed on workers {failed_workers}: "
-                        f"{_worker_error_messages(results, failed_workers)}"
-                    )
-                if effective_strategy == "pause":
-                    prefix_cache_reset = await self._reset_prefix_cache_after_weight_sync(
-                        require_success=pause_mode == "abort",
-                    )
-                update_succeeded = True
-            finally:
-                self._updating_workers.clear()
-                can_restore_scheduling = update_succeeded or not weight_update_started
-                if effective_strategy == "pause":
-                    if generation_paused and update_succeeded:
-                        await self._resume_generation_after_weight_sync()
-                    if scheduler_paused and (update_succeeded or not generation_paused):
-                        if not scheduler_was_paused:
-                            self._scheduler.resume()
-                    elif scheduler_paused:
-                        logger.error(
-                            f"{fail_label} failed after vLLM generation was paused; "
-                            "leaving scheduler and workers paused for operator recovery."
-                        )
-                elif scheduler_paused and can_restore_scheduling and not scheduler_was_paused:
-                    self._scheduler.resume()
-                if skipped_workers and can_restore_scheduling:
-                    for index in available_workers:
-                        self._scheduler.mark_worker_available(index)
-
-            per_worker = [
-                {"status": "error", "message": str(r)} if isinstance(r, Exception) else r
-                for r in results
-            ]
-            elapsed = time.time() - t0
-            logger.info(
-                "%s: %d replicas (world_size=%d)%s in %.2fs",
-                fail_label, n, world_size, log_extra, elapsed,
-            )
-            response = {
-                "elapsed": elapsed,
-                "world_size": world_size,
-                "strategy": strategy,
-                "pause_mode": pause_mode,
-                "workers": per_worker,
-            }
-            if extra_response:
-                response.update(extra_response)
-            if prefix_cache_reset is not None:
-                response["prefix_cache_reset"] = prefix_cache_reset
-            return response
-
-    async def sync_weights_broadcast(
-        self,
-        master_addr: str,
-        master_port: int,
-        bucket_size: int = 256 * 1024 * 1024,
-        strategy: str = "pause",
-        pause_mode: str = "keep",
-        clear_cache: bool = False,
-        engine_only: bool = False,
-        model_id: str | None = None,
-        weight_format: str = "vllm",
-    ) -> dict[str, Any]:
-        """Join one NCCL broadcast group (rank 0 = trainer) and load weights into all replicas."""
-        def build_tasks(n, tp, world_size):
-            return [
-                worker.sync_weights_broadcast.remote(
-                    master_addr, master_port,
-                    rank_offset=1 + i * tp,
-                    world_size=world_size,
-                    bucket_size=bucket_size,
-                    engine_only=engine_only,
-                    weight_format=weight_format,
-                )
-                for i, worker in enumerate(self._workers)
-            ]
-
-        return await self._run_broadcast_weight_sync(
-            build_tasks=build_tasks,
-            strategy=strategy,
-            pause_mode=pause_mode,
-            clear_cache=clear_cache,
-            engine_only=engine_only,
-            model_id=model_id,
-            fail_label="Broadcast weight sync",
-        )
-
-    async def sync_lora_weights_broadcast(
-        self,
-        master_addr: str,
-        master_port: int,
-        lora_config: dict[str, Any],
-        bucket_size: int = 256 * 1024 * 1024,
-        strategy: str = "pause",
-        pause_mode: str = "keep",
-        clear_cache: bool = False,
-        engine_only: bool = False,
-        model_id: str | None = None,
-        lora_name_prefix: str = "policy",
-    ) -> dict[str, Any]:
-        """Join the NCCL broadcast group (rank 0 = trainer) and install a LoRA
-        adapter into every replica's LoRA manager.
-
-        Adapter-only payload over :meth:`sync_weights_broadcast`'s lifecycle.
-        Every sync replaces the same adapter id and name so paused requests
-        continue to reference the resident adapter when generation resumes.
-        """
-        if self._synced_lora_name is None:
-            lora_name = lora_name_prefix
-            if not engine_only:
-                self._synced_lora_name = lora_name
-        else:
-            lora_name = self._synced_lora_name
-            if not engine_only and lora_name_prefix != lora_name:
-                raise ValueError(
-                    "The synced LoRA adapter name must remain stable across "
-                    f"updates: expected {lora_name!r}, got {lora_name_prefix!r}"
-                )
-        lora_int_id = _SYNCED_LORA_ADAPTER_ID
-        evict_first = strategy != "hotswap"
-
-        def build_tasks(n, tp, world_size):
-            return [
-                worker.sync_lora_weights_broadcast.remote(
-                    master_addr, master_port,
-                    rank_offset=1 + i * tp,
-                    world_size=world_size,
-                    lora_int_id=lora_int_id,
-                    lora_name=lora_name,
-                    lora_config=lora_config,
-                    bucket_size=bucket_size,
-                    engine_only=engine_only,
-                    staging=self.config.lora_sync_staging,
-                    evict_first=evict_first,
-                )
-                for i, worker in enumerate(self._workers)
-            ]
-
-        return await self._run_broadcast_weight_sync(
-            build_tasks=build_tasks,
-            strategy=strategy,
-            pause_mode=pause_mode,
-            clear_cache=clear_cache,
-            engine_only=engine_only,
-            model_id=model_id,
-            fail_label="LoRA weight sync",
-            log_extra=f" lora_int_id={lora_int_id}",
-            extra_response={
-                "weight_format": "lora",
-                "lora_int_id": lora_int_id,
-                "lora_name": lora_name,
-                "lora_sync_staging": self.config.lora_sync_staging,
-                "lora_evict_first": evict_first,
-            },
-        )
-
-    def get_spec_weights_info(self, model_id: str | None = None) -> list[dict]:
-        """Return weight metadata for the spec (drafter) model."""
-        self._check_model_id(model_id)
-        if self._config is None:
-            raise RuntimeError("ReplicaPool not initialized")
-        spec_model = getattr(self._config, "speculative_model", None)
-        if not spec_model:
-            raise RuntimeError("No speculative_model configured")
-        if self._cached_spec_weights_info is None:
-            from arctic_platform.inference.server.weight_sync import build_weights_info
-            infos = build_weights_info(spec_model)
-            self._cached_spec_weights_info = [wi.to_dict() for wi in infos]
-        return self._cached_spec_weights_info
-
-    async def sync_spec_weights(
-        self,
-        groups: list[dict[str, Any]] | None = None,
-        bucket_size: int = 256 * 1024 * 1024,
-        strategy: str = "hotswap",
-        engine_only: bool = False,
-        reverse: bool = False,
-        model_id: str | None = None,
-        master_addr: str | None = None,
-        master_port: int | None = None,
-        world_size: int | None = None,
-    ) -> dict[str, Any]:
-        """Receive spec (drafter) weights from sender(s) and load into all replicas.
-
-        Same semantics as :meth:`sync_weights` but targets the drafter model.
-        """
-        self._check_model_id(model_id)
-        if self._scheduler is None:
-            raise RuntimeError("ReplicaPool not initialized")
-
-        if groups is None:
-            if master_addr is None or master_port is None:
-                raise ValueError(
-                    "Provide either 'groups' or legacy flat fields "
-                    "(master_addr, master_port, world_size)"
-                )
-            n = self.num_replicas
-            tp = self.tp_size
-            groups = [{
-                "group_id": 0,
-                "master_addr": master_addr,
-                "master_port": master_port,
-                "world_size": world_size or (1 + n * tp),
-                "replica_ids": list(range(n)),
-            }]
-
-        async with self._stream_lifecycle():
-            t0 = time.time()
-            n = len(self._workers)
-
-            scheduler_was_paused = self._scheduler.paused
-            available_workers = [
-                index for index in range(n)
-                if self._scheduler.is_worker_available(index)
-            ]
-            if strategy == "drain":
-                self._scheduler.pause()
-            elif strategy == "skip":
-                for i in range(n):
-                    self._scheduler.mark_worker_unavailable(i)
-            elif strategy != "hotswap":
-                raise ValueError(
-                    f"Unknown strategy: {strategy!r}. "
-                    "Use: drain, skip, hotswap"
-                )
-
-            try:
-                await self._scheduler.abort_streams()
-                if strategy == "drain":
-                    await self._scheduler.drain()
-                elif strategy == "skip":
-                    for i in range(n):
-                        self._scheduler.cancel_worker_inflight(i)
-            except BaseException:
-                if strategy == "drain" and not scheduler_was_paused:
-                    self._scheduler.resume()
-                elif strategy == "skip":
-                    for index in available_workers:
-                        self._scheduler.mark_worker_available(index)
-                raise
-
-            tp = self.tp_size
-            replica_to_group: dict[int, dict[str, Any]] = {}
-            for g in groups:
-                base_port = g["master_port"]
-                for rid in g["replica_ids"]:
-                    replica_to_group[rid] = {
-                        "master_addr": g["master_addr"],
-                        "master_port": base_port + rid * tp,
-                        "world_size": 2,
-                        "rank_offset": 1,
-                    }
-
-            tasks = []
-            for i, worker in enumerate(self._workers):
-                gcfg = replica_to_group.get(i)
-                if gcfg is None:
-                    raise RuntimeError(
-                        f"Replica {i} not assigned to any group. "
-                        f"Groups cover replicas: "
-                        f"{[g['replica_ids'] for g in groups]}"
-                    )
-                tasks.append(
-                    worker.sync_spec_weights.remote(
-                        gcfg["master_addr"], gcfg["master_port"],
-                        gcfg["rank_offset"], gcfg["world_size"],
-                        bucket_size, engine_only, reverse,
-                    )
-                )
-
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            if strategy == "drain" and not scheduler_was_paused:
-                self._scheduler.resume()
-            elif strategy == "skip":
-                for index in available_workers:
-                    self._scheduler.mark_worker_available(index)
-
-            per_worker = [
-                {"status": "error", "message": str(r)}
-                if isinstance(r, Exception) else r
-                for r in results
-            ]
-            elapsed = time.time() - t0
-            logger.info(
-                "Spec weight sync: %d workers, %d group(s) in %.2fs",
-                n, len(groups), elapsed,
-            )
-            return {
-                "elapsed": elapsed,
-                "num_groups": len(groups),
-                "strategy": strategy,
-                "strategy_elapsed": elapsed,
-                "workers": per_worker,
-            }
-
-    async def close_weight_sync(self, model_id: str | None = None) -> dict[str, Any]:
-        self._check_model_id(model_id)
-        async with self._stream_lifecycle():
-            results = await asyncio.gather(*[w.close_weight_sync.remote() for w in self._workers])
-            return {"status": "ok", "workers": list(results)}
-
-    # ------------------------------------------------------------------
-    # Health monitoring
-    # ------------------------------------------------------------------
-
-    async def _monitor_health(self) -> None:
-        while not self._stop_monitoring:
-            await asyncio.sleep(10)
-            for i, w in enumerate(self._workers):
-                if i in self._updating_workers:
-                    continue
-                if self._scheduler is not None and not self._scheduler.is_worker_available(i):
-                    continue
-                try:
-                    healthy = await asyncio.wait_for(w.is_healthy.remote(), timeout=30)
-                except Exception as exc:
-                    logger.warning(
-                        "Worker %d health check failed; %s: %s",
-                        i,
-                        type(exc).__name__,
-                        exc,
-                        exc_info=True,
-                    )
-                    continue
-                if not healthy:
-                    logger.warning("Worker %d unhealthy", i)
-                    continue
-
-    async def _restart_worker(self, idx: int) -> None:
-        old = self._workers[idx]
-        if self._scheduler is not None:
-            self._scheduler.mark_worker_unavailable(idx)
-
-        engine_kwargs = self._engine_kwargs()
-        extra_env = self._config.extra_env or None
-
-        if not self._is_multi_node():
-            try:
-                ray.kill(old)
-            except Exception:
-                pass
-            new_worker = self._make_worker()
-            try:
-                await new_worker.initialize.remote(
-                    engine_kwargs,
-                    extra_env,
-                    self._model_id,
-                )
-            except BaseException:
-                try:
-                    ray.kill(new_worker)
-                except Exception:
-                    pass
-                raise
-        else:
-            # vLLM's Ray child actors may release PG bundles asynchronously.
-            # Ask the coordinator to shut down first, then retry creation until
-            # the placement-group restart deadline expires.
-            await self._shutdown_workers([old])
-            new_worker = await self._restart_placement_worker(
-                engine_kwargs,
-                extra_env,
-            )
-
-        self._workers[idx] = new_worker
-
-        if self._scheduler is not None:
-            self._scheduler.update_worker_handle(idx, new_worker)
-            self._scheduler.mark_worker_available(idx)
-
-        logger.info(f"Worker {idx} restarted successfully")
-
-    async def _restart_placement_worker(
-        self,
-        engine_kwargs: dict[str, Any],
-        extra_env: dict[str, str] | None,
-    ) -> ray.actor.ActorHandle:
-        total_timeout = _env_float(
-            "ARCTIC_WORKER_RESTART_TIMEOUT_S", 600.0, minimum=0.001
-        )
-        retry_s = _env_float(
-            "ARCTIC_WORKER_RESTART_RETRY_S", 1.0, minimum=0.0
-        )
-        deadline = time.monotonic() + total_timeout
-        attempt = 0
-
-        while True:
-            attempt += 1
-            new_worker = None
-            try:
-                new_worker = self._make_worker()
-                remaining = max(deadline - time.monotonic(), 0.001)
-                await asyncio.wait_for(
-                    _await_maybe(
-                        new_worker.initialize.remote(
-                            engine_kwargs,
-                            extra_env,
-                            self._model_id,
-                        )
-                    ),
-                    timeout=remaining,
-                )
-                return new_worker
-            except asyncio.CancelledError:
-                if new_worker is not None:
-                    try:
-                        ray.kill(new_worker)
-                    except Exception:
-                        pass
-                raise
-            except Exception:
-                if new_worker is not None:
-                    try:
-                        ray.kill(new_worker)
-                    except Exception:
-                        pass
-                if not self._is_multi_node() or time.monotonic() >= deadline:
-                    raise
-                delay = min(retry_s, max(deadline - time.monotonic(), 0.0))
-                logger.warning(
-                    "Placement-group worker restart attempt %d failed; "
-                    "retrying in %.3fs",
-                    attempt,
-                    delay,
-                    exc_info=True,
-                )
-                await asyncio.sleep(delay)

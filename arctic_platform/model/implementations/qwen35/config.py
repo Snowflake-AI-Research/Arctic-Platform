@@ -54,5 +54,7 @@ class ModelConfig:
 
     fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = "disabled"
     fp32_lm_head: bool = False
+    # Evaluate the residual adds, the partial rotary embedding and the GatedDeltaNet beta gate in fp32.
+    fp32_parity: bool = True
 
     debug: DebugModelConfig = field(default_factory=DebugModelConfig)

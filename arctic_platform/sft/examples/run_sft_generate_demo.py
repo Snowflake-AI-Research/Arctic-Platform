@@ -61,7 +61,6 @@ def main() -> None:
         seed=SEED,
         training_gpus=1,
         sampling_gpus=1,
-        job_ready_timeout=900.0,
         backend=OnPremConfig(colocate=True),
         sampling=SamplingConfig(
             vllm={"tensor_parallel_size": 1, "max_model_len": 512, "gpu_memory_utilization": 0.35}

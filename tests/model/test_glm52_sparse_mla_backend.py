@@ -76,14 +76,15 @@ def test_flashmla_load_error_is_not_hidden_as_missing(monkeypatch):
 
 
 def test_sparse_backends_keep_expected_masks_and_inf_grad_merge_flag():
-    """TileLang uses local causal rows; FlashMLA validates global CP indices."""
+    """TileLang masks the sentinel key row; FlashMLA validates global CP indices."""
     kernels = Path(__file__).resolve().parents[2] / "arctic_platform/model/implementations/glm52/models/kernels"
     fwd = (kernels / "sparse_mla_fwd.py").read_text()
     bwd = (kernels / "sparse_mla_bwd.py").read_text()
     flash = (kernels / "sparse_mla_flashmla.py").read_text()
-    assert "mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] <= max_kv_i" in fwd
-    assert "max_kv_i = q_i" in fwd
-    assert "mask[bi_i] = Indices[by, s_i, bz // NH, i_i * BS + bi_i] <= max_kv_i" in bwd
+    assert "mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] < sentinel" in fwd
+    assert "max_kv_i = q_i" not in fwd
+    assert "mask[bi_i] = Indices[by, s_i, bz // NH, i_i * BS + bi_i] < sentinel" in bwd
+    assert "max_kv_i" not in bwd
     assert "TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: False" in bwd
     assert "flash_indices == sentinel_idx" in flash
     assert "(flash_indices < 0) | (flash_indices >= kv_seq_len)" in flash

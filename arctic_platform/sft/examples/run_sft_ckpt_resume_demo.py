@@ -83,7 +83,6 @@ def main() -> None:
         model_name=args.model,
         seed=SEED,
         training_gpus=args.training_gpus,
-        job_ready_timeout=600.0,
         training=TrainingConfig(
             checkpoint_path=str(ckpt_root),
             ds_config={

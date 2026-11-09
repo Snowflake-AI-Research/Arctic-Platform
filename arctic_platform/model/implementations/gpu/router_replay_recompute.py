@@ -45,30 +45,38 @@ _thread_local = threading.local()
 
 
 def _in_recompute() -> bool:
-    return getattr(_thread_local, "depth", 0) > 0
+    thread_local = getattr(_ckpt, "_recompute_thread_local", _thread_local)
+    return getattr(thread_local, "depth", 0) > 0
 
 
 def _install_recompute_detector() -> None:
     """Wrap ``torch.utils.checkpoint._recomputation_hook`` so a module forward can tell whether it is running
     the original pass or the backward recompute. The non-reentrant checkpoint resolves that name as a module
-    global at call time, so patching it here is picked up by all subsequent checkpoint calls."""
+    global at call time, so patching it here is picked up by all subsequent checkpoint calls.
+
+    The hook class closes over a thread_local captured here (not the module global) and that same object is
+    stashed on _ckpt, so a second import of this module (e.g. resolved under a different module path) finds
+    the canonical thread_local via _ckpt instead of racing to install its own detector against a different
+    thread_local that the already-installed hook never touches."""
     if getattr(_ckpt, "_recompute_detector_installed", False):
         return
 
+    thread_local = _thread_local
     _BaseRecomputationHook = _ckpt._recomputation_hook
 
     class _DetectingRecomputationHook(_BaseRecomputationHook):  # type: ignore[misc, valid-type]
         def __enter__(self):
-            _thread_local.depth = getattr(_thread_local, "depth", 0) + 1
+            thread_local.depth = getattr(thread_local, "depth", 0) + 1
             return super().__enter__()
 
         def __exit__(self, *exc):
             try:
                 return super().__exit__(*exc)
             finally:
-                _thread_local.depth = max(0, getattr(_thread_local, "depth", 1) - 1)
+                thread_local.depth = max(0, getattr(thread_local, "depth", 1) - 1)
 
     _ckpt._recomputation_hook = _DetectingRecomputationHook
+    _ckpt._recompute_thread_local = thread_local
     _ckpt._recompute_detector_installed = True
 
 
