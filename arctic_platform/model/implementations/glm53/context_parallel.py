@@ -65,7 +65,12 @@ def _gather_sequence_no_grad(tensor: torch.Tensor, group) -> torch.Tensor:
     return torch.cat(gathered, dim=1)
 
 
-def _normalize_cu_seqlens(cu_seqlens: torch.Tensor, *, sequence_length: int, device: torch.device) -> torch.Tensor:
+def _normalize_cu_seqlens(
+    cu_seqlens: torch.Tensor,
+    *,
+    sequence_length: int,
+    device: torch.device,
+) -> torch.Tensor:
     if not torch.is_tensor(cu_seqlens) or cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
         raise ValueError("GLM-5.3 packed boundaries must be a one-dimensional tensor with at least two entries")
     cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32)
@@ -78,7 +83,15 @@ def _normalize_cu_seqlens(cu_seqlens: torch.Tensor, *, sequence_length: int, dev
         raise ValueError(f"GLM-5.3 packed boundaries end at {real_length}, beyond sequence length {sequence_length}")
     if real_length < sequence_length:
         cu_seqlens = torch.cat(
-            [cu_seqlens, torch.arange(real_length + 1, sequence_length + 1, device=device, dtype=torch.int32)]
+            [
+                cu_seqlens,
+                torch.arange(
+                    real_length + 1,
+                    sequence_length + 1,
+                    device=device,
+                    dtype=torch.int32,
+                ),
+            ]
         )
     return cu_seqlens
 
@@ -187,7 +200,10 @@ def _select_sparse_indices(
     query = indexer.wq_b(q_resid).view(hidden_shape)
     key = indexer.k_norm(indexer.wk(hidden_states)).view(hidden_shape).squeeze(2)
     gate_scores = F.linear(hidden_states, indexer.index_kpool_compress_gate)
-    packed_local = torch.cat([key, gate_scores, attention_mask.to(key.dtype)[..., None]], dim=-1)
+    packed_local = torch.cat(
+        [key, gate_scores, attention_mask.to(key.dtype)[..., None]],
+        dim=-1,
+    )
     packed_states = _gather_sequence_no_grad(packed_local, cp_group)
     # Score as the vLLM sampler does (glm5next Indexer.forward): fp32 head gate, Hadamard + FP8 query and pooled keys.
     weights = hidden_states.float() @ indexer.weights_proj.weight.float().t()
@@ -196,7 +212,10 @@ def _select_sparse_indices(
     if indexer.index_kpool_always_select_tail:
         output_width += indexer.index_kpool - 1
     topk_indices = torch.full(
-        (batch_size, local_length, output_width), -1, dtype=torch.int32, device=hidden_states.device
+        (batch_size, local_length, output_width),
+        -1,
+        dtype=torch.int32,
+        device=hidden_states.device,
     )
     query_offset = cp_rank * local_length
     for start_tensor, end_tensor in zip(global_cu_seqlens[:-1], global_cu_seqlens[1:], strict=True):
@@ -254,7 +273,8 @@ def _select_sparse_indices(
             del scores
 
             pool_visible = visible_tokens.gather(
-                dim=-1, index=pool_end[:, None].expand(batch_size, chunk_end - chunk_start, -1)
+                dim=-1,
+                index=pool_end[:, None].expand(batch_size, chunk_end - chunk_start, -1),
             )
             valid_candidates = pool_visible & pool_valid[:, None]
             index_scores.masked_fill_(~valid_candidates, torch.finfo(index_scores.dtype).min)
@@ -263,12 +283,19 @@ def _select_sparse_indices(
             selected = index_scores.topk(select_k, dim=-1).indices
             selected_valid = valid_candidates.gather(-1, selected)
             selected_indices = pool_indices[batch_idx, selected]
-            selected_indices.masked_fill_(~selected_valid[..., None].expand_as(selected_indices), -1)
+            selected_indices.masked_fill_(
+                ~selected_valid[..., None].expand_as(selected_indices),
+                -1,
+            )
             segment_topk = selected_indices.flatten(-2)
 
             if indexer.index_kpool_always_select_tail:
                 segment_topk = indexer.append_visible_tail(segment_topk, visible_tokens, valid_keys)
-            segment_topk = F.pad(segment_topk, (0, output_width - segment_topk.shape[-1]), value=-1)[..., :output_width]
+            segment_topk = F.pad(
+                segment_topk,
+                (0, output_width - segment_topk.shape[-1]),
+                value=-1,
+            )[..., :output_width]
             segment_topk = torch.where(segment_topk >= 0, segment_topk + start, segment_topk)
             segment_topk.masked_fill_(~attention_mask[:, query_slice, None], -1)
             topk_indices[:, query_slice] = segment_topk.to(torch.int32)
@@ -276,7 +303,11 @@ def _select_sparse_indices(
 
 
 def _reference_sparse_mla_math(
-    query: torch.Tensor, key_value: torch.Tensor, indices: torch.Tensor, scale: float, value_dim: int
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    indices: torch.Tensor,
+    scale: float,
+    value_dim: int,
 ) -> torch.Tensor:
     kv_length = key_value.shape[1] - 1
     valid = (indices >= 0) & (indices < kv_length)
@@ -289,7 +320,11 @@ def _reference_sparse_mla_math(
     scores.masked_fill_(empty[:, :, None, None], 0)
     probabilities = torch.softmax(scores, dim=-1)
     probabilities = probabilities.masked_fill(empty[:, :, None, None], 0)
-    return torch.einsum("bqhk,bqkd->bqhd", probabilities, gathered[..., :value_dim]).to(query.dtype)
+    return torch.einsum(
+        "bqhk,bqkd->bqhd",
+        probabilities,
+        gathered[..., :value_dim],
+    ).to(query.dtype)
 
 
 def _sparse_mla_query_tile(query_len: int, topk: int, dim: int) -> int:
@@ -300,7 +335,11 @@ def _sparse_mla_query_tile(query_len: int, topk: int, dim: int) -> int:
 
 
 def _reference_sparse_mla_tiled(
-    query: torch.Tensor, key_value: torch.Tensor, indices: torch.Tensor, scale: float, value_dim: int
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    indices: torch.Tensor,
+    scale: float,
+    value_dim: int,
 ) -> torch.Tensor:
     query_len = query.shape[1]
     output = query.new_empty(query.shape[0], query_len, query.shape[2], value_dim)
@@ -308,7 +347,11 @@ def _reference_sparse_mla_tiled(
     for start in range(0, query_len, tile):
         end = min(start + tile, query_len)
         output[:, start:end] = _reference_sparse_mla_math(
-            query[:, start:end], key_value, indices[:, start:end], scale, value_dim
+            query[:, start:end],
+            key_value,
+            indices[:, start:end],
+            scale,
+            value_dim,
         )
     return output
 
@@ -390,7 +433,11 @@ def _flashinfer_wrapper(device: torch.device):
 
 
 def _flashinfer_sparse_mla_requests(
-    query: torch.Tensor, key_value: torch.Tensor, indices: torch.Tensor, scale: float, value_dim: int
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    indices: torch.Tensor,
+    scale: float,
+    value_dim: int,
 ) -> torch.Tensor:
     """One FlashInfer plan. ``query`` must stay within ``_FLASHINFER_MAX_REQUESTS``."""
     kv_len = key_value.shape[1] - 1
@@ -406,7 +453,18 @@ def _flashinfer_sparse_mla_requests(
     kv_indptr[1:] = counts.cumsum(0)
     wrapper = _flashinfer_wrapper(query.device)
     wrapper.plan(
-        qo_indptr, kv_indptr, packed, counts, heads, query.shape[-1], 0, 1, False, scale, query.dtype, key_value.dtype
+        qo_indptr,
+        kv_indptr,
+        packed,
+        counts,
+        heads,
+        query.shape[-1],
+        0,
+        1,
+        False,
+        scale,
+        query.dtype,
+        key_value.dtype,
     )
     absorbed = wrapper.run(
         query[0].contiguous(),
@@ -420,7 +478,11 @@ def _flashinfer_sparse_mla_requests(
 
 
 def _flashinfer_sparse_mla(
-    query: torch.Tensor, key_value: torch.Tensor, indices: torch.Tensor, scale: float, value_dim: int
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    indices: torch.Tensor,
+    scale: float,
+    value_dim: int,
 ) -> torch.Tensor:
     """Hopper FlashInfer MLA. Each query row is one page-size-1 request over its valid keys."""
     if query.shape[0] != 1:
@@ -432,7 +494,11 @@ def _flashinfer_sparse_mla(
     for start in range(0, query_len, _FLASHINFER_MAX_REQUESTS):
         end = min(start + _FLASHINFER_MAX_REQUESTS, query_len)
         output[:, start:end] = _flashinfer_sparse_mla_requests(
-            query[:, start:end], key_value, indices[:, start:end], scale, value_dim
+            query[:, start:end],
+            key_value,
+            indices[:, start:end],
+            scale,
+            value_dim,
         )
     return output
 
@@ -475,7 +541,11 @@ class _TiledSparseMLA(torch.autograd.Function):
                     kv_tile = kv_tile.requires_grad_(True)
                 with torch.enable_grad():
                     tile_out = _reference_sparse_mla_math(
-                        query_tile, kv_tile, indices[:, start:end], ctx.scale, ctx.value_dim
+                        query_tile,
+                        kv_tile,
+                        indices[:, start:end],
+                        ctx.scale,
+                        ctx.value_dim,
                     )
                     torch.autograd.backward(tile_out, grad_output[:, start:end])
                 if need_query:
@@ -488,13 +558,23 @@ class _TiledSparseMLA(torch.autograd.Function):
 
 
 def _reference_sparse_mla(
-    query: torch.Tensor, key_value: torch.Tensor, indices: torch.Tensor, *, scale: float, value_dim: int
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    scale: float,
+    value_dim: int,
 ) -> torch.Tensor:
     return _TiledSparseMLA.apply(query, key_value, indices, float(scale), int(value_dim), False)
 
 
 def _flashinfer_sparse_mla_apply(
-    query: torch.Tensor, key_value: torch.Tensor, indices: torch.Tensor, *, scale: float, value_dim: int
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    scale: float,
+    value_dim: int,
 ) -> torch.Tensor:
     return _TiledSparseMLA.apply(query, key_value, indices, float(scale), int(value_dim), True)
 
@@ -520,16 +600,26 @@ def _sparse_attention_forward(
     if hidden_states.shape[0] != 1:
         raise NotImplementedError("GLM-5.3 context parallelism currently requires one packed row")
     if attention_mask is None:
-        attention_mask = torch.ones(hidden_states.shape[:2], dtype=torch.bool, device=hidden_states.device)
+        attention_mask = torch.ones(
+            hidden_states.shape[:2],
+            dtype=torch.bool,
+            device=hidden_states.device,
+        )
 
     batch_size, local_length = hidden_states.shape[:2]
     query_shape = (batch_size, local_length, -1, self.qk_head_dim)
     q_resid = self.q_a_layernorm(self.q_a_proj(hidden_states))
     query_states = self.q_b_proj(q_resid).view(query_shape)
-    q_nope, q_position = query_states.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+    q_nope, q_position = query_states.split(
+        [self.qk_nope_head_dim, self.qk_rope_head_dim],
+        dim=-1,
+    )
 
     compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-    kv_pass, k_position = compressed_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+    kv_pass, k_position = compressed_kv.split(
+        [self.kv_lora_rank, self.qk_rope_head_dim],
+        dim=-1,
+    )
     kv_pass = self.kv_a_layernorm(kv_pass)
     kv_pass_full = gather_sequence(kv_pass, self._cp_group)
     k_position_full = gather_sequence(k_position, self._cp_group)
@@ -538,7 +628,9 @@ def _sparse_attention_forward(
         global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
         if global_cu_seqlens is None:
             global_cu_seqlens = torch.tensor(
-                [0, local_length * self._cp_world_size], dtype=torch.int32, device=hidden_states.device
+                [0, local_length * self._cp_world_size],
+                dtype=torch.int32,
+                device=hidden_states.device,
             )
         topk_indices = _select_sparse_indices(
             self.indexer,
@@ -556,14 +648,22 @@ def _sparse_attention_forward(
 
     # The absorbed path reads the weight rather than calling the module, so a LoRA delta has to be added here.
     kv_b_weight = compute_weight(self.kv_b_proj).view(
-        self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
+        self.num_heads,
+        self.qk_nope_head_dim + self.v_head_dim,
+        self.kv_lora_rank,
     )
     key_weight = kv_b_weight[:, : self.qk_nope_head_dim]
     value_weight = kv_b_weight[:, self.qk_nope_head_dim :]
     query_absorbed = torch.einsum("bqhd,hdk->bqhk", q_nope, key_weight)
     sparse_query = torch.cat([query_absorbed, q_position], dim=-1)
     sparse_kv = torch.cat([kv_pass_full, k_position_full], dim=-1).unsqueeze(2)
-    sparse_kv = torch.cat([sparse_kv, sparse_kv.new_zeros(batch_size, 1, 1, sparse_kv.shape[-1])], dim=1)
+    sparse_kv = torch.cat(
+        [
+            sparse_kv,
+            sparse_kv.new_zeros(batch_size, 1, 1, sparse_kv.shape[-1]),
+        ],
+        dim=1,
+    )
 
     kernel_indices = _pad_sparse_indices(topk_indices)
     backend = _select_sparse_mla_backend(
@@ -571,7 +671,11 @@ def _sparse_attention_forward(
     )
     if backend == "flashinfer":
         absorbed_output = _flashinfer_sparse_mla_apply(
-            sparse_query, sparse_kv, kernel_indices, scale=self.scaling, value_dim=self.kv_lora_rank
+            sparse_query,
+            sparse_kv,
+            kernel_indices,
+            scale=self.scaling,
+            value_dim=self.kv_lora_rank,
         )
         if not getattr(self, "_ap_flashinfer_dispatch_reported", False):
             get_logger().info(
@@ -592,7 +696,10 @@ def _sparse_attention_forward(
         # the FlashMLA forward maps them back to -1.
         sentinel_indices = kernel_indices.masked_fill(kernel_indices < 0, sparse_kv.shape[1] - 1)
         absorbed_output = sparse_mla_flashmla_fused_apply(
-            sparse_query, sparse_kv, sentinel_indices.unsqueeze(2), self.scaling
+            sparse_query,
+            sparse_kv,
+            sentinel_indices.unsqueeze(2),
+            self.scaling,
         )
         if not getattr(self, "_ap_flashmla_dispatch_reported", False):
             get_logger().info(
@@ -604,7 +711,11 @@ def _sparse_attention_forward(
             self._ap_flashmla_dispatch_reported = True
     else:
         absorbed_output = _reference_sparse_mla(
-            sparse_query, sparse_kv, kernel_indices, scale=self.scaling, value_dim=self.kv_lora_rank
+            sparse_query,
+            sparse_kv,
+            kernel_indices,
+            scale=self.scaling,
+            value_dim=self.kv_lora_rank,
         )
         if not getattr(self, "_ap_reference_dispatch_reported", False):
             get_logger().info(
@@ -618,7 +729,11 @@ def _sparse_attention_forward(
     attention_output = torch.einsum("bqhk,hdk->bqhd", absorbed_output, value_weight)
     attention_output = attention_output.reshape(batch_size, local_length, -1)
     attention_output = self.o_proj(attention_output)
-    return (attention_output, None, topk_indices if self.next_skip_topk else None)
+    return (
+        attention_output,
+        None,
+        topk_indices if self.next_skip_topk else None,
+    )
 
 
 @functools.cache
@@ -632,7 +747,11 @@ def _kda_beta(self, hidden_states: torch.Tensor) -> torch.Tensor:
 
 
 def _linear_attention_forward(
-    self, hidden_states: torch.Tensor, cache_params=None, attention_mask: torch.Tensor | None = None, **_kwargs
+    self,
+    hidden_states: torch.Tensor,
+    cache_params=None,
+    attention_mask: torch.Tensor | None = None,
+    **_kwargs,
 ):
     if cache_params is not None:
         raise NotImplementedError("GLM-5.3 head-parallel KDA is a training-only path")
@@ -652,7 +771,14 @@ def _linear_attention_forward(
     decay = self.forget_gate(hidden_states)
     beta = _kda_beta(self, hidden_states)
     exchanged = _pack_and_exchange_head_tensors(
-        {"query": query, "key": key, "value": value, "decay": decay, "beta": beta}, process_group=self._cp_group
+        {
+            "query": query,
+            "key": key,
+            "value": value,
+            "decay": decay,
+            "beta": beta,
+        },
+        process_group=self._cp_group,
     )
 
     world_size = self._cp_world_size
@@ -705,7 +831,11 @@ def _linear_attention_forward(
         )
     mixed_qkv = mixed_qkv.transpose(1, 2)
     local_width = local_heads * self.head_dim
-    query, key, value = torch.split(mixed_qkv, [local_width, local_width, local_width], dim=-1)
+    query, key, value = torch.split(
+        mixed_qkv,
+        [local_width, local_width, local_width],
+        dim=-1,
+    )
     query = query.view(batch_size, global_length, local_heads, self.head_dim)
     key = key.view(batch_size, global_length, local_heads, self.head_dim)
     value = value.view(batch_size, global_length, local_heads, self.head_dim)
@@ -725,14 +855,23 @@ def _linear_attention_forward(
     )
     if final_state is not None:
         raise RuntimeError("GLM-5.3 KDA unexpectedly returned recurrent state")
-    output = sequence_head_all_to_all(self._cp_group, output, scatter_dim=1, gather_dim=2)
+    output = sequence_head_all_to_all(
+        self._cp_group,
+        output,
+        scatter_dim=1,
+        gather_dim=2,
+    )
     gate = self.g_b_proj(self.g_a_proj(hidden_states)).view(shape)
     output = self.o_norm(output, gate).reshape(batch_size, local_length, -1)
     return self.o_proj(output)
 
 
 def _local_linear_attention_forward(
-    self, hidden_states: torch.Tensor, cache_params=None, attention_mask: torch.Tensor | None = None, **_kwargs
+    self,
+    hidden_states: torch.Tensor,
+    cache_params=None,
+    attention_mask: torch.Tensor | None = None,
+    **_kwargs,
 ):
     if cache_params is not None:
         raise NotImplementedError("GLM-5.3 packed KDA is a training-only path")
@@ -744,10 +883,19 @@ def _local_linear_attention_forward(
     batch_size, sequence_length = hidden_states.shape[:2]
     global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
     if global_cu_seqlens is None:
-        global_cu_seqlens = torch.tensor([0, sequence_length], dtype=torch.int32, device=hidden_states.device)
+        global_cu_seqlens = torch.tensor(
+            [0, sequence_length],
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
     shape = (batch_size, sequence_length, self.num_heads, self.head_dim)
     mixed_qkv = torch.cat(
-        [self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)], dim=-1
+        [
+            self.q_proj(hidden_states),
+            self.k_proj(hidden_states),
+            self.v_proj(hidden_states),
+        ],
+        dim=-1,
     ).transpose(1, 2)
 
     from causal_conv1d import causal_conv1d_fn
@@ -809,10 +957,16 @@ def _wrap_backbone_forward(backbone: nn.Module, parallel_modules: list[nn.Module
             cu_seqlens = (
                 cu_seqlens_from_position_ids(global_position_ids)
                 if global_position_ids is not None
-                else torch.tensor([0, global_sequence_length], dtype=torch.int32, device=input_tensor.device)
+                else torch.tensor(
+                    [0, global_sequence_length],
+                    dtype=torch.int32,
+                    device=input_tensor.device,
+                )
             )
         cu_seqlens = _normalize_cu_seqlens(
-            cu_seqlens, sequence_length=global_sequence_length, device=input_tensor.device
+            cu_seqlens,
+            sequence_length=global_sequence_length,
+            device=input_tensor.device,
         )
         for module in parallel_modules:
             setattr(module, _GLOBAL_POSITION_IDS, global_position_ids)
@@ -854,7 +1008,10 @@ def apply_context_parallelism(
         attention._cp_world_size = cp_world_size
         if layer.block_type == "indexed_attention":
             attention._ap_sparse_mla_backend = attn_implementation
-            attention.forward = types.MethodType(_sparse_attention_forward, attention)
+            attention.forward = types.MethodType(
+                _sparse_attention_forward,
+                attention,
+            )
             parallel_modules.append(attention)
             sparse_layers += 1
         elif layer.block_type == "linear_attention":
@@ -864,7 +1021,8 @@ def apply_context_parallelism(
                     f"GLM-5.3 KDA heads ({attention.num_heads}) must be divisible by CP size ({cp_world_size})"
                 )
             attention.forward = types.MethodType(
-                _linear_attention_forward if cp_size > 1 else _local_linear_attention_forward, attention
+                _linear_attention_forward if cp_size > 1 else _local_linear_attention_forward,
+                attention,
             )
             parallel_modules.append(attention)
             linear_layers += 1
@@ -880,4 +1038,8 @@ def apply_context_parallelism(
     )
 
 
-__all__ = ["_pad_sparse_indices", "_reference_sparse_mla", "apply_context_parallelism"]
+__all__ = [
+    "_pad_sparse_indices",
+    "_reference_sparse_mla",
+    "apply_context_parallelism",
+]
