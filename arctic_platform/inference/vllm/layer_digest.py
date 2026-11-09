@@ -74,6 +74,9 @@ def record_numbered(prefix: str, tensor: torch.Tensor) -> None:
     digest = row_digest(tensor, _state["rows"])
     if digest is not None:
         digests[f"{prefix}#{n}"] = digest
+    dump = _state.get("dump")
+    if dump is not None and _dump_selected(prefix):
+        dump[f"{prefix}#{n}"] = {"args": [], "out": tensor.detach().cpu()}
 
 
 def kernel_inventory(model: torch.nn.Module) -> dict[str, dict[str, str]]:
@@ -110,12 +113,18 @@ def _write_inventory(model: torch.nn.Module, directory: str) -> None:
 
 
 DUMP_ROWS_ENV = "ARCTIC_LAYER_DUMP_ROWS"
+DUMP_MATCH_ENV = "ARCTIC_LAYER_DUMP_MATCH"
+
+
+def _dump_selected(name: str) -> bool:
+    """Whether ``name`` contains ``ARCTIC_LAYER_DUMP_MATCH`` (every name when unset)."""
+    return os.environ.get(DUMP_MATCH_ENV, "") in name
 
 
 def _dump(name: str, args, out) -> None:
     """Debug: keep the full input and output tensors of a call in steps of at most ``ARCTIC_LAYER_DUMP_ROWS`` rows."""
     dump = _state.get("dump")
-    if dump is None:
+    if dump is None or not _dump_selected(name):
         return
     counts = _state.setdefault("dump_counts", {})
     base = f"L{_state.get('layer', -1):02d}.{name}"
