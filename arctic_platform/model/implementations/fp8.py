@@ -21,6 +21,7 @@ activation-quant kernel is imported lazily from the shared kernels package.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -224,6 +225,12 @@ def _quantize_act_fp8_1x128(x: Tensor) -> tuple[Tensor, Tensor]:
     group = _FP8_BLOCK
     if x.shape[-1] % group != 0:
         raise ValueError(f"FP8 activation quant expects K divisible by {group}, got {tuple(x.shape)}")
+    dg = _deep_gemm()
+    if x.is_cuda and dg is not None and x.ndim == 2:
+        from arctic_platform.model.implementations.kernels.fp8_quant import per_token_group_quant_fp8_mn_major
+
+        # Scales written straight into DeepGEMM's MN-major TMA-aligned layout; same values as the per-group kernel.
+        return per_token_group_quant_fp8_mn_major(x, group)
     if x.is_cuda:
         from arctic_platform.model.implementations.kernels.fp8_quant import per_token_group_quant_fp8
 
@@ -235,7 +242,6 @@ def _quantize_act_fp8_1x128(x: Tensor) -> tuple[Tensor, Tensor]:
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
         scale = (amax / fp8_max).contiguous()
         q = (blocks.float() / scale.unsqueeze(-1)).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn).view(rows, cols)
-    dg = _deep_gemm()
     if dg is not None and q.is_cuda:
         scale = dg.get_mn_major_tma_aligned_tensor(scale)
     return q, scale
@@ -315,11 +321,46 @@ def _fp8_linear_bwd_input(
     return dx
 
 
-def _decode_fp8_to_bf16(weight: Tensor, scale: Tensor, block_size: int) -> Tensor:
-    """BF16 copy of a CUDA block-FP8 matrix or expert stack, for one GEMM."""
+_DECODE_WORKSPACES: dict[torch.device, Tensor] = {}
+
+
+def _decode_workspace(shape: tuple[int, ...], device: torch.device) -> Tensor:
+    """A BF16 view of ``shape`` on ``device``'s decode workspace, grown to the largest decode seen.
+
+    Frozen block-FP8 weights are decoded for one GEMM at a time on the current stream (expert stacks of up to
+    512 MiB at Qwen3.6 EP2), so one reused buffer replaces a fresh allocation per GEMM. Those large requests,
+    made in backward when activations fill most of the GPU, are what made the caching allocator map new memory
+    mid-step; mapping blocks the host for up to seconds on H200. The view is valid until the next decode.
+    """
+    numel = math.prod(shape)
+    buffer = _DECODE_WORKSPACES.get(device)
+    if buffer is None or buffer.numel() < numel:
+        _DECODE_WORKSPACES.pop(device, None)
+        buffer = torch.empty(numel, dtype=torch.bfloat16, device=device)
+        _DECODE_WORKSPACES[device] = buffer
+    return buffer[:numel].view(shape)
+
+
+def _decode_fp8_to_bf16(
+    weight: Tensor | tuple[Tensor, ...], scale: Tensor | tuple[Tensor, ...], block_size: int
+) -> Tensor:
+    """BF16 copy of a CUDA block-FP8 matrix or expert stack, for one GEMM on the current stream.
+
+    Tuples of stacks (e.g. gate and up) are decoded side by side along the output rows into one stack. CUDA
+    decodes land in the shared decode workspace: use the result for one GEMM and do not keep it.
+    """
     from arctic_platform.model.implementations.kernels.fp8_block_dequant import dequantize_fp8_blocks
 
-    return dequantize_fp8_blocks(weight, scale, block_size)
+    stacks = weight if isinstance(weight, tuple) else (weight,)
+    scales = scale if isinstance(scale, tuple) else (scale,)
+    first = stacks[0]
+    rows = sum(w.shape[-2] for w in stacks)
+    out = _decode_workspace((*first.shape[:-2], rows, first.shape[-1]), first.device)
+    row = 0
+    for w, sc in zip(stacks, scales):
+        dequantize_fp8_blocks(w, sc, block_size, out=out, out_row=row)
+        row += w.shape[-2]
+    return out
 
 
 class _BlockFp8LinearFn(torch.autograd.Function):
@@ -566,11 +607,12 @@ class _GroupedDecodedFp8MmFn(torch.autograd.Function):
     """Grouped ``x_e @ W_e.T`` against block-FP8 experts decoded to BF16; gradients flow to ``x``.
 
     The decoded ``[E, rows, cols]`` weights exist for one GEMM and are decoded again in
-    backward. Rows of ``x`` past the last expert offset are padding and stay zero.
+    backward. Rows of ``x`` past the last expert offset are padding and stay zero. ``weight``
+    and ``scale`` may be tuples of stacks sharing ``x`` (gate and up): one GEMM each way.
     """
 
     @staticmethod
-    def forward(ctx, x: Tensor, weight: Tensor, scale: Tensor, offsets: Tensor, rows: int, block_size: int) -> Tensor:
+    def forward(ctx, x: Tensor, weight, scale, offsets: Tensor, rows: int, block_size: int) -> Tensor:
         # Frozen weights ride on ctx, not save_for_backward, so activation offload never copies them.
         ctx.weights = (weight, scale)
         ctx.rows = rows
@@ -594,15 +636,22 @@ class _GroupedDecodedFp8MmFn(torch.autograd.Function):
 
 
 def grouped_fp8_decoded_mm(
-    x: Tensor, weight: Tensor, scale: Tensor, offsets: Tensor, rows: int, block_size: int
+    x: Tensor,
+    weight: Tensor | tuple[Tensor, ...],
+    scale: Tensor | tuple[Tensor, ...],
+    offsets: Tensor,
+    rows: int,
+    block_size: int,
 ) -> Tensor:
     """Grouped GEMM of tokens packed by expert against block-FP8 experts decoded to BF16 per call (W8A16).
 
     Unlike ``grouped_fp8_mm`` on Hopper, activations stay BF16 and tokens need no per-expert padding.
-    ``offsets`` is the cumulative token count per expert and ``rows`` its last value.
+    ``offsets`` is the cumulative token count per expert and ``rows`` its last value. Tuples of expert
+    stacks give their outputs side by side, ``[rows, sum of out features]``, from one GEMM.
     """
-    if offsets.numel() != weight.shape[0]:
-        raise ValueError(f"{offsets.numel()} expert offsets for {weight.shape[0]} FP8 experts")
+    experts = weight[0].shape[0] if isinstance(weight, tuple) else weight.shape[0]
+    if offsets.numel() != experts:
+        raise ValueError(f"{offsets.numel()} expert offsets for {experts} FP8 experts")
     return _GroupedDecodedFp8MmFn.apply(x, weight, scale, offsets, rows, block_size)
 
 
