@@ -70,6 +70,7 @@ from .media import MEDIA_KEYS
 from .media import MEDIA_KINDS
 from .media import VIDEO_MEDIA
 from .media import MediaKind
+from .media import MediaStraddleError
 from .media import check_media
 from .media import media_token_spans
 from .media import select_media_rows
@@ -110,6 +111,7 @@ __all__ = [
     "MEDIA_KEYS",
     "MEDIA_KINDS",
     "MediaKind",
+    "MediaStraddleError",
     "MediaSpec",
     "MROPE_CHANNELS",
     "MicrobatchSplit",
