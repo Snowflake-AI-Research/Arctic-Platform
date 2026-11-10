@@ -394,7 +394,7 @@ class Driver:
     async def media_modalities(self, model_id: str | None = None) -> dict[str, int]:
         """``{modality: placeholder token id}`` the model's workers decode (see ``ReplicaPool.media_modalities``).
 
-        ``{}`` when the model has no ready worker; ``KeyError`` for an unknown model.
+        Raises when the model has no ready worker in time; ``KeyError`` for an unknown model.
         """
         return await self._get_pool(model_id).media_modalities()
 
