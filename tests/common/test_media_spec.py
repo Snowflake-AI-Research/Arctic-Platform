@@ -149,7 +149,7 @@ def test_qwen_vl_tokens_per_item_matches_media_token_spans():
 
 
 def test_register_a_second_spec(registry):
-    image = MediaKind("image", "images", "image_sizes", "image_rows", "image_ranges", 1)
+    image = MediaKind("image", "images", "image_sizes", "image_rows", 1)
     spec = MediaSpec(
         kinds=(image,),
         placeholder_ids=lambda config: {"image": int(config["image_token_index"])},

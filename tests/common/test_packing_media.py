@@ -25,6 +25,7 @@ from arctic_platform.common.packing import pack_microbatch
 from arctic_platform.common.packing import pad_packed_microbatch
 from arctic_platform.common.packing import select_rows
 from arctic_platform.common.packing import token_shard
+from arctic_platform.common.packing import window_media
 from arctic_platform.common.packing.media import VIDEO_MEDIA
 
 MERGE = 2
@@ -200,77 +201,92 @@ def _windows(batch, shard_count, multiple=None):
 
 def test_each_window_gets_the_whole_images_whose_tokens_it_holds():
     # Packed layout: row 0 [0, 7) with image A at 1..4, row 1 [7, 10), row 2 [10, 16) with B at 11..12 and
-    # C at 14..15. Four windows of four tokens: A straddles windows 0 and 1, B straddles 2 and 3.
-    _, _, windows = _windows(_batch(), shard_count=4)
+    # C at 14..15. Two windows of eight tokens: A sits in window 0, B and C in window 1.
+    packed, _, windows = _windows(_batch(), shard_count=2)
 
-    assert [_owners(w["pixel_values"]) for w in windows] == [[0], [0], [1], [1, 2]]
-    assert [w["image_row_ids"].tolist() for w in windows] == [[0], [0], [2], [2, 2]]
-    assert [w["image_window_token_ranges"].tolist() for w in windows] == [
-        [[0, 3]],
-        [[3, 4]],
-        [[0, 1]],
-        [[1, 2], [0, 2]],
-    ]
-    # A window carries whole images: every one of A's 16 patches, in order, in both windows that touch it.
-    for window in windows[:2]:
-        torch.testing.assert_close(window["pixel_values"][:, 1], torch.arange(16, dtype=torch.float))
+    assert [_owners(w["pixel_values"]) for w in windows] == [[0], [1, 2]]
+    assert [w["image_row_ids"].tolist() for w in windows] == [[0], [2, 2]]
+    assert [w["image_grid_thw"].tolist() for w in windows] == [[[1, 4, 4]], [[1, 2, 4], [1, 2, 4]]]
+    # A window carries whole images: every one of A's 16 patches, in order, and only the leaves the call has.
+    torch.testing.assert_close(windows[0]["pixel_values"][:, 1], torch.arange(16, dtype=torch.float))
+    assert all(w.keys() == packed.keys() for w in windows)
+    # The patches are the batch's own, untouched: A's in window 0, B's then C's in window 1.
+    torch.testing.assert_close(torch.cat([w["pixel_values"] for w in windows]), packed["pixel_values"])
 
 
-def test_window_ranges_select_exactly_the_windows_image_tokens():
-    batch = _batch()
-    packed, _, windows = _windows(batch, shard_count=4)
-    merged_tokens = {0: 4, 1: 2, 2: 2}
+def test_each_image_lands_in_exactly_one_window():
+    _, _, windows = _windows(_batch(), shard_count=2)
 
-    covered = {item: [] for item in merged_tokens}
+    owners = [owner for window in windows for owner in _owners(window["pixel_values"])]
+    assert owners == [0, 1, 2]
+    # The images a window gets hold exactly its image-token slots.
     for window in windows:
-        image_slots = int((window["mm_token_type_ids"] == 1).sum())
-        ranges = window["image_window_token_ranges"]
-        # The ranges fill this window's image-token slots exactly, in order.
-        assert int((ranges[:, 1] - ranges[:, 0]).sum()) == image_slots
-        owners = []
-        for patch_owner in window["pixel_values"][:, 0].tolist():
-            if not owners or owners[-1] != int(patch_owner):
-                owners.append(int(patch_owner))
-        for owner, (first, end) in zip(owners, ranges.tolist()):
-            covered[owner].extend(range(first, end))
-    # Across the windows, every merged embedding of every image is placed once.
-    assert covered == {item: list(range(count)) for item, count in merged_tokens.items()}
+        tokens = int((window["image_grid_thw"].prod(dim=1) // MERGE**2).sum())
+        assert tokens == int((window["mm_token_type_ids"] == 1).sum())
+
+
+@pytest.mark.parametrize("shard_index", range(4))
+def test_an_image_straddling_a_window_boundary_is_refused_on_every_window(shard_index):
+    # Four windows of four tokens: A at [1, 5) straddles the boundary at 4. Every window refuses the call, the
+    # ones A never touches too, so no rank goes on alone.
+    packed, metadata = pad_packed_microbatch(*pack_microbatch(_batch()), 4)
+    with pytest.raises(ValueError, match=r"image 0's tokens \[1, 5\) straddle the window boundary at token 4"):
+        token_shard(packed, metadata, 4, shard_index, spatial_merge_size=MERGE)
+
+
+def test_window_media_alone_checks_its_own_boundaries_unless_given_the_calls():
+    packed, metadata = pack_microbatch(_batch())
+    media = {key: packed[key] for key in ("pixel_values", "image_grid_thw", "image_row_ids")}
+    types = packed["mm_token_type_ids"]
+
+    def window(span, **kwargs):
+        return window_media(media, types, metadata.cu_seqlens, span, spatial_merge_size=MERGE, **kwargs)
+
+    # A at [1, 5) crosses this window's own start.
+    with pytest.raises(ValueError, match=r"image 0's tokens \[1, 5\) straddle the window boundary at token 4"):
+        window((4, 8))
+    # [8, 16) does not touch A, and its own boundaries cut no image: B and C, whole.
+    assert window((8, 16))["image_grid_thw"].tolist() == [[1, 2, 4], [1, 2, 4]]
+    # Given the call's boundaries, it refuses the straddle elsewhere in the call too.
+    with pytest.raises(ValueError, match="at token 4"):
+        window((8, 16), boundaries=[0, 4, 8, 12, 16])
 
 
 def test_window_without_media_keeps_empty_media_leaves():
-    # Three windows of four tokens: the first holds only row 0, which is text.
-    rows = [([0, 0, 0, 0], []), ([0, 1, 1, 1, 1, 0, 0, 0], [[1, 4, 4]])]
+    # Three windows of four tokens: the first holds only row 0, which is text; the image fills the second exactly.
+    rows = [([0, 0, 0, 0], []), ([1, 1, 1, 1, 0, 0, 0, 0], [[1, 4, 4]])]
     _, _, windows = _windows(_batch(rows=rows), shard_count=3)
 
     empty = windows[0]
     assert empty["pixel_values"].shape == (0, 4)
     assert empty["image_grid_thw"].shape == (0, 3)
     assert empty["image_row_ids"].shape == (0,)
-    assert empty["image_window_token_ranges"].shape == (0, 2)
+    assert [w["image_grid_thw"].shape[0] for w in windows] == [0, 1, 0]
 
 
 def test_multimodal_positions_are_cut_on_the_token_axis():
-    packed, metadata, windows = _windows(_batch(), shard_count=4)
+    packed, metadata, windows = _windows(_batch(), shard_count=2)
 
-    assert all(w["position_ids"].shape == (4, 1, 4) for w in windows)
+    assert all(w["position_ids"].shape == (4, 1, 8) for w in windows)
     gathered = torch.cat([w["position_ids"] for w in windows], dim=2)
     torch.testing.assert_close(gathered, packed["position_ids"])
     assert cu_seqlens_from_position_ids(gathered).tolist() == metadata.cu_seqlens.tolist()
 
 
 def test_patch_dim_equal_to_the_padded_width_is_not_sliced():
-    _, _, windows = _windows(_batch(patch_dim=16), shard_count=4)
+    _, _, windows = _windows(_batch(patch_dim=16), shard_count=2)
 
-    assert [w["pixel_values"].shape for w in windows] == [(16, 16), (16, 16), (8, 16), (16, 16)]
+    assert [w["pixel_values"].shape for w in windows] == [(16, 16), (16, 16)]
 
 
 def test_video_frames_follow_the_same_rules():
-    # A [2, 4, 4] video is 8 merged tokens; two windows of 6 split it 5 / 3.
+    # A [2, 4, 4] video is 8 merged tokens at [1, 9); with the trailing text, one window holds it whole.
     rows = [([0, *[1] * 8, 0, 0, 0], [[2, 4, 4]])]
-    packed, _, windows = _windows(_batch(rows=rows, kind="video"), shard_count=2)
+    packed, _, windows = _windows(_batch(rows=rows, kind="video"), shard_count=1)
 
-    assert [w["video_window_token_ranges"].tolist() for w in windows] == [[[0, 5]], [[5, 8]]]
-    assert all(w["pixel_values_videos"].shape == (32, 4) for w in windows)
+    assert windows[0]["video_grid_thw"].tolist() == [[2, 4, 4]]
+    assert windows[0]["pixel_values_videos"].shape == (32, 4)
+    assert "video_window_token_ranges" not in windows[0]
     assert packed["position_ids"][1, 0].tolist() == [0, 1, 1, 1, 1, 3, 3, 3, 3, 5, 6, 7]
 
 
@@ -281,7 +297,6 @@ def test_selected_rows_pack_and_window_like_a_batch_built_in_that_order():
 
     for got, want in zip(from_selection, built):
         assert got["image_row_ids"].tolist() == want["image_row_ids"].tolist()
-        assert got["image_window_token_ranges"].tolist() == want["image_window_token_ranges"].tolist()
         torch.testing.assert_close(got["position_ids"], want["position_ids"])
         torch.testing.assert_close(got["pixel_values"][:, 1], want["pixel_values"][:, 1])
 
@@ -375,48 +390,46 @@ def test_several_videos_in_packed_rows_with_images_each_span_their_own_frames():
     assert spans.tolist() == [[1, 11], [16, 21], [23, 28], [29, 33]]
 
 
-def test_window_ranges_count_a_videos_embeddings_not_the_text_between_its_frames():
-    # Packed: row 0 [0, 12) with the video's frames at 1..2, 5..6, 9..10. Three windows of four tokens.
-    packed, _, windows = _windows(_mixed_batch(VIDEO_ROWS[:1]), shard_count=3)
-
-    assert [w["video_window_token_ranges"].tolist() for w in windows] == [[[0, 2]], [[2, 4]], [[4, 6]]]
-    # Each window carries the whole video: all three frames' patches.
-    assert all(w["pixel_values_videos"].shape == (24, 4) for w in windows)
-    assert packed["position_ids"].shape == (4, 1, 12)
+def _video_owners(window):
+    return _owners(window["pixel_values_videos"])
 
 
-def test_window_holding_only_text_between_frames_still_gets_the_video_with_an_empty_range():
-    rows = [([T, V, V, T, T, T, T, V, V, T], [], [[2, 2, 4]])]
-    _, _, windows = _windows(_mixed_batch(rows), shard_count=5)
+def test_each_window_gets_the_whole_videos_and_images_inside_it():
+    # Row 0 [0, 12): the 3-frame video at [1, 11). Row 1 [12, 24): an image at [13, 15), a video at [16, 21).
+    rows = [VIDEO_ROWS[0], ([T, I, I, T, V, V, T, V, V, T, T, T], [[1, 2, 4]], [[2, 2, 4]])]
+    packed, _, windows = _windows(_mixed_batch(rows), shard_count=2)
 
-    assert [w["video_window_token_ranges"].tolist() for w in windows] == [
-        [[0, 1]],
-        [[1, 2]],
-        [[2, 2]],
-        [[2, 3]],
-        [[3, 4]],
-    ]
+    assert [_video_owners(w) for w in windows] == [[0], [1]]
+    assert [_owners(w["pixel_values"]) for w in windows] == [[], [0]]
+    assert [w["video_row_ids"].tolist() for w in windows] == [[0], [1]]
+    # Each window carries a whole video: all three frames' patches.
+    assert [w["pixel_values_videos"].shape for w in windows] == [(24, 4), (16, 4)]
+    assert all(w.keys() == packed.keys() for w in windows)
 
 
-def test_window_ranges_fill_each_windows_video_slots_and_place_every_embedding_once():
-    batch = _mixed_batch(VIDEO_ROWS)
-    for shard_count in (1, 3, 9):
-        _, _, windows = _windows(batch, shard_count=shard_count)
-        covered = {0: [], 1: [], 2: []}
-        for window in windows:
-            ranges = window["video_window_token_ranges"]
-            assert int((ranges[:, 1] - ranges[:, 0]).sum()) == int((window["mm_token_type_ids"] == V).sum())
-            image_ranges = window["image_window_token_ranges"]
-            assert int((image_ranges[:, 1] - image_ranges[:, 0]).sum()) == int(
-                (window["mm_token_type_ids"] == I).sum()
-            )
-            owners = []
-            for patch_owner in window["pixel_values_videos"][:, 0].tolist():
-                if not owners or owners[-1] != int(patch_owner):
-                    owners.append(int(patch_owner))
-            for owner, (first, end) in zip(owners, ranges.tolist()):
-                covered[owner].extend(range(first, end))
-        assert covered == {0: list(range(6)), 1: list(range(4)), 2: list(range(4))}
+@pytest.mark.parametrize(
+    "rows, shard_count, match",
+    [
+        # Three windows of ten (28 tokens padded to 30): the first video, [1, 11), crosses 10.
+        (VIDEO_ROWS, 3, r"video 0's tokens \[1, 11\) straddle the window boundary at token 10"),
+        # The boundary falls on the text between the video's two frames.
+        ([([T, V, V, T, T, T, T, V, V, T], [], [[2, 2, 4]])], 2, r"video 0's tokens \[1, 9\) straddle .* token 5"),
+        # In the second packed row: the video at [17, 21) crosses 18.
+        (
+            [([T] * 12, [], []), ([T, T, T, T, T, V, V, V, V, T, T, T], [], [[2, 2, 4]])],
+            4,
+            r"video 0's tokens \[17, 21\) straddle the window boundary at token 18",
+        ),
+        # Two windows of 14: the image at [13, 15) in the second row crosses 14.
+        (VIDEO_ROWS, 2, r"image 0's tokens \[13, 15\) straddle the window boundary at token 14"),
+    ],
+    ids=["video-first-row", "boundary-between-frames", "video-second-row", "image-second-row"],
+)
+def test_media_straddling_a_window_boundary_in_packed_rows_is_refused(rows, shard_count, match):
+    packed, metadata = pad_packed_microbatch(*pack_microbatch(_mixed_batch(rows)), shard_count)
+    for shard_index in range(shard_count):
+        with pytest.raises(ValueError, match=match):
+            token_shard(packed, metadata, shard_count, shard_index, spatial_merge_size=MERGE)
 
 
 @pytest.mark.parametrize(
