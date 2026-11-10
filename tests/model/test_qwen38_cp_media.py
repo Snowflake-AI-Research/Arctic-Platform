@@ -12,16 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3.8 context parallelism on media calls: windowed (the default) and sharded after the vision merge.
+"""Qwen3.8 context parallelism on windowed media calls.
 
-Windowed, what the trainers dispatch today: each rank gets ``token_shard``'s window of the packed call with the
-whole media items in it and their ``*_window_token_ranges``. The call is already sharded and passes through the
-CP wrapper unchanged, as does any call not marked whole, text-only calls included.
-
-After the vision merge (prime-rl #3916), opt-in: the caller passes ``cp_shard_after_vision_merge=True`` and the
-whole call, images and video included, to every rank. Each rank runs the vision tower and the merge, then hands
-the language model only its ``token_window`` of the merged ``inputs_embeds``, the raw ``ple_input_ids``, the
-positions and ``routed_experts``.
+What the trainers dispatch: each rank gets ``token_shard``'s window of the packed call with the whole media items
+in it and their ``*_window_token_ranges``. The call is already sharded and reaches the language model as it would
+without CP, text-only calls included.
 
 CPU only, on the tiny config and dense-MLP model of ``test_qwen4_exp_multimodal.py``. The CP group is faked the
 way that file's spec does: ``dist.get_world_size`` / ``dist.get_rank`` are patched, and the GatedDeltaNet adapter
@@ -44,7 +39,6 @@ from arctic_platform.common.packing import token_window
 from arctic_platform.model import get_language_model
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.testing_utils import set_seed
-from arctic_platform.testing_utils import torch_assert_close
 from arctic_platform.testing_utils import torch_assert_equal
 from tests.model.test_qwen4_exp_multimodal import IMAGE_GRID_THW
 from tests.model.test_qwen4_exp_multimodal import IMAGE_TOKEN_ID
@@ -53,13 +47,8 @@ from tests.model.test_qwen4_exp_multimodal import VISION_END_TOKEN_ID
 from tests.model.test_qwen4_exp_multimodal import VISION_START_TOKEN_ID
 from tests.model.test_qwen4_exp_multimodal import _count_vision_forwards
 from tests.model.test_qwen4_exp_multimodal import _image_row
-from tests.model.test_qwen4_exp_multimodal import _lora
 from tests.model.test_qwen4_exp_multimodal import _model
 from tests.model.test_qwen4_exp_multimodal import _StopForward
-
-# One three-frame video of 2x2 patches (merge 1): each frame's 4 tokens follow its timestamp text.
-VIDEO_GRID_THW = torch.tensor([[3, 2, 2]])
-TIMESTAMP_TOKEN_IDS = (10, 11, 12)
 
 GROUPS = [(2, rank) for rank in range(2)] + [(4, rank) for rank in range(4)]
 
@@ -112,43 +101,8 @@ def _image_call(model):
     )
 
 
-def _video_call(model):
-    """One row holding a video whose frames are separated by their timestamp text, as the processor lays it out."""
-    video_token_id = model.config.video_token_id
-    frame_tokens = int(VIDEO_GRID_THW[0, 1:].prod())
-    tokens = [2]
-    for timestamp in TIMESTAMP_TOKEN_IDS:
-        tokens += [timestamp, VISION_START_TOKEN_ID] + [video_token_id] * frame_tokens + [VISION_END_TOKEN_ID]
-    tokens += [4, 5]
-    input_ids = torch.tensor([tokens])
-    mm_token_type_ids = (input_ids == video_token_id).int() * 2
-    set_seed(2)
-    pixel_values_videos = torch.randn(int(VIDEO_GRID_THW.prod(-1).sum()), _patch_dim(model))
-    position_ids = mrope_position_ids(
-        mm_token_type_ids,
-        torch.tensor([0, input_ids.shape[-1]]),
-        spatial_merge_size=model.config.vision_config.spatial_merge_size,
-        video_grid_thw=VIDEO_GRID_THW,
-    )
-    return dict(
-        input_ids=input_ids,
-        pixel_values_videos=pixel_values_videos,
-        video_grid_thw=VIDEO_GRID_THW,
-        mm_token_type_ids=mm_token_type_ids,
-        position_ids=position_ids,
-    )
-
-
-CALLS = {"image": _image_call, "video": _video_call}
-
-
-def _whole(inputs):
-    """``inputs`` marked as the whole packed call, to be sharded after the vision merge."""
-    return dict(inputs, cp_shard_after_vision_merge=True)
-
-
 def _language_model_inputs(model, inputs):
-    """The keyword inputs the language model gets, after the vision merge (and the CP shard); resolved through PEFT."""
+    """The keyword inputs the language model gets, after the vision merge; resolved through PEFT."""
     captured = {}
 
     def capture(_module, _args, kwargs):
@@ -162,45 +116,6 @@ def _language_model_inputs(model, inputs):
     finally:
         handle.remove()
     return captured
-
-
-@pytest.mark.parametrize("world_size, rank", GROUPS)
-@pytest.mark.parametrize("kind", sorted(CALLS))
-def test_each_rank_gets_its_window_of_the_merged_media_call(monkeypatch, kind, world_size, rank):
-    reference = _model().eval()
-    inputs = CALLS[kind](reference)
-    unsharded = _language_model_inputs(reference, inputs)
-    model, group = _cp_model(monkeypatch, world_size)
-    model.eval()
-    group.rank = rank
-
-    sharded = _language_model_inputs(model, _whole(inputs))
-
-    start, end = token_window(inputs["input_ids"].shape[-1], world_size, rank)
-    assert "cp_shard_after_vision_merge" not in sharded
-    torch_assert_equal(sharded["inputs_embeds"], unsharded["inputs_embeds"][:, start:end])
-    torch_assert_equal(sharded["ple_input_ids"], inputs["input_ids"][:, start:end])
-    torch_assert_equal(sharded["position_ids"], inputs["position_ids"][..., start:end])
-    torch_assert_equal(sharded["ple_position_ids"], inputs["position_ids"][0, :, start:end])
-
-
-@pytest.mark.parametrize("world_size", [2, 4])
-@pytest.mark.parametrize("kind", sorted(CALLS))
-def test_ranks_windows_concatenate_to_the_unsharded_merged_call(monkeypatch, kind, world_size):
-    reference = _model().eval()
-    inputs = CALLS[kind](reference)
-    unsharded = _language_model_inputs(reference, inputs)
-    model, group = _cp_model(monkeypatch, world_size)
-    model.eval()
-
-    windows = []
-    for rank in range(world_size):
-        group.rank = rank
-        windows.append(_language_model_inputs(model, _whole(inputs)))
-
-    for key in ("inputs_embeds", "ple_input_ids", "ple_position_ids"):
-        torch_assert_equal(torch.cat([window[key] for window in windows], dim=1), unsharded[key], msg=key)
-    torch_assert_equal(torch.cat([window["position_ids"] for window in windows], dim=-1), unsharded["position_ids"])
 
 
 @pytest.mark.parametrize("world_size, rank", GROUPS)
@@ -247,122 +162,9 @@ def test_dummy_vision_forward_gives_zero_vision_grads_under_cp(monkeypatch, worl
         torch_assert_equal(parameter.grad, torch.zeros_like(parameter), msg=name)
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
-@pytest.mark.parametrize("kind", sorted(CALLS))
-def test_ranks_vision_grads_sum_to_the_unsharded_vision_grads(monkeypatch, kind, world_size):
-    reference = _model().train()
-    _identity_language_model(reference)
-    inputs = CALLS[kind](reference)
-    # A per-token sum, so the unsharded loss is the sum of the ranks' window losses.
-    reference(**inputs).logits.float().square().sum().backward()
-    model, group = _cp_model(monkeypatch, world_size)
-    model.train()
-    _identity_language_model(model)
-
-    for rank in range(world_size):
-        group.rank = rank
-        model(**_whole(inputs)).logits.float().square().sum().backward()
-
-    vision_grads = dict(model.model.visual.named_parameters())
-    for name, parameter in reference.model.visual.named_parameters():
-        # The ranks' grads accumulate in a different order than one backward over every token: fp32 rounding only.
-        torch_assert_close(vision_grads[name].grad, parameter.grad, rtol=0, atol=1e-5, msg=name)
-
-
-def test_media_call_without_packed_positions_is_refused(monkeypatch):
-    # Without position_ids the forward builds [3, B, T] M-RoPE ids: no row channel for the backbone's boundaries.
-    model, group = _cp_model(monkeypatch, 2)
-    model.eval()
-    group.rank = 1
-    inputs = _image_call(model)
-    del inputs["position_ids"]
-
-    with pytest.raises(ValueError, match=r"packed \[4, batch, sequence\] M-RoPE position_ids"), torch.no_grad():
-        model(**_whole(inputs))
-
-
-def test_lora_wrapped_model_shards_its_media_calls(monkeypatch):
-    from arctic_platform.model.implementations.qwen38 import context_parallel
-
-    reference = _lora(_model(), ["q_proj", "k_proj", "v_proj", "o_proj"]).eval()
-    inputs = _image_call(reference)
-    unsharded = _language_model_inputs(reference, inputs)
-    model = _lora(_model(), ["q_proj", "k_proj", "v_proj", "o_proj"]).eval()
-    group = _FakeGroup(monkeypatch, 2)
-    context_parallel.apply_context_parallelism(model, 2, object())
-    group.rank = 1
-
-    sharded = _language_model_inputs(model, _whole(inputs))
-
-    start, end = token_window(inputs["input_ids"].shape[-1], 2, 1)
-    torch_assert_equal(sharded["inputs_embeds"], unsharded["inputs_embeds"][:, start:end])
-    torch_assert_equal(sharded["ple_input_ids"], inputs["input_ids"][:, start:end])
-
-
-def test_media_call_that_does_not_split_evenly_is_refused(monkeypatch):
-    # The video call has 24 tokens: four ranks split it, five cannot.
-    model, _group = _cp_model(monkeypatch, 5)
-    model.eval()
-    inputs = _video_call(model)
-
-    with pytest.raises(ValueError, match="must divide by shard_count"), torch.no_grad():
-        model(**_whole(inputs))
-
-
-def test_media_call_with_windowed_positions_is_refused(monkeypatch):
-    # position_ids that are already one rank's window would be cut a second time.
-    model, group = _cp_model(monkeypatch, 2)
-    model.eval()
-    group.rank = 1
-    inputs = _image_call(model)
-    inputs["position_ids"] = inputs["position_ids"][..., 16:]
-
-    with pytest.raises(ValueError, match="media call"), torch.no_grad():
-        model(**_whole(inputs))
-
-
-def test_media_call_already_cut_to_a_mid_row_window_is_refused(monkeypatch):
-    # Rank 1's 16-token window of the image call, every input cut alike: its width divides by the CP size, but it
-    # opens mid-row (position 16), so it cannot be a whole packed call and must not be cut a second time.
-    from arctic_platform.model.implementations.qwen38 import context_parallel
-
-    _FakeGroup(monkeypatch, 2)
-    reference = _model().eval()
-    inputs = _image_call(reference)
-    merged = _language_model_inputs(reference, inputs)
-    window = {key: merged[key][:, 16:] for key in ("inputs_embeds", "ple_input_ids", "ple_position_ids")}
-    window["position_ids"] = merged["position_ids"][..., 16:]
-
-    with pytest.raises(ValueError, match=r"first positions \[16\]"):
-        context_parallel._shard_merged_call(None, (), window, process_group=object())
-
-
-def test_routed_experts_and_attention_mask_are_cut_on_the_token_axis(monkeypatch):
-    # Router replay's [B, T, layers, top_k] expert ids must cover the rank's tokens only, like the hidden states,
-    # and so must a [B, T] attention mask.
-    model, group = _cp_model(monkeypatch, 2)
-    model.eval()
-    group.rank = 1
-    inputs = _image_call(model)
-    tokens = inputs["input_ids"].shape[-1]
-    layers = model.config.text_config.num_hidden_layers
-    routed_experts = torch.arange(tokens * layers * 2).reshape(1, tokens, layers, 2)
-
-    attention_mask = torch.ones(1, tokens, dtype=torch.long)
-    attention_mask[:, -3:] = 0
-
-    sharded = _language_model_inputs(
-        model, _whole(dict(inputs, routed_experts=routed_experts, attention_mask=attention_mask))
-    )
-
-    start, end = token_window(tokens, 2, 1)
-    torch_assert_equal(sharded["routed_experts"], routed_experts[:, start:end])
-    torch_assert_equal(sharded["attention_mask"], attention_mask[:, start:end])
-
-
 @pytest.mark.parametrize("rank", [0, 1])
-def test_media_call_not_marked_whole_passes_through_unchanged(monkeypatch, rank):
-    # Without the flag a call is taken to be the rank's window already, whatever its media and positions.
+def test_media_call_passes_through_unchanged(monkeypatch, rank):
+    # A media call is taken to be the rank's window already, whatever its media and positions.
     reference = _model().eval()
     inputs = _image_call(reference)
     expected = _language_model_inputs(reference, inputs)
@@ -381,7 +183,7 @@ def _two_row_windows(model, shard_count=2):
     """The review's sp=2 example through the trainers' own sharding: two 16-token rows, one image in row 0.
 
     Returns the packed whole call, its metadata, and ``token_shard``'s windows (with ``window_media``'s whole
-    images and ``image_window_token_ranges``). Rank 0's window opens a row at position 0, like a whole call.
+    images and ``image_window_token_ranges``).
     """
     image_tokens = int(IMAGE_GRID_THW[0].prod())
     row_0 = [2, VISION_START_TOKEN_ID] + [IMAGE_TOKEN_ID] * image_tokens + [VISION_END_TOKEN_ID]
@@ -445,20 +247,3 @@ def test_token_shard_windows_pass_through_and_each_rank_gets_its_own_window(monk
     gathered = torch.cat([context_parallel._text_position_ids(inputs["position_ids"]) for inputs in received], dim=-1)
     torch_assert_equal(cu_seqlens_from_position_ids(gathered).to(metadata.cu_seqlens.dtype), metadata.cu_seqlens)
 
-
-def test_token_shard_window_marked_whole_is_refused(monkeypatch):
-    # Rank 0's window opens at position 0 and divides evenly: only its window ranges say it is not the whole call.
-    model, group = _cp_model(monkeypatch, 2)
-    model.eval()
-    _, _, windows = _two_row_windows(model)
-
-    with pytest.raises(ValueError, match="image_window_token_ranges"), torch.no_grad():
-        model(**_whole(windows[0]))
-
-
-def test_text_only_call_marked_whole_is_refused(monkeypatch):
-    model, _group = _cp_model(monkeypatch, 2)
-    model.eval()
-
-    with pytest.raises(ValueError, match="a text-only call is sharded before the model"), torch.no_grad():
-        model(**_whole(dict(input_ids=TEXT_ONLY_INPUT_IDS)))
