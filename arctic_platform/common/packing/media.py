@@ -225,9 +225,10 @@ def media_token_spans(
     equal what the grids expand to. Token types cannot tell one video from the next, so a video's frames are
     the next ``t`` frame runs in packed order, as ``mrope_position_ids`` reads them too.
     """
-    grid, row_ids = media[kind.grid_key], media[kind.row_ids_key]
+    # On CPU once: the loop reads them per item (per frame for video), one device sync each on GPU.
+    grid, row_ids = media[kind.grid_key].cpu(), media[kind.row_ids_key].cpu()
     token_counts = _patch_counts(grid) // (spatial_merge_size**2)
-    token_types = mm_token_type_ids.reshape(-1)
+    token_types = mm_token_type_ids.reshape(-1).cpu()
     positions = torch.nonzero(token_types == kind.token_type).flatten()
     if int(positions.numel()) != int(token_counts.sum()):
         raise MediaBatchError(

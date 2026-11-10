@@ -63,12 +63,15 @@ Media leaves ride at the top level only; one inside `context` is refused.
 Everything above is the Qwen-VL layout. `media_spec_for(model_type)` (`media_spec.py`) returns the `MediaSpec` that states it for one model family, or `None` for a model with no registered media:
 
 - `kinds` / `modalities`: the media the model takes, each a `MediaKind` with its values, grid and row-id leaf names and its token type;
-- `placeholder_ids(config)`: `{modality: token id}` read from the model config (Qwen-VL: `image_token_id`, `video_token_id`);
-- `tokens_per_item(grid_row, spatial_merge_size)`: an item's token count in its row (Qwen-VL: `t * h * w / merge**2`);
-- `positions`: `"mrope"` (`[4, 1, T]`) or `"1d"`;
-- `item_prefix_tokens`: text tokens just before an item that belong to it, such as a begin marker (Qwen-VL: 0).
+- `placeholder_ids(config)`: `{modality: token id}` read from the model config (Qwen-VL: `image_token_id`, `video_token_id`, top-level or under `text_config`);
+- `spatial_merge_size(config)`: the vision tower's merge factor (Qwen-VL: `vision_config.spatial_merge_size`);
+- `positions`: `"mrope"` (`[4, 1, T]`) or `"1d"`.
 
-The Qwen-VL entry is registered for `qwen3_vl`, `qwen3_vl_moe`, `qwen3_5`, `qwen3_5_moe` and `qwen4_exp`. A family with another layout adds its own with `register_media_spec(model_type, spec)`; a model type registered twice is refused. The code in this package still uses the Qwen-VL constants directly; the spec is where a caller reads them instead of assuming them.
+An item's token count is not in the spec: `media_token_spans`, `mrope_position_ids` and `window_media` count `t * h * w / merge**2` tokens per item, so a family that counts otherwise brings its count with them.
+
+The Qwen-VL entry is registered for `qwen4_exp` only: its Arctic modeling takes `[4, 1, T]` M-RoPE `position_ids` and both `pixel_values` and `pixel_values_videos`. Other Qwen vision-language model types are left out until their Arctic code path does the same: Arctic's `qwen3_5_moe` modeling flattens `position_ids.view(-1)` to find its packed rows and has no `pixel_values_videos` parameter, and `qwen3_vl`, `qwen3_vl_moe` and `qwen3_5` have no Arctic modeling that reads `[4, 1, T]` positions. A family with another layout adds its own with `register_media_spec(model_type, spec)`; a model type registered twice is refused.
+
+`run_pipeline` takes its media kinds, merge factor and position layout from the spec of the engine's `model_type`, and checks each item's tokens with `media_token_spans`. A model type with no spec gets `pixel_values` and `image_grid_thw` as sent, with no M-RoPE positions or row ids, and any other media key is refused for it. `mm_token_type_ids` is read to build the positions and is not forwarded to the model.
 
 ### Media under context parallelism
 
