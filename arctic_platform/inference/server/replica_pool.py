@@ -1347,6 +1347,21 @@ class ReplicaPool:
         worker = await self._scheduler.wait_for_schedulable_worker(timeout)
         return await worker.get_chat_support.remote()
 
+    async def media_modalities(self, model_id: str | None = None) -> dict[str, int]:
+        """``{modality: placeholder token id}`` the loaded model's workers decode (see ``InferenceWorker.media_modalities``).
+
+        Asked of one worker the scheduler can route to, in its own process:
+        every replica runs the same image with the same engine kwargs and
+        model config. ``{}`` when no worker is ready; this does not wait for one.
+        """
+        self._check_model_id(model_id)
+        if self._scheduler is None:
+            return {}
+        for index in range(len(self._workers)):
+            if self._scheduler.is_worker_available(index):
+                return await self._workers[index].media_modalities.remote()
+        return {}
+
     # ------------------------------------------------------------------
     # Metrics
     # ------------------------------------------------------------------
