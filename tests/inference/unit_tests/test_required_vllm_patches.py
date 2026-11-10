@@ -46,7 +46,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "ensure_tp_spec_decode_sync",
         lambda: calls.append("tp_spec_decode_sync"),
     )
-    monkeypatch.setattr(glm5next_kpool_chunk_align, "apply_glm5next_kpool_chunk_align_check", lambda: calls.append("glm5next_kpool_chunk_align"))
+    monkeypatch.setattr(
+        glm5next_kpool_chunk_align,
+        "apply_glm5next_kpool_chunk_align_check",
+        lambda: calls.append("glm5next_kpool_chunk_align"),
+    )
     monkeypatch.setattr(
         config,
         "ensure_dflash_max_position_patch",
