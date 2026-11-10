@@ -131,8 +131,9 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
 
     Sequence parallelism reduces the data-parallel degree used to derive
     ``train_batch_size`` when the caller does not provide it explicitly.
-    Unspecified gradient accumulation uses FP32 where DeepSpeed supports it;
-    explicit accumulation dtypes are preserved.
+    Unspecified BF16 gradient accumulation uses FP32 where DeepSpeed supports
+    it, based on the effective precision after overrides. FP16 and FP32 retain
+    DeepSpeed's native defaults; explicit accumulation dtypes are preserved.
     """
     dtype = (spec.dtype or "bfloat16").lower()
     is_bf16 = dtype in ("bfloat16", "bf16")
