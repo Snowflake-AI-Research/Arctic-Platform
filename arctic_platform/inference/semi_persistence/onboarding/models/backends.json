@@ -7,7 +7,7 @@
   "glm53-flash-bf16-standard-full":         {"image_tag": "dev_20261106_001119_9fa58f7d83f"},
   "glm53-flash-long-full":                  {"image_tag": "dev_20261106_001119_9fa58f7d83f"},
   "glm53-flash-long-lora":                  {"image_tag": "dev_20261109_012119_5f86137fa32"},
-  "glm53-long-full":                        {"image_tag": "dev_20261110_020731_589ef4264be"},
+  "glm53-long-full":                        {"image_tag": "dev_20261110_044940_0a95b4bbdab"},
   "glm53-standard-full":                    {"image_tag": "dev_20261106_001119_9fa58f7d83f"},
   "glm53-tp16":                             {"image_tag": "dev_20261014_134647_8504440038f"},
   "glm53-tp8":                              {"image_tag": "dev_20261014_134647_8504440038f"},
