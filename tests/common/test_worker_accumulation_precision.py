@@ -39,6 +39,21 @@ _ZERO2 = {"zero_optimization": {"stage": 2}}
 _REFUSED_ZERO = [{"stage": 0}, {"stage": 1, "compute_grad_norm": False}]
 
 
+def _entry_point_config(worker, entry_point, overrides, dtype="bfloat16"):
+    if entry_point == "builder":
+        return build_deepspeed_config(
+            TrainingEngineSpec(world_size=1, dtype=dtype, fp32_masters=True, ds_overrides=overrides)
+        )
+    config = {
+        "train_micro_batch_size_per_gpu": 1,
+        "bf16": {"enabled": dtype in ("bf16", "bfloat16")},
+        "fp16": {"enabled": dtype in ("fp16", "float16")},
+        **deepcopy(_ZERO2),
+    }
+    config.update(overrides)
+    return worker.ds_training_config({}, config, {})
+
+
 @pytest.mark.parametrize("job_config", [{}, {"training_config": {}}])
 def test_missing_data_types_retains_worker_fp32_accumulation_default(worker, job_config):
     config = deepcopy(_ZERO2)
@@ -50,27 +65,25 @@ def test_missing_data_types_retains_worker_fp32_accumulation_default(worker, job
     "data_types", [{"grad_accum_dtype": "bf16"}, {"grad_accum_dtype": "fp32", "other_setting": True}]
 )
 @pytest.mark.parametrize("zero", [{"stage": 2}, *_REFUSED_ZERO])
-def test_explicit_accumulation_precision_is_preserved(worker, data_types, zero):
-    supplied = deepcopy(data_types)
-    config = {"data_types": supplied, "zero_optimization": deepcopy(zero)}
-    worker.ds_training_config({}, config, {})
+@pytest.mark.parametrize("entry_point", ["builder", "worker"])
+def test_explicit_accumulation_precision_is_preserved(worker, entry_point, data_types, zero):
+    supplied = {"data_types": deepcopy(data_types), "zero_optimization": deepcopy(zero)}
+    config = _entry_point_config(worker, entry_point, supplied)
     assert config["data_types"] == data_types
-    assert supplied == data_types
+    assert config["data_types"] is supplied["data_types"]
+    assert supplied == {"data_types": data_types, "zero_optimization": zero}
 
 
 @pytest.mark.parametrize("data_types", [None, {}, {"other_setting": True}, {"grad_accum_dtype": None}])
-@pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32"])
-def test_supplied_block_without_accumulation_precision_gets_worker_fp32_default(worker, data_types, dtype):
-    supplied = deepcopy(data_types)
-    config = {
-        "data_types": supplied,
-        "bf16": {"enabled": dtype == "bfloat16"},
-        "fp16": {"enabled": dtype == "float16"},
-        **deepcopy(_ZERO2),
-    }
-    worker.ds_training_config({}, config, {})
+@pytest.mark.parametrize(
+    "entry_point, dtype",
+    [("builder", "bfloat16"), ("worker", "bfloat16"), ("worker", "float16"), ("worker", "float32")],
+)
+def test_supplied_block_without_accumulation_precision_gets_fp32_default(worker, entry_point, dtype, data_types):
+    supplied = {"data_types": deepcopy(data_types)}
+    config = _entry_point_config(worker, entry_point, supplied, dtype)
     assert config["data_types"] == {**(data_types or {}), "grad_accum_dtype": "fp32"}
-    assert supplied == data_types
+    assert supplied == {"data_types": data_types}
 
 
 @pytest.mark.parametrize("job_config", [{}, {"training_config": {}}])
@@ -95,27 +108,14 @@ def test_worker_leaves_accumulation_unset_where_deepspeed_refuses_fp32(worker, z
     assert "data_types" not in config
 
 
-@pytest.mark.parametrize("dtype", ["bf16", "bfloat16"])
-@pytest.mark.parametrize("fp32_masters", [False, True])
-def test_bfloat16_config_builder_defaults_accumulation_to_fp32(dtype, fp32_masters):
-    ds_config = build_deepspeed_config(TrainingEngineSpec(world_size=4, dtype=dtype, fp32_masters=fp32_masters))
-    assert ds_config["data_types"] == {"grad_accum_dtype": "fp32"}
-
-
-@pytest.mark.parametrize("dtype", ["float16", "fp16", "float32", "fp32"])
-def test_other_precisions_keep_native_accumulation_defaults_under_zero(dtype):
-    ds_config = build_deepspeed_config(TrainingEngineSpec(world_size=1, dtype=dtype))
-    assert "data_types" not in ds_config
-    expected_dtype = torch.float16 if dtype in ("float16", "fp16") else torch.float32
-    assert _resolved_engine(ds_config).get_data_types() == (expected_dtype, expected_dtype)
-
-
 @pytest.mark.parametrize("entry_point", ["builder", "worker"])
 @pytest.mark.parametrize(
     "dtype, overrides, model_dtype, accumulation_dtype",
     [
         ("float16", {}, torch.float16, torch.float16),
+        ("fp16", {}, torch.float16, torch.float16),
         ("float32", {}, torch.float32, torch.float32),
+        ("fp32", {}, torch.float32, torch.float32),
         (
             "bfloat16",
             {"bf16": {"enabled": False}, "fp16": {"enabled": True}},
@@ -143,19 +143,9 @@ def test_effective_precision_controls_default_and_preserves_explicit_dtype(
     worker, entry_point, dtype, overrides, model_dtype, accumulation_dtype
 ):
     supplied = deepcopy(overrides)
-    if entry_point == "builder":
-        config = build_deepspeed_config(TrainingEngineSpec(world_size=1, dtype=dtype, ds_overrides=supplied))
-    else:
-        config = dict(
-            train_micro_batch_size_per_gpu=1,
-            bf16=dict(enabled=dtype == "bfloat16"),
-            fp16=dict(enabled=dtype == "float16"),
-            **deepcopy(_ZERO2),
-        )
-        config.update(supplied)
-        worker.ds_training_config({}, config, {})
-        if "data_types" not in overrides:
-            accumulation_dtype = torch.float32
+    config = _entry_point_config(worker, entry_point, supplied, dtype)
+    if entry_point == "worker" and "data_types" not in overrides:
+        accumulation_dtype = torch.float32
     assert supplied == overrides
     if entry_point == "builder" and model_dtype != torch.bfloat16 and "data_types" not in overrides:
         assert "data_types" not in config
@@ -163,34 +153,6 @@ def test_effective_precision_controls_default_and_preserves_explicit_dtype(
         expected_accumulation = "bf16" if accumulation_dtype == torch.bfloat16 else "fp32"
         assert config["data_types"] == {"grad_accum_dtype": expected_accumulation}
     assert _resolved_engine(config).get_data_types() == (model_dtype, accumulation_dtype)
-
-
-@pytest.mark.parametrize("data_types", [{"grad_accum_dtype": "bf16"}, {"grad_accum_dtype": "fp32"}])
-@pytest.mark.parametrize("zero", [{"stage": 2}, *_REFUSED_ZERO])
-def test_explicit_accumulation_override_is_preserved(data_types, zero):
-    override = {"data_types": deepcopy(data_types), "zero_optimization": deepcopy(zero)}
-    ds_config = build_deepspeed_config(TrainingEngineSpec(world_size=4, ds_overrides=override))
-    assert ds_config["data_types"] == data_types
-    assert override == {"data_types": data_types, "zero_optimization": zero}
-
-
-@pytest.mark.parametrize("data_types", [None, {}, {"other_setting": True}, {"grad_accum_dtype": None}])
-def test_override_block_without_accumulation_precision_gets_fp32_default(data_types):
-    override = {"data_types": deepcopy(data_types)}
-    ds_config = build_deepspeed_config(TrainingEngineSpec(world_size=4, ds_overrides=override))
-    assert ds_config["data_types"] == {**(data_types or {}), "grad_accum_dtype": "fp32"}
-    assert override == {"data_types": data_types}
-
-
-@pytest.mark.parametrize(
-    "dtype, zero",
-    [("bfloat16", _REFUSED_ZERO[0]), ("float16", _REFUSED_ZERO[0]), ("bfloat16", _REFUSED_ZERO[1])],
-)
-def test_config_builder_leaves_accumulation_unset_where_deepspeed_refuses_fp32(dtype, zero):
-    ds_config = build_deepspeed_config(
-        TrainingEngineSpec(world_size=4, dtype=dtype, ds_overrides={"zero_optimization": deepcopy(zero)})
-    )
-    assert "data_types" not in ds_config
 
 
 @pytest.mark.parametrize(
@@ -208,19 +170,12 @@ def test_config_builder_leaves_accumulation_unset_where_deepspeed_refuses_fp32(d
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32"])
 def test_default_is_written_only_for_supported_bfloat16_accumulation(zero, dtype):
     """Check the policy against the installed DeepSpeed optimizer sanity check, without initializing ranks."""
-    from deepspeed.runtime.config import DeepSpeedConfig
-    from deepspeed.runtime.engine import DeepSpeedEngine
-
     overrides = {"zero_optimization": deepcopy(zero), "zero_allow_untested_optimizer": True}
     defaulted = build_deepspeed_config(
         TrainingEngineSpec(world_size=1, dtype=dtype, fp32_masters=True, ds_overrides=overrides)
     )
     explicit = {**defaulted, "data_types": {"grad_accum_dtype": "fp32"}}
-    engine = DeepSpeedEngine.__new__(DeepSpeedEngine)
-    torch.nn.Module.__init__(engine)
-    object.__setattr__(engine, "_config", DeepSpeedConfig(explicit))
-    object.__setattr__(engine, "pipeline_parallelism", False)
-    object.__setattr__(engine, "global_rank", 0)
+    engine = _resolved_engine(explicit)
     try:
         engine._do_optimizer_sanity_check(torch.optim.AdamW([torch.nn.Parameter(torch.zeros(8))]))
         accepted = True
@@ -268,12 +223,7 @@ def test_typed_grad_norm_policy_matches_real_deepspeed_sanity_check(
         "zero_allow_untested_optimizer": True,
     }
     assert get_zero_config(overrides).compute_grad_norm is resolved_boolean
-    if entry_point == "builder":
-        defaulted = build_deepspeed_config(
-            TrainingEngineSpec(world_size=1, fp32_masters=True, ds_overrides=deepcopy(overrides))
-        )
-    else:
-        defaulted = worker.ds_training_config({}, deepcopy(overrides), {})
+    defaulted = _entry_point_config(worker, entry_point, deepcopy(overrides))
     assert ("data_types" in defaulted) is resolved_boolean
     engine = _resolved_engine(defaulted)
     assert engine._config.zero_config.compute_grad_norm is resolved_boolean
@@ -342,11 +292,8 @@ def test_auto_and_legacy_zero_policy_matches_real_deepspeed_parser(
     assert (parsed.offload_optimizer is not None) is cpu_offload
     if cpu_offload:
         assert parsed.offload_optimizer.device == "cpu"
-    if entry_point == "builder":
-        defaulted = build_deepspeed_config(TrainingEngineSpec(world_size=1, fp32_masters=True, ds_overrides=overrides))
-        assert overrides == original
-    else:
-        defaulted = worker.ds_training_config({}, overrides, {})
+    defaulted = _entry_point_config(worker, entry_point, overrides)
+    assert overrides == original
     assert defaulted["zero_optimization"] == zero
     assert ("data_types" in defaulted) is fp32
     engine = _resolved_engine(defaulted)
@@ -398,26 +345,12 @@ def test_bfloat16_alias_keeps_zero0_native_accumulation_default():
     assert config == {"bfloat16": {"enabled": True}}
 
 
-@pytest.mark.parametrize("override", [None, {"data_types": {"grad_accum_dtype": "fp32"}}])
+@pytest.mark.parametrize("dtype", ["bf16", "bfloat16"])
 @pytest.mark.parametrize("fp32_masters", [False, True])
-def test_deepspeed_resolves_float32_accumulation_without_changing_model_precision(fp32_masters, override):
-    from deepspeed.runtime.config import DeepSpeedConfig
-    from deepspeed.runtime.engine import DeepSpeedEngine
-
-    ds_config = build_deepspeed_config(
-        TrainingEngineSpec(
-            world_size=1,
-            fp32_masters=fp32_masters,
-            ds_overrides=override,
-        )
-    )
-    config = DeepSpeedConfig(ds_config)
-    engine = DeepSpeedEngine.__new__(DeepSpeedEngine)
-    torch.nn.Module.__init__(engine)
-    object.__setattr__(engine, "_config", config)
-    engine.optimizer = None
-    engine.checkpoint_engine = None
-    assert engine.get_data_types() == (torch.bfloat16, torch.float32)
+def test_deepspeed_resolves_float32_accumulation_without_changing_model_precision(fp32_masters, dtype):
+    ds_config = build_deepspeed_config(TrainingEngineSpec(world_size=1, dtype=dtype, fp32_masters=fp32_masters))
+    assert ds_config["data_types"] == {"grad_accum_dtype": "fp32"}
+    assert _resolved_engine(ds_config).get_data_types() == (torch.bfloat16, torch.float32)
     assert ds_config["bf16"]["bf16_master_weights_and_grads"] is not fp32_masters
     assert ds_config["bf16"]["bf16_optimizer_states"] is not fp32_masters
 
