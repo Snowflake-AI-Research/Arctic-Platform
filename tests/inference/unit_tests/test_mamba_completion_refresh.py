@@ -1,6 +1,6 @@
 """CPU completion ordering; real vLLM methods, synthetic storage, no GPU kernels.
 
-VLLM_SOURCE_ROOT may name a vLLM 0.33.0 checkout on CPU-only test hosts.
+VLLM_SOURCE_ROOT may name the pinned vLLM checkout on CPU-only test hosts.
 Otherwise read the installed vLLM package without importing its GPU runtime.
 """
 
@@ -14,6 +14,7 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from vllm.utils.gc_utils import untracked_list
 
 
 def methods(root, file, cls, names, keep_classmethod=False):
@@ -100,7 +101,7 @@ def manager_methods(monkeypatch):
         type_ignores=[],
     )
     global ns
-    ns = {"defaultdict": defaultdict, "MambaSpec": SimpleNamespace, "cdiv": lambda a, b: (a + b - 1) // b}
+    ns = {"untracked_list": untracked_list, "defaultdict": defaultdict, "MambaSpec": SimpleNamespace, "cdiv": lambda a, b: (a + b - 1) // b}
     exec(compile(ast.fix_missing_locations(module), str(root), "exec"), ns)  # noqa: S102
     target = ModuleType("vllm.v1.core.single_type_kv_cache_manager")
     target.MambaManager = ns["Manager"]
@@ -111,7 +112,7 @@ def manager_methods(monkeypatch):
     monkeypatch.setitem(sys.modules, interface.__name__, interface)
     ns["original_window_cap"] = ns["WindowSpec"].max_admission_blocks_per_request
     vllm = ModuleType("vllm")
-    vllm.__version__ = "0.33.0"
+    vllm.__version__ = "0.33.0rc1.dev1045+gf905e7007"
     monkeypatch.setitem(sys.modules, "vllm", vllm)
     # Loading the patch through the required entry point also covers vanilla vLLM.
     from arctic_platform.inference.vllm import required_patches
@@ -162,7 +163,7 @@ class Queue:
 class Block:
     def __init__(self, name, pool):
         self.name = self.block_hash = name
-        self.pool = pool
+        self.pool = pool._weak_self
         self.is_null = False
         self.ref_cnt = 1
 
@@ -177,6 +178,7 @@ def setup(retained, active_last=False):
         metrics_collector=None,
         cached_block_hash_to_block=SimpleNamespace(get_one_block=mapping.get),
     )
+    pool._weak_self = lambda: pool
     pool.free_blocks = lambda blocks: ns["free_blocks"](pool, blocks)
     pool.get_num_free_blocks = lambda: len(queue.blocks)
 
@@ -445,6 +447,7 @@ def hybrid_turn(root, *, eagle, window, churn, deferred, resend=False):
         cached_block_hash_to_block=SimpleNamespace(get_one_block=mapping.get),
         hash_block_size=1,
     )
+    pool._weak_self = lambda: pool
     pool.free_blocks = lambda blocks: ns["free_blocks"](pool, blocks)
     pool.get_num_free_blocks = lambda: len(queue.blocks)
     pool.get_cached_block = lambda h, gids: (

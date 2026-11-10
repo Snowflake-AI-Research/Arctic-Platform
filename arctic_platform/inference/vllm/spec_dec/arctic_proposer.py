@@ -13,47 +13,117 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Union, List
+import copy
 
-from vllm.config import VllmConfig
-from vllm.model_executor.model_loader import get_model
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.worker.gpu_model_runner import logger
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
-from vllm.v1.utils import CpuGpuBuffer 
-from vllm.utils.platform_utils import is_pin_memory_available 
-
-import numpy as np
 import torch
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
+from vllm.model_executor.model_loader import get_model
+from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator, DraftModelSpeculator
 
-from arctic_platform.inference.vllm.spec_dec.arctic_speculator import ArcticMLPSpeculator, ArcticLSTMSpeculator
 from arctic_platform.inference.envs import ARCTIC_INFERENCE_SKIP_SPEC_MODEL_CHECK
+from arctic_platform.inference.suffix_decoding.cache import SuffixDecodingCache
+
+logger = init_logger(__name__)
 
 
-class ArcticProposer:
-
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-    ):
+class SuffixProposer(BaseSpeculator):
+    def __init__(self, vllm_config, device, req_states):
         self.vllm_config = vllm_config
         self.speculative_config = vllm_config.speculative_config
+        self.device = device
+        self.req_states = req_states
+        self.num_speculative_steps = self.speculative_config.num_speculative_tokens
+        self.max_model_len = vllm_config.model_config.max_model_len
+        self._new_cache()
 
-        self.model = None
-        self.device = None
+    def _new_cache(self):
+        config = self.speculative_config
+        self.cache = SuffixDecodingCache(
+            max_tree_depth=config.suffix_cache_max_depth,
+            max_cached_requests=config.suffix_cache_max_requests,
+        )
+        self._lengths = {}
+        self.last_draft_lengths = {}
 
-        self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
-        self.backup_next_token_ids = None  # type: Optional[CpuGpuBuffer]
+    def init_cudagraph_manager(self, cudagraph_mode):
+        pass
 
-    def load_model(
-        self,
-        model: Union[ArcticMLPSpeculator, ArcticLSTMSpeculator],
-    ):
-        from vllm.config import VllmConfig
+    def capture(self):
+        pass
 
+    def reset_state(self):
+        self._new_cache()
+
+    def update_max_model_len(self, max_model_len):
+        self.max_model_len = max_model_len
+
+    def on_requests_finished(self, finished_req_ids):
+        for req_id in sorted(finished_req_ids):
+            if req_id in self.cache.active_requests:
+                self.cache.stop_request(req_id)
+            self._lengths.pop(req_id, None)
+            self.last_draft_lengths.pop(req_id, None)
+
+    def propose(self, input_batch, attn_metadata, slot_mappings,
+                last_hidden_states, aux_hidden_states, num_sampled,
+                num_rejected, last_sampled, next_prefill_tokens,
+                temperature, seeds, dp_sync_state=None, dummy_run=False,
+                skip_attn_for_dummy_run=False, mm_inputs=None, is_profile=False,
+                num_speculative_tokens=None):
+        width = self.num_speculative_steps
+        result = torch.full((input_batch.num_reqs, width), -1,
+                            dtype=torch.int64, device=self.device)
+        self.last_draft_lengths = dict.fromkeys(input_batch.req_ids, 0)
+        if dummy_run:
+            return result
+        config = self.speculative_config
+        limit = config.disable_by_batch_size or input_batch.num_reqs
+        lengths = self.req_states.total_len.gpu[input_batch.idx_mapping].cpu().tolist()
+        sampled = num_sampled.cpu().tolist()
+        k = width if num_speculative_tokens is None else num_speculative_tokens
+        for row, req_id in enumerate(input_batch.req_ids):
+            idx = self.req_states.req_id_to_index[req_id]
+            total = lengths[row]
+            prompt_len = int(self.req_states.prompt_len.np[idx])
+            if req_id not in self.cache.active_requests:
+                prompt = self.req_states.all_token_ids.gpu[idx, :prompt_len].cpu().tolist()
+                self.cache.start_request(req_id, prompt)
+                self._lengths[req_id] = prompt_len
+            previous = self._lengths[req_id]
+            if total > previous:
+                response = self.req_states.all_token_ids.gpu[idx, previous:total].cpu().tolist()
+                self.cache.add_active_response(req_id, response)
+                self._lengths[req_id] = total
+            if row >= limit or sampled[row] == 0 or k == 0:
+                continue
+            max_spec = min(k, self.max_model_len - total - 1)
+            if max_spec <= 0:
+                continue
+            start = max(0, total - config.suffix_cache_max_depth)
+            pattern = self.req_states.all_token_ids.gpu[idx, start:total].cpu().tolist()
+            draft = self.cache.speculate(
+                req_id, pattern, max_spec_tokens=max_spec,
+                max_spec_factor=config.suffix_max_spec_factor,
+                max_spec_offset=config.suffix_max_spec_offset,
+                min_token_prob=config.suffix_min_token_prob,
+            )
+            tokens = draft.token_ids[:max_spec]
+            self.last_draft_lengths[req_id] = len(tokens)
+            if tokens:
+                result[row, :len(tokens)] = torch.tensor(tokens, device=self.device)
+        return result
+
+
+class ArcticProposer(DraftModelSpeculator):
+    def __init__(self, vllm_config, device, req_states):
+        super().__init__(vllm_config, device)
+        self.req_states = req_states
+        self.suffix = (SuffixProposer(vllm_config, device, req_states)
+                       if self.speculative_config.enable_suffix_decoding else None)
+
+    def load_draft_model(self, target_model, target_attn_layer_names):
         draft_config_model_config = self.speculative_config.draft_model_config
-
         spec_model_archs = draft_config_model_config.hf_config.architectures
         if not isinstance(spec_model_archs, list):
             logger.error(
@@ -92,210 +162,87 @@ class ArcticProposer:
                 )
                 assert False
 
-        draft_config_quant_config = VllmConfig._get_quantization_config(
-            self.vllm_config.model_config,
-            self.vllm_config.load_config,
-        )
-        self.speculative_config.draft_parallel_config.worker_cls =\
-            self.vllm_config.parallel_config.sd_worker_cls
-        draft_config_parallel_config = self.speculative_config.draft_parallel_config
+        draft_config = copy.copy(self.vllm_config)
+        draft_config.model_config = draft_config_model_config
+        draft_config.parallel_config = self.speculative_config.draft_parallel_config
+        draft_config.speculative_config = None
+        draft_config.load_config = self.speculative_config.draft_load_config or self.vllm_config.load_config
+        draft_config.quant_config = VllmConfig._get_quantization_config(
+            draft_config_model_config, draft_config.load_config)
+        return get_model(vllm_config=draft_config)
 
-        # We cannot use deepcopy here because Ulysses introduces
-        # torch._C._distributed_c10d.ProcessGroup objects that are not
-        # designed to be pickled.
-        draft_worker_config = VllmConfig(
-            model_config=draft_config_model_config,
-            quant_config=draft_config_quant_config,
-            parallel_config=draft_config_parallel_config,
-            scheduler_config=self.vllm_config.scheduler_config,
-            speculative_config=self.speculative_config,
-            load_config=self.vllm_config.load_config,
-            device_config=self.vllm_config.device_config,
-        )
-
-        self.model = get_model(vllm_config=draft_worker_config)
-        self.device = next(self.model.parameters()).device
-
-        self.input_hidden_dim = self.model.input_hidden_dim if isinstance(
-            self.model, ArcticLSTMSpeculator) else self.model.emb_dim
-
-        self.backup_next_token_ids = CpuGpuBuffer(
-            self.max_batch_size,
-            dtype=torch.int32,
-            pin_memory=is_pin_memory_available(),
-            device=self.device,
-            with_numpy=True,
-        )
-
-    def prepare_hidden_states(
-        self,
-        sample_hidden_states: torch.Tensor,
-        sampled_token_ids: Union[torch.Tensor, np.ndarray, List[List[int]]],
-        spec_decode_metadata: SpecDecodeMetadata,
-    ) -> torch.Tensor:
-        assert sample_hidden_states is not None, "sample_hidden_states must be provided"
-
-        if isinstance(sampled_token_ids, np.ndarray):
-            sampled_token_ids = torch.as_tensor(
-                sampled_token_ids, device=sample_hidden_states.device, dtype=torch.long
-            )
-        elif isinstance(sampled_token_ids, list):
-            sampled_token_ids = torch.as_tensor(
-                sampled_token_ids, device=sample_hidden_states.device, dtype=torch.long
-            )
-        elif sampled_token_ids.device != sample_hidden_states.device:
-            sampled_token_ids = sampled_token_ids.to(sample_hidden_states.device, non_blocking=True)
-
-        max_gen_len = sampled_token_ids.shape[-1]
-        num_requests = sampled_token_ids.shape[0]
-        if max_gen_len == 1 and sample_hidden_states.shape[0] == num_requests:
-            # Fast path: one row per request, no index-select needed.
-            return sample_hidden_states
-
-        assert spec_decode_metadata is not None
-
-        if hasattr(spec_decode_metadata, "cu_num_draft_tokens") and spec_decode_metadata.cu_num_draft_tokens is not None:
-            cu = spec_decode_metadata.cu_num_draft_tokens
-            num_draft_tokens_gpu = torch.cat([cu[0:1], cu[1:] - cu[:-1]])
-        else:
-            num_draft_tokens_gpu = torch.as_tensor(
-                spec_decode_metadata.num_draft_tokens, 
-                device=sample_hidden_states.device, 
-                dtype=torch.int64
-            )
-
-        num_processed_tokens_per_req = num_draft_tokens_gpu + 1 
-
-        offsets = torch.cumsum(num_processed_tokens_per_req, dim=0) - num_processed_tokens_per_req
-
-        vocab_size = self.vllm_config.model_config.get_vocab_size()
-        valid_mask = (sampled_token_ids != -1) & (sampled_token_ids < vocab_size)
-        gen_lens = valid_mask.sum(dim=1).to(dtype=torch.int64)
-
-        last_valid = torch.clamp(gen_lens - 1, min=0)
-        hidden_states_idx = offsets + last_valid
-        
-        previous_hidden_states = sample_hidden_states.index_select(
-            dim=0, index=hidden_states_idx
-        )
-  
-        assert previous_hidden_states.size(-1) == self.input_hidden_dim, (
-            f"hidden_states dim {previous_hidden_states.size(-1)} != speculator expected {self.input_hidden_dim}. "
-            "Make sure the spec model is trained with the same base model."
-        )
-        
-        return previous_hidden_states
-
-    def propose(
-        self,
-        context_token_ids: Union[torch.Tensor, np.ndarray, List[int]],
-        previous_hidden_states: Optional[torch.Tensor],
-        num_predict_tokens: int,
-    ) -> Optional[torch.Tensor]:
-        assert num_predict_tokens > 0
-        if isinstance(context_token_ids, torch.Tensor):
-            if context_token_ids.device != self.device:
-                input_ids = context_token_ids.to(self.device, non_blocking=True)
-            else:
-                input_ids = context_token_ids
-        else:
-            input_ids = torch.as_tensor(context_token_ids, device=self.device, dtype=torch.long)
-
-        next_tokens = self.model.generate_proposals(
-            input_ids=input_ids,
-            previous_hidden_states=previous_hidden_states,
-            num_predict_tokens=num_predict_tokens,
-        )
-        return next_tokens
-
-    # Borrow from eagle
-    def prepare_next_token_ids_cpu(
-        self,
-        sampled_token_ids: list[list[int]],
-        requests: dict[str, CachedRequestState],
-        gpu_input_batch: InputBatch,
-        num_scheduled_tokens: dict[str, int],
-    ) -> torch.Tensor:
-        req_ids = gpu_input_batch.req_ids
-        next_token_ids: list[int] = []
-        for i, token_ids in enumerate(sampled_token_ids):
-            if token_ids:
-                # Common case.
-                next_token_id = token_ids[-1]
-            else:
-                # Partial prefill (rare case).
-                # Get the next token id from the request state.
-                req_id = req_ids[i]
-                req_state = requests[req_id]
-                seq_len = req_state.num_computed_tokens + num_scheduled_tokens[req_id]
-                next_token_id = req_state.get_token_id(seq_len)
-            next_token_ids.append(next_token_id)
-        next_token_ids = torch.tensor(
-            next_token_ids, dtype=torch.int32, device=self.device
-        )
-        return next_token_ids
-
-
-    def prepare_next_token_ids_padded(
-        self,
-        common_attn_metadata: CommonAttentionMetadata,
-        sampled_token_ids: torch.Tensor,
-        requests: dict[str, CachedRequestState],
-        gpu_input_batch: InputBatch,
-        discard_request_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        from vllm.triton_utils import triton
-        from vllm.v1.spec_decode.utils import eagle_prepare_next_token_padded_kernel
-        
-        num_reqs = gpu_input_batch.num_reqs
-        self.backup_next_token_ids.np[:num_reqs] = np.array(
-            [
-                requests[gpu_input_batch.req_ids[i]].get_token_id(
-                    gpu_input_batch.num_tokens_no_spec[i] - 1
-                )
-                for i in range(num_reqs)
-            ],
-            dtype=np.int32,
-        )
-        self.backup_next_token_ids.copy_to_gpu(num_reqs)
-        backup_tokens_gpu = self.backup_next_token_ids.gpu
-
-        batch_size, num_tokens = sampled_token_ids.shape
-        device = sampled_token_ids.device
-
-        assert discard_request_mask.dtype == torch.bool
-        assert backup_tokens_gpu.dtype == torch.int32
-
-        next_token_ids = torch.empty(batch_size, dtype=torch.int32, device=device)
-        valid_sampled_tokens_count = next_token_ids.new_empty(batch_size)
-
-        # Kernel grid: one program per request (row)
-        grid = (batch_size,)
-
-        # Find the next power of 2 for block sizes
-        BLOCK_SIZE_TOKENS = triton.next_power_of_2(num_tokens)
-        eagle_prepare_next_token_padded_kernel[grid](
-            sampled_token_ids,
-            discard_request_mask,
-            backup_tokens_gpu,
-            next_token_ids,
-            valid_sampled_tokens_count,
-            gpu_input_batch.vocab_size,
-            num_tokens,
-            batch_size,
-            sampled_token_ids.stride(0),
-            BLOCK_SIZE_TOKENS=BLOCK_SIZE_TOKENS,
-        )
-
-        return next_token_ids, valid_sampled_tokens_count
-
-
-class SuffixProposer:
-    def __init__(self):
+    def init_cudagraph_manager(self, cudagraph_mode):
         pass
 
-    def load_model(
-        self,
-        model: None,
-    ):
+    def capture(self):
+        # The neural speculators capture their proposal graphs by batch size.
         pass
+
+    def set_attn(self, *args, **kwargs):
+        pass
+
+    def prepare_propose(self, *args, **kwargs):
+        pass
+
+    def on_requests_finished(self, finished_req_ids):
+        if self.suffix is not None:
+            self.suffix.on_requests_finished(finished_req_ids)
+
+    def reset_state(self):
+        if self.suffix is not None:
+            self.suffix.reset_state()
+
+    def update_max_model_len(self, max_model_len):
+        super().update_max_model_len(max_model_len)
+        if self.suffix is not None:
+            self.suffix.update_max_model_len(max_model_len)
+
+    def propose(self, input_batch, attn_metadata, slot_mappings,
+                last_hidden_states, aux_hidden_states, num_sampled,
+                num_rejected, last_sampled, next_prefill_tokens,
+                temperature, seeds, dp_sync_state=None, dummy_run=False,
+                skip_attn_for_dummy_run=False, mm_inputs=None, is_profile=False,
+                num_speculative_tokens=None):
+        width = self.num_speculative_steps
+        batch_size = input_batch.num_reqs
+        result = torch.full((batch_size, width), -1,
+                            dtype=torch.int64, device=self.device)
+        k = width if num_speculative_tokens is None else num_speculative_tokens
+        neural_width = min(width, self.model.n_predict)
+        limit = min(self.speculative_config.disable_by_batch_size or batch_size, batch_size)
+        self.last_draft_lengths = {
+            req_id: min(k, neural_width) if row < limit else 0
+            for row, req_id in enumerate(input_batch.req_ids)
+        }
+        if k and batch_size:
+            # The state is already advanced by v2 postprocess_sampled. The hidden
+            # row that predicted the last accepted token is before the rejected tail.
+            hidden_indices = input_batch.query_start_loc[1:limit + 1].long() - 1 - num_rejected[:limit]
+            hidden_states = last_hidden_states[hidden_indices]
+            context_tokens = last_sampled[input_batch.idx_mapping[:limit]].reshape(-1)
+            drafts = self.model.generate_proposals(
+                input_ids=context_tokens,
+                previous_hidden_states=hidden_states,
+                num_predict_tokens=neural_width,
+            )
+            result[:limit, :neural_width] = drafts
+            result.masked_fill_((num_sampled == 0).unsqueeze(1), -1)
+        if self.suffix is not None:
+            suffix = self.suffix.propose(
+                input_batch, attn_metadata, slot_mappings, last_hidden_states,
+                aux_hidden_states, num_sampled, num_rejected, last_sampled,
+                next_prefill_tokens, temperature, seeds, dp_sync_state,
+                dummy_run, skip_attn_for_dummy_run, mm_inputs, is_profile, k,
+            )
+            suffix_lengths = (suffix >= 0).sum(dim=1)
+            # Preserve the old hybrid choice: suffix replaces the entire neural
+            # chain only when it offers a longer continuation.
+            use_suffix = suffix_lengths > neural_width
+            result = torch.where(use_suffix.unsqueeze(1), suffix, result)
+            for req_id, length in self.suffix.last_draft_lengths.items():
+                self.last_draft_lengths[req_id] = max(self.last_draft_lengths[req_id], length)
+        result[:, k:] = -1
+        positions = self.req_states.total_len.gpu[input_batch.idx_mapping].unsqueeze(1)
+        slots = torch.arange(width, device=self.device).unsqueeze(0)
+        result.masked_fill_(positions + slots >= self.max_model_len - 1, -1)
+        return result

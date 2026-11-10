@@ -73,31 +73,13 @@ numbers are from vLLM 0.30; the names have been stable since v0.10.0.
    path. **Never unpack this NamedTuple positionally** -- that is exactly what
    breaks when vLLM appends another field.
 
-3. The ``n-1`` row count is not a quirk, it is arithmetic. A logprob at prompt
-   position ``i`` is ``P(t_i | t_0..t_{i-1})``; position 0 has no preceding
-   context, so only positions ``1..n-1`` are scoreable. The producer allocates
-   accordingly::
+3. Row ``i`` of the payload scores prompt position ``i + 1``. Position 0
+   has no preceding context, so only positions ``1..n-1`` are scored.
 
-       # vllm/v1/worker/gpu_model_runner.py:5725
-       logprobs_tensors = LogprobsTensors.empty_cpu(
-           num_prompt_tokens - 1, num_prompt_logprobs + 1)
-
-   and offsets the target tokens by one::
-
-       # vllm/v1/worker/gpu_model_runner.py:5760
-       # Get the "target" tokens for each index. For prompt at index i,
-       # the token at prompt index i+1 is the "sampled" token we want
-       # to gather the logprob for.
-
-   **Row ``i`` of the tensors scores prompt position ``i + 1``.**
-
-4. Chunked prefill is already reassembled for us. The model runner keeps a
-   full-size CPU buffer in ``request.in_progress_prompt_logprobs_cpu``, copies
-   each chunk into a slice, and only publishes it on the final chunk
-   (``gpu_model_runner.py:5721-5744``). So ``_update_prompt_logprobs`` is called
-   **once per request with complete tensors**. If that ever changes, the guard
-   in :func:`_update_prompt_logprobs_dense` raises instead of silently keeping
-   the last chunk.
+4. V2's ``PromptLogprobsWorker.compute_prompt_logprobs`` collects chunks in
+   ``in_progress_prompt_logprobs`` and concatenates them before publishing
+   on the final prefill chunk. The dense processor therefore receives one
+   complete tensor payload per request.
 
 5. That CPU buffer is engine-owned and reused, so :func:`densify` copies rather
    than views. See ``test_densify_does_not_alias_the_engine_tensors``.
@@ -343,7 +325,7 @@ def ensure_dense_prompt_logprobs_patch() -> None:
             raise RuntimeError(
                 "dense prompt logprobs received a second tensor chunk; vLLM no "
                 "longer reassembles chunked prefill before publishing "
-                "(see gpu_model_runner._get_prompt_logprobs_dict)"
+                "(see PromptLogprobsWorker.compute_prompt_logprobs)"
             )
 
         assert self.num_prompt_logprobs is not None

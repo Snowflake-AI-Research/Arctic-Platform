@@ -20,10 +20,11 @@ explicitly at runtime via ``set_caching_enabled()``.
 from __future__ import annotations
 
 import logging
+import weakref
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
 
-from vllm.v1.core.block_pool import BlockHashToBlockMap
+from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashList,
@@ -72,6 +73,8 @@ class PrefixCacheableElasticBlockPool:
         from kvcached.integration.vllm.interfaces import get_kv_cache_manager
 
         self.num_gpu_blocks = num_gpu_blocks
+        self.num_hash_lookahead_tokens = 0
+        self._weak_self = weakref.ref(self)
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size or block_size
         self.enable_kv_cache_events = False
@@ -92,7 +95,7 @@ class PrefixCacheableElasticBlockPool:
         self._eviction_blocks: list[KVCacheBlock] = []
         self._eviction_queue = FreeKVCacheBlockQueue(self._eviction_blocks)
 
-        self.cached_block_hash_to_block = BlockHashToBlockMap()
+        self.cached_block_hash_to_block = BlockHashToBlockMap(self._block_cache)
         self.cached_block_hashes_by_block: dict[
             int, set[BlockHashWithGroupId]
         ] = {}
@@ -100,7 +103,7 @@ class PrefixCacheableElasticBlockPool:
         # Allocate a null block.
         null_ids = self.kv_cache_manager.alloc(1)
         assert null_ids is not None and len(null_ids) == 1
-        self.null_block = KVCacheBlock(null_ids[0])
+        self.null_block = KVCacheBlock(null_ids[0], pool=self._weak_self)
         self.null_block.is_null = True
         self._block_cache[null_ids[0]] = self.null_block
 
@@ -261,7 +264,7 @@ class PrefixCacheableElasticBlockPool:
             for bid in new_ids:
                 block = self._block_cache.get(bid)
                 if block is None:
-                    block = KVCacheBlock(bid)
+                    block = KVCacheBlock(bid, pool=self._weak_self)
                     self._block_cache[bid] = block
                 else:
                     block.reset_hash()
@@ -333,7 +336,7 @@ class PrefixCacheableElasticBlockPool:
                 watcher(block)
         self._reuse_watchers.clear()
         self._flush_eviction_queue()
-        self.cached_block_hash_to_block = BlockHashToBlockMap()
+        self.cached_block_hash_to_block = BlockHashToBlockMap(self._block_cache)
         self.cached_block_hashes_by_block.clear()
         for block in self._block_cache.values():
             block.reset_hash()
@@ -374,7 +377,7 @@ class PrefixCacheableElasticBlockPool:
         """
         if self.enable_caching and not enabled:
             self._flush_eviction_queue()
-            self.cached_block_hash_to_block = BlockHashToBlockMap()
+            self.cached_block_hash_to_block = BlockHashToBlockMap(self._block_cache)
             self.cached_block_hashes_by_block.clear()
             for block in self._block_cache.values():
                 if not block.is_null:
@@ -383,6 +386,9 @@ class PrefixCacheableElasticBlockPool:
         elif not self.enable_caching and enabled:
             logger.info("kvcached: prefix caching enabled")
         self.enable_caching = enabled
+
+    generate_event_extra_keys = BlockPool.generate_event_extra_keys
+    get_lookahead_token_ids = BlockPool.get_lookahead_token_ids
 
     # ------------------------------------------------------------------
     # Internal helpers

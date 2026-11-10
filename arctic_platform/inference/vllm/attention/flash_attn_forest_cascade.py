@@ -9,7 +9,6 @@
 
 import copy
 from dataclasses import dataclass
-from typing import ClassVar
 
 import numpy as np
 import torch
@@ -21,10 +20,8 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
-    AttentionBackend,
     AttentionImpl,
     AttentionType,
-    MultipleOf,
 )
 from vllm.v1.attention.backends.fa_utils import (
     flash_attn_supports_kv_cache_dtype,
@@ -43,13 +40,10 @@ if is_flash_attn_varlen_func_available():
     )
 from vllm.config import (
     VllmConfig,
-    get_current_vllm_config,
     get_layers_from_vllm_config,
 )
-from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
-from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
@@ -58,106 +52,14 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
-    get_flashinfer_layout_string,
 )
+from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend as NativeFlashAttentionBackend
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
 
-def get_kv_cache_layout() -> str:
-    """Map the engine-resolved KV-cache layout onto NHD/HND.
-
-    vLLM 0.30 resolves layout once onto ``cache_config.kv_cache_layout``
-    (backend preference, KV-connector preference, and ``VLLM_KV_CACHE_LAYOUT``
-    as one input). Re-reading the raw env var would default to NHD whenever
-    it is unset, which is the common case and can disagree with the negotiated
-    physical axis order.
-    """
-    layout = get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
-    try:
-        return get_flashinfer_layout_string(layout)
-    except (AssertionError, KeyError) as exc:
-        raise ValueError(
-            "Forest Cascade attention has no NHD/HND mapping for KV cache "
-            f"layout {getattr(layout, 'name', layout)}."
-        ) from exc
-
-
-class FlashAttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-    supported_dtypes: ClassVar[list[torch.dtype]] = [
-        torch.float16,
-        torch.bfloat16,
-    ]
-
-    @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        vllm_config = get_current_vllm_config()
-        model_config = vllm_config.model_config
-        cache_config = vllm_config.cache_config
-        if (
-            model_config
-            and model_config.is_hybrid
-            and (
-                cache_config.mamba_ssm_cache_dtype == "float32"
-                or cache_config.mamba_cache_dtype == "float32"
-            )
-        ):
-            return [16, 32, 64]
-        return [MultipleOf(16)]
-
-    @staticmethod
-    def get_name() -> str:
-        return "FLASH_ATTN"
-
-    @classmethod
-    def supports_attn_type(cls, attn_type: str) -> bool:
-        """FlashAttention supports all attention types."""
-        return attn_type in (
-            AttentionType.DECODER,
-            AttentionType.ENCODER,
-            AttentionType.ENCODER_ONLY,
-            AttentionType.ENCODER_DECODER,
-        )
-
-    @staticmethod
-    def get_impl_cls() -> type["FlashAttentionImpl"]:
-        return FlashAttentionImpl
-
-    @staticmethod
-    def get_builder_cls() -> type["FlashAttentionMetadataBuilder"]:
-        return FlashAttentionMetadataBuilder
-
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        if block_size % 16 != 0:
-            raise ValueError("Block size must be a multiple of 16.")
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
-
-    @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False,
-    ) -> tuple[int, ...]:
-        cache_layout = get_kv_cache_layout()
-        if cache_layout == "NHD" and include_num_layers_dimension:
-            return (2, 0, 1, 3, 4, 5)
-        elif cache_layout == "NHD":
-            stride_order = (0, 1, 2, 3, 4)
-        elif cache_layout == "HND" and include_num_layers_dimension:
-            return (2, 4, 0, 1, 3, 5)
-        elif cache_layout == "HND":
-            stride_order = (0, 1, 3, 2, 4)
-        else:
-            raise ValueError(f"Unknown cache layout format {cache_layout}.")
-        return stride_order
-
+class FlashAttentionBackend(NativeFlashAttentionBackend):
     @staticmethod
     def get_fp8_dtype_for_flashattn(kv_cache_dtype: str) -> torch.dtype:
         if kv_cache_dtype in ("fp8", "fp8_e4m3"):
@@ -165,47 +67,6 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             raise ValueError(f"Unrecognized FP8 dtype: {kv_cache_dtype}")
 
-    @classmethod
-    def supports_head_size(cls, head_size: int) -> bool:
-        return head_size % 8 == 0 and head_size <= 256
-
-    @classmethod
-    def supports_kv_cache_dtype(
-        cls, kv_cache_dtype: CacheDType | None
-    ) -> bool:
-        if kv_cache_dtype is None:
-            return True
-        if kv_cache_dtype.startswith("fp8"):
-            return flash_attn_supports_kv_cache_dtype(kv_cache_dtype)
-        return kv_cache_dtype in ["auto"]
-
-    @classmethod
-    def supports_sink(cls) -> bool:
-        if not is_flash_attn_varlen_func_available():
-            return False
-        return flash_attn_supports_sinks()
-
-    @classmethod
-    def supports_compute_capability(
-        cls, capability: DeviceCapability
-    ) -> bool:
-        return capability >= DeviceCapability(8, 0)
-
-    @classmethod
-    def supports_combination(
-        cls,
-        head_size: int,
-        dtype: torch.dtype,
-        kv_cache_dtype: CacheDType | None,
-        block_size: int | None,
-        use_mla: bool,
-        has_sink: bool,
-        use_sparse: bool,
-        device_capability: DeviceCapability,
-    ) -> str | None:
-        if has_sink and device_capability < DeviceCapability(9, 0):
-            return "sink not supported on compute capability < 9.0"
-        return None
 
 
 @dataclass
@@ -321,7 +182,7 @@ class FlashAttentionMetadataBuilder(
 
         # Forest cascade attention (ragged groups) tuning knobs,
         # configured via --forest-cascade-attn-configs CLI arg.
-        fca_cfg = getattr(vllm_config, '_forest_cascade_attn_config', None)
+        fca_cfg = vllm_config.additional_config.get('forest_cascade_attn')
         self.forest_cascade_enabled = fca_cfg is not None
         if fca_cfg is None:
             fca_cfg = {}

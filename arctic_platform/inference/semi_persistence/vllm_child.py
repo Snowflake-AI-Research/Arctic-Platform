@@ -558,8 +558,7 @@ def _semip_layout(worker):
     for name, p in mr.model.named_parameters():
         d = p.data
         layout.append((f"main:p:{name}", d.nbytes, d.dtype, tuple(d.shape)))
-    drafter = getattr(mr, "drafter", None)
-    dm = getattr(drafter, "model", None) if drafter is not None else None
+    dm = mr.get_draft_model()
     if dm is not None:
         for name, p in dm.named_parameters():
             d = p.data
@@ -570,8 +569,7 @@ def _semip_layout(worker):
 def _semip_param_tensors(worker):
     mr = worker.model_runner
     t = {f"main:p:{n}": p.data for n, p in mr.model.named_parameters()}
-    drafter = getattr(mr, "drafter", None)
-    dm = getattr(drafter, "model", None) if drafter is not None else None
+    dm = mr.get_draft_model()
     if dm is not None:
         for n, p in dm.named_parameters():
             t[f"drafter:p:{n}"] = p.data

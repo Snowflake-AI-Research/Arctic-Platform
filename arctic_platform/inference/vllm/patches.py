@@ -129,179 +129,36 @@ def _patch_scheduler_check_stop() -> None:
 
 
 class AsyncSchedulerPatch(ArcticPatch[AsyncScheduler]):
-    """Patch AsyncScheduler to:
-    1. Respect ``disable_by_batch_size`` when allocating spec token
-       placeholders (the worker only drafts for the first N requests).
-    2. Use the previous step's actual draft length for dynamic placeholder
-       allocation, avoiding wasted verification compute when the real draft
-       width (e.g. Arctic n_predict=3) is much smaller than
-       num_speculative_tokens (e.g. 12).
-    3. Store ``_scheduled_spec_count`` so that the post-fix in
-       ``update_from_output`` can compensate for worker-side trimming.
-    """
 
     _orig_update_after_schedule = AsyncScheduler._update_after_schedule
+    _orig_update_from_output = AsyncScheduler.update_from_output
 
     def _update_after_schedule(self, scheduler_output):
-        # Call Scheduler._update_after_schedule (the grandparent),
-        # skipping the base AsyncScheduler override which we are replacing.
-        Scheduler._update_after_schedule(self, scheduler_output)
-
-        spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
-
-        # Respect disable_by_batch_size: only add spec token placeholders
-        # for the first N decode requests (matching the worker's draft_limit
-        # in propose_draft_token_ids).
-        spec_config = getattr(self.vllm_config, 'speculative_config', None)
-        disable_bs = (
-            spec_config.disable_by_batch_size if spec_config else None
-        )
-        decode_with_spec_count = 0
+        self._orig_update_after_schedule(scheduler_output)
+        spec = self.vllm_config.speculative_config
+        if spec is None or spec.custom_method not in (
+            "arctic", "mlp_speculator", "arctic_suffix"
+        ):
+            return
+        limit = spec.disable_by_batch_size
+        decode_count = 0
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if request.is_prefill_chunk:
                 continue
-
-            scheduler_output.pending_structured_output_tokens |= (
-                request.use_structured_output
-                and request.num_output_placeholders > 0
-            )
-
-            cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
-            # Store the originally-scheduled spec count so that
-            # update_from_output can compensate for worker-side trimming.
-            request._scheduled_spec_count = cur_num_spec_tokens
-
-            request.num_output_placeholders += 1 + cur_num_spec_tokens
-
-            decode_with_spec_count += 1
-            if disable_bs and decode_with_spec_count > disable_bs:
+            decode_count += 1
+            if limit and decode_count > limit:
                 request.spec_token_ids = []
-                continue
-
-            # Use previous step's actual draft length to size
-            # placeholders.  When suffix had a good match (actual
-            # > n_predict), allocate the full width so the next
-            # step can verify all suffix tokens.  When suffix
-            # didn't match (actual = n_predict from arctic),
-            # allocate only that many to avoid wasting attention
-            # compute on zero-padded positions.
-            # Cold start: allocate full width (generous).
-            prev_actual = getattr(
-                request, '_prev_actual_draft_len', None)
-            if prev_actual is not None:
-                num_placeholders = min(
-                    max(prev_actual, 1), self.num_spec_tokens)
-            else:
-                num_placeholders = self.num_spec_tokens
-
-            request.spec_token_ids = [-1] * num_placeholders
+            elif hasattr(request, "_arctic_draft_length"):
+                request.spec_token_ids = request.spec_token_ids[:request._arctic_draft_length]
 
     def update_from_output(self, scheduler_output, model_runner_output):
-        """Wrap Scheduler.update_from_output to store actual draft counts.
-
-        We infer the drafter's real capability from the acceptance
-        results so that the next ``_update_after_schedule`` can size
-        placeholders correctly.  This works even when the worker runs
-        in a separate process (where scheduler_output._actual_draft_lens
-        set by the worker doesn't survive serialisation back to the
-        scheduler).
-
-        Strategy:
-        1. **Primary path**: read ``_actual_draft_lens`` from the
-           ``model_runner_output`` object (attached by the model runner
-           to the ``ModelRunnerOutput`` dataclass, which reliably
-           survives the async pipeline).
-        2. **Legacy path**: read from ``scheduler_output._actual_draft_lens``
-           (works in same-process non-async mode).
-        3. **Fallback**: infer from acceptance results with exponential
-           growth — when all drafted tokens are accepted, double the
-           allocation so suffix decoding reaches full capacity in
-           O(log n) steps instead of O(n).
-
-        In v0.18, ``update_from_output`` returns ``dict[int, EngineCoreOutputs]``.
-        """
-        sampled_token_ids = model_runner_output.sampled_token_ids
-        req_id_to_index = model_runner_output.req_id_to_index
-
-        result = Scheduler.update_from_output(
-            self, scheduler_output, model_runner_output)
-
-        # Primary path: read from model_runner_output (most reliable
-        # for async scheduling — the ModelRunnerOutput object is
-        # returned by get_output() and guaranteed to survive).
-        actual_lens = getattr(
-            model_runner_output, '_actual_draft_lens', None)
-
-        # Legacy path: read from scheduler_output (works for non-async
-        # or same-process setups where the attribute is preserved).
-        if not actual_lens:
-            actual_lens = getattr(
-                scheduler_output, '_actual_draft_lens', None)
-
-        if actual_lens:
-            for req_id, actual_len in actual_lens.items():
-                request = self.requests.get(req_id)
-                if request is not None:
-                    request._prev_actual_draft_len = actual_len
-            return result
-
-        # Fallback: infer from acceptance results (multi-process case).
-        # Uses exponential growth when all drafted tokens are accepted
-        # (indicating the drafter / suffix cache can handle more), so
-        # the allocation converges to num_spec_tokens in O(log n)
-        # steps:
-        #   step 0: 1 position  → accept 1/1 → prev = 2
-        #   step 1: 2 positions → accept 2/2 → prev = 4
-        #   step 2: 4 positions → accept 4/4 → prev = 8
-        #   ...
-        # When not all are accepted (normal drafter), linear growth:
-        #   step 0: 1 position  → accept 1 → prev = 2
-        #   step 1: 2 positions → accept 2 → prev = 3
-        #   step 2: 3 positions → steady state (n_predict = 3)
-        if not sampled_token_ids:
-            return result
-
-        for req_id in scheduler_output.num_scheduled_tokens:
-            scheduled_spec = (
-                scheduler_output.scheduled_spec_decode_tokens.get(req_id))
-            if not scheduled_spec:
-                continue
-
-            req_index = req_id_to_index.get(req_id)
-            if req_index is None:
-                continue
-
+        output = self._orig_update_from_output(scheduler_output, model_runner_output)
+        for req_id, length in getattr(model_runner_output, "_arctic_draft_lengths", {}).items():
             request = self.requests.get(req_id)
-            if request is None:
-                continue
-
-            generated = sampled_token_ids[req_index]
-            num_accepted = (len(generated) - 1) if generated else 0
-            num_draft = len(scheduled_spec)
-
-            prev = getattr(request, '_prev_actual_draft_len', None)
-
-            if num_accepted > 0:
-                if num_accepted >= num_draft and num_draft > 0:
-                    # All drafted tokens accepted — the drafter (or
-                    # suffix cache) could produce more if given room.
-                    # Double the allocation for exponential ramp-up.
-                    new_val = min(
-                        num_draft * 2, self.num_spec_tokens)
-                else:
-                    # Partial acceptance: grow linearly.
-                    new_val = min(
-                        num_accepted + 1, self.num_spec_tokens)
-                request._prev_actual_draft_len = max(
-                    prev or 0, new_val)
-            elif prev is None:
-                # First step for this request, zero acceptance.
-                # Seed with 1 so _update_after_schedule doesn't
-                # fall back to the full num_spec_tokens next time.
-                request._prev_actual_draft_len = 1
-
-        return result
+            if request is not None:
+                request._arctic_draft_length = length
+        return output
 
 
 class WorkerBasePatch(ArcticPatch[WorkerBase]):
@@ -315,44 +172,20 @@ class WorkerBasePatch(ArcticPatch[WorkerBase]):
         # process has been forked (i.e., in the WorkerBase initializer).
         from arctic_platform.inference.vllm.model_runner import GPUModelRunnerPatch
 
-        GPUModelRunnerPatch.apply_patch()
-        WorkerPatch.apply_patch()
+        for patch in (GPUModelRunnerPatch, WorkerPatch):
+            if patch not in getattr(patch._arctic_patch_target, "_arctic_patches", {}).values():
+                patch.apply_patch()
 
         return self._orig_init(*args, **kwargs)
 
 
 class WorkerPatch(ArcticPatch[Worker]):
-    """Fix weights offloading for sleep mode and add drafter support.
+    """Preserve draft state and reload discarded main parameters after level-2 sleep.
 
-    The upstream ``load_model`` context-manager chaining bug was fixed in
-    v0.18 (see https://github.com/vllm-project/vllm/pull/32947); we no
-    longer patch ``load_model`` here.
-
-    sleep/wake_up: Level-2 sleep discards all GPU weights as designed.
-    On wake-up the main model is reloaded from disk via the upstream
-    ``reload_weights()`` path.  The drafter (speculative model) is *not*
-    covered by ``reload_weights()`` and ``drafter.load_model()`` would
-    allocate a new model outside the CuMemAllocator pool, so we save the
-    drafter state to CPU during sleep and restore it on wake-up instead.
-    The drafter is small so the CPU cost is negligible.
-
-    Note: FP8 quantization replaces ``ModelWeightParameter`` with plain
-    ``Parameter`` during ``process_weights_after_loading``, which strips
-    the TP-sharding methods that ``reload_weights()`` depends on.
-    Level-2 sleep therefore only works for non-FP8 models at present.
-
-    Opt-out flags (read from the worker instance via ``getattr``; default
-    False -> original behavior).  Intended for callers that restore main
-    params and/or drafter params themselves from a host-side pinned
-    buffer, e.g. ``arctic_platform.inference.semi_persistence``:
-
-    - ``_skip_main_reload_on_wake``: skip the ``_orig_reload_weights``
-      disk-load of the main model inside ``wake_up`` after a level-2
-      sleep.
-    - ``_skip_drafter_param_snapshot``: skip the ``cpu().clone()`` of
-      drafter ``named_parameters()`` inside ``sleep``; drafter
-      ``named_buffers()`` are always snapshotted (sub-MB, may carry
-      runtime-mutating state).
+    The native sleep backend retains buffers and parameters outside the main
+    model's discardable set. Draft snapshots also support callers that restore
+    parameters from their own pinned buffer: `_skip_main_reload_on_wake` skips
+    the main disk reload; `_skip_drafter_param_snapshot` retains only draft buffers.
     """
 
     _orig_sleep = Worker.sleep
@@ -382,46 +215,27 @@ class WorkerPatch(ArcticPatch[Worker]):
                 buf.data.copy_(state[key])
 
     def sleep(self, level: int = 1) -> None:
-        # Inlined replacement for upstream ``Worker.sleep`` (see
-        # ``vllm/v1/worker/gpu_worker.py``).  We drop the
-        # GPU-global ``get_memory_info`` bracket and the
-        # ``assert freed_bytes >= 0`` regression check: that read is
-        # GPU-global, so when peer processes on the same GPU allocate
-        # concurrently with our sleep call, ``freed_bytes`` goes
-        # negative and the assertion kills the child engine.  The
-        # surrounding worker-level ``logger.info`` is dropped along
-        # with it because the sleep backend already emits its own
-        # peer-safe report from allocator-owned state.
+        from vllm.distributed.kv_transfer import has_kv_transfer_group, get_kv_transfer_group
 
+        torch.accelerator.synchronize()
+        discardable = self._discardable_parameters(self.model_runner.model) if level == 2 else set()
         if level == 2:
-            drafter = getattr(self.model_runner, "drafter", None)
-            if drafter is not None and getattr(drafter, "model", None) is not None:
-                # Skip the drafter parameter snapshot when the caller
-                # (e.g. semi-persistence) restores drafter params itself
-                # from a host-side pinned buffer.  Drafter buffers are
-                # always saved (sub-MB, may carry runtime state).
-                self._sleep_saved_drafter_state = self._save_module_state(
-                    drafter.model,
-                    skip_params=getattr(self, "_skip_drafter_param_snapshot", False),
-                )
-            else:
-                self._sleep_saved_drafter_state = {}
+            draft = self.model_runner.get_draft_model()
+            self._sleep_saved_drafter_state = (
+                self._save_module_state(draft, skip_params=getattr(self, "_skip_drafter_param_snapshot", False))
+                if draft is not None else {}
+            )
             self._sleep_level = 2
-
-            model = self.model_runner.model
-            self._sleep_saved_buffers = {
-                name: buffer.cpu().clone()
-                for name, buffer in model.named_buffers()
-            }
-
-        # vLLM 0.30 routes sleep through a pluggable backend instead of
-        # calling CuMemAllocator directly. Preserve that abstraction while
-        # omitting only the process-global free-memory assertion above.
-        self.sleep_mode_backend.suspend(level)
+        if has_kv_transfer_group():
+            get_kv_transfer_group().unregister_kv_caches()
+        cache = self.model_runner.extensible_kv_cache
+        if cache is not None:
+            cache.release_physical()
+        self.sleep_mode_backend.suspend(discardable)
         if self.vllm_config.model_config.enable_nccl_comm_suspend:
             from vllm.distributed.parallel_state import suspend_device_comms
-
             suspend_device_comms()
+        torch.accelerator.synchronize()
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         self._orig_wake_up(tags=tags)
@@ -437,9 +251,9 @@ class WorkerPatch(ArcticPatch[Worker]):
 
             saved_drafter = getattr(self, "_sleep_saved_drafter_state", {})
             if saved_drafter:
-                drafter = getattr(self.model_runner, "drafter", None)
-                if drafter is not None and getattr(drafter, "model", None) is not None:
-                    self._restore_module_state(drafter.model, saved_drafter)
+                draft = self.model_runner.get_draft_model()
+                if draft is not None:
+                    self._restore_module_state(draft, saved_drafter)
                 self._sleep_saved_drafter_state = {}
 
             self._sleep_level = 0
@@ -475,6 +289,9 @@ def apply_arctic_patches():
     # This name is currently used in corvo
     ModelRegistry.register_model("MLPVariantSpeculatorPreTrainedModel",
                                  ArcticLSTMSpeculator)
+
+    from arctic_platform.inference.vllm.spec_dec.v2_config import register_arctic_speculators
+    register_arctic_speculators()
 
     WorkerBasePatch.apply_patch()
 
