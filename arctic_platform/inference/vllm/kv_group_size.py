@@ -102,13 +102,13 @@ def uniform_page_size_groups(
     if group_size is None:
         return original(kv_cache_spec)
 
-    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.core import kv_cache_planning
 
     grouped = split_buckets(layer_buckets(kv_cache_spec), group_size)
-    kv_cache_utils.logger.info(
+    kv_cache_planning.logger.info(
         "additional_config[%r]=%d: %d hybrid KV cache groups of up to %d layers",
         KV_GROUP_SIZE_KEY, group_size, len(grouped), max(map(len, grouped)))
-    return kv_cache_utils.create_kv_cache_group_specs(kv_cache_spec, grouped)
+    return kv_cache_planning.create_kv_cache_group_specs(kv_cache_spec, grouped)
 
 
 def ensure_kv_group_size_patch() -> None:
@@ -117,13 +117,13 @@ def ensure_kv_group_size_patch() -> None:
 
     require_supported_vllm_version("hybrid KV cache group size")
 
-    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.core import kv_cache_planning
 
-    if getattr(kv_cache_utils.get_kv_cache_groups, "_arctic_kv_group_size", False):
+    if getattr(kv_cache_planning.get_kv_cache_groups, "_arctic_kv_group_size", False):
         return
 
-    original_get_kv_cache_groups = kv_cache_utils.get_kv_cache_groups
-    original_uniform = kv_cache_utils._get_kv_cache_groups_uniform_page_size
+    original_get_kv_cache_groups = kv_cache_planning.get_kv_cache_groups
+    original_uniform = kv_cache_planning._get_kv_cache_groups_uniform_page_size
 
     def get_kv_cache_groups(vllm_config, kv_cache_spec):
         token = _VLLM_CONFIG.set(vllm_config)
@@ -138,5 +138,5 @@ def ensure_kv_group_size_patch() -> None:
     get_kv_cache_groups._arctic_kv_group_size = True
     get_kv_cache_groups._orig = original_get_kv_cache_groups
     _get_kv_cache_groups_uniform_page_size._orig = original_uniform
-    kv_cache_utils.get_kv_cache_groups = get_kv_cache_groups
-    kv_cache_utils._get_kv_cache_groups_uniform_page_size = _get_kv_cache_groups_uniform_page_size
+    kv_cache_planning.get_kv_cache_groups = get_kv_cache_groups
+    kv_cache_planning._get_kv_cache_groups_uniform_page_size = _get_kv_cache_groups_uniform_page_size
