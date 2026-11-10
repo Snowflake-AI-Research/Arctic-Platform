@@ -2333,8 +2333,9 @@ def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
     whose images this adapter has restored repeatedly. It needs **no TP branch**:
     ``cuda_checkpoint()`` inserts ``destroy_nccl()`` itself when
     ``tensor_parallel_size > 1``, so unlike the restore side -- where the caller
-    must add ``reinit_nccl()`` and ``rebind_graphs()`` by hand -- there is
-    nothing here a TP1 test hides.
+    must add ``reinit_nccl()`` and ``rebind_graphs()`` (``recapture_graphs()``
+    when the dump dropped the graphs) by hand -- there is nothing here a TP1
+    test hides.
     See ``semi_persistence/skills/tp_DESIGN.md`` Section 2.
 
     The ordering is a contract rather than a style: ``save_weights()`` sits
@@ -2431,6 +2432,15 @@ def _unprivileged_mismatch(meta: dict[str, Any]) -> str | None:
             f"level only restores under the same mode")
 
 
+def _graphs_dropped(meta: dict[str, Any]) -> bool:
+    """Whether the dump destroyed the image's CUDA graphs before ``destroy_nccl``.
+
+    Such an image has nothing to rebind and must recapture. Images that predate
+    the field kept their graphs; the multi-node restore recaptures regardless.
+    """
+    return bool(meta.get("graphs_dropped"))
+
+
 def _restore(model_dir: str, engine_kwargs: dict[str, Any],
              gpus: list[int], *,
              weights_dir: str | None = None,
@@ -2463,9 +2473,16 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
     _check_device_visibility(meta, model_dir)
     gpus = _dump_placement(meta, gpus, model_dir)
     _check_gpu_placement(meta, gpus, model_dir)
+    recapture = _graphs_dropped(meta)
 
     logger.info("semi_p: restoring image model_dir=%s (dumped on %s) onto "
                 "physical GPU(s) %s", model_dir, meta.get("gpus"), gpus)
+    if recapture:
+        logger.info("semi_p: the dump dropped this image's CUDA graphs (%s; "
+                    "NCCL kernel nodes per rank %s), so the restore "
+                    "recaptures them instead of rebinding",
+                    meta.get("graphs_dropped_reason"),
+                    meta.get("graph_nccl_nodes"))
     inst = Instance(baked, model_dir)
 
     # Serving restore, following reproduce/example_full.py. The wait()
@@ -2484,7 +2501,10 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
         inst.plan_restore_weights().wait()
         inst.restore_weights().wait()
         inst.wake_up_kv_cache().wait()
-        inst.rebind_graphs().wait()
+        if recapture:
+            inst.recapture_graphs().wait()
+        else:
+            inst.rebind_graphs().wait()
     except BaseException:
         # Do not leak the Instance's worker process (or a partially restored
         # tree) when the restore fails. This matters more than it looks:

@@ -1279,7 +1279,10 @@ def _nccl_abort_comms_concurrent(targets, timeout=60.0, after_fire=None):
     abort deadlocks on DeepSeek-style overlapping world/tp/dp/ep comms: the
     shared per-rank proxy only drains once every comm's abort flag is set.  The
     ``after_fire`` hook sets the torch ProcessGroupNCCL abort flags while the
-    pynccl aborts are in flight, so all flags are set together."""
+    pynccl aborts are in flight, so all flags are set together.
+
+    Returns ``(results, stuck)``: ``stuck`` names the comms whose abort was
+    still running at the deadline."""
     import threading
     import time as _t
     results = {}
@@ -1303,7 +1306,8 @@ def _nccl_abort_comms_concurrent(targets, timeout=60.0, after_fire=None):
     deadline = _t.monotonic() + timeout
     for th in threads:
         th.join(max(0.0, deadline - _t.monotonic()))
-    return results
+    stuck = [nm for (nm, _ptr), th in zip(targets, threads) if th.is_alive()]
+    return results, stuck
 
 
 def _abort_torch_process_groups():
@@ -1412,6 +1416,12 @@ _MQ_PARK = {}
 # between mq_begin_unpark and mq_finish_unpark.
 _FOLLOWER = {}
 _UNPARK = {}
+
+# What the dump did with the captured graphs, as recorded into ``meta.json``:
+# ``graphs_dropped``, ``graphs_dropped_reason`` and ``graph_nccl_nodes``. Rides
+# into the image, so a restored child knows there is nothing to rebind; cleared
+# by a successful ``recapture_graphs``.
+_GRAPH_DROP = {}
 
 # Node identity when this child is one node-partition of a TP group that spans pods:
 # ``MultiNode.as_init_kwargs()``, set once at spawn.  ``None`` means
@@ -2098,9 +2108,13 @@ def _destroy_nccl(worker):
 
     Always graph-preserving: abort (unilateral ncclCommAbort) rather than
     collective-destroy, because a live captured graph pins the comm and the
-    MoE/EP topology would deadlock a collective destroy.  The graphs are always
-    preserved now, so the collective path is gone with the `full` mode that was
-    its only caller.
+    MoE/EP topology would deadlock a collective destroy.  The collective path
+    is gone with the `full` mode that was its only caller.
+
+    The abort itself still waits for any live graph holding one of the comm's
+    collectives, so graphs with NCCL kernels must be dropped first (see
+    ``drop_graphs_if_nccl``).  A comm whose abort outlives the deadline raises
+    here rather than riding into an image that cannot restore.
     """
     import torch.distributed as dist
 
@@ -2190,7 +2204,24 @@ def _destroy_nccl(worker):
                 group.mq_broadcaster = None
 
     if abort_targets:
-        _nccl_abort_comms_concurrent(abort_targets)
+        results, stuck = _nccl_abort_comms_concurrent(abort_targets)
+        if stuck:
+            # Never dump past this. The comm keeps its P2P/cuMem peer mappings,
+            # which cuCheckpointProcessCheckpoint accepts and
+            # cuCheckpointProcessRestore rejects with CUresult=801.
+            raise RuntimeError(
+                f"rank {getattr(worker, 'rank', '?')}: ncclCommAbort did not "
+                f"return for {', '.join(stuck)} within the deadline. NCCL waits "
+                f"for every CUDA graph that captured one of a comm's "
+                f"collectives to be destroyed (localPersistentRefs != 0), so "
+                f"the kept graphs likely captured NCCL collectives; they must "
+                f"be dropped before destroy_nccl. Dumping now would fail "
+                f"cuda_restore with CUresult=801.")
+        failed = {nm: r for nm, r in results.items()
+                  if r[0] != "ok" or r[1] != 0}
+        if failed:
+            print(f"[semip] rank {getattr(worker, 'rank', '?')} "
+                  f"ncclCommAbort reported {failed}", flush=True)
         for pynccl in abort_pynccls:
             pynccl.comm = None
 
@@ -2978,10 +3009,10 @@ def _prepare_worker_dump(worker):
 # CUDA graph handling around CRIU (worker-local, via collective_rpc).
 #
 # Graphs are preserved in the CRIU image and their stale CustomAllreduce
-# addresses are rewritten after reinit by ca_graph_rebind.  Nothing is ever
-# recaptured: the `full` path that dropped the graphs and rebuilt them with
-# capture_model() was retired 2026-09-24, along with the cleargraph primitive
-# that only it could reach.
+# addresses are rewritten after reinit by ca_graph_rebind -- unless they hold
+# NCCL kernels (always across nodes; single-node models whose graphs capture a
+# PyNccl collective), which ncclCommAbort cannot outlive.  Those are dropped
+# before destroy_nccl and recaptured after the restore.
 # ---------------------------------------------------------------------------
 def _semip_prepare_graph_reuse_snapshot(worker):
     """Cold-start hook: record the CA meta/buffer/rank_data snapshot the
@@ -3088,11 +3119,12 @@ def _graph_wrappers():
 def _semip_drop_graphs(worker):
     """Destroy every captured CUDA graph and empty the containers holding them.
 
-    Across nodes vLLM has no custom all-reduce, so every all-reduce a graph
-    captured is an NCCL kernel, and ``ncclCommAbort`` does not return while a
-    graph that captured the communicator is alive. A multi-node dump therefore
-    drops the graphs before ``destroy_nccl``, and the restore captures them
-    again with ``capture_model()``.
+    ``ncclCommAbort`` does not return while a graph that captured the
+    communicator is alive. So a dump whose graphs hold NCCL kernels drops them
+    before ``destroy_nccl``, and the restore captures them again with
+    ``capture_model()``. That is every multi-node dump, where vLLM has no
+    custom all-reduce, and any single-node one whose graphs captured a PyNccl
+    collective (``_semip_nccl_graph_census``).
 
     On vLLM 0.30 the graphs sit in three places: the wrapper entries, the V2
     runner's manager, and piecewise segments reachable only through bound
@@ -3193,6 +3225,12 @@ def _semip_recapture_graphs(worker):
     happens the workspace refuses any allocation bigger than the current one.
     Unlocking first puts the recapture back in the state the cold-start capture
     ran in; ``capture_model()`` locks it again on the way out.
+
+    A single-node rank still has CustomAllreduce, and its stock capture exports
+    every activation it all-reduced through the legacy IPC API on exit, which
+    fails on the cuMem-backed memory sleep mode puts in play (the fault
+    ``install_force_copy_patch`` documents). The cold start captured on the
+    copy path for that reason, so the recapture does too.
     """
     rank = getattr(worker, "rank", "?")
     torch.cuda.synchronize()
@@ -3204,8 +3242,15 @@ def _semip_recapture_graphs(worker):
         unlocked = True
     except Exception:  # noqa: BLE001
         pass
+    ca_copy = bool(_CA_REBIND_AVAILABLE and ca_graph_rebind is not None
+                   and ca_graph_rebind._find_ca(worker) is not None
+                   and ca_graph_rebind.install_force_copy_patch())
     t0 = time.monotonic()
-    worker.model_runner.capture_model()
+    try:
+        worker.model_runner.capture_model()
+    finally:
+        if ca_copy:
+            ca_graph_rebind.restore_force_copy_patch()
     torch.cuda.synchronize()
     seconds = time.monotonic() - t0
     free_after = torch.cuda.mem_get_info()[0]
@@ -3228,11 +3273,97 @@ def _semip_recapture_graphs(worker):
     return {"ok": n_graphs > 0 and n_exec_ok == n_graphs, "rank": rank,
             "seconds": round(seconds, 2),
             "unlocked_workspace": unlocked,
+            "ca_copy_path": ca_copy,
             "used_mib": used_mib,
             "estimate_mib": (int(estimate) >> 20) if estimate else None,
             "free_after_mib": free_after >> 20,
             "n_graphs": n_graphs,
             "n_exec_ok": n_exec_ok}
+
+
+def _semip_nccl_graph_census(worker):
+    """This rank's count of NCCL kernel nodes in its kept graphs.
+
+    A config with graphs off is answered without a walk once the census proves
+    the rank graphless, the same proof ``_semip_rebind_graphs`` skips on.
+    """
+    rank = getattr(worker, "rank", "?")
+    if _semip_tp_size(worker) <= 1:
+        return {"ok": True, "complete": True, "rank": rank,
+                "n_nccl_nodes": 0, "skipped": "tp1"}
+    if not _CA_REBIND_AVAILABLE or ca_graph_rebind is None:
+        return {"ok": False, "complete": False, "rank": rank,
+                "incomplete_why": "ca_graph_rebind unavailable"}
+    if _semip_cudagraphs_disabled(worker):
+        if _semip_confirmed_graphless(worker) is not None:
+            return {"ok": True, "complete": True, "rank": rank,
+                    "n_graphs": 0, "n_nccl_nodes": 0,
+                    "skipped": "no_cuda_graphs"}
+    out = ca_graph_rebind.nccl_node_census(worker)
+    out["rank"] = rank
+    return out
+
+
+def _semip_graph_drop_decision(censuses, n_ranks):
+    """Whether the dump must drop its graphs, from every rank's NCCL census.
+
+    The meta fields the dump records: ``graphs_dropped``,
+    ``graphs_dropped_reason`` (``nccl_in_graphs`` / ``census_incomplete``) and
+    ``graph_nccl_nodes`` (rank -> count, None where the rank's census is not a
+    full reading). A rank with no reading counts as one holding NCCL: keeping
+    a graph that does stalls ``destroy_nccl`` and makes an unrestorable image,
+    while dropping one that does not only costs a recapture.
+    """
+    counts = {}
+    unknown = []
+    for i, c in enumerate(censuses or ()):
+        if not isinstance(c, dict):
+            unknown.append(str(i))
+            continue
+        rank = str(c.get("rank", i))
+        n = c.get("n_nccl_nodes")
+        n = n if isinstance(n, int) and not isinstance(n, bool) else None
+        complete = bool(c.get("ok") and c.get("complete")) and n is not None
+        # A partial walk that already found NCCL is a reading; its zero is not.
+        counts[rank] = n if (complete or n) else None
+        if not complete:
+            unknown.append(rank)
+    missing = max(0, int(n_ranks or 0) - len(censuses or ()))
+    if missing:
+        unknown.append(f"{missing} rank(s) unreported")
+    if any(n for n in counts.values()):
+        reason = "nccl_in_graphs"
+    elif unknown:
+        reason = "census_incomplete"
+    else:
+        reason = None
+    return {"graphs_dropped": reason is not None,
+            "graphs_dropped_reason": reason,
+            "graph_nccl_nodes": counts,
+            "census_unknown": unknown}
+
+
+def _semip_graph_drop_message(decision, censuses=()):
+    """The one line that says what the dump did with its graphs, and why."""
+    counts = decision.get("graph_nccl_nodes") or {}
+    known = {r: n for r, n in counts.items() if n is not None}
+    reason = decision.get("graphs_dropped_reason")
+    if reason == "nccl_in_graphs":
+        rank, n = next((r, v) for r, v in known.items() if v)
+        return (f"semi_p: kept graphs hold {n} NCCL kernel node(s) on rank "
+                f"{rank} (max {max(known.values())}); dropping graphs before "
+                f"destroy_nccl, restore will recapture. Per rank: {counts}")
+    if reason == "census_incomplete":
+        why = {str(c.get("rank", "?")): c.get("incomplete_why")
+               or c.get("error") for c in censuses or ()
+               if isinstance(c, dict) and not c.get("complete")}
+        return (f"semi_p: NCCL census of the kept graphs is incomplete on "
+                f"{decision.get('census_unknown')} ({why}); treating it as "
+                f"NCCL present, dropping graphs before destroy_nccl, restore "
+                f"will recapture. Per rank: {counts}")
+    return (f"semi_p: kept graphs hold no NCCL kernel nodes on any of "
+            f"{len(counts)} rank(s); keeping them for rebind_graphs. "
+            f"Per rank: {counts}")
 
 
 def _semip_graph_census(worker):
@@ -5190,6 +5321,13 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
             elif cmd == "rebind_graphs":
                 if llm is None:
                     raise RuntimeError("rebind_graphs requires init/load first")
+                if _GRAPH_DROP.get("graphs_dropped"):
+                    raise RuntimeError(
+                        "rebind_graphs: the dump dropped this engine's graphs "
+                        "before destroy_nccl (reason: "
+                        f"{_GRAPH_DROP.get('graphs_dropped_reason')}), so there "
+                        "is nothing to rebind. Call recapture_graphs() after "
+                        "wake_up_kv_cache().")
                 results = llm.collective_rpc(_semip_rebind_graphs)
                 failures = [r for r in results
                             if not (isinstance(r, dict) and r.get("ok", False))]
@@ -5242,7 +5380,16 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                             if not (isinstance(r, dict) and r.get("ok"))]
                 if failures:
                     raise RuntimeError(f"semip {cmd} failed: {failures}")
+                if cmd == "drop_graphs":
+                    _GRAPH_DROP.clear()
+                    _GRAPH_DROP.update(
+                        graphs_dropped=True,
+                        graphs_dropped_reason=kwargs.get("reason")
+                        or "requested",
+                        graph_nccl_nodes=None)
+                    info["graph_drop"] = dict(_GRAPH_DROP)
                 if cmd == "recapture_graphs":
+                    _GRAPH_DROP.clear()
                     # G5: what the capture cost against what the cold start
                     # reserved for it, and what is left.  One line, because the
                     # ranks differ only in the low tens of MiB and the useful
@@ -5263,6 +5410,42 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                             _est if _est is not None else "?",
                             min(r.get("free_after_mib") or 0 for r in _ok))
                 info[cmd] = results
+
+            elif cmd == "drop_graphs_if_nccl":
+                if llm is None:
+                    raise RuntimeError(f"{cmd} requires init/load first")
+                try:
+                    _expected = int(llm.llm_engine.vllm_config
+                                    .parallel_config.world_size)
+                except Exception:  # noqa: BLE001
+                    _expected = 0
+                try:
+                    censuses = list(llm.collective_rpc(
+                        _semip_nccl_graph_census))
+                except Exception:  # noqa: BLE001 - an absent reading drops
+                    log.warning("  NCCL graph census failed", exc_info=True)
+                    censuses = []
+                for _c in censuses:
+                    log.info("  nccl census %s", _c)
+                decision = _semip_graph_drop_decision(censuses, _expected)
+                log.info("  %s", _semip_graph_drop_message(decision, censuses))
+                if decision["graphs_dropped"]:
+                    results = llm.collective_rpc(_semip_drop_graphs)
+                    for _r in results:
+                        log.info("  drop_graphs %s", _r)
+                    failures = [r for r in results
+                                if not (isinstance(r, dict) and r.get("ok"))]
+                    if failures:
+                        raise RuntimeError(
+                            "semip drop_graphs failed ("
+                            f"{decision['graphs_dropped_reason']}): {failures}")
+                    info["drop_graphs"] = results
+                _GRAPH_DROP.clear()
+                _GRAPH_DROP.update(
+                    {k: decision[k] for k in ("graphs_dropped",
+                                              "graphs_dropped_reason",
+                                              "graph_nccl_nodes")})
+                info["graph_drop"] = dict(_GRAPH_DROP)
 
             elif cmd == "save_weights":
                 if llm is None:

@@ -1641,6 +1641,119 @@ def dump_sp_nccl_nodes(worker, max_samples=48, n_words=8):
     return summary
 
 
+def nccl_node_census(worker=None) -> dict:
+    """How many NCCL kernel nodes this rank's captured graphs hold right now.
+
+    The dump-time gate on keeping the graphs. NCCL counts every collective a
+    graph captures against its communicator (``localPersistentRefs``), and
+    ``ncclCommAbort`` waits for that count to reach zero, which only happens
+    when the graph is destroyed. So a single NCCL node in a kept graph turns
+    ``destroy_nccl`` into a 60 s stall and the image into one whose
+    ``cuda_restore`` fails with CUresult=801.
+
+    Walks the same set ``_semip_drop_graphs`` resets (``_collect_graph_entries``,
+    heap fallback included) and recurses into child-graph nodes. ``complete``
+    is False whenever some part of that set could not be read -- a graph with
+    no retained topology, a child graph or a conditional body we cannot open,
+    an incomplete discovery -- because a zero over a partial walk proves
+    nothing. Read-only; never raises.
+    """
+    _ensure_worker_log_handler()
+    out = {"step": "nccl_node_census", "ok": False, "complete": False,
+           "incomplete_why": None, "n_graphs": 0, "n_graphs_scanned": 0,
+           "n_child_graphs": 0, "n_kernel_nodes": 0, "n_nccl_nodes": 0,
+           "n_unidentified_kernels": 0, "nccl_kernels": {}}
+    why = []
+    try:
+        entries, diag = _collect_graph_entries(worker)
+        out["n_graphs"] = len(entries)
+        if diag.get("err"):
+            why.append(f"discovery: {diag['err']}")
+        if not entries:
+            # A finished heap scan that found nothing is the absence of graphs.
+            if not diag.get("gc_scanned"):
+                why.append(diag.get("incomplete_why")
+                           or "graph discovery found nothing and did not "
+                              "scan the heap")
+        elif not diag.get("complete"):
+            why.append(diag.get("incomplete_why") or "incomplete discovery")
+        cu = _cu() if entries else None
+        names = {}
+        seen = set()
+        n_topo_fail = n_unscanned = 0
+        for _key, obj in entries:
+            try:
+                root = int(obj.raw_cuda_graph())
+            except Exception:  # noqa: BLE001 - captured without keep_graph
+                root = 0
+            if not root:
+                n_topo_fail += 1
+                continue
+            stack = [root]
+            while stack:
+                graph = stack.pop()
+                if graph in seen:
+                    continue
+                seen.add(graph)
+                try:
+                    nodes = _graph_nodes(cu, graph)
+                except Exception:  # noqa: BLE001
+                    n_unscanned += 1
+                    continue
+                for node in nodes:
+                    t = ctypes.c_int(-1)
+                    if cu.cuGraphNodeGetType(node, ctypes.byref(t)) != 0:
+                        n_unscanned += 1
+                        continue
+                    if t.value == _CU_NODE_TYPE_GRAPH:
+                        sub = ctypes.c_void_p()
+                        if _e8_child_graph(cu, node, sub) and sub.value:
+                            out["n_child_graphs"] += 1
+                            stack.append(sub.value)
+                        else:
+                            n_unscanned += 1
+                        continue
+                    if t.value == _CU_NODE_TYPE_CONDITIONAL:
+                        n_unscanned += 1
+                        continue
+                    if t.value != _CU_NODE_TYPE_KERNEL:
+                        continue
+                    out["n_kernel_nodes"] += 1
+                    params = _KernelNodeParams()
+                    if cu.cuGraphKernelNodeGetParams_v2(
+                            node, ctypes.byref(params)) != 0:
+                        out["n_unidentified_kernels"] += 1
+                        continue
+                    func = params.func or 0
+                    if func not in names:
+                        names[func] = _func_name(cu, params.func)
+                    name = names[func]
+                    if not name:
+                        out["n_unidentified_kernels"] += 1
+                        continue
+                    if "nccl" in name.lower():
+                        out["n_nccl_nodes"] += 1
+                        out["nccl_kernels"][name] = (
+                            out["nccl_kernels"].get(name, 0) + 1)
+            out["n_graphs_scanned"] += 1
+        if n_topo_fail:
+            why.append(f"{n_topo_fail} graph(s) without a retained topology")
+        if n_unscanned:
+            why.append(f"{n_unscanned} node(s) or child graph(s) unreadable")
+        out["ok"] = True
+    except Exception as e:  # noqa: BLE001
+        why.append(f"{type(e).__name__}: {e}")
+    out["complete"] = out["ok"] and not why
+    out["incomplete_why"] = "; ".join(why) or None
+    log.info("NCCL NODE CENSUS: graphs=%d scanned=%d child_graphs=%d "
+             "kernel_nodes=%d nccl_nodes=%d unidentified=%d complete=%s "
+             "kernels=%s why=%s", out["n_graphs"], out["n_graphs_scanned"],
+             out["n_child_graphs"], out["n_kernel_nodes"],
+             out["n_nccl_nodes"], out["n_unidentified_kernels"],
+             out["complete"], out["nccl_kernels"], out["incomplete_why"])
+    return out
+
+
 def _patch_node(cu, exec_handle, node, meta_map, vfy=None):
     """If `node` is a CA all-reduce kernel, value-match old->new meta_ptrs in its
     sg (kernelParams[1], 8 ptrs) and self_sg (kernelParams[2], 1 ptr) and commit.

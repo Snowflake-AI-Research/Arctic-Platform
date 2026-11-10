@@ -477,16 +477,22 @@ class Instance:
         # A follower node holds no executor-side queues; the leader's
         # destroy_nccl reaches its ranks.
         if self.n_gpus > 1 and self.node_rank == 0:
-            # G1: across nodes the graphs cannot survive the teardown and must
-            # go first.  vLLM turns custom all-reduce off when ranks span
-            # machines, so every all-reduce a graph captured is an NCCL kernel,
-            # and NCCL will not release a communicator a live graph captured:
-            # commDestroySync spins on `while (comm->localPersistentRefs != 0)`
-            # until the graphs referencing it are destroyed.  Ordering this
-            # before destroy_nccl is what turns that hang into a 2-3 s drop.
-            # The restore pairs it with recapture_graphs.
+            # G1: graphs holding NCCL kernels cannot survive the teardown and
+            # must go first.  NCCL will not release a communicator a live
+            # graph captured: commDestroySync spins on `while
+            # (comm->localPersistentRefs != 0)` until the graphs referencing
+            # it are destroyed.  Ordering the drop before destroy_nccl is what
+            # turns that hang into a 2-3 s drop; the restore pairs it with
+            # recapture_graphs.  Across nodes vLLM turns custom all-reduce
+            # off, so every graph all-reduce is an NCCL kernel and the drop is
+            # unconditional.  On one node the child counts NCCL kernel nodes
+            # in the kept graphs on every rank and drops only if one holds
+            # any, or if a count is incomplete; graphs whose collectives are
+            # all CustomAllreduce stay for rebind_graphs.
             if self.nnodes > 1:
-                self._send("drop_graphs")
+                self._send("drop_graphs", reason="multinode")
+            else:
+                self._send("drop_graphs_if_nccl")
             self._send("destroy_nccl")
         return self._send("cuda_checkpoint")
 
@@ -544,7 +550,9 @@ class Instance:
         """Tear down NCCL and CustomAllreduce IPC.  No-op at TP=1.
 
         Always the graph-preserving unilateral-abort teardown: the captured
-        graphs go into the image and are rebound after restore.
+        graphs go into the image and are rebound after restore.  Fails if a
+        communicator's abort does not return, which is what a kept graph
+        holding NCCL kernels causes; ``cuda_checkpoint`` drops those first.
         """
         self._log("destroy_nccl")
         return self._send("destroy_nccl")
@@ -608,12 +616,15 @@ class Instance:
         through CRIU intact, so there is nothing to instantiate either.  The
         work is address rewriting and always was, once the image is warm.
 
-        Single-node only.  Across nodes there is nothing to rebind: vLLM turns
-        custom all-reduce off, so the graphs held NCCL kernels, so the dump had
-        to destroy them for ``ncclCommAbort`` to return.  Use
-        ``recapture_graphs``.  Raising rather than quietly doing nothing keeps
-        a mis-ordered restore from reporting success and then wedging on the
-        first replay of a graph that no longer exists.
+        Only for an image that kept its graphs.  Across nodes there is nothing
+        to rebind: vLLM turns custom all-reduce off, so the graphs held NCCL
+        kernels, so the dump had to destroy them for ``ncclCommAbort`` to
+        return.  The same holds for a single-node image whose graphs held NCCL
+        kernels (``graphs_dropped`` in its ``meta.json``), where the child
+        raises instead.  Use ``recapture_graphs``.  Raising rather than
+        quietly doing nothing keeps a mis-ordered restore from reporting
+        success and then wedging on the first replay of a graph that no
+        longer exists.
         """
         if self.nnodes > 1:
             raise RuntimeError(
@@ -623,19 +634,32 @@ class Instance:
         self._log("rebind_graphs")
         return self._send("rebind_graphs")
 
-    def drop_graphs(self):
+    def drop_graphs(self, reason="requested"):
         """Destroy every captured CUDA graph, before ``cuda_checkpoint``.
 
-        Across nodes the graphs hold NCCL kernels, and ``ncclCommAbort`` does
-        not return while they are alive. Pair with ``recapture_graphs`` on
-        the restore side.
+        ``ncclCommAbort`` does not return while a graph holding one of the
+        communicator's NCCL kernels is alive. Pair with ``recapture_graphs``
+        on the restore side. ``reason`` is recorded as
+        ``graphs_dropped_reason`` in the image's ``meta.json``.
         """
         self._log("drop_graphs")
-        return self._send("drop_graphs")
+        return self._send("drop_graphs", reason=reason)
+
+    def drop_graphs_if_nccl(self):
+        """Drop the captured graphs if any rank's hold an NCCL kernel node.
+
+        Single-node half of ``cuda_checkpoint``'s gate. Every rank counts the
+        NCCL kernel nodes in its graphs (child graphs included); a count above
+        zero, or one that could not be completed, drops the graphs and the
+        image records ``graphs_dropped``. No-op at TP=1.
+        """
+        self._log("drop_graphs_if_nccl")
+        return self._send("drop_graphs_if_nccl")
 
     def recapture_graphs(self):
         """Capture the CUDA graphs again after a restore whose dump dropped
-        them. Run after ``reinit_nccl`` and ``wake_up_kv_cache``."""
+        them. Run after ``reinit_nccl`` and ``wake_up_kv_cache``. Single- and
+        multi-node alike."""
         self._log("recapture_graphs")
         return self._send("recapture_graphs")
 
@@ -668,6 +692,10 @@ class Instance:
                 "n_gpus":           self.n_gpus,
                 "max_pinned_bytes_per_worker":
                     self.max_pinned_bytes_per_worker}
+        # The leader's child reports its own drop and the worker records that
+        # over this; a follower node-partition never sees the command.
+        if self.nnodes > 1:
+            meta.update(graphs_dropped=True, graphs_dropped_reason="multinode")
         if meta_extra:
             meta.update(meta_extra)
         return self._send("criu_dump", filename=filename, meta_extra=meta)
