@@ -94,7 +94,7 @@ def _comparison_tensors(
     beta1, beta2 = settings.betas
     epsilon = settings.eps
     learning_rate = float(learning_rate)
-    if backend == "dss":
+    if backend == "ap":
         beta1 = float(torch.tensor(beta1, dtype=torch.float32))
         beta2 = float(torch.tensor(beta2, dtype=torch.float32))
         beta1_correction = float(torch.tensor(1.0 - math.pow(beta1, step), dtype=torch.float32))
@@ -112,7 +112,7 @@ def _comparison_tensors(
     unbiased_avg = exp_avg / beta1_correction
     unbiased_avg_sq = exp_avg_sq / beta2_correction
     denominator = unbiased_avg_sq.sqrt() + epsilon
-    if backend == "dss":
+    if backend == "ap":
         moment_update = -(unbiased_avg / denominator) * learning_rate
     else:
         moment_update = -learning_rate * unbiased_avg / denominator
@@ -172,7 +172,7 @@ def summarize_optimizer_artifacts(
     comparison-state norms. ``criterion`` versions this magnitude-only measurement, which cannot detect equal-norm
     sign, permutation, or directional errors. No legacy full-tensor tolerance is implied by this summary.
     """
-    if backend not in {"reference", "dss"}:
+    if backend not in {"reference", "ap"}:
         raise ValueError(f"unknown optimizer comparison backend: {backend!r}")
     path = Path(manifest)
     raw_manifest = json.loads(path.read_text())
@@ -185,7 +185,7 @@ def summarize_optimizer_artifacts(
         raise ValueError("optimizer norm artifacts have an empty canonical parameter name")
     groups = (
         canonical_dss_tensor_groups(entries)
-        if backend == "dss"
+        if backend == "ap"
         else {name: CanonicalTensorGroup((name,)) for name in entries}
     )
     covered = [name for group in groups.values() for name in group.originals]
@@ -250,7 +250,7 @@ def compare_optimizer_norms(dss_summary: dict, reference_summary: dict) -> Optim
     """
     dss = _validate_optimizer_norm_summary(dss_summary)
     reference = _validate_optimizer_norm_summary(reference_summary)
-    validate_optimizer_participation(dss_summary, backend="dss")
+    validate_optimizer_participation(dss_summary, backend="ap")
     validate_optimizer_participation(reference_summary, backend="reference")
     if dss_summary.get("participation") is not None or reference_summary.get("participation") is not None:
         target = dss_summary.get("participation")

@@ -702,7 +702,7 @@ def execute(
         optimizer_state_output_dir = None
         if stepping and not isinstance(client_backend, CortexConfig):
             optimizer_state_output_dir = require_data_fast_path(
-                tmp / "optimizer" / "dss" / arm.name, label="optimizer artifact output"
+                tmp / "optimizer" / "ap" / arm.name, label="optimizer artifact output"
             )
             optimizer_state_output_dir.mkdir(parents=True, exist_ok=True)
         payload = build_payload(
@@ -748,7 +748,7 @@ def execute(
                     job,
                     body,
                     learning_rate=OPTIMIZER_LEARNING_RATE,
-                    output_dir=tmp / "optimizer" / "dss" / arm.name,
+                    output_dir=tmp / "optimizer" / "ap" / arm.name,
                     expected_dp_world_size=cfg.n_gpus if supplier is not None else cfg.dp_size,
                     optimizer_config=optimizer_config,
                     **({"local_checkpoint": True} if local_cortex_fixture else {}),
@@ -1115,7 +1115,7 @@ def execute(
                 with running_job(session, payload_for(arm)) as job_id:
                     started = time.monotonic()
                     context._target[arm.name] = measure_target(session, job_id, arm)
-                    context._timing.setdefault(arm.name, {})["dss"] = time.monotonic() - started
+                    context._timing.setdefault(arm.name, {})["ap"] = time.monotonic() - started
         except UnsafeCleanupError:
             raise
         except Exception as exc:  # noqa: BLE001 - startup failures must also reach the report

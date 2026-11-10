@@ -828,7 +828,7 @@ def _run(ctx) -> TestResult:
     validate_reference(reference, inputs)
     validate_replay(inputs)
     target_losses, target_logprobs = run_dss_trajectory(
-        ctx, inputs.replay, inputs.workdir / "dss", inputs.peft_adapter_path
+        ctx, inputs.replay, inputs.workdir / "ap", inputs.peft_adapter_path
     )
     if len(target_losses) != TRAIN_STEPS or any(
         type(value) not in (int, float) or not math.isfinite(value) for value in target_losses
