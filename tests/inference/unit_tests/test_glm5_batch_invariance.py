@@ -170,6 +170,29 @@ def test_tokens_that_fit_in_index_topk_get_causal_indices_beside_longer_sequence
     assert buffer[3].tolist() == [7, 7, 7, 7]
 
 
+def test_causal_rows_fill_without_a_host_sync_matches_the_row_selection():
+    import torch
+
+    from arctic_platform.inference.vllm.glm5_batch_invariance import fill_causal_rows
+
+    def by_selection(buffer, positions, topk_tokens):
+        positions = positions[: buffer.shape[0]]
+        rows = torch.nonzero(positions < topk_tokens).flatten()
+        col = torch.arange(buffer.shape[1], dtype=torch.int32)
+        causal = col[None, :].repeat(rows.numel(), 1)
+        causal[col[None, :] > positions[rows, None].to(torch.int32)] = -1
+        buffer[rows] = causal
+
+    torch.manual_seed(0)
+    for rows, n_positions in ((6, 6), (6, 4), (4, 6)):
+        buffer = torch.randint(-1, 50, (rows, 16), dtype=torch.int32)
+        positions = torch.randint(0, 24, (n_positions,))
+        expected = buffer.clone()
+        by_selection(expected[:n_positions], positions, 12)
+        fill_causal_rows(buffer, positions, 12)
+        assert torch.equal(buffer, expected)
+
+
 def test_indexer_key_norm_runs_eagerly_with_the_reference_math(monkeypatch):
     import sys
     import types
