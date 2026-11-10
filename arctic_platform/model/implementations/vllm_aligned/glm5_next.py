@@ -1001,7 +1001,10 @@ def _vllm_backward_runner(input_ids: torch.Tensor, position_ids: torch.Tensor, k
 
     config = ctx.config
     mask = torch.ones(1, input_ids.numel(), dtype=torch.bool, device=input_ids.device)
-    layer_kwargs = {**kwargs, "input_ids": input_ids.reshape(1, -1)}
+    # What the stock decoder layer passes on to its attention: the packing kwargs without its own named arguments.
+    named = ("attention_mask", "position_ids", "past_key_values", "use_cache", "position_embeddings",
+             "prev_topk_indices", "routed_experts")  # fmt: skip
+    layer_kwargs = {**{k: v for k, v in kwargs.items() if k not in named}, "input_ids": input_ids.reshape(1, -1)}
 
     def pre(layer, hc, norm, streams):
         with torch.no_grad():
@@ -1025,14 +1028,15 @@ def _vllm_backward_runner(input_ids: torch.Tensor, position_ids: torch.Tensor, k
         with torch.no_grad():
             mixed_exact = _mixer(layer, exact[2], ctx)
         with _stock_replay(layer, record, kwargs, vllm_mla_weights=True) as extra:
+            # The stock layer takes these by name before passing the rest of the packing kwargs down.
             if layer.block_type == "linear_attention":
-                mixed = layer.self_attn(hidden_states=x.unsqueeze(0), cache_params=None, attention_mask=mask,
-                                        **layer_kwargs)  # fmt: skip
+                mixed = layer.self_attn(**{**layer_kwargs, "hidden_states": x.unsqueeze(0), "cache_params": None,
+                                           "attention_mask": mask})  # fmt: skip
             else:
-                mixed = layer.self_attn(hidden_states=x.unsqueeze(0), attention_mask=mask,
-                                        position_ids=position_ids.reshape(1, -1), past_key_values=None,
-                                        use_cache=False, position_embeddings=None, prev_topk_indices=None,
-                                        **layer_kwargs)[0]  # fmt: skip
+                mixed = layer.self_attn(**{**layer_kwargs, "hidden_states": x.unsqueeze(0), "attention_mask": mask,
+                                           "position_ids": position_ids.reshape(1, -1), "past_key_values": None,
+                                           "use_cache": False, "position_embeddings": None,
+                                           "prev_topk_indices": None})[0]  # fmt: skip
             mixed = substitute(mixed.squeeze(0), mixed_exact)
             streams = post_(layer, fused, post, comb, mixed, mixed_exact, streams, exact)
             fused, post, comb, x, exact = pre(layer, layer.ffn_hc, layer.post_attention_layernorm, streams)
