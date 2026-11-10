@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
+import random
 import time
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Hashable
 
 import ray
@@ -43,6 +45,8 @@ class WorkerState:
     available: bool = True
     streaming_requests: int = 0
     quarantined: bool = False
+    # Futures of the generate calls running on this worker.
+    inflight: set = field(default_factory=set)
 
     @property
     def schedulable(self) -> bool:
@@ -75,12 +79,12 @@ def _compute_prefix_hash(prompt: Any) -> int:
 class Scheduler:
     """Routes each request to a worker, with no admission limit of its own.
 
-    A request with no key goes to the least-loaded worker. A keyed one goes to
-    the worker its key was first given, the least-loaded then; a prefix-hash
-    key spills to the least-loaded worker while its own holds ``capacity``
-    requests, and a sticky one never spills. Requests wait only while the
-    scheduler is paused or no worker can take them; beyond ``capacity`` they
-    queue in the engine.
+    A request with no key goes to the less loaded of two random workers. A
+    keyed one goes to the worker its key was first given, chosen that way then;
+    a prefix-hash key spills while its worker holds ``capacity`` requests and
+    another has room, and a sticky one never spills. Requests wait only while
+    the scheduler is paused or no worker can take them; beyond ``capacity``
+    they queue in the engine.
     """
 
     def __init__(
@@ -97,7 +101,8 @@ class Scheduler:
         self._capacity = capacity
         self._prefix_routing = prefix_routing
         self._keys: OrderedDict[Hashable, int] = OrderedDict()
-        self._next = 0
+        # Requests no worker could take, retried by `_notify`.
+        self._waiting: list[_Request] = []
         self._next_id = 0
         self._streams = {}
         self._stream_retired = OrderedDict()
@@ -106,7 +111,6 @@ class Scheduler:
         self._paused = False
         self._stopped = False
         self._wake = asyncio.Event()
-        self._inflight_tasks: dict[int, set] = {i: set() for i in range(len(workers))}
         # Per-request metric ring (drained by `drain_metrics`).
         self._request_records: _BoundedDeque = _BoundedDeque(max_request_records)
         # Best-effort: tell each worker its index so snapshots are
@@ -120,7 +124,8 @@ class Scheduler:
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state["_wake"] = None
-        state["_inflight_tasks"] = {i: set() for i in state.get("_inflight_tasks", {})}
+        state["_waiting"] = []
+        state["_workers"] = [replace(ws, inflight=set()) for ws in self._workers]
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -154,7 +159,8 @@ class Scheduler:
             raise RuntimeError("Scheduler is stopped")
         future = asyncio.get_running_loop().create_future()
         req = self._request(prompt, sampling_params, future, routing_key, strict)
-        asyncio.create_task(self._process_request(req))
+        if not self._dispatch(req):
+            self._waiting.append(req)
         return future
 
     def stream_generate(self, request_id, prompt, sampling_params=None, *, limits=None, routing_key=None, strict=False):
@@ -308,21 +314,14 @@ class Scheduler:
         self._notify()
 
     def cancel_worker_inflight(self, idx: int) -> int:
-        """Cancel all in-flight tasks for worker *idx*. Returns count cancelled."""
+        """Cancel all in-flight requests for worker *idx*. Returns count cancelled."""
         self._check_idx(idx)
-        tasks = self._inflight_tasks.get(idx, set())
-        cancelled = 0
-        for task in list(tasks):
-            if not task.done():
-                task.cancel()
-                cancelled += 1
-        return cancelled
+        return sum(future.cancel() for future in list(self._workers[idx].inflight))
 
     def add_worker(self, handle: ray.actor.ActorHandle) -> None:
         """Add a new worker to the scheduler."""
         idx = len(self._workers)
         self._workers.append(WorkerState(handle=handle))
-        self._inflight_tasks[idx] = set()
         try:
             handle.set_replica_id.remote(idx)
         except Exception:
@@ -333,15 +332,15 @@ class Scheduler:
         """Remove the last worker. Raises if no workers remain."""
         if not self._workers:
             raise RuntimeError("No workers to remove")
-        idx = len(self._workers) - 1
-        for task in list(self._inflight_tasks.get(idx, set())):
-            if not task.done():
-                task.cancel()
-        self._inflight_tasks.pop(idx, None)
+        self.cancel_worker_inflight(len(self._workers) - 1)
         self._workers.pop()
 
     async def shutdown(self) -> None:
         self._stopped = True
+        for req in self._waiting:
+            if not req.future.done():
+                req.future.set_exception(RuntimeError("Scheduler stopped"))
+        self._waiting = []
         self._notify()
         await self.abort_streams()
 
@@ -354,7 +353,11 @@ class Scheduler:
             raise IndexError(f"Worker index {idx} out of range (have {len(self._workers)} workers)")
 
     def _notify(self) -> None:
-        """Wake every waiter, to try again."""
+        """Retry waiting requests, and wake every stream waiter to try again."""
+        waiting, self._waiting = self._waiting, []
+        for req in waiting:
+            if not req.future.done() and not self._dispatch(req):
+                self._waiting.append(req)
         self._wake.set()
         self._wake = asyncio.Event()
 
@@ -403,56 +406,56 @@ class Scheduler:
             return idx
         self._keys.move_to_end(req.key)
         ws = self._workers[idx]
-        if not stream or ws.streaming_requests < MAX_WORKER_STREAMS:
-            if req.sticky or ws.active_requests < self._capacity:
-                return idx
-        return None if req.sticky else self._least_loaded(stream)
+        stream_full = stream and ws.streaming_requests >= MAX_WORKER_STREAMS
+        if not stream_full and (req.sticky or ws.active_requests < self._capacity):
+            return idx
+        if req.sticky:
+            return None
+        alt = self._least_loaded(stream)
+        # Spilling only helps when another worker has room; otherwise it just splits the key's cache.
+        if not stream_full and (alt is None or self._workers[alt].active_requests >= self._capacity):
+            return idx
+        return alt
 
     def _least_loaded(self, stream: bool) -> int | None:
-        """The schedulable worker with the fewest requests; ties rotate."""
-        best = None
+        """The less loaded of two random workers that can take a request, else the least loaded of all that can."""
+        def can_take(ws: WorkerState) -> bool:
+            return ws.schedulable and not (stream and ws.streaming_requests >= MAX_WORKER_STREAMS)
+
         n = len(self._workers)
-        for k in range(n):
-            i = (self._next + k) % n
-            ws = self._workers[i]
-            if not ws.schedulable or (stream and ws.streaming_requests >= MAX_WORKER_STREAMS):
-                continue
-            if best is None or ws.active_requests < self._workers[best].active_requests:
-                best = i
-        if best is not None:
-            self._next = best + 1
-        return best
+        i = random.randrange(n)
+        j = (i + 1 + random.randrange(n - 1)) % n if n > 1 else i
+        a, b = self._workers[i], self._workers[j]
+        if can_take(a) and can_take(b):
+            return i if a.active_requests <= b.active_requests else j
+        candidates = [k for k, ws in enumerate(self._workers) if can_take(ws)]
+        return min(candidates, key=lambda k: self._workers[k].active_requests, default=None)
 
-    async def _process_request(self, req: _Request) -> None:
-        while (ws := self._take(req)) is None:
-            if self._stopped:
-                if not req.future.done():
-                    req.future.set_exception(RuntimeError("Scheduler stopped"))
-                return
-            await self._wake.wait()
+    def _dispatch(self, req: _Request) -> bool:
+        """Send ``req`` to a worker, or False while none can take it."""
+        ws = self._take(req)
+        if ws is None:
+            return False
+        future = ws.handle.generate.remote(req.prompt, req.sampling_params).as_future()
+        ws.inflight.add(future)
+        future.add_done_callback(functools.partial(self._done, req, ws, time.time()))
+        return True
 
-        inflight = self._inflight_tasks[req.worker_idx]
-        task = asyncio.current_task()
-        inflight.add(task)
-        submitted_time = time.time()
-        try:
-            result = await ws.handle.generate.remote(req.prompt, req.sampling_params)
-        except asyncio.CancelledError:
-            if not req.future.done():
-                req.future.set_exception(RuntimeError("Request cancelled for weight update"))
-            return
-        except Exception as exc:
+    def _done(self, req: _Request, ws: WorkerState, submitted_time: float, future: asyncio.Future) -> None:
+        ws.inflight.discard(future)
+        ws.active_requests -= 1
+        if future.cancelled():
+            error: BaseException | None = RuntimeError("Request cancelled for weight update")
+        elif (error := future.exception()) is not None:
             logger.warning(
                 "Worker %d generate failed for request %d: %s: %s",
-                req.worker_idx, req.id, type(exc).__name__, exc, exc_info=True,
+                req.worker_idx, req.id, type(error).__name__, error, exc_info=error,
             )
+        if error is not None:
             if not req.future.done():
-                req.future.set_exception(exc)
+                req.future.set_exception(error)
             return
-        finally:
-            inflight.discard(task)
-            ws.active_requests -= 1
-
+        result = future.result()
         if not req.future.done():
             req.future.set_result(result)
         if isinstance(result, dict):

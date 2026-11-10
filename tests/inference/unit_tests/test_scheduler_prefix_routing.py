@@ -77,22 +77,10 @@ class TestComputePrefixHash:
 
 class TestRoute:
     def test_unkeyed_goes_to_least_loaded(self):
-        sch = _scheduler(3, prefix_routing=False)
+        sch = _scheduler(2, prefix_routing=False)
         sch._workers[0].active_requests = 5
         sch._workers[1].active_requests = 2
-        sch._workers[2].active_requests = 7
         assert _route(sch, "a") == 1
-
-    def test_idle_new_keys_spread(self):
-        sch = _scheduler(3)
-        for ws in sch._workers:
-            ws.active_requests = 0
-        assigned = []
-        for idx in range(6):
-            assigned.append(_route(sch, routing_key=f"group-{idx}"))
-            for ws in sch._workers:
-                ws.active_requests = 0
-        assert assigned == [0, 1, 2, 0, 1, 2]
 
     def test_grpo_group_colocates(self):
         sch = _scheduler(4)
@@ -139,14 +127,15 @@ class TestRoute:
 
 
 def _capture_requests(sch: Scheduler) -> list:
-    """Replace _process_request with a no-op capture so we can inspect the
-    _Request objects submit() builds, without racing real worker dispatch."""
+    """Replace _dispatch with a capture so we can inspect the
+    _Request objects submit() builds, without real worker dispatch."""
     captured: list = []
 
-    async def fake_process(req):
+    def fake_dispatch(req):
         captured.append(req)
+        return True
 
-    sch._process_request = fake_process  # type: ignore[method-assign]
+    sch._dispatch = fake_dispatch  # type: ignore[method-assign]
     return captured
 
 

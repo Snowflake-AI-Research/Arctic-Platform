@@ -7,6 +7,7 @@ import os
 from typing import Any
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import ray
 import torch
@@ -248,3 +249,23 @@ def _dummy_sample_logprobs(
         }
         for pos in range(num_tokens)
     ]
+
+
+class _Ref:
+    """A Ray ObjectRef stand-in: awaitable, or turned into a future with ``as_future``."""
+
+    def __init__(self, coro) -> None:
+        self._coro = coro
+
+    def __await__(self):
+        return self._coro.__await__()
+
+    def as_future(self) -> asyncio.Future:
+        return asyncio.ensure_future(self._coro)
+
+
+class RemoteMock(AsyncMock):
+    """An ``AsyncMock`` for an actor method's ``.remote`` whose calls return ObjectRef stand-ins."""
+
+    def __call__(self, *args, **kwargs):
+        return _Ref(super().__call__(*args, **kwargs))

@@ -13,6 +13,7 @@ from arctic_platform.inference.server.config import ModelConfig
 from arctic_platform.inference.server.replica_pool import ReplicaPool
 from arctic_platform.inference.server.scheduler import Scheduler
 from arctic_platform.inference.server.streaming import StreamLimits
+from arctic_platform.inference.server.testing import RemoteMock
 from arctic_platform.inference.server.worker import InferenceWorker
 from arctic_platform.inference.server.worker import WorkerLifecycleState
 
@@ -36,7 +37,7 @@ def make_pool():
     for method in (*WEIGHT_METHODS, "sleep", "wake_up", "pause_generation",
                    "resume_generation", "abort_stream"):
         getattr(handle, method).remote = AsyncMock(return_value={"status": "aborted"})
-    handle.generate.remote = AsyncMock(return_value={"text": "legacy", "token_ids": [1]})
+    handle.generate.remote = RemoteMock(return_value={"text": "legacy", "token_ids": [1]})
     pool = ReplicaPool()
     pool._config = ModelConfig(model="fake")
     pool._workers = [handle]
@@ -136,7 +137,7 @@ def test_quarantine_blocks_legacy_dispatch_until_worker_replacement(prefix_routi
                 await asyncio.wait_for(asyncio.shield(future), 0.02)
             handle.generate.remote.assert_not_awaited()
             replacement = MagicMock()
-            replacement.generate.remote = AsyncMock(return_value={"text": "recovered"})
+            replacement.generate.remote = RemoteMock(return_value={"text": "recovered"})
             scheduler.update_worker_handle(0, replacement)
             scheduler.mark_worker_available(0)
             assert (await asyncio.wait_for(future, 1))["text"] == "recovered"
@@ -278,7 +279,7 @@ def test_uncertain_stream_cleanup_prevents_engine_mutation(method, strategy):
         stream.worker.active_requests = stream.worker.streaming_requests = 1
         handle.abort_stream.remote.return_value = {"status": "cleanup_unconfirmed"}
         healthy = MagicMock()
-        healthy.generate.remote = AsyncMock(return_value={"text": "healthy"})
+        healthy.generate.remote = RemoteMock(return_value={"text": "healthy"})
         getattr(healthy, method).remote = AsyncMock()
         healthy.pause_generation.remote = AsyncMock()
         pool._workers.append(healthy)
