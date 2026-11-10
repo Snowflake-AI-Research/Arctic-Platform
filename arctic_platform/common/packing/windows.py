@@ -62,8 +62,10 @@ def token_shard(
     provider adapters rely on when they all-gather ``position_ids`` to rebuild global varlen boundaries.
     Multimodal ``[channels, 1, T]`` positions are cut on their token axis the same way.
 
-    Media is not cut: a window gets every image or video whose tokens overlap it, whole, plus the slice of its
-    embeddings that lands in the window (``window_media``). Finding those tokens takes the call's packed
+    Media is not cut: a window gets every image or video whose tokens sit inside it, whole (``window_media``).
+    An item whose tokens straddle any of the call's window boundaries is refused on every shard alike, with a
+    ValueError naming the item, its token span and the boundary; a caller avoids it by moving the boundary off
+    the item, padding or reordering the text before it. Finding those tokens takes the call's packed
     ``mm_token_type_ids`` and the model's ``spatial_merge_size``, which a call carrying media must pass.
     """
     start, end = token_window(metadata.padded_tokens, shard_count, shard_index)
@@ -94,6 +96,7 @@ def token_shard(
                 metadata.cu_seqlens,
                 (start, end),
                 spatial_merge_size=spatial_merge_size,
+                boundaries=range(0, metadata.padded_tokens + 1, max(end - start, 1)),
             )
         )
     return window

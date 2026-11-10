@@ -15,8 +15,8 @@
 """Qwen3.8 context parallelism on windowed media calls.
 
 What the trainers dispatch: each rank gets ``token_shard``'s window of the packed call with the whole media items
-in it and their ``*_window_token_ranges``. The call is already sharded and reaches the language model as it would
-without CP, text-only calls included.
+in it; ``token_shard`` refuses an item that straddles two windows. The call is already sharded and reaches the
+language model as it would without CP, text-only calls included.
 
 CPU only, on the tiny config and dense-MLP model of ``test_qwen4_exp_multimodal.py``. The CP group is faked the
 way that file's spec does: ``dist.get_world_size`` / ``dist.get_rank`` are patched, and the GatedDeltaNet adapter
@@ -183,7 +183,7 @@ def _two_row_windows(model, shard_count=2):
     """The review's sp=2 example through the trainers' own sharding: two 16-token rows, one image in row 0.
 
     Returns the packed whole call, its metadata, and ``token_shard``'s windows (with ``window_media``'s whole
-    images and ``image_window_token_ranges``).
+    images; the image sits inside rank 0's window).
     """
     image_tokens = int(IMAGE_GRID_THW[0].prod())
     row_0 = [2, VISION_START_TOKEN_ID] + [IMAGE_TOKEN_ID] * image_tokens + [VISION_END_TOKEN_ID]
@@ -224,7 +224,8 @@ def _without_empty_media(window):
 def test_token_shard_windows_pass_through_and_each_rank_gets_its_own_window(monkeypatch, world_size):
     reference = _model().eval()
     packed, metadata, windows = _two_row_windows(reference, world_size)
-    assert windows[0]["image_window_token_ranges"].tolist() == [[0, int(IMAGE_GRID_THW[0].prod())]]
+    assert windows[0]["image_grid_thw"].tolist() == IMAGE_GRID_THW[:1].tolist()
+    assert all("image_window_token_ranges" not in window for window in windows)
     assert all(window["image_grid_thw"].shape[0] == 0 for window in windows[1:])
     unsharded = _language_model_inputs(reference, {k: v for k, v in packed.items() if k != "image_row_ids"})
     model, group = _cp_model(monkeypatch, world_size)
