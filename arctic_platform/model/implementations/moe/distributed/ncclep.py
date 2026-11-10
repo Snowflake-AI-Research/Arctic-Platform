@@ -92,7 +92,7 @@ def dispatch_tokens_async(
     belongs = valid[tokens] & (destinations[tokens] == ranks[:, None])
     indices = (selected_experts_indices[tokens] % local_experts).masked_fill(~belongs, -1)
     scores = top_scores[tokens].masked_fill(~belongs, 0)
-    received_hidden = _AllToAll.apply(hidden_states[tokens], send_splits, recv_splits, group)
+    received_hidden = _AllToAll.apply(gather_token_rows(hidden_states, tokens), send_splits, recv_splits, group)
     received_indices = indices.new_empty((sum(recv_splits), indices.shape[1]))
     dist.all_to_all_single(received_indices, indices.contiguous(), recv_splits, send_splits, group=group)
     received_scores = _AllToAll.apply(scores, send_splits, recv_splits, group)
