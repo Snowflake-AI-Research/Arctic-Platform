@@ -29,6 +29,7 @@ from arctic_platform.inference.vllm.dense_prompt_logprobs import (
     stage_sampling_params as _stage_dense_prompt_logprobs,
     take_dense as _take_dense_prompt_logprobs,
 )
+from arctic_platform.inference.vllm.prefill_chunk_report import KEY as PREFILL_CHUNKS_KEY
 from arctic_platform.inference.vllm.spec_decode_grammar import (
     ensure_spec_decode_grammar_fix,
 )
@@ -677,6 +678,10 @@ def _result_from_output(
     spec = getattr(choice, "spec_decode_metrics", None)
     if spec is not None:
         result["spec_decode_metrics"] = spec.to_dict()
+
+    chunk_report = (getattr(final_output, "kv_transfer_params", None) or {}).get(PREFILL_CHUNKS_KEY)
+    if chunk_report is not None:
+        result["prefill_chunks"] = chunk_report
 
     if final_output.prompt_logprobs is not None:
         # The dense patch leaves tensors here instead of one dict per position;
