@@ -1,8 +1,8 @@
 """Media prompts: vLLM ``TokensPrompt`` keys with ``multi_modal_data``.
 
-The Zone Manager imports this module to learn whether a worker takes media
-prompts (``SUPPORTS_MEDIA``). Media arrives as raw encoded bytes, one placeholder
-token per item; ``decode_media`` turns them into what vLLM's engine takes, with
+A caller that embeds the server imports this module to learn whether a worker
+takes media prompts (``SUPPORTS_MEDIA``). Media arrives as raw encoded bytes, one
+placeholder token per item; ``decode_media`` turns them into what vLLM's engine takes, with
 vLLM's own loaders, keeping the original bytes (``MediaWithBytes``) so that
 vLLM's media hashes match.
 
