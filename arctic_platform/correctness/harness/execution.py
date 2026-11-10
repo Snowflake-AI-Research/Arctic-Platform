@@ -980,7 +980,7 @@ def parse_args(argv=None):
     r.add_argument(
         "--out",
         type=Path,
-        help="report directory; default a unique directory under ./work/logs (or DSS_CORRECTNESS_LOGDIR)",
+        help="report directory; default a unique directory under ./work/logs (or AP_CORRECTNESS_LOGDIR)",
     )
     r.add_argument(
         "--reference-records-dir",

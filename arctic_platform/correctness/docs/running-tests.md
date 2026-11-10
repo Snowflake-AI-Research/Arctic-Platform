@@ -10,7 +10,7 @@
 - Install with `python -m pip install -e '.[correctness]'`. The correctness extra supplies training and reference dependencies plus `pytest` and `pytest-instafail` for CPU selftests; the separate `testing` extra is not required for this workflow. Install CUDA and model-specific attention kernels separately.
 - Make the allocation's GPU family and available devices match the supplied configuration. For multiple nodes, provide the allocated hostfile through `DSS_GATEWAY_HOSTFILE` and working allocation-local `ds_ssh`.
 - Make the reviewed model and tokenizer assets readable at the paths recorded in the test specification.
-- Keep generated fixtures, adapter packs, optimizer snapshots and calibration scratch on allocation-local fast storage. The harness uses `/data-fast` defaults; `DSS_CORRECTNESS_TMPDIR` can select another directory under that mount. Temporary files disappear with the allocation.
+- Keep generated fixtures, adapter packs, optimizer snapshots and calibration scratch on allocation-local fast storage. The harness uses `/data-fast` defaults; `AP_CORRECTNESS_TMPDIR` can select another directory under that mount. Temporary files disappear with the allocation.
 - Choose persistent locations for the checkout, downloaded source model, native config and final reports. Supply the native config (`.config` or `.json`) to onboarding; it creates the specification and references. Regression requires those reviewed inputs. No real configurations, specifications or measurements are bundled.
 
 ## Checks
@@ -50,8 +50,8 @@ python -m arctic_platform.correctness list
 
 ```bash
 mkdir -p ./work/configs ./work/reports ./work/logs
-export DSS_CORRECTNESS_TMPDIR="$(mktemp -d /data-fast/tmp/correctness-demo.XXXXXXXX)"
-export DSS_CORRECTNESS_LOGDIR="$PWD/work/logs/correctness-demo"
+export AP_CORRECTNESS_TMPDIR="$(mktemp -d /data-fast/tmp/correctness-demo.XXXXXXXX)"
+export AP_CORRECTNESS_LOGDIR="$PWD/work/logs/correctness-demo"
 export HF_HOME=/checkpoint/huggingface
 export HF_HUB_CACHE=/checkpoint/huggingface/hub
 python - <<'PY'
@@ -146,7 +146,7 @@ python -m arctic_platform.correctness onboard \
 
 **No manual gateway startup or fixture flag is needed for this onboarding command.** With no Cortex host or base URL configured, onboarding selects the reduced local fixture, starts the installed `dss.ray_dss.gateway_server` on loopback for target validation, and closes its owned gateway afterwards. An existing loopback gateway can be supplied with `--base-url`; onboarding does not start or stop that external service. Hosted Cortex account endpoints cannot use this reduced-fixture onboarding mode.
 
-**Every onboarding attempt retains diagnostics in `./work/logs/`.** The printed attempt directory contains `onboarding.log`, `report.md`, the summary, sizing results, calibration summaries, target reports and complete reference-worker logs. `DSS_CORRECTNESS_LOGDIR` overrides this root. Stage headings use vertical spacing. Queued checks use `###` markers and automatic numbering, for example `### Onboarding 1/2: Single Step Grads ###` and `### Onboarding 2/2: Single Step Optimizer ###`; inner phases retain `***` markers. Prerequisite gradient onboarding counts toward the total when needed. Model fixtures, adapters and tensor scratch remain on fast storage, never Git.
+**Every onboarding attempt retains diagnostics in `./work/logs/`.** The printed attempt directory contains `onboarding.log`, `report.md`, the summary, sizing results, calibration summaries, target reports and complete reference-worker logs. `AP_CORRECTNESS_LOGDIR` overrides this root. Stage headings use vertical spacing. Queued checks use `###` markers and automatic numbering, for example `### Onboarding 1/2: Single Step Grads ###` and `### Onboarding 2/2: Single Step Optimizer ###`; inner phases retain `***` markers. Prerequisite gradient onboarding counts toward the total when needed. Model fixtures, adapters and tensor scratch remain on fast storage, never Git.
 
 **After fixing a reported failure, repeat exactly the same command.** Small recovery records live in `./work/logs/onboarding-state/`. The harness reuses completed sizing, fixture, calibration, reference preparation and successful validation only when their inputs, source, environment and retained artifacts match. It retries failed phases and rebuilds missing or changed artifacts. A failed optimizer validation does not force another gradient calibration. Removing temporary model fixtures after an allocation ends can require rebuilding those phases; logs alone are not reusable model data.
 
@@ -267,15 +267,15 @@ python -m arctic_platform.correctness run \
 
 ## Results And Diagnostics
 
-**Every regression ends with total wall-clock runtime after the report paths and any error guidance.** The final runtime is rounded upward to whole seconds in `HH:MM:SS` format and includes gateway startup, execution, owned shutdown and report writing. Reports and complete logs default to `./work/logs`, overridden by `DSS_CORRECTNESS_LOGDIR` or `--out`; tensor scratch remains on fast storage.
+**Every regression ends with total wall-clock runtime after the report paths and any error guidance.** The final runtime is rounded upward to whole seconds in `HH:MM:SS` format and includes gateway startup, execution, owned shutdown and report writing. Reports and complete logs default to `./work/logs`, overridden by `AP_CORRECTNESS_LOGDIR` or `--out`; tensor scratch remains on fast storage.
 
 **Optimizer calibration displays a `tqdm` progress bar for each GAS arm.** The bar counts eight nondeterministic HF runs by default and updates elapsed time and ETA after each completed run. Onboarding ends with total wall-clock runtime rounded upward to whole seconds in `HH:MM:SS` format in the terminal and `onboarding.log`, including when onboarding fails.
 
 **Reports retain comparison results and complete execution errors.** Read the report directory's `report.md`, `report.json`, `batch.json`, and `full.log`. A missing reference, an execution exception, an unsafe cleanup, or an empty selection is not a numerical pass. Unsafe cleanup stops the remaining batch.
 
-**HF preparation also reports each worker's progress and complete subprocess logs.** Start and completion or failure messages identify the arm, run and device, with elapsed time. After a worker exits, the console prints its `ref-<run>.stdout.log`, `ref-<run>.stderr.log` and `ref-<run>.returncode` paths under `./work/logs`, including successful workers. These files are separate from compact reference records; `DSS_CORRECTNESS_LOGDIR` overrides their root. Output remains captured until that subprocess exits; a start message alone is not evidence of continuing computation.
+**HF preparation also reports each worker's progress and complete subprocess logs.** Start and completion or failure messages identify the arm, run and device, with elapsed time. After a worker exits, the console prints its `ref-<run>.stdout.log`, `ref-<run>.stderr.log` and `ref-<run>.returncode` paths under `./work/logs`, including successful workers. These files are separate from compact reference records; `AP_CORRECTNESS_LOGDIR` overrides their root. Output remains captured until that subprocess exits; a start message alone is not evidence of continuing computation.
 
-**The LM-head diagnostic changes the workload and is not a canonical result.** It removes `fused_lm_head_token_chunk_size` from a copied in-memory config without editing the source config or spec. Compatible diagnostic reference records are still required; do not relabel canonical records.
+**The LM-head diagnostic changes the workload and is not a canonical result.** It sets `model_options["lm_head.token_chunk_size"]` to `"disabled"` in a copied in-memory config, including an existing nested `model_options["lm_head"]["token_chunk_size"]`, without editing the source config or spec. The explicit option takes precedence over legacy settings and prevents the runner from restoring the spec's chunk size. Compatible diagnostic reference records are still required; do not relabel canonical records.
 
 ```bash
 python -m arctic_platform.correctness.diagnostics list

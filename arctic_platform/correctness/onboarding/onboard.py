@@ -1048,7 +1048,7 @@ def build_spec(
     from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
     from arctic_platform.correctness.onboarding.synth_model import size_for_single_gpu
 
-    temporary = workdir if workdir is not None else correctness_workdir("dss-onboard-")
+    temporary = workdir if workdir is not None else correctness_workdir("ap-onboard-")
     temporary.mkdir(parents=True, exist_ok=True)
     if num_layers is None:
         num_layers, _ = size_for_single_gpu(source_checkpoint)

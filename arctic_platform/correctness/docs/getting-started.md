@@ -33,8 +33,8 @@ First let's create a simple config that will onboarded:
 
 ```bash
 mkdir -p ./work/configs ./work/reports ./work/logs
-export DSS_CORRECTNESS_TMPDIR="$(mktemp -d /data-fast/tmp/correctness-demo.XXXXXXXX)"
-export DSS_CORRECTNESS_LOGDIR="$PWD/work/logs/correctness-demo"
+export AP_CORRECTNESS_TMPDIR="$(mktemp -d /data-fast/tmp/correctness-demo.XXXXXXXX)"
+export AP_CORRECTNESS_LOGDIR="$PWD/work/logs/correctness-demo"
 export HF_HOME=/checkpoint/huggingface
 export HF_HUB_CACHE=/checkpoint/huggingface/hub
 python - <<'PY'
@@ -93,6 +93,8 @@ Path("./work/configs/tiny-qwen3-129m-one-h200--fp32.json").write_text(
 )
 PY
 ```
+
+**Use `AP_CORRECTNESS_*` for harness-owned environment settings.** Existing `DSS_CORRECTNESS_*` settings remain accepted as compatibility aliases; the AP setting takes precedence when both are present. Actual installed DSS gateway and worker variables retain their upstream names.
 
 All subsequent commands run from the checkout root.
 

@@ -740,6 +740,84 @@ def test_config_gpu_attention_explicit_lm_head_chunk_precedes_legacy_settings(tm
     assert load_config(path).lm_head_token_chunk_size == expected
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        None,
+        {},
+        {"lm_head.token_chunk_size": 1024},
+        {"lm_head": {"token_chunk_size": 2048, "fp32": True}},
+        {"lm_head.token_chunk_size": 1024, "lm_head": {"token_chunk_size": 2048}},
+        {"lm_head": {"token_chunk_size": "disabled"}},
+        {"attention": {"backend": "sdpa"}, "lm_head.cross_entropy": "liger"},
+    ],
+)
+def test_lm_head_diagnostic_disables_modern_options_without_mutating_source(tmp_path, options):
+    from arctic_platform.correctness.diagnostics.lm_head_chunking import without_chunked_head
+
+    path = _config_gpu_attention_write_config(tmp_path, "h200", "flash_attention_3")
+    raw = json.loads(path.read_text())
+    training = raw["training"]["ds_worker_config"]
+    training.update(
+        model_options=copy.deepcopy(options),
+        fused_lm_head_token_chunk_size=4096,
+        prime_rl={"fused_lm_head_token_chunk_size": 8192, "fused_cross_entropy": False},
+    )
+    path.write_text(json.dumps(raw))
+    source = path.read_bytes()
+    cfg = load_config(path)
+    cfg.sub_jobs.extend([copy.deepcopy(cfg.sub_job), {"job_type": "sampling", "sampling_config": {"temperature": 1}}])
+    original = copy.deepcopy(cfg)
+    changed = without_chunked_head(cfg)
+    assert cfg == original
+    assert path.read_bytes() == source
+    assert changed.lm_head_token_chunk_size is None
+    assert changed.sub_jobs[-1] == cfg.sub_jobs[-1]
+    for sub in [changed.sub_job, *changed.sub_jobs[:-1]]:
+        modified = sub["training_config"]
+        assert modified["prime_rl"] == cfg.training["prime_rl"]
+        assert modified["fused_lm_head_token_chunk_size"] == 4096
+        updated = copy.deepcopy(options) or {}
+        updated["lm_head.token_chunk_size"] = "disabled"
+        if isinstance(updated.get("lm_head"), dict):
+            updated["lm_head"]["token_chunk_size"] = "disabled"
+        assert modified["model_options"] == updated
+    payload = build_payload(changed.training, changed.model_name, 42, lm_head_token_chunk_size=2048)
+    assert payload["training_config"]["model_options"]["lm_head.token_chunk_size"] == "disabled"
+
+
+@pytest.mark.parametrize(
+    "name", ["TMPDIR", "LOGDIR", "RUNTIME_ADMISSION", "SSH_KNOWN_HOSTS", "SSH_PORT", "GATEWAY_OWNER"]
+)
+@pytest.mark.parametrize("current", [None, "", "ap-setting"])
+def test_ap_correctness_environment_accepts_legacy_alias_with_ap_precedence(monkeypatch, name, current):
+    from arctic_platform.correctness.harness.storage import correctness_environment
+
+    key = "AP_CORRECTNESS_" + name
+    monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("DSS_CORRECTNESS_" + name, raising=False)
+    assert correctness_environment(key, "default") == "default"
+    monkeypatch.setenv("DSS_CORRECTNESS_" + name, "legacy-setting")
+    if current is not None:
+        monkeypatch.setenv(key, current)
+    assert correctness_environment(key, "default") == ("legacy-setting" if current is None else current)
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        ([b"AP_CORRECTNESS_GATEWAY_OWNER=token"], True),
+        ([b"DSS_CORRECTNESS_GATEWAY_OWNER=token"], True),
+        ([b"DSS_CORRECTNESS_GATEWAY_OWNER=other"], False),
+        ([b"AP_CORRECTNESS_GATEWAY_OWNER=other", b"DSS_CORRECTNESS_GATEWAY_OWNER=token"], False),
+        ([b"AP_CORRECTNESS_GATEWAY_OWNER=token", b"DSS_CORRECTNESS_GATEWAY_OWNER=other"], True),
+        ([], False),
+    ],
+)
+def test_ap_gateway_owner_matches_legacy_records_without_overriding_ap(environment, expected):
+    assert ap_driver._gateway_owner_matches(environment, "token") is expected
+
+
 def test_config_gpu_attention_config_checksum_is_canonical_and_tracks_training_behavior(tmp_path: Path) -> None:
     path = _config_gpu_attention_write_config(tmp_path, "h200", "flash_attention_3", n_gpus=4)
     first = config_checksum(load_config(path))
@@ -3831,7 +3909,7 @@ def test_onboarding_total_runtime_is_last_and_retained_in_console_log(tmp_path, 
     from arctic_platform.correctness.onboarding import onboard
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
+    monkeypatch.delenv("AP_CORRECTNESS_LOGDIR", raising=False)
     ticks = iter([100.0, 167.01])
     monkeypatch.setattr(onboard.time, "monotonic", lambda: next(ticks))
 
@@ -3852,7 +3930,7 @@ def test_onboarding_total_runtime_is_last_and_retained_in_console_log(tmp_path, 
         assert banner in (args._diagnostics_dir / "onboarding.log").read_text()
     assert captured.out.splitlines()[-1] == "Total run time: 00:01:08"
     assert (args._diagnostics_dir / "onboarding.log").read_text().splitlines()[-1] == "Total run time: 00:01:08"
-    assert "DSS_CORRECTNESS_LOGDIR" not in os.environ
+    assert "AP_CORRECTNESS_LOGDIR" not in os.environ
 
 
 def test_onboarding_failure_banner_preserves_diagnostic_case_and_spacing(capsys):
@@ -3869,15 +3947,15 @@ def test_onboarding_failure_banner_preserves_diagnostic_case_and_spacing(capsys)
 @pytest.mark.parametrize("destination", ["workspace", "environment", "explicit"])
 def test_regression_failure_logs_use_durable_report_directory(tmp_path, monkeypatch, destination):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
+    monkeypatch.delenv("AP_CORRECTNESS_LOGDIR", raising=False)
     root = tmp_path / "work" / "logs"
     options = api.RunOptions()
     if destination == "environment":
         root = tmp_path / "retained-logs"
-        monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(root))
+        monkeypatch.setenv("AP_CORRECTNESS_LOGDIR", str(root))
     elif destination == "explicit":
         root = tmp_path / "explicit-report"
-        monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(tmp_path / "unused-logs"))
+        monkeypatch.setenv("AP_CORRECTNESS_LOGDIR", str(tmp_path / "unused-logs"))
         options = api.RunOptions(out=root)
     _operator_api_fake_batches(monkeypatch, [RuntimeError("synthetic target failure")])
     result = api.run(
@@ -3899,12 +3977,12 @@ def test_regression_failure_logs_use_durable_report_directory(tmp_path, monkeypa
 @pytest.mark.parametrize("destination", ["workspace", "environment", "explicit"])
 def test_compatibility_runner_uses_durable_report_directory_before_backend(tmp_path, monkeypatch, destination):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
+    monkeypatch.delenv("AP_CORRECTNESS_LOGDIR", raising=False)
     root = tmp_path / "work" / "logs"
     args = execution.parse_args(["run", "--config", _operator_api_CONFIG])
     if destination == "environment":
         root = tmp_path / "retained-logs"
-        monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(root))
+        monkeypatch.setenv("AP_CORRECTNESS_LOGDIR", str(root))
     elif destination == "explicit":
         root = tmp_path / "explicit-report"
         args.out = root
@@ -3926,7 +4004,7 @@ def test_regression_help_describes_durable_logs_and_untracked_reference_records(
         execution.parse_args(["run", "--help"])
     assert exc.value.code == 0
     help_text = capsys.readouterr().out
-    assert "./work/logs" in help_text and "DSS_CORRECTNESS_LOGDIR" in help_text
+    assert "./work/logs" in help_text and "AP_CORRECTNESS_LOGDIR" in help_text
     assert "Git-tracked prepared HF records" not in help_text
     assert "default a unique directory under /data-fast/tmp" not in help_text
 
@@ -4061,7 +4139,7 @@ def test_operator_api_parse_flags_is_shared_with_operator_command():
 
 @pytest.mark.usefixtures("_operator_api_catalog")
 def test_operator_api_static_guide_is_unchanged_by_run_and_onboarding(tmp_path, monkeypatch):
-    monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("AP_CORRECTNESS_LOGDIR", str(tmp_path / "logs"))
     guide = api.PACKAGE_DIR / "docs" / "running-tests.md"
     before = guide.read_bytes()
     monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **k: 128)
@@ -4369,9 +4447,9 @@ def test_workdir_root_correctness_workdir_prefers_data_fast_over_unsafe_tmpdir(
     monkeypatch.setattr(workdir, "_DATA_FAST_TMPDIR", data_fast_tmp)
     monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", data_fast_tmp.parent)
     monkeypatch.setenv("TMPDIR", "/code/users/stas/ap3tmp")
-    created = workdir.correctness_workdir("dss-correctness-")
+    created = workdir.correctness_workdir("ap-correctness-")
     assert created.parent == data_fast_tmp
-    assert created.name.startswith("dss-correctness-")
+    assert created.name.startswith("ap-correctness-")
 
 
 def test_workdir_root_correctness_workdir_fails_closed_without_data_fast(
@@ -4383,7 +4461,7 @@ def test_workdir_root_correctness_workdir_fails_closed_without_data_fast(
     monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", missing_root)
     monkeypatch.setenv("TMPDIR", "/code/users/stas/ap3tmp")
     with pytest.raises(ValueError, match="existing /data-fast"):
-        workdir.correctness_workdir("dss-correctness-")
+        workdir.correctness_workdir("ap-correctness-")
     assert not missing_root.exists()
 
 
@@ -4398,7 +4476,7 @@ def test_workdir_root_correctness_workdir_honors_safe_explicit_override(
     monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", data_fast)
     monkeypatch.setenv("TMPDIR", "/code/users/stas/ap3tmp")
     monkeypatch.setenv(CORRECTNESS_TMPDIR_ENV, str(override))
-    created = workdir.correctness_workdir("dss-correctness-")
+    created = workdir.correctness_workdir("ap-correctness-")
     assert created.parent == override
 
 
@@ -4408,7 +4486,7 @@ def test_workdir_root_correctness_workdir_rejects_unsafe_explicit_override(
     _workdir_root_reset_tmp_env(monkeypatch)
     monkeypatch.setenv(CORRECTNESS_TMPDIR_ENV, "/code/users/stas/ap3tmp")
     with pytest.raises(ValueError, match=CORRECTNESS_TMPDIR_ENV):
-        workdir.correctness_workdir("dss-correctness-")
+        workdir.correctness_workdir("ap-correctness-")
 
 
 @pytest.fixture
@@ -5488,7 +5566,7 @@ def test_native_gateway_command_preserves_owned_launch_and_teardown(
         str(state.out / "hostfile"),
     ]
     assert state.start.call_args.kwargs["start_new_session"] is True
-    assert state.start.call_args.kwargs["env"]["DSS_CORRECTNESS_GATEWAY_OWNER"]
+    assert state.start.call_args.kwargs["env"]["AP_CORRECTNESS_GATEWAY_OWNER"]
     state.process.terminate.assert_called_once()
     state.process.wait.assert_called_once_with(timeout=120)
 
@@ -5874,7 +5952,7 @@ def _owned_gateway_descendant(tmp_path, monkeypatch):
     child.mkdir()
     fields = ["S", "1", "12345", "12345"] + ["0"] * 15 + ["101"]
     (child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(fields))
-    (child / "environ").write_bytes(b"DSS_CORRECTNESS_GATEWAY_OWNER=owned-token\0")
+    (child / "environ").write_bytes(b"AP_CORRECTNESS_GATEWAY_OWNER=owned-token\0")
     return SimpleNamespace(root=root, gateway=gateway, child=child, fields=fields)
 
 
@@ -5882,7 +5960,7 @@ def _owned_gateway_descendant(tmp_path, monkeypatch):
 def test_owned_gateway_descendants_reject_unverified_members(_owned_gateway_descendant, monkeypatch, drift):
     state = _owned_gateway_descendant
     if drift == "token":
-        (state.child / "environ").write_bytes(b"DSS_CORRECTNESS_GATEWAY_OWNER=other-token\0")
+        (state.child / "environ").write_bytes(b"AP_CORRECTNESS_GATEWAY_OWNER=other-token\0")
     elif drift in {"group", "birth"}:
         state.fields[2 if drift == "group" else 19] = "999" if drift == "group" else "99"
         (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(state.fields))
@@ -5956,13 +6034,13 @@ def test_owned_gateway_real_unverified_descendant_natural_exit_is_waited_for(tmp
     gateway_script = (
         "import os,subprocess,sys,time; "
         f"subprocess.Popen([sys.executable, '-c', {child_script!r}], "
-        "env={key:value for key,value in os.environ.items() if key != 'DSS_CORRECTNESS_GATEWAY_OWNER'}); "
+        "env={key:value for key,value in os.environ.items() if key != 'AP_CORRECTNESS_GATEWAY_OWNER'}); "
         "time.sleep(300)"
     )
     leader = subprocess.Popen(
         [sys.executable, "-c", gateway_script],
         start_new_session=True,
-        env={**os.environ, "DSS_CORRECTNESS_GATEWAY_OWNER": "owned-token"},
+        env={**os.environ, "AP_CORRECTNESS_GATEWAY_OWNER": "owned-token"},
     )
     gateway = ap_driver._gateway_process_identity(leader.pid)
     child = None
@@ -5994,7 +6072,7 @@ def test_owned_gateway_descendants_ignore_other_sessions_and_zombies(_owned_gate
         fields = state.fields.copy()
         fields[field] = value
         (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(fields))
-        (state.child / "environ").write_bytes(b"DSS_CORRECTNESS_GATEWAY_OWNER=another-command\0")
+        (state.child / "environ").write_bytes(b"AP_CORRECTNESS_GATEWAY_OWNER=another-command\0")
         assert not ap_driver._owned_gateway_descendants(state.gateway, "owned-token")
 
 
@@ -6266,7 +6344,7 @@ def test_owned_gateway_preserves_owner_environment_for_process_titles(
     ):
         environment = state.start.call_args.kwargs["env"]
         assert environment["SPT_NOENV"] == "1"
-        assert environment["DSS_CORRECTNESS_GATEWAY_OWNER"]
+        assert environment["AP_CORRECTNESS_GATEWAY_OWNER"]
         assert os.environ.get("SPT_NOENV") == inherited
     assert os.environ.get("SPT_NOENV") == inherited
 
@@ -6451,7 +6529,7 @@ def _stale_gateway_record(tmp_path, monkeypatch):
         Path,
         "read_bytes",
         lambda file: (
-            b"DSS_CORRECTNESS_GATEWAY_OWNER=synthetic-owner-token\0"
+            b"AP_CORRECTNESS_GATEWAY_OWNER=synthetic-owner-token\0"
             if str(file) == f"/proc/{gateway['pid']}/environ"
             else read_bytes(file)
         ),
@@ -6627,7 +6705,7 @@ def test_owned_gateway_registry_records_launch_and_clears_after_cleanup(_automat
         record = json.loads(path.read_text())
         assert record["owner"]["pid"] == os.getpid()
         assert record["gateway"]["pid"] == state.process.pid
-        assert record["token"] == state.start.call_args.kwargs["env"]["DSS_CORRECTNESS_GATEWAY_OWNER"]
+        assert record["token"] == state.start.call_args.kwargs["env"]["AP_CORRECTNESS_GATEWAY_OWNER"]
         assert Path(record["log"]).is_file()
     assert not path.exists()
 
@@ -6706,7 +6784,7 @@ def test_onboarding_resume_config_only_command_retries_failed_optimizer(tmp_path
         "ARCTIC_CORTEX_HOST",
         "ARCTIC_CORTEX_BASE_URL",
         "ARCTIC_CORTEX_PAT",
-        "DSS_CORRECTNESS_LOGDIR",
+        "AP_CORRECTNESS_LOGDIR",
     ):
         monkeypatch.delenv(name, raising=False)
     config_path = tmp_path / "recipe.json"
@@ -6859,12 +6937,12 @@ def test_demo_artifact_commands_stage_reusable_inputs_and_clean_only_owned_scrat
     cleanup = text[cleanup_header.end() :]
     commands = [block.split("```", 1)[0] for block in cleanup.split("```bash\n")[1:3]]
     report_dir = re.search(r"--out (\./work/reports/[a-zA-Z0-9_-]+)", text).group(1)
-    assert all("/data-fast" not in command and "DSS_CORRECTNESS_TMPDIR" not in command for command in commands)
+    assert all("/data-fast" not in command and "AP_CORRECTNESS_TMPDIR" not in command for command in commands)
     assert commands == [
         "rm ./work/configs/tiny-qwen3-129m-one-h200--fp32.json\n",
         f"rm -r ./work/logs/correctness-demo/\nrm -r {report_dir}/\n",
     ]
-    assert 'export DSS_CORRECTNESS_LOGDIR="$PWD/work/logs/correctness-demo"' in text
+    assert 'export AP_CORRECTNESS_LOGDIR="$PWD/work/logs/correctness-demo"' in text
     identifier = "tiny-qwen3-129m-standard-h200-training-full--fp32"
     placement = "tiny-qwen3-129m/standard/h200-training-full--fp32"
     config = f"arctic_platform/correctness/configs/{placement}.json"
@@ -6929,8 +7007,8 @@ def test_demo_artifact_commands_stage_reusable_inputs_and_clean_only_owned_scrat
         (scratch_path / "retained-input").symlink_to(tmp_path / config)
         env = {
             **os.environ,
-            "DSS_CORRECTNESS_TMPDIR": scratch,
-            "DSS_CORRECTNESS_LOGDIR": overrides[log_override],
+            "AP_CORRECTNESS_TMPDIR": scratch,
+            "AP_CORRECTNESS_LOGDIR": overrides[log_override],
         }
         for command in commands:
             run("bash", "-eu", "-c", command, env=env)
@@ -7117,7 +7195,7 @@ def _gateway_scratch_launch_transport(tmp_path, monkeypatch):
     hostfile = tmp_path / "hostfile"
     hostfile.write_text("synthetic-head slots=8\nsynthetic-peer slots=8\n")
     root = tmp_path / "owned-scratch"
-    monkeypatch.setenv("DSS_CORRECTNESS_TMPDIR", str(root))
+    monkeypatch.setenv("AP_CORRECTNESS_TMPDIR", str(root))
     monkeypatch.setattr(ap_driver, "_ds_ssh", lambda: "/held/runtime/ds_ssh")
     state = SimpleNamespace(damage=None, starts=[], waits=[], signals=[], live=False)
 
@@ -7226,7 +7304,7 @@ def test_gateway_scratch_launch_rejects_partial_or_unauthenticated_fanout_with_s
 def test_gateway_scratch_launch_prepares_before_gateway_and_restores_original_environment(
     tmp_path, monkeypatch, body_error
 ):
-    monkeypatch.setenv("DSS_CORRECTNESS_TMPDIR", "/data-fast/tmp/original-parent")
+    monkeypatch.setenv("AP_CORRECTNESS_TMPDIR", "/data-fast/tmp/original-parent")
     hostfile = tmp_path / "hostfile"
     hostfile.write_text("synthetic-head slots=8\n")
     monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: hostfile)
@@ -7239,7 +7317,7 @@ def test_gateway_scratch_launch_prepares_before_gateway_and_restores_original_en
 
     @contextmanager
     def launch(directory, record, hosts, *, gateway_module):
-        events.append(("launched", hosts, os.environ["DSS_CORRECTNESS_TMPDIR"]))
+        events.append(("launched", hosts, os.environ["AP_CORRECTNESS_TMPDIR"]))
         yield "http://127.0.0.1:1"
 
     monkeypatch.setattr(ap_driver, "_launch_local_cortex_gateway", launch)
@@ -7262,7 +7340,7 @@ def test_gateway_scratch_launch_prepares_before_gateway_and_restores_original_en
             workload()
     else:
         workload()
-    assert os.environ["DSS_CORRECTNESS_TMPDIR"] == "/data-fast/tmp/original-parent"
+    assert os.environ["AP_CORRECTNESS_TMPDIR"] == "/data-fast/tmp/original-parent"
 
 
 def test_gateway_scratch_launch_failure_prevents_gateway_creation(tmp_path, monkeypatch):
@@ -7363,7 +7441,7 @@ def test_gateway_scratch_cleanup_node_boot_drift_is_retained_without_success(
 def test_gateway_scratch_cleanup_default_environment_restored_and_upstream_remains_unchanged(
     tmp_path, monkeypatch, upstream
 ):
-    monkeypatch.delenv("DSS_CORRECTNESS_TMPDIR", raising=False)
+    monkeypatch.delenv("AP_CORRECTNESS_TMPDIR", raising=False)
     hostfile = tmp_path / "hostfile"
     hostfile.write_text("synthetic-head slots=8\n")
     monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: hostfile)
@@ -7376,7 +7454,7 @@ def test_gateway_scratch_cleanup_default_environment_restored_and_upstream_remai
 
     @contextmanager
     def launch(*args, **kwargs):
-        assert os.environ.get("DSS_CORRECTNESS_TMPDIR") == (None if upstream else "/data-fast/tmp/owned-default")
+        assert os.environ.get("AP_CORRECTNESS_TMPDIR") == (None if upstream else "/data-fast/tmp/owned-default")
         events.append("launched")
         yield "http://127.0.0.1:1"
 
@@ -7386,7 +7464,7 @@ def test_gateway_scratch_cleanup_default_environment_restored_and_upstream_remai
     with pytest.raises(RuntimeError, match="original workload"):
         with ap_driver._started_local_cortex_gateway(tmp_path / "gateway", tmp_path / "owner.json", **options):
             raise RuntimeError("original workload")
-    assert "DSS_CORRECTNESS_TMPDIR" not in os.environ
+    assert "AP_CORRECTNESS_TMPDIR" not in os.environ
     assert events == (["launched"] if upstream else ["prepared", "launched"])
 
 
@@ -7704,7 +7782,7 @@ def gateway_scratch_peer_transport(tmp_path, monkeypatch, gateway_scratch_peer_r
     directory.mkdir()
     hostfile = tmp_path / "head-hostfile"
     hostfile.write_bytes(base64.b64decode(request["hostfile_base64"]))
-    monkeypatch.setenv("DSS_CORRECTNESS_TMPDIR", request["path"])
+    monkeypatch.setenv("AP_CORRECTNESS_TMPDIR", request["path"])
     monkeypatch.setattr(ap_driver, "_ds_ssh", lambda: "/synthetic/ds_ssh")
     state = SimpleNamespace(
         damage=None,
@@ -7980,7 +8058,7 @@ def test_gateway_scratch_peer_started_gateway_passes_mapping_only_to_preparation
     hostfile = tmp_path / "hostfile"
     hostfile.write_text("synthetic-peer slots=8\n")
     monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: hostfile)
-    monkeypatch.setenv("DSS_CORRECTNESS_TMPDIR", "/data-fast/tmp/original-peer-parent")
+    monkeypatch.setenv("AP_CORRECTNESS_TMPDIR", "/data-fast/tmp/original-peer-parent")
     members = gateway_scratch_peer_request["allocation_members"]
     events = []
     options = {"allocation_members": members} if explicit else {}
@@ -7995,7 +8073,7 @@ def test_gateway_scratch_peer_started_gateway_passes_mapping_only_to_preparation
     @contextmanager
     def launch(directory, record, hosts, *, gateway_module):
         assert hosts == hostfile
-        assert os.environ["DSS_CORRECTNESS_TMPDIR"] == str(tmp_path / "prepared-peer-parent")
+        assert os.environ["AP_CORRECTNESS_TMPDIR"] == str(tmp_path / "prepared-peer-parent")
         events.append("launch")
         try:
             yield "http://synthetic.invalid:1"
@@ -8024,7 +8102,7 @@ def test_gateway_scratch_peer_started_gateway_passes_mapping_only_to_preparation
     else:
         workload()
     assert events == ["prepare", "launch", "close"]
-    assert os.environ["DSS_CORRECTNESS_TMPDIR"] == "/data-fast/tmp/original-peer-parent"
+    assert os.environ["AP_CORRECTNESS_TMPDIR"] == "/data-fast/tmp/original-peer-parent"
 
 
 # Reviewed subset specifications and explicit operator case selection.
@@ -8246,7 +8324,7 @@ def test_onboarding_reports_each_attempt_time_and_separates_shared_preparation(
 ):
     state = _onboarding_prerequisites
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
+    monkeypatch.delenv("AP_CORRECTNESS_LOGDIR", raising=False)
     clock = [100.0]
     monkeypatch.setattr(state.onboard.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(state.onboard, "run", state.onboard._onboard_configuration)
@@ -8351,7 +8429,7 @@ def test_onboarding_final_timing_survives_interruption_or_unsafe_cleanup(tmp_pat
     from arctic_platform.correctness.onboarding import onboard
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
+    monkeypatch.delenv("AP_CORRECTNESS_LOGDIR", raising=False)
     clock = [100.0]
     monkeypatch.setattr(onboard.time, "monotonic", lambda: clock[0])
 
@@ -21302,7 +21380,7 @@ def test_native_reserved_listener_zone_head_handoff_and_worker_isolation(
                 raise failure
         else:
             assert argv[:4] == ["exec", "setsid", "--wait", "env"]
-            owner = argv[4].removeprefix("DSS_CORRECTNESS_GATEWAY_OWNER=")
+            owner = argv[4].removeprefix("AP_CORRECTNESS_GATEWAY_OWNER=")
             assert len(owner) == 32 and all(character in "0123456789abcdef" for character in owner)
             assert argv[5:] == ["SPT_NOENV=1", sys.executable, "-m", control.native._MODULE, "worker"]
             assert listener.closed and kwargs == {"stdout": "worker-log", "stdin": subprocess.PIPE}
@@ -23634,7 +23712,7 @@ def test_owned_worker_lease_new_zone_launch_and_primary_failure(owned_worker_lea
             assert kwargs == {"pass_fds": (43,)}
             return head_process
         assert argv[:4] == ["exec", "setsid", "--wait", "env"]
-        assert argv[4].startswith("DSS_CORRECTNESS_GATEWAY_OWNER=") and len(argv[4].split("=", 1)[1]) == 32
+        assert argv[4].startswith("AP_CORRECTNESS_GATEWAY_OWNER=") and len(argv[4].split("=", 1)[1]) == 32
         assert argv[5:10] == ["SPT_NOENV=1", sys.executable, "-m", case.native._MODULE, "worker"]
         assert argv[10:] == ["--zone-id", "owned-zone", "--server-url", "owned-head:1234"]
         assert kwargs == {"stdin": subprocess.PIPE, "stdout": "retained-log"}
@@ -23828,7 +23906,7 @@ def test_owned_worker_session_cleanup_new_waits_for_descendants(monkeypatch, pri
     events = []
     worker = object()
     primary = RuntimeError("worker primary")
-    monkeypatch.setenv("DSS_CORRECTNESS_GATEWAY_OWNER", token)
+    monkeypatch.setenv("AP_CORRECTNESS_GATEWAY_OWNER", token)
     monkeypatch.setenv("SPT_NOENV", "1")
     monkeypatch.setattr(native_lora.os, "getsid", lambda pid: os.getpid())
     monkeypatch.setattr(ap_driver, "_gateway_process_identity", lambda pid: identity)
@@ -23859,7 +23937,7 @@ def test_owned_worker_session_cleanup_new_retains_cleanup_failure(monkeypatch, p
     from arctic_platform.correctness.harness import gateway as ap_driver
     from arctic_platform.correctness.harness import lora as native_lora
 
-    monkeypatch.setenv("DSS_CORRECTNESS_GATEWAY_OWNER", "a" * 32)
+    monkeypatch.setenv("AP_CORRECTNESS_GATEWAY_OWNER", "a" * 32)
     monkeypatch.setenv("SPT_NOENV", "1")
     monkeypatch.setattr(native_lora.os, "getsid", lambda pid: os.getpid())
     monkeypatch.setattr(
@@ -23893,7 +23971,7 @@ def test_owned_worker_session_cleanup_new_rejects_unowned_launch(monkeypatch, in
     from arctic_platform.correctness.harness import gateway as ap_driver
     from arctic_platform.correctness.harness import lora as native_lora
 
-    monkeypatch.setenv("DSS_CORRECTNESS_GATEWAY_OWNER", "a" * 32 if invalid != "token" else "")
+    monkeypatch.setenv("AP_CORRECTNESS_GATEWAY_OWNER", "a" * 32 if invalid != "token" else "")
     monkeypatch.setenv("SPT_NOENV", "1" if invalid != "retitle" else "0")
     monkeypatch.setattr(native_lora.os, "getsid", lambda pid: os.getpid() + (invalid == "session"))
     monkeypatch.setattr(
@@ -23938,7 +24016,7 @@ def test_owned_worker_session_cleanup_new_real_retitled_child_exits_before_worke
             "setsid",
             "--wait",
             "env",
-            "DSS_CORRECTNESS_GATEWAY_OWNER=" + "b" * 32,
+            "AP_CORRECTNESS_GATEWAY_OWNER=" + "b" * 32,
             "SPT_NOENV=1",
             sys.executable,
             "-c",
@@ -31357,7 +31435,7 @@ def test_onboarding_storage_optimizer_calibration_allocates_fresh_root_and_clean
 
     output = _onboarding_storage_fast_root / "output"
     output.mkdir()
-    prior = _onboarding_storage_fast_root / "dss-correctness-calibration" / "test"
+    prior = _onboarding_storage_fast_root / "ap-correctness-calibration" / "test"
     prior.mkdir(parents=True)
     sentinel = prior / "sentinel"
     sentinel.write_text("preexisting")
@@ -31710,7 +31788,7 @@ def test_local_cortex_reference_publication_runs_after_frozen_gate_before_valida
         assert keywords["select"] == ["single-step-grads"]
         assert keywords["reference_records_dir"] == state.args.reference_records_dir
         assert keywords["reference_token_budget"] == state.args.reference_token_budget
-        assert keywords["workdir"] == state.args.output_dir
+        assert keywords["workdir"] == state.args.output_dir / f"gpu{state.cfg.n_gpus}"
         assert "local_gateway_full_model" not in keywords
     else:
         assert state.calls == []
@@ -32811,7 +32889,7 @@ def test_optimizer_state_check_compare_optimizer_artifacts_retains_unmatched_tar
         tmp_path / "reference-moe", {"model.layer.weight": _optimizer_state_check_states(torch.zeros(2))}
     )
     ap = _optimizer_state_check_write_artifacts(
-        tmp_path / "dss-moe",
+        tmp_path / "ap-moe",
         {
             "module.layer.weight": _optimizer_state_check_states(torch.zeros(2)),
             "module.visual.unused.weight": _optimizer_state_check_states(torch.zeros(2)),
@@ -34705,6 +34783,9 @@ _SELFTEST_GROUPS = {
         "test_config_gpu_attention_effective_training_applies_nested_prime_rl_overrides",
         "test_config_gpu_attention_disabled_lm_head_chunk_resolves_to_none",
         "test_config_gpu_attention_explicit_lm_head_chunk_precedes_legacy_settings",
+        "test_lm_head_diagnostic_disables_modern_options_without_mutating_source",
+        "test_ap_correctness_environment_accepts_legacy_alias_with_ap_precedence",
+        "test_ap_gateway_owner_matches_legacy_records_without_overriding_ap",
         "test_config_gpu_attention_config_checksum_is_canonical_and_tracks_training_behavior",
         "test_config_gpu_attention_optimizer_dtype_follows_explicit_deepspeed_state_precision",
         "test_config_gpu_attention_optimizer_dtype_rejects_mixed_master_and_state_precision",

@@ -50,10 +50,16 @@ from typing import Tuple
 
 # Storage
 
-CORRECTNESS_TMPDIR_ENV = "DSS_CORRECTNESS_TMPDIR"
-CORRECTNESS_LOGDIR_ENV = "DSS_CORRECTNESS_LOGDIR"
+CORRECTNESS_TMPDIR_ENV = "AP_CORRECTNESS_TMPDIR"
+CORRECTNESS_LOGDIR_ENV = "AP_CORRECTNESS_LOGDIR"
 _DATA_FAST_ROOT = Path("/data-fast")
 _DATA_FAST_TMPDIR = Path("/data-fast/tmp")
+
+
+def correctness_environment(name: str, default: str | None = None) -> str | None:
+    """Prefer the AP setting while accepting the previous harness-owned DSS alias."""
+    legacy = "DSS_CORRECTNESS_" + name.removeprefix("AP_CORRECTNESS_")
+    return os.environ.get(name, os.environ.get(legacy, default))
 
 
 def require_data_fast_path(path: str | Path, *, label: str = "correctness storage path") -> Path:
@@ -73,7 +79,7 @@ def correctness_workdir(prefix: str) -> Path:
     """Create a heavyweight correctness workdir exclusively on fast storage."""
     if not isinstance(prefix, str) or os.sep in prefix or (os.altsep and os.altsep in prefix):
         raise ValueError("correctness workdir prefix must not contain a directory path")
-    override = os.environ.get(CORRECTNESS_TMPDIR_ENV)
+    override = correctness_environment(CORRECTNESS_TMPDIR_ENV)
     root = require_data_fast_path(
         override if override else _DATA_FAST_TMPDIR,
         label=CORRECTNESS_TMPDIR_ENV if override else "correctness workdir",
@@ -84,7 +90,7 @@ def correctness_workdir(prefix: str) -> Path:
 
 def correctness_logdir(prefix: str) -> Path:
     """Keep small, shareable diagnostics in the operator's current workspace."""
-    root = Path(os.environ.get(CORRECTNESS_LOGDIR_ENV) or Path.cwd() / "work" / "logs").resolve()
+    root = Path(correctness_environment(CORRECTNESS_LOGDIR_ENV) or Path.cwd() / "work" / "logs").resolve()
     root.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix=prefix, dir=root))
 

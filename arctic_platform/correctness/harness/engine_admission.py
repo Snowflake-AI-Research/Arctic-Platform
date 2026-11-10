@@ -36,7 +36,9 @@ from copy import deepcopy
 from functools import wraps
 from pathlib import Path
 
-RUNTIME_ADMISSION_ENV = "DSS_CORRECTNESS_RUNTIME_ADMISSION"
+from arctic_platform.correctness.harness.storage import correctness_environment
+
+RUNTIME_ADMISSION_ENV = "AP_CORRECTNESS_RUNTIME_ADMISSION"
 RUNTIME_ADMISSION_KEY = "correctness_runtime_admission"
 _RUNTIME_MODULES = (
     "dss.ray_dss.models",
@@ -157,8 +159,8 @@ def _runtime_admission_receipt(request: dict) -> dict:
 def _existing_allocation_transport() -> dict:
     from .inference import _held_ssh_trust
 
-    trust = Path(os.environ.get("DSS_CORRECTNESS_SSH_KNOWN_HOSTS", str(Path.home() / ".ssh/known_hosts")))
-    port = int(os.environ.get("DSS_CORRECTNESS_SSH_PORT", "22"))
+    trust = Path(correctness_environment("AP_CORRECTNESS_SSH_KNOWN_HOSTS", str(Path.home() / ".ssh/known_hosts")))
+    port = int(correctness_environment("AP_CORRECTNESS_SSH_PORT", "22"))
     transport = {
         "port": port,
         "known_hosts": str(trust),
@@ -425,7 +427,8 @@ def verify_final_runtime_request(cfg: dict, admission: dict, world_size: int, sp
 @contextlib.contextmanager
 def gateway_runtime_scope(gateway, hostfile: Path):
     """Bind final child requests before the gateway sends them to the zone."""
-    allocation = json.loads(os.environ[RUNTIME_ADMISSION_ENV]) if RUNTIME_ADMISSION_ENV in os.environ else None
+    raw_allocation = correctness_environment(RUNTIME_ADMISSION_ENV)
+    allocation = json.loads(raw_allocation) if raw_allocation is not None else None
     if allocation is None:
         yield
         return
