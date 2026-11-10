@@ -128,11 +128,10 @@ class ArcticTrainingClient:
         # Padded response width (== configured max_completion_length == server ds_worker_config.response_len).
         # Zorro emits verl-style structured [B, max_prompt_len + response_len] batches, so this must be set.
         self.response_len = response_len
-        # Zorro-group load balancer: server reorgs the global batch across DP workers (reorg_global_batch) so
-        # same-prompt rollouts land together for better dedup, then restore_batch_order undoes it before the
-        # response. EXPERIMENTAL/off by default here: reorg's bin-packer assumes a verl-style global batch that
-        # divides evenly into world_size bins with fittable prompt groups; TRL's per-forward_backward microbatch
-        # does not guarantee that, so it raises "shouldn't reach here". Opt in only for compatible batch shapes.
+        # Off by default. The server ignores load_balancer and balances unless
+        # balance_batch is false. TRL microbatches are not guaranteed to divide
+        # into equal rank bins, so the default keeps arrival order. Opt in only
+        # when every prompt group fits a rank.
         self.zorro_load_balancer = zorro_load_balancer
         if zorro_train_enable:
             if not server_side_loss:
@@ -359,8 +358,8 @@ class ArcticTrainingClient:
             **self._meta(calculate_entropy=True),
             "max_prompt_len": layout["max_prompt_len"],
             "max_response_len": self.response_len,
-            # reorg same-prompt rollouts across DP workers for better dedup (undone by restore_batch_order).
-            "load_balancer": self.zorro_load_balancer,
+            # False keeps arrival order. True packs prompt groups across ranks.
+            "balance_batch": self.zorro_load_balancer,
             "epsilon_low": ing["epsilon_low"],
             "epsilon_high": ing["epsilon_high"],
             "batch_num_tokens": batch_num_tokens,
@@ -530,13 +529,13 @@ def _to_server_bs(shifted: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor
 
 
 def _assert_uniform_prompt_groups(prompts_2d: torch.Tensor, rollout_n: int) -> None:
-    """Fail fast when the load-balancer batch holds ragged prompt groups.
+    """Fail fast when a balanced ZoRRo batch holds ragged prompt groups.
 
-    ZoRRo's ``load_balancer`` (``reorg_global_batch``) packs *atomic* prompt groups into ``world_size`` bins and
-    assumes every group has exactly ``rollout_n`` rollouts. TRL's async buffer drops *individual* stale samples
-    (``RolloutQueueDataset``), so a fixed-count micro-batch can straddle group boundaries (e.g. sizes ``8,8,7,7,2``),
-    which the server bin-packer rejects with an opaque ``"shouldn't reach here"``. Prompts are left-padded, so a
-    group's rows are byte-identical; group by row identity and require every group to have ``rollout_n`` members.
+    ``balance_batch`` true packs whole prompt groups into rank bins and assumes
+    every group has exactly ``rollout_n`` rollouts. TRL's async buffer drops
+    individual stale samples, so a fixed-count micro-batch can straddle group
+    boundaries. Prompts are left-padded, so a group's rows are byte-identical;
+    group by row identity and require every group to have ``rollout_n`` members.
     """
     from collections import Counter
 
@@ -545,7 +544,7 @@ def _assert_uniform_prompt_groups(prompts_2d: torch.Tensor, rollout_n: int) -> N
         counts = sorted(sizes.values(), reverse=True)
         raise ValueError(
             f"zorro_load_balancer: forward batch has ragged prompt groups (sizes={counts}); every group must have "
-            f"exactly rollout_n={rollout_n} rollouts so reorg_global_batch can tile whole groups across DP workers. "
+            f"exactly rollout_n={rollout_n} rollouts so balance_batch can keep whole groups on one rank. "
             "This usually means the async rollout buffer dropped stale samples mid-group. Fixes: raise max_staleness "
             "so groups aren't split, keep per_device_bsz a multiple of rollout_n*training_gpus, or disable "
             "zorro_load_balancer."
