@@ -274,7 +274,8 @@ def test_zorro_forward_backward_wiring():
     assert meta["max_response_len"] == RESPONSE_LEN
     assert meta["return_fwd_batch"] is True
     assert meta["zorro_train_enable"] is True
-    assert meta["load_balancer"] is False  # experimental; off by default (verl-only bin-packing assumption)
+    assert meta["balance_batch"] is False
+    assert "load_balancer" not in meta
     assert payload["processing"]["loss_fn"] == "arctic_platform.integrations.trl.loss.trl_grpo"
 
     # Outputs mapped back to TRL's shifted [1, T-1] frame.
@@ -286,7 +287,7 @@ def test_zorro_forward_backward_wiring():
 
 def test_zorro_load_balancer_opt_in():
     # Fixture has two uniform groups of 2 (seq0/seq1 share a prompt, seq2/seq3 share a prompt), so rollout_n=2 passes
-    # the uniform-group fail-fast and the load_balancer flag reaches the wire.
+    # the uniform-group fail-fast and balance_batch true reaches the wire.
     adapter = ArcticTrainingClient(
         client=_RecordingClient(torch.zeros(4, 7), torch.zeros(4, 7), 0.0),
         server_side_loss=True,
@@ -301,7 +302,8 @@ def test_zorro_load_balancer_opt_in():
         PACKED_COMPLETION_MASK,
         **_loss_kwargs(torch.zeros(1, 18), torch.zeros(1, 18), torch.zeros(1, 18), torch.tensor(9.0)),
     )
-    assert adapter.client.last_payload["meta"]["load_balancer"] is True
+    assert adapter.client.last_payload["meta"]["balance_batch"] is True
+    assert "load_balancer" not in adapter.client.last_payload["meta"]
 
 
 # Ragged groups for the load-balancer fail-fast: group [5,6,7] has 2 rollouts but group [1,2] has only 1 (a stale
@@ -353,7 +355,7 @@ def test_zorro_load_balancer_off_allows_ragged_groups():
         RAGGED_COMPLETION_MASK,
         **_loss_kwargs(zeros, zeros, zeros, torch.tensor(6.0)),
     )
-    assert adapter.client.last_payload["meta"]["load_balancer"] is False
+    assert adapter.client.last_payload["meta"]["balance_batch"] is False
 
 
 def test_zorro_requires_server_side_loss_and_response_len():
