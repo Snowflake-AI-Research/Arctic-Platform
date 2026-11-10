@@ -1,0 +1,19 @@
+{
+  "name": "gpt-oss-120b-long-full",
+  "description": "openai/gpt-oss-120b, TP=8, 1 replica(s) on 8 GPU(s); catalog gpt-oss-120b/long/h200-inference-full.json",
+  "sub_job": {
+    "job_type": "sampling",
+    "model_name": "openai/gpt-oss-120b",
+    "dtype": "bfloat16",
+    "seed": 42,
+    "inference_config": {
+      "max_seq_len": 131072,
+      "n_gpus": 8,
+      "vllm_config": {
+        "tensor_parallel_size": 8,
+        "kv_cache_dtype": "fp8",
+        "gpu_memory_utilization": 0.8
+      }
+    }
+  }
+}

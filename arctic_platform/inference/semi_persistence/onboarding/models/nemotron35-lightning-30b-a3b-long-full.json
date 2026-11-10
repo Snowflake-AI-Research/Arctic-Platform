@@ -1,0 +1,18 @@
+{
+  "name": "nemotron35-lightning-30b-a3b-long-full",
+  "description": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16, TP=8, 1 replica(s) on 8 GPU(s); catalog nvidia-nemotron-3.5-lightning-30b-a3b-bf16/long/h200-inference-full.json",
+  "sub_job": {
+    "job_type": "sampling",
+    "model_name": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+    "dtype": "bfloat16",
+    "seed": 42,
+    "inference_config": {
+      "n_gpus": 8,
+      "max_seq_len": 262144,
+      "vllm_config": {
+        "tensor_parallel_size": 8,
+        "gpu_memory_utilization": 0.8
+      }
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "qwen38-flash-next-long-full",
+  "description": "Qwen/Qwen3.8-Flash-Next, TP=8, 1 replica(s) on 8 GPU(s); catalog qwen3.8-flash-next/long/h200-inference-full.json",
+  "sub_job": {
+    "job_type": "sampling",
+    "model_name": "Qwen/Qwen3.8-Flash-Next",
+    "dtype": "bfloat16",
+    "seed": 42,
+    "inference_config": {
+      "n_gpus": 8,
+      "max_seq_len": 262144,
+      "vllm_config": {
+        "tensor_parallel_size": 8,
+        "gpu_memory_utilization": 0.9,
+        "max_num_seqs": 16,
+        "distributed_executor_backend": "mp",
+        "enable_chunked_prefill": true,
+        "max_num_batched_tokens": 8192,
+        "enforce_eager": false,
+        "enable_return_routed_experts": true,
+        "enable_prefix_caching": true,
+        "gdn_prefill_backend": "triton",
+        "reasoning_parser": "qwen3",
+        "extra_engine_kwargs": {
+          "disable_custom_all_reduce": true
+        }
+      },
+      "router_replay": {
+        "enabled": true,
+        "max_cache_bytes": 17179869184
+      }
+    }
+  }
+}
