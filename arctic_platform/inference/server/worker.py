@@ -739,11 +739,12 @@ def _media_hashes(
     ``ProcessorInputs.get_mm_hashes`` (vllm/multimodal/processing/inputs.py,
     v0.32.0, lines 34-109) with vLLM's own ``MultiModalHasher`` and the engine's
     ``mm_hasher_algorithm``. Each item is hashed with ``model_id``, the item (or
-    the caller's uuid in its place) and the non-empty ``media_io_kwargs`` and
-    ``mm_processor_kwargs``, scoped to the item's modality; a caller's uuid is the
-    hash only when both are empty.
+    the caller's uuid in its place) and the non-empty ``mm_processor_kwargs``,
+    scoped to the item's modality; a caller's uuid is the hash only when those are
+    empty. vLLM's other factor, ``media_io_kwargs``, is always empty here: a media
+    prompt cannot carry it (``MEDIA_PROMPT_KEYS``).
 
-    Both kwargs are the prompt's own, as vLLM's renderer hands them over
+    The kwargs are the prompt's own, as vLLM's renderer hands them over
     (vllm/renderers/base.py, v0.32.0, lines 915-921 and 950-955): the engine's
     ``mm_processor_kwargs`` are merged only when the HF processor runs and its
     ``media_io_kwargs`` only decode, so neither is a hash factor. With
@@ -760,7 +761,6 @@ def _media_hashes(
         raise ValueError(f"Model {model_config.model} does not take multi_modal_data")
     algorithm = mm_config.mm_hasher_algorithm
     processor_kwargs = prompt.get("mm_processor_kwargs") or {}
-    prompt_media_io_kwargs = prompt.get("media_io_kwargs") or {}
     synthetic_uuids = mm_config.mm_processor_cache_gb == 0 and not cache_config.enable_prefix_caching
     uuids = prompt.get("multi_modal_uuids") or {}
     hashes: dict[str, list[str]] = {}
@@ -777,8 +777,6 @@ def _media_hashes(
                 for i, uuid in enumerate(item_uuids)
             ]
         if modality in _HF_MODALITY_PROCESSOR_KWARGS:
-            modality_media_io_kwargs = prompt_media_io_kwargs.get(modality, {})
-            media_io_kwargs = {modality: modality_media_io_kwargs} if modality_media_io_kwargs else {}
             scoped_key = _HF_MODALITY_PROCESSOR_KWARGS[modality]
             mm_processor_kwargs = {
                 key: value
@@ -786,16 +784,8 @@ def _media_hashes(
                 if key not in _HF_MODALITY_PROCESSOR_KWARGS.values() or key == scoped_key
             }
         else:
-            media_io_kwargs = dict(prompt_media_io_kwargs)
             mm_processor_kwargs = dict(processor_kwargs)
-        hash_factors = {
-            key: value
-            for key, value in (
-                ("media_io_kwargs", media_io_kwargs),
-                ("mm_processor_kwargs", mm_processor_kwargs),
-            )
-            if value
-        }
+        hash_factors = {"mm_processor_kwargs": mm_processor_kwargs} if mm_processor_kwargs else {}
         hashes[modality] = [
             MultiModalHasher.hash_kwargs(
                 algorithm,
@@ -808,10 +798,6 @@ def _media_hashes(
             for item, uuid in zip(items, item_uuids)
         ]
     return hashes
-
-
-# Model types already warned about in this process for lacking placeholder ids.
-_NO_PLACEHOLDER_IDS_WARNED: set[str] = set()
 
 
 def _placeholder_ids(hf_config: Any) -> dict[str, int]:
@@ -1600,7 +1586,10 @@ class InferenceWorker(StreamingWorkerMixin):
         if media_hashes is not None:
             # RL trains on the expanded ids and keys router replay and prefix caching
             # on them and the media hashes.
-            result["prompt_token_ids"] = list(getattr(final_output, "prompt_token_ids", None) or [])
+            expanded_ids = getattr(final_output, "prompt_token_ids", None)
+            if not expanded_ids:
+                raise RuntimeError(f"vLLM returned no prompt_token_ids for media request {request_id}")
+            result["prompt_token_ids"] = list(expanded_ids)
             result["mm_hashes"] = media_hashes
         if self._return_reasoning_content:
             self._apply_reasoning_parser(result, reasoning_ended=reasoning_ended)
@@ -1654,9 +1643,8 @@ class InferenceWorker(StreamingWorkerMixin):
         engine's HF config through the model type's media spec (else the
         config's ``image_token_id`` / ``video_token_id``). A caller on another
         host can tell neither. ``{}`` before the engine is up, when media
-        prompts are unsupported, or when the model takes no media (including a
-        config its media spec rejects for lacking an id: warned once per model
-        type in this process).
+        prompts are unsupported, or when the model takes no media. Raises the
+        media spec's ``ValueError`` for a config it cannot place tokens with.
         """
         if not self.supports_media or self.llm is None:
             return {}
@@ -1664,16 +1652,7 @@ class InferenceWorker(StreamingWorkerMixin):
         mm_config = model_config.multimodal_config
         if mm_config is None:
             return {}
-        try:
-            ids = _placeholder_ids(model_config.hf_config)
-        except ValueError as exc:
-            # The model type's media spec cannot place tokens with this config:
-            # it takes no media, so a media prompt gets the caller's usual reject.
-            model_type = str(getattr(model_config.hf_config, "model_type", None))
-            if model_type not in _NO_PLACEHOLDER_IDS_WARNED:
-                _NO_PLACEHOLDER_IDS_WARNED.add(model_type)
-                logger.warning("media_modalities: model type %r takes no media: %s", model_type, exc)
-            return {}
+        ids = _placeholder_ids(model_config.hf_config)
         decodable = decodable_modalities(mm_config.media_io_kwargs)
         return {modality: ids[modality] for modality in sorted(decodable) if modality in ids}
 
