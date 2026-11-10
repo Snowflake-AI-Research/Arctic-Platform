@@ -222,9 +222,10 @@ def test_padding_does_not_suppress_the_next_router_call():
     assert report["router"]["sampled_tokens"] == pytest.approx(float(len(x)))
 
 
-def test_on_error_drops_partial_totals():
+def test_on_error_drops_partial_totals_from_the_failed_request():
     model, callback, trainer = _hooked(stride=1)
     x = torch.randn(4, DIM)
+    callback.pre_fwd_bwd(trainer)
     callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
     model.router(x)
 
@@ -236,9 +237,30 @@ def test_on_error_drops_partial_totals():
     assert report["router"]["tokens_per_expert"] == [0.0] * EXPERTS
 
 
+def test_on_error_keeps_earlier_successful_fwd_bwd_totals_in_the_same_step():
+    model, callback, trainer = _hooked(stride=1)
+    first = torch.randn(4, DIM)
+    second = torch.randn(6, DIM)
+
+    callback.pre_fwd_bwd(trainer)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(first)
+    callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+
+    callback.pre_fwd_bwd(trainer)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(second)
+    callback.on_error(trainer, "fwd_bwd", RuntimeError("second request failed"))
+
+    callback.post_step(trainer)
+    _reduce, report = callback.pending["router_stats"]
+    assert report["router"]["sampled_tokens"] == pytest.approx(float(len(first)))
+
+
 def test_on_error_during_step_keeps_completed_fwd_bwd_totals():
     model, callback, trainer = _hooked(stride=1)
     x = torch.randn(4, DIM)
+    callback.pre_fwd_bwd(trainer)
     callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
     model.router(x)
     callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
