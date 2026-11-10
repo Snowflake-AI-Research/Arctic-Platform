@@ -847,55 +847,26 @@ def _func_name(cu, func):
 
 
 def _graph_manager_holders(worker):
-    """The objects that own a {desc: torch.cuda.CUDAGraph} `graphs` dict, i.e. the
-    FULL-cudagraph managers. The dense runner's is the one that matters; a spec-decode
-    speculator carries its own and its FULL graphs bake the same CA pointers, so
-    include it too. Returns (managers, why) -- `why` explains an empty result so a log
-    can tell "V1 runner, nothing to find" apart from "V2 runner, plumbing broken".
-
-    ONLY THE V2 RUNNER HAS ONE. vLLM 0.24 picks the runner per model
-    (`gpu_worker.py:355` on `vllm_config.use_v2_model_runner`, an ARCHITECTURE
-    ALLOWLIST -- `config/vllm.py:550` DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES =
-    {Qwen3ForCausalLM, DeepseekV2ForCausalLM, Qwen2MoeForCausalLM,
-    GraniteMoeForCausalLM, LlamaForCausalLM, MistralForCausalLM}). V2
-    (`v1/worker/gpu/model_runner.py:466`) always builds a ModelCudaGraphManager; V1
-    (`v1/worker/gpu_model_runner.py`) has no decode manager at all -- its only
-    `*cudagraph_manager` is `encoder_cudagraph_manager` for multimodal encoders, and
-    its FULL graphs go through CUDAGraphWrapper, so source 1 already covers them.
-
-    So `n_managers == 0` is EXPECTED on a V1 model and is a BUG only on a V2 model.
-    Record `runner_class` in diag rather than inferring it: an empty result is
-    otherwise indistinguishable between the two, which is what made the first read
-    of the Qwen3-235B-A22B-tp4 (Qwen3MoeForCausalLM -> V1) validation run wrong.
-    `runner_class` does NOT disambiguate on its own either -- both runners name the
-    class GPUModelRunner, they differ only by module.
-
-    THE ALLOWLIST IS NOT STABLE ACROSS VLLM VERSIONS. This docstring used to list
-    GLM among the V1 models. On 0.30 GLM-5.3 TP=8 reports `n_managers: 1`, i.e. it
-    has moved to V2, so which source covers the FULL graphs moved with it. Treat
-    the per-model V1/V2 claims here as a reading of one version, not a fact about
-    the model, and rely on the completeness verdict (`_discovery_verdict`) rather
-    than on knowing which source should have supplied what."""
-    out = []
-    mr = getattr(worker, "model_runner", None)
+    """Find the runner, shift, native draft and Arctic proposal graph holders."""
     if worker is None:
-        return out, "worker is None (caller did not pass it)"
+        return [], "worker is None (caller did not pass it)"
+    mr = getattr(worker, "model_runner", None)
     if mr is None:
-        return out, f"{type(worker).__name__} has no .model_runner"
-    # 0.24 names the spec-decode holder `speculator` (model_runner.py:188/193);
-    # `drafter` is kept for older/newer spellings, hence both.
-    for attr, holder in (("model_runner", mr),
-                         ("speculator", getattr(mr, "speculator", None)),
-                         ("drafter", getattr(mr, "drafter", None))):
-        if holder is None:
-            continue
-        mgr = getattr(holder, "cudagraph_manager", None)
-        if mgr is not None and not any(m is mgr for m in out):
-            out.append(mgr)
-    if out:
-        return out, None
-    return out, (f"{type(mr).__name__} has no cudagraph_manager -- expected on the "
-                 f"V1 runner, where FULL graphs live in CUDAGraphWrapper (source 1)")
+        return [], f"{type(worker).__name__} has no .model_runner"
+    speculator = getattr(mr, "speculator", None)
+    holders = [getattr(mr, "cudagraph_manager", None),
+               getattr(mr, "shift_cudagraph_manager", None),
+               getattr(speculator, "cudagraph_manager", None)]
+    draft = mr.get_draft_model() if hasattr(mr, "get_draft_model") else None
+    if isinstance(getattr(draft, "cuda_graphs", None), dict):
+        # Proposal models capture lazily and retain the live dictionary.
+        from types import SimpleNamespace
+        holders.append(SimpleNamespace(graphs=draft.cuda_graphs))
+    out = []
+    for holder in holders:
+        if holder is not None and not any(holder is existing for existing in out):
+            out.append(holder)
+    return out, None if out else f"{type(mr).__name__} has no v2 graph holders"
 
 
 # Depth of the wrapper-entry walk below. 3 reaches entry -> container -> object;
@@ -1014,82 +985,14 @@ def _discovery_verdict(diag, n_found):
 
 
 def _find_captured_graphs(worker=None):
-    """Collect (cudaGraph_t, cudaGraphExec_t_or_0) for every captured
-    torch.cuda.CUDAGraph vLLM 0.24 holds.
+    """Collect graph and executable handles from wrappers and v2 graph holders.
 
-    A gc.get_objects() scan returns 0 on 0.24: vLLM gc.freeze()s the worker heap
-    after capture (gpu_worker.py freeze_gc_heap; comment literally lists "CUDA
-    graphs"), moving the graphs into CPython's permanent generation which
-    gc.get_objects() does NOT return. So enumerate the two places vLLM itself keeps
-    them, both freeze-immune:
-
-      1. the WRAPPER REGISTRIES -- CUDAGraphWrapper._all_instances (+
-         BreakableCUDAGraphWrapper) -> .concrete_cudagraph_entries[*].cudagraph
-         (cuda_graph.py). Take ALL wrappers, not just runtime_mode=FULL ones: the TP
-         custom-all-reduce kernels live in the piecewise regions too.
-      2. the GRAPH MANAGER -- worker.model_runner.cudagraph_manager.graphs, a plain
-         {BatchExecutionDescriptor: torch.cuda.CUDAGraph}.
-
-    Source 2 is here because omitting it WAS the reuse-graph bug (resume18, codex
-    gpt-5.5 consensus 2026-08-01), on the model runners where it applies. Which runner
-    you get is decided per-architecture by vllm/config/vllm.py:522 use_v2_model_runner
-    against DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES (vllm.py:68), and that gate is also
-    the answer to why reuse "sometimes" worked:
-
-      * arch NOT in that set -> V1 runner (gpu_model_runner.py). With FULL_AND_PIECEWISE
-        and breakable cudagraphs off, :5317 wraps the model in
-        CUDAGraphWrapper(runtime_mode=FULL), so source 1 already covers the FULL graphs.
-        e.g. Qwen3-235B-A22B (Qwen3MoeForCausalLM, 94 layers): n_wrappers=96,
-        n_entries=4896=96x51, i.e. 95 piecewise pieces + 1 FULL wrapper. This model never
-        faulted on ckpt-wake -- its FULL graphs were always patched.
-      * arch IN that set -> V2 runner (gpu/model_runner.py:466). The FULL graphs are bare
-        torch.cuda.CUDAGraph objects in mgr.graphs[desc] (gpu/cudagraph_utils.py:316/327)
-        replayed via self.graphs[desc].replay() (:373); no CUDAGraphWrapper is ever
-        constructed, so they are in NO registry and source 1 misses every one of them.
-        e.g. Qwen3-32B (Qwen3ForCausalLM, 64 layers): n_wrappers=65, n_entries=3315=65x51,
-        i.e. 65 piecewise pieces and NO FULL wrapper. Across a CA address move those FULL
-        graphs kept freed VAs -> async illegal-memory-access on the first FULL decode
-        replay. That is the observed fault
-        (agent_run_log/ep/wakepath_qwen3-32b-tp4-dense_20260731-203342.log).
-
-    The capture progress-bar label is an independent tell for which runner ran: only V1's
-    gpu_model_runner.py:6718 emits the two-part "Capturing CUDA graphs ({}, {})", so
-    "(decode, FULL)" means V1 and a bare "(FULL)" means V2.
-
-    The gap also made E4's "pre_valid_post_invalid=0" true but vacuous on V2 models: E4
-    used this same enumerator, so it inventoried only the set that had just been patched.
-
-    `worker` is optional so the few diagnostic callers that have no worker still
-    work, but passing None silently reverts to the piecewise-only bug -- hence
-    diag["src"] records which sources actually contributed.
-
-    NEITHER SOURCE CAN BE ASSUMED TO COVER ITS HALF. Both the entry layout and
-    the V1/V2 split have moved under us, and a source that quietly contributes
-    nothing looks exactly like a source that had nothing to contribute. GLM-5.3
-    on 0.30: `n_wrappers: 1, n_entries: 51, n_manager_graphs: 51,
-    n_cudagraph_objs: 51` -- 51 entries yielded 0 graphs because the CUDAGraph
-    was no longer on the entry's `__dict__`, the manager supplied the other
-    family, and the rebind patched half the graphs and reported success. The
-    restore then died on `cudaErrorIllegalAddress` in the first `engine.step()`.
-    Against 35B-A3B TP=4, which restores cleanly: `n_wrappers: 41,
-    n_entries: 2091, n_manager_graphs: 51, n_cudagraph_objs: 2142`.
-
-    Hence two defences, both here rather than in the caller: `_entry_cuda_graphs`
-    is shape-agnostic about where the graph sits, and `_discovery_verdict` sets
-    diag["complete"], which `rewrite_addrs_in_graphs` refuses to report success
-    without. The audits downstream (topo_readback, stale_ca_audit) range over the
-    discovered set and so are structurally unable to notice a missing family --
-    they returned bad=0 on the GLM run above.
-
-    Topology needs keep_graph=True (install_keepgraph_patch, on __new__); exec may
-    be 0 for a shape captured-but-not-yet-instantiated -- we patch topology for all
-    and exec for the instantiated ones (later instantiate() inherits the patched
-    topology). Deduped by graph handle as well as by object identity: a handle
-    reachable from both sources must be patched once, since applying an old->new
-    value map twice can misfire if a new address is also an old key.
-    Preserves the (pairs, diag) contract of the old gc-scan version; diag carries
-    the manager handle set under the private key "_manager_handles" so callers can
-    split their counters by source (pop it before logging -- it is not a metric)."""
+    Registries remain visible after vLLM freezes the worker heap. FULL runner,
+    shift and draft graphs are held outside the piecewise wrapper registries.
+    Check both sources for completeness and fall back to an unfrozen heap scan
+    if either source is incomplete. Deduplicate objects and graph handles.
+    The private diagnostic key `_manager_handles` distinguishes manager graphs.
+    """
     pairs = []
     diag = {"n_wrappers": 0, "n_entries": 0, "n_cudagraph_objs": 0,
             "n_topo_ok": 0, "n_exec_ok": 0, "n_topo_fail": 0,
@@ -1140,7 +1043,6 @@ def _find_captured_graphs(worker=None):
                             seen.add(id(v)); cgs.append(v)
                             diag["n_wrapper_graphs"] += 1
         # Source 2: the FULL graphs, which live in no registry (see docstring).
-        # V2 runner only -- on V1 there is no manager and source 1 already has them.
         mgr_ids = set()
         _mr = getattr(worker, "model_runner", None)
         diag["runner_class"] = type(_mr).__name__ if _mr is not None else None

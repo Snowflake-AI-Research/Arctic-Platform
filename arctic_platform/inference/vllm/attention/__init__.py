@@ -61,5 +61,9 @@ def apply_forest_cascade_patches():
     activates forest cascade paths when ``--forest-cascade-attn-configs``
     is provided.
     """
-    import vllm.v1.attention.backends.flash_attn as target_module
-    target_module.FlashAttentionBackend = ForestFlashAttentionBackend
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+
+    register_backend(
+        AttentionBackendEnum.FLASH_ATTN,
+        "arctic_platform.inference.vllm.attention.ForestFlashAttentionBackend",
+    )

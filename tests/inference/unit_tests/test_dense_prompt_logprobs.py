@@ -307,7 +307,7 @@ def patched(monkeypatch):
     from types import ModuleType
 
     vllm = ModuleType("vllm")
-    vllm.__version__ = "0.33.0"
+    vllm.__version__ = "0.33.0rc1.dev1045+gf905e7007"
     logprobs_mod = ModuleType("vllm.v1.engine.logprobs")
     logprobs_mod.LogprobsProcessor = _StubProcessor
     for name, module in (

@@ -13,19 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
 from importlib.metadata import requires
 
-VLLM_VERSION_033 = "0.33.0"
-SUPPORTED_VLLM_VERSIONS = (VLLM_VERSION_033,)
+VLLM_VERSION_V2 = "0.33.0rc1.dev1045+gf905e7007"
+SUPPORTED_VLLM_VERSIONS = (VLLM_VERSION_V2,)
 
 
 def get_compatible_vllm_version():
-    reqs = requires("arctic-platform")
-    for req in reqs:
-        match = re.match("vllm==(.*); extra == \"inference\"", req)
-        if match is not None:
-            return match.groups()[0]
+    from packaging.requirements import Requirement
+
+    for raw in requires("arctic-platform") or ():
+        req = Requirement(raw)
+        if req.name == "vllm" and req.marker.evaluate({"extra": "inference"}):
+            if req.url:
+                return VLLM_VERSION_V2
+            return next(iter(req.specifier)).version
 
 
 def get_runtime_vllm_version() -> str:

@@ -25,16 +25,12 @@ from grpc import aio
 from grpc import ServicerContext
 
 
-from vllm.engine.async_llm_engine import AsyncLLMEngine
+from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.usage.usage_lib import UsageContext
 from vllm.inputs import TokensPrompt
 from vllm.pooling_params import PoolingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-
-# Ensure we're using vLLM v0 for embedding support
-os.environ["VLLM_USE_V1"] = "0"
-
 
 # Import the generated protobuf code
 try:
@@ -59,10 +55,10 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
     """
 
     def __init__(self, engine_args: AsyncEngineArgs):
-        """Initialize the servicer with AsyncLLMEngine arguments.
+        """Initialize the servicer with AsyncLLM arguments.
 
         Args:
-            engine_args: Configuration for the AsyncLLMEngine.
+            engine_args: Configuration for the AsyncLLM.
         """
         self.engine_args = engine_args
         self.engine = None
@@ -76,19 +72,18 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
     async def start(self):
         """Initialize and start the LLM engine.
 
-        This method creates the AsyncLLMEngine instance and initializes
+        This method creates the AsyncLLM instance and initializes
         the tokenizer and model configuration.
         """
         # Create the engine from the provided arguments
-        self.engine = AsyncLLMEngine.from_engine_args(
+        self.engine = AsyncLLM.from_engine_args(
             self.engine_args, usage_context=UsageContext.API_SERVER
         )
         self.engine.log_requests = False
-        self.engine.start_background_loop()
 
         # Get tokenizer and model configuration
-        self.tokenizer = await self.engine.get_tokenizer()
-        self.model_config = await self.engine.get_model_config()
+        self.tokenizer = self.engine.get_tokenizer()
+        self.model_config = self.engine.vllm_config.model_config
         self.model_name = self.model_config.model
         self.max_model_len = self.model_config.max_model_len
 
@@ -96,7 +91,8 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
 
     async def stop(self):
         """Shut down the LLM engine."""
-        await self.engine.shutdown()
+        self.engine.shutdown()
+        self.ready = False
 
     async def _encode_one_prompt(
         self,
@@ -284,21 +280,18 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
         """
         try:
             # Gather all configuration information
-            model_config = await self.engine.get_model_config()
-            parallel_config = await self.engine.get_parallel_config()
-            decoding_config = await self.engine.get_decoding_config()
-            scheduler_config = await self.engine.get_scheduler_config()
-            lora_config = await self.engine.get_lora_config()
+            config = self.engine.vllm_config
+            model_config = config.model_config
 
             replica_info = inference_pb2.SingleReplicaInfoResponse(
                 model_name=str(model_config.model),
-                task=str(model_config.task),
+                task=str(model_config.pooler_config.task),
                 dtype=str(model_config.dtype),
                 ready=self.ready,
-                parallel_config=str(parallel_config),
-                decoding_config=str(decoding_config),
-                scheduler_config=str(scheduler_config),
-                lora_config=str(lora_config),
+                parallel_config=str(config.parallel_config),
+                decoding_config=str(config.decoding_config),
+                scheduler_config=str(config.scheduler_config),
+                lora_config=str(config.lora_config),
             )
 
             return inference_pb2.ReplicaInfoResponse(

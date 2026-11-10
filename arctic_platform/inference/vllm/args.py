@@ -19,7 +19,6 @@ import argparse
 import json
 from dataclasses import dataclass, fields
 
-from vllm.config import ParallelConfig
 from vllm.config.utils import is_init_field
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -124,7 +123,7 @@ class EngineArgsPatch(ArcticPatch[EngineArgs]):
             action='store_true',
             help=('Run the lm_head matmul in fp32 (weights stay in their '
                   'native dtype; the operands are upcast on the fly). '
-                  'vLLM\'s V1 sampler already runs softmax in fp32, so '
+                  'vLLM\'s sampler already runs softmax in fp32, so '
                   'this gives precise log-probs end-to-end. Needed for '
                   'RL workloads. Equivalent to ARCTIC_FP32_LM_HEAD=1.'),
         )
@@ -148,10 +147,6 @@ class EngineArgsPatch(ArcticPatch[EngineArgs]):
         if (self.ulysses_sequence_parallel_size > 1 and
                 self.distributed_executor_backend is None):
             self.distributed_executor_backend = "mp"
-
-        # Store ulysses_sequence_parallel_size for access during config initialization
-        from arctic_platform.inference.vllm import ulysses
-        ulysses._ulysses_sp_size = self.ulysses_sequence_parallel_size
 
         vllm_config = self._orig_create_engine_config(*args, **kwargs)
         # Recreate the parallel config with Arctic parameters since they might
@@ -177,9 +172,13 @@ class EngineArgsPatch(ArcticPatch[EngineArgs]):
                 raise ValueError(
                     "--forest-cascade-attn-configs must be a JSON object"
                 )
-            vllm_config._forest_cascade_attn_config = fca_cfg
-        else:
-            vllm_config._forest_cascade_attn_config = None
+            vllm_config.additional_config["forest_cascade_attn"] = fca_cfg
+
+        from vllm.utils.math_utils import round_up
+        scheduler = vllm_config.scheduler_config
+        scheduler.max_num_batched_tokens = round_up(
+            scheduler.max_num_batched_tokens, self.ulysses_sequence_parallel_size
+        )
 
         return vllm_config
 

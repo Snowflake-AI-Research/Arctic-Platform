@@ -52,11 +52,10 @@ from contextlib import contextmanager
 
 
 @contextmanager
-def graph_capture(device: torch.device):
+def graph_capture(device: torch.device, group):
     from vllm.distributed.parallel_state import GraphCaptureContext
     context = GraphCaptureContext(torch.cuda.Stream(device=device))
-    import vllm.distributed.parallel_state as parallel_state
-    with parallel_state._TP.graph_capture(context):
+    with group.graph_capture(context):
         yield context
 
 
@@ -107,7 +106,7 @@ class MLPSpeculatorLayerNorm(nn.Module):
         )
 
     def forward(self, x):
-        if USE_CUSTOM_OP:
+        if USE_CUSTOM_OP and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
             return self.forward_opt(x)
         else:
             return self.forward_fallback(x)
@@ -390,7 +389,7 @@ class ArcticMLPSpeculator(nn.Module, SpeculatorTPInit):
                     static_next_tokens,
                 )
                 torch.cuda.synchronize()
-                with graph_capture(device=device) as capture_context:
+                with graph_capture(device=device, group=self.TP_GROUP) as capture_context:
                     g = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(g, stream=capture_context.stream):
                         self.generate_token_ids(
@@ -437,7 +436,8 @@ class ArcticMLPSpeculator(nn.Module, SpeculatorTPInit):
         head_weight = self.head[0].weight.data
         qweight, weight_scale = ops.scaled_fp8_quant(head_weight, scale=None)
         self.qhead[0].weight.data.copy_(qweight.t())
-        self.qhead[0].weight_scale.data.copy_(weight_scale)
+        scale = self.qhead[0].weight_scale.data
+        scale.copy_(weight_scale.reshape_as(scale))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
@@ -956,7 +956,7 @@ class ArcticLSTMSpeculator(nn.Module, SpeculatorTPInit):
                         static_next_tokens,
                     )
                 torch.cuda.synchronize()
-                with graph_capture(device=device) as capture_context:
+                with graph_capture(device=device, group=self.TP_GROUP) as capture_context:
                     g = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(g, stream=capture_context.stream):
                         if self.method == "sum_lstm":
@@ -1022,7 +1022,8 @@ class ArcticLSTMSpeculator(nn.Module, SpeculatorTPInit):
         head_weight = self.head[0].weight.data
         qweight, weight_scale = ops.scaled_fp8_quant(head_weight, scale=None)
         self.qhead[0].weight.data.copy_(qweight.t())
-        self.qhead[0].weight_scale.data.copy_(weight_scale)
+        scale = self.qhead[0].weight_scale.data
+        scale.copy_(weight_scale.reshape_as(scale))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = collections.OrderedDict(weights)

@@ -16,9 +16,12 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 import vllm
 from vllm import LLM, SamplingParams
+
+from arctic_platform.testing_utils import require_torch_gpu
 
 MAX_MODEL_LEN = 256
 
@@ -63,6 +66,8 @@ def sampling_configs():
     ]
 
 
+@require_torch_gpu
+@pytest.mark.vllm
 @pytest.mark.parametrize(
     "model_name, spec_config",
     [
@@ -79,10 +84,11 @@ def test_speculative_decoding(
     spec_config: dict,
 ):
     '''Spec decoding at max_model_len must not raise.'''
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Speculative decoding requires two GPUs")
     with monkeypatch.context() as m:
         m.setenv("ARCTIC_INFERENCE_ENABLED", "1")
         m.setenv("VLLM_PLUGINS", "arctic_inference")
-        m.setenv("VLLM_USE_V1", "1")
 
         vllm.plugins.load_general_plugins()
 

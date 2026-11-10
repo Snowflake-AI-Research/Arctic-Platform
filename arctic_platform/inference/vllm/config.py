@@ -17,7 +17,6 @@ import logging
 from functools import wraps
 
 import torch
-import vllm
 from pydantic import ConfigDict
 from vllm.config import ParallelConfig, SpeculativeConfig, VllmConfig
 from vllm.config.utils import config
@@ -44,7 +43,16 @@ class ArcticParallelConfig(ParallelConfig):
         # tensor_parallel_size; override to PP * TP * ulysses_sequence_parallel_size.
         self.world_size = (self.pipeline_parallel_size *
                            self.tensor_parallel_size *
+                           self.prefill_context_parallel_size *
                            self.ulysses_sequence_parallel_size)
+
+    def compile_factors(self):
+        factors = super().compile_factors()
+        factors.update(
+            ulysses_sequence_parallel_size=self.ulysses_sequence_parallel_size,
+            enable_shift_parallel=self.enable_shift_parallel,
+        )
+        return factors
 
 
 @config(config=ConfigDict(extra="forbid"))
@@ -83,49 +91,25 @@ class SpeculativeConfigPatch(ArcticPatch[SpeculativeConfig]):
         return super(SpeculativeConfig, cls).__new__(cls)
 
     def __post_init__(self):
-        is_arctic_method = self.method in ("arctic", "mlp_speculator")
-        use_suffix = (self.method == "suffix") or (self.method is None
-                                                   and self.enable_suffix_decoding)
-        use_hybrid = (self.method == "arctic" and self.enable_suffix_decoding)
-
-        if (use_suffix or is_arctic_method) and self.disable_by_batch_size is None:
-            logger.info("Defaulting disable_by_batch_size to 64")
+        arctic_method = self.method in ("arctic", "mlp_speculator")
+        use_suffix = self.method == "suffix" or (
+            self.method is None and self.enable_suffix_decoding
+        )
+        if (arctic_method or use_suffix) and self.disable_by_batch_size is None:
             self.disable_by_batch_size = 64
-
-        if use_hybrid:
-            self.suffix_speculative_tokens = self.suffix_cache_max_depth
-
         if use_suffix:
-            self.method = "suffix"
+            self.method = "arctic_suffix"
             self.enable_suffix_decoding = True
-            # Use suffix_speculative_tokens if explicitly set, otherwise
-            # default to 16 (not suffix_cache_max_depth which can be very
-            # large and makes every step process 1+N tokens even when the
-            # suffix cache has no matches).
-            # NOTE: num_speculative_tokens defaults to None (not 0).
             if self.suffix_speculative_tokens > 0:
                 self.num_speculative_tokens = self.suffix_speculative_tokens
             elif self.num_speculative_tokens is None:
                 self.num_speculative_tokens = 16
-            self._verify_args()
-            return
-
-        if is_arctic_method:
-            # vLLM 0.33 removed mlp_speculator. Use its draft config loading
-            # with TP=1; GPUModelRunnerPatch owns the Arctic drafter.
-            saved_method = self.method
-            self.method = "draft_model"
+        elif arctic_method:
             if self.draft_tensor_parallel_size is None:
                 self.draft_tensor_parallel_size = 1
-            try:
-                self._orig_post_init()
-            finally:
-                self.method = saved_method
-
-            if self.num_speculative_tokens == 0:
-                self.num_speculative_tokens = getattr(self, "num_lookahead_slots", 1)
-        else:
-            self._orig_post_init()
+            if self.enable_suffix_decoding:
+                self.suffix_speculative_tokens = self.suffix_cache_max_depth
+        self._orig_post_init()
 
 
 _DFLASH_PATCHED = False
@@ -175,18 +159,6 @@ def ensure_dflash_max_position_patch() -> None:
 class VllmConfigPatch(ArcticPatch[VllmConfig]):
 
     _orig_str = VllmConfig.__str__
-    _orig_post_init = VllmConfig.__post_init__
-    _orig_get_v2_unsupported = VllmConfig._get_v2_model_runner_unsupported_features
-
-    from typing import Literal
-    OldEagleModelTypes = vllm.config.speculative.EagleModelTypes
-    NewEagleModelTypes = Literal["arctic", "mlp_speculator", "suffix", OldEagleModelTypes]
-
-    def _get_v2_model_runner_unsupported_features(self):
-        unsupported = list(self._orig_get_v2_unsupported())
-        # vLLM 0.33 defaults to V2, but Arctic patches the V1 GPUModelRunner.
-        unsupported.append("Arctic Inference model runner")
-        return unsupported
 
     def __str__(self, *args, **kwargs):
         string = self._orig_str(*args, **kwargs)
@@ -194,15 +166,3 @@ class VllmConfigPatch(ArcticPatch[VllmConfig]):
         string += f", enable_shift_parallel={self.parallel_config.enable_shift_parallel}"
         string += f", shift_parallel_threshold={self.parallel_config.shift_parallel_threshold}"
         return string
-
-    def __post_init__(self, *args, **kwargs):
-        import sys
-        from typing import Literal, get_args
-        target_module = sys.modules[VllmConfig.__module__]
-        original_types = getattr(target_module, "EagleModelTypes")
-        NewEagleModelTypes = Literal["arctic", "mlp_speculator", "suffix", original_types]
-        setattr(target_module, "EagleModelTypes", NewEagleModelTypes)
-        try:
-            self._orig_post_init(*args, **kwargs)
-        finally:
-            setattr(target_module, "EagleModelTypes", original_types)

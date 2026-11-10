@@ -6,13 +6,11 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
-from vllm.distributed import (divide,
-                              tensor_model_parallel_all_reduce)
+from vllm.distributed import divide
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase, method_has_implemented_embedding)
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.platforms import current_platform
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -29,10 +27,9 @@ class SpeculatorTPInit():
         sp_world_size = _SP.world_size
 
         # Work around due to cuda graph capture failure using SP_TP_GROUP's AllGather
-        self.tp_size = max(tp_world_size, sp_world_size)
-        self.tp_rank = _TP.rank % self.tp_size
-
         self.TP_GROUP = _SP if sp_world_size > tp_world_size else _TP
+        self.tp_size = self.TP_GROUP.world_size
+        self.tp_rank = self.TP_GROUP.rank_in_group
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -434,7 +431,7 @@ class VocabParallelEmbedding(torch.nn.Module, SpeculatorTPInit):
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
-        output = tensor_model_parallel_all_reduce(output_parallel)
+        output = self.TP_GROUP.all_reduce(output_parallel)
         return output
 
     def extra_repr(self) -> str:

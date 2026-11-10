@@ -288,6 +288,7 @@ def test_vllm_qwen_parser_natively_ends_reasoning_at_tool_call():
     parser_engine._reasoning_start_token_id = 10
     parser_engine._reasoning_end_token_id = 11
     parser_engine._reasoning_end_token_ids = frozenset({11, 13})
+    parser_engine._reasoning_boundary_token_ids = frozenset({10, 11, 13})
     parser_engine._tool_call_token_id = 13
     parser_engine._tool_call_end_token_id = 14
     parser_engine._turn_boundary_token_ids = frozenset()

@@ -198,7 +198,7 @@ inference = [
     "ray",
     "tqdm",
     "uvicorn",
-    "vllm==0.33.0",
+    "vllm @ https://wheels.vllm.ai/f905e70070cce1ee0f7d184449f43a4af385360d/vllm-0.33.0rc1.dev1045%2Bgf905e7007-cp38-abi3-manylinux_2_28_x86_64.whl",
     "xgrammar==0.2.8",
 ]
 

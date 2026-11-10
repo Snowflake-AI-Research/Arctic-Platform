@@ -14,6 +14,7 @@ __global__ void reshape_and_cache_flash_bulk_kernel(
     const scalar_t *__restrict__ keys, const scalar_t *__restrict__ values,
     int64_t *key_cache_ptrs, int64_t *value_cache_ptrs,
     const int64_t *__restrict__ slot_mapping, const int block_stride,
+    const int token_stride, const int head_stride,
     const int key_stride, const int value_stride, const int num_heads,
     const int head_size, const int block_size, int64_t *k_scale_ptrs,
     int64_t *v_scale_ptrs) {
@@ -43,8 +44,8 @@ __global__ void reshape_and_cache_flash_bulk_kernel(
     const int head_idx = i / head_size;
     const int head_offset = i % head_size;
     const int64_t tgt_key_value_idx = block_idx * block_stride +
-                                      block_offset * num_heads * head_size +
-                                      head_idx * head_size + head_offset;
+                                      block_offset * token_stride +
+                                      head_idx * head_stride + head_offset;
     scalar_t tgt_key = keys[src_key_idx];
     scalar_t tgt_value = values[src_value_idx];
     if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
@@ -68,7 +69,8 @@ __global__ void reshape_and_cache_flash_bulk_kernel(
           reinterpret_cast<KV_T *>(values.data_ptr()),                         \
           key_cache_ptrs_tensor.data_ptr<int64_t>(),                           \
           value_cache_ptrs_tensor.data_ptr<int64_t>(),                         \
-          slot_mapping.data_ptr<int64_t>(), block_stride, key_stride,          \
+          slot_mapping.data_ptr<int64_t>(), block_stride, token_stride,        \
+          head_stride, key_stride,                                            \
           value_stride, static_cast<int>(num_heads),                           \
           static_cast<int>(head_size), block_size,                             \
           k_scale_ptrs_tensor.data_ptr<int64_t>(),                             \
@@ -99,6 +101,8 @@ void reshape_and_cache_flash_bulk(
   int key_stride = keys.stride(0);
   int value_stride = values.stride(0);
   int block_stride = key_caches[0].stride(0);
+  int token_stride = key_caches[0].stride(1);
+  int head_stride = key_caches[0].stride(2);
   TORCH_CHECK(block_stride == value_caches[0].stride(0));
 
   int64_t key_cache_ptrs[num_layers];
@@ -107,6 +111,14 @@ void reshape_and_cache_flash_bulk(
   int64_t v_scale_ptrs[num_layers];
 
   for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+    for (auto const &cache : {key_caches[layer_idx], value_caches[layer_idx]}) {
+      TORCH_CHECK(cache.dim() == 4 && cache.size(1) == block_size &&
+                  cache.size(2) == num_heads && cache.size(3) == head_size);
+      TORCH_CHECK(cache.stride(0) == block_stride &&
+                  cache.stride(1) == token_stride &&
+                  cache.stride(2) == head_stride && cache.stride(3) == 1,
+                  "Bulk KV cache views must share their strides");
+    }
     key_cache_ptrs[layer_idx] =
         reinterpret_cast<int64_t>(key_caches[layer_idx].data_ptr());
     value_cache_ptrs[layer_idx] =
