@@ -81,7 +81,9 @@ def start_cursor(client: Any, job_id: str) -> str | None:
 def read_sub_job_log(client: Any, job_id: str, max_pages: int = 200) -> list[str]:
     """The sub-job log so far, from the job's start. Pages until one comes back
     empty: a running job's log never reports ``eof``, so
-    ``stream_logs(follow=False)`` would not return."""
+    ``stream_logs(follow=False)`` would not return. A page that fails after
+    others were read (the service answers 409 Conflict once the job has ended)
+    ends the read with the lines read so far."""
     try:
         cursor = start_cursor(client, job_id)
         page = client.tail_logs(job_id, cursor=cursor, max_lines=1000, sub_job_type="sampling")
@@ -91,7 +93,14 @@ def read_sub_job_log(client: Any, job_id: str, max_pages: int = 200) -> list[str
     lines: list[str] = []
     for _ in range(max_pages):
         if page is None:
-            page = client.tail_logs(job_id, cursor=cursor, max_lines=1000, sub_job_type="sampling")
+            try:
+                page = client.tail_logs(job_id, cursor=cursor, max_lines=1000, sub_job_type="sampling")
+            except Exception as exc:  # noqa: BLE001
+                if not lines:
+                    raise
+                logger.warning("sub-job log for %s: a page after %d line(s) failed (%s); keeping those",
+                               job_id, len(lines), exc)
+                break
         entries = page.get("entries") or []
         for entry in entries:
             lines.extend(log_text(entry).splitlines())
