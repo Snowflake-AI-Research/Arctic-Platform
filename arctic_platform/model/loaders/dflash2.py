@@ -15,7 +15,8 @@
 """Loader for online DFlash2 draft training: a frozen target plus a trainable DFlash2 draft.
 
 ``model_path_or_name`` is the *target* checkpoint. The draft architecture comes from
-``loader_options.draft_config`` (the content of a DFlash2 draft ``config.json``).
+``loader_options.draft_config`` (the content of a DFlash2 draft ``config.json``). A target that is a LoRA
+fine-tune arrives as its base checkpoint plus ``loader_options.target_adapter``, which is merged in first.
 """
 
 from __future__ import annotations
@@ -46,6 +47,13 @@ class DFlash2Options(BaseModel):
     )
     init_from: str | None = Field(
         None, description="Existing draft directory (config.json + model.safetensors) to start from."
+    )
+    target_adapter: str | None = Field(
+        None,
+        description=(
+            "PEFT LoRA adapter directory (adapter_config.json + weights) of a fine-tune of the target. It is merged "
+            "into the target before the target is frozen, so the draft reads the fine-tune's hidden states."
+        ),
     )
     attention_backend: Literal["sdpa", "flex_attention", "eager"] = Field(
         "sdpa", description="Draft attention implementation (SpecForge's training.attention_backend)."
@@ -95,6 +103,13 @@ def _validate_spec(spec: ModelSpec) -> None:
         raise ValueError("the dflash2 loader supports data parallelism only (sequence/expert parallel size must be 1)")
 
 
+def merge_target_adapter(target: torch.nn.Module, adapter_dir: str) -> torch.nn.Module:
+    """``target`` with the LoRA adapter at ``adapter_dir`` merged into its weights, as a plain model again."""
+    from peft import PeftModel
+
+    return PeftModel.from_pretrained(target, adapter_dir, is_trainable=False).merge_and_unload()
+
+
 @register_loader("dflash2", options=DFlash2Options, validate_spec=_validate_spec)
 def load_dflash2(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.dflash2.online import build_online_model
@@ -106,6 +121,8 @@ def load_dflash2(ctx: LoaderContext) -> LoadedModel:
         dtype=dtype,
         attn_implementation=ctx.spec.attn_implementation,
     )
+    if options.target_adapter is not None:
+        target = merge_target_adapter(target, options.target_adapter)
     model = build_online_model(
         target,
         options.draft_config,

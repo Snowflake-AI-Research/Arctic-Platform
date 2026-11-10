@@ -395,6 +395,44 @@ def test_loader_rejects_generic_model_patches(target_dir, patch):
         build_model(loader_spec(target_dir, patches=Patches(**{patch: True})))
 
 
+@pytest.fixture
+def lora_fine_tune(target, tmp_path):
+    """``(adapter dir, the fine-tune as base + unmerged adapter)`` of a LoRA fine-tune of ``target``."""
+    from peft import LoraConfig
+    from peft import get_peft_model
+
+    torch.manual_seed(1)
+    # init_lora_weights=False draws both factors at random, so the adapter changes the target's outputs.
+    tuned = get_peft_model(
+        copy.deepcopy(target),
+        LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj", "v_proj", "down_proj"], init_lora_weights=False),
+    ).eval()
+    path = tmp_path / "adapter"
+    tuned.save_pretrained(path)
+    return path, tuned
+
+
+def test_loader_merges_a_lora_fine_tune_into_the_target_the_draft_reads(target_dir, lora_fine_tune):
+    adapter_dir, tuned = lora_fine_tune
+    model = build_model(loader_spec(target_dir, loader_options={"target_adapter": str(adapter_dir)})).model
+    input_ids = torch.tensor([[10, 11, 12, 13, 14]])
+
+    with torch.no_grad():
+        tuned_out = tuned(input_ids=input_ids, output_hidden_states=True)
+        base_hidden = build_model(loader_spec(target_dir)).model.target_context(input_ids)
+    expected = torch.cat([tuned_out.hidden_states[i + 1] for i in model.draft.target_layer_ids], dim=-1)
+
+    torch.testing.assert_close(model.target_context(input_ids), expected)
+    assert not torch.allclose(base_hidden, expected)
+
+
+def test_a_merged_target_is_a_plain_frozen_model(target_dir, lora_fine_tune):
+    model = build_model(loader_spec(target_dir, loader_options={"target_adapter": str(lora_fine_tune[0])})).model
+
+    assert type(model.target) is Qwen3ForCausalLM
+    assert not any(p.requires_grad for p in model.target.parameters())
+
+
 @pytest.mark.parametrize("parallelism", [dict(sequence_parallel=2), dict(expert_parallel=2)])
 def test_loader_supports_data_parallelism_only(target_dir, parallelism):
     with pytest.raises((ValidationError, ValueError), match="data parallelism only"):
