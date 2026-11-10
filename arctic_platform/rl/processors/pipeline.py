@@ -568,12 +568,6 @@ def run_pipeline(
         # Zorro reads calculate_entropy from engine kwargs. Loss tensors stay
         # on batch and meta for posts and losses.
         fwd_kwargs = _engine_forward_kwargs(batch, meta)
-        # A vLLM-aligned hybrid tells prefilled tokens from decoded ones by the trained positions. RL batches carry
-        # them as loss_mask, and their labels (rolled input_ids) mark every position.
-        model = getattr(engine, "module", engine)
-        if getattr(model, "_vllm_aligned_reads_loss_mask", False) and "vllm_aligned_loss_mask" not in fwd_kwargs:
-            if torch.is_tensor(batch.get("loss_mask")):
-                fwd_kwargs["vllm_aligned_loss_mask"] = batch["loss_mask"]
         output_keys = ["logits", "logprobs", "entropy", "loss"]
         if loss_object is not None:
             context = {**meta, **batch}

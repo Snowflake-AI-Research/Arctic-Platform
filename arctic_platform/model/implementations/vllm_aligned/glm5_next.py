@@ -808,7 +808,7 @@ def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_f
     model._vllm_aligned_stock_forward = model.forward
     model.forward = types.MethodType(_causal_lm_forward, model)
     model._vllm_aligned = True
-    model._vllm_aligned_reads_loss_mask = True
+    model._vllm_aligned_takes_loss_mask = True
 
 
 __all__ = ["aligned_hidden", "aligned_layer", "apply_vllm_aligned_glm5_next", "hc_post", "hc_pre"]
