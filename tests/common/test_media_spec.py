@@ -18,7 +18,6 @@
 import dataclasses
 
 import pytest
-import torch
 
 from arctic_platform.common.packing import IMAGE_MEDIA
 from arctic_platform.common.packing import QWEN_VL_MEDIA_SPEC
@@ -27,10 +26,7 @@ from arctic_platform.common.packing import MediaKind
 from arctic_platform.common.packing import MediaSpec
 from arctic_platform.common.packing import media_spec as media_spec_module
 from arctic_platform.common.packing import media_spec_for
-from arctic_platform.common.packing import media_token_spans
 from arctic_platform.common.packing import register_media_spec
-
-MERGE = 2
 
 
 @pytest.fixture
@@ -89,6 +85,11 @@ def test_qwen_vl_placeholder_ids_leave_out_a_kind_with_no_id():
     assert QWEN_VL_MEDIA_SPEC.placeholder_ids({"vocab_size": 64}) == {}
 
 
+def test_qwen_vl_placeholder_ids_are_the_shared_config_reading():
+    # The inference worker reads a model type with no spec the same way.
+    assert QWEN_VL_MEDIA_SPEC.placeholder_ids is media_spec_module.config_placeholder_ids
+
+
 def test_qwen_vl_placeholder_ids_fall_back_to_text_config():
     config = {"image_token_id": 29, "text_config": {"image_token_id": 99, "video_token_id": 30}}
     # Top-level first: the image id is the config's own, the video id comes from text_config.
@@ -115,37 +116,8 @@ def test_qwen_vl_leaf_names_are_the_ones_media_uses():
     assert QWEN_VL_MEDIA_SPEC.kind("image").keys == ("pixel_values", "image_grid_thw", "image_row_ids")
     assert QWEN_VL_MEDIA_SPEC.kind("video").keys == ("pixel_values_videos", "video_grid_thw", "video_row_ids")
     assert QWEN_VL_MEDIA_SPEC.positions == "mrope"
-    assert QWEN_VL_MEDIA_SPEC.item_prefix_tokens == 0
     with pytest.raises(KeyError, match="audio"):
         QWEN_VL_MEDIA_SPEC.kind("audio")
-
-
-def _kind_tokens_in_spans(media, kind, token_types, cu_seqlens):
-    spans = media_token_spans(media, kind, token_types, cu_seqlens, MERGE)
-    flat = token_types.reshape(-1)
-    return [int((flat[start:end] == kind.token_type).sum()) for start, end in spans.tolist()]
-
-
-def test_qwen_vl_tokens_per_item_matches_media_token_spans():
-    # Row 0: text, image (1x4x4 -> 4 tokens), text, image (1x2x4 -> 2 tokens), text.
-    # Row 1: text, a 3-frame video (3x2x4 -> 2 tokens a frame) with timestamp text between frames, text.
-    row0 = [0, 1, 1, 1, 1, 0, 1, 1, 0]
-    row1 = [0, 2, 2, 0, 0, 2, 2, 0, 2, 2, 0]
-    token_types = torch.tensor([row0 + row1])
-    cu_seqlens = torch.tensor([0, len(row0), len(row0) + len(row1)])
-    image_grid = torch.tensor([[1, 4, 4], [1, 2, 4]])
-    video_grid = torch.tensor([[3, 2, 4]])
-    media = {
-        "image_grid_thw": image_grid,
-        "image_row_ids": torch.tensor([0, 0]),
-        "video_grid_thw": video_grid,
-        "video_row_ids": torch.tensor([1]),
-    }
-    for kind, grid in ((IMAGE_MEDIA, image_grid), (VIDEO_MEDIA, video_grid)):
-        expected = _kind_tokens_in_spans(media, kind, token_types, cu_seqlens)
-        assert [QWEN_VL_MEDIA_SPEC.tokens_per_item(row, MERGE) for row in grid] == expected
-        assert [QWEN_VL_MEDIA_SPEC.tokens_per_item(row.tolist(), MERGE) for row in grid] == expected
-    assert QWEN_VL_MEDIA_SPEC.tokens_per_item([3, 2, 4], MERGE) == 6
 
 
 def test_register_a_second_spec(registry):
@@ -153,17 +125,14 @@ def test_register_a_second_spec(registry):
     spec = MediaSpec(
         kinds=(image,),
         placeholder_ids=lambda config: {"image": int(config["image_token_index"])},
-        tokens_per_item=lambda grid_row, merge: int(grid_row[1]) * int(grid_row[2]) // merge**2 + 1,
         spatial_merge_size=lambda config: int(config["merge"]),
         positions="1d",
-        item_prefix_tokens=1,
     )
     register_media_spec("example_vlm", spec)
     assert media_spec_for("example_vlm") is spec
     assert media_spec_for("qwen4_exp") is QWEN_VL_MEDIA_SPEC
     assert spec.modalities == ("image",)
     assert spec.placeholder_ids({"image_token_index": 7}) == {"image": 7}
-    assert spec.tokens_per_item([1, 4, 4], MERGE) == 5
     assert spec.spatial_merge_size({"merge": 2}) == 2
 
 
@@ -189,8 +158,6 @@ def test_a_spec_is_frozen():
 def test_a_malformed_spec_is_refused():
     ids, merge = QWEN_VL_MEDIA_SPEC.placeholder_ids, QWEN_VL_MEDIA_SPEC.spatial_merge_size
     with pytest.raises(ValueError, match="positions"):
-        MediaSpec((IMAGE_MEDIA,), ids, QWEN_VL_MEDIA_SPEC.tokens_per_item, merge, "rope3d")
+        MediaSpec((IMAGE_MEDIA,), ids, merge, "rope3d")
     with pytest.raises(ValueError, match="distinct"):
-        MediaSpec((IMAGE_MEDIA, IMAGE_MEDIA), ids, len, merge, "mrope")
-    with pytest.raises(ValueError, match="item_prefix_tokens"):
-        MediaSpec((IMAGE_MEDIA,), ids, len, merge, "1d", item_prefix_tokens=-1)
+        MediaSpec((IMAGE_MEDIA, IMAGE_MEDIA), ids, merge, "mrope")

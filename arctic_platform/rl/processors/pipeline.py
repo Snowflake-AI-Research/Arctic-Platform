@@ -62,6 +62,7 @@ from arctic_platform.common.packing import MEDIA_KINDS
 from arctic_platform.common.packing import MediaSpec
 from arctic_platform.common.packing import check_media
 from arctic_platform.common.packing import media_spec_for
+from arctic_platform.common.packing import media_token_spans
 from arctic_platform.common.packing import mrope_position_ids
 from arctic_platform.common.packing import select_media_rows
 from arctic_platform.common.packing import split_media
@@ -100,6 +101,7 @@ except ImportError:
 
 # Model-forward keys only. Loss tensors live in batch/meta and must not reach engine().
 # Posts and losses still receive the full batch/meta dicts.
+# mm_token_type_ids is read to build position_ids, not forwarded to the engine.
 _ENGINE_FWD_KEYS = frozenset(
     {
         "input_ids",
@@ -116,8 +118,6 @@ _ENGINE_FWD_KEYS = frozenset(
         "image_grid_thw",
         "pixel_values_videos",
         "video_grid_thw",
-        # Token types locate image and video placeholders; positions are built from them below.
-        "mm_token_type_ids",
         "dss_compute_logprobs",
         # Packed/varlen flash-attn aliases (``cu_seqlens`` itself stays blocked).
         "cu_seq_lens_q",
@@ -240,18 +240,20 @@ def _media_with_row_ids(media: dict, n_rows: int) -> dict:
 
     A one-row batch may omit them, as callers did before row ids existed (``pixel_values`` + ``image_grid_thw``
     alone): every item is that row's. A batch of more rows without them is refused with a ValueError, since which
-    row owns which item cannot be known.
+    row owns which item cannot be known. A kind with no grid is left as sent, for ``check_media`` to refuse.
     """
     media = dict(media)
     for kind in MEDIA_KINDS:
         values = media.get(kind.values_key)
         if values is None or media.get(kind.row_ids_key) is not None:
             continue
-        if n_rows != 1 or media.get(kind.grid_key) is None:
+        if n_rows != 1:
             raise ValueError(
                 f"{kind.values_key} on a {n_rows}-row batch needs {kind.row_ids_key} to say which row owns each "
                 "item; only a one-row batch may leave them out"
             )
+        if media.get(kind.grid_key) is None:
+            continue
         media[kind.row_ids_key] = torch.zeros(media[kind.grid_key].shape[0], dtype=torch.long)
     check_media(media, n_rows)
     return media
@@ -299,46 +301,24 @@ def _media_spec(engine, media: dict) -> tuple[MediaSpec, int] | None:
     return spec, spec.spatial_merge_size(config)
 
 
-def _check_media_rows(
-    media: dict, kind, token_types: torch.Tensor, cu_seqlens: list, spec: MediaSpec, spatial_merge_size: int
-):
-    """Every row holds exactly the ``kind`` tokens its own items expand to.
-
-    An item counts ``spec.tokens_per_item`` tokens. ``media_token_spans`` would check more (contiguous runs,
-    video frames with only text between them) but cannot take the spec's count: it takes no tokens per item
-    and counts every item as ``t * h * w / merge**2``.
-    """
-    grid, row_ids = media[kind.grid_key], media[kind.row_ids_key].to(torch.long).cpu()
-    item_tokens = torch.tensor([spec.tokens_per_item(row, spatial_merge_size) for row in grid.cpu()], dtype=torch.long)
-    expected = torch.zeros(len(cu_seqlens) - 1, dtype=torch.long).index_add_(0, row_ids, item_tokens)
-    is_kind = (token_types == kind.token_type).to(torch.long).cpu()
-    found = torch.stack([is_kind[start:end].sum() for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])])
-    if not torch.equal(found, expected):
-        raise ValueError(
-            f"rows hold {found.tolist()} {kind.name} tokens but their {kind.grid_key} by {kind.row_ids_key} "
-            f"expand to {expected.tolist()} at spatial_merge_size {spatial_merge_size}"
-        )
-
-
 def _packed_media_kwargs(
     media: dict, mm_token_type_ids, cu_seqlens: torch.Tensor, spec: MediaSpec, spatial_merge_size: int
 ) -> dict:
     """Model inputs for row-owned ``media`` in one packed call: its pixels, grids and M-RoPE ``position_ids``.
 
-    Each row must hold the tokens of exactly the items its row ids give it. A kind with no item in the call is
+    Each item's tokens must be where ``media_token_spans`` places them: in packed order, contiguous, inside the
+    row its row id names, and as many as its grid expands to. A kind with no item in the call is
     left out, so a text-only microbatch of a media batch runs no vision forward. ``position_ids`` is
     ``[4, 1, T]`` and every row restarts at 0, which is what the row gets alone.
     """
     if mm_token_type_ids is None:
         raise ValueError("a batch with media needs mm_token_type_ids to place image and video tokens")
-    token_types = mm_token_type_ids.reshape(-1)
-    boundaries = [int(value) for value in cu_seqlens.tolist()]
     kwargs = {}
     for kind in spec.kinds:
         grid = media.get(kind.grid_key)
         if media.get(kind.values_key) is None:
             continue
-        _check_media_rows(media, kind, token_types, boundaries, spec, spatial_merge_size)
+        media_token_spans(media, kind, mm_token_type_ids, cu_seqlens, spatial_merge_size)
         if grid.shape[0]:
             kwargs[kind.values_key] = media[kind.values_key]
             kwargs[kind.grid_key] = grid

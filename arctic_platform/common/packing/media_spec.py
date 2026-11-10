@@ -17,10 +17,11 @@
 
 The rest of this package is written for the Qwen-VL layout: placeholder token ids read from the config's
 ``image_token_id`` / ``video_token_id``, batch leaves named as in ``media.py``, ``t * h * w / merge**2`` tokens
-per item, and ``[4, 1, T]`` M-RoPE positions. A ``MediaSpec`` states each of those for one model family, so a
-caller asks ``media_spec_for(model_type)`` instead of assuming them, and a family with another layout
-(other placeholder rules, other leaf names, a token count on another grid, 1-D positions, a marker token
-before each item that belongs to it) registers its own entry with ``register_media_spec``.
+per item, and ``[4, 1, T]`` M-RoPE positions. A ``MediaSpec`` states the placeholder ids, the leaf names, the
+merge factor and the position layout for one model family, so a caller asks ``media_spec_for(model_type)``
+instead of assuming them, and a family with another layout registers its own entry with ``register_media_spec``.
+The token count per item is not in the spec: ``media_token_spans``, ``mrope_position_ids`` and ``window_media``
+count ``t * h * w / merge**2``, so a family that counts otherwise brings its count with those.
 
 The Qwen-VL entry reproduces the constants the existing code uses. ``run_pipeline`` takes its media kinds, its
 spatial merge factor and its position layout from the spec of the engine's ``model_type``. A model type with no spec
@@ -41,10 +42,7 @@ from typing import Any
 from typing import Callable
 from typing import Dict
 from typing import Optional
-from typing import Sequence
 from typing import Tuple
-
-import torch
 
 from .media import IMAGE_MEDIA
 from .media import VIDEO_MEDIA
@@ -61,21 +59,15 @@ class MediaSpec:
       its ``mm_token_type_ids`` value; ``modalities`` are their names, in order.
     * ``placeholder_ids(config)`` -- ``{modality: token id}`` of the placeholder token each item's tokens use,
       read from the model's config (a ``PretrainedConfig`` or its ``config.json`` dict).
-    * ``tokens_per_item(grid_row, spatial_merge_size)`` -- how many placeholder tokens one item of grid
-      ``grid_row`` expands to in its row.
     * ``spatial_merge_size(config)`` -- the vision tower's spatial merge factor, read from the model's config.
     * ``positions`` -- ``"mrope"`` for ``[4, 1, T]`` multimodal positions (``mrope_position_ids``), ``"1d"`` for
       plain text positions.
-    * ``item_prefix_tokens`` -- how many text tokens just before an item's first placeholder token belong to the
-      item (a begin marker, say), so a window that cuts between them and the item would split the item.
     """
 
     kinds: Tuple[MediaKind, ...]
     placeholder_ids: Callable[[Any], Dict[str, int]]
-    tokens_per_item: Callable[[Sequence[int], int], int]
     spatial_merge_size: Callable[[Any], int]
     positions: str
-    item_prefix_tokens: int = 0
 
     def __post_init__(self) -> None:
         names = [kind.name for kind in self.kinds]
@@ -83,8 +75,6 @@ class MediaSpec:
             raise ValueError(f"a media spec needs one or more distinct media kinds, got {names}")
         if self.positions not in POSITION_LAYOUTS:
             raise ValueError(f"positions must be one of {POSITION_LAYOUTS}, got {self.positions!r}")
-        if self.item_prefix_tokens < 0:
-            raise ValueError(f"item_prefix_tokens must be >= 0, got {self.item_prefix_tokens}")
 
     @property
     def modalities(self) -> Tuple[str, ...]:
@@ -104,8 +94,12 @@ def _config_value(config: Any, key: str) -> Any:
     return getattr(config, key, None)
 
 
-def _qwen_vl_placeholder_ids(config: Any) -> Dict[str, int]:
-    """The ids the config has, each read top-level, then from ``text_config``; a kind with neither is left out."""
+def config_placeholder_ids(config: Any) -> Dict[str, int]:
+    """``{modality: token id}`` from the config's ``image_token_id`` / ``video_token_id``.
+
+    Each id is read top-level, then from ``text_config``; a kind with neither is left out. The Qwen-VL spec reads its
+    ids this way, and so does a caller that needs the ids of a model type with no spec.
+    """
     text_config = _config_value(config, "text_config")
     ids = {}
     for modality, key in (("image", "image_token_id"), ("video", "video_token_id")):
@@ -125,21 +119,11 @@ def _qwen_vl_spatial_merge_size(config: Any) -> int:
     return int(merge)
 
 
-def _qwen_vl_tokens_per_item(grid_row: Sequence[int], spatial_merge_size: int) -> int:
-    # A video's frames are h * w / merge**2 tokens each; t of them make the same total as an image's grid.
-    if isinstance(grid_row, torch.Tensor):
-        grid_row = grid_row.tolist()
-    grid_t, grid_h, grid_w = (int(value) for value in grid_row)
-    return grid_t * grid_h * grid_w // (spatial_merge_size**2)
-
-
 QWEN_VL_MEDIA_SPEC = MediaSpec(
     kinds=(IMAGE_MEDIA, VIDEO_MEDIA),
-    placeholder_ids=_qwen_vl_placeholder_ids,
-    tokens_per_item=_qwen_vl_tokens_per_item,
+    placeholder_ids=config_placeholder_ids,
     spatial_merge_size=_qwen_vl_spatial_merge_size,
     positions="mrope",
-    item_prefix_tokens=0,
 )
 
 # Model types whose Arctic modeling takes media.py's layout and [4, 1, T] positions; see the module docstring.
