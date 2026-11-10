@@ -77,11 +77,19 @@ MEDIA_KINDS = (IMAGE_MEDIA, VIDEO_MEDIA)
 MEDIA_KEYS = frozenset(key for kind in MEDIA_KINDS for key in kind.keys)
 
 
-class MediaStraddleError(ValueError):
+class MediaBatchError(ValueError):
+    """The caller's media batch is malformed: its media leaves disagree with each other, its rows or its tokens.
+
+    A ValueError, so callers that catch ValueError still do; a caller that must tell a bad batch from an
+    internal error catches this instead of matching the message.
+    """
+
+
+class MediaStraddleError(MediaBatchError):
     """A media item's tokens straddle a window boundary, so no window can hold the item whole.
 
-    A ValueError, so callers that catch ValueError still do; a caller that must tell this refusal from other
-    malformed media (to change its layout and retry, say) catches this instead of matching the message.
+    A MediaBatchError; a caller that must tell this refusal from other malformed media (to change its layout
+    and retry, say) catches this instead of matching the message.
     ``kind`` is the media kind's name (``"image"`` or ``"video"``), ``index`` the item's position among that
     kind's items in the call, ``span`` its ``(start, end)`` token range and ``boundary`` the token it crosses.
     """
@@ -118,7 +126,7 @@ def split_media(batch: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any
             if isinstance(value, dict):
                 nested = sorted(MEDIA_KEYS.intersection(_all_keys(value)))
                 if nested:
-                    raise ValueError(f"media leaves {nested} must be top-level batch keys, not inside {key!r}")
+                    raise MediaBatchError(f"media leaves {nested} must be top-level batch keys, not inside {key!r}")
             rest[key] = value
     return rest, media
 
@@ -140,7 +148,7 @@ def _present_kinds(media: Mapping[str, Any]) -> List[MediaKind]:
             continue
         if len(present) != len(kind.keys):
             missing = sorted(set(kind.keys) - set(present))
-            raise ValueError(f"{kind.name} media needs {list(kind.keys)} together; missing {missing}")
+            raise MediaBatchError(f"{kind.name} media needs {list(kind.keys)} together; missing {missing}")
         kinds.append(kind)
     return kinds
 
@@ -154,22 +162,22 @@ def check_media(media: Mapping[str, Any], n_rows: int) -> None:
     for kind in _present_kinds(media):
         values, grid, row_ids = (media[key] for key in kind.keys)
         if grid.ndim != 2 or grid.shape[1] != 3:
-            raise ValueError(f"{kind.grid_key} must be [{kind.name}s, 3], got {tuple(grid.shape)}")
+            raise MediaBatchError(f"{kind.grid_key} must be [{kind.name}s, 3], got {tuple(grid.shape)}")
         if row_ids.ndim != 1 or row_ids.shape[0] != grid.shape[0]:
-            raise ValueError(
+            raise MediaBatchError(
                 f"{kind.row_ids_key} must hold one row id per {kind.name} ({grid.shape[0]}), "
                 f"got shape {tuple(row_ids.shape)}"
             )
         if row_ids.numel():
             if int(row_ids.min()) < 0 or int(row_ids.max()) >= n_rows:
-                raise ValueError(f"{kind.row_ids_key} must be in [0, {n_rows}), got {row_ids.tolist()}")
+                raise MediaBatchError(f"{kind.row_ids_key} must be in [0, {n_rows}), got {row_ids.tolist()}")
             if (row_ids[1:] < row_ids[:-1]).any():
-                raise ValueError(
+                raise MediaBatchError(
                     f"{kind.row_ids_key} must be non-decreasing (media in row order), got {row_ids.tolist()}"
                 )
         patches = int(_patch_counts(grid).sum())
         if values.ndim < 1 or int(values.shape[0]) != patches:
-            raise ValueError(
+            raise MediaBatchError(
                 f"{kind.values_key} has {int(values.shape[0]) if values.ndim else 0} patches but "
                 f"{kind.grid_key} describes {patches}"
             )
@@ -222,7 +230,7 @@ def media_token_spans(
     token_types = mm_token_type_ids.reshape(-1)
     positions = torch.nonzero(token_types == kind.token_type).flatten()
     if int(positions.numel()) != int(token_counts.sum()):
-        raise ValueError(
+        raise MediaBatchError(
             f"the packed call has {int(positions.numel())} {kind.name} tokens but {kind.grid_key} expands to "
             f"{int(token_counts.sum())} at spatial_merge_size {spatial_merge_size}"
         )
@@ -233,15 +241,15 @@ def media_token_spans(
         item_positions = positions[offset : offset + count]
         offset += count
         if count == 0:
-            raise ValueError(f"{kind.name} {item} expands to no tokens")
+            raise MediaBatchError(f"{kind.name} {item} expands to no tokens")
         if kind.token_type == VIDEO_TOKEN_TYPE:
             _check_video_frames(item, grid[item], item_positions, token_types, spatial_merge_size)
         elif int(item_positions[-1]) - int(item_positions[0]) + 1 != count:
-            raise ValueError(f"{kind.name} {item}'s {count} tokens are not contiguous in the packed call")
+            raise MediaBatchError(f"{kind.name} {item}'s {count} tokens are not contiguous in the packed call")
         start, last = int(item_positions[0]), int(item_positions[-1])
         row = int(row_ids[item])
         if not (boundaries[row] <= start and last < boundaries[row + 1]):
-            raise ValueError(
+            raise MediaBatchError(
                 f"{kind.name} {item} belongs to row {row} ([{boundaries[row]}, {boundaries[row + 1]})) but its "
                 f"tokens are at [{start}, {last + 1})"
             )
@@ -263,7 +271,7 @@ def _check_video_frames(
     frames, height, width = (int(value) for value in grid.tolist())
     frame_tokens = height * width // (spatial_merge_size**2)
     if frame_tokens * frames != int(positions.numel()):
-        raise ValueError(
+        raise MediaBatchError(
             f"video {item}'s grid {[frames, height, width]} does not split into {frames} frames of whole merged "
             f"tokens at spatial_merge_size {spatial_merge_size}"
         )
@@ -272,13 +280,13 @@ def _check_video_frames(
         frame_positions = positions[frame * frame_tokens : (frame + 1) * frame_tokens]
         start, last = int(frame_positions[0]), int(frame_positions[-1])
         if last - start + 1 != frame_tokens:
-            raise ValueError(
+            raise MediaBatchError(
                 f"video {item}'s frame {frame} ({frame_tokens} tokens) is not contiguous in the packed call"
             )
         if previous_last is not None:
             between = token_types[previous_last + 1 : start]
             if (between != TEXT_TOKEN_TYPE).any():
-                raise ValueError(
+                raise MediaBatchError(
                     f"video {item} has non-text tokens (types {sorted(set(between.tolist()) - {TEXT_TOKEN_TYPE})}) "
                     f"between its frames {frame - 1} and {frame}, at [{previous_last + 1}, {start})"
                 )
@@ -311,7 +319,7 @@ def window_media(
     if spatial_merge_size is None:
         raise ValueError("splitting a call that carries media needs spatial_merge_size to locate media tokens")
     if mm_token_type_ids is None:
-        raise ValueError("splitting a call that carries media needs its packed mm_token_type_ids")
+        raise MediaBatchError("splitting a call that carries media needs its packed mm_token_type_ids")
     window_start, window_end = window
     cuts = sorted({window_start, window_end} if boundaries is None else {int(cut) for cut in boundaries})
     result: Dict[str, Any] = dict(media)
