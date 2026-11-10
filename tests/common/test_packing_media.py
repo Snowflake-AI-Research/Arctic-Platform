@@ -20,15 +20,20 @@ import pickle
 import pytest
 import torch
 
+from arctic_platform.common.packing import MediaBatchError
 from arctic_platform.common.packing import MediaStraddleError
+from arctic_platform.common.packing import check_media
 from arctic_platform.common.packing import cu_seqlens_from_position_ids
 from arctic_platform.common.packing import media_token_spans
 from arctic_platform.common.packing import mrope_position_ids
 from arctic_platform.common.packing import pack_microbatch
 from arctic_platform.common.packing import pad_packed_microbatch
+from arctic_platform.common.packing import select_media_rows
 from arctic_platform.common.packing import select_rows
+from arctic_platform.common.packing import split_media
 from arctic_platform.common.packing import token_shard
 from arctic_platform.common.packing import window_media
+from arctic_platform.common.packing.media import IMAGE_MEDIA
 from arctic_platform.common.packing.media import VIDEO_MEDIA
 
 MERGE = 2
@@ -171,14 +176,38 @@ def test_pad_extends_multimodal_positions_with_zeros():
         (lambda b: b.update(image_row_ids=torch.tensor([0, 2])), "one row id per image"),
         (lambda b: b.pop("image_row_ids"), r"missing \['image_row_ids'\]"),
         (lambda b: b.update(context={"pixel_values": b.pop("pixel_values")}), "must be top-level"),
+        (lambda b: b.update(image_grid_thw=b["image_grid_thw"][:, :2]), r"must be \[images, 3\], got \(3, 2\)"),
     ],
-    ids=["row-out-of-range", "rows-out-of-order", "patch-count", "row-id-count", "partial-keys", "nested"],
+    ids=["row-out-of-range", "rows-out-of-order", "patch-count", "row-id-count", "partial-keys", "nested", "grid"],
 )
-def test_pack_rejects_inconsistent_media(mutate, match):
+def test_pack_and_select_rows_reject_inconsistent_media(mutate, match):
     batch = _batch()
     mutate(batch)
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(MediaBatchError, match=match):
         pack_microbatch(batch)
+    with pytest.raises(MediaBatchError, match=match):
+        select_rows(batch, torch.tensor([2, 0]), n_rows=3)
+
+
+def test_a_malformed_media_batch_is_a_value_error_and_a_straddle_is_one_of_them():
+    assert issubclass(MediaBatchError, ValueError)
+    assert issubclass(MediaStraddleError, MediaBatchError)
+
+
+def test_each_public_media_check_raises_a_media_batch_error():
+    _, media = split_media(_batch())
+    packed, metadata = pack_microbatch(_batch())
+    types = packed["mm_token_type_ids"]
+    with pytest.raises(MediaBatchError, match="must be top-level"):
+        split_media({"context": {"image_grid_thw": media["image_grid_thw"]}})
+    with pytest.raises(MediaBatchError, match=r"must be in \[0, 2\)"):
+        check_media(media, n_rows=2)
+    with pytest.raises(MediaBatchError, match=r"must be in \[0, 2\)"):
+        select_media_rows(media, torch.tensor([0]), n_rows=2)
+    with pytest.raises(
+        MediaBatchError, match="has 8 image tokens but image_grid_thw expands to 1 at spatial_merge_size 4"
+    ):
+        media_token_spans(media, IMAGE_MEDIA, types, metadata.cu_seqlens, spatial_merge_size=4)
 
 
 # ─── Token windows ──────────────────────────────────────────────────────
@@ -233,7 +262,7 @@ def test_an_image_straddling_a_window_boundary_is_refused_on_every_window(shard_
     # Four windows of four tokens: A at [1, 5) straddles the boundary at 4. Every window refuses the call, the
     # ones A never touches too, so no rank goes on alone.
     packed, metadata = pad_packed_microbatch(*pack_microbatch(_batch()), 4)
-    with pytest.raises(ValueError, match=r"image 0's tokens \[1, 5\) straddle the window boundary at token 4"):
+    with pytest.raises(MediaBatchError, match=r"image 0's tokens \[1, 5\) straddle the window boundary at token 4"):
         token_shard(packed, metadata, 4, shard_index, spatial_merge_size=MERGE)
 
 
@@ -277,12 +306,12 @@ def test_window_media_alone_checks_its_own_boundaries_unless_given_the_calls():
         return window_media(media, types, metadata.cu_seqlens, span, spatial_merge_size=MERGE, **kwargs)
 
     # A at [1, 5) crosses this window's own start.
-    with pytest.raises(ValueError, match=r"image 0's tokens \[1, 5\) straddle the window boundary at token 4"):
+    with pytest.raises(MediaBatchError, match=r"image 0's tokens \[1, 5\) straddle the window boundary at token 4"):
         window((4, 8))
     # [8, 16) does not touch A, and its own boundaries cut no image: B and C, whole.
     assert window((8, 16))["image_grid_thw"].tolist() == [[1, 2, 4], [1, 2, 4]]
     # Given the call's boundaries, it refuses the straddle elsewhere in the call too.
-    with pytest.raises(ValueError, match="at token 4"):
+    with pytest.raises(MediaBatchError, match="at token 4"):
         window((8, 16), boundaries=[0, 4, 8, 12, 16])
 
 
@@ -345,7 +374,7 @@ def test_splitting_media_needs_token_types():
     batch = _batch()
     batch.pop("mm_token_type_ids")
     packed, metadata = pack_microbatch(batch)
-    with pytest.raises(ValueError, match="needs its packed mm_token_type_ids"):
+    with pytest.raises(MediaBatchError, match="needs its packed mm_token_type_ids"):
         token_shard(packed, metadata, 1, 0, spatial_merge_size=MERGE)
 
 
@@ -354,7 +383,7 @@ def test_grids_that_disagree_with_the_image_tokens_are_rejected():
     batch["image_grid_thw"] = torch.tensor([[1, 4, 4], [1, 2, 4], [1, 2, 2]])
     batch["pixel_values"] = batch["pixel_values"][:28]
     packed, metadata = pack_microbatch(batch)
-    with pytest.raises(ValueError, match="has 8 image tokens but image_grid_thw expands to 7"):
+    with pytest.raises(MediaBatchError, match="has 8 image tokens but image_grid_thw expands to 7"):
         token_shard(packed, metadata, 1, 0, spatial_merge_size=MERGE)
 
 
@@ -363,7 +392,7 @@ def test_image_whose_tokens_sit_in_another_row_is_rejected():
     batch = _batch()
     batch["image_row_ids"] = torch.tensor([1, 2, 2])
     packed, metadata = pack_microbatch(batch)
-    with pytest.raises(ValueError, match="image 0 belongs to row 1"):
+    with pytest.raises(MediaBatchError, match="image 0 belongs to row 1"):
         token_shard(packed, metadata, 1, 0, spatial_merge_size=MERGE)
 
 
@@ -462,7 +491,7 @@ def test_each_window_gets_the_whole_videos_and_images_inside_it():
 def test_media_straddling_a_window_boundary_in_packed_rows_is_refused(rows, shard_count, match):
     packed, metadata = pad_packed_microbatch(*pack_microbatch(_mixed_batch(rows)), shard_count)
     for shard_index in range(shard_count):
-        with pytest.raises(ValueError, match=match):
+        with pytest.raises(MediaBatchError, match=match):
             token_shard(packed, metadata, shard_count, shard_index, spatial_merge_size=MERGE)
 
 
@@ -480,18 +509,20 @@ def test_media_straddling_a_window_boundary_in_packed_rows_is_refused(rows, shar
         ([([T, V, V, T], [], [[2, 2, 4]]), ([T, V, V, T], [], [])], "video 0 belongs to row 0"),
         # A grid whose frames are not whole merged tokens: 12 patches are 3 tokens, frames of 6 patches 1 each.
         ([([T, V, V, V, T], [], [[2, 2, 3]])], r"does not split into 2 frames of whole merged tokens"),
+        # A grid smaller than one merged token: 1 patch is no token at merge 2.
+        ([([T, T], [], [[1, 1, 1]])], "video 0 expands to no tokens"),
     ],
-    ids=["frame-size", "image-between-frames", "frame-outside-row", "fractional-frame"],
+    ids=["frame-size", "image-between-frames", "frame-outside-row", "fractional-frame", "no-tokens"],
 )
 def test_videos_that_are_not_text_separated_frame_runs_are_rejected(rows, match):
     batch = _mixed_batch(rows)
     packed, metadata = pack_microbatch(batch)
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(MediaBatchError, match=match):
         token_shard(packed, metadata, 1, 0, spatial_merge_size=MERGE)
 
 
 def test_an_image_split_by_text_is_still_rejected():
     rows = [([T, I, I, T, I, I, T], [[1, 4, 4]], [])]
     packed, metadata = pack_microbatch(_mixed_batch(rows))
-    with pytest.raises(ValueError, match="image 0's 4 tokens are not contiguous"):
+    with pytest.raises(MediaBatchError, match="image 0's 4 tokens are not contiguous"):
         token_shard(packed, metadata, 1, 0, spatial_merge_size=MERGE)
