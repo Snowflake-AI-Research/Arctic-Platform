@@ -41,9 +41,14 @@ def registry(monkeypatch):
     return specs
 
 
-@pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe", "qwen4_exp"])
-def test_qwen_vl_model_types_get_the_qwen_vl_spec(model_type):
-    assert media_spec_for(model_type) is QWEN_VL_MEDIA_SPEC
+def test_qwen4_exp_gets_the_qwen_vl_spec():
+    assert media_spec_for("qwen4_exp") is QWEN_VL_MEDIA_SPEC
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"])
+def test_qwen_vl_model_types_without_an_mrope_media_forward_have_no_spec(model_type):
+    # Their Arctic modeling does not read [4, 1, T] positions and video (qwen3_5_moe flattens position_ids).
+    assert media_spec_for(model_type) is None
 
 
 def test_unknown_and_text_only_model_types_have_no_spec():
@@ -78,9 +83,29 @@ def test_qwen_vl_placeholder_ids_from_each_family_default_config(model_type):
     assert ids == {"image": config.image_token_id, "video": config.video_token_id}
 
 
-def test_qwen_vl_placeholder_ids_need_both_ids():
-    with pytest.raises(ValueError, match="video_token_id"):
-        QWEN_VL_MEDIA_SPEC.placeholder_ids({"image_token_id": 29})
+def test_qwen_vl_placeholder_ids_leave_out_a_kind_with_no_id():
+    assert QWEN_VL_MEDIA_SPEC.placeholder_ids({"image_token_id": 29}) == {"image": 29}
+    assert QWEN_VL_MEDIA_SPEC.placeholder_ids({"video_token_id": 30, "text_config": {}}) == {"video": 30}
+    assert QWEN_VL_MEDIA_SPEC.placeholder_ids({"vocab_size": 64}) == {}
+
+
+def test_qwen_vl_placeholder_ids_fall_back_to_text_config():
+    config = {"image_token_id": 29, "text_config": {"image_token_id": 99, "video_token_id": 30}}
+    # Top-level first: the image id is the config's own, the video id comes from text_config.
+    assert QWEN_VL_MEDIA_SPEC.placeholder_ids(config) == {"image": 29, "video": 30}
+    transformers = pytest.importorskip("transformers")
+    nested = transformers.PretrainedConfig(text_config=transformers.PretrainedConfig(image_token_id=29))
+    assert QWEN_VL_MEDIA_SPEC.placeholder_ids(nested) == {"image": 29}
+
+
+def test_qwen_vl_spatial_merge_size_from_the_vision_config():
+    transformers = pytest.importorskip("transformers")
+    config = transformers.Qwen3VLConfig(vision_config={"depth": 1, "hidden_size": 16, "spatial_merge_size": 3})
+    assert QWEN_VL_MEDIA_SPEC.spatial_merge_size(config) == 3
+    assert QWEN_VL_MEDIA_SPEC.spatial_merge_size(config.to_dict()) == 3
+    for missing in ({}, {"vision_config": {}}):
+        with pytest.raises(ValueError, match="vision_config.spatial_merge_size"):
+            QWEN_VL_MEDIA_SPEC.spatial_merge_size(missing)
 
 
 def test_qwen_vl_leaf_names_are_the_ones_media_uses():
@@ -129,6 +154,7 @@ def test_register_a_second_spec(registry):
         kinds=(image,),
         placeholder_ids=lambda config: {"image": int(config["image_token_index"])},
         tokens_per_item=lambda grid_row, merge: int(grid_row[1]) * int(grid_row[2]) // merge**2 + 1,
+        spatial_merge_size=lambda config: int(config["merge"]),
         positions="1d",
         item_prefix_tokens=1,
     )
@@ -138,6 +164,7 @@ def test_register_a_second_spec(registry):
     assert spec.modalities == ("image",)
     assert spec.placeholder_ids({"image_token_index": 7}) == {"image": 7}
     assert spec.tokens_per_item([1, 4, 4], MERGE) == 5
+    assert spec.spatial_merge_size({"merge": 2}) == 2
 
 
 def test_a_duplicate_model_type_is_refused(registry):
@@ -160,9 +187,10 @@ def test_a_spec_is_frozen():
 
 
 def test_a_malformed_spec_is_refused():
+    ids, merge = QWEN_VL_MEDIA_SPEC.placeholder_ids, QWEN_VL_MEDIA_SPEC.spatial_merge_size
     with pytest.raises(ValueError, match="positions"):
-        MediaSpec((IMAGE_MEDIA,), QWEN_VL_MEDIA_SPEC.placeholder_ids, QWEN_VL_MEDIA_SPEC.tokens_per_item, "rope3d")
+        MediaSpec((IMAGE_MEDIA,), ids, QWEN_VL_MEDIA_SPEC.tokens_per_item, merge, "rope3d")
     with pytest.raises(ValueError, match="distinct"):
-        MediaSpec((IMAGE_MEDIA, IMAGE_MEDIA), QWEN_VL_MEDIA_SPEC.placeholder_ids, len, "mrope")
+        MediaSpec((IMAGE_MEDIA, IMAGE_MEDIA), ids, len, merge, "mrope")
     with pytest.raises(ValueError, match="item_prefix_tokens"):
-        MediaSpec((IMAGE_MEDIA,), QWEN_VL_MEDIA_SPEC.placeholder_ids, len, "1d", item_prefix_tokens=-1)
+        MediaSpec((IMAGE_MEDIA,), ids, len, merge, "1d", item_prefix_tokens=-1)

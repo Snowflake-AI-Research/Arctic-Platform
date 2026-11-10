@@ -22,7 +22,16 @@ caller asks ``media_spec_for(model_type)`` instead of assuming them, and a famil
 (other placeholder rules, other leaf names, a token count on another grid, 1-D positions, a marker token
 before each item that belongs to it) registers its own entry with ``register_media_spec``.
 
-The Qwen-VL entry reproduces the constants the existing code uses; nothing here changes that code yet.
+The Qwen-VL entry reproduces the constants the existing code uses. ``run_pipeline`` takes its media kinds, its
+spatial merge factor and its position layout from the spec of the engine's ``model_type``. A model type with no spec
+keeps what ``run_pipeline`` did before specs: ``pixel_values`` and ``image_grid_thw`` reach the engine as sent (no
+M-RoPE positions, no row ids; the model builds its own positions), and any other media key is refused for it.
+
+Only ``qwen4_exp`` is registered: its Arctic modeling takes ``[4, 1, T]`` M-RoPE ``position_ids`` and both
+``pixel_values`` and ``pixel_values_videos``. Other Qwen vision-language model types are left out until their Arctic
+code path does the same: Arctic's own ``qwen3_5_moe`` modeling flattens ``position_ids.view(-1)`` to find its packed
+rows and has no ``pixel_values_videos`` parameter, and ``qwen3_vl``, ``qwen3_vl_moe`` and ``qwen3_5`` have no Arctic
+modeling that reads ``[4, 1, T]`` positions. Spec'd media for them would reach a forward that misreads it.
 """
 
 from __future__ import annotations
@@ -54,6 +63,7 @@ class MediaSpec:
       read from the model's config (a ``PretrainedConfig`` or its ``config.json`` dict).
     * ``tokens_per_item(grid_row, spatial_merge_size)`` -- how many placeholder tokens one item of grid
       ``grid_row`` expands to in its row.
+    * ``spatial_merge_size(config)`` -- the vision tower's spatial merge factor, read from the model's config.
     * ``positions`` -- ``"mrope"`` for ``[4, 1, T]`` multimodal positions (``mrope_position_ids``), ``"1d"`` for
       plain text positions.
     * ``item_prefix_tokens`` -- how many text tokens just before an item's first placeholder token belong to the
@@ -63,6 +73,7 @@ class MediaSpec:
     kinds: Tuple[MediaKind, ...]
     placeholder_ids: Callable[[Any], Dict[str, int]]
     tokens_per_item: Callable[[Sequence[int], int], int]
+    spatial_merge_size: Callable[[Any], int]
     positions: str
     item_prefix_tokens: int = 0
 
@@ -94,13 +105,24 @@ def _config_value(config: Any, key: str) -> Any:
 
 
 def _qwen_vl_placeholder_ids(config: Any) -> Dict[str, int]:
+    """The ids the config has, each read top-level, then from ``text_config``; a kind with neither is left out."""
+    text_config = _config_value(config, "text_config")
     ids = {}
     for modality, key in (("image", "image_token_id"), ("video", "video_token_id")):
         value = _config_value(config, key)
-        if value is None:
-            raise ValueError(f"a Qwen-VL config needs {key} to place {modality} tokens")
-        ids[modality] = int(value)
+        if value is None and text_config is not None:
+            value = _config_value(text_config, key)
+        if value is not None:
+            ids[modality] = int(value)
     return ids
+
+
+def _qwen_vl_spatial_merge_size(config: Any) -> int:
+    vision_config = _config_value(config, "vision_config")
+    merge = None if vision_config is None else _config_value(vision_config, "spatial_merge_size")
+    if merge is None:
+        raise ValueError("a Qwen-VL config needs vision_config.spatial_merge_size")
+    return int(merge)
 
 
 def _qwen_vl_tokens_per_item(grid_row: Sequence[int], spatial_merge_size: int) -> int:
@@ -115,12 +137,13 @@ QWEN_VL_MEDIA_SPEC = MediaSpec(
     kinds=(IMAGE_MEDIA, VIDEO_MEDIA),
     placeholder_ids=_qwen_vl_placeholder_ids,
     tokens_per_item=_qwen_vl_tokens_per_item,
+    spatial_merge_size=_qwen_vl_spatial_merge_size,
     positions="mrope",
     item_prefix_tokens=0,
 )
 
-# Qwen vision-language families whose media follows media.py's layout, Qwen3-VL video frames included.
-QWEN_VL_MODEL_TYPES = ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe", "qwen4_exp")
+# Model types whose Arctic modeling takes media.py's layout and [4, 1, T] positions; see the module docstring.
+QWEN_VL_MODEL_TYPES = ("qwen4_exp",)
 
 _MEDIA_SPECS: Dict[str, MediaSpec] = {}
 

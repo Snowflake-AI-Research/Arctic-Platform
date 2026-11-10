@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import importlib
 import importlib.abc
 import importlib.machinery
@@ -1317,7 +1318,7 @@ def test_stream_refuses_unsupported_format_before_any_loader(fake_loaders, monke
 # The engine's resolved kwargs name torchcodec; a caller's default ones would name opencv (cv2).
 _ENGINE_VIDEO_KWARGS = {"video": {"backend": "torchcodec"}}
 # The engine's loaded config: ids unlike any Qwen-VL checkpoint's a caller could read.
-_ENGINE_HF_CONFIG = SimpleNamespace(model_type="qwen3_5", image_token_id=901, video_token_id=902)
+_ENGINE_HF_CONFIG = SimpleNamespace(model_type="qwen4_exp", image_token_id=901, video_token_id=902)
 _ENGINE_IDS = {"image": 901, "video": 902}
 
 
@@ -1450,9 +1451,18 @@ def test_pool_media_modalities_check_model_id(monkeypatch):
 
 
 def test_worker_media_modalities_raise_when_spec_lacks_an_id(monkeypatch):
-    # A Qwen-VL config without video_token_id: its spec cannot place tokens, which is not "no media".
+    # A spec'd config its spec cannot place tokens with: that is not "no media".
+    from arctic_platform.common.packing import media_spec as media_spec_module
+
+    def strict_ids(config):
+        if getattr(config, "video_token_id", None) is None:
+            raise ValueError("strict_vl needs video_token_id")
+        return {"image": config.image_token_id, "video": config.video_token_id}
+
+    spec = dataclasses.replace(media_spec_module.QWEN_VL_MEDIA_SPEC, placeholder_ids=strict_ids)
+    monkeypatch.setattr(media_spec_module, "_MEDIA_SPECS", {**media_spec_module._MEDIA_SPECS, "strict_vl": spec})
     _video_libraries(monkeypatch, *_VIDEO_LIBRARIES)
-    worker = _media_worker(hf_config=SimpleNamespace(model_type="qwen3_5", image_token_id=901, secret="s3cr3t"))
+    worker = _media_worker(hf_config=SimpleNamespace(model_type="strict_vl", image_token_id=901, secret="s3cr3t"))
     with pytest.raises(ValueError, match="needs video_token_id") as raised:
         worker.media_modalities()
     assert "s3cr3t" not in str(raised.value)
