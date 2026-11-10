@@ -616,18 +616,23 @@ def lm_head_logprobs_kernel(
     token_chunk_size: int,
     vocab_padding: int,
     fp32: bool = False,
+    tensor_parallel: int = 1,
 ) -> torch.Tensor:
     """The forward of :func:`lm_head_logprobs` without autograd; ``labels`` must be valid token ids."""
     head = _fp32_logits_linear() if fp32 else _batch_invariant().linear_batch_invariant
     vocab_size = weight.shape[0]
     padded = _padded_vocab(vocab_size, vocab_padding)
+    if padded % tensor_parallel:
+        raise ValueError(f"the padded vocabulary {padded} does not split across {tensor_parallel} ranks")
     lm_weight = weight
     if padded != vocab_size:
         lm_weight = torch.cat((weight, weight.new_zeros(padded - vocab_size, weight.shape[1])))
+    shards = lm_weight.chunk(tensor_parallel)
     out = torch.empty(hidden.shape[0], dtype=torch.float32, device=hidden.device)
     for start in range(0, hidden.shape[0], token_chunk_size):
         stop = min(start + token_chunk_size, hidden.shape[0])
-        logits = head(hidden[start:stop], lm_weight)[:, :vocab_size]
+        # vLLM's ParallelLMHead: each rank's logits over its slice of the padded vocabulary, gathered.
+        logits = torch.cat([head(hidden[start:stop], shard) for shard in shards], dim=-1)[:, :vocab_size]
         if temperature != 1.0:
             logits = logits.float() / torch.tensor(temperature, dtype=torch.float32, device=logits.device)
         out[start:stop] = _token_logprobs_kernel(logits, labels[start:stop])
@@ -636,8 +641,9 @@ def lm_head_logprobs_kernel(
 
 class _LMHeadLogprobs(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight, labels, temperature, token_chunk_size, vocab_padding, fp32):
-        out = lm_head_logprobs_kernel(hidden, weight, labels, temperature, token_chunk_size, vocab_padding, fp32)
+    def forward(ctx, hidden, weight, labels, temperature, token_chunk_size, vocab_padding, fp32, tensor_parallel):
+        out = lm_head_logprobs_kernel(hidden, weight, labels, temperature, token_chunk_size, vocab_padding, fp32,
+                                      tensor_parallel)  # fmt: skip
         ctx.save_for_backward(hidden, weight, labels)
         ctx.temperature = temperature
         ctx.token_chunk_size = token_chunk_size
@@ -686,7 +692,7 @@ class _LMHeadLogprobs(torch.autograd.Function):
                 grad_hidden[t0:t1] += (grad_logits @ w).float()
                 grad_w += (grad_logits.t() @ hidden[t0:t1].to(compute_dtype)).float()
             grad_weight[v0:v1] = grad_w.to(weight.dtype)
-        return grad_hidden.to(hidden.dtype), grad_weight, None, None, None, None, None
+        return grad_hidden.to(hidden.dtype), grad_weight, None, None, None, None, None, None
 
 
 def lm_head_logprobs(
@@ -698,6 +704,7 @@ def lm_head_logprobs(
     token_chunk_size: int = 1024,
     vocab_padding: int = 64,
     fp32: bool = False,
+    tensor_parallel: int = 1,
 ) -> torch.Tensor:
     """Log-probability of ``labels`` (``[tokens]``) under the logits of ``hidden`` (``[tokens, hidden]``).
 
@@ -708,11 +715,13 @@ def lm_head_logprobs(
     differently from a full log-softmax followed by a gather. Rows are independent, so chunking them changes nothing.
     A label of -100 scores 0 and receives no gradient. ``fp32`` computes fp32 logits from the bf16 operands by
     vLLM's batch-invariant persistent matmul, as the sampler's fp32 LM head does in batch-invariant mode
-    (:mod:`arctic_platform.inference.vllm.batch_invariant_fp32_logits`), and takes the gradient in fp32.
+    (:mod:`arctic_platform.inference.vllm.batch_invariant_fp32_logits`), and takes the gradient in fp32. At
+    ``tensor_parallel`` > 1 the logits are the ranks' matmuls over their slices of the padded vocabulary, gathered.
     """
     ignored = labels == -100
     safe_labels = labels.masked_fill(ignored, 0).to(torch.long)
     logprobs = _LMHeadLogprobs.apply(
-        hidden, weight, safe_labels, float(temperature), int(token_chunk_size), int(vocab_padding), bool(fp32)
-    )
+        hidden, weight, safe_labels, float(temperature), int(token_chunk_size), int(vocab_padding), bool(fp32),
+        int(tensor_parallel),
+    )  # fmt: skip
     return logprobs.masked_fill(ignored, 0.0)

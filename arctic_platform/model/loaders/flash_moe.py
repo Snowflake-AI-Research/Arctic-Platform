@@ -71,11 +71,20 @@ class Glm5NextOptions(FlashMoeOptions):
             " arctic_platform.model.implementations.vllm_aligned.glm5_next)."
         ),
     )
+    vllm_aligned_tensor_parallel: int = Field(
+        1,
+        ge=1,
+        description=(
+            "Experimental, with vllm_aligned. The sampler's tensor-parallel size: the trainer runs each rank's share"
+            " of the split layers on its weight shard and sums the partials as vLLM's batch-invariant all-reduce does."
+        ),
+    )
 
 
 class _FlashLoadOptions(Qwen3_5MoeOptions):
     fp32_routed_weighting: bool = False
     vllm_aligned: bool = False
+    vllm_aligned_tensor_parallel: int = 1
 
 
 def _matches(family: str):
@@ -190,6 +199,7 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
             token_chunk_size=chunk if isinstance(chunk, int) else 1024,
             lm_head_fp32=options.fp32_lm_head,
             ep_group=(ctx.parallel_groups or {}).get("ep_group"),
+            tensor_parallel=options.vllm_aligned_tensor_parallel,
         )
     return loaded
 

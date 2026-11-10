@@ -56,6 +56,45 @@ from arctic_platform.model.implementations.vllm_aligned import ops
 FP8_BLOCK = 128  # block-FP8 weight block (rows and columns)
 
 
+def tp_shard(tensor: torch.Tensor, tp: int, rank: int, dim: int = 0) -> torch.Tensor:
+    """Tensor-parallel rank ``rank``'s contiguous ``1 / tp`` of ``tensor`` along ``dim``, as vLLM's loaders shard."""
+    if tp == 1:
+        return tensor
+    size = tensor.shape[dim]
+    if size % tp:
+        raise ValueError(f"{size} rows do not split across {tp} tensor-parallel ranks")
+    return tensor.narrow(dim, rank * (size // tp), size // tp)
+
+
+def tp_sum(partials: list[torch.Tensor]) -> torch.Tensor:
+    """vLLM's batch-invariant all-reduce: the ranks' partials added in fp32 in rank order, rounded once."""
+    if len(partials) == 1:
+        return partials[0]
+    total = partials[0].float()
+    for partial in partials[1:]:
+        total = total + partial.float()
+    return total.to(partials[0].dtype)
+
+
+def _fp8_shard(weight: torch.Tensor, scale: torch.Tensor, tp: int, rank: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """A rank's shard of a block-FP8 weight and its block scales along ``dim`` (whole 128-blocks per rank)."""
+    if tp == 1:
+        return weight, scale
+    if (weight.shape[dim] // tp) % FP8_BLOCK:
+        raise ValueError(f"{weight.shape[dim]} FP8 rows do not split across {tp} ranks in {FP8_BLOCK}-blocks")
+    return tp_shard(weight, tp, rank, dim).contiguous(), tp_shard(scale, tp, rank, dim).contiguous()
+
+
+def _column_lora(factors: tuple | None, tp: int, rank: int) -> tuple | None:
+    """vLLM's column-parallel LoRA shard: the whole ``A``, the rank's rows of ``B``."""
+    return factors if factors is None or tp == 1 else (factors[0], tp_shard(factors[1], tp, rank).contiguous())
+
+
+def _row_lora(factors: tuple | None, tp: int, rank: int) -> tuple | None:
+    """vLLM's row-parallel LoRA shard: the rank's input columns of ``A``, the whole ``B``."""
+    return factors if factors is None or tp == 1 else (tp_shard(factors[0], tp, rank, 1).contiguous(), factors[1])
+
+
 def _mhc_constants():
     from vllm.models.glm5next.common.model import _MHC_POST_MULT_VALUE
 
@@ -112,7 +151,7 @@ class _AlignedLayer(torch.autograd.Function):
 KDA_O_NORM_EPS = 1e-5  # vLLM builds the gated output norm with FusedRMSNormGated's default eps, not rms_norm_eps
 
 
-def _kda_decode(core, qkv, g1, beta, conv_states, recurrent, conv_weight, gate, starts, prompt_lens, lengths, slots,
+def _kda_decode(core, qkv, g1, beta, conv_states, recurrent, conv_weight, w, starts, prompt_lens, lengths, slots,
                 heads: int, head_dim: int, config: Any) -> None:  # fmt: skip
     """Write the decoded tokens' KDA core output into ``core``, one decode step at a time over every request still
     decoding, as vLLM's plain decode step runs them: ``causal_conv1d_update`` on the request's conv state slot, then
@@ -121,8 +160,8 @@ def _kda_decode(core, qkv, g1, beta, conv_states, recurrent, conv_weight, gate, 
     from vllm.models.glm5next.nvidia.ops.third_party.kda import fused_recurrent_kda
 
     projection = heads * head_dim
-    a_log = gate.A_log.float().reshape(1, 1, heads, 1)
-    g_bias = gate.dt_bias.float().reshape(-1)
+    a_log = w.a_log.reshape(1, 1, heads, 1)
+    g_bias = w.dt_bias
     steps = lengths - prompt_lens
     for step in range(int(steps.max())):
         active = torch.nonzero(steps > step).flatten()
@@ -146,8 +185,33 @@ def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
     return kda_forward(attn, x, cu_seqlens, config, trace=trace)
 
 
+def _kda_weights(attn: Any, tp: int = 1, rank: int = 0) -> Any:
+    """Tensor-parallel rank ``rank``'s KDA weights as vLLM holds them: its heads of q/k/v/b, ``f_b``/``g_b``, the conv,
+    ``A_log`` and ``dt_bias``, the replicated ``f_a``/``g_a``, and its input columns of ``o_proj`` (and of its LoRA A)."""
+    import types
+
+    gate = attn.forget_gate
+    projection = attn.num_heads * attn.head_dim
+    conv = attn.conv1d.weight.float().reshape(3 * projection, -1)
+    merged = [tp_shard(t, tp, rank) for t in (attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight,
+                                               attn.b_proj.weight)]  # fmt: skip
+    return types.SimpleNamespace(
+        heads=attn.num_heads // tp,
+        head_dim=attn.head_dim,
+        merged=torch.cat([*merged, gate.f_a_proj.weight, attn.g_a_proj.weight]),
+        f_b=tp_shard(gate.f_b_proj.weight, tp, rank),
+        g_b=tp_shard(attn.g_b_proj.weight, tp, rank),
+        conv=torch.cat([tp_shard(c, tp, rank) for c in conv.split(projection)]),
+        a_log=tp_shard(gate.A_log.float().reshape(-1), tp, rank),
+        dt_bias=tp_shard(gate.dt_bias.float().reshape(-1), tp, rank),
+        o_norm=attn.o_norm.weight,
+        o_weight=tp_shard(bf16_weight(attn.o_proj), tp, rank, 1).contiguous(),
+        o_lora=_row_lora(lora_factors(attn.o_proj), tp, rank),
+    )
+
+
 def kda_forward(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any,
-                prompt_lens: torch.Tensor | None = None, trace: dict | None = None) -> torch.Tensor:  # fmt: skip
+                prompt_lens: torch.Tensor | None = None, trace: dict | None = None, tp: int = 1) -> torch.Tensor:  # fmt: skip
     """vLLM's ``Glm5NextLinearAttention`` on packed requests: each prompt prefilled whole, then the rest decoded.
 
     ``x`` is ``[tokens, hidden]`` (the layer input after the hyper-connection pre-norm), ``cu_seqlens`` the int32
@@ -156,13 +220,23 @@ def kda_forward(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
     conv weights and FlashKDA on the raw gate and beta logits; over each later token, one decode step at a time, the
     conv update and the recurrent kernel from the conv state and the fp32 recurrent state the request has reached;
     then the sigmoid-gated RMSNorm and ``o_proj``. ``trace`` (debug) collects the prefill's intermediate tensors.
+
+    At ``tp`` > 1 every tensor-parallel rank's share runs on its own weights (:func:`_kda_weights`), and the ranks'
+    ``o_proj`` partials are all-reduced (:func:`tp_sum`).
     """
+    partials = [_kda_rank(_kda_weights(attn, tp, rank), x, cu_seqlens, config, prompt_lens,
+                          trace if rank == 0 else None) for rank in range(tp)]  # fmt: skip
+    return tp_sum(partials)
+
+
+def _kda_rank(w: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, prompt_lens: torch.Tensor | None,
+              trace: dict | None) -> torch.Tensor:  # fmt: skip
     trace = {} if trace is None else trace
     import vllm._flashkda_C  # noqa: F401
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
     from vllm.third_party.flash_linear_attention.ops.kda import rms_norm_gated
 
-    heads, head_dim = attn.num_heads, attn.head_dim
+    heads, head_dim = w.heads, w.head_dim
     projection = heads * head_dim
     tokens, num_seqs = x.shape[0], cu_seqlens.numel() - 1
     starts, lengths = cu_seqlens[:-1].long(), (cu_seqlens[1:] - cu_seqlens[:-1]).long()
@@ -175,15 +249,12 @@ def kda_forward(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
         prompt_cu = torch.cat([cu_seqlens.new_zeros(1), torch.cumsum(prompt_lens, 0).to(cu_seqlens.dtype)])
     else:
         prompt_rows, prompt_cu = None, cu_seqlens
-    gate = attn.forget_gate
-    weight = torch.cat([attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight, attn.b_proj.weight,
-                        gate.f_a_proj.weight, attn.g_a_proj.weight])  # fmt: skip
-    projected = ops.linear_kernel(x, weight)
+    projected = ops.linear_kernel(x, w.merged)
     qkv, beta, f_a, g_a = projected.split([3 * projection, heads, head_dim, head_dim], dim=-1)
-    g1 = ops.linear_kernel(f_a, gate.f_b_proj.weight).reshape(1, tokens, heads, head_dim)
-    g2 = ops.linear_kernel(g_a, attn.g_b_proj.weight).reshape(tokens, heads, head_dim)
+    g1 = ops.linear_kernel(f_a, w.f_b).reshape(1, tokens, heads, head_dim)
+    g2 = ops.linear_kernel(g_a, w.g_b).reshape(tokens, heads, head_dim)
 
-    conv_weight = attn.conv1d.weight.float().reshape(3 * projection, -1)
+    conv_weight = w.conv
     # State slot 0 is vLLM's null block, which the conv kernel treats as padding, so the slots start at 1.
     slots = torch.arange(1, num_seqs + 1, dtype=torch.int32, device=x.device)
     conv_states = x.new_zeros((num_seqs + 1, 3 * projection, conv_weight.shape[-1] - 1))
@@ -212,7 +283,7 @@ def kda_forward(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
     core_p = torch.empty((1, prompt_tokens, heads, head_dim), dtype=x.dtype, device=x.device)
     torch.ops._flashkda_C.fwd(
         q, k, v, g1_p.contiguous(), beta_p.unsqueeze(0), head_dim**-0.5, core_p, workspace,
-        gate.A_log.float().view(-1), gate.dt_bias.float().view(-1, head_dim), config.linear_lower_bound,
+        w.a_log, w.dt_bias.view(-1, head_dim), config.linear_lower_bound,
         state, final_state, prompt_cu.contiguous(), None, None,
     )  # fmt: skip
     if prompt_rows is None:
@@ -222,12 +293,13 @@ def kda_forward(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
         core[:, prompt_rows] = core_p
         recurrent = torch.zeros((num_seqs + 1, heads, head_dim, head_dim), dtype=torch.float32, device=x.device)
         recurrent[1:] = final_state
-        _kda_decode(core, qkv, g1, beta, conv_states, recurrent, conv_weight, gate, starts, prompt_lens, lengths,
+        _kda_decode(core, qkv, g1, beta, conv_states, recurrent, conv_weight, w, starts, prompt_lens, lengths,
                     slots, heads, head_dim, config)  # fmt: skip
     trace.update(core=core, g2=g2)
-    core = rms_norm_gated(core, g2, attn.o_norm.weight, None, "sigmoid", eps=KDA_O_NORM_EPS)
+    core = rms_norm_gated(core, g2, w.o_norm, None, "sigmoid", eps=KDA_O_NORM_EPS).reshape(tokens, -1)
     trace.update(normed=core)
-    return lora_linear(core.reshape(tokens, -1), attn.o_proj)
+    out = ops.linear_kernel(core, w.o_weight)
+    return add_lora(out, core, [w.o_lora], (out.shape[-1],))
 
 
 SPARSE_TOPK_BLOCK = 128  # sparse MLA tiles the top-k index buffer in 128 columns
@@ -415,7 +487,7 @@ def lora_linear(x: torch.Tensor, module: Any, weight: torch.Tensor | None = None
 
 
 def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlens: torch.Tensor,
-                  config: Any, record: dict | None = None) -> torch.Tensor:  # fmt: skip
+                  config: Any, record: dict | None = None, tp: int = 1) -> torch.Tensor:  # fmt: skip
     """vLLM's ``Glm5NextMLAAttention`` (sparse MLA with ``mla_use_nope``) on packed requests.
 
     Each token attends to the rows :func:`indexer_topk` selects (every earlier token below ``index_topk``, the
@@ -427,6 +499,10 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     ``W_UK_T``, FA3 sparse attention over one-token pages of ``[kv_c | k_pe]`` rows (QV form), the value
     up-projection by ``W_UV`` and ``o_proj``. A LoRA adapter on ``q_a``/``kv_a``/``q_b``/``o`` adds its delta with
     vLLM's kernels (:func:`add_lora`).
+
+    At ``tp`` > 1 the replicated ``[q_a; kv_a]``, norms and indexer run once; each tensor-parallel rank then runs its
+    heads (its rows of ``q_b_proj`` and ``kv_b_proj``, its input columns of ``o_proj``), and the ranks' ``o_proj``
+    partials are all-reduced (:func:`tp_sum`).
     """
     from vllm.models.common.ops import fused_q_kv_rmsnorm
     from vllm.v1.attention.backends.mla import flashattn_mla_sparse
@@ -448,12 +524,6 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     kv_c, k_pe = kv_lora.split([latent, rope], dim=-1)
     q_c, kv_c = fused_q_kv_rmsnorm(q_c, kv_c, attn.q_a_layernorm.weight, attn.kv_a_layernorm.weight,
                                    attn.q_a_layernorm.variance_epsilon)  # fmt: skip
-    q = lora_linear(q_c, attn.q_b_proj).view(tokens, heads, nope + rope)
-    q_nope, q_pe = q.split([nope, rope], dim=-1)
-
-    w_uk_t, w_uv = mla_kv_up_weights(attn.kv_b_proj, config)
-    q_latent = q.new_empty((tokens, heads, latent))
-    torch.bmm(q_nope.transpose(0, 1), w_uk_t, out=q_latent.transpose(0, 1))
 
     seq_of_token = torch.repeat_interleave(torch.arange(starts.numel(), device=x.device), lengths)
     topk = indexer_topk(attn.indexer, x, q_c, positions, cu_seqlens, config, topk_buffer_width(config))
@@ -463,34 +533,52 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     valid = (topk >= 0).sum(-1).to(torch.int32)
     kv_rows = torch.cat([kv_c, k_pe], dim=-1)
     v_cache = kv_rows[:, :latent].unsqueeze(1).unsqueeze(1)
-    if rope:
-        k_cache, q_rope = kv_rows[:, latent:].unsqueeze(1).unsqueeze(1), q_pe
-    else:  # FA3's QV path needs a 64-wide Q/K: a zero query against the first 64 latent columns
-        k_cache, q_rope = v_cache[..., :64], q.new_zeros((tokens, heads, 64))
-    out = flashattn_mla_sparse.flash_attn_varlen_func(
-        q=q_rope,
-        k=k_cache,
-        v=v_cache,
-        q_v=q_latent,
-        max_seqlen_q=1,
-        cu_seqlens_q=torch.arange(tokens + 1, dtype=torch.int32, device=x.device),
-        max_seqlen_k=rows.shape[1],
-        seqused_k=valid,
-        block_table=rows,
-        softmax_scale=(nope + rope) ** -0.5,
-        causal=True,
-        fa_version=3,
-    )
-    up = out.new_empty((tokens, heads, value))
-    torch.bmm(out.view(-1, heads, latent).transpose(0, 1), w_uv, out=up.transpose(0, 1))
-    return lora_linear(up.view(tokens, heads * value), attn.o_proj)
+
+    w_uk_t_all, w_uv_all = mla_kv_up_weights(attn.kv_b_proj, config)
+    q_b, q_b_lora = bf16_weight(attn.q_b_proj), lora_factors(attn.q_b_proj)
+    o, o_lora = bf16_weight(attn.o_proj), lora_factors(attn.o_proj)
+    heads_r = heads // tp
+    partials = []
+    for rank in range(tp):
+        q_b_r = tp_shard(q_b, tp, rank)
+        q = add_lora(ops.linear_kernel(q_c, q_b_r), q_c, [_column_lora(q_b_lora, tp, rank)], (q_b_r.shape[0],))
+        q = q.view(tokens, heads_r, nope + rope)
+        q_nope, q_pe = q.split([nope, rope], dim=-1)
+        w_uk_t, w_uv = tp_shard(w_uk_t_all, tp, rank), tp_shard(w_uv_all, tp, rank)
+        q_latent = q.new_empty((tokens, heads_r, latent))
+        torch.bmm(q_nope.transpose(0, 1), w_uk_t, out=q_latent.transpose(0, 1))
+        if rope:
+            k_cache, q_rope = kv_rows[:, latent:].unsqueeze(1).unsqueeze(1), q_pe
+        else:  # FA3's QV path needs a 64-wide Q/K: a zero query against the first 64 latent columns
+            k_cache, q_rope = v_cache[..., :64], q.new_zeros((tokens, heads_r, 64))
+        out = flashattn_mla_sparse.flash_attn_varlen_func(
+            q=q_rope,
+            k=k_cache,
+            v=v_cache,
+            q_v=q_latent,
+            max_seqlen_q=1,
+            cu_seqlens_q=torch.arange(tokens + 1, dtype=torch.int32, device=x.device),
+            max_seqlen_k=rows.shape[1],
+            seqused_k=valid,
+            block_table=rows,
+            softmax_scale=(nope + rope) ** -0.5,
+            causal=True,
+            fa_version=3,
+        )
+        up = out.new_empty((tokens, heads_r, value))
+        torch.bmm(out.view(-1, heads_r, latent).transpose(0, 1), w_uv, out=up.transpose(0, 1))
+        up = up.view(tokens, heads_r * value)
+        o_r = tp_shard(o, tp, rank, 1).contiguous()
+        partials.append(add_lora(ops.linear_kernel(up, o_r), up, [_row_lora(o_lora, tp, rank)], (o_r.shape[0],)))
+    return tp_sum(partials)
 
 
 def _mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     prompt_lens = getattr(ctx, "prompt_lens", None)
+    tp = getattr(ctx, "tp", 1)
     if layer.block_type == "linear_attention":
-        return kda_forward(layer.self_attn, x, ctx.cu_seqlens, ctx.config, prompt_lens)
-    return mla_attention(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config, _record(ctx, layer))
+        return kda_forward(layer.self_attn, x, ctx.cu_seqlens, ctx.config, prompt_lens, tp=tp)
+    return mla_attention(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config, _record(ctx, layer), tp=tp)
 
 
 def fp8_block_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale_inv: torch.Tensor) -> torch.Tensor:
@@ -529,21 +617,38 @@ def _merged_fp8(*linears: Any) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.cat([linear.weight for linear in linears]), torch.cat([linear.weight_scale_inv for linear in linears])
 
 
-def dense_mlp(mlp: Any, x: torch.Tensor) -> torch.Tensor:
-    """vLLM's ``Glm5NextMLP``: merged FP8 ``gate_up``, the clamped SwiGLU, FP8 ``down``."""
-    weight, scale = _merged_fp8(mlp.gate_proj, mlp.up_proj)
-    hidden = silu_and_mul_with_clamp(fp8_block_linear(x, weight, scale), mlp.swiglu_limit)
-    return fp8_block_linear(hidden, mlp.down_proj.weight, mlp.down_proj.weight_scale_inv)
+def _fp8_mlp_partials(x: torch.Tensor, gate: tuple, up: tuple, down: tuple, swiglu_limit: float,
+                      tp: int) -> list[torch.Tensor]:  # fmt: skip
+    """vLLM's ``Glm5NextMLP`` on each tensor-parallel rank, before the all-reduce: its rows of the merged FP8
+    ``gate_up``, the clamped SwiGLU, its input columns of the FP8 ``down``. ``gate``/``up``/``down`` are
+    ``(weight, scale)``."""
+    partials = []
+    for rank in range(tp):
+        (gate_w, gate_s), (up_w, up_s) = (_fp8_shard(*pair, tp, rank, 0) for pair in (gate, up))
+        if gate_w.shape[0] % FP8_BLOCK:
+            raise ValueError(f"merging FP8 projections needs {FP8_BLOCK}-row pieces, got {gate_w.shape[0]}")
+        hidden = silu_and_mul_with_clamp(fp8_block_linear(x, torch.cat([gate_w, up_w]), torch.cat([gate_s, up_s])),
+                                         swiglu_limit)  # fmt: skip
+        partials.append(fp8_block_linear(hidden, *_fp8_shard(*down, tp, rank, 1)))
+    return partials
+
+
+def dense_mlp(mlp: Any, x: torch.Tensor, tp: int = 1) -> torch.Tensor:
+    """vLLM's ``Glm5NextMLP``: merged FP8 ``gate_up``, the clamped SwiGLU, FP8 ``down`` (all-reduced at ``tp`` > 1)."""
+    pieces = [(p.weight, p.weight_scale_inv) for p in (mlp.gate_proj, mlp.up_proj, mlp.down_proj)]
+    return tp_sum(_fp8_mlp_partials(x, *pieces, mlp.swiglu_limit, tp))
+
+
+def shared_expert_partials(ffn: Any, x: torch.Tensor, swiglu_limit: float, tp: int = 1) -> list[torch.Tensor]:
+    """vLLM's shared-expert ``Glm5NextMLP`` (``reduce_results=False``) on the trainer's ``BCFeedForward`` (``w1`` gate,
+    ``w3`` up, ``w2`` down): each tensor-parallel rank's partial."""
+    pieces = [(ffn.w1, ffn.w1_scale_inv), (ffn.w3, ffn.w3_scale_inv), (ffn.w2, ffn.w2_scale_inv)]
+    return _fp8_mlp_partials(x, *pieces, swiglu_limit, tp)
 
 
 def shared_expert_mlp(ffn: Any, x: torch.Tensor, swiglu_limit: float) -> torch.Tensor:
-    """vLLM's shared-expert ``Glm5NextMLP`` on the trainer's ``BCFeedForward`` (``w1`` gate, ``w3`` up, ``w2`` down)."""
-    weight = torch.cat([ffn.w1, ffn.w3])
-    scale = torch.cat([ffn.w1_scale_inv, ffn.w3_scale_inv])
-    if ffn.w1.shape[0] % FP8_BLOCK:
-        raise ValueError(f"merging FP8 projections needs {FP8_BLOCK}-row pieces, got {ffn.w1.shape[0]}")
-    hidden = silu_and_mul_with_clamp(fp8_block_linear(x, weight, scale), swiglu_limit)
-    return fp8_block_linear(hidden, ffn.w2, ffn.w2_scale_inv)
+    """:func:`shared_expert_partials` at TP 1."""
+    return shared_expert_partials(ffn, x, swiglu_limit)[0]
 
 
 def _full(tensor: torch.Tensor, num_experts: int, ep_group: Any = None) -> torch.Tensor:
@@ -613,10 +718,15 @@ def _triton_experts(num_experts: int, top_k: int, hidden: int, intermediate: int
     return FusedMoEKernel(prepare, TritonExperts(moe_config, quant_config)), MoEActivation.SILU
 
 
-def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None, record: dict | None = None) -> torch.Tensor:
-    """vLLM's ``Glm5NextMoE`` at TP 1 on the trainer's ``MoE``: fp32 router logits by the batch-invariant matmul, the
+def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None, record: dict | None = None,
+        tp: int = 1) -> torch.Tensor:  # fmt: skip
+    """vLLM's ``Glm5NextMoE`` on the trainer's ``MoE``: fp32 router logits by the batch-invariant matmul, the
     batch-invariant grouped top-k (renormalized and scaled by ``routed_scaling_factor`` there, as vLLM's router does
-    when the runner does not scale the output), the Triton routed experts, then ``shared + routed`` in bf16."""
+    when the runner does not scale the output), the Triton routed experts, then ``shared + routed`` in bf16.
+
+    At ``tp`` > 1 (experts on every rank, split by intermediate size) each tensor-parallel rank runs the experts on its
+    shard of every expert's ``gate``/``up`` rows and ``down`` columns, adds its shared-expert partial, and the ranks'
+    sums are all-reduced, as vLLM's MoE runner reduces ``shared + routed`` once (:func:`tp_sum`)."""
     from vllm.v1.worker.workspace import init_workspace_manager
     from vllm.v1.worker.workspace import is_workspace_manager_initialized
 
@@ -643,22 +753,29 @@ def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None, record: di
     total = config.n_routed_experts
     w1, w2, w3 = (_full(t, total, ep_group) for t in (experts.w1, experts.w2, experts.w3))
     s1, s2, s3 = (_full(t, total, ep_group) for t in (experts.w1_scale_inv, experts.w2_scale_inv, experts.w3_scale_inv))
-    w13, w13_scale = torch.cat([w1, w3], dim=1), torch.cat([s1, s3], dim=1)
     num_experts, intermediate, hidden = w1.shape
-    # The kernel captures the scales in its quant config, so it is rebuilt for every call (cheap, host-side only).
-    kernel, activation = _triton_experts(num_experts, config.num_experts_per_tok, hidden, intermediate,
-                                         config.swiglu_limit, w13_scale, s2, x.device)  # fmt: skip
-    routed = kernel.apply(
-        x.contiguous(), w13, w2, weights, ids, activation=activation, global_num_experts=num_experts,
-        expert_map=None, apply_router_weight_on_input=False,
-    )  # fmt: skip
-    return shared_expert_mlp(mlp.shared_expert, x, config.swiglu_limit) + routed
+    shared = shared_expert_partials(mlp.shared_expert, x, config.swiglu_limit, tp)
+    partials = []
+    for rank in range(tp):
+        (w1_r, s1_r), (w3_r, s3_r) = _fp8_shard(w1, s1, tp, rank, 1), _fp8_shard(w3, s3, tp, rank, 1)
+        w2_r, s2_r = _fp8_shard(w2, s2, tp, rank, 2)
+        w13, w13_scale = torch.cat([w1_r, w3_r], dim=1), torch.cat([s1_r, s3_r], dim=1)
+        # The kernel captures the scales in its quant config, so it is rebuilt for every call (cheap, host-side only).
+        kernel, activation = _triton_experts(num_experts, config.num_experts_per_tok, hidden, intermediate // tp,
+                                             config.swiglu_limit, w13_scale, s2_r, x.device)  # fmt: skip
+        routed = kernel.apply(
+            x.contiguous(), w13, w2_r, weights, ids, activation=activation, global_num_experts=num_experts,
+            expert_map=None, apply_router_weight_on_input=False,
+        )  # fmt: skip
+        partials.append(shared[rank] + routed)
+    return tp_sum(partials)
 
 
 def _mlp(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
+    tp = getattr(ctx, "tp", 1)
     if hasattr(layer.mlp, "gate_proj"):
-        return dense_mlp(layer.mlp, x)
-    return moe(layer.mlp, x, ctx.config, getattr(ctx, "ep_group", None), _record(ctx, layer))
+        return dense_mlp(layer.mlp, x, tp)
+    return moe(layer.mlp, x, ctx.config, getattr(ctx, "ep_group", None), _record(ctx, layer), tp)
 
 
 def _record(ctx: Any, layer: Any) -> dict | None:
@@ -680,7 +797,7 @@ def aligned_hidden(backbone: Any, input_ids: torch.Tensor, config: Any, ctx: Any
 
     ``run_stock(layer, streams)`` runs the stock layer on ``[tokens, hc_mult, hidden]`` streams for the backward.
     """
-    embeds = backbone.embed_tokens(input_ids.reshape(-1))
+    embeds = ops.tensor_parallel_embedding(backbone.embed_tokens(input_ids.reshape(-1)), getattr(ctx, "tp", 1))
     streams = embeds.unsqueeze(1).expand(-1, config.hc_mult, -1).contiguous()
     for layer in backbone.layers:
         streams = _AlignedLayer.apply(
@@ -808,13 +925,15 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
     ctx = types.SimpleNamespace(config=config, positions=layout.positions, cu_seqlens=cu,
                                 prompt_lens=prompt_lengths(trained, cu),
                                 replay={} if torch.is_grad_enabled() else None,
-                                ep_group=getattr(model, "_vllm_aligned_ep_group", None))  # fmt: skip
+                                ep_group=getattr(model, "_vllm_aligned_ep_group", None),
+                                tp=getattr(model, "_vllm_aligned_tensor_parallel", 1))  # fmt: skip
     run_stock = _stock_layer_runner(backbone, input_ids, position_ids, kwargs, ctx.replay)
     hidden = aligned_hidden(backbone, input_ids, config, ctx, run_stock)
     return ops.lm_head_logprobs(
         hidden,
         model.lm_head.weight,
         labels.reshape(-1),
+        tensor_parallel=ctx.tp,
         temperature=temperature,
         token_chunk_size=model._vllm_aligned_token_chunk_size,
         fp32=model._vllm_aligned_lm_head_fp32,
@@ -853,12 +972,28 @@ def _causal_lm_forward(self, input_ids=None, attention_mask=None, position_ids=N
     return {"logprobs": logprobs.view(input_ids.shape)}
 
 
+def check_tensor_parallel(config: Any, tp: int) -> None:
+    """The sampler's tensor-parallel size has to split the heads, and the FP8 MLPs and experts in whole blocks."""
+    if tp < 1:
+        raise ValueError("tensor_parallel must be positive")
+    if tp == 1:
+        return
+    for name in ("num_attention_heads", "linear_num_heads"):
+        if getattr(config, name) % tp:
+            raise ValueError(f"config.{name}={getattr(config, name)} does not split across {tp} ranks")
+    sizes = {"intermediate_size": config.intermediate_size, "moe_intermediate_size": config.moe_intermediate_size,
+             "shared expert": config.moe_intermediate_size * (config.n_shared_experts or 1)}  # fmt: skip
+    for name, size in sizes.items():
+        if size % (tp * FP8_BLOCK):
+            raise ValueError(f"{name} {size} does not split across {tp} ranks in {FP8_BLOCK}-blocks")
+
+
 def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_fp32: bool = False,
-                                 ep_group: Any = None) -> None:  # fmt: skip
+                                 ep_group: Any = None, tensor_parallel: int = 1) -> None:  # fmt: skip
     """Make a GLM-5.3-Flash model's ``dss_compute_logprobs`` forward compute the batch-invariant sampler's logprobs.
 
-    Covers prompts prefilled whole at TP 1 (milestone 1); decoded tokens and the indexer for prompts longer than
-    ``index_topk`` are not in yet.
+    ``tensor_parallel`` is the sampler's TP size: every rank's share of the split layers runs on its own weight shard,
+    and the partial sums are reduced as vLLM's batch-invariant all-reduce reduces them.
     """
     import types
 
@@ -866,12 +1001,14 @@ def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_f
 
     config = model.model.language_model.config
     check_supported_config(config)
+    check_tensor_parallel(config, int(tensor_parallel))
     ops.require_batch_invariant_env()
     import os
 
     os.environ.setdefault("ARCTIC_GLM5_BATCH_INVARIANT", "1")
     ensure_glm5_batch_invariance()
     model._vllm_aligned_ep_group = ep_group
+    model._vllm_aligned_tensor_parallel = int(tensor_parallel)
     model._vllm_aligned_token_chunk_size = int(token_chunk_size)
     model._vllm_aligned_lm_head_fp32 = bool(lm_head_fp32)
     model._vllm_aligned_stock_forward = model.forward
