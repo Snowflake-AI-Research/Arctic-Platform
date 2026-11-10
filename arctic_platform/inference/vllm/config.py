@@ -139,6 +139,13 @@ def ensure_dflash_max_position_patch() -> None:
     if _DFLASH_PATCHED:
         return
     original = SpeculativeConfig.__post_init__
+    resize = SpeculativeConfig._maybe_override_draft_max_position_embeddings
+
+    def resize_draft(draft, target_max_model_len):
+        if not _DRAFT_ROPE_FOLLOWS_TARGET.get():
+            resize(draft, target_max_model_len)
+
+    SpeculativeConfig._maybe_override_draft_max_position_embeddings = staticmethod(resize_draft)
 
     @wraps(original)
     def post_init(self):
