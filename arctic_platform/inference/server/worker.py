@@ -19,7 +19,6 @@ from uuid import uuid4
 
 import ray
 
-from arctic_platform.common.packing.media_spec import media_spec_for
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
 from arctic_platform.inference.server.chat import ChatModel, resolve_chat_model
 from arctic_platform.inference.server.metrics import RingStatLogger, get_collector
@@ -829,6 +828,10 @@ def _placeholder_ids(hf_config: Any) -> dict[str, int]:
     without one falls back to the config's ``image_token_id`` /
     ``video_token_id``, each only when set.
     """
+    # Imported here, not at module level: the packing package pulls in torch,
+    # and the inference server's import path stays free of it.
+    from arctic_platform.common.packing.media_spec import media_spec_for
+
     spec = media_spec_for(getattr(hf_config, "model_type", None) or "")
     if spec is not None:
         return spec.placeholder_ids(hf_config)
