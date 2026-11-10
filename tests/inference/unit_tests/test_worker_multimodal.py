@@ -700,11 +700,9 @@ def test_media_routing_key_follows_token_ids():
     assert replica_pool._media_routing_key([1, 2], None) is None
 
 
-def test_stream_validation_passes_media_prompt_through():
-    prompt = _media_prompt(multi_modal_uuids=None)
-    checked, _params = streaming.validate_request(prompt, {"max_tokens": 4})
-    assert checked == {"prompt_token_ids": [1, 2, IMAGE_PAD, 3], "multi_modal_data": {"image": IMAGE}}
-    assert checked["multi_modal_data"]["image"] is IMAGE
+def test_stream_refuses_media_prompt():
+    with pytest.raises(ValueError, match="media prompts go through generate"):
+        streaming.validate_request(_media_prompt(), {"max_tokens": 4})
     with pytest.raises(ValueError):
         streaming.validate_request({"prompt_token_ids": [1]}, {"max_tokens": 4})
     assert streaming.validate_request([1, 2], {"max_tokens": 4})[0] == [1, 2]
@@ -735,13 +733,13 @@ def test_worker_refuses_dict_without_multimodal_data_as_before(prompt):
 
 @pytest.mark.parametrize("prompt", _NOT_MEDIA_DICTS)
 def test_stream_refuses_dict_without_multimodal_data_as_before(prompt):
-    with pytest.raises(ValueError, match="^Expected one prepared text prompt, token-ID list, ") as error:
+    with pytest.raises(ValueError, match="^Expected one prepared text prompt, token-ID list or ChatPrompt$") as error:
         streaming.validate_request(prompt, {"max_tokens": 4})
     assert "multi_modal_data" not in str(error.value)
     from dataclasses import asdict
 
     worker = _new_worker()
-    with pytest.raises(ValueError, match="^Expected one prepared text prompt, token-ID list, "):
+    with pytest.raises(ValueError, match="^Expected one prepared text prompt, token-ID list or ChatPrompt$"):
         worker.start_stream("not-media", prompt, {"max_tokens": 1}, 20, asdict(streaming.StreamLimits()))
     assert worker._engine_streams == {}
 
@@ -787,32 +785,15 @@ class _StreamEngine(_FakeEngine):
         return 0
 
 
-def test_stream_hands_media_prompt_to_vllm():
+def test_stream_refuses_media_prompt_before_the_engine():
     from dataclasses import asdict
 
-    async def scenario():
-        worker = _new_worker()
-        worker.llm = _StreamEngine()
-        worker._stream_sampling_params = lambda params: params
-        prompt = _media_prompt(mm_processor_kwargs={"max_pixels": 1024})
-        assert worker.start_stream("media", prompt, {"max_tokens": 1}, 20, asdict(streaming.StreamLimits()))
-        events = []
-        reader = worker.stream_events("media")
-        async for batch in reader:
-            events.extend(batch)
-            if batch[-1]["type"] in ("completed", "terminal_error"):
-                break
-            worker.acknowledge_stream("media", batch[-1]["sequence"])
-        await reader.aclose()
-        (sent, _params, kwargs), = worker.llm.calls
-        assert sent == prompt
-        assert sent["multi_modal_data"]["image"] is IMAGE
-        assert kwargs["request_id"] == "media"
-        return events
-
-    events = asyncio.run(scenario())
-    assert [e["type"] for e in events] == ["delta", "choice_finished", "usage", "completed"]
-    assert events[2]["prompt_tokens"] == len(EXPANDED)
+    worker = _new_worker()
+    worker.llm = _StreamEngine()
+    with pytest.raises(ValueError, match="media prompts go through generate"):
+        worker.start_stream("media", _media_prompt(), {"max_tokens": 1}, 20, asdict(streaming.StreamLimits()))
+    assert worker.llm.calls == []
+    assert worker._engine_streams == {}
 
 
 # --- raw encoded bytes: decoded in the worker with vLLM's loaders ---
@@ -1381,113 +1362,6 @@ def test_bad_prompt_shape_with_bad_bytes_keeps_its_error(fake_loaders, prompt, m
         _generate(_new_worker(), prompt)
     assert type(caught.value) is ValueError
     assert fake_loaders.loaded == []
-
-
-@pytest.mark.parametrize("modality, cls", _DECODE_FAILURES, ids=lambda v: getattr(v, "__name__", v))
-def test_stream_raises_media_decode_error_for_each_decoder_failure(fake_loaders, monkeypatch, modality, cls):
-    from dataclasses import asdict
-
-    raised = []
-
-    def recording_decode(*args, **kwargs):
-        try:
-            return decode_media(*args, **kwargs)
-        except Exception as exc:
-            raised.append(exc)
-            raise
-
-    decode_media = streaming.decode_media
-    monkeypatch.setattr(streaming, "decode_media", recording_decode)
-
-    async def scenario():
-        worker = _new_worker()
-        worker.llm = _StreamEngine()
-        worker._stream_sampling_params = lambda params: params
-        good = _MEDIA[modality]
-        prompt = _media_prompt(
-            multi_modal_data={modality: [good(b"good-0"), _failing_bytes(modality, cls), good(b"good-2")]}
-        )
-        worker.start_stream("media", prompt, {"max_tokens": 1}, 20, asdict(streaming.StreamLimits()))
-        events = []
-        reader = worker.stream_events("media")
-        async for batch in reader:
-            events.extend(batch)
-            if batch[-1]["type"] in ("completed", "terminal_error"):
-                break
-            worker.acknowledge_stream("media", batch[-1]["sequence"])
-        await reader.aclose()
-        return worker.llm.calls, events
-
-    calls, events = asyncio.run(scenario())
-    (exc,) = raised
-    _assert_decode_error(exc, modality, 1, cls)
-    good = _MEDIA[modality]
-    assert fake_loaders.loaded == [(modality, good(b"good-0")), (modality, _failing_bytes(modality, cls))]
-    assert calls == []
-    assert events[-1]["type"] == "terminal_error"
-    assert "secret" not in repr(events)
-
-
-def test_stream_decodes_media_bytes(fake_loaders):
-    from dataclasses import asdict
-
-    async def scenario():
-        worker = _new_worker()
-        worker.llm = _StreamEngine()
-        worker._stream_sampling_params = lambda params: params
-        prompt = _media_prompt(multi_modal_data={"image": [JPEG]})
-        worker.start_stream("media", prompt, {"max_tokens": 1}, 20, asdict(streaming.StreamLimits()))
-        reader = worker.stream_events("media")
-        async for batch in reader:
-            if batch[-1]["type"] in ("completed", "terminal_error"):
-                break
-            worker.acknowledge_stream("media", batch[-1]["sequence"])
-        await reader.aclose()
-        (sent, _params, _kwargs), = worker.llm.calls
-        return sent
-
-    sent = asyncio.run(scenario())
-    assert sent["multi_modal_data"]["image"][0].original_bytes == JPEG
-
-
-def test_stream_refuses_unsupported_format_before_any_loader(fake_loaders, monkeypatch):
-    from dataclasses import asdict
-
-    raised = []
-
-    def recording_decode(*args, **kwargs):
-        try:
-            return decode_media(*args, **kwargs)
-        except Exception as exc:
-            raised.append(exc)
-            raise
-
-    decode_media = streaming.decode_media
-    monkeypatch.setattr(streaming, "decode_media", recording_decode)
-
-    async def scenario():
-        worker = _new_worker()
-        worker.llm = _StreamEngine()
-        worker._stream_sampling_params = lambda params: params
-        prompt = _media_prompt(multi_modal_data={"image": [PNG, b"GIF89a" + _TAG]})
-        worker.start_stream("media", prompt, {"max_tokens": 1}, 20, asdict(streaming.StreamLimits()))
-        events = []
-        reader = worker.stream_events("media")
-        async for batch in reader:
-            events.extend(batch)
-            if batch[-1]["type"] in ("completed", "terminal_error"):
-                break
-            worker.acknowledge_stream("media", batch[-1]["sequence"])
-        await reader.aclose()
-        return worker.llm.calls, events
-
-    calls, events = asyncio.run(scenario())
-    (exc,) = raised
-    assert type(exc) is MediaDecodeError and str(exc) == "could not decode image 1 (unsupported format)"
-    assert calls == []
-    assert fake_loaders == [] and fake_loaders.loaded == []
-    assert events[-1]["type"] == "terminal_error"
-    assert "secret" not in repr(events)
 
 
 # The engine's resolved kwargs name torchcodec; a caller's default ones would name opencv (cv2).
