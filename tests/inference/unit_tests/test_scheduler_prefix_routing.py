@@ -100,7 +100,8 @@ class TestRoute:
     def test_strict_prefix_key_never_spills(self):
         sch = _scheduler(2, capacity=1)
         first = _route(sch, "p", strict=True)
-        assert all(_route(sch, "p", strict=True) == first for _ in range(5))
+        # Past its worker's backlog it waits (None) rather than spill.
+        assert [_route(sch, "p", strict=True) for _ in range(3)] == [first, None, None]
 
     def test_routing_key_never_spills(self):
         sch = _scheduler(2, capacity=1, prefix_routing=False)

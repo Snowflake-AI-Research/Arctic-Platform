@@ -7,7 +7,7 @@ import logging
 import os
 import random
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Hashable
 
@@ -22,6 +22,8 @@ logger = logging.getLogger("arctic_platform.inference.server")
 
 _LOG_AFFINITY = os.environ.get("ARCTIC_LOG_AFFINITY", "") == "1"
 _MAX_KEYS = 500_000
+# Requests a worker may hold, as a multiple of capacity, before the rest wait here for whichever worker frees first.
+_BACKLOG = 2
 
 
 @dataclass
@@ -77,14 +79,15 @@ def _compute_prefix_hash(prompt: Any) -> int:
 
 
 class Scheduler:
-    """Routes each request to a worker, with no admission limit of its own.
+    """Routes each request to a worker, letting each engine queue a backlog of its own.
 
     A request with no key goes to the less loaded of two random workers. A
     keyed one goes to the worker its key was first given, chosen that way then;
     a prefix-hash key spills while its worker holds ``capacity`` requests and
-    another has room, and a sticky one never spills. Requests wait only while
-    the scheduler is paused or no worker can take them; beyond ``capacity``
-    they queue in the engine.
+    another has room, and a sticky one never spills. A worker takes up to
+    ``_BACKLOG * capacity`` generate requests; past that on every worker, or
+    while paused, requests wait here in order and go to the first worker that
+    frees up.
     """
 
     def __init__(
@@ -99,10 +102,11 @@ class Scheduler:
 
         self._workers = [WorkerState(handle=w) for w in workers]
         self._capacity = capacity
+        self._backlog = _BACKLOG * capacity
         self._prefix_routing = prefix_routing
         self._keys: OrderedDict[Hashable, int] = OrderedDict()
-        # Requests no worker could take, retried by `_notify`.
-        self._waiting: list[_Request] = []
+        # Requests no worker could take yet, dispatched in order by `_drain`.
+        self._waiting: deque[_Request] = deque()
         self._next_id = 0
         self._streams = {}
         self._stream_retired = OrderedDict()
@@ -124,7 +128,7 @@ class Scheduler:
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state["_wake"] = None
-        state["_waiting"] = []
+        state["_waiting"] = deque()
         state["_workers"] = [replace(ws, inflight=set()) for ws in self._workers]
         return state
 
@@ -158,9 +162,8 @@ class Scheduler:
         if self._stopped:
             raise RuntimeError("Scheduler is stopped")
         future = asyncio.get_running_loop().create_future()
-        req = self._request(prompt, sampling_params, future, routing_key, strict)
-        if not self._dispatch(req):
-            self._waiting.append(req)
+        self._waiting.append(self._request(prompt, sampling_params, future, routing_key, strict))
+        self._drain()
         return future
 
     def stream_generate(self, request_id, prompt, sampling_params=None, *, limits=None, routing_key=None, strict=False):
@@ -340,7 +343,7 @@ class Scheduler:
         for req in self._waiting:
             if not req.future.done():
                 req.future.set_exception(RuntimeError("Scheduler stopped"))
-        self._waiting = []
+        self._waiting.clear()
         self._notify()
         await self.abort_streams()
 
@@ -354,12 +357,17 @@ class Scheduler:
 
     def _notify(self) -> None:
         """Retry waiting requests, and wake every stream waiter to try again."""
-        waiting, self._waiting = self._waiting, []
-        for req in waiting:
-            if not req.future.done() and not self._dispatch(req):
-                self._waiting.append(req)
+        self._drain()
         self._wake.set()
         self._wake = asyncio.Event()
+
+    def _drain(self) -> None:
+        """Dispatch waiting requests in order, until one can't go anywhere yet."""
+        while self._waiting:
+            req = self._waiting[0]
+            if not req.future.done() and not self._dispatch(req):
+                return
+            self._waiting.popleft()
 
     def _request(self, prompt, sampling_params, future, routing_key, strict) -> _Request:
         if routing_key is not None:
@@ -406,21 +414,26 @@ class Scheduler:
             return idx
         self._keys.move_to_end(req.key)
         ws = self._workers[idx]
-        stream_full = stream and ws.streaming_requests >= MAX_WORKER_STREAMS
-        if not stream_full and (req.sticky or ws.active_requests < self._capacity):
+        room = self._has_room(ws, stream)
+        if room and (req.sticky or ws.active_requests < self._capacity):
             return idx
         if req.sticky:
             return None
         alt = self._least_loaded(stream)
         # Spilling only helps when another worker has room; otherwise it just splits the key's cache.
-        if not stream_full and (alt is None or self._workers[alt].active_requests >= self._capacity):
-            return idx
-        return alt
+        if alt is not None and self._workers[alt].active_requests < self._capacity:
+            return alt
+        return idx if room else alt
+
+    def _has_room(self, ws: WorkerState, stream: bool) -> bool:
+        if stream:
+            return ws.streaming_requests < MAX_WORKER_STREAMS
+        return ws.active_requests < self._backlog
 
     def _least_loaded(self, stream: bool) -> int | None:
         """The less loaded of two random workers that can take a request, else the least loaded of all that can."""
         def can_take(ws: WorkerState) -> bool:
-            return ws.schedulable and not (stream and ws.streaming_requests >= MAX_WORKER_STREAMS)
+            return ws.schedulable and self._has_room(ws, stream)
 
         n = len(self._workers)
         i = random.randrange(n)
@@ -444,6 +457,7 @@ class Scheduler:
     def _done(self, req: _Request, ws: WorkerState, submitted_time: float, future: asyncio.Future) -> None:
         ws.inflight.discard(future)
         ws.active_requests -= 1
+        self._drain()
         if future.cancelled():
             error: BaseException | None = RuntimeError("Request cancelled for weight update")
         elif (error := future.exception()) is not None:
