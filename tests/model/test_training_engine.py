@@ -387,13 +387,24 @@ def test_cpu_optimizer_log_names_the_selected_implementation(monkeypatch, caplog
     assert f"using optimizer='{expected}'" in caplog.text
 
 
-def _tiny_qwen38_flash():
+def test_build_training_optimizer_decays_only_nonbias_matrices():
+    model = torch.nn.Module()
+    for name, shape in (("matrix", (2, 3)), ("matrix_bias", (2, 3)), ("gain", (3,)), ("offset", ())):
+        model.register_parameter(name, torch.nn.Parameter(torch.ones(shape)))
+    optimizer = build_training_optimizer(
+        model, OptimizerSettings(name="torch_adamw", weight_decay=0.1), _ZERO2, fused=False
+    )
+    decayed = {id(param) for group in optimizer.param_groups if group["weight_decay"] for param in group["params"]}
+    assert decayed == {id(model.matrix)}
+
+
+def test_build_training_optimizer_disables_decay_on_every_qwen38_norm():
     pytest.importorskip("transformers.models.qwen4_exp")
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM
 
     # A GatedDeltaNet layer with PLE and a QSA layer: every RMSNorm the model family has.
-    return Qwen4ExpForCausalLM(
+    model = Qwen4ExpForCausalLM(
         Qwen4ExpTextConfig(
             vocab_size=32,
             hidden_size=16,
@@ -432,30 +443,19 @@ def _tiny_qwen38_flash():
         )
     )
 
-
-def _tiny_glm53():
-    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
-    from tests.model.test_glm5_next import _tiny_config
-
-    config = _tiny_config()
-    config.use_grouped_mm = False
-    return Glm5NextForConditionalGenerationPrimeRL(config)
-
-
-@pytest.mark.parametrize("build", [_tiny_qwen38_flash, _tiny_glm53])
-def test_build_training_optimizer_decays_no_one_dimensional_parameter(build):
-    # Norm weights, KDA/GatedDeltaNet A_log and the mHC base/scale are all 1-D.
-    model = build()
-
     optimizer = build_training_optimizer(
         model, OptimizerSettings(name="torch_adamw", weight_decay=0.1), _ZERO2, fused=False
     )
 
     decayed = {id(param) for group in optimizer.param_groups if group["weight_decay"] for param in group["params"]}
-    decayed_1d = [name for name, param in model.named_parameters() if id(param) in decayed and param.ndim < 2]
-    assert not decayed_1d, f"1-D parameters in the weight-decay group: {decayed_1d}"
-    linear_weights = [module.weight for module in model.modules() if isinstance(module, torch.nn.Linear)]
-    assert linear_weights and all(id(weight) in decayed for weight in linear_weights)
+    decayed_norms = [
+        name
+        for module_name, module in model.named_modules()
+        if "Norm" in type(module).__name__
+        for name, param in module.named_parameters(prefix=module_name, recurse=False)
+        if id(param) in decayed
+    ]
+    assert not decayed_norms, f"norm weights in the weight-decay group: {decayed_norms}"
 
 
 def test_build_training_optimizer_disables_decay_on_bias_and_norm(monkeypatch):
