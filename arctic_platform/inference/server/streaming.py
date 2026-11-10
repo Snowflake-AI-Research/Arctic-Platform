@@ -20,7 +20,7 @@ from arctic_platform.inference.server.chat import (
     ChatPrompt,
     validate_chat_prompt,
 )
-from arctic_platform.inference.server.media_prompts import decode_media, is_media_prompt, validate_media_prompt
+from arctic_platform.inference.server.media_prompts import is_media_prompt, valid_token_ids
 
 logger = logging.getLogger(__name__)
 
@@ -216,22 +216,26 @@ def schema_depth(value) -> int:
 
 
 def validate_request(prompt, sampling_params):
+    """Check a stream's prompt and sampling parameters; return copies of both.
+
+    A stream takes no media: a prompt with ``multi_modal_data`` is refused, and
+    media prompts go through ``generate``. Streaming media can come with a caller
+    that needs it.
+    """
     if is_media_prompt(prompt):
-        prompt = validate_media_prompt(prompt)
+        raise ValueError("Streams take no multi_modal_data; media prompts go through generate")
     elif isinstance(prompt, str):
         if not prompt or len(prompt.encode("utf-8")) > 1024 * 1024:
             raise ValueError("Prompt must contain 1..1048576 UTF-8 bytes")
     elif isinstance(prompt, list):
-        if not 0 < len(prompt) <= 131072 or any(
-            type(token) is not int or not 0 <= token < 2**31 for token in prompt
-        ):
+        if not valid_token_ids(prompt):
             raise ValueError("Prompt must contain 1..131072 nonnegative token IDs")
         prompt = list(prompt)
     elif isinstance(prompt, ChatPrompt):
         prompt = validate_chat_prompt(prompt)
     else:
         raise ValueError(
-            "Expected one prepared text prompt, token-ID list, media prompt or ChatPrompt"
+            "Expected one prepared text prompt, token-ID list or ChatPrompt"
         )
     params = dict(sampling_params or {})
     unsupported = params.keys() - {
@@ -661,17 +665,11 @@ class EngineStream:
                 params = self.owner._stream_sampling_params(params)
             else:
                 params = self.owner._stream_sampling_params(self.params)
-                # A media prompt is already vLLM's TokensPrompt and passes through.
                 prepared = (
                     {"prompt_token_ids": self.prompt}
                     if isinstance(self.prompt, list)
                     else self.prompt
                 )
-                if isinstance(prepared, dict) and "multi_modal_data" in prepared:
-                    mm_config = getattr(self.owner.llm.model_config, "multimodal_config", None)
-                    if mm_config is None:
-                        raise ValueError("Model does not take multi_modal_data")
-                    prepared = await asyncio.to_thread(decode_media, prepared, mm_config.media_io_kwargs)
                 if self.owner._chat_only_reasoner:
                     # Grammar from the first token, as without chat's reasoner.
                     kwargs["reasoning_ended"] = True
