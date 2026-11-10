@@ -304,8 +304,9 @@ def _check_media_rows(
 ):
     """Every row holds exactly the ``kind`` tokens its own items expand to.
 
-    Counted per row rather than per item span (``media_token_spans``): the Qwen3-VL processor puts each video
-    frame's timestamp text between frames, so a video's tokens are not one contiguous run.
+    An item counts ``spec.tokens_per_item`` tokens. ``media_token_spans`` would check more (contiguous runs,
+    video frames with only text between them) but cannot take the spec's count: it takes no tokens per item
+    and counts every item as ``t * h * w / merge**2``.
     """
     grid, row_ids = media[kind.grid_key], media[kind.row_ids_key].to(torch.long).cpu()
     item_tokens = torch.tensor([spec.tokens_per_item(row, spatial_merge_size) for row in grid.cpu()], dtype=torch.long)
