@@ -53,7 +53,7 @@ These leaves are matched by key, never by shape. Their leading dimension counts 
 - `select_rows` moves each row's media with it and renumbers the row ids to the new order.
 - `pack_microbatch` checks the media against the rows and passes it through: packing keeps rows in order, so a row id still names its row in the packed call.
 - `pad_packed_microbatch` leaves media alone.
-- `token_shard(..., spatial_merge_size=...)` gives each window every image whose tokens overlap it, whole (a vision tower encodes complete images), plus `image_window_token_ranges` (`[images, 2]`): the `[first, end)` slice of that image's merged embeddings whose tokens are in the window. Across a call's windows, each embedding lands in exactly one window. Locating the tokens takes the packed `mm_token_type_ids` and the merge size, so a call carrying media must pass both; an image whose tokens are not in its own row, or grids that disagree with the token count, are refused.
+- `token_shard(..., spatial_merge_size=...)` gives each window every image or video whose tokens sit inside it, whole (a vision tower encodes complete items, and the window holds all of the item's placeholder tokens). An item whose tokens straddle a window boundary is refused, naming the item, its token span and the boundary, on every window of the call: each window would otherwise get all its pixels but only part of its tokens. A caller avoids a straddle by moving the boundary off the item: pad or reorder the text before it. Locating the tokens takes the packed `mm_token_type_ids` and the merge size, so a call carrying media must pass both; an image whose tokens are not in its own row, or grids that disagree with the token count, are refused.
 - Multimodal `[4, 1, T]` `position_ids` are padded with zeros and cut on their token axis like any token leaf, so gathering the windows' positions still rebuilds the call's boundaries.
 
 Media leaves ride at the top level only; one inside `context` is refused.
@@ -72,7 +72,7 @@ The Qwen-VL entry is registered for `qwen3_vl`, `qwen3_vl_moe`, `qwen3_5`, `qwen
 
 ### Media under context parallelism
 
-A CP rank's model call takes a media call windowed, which is what every dispatch sends: a caller's data plane and `run_pipeline`. Each rank gets `token_shard`'s window with the whole media items in it and their `*_window_token_ranges`; an item that straddles windows is refused upstream. The call is already sharded, so the Qwen3.8 CP wrapper (`qwen38/context_parallel.py`) runs it as it does a text-only call.
+A CP rank's model call takes a media call windowed, which is what every dispatch sends: a caller's data plane and `run_pipeline`. Each rank gets `token_shard`'s window with the whole media items in it; `token_shard` refuses an item that straddles windows. The call is already sharded, so the Qwen3.8 CP wrapper (`qwen38/context_parallel.py`) runs it as it does a text-only call.
 
 ## Cost
 
