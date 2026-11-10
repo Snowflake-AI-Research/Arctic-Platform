@@ -231,6 +231,8 @@ def test_unpacked_media_row_logprobs_match_a_direct_forward(model, row_index):
         else:
             assert key not in call
     assert "image_row_ids" not in call and "video_row_ids" not in call
+    # Token types build the positions; the model is not given them.
+    assert "mm_token_type_ids" not in call
     assert call["position_ids"].shape == (4, 1, len(row["tokens"]))
 
 
@@ -280,7 +282,7 @@ def test_packed_call_gets_its_rows_media_and_packed_mrope_positions(model):
     torch_assert_equal(call["image_grid_thw"], torch.cat([rows[index]["image_grid"] for index in image_owners]))
     torch_assert_equal(call["pixel_values_videos"], rows[1]["pixel_values_videos"])
     torch_assert_equal(call["video_grid_thw"], VIDEO_GRIDS)
-    torch_assert_equal(call["mm_token_type_ids"], _token_types(torch.tensor([tokens])))
+    assert "mm_token_type_ids" not in call
 
     lengths = torch.tensor([len(rows[index]["tokens"]) for index in order])
     cu_seqlens = torch.nn.functional.pad(lengths.cumsum(0), (1, 0))
@@ -383,11 +385,12 @@ def _first_model_call(model, batch, *, pack: bool) -> dict:
 @pytest.mark.parametrize("row_indices", [[0], [0, 3]], ids=["one-row", "two-rows"])
 def test_images_for_a_model_type_with_no_media_spec_pass_through_as_on_main(model, pack, row_indices):
     """As before media specs: ``pixel_values`` and ``image_grid_thw`` reach the model as sent, with the token
-    inputs and positions a text batch gets; no M-RoPE positions, row ids or token types are added."""
+    inputs and positions a text batch gets; no M-RoPE positions or row ids are added, and the batch's token types
+    are not forwarded: main never forwarded ``mm_token_type_ids``; run_pipeline reads it to build positions."""
     other = _qwen3_5_moe_model()
     rows = _with_pixels(model, _rows())
     batch = _padded_batch([rows[index] for index in row_indices])
-    del batch["mm_token_type_ids"], batch["image_row_ids"]
+    del batch["image_row_ids"]
     mask = batch["attention_mask"].bool()
 
     call = _first_model_call(other, batch, pack=pack)
@@ -400,6 +403,7 @@ def test_images_for_a_model_type_with_no_media_spec_pass_through_as_on_main(mode
         expected.update(attention_mask=torch.ones_like(expected["input_ids"]))
     expected.update(pixel_values=batch["pixel_values"], image_grid_thw=batch["image_grid_thw"])
     assert set(call) == set(expected)
+    assert "mm_token_type_ids" not in call
     for key, value in expected.items():
         if torch.is_tensor(value):
             torch_assert_equal(call[key], value)
@@ -435,7 +439,7 @@ def test_image_tokens_in_another_row_are_refused(model):
     # Claim the first image for the text row.
     batch["image_row_ids"] = torch.tensor([2, 3])
 
-    with pytest.raises(ValueError, match="rows hold"):
+    with pytest.raises(ValueError, match=r"image 0 belongs to row 2 \(\[\d+, \d+\)\) but its tokens are at"):
         _run(model, batch, pack=False)
 
 
@@ -513,6 +517,30 @@ def test_one_row_batch_may_omit_row_ids(model, pack):
 
     expected = _direct_logprobs(model, rows[3])
     torch_assert_close(_row_logprobs(logprobs, 0, len(rows[3]["tokens"])), expected, rtol=0, atol=1e-5)
+
+
+@pytest.mark.parametrize("pack", [True, False], ids=["packed", "unpacked"])
+def test_image_tokens_split_by_text_are_refused(model, pack):
+    rows = _with_pixels(model, _rows())
+    batch = _padded_batch([rows[0]])
+    # The row's image-token count still matches its grid, but one of them moves past the image's end.
+    first = batch["mm_token_type_ids"][0].tolist().index(1)
+    batch["mm_token_type_ids"][0, first] = 0
+    batch["mm_token_type_ids"][0, first + 5] = 1
+
+    with pytest.raises(ValueError, match="image 0's 4 tokens are not contiguous"):
+        _run(model, batch, pack=pack)
+
+
+@pytest.mark.parametrize("pack", [True, False], ids=["packed", "unpacked"])
+@pytest.mark.parametrize("row_index, name", [(3, "image"), (1, "video")], ids=["image", "video"])
+def test_one_row_batch_without_a_grid_names_the_grid(model, pack, row_index, name):
+    rows = _with_pixels(model, _rows())
+    batch = _padded_batch([rows[row_index]])
+    del batch[f"{name}_row_ids"], batch[f"{name}_grid_thw"]
+
+    with pytest.raises(ValueError, match=rf"{name} media needs .* missing \['{name}_grid_thw'"):
+        _run(model, batch, pack=pack)
 
 
 def test_media_only_on_meta_does_not_reach_the_model(model):
