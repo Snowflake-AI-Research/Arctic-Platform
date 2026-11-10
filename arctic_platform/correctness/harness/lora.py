@@ -24,7 +24,6 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
-import importlib
 import inspect
 import json
 import logging
@@ -1501,8 +1500,7 @@ def _coordinator_class(training, request: dict, files_ref):
         # The native constructor takes ``cfg`` alone in current DSS and ``cfg, source_stage_info`` in older DSS.
         def __init__(self, cfg, *args, **kwargs):
             import ray
-
-            native_training = importlib.import_module("dss.ray_dss.jobs.gpu.training")
+            from dss.ray_dss.jobs.gpu import training as native_training
 
             _verify_runtime(native_training, request["sources"])
             rank = int(os.environ["RANK"])
@@ -1528,7 +1526,7 @@ def _coordinator_class(training, request: dict, files_ref):
 
     class OriginalAdapterCoordinator(coordinator_base):
         async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
-            native_training = importlib.import_module("dss.ray_dss.jobs.gpu.training")
+            from dss.ray_dss.jobs.gpu import training as native_training
 
             _verify_runtime(native_training, request["sources"])
             if self._workers or len(ranks) != request["training_gpus"] or _request(self._info.config) != request:
@@ -1596,8 +1594,7 @@ def _shared_coordinator_class(training, request: dict, files_ref):
         # The native constructor takes ``cfg`` alone in current DSS and ``cfg, source_stage_info`` in older DSS.
         def __init__(self, cfg, *args, **kwargs):
             import ray
-
-            native_training = importlib.import_module("dss.ray_dss.jobs.gpu.training")
+            from dss.ray_dss.jobs.gpu import training as native_training
 
             _verify_shared_runtime(native_training, request["sources"])
             rank = int(os.environ["RANK"])
@@ -1622,7 +1619,7 @@ def _shared_coordinator_class(training, request: dict, files_ref):
 
     class SharedAdapterCoordinator(coordinator_base):
         async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
-            native_training = importlib.import_module("dss.ray_dss.jobs.gpu.training")
+            from dss.ray_dss.jobs.gpu import training as native_training
 
             _verify_shared_runtime(native_training, request["sources"])
             if (
@@ -1683,9 +1680,8 @@ def _shared_coordinator_class(training, request: dict, files_ref):
 def install_manager(manager) -> None:
     """Select the subclass in the actual zone head, before native create.remote."""
     import ray
-
-    training = importlib.import_module("dss.ray_dss.jobs.gpu.training")
-    manager_module = importlib.import_module("dss.ray_dss.zones.manager")
+    from dss.ray_dss.jobs.gpu import training
+    from dss.ray_dss.zones import manager as manager_module
 
     if manager.zone_type.value != "training" or manager.backend.value != "gpu":
         return
@@ -1873,8 +1869,8 @@ async def _serve_with_listener(server_head, original_serve, args, listener):
 @contextlib.contextmanager
 def gateway_scope(gateway):
     """Keep launch substitution local to the owned correctness gateway process."""
-    training = importlib.import_module("dss.ray_dss.jobs.gpu.training")
-    local = importlib.import_module("dss.ray_dss.placement.local")
+    from dss.ray_dss.jobs.gpu import training
+    from dss.ray_dss.placement import local
 
     original_openapi = gateway.app.openapi
     previous_schema = gateway.app.openapi_schema
@@ -2081,7 +2077,7 @@ def _owned_worker_session(worker):
 def main() -> None:
     role = sys.argv.pop(1) if len(sys.argv) > 1 else None
     if role == "zone":
-        server = importlib.import_module("dss.ray_dss.zones.server")
+        from dss.ray_dss.zones import server
 
         original = server._head_argv
         original_run = server.run_cmd
@@ -2150,7 +2146,7 @@ def main() -> None:
                     else:
                         raise RuntimeError(detail)
     elif role == "head":
-        server_head = importlib.import_module("dss.ray_dss.zones.server_head")
+        from dss.ray_dss.zones import server_head
 
         original = server_head._setup_state
         original_serve = server_head._serve
@@ -2174,7 +2170,7 @@ def main() -> None:
                 server_head._setup_state = original
                 server_head._serve = original_serve
     elif role == "worker":
-        server_worker = importlib.import_module("dss.ray_dss.zones.server_worker")
+        from dss.ray_dss.zones import server_worker
 
         _owned_worker_session(server_worker)
     else:

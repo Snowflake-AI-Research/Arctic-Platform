@@ -21,7 +21,6 @@ import asyncio
 import base64
 import contextlib
 import hashlib
-import importlib
 import inspect
 import json
 import marshal
@@ -85,13 +84,21 @@ def _validate_runtime_sources(sources: dict) -> None:
 
 
 def _runtime_sources() -> dict:
+    from deepspeed.runtime import config as ds_config
+    from deepspeed.runtime import constants as ds_constants
+    from deepspeed.runtime import engine as ds_engine
+    from deepspeed.runtime import precision_config as ds_precision
+    from deepspeed.runtime.zero import config as ds_zero
+    from dss.ray_dss import models
+    from dss.ray_dss.jobs.gpu import training
+
+    from arctic_platform.common import deepspeed_engine as shared
+
     sources = {}
-    for name in _RUNTIME_MODULES:
-        module = importlib.import_module(name)
+    modules = (models, training, shared, ds_config, ds_constants, ds_engine, ds_precision, ds_zero)
+    for module in modules:
         path = Path(inspect.getsourcefile(module)).resolve()
-        sources[name] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-    training = importlib.import_module("dss.ray_dss.jobs.gpu.training")
-    shared = importlib.import_module("arctic_platform.common.deepspeed_engine")
+        sources[module.__name__] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
     for name in ("build_deepspeed_config", "TrainingEngineSpec", "initialize_training_engine"):
         if getattr(training, name) is not getattr(shared, name):
             raise ValueError(f"native training does not bind the admitted shared {name}")
@@ -100,7 +107,7 @@ def _runtime_sources() -> dict:
         if namespace.get(name) is not getattr(training, name):
             raise ValueError(f"native worker constructor binds a different {name}")
     callables = {
-        "payload": importlib.import_module("dss.ray_dss.models").JobConfig.to_engine_dict,
+        "payload": models.JobConfig.to_engine_dict,
         "builder": training._build_ds_config,
         "spec_builder": training._training_engine_spec,
         "engine_spec": shared.TrainingEngineSpec.__init__,
@@ -108,7 +115,7 @@ def _runtime_sources() -> dict:
         "shared_builder": shared.build_deepspeed_config,
         "accumulation_default": shared.apply_default_grad_accum_dtype,
         "initializer": shared.initialize_training_engine,
-        "engine_dtypes": importlib.import_module("deepspeed.runtime.engine").DeepSpeedEngine.get_data_types,
+        "engine_dtypes": ds_engine.DeepSpeedEngine.get_data_types,
     }
     sources["loaded_callables"] = {
         name: hashlib.sha256(marshal.dumps(function.__code__)).hexdigest() for name, function in callables.items()
@@ -117,8 +124,9 @@ def _runtime_sources() -> dict:
 
 
 def _runtime_engine_config(payload: dict, n_gpus: int, sp_size: int) -> dict:
-    JobConfig = importlib.import_module("dss.ray_dss.models").JobConfig
-    runtime = importlib.import_module("dss.ray_dss.jobs.gpu.training")
+    from dss.ray_dss.jobs.gpu import training as runtime
+    from dss.ray_dss.models import JobConfig
+
     builder = getattr(runtime, "_build_ds_config", None)
     if not callable(builder):
         raise ValueError("installed DSS runtime does not expose _build_ds_config")
@@ -298,8 +306,8 @@ def _owned_local_engine_config(config, *, automatically_owned_local: bool) -> di
         request = {"payload": client.to_cortex()[0], "n_gpus": config.n_gpus, "sp_size": config.sp_size}
         hostfile = _allocation_hostfile()
         if hostfile is not None:
-            LocalPlacementBackend = importlib.import_module("dss.ray_dss.placement.local").LocalPlacementBackend
-            is_local = importlib.import_module("dss.ray_dss.utils").is_local
+            from dss.ray_dss.placement.local import LocalPlacementBackend
+            from dss.ray_dss.utils import is_local
 
             # An owned gateway starts a fresh placement pool. Use its real
             # selection, not the on-prem gateway's unrelated peer decision.
@@ -352,7 +360,8 @@ def verify_runtime_node(cfg: dict, admission: dict, host: str, world_size: int, 
     sources = _runtime_sources()
     if sources != admission["runtime_receipts"][host]["sources"]:
         raise ValueError("actual worker runtime sources or bound callables changed")
-    training = importlib.import_module("dss.ray_dss.jobs.gpu.training")
+    from dss.ray_dss.jobs.gpu import training
+
     resolved = training._build_ds_config(cfg, world_size, sp_size)
     _validate_engine_config(resolved)
     if resolved != admission["runtime_receipts"][host]["resolved"]:
@@ -425,9 +434,9 @@ def gateway_runtime_scope(gateway, hostfile: Path):
     async def create_job(zone, config, job_id):
         if config.training_config is None:
             return await original(zone, config, job_id)
-        strip_stage_info_from_job_config = importlib.import_module(
-            "dss.ray_dss.stage_info"
-        ).strip_stage_info_from_job_config
+        from dss.ray_dss.jobs.gpu import training
+        from dss.ray_dss.stage_info import strip_stage_info_from_job_config
+
         ranks = [(node.host, gpu) for node in zone.nodes for gpu in node.gpu_ids]
         slots = {node["host"]: node["slots"] for node in allocation["nodes"]}
         if (
@@ -441,7 +450,6 @@ def gateway_runtime_scope(gateway, hostfile: Path):
         cfg = strip_stage_info_from_job_config(config).to_engine_dict(job_id)
         if runtime_request_from_config(cfg) is not None:
             raise ValueError("runtime admission must be supplied by the owned gateway, not its client")
-        training = importlib.import_module("dss.ray_dss.jobs.gpu.training")
         request = {
             "payload": _final_engine_payload(cfg),
             "n_gpus": len(ranks),
@@ -478,7 +486,8 @@ def gateway_runtime_scope(gateway, hostfile: Path):
 @contextlib.contextmanager
 def runtime_engine_scope(receipt: dict):
     """Check the config passed to the bound initializer before DeepSpeed creation."""
-    training = importlib.import_module("dss.ray_dss.jobs.gpu.training")
+    from dss.ray_dss.jobs.gpu import training
+
     namespace = training._DeepSpeedWorker.__init__.__globals__
     original = namespace["initialize_training_engine"]
     signature = inspect.signature(original)

@@ -24,7 +24,6 @@ import contextlib
 import copy
 import fcntl
 import hashlib
-import importlib
 import json
 import math
 import os
@@ -2145,7 +2144,7 @@ def install_checkpoint_routes(gw, store) -> None:
         return child
 
     def owned_training(child: str):
-        gateway_snowapi = importlib.import_module("dss.ray_dss.gateway_snowapi")
+        from dss.ray_dss import gateway_snowapi
 
         parents = [
             parent
@@ -2274,7 +2273,7 @@ def install_checkpoint_routes(gw, store) -> None:
 
 
 def main() -> None:
-    gateway_server = importlib.import_module("dss.ray_dss.gateway_server")
+    from dss.ray_dss import gateway_server
 
     from arctic_platform.correctness.harness.engine_admission import gateway_runtime_scope
     from arctic_platform.correctness.harness.lora import gateway_scope

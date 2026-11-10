@@ -1624,7 +1624,9 @@ def test_owned_runtime_admission_initializer_is_checked_before_engine_creation(m
         _build_ds_config=object(),
         TrainingEngineSpec=object(),
     )
-    monkeypatch.setattr(engine_admission.importlib, "import_module", lambda name: training)
+    package = ModuleType("dss.ray_dss.jobs.gpu")
+    package.training = training
+    monkeypatch.setitem(sys.modules, package.__name__, package)
     monkeypatch.setattr(engine_admission, "_RUNTIME_MODULES", ())
     monkeypatch.setattr(engine_admission, "_validate_engine_config", lambda cfg: events.append("parsers"))
     receipt = {"rank": 3, "resolved": {"bf16": {"enabled": True}}, "sources": {}}
@@ -3482,7 +3484,8 @@ def _node_prerequisites(tmp_path, monkeypatch):
             return SimpleNamespace(is_flash_attn_3_available=lambda: True)
         return imported(name)
 
-    monkeypatch.setattr(preflight.importlib, "import_module", import_module)
+    monkeypatch.setattr(preflight, "importlib", SimpleNamespace(import_module=import_module))
+    monkeypatch.setattr(transformers, "utils", SimpleNamespace(is_flash_attn_3_available=lambda: True))
     source = tmp_path / "source"
     source.mkdir()
     (source / "config.json").write_text("{}")
@@ -3535,6 +3538,8 @@ def test_onboarding_node_prerequisites_do_not_allocate_models(_node_prerequisite
             return state.importer(name)
 
         monkeypatch.setattr(preflight.importlib, "import_module", import_module)
+        if fault == "hf":
+            monkeypatch.setattr(transformers.utils, "is_flash_attn_3_available", lambda: False)
     elif fault == "source":
         (Path(state.request["source"]) / "config.json").unlink()
     elif fault == "output":
@@ -13877,6 +13882,7 @@ def test_optimizer_capture_missing_participating_bf16_buffer_with_no_local_grad_
 @pytest.fixture
 def _optimizer_capture_capture_server(monkeypatch):
     import arctic_platform.common as common_package
+    import arctic_platform.rl as rl_package
 
     files = {"head": {}, "peer": {}}
     events = []
@@ -13945,6 +13951,7 @@ def _optimizer_capture_capture_server(monkeypatch):
         monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(common_package, "deepspeed_worker", worker_module, raising=False)
     monkeypatch.setattr(common_package, "ray_server", server_module, raising=False)
+    monkeypatch.setattr(rl_package, "ray_server", compatibility_module, raising=False)
     production_worker = worker_module.DeepSpeedWorker
     capture_worker = object()
     monkeypatch.setattr(optimizer_capture, "_optimizer_capture_worker_class", lambda: capture_worker)
@@ -14116,6 +14123,7 @@ def test_optimizer_capture_preloaded_compatibility_server_publishes_and_restores
     compatibility.ArcticRLRayServer = state.server_class
     compatibility.ArcticRLRayServerState = state.state_class
     monkeypatch.setitem(sys.modules, compatibility.__name__, compatibility)
+    monkeypatch.setattr(sys.modules["arctic_platform.rl"], "ray_server", compatibility)
     expected = pytest.raises(RuntimeError, match="context failed") if fail_context else contextlib.nullcontext()
     with expected:
         with optimizer_capture.optimizer_capture_worker():
@@ -14137,6 +14145,7 @@ def test_optimizer_capture_lazy_compatibility_import_restores_production_classes
 ):
     state = _optimizer_capture_capture_server
     monkeypatch.delitem(sys.modules, "arctic_platform.rl.ray_server")
+    monkeypatch.delattr(sys.modules["arctic_platform.rl"], "ray_server")
     with optimizer_capture.optimizer_capture_worker():
         compatibility = sys.modules["arctic_platform.rl.ray_server"]
         assert compatibility.ArcticRLRayServer is state.server_module.ArcticRLRayServer
@@ -15415,12 +15424,10 @@ def _maintained_native_scope(case, monkeypatch, *, split, rpc_timeout=30):
     ray = ModuleType("ray")
     ray.get, ray.is_initialized = get, is_initialized
     modules = {module.__name__: module for module in (snow, gateway, manager_module, ray)}
-    original_import = decoder.importlib.import_module
-    monkeypatch.setattr(
-        decoder.importlib,
-        "import_module",
-        lambda name, *args, **kwargs: modules[name] if name in modules else original_import(name, *args, **kwargs),
+    _native_original_composition_modules(
+        monkeypatch, **{name: module for name, module in modules.items() if name.startswith("dss.")}
     )
+    monkeypatch.setitem(sys.modules, "ray", ray)
     monkeypatch.setattr(
         decoder,
         "_native_scope_actor_workers",
@@ -19666,6 +19673,7 @@ def test_shared_adapter_running_job_ray_handoff_precedes_client_and_restores_ove
     generated_adapter_config, tmp_path, monkeypatch, failure
 ):
     from arctic_platform import common
+    from arctic_platform import rl
     from arctic_platform.correctness.harness import gateway as dss_driver
     from arctic_platform.correctness.harness import optimizer as optimizer_capture
 
@@ -19699,6 +19707,7 @@ def test_shared_adapter_running_job_ray_handoff_precedes_client_and_restores_ove
         monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(common, "deepspeed_worker", worker, raising=False)
     monkeypatch.setattr(common, "ray_server", server, raising=False)
+    monkeypatch.setattr(rl, "ray_server", compatibility, raising=False)
     monkeypatch.setattr(optimizer_capture, "_optimizer_capture_worker_class", lambda: capture_worker)
 
     def require_overlay():
@@ -36207,6 +36216,8 @@ def _native_ap_ep_shards(pair, source, root, step, ep_ranks):
 
 
 def test_automatic_participation_globalizes_expert_parallel_shapes(monkeypatch):
+    from deepspeed import utils
+
     from arctic_platform.correctness.harness.optimizer import WorkerParticipation
     from arctic_platform.correctness.harness.optimizer import merge_worker_receipts
 
@@ -36218,9 +36229,9 @@ def test_automatic_participation_globalizes_expert_parallel_shapes(monkeypatch):
     model.experts.group_name = "ep_size_4"
     model.get_decoder = lambda: model.decoder
     model.get_output_embeddings = lambda: model.head
-    monkeypatch.setitem(
-        sys.modules, "deepspeed.utils.groups", SimpleNamespace(_get_expert_parallel_group=lambda name: name)
-    )
+    groups = SimpleNamespace(_get_expert_parallel_group=lambda name: name)
+    monkeypatch.setitem(sys.modules, "deepspeed.utils.groups", groups)
+    monkeypatch.setattr(utils, "groups", groups)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: {"ep_size_4": 4}[group])
     receipts = []
     for rank in range(4):

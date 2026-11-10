@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import importlib
 import importlib.util
 import inspect
 import json
@@ -80,8 +79,7 @@ def owner_split_request(cfg, *, checkpoint_parent: Path, hostfile: Path) -> dict
     import ray.actor
     from deepspeed.runtime.engine import DeepSpeedEngine
     from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
-
-    build_checkpointer = importlib.import_module("dss.ray_dss.jobs.checkpointing").build_checkpointer
+    from dss.ray_dss.jobs.checkpointing import build_checkpointer
 
     from arctic_platform.correctness.harness import optimizer
     from arctic_platform.correctness.harness.storage import parse_hostfile
@@ -168,10 +166,12 @@ def install_gateway_route(gateway) -> None:
 
     def parent(body: dict = Body(...)):
         try:
+            from dss.ray_dss import gateway_snowapi
+
             binding = resolve_native_optimizer_parent(
                 body["request"],
                 body["parent_job_id"],
-                gateway_snowapi=importlib.import_module("dss.ray_dss.gateway_snowapi"),
+                gateway_snowapi=gateway_snowapi,
                 gateway=gateway,
             )
             return {"binding": binding, "zone_url": gateway._zones[binding["zone_id"]].url}
@@ -198,6 +198,8 @@ def install_zone_routes(app) -> None:
         request, binding, gateway_url = body["request"], body["binding"], body["gateway_url"]
         with lock:
             try:
+                import ray
+
                 require_local_cortex_gateway(CortexConfig(base_url=gateway_url))
 
                 def verify_parent_binding(current):
@@ -209,7 +211,7 @@ def install_zone_routes(app) -> None:
                     request,
                     binding,
                     manager=app.state.manager,
-                    ray=importlib.import_module("ray"),
+                    ray=ray,
                     verify_parent_binding=verify_parent_binding,
                 )
             except Exception as error:

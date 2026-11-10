@@ -380,7 +380,10 @@ def installed_runtime(monkeypatch):
         return {"bf16": {"enabled": True}, "data_types": {"grad_accum_dtype": "fp32"}}
 
     runtime._build_ds_config = build
+    package = ModuleType("dss.ray_dss.jobs.gpu")
+    package.training = runtime
     monkeypatch.setitem(sys.modules, schema.__name__, schema)
+    monkeypatch.setitem(sys.modules, package.__name__, package)
     monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     monkeypatch.setattr(gateway, "_allocation_hostfile", lambda: None)
@@ -512,7 +515,8 @@ async def test_gateway_runtime_scope_does_not_load_dss_for_nontraining_jobs(monk
     monkeypatch.delenv(engine_admission.RUNTIME_ADMISSION_ENV, raising=False)
     if admitted:
         monkeypatch.setenv(engine_admission.RUNTIME_ADMISSION_ENV, "{}")
-    monkeypatch.setattr(engine_admission.importlib, "import_module", forbidden)
+    monkeypatch.setitem(sys.modules, "dss.ray_dss.jobs.gpu", None)
+    monkeypatch.setitem(sys.modules, "dss.ray_dss.stage_info", None)
     calls = []
 
     async def original(zone, config, job_id):
@@ -552,6 +556,9 @@ async def test_gateway_runtime_scope_loads_stage_info_only_for_admitted_training
     monkeypatch.setitem(sys.modules, stage_info.__name__, stage_info)
     training = ModuleType("dss.ray_dss.jobs.gpu.training")
     training.sp = SimpleNamespace(sp_size_of=lambda config: 1)
+    package = ModuleType("dss.ray_dss.jobs.gpu")
+    package.training = training
+    monkeypatch.setitem(sys.modules, package.__name__, package)
     monkeypatch.setitem(sys.modules, training.__name__, training)
     requests = []
 

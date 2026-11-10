@@ -243,7 +243,8 @@ def onboarding_node_prerequisites(request: dict) -> dict:
             if attribute and not callable(getattr(module, attribute, None)):
                 raise ImportError(f"{module_name}.{attribute} is unavailable")
             if backend in request.get("hf_attention", []) and backend in {"flash_attention_2", "flash_attention_3"}:
-                availability = importlib.import_module("transformers.utils")
+                from transformers import utils as availability
+
                 checker = getattr(availability, f"is_flash_attn_{backend[-1]}_available")
                 if not checker():
                     raise ImportError(f"Transformers does not recognize an installed {backend} package")
@@ -431,7 +432,7 @@ def _canonical_root(path: str | Path) -> Path:
 
 
 def _native_path(source_job_id: str) -> Path:
-    _job_ckpt_dir = importlib.import_module("dss.ray_dss.jobs.checkpointing")._job_ckpt_dir
+    from dss.ray_dss.jobs.checkpointing import _job_ckpt_dir
 
     return Path(_job_ckpt_dir(source_job_id))
 
