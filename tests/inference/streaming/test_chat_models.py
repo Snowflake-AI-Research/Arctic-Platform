@@ -31,6 +31,7 @@ LOADER_ARCHITECTURES = {
         "Qwen3_5ForCausalLM",
     },
     "qwen3_5_moe": {"Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"},
+    "inkling": {"InklingForCausalLM", "InklingForConditionalGeneration"},
     "glm_moe_dsa": {"GlmMoeDsaForCausalLM"},
     "generic_moe": {
         "Qwen3MoeForCausalLM",
