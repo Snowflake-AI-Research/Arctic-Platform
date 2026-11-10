@@ -81,12 +81,13 @@ class Glm5NextOptions(FlashMoeOptions):
             " of the split layers on its weight shard and sums the partials as vLLM's batch-invariant all-reduce does."
         ),
     )
-    vllm_aligned_backward: Literal["stock", "vllm"] = Field(
+    vllm_aligned_backward: Literal["stock", "vllm", "vllm_op"] = Field(
         "stock",
         description=(
             "Experimental, with vllm_aligned. 'stock': each layer's backward recomputes the stock layer on the layer's"
             " input. 'vllm': each sublayer's gradient is taken at the aligned forward's exact values, through stock"
             " sublayers made to compute vLLM's math (replayed choices, bf16 MLA projections, FP8 activation quantization)."
+            " 'vllm_op': each vLLM kernel's gradient is that of its reference math at the kernel's exact inputs."
         ),
     )
 

@@ -47,6 +47,8 @@ Kernels the sampler runs (its kernel inventory, ``layer_digest.kernel_inventory`
 from __future__ import annotations
 
 import contextlib
+import contextvars
+import functools
 from typing import Any
 from typing import Callable
 
@@ -55,6 +57,43 @@ import torch
 from arctic_platform.model.implementations.vllm_aligned import ops
 
 FP8_BLOCK = 128  # block-FP8 weight block (rows and columns)
+
+# Set while a layer's backward recomputes the aligned forward with every kernel call differentiable (``vllm_op``).
+_DIFFERENTIABLE = contextvars.ContextVar("vllm_aligned_differentiable", default=False)
+
+
+@contextlib.contextmanager
+def differentiable():
+    """Within: each vLLM kernel call of the aligned forward keeps its value and gets the gradient of its reference
+    math at its inputs (:mod:`glm5_next_backward`)."""
+    token = _DIFFERENTIABLE.set(True)
+    try:
+        yield
+    finally:
+        _DIFFERENTIABLE.reset(token)
+
+
+def _bind(fn: Callable, static: dict) -> Callable:
+    """``fn`` with the keyword arguments of ``static`` it takes."""
+    import inspect
+
+    params = inspect.signature(fn).parameters
+    if not any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        static = {k: v for k, v in static.items() if k in params}
+    return functools.partial(fn, **static)
+
+
+def _op(kernel: Callable, reference: str, *inputs: torch.Tensor, **static: Any):
+    """``kernel(*inputs, **static)``; in :func:`differentiable` mode with the gradient of the named reference."""
+    if not _DIFFERENTIABLE.get():
+        return _bind(kernel, static)(*inputs)
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next_backward as bw
+
+    return bw.vllm_op(_bind(kernel, static), _bind(getattr(bw, reference), static), *inputs)
+
+
+def _linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return _op(ops.linear_kernel, "ref_linear", x, weight)
 
 
 def tp_shard(tensor: torch.Tensor, tp: int, rank: int, dim: int = 0) -> torch.Tensor:
@@ -108,25 +147,20 @@ def hc_pre(streams: torch.Tensor, hc: Any, norm: Any, config: Any) -> tuple[torc
     ``streams`` is ``[tokens, hc_mult, hidden]`` bf16; ``hc`` the stock ``Glm5NextTextHyperConnection`` and ``norm``
     the RMSNorm that follows it in the stock layer.
     """
-    return torch.ops.vllm.mhc_pre_tilelang(
-        streams,
-        hc.fn.float(),
-        hc.scale.float(),
-        hc.base.float(),
-        config.rms_norm_eps,
-        config.hc_eps,
-        config.hc_eps,
-        _mhc_constants(),
-        config.hc_sinkhorn_iters,
-        1,
-        norm.weight,
-        norm.variance_epsilon,
-    )
+    return _op(_mhc_pre_kernel, "ref_mhc_pre", streams, hc.fn, hc.scale, hc.base, norm.weight,
+               rms_eps=config.rms_norm_eps, pre_eps=config.hc_eps, sinkhorn_eps=config.hc_eps,
+               post_mult=_mhc_constants(), iters=config.hc_sinkhorn_iters, norm_eps=norm.variance_epsilon)  # fmt: skip
+
+
+def _mhc_pre_kernel(streams, fn, scale, base, norm_weight, *, rms_eps, pre_eps, sinkhorn_eps, post_mult, iters,
+                    norm_eps):  # fmt: skip
+    return torch.ops.vllm.mhc_pre_tilelang(streams, fn.float(), scale.float(), base.float(), rms_eps, pre_eps,
+                                           sinkhorn_eps, post_mult, iters, 1, norm_weight, norm_eps)  # fmt: skip
 
 
 def hc_post(x: torch.Tensor, streams: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
     """vLLM's ``mhc_post``: ``post_j * x + sum_i comb_ij * streams_i``, the residual streams after a sublayer."""
-    return torch.ops.vllm.mhc_post_tilelang(x, streams, post, comb)
+    return _op(torch.ops.vllm.mhc_post_tilelang, "ref_mhc_post", x, streams, post, comb)
 
 
 class _AlignedLayer(torch.autograd.Function):
@@ -152,33 +186,93 @@ class _AlignedLayer(torch.autograd.Function):
 KDA_O_NORM_EPS = 1e-5  # vLLM builds the gated output norm with FusedRMSNormGated's default eps, not rms_norm_eps
 
 
-def _kda_decode(core, qkv, g1, beta, conv_states, recurrent, conv_weight, w, starts, prompt_lens, lengths, slots,
-                heads: int, head_dim: int, config: Any) -> None:  # fmt: skip
-    """Write the decoded tokens' KDA core output into ``core``, one decode step at a time over every request still
-    decoding, as vLLM's plain decode step runs them: ``causal_conv1d_update`` on the request's conv state slot, then
-    ``fused_recurrent_kda`` (gate and beta sigmoid in the kernel) updating its fp32 recurrent state slot in place."""
-    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
-    from vllm.models.glm5next.nvidia.ops.third_party.kda import fused_recurrent_kda
-
-    projection = heads * head_dim
-    a_log = w.a_log.reshape(1, 1, heads, 1)
-    g_bias = w.dt_bias
-    steps = lengths - prompt_lens
+def _decode_steps(layout: Any):
+    """Each decode step's active requests and their rows, as vLLM's decode steps take them."""
+    steps = layout.lengths - layout.prompt_lens
     for step in range(int(steps.max())):
         active = torch.nonzero(steps > step).flatten()
-        rows = starts[active] + prompt_lens[active] + step
+        yield active, layout.starts[active] + layout.prompt_lens[active] + step
+
+
+def _kda_conv_kernel(qkv: torch.Tensor, conv_weight: torch.Tensor, *, layout: Any, trace: dict, **_) -> torch.Tensor:
+    """vLLM's q|k|v causal conv with SiLU: ``causal_conv1d_fn`` over each prompt from a zero state, then one
+    ``causal_conv1d_update`` per decode step on the request's conv state slot. ``[tokens, 3 * projection]``."""
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
+
+    # State slot 0 is vLLM's null block, which the conv kernel treats as padding, so the slots start at 1.
+    conv_states = qkv.new_zeros((layout.num_seqs + 1, qkv.shape[-1], conv_weight.shape[-1] - 1))
+    qkv_p = qkv if layout.prompt_rows is None else qkv[layout.prompt_rows]
+    conv_p = causal_conv1d_fn(
+        qkv_p.transpose(0, 1),
+        conv_weight,
+        None,
+        activation="silu",
+        conv_states=conv_states,
+        has_initial_state=torch.zeros(layout.num_seqs, dtype=torch.bool, device=qkv.device),
+        cache_indices=layout.slots,
+        query_start_loc=layout.prompt_cu,
+    ).transpose(0, 1)
+    trace.update(conv_in=qkv_p.transpose(0, 1), conv_weight=conv_weight, conv_out=conv_p)
+    if layout.prompt_rows is None:
+        return conv_p
+    conv = qkv.new_empty(qkv.shape)
+    conv[layout.prompt_rows] = conv_p
+    for active, rows in _decode_steps(layout):
+        conv[rows] = causal_conv1d_update(qkv[rows], conv_states, conv_weight, None, activation="silu",
+                                          conv_state_indices=layout.slots[active])  # fmt: skip
+    return conv
+
+
+def _kda_core_kernel(q, k, v, g, beta, a_log, dt_bias, *, layout: Any, lower_bound: float, trace: dict,
+                     **_) -> torch.Tensor:  # fmt: skip
+    """vLLM's KDA core on ``[1, tokens, heads, head_dim]`` q/k/v/g and ``[tokens, heads]`` beta logits: FlashKDA over
+    each prompt from a zero state, then one ``fused_recurrent_kda`` step per decode step (gate and beta sigmoid in the
+    kernel) from the fp32 state the request reached, in its recurrent state slot."""
+    import vllm._flashkda_C  # noqa: F401
+    from vllm.models.glm5next.nvidia.ops.third_party.kda import fused_recurrent_kda
+
+    heads, head_dim = q.shape[2:]
+    rows_p = layout.prompt_rows
+    q_p, k_p, v_p, g_p = (t if rows_p is None else t[:, rows_p] for t in (q, k, v, g))
+    beta_p = beta if rows_p is None else beta[rows_p]
+    q_p, k_p, v_p = (t.contiguous() for t in (q_p, k_p, v_p))
+    trace.update(q=q_p, k=k_p, v=v_p, g=g_p, beta=beta_p.unsqueeze(0))
+    prompt_tokens, num_seqs = q_p.shape[1], layout.num_seqs
+    state = torch.zeros((num_seqs, heads, head_dim, head_dim), dtype=torch.float32, device=q.device)
+    final_state = torch.empty_like(state)
+    workspace = torch.empty(torch.ops._flashkda_C.get_workspace_size(prompt_tokens, heads, num_seqs),
+                            dtype=torch.uint8, device=q.device)  # fmt: skip
+    core_p = torch.empty((1, prompt_tokens, heads, head_dim), dtype=q.dtype, device=q.device)
+    torch.ops._flashkda_C.fwd(
+        q_p, k_p, v_p, g_p.contiguous(), beta_p.unsqueeze(0), head_dim**-0.5, core_p, workspace,
+        a_log, dt_bias.view(-1, head_dim), lower_bound,
+        state, final_state, layout.prompt_cu.contiguous(), None, None,
+    )  # fmt: skip
+    if rows_p is None:
+        return core_p
+    core = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    core[:, rows_p] = core_p
+    recurrent = torch.zeros((num_seqs + 1, heads, head_dim, head_dim), dtype=torch.float32, device=q.device)
+    recurrent[1:] = final_state
+    for active, rows in _decode_steps(layout):
         batch = rows.numel()
-        conv = causal_conv1d_update(qkv[rows], conv_states, conv_weight, None, activation="silu",
-                                    conv_state_indices=slots[active])  # fmt: skip
-        q, k, v = (t.reshape(1, batch, heads, head_dim) for t in conv.split(projection, dim=-1))
         out, _ = fused_recurrent_kda(
-            q=q, k=k, v=v, g=g1[:, rows], beta=beta[rows].unsqueeze(0), initial_state=recurrent,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=torch.arange(batch + 1, dtype=torch.int32, device=qkv.device),
-            ssm_state_indices=slots[active], sigmoid_beta=True, a_log=a_log, g_bias=g_bias, compute_gate=True,
-            lower_bound=config.linear_lower_bound,
+            q=q[:, rows], k=k[:, rows], v=v[:, rows], g=g[:, rows], beta=beta[rows].unsqueeze(0),
+            initial_state=recurrent, use_qk_l2norm_in_kernel=True,
+            cu_seqlens=torch.arange(batch + 1, dtype=torch.int32, device=q.device),
+            ssm_state_indices=layout.slots[active], sigmoid_beta=True, a_log=a_log.reshape(1, 1, heads, 1),
+            g_bias=dt_bias, compute_gate=True, lower_bound=lower_bound,
         )  # fmt: skip
         core[:, rows] = out.to(core.dtype)
+    return core
+
+
+def _gated_norm_kernel(x: torch.Tensor, g: torch.Tensor, weight: torch.Tensor, *, eps: float) -> torch.Tensor:
+    from vllm.third_party.flash_linear_attention.ops.kda import rms_norm_gated
+
+    # It writes its output over a contiguous ``x``; the per-op backward keeps ``x`` for the reference.
+    return rms_norm_gated(x.clone(), g, weight, None, "sigmoid", eps=eps)
 
 
 def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, trace: dict | None = None) -> torch.Tensor:
@@ -232,75 +326,38 @@ def kda_forward(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
 
 def _kda_rank(w: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, prompt_lens: torch.Tensor | None,
               trace: dict | None) -> torch.Tensor:  # fmt: skip
-    trace = {} if trace is None else trace
-    import vllm._flashkda_C  # noqa: F401
-    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
-    from vllm.third_party.flash_linear_attention.ops.kda import rms_norm_gated
+    import types
 
+    trace = {} if trace is None else trace
     heads, head_dim = w.heads, w.head_dim
     projection = heads * head_dim
     tokens, num_seqs = x.shape[0], cu_seqlens.numel() - 1
     starts, lengths = cu_seqlens[:-1].long(), (cu_seqlens[1:] - cu_seqlens[:-1]).long()
     prompt_lens = lengths if prompt_lens is None else prompt_lens.long()
-    decoded = bool((prompt_lens < lengths).any())
-    if decoded:
+    if bool((prompt_lens < lengths).any()):
         seq_of_token = torch.repeat_interleave(torch.arange(num_seqs, device=x.device), lengths)
         in_prompt = torch.arange(tokens, device=x.device) - starts[seq_of_token] < prompt_lens[seq_of_token]
         prompt_rows = torch.nonzero(in_prompt).flatten()
         prompt_cu = torch.cat([cu_seqlens.new_zeros(1), torch.cumsum(prompt_lens, 0).to(cu_seqlens.dtype)])
     else:
         prompt_rows, prompt_cu = None, cu_seqlens
-    projected = ops.linear_kernel(x, w.merged)
+    layout = types.SimpleNamespace(num_seqs=num_seqs, starts=starts, lengths=lengths, prompt_lens=prompt_lens,
+                                   prompt_rows=prompt_rows, prompt_cu=prompt_cu,
+                                   slots=torch.arange(1, num_seqs + 1, dtype=torch.int32, device=x.device))  # fmt: skip
+    projected = _linear(x, w.merged)
     qkv, beta, f_a, g_a = projected.split([3 * projection, heads, head_dim, head_dim], dim=-1)
-    g1 = ops.linear_kernel(f_a, w.f_b).reshape(1, tokens, heads, head_dim)
-    g2 = ops.linear_kernel(g_a, w.g_b).reshape(tokens, heads, head_dim)
+    g1 = _linear(f_a, w.f_b).reshape(1, tokens, heads, head_dim)
+    g2 = _linear(g_a, w.g_b).reshape(tokens, heads, head_dim)
 
-    conv_weight = w.conv
-    # State slot 0 is vLLM's null block, which the conv kernel treats as padding, so the slots start at 1.
-    slots = torch.arange(1, num_seqs + 1, dtype=torch.int32, device=x.device)
-    conv_states = x.new_zeros((num_seqs + 1, 3 * projection, conv_weight.shape[-1] - 1))
-    qkv_p = qkv if prompt_rows is None else qkv[prompt_rows]
-    g1_p = g1 if prompt_rows is None else g1[:, prompt_rows]
-    beta_p = beta if prompt_rows is None else beta[prompt_rows]
-    prompt_tokens = qkv_p.shape[0]
-    conv = causal_conv1d_fn(
-        qkv_p.transpose(0, 1),
-        conv_weight,
-        None,
-        activation="silu",
-        conv_states=conv_states,
-        has_initial_state=torch.zeros(num_seqs, dtype=torch.bool, device=x.device),
-        cache_indices=slots,
-        query_start_loc=prompt_cu,
-    ).transpose(0, 1)
-    q, k, v = (t.reshape(1, prompt_tokens, heads, head_dim).contiguous() for t in conv.split(projection, dim=-1))
-    trace.update(conv_in=qkv_p.transpose(0, 1), conv_weight=conv_weight, conv_out=conv, q=q, k=k, v=v, g=g1_p,
-                 beta=beta_p.unsqueeze(0))  # fmt: skip
-
-    state = torch.zeros((num_seqs, heads, head_dim, head_dim), dtype=torch.float32, device=x.device)
-    final_state = torch.empty_like(state)
-    workspace = torch.empty(torch.ops._flashkda_C.get_workspace_size(prompt_tokens, heads, num_seqs),
-                            dtype=torch.uint8, device=x.device)  # fmt: skip
-    core_p = torch.empty((1, prompt_tokens, heads, head_dim), dtype=x.dtype, device=x.device)
-    torch.ops._flashkda_C.fwd(
-        q, k, v, g1_p.contiguous(), beta_p.unsqueeze(0), head_dim**-0.5, core_p, workspace,
-        w.a_log, w.dt_bias.view(-1, head_dim), config.linear_lower_bound,
-        state, final_state, prompt_cu.contiguous(), None, None,
-    )  # fmt: skip
-    if prompt_rows is None:
-        core = core_p
-    else:
-        core = torch.empty((1, tokens, heads, head_dim), dtype=x.dtype, device=x.device)
-        core[:, prompt_rows] = core_p
-        recurrent = torch.zeros((num_seqs + 1, heads, head_dim, head_dim), dtype=torch.float32, device=x.device)
-        recurrent[1:] = final_state
-        _kda_decode(core, qkv, g1, beta, conv_states, recurrent, conv_weight, w, starts, prompt_lens, lengths,
-                    slots, heads, head_dim, config)  # fmt: skip
+    conv = _op(_kda_conv_kernel, "ref_causal_conv_silu", qkv, w.conv, layout=layout, trace=trace,
+               cu_seqlens=cu_seqlens)  # fmt: skip
+    q, k, v = (t.reshape(1, tokens, heads, head_dim) for t in conv.split(projection, dim=-1))
+    core = _op(_kda_core_kernel, "ref_kda_core", q, k, v, g1, beta, w.a_log, w.dt_bias, layout=layout,
+               lower_bound=config.linear_lower_bound, trace=trace, cu_seqlens=cu_seqlens)  # fmt: skip
     trace.update(core=core, g2=g2)
-    core = rms_norm_gated(core, g2, w.o_norm, None, "sigmoid", eps=KDA_O_NORM_EPS).reshape(tokens, -1)
+    core = _op(_gated_norm_kernel, "ref_gated_rms_norm", core, g2, w.o_norm, eps=KDA_O_NORM_EPS).reshape(tokens, -1)
     trace.update(normed=core)
-    out = ops.linear_kernel(core, w.o_weight)
-    return add_lora(out, core, [w.o_lora], (out.shape[-1],))
+    return add_lora(_linear(core, w.o_weight), core, [w.o_lora], (w.o_weight.shape[0],))
 
 
 SPARSE_TOPK_BLOCK = 128  # sparse MLA tiles the top-k index buffer in 128 columns
@@ -455,35 +512,47 @@ def add_lora(y: torch.Tensor, x: torch.Tensor, adapters: list, output_slices: tu
     present = [f for f in adapters if f is not None]
     if not present or x.shape[0] == 0:
         return y
+    rank = present[0][0].shape[0]
+    if any(a.shape[0] != rank for a, _ in present):
+        raise NotImplementedError("the vLLM-aligned LoRA covers one rank across a merged projection")
+    factors = []
+    for pair, width in zip(adapters, output_slices):
+        a, b = pair if pair is not None else (x.new_zeros(rank, x.shape[1]), x.new_zeros(width, rank))
+        if b.shape[0] < width:
+            b = torch.cat([b, b.new_zeros(width - b.shape[0], rank)])
+        factors += [a, b]
+    if _DIFFERENTIABLE.get():
+        return _op(_add_lora_kernel, "ref_add_lora", y, x, *factors, slices=tuple(output_slices))
+    return _add_lora_kernel(y, x, *factors, out=y)
+
+
+def _add_lora_kernel(y: torch.Tensor, x: torch.Tensor, *factors: torch.Tensor, out: torch.Tensor | None = None,
+                     **_) -> torch.Tensor:  # fmt: skip
+    """The shrink and expand of :func:`add_lora` (``factors`` = A0, B0, A1, B1, ...) adding onto ``out`` (a copy of
+    ``y`` by default)."""
     from vllm.lora.ops.triton_ops import LoRAKernelMeta
     from vllm.lora.ops.triton_ops import lora_expand
     from vllm.lora.ops.triton_ops import lora_shrink
     from vllm.lora.ops.triton_ops import utils as lora_utils
 
-    rank, tokens = present[0][0].shape[0], x.shape[0]
-    if any(a.shape[0] != rank for a, _ in present):
-        raise NotImplementedError("the vLLM-aligned LoRA covers one rank across a merged projection")
-    a_stack, b_stack = [], []
-    for factors, width in zip(adapters, output_slices):
-        a, b = factors if factors is not None else (x.new_zeros(rank, x.shape[1]), x.new_zeros(width, rank))
-        if b.shape[0] < width:
-            b = torch.cat([b, b.new_zeros(width - b.shape[0], rank)])
-        a_stack.append(a.unsqueeze(0).contiguous())
-        b_stack.append(b.unsqueeze(0).contiguous())
+    out = y.clone() if out is None else out
+    tokens, rank = x.shape[0], factors[0].shape[0]
+    a_stack = [a.unsqueeze(0).contiguous() for a in factors[0::2]]
+    b_stack = [b.unsqueeze(0).contiguous() for b in factors[1::2]]
     # vLLM caches each weight list's pointers and strides by ``data_ptr`` alone; these tensors are new every call.
     lora_utils._LORA_A_PTR_DICT.clear()
     lora_utils._LORA_B_PTR_DICT.clear()
     meta = LoRAKernelMeta.make(1, tokens, x.device)
     meta.prepare_tensors(torch.zeros(tokens, dtype=torch.int32, device=x.device))
-    buffer = torch.empty((len(adapters), tokens, rank), dtype=torch.float32, device=x.device)
+    buffer = torch.empty((len(a_stack), tokens, rank), dtype=torch.float32, device=x.device)
     lora_shrink(x.contiguous(), a_stack, buffer, *meta.meta_args(tokens, False), 1.0)
-    lora_expand(buffer, b_stack, y, *meta.meta_args(tokens, False), offset_start=0, add_inputs=True)
-    return y
+    lora_expand(buffer, b_stack, out, *meta.meta_args(tokens, False), offset_start=0, add_inputs=True)
+    return out
 
 
 def lora_linear(x: torch.Tensor, module: Any, weight: torch.Tensor | None = None) -> torch.Tensor:
     """A projection as vLLM serves it with the synced adapter: the batch-invariant bf16 matmul, then the LoRA delta."""
-    y = ops.linear_kernel(x, bf16_weight(module) if weight is None else weight)
+    y = _linear(x, bf16_weight(module) if weight is None else weight)
     return add_lora(y, x, [lora_factors(module)], (y.shape[-1],))
 
 
@@ -505,9 +574,6 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     heads (its rows of ``q_b_proj`` and ``kv_b_proj``, its input columns of ``o_proj``), and the ranks' ``o_proj``
     partials are all-reduced (:func:`tp_sum`).
     """
-    from vllm.models.common.ops import fused_q_kv_rmsnorm
-    from vllm.v1.attention.backends.mla import flashattn_mla_sparse
-
     if not getattr(config, "mla_use_nope", True) and config.qk_rope_head_dim:
         raise NotImplementedError("vLLM-aligned sparse MLA covers mla_use_nope (no rotary embedding)")
     starts, lengths = cu_seqlens[:-1], cu_seqlens[1:] - cu_seqlens[:-1]
@@ -518,16 +584,17 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     kv_a = bf16_weight(attn.kv_a_proj_with_mqa)
     if kv_a.shape[0] == latent and rope:
         kv_a = torch.cat([kv_a, kv_a.new_zeros((rope, kv_a.shape[1]))])
-    qkv_lora = ops.linear_kernel(x, torch.cat([bf16_weight(attn.q_a_proj), kv_a]))
-    add_lora(qkv_lora, x, [lora_factors(attn.q_a_proj), lora_factors(attn.kv_a_proj_with_mqa)],
-             (config.q_lora_rank, latent + rope))  # fmt: skip
+    qkv_lora = _linear(x, torch.cat([bf16_weight(attn.q_a_proj), kv_a]))
+    qkv_lora = add_lora(qkv_lora, x, [lora_factors(attn.q_a_proj), lora_factors(attn.kv_a_proj_with_mqa)],
+                        (config.q_lora_rank, latent + rope))  # fmt: skip
     q_c, kv_lora = qkv_lora.split([config.q_lora_rank, latent + rope], dim=-1)
     kv_c, k_pe = kv_lora.split([latent, rope], dim=-1)
-    q_c, kv_c = fused_q_kv_rmsnorm(q_c, kv_c, attn.q_a_layernorm.weight, attn.kv_a_layernorm.weight,
-                                   attn.q_a_layernorm.variance_epsilon)  # fmt: skip
+    q_c, kv_c = _op(_q_kv_norm_kernel, "ref_q_kv_rmsnorm", q_c, kv_c, attn.q_a_layernorm.weight,
+                    attn.kv_a_layernorm.weight, eps=attn.q_a_layernorm.variance_epsilon)  # fmt: skip
 
     seq_of_token = torch.repeat_interleave(torch.arange(starts.numel(), device=x.device), lengths)
-    topk = indexer_topk(attn.indexer, x, q_c, positions, cu_seqlens, config, topk_buffer_width(config))
+    with torch.no_grad():  # the selection is discrete: no gradient through the indexer
+        topk = indexer_topk(attn.indexer, x, q_c, positions, cu_seqlens, config, topk_buffer_width(config))
     rows = torch.where(topk >= 0, topk + starts.to(torch.int32)[seq_of_token, None], topk)
     if record is not None:
         record["topk"] = rows
@@ -542,36 +609,57 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     partials = []
     for rank in range(tp):
         q_b_r = tp_shard(q_b, tp, rank)
-        q = add_lora(ops.linear_kernel(q_c, q_b_r), q_c, [_column_lora(q_b_lora, tp, rank)], (q_b_r.shape[0],))
+        q = add_lora(_linear(q_c, q_b_r), q_c, [_column_lora(q_b_lora, tp, rank)], (q_b_r.shape[0],))
         q = q.view(tokens, heads_r, nope + rope)
         q_nope, q_pe = q.split([nope, rope], dim=-1)
         w_uk_t, w_uv = tp_shard(w_uk_t_all, tp, rank), tp_shard(w_uv_all, tp, rank)
-        q_latent = q.new_empty((tokens, heads_r, latent))
-        torch.bmm(q_nope.transpose(0, 1), w_uk_t, out=q_latent.transpose(0, 1))
+        q_latent = _op(_head_bmm_kernel, "ref_head_bmm", q_nope.transpose(0, 1), w_uk_t)
         if rope:
             k_cache, q_rope = kv_rows[:, latent:].unsqueeze(1).unsqueeze(1), q_pe
         else:  # FA3's QV path needs a 64-wide Q/K: a zero query against the first 64 latent columns
             k_cache, q_rope = v_cache[..., :64], q.new_zeros((tokens, heads_r, 64))
-        out = flashattn_mla_sparse.flash_attn_varlen_func(
-            q=q_rope,
-            k=k_cache,
-            v=v_cache,
-            q_v=q_latent,
-            max_seqlen_q=1,
-            cu_seqlens_q=torch.arange(tokens + 1, dtype=torch.int32, device=x.device),
-            max_seqlen_k=rows.shape[1],
-            seqused_k=valid,
-            block_table=rows,
-            softmax_scale=(nope + rope) ** -0.5,
-            causal=True,
-            fa_version=3,
-        )
-        up = out.new_empty((tokens, heads_r, value))
-        torch.bmm(out.view(-1, heads_r, latent).transpose(0, 1), w_uv, out=up.transpose(0, 1))
+        out = _op(_sparse_mla_kernel, "ref_sparse_mla", q_rope, k_cache, v_cache, q_latent, rows, valid,
+                  softmax_scale=(nope + rope) ** -0.5)  # fmt: skip
+        up = _op(_head_bmm_kernel, "ref_head_bmm", out.view(-1, heads_r, latent).transpose(0, 1), w_uv)
         up = up.view(tokens, heads_r * value)
         o_r = tp_shard(o, tp, rank, 1).contiguous()
-        partials.append(add_lora(ops.linear_kernel(up, o_r), up, [_row_lora(o_lora, tp, rank)], (o_r.shape[0],)))
+        partials.append(add_lora(_linear(up, o_r), up, [_row_lora(o_lora, tp, rank)], (o_r.shape[0],)))
     return tp_sum(partials)
+
+
+def _q_kv_norm_kernel(q: torch.Tensor, kv: torch.Tensor, q_weight: torch.Tensor, kv_weight: torch.Tensor, *,
+                      eps: float) -> tuple[torch.Tensor, torch.Tensor]:  # fmt: skip
+    from vllm.models.common.ops import fused_q_kv_rmsnorm
+
+    return fused_q_kv_rmsnorm(q, kv, q_weight, kv_weight, eps)
+
+
+def _head_bmm_kernel(a: torch.Tensor, b: torch.Tensor, **_) -> torch.Tensor:
+    """``a [heads, tokens, i] @ b [heads, i, o]`` written into a ``[tokens, heads, o]`` tensor, as vLLM's absorbed
+    MLA writes its per-head matmuls."""
+    out = a.new_empty((a.shape[1], a.shape[0], b.shape[2]))
+    torch.bmm(a, b, out=out.transpose(0, 1))
+    return out
+
+
+def _sparse_mla_kernel(q_rope, k_cache, v_cache, q_v, rows, valid, *, softmax_scale: float, **_) -> torch.Tensor:
+    from vllm.v1.attention.backends.mla import flashattn_mla_sparse
+
+    tokens = q_v.shape[0]
+    return flashattn_mla_sparse.flash_attn_varlen_func(
+        q=q_rope,
+        k=k_cache,
+        v=v_cache,
+        q_v=q_v,
+        max_seqlen_q=1,
+        cu_seqlens_q=torch.arange(tokens + 1, dtype=torch.int32, device=q_v.device),
+        max_seqlen_k=rows.shape[1],
+        seqused_k=valid,
+        block_table=rows,
+        softmax_scale=softmax_scale,
+        causal=True,
+        fa_version=3,
+    )
 
 
 def _mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
@@ -628,9 +716,9 @@ def _fp8_mlp_partials(x: torch.Tensor, gate: tuple, up: tuple, down: tuple, swig
         (gate_w, gate_s), (up_w, up_s) = (_fp8_shard(*pair, tp, rank, 0) for pair in (gate, up))
         if gate_w.shape[0] % FP8_BLOCK:
             raise ValueError(f"merging FP8 projections needs {FP8_BLOCK}-row pieces, got {gate_w.shape[0]}")
-        hidden = silu_and_mul_with_clamp(fp8_block_linear(x, torch.cat([gate_w, up_w]), torch.cat([gate_s, up_s])),
-                                         swiglu_limit)  # fmt: skip
-        partials.append(fp8_block_linear(hidden, *_fp8_shard(*down, tp, rank, 1)))
+        gate_up = _op(fp8_block_linear, "ref_fp8_linear", x, torch.cat([gate_w, up_w]), torch.cat([gate_s, up_s]))
+        hidden = _op(silu_and_mul_with_clamp, "ref_silu_and_mul_with_clamp", gate_up, limit=swiglu_limit)
+        partials.append(_op(fp8_block_linear, "ref_fp8_linear", hidden, *_fp8_shard(*down, tp, rank, 1)))
     return partials
 
 
@@ -736,40 +824,47 @@ def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None, record: di
 
     if not is_workspace_manager_initialized():  # the fused-MoE kernels take their scratch from vLLM's workspace
         init_workspace_manager(x.device)
-    logits = linear_fp32_out(x, mlp.router.gate.weight)
-    weights, ids = grouped_topk(
-        x,
-        logits,
-        topk=config.num_experts_per_tok,
-        renormalize=config.norm_topk_prob,
-        num_expert_group=config.n_group,
-        topk_group=config.topk_group,
-        scoring_func=config.scoring_func,
-        routed_scaling_factor=config.routed_scaling_factor,
-        e_score_correction_bias=mlp.expert_bias,
-    )
+    logits = _op(linear_fp32_out, "ref_linear_fp32_out", x, mlp.router.gate.weight)
+
+    def route(logits, **_):
+        return grouped_topk(x, logits, topk=config.num_experts_per_tok, renormalize=config.norm_topk_prob,
+                            num_expert_group=config.n_group, topk_group=config.topk_group,
+                            scoring_func=config.scoring_func, routed_scaling_factor=config.routed_scaling_factor,
+                            e_score_correction_bias=mlp.expert_bias)  # fmt: skip
+
+    with torch.no_grad():
+        weights, ids = route(logits)
+    if _DIFFERENTIABLE.get():
+        if config.scoring_func != "sigmoid":
+            raise NotImplementedError("the per-op vLLM backward covers sigmoid routing")
+        weights = _op(lambda logits, ids, **_: route(logits)[0], "ref_router_weights", logits, ids,
+                      renormalize=config.norm_topk_prob, scaling=config.routed_scaling_factor)  # fmt: skip
     if record is not None:
         record["experts"] = ids.to(torch.int64)
     experts = mlp.experts
     total = config.n_routed_experts
     w1, w2, w3 = (_full(t, total, ep_group) for t in (experts.w1, experts.w2, experts.w3))
     s1, s2, s3 = (_full(t, total, ep_group) for t in (experts.w1_scale_inv, experts.w2_scale_inv, experts.w3_scale_inv))
-    num_experts, intermediate, hidden = w1.shape
     shared = shared_expert_partials(mlp.shared_expert, x, config.swiglu_limit, tp)
     partials = []
     for rank in range(tp):
         (w1_r, s1_r), (w3_r, s3_r) = _fp8_shard(w1, s1, tp, rank, 1), _fp8_shard(w3, s3, tp, rank, 1)
         w2_r, s2_r = _fp8_shard(w2, s2, tp, rank, 2)
         w13, w13_scale = torch.cat([w1_r, w3_r], dim=1), torch.cat([s1_r, s3_r], dim=1)
-        # The kernel captures the scales in its quant config, so it is rebuilt for every call (cheap, host-side only).
-        kernel, activation = _triton_experts(num_experts, config.num_experts_per_tok, hidden, intermediate // tp,
-                                             config.swiglu_limit, w13_scale, s2_r, x.device)  # fmt: skip
-        routed = kernel.apply(
-            x.contiguous(), w13, w2_r, weights, ids, activation=activation, global_num_experts=num_experts,
-            expert_map=None, apply_router_weight_on_input=False,
-        )  # fmt: skip
+        routed = _op(_routed_experts_kernel, "ref_routed_experts", x, weights, ids, w13, w13_scale, w2_r, s2_r,
+                     top_k=config.num_experts_per_tok, limit=config.swiglu_limit)  # fmt: skip
         partials.append(shared[rank] + routed)
     return tp_sum(partials)
+
+
+def _routed_experts_kernel(x, weights, ids, w13, w13_scale, w2, w2_scale, *, top_k: int, limit: float) -> torch.Tensor:
+    """vLLM's Triton routed experts on the given expert weight shard (``w13 [E, 2I, H]``, ``w2 [E, H, I]``)."""
+    num_experts, intermediate2, hidden = w13.shape
+    # The kernel captures the scales in its quant config, so it is rebuilt for every call (cheap, host-side only).
+    kernel, activation = _triton_experts(num_experts, top_k, hidden, intermediate2 // 2, limit, w13_scale, w2_scale,
+                                         x.device)  # fmt: skip
+    return kernel.apply(x.contiguous(), w13, w2, weights, ids, activation=activation, global_num_experts=num_experts,
+                        expert_map=None, apply_router_weight_on_input=False)  # fmt: skip
 
 
 def _mlp(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
@@ -1053,6 +1148,18 @@ def _vllm_backward_runner(input_ids: torch.Tensor, position_ids: torch.Tensor, k
     return run
 
 
+def _per_op_backward_runner(ctx: Any) -> Callable:
+    """``run(layer, streams)`` for the backward: the aligned layer itself, recomputed with every vLLM kernel call
+    differentiable (:func:`differentiable`). Each kernel keeps its value; its gradient is that of its reference math
+    (:mod:`glm5_next_backward`) at the inputs the kernel got, so every op's derivative is taken at vLLM's values."""
+
+    def run(layer: Any, streams: torch.Tensor) -> torch.Tensor:
+        with differentiable():
+            return aligned_layer(layer, streams, ctx.config, ctx)
+
+    return run
+
+
 def _sequence_of_tokens(cu_seqlens: torch.Tensor) -> torch.Tensor:
     lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
     return torch.repeat_interleave(torch.arange(lengths.numel(), device=cu_seqlens.device), lengths)
@@ -1087,7 +1194,10 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
                                 replay={} if torch.is_grad_enabled() else None,
                                 ep_group=getattr(model, "_vllm_aligned_ep_group", None),
                                 tp=getattr(model, "_vllm_aligned_tensor_parallel", 1))  # fmt: skip
-    if getattr(model, "_vllm_aligned_backward", "stock") == "vllm" and ctx.replay is not None:
+    mode = getattr(model, "_vllm_aligned_backward", "stock")
+    if mode == "vllm_op":
+        run_backward = _per_op_backward_runner(ctx)
+    elif mode == "vllm" and ctx.replay is not None:
         run_backward = _vllm_backward_runner(input_ids, position_ids, kwargs, ctx)
     else:
         run_backward = _stock_layer_runner(backbone, input_ids, position_ids, kwargs, ctx.replay)
@@ -1157,11 +1267,12 @@ def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_f
 
     ``tensor_parallel`` is the sampler's TP size: every rank's share of the split layers runs on its own weight shard,
     and the partial sums are reduced as vLLM's batch-invariant all-reduce reduces them. ``backward`` is ``"stock"``
-    (each layer's backward recomputes the stock layer on the layer's input) or ``"vllm"`` (each sublayer's gradient is
-    taken at the aligned forward's exact values, :func:`_vllm_backward_runner`).
+    (each layer's backward recomputes the stock layer on the layer's input), ``"vllm"`` (each sublayer's gradient is
+    taken at the aligned forward's exact values, :func:`_vllm_backward_runner`) or ``"vllm_op"`` (each vLLM kernel's
+    gradient is its reference math's at its exact inputs, :func:`_per_op_backward_runner`).
     """
-    if backward not in ("stock", "vllm"):
-        raise ValueError(f"backward must be 'stock' or 'vllm', got {backward!r}")
+    if backward not in ("stock", "vllm", "vllm_op"):
+        raise ValueError(f"backward must be 'stock', 'vllm' or 'vllm_op', got {backward!r}")
     import types
 
     from arctic_platform.inference.vllm.glm5_batch_invariance import ensure_glm5_batch_invariance
