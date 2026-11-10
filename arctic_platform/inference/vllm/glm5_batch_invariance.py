@@ -216,6 +216,16 @@ def _deterministic_indexer_topk() -> None:
     sparse_indexer.get_indexer_topk = decode_topk
 
 
+def fill_causal_rows(buffer: torch.Tensor, positions: torch.Tensor, topk_tokens: int) -> None:
+    """Overwrite the top-k row of every token at a position below ``topk_tokens`` with its causal indices
+    (``0..position``, then ``-1``), in place and without a host sync, so a CUDA-graph decode step can capture it."""
+    n = min(positions.shape[0], buffer.shape[0])
+    rows, positions = buffer[:n], positions[:n].to(torch.int64)
+    col = torch.arange(rows.shape[1], device=rows.device)
+    causal = torch.where(col[None, :] > positions[:, None], -1, col[None, :]).to(rows.dtype)
+    rows.copy_(torch.where((positions < topk_tokens)[:, None], causal, rows))
+
+
 def _causal_indices_per_token() -> None:
     """Give every token whose sequence fits in ``index_topk`` its causal indices, whatever its batch-mates' lengths.
 
@@ -225,7 +235,6 @@ def _causal_indices_per_token() -> None:
     """
     import inspect
 
-    from vllm.models.glm5next.common.sparse_indexer import _fill_causal_indices
     from vllm.models.glm5next.nvidia import sparse_indexer
 
     original = sparse_indexer.sparse_attn_indexer_kpool
@@ -237,13 +246,7 @@ def _causal_indices_per_token() -> None:
         positions = bound.get("positions")
         if positions is None or positions.numel() == 0:
             return out
-        buffer = bound["topk_indices_buffer"]
-        positions = positions[: buffer.shape[0]]
-        rows = torch.nonzero(positions < bound["topk_tokens"]).flatten()
-        if rows.numel():
-            causal = buffer[rows]
-            _fill_causal_indices(causal, positions[rows])
-            buffer[rows] = causal
+        fill_causal_rows(bound["topk_indices_buffer"], positions, bound["topk_tokens"])
         return out
 
     sparse_indexer.sparse_attn_indexer_kpool = sparse_attn_indexer_kpool
