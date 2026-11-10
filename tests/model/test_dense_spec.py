@@ -20,7 +20,9 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.dense_spec import dense_model_spec
+from arctic_platform.model.dense_spec import ds_worker_dense_model_spec
 
 
 def _training_options():
@@ -105,6 +107,30 @@ def test_omitted_loader_options_are_not_passed(monkeypatch):
     assert "loader_options" not in seen[0]
 
 
+@pytest.mark.parametrize("token_budget", [None, 4096])
+def test_tiled_remat_uses_shared_dense_training_mapping(token_budget):
+    options = {"tiled_remat_token_budget": token_budget}
+    dense = _spec(training_options=options)
+    onprem = ds_worker_dense_model_spec(
+        "Qwen/Qwen3-8B",
+        {"attn_implementation": "sdpa", "enable_gradient_checkpointing": False, **options},
+        dtype="bfloat16",
+        sequence_parallel=1,
+    )
+    assert onprem.model_dump() == dense.model_dump()
+    if token_budget is None:
+        assert dense.patches.tiled_remat is None
+    else:
+        assert dense.patches.tiled_remat.token_budget == token_budget
+    assert ModelSpec.model_validate_json(dense.model_dump_json()).model_dump() == dense.model_dump()
+
+
+@pytest.mark.parametrize("token_budget", [0, -1])
+def test_tiled_remat_rejects_nonpositive_budget(token_budget):
+    with pytest.raises(ValueError, match="token_budget"):
+        _spec(training_options={"tiled_remat_token_budget": token_budget})
+
+
 def test_loader_fields_in_training_options_are_rejected():
     with pytest.raises(ValueError, match="not in training_options; move fp32_parity"):
         _spec(training_options={"fp32_parity": False})
@@ -139,3 +165,109 @@ def test_loader_options_are_validated_by_the_huggingface_schema():
         _spec(loader_options={"fp32_parity": False, "fp32_residual": True})
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         _spec(loader_options={"not_a_loader_option": True})
+
+
+@pytest.mark.parametrize(
+    "lm_head_options",
+    [{"fp32_lm_head": True}, {"fused_lm_head_token_chunk_size": 128}],
+)
+def test_lm_head_without_a_vocab_chunk_size_is_rejected(lm_head_options):
+    with pytest.raises(ValueError, match="require fused_lm_head_vocab_chunk_size"):
+        _spec(training_options=lm_head_options)
+
+
+def test_ds_worker_config_translates_like_dense_training_options():
+    shared = _training_options()
+    flat = {
+        **{key: value for key, value in shared.items() if key != "activation_checkpointing"},
+        "attn_implementation": "flash_attention_3",
+        "enable_gradient_checkpointing": shared["activation_checkpointing"],
+        "use_liger": True,
+        "fp32_parity": True,
+        "fp32_residual": True,
+    }
+
+    onprem = ds_worker_dense_model_spec("Qwen/Qwen3-8B", flat, dtype="bfloat16", sequence_parallel=1)
+    dense = dense_model_spec(
+        model_path="Qwen/Qwen3-8B",
+        dtype="bfloat16",
+        attn_implementation="flash_attention_3",
+        sequence_parallel=1,
+        liger=True,
+        training_options=shared,
+        loader_options={"fp32_parity": True, "fp32_residual": True},
+    )
+
+    assert onprem == dense
+
+
+def test_ds_worker_config_defaults_gradient_checkpointing_on():
+    spec = ds_worker_dense_model_spec(
+        "Qwen/Qwen3-8B", {"attn_implementation": "sdpa"}, dtype="bfloat16", sequence_parallel=1
+    )
+
+    assert spec.patches.gradient_checkpointing is True
+    assert spec.patches.liger is False
+    assert spec.patches.lm_head is None
+    assert spec.patches.zorro_train is None
+    assert spec.loader_options == {"fp32_parity": True, "fp32_residual": False}
+    assert spec.debug == {}
+
+
+def test_ds_worker_config_selects_liger_provider_zorro_train_and_debug():
+    spec = ds_worker_dense_model_spec(
+        "Qwen/Qwen3-8B",
+        {
+            "attn_implementation": "flash_attention_2",
+            "model_provider": "liger",
+            "zorro_train_enable": True,
+            "rollout_n": 4,
+            "use_unpad": True,
+            "unrelated": "ignored",
+        },
+        dtype="bfloat16",
+        sequence_parallel=1,
+        debug={"gpu_mem_preallocate_gib": 2},
+    )
+
+    assert spec.patches.liger is True
+    assert spec.patches.zorro_train.rollout_n == 4
+    assert spec.patches.zorro_train.use_unpad is True
+    assert spec.debug == {"gpu_mem_preallocate_gib": 2}
+
+
+@pytest.mark.parametrize("flat", [{}, {"attn_implementation": None}])
+def test_ds_worker_config_requires_attn_implementation(flat):
+    with pytest.raises(ValueError, match="requires attn_implementation"):
+        ds_worker_dense_model_spec("Qwen/Qwen3-8B", flat, dtype="bfloat16", sequence_parallel=1)
+
+
+@pytest.mark.parametrize("attn_implementation", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
+def test_ds_worker_config_accepts_any_flash_attention_backend(attn_implementation):
+    spec = ds_worker_dense_model_spec(
+        "Qwen/Qwen3-8B", {"attn_implementation": attn_implementation}, dtype="bfloat16", sequence_parallel=1
+    )
+
+    assert spec.attn_implementation == attn_implementation
+
+
+def test_ds_worker_config_rejects_zorro_train_with_sdpa():
+    with pytest.raises(ValueError, match="ZoRRo Train does not support attn_implementation='sdpa'"):
+        ds_worker_dense_model_spec(
+            "Qwen/Qwen3-8B",
+            {"attn_implementation": "sdpa", "zorro_train_enable": True},
+            dtype="bfloat16",
+            sequence_parallel=1,
+        )
+
+
+def test_ds_worker_config_accepts_zorro_train_with_eager():
+    spec = ds_worker_dense_model_spec(
+        "Qwen/Qwen3-8B",
+        {"attn_implementation": "eager", "zorro_train_enable": True},
+        dtype="bfloat16",
+        sequence_parallel=1,
+    )
+
+    assert spec.attn_implementation == "eager"
+    assert spec.patches.zorro_train is not None

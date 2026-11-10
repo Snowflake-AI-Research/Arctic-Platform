@@ -31,7 +31,6 @@ from typing_extensions import Self
 
 from arctic_platform.common.config import validate_peft_config
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_mem_preallocate_bytes
-from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
 
 PinMemoryMaxSize = float | Literal["auto"]
 
@@ -251,82 +250,6 @@ class ModelSpec(BaseModel):
     patches: Patches = Field(default_factory=Patches, description="Post-load patches.")
     debug: dict = Field(default_factory=dict, description="Runtime GPU capacity guard, separate from loader debug.")
     loader_options: dict = Field(default_factory=dict, description="JSON-only loader-specific extras.")
-
-    @classmethod
-    def from_ds_worker_config(cls, model_name: str, ds_worker_config: dict) -> "ModelSpec":
-        """Transitional bridge: map flat verl ``ds_worker_config`` into a ``ModelSpec``.
-
-        Callers (adapter / SFT demos) own the knobs on the flat dict today. Longer-term,
-        ``ModelSpec`` should be constructed upstream as part of the main client config
-        instead of being inferred here.
-        """
-        cfg = ds_worker_config or {}
-
-        # Require an explicit attention backend. Packed varlen / ZoRRo Train need
-        # some flash-attention implementation (FA2 / FA3 / FA4); do not invent a
-        # default here (ModelSpec leaves it None).
-        if "attn_implementation" not in cfg or cfg["attn_implementation"] is None:
-            raise ValueError(
-                "from_ds_worker_config requires attn_implementation "
-                "(flash_attention_2 / flash_attention_3 / flash_attention_4)."
-            )
-
-        zorro_train_patch = None
-        if cfg.get("zorro_train_enable", False):
-            # Only forward keys present in cfg; ZorroTrainPatch pydantic defaults fill the rest.
-            zorro_keys = (
-                "response_len",
-                "max_token_len",
-                "rollout_n",
-                "temperature",
-                "use_unpad",
-                "world_size",
-                "logits_optimization",
-                "logits_optimization_peak_mem_size_in_gib",
-                "logits_compute_from_fp32_inputs",
-                "logits_compute_in_fp32",
-            )
-            zorro_train_patch = ZorroTrainPatch(**{k: cfg[k] for k in zorro_keys if k in cfg})
-
-        tiled_mlp_patch = None
-        tiled_mlp_token_chunk_size = cfg.get("tiled_mlp_token_chunk_size")
-        if tiled_mlp_token_chunk_size is not None:
-            tiled_mlp_patch = TiledMlpPatch(token_chunk_size=tiled_mlp_token_chunk_size)
-
-        tiled_remat_patch = None
-        tiled_remat_token_budget = cfg.get("tiled_remat_token_budget")
-        if tiled_remat_token_budget is not None:
-            tiled_remat_patch = TiledRematPatch(token_budget=tiled_remat_token_budget)
-
-        activation_offload_patch = None
-        if cfg.get("enable_activation_offload", False):
-            offload_keys = (
-                "keep_last_n",
-                "use_streams",
-                "tensor_size_threshold",
-                "pin_memory_enabled",
-                "pin_memory_max_size_gib",
-                "pin_memory_bucket_size_mib",
-            )
-            activation_offload_patch = ActivationOffloadPatch(**{k: cfg[k] for k in offload_keys if k in cfg})
-
-        # Worker bridge defaults GC on (historical DeepSpeedWorker behavior). Generic
-        # ``Patches.gradient_checkpointing`` stays False for direct ModelSpec users.
-        return cls(
-            model_path_or_name=model_name,
-            dtype="bfloat16",
-            attn_implementation=cfg["attn_implementation"],
-            debug=gpu_memory_debug_config(cfg),
-            patches=Patches(
-                liger=cfg.get("use_liger", False),
-                zorro_train=zorro_train_patch,
-                gradient_checkpointing=cfg.get("enable_gradient_checkpointing", True),
-                tiled_mlp=tiled_mlp_patch,
-                tiled_remat=tiled_remat_patch,
-                activation_offload=activation_offload_patch,
-                peft=cfg.get("peft_config"),
-            ),
-        )
 
     @field_validator("dtype")
     @classmethod
