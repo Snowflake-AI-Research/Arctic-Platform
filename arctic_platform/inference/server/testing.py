@@ -99,15 +99,6 @@ class DummyWorker:
     def get_state(self) -> str:
         return self.state.value
 
-    def get_stats(self) -> dict[str, Any]:
-        return {
-            "state": self.state.value,
-            "pid": os.getpid(),
-            "gpu_cache_usage": 0.0,
-            "num_requests_running": 0,
-            "num_requests_waiting": 0,
-        }
-
     def drain_metrics(self) -> dict[str, Any]:
         return {
             "pid": os.getpid(),

@@ -184,12 +184,7 @@ def _scheduler_pool(
 
     pool = ReplicaPool()
     pool._workers = [worker]
-    pool._scheduler = Scheduler(
-        [worker],
-        dynamic_concurrency=False,
-        initial_concurrency=4,
-    )
-    pool._scheduler._ensure_background_tasks = lambda: None
+    pool._scheduler = Scheduler([worker], capacity=4)
     return pool, worker
 
 

@@ -11,12 +11,7 @@ import pytest
 from test_review_regressions import local_worker
 from arctic_platform.inference.server.config import ModelConfig
 from arctic_platform.inference.server.replica_pool import ReplicaPool
-from arctic_platform.inference.server.scheduler import (
-    Scheduler,
-    least_loaded_routing,
-    prefix_affinity_routing,
-    strict_affinity_routing,
-)
+from arctic_platform.inference.server.scheduler import Scheduler
 from arctic_platform.inference.server.streaming import StreamLimits
 from arctic_platform.inference.server.worker import InferenceWorker
 from arctic_platform.inference.server.worker import WorkerLifecycleState
@@ -45,8 +40,7 @@ def make_pool():
     pool = ReplicaPool()
     pool._config = ModelConfig(model="fake")
     pool._workers = [handle]
-    pool._scheduler = Scheduler([handle], dynamic_concurrency=False)
-    pool._scheduler._ensure_background_tasks = lambda: None
+    pool._scheduler = Scheduler([handle], capacity=1024)
     pool._reset_prefix_cache_after_weight_sync = AsyncMock(return_value={"status": "ok"})
     return pool, handle
 
@@ -120,15 +114,14 @@ def test_cancel_during_iterator_close_blocks_mutation(ignore_cancellation):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("routing", [
-    least_loaded_routing, prefix_affinity_routing, strict_affinity_routing, None,
+@pytest.mark.parametrize("prefix_routing, routing_key, strict", [
+    (False, None, False), (True, None, False), (True, None, True), (False, "key", False),
 ])
-def test_quarantine_blocks_legacy_dispatch_until_worker_replacement(routing):
+def test_quarantine_blocks_legacy_dispatch_until_worker_replacement(prefix_routing, routing_key, strict):
     async def scenario():
         pool, handle = make_pool()
         scheduler = pool._scheduler
-        if routing is not None:
-            scheduler._routing_fn = routing
+        scheduler._prefix_routing = prefix_routing
         stream = scheduler.stream_generate("failed", "prompt")
         stream.worker = scheduler._workers[0]
         stream.worker.active_requests = stream.worker.streaming_requests = 1
@@ -138,7 +131,7 @@ def test_quarantine_blocks_legacy_dispatch_until_worker_replacement(routing):
         try:
             assert not scheduler.is_worker_available(0)
             stream.worker.available = True
-            future = scheduler.submit("prompt", {}, routing_key="key" if routing is None else None)
+            future = scheduler.submit("prompt", {}, routing_key=routing_key, strict=strict)
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(asyncio.shield(future), 0.02)
             handle.generate.remote.assert_not_awaited()
@@ -344,7 +337,6 @@ def test_lifecycle_preparation_failure_restores_previous_state(
             with pytest.raises(failure, match="preparation failed"):
                 await mutate(pool, method, strategy)
             assert scheduler._paused == initially_paused
-            assert scheduler._pause_event.is_set() == (not initially_paused)
             assert scheduler.is_worker_available(0)
             assert not scheduler.is_worker_available(1)
             assert not pool._stream_admission_blocked
@@ -371,7 +363,6 @@ def test_weight_sync_preparation_failure_does_not_wake_sleeping_pool(method, str
                 await mutate(pool, method, strategy)
             assert pool.sleeping
             assert scheduler.paused
-            assert not scheduler._pause_event.is_set()
             getattr(handle, method).remote.assert_not_awaited()
             handle.pause_generation.remote.assert_not_awaited()
         finally:

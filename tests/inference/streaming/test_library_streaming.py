@@ -249,7 +249,7 @@ async def exercise(check):
     actor = FakeEngineWorker.remote()
     await actor.stats.remote()
     pool = ReplicaPool()
-    pool._scheduler = Scheduler([actor], dynamic_concurrency=False)
+    pool._scheduler = Scheduler([actor], capacity=1024)
     driver = Driver()
     driver._pools["model"] = pool
     try:

@@ -13,11 +13,7 @@ import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from arctic_platform.inference.server.config import ModelConfig
-from arctic_platform.inference.server.scheduler import (
-    RoutingFn,
-    Scheduler,
-    prefix_affinity_routing,
-)
+from arctic_platform.inference.server.scheduler import Scheduler
 from arctic_platform.inference.server.token_prompts import compact_token_tensor, is_token_tensor
 from arctic_platform.inference.server.worker import InferenceWorker
 
@@ -148,32 +144,18 @@ def ensure_ray() -> int:
 class ReplicaPool:
     """Manages a set of worker replicas for a single model.
 
-    Owns the workers and an internal :class:`Scheduler` that handles
-    request routing and concurrency control.
+    Owns the workers and an internal :class:`Scheduler` that routes
+    requests to them.
 
     Args:
         worker_cls: Ray actor class for inference workers.
     """
 
-    def __init__(
-        self,
-        worker_cls=InferenceWorker,
-        routing_fn: RoutingFn | None = None,
-        enable_prefix_hash: bool | None = None,
-    ) -> None:
+    def __init__(self, worker_cls=InferenceWorker) -> None:
         self._worker_cls = worker_cls
-        _opt_out = os.environ.get(
+        self._prefix_routing = os.environ.get(
             "ARCTIC_PREFIX_ROUTING_DISABLED", ""
-        ).lower() in ("1", "true", "yes")
-        if _opt_out:
-            self._routing_fn = None
-            self._enable_prefix_hash = False
-        elif enable_prefix_hash is None and routing_fn is None:
-            self._routing_fn = prefix_affinity_routing
-            self._enable_prefix_hash = True
-        else:
-            self._routing_fn = routing_fn
-            self._enable_prefix_hash = bool(enable_prefix_hash)
+        ).lower() not in ("1", "true", "yes")
         self._config: ModelConfig | None = None
         self._model_id: str | None = None
         self._workers: list[ray.actor.ActorHandle] = []
@@ -540,9 +522,6 @@ class ReplicaPool:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def _worker_concurrency_limit(self) -> int:
-        return _env_int("ARCTIC_WORKER_CONCURRENCY_LIMIT", 128)
-
     @asynccontextmanager
     async def _stream_lifecycle(self):
         async with self._lock:
@@ -552,16 +531,8 @@ class ReplicaPool:
             finally:
                 self._stream_admission_blocked = False
 
-    def _make_scheduler(self, workers: list[ray.actor.ActorHandle]) -> Scheduler:
-        kwargs: dict[str, Any] = {
-            "workers": workers,
-            "initial_concurrency": self._worker_concurrency_limit(),
-        }
-        if self._routing_fn is not None:
-            kwargs["routing_fn"] = self._routing_fn
-        if self._enable_prefix_hash:
-            kwargs["enable_prefix_hash"] = True
-        return Scheduler(**kwargs)
+    def _make_scheduler(self, workers: list[ray.actor.ActorHandle], capacity: int) -> Scheduler:
+        return Scheduler(workers, capacity, prefix_routing=self._prefix_routing)
 
     def _reset_lifecycle_state(self) -> None:
         self._workers.clear()
@@ -923,7 +894,7 @@ class ReplicaPool:
             await self._cleanup_failed_initialize()
             raise
 
-        self._scheduler = self._make_scheduler(self._workers)
+        self._scheduler = self._make_scheduler(self._workers, engine_kwargs["max_num_seqs"])
 
         self._stop_monitoring = False
         self._health_task = asyncio.create_task(self._monitor_health())
@@ -1176,10 +1147,7 @@ class ReplicaPool:
 
                 self._workers.append(worker)
                 self._slots.append((node, slot))
-                self._scheduler.add_worker(
-                    worker,
-                    concurrency_limit=self._worker_concurrency_limit(),
-                )
+                self._scheduler.add_worker(worker)
                 logger.info(f"Scaled up: added worker {len(self._workers) - 1}")
 
     # ------------------------------------------------------------------
