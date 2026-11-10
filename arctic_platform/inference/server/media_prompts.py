@@ -2,15 +2,21 @@
 
 The Zone Manager imports this module to learn whether a worker takes media
 prompts (``SUPPORTS_MEDIA``). Media arrives as raw encoded bytes, one placeholder
-token per item; ``decode_media`` turns them into what vLLM 0.32 takes, with
+token per item; ``decode_media`` turns them into what vLLM's engine takes, with
 vLLM's own loaders, keeping the original bytes (``MediaWithBytes``) so that
 vLLM's media hashes match.
 
-Importing this module does not import vLLM.
+``decodable_modalities`` says which modalities ``decode_media`` can decode here:
+images always (Pillow), video only when the library of the codec the engine's
+video loader decodes with is importable. ``decode_media`` refuses video bytes otherwise.
+
+Importing this module does not import vLLM or any video library.
 """
 
 from __future__ import annotations
 
+import importlib.util
+import os
 from typing import Any
 
 from arctic_platform.inference.server.token_prompts import check_token_tensor, is_token_tensor
@@ -22,6 +28,7 @@ __all__ = [
     "MEDIA_PROMPT_KEYS",
     "SUPPORTS_MEDIA",
     "MediaDecodeError",
+    "decodable_modalities",
     "decode_media",
     "is_media_prompt",
     "validate_media_prompt",
@@ -35,7 +42,7 @@ MEDIA_PROMPT_KEYS = frozenset(
 # (offset, leading bytes) signatures: PNG and JPEG images, and MP4 video (an
 # ISO-BMFF file whose first box is ``ftyp`` with one of these major brands).
 # Bytes in any other format are refused before a loader sees them, so Pillow's
-# other plugins and the video backend's other demuxers never parse request bytes.
+# other plugins and the video codec's other demuxers never parse request bytes.
 _MP4_BRANDS = (b"isom", b"iso2", b"iso4", b"iso5", b"iso6", b"mp41", b"mp42", b"avc1")
 MEDIA_FORMATS: dict[str, tuple[tuple[int, bytes], ...]] = {
     "image": ((0, b"\x89PNG\r\n\x1a\n"), (0, b"\xff\xd8\xff")),
@@ -50,6 +57,51 @@ class MediaDecodeError(ValueError):
     decoder's exception type or "unsupported format", never the bytes: the
     decoder's own message may echo the input.
     """
+
+
+# vLLM names two things in the ``video`` entry of ``media_io_kwargs``: the video
+# loader (``video_backend``, else ``VLLM_VIDEO_LOADER_BACKEND``, else ``"opencv"``;
+# an entry of its loader registry, such as ``opencv`` or a model's own loader)
+# and the codec that loader decodes with (``backend``, else ``"opencv"``). The
+# ``pynvvideocodec`` loader always decodes with PyNvVideoCodec. This is the
+# library each codec imports; a codec not named here (``deepstream``, or any
+# other) counts as not decodable.
+_VIDEO_CODEC_MODULES = {"opencv": "cv2", "torchcodec": "torchcodec", "pynvvideocodec": "PyNvVideoCodec"}
+
+
+def _video_codec(media_io_kwargs: dict[str, dict[str, Any]] | None) -> Any:
+    video = (media_io_kwargs or {}).get("video") or {}
+    loader = video.get("video_backend")
+    if loader is None:
+        loader = os.environ.get("VLLM_VIDEO_LOADER_BACKEND", "opencv")
+    if loader == "pynvvideocodec":
+        return "pynvvideocodec"
+    # Any other loader, a model's or one vLLM does not know, decodes with the codec.
+    codec = video.get("backend")
+    return "opencv" if codec is None else codec
+
+
+def _importable(module: str) -> bool:
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def decodable_modalities(media_io_kwargs: dict[str, dict[str, Any]] | None = None) -> frozenset[str]:
+    """Return the modalities whose raw bytes ``decode_media`` can decode here.
+
+    Always ``"image"``; ``"video"`` when the library of the video codec is
+    importable. The codec is ``"pynvvideocodec"`` when the video loader (the
+    ``video`` entry's ``video_backend``, else ``VLLM_VIDEO_LOADER_BACKEND``,
+    else ``"opencv"``) is ``pynvvideocodec``; otherwise the ``video`` entry's
+    ``backend``, else ``"opencv"``. The library is looked up, not imported.
+    """
+    codec = _video_codec(media_io_kwargs)
+    module = _VIDEO_CODEC_MODULES.get(codec) if isinstance(codec, str) else None
+    if module is not None and _importable(module):
+        return frozenset({"image", "video"})
+    return frozenset({"image"})
 
 
 def is_media_prompt(prompt) -> bool:
@@ -102,13 +154,20 @@ def decode_media(prompt: dict, media_io_kwargs: dict[str, dict[str, Any]] | None
     bytes (already decoded) pass through. Before anything is decoded, image and
     video bytes not in a ``MEDIA_FORMATS`` format raise ``MediaDecodeError``
     (``unsupported format``). An item whose ``load_bytes`` fails raises
-    ``MediaDecodeError``, unchained, and no later item is decoded. Video when
-    vLLM's video decoding is not available in this process, and bytes of any other
-    modality, raise ``ValueError``.
+    ``MediaDecodeError``, unchained, and no later item is decoded. Video bytes when
+    ``"video"`` is not in ``decodable_modalities`` raise ``MediaDecodeError``
+    (``video decoding is not available``) before any loader is built. Video when
+    vLLM's video loader cannot be imported, and bytes of any other modality, raise
+    ``ValueError``.
     """
     media = prompt["multi_modal_data"]
     if not any(_is_bytes(item) for items in media.values() for item in (items if isinstance(items, list) else [items])):
         return prompt
+    videos = media.get("video")
+    if any(_is_bytes(item) for item in (videos if isinstance(videos, list) else [videos])) and (
+        "video" not in decodable_modalities(media_io_kwargs)
+    ):
+        raise MediaDecodeError("video decoding is not available")
     for modality, items in media.items():
         if modality not in MEDIA_FORMATS:
             continue

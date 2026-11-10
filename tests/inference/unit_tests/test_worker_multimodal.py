@@ -6,6 +6,7 @@ import contextlib
 import importlib
 import importlib.abc
 import importlib.machinery
+import importlib.util
 import random
 import struct
 import sys
@@ -745,8 +746,32 @@ class _Built(list):
         self.loaded = []
 
 
+_VIDEO_LIBRARIES = ("cv2", "torchcodec", "PyNvVideoCodec")
+
+
+def _video_libraries(monkeypatch, *present, backend=None):
+    """Make ``find_spec`` find only the *present* video libraries; set or clear the env var backend."""
+    real = importlib.util.find_spec
+    looked_up = []
+
+    def find_spec(name, package=None):
+        if name in _VIDEO_LIBRARIES:
+            looked_up.append(name)
+            return importlib.machinery.ModuleSpec(name, None) if name in present else None
+        return real(name, package)
+
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+    if backend is None:
+        monkeypatch.delenv("VLLM_VIDEO_LOADER_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_VIDEO_LOADER_BACKEND", backend)
+    return looked_up
+
+
 @pytest.fixture
 def fake_loaders(monkeypatch):
+    # The default video backend's library is there, whether or not OpenCV is installed.
+    _video_libraries(monkeypatch, "cv2")
     built = _Built()
     failures = {_failing_bytes(modality, cls): cls for modality, cls in _DECODE_FAILURES}
     loaded = built.loaded
@@ -887,6 +912,9 @@ def test_media_decode_error_is_exported():
 
 
 def test_video_without_a_decoder_is_refused(monkeypatch):
+    # OpenCV is there but vLLM's video loader cannot be built.
+    _video_libraries(monkeypatch, "cv2")
+
     def broken(name):
         module = types.ModuleType(f"vllm.multimodal.media.{name}")
 
@@ -908,6 +936,190 @@ def test_video_without_a_decoder_is_refused(monkeypatch):
     assert type(caught.value) is ValueError
     assert str(caught.value) == "Cannot decode video: this worker has no vLLM video decoder (No module named 'cv2')"
     assert worker.llm.calls == []
+
+
+@pytest.mark.parametrize(
+    "present, decodable", [(("cv2",), True), ((), False), (("torchcodec", "PyNvVideoCodec"), False)]
+)
+def test_default_video_backend_is_opencv(monkeypatch, present, decodable):
+    from arctic_platform.inference.server import media_prompts
+
+    looked_up = _video_libraries(monkeypatch, *present)
+    expected = {"image", "video"} if decodable else {"image"}
+    assert media_prompts.decodable_modalities({}) == expected
+    assert media_prompts.decodable_modalities() == expected
+    assert media_prompts.decodable_modalities({"video": {"num_frames": 8}}) == expected
+    assert set(looked_up) == {"cv2"}
+
+
+_CODECS = [("opencv", "cv2"), ("torchcodec", "torchcodec"), ("pynvvideocodec", "PyNvVideoCodec")]
+
+
+@pytest.mark.parametrize("loader", [None, "opencv", "qwen3_vl", "qwen2_vl", "opencv_dynamic", "no_such_loader"])
+@pytest.mark.parametrize("codec, library", _CODECS)
+def test_named_codec_needs_its_library(monkeypatch, loader, codec, library):
+    from arctic_platform.inference.server import media_prompts
+
+    kwargs = {"video": {"backend": codec} | ({} if loader is None else {"video_backend": loader})}
+    others = [name for name in _VIDEO_LIBRARIES if name != library]
+    _video_libraries(monkeypatch, library)
+    assert media_prompts.decodable_modalities(kwargs) == {"image", "video"}
+    # The other codecs' libraries do not stand in for this one's.
+    _video_libraries(monkeypatch, *others)
+    assert media_prompts.decodable_modalities(kwargs) == {"image"}
+
+
+@pytest.mark.parametrize("loader", ["opencv", "qwen3_vl", "glm46v", "molmo2", "no_such_loader"])
+def test_a_loader_without_a_codec_decodes_with_opencv(monkeypatch, loader):
+    from arctic_platform.inference.server import media_prompts
+
+    looked_up = _video_libraries(monkeypatch, "cv2")
+    assert media_prompts.decodable_modalities({"video": {"video_backend": loader}}) == {"image", "video"}
+    _video_libraries(monkeypatch, "torchcodec", "PyNvVideoCodec")
+    assert media_prompts.decodable_modalities({"video": {"video_backend": loader}}) == {"image"}
+    assert set(looked_up) == {"cv2"}
+
+
+def test_qwen3_vl_loader_with_the_pynvvideocodec_codec_needs_pynvvideocodec(monkeypatch):
+    from arctic_platform.inference.server import media_prompts
+
+    kwargs = {"video": {"video_backend": "qwen3_vl", "backend": "pynvvideocodec"}}
+    _video_libraries(monkeypatch, "PyNvVideoCodec")
+    assert media_prompts.decodable_modalities(kwargs) == {"image", "video"}
+    _video_libraries(monkeypatch, "cv2", "torchcodec")
+    assert media_prompts.decodable_modalities(kwargs) == {"image"}
+
+
+@pytest.mark.parametrize("codec", [None, "opencv", "torchcodec", "deepstream", "no_such_codec"])
+def test_pynvvideocodec_loader_always_needs_pynvvideocodec(monkeypatch, codec):
+    from arctic_platform.inference.server import media_prompts
+
+    kwargs = {"video": {"video_backend": "pynvvideocodec"} | ({} if codec is None else {"backend": codec})}
+    looked_up = _video_libraries(monkeypatch, "PyNvVideoCodec")
+    assert media_prompts.decodable_modalities(kwargs) == {"image", "video"}
+    _video_libraries(monkeypatch, "cv2", "torchcodec")
+    assert media_prompts.decodable_modalities(kwargs) == {"image"}
+    assert set(looked_up) == {"PyNvVideoCodec"}
+
+
+@pytest.mark.parametrize("backend", [["opencv"], 1])
+def test_a_codec_that_is_not_a_name_is_not_decodable(monkeypatch, backend):
+    from arctic_platform.inference.server import media_prompts
+
+    looked_up = _video_libraries(monkeypatch, *_VIDEO_LIBRARIES)
+    assert media_prompts.decodable_modalities({"video": {"backend": backend}}) == {"image"}
+    assert looked_up == []
+
+
+@pytest.mark.parametrize("codec", ["deepstream", "ffmpeg", "OpenCV", ""])
+@pytest.mark.parametrize("loader", [None, "opencv", "qwen3_vl"])
+def test_deepstream_and_unknown_codecs_are_not_decodable(monkeypatch, codec, loader):
+    from arctic_platform.inference.server import media_prompts
+
+    kwargs = {"video": {"backend": codec} | ({} if loader is None else {"video_backend": loader})}
+    looked_up = _video_libraries(monkeypatch, *_VIDEO_LIBRARIES)
+    assert media_prompts.decodable_modalities(kwargs) == {"image"}
+    assert looked_up == []
+
+
+@pytest.mark.parametrize("loader", ["opencv", "qwen3_vl", "opencv_dynamic", "no_such_loader"])
+@pytest.mark.parametrize("codec, library", [(None, "cv2"), *_CODECS])
+def test_env_var_names_the_loader(monkeypatch, loader, codec, library):
+    from arctic_platform.inference.server import media_prompts
+
+    kwargs = {"video": {"num_frames": 8} | ({} if codec is None else {"backend": codec})}
+    _video_libraries(monkeypatch, library, backend=loader)
+    assert media_prompts.decodable_modalities(kwargs) == {"image", "video"}
+    _video_libraries(monkeypatch, *(name for name in _VIDEO_LIBRARIES if name != library), backend=loader)
+    assert media_prompts.decodable_modalities(kwargs) == {"image"}
+
+
+@pytest.mark.parametrize("codec", [None, "opencv", "torchcodec"])
+def test_env_var_pynvvideocodec_loader_needs_pynvvideocodec(monkeypatch, codec):
+    from arctic_platform.inference.server import media_prompts
+
+    kwargs = {} if codec is None else {"video": {"backend": codec}}
+    _video_libraries(monkeypatch, "PyNvVideoCodec", backend="pynvvideocodec")
+    assert media_prompts.decodable_modalities(kwargs) == {"image", "video"}
+    _video_libraries(monkeypatch, "cv2", "torchcodec", backend="pynvvideocodec")
+    assert media_prompts.decodable_modalities(kwargs) == {"image"}
+
+
+def test_the_entry_loader_wins_over_the_env_var(monkeypatch):
+    from arctic_platform.inference.server import media_prompts
+
+    _video_libraries(monkeypatch, "cv2", backend="pynvvideocodec")
+    assert media_prompts.decodable_modalities({"video": {"video_backend": "qwen3_vl"}}) == {"image", "video"}
+    _video_libraries(monkeypatch, "PyNvVideoCodec", backend="qwen3_vl")
+    assert media_prompts.decodable_modalities({"video": {"video_backend": "pynvvideocodec"}}) == {"image", "video"}
+
+
+def test_decodable_modalities_does_not_import_the_library(monkeypatch):
+    from arctic_platform.inference.server import media_prompts
+
+    _video_libraries(monkeypatch, "cv2")
+    monkeypatch.delitem(sys.modules, "cv2", raising=False)
+    assert media_prompts.decodable_modalities({}) == {"image", "video"}
+    assert "cv2" not in sys.modules
+
+
+def test_decodable_modalities_is_exported():
+    from arctic_platform.inference.server import media_prompts
+
+    assert "decodable_modalities" in media_prompts.__all__
+    assert "SUPPORTS_MEDIA" in media_prompts.__all__ and media_prompts.SUPPORTS_MEDIA is True
+    assert "decodable_modalities" in media_prompts.__doc__
+
+
+@pytest.mark.parametrize("wrap", [bytes, bytearray, memoryview])
+@pytest.mark.parametrize("single", [False, True])
+@pytest.mark.parametrize(
+    "media_io_kwargs, present",
+    [
+        ({}, ("torchcodec", "PyNvVideoCodec")),  # no cv2 for the default opencv codec
+        ({"video": {"video_backend": "qwen3_vl"}}, ("torchcodec", "PyNvVideoCodec")),
+        ({"video": {"video_backend": "pynvvideocodec", "backend": "opencv"}}, ("cv2", "torchcodec")),
+        ({"video": {"backend": "deepstream"}}, _VIDEO_LIBRARIES),
+    ],
+)
+def test_video_is_refused_before_any_loader_when_not_decodable(
+    fake_loaders, monkeypatch, wrap, single, media_io_kwargs, present
+):
+    _video_libraries(monkeypatch, *present)
+    worker = _new_worker()
+    worker.llm = _FakeEngine()
+    worker.llm.model_config = _model_config(media_io_kwargs=media_io_kwargs)
+    video = wrap(_video(b"secret-input"))
+    prompt = _media_prompt(multi_modal_data={"image": [_image(b"good-0")], "video": video if single else [video]})
+    with pytest.raises(MediaDecodeError) as caught:
+        asyncio.run(worker.generate(prompt, {"max_tokens": 1}))
+    error = caught.value
+    assert type(error) is MediaDecodeError and error.args == ("video decoding is not available",)
+    assert error.__cause__ is None and error.__context__ is None
+    # No loader was built, not even the image one, and vLLM gets nothing.
+    assert fake_loaders == [] and fake_loaders.loaded == []
+    assert worker.llm.calls == []
+
+
+def test_video_refusal_uses_the_engine_media_io_kwargs(fake_loaders, monkeypatch):
+    from arctic_platform.inference.server import media_prompts
+
+    _video_libraries(monkeypatch, "cv2")
+    kwargs = {"video": {"video_backend": "pynvvideocodec"}}
+    with pytest.raises(MediaDecodeError, match="^video decoding is not available$"):
+        media_prompts.decode_media(_media_prompt(multi_modal_data={"video": [MP4]}), kwargs)
+    assert fake_loaders == []
+
+
+def test_images_and_decoded_video_are_unaffected_when_video_is_not_decodable(fake_loaders, monkeypatch):
+    _video_libraries(monkeypatch)
+    frames = object()
+    prompt = _media_prompt(multi_modal_data={"image": [_image(b"one"), JPEG], "video": [frames]})
+    _result, calls = _generate(_new_worker(), prompt)
+    sent = calls[0][0]["multi_modal_data"]
+    assert [i.original_bytes for i in sent["image"]] == [_image(b"one"), JPEG]
+    assert sent["video"] == [frames]
+    assert [kind for kind, _kwargs in fake_loaders] == ["image"]
 
 
 def test_unknown_modality_bytes_are_refused(fake_loaders):
