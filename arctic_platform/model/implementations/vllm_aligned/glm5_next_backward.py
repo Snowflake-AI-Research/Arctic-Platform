@@ -70,6 +70,31 @@ def vllm_op(kernel: Callable, reference: Callable, *inputs: torch.Tensor):
     return _VllmOp.apply(kernel, reference, *inputs)
 
 
+class _FakeFp8(torch.autograd.Function):
+    """vLLM's per-128-group dynamic FP8 activation quantization (``per_token_group_quant_fp8``: scale ``amax / 448``,
+    a power of two with ``ue8m0``), dequantized in fp32, with a straight-through gradient."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, ue8m0: bool) -> torch.Tensor:
+        if x.shape[-1] % FP8_BLOCK or x.numel() == 0:
+            return x.float()
+        groups = x.float().reshape(-1, x.shape[-1] // FP8_BLOCK, FP8_BLOCK)
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        scale = groups.abs().amax(-1, keepdim=True).clamp_min(1e-10) / fp8_max
+        if ue8m0:
+            scale = torch.exp2(torch.ceil(torch.log2(scale)))
+        q = (groups / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+        return (q.float() * scale).reshape(x.shape)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        return grad, None
+
+
+def fake_fp8(x: torch.Tensor, ue8m0: bool) -> torch.Tensor:
+    return _FakeFp8.apply(x, ue8m0)
+
+
 # ---- references (fp32 math, results in the kernel's output dtypes) ----
 
 
@@ -219,8 +244,9 @@ def ref_router_weights(logits: torch.Tensor, ids: torch.Tensor, renormalize: boo
 
 def ref_routed_experts(x, weights, ids, w13, s13, w2, s2, limit: float, block: int = FP8_BLOCK):
     """``sum_k weights[t, k] * down_e(swiglu_clamp(gate_up_e(x_t)))`` for ``e = ids[t, k]`` on the dequantized FP8
-    expert weights (``w13 [E, 2I, H]``, ``w2 [E, H, I]``), expert by expert; activation quantization is
-    straight-through, so it does not appear."""
+    expert weights (``w13 [E, 2I, H]``, ``w2 [E, H, I]``), expert by expert. Both GEMM inputs are quantized as vLLM's
+    MoE quantizes them (power-of-two scales), straight-through, so the expert outputs the routing weights' gradient
+    sees, and the point where the SwiGLU is differentiated, are the kernel's up to rounding."""
     from torch.utils.checkpoint import checkpoint
 
     out = x.new_zeros(x.shape, dtype=torch.float32)
@@ -239,15 +265,18 @@ def _expert(x, w13, s13, w2, s2, limit, block):
     """One expert on its tokens; checkpointed so only one expert's dequantized weights are alive in the backward."""
     from arctic_platform.model.implementations.fp8 import dequantize_from_fp8_blockwise
 
-    gate_up = x.float() @ dequantize_from_fp8_blockwise(w13, s13, block, torch.float32).t()
-    hidden = ref_silu_and_mul_with_clamp(gate_up, limit)
-    return hidden @ dequantize_from_fp8_blockwise(w2, s2, block, torch.float32).t()
+    gate_up = fake_fp8(x, True) @ dequantize_from_fp8_blockwise(w13, s13, block, torch.float32).t()
+    hidden = ref_silu_and_mul_with_clamp(gate_up.to(x.dtype), limit)
+    return fake_fp8(hidden, True) @ dequantize_from_fp8_blockwise(w2, s2, block, torch.float32).t()
 
 
 def ref_fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, block: int = FP8_BLOCK) -> torch.Tensor:
+    """vLLM's block-FP8 linear: the input quantized per 128-group with plain scales (straight-through), the
+    dequantized weight."""
     from arctic_platform.model.implementations.fp8 import dequantize_from_fp8_blockwise
 
-    return (x.float() @ dequantize_from_fp8_blockwise(weight, scale, block, torch.float32).t()).to(x.dtype)
+    w = dequantize_from_fp8_blockwise(weight, scale, block, torch.float32)
+    return (fake_fp8(x, False) @ w.t()).to(x.dtype)
 
 
 def ref_head_bmm(a: torch.Tensor, b: torch.Tensor, **_) -> torch.Tensor:
