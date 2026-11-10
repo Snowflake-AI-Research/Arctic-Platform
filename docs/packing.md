@@ -72,10 +72,7 @@ The Qwen-VL entry is registered for `qwen3_vl`, `qwen3_vl_moe`, `qwen3_5`, `qwen
 
 ### Media under context parallelism
 
-A CP rank's model call takes a media call in one of two modes. The Qwen3.8 CP wrapper (`qwen38/context_parallel.py`) tells them apart only by an explicit flag on the model call, never by the call's shape: rank 0's window opens a row at position 0 and divides evenly, just like a whole call.
-
-- **Windowed** (the default, and what every dispatch sends today: dss's data plane and `run_pipeline`). Each rank gets `token_shard`'s window with the whole media items in it and their `*_window_token_ranges`; an item that straddles windows is refused upstream. The call is already sharded, so the wrapper passes it through unchanged, as it does any call not marked whole, text-only calls included.
-- **After the vision merge** (prime-rl #3916, opt-in). The caller passes the whole packed call, with all its media, to every rank and `cp_shard_after_vision_merge=True`. Each rank runs the vision tower and the merge on the whole call, then a pre-hook on the language model keeps the rank's `token_window` of `inputs_embeds`, the raw `ple_input_ids`, `ple_position_ids`, `attention_mask`, `routed_experts` and the `[4, B, T]` positions. A call so marked is refused if it carries `*_window_token_ranges`, has no media, does not divide by the CP size, or has positions that are not the whole call's. No dispatch uses this mode yet; it is what a later one could use to lift the straddle refusal, since no rank then needs an item cut at a window edge.
+A CP rank's model call takes a media call windowed, which is what every dispatch sends: a caller's data plane and `run_pipeline`. Each rank gets `token_shard`'s window with the whole media items in it and their `*_window_token_ranges`; an item that straddles windows is refused upstream. The call is already sharded, so the Qwen3.8 CP wrapper (`qwen38/context_parallel.py`) runs it as it does a text-only call.
 
 ## Cost
 

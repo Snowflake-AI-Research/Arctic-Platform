@@ -23,8 +23,8 @@ the language model only. The PR's own test files could not be read from the host
 written on, so the cases follow the PR's description and the media research plan, re-expressed against
 ``Qwen4ExpForConditionalGenerationPrimeRL``; no prime-rl code is copied.
 
-Every case now passes; the last ``xfail(strict=True)``, context-parallel sharding after the vision merge, is
-covered in more depth by ``test_qwen38_cp_media.py``.
+Every case passes. Context-parallel sharding after the vision merge is not ported: every dispatch sends a CP
+rank its ``token_shard`` window, and ``test_qwen38_cp_media.py`` covers those windowed media calls.
 
 CPU only, on the tiny random-weight config of ``test_qwen4_exp.py``. The DSS MoE router counts tokens with
 ``torch.histc`` on integer ids, which has no CPU kernel, so every decoder layer's MoE is swapped for a dense
@@ -98,14 +98,12 @@ def _pixel_values(model):
     return torch.randn(int(IMAGE_GRID_THW.prod(-1).sum()), patch_dim)
 
 
-def _capture_language_model_inputs(model, *, stop: bool = False):
+def _capture_language_model_inputs(model):
     """Record the keyword inputs the language model is called with, after the vision merge."""
     captured = {}
 
     def hook(_module, _args, kwargs):
         captured.update(kwargs)
-        if stop:
-            raise _StopForward
 
     handle = model.model.language_model.register_forward_pre_hook(hook, with_kwargs=True)
     return captured, handle
@@ -427,44 +425,6 @@ def test_image_batch_runs_the_vision_tower_once_and_is_unchanged():
     vision_grads = dict(model.model.visual.named_parameters())
     for name, parameter in reference.model.visual.named_parameters():
         torch_assert_equal(vision_grads[name].grad, parameter.grad, msg=name)
-
-
-def test_context_parallel_shards_after_the_vision_merge(monkeypatch):
-    from arctic_platform.model.implementations.qwen38 import context_parallel
-
-    model = _model().eval()
-    input_ids, mm_token_type_ids = _image_row()
-    pixel_values = _pixel_values(model)
-    packed_positions = _packed_positions(model, mm_token_type_ids)
-    sequence_length = input_ids.shape[-1]
-    assert sequence_length % 2 == 0
-    local = slice(sequence_length // 2, sequence_length)
-    inputs = dict(
-        input_ids=input_ids,
-        pixel_values=pixel_values,
-        image_grid_thw=IMAGE_GRID_THW,
-        position_ids=packed_positions,
-    )
-
-    unsharded, handle = _capture_language_model_inputs(model, stop=True)
-    with pytest.raises(_StopForward), torch.no_grad():
-        model(**inputs)
-    handle.remove()
-
-    # Rank 1 of a two-rank context-parallel group; the collectives run only inside the backbone forward.
-    monkeypatch.setattr(context_parallel.dist, "get_world_size", lambda group=None: 2)
-    monkeypatch.setattr(context_parallel.dist, "get_rank", lambda group=None: 1)
-    # The GatedDeltaNet adapter imports fla, a CUDA package; the shard is taken before any layer runs.
-    monkeypatch.setattr(context_parallel, "_adapt_linear_attention", lambda module, process_group: None)
-    context_parallel.apply_context_parallelism(model, 2, object())
-    sharded, _ = _capture_language_model_inputs(model, stop=True)
-    with pytest.raises(_StopForward), torch.no_grad():
-        # The whole call reaches this rank, marked so; a call without the flag is taken to be a window already.
-        model(**inputs, cp_shard_after_vision_merge=True)
-
-    torch_assert_equal(sharded["inputs_embeds"], unsharded["inputs_embeds"][:, local])
-    torch_assert_equal(sharded["ple_input_ids"], input_ids[:, local])
-    torch_assert_equal(sharded["position_ids"], packed_positions[..., local])
 
 
 def test_video_batch_runs_the_vision_tower_once():
