@@ -23,12 +23,9 @@ def register(registry: Registry) -> None:
     register_profile(
         "inkling",
         extends="generic_moe",
-        supports=["peft"],
+        supports=["peft", "tiled_mlp.token_chunk_size", "lm_head.fp32", "lm_head.token_chunk_size"],
         unsupported={
             "checkpointing.targets": "only full activation checkpointing is supported",
-            "tiled_mlp.token_chunk_size": "native Inkling dense and shared experts are used",
-            "lm_head.fp32": "native Inkling LM head is used",
-            "lm_head.token_chunk_size": "native Inkling LM head is used",
             "lm_head.cross_entropy": "native Inkling causal LM loss is used",
             "moe.sonicmoe": "routed experts use grouped GEMM or the expert loop",
         },

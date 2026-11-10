@@ -353,6 +353,39 @@ class TestInklingTraining(TestCasePlus):
         torch_assert_close(last, expected_logprobs[:, -3:], atol=1e-6, rtol=0)
 
     @require_torch_gpu
+    def test_configured_chunked_head_preserves_grpo_logprobs_and_gradients(self):
+        import copy
+
+        from arctic_platform.model.implementations.inkling.deepspeed_integration import _adapter_for_inkling
+        from arctic_platform.model.loaders.inkling import InklingOptions
+
+        set_seed(947)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        reference = initialized_prime_model(tiny_config()).cuda().float()
+        for module in reference.modules():
+            if isinstance(module, InklingMoE):
+                module.ep_comm_backend = "local"
+        actual = copy.deepcopy(reference)
+        options = InklingOptions(fused_lm_head_token_chunk_size=4, fp32_lm_head=True)
+        _adapter_for_inkling(options).inject_lm_head(
+            actual,
+            chunk_size=options.fused_lm_head_token_chunk_size,
+            fused_cross_entropy=False,
+            fp32_lm_head=options.fp32_lm_head,
+        )
+        ids = torch.randint(0, 60, (2, 9), device="cuda")
+        labels = ids.roll(-1, dims=1)
+        temperature = 0.7
+        logits = reference(input_ids=ids).logits.float() / temperature
+        expected = logits.log_softmax(-1).gather(-1, labels[:, :, None]).squeeze(-1)
+        result = actual(input_ids=ids, labels=labels, temperature=temperature, dss_compute_logprobs=True)["logprobs"]
+        torch_assert_close(result, expected, atol=1e-6, rtol=0)
+        (-expected.mean()).backward()
+        (-result.mean()).backward()
+        for (name, parameter), baseline in zip(actual.named_parameters(), reference.parameters()):
+            torch_assert_close(parameter.grad, baseline.grad, atol=1e-6, rtol=0, msg=name)
+
+    @require_torch_gpu
     def test_flex_checkpoint_resume_reproduces_next_full_and_lora_update(self):
         import copy
 
