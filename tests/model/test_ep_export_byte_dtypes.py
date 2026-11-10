@@ -92,8 +92,9 @@ def _worker(rank: int, rendezvous: str, gather_bytes: int, out_dir: str) -> None
         ds_groups._EXPERT_PARALLEL_GROUP.pop(group_name, None)
         dist.destroy_process_group()
         integration._EXPORT_GATHER_BYTES = previous_gather_bytes
-        gc.collect()
-        assert group_ref() is None, "the test-owned Gloo group must be released before interpreter shutdown"
+    # An active exception traceback can still retain the iterator's local group.
+    gc.collect()
+    assert group_ref() is None, "the test-owned Gloo group must be released before interpreter shutdown"
 
 
 @pytest.mark.parametrize("gather_bytes", [1 << 30, 2 * _COLS * _WORLD], ids=["one_gather", "row_slices"])
@@ -103,23 +104,39 @@ def test_ep_export_gathers_backend_unsupported_dtypes_as_bytes(gather_bytes: int
         assert os.path.exists(os.path.join(tmp, "ok"))
 
 
-def _failed_export_worker(rank: int, rendezvous: str) -> None:
+def _failed_export_worker(rank: int, rendezvous: str, failure_stage: str) -> None:
     import deepspeed.utils.groups as ds_groups
 
     import arctic_platform.model.implementations.moe.deepspeed_integration as integration
 
+    group_refs = []
+    previous_gather_bytes = integration._EXPORT_GATHER_BYTES
+
     def fail_export(_model):
+        group_refs.append(weakref.ref(dist.group.WORLD))
+        raise RuntimeError("injected export failure")
+
+    def fail_gather(_tensor, ep_group, **_kwargs):
+        group_refs.append(weakref.ref(ep_group))
         raise RuntimeError("injected export failure")
 
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(integration, "build_iter_full_hf_weights", fail_export)
+        if failure_stage == "build":
+            monkeypatch.setattr(integration, "build_iter_full_hf_weights", fail_export)
+        else:
+            monkeypatch.setattr(integration, "_gather_ep_weight_to_cpu", fail_gather)
         with pytest.raises(RuntimeError, match="injected export failure"):
             _worker(rank, rendezvous, 32, "")
 
     assert not dist.is_initialized()
     assert f"ep_size_{_WORLD}" not in ds_groups._EXPERT_PARALLEL_GROUP
+    assert integration._EXPORT_GATHER_BYTES == previous_gather_bytes
+    gc.collect()
+    assert len(group_refs) == 1
+    assert group_refs[0]() is None, "release the group after the export exception traceback is released"
 
 
-def test_ep_export_releases_the_process_group_when_export_fails() -> None:
+@pytest.mark.parametrize("failure_stage", ["build", "gather"])
+def test_ep_export_releases_the_process_group_when_export_fails(failure_stage: str) -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        mp.spawn(_failed_export_worker, args=(f"file://{tmp}/rendezvous",), nprocs=_WORLD, join=True)
+        mp.spawn(_failed_export_worker, args=(f"file://{tmp}/rendezvous", failure_stage), nprocs=_WORLD, join=True)
