@@ -826,21 +826,17 @@ def _placeholder_ids(hf_config: Any) -> dict[str, int]:
 
     The media spec of the config's ``model_type`` gives them; a model type
     without one falls back to the config's ``image_token_id`` /
-    ``video_token_id``, each only when set.
+    ``video_token_id``, read as the Qwen-VL spec reads them.
     """
-    # Imported here, not at module level: the packing package pulls in torch,
-    # and the inference server's import path stays free of it.
+    # Imported here, not at module level: this keeps ``common.packing`` (and
+    # the ``torch.nn.functional`` it imports) off worker.py's import path.
+    from arctic_platform.common.packing.media_spec import config_placeholder_ids
     from arctic_platform.common.packing.media_spec import media_spec_for
 
     spec = media_spec_for(getattr(hf_config, "model_type", None) or "")
     if spec is not None:
         return spec.placeholder_ids(hf_config)
-    ids = {}
-    for modality, key in (("image", "image_token_id"), ("video", "video_token_id")):
-        value = getattr(hf_config, key, None)
-        if value is not None:
-            ids[modality] = int(value)
-    return ids
+    return config_placeholder_ids(hf_config)
 
 
 def _maybe_cache_routed_experts(
