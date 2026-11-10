@@ -31,11 +31,17 @@ channel 0 as ``cu_seqlens_from_position_ids`` does. Tests that put several rows 
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
+import transformers
 import transformers.models.qwen4_exp.modeling_qwen4_exp as hf_qwen4_exp
 
+from arctic_platform.common.packing import IMAGE_MEDIA
+from arctic_platform.common.packing import QWEN_VL_MEDIA_SPEC
 from arctic_platform.common.packing import cu_seqlens_from_position_ids
+from arctic_platform.common.packing import media_spec as media_spec_module
 from arctic_platform.common.packing import mrope_position_ids
 from arctic_platform.rl.processors.pipeline import run_pipeline
 from arctic_platform.testing_utils import set_seed
@@ -319,13 +325,108 @@ def test_text_only_batch_forwards_as_before(model):
         torch_assert_equal(call["position_ids"], torch.arange(call["input_ids"].shape[-1])[None])
 
 
-def test_media_of_a_many_row_batch_needs_row_ids(model):
+@pytest.mark.parametrize("pack", [True, False], ids=["packed", "unpacked"])
+def test_media_of_a_many_row_batch_needs_row_ids(model, pack):
     rows = _with_pixels(model, _rows())
     batch = _padded_batch(rows)
     del batch["image_row_ids"]
 
-    with pytest.raises(ValueError, match="needs image_row_ids"):
-        _run(model, batch, pack=True)
+    with pytest.raises(ValueError, match="4-row batch needs image_row_ids.*only a one-row batch"):
+        _run(model, batch, pack=pack)
+
+
+def _qwen3_5_moe_model():
+    """A tiny Hugging Face Qwen3.5-MoE vision-language model: it has a vision_config, but no media spec."""
+    config = transformers.Qwen3_5MoeConfig(
+        text_config=dict(
+            vocab_size=64,
+            hidden_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=8,
+            shared_expert_intermediate_size=8,
+            layer_types=["full_attention"],
+        ),
+        vision_config=dict(
+            depth=1, hidden_size=16, intermediate_size=16, num_heads=2, out_hidden_size=16, spatial_merge_size=1
+        ),
+    )
+    return transformers.Qwen3_5MoeForConditionalGeneration(config).eval()
+
+
+class _Stop(Exception):
+    pass
+
+
+def _first_model_call(model, batch, *, pack: bool) -> dict:
+    """The kwargs of the model's first forward, stopped there (the pixels need not fit this model's vision tower)."""
+    calls = []
+
+    def hook(_module, _args, kwargs):
+        calls.append(dict(kwargs))
+        raise _Stop
+
+    handle = model.register_forward_pre_hook(hook, with_kwargs=True)
+    try:
+        with pytest.raises(_Stop):
+            _run(model, batch, pack=pack)
+    finally:
+        handle.remove()
+    return calls[0]
+
+
+@pytest.mark.parametrize("pack", [True, False], ids=["packed", "unpacked"])
+@pytest.mark.parametrize("row_indices", [[0], [0, 3]], ids=["one-row", "two-rows"])
+def test_images_for_a_model_type_with_no_media_spec_pass_through_as_on_main(model, pack, row_indices):
+    """As before media specs: ``pixel_values`` and ``image_grid_thw`` reach the model as sent, with the token
+    inputs and positions a text batch gets; no M-RoPE positions, row ids or token types are added."""
+    other = _qwen3_5_moe_model()
+    rows = _with_pixels(model, _rows())
+    batch = _padded_batch([rows[index] for index in row_indices])
+    del batch["mm_token_type_ids"], batch["image_row_ids"]
+    mask = batch["attention_mask"].bool()
+
+    call = _first_model_call(other, batch, pack=pack)
+
+    expected = dict(input_ids=batch["input_ids"][mask][None])
+    if pack:
+        lens = mask.sum(dim=1).tolist()
+        expected.update(position_ids=torch.cat([torch.arange(n) for n in lens])[None], use_cache=False)
+    else:
+        expected.update(attention_mask=torch.ones_like(expected["input_ids"]))
+    expected.update(pixel_values=batch["pixel_values"], image_grid_thw=batch["image_grid_thw"])
+    assert set(call) == set(expected)
+    for key, value in expected.items():
+        if torch.is_tensor(value):
+            torch_assert_equal(call[key], value)
+        else:
+            assert call[key] == value
+
+
+@pytest.mark.parametrize("pack", [True, False], ids=["packed", "unpacked"])
+@pytest.mark.parametrize(
+    "keys",
+    [("pixel_values_videos", "video_grid_thw"), ("image_row_ids",)],
+    ids=["video", "image-row-ids"],
+)
+def test_media_main_did_not_forward_is_refused_for_a_model_type_with_no_media_spec(model, pack, keys):
+    other = _qwen3_5_moe_model()
+    rows = _with_pixels(model, _rows())
+    batch = _padded_batch([rows[0], rows[1]])
+    del batch["mm_token_type_ids"]
+    for key in {"pixel_values_videos", "video_grid_thw", "video_row_ids", "image_row_ids"} - set(keys):
+        batch.pop(key, None)
+    calls, handle = _record_model_calls(other)
+    try:
+        with pytest.raises(ValueError, match=f"model_type 'qwen3_5_moe' has no media spec.*{keys[0]}"):
+            _run(other, batch, pack=pack)
+    finally:
+        handle.remove()
+    assert calls == []
 
 
 def test_image_tokens_in_another_row_are_refused(model):
@@ -367,11 +468,48 @@ def test_unpacked_media_batch_rows_match_a_direct_forward(model, varlen_linear_a
         )
 
 
-def test_one_row_batch_may_omit_row_ids(model):
+def test_text_only_batch_needs_no_media_spec():
+    other = _qwen3_5_moe_model()
+    set_seed(2)
+    batch = _padded_batch([dict(tokens=[2, 3, 4, 5, 6, 7]), dict(tokens=[8, 9, 10, 11])])
+    del batch["mm_token_type_ids"]
+    for pack in (True, False):
+        assert _run(other, batch, pack=pack).shape[0] == 2
+
+
+def _with_spec(monkeypatch, model_type, spec):
+    specs = dict(media_spec_module._MEDIA_SPECS)
+    specs[model_type] = spec
+    monkeypatch.setattr(media_spec_module, "_MEDIA_SPECS", specs)
+
+
+@pytest.mark.parametrize("pack", [True, False], ids=["packed", "unpacked"])
+def test_media_of_a_kind_the_spec_does_not_take_is_refused(model, monkeypatch, pack):
+    _with_spec(monkeypatch, "qwen4_exp", dataclasses.replace(QWEN_VL_MEDIA_SPEC, kinds=(IMAGE_MEDIA,)))
+    rows = _with_pixels(model, _rows())
+    calls, handle = _record_model_calls(model)
+    try:
+        with pytest.raises(ValueError, match=r"model_type 'qwen4_exp' takes \['pixel_values'\] media, not"):
+            _run(model, _padded_batch(rows), pack=pack)
+    finally:
+        handle.remove()
+    assert calls == []
+
+
+@pytest.mark.parametrize("pack", [True, False], ids=["packed", "unpacked"])
+def test_media_for_a_spec_without_mrope_positions_is_refused(model, monkeypatch, pack):
+    _with_spec(monkeypatch, "qwen4_exp", dataclasses.replace(QWEN_VL_MEDIA_SPEC, positions="1d"))
+    rows = _with_pixels(model, _rows())
+    with pytest.raises(ValueError, match="model_type 'qwen4_exp' has '1d' positions"):
+        _run(model, _padded_batch([rows[0]]), pack=pack)
+
+
+@pytest.mark.parametrize("pack", [True, False], ids=["packed", "unpacked"])
+def test_one_row_batch_may_omit_row_ids(model, pack):
     rows = _with_pixels(model, _rows())
     batch = _padded_batch([rows[3]])
     del batch["image_row_ids"]
-    logprobs = _run(model, batch, pack=True)
+    logprobs = _run(model, batch, pack=pack)
 
     expected = _direct_logprobs(model, rows[3])
     torch_assert_close(_row_logprobs(logprobs, 0, len(rows[3]["tokens"])), expected, rtol=0, atol=1e-5)
