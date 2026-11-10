@@ -247,4 +247,3 @@ def test_token_shard_windows_pass_through_and_each_rank_gets_its_own_window(monk
 
     gathered = torch.cat([context_parallel._text_position_ids(inputs["position_ids"]) for inputs in received], dim=-1)
     torch_assert_equal(cu_seqlens_from_position_ids(gathered).to(metadata.cu_seqlens.dtype), metadata.cu_seqlens)
-
