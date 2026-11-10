@@ -1996,6 +1996,12 @@ def _worker_criu_load_lowcap(image_dir, new_pipe_fd):
 # Child thread -- communicates with the vLLM child process via pipe
 # ---------------------------------------------------------------------------
 
+# The commands between the last forward pass and the checkpoint that decide
+# whether the image can restore: a failure in any of them refuses the dump,
+# and the graph drop they report goes into meta.json.
+_NCCL_TEARDOWN_CMDS = ("drop_graphs", "drop_graphs_if_nccl", "destroy_nccl")
+
+
 def _child_thread(instance_id, gpus, child_pid, pipe,
                   child_queue, result_queue, completed_counter,
                   initial_state="alive", capture_gpu_uuids=None,
@@ -2113,6 +2119,14 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
     # engine that did not sleep still holds its weights and KV cache, so a
     # checkpoint would capture all of it; refuse instead.
     sleep_error = None
+    # Set by a failed graph drop or NCCL teardown.  A comm whose abort never
+    # finished still holds peer memory, which checkpoints and then fails
+    # cuda_restore with CUresult=801; refuse instead.
+    nccl_error = None
+    # What the child did with its graphs before destroy_nccl (its
+    # ``graph_drop`` reply), recorded into meta.json so the restore knows
+    # whether to rebind or recapture.
+    graph_drop = None
 
     while True:
         cmd, kwargs = _get_next_command()
@@ -2136,6 +2150,13 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
                       cmd, sleep_error)
             _emit_result(cmd, 0.0,
                          f"refused: the engine failed to sleep ({sleep_error})", {})
+            continue
+
+        if cmd in ("cuda_checkpoint", "criu_dump") and nccl_error is not None:
+            log.error("<<< %s FAILED (NCCL teardown failed: %s)",
+                      cmd, nccl_error)
+            _emit_result(cmd, 0.0,
+                         f"refused: NCCL teardown failed ({nccl_error})", {})
             continue
 
         if cmd == "cuda_checkpoint":
@@ -2335,9 +2356,12 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
                             f"{len(_bad)} inet socket(s) would go into a "
                             f"multi-node image: {_bad}")
 
+                meta_extra = dict(kwargs.get("meta_extra") or {})
+                if graph_drop:
+                    meta_extra.update(graph_drop)
                 meta = _worker_criu_save(
                     child_pid, image_dir, child_pipe_fd, pipe_resource, gpus,
-                    meta_extra=kwargs.get("meta_extra"),
+                    meta_extra=meta_extra,
                 )
                 info["image_dir"] = image_dir
                 info["meta"] = meta
@@ -2453,9 +2477,15 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
             break
         # Track child pause state so `_drain_pipe_generates` can no-op
         # for the duration of the pause/save/restore/resume cycle.
-        _result_cmd, _, _result_error, _ = result
+        _result_cmd, _, _result_error, _result_info = result
         if _result_cmd == "sleep":
             sleep_error = _result_error
+        if _result_cmd in _NCCL_TEARDOWN_CMDS:
+            if _result_error is not None:
+                nccl_error = f"{_result_cmd}: {_result_error}"
+            elif isinstance(_result_info, dict) and _result_info.get(
+                    "graph_drop"):
+                graph_drop = dict(_result_info["graph_drop"])
         if _result_error is None:
             if _result_cmd == "pause":
                 _worker_paused = True
