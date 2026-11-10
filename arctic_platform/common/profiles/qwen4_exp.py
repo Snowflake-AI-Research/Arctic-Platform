@@ -15,11 +15,12 @@
 
 """Profile of the ``qwen4_exp`` loader (Qwen3.8-Flash-Next).
 
-The loader registers ``FlashMoeOptions`` (``GenericMoeOptions`` plus ``fp32_parity`` and ``fp32_routed_weighting``),
-so it extends the ``generic_moe`` profile and overrides only what differs: it supports ``numerics.fp32_parity``,
-which evaluates the QSA rotary embedding, softmax probabilities, P·V product and output gate in fp32, as vLLM does,
-and ``numerics.fp32_routed_weighting``, which weights the BF16 experts' fp32 down-projection accumulator before
-rounding.
+The loader registers ``Qwen38FlashMoeOptions`` (``GenericMoeOptions`` plus ``fp32_parity``, ``fp32_routed_weighting``
+and ``fp32_residual``), so it extends the ``generic_moe`` profile and overrides only what differs: it supports
+``numerics.fp32_parity``, which evaluates the QSA rotary embedding, softmax probabilities, P·V product and output gate
+in fp32, as vLLM does, ``numerics.fp32_routed_weighting``, which weights the BF16 experts' fp32 down-projection
+accumulator before rounding, and ``numerics.fp32_residual``, which carries the hyper-connection residual streams in
+fp32 between blocks, with the sampler doing the same under ``ARCTIC_FP32_HC_RESIDUAL``.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ def register(registry: Registry) -> None:
     register_profile(
         "qwen4_exp",
         extends="generic_moe",
-        supports=["numerics.fp32_parity", "numerics.fp32_routed_weighting"],
+        supports=["numerics.fp32_parity", "numerics.fp32_routed_weighting", "numerics.fp32_residual"],
         not_applicable={
             "attention.sparse_mla": "Qwen3.8-Flash-Next uses QSA attention, not sparse MLA",
         },

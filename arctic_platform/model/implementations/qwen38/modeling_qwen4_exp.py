@@ -281,7 +281,7 @@ class Qwen4ExpTextGatedResidualPrimeRL(Qwen4ExpTextGatedResidual):
     """
 
     def forward(self, hyper_input: torch.Tensor):
-        normed = self.hc_norm(hyper_input)
+        normed = self.hc_norm(hyper_input).to(self.input_mix_weight_down.weight.dtype)
         down = self.input_mix_weight_down(normed)
         gate = self.input_mix_weight_up(F.silu(down.float() / self.hc_count).to(down.dtype))
         mixed = hyper_connection.gate_mix(normed, gate, self.hc_count)
@@ -329,9 +329,13 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
         **kwargs,
     ) -> torch.FloatTensor:
         ple_position_ids = kwargs.pop("ple_position_ids", None)
+        if self._fp32_residual:
+            hidden_states = hidden_states.float()
         if self.ple is not None:
+            # vLLM's fused PLE gate reads the streams in the projection dtype, so fp32 streams are read rounded.
+            ple_input = hidden_states.to(self.ple.key_proj.weight.dtype) if self._fp32_residual else hidden_states
             hidden_states = hidden_states + self.ple(
-                hidden_states,
+                ple_input,
                 ple_input_ids,
                 past_key_values,
                 conv_mask=conv_mask,
@@ -386,6 +390,7 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
         self.model.__class__ = Qwen4ExpModelPrimeRL
         text_config = config.text_config
         use_grouped_mm = getattr(config, "use_grouped_mm", True)
+        fp32_residual = getattr(config, "fp32_residual", False)
         if getattr(config, "fp32_parity", True):
             for module in self.model.language_model.modules():
                 if type(module) is Qwen4ExpTextGatedResidual:
@@ -393,6 +398,7 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
         for layer_idx, layer in enumerate(self.model.language_model.layers):
             layer.__class__ = Qwen4ExpTextDecoderLayerPrimeRL
             layer._replay_layer_idx = layer_idx
+            layer._fp32_residual = fp32_residual
             if layer.layer_type == "linear_attention":
                 round_gated_norm_once(layer.linear_attn.norm)
                 if getattr(config, "fp32_parity", True):

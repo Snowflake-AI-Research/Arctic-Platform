@@ -62,5 +62,7 @@ class ModelConfig:
     fp32_parity: bool = True
     # BF16 experts weight the down projection's fp32 accumulator and round once (GLM-5.3-Flash, Qwen3.8-Flash-Next).
     fp32_routed_weighting: bool = False
+    # Qwen3.8-Flash-Next carries its hyper-connection residual streams in fp32 between blocks.
+    fp32_residual: bool = False
 
     debug: DebugModelConfig = field(default_factory=DebugModelConfig)

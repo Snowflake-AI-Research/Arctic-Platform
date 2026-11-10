@@ -62,7 +62,7 @@ EXPECTED_KEYS = {
     "attention.sparse_mla": ("trainer", "speed"),
     "numerics.reduce_dtype": ("trainer", "parity"),
     "numerics.fp32_parity": ("trainer", "parity"),
-    "numerics.fp32_residual": ("trainer", "parity"),
+    "numerics.fp32_residual": ("both", "parity"),
     "numerics.fp32_routed_weighting": ("trainer", "parity"),
     "numerics.optimization_dtype": ("trainer", "parity"),
     "compile.fullgraph": ("trainer", "speed"),

@@ -102,9 +102,11 @@ LOADER_OPTION_FIELDS: dict[str, str | None] = {
 
 
 # Per-loader entries that differ from ``LOADER_OPTION_FIELDS``. ``glm5_next`` picks its sparse MLA kernel through
-# ``attn_implementation``, which ``_validate_glm5_next`` requires to name a sparse MLA backend.
+# ``attn_implementation``, which ``_validate_glm5_next`` requires to name a sparse MLA backend. ``qwen4_exp`` is the
+# one custom loader with ``fp32_residual``.
 LOADER_FIELD_OVERRIDES: dict[str, dict[str, str | None]] = {
     "glm5_next": {"attention.sparse_mla": "ModelSpec.attn_implementation"},
+    "qwen4_exp": {"numerics.fp32_residual": "fp32_residual"},
 }
 
 _MODEL_SPEC_PREFIX = "ModelSpec."
