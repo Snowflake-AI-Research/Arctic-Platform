@@ -394,6 +394,8 @@ def _native_grpo_kd_request():
         },
         "context": {
             "pad_token_id": 0,
+            # The gradient and group-shape asserts depend on rows staying in arrival order on each worker.
+            "balance_batch": False,
             "old_log_probs_shifted": torch.zeros(rows, sequence_length),
             "advantages": torch.ones(rows, sequence_length),
             "loss_mask": target_mask,

@@ -18,7 +18,6 @@
 """Logical SP batch preparation only; no native models, ranks or token partition."""
 
 from copy import deepcopy
-from types import ModuleType
 
 import pytest
 import torch
@@ -52,7 +51,7 @@ def _envelope(rows=5):
             "attention_mask": torch.tensor([[1, 1, 1, 0]]).repeat(rows, 1),
             "labels": torch.arange(rows * 4).reshape(rows, 4),
         },
-        "meta": {"drop_position_ids": True},
+        "meta": {"drop_position_ids": True, "balance_batch": False},
         "processing": {"loss_fn": "sft_ce"},
     }
 
@@ -99,26 +98,43 @@ def test_sp_preparation_gas_preserves_per_microbatch_labels_and_reconstructs_pos
 
 
 def test_sp_preparation_balances_logical_dp_rows_and_preserves_inverse_reorder(monkeypatch):
-    import sys
+    from arctic_platform.common.utils import balanced_batch
 
-    module = ModuleType("arctic_platform.rl.zorro_train.seqlen_balancing")
     source = _envelope(rows=4)
     order = [2, 0, 3, 1]
     observed = []
 
-    def balance(batch, **kwargs):
-        observed.append(kwargs)
-        assert "position_ids" in batch
-        return {name: value[order] for name, value in batch.items()}, order
+    def balance(num_shards, meta, **kwargs):
+        observed.append(num_shards)
+        assert meta["balance_batch"] is True
+        torch_assert_equal(kwargs["input_ids"], source["batch"]["input_ids"])
+        return [[2, 0], [3, 1]]
 
-    module.reorg_global_batch = balance
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    source["meta"].update(load_balancer=True, rollout_n=1, max_response_len=4, max_token_len_per_gpu=8)
+    monkeypatch.setattr(balanced_batch, "assign_balanced_batch", balance)
+    source["meta"]["balance_batch"] = True
     shards, reorder = _split_batch(source, 4, 2, worker_sp_info=_membership())
-    assert observed[0]["world_size"] == 2
+    assert observed == [2]
     assert reorder == order
     logical = {"input_ids": torch.cat([shards[0]["batch"]["input_ids"], shards[1]["batch"]["input_ids"]])}
     torch_assert_equal(restore_batch_order(logical, reorder)["input_ids"], source["batch"]["input_ids"])
+
+
+def test_sp_preparation_real_balancer_assigns_logical_groups_and_restores_rows():
+    source = _envelope(rows=4)
+    source["meta"]["balance_batch"] = True
+    source["batch"]["attention_mask"] = torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0], [1, 1, 0, 0], [1, 0, 0, 0]])
+    original = deepcopy(source)
+    shards, reorder = _split_batch(source, 4, 2, worker_sp_info=_membership())
+    assert reorder == [0, 3, 1, 2]
+    for group in ((0, 2), (1, 3)):
+        left, right = (shards[index] for index in group)
+        assert left["batch"] is not right["batch"]
+        assert left["meta"]["dp_size"] == right["meta"]["dp_size"] == 2
+        for name in ("input_ids", "attention_mask", "labels", "position_ids"):
+            torch_assert_equal(left["batch"][name], right["batch"][name])
+    logical = {"input_ids": torch.cat([shards[0]["batch"]["input_ids"], shards[1]["batch"]["input_ids"]])}
+    torch_assert_equal(restore_batch_order(logical, reorder)["input_ids"], original["batch"]["input_ids"])
+    assert "position_ids" not in source["batch"]
 
 
 @pytest.mark.parametrize(

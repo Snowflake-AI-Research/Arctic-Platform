@@ -141,6 +141,10 @@ class EngineArgsPatch(ArcticPatch[EngineArgs]):
         return EngineArgsPatch._orig_from_cli_args.__func__(cls, args)
 
     def create_engine_config(self, *args, **kwargs):
+        # The first EngineArgs can be constructed before its plugin is loaded.
+        for field in fields(ArcticArgs):
+            if not hasattr(self, field.name):
+                setattr(self, field.name, field.default)
         if (self.ulysses_sequence_parallel_size > 1 and
                 self.distributed_executor_backend is None):
             self.distributed_executor_backend = "mp"
