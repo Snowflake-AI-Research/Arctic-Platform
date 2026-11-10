@@ -117,6 +117,7 @@ model with no entry stops the run before anything is submitted.
 | `job_<variant>` | none | Attach to running jobs instead of submitting (`on_job_id` / `off_job_id` still work) |
 | `log_files_on`, `log_files_off` | none | Saved GPU pod logs of `on_hit` / `off_default` (per-step restore breakdown) |
 | `timeout_s` | `3600` | How long each job may take to reach `running` |
+| `log_wait_s` | `90` | How long to keep re-reading a served job's log, before cancelling it, until it shows the job's start-up total |
 | `publish_dir` | `<out_dir>/publish` | Where `publish` wrote `<image_tag>/summary.json` |
 | `verify_timeout_s` | `3600` | How long to wait for the published image to be verified on every node |
 
@@ -283,6 +284,14 @@ published size. Override with `copies=` or a model file's `"copies"`.
 If neither the live log nor the archived execution logs carry the semi_p
 markers, the verdict is `WARN` (restore not confirmed); pass saved logs with
 `log_files_on` / `log_files_off`.
+
+The service's tail of a long sub-job log can stop advancing while the job runs
+on, and reads answer 409 Conflict once the job has ended. So each job's log is
+followed: lines already read are kept, the newest page is added when a read from
+the start brings nothing new, and before a served job is cancelled its log is
+re-read for up to `log_wait_s` until it shows the job's start-up total (semi_p
+key to ready, or vLLM's engine init). A total still missing is listed under
+"Start-up totals unknown" with why (`log stream stalled`), not left blank.
 
 ## Reports and verdict
 

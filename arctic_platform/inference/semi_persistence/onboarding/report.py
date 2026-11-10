@@ -202,6 +202,9 @@ def markdown(result: dict) -> str:
         if st.get("generate_counts"):
             lines += ["Generate requests served per semi_p replica: "
                       + ", ".join(f"{k} {v}" for k, v in st["generate_counts"].items()), ""]
+        if st.get("unknown"):
+            lines += ["Start-up totals unknown: " + "; ".join(
+                f"{VARIANT_LABELS.get(v, v)} `{u['field']}` ({u['why']})" for v, u in st["unknown"].items()), ""]
         lines += [f"Log sources: semi_p {st.get('on_sources') or ['none']}; plain {st.get('off_sources') or ['none']}", ""]
 
     corr = result.get("correctness") or []

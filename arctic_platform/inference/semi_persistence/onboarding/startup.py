@@ -30,6 +30,11 @@ an engine is identified by that worker plus the ``replica<K>`` or ``node<K>``
 directory of its model_dir. Logs saved from the GPU pod instead tag lines
 ``HH:MM:SS.fff [r<K> <process>]`` and also carry each restore step as
 ``<<< <step> OK (<seconds>s)``, which the sub-job log does not.
+
+The service's tail of the sub-job log can stop advancing partway through a long
+log while the job runs on, and every read answers 409 Conflict once the job has
+ended, so a job's log is followed (``follow_sub_job_log``): lines already seen
+are kept, and the newest page is added when a read from the start stalls.
 """
 
 from __future__ import annotations
@@ -37,6 +42,8 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -67,6 +74,11 @@ VLLM_PHASES = {
     "graph_capture_s": re.compile(r"Graph capturing finished in ([0-9.]+) secs"),
     "engine_init_s": re.compile(r"init engine \(profile, create kv cache, warmup model\) took ([0-9.]+) s"),
 }
+SUB_JOB_LOG = "sub-job.log"
+LOG_TIME = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)")
+# Where a job's start-up total lands in a report's start-up section.
+REPORT_FIELDS = {"on_hit": ("semi_p", "key_to_ready_s"), "off_default": ("vllm_off", "engine_init_s"),
+                 "on_miss": ("semi_p_miss", "key_to_ready_s"), "off_matched": ("vllm_matched", "engine_init_s")}
 
 
 def start_cursor(client: Any, job_id: str) -> str | None:
@@ -111,16 +123,80 @@ def read_sub_job_log(client: Any, job_id: str, max_pages: int = 200) -> list[str
     return lines
 
 
-def collect_logs(client: Any, job_id: str) -> dict[str, list[str]]:
-    """The logs the API serves for ``job_id``: the sub-job log and the archived
-    execution logs, keyed by a source name (also the saved file name)."""
-    logs: dict[str, list[str]] = {}
+def merge_lines(lines: list[str], more: list[str]) -> list[str]:
+    """``lines``, then the lines of ``more`` it does not hold yet."""
+    known = set(lines)
+    return lines + [line for line in dict.fromkeys(more) if line not in known]
+
+
+def newest_lines(client: Any, job_id: str) -> list[str]:
+    """The newest page of the sub-job log (a read without a cursor)."""
+    page = client.tail_logs(job_id, max_lines=1000, sub_job_type="sampling")
+    return [line for entry in page.get("entries") or [] for line in log_text(entry).splitlines()]
+
+
+def follow_sub_job_log(client: Any, job_id: str, seen: list[str], newest: bool = False,
+                       label: str | None = None) -> list[str]:
+    """Every sub-job log line seen so far: ``seen`` plus what a read from the
+    start adds. When that read brings nothing new (the tail has stalled), or
+    with ``newest``, the newest page is added too; a read that fails, as every
+    read does once the job has ended (409 Conflict), keeps what was seen."""
+    label = label or job_id
     try:
-        live = read_sub_job_log(client, job_id)
-        if live:
-            logs["sub-job.log"] = live
-    except Exception as exc:  # noqa: BLE001 - a missing source is reported, not fatal
-        logger.warning("sub-job log for %s unavailable: %s", job_id, exc)
+        head = read_sub_job_log(client, job_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("%s: sub-job log unreadable (%s); keeping the %d line(s) seen", label, exc, len(seen))
+        return seen
+    lines = merge_lines(head, seen)
+    if newest or len(lines) == len(seen):
+        try:
+            lines = merge_lines(lines, newest_lines(client, job_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s: newest sub-job log lines unreadable (%s)", label, exc)
+    return lines
+
+
+def missing_fields(lines: list[str], semi_p: bool) -> list[str]:
+    """The start-up total a served job's log gives that ``lines`` lack yet:
+    semi_p's key to ready (every engine whose markers show has restored), or
+    plain vLLM's engine init. A semi_p log with no markers at all has nothing
+    to wait for."""
+    if semi_p:
+        sp = parse_semi_p(lines)
+        return ["key_to_ready_s"] if sp["markers_visible"] and "key_to_ready_s" not in sp else []
+    return [] if "engine_init_s" in parse_vllm(lines) else ["engine_init_s"]
+
+
+def stall_note(lines: list[str]) -> str:
+    """Why a served job's start-up total is not in ``lines``, its sub-job log."""
+    if not lines:
+        return "no sub-job log could be read before the job was cancelled"
+    last = next((m.group(1) for m in map(LOG_TIME.search, reversed(lines)) if m), None)
+    return (f"log stream stalled: the {len(lines)} sub-job log line(s) read before the job was cancelled"
+            + (f" (last at {last.replace('T', ' ')})" if last else "") + " do not have it")
+
+
+def collect_logs(client: Any, job_id: str, seen: dict[str, list[str]] | None = None, semi_p: bool | None = None,
+                 wait_s: float = 0.0, poll_s: float = 15.0,
+                 stop: threading.Event | None = None) -> dict[str, list[str]]:
+    """The logs the API serves for ``job_id``: the sub-job log and the archived
+    execution logs, keyed by a source name (also the saved file name). The
+    sub-job log continues from ``seen`` (an earlier result). For a served job
+    (``semi_p`` True for semi_p, False for plain vLLM) whose log lacks its
+    start-up total, the newest page is added, then the log is re-read every
+    ``poll_s`` for up to ``wait_s`` (or until ``stop``) until it has it."""
+    logs: dict[str, list[str]] = {}
+    live = follow_sub_job_log(client, job_id, (seen or {}).get(SUB_JOB_LOG, []))
+    deadline = time.time() + wait_s
+    while semi_p is not None and missing_fields(live, semi_p):
+        live = follow_sub_job_log(client, job_id, live, newest=True)
+        missing = missing_fields(live, semi_p)
+        if missing and (time.time() + poll_s > deadline or (stop or threading.Event()).wait(poll_s)):
+            logger.warning("%s: %s not in its sub-job log after waiting %.0fs; %s", job_id, ", ".join(missing),
+                           wait_s, stall_note(live))
+            break
+    if live:
+        logs[SUB_JOB_LOG] = live
     try:
         for f in client.fetch_execution_logs(job_id):
             logs[f"execution-{Path(f.get('filename') or 'log').name}"] = (f.get("content") or "").splitlines()

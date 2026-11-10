@@ -57,14 +57,14 @@ from typing import Any
 
 from arctic_platform.inference.semi_persistence.onboarding.client import enable_debug_options
 from arctic_platform.inference.semi_persistence.onboarding.client import make_client
-from arctic_platform.inference.semi_persistence.onboarding.common import log_text
 from arctic_platform.inference.semi_persistence.onboarding.common import parse_kv_args
 from arctic_platform.inference.semi_persistence.onboarding.jobs import TERMINAL
 from arctic_platform.inference.semi_persistence.onboarding.jobs import ModelSpec
 from arctic_platform.inference.semi_persistence.onboarding.jobs import load_model
 from arctic_platform.inference.semi_persistence.onboarding.jobs import normalize_status
+from arctic_platform.inference.semi_persistence.onboarding.startup import follow_sub_job_log
+from arctic_platform.inference.semi_persistence.onboarding.startup import merge_lines
 from arctic_platform.inference.semi_persistence.onboarding.startup import parse_semi_p
-from arctic_platform.inference.semi_persistence.onboarding.startup import read_sub_job_log
 
 logger = logging.getLogger(__name__)
 
@@ -112,18 +112,6 @@ def publish_outcome(lines: list[str]) -> dict | None:
                            weight_hash=skeleton.group(2)[-12:])
             return out
     return None
-
-
-def merge_lines(lines: list[str], more: list[str]) -> list[str]:
-    """``lines``, then the lines of ``more`` it does not hold yet."""
-    known = set(lines)
-    return lines + [line for line in dict.fromkeys(more) if line not in known]
-
-
-def newest_lines(client: Any, job_id: str) -> list[str]:
-    """The newest page of the sub-job log (a read without a cursor)."""
-    page = client.tail_logs(job_id, max_lines=1000, sub_job_type="sampling")
-    return [line for entry in page.get("entries") or [] for line in log_text(entry).splitlines()]
 
 
 class Publisher:
@@ -187,23 +175,8 @@ class Publisher:
         raise TimeoutError("not running in time")
 
     def read_log(self, name: str, job_id: str) -> list[str]:
-        """Every sub-job log line seen so far. The service's tail can stop
-        advancing partway through a long log while the job runs on, so when a
-        read from the start brings nothing new the newest page is added; a read
-        that fails, as every read does once the job has ended (409 Conflict),
-        keeps what was seen."""
-        seen = self.logs.get(job_id, [])
-        try:
-            head = read_sub_job_log(self.client, job_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("%s: sub-job log unreadable (%s); keeping the %d line(s) seen", name, exc, len(seen))
-            return seen
-        lines = merge_lines(head, seen)
-        if len(lines) == len(seen):
-            try:
-                lines = merge_lines(lines, newest_lines(self.client, job_id))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("%s: newest sub-job log lines unreadable (%s)", name, exc)
+        """Every sub-job log line seen so far (see ``follow_sub_job_log``)."""
+        lines = follow_sub_job_log(self.client, job_id, self.logs.get(job_id, []), label=name)
         self.logs[job_id] = lines
         return lines
 

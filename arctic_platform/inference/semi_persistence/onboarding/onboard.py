@@ -68,6 +68,9 @@ Arguments (``key=value``):
   log_files_on / log_files_off   saved GPU pod logs of on_hit / off_default (files
                    or directories); they add the per-step restore breakdown
   timeout_s        how long each job may take to reach running (default 3600)
+  log_wait_s       how long to keep re-reading a served job's log, before
+                   cancelling it, until it shows the job's start-up total
+                   (default 90); one still missing is reported as unknown
   publish_dir      where publish wrote <image_tag>/summary.json, which names each
                    model's skeleton and weights (default <out_dir>/publish)
   verify_timeout_s how long to wait for them to be verified on every node
@@ -167,6 +170,21 @@ def analyze_startup(on_api: dict, off_api: dict, on_pods: dict, off_pods: dict) 
     }
 
 
+def unknown_startup(st: dict, runs: dict[str, JobRun]) -> dict:
+    """``{variant: {"field", "why"}}`` for each job that came up, and so logged
+    its start-up total, but whose total the start-up section ``st`` lacks."""
+    out = {}
+    for v, r in runs.items():
+        section, field = startup.REPORT_FIELDS[v]
+        got = st.get(section) or {}
+        if "running" not in r.tracker.transitions or got.get(field) is not None:
+            continue
+        if field == "key_to_ready_s" and not got.get("markers_visible"):
+            continue  # the verdict already says semi_p's markers are not visible
+        out[v] = {"field": field, "why": startup.stall_note((r.logs or {}).get(startup.SUB_JOB_LOG, []))}
+    return out
+
+
 class Runner:
     def __init__(self, args: dict[str, str]):
         if "config" not in args:
@@ -188,7 +206,9 @@ class Runner:
         self.reserve_gpus = int(args.get("reserve_gpus", "0"))
         self.gpus_per_node = int(args.get("gpus_per_node", str(GPUS_PER_NODE)))
         self.pre_cancel_hook = args.get("pre_cancel_hook") or None
+        self.log_wait_s = float(args.get("log_wait_s", "90"))
         self.poll_s = 5.0
+        self.log_poll_s = 15.0
         Path(self.out_dir).expanduser().mkdir(parents=True, exist_ok=True)
         self.ledger = Path(self.out_dir).expanduser() / f"jobs-{utc_now().replace(':', '').replace('-', '')}.jsonl"
         self.live: dict[str, str] = {}
@@ -331,8 +351,8 @@ class Runner:
                 if not wait_until_running(client, t, deadline, self.poll_s, stop):
                     return
                 if variant == "on_hit":
-                    restore = startup.restore_report(startup.collect_logs(client, t.job_id),
-                                                     startup.read_files(self.log_files["on"]))
+                    run.logs = self.read_logs(client, variant, run, stop)
+                    restore = startup.restore_report(run.logs, startup.read_files(self.log_files["on"]))
                     result["startup"] = {"semi_p": restore}
                     if restore["cache_miss"] and self.require_restore:
                         raise RuntimeError("semi_p job cold-started (cache miss); publish this config's image first, "
@@ -351,7 +371,7 @@ class Runner:
                     stop.set()
             finally:
                 if client is not None:  # else finish() reads its logs and cancels it
-                    self.release(client, variant, run, result, attached)
+                    self.release(client, variant, run, result, attached, stop)
 
         threads = [threading.Thread(target=serve, args=(v, r), name=f"{spec.name}/{v}") for v, r in runs.items()]
         for thread in threads:
@@ -359,13 +379,23 @@ class Runner:
         for thread in threads:
             thread.join()
 
-    def release(self, client: Any, variant: str, run: JobRun, result: dict, attached: bool) -> None:
+    def release(self, client: Any, variant: str, run: JobRun, result: dict, attached: bool,
+                stop: threading.Event | None = None) -> None:
         """Read a served job's logs while its pods exist, then cancel it unless it is kept."""
         try:
-            run.logs = startup.collect_logs(client, run.tracker.job_id)
+            run.logs = self.read_logs(client, variant, run, stop)
         finally:
             if not (self.keep_jobs or attached):
                 self.cancel(client, variant, run, result)
+
+    def read_logs(self, client: Any, variant: str, run: JobRun, stop: threading.Event | None = None) -> dict:
+        """A job's logs, continuing from those already read. A job that came up
+        has its start-up total logged by now, so its log is re-read for up to
+        ``log_wait_s`` until it shows it (the service's tail can stall)."""
+        up = "running" in run.tracker.transitions
+        return startup.collect_logs(client, run.tracker.job_id, seen=run.logs,
+                                    semi_p=variant.startswith("on_") if up else None,
+                                    wait_s=self.log_wait_s, poll_s=self.log_poll_s, stop=stop)
 
     def cancel(self, client: Any, variant: str, run: JobRun, result: dict) -> None:
         """``pre_cancel_hook``, then cancel; at most once per job."""
@@ -440,7 +470,7 @@ class Runner:
         the jobs were served), then the start-up section from every job's logs."""
         for v, r in runs.items():
             if r.logs is None:
-                r.logs = startup.collect_logs(client, r.tracker.job_id)
+                r.logs = self.read_logs(client, v, r)
             if not (self.keep_jobs or attached):
                 self.cancel(client, v, r, result)
         st = result.setdefault("startup", {})
@@ -459,6 +489,9 @@ class Runner:
                 st["semi_p_miss"] = startup.restore_report(logs["on_miss"], {})
             if "off_matched" in logs:
                 st["vllm_matched"] = startup.parse_vllm([x for v in logs["off_matched"].values() for x in v])
+            unknown = unknown_startup(st, runs)
+            if unknown:
+                st["unknown"] = unknown
             st["log_dir"] = str(log_dir)
         except Exception as exc:  # noqa: BLE001
             logger.warning("could not read start-up logs: %s", exc)
