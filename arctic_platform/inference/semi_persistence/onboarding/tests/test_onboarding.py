@@ -9,6 +9,10 @@ repository root::
 
 import base64
 import json
+import signal
+import threading
+import time
+import zlib
 
 import pytest
 
@@ -281,14 +285,17 @@ class _FakeClient:
 
     def __init__(self, drift=()):
         self.drift, self.pending, self.n = set(drift), {}, 0
+        self.lock = threading.Lock()
 
     def generate(self, job_id, prompts, sampling_params, routing_key=None):
-        self.n += 1
-        rid = f"r{self.n}"
+        with self.lock:
+            self.n += 1
+            rid = f"r{self.n}"
         out = []
         for p in prompts:
             n = int(sampling_params.get("max_tokens", 4)) if sampling_params.get("ignore_eos") else 3
-            ids = [abs(hash((str(p), json.dumps(sampling_params, sort_keys=True), i))) % 1000 + 1 for i in range(n)]
+            key = json.dumps([str(p), sampling_params], sort_keys=True)
+            ids = [zlib.crc32(f"{key}/{i}".encode()) % 1000 + 1 for i in range(n)]
             if job_id in self.drift and sampling_params.get("temperature") == 0.0:
                 ids[-1] += 1
             r = {"token_ids": ids, "text": " ".join(map(str, ids)), "finish_reason": "stop",
@@ -347,6 +354,216 @@ def test_footprint_counts_whole_nodes(monkeypatch, tmp_path):
     assert runner.footprint(_spec(tp=2, n_gpus=8)) == (56, 7)  # 16 + 16 + 8 + 16 GPUs, 2 + 2 + 1 + 2 nodes
     assert runner.footprint(_spec(tp=1, n_gpus=1)) == (3, 3)   # three 1-GPU jobs, one node each
     assert runner.footprint(_spec(tp=16, n_gpus=16)) == (48, 6)  # off_matched skipped: 16 x 3
+
+
+_MISS_LOG = ["00:00:01.000 [r0 engine] semi_p: resolved model_dir=/cache/k",
+             "00:00:01.100 [r0 engine] semi_p: cache miss -- cold-starting",
+             "00:05:00.000 [r0 engine] semi_p: dump complete model_dir=/cache/k in 298.9s"]
+_JOB_LOGS = {"on_hit": RESTORE_LOG, "on_miss": _MISS_LOG, "off_matched": [jobs.MATCH_APPLIED_MARKER],
+             "off_default": ["INFO [core.py:373] init engine (profile, create kv cache, warmup model) took 137.22 s"]}
+# correctness.run's checks (sha256 of their sorted JSON) for _FakeClient(drift={"job-off_default"})
+# and the four jobs of _spec(tp=2, n_gpus=8), as reported when each request went to every job in turn.
+_SIMULTANEOUS_CHECKS_SHA256 = "92e9de3a0852ef7a7c5869ed76aae014aaf523b4a59fa9318d90f763921eecc0"
+
+
+def _variant_of(body):
+    ic = body["sub_job_configs"][0]["inference_config"]
+    env = ic["vllm_config"].get("extra_env") or {}
+    if ic["semi_p"]:
+        return "on_miss" if "SEMIP_IMAGE_SOURCE" in env else "on_hit"
+    return "off_matched" if "SEMIP_MATCH_COLLECTIVES" in env else "off_default"
+
+
+class _Cluster(_FakeClient):
+    """Jobs for ``Runner.run_one``, named ``job-<variant>``. A job runs once
+    ``ready(variant, cluster)`` says so, a job in ``fail`` ends failed, and a
+    cancelled one stays cancelled; only a running job answers. ``events``
+    records each job first seen running and each cancel, in order."""
+
+    def __init__(self, ready=lambda variant, cluster: True, fail=()):
+        super().__init__(drift={"job-off_default"})
+        self.ready, self.fail = ready, set(fail)
+        self.cancelled, self.events = [], []
+
+    def create_job_from_body(self, body):
+        return {"job_id": f"job-{_variant_of(body)}"}
+
+    def get_capacity(self):
+        return {"available_gpus": 10_000}
+
+    def status(self, job_id):
+        variant = job_id[len("job-"):]
+        if job_id in self.cancelled:
+            return "cancelled"
+        if variant in self.fail:
+            return "failed"
+        return "running" if self.ready(variant, self) else "initializing"
+
+    def get_job(self, job_id):
+        status = self.status(job_id)
+        with self.lock:
+            if status == "running" and ("running", job_id) not in self.events:
+                self.events.append(("running", job_id))
+        return {"status": f"JOB_STATE_{status.upper()}", "reason": "no capacity" if status == "failed" else None}
+
+    def cancel_job(self, job_id):
+        with self.lock:
+            self.cancelled.append(job_id)
+            self.events.append(("cancelled", job_id))
+
+    def tail_logs(self, job_id, cursor=None, max_lines=1000, sub_job_type=None):
+        return {"entries": [{"_raw": line} for line in _JOB_LOGS[job_id[len("job-"):]]], "eof": True}
+
+    def fetch_execution_logs(self, job_id):
+        return []
+
+    def generate(self, job_id, prompts, sampling_params, routing_key=None):
+        assert self.status(job_id) == "running", f"request to {job_id} while it is {self.status(job_id)}"
+        return super().generate(job_id, prompts, sampling_params, routing_key)
+
+
+def _runner(monkeypatch, tmp_path, cluster, **args):
+    """A Runner against ``cluster``, whose perf cells answer at once: semi_p 1 ms slower than plain."""
+    from arctic_platform.inference.semi_persistence.onboarding import onboard
+
+    def cell(_make_client, job_id, concurrency, prompt_len, out_len, *_a):
+        assert cluster.status(job_id) == "running", f"perf on {job_id} while it is {cluster.status(job_id)}"
+        srv = 0.05 + 0.002 * out_len + (0.001 if job_id == "job-on_hit" else 0.0)
+        return {"concurrency": concurrency, "prompt": prompt_len, "output": out_len, "requests": 16, "errors": 0,
+                "first_error": "", "server_p50": srv, "server_p90": srv, "client_p50": srv + 0.2,
+                "client_p90": srv + 0.2, "tok_s": concurrency * out_len / srv, "zero_id_responses": 0}
+
+    monkeypatch.delenv("CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS", raising=False)
+    monkeypatch.setattr(onboard, "make_client", lambda *a, **k: cluster)
+    monkeypatch.setattr(perf, "cell", cell)
+    runner = onboard.Runner({"config": "x", "out_dir": str(tmp_path), "debug_image_tag": "dev_T",
+                             "timeout_s": "60", **args})
+    runner.poll_s = 0.01
+    return runner
+
+
+def _plain_starts_after_semi_p_is_cancelled(variant, cluster):
+    return variant != "off_default" or "job-on_hit" in cluster.cancelled
+
+
+def test_a_job_that_is_up_is_served_and_cancelled_without_waiting_for_the_others(monkeypatch, tmp_path):
+    from arctic_platform.inference.semi_persistence.onboarding import cleanup
+
+    # Waiting for every job before serving any would never finish here.
+    cluster = _Cluster(ready=_plain_starts_after_semi_p_is_cancelled)
+    runner = _runner(monkeypatch, tmp_path, cluster)
+    result = runner.run_one(_spec(tp=2, n_gpus=8))
+    assert cluster.events.index(("cancelled", "job-on_hit")) < cluster.events.index(("running", "job-off_default"))
+    assert sorted(cluster.cancelled) == sorted(f"job-{v}" for v in jobs.VARIANTS)
+    assert cleanup.open_jobs(runner.ledger) == {}
+    assert report.verdict(result) == ("PASS", []) and "not_measured" not in result
+    assert "matched" in result["perf"]["rows"][0] and result["perf"]["breakdown"]
+    assert result["variant_notes"]["on_miss"].startswith("cold-started")
+    assert result["startup"]["semi_p"]["restored"] and result["startup"]["vllm_off"]["engine_init_s"] == 137.22
+    assert all(t["running_to_cancelled_s"] >= 0 for t in result["startup"]["timelines"].values())
+
+
+def test_checks_from_stored_answers_match_sending_every_request_to_every_job(monkeypatch, tmp_path):
+    import hashlib
+
+    from arctic_platform.inference.semi_persistence.onboarding import correctness
+
+    def digest(checks):
+        return hashlib.sha256(json.dumps(checks, sort_keys=True).encode()).hexdigest()
+
+    result = _runner(monkeypatch, tmp_path, _Cluster(ready=_plain_starts_after_semi_p_is_cancelled)).run_one(
+        _spec(tp=2, n_gpus=8))
+    assert digest(result["correctness"]) == _SIMULTANEOUS_CHECKS_SHA256
+    jobs_ = {v: f"job-{v}" for v in jobs.VARIANTS}
+    replicas = {"on_hit": 8, "off_default": 8, "on_miss": 4, "off_matched": 8}
+    checks = correctness.run(_FakeClient(drift={"job-off_default"}), jobs_, "on_hit", {"on_miss", "off_matched"},
+                             replicas, 128)
+    assert digest(checks) == _SIMULTANEOUS_CHECKS_SHA256
+    greedy = checks[0]["variants"]
+    assert greedy["on_miss"]["passed"] and greedy["off_matched"]["gated"] and not greedy["off_default"]["passed"]
+
+
+def test_a_job_that_fails_to_start_drops_out_and_the_others_are_still_served(monkeypatch, tmp_path):
+    from arctic_platform.inference.semi_persistence.onboarding import cleanup
+
+    cluster = _Cluster(fail={"off_default"})
+    runner = _runner(monkeypatch, tmp_path, cluster)
+    result = runner.run_one(_spec(tp=2, n_gpus=8))
+    failed = "RuntimeError: off_default job job-off_default ended failed: no capacity"
+    assert result["error"] == failed
+    assert result["not_measured"] == {"off_default": f"perf and correctness: {failed}"}
+    assert "perf" not in result
+    assert set(result["correctness"][0]["variants"]) == {"on_miss", "off_matched"}
+    assert all(c["passed"] for c in result["correctness"] if c["required"])
+    assert sorted(cluster.cancelled) == sorted(f"job-{v}" for v in jobs.VARIANTS)
+    assert cleanup.open_jobs(runner.ledger) == {}
+    assert report.verdict(result)[0] == "FAIL" and "**not measured** for perf and correctness" in report.markdown(result)
+
+
+def test_a_failed_reference_stops_the_others_at_once(monkeypatch, tmp_path):
+    cluster = _Cluster(ready=lambda variant, _cluster: variant != "off_default", fail={"on_hit"})
+    started = time.time()
+    result = _runner(monkeypatch, tmp_path, cluster).run_one(_spec(tp=2, n_gpus=8))
+    assert time.time() - started < 10  # not timeout_s: plain is cancelled while it starts
+    assert result["error"] == "RuntimeError: on_hit job job-on_hit ended failed: no capacity"
+    assert "correctness" not in result and "perf" not in result
+    assert result["not_measured"]["off_default"] == f"perf and correctness: stopped after {result['error']}"
+    assert "job-off_default" in cluster.cancelled and ("running", "job-off_default") not in cluster.events
+
+
+def test_a_signal_cancels_the_jobs_still_held(monkeypatch, tmp_path):
+    from arctic_platform.inference.semi_persistence.onboarding import cleanup
+    from arctic_platform.inference.semi_persistence.onboarding import onboard
+
+    cluster = _Cluster(ready=lambda variant, _cluster: variant == "on_hit")
+    runner = _runner(monkeypatch, tmp_path, cluster, variants="on_hit,off_default")
+    exits = []
+    monkeypatch.setattr(onboard.os, "_exit", exits.append)
+    worker = threading.Thread(target=runner.run_one, args=(_spec(tp=2, n_gpus=8),))
+    worker.start()
+    deadline = time.time() + 10
+    while list(runner.live) != ["job-off_default"] and time.time() < deadline:
+        time.sleep(0.01)
+    assert list(runner.live) == ["job-off_default"]  # semi_p served and cancelled; plain held, starting
+    runner.abort(signal.SIGTERM, None)
+    assert exits == [128 + signal.SIGTERM]
+    assert cluster.cancelled[:2] == ["job-on_hit", "job-off_default"] and cluster.cancelled.count("job-on_hit") == 1
+    assert runner.live == {} and cleanup.open_jobs(runner.ledger) == {}
+    worker.join(10)
+    assert not worker.is_alive()
+
+
+def test_attached_jobs_are_served_and_kept(monkeypatch, tmp_path):
+    cluster = _Cluster()
+    runner = _runner(monkeypatch, tmp_path, cluster, job_on_hit="job-on_hit", job_off_default="job-off_default")
+    result = runner.run_one(_spec(tp=2, n_gpus=8))
+    assert cluster.cancelled == [] and runner.live == {}
+    assert report.verdict(result)[0] == "PASS" and result["perf"] and result["correctness"]
+
+
+def test_perf_compares_the_same_whichever_job_is_measured_first(monkeypatch):
+    calls = []
+
+    def cell(_make_client, job, concurrency, prompt_len, out_len, _per_thread, salt, *_a):
+        calls.append(job)
+        # semi_p's first measurement of the loaded cell is over the latency limit; its repeat is not.
+        srv = (0.05 + 0.002 * out_len) * (1.3 if (job, concurrency, salt) == ("on", 8, 100) else 1.0)
+        return {"concurrency": concurrency, "prompt": prompt_len, "output": out_len, "requests": 16, "errors": 0,
+                "first_error": "", "server_p50": srv, "server_p90": srv, "client_p50": srv + 0.2,
+                "client_p90": srv + 0.2, "tok_s": concurrency * out_len / srv, "zero_id_responses": 0}
+
+    monkeypatch.setattr(perf, "cell", cell)
+    settings = {"shapes": [[16, 16]], "concurrency": [1, 8]}
+    combined = []
+    for order in (("off", "on"), ("on", "off")):
+        grids, calls[:] = {}, []
+        measured = {side: perf.measure(lambda: None, side, 1, 128, settings, None, side, grids) for side in order}
+        combined.append(perf.combine(measured, 1, settings))
+        # The first job measures every repeat (2 cells x 3, plus 3 latency cells); the second
+        # only the one repeat the comparison uses.
+        assert (calls.count(order[0]), calls.count(order[1])) == (9, 6)
+    assert combined[0] == combined[1]
+    assert [m["on"] for m in combined[0]["rows"][1]["remeasured"]] == pytest.approx([0.082 * 1.3, 0.082])
 
 
 def test_perf_breakdown_splits_settings_from_semi_p():
@@ -410,9 +627,11 @@ def _scripted_perf(monkeypatch, on_grid_p50s):
     def cell(_make_client, job, concurrency, prompt_len, out_len, *_a):
         if concurrency == 1:
             srv = 0.05 + 0.004 * (out_len - 1)
-        else:
+        elif job == "on":
             salts.append(_a[1])
-            srv = next(on_p50s) if job == "on" else 0.200
+            srv = next(on_p50s)
+        else:
+            srv = 0.200
         return {"concurrency": concurrency, "prompt": prompt_len, "output": out_len, "requests": 16,
                 "errors": 0, "first_error": "", "server_p50": srv, "server_p90": srv, "client_p50": srv + 0.2,
                 "client_p90": srv + 0.2, "tok_s": concurrency * out_len / srv, "zero_id_responses": 0}

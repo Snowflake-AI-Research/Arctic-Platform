@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass
@@ -213,13 +214,14 @@ def normalize_status(status: Any) -> str:
 
 @dataclass
 class JobTracker:
-    """A job's id and the wall-clock time each status was first seen."""
+    """A job's id, the wall-clock time each status was first seen, and when the suite cancelled it."""
 
     label: str
     job_id: str
     submitted_at: float
     transitions: dict = field(default_factory=dict)
     reason: str = ""
+    cancelled_at: float | None = None
 
     @property
     def status(self) -> str:
@@ -233,27 +235,28 @@ class JobTracker:
         return status
 
 
-def wait_running(client: Any, trackers: list[JobTracker], timeout_s: float, interval_s: float = 5.0) -> None:
-    """Poll every tracker until all are running; raise if one fails or time runs out."""
-    deadline = time.time() + timeout_s
-    pending = list(trackers)
-    while pending:
-        for tracker in list(pending):
-            status = tracker.poll(client)
-            if status == "running":
-                logger.info("%s job %s is running", tracker.label, tracker.job_id)
-                pending.remove(tracker)
-            elif status in TERMINAL:
-                raise RuntimeError(f"{tracker.label} job {tracker.job_id} ended {status}: {tracker.reason}")
-        if pending:
-            if time.time() > deadline:
-                names = ", ".join(f"{t.label}={t.status}" for t in pending)
-                raise TimeoutError(f"jobs not running after {timeout_s:.0f}s ({names})")
-            time.sleep(interval_s)
+def wait_until_running(client: Any, tracker: JobTracker, deadline: float, interval_s: float = 5.0,
+                       stop: threading.Event | None = None) -> bool:
+    """Poll one tracker until it is running (True) or ``stop`` is set (False);
+    raise if it ends or is not running by ``deadline`` (a ``time.time()``)."""
+    stop = stop or threading.Event()
+    while True:
+        status = tracker.poll(client)
+        if status == "running":
+            logger.info("%s job %s is running", tracker.label, tracker.job_id)
+            return True
+        if status in TERMINAL:
+            raise RuntimeError(f"{tracker.label} job {tracker.job_id} ended {status}: {tracker.reason}")
+        if time.time() > deadline:
+            raise TimeoutError(f"{tracker.label} job {tracker.job_id} not running "
+                               f"{time.time() - tracker.submitted_at:.0f}s after submission ({status})")
+        if stop.wait(interval_s):
+            return False
 
 
 def timeline(tracker: JobTracker) -> dict:
-    """Seconds from submission to each status, and the placement/start-up split."""
+    """Seconds from submission to each status, the placement/start-up split,
+    and how long the job ran before the suite cancelled it."""
     out = {status: round(t - tracker.submitted_at, 1) for status, t in tracker.transitions.items()}
     running = tracker.transitions.get("running")
     initializing = tracker.transitions.get("initializing")
@@ -261,4 +264,6 @@ def timeline(tracker: JobTracker) -> dict:
         out["submit_to_running_s"] = round(running - tracker.submitted_at, 1)
         if initializing is not None:
             out["initializing_to_running_s"] = round(running - initializing, 1)
+        if tracker.cancelled_at is not None:
+            out["running_to_cancelled_s"] = round(tracker.cancelled_at - running, 1)
     return out

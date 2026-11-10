@@ -165,9 +165,12 @@ def markdown(result: dict) -> str:
     ]
     jobs = result.get("jobs") or {"on_hit": result.get("on_job_id"), "off_default": result.get("off_job_id")}
     notes = result.get("variant_notes") or {}
+    missing = result.get("not_measured") or {}
     lines += ["| job | id | role |", "|---|---|---|"]
     for variant, job_id in jobs.items():
         role = "reference" if variant == "on_hit" else notes.get(variant, "")
+        if variant in missing:
+            role = "; ".join(filter(None, [role, f"**not measured** for {missing[variant]}"]))
         lines.append(f"| {VARIANT_LABELS.get(variant, variant)} | `{job_id}` | {role} |")
     for variant, why in (result.get("variants_skipped") or {}).items():
         lines.append(f"| {VARIANT_LABELS.get(variant, variant)} | not run | {why} |")
