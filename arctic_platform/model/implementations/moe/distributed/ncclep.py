@@ -47,6 +47,7 @@ class _AllToAll(torch.autograd.Function):
 @dataclass
 class _PendingDispatchState:
     hidden_states: torch.Tensor
+    hidden_dtype: torch.dtype
     indices: torch.Tensor
     scores: torch.Tensor
     counts: torch.Tensor
@@ -92,13 +93,15 @@ def dispatch_tokens_async(
     belongs = valid[tokens] & (destinations[tokens] == ranks[:, None])
     indices = (selected_experts_indices[tokens] % local_experts).masked_fill(~belongs, -1)
     scores = top_scores[tokens].masked_fill(~belongs, 0)
-    received_hidden = _AllToAll.apply(gather_token_rows(hidden_states, tokens), send_splits, recv_splits, group)
+    # Dispatch backward must retain FP32 partial gradients between owners.
+    received_hidden = _AllToAll.apply(gather_token_rows(hidden_states.float(), tokens), send_splits, recv_splits, group)
     received_indices = indices.new_empty((sum(recv_splits), indices.shape[1]))
     dist.all_to_all_single(received_indices, indices.contiguous(), recv_splits, send_splits, group=group)
     received_scores = _AllToAll.apply(scores, send_splits, recv_splits, group)
     expert_counts = torch.bincount(received_indices[received_indices >= 0], minlength=local_experts).int()
     return _PendingDispatchState(
         received_hidden,
+        hidden_states.dtype,
         received_indices,
         received_scores,
         expert_counts,
@@ -116,7 +119,7 @@ def finalize_dispatch_tokens(pending: _PendingDispatchState) -> tuple[torch.Tens
     order = torch.argsort(pending.indices[mask], stable=True)
     tokens = torch.arange(len(pending.hidden_states), device=pending.hidden_states.device)
     permuted_indices = tokens.repeat_interleave(mask.sum(dim=1))[order]
-    hidden = gather_token_rows(pending.hidden_states, permuted_indices)
+    hidden = gather_token_rows(pending.hidden_states, permuted_indices).to(pending.hidden_dtype)
     scores = pending.scores[mask][order]
     if pending.score_before_experts:
         hidden = apply_routing_weights(hidden, scores)
@@ -130,7 +133,8 @@ def combine_tokens(hidden_states: torch.Tensor, state: _DispatchState, replay=No
         raise NotImplementedError("NCCL dispatch does not support combine replay")
     if state.permuted_scores is not None:
         hidden_states = apply_routing_weights(hidden_states, state.permuted_scores)
-    received = sum_rows_by_token(hidden_states, state.permuted_indices, state.num_recv_tokens)
+    # Round only after the cross-owner fold.
+    received = sum_rows_by_token(hidden_states.float(), state.permuted_indices, state.num_recv_tokens)
     pending = state.pending
     if torch.is_grad_enabled():
         # Empty expert outputs still participate in both backward collectives.
@@ -139,7 +143,7 @@ def combine_tokens(hidden_states: torch.Tensor, state: _DispatchState, replay=No
         )
         received = received + dependency
     returned = _AllToAll.apply(received, pending.recv_splits, pending.send_splits, pending.group)
-    return sum_rows_by_token(returned, pending.sent_token_ids, pending.num_input_tokens)
+    return sum_rows_by_token(returned, pending.sent_token_ids, pending.num_input_tokens).to(hidden_states.dtype)
 
 
 def sync_combine() -> None:

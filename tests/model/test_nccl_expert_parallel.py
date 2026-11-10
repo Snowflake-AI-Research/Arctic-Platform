@@ -158,6 +158,36 @@ def worker(rank, port):
         dist.destroy_process_group()
 
 
+def _multiowner_combine_worker(rank, port):
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=120),
+    )
+    try:
+        hidden = torch.ones(16, 4096, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        indices = torch.arange(4, device="cuda").expand(16, -1).clone()
+        scores = torch.ones(16, 4, device="cuda", requires_grad=True)
+        pending = nccl_ep.dispatch_tokens_async(
+            hidden, indices, scores, 4, dist.group.WORLD, score_before_experts=False
+        )
+        received, counts, state = nccl_ep.finalize_dispatch_tokens(pending)
+        scales = torch.tensor([1.0 if rank == 0 else -1.0, 1 / 256], device="cuda", dtype=torch.bfloat16)
+        rows = received * scales.repeat_interleave(counts.long())[:, None]
+        output = nccl_ep.combine_tokens(rows, state)
+        expected = torch.full_like(hidden, 1 / 128)
+        torch_assert_close(output, expected, atol=0, rtol=0)
+        loss = output.float().square().sum()
+        torch_assert_close(loss, expected.float().square().sum(), atol=0, rtol=0)
+        loss.backward()
+        torch_assert_close(hidden.grad, torch.full_like(hidden, 1 / 8192), atol=0, rtol=0)
+    finally:
+        dist.destroy_process_group()
+
+
 def _multidestination_gradient_worker(rank, port):
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -191,6 +221,13 @@ def _multidestination_gradient_worker(rank, port):
 
 @pytest.mark.timeout(300)
 class TestNcclExpertParallel(TestCasePlus):
+    @require_torch_gpu
+    def test_multiowner_bf16_combine_accumulates_in_fp32(self):
+        if torch.cuda.device_count() < 2:
+            self.skipTest("requires two GPUs")
+        port = reserve_free_port(get_unique_port_number() + 1, span=7)
+        torch.multiprocessing.spawn(_multiowner_combine_worker, args=(port,), nprocs=2, join=True)
+
     @require_torch_gpu
     def test_dispatch_combine_and_gradients(self):
         if torch.cuda.device_count() < 2:
