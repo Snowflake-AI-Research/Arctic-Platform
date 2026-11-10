@@ -69,6 +69,7 @@ from .media import IMAGE_MEDIA
 from .media import MEDIA_KEYS
 from .media import MEDIA_KINDS
 from .media import VIDEO_MEDIA
+from .media import MediaBatchError
 from .media import MediaKind
 from .media import MediaStraddleError
 from .media import check_media
@@ -110,6 +111,7 @@ __all__ = [
     "IMAGE_TOKEN_TYPE",
     "MEDIA_KEYS",
     "MEDIA_KINDS",
+    "MediaBatchError",
     "MediaKind",
     "MediaStraddleError",
     "MediaSpec",
