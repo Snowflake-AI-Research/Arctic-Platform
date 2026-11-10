@@ -192,7 +192,7 @@ def onboarding_node_prerequisites(request: dict) -> dict:
     native_inference = modules.get("arctic_platform.inference.utils")
     if native_inference is not None:
         try:
-            native_inference.require_supported_vllm_version(feature="DSS correctness sampling")
+            native_inference.require_supported_vllm_version(feature="Arctic Platform correctness sampling")
         except Exception as exc:
             errors.append(f"native sampling runtime: {type(exc).__name__}: {exc}")
     torch = modules.get("torch")

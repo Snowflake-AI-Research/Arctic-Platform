@@ -41,10 +41,10 @@ from typing import Optional
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
-from arctic_platform.correctness.harness.gateway import build_payload
 from arctic_platform.correctness.harness.gateway import (
-    dss_driver_copy_checkpoint_peft_adapter as copy_checkpoint_peft_adapter,
+    ap_driver_copy_checkpoint_peft_adapter as copy_checkpoint_peft_adapter,
 )
+from arctic_platform.correctness.harness.gateway import build_payload
 from arctic_platform.correctness.harness.gateway import fwd_bwd_step
 from arctic_platform.correctness.harness.gateway import gateway
 from arctic_platform.correctness.harness.gateway import pack
@@ -264,7 +264,7 @@ def run_reference(
     return json.loads(out_path.read_text())
 
 
-def materialize_dss_peft_adapter(
+def materialize_ap_peft_adapter(
     cfg: LoadedConfig,
     model_path: str,
     workdir: Path,
@@ -605,7 +605,7 @@ def execute(
         ):
             raise ValueError("local optimizer fixture must match the frozen optimizer reference model")
     target_model = published_fixture["model_name"] if published_fixture is not None else reference_model_path
-    tmp = workdir if workdir is not None else correctness_workdir("dss-correctness-")
+    tmp = workdir if workdir is not None else correctness_workdir("ap-correctness-")
     tmp.mkdir(parents=True, exist_ok=True)
     attn_impl = attn or cfg.attention_implementation
 
@@ -625,7 +625,7 @@ def execute(
                 max_seq_len=definition.max_seq_len,
                 total_tokens=batch.total_tokens,
                 active_tokens=batch.active_tokens,
-                dss_microbatches=definition.microbatches(
+                ap_microbatches=definition.microbatches(
                     correctness_microbatch_tokens(cfg.max_tokens_per_mb), cfg.dp_size
                 ),
                 pad_fraction=batch.pad_fraction,

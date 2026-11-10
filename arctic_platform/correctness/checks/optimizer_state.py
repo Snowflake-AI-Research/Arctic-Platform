@@ -31,7 +31,7 @@ from arctic_platform.correctness.harness.optimizer import COMPARISON_STATE_KEYS
 from arctic_platform.correctness.harness.optimizer import OPTIMIZER_NORM_CRITERION
 from arctic_platform.correctness.harness.optimizer import STATE_KEYS
 from arctic_platform.correctness.harness.optimizer import CanonicalTensorGroup
-from arctic_platform.correctness.harness.optimizer import canonical_dss_tensor_groups
+from arctic_platform.correctness.harness.optimizer import canonical_ap_tensor_groups
 from arctic_platform.correctness.harness.optimizer import canonical_participation
 from arctic_platform.correctness.harness.optimizer import compare_participation
 from arctic_platform.correctness.harness.optimizer import normalize
@@ -52,7 +52,7 @@ class StateDelta:
 @dataclass(frozen=True)
 class OptimizerComparison:
     deltas: List[StateDelta]
-    only_dss: List[str]
+    only_ap: List[str]
     only_reference: List[str]
 
     @property
@@ -182,7 +182,7 @@ def summarize_optimizer_artifacts(
     if any(not name for name in entries):
         raise ValueError("optimizer norm artifacts have an empty canonical parameter name")
     groups = (
-        canonical_dss_tensor_groups(entries)
+        canonical_ap_tensor_groups(entries)
         if backend == "ap"
         else {name: CanonicalTensorGroup((name,)) for name in entries}
     )
@@ -238,29 +238,29 @@ def summarize_optimizer_artifacts(
     return summary
 
 
-def compare_optimizer_norms(dss_summary: dict, reference_summary: dict) -> OptimizerComparison:
+def compare_optimizer_norms(ap_summary: dict, reference_summary: dict) -> OptimizerComparison:
     """Compare scalar norms by absolute difference, including zero and near-zero values without exemptions.
 
     Names and shapes must align exactly; even unmatched zero vision tensors remain coverage failures. All summaries
     must carry the versioned step-one state coverage metadata, and every norm must be finite and nonnegative.
     """
-    dss = _validate_optimizer_norm_summary(dss_summary)
+    ap = _validate_optimizer_norm_summary(ap_summary)
     reference = _validate_optimizer_norm_summary(reference_summary)
-    validate_optimizer_participation(dss_summary, backend="ap")
+    validate_optimizer_participation(ap_summary, backend="ap")
     validate_optimizer_participation(reference_summary, backend="reference")
-    if dss_summary.get("participation") is not None or reference_summary.get("participation") is not None:
-        compare_participation(dss_summary.get("participation"), reference_summary.get("participation"))
+    if ap_summary.get("participation") is not None or reference_summary.get("participation") is not None:
+        compare_participation(ap_summary.get("participation"), reference_summary.get("participation"))
     deltas = []
-    for name in sorted(set(dss) & set(reference)):
-        if dss[name]["shape"] != reference[name]["shape"]:
+    for name in sorted(set(ap) & set(reference)):
+        if ap[name]["shape"] != reference[name]["shape"]:
             raise ValueError(
-                f"optimizer norm shape mismatch for {name}: {dss[name]['shape']} != {reference[name]['shape']}"
+                f"optimizer norm shape mismatch for {name}: {ap[name]['shape']} != {reference[name]['shape']}"
             )
         for state in COMPARISON_STATE_KEYS:
-            delta = abs(dss[name][state] - reference[name][state])
+            delta = abs(ap[name][state] - reference[name][state])
             deltas.append(StateDelta(name=name, state=state, delta_norm=float(delta)))
     return OptimizerComparison(
-        deltas=deltas, only_dss=sorted(set(dss) - set(reference)), only_reference=sorted(set(reference) - set(dss))
+        deltas=deltas, only_ap=sorted(set(ap) - set(reference)), only_reference=sorted(set(reference) - set(ap))
     )
 
 
@@ -317,39 +317,39 @@ def _load_tensor_group(
 
 
 def compare_optimizer_artifacts(
-    dss_manifest: Path, reference_manifest: Path, *, optimizer_config: dict, learning_rate: float
+    ap_manifest: Path, reference_manifest: Path, *, optimizer_config: dict, learning_rate: float
 ) -> OptimizerComparison:
     """Return moment deltas and the update delta left after each engine's own moments are accounted for."""
     import torch
 
-    dss_step, dss = _load_manifest(Path(dss_manifest))
+    ap_step, ap = _load_manifest(Path(ap_manifest))
     reference_step, reference = _load_manifest(Path(reference_manifest))
-    if dss_step != reference_step or dss_step != 1:
+    if ap_step != reference_step or ap_step != 1:
         raise ValueError(
-            f"optimizer artifact step mismatch: Arctic Platform={dss_step}, reference={reference_step}, expected=1"
+            f"optimizer artifact step mismatch: Arctic Platform={ap_step}, reference={reference_step}, expected=1"
         )
 
-    dss_groups = canonical_dss_tensor_groups(dss)
-    only_dss_keys = set(dss_groups) - set(reference)
-    shared = sorted(set(dss_groups) & set(reference))
+    ap_groups = canonical_ap_tensor_groups(ap)
+    only_ap_keys = set(ap_groups) - set(reference)
+    shared = sorted(set(ap_groups) & set(reference))
     deltas = []
     comparison_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     for name in shared:
-        dss_tensors = _load_tensor_group(dss, dss_groups[name], comparison_device)
+        ap_tensors = _load_tensor_group(ap, ap_groups[name], comparison_device)
         reference_tensors = torch.load(reference[name], map_location="cpu", weights_only=True)
         reference_values = {}
         for state in STATE_KEYS:
             if state not in reference_tensors:
                 raise ValueError(f"optimizer artifact for {name} is missing {state}")
             reference_values[state] = reference_tensors[state].to(device=comparison_device, dtype=torch.float32)
-            if dss_tensors[state].shape != reference_values[state].shape:
+            if ap_tensors[state].shape != reference_values[state].shape:
                 raise ValueError(
                     f"optimizer artifact shape mismatch for {name}::{state}: "
-                    f"{tuple(dss_tensors[state].shape)} != {tuple(reference_values[state].shape)}"
+                    f"{tuple(ap_tensors[state].shape)} != {tuple(reference_values[state].shape)}"
                 )
-        dss_values = _comparison_tensors(
-            dss_tensors,
-            step=dss_step,
+        ap_values = _comparison_tensors(
+            ap_tensors,
+            step=ap_step,
             optimizer_config=optimizer_config,
             learning_rate=learning_rate,
             backend="ap",
@@ -362,13 +362,13 @@ def compare_optimizer_artifacts(
             backend="reference",
         )
         for state in COMPARISON_STATE_KEYS:
-            delta_norm = torch.linalg.vector_norm(dss_values[state] - reference_values[state])
+            delta_norm = torch.linalg.vector_norm(ap_values[state] - reference_values[state])
             deltas.append(StateDelta(name=name, state=state, delta_norm=float(delta_norm.cpu())))
-        del dss_tensors, dss_values, reference_tensors, reference_values
+        del ap_tensors, ap_values, reference_tensors, reference_values
     return OptimizerComparison(
         deltas=deltas,
-        only_dss=sorted(original for key in only_dss_keys for original in dss_groups[key].originals),
-        only_reference=sorted(set(reference) - set(dss_groups)),
+        only_ap=sorted(original for key in only_ap_keys for original in ap_groups[key].originals),
+        only_reference=sorted(set(reference) - set(ap_groups)),
     )
 
 

@@ -70,7 +70,7 @@ from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import parse_hostfile
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 
-# Dss Driver
+# Arctic Platform Driver
 
 
 @dataclass
@@ -2297,7 +2297,7 @@ if __name__ == "__main__":
     main()
 
 
-def dss_driver_copy_checkpoint_peft_adapter(checkpoint_root: Path, destination: Path) -> Path:
+def ap_driver_copy_checkpoint_peft_adapter(checkpoint_root: Path, destination: Path) -> Path:
     """Copy the PEFT pack from a weights-only checkpoint when the exporter retained one."""
     destination = require_data_fast_path(destination, label="PEFT adapter output")
     from safetensors import safe_open

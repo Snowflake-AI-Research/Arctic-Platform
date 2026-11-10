@@ -124,7 +124,7 @@ def owner_split_execution(cfg) -> dict:
     hostfile = _allocation_hostfile()
     if hostfile is None:
         raise ValueError("native optimizer owner split requires the admitted allocation hostfile")
-    workdir = correctness_workdir("dss-correctness-")
+    workdir = correctness_workdir("ap-correctness-")
     request = owner_split_request(cfg, checkpoint_parent=workdir, hostfile=hostfile)
     return {
         "workdir": workdir,

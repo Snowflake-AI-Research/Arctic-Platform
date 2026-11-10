@@ -317,18 +317,20 @@ def arm_verdict(result: TestResult, arm: Optional[ArmSpec], timing: Optional[dic
         lines.append(f"    INAPPLICABLE  {result.reason}")
         return "\n".join(lines)
 
-    if "reference_loss" in m and "dss_loss" in m:
+    # Historical results remain readable; new AP metrics take precedence.
+    ap_loss = m.get("ap_loss", m.get("dss_loss"))
+    if "reference_loss" in m and ap_loss is not None:
         lines.append(
-            f"    loss          reference {m['reference_loss']:<12.6f} Arctic Platform {m['dss_loss']:<12.6f} "
+            f"    loss          reference {m['reference_loss']:<12.6f} Arctic Platform {ap_loss:<12.6f} "
             f"delta {m.get('loss_delta', 0.0):.3e}"
         )
     elif "loss_delta" in m:
         lines.append(f"    loss          delta {m['loss_delta']:.3e}")
 
-    observed = m.get("dss_model_calls_observed")
+    observed = m.get("ap_model_calls_observed", m.get("dss_model_calls_observed"))
     ref_calls = m.get("reference_microbatches")
     if observed is not None or ref_calls is not None:
-        predicted = m.get("dss_microbatches_predicted")
+        predicted = m.get("ap_microbatches_predicted", m.get("dss_microbatches_predicted"))
         note = (
             ""
             if observed is None or predicted is None or int(predicted) == int(observed)
@@ -340,7 +342,7 @@ def arm_verdict(result: TestResult, arm: Optional[ArmSpec], timing: Optional[dic
 
     compared = int(m.get("tensors_compared", 0))
     if compared:
-        unmatched = int(m.get("unmatched_dss", 0)) + int(m.get("unmatched_reference", 0))
+        unmatched = int(m.get("unmatched_ap", m.get("unmatched_dss", 0))) + int(m.get("unmatched_reference", 0))
         over_stated = int(m.get("tensors_over_stated_criterion", 0))
         label = 43  # one column for every sub-row, so the values below form a single readable column
         tail = f", {unmatched} unmatched" if unmatched else ""
@@ -562,7 +564,7 @@ def to_markdown(
                     f"{a.total_tokens:,}",
                     f"{a.active_tokens:,}",
                     f"{a.pad_fraction:.1%}",
-                    f"{a.dss_microbatches}",
+                    f"{a.ap_microbatches}",
                 ]
                 for a in spec.arms
             ],
