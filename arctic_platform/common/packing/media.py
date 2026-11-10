@@ -33,11 +33,11 @@ An image's tokens are one contiguous run. A video's are ``t`` frame runs of ``h 
 in order, with only text between them: the Qwen3-VL processor puts each frame's timestamp text before it. An
 item's span runs from its first token to its last, text between frames included.
 
-``token_shard`` gives each window the media whose span overlaps it, whole: a vision tower encodes complete
-images and videos. Each window also gets ``image_window_token_ranges`` (``[images, 2]``): the ``[first, end)``
-slice of that image's merged embeddings whose tokens fall inside the window, which is what the window scatters
-into its own image-token slots. A window that holds only text between two of a video's frames still gets the
-video, with an empty range.
+``token_shard`` gives each window the media whose span sits inside it, whole: a vision tower encodes complete
+images and videos, and the window holds all of the item's placeholder tokens to scatter them into. An item whose
+span crosses a window boundary is refused, because each window would get all of its pixels but only part of its
+placeholder tokens. A caller avoids that by moving the boundary off the item: pad or reorder the text before it
+so that the item starts in the window it ends in.
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ from typing import Dict
 from typing import List
 from typing import Mapping
 from typing import Optional
+from typing import Sequence
 from typing import Tuple
 
 import torch
@@ -63,7 +64,6 @@ class MediaKind:
     values_key: str
     grid_key: str
     row_ids_key: str
-    window_ranges_key: str
     token_type: int
 
     @property
@@ -71,14 +71,10 @@ class MediaKind:
         return (self.values_key, self.grid_key, self.row_ids_key)
 
 
-IMAGE_MEDIA = MediaKind(
-    "image", "pixel_values", "image_grid_thw", "image_row_ids", "image_window_token_ranges", IMAGE_TOKEN_TYPE
-)
-VIDEO_MEDIA = MediaKind(
-    "video", "pixel_values_videos", "video_grid_thw", "video_row_ids", "video_window_token_ranges", VIDEO_TOKEN_TYPE
-)
+IMAGE_MEDIA = MediaKind("image", "pixel_values", "image_grid_thw", "image_row_ids", IMAGE_TOKEN_TYPE)
+VIDEO_MEDIA = MediaKind("video", "pixel_values_videos", "video_grid_thw", "video_row_ids", VIDEO_TOKEN_TYPE)
 MEDIA_KINDS = (IMAGE_MEDIA, VIDEO_MEDIA)
-MEDIA_KEYS = frozenset(key for kind in MEDIA_KINDS for key in (*kind.keys, kind.window_ranges_key))
+MEDIA_KEYS = frozenset(key for kind in MEDIA_KINDS for key in kind.keys)
 
 
 def split_media(batch: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -270,8 +266,15 @@ def window_media(
     window: Tuple[int, int],
     *,
     spatial_merge_size: Optional[int],
+    boundaries: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
-    """The media one ``[start, end)`` token window needs: every item whose span overlaps it, whole, with its range.
+    """The media one ``[start, end)`` token window needs: every item whose span sits inside it, whole.
+
+    An item whose span straddles a window boundary -- some of its tokens before it and some at or after it -- is
+    refused with a ValueError naming the item, its span and the boundary. ``boundaries`` are the token offsets
+    where the call's windows meet, so that every window of one call refuses the same straddle; they default to
+    this window's own ``start`` and ``end``. To avoid a straddle, move the boundary off the item: pad or reorder
+    the text before the item so it lands wholly in one window.
 
     A kind with no item in the window keeps its keys, with zero items, so every window of a call carries the
     same set of leaves.
@@ -284,15 +287,20 @@ def window_media(
     if mm_token_type_ids is None:
         raise ValueError("splitting a call that carries media needs its packed mm_token_type_ids")
     window_start, window_end = window
+    cuts = sorted({window_start, window_end} if boundaries is None else {int(cut) for cut in boundaries})
     result: Dict[str, Any] = dict(media)
     for kind in kinds:
         values, grid, row_ids = (media[key] for key in kind.keys)
         spans = media_token_spans(media, kind, mm_token_type_ids, cu_seqlens, spatial_merge_size)
-        is_kind = (mm_token_type_ids.reshape(-1) == kind.token_type).to(torch.long).cpu()
-        kind_tokens_before = torch.cat([torch.zeros(1, dtype=torch.long), torch.cumsum(is_kind, dim=0)])
-        overlap_start = spans[:, 0].clamp(min=window_start)
-        overlap_end = spans[:, 1].clamp(max=window_end)
-        inside = torch.nonzero(overlap_end > overlap_start).flatten()
+        for item, (start, end) in enumerate(spans.tolist()):
+            for cut in cuts:
+                if start < cut < end:
+                    raise ValueError(
+                        f"{kind.name} {item}'s tokens [{start}, {end}) straddle the window boundary at token {cut}; "
+                        "each window would get all its pixels but only part of its tokens. Move the boundary off "
+                        "the item: pad or reorder the text before it so it sits inside one window"
+                    )
+        inside = torch.nonzero((spans[:, 0] >= window_start) & (spans[:, 1] <= window_end)).flatten()
         patch_counts = _patch_counts(grid)
         patch_starts = torch.cumsum(patch_counts, dim=0) - patch_counts
         patch_index = (
@@ -303,11 +311,4 @@ def window_media(
         result[kind.values_key] = values.index_select(0, patch_index.to(values.device))
         result[kind.grid_key] = grid.index_select(0, inside.to(grid.device))
         result[kind.row_ids_key] = row_ids.index_select(0, inside.to(row_ids.device))
-        # Embedding indices, not token offsets: an item's embeddings before a token are its kind tokens before
-        # it, which skips the text between a video's frames.
-        before = kind_tokens_before[spans[inside, 0]]
-        result[kind.window_ranges_key] = torch.stack(
-            [kind_tokens_before[overlap_start[inside]] - before, kind_tokens_before[overlap_end[inside]] - before],
-            dim=1,
-        )
     return result
