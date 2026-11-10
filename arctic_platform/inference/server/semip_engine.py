@@ -1269,6 +1269,11 @@ def _check_env_files(meta: dict[str, Any], model_dir: str, *,
 
     scope = "under" if under_model_dir else "outside"
     if missing:
+        # /dev/shm segments are hundreds of the absences on any TP image, and the
+        # dump unlinks them so CRIU carries them as ghosts; anything else is the
+        # likelier cause of a "Can't open file", so it goes first in the
+        # truncated report.
+        missing.sort(key=lambda p: p.startswith("/dev/shm/"))
         logger.warning(
             "semi_p: %d of %d mapping(s) %s %s are absent (%s); not fatal on "
             "its own -- CRIU re-validates size, and a ghosted or recreated "
@@ -1284,7 +1289,7 @@ def _check_env_files(meta: dict[str, Any], model_dir: str, *,
             " ..." if len(mismatched) > _ENV_FILES_REPORT else "")
     else:
         logger.info("semi_p: %d mapping(s) %s %s match the image",
-                    checked, scope, model_dir)
+                    checked - len(missing), scope, model_dir)
     return mismatched
 
 

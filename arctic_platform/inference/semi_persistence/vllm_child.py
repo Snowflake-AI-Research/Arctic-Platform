@@ -1149,8 +1149,43 @@ def _semip_load_weights(worker, weights_dir, io_workers=None):
 # ---------------------------------------------------------------------------
 
 
-_COMPILE_CACHE_ENVS = ("TRITON_CACHE_DIR", "VLLM_CACHE_ROOT",
-                       "TORCHINDUCTOR_CACHE_DIR", "FLASHINFER_WORKSPACE_BASE")
+# (env var, directory under <model_dir>/compilation). Every library here loads
+# what it compiled by path -- dlopen() of a .so, cuModuleLoad() of a .cubin --
+# so CRIU records the file and needs it at restore. Defaults are node-local:
+# ~/.triton, ~/.cache/vllm, /tmp/torchinductor_*, ~/.cache/flashinfer,
+# ~/.humming/cache, ~/.tilelang/cache, ~/.cache/tvm-ffi,
+# ~/.cache/torch_extensions, /tmp/<user>/quack_cache.
+#
+# DG_JIT_CACHE_DIR is where vLLM points DeepGEMM anyway (VLLM_CACHE_ROOT/
+# deep_gemm), but only once its lazy init runs; pinning it here covers a
+# DeepGEMM JIT that happens before that.
+_COMPILE_CACHE_DIRS = (
+    ("TRITON_CACHE_DIR", "triton"),
+    ("VLLM_CACHE_ROOT", "vllm"),
+    ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+    ("FLASHINFER_WORKSPACE_BASE", "flashinfer"),
+    ("DG_JIT_CACHE_DIR", os.path.join("vllm", "deep_gemm")),
+    ("HUMMING_CACHE_DIR", "humming"),
+    ("TILELANG_CACHE_DIR", "tilelang"),
+    ("TVM_FFI_CACHE_DIR", "tvm-ffi"),
+    ("TORCH_EXTENSIONS_DIR", "torch_extensions"),
+    ("QUACK_CACHE_DIR", "quack"),
+)
+_COMPILE_CACHE_ENVS = tuple(env for env, _ in _COMPILE_CACHE_DIRS)
+
+
+def _pin_compile_caches(model_dir):
+    """Point every JIT cache at ``<model_dir>/compilation/<name>``.
+
+    Has to run before vLLM is imported: FlashInfer resolves its root at import
+    and humming memoizes its cache dir on first use.
+    """
+    _compile_root = os.path.join(model_dir, "compilation")
+    for env, sub in _COMPILE_CACHE_DIRS:
+        cache_dir = os.path.join(_compile_root, sub)
+        os.environ[env] = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+    return _compile_root
 
 
 def _compile_cache_fingerprint(budget_s=2.0):
@@ -3629,12 +3664,11 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
         # the config is known.
         os.environ["SEMIP_MULTINODE_IFNAME"] = _mn_ifname
 
-    # JIT/compile caches (Triton, vLLM torch.compile, torch inductor,
-    # FlashInfer) all produce .so's that get dlopen()'d into the process.
-    # CRIU records those mappings by absolute path and requires the files
-    # to exist at restore; their defaults live in node-local dirs
-    # ($HOME/.triton, ~/.cache/vllm, /tmp/torchinductor_*), so on another
-    # node they are absent and restore fails with "Can't open file ...".
+    # JIT/compile caches (_COMPILE_CACHE_DIRS) all produce files that get
+    # mapped into the process. CRIU records those mappings by absolute path
+    # and requires the files to exist at restore; their defaults live in
+    # node-local dirs, so on another node they are absent and restore fails
+    # with "Can't open file ...".
     #
     # When the Instance supplies a model_dir, the cache lives at
     # <model_dir>/compilation -- embedded next to the CRIU image so the
@@ -3647,18 +3681,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
     # Must be set before vLLM (and FlashInfer, whose env module resolves
     # these at import) is imported.
     if model_dir:
-        _compile_root = os.path.join(model_dir, "compilation")
-        os.environ["TRITON_CACHE_DIR"] = os.path.join(_compile_root, "triton")
-        os.environ["VLLM_CACHE_ROOT"] = os.path.join(_compile_root, "vllm")
-        os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(
-            _compile_root, "inductor")
-        os.environ["FLASHINFER_WORKSPACE_BASE"] = os.path.join(
-            _compile_root, "flashinfer")
-        for _cache_dir in (os.environ["TRITON_CACHE_DIR"],
-                           os.environ["VLLM_CACHE_ROOT"],
-                           os.environ["TORCHINDUCTOR_CACHE_DIR"],
-                           os.environ["FLASHINFER_WORKSPACE_BASE"]):
-            os.makedirs(_cache_dir, exist_ok=True)
+        _pin_compile_caches(model_dir)
 
     # vLLM's own lines carry the replica tag too, since several replicas share
     # one pod log. Before vLLM is imported: its logger formats this in once.
@@ -4377,10 +4400,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     # Compile-cache roots: CRIU bakes the resulting .so
                     # paths into the image, so a user override here would
                     # make the image unrestorable.
-                    "TRITON_CACHE_DIR",
-                    "VLLM_CACHE_ROOT",
-                    "TORCHINDUCTOR_CACHE_DIR",
-                    "FLASHINFER_WORKSPACE_BASE",
+                    *_COMPILE_CACHE_ENVS,
                 }
                 for k, v in (vllm_config.pop("_env", None) or {}).items():
                     if k in _RESERVED_ENV:
