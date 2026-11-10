@@ -21,6 +21,8 @@ Hugging Face iterator.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field
 
 from arctic_platform.model.config import ModelSpec
@@ -58,8 +60,43 @@ class FlashMoeOptions(GenericMoeOptions):
     )
 
 
+class Glm5NextOptions(FlashMoeOptions):
+    """Validated ``loader_options`` for GLM-5.3-Flash."""
+
+    vllm_aligned: bool = Field(
+        False,
+        description=(
+            "Experimental, GLM-5.3-Flash only. Compute dss_compute_logprobs with the kernels the batch-invariant vLLM"
+            " sampler runs (VLLM_BATCH_INVARIANT=1, ARCTIC_GLM5_BATCH_INVARIANT=1, enforce_eager, tensor parallelism"
+            " 1), so trainer and sampler logprobs are bitwise equal at the same weights; the backward recomputes the"
+            " stock layers. Covers prompts prefilled whole, up to index_topk tokens, for now (see"
+            " arctic_platform.model.implementations.vllm_aligned.glm5_next)."
+        ),
+    )
+    vllm_aligned_tensor_parallel: int = Field(
+        1,
+        ge=1,
+        description=(
+            "Experimental, with vllm_aligned. The sampler's tensor-parallel size: the trainer runs each rank's share"
+            " of the split layers on its weight shard and sums the partials as vLLM's batch-invariant all-reduce does."
+        ),
+    )
+    vllm_aligned_backward: Literal["stock", "vllm", "vllm_op"] = Field(
+        "stock",
+        description=(
+            "Experimental, with vllm_aligned. 'stock': each layer's backward recomputes the stock layer on the layer's"
+            " input. 'vllm': each sublayer's gradient is taken at the aligned forward's exact values, through stock"
+            " sublayers made to compute vLLM's math (replayed choices, bf16 MLA projections, FP8 activation quantization)."
+            " 'vllm_op': each vLLM kernel's gradient is that of its reference math at the kernel's exact inputs."
+        ),
+    )
+
+
 class _FlashLoadOptions(Qwen3_5MoeOptions):
     fp32_routed_weighting: bool = False
+    vllm_aligned: bool = False
+    vllm_aligned_tensor_parallel: int = 1
+    vllm_aligned_backward: str = "stock"
 
 
 def _matches(family: str):
@@ -157,13 +194,27 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
 @register_loader(
     "glm5_next",
     matches=_matches("glm5_next"),
-    options=FlashMoeOptions,
+    options=Glm5NextOptions,
     validate_spec=_validate_glm5_next,
 )
 def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.glm53.deepspeed_integration import load_glm5_next_model
 
-    return _load(ctx, load_glm5_next_model)
+    loaded = _load(ctx, load_glm5_next_model)
+    options = _FlashLoadOptions.model_validate(ctx.spec.loader_options)
+    if options.vllm_aligned:
+        from arctic_platform.model.implementations.vllm_aligned.glm5_next import apply_vllm_aligned_glm5_next
+
+        chunk = options.fused_lm_head_token_chunk_size
+        apply_vllm_aligned_glm5_next(
+            loaded.model,
+            token_chunk_size=chunk if isinstance(chunk, int) else 1024,
+            lm_head_fp32=options.fp32_lm_head,
+            ep_group=(ctx.parallel_groups or {}).get("ep_group"),
+            tensor_parallel=options.vllm_aligned_tensor_parallel,
+            backward=options.vllm_aligned_backward,
+        )
+    return loaded
 
 
 @register_loader(

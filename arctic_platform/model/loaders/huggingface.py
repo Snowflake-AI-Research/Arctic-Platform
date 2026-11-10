@@ -63,11 +63,98 @@ class HuggingfaceOptions(BaseModel):
         ),
     )
 
+    vllm_aligned: bool = Field(
+        False,
+        description=(
+            "Experimental. For the dense Qwen3 family, replace the training forward with one that calls the kernels a"
+            " batch-invariant vLLM sampler runs (VLLM_BATCH_INVARIANT=1, enforce_eager, tensor parallelism 1, the"
+            " FLASH_ATTN backend, Model Runner V2, KV-cache page size 16, the trainer's vLLM version), so the"
+            " trainer's logprobs equal the sampler's bitwise at the same weights. The backward is the ordinary math"
+            " and is not bitwise. patches.lm_head.fp32 computes fp32 logits as a batch-invariant sampler with"
+            " vllm_config.fp32_lm_head does, and takes their gradient in fp32. The dense Qwen3.5 family (GatedDeltaNet"
+            " hybrids) is covered too; its sampler also needs ARCTIC_GDN_BATCH_INVARIANT=1, the Triton GDN prefill"
+            " backend and VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0 (see"
+            " arctic_platform.model.implementations.vllm_aligned.qwen3_5). Requires patches.lm_head.token_chunk_size,"
+            " which bounds the LM-head rows held at once, and rejects the other kernel patches and sequence"
+            " parallelism."
+        ),
+    )
+
+    vllm_aligned_tensor_parallel: int = Field(
+        1,
+        ge=1,
+        description=(
+            "Experimental. The sampler's tensor-parallel size for vllm_aligned: the row-parallel projections add"
+            " per-rank partials in fp32 in rank order, as vLLM's batch-invariant custom all-reduce does."
+        ),
+    )
+
+    vllm_aligned_prefill_chunk: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Experimental. The sampler's ARCTIC_PREFILL_CHUNK_ALIGN for vllm_aligned: prompts are prefilled that"
+            " many tokens at a time from the sequence start, as that sampler's chunked prefill cuts them. 0 means"
+            " each prompt is prefilled in one step."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _tensor_parallel_needs_vllm_aligned(self) -> HuggingfaceOptions:
+        if self.vllm_aligned_tensor_parallel != 1 and not self.vllm_aligned:
+            raise ValueError("vllm_aligned_tensor_parallel requires vllm_aligned")
+        if self.vllm_aligned_prefill_chunk and not self.vllm_aligned:
+            raise ValueError("vllm_aligned_prefill_chunk requires vllm_aligned")
+        return self
+
     @model_validator(mode="after")
     def _fp32_residual_needs_fp32_parity(self) -> HuggingfaceOptions:
         if self.fp32_residual and not self.fp32_parity:
             raise ValueError("fp32_residual requires fp32_parity: only the fp32 parity forward carries the residual")
         return self
+
+
+def _check_vllm_aligned_spec(ctx: LoaderContext) -> tuple[str, int, bool]:
+    """Fail before the weights load when a job asks for the vLLM-aligned forward with something it cannot honour.
+
+    Returns the aligned model family, ``"qwen3"`` or ``"qwen3_5"``, the LM-head token chunk size, and whether the
+    LM head computes fp32 logits (``patches.lm_head.fp32``; the sampler then needs ``fp32_lm_head``).
+    """
+    from arctic_platform.model.implementations.vllm_aligned import qwen3
+    from arctic_platform.model.implementations.vllm_aligned import qwen3_5
+
+    spec = ctx.spec
+    if ctx.hf_config is None:
+        raise ValueError("vllm_aligned needs a model with a Hugging Face config")
+    text_config = ctx.hf_config.get_text_config() if hasattr(ctx.hf_config, "get_text_config") else ctx.hf_config
+    if getattr(text_config, "model_type", None) in qwen3_5.SUPPORTED_MODEL_TYPES:
+        family = "qwen3_5"
+        qwen3_5.check_supported_config(text_config)
+    else:
+        family = "qwen3"
+        qwen3.check_supported_config(text_config)
+    if spec.dtype != "bfloat16":
+        raise ValueError(f"vllm_aligned requires dtype bfloat16, the sampler's, got {spec.dtype!r}")
+    if spec.parallelism.sequence_parallel != 1 and family != "qwen3_5":
+        raise ValueError("vllm_aligned supports sequence parallelism for the Qwen3.5 family only")
+    patches = spec.patches
+    unsupported = {
+        "liger": patches.liger,
+        "activation_offload": patches.activation_offload,
+        "compile": patches.compile,
+        "tiled_mlp": patches.tiled_mlp,
+        "zorro_train": patches.zorro_train,
+        "peft": patches.peft,
+    }
+    requested = sorted(name for name, value in unsupported.items() if value)
+    if requested:
+        raise ValueError(f"vllm_aligned replaces the forward those patches change; remove {', '.join(requested)}")
+    if patches.lm_head is None or patches.lm_head.token_chunk_size is None:
+        raise ValueError(
+            "vllm_aligned computes logprobs inside the model and needs patches.lm_head.token_chunk_size, which also"
+            " makes the trainer ask the model for logprobs"
+        )
+    return family, patches.lm_head.token_chunk_size, bool(patches.lm_head.fp32)
 
 
 def _is_local_qwen3_5_dense(model_path_or_name: str) -> bool:
@@ -129,6 +216,7 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
         kwargs["config"] = config
 
     options = HuggingfaceOptions.model_validate(ctx.spec.loader_options)
+    vllm_aligned = _check_vllm_aligned_spec(ctx) if options.vllm_aligned else None
     if options.fp32_parity and _is_local_qwen3_5_dense(str(ctx.spec.model_path_or_name)):
         from arctic_platform.model.implementations.gpu.qwen3_5_dense_parity import check_stock_classes
 
@@ -154,4 +242,28 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
         )
 
         configure_transformers_sequence_parallel_model(model, groups["sp_group"], fp32_beta=options.fp32_parity)
+    if vllm_aligned is not None:
+        family, token_chunk_size, lm_head_fp32 = vllm_aligned
+        if family == "qwen3_5":
+            from arctic_platform.model.implementations.vllm_aligned.qwen3_5 import apply_vllm_aligned_qwen3_5
+
+            apply_vllm_aligned_qwen3_5(
+                model,
+                token_chunk_size=token_chunk_size,
+                lm_head_fp32=lm_head_fp32,
+                tensor_parallel=options.vllm_aligned_tensor_parallel,
+                prefill_chunk=options.vllm_aligned_prefill_chunk,
+                sp_group=groups.get("sp_group") if parallelism.sequence_parallel > 1 else None,
+            )
+        else:
+            from arctic_platform.model.implementations.vllm_aligned.qwen3 import apply_vllm_aligned
+
+            apply_vllm_aligned(
+                model,
+                token_chunk_size=token_chunk_size,
+                lm_head_fp32=lm_head_fp32,
+                tensor_parallel=options.vllm_aligned_tensor_parallel,
+            )
+        # The aligned forward computes logprobs itself; the chunked LM-head patch would wrap it with its own head.
+        return LoadedModel(model=model, applied_patches=frozenset({"lm_head"}))
     return LoadedModel(model=model)

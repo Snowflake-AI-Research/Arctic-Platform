@@ -1,11 +1,16 @@
+from arctic_platform.inference.vllm import aligned_prefill_chunks
 from arctic_platform.inference.vllm import config
 from arctic_platform.inference.vllm import deepseek_v41_lora
 from arctic_platform.inference.vllm import dense_prompt_logprobs
+from arctic_platform.inference.vllm import gdn_batch_invariance
+from arctic_platform.inference.vllm import glm5_batch_invariance
 from arctic_platform.inference.vllm import glm5next_lora
 from arctic_platform.inference.vllm import hybrid_state_fixes
 from arctic_platform.inference.vllm import kv_group_size
+from arctic_platform.inference.vllm import layer_digest
 from arctic_platform.inference.vllm import mamba_completion_refresh
 from arctic_platform.inference.vllm import mrope_yarn
+from arctic_platform.inference.vllm import prefill_chunk_report
 from arctic_platform.inference.vllm import required_patches
 from arctic_platform.inference.vllm import router_replay
 from arctic_platform.inference.vllm import spec_decode_grammar
@@ -73,6 +78,31 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         lambda: calls.append("deepseek_v41_lora"),
     )
 
+    monkeypatch.setattr(
+        glm5_batch_invariance,
+        "ensure_glm5_batch_invariance",
+        lambda: calls.append("glm5_batch_invariance"),
+    )
+    monkeypatch.setattr(
+        gdn_batch_invariance,
+        "ensure_gdn_batch_invariance",
+        lambda: calls.append("gdn_batch_invariance"),
+    )
+
+    monkeypatch.setattr(
+        aligned_prefill_chunks,
+        "ensure_aligned_prefill_chunks",
+        lambda: calls.append("aligned_prefill_chunks"),
+    )
+
+    monkeypatch.setattr(
+        prefill_chunk_report,
+        "ensure_prefill_chunk_report",
+        lambda: calls.append("prefill_chunk_report"),
+    )
+
+    monkeypatch.setattr(layer_digest, "ensure_layer_digest", lambda: calls.append("layer_digest"))
+
     required_patches.apply_required_vllm_patches()
 
     assert calls == [
@@ -88,4 +118,9 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "mrope_yarn",
         "mamba_completion_refresh",
         "deepseek_v41_lora",
+        "glm5_batch_invariance",
+        "gdn_batch_invariance",
+        "aligned_prefill_chunks",
+        "prefill_chunk_report",
+        "layer_digest",
     ]

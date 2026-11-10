@@ -591,7 +591,11 @@ def _sparse_attention_forward(
     kv_pass_full = gather_sequence(kv_pass, self._cp_group)
     k_position_full = gather_sequence(k_position, self._cp_group)
 
-    if self.indexer is not None:
+    replayed = getattr(self, "_ap_replay_topk_indices", None)
+    if replayed is not None:
+        # A recompute that must attend to the keys another forward selected (the vLLM-aligned backward).
+        topk_indices = replayed
+    elif self.indexer is not None:
         global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
         if global_cu_seqlens is None:
             global_cu_seqlens = torch.tensor(
