@@ -23,13 +23,14 @@ itself; this module is about trainer-wide lifecycle callbacks).
 
 Callbacks are **observational**: they must not change weights, batch, loss,
 gradients, optimizer state, RNG state, or control flow. They may keep state,
-install read-only hooks (e.g. forward hooks), run collectives, and raise.
-Collectives a callback runs must be unconditional — every rank makes the same
-calls in the same order, never gated on rank or other rank-local state.
-``rank_zero_only`` callbacks are constructed only on rank 0, so they must not
-run collectives. A ``MetricsCallback`` with ``rank_zero_only`` may log only
-``Reduce.RANK0``. Enablement comes from ``training_config``, identical on every
-rank, and callbacks run in registry order.
+install read-only hooks (e.g. forward hooks), and raise. They must **not** run
+collectives inside hooks: aggregation belongs to ``Reduce`` + the driver's
+``merge_metrics``. That keeps a single-rank raise from hanging peers, and lets
+``CallbackRunner`` quarantine a failed callback for the rest of the step.
+``rank_zero_only`` callbacks are constructed only on rank 0. A
+``MetricsCallback`` with ``rank_zero_only`` may log only ``Reduce.RANK0``.
+Enablement comes from ``training_config``, identical on every rank, and
+callbacks run in registry order.
 """
 
 from __future__ import annotations
@@ -129,31 +130,51 @@ class MetricsCallback(Callback):
 
 
 class CallbackRunner:
-    """Instantiates the enabled callbacks for this rank and dispatches hooks to them in order."""
+    """Instantiates the enabled callbacks for this rank and dispatches hooks to them in order.
+
+    A hook ``Exception`` quarantines that callback for the rest of the step: later hooks skip
+    it and ``flush`` drops its metrics. ``BaseException`` (e.g. ``KeyboardInterrupt``) still
+    propagates. ``_failed`` clears on ``flush`` / ``on_error``.
+    """
 
     def __init__(self, types: Sequence[Type[Callback]], training_config: Mapping[str, Any], rank: int) -> None:
         self.callbacks = [
             t(training_config) for t in types if t.enabled(training_config) and (rank == 0 or not t.rank_zero_only)
         ]
         self._metrics = [cb for cb in self.callbacks if isinstance(cb, MetricsCallback)]
+        self._failed: set[Callback] = set()
 
     def run(self, hook: str, trainer: Trainer, *args: Any) -> None:
         for cb in self.callbacks:
-            getattr(cb, hook)(trainer, *args)
+            if cb in self._failed:
+                continue
+            try:
+                getattr(cb, hook)(trainer, *args)
+            except Exception:
+                logger.exception(
+                    "%s.%s failed; dropping its metrics this step",
+                    type(cb).__name__,
+                    hook,
+                )
+                self._failed.add(cb)
 
     def flush(self) -> Dict[str, Entry]:
         try:
             merged: Dict[str, Entry] = {}
             for cb in self._metrics:
+                if cb in self._failed:
+                    continue
                 if clash := merged.keys() & cb.pending.keys():
                     raise ValueError(f"metric names logged by more than one callback: {sorted(clash)}")
                 merged.update(cb.pending)
             return merged
         finally:
             self._clear()
+            self._failed.clear()
 
     def on_error(self, trainer: Trainer, stage: str, exc: BaseException) -> None:
         self._clear()
+        self._failed.clear()
         for cb in self.callbacks:
             try:
                 cb.on_error(trainer, stage, exc)
