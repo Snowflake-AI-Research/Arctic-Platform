@@ -722,7 +722,7 @@ def _result_from_output(
     return result
 
 
-# vllm/multimodal/processing/inputs.py (v0.32.0) lines 13-17.
+# vllm/multimodal/processing/inputs.py (v0.33.0) lines 13-17.
 _HF_MODALITY_PROCESSOR_KWARGS = {
     "image": "images_kwargs",
     "video": "videos_kwargs",
@@ -731,28 +731,46 @@ _HF_MODALITY_PROCESSOR_KWARGS = {
 
 
 def _media_hashes(
-    prompt: Mapping[str, Any], model_config: Any, cache_config: Any, request_id: str
+    prompt: Mapping[str, Any], model_config: Any, renderer: Any, request_id: str
 ) -> dict[str, list[str]]:
     """The per-item media hashes vLLM uses for its processor and prefix caches.
 
-    vLLM 0.32 does not return them on the output, so this repeats
+    vLLM 0.33 does not hand them back: ``RequestOutput`` (vllm/outputs.py,
+    v0.33.0, lines 137-200) has no hash field. They exist only inside the engine,
+    on the ``MultiModalInput`` the renderer's ``_process_multimodal`` builds
+    (vllm/renderers/base.py, v0.33.0, lines 944-985) and on each item's
+    ``MultiModalFeatureSpec.mm_hash`` (vllm/multimodal/inputs.py, v0.33.0, lines
+    344-373), and ``AsyncLLM.generate`` returns neither. Running the renderer a
+    second time to get them would run the HF processor again, touch the processor
+    cache and draw a new request id from its counter. So this repeats
     ``ProcessorInputs.get_mm_hashes`` (vllm/multimodal/processing/inputs.py,
-    v0.32.0, lines 34-109) with vLLM's own ``MultiModalHasher`` and the engine's
-    ``mm_hasher_algorithm``. Each item is hashed with ``model_id``, the item (or
-    the caller's uuid in its place) and the non-empty ``mm_processor_kwargs``,
-    scoped to the item's modality; a caller's uuid is the hash only when those are
-    empty. vLLM's other factor, ``media_io_kwargs``, is always empty here: a media
-    prompt cannot carry it (``MEDIA_PROMPT_KEYS``).
+    v0.33.0, lines 34-109) with vLLM's own ``MultiModalHasher`` and the engine's
+    ``mm_hasher_algorithm`` (vllm/config/multimodal.py, v0.33.0, line 372). The
+    items are the ones vLLM hashes: the renderer's own processor parses the data
+    (vllm/renderers/base.py, v0.33.0, line 959; a ``None`` modality is dropped,
+    vllm/multimodal/parse.py, v0.33.0, lines 861-873) and each item is taken from
+    ``get_all_items_for_hash`` (vllm/multimodal/processing/inputs.py, v0.33.0, line
+    85). That item is not always the prompt's: a decoded video
+    ``MediaWithBytes((frames, metadata), bytes)`` is hashed as
+    ``(MediaWithBytes(frames, bytes), metadata)`` (parse.py lines 412-417 and
+    650-654), and a PIL image is hashed after its RGB conversion (lines 772-777).
+    ``model_id`` is the processor info's ``model_id``, which vLLM passes
+    (vllm/multimodal/processing/processor.py, v0.33.0, lines 1396-1401). Each
+    item is hashed with ``model_id``, the item (or the caller's uuid in its place)
+    and the non-empty ``mm_processor_kwargs``, scoped to the item's modality; a
+    caller's uuid is the hash only when those are empty (inputs.py lines 70-105). vLLM's
+    other factor, ``media_io_kwargs``, is always empty here: a media prompt cannot
+    carry it (``MEDIA_PROMPT_KEYS``).
 
     The kwargs are the prompt's own, as vLLM's renderer hands them over
-    (vllm/renderers/base.py, v0.32.0, lines 915-921 and 950-955): the engine's
-    ``mm_processor_kwargs`` are merged only when the HF processor runs and its
+    (vllm/renderers/base.py, v0.33.0, lines 1066-1074 and 966-971): the engine's
+    ``mm_processor_kwargs`` are not on ``ProcessorInputs`` and its
     ``media_io_kwargs`` only decode, so neither is a hash factor. With
     ``mm_processor_cache_gb == 0`` and prefix caching off, vLLM gives every item
     without a uuid a per-request one instead of hashing its content (lines
-    874-889); its ids come from a renderer counter this worker cannot see, so
-    this does the same with ``request_id``: the hashes are per request, as
-    vLLM's are, and never shared across requests.
+    923-938); its ids come from a renderer counter this worker cannot see (line
+    957), so this does the same with ``request_id``: the hashes are per request,
+    as vLLM's are, and never shared across requests.
     """
     from vllm.multimodal.hasher import MultiModalHasher
 
@@ -761,14 +779,18 @@ def _media_hashes(
         raise ValueError(f"Model {model_config.model} does not take multi_modal_data")
     algorithm = mm_config.mm_hasher_algorithm
     processor_kwargs = prompt.get("mm_processor_kwargs") or {}
-    synthetic_uuids = mm_config.mm_processor_cache_gb == 0 and not cache_config.enable_prefix_caching
+    synthetic_uuids = mm_config.mm_processor_cache_gb == 0 and not renderer.config.cache_config.enable_prefix_caching
     uuids = prompt.get("multi_modal_uuids") or {}
+    info = renderer.get_mm_processor().info
     hashes: dict[str, list[str]] = {}
-    for modality, items in prompt["multi_modal_data"].items():
-        items = items if isinstance(items, list) else [items]
+    for modality, data_items in info.parse_mm_data(prompt["multi_modal_data"]).items():
+        items = data_items.get_all_items_for_hash()
         item_uuids = uuids.get(modality)
-        if not isinstance(item_uuids, list):
-            item_uuids = [item_uuids] * len(items)
+        if item_uuids is None:
+            item_uuids = [None] * len(items)
+        elif not isinstance(item_uuids, list):
+            # vllm/multimodal/parse.py (v0.33.0) lines 883-890: a single uuid is a list of one.
+            item_uuids = [item_uuids]
         if len(item_uuids) != len(items):
             raise ValueError(f"Got {len(item_uuids)} multi_modal_uuids for {len(items)} {modality} items")
         if synthetic_uuids:
@@ -789,7 +811,7 @@ def _media_hashes(
         hashes[modality] = [
             MultiModalHasher.hash_kwargs(
                 algorithm,
-                model_id=model_config.model,
+                model_id=info.model_id,
                 **{modality: uuid if uuid is not None else item},
                 **hash_factors,
             )
@@ -1558,7 +1580,7 @@ class InferenceWorker(StreamingWorkerMixin):
                 decode_media, effective_prompt, mm_config.media_io_kwargs
             )
             media_hashes = _media_hashes(
-                effective_prompt, model_config, self.llm.renderer.config.cache_config, request_id
+                effective_prompt, model_config, self.llm.renderer, request_id
             )
             prompt_input: Any = TokensPrompt(**effective_prompt)
         elif isinstance(effective_prompt, list):
