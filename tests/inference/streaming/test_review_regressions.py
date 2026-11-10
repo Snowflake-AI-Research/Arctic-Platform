@@ -524,14 +524,13 @@ def test_review_scale_down_preserves_retained_replica_streams():
         driver = Driver()
         driver._pools["model"] = pool
         try:
-            retained = driver.stream_generate(
-                "model", "retained", "blocked", {"max_tokens": 2}
-            )
-            removed = driver.stream_generate(
-                "model", "removed", "blocked", {"max_tokens": 2}
-            )
-            await anext(retained)
-            await anext(removed)
+            streams = [
+                driver.stream_generate("model", request_id, "blocked", {"max_tokens": 2})
+                for request_id in ("first", "second")
+            ]
+            for stream in streams:
+                await anext(stream)
+            retained, removed = sorted(streams, key=lambda stream: stream.request.worker_idx)
             assert retained.request.worker_idx == 0
             assert removed.request.worker_idx == 1
             await pool.scale_down(1)
