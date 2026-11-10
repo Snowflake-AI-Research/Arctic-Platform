@@ -23,7 +23,7 @@ export ARCTIC_CORTEX_SCHEMA=dev
 
 For an authenticated Cortex endpoint use `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA`, and `ARCTIC_CORTEX_PAT` instead of a direct URL. Supply the token through a protected environment or `--pat-file`, not through a configuration file or a pasted command. The operator-facing backend is `cortex-training`; `cortex` is a compatibility alias and `onprem` is rejected. For a local multi-node gateway, provide the same-job hostfile through `DSS_GATEWAY_HOSTFILE` and working allocation-local `ds_ssh`.
 
-**Large artifacts and small diagnostics have separate defaults.** Temporary model fixtures and tensor scratch use `/data-fast/tmp`; `DSS_CORRECTNESS_TMPDIR` can select another directory under `/data-fast`. Small reports and complete logs use `./work/logs`, overridden by `DSS_CORRECTNESS_LOGDIR` or a regression `--out` directory. Compact reference JSON files default to the locally retained, Git-ignored `arctic_platform/correctness/reference_data`; `--reference-records-dir` must select a directory inside the checkout, not scratch storage.
+**Large artifacts and small diagnostics have separate defaults.** Temporary model fixtures and tensor scratch use `/data-fast/tmp`; `AP_CORRECTNESS_TMPDIR` can select another directory under `/data-fast`. Small reports and complete logs use `./work/logs`, overridden by `AP_CORRECTNESS_LOGDIR` or a regression `--out` directory. Compact reference JSON files default to the locally retained, Git-ignored `arctic_platform/correctness/reference_data`; `--reference-records-dir` must select a directory inside the checkout, not scratch storage.
 
 ## Setup
 
@@ -49,8 +49,8 @@ python -m arctic_platform.correctness list
 
 ```bash
 mkdir -p ./work/configs ./work/reports ./work/logs
-export DSS_CORRECTNESS_TMPDIR="$(mktemp -d /data-fast/tmp/correctness-demo.XXXXXXXX)"
-export DSS_CORRECTNESS_LOGDIR="$PWD/work/logs/correctness-demo"
+export AP_CORRECTNESS_TMPDIR="$(mktemp -d /data-fast/tmp/correctness-demo.XXXXXXXX)"
+export AP_CORRECTNESS_LOGDIR="$PWD/work/logs/correctness-demo"
 export HF_HOME=/checkpoint/huggingface
 export HF_HUB_CACHE=/checkpoint/huggingface/hub
 python - <<'PY'
@@ -142,7 +142,7 @@ python -m arctic_platform.correctness onboard \
 
 **The first two reduced-fixture checks manage local validation automatically.** Without a configured Cortex host or base URL, onboarding selects the local fixture, starts the installed `dss.ray_dss.gateway_server` on loopback for validation and closes its owned gateway afterwards. No manual fixture flag or gateway command is needed. An explicitly supplied loopback gateway is left running; a hosted account endpoint cannot accept this reduced-fixture workflow. This automation does not add target capabilities for later checks.
 
-**Every onboarding attempt retains diagnostics in `./work/logs/`.** The printed attempt directory contains `onboarding.log`, `report.md`, the summary, sizing results, calibration summaries, target reports and complete reference-worker logs. `DSS_CORRECTNESS_LOGDIR` overrides this root. Stage headings use vertical spacing and `***` prefixes. Queued checks are numbered, for example `### Onboarding 1/2: Single Step Grads ###` and `### Onboarding 2/2: Single Step Optimizer ###`; prerequisite gradient onboarding counts toward the total when needed. Model fixtures, adapters and tensor scratch remain on fast storage, never Git.
+**Every onboarding attempt retains diagnostics in `./work/logs/`.** The printed attempt directory contains `onboarding.log`, `report.md`, the summary, sizing results, calibration summaries, target reports and complete reference-worker logs. `AP_CORRECTNESS_LOGDIR` overrides this root. Stage headings use vertical spacing and `***` prefixes. Queued checks are numbered, for example `### Onboarding 1/2: Single Step Grads ###` and `### Onboarding 2/2: Single Step Optimizer ###`; prerequisite gradient onboarding counts toward the total when needed. Model fixtures, adapters and tensor scratch remain on fast storage, never Git.
 
 **Repeat the same command after resolving a reported failure.** Recovery records in `./work/logs/onboarding-state/` reuse completed phases only when configuration, options, source, code, dependencies and retained artifacts match. Missing or changed artifacts rebuild the affected phase and its successors. Failed validation is retried, not counted as complete; compatible sizing and calibration do not repeat. Recycling a node can remove temporary fixtures and require rebuilding them, even though the diagnostic logs remain.
 
@@ -350,6 +350,8 @@ python -m arctic_platform.correctness.diagnostics run <diagnostic-id> --help
 ```
 
 Diagnostics have their own resource requirements and are not substitutes for the reviewed regression tests.
+
+**The LM-head diagnostic changes the workload and is not a canonical result.** It sets `model_options["lm_head.token_chunk_size"]` to `"disabled"` in a copied in-memory config, including an existing nested `model_options["lm_head"]["token_chunk_size"]`, without editing the source config or spec. The explicit option takes precedence over legacy settings and prevents the runner from restoring the spec's chunk size. Compatible diagnostic reference records are still required; do not relabel canonical records.
 
 **This guide is static.** Onboarding and test execution never append results, status, receipts, or logs here. Run artifacts belong in the selected report directory.
 

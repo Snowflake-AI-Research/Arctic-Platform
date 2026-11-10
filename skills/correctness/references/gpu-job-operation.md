@@ -117,13 +117,13 @@ bash /code/users/stas/github/sf/stas-dss-repro/setup.sh
 
 **Apply setup to every node that needs it.** Put the setup block in a fresh shared node script and invoke it through same-job `ds_ssh -f "$HOSTFILE" -- "bash <absolute-node-script>"` after verifying the transport. If the nodes share the Python environment, install once and verify all nodes; do not run competing installers into that shared environment. For node-local environments, provision each node and check its result. Re-run the all-node probe after setup, before numerical work. A successful head-node install does not finish multi-node setup.
 
-**Verify the harness's strict SSH transport separately from `ds_ssh`.** Runtime admission and fixture transfer use `ssh -F /dev/null`, ignore ambient SSH configuration and require authenticated host keys. Export `DSS_CORRECTNESS_SSH_KNOWN_HOSTS` as the existing trusted, owned regular known-hosts file and `DSS_CORRECTNESS_SSH_PORT` as the allocation's actual SSH port; defaults are `~/.ssh/known_hosts` and `22`. A successful `ds_ssh` command does not establish that these defaults work. Obtain missing trust or port details through the allocation's authenticated setup or the operator; never disable host-key checking or trust an unauthenticated key scan.
+**Verify the harness's strict SSH transport separately from `ds_ssh`.** Runtime admission and fixture transfer use `ssh -F /dev/null`, ignore ambient SSH configuration and require authenticated host keys. Export `AP_CORRECTNESS_SSH_KNOWN_HOSTS` as the existing trusted, owned regular known-hosts file and `AP_CORRECTNESS_SSH_PORT` as the allocation's actual SSH port; defaults are `~/.ssh/known_hosts` and `22`. A successful `ds_ssh` command does not establish that these defaults work. Obtain missing trust or port details through the allocation's authenticated setup or the operator; never disable host-key checking or trust an unauthenticated key scan.
 
 **Run this read-only transport probe once on the head after setup.** Keep the verified interpreter, checkout and hostfile from the preceding probe. It uses the executing harness's exact trust handling and reports each authenticated node's hostname. A failure is a setup problem to resolve before dispatch, not permission to weaken admission.
 
 ```bash
-export DSS_CORRECTNESS_SSH_KNOWN_HOSTS="$HOME/.ssh/known_hosts"
-export DSS_CORRECTNESS_SSH_PORT=22  # Replace with the verified allocation port.
+export AP_CORRECTNESS_SSH_KNOWN_HOSTS="$HOME/.ssh/known_hosts"
+export AP_CORRECTNESS_SSH_PORT=22  # Replace with the verified allocation port.
 "$PYTHON" - "$HOSTFILE" <<'PY'
 import subprocess
 import sys
@@ -176,16 +176,16 @@ export PYTHONUNBUFFERED=1
 export DSS_GATEWAY_HOSTFILE="$HOSTFILE"
 export ARCTIC_HOSTFILE="$HOSTFILE"
 # Set these to the trust file and port verified by the strict SSH probe.
-export DSS_CORRECTNESS_SSH_KNOWN_HOSTS="$HOME/.ssh/known_hosts"
-export DSS_CORRECTNESS_SSH_PORT=22
+export AP_CORRECTNESS_SSH_KNOWN_HOSTS="$HOME/.ssh/known_hosts"
+export AP_CORRECTNESS_SSH_PORT=22
 export HF_HOME=/checkpoint/huggingface
 export HF_HUB_CACHE=/checkpoint/huggingface/hub
 ATTEMPT="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-export DSS_CORRECTNESS_TMPDIR
-DSS_CORRECTNESS_TMPDIR="$(mktemp -d /data-fast/tmp/correctness.XXXXXXXX)"
-export DSS_CORRECTNESS_LOGDIR="$AP/work/logs/onboarding-$ATTEMPT"
+export AP_CORRECTNESS_TMPDIR
+AP_CORRECTNESS_TMPDIR="$(mktemp -d /data-fast/tmp/correctness.XXXXXXXX)"
+export AP_CORRECTNESS_LOGDIR="$AP/work/logs/onboarding-$ATTEMPT"
 printf 'head=%s pool=%s hostfile=%s logs=%s scratch=%s\n' \
-    "$(hostname)" "$POOL" "$HOSTFILE" "$DSS_CORRECTNESS_LOGDIR" "$DSS_CORRECTNESS_TMPDIR"
+    "$(hostname)" "$POOL" "$HOSTFILE" "$AP_CORRECTNESS_LOGDIR" "$AP_CORRECTNESS_TMPDIR"
 "$PYTHON" -m arctic_platform.correctness list
 "$PYTHON" -m arctic_platform.correctness onboard --config "$CONFIG" --gpu-pool "$POOL"
 ```

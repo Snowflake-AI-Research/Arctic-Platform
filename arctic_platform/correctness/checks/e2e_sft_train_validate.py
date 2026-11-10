@@ -81,6 +81,7 @@ from arctic_platform.correctness.harness.sft import cross_entropy
 from arctic_platform.correctness.harness.sft import load
 from arctic_platform.correctness.harness.sft import reference_answer_logprobs
 from arctic_platform.correctness.harness.sft import save
+from arctic_platform.correctness.harness.storage import correctness_environment
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 from arctic_platform.debug.training import maybe_bind_reduced_fixture_mtp
 from arctic_platform.model.implementations.debug.determinism import CUBLAS_WORKSPACE
@@ -94,7 +95,7 @@ from ..harness.registry import correctness_test
 from ..reference.model_features import uses_mixer_packing
 
 TEST_ID = "e2e-sft-train-validate"
-GSM8K_DATA_ROOT_ENV = "DSS_CORRECTNESS_GSM8K_ROOT"
+GSM8K_DATA_ROOT_ENV = "AP_CORRECTNESS_GSM8K_ROOT"
 logger = logging.getLogger(__name__)
 
 # The recipe length the criterion names: "~100 step SFT recipe with HF".
@@ -593,7 +594,7 @@ def run(ctx) -> List[TestResult]:
 
 def dataset_paths() -> Tuple[Path, Path]:
     """Resolve staged GSM8K files without changing their logical split identities."""
-    staged = os.environ.get(GSM8K_DATA_ROOT_ENV)
+    staged = correctness_environment(GSM8K_DATA_ROOT_ENV)
     if staged is None:
         return TRAIN_SPLIT, VALIDATION_SPLIT
     root = require_data_fast_path(staged, label=GSM8K_DATA_ROOT_ENV)

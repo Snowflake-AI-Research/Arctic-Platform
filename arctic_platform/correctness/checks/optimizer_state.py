@@ -31,7 +31,7 @@ from arctic_platform.correctness.harness.optimizer import COMPARISON_STATE_KEYS
 from arctic_platform.correctness.harness.optimizer import OPTIMIZER_NORM_CRITERION
 from arctic_platform.correctness.harness.optimizer import STATE_KEYS
 from arctic_platform.correctness.harness.optimizer import CanonicalTensorGroup
-from arctic_platform.correctness.harness.optimizer import canonical_dss_tensor_groups
+from arctic_platform.correctness.harness.optimizer import canonical_ap_tensor_groups
 from arctic_platform.correctness.harness.optimizer import canonical_participation
 from arctic_platform.correctness.harness.optimizer import compare_participation
 from arctic_platform.correctness.harness.optimizer import normalize
@@ -54,7 +54,7 @@ class StateDelta:
 @dataclass(frozen=True)
 class OptimizerComparison:
     deltas: List[StateDelta]
-    only_dss: List[str]
+    only_ap: List[str]
     only_reference: List[str]
 
     @property
@@ -184,7 +184,7 @@ def summarize_optimizer_artifacts(
     if any(not name for name in entries):
         raise ValueError("optimizer norm artifacts have an empty canonical parameter name")
     groups = (
-        canonical_dss_tensor_groups(entries)
+        canonical_ap_tensor_groups(entries)
         if backend == "ap"
         else {name: CanonicalTensorGroup((name,)) for name in entries}
     )
@@ -240,7 +240,7 @@ def summarize_optimizer_artifacts(
     return summary
 
 
-def compare_optimizer_norms(dss_summary: dict, reference_summary: dict) -> OptimizerComparison:
+def compare_optimizer_norms(ap_summary: dict, reference_summary: dict) -> OptimizerComparison:
     """Compare scalar norms by absolute difference, including zero and near-zero values without exemptions.
 
     Names and shapes must align exactly; even unmatched zero vision tensors remain coverage failures. All summaries
@@ -248,24 +248,24 @@ def compare_optimizer_norms(dss_summary: dict, reference_summary: dict) -> Optim
     participation inventories are compared as the gradient check compares them: a reference vision tower that a
     text-only target does not build is dropped only when every one of its parameters is an uncalled bypass.
     """
-    dss = _validate_optimizer_norm_summary(dss_summary)
+    ap = _validate_optimizer_norm_summary(ap_summary)
     reference = _validate_optimizer_norm_summary(reference_summary)
-    validate_optimizer_participation(dss_summary, backend="ap")
+    validate_optimizer_participation(ap_summary, backend="ap")
     validate_optimizer_participation(reference_summary, backend="reference")
-    if dss_summary.get("participation") is not None or reference_summary.get("participation") is not None:
-        target = dss_summary.get("participation")
+    if ap_summary.get("participation") is not None or reference_summary.get("participation") is not None:
+        target = ap_summary.get("participation")
         compare_participation(target, _without_absent_bypassed_tower(reference_summary.get("participation"), target))
     deltas = []
-    for name in sorted(set(dss) & set(reference)):
-        if dss[name]["shape"] != reference[name]["shape"]:
+    for name in sorted(set(ap) & set(reference)):
+        if ap[name]["shape"] != reference[name]["shape"]:
             raise ValueError(
-                f"optimizer norm shape mismatch for {name}: {dss[name]['shape']} != {reference[name]['shape']}"
+                f"optimizer norm shape mismatch for {name}: {ap[name]['shape']} != {reference[name]['shape']}"
             )
         for state in COMPARISON_STATE_KEYS:
-            delta = abs(dss[name][state] - reference[name][state])
+            delta = abs(ap[name][state] - reference[name][state])
             deltas.append(StateDelta(name=name, state=state, delta_norm=float(delta)))
     return OptimizerComparison(
-        deltas=deltas, only_dss=sorted(set(dss) - set(reference)), only_reference=sorted(set(reference) - set(dss))
+        deltas=deltas, only_ap=sorted(set(ap) - set(reference)), only_reference=sorted(set(reference) - set(ap))
     )
 
 

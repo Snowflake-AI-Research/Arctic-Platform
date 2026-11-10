@@ -14,15 +14,11 @@
 # limitations under the License.
 
 # !/usr/bin/env python3
-"""Does the chunked LM head produce a config's last-layer gradient-norm disagreement?
+"""Diagnostic that disables LM-head chunking through copied model options.
 
-Runs ``python -m arctic_platform.correctness run`` unchanged, except that ``fused_lm_head_token_chunk_size`` is removed from
-the training sub-job each placement executes. The key is dropped after the spec's config checksum has been
-verified, so the config file, its checksum gate, the cases, and the frozen tolerances are exactly regression's.
-Both arms lose the chunked head together: the Arctic Platform payload no longer carries the key, which leaves the head
-unchunked, and the single-GPU reference reads the same in-memory config, which selects its ordinary chunked
-cross entropy instead of the tiled log-probability path. A verdict that changes between this and a plain
-regression run is therefore attributable to that one knob.
+The source config and reviewed specification are not edited. This altered workload
+still requires compatible prepared reference records; a canonical record must not
+be reused as if its chunking identity matched the altered workload.
 
 Usage: ``python -m arctic_platform.correctness.diagnostics.lm_head_chunking --config <path> --test single-step-grads``; every
 argument is passed to ``run``.
@@ -38,19 +34,21 @@ from typing import Optional
 from arctic_platform.correctness import api
 from arctic_platform.correctness.harness.config import LoadedConfig
 
-KNOB = "fused_lm_head_token_chunk_size"
+KNOB = "lm_head.token_chunk_size"
 
 
 def without_chunked_head(cfg: LoadedConfig) -> LoadedConfig:
-    """A copy of ``cfg`` whose training sub-job has no ``fused_lm_head_token_chunk_size``."""
+    """Disable chunking explicitly without changing the source config or legacy settings."""
     stripped = copy.deepcopy(cfg)
     for sub in [stripped.sub_job, *stripped.sub_jobs]:
         training = sub.get("training_config")
         if isinstance(training, dict):
-            training.pop(KNOB, None)
-            prime_rl = training.get("prime_rl")
-            if isinstance(prime_rl, dict):
-                prime_rl.pop(KNOB, None)
+            options = training.get("model_options") or {}
+            training["model_options"] = options
+            options[KNOB] = "disabled"
+            lm_head = options.get("lm_head")
+            if isinstance(lm_head, dict):
+                lm_head["token_chunk_size"] = "disabled"
     return stripped
 
 
@@ -60,7 +58,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     def execute_without_chunked_head(cfg, *args, **kwargs):
         print(
-            f"diagnostic: {KNOB} removed (was {cfg.training.get(KNOB)!r}) for {cfg.config_id} on {cfg.n_gpus} GPU(s)",
+            f"diagnostic: model_options[{KNOB!r}] disabled (was {cfg.lm_head_token_chunk_size!r}) "
+            f"for {cfg.config_id} on {cfg.n_gpus} GPU(s)",
             flush=True,
         )
         return execute(without_chunked_head(cfg), *args, **kwargs)

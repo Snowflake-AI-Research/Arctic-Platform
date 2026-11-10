@@ -652,9 +652,19 @@ def test_initialize_native_deepspeed_optimizer_forwards_model_parameters(monkeyp
 
 
 @pytest.mark.parametrize("model_type", ["glm_moe_dsa", "glm5_next_text"])
-@pytest.mark.parametrize("fused,expected", [(None, "torch_adamw"), (False, "torch_adamw"), (True, "fused_adam")])
+@pytest.mark.parametrize(
+    "name,fused,expected",
+    [
+        ("AdamW", None, "torch_adamw"),
+        ("AdamW", False, "torch_adamw"),
+        ("AdamW", True, "fused_adam"),
+        ("FusedAdam", None, "torch_adamw"),
+        ("fused_adam", None, "torch_adamw"),
+        ("torch_adamw", None, "torch_adamw"),
+    ],
+)
 def test_initialize_splits_expert_groups_and_respects_glm_optimizer_choice(
-    monkeypatch, tmp_path, model_type, fused, expected
+    monkeypatch, tmp_path, model_type, name, fused, expected
 ):
     calls = {}
 
@@ -682,7 +692,7 @@ def test_initialize_splits_expert_groups_and_respects_glm_optimizer_choice(
     engine, optimizer, choice = initialize_training_engine(
         model,
         _ZERO2,
-        optimizer=OptimizerSettings(fused=fused),
+        optimizer=OptimizerSettings(name=name, fused=fused),
         ep_size=2,
         mpu=None,
         model_path=str(tmp_path),

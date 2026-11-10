@@ -1165,7 +1165,7 @@ def _spec_arms(cfg, arm_defs, vocab_size: int):
                 max_seq_len=definition.max_seq_len,
                 total_tokens=batch.total_tokens,
                 active_tokens=batch.active_tokens,
-                dss_microbatches=definition.microbatches(
+                ap_microbatches=definition.microbatches(
                     correctness_microbatch_tokens(cfg.max_tokens_per_mb), cfg.dp_size
                 ),
                 pad_fraction=batch.pad_fraction,
@@ -1173,7 +1173,7 @@ def _spec_arms(cfg, arm_defs, vocab_size: int):
         )
 
     notes = []
-    if not any(arm.dss_microbatches > 1 for arm in arms):
+    if not any(arm.ap_microbatches > 1 for arm in arms):
         notes.append(
             "No arm splits into more than one microbatch, so gradient accumulation is untested; "
             "raise a global batch size or lower mb_spec.max_tokens_per_mb."
@@ -1203,7 +1203,7 @@ def build_spec(
     from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
     from arctic_platform.correctness.onboarding.synth_model import size_for_single_gpu
 
-    temporary = workdir if workdir is not None else correctness_workdir("dss-onboard-")
+    temporary = workdir if workdir is not None else correctness_workdir("ap-onboard-")
     temporary.mkdir(parents=True, exist_ok=True)
     if num_layers is None:
         num_layers, _ = size_for_single_gpu(source_checkpoint)

@@ -70,6 +70,7 @@ from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
 from arctic_platform.correctness.harness.cortex import UnsafeCleanupError
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.storage import _ds_ssh
+from arctic_platform.correctness.harness.storage import correctness_environment
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import parse_hostfile
 from arctic_platform.correctness.harness.storage import require_data_fast_path
@@ -77,7 +78,7 @@ from arctic_platform.debug.training import maybe_bind_reduced_fixture_mtp
 from arctic_platform.debug.training import maybe_configure_router_replay_sampling
 from arctic_platform.debug.weight_sync import maybe_configure_broadcast_sampling
 
-# Dss Driver
+# Arctic Platform Driver
 
 
 @dataclass
@@ -216,6 +217,14 @@ def _legacy_owned_gateways() -> list[tuple[dict, str]]:
     return found
 
 
+def _gateway_owner_matches(environment: list[bytes], token: str) -> bool:
+    """Recover old owned processes without letting a legacy marker override an AP marker."""
+    prefix = b"AP_CORRECTNESS_GATEWAY_OWNER="
+    if any(entry.startswith(prefix) for entry in environment):
+        return prefix + token.encode() in environment
+    return f"DSS_CORRECTNESS_GATEWAY_OWNER={token}".encode() in environment
+
+
 def _recover_owned_gateway(record_path: Path) -> None:
     if not record_path.exists():
         return
@@ -233,8 +242,7 @@ def _recover_owned_gateway(record_path: Path) -> None:
             record_path.unlink()
             return
         environment = (_GATEWAY_PROC_ROOT / str(gateway["pid"]) / "environ").read_bytes().split(b"\0")
-        marker = f"DSS_CORRECTNESS_GATEWAY_OWNER={record['token']}".encode()
-        if marker not in environment or os.getpgid(gateway["pid"]) != gateway["pid"]:
+        if not _gateway_owner_matches(environment, record["token"]) or os.getpgid(gateway["pid"]) != gateway["pid"]:
             raise ValueError("live process does not match the recorded harness-owned gateway")
         try:
             _stop_stale_gateway(gateway, record["log"])
@@ -332,12 +340,12 @@ def _started_local_cortex_gateway(
     if hostfile is None:
         hostfile = directory / "hostfile"
         hostfile.write_text(f"{socket.gethostname()} slots={torch.cuda.device_count()}\n")
-    previous = os.environ.get("DSS_CORRECTNESS_TMPDIR")
+    previous = os.environ.get("AP_CORRECTNESS_TMPDIR")
     prepared = None
     if gateway_module == "arctic_platform.correctness.harness.gateway":
         options = {} if allocation_members is None else {"allocation_members": allocation_members}
         prepared = _prepare_gateway_scratch(directory, hostfile, **options)
-        os.environ["DSS_CORRECTNESS_TMPDIR"] = prepared["path"]
+        os.environ["AP_CORRECTNESS_TMPDIR"] = prepared["path"]
     command_options = {}
     if gateway_command_builder is not None or gateway_command_source is not None:
         command_options.update(
@@ -356,9 +364,9 @@ def _started_local_cortex_gateway(
     finally:
         if prepared is not None:
             if previous is None:
-                os.environ.pop("DSS_CORRECTNESS_TMPDIR", None)
+                os.environ.pop("AP_CORRECTNESS_TMPDIR", None)
             else:
-                os.environ["DSS_CORRECTNESS_TMPDIR"] = previous
+                os.environ["AP_CORRECTNESS_TMPDIR"] = previous
 
 
 def _gateway_scratch_identity(info: os.stat_result) -> list[int]:
@@ -511,7 +519,7 @@ def _gateway_scratch_node(request: dict) -> dict:
 def _prepare_gateway_scratch(directory: Path, hostfile: Path, *, allocation_members: dict | None = None) -> dict:
     """Prepare the exact same-allocation scratch parent before starting a gateway."""
     token = uuid.uuid4().hex
-    root = Path(os.environ.get("DSS_CORRECTNESS_TMPDIR") or f"/data-fast/tmp/correctness-gateway-{token}")
+    root = Path(correctness_environment("AP_CORRECTNESS_TMPDIR") or f"/data-fast/tmp/correctness-gateway-{token}")
     if not root.is_absolute() or root.resolve() != root or not root.is_relative_to("/data-fast"):
         raise ValueError("gateway scratch parent must be a canonical FAST descendant")
     host_bytes = hostfile.read_bytes()
@@ -699,7 +707,6 @@ def _owned_gateway_descendants(gateway: dict, token: str) -> list[dict]:
     """Find token-bound children, including workers that detached into another session."""
     leader = _gateway_process_identity(gateway["pid"])
     descendants = []
-    marker = f"DSS_CORRECTNESS_GATEWAY_OWNER={token}".encode()
     for directory in _GATEWAY_PROC_ROOT.iterdir():
         if not directory.name.isdecimal() or int(directory.name) == gateway["pid"]:
             continue
@@ -715,14 +722,15 @@ def _owned_gateway_descendants(gateway: dict, token: str) -> list[dict]:
             if identity is None:
                 continue
             environment = (directory / "environ").read_bytes().split(b"\0")
-            if not original_session and marker not in environment:
+            owned = _gateway_owner_matches(environment, token)
+            if not original_session and not owned:
                 continue
             if (
                 (original_session and int(fields[2]) != gateway["pid"])
                 or identity["uid"] != gateway["uid"]
                 or int(identity["start_time"]) < int(gateway["start_time"])
                 or identity["start_time"] != fields[19]
-                or marker not in environment
+                or not owned
             ):
                 if _gateway_process_identity(int(directory.name)) is None:
                     continue
@@ -866,7 +874,6 @@ def cleanup_owned_gateway(record_path: Path, token: str) -> None:
 
 def _cleanup_unrecorded_gateway(token: str) -> None:
     # Cover owner death between gateway launch and publication of its ownership record.
-    marker = f"DSS_CORRECTNESS_GATEWAY_OWNER={token}".encode()
     for directory in _GATEWAY_PROC_ROOT.iterdir():
         if not directory.name.isdecimal():
             continue
@@ -874,7 +881,7 @@ def _cleanup_unrecorded_gateway(token: str) -> None:
             identity = _gateway_process_identity(int(directory.name))
             if identity is None or identity["uid"] != os.getuid():
                 continue
-            if marker not in (directory / "environ").read_bytes().split(b"\0"):
+            if not _gateway_owner_matches((directory / "environ").read_bytes().split(b"\0"), token):
                 continue
             if os.getpgid(identity["pid"]) != identity["pid"]:
                 continue
@@ -1003,7 +1010,7 @@ def _launch_local_cortex_gateway(
                 # Ray retitles its agents; keep the ownership marker readable in /proc/environ.
                 env={
                     **os.environ,
-                    "DSS_CORRECTNESS_GATEWAY_OWNER": token,
+                    "AP_CORRECTNESS_GATEWAY_OWNER": token,
                     "SPT_NOENV": "1",
                 },
             )

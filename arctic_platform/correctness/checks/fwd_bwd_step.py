@@ -74,17 +74,17 @@ def _compare_arm(ctx, arm, reference: dict, target) -> TestResult:
     provenance_text = json.dumps(provenance, sort_keys=True, allow_nan=False)
     if not target.optimizer_state_manifest:
         raise ValueError("optimizer step did not return the target optimizer-state manifest")
-    dss_summary = summarize_optimizer_artifacts(
+    ap_summary = summarize_optimizer_artifacts(
         Path(target.optimizer_state_manifest),
         optimizer_config=ctx.cfg.training["optimizer"],
         learning_rate=OPTIMIZER_LEARNING_RATE,
         backend="ap",
     )
     reference_summary = reference["optimizer_norms"]
-    comparison = compare_optimizer_norms(dss_summary, reference_summary)
+    comparison = compare_optimizer_norms(ap_summary, reference_summary)
     compared = len(comparison.deltas)
     expected = reference_summary["optimizer_values_count"]
-    if comparison.only_dss or comparison.only_reference:
+    if comparison.only_ap or comparison.only_reference:
         return TestResult(
             test_id="single-step-optimizer",
             config_id=ctx.config_id,
@@ -92,13 +92,13 @@ def _compare_arm(ctx, arm, reference: dict, target) -> TestResult:
             outcome=TestOutcome.FAIL,
             summary=f"only {compared}/{expected} optimizer quantities matched by parameter name",
             reason=(
-                f"Unmatched Arctic Platform parameters: {', '.join(comparison.only_dss[:4]) or 'none'}. "
+                f"Unmatched Arctic Platform parameters: {', '.join(comparison.only_ap[:4]) or 'none'}. "
                 f"Unmatched reference parameters: {', '.join(comparison.only_reference[:4]) or 'none'}. "
                 f"Criterion: {OPTIMIZER_NORM_CRITERION}; reviewed gate provenance: {provenance_text}."
             ),
             metrics={
                 "optimizer_values_compared": float(compared),
-                "unmatched_dss": float(len(comparison.only_dss)),
+                "unmatched_ap": float(len(comparison.only_ap)),
                 "unmatched_reference": float(len(comparison.only_reference)),
             },
         )
@@ -106,7 +106,7 @@ def _compare_arm(ctx, arm, reference: dict, target) -> TestResult:
     values = [
         Mismatch(
             name=f"{item.name}::{item.state}",
-            target=dss_summary["parameters"][item.name][item.state],
+            target=ap_summary["parameters"][item.name][item.state],
             reference=reference_summary["parameters"][item.name][item.state],
             difference=item.delta_norm,
         )
@@ -135,14 +135,14 @@ def _compare_arm(ctx, arm, reference: dict, target) -> TestResult:
         worst_name=worst.name if worst else None,
         metrics={
             "reference_loss": float(reference["loss"]),
-            "dss_loss": target.avg_loss,
+            "ap_loss": target.avg_loss,
             "loss_delta": abs(target.avg_loss - float(reference["loss"])),
             "optimizer_values_compared": float(compared),
             "optimizer_values_over_criterion": float(len(failures)),
             "max_optimizer_norm_delta": worst.abs_diff if worst else 0.0,
             "stated_criterion_abs": gate,
             "reference_microbatches": float(reference["microbatches"]),
-            **({"dss_model_calls_observed": float(target.model_calls)} if target.model_calls is not None else {}),
+            **({"ap_model_calls_observed": float(target.model_calls)} if target.model_calls is not None else {}),
         },
     )
 

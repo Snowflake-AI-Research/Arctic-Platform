@@ -133,7 +133,7 @@ def _normalized(values: Dict[str, float]) -> Dict[str, _Entry]:
     return entries
 
 
-def _canonical_dss(values: Dict[str, float]) -> Dict[str, _Entry]:
+def _canonical_ap(values: Dict[str, float]) -> Dict[str, _Entry]:
     source = _normalized(values)
     canonical: Dict[str, _Entry] = {}
     routed: Dict[str, Dict[str, _Entry]] = {}
@@ -184,7 +184,7 @@ class CanonicalTensorGroup:
     concatenate_dim: Optional[int] = None
 
 
-def canonical_dss_tensor_groups(names: Iterable[str]) -> Dict[str, CanonicalTensorGroup]:
+def canonical_ap_tensor_groups(names: Iterable[str]) -> Dict[str, CanonicalTensorGroup]:
     """Group Arctic Platform tensor names by their Hugging Face parameter representation."""
     canonical: Dict[str, CanonicalTensorGroup] = {}
     routed: Dict[str, Dict[str, str]] = {}
@@ -231,16 +231,16 @@ def _originals(entries: Dict[str, _Entry], keys: set[str]) -> List[str]:
 
 
 def align(
-    dss: Dict[str, float], reference: Dict[str, float]
+    ap: Dict[str, float], reference: Dict[str, float]
 ) -> Tuple[List[Tuple[str, float, float]], List[str], List[str]]:
     """Pair every semantic tensor and return pairs plus uncovered raw names on either side."""
-    dss_by_key = _canonical_dss(dss)
+    ap_by_key = _canonical_ap(ap)
     ref_by_key = _normalized(reference)
-    shared = sorted(set(dss_by_key) & set(ref_by_key))
-    pairs = [(key, dss_by_key[key].value, ref_by_key[key].value) for key in shared]
-    only_dss_keys = set(dss_by_key) - set(ref_by_key)
-    only_ref_keys = set(ref_by_key) - set(dss_by_key)
-    return pairs, _originals(dss_by_key, only_dss_keys), _originals(ref_by_key, only_ref_keys)
+    shared = sorted(set(ap_by_key) & set(ref_by_key))
+    pairs = [(key, ap_by_key[key].value, ref_by_key[key].value) for key in shared]
+    only_ap_keys = set(ap_by_key) - set(ref_by_key)
+    only_ref_keys = set(ref_by_key) - set(ap_by_key)
+    return pairs, _originals(ap_by_key, only_ap_keys), _originals(ref_by_key, only_ref_keys)
 
 
 STATE_KEYS = ("parameter_update", "exp_avg", "exp_avg_sq")
@@ -958,7 +958,7 @@ def canonical_participation(record: dict, *, backend: str) -> dict:
         if key in normalized:
             raise ValueError(f"participation inventory has duplicate canonical name {key}")
         normalized[key] = entry
-    groups = canonical_dss_tensor_groups(normalized) if backend == "ap" else {name: None for name in normalized}
+    groups = canonical_ap_tensor_groups(normalized) if backend == "ap" else {name: None for name in normalized}
     covered = [name for group in groups.values() for name in group.originals] if backend == "ap" else list(groups)
     if sorted(covered) != sorted(normalized):
         raise ValueError("participation inventory has a canonical name collision")

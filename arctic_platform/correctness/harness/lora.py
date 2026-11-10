@@ -49,6 +49,7 @@ from typing import Mapping
 
 from arctic_platform.common.peft import normalize_lora_peft_config
 from arctic_platform.correctness.harness.sft import SEED
+from arctic_platform.correctness.harness.storage import correctness_environment
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 from arctic_platform.debug.training import maybe_select_participation_coordinator
@@ -2051,7 +2052,7 @@ def _owned_worker_session(worker):
     from arctic_platform.correctness.harness.gateway import _gateway_process_identity
     from arctic_platform.correctness.harness.gateway import _reap_owned_gateway_descendants
 
-    token = os.environ.get("DSS_CORRECTNESS_GATEWAY_OWNER", "")
+    token = correctness_environment("AP_CORRECTNESS_GATEWAY_OWNER", "")
     if (
         len(token) != 32
         or any(character not in "0123456789abcdef" for character in token)
@@ -2102,7 +2103,7 @@ def main() -> None:
                     "setsid",
                     "--wait",
                     "env",
-                    f"DSS_CORRECTNESS_GATEWAY_OWNER={os.urandom(16).hex()}",
+                    f"AP_CORRECTNESS_GATEWAY_OWNER={os.urandom(16).hex()}",
                     "SPT_NOENV=1",
                     *selected,
                 ]

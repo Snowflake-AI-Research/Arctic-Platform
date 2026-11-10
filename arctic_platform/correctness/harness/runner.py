@@ -643,7 +643,7 @@ def execute(
             raise ValueError("local optimizer fixture must match the frozen optimizer reference model")
     optimizer_compute_dtype = cfg.optimizer_compute_dtype(reference_model_path) if stepping else None
     target_model = published_fixture["model_name"] if published_fixture is not None else reference_model_path
-    tmp = workdir if workdir is not None else correctness_workdir("dss-correctness-")
+    tmp = workdir if workdir is not None else correctness_workdir("ap-correctness-")
     tmp.mkdir(parents=True, exist_ok=True)
     attn_impl = attn or cfg.attention_implementation
 
@@ -663,7 +663,7 @@ def execute(
                 max_seq_len=definition.max_seq_len,
                 total_tokens=batch.total_tokens,
                 active_tokens=batch.active_tokens,
-                dss_microbatches=definition.microbatches(
+                ap_microbatches=definition.microbatches(
                     correctness_microbatch_tokens(cfg.max_tokens_per_mb), cfg.dp_size
                 ),
                 pad_fraction=batch.pad_fraction,
@@ -1270,7 +1270,7 @@ def execute_rl(
             raise ValueError("explicit inference sampling topology requires only inference-checkpoint-loss")
         _sampling_topology(SimpleNamespace(cfg=cfg, inference_sampling_topology=inference_sampling_topology))
     assert_applicable_tests_registered(spec, cfg.config_id)
-    tmp = workdir if workdir is not None else correctness_workdir("dss-correctness-rl-")
+    tmp = workdir if workdir is not None else correctness_workdir("ap-correctness-rl-")
     tmp.mkdir(parents=True, exist_ok=True)
     context = RunContext(
         config_id=cfg.config_id,

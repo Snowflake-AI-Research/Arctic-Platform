@@ -119,7 +119,7 @@ class ArmSpec:
     max_seq_len: int
     total_tokens: int
     active_tokens: int
-    dss_microbatches: int
+    ap_microbatches: int
     pad_fraction: float
 
 
@@ -212,6 +212,13 @@ class TestSpec:
     @staticmethod
     def read(path: Path) -> "TestSpec":
         raw = json.loads(Path(path).read_text())
+        # Previously onboarded specifications retain their original bytes.
+        for arm in raw["arms"]:
+            if "dss_microbatches" in arm:
+                legacy = arm.pop("dss_microbatches")
+                if "ap_microbatches" in arm and arm["ap_microbatches"] != legacy:
+                    raise ValueError("specification has conflicting AP and legacy microbatch counts")
+                arm.setdefault("ap_microbatches", legacy)
         return TestSpec(
             config_id=raw["config_id"],
             config_path=raw["config_path"],

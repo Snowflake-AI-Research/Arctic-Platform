@@ -148,7 +148,7 @@ from arctic_platform.correctness.harness import cortex as cortex_fixture
 from arctic_platform.correctness.harness import cortex as local_transport_cortex_transport
 from arctic_platform.correctness.harness import execution
 from arctic_platform.correctness.harness import execution as cli
-from arctic_platform.correctness.harness import gateway as dss_driver
+from arctic_platform.correctness.harness import gateway as ap_driver
 from arctic_platform.correctness.harness import gateway as hosted
 from arctic_platform.correctness.harness import gateway as rl_driver
 from arctic_platform.correctness.harness import inference as export
@@ -218,7 +218,7 @@ from arctic_platform.correctness.harness.gateway import save_and_resolve_checkpo
 from arctic_platform.correctness.harness.inference import FAMILIES
 from arctic_platform.correctness.harness.lora import canonical_name
 from arctic_platform.correctness.harness.optimizer import align
-from arctic_platform.correctness.harness.optimizer import canonical_dss_tensor_groups
+from arctic_platform.correctness.harness.optimizer import canonical_ap_tensor_groups
 from arctic_platform.correctness.harness.registry import TestOutcome
 from arctic_platform.correctness.harness.registry import TestOutcome as Outcome
 from arctic_platform.correctness.harness.registry import TestResult as Result
@@ -606,7 +606,7 @@ def _applicable_tests_spec(applicable):
                 max_seq_len=8,
                 total_tokens=8,
                 active_tokens=7,
-                dss_microbatches=1,
+                ap_microbatches=1,
                 pad_fraction=0.125,
             )
         ],
@@ -752,6 +752,38 @@ def test_config_gpu_attention_explicit_lm_head_chunk_precedes_legacy_settings(tm
     training["model_options"] = options
     path.write_text(json.dumps(raw))
     assert load_config(path).lm_head_token_chunk_size == expected
+
+
+@pytest.mark.parametrize(
+    "name", ["TMPDIR", "LOGDIR", "RUNTIME_ADMISSION", "SSH_KNOWN_HOSTS", "SSH_PORT", "GATEWAY_OWNER", "GSM8K_ROOT"]
+)
+@pytest.mark.parametrize("current", [None, "", "ap-setting"])
+def test_ap_correctness_environment_accepts_legacy_alias_with_ap_precedence(monkeypatch, name, current):
+    from arctic_platform.correctness.harness.storage import correctness_environment
+
+    key = "AP_CORRECTNESS_" + name
+    monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("DSS_CORRECTNESS_" + name, raising=False)
+    assert correctness_environment(key, "default") == "default"
+    monkeypatch.setenv("DSS_CORRECTNESS_" + name, "legacy-setting")
+    if current is not None:
+        monkeypatch.setenv(key, current)
+    assert correctness_environment(key, "default") == ("legacy-setting" if current is None else current)
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        ([b"AP_CORRECTNESS_GATEWAY_OWNER=token"], True),
+        ([b"DSS_CORRECTNESS_GATEWAY_OWNER=token"], True),
+        ([b"DSS_CORRECTNESS_GATEWAY_OWNER=other"], False),
+        ([b"AP_CORRECTNESS_GATEWAY_OWNER=other", b"DSS_CORRECTNESS_GATEWAY_OWNER=token"], False),
+        ([b"AP_CORRECTNESS_GATEWAY_OWNER=token", b"DSS_CORRECTNESS_GATEWAY_OWNER=other"], True),
+        ([], False),
+    ],
+)
+def test_ap_gateway_owner_matches_legacy_records_without_overriding_ap(environment, expected):
+    assert ap_driver._gateway_owner_matches(environment, "token") is expected
 
 
 def test_config_gpu_attention_config_checksum_is_canonical_and_tracks_training_behavior(tmp_path: Path) -> None:
@@ -1411,14 +1443,14 @@ def test_flash_recipe_glm_rejects_generic_h200_attention(tmp_path: Path, model: 
 # Config tolerance.
 
 
-def _config_tolerance_context(*, gate: float, dss_norm: float):
+def _config_tolerance_context(*, gate: float, ap_norm: float):
     arm = ArmSpec(
         name="fixed",
         global_batch_size=1,
         max_seq_len=8,
         total_tokens=8,
         active_tokens=7,
-        dss_microbatches=1,
+        ap_microbatches=1,
         pad_fraction=0.125,
     )
     spec = ConfigSpec(
@@ -1440,16 +1472,16 @@ def _config_tolerance_context(*, gate: float, dss_norm: float):
         test_tolerances={"single-step-grads": Tolerance(absolute=gate)},
     )
     reference = {"loss": 1.0, "grad_norms": {"weight": 1.0}, "microbatches": 1}
-    dss = SimpleNamespace(avg_loss=1.0, grad_norms={"weight": dss_norm}, model_calls=1)
+    ap = SimpleNamespace(avg_loss=1.0, grad_norms={"weight": ap_norm}, model_calls=1)
     context = SimpleNamespace(
-        config_id="unit", spec=spec, reference_for=lambda _arm: reference, target_for=lambda _arm: dss
+        config_id="unit", spec=spec, reference_for=lambda _arm: reference, target_for=lambda _arm: ap
     )
     return (context, arm)
 
 
 def test_config_tolerance_gradient_norm_verdict_uses_the_frozen_config_gate():
-    passing_context, arm = _config_tolerance_context(gate=0.01, dss_norm=1.005)
-    failing_context, _ = _config_tolerance_context(gate=0.001, dss_norm=1.005)
+    passing_context, arm = _config_tolerance_context(gate=0.01, ap_norm=1.005)
+    failing_context, _ = _config_tolerance_context(gate=0.001, ap_norm=1.005)
     assert _run_arm(passing_context, arm).outcome.value == "pass"
     assert _run_arm(failing_context, arm).outcome.value == "fail"
 
@@ -1492,14 +1524,14 @@ def test_participation_requires_complete_matching_inventory_and_independent_inac
 
 @pytest.mark.parametrize("norm", [float("nan"), float("inf"), -1.0])
 def test_gradient_comparison_rejects_nonfinite_or_negative_norms(norm):
-    context, arm = _config_tolerance_context(gate=0.001, dss_norm=norm)
+    context, arm = _config_tolerance_context(gate=0.001, ap_norm=norm)
     result = _run_arm(context, arm)
     assert result.outcome.value == "fail"
     assert "finite" in result.reason
 
 
 def test_gradient_comparison_rejects_empty_pairs_and_missing_target_participation():
-    context, arm = _config_tolerance_context(gate=0.001, dss_norm=1.0)
+    context, arm = _config_tolerance_context(gate=0.001, ap_norm=1.0)
     reference, target = context.reference_for(arm), context.target_for(arm)
     reference["grad_norms"].clear()
     target.grad_norms.clear()
@@ -1510,7 +1542,7 @@ def test_gradient_comparison_rejects_empty_pairs_and_missing_target_participatio
 
 
 def test_gradient_comparison_accepts_only_witnessed_inactive_zero_buffers():
-    context, arm = _config_tolerance_context(gate=0.001, dss_norm=1.0)
+    context, arm = _config_tolerance_context(gate=0.001, ap_norm=1.0)
     reference, target = context.reference_for(arm), context.target_for(arm)
     reference["participation"] = _participation_record()
     target.participation = deepcopy(reference["participation"])
@@ -1574,7 +1606,7 @@ def test_config_tolerance_calibrated_gate_rounds_up_and_has_a_one_millithreshold
 
 
 def test_names_qwen35_moe_norms_align_across_fused_and_prime_layouts() -> None:
-    dss = {
+    ap = {
         "model.layers.0._checkpoint_wrapped_module.mlp.router.gate.weight": 1.0,
         "model.layers.0._checkpoint_wrapped_module.mlp.experts.w1": 3.0,
         "model.layers.0._checkpoint_wrapped_module.mlp.experts.w2": 5.0,
@@ -1593,8 +1625,8 @@ def test_names_qwen35_moe_norms_align_across_fused_and_prime_layouts() -> None:
         "model.language_model.layers.0.mlp.shared_expert.up_proj.weight": 8.0,
         "model.language_model.layers.0.mlp.shared_expert_gate.weight": 9.0,
     }
-    pairs, only_dss, only_reference = align(dss, reference)
-    assert not only_dss
+    pairs, only_ap, only_reference = align(ap, reference)
+    assert not only_ap
     assert not only_reference
     assert dict(((name, (actual, expected)) for name, actual, expected in pairs))[
         "layers.0.mlp.experts.gate_up_proj"
@@ -1602,44 +1634,44 @@ def test_names_qwen35_moe_norms_align_across_fused_and_prime_layouts() -> None:
 
 
 def test_names_equal_checkpoint_aliases_collapse_without_losing_coverage() -> None:
-    dss = {
+    ap = {
         "model.layers.0.input_layernorm.weight": 2.0,
         "model.language_model.layers.0._checkpoint_wrapped_module.input_layernorm.weight": 2.0,
     }
     reference = {"model.language_model.layers.0.input_layernorm.weight": 2.0}
-    pairs, only_dss, only_reference = align(dss, reference)
+    pairs, only_ap, only_reference = align(ap, reference)
     assert pairs == [("layers.0.input_layernorm.weight", 2.0, 2.0)]
-    assert not only_dss
+    assert not only_ap
     assert not only_reference
 
 
 def test_names_unequal_checkpoint_aliases_fail_coverage() -> None:
-    dss = {
+    ap = {
         "model.layers.0.input_layernorm.weight": 2.0,
         "model.language_model.layers.0._checkpoint_wrapped_module.input_layernorm.weight": 3.0,
     }
     reference = {"model.language_model.layers.0.input_layernorm.weight": 2.0}
-    _, only_dss, _ = align(dss, reference)
-    assert only_dss == ["model.language_model.layers.0._checkpoint_wrapped_module.input_layernorm.weight"]
+    _, only_ap, _ = align(ap, reference)
+    assert only_ap == ["model.language_model.layers.0._checkpoint_wrapped_module.input_layernorm.weight"]
 
 
 def test_names_unmatched_zero_vision_gradients_fail_coverage() -> None:
-    dss = {"model.visual.blocks.0.attn.qkv.weight": 0.0, "model.layers.0.input_layernorm.weight": 2.0}
+    ap = {"model.visual.blocks.0.attn.qkv.weight": 0.0, "model.layers.0.input_layernorm.weight": 2.0}
     reference = {"model.language_model.layers.0.input_layernorm.weight": 2.0}
-    pairs, only_dss, only_reference = align(dss, reference)
+    pairs, only_ap, only_reference = align(ap, reference)
     assert pairs == [("layers.0.input_layernorm.weight", 2.0, 2.0)]
-    assert only_dss == ["model.visual.blocks.0.attn.qkv.weight"]
+    assert only_ap == ["model.visual.blocks.0.attn.qkv.weight"]
     assert not only_reference
 
 
 def test_names_nonzero_vision_gradient_fails_text_only_coverage() -> None:
-    dss = {"model.visual.blocks.0.attn.qkv.weight": 1.0}
-    _, only_dss, _ = align(dss, {})
-    assert only_dss == ["model.visual.blocks.0.attn.qkv.weight"]
+    ap = {"model.visual.blocks.0.attn.qkv.weight": 1.0}
+    _, only_ap, _ = align(ap, {})
+    assert only_ap == ["model.visual.blocks.0.attn.qkv.weight"]
 
 
 def test_names_qwen4_shared_expert_norms_follow_the_weight_conversion() -> None:
-    dss = {
+    ap = {
         "model.layers.0._checkpoint_wrapped_module.mlp.qwen_shared_expert.w1.weight": 6.0,
         "model.layers.0._checkpoint_wrapped_module.mlp.qwen_shared_expert.w2.weight": 7.0,
         "model.layers.0._checkpoint_wrapped_module.mlp.qwen_shared_expert.w3.weight": 8.0,
@@ -1649,8 +1681,8 @@ def test_names_qwen4_shared_expert_norms_follow_the_weight_conversion() -> None:
         "model.language_model.layers.0.mlp.shared_expert.down_proj.weight": 7.0,
         "model.language_model.layers.0.mlp.shared_expert.up_proj.weight": 8.0,
     }
-    pairs, only_dss, only_reference = align(dss, reference)
-    assert not only_dss
+    pairs, only_ap, only_reference = align(ap, reference)
+    assert not only_ap
     assert not only_reference
     assert len(pairs) == 3
     assert all((actual == expected for _, actual, expected in pairs))
@@ -1659,33 +1691,33 @@ def test_names_qwen4_shared_expert_norms_follow_the_weight_conversion() -> None:
 @pytest.mark.parametrize("source,target", [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")])
 def test_names_qwen4_shared_expert_tensor_groups_preserve_original_names(source: str, target: str) -> None:
     original = f"model.layers.2.mlp.qwen_shared_expert.{source}.weight"
-    groups = canonical_dss_tensor_groups([original])
+    groups = canonical_ap_tensor_groups([original])
     group = groups[f"layers.2.mlp.shared_expert.{target}.weight"]
     assert group.originals == (original,)
     assert group.concatenate_dim is None
 
 
 def test_names_qwen4_shared_expert_mapping_preserves_numerical_differences() -> None:
-    pairs, only_dss, only_reference = align(
+    pairs, only_ap, only_reference = align(
         {"model.layers.0.mlp.qwen_shared_expert.w1.weight": 2.0},
         {"model.language_model.layers.0.mlp.shared_expert.gate_proj.weight": 3.0},
     )
     assert pairs == [("layers.0.mlp.shared_expert.gate_proj.weight", 2.0, 3.0)]
-    assert not only_dss
+    assert not only_ap
     assert not only_reference
 
 
 def test_names_qwen4_unequal_shared_expert_aliases_fail_coverage() -> None:
-    dss = {"model.layers.0.mlp.qwen_shared_expert.w1.weight": 2.0, "model.layers.0.shared_expert.w1.weight": 3.0}
+    ap = {"model.layers.0.mlp.qwen_shared_expert.w1.weight": 2.0, "model.layers.0.shared_expert.w1.weight": 3.0}
     reference = {"model.language_model.layers.0.mlp.shared_expert.gate_proj.weight": 2.0}
-    pairs, only_dss, only_reference = align(dss, reference)
+    pairs, only_ap, only_reference = align(ap, reference)
     assert pairs == [("layers.0.mlp.shared_expert.gate_proj.weight", 2.0, 2.0)]
-    assert only_dss == ["model.layers.0.shared_expert.w1.weight"]
+    assert only_ap == ["model.layers.0.shared_expert.w1.weight"]
     assert not only_reference
 
 
 def test_names_glm53_bare_shared_expert_norms_follow_the_weight_conversion() -> None:
-    dss = {
+    ap = {
         "model.language_model.layers.3._checkpoint_wrapped_module.mlp.shared_expert.w1": 6.0,
         "model.language_model.layers.3._checkpoint_wrapped_module.mlp.shared_expert.w2": 7.0,
         "model.language_model.layers.3._checkpoint_wrapped_module.mlp.shared_expert.w3": 8.0,
@@ -1695,52 +1727,52 @@ def test_names_glm53_bare_shared_expert_norms_follow_the_weight_conversion() -> 
         "model.language_model.layers.3.mlp.shared_experts.down_proj.weight": 7.0,
         "model.language_model.layers.3.mlp.shared_experts.up_proj.weight": 8.0,
     }
-    pairs, only_dss, only_reference = align(dss, reference)
+    pairs, only_ap, only_reference = align(ap, reference)
     assert pairs == [
         ("layers.3.mlp.shared_experts.down_proj.weight", 7.0, 7.0),
         ("layers.3.mlp.shared_experts.gate_proj.weight", 6.0, 6.0),
         ("layers.3.mlp.shared_experts.up_proj.weight", 8.0, 8.0),
     ]
-    assert not only_dss
+    assert not only_ap
     assert not only_reference
 
 
 @pytest.mark.parametrize("source,target", [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")])
 def test_names_glm53_bare_shared_expert_tensor_groups_preserve_raw_originals(source: str, target: str) -> None:
     original = f"model.language_model.layers.3._checkpoint_wrapped_module.mlp.shared_expert.{source}"
-    group = canonical_dss_tensor_groups([original])[f"layers.3.mlp.shared_experts.{target}.weight"]
+    group = canonical_ap_tensor_groups([original])[f"layers.3.mlp.shared_experts.{target}.weight"]
     assert group.originals == (original,)
     assert group.concatenate_dim is None
 
 
 @pytest.mark.parametrize("source,target", [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")])
 def test_names_glm53_bare_shared_expert_mapping_preserves_numerical_differences(source: str, target: str) -> None:
-    pairs, only_dss, only_reference = align(
+    pairs, only_ap, only_reference = align(
         {f"model.language_model.layers.3.mlp.shared_expert.{source}": 2.0},
         {f"model.language_model.layers.3.mlp.shared_experts.{target}.weight": 3.0},
     )
     assert pairs == [(f"layers.3.mlp.shared_experts.{target}.weight", 2.0, 3.0)]
-    assert not only_dss
+    assert not only_ap
     assert not only_reference
 
 
 def test_names_glm53_bare_shared_expert_mapping_does_not_drop_unmatched_indexer() -> None:
     indexer = "model.language_model.layers.3._checkpoint_wrapped_module.self_attn.indexer.index_kpool_compress_ape"
-    pairs, only_dss, only_reference = align(
+    pairs, only_ap, only_reference = align(
         {"model.language_model.layers.3.mlp.shared_expert.w1": 2.0, indexer: 1.0},
         {"model.language_model.layers.3.mlp.shared_experts.gate_proj.weight": 2.0},
     )
     assert pairs == [("layers.3.mlp.shared_experts.gate_proj.weight", 2.0, 2.0)]
-    assert only_dss == [indexer]
+    assert only_ap == [indexer]
     assert not only_reference
 
 
 def test_names_glm53_bare_shared_expert_does_not_match_singular_hf_container() -> None:
     original = "model.language_model.layers.3.mlp.shared_expert.w1"
     reference = "model.language_model.layers.3.mlp.shared_expert.gate_proj.weight"
-    pairs, only_dss, only_reference = align({original: 2.0}, {reference: 2.0})
+    pairs, only_ap, only_reference = align({original: 2.0}, {reference: 2.0})
     assert not pairs
-    assert only_dss == [original]
+    assert only_ap == [original]
     assert only_reference == [reference]
 
 
@@ -2352,10 +2384,10 @@ def test_rl_bootstrap_sft_missing_spec_still_requires_reviewed_spec(monkeypatch,
 
 @pytest.fixture(autouse=False)
 def _isolated_gateway_ownership(tmp_path, monkeypatch):
-    scanner = dss_driver._legacy_owned_gateways
-    monkeypatch.setattr(dss_driver, "_gateway_state_directory", lambda: tmp_path / "gateway-ownership")
-    monkeypatch.setattr(dss_driver, "_legacy_owned_gateways", lambda: [])
-    monkeypatch.setattr(dss_driver, "_gateway_owner_guard", lambda *args: nullcontext())
+    scanner = ap_driver._legacy_owned_gateways
+    monkeypatch.setattr(ap_driver, "_gateway_state_directory", lambda: tmp_path / "gateway-ownership")
+    monkeypatch.setattr(ap_driver, "_legacy_owned_gateways", lambda: [])
+    monkeypatch.setattr(ap_driver, "_gateway_owner_guard", lambda *args: nullcontext())
     return scanner
 
 
@@ -2442,13 +2474,13 @@ def test_clean_port_checkpoint_cases_use_plain_supervised_requests(provider, cas
         cfg=SimpleNamespace(training={"model_provider": provider}),
         vocab_size=128,
     )
-    arm = SimpleNamespace(name=case, global_batch_size=rows, max_seq_len=8, dss_microbatches=calls)
+    arm = SimpleNamespace(name=case, global_batch_size=rows, max_seq_len=8, ap_microbatches=calls)
     bodies = checkpoint_resume._iteration_bodies(ctx, arm)
     batches = checkpoint_resume.iteration_batches(ctx, arm)
     for body, batch in zip(bodies, batches, strict=True):
         assert isinstance(body["batch"], dict)
         assert body["processing"] == {"loss_fn": "sft"}
-        lowered = dss_driver.cortex_training_body(body)
+        lowered = ap_driver.cortex_training_body(body)
         assert "processing" not in lowered
         assert lowered["kwargs"]["input_ids"].shape == (rows, 8)
         labels = batch.shifted_labels() if provider == "prime_rl" else batch.labels
@@ -2456,18 +2488,18 @@ def test_clean_port_checkpoint_cases_use_plain_supervised_requests(provider, cas
 
 
 def test_clean_port_payload_does_not_invent_deepep_chunking():
-    payload = dss_driver.build_payload({"ep_size": 4, "mb_spec": {"max_tokens_per_mb": 10240}}, "model", 42)
+    payload = ap_driver.build_payload({"ep_size": 4, "mb_spec": {"max_tokens_per_mb": 10240}}, "model", 42)
     assert "deepep_token_chunk_size" not in payload["training_config"]
-    configured = dss_driver.build_payload({"ep_size": 4, "deepep_token_chunk_size": 4096}, "model", 42)
+    configured = ap_driver.build_payload({"ep_size": 4, "deepep_token_chunk_size": 4096}, "model", 42)
     assert configured["training_config"]["deepep_token_chunk_size"] == 4096
 
 
 def test_clean_port_normal_runner_has_no_execution_overlay_or_config_specific_loss_selector():
     assert "optimizer_capture_worker" not in vars(runner)
-    assert not hasattr(dss_driver, "ap_batch_processing_options")
-    assert not hasattr(dss_driver, "pack_microbatches")
-    assert "gradient_accumulation_steps" not in inspect.signature(dss_driver.build_payload).parameters
-    assert "processing_config" not in inspect.signature(dss_driver.pack).parameters
+    assert not hasattr(ap_driver, "ap_batch_processing_options")
+    assert not hasattr(ap_driver, "pack_microbatches")
+    assert "gradient_accumulation_steps" not in inspect.signature(ap_driver.build_payload).parameters
+    assert "processing_config" not in inspect.signature(ap_driver.pack).parameters
 
 
 def test_clean_port_core_fixture_binding_has_no_upload_account_or_subprocess_dependency():
@@ -2523,7 +2555,7 @@ def test_clean_port_golden_fused_cross_entropy_uses_configured_accumulation(monk
 
 
 def test_clean_port_sampling_does_not_select_gdn_backend_to_match_training():
-    payload = dss_driver.sampling_payload("model", 42, dtype="bfloat16", n_gpus=4, max_seq_len=128)
+    payload = ap_driver.sampling_payload("model", 42, dtype="bfloat16", n_gpus=4, max_seq_len=128)
     assert "gdn_prefill_backend" not in payload["inference_config"]["vllm_config"]
 
 
@@ -4098,6 +4130,92 @@ def test_console_failing_gate_reports_failed_tensors() -> None:
     assert "2/47" in rendered
 
 
+@pytest.mark.parametrize("prefix", ["ap", "dss", "both"])
+def test_console_target_metrics_use_ap_names_and_read_historical_results(prefix) -> None:
+    metrics = {
+        "reference_loss": 2.0,
+        "loss_delta": 0.125,
+        "reference_microbatches": 4.0,
+        "tensors_compared": 4.0,
+    }
+    for label in ("ap", "dss") if prefix == "both" else (prefix,):
+        metrics.update(
+            {
+                f"{label}_loss": 2.125,
+                f"{label}_model_calls_observed": 4.0,
+                f"{label}_microbatches_predicted": 4.0,
+                f"unmatched_{label}": 2.0,
+            }
+        )
+    if prefix == "both":
+        metrics.update(dss_loss=9.0, dss_model_calls_observed=9.0, dss_microbatches_predicted=8.0, unmatched_dss=9.0)
+    rendered = arm_verdict(
+        Result(test_id="single-step-grads", config_id="example", outcome=Outcome.FAIL, metrics=metrics), None
+    )
+    assert "Arctic Platform 2.125000" in rendered
+    assert "Arctic Platform 4" in rendered
+    assert "2 unmatched" in rendered
+    assert "9.000000" not in rendered
+    assert "9 unmatched" not in rendered
+    assert "predicted" not in rendered
+
+
+@pytest.mark.parametrize("norm", [1.0, 2.0])
+def test_gradient_arm_emits_only_ap_target_metrics(norm) -> None:
+    from arctic_platform.correctness.checks import fwd_bwd
+
+    arm = ArmSpec("gas4", 4, 8, 32, 28, 4, 0.125)
+    reference = {"loss": 2.0, "grad_norms": {"layer.weight": 1.0}, "microbatches": 4}
+    target = SimpleNamespace(avg_loss=2.125, grad_norms={"layer.weight": norm}, model_calls=4)
+    ctx = SimpleNamespace(
+        config_id="example",
+        reference_for=lambda _: reference,
+        target_for=lambda _: target,
+        spec=SimpleNamespace(tolerance_for=lambda _: 0.001),
+    )
+    result = fwd_bwd._run_arm(ctx, arm)
+    assert result.outcome is (Outcome.PASS if norm == 1.0 else Outcome.FAIL)
+    assert result.metrics["ap_loss"] == 2.125
+    assert result.metrics["ap_microbatches_predicted"] == 4.0
+    assert result.metrics["ap_model_calls_observed"] == 4.0
+    assert result.metrics["unmatched_ap"] == 0.0
+    assert not any("dss" in name for name in result.metrics)
+    if norm == 2.0:
+        assert "4 microbatches" in result.reason
+
+
+@pytest.mark.parametrize(
+    "fields", [("ap_microbatches",), ("dss_microbatches",), ("ap_microbatches", "dss_microbatches")]
+)
+def test_config_spec_reads_historical_arm_names_and_writes_only_ap(tmp_path, fields) -> None:
+    from arctic_platform.correctness.harness.config import TestSpec
+
+    path = tmp_path / "spec.json"
+    raw = json.loads(_applicable_tests_spec(["single-step-grads"]).to_json())
+    for arm in raw["arms"]:
+        arm.pop("ap_microbatches")
+        arm.update({key: 4 for key in fields})
+    original = json.dumps(raw)
+    path.write_text(original)
+    spec = TestSpec.read(path)
+    assert path.read_text() == original
+    for saved, arm in zip(raw["arms"], spec.arms):
+        assert arm.ap_microbatches == saved[fields[0]]
+    written = json.loads(spec.to_json())
+    assert all("ap_microbatches" in arm and "dss_microbatches" not in arm for arm in written["arms"])
+
+
+def test_config_spec_rejects_conflicting_legacy_arm_counts(tmp_path) -> None:
+    from arctic_platform.correctness.harness.config import TestSpec
+
+    path = tmp_path / "spec.json"
+    raw = json.loads(_applicable_tests_spec(["single-step-grads"]).to_json())
+    raw["arms"][0]["dss_microbatches"] = raw["arms"][0]["ap_microbatches"] + 1
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="conflicting AP and legacy"):
+        TestSpec.read(path)
+
+
 @pytest.mark.parametrize("metric", ["max_optimizer_norm_delta", "max_optimizer_delta_norm"])
 def test_console_optimizer_gate_names_residual_delta_and_reports_passed_values(
     metric,
@@ -4311,7 +4429,7 @@ def _diagnostics_dispatch_chunking_config():
     return LoadedConfig("test", Path("test.config"), sub_job, [sub_job, second])
 
 
-def test_diagnostics_dispatch_chunking_removes_only_knob_from_copied_training_configs():
+def test_diagnostics_dispatch_chunking_disables_only_model_option_in_copied_training_configs():
     from arctic_platform.correctness.diagnostics.lm_head_chunking import KNOB
     from arctic_platform.correctness.diagnostics.lm_head_chunking import without_chunked_head
 
@@ -4321,13 +4439,58 @@ def test_diagnostics_dispatch_chunking_removes_only_knob_from_copied_training_co
     assert cfg == before
     assert stripped is not cfg
     for sub in [stripped.sub_job, *stripped.sub_jobs]:
-        assert KNOB not in sub["training_config"]
-        assert KNOB not in sub["training_config"].get("prime_rl", {})
+        assert sub["training_config"]["model_options"][KNOB] == "disabled"
+    assert stripped.lm_head_token_chunk_size is None
     expected = copy.deepcopy(before)
     for sub in [expected.sub_job, *expected.sub_jobs]:
-        sub["training_config"].pop(KNOB, None)
-        sub["training_config"].get("prime_rl", {}).pop(KNOB, None)
+        sub["training_config"]["model_options"] = {KNOB: "disabled"}
     assert stripped == expected
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        None,
+        {},
+        {"lm_head.token_chunk_size": 1024},
+        {"lm_head": {"token_chunk_size": 2048, "fp32": True}},
+        {"lm_head.token_chunk_size": 1024, "lm_head": {"token_chunk_size": 2048}},
+        {"lm_head": {"token_chunk_size": "disabled"}},
+        {"attention": {"backend": "sdpa"}, "lm_head.cross_entropy": "liger"},
+    ],
+)
+def test_lm_head_diagnostic_disables_modern_options_without_mutating_source(tmp_path, options):
+    from arctic_platform.correctness.diagnostics.lm_head_chunking import without_chunked_head
+
+    path = _config_gpu_attention_write_config(tmp_path, "h200", "flash_attention_3")
+    raw = json.loads(path.read_text())
+    training = raw["training"]["ds_worker_config"]
+    training.update(
+        model_options=copy.deepcopy(options),
+        fused_lm_head_token_chunk_size=4096,
+        prime_rl={"fused_lm_head_token_chunk_size": 8192, "fused_cross_entropy": False},
+    )
+    path.write_text(json.dumps(raw))
+    source = path.read_bytes()
+    cfg = load_config(path)
+    cfg.sub_jobs.extend([copy.deepcopy(cfg.sub_job), {"job_type": "sampling", "sampling_config": {"temperature": 1}}])
+    original = copy.deepcopy(cfg)
+    changed = without_chunked_head(cfg)
+    assert cfg == original
+    assert path.read_bytes() == source
+    assert changed.lm_head_token_chunk_size is None
+    assert changed.sub_jobs[-1] == cfg.sub_jobs[-1]
+    for sub in [changed.sub_job, *changed.sub_jobs[:-1]]:
+        modified = sub["training_config"]
+        assert modified["prime_rl"] == cfg.training["prime_rl"]
+        assert modified["fused_lm_head_token_chunk_size"] == 4096
+        updated = copy.deepcopy(options) or {}
+        updated["lm_head.token_chunk_size"] = "disabled"
+        if isinstance(updated.get("lm_head"), dict):
+            updated["lm_head"]["token_chunk_size"] = "disabled"
+        assert modified["model_options"] == updated
+    payload = build_payload(changed.training, changed.model_name, 42, lm_head_token_chunk_size=2048)
+    assert payload["training_config"]["model_options"]["lm_head.token_chunk_size"] == "disabled"
 
 
 @pytest.mark.parametrize("arguments", [None, [], ["--config", "test.config", "--test", "single-step-grads"]])
@@ -4427,7 +4590,7 @@ def test_gateway_lifecycle_available_gpus_reads_a_hostfile_without_a_prestarted_
     hostfile.write_text("node-a slots=8\nnode-b slots=8\n")
     monkeypatch.delenv("DSS_GATEWAY_URL", raising=False)
     monkeypatch.setenv("DSS_GATEWAY_HOSTFILE", str(hostfile))
-    assert dss_driver.available_gpus() == 16
+    assert ap_driver.available_gpus() == 16
 
 
 # Operator api.
@@ -4889,7 +5052,7 @@ def _onboarding_prerequisites(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(config_module, "load_config", lambda *a: config)
     monkeypatch.setattr(registry, "registered_tests", lambda: tests)
-    monkeypatch.setattr(dss_driver, "_allocation_hostfile", lambda: None)
+    monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: None)
     calls = []
     result = {
         "host": "head",
@@ -4930,7 +5093,7 @@ def test_onboarding_refuses_bf16_accumulation_before_any_work(
             state.onboard, name, lambda *a: pytest.fail("precision prerequisite reached setup or model work")
         )
     monkeypatch.setattr(
-        dss_driver, "recover_local_cortex_gateway", lambda: pytest.fail("precision prerequisite recovered gateway")
+        ap_driver, "recover_local_cortex_gateway", lambda: pytest.fail("precision prerequisite recovered gateway")
     )
 
     with pytest.raises(ValueError, match="use FP32 HF gradient accumulation") as caught:
@@ -5196,7 +5359,7 @@ def test_onboarding_recovers_orphan_before_reference_prerequisites_and_reports_c
         assert state.calls == []
         recovered.append(True)
 
-    monkeypatch.setattr(dss_driver, "recover_local_cortex_gateway", recover)
+    monkeypatch.setattr(ap_driver, "recover_local_cortex_gateway", recover)
     state.onboard._onboarding_preflight(state.args, state.config)
     assert recovered == [True] and len(state.calls) == 1
     output = capsys.readouterr().out
@@ -5210,7 +5373,7 @@ def test_onboarding_external_service_does_not_recover_local_gateway(_onboarding_
     state.args.backend = "cortex"
     state.args.base_url = "http://127.0.0.1:8003"
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "recover_local_cortex_gateway",
         lambda: pytest.fail("external service recovery"),
     )
@@ -5250,7 +5413,7 @@ def test_onboarding_prerequisites_check_actual_allocation_nodes(
     if fault == "capacity":
         hostfile.write_text("head slots=4\npeer slots=2\n")
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "_allocation_hostfile",
         lambda: None if fault == "no-hostfile" else hostfile,
     )
@@ -5309,7 +5472,7 @@ def test_onboarding_prerequisites_reference_workers_are_not_target_requirements(
             for host in ("head", "peer")
         }
     )
-    monkeypatch.setattr(dss_driver, "_allocation_hostfile", lambda: hostfile)
+    monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: hostfile)
     monkeypatch.setattr(preflight, "allocation_onboarding_prerequisites", remote)
     state.onboard._onboarding_preflight(state.args, state.config)
     assert state.calls[0]["min_gpus"] == (workers or 1)
@@ -5361,9 +5524,9 @@ def test_onboarding_sampling_prerequisites_follow_selected_provider(
     state.args._automatic_cortex_gateway = route == "native"
     state.args.test_spec.write_text("{}")
     monkeypatch.setattr(state.onboard, "_configure_fixture_target", lambda *args: None)
-    monkeypatch.setattr(dss_driver, "recover_local_cortex_gateway", lambda: None)
+    monkeypatch.setattr(ap_driver, "recover_local_cortex_gateway", lambda: None)
     # P1 registers only supervised checks; this fixture isolates the shared provider selection.
-    monkeypatch.setattr(dss_driver, "rl_gpu_count", lambda config: config.n_gpus, raising=False)
+    monkeypatch.setattr(ap_driver, "rl_gpu_count", lambda config: config.n_gpus, raising=False)
     if route == "references":
         from arctic_platform.correctness.harness.config import TestSpec
 
@@ -5425,8 +5588,8 @@ def test_onboarding_router_replay_prerequisite_follows_local_recipe(
     elif replay == "routed-experts":
         state.config.sub_jobs[0]["inference_config"]["vllm_config"] = {"enable_return_routed_experts": True}
     monkeypatch.setattr(state.onboard, "_configure_fixture_target", lambda *args: None)
-    monkeypatch.setattr(dss_driver, "recover_local_cortex_gateway", lambda: None)
-    monkeypatch.setattr(dss_driver, "rl_gpu_count", lambda config: config.n_gpus, raising=False)
+    monkeypatch.setattr(ap_driver, "recover_local_cortex_gateway", lambda: None)
+    monkeypatch.setattr(ap_driver, "rl_gpu_count", lambda config: config.n_gpus, raising=False)
     if route == "references":
         from arctic_platform.correctness.harness.config import TestSpec
 
@@ -5601,7 +5764,7 @@ def test_onboarding_native_sampling_uses_provider_version_guard(_node_prerequisi
     state.request["modules"].append("arctic_platform.inference.utils")
     result = preflight.onboarding_node_prerequisites(state.request)
     assert bool(result["errors"]) == (fault is not None)
-    assert checked == ([] if fault == "import" else ["DSS correctness sampling"])
+    assert checked == ([] if fault == "import" else ["Arctic Platform correctness sampling"])
     if fault == "version":
         assert "supports vLLM v0.31.0 only" in "\n".join(result["errors"])
     assert not Path(state.request["writable"]["scratch"]).exists()
@@ -5753,7 +5916,7 @@ def test_onboarding_total_runtime_is_last_and_retained_in_console_log(tmp_path, 
     from arctic_platform.correctness.onboarding import onboard
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
+    monkeypatch.delenv("AP_CORRECTNESS_LOGDIR", raising=False)
     ticks = iter([100.0, 167.01])
     monkeypatch.setattr(onboard.time, "monotonic", lambda: next(ticks))
 
@@ -5774,7 +5937,7 @@ def test_onboarding_total_runtime_is_last_and_retained_in_console_log(tmp_path, 
         assert banner in (args._diagnostics_dir / "onboarding.log").read_text()
     assert captured.out.splitlines()[-1] == "Total run time: 00:01:08"
     assert (args._diagnostics_dir / "onboarding.log").read_text().splitlines()[-1] == "Total run time: 00:01:08"
-    assert "DSS_CORRECTNESS_LOGDIR" not in os.environ
+    assert "AP_CORRECTNESS_LOGDIR" not in os.environ
 
 
 @pytest.mark.parametrize("failure", [None, "exit", "exception", "combined"])
@@ -5783,7 +5946,7 @@ def test_onboarding_reports_each_attempt_time_and_separates_shared_preparation(
 ):
     state = _onboarding_prerequisites
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
+    monkeypatch.delenv("AP_CORRECTNESS_LOGDIR", raising=False)
     clock = [100.0]
     monkeypatch.setattr(state.onboard.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(state.onboard, "run", state.onboard._onboard_configuration)
@@ -5889,7 +6052,7 @@ def test_onboarding_final_timing_survives_interruption_or_unsafe_cleanup(tmp_pat
     from arctic_platform.correctness.onboarding import onboard
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
+    monkeypatch.delenv("AP_CORRECTNESS_LOGDIR", raising=False)
     clock = [100.0]
     monkeypatch.setattr(onboard.time, "monotonic", lambda: clock[0])
 
@@ -5930,15 +6093,15 @@ def test_onboarding_failure_banner_uppercases_only_heading_and_preserves_diagnos
 @pytest.mark.parametrize("destination", ["workspace", "environment", "explicit"])
 def test_regression_failure_logs_use_durable_report_directory(tmp_path, monkeypatch, destination):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
+    monkeypatch.delenv("AP_CORRECTNESS_LOGDIR", raising=False)
     root = tmp_path / "work" / "logs"
     options = api.RunOptions()
     if destination == "environment":
         root = tmp_path / "retained-logs"
-        monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(root))
+        monkeypatch.setenv("AP_CORRECTNESS_LOGDIR", str(root))
     elif destination == "explicit":
         root = tmp_path / "explicit-report"
-        monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(tmp_path / "unused-logs"))
+        monkeypatch.setenv("AP_CORRECTNESS_LOGDIR", str(tmp_path / "unused-logs"))
         options = api.RunOptions(out=root)
     _operator_api_fake_batches(monkeypatch, [RuntimeError("synthetic target failure")])
     result = api.run(
@@ -5959,12 +6122,12 @@ def test_regression_failure_logs_use_durable_report_directory(tmp_path, monkeypa
 @pytest.mark.parametrize("destination", ["workspace", "environment", "explicit"])
 def test_compatibility_runner_uses_durable_report_directory_before_backend(tmp_path, monkeypatch, destination):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("DSS_CORRECTNESS_LOGDIR", raising=False)
+    monkeypatch.delenv("AP_CORRECTNESS_LOGDIR", raising=False)
     root = tmp_path / "work" / "logs"
     args = execution.parse_args(["run", "--config", _operator_api_CONFIG])
     if destination == "environment":
         root = tmp_path / "retained-logs"
-        monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(root))
+        monkeypatch.setenv("AP_CORRECTNESS_LOGDIR", str(root))
     elif destination == "explicit":
         root = tmp_path / "explicit-report"
         args.out = root
@@ -5986,7 +6149,7 @@ def test_regression_help_describes_durable_logs_and_untracked_reference_records(
         execution.parse_args(["run", "--help"])
     assert exc.value.code == 0
     help_text = capsys.readouterr().out
-    assert "./work/logs" in help_text and "DSS_CORRECTNESS_LOGDIR" in help_text
+    assert "./work/logs" in help_text and "AP_CORRECTNESS_LOGDIR" in help_text
     assert "Git-tracked prepared HF records" not in help_text
     assert "default a unique directory under /data-fast/tmp" not in help_text
 
@@ -6144,7 +6307,7 @@ def test_operator_api_parse_flags_is_shared_with_operator_command():
 
 
 def test_operator_api_static_guide_is_unchanged_by_run_and_onboarding(tmp_path, monkeypatch):
-    monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("AP_CORRECTNESS_LOGDIR", str(tmp_path / "logs"))
     guide = api.PACKAGE_DIR / "docs" / "running-tests.md"
     before = guide.read_bytes()
     monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **k: 128)
@@ -6520,9 +6683,9 @@ def test_workdir_root_correctness_workdir_prefers_data_fast_over_unsafe_tmpdir(
     monkeypatch.setattr(workdir, "_DATA_FAST_TMPDIR", data_fast_tmp)
     monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", data_fast_tmp.parent)
     monkeypatch.setenv("TMPDIR", "/code/users/stas/ap3tmp")
-    created = workdir.correctness_workdir("dss-correctness-")
+    created = workdir.correctness_workdir("ap-correctness-")
     assert created.parent == data_fast_tmp
-    assert created.name.startswith("dss-correctness-")
+    assert created.name.startswith("ap-correctness-")
 
 
 def test_workdir_root_correctness_workdir_fails_closed_without_data_fast(
@@ -6534,7 +6697,7 @@ def test_workdir_root_correctness_workdir_fails_closed_without_data_fast(
     monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", missing_root)
     monkeypatch.setenv("TMPDIR", "/code/users/stas/ap3tmp")
     with pytest.raises(ValueError, match="existing /data-fast"):
-        workdir.correctness_workdir("dss-correctness-")
+        workdir.correctness_workdir("ap-correctness-")
     assert not missing_root.exists()
 
 
@@ -6549,7 +6712,7 @@ def test_workdir_root_correctness_workdir_honors_safe_explicit_override(
     monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", data_fast)
     monkeypatch.setenv("TMPDIR", "/code/users/stas/ap3tmp")
     monkeypatch.setenv(CORRECTNESS_TMPDIR_ENV, str(override))
-    created = workdir.correctness_workdir("dss-correctness-")
+    created = workdir.correctness_workdir("ap-correctness-")
     assert created.parent == override
 
 
@@ -6559,7 +6722,7 @@ def test_workdir_root_correctness_workdir_rejects_unsafe_explicit_override(
     _workdir_root_reset_tmp_env(monkeypatch)
     monkeypatch.setenv(CORRECTNESS_TMPDIR_ENV, "/code/users/stas/ap3tmp")
     with pytest.raises(ValueError, match=CORRECTNESS_TMPDIR_ENV):
-        workdir.correctness_workdir("dss-correctness-")
+        workdir.correctness_workdir("ap-correctness-")
 
 
 @pytest.fixture
@@ -7521,7 +7684,7 @@ def test_onboarding_automatic_gateway_uses_upstream_server_and_closes_owned_proc
     process.wait.return_value = 0
     start = Mock(return_value=process)
     monkeypatch.setattr(onboard.subprocess, "Popen", start)
-    monkeypatch.setattr(dss_driver, "_allocation_hostfile", lambda: Path("/job/hostfile") if job_hostfile else None)
+    monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: Path("/job/hostfile") if job_hostfile else None)
     is_file = Path.is_file
     monkeypatch.setattr(
         Path,
@@ -7530,11 +7693,11 @@ def test_onboarding_automatic_gateway_uses_upstream_server_and_closes_owned_proc
     )
     listener = MagicMock()
     listener.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 54321)
-    monkeypatch.setattr(dss_driver.socket, "socket", lambda: listener)
+    monkeypatch.setattr(ap_driver.socket, "socket", lambda: listener)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     monkeypatch.setattr(requests, "get", lambda *a, **k: SimpleNamespace(status_code=200))
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "_gateway_process_identity",
         lambda pid: {"pid": pid, "uid": os.getuid(), "start_time": "1"},
     )
@@ -7604,9 +7767,9 @@ def _automatic_regression_gateway(tmp_path, monkeypatch):
 
     for name in ("ARCTIC_CORTEX_HOST", "ARCTIC_CORTEX_BASE_URL", "ARCTIC_CORTEX_PAT"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(dss_driver, "_allocation_hostfile", lambda: None)
+    monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: None)
     monkeypatch.setattr(
-        dss_driver, "_prepare_gateway_scratch", lambda *a, **k: {"path": str(tmp_path / "gateway-scratch")}
+        ap_driver, "_prepare_gateway_scratch", lambda *a, **k: {"path": str(tmp_path / "gateway-scratch")}
     )
     is_file = Path.is_file
     monkeypatch.setattr(
@@ -7616,7 +7779,7 @@ def _automatic_regression_gateway(tmp_path, monkeypatch):
     )
     listener = MagicMock()
     listener.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 54321)
-    monkeypatch.setattr(dss_driver.socket, "socket", lambda: listener)
+    monkeypatch.setattr(ap_driver.socket, "socket", lambda: listener)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     monkeypatch.setattr(requests, "get", lambda *a, **k: SimpleNamespace(status_code=200))
     process = Mock()
@@ -7625,13 +7788,13 @@ def _automatic_regression_gateway(tmp_path, monkeypatch):
     process.wait.return_value = 0
     start = Mock(return_value=process)
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "_gateway_process_identity",
         lambda pid: {"pid": pid, "uid": os.getuid(), "start_time": "1"},
     )
-    original_popen = dss_driver.subprocess.Popen
+    original_popen = ap_driver.subprocess.Popen
     monkeypatch.setattr(
-        dss_driver.subprocess,
+        ap_driver.subprocess,
         "Popen",
         lambda command, *args, **kwargs: (
             start(command, *args, **kwargs)
@@ -7678,21 +7841,21 @@ def test_owned_gateway_explicit_module_is_allowlisted_before_recovery(
     _automatic_regression_gateway, monkeypatch, gateway_module
 ):
     state = _automatic_regression_gateway
-    monkeypatch.setattr(dss_driver.subprocess, "Popen", state.start)
+    monkeypatch.setattr(ap_driver.subprocess, "Popen", state.start)
     if gateway_module == "unrelated.gateway":
         monkeypatch.setattr(
-            dss_driver,
+            ap_driver,
             "_owned_gateway_slot",
             lambda: pytest.fail("invalid module recovered owned resources"),
         )
         with pytest.raises(ValueError, match="unsupported correctness gateway module"):
-            with dss_driver.local_cortex_gateway(state.out, gateway_module=gateway_module):
+            with ap_driver.local_cortex_gateway(state.out, gateway_module=gateway_module):
                 pytest.fail("invalid module started")
         state.start.assert_not_called()
         state.process.terminate.assert_not_called()
         return
     options = {} if gateway_module is None else {"gateway_module": gateway_module}
-    with dss_driver.local_cortex_gateway(state.out, **options) as url:
+    with ap_driver.local_cortex_gateway(state.out, **options) as url:
         assert url == "http://127.0.0.1:54321"
     state.start.assert_called_once()
     assert state.start.call_args.args[0][:3] == [
@@ -7725,7 +7888,7 @@ def test_native_gateway_command_preserves_owned_launch_and_teardown(
     import requests
 
     state, native = _automatic_regression_gateway, _native_gateway_command
-    monkeypatch.setattr(dss_driver.subprocess, "Popen", state.start)
+    monkeypatch.setattr(ap_driver.subprocess, "Popen", state.start)
     if failure in {"health", "interrupt"}:
 
         def health(*args, **kwargs):
@@ -7737,7 +7900,7 @@ def test_native_gateway_command_preserves_owned_launch_and_teardown(
 
     @contextmanager
     def run():
-        with dss_driver.local_cortex_gateway(
+        with ap_driver.local_cortex_gateway(
             state.out,
             gateway_command_builder=native.builder,
             gateway_command_source=native.descriptor,
@@ -7766,7 +7929,7 @@ def test_native_gateway_command_preserves_owned_launch_and_teardown(
         str(state.out / "hostfile"),
     ]
     assert state.start.call_args.kwargs["start_new_session"] is True
-    assert state.start.call_args.kwargs["env"]["DSS_CORRECTNESS_GATEWAY_OWNER"]
+    assert state.start.call_args.kwargs["env"]["AP_CORRECTNESS_GATEWAY_OWNER"]
     state.process.terminate.assert_called_once()
     state.process.wait.assert_called_once_with(timeout=120)
 
@@ -7790,9 +7953,9 @@ def test_native_gateway_command_rejects_unbound_source_before_recovery(
         options["gateway_command_source"]["path"] = str(native.source.with_name("other.py"))
     else:
         options["gateway_module"] = "arctic_platform.correctness.harness.gateway"
-    monkeypatch.setattr(dss_driver, "_owned_gateway_slot", lambda: pytest.fail("unbound source recovered gateway"))
+    monkeypatch.setattr(ap_driver, "_owned_gateway_slot", lambda: pytest.fail("unbound source recovered gateway"))
     with pytest.raises(ValueError):
-        with dss_driver.local_cortex_gateway(state.out, **options):
+        with ap_driver.local_cortex_gateway(state.out, **options):
             pytest.fail("unbound builder started a gateway")
     state.start.assert_not_called()
     state.process.terminate.assert_not_called()
@@ -7821,9 +7984,9 @@ def test_native_gateway_command_rejects_mutation_before_process_start(
     namespace = {}
     exec(compile(native.source.read_text(), str(native.source), "exec"), namespace)
     native.descriptor["sha256"] = hashlib.sha256(native.source.read_bytes()).hexdigest()
-    monkeypatch.setattr(dss_driver.subprocess, "Popen", state.start)
+    monkeypatch.setattr(ap_driver.subprocess, "Popen", state.start)
     with pytest.raises(ValueError):
-        with dss_driver.local_cortex_gateway(
+        with ap_driver.local_cortex_gateway(
             state.out, gateway_command_builder=namespace["build"], gateway_command_source=native.descriptor
         ):
             pytest.fail("mutated builder started a gateway")
@@ -7933,7 +8096,7 @@ def test_gateway_readiness_ignores_proxy_environment(_automatic_regression_gatew
         return response
 
     monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
-    with dss_driver.local_cortex_gateway(state.out) as url:
+    with ap_driver.local_cortex_gateway(state.out) as url:
         assert url == "http://127.0.0.1:54321"
     assert len(observed) == 1
     state.process.terminate.assert_called_once()
@@ -8175,7 +8338,7 @@ def test_checkpoint_bridge_failure_restores_flags_and_retains_unsafe_shutdown(
             subprocess.TimeoutExpired("checkpoint gateway", 120),
             0,
         ]
-        monkeypatch.setattr(dss_driver.os, "killpg", Mock())
+        monkeypatch.setattr(ap_driver.os, "killpg", Mock())
     observed = []
 
     def execute(cfg, *a, **k):
@@ -8196,7 +8359,7 @@ def test_checkpoint_bridge_failure_restores_flags_and_retains_unsafe_shutdown(
     ).read_text()
     state.start.assert_called_once()
     if failure == "cleanup":
-        dss_driver.os.killpg.assert_called_once_with(12345, dss_driver.signal.SIGKILL)
+        ap_driver.os.killpg.assert_called_once_with(12345, ap_driver.signal.SIGKILL)
     else:
         state.process.wait.assert_called_once_with()
 
@@ -8486,16 +8649,16 @@ def test_regression_automatic_gateway_startup_and_cleanup_failures_are_saved_and
         state.process.returncode = 7
     elif failure == "timeout":
         ticks = itertools.chain((0, 1), itertools.count(121))
-        monkeypatch.setattr(dss_driver.time, "monotonic", lambda: next(ticks))
-        monkeypatch.setattr(dss_driver.time, "sleep", lambda *a: None)
+        monkeypatch.setattr(ap_driver.time, "monotonic", lambda: next(ticks))
+        monkeypatch.setattr(ap_driver.time, "sleep", lambda *a: None)
         monkeypatch.setattr(requests, "get", lambda *a, **k: SimpleNamespace(status_code=503))
     else:
         state.process.pid = 12345
         state.process.wait.side_effect = [subprocess.TimeoutExpired("gateway", 120), 0]
-        monkeypatch.setattr(dss_driver.os, "killpg", Mock())
+        monkeypatch.setattr(ap_driver.os, "killpg", Mock())
     if failure in {"exit", "timeout"}:
         with pytest.raises(RuntimeError, match="exited|did not become ready"):
-            with dss_driver.local_cortex_gateway(state.out):
+            with ap_driver.local_cortex_gateway(state.out):
                 pytest.fail("unready gateway reached target work")
     else:
         result = api.run(
@@ -8506,7 +8669,7 @@ def test_regression_automatic_gateway_startup_and_cleanup_failures_are_saved_and
         assert result.exit_code == 1 and result.stopped_unsafe
         assert result.cases[0]["status"] == "error"
         assert "did not shut down cleanly" in (state.out / "full.log").read_text()
-        dss_driver.os.killpg.assert_called_once_with(12345, dss_driver.signal.SIGKILL)
+        ap_driver.os.killpg.assert_called_once_with(12345, ap_driver.signal.SIGKILL)
     if failure != "shutdown":
         assert (state.out / "gateway.log").is_file()
     else:
@@ -8526,7 +8689,7 @@ def test_regression_gateway_cleanup_exceptions_stop_following_work(
     else:
         state.process.wait.side_effect = subprocess.TimeoutExpired("gateway", 120)
         monkeypatch.setattr(
-            dss_driver.os,
+            ap_driver.os,
             "killpg",
             Mock(side_effect=OSError("synthetic group kill failure")),
         )
@@ -8545,11 +8708,11 @@ def test_regression_gateway_disappearing_group_still_reaps_owned_child(_automati
     state.process.pid = 12345
     state.process.wait.side_effect = [subprocess.TimeoutExpired("gateway", 120), 0]
     kill = Mock(side_effect=ProcessLookupError("synthetic group already exited"))
-    monkeypatch.setattr(dss_driver.os, "killpg", kill)
+    monkeypatch.setattr(ap_driver.os, "killpg", kill)
     with pytest.raises(operator_interface_UnsafeCleanupError, match="did not shut down cleanly"):
-        with dss_driver.local_cortex_gateway(state.out):
+        with ap_driver.local_cortex_gateway(state.out):
             pass
-    kill.assert_called_once_with(12345, dss_driver.signal.SIGKILL)
+    kill.assert_called_once_with(12345, ap_driver.signal.SIGKILL)
     assert state.process.wait.call_count == 2
     assert state.process.wait.call_args_list[0].kwargs == {"timeout": 120}
     assert state.process.wait.call_args_list[1].kwargs == {}
@@ -8559,13 +8722,13 @@ def test_regression_gateway_disappearing_group_still_reaps_owned_child(_automati
 def _owned_gateway_descendant(tmp_path, monkeypatch):
     root = tmp_path / "proc"
     root.mkdir()
-    monkeypatch.setattr(dss_driver, "_GATEWAY_PROC_ROOT", root)
+    monkeypatch.setattr(ap_driver, "_GATEWAY_PROC_ROOT", root)
     gateway = {"pid": 12345, "uid": os.getuid(), "start_time": "100"}
     child = root / "12346"
     child.mkdir()
     fields = ["S", "1", "12345", "12345"] + ["0"] * 15 + ["101"]
     (child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(fields))
-    (child / "environ").write_bytes(b"DSS_CORRECTNESS_GATEWAY_OWNER=owned-token\0")
+    (child / "environ").write_bytes(b"AP_CORRECTNESS_GATEWAY_OWNER=owned-token\0")
     return SimpleNamespace(root=root, gateway=gateway, child=child, fields=fields)
 
 
@@ -8573,7 +8736,7 @@ def _owned_gateway_descendant(tmp_path, monkeypatch):
 def test_owned_gateway_descendants_reject_unverified_members(_owned_gateway_descendant, monkeypatch, drift):
     state = _owned_gateway_descendant
     if drift == "token":
-        (state.child / "environ").write_bytes(b"DSS_CORRECTNESS_GATEWAY_OWNER=other-token\0")
+        (state.child / "environ").write_bytes(b"AP_CORRECTNESS_GATEWAY_OWNER=other-token\0")
     elif drift in {"group", "birth"}:
         state.fields[2 if drift == "group" else 19] = "999" if drift == "group" else "99"
         (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(state.fields))
@@ -8584,9 +8747,9 @@ def test_owned_gateway_descendants_reject_unverified_members(_owned_gateway_desc
         leader.mkdir()
         (leader / "stat").write_text("12345 (other) " + " ".join(state.fields))
     signal_child = Mock()
-    monkeypatch.setattr(dss_driver.signal, "pidfd_send_signal", signal_child, raising=False)
+    monkeypatch.setattr(ap_driver.signal, "pidfd_send_signal", signal_child, raising=False)
     with pytest.raises(operator_interface_UnsafeCleanupError, match="ownership validation|PID was reused"):
-        dss_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0)
+        ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0)
     signal_child.assert_not_called()
 
 
@@ -8606,8 +8769,8 @@ def test_owned_gateway_descendant_cleared_environment_and_verified_exit_is_not_s
 
     send = Mock()
     monkeypatch.setattr(Path, "read_bytes", read)
-    monkeypatch.setattr(dss_driver.signal, "pidfd_send_signal", send, raising=False)
-    dss_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0)
+    monkeypatch.setattr(ap_driver.signal, "pidfd_send_signal", send, raising=False)
+    ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0)
     send.assert_not_called()
 
 
@@ -8625,15 +8788,15 @@ def test_owned_gateway_unverified_descendant_grace_never_signals(_owned_gateway_
             (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(fields))
 
     send = Mock()
-    monkeypatch.setattr(dss_driver.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(dss_driver.time, "sleep", pause)
-    monkeypatch.setattr(dss_driver.signal, "pidfd_send_signal", send, raising=False)
+    monkeypatch.setattr(ap_driver.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(ap_driver.time, "sleep", pause)
+    monkeypatch.setattr(ap_driver.signal, "pidfd_send_signal", send, raising=False)
     if exits:
-        dss_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0.1)
+        ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0.1)
         assert clock[0] == 0.05
     else:
         with pytest.raises(operator_interface_UnsafeCleanupError, match="ownership validation"):
-            dss_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0.1)
+            ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0.1)
         assert clock[0] == 0.1
     send.assert_not_called()
 
@@ -8647,53 +8810,53 @@ def test_owned_gateway_real_unverified_descendant_natural_exit_is_waited_for(tmp
     gateway_script = (
         "import os,subprocess,sys,time; "
         f"subprocess.Popen([sys.executable, '-c', {child_script!r}], "
-        "env={key:value for key,value in os.environ.items() if key != 'DSS_CORRECTNESS_GATEWAY_OWNER'}); "
+        "env={key:value for key,value in os.environ.items() if key != 'AP_CORRECTNESS_GATEWAY_OWNER'}); "
         "time.sleep(300)"
     )
     leader = subprocess.Popen(
         [sys.executable, "-c", gateway_script],
         start_new_session=True,
-        env={**os.environ, "DSS_CORRECTNESS_GATEWAY_OWNER": "owned-token"},
+        env={**os.environ, "AP_CORRECTNESS_GATEWAY_OWNER": "owned-token"},
     )
-    gateway = dss_driver._gateway_process_identity(leader.pid)
+    gateway = ap_driver._gateway_process_identity(leader.pid)
     child = None
     try:
         deadline = time.monotonic() + 10
         while not child_file.exists():
             assert time.monotonic() < deadline
             time.sleep(0.01)
-        child = dss_driver._gateway_process_identity(int(child_file.read_text()))
+        child = ap_driver._gateway_process_identity(int(child_file.read_text()))
         assert child is not None
         leader.terminate()
         leader.wait(timeout=5)
         started = time.monotonic()
-        dss_driver._reap_owned_gateway_descendants(gateway, "owned-token", timeout=2)
+        ap_driver._reap_owned_gateway_descendants(gateway, "owned-token", timeout=2)
         assert time.monotonic() - started >= 0.1
-        assert dss_driver._gateway_process_identity(child["pid"]) is None
+        assert ap_driver._gateway_process_identity(child["pid"]) is None
     finally:
         if leader.poll() is None:
             leader.kill()
             leader.wait(timeout=5)
-        if child is not None and dss_driver._gateway_process_identity(child["pid"]) == child:
+        if child is not None and ap_driver._gateway_process_identity(child["pid"]) == child:
             os.kill(child["pid"], signal.SIGKILL)
 
 
 def test_owned_gateway_descendants_ignore_other_sessions_and_zombies(_owned_gateway_descendant):
     state = _owned_gateway_descendant
-    assert [entry["pid"] for entry in dss_driver._owned_gateway_descendants(state.gateway, "owned-token")] == [12346]
+    assert [entry["pid"] for entry in ap_driver._owned_gateway_descendants(state.gateway, "owned-token")] == [12346]
     for field, value in ((3, "999"), (0, "Z")):
         fields = state.fields.copy()
         fields[field] = value
         (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(fields))
-        (state.child / "environ").write_bytes(b"DSS_CORRECTNESS_GATEWAY_OWNER=another-command\0")
-        assert not dss_driver._owned_gateway_descendants(state.gateway, "owned-token")
+        (state.child / "environ").write_bytes(b"AP_CORRECTNESS_GATEWAY_OWNER=another-command\0")
+        assert not ap_driver._owned_gateway_descendants(state.gateway, "owned-token")
 
 
 def test_owned_gateway_descendants_include_token_bound_detached_workers(_owned_gateway_descendant):
     state = _owned_gateway_descendant
     state.fields[2:4] = ["12346", "12346"]
     (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(state.fields))
-    assert [entry["pid"] for entry in dss_driver._owned_gateway_descendants(state.gateway, "owned-token")] == [12346]
+    assert [entry["pid"] for entry in ap_driver._owned_gateway_descendants(state.gateway, "owned-token")] == [12346]
 
 
 @pytest.mark.parametrize("exited", [False, True])
@@ -8714,10 +8877,10 @@ def test_owned_gateway_descendant_unreadable_environment_requires_verified_exit(
 
     monkeypatch.setattr(Path, "read_bytes", read)
     if exited:
-        assert not dss_driver._owned_gateway_descendants(state.gateway, "owned-token")
+        assert not ap_driver._owned_gateway_descendants(state.gateway, "owned-token")
     else:
         with pytest.raises(operator_interface_UnsafeCleanupError, match="unreadable environment"):
-            dss_driver._owned_gateway_descendants(state.gateway, "owned-token")
+            ap_driver._owned_gateway_descendants(state.gateway, "owned-token")
 
 
 @pytest.mark.parametrize("exits", [False, True])
@@ -8740,15 +8903,15 @@ def test_owned_gateway_unreadable_descendant_grace_never_signals(_owned_gateway_
 
     send = Mock()
     monkeypatch.setattr(Path, "read_bytes", read)
-    monkeypatch.setattr(dss_driver.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(dss_driver.time, "sleep", pause)
-    monkeypatch.setattr(dss_driver.signal, "pidfd_send_signal", send, raising=False)
+    monkeypatch.setattr(ap_driver.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(ap_driver.time, "sleep", pause)
+    monkeypatch.setattr(ap_driver.signal, "pidfd_send_signal", send, raising=False)
     if exits:
-        dss_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0.1)
+        ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0.1)
         assert clock[0] == 0.05
     else:
         with pytest.raises(operator_interface_UnsafeCleanupError, match="unreadable environment"):
-            dss_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0.1)
+            ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0.1)
         assert clock[0] == 0.1
     send.assert_not_called()
 
@@ -8758,15 +8921,15 @@ def test_owned_gateway_pidfd_libc_fallback_preserves_errors(monkeypatch, code):
     import ctypes
 
     open_pidfd = Mock(return_value=-1 if code else 42)
-    monkeypatch.delattr(dss_driver.os, "pidfd_open", raising=False)
+    monkeypatch.delattr(ap_driver.os, "pidfd_open", raising=False)
     monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: SimpleNamespace(pidfd_open=open_pidfd))
     monkeypatch.setattr(ctypes, "get_errno", lambda: code)
     if code:
         with pytest.raises(OSError) as raised:
-            dss_driver._open_gateway_pidfd(12345)
+            ap_driver._open_gateway_pidfd(12345)
         assert raised.value.errno == code
     else:
-        assert dss_driver._open_gateway_pidfd(12345) == 42
+        assert ap_driver._open_gateway_pidfd(12345) == 42
     open_pidfd.assert_called_once_with(12345, 0)
     assert open_pidfd.argtypes == [ctypes.c_int, ctypes.c_uint]
     assert open_pidfd.restype is ctypes.c_int
@@ -8774,18 +8937,18 @@ def test_owned_gateway_pidfd_libc_fallback_preserves_errors(monkeypatch, code):
 
 def test_owned_gateway_pidfd_prefers_python_interface(monkeypatch):
     pin = Mock(return_value=42)
-    monkeypatch.setattr(dss_driver.os, "pidfd_open", pin, raising=False)
-    assert dss_driver._open_gateway_pidfd(12345) == 42
+    monkeypatch.setattr(ap_driver.os, "pidfd_open", pin, raising=False)
+    assert ap_driver._open_gateway_pidfd(12345) == 42
     pin.assert_called_once_with(12345)
 
 
 def test_owned_gateway_pidfd_missing_libc_support_fails_closed(monkeypatch):
     import ctypes
 
-    monkeypatch.delattr(dss_driver.os, "pidfd_open", raising=False)
+    monkeypatch.delattr(ap_driver.os, "pidfd_open", raising=False)
     monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: SimpleNamespace())
     with pytest.raises(operator_interface_UnsafeCleanupError, match="libc does not expose"):
-        dss_driver._open_gateway_pidfd(12345)
+        ap_driver._open_gateway_pidfd(12345)
 
 
 @pytest.mark.parametrize("code", [0, 3, 38])
@@ -8793,15 +8956,15 @@ def test_owned_gateway_pidfd_signal_libc_fallback_preserves_errors(monkeypatch, 
     import ctypes
 
     send = Mock(return_value=-1 if code else 0)
-    monkeypatch.delattr(dss_driver.signal, "pidfd_send_signal", raising=False)
+    monkeypatch.delattr(ap_driver.signal, "pidfd_send_signal", raising=False)
     monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: SimpleNamespace(pidfd_send_signal=send))
     monkeypatch.setattr(ctypes, "get_errno", lambda: code)
     if code:
         with pytest.raises(OSError) as raised:
-            dss_driver._send_gateway_pidfd_signal(42, signal.SIGTERM)
+            ap_driver._send_gateway_pidfd_signal(42, signal.SIGTERM)
         assert raised.value.errno == code
     else:
-        dss_driver._send_gateway_pidfd_signal(42, signal.SIGTERM)
+        ap_driver._send_gateway_pidfd_signal(42, signal.SIGTERM)
     send.assert_called_once_with(42, signal.SIGTERM, None, 0)
 
 
@@ -8821,10 +8984,10 @@ def test_owned_gateway_descendants_use_pinned_signals_and_verify_exit(
             (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(fields))
 
     send = Mock(side_effect=stop)
-    monkeypatch.setattr(dss_driver, "_open_gateway_pidfd", pin)
-    monkeypatch.setattr(dss_driver.os, "close", close)
-    monkeypatch.setattr(dss_driver.signal, "pidfd_send_signal", send, raising=False)
-    dss_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0)
+    monkeypatch.setattr(ap_driver, "_open_gateway_pidfd", pin)
+    monkeypatch.setattr(ap_driver.os, "close", close)
+    monkeypatch.setattr(ap_driver.signal, "pidfd_send_signal", send, raising=False)
+    ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0)
     assert send.call_args_list == (
         [call(42, signal.SIGTERM), call(42, signal.SIGKILL)] if resists_term else [call(42, signal.SIGTERM)]
     )
@@ -8841,11 +9004,11 @@ def test_owned_gateway_descendant_pid_reuse_is_not_signalled(_owned_gateway_desc
 
     send = Mock()
     close = Mock()
-    monkeypatch.setattr(dss_driver, "_open_gateway_pidfd", pin)
-    monkeypatch.setattr(dss_driver.os, "close", close)
-    monkeypatch.setattr(dss_driver.signal, "pidfd_send_signal", send, raising=False)
+    monkeypatch.setattr(ap_driver, "_open_gateway_pidfd", pin)
+    monkeypatch.setattr(ap_driver.os, "close", close)
+    monkeypatch.setattr(ap_driver.signal, "pidfd_send_signal", send, raising=False)
     with pytest.raises(operator_interface_UnsafeCleanupError, match="identity changed"):
-        dss_driver._reap_owned_gateway_descendants(state.gateway, "owned-token")
+        ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token")
     send.assert_not_called()
     close.assert_called_once_with(42)
 
@@ -8868,13 +9031,13 @@ def test_owned_gateway_descendant_exit_wait_does_not_reread_environment(_owned_g
         return None
 
     def send(*a):
-        monkeypatch.setattr(dss_driver, "_gateway_process_identity", stopped)
+        monkeypatch.setattr(ap_driver, "_gateway_process_identity", stopped)
 
     monkeypatch.setattr(Path, "read_bytes", read)
-    monkeypatch.setattr(dss_driver, "_open_gateway_pidfd", lambda pid: 42)
-    monkeypatch.setattr(dss_driver.os, "close", Mock())
-    monkeypatch.setattr(dss_driver.signal, "pidfd_send_signal", send, raising=False)
-    dss_driver._reap_owned_gateway_descendants(state.gateway, "owned-token")
+    monkeypatch.setattr(ap_driver, "_open_gateway_pidfd", lambda pid: 42)
+    monkeypatch.setattr(ap_driver.os, "close", Mock())
+    monkeypatch.setattr(ap_driver.signal, "pidfd_send_signal", send, raising=False)
+    ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token")
     assert len(checked) == 1
 
 
@@ -8883,7 +9046,7 @@ def test_owned_gateway_reaps_descendants_before_retiring_ownership(
     _automatic_regression_gateway, monkeypatch, cleanup_error
 ):
     state = _automatic_regression_gateway
-    records = dss_driver._gateway_state_directory() / "gateway.json"
+    records = ap_driver._gateway_state_directory() / "gateway.json"
 
     def reap(gateway, token):
         state.process.wait.assert_called_once_with(timeout=120)
@@ -8893,14 +9056,14 @@ def test_owned_gateway_reaps_descendants_before_retiring_ownership(
             raise operator_interface_UnsafeCleanupError("synthetic descendants survived")
 
     stop = Mock(side_effect=reap)
-    monkeypatch.setattr(dss_driver, "_reap_owned_gateway_descendants", stop)
+    monkeypatch.setattr(ap_driver, "_reap_owned_gateway_descendants", stop)
     if cleanup_error:
         with pytest.raises(operator_interface_UnsafeCleanupError, match="descendants survived"):
-            with dss_driver.local_cortex_gateway(state.out):
+            with ap_driver.local_cortex_gateway(state.out):
                 pass
         assert records.is_file()
     else:
-        with dss_driver.local_cortex_gateway(state.out):
+        with ap_driver.local_cortex_gateway(state.out):
             pass
         assert not records.exists()
     stop.assert_called_once()
@@ -8910,7 +9073,7 @@ def test_owned_gateway_reaps_descendants_before_retiring_ownership(
 def test_owned_gateway_recovery_keeps_dead_leader_record_until_descendants_exit(
     _automatic_regression_gateway, monkeypatch, survives
 ):
-    root = dss_driver._gateway_state_directory()
+    root = ap_driver._gateway_state_directory()
     root.mkdir()
     path = root / "gateway.json"
     record = {
@@ -8921,15 +9084,15 @@ def test_owned_gateway_recovery_keeps_dead_leader_record_until_descendants_exit(
         "log": "retained-gateway.log",
     }
     path.write_text(json.dumps(record))
-    monkeypatch.setattr(dss_driver, "_gateway_process_identity", lambda pid: None)
+    monkeypatch.setattr(ap_driver, "_gateway_process_identity", lambda pid: None)
     reap = Mock(side_effect=operator_interface_UnsafeCleanupError("descendants survived") if survives else None)
-    monkeypatch.setattr(dss_driver, "_reap_owned_gateway_descendants", reap)
+    monkeypatch.setattr(ap_driver, "_reap_owned_gateway_descendants", reap)
     if survives:
         with pytest.raises(operator_interface_UnsafeCleanupError, match="descendants survived"):
-            dss_driver._recover_owned_gateway(path)
+            ap_driver._recover_owned_gateway(path)
         assert path.is_file()
     else:
-        dss_driver._recover_owned_gateway(path)
+        ap_driver._recover_owned_gateway(path)
         assert not path.exists()
     reap.assert_called_once_with(record["gateway"], record["token"])
 
@@ -8961,41 +9124,38 @@ def test_owned_gateway_real_orphan_descendant_is_stopped_after_leader_exit(tmp_p
         started.append(process)
         return process
 
-    monkeypatch.setattr(dss_driver.subprocess, "Popen", launch)
+    monkeypatch.setattr(ap_driver.subprocess, "Popen", launch)
     monkeypatch.setattr(requests, "get", lambda *a, **k: SimpleNamespace(status_code=200))
-    reap = dss_driver._reap_owned_gateway_descendants
+    reap = ap_driver._reap_owned_gateway_descendants
     monkeypatch.setattr(
-        dss_driver, "_reap_owned_gateway_descendants", lambda gateway, token: reap(gateway, token, timeout=0.1)
+        ap_driver, "_reap_owned_gateway_descendants", lambda gateway, token: reap(gateway, token, timeout=0.1)
     )
     record = tmp_path / "gateway.json"
     child_identity = None
     try:
         try:
-            with dss_driver._launch_local_cortex_gateway(
+            with ap_driver._launch_local_cortex_gateway(
                 tmp_path, record, tmp_path / "hostfile", gateway_module="dss.ray_dss.gateway_server"
             ):
                 deadline = time.monotonic() + 10
                 while not child_file.exists():
                     assert time.monotonic() < deadline, "gateway descendant startup timed out"
                     time.sleep(0.05)
-                child_identity = dss_driver._gateway_process_identity(int(child_file.read_text()))
+                child_identity = ap_driver._gateway_process_identity(int(child_file.read_text()))
                 assert child_identity is not None
                 if body_error:
                     raise RuntimeError("synthetic target failed")
         except RuntimeError as exc:
             assert body_error and str(exc) == "synthetic target failed"
         assert started[0].poll() is not None
-        assert dss_driver._gateway_process_identity(child_identity["pid"]) is None
+        assert ap_driver._gateway_process_identity(child_identity["pid"]) is None
         assert not record.exists()
     finally:
         for process in started:
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
-        if (
-            child_identity is not None
-            and dss_driver._gateway_process_identity(child_identity["pid"]) == child_identity
-        ):
+        if child_identity is not None and ap_driver._gateway_process_identity(child_identity["pid"]) == child_identity:
             os.kill(child_identity["pid"], signal.SIGKILL)
 
 
@@ -9008,8 +9168,8 @@ def test_owned_gateway_preserves_owner_environment_for_process_titles(
         monkeypatch.delenv("SPT_NOENV", raising=False)
     else:
         monkeypatch.setenv("SPT_NOENV", inherited)
-    monkeypatch.setattr(dss_driver, "_reap_owned_gateway_descendants", Mock())
-    with dss_driver._launch_local_cortex_gateway(
+    monkeypatch.setattr(ap_driver, "_reap_owned_gateway_descendants", Mock())
+    with ap_driver._launch_local_cortex_gateway(
         tmp_path,
         tmp_path / "gateway.json",
         tmp_path / "hostfile",
@@ -9017,7 +9177,7 @@ def test_owned_gateway_preserves_owner_environment_for_process_titles(
     ):
         environment = state.start.call_args.kwargs["env"]
         assert environment["SPT_NOENV"] == "1"
-        assert environment["DSS_CORRECTNESS_GATEWAY_OWNER"]
+        assert environment["AP_CORRECTNESS_GATEWAY_OWNER"]
         assert os.environ.get("SPT_NOENV") == inherited
     assert os.environ.get("SPT_NOENV") == inherited
 
@@ -9052,16 +9212,16 @@ def test_owned_gateway_real_retitled_ray_agent_keeps_marker_and_is_reaped(tmp_pa
         return process
 
     monkeypatch.delenv("SPT_NOENV", raising=False)
-    monkeypatch.setattr(dss_driver.subprocess, "Popen", launch)
+    monkeypatch.setattr(ap_driver.subprocess, "Popen", launch)
     monkeypatch.setattr(requests, "get", lambda *a, **k: SimpleNamespace(status_code=200))
-    reap = dss_driver._reap_owned_gateway_descendants
+    reap = ap_driver._reap_owned_gateway_descendants
     monkeypatch.setattr(
-        dss_driver, "_reap_owned_gateway_descendants", lambda gateway, token: reap(gateway, token, timeout=0.2)
+        ap_driver, "_reap_owned_gateway_descendants", lambda gateway, token: reap(gateway, token, timeout=0.2)
     )
     record_path = tmp_path / "gateway.json"
     child_identity = None
     try:
-        with dss_driver._launch_local_cortex_gateway(
+        with ap_driver._launch_local_cortex_gateway(
             tmp_path,
             record_path,
             tmp_path / "hostfile",
@@ -9071,12 +9231,12 @@ def test_owned_gateway_real_retitled_ray_agent_keeps_marker_and_is_reaped(tmp_pa
             while not child_file.exists():
                 assert time.monotonic() < deadline, "retitled Ray agent startup timed out"
                 time.sleep(0.05)
-            child_identity = dss_driver._gateway_process_identity(int(child_file.read_text()))
+            child_identity = ap_driver._gateway_process_identity(int(child_file.read_text()))
             assert child_identity is not None
             record = json.loads(record_path.read_text())
-            assert dss_driver._owned_gateway_descendants(record["gateway"], record["token"]) == [child_identity]
+            assert ap_driver._owned_gateway_descendants(record["gateway"], record["token"]) == [child_identity]
         assert started[0].poll() is not None
-        assert dss_driver._gateway_process_identity(child_identity["pid"]) is None
+        assert ap_driver._gateway_process_identity(child_identity["pid"]) is None
         assert not record_path.exists()
         assert "SPT_NOENV" not in os.environ
     finally:
@@ -9084,10 +9244,7 @@ def test_owned_gateway_real_retitled_ray_agent_keeps_marker_and_is_reaped(tmp_pa
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
-        if (
-            child_identity is not None
-            and dss_driver._gateway_process_identity(child_identity["pid"]) == child_identity
-        ):
+        if child_identity is not None and ap_driver._gateway_process_identity(child_identity["pid"]) == child_identity:
             os.kill(child_identity["pid"], signal.SIGKILL)
 
 
@@ -9104,11 +9261,11 @@ def test_owned_gateway_stop_signals_clean_up_and_restore_handlers(
     previous = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     if phase == "startup":
         monkeypatch.setattr(requests, "get", lambda *a, **k: signal.raise_signal(signum))
-        context = dss_driver.local_cortex_gateway(state.out)
+        context = ap_driver.local_cortex_gateway(state.out)
     elif phase == "onboarding":
         context = onboard._validation_gateway(Namespace(_automatic_cortex_gateway=True, output_dir=state.out))
     else:
-        context = dss_driver.local_cortex_gateway(state.out)
+        context = ap_driver.local_cortex_gateway(state.out)
     with pytest.raises(KeyboardInterrupt, match=f"received {signal.Signals(signum).name}"):
         with context:
             signal.raise_signal(signum)
@@ -9127,7 +9284,7 @@ def test_owned_gateway_repeated_stop_does_not_interrupt_cleanup(
     previous = signal.getsignal(signal.SIGTERM)
     state.process.terminate.side_effect = lambda: signal.raise_signal(signal.SIGTERM)
     with pytest.raises(KeyboardInterrupt, match="received SIGTERM"):
-        with dss_driver.local_cortex_gateway(state.out):
+        with ap_driver.local_cortex_gateway(state.out):
             signal.raise_signal(signal.SIGTERM)
     state.process.wait.assert_called_once_with(timeout=120)
     assert signal.getsignal(signal.SIGTERM) == previous
@@ -9138,15 +9295,15 @@ def test_owned_gateway_real_process_signal_reaps_child(tmp_path, signum):
     script = (
         "\nimport os\nimport signal\nimport subprocess\nimport sys\nfrom pathlib import Path\nfrom types import"
         " SimpleNamespace\nimport requests\nimport torch\nfrom arctic_platform.correctness.harness import gateway as"
-        " dss_driver\n\ndirectory = Path(sys.argv[1])\noriginal_popen = subprocess.Popen\ndef start_gateway(*args,"
-        ' **kwargs):\n    if args[0][1:3] == ["-c", dss_driver._GATEWAY_CLEANUP_BOOTSTRAP]:\n        return'
+        " ap_driver\n\ndirectory = Path(sys.argv[1])\noriginal_popen = subprocess.Popen\ndef start_gateway(*args,"
+        ' **kwargs):\n    if args[0][1:3] == ["-c", ap_driver._GATEWAY_CLEANUP_BOOTSTRAP]:\n        return'
         ' original_popen(*args, **kwargs)\n    return original_popen(\n        [sys.executable, "-c", "import time;'
         ' time.sleep(300)"],\n        stdout=kwargs["stdout"], stderr=kwargs["stderr"], start_new_session=True,'
         ' env=kwargs["env"],\n    )\ndss_driver.subprocess.Popen = start_gateway\ndss_driver._allocation_hostfile ='
         " lambda: None\ndss_driver._gateway_state_directory = lambda: directory /"
         ' "ownership"\ndss_driver._legacy_owned_gateways = lambda: []\ntorch.cuda.device_count = lambda:'
         " 1\nrequests.get = lambda *args, **kwargs: SimpleNamespace(status_code=200)\nwith"
-        ' dss_driver.local_cortex_gateway(directory):\n    (directory / "ready").write_text(str(os.getpid()))\n   '
+        ' ap_driver.local_cortex_gateway(directory):\n    (directory / "ready").write_text(str(os.getpid()))\n   '
         " signal.pause()\n"
     )
     process = subprocess.Popen(
@@ -9185,7 +9342,7 @@ def test_owned_gateway_real_process_signal_reaps_child(tmp_path, signum):
 
 @pytest.fixture
 def _stale_gateway_record(tmp_path, monkeypatch):
-    root = dss_driver._gateway_state_directory()
+    root = ap_driver._gateway_state_directory()
     root.mkdir()
     path = root / "gateway.json"
     owner = {"pid": 999001, "start_time": "101", "uid": os.getuid()}
@@ -9199,27 +9356,27 @@ def _stale_gateway_record(tmp_path, monkeypatch):
     }
     path.write_text(json.dumps(record))
     live = {owner["pid"]: None, gateway["pid"]: gateway}
-    monkeypatch.setattr(dss_driver, "_gateway_process_identity", lambda pid: live.get(pid))
+    monkeypatch.setattr(ap_driver, "_gateway_process_identity", lambda pid: live.get(pid))
     read_bytes = Path.read_bytes
     monkeypatch.setattr(
         Path,
         "read_bytes",
         lambda file: (
-            b"DSS_CORRECTNESS_GATEWAY_OWNER=synthetic-owner-token\0"
+            b"AP_CORRECTNESS_GATEWAY_OWNER=synthetic-owner-token\0"
             if str(file) == f"/proc/{gateway['pid']}/environ"
             else read_bytes(file)
         ),
     )
-    monkeypatch.setattr(dss_driver.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(ap_driver.os, "getpgid", lambda pid: pid)
     kill = Mock(side_effect=lambda pid, signum: live.update({pid: None}))
-    monkeypatch.setattr(dss_driver.os, "kill", kill)
-    monkeypatch.setattr(dss_driver.os, "killpg", Mock())
+    monkeypatch.setattr(ap_driver.os, "kill", kill)
+    monkeypatch.setattr(ap_driver.os, "killpg", Mock())
     return SimpleNamespace(path=path, record=record, owner=owner, gateway=gateway, live=live, kill=kill)
 
 
 def test_stale_owned_gateway_is_stopped_before_replacement(_stale_gateway_record, capsys):
     state = _stale_gateway_record
-    with dss_driver._owned_gateway_slot() as path:
+    with ap_driver._owned_gateway_slot() as path:
         assert path == state.path and not path.exists()
         state.kill.assert_called_once_with(state.gateway["pid"], signal.SIGTERM)
     output = capsys.readouterr().out
@@ -9231,7 +9388,7 @@ def test_stale_owned_gateway_is_stopped_before_replacement(_stale_gateway_record
 def test_stale_gateway_missing_or_reused_pid_is_not_signalled(_stale_gateway_record, state_kind):
     state = _stale_gateway_record
     state.live[state.gateway["pid"]] = None if state_kind == "gone" else {**state.gateway, "start_time": "different"}
-    dss_driver.recover_local_cortex_gateway()
+    ap_driver.recover_local_cortex_gateway()
     state.kill.assert_not_called()
     assert not state.path.exists()
 
@@ -9244,19 +9401,19 @@ def test_stale_gateway_unproven_ownership_refuses_startup(_stale_gateway_record,
     elif fault == "token":
         state.record["token"] = "different"
     elif fault == "group":
-        monkeypatch.setattr(dss_driver.os, "getpgid", lambda pid: pid + 1)
+        monkeypatch.setattr(ap_driver.os, "getpgid", lambda pid: pid + 1)
     elif fault == "schema":
         state.record["schema"] = "unknown"
     elif fault == "user":
         state.record["gateway"]["uid"] += 1
     state.path.write_text("{" if fault == "json" else json.dumps(state.record))
     monkeypatch.setattr(
-        dss_driver.subprocess,
+        ap_driver.subprocess,
         "Popen",
         lambda *a, **k: pytest.fail("unsafe replacement started"),
     )
     with pytest.raises(operator_interface_UnsafeCleanupError, match="still owns|cannot safely recover"):
-        with dss_driver.local_cortex_gateway(state.path.parent / "next"):
+        with ap_driver.local_cortex_gateway(state.path.parent / "next"):
             pytest.fail("unsafe replacement yielded")
     state.kill.assert_not_called()
     assert state.path.exists()
@@ -9266,27 +9423,27 @@ def test_stale_gateway_forced_shutdown_blocks_replacement(_stale_gateway_record,
     state = _stale_gateway_record
     state.kill.side_effect = None
     ticks = iter([0, 121])
-    monkeypatch.setattr(dss_driver.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(ap_driver.time, "monotonic", lambda: next(ticks))
     descendants = Mock()
-    monkeypatch.setattr(dss_driver, "_reap_owned_gateway_descendants", descendants)
+    monkeypatch.setattr(ap_driver, "_reap_owned_gateway_descendants", descendants)
     monkeypatch.setattr(
-        dss_driver.subprocess,
+        ap_driver.subprocess,
         "Popen",
         lambda *a, **k: pytest.fail("unsafe replacement started"),
     )
     with pytest.raises(operator_interface_UnsafeCleanupError, match="required forced shutdown"):
-        with dss_driver.local_cortex_gateway(state.path.parent / "next"):
+        with ap_driver.local_cortex_gateway(state.path.parent / "next"):
             pytest.fail("unsafe replacement yielded")
     state.kill.assert_called_once_with(state.gateway["pid"], signal.SIGTERM)
-    dss_driver.os.killpg.assert_called_once_with(state.gateway["pid"], signal.SIGKILL)
+    ap_driver.os.killpg.assert_called_once_with(state.gateway["pid"], signal.SIGKILL)
     descendants.assert_called_once_with(state.gateway, state.record["token"])
     assert state.path.exists()
 
 
 def test_owned_gateway_lock_rejects_concurrent_commands():
-    with dss_driver._owned_gateway_slot():
+    with ap_driver._owned_gateway_slot():
         with pytest.raises(operator_interface_UnsafeCleanupError, match="another correctness command"):
-            dss_driver.recover_local_cortex_gateway()
+            ap_driver.recover_local_cortex_gateway()
 
 
 @pytest.mark.parametrize("layout", ["onboarding", "regression"])
@@ -9306,7 +9463,7 @@ def test_owned_gateway_lock_rejects_concurrent_commands():
 def test_legacy_gateway_only_matching_orphan_recovered(
     tmp_path, monkeypatch, _isolated_gateway_ownership, layout, fault
 ):
-    monkeypatch.setattr(dss_driver, "_legacy_owned_gateways", _isolated_gateway_ownership)
+    monkeypatch.setattr(ap_driver, "_legacy_owned_gateways", _isolated_gateway_ownership)
     root = tmp_path / "proc"
     process = root / "999003"
     (process / "fd").mkdir(parents=True)
@@ -9351,15 +9508,15 @@ def test_legacy_gateway_only_matching_orphan_recovered(
         skill.unlink()
     elif fault == "other-user":
         uid = os.getuid()
-        monkeypatch.setattr(dss_driver.os, "getuid", lambda: uid + 1)
+        monkeypatch.setattr(ap_driver.os, "getuid", lambda: uid + 1)
     (process / "cmdline").write_bytes(b"\0".join(value.encode() for value in command) + b"\0")
     (process / "stat").write_text("999003 (python) " + " ".join(fields))
-    monkeypatch.setattr(dss_driver, "_GATEWAY_PROC_ROOT", root)
-    monkeypatch.setattr(dss_driver.os, "getpgid", lambda pid: pid + 1 if fault == "no-session" else pid)
-    identity = dss_driver._gateway_process_identity(999003)
+    monkeypatch.setattr(ap_driver, "_GATEWAY_PROC_ROOT", root)
+    monkeypatch.setattr(ap_driver.os, "getpgid", lambda pid: pid + 1 if fault == "no-session" else pid)
+    identity = ap_driver._gateway_process_identity(999003)
     kill = Mock(side_effect=lambda *a: (process / "stat").unlink())
-    monkeypatch.setattr(dss_driver.os, "kill", kill)
-    dss_driver.recover_local_cortex_gateway()
+    monkeypatch.setattr(ap_driver.os, "kill", kill)
+    ap_driver.recover_local_cortex_gateway()
     if fault is None:
         kill.assert_called_once_with(identity["pid"], signal.SIGTERM)
     else:
@@ -9374,14 +9531,14 @@ def test_owned_gateway_registry_records_launch_and_clears_after_cleanup(_automat
     context = (
         onboard._validation_gateway(Namespace(_automatic_cortex_gateway=True, output_dir=state.out))
         if command == "onboarding"
-        else dss_driver.local_cortex_gateway(state.out)
+        else ap_driver.local_cortex_gateway(state.out)
     )
-    path = dss_driver._gateway_state_directory() / "gateway.json"
+    path = ap_driver._gateway_state_directory() / "gateway.json"
     with context:
         record = json.loads(path.read_text())
         assert record["owner"]["pid"] == os.getpid()
         assert record["gateway"]["pid"] == state.process.pid
-        assert record["token"] == state.start.call_args.kwargs["env"]["DSS_CORRECTNESS_GATEWAY_OWNER"]
+        assert record["token"] == state.start.call_args.kwargs["env"]["AP_CORRECTNESS_GATEWAY_OWNER"]
         assert Path(record["log"]).is_file()
     assert not path.exists()
 
@@ -9396,12 +9553,12 @@ def test_owned_gateway_cleanup_guard_respects_replacement_registry(tmp_path, mon
         path.write_text(json.dumps({"token": record_token}))
     recover = Mock()
     scan = Mock()
-    monkeypatch.setattr(dss_driver, "_recover_owned_gateway", recover)
-    monkeypatch.setattr(dss_driver, "_cleanup_unrecorded_gateway", scan)
+    monkeypatch.setattr(ap_driver, "_recover_owned_gateway", recover)
+    monkeypatch.setattr(ap_driver, "_cleanup_unrecorded_gateway", scan)
     with (tmp_path / "owner.lock").open("a") as lock:
         if lock_busy:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        dss_driver.cleanup_owned_gateway(path, "old-token")
+        ap_driver.cleanup_owned_gateway(path, "old-token")
     if record_token == "old-token" and not lock_busy:
         recover.assert_called_once_with(path)
     else:
@@ -9420,7 +9577,7 @@ def test_owned_gateway_cleanup_guard_normal_exit_uses_only_standard_library(tmp_
                 "-I",
                 "-S",
                 "-c",
-                dss_driver._GATEWAY_CLEANUP_BOOTSTRAP,
+                ap_driver._GATEWAY_CLEANUP_BOOTSTRAP,
                 str(reader),
                 str(tmp_path / "gateway.json"),
                 "test-token",
@@ -9451,12 +9608,12 @@ def test_owned_gateway_cleanup_guard_scans_unrecorded_launch_after_recovery_fail
     path = tmp_path / "gateway.json"
     path.write_text(json.dumps({"token": "old-token"}))
     monkeypatch.setattr(
-        dss_driver, "_recover_owned_gateway", Mock(side_effect=operator_interface_UnsafeCleanupError("unsafe"))
+        ap_driver, "_recover_owned_gateway", Mock(side_effect=operator_interface_UnsafeCleanupError("unsafe"))
     )
     scan = Mock()
-    monkeypatch.setattr(dss_driver, "_cleanup_unrecorded_gateway", scan)
+    monkeypatch.setattr(ap_driver, "_cleanup_unrecorded_gateway", scan)
     with pytest.raises(operator_interface_UnsafeCleanupError, match="unsafe"):
-        dss_driver.cleanup_owned_gateway(path, "old-token")
+        ap_driver.cleanup_owned_gateway(path, "old-token")
     scan.assert_called_once_with("old-token")
     assert path.exists()
 
@@ -9467,7 +9624,7 @@ def test_owned_gateway_real_process_sigkill_automatically_cleans_without_next_co
     script = (
         "\nimport json\nimport os\nimport signal\nimport subprocess\nimport sys\nfrom argparse import Namespace\nfrom"
         " pathlib import Path\nfrom types import SimpleNamespace\nimport requests\nimport torch\nfrom"
-        " arctic_platform.correctness.harness import gateway as dss_driver\nfrom"
+        " arctic_platform.correctness.harness import gateway as ap_driver\nfrom"
         " arctic_platform.correctness.onboarding import onboard\n\nroot, command, phase = Path(sys.argv[1]),"
         " sys.argv[2], sys.argv[3]\ndss_driver._gateway_state_directory = lambda: root /"
         ' "ownership"\ndss_driver._allocation_hostfile = lambda: None\ndss_driver._legacy_owned_gateways = lambda:'
@@ -9479,14 +9636,14 @@ def test_owned_gateway_real_process_sigkill_automatically_cleans_without_next_co
         ' time.sleep(300)"\n)\ngateway_script = (\n    "import subprocess,sys,time; "\n   '
         " f\"subprocess.Popen([sys.executable, '-c', {child_script!r}], start_new_session=True);"
         ' time.sleep(300)"\n)\ndef start_gateway(*args, **kwargs):\n    if args[0][1:3] == ["-c",'
-        " dss_driver._GATEWAY_CLEANUP_BOOTSTRAP]:\n        return original_popen(*args, **kwargs)\n    gateway ="
+        " ap_driver._GATEWAY_CLEANUP_BOOTSTRAP]:\n        return original_popen(*args, **kwargs)\n    gateway ="
         ' original_popen(\n        [sys.executable, "-c", gateway_script],\n        stdout=kwargs["stdout"],'
         ' stderr=kwargs["stderr"], start_new_session=True, env=kwargs["env"],\n    )\n    (root /'
         ' "gateway.pid").write_text(str(gateway.pid))\n    if phase == "unrecorded":\n        (root /'
         ' "ready").write_text("")\n        signal.pause()\n    return gateway\ndss_driver.subprocess.Popen ='
         ' start_gateway\ndirectory = root / "attempt"\ncontext ='
         " (onboard._validation_gateway(Namespace(_automatic_cortex_gateway=True, output_dir=directory))\n           if"
-        ' command == "onboarding" else dss_driver.local_cortex_gateway(directory))\nwith context:\n    (root /'
+        ' command == "onboarding" else ap_driver.local_cortex_gateway(directory))\nwith context:\n    (root /'
         ' "ready").write_text("")\n    signal.pause()\n'
     )
     old = subprocess.Popen(
@@ -9505,17 +9662,17 @@ def test_owned_gateway_real_process_sigkill_automatically_cleans_without_next_co
             assert time.monotonic() < deadline, "orphan test startup timed out"
             time.sleep(0.05)
         record_path = tmp_path / "ownership" / "gateway.json"
-        gateway = dss_driver._gateway_process_identity(int((tmp_path / "gateway.pid").read_text()))
+        gateway = ap_driver._gateway_process_identity(int((tmp_path / "gateway.pid").read_text()))
         identities = [
             gateway,
-            dss_driver._gateway_process_identity(int((tmp_path / "worker.pid").read_text())),
+            ap_driver._gateway_process_identity(int((tmp_path / "worker.pid").read_text())),
         ]
         assert all(identities)
         old.kill()
         old.communicate(timeout=5)
         deadline = time.monotonic() + 40
         while record_path.exists() or any(
-            dss_driver._gateway_process_identity(entry["pid"]) == entry for entry in identities
+            ap_driver._gateway_process_identity(entry["pid"]) == entry for entry in identities
         ):
             assert time.monotonic() < deadline, (tmp_path / "attempt" / "gateway-cleanup.log").read_text()
             time.sleep(0.05)
@@ -9528,7 +9685,7 @@ def test_owned_gateway_real_process_sigkill_automatically_cleans_without_next_co
             old.kill()
             old.communicate(timeout=5)
         for entry in identities:
-            if dss_driver._gateway_process_identity(entry["pid"]) == entry:
+            if ap_driver._gateway_process_identity(entry["pid"]) == entry:
                 os.kill(entry["pid"], signal.SIGKILL)
 
 
@@ -9542,7 +9699,7 @@ def test_onboarding_resume_config_only_command_retries_failed_optimizer(tmp_path
         "ARCTIC_CORTEX_HOST",
         "ARCTIC_CORTEX_BASE_URL",
         "ARCTIC_CORTEX_PAT",
-        "DSS_CORRECTNESS_LOGDIR",
+        "AP_CORRECTNESS_LOGDIR",
     ):
         monkeypatch.delenv(name, raising=False)
     config_path = tmp_path / "recipe.json"
@@ -9691,12 +9848,12 @@ def test_demo_artifact_commands_stage_reusable_inputs_and_clean_only_owned_scrat
     cleanup = text[cleanup_header.end() :]
     commands = [block.split("```", 1)[0] for block in cleanup.split("```bash\n")[1:3]]
     report_dir = re.search(r"--out (\./work/reports/[a-zA-Z0-9_-]+)", text).group(1)
-    assert all("/data-fast" not in command and "DSS_CORRECTNESS_TMPDIR" not in command for command in commands)
+    assert all("/data-fast" not in command and "AP_CORRECTNESS_TMPDIR" not in command for command in commands)
     assert commands == [
         "rm ./work/configs/tiny-qwen3-129m-one-h200.json\n",
         f"rm -r ./work/logs/correctness-demo/\nrm -r {report_dir}/\n",
     ]
-    assert 'export DSS_CORRECTNESS_LOGDIR="$PWD/work/logs/correctness-demo"' in text
+    assert 'export AP_CORRECTNESS_LOGDIR="$PWD/work/logs/correctness-demo"' in text
     identifier = "tiny-qwen3-129m-one-h200"
     config = f"arctic_platform/correctness/configs/{identifier}.json"
     specification = f"arctic_platform/correctness/specs/{identifier}.json"
@@ -9757,8 +9914,8 @@ def test_demo_artifact_commands_stage_reusable_inputs_and_clean_only_owned_scrat
         (scratch_path / "retained-input").symlink_to(tmp_path / config)
         env = {
             **os.environ,
-            "DSS_CORRECTNESS_TMPDIR": scratch,
-            "DSS_CORRECTNESS_LOGDIR": overrides[log_override],
+            "AP_CORRECTNESS_TMPDIR": scratch,
+            "AP_CORRECTNESS_LOGDIR": overrides[log_override],
         }
         for command in commands:
             run("bash", "-eu", "-c", command, env=env)
@@ -9807,8 +9964,8 @@ def test_onboarding_heading_marker_is_distinct_from_inner_stages(capsys, phase, 
 def _gateway_scratch_launch_node(tmp_path, monkeypatch):
     hostfile = tmp_path / "hostfile"
     hostfile.write_text("synthetic-head slots=8\n")
-    monkeypatch.setattr(dss_driver.socket, "gethostname", lambda: "synthetic-head")
-    monkeypatch.setattr(dss_driver.socket, "gethostbyname", lambda host: "192.0.2.1")
+    monkeypatch.setattr(ap_driver.socket, "gethostname", lambda: "synthetic-head")
+    monkeypatch.setattr(ap_driver.socket, "gethostbyname", lambda host: "192.0.2.1")
     request = {
         "token": "new-launch",
         "path": str(tmp_path / "owned" / "scratch"),
@@ -9823,8 +9980,8 @@ def test_gateway_scratch_launch_node_creates_only_owned_parent_and_retains_ident
     _gateway_scratch_launch_node,
 ):
     request = _gateway_scratch_launch_node
-    first = dss_driver._gateway_scratch_node(request)
-    second = dss_driver._gateway_scratch_node(request)
+    first = ap_driver._gateway_scratch_node(request)
+    second = ap_driver._gateway_scratch_node(request)
     assert first["ok"] and first["created"]
     assert second["ok"] and not second["created"]
     assert first["identity"] == second["identity"]
@@ -9847,16 +10004,16 @@ def test_gateway_scratch_launch_node_refuses_unowned_or_unbound_parent(
         root.symlink_to(destination, target_is_directory=True)
     elif damage == "foreign-uid":
         root.mkdir(parents=True)
-        monkeypatch.setattr(dss_driver.os, "geteuid", lambda: root.stat().st_uid + 1)
+        monkeypatch.setattr(ap_driver.os, "geteuid", lambda: root.stat().st_uid + 1)
     elif damage == "hostfile":
         request["hostfile_sha256"] = "f" * 64
     elif damage == "member":
-        monkeypatch.setattr(dss_driver.socket, "gethostname", lambda: "unrelated-node")
+        monkeypatch.setattr(ap_driver.socket, "gethostname", lambda: "unrelated-node")
     elif damage == "python":
         request["python"] = "/unrelated/python"
     else:
         request["path"] = "/tmp/not-fast-scratch"
-    result = dss_driver._gateway_scratch_node(request)
+    result = ap_driver._gateway_scratch_node(request)
     assert not result["ok"] and result["error"]
 
 
@@ -9870,8 +10027,8 @@ def _gateway_scratch_launch_transport(tmp_path, monkeypatch):
     hostfile = tmp_path / "hostfile"
     hostfile.write_text("synthetic-head slots=8\nsynthetic-peer slots=8\n")
     root = tmp_path / "owned-scratch"
-    monkeypatch.setenv("DSS_CORRECTNESS_TMPDIR", str(root))
-    monkeypatch.setattr(dss_driver, "_ds_ssh", lambda: "/held/runtime/ds_ssh")
+    monkeypatch.setenv("AP_CORRECTNESS_TMPDIR", str(root))
+    monkeypatch.setattr(ap_driver, "_ds_ssh", lambda: "/held/runtime/ds_ssh")
     state = SimpleNamespace(damage=None, starts=[], waits=[], signals=[], live=False)
 
     def start(command, **kwargs):
@@ -9919,7 +10076,7 @@ def _gateway_scratch_launch_transport(tmp_path, monkeypatch):
 
         return SimpleNamespace(pid=12345, wait=wait)
 
-    monkeypatch.setattr(dss_driver.subprocess, "Popen", start)
+    monkeypatch.setattr(ap_driver.subprocess, "Popen", start)
 
     def killpg(pid, signum):
         if signum == 0:
@@ -9929,7 +10086,7 @@ def _gateway_scratch_launch_transport(tmp_path, monkeypatch):
         state.signals.append((pid, signum))
         state.live = False
 
-    monkeypatch.setattr(dss_driver.os, "killpg", killpg)
+    monkeypatch.setattr(ap_driver.os, "killpg", killpg)
     return state, directory, hostfile, root
 
 
@@ -9937,7 +10094,7 @@ def test_gateway_scratch_launch_collects_every_member_and_publishes_terminal_rec
     _gateway_scratch_launch_transport,
 ):
     state, directory, hostfile, root = _gateway_scratch_launch_transport
-    result = dss_driver._prepare_gateway_scratch(directory, hostfile)
+    result = ap_driver._prepare_gateway_scratch(directory, hostfile)
     assert result["ok"] and result["path"] == str(root)
     assert set(result["nodes"]) == {"synthetic-head", "synthetic-peer"}
     assert state.starts[0][0][:3] == ["/held/runtime/ds_ssh", "-f", str(hostfile)]
@@ -9966,7 +10123,7 @@ def test_gateway_scratch_launch_rejects_partial_or_unauthenticated_fanout_with_s
     state, directory, hostfile, _ = _gateway_scratch_launch_transport
     state.damage = damage
     with pytest.raises((ValueError, subprocess.TimeoutExpired)) as caught:
-        dss_driver._prepare_gateway_scratch(directory, hostfile)
+        ap_driver._prepare_gateway_scratch(directory, hostfile)
     saved = json.loads(next(directory.glob("scratch-preparation-*.json")).read_text())
     assert not saved["ok"] and saved["error"]
     assert Path(saved["transport_log"]).stat().st_size > 0
@@ -9979,26 +10136,26 @@ def test_gateway_scratch_launch_rejects_partial_or_unauthenticated_fanout_with_s
 def test_gateway_scratch_launch_prepares_before_gateway_and_restores_original_environment(
     tmp_path, monkeypatch, body_error
 ):
-    monkeypatch.setenv("DSS_CORRECTNESS_TMPDIR", "/data-fast/tmp/original-parent")
+    monkeypatch.setenv("AP_CORRECTNESS_TMPDIR", "/data-fast/tmp/original-parent")
     hostfile = tmp_path / "hostfile"
     hostfile.write_text("synthetic-head slots=8\n")
-    monkeypatch.setattr(dss_driver, "_allocation_hostfile", lambda: hostfile)
+    monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: hostfile)
     events = []
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "_prepare_gateway_scratch",
         lambda directory, hosts: events.append(("prepared", hosts)) or {"path": "/data-fast/tmp/prepared-parent"},
     )
 
     @contextmanager
     def launch(directory, record, hosts, *, gateway_module):
-        events.append(("launched", hosts, os.environ["DSS_CORRECTNESS_TMPDIR"]))
+        events.append(("launched", hosts, os.environ["AP_CORRECTNESS_TMPDIR"]))
         yield "http://127.0.0.1:1"
 
-    monkeypatch.setattr(dss_driver, "_launch_local_cortex_gateway", launch)
+    monkeypatch.setattr(ap_driver, "_launch_local_cortex_gateway", launch)
 
     def workload():
-        with dss_driver._started_local_cortex_gateway(
+        with ap_driver._started_local_cortex_gateway(
             tmp_path / "gateway",
             tmp_path / "owner.json",
             gateway_module="arctic_platform.correctness.harness.gateway",
@@ -10015,25 +10172,25 @@ def test_gateway_scratch_launch_prepares_before_gateway_and_restores_original_en
             workload()
     else:
         workload()
-    assert os.environ["DSS_CORRECTNESS_TMPDIR"] == "/data-fast/tmp/original-parent"
+    assert os.environ["AP_CORRECTNESS_TMPDIR"] == "/data-fast/tmp/original-parent"
 
 
 def test_gateway_scratch_launch_failure_prevents_gateway_creation(tmp_path, monkeypatch):
     hostfile = tmp_path / "hostfile"
     hostfile.write_text("synthetic-head slots=8\n")
-    monkeypatch.setattr(dss_driver, "_allocation_hostfile", lambda: hostfile)
+    monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: hostfile)
 
     def fail(*args):
         raise ValueError("actual peer ownership rejection")
 
-    monkeypatch.setattr(dss_driver, "_prepare_gateway_scratch", fail)
+    monkeypatch.setattr(ap_driver, "_prepare_gateway_scratch", fail)
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "_launch_local_cortex_gateway",
         lambda *a, **k: pytest.fail("gateway started"),
     )
     with pytest.raises(ValueError, match="actual peer ownership rejection"):
-        with dss_driver._started_local_cortex_gateway(
+        with ap_driver._started_local_cortex_gateway(
             tmp_path / "gateway",
             tmp_path / "owner.json",
             gateway_module="arctic_platform.correctness.harness.gateway",
@@ -10045,8 +10202,8 @@ def test_gateway_scratch_cleanup_escalates_only_owned_transport_group_and_waits(
     monkeypatch,
 ):
     state = SimpleNamespace(now=0.0, live=True, signals=[], waits=[])
-    monkeypatch.setattr(dss_driver.time, "monotonic", lambda: state.now)
-    monkeypatch.setattr(dss_driver.time, "sleep", lambda delay: setattr(state, "now", state.now + delay))
+    monkeypatch.setattr(ap_driver.time, "monotonic", lambda: state.now)
+    monkeypatch.setattr(ap_driver.time, "sleep", lambda delay: setattr(state, "now", state.now + delay))
 
     def killpg(pid, signum):
         assert pid == 12345
@@ -10057,9 +10214,9 @@ def test_gateway_scratch_cleanup_escalates_only_owned_transport_group_and_waits(
         if signum == signal.SIGKILL:
             state.live = False
 
-    monkeypatch.setattr(dss_driver.os, "killpg", killpg)
+    monkeypatch.setattr(ap_driver.os, "killpg", killpg)
     process = SimpleNamespace(pid=12345, wait=lambda timeout: state.waits.append(timeout))
-    dss_driver._reap_gateway_scratch_transport(process)
+    ap_driver._reap_gateway_scratch_transport(process)
     assert state.signals == [signal.SIGTERM, signal.SIGKILL] and state.waits == [10]
     assert 5 <= state.now < 6
 
@@ -10070,7 +10227,7 @@ def test_gateway_scratch_cleanup_refuses_lingering_descendants_after_direct_chil
     state, directory, hostfile, _ = _gateway_scratch_launch_transport
     state.live = True
     with pytest.raises(ValueError, match="left descendants"):
-        dss_driver._prepare_gateway_scratch(directory, hostfile)
+        ap_driver._prepare_gateway_scratch(directory, hostfile)
     assert state.signals == [(12345, signal.SIGTERM)] and state.waits == [120, 10]
     saved = json.loads(next(directory.glob("scratch-preparation-*.json")).read_text())
     assert not saved["ok"]
@@ -10090,7 +10247,7 @@ def test_gateway_scratch_cleanup_receipt_write_failure_cannot_replace_primary_tr
 
     monkeypatch.setattr(Path, "open", fail_receipt)
     with pytest.raises(ValueError, match="preparation rejected") as caught:
-        dss_driver._prepare_gateway_scratch(directory, hostfile)
+        ap_driver._prepare_gateway_scratch(directory, hostfile)
     assert any("Could not publish scratch preparation receipt" in note for note in caught.value.__notes__)
     assert next(directory.glob("*.transport.log")).stat().st_size > 0
 
@@ -10107,7 +10264,7 @@ def test_gateway_scratch_cleanup_node_boot_drift_is_retained_without_success(
         return original(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", read)
-    result = dss_driver._gateway_scratch_node(_gateway_scratch_launch_node)
+    result = ap_driver._gateway_scratch_node(_gateway_scratch_launch_node)
     assert not result["ok"] and "allocation identity changed" in result["error"]
     assert result["boot_id"] == "original-boot"
 
@@ -10116,10 +10273,10 @@ def test_gateway_scratch_cleanup_node_boot_drift_is_retained_without_success(
 def test_gateway_scratch_cleanup_default_environment_restored_and_upstream_remains_unchanged(
     tmp_path, monkeypatch, upstream
 ):
-    monkeypatch.delenv("DSS_CORRECTNESS_TMPDIR", raising=False)
+    monkeypatch.delenv("AP_CORRECTNESS_TMPDIR", raising=False)
     hostfile = tmp_path / "hostfile"
     hostfile.write_text("synthetic-head slots=8\n")
-    monkeypatch.setattr(dss_driver, "_allocation_hostfile", lambda: hostfile)
+    monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: hostfile)
     events = []
 
     def prepare(*args):
@@ -10129,17 +10286,17 @@ def test_gateway_scratch_cleanup_default_environment_restored_and_upstream_remai
 
     @contextmanager
     def launch(*args, **kwargs):
-        assert os.environ.get("DSS_CORRECTNESS_TMPDIR") == (None if upstream else "/data-fast/tmp/owned-default")
+        assert os.environ.get("AP_CORRECTNESS_TMPDIR") == (None if upstream else "/data-fast/tmp/owned-default")
         events.append("launched")
         yield "http://127.0.0.1:1"
 
-    monkeypatch.setattr(dss_driver, "_prepare_gateway_scratch", prepare)
-    monkeypatch.setattr(dss_driver, "_launch_local_cortex_gateway", launch)
+    monkeypatch.setattr(ap_driver, "_prepare_gateway_scratch", prepare)
+    monkeypatch.setattr(ap_driver, "_launch_local_cortex_gateway", launch)
     options = {} if upstream else {"gateway_module": "arctic_platform.correctness.harness.gateway"}
     with pytest.raises(RuntimeError, match="original workload"):
-        with dss_driver._started_local_cortex_gateway(tmp_path / "gateway", tmp_path / "owner.json", **options):
+        with ap_driver._started_local_cortex_gateway(tmp_path / "gateway", tmp_path / "owner.json", **options):
             raise RuntimeError("original workload")
-    assert "DSS_CORRECTNESS_TMPDIR" not in os.environ
+    assert "AP_CORRECTNESS_TMPDIR" not in os.environ
     assert events == (["launched"] if upstream else ["prepared", "launched"])
 
 
@@ -10148,7 +10305,7 @@ def test_gateway_scratch_hostfile_identity_ignores_read_atime_but_rejects_same_b
     _gateway_scratch_launch_transport, monkeypatch, changed
 ):
     _, directory, hostfile, _ = _gateway_scratch_launch_transport
-    original = dss_driver.subprocess.Popen
+    original = ap_driver.subprocess.Popen
     original_stat = hostfile.stat()
 
     def start(*args, **kwargs):
@@ -10183,12 +10340,12 @@ def test_gateway_scratch_hostfile_identity_ignores_read_atime_but_rejects_same_b
             )
         return process
 
-    monkeypatch.setattr(dss_driver.subprocess, "Popen", start)
+    monkeypatch.setattr(ap_driver.subprocess, "Popen", start)
     if changed == "inode":
         with pytest.raises(ValueError, match="hostfile identity differs"):
-            dss_driver._prepare_gateway_scratch(directory, hostfile)
+            ap_driver._prepare_gateway_scratch(directory, hostfile)
     else:
-        assert dss_driver._prepare_gateway_scratch(directory, hostfile)["ok"]
+        assert ap_driver._prepare_gateway_scratch(directory, hostfile)["ok"]
 
 
 # Explicit authenticated allocation identities for head-local gateway hostfiles.
@@ -10204,11 +10361,11 @@ def gateway_scratch_peer_runtime(tmp_path, monkeypatch):
         parsed=[],
         forbidden_reads=[],
     )
-    monkeypatch.setattr(dss_driver.socket, "gethostname", lambda: state.host)
-    monkeypatch.setattr(dss_driver.socket, "gethostbyname", lambda host: state.address)
+    monkeypatch.setattr(ap_driver.socket, "gethostname", lambda: state.host)
+    monkeypatch.setattr(ap_driver.socket, "gethostbyname", lambda host: state.address)
     original_read_text = Path.read_text
     original_open = Path.open
-    parser = dss_driver.parse_hostfile
+    parser = ap_driver.parse_hostfile
 
     def read_text(path, *args, **kwargs):
         if str(path) == "/proc/sys/kernel/random/boot_id":
@@ -10230,11 +10387,11 @@ def gateway_scratch_peer_runtime(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "read_text", read_text)
     monkeypatch.setattr(Path, "open", open_path)
-    monkeypatch.setattr(dss_driver, "parse_hostfile", parse)
-    monkeypatch.setattr(dss_driver.subprocess, "Popen", forbidden)
-    monkeypatch.setattr(dss_driver.subprocess, "run", forbidden)
-    monkeypatch.setattr(dss_driver.socket, "create_connection", forbidden)
-    monkeypatch.setattr(dss_driver.socket.socket, "connect", forbidden)
+    monkeypatch.setattr(ap_driver, "parse_hostfile", parse)
+    monkeypatch.setattr(ap_driver.subprocess, "Popen", forbidden)
+    monkeypatch.setattr(ap_driver.subprocess, "run", forbidden)
+    monkeypatch.setattr(ap_driver.socket, "create_connection", forbidden)
+    monkeypatch.setattr(ap_driver.socket.socket, "connect", forbidden)
     monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
     return state
 
@@ -10277,8 +10434,8 @@ def test_gateway_scratch_peer_missing_local_file_requires_exact_authenticated_sn
         request["hostfile_sha256"] = hashlib.sha256(payload).hexdigest()
     payload = base64.b64decode(request["hostfile_base64"])
     assert not Path(request["hostfile"]).exists()
-    first = dss_driver._gateway_scratch_node(request)
-    second = dss_driver._gateway_scratch_node(request)
+    first = ap_driver._gateway_scratch_node(request)
+    second = ap_driver._gateway_scratch_node(request)
     assert first["ok"] and first["created"], first
     assert second["ok"] and not second["created"], second
     assert first["identity"] == second["identity"]
@@ -10385,7 +10542,7 @@ def test_gateway_scratch_peer_rejects_snapshot_membership_and_runtime_drift_befo
         state.boot = "recreated-peer"
     else:
         request["python"] = "/foreign/python"
-    result = dss_driver._gateway_scratch_node(request)
+    result = ap_driver._gateway_scratch_node(request)
     assert result["ok"] is False and result["error"], result
     assert not Path(request["path"]).exists(), result
 
@@ -10403,8 +10560,8 @@ def test_gateway_scratch_peer_checks_runtime_identity_again_after_local_mkdir(
             setattr(state, {"boot": "boot", "hostname": "host", "address": "address"}[damage], "changed-after-mkdir")
         return result
 
-    monkeypatch.setattr(dss_driver.os, "mkdir", mkdir)
-    result = dss_driver._gateway_scratch_node(request)
+    monkeypatch.setattr(ap_driver.os, "mkdir", mkdir)
+    result = ap_driver._gateway_scratch_node(request)
     assert not result["ok"] and "allocation identity changed" in result["error"], result
     assert result["boot_id"] == "peer-boot"
     assert Path(request["path"]).is_dir()
@@ -10436,8 +10593,8 @@ def test_gateway_scratch_peer_legacy_path_still_reads_local_file_and_does_not_in
                 state.boot = "new-legacy-boot"
         return result
 
-    monkeypatch.setattr(dss_driver.os, "mkdir", mkdir)
-    result = dss_driver._gateway_scratch_node(request)
+    monkeypatch.setattr(ap_driver.os, "mkdir", mkdir)
+    result = ap_driver._gateway_scratch_node(request)
     if damage == "none":
         assert result["ok"] and result["boot_id"] == "peer-boot", result
         assert "member" not in result and "slots" not in result
@@ -10457,8 +10614,8 @@ def gateway_scratch_peer_transport(tmp_path, monkeypatch, gateway_scratch_peer_r
     directory.mkdir()
     hostfile = tmp_path / "head-hostfile"
     hostfile.write_bytes(base64.b64decode(request["hostfile_base64"]))
-    monkeypatch.setenv("DSS_CORRECTNESS_TMPDIR", request["path"])
-    monkeypatch.setattr(dss_driver, "_ds_ssh", lambda: "/synthetic/ds_ssh")
+    monkeypatch.setenv("AP_CORRECTNESS_TMPDIR", request["path"])
+    monkeypatch.setattr(ap_driver, "_ds_ssh", lambda: "/synthetic/ds_ssh")
     state = SimpleNamespace(
         damage=None,
         starts=[],
@@ -10488,7 +10645,7 @@ def gateway_scratch_peer_transport(tmp_path, monkeypatch, gateway_scratch_peer_r
             peer_request = copy.deepcopy(incoming)
             if "allocation_members" in incoming or state.head_only:
                 peer_request["hostfile"] = request["hostfile"]
-            row = dss_driver._gateway_scratch_node(peer_request)
+            row = ap_driver._gateway_scratch_node(peer_request)
             assert row["ok"], row
             rows.append((key, row))
         if state.damage == "swapped":
@@ -10534,8 +10691,8 @@ def gateway_scratch_peer_transport(tmp_path, monkeypatch, gateway_scratch_peer_r
         assert pid == 23456 and signum == 0
         raise ProcessLookupError
 
-    monkeypatch.setattr(dss_driver.subprocess, "Popen", start)
-    monkeypatch.setattr(dss_driver.os, "killpg", killpg)
+    monkeypatch.setattr(ap_driver.subprocess, "Popen", start)
+    monkeypatch.setattr(ap_driver.os, "killpg", killpg)
     return state
 
 
@@ -10547,7 +10704,7 @@ def test_gateway_scratch_peer_head_transports_snapshot_with_or_without_supplied_
 
     state = gateway_scratch_peer_transport
     options = {"allocation_members": state.members} if explicit else {}
-    result = dss_driver._prepare_gateway_scratch(state.directory, state.hostfile, **options)
+    result = ap_driver._prepare_gateway_scratch(state.directory, state.hostfile, **options)
     assert result["ok"] and set(result["nodes"]) == set(state.members)
     incoming = state.requests[0]
     assert incoming == result["request"]
@@ -10568,7 +10725,7 @@ def test_gateway_scratch_peer_head_transports_snapshot_with_or_without_supplied_
 def test_gateway_scratch_implicit_head_only_hostfile_prepares_every_worker(gateway_scratch_peer_transport):
     state = gateway_scratch_peer_transport
     state.head_only = True
-    result = dss_driver._prepare_gateway_scratch(state.directory, state.hostfile)
+    result = ap_driver._prepare_gateway_scratch(state.directory, state.hostfile)
     assert result["ok"] and set(result["nodes"]) == set(state.members)
     assert "allocation_members" not in result["request"]
     assert all(row["ok"] for row in result["nodes"].values())
@@ -10588,7 +10745,7 @@ def test_gateway_scratch_implicit_snapshot_never_requires_peer_local_hostfile(
         host_bytes = b"192.0.2.1 slots=4\n192.0.2.2 slots=8\n"
         request["hostfile_base64"] = base64.b64encode(host_bytes).decode("ascii")
         request["hostfile_sha256"] = hashlib.sha256(host_bytes).hexdigest()
-    result = dss_driver._gateway_scratch_node(request)
+    result = ap_driver._gateway_scratch_node(request)
     assert result["ok"] and result["boot_id"] == "peer-boot", result
     assert len(gateway_scratch_peer_runtime.parsed) == 1
     assert "member" not in result and "slots" not in result
@@ -10616,7 +10773,7 @@ def test_gateway_scratch_implicit_snapshot_rejects_unbound_metadata_before_mkdir
         request["hostfile_sha256"] = "0" * 64
     else:
         request["python"] = "/foreign/python"
-    result = dss_driver._gateway_scratch_node(request)
+    result = ap_driver._gateway_scratch_node(request)
     assert not result["ok"] and result["error"], result
     assert not Path(request["path"]).exists()
 
@@ -10629,7 +10786,7 @@ def test_gateway_scratch_implicit_snapshot_retains_head_and_complete_fanout_guar
     state.head_only = True
     state.damage = damage
     with pytest.raises(ValueError):
-        dss_driver._prepare_gateway_scratch(state.directory, state.hostfile)
+        ap_driver._prepare_gateway_scratch(state.directory, state.hostfile)
     saved = json.loads(next(state.directory.glob("scratch-preparation-*.json")).read_text())
     assert not saved["ok"] and saved["error"]
     assert Path(saved["transport_log"]).stat().st_size > 0
@@ -10660,7 +10817,7 @@ def test_gateway_scratch_peer_head_rejects_changed_file_or_unauthenticated_trans
     state = gateway_scratch_peer_transport
     state.damage = damage
     with pytest.raises(ValueError) as caught:
-        dss_driver._prepare_gateway_scratch(state.directory, state.hostfile, allocation_members=state.members)
+        ap_driver._prepare_gateway_scratch(state.directory, state.hostfile, allocation_members=state.members)
     saved = json.loads(next(state.directory.glob("scratch-preparation-*.json")).read_text())
     assert saved["ok"] is False and saved["error"]
     assert Path(saved["transport_log"]).stat().st_size > 0
@@ -10680,7 +10837,7 @@ def test_gateway_scratch_peer_head_rejects_incomplete_mapping_before_transport(g
     else:
         state.members["synthetic-peer"]["address"] = state.members["synthetic-head"]["address"]
     with pytest.raises(ValueError):
-        dss_driver._prepare_gateway_scratch(state.directory, state.hostfile, allocation_members=state.members)
+        ap_driver._prepare_gateway_scratch(state.directory, state.hostfile, allocation_members=state.members)
     assert state.starts == [] and not state.root.exists()
     saved = json.loads(next(state.directory.glob("scratch-preparation-*.json")).read_text())
     assert not saved["ok"] and saved["error"]
@@ -10702,10 +10859,10 @@ def test_gateway_scratch_peer_public_gateway_passes_optional_mapping_without_cha
         seen.append((directory, record, gateway_module, kwargs))
         yield "http://synthetic.invalid:1"
 
-    monkeypatch.setattr(dss_driver, "_owned_gateway_slot", slot)
-    monkeypatch.setattr(dss_driver, "_started_local_cortex_gateway", started)
+    monkeypatch.setattr(ap_driver, "_owned_gateway_slot", slot)
+    monkeypatch.setattr(ap_driver, "_started_local_cortex_gateway", started)
     options = {"allocation_members": members} if explicit else {}
-    with dss_driver.local_cortex_gateway(
+    with ap_driver.local_cortex_gateway(
         tmp_path / "gateway", gateway_module="arctic_platform.correctness.harness.gateway", **options
     ) as url:
         assert url == "http://synthetic.invalid:1"
@@ -10717,9 +10874,9 @@ def test_gateway_scratch_peer_public_gateway_passes_optional_mapping_without_cha
 def test_gateway_scratch_peer_public_gateway_rejects_supplied_mapping_for_upstream_before_ownership(
     tmp_path, monkeypatch, gateway_scratch_peer_request
 ):
-    monkeypatch.setattr(dss_driver, "_owned_gateway_slot", lambda: pytest.fail("ownership touched before rejection"))
+    monkeypatch.setattr(ap_driver, "_owned_gateway_slot", lambda: pytest.fail("ownership touched before rejection"))
     with pytest.raises(ValueError, match="correctness gateway"):
-        with dss_driver.local_cortex_gateway(
+        with ap_driver.local_cortex_gateway(
             tmp_path / "gateway", allocation_members=gateway_scratch_peer_request["allocation_members"]
         ):
             pytest.fail("upstream gateway accepted authenticated mapping")
@@ -10732,8 +10889,8 @@ def test_gateway_scratch_peer_started_gateway_passes_mapping_only_to_preparation
 ):
     hostfile = tmp_path / "hostfile"
     hostfile.write_text("synthetic-peer slots=8\n")
-    monkeypatch.setattr(dss_driver, "_allocation_hostfile", lambda: hostfile)
-    monkeypatch.setenv("DSS_CORRECTNESS_TMPDIR", "/data-fast/tmp/original-peer-parent")
+    monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: hostfile)
+    monkeypatch.setenv("AP_CORRECTNESS_TMPDIR", "/data-fast/tmp/original-peer-parent")
     members = gateway_scratch_peer_request["allocation_members"]
     events = []
     options = {"allocation_members": members} if explicit else {}
@@ -10748,19 +10905,19 @@ def test_gateway_scratch_peer_started_gateway_passes_mapping_only_to_preparation
     @contextmanager
     def launch(directory, record, hosts, *, gateway_module):
         assert hosts == hostfile
-        assert os.environ["DSS_CORRECTNESS_TMPDIR"] == str(tmp_path / "prepared-peer-parent")
+        assert os.environ["AP_CORRECTNESS_TMPDIR"] == str(tmp_path / "prepared-peer-parent")
         events.append("launch")
         try:
             yield "http://synthetic.invalid:1"
         finally:
             events.append("close")
 
-    monkeypatch.setattr(dss_driver, "_prepare_gateway_scratch", prepare)
-    monkeypatch.setattr(dss_driver, "_launch_local_cortex_gateway", launch)
+    monkeypatch.setattr(ap_driver, "_prepare_gateway_scratch", prepare)
+    monkeypatch.setattr(ap_driver, "_launch_local_cortex_gateway", launch)
     primary = RuntimeError("new peer workload failure")
 
     def workload():
-        with dss_driver._started_local_cortex_gateway(
+        with ap_driver._started_local_cortex_gateway(
             tmp_path / "gateway",
             tmp_path / "owner.json",
             gateway_module="arctic_platform.correctness.harness.gateway",
@@ -10777,7 +10934,7 @@ def test_gateway_scratch_peer_started_gateway_passes_mapping_only_to_preparation
     else:
         workload()
     assert events == ["prepare", "launch", "close"]
-    assert os.environ["DSS_CORRECTNESS_TMPDIR"] == "/data-fast/tmp/original-peer-parent"
+    assert os.environ["AP_CORRECTNESS_TMPDIR"] == "/data-fast/tmp/original-peer-parent"
 
 
 # Reviewed subset specifications and explicit operator case selection.
@@ -10798,9 +10955,9 @@ def selected_spec_case_state(tmp_path, monkeypatch):
     monkeypatch.setattr(execution, "local_cortex_gateway", forbidden)
     monkeypatch.setattr(subprocess, "Popen", forbidden)
     monkeypatch.setattr(subprocess, "run", forbidden)
-    monkeypatch.setattr(dss_driver.socket, "gethostbyname", forbidden)
-    monkeypatch.setattr(dss_driver.socket, "create_connection", forbidden)
-    monkeypatch.setattr(dss_driver.socket.socket, "connect", forbidden)
+    monkeypatch.setattr(ap_driver.socket, "gethostbyname", forbidden)
+    monkeypatch.setattr(ap_driver.socket, "create_connection", forbidden)
+    monkeypatch.setattr(ap_driver.socket.socket, "connect", forbidden)
     monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
     path = tmp_path / "synthetic-selected.config"
     cfg = LoadedConfig(
@@ -10838,7 +10995,7 @@ def selected_spec_case_state(tmp_path, monkeypatch):
                 max_seq_len=arm.max_seq_len,
                 total_tokens=arm.total_tokens,
                 active_tokens=arm.total_tokens,
-                dss_microbatches=1 if arm.name == "gas1" else 4,
+                ap_microbatches=1 if arm.name == "gas1" else 4,
                 pad_fraction=0.0,
             )
             for arm in arms
@@ -14759,7 +14916,7 @@ def test_cortex_optimizer_decode_decode_named_fp32_update_moments_and_padding(tm
     comparison = compare_optimizer_norms(summary, summary)
     assert len(comparison.deltas) == 3 * len(pair.expected)
     assert all((item.delta_norm == 0 for item in comparison.deltas if item.state in ("exp_avg", "exp_avg_sq")))
-    assert not comparison.only_dss and (not comparison.only_reference)
+    assert not comparison.only_ap and (not comparison.only_reference)
 
 
 def test_cortex_optimizer_decode_decode_uses_actual_state_step_and_group_lr_not_legacy_or_config_defaults(tmp_path):
@@ -15135,7 +15292,7 @@ def test_cortex_optimizer_decode_decode_rejects_unmatched_expected_optimizer_typ
 # Dss driver.
 
 
-def test_dss_driver_globalize_expert_norms_replaces_rank_local_value() -> None:
+def test_ap_driver_globalize_expert_norms_replaces_rank_local_value() -> None:
     norms = _globalize_expert_norms(
         {"layers.0.mlp.experts.w1": 3.0, "layers.0.input_layernorm.weight": 7.0},
         {"layers.0.mlp.experts.w1": [3.0, 4.0]},
@@ -15143,7 +15300,7 @@ def test_dss_driver_globalize_expert_norms_replaces_rank_local_value() -> None:
     assert norms == {"layers.0.mlp.experts.w1": 5.0, "layers.0.input_layernorm.weight": 7.0}
 
 
-def test_dss_driver_fwd_bwd_step_reads_rank_owned_norms_from_merged_list() -> None:
+def test_ap_driver_fwd_bwd_step_reads_rank_owned_norms_from_merged_list() -> None:
     from arctic_platform.correctness.harness.gateway import fwd_bwd_step
 
     class Client:
@@ -15167,7 +15324,7 @@ def test_dss_driver_fwd_bwd_step_reads_rank_owned_norms_from_merged_list() -> No
     assert result.grad_norms == {"layers.0.input_layernorm.weight": 2.0}
 
 
-def test_dss_driver_fwd_bwd_step_unwraps_rank_owned_optimizer_manifest() -> None:
+def test_ap_driver_fwd_bwd_step_unwraps_rank_owned_optimizer_manifest() -> None:
     from arctic_platform.correctness.harness.gateway import fwd_bwd_step
 
     class Client:
@@ -15185,7 +15342,7 @@ def test_dss_driver_fwd_bwd_step_unwraps_rank_owned_optimizer_manifest() -> None
     assert result.optimizer_state_manifest == "/tmp/manifest.json"
 
 
-def test_dss_driver_optimizer_capture_worker_patches_imported_server_worker_bindings(monkeypatch) -> None:
+def test_ap_driver_optimizer_capture_worker_patches_imported_server_worker_bindings(monkeypatch) -> None:
     import arctic_platform.common as common_package
     from arctic_platform.correctness.harness.optimizer import _patched_deepspeed_worker_bindings
 
@@ -15211,7 +15368,7 @@ def test_dss_driver_optimizer_capture_worker_patches_imported_server_worker_bind
     assert rl_server.DeepSpeedWorker is stale_worker
 
 
-def test_dss_driver_optimizer_capture_server_patches_workers_inside_actor(monkeypatch) -> None:
+def test_ap_driver_optimizer_capture_server_patches_workers_inside_actor(monkeypatch) -> None:
     import arctic_platform.common as common_package
     from arctic_platform.correctness.harness import optimizer as optimizer_capture
 
@@ -15249,7 +15406,7 @@ def test_dss_driver_optimizer_capture_server_patches_workers_inside_actor(monkey
     assert server_module.DeepSpeedWorker is original_worker
 
 
-def test_dss_driver_prime_rl_receives_prediction_aligned_labels() -> None:
+def test_ap_driver_prime_rl_receives_prediction_aligned_labels() -> None:
     batch = Batch(
         name="one",
         input_ids=torch.tensor([[4, 5, 6]]),
@@ -15260,7 +15417,7 @@ def test_dss_driver_prime_rl_receives_prediction_aligned_labels() -> None:
     assert _labels_for_provider(batch, "huggingface").tolist() == [[4, 5, 6]]
 
 
-def test_dss_driver_prime_rl_uses_fused_model_loss_with_aligned_labels() -> None:
+def test_ap_driver_prime_rl_uses_fused_model_loss_with_aligned_labels() -> None:
     batch = Batch(
         name="one",
         input_ids=torch.tensor([[4, 5, 6]]),
@@ -15276,7 +15433,7 @@ def test_dss_driver_prime_rl_uses_fused_model_loss_with_aligned_labels() -> None
     assert pack(batch, model_provider="huggingface")["processing"]["loss_fn"] == "sft"
 
 
-def test_dss_driver_pack_microbatches_emits_exact_gas_list() -> None:
+def test_ap_driver_pack_microbatches_emits_exact_gas_list() -> None:
     batch = Batch(
         name="gas4",
         input_ids=torch.arange(15).view(5, 3),
@@ -15290,7 +15447,7 @@ def test_dss_driver_pack_microbatches_emits_exact_gas_list() -> None:
     assert body["batch"][-1]["labels"].tolist() == [[12, 13, 14]]
 
 
-def test_dss_driver_pack_microbatches_preserves_prime_rl_shifted_labels() -> None:
+def test_ap_driver_pack_microbatches_preserves_prime_rl_shifted_labels() -> None:
     batch = Batch(
         name="prime",
         input_ids=torch.tensor([[4, 5, 6], [7, 8, 9]]),
@@ -15303,7 +15460,7 @@ def test_dss_driver_pack_microbatches_preserves_prime_rl_shifted_labels() -> Non
     assert body["batch"][1]["labels"].tolist() == [[8, 9, -100]]
 
 
-def test_dss_driver_pack_microbatches_can_request_memory_sft_ce_without_mutating_config() -> None:
+def test_ap_driver_pack_microbatches_can_request_memory_sft_ce_without_mutating_config() -> None:
     batch = Batch(
         name="gas4",
         input_ids=torch.arange(12).view(4, 3),
@@ -15319,7 +15476,7 @@ def test_dss_driver_pack_microbatches_can_request_memory_sft_ce_without_mutating
     }
 
 
-def test_dss_driver_normal_packing_uses_plain_supervised_loss() -> None:
+def test_ap_driver_normal_packing_uses_plain_supervised_loss() -> None:
     from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
 
     body = pack(build_batch("gas4", 16, 8, 128))
@@ -15327,7 +15484,7 @@ def test_dss_driver_normal_packing_uses_plain_supervised_loss() -> None:
     assert body["processing"] == {"loss_fn": "sft"}
 
 
-def test_dss_driver_reference_runner_passes_the_harness_seed(tmp_path, monkeypatch) -> None:
+def test_ap_driver_reference_runner_passes_the_harness_seed(tmp_path, monkeypatch) -> None:
     from arctic_platform.correctness.harness import runner
 
     output = tmp_path / "reference.json"
@@ -15359,7 +15516,7 @@ def test_dss_driver_reference_runner_passes_the_harness_seed(tmp_path, monkeypat
 
 @pytest.mark.parametrize("unsafe", ["/tmp", "/code", "/data-fast-shadow", "/data-fast", "symlink"])
 @pytest.mark.parametrize("boundary", ["execute", "execute_rl", "reference_optimizer"])
-def test_dss_driver_runner_requires_data_fast_before_operational_side_effects(tmp_path, monkeypatch, unsafe, boundary):
+def test_ap_driver_runner_requires_data_fast_before_operational_side_effects(tmp_path, monkeypatch, unsafe, boundary):
     from arctic_platform.correctness.harness import runner
 
     destination = Path(unsafe)
@@ -15394,7 +15551,7 @@ def test_dss_driver_runner_requires_data_fast_before_operational_side_effects(tm
     assert not (tmp_path / "reference.json").exists()
 
 
-def test_dss_driver_reference_allows_small_repo_report_with_data_fast_optimizer_output(tmp_path, monkeypatch):
+def test_ap_driver_reference_allows_small_repo_report_with_data_fast_optimizer_output(tmp_path, monkeypatch):
     from arctic_platform.correctness.harness import runner
 
     output = Path(__file__).resolve().parents[3] / ".codex-run-state" / f"reference-report-{tmp_path.name}.json"
@@ -15435,7 +15592,7 @@ def test_dss_driver_reference_allows_small_repo_report_with_data_fast_optimizer_
     assert not output.exists()
 
 
-def test_dss_driver_full_model_weights_only_export_still_requires_model_config(tmp_path) -> None:
+def test_ap_driver_full_model_weights_only_export_still_requires_model_config(tmp_path) -> None:
     from arctic_platform.correctness.harness.gateway import save_weights_only_checkpoint
 
     client = SimpleNamespace(save_checkpoint=lambda **kwargs: {"hf_path": str(tmp_path), "path": str(tmp_path)})
@@ -15443,7 +15600,7 @@ def test_dss_driver_full_model_weights_only_export_still_requires_model_config(t
         save_weights_only_checkpoint(None, SimpleNamespace(client=client), tmp_path)
 
 
-def test_dss_driver_payload_routes_optimizer_capture_to_debug_for_harness(tmp_path) -> None:
+def test_ap_driver_payload_routes_optimizer_capture_to_debug_for_harness(tmp_path) -> None:
     destination = tmp_path / "optimizer"
     payload = build_payload(
         {"n_gpus": 1, "mb_spec": {"max_tokens_per_mb": 1024}}, "model", 42, optimizer_state_output_dir=destination
@@ -15462,13 +15619,13 @@ def test_dss_driver_payload_routes_optimizer_capture_to_debug_for_harness(tmp_pa
         {"debug": {"optimizer_state_output_dir": "/ignored"}},
     ],
 )
-def test_dss_driver_optimizer_capture_debug_config_defaults(job_config) -> None:
+def test_ap_driver_optimizer_capture_debug_config_defaults(job_config) -> None:
     from arctic_platform.correctness.harness.optimizer import _optimizer_capture_debug_config
 
     assert _optimizer_capture_debug_config(job_config) == {}
 
 
-def test_dss_driver_optimizer_capture_debug_config_merges_supported_sections_without_mutation() -> None:
+def test_ap_driver_optimizer_capture_debug_config_merges_supported_sections_without_mutation() -> None:
     from arctic_platform.correctness.harness.optimizer import _optimizer_capture_debug_config
 
     training_debug = {"optimizer_state_output_dir": "/training", "model_state_output_dir": "/model"}
@@ -15485,7 +15642,7 @@ def test_dss_driver_optimizer_capture_debug_config_merges_supported_sections_wit
 @pytest.mark.parametrize("section", ["training_config", "ds_worker_config"])
 @pytest.mark.parametrize("nested_debug", [False, True], ids=["config", "debug"])
 @pytest.mark.parametrize("value", [[], "", False])
-def test_dss_driver_optimizer_capture_debug_config_rejects_malformed_sections(section, nested_debug, value) -> None:
+def test_ap_driver_optimizer_capture_debug_config_rejects_malformed_sections(section, nested_debug, value) -> None:
     from arctic_platform.correctness.harness.optimizer import _optimizer_capture_debug_config
 
     config = {section: {"debug": value} if nested_debug else value}
@@ -15495,7 +15652,7 @@ def test_dss_driver_optimizer_capture_debug_config_rejects_malformed_sections(se
 
 
 @pytest.fixture
-def _dss_driver_optimizer_capture_initializer(monkeypatch):
+def _ap_driver_optimizer_capture_initializer(monkeypatch):
     import arctic_platform.common as common_package
     from arctic_platform.correctness.harness import optimizer as optimizer_capture
 
@@ -15525,14 +15682,14 @@ def _dss_driver_optimizer_capture_initializer(monkeypatch):
     ],
     ids=["disabled", "optimizer", "model", "both"],
 )
-def test_dss_driver_optimizer_capture_initialize_uses_current_client_job_config(
-    _dss_driver_optimizer_capture_initializer, tmp_path, fields
+def test_ap_driver_optimizer_capture_initialize_uses_current_client_job_config(
+    _ap_driver_optimizer_capture_initializer, tmp_path, fields
 ):
     payload = build_payload({"n_gpus": 1}, "model", 42)
     payload["training_config"]["debug"].update({field: str(tmp_path / field) for field in fields})
     client_config = _training_client_config(SimpleNamespace(workdir=tmp_path), payload)
     job_config = client_config.to_onprem("training")
-    worker = _dss_driver_optimizer_capture_initializer
+    worker = _ap_driver_optimizer_capture_initializer
     assert worker.initialize("master", job_config) is True
     assert worker._optimizer_state_output_dir == (
         str(tmp_path / "optimizer_state_output_dir") if "optimizer_state_output_dir" in fields else None
@@ -15544,10 +15701,10 @@ def test_dss_driver_optimizer_capture_initialize_uses_current_client_job_config(
     assert worker.production_initialization[1] is job_config
 
 
-def test_dss_driver_optimizer_capture_initialize_accepts_path_objects(
-    _dss_driver_optimizer_capture_initializer, tmp_path
+def test_ap_driver_optimizer_capture_initialize_accepts_path_objects(
+    _ap_driver_optimizer_capture_initializer, tmp_path
 ):
-    worker = _dss_driver_optimizer_capture_initializer
+    worker = _ap_driver_optimizer_capture_initializer
     job_config = {
         "training_config": {
             "debug": {
@@ -15561,10 +15718,10 @@ def test_dss_driver_optimizer_capture_initialize_accepts_path_objects(
     assert worker._model_state_output_dir == str(tmp_path / "model")
 
 
-def test_dss_driver_optimizer_capture_initialize_worker_settings_can_disable_training_capture(
-    _dss_driver_optimizer_capture_initializer,
+def test_ap_driver_optimizer_capture_initialize_worker_settings_can_disable_training_capture(
+    _ap_driver_optimizer_capture_initializer,
 ):
-    worker = _dss_driver_optimizer_capture_initializer
+    worker = _ap_driver_optimizer_capture_initializer
     job_config = {
         "training_config": {"debug": {"optimizer_state_output_dir": "/training", "model_state_output_dir": "/model"}},
         "ds_worker_config": {"debug": {"optimizer_state_output_dir": None, "model_state_output_dir": None}},
@@ -15576,26 +15733,26 @@ def test_dss_driver_optimizer_capture_initialize_worker_settings_can_disable_tra
 
 @pytest.mark.parametrize("field", ["optimizer_state_output_dir", "model_state_output_dir"])
 @pytest.mark.parametrize("value", ["", "relative/path"])
-def test_dss_driver_optimizer_capture_initialize_rejects_relative_paths(
-    _dss_driver_optimizer_capture_initializer, field, value
+def test_ap_driver_optimizer_capture_initialize_rejects_relative_paths(
+    _ap_driver_optimizer_capture_initializer, field, value
 ):
-    worker = _dss_driver_optimizer_capture_initializer
+    worker = _ap_driver_optimizer_capture_initializer
     with pytest.raises(ValueError, match=f"debug.{field} must be an absolute path"):
         worker.initialize("master", {"ds_worker_config": {"debug": {field: value}}})
     assert not hasattr(worker, "production_initialization")
 
 
 @pytest.mark.parametrize("field", ["optimizer_state_output_dir", "model_state_output_dir"])
-def test_dss_driver_optimizer_capture_initialize_rejects_non_path_values(
-    _dss_driver_optimizer_capture_initializer, field
+def test_ap_driver_optimizer_capture_initialize_rejects_non_path_values(
+    _ap_driver_optimizer_capture_initializer, field
 ):
-    worker = _dss_driver_optimizer_capture_initializer
+    worker = _ap_driver_optimizer_capture_initializer
     with pytest.raises(TypeError):
         worker.initialize("master", {"ds_worker_config": {"debug": {field: 123}}})
     assert not hasattr(worker, "production_initialization")
 
 
-def test_dss_driver_optimizer_capture_worker_context_restores_production_worker() -> None:
+def test_ap_driver_optimizer_capture_worker_context_restores_production_worker() -> None:
     pytest.importorskip("ray")
     from arctic_platform.common import deepspeed_worker as deepspeed_worker_module
     from arctic_platform.correctness.harness.optimizer import _optimizer_capture_worker_class
@@ -15608,12 +15765,12 @@ def test_dss_driver_optimizer_capture_worker_context_restores_production_worker(
     assert deepspeed_worker_module.DeepSpeedWorker is original
 
 
-def test_dss_driver_payload_can_skip_unused_gradient_norm_collection() -> None:
+def test_ap_driver_payload_can_skip_unused_gradient_norm_collection() -> None:
     payload = build_payload({}, "model", 42, gradient_norms_per_param=False)
     assert payload["training_config"]["debug"]["gradient_norms_per_param"] is False
 
 
-def test_dss_driver_payload_preserves_configured_deepspeed_accumulation() -> None:
+def test_ap_driver_payload_preserves_configured_deepspeed_accumulation() -> None:
     payload = build_payload(
         {
             "n_gpus": 4,
@@ -15631,29 +15788,29 @@ def test_dss_driver_payload_preserves_configured_deepspeed_accumulation() -> Non
     assert ds_config["train_batch_size"] == 4
 
 
-def test_dss_driver_payload_caps_large_microbatch_budget_at_64k() -> None:
+def test_ap_driver_payload_caps_large_microbatch_budget_at_64k() -> None:
     payload = build_payload({"mb_spec": {"max_tokens_per_mb": 262144}}, "model", 42)
     assert payload["training_config"]["mb_spec"]["max_tokens_per_mb"] == 65536
 
 
-def test_dss_driver_payload_applies_spec_lm_head_chunk_without_overriding_config() -> None:
+def test_ap_driver_payload_applies_spec_lm_head_chunk_without_overriding_config() -> None:
     injected = build_payload({}, "model", 42, lm_head_token_chunk_size=2048)
     configured = build_payload({"fused_lm_head_token_chunk_size": 4096}, "model", 42, lm_head_token_chunk_size=2048)
     assert injected["training_config"]["fused_lm_head_token_chunk_size"] == 2048
     assert configured["training_config"]["fused_lm_head_token_chunk_size"] == 4096
 
 
-def test_dss_driver_payload_preserves_smaller_microbatch_budget() -> None:
+def test_ap_driver_payload_preserves_smaller_microbatch_budget() -> None:
     payload = build_payload({"mb_spec": {"max_tokens_per_mb": 10240}}, "model", 42)
     assert payload["training_config"]["mb_spec"]["max_tokens_per_mb"] == 10240
 
 
-def test_dss_driver_payload_does_not_choose_deepep_chunks() -> None:
+def test_ap_driver_payload_does_not_choose_deepep_chunks() -> None:
     payload = build_payload({"ep_size": 4, "mb_spec": {"max_tokens_per_mb": 10240}}, "model", 42)
     assert "deepep_token_chunk_size" not in payload["training_config"]
 
 
-def test_dss_driver_pool_is_the_local_devices_when_the_harness_owns_the_gateway(monkeypatch) -> None:
+def test_ap_driver_pool_is_the_local_devices_when_the_harness_owns_the_gateway(monkeypatch) -> None:
     """With no external gateway the harness starts one on this node, so its devices are the whole pool."""
     monkeypatch.delenv("DSS_GATEWAY_URL", raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -15661,7 +15818,7 @@ def test_dss_driver_pool_is_the_local_devices_when_the_harness_owns_the_gateway(
     assert available_gpus() == 8
 
 
-def test_dss_driver_pool_is_the_hostfile_slots_when_an_external_gateway_owns_placement(monkeypatch, tmp_path) -> None:
+def test_ap_driver_pool_is_the_hostfile_slots_when_an_external_gateway_owns_placement(monkeypatch, tmp_path) -> None:
     """A gateway the harness did not start places jobs across its hostfile, which this node cannot see."""
     hostfile = tmp_path / "hostfile"
     hostfile.write_text("10.0.0.1 slots=8\n10.0.0.2 slots=8\n")
@@ -15672,7 +15829,7 @@ def test_dss_driver_pool_is_the_hostfile_slots_when_an_external_gateway_owns_pla
     assert available_gpus() == 16
 
 
-def test_dss_driver_pool_falls_back_to_local_devices_when_the_named_hostfile_is_absent(monkeypatch, tmp_path) -> None:
+def test_ap_driver_pool_falls_back_to_local_devices_when_the_named_hostfile_is_absent(monkeypatch, tmp_path) -> None:
     """An unreadable hostfile leaves the pool unknown, so the guard keeps the number it can verify."""
     monkeypatch.setenv("DSS_GATEWAY_URL", "http://gateway:8000")
     monkeypatch.setenv("DSS_GATEWAY_HOSTFILE", str(tmp_path / "missing"))
@@ -15681,7 +15838,7 @@ def test_dss_driver_pool_falls_back_to_local_devices_when_the_named_hostfile_is_
     assert available_gpus() == 8
 
 
-def test_dss_driver_payload_pins_determinism_over_a_config_that_asks_otherwise() -> None:
+def test_ap_driver_payload_pins_determinism_over_a_config_that_asks_otherwise() -> None:
     payload = build_payload(
         {
             "debug": {"full_determinism": False, "full_determinism_must_comply": True},
@@ -15695,7 +15852,7 @@ def test_dss_driver_payload_pins_determinism_over_a_config_that_asks_otherwise()
     assert debug["full_determinism_must_comply"] is False
 
 
-def test_dss_driver_payload_determinism_off_clears_a_config_that_asks_for_the_pin() -> None:
+def test_ap_driver_payload_determinism_off_clears_a_config_that_asks_for_the_pin() -> None:
     payload = build_payload(
         {
             "debug": {"full_determinism": True, "full_determinism_must_comply": True},
@@ -15712,10 +15869,10 @@ def test_dss_driver_payload_determinism_off_clears_a_config_that_asks_for_the_pi
 
 @pytest.mark.parametrize("auth_mode", [None, "disabled", "token", "legacy-mode"])
 @pytest.mark.parametrize("slots", [8, 16])
-def test_dss_driver_gateway_runtime_verifies_before_and_after_owned_shutdown(monkeypatch, auth_mode, slots) -> None:
+def test_ap_driver_gateway_runtime_verifies_before_and_after_owned_shutdown(monkeypatch, auth_mode, slots) -> None:
     import torch
 
-    from arctic_platform.correctness.harness import gateway as dss_driver
+    from arctic_platform.correctness.harness import gateway as ap_driver
 
     events = []
     monkeypatch.setenv("MASTER_PORT", "12345")
@@ -15723,7 +15880,7 @@ def test_dss_driver_gateway_runtime_verifies_before_and_after_owned_shutdown(mon
         monkeypatch.delenv("RAY_AUTH_MODE", raising=False)
     else:
         monkeypatch.setenv("RAY_AUTH_MODE", auth_mode)
-    monkeypatch.setattr(dss_driver, "_verify_gateway_runtime_idle", lambda: events.append("verify"))
+    monkeypatch.setattr(ap_driver, "_verify_gateway_runtime_idle", lambda: events.append("verify"))
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
 
     class RayCluster:
@@ -15749,7 +15906,7 @@ def test_dss_driver_gateway_runtime_verifies_before_and_after_owned_shutdown(mon
         events.append(("load", os.environ["MASTER_PORT"], os.environ.get("RAY_AUTH_MODE")))
         return RayCluster
 
-    monkeypatch.setattr(dss_driver, "_load_gateway_ray_cluster", load_ray_cluster)
+    monkeypatch.setattr(ap_driver, "_load_gateway_ray_cluster", load_ray_cluster)
     selected_hostfile = os.devnull if slots == 8 else "/job/hostfile"
     with _gateway_runtime(slots):
         assert RayCluster._HOSTFILE == selected_hostfile
@@ -15768,10 +15925,10 @@ def test_dss_driver_gateway_runtime_verifies_before_and_after_owned_shutdown(mon
 
 
 @pytest.mark.parametrize("stage", ["start", "body"])
-def test_dss_driver_gateway_runtime_restores_hostfile_after_failure(monkeypatch, stage) -> None:
+def test_ap_driver_gateway_runtime_restores_hostfile_after_failure(monkeypatch, stage) -> None:
     import torch
 
-    from arctic_platform.correctness.harness import gateway as dss_driver
+    from arctic_platform.correctness.harness import gateway as ap_driver
 
     failure = RuntimeError("runtime failed")
     shutdown_hostfiles = []
@@ -15786,8 +15943,8 @@ def test_dss_driver_gateway_runtime_restores_hostfile_after_failure(monkeypatch,
     ray.init_ray_cluster = start
     ray._shutdown = lambda: shutdown_hostfiles.append(ray._HOSTFILE)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
-    monkeypatch.setattr(dss_driver, "_load_gateway_ray_cluster", lambda: ray)
-    monkeypatch.setattr(dss_driver, "_verify_gateway_runtime_idle", lambda: None)
+    monkeypatch.setattr(ap_driver, "_load_gateway_ray_cluster", lambda: ray)
+    monkeypatch.setattr(ap_driver, "_verify_gateway_runtime_idle", lambda: None)
     monkeypatch.delenv("MASTER_PORT", raising=False)
     with pytest.raises(RuntimeError) as caught:
         with _gateway_runtime(8):
@@ -15818,17 +15975,17 @@ def test_dss_driver_gateway_runtime_restores_hostfile_after_failure(monkeypatch,
     ],
     ids=["dss-precedence", "arctic", "fast-precedence", "job-fallback", "local-only", "missing-env"],
 )
-def test_dss_driver_selected_hostfile_is_shared_by_gateway_and_allocation(
+def test_ap_driver_selected_hostfile_is_shared_by_gateway_and_allocation(
     monkeypatch, environment, existing, expected
 ) -> None:
-    from arctic_platform.correctness.harness import gateway as dss_driver
+    from arctic_platform.correctness.harness import gateway as ap_driver
 
     monkeypatch.delenv("DSS_GATEWAY_HOSTFILE", raising=False)
     monkeypatch.delenv("ARCTIC_HOSTFILE", raising=False)
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setattr(Path, "is_file", lambda path: str(path) in existing)
-    selected = dss_driver._allocation_hostfile()
+    selected = ap_driver._allocation_hostfile()
     assert selected == (Path(expected) if expected else None)
     commands = []
 
@@ -15836,14 +15993,14 @@ def test_dss_driver_selected_hostfile_is_shared_by_gateway_and_allocation(
         commands.append(arguments)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(dss_driver.subprocess, "run", command)
-    dss_driver._run_on_allocation("readonly-selection-check")
+    monkeypatch.setattr(ap_driver.subprocess, "run", command)
+    ap_driver._run_on_allocation("readonly-selection-check")
     arguments = commands[0]
     assert arguments[1:3] == (["-f", expected] if expected else ["-lc", "readonly-selection-check"])
 
 
-def test_dss_driver_allocation_runtime_command_uses_hostfile_ds_ssh(monkeypatch, tmp_path) -> None:
-    from arctic_platform.correctness.harness import gateway as dss_driver
+def test_ap_driver_allocation_runtime_command_uses_hostfile_ds_ssh(monkeypatch, tmp_path) -> None:
+    from arctic_platform.correctness.harness import gateway as ap_driver
 
     hostfile = tmp_path / "hostfile"
     hostfile.write_text("10.0.0.1 slots=8\n10.0.0.2 slots=8\n")
@@ -15855,30 +16012,30 @@ def test_dss_driver_allocation_runtime_command_uses_hostfile_ds_ssh(monkeypatch,
         return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     monkeypatch.setenv("DSS_GATEWAY_HOSTFILE", str(hostfile))
-    monkeypatch.setattr(dss_driver.subprocess, "run", run)
-    dss_driver._run_on_allocation("readonly-check")
+    monkeypatch.setattr(ap_driver.subprocess, "run", run)
+    ap_driver._run_on_allocation("readonly-check")
     assert captured["command"][1:3] == ["-f", str(hostfile)]
     assert captured["command"][0].endswith("/ds_ssh")
     assert captured["command"][3] == "readonly-check"
     assert captured["kwargs"] == {"capture_output": True, "text": True, "timeout": 180}
 
 
-def test_dss_driver_runtime_idle_check_only_checks_processes_and_port(monkeypatch) -> None:
-    from arctic_platform.correctness.harness import gateway as dss_driver
+def test_ap_driver_runtime_idle_check_only_checks_processes_and_port(monkeypatch) -> None:
+    from arctic_platform.correctness.harness import gateway as ap_driver
 
     scripts = []
-    monkeypatch.setattr(dss_driver, "_run_on_allocation", lambda script: scripts.append(script))
-    dss_driver._verify_gateway_runtime_idle()
+    monkeypatch.setattr(ap_driver, "_run_on_allocation", lambda script: scripts.append(script))
+    ap_driver._verify_gateway_runtime_idle()
     assert len(scripts) == 1
     assert "pgrep -af" in scripts[0]
     assert "29500" in scripts[0]
     assert all(command not in scripts[0] for command in ("stop", "kill", "pkill"))
-    assert "ray::" not in dss_driver._RAY_PROCESS_PATTERN
+    assert "ray::" not in ap_driver._RAY_PROCESS_PATTERN
 
 
 @pytest.mark.parametrize("failure", [RuntimeError("port is still bound"), KeyboardInterrupt("preflight interrupted")])
-def test_dss_driver_gateway_runtime_refuses_preflight_without_foreign_teardown(monkeypatch, failure) -> None:
-    from arctic_platform.correctness.harness import gateway as dss_driver
+def test_ap_driver_gateway_runtime_refuses_preflight_without_foreign_teardown(monkeypatch, failure) -> None:
+    from arctic_platform.correctness.harness import gateway as ap_driver
 
     calls = []
 
@@ -15898,11 +16055,11 @@ def test_dss_driver_gateway_runtime_refuses_preflight_without_foreign_teardown(m
         return ray
 
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "_load_gateway_ray_cluster",
         load,
     )
-    monkeypatch.setattr(dss_driver, "_verify_gateway_runtime_idle", verify)
+    monkeypatch.setattr(ap_driver, "_verify_gateway_runtime_idle", verify)
     with pytest.raises(type(failure)) as caught:
         with _gateway_runtime(1):
             pytest.fail("preflight must fail before launch")
@@ -15913,18 +16070,18 @@ def test_dss_driver_gateway_runtime_refuses_preflight_without_foreign_teardown(m
 
 
 @pytest.mark.parametrize("probe_status", [0, 1, 2], ids=["occupied", "idle", "probe-error"])
-def test_dss_driver_runtime_idle_check_requires_successful_process_inventory(monkeypatch, tmp_path, probe_status):
+def test_ap_driver_runtime_idle_check_requires_successful_process_inventory(monkeypatch, tmp_path, probe_status):
     import subprocess
 
-    from arctic_platform.correctness.harness import gateway as dss_driver
+    from arctic_platform.correctness.harness import gateway as ap_driver
 
     interpreter = tmp_path / "port-probe"
     interpreter.write_text("#!/bin/sh\nprintf 'PORT_CHECK\\n'\n")
     interpreter.chmod(0o700)
-    monkeypatch.setattr(dss_driver, "sys", SimpleNamespace(executable=str(interpreter)))
+    monkeypatch.setattr(ap_driver, "sys", SimpleNamespace(executable=str(interpreter)))
     scripts = []
-    monkeypatch.setattr(dss_driver, "_run_on_allocation", lambda script: scripts.append(script))
-    dss_driver._verify_gateway_runtime_idle()
+    monkeypatch.setattr(ap_driver, "_run_on_allocation", lambda script: scripts.append(script))
+    ap_driver._verify_gateway_runtime_idle()
     result = subprocess.run(
         ["bash", "-c", f"pgrep() {{ return {probe_status}; }}\n" + scripts[0]],
         capture_output=True,
@@ -15935,8 +16092,8 @@ def test_dss_driver_runtime_idle_check_requires_successful_process_inventory(mon
     assert ("PORT_CHECK" in result.stdout) is (probe_status == 1)
 
 
-def test_dss_driver_gateway_runtime_load_failure_does_not_shutdown_or_recheck(monkeypatch):
-    from arctic_platform.correctness.harness import gateway as dss_driver
+def test_ap_driver_gateway_runtime_load_failure_does_not_shutdown_or_recheck(monkeypatch):
+    from arctic_platform.correctness.harness import gateway as ap_driver
 
     calls = []
     failure = RuntimeError("cluster import failed")
@@ -15945,8 +16102,8 @@ def test_dss_driver_gateway_runtime_load_failure_does_not_shutdown_or_recheck(mo
         calls.append("load")
         raise failure
 
-    monkeypatch.setattr(dss_driver, "_verify_gateway_runtime_idle", lambda: calls.append("verify"))
-    monkeypatch.setattr(dss_driver, "_load_gateway_ray_cluster", load)
+    monkeypatch.setattr(ap_driver, "_verify_gateway_runtime_idle", lambda: calls.append("verify"))
+    monkeypatch.setattr(ap_driver, "_load_gateway_ray_cluster", load)
     monkeypatch.delenv("MASTER_PORT", raising=False)
     with pytest.raises(RuntimeError) as caught:
         with _gateway_runtime(1):
@@ -15956,8 +16113,8 @@ def test_dss_driver_gateway_runtime_load_failure_does_not_shutdown_or_recheck(mo
     assert "MASTER_PORT" not in os.environ
 
 
-def test_dss_driver_running_job_keeps_cleanup_outside_client_shutdown(monkeypatch, tmp_path) -> None:
-    from arctic_platform.correctness.harness import gateway as dss_driver
+def test_ap_driver_running_job_keeps_cleanup_outside_client_shutdown(monkeypatch, tmp_path) -> None:
+    from arctic_platform.correctness.harness import gateway as ap_driver
 
     events = []
 
@@ -15978,22 +16135,22 @@ def test_dss_driver_running_job_keeps_cleanup_outside_client_shutdown(monkeypatc
         def shutdown(self):
             events.append("client-shutdown")
 
-    monkeypatch.setattr(dss_driver, "_gateway_runtime", runtime)
-    monkeypatch.setattr(dss_driver, "ArcticClient", Client)
+    monkeypatch.setattr(ap_driver, "_gateway_runtime", runtime)
+    monkeypatch.setattr(ap_driver, "ArcticClient", Client)
     payload = {
         "model_name": "model",
         "job_type": "training",
         "training_config": {"n_gpus": 1, "mb_spec": {"max_tokens_per_mb": 1}},
     }
-    with dss_driver.running_job(dss_driver.GatewaySession(tmp_path, 1), payload) as job:
+    with ap_driver.running_job(ap_driver.GatewaySession(tmp_path, 1), payload) as job:
         events.append(("job", job.job_id))
     assert events == [("runtime-enter", 1), "client-start", ("job", 7), "client-shutdown", "runtime-exit"]
 
 
 @pytest.mark.parametrize("stage", ["shutdown", "verify"])
 @pytest.mark.parametrize("primary", [None, RuntimeError("target failed")], ids=["success", "target-error"])
-def test_dss_driver_gateway_runtime_cleanup_failure_is_unsafe_and_restores_port(monkeypatch, stage, primary):
-    from arctic_platform.correctness.harness import gateway as dss_driver
+def test_ap_driver_gateway_runtime_cleanup_failure_is_unsafe_and_restores_port(monkeypatch, stage, primary):
+    from arctic_platform.correctness.harness import gateway as ap_driver
 
     failure = RuntimeError("owned runtime not clean")
     calls = []
@@ -16008,11 +16165,11 @@ def test_dss_driver_gateway_runtime_cleanup_failure_is_unsafe_and_restores_port(
             raise failure
 
     ray = SimpleNamespace(_HOSTFILE="/job/hostfile", init_ray_cluster=lambda **kwargs: None, _shutdown=shutdown)
-    monkeypatch.setattr(dss_driver, "_load_gateway_ray_cluster", lambda: ray)
-    monkeypatch.setattr(dss_driver, "_verify_gateway_runtime_idle", cleanup)
+    monkeypatch.setattr(ap_driver, "_load_gateway_ray_cluster", lambda: ray)
+    monkeypatch.setattr(ap_driver, "_verify_gateway_runtime_idle", cleanup)
     monkeypatch.setenv("MASTER_PORT", "12345")
-    with pytest.raises(dss_driver.UnsafeCleanupError) as caught:
-        with dss_driver._gateway_runtime(1):
+    with pytest.raises(ap_driver.UnsafeCleanupError) as caught:
+        with ap_driver._gateway_runtime(1):
             if primary is not None:
                 raise primary
     assert caught.value.__cause__ is failure
@@ -16023,8 +16180,8 @@ def test_dss_driver_gateway_runtime_cleanup_failure_is_unsafe_and_restores_port(
     assert ray._HOSTFILE == "/job/hostfile"
 
 
-def test_dss_driver_running_job_shutdown_failure_is_unsafe(monkeypatch, tmp_path):
-    from arctic_platform.correctness.harness import gateway as dss_driver
+def test_ap_driver_running_job_shutdown_failure_is_unsafe(monkeypatch, tmp_path):
+    from arctic_platform.correctness.harness import gateway as ap_driver
 
     failure = RuntimeError("cancel failed")
 
@@ -16036,15 +16193,15 @@ def test_dss_driver_running_job_shutdown_failure_is_unsafe(monkeypatch, tmp_path
         def shutdown(self):
             raise failure
 
-    monkeypatch.setattr(dss_driver, "_gateway_runtime", lambda *a: contextlib.nullcontext())
-    monkeypatch.setattr(dss_driver, "ArcticClient", Client)
+    monkeypatch.setattr(ap_driver, "_gateway_runtime", lambda *a: contextlib.nullcontext())
+    monkeypatch.setattr(ap_driver, "ArcticClient", Client)
     payload = {
         "model_name": "model",
         "job_type": "training",
         "training_config": {"n_gpus": 1, "mb_spec": {"max_tokens_per_mb": 1}},
     }
-    with pytest.raises(dss_driver.UnsafeCleanupError) as caught:
-        with dss_driver.running_job(dss_driver.GatewaySession(tmp_path, 1), payload):
+    with pytest.raises(ap_driver.UnsafeCleanupError) as caught:
+        with ap_driver.running_job(ap_driver.GatewaySession(tmp_path, 1), payload):
             pass
     assert caught.value.__cause__ is failure
 
@@ -27247,7 +27404,7 @@ def test_shared_adapter_running_job_ray_handoff_precedes_client_and_restores_ove
 ):
     from arctic_platform import common
     from arctic_platform import rl
-    from arctic_platform.correctness.harness import gateway as dss_driver
+    from arctic_platform.correctness.harness import gateway as ap_driver
     from arctic_platform.correctness.harness import optimizer as optimizer_capture
 
     source = generated_adapter_config
@@ -27335,9 +27492,9 @@ def test_shared_adapter_running_job_ray_handoff_precedes_client_and_restores_ove
             if failure == "shutdown":
                 raise raised
 
-    monkeypatch.setattr(dss_driver, "_gateway_runtime", runtime)
-    monkeypatch.setattr(dss_driver, "ArcticClient", Client)
-    payload = dss_driver.build_payload({"n_gpus": 1, "peft_config": source.config}, str(source.path), 42)
+    monkeypatch.setattr(ap_driver, "_gateway_runtime", runtime)
+    monkeypatch.setattr(ap_driver, "ArcticClient", Client)
+    payload = ap_driver.build_payload({"n_gpus": 1, "peft_config": source.config}, str(source.path), 42)
     payload["training_config"]["debug"]["shared_peft_adapter"] = {
         "path": str(pack),
         "identity": identity,
@@ -27348,7 +27505,7 @@ def test_shared_adapter_running_job_ray_handoff_precedes_client_and_restores_ove
         config_path.write_bytes(config_path.read_bytes() + b"\n")
 
     def execute():
-        with dss_driver.running_job(dss_driver.GatewaySession(tmp_path / "run", 1), payload) as job:
+        with ap_driver.running_job(ap_driver.GatewaySession(tmp_path / "run", 1), payload) as job:
             require_overlay()
             events.append("body")
             assert job.job_id == "owned-training-child"
@@ -27359,7 +27516,7 @@ def test_shared_adapter_running_job_ray_handoff_precedes_client_and_restores_ove
         with pytest.raises(ValueError, match="changed before transfer"):
             execute()
     elif failure:
-        error_type = dss_driver.UnsafeCleanupError if failure == "shutdown" else RuntimeError
+        error_type = ap_driver.UnsafeCleanupError if failure == "shutdown" else RuntimeError
         with pytest.raises(error_type) as caught:
             execute()
         if failure == "shutdown":
@@ -27390,7 +27547,7 @@ def test_shared_adapter_running_job_ray_handoff_precedes_client_and_restores_ove
 def test_shared_adapter_capture_initializer_enters_worker_scope_before_base_and_restores(
     worker_adapter_transfer, tmp_path, monkeypatch, failure
 ):
-    from arctic_platform.correctness.harness import gateway as dss_driver
+    from arctic_platform.correctness.harness import gateway as ap_driver
     from arctic_platform.correctness.harness import optimizer as optimizer_capture
 
     control = worker_adapter_transfer
@@ -27398,8 +27555,8 @@ def test_shared_adapter_capture_initializer_enters_worker_scope_before_base_and_
     raised = RuntimeError("base initializer failed")
     if failure == "load":
         control.loaded.model = _model(dtype=torch.bfloat16)
-    payload = dss_driver.build_payload({"n_gpus": 1}, "config-only-base", 42)
-    job_config = dss_driver._training_client_config(dss_driver.GatewaySession(tmp_path / "run", 1), payload).to_onprem(
+    payload = ap_driver.build_payload({"n_gpus": 1}, "config-only-base", 42)
+    job_config = ap_driver._training_client_config(ap_driver.GatewaySession(tmp_path / "run", 1), payload).to_onprem(
         "training"
     )
     job_config["ds_worker_config"]["debug"]["shared_peft_adapter"] = {
@@ -30046,7 +30203,7 @@ def test_native_reserved_listener_zone_head_handoff_and_worker_isolation(
                 raise failure
         else:
             assert argv[:4] == ["exec", "setsid", "--wait", "env"]
-            owner = argv[4].removeprefix("DSS_CORRECTNESS_GATEWAY_OWNER=")
+            owner = argv[4].removeprefix("AP_CORRECTNESS_GATEWAY_OWNER=")
             assert len(owner) == 32 and all(character in "0123456789abcdef" for character in owner)
             assert argv[5:] == ["SPT_NOENV=1", sys.executable, "-m", control.native._MODULE, "worker"]
             assert listener.closed and kwargs == {"stdout": "worker-log", "stdin": subprocess.PIPE}
@@ -34828,7 +34985,7 @@ def test_owned_worker_lease_new_zone_launch_and_primary_failure(owned_worker_lea
             assert kwargs == {"pass_fds": (43,)}
             return head_process
         assert argv[:4] == ["exec", "setsid", "--wait", "env"]
-        assert argv[4].startswith("DSS_CORRECTNESS_GATEWAY_OWNER=") and len(argv[4].split("=", 1)[1]) == 32
+        assert argv[4].startswith("AP_CORRECTNESS_GATEWAY_OWNER=") and len(argv[4].split("=", 1)[1]) == 32
         assert argv[5:10] == ["SPT_NOENV=1", sys.executable, "-m", case.native._MODULE, "worker"]
         assert argv[10:] == ["--zone-id", "owned-zone", "--server-url", "owned-head:1234"]
         assert kwargs == {"stdin": subprocess.PIPE, "stdout": "retained-log"}
@@ -35014,7 +35171,7 @@ def test_owned_worker_lease_new_worker_role_dispatches_without_changing_args(mon
 
 @pytest.mark.parametrize("primary_failure", [False, True])
 def test_owned_worker_session_cleanup_new_waits_for_descendants(monkeypatch, primary_failure):
-    from arctic_platform.correctness.harness import gateway as dss_driver
+    from arctic_platform.correctness.harness import gateway as ap_driver
     from arctic_platform.correctness.harness import lora as native_lora
 
     token = "a" * 32
@@ -35022,10 +35179,10 @@ def test_owned_worker_session_cleanup_new_waits_for_descendants(monkeypatch, pri
     events = []
     worker = object()
     primary = RuntimeError("worker primary")
-    monkeypatch.setenv("DSS_CORRECTNESS_GATEWAY_OWNER", token)
+    monkeypatch.setenv("AP_CORRECTNESS_GATEWAY_OWNER", token)
     monkeypatch.setenv("SPT_NOENV", "1")
     monkeypatch.setattr(native_lora.os, "getsid", lambda pid: os.getpid())
-    monkeypatch.setattr(dss_driver, "_gateway_process_identity", lambda pid: identity)
+    monkeypatch.setattr(ap_driver, "_gateway_process_identity", lambda pid: identity)
 
     def main(actual):
         assert actual is worker
@@ -35035,7 +35192,7 @@ def test_owned_worker_session_cleanup_new_waits_for_descendants(monkeypatch, pri
 
     monkeypatch.setattr(native_lora, "_owned_worker_main", main)
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "_reap_owned_gateway_descendants",
         lambda actual, marker: events.append(("descendants-exit", actual, marker)),
     )
@@ -35050,19 +35207,19 @@ def test_owned_worker_session_cleanup_new_waits_for_descendants(monkeypatch, pri
 
 @pytest.mark.parametrize("primary_failure", [False, True])
 def test_owned_worker_session_cleanup_new_retains_cleanup_failure(monkeypatch, primary_failure):
-    from arctic_platform.correctness.harness import gateway as dss_driver
+    from arctic_platform.correctness.harness import gateway as ap_driver
     from arctic_platform.correctness.harness import lora as native_lora
 
-    monkeypatch.setenv("DSS_CORRECTNESS_GATEWAY_OWNER", "a" * 32)
+    monkeypatch.setenv("AP_CORRECTNESS_GATEWAY_OWNER", "a" * 32)
     monkeypatch.setenv("SPT_NOENV", "1")
     monkeypatch.setattr(native_lora.os, "getsid", lambda pid: os.getpid())
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "_gateway_process_identity",
         lambda pid: {"pid": pid, "uid": os.getuid(), "start_time": "123"},
     )
     primary = RuntimeError("worker primary")
-    cleanup = dss_driver.UnsafeCleanupError("unverified descendant")
+    cleanup = ap_driver.UnsafeCleanupError("unverified descendant")
 
     def main(worker):
         if primary_failure:
@@ -35072,7 +35229,7 @@ def test_owned_worker_session_cleanup_new_retains_cleanup_failure(monkeypatch, p
         raise cleanup
 
     monkeypatch.setattr(native_lora, "_owned_worker_main", main)
-    monkeypatch.setattr(dss_driver, "_reap_owned_gateway_descendants", reap)
+    monkeypatch.setattr(ap_driver, "_reap_owned_gateway_descendants", reap)
     with pytest.raises(RuntimeError) as caught:
         native_lora._owned_worker_session(object())
     if primary_failure:
@@ -35084,20 +35241,20 @@ def test_owned_worker_session_cleanup_new_retains_cleanup_failure(monkeypatch, p
 
 @pytest.mark.parametrize("invalid", ["token", "retitle", "session", "identity"])
 def test_owned_worker_session_cleanup_new_rejects_unowned_launch(monkeypatch, invalid):
-    from arctic_platform.correctness.harness import gateway as dss_driver
+    from arctic_platform.correctness.harness import gateway as ap_driver
     from arctic_platform.correctness.harness import lora as native_lora
 
-    monkeypatch.setenv("DSS_CORRECTNESS_GATEWAY_OWNER", "a" * 32 if invalid != "token" else "")
+    monkeypatch.setenv("AP_CORRECTNESS_GATEWAY_OWNER", "a" * 32 if invalid != "token" else "")
     monkeypatch.setenv("SPT_NOENV", "1" if invalid != "retitle" else "0")
     monkeypatch.setattr(native_lora.os, "getsid", lambda pid: os.getpid() + (invalid == "session"))
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "_gateway_process_identity",
         lambda pid: None if invalid == "identity" else {"pid": pid, "uid": os.getuid(), "start_time": "123"},
     )
     monkeypatch.setattr(native_lora, "_owned_worker_main", lambda worker: pytest.fail("unowned worker executed"))
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "_reap_owned_gateway_descendants",
         lambda *args: pytest.fail("unowned process signalled"),
     )
@@ -35132,7 +35289,7 @@ def test_owned_worker_session_cleanup_new_real_retitled_child_exits_before_worke
             "setsid",
             "--wait",
             "env",
-            "DSS_CORRECTNESS_GATEWAY_OWNER=" + "b" * 32,
+            "AP_CORRECTNESS_GATEWAY_OWNER=" + "b" * 32,
             "SPT_NOENV=1",
             sys.executable,
             "-c",
@@ -37580,7 +37737,7 @@ def test_reference_free_metadata_generated_arms_checksum_and_only_selected_rl_ch
             "max_seq_len": definition.max_seq_len,
             "total_tokens": batch.total_tokens,
             "active_tokens": batch.active_tokens,
-            "dss_microbatches": definition.microbatches(
+            "ap_microbatches": definition.microbatches(
                 correctness_microbatch_tokens(cfg.max_tokens_per_mb), cfg.dp_size
             ),
             "pad_fraction": batch.pad_fraction,
@@ -38498,7 +38655,7 @@ def test_optimizer_norms_unexplained_update_is_not_removed_by_norm_reduction(_op
 def test_optimizer_norms_moe_tensors_are_concatenated_before_residual_and_norm(_optimizer_norms_artifact_root):
     w1 = _optimizer_norms_adam_states(torch.tensor([[[0.2, 0.4]]]), "ap")
     w3 = _optimizer_norms_adam_states(torch.tensor([[[0.6, 0.8]]]), "ap")
-    dss = _optimizer_norms_manifest(
+    ap = _optimizer_norms_manifest(
         _optimizer_norms_artifact_root / "moe",
         {"module.layers.0.mlp.experts.w1": w1, "module.layers.0.mlp.experts.w3": w3},
     )
@@ -38506,7 +38663,7 @@ def test_optimizer_norms_moe_tensors_are_concatenated_before_residual_and_norm(_
     canonical = _optimizer_norms_manifest(
         _optimizer_norms_artifact_root / "canonical", {"layers.0.mlp.experts.gate_up_proj": joined}
     )
-    actual = summarize_optimizer_artifacts(dss, backend="ap", **_optimizer_norms_KWARGS)
+    actual = summarize_optimizer_artifacts(ap, backend="ap", **_optimizer_norms_KWARGS)
     expected = summarize_optimizer_artifacts(canonical, backend="ap", **_optimizer_norms_KWARGS)
     assert actual == expected
     entry = actual["parameters"]["layers.0.mlp.experts.gate_up_proj"]
@@ -38613,11 +38770,11 @@ def test_optimizer_norms_compare_uses_scalar_norm_difference_not_tensor_differen
     ref = _optimizer_norms_manifest(
         _optimizer_norms_artifact_root / "ref", {"layer.weight": _optimizer_norms_states(torch.tensor([1.0, 2.0]))}
     )
-    dss = _optimizer_norms_manifest(
+    ap = _optimizer_norms_manifest(
         _optimizer_norms_artifact_root / "ap", {"layer.weight": _optimizer_norms_states(torch.tensor([4.0, 6.0]))}
     )
     comparison = compare_optimizer_norms(
-        summarize_optimizer_artifacts(dss, backend="ap", **_optimizer_norms_KWARGS),
+        summarize_optimizer_artifacts(ap, backend="ap", **_optimizer_norms_KWARGS),
         summarize_optimizer_artifacts(ref, **_optimizer_norms_KWARGS),
     )
     assert comparison.worst_delta == pytest.approx(math.sqrt(52) - math.sqrt(5))
@@ -38628,11 +38785,11 @@ def test_optimizer_norms_equal_norm_different_direction_is_intentionally_undetec
     ref = _optimizer_norms_manifest(
         _optimizer_norms_artifact_root / "ref", {"layer.weight": _optimizer_norms_states(torch.tensor([3.0, 4.0]))}
     )
-    dss = _optimizer_norms_manifest(
+    ap = _optimizer_norms_manifest(
         _optimizer_norms_artifact_root / "ap", {"layer.weight": _optimizer_norms_states(torch.tensor([-3.0, -4.0]))}
     )
     comparison = compare_optimizer_norms(
-        summarize_optimizer_artifacts(dss, backend="ap", **_optimizer_norms_KWARGS),
+        summarize_optimizer_artifacts(ap, backend="ap", **_optimizer_norms_KWARGS),
         summarize_optimizer_artifacts(ref, **_optimizer_norms_KWARGS),
     )
     assert comparison.worst_delta == 0.0
@@ -38653,7 +38810,7 @@ def test_optimizer_norms_missing_zero_vision_parameter_is_still_a_coverage_failu
     target = copy.deepcopy(reference["parameters"])
     target["visual.unused.weight"] = copy.deepcopy(target["layer.weight"])
     comparison = compare_optimizer_norms(_optimizer_norms_summary(target), reference)
-    assert comparison.only_dss == ["visual.unused.weight"]
+    assert comparison.only_ap == ["visual.unused.weight"]
     assert comparison.only_reference == []
     assert len(comparison.deltas) == 3
 
@@ -38662,7 +38819,7 @@ def test_optimizer_norms_comparison_reports_both_unmatched_parameter_sets():
     target = _optimizer_norms_summary({"target.weight": _optimizer_norms_summary()["parameters"]["layer.weight"]})
     reference = _optimizer_norms_summary({"ref.weight": _optimizer_norms_summary()["parameters"]["layer.weight"]})
     comparison = compare_optimizer_norms(target, reference)
-    assert comparison.only_dss == ["target.weight"]
+    assert comparison.only_ap == ["target.weight"]
     assert comparison.only_reference == ["ref.weight"]
     assert comparison.deltas == []
 
@@ -38856,7 +39013,7 @@ def test_optimizer_norms_arm_coverage_failure_is_not_a_zero_norm_pass(monkeypatc
     ctx, arm, reference, target = _optimizer_norms_context_and_results("target", gate=100)
     result = fwd_bwd_step._compare_arm(ctx, arm, reference, target)
     assert result.outcome is Outcome.FAIL
-    assert result.metrics["unmatched_dss"] == 1
+    assert result.metrics["unmatched_ap"] == 1
     assert result.metrics["unmatched_reference"] == 1
 
 
@@ -40076,7 +40233,7 @@ def _fixed_tolerance_onboarding_write_spec(config_path: Path, spec_path: Path) -
                 max_seq_len=10240,
                 total_tokens=10240,
                 active_tokens=10240,
-                dss_microbatches=1,
+                ap_microbatches=1,
                 pad_fraction=0.0,
             )
         ],
@@ -40363,7 +40520,7 @@ def test_inference_forwarding_onboarding_local_route_never_admits_gpu_pool_from_
     monkeypatch.setattr(
         config_module, "validate_against_host", lambda *a: pytest.fail("no author-host GPU validation")
     )
-    monkeypatch.setattr(dss_driver, "available_gpus", lambda: pytest.fail("no author GPU probe"))
+    monkeypatch.setattr(ap_driver, "available_gpus", lambda: pytest.fail("no author GPU probe"))
     monkeypatch.setattr(workdir, "ensure_no_interrupted_builds", lambda: pytest.fail("no onprem build probe"))
     calls = []
     monkeypatch.setattr(onboard, "_onboard_fixed_tolerance_test", lambda args, cfg: calls.append(cfg) or 0)
@@ -40476,7 +40633,7 @@ def test_rl_local_onboarding_admission_preserves_checks_and_combined_gpu_width(
         pytest.fail("RL local admission must not probe GPUs, size, calibrate or start a model")
 
     monkeypatch.setattr(config_module, "validate_against_host", unexpected)
-    monkeypatch.setattr(dss_driver, "available_gpus", unexpected)
+    monkeypatch.setattr(ap_driver, "available_gpus", unexpected)
     monkeypatch.setattr(workdir, "ensure_no_interrupted_builds", unexpected)
     monkeypatch.setattr(onboard, "_run_probe", unexpected)
     monkeypatch.setattr(onboard, "_render_and_run_calibration", unexpected)
@@ -40545,7 +40702,7 @@ def test_supervised_local_fixture_onboarding_admits_only_explicit_native_route(
         pytest.fail("local fixture admission must not probe the author host or start a model")
 
     monkeypatch.setattr(_fixed_tolerance_onboarding_SPEC, "validate_against_host", unexpected)
-    monkeypatch.setattr(dss_driver, "available_gpus", unexpected)
+    monkeypatch.setattr(ap_driver, "available_gpus", unexpected)
     monkeypatch.setattr(workdir, "ensure_no_interrupted_builds", unexpected)
     monkeypatch.setattr(onboard, "_render_and_run_calibration", unexpected)
     monkeypatch.setattr(onboard, "_run_final_regression", unexpected)
@@ -40656,27 +40813,27 @@ def test_helper_storage_direct_helpers_reject_unsafe_writes_before_side_effects(
     monkeypatch.setattr(Path, "mkdir", side_effect)
     monkeypatch.setattr(shutil, "rmtree", side_effect)
     monkeypatch.setattr(shutil, "copytree", side_effect)
-    monkeypatch.setattr(dss_driver, "_gateway_runtime", side_effect)
-    monkeypatch.setattr(dss_driver, "ArcticClient", side_effect)
+    monkeypatch.setattr(ap_driver, "_gateway_runtime", side_effect)
+    monkeypatch.setattr(ap_driver, "ArcticClient", side_effect)
     client = SimpleNamespace(save_checkpoint=side_effect)
     with pytest.raises(ValueError, match="/data-fast"):
         if helper == "gateway":
-            with dss_driver.gateway(_helper_storage_unsafe_destination, 1):
+            with ap_driver.gateway(_helper_storage_unsafe_destination, 1):
                 pytest.fail("unsafe gateway entered")
         elif helper == "transport":
-            with dss_driver.GatewayTransport(
+            with ap_driver.GatewayTransport(
                 _helper_storage_unsafe_destination, {"n_gpus": 1}, "read-only-model", 42, slots=1
             ):
                 pytest.fail("unsafe transport entered")
         elif helper == "job":
-            with dss_driver.running_job(dss_driver.GatewaySession(_helper_storage_unsafe_destination, 1), payload):
+            with ap_driver.running_job(ap_driver.GatewaySession(_helper_storage_unsafe_destination, 1), payload):
                 pytest.fail("unsafe job entered")
         elif helper == "weights":
-            dss_driver.save_weights_only_checkpoint(
+            ap_driver.save_weights_only_checkpoint(
                 None, SimpleNamespace(client=client), _helper_storage_unsafe_destination
             )
         elif helper == "payload":
-            dss_driver.build_payload(
+            ap_driver.build_payload(
                 {"n_gpus": 1}, "read-only-model", 42, optimizer_state_output_dir=_helper_storage_unsafe_destination
             )
         else:
@@ -40685,7 +40842,7 @@ def test_helper_storage_direct_helpers_reject_unsafe_writes_before_side_effects(
 
 def test_helper_storage_transport_revalidates_destination_before_enter_mkdir(tmp_path, monkeypatch):
     destination = tmp_path / "transport"
-    transport = dss_driver.GatewayTransport(destination, {"n_gpus": 1}, "read-only-model", 42, slots=1)
+    transport = ap_driver.GatewayTransport(destination, {"n_gpus": 1}, "read-only-model", 42, slots=1)
     destination.symlink_to("/tmp", target_is_directory=True)
     monkeypatch.setattr(Path, "mkdir", lambda *args, **kwargs: pytest.fail("unsafe transport reached mkdir"))
     with pytest.raises(ValueError, match="/data-fast"):
@@ -40696,11 +40853,11 @@ def test_helper_storage_transport_revalidates_destination_before_enter_mkdir(tmp
 def test_helper_storage_direct_training_job_rejects_checkpoint_child_escape_before_allocation(tmp_path, monkeypatch):
     (tmp_path / "checkpoints").symlink_to("/tmp", target_is_directory=True)
     monkeypatch.setattr(
-        dss_driver, "_gateway_runtime", lambda *args, **kwargs: pytest.fail("unsafe checkpoint reached runtime")
+        ap_driver, "_gateway_runtime", lambda *args, **kwargs: pytest.fail("unsafe checkpoint reached runtime")
     )
     payload = {"training_config": {"n_gpus": 1}, "model_name": "read-only-model"}
     with pytest.raises(ValueError, match="/data-fast"):
-        with dss_driver.running_job(dss_driver.GatewaySession(tmp_path, 1), payload):
+        with ap_driver.running_job(ap_driver.GatewaySession(tmp_path, 1), payload):
             pytest.fail("unsafe checkpoint reached a job")
 
 
@@ -40790,9 +40947,9 @@ def test_helper_storage_fast_batch_destination_is_canonical_and_read_inputs_rema
 
 def test_helper_storage_remote_training_config_without_local_writes_allows_read_only_workdir():
     backend = CortexConfig(base_url="http://unused")
-    session = dss_driver.GatewaySession(Path("/code/read-only"), 1, backend)
-    payload = dss_driver.build_payload({"n_gpus": 1}, "/code/read-only-model", 42)
-    config = dss_driver._training_client_config(session, payload)
+    session = ap_driver.GatewaySession(Path("/code/read-only"), 1, backend)
+    payload = ap_driver.build_payload({"n_gpus": 1}, "/code/read-only-model", 42)
+    config = ap_driver._training_client_config(session, payload)
     assert config.training.checkpoint_path is None
     assert config.model_name == "/code/read-only-model"
 
@@ -40812,7 +40969,7 @@ def test_helper_storage_weights_save_keeps_public_framing_and_does_not_restrict_
     monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", fast_root)
     destination = fast_root / "unused" / ".." / "checkpoint"
     job = SimpleNamespace(client=SimpleNamespace(save_checkpoint=save_checkpoint))
-    assert dss_driver.save_weights_only_checkpoint(None, job, destination) == str(source)
+    assert ap_driver.save_weights_only_checkpoint(None, job, destination) == str(source)
     assert calls == [{"path": str(fast_root / "checkpoint"), "export_hf": True}]
     assert not (fast_root / "checkpoint").exists()
 
@@ -41846,7 +42003,7 @@ def test_sizing_reuse_parent_continues_only_admitted_sizing(_sizing_reuse_case, 
     )
     monkeypatch.setattr(_fixed_tolerance_onboarding_SPEC, "load_config", lambda *a: config)
     monkeypatch.setattr(_fixed_tolerance_onboarding_SPEC, "validate_against_host", lambda *a: None)
-    monkeypatch.setattr(dss_driver, "available_gpus", lambda: 8)
+    monkeypatch.setattr(ap_driver, "available_gpus", lambda: 8)
     monkeypatch.setattr(workdir, "ensure_no_interrupted_builds", lambda: None)
     monkeypatch.setattr(onboard, "_checkout_root", lambda unused: args.cache_root.parent)
     monkeypatch.setattr(onboard, "_model_shape", lambda unused: (45, 4, 4))
@@ -43082,7 +43239,7 @@ def test_cortex_checkpoint_calibration_parent_admission_and_local_guards(
     monkeypatch.setattr(onboard, "_validate_storage", lambda *a: None)
     monkeypatch.setattr(onboard, "_checkout_root", lambda *a: tmp_path)
     monkeypatch.setattr(onboard, "_resume_setup", lambda *a: None)
-    monkeypatch.setattr(dss_driver, "available_gpus", _onboarding_storage_unexpected)
+    monkeypatch.setattr(ap_driver, "available_gpus", _onboarding_storage_unexpected)
     monkeypatch.setattr(workdir, "ensure_no_interrupted_builds", _onboarding_storage_unexpected)
     reached = []
     monkeypatch.setattr(onboard, "_onboard_checkpoint_resume", lambda *a: reached.append(True) or 0)
@@ -43195,7 +43352,7 @@ def test_cortex_checkpoint_calibration_preserves_nondefault_reviewed_arms(tmp_pa
             "max_seq_len": 512,
             "total_tokens": rows * 512,
             "active_tokens": rows * 512,
-            "dss_microbatches": count,
+            "ap_microbatches": count,
             "pad_fraction": 0.0,
         }
         for name, rows, count in (("gas1", 1, 1), ("gas4", 16, 4))
@@ -43349,7 +43506,7 @@ def test_cortex_checkpoint_rl_calibration_parent_preserves_whole_allocation_guar
     monkeypatch.setattr(onboard, "_validate_storage", lambda *a: None)
     monkeypatch.setattr(onboard, "_checkout_root", lambda *a: tmp_path)
     monkeypatch.setattr(onboard, "_resume_setup", lambda *a: None)
-    monkeypatch.setattr(dss_driver, "available_gpus", _onboarding_storage_unexpected)
+    monkeypatch.setattr(ap_driver, "available_gpus", _onboarding_storage_unexpected)
     monkeypatch.setattr(workdir, "ensure_no_interrupted_builds", _onboarding_storage_unexpected)
     reached = []
     monkeypatch.setattr(onboard, "_onboard_checkpoint_resume", lambda *a: reached.append(True) or 0)
@@ -43447,7 +43604,7 @@ def _local_cortex_reference_publication(tmp_path, monkeypatch):
     monkeypatch.setattr(onboard, "_model_shape", lambda *a: (45, 4, 4))
     monkeypatch.setattr(onboard, "_run_probe", lambda *a: state.selected)
     monkeypatch.setattr(_fixed_tolerance_onboarding_SPEC, "validate_against_host", lambda *a: None)
-    monkeypatch.setattr(dss_driver, "available_gpus", lambda: 8)
+    monkeypatch.setattr(ap_driver, "available_gpus", lambda: 8)
     monkeypatch.setattr(workdir, "ensure_no_interrupted_builds", lambda: None)
 
     def initial(actual, selected, first_oom):
@@ -43730,7 +43887,7 @@ def _local_cortex_optimizer_onboarding(tmp_path, monkeypatch):
     monkeypatch.setattr(onboard, "_run_probe", forbidden)
     monkeypatch.setattr(synth_model, "materialize_pretrained", forbidden)
     monkeypatch.setattr(runner, "run_reference", forbidden)
-    monkeypatch.setattr(dss_driver, "available_gpus", forbidden)
+    monkeypatch.setattr(ap_driver, "available_gpus", forbidden)
     monkeypatch.setattr(workdir, "ensure_no_interrupted_builds", forbidden)
     monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *a, **k: SimpleNamespace(vocab_size=32))
 
@@ -45045,8 +45202,8 @@ def test_checkpoint_resume_a_resumed_arctic_job_loads_the_saved_path_after_creat
         calls.append(("create", payload["model_name"]))
         yield SimpleNamespace(client=Client())
 
-    monkeypatch.setattr(dss_driver, "running_job", running_job)
-    transport = dss_driver.GatewayTransport(tmp_path, {"n_gpus": 1}, "/models/reduced", 1234, slots=1)
+    monkeypatch.setattr(ap_driver, "running_job", running_job)
+    transport = ap_driver.GatewayTransport(tmp_path, {"n_gpus": 1}, "/models/reduced", 1234, slots=1)
     checkpoint = Checkpoint(reference="/checkpoints/global_step10", source_job="/checkpoints/global_step10")
     with transport.job(resume_from=checkpoint):
         pass
@@ -45060,7 +45217,7 @@ def test_checkpoint_resume_arctic_checkpoint_reference_is_the_saved_path(tmp_pat
         def save_checkpoint(self):
             return {"path": "/checkpoints/global_step10", "global_step": 10}
 
-    wrapped = dss_driver.GatewayTrainingJob(dss_driver.GatewaySession(tmp_path, 1), SimpleNamespace(client=Client()))
+    wrapped = ap_driver.GatewayTrainingJob(ap_driver.GatewaySession(tmp_path, 1), SimpleNamespace(client=Client()))
     checkpoint = wrapped.save_resumable()
     assert checkpoint.reference == "/checkpoints/global_step10"
     assert checkpoint.source_job == "/checkpoints/global_step10"
@@ -45127,7 +45284,7 @@ def _checkpoint_resume_context(transport, tmp_path):
         vocab_size=128,
         cfg=SimpleNamespace(training={}),
         spec=_checkpoint_resume_Gate(),
-        arms=[SimpleNamespace(name="gas1", global_batch_size=2, max_seq_len=64, dss_microbatches=1)],
+        arms=[SimpleNamespace(name="gas1", global_batch_size=2, max_seq_len=64, ap_microbatches=1)],
         transport_for=lambda workdir: transport,
     )
 
@@ -45163,7 +45320,7 @@ def test_checkpoint_resume_gas4_uses_identical_plain_requests_for_uninterrupted_
     transport = _checkpoint_resume_Transport()
     ctx = _checkpoint_resume_context(transport, tmp_path)
     ctx.config_id = "qwen3-8b-h200-train-sft-full-4gpus-64k"
-    ctx.arms = [SimpleNamespace(name="gas4", global_batch_size=8, max_seq_len=64, dss_microbatches=4)]
+    ctx.arms = [SimpleNamespace(name="gas4", global_batch_size=8, max_seq_len=64, ap_microbatches=4)]
     calls = []
 
     def transport_for(workdir):
@@ -45198,8 +45355,8 @@ def test_checkpoint_resume_gateway_transport_preserves_config_accumulation_for_a
         payloads.append(payload)
         yield SimpleNamespace(client=SimpleNamespace(load_checkpoint=lambda **kwargs: None))
 
-    monkeypatch.setattr(dss_driver, "running_job", running_job)
-    transport = dss_driver.GatewayTransport(
+    monkeypatch.setattr(ap_driver, "running_job", running_job)
+    transport = ap_driver.GatewayTransport(
         tmp_path,
         {
             "n_gpus": 4,
@@ -46144,9 +46301,9 @@ def _optimizer_state_check_states(value: torch.Tensor) -> dict[str, torch.Tensor
     }
 
 
-def _optimizer_state_check_compare(dss, reference):
+def _optimizer_state_check_compare(ap, reference):
     return compare_optimizer_norms(
-        summarize_optimizer_artifacts(dss, backend="ap", **_optimizer_state_check_COMPARE_KWARGS),
+        summarize_optimizer_artifacts(ap, backend="ap", **_optimizer_state_check_COMPARE_KWARGS),
         summarize_optimizer_artifacts(reference, **_optimizer_state_check_COMPARE_KWARGS),
     )
 
@@ -46157,8 +46314,8 @@ def test_optimizer_state_check_norms_align_qwen_moe_tensor_layouts(tmp_path):
     w2 = torch.tensor([[[5.0], [6.0]]])
     router = torch.tensor([[7.0]])
     shared_gate = torch.tensor([[8.0, 9.0]])
-    dss = _optimizer_state_check_write_artifacts(
-        tmp_path / "dss-moe",
+    ap = _optimizer_state_check_write_artifacts(
+        tmp_path / "ap-moe",
         {
             "module.layers.0.mlp.experts.w1": _optimizer_state_check_states(w1),
             "module.layers.0.mlp.experts.w2": _optimizer_state_check_states(w2),
@@ -46177,8 +46334,8 @@ def test_optimizer_state_check_norms_align_qwen_moe_tensor_layouts(tmp_path):
             "model.layers.0.mlp.shared_expert.gate_proj.weight": _optimizer_state_check_states(shared_gate),
         },
     )
-    result = _optimizer_state_check_compare(dss, reference)
-    assert result.only_dss == ["visual.unused.weight"]
+    result = _optimizer_state_check_compare(ap, reference)
+    assert result.only_ap == ["visual.unused.weight"]
     assert result.only_reference == []
     assert len(result.deltas) == 12
     assert result.worst_delta == 0.0
@@ -46190,13 +46347,13 @@ def test_optimizer_state_check_uses_scalar_residual_norm_difference(tmp_path):
         "model.layer.weight",
         {"parameter_update": torch.tensor([1.0, 2.0]), "exp_avg": torch.zeros(2), "exp_avg_sq": torch.zeros(2)},
     )
-    dss = _optimizer_state_check_write_artifact(
+    ap = _optimizer_state_check_write_artifact(
         tmp_path / "ap",
         "module.layer.weight",
         {"parameter_update": torch.tensor([4.0, 6.0]), "exp_avg": torch.zeros(2), "exp_avg_sq": torch.zeros(2)},
     )
-    result = _optimizer_state_check_compare(dss, reference)
-    assert result.only_dss == []
+    result = _optimizer_state_check_compare(ap, reference)
+    assert result.only_ap == []
     assert result.only_reference == []
     by_state = {item.state: item.delta_norm for item in result.deltas}
     assert by_state["parameter_update_residual"] == pytest.approx(math.sqrt(52) - math.sqrt(5))
@@ -46210,13 +46367,13 @@ def test_optimizer_state_check_norms_reject_shape_mismatch(tmp_path):
         "layer.weight",
         {"parameter_update": torch.zeros(2), "exp_avg": torch.zeros(2), "exp_avg_sq": torch.zeros(2)},
     )
-    dss = _optimizer_state_check_write_artifact(
+    ap = _optimizer_state_check_write_artifact(
         tmp_path / "ap",
         "layer.weight",
         {"parameter_update": torch.zeros(3), "exp_avg": torch.zeros(2), "exp_avg_sq": torch.zeros(2)},
     )
     with pytest.raises(ValueError, match="shape mismatch"):
-        _optimizer_state_check_compare(dss, reference)
+        _optimizer_state_check_compare(ap, reference)
 
 
 def test_optimizer_state_check_delta_update_arm_applies_reviewed_norm_gate_to_every_state(tmp_path):
@@ -46225,7 +46382,7 @@ def test_optimizer_state_check_delta_update_arm_applies_reviewed_norm_gate_to_ev
         "layer.weight",
         {"parameter_update": torch.zeros(2), "exp_avg": torch.zeros(2), "exp_avg_sq": torch.zeros(2)},
     )
-    dss_manifest = _optimizer_state_check_write_artifact(
+    ap_manifest = _optimizer_state_check_write_artifact(
         tmp_path / "ap",
         "layer.weight",
         _optimizer_state_check_first_step_adam_state(torch.tensor([0.02, 0.0]), backend="ap"),
@@ -46246,8 +46403,8 @@ def test_optimizer_state_check_delta_update_arm_applies_reviewed_norm_gate_to_ev
         "loss": 2.0,
         "microbatches": 1,
     }
-    dss_result = SimpleNamespace(optimizer_state_manifest=str(dss_manifest), avg_loss=2.0, model_calls=1)
-    result = _compare_arm(ctx, arm, reference_result, dss_result)
+    ap_result = SimpleNamespace(optimizer_state_manifest=str(ap_manifest), avg_loss=2.0, model_calls=1)
+    result = _compare_arm(ctx, arm, reference_result, ap_result)
     assert result.outcome is Outcome.FAIL
     assert result.metrics["optimizer_values_compared"] == 3
     assert result.metrics["optimizer_values_over_criterion"] == 1
@@ -46302,12 +46459,12 @@ def test_optimizer_state_check_moment_implied_raw_update_difference_has_zero_res
         "layer.weight",
         _optimizer_state_check_first_step_adam_state(torch.tensor([1e-06])),
     )
-    dss = _optimizer_state_check_write_artifact(
+    ap = _optimizer_state_check_write_artifact(
         tmp_path / "dss-sign",
         "layer.weight",
         _optimizer_state_check_first_step_adam_state(torch.tensor([-1e-06]), backend="ap"),
     )
-    result = _optimizer_state_check_compare(dss, reference)
+    result = _optimizer_state_check_compare(ap, reference)
     by_state = {item.state: item.delta_norm for item in result.deltas}
     assert by_state["parameter_update_residual"] == pytest.approx(0.0, abs=1e-09)
     assert by_state["exp_avg"] == pytest.approx(0.0, abs=1e-12)
@@ -46315,11 +46472,11 @@ def test_optimizer_state_check_moment_implied_raw_update_difference_has_zero_res
 
 def test_optimizer_state_check_unexplained_update_corruption_remains_in_residual(tmp_path: Path) -> None:
     reference_states = _optimizer_state_check_first_step_adam_state(torch.tensor([1.0]))
-    dss_states = _optimizer_state_check_first_step_adam_state(torch.tensor([1.0]), backend="ap")
-    dss_states["parameter_update"] += 0.005
+    ap_states = _optimizer_state_check_first_step_adam_state(torch.tensor([1.0]), backend="ap")
+    ap_states["parameter_update"] += 0.005
     reference = _optimizer_state_check_write_artifact(tmp_path / "reference-corrupt", "layer.weight", reference_states)
-    dss = _optimizer_state_check_write_artifact(tmp_path / "dss-corrupt", "layer.weight", dss_states)
-    result = _optimizer_state_check_compare(dss, reference)
+    ap = _optimizer_state_check_write_artifact(tmp_path / "dss-corrupt", "layer.weight", ap_states)
+    result = _optimizer_state_check_compare(ap, reference)
     by_state = {item.state: item.delta_norm for item in result.deltas}
     assert by_state["parameter_update_residual"] == pytest.approx(0.005)
     assert by_state["exp_avg"] < 0.001
@@ -49355,7 +49512,7 @@ def test_local_cortex_forward_full_model_e2e_existing_replay_routes_held_out_to_
     _local_cortex_forward_gateway, monkeypatch, tmp_path, failure
 ):
     from arctic_platform.correctness.checks import e2e_sft_train_validate as check
-    from arctic_platform.correctness.harness import gateway as dss_driver
+    from arctic_platform.correctness.harness import gateway as ap_driver
     from arctic_platform.correctness.harness import sft as gsm8k
     from arctic_platform.correctness.harness.config import load_config
 
@@ -49387,7 +49544,7 @@ def test_local_cortex_forward_full_model_e2e_existing_replay_routes_held_out_to_
     )
     _, validation = check.request_bodies(replay, model_provider="huggingface")
     validation["processing"].pop("return_logprobs")
-    expected = dss_driver.cortex_training_body(validation)
+    expected = ap_driver.cortex_training_body(validation)
     original_send = aiohttp.ClientSession.request
     calls, _ = _local_cortex_forward_gateway
     replies, backward, steps, forwards = ({}, [], [], [])
@@ -49419,15 +49576,15 @@ def test_local_cortex_forward_full_model_e2e_existing_replay_routes_held_out_to_
 
     monkeypatch.setattr(aiohttp.ClientSession, "request", send)
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "_gateway_runtime",
         lambda *args, **kwargs: pytest.fail("no new gateway"),
     )
     if failure:
         with pytest.raises(aiohttp.ClientResponseError, match="native forward failed"):
-            check.run_dss_trajectory(ctx, replay, tmp_path / "target")
+            check.run_ap_trajectory(ctx, replay, tmp_path / "target")
     else:
-        losses, scores = check.run_dss_trajectory(ctx, replay, tmp_path / "target")
+        losses, scores = check.run_ap_trajectory(ctx, replay, tmp_path / "target")
         assert losses == [1.0, 2.0, 3.0]
         assert torch.equal(scores, torch.tensor([[1.0, 2.0, 3.0]]))
     payload = _local_cortex_forward_created(calls)
@@ -50320,14 +50477,14 @@ def test_client_backends_remote_job_skips_ray_and_preserves_backend(tmp_path, mo
         def shutdown(self):
             seen.append("shutdown")
 
-    monkeypatch.setattr(dss_driver, "_gateway_runtime", forbidden)
-    monkeypatch.setattr(dss_driver, "ArcticClient", Client)
+    monkeypatch.setattr(ap_driver, "_gateway_runtime", forbidden)
+    monkeypatch.setattr(ap_driver, "ArcticClient", Client)
     payload = {
         "model_name": "model",
         "training_config": {"n_gpus": 8, "max_seq_len": 8},
     }
-    with dss_driver.gateway(tmp_path, 8, backend=backend) as session:
-        with dss_driver.running_job(session, payload) as job:
+    with ap_driver.gateway(tmp_path, 8, backend=backend) as session:
+        with ap_driver.running_job(session, payload) as job:
             assert job.job_id == "parent:training:0"
     assert seen[0].backend is backend
     assert seen[0].training.checkpoint_path is None
@@ -50348,7 +50505,7 @@ def test_client_backends_cortex_batch_preserves_microbatch_order_labels_and_cont
         "meta": {"labels_are_shifted": True},
         "processing": {"loss_fn": "sft"},
     }
-    lowered = dss_driver.cortex_training_body(body)
+    lowered = ap_driver.cortex_training_body(body)
     torch_assert_equal(
         lowered["kwargs"]["input_ids"],
         torch.cat([chunk["input_ids"] for chunk in chunks]),
@@ -50364,16 +50521,16 @@ def test_client_backends_cortex_batch_preserves_microbatch_order_labels_and_cont
 @pytest.mark.parametrize("batches", [[], [{"x": torch.ones(1)}, {"y": torch.ones(1)}]])
 def test_client_backends_cortex_rejects_malformed_microbatch_lists(batches):
     with pytest.raises(ValueError, match="identical tensor keys"):
-        dss_driver.cortex_training_body({"batch": batches})
+        ap_driver.cortex_training_body({"batch": batches})
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
 def test_client_backends_onprem_batch_and_cortex_rpc_are_not_rewritten():
     body = {"batch": {"input_ids": torch.ones(1, 2)}}
     job = SimpleNamespace(client=SimpleNamespace(config=SimpleNamespace(backend=OnPremConfig())))
-    assert dss_driver.training_body(job, body) is body
+    assert ap_driver.training_body(job, body) is body
     rpc = {"args": (), "kwargs": {"input_ids": torch.ones(1, 2)}}
-    assert dss_driver.cortex_training_body(rpc) is rpc
+    assert ap_driver.cortex_training_body(rpc) is rpc
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
@@ -50887,7 +51044,7 @@ def test_client_backends_cortex_sft_body_does_not_select_the_rl_processor():
         },
         "processing": {"loss_fn": "sft"},
     }
-    lowered = dss_driver.cortex_training_body(body)
+    lowered = ap_driver.cortex_training_body(body)
     assert "processing" not in lowered
     decoded = wire.loads(wire.dumps(lowered))
     torch_assert_equal(decoded["kwargs"]["labels"], body["batch"]["labels"])
@@ -50905,7 +51062,7 @@ def test_client_backends_cortex_does_not_silently_drop_sft_processing_options(
     processing,
 ):
     with pytest.raises(ValueError, match="use --backend onprem"):
-        dss_driver.cortex_training_body({"batch": {"input_ids": torch.ones(1, 2)}, "processing": processing})
+        ap_driver.cortex_training_body({"batch": {"input_ids": torch.ones(1, 2)}, "processing": processing})
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
@@ -51101,7 +51258,7 @@ def test_client_backends_checkpoint_check_uses_three_real_cortex_clients(tmp_pat
         name=case,
         global_batch_size=16 * microbatches,
         max_seq_len=8,
-        dss_microbatches=microbatches,
+        ap_microbatches=microbatches,
     )
     ctx = runner.RunContext(
         config_id="unit",
@@ -51177,8 +51334,8 @@ def test_client_backends_remote_startup_failure_releases_job_and_session(tmp_pat
                     pytest.fail("failed startup must not yield a job")
         else:
             payload = {"model_name": "model", "training_config": {"n_gpus": 8}}
-            with dss_driver.gateway(tmp_path, 8, backend=_client_backends_remote()) as gateway_session:
-                with dss_driver.running_job(gateway_session, payload):
+            with ap_driver.gateway(tmp_path, 8, backend=_client_backends_remote()) as gateway_session:
+                with ap_driver.running_job(gateway_session, payload):
                     pytest.fail("failed startup must not yield a job")
     assert events == ["cancel", "close"]
     assert transport.job_id is None
@@ -51337,7 +51494,7 @@ def test_e2e_reduced_fixture_mtp_binds_before_native_adapter_without_mutating_in
         return deepcopy(payload)
 
     monkeypatch.setattr(lora, "bind_payload", bind_adapter)
-    losses, _ = runtime_clients_check.run_dss_trajectory(ctx, SimpleNamespace(), tmp_path / "target", adapter)
+    losses, _ = runtime_clients_check.run_ap_trajectory(ctx, SimpleNamespace(), tmp_path / "target", adapter)
     assert losses == [2.0] and len(captured) == 1
     debug = captured[0]["training_config"]["prime_rl"]["debug"]
     assert debug["existing_debug"] == "preserved"
@@ -51377,7 +51534,7 @@ def test_e2e_reduced_fixture_mtp_rejects_bad_binding_before_job_creation(tmp_pat
         lambda *args, **kwargs: pytest.fail("must reject before job creation"),
     )
     with pytest.raises(ValueError):
-        runtime_clients_check.run_dss_trajectory(ctx, SimpleNamespace(), tmp_path / "target")
+        runtime_clients_check.run_ap_trajectory(ctx, SimpleNamespace(), tmp_path / "target")
 
 
 @pytest.mark.parametrize("mode", ["unpublished", "non_qwen", "full_model", "on_prem"])
@@ -51394,7 +51551,7 @@ def test_e2e_reduced_fixture_mtp_does_not_change_unrequested_payloads(tmp_path, 
     elif mode == "on_prem":
         ctx.client_backend = OnPremConfig()
     captured = _e2e_reduced_fixture_capture(monkeypatch)
-    runtime_clients_check.run_dss_trajectory(ctx, SimpleNamespace(), tmp_path / "target")
+    runtime_clients_check.run_ap_trajectory(ctx, SimpleNamespace(), tmp_path / "target")
     assert captured[0]["training_config"]["prime_rl"]["debug"] == {"existing_debug": "preserved"}
 
 
@@ -51517,7 +51674,7 @@ def test_cortex_e2e_e2e_replay_uses_validated_fixture_and_cleans_up(
     def forbidden(*args, **kwargs):
         pytest.fail("Cortex replay must not enter the local Ray gateway")
 
-    monkeypatch.setattr(dss_driver, "_gateway_runtime", forbidden)
+    monkeypatch.setattr(ap_driver, "_gateway_runtime", forbidden)
 
     async def send(transport, method, url, *, policy=_DEFAULT, **kwargs):
         assert asyncio.get_running_loop() is transport._loop
@@ -51568,9 +51725,9 @@ def test_cortex_e2e_e2e_replay_uses_validated_fixture_and_cleans_up(
     monkeypatch.setattr(CortexTransport, "_send", send)
     if failure:
         with pytest.raises(RuntimeError, match=f"mock {failure} failed"):
-            runtime_clients_check.run_dss_trajectory(ctx, recorded, tmp_path / "target")
+            runtime_clients_check.run_ap_trajectory(ctx, recorded, tmp_path / "target")
     else:
-        losses, logprobs = runtime_clients_check.run_dss_trajectory(ctx, recorded, tmp_path / "target")
+        losses, logprobs = runtime_clients_check.run_ap_trajectory(ctx, recorded, tmp_path / "target")
         assert losses == [1.0, 2.0, 3.0]
         assert torch.all(logprobs == -1.25)
         assert steps == [{"learning_rate": ctx.cfg.training["optimizer"]["lr"]}] * 3
@@ -51604,7 +51761,7 @@ def test_cortex_e2e_e2e_rejects_missing_fixture_before_allocation(tmp_path, monk
         lambda *args, **kwargs: pytest.fail("must reject before allocation"),
     )
     with pytest.raises(ValueError, match="validated published Cortex fixture"):
-        runtime_clients_check.run_dss_trajectory(ctx, _cortex_e2e_replay(tmp_path), tmp_path / "target")
+        runtime_clients_check.run_ap_trajectory(ctx, _cortex_e2e_replay(tmp_path), tmp_path / "target")
 
 
 def _cortex_e2e_full_context(tmp_path):
@@ -51721,9 +51878,9 @@ def test_cortex_e2e_full_e2e_requests_original_model_and_preserves_cleanup(tmp_p
     monkeypatch.setattr(runtime_clients_check, "forward_logprobs", forward)
     if failure:
         with pytest.raises(RuntimeError, match=f"mock {failure} failed"):
-            runtime_clients_check.run_dss_trajectory(ctx, recorded, tmp_path / "target")
+            runtime_clients_check.run_ap_trajectory(ctx, recorded, tmp_path / "target")
     else:
-        losses, logprobs = runtime_clients_check.run_dss_trajectory(ctx, recorded, tmp_path / "target")
+        losses, logprobs = runtime_clients_check.run_ap_trajectory(ctx, recorded, tmp_path / "target")
         assert losses == [1.0, 2.0, 3.0]
         assert torch.all(logprobs == -1.25)
     assert exited == [job]
@@ -51744,7 +51901,7 @@ def test_cortex_e2e_full_e2e_rejects_missing_or_nonfast_snapshot_before_allocati
         lambda *args, **kwargs: pytest.fail("must reject before allocation"),
     )
     with pytest.raises(ValueError, match="validated local full-model snapshot|/data-fast"):
-        runtime_clients_check.run_dss_trajectory(ctx, _cortex_e2e_replay(tmp_path), tmp_path / "target")
+        runtime_clients_check.run_ap_trajectory(ctx, _cortex_e2e_replay(tmp_path), tmp_path / "target")
 
 
 @pytest.mark.usefixtures("_cortex_e2e_no_network")
@@ -51766,7 +51923,7 @@ def test_cortex_e2e_full_e2e_never_bypasses_hosted_or_non_gateway_guards(tmp_pat
         lambda *args, **kwargs: pytest.fail("must reject before allocation"),
     )
     with pytest.raises(ValueError, match="local Cortex gateway|HTTP loopback"):
-        runtime_clients_check.run_dss_trajectory(ctx, _cortex_e2e_replay(tmp_path), tmp_path / "target")
+        runtime_clients_check.run_ap_trajectory(ctx, _cortex_e2e_replay(tmp_path), tmp_path / "target")
 
 
 # Cortex model identity.
@@ -51967,7 +52124,7 @@ def test_cortex_model_identity_e2e_target_identity_hardware_and_backend(tmp_path
         return torch.tensor([[-1.0]])
 
     monkeypatch.setattr(e2e, "forward_logprobs", forward_logprobs)
-    losses, _ = e2e.run_dss_trajectory(ctx, replay, tmp_path)
+    losses, _ = e2e.run_ap_trajectory(ctx, replay, tmp_path)
     assert losses == [2.0]
     assert len(captured) == 1
     assert captured[0]["model_name"] == (ctx.target_model_name if remote else spec.model.cache_path)
@@ -51993,7 +52150,7 @@ def test_cortex_model_identity_cortex_e2e_without_published_identity_never_creat
     )
     monkeypatch.setattr(e2e, "request_bodies", lambda *args, **kwargs: ([], {}))
     with pytest.raises(ValueError, match="published Cortex fixture"):
-        e2e.run_dss_trajectory(ctx, SimpleNamespace(), tmp_path)
+        e2e.run_ap_trajectory(ctx, SimpleNamespace(), tmp_path)
 
 
 # Cortex port.
@@ -52084,7 +52241,7 @@ def test_driver_reviewed_build_payload_keeps_format_outside_worker_config(
 ):
     cfg = load_config(_driver_reviewed_root / "configs/qwen3.8-flash-next/long/h200-training-full.json")
     before = deepcopy(cfg.training)
-    payload = dss_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed, weight_format=weight_format)
+    payload = ap_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed, weight_format=weight_format)
     assert payload.get("weight_format") == weight_format
     assert ("weight_format" in payload) == (weight_format is not None)
     assert "weight_format" not in payload["training_config"]
@@ -52100,7 +52257,7 @@ def test_driver_reviewed_training_preserves_explicit_format_without_mutating_pay
     payload["weight_format"] = weight_format
     before = deepcopy(payload)
     session = GatewaySession(Path("."), 32, CortexConfig(base_url="http://unused"))
-    native = dss_driver._training_client_config(session, payload)
+    native = ap_driver._training_client_config(session, payload)
     assert native.training.weight_format == weight_format
     assert native.to_cortex()[0]["weight_format"] == weight_format
     assert payload == before
@@ -52111,7 +52268,7 @@ def test_driver_reviewed_inference_preserves_format_topology_and_independent_rep
     job_type,
 ):
     cfg = load_config(_driver_reviewed_rl_config)
-    payload = deepcopy(dss_driver.sub_job_of_type(cfg, "sampling"))
+    payload = deepcopy(ap_driver.sub_job_of_type(cfg, "sampling"))
     payload["model_name"] = "/data-fast/models/reviewed"
     payload["job_type"] = job_type
     if job_type == "log_prob":
@@ -52119,7 +52276,7 @@ def test_driver_reviewed_inference_preserves_format_topology_and_independent_rep
         payload["inference_config"].pop("num_replicas")
         payload["inference_config"].pop("router_replay")
     before = deepcopy(payload)
-    native = dss_driver._inference_client_config(payload, backend=CortexConfig(base_url="http://unused"))
+    native = ap_driver._inference_client_config(payload, backend=CortexConfig(base_url="http://unused"))
     sub = native.to_cortex()[0]
     assert isinstance(native, CortexTrainingConfig)
     assert native.sampling.weight_format == sub["weight_format"] == "vllm"
@@ -52138,7 +52295,7 @@ def test_driver_reviewed_inference_preserves_format_topology_and_independent_rep
 def test_driver_reviewed_rl_bootstraps_before_yield_and_always_shuts_down(monkeypatch, tmp_path, failure):
     cfg = load_config(_driver_reviewed_rl_config)
     original = cfg.native.model_dump()
-    payload = dss_driver.build_payload(cfg.training, "/data-fast/models/reviewed", cfg.native.seed)
+    payload = ap_driver.build_payload(cfg.training, "/data-fast/models/reviewed", cfg.native.seed)
     before = deepcopy(payload)
     events = []
 
@@ -52164,10 +52321,10 @@ def test_driver_reviewed_rl_bootstraps_before_yield_and_always_shuts_down(monkey
         def shutdown(self):
             events.append("shutdown")
 
-    monkeypatch.setattr(dss_driver, "RLClient", Client)
+    monkeypatch.setattr(ap_driver, "RLClient", Client)
 
     def run():
-        with dss_driver.running_rl_client(
+        with ap_driver.running_rl_client(
             cfg,
             payload,
             "/data-fast/models/reviewed",
@@ -52196,7 +52353,7 @@ def test_driver_reviewed_rl_bootstraps_before_yield_and_always_shuts_down(monkey
 @pytest.mark.parametrize("disabled_side", ["training", "sampling"])
 def test_driver_reviewed_rl_does_not_bootstrap_when_either_side_is_disabled(monkeypatch, tmp_path, disabled_side):
     cfg = load_config(_driver_reviewed_rl_config)
-    payload = dss_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed)
+    payload = ap_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed)
     if disabled_side == "training":
         payload["training_config"]["router_replay"]["enabled"] = False
     else:
@@ -52213,8 +52370,8 @@ def test_driver_reviewed_rl_does_not_bootstrap_when_either_side_is_disabled(monk
         def shutdown(self):
             events.append("shutdown")
 
-    monkeypatch.setattr(dss_driver, "RLClient", Client)
-    with dss_driver.running_rl_client(
+    monkeypatch.setattr(ap_driver, "RLClient", Client)
+    with ap_driver.running_rl_client(
         cfg,
         payload,
         cfg.model_name,
@@ -52236,7 +52393,7 @@ def test_driver_replay_verification_enables_unconfigured_sampler_without_mutatin
     else:
         inference["router_replay"] = deepcopy(sampling_replay)
     original = cfg.native.model_dump()
-    payload = dss_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed)
+    payload = ap_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed)
     before = deepcopy(payload)
     events = []
 
@@ -52257,8 +52414,8 @@ def test_driver_replay_verification_enables_unconfigured_sampler_without_mutatin
         def shutdown(self):
             events.append("shutdown")
 
-    monkeypatch.setattr(dss_driver, "RLClient", Client)
-    with dss_driver.running_rl_client(
+    monkeypatch.setattr(ap_driver, "RLClient", Client)
+    with ap_driver.running_rl_client(
         cfg,
         payload,
         cfg.model_name,
@@ -52273,7 +52430,7 @@ def test_driver_replay_verification_enables_unconfigured_sampler_without_mutatin
 
 
 def test_driver_reviewed_rl_fwd_bwd_preserves_replay_identity_in_zone_metadata():
-    batch = dss_driver.rl_batch([[1, 2, 3]], [2], pad_id=0)
+    batch = ap_driver.rl_batch([[1, 2, 3]], [2], pad_id=0)
     batch["kwargs"].update(
         rr_sample_ids=["rr1:row-0"],
         rr_replay_meta=[{"replay_id": "rr1:row-0"}],
@@ -52300,21 +52457,21 @@ def test_driver_reviewed_rl_fwd_bwd_preserves_replay_identity_in_zone_metadata()
             torch_assert_equal(payload["kwargs"]["input_ids"], batch["kwargs"]["input_ids"])
             return response
 
-    assert dss_driver.rl_fwd_bwd(Client(), batch, replay_sampling=True) is response
+    assert ap_driver.rl_fwd_bwd(Client(), batch, replay_sampling=True) is response
     assert "router_replay" not in batch
 
 
 def test_driver_reviewed_rl_revalidates_incompatible_formats_before_client_creation(monkeypatch, tmp_path):
     cfg = load_config(_driver_reviewed_rl_config)
-    payload = dss_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed)
+    payload = ap_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed)
     payload["weight_format"] = "hf"
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "RLClient",
         lambda config: pytest.fail("invalid config must not create jobs"),
     )
     with pytest.raises(ValueError, match="weight formats must agree"):
-        with dss_driver.running_rl_client(
+        with ap_driver.running_rl_client(
             cfg,
             payload,
             cfg.model_name,
@@ -52331,14 +52488,14 @@ def test_driver_reviewed_rl_rejects_unsupported_onprem_fields_before_transport(m
     cfg.native.sampling.weight_format = "vllm" if unsupported == "sampling-format" else None
     if unsupported != "replicas":
         cfg.native.sampling.arctic_inference_config.pop("num_replicas")
-    payload = dss_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed)
+    payload = ap_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed)
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "RLClient",
         lambda *args, **kwargs: pytest.fail("must not create jobs"),
     )
     with pytest.raises(ValueError, match="require the Cortex correctness route"):
-        with dss_driver.running_rl_client(
+        with ap_driver.running_rl_client(
             cfg,
             payload,
             cfg.model_name,
@@ -52351,23 +52508,21 @@ def test_driver_reviewed_rl_rejects_unsupported_onprem_fields_before_transport(m
 @pytest.mark.parametrize("job_type", ["training", "sampling"])
 def test_driver_reviewed_rejects_unsupported_format_before_gateway_runtime(monkeypatch, job_type):
     cfg = load_config(_driver_reviewed_rl_config)
-    payload = (
-        deepcopy(cfg.sub_job) if job_type == "training" else deepcopy(dss_driver.sub_job_of_type(cfg, "sampling"))
-    )
+    payload = deepcopy(cfg.sub_job) if job_type == "training" else deepcopy(ap_driver.sub_job_of_type(cfg, "sampling"))
     payload["model_name"] = "/data-fast/models/reviewed"
     session = GatewaySession(Path("/data-fast/tmp/reviewed-prestart-control"), 32, OnPremConfig())
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "_gateway_runtime",
         lambda *args: pytest.fail("invalid recipe must not touch the runtime"),
     )
     monkeypatch.setattr(
-        dss_driver,
+        ap_driver,
         "ArcticClient",
         lambda *args: pytest.fail("invalid recipe must not create jobs"),
     )
     with pytest.raises(ValueError, match="require the Cortex correctness route"):
-        with dss_driver.running_job(session, payload):
+        with ap_driver.running_job(session, payload):
             pytest.fail("unsupported fields must not yield")
 
 
@@ -52411,7 +52566,7 @@ def test_cortex_port_config_intake_does_not_ignore_unknown_protocols(tmp_path, p
 
 
 @pytest.mark.usefixtures("_cortex_port_no_network")
-def test_cortex_port_cortex_training_preserves_dss_extra_fields_and_determinism():
+def test_cortex_port_cortex_training_preserves_ap_extra_fields_and_determinism():
     training = {
         "n_gpus": 8,
         "max_seq_len": 32,
@@ -52453,7 +52608,7 @@ def test_cortex_port_hosted_config_does_not_depend_on_removed_public_backend_fie
 @pytest.mark.usefixtures("_cortex_port_no_network")
 @pytest.mark.parametrize("order", ["batched", "interleaved"])
 @pytest.mark.parametrize("startup_error", [False, True])
-def test_cortex_port_reviewed_gradient_cases_send_dss_requests_not_onprem_workarounds(
+def test_cortex_port_reviewed_gradient_cases_send_ap_requests_not_onprem_workarounds(
     tmp_path, monkeypatch, order, startup_error
 ):
     from arctic_platform.correctness.harness import cortex as cortex_fixture
@@ -52644,7 +52799,7 @@ def test_cortex_port_managed_inference_uses_public_transport_and_cleans_up(tmp_p
     def forbidden(*args, **kwargs):
         pytest.fail("managed inference must not enter Ray or use a local checkpoint export/tokenizer write")
 
-    monkeypatch.setattr(dss_driver, "_gateway_runtime", forbidden)
+    monkeypatch.setattr(ap_driver, "_gateway_runtime", forbidden)
     monkeypatch.setattr(inference, "save_weights_only_checkpoint", forbidden)
     monkeypatch.setattr(inference, "materialize_checkpoint_tokenizer", forbidden)
     monkeypatch.setattr(inference, "_onprem_sampling_and_reload", forbidden)
@@ -52894,8 +53049,8 @@ def test_cortex_port_onprem_inference_retains_local_export_and_reload_diagnostic
                 ]
             }
 
-    monkeypatch.setattr(dss_driver, "ArcticClient", Client)
-    monkeypatch.setattr(dss_driver, "_gateway_runtime", lambda *args: contextlib.nullcontext())
+    monkeypatch.setattr(ap_driver, "ArcticClient", Client)
+    monkeypatch.setattr(ap_driver, "_gateway_runtime", lambda *args: contextlib.nullcontext())
     monkeypatch.setattr(inference, "CorrectnessClient", forbidden)
     monkeypatch.setattr(inference, "save_and_resolve_checkpoint_id", forbidden)
     monkeypatch.setattr(
@@ -53148,7 +53303,7 @@ def test_hosted_an_ambiguous_catalog_delta_is_refused() -> None:
         save_and_resolve_checkpoint_id(client, "job-1", "resumable")
 
 
-def test_hosted_checkpoint_jobs_preserve_dss_engine_gas_and_width(monkeypatch) -> None:
+def test_hosted_checkpoint_jobs_preserve_ap_engine_gas_and_width(monkeypatch) -> None:
     client = _hosted_Client()
     monkeypatch.setattr(hosted, "ArcticClient", client.create)
     cfg = _hosted_config().at_gpu_width(8)
@@ -55027,7 +55182,7 @@ def test_native_broadcast_frozen_skips_require_all_rank_unchanged_storage(
     monkeypatch.setattr(dist, "get_world_size", lambda: 2)
     model = torch.nn.Linear(2, 1, bias=False)
     model.register_parameter("frozen", torch.nn.Parameter(torch.ones(3), requires_grad=case == "trainable-skip"))
-    model.frozen._dss_skip_weight_sync = True
+    model.frozen._ap_skip_weight_sync = True
     calls = []
 
     def gather(records, local, *, group):
@@ -55058,7 +55213,7 @@ def test_native_broadcast_frozen_skips_require_all_rank_unchanged_storage(
         elif case == "replacement":
             model.frozen.data = model.frozen.detach().clone()
         elif case == "changed-skip":
-            model.frozen._dss_skip_weight_sync = False
+            model.frozen._ap_skip_weight_sync = False
         if case != "missing-completion":
             broadcast.maybe_complete_broadcast_trainer_inventory(model, is_master=True)
 
@@ -57472,7 +57627,7 @@ def test_reviewed_weight_format_callers_e2e_trajectory_preserves_top_level_forma
     run = _reviewed_weight_format_callers_e2e_run
     run.context.cfg = _reviewed_weight_format_callers_config(tmp_path, weight_format)
     before = deepcopy(run.context.cfg)
-    losses, logprobs = run.module.run_dss_trajectory(run.context, object(), tmp_path)
+    losses, logprobs = run.module.run_ap_trajectory(run.context, object(), tmp_path)
     assert losses == [2.0]
     assert torch.equal(logprobs, torch.tensor([[-1.0]]))
     assert len(run.captured) == 1
@@ -57574,7 +57729,7 @@ def test_reviewed_weight_format_callers_explicit_onprem_format_reaches_prestart_
     monkeypatch.setattr(cortex.ArcticClient, "__init__", must_not_start)
     monkeypatch.setattr(run.module, "running_job", running_job)
     with pytest.raises(ValueError, match="require the Cortex correctness route"):
-        run.module.run_dss_trajectory(run.context, object(), tmp_path)
+        run.module.run_ap_trajectory(run.context, object(), tmp_path)
     assert len(captured) == 1
     assert captured[0]["weight_format"] == "vllm"
 
@@ -57596,7 +57751,7 @@ def test_reviewed_weight_format_callers_onprem_rejects_before_gateway_runtime_or
     monkeypatch.setattr(rl_driver, "_gateway_runtime", must_not_start)
     monkeypatch.setattr(rl_driver, "ArcticClient", must_not_start)
     with pytest.raises(ValueError, match="require the Cortex correctness route"):
-        run.module.run_dss_trajectory(run.context, object(), tmp_path)
+        run.module.run_ap_trajectory(run.context, object(), tmp_path)
 
 
 # Inference sampling topology.
@@ -60909,7 +61064,7 @@ def _qwen4_schema_diagnostic_local(tmp_path, monkeypatch, _qwen4_inference_schem
             )
         )
     logs = tmp_path / "logs"
-    monkeypatch.setenv("DSS_CORRECTNESS_LOGDIR", str(logs))
+    monkeypatch.setenv("AP_CORRECTNESS_LOGDIR", str(logs))
     monkeypatch.setattr(
         AutoConfig,
         "from_pretrained",
@@ -63903,7 +64058,7 @@ _SELFTEST_FIXTURES = (
     "_cortex_optimizer_capture_no_network",
     "_cortex_optimizer_capture_artifact_stubs",
     "_cortex_optimizer_capture_lifecycle",
-    "_dss_driver_optimizer_capture_initializer",
+    "_ap_driver_optimizer_capture_initializer",
     "_native_participation_worker",
     "_optimizer_capture_capture_worker",
     "_optimizer_capture_capture_server",
@@ -64037,6 +64192,8 @@ _SELFTEST_GROUPS = {
         "test_config_gpu_attention_effective_training_applies_nested_prime_rl_overrides",
         "test_config_gpu_attention_disabled_lm_head_chunk_resolves_to_none",
         "test_config_gpu_attention_explicit_lm_head_chunk_precedes_legacy_settings",
+        "test_ap_correctness_environment_accepts_legacy_alias_with_ap_precedence",
+        "test_ap_gateway_owner_matches_legacy_records_without_overriding_ap",
         "test_config_gpu_attention_config_checksum_is_canonical_and_tracks_training_behavior",
         "test_config_gpu_attention_optimizer_dtype_follows_explicit_deepspeed_state_precision",
         "test_config_gpu_attention_optimizer_dtype_rejects_mixed_master_and_state_precision",
@@ -64191,6 +64348,10 @@ _SELFTEST_GROUPS = {
         "test_console_activity_prints_one_progress_line_when_output_is_not_interactive",
         "test_console_passing_gate_reports_passed_tensors",
         "test_console_failing_gate_reports_failed_tensors",
+        "test_console_target_metrics_use_ap_names_and_read_historical_results",
+        "test_gradient_arm_emits_only_ap_target_metrics",
+        "test_config_spec_reads_historical_arm_names_and_writes_only_ap",
+        "test_config_spec_rejects_conflicting_legacy_arm_counts",
         "test_console_optimizer_gate_names_residual_delta_and_reports_passed_values",
         "test_console_optimizer_norm_delta_takes_precedence_over_legacy_metric",
         "test_console_optimizer_missing_delta_does_not_report_zero",
@@ -64202,7 +64363,8 @@ _SELFTEST_GROUPS = {
         "test_diagnostics_dispatch_module_exit_is_preserved_and_argv_restored",
         "test_diagnostics_dispatch_original_error_and_interruption_propagate",
         "test_diagnostics_dispatch_real_module_entry_runs_main_with_native_argv",
-        "test_diagnostics_dispatch_chunking_removes_only_knob_from_copied_training_configs",
+        "test_diagnostics_dispatch_chunking_disables_only_model_option_in_copied_training_configs",
+        "test_lm_head_diagnostic_disables_modern_options_without_mutating_source",
         "test_diagnostics_dispatch_chunking_uses_injected_api_executor_without_global_mutation",
         "test_diagnostics_dispatch_chunking_parse_failure_does_not_load_executor",
         "test_diagnostics_dispatch_chunking_executor_failure_keeps_original_config_and_binding",
@@ -64541,53 +64703,53 @@ _SELFTEST_GROUPS = {
         "test_cortex_optimizer_decode_decode_does_not_allow_arbitrary_pickled_checkpoint_classes",
         "test_cortex_optimizer_decode_decode_rejects_non_adamw_or_missing_model_and_shard_optimizer_types",
         "test_cortex_optimizer_decode_decode_rejects_unmatched_expected_optimizer_type",
-        "test_dss_driver_globalize_expert_norms_replaces_rank_local_value",
-        "test_dss_driver_fwd_bwd_step_reads_rank_owned_norms_from_merged_list",
-        "test_dss_driver_fwd_bwd_step_unwraps_rank_owned_optimizer_manifest",
-        "test_dss_driver_optimizer_capture_worker_patches_imported_server_worker_bindings",
-        "test_dss_driver_optimizer_capture_server_patches_workers_inside_actor",
-        "test_dss_driver_prime_rl_receives_prediction_aligned_labels",
-        "test_dss_driver_prime_rl_uses_fused_model_loss_with_aligned_labels",
-        "test_dss_driver_pack_microbatches_emits_exact_gas_list",
-        "test_dss_driver_pack_microbatches_preserves_prime_rl_shifted_labels",
-        "test_dss_driver_pack_microbatches_can_request_memory_sft_ce_without_mutating_config",
-        "test_dss_driver_normal_packing_uses_plain_supervised_loss",
-        "test_dss_driver_reference_runner_passes_the_harness_seed",
-        "test_dss_driver_runner_requires_data_fast_before_operational_side_effects",
-        "test_dss_driver_reference_allows_small_repo_report_with_data_fast_optimizer_output",
-        "test_dss_driver_full_model_weights_only_export_still_requires_model_config",
-        "test_dss_driver_payload_routes_optimizer_capture_to_debug_for_harness",
-        "test_dss_driver_optimizer_capture_debug_config_defaults",
-        "test_dss_driver_optimizer_capture_debug_config_merges_supported_sections_without_mutation",
-        "test_dss_driver_optimizer_capture_debug_config_rejects_malformed_sections",
-        "test_dss_driver_optimizer_capture_initialize_uses_current_client_job_config",
-        "test_dss_driver_optimizer_capture_initialize_accepts_path_objects",
-        "test_dss_driver_optimizer_capture_initialize_worker_settings_can_disable_training_capture",
-        "test_dss_driver_optimizer_capture_initialize_rejects_relative_paths",
-        "test_dss_driver_optimizer_capture_initialize_rejects_non_path_values",
-        "test_dss_driver_optimizer_capture_worker_context_restores_production_worker",
-        "test_dss_driver_payload_can_skip_unused_gradient_norm_collection",
-        "test_dss_driver_payload_preserves_configured_deepspeed_accumulation",
-        "test_dss_driver_payload_caps_large_microbatch_budget_at_64k",
-        "test_dss_driver_payload_applies_spec_lm_head_chunk_without_overriding_config",
-        "test_dss_driver_payload_preserves_smaller_microbatch_budget",
-        "test_dss_driver_payload_does_not_choose_deepep_chunks",
-        "test_dss_driver_pool_is_the_local_devices_when_the_harness_owns_the_gateway",
-        "test_dss_driver_pool_is_the_hostfile_slots_when_an_external_gateway_owns_placement",
-        "test_dss_driver_pool_falls_back_to_local_devices_when_the_named_hostfile_is_absent",
-        "test_dss_driver_payload_pins_determinism_over_a_config_that_asks_otherwise",
-        "test_dss_driver_payload_determinism_off_clears_a_config_that_asks_for_the_pin",
-        "test_dss_driver_gateway_runtime_verifies_before_and_after_owned_shutdown",
-        "test_dss_driver_gateway_runtime_restores_hostfile_after_failure",
-        "test_dss_driver_selected_hostfile_is_shared_by_gateway_and_allocation",
-        "test_dss_driver_allocation_runtime_command_uses_hostfile_ds_ssh",
-        "test_dss_driver_runtime_idle_check_only_checks_processes_and_port",
-        "test_dss_driver_gateway_runtime_refuses_preflight_without_foreign_teardown",
-        "test_dss_driver_runtime_idle_check_requires_successful_process_inventory",
-        "test_dss_driver_gateway_runtime_load_failure_does_not_shutdown_or_recheck",
-        "test_dss_driver_running_job_keeps_cleanup_outside_client_shutdown",
-        "test_dss_driver_gateway_runtime_cleanup_failure_is_unsafe_and_restores_port",
-        "test_dss_driver_running_job_shutdown_failure_is_unsafe",
+        "test_ap_driver_globalize_expert_norms_replaces_rank_local_value",
+        "test_ap_driver_fwd_bwd_step_reads_rank_owned_norms_from_merged_list",
+        "test_ap_driver_fwd_bwd_step_unwraps_rank_owned_optimizer_manifest",
+        "test_ap_driver_optimizer_capture_worker_patches_imported_server_worker_bindings",
+        "test_ap_driver_optimizer_capture_server_patches_workers_inside_actor",
+        "test_ap_driver_prime_rl_receives_prediction_aligned_labels",
+        "test_ap_driver_prime_rl_uses_fused_model_loss_with_aligned_labels",
+        "test_ap_driver_pack_microbatches_emits_exact_gas_list",
+        "test_ap_driver_pack_microbatches_preserves_prime_rl_shifted_labels",
+        "test_ap_driver_pack_microbatches_can_request_memory_sft_ce_without_mutating_config",
+        "test_ap_driver_normal_packing_uses_plain_supervised_loss",
+        "test_ap_driver_reference_runner_passes_the_harness_seed",
+        "test_ap_driver_runner_requires_data_fast_before_operational_side_effects",
+        "test_ap_driver_reference_allows_small_repo_report_with_data_fast_optimizer_output",
+        "test_ap_driver_full_model_weights_only_export_still_requires_model_config",
+        "test_ap_driver_payload_routes_optimizer_capture_to_debug_for_harness",
+        "test_ap_driver_optimizer_capture_debug_config_defaults",
+        "test_ap_driver_optimizer_capture_debug_config_merges_supported_sections_without_mutation",
+        "test_ap_driver_optimizer_capture_debug_config_rejects_malformed_sections",
+        "test_ap_driver_optimizer_capture_initialize_uses_current_client_job_config",
+        "test_ap_driver_optimizer_capture_initialize_accepts_path_objects",
+        "test_ap_driver_optimizer_capture_initialize_worker_settings_can_disable_training_capture",
+        "test_ap_driver_optimizer_capture_initialize_rejects_relative_paths",
+        "test_ap_driver_optimizer_capture_initialize_rejects_non_path_values",
+        "test_ap_driver_optimizer_capture_worker_context_restores_production_worker",
+        "test_ap_driver_payload_can_skip_unused_gradient_norm_collection",
+        "test_ap_driver_payload_preserves_configured_deepspeed_accumulation",
+        "test_ap_driver_payload_caps_large_microbatch_budget_at_64k",
+        "test_ap_driver_payload_applies_spec_lm_head_chunk_without_overriding_config",
+        "test_ap_driver_payload_preserves_smaller_microbatch_budget",
+        "test_ap_driver_payload_does_not_choose_deepep_chunks",
+        "test_ap_driver_pool_is_the_local_devices_when_the_harness_owns_the_gateway",
+        "test_ap_driver_pool_is_the_hostfile_slots_when_an_external_gateway_owns_placement",
+        "test_ap_driver_pool_falls_back_to_local_devices_when_the_named_hostfile_is_absent",
+        "test_ap_driver_payload_pins_determinism_over_a_config_that_asks_otherwise",
+        "test_ap_driver_payload_determinism_off_clears_a_config_that_asks_for_the_pin",
+        "test_ap_driver_gateway_runtime_verifies_before_and_after_owned_shutdown",
+        "test_ap_driver_gateway_runtime_restores_hostfile_after_failure",
+        "test_ap_driver_selected_hostfile_is_shared_by_gateway_and_allocation",
+        "test_ap_driver_allocation_runtime_command_uses_hostfile_ds_ssh",
+        "test_ap_driver_runtime_idle_check_only_checks_processes_and_port",
+        "test_ap_driver_gateway_runtime_refuses_preflight_without_foreign_teardown",
+        "test_ap_driver_runtime_idle_check_requires_successful_process_inventory",
+        "test_ap_driver_gateway_runtime_load_failure_does_not_shutdown_or_recheck",
+        "test_ap_driver_running_job_keeps_cleanup_outside_client_shutdown",
+        "test_ap_driver_gateway_runtime_cleanup_failure_is_unsafe_and_restores_port",
+        "test_ap_driver_running_job_shutdown_failure_is_unsafe",
         "test_native_participation_collector_observes_backward_and_restores_all_hooks",
         "test_native_participation_collector_rejects_early_source_drift_and_still_closes",
         "test_native_participation_collector_arm_failure_does_not_leak_hooks",
@@ -65762,9 +65924,9 @@ _SELFTEST_GROUPS = {
         "test_driver_reviewed_rejects_unsupported_format_before_gateway_runtime",
         "test_cortex_port_retained_config_loads_without_changing_the_reviewed_identity",
         "test_cortex_port_config_intake_does_not_ignore_unknown_protocols",
-        "test_cortex_port_cortex_training_preserves_dss_extra_fields_and_determinism",
+        "test_cortex_port_cortex_training_preserves_ap_extra_fields_and_determinism",
         "test_cortex_port_hosted_config_does_not_depend_on_removed_public_backend_fields",
-        "test_cortex_port_reviewed_gradient_cases_send_dss_requests_not_onprem_workarounds",
+        "test_cortex_port_reviewed_gradient_cases_send_ap_requests_not_onprem_workarounds",
         "test_cortex_port_managed_inference_uses_public_transport_and_cleans_up",
         "test_cortex_port_sampling_config_forwards_checkpoint_identity_without_mutating_training",
         "test_cortex_port_onprem_inference_retains_local_export_and_reload_diagnostic",
@@ -65785,7 +65947,7 @@ _SELFTEST_GROUPS = {
         "test_hosted_the_connection_does_not_render_its_token",
         "test_hosted_explicit_checkpoint_id_does_not_use_a_deepspeed_tag",
         "test_hosted_an_ambiguous_catalog_delta_is_refused",
-        "test_hosted_checkpoint_jobs_preserve_dss_engine_gas_and_width",
+        "test_hosted_checkpoint_jobs_preserve_ap_engine_gas_and_width",
         "test_hosted_local_gateway_accepts_only_explicit_http_loopback",
         "test_hosted_local_gateway_rejects_nonloopback_and_decorated_urls",
         "test_hosted_local_gateway_refuses_hosted_credentials",
