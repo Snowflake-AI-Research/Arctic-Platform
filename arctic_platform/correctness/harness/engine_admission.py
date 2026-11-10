@@ -423,10 +423,11 @@ def gateway_runtime_scope(gateway, hostfile: Path):
     original = gateway._create_job_v0
 
     async def create_job(zone, config, job_id):
-        from dss.ray_dss.stage_info import strip_stage_info_from_job_config
-
         if config.training_config is None:
             return await original(zone, config, job_id)
+        strip_stage_info_from_job_config = importlib.import_module(
+            "dss.ray_dss.stage_info"
+        ).strip_stage_info_from_job_config
         ranks = [(node.host, gpu) for node in zone.nodes for gpu in node.gpu_ids]
         slots = {node["host"]: node["slots"] for node in allocation["nodes"]}
         if (

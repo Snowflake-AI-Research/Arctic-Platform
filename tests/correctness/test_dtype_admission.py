@@ -16,6 +16,7 @@
 """CPU admission controls; no model, reference subprocess or gateway is started."""
 
 import copy
+import hashlib
 import io
 import json
 import sys
@@ -405,7 +406,7 @@ def test_owned_runtime_resolution_fails_closed(recipe, installed_runtime, monkey
     message = {
         "unowned": "automatically owned local",
         "missing-builder": "does not expose _build_ds_config",
-        "nonlocal-width": "nonlocal DSS worker installation",
+        "nonlocal-width": "requires a same-job hostfile for nonlocal workers",
         "builder-error": "synthetic builder failure",
     }[fault]
     if fault == "missing-builder":
@@ -425,25 +426,158 @@ def test_owned_runtime_resolution_fails_closed(recipe, installed_runtime, monkey
     assert untouched(config) == before
 
 
-@pytest.mark.parametrize("local, gpu", [(False, 0), (True, 1)])
-def test_owned_runtime_resolution_refuses_unverified_hostfile_placement(
-    recipe, installed_runtime, monkeypatch, tmp_path, local, gpu
-):
-    config = recipe(accumulation=None)
-    before = untouched(config)
+@pytest.fixture(params=[(False, 0), (True, 1)])
+def selected_hostfile_placement(installed_runtime, monkeypatch, tmp_path, request):
+    local, gpu = request.param
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("selected-worker slots=2\n")
+    node = SimpleNamespace(host="selected-worker", gpu_ids=[gpu])
     placement = ModuleType("dss.ray_dss.placement.local")
-    placement.LocalPlacementBackend = lambda **kwargs: SimpleNamespace(
-        _pick_hosts=lambda width: [SimpleNamespace(host="selected-worker", gpu_ids=[gpu])]
-    )
+
+    def backend(*, hostfile):
+        assert hostfile == str(tmp_path / "hostfile")
+        return SimpleNamespace(_pick_hosts=lambda width: [node])
+
+    placement.LocalPlacementBackend = backend
     utilities = ModuleType("dss.ray_dss.utils")
     utilities.is_local = lambda host: local
     monkeypatch.setitem(sys.modules, placement.__name__, placement)
     monkeypatch.setitem(sys.modules, utilities.__name__, utilities)
-    monkeypatch.setattr(gateway, "_allocation_hostfile", lambda: tmp_path / "hostfile")
-    with pytest.raises(ValueError, match="nonlocal DSS worker installation"):
+    monkeypatch.setattr(gateway, "_allocation_hostfile", lambda: hostfile)
+    return SimpleNamespace(hostfile=hostfile, gpu=gpu)
+
+
+def test_owned_runtime_resolution_refuses_unverified_hostfile_placement(
+    recipe, installed_runtime, selected_hostfile_placement, monkeypatch
+):
+    config = recipe(accumulation=None)
+    before = untouched(config)
+    calls = []
+
+    def reject(request, hostfile):
+        calls.append(request)
+        assert hostfile == selected_hostfile_placement.hostfile
+        assert storage.parse_hostfile(hostfile)[0].host == "selected-worker"
+        raise ValueError("unverified allocation worker runtime")
+
+    monkeypatch.setattr(engine_admission, "_allocation_runtime_receipts", reject)
+    with pytest.raises(ValueError, match="unverified allocation worker runtime"):
         engine_admission._owned_local_engine_config(config, automatically_owned_local=True)
+    assert len(calls) == 1
     assert installed_runtime.calls == []
     assert untouched(config) == before
+
+
+@pytest.mark.parametrize("gpu_count", [1, 2])
+def test_owned_runtime_resolution_uses_verified_hostfile_placement(
+    recipe, installed_runtime, selected_hostfile_placement, monkeypatch, gpu_count
+):
+    config = recipe(accumulation=None)
+    before = untouched(config)
+    expected = gateway.training_client_config(config, CortexConfig(base_url="http://127.0.0.1:1")).to_cortex()[0]
+    resolved = {"bf16": {"enabled": True}, "data_types": {"grad_accum_dtype": "fp32"}}
+    calls = []
+
+    def receipts(request, hostfile):
+        calls.append(request)
+        assert hostfile == selected_hostfile_placement.hostfile
+        assert request == {"payload": expected, "n_gpus": config.n_gpus, "sp_size": config.sp_size}
+        return {"selected-worker": {"gpu_count": gpu_count, "resolved": copy.deepcopy(resolved)}}
+
+    monkeypatch.setattr(engine_admission, "_allocation_runtime_receipts", receipts)
+    if selected_hostfile_placement.gpu >= gpu_count:
+        with pytest.raises(ValueError, match="selected unavailable GPUs"):
+            engine_admission.validate_reference_accumulation(config, automatically_owned_local=True)
+    else:
+        engine_admission.validate_reference_accumulation(config, automatically_owned_local=True)
+    assert len(calls) == 1
+    assert installed_runtime.calls == []
+    assert untouched(config) == before
+
+
+def test_allocation_runtime_resolution_refuses_disagreeing_workers(monkeypatch, tmp_path):
+    layout = [SimpleNamespace(host=host, gpu_ids=[0]) for host in ("head", "worker")]
+    receipts = {
+        host: {"gpu_count": 1, "resolved": {"bf16": {"enabled": True}, "data_types": {"grad_accum_dtype": dtype}}}
+        for host, dtype in (("head", "fp32"), ("worker", "bf16"))
+    }
+    monkeypatch.setattr(engine_admission, "_allocation_runtime_receipts", lambda *args: receipts)
+    with pytest.raises(ValueError, match="workers resolve different submitted engine configurations"):
+        engine_admission._allocation_engine_configs({}, tmp_path / "hostfile", layout)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admitted", [False, True])
+async def test_gateway_runtime_scope_does_not_load_dss_for_nontraining_jobs(monkeypatch, tmp_path, admitted):
+    monkeypatch.delenv(engine_admission.RUNTIME_ADMISSION_ENV, raising=False)
+    if admitted:
+        monkeypatch.setenv(engine_admission.RUNTIME_ADMISSION_ENV, "{}")
+    monkeypatch.setattr(engine_admission.importlib, "import_module", forbidden)
+    calls = []
+
+    async def original(zone, config, job_id):
+        calls.append((zone, config, job_id))
+        return "created"
+
+    service = SimpleNamespace(_create_job_v0=original)
+    config = SimpleNamespace(training_config=None)
+    with engine_admission.gateway_runtime_scope(service, tmp_path / "unused-hostfile"):
+        assert await service._create_job_v0("zone", config, "child") == "created"
+    assert calls == [("zone", config, "child")]
+    assert service._create_job_v0 is original
+
+
+@pytest.mark.asyncio
+async def test_gateway_runtime_scope_loads_stage_info_only_for_admitted_training(monkeypatch, tmp_path):
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("worker slots=1\n")
+    receipt = {"host": "worker", "boot_id": "boot", "python": sys.executable, "python_sha256": "a" * 64, "sources": {}}
+    allocation = {
+        "nodes": [{"host": "worker", "slots": 1}],
+        "hostfile_sha256": hashlib.sha256(hostfile.read_bytes()).hexdigest(),
+        "runtime_receipts": {"worker": receipt},
+        "ssh": {"port": 22},
+    }
+    monkeypatch.setenv(engine_admission.RUNTIME_ADMISSION_ENV, json.dumps(allocation))
+    payload = {"job_id": "child", "training_config": {"ds_config": {"bf16": {"enabled": True}}}}
+    config = SimpleNamespace(job_id="child", num_gpus=1, training_config=SimpleNamespace(debug=None))
+    stripped = []
+    stage_info = ModuleType("dss.ray_dss.stage_info")
+
+    def strip(request):
+        stripped.append(request)
+        return SimpleNamespace(to_engine_dict=lambda job_id: copy.deepcopy(payload))
+
+    stage_info.strip_stage_info_from_job_config = strip
+    monkeypatch.setitem(sys.modules, stage_info.__name__, stage_info)
+    training = ModuleType("dss.ray_dss.jobs.gpu.training")
+    training.sp = SimpleNamespace(sp_size_of=lambda config: 1)
+    monkeypatch.setitem(sys.modules, training.__name__, training)
+    requests = []
+
+    def receipts(request, selected_hostfile, transport):
+        requests.append(request)
+        assert selected_hostfile == hostfile
+        assert transport == allocation["ssh"]
+        return allocation["runtime_receipts"]
+
+    monkeypatch.setattr(engine_admission, "_allocation_runtime_receipts", receipts)
+    calls = []
+
+    async def original(zone, request, job_id):
+        calls.append(request)
+        return "created"
+
+    service = SimpleNamespace(_create_job_v0=original)
+    zone = SimpleNamespace(nodes=[SimpleNamespace(host="worker", gpu_ids=[0])], zone_id="zone")
+    with engine_admission.gateway_runtime_scope(service, hostfile):
+        assert await service._create_job_v0(zone, config, "child") == "created"
+    assert stripped == calls == [config]
+    assert requests == [{"payload": payload, "n_gpus": 1, "sp_size": 1}]
+    admission = config.training_config.debug[engine_admission.RUNTIME_ADMISSION_KEY]
+    assert admission["training_child_id"] == "child"
+    assert admission["ranks"] == [("worker", 0)]
+    assert service._create_job_v0 is original
 
 
 @pytest.mark.parametrize("test_id", CHECKS)
