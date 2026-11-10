@@ -305,73 +305,6 @@ def tensor_digest(tensor: torch.Tensor, *, chunk_bytes: int = 8 * 1024 * 1024) -
     return digest.hexdigest()
 
 
-def model_state_manifest(engine, rank: int) -> dict:
-    model = engine.module
-    persistent_buffers = {
-        f"{prefix}.{name}" if prefix else name
-        for prefix, module in model.named_modules()
-        for name in module._buffers
-        if name not in module._non_persistent_buffers_set
-    }
-    entries = []
-    for kind, tensors in (("parameter", model.named_parameters()), ("buffer", model.named_buffers())):
-        for name, tensor in sorted(tensors):
-            entry = {
-                "name": name,
-                "kind": kind,
-                "shape": list(tensor.shape),
-                "dtype": str(tensor.dtype),
-                "requires_grad": bool(tensor.requires_grad),
-                "group_name": getattr(tensor, "group_name", None),
-                "allreduce": getattr(tensor, "allreduce", True),
-                "sha256": tensor_digest(tensor),
-            }
-            if kind == "buffer":
-                entry["persistent"] = name in persistent_buffers
-            entries.append(entry)
-    return {
-        "rank": int(rank),
-        "engine": {
-            "global_steps": int(engine.global_steps),
-            "has_moe_layers": bool(engine.has_moe_layers),
-            "num_experts": list(engine.num_experts),
-        },
-        "tensors": entries,
-    }
-
-
-class ModelStateCaptureMixin:
-    """Record local tensors immediately before save and after load when opted in."""
-
-    _model_state_output_dir = None
-
-    def _capture_model_state(self, phase: str) -> None:
-        if self._model_state_output_dir is None:
-            return
-        import deepspeed
-
-        manifest = model_state_manifest(self.engine, self.rank)
-        manifest["deepspeed_version"] = deepspeed.__version__
-        directory = Path(self._model_state_output_dir) / phase
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / f"rank-{self.rank:05d}.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        print(
-            f"MODEL_STATE phase={phase} rank={self.rank} tensors={len(manifest['tensors'])} "
-            f"has_moe_layers={manifest['engine']['has_moe_layers']} "
-            f"step={manifest['engine']['global_steps']} deepspeed={manifest['deepspeed_version']}",
-            flush=True,
-        )
-
-    def save_checkpoint(self, path: str, export_hf: bool = False) -> dict:
-        self._capture_model_state("before-save")
-        return super().save_checkpoint(path, export_hf=export_hf)
-
-    def load_checkpoint(self, path: str) -> int:
-        restored_step = super().load_checkpoint(path)
-        self._capture_model_state("after-load")
-        return restored_step
-
-
 _OPTIMIZER_CAPTURE_WORKER: Any | None = None
 
 
@@ -432,7 +365,7 @@ def _optimizer_capture_worker_class() -> Any:
     base_worker = deepspeed_worker_module.DeepSpeedWorker.__ray_metadata__.modified_class
 
     @ray.remote
-    class OptimizerCaptureDeepSpeedWorker(ModelStateCaptureMixin, base_worker):
+    class OptimizerCaptureDeepSpeedWorker(base_worker):
         """Add optimizer-state artifact capture for correctness harness jobs only."""
 
         def initialize(self, master_addr: str, job_config: dict) -> bool:
@@ -444,12 +377,6 @@ def _optimizer_capture_worker_class() -> Any:
                 if not os.path.isabs(optimizer_state_output_dir):
                     raise ValueError("debug.optimizer_state_output_dir must be an absolute path")
             self._optimizer_state_output_dir = optimizer_state_output_dir
-            model_state_output_dir = debug_config.get("model_state_output_dir")
-            if model_state_output_dir is not None:
-                model_state_output_dir = os.fspath(model_state_output_dir)
-                if not os.path.isabs(model_state_output_dir):
-                    raise ValueError("debug.model_state_output_dir must be an absolute path")
-            self._model_state_output_dir = model_state_output_dir
             adapter = debug_config.get("shared_peft_adapter")
             if adapter is None:
                 return super().initialize(master_addr, job_config)

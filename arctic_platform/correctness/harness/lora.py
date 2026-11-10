@@ -663,120 +663,6 @@ def original_adapter_files(
 
 
 @contextlib.contextmanager
-def native_worker_adapter_scope(
-    training_module,
-    files: dict[str, bytes],
-    expected_identity: dict,
-    expected_original_metadata: dict,
-    *,
-    job_id: str,
-    rank: int,
-):
-    """Wrap the actual worker's imported engine initializer before optimizer creation."""
-
-    if not isinstance(job_id, str) or not job_id.strip() or type(rank) is not int or rank < 0:
-        raise ValueError("native adapter scope requires an explicit job identity and nonnegative worker rank")
-    if (
-        not isinstance(files, dict)
-        or not {"adapter_config.json", "adapter_model.safetensors", "initialization.json"}
-        <= set(files)
-        <= set(_ORIGINAL_ADAPTER_FILES)
-        or any(not isinstance(raw, bytes) for raw in files.values())
-    ):
-        raise ValueError("original adapter transfer must contain only original pack bytes")
-    received = dict(files)
-    shared_identity = deepcopy(expected_identity)
-    original_metadata = deepcopy(expected_original_metadata)
-    original = training_module.initialize_training_engine
-    signature = inspect.signature(original)
-    if not {"model", "rank"} <= set(signature.parameters):
-        raise ValueError("native engine initializer must expose model and rank arguments")
-    if not _NATIVE_ADAPTER_SCOPE_LOCK.acquire(blocking=False):
-        raise ValueError("native adapter worker scope is already active")
-    scratch = None
-    installed = False
-    calls = 0
-    completed = None
-    receipt = {
-        "schema": "original-peft-worker-initialization-v1",
-        "job_id": job_id,
-        "rank": rank,
-        "engine_initializations": 0,
-    }
-    try:
-        scratch = correctness_workdir("original-peft-worker-")
-        with tempfile.TemporaryDirectory(prefix="adapter-", dir=scratch) as temporary:
-            path = Path(temporary)
-            for name, raw in received.items():
-                (path / name).write_bytes(raw)
-            _verify_original_adapter(path, shared_identity, original_metadata)
-
-            def check_binding():
-                if training_module.initialize_training_engine is not initialize_training_engine:
-                    raise ValueError("native engine initializer binding changed during adapter scope")
-
-            @wraps(original)
-            def initialize_training_engine(*args, **kwargs):
-                nonlocal calls, completed
-
-                from peft import get_peft_model_state_dict
-
-                calls += 1
-                if calls != 1:
-                    raise ValueError("native adapter engine initialization must be single-use per worker")
-                check_binding()
-                bound = signature.bind(*args, **kwargs)
-                if type(bound.arguments.get("rank")) is not int or bound.arguments["rank"] != rank:
-                    raise ValueError("native adapter engine rank differs from the selected worker")
-                model = bound.arguments["model"]
-                _verify_original_adapter(path, shared_identity, original_metadata)
-                shared_initialize_adapter(model, path, shared_identity)
-                _verify_original_adapter(path, shared_identity, original_metadata)
-                verified = verify_tensors(
-                    get_peft_model_state_dict(model, adapter_name="default"), original_metadata["initialization"]
-                )
-                check_binding()
-                result = original(*args, **kwargs)
-                check_binding()
-                _verify_original_adapter(path, shared_identity, original_metadata)
-                completed = {
-                    "schema": "original-peft-worker-initialization-v1",
-                    "job_id": job_id,
-                    "rank": rank,
-                    "engine_initializations": calls,
-                    "original_identity_sha256": original_metadata["identity_sha256"],
-                    "shared_identity": deepcopy(shared_identity),
-                    "initialization": verified,
-                }
-                receipt.clear()
-                receipt.update(deepcopy(completed))
-                return result
-
-            if training_module.initialize_training_engine is not original:
-                raise ValueError("native engine initializer binding changed before adapter scope")
-            training_module.initialize_training_engine = initialize_training_engine
-            installed = True
-            yield receipt
-            check_binding()
-            if calls != 1 or completed is None:
-                raise ValueError("native adapter worker requires exactly one successful engine initialization")
-            if receipt != completed:
-                raise ValueError("native adapter worker initialization receipt changed")
-            _verify_original_adapter(path, shared_identity, original_metadata)
-    finally:
-        # Restore without re-validating source: the constructor may have raised or changed the binding.
-        try:
-            if installed:
-                training_module.initialize_training_engine = original
-        finally:
-            try:
-                if scratch is not None:
-                    scratch.rmdir()
-            finally:
-                _NATIVE_ADAPTER_SCOPE_LOCK.release()
-
-
-@contextlib.contextmanager
 def worker_adapter_scope(object_ref, expected_identity: dict):
     """Receive identical bytes on each worker; no coordinator filesystem access."""
     import ray
@@ -1408,7 +1294,7 @@ def _runtime_sources(training) -> dict:
     return {
         "training": _source(training._DeepSpeedWorker.__init__),
         "engine": _source(training.initialize_training_engine),
-        "adapter": _source(shared_lora_adapter.native_worker_adapter_scope),
+        "adapter": _source(shared_lora_adapter.native_original_worker_adapter_scope),
         "lora": _source(lora.identity_metadata),
         "composition": _source(_runtime_sources),
         "native_adapter": _source(native_adapter.initialize_native_adapter),

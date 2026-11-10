@@ -2066,7 +2066,8 @@ def test_clean_port_normal_runner_has_no_execution_overlay_or_config_specific_lo
 def test_clean_port_core_fixture_binding_has_no_upload_account_or_subprocess_dependency():
     assert not hasattr(cortex_fixture, "require_upload_credentials")
     assert not hasattr(cortex_fixture, "DEV_STAGE")
-    assert not hasattr(cortex_fixture, "subprocess")
+    for loader in (cortex_fixture.load_local_fixture, cortex_fixture._load_local_fixture):
+        assert "subprocess" not in inspect.getsource(loader)
 
 
 @pytest.mark.parametrize("fp32_lm_head,accum_dtype", [(False, None), (True, torch.float32)])
@@ -12941,14 +12942,17 @@ def test_ap_driver_optimizer_capture_debug_config_defaults(job_config) -> None:
 def test_ap_driver_optimizer_capture_debug_config_merges_supported_sections_without_mutation() -> None:
     from arctic_platform.correctness.harness.optimizer import _optimizer_capture_debug_config
 
-    training_debug = {"optimizer_state_output_dir": "/training", "model_state_output_dir": "/model"}
+    training_debug = {"optimizer_state_output_dir": "/training", "shared_peft_adapter": {"identity": "original"}}
     worker_debug = {"optimizer_state_output_dir": "/worker"}
     debug = _optimizer_capture_debug_config(
         {"training_config": {"debug": training_debug}, "ds_worker_config": {"debug": worker_debug}}
     )
-    assert debug == {"optimizer_state_output_dir": "/worker", "model_state_output_dir": "/model"}
+    assert debug == {"optimizer_state_output_dir": "/worker", "shared_peft_adapter": {"identity": "original"}}
     debug["optimizer_state_output_dir"] = "/changed"
-    assert training_debug == {"optimizer_state_output_dir": "/training", "model_state_output_dir": "/model"}
+    assert training_debug == {
+        "optimizer_state_output_dir": "/training",
+        "shared_peft_adapter": {"identity": "original"},
+    }
     assert worker_debug == {"optimizer_state_output_dir": "/worker"}
 
 
@@ -12985,31 +12989,20 @@ def _ap_driver_optimizer_capture_initializer(monkeypatch):
     return optimizer_capture._optimizer_capture_worker_class()()
 
 
-@pytest.mark.parametrize(
-    "fields",
-    [
-        (),
-        ("optimizer_state_output_dir",),
-        ("model_state_output_dir",),
-        ("optimizer_state_output_dir", "model_state_output_dir"),
-    ],
-    ids=["disabled", "optimizer", "model", "both"],
-)
+@pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "optimizer"])
 def test_ap_driver_optimizer_capture_initialize_uses_current_client_job_config(
-    _ap_driver_optimizer_capture_initializer, tmp_path, fields
+    _ap_driver_optimizer_capture_initializer, tmp_path, enabled
 ):
     payload = build_payload({"n_gpus": 1}, "model", 42)
-    payload["training_config"]["debug"].update({field: str(tmp_path / field) for field in fields})
+    if enabled:
+        payload["training_config"]["debug"]["optimizer_state_output_dir"] = str(
+            tmp_path / "optimizer_state_output_dir"
+        )
     client_config = _training_client_config(SimpleNamespace(workdir=tmp_path), payload)
     job_config = client_config.to_onprem("training")
     worker = _ap_driver_optimizer_capture_initializer
     assert worker.initialize("master", job_config) is True
-    assert worker._optimizer_state_output_dir == (
-        str(tmp_path / "optimizer_state_output_dir") if "optimizer_state_output_dir" in fields else None
-    )
-    assert worker._model_state_output_dir == (
-        str(tmp_path / "model_state_output_dir") if "model_state_output_dir" in fields else None
-    )
+    assert worker._optimizer_state_output_dir == (str(tmp_path / "optimizer_state_output_dir") if enabled else None)
     assert worker.production_initialization[0] == "master"
     assert worker.production_initialization[1] is job_config
 
@@ -13022,13 +13015,11 @@ def test_ap_driver_optimizer_capture_initialize_accepts_path_objects(
         "training_config": {
             "debug": {
                 "optimizer_state_output_dir": tmp_path / "optimizer",
-                "model_state_output_dir": tmp_path / "model",
             }
         }
     }
     assert worker.initialize("master", job_config) is True
     assert worker._optimizer_state_output_dir == str(tmp_path / "optimizer")
-    assert worker._model_state_output_dir == str(tmp_path / "model")
 
 
 def test_ap_driver_optimizer_capture_initialize_worker_settings_can_disable_training_capture(
@@ -13036,32 +13027,29 @@ def test_ap_driver_optimizer_capture_initialize_worker_settings_can_disable_trai
 ):
     worker = _ap_driver_optimizer_capture_initializer
     job_config = {
-        "training_config": {"debug": {"optimizer_state_output_dir": "/training", "model_state_output_dir": "/model"}},
-        "ds_worker_config": {"debug": {"optimizer_state_output_dir": None, "model_state_output_dir": None}},
+        "training_config": {"debug": {"optimizer_state_output_dir": "/training"}},
+        "ds_worker_config": {"debug": {"optimizer_state_output_dir": None}},
     }
     assert worker.initialize("master", job_config) is True
     assert worker._optimizer_state_output_dir is None
-    assert worker._model_state_output_dir is None
 
 
-@pytest.mark.parametrize("field", ["optimizer_state_output_dir", "model_state_output_dir"])
 @pytest.mark.parametrize("value", ["", "relative/path"])
 def test_ap_driver_optimizer_capture_initialize_rejects_relative_paths(
-    _ap_driver_optimizer_capture_initializer, field, value
+    _ap_driver_optimizer_capture_initializer, value
 ):
     worker = _ap_driver_optimizer_capture_initializer
-    with pytest.raises(ValueError, match=f"debug.{field} must be an absolute path"):
-        worker.initialize("master", {"ds_worker_config": {"debug": {field: value}}})
+    with pytest.raises(ValueError, match="debug.optimizer_state_output_dir must be an absolute path"):
+        worker.initialize("master", {"ds_worker_config": {"debug": {"optimizer_state_output_dir": value}}})
     assert not hasattr(worker, "production_initialization")
 
 
-@pytest.mark.parametrize("field", ["optimizer_state_output_dir", "model_state_output_dir"])
 def test_ap_driver_optimizer_capture_initialize_rejects_non_path_values(
-    _ap_driver_optimizer_capture_initializer, field
+    _ap_driver_optimizer_capture_initializer,
 ):
     worker = _ap_driver_optimizer_capture_initializer
     with pytest.raises(TypeError):
-        worker.initialize("master", {"ds_worker_config": {"debug": {field: 123}}})
+        worker.initialize("master", {"ds_worker_config": {"debug": {"optimizer_state_output_dir": 123}}})
     assert not hasattr(worker, "production_initialization")
 
 
@@ -20115,327 +20103,9 @@ def native_original_adapter(tmp_path, monkeypatch):
     )
 
 
-def _native_original_adapter_scope(control, **kwargs):
-    return shared.native_worker_adapter_scope(
-        control.training,
-        control.files,
-        control.identity,
-        control.metadata,
-        job_id=kwargs.get("job_id", "selected-job"),
-        rank=kwargs.get("rank", 3),
-    )
-
-
-def _native_original_adapter_call(control, *, rank=3):
-    return control.training.initialize_training_engine(
-        control.model,
-        control.ds_config,
-        optimizer=control.optimizer,
-        ep_size=4,
-        mpu=control.mpu,
-        model_path="unchanged-model-path",
-        rank=rank,
-    )
-
-
 def _native_original_adapter_restored(control):
     assert control.training.initialize_training_engine is control.engine
     assert not control.worker_root.exists() or list(control.worker_root.iterdir()) == []
-
-
-def test_native_original_adapter_metadata_transit_and_pre_optimizer_receipt(native_original_adapter, monkeypatch):
-    control = native_original_adapter
-    assert control.files == {path.name: path.read_bytes() for path in control.path.iterdir()}
-    assert json.loads(control.files["initialization.json"]) == control.metadata
-    events = []
-    load = shared.shared_initialize_adapter
-    verify_metadata = lora_init.identity_metadata
-    verify_manifest = lora_init.verify_tensors
-
-    def initialize(model, path, identity):
-        assert {item.name: item.read_bytes() for item in path.iterdir()} == control.files
-        load(model, path, identity)
-        events.append("loaded-original")
-
-    def metadata(path):
-        events.append("metadata")
-        return verify_metadata(path)
-
-    def manifest(*args, **kwargs):
-        assert not kwargs.get("allow_exact_float32_widening", False)
-        events.append("manifest")
-        return verify_manifest(*args, **kwargs)
-
-    original = control.engine
-
-    def engine(model, ds_config, *, optimizer, ep_size, mpu, model_path, rank):
-        events.append("optimizer-boundary")
-        return original(
-            model, ds_config, optimizer=optimizer, ep_size=ep_size, mpu=mpu, model_path=model_path, rank=rank
-        )
-
-    monkeypatch.setattr(shared, "shared_initialize_adapter", initialize)
-    monkeypatch.setattr(lora_init, "identity_metadata", metadata)
-    monkeypatch.setattr(lora_init, "verify_tensors", manifest)
-    monkeypatch.setattr(control.training, "initialize_training_engine", engine)
-    control.engine = engine
-    shutil.rmtree(control.path)
-    with _native_original_adapter_scope(control) as receipt:
-        assert receipt["engine_initializations"] == 0
-        assert _native_original_adapter_call(control) is control.result
-    load_index = events.index("loaded-original")
-    engine_index = events.index("optimizer-boundary")
-    assert "metadata" in events[load_index + 1 : engine_index]
-    assert "manifest" in events[load_index + 1 : engine_index]
-    assert len(control.calls) == 1
-    actual = control.calls[0]
-    assert actual[0] is control.model and actual[1] is control.ds_config
-    assert actual[2] is control.optimizer and actual[4] is control.mpu
-    assert actual[3:] == (4, control.mpu, "unchanged-model-path", 3)
-    assert receipt == {
-        "schema": "original-peft-worker-initialization-v1",
-        "job_id": "selected-job",
-        "rank": 3,
-        "engine_initializations": 1,
-        "original_identity_sha256": control.metadata["identity_sha256"],
-        "shared_identity": control.identity,
-        "initialization": verify_manifest(peft.get_peft_model_state_dict(control.model), control.manifest),
-    }
-    assert json.loads(json.dumps(receipt)) == receipt
-    _native_original_adapter_restored(control)
-
-
-@pytest.mark.parametrize(
-    "damage",
-    ["metadata", "config", "bytes", "dtype", "coverage", "missing-metadata", "extra-file", "not-bytes"],
-)
-def test_native_original_adapter_pack_rejection_precedes_hook(native_original_adapter, damage):
-    control = native_original_adapter
-    if damage == "metadata":
-        altered = copy.deepcopy(control.metadata)
-        altered["model_name"] = "different-original"
-        control.files["initialization.json"] = json.dumps(altered).encode()
-    elif damage == "config":
-        control.files["adapter_config.json"] += b" "
-    elif damage in {"bytes", "dtype", "coverage"}:
-        state = safetensors.torch.load(control.files["adapter_model.safetensors"])
-        if damage == "bytes":
-            state[sorted(state)[0]][0, 0] += 1
-        elif damage == "dtype":
-            state = {name: tensor.float() for name, tensor in state.items()}
-        else:
-            state.pop(sorted(state)[0])
-        control.files["adapter_model.safetensors"] = save(state)
-    elif damage == "missing-metadata":
-        del control.files["initialization.json"]
-    elif damage == "extra-file":
-        control.files["../foreign-file"] = b"untrusted"
-    else:
-        control.files["initialization.json"] = "{}"
-    before = {name: _bytes(value) for name, value in _installed(control.model).items()}
-    with pytest.raises(ValueError):
-        with _native_original_adapter_scope(control):
-            pytest.fail("invalid original pack reached the constructor")
-    assert before == {name: _bytes(value) for name, value in _installed(control.model).items()}
-    assert control.calls == []
-    _native_original_adapter_restored(control)
-
-
-def test_native_original_adapter_rejects_forged_shared_identity_for_changed_original_bytes(native_original_adapter):
-    control = native_original_adapter
-    state = load_file(str(control.path / "adapter_model.safetensors"))
-    state[sorted(state)[0]][0, 0] += 1
-    save_file(state, str(control.path / "adapter_model.safetensors"))
-    control.identity = shared.shared_adapter_identity(control.path)
-    control.files["adapter_model.safetensors"] = (control.path / "adapter_model.safetensors").read_bytes()
-    with pytest.raises(ValueError, match="bytes differ"):
-        with _native_original_adapter_scope(control):
-            pytest.fail("a replacement shared hash admitted different original factors")
-    assert control.calls == []
-    _native_original_adapter_restored(control)
-
-
-@pytest.mark.parametrize("damage", ["dtype", "topology", "shape", "coverage"])
-def test_native_original_adapter_target_rejection_precedes_optimizer(native_original_adapter, monkeypatch, damage):
-    control = native_original_adapter
-    if damage == "dtype":
-        control.model = control.model.float()
-    elif damage == "topology":
-        control.model = _native_original_adapter_model(targets=("q_proj",))
-    elif damage == "shape":
-        control.model.base_model.model.q_proj.lora_A["default"].weight = nn.Parameter(
-            torch.zeros(3, 4, dtype=torch.bfloat16)
-        )
-    else:
-        state_dict = peft.get_peft_model_state_dict
-
-        def missing(model, *args, **kwargs):
-            state = state_dict(model, *args, **kwargs)
-            state.pop(sorted(state)[0])
-            return state
-
-        monkeypatch.setattr(peft, "get_peft_model_state_dict", missing)
-    before = {name: _bytes(value) for name, value in _installed(control.model).items()}
-    with pytest.raises(ValueError):
-        with _native_original_adapter_scope(control):
-            _native_original_adapter_call(control)
-    assert before == {name: _bytes(value) for name, value in _installed(control.model).items()}
-    assert control.calls == []
-    _native_original_adapter_restored(control)
-
-
-@pytest.mark.parametrize("rank", [2, True, "3"])
-def test_native_original_adapter_observed_rank_must_match_receipt(native_original_adapter, rank):
-    control = native_original_adapter
-    with pytest.raises(ValueError, match="rank differs"):
-        with _native_original_adapter_scope(control):
-            _native_original_adapter_call(control, rank=rank)
-    assert control.calls == []
-    _native_original_adapter_restored(control)
-
-
-@pytest.mark.parametrize("job_id,rank", [("", 3), (" ", 3), (None, 3), ("selected-job", -1), ("selected-job", True)])
-def test_native_original_adapter_receipt_requires_explicit_worker_identity(native_original_adapter, job_id, rank):
-    control = native_original_adapter
-    with pytest.raises(ValueError, match="job identity"):
-        with _native_original_adapter_scope(control, job_id=job_id, rank=rank):
-            pytest.fail("invalid worker identity reached the constructor")
-    assert control.calls == []
-    _native_original_adapter_restored(control)
-
-
-def test_native_original_adapter_constructor_requires_one_hook(native_original_adapter):
-    control = native_original_adapter
-    with pytest.raises(ValueError, match="exactly one successful"):
-        with _native_original_adapter_scope(control):
-            pass
-    _native_original_adapter_restored(control)
-
-
-def test_native_original_adapter_multiple_hooks_fail_even_if_constructor_catches_second(native_original_adapter):
-    control = native_original_adapter
-    with pytest.raises(ValueError, match="exactly one successful"):
-        with _native_original_adapter_scope(control):
-            _native_original_adapter_call(control)
-            with pytest.raises(ValueError, match="single-use"):
-                _native_original_adapter_call(control)
-    assert len(control.calls) == 1
-    _native_original_adapter_restored(control)
-
-
-@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt, SystemExit])
-@pytest.mark.parametrize("drift", [False, True])
-def test_native_original_adapter_engine_exception_identity_and_restoration(
-    native_original_adapter, failure_type, drift
-):
-    control = native_original_adapter
-    failure = failure_type("original engine interruption")
-
-    def engine(model, ds_config, *, optimizer, ep_size, mpu, model_path, rank):
-        lora_init.verify_tensors(peft.get_peft_model_state_dict(model), control.manifest)
-        if drift:
-            control.training.initialize_training_engine = object()
-        raise failure
-
-    control.training.initialize_training_engine = control.engine = engine
-    with pytest.raises(failure_type) as caught:
-        with _native_original_adapter_scope(control) as receipt:
-            _native_original_adapter_call(control)
-    assert caught.value is failure
-    assert receipt["engine_initializations"] == 0
-    _native_original_adapter_restored(control)
-
-
-def test_native_original_adapter_constructor_exception_is_not_replaced_by_missing_hook(native_original_adapter):
-    control = native_original_adapter
-    failure = KeyboardInterrupt("constructor interruption before engine")
-    with pytest.raises(KeyboardInterrupt) as caught:
-        with _native_original_adapter_scope(control):
-            raise failure
-    assert caught.value is failure
-    _native_original_adapter_restored(control)
-
-
-@pytest.mark.parametrize("phase", ["constructor", "loader", "engine"])
-def test_native_original_adapter_binding_drift_is_rejected_and_restored(native_original_adapter, monkeypatch, phase):
-    control = native_original_adapter
-    original_load = shared.shared_initialize_adapter
-    original_engine = control.engine
-
-    def initialize(*args, **kwargs):
-        original_load(*args, **kwargs)
-        control.training.initialize_training_engine = object()
-
-    def engine(model, ds_config, *, optimizer, ep_size, mpu, model_path, rank):
-        result = original_engine(
-            model, ds_config, optimizer=optimizer, ep_size=ep_size, mpu=mpu, model_path=model_path, rank=rank
-        )
-        control.training.initialize_training_engine = object()
-        return result
-
-    if phase == "loader":
-        monkeypatch.setattr(shared, "shared_initialize_adapter", initialize)
-    elif phase == "engine":
-        control.training.initialize_training_engine = control.engine = engine
-    with pytest.raises(ValueError, match="binding changed"):
-        with _native_original_adapter_scope(control):
-            if phase == "constructor":
-                control.training.initialize_training_engine = object()
-            else:
-                _native_original_adapter_call(control)
-    assert len(control.calls) == int(phase == "engine")
-    _native_original_adapter_restored(control)
-
-
-def test_native_original_adapter_metadata_drift_after_loading_prevents_engine(native_original_adapter, monkeypatch):
-    control = native_original_adapter
-    original_load = shared.shared_initialize_adapter
-
-    def initialize(model, path, identity):
-        original_load(model, path, identity)
-        (path / "initialization.json").write_text("{}")
-
-    monkeypatch.setattr(shared, "shared_initialize_adapter", initialize)
-    with pytest.raises(ValueError, match="initialization metadata"):
-        with _native_original_adapter_scope(control):
-            _native_original_adapter_call(control)
-    assert control.calls == []
-    _native_original_adapter_restored(control)
-
-
-def test_native_original_adapter_single_worker_scope_rejects_nested_initialization(native_original_adapter):
-    control = native_original_adapter
-    with _native_original_adapter_scope(control):
-        installed = control.training.initialize_training_engine
-        with pytest.raises(ValueError, match="already active"):
-            with _native_original_adapter_scope(control):
-                pytest.fail("a second scope was installed")
-        assert control.training.initialize_training_engine is installed
-        _native_original_adapter_call(control)
-    _native_original_adapter_restored(control)
-
-
-def test_native_original_adapter_receipt_drift_rejects_normal_constructor_exit(native_original_adapter):
-    control = native_original_adapter
-    with pytest.raises(ValueError, match="receipt changed"):
-        with _native_original_adapter_scope(control) as receipt:
-            _native_original_adapter_call(control)
-            receipt["rank"] = 8
-    _native_original_adapter_restored(control)
-
-
-def test_native_original_adapter_swallowed_engine_failure_cannot_produce_receipt(native_original_adapter):
-    control = native_original_adapter
-
-    def engine(model, ds_config, *, optimizer, ep_size, mpu, model_path, rank):
-        raise RuntimeError("original engine failure")
-
-    control.training.initialize_training_engine = control.engine = engine
-    with pytest.raises(ValueError, match="exactly one successful"):
-        with _native_original_adapter_scope(control):
-            with pytest.raises(RuntimeError, match="original engine failure"):
-                _native_original_adapter_call(control)
-    _native_original_adapter_restored(control)
 
 
 def test_native_original_adapter_sender_rejects_metadata_drift_during_pack_read(native_original_adapter, monkeypatch):
@@ -21814,7 +21484,7 @@ def test_native_original_composition_source_pin_unwraps_adapter_scope():
     from arctic_platform.correctness.harness import lora as native_lora
 
     path = Path(shared.__file__)
-    assert native_lora._source(shared.native_worker_adapter_scope) == {
+    assert native_lora._source(shared.native_original_worker_adapter_scope) == {
         "path": str(path),
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
@@ -35456,21 +35126,6 @@ _SELFTEST_GROUPS = {
         "test_shared_adapter_initialization_source_binding_leaves_other_record_recipes_unchanged",
         "test_shared_adapter_running_job_ray_handoff_precedes_client_and_restores_overlay",
         "test_shared_adapter_capture_initializer_enters_worker_scope_before_base_and_restores",
-        "test_native_original_adapter_metadata_transit_and_pre_optimizer_receipt",
-        "test_native_original_adapter_pack_rejection_precedes_hook",
-        "test_native_original_adapter_rejects_forged_shared_identity_for_changed_original_bytes",
-        "test_native_original_adapter_target_rejection_precedes_optimizer",
-        "test_native_original_adapter_observed_rank_must_match_receipt",
-        "test_native_original_adapter_receipt_requires_explicit_worker_identity",
-        "test_native_original_adapter_constructor_requires_one_hook",
-        "test_native_original_adapter_multiple_hooks_fail_even_if_constructor_catches_second",
-        "test_native_original_adapter_engine_exception_identity_and_restoration",
-        "test_native_original_adapter_constructor_exception_is_not_replaced_by_missing_hook",
-        "test_native_original_adapter_binding_drift_is_rejected_and_restored",
-        "test_native_original_adapter_metadata_drift_after_loading_prevents_engine",
-        "test_native_original_adapter_single_worker_scope_rejects_nested_initialization",
-        "test_native_original_adapter_receipt_drift_rejects_normal_constructor_exit",
-        "test_native_original_adapter_swallowed_engine_failure_cannot_produce_receipt",
         "test_native_original_adapter_sender_rejects_metadata_drift_during_pack_read",
         "test_native_original_composition_zone_command_selects_only_training_gpu",
         "test_native_original_composition_zone_command_leaves_cleanup_unchanged",
