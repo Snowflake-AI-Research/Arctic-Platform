@@ -77,6 +77,32 @@ MEDIA_KINDS = (IMAGE_MEDIA, VIDEO_MEDIA)
 MEDIA_KEYS = frozenset(key for kind in MEDIA_KINDS for key in kind.keys)
 
 
+class MediaStraddleError(ValueError):
+    """A media item's tokens straddle a window boundary, so no window can hold the item whole.
+
+    A ValueError, so callers that catch ValueError still do; a caller that must tell this refusal from other
+    malformed media (to change its layout and retry, say) catches this instead of matching the message.
+    ``kind`` is the media kind's name (``"image"`` or ``"video"``), ``index`` the item's position among that
+    kind's items in the call, ``span`` its ``(start, end)`` token range and ``boundary`` the token it crosses.
+    """
+
+    def __init__(self, kind: str, index: int, span: Tuple[int, int], boundary: int) -> None:
+        start, end = span
+        super().__init__(
+            f"{kind} {index}'s tokens [{start}, {end}) straddle the window boundary at token {boundary}; "
+            "each window would get all its pixels but only part of its tokens. Move the boundary off "
+            "the item: pad or reorder the text before it so it sits inside one window"
+        )
+        self.kind = kind
+        self.index = index
+        self.span = (start, end)
+        self.boundary = boundary
+
+    def __reduce__(self):
+        # Rebuild from the attributes, not the message, so the error survives a trip across processes.
+        return type(self), (self.kind, self.index, self.span, self.boundary)
+
+
 def split_media(batch: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """``batch`` without its media leaves, and the media leaves alone.
 
@@ -271,10 +297,10 @@ def window_media(
     """The media one ``[start, end)`` token window needs: every item whose span sits inside it, whole.
 
     An item whose span straddles a window boundary -- some of its tokens before it and some at or after it -- is
-    refused with a ValueError naming the item, its span and the boundary. ``boundaries`` are the token offsets
-    where the call's windows meet, so that every window of one call refuses the same straddle; they default to
-    this window's own ``start`` and ``end``. To avoid a straddle, move the boundary off the item: pad or reorder
-    the text before the item so it lands wholly in one window.
+    refused with a ``MediaStraddleError`` naming the item, its span and the boundary. ``boundaries`` are the token
+    offsets where the call's windows meet, so that every window of one call refuses the same straddle; they
+    default to this window's own ``start`` and ``end``. To avoid a straddle, move the boundary off the item: pad or
+    reorder the text before the item so it lands wholly in one window.
 
     A kind with no item in the window keeps its keys, with zero items, so every window of a call carries the
     same set of leaves.
@@ -295,11 +321,7 @@ def window_media(
         for item, (start, end) in enumerate(spans.tolist()):
             for cut in cuts:
                 if start < cut < end:
-                    raise ValueError(
-                        f"{kind.name} {item}'s tokens [{start}, {end}) straddle the window boundary at token {cut}; "
-                        "each window would get all its pixels but only part of its tokens. Move the boundary off "
-                        "the item: pad or reorder the text before it so it sits inside one window"
-                    )
+                    raise MediaStraddleError(kind.name, item, (start, end), cut)
         inside = torch.nonzero((spans[:, 0] >= window_start) & (spans[:, 1] <= window_end)).flatten()
         patch_counts = _patch_counts(grid)
         patch_starts = torch.cumsum(patch_counts, dim=0) - patch_counts

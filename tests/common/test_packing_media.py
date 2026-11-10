@@ -15,9 +15,12 @@
 
 """Row-owned media through row selection, packing, padding and token windows: pure tensors, no model."""
 
+import pickle
+
 import pytest
 import torch
 
+from arctic_platform.common.packing import MediaStraddleError
 from arctic_platform.common.packing import cu_seqlens_from_position_ids
 from arctic_platform.common.packing import media_token_spans
 from arctic_platform.common.packing import mrope_position_ids
@@ -232,6 +235,37 @@ def test_an_image_straddling_a_window_boundary_is_refused_on_every_window(shard_
     packed, metadata = pad_packed_microbatch(*pack_microbatch(_batch()), 4)
     with pytest.raises(ValueError, match=r"image 0's tokens \[1, 5\) straddle the window boundary at token 4"):
         token_shard(packed, metadata, 4, shard_index, spatial_merge_size=MERGE)
+
+
+@pytest.mark.parametrize(
+    "rows, kind, shard_count, index, span, boundary",
+    [
+        # Four windows of four tokens: image A at [1, 5) crosses 4.
+        (ROWS, "image", 4, 0, (1, 5), 4),
+        # Four windows of four tokens: video 0 at [4, 8) fits the second, video 1 at [9, 13) crosses 12.
+        ([([0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0], [[1, 4, 4], [1, 4, 4]])], "video", 4, 1, (9, 13), 12),
+    ],
+    ids=["image", "video"],
+)
+def test_a_straddle_raises_a_typed_error_naming_the_item(rows, kind, shard_count, index, span, boundary):
+    packed, metadata = pad_packed_microbatch(*pack_microbatch(_batch(rows=rows, kind=kind)), shard_count)
+    for shard_index in range(shard_count):
+        with pytest.raises(MediaStraddleError) as raised:
+            token_shard(packed, metadata, shard_count, shard_index, spatial_merge_size=MERGE)
+        error = raised.value
+        assert isinstance(error, ValueError)
+        assert (error.kind, error.index, error.span, error.boundary) == (kind, index, span, boundary)
+        # The same message as before, so callers matching the text still match.
+        start, end = span
+        assert str(error).startswith(f"{kind} {index}'s tokens [{start}, {end}) straddle the window boundary at token")
+
+
+def test_a_straddle_error_survives_pickling():
+    error = pickle.loads(pickle.dumps(MediaStraddleError("video", 1, (9, 13), 12)))
+
+    assert isinstance(error, MediaStraddleError)
+    assert (error.kind, error.index, error.span, error.boundary) == ("video", 1, (9, 13), 12)
+    assert str(error) == str(MediaStraddleError("video", 1, (9, 13), 12))
 
 
 def test_window_media_alone_checks_its_own_boundaries_unless_given_the_calls():
