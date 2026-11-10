@@ -525,6 +525,99 @@ def test_publish_outcome_needs_nothing_for_a_restore_from_the_mirror():
     assert publish.publish_outcome(lines)["status"].startswith("already published")
 
 
+_DUMPED = _engine_log(f"resolved model_dir={_KEY} (config=...)", "cache miss -- cold-starting",
+                      f"dump complete model_dir={_KEY} in 412.0s", f"restore complete model_dir={_KEY} gpus=[0]",
+                      f"publishing {_KEY} to s3://bucket (log /tmp/x.log): python3 ...")
+_PUBLISHED = [f"12:30:00 [r0 engine] semi_p: published {_KEY} in 1485s:",
+              "  skeleton s3://b/image-cache/M/skeleton/aaaaaaaaaaaa_bbbbbbbbbbbb_cccccccccccc/ expect it on every node"]
+
+
+class _PublishJob:
+    """A client whose log a read from the job's start serves as ``pages``, then
+    an empty page, as a stalled tail does. ``newest[t]`` is the newest page at
+    poll ``t`` (each sleep is a poll); from poll ``ended_at`` the job is
+    TERMINATED by idle_timeout, and after ``readable`` successful log reads
+    every read, and the cancel, answer 409 Conflict."""
+
+    def __init__(self, pages, newest=None, ended_at=None, readable=10**9, execution=()):
+        self.pages, self.newest, self.ended_at, self.readable = pages, newest or {}, ended_at, readable
+        self.execution = list(execution)
+        self.tick = 0
+
+    def sleep(self, _seconds):
+        self.tick += 1
+
+    def _conflict(self):
+        return RuntimeError("409 Client Error: Conflict for url: .../operation")
+
+    def get_job(self, _job_id):
+        ended = self.ended_at is not None and self.tick >= self.ended_at
+        return {"status": "TERMINATED" if ended else "RUNNING", "reason": "idle_timeout" if ended else None,
+                "created_at": "2026-11-10T18:42:13Z"}
+
+    def tail_logs(self, _job_id, cursor=None, max_lines=None, sub_job_type=None):
+        if self.readable <= 0:
+            raise self._conflict()
+        self.readable -= 1
+        if cursor is None:
+            lines = self.newest.get(self.tick, [])
+            return {"entries": [{"msg": line} for line in lines], "next_cursor": "p0"}
+        i = int(cursor[1:]) if cursor.startswith("p") else 0
+        if i < len(self.pages):
+            return {"entries": [{"msg": line} for line in self.pages[i]], "next_cursor": f"p{i + 1}"}
+        return {"entries": [], "next_cursor": cursor}
+
+    def fetch_execution_logs(self, _job_id):
+        return [{"filename": "execution.jsonl", "content": "\n".join(self.execution)}]
+
+    def create_job_from_body(self, _body):
+        return {"job_id": "job-1"}
+
+    def cancel_job(self, _job_id):
+        raise self._conflict()
+
+
+def _publisher(monkeypatch, tmp_path, service):
+    from arctic_platform.inference.semi_persistence.onboarding import publish
+
+    monkeypatch.setattr(publish, "make_client", lambda _config: service)
+    monkeypatch.setattr(publish.time, "sleep", service.sleep)
+    monkeypatch.delenv("CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS", raising=False)
+    return publish.Publisher({"config": "conn.json", "image_tag": "dev_X", "models": "qwen36-35b-a3b-tp1",
+                              "out_dir": str(tmp_path)})
+
+
+def test_publish_reads_the_newest_lines_when_the_tail_stalls(monkeypatch, tmp_path):
+    service = _PublishJob([_DUMPED[:3], _DUMPED[3:]], newest={1: _DUMPED[-1:], 2: _DUMPED[-1:] + _PUBLISHED})
+    out = _publisher(monkeypatch, tmp_path, service).wait_published("m", "job-1", deadline=float("inf"))
+    assert out["status"] == "published" and out["key_dir"] == _KEY and out["weight_hash"] == "cccccccccccc"
+    assert service.tick == 2
+
+
+def test_publish_keeps_a_published_line_read_before_the_409(monkeypatch, tmp_path):
+    # The job has ended: the read gets two pages, the second with the line, then 409.
+    service = _PublishJob([_DUMPED, _PUBLISHED], ended_at=0, readable=2)
+    out = _publisher(monkeypatch, tmp_path, service).wait_published("m", "job-1", deadline=float("inf"))
+    assert out["status"] == "published" and out["publish_s"] == 1485
+
+
+def test_publish_after_idle_timeout_with_no_evidence_is_unknown(monkeypatch, tmp_path):
+    service = _PublishJob([_DUMPED], ended_at=1, readable=2)
+    publisher = _publisher(monkeypatch, tmp_path, service)
+    res = publisher.prepare("qwen36-35b-a3b-tp1")
+    assert res["status"].startswith("unknown: the job ended terminated (idle_timeout) while the engine was "
+                                    f"uploading {_KEY}")
+    assert res["key_dir"] == _KEY
+    assert (tmp_path / "dev_X" / "qwen36-35b-a3b-tp1.log").read_text().splitlines() == _DUMPED
+
+
+def test_publish_after_idle_timeout_reads_the_archived_execution_logs(monkeypatch, tmp_path):
+    archived = [json.dumps({"msg": line}) for line in _PUBLISHED]
+    service = _PublishJob([_DUMPED], ended_at=1, readable=2, execution=archived)
+    out = _publisher(monkeypatch, tmp_path, service).wait_published("m", "job-1", deadline=float("inf"))
+    assert out["status"] == "published" and out["skeleton"] == "aaaaaaaaaaaa_bbbbbbbbbbbb_cccccccccccc"
+
+
 def _fake_kubectl(ready_after):
     """kubectl that reports 3 cache nodes, and each label ready once polled ``ready_after`` times."""
     from types import SimpleNamespace

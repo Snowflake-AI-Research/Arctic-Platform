@@ -159,7 +159,11 @@ python -m arctic_platform.inference.semi_persistence.onboarding.publish config=c
 
 It submits one job per model with the flag, waits for the engine's
 `semi_p: published` line in the sub-job log (or a restore from an image that is
-published already), saves the log and cancels the job. Results are in
+published already), saves the log and cancels the job. If the job ends first
+(an idle timeout can end it while the upload runs on) and neither its sub-job
+log nor its archived execution logs say how the publish went, the model's
+status is `unknown`, not `FAILED`: look for the skeleton in the bucket or for
+the `semi_p: published` line in the device-manager pod's log. Results are in
 `onboarding_reports/publish/<image_tag>/summary.json`; a re-run for some models
 keeps the other models' entries. Publishing ends with the upload: `onboard` is the
 one that waits for the nodes to verify the image. Then point the models' entries in
