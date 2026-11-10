@@ -29,12 +29,18 @@ published skeleton and weights on every node (see verify.py), since on_hit
 cannot restore from a node that has not.
 
 on_hit and off_default run copies x the published layout and are compared for
-throughput and latency; that runs first, while on_miss may still be dumping.
-Then every check sends the same requests to every job: on_miss and off_matched
-must match on_hit token for token, and off_default's differences are reported
-with where they start. Start-up phases come from the logs; all jobs are then
-cancelled and a report written. With several models, they run concurrently
-within ``max_gpus``, largest first.
+throughput and latency. Every job gets the same correctness requests: on_miss
+and off_matched must match on_hit token for token, and off_default's
+differences are reported with where they start.
+
+Each job is served on its own thread: as soon as it is running it is measured
+and answers every request, its logs are read and it is cancelled, so a job that
+is up does not hold its GPUs while another is still starting (or dumping).
+Once every job is done the checks compare the stored results, start-up phases
+come from the logs, and a report is written. A job that fails to start drops
+out of the comparison and the report lists what it did not measure; a failed
+on_hit stops the others, since nothing can be compared with it. With several
+models, they run concurrently within ``max_gpus``, largest first.
 
 Arguments (``key=value``):
   config           connection file (required)
@@ -61,7 +67,7 @@ Arguments (``key=value``):
                    attach to running jobs instead (one model only; kept)
   log_files_on / log_files_off   saved GPU pod logs of on_hit / off_default (files
                    or directories); they add the per-step restore breakdown
-  timeout_s        how long to wait for the jobs to run (default 3600)
+  timeout_s        how long each job may take to reach running (default 3600)
   publish_dir      where publish wrote <image_tag>/summary.json, which names each
                    model's skeleton and weights (default <out_dir>/publish)
   verify_timeout_s how long to wait for them to be verified on every node
@@ -91,6 +97,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
@@ -102,7 +109,6 @@ from arctic_platform.inference.semi_persistence.onboarding import perf
 from arctic_platform.inference.semi_persistence.onboarding import report
 from arctic_platform.inference.semi_persistence.onboarding import startup
 from arctic_platform.inference.semi_persistence.onboarding import verify
-from arctic_platform.inference.semi_persistence.onboarding.common import Pair
 from arctic_platform.inference.semi_persistence.onboarding.common import as_bool
 from arctic_platform.inference.semi_persistence.onboarding.common import parse_kv_args
 from arctic_platform.inference.semi_persistence.onboarding.jobs import GPUS_PER_NODE
@@ -117,15 +123,36 @@ from arctic_platform.inference.semi_persistence.onboarding.jobs import plan_vari
 from arctic_platform.inference.semi_persistence.onboarding.jobs import resolve_image_tag
 from arctic_platform.inference.semi_persistence.onboarding.jobs import copies_for
 from arctic_platform.inference.semi_persistence.onboarding.jobs import timeline
-from arctic_platform.inference.semi_persistence.onboarding.jobs import wait_running
+from arctic_platform.inference.semi_persistence.onboarding.jobs import wait_until_running
 from arctic_platform.inference.semi_persistence.onboarding.client import enable_debug_options
 from arctic_platform.inference.semi_persistence.onboarding.client import make_client
 
 logger = logging.getLogger(__name__)
 
 
+PERF_SIDES = {"on_hit": "on", "off_default": "off", "off_matched": "matched"}
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def job_replicas(spec: ModelSpec, copies: int, variants: list[str]) -> dict[str, int]:
+    """Replicas per job: the perf jobs run ``copies`` x the published layout."""
+    return {v: spec.replicas * (copies if v in PERF_VARIANTS else 1) for v in variants}
+
+
+@dataclass
+class JobRun:
+    """One of a model's jobs, and what it returned before it was cancelled."""
+
+    tracker: JobTracker
+    error: str = ""
+    perf: dict | None = None
+    answers: dict | None = None
+    logs: dict | None = None
+    served: bool = False
+    released: bool = False
 
 
 def analyze_startup(on_api: dict, off_api: dict, on_pods: dict, off_pods: dict) -> dict:
@@ -161,6 +188,7 @@ class Runner:
         self.reserve_gpus = int(args.get("reserve_gpus", "0"))
         self.gpus_per_node = int(args.get("gpus_per_node", str(GPUS_PER_NODE)))
         self.pre_cancel_hook = args.get("pre_cancel_hook") or None
+        self.poll_s = 5.0
         Path(self.out_dir).expanduser().mkdir(parents=True, exist_ok=True)
         self.ledger = Path(self.out_dir).expanduser() / f"jobs-{utc_now().replace(':', '').replace('-', '')}.jsonl"
         self.live: dict[str, str] = {}
@@ -246,7 +274,7 @@ class Runner:
         }
         client = self.fast_client()
         attached = bool(self.attach)
-        trackers: dict[str, JobTracker] = {}
+        runs: dict[str, JobRun] = {}
         try:
             miss_cache = (f"{self.miss_image_cache.rstrip('/')}/{report.stem(result)}"
                           if self.miss_image_cache else None)
@@ -262,81 +290,165 @@ class Runner:
                 self.wait_for_capacity(self.footprint(spec)[0], spec.name)
             for v in variants:
                 if attached:
-                    trackers[v] = JobTracker(v, self.attach[v], time.time())
+                    runs[v] = JobRun(JobTracker(v, self.attach[v], time.time()))
                     continue
                 submitted = time.time()
-                trackers[v] = JobTracker(v, client.create_job_from_body(bodies[v])["job_id"], submitted)
-                self.submitted(trackers[v].job_id, spec, v)
-                logger.info("submitted %s job %s", v, trackers[v].job_id)
-            result["jobs"] = {v: t.job_id for v, t in trackers.items()}
-            result["on_job_id"], result["off_job_id"] = trackers["on_hit"].job_id, trackers["off_default"].job_id
-
-            # The perf jobs first: on_miss may still be cold-starting and dumping.
-            wait_running(client, [trackers[v] for v in variants if v in PERF_VARIANTS], self.timeout_s)
-            restore = startup.restore_report(startup.collect_logs(client, trackers["on_hit"].job_id),
-                                             startup.read_files(self.log_files["on"]))
-            result["startup"] = {"semi_p": restore}
-            if restore["cache_miss"] and self.require_restore:
-                raise RuntimeError("semi_p job cold-started (cache miss); publish this config's image first, "
-                                   "or pass require_restore=false")
-            if "perf" in self.checks:
-                pair = Pair(on=trackers["on_hit"].job_id, off=trackers["off_default"].job_id,
-                            replicas=spec.replicas * copies, max_seq_len=spec.max_seq_len)
-                matched = trackers["off_matched"].job_id if "off_matched" in trackers else None
-                result["perf"] = perf.run(self.fast_client, pair, spec.perf, spec.thresholds, matched)
-
-            if "correctness" in self.checks:
-                rest = [trackers[v] for v in variants if v not in PERF_VARIANTS]
-                wait_running(client, rest, self.timeout_s)
-                gated = self.gated_variants(client, trackers, result)
-                replicas = {v: spec.replicas * (copies if v in PERF_VARIANTS else 1) for v in variants}
-                result["correctness"] = correctness.run(client, {v: t.job_id for v, t in trackers.items()},
-                                                        "on_hit", gated, replicas, spec.max_seq_len,
-                                                        spec.correctness)
+                runs[v] = JobRun(JobTracker(v, client.create_job_from_body(bodies[v])["job_id"], submitted))
+                self.submitted(runs[v].tracker.job_id, spec, v)
+                logger.info("submitted %s job %s", v, runs[v].tracker.job_id)
+            result["jobs"] = {v: r.tracker.job_id for v, r in runs.items()}
+            result["on_job_id"], result["off_job_id"] = runs["on_hit"].tracker.job_id, runs["off_default"].tracker.job_id
+            self.serve_all(spec, runs, result, copies, attached)
+            self.compare(spec, runs, result, copies)
         except Exception as exc:  # noqa: BLE001 - recorded in the report
             logger.exception("%s: %s", spec.name, exc)
             result["error"] = f"{type(exc).__name__}: {exc}"
         finally:
-            if trackers:
-                self.finish(client, spec, trackers, result, attached)
+            if runs:
+                self.finish(client, runs, result, attached)
             result["finished_at"] = utc_now()
             result["report"] = str(report.write(result, self.out_dir))
             logger.info("%s: %s, report %s", spec.name, report.verdict(result)[0], result["report"])
         return result
 
-    def gated_variants(self, client: Any, trackers: dict[str, JobTracker], result: dict) -> set[str]:
-        """Which jobs must agree with on_hit exactly. on_miss must really have
-        cold-started; off_matched only counts once the backend applied the match."""
+    def serve_all(self, spec: ModelSpec, runs: dict[str, JobRun], result: dict, copies: int, attached: bool) -> None:
+        """Serve every job in its own thread: as soon as it is running it answers
+        every request the checks need (perf first, then correctness), its logs are
+        read and it is cancelled, without waiting for the others. A failed on_hit
+        (or one that cold-started, under ``require_restore``) stops the rest, since
+        nothing can be compared with it; another failed job only drops itself."""
+        replicas = job_replicas(spec, copies, list(runs))
+        plan = correctness.probes(replicas, spec.max_seq_len, spec.correctness) if "correctness" in self.checks else []
+        grids: dict[str, dict] = {}
+        stop = threading.Event()
+        deadline = time.time() + self.timeout_s
+
+        def serve(variant: str, run: JobRun) -> None:
+            t = run.tracker
+            client = None
+            try:
+                client = self.fast_client()
+                if not wait_until_running(client, t, deadline, self.poll_s, stop):
+                    return
+                if variant == "on_hit":
+                    restore = startup.restore_report(startup.collect_logs(client, t.job_id),
+                                                     startup.read_files(self.log_files["on"]))
+                    result["startup"] = {"semi_p": restore}
+                    if restore["cache_miss"] and self.require_restore:
+                        raise RuntimeError("semi_p job cold-started (cache miss); publish this config's image first, "
+                                           "or pass require_restore=false")
+                pair_failed = any(runs[v].error for v in ("on_hit", "off_default"))
+                if "perf" in self.checks and variant in PERF_SIDES and not pair_failed:
+                    run.perf = perf.measure(self.fast_client, t.job_id, spec.replicas * copies, spec.max_seq_len,
+                                            spec.perf, spec.thresholds, PERF_SIDES[variant], grids, stop)
+                if plan:
+                    run.answers = correctness.collect(client, t.job_id, plan, variant == "on_hit", stop)
+                run.served = not stop.is_set()
+            except Exception as exc:  # noqa: BLE001 - recorded in the report
+                logger.exception("%s %s job %s: %s", spec.name, variant, t.job_id, exc)
+                run.error = f"{type(exc).__name__}: {exc}"
+                if variant == "on_hit":
+                    stop.set()
+            finally:
+                if client is not None:  # else finish() reads its logs and cancels it
+                    self.release(client, variant, run, result, attached)
+
+        threads = [threading.Thread(target=serve, args=(v, r), name=f"{spec.name}/{v}") for v, r in runs.items()]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    def release(self, client: Any, variant: str, run: JobRun, result: dict, attached: bool) -> None:
+        """Read a served job's logs while its pods exist, then cancel it unless it is kept."""
+        try:
+            run.logs = startup.collect_logs(client, run.tracker.job_id)
+        finally:
+            if not (self.keep_jobs or attached):
+                self.cancel(client, variant, run, result)
+
+    def cancel(self, client: Any, variant: str, run: JobRun, result: dict) -> None:
+        """``pre_cancel_hook``, then cancel; at most once per job."""
+        if run.released:
+            return
+        run.released = True
+        t = run.tracker
+        self.run_pre_cancel_hook(variant, t.job_id, result)
+        try:
+            client.cancel_job(t.job_id)
+            t.cancelled_at = time.time()
+            self.cancelled(t.job_id)
+            logger.info("cancelled %s job %s", variant, t.job_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to cancel %s -- cancel it by hand", t.job_id)
+
+    def compare(self, spec: ModelSpec, runs: dict[str, JobRun], result: dict, copies: int) -> None:
+        """The checks, from what each job returned before it was cancelled. Every
+        job error is recorded, and ``not_measured`` lists the jobs that failed or
+        were stopped, the checks they missed, and why."""
+        errors = [r.error for r in runs.values() if r.error]
+        if errors:
+            result["error"] = "; ".join(errors)
+        if "perf" in self.checks:
+            measured = {PERF_SIDES[v]: r.perf for v, r in runs.items() if v in PERF_SIDES and r.perf is not None}
+            if "on" in measured and "off" in measured:
+                result["perf"] = perf.combine(measured, spec.replicas * copies, spec.perf, spec.thresholds)
+        if "correctness" in self.checks:
+            answered = {v: r.answers for v, r in runs.items() if r.answers is not None}
+            if "on_hit" in answered:
+                gated = self.gated_variants({v: runs[v].logs or {} for v in answered}, result)
+                result["correctness"] = correctness.compare(answered, "on_hit", gated,
+                                                            job_replicas(spec, copies, list(runs)),
+                                                            spec.max_seq_len, spec.correctness)
+        missing = {}
+        for v, r in runs.items():
+            checks = [c for c in ("perf", "correctness") if c in self.checks and (c != "perf" or v in PERF_SIDES)]
+            if not r.served and checks:
+                missing[v] = f"{' and '.join(checks)}: {r.error or 'stopped after ' + (errors or ['an error'])[0]}"
+                logger.warning("%s: %s job not measured for %s", spec.name, v, missing[v])
+        if missing:
+            result["not_measured"] = missing
+
+    def gated_variants(self, logs: dict[str, dict[str, list[str]]], result: dict) -> set[str]:
+        """Which jobs must agree with on_hit exactly, from the logs each compared job
+        left before it was cancelled. on_miss must really have cold-started;
+        off_matched only counts once the backend applied the match."""
         gated = set()
         notes = result.setdefault("variant_notes", {})
-        if "on_miss" in trackers:
-            miss = startup.restore_report(startup.collect_logs(client, trackers["on_miss"].job_id), {})
+        if "on_miss" in logs:
+            miss = startup.restore_report(logs["on_miss"], {})
             if miss["cache_miss"]:
                 notes["on_miss"] = "cold-started and dumped (forced miss)"
             else:
                 notes["on_miss"] = ("did not cold-start: it found a local image (set miss_image_cache to force a "
                                     "miss); still compared as a second restore")
             gated.add("on_miss")
-        if "off_matched" in trackers:
-            lines = [x for v in startup.collect_logs(client, trackers["off_matched"].job_id).values() for x in v]
+        if "off_matched" in logs:
+            lines = [x for v in logs["off_matched"].values() for x in v]
             if any(MATCH_APPLIED_MARKER in line for line in lines):
                 notes["off_matched"] = "backend applied semi_p's collective setup (worker class, workspace, copy path)"
                 gated.add("off_matched")
             else:
                 notes["off_matched"] = ("backend did not report SEMIP_MATCH_COLLECTIVES (older image): only the "
                                         "environment and pass_config were matched, so it is reported, not gated")
-        if "off_default" in trackers:
+        if "off_default" in logs:
             notes["off_default"] = "stock vLLM collectives; differences at TP >= 2 are expected and reported"
         return gated
 
-    def finish(self, client: Any, spec: ModelSpec, trackers: dict[str, JobTracker], result: dict,
-               attached: bool) -> None:
+    def finish(self, client: Any, runs: dict[str, JobRun], result: dict, attached: bool) -> None:
+        """Read the logs of, and cancel, any job a thread did not (an error before
+        the jobs were served), then the start-up section from every job's logs."""
+        for v, r in runs.items():
+            if r.logs is None:
+                r.logs = startup.collect_logs(client, r.tracker.job_id)
+            if not (self.keep_jobs or attached):
+                self.cancel(client, v, r, result)
         st = result.setdefault("startup", {})
         if not attached:
-            st["timelines"] = {v: timeline(t) for v, t in trackers.items()}
+            st["timelines"] = {v: timeline(r.tracker) for v, r in runs.items()}
             st["on_timeline"], st["off_timeline"] = st["timelines"]["on_hit"], st["timelines"]["off_default"]
         try:
-            logs = {v: startup.collect_logs(client, t.job_id) for v, t in trackers.items()}
+            logs = {v: r.logs for v, r in runs.items()}
             log_dir = Path(self.out_dir).expanduser() / f"{report.stem(result)}-logs"
             for v, logs_ in logs.items():
                 startup.save_logs(logs_, log_dir, v)
@@ -350,16 +462,6 @@ class Runner:
             st["log_dir"] = str(log_dir)
         except Exception as exc:  # noqa: BLE001
             logger.warning("could not read start-up logs: %s", exc)
-        if self.keep_jobs or attached:
-            return
-        for v, t in trackers.items():
-            self.run_pre_cancel_hook(v, t.job_id, result)
-            try:
-                client.cancel_job(t.job_id)
-                self.cancelled(t.job_id)
-                logger.info("cancelled %s job %s", v, t.job_id)
-            except Exception:  # noqa: BLE001
-                logger.exception("failed to cancel %s -- cancel it by hand", t.job_id)
 
     def run_pre_cancel_hook(self, variant: str, job_id: str, result: dict) -> None:
         """Run ``pre_cancel_hook`` for one job, while its pods still exist (for
