@@ -72,7 +72,7 @@ def _tiny_config():
             "linear_attention",
             "linear_attention",
             "linear_attention",
-            "deepseek_sparse_attention",
+            "indexed_attention",
         ],
         mlp_layer_types=["dense", "dense", "dense", "sparse"],
     )
