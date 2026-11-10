@@ -30,6 +30,10 @@ from torch.distributed.tensor import DTensor
 from arctic_platform.model.loader import canonical_parameter_name
 
 
+def _canonical_weight_name(name: str) -> str:
+    return canonical_parameter_name(name).replace("model.embed_tokens.embed_norm.", "model.embed_norm.")
+
+
 def build_iter_vllm_weights(model):
     from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
 
@@ -38,6 +42,7 @@ def build_iter_vllm_weights(model):
     def serving_name(name):
         if name == "lm_head.weight":
             return "model.llm.unembed.weight"
+        name = _canonical_weight_name(name)
         name = name.replace("model.embed_tokens.", "model.embed.")
         for source, target in (
             (".self_attn.q_proj.", ".attn.wq_du."),
@@ -134,7 +139,7 @@ def weight_targets(name: str) -> list[tuple[str, int | Literal["gate", "up"] | N
         if name.endswith(source):
             name = name.removesuffix(source) + target
             break
-    return [(name, None)]
+    return [(_canonical_weight_name(name), None)]
 
 
 @torch.no_grad()
@@ -147,7 +152,7 @@ def load_weights(model, config, parallel_dims):
         sorted(set(json.loads(index.read_text())["weight_map"].values())) if index.is_file() else ["model.safetensors"]
     )
     model.to_empty(device=torch.cuda.current_device())
-    targets = {canonical_parameter_name(name): tensor for name, tensor in model.state_dict().items()}
+    targets = {_canonical_weight_name(name): tensor for name, tensor in model.state_dict().items()}
     loaded = set()
     for filename in files:
         with safe_open(path / filename, framework="pt", device="cpu") as source:

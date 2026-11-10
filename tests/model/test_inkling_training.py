@@ -838,6 +838,8 @@ class TestInklingTraining(TestCasePlus):
     "name,expected",
     [
         ("model.llm.embed.weight", [("model.embed_tokens.weight", None)]),
+        ("model.llm.embed_norm.weight", [("model.embed_norm.weight", None)]),
+        ("model.embed_tokens.embed_norm.weight", [("model.embed_norm.weight", None)]),
         (
             "model.llm.layers.2.mlp.experts.w13_weight",
             [("model.layers.2.mlp.experts.w1", 0), ("model.layers.2.mlp.experts.w3", 1)],
