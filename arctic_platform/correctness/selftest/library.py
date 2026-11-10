@@ -5468,7 +5468,8 @@ def _node_prerequisites(tmp_path, monkeypatch):
             return SimpleNamespace(is_flash_attn_3_available=lambda: True)
         return imported(name)
 
-    monkeypatch.setattr(preflight.importlib, "import_module", import_module)
+    monkeypatch.setattr(preflight, "importlib", SimpleNamespace(import_module=import_module))
+    monkeypatch.setattr(transformers, "utils", SimpleNamespace(is_flash_attn_3_available=lambda: True))
     source = tmp_path / "source"
     source.mkdir()
     (source / "config.json").write_text("{}")
@@ -5521,6 +5522,8 @@ def test_onboarding_node_prerequisites_do_not_allocate_models(_node_prerequisite
             return state.importer(name)
 
         monkeypatch.setattr(preflight.importlib, "import_module", import_module)
+        if fault == "hf":
+            monkeypatch.setattr(transformers.utils, "is_flash_attn_3_available", lambda: False)
     elif fault == "source":
         (Path(state.request["source"]) / "config.json").unlink()
     elif fault == "output":
@@ -14025,14 +14028,8 @@ def test_native_callback_rejects_altered_ray_wrappers(monkeypatch, damage):
         elif damage == "globals":
             globals_dict = dict(globals_dict)
         elif damage == "code":
-
-            def unrelated_wrapper(func, ray):
-                def wrapper(*args, **kwargs):
-                    return ray if args else func(*args, **kwargs)
-
-                return wrapper
-
-            code = unrelated_wrapper(None, None).__code__
+            # Preserve the installed Ray closure arity while replacing its executable code object.
+            code = code.replace(co_consts=(*code.co_consts, "synthetic wrapper code drift"))
         altered = types.FunctionType(code, globals_dict, callback.__name__, callback.__defaults__, cells)
         altered.__dict__.update(callback.__dict__)
         altered.__module__, altered.__qualname__ = callback.__module__, callback.__qualname__
@@ -16842,6 +16839,7 @@ def test_optimizer_capture_missing_participating_bf16_buffer_with_no_local_grad_
 @pytest.fixture
 def _optimizer_capture_capture_server(monkeypatch):
     import arctic_platform.common as common_package
+    import arctic_platform.rl as rl_package
 
     files = {"head": {}, "peer": {}}
     events = []
@@ -16910,6 +16908,7 @@ def _optimizer_capture_capture_server(monkeypatch):
         monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(common_package, "deepspeed_worker", worker_module, raising=False)
     monkeypatch.setattr(common_package, "ray_server", server_module, raising=False)
+    monkeypatch.setattr(rl_package, "ray_server", compatibility_module, raising=False)
     production_worker = worker_module.DeepSpeedWorker
     capture_worker = object()
     monkeypatch.setattr(optimizer_capture, "_optimizer_capture_worker_class", lambda: capture_worker)
@@ -17081,6 +17080,7 @@ def test_optimizer_capture_preloaded_compatibility_server_publishes_and_restores
     compatibility.ArcticRLRayServer = state.server_class
     compatibility.ArcticRLRayServerState = state.state_class
     monkeypatch.setitem(sys.modules, compatibility.__name__, compatibility)
+    monkeypatch.setattr(sys.modules["arctic_platform.rl"], "ray_server", compatibility)
     expected = pytest.raises(RuntimeError, match="context failed") if fail_context else contextlib.nullcontext()
     with expected:
         with optimizer_capture.optimizer_capture_worker():
@@ -17102,6 +17102,7 @@ def test_optimizer_capture_lazy_compatibility_import_restores_production_classes
 ):
     state = _optimizer_capture_capture_server
     monkeypatch.delitem(sys.modules, "arctic_platform.rl.ray_server")
+    monkeypatch.delattr(sys.modules["arctic_platform.rl"], "ray_server")
     with optimizer_capture.optimizer_capture_worker():
         compatibility = sys.modules["arctic_platform.rl.ray_server"]
         assert compatibility.ArcticRLRayServer is state.server_module.ArcticRLRayServer
@@ -18395,12 +18396,10 @@ def _maintained_native_scope(case, monkeypatch, *, split, rpc_timeout=30):
     ray = ModuleType("ray")
     ray.get, ray.is_initialized = get, is_initialized
     modules = {module.__name__: module for module in (snow, gateway, manager_module, ray)}
-    original_import = decoder.importlib.import_module
-    monkeypatch.setattr(
-        decoder.importlib,
-        "import_module",
-        lambda name, *args, **kwargs: modules[name] if name in modules else original_import(name, *args, **kwargs),
+    _native_original_composition_modules(
+        monkeypatch, **{name: module for name, module in modules.items() if name.startswith("dss.")}
     )
+    monkeypatch.setitem(sys.modules, "ray", ray)
     monkeypatch.setattr(
         decoder,
         "_native_scope_actor_workers",
@@ -27247,6 +27246,7 @@ def test_shared_adapter_running_job_ray_handoff_precedes_client_and_restores_ove
     generated_adapter_config, tmp_path, monkeypatch, failure
 ):
     from arctic_platform import common
+    from arctic_platform import rl
     from arctic_platform.correctness.harness import gateway as dss_driver
     from arctic_platform.correctness.harness import optimizer as optimizer_capture
 
@@ -27280,6 +27280,7 @@ def test_shared_adapter_running_job_ray_handoff_precedes_client_and_restores_ove
         monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(common, "deepspeed_worker", worker, raising=False)
     monkeypatch.setattr(common, "ray_server", server, raising=False)
+    monkeypatch.setattr(rl, "ray_server", compatibility, raising=False)
     monkeypatch.setattr(optimizer_capture, "_optimizer_capture_worker_class", lambda: capture_worker)
 
     def require_overlay():
@@ -45998,7 +45999,9 @@ def test_cortex_checkpoint_export_job_identity_and_unsafe_endpoint_ids_rejected_
 
 @pytest.fixture
 def _model_state_capture_capture_module():
-    return importlib.import_module("arctic_platform.correctness.harness.optimizer")
+    from arctic_platform.correctness.harness import optimizer
+
+    return optimizer
 
 
 def _model_state_capture_engine():

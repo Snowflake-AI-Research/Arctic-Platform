@@ -245,7 +245,8 @@ def onboarding_node_prerequisites(request: dict) -> dict:
             if attribute and not callable(getattr(module, attribute, None)):
                 raise ImportError(f"{module_name}.{attribute} is unavailable")
             if backend in request.get("hf_attention", []) and backend in {"flash_attention_2", "flash_attention_3"}:
-                availability = importlib.import_module("transformers.utils")
+                from transformers import utils as availability
+
                 checker = getattr(availability, f"is_flash_attn_{backend[-1]}_available")
                 if not checker():
                     raise ImportError(f"Transformers does not recognize an installed {backend} package")

@@ -22,7 +22,6 @@ import contextlib
 import dis
 import fcntl
 import hashlib
-import importlib
 import inspect
 import json
 import math
@@ -856,7 +855,8 @@ def optimizer_capture_worker() -> Iterator[None]:
     from arctic_platform.common import ray_server
 
     # Load the compatibility re-export before patching so lazy clients cannot retain an overlay.
-    compatibility_server = importlib.import_module("arctic_platform.rl.ray_server")
+    from arctic_platform.rl import ray_server as compatibility_server
+
     server_modules = [ray_server, compatibility_server]
     originals = [(module, module.ArcticRLRayServerState, module.ArcticRLRayServer) for module in server_modules]
     capture_worker = _optimizer_capture_worker_class()
@@ -1324,14 +1324,17 @@ def _native_callback_origin(callback):
         templates = [contextlib.contextmanager(wrapped)]
         tracing_template = None
         if selected.__module__ == "ray._private.worker" and selected.__name__ in {"is_initialized", "get", "put"}:
-            ray = importlib.import_module("ray")
+            import ray
+
             if callback is not getattr(ray, selected.__name__, None):
                 raise ValueError("native optimizer callback requires the current public Ray function")
-            client_hook = importlib.import_module("ray._private.client_mode_hook")
-            auto_init_hook = importlib.import_module("ray._private.auto_init_hook")
+            from ray._private import auto_init_hook
+            from ray._private import client_mode_hook as client_hook
+
             templates.extend((client_hook.client_mode_hook(wrapped), auto_init_hook.wrap_auto_init(wrapped)))
         if selected.__globals__.get("__name__") == "ray.util.tracing.tracing_helper":
-            tracing = importlib.import_module("ray.util.tracing.tracing_helper")
+            from ray.util.tracing import tracing_helper as tracing
+
             factory_name = "async_span_wrapper" if inspect.iscoroutinefunction(wrapped) else "span_wrapper"
             factories = [
                 code
@@ -1966,19 +1969,23 @@ def make_native_optimizer_scope(request, *, gateway_snowapi, gateway, manager, r
     """Bind caller-held current MAIN objects; never discover another allocation or create a receiver."""
     request = json.loads(json.dumps(request, allow_nan=False))
     _native_scope_sources(request)
-    manager_module = importlib.import_module("dss.ray_dss.zones.manager")
-    for module, name, role in (
-        (gateway_snowapi, "dss.ray_dss.gateway_snowapi", "gateway_snowapi"),
-        (gateway, "dss.ray_dss.gateway_server", "gateway"),
-        (manager_module, "dss.ray_dss.zones.manager", "manager"),
+    import ray as installed_ray
+    from dss.ray_dss import gateway_server as installed_gateway
+    from dss.ray_dss import gateway_snowapi as installed_snowapi
+    from dss.ray_dss.zones import manager as manager_module
+
+    for module, installed, role in (
+        (gateway_snowapi, installed_snowapi, "gateway_snowapi"),
+        (gateway, installed_gateway, "gateway"),
+        (manager_module, manager_module, "manager"),
     ):
-        if module is not importlib.import_module(name) or module.__file__ != request["route_sources"][role]["path"]:
+        if module is not installed or module.__file__ != request["route_sources"][role]["path"]:
             raise ValueError("native scope requires the actual selected MAIN modules")
     if type(manager) is not manager_module.ZoneManager or manager.zone_type.value != "training":
         raise ValueError("native scope requires its actual current MAIN training manager")
     verify_native_callback(manager.get_job, request["route_sources"]["manager"])
     _native_scope_origin(ray.get, request["route_sources"]["ray_get"])
-    if ray is not importlib.import_module("ray"):
+    if ray is not installed_ray:
         raise ValueError("native scope requires the current installed Ray module")
     get = ray.get
     timeout = request["rpc_timeout_seconds"]
@@ -2218,11 +2225,14 @@ def resolve_native_optimizer_parent(request, parent_id, *, gateway_snowapi, gate
     """Resolve only in the actual gateway owner; allocation fields remain caller expectations."""
     request = json.loads(json.dumps(request, allow_nan=False))
     digest = _native_split_request(request)
-    for module, name, role in (
-        (gateway_snowapi, "dss.ray_dss.gateway_snowapi", "gateway_snowapi"),
-        (gateway, "dss.ray_dss.gateway_server", "gateway"),
+    from dss.ray_dss import gateway_server as installed_gateway
+    from dss.ray_dss import gateway_snowapi as installed_snowapi
+
+    for module, installed, role in (
+        (gateway_snowapi, installed_snowapi, "gateway_snowapi"),
+        (gateway, installed_gateway, "gateway"),
     ):
-        if module is not importlib.import_module(name) or module.__file__ != request["route_sources"][role]["path"]:
+        if module is not installed or module.__file__ != request["route_sources"][role]["path"]:
             raise ValueError("native parent resolution requires the actual gateway owner modules")
     parent = gateway_snowapi._parents.get(parent_id)
     if (
@@ -2301,7 +2311,9 @@ def open_native_optimizer_zone_scope(request, binding, *, manager, ray, verify_p
         != {"hosts": request["allocation_hosts"], "world_size": request["expected_world_size"]}
     ):
         raise ValueError("native zone scope requires its exact source-bound gateway binding")
-    manager_module = importlib.import_module("dss.ray_dss.zones.manager")
+    import ray as installed_ray
+    from dss.ray_dss.zones import manager as manager_module
+
     if (
         manager_module.__file__ != request["route_sources"]["manager"]["path"]
         or type(manager) is not manager_module.ZoneManager
@@ -2310,7 +2322,7 @@ def open_native_optimizer_zone_scope(request, binding, *, manager, ray, verify_p
     ):
         raise ValueError("native zone scope requires its actual owning training manager")
     _native_scope_origin(ray.get, request["route_sources"]["ray_get"])
-    if ray is not importlib.import_module("ray"):
+    if ray is not installed_ray:
         raise ValueError("native zone scope requires canonical initialized owner Ray")
     verify_native_callback(ray.is_initialized, request["route_sources"]["ray_is_initialized"])
     if ray.is_initialized() is not True:
@@ -2652,9 +2664,19 @@ def _load(path: Path) -> dict:
     if globals_needed - _SCHEMA_GLOBALS:
         raise ValueError(f"unsupported checkpoint globals in {path.name}: {sorted(globals_needed - _SCHEMA_GLOBALS)}")
     allowed = []
-    for name in sorted(globals_needed):
-        module, _, attribute = name.rpartition(".")
-        allowed.append(getattr(importlib.import_module(module), attribute))
+    if globals_needed:
+        from deepspeed.runtime.fp16.loss_scaler import DynamicLossScaler
+        from deepspeed.runtime.fp16.loss_scaler import LossScaler
+        from deepspeed.runtime.zero.config import ZeroStageEnum
+        from deepspeed.utils.tensor_fragment import fragment_address
+
+        schema_types = {
+            "deepspeed.runtime.fp16.loss_scaler.DynamicLossScaler": DynamicLossScaler,
+            "deepspeed.runtime.fp16.loss_scaler.LossScaler": LossScaler,
+            "deepspeed.runtime.zero.config.ZeroStageEnum": ZeroStageEnum,
+            "deepspeed.utils.tensor_fragment.fragment_address": fragment_address,
+        }
+        allowed = [schema_types[name] for name in sorted(globals_needed)]
     with torch.serialization.safe_globals(allowed):
         state = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
     if not isinstance(state, dict):
