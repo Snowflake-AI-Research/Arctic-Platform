@@ -1,20 +1,21 @@
 {
   "name": "glm53-long-full",
-  "description": "zai-org/GLM-5.3, TP=8, 1 replica(s) on 8 GPU(s); catalog glm-5.3/long/h200-inference-full.json with a proposed change: CUDA graphs on (enforce_eager removed), gpu_memory_utilization 0.936, compilation_config.max_cudagraph_capture_size 64. The catalog config (gpu_memory_utilization 0.95, enforce_eager) runs out of memory in vLLM's FlashInfer autotune at max_seq_len 720896",
+  "description": "zai-org/GLM-5.3, TP=8, 1 replica(s) on 8 GPU(s); catalog glm-5.3/long/h200-inference-full.json as proposed in snowflakedb/cortex-training#271 (CUDA graphs on with max_cudagraph_capture_size 64, gpu_memory_utilization 0.943, max_num_batched_tokens 4096); the current catalog config (0.95, eager) runs out of memory in vLLM's FlashInfer autotune at 720896",
   "sub_job": {
     "inference_config": {
+      "max_num_batched_tokens": 4096,
       "max_seq_len": 720896,
       "n_gpus": 8,
       "vllm_config": {
-        "gpu_memory_utilization": 0.936,
-        "kv_cache_dtype": "fp8_ds_mla",
-        "reasoning_parser": "glm45",
-        "tensor_parallel_size": 8,
         "extra_engine_kwargs": {
           "compilation_config": {
             "max_cudagraph_capture_size": 64
           }
-        }
+        },
+        "gpu_memory_utilization": 0.943,
+        "kv_cache_dtype": "fp8_ds_mla",
+        "reasoning_parser": "glm45",
+        "tensor_parallel_size": 8
       }
     },
     "job_type": "sampling",
