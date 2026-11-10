@@ -19,6 +19,7 @@ from uuid import uuid4
 
 import ray
 
+from arctic_platform.common.packing.media_spec import media_spec_for
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
 from arctic_platform.inference.server.chat import ChatModel, resolve_chat_model
 from arctic_platform.inference.server.metrics import RingStatLogger, get_collector
@@ -28,6 +29,7 @@ from arctic_platform.inference.server.streaming import (
 )
 from arctic_platform.inference.server.media_prompts import (
     SUPPORTS_MEDIA,
+    decodable_modalities,
     decode_media,
     is_media_prompt,
     validate_media_prompt,
@@ -806,6 +808,28 @@ def _media_hashes(
             for item, uuid in zip(items, item_uuids)
         ]
     return hashes
+
+
+# Model types already warned about in this process for lacking placeholder ids.
+_NO_PLACEHOLDER_IDS_WARNED: set[str] = set()
+
+
+def _placeholder_ids(hf_config: Any) -> dict[str, int]:
+    """``{modality: placeholder token id}`` from a loaded HF config.
+
+    The media spec of the config's ``model_type`` gives them; a model type
+    without one falls back to the config's ``image_token_id`` /
+    ``video_token_id``, each only when set.
+    """
+    spec = media_spec_for(getattr(hf_config, "model_type", None) or "")
+    if spec is not None:
+        return spec.placeholder_ids(hf_config)
+    ids = {}
+    for modality, key in (("image", "image_token_id"), ("video", "video_token_id")):
+        value = getattr(hf_config, key, None)
+        if value is not None:
+            ids[modality] = int(value)
+    return ids
 
 
 def _maybe_cache_routed_experts(
@@ -1620,6 +1644,38 @@ class InferenceWorker(StreamingWorkerMixin):
 
     def get_state(self) -> str:
         return self.state.value
+
+    def media_modalities(self) -> dict[str, int]:
+        """``{modality: placeholder token id}`` for each modality this worker's ``generate`` decodes.
+
+        Computed here, in the process that decodes and that holds the loaded
+        model: the modalities from this engine's resolved ``media_io_kwargs``
+        and this process's environment and libraries, the ids from the
+        engine's HF config through the model type's media spec (else the
+        config's ``image_token_id`` / ``video_token_id``). A caller on another
+        host can tell neither. ``{}`` before the engine is up, when media
+        prompts are unsupported, or when the model takes no media (including a
+        config its media spec rejects for lacking an id: warned once per model
+        type in this process).
+        """
+        if not self.supports_media or self.llm is None:
+            return {}
+        model_config = self.llm.model_config
+        mm_config = model_config.multimodal_config
+        if mm_config is None:
+            return {}
+        try:
+            ids = _placeholder_ids(model_config.hf_config)
+        except ValueError as exc:
+            # The model type's media spec cannot place tokens with this config:
+            # it takes no media, so a media prompt gets the caller's usual reject.
+            model_type = str(getattr(model_config.hf_config, "model_type", None))
+            if model_type not in _NO_PLACEHOLDER_IDS_WARNED:
+                _NO_PLACEHOLDER_IDS_WARNED.add(model_type)
+                logger.warning("media_modalities: model type %r takes no media: %s", model_type, exc)
+            return {}
+        decodable = decodable_modalities(mm_config.media_io_kwargs)
+        return {modality: ids[modality] for modality in sorted(decodable) if modality in ids}
 
     def get_stats(self) -> dict[str, Any]:
         """Return the latest scheduler stats, plus liveness metadata.

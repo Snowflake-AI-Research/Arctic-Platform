@@ -1337,3 +1337,151 @@ def test_stream_refuses_unsupported_format_before_any_loader(fake_loaders, monke
     assert fake_loaders == [] and fake_loaders.loaded == []
     assert events[-1]["type"] == "terminal_error"
     assert "secret" not in repr(events)
+
+
+# The engine's resolved kwargs name torchcodec; a caller's default ones would name opencv (cv2).
+_ENGINE_VIDEO_KWARGS = {"video": {"backend": "torchcodec"}}
+# The engine's loaded config: ids unlike any Qwen-VL checkpoint's a caller could read.
+_ENGINE_HF_CONFIG = SimpleNamespace(model_type="qwen3_5", image_token_id=901, video_token_id=902)
+_ENGINE_IDS = {"image": 901, "video": 902}
+
+
+def _media_worker(media_io_kwargs=_ENGINE_VIDEO_KWARGS, hf_config=_ENGINE_HF_CONFIG):
+    worker = _new_worker()
+    worker.llm.model_config = _model_config(media_io_kwargs=media_io_kwargs)
+    worker.llm.model_config.hf_config = hf_config
+    return worker
+
+
+def test_worker_media_modalities_use_engine_kwargs_and_its_own_libraries(monkeypatch):
+    worker = _media_worker()
+    looked_up = _video_libraries(monkeypatch, "torchcodec")
+    assert worker.media_modalities() == _ENGINE_IDS
+    assert looked_up == ["torchcodec"]
+    # Only the caller's (default) codec library present: the engine's codec is missing.
+    _video_libraries(monkeypatch, "cv2")
+    assert worker.media_modalities() == {"image": 901}
+
+
+def test_worker_media_modalities_follow_its_env(monkeypatch):
+    worker = _media_worker({})
+    _video_libraries(monkeypatch, "PyNvVideoCodec", backend="pynvvideocodec")
+    assert worker.media_modalities() == _ENGINE_IDS
+    _video_libraries(monkeypatch, "PyNvVideoCodec")
+    assert worker.media_modalities() == {"image": 901}
+
+
+def test_worker_media_modalities_empty_before_init(monkeypatch):
+    _video_libraries(monkeypatch, *_VIDEO_LIBRARIES)
+    worker = _media_worker()
+    worker.llm = None
+    worker.state = WorkerLifecycleState.UNINITIALIZED
+    assert worker.media_modalities() == {}
+
+
+def test_worker_media_modalities_empty_without_media_support(monkeypatch):
+    _video_libraries(monkeypatch, *_VIDEO_LIBRARIES)
+    worker = _media_worker()
+    monkeypatch.setattr(WorkerClass, "supports_media", False)
+    assert worker.media_modalities() == {}
+
+
+def test_worker_media_modalities_empty_for_text_only_model(monkeypatch):
+    _video_libraries(monkeypatch, *_VIDEO_LIBRARIES)
+    worker = _media_worker()
+    worker.llm.model_config = SimpleNamespace(
+        model="text", max_model_len=4096, multimodal_config=None, hf_config=SimpleNamespace(model_type="llama")
+    )
+    assert worker.media_modalities() == {}
+
+
+def test_worker_media_modalities_ids_without_a_media_spec(monkeypatch):
+    # No spec for this model type: the config's own ids, each only when set.
+    _video_libraries(monkeypatch, *_VIDEO_LIBRARIES)
+    worker = _media_worker(hf_config=SimpleNamespace(model_type="other_vl", image_token_id=77))
+    assert worker.media_modalities() == {"image": 77}
+    worker = _media_worker(hf_config=SimpleNamespace(model_type="other_vl"))
+    assert worker.media_modalities() == {}
+
+
+class _RemoteMethod:
+    """``handle.method.remote()`` for an in-process worker: an awaitable, like an ObjectRef."""
+
+    def __init__(self, fn):
+        self._fn = fn
+        self.calls = 0
+
+    def remote(self):
+        self.calls += 1
+
+        async def call():
+            return self._fn()
+
+        return call()
+
+
+class _AvailabilityScheduler:
+    def __init__(self, available):
+        self._available = available
+
+    def is_worker_available(self, idx):
+        return self._available[idx]
+
+
+def _media_pool(workers, available, model_id="vl"):
+    pool = ReplicaPool.__new__(ReplicaPool)
+    pool._model_id = model_id
+    pool._scheduler = _AvailabilityScheduler(available)
+    pool._workers = [SimpleNamespace(media_modalities=_RemoteMethod(w.media_modalities)) for w in workers]
+    return pool
+
+
+def test_pool_media_modalities_pass_one_ready_workers_answer_through(monkeypatch):
+    _video_libraries(monkeypatch, "torchcodec")
+    pool = _media_pool([_media_worker(), _media_worker()], [False, True])
+    assert asyncio.run(pool.media_modalities("vl")) == _ENGINE_IDS
+    assert asyncio.run(pool.media_modalities()) == _ENGINE_IDS
+    assert [w.media_modalities.calls for w in pool._workers] == [0, 2]
+
+
+def test_pool_media_modalities_empty_without_ready_worker(monkeypatch):
+    _video_libraries(monkeypatch, *_VIDEO_LIBRARIES)
+    pool = _media_pool([_media_worker()], [False])
+    assert asyncio.run(pool.media_modalities("vl")) == {}
+    assert pool._workers[0].media_modalities.calls == 0
+    pool._scheduler = None
+    assert asyncio.run(pool.media_modalities("vl")) == {}
+
+
+def test_pool_media_modalities_check_model_id(monkeypatch):
+    pool = _media_pool([_media_worker()], [True])
+    with pytest.raises(ValueError, match="model_id mismatch"):
+        asyncio.run(pool.media_modalities("other"))
+
+
+def test_worker_media_modalities_empty_when_spec_lacks_an_id(monkeypatch, caplog):
+    # A Qwen-VL config without video_token_id: its spec cannot place tokens, so the model takes no media.
+    _video_libraries(monkeypatch, *_VIDEO_LIBRARIES)
+    monkeypatch.setattr(worker_module, "_NO_PLACEHOLDER_IDS_WARNED", set())
+    worker = _media_worker(hf_config=SimpleNamespace(model_type="qwen3_5", image_token_id=901, secret="s3cr3t"))
+    with caplog.at_level("WARNING", logger="arctic_platform.inference.server"):
+        assert worker.media_modalities() == {}
+        assert worker.media_modalities() == {}
+    (record,) = [r for r in caplog.records if "takes no media" in r.getMessage()]
+    assert record.levelname == "WARNING"
+    assert "'qwen3_5'" in record.getMessage() and "video_token_id" in record.getMessage()
+    assert "s3cr3t" not in caplog.text
+
+
+def test_driver_media_modalities_pass_the_pools_answer_through(monkeypatch):
+    from arctic_platform.inference.server.multi_model import Driver
+
+    _video_libraries(monkeypatch, "torchcodec")
+    driver = Driver.__new__(Driver)
+    driver._pools = {"vl": _media_pool([_media_worker()], [True]), "idle": _media_pool([_media_worker()], [False], "idle")}
+    assert asyncio.run(driver.media_modalities("vl")) == _ENGINE_IDS
+    assert asyncio.run(driver.media_modalities("idle")) == {}
+    with pytest.raises(KeyError, match="Unknown model_id 'other'"):
+        asyncio.run(driver.media_modalities("other"))
+    with pytest.raises(ValueError, match="model_id is required"):
+        asyncio.run(driver.media_modalities())
