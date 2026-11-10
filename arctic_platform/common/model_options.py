@@ -197,17 +197,19 @@ def register(registry: Registry) -> None:
     )
     register_option(
         "numerics.fp32_residual",
-        runs_in="trainer",
+        runs_in="both",
         goal="parity",
         why=(
             "Experimental. With fp32_parity on, carry the residual stream of the stock dense Qwen3.5 family in fp32"
             " between decoder layers, from the embeddings on, instead of rounding it to the branch dtype after each"
             " fused add. Checked on CPU against a reference and under checkpointing, offload and compile; its effect"
             " on GPU training is not yet measured. Under full activation checkpointing each decoder layer after the"
-            " first holds an fp32 residual at its boundary, twice the bytes of a bf16 one."
+            " first holds an fp32 residual at its boundary, twice the bytes of a bf16 one. On Qwen3.8-Flash-Next it"
+            " carries the hyper-connection residual streams in fp32 between blocks; the sampler matches it under"
+            " ARCTIC_FP32_HC_RESIDUAL=1."
         ),
         remove_when="GPU runs show it does not bring training closer to vLLM, or it becomes part of fp32_parity",
-        source="`loader_options.fp32_residual`",
+        source="`loader_options.fp32_residual`; sampler `ARCTIC_FP32_HC_RESIDUAL` (Qwen3.8-Flash-Next)",
         registry=registry,
     )
     register_option(

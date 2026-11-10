@@ -233,14 +233,14 @@ class _GatedResidualFn(torch.autograd.Function):
         hidden = width // hc
         block = triton.next_power_of_2(hidden)
         x = x.contiguous()
-        n = torch.empty_like(x)
+        n = torch.empty_like(x, dtype=torch.bfloat16)  # x may be an fp32 stream; n feeds the BF16 GEMMs
         rstd = torch.empty(rows * hc, dtype=torch.float32, device=x.device)
         _norm_fwd_kernel[(rows * hc,)](x, norm_weight, n, rstd, hidden, eps, HC=hc, BLOCK=block, num_warps=8)
         rank = w_up.shape[1]
         al = n @ w_down_inject.t()
         a_div = al[:, :rank].float() / hc if round_once else al[:, :rank] / hc
-        b = F.silu(a_div).to(x.dtype) @ w_up.t()
-        mixed = torch.empty(rows, hidden, dtype=x.dtype, device=x.device)
+        b = F.silu(a_div).to(n.dtype) @ w_up.t()
+        mixed = torch.empty(rows, hidden, dtype=n.dtype, device=x.device)
         grid = (rows, triton.cdiv(hidden, _BLOCK_H))
         if round_once:
             _gate_mix_fwd_kernel[grid](n, b, mixed, hidden, HC=hc, BLOCK=_BLOCK_H)
@@ -314,9 +314,13 @@ class _InjectFn(torch.autograd.Function):
 
 
 def fused_hyper_connection_supported(module, x: torch.Tensor) -> bool:
-    """The fused path covers BF16 CUDA hyper connections whose stream count is a power of two, frozen or training."""
+    """The fused path covers CUDA hyper connections whose stream count is a power of two, frozen or training, on a
+    BF16 stream or on an FP32 stream with BF16 weights."""
     hc = module.hc_count
-    return x.is_cuda and x.dtype == torch.bfloat16 and module.block_inject_weight is not None and hc & (hc - 1) == 0
+    bf16_operands = x.dtype == torch.bfloat16 or (
+        x.dtype == torch.float32 and module.input_mix_weight_up.weight.dtype == torch.bfloat16
+    )
+    return x.is_cuda and bf16_operands and module.block_inject_weight is not None and hc & (hc - 1) == 0
 
 
 def gated_residual(module, hidden_states: torch.Tensor, round_once: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
