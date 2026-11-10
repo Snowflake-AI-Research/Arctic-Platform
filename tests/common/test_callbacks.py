@@ -165,6 +165,53 @@ class TestCallbackRunner(unittest.TestCase):
         runner.on_error(_Trainer(rank=0), "step", exc)
         self.assertEqual(runner.callbacks[0].pending, {})
 
+    def test_run_quarantines_a_failing_callback_and_keeps_siblings(self):
+        class _Boom(MetricsCallback):
+            @classmethod
+            def enabled(cls, training_config):
+                return True
+
+            def post_step(self, trainer):
+                raise RuntimeError("post-step boom")
+
+        class _Ok(MetricsCallback):
+            @classmethod
+            def enabled(cls, training_config):
+                return True
+
+            def post_step(self, trainer):
+                self.log("ok", 1, reduce=Reduce.SUM)
+
+        runner = CallbackRunner([_Boom, _Ok], {}, rank=0)
+        runner.run("post_step", _Trainer(rank=0))
+        self.assertEqual(runner.flush(), {"ok": (Reduce.SUM, 1)})
+        # Quarantine clears at flush so the next step can retry the callback.
+        self.assertEqual(runner._failed, set())
+
+    def test_quarantined_callback_is_skipped_on_later_hooks_until_flush(self):
+        class _Boom(Callback):
+            def __init__(self, training_config):
+                self.calls = []
+
+            @classmethod
+            def enabled(cls, training_config):
+                return True
+
+            def pre_step(self, trainer):
+                self.calls.append("pre_step")
+                raise RuntimeError("pre-step boom")
+
+            def post_step(self, trainer):
+                self.calls.append("post_step")
+
+        runner = CallbackRunner([_Boom], {}, rank=0)
+        runner.run("pre_step", _Trainer(rank=0))
+        runner.run("post_step", _Trainer(rank=0))
+        self.assertEqual(runner.callbacks[0].calls, ["pre_step"])
+        runner.flush()
+        runner.run("post_step", _Trainer(rank=0))
+        self.assertEqual(runner.callbacks[0].calls, ["pre_step", "post_step"])
+
 
 class TestMergeMetrics(unittest.TestCase):
     def test_rank0_keeps_rank_zeros_value(self):
