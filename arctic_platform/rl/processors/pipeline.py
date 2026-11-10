@@ -76,6 +76,9 @@ from arctic_platform.rl.utils.debug import see_memory_usage
 from .base_loss import BaseLoss
 from .base_loss import resolve_loss
 from .microbatch import DEFAULT_MAX_TOKENS_PER_MB
+from .multimodal import IMAGE_INPUT_KEYS
+from .multimodal import MULTI_MODAL_INPUTS_KEY
+from .multimodal import collate_multi_modal_inputs
 from .packed_reduction import apply_packed_loss_reduction
 from .packed_reduction import combine_packed_losses
 from .packed_reduction import combine_packed_metrics
@@ -484,6 +487,10 @@ def run_pipeline(
                 loss_object=loss_object,
             )
 
+    if MULTI_MODAL_INPUTS_KEY in batch and any(key in batch for key in IMAGE_INPUT_KEYS):
+        raise ValueError(f"send images either per sequence as {MULTI_MODAL_INPUTS_KEY!r} or as {IMAGE_INPUT_KEYS}")
+    image_inputs = collate_multi_modal_inputs(batch.pop(MULTI_MODAL_INPUTS_KEY, None))
+
     rank = _engine_rank(engine)
     tname_e2e = timers.start(f"run_pipeline e2e {rank}")
     see_memory_usage("before fwd", force=True)
@@ -549,6 +556,7 @@ def run_pipeline(
         pad_token = meta["pad_token_id"]
         attention_mask_2d_bool = batch["attention_mask"].bool()
         batch = padded_tensor_2d_dict_to_unpadded_tensor_1d_dict(batch, attention_mask_2d_bool)
+    batch.update(image_inputs)
 
     log_dp_shard_tokens(
         rank,
@@ -712,6 +720,12 @@ def _run_pipeline_with_packing(
     from .packing import pack_sequences
     from .packing import unpack_sequences
 
+    if any(key in batch for key in IMAGE_INPUT_KEYS):
+        raise ValueError(
+            f"microbatching cannot split batch-level {IMAGE_INPUT_KEYS} by sequence; "
+            f"send each sequence's images in batch[{MULTI_MODAL_INPUTS_KEY!r}]"
+        )
+
     # Combine for splitting — meta tensors are split the same way as batch
     all_input = {**meta, **batch}  # batch takes priority on key collision
     mb_spec = MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb)
@@ -733,6 +747,7 @@ def _run_pipeline_with_packing(
     for i, mb in enumerate(mb_list.mbs):
         packed = pack_sequences(mb)
         pack_meta = packed.pop("_pack_meta")
+        mb_images = packed.pop(MULTI_MODAL_INPUTS_KEY, None)
 
         # 1D meta: packed tensors have shape [1, T] — squeeze for loss fns
         mb_1d = {
@@ -754,6 +769,8 @@ def _run_pipeline_with_packing(
                 mb_kwargs[key] = packed[key]
         if "position_ids" in packed:
             mb_kwargs["position_ids"] = packed["position_ids"]
+        if MULTI_MODAL_INPUTS_KEY in batch:
+            mb_kwargs[MULTI_MODAL_INPUTS_KEY] = mb_images
 
         if backward is True and hasattr(engine, "set_gradient_accumulation_boundary"):
             engine.set_gradient_accumulation_boundary(i == n_mbs - 1)
