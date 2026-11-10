@@ -31,6 +31,7 @@ __all__ = [
     "decodable_modalities",
     "decode_media",
     "is_media_prompt",
+    "valid_token_ids",
     "validate_media_prompt",
 ]
 
@@ -109,6 +110,20 @@ def is_media_prompt(prompt) -> bool:
     return isinstance(prompt, dict) and "multi_modal_data" in prompt
 
 
+# Prompt token-id bounds: at most this many ids, each in [0, MAX_TOKEN_ID).
+MAX_PROMPT_TOKENS = 131072
+MAX_TOKEN_ID = 2**31
+
+
+def valid_token_ids(token_ids) -> bool:
+    """Whether *token_ids* is a list of 1..131072 ints in [0, 2**31)."""
+    return (
+        isinstance(token_ids, list)
+        and 0 < len(token_ids) <= MAX_PROMPT_TOKENS
+        and all(type(token) is int and 0 <= token < MAX_TOKEN_ID for token in token_ids)
+    )
+
+
 def validate_media_prompt(prompt: dict) -> dict:
     """Check a media prompt's shape and return a copy with ``None`` keys dropped.
 
@@ -122,9 +137,7 @@ def validate_media_prompt(prompt: dict) -> dict:
     token_ids = prompt.get("prompt_token_ids")
     if is_token_tensor(token_ids):
         token_ids = check_token_tensor(token_ids).tolist()
-    if not isinstance(token_ids, list) or not 0 < len(token_ids) <= 131072 or any(
-        type(token) is not int or not 0 <= token < 2**31 for token in token_ids
-    ):
+    if not valid_token_ids(token_ids):
         raise ValueError("Media prompt_token_ids must be 1..131072 nonnegative token IDs")
     media = prompt.get("multi_modal_data")
     if not isinstance(media, dict) or not media:

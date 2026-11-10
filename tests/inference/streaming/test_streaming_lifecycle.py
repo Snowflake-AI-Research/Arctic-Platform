@@ -702,3 +702,18 @@ def test_pool_sleeps_a_half_woken_pool():
         await pool._scheduler.shutdown()
 
     asyncio.run(scenario())
+
+
+def test_pool_refuses_a_media_stream_before_any_worker():
+    async def scenario():
+        pool, handle = make_pool()
+        prompt = {"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"image": b"\x89PNG\r\n\x1a\n"}}
+        try:
+            with pytest.raises(ValueError, match="media prompts go through generate"):
+                pool.stream_generate("media", prompt, {"max_tokens": 1})
+            assert pool._scheduler._streams == {}
+            handle.start_stream.remote.assert_not_called()
+        finally:
+            await pool._scheduler.shutdown()
+
+    asyncio.run(scenario())
