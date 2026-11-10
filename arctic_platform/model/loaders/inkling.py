@@ -27,6 +27,7 @@ from pydantic import model_validator
 
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
+from arctic_platform.model.implementations.moe.config import EPCommBackend
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
@@ -36,7 +37,7 @@ class InklingOptions(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     seq_len: int = Field(4096, gt=0)
-    ep_comm_backend: Literal["deepep", "uccl"] = "deepep"
+    ep_comm_backend: EPCommBackend = "deepep"
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
     moe_use_grouped_mm: bool = True

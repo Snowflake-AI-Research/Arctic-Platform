@@ -1088,6 +1088,8 @@ def install_combine_replay(block: nn.Module) -> None:
     """
     for module in block.modules():
         if isinstance(module, MoE):
+            if module.ep_comm_backend == "nccl":
+                raise ValueError("NCCL expert dispatch requires combine_replay=False")
             module.combine_replay = CombineReplay()
 
 

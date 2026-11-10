@@ -84,6 +84,16 @@ def initialized_prime_model(config):
 
 
 class TestInklingTraining(TestCasePlus):
+    def test_nccl_rejects_combine_replay(self):
+        from arctic_platform.model.implementations.moe.layers.moe import install_combine_replay
+
+        model = initialized_prime_model(tiny_config())
+        for module in model.modules():
+            if isinstance(module, InklingMoE):
+                module.set_ep_comm_backend("nccl")
+        with self.assertRaisesRegex(ValueError, "combine_replay=False"):
+            install_combine_replay(model)
+
     @require_torch_gpu
     def test_router_is_invariant_to_sequence_shard_length(self):
         from arctic_platform.model.implementations.inkling.modeling_inkling import InklingTopkRouter
@@ -436,7 +446,10 @@ class TestInklingTraining(TestCasePlus):
 
         path = self.checkpoint_config(**tiny_config().to_dict())
         options = InklingOptions(
-            attention_query_chunk_size=128, tiled_mlp_token_chunk_size=64, fused_lm_head_token_chunk_size=32
+            attention_query_chunk_size=128,
+            tiled_mlp_token_chunk_size=64,
+            fused_lm_head_token_chunk_size=32,
+            ep_comm_backend="nccl",
         )
         spec = ModelSpec(
             model_path_or_name=path, attn_implementation="flex_attention", loader_options=options.model_dump()
