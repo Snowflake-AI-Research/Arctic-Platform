@@ -215,7 +215,7 @@ def test_freeze_fp8_weights_and_scales():
 def test_model_parallelism_metadata_uses_glm_next_shared_heads(nested):
     text_config = dict(
         num_attention_heads=4,
-        layer_types=["linear_attention", "deepseek_sparse_attention"],
+        layer_types=["linear_attention", "indexed_attention"],
         linear_num_heads=2,
     )
     config = dict(text_config=text_config) if nested else text_config
