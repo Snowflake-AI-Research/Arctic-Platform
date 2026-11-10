@@ -275,6 +275,39 @@ def test_freeze_fp8_weights_and_scales():
     assert freeze_fp8_weights_and_scales(model) == 0
 
 
+@pytest.mark.parametrize("family", ["glm5_next", "kimi_linear"])
+@pytest.mark.parametrize("legacy_heads", [None, 4])
+@pytest.mark.parametrize("serialized", [False, True])
+def test_model_parallelism_metadata_matches_hf_shared_heads(family, legacy_heads, serialized):
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextConfig
+    from transformers.models.kimi_linear.configuration_kimi_linear import KimiLinearConfig
+
+    text_config = dict(num_attention_heads=8, num_key_value_heads=8, linear_num_heads=2)
+    if legacy_heads is not None:
+        text_config["linear_attn_config"] = dict(num_heads=legacy_heads)
+    if family == "glm5_next":
+        config = dict(text_config=text_config)
+        hf_config = Glm5NextConfig(**config)
+    else:
+        config = text_config
+        hf_config = KimiLinearConfig(**config)
+    if serialized:
+        config = hf_config.to_dict()
+
+    metadata = model_parallelism_metadata_from_config(config)
+
+    expected_heads = 2 if legacy_heads is None else legacy_heads
+    hf_text_config = hf_config.text_config if family == "glm5_next" else hf_config
+    assert hf_text_config.linear_num_heads == expected_heads
+    assert metadata == ModelParallelismMetadata(
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        has_linear_attention=True,
+        linear_num_key_heads=expected_heads,
+        linear_num_value_heads=expected_heads,
+    )
+
+
 @pytest.mark.parametrize("nested", [False, True])
 def test_model_parallelism_metadata_kda_fallback_does_not_enable_linear_attention(nested):
     text_config = dict(num_attention_heads=4, linear_attn_config=dict(num_heads=4))

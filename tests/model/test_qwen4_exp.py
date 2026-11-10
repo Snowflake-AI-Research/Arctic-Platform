@@ -1047,7 +1047,7 @@ def test_packed_ple_survives_custom_lm_head():
         layer.mlp = Zero()
     model.lm_head = HiddenHead()
     _patch_model_forward(model)
-    kwargs = dict(attention_mask={"linear_attention": None, "qwen_sparse_attention": None})
+    kwargs = dict(attention_mask={"linear_attention": None, "indexed_attention": None})
     ids = torch.tensor([[2, 3, 4, 5, 6, 7, 8, 9]])
     positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
     packed = model(input_ids=ids, position_ids=positions, **kwargs)
