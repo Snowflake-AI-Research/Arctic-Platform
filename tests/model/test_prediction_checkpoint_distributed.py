@@ -15,7 +15,9 @@
 
 """Real two-rank CPU capture/export/reload controls, not large-model or NCCL qualification."""
 
+import gc
 import json
+import weakref
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -73,7 +75,7 @@ class _CheckpointFixture(nn.Module):
                 linear_num_heads=2,
                 linear_head_dim=4,
                 hc_mult=2,
-                layer_types=["deepseek_sparse_attention"],
+                layer_types=["indexed_attention"],
                 mlp_layer_types=["sparse"],
             )
         self.model = nn.Module()
@@ -131,6 +133,7 @@ def _checkpoint_worker(rank, rendezvous, directory, family, fault):
         world_size=2,
         timeout=timedelta(seconds=30),
     )
+    group_ref = weakref.ref(dist.group.WORLD)
     try:
         groups._EXPERT_PARALLEL_GROUP["ep_size_2"] = dist.group.WORLD
         model = _CheckpointFixture(family, rank)
@@ -206,7 +209,11 @@ def _checkpoint_worker(rank, rendezvous, directory, family, fault):
         assert (messages[0] is None) == (fault == "none")
         (Path(directory) / f"rank{rank}.json").write_text(json.dumps({"status": message, "fault": fault}))
     finally:
+        # Release the test-owned group before interpreter shutdown, including failed exports.
+        groups._EXPERT_PARALLEL_GROUP.pop("ep_size_2", None)
         dist.destroy_process_group()
+    gc.collect()
+    assert group_ref() is None, "the test-owned Gloo group must be released before interpreter shutdown"
 
 
 class TestPredictionCheckpointDistributed(TestCasePlus):

@@ -973,7 +973,7 @@ def apply_context_parallelism(
         attention._cp_group = cp_group
         attention._cp_rank = cp_rank
         attention._cp_world_size = cp_world_size
-        if layer.block_type == "deepseek_sparse_attention":
+        if layer.block_type == "indexed_attention":
             attention._ap_sparse_mla_backend = attn_implementation
             attention.forward = types.MethodType(
                 _sparse_attention_forward,
