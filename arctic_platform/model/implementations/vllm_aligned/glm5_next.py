@@ -841,20 +841,50 @@ def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None, record: di
                       renormalize=config.norm_topk_prob, scaling=config.routed_scaling_factor)  # fmt: skip
     if record is not None:
         record["experts"] = ids.to(torch.int64)
-    experts = mlp.experts
-    total = config.n_routed_experts
+    # One op for every rank's experts: the gathered and sharded expert weights stay inside the kernel call, so the
+    # per-op backward saves only the tokens, weights and ids (the whole model's experts would not fit otherwise).
+    routed = _op(_routed_experts_ranks, "ref_routed_experts_ep", x, weights, ids, experts=mlp.experts, moe=mlp,
+                 total=config.n_routed_experts, ep_group=ep_group, tp=tp, top_k=config.num_experts_per_tok,
+                 limit=config.swiglu_limit)  # fmt: skip
+    shared = shared_expert_partials(mlp.shared_expert, x, config.swiglu_limit, tp)
+    return tp_sum([s + r for s, r in zip(shared, routed)])
+
+
+def _routed_experts_ranks(x, weights, ids, *, experts: Any, total: int, ep_group: Any, tp: int, top_k: int,
+                          limit: float) -> tuple[torch.Tensor, ...]:  # fmt: skip
+    """Each tensor-parallel rank's routed-expert output: vLLM's Triton experts on that rank's shard of every expert's
+    ``gate``/``up`` rows and ``down`` columns, the experts gathered from every expert-parallel rank."""
     w1, w2, w3 = (_full(t, total, ep_group) for t in (experts.w1, experts.w2, experts.w3))
     s1, s2, s3 = (_full(t, total, ep_group) for t in (experts.w1_scale_inv, experts.w2_scale_inv, experts.w3_scale_inv))
-    shared = shared_expert_partials(mlp.shared_expert, x, config.swiglu_limit, tp)
-    partials = []
+    out = []
     for rank in range(tp):
         (w1_r, s1_r), (w3_r, s3_r) = _fp8_shard(w1, s1, tp, rank, 1), _fp8_shard(w3, s3, tp, rank, 1)
         w2_r, s2_r = _fp8_shard(w2, s2, tp, rank, 2)
         w13, w13_scale = torch.cat([w1_r, w3_r], dim=1), torch.cat([s1_r, s3_r], dim=1)
-        routed = _op(_routed_experts_kernel, "ref_routed_experts", x, weights, ids, w13, w13_scale, w2_r, s2_r,
-                     top_k=config.num_experts_per_tok, limit=config.swiglu_limit)  # fmt: skip
-        partials.append(shared[rank] + routed)
-    return tp_sum(partials)
+        out.append(_routed_experts_kernel(x, weights, ids, w13, w13_scale, w2_r, s2_r, top_k=top_k, limit=limit))
+    return tuple(out)
+
+
+def stock_routed_experts(moe: Any, x: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """The stock MoE's routed experts alone (no shared expert) at the given expert ids and routing weights, through
+    its own expert-parallel dispatch, with vLLM's FP8 activation quantization (:func:`_vllm_mlp_quantization`)."""
+    import types as _types
+
+    from arctic_platform.model.implementations.moe.distributed.ep_backend import uses_dispatch_ep
+
+    ids = ids.long()
+    saved = moe.shared_expert, moe.combine_replay
+    moe.shared_expert, moe.combine_replay = None, None
+    try:
+        with _vllm_mlp_quantization(_types.SimpleNamespace(mlp=moe)):
+            if uses_dispatch_ep(moe.ep_comm_backend):
+                return moe._run_deepep_routed_experts(x, ids, weights)
+            scores, tokens, counts = moe.reorderer(weights, ids)
+            routed = moe._run_routed_experts(x, tokens, counts, scores)
+            index = tokens.reshape(-1, 1).expand(-1, x.shape[-1])
+            return torch.zeros_like(x, dtype=routed.dtype).scatter_add(0, index, routed)
+    finally:
+        moe.shared_expert, moe.combine_replay = saved
 
 
 def _routed_experts_kernel(x, weights, ids, w13, w13_scale, w2, w2_scale, *, top_k: int, limit: float) -> torch.Tensor:

@@ -30,6 +30,36 @@ def test_op_routes_through_vllm_op_only_in_differentiable_mode():
     assert torch.allclose(x.grad, weight.sum(0).expand(3, 4))  # the reference's gradient: no factor 2
 
 
+def test_routed_experts_reference_runs_the_stock_dispatch_and_shares_its_gradient_across_tp_outputs():
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next
+
+    class FakeMoE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.shared_expert = torch.nn.Linear(4, 4)
+            self.combine_replay = "replay"
+            self.ep_comm_backend = "deepep"
+            self.seen = None
+
+        def _run_deepep_routed_experts(self, x, ids, weights):
+            self.seen = (self.shared_expert, self.combine_replay, ids.dtype)
+            return x * weights.sum(-1, keepdim=True)
+
+    moe = FakeMoE()
+    x = torch.randn(3, 4, requires_grad=True)
+    weights = torch.rand(3, 2, requires_grad=True)
+    ids = torch.tensor([[0, 1], [1, 2], [2, 0]], dtype=torch.int32)
+    kernel = lambda x, weights, ids, *, tp: tuple(x * weights.sum(-1, keepdim=True) / tp for _ in range(tp))  # noqa: E731
+    with glm5_next.differentiable():
+        parts = glm5_next._op(kernel, "ref_routed_experts_ep", x, weights, ids, moe=moe, tp=4)
+    assert len(parts) == 4 and moe.seen is None  # the reference runs only in the backward
+    glm5_next.tp_sum(list(parts)).sum().backward()
+    assert moe.seen == (None, None, torch.int64)
+    assert isinstance(moe.shared_expert, torch.nn.Linear) and moe.combine_replay == "replay"
+    assert torch.allclose(x.grad, weights.detach().sum(-1, keepdim=True).expand(3, 4))
+    assert torch.allclose(weights.grad, x.detach().sum(-1, keepdim=True).expand(3, 2))
+
+
 def _naive_kda(q, k, v, g, beta, a_log, dt_bias, lower_bound):
     heads, dim = q.shape[1:]
     h = torch.zeros(heads, v.shape[-1], dim, dtype=torch.float64)
