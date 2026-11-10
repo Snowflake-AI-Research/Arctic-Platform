@@ -298,6 +298,114 @@ def test_stock_recompute_keeps_the_peft_adapter_on_the_bf16_projection():
     assert "forward" not in vars(projection) and "forward" not in vars(projection.base_layer)
 
 
+def test_substitute_takes_the_exact_value_and_the_reference_gradient():
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import substitute
+
+    w = torch.tensor([2.0, 3.0], requires_grad=True)
+    reference = (w * 1.5).unsqueeze(0)
+    exact = torch.tensor([3.25, 4.25], dtype=torch.float64)
+    out = substitute(reference, exact)
+    assert out.shape == (1, 2) and out.dtype == torch.float64 and out.tolist() == [[3.25, 4.25]]
+    out.sum().backward()
+    assert w.grad.tolist() == [1.5, 1.5]
+
+
+def test_fake_fp8_is_vllms_group_quantization_with_a_straight_through_gradient():
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import fake_fp8
+
+    torch.manual_seed(9)
+    x = (torch.randn(3, 256) * 5).to(torch.bfloat16).requires_grad_(True)
+    groups = x.detach().float().reshape(3, 2, 128)
+    scale = groups.abs().amax(-1, keepdim=True) / 448.0
+    expected = ((groups / scale).clamp(-448, 448).to(torch.float8_e4m3fn).float() * scale).reshape(3, 256)
+    assert torch.equal(fake_fp8(x, False), expected.to(torch.bfloat16))
+    pow2 = torch.exp2(torch.ceil(torch.log2(scale)))
+    expected_ue8m0 = ((groups / pow2).to(torch.float8_e4m3fn).float() * pow2).reshape(3, 256)
+    out = fake_fp8(x, True)
+    assert torch.equal(out, expected_ue8m0.to(torch.bfloat16)) and not torch.equal(out, fake_fp8(x, False))
+    out.float().sum().backward()
+    assert torch.equal(x.grad, torch.ones_like(x))
+    odd = torch.randn(2, 100)
+    assert torch.equal(fake_fp8(odd, True), odd)
+
+
+def test_vllm_backward_chains_the_exact_sublayer_values_with_stock_gradients(monkeypatch):
+    import contextlib
+    import sys
+    import types
+
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next
+
+    n, hidden, tokens = 2, 4, 3
+
+    def remix(fused, fp32, post, comb, out, res):
+        return post[..., None] * out[..., None, :] + comb.transpose(-1, -2) @ res
+
+    modeling = types.ModuleType("arctic_platform.model.implementations.glm53.modeling_glm5_next")
+    modeling.fused_hyper_connection_applies = lambda hc, res: False
+    modeling._remix = remix
+    package = types.ModuleType("arctic_platform.model.implementations.glm53")
+    package.modeling_glm5_next = modeling
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    monkeypatch.setitem(sys.modules, modeling.__name__, modeling)
+
+    class HC(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = torch.nn.Parameter(torch.tensor(1.2))
+
+        def forward(self, res):
+            post = torch.sigmoid(self.a) * torch.ones(1, tokens, n)
+            return post, torch.eye(n).expand(1, tokens, n, n) * self.a, res.mean(2) * self.a
+
+    class Scale(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.tensor(value))
+
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states * self.w
+
+    class Layer(torch.nn.Module):
+        block_type, _fp32_parity, _replay_layer_idx = "linear_attention", True, 0
+
+        def __init__(self):
+            super().__init__()
+            self.attn_hc, self.ffn_hc = HC(), HC()
+            self.input_layernorm, self.post_attention_layernorm = Scale(0.9), Scale(1.1)
+            self.self_attn, self.mlp = Scale(1.7), Scale(2.3)
+
+    def exact_pre(streams, hc, norm, config):
+        return torch.full((tokens, n), 0.5), torch.eye(n).expand(tokens, n, n) * 1.25, streams.mean(1) * 1.5
+
+    def exact_post(x, streams, post, comb):
+        return remix(False, True, post, comb, x, streams)
+
+    monkeypatch.setattr(glm5_next, "hc_pre", exact_pre)
+    monkeypatch.setattr(glm5_next, "hc_post", exact_post)
+    monkeypatch.setattr(glm5_next, "_mixer", lambda layer, x, ctx: x * 2.0)
+    monkeypatch.setattr(glm5_next, "_mlp", lambda layer, x, ctx: x * 3.0)
+    monkeypatch.setattr(glm5_next, "_vllm_mlp_quantization", lambda layer: contextlib.nullcontext())
+
+    layer = Layer()
+    ctx = types.SimpleNamespace(config=types.SimpleNamespace(), replay={})
+    run = glm5_next._vllm_backward_runner(torch.zeros(tokens, dtype=torch.long), torch.arange(tokens), {}, ctx)
+    torch.manual_seed(10)
+    streams = torch.randn(tokens, n, hidden, requires_grad=True)
+    out = run(layer, streams)
+
+    with torch.no_grad():
+        post, comb, x = exact_pre(streams, None, None, None)
+        s1 = exact_post(x * 2.0, streams, post, comb)
+        post, comb, x = exact_pre(s1, None, None, None)
+        expected = exact_post(x * 3.0, s1, post, comb)
+    assert torch.equal(out, expected)
+    out.sum().backward()
+    for name, p in layer.named_parameters():
+        assert p.grad is not None and p.grad.abs().sum() > 0, name
+    assert streams.grad is not None and streams.grad.abs().sum() > 0
+
+
 def test_tp_sum_adds_rank_partials_in_fp32_in_rank_order_and_rounds_once():
     from arctic_platform.model.implementations.vllm_aligned.glm5_next import tp_sum
 

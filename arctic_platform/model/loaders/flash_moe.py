@@ -21,6 +21,8 @@ Hugging Face iterator.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field
 
 from arctic_platform.model.config import ModelSpec
@@ -79,12 +81,21 @@ class Glm5NextOptions(FlashMoeOptions):
             " of the split layers on its weight shard and sums the partials as vLLM's batch-invariant all-reduce does."
         ),
     )
+    vllm_aligned_backward: Literal["stock", "vllm"] = Field(
+        "stock",
+        description=(
+            "Experimental, with vllm_aligned. 'stock': each layer's backward recomputes the stock layer on the layer's"
+            " input. 'vllm': each sublayer's gradient is taken at the aligned forward's exact values, through stock"
+            " sublayers made to compute vLLM's math (replayed choices, bf16 MLA projections, FP8 activation quantization)."
+        ),
+    )
 
 
 class _FlashLoadOptions(Qwen3_5MoeOptions):
     fp32_routed_weighting: bool = False
     vllm_aligned: bool = False
     vllm_aligned_tensor_parallel: int = 1
+    vllm_aligned_backward: str = "stock"
 
 
 def _matches(family: str):
@@ -200,6 +211,7 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
             lm_head_fp32=options.fp32_lm_head,
             ep_group=(ctx.parallel_groups or {}).get("ep_group"),
             tensor_parallel=options.vllm_aligned_tensor_parallel,
+            backward=options.vllm_aligned_backward,
         )
     return loaded
 

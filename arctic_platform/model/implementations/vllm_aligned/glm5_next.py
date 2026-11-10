@@ -46,6 +46,7 @@ Kernels the sampler runs (its kernel inventory, ``layer_digest.kernel_inventory`
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 from typing import Callable
 
@@ -833,6 +834,40 @@ def _bf16_linear_forward(self, x: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.linear(x, weight.to(x.dtype))
 
 
+@contextlib.contextmanager
+def _stock_replay(layer: Any, record: dict, kwargs: dict, vllm_mla_weights: bool):
+    """The stock layer set up to follow the aligned forward: its sparse attention takes the forward's top-k rows, its
+    MLA projections (with ``vllm_mla_weights``) run as bf16 matmuls on vLLM's dequantized weights. Yields the extra
+    layer kwargs (the forward's expert ids, ``routed_experts``, for router replay)."""
+    import types as _types
+
+    swapped = []
+    if vllm_mla_weights and layer.block_type == "deepseek_sparse_attention":
+        for name in MLA_DEQUANTIZED_PROJECTIONS:
+            # Under PEFT the wrapper keeps adding the adapter's ``lora_B(lora_A(x))`` to the swapped base.
+            module = base_linear(getattr(layer.self_attn, name, None))
+            if module is not None and getattr(module, "weight_scale_inv", None) is not None:
+                module.forward = _types.MethodType(_bf16_linear_forward, module)
+                swapped.append(module)
+    extra = {}
+    experts = record.get("experts")
+    if experts is not None and kwargs.get("routed_experts") is None:
+        index = layer._replay_layer_idx
+        routes = experts.new_zeros((1, experts.shape[0], index + 1, experts.shape[1]))
+        routes[0, :, index] = experts
+        extra["routed_experts"] = routes
+    topk = record.get("topk")
+    if topk is not None:
+        setattr(layer.self_attn, REPLAY_TOPK_ATTR, topk.unsqueeze(0))
+    try:
+        yield extra
+    finally:
+        if topk is not None:
+            delattr(layer.self_attn, REPLAY_TOPK_ATTR)
+        for module in swapped:
+            del module.forward
+
+
 def _stock_layer_runner(backbone: Any, input_ids: torch.Tensor, position_ids: torch.Tensor, kwargs: dict,
                         replay: dict | None = None, vllm_mla_weights: bool = True) -> Callable:  # fmt: skip
     """``run_stock(layer, streams)``: the stock decoder layer on ``[tokens, hc_mult, hidden]`` streams, packed as the
@@ -843,52 +878,173 @@ def _stock_layer_runner(backbone: Any, input_ids: torch.Tensor, position_ids: to
     top-k rows, so the backward differentiates the selection the forward computed. With ``vllm_mla_weights``, the
     sparse-attention projections vLLM serves dequantized run as bf16 matmuls instead of the trainer's W8A8 GEMMs.
     """
-    import types as _types
-
     mask = torch.ones(1, input_ids.numel(), dtype=torch.bool, device=input_ids.device)
-    masks = {"deepseek_sparse_attention": mask, "linear_attention": mask}
 
     def run(layer: Any, streams: torch.Tensor) -> torch.Tensor:
-        swapped = []
-        if vllm_mla_weights and layer.block_type == "deepseek_sparse_attention":
-            for name in MLA_DEQUANTIZED_PROJECTIONS:
-                # Under PEFT the wrapper keeps adding the adapter's ``lora_B(lora_A(x))`` to the swapped base.
-                module = base_linear(getattr(layer.self_attn, name, None))
-                if module is not None and getattr(module, "weight_scale_inv", None) is not None:
-                    module.forward = _types.MethodType(_bf16_linear_forward, module)
-                    swapped.append(module)
-        try:
-            return _run(layer, streams)
-        finally:
-            for module in swapped:
-                del module.forward
-
-    def _run(layer: Any, streams: torch.Tensor) -> torch.Tensor:
         record = {} if replay is None else replay.get(id(layer), {})
-        extra = {}
-        experts = record.get("experts")
-        if experts is not None and kwargs.get("routed_experts") is None:
-            index = layer._replay_layer_idx
-            routes = experts.new_zeros((1, experts.shape[0], index + 1, experts.shape[1]))
-            routes[0, :, index] = experts
-            extra["routed_experts"] = routes
-        topk = record.get("topk")
-        if topk is not None:
-            setattr(layer.self_attn, REPLAY_TOPK_ATTR, topk.unsqueeze(0))
-        try:
+        with _stock_replay(layer, record, kwargs, vllm_mla_weights) as extra:
             out, _ = layer(
                 streams.unsqueeze(0),
-                attention_mask=masks[layer.block_type],
+                attention_mask=mask,
                 position_ids=position_ids.reshape(1, -1),
                 position_embeddings=None,
                 input_ids=input_ids.reshape(1, -1),
                 prev_topk_indices=None,
                 **{**kwargs, **extra},
             )
-        finally:
-            if topk is not None:
-                delattr(layer.self_attn, REPLAY_TOPK_ATTR)
         return out.squeeze(0)
+
+    return run
+
+
+class _Substitute(torch.autograd.Function):
+    """``exact`` as the value, ``reference``'s graph for the gradient: a sublayer's output with the bits vLLM's kernels
+    computed and the derivative of the same math, evaluated where vLLM's forward actually was."""
+
+    @staticmethod
+    def forward(ctx, reference: torch.Tensor, exact: torch.Tensor) -> torch.Tensor:
+        ctx.dtype = reference.dtype
+        return exact.reshape(reference.shape).clone()
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        return grad.to(ctx.dtype), None
+
+
+def substitute(reference: torch.Tensor, exact: torch.Tensor) -> torch.Tensor:
+    return _Substitute.apply(reference, exact.detach())
+
+
+class _FakeFp8(torch.autograd.Function):
+    """vLLM's per-128-group dynamic FP8 activation quantization (``per_token_group_quant_fp8``: scale ``amax / 448``,
+    a power of two with ``ue8m0``), dequantized, with a straight-through gradient."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, ue8m0: bool) -> torch.Tensor:
+        if x.shape[-1] % FP8_BLOCK or x.numel() == 0:
+            return x.clone()
+        groups = x.float().reshape(-1, x.shape[-1] // FP8_BLOCK, FP8_BLOCK)
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        scale = groups.abs().amax(-1, keepdim=True).clamp_min(1e-10) / fp8_max
+        if ue8m0:
+            scale = torch.exp2(torch.ceil(torch.log2(scale)))
+        q = (groups / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+        return (q.float() * scale).reshape(x.shape).to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        return grad, None
+
+
+def fake_fp8(x: torch.Tensor, ue8m0: bool) -> torch.Tensor:
+    return _FakeFp8.apply(x, ue8m0)
+
+
+@contextlib.contextmanager
+def _vllm_mlp_quantization(layer: Any):
+    """The stock MLPs with vLLM's FP8 activation quantization (straight-through): the routed experts' two GEMM inputs
+    with power-of-two scales (DeepGEMM's E8M0 mode, which vLLM's MoE quantizer follows), the dense and shared-expert
+    block-FP8 linears with plain scales (``TritonFp8BlockScaledMMKernel``, ``use_ue8m0=False``)."""
+    import types as _types
+
+    from arctic_platform.model.implementations import fp8
+    from arctic_platform.model.implementations.fp8 import dequantize_from_fp8_blockwise
+    from arctic_platform.model.implementations.moe.layers import moe as stock_moe
+
+    def experts_decoded(self, x, num_tokens_per_expert, weights, scales, ab, scores=None):
+        if ab:
+            raise NotImplementedError("the vLLM backward covers experts without LoRA")
+        from arctic_platform.model.implementations.fp8 import grouped_fp8_decoded_mm
+
+        offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+        rows, block = int(offsets[-1]), self.fp8_block_size
+        (w1, w2, w3), (s1, s2, s3) = weights, scales
+        xq = fake_fp8(x, True)
+        gate = grouped_fp8_decoded_mm(xq, w1, s1, offsets, rows, block)
+        up = grouped_fp8_decoded_mm(xq, w3, s3, offsets, rows, block)
+        hidden = fake_fp8(stock_moe._apply_swiglu(gate, up, self.swiglu_limit), True)
+        out = grouped_fp8_decoded_mm(hidden, w2, s2, offsets, rows, block)
+        return out if scores is None else stock_moe.apply_routing_weights(out, scores)
+
+    def fp8_linear(x, weight, scale, block_size, delta=None):
+        out = torch.nn.functional.linear(fake_fp8(x, False), dequantize_from_fp8_blockwise(weight, scale, dtype=x.dtype))
+        return out if delta is None else out + torch.nn.functional.linear(x, delta.to(x.dtype))
+
+    def block_linear(self, x):
+        weight = dequantize_from_fp8_blockwise(self.weight, self.weight_scale_inv, dtype=x.dtype)
+        return torch.nn.functional.linear(fake_fp8(x, False), weight)
+
+    saved = [(stock_moe.GroupedExperts, "_forward_fp8_decoded"), (fp8, "fp8_linear_with_lora_delta")]
+    originals = [getattr(owner, name) for owner, name in saved]
+    stock_moe.GroupedExperts._forward_fp8_decoded = experts_decoded
+    fp8.fp8_linear_with_lora_delta = fp8_linear
+    swapped = [m for m in layer.mlp.modules() if isinstance(m, torch.nn.Linear)
+               and getattr(m, "weight_scale_inv", None) is not None and m.weight.element_size() == 1]  # fmt: skip
+    for module in swapped:
+        module.forward = _types.MethodType(block_linear, module)
+    try:
+        yield
+    finally:
+        for (owner, name), original in zip(saved, originals):
+            setattr(owner, name, original)
+        for module in swapped:
+            del module.forward
+
+
+def _vllm_backward_runner(input_ids: torch.Tensor, position_ids: torch.Tensor, kwargs: dict, ctx: Any) -> Callable:
+    """``run(layer, streams)`` for the backward: the layer as a chain of sublayers whose values are the aligned
+    forward's (vLLM's kernels, recomputed) and whose gradients are the stock sublayers' made to compute vLLM's math
+    (replayed expert ids and top-k rows, bf16 MLA projections, vLLM's FP8 activation quantization), each evaluated on
+    the exact input vLLM's forward gave it (:func:`substitute`). Sublayers: the attention-site hyper-connection pre
+    (with its norm), the mixer, the post; the FFN site's pre, the MLP or MoE, the post."""
+    from arctic_platform.model.implementations.glm53 import modeling_glm5_next as modeling
+
+    config = ctx.config
+    mask = torch.ones(1, input_ids.numel(), dtype=torch.bool, device=input_ids.device)
+    layer_kwargs = {**kwargs, "input_ids": input_ids.reshape(1, -1)}
+
+    def pre(layer, hc, norm, streams):
+        with torch.no_grad():
+            exact = hc_pre(streams, hc, norm, config)
+        res = streams.unsqueeze(0)
+        fused = modeling.fused_hyper_connection_applies(hc, res)
+        post, comb, x = modeling.hyper_connection(hc, res) if fused else hc(res)
+        x = norm(x)
+        post, comb, x = (substitute(r, e) for r, e in zip((post, comb, x), exact))
+        return fused, post, comb, x.squeeze(0), exact
+
+    def post_(layer, fused, post, comb, out, out_exact, streams, exact):
+        with torch.no_grad():
+            value = hc_post(out_exact, streams, exact[0], exact[1])
+        mixed = modeling._remix(fused, layer._fp32_parity, post, comb, out.unsqueeze(0), streams.unsqueeze(0))
+        return substitute(mixed.squeeze(0), value)
+
+    def run(layer: Any, streams: torch.Tensor) -> torch.Tensor:
+        record = _record(ctx, layer) or {}
+        fused, post, comb, x, exact = pre(layer, layer.attn_hc, layer.input_layernorm, streams)
+        with torch.no_grad():
+            mixed_exact = _mixer(layer, exact[2], ctx)
+        with _stock_replay(layer, record, kwargs, vllm_mla_weights=True) as extra:
+            if layer.block_type == "linear_attention":
+                mixed = layer.self_attn(hidden_states=x.unsqueeze(0), cache_params=None, attention_mask=mask,
+                                        **layer_kwargs)  # fmt: skip
+            else:
+                mixed = layer.self_attn(hidden_states=x.unsqueeze(0), attention_mask=mask,
+                                        position_ids=position_ids.reshape(1, -1), past_key_values=None,
+                                        use_cache=False, position_embeddings=None, prev_topk_indices=None,
+                                        **layer_kwargs)[0]  # fmt: skip
+            mixed = substitute(mixed.squeeze(0), mixed_exact)
+            streams = post_(layer, fused, post, comb, mixed, mixed_exact, streams, exact)
+            fused, post, comb, x, exact = pre(layer, layer.ffn_hc, layer.post_attention_layernorm, streams)
+            with torch.no_grad():
+                mlp_exact = _mlp(layer, exact[2], ctx)
+            with _vllm_mlp_quantization(layer):
+                if "routed_experts" in extra:
+                    out = layer.mlp(x.unsqueeze(0), routed_experts=extra["routed_experts"][:, :, layer._replay_layer_idx])
+                else:
+                    out = layer.mlp(x.unsqueeze(0))
+            out = substitute(out.squeeze(0), mlp_exact)
+            return post_(layer, fused, post, comb, out, mlp_exact, streams, exact)
 
     return run
 
@@ -927,8 +1083,11 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
                                 replay={} if torch.is_grad_enabled() else None,
                                 ep_group=getattr(model, "_vllm_aligned_ep_group", None),
                                 tp=getattr(model, "_vllm_aligned_tensor_parallel", 1))  # fmt: skip
-    run_stock = _stock_layer_runner(backbone, input_ids, position_ids, kwargs, ctx.replay)
-    hidden = aligned_hidden(backbone, input_ids, config, ctx, run_stock)
+    if getattr(model, "_vllm_aligned_backward", "stock") == "vllm" and ctx.replay is not None:
+        run_backward = _vllm_backward_runner(input_ids, position_ids, kwargs, ctx)
+    else:
+        run_backward = _stock_layer_runner(backbone, input_ids, position_ids, kwargs, ctx.replay)
+    hidden = aligned_hidden(backbone, input_ids, config, ctx, run_backward)
     return ops.lm_head_logprobs(
         hidden,
         model.lm_head.weight,
@@ -989,12 +1148,16 @@ def check_tensor_parallel(config: Any, tp: int) -> None:
 
 
 def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_fp32: bool = False,
-                                 ep_group: Any = None, tensor_parallel: int = 1) -> None:  # fmt: skip
+                                 ep_group: Any = None, tensor_parallel: int = 1, backward: str = "stock") -> None:  # fmt: skip
     """Make a GLM-5.3-Flash model's ``dss_compute_logprobs`` forward compute the batch-invariant sampler's logprobs.
 
     ``tensor_parallel`` is the sampler's TP size: every rank's share of the split layers runs on its own weight shard,
-    and the partial sums are reduced as vLLM's batch-invariant all-reduce reduces them.
+    and the partial sums are reduced as vLLM's batch-invariant all-reduce reduces them. ``backward`` is ``"stock"``
+    (each layer's backward recomputes the stock layer on the layer's input) or ``"vllm"`` (each sublayer's gradient is
+    taken at the aligned forward's exact values, :func:`_vllm_backward_runner`).
     """
+    if backward not in ("stock", "vllm"):
+        raise ValueError(f"backward must be 'stock' or 'vllm', got {backward!r}")
     import types
 
     from arctic_platform.inference.vllm.glm5_batch_invariance import ensure_glm5_batch_invariance
@@ -1009,6 +1172,7 @@ def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_f
     ensure_glm5_batch_invariance()
     model._vllm_aligned_ep_group = ep_group
     model._vllm_aligned_tensor_parallel = int(tensor_parallel)
+    model._vllm_aligned_backward = backward
     model._vllm_aligned_token_chunk_size = int(token_chunk_size)
     model._vllm_aligned_lm_head_fp32 = bool(lm_head_fp32)
     model._vllm_aligned_stock_forward = model.forward
