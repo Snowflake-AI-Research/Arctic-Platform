@@ -93,6 +93,10 @@ def rebuild(path: Path, on_paths: list[str], off_paths: list[str], out_dir: str 
     if off_api or off_pods:
         st["vllm_off"] = startup.parse_vllm([x for logs in (off_api, off_pods) for v in logs.values() for x in v])
         st["off_sources"] = sorted(off_api) + sorted(off_pods)
+    unknown = {v: u for v, u in (st.pop("unknown", None) or {}).items()
+               if (st.get(startup.REPORT_FIELDS[v][0]) or {}).get(u["field"]) is None}
+    if unknown:
+        st["unknown"] = unknown
     pf = result.get("perf") or {}
     if pf.get("rows") and pf.get("latency"):
         replicas = int(result["model"].get("replicas", 1)) * int(result["model"].get("copies", 1))

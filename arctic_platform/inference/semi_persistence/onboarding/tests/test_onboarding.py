@@ -358,9 +358,11 @@ def test_footprint_counts_whole_nodes(monkeypatch, tmp_path):
 
 _MISS_LOG = ["00:00:01.000 [r0 engine] semi_p: resolved model_dir=/cache/k",
              "00:00:01.100 [r0 engine] semi_p: cache miss -- cold-starting",
-             "00:05:00.000 [r0 engine] semi_p: dump complete model_dir=/cache/k in 298.9s"]
-_JOB_LOGS = {"on_hit": RESTORE_LOG, "on_miss": _MISS_LOG, "off_matched": [jobs.MATCH_APPLIED_MARKER],
-             "off_default": ["INFO [core.py:373] init engine (profile, create kv cache, warmup model) took 137.22 s"]}
+             "00:05:00.000 [r0 engine] semi_p: dump complete model_dir=/cache/k in 298.9s",
+             "00:05:30.000 [r0 engine] semi_p: restore complete model_dir=/cache/k gpus=[0]"]
+_INIT_LINE = "INFO [core.py:373] init engine (profile, create kv cache, warmup model) took 137.22 s"
+_JOB_LOGS = {"on_hit": RESTORE_LOG, "on_miss": _MISS_LOG, "off_matched": [jobs.MATCH_APPLIED_MARKER, _INIT_LINE],
+             "off_default": [_INIT_LINE]}
 # correctness.run's checks (sha256 of their sorted JSON) for _FakeClient(drift={"job-off_default"})
 # and the four jobs of _spec(tp=2, n_gpus=8), as reported when each request went to every job in turn.
 _SIMULTANEOUS_CHECKS_SHA256 = "92e9de3a0852ef7a7c5869ed76aae014aaf523b4a59fa9318d90f763921eecc0"
@@ -437,8 +439,8 @@ def _runner(monkeypatch, tmp_path, cluster, **args):
     monkeypatch.setattr(onboard, "make_client", lambda *a, **k: cluster)
     monkeypatch.setattr(perf, "cell", cell)
     runner = onboard.Runner({"config": "x", "out_dir": str(tmp_path), "debug_image_tag": "dev_T",
-                             "timeout_s": "60", **args})
-    runner.poll_s = 0.01
+                             "timeout_s": "60", "log_wait_s": "1", **args})
+    runner.poll_s = runner.log_poll_s = 0.01
     return runner
 
 
@@ -835,6 +837,80 @@ def test_publish_after_idle_timeout_reads_the_archived_execution_logs(monkeypatc
     service = _PublishJob([_DUMPED], ended_at=1, readable=2, execution=archived)
     out = _publisher(monkeypatch, tmp_path, service).wait_published("m", "job-1", deadline=float("inf"))
     assert out["status"] == "published" and out["skeleton"] == "aaaaaaaaaaaa_bbbbbbbbbbbb_cccccccccccc"
+
+
+_WORKER = "(InferenceWorker pid=1100, ip=10.4.173.206)"
+_STALLED_HEAD = [
+    f"2026-11-10T20:41:10.100Z {_WORKER} INFO [default_loader.py:484] Loading weights took 288.08 seconds",
+    f"2026-11-10T20:41:16.554Z {_WORKER} WARNING [model_manager.py:496] no matching PunicaWrapper is found"]
+_PLAIN_INIT = (f"2026-11-10T20:48:02.000Z {_WORKER} INFO [core.py:373] init engine (profile, create kv cache, "
+               "warmup model) took 412.50 s")
+
+
+def test_collect_logs_adds_the_newest_page_when_the_tail_stalls():
+    service = _PublishJob([_STALLED_HEAD], newest={0: [_STALLED_HEAD[-1], _PLAIN_INIT]})
+    logs = startup.collect_logs(service, "J", semi_p=False, wait_s=60, poll_s=0)
+    assert logs["sub-job.log"] == _STALLED_HEAD + [_PLAIN_INIT]
+    assert startup.parse_vllm(logs["sub-job.log"]) == {"load_weights_s": 288.08, "engine_init_s": 412.5}
+
+
+def test_collect_logs_keeps_the_lines_read_before_a_409():
+    # The job has ended: two pages come back, then 409 Conflict, and later every read 409s.
+    service = _PublishJob([_STALLED_HEAD, [_PLAIN_INIT]], readable=2)
+    logs = startup.collect_logs(service, "J", semi_p=False, wait_s=60, poll_s=0)
+    assert logs["sub-job.log"] == _STALLED_HEAD + [_PLAIN_INIT]
+    again = startup.collect_logs(service, "J", seen=logs, semi_p=False, wait_s=60, poll_s=0)
+    assert again["sub-job.log"] == logs["sub-job.log"]
+
+
+def test_collect_logs_gives_up_on_a_missing_total_after_its_wait():
+    service = _PublishJob([_STALLED_HEAD], newest={0: _STALLED_HEAD[-1:]})
+    started = time.time()
+    logs = startup.collect_logs(service, "J", semi_p=False, wait_s=0.05, poll_s=0.01)
+    assert time.time() - started < 5 and logs["sub-job.log"] == _STALLED_HEAD
+    assert startup.missing_fields(logs["sub-job.log"], semi_p=False) == ["engine_init_s"]
+    assert startup.stall_note(logs["sub-job.log"]) == (
+        "log stream stalled: the 2 sub-job log line(s) read before the job was cancelled "
+        "(last at 2026-11-10 20:41:16) do not have it")
+    # semi_p's total is key to ready, once every engine whose markers show has restored.
+    assert startup.missing_fields(RESTORE_LOG[:4], semi_p=True) == ["key_to_ready_s"]
+    assert startup.missing_fields(RESTORE_LOG, semi_p=True) == []
+    assert startup.missing_fields(["plain vLLM output"], semi_p=True) == []
+
+
+class _StalledPlainCluster(_Cluster):
+    """off_default's log read from the start stops mid weight load; its newest
+    page holds ``newest``."""
+
+    def __init__(self, newest):
+        super().__init__()
+        self.newest = newest
+
+    def get_job(self, job_id):
+        return {**super().get_job(job_id), "created_at": "2026-11-10T20:31:06Z"}
+
+    def tail_logs(self, job_id, cursor=None, max_lines=1000, sub_job_type=None):
+        if job_id != "job-off_default":
+            return super().tail_logs(job_id, cursor, max_lines, sub_job_type)
+        lines = self.newest if cursor is None else [] if cursor == "end" else _STALLED_HEAD
+        return {"entries": [{"_raw": line} for line in lines], "next_cursor": "end"}
+
+
+def test_the_suite_reads_plain_engine_init_from_the_newest_page_when_the_tail_stalls(monkeypatch, tmp_path):
+    result = _runner(monkeypatch, tmp_path, _StalledPlainCluster([_PLAIN_INIT])).run_one(_spec(tp=2, n_gpus=8))
+    assert result["startup"]["vllm_off"] == {"load_weights_s": 288.08, "engine_init_s": 412.5}
+    assert "unknown" not in result["startup"]
+
+
+def test_the_suite_reports_a_start_up_total_a_stalled_log_never_showed(monkeypatch, tmp_path):
+    cluster = _StalledPlainCluster(_STALLED_HEAD[-1:])
+    result = _runner(monkeypatch, tmp_path, cluster).run_one(_spec(tp=2, n_gpus=8))
+    assert result["startup"]["vllm_off"] == {"load_weights_s": 288.08}
+    assert result["startup"]["unknown"] == {"off_default": {"field": "engine_init_s", "why": (
+        "log stream stalled: the 2 sub-job log line(s) read before the job was cancelled "
+        "(last at 2026-11-10 20:41:16) do not have it")}}
+    assert "Start-up totals unknown: plain, default `engine_init_s` (log stream stalled" in report.markdown(result)
+    assert "job-off_default" in cluster.cancelled
 
 
 def _fake_kubectl(ready_after):
