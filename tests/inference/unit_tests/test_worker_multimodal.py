@@ -1421,10 +1421,14 @@ def test_worker_media_modalities_empty_for_text_only_model(monkeypatch):
 
 
 def test_worker_media_modalities_ids_without_a_media_spec(monkeypatch):
-    # No spec for this model type: the config's own ids, each only when set.
+    # No spec for this model type: the config's own ids, each only when set, read top-level then from
+    # text_config as the Qwen-VL spec reads them.
     _video_libraries(monkeypatch, *_VIDEO_LIBRARIES)
     worker = _media_worker(hf_config=SimpleNamespace(model_type="other_vl", image_token_id=77))
     assert worker.media_modalities() == {"image": 77}
+    nested = SimpleNamespace(image_token_id=78, video_token_id=79)
+    worker = _media_worker(hf_config=SimpleNamespace(model_type="other_vl", image_token_id=77, text_config=nested))
+    assert worker.media_modalities() == {"image": 77, "video": 79}
     worker = _media_worker(hf_config=SimpleNamespace(model_type="other_vl"))
     assert worker.media_modalities() == {}
 
