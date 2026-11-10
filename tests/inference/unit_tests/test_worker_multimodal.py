@@ -8,6 +8,7 @@ import importlib
 import importlib.abc
 import importlib.machinery
 import importlib.util
+import inspect
 import random
 import struct
 import sys
@@ -50,13 +51,28 @@ def _stub_attr(module_name, name):
 
 
 class _FakeHasher:
-    """vLLM 0.32.0's signature: the algorithm is positional-only and required."""
+    """``MultiModalHasher`` with vLLM 0.33.0's signatures (vllm/multimodal/hasher.py lines 85-237).
+
+    All four are classmethods; ``hash_kwargs``'s algorithm is positional-only and required.
+    """
 
     calls = []
 
-    @staticmethod
-    def hash_kwargs(algorithm, /, **kwargs):
-        _FakeHasher.calls.append((algorithm, kwargs))
+    @classmethod
+    def serialize_item(cls, obj: object):
+        raise NotImplementedError
+
+    @classmethod
+    def iter_item_to_bytes(cls, key: str, obj: object):
+        raise NotImplementedError
+
+    @classmethod
+    def iter_value_to_bytes(cls, obj: object):
+        raise NotImplementedError
+
+    @classmethod
+    def hash_kwargs(cls, algorithm, /, **kwargs: object) -> str:
+        cls.calls.append((algorithm, kwargs))
         return f"{algorithm}:" + repr(sorted(kwargs.items()))
 
 
@@ -135,10 +151,48 @@ def _model_config(
     return SimpleNamespace(model="qwen-vl", max_model_len=4096, multimodal_config=mm_config)
 
 
-def _renderer(enable_prefix_caching=True):
-    """vLLM's renderer keeps the engine's ``VllmConfig`` as ``config`` (vllm/renderers/base.py lines 106-110)."""
+class _FakeDataItems:
+    """One modality's parsed items; ``get_all_items_for_hash`` is vllm/multimodal/parse.py (v0.33.0) line 101."""
+
+    def __init__(self, items, for_hash):
+        self._items = items
+        self._for_hash = for_hash
+
+    def __len__(self):
+        return len(self._items)
+
+    def get_all_items_for_hash(self):
+        return [self._for_hash(item) for item in self._items]
+
+
+class _FakeProcessingInfo:
+    """The processor's ``info``: ``parse_mm_data`` as the renderer calls it (vllm/renderers/base.py v0.33.0,
+    line 959) and ``model_id`` (vllm/multimodal/processing/processor.py v0.33.0, line 1399), with
+    ``BaseProcessingInfo``'s signatures (vllm/multimodal/processing/context.py v0.33.0: ``model_id`` 459-460,
+    ``parse_mm_data(mm_data, *, validate=True)`` 628).
+
+    Like ``MultiModalDataParser.parse_mm_data`` (parse.py lines 861-873) a ``None`` modality is dropped and a
+    single item becomes a list of one; ``for_hash`` stands in for the item's ``get_item_for_hash``.
+    """
+
+    def __init__(self, model_id="qwen-vl", for_hash=lambda item: item):
+        self.model_id = model_id
+        self._for_hash = for_hash
+
+    def parse_mm_data(self, mm_data, *, validate=True):
+        return {
+            modality: _FakeDataItems(items if isinstance(items, list) else [items], self._for_hash)
+            for modality, items in mm_data.items()
+            if items is not None
+        }
+
+
+def _renderer(enable_prefix_caching=True, info=None):
+    """vLLM's renderer keeps the engine's ``VllmConfig`` as ``config`` (vllm/renderers/base.py v0.33.0, 106-110)
+    and its processor behind ``get_mm_processor()`` (lines 231-235)."""
     cache_config = SimpleNamespace(enable_prefix_caching=enable_prefix_caching)
-    return SimpleNamespace(config=SimpleNamespace(cache_config=cache_config))
+    processor = SimpleNamespace(info=info or _FakeProcessingInfo())
+    return SimpleNamespace(config=SimpleNamespace(cache_config=cache_config), get_mm_processor=lambda: processor)
 
 
 def _new_worker(parser=None):
@@ -188,11 +242,11 @@ class _FakeEngine:
         yield SimpleNamespace(outputs=[choice], prompt_token_ids=ids, num_cached_tokens=0, prompt_logprobs=None)
 
 
-def _generate(worker, prompt, params=None, model_config=None, enable_prefix_caching=True):
+def _generate(worker, prompt, params=None, model_config=None, enable_prefix_caching=True, info=None):
     worker.llm = _FakeEngine()
     if model_config is not None:
         worker.llm.model_config = model_config
-    worker.llm.renderer = _renderer(enable_prefix_caching)
+    worker.llm.renderer = _renderer(enable_prefix_caching, info)
     result = asyncio.run(worker.generate(prompt, dict(params or {"max_tokens": 1})))
     return result, worker.llm.calls
 
@@ -249,13 +303,32 @@ def test_media_prompt_drops_none_keys():
     assert set(calls[0][0]) == {"prompt_token_ids", "multi_modal_data"}
 
 
-def _hash_calls(prompt, model_config, enable_prefix_caching=True):
+def _hash_calls(prompt, model_config, enable_prefix_caching=True, info=None):
     calls = _FakeHasher.calls
     calls.clear()
     result, _calls = _generate(
-        _new_worker(), prompt, model_config=model_config, enable_prefix_caching=enable_prefix_caching
+        _new_worker(), prompt, model_config=model_config, enable_prefix_caching=enable_prefix_caching, info=info
     )
     return result["mm_hashes"], list(calls)
+
+
+def test_media_hashes_hash_the_parsed_item_with_the_processors_model_id():
+    # vllm/multimodal/processing/inputs.py (v0.33.0) line 85 hashes get_all_items_for_hash(), not the prompt's
+    # item: a decoded video MediaWithBytes((frames, metadata), bytes) is hashed as
+    # (MediaWithBytes(frames, bytes), metadata) (vllm/multimodal/parse.py lines 412-417 and 650-654).
+    # processor.py lines 1396-1401 pass the processor info's model_id.
+    video = object()
+    info = _FakeProcessingInfo(model_id="Qwen/Qwen2.5-VL", for_hash=lambda item: ("for-hash", item))
+    prompt = _media_prompt(multi_modal_data={"video": video})
+    _hashes, calls = _hash_calls(prompt, _model_config(), info=info)
+    assert calls == [("blake3", {"model_id": "Qwen/Qwen2.5-VL", "video": ("for-hash", video)})]
+
+
+def test_a_single_media_uuid_is_a_list_of_one():
+    # vllm/multimodal/parse.py (v0.33.0) lines 883-890: a str uuid stands for one item only.
+    prompt = _media_prompt(multi_modal_data={"image": [object(), object()]}, multi_modal_uuids={"image": "a"})
+    with pytest.raises(ValueError, match="multi_modal_uuids"):
+        _hash_calls(prompt, _model_config())
 
 
 def test_media_hashes_use_engine_algorithm_positionally():
@@ -278,7 +351,8 @@ def test_media_uuid_is_hashed_in_place_of_item_with_factors():
     assert hashes["image"] != ["img-0"]
 
 
-# A deployment that sets both kwargs at engine level. vLLM 0.32's default mm_device_do_normalize makes
+# A deployment that sets both kwargs at engine level. vLLM 0.33's default mm_device_do_normalize
+# (vllm/config/multimodal.py line 352) makes
 # its merged processor kwargs carry do_normalize / do_rescale even when the prompt has none.
 def _engine_kwargs_config(**kwargs):
     engine_kwargs = {"max_pixels": 256}
@@ -292,7 +366,7 @@ def _engine_kwargs_config(**kwargs):
 
 
 def _vllm_mm_hashes(model_id, mm_data, mm_uuids, mm_processor_kwargs, media_io_kwargs):
-    """``ProcessorInputs.get_mm_hashes`` (vllm/multimodal/processing/inputs.py, v0.32.0), step by step."""
+    """``ProcessorInputs.get_mm_hashes`` (vllm/multimodal/processing/inputs.py, v0.33.0), step by step."""
     hasher, scoped = _FakeHasher, {"image": "images_kwargs", "video": "videos_kwargs", "audio": "audio_kwargs"}
     mm_hashes = {}
     for modality, items in mm_data.items():  # line 45
@@ -317,8 +391,8 @@ def test_engine_kwargs_are_not_hash_factors():
     image, clip = object(), object()
     prompt = _media_prompt(multi_modal_data={"image": [image], "video": [clip]}, multi_modal_uuids={"image": ["img-0"]})
     hashes, _calls = _hash_calls(prompt, _engine_kwargs_config())
-    # vllm/renderers/base.py (v0.32.0) lines 950-955 take both kwargs from the prompt, which has none, and
-    # lines 915-921 put them on ProcessorInputs as {}: the engine's are not merged in.
+    # vllm/renderers/base.py (v0.33.0) lines 1066-1074 take both kwargs from the prompt, which has none, and
+    # lines 966-971 put them on ProcessorInputs as {}: the engine's are not merged in.
     expected = _vllm_mm_hashes("qwen-vl", {"image": [image], "video": [clip]}, {"image": ["img-0"]}, {}, {})
     assert hashes == expected
     assert hashes["image"] == ["img-0"]
@@ -333,7 +407,7 @@ def test_engine_kwargs_are_not_merged_into_request_kwargs():
         mm_processor_kwargs=request_kwargs,
     )
     hashes, calls = _hash_calls(prompt, _engine_kwargs_config())
-    # Lines 950-955 and 915-921 again: ProcessorInputs gets the prompt's kwargs exactly.
+    # Lines 1066-1074 and 966-971 again: ProcessorInputs gets the prompt's kwargs exactly.
     expected = _vllm_mm_hashes(
         "qwen-vl", {"image": [image], "video": [clip]}, {"image": ["img-0"]}, request_kwargs, {}
     )
@@ -351,7 +425,7 @@ def test_generate_hashes_request_kwargs_without_engine_kwargs():
         multi_modal_data={"image": [image]}, multi_modal_uuids={"image": ["img-0"]}, mm_processor_kwargs=request_kwargs
     )
     hashes, _calls = _hash_calls(prompt, _engine_kwargs_config())
-    # Through generate: lines 950-955 and 915-921 hand ProcessorInputs the prompt's kwargs, not the engine merge.
+    # Through generate: lines 1066-1074 and 966-971 hand ProcessorInputs the prompt's kwargs, not the engine merge.
     assert hashes == _vllm_mm_hashes("qwen-vl", {"image": [image]}, {"image": ["img-0"]}, request_kwargs, {})
 
 
@@ -365,9 +439,9 @@ def test_media_hashes_take_per_request_uuids_when_both_caches_are_off(monkeypatc
         mm_processor_kwargs=request_kwargs,
     )
     hashes, _calls = _hash_calls(prompt, _engine_kwargs_config(mm_processor_cache_gb=0), enable_prefix_caching=False)
-    # vllm/renderers/base.py lines 874-889: with mm_processor_cache_gb == 0 and prefix caching off, an item without
-    # a uuid gets f"{mm_req_id}-{modality}-{i}"; a given uuid is kept. vLLM's mm_req_id is a renderer counter
-    # (line 906) the worker cannot see, so the worker's request id stands in for it.
+    # vllm/renderers/base.py (v0.33.0) lines 923-938: with mm_processor_cache_gb == 0 and prefix caching off, an
+    # item without a uuid gets f"{mm_req_id}-{modality}-{i}"; a given uuid is kept. vLLM's mm_req_id is a renderer
+    # counter (line 957) the worker cannot see, so the worker's request id stands in for it.
     uuids = {"image": ["req-1-image-0", "img-1"]}
     assert hashes == _vllm_mm_hashes("qwen-vl", {"image": images}, uuids, request_kwargs or {}, {})
     if request_kwargs is None:
@@ -383,6 +457,107 @@ def test_media_hashes_hash_content_when_either_cache_is_on(monkeypatch, cache_gb
         prompt, _engine_kwargs_config(mm_processor_cache_gb=cache_gb), enable_prefix_caching=prefix_caching
     )
     assert hashes == _vllm_mm_hashes("qwen-vl", {"image": [image]}, {}, {}, {})
+
+
+_REAL_VLLM = {}
+
+
+@contextlib.contextmanager
+def _real_vllm():
+    """Take the stand-in out for vLLM itself, if installed, then put the stand-in back.
+
+    The real modules are kept after the first import and reused, so vLLM is imported once per process.
+    """
+    stand_ins = {name: module for name, module in sys.modules.items() if _is_vllm(name)}
+    finders = [finder for finder in sys.meta_path if isinstance(finder, _StubVllm)]
+    for name in stand_ins:
+        del sys.modules[name]
+    for finder in finders:
+        sys.meta_path.remove(finder)
+    sys.modules.update(_REAL_VLLM)
+    try:
+        yield
+    finally:
+        _REAL_VLLM.update({name: module for name, module in sys.modules.items() if _is_vllm(name)})
+        for name in [name for name in sys.modules if _is_vllm(name)]:
+            del sys.modules[name]
+        sys.modules.update(stand_ins)
+        sys.meta_path[:0] = finders
+
+
+@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize(
+    "mm_uuids, mm_processor_kwargs",
+    [
+        (None, None),
+        ({"image": ["img-0", None], "video": ["clip-0", None]}, None),
+        (None, {"fps": 2, "images_kwargs": {"max_pixels": 64}, "videos_kwargs": {"max_pixels": 128}}),
+        ({"image": ["img-0", None], "video": ["clip-0", None]}, {"fps": 2, "videos_kwargs": {"max_pixels": 128}}),
+    ],
+)
+def test_media_hashes_match_vllms_own_get_mm_hashes(modality, mm_uuids, mm_processor_kwargs):
+    """Where vLLM is installed, ``_media_hashes`` equals ``ProcessorInputs.get_mm_hashes`` on the same items."""
+    with _real_vllm():
+        pytest.importorskip("vllm")
+        import numpy as np
+        from PIL import Image
+        from vllm.multimodal.hasher import MultiModalHasher
+        from vllm.multimodal.media import MediaWithBytes
+        from vllm.multimodal.parse import MultiModalDataParser, parse_mm_uuids
+        from vllm.multimodal.processing import ProcessorInputs
+
+        for name in ("serialize_item", "iter_item_to_bytes", "iter_value_to_bytes", "hash_kwargs"):
+            assert inspect.signature(getattr(_FakeHasher, name)) == inspect.signature(getattr(MultiModalHasher, name))
+
+        rng = np.random.default_rng(0)
+        # The second item of each is what decode_media hands over: the decoded media with its original bytes,
+        # a video as (frames, metadata) (vllm/multimodal/parse.py v0.33.0, lines 650-654, take it apart).
+        items = {
+            "image": [
+                Image.fromarray(rng.integers(0, 256, (8, 8, 3), dtype=np.uint8)),
+                MediaWithBytes(Image.fromarray(rng.integers(0, 256, (8, 8, 3), dtype=np.uint8)), b"png"),
+            ],
+            "video": [
+                rng.integers(0, 256, (2, 8, 8, 3), dtype=np.uint8),
+                MediaWithBytes((rng.integers(0, 256, (2, 8, 8, 3), dtype=np.uint8), {"fps": 2.0}), b"mp4"),
+            ],
+        }[modality]
+        mm_data = {modality: items}
+        uuids = {modality: mm_uuids[modality]} if mm_uuids else None
+        prompt = {"prompt_token_ids": [1, 2, 3], "multi_modal_data": mm_data}
+        if uuids:
+            prompt["multi_modal_uuids"] = uuids
+        if mm_processor_kwargs:
+            prompt["mm_processor_kwargs"] = mm_processor_kwargs
+        model_config = SimpleNamespace(
+            model="qwen-vl",
+            multimodal_config=SimpleNamespace(mm_hasher_algorithm="sha256", mm_processor_cache_gb=4),
+        )
+        info = SimpleNamespace(model_id="qwen-vl", parse_mm_data=MultiModalDataParser().parse_mm_data)
+        renderer = _renderer(info=info)
+
+        expected = ProcessorInputs(
+            [1, 2, 3],
+            MultiModalDataParser().parse_mm_data(mm_data),
+            parse_mm_uuids(uuids),
+            hf_processor_mm_kwargs=mm_processor_kwargs or {},
+        ).get_mm_hashes("qwen-vl", "sha256")
+        assert worker_module._media_hashes(prompt, model_config, renderer, "req-1") == expected
+
+
+@pytest.mark.parametrize("cache_gb, prefix_caching", [(4, True), (0, False)])
+def test_media_hashes_skip_a_none_modality(monkeypatch, cache_gb, prefix_caching):
+    monkeypatch.setattr(worker_module, "uuid4", lambda: "req-1")
+    image = object()
+    prompt = _media_prompt(
+        multi_modal_data={"image": [image], "video": None}, multi_modal_uuids={"video": ["clip-0"]}
+    )
+    hashes, _calls = _hash_calls(
+        prompt, _engine_kwargs_config(mm_processor_cache_gb=cache_gb), enable_prefix_caching=prefix_caching
+    )
+    # vllm/renderers/base.py (v0.33.0) lines 881-882: a None modality is not in mm_data_items, so
+    # get_mm_hashes (lines 45-107) and the synthetic uuids (line 931) never see it.
+    assert set(hashes) == {"image"}
 
 
 class _NoPromptIdsEngine(_FakeEngine):
