@@ -174,7 +174,7 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         zero_config["allgather_bucket_size"] = spec.zero_bucket_size
     if spec.ds_overrides:
         ds_config.update(spec.ds_overrides)
-    apply_default_grad_accum_dtype(ds_config)
+    apply_default_grad_accum_dtype(ds_config, bf16_only=True)
     _require_fp32_gradient_reduction(ds_config)
     logger.info(
         "Resolved DeepSpeed precision: bf16=%s fp16=%s communication_data_type=%s",
@@ -185,11 +185,12 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
     return ds_config
 
 
-def apply_default_grad_accum_dtype(ds_config: dict[str, Any]) -> None:
-    """Default an unspecified accumulation dtype to FP32 without mutating a caller-owned block.
+def apply_default_grad_accum_dtype(ds_config: dict[str, Any], *, bf16_only: bool = False) -> None:
+    """Default unspecified accumulation to FP32 without mutating a caller-owned block.
 
-    DeepSpeed uses the model dtype when ``grad_accum_dtype`` is absent or ``None``. Preserve other ``data_types``
-    fields and explicit dtypes, and leave invalid blocks to DeepSpeed's config validation.
+    The builder opts into BF16-only defaulting; the worker retains its existing FP32 default for all supported
+    precisions. Preserve other ``data_types`` fields and explicit dtypes, and leave invalid blocks to
+    DeepSpeed's config validation.
 
     Mixed-precision ZeRO0 rejects FP32 accumulation. BF16 ZeRO1 without CPU offload selects DeepSpeed's BF16
     optimizer when gradient norms are disabled, and that optimizer refuses this configuration. Leave the native
@@ -200,13 +201,13 @@ def apply_default_grad_accum_dtype(ds_config: dict[str, Any]) -> None:
         return
     if (data_types or {}).get("grad_accum_dtype") is not None:
         return
-    if not _deepspeed_accepts_fp32_grad_accumulation(ds_config):
+    if not _deepspeed_accepts_fp32_grad_accumulation(ds_config, bf16_only=bf16_only):
         return
     ds_config["data_types"] = {**(data_types or {}), "grad_accum_dtype": "fp32"}
 
 
-def _deepspeed_accepts_fp32_grad_accumulation(ds_config: dict[str, Any]) -> bool:
-    """Whether DeepSpeed's optimizer sanity check accepts an explicit FP32 accumulation dtype."""
+def _deepspeed_accepts_fp32_grad_accumulation(ds_config: dict[str, Any], *, bf16_only: bool) -> bool:
+    """Whether the effective config supports FP32 accumulation within the caller's precision policy."""
     from deepspeed.runtime.precision_config import get_bfloat16_config
     from deepspeed.runtime.precision_config import get_float16_config
     from deepspeed.runtime.zero.config import ZeroStageEnum
@@ -217,6 +218,8 @@ def _deepspeed_accepts_fp32_grad_accumulation(ds_config: dict[str, Any]) -> bool
     zero = get_zero_config(ds_config)
     bf16 = get_bfloat16_config(ds_config).enabled
     fp16 = get_float16_config(ds_config).enabled
+    if bf16_only and not bf16:
+        return False
     if zero.stage == ZeroStageEnum.disabled:
         return not (bf16 or fp16)
     cpu_offload = zero.offload_optimizer is not None and zero.offload_optimizer.device == OffloadDeviceEnum.cpu
