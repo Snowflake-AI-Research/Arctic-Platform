@@ -109,6 +109,7 @@ with _vllm_stand_in():
     from arctic_platform.inference.server import replica_pool, streaming, worker as worker_module
     from arctic_platform.inference.server.media_prompts import MediaDecodeError
     from arctic_platform.inference.server.replica_pool import ReplicaPool
+    from arctic_platform.inference.server.scheduler import Scheduler
     from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
 WorkerClass = InferenceWorker.__ray_metadata__.modified_class
@@ -256,14 +257,6 @@ def _hash_calls(prompt, model_config, enable_prefix_caching=True):
     return result["mm_hashes"], list(calls)
 
 
-def _direct_hash_calls(prompt, model_config):
-    """``_media_hashes`` itself, for prompt keys ``generate`` refuses (media prompts carry no ``media_io_kwargs``)."""
-    calls = _FakeHasher.calls
-    calls.clear()
-    hashes = worker_module._media_hashes(prompt, model_config, _renderer().config.cache_config, "req-1")
-    return hashes, list(calls)
-
-
 def test_media_hashes_use_engine_algorithm_positionally():
     images = [object(), object()]
     prompt = _media_prompt(multi_modal_data={"image": images}, multi_modal_uuids={"image": ["a", None]})
@@ -271,36 +264,6 @@ def test_media_hashes_use_engine_algorithm_positionally():
     # No hash factors: the caller's uuid is the hash as is, the other item is hashed.
     assert calls == [("sha512", {"model_id": "qwen-vl", "image": images[1]})]
     assert hashes == {"image": ["a", "sha512:" + repr([("image", images[1]), ("model_id", "qwen-vl")])]}
-
-
-def test_media_hash_factors_are_nested_and_scoped_per_modality():
-    image, clip = object(), object()
-    prompt = _media_prompt(
-        multi_modal_data={"image": image, "video": clip},
-        mm_processor_kwargs={"fps": 2, "images_kwargs": {"max_pixels": 64}, "videos_kwargs": {"max_frames": 4}},
-        media_io_kwargs={"video": {"num_frames": 8}},
-    )
-    hashes, calls = _direct_hash_calls(prompt, _model_config())
-    assert calls == [
-        (
-            "blake3",
-            {
-                "model_id": "qwen-vl",
-                "image": image,
-                "mm_processor_kwargs": {"fps": 2, "images_kwargs": {"max_pixels": 64}},
-            },
-        ),
-        (
-            "blake3",
-            {
-                "model_id": "qwen-vl",
-                "video": clip,
-                "media_io_kwargs": {"video": {"num_frames": 8}},
-                "mm_processor_kwargs": {"fps": 2, "videos_kwargs": {"max_frames": 4}},
-            },
-        ),
-    ]
-    assert set(hashes) == {"image", "video"}
 
 
 def test_media_uuid_is_hashed_in_place_of_item_with_factors():
@@ -363,30 +326,20 @@ def test_engine_kwargs_are_not_hash_factors():
 def test_engine_kwargs_are_not_merged_into_request_kwargs():
     image, clip = object(), object()
     request_kwargs = {"fps": 2, "images_kwargs": {"max_pixels": 64}}
-    request_media_io = {"video": {"num_frames": 4}}
     prompt = _media_prompt(
         multi_modal_data={"image": [image], "video": [clip]},
         multi_modal_uuids={"image": ["img-0"]},
         mm_processor_kwargs=request_kwargs,
-        media_io_kwargs=request_media_io,
     )
-    hashes, calls = _direct_hash_calls(prompt, _engine_kwargs_config())
+    hashes, calls = _hash_calls(prompt, _engine_kwargs_config())
     # Lines 950-955 and 915-921 again: ProcessorInputs gets the prompt's kwargs exactly.
     expected = _vllm_mm_hashes(
-        "qwen-vl", {"image": [image], "video": [clip]}, {"image": ["img-0"]}, request_kwargs, request_media_io
+        "qwen-vl", {"image": [image], "video": [clip]}, {"image": ["img-0"]}, request_kwargs, {}
     )
     assert hashes == expected
     assert calls == [
         ("blake3", {"model_id": "qwen-vl", "image": "img-0", "mm_processor_kwargs": request_kwargs}),
-        (
-            "blake3",
-            {
-                "model_id": "qwen-vl",
-                "video": clip,
-                "media_io_kwargs": request_media_io,
-                "mm_processor_kwargs": {"fps": 2},
-            },
-        ),
+        ("blake3", {"model_id": "qwen-vl", "video": clip, "mm_processor_kwargs": {"fps": 2}}),
     ]
 
 
@@ -429,6 +382,28 @@ def test_media_hashes_hash_content_when_either_cache_is_on(monkeypatch, cache_gb
         prompt, _engine_kwargs_config(mm_processor_cache_gb=cache_gb), enable_prefix_caching=prefix_caching
     )
     assert hashes == _vllm_mm_hashes("qwen-vl", {"image": [image]}, {}, {}, {})
+
+
+class _NoPromptIdsEngine(_FakeEngine):
+    """An engine whose output carries no prompt ids (``RequestOutput.prompt_token_ids`` is Optional)."""
+
+    def __init__(self, prompt_token_ids):
+        super().__init__()
+        self._prompt_token_ids = prompt_token_ids
+
+    async def generate(self, prompt, params, **kwargs):
+        async for output in super().generate(prompt, params, **kwargs):
+            output.prompt_token_ids = self._prompt_token_ids
+            yield output
+
+
+@pytest.mark.parametrize("prompt_token_ids", [None, []])
+def test_media_result_without_expanded_ids_raises(prompt_token_ids):
+    worker = _new_worker()
+    worker.llm = _NoPromptIdsEngine(prompt_token_ids)
+    with pytest.raises(RuntimeError, match="no prompt_token_ids for media request"):
+        asyncio.run(worker.generate(_media_prompt(), {"max_tokens": 1}))
+    assert len(worker.llm.calls) == 1
 
 
 def test_media_prompt_needs_multimodal_model():
@@ -1420,19 +1395,16 @@ class _RemoteMethod:
         return call()
 
 
-class _AvailabilityScheduler:
-    def __init__(self, available):
-        self._available = available
-
-    def is_worker_available(self, idx):
-        return self._available[idx]
-
-
 def _media_pool(workers, available, model_id="vl"):
-    pool = ReplicaPool.__new__(ReplicaPool)
+    """A pool over in-process workers, with the scheduler ``ReplicaPool`` routes through."""
+    handles = [SimpleNamespace(media_modalities=_RemoteMethod(w.media_modalities)) for w in workers]
+    pool = ReplicaPool()
     pool._model_id = model_id
-    pool._scheduler = _AvailabilityScheduler(available)
-    pool._workers = [SimpleNamespace(media_modalities=_RemoteMethod(w.media_modalities)) for w in workers]
+    pool._workers = handles
+    pool._scheduler = Scheduler(handles, dynamic_concurrency=False)
+    for index, ready in enumerate(available):
+        if not ready:
+            pool._scheduler.mark_worker_unavailable(index)
     return pool
 
 
@@ -1444,13 +1416,31 @@ def test_pool_media_modalities_pass_one_ready_workers_answer_through(monkeypatch
     assert [w.media_modalities.calls for w in pool._workers] == [0, 2]
 
 
-def test_pool_media_modalities_empty_without_ready_worker(monkeypatch):
+def test_pool_media_modalities_wait_for_a_worker_to_become_ready(monkeypatch):
+    # Both workers restarting: the answer waits for one, it is not {} (no media).
+    _video_libraries(monkeypatch, "torchcodec")
+    pool = _media_pool([_media_worker(), _media_worker()], [False, False])
+
+    async def scenario():
+        query = asyncio.ensure_future(pool.media_modalities("vl"))
+        await asyncio.sleep(0.2)
+        assert not query.done()
+        pool._scheduler.mark_worker_available(1)
+        return await query
+
+    assert asyncio.run(asyncio.wait_for(scenario(), 30)) == _ENGINE_IDS
+    assert [w.media_modalities.calls for w in pool._workers] == [0, 1]
+
+
+def test_pool_media_modalities_raise_without_ready_worker_in_time(monkeypatch):
     _video_libraries(monkeypatch, *_VIDEO_LIBRARIES)
     pool = _media_pool([_media_worker()], [False])
-    assert asyncio.run(pool.media_modalities("vl")) == {}
+    with pytest.raises(RuntimeError, match="No schedulable worker within 0.1s"):
+        asyncio.run(pool.media_modalities("vl", timeout=0.1))
     assert pool._workers[0].media_modalities.calls == 0
     pool._scheduler = None
-    assert asyncio.run(pool.media_modalities("vl")) == {}
+    with pytest.raises(RuntimeError, match="ReplicaPool not initialized"):
+        asyncio.run(pool.media_modalities("vl"))
 
 
 def test_pool_media_modalities_check_model_id(monkeypatch):
@@ -1459,18 +1449,13 @@ def test_pool_media_modalities_check_model_id(monkeypatch):
         asyncio.run(pool.media_modalities("other"))
 
 
-def test_worker_media_modalities_empty_when_spec_lacks_an_id(monkeypatch, caplog):
-    # A Qwen-VL config without video_token_id: its spec cannot place tokens, so the model takes no media.
+def test_worker_media_modalities_raise_when_spec_lacks_an_id(monkeypatch):
+    # A Qwen-VL config without video_token_id: its spec cannot place tokens, which is not "no media".
     _video_libraries(monkeypatch, *_VIDEO_LIBRARIES)
-    monkeypatch.setattr(worker_module, "_NO_PLACEHOLDER_IDS_WARNED", set())
     worker = _media_worker(hf_config=SimpleNamespace(model_type="qwen3_5", image_token_id=901, secret="s3cr3t"))
-    with caplog.at_level("WARNING", logger="arctic_platform.inference.server"):
-        assert worker.media_modalities() == {}
-        assert worker.media_modalities() == {}
-    (record,) = [r for r in caplog.records if "takes no media" in r.getMessage()]
-    assert record.levelname == "WARNING"
-    assert "'qwen3_5'" in record.getMessage() and "video_token_id" in record.getMessage()
-    assert "s3cr3t" not in caplog.text
+    with pytest.raises(ValueError, match="needs video_token_id") as raised:
+        worker.media_modalities()
+    assert "s3cr3t" not in str(raised.value)
 
 
 def test_driver_media_modalities_pass_the_pools_answer_through(monkeypatch):
@@ -1478,9 +1463,13 @@ def test_driver_media_modalities_pass_the_pools_answer_through(monkeypatch):
 
     _video_libraries(monkeypatch, "torchcodec")
     driver = Driver.__new__(Driver)
-    driver._pools = {"vl": _media_pool([_media_worker()], [True]), "idle": _media_pool([_media_worker()], [False], "idle")}
+    idle = _media_pool([_media_worker()], [False], "idle")
+    driver._pools = {"vl": _media_pool([_media_worker()], [True]), "idle": idle}
     assert asyncio.run(driver.media_modalities("vl")) == _ENGINE_IDS
-    assert asyncio.run(driver.media_modalities("idle")) == {}
+    # A pool with no ready worker raises through the Driver; a stopped scheduler raises at once.
+    asyncio.run(idle._scheduler.shutdown())
+    with pytest.raises(RuntimeError, match="Scheduler stopped"):
+        asyncio.run(driver.media_modalities("idle"))
     with pytest.raises(KeyError, match="Unknown model_id 'other'"):
         asyncio.run(driver.media_modalities("other"))
     with pytest.raises(ValueError, match="model_id is required"):
