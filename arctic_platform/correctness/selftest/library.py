@@ -11713,7 +11713,7 @@ def test_cortex_optimizer_capture_runner_public_cortex_capture_keeps_fixture_bud
         assert all((session is not None and session.closed for _, session in closed))
         assert all((transport.job_id is None and transport._session is None for transport in transports))
         assert all((not snapshot.exists() for snapshot in snapshots))
-        assert not list((tmp_path / "optimizer" / "dss" / "gas1").iterdir())
+        assert not list((tmp_path / "optimizer" / "ap" / "gas1").iterdir())
         assert references == [
             (check, arm) for arm in ("gas1", "gas4") for check in ("single-step-grads", "single-step-optimizer")
         ]
@@ -26897,7 +26897,7 @@ def test_local_cortex_fixture_local_fixture_rejects_nonlocal_or_ambiguous_urls_b
 
 @pytest.mark.parametrize(
     "field,value",
-    [("backend", "dss"), ("source_root", "/different/AP/checkout"), ("supports_local_model_paths", False)],
+    [("backend", "ap"), ("source_root", "/different/AP/checkout"), ("supports_local_model_paths", False)],
 )
 def test_local_cortex_fixture_local_fixture_does_not_require_or_attest_backend_identity(
     tmp_path, monkeypatch, field, value
@@ -27511,6 +27511,23 @@ def test_reference_free_metadata_rejects_source_drift_during_header_admission(
 _optimizer_norms_KWARGS = {"optimizer_config": {}, "learning_rate": OPTIMIZER_LEARNING_RATE}
 
 
+@pytest.mark.parametrize("entrypoint", ["summary", "participation"])
+def test_optimizer_norms_unknown_backend_is_rejected_before_input_access(monkeypatch, entrypoint):
+    monkeypatch.setattr(Path, "read_text", lambda *args, **kwargs: pytest.fail("invalid backend read artifacts"))
+    with pytest.raises(ValueError, match="unknown .*backend"):
+        if entrypoint == "summary":
+            summarize_optimizer_artifacts(Path("missing-manifest.json"), backend="unknown", **_optimizer_norms_KWARGS)
+        else:
+            optimizer_capture.canonical_participation({}, backend="unknown")
+
+
+@pytest.mark.parametrize("key,label", [("ap", "Arctic Platform"), ("optimizer_ap", "opt Arctic Platform")])
+def test_optimizer_norms_runtime_table_reads_ap_backend_timing(key, label):
+    rendered = report.runtime_table({"gas1": {key: 2.0}, "gas4": {key: 4.0}}, 6.0)
+    row = next(line for line in rendered.splitlines() if line.strip().startswith(label))
+    assert row.split()[-3:] == ["2.0s", "4.0s", "6.0s"]
+
+
 @pytest.fixture
 def _optimizer_norms_artifact_root(tmp_path):
     assert tmp_path.resolve().is_relative_to(
@@ -27557,7 +27574,7 @@ def _optimizer_norms_summary(parameters=None):
 
 def _optimizer_norms_adam_states(gradient, backend):
     beta1, beta2, epsilon, lr = (0.9, 0.999, 1e-08, OPTIMIZER_LEARNING_RATE)
-    if backend == "dss":
+    if backend == "ap":
         beta1, beta2, epsilon, lr = [
             float(torch.tensor(value, dtype=torch.float32)) for value in (beta1, beta2, epsilon, lr)
         ]
@@ -27568,7 +27585,7 @@ def _optimizer_norms_adam_states(gradient, backend):
     second = (1.0 - beta2) * gradient.square()
     denominator = (second / correction2).sqrt() + epsilon
     update = (
-        -(first / correction1 / denominator) * lr if backend == "dss" else -lr * (first / correction1) / denominator
+        -(first / correction1 / denominator) * lr if backend == "ap" else -lr * (first / correction1) / denominator
     )
     return {"parameter_update": update, "exp_avg": first, "exp_avg_sq": second}
 
@@ -27612,7 +27629,7 @@ def _optimizer_participation_manifest(root, *, include_inactive=True):
     return path
 
 
-@pytest.mark.parametrize("backend", ["reference", "dss"])
+@pytest.mark.parametrize("backend", ["reference", "ap"])
 @pytest.mark.parametrize("include_inactive", [True, False])
 def test_optimizer_participation_preserves_complete_inactive_witnesses(
     _optimizer_norms_artifact_root, backend, include_inactive
@@ -27708,7 +27725,7 @@ def test_optimizer_norms_summary_is_compact_serializable_float32_l2(_optimizer_n
     )
 
 
-@pytest.mark.parametrize("backend", ["reference", "dss"])
+@pytest.mark.parametrize("backend", ["reference", "ap"])
 def test_optimizer_norms_norms_keep_backend_specific_moment_update_residual(_optimizer_norms_artifact_root, backend):
     states = _optimizer_norms_adam_states(torch.tensor([0.2, -0.4, 2.0]), backend)
     manifest = _optimizer_norms_manifest(_optimizer_norms_artifact_root / backend, {"layer.weight": states})
@@ -27720,7 +27737,7 @@ def test_optimizer_norms_norms_keep_backend_specific_moment_update_residual(_opt
     assert result["exp_avg_sq"] == float(torch.linalg.vector_norm(states["exp_avg_sq"]))
 
 
-@pytest.mark.parametrize("backend", ["reference", "dss"])
+@pytest.mark.parametrize("backend", ["reference", "ap"])
 def test_optimizer_norms_nonzero_initial_parameters_do_not_enter_update_norm(_optimizer_norms_artifact_root, backend):
     initial = torch.tensor([2.0, -3.0])
     states = _optimizer_norms_adam_states(torch.tensor([1.0, -1.0]), backend)
@@ -27735,16 +27752,16 @@ def test_optimizer_norms_nonzero_initial_parameters_do_not_enter_update_norm(_op
 
 
 def test_optimizer_norms_unexplained_update_is_not_removed_by_norm_reduction(_optimizer_norms_artifact_root):
-    states = _optimizer_norms_adam_states(torch.tensor([1.0, -1.0]), "dss")
+    states = _optimizer_norms_adam_states(torch.tensor([1.0, -1.0]), "ap")
     states["parameter_update"] += torch.tensor([0.003, 0.004])
     manifest = _optimizer_norms_manifest(_optimizer_norms_artifact_root / "corrupt", {"module.layer.weight": states})
-    result = summarize_optimizer_artifacts(manifest, backend="dss", **_optimizer_norms_KWARGS)
+    result = summarize_optimizer_artifacts(manifest, backend="ap", **_optimizer_norms_KWARGS)
     assert result["parameters"]["layer.weight"]["parameter_update_residual"] == pytest.approx(0.005)
 
 
 def test_optimizer_norms_moe_tensors_are_concatenated_before_residual_and_norm(_optimizer_norms_artifact_root):
-    w1 = _optimizer_norms_adam_states(torch.tensor([[[0.2, 0.4]]]), "dss")
-    w3 = _optimizer_norms_adam_states(torch.tensor([[[0.6, 0.8]]]), "dss")
+    w1 = _optimizer_norms_adam_states(torch.tensor([[[0.2, 0.4]]]), "ap")
+    w3 = _optimizer_norms_adam_states(torch.tensor([[[0.6, 0.8]]]), "ap")
     dss = _optimizer_norms_manifest(
         _optimizer_norms_artifact_root / "moe",
         {"module.layers.0.mlp.experts.w1": w1, "module.layers.0.mlp.experts.w3": w3},
@@ -27753,8 +27770,8 @@ def test_optimizer_norms_moe_tensors_are_concatenated_before_residual_and_norm(_
     canonical = _optimizer_norms_manifest(
         _optimizer_norms_artifact_root / "canonical", {"layers.0.mlp.experts.gate_up_proj": joined}
     )
-    actual = summarize_optimizer_artifacts(dss, backend="dss", **_optimizer_norms_KWARGS)
-    expected = summarize_optimizer_artifacts(canonical, backend="dss", **_optimizer_norms_KWARGS)
+    actual = summarize_optimizer_artifacts(dss, backend="ap", **_optimizer_norms_KWARGS)
+    expected = summarize_optimizer_artifacts(canonical, backend="ap", **_optimizer_norms_KWARGS)
     assert actual == expected
     entry = actual["parameters"]["layers.0.mlp.experts.gate_up_proj"]
     assert entry["shape"] == [1, 2, 2]
@@ -27772,7 +27789,7 @@ def test_optimizer_norms_canonical_collision_cannot_hide_a_parameter(_optimizer_
         },
     )
     with pytest.raises(ValueError, match="canonical parameter name collision"):
-        summarize_optimizer_artifacts(manifest, backend="dss", **_optimizer_norms_KWARGS)
+        summarize_optimizer_artifacts(manifest, backend="ap", **_optimizer_norms_KWARGS)
 
 
 def test_optimizer_norms_normalization_collision_is_rejected(_optimizer_norms_artifact_root):
@@ -27861,10 +27878,10 @@ def test_optimizer_norms_compare_uses_scalar_norm_difference_not_tensor_differen
         _optimizer_norms_artifact_root / "ref", {"layer.weight": _optimizer_norms_states(torch.tensor([1.0, 2.0]))}
     )
     dss = _optimizer_norms_manifest(
-        _optimizer_norms_artifact_root / "dss", {"layer.weight": _optimizer_norms_states(torch.tensor([4.0, 6.0]))}
+        _optimizer_norms_artifact_root / "ap", {"layer.weight": _optimizer_norms_states(torch.tensor([4.0, 6.0]))}
     )
     comparison = compare_optimizer_norms(
-        summarize_optimizer_artifacts(dss, backend="dss", **_optimizer_norms_KWARGS),
+        summarize_optimizer_artifacts(dss, backend="ap", **_optimizer_norms_KWARGS),
         summarize_optimizer_artifacts(ref, **_optimizer_norms_KWARGS),
     )
     assert comparison.worst_delta == pytest.approx(math.sqrt(52) - math.sqrt(5))
@@ -27876,10 +27893,10 @@ def test_optimizer_norms_equal_norm_different_direction_is_intentionally_undetec
         _optimizer_norms_artifact_root / "ref", {"layer.weight": _optimizer_norms_states(torch.tensor([3.0, 4.0]))}
     )
     dss = _optimizer_norms_manifest(
-        _optimizer_norms_artifact_root / "dss", {"layer.weight": _optimizer_norms_states(torch.tensor([-3.0, -4.0]))}
+        _optimizer_norms_artifact_root / "ap", {"layer.weight": _optimizer_norms_states(torch.tensor([-3.0, -4.0]))}
     )
     comparison = compare_optimizer_norms(
-        summarize_optimizer_artifacts(dss, backend="dss", **_optimizer_norms_KWARGS),
+        summarize_optimizer_artifacts(dss, backend="ap", **_optimizer_norms_KWARGS),
         summarize_optimizer_artifacts(ref, **_optimizer_norms_KWARGS),
     )
     assert comparison.worst_delta == 0.0
@@ -28055,7 +28072,7 @@ def _optimizer_norms_context_and_results(manifest, reference_norms=None, gate=0.
 
 def test_optimizer_norms_arm_consumes_only_stored_norms_and_explicit_reviewed_gate(_optimizer_norms_artifact_root):
     manifest = _optimizer_norms_manifest(
-        _optimizer_norms_artifact_root / "dss", {"layer.weight": _optimizer_norms_states(torch.tensor([0.01, 0.0]))}
+        _optimizer_norms_artifact_root / "ap", {"layer.weight": _optimizer_norms_states(torch.tensor([0.01, 0.0]))}
     )
     ctx, arm, reference, target = _optimizer_norms_context_and_results(manifest, gate=0.02)
     reference["optimizer_state_manifest"] = "do-not-open-reference-tensors"
@@ -29347,7 +29364,7 @@ def test_helper_storage_direct_training_job_rejects_checkpoint_child_escape_befo
             pytest.fail("unsafe checkpoint reached a job")
 
 
-@pytest.mark.parametrize("branch", ["reference", "dss"])
+@pytest.mark.parametrize("branch", ["reference", "ap"])
 @pytest.mark.parametrize("order", ["batched", "interleaved"])
 def test_helper_storage_runner_rejects_derived_optimizer_symlink_before_mkdir_or_payload(
     tmp_path, monkeypatch, capsys, branch, order

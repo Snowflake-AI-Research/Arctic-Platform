@@ -227,11 +227,11 @@ def runtime_table(timing, wall_seconds: float) -> str:
     width = max(9, max(len(n) for n in names) + 2)
     header = "  runtime    " + "".join(n.rjust(width) for n in names) + "total".rjust(width)
     rows = list(SEPARATOR) + [header]
-    engines = [("reference", "reference"), ("Arctic Platform", "dss")]
+    engines = [("reference", "reference"), ("Arctic Platform", "ap")]
     if any("optimizer_reference" in timing[name] for name in names):
         engines.append(("opt ref", "optimizer_reference"))
-    if any("optimizer_dss" in timing[name] for name in names):
-        engines.append(("opt Arctic Platform", "optimizer_dss"))
+    if any("optimizer_ap" in timing[name] for name in names):
+        engines.append(("opt Arctic Platform", "optimizer_ap"))
     for engine, key in engines:
         cells = [timing[n].get(key) for n in names]
         total = sum(v for v in cells if v is not None)

@@ -78,7 +78,7 @@ def _compare_arm(ctx, arm, reference: dict, target) -> TestResult:
         Path(target.optimizer_state_manifest),
         optimizer_config=ctx.cfg.training["optimizer"],
         learning_rate=OPTIMIZER_LEARNING_RATE,
-        backend="dss",
+        backend="ap",
     )
     reference_summary = reference["optimizer_norms"]
     comparison = compare_optimizer_norms(dss_summary, reference_summary)

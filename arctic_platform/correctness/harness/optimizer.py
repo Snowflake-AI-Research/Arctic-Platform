@@ -1256,7 +1256,7 @@ def validate_participation(record: dict) -> dict:
 
 
 def canonical_participation(record: dict, *, backend: str) -> dict:
-    if backend not in {"dss", "reference"}:
+    if backend not in {"ap", "reference"}:
         raise ValueError(f"unknown participation backend: {backend}")
     parameters = validate_participation(record)
     normalized = {}
@@ -1265,8 +1265,8 @@ def canonical_participation(record: dict, *, backend: str) -> dict:
         if key in normalized:
             raise ValueError(f"participation inventory has duplicate canonical name {key}")
         normalized[key] = entry
-    groups = canonical_dss_tensor_groups(normalized) if backend == "dss" else {name: None for name in normalized}
-    covered = [name for group in groups.values() for name in group.originals] if backend == "dss" else list(groups)
+    groups = canonical_dss_tensor_groups(normalized) if backend == "ap" else {name: None for name in normalized}
+    covered = [name for group in groups.values() for name in group.originals] if backend == "ap" else list(groups)
     if sorted(covered) != sorted(normalized):
         raise ValueError("participation inventory has a canonical name collision")
     result = {}
@@ -1289,7 +1289,7 @@ def canonical_participation(record: dict, *, backend: str) -> dict:
 
 
 def compare_participation(target: dict, reference: dict) -> tuple[int, int]:
-    actual = canonical_participation(target, backend="dss")
+    actual = canonical_participation(target, backend="ap")
     expected = canonical_participation(reference, backend="reference")
     if set(actual) != set(expected):
         raise ValueError(
