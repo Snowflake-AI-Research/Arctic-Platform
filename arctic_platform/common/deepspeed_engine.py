@@ -691,7 +691,14 @@ def _optimizer_cpu_offload_enabled(ds_config: dict) -> bool:
     zero_config = ds_config.get("zero_optimization")
     if not isinstance(zero_config, dict):
         return False
-    return bool(zero_config.get("offload_optimizer"))
+    offload = zero_config.get("offload_optimizer")
+    if isinstance(offload, dict):
+        from deepspeed.runtime.zero.offload_config import DeepSpeedZeroOffloadOptimizerConfig
+        from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
+
+        # Same default as DeepSpeed: missing device is none. Extra keys raise.
+        return DeepSpeedZeroOffloadOptimizerConfig(**offload).device != OffloadDeviceEnum.none
+    return bool(offload)
 
 
 def _aligned_first(params: list) -> list:

@@ -95,11 +95,11 @@ def _is_local_qwen3_5_dense(model_path_or_name: str) -> bool:
 
 
 def apply_loader_numerics(model, options: HuggingfaceOptions, *, sequence_parallel: bool) -> None:
-    """Round a loaded stock transformers model the way this loader does, after its weights load.
+    """Apply this loader's numerical patches to an already loaded stock Transformers model.
 
-    The GatedDeltaNet output norms always round once; ``fp32_parity`` adds the dense Qwen3.5 fp32 operations. A
-    single-GPU reference that compares against a model built by this loader calls this with the same options, so
-    both sides evaluate the same function.
+    GatedDeltaNet output norms always round once. ``fp32_parity`` additionally enables the dense Qwen3.5 fp32
+    operations, with optional fp32 residuals. Call before installing sequence-parallel wrappers; this helper
+    does not configure process groups or replace the Qwen3 loss function.
     """
     from arctic_platform.model.implementations.gpu.vllm_rounding import round_gated_norms_once
 

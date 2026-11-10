@@ -1,6 +1,6 @@
 """CPU completion ordering; real vLLM methods, synthetic storage, no GPU kernels.
 
-VLLM_SOURCE_ROOT may name a vLLM 0.32.0 checkout on CPU-only test hosts.
+VLLM_SOURCE_ROOT may name a vLLM 0.33.0 checkout on CPU-only test hosts.
 Otherwise read the installed vLLM package without importing its GPU runtime.
 """
 
@@ -84,6 +84,10 @@ def manager_methods(monkeypatch):
     )
     functions = methods(root, "block_pool.py", "BlockPool", {"free_blocks", "get_new_blocks"})
     functions += methods(root, "sched/scheduler.py", "Scheduler", {"_drain_deferred_frees"})
+    functions += [
+        node for node in ast.parse((root / "kv_cache_utils.py").read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name in {"trim_null_head", "null_head_len"}
+    ]
     module = ast.Module(
         body=[
             ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
@@ -107,7 +111,7 @@ def manager_methods(monkeypatch):
     monkeypatch.setitem(sys.modules, interface.__name__, interface)
     ns["original_window_cap"] = ns["WindowSpec"].max_admission_blocks_per_request
     vllm = ModuleType("vllm")
-    vllm.__version__ = "0.32.0"
+    vllm.__version__ = "0.33.0"
     monkeypatch.setitem(sys.modules, "vllm", vllm)
     # Loading the patch through the required entry point also covers vanilla vLLM.
     from arctic_platform.inference import vllm as patches
@@ -122,11 +126,9 @@ def manager_methods(monkeypatch):
         ("spec_decode_grammar", "ensure_spec_decode_grammar_fix"),
         ("hybrid_state_fixes", "apply_hybrid_state_fixes"),
         ("tp_spec_decode_sync", "ensure_tp_spec_decode_sync"),
-        ("glm5next_lora", "ensure_glm5next_lora"),
         ("kv_group_size", "ensure_kv_group_size_patch"),
         ("mrope_yarn", "ensure_mrope_yarn_fix"),
         ("glm5next_lora", "ensure_glm5next_lora"),
-        ("deepseek_v41_lora", "ensure_deepseek_v41_lora"),
     ]:
         stub = ModuleType(f"arctic_platform.inference.vllm.{name}")
         setattr(stub, entry, lambda: None)
