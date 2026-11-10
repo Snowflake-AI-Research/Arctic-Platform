@@ -227,7 +227,7 @@ def kda_forward(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
     trace.update(core=core, g2=g2)
     core = rms_norm_gated(core, g2, attn.o_norm.weight, None, "sigmoid", eps=KDA_O_NORM_EPS)
     trace.update(normed=core)
-    return ops.linear_kernel(core.reshape(tokens, -1), attn.o_proj.weight)
+    return lora_linear(core.reshape(tokens, -1), attn.o_proj)
 
 
 SPARSE_TOPK_BLOCK = 128  # sparse MLA tiles the top-k index buffer in 128 columns
@@ -341,12 +341,77 @@ def dequant_fp8_block(weight: torch.Tensor, scale_inv: torch.Tensor, block: int 
     return (padded.to(torch.float32) * scale).to(torch.bfloat16)[:rows, :cols].contiguous()
 
 
+def base_linear(module: Any) -> Any:
+    """The projection under a PEFT LoRA wrapper, or the projection itself."""
+    return getattr(module, "base_layer", module)
+
+
 def bf16_weight(linear: Any) -> torch.Tensor:
     """A projection's weight as vLLM serves it in bf16: dequantized if the trainer holds it in block FP8."""
+    linear = base_linear(linear)
     scale_inv = getattr(linear, "weight_scale_inv", None)
     if linear.weight.element_size() == 1 and scale_inv is not None:
         return dequant_fp8_block(linear.weight, scale_inv)
     return linear.weight
+
+
+def lora_factors(module: Any) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """A projection's active PEFT LoRA factors as vLLM holds the synced adapter: ``A`` and ``B`` cast to bf16, then
+    ``B`` multiplied by ``lora_alpha / r`` (``LoRALayerWeights.optimize``)."""
+    lora_a = getattr(module, "lora_A", None)
+    if not lora_a or getattr(module, "disable_adapters", False) or getattr(module, "merged", False):
+        return None
+    names = [name for name in module.active_adapters if name in lora_a]
+    if not names:
+        return None
+    if len(names) > 1:
+        raise NotImplementedError("vLLM serves one LoRA adapter at a time")
+    a = lora_a[names[0]].weight.to(torch.bfloat16)
+    b = module.lora_B[names[0]].weight.to(torch.bfloat16)
+    scaling = module.scaling[names[0]]
+    return a, (b if scaling == 1 else b * scaling)
+
+
+def add_lora(y: torch.Tensor, x: torch.Tensor, adapters: list, output_slices: tuple[int, ...]) -> torch.Tensor:
+    """vLLM's ``add_lora_linear`` with every token on one adapter: the shrink ``x @ A.T`` into an fp32
+    ``[slices, tokens, r]`` buffer, then the expand adding ``buffer @ B.T`` onto each output slice of ``y`` in place.
+
+    A slice without an adapter, or with a ``B`` narrower than the slice (``kv_a`` against its zero rope rows), gets
+    zero rows, as in vLLM's stacked buffers.
+    """
+    present = [f for f in adapters if f is not None]
+    if not present or x.shape[0] == 0:
+        return y
+    from vllm.lora.ops.triton_ops import LoRAKernelMeta
+    from vllm.lora.ops.triton_ops import lora_expand
+    from vllm.lora.ops.triton_ops import lora_shrink
+    from vllm.lora.ops.triton_ops import utils as lora_utils
+
+    rank, tokens = present[0][0].shape[0], x.shape[0]
+    if any(a.shape[0] != rank for a, _ in present):
+        raise NotImplementedError("the vLLM-aligned LoRA covers one rank across a merged projection")
+    a_stack, b_stack = [], []
+    for factors, width in zip(adapters, output_slices):
+        a, b = factors if factors is not None else (x.new_zeros(rank, x.shape[1]), x.new_zeros(width, rank))
+        if b.shape[0] < width:
+            b = torch.cat([b, b.new_zeros(width - b.shape[0], rank)])
+        a_stack.append(a.unsqueeze(0).contiguous())
+        b_stack.append(b.unsqueeze(0).contiguous())
+    # vLLM caches each weight list's pointers and strides by ``data_ptr`` alone; these tensors are new every call.
+    lora_utils._LORA_A_PTR_DICT.clear()
+    lora_utils._LORA_B_PTR_DICT.clear()
+    meta = LoRAKernelMeta.make(1, tokens, x.device)
+    meta.prepare_tensors(torch.zeros(tokens, dtype=torch.int32, device=x.device))
+    buffer = torch.empty((len(adapters), tokens, rank), dtype=torch.float32, device=x.device)
+    lora_shrink(x.contiguous(), a_stack, buffer, *meta.meta_args(tokens, False), 1.0)
+    lora_expand(buffer, b_stack, y, *meta.meta_args(tokens, False), offset_start=0, add_inputs=True)
+    return y
+
+
+def lora_linear(x: torch.Tensor, module: Any, weight: torch.Tensor | None = None) -> torch.Tensor:
+    """A projection as vLLM serves it with the synced adapter: the batch-invariant bf16 matmul, then the LoRA delta."""
+    y = ops.linear_kernel(x, bf16_weight(module) if weight is None else weight)
+    return add_lora(y, x, [lora_factors(module)], (y.shape[-1],))
 
 
 def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlens: torch.Tensor,
@@ -360,7 +425,8 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     ``q_a``/``kv_a``/``q_b``/``o`` projections are dequantized to bf16 as vLLM does at load. Then: the merged
     ``[q_a; kv_a]`` projection, the fused q/kv RMSNorm, ``q_b_proj``, the query absorbed into the latent space by
     ``W_UK_T``, FA3 sparse attention over one-token pages of ``[kv_c | k_pe]`` rows (QV form), the value
-    up-projection by ``W_UV`` and ``o_proj``.
+    up-projection by ``W_UV`` and ``o_proj``. A LoRA adapter on ``q_a``/``kv_a``/``q_b``/``o`` adds its delta with
+    vLLM's kernels (:func:`add_lora`).
     """
     from vllm.models.common.ops import fused_q_kv_rmsnorm
     from vllm.v1.attention.backends.mla import flashattn_mla_sparse
@@ -376,11 +442,13 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     if kv_a.shape[0] == latent and rope:
         kv_a = torch.cat([kv_a, kv_a.new_zeros((rope, kv_a.shape[1]))])
     qkv_lora = ops.linear_kernel(x, torch.cat([bf16_weight(attn.q_a_proj), kv_a]))
+    add_lora(qkv_lora, x, [lora_factors(attn.q_a_proj), lora_factors(attn.kv_a_proj_with_mqa)],
+             (config.q_lora_rank, latent + rope))  # fmt: skip
     q_c, kv_lora = qkv_lora.split([config.q_lora_rank, latent + rope], dim=-1)
     kv_c, k_pe = kv_lora.split([latent, rope], dim=-1)
     q_c, kv_c = fused_q_kv_rmsnorm(q_c, kv_c, attn.q_a_layernorm.weight, attn.kv_a_layernorm.weight,
                                    attn.q_a_layernorm.variance_epsilon)  # fmt: skip
-    q = ops.linear_kernel(q_c, bf16_weight(attn.q_b_proj)).view(tokens, heads, nope + rope)
+    q = lora_linear(q_c, attn.q_b_proj).view(tokens, heads, nope + rope)
     q_nope, q_pe = q.split([nope, rope], dim=-1)
 
     w_uk_t, w_uv = mla_kv_up_weights(attn.kv_b_proj, config)
@@ -415,7 +483,7 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     )
     up = out.new_empty((tokens, heads, value))
     torch.bmm(out.view(-1, heads, latent).transpose(0, 1), w_uv, out=up.transpose(0, 1))
-    return ops.linear_kernel(up.view(tokens, heads * value), bf16_weight(attn.o_proj))
+    return lora_linear(up.view(tokens, heads * value), attn.o_proj)
 
 
 def _mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
@@ -667,7 +735,8 @@ def _stock_layer_runner(backbone: Any, input_ids: torch.Tensor, position_ids: to
         swapped = []
         if vllm_mla_weights and layer.block_type == "deepseek_sparse_attention":
             for name in MLA_DEQUANTIZED_PROJECTIONS:
-                module = getattr(layer.self_attn, name, None)
+                # Under PEFT the wrapper keeps adding the adapter's ``lora_B(lora_A(x))`` to the swapped base.
+                module = base_linear(getattr(layer.self_attn, name, None))
                 if module is not None and getattr(module, "weight_scale_inv", None) is not None:
                     module.forward = _types.MethodType(_bf16_linear_forward, module)
                     swapped.append(module)

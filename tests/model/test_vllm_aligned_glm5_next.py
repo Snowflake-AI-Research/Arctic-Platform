@@ -170,3 +170,129 @@ def test_stock_recompute_replays_the_forward_choices_and_vllm_mla_weights():
     assert seen["projection"].__func__ is glm5_next._bf16_linear_forward
     assert not hasattr(layer.self_attn, glm5_next.REPLAY_TOPK_ATTR)
     assert layer.self_attn.q_a_proj(torch.zeros(1)) == "fp8"
+
+
+def _peft_projection(rows: int = 6, cols: int = 8, r: int = 2, alpha: int = 4):
+    from peft import LoraConfig
+    from peft.tuners.lora.layer import Linear as LoraLinear
+
+    class Projection(torch.nn.Linear):
+        def __init__(self):
+            super().__init__(cols, rows, bias=False)
+            self.weight_scale_inv = torch.nn.Parameter(torch.full((1, 1), 0.5), requires_grad=False)
+            self.block_size = 128
+
+        def forward(self, x):
+            raise AssertionError("the W8A8 forward runs")
+
+    wrapped = LoraLinear(Projection(), "default", LoraConfig(r=r, lora_alpha=alpha), r=r, lora_alpha=alpha)
+    torch.nn.init.normal_(wrapped.lora_B["default"].weight)
+    fp8 = torch.randn(rows, cols).to(torch.float8_e4m3fn)
+    wrapped.base_layer.weight = torch.nn.Parameter(fp8, requires_grad=False)
+    return wrapped
+
+
+def test_lora_factors_cast_to_bf16_then_fold_the_scaling_like_vllm():
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import bf16_weight
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import lora_factors
+
+    torch.manual_seed(3)
+    projection = _peft_projection(r=2, alpha=4)
+    a, b = lora_factors(projection)
+    assert a.dtype == b.dtype == torch.bfloat16
+    assert torch.equal(a, projection.lora_A["default"].weight.to(torch.bfloat16))
+    assert torch.equal(b, projection.lora_B["default"].weight.to(torch.bfloat16) * 2.0)
+    assert torch.equal(bf16_weight(projection), (projection.base_layer.weight.float() * 0.5).to(torch.bfloat16))
+    projection.enable_adapters(False)
+    assert lora_factors(projection) is None
+    assert lora_factors(torch.nn.Linear(2, 2)) is None
+
+
+def test_add_lora_stacks_merged_slices_like_vllm(monkeypatch):
+    import sys
+    import types
+
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next
+
+    def lora_shrink(x, a_stack, buffer, *meta_and_scale):
+        assert len(meta_and_scale) == 8
+        for i, a in enumerate(a_stack):
+            buffer[i] = (x.float() @ a[0].float().t()) * meta_and_scale[-1]
+
+    def lora_expand(buffer, b_stack, y, *meta, offset_start, add_inputs):
+        assert add_inputs and offset_start == 0
+        offset = 0
+        for i, b in enumerate(b_stack):
+            width = b.shape[1]
+            y[:, offset : offset + width] += (buffer[i].to(b.dtype) @ b[0].t()).to(y.dtype)
+            offset += width
+
+    class Meta:
+        @staticmethod
+        def make(max_loras, tokens, device):
+            return Meta()
+
+        def prepare_tensors(self, mapping):
+            assert mapping.tolist() == [0] * mapping.numel()
+
+        def meta_args(self, tokens, specialize):
+            return (None,) * 7
+
+    ops = types.ModuleType("vllm.lora.ops.triton_ops")
+    utils = types.ModuleType("vllm.lora.ops.triton_ops.utils")
+    utils._LORA_A_PTR_DICT, utils._LORA_B_PTR_DICT = {(1,): "stale"}, {(1,): "stale"}
+    ops.LoRAKernelMeta, ops.lora_shrink, ops.lora_expand, ops.utils = Meta, lora_shrink, lora_expand, utils
+    for name, module in (("vllm", types.ModuleType("vllm")), ("vllm.lora", types.ModuleType("vllm.lora")),
+                         ("vllm.lora.ops", types.ModuleType("vllm.lora.ops")), (ops.__name__, ops),
+                         (utils.__name__, utils)):  # fmt: skip
+        monkeypatch.setitem(sys.modules, name, module)
+
+    torch.manual_seed(4)
+    x = torch.randn(5, 8, dtype=torch.bfloat16)
+    y = torch.randn(5, 7, dtype=torch.bfloat16)
+    q = (torch.randn(2, 8, dtype=torch.bfloat16), torch.randn(3, 2, dtype=torch.bfloat16))
+    kv = (torch.randn(2, 8, dtype=torch.bfloat16), torch.randn(2, 2, dtype=torch.bfloat16))  # 2 of 4 rows: no rope rows
+    out = glm5_next.add_lora(y.clone(), x, [q, kv], (3, 4))
+
+    def delta(a, b):
+        return ((x.float() @ a.float().t()).to(torch.bfloat16) @ b.t()).to(torch.bfloat16)
+
+    assert torch.equal(out[:, :3], y[:, :3] + delta(*q))
+    assert torch.equal(out[:, 3:5], y[:, 3:5] + delta(*kv))
+    assert torch.equal(out[:, 5:], y[:, 5:])
+    assert not utils._LORA_A_PTR_DICT and not utils._LORA_B_PTR_DICT
+    only_kv = glm5_next.add_lora(y.clone(), x, [None, kv], (3, 4))
+    assert torch.equal(only_kv[:, :3], y[:, :3]) and torch.equal(only_kv[:, 3:5], out[:, 3:5])
+    assert glm5_next.add_lora(y, x, [None, None], (3, 4)) is y
+
+
+def test_stock_recompute_keeps_the_peft_adapter_on_the_bf16_projection():
+    import types
+
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next
+
+    torch.manual_seed(5)
+    projection = _peft_projection()
+    x = torch.randn(3, 8)
+    seen = {}
+
+    class Layer(torch.nn.Module):
+        block_type = "deepseek_sparse_attention"
+
+        def __init__(self):
+            super().__init__()
+            self.self_attn = types.SimpleNamespace(q_a_proj=projection)
+
+        def forward(self, streams, **kwargs):
+            seen["out"] = self.self_attn.q_a_proj(x)
+            return streams, None
+
+    run = glm5_next._stock_layer_runner(None, torch.zeros(1, 3, dtype=torch.long), torch.arange(3)[None], {})
+    run(Layer(), torch.zeros(3, 4, 8))
+
+    lora = projection.lora_B["default"](projection.lora_A["default"](x)) * projection.scaling["default"]
+    base = torch.nn.functional.linear(x, glm5_next.bf16_weight(projection).float())
+    assert torch.allclose(seen["out"], base + lora)
+    seen["out"].sum().backward()
+    assert projection.lora_B["default"].weight.grad.abs().sum() > 0
+    assert "forward" not in vars(projection) and "forward" not in vars(projection.base_layer)
