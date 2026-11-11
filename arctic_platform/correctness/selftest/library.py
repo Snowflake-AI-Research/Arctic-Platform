@@ -20917,7 +20917,7 @@ def test_e2e_reference_records_prepared_regression_runs_one_target_and_zero_hf(
             ),
         )
 
-    monkeypatch.setattr(lora_training_check, "run_dss_trajectory", target)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", target)
     result = lora_training_check.run(_e2e_reference_records_ctx)[0]
     assert result.outcome is Outcome.PASS
     assert calls == [100]
@@ -20935,7 +20935,7 @@ def test_e2e_reference_records_missing_record_stops_before_target_and_prints_ful
     _e2e_reference_records_ctx, monkeypatch, caplog
 ):
     _e2e_reference_records_guard_launches(monkeypatch)
-    monkeypatch.setattr(lora_training_check, "run_dss_trajectory", _e2e_reference_records_forbidden)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
     with caplog.at_level(logging.ERROR):
         result = lora_training_check.run(_e2e_reference_records_ctx)[0]
     assert result.outcome is Outcome.FAIL
@@ -20950,7 +20950,7 @@ def test_e2e_reference_records_corrupt_record_cannot_fall_back_to_hf(_e2e_refere
     record["measurements"]["train_losses"][0] = 123.0
     path.write_text(json.dumps(record))
     _e2e_reference_records_guard_launches(monkeypatch)
-    monkeypatch.setattr(lora_training_check, "run_dss_trajectory", _e2e_reference_records_forbidden)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
     with pytest.raises(reference_records.ReferencePrerequisiteError, match="corrupt or incompatible"):
         lora_training_check._run(_e2e_reference_records_ctx)
 
@@ -21021,7 +21021,7 @@ def test_e2e_reference_records_incomplete_or_nonfinite_scalars_stop_before_targe
     reference[key] = value
     _e2e_reference_records_guard_launches(monkeypatch)
     monkeypatch.setattr(reference_records, "load_record", lambda context, identity: reference)
-    monkeypatch.setattr(lora_training_check, "run_dss_trajectory", _e2e_reference_records_forbidden)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
     with pytest.raises(reference_records.ReferencePrerequisiteError):
         lora_training_check._run(_e2e_reference_records_ctx)
 
@@ -21046,7 +21046,7 @@ def test_e2e_reference_records_input_or_workload_drift_requires_a_new_record_bef
     else:
         monkeypatch.setattr(lora_training_check, "TOLERANCE", 0.04)
     _e2e_reference_records_guard_launches(monkeypatch)
-    monkeypatch.setattr(lora_training_check, "run_dss_trajectory", _e2e_reference_records_forbidden)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
     with pytest.raises(
         reference_records.ReferencePrerequisiteError,
         match="prepared HF reference incompatible",
@@ -21091,7 +21091,7 @@ def test_e2e_reference_records_replay_tampering_after_record_load_stops_before_t
 
     monkeypatch.setattr(reference_records, "load_record", load_record)
     _e2e_reference_records_guard_launches(monkeypatch)
-    monkeypatch.setattr(lora_training_check, "run_dss_trajectory", _e2e_reference_records_forbidden)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
     with pytest.raises(reference_records.ReferencePrerequisiteError, match="replay differs"):
         lora_training_check._run(_e2e_reference_records_ctx)
 
@@ -21108,7 +21108,7 @@ def test_e2e_reference_records_explicit_preparation_runs_hf_once_publishes_scala
         monkeypatch.setattr(deterministic_lora, "materialize_adapter", lambda *args: adapter)
         monkeypatch.setattr(deterministic_lora, "identity_metadata", lambda path: {"mock": "exact-init"})
     monkeypatch.setattr(deterministic_lora, "bind_payload", _e2e_reference_records_forbidden)
-    monkeypatch.setattr(lora_training_check, "run_dss_trajectory", _e2e_reference_records_forbidden)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
     calls = []
 
     def reference(context, replay, directory, prepared_adapter):
@@ -21168,7 +21168,7 @@ def test_e2e_reference_records_corrupt_existing_record_is_not_reprepared(_e2e_re
     path.write_text("invalid JSON")
     _e2e_reference_records_ctx.prepare_references = True
     _e2e_reference_records_guard_launches(monkeypatch)
-    monkeypatch.setattr(lora_training_check, "run_dss_trajectory", _e2e_reference_records_forbidden)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
     with pytest.raises(
         reference_records.ReferencePrerequisiteError,
         match="prepared HF reference corrupt",
@@ -21187,7 +21187,7 @@ def test_e2e_reference_records_unsupported_lora_init_fails_before_hf_or_target(
     )
     monkeypatch.setattr(deterministic_lora, "identity_metadata", _e2e_reference_records_forbidden)
     _e2e_reference_records_guard_launches(monkeypatch)
-    monkeypatch.setattr(lora_training_check, "run_dss_trajectory", _e2e_reference_records_forbidden)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
     with pytest.raises(deterministic_lora.LoraInitializationPrerequisiteError, match="public"):
         lora_training_check._run(_e2e_reference_records_ctx)
 
@@ -51190,7 +51190,7 @@ def test_cortex_e2e_e2e_tokenizer_uses_selected_reference_identity(tmp_path, mon
     monkeypatch.setattr(gsm8k, "load_tokenizer", tokenizer)
     monkeypatch.setattr(runtime_clients_check.reference_records, "load_record", forbidden)
     monkeypatch.setattr(runtime_clients_check, "run_reference_trajectory", forbidden)
-    monkeypatch.setattr(runtime_clients_check, "run_dss_trajectory", forbidden)
+    monkeypatch.setattr(runtime_clients_check, "run_ap_trajectory", forbidden)
     with pytest.raises(RuntimeError, match="stop before materializing"):
         runtime_clients_check._run(ctx)
     assert seen == [("model", expected), ("tokenizer", expected)]

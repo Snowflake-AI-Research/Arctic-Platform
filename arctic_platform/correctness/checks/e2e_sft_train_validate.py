@@ -368,7 +368,7 @@ def reference_model_path(ctx) -> str:
     return str(require_data_fast_path(model_path, label="full-model e2e reference"))
 
 
-def run_dss_trajectory(
+def run_ap_trajectory(
     ctx, replay: Replay, workdir: Path, peft_adapter_path: Path | None = None
 ) -> Tuple[List[float], "torch.Tensor"]:
     """The same replay through Arctic Platform at the config's own topology, then the held-out forward.
@@ -828,7 +828,7 @@ def _run(ctx) -> TestResult:
     reference = reference_records.load_record(ctx, identity)
     validate_reference(reference, inputs)
     validate_replay(inputs)
-    target_losses, target_logprobs = run_dss_trajectory(
+    target_losses, target_logprobs = run_ap_trajectory(
         ctx, inputs.replay, inputs.workdir / "ap", inputs.peft_adapter_path
     )
     if len(target_losses) != TRAIN_STEPS or any(
