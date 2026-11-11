@@ -37,6 +37,7 @@ from arctic_platform.model.implementations.deepseek_v41.attention import Deepsee
 from arctic_platform.model.implementations.deepseek_v41.attention import SharedAttentionState
 from arctic_platform.model.implementations.deepseek_v41.attention import build_packed
 from arctic_platform.model.implementations.deepseek_v41.configuration_deepseek_v41 import DeepseekV41Config
+from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import EXPORT_SOURCE_NAMESPACES
 from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import conversion_chain
 from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import log_deferred_checkpoint_keys
 from arctic_platform.model.implementations.deepseek_v41.dequantize import dequantize_state_dict_
@@ -152,6 +153,8 @@ class DeepseekV41PreTrainedModel(PreTrainedModelPrimeRL):
     _can_compile_fullgraph = False
     _supports_attention_backend = True
     _can_record_outputs = {"hidden_states": DeepseekV41DecoderLayer}
+    # Published tensors the text model does not build that an HF export copies from the source checkpoint.
+    hf_export_source_prefixes = EXPORT_SOURCE_NAMESPACES
 
     @classmethod
     def cp_blocker(cls, config, cp: int) -> str | None:
@@ -227,10 +230,21 @@ class DeepseekV41PreTrainedModel(PreTrainedModelPrimeRL):
                 out[key] = value.view(torch.float8_e8m0fnu)
         return out
 
-    def convert_layer_to_hf(self, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:  # type: ignore[override]
-        # The chain skips keys a group does not hold, so one decoder layer or the
-        # top-level group (``layer_idx == -1``) goes through it whole. No layer has a hash router to restore.
+    def convert_layer_to_hf(  # type: ignore[override]
+        self, state_dict: dict[str, Tensor], layer_idx: int
+    ) -> dict[str, Tensor]:
+        """One export group in the published names, in place: decoder layer ``layer_idx``, or the top-level group
+        (embedding, final norm, LM head) for ``-1``.
+
+        Every op of the chain skips keys the group does not hold, so each group goes through the whole chain. The
+        experts arrive gathered over EP in logical order (``build_iter_full_hf_weights`` undoes a static placement).
+        Packed MXFP4 experts (LoRA on the official checkpoint) get their UE8M0 scales back, as published.
+        """
         del layer_idx
+        if packs_experts(self.config):
+            for key, value in list(state_dict.items()):
+                if ".mlp.experts." in key and key.endswith("_scale_inv") and value.dtype != torch.float8_e8m0fnu:
+                    state_dict[key] = value.to(dtype=torch.float8_e8m0fnu)
         return self.convert_to_hf(state_dict)
 
     def stream_convert_to_prime(self, source_path: Path, output_path: Path) -> None:
