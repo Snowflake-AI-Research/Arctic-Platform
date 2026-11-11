@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import torch
@@ -29,7 +30,9 @@ from transformers.modeling_outputs import MoeModelOutputWithPast
 from arctic_platform.model.implementations.deepseek_v4.attention import PackedContext
 from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_hf_to_prime
 from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_prime_to_hf
-from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import vllm_lora_name
+from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import (
+    vllm_lora_name as _attention_lora_name,
+)
 from arctic_platform.model.implementations.deepseek_v4.cp import CPContext
 from arctic_platform.model.implementations.deepseek_v4.cp import gather_for_cp
 from arctic_platform.model.implementations.deepseek_v4.rotary import DeepseekV4RotaryEmbedding
@@ -402,11 +405,29 @@ class DeepseekV41Model(DeepseekV41PreTrainedModel):
         return hashes, token_mask
 
 
+_PRIME_MOE_LORA_MODULE = re.compile(r"(^|\.)model\.layers\.(\d+)\.mlp\.(experts|shared_expert)\.")
+
+
+def vllm_lora_name(name: str) -> str:
+    """A LoRA tensor's name in vLLM's DeepSeek-V4.1 tree: the attention projections as published
+    (converting_deepseek_v4.vllm_lora_name), the routed experts ``layers.N.ffn.experts`` and the shared expert's w1 /
+    w2 / w3 ``layers.N.ffn.shared_experts.w1|w2|w3``, which vLLM's DeepSeek-V4 weights mapper names gate_up_proj (w1,
+    w3) and down_proj."""
+    return _PRIME_MOE_LORA_MODULE.sub(
+        lambda m: f"{m.group(1)}layers.{m.group(2)}.ffn.{'experts' if m.group(3) == 'experts' else 'shared_experts'}.",
+        _attention_lora_name(name),
+    )
+
+
 class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_gather_output"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    # LoRA weight sync and the sampler's adapter pack (weight_export.py) name tensors after vLLM's modules; the pack
+    # carries the routed experts' LoRA one expert at a time (ffn.experts.{e}.w1 / w2 / w3, vLLM's expert mapping):
+    # PEFT's 3-D layout nests one wrapper per expert parameter and vLLM reads two of them.
     vllm_lora_name = staticmethod(vllm_lora_name)
+    vllm_lora_expert_projections = {"w1": "w1", "w2": "w2", "w3": "w3"}
 
     def __init__(self, config: DeepseekV41Config):
         super().__init__(config)
