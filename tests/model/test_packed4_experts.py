@@ -172,6 +172,32 @@ def test_peft_sizes_int4_expert_lora_from_the_logical_shape():
     assert isinstance(wrapped, peft.PeftModel)
 
 
+@cuda
+def test_w4a8_experts_match_the_decoded_bf16_experts(monkeypatch):
+    monkeypatch.setenv("ARL_W4A8_EXPERTS", "1")
+    torch.manual_seed(0)
+    experts, dim, hidden = 4, 512, 512
+    module, reference = _int4_experts(experts, dim, hidden, "cuda")
+    for name in ("w1", "w2", "w3"):
+        getattr(module, f"{name}_input_scale").data.fill_(1.0)
+    counts = [5, 0, 17, 9]
+    x = torch.randn(sum(counts), dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    scores = torch.rand(sum(counts), device="cuda", requires_grad=True)
+    out = module(x, torch.tensor(counts, device="cuda"), scores)
+    x_ref = x.detach().clone().requires_grad_(True)
+    scores_ref = scores.detach().clone().requires_grad_(True)
+    want = _dense_experts(reference, x_ref.float(), counts, scores_ref)
+    # The forward quantizes the gate/up and down inputs to E4M3 (scale 1), about 3% error per element.
+    error = (out.float() - want).norm() / want.norm()
+    assert error < 5e-2, error
+    grad = torch.randn_like(want)
+    out.float().backward(grad)
+    want.backward(grad)
+    error = (x.grad.float() - x_ref.grad.float()).norm() / x_ref.grad.float().norm()
+    assert error < 5e-2, error
+    assert module._scales_interleaved and module.w1_scale_inv.shape == (experts, dim // 128, hidden)
+
+
 def _random_mxfp4(experts, rows, cols, device="cpu"):
     packed = torch.randint(-128, 128, (experts, rows, cols // 2), dtype=torch.int8, device=device)
     # E8M0 exponents around 2^-7 .. 2^-3, the official checkpoint's range for 2304 x 5120 experts.
@@ -319,3 +345,40 @@ def test_mxfp4_scales_compact_to_e8m0_bytes_exactly():
     module.w1_scale_inv.data = torch.full(module.w1_scale_inv.shape, 0.3)
     with pytest.raises(ValueError, match="powers of two"):
         module.compact_mxfp4_scales()
+
+
+def test_stash_frozen_keeps_parameters_on_ctx_and_saves_other_stacks():
+    import gc
+    import weakref
+
+    from arctic_platform.model.implementations.fp8 import Int4InterleavedScales
+    from arctic_platform.model.implementations.fp8 import Nvfp4Scales
+    from arctic_platform.model.implementations.fp8 import stash_frozen
+    from arctic_platform.model.implementations.fp8 import unstash_frozen
+
+    class Ctx:
+        pass
+
+    param = nn.Parameter(torch.zeros(2, 3), requires_grad=False)
+    ctx = Ctx()
+    assert stash_frozen(ctx, param, Int4InterleavedScales(param, 1)) == []
+    assert unstash_frozen(ctx, (torch.ones(1),))[0][0] is param
+
+    stack, scale = torch.zeros(4, 3), torch.ones(4, 2)
+    ctx = Ctx()
+    saved = stash_frozen(ctx, (stack, stack), (Int4InterleavedScales(scale, 1), Int4InterleavedScales(scale, 1)))
+    (weights, scales), rest = unstash_frozen(ctx, (torch.ones(1), *saved))
+    assert weights[0] is stack and scales[1].scale is scale and scales[1].align == 1 and len(rest) == 1
+
+    per_matrix = torch.ones(4)
+    ctx = Ctx()
+    nv_saved = stash_frozen(ctx, (stack, stack), (scale, Nvfp4Scales(scale, per_matrix)))
+    (nv_weights, nv_scales), nv_rest = unstash_frozen(ctx, (torch.ones(1), *nv_saved))
+    assert nv_weights[0] is stack and nv_scales[0] is scale and nv_scales[1].per_matrix is per_matrix
+    assert len(nv_rest) == 1
+    del nv_saved, nv_weights, nv_scales, nv_rest
+    # Nothing but the saved tensors keeps the stacks alive: the rebuild closure holds only their structure.
+    ref = weakref.ref(stack)
+    del stack, weights, scales, saved, rest
+    gc.collect()
+    assert ref() is None
