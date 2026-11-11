@@ -251,3 +251,43 @@ def test_sonic_relu2_experts_match_fp32_reference():
     assert rel(got[1][idx >= 0], want[1][idx >= 0]) < 1e-2
     for g, w in zip(got[2:], want[2:]):
         assert rel(g, w) < 2e-2
+
+
+class _SpareCopies:
+    """Stands in for the online replicas' _ReplicaCall: spare slots holding copies of the first experts."""
+
+    def __init__(self, spares):
+        self.spares = spares
+
+    def extend(self, *weights):
+        return tuple(torch.cat([w, w[: self.spares]], dim=0) for w in weights)
+
+
+def test_relu2_experts_route_spare_slots_to_their_owners_weights():
+    """Rows sent to a spare slot see the copied expert's weights, on the SonicMoE path."""
+    _require_sonicmoe()
+    from arctic_platform.model.implementations.moe.layers.moe import NonGatedGroupedExperts
+
+    torch.manual_seed(0)
+    tokens, topk, experts, spares, hidden, inter = 1500, 2, 4, 2, 256, 384
+    module = NonGatedGroupedExperts(hidden, inter, experts, use_grouped_mm=True)
+    module.set_ep_comm_backend("deepep")
+    module = module.cuda().bfloat16()
+    with torch.no_grad():
+        for w in (module.w1, module.w2):
+            w.normal_(std=0.05)
+    idx = torch.randint(0, experts, (tokens, topk), device="cuda")
+    on_spare = torch.where(idx < spares, idx + experts, idx)  # experts 0, 1 served by their spare copies 4, 5
+    scores = torch.rand(tokens, topk, device="cuda")
+    x = torch.randn(tokens, hidden, device="cuda").bfloat16()
+
+    def run(indices, replicas):
+        module._arl_replica_call = replicas
+        try:
+            return module(x, None, scores, expert_indices=indices)
+        finally:
+            module._arl_replica_call = None
+
+    torch.testing.assert_close(
+        run(on_spare, _SpareCopies(spares)).float(), run(idx, None).float(), rtol=2e-2, atol=2e-3
+    )
