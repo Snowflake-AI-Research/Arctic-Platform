@@ -158,6 +158,11 @@ def load_glm_moe_dsa_model(
     ep_group=None,
     options: GlmMoeDsaOptions,
 ) -> nn.Module:
+    from arctic_platform.model.implementations.kernels.flashinfer_top_k import prepare_flashinfer_top_k
+
+    # Every rank, before the checkpoint load: a node whose FlashInfer cache lacks the indexer's top-k builds it now
+    # (~10 minutes) while the others wait on the CPU, not in a step's collective.
+    prepare_flashinfer_top_k()
     from arctic_platform.model.implementations.moe.dense_shard import resolve_dense_sharding
 
     if resolve_dense_sharding(options.shard_dense) and options.tiled_mlp_token_chunk_size is not None:

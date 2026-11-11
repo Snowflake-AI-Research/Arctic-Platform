@@ -11,11 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-try:
-    from flashinfer import top_k as _flashinfer_top_k
-    from flashinfer.topk import TopKTieBreak
-except ImportError:  # optional: torch.topk selects the same keys, more slowly
-    _flashinfer_top_k = None
+from arctic_platform.model.implementations.kernels.flashinfer_top_k import topk_indices
 
 FP8_MAX = 448.0
 FP8_MIN = -448.0
@@ -175,17 +171,6 @@ def _triton_fp8_indexer_kernel(
     acc = tl.where(valid, acc, float("-inf"))
 
     tl.store(out_ptrs, acc, mask=out_mask)
-
-
-def topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
-    """Column indices of each row's ``k`` largest scores, in no particular order.
-
-    FlashInfer's radix select is about 4x faster than ``torch.topk`` on 128K-wide rows. Ties at the
-    selection boundary go to the smaller column, so the selected set is deterministic.
-    """
-    if _flashinfer_top_k is None or not scores.is_cuda:
-        return torch.topk(scores, k, dim=-1).indices
-    return _flashinfer_top_k(scores, k, sorted=False, deterministic=True, tie_break=TopKTieBreak.SMALL)[1]
 
 
 @functools.cache
