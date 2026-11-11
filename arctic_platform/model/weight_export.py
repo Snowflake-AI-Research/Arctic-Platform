@@ -516,7 +516,7 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
     # Families whose served MoE takes expert LoRA per expert ({parameter: served projection}) get their
     # target_parameters LoRAs (PEFT's 3-D layout) written as {experts}.{e}.{projection}.lora_{A,B}.weight.
     expert_projections = getattr(family, "vllm_lora_expert_projections", None) or {}
-    wrapped_parameters = _param_wrapper_parameter_names(model) if expert_projections else {}
+    wrappers = _param_wrappers(model)
     # PEFT must select against live wrapped names before we make the pack portable.
     for adapter_name in model.peft_config:
         output_dir = adapter_dir if adapter_name == "default" else os.path.join(adapter_dir, adapter_name)
@@ -526,25 +526,24 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
             saved_names = list(handle.keys())
             portable = {}
             renamed = False
-            per_expert = False
+            stacked_left = False  # a tensor still in PEFT's 3-D expert layout
             for name in saved_names:
                 unwrapped = strip_activation_checkpoint_segments(name)
                 module_name, _, leaf = unwrapped.rpartition(".lora_")
-                projection = expert_projections.get(wrapped_parameters.get(module_name))
+                parameter_name, num_experts = wrappers.get(module_name, (None, 0))
+                projection = expert_projections.get(parameter_name) if num_experts > 1 else None
                 if projection is None:
-                    exports = {rename(unwrapped): handle.get_tensor(name)}
+                    exports = {rename(_parameter_lora_name(unwrapped, wrappers)): handle.get_tensor(name)}
+                    stacked_left = stacked_left or num_experts > 1
                 else:
                     kind = leaf.split(".", 1)[0]
                     rank = _peft_adapter_rank(model, f"lora_{kind}.{adapter_name}.weight")
                     stacked = _reshape_expert_lora_for_ep(handle.get_tensor(name), kind, rank, label=unwrapped)
-                    experts = module_name
-                    while experts.endswith(".base_layer"):
-                        experts = experts.removesuffix(".base_layer")
+                    experts = _unnested(module_name)
                     exports = {
                         rename(f"{experts}.{expert}.{projection}.lora_{kind}.weight"): stacked[expert].clone()
                         for expert in range(stacked.shape[0])
                     }
-                    per_expert = True
                 for export_name, tensor in exports.items():
                     renamed = renamed or export_name != unwrapped
                     if export_name in portable:
@@ -559,21 +558,41 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
             save_file(portable, temporary_path, metadata=metadata)
             os.replace(temporary_path, weights_path)
         if renamed:
-            _rewrite_adapter_target_modules(output_dir, portable, drop_target_parameters=per_expert)
+            _rewrite_adapter_target_modules(output_dir, portable, drop_target_parameters=not stacked_left)
 
 
-def _param_wrapper_parameter_names(model: nn.Module) -> dict[str, str]:
-    """``{module name without activation-checkpoint segments: parameter name}`` of every PEFT ``ParamWrapper``
-    (a ``target_parameters`` LoRA) in ``model``; nested wrappers of one module end in ``.base_layer``."""
+def _param_wrappers(model: nn.Module) -> dict[str, tuple[str, int]]:
+    """``{module name without activation-checkpoint segments: (parameter name, experts)}`` of every PEFT
+    ``ParamWrapper`` (a ``target_parameters`` LoRA) in ``model``; nested wrappers of one module end in
+    ``.base_layer``, and ``experts`` is 1 for a parameter that is not an expert stack."""
     try:
         from peft.tuners.lora.layer import ParamWrapper
     except ImportError:
         return {}
     return {
-        strip_activation_checkpoint_segments(name): module.parameter_name
+        strip_activation_checkpoint_segments(name): (module.parameter_name, module.num_experts)
         for name, module in model.named_modules()
         if isinstance(module, ParamWrapper)
     }
+
+
+def _unnested(module_name: str) -> str:
+    while module_name.endswith(".base_layer"):
+        module_name = module_name.removesuffix(".base_layer")
+    return module_name
+
+
+def _parameter_lora_name(name: str, wrappers: dict[str, tuple[str, int]]) -> str:
+    """``{module}.lora_{A,B}.weight`` of a LoRA on a parameter of a module that is not an expert stack (e.g. a shared
+    expert's w1, through target_parameters) as ``{module}.{parameter}.lora_{A,B}.weight``. PEFT names it after its
+    wrapper, one ``.base_layer`` deeper for each later parameter targeted on the module (a shared expert's w1 / w2 /
+    w3 are ``shared_expert.base_layer.base_layer`` / ``shared_expert.base_layer`` / ``shared_expert``), which no
+    served module is; families rename ``{module}.{parameter}`` to their served projection. Other names unchanged."""
+    module_name, _, leaf = name.rpartition(".lora_")
+    parameter_name, num_experts = wrappers.get(module_name, (None, 0))
+    if parameter_name in (None, "weight") or num_experts != 1:
+        return name
+    return f"{_unnested(module_name)}.{parameter_name}.lora_{leaf}"
 
 
 def _rewrite_adapter_target_modules(
@@ -777,10 +796,11 @@ def iter_lora_weights(
         elif is_master:
             yield rename(_expert_lora_vllm_key(prefix, weight_name, kind)), local
 
+    wrappers = _param_wrappers(model)
     for name, parameter in model.named_parameters():
         if not is_peft_lora_param(name, parameter) or id(parameter) in expert_parameter_ids:
             continue
-        export_name = rename(_peft_lora_parameter_to_vllm_name(name))
+        export_name = rename(_parameter_lora_name(_peft_lora_parameter_to_vllm_name(name), wrappers))
         if _is_ep_sharded_parameter(parameter):
             import torch.distributed as dist
 
