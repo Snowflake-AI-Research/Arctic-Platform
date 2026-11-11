@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+from contextvars import ContextVar
 from functools import wraps
 
 import torch
@@ -129,6 +130,8 @@ class SpeculativeConfigPatch(ArcticPatch[SpeculativeConfig]):
 
 
 _DFLASH_PATCHED = False
+# speculative_config["draft_rope_follows_target"]: opt-in; the draft gets the target's YaRN factor over its own length.
+_DRAFT_ROPE_FOLLOWS_TARGET = ContextVar("draft_rope_follows_target", default=False)
 
 
 def ensure_dflash_max_position_patch() -> None:
@@ -136,10 +139,29 @@ def ensure_dflash_max_position_patch() -> None:
     if _DFLASH_PATCHED:
         return
     original = SpeculativeConfig.__post_init__
+    resize = SpeculativeConfig._maybe_override_draft_max_position_embeddings
+
+    def resize_draft(draft, target_max_model_len):
+        if not _DRAFT_ROPE_FOLLOWS_TARGET.get():
+            resize(draft, target_max_model_len)
+
+    SpeculativeConfig._maybe_override_draft_max_position_embeddings = staticmethod(resize_draft)
 
     @wraps(original)
     def post_init(self):
         result = original(self)
+        if _DRAFT_ROPE_FOLLOWS_TARGET.get():
+            if self.method != "dflash":
+                raise ValueError("draft_rope_follows_target applies to method 'dflash' only")
+            draft = self.draft_model_config.hf_config
+            rope = self.target_model_config.hf_text_config.rope_parameters
+            if rope["rope_type"] != "yarn":
+                raise ValueError("draft_rope_follows_target needs a target with rope_type 'yarn'")
+            native = draft.max_position_embeddings
+            draft.rope_parameters = dict(
+                draft.rope_parameters, rope_type="yarn", factor=rope["factor"], original_max_position_embeddings=native
+            )
+            draft.max_position_embeddings = int(native * rope["factor"])
         if self.method == "dflash":
             # DFlash queries the draft up to num_speculative_tokens past the last target position, unclamped.
             draft = self.draft_model_config.hf_config
@@ -151,6 +173,20 @@ def ensure_dflash_max_position_patch() -> None:
 
     SpeculativeConfig.__post_init__ = post_init
     SpeculativeConfigPatch._orig_post_init = post_init
+    from vllm.engine.arg_utils import EngineArgs
+
+    create = EngineArgs.create_speculative_config
+
+    @wraps(create)
+    def create_speculative_config(self, *args, **kwargs):
+        follows = (self.speculative_config or {}).pop("draft_rope_follows_target", False)
+        token = _DRAFT_ROPE_FOLLOWS_TARGET.set(bool(follows))
+        try:
+            return create(self, *args, **kwargs)
+        finally:
+            _DRAFT_ROPE_FOLLOWS_TARGET.reset(token)
+
+    EngineArgs.create_speculative_config = create_speculative_config
 
     from vllm.model_executor.layers.rotary_embedding import YaRNScalingRotaryEmbedding
     from vllm.model_executor.models import qwen3_dflash
