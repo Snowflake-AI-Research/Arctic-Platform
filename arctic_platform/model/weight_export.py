@@ -22,6 +22,7 @@ import json
 import logging
 import os
 from collections.abc import Callable
+from collections.abc import Collection
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Sequence
@@ -331,6 +332,58 @@ def pretrained_config_of(model: Any) -> Any:
         if config is not None and hasattr(config, "save_pretrained") and not getattr(config, "peft_type", None):
             return config
     return getattr(model, "config", None)
+
+
+def hf_export_config(model: Any, source_config: dict) -> dict:
+    """The source checkpoint's ``config.json`` as an HF export of ``model``'s weights needs it.
+
+    A model dequantized at load (``dequantize_checkpoint``: published FP8 / MXFP4 weights trained in BF16) has no
+    ``quantization_config`` of its own and exports BF16 tensors, so the export's config leaves the source's out: a
+    server reading it would build quantized parameters and copy the BF16 weights into them unscaled. A model that
+    kept its quantization (packed experts frozen under LoRA) keeps the source's. ``source_config`` is not modified.
+    """
+    config = json.loads(json.dumps(source_config))
+    if getattr(pretrained_config_of(model), "quantization_config", None) is None:
+        config.pop("quantization_config", None)
+        text_config = config.get("text_config")
+        if isinstance(text_config, dict):
+            text_config.pop("quantization_config", None)
+    return config
+
+
+def iter_hf_source_tensors(
+    model: nn.Module, source_model_dir: str, *, skip: Collection[str] = ()
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Source checkpoint tensors an HF export of ``model`` carries over unchanged, as ``(name, tensor)``.
+
+    These are the published tensors under the family's ``hf_export_source_prefixes`` (DeepSeek-V4.1: the vision
+    tower, aligner and image embeddings, which the text model drops at load but vLLM always builds), read from
+    ``source_model_dir`` one tensor at a time. Names in ``skip`` (the ones the export already wrote) are left out;
+    ``skip`` is read when the first tensor is requested, so an export can pass the set it is still filling.
+    """
+    prefixes = tuple(getattr(type(_family_model_for_export(model)), "hf_export_source_prefixes", ()) or ())
+    if not prefixes:
+        return
+    from safetensors import safe_open
+
+    index = os.path.join(source_model_dir, "model.safetensors.index.json")
+    if os.path.isfile(index):
+        with open(index) as f:
+            weight_map = json.load(f)["weight_map"]
+    else:
+        single = os.path.join(source_model_dir, "model.safetensors")
+        if not os.path.isfile(single):
+            raise FileNotFoundError(f"no safetensors checkpoint in {source_model_dir!r} to copy {prefixes} from")
+        with safe_open(single, framework="pt") as f:
+            weight_map = dict.fromkeys(f.keys(), "model.safetensors")
+    by_file: dict[str, list[str]] = {}
+    for name, file in sorted(weight_map.items()):
+        if name.startswith(prefixes) and name not in skip:
+            by_file.setdefault(file, []).append(name)
+    for file, names in sorted(by_file.items()):
+        with safe_open(os.path.join(source_model_dir, file), framework="pt") as f:
+            for name in names:
+                yield name, f.get_tensor(name)
 
 
 def checkpoint_peft_adapter_dir(model_dir: str) -> str | None:
