@@ -808,7 +808,7 @@ def _triton_experts(num_experts: int, top_k: int, hidden: int, intermediate: int
 
 
 def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None, record: dict | None = None,
-        tp: int = 1) -> torch.Tensor:  # fmt: skip
+        tp: int = 1, keep_out: bool = False) -> torch.Tensor:  # fmt: skip
     """vLLM's ``Glm5NextMoE`` on the trainer's ``MoE``: fp32 router logits by the batch-invariant matmul, the
     batch-invariant grouped top-k (renormalized and scaled by ``routed_scaling_factor`` there, as vLLM's router does
     when the runner does not scale the output), the Triton routed experts, then ``shared + routed`` in bf16.
@@ -841,13 +841,20 @@ def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None, record: di
                       renormalize=config.norm_topk_prob, scaling=config.routed_scaling_factor)  # fmt: skip
     if record is not None:
         record["experts"] = ids.to(torch.int64)
-    # One op for every rank's experts: the gathered and sharded expert weights stay inside the kernel call, so the
-    # per-op backward saves only the tokens, weights and ids (the whole model's experts would not fit otherwise).
+    if _DIFFERENTIABLE.get() and record is not None and "out" in record:
+        # The per-op recompute takes the forward's exact output: re-running vLLM's routed experts would gather every
+        # expert onto every rank, which the full model has no memory left for in its backward.
+        shared = shared_expert_partials(mlp.shared_expert, x, config.swiglu_limit, tp)
+        reference = tp_sum(shared) + stock_routed_experts(mlp, x, ids, weights).to(x.dtype)
+        return substitute(reference, record.pop("out"))
     routed = _op(_routed_experts_ranks, "ref_routed_experts_ep", x, weights, ids, experts=mlp.experts, moe=mlp,
                  total=config.n_routed_experts, ep_group=ep_group, tp=tp, top_k=config.num_experts_per_tok,
                  limit=config.swiglu_limit)  # fmt: skip
     shared = shared_expert_partials(mlp.shared_expert, x, config.swiglu_limit, tp)
-    return tp_sum([s + r for s, r in zip(shared, routed)])
+    out = tp_sum([s + r for s, r in zip(shared, routed)])
+    if keep_out and record is not None:
+        record["out"] = out.detach()
+    return out
 
 
 def _routed_experts_ranks(x, weights, ids, *, experts: Any, total: int, ep_group: Any, tp: int, top_k: int,
@@ -901,7 +908,8 @@ def _mlp(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     tp = getattr(ctx, "tp", 1)
     if hasattr(layer.mlp, "gate_proj"):
         return dense_mlp(layer.mlp, x, tp)
-    return moe(layer.mlp, x, ctx.config, getattr(ctx, "ep_group", None), _record(ctx, layer), tp)
+    return moe(layer.mlp, x, ctx.config, getattr(ctx, "ep_group", None), _record(ctx, layer), tp,
+               keep_out=getattr(ctx, "keep_moe_out", False))  # fmt: skip
 
 
 def _record(ctx: Any, layer: Any) -> dict | None:
@@ -1226,6 +1234,7 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
                                 tp=getattr(model, "_vllm_aligned_tensor_parallel", 1))  # fmt: skip
     mode = getattr(model, "_vllm_aligned_backward", "stock")
     if mode == "vllm_op":
+        ctx.keep_moe_out = ctx.replay is not None
         run_backward = _per_op_backward_runner(ctx)
     elif mode == "vllm" and ctx.replay is not None:
         run_backward = _vllm_backward_runner(input_ids, position_ids, kwargs, ctx)
