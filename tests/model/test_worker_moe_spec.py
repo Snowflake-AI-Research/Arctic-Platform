@@ -79,9 +79,10 @@ def test_worker_moe_spec_preserves_glm53_recipe_and_input(tmp_path, worker_confi
     assert worker_config == original
 
 
-def test_worker_moe_spec_glm52_still_rejects_sp(tmp_path, worker_config):
-    with pytest.raises(ValueError, match="glm_moe_dsa does not support sequence parallelism"):
-        ds_worker_moe_model_spec(_model_path(tmp_path, "glm_moe_dsa"), worker_config)
+def test_worker_moe_spec_glm52_carries_sp(tmp_path, worker_config):
+    # glm_moe_dsa runs context parallelism over the sequence-parallel group.
+    spec = ds_worker_moe_model_spec(_model_path(tmp_path, "glm_moe_dsa"), worker_config)
+    assert spec.loader == "glm_moe_dsa" and spec.parallelism.sequence_parallel == 8
 
 
 @pytest.mark.parametrize(

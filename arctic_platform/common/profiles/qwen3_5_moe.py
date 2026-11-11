@@ -58,7 +58,9 @@ def register(registry: Registry) -> None:
             "numerics.fp32_parity",
         ],
         unsupported={
-            "shard_dense": "the huggingface loader's option (patches.dense_shard)",
+            "shard_dense": (
+                "the huggingface loader's option; the MoE loaders shard their replicated weights with moe.shard_dense"
+            ),
             "numerics.fp32_residual": "this loader has no fp32_residual option; only huggingface has one",
             "numerics.fp32_routed_weighting": "no fp32_routed_weighting option; see glm5_next, qwen4_exp",
             "lm_head.vocab_chunk_size": "no equivalent option",
