@@ -190,12 +190,15 @@ def topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
 
 @functools.cache
 def _deep_gemm_mqa_logits(capability_major: int):
-    """DeepGEMM's FP8 MQA-logits kernel, bundled with vLLM, on SM90/SM100; else ``None``.
+    """DeepGEMM's FP8 MQA-logits kernel, bundled with vLLM, on SM90; else ``None``.
 
-    It scores exactly what ``_triton_fp8_indexer_kernel`` does, 2-3x faster on B200/B300, and
-    skips key blocks outside each row's ``[ks, ke)``.
+    It scores exactly what ``_triton_fp8_indexer_kernel`` does, and skips key blocks outside each
+    row's ``[ks, ke)``. vLLM 0.33's build returns compressed logits: row ``i`` holds the keys
+    ``[ks[i], ke[i])`` from column 0, and the columns past ``ke[i] - ks[i]`` are not cleaned. On SM100
+    it takes only MX-scaled queries and keys and returns BF16 logits, which would not pick the Triton
+    kernel's keys, so SM100 scores with the Triton kernel.
     """
-    if capability_major not in (9, 10):
+    if capability_major != 9:
         return None
     try:
         from vllm.third_party.deep_gemm import fp8_fp4_mqa_logits
@@ -292,24 +295,30 @@ def fp8_indexer(q, k, w, ks, ke, topk, weight_scale=1.0):
         lo, hi = int(ks_c.min()) // 64 * 64, int(ke_c.max())
         width = max(hi - lo, 1)
         if mqa_logits is not None:
+            # Compressed logits: row i holds the keys [ks_i, ke_i), from column 0.
+            lengths = ke_c - ks_c
             logits = mqa_logits(
                 (q_fp8[start:stop], None),
                 (k_fp8[lo : lo + width], k_scales[lo : lo + width]),
                 w[start:stop],
                 ks_c - lo,
                 ke_c - lo,
-                clean_logits=True,
+                max(int(lengths.max()), 1),
             )
-            # DeepGEMM pads each row past ``width``. Top-k reads whole rows, so take the padded rows
-            # with the padding masked instead of copying the block; picks there become the sentinel.
-            logits = logits.as_strided((stop - start, logits.stride(0)), (logits.stride(0), 1))
-            logits[:, width:] = float("-inf")
+            # DeepGEMM pads each row and leaves the columns past a row's length as they are. Top-k
+            # reads whole rows, so take the padded rows with every column past the length masked,
+            # instead of copying the block; picks there become the sentinel.
+            pitch = logits.stride(0)
+            logits = logits.as_strided((stop - start, pitch), (pitch, 1))
+            logits.masked_fill_(torch.arange(pitch, device=device) >= lengths.unsqueeze(1), float("-inf"))
+            first = ks_c.unsqueeze(1)
         else:
             logits = weighted_relu_scores(
                 q_fp8[:, start:stop], k_fp8[lo:], k_scales[lo:], w[start:stop], ks_c - lo, ke_c - lo, width
             )
-        actual_topk = min(topk, width)
-        chosen = topk_indices(logits, actual_topk) + lo
+            first = lo
+        actual_topk = min(topk, logits.shape[1])
+        chosen = topk_indices(logits, actual_topk) + first
         # Keys outside a row's [ks, ke) -- other sequences, or the causal future -- become the sentinel N.
         out_of_range = (chosen < ks_c.unsqueeze(1)) | (chosen >= ke_c.unsqueeze(1))
         indices[start:stop, :actual_topk] = chosen.masked_fill(out_of_range, N).to(torch.int32)
