@@ -39,7 +39,9 @@ _SETTERS = {
 
 
 class MoeRuntimeOptions(BaseModel):
-    """Settings of the MoE runtime, one field per module setting. None: the environment variable decides."""
+    """Expert-balance and expert-GEMM settings of the MoE runtime. None: the environment variable
+    decides. UltraEP's spares and the online replicas both fill the spare expert slots, so at most one of them is
+    on."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 

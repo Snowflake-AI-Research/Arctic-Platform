@@ -58,7 +58,9 @@ def _switches(switches=SWITCHES):
 @pytest.mark.parametrize("options_cls", [GlmMoeDsaOptions, GenericMoeOptions, Qwen3_5MoeOptions])
 def test_loader_options_carry_the_runtime_fields(options_cls):
     switches = SWITCHES
-    options = options_cls.model_validate({field: spec[3] for field, spec in switches.items()})
+    options = options_cls.model_validate(
+        {field: spec[3] for field, spec in switches.items()} | {"ultraep_ipc_symm": True}
+    )
     apply_moe_runtime_options(options)
     assert _switches(switches) == {field: spec[3] for field, spec in switches.items()}
 
