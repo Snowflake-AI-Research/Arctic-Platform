@@ -240,7 +240,7 @@ def _offloaded_layers(rank, world, group, layers=3):
     built = [_experts(200 + 10 * i, rank) for i in range(layers)]
     blocks = [_Block(e, _skewed_routing(17 + i, rank, world), group, 21 + i) for i, (e, *_) in enumerate(built)]
     model = nn.ModuleList([checkpoint_wrapper(b, early_stop=False) for b in blocks])
-    offload = install_frozen_expert_offload(model)
+    offload = install_frozen_expert_offload(model, root=model)
     g = torch.Generator(device="cuda").manual_seed(31 + rank)
     rows = (L + S) * MAX_ROWS  # rows past a layer's last slot are padding and come out zero
     xs = [torch.randn(rows, DIM, device="cuda", generator=g).bfloat16().requires_grad_(True) for _ in blocks]
