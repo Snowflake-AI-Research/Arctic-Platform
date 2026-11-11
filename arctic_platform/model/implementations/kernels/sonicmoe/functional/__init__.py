@@ -19,6 +19,7 @@
 
 import itertools
 import logging
+import time
 from functools import partial
 
 import quack.autotuner
@@ -166,6 +167,78 @@ def _make_bucketized_key(self, args, kwargs) -> tuple:
     return tuple(key)
 
 
+# A sweep's cost per config, bounded by GPU time instead of by launch count (local change). QuACK benches each config
+# on the call's real operands with 3 priming + 1 probe + max(50, 200 ms / t) warmup + 200 timed launches: >= 254
+# launches, so a sweep's length grows with the rows the calling rank received. An EP rank that receives most of the
+# routed rows (1e6+ rows at ~20 ms per launch) then sweeps for minutes while its peers wait inside the next DeepEP
+# kernel, whose barrier traps after ~100 s ("DeepEP timeout check failed", then "unspecified launch failure"). These
+# budgets keep every config at a few launches once a launch is long, and at QuACK's counts for short launches.
+_TUNE_WARMUP_MS = 25.0
+_TUNE_TIMED_MS = 25.0
+_TUNE_MAX_WARMUP_CALLS = 50  # QuACK's minimum warmup count; the sweep's 200 ms GPU warmup already ramped the clocks
+_TUNE_MIN_TIMED_CALLS = 3
+_TUNE_MAX_TIMED_CALLS = 200  # QuACK's timed count, kept for short launches
+
+
+def _bench_launch_counts(est_ms: float, n_sets: int) -> tuple[int, int]:
+    """(warmup launches, timed rounds over the ``n_sets`` rotated operand sets) for a config whose probe launch took
+    ``est_ms``: about ``_TUNE_WARMUP_MS`` of warmup (1 to ``_TUNE_MAX_WARMUP_CALLS`` launches) and ``_TUNE_TIMED_MS``
+    of timed work (``_TUNE_MIN_TIMED_CALLS`` to ``_TUNE_MAX_TIMED_CALLS`` launches, whole rounds)."""
+    n_warmup = min(_TUNE_MAX_WARMUP_CALLS, max(1, int(_TUNE_WARMUP_MS / est_ms)))
+    n_timed = min(_TUNE_MAX_TIMED_CALLS, max(_TUNE_MIN_TIMED_CALLS, int(_TUNE_TIMED_MS / est_ms)))
+    return n_warmup, max(1, -(-n_timed // n_sets))
+
+
+def _bench_cuda_graph_l2_rotate_bounded(fn, arg_sets, kwarg_sets, extra_kwargs, quantiles=None, **_):
+    """``quack.bench.bench_utils._bench_cuda_graph_l2_rotate`` (L2-cold round-robin over the cloned operand sets, timed
+    as one CUDA-graph replay) with launch counts from ``_bench_launch_counts``."""
+    n_sets = len(arg_sets)
+    fn(*arg_sets[0], **kwarg_sets[0], **extra_kwargs)  # first launch: module load (or CompilePending, to the caller)
+    torch.cuda.synchronize()
+    probe_start = torch.cuda.Event(enable_timing=True)
+    probe_end = torch.cuda.Event(enable_timing=True)
+    probe_start.record()
+    fn(*arg_sets[0], **kwarg_sets[0], **extra_kwargs)
+    probe_end.record()
+    torch.cuda.synchronize()
+    n_warmup, rounds = _bench_launch_counts(max(probe_start.elapsed_time(probe_end), 1e-3), n_sets)
+    for i in range(n_warmup):
+        fn(*arg_sets[i % n_sets], **kwarg_sets[i % n_sets], **extra_kwargs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(rounds):
+            for i in range(n_sets):
+                fn(*arg_sets[i], **kwarg_sets[i], **extra_kwargs)
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    graph.replay()
+    end.record()
+    torch.cuda.synchronize()
+    ms = start.elapsed_time(end) / (rounds * n_sets)
+    return [ms for _ in quantiles] if quantiles else ms
+
+
+def _pick_l2_rotate_count_bounded(args, kwargs, target_ratio: int = 3, min_buffers: int = 4, max_buffers: int = 16):
+    """``quack.bench.bench_utils._pick_l2_rotate_count``, except that one operand set larger than ``target_ratio`` L2
+    caches is not cloned ``min_buffers`` times (it already defeats L2 reuse: QuACK cloned a hot rank's GBs of rows
+    four times), and the free-memory cap applies below ``min_buffers`` too."""
+    if not torch.cuda.is_available():
+        return min_buffers
+    tensor_bytes = sum(a.numel() * a.element_size() for a in args if isinstance(a, torch.Tensor)) + sum(
+        v.numel() * v.element_size() for v in kwargs.values() if isinstance(v, torch.Tensor)
+    )
+    if tensor_bytes == 0:
+        return min_buffers
+    l2_size = torch.cuda.get_device_properties(torch.cuda.current_device()).L2_cache_size
+    n_by_l2 = -(-target_ratio * l2_size // tensor_bytes)
+    n_by_mem = int(torch.cuda.mem_get_info()[0] * 0.5) // tensor_bytes
+    wanted = 1 if n_by_l2 <= 1 else max(min_buffers, n_by_l2)
+    return max(1, min(max_buffers, n_by_mem, wanted))
+
+
 _orig_autotuner_call = quack.autotuner.Autotuner.__call__
 
 
@@ -188,16 +261,22 @@ def _autotuner_call_with_M_buckets(self, *args, **kwargs):
         logging.getLogger(__name__).warning(
             "SonicMoE autotuning %s for %s", getattr(self.fn, "__name__", self.fn), bucket_key
         )
+        start = time.perf_counter()
     ret = _orig_autotuner_call(self, *args, **kwargs)
 
     # ... then alias that winner onto the bucket key, for every later M in the bucket.
     if len(self.configs) > 1 and hasattr(self, "best_config"):
         self.cache[_make_bucketized_key(self, args, kwargs)] = self.best_config
+        logging.getLogger(__name__).warning(
+            "SonicMoE autotuned %s in %.1f s", getattr(self.fn, "__name__", self.fn), time.perf_counter() - start
+        )
 
     return ret
 
 
 quack.autotuner.Autotuner.__call__ = _autotuner_call_with_M_buckets
+quack.autotuner._bench_cuda_graph_l2_rotate = _bench_cuda_graph_l2_rotate_bounded
+quack.autotuner._pick_l2_rotate_count = _pick_l2_rotate_count_bounded
 _gc._get_sm90_configs = _fast_sm90_configs
 _gc._get_sm100_configs = _fast_sm100_configs
 
