@@ -77,6 +77,12 @@ def patch_deepspeed_moe_detection() -> None:
                 num_experts = getattr(experts, "num_experts", None)
             if num_experts is not None:
                 self.num_experts.append(num_experts)
+        from .dense_shard import is_dense_shard
+
+        # Node shards of replicated weights (dense_shard.py) are reduced over their expert-data-parallel group, which
+        # ZeRO does only for a model it knows to have MoE layers.
+        if not self.has_moe_layers and any(is_dense_shard(parameter) for parameter in self.module.parameters()):
+            self.has_moe_layers = True
 
     ds_engine.DeepSpeedEngine._configure_distributed_model = patched
     ds_engine.DeepSpeedEngine._ap_moe_patched = True
@@ -297,7 +303,7 @@ def build_iter_full_hf_weights(model: nn.Module):
 
         ordered_layers = ([-1] if -1 in by_layer else []) + sorted(index for index in by_layer if index >= 0)
         for index in ordered_layers:
-            # Parameters the model holds elsewhere (weight_export.HeldParameters) are whole only for this layer;
+            # Parameters the model holds elsewhere (moe/dense_shard.py's node shards) are whole only for this layer;
             # its tensors live in export_layer's frame, which ends before the next layer is materialized.
             with materialized_parameters(model, [tensor for _, tensor in by_layer[index]]):
                 yield from export_layer(index, by_layer[index])
@@ -413,8 +419,8 @@ def load_moe_model(
 
     from .runtime_options import apply_moe_runtime_options
 
-    # Before the model is built: the modules these settings steer read them while it is built and run, so every
-    # module reads this load's settings.
+    # Before the model is built: offload, sharding, W4A8, UltraEP, the online replicas and the expert placement read
+    # these settings while it is built and run, so every module reads this load's settings.
     apply_moe_runtime_options(options)
     world_size = dist.get_world_size()
     if world_size % ep_size:
