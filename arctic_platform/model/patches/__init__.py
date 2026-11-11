@@ -16,6 +16,7 @@
 
 from arctic_platform.model.patches import activation_offload  # noqa: F401
 from arctic_platform.model.patches import compile  # noqa: F401
+from arctic_platform.model.patches import dense_shard  # noqa: F401
 from arctic_platform.model.patches import gradient_checkpointing  # noqa: F401
 from arctic_platform.model.patches import liger  # noqa: F401
 from arctic_platform.model.patches import lm_head  # noqa: F401
