@@ -52,6 +52,9 @@ def _integer_histc_on_cpu():
 
 
 class DeepseekV41MoE(MoE):
+    # A weights-only checkpoint carries the image-token routing bias, as published; weight sync leaves it out.
+    _dss_weight_export_buffers = frozenset({"bias_vl"})
+
     def __init__(self, config: DeepseekV41Config, layer_idx: int):
         if config.hidden_act != "silu":
             raise ValueError(f"DeepSeek V4.1 experts implement SiLU, got hidden_act={config.hidden_act!r}")
