@@ -84,6 +84,27 @@ def test_loader_preserves_options_and_process_group(monkeypatch, backend):
 
 
 @pytest.mark.parametrize(
+    "ac_config",
+    [
+        None,
+        {"combine_replay": True},
+        {"mode": "selective", "targets": ["norm"]},
+        {"layers": [3], "combine_replay": True},
+    ],
+)
+def test_deepep_v2_is_accepted_where_its_recompute_can_replay_the_dispatch(ac_config):
+    options = GlmMoeDsaOptions(ep_comm_backend="deepep_v2", ac_config=ac_config)
+    assert options.ep_comm_backend == "deepep_v2"
+
+
+def test_deepep_v2_refuses_whole_block_recompute_without_the_combine_replay():
+    """DeepEP V2's unordered kernels: a recompute that dispatched afresh would rebuild its rows in another order."""
+    with pytest.raises(ValueError, match="combine_replay"):
+        GlmMoeDsaOptions(ep_comm_backend="deepep_v2", ac_config={"mode": "full"})
+    assert GlmMoeDsaOptions(ep_comm_backend="uccl", ac_config={"mode": "full"}).ac_config.combine_replay is False
+
+
+@pytest.mark.parametrize(
     "options",
     [
         {"ep_comm_backend": "unknown"},
