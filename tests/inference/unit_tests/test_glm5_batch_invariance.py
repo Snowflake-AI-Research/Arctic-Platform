@@ -170,6 +170,18 @@ def test_tokens_that_fit_in_index_topk_get_causal_indices_beside_longer_sequence
     assert buffer[3].tolist() == [7, 7, 7, 7]
 
 
+def test_an_unknown_patch_to_skip_is_rejected(monkeypatch):
+    import pytest
+
+    from arctic_platform.inference.vllm import glm5_batch_invariance
+
+    monkeypatch.setenv(glm5_batch_invariance.ENV_VAR, "1")
+    monkeypatch.setenv(glm5_batch_invariance.SKIP_ENV_VAR, "one_split, no_such_patch")
+    monkeypatch.setattr(glm5_batch_invariance, "_APPLIED", False)
+    with pytest.raises(ValueError, match="no_such_patch"):
+        glm5_batch_invariance.ensure_glm5_batch_invariance()
+
+
 def test_causal_rows_fill_without_a_host_sync_matches_the_row_selection():
     import torch
 

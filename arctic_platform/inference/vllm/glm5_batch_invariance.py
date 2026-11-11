@@ -396,6 +396,10 @@ def _sparse_mla_always_mqa() -> None:
 
 
 PROXY_ENV_VAR = "ARCTIC_GLM5_PROXY_LAYERS"
+# Debug, for ablations: comma-separated patches of ``PATCHES`` to leave out. The backend gating always applies.
+SKIP_ENV_VAR = "ARCTIC_GLM5_BI_SKIP"
+PATCHES = ("gdn", "one_split", "mhc_split", "mhc_unfused", "router_gate", "mla_mqa", "fp8_linear", "kda_mixed",
+           "indexer_topk", "causal_rows", "indexer_knorm", "indexer_weights", "grouped_topk", "kda_pin")  # fmt: skip
 
 
 def _load_proxy_layers_only(num_layers: int) -> None:
@@ -420,13 +424,15 @@ def ensure_glm5_batch_invariance() -> None:
         return
     if os.environ.get(PROXY_ENV_VAR):
         _load_proxy_layers_only(int(os.environ[PROXY_ENV_VAR]))
-    os.environ.setdefault("ARCTIC_GDN_BATCH_INVARIANT", "1")
-    # The fused grouped top-k CUDA kernel's routing weights depend on the step; vLLM's torch path sorts for batch
-    # invariance.
-    os.environ.setdefault("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "0")
-    from arctic_platform.inference.vllm.gdn_batch_invariance import ensure_gdn_batch_invariance
+    skip = {name.strip() for name in os.environ.get(SKIP_ENV_VAR, "").split(",") if name.strip()}
+    unknown = skip - set(PATCHES)
+    if unknown:
+        raise ValueError(f"{SKIP_ENV_VAR}: unknown patches {sorted(unknown)}; known: {list(PATCHES)}")
+    if "gdn" not in skip:
+        os.environ.setdefault("ARCTIC_GDN_BATCH_INVARIANT", "1")
+        from arctic_platform.inference.vllm.gdn_batch_invariance import ensure_gdn_batch_invariance
 
-    ensure_gdn_batch_invariance()
+        ensure_gdn_batch_invariance()
 
     from vllm.v1.attention.backends.mla import flashattn_mla_sparse
     from vllm.v1.attention.backends.mla import indexer
@@ -437,29 +443,37 @@ def ensure_glm5_batch_invariance() -> None:
         indexer.KpoolTailBackend,
     ):
         backend.supports_batch_invariance = classmethod(lambda cls: True)
-    flashattn_mla_sparse.flash_attn_varlen_func = _single_split(flashattn_mla_sparse.flash_attn_varlen_func)
+    if "one_split" not in skip:
+        flashattn_mla_sparse.flash_attn_varlen_func = _single_split(flashattn_mla_sparse.flash_attn_varlen_func)
     from vllm.model_executor.kernels.mhc import tilelang_kernels
     from vllm.model_executor.kernels.mhc import warmup
 
-    # The hyper-connection pre-norm GEMM splits its reduction by the step's token count; callers import these from
-    # both modules at call time.
-    for module in (tilelang_kernels, warmup):
-        module.compute_num_split = lambda *args, **kwargs: 1
-        module.compute_mhc_pre_num_splits = lambda *args, **kwargs: 1
-    # Small steps would take a fused post + pre-norm kernel with its own split; every step takes the split-free path.
-    # The fused kernel then has no compile keys, so the kernel warm-up (run with CUDA graphs) must not ask for any.
-    tilelang_kernels.mhc_fused_post_pre_split_config = lambda *args, **kwargs: None
-    tilelang_kernels.MhcFusedTileLangKernel.get_warmup_keys = lambda self, *args, **kwargs: []
-    _batch_invariant_router_gate()
-    _sparse_mla_always_mqa()
-    _batch_invariant_fp8_block_linear()
-    _split_mixed_kda_steps()
-    _deterministic_indexer_topk()
-    _causal_indices_per_token()
-    _eager_indexer_k_norm()
-    _batch_invariant_indexer_head_weights()
-    from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
+    if "mhc_split" not in skip:
+        # The hyper-connection pre-norm GEMM splits its reduction by the step's token count; callers import these
+        # from both modules at call time.
+        for module in (tilelang_kernels, warmup):
+            module.compute_num_split = lambda *args, **kwargs: 1
+            module.compute_mhc_pre_num_splits = lambda *args, **kwargs: 1
+    if "mhc_unfused" not in skip:
+        # Small steps would take a fused post + pre-norm kernel with its own split; every step takes the split-free
+        # path. The fused kernel then has no compile keys, so the kernel warm-up (run with CUDA graphs) must not ask
+        # for any.
+        tilelang_kernels.mhc_fused_post_pre_split_config = lambda *args, **kwargs: None
+        tilelang_kernels.MhcFusedTileLangKernel.get_warmup_keys = lambda self, *args, **kwargs: []
+    for name, apply in (("router_gate", _batch_invariant_router_gate), ("mla_mqa", _sparse_mla_always_mqa),
+                        ("fp8_linear", _batch_invariant_fp8_block_linear), ("kda_mixed", _split_mixed_kda_steps),
+                        ("indexer_topk", _deterministic_indexer_topk), ("causal_rows", _causal_indices_per_token),
+                        ("indexer_knorm", _eager_indexer_k_norm),
+                        ("indexer_weights", _batch_invariant_indexer_head_weights)):  # fmt: skip
+        if name not in skip:
+            apply()
+    if "grouped_topk" not in skip:
+        # The fused grouped top-k CUDA kernel's routing weights depend on the step; vLLM's torch path sorts for
+        # batch invariance.
+        os.environ.setdefault("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "0")
+        from vllm.model_executor.layers.fused_moe.router import grouped_topk_router
 
-    grouped_topk_router.grouped_topk = grouped_topk
-    pin_kda_kernels()
+        grouped_topk_router.grouped_topk = grouped_topk
+    if "kda_pin" not in skip:
+        pin_kda_kernels()
     _APPLIED = True
