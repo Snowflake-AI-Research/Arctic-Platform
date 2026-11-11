@@ -140,3 +140,58 @@ def sonic_routed_experts(
         True,  # concat layout: gate rows, then up rows
     )
     return out
+
+
+def sonic_relu2_experts_applicable(experts: nn.Module) -> bool:
+    """BF16 non-gated relu^2 experts (Nemotron-H) on a Hopper/Blackwell GPU, trained or frozen, with PEFT's merged
+    expert LoRA or none: SonicMoE's RELU_SQ epilogue, as for SwiGLU in ``sonic_routed_experts_applicable``."""
+    w1 = getattr(experts, "w1", None)
+    if w1 is None or not w1.is_cuda or w1.dtype != torch.bfloat16:
+        return False
+    if not getattr(experts, "use_grouped_mm", False):
+        return False
+    if getattr(experts, "_ap_lora_ab", None) or getattr(experts, "_dss_lora_ab", None):
+        return False
+    if torch.cuda.get_device_capability(w1.device)[0] < 9:
+        return False
+    try:
+        from arctic_platform.model.implementations.kernels import sonicmoe  # noqa: F401
+    except ImportError as exc:
+        _warn_sonicmoe_import_failed(exc)
+        return False
+    return True
+
+
+def sonic_relu2_experts(
+    experts: nn.Module, hidden_states: torch.Tensor, expert_indices: torch.Tensor, scores: torch.Tensor
+) -> torch.Tensor:
+    """``sum_k scores[t, k] * w2_e relu(w1_e hidden_states[t])^2`` over the local experts ``e = indices[t, k]`` of each
+    received token (``-1`` elsewhere), as ``[tokens, hidden]``: Nemotron-H's non-gated experts through SonicMoE (the
+    up projection's epilogue applies relu^2, the down projection folds in the routing weights and the per-token sum).
+    Differentiable in ``hidden_states``, ``scores`` and, when they train, the expert weights."""
+    from arctic_platform.model.implementations.kernels.sonicmoe import ActivationType
+    from arctic_platform.model.implementations.kernels.sonicmoe import moe_general_routing_inputs
+    from arctic_platform.model.implementations.kernels.sonicmoe.functional import note_feature_dims
+
+    tokens, topk = expert_indices.shape
+    mask = expert_indices >= 0
+    token_ids = torch.arange(tokens, device=hidden_states.device).unsqueeze(1).expand(tokens, topk)[mask].int()
+    local_ids = expert_indices[mask].int()
+    w1, w2 = experts.w1, experts.w2  # [E, I, H] and [E, H, I], LoRA-merged inside the PEFT wrappers
+    num_experts, inter, hidden = w1.shape
+    note_feature_dims(num_experts, num_experts + 1, inter, hidden)
+    out, _ = moe_general_routing_inputs(
+        hidden_states,
+        scores[mask],
+        token_ids,
+        local_ids,
+        w1.permute(1, 2, 0),
+        None,
+        w2.permute(1, 2, 0),
+        None,
+        num_experts,
+        torch.cuda.current_stream().cuda_stream,
+        ActivationType.RELU_SQ,
+        not torch.is_grad_enabled(),
+    )
+    return out
