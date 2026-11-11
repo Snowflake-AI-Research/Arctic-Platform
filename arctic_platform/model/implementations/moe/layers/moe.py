@@ -327,7 +327,13 @@ def _run_experts_grouped_mm_impl(
 
     gate = torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
     up = torch._grouped_mm(x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets)
-    h = _apply_swiglu(gate, up, swiglu_limit)
+    if gate.is_cuda:
+        from arctic_platform.model.implementations.kernels.fused_swiglu import fused_swiglu
+
+        # One pass each way, keeping gate and up only (autograd's SiLU-then-product also keeps silu(gate)).
+        h = fused_swiglu(gate, up, swiglu_limit)
+    else:
+        h = _apply_swiglu(gate, up, swiglu_limit)
     if scores is not None:
         return weighted_down_projection(h, w2.bfloat16(), offsets, scores).type_as(x)
     out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
