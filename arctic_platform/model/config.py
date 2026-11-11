@@ -195,6 +195,17 @@ class Patches(BaseModel):
         False,
         description="False disables; True checkpoints every layer; an integer checkpoints every Nth layer.",
     )
+    checkpoint_keep_attention: StrictBool | list[str] = Field(
+        False,
+        description=(
+            "With gradient_checkpointing, keep each checkpointed layer's attention-kernel outputs (the attention"
+            " output and its log-sum-exp) from the forward pass, so the backward recompute runs everything in the"
+            " layer except the attention kernel. Costs one attention output per checkpointed layer. True keeps every"
+            " known attention kernel (FlashAttention 3 / 2, SDPA's kernels, and ops registered with"
+            " register_attention_kernel_op); a list of op names ('namespace::name' or 'namespace::name.overload')"
+            " keeps only those kernels and recomputes the others."
+        ),
+    )
     activation_offload: ActivationOffloadPatch | None = Field(
         None, description="CPU offload for activations saved by checkpointed layers."
     )
@@ -220,6 +231,10 @@ class Patches(BaseModel):
         if self.activation_offload is not None:
             if self.gradient_checkpointing is False:
                 raise ValueError("activation_offload requires gradient_checkpointing")
+        if self.checkpoint_keep_attention and self.gradient_checkpointing is False:
+            raise ValueError("checkpoint_keep_attention requires gradient_checkpointing")
+        if isinstance(self.checkpoint_keep_attention, list) and not self.checkpoint_keep_attention:
+            raise ValueError("checkpoint_keep_attention lists no op; use false to keep none")
         if self.dense_shard and self.peft is not None:
             raise ValueError("dense_shard shards trainable weights for full fine-tuning; it does not support PEFT")
         if self.dense_shard and self.tiled_mlp is not None:

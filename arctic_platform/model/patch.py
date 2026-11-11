@@ -35,6 +35,7 @@ Patch = Callable[[nn.Module, LoaderContext], nn.Module | None]
 PATCH_ORDER: tuple[str, ...] = (
     "liger",
     "gradient_checkpointing",
+    "checkpoint_keep_attention",
     "activation_offload",
     "compile",
     "tiled_mlp",
