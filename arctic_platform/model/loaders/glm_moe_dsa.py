@@ -26,6 +26,7 @@ from typing_extensions import Self
 
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
+from arctic_platform.model.implementations.moe.config_validation import validate_deepep_v2_recompute
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.implementations.moe.runtime_options import MoeRuntimeOptions
 from arctic_platform.model.loader import LoadedModel
@@ -77,6 +78,11 @@ class GlmMoeDsaOptions(MoeRuntimeOptions):
         validate_lm_head_fused_ce_config(self.model_dump())
         if self.fused_cross_entropy == "quack" and self.fp32_lm_head:
             raise ValueError("fp32_lm_head is not supported with fused_cross_entropy='quack'")
+        return self
+
+    @model_validator(mode="after")
+    def _deepep_v2_recompute_needs_its_forwards_dispatch(self) -> Self:
+        validate_deepep_v2_recompute(self.ep_comm_backend, self.ac_config)
         return self
 
 
