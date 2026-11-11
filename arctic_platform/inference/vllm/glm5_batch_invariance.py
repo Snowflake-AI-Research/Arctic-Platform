@@ -447,7 +447,9 @@ def ensure_glm5_batch_invariance() -> None:
         module.compute_num_split = lambda *args, **kwargs: 1
         module.compute_mhc_pre_num_splits = lambda *args, **kwargs: 1
     # Small steps would take a fused post + pre-norm kernel with its own split; every step takes the split-free path.
+    # The fused kernel then has no compile keys, so the kernel warm-up (run with CUDA graphs) must not ask for any.
     tilelang_kernels.mhc_fused_post_pre_split_config = lambda *args, **kwargs: None
+    tilelang_kernels.MhcFusedTileLangKernel.get_warmup_keys = lambda self, *args, **kwargs: []
     _batch_invariant_router_gate()
     _sparse_mla_always_mqa()
     _batch_invariant_fp8_block_linear()
