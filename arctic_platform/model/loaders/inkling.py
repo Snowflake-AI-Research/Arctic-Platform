@@ -19,7 +19,6 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import field_validator
@@ -28,12 +27,13 @@ from pydantic import model_validator
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config import EPCommBackend
+from arctic_platform.model.implementations.moe.runtime_options import MoeRuntimeOptions
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
 
 
-class InklingOptions(BaseModel):
+class InklingOptions(MoeRuntimeOptions):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     seq_len: int = Field(4096, gt=0)
