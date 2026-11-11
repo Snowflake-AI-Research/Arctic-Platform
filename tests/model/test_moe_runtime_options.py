@@ -18,6 +18,7 @@ option turns its switch off. CPU only."""
 from __future__ import annotations
 
 import importlib
+import os
 
 import pytest
 
@@ -30,6 +31,7 @@ from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 # field -> (module, reader, value when set, value when off)
 SWITCHES = {
     "w8a8_experts": ("kernels.fp8_grouped_w8a8", "w8a8_experts_requested", True, False),
+    "ultraep_spares": ("moe.ultraep_replicas", "ultraep_spares", 2, 0),
 }
 
 
@@ -38,7 +40,8 @@ def _module(name):
 
 
 @pytest.fixture(autouse=True)
-def _clean():
+def _clean(monkeypatch):
+    monkeypatch.delenv("ULTRA_EP_IPC_SYMM", raising=False)
     yield
     apply_moe_runtime_options(MoeRuntimeOptions())  # every switch off again
 
@@ -50,6 +53,9 @@ def _switches(switches=SWITCHES):
 @pytest.mark.parametrize("options_cls", [GlmMoeDsaOptions, GenericMoeOptions, Qwen3_5MoeOptions])
 def test_loader_options_carry_the_runtime_fields(options_cls):
     switches = SWITCHES
-    options = options_cls.model_validate({field: spec[2] for field, spec in switches.items()})
+    options = options_cls.model_validate(
+        {field: spec[2] for field, spec in switches.items()} | {"ultraep_ipc_symm": True}
+    )
     apply_moe_runtime_options(options)
     assert _switches(switches) == {field: spec[2] for field, spec in switches.items()}
+    assert os.environ["ULTRA_EP_IPC_SYMM"] == "1"
