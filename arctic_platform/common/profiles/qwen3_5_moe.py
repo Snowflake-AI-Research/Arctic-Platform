@@ -49,6 +49,7 @@ def register(registry: Registry) -> None:
             "moe.ultraep_ipc_symm",
             "moe.expert_replicas",
             "moe.expert_replicas_ema",
+            "moe.expert_placement",
             "attention.backend",
             "numerics.reduce_dtype",
             "numerics.optimization_dtype",
