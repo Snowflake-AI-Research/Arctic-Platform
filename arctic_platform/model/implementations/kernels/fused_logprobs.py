@@ -24,11 +24,14 @@ The math is the composition's, in FP32 per element: the target's log-probability
 ``-softplus(logsumexp_{j != t}(x_j) - x_t)`` with the difference formed as ``(m - x_t) + log(s)`` (``m`` the row's
 max, ``s`` the sum of ``exp(x_j - m)`` over the non-target logits), so a near-certain target keeps its precision; the
 backward rebuilds ``softmax`` from the cached ``logz`` and takes the target's ``1 - softmax`` as
-``sigmoid(logsumexp_{j != t} - x_t)``. ``x`` is the BF16 logit times the row's inverse temperature.
+``sigmoid(logsumexp_{j != t} - x_t)``. ``x`` is the BF16 logit times the row's inverse temperature, after Gemma's
+``softcap * tanh(logit / softcap)`` when a softcap is given (the composition's order: the cap, then the temperature);
+backward then multiplies the logit gradient by ``1 - tanh^2`` after the temperature's chain rule.
 """
 
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 # One row per program; a 151,936-entry vocabulary is 19 blocks of 8,192.
 _BLOCK_V = 8192
@@ -50,6 +53,14 @@ def _softplus(x):
 
 
 @triton.jit
+def _capped(logit, softcap, HAS_SOFTCAP: tl.constexpr):
+    # Gemma's cap as the composition writes it: tanh(logit / softcap) * softcap.
+    if HAS_SOFTCAP:
+        return libdevice.tanh(logit / softcap) * softcap
+    return logit
+
+
+@triton.jit
 def _logprob_fwd_kernel(
     logits_ptr,
     stride_row,
@@ -59,19 +70,22 @@ def _logprob_fwd_kernel(
     logz_ptr,
     omt_ptr,
     vocab,
+    softcap,
     BLOCK_V: tl.constexpr,
+    HAS_SOFTCAP: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     base = logits_ptr + row * stride_row
     label = tl.load(labels_ptr + row)
     inv_t = tl.load(inv_t_ptr + row)
-    x_t = tl.load(base + label).to(tl.float32) * inv_t
+    x_t = _capped(tl.load(base + label).to(tl.float32), softcap, HAS_SOFTCAP) * inv_t
     m = tl.full((), float("-inf"), tl.float32)
     s = tl.zeros((), tl.float32)
     for start in range(0, vocab, BLOCK_V):
         cols = start + tl.arange(0, BLOCK_V)
         valid = cols < vocab
-        x = tl.load(base + cols, mask=valid, other=float("-inf")).to(tl.float32) * inv_t
+        x = tl.load(base + cols, mask=valid, other=0.0).to(tl.float32)
+        x = tl.where(valid, _capped(x, softcap, HAS_SOFTCAP) * inv_t, float("-inf"))
         m_new = tl.maximum(m, tl.max(x, axis=0))
         # The target's exp(0) = 1 would absorb the rest of the sum in FP32; it is added back through logz.
         e = tl.where(valid & (cols != label), tl.exp(x - m_new), 0.0)
@@ -97,7 +111,9 @@ def _logprob_bwd_kernel(
     logz_ptr,
     omt_ptr,
     vocab,
+    softcap,
     BLOCK_V: tl.constexpr,
+    HAS_SOFTCAP: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     base = logits_ptr + row * stride_row
@@ -112,13 +128,20 @@ def _logprob_bwd_kernel(
     for start in range(0, vocab, BLOCK_V):
         cols = start + tl.arange(0, BLOCK_V)
         valid = cols < vocab
-        x = tl.load(base + cols, mask=valid, other=0.0).to(tl.float32) * inv_t
+        logit = tl.load(base + cols, mask=valid, other=0.0).to(tl.float32)
+        if HAS_SOFTCAP:
+            squashed = libdevice.tanh(logit / softcap)
+            x = squashed * softcap * inv_t
+        else:
+            x = logit * inv_t
         d = (-g * tl.exp(x - logz)) * inv_t
         d = tl.where(cols == label, target_grad, d)
+        if HAS_SOFTCAP:
+            d = d * (1 - squashed * squashed)
         tl.store(base + cols, d.to(logits_ptr.dtype.element_ty), mask=valid)
 
 
-def target_logprobs_forward(logits, labels, inv_temperature, logprobs, logz, others_minus_target):
+def target_logprobs_forward(logits, labels, inv_temperature, logprobs, logz, others_minus_target, softcap=None):
     """Fill ``logprobs``, ``logz`` and ``others_minus_target`` (FP32 ``[rows]``) from ``logits`` ``[rows, vocab]``."""
     rows, vocab = logits.shape
     if rows == 0:
@@ -134,12 +157,14 @@ def target_logprobs_forward(logits, labels, inv_temperature, logprobs, logz, oth
         logz,
         others_minus_target,
         vocab,
+        float(softcap) if softcap else 1.0,
         BLOCK_V=_BLOCK_V,
+        HAS_SOFTCAP=bool(softcap),
         num_warps=_NUM_WARPS,
     )
 
 
-def target_logprobs_backward_(logits, labels, inv_temperature, grad_logprobs, logz, others_minus_target):
+def target_logprobs_backward_(logits, labels, inv_temperature, grad_logprobs, logz, others_minus_target, softcap=None):
     """Overwrite ``logits`` with ``d sum(grad_logprobs * logprobs) / d logits`` in its own dtype; returns it."""
     rows, vocab = logits.shape
     if rows == 0:
@@ -155,7 +180,9 @@ def target_logprobs_backward_(logits, labels, inv_temperature, grad_logprobs, lo
         logz,
         others_minus_target,
         vocab,
+        float(softcap) if softcap else 1.0,
         BLOCK_V=_BLOCK_V,
+        HAS_SOFTCAP=bool(softcap),
         num_warps=_NUM_WARPS,
     )
     return logits
