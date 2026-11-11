@@ -6,6 +6,7 @@ Hybrid Mamba-Transformer-MoE architecture with three distinct layer types:
 - Attention layers (using shared FlashAttention/SDPA from prime-rl)
 """
 
+import re
 from typing import Optional
 
 import torch
@@ -360,6 +361,18 @@ def _build_layer(config: NemotronHConfig, layer_idx: int):
     return cls(config)
 
 
+# A block's mixer in prime-rl's tree (self_attn, mamba, mlp, and the MoE's shared expert).
+_PRIME_MIXER = re.compile(r"((?:^|\.)layers\.\d+)\.(self_attn|mamba|mlp\.shared_expert|mlp)\.")
+
+
+def vllm_lora_name(name: str) -> str:
+    """A LoRA tensor's name in vLLM's Nemotron-H module tree, where every block's mixer is ``mixer`` (attention,
+    Mamba-2 and MoE alike) and the MoE's shared expert is ``mixer.shared_experts``."""
+    return _PRIME_MIXER.sub(
+        lambda m: f"{m.group(1)}.mixer.{'shared_experts.' if m.group(2) == 'mlp.shared_expert' else ''}", name
+    )
+
+
 @auto_docstring
 class NemotronHPreTrainedModel(PreTrainedModelPrimeRL):
     config: NemotronHConfig
@@ -369,6 +382,11 @@ class NemotronHPreTrainedModel(PreTrainedModelPrimeRL):
     _supports_flash_attn = True
     _supports_sdpa = True
     _can_compile_fullgraph = False
+    # LoRA weight sync and the sampler's adapter pack (weight_export.py) name tensors after vLLM's modules.
+    vllm_lora_name = staticmethod(vllm_lora_name)
+    # vLLM serves the non-gated experts' LoRA one expert at a time (up_proj, down_proj): the PEFT 3-D expert format
+    # it also reads assumes a gated gate_up and would split w1 in halves.
+    vllm_lora_expert_projections = {"w1": "up_proj", "w2": "down_proj"}
 
     def _init_weights(self, module):
         std = self.config.initializer_range
