@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The MoE runtime options (moe/runtime_options.py): the MoE loaders' options steer the runtime switches; an unset
-option leaves each switch's environment variable in charge. CPU only."""
+"""The MoE runtime options (moe/runtime_options.py): the MoE loaders' options steer the runtime switches (offload,
+sharding, W4A8, UltraEP, the online replicas, the expert placement, deepep_v2); an unset option leaves each switch's
+environment variable in charge. CPU only."""
 
 from __future__ import annotations
 
@@ -62,6 +63,11 @@ SWITCHES = {
     # expert_replicas is set apart (test_online_replicas_*): it cannot be on together with ultraep_spares.
     "expert_replicas_ema": ("moe.expert_replicas", "replica_ema", "ARL_EXPERT_REPLICAS_EMA", 0.25, 0.5),
 }
+# glm_moe_dsa's own runtime fields (GlmMoeDsaOptions), which the other loaders' options refuse.
+GLM_SWITCHES = {
+    "shard_dense": ("moe.dense_shard", "dense_sharding_requested", "ARL_SHARD_DENSE", True, False),
+}
+ALL_SWITCHES = SWITCHES | GLM_SWITCHES
 REPLICAS_ENV = "ARL_EXPERT_REPLICAS"
 PLACEMENT_ENV = "ARL_EXPERT_PLACEMENT"
 
@@ -76,7 +82,7 @@ def _env_value(value) -> str:
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
-    for _, _, env, _, _ in SWITCHES.values():
+    for _, _, env, _, _ in ALL_SWITCHES.values():
         monkeypatch.delenv(env, raising=False)
     monkeypatch.delenv(REPLICAS_ENV, raising=False)
     monkeypatch.delenv(PLACEMENT_ENV, raising=False)
@@ -85,13 +91,13 @@ def _clean(monkeypatch):
     apply_moe_runtime_options(MoeRuntimeOptions())  # leave every switch to its environment variable again
 
 
-def _switches(switches=SWITCHES):
+def _switches(switches=ALL_SWITCHES):
     return {field: getattr(_module(spec[0]), spec[1])() for field, spec in switches.items()}
 
 
 @pytest.mark.parametrize("options_cls", [GlmMoeDsaOptions, GenericMoeOptions, Qwen3_5MoeOptions])
 def test_loader_options_carry_the_runtime_fields(options_cls):
-    switches = SWITCHES
+    switches = ALL_SWITCHES if options_cls is GlmMoeDsaOptions else SWITCHES
     options = options_cls.model_validate(
         {field: spec[3] for field, spec in switches.items()} | {"ultraep_ipc_symm": True}
     )
@@ -100,19 +106,26 @@ def test_loader_options_carry_the_runtime_fields(options_cls):
     assert os.environ["ULTRA_EP_IPC_SYMM"] == "1"
 
 
+@pytest.mark.parametrize("options_cls", [MoeRuntimeOptions, GenericMoeOptions, Qwen3_5MoeOptions])
+@pytest.mark.parametrize("field", sorted(GLM_SWITCHES) + ["shard_dense_group_size"])
+def test_only_the_glm_moe_dsa_loader_takes_the_dense_shard_fields(options_cls, field):
+    with pytest.raises(ValidationError):
+        options_cls.model_validate({field: 2 if field == "shard_dense_group_size" else True})
+
+
 def test_options_override_the_environment(monkeypatch):
-    for spec in SWITCHES.values():
+    for spec in ALL_SWITCHES.values():
         monkeypatch.setenv(spec[2], _env_value(spec[3]))
-    apply_moe_runtime_options(GlmMoeDsaOptions(**{field: spec[4] for field, spec in SWITCHES.items()}))
-    assert _switches() == {field: spec[4] for field, spec in SWITCHES.items()}
+    apply_moe_runtime_options(GlmMoeDsaOptions(**{field: spec[4] for field, spec in ALL_SWITCHES.items()}))
+    assert _switches() == {field: spec[4] for field, spec in ALL_SWITCHES.items()}
 
 
 def test_unset_options_leave_the_environment_in_charge(monkeypatch):
     apply_moe_runtime_options(MoeRuntimeOptions())
-    assert _switches() == {field: spec[4] for field, spec in SWITCHES.items()}
-    for spec in SWITCHES.values():
+    assert _switches() == {field: spec[4] for field, spec in ALL_SWITCHES.items()}
+    for spec in ALL_SWITCHES.values():
         monkeypatch.setenv(spec[2], _env_value(spec[3]))
-    assert _switches() == {field: spec[3] for field, spec in SWITCHES.items()}
+    assert _switches() == {field: spec[3] for field, spec in ALL_SWITCHES.items()}
 
 
 @pytest.mark.parametrize("value", ["", "0", "false", "False"])
@@ -120,6 +133,19 @@ def test_offload_environment_off_values(monkeypatch, value):
     monkeypatch.setenv("ARL_OFFLOAD_FROZEN_EXPERTS", value)
     apply_moe_runtime_options(MoeRuntimeOptions())
     assert not _module("moe.frozen_offload").frozen_expert_offload_requested()
+
+
+def test_the_dense_shard_group_size_takes_the_option_then_the_environment(monkeypatch):
+    dense_shard = _module("moe.dense_shard")
+    monkeypatch.delenv(dense_shard.SHARD_DENSE_GROUP_SIZE_ENV, raising=False)
+    apply_moe_runtime_options(MoeRuntimeOptions())
+    assert dense_shard.configured_group_size() is None  # the ranks of one host
+    monkeypatch.setenv(dense_shard.SHARD_DENSE_GROUP_SIZE_ENV, "4")
+    assert dense_shard.configured_group_size() == 4
+    apply_moe_runtime_options(GlmMoeDsaOptions(shard_dense=True, shard_dense_group_size=2))
+    assert dense_shard.configured_group_size() == 2 and dense_shard.dense_sharding_requested()
+    with pytest.raises(ValidationError):
+        GlmMoeDsaOptions(shard_dense_group_size=1)
 
 
 def test_ipc_symm_is_written_for_ultraep():

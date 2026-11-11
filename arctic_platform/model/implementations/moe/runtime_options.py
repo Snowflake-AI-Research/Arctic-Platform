@@ -47,6 +47,9 @@ _SETTERS = {
     "expert_replicas": ("moe.expert_replicas", "configure_spares"),
     "expert_replicas_ema": ("moe.expert_replicas", "configure_ema"),
     "expert_placement": ("moe.expert_placement", "configure_from_options"),
+    # glm_moe_dsa's own fields (GlmMoeDsaOptions): the other loaders lack them, so they count as unset there.
+    "shard_dense": ("moe.dense_shard", "configure_from_options"),
+    "shard_dense_group_size": ("moe.dense_shard", "configure_group_size"),
 }
 _ULTRA_EP_IPC_SYMM_ENV = "ULTRA_EP_IPC_SYMM"
 

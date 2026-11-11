@@ -52,6 +52,7 @@ def register(registry: Registry) -> None:
             "moe.expert_replicas",
             "moe.expert_replicas_ema",
             "moe.expert_placement",
+            "moe.shard_dense",
             "attention.sparse_mla",
             "attention.backend",
             "numerics.reduce_dtype",

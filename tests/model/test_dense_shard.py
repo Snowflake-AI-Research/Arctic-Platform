@@ -80,6 +80,23 @@ def test_the_option_wins_and_the_environment_is_the_fallback(monkeypatch):
         dense_shard.configure_group_size(None)
 
 
+def test_lora_is_refused():
+    from arctic_platform.model.config import ModelSpec
+    from arctic_platform.model.config import Patches
+    from arctic_platform.model.loader import LoaderContext
+    from arctic_platform.model.loaders.glm_moe_dsa import load_glm_moe_dsa
+
+    spec = ModelSpec(
+        model_path_or_name="local",
+        loader="glm_moe_dsa",
+        attn_implementation="sdpa",
+        patches=Patches(peft={"peft_type": "Lora"}),
+        loader_options={"shard_dense": True},
+    )
+    with pytest.raises(ValueError, match="does not support PEFT"):
+        load_glm_moe_dsa(LoaderContext(spec=spec, parallel_groups={"ep_group": object()}))
+
+
 def test_every_rank_lists_the_moe_groups_in_one_order():
     """DeepSpeed gathers the expert group names in a set; the experts' and the shards' groups come out sorted."""
     from arctic_platform.common.deepspeed_engine import split_expert_param_groups
