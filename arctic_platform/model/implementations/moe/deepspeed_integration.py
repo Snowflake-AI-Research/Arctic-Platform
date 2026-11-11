@@ -242,7 +242,7 @@ def build_iter_full_hf_weights(model: nn.Module):
             for name, tensor in by_layer[index]:
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
-                    # Only the master's EP replica participates; gather its shards into bounded CPU output.
+                    # Only the master's EP replica participates.
                     if 0 not in dist.get_process_group_ranks(ep_group):
                         continue
                     if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
@@ -252,11 +252,15 @@ def build_iter_full_hf_weights(model: nn.Module):
                             layer_state[name] = full
                         del full
                         continue
-                    full = _gather_ep_weight_to_cpu(
-                        tensor, ep_group, is_master=is_master, max_gather_bytes=_EXPORT_GATHER_BYTES
-                    )
+                    if include_skipped:  # a checkpoint export stages through bounded host memory
+                        full = _gather_ep_weight_to_cpu(
+                            tensor, ep_group, is_master=is_master, max_gather_bytes=_EXPORT_GATHER_BYTES
+                        )
+                    else:  # a weight sync sends from the device; a host round trip would only add two copies
+                        full = _gather_ep_weight_on_master(tensor, ep_group, is_master=is_master)
                     if is_master:
                         layer_state[name] = full
+                    del full
                 elif is_master:
                     layer_state[name] = tensor.data
 
@@ -425,6 +429,22 @@ def load_moe_model(
     )
     maybe_use_fixed_order_row_sum(model, options.model_dump())
     return model
+
+
+def _gather_ep_weight_on_master(tensor: torch.Tensor, ep_group, *, is_master: bool) -> torch.Tensor | None:
+    """The EP group's shards of ``tensor``, gathered as bytes into one tensor on the master's device, else ``None``."""
+    import torch.distributed as dist
+
+    from arctic_platform.model.weight_export import wait_for_export_collective
+
+    local = tensor.detach().contiguous()
+    world = dist.get_world_size(group=ep_group)
+    full = local.new_empty((world * local.shape[0], *local.shape[1:])) if is_master else None
+    outputs = list(full.view(torch.uint8).view(world, -1).unbind(0)) if full is not None else None
+    dist.gather(local.view(torch.uint8).view(-1), outputs, dst=0, group=ep_group)
+    if not is_master:
+        wait_for_export_collective(local)
+    return full
 
 
 def _gather_ep_weight_to_cpu(

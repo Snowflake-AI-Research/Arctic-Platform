@@ -16,6 +16,7 @@
 """Non-master ranks finish each EP export collective before queuing the next (CPU, faked collectives)."""
 
 import sys
+import weakref
 from types import ModuleType
 from types import SimpleNamespace
 
@@ -117,33 +118,63 @@ def _set_rank(monkeypatch, rank):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: rank)
 
 
-def test_hf_export_non_master_waits_after_every_gather(monkeypatch, events):
+@pytest.mark.parametrize(
+    "include_skipped,expected",
+    [
+        (True, [("all_gather", (32,)), ("wait", (32,)), ("all_gather", (24,)), ("wait", (24,))]),
+        (False, [("gather", (32,)), ("wait", (4, 2)), ("gather", (24,)), ("wait", (3, 2))]),
+    ],
+)
+def test_hf_export_non_master_waits_after_every_gather(monkeypatch, events, include_skipped, expected):
     _set_rank(monkeypatch, 1)
 
-    assert list(deepspeed_integration.build_iter_full_hf_weights(_model((4, 2), (3, 2)))()) == []
+    model = _model((4, 2), (3, 2))
+    assert list(deepspeed_integration.build_iter_full_hf_weights(model)(include_skipped=include_skipped)) == []
 
     # HF export gathers fp32 rows as bytes.
-    assert events == [("all_gather", (32,)), ("wait", (32,)), ("all_gather", (24,)), ("wait", (24,))]
+    assert events == expected
+
+
+@pytest.mark.parametrize("include_skipped", [False, True])
+def test_hf_export_releases_previous_layer_before_gather(monkeypatch, events, include_skipped):
+    _set_rank(monkeypatch, 0)
+    model = _model((3, 2))
+    model.model.layers.append(_model((3, 2)).model.layers[0])
+    stream = deepspeed_integration.build_iter_full_hf_weights(model)(include_skipped=include_skipped)
+    previous = weakref.ref(next(stream)[1])
+    gather = torch.distributed.gather if not include_skipped else torch.distributed.all_gather
+
+    def checked_gather(*args, **kwargs):
+        assert previous() is None
+        return gather(*args, **kwargs)
+
+    monkeypatch.setattr(torch.distributed, "gather" if not include_skipped else "all_gather", checked_gather)
+    assert len(list(stream)) == 1
 
 
 def test_hf_export_non_master_waits_after_every_row_slice(monkeypatch, events):
     _set_rank(monkeypatch, 1)
     monkeypatch.setattr(deepspeed_integration, "_EXPORT_GATHER_BYTES", 16)
 
-    assert list(deepspeed_integration.build_iter_full_hf_weights(_model((3, 2)))()) == []
+    assert list(deepspeed_integration.build_iter_full_hf_weights(_model((3, 2)))(include_skipped=True)) == []
 
     assert events == [("all_gather", (8,)), ("wait", (8,))] * 3
 
 
-@pytest.mark.parametrize("gather_bytes", (1 << 30, 16))
-def test_hf_export_master_does_not_wait_and_still_receives_every_shard(monkeypatch, events, gather_bytes):
+@pytest.mark.parametrize("include_skipped,gather_bytes", [(True, 1 << 30), (True, 16), (False, 16)])
+def test_hf_export_master_does_not_wait_and_still_receives_every_shard(
+    monkeypatch, events, include_skipped, gather_bytes
+):
     _set_rank(monkeypatch, 0)
     monkeypatch.setattr(deepspeed_integration, "_EXPORT_GATHER_BYTES", gather_bytes)
     model = _model((3, 2))
 
-    exported = dict(deepspeed_integration.build_iter_full_hf_weights(model)())
+    exported = dict(deepspeed_integration.build_iter_full_hf_weights(model)(include_skipped=include_skipped))
 
-    assert all(kind == "all_gather" for kind, _ in events)
+    if include_skipped:
+        assert all(kind == "all_gather" for kind, _ in events)
+    else:  # a weight sync gathers each tensor once, whatever the export budget
+        assert events == [("gather", (24,))]
     expected = model.model.layers[0].mlp.experts.w0.detach()
     torch.testing.assert_close(exported["model.layers.0.mlp.experts.w0"], torch.cat([expected, expected]))
 
