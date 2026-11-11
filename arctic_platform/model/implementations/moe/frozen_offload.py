@@ -28,7 +28,7 @@ their objects with empty data, and during a call each is replaced by a temporary
 The temporaries are tagged ``_ap_transient``: the expert GEMMs then save them with ``save_for_backward``
 (``fp8.stash_frozen``), so the checkpointed forward drops them after the layer and only the recompute's copy lives
 until that layer's backward. Only the code stacks ``w1`` / ``w2`` / ``w3`` move; their scales stay on the GPU (block
-FP8's FP32 scales are a 4,096th of the codes' bytes; W4A8 rewrites INT4 group scales in place on first use).
+FP8's FP32 scales are a 4,096th of the codes' bytes).
 
 The offload is a holding of the model's frozen weights (``moe/frozen_held.py``): the weight export copies a layer's
 codes into its buffer and points the parameters at them for that layer's export unit, so a weights-only checkpoint
@@ -43,7 +43,6 @@ layers keep their codes on the GPU and are not managed.
 from __future__ import annotations
 
 import contextlib
-import os
 import weakref
 from collections.abc import Iterator
 from collections.abc import Sequence
@@ -51,12 +50,11 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 
-OFFLOAD_FROZEN_EXPERTS_ENV = "ARL_OFFLOAD_FROZEN_EXPERTS"
 _ALIGN = 256
 _NAMES = ("w1", "w2", "w3")
 
 
-_configured: bool | None = None  # loader option moe.frozen_expert_offload (moe/runtime_options.py); None: the env
+_configured: bool | None = None  # loader option moe.frozen_expert_offload (moe/runtime_options.py); None: off
 
 
 def configure_from_options(value: bool | None) -> None:
@@ -65,9 +63,7 @@ def configure_from_options(value: bool | None) -> None:
 
 
 def frozen_expert_offload_requested() -> bool:
-    if _configured is not None:
-        return _configured
-    return os.environ.get(OFFLOAD_FROZEN_EXPERTS_ENV, "0") not in ("", "0", "false", "False")
+    return bool(_configured)
 
 
 def _align(n: int) -> int:
