@@ -376,6 +376,9 @@ PRIME_RL_BLOCK_OTHER: dict[str, str] = {
         "no key: this entry stays the only documented spelling, which the expert-parallel loaders read; an "
         "external-checkpoint import always loads with false"
     ),
+    "attention_query_chunk_size": (
+        "no key: this entry stays the only documented spelling, which the expert-parallel loaders read"
+    ),
     "weight_conversion_cache_dir": (
         "set by the server: an external-checkpoint import always uses its per-job directory; for other "
         "expert-parallel training a value sent here is used, and a future server may ignore or reject it; on the "
