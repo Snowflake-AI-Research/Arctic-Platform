@@ -198,3 +198,100 @@ def test_sonic_routed_experts_carry_peft_expert_lora():
     assert rel(sonic_out, grouped_out) < 1e-2
     for got, want in zip(sonic_grads, grouped_grads):
         assert rel(got, want) < 2e-2
+
+
+def _relu2_reference(x, idx, scores, w1, w2):
+    """FP32 sum over each token's local experts of score * down(relu(up(x))^2) (Nemotron-H's non-gated experts)."""
+    out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+    xf = x.float()
+    for k in range(idx.shape[1]):
+        for e in idx[:, k].unique().tolist():
+            if e < 0:
+                continue
+            rows = idx[:, k] == e
+            h = torch.relu(xf[rows] @ w1[e].float().T).square()
+            out[rows] += scores[rows, k, None].float() * (h @ w2[e].float().T)
+    return out
+
+
+@pytest.mark.parametrize("trained", [False, True])
+def test_sonic_relu2_experts_match_fp32_reference(trained):
+    _require_sonicmoe()
+    from arctic_platform.model.implementations.kernels.sonic_experts import sonic_relu2_experts_applicable
+    from arctic_platform.model.implementations.moe.layers.moe import NonGatedGroupedExperts
+
+    torch.manual_seed(0)
+    tokens, topk, experts, hidden, inter = 3000, 6, 8, 512, 384
+    module = NonGatedGroupedExperts(hidden, inter, experts, use_grouped_mm=True).cuda().bfloat16()
+    with torch.no_grad():
+        for w in (module.w1, module.w2):
+            w.normal_(std=0.05)
+            w.requires_grad_(trained)
+    assert sonic_relu2_experts_applicable(module)
+    idx = torch.randint(0, experts, (tokens, topk), device="cuda")
+    idx = torch.where(torch.rand(tokens, topk, device="cuda") < 0.3, -1, idx)
+    idx[0] = -1  # a token with no local expert
+    scores = torch.rand(tokens, topk, device="cuda").requires_grad_(True)
+    x = torch.randn(tokens, hidden, device="cuda").bfloat16().requires_grad_(True)
+    dy = torch.randn(tokens, hidden, device="cuda").bfloat16()
+
+    out = module(x, None, scores, expert_indices=idx)
+    wrt = (x, scores) + ((module.w1, module.w2) if trained else ())
+    got = torch.autograd.grad(out, wrt, dy)
+
+    ref_w = [w.detach().float().requires_grad_(trained) for w in (module.w1, module.w2)]
+    xr = x.detach().float().requires_grad_(True)
+    sr = scores.detach().clone().requires_grad_(True)
+    ref = _relu2_reference(xr, idx, sr, *ref_w)
+    want = torch.autograd.grad(ref, (xr, sr) + (tuple(ref_w) if trained else ()), dy.float())
+
+    def rel(a, b):
+        return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+    assert rel(out, ref) < 1e-2
+    assert torch.all(out[0] == 0)
+    assert rel(got[0], want[0]) < 1e-2
+    assert rel(got[1][idx >= 0], want[1][idx >= 0]) < 1e-2
+    for g, w in zip(got[2:], want[2:]):
+        assert rel(g, w) < 2e-2
+
+
+def test_sonic_relu2_experts_match_the_grouped_path():
+    """The SonicMoE path against the grouped-GEMM path it replaces (bf16 both), forward and gradients."""
+    _require_sonicmoe()
+    from arctic_platform.model.implementations.moe.layers.moe import NonGatedGroupedExperts
+
+    torch.manual_seed(0)
+    tokens, topk, experts, hidden, inter = 2000, 6, 8, 512, 384
+    module = NonGatedGroupedExperts(hidden, inter, experts, use_grouped_mm=True)
+    module.set_ep_comm_backend("deepep")
+    module = module.cuda().bfloat16()
+    with torch.no_grad():
+        for w in (module.w1, module.w2):
+            w.normal_(std=0.05)
+    idx = torch.randint(0, experts, (tokens, topk), device="cuda")
+    idx = torch.where(torch.rand(tokens, topk, device="cuda") < 0.3, -1, idx)
+    scores = torch.rand(tokens, topk, device="cuda").requires_grad_(True)
+    x = torch.randn(tokens, hidden, device="cuda").bfloat16().requires_grad_(True)
+    dy = torch.randn(tokens, hidden, device="cuda").bfloat16()
+    wrt = (x, scores, module.w1, module.w2)
+
+    sonic_out = module(x, None, scores, expert_indices=idx)
+    sonic_grads = torch.autograd.grad(sonic_out, wrt, dy)
+
+    mask = idx >= 0
+    token_ids = torch.arange(tokens, device="cuda").unsqueeze(1).expand(tokens, topk)[mask]
+    expert_ids, pair_scores = idx[mask], scores[mask]
+    order = torch.argsort(expert_ids, stable=True)
+    counts = torch.bincount(expert_ids, minlength=experts)
+    rows = module(x[token_ids[order]], counts)
+    grouped = torch.zeros(tokens, hidden, device="cuda", dtype=torch.float32)
+    grouped = grouped.index_add(0, token_ids[order], rows.float() * pair_scores[order, None]).bfloat16()
+    grouped_grads = torch.autograd.grad(grouped, wrt, dy)
+
+    def rel(a, b):
+        return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+    assert rel(sonic_out, grouped) < 1e-2
+    for got, want in zip(sonic_grads, grouped_grads):
+        assert rel(got, want) < 2e-2
