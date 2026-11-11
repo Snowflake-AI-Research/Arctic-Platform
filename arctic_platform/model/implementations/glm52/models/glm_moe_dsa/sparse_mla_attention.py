@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from arctic_platform.model.implementations.glm52.models.fp8 import compute_weight, make_linear
@@ -14,6 +15,7 @@ from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flash
 )
 from arctic_platform.model.implementations.glm52.models.layers.norms import LayerNorm, RMSNorm, RMSNormConfig
 from arctic_platform.model.implementations.glm52.models.layers.rotary_emb import apply_rotary_pos_emb_interleave
+from arctic_platform.model.implementations.glm52.utils.cp import gather_for_cp
 
 try:
     from arctic_platform.model.implementations.glm52.models.kernels.fp8_indexer import fp8_indexer
@@ -39,6 +41,10 @@ def _resolve_sparse_mla_backend() -> str:
         return "flashmla"
     if backend == "ref":
         return "ref"
+    if backend == "flashmla_tilelang":
+        if not flash_mla_available() or sparse_mla_bwd is None:
+            raise ImportError("sparse_mla_backend='flashmla_tilelang' needs flash_mla and the TileLang MLA kernels")
+        return backend
     if backend in ("tilelang", "dense"):
         if sparse_mla_fwd_interface is None or sparse_mla_bwd is None:
             raise ImportError("TileLang MLA kernels are not available")
@@ -138,8 +144,49 @@ def sparse_mla_apply(q, kv, indices, sm_scale):
         return sparse_mla_flashmla_apply(q, kv, indices, sm_scale)
     if backend == "ref":
         return sparse_mla_ref_apply(q, kv, indices, sm_scale)
-    # tilelang and dense both use fused TileLang fwd+bwd kernels
-    return _SparseMLATilelang.apply(q, kv, indices, sm_scale)
+    # tilelang and dense both use fused TileLang fwd+bwd kernels; flashmla_tilelang swaps in FlashMLA's forward
+    return _SparseMLATilelang.apply(q, kv, indices, sm_scale, backend == "flashmla_tilelang")
+
+
+def _exchange(tensors: list[torch.Tensor], peer: int, group: dist.ProcessGroup) -> list[torch.Tensor]:
+    """Swap same-shaped tensors with CP rank ``peer`` (point to point)."""
+    received = [torch.empty_like(t) for t in tensors]
+    global_peer = dist.get_global_rank(group, peer)
+    ops = [dist.P2POp(dist.isend, t.contiguous(), global_peer, group) for t in tensors]
+    ops += [dist.P2POp(dist.irecv, r, global_peer, group) for r in received]
+    for work in dist.batch_isend_irecv(ops):
+        work.wait()
+    return received
+
+
+def _cp_balanced_indexer(q_idx, k_idx, w, ks, ke, index_topk, weight_scale, group, rank, world):
+    """The indexer's top-k for this CP rank's queries, with the causal work split evenly across ranks.
+
+    A query scores every key before it, so with contiguous CP shards the last rank's indexer costs ~15x the first's
+    at 256K (2.76 s against 0.20 s of logits per step on GLM-5.3) and every rank waits for it at the next
+    collective. Ranks ``r`` and ``world - 1 - r`` swap the second halves of their queries, compute top-k for their
+    own first half and the partner's second half, and swap the results back: each pair then holds the same work,
+    ``(r + 0.25) + (world - 1 - r + 0.75)`` shards' worth, on every rank. The indices are the same as unbalanced.
+    """
+    tokens = q_idx.shape[0]
+    local = slice(rank * tokens, (rank + 1) * tokens)
+    partner = world - 1 - rank
+    half = tokens // 2
+    if partner == rank or half == 0:
+        return fp8_indexer(q_idx, k_idx, w, ks[local], ke[local], index_topk, weight_scale)
+    theirs = slice(partner * tokens + half, (partner + 1) * tokens)
+    their_q, their_w = _exchange([q_idx[half:], w[half:]], partner, group)
+    indices = fp8_indexer(
+        torch.cat([q_idx[:half], their_q]),
+        k_idx,
+        torch.cat([w[:half], their_w]),
+        torch.cat([ks[local][:half], ks[theirs]]),
+        torch.cat([ke[local][:half], ke[theirs]]),
+        index_topk,
+        weight_scale,
+    )
+    (mine,) = _exchange([indices[half:]], partner, group)
+    return torch.cat([indices[:half], mine])
 
 
 class Indexer(nn.Module):
@@ -169,7 +216,13 @@ class Indexer(nn.Module):
         ke: torch.Tensor,
         index_topk: int,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        cp: tuple[dist.ProcessGroup, int, int] | None = None,
     ) -> torch.Tensor:
+        """Top-k key indices for this rank's queries.
+
+        Under ``cp`` the keys are every rank's, gathered, and ``ks``/``ke`` describe the whole
+        sequence; ``hidden_states``, ``q_latent`` and ``position_embeddings`` are this rank's.
+        """
         total_tokens = hidden_states.shape[1]
         assert index_topk % 64 == 0, f"index_topk must be divisible by 64 (block_I), got {index_topk}"
 
@@ -191,10 +244,14 @@ class Indexer(nn.Module):
 
         q_idx = torch.cat([q_pe, q_nope], dim=-1)
         k_idx = torch.cat([k_pe, k_nope], dim=-1)
-
         if fp8_indexer is None:
             raise ImportError("triton is required for the GLM-5.2 FP8 indexer")
-        indices = fp8_indexer(q_idx, k_idx, w, ks, ke, index_topk, self.weight_scale)
+        if cp is not None:
+            group, rank, world = cp
+            k_idx = gather_for_cp(k_idx.unsqueeze(0), group).squeeze(0)
+            indices = _cp_balanced_indexer(q_idx, k_idx, w, ks, ke, index_topk, self.weight_scale, group, rank, world)
+        else:
+            indices = fp8_indexer(q_idx, k_idx, w, ks, ke, index_topk, self.weight_scale)
         return indices.view(1, total_tokens, 1, index_topk)
 
 
@@ -255,7 +312,9 @@ class GlmMoeDsaAttention(nn.Module):
         k_compressed_normed: torch.Tensor,
         k_rope: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        cp_group: dist.ProcessGroup | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Absorbed queries and sparse KV; under ``cp_group`` the KV is every rank's keys, in order."""
         batch_size, total_tokens, _ = q_latent.shape
         q_full = self.q_b_proj(q_latent).view(batch_size, total_tokens, self.num_heads, self.qk_head_dim)
         q_nope, q_rope = q_full.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -276,6 +335,9 @@ class GlmMoeDsaAttention(nn.Module):
 
         sparse_q = torch.cat([q_absorbed, q_rope], dim=-1)
         sparse_kv = torch.cat([k_compressed_normed, k_rope], dim=-1).unsqueeze(2)
+        if cp_group is not None:
+            # Keys were roped at their own positions above, so gathering them gives the global keys.
+            sparse_kv = gather_for_cp(sparse_kv, cp_group)
 
         sentinel = torch.zeros(batch_size, 1, 1, sparse_kv.shape[-1], dtype=sparse_kv.dtype, device=sparse_kv.device)
         sparse_kv = torch.cat([sparse_kv, sentinel], dim=1)
@@ -297,18 +359,33 @@ class GlmMoeDsaAttention(nn.Module):
         ks: torch.Tensor | None = None,
         ke: torch.Tensor | None = None,
         cached_indices: torch.Tensor | None = None,
+        cp: tuple[dist.ProcessGroup, int, int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Sparse MLA for ``hidden_states``; with ``cp`` they are this rank's contiguous query shard.
+
+        ``position_embeddings``, ``ks`` and ``ke`` always describe the whole
+        sequence. Under context parallelism only the 576-wide compressed KV and
+        the 128-wide indexer keys are gathered; queries stay local, apart from the
+        indexer queries ranks trade to balance top-k selection.
+        """
+        cp_group = None
+        if cp is not None:
+            cp_group, cp_rank, _ = cp
+            local = slice(cp_rank * hidden_states.shape[1], (cp_rank + 1) * hidden_states.shape[1])
+            position_embeddings = tuple(t[:, local] for t in position_embeddings)
         q_latent, k_compressed_normed, k_rope = self.attn_projections(hidden_states)
 
         indices = cached_indices
         if sparse_mla_backend() == "dense":
+            if cp is not None:
+                raise NotImplementedError("dense sparse MLA indices assume local positions; use tilelang or flashmla")
             batch_size, seq_len = hidden_states.shape[:2]
             indices = make_dense_causal_indices(
                 batch_size, seq_len, self.args.index_topk, hidden_states.device
             )
         elif not self.skip_topk:
             indices = self.indexer.compute_sparse_indices(
-                hidden_states, q_latent, ks, ke, self.args.index_topk, position_embeddings
+                hidden_states, q_latent, ks, ke, self.args.index_topk, position_embeddings, cp=cp
             )
         elif indices is None:
             raise ValueError(
@@ -321,6 +398,7 @@ class GlmMoeDsaAttention(nn.Module):
             k_compressed_normed,
             k_rope,
             position_embeddings=position_embeddings,
+            cp_group=cp_group,
         )
 
         out = sparse_mla_apply(sparse_q, sparse_kv, indices, self.scaling)

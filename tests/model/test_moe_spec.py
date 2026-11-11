@@ -263,10 +263,11 @@ def test_fused_cross_entropy_with_chunked_lm_head_is_rejected(tmp_path):
         )
 
 
-def test_glm_spec_rejects_sequence_parallelism(tmp_path):
+def test_glm_spec_accepts_sequence_parallelism(tmp_path):
+    """glm_moe_dsa runs context parallelism over the sequence-parallel group."""
     checkpoint = _write_config(tmp_path / "glm", {"model_type": "glm_moe_dsa"})
-    with pytest.raises(ValueError, match="glm_moe_dsa does not support sequence parallelism"):
-        moe_model_spec(model_name=checkpoint, ep_size=8, sp_size=2)
+    spec = moe_model_spec(model_name=checkpoint, ep_size=8, sp_size=2)
+    assert spec.parallelism.sequence_parallel == 2
 
 
 @pytest.mark.parametrize("nested", [False, True])

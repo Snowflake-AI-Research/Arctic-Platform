@@ -98,7 +98,7 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
-- `shard_dense` (no): the huggingface loader's option (patches.dense_shard)
+- `shard_dense` (no): the huggingface loader's option; the MoE loaders shard their replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `deepseek_v41`
@@ -115,7 +115,7 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
-- `shard_dense` (no): the huggingface loader's option (patches.dense_shard)
+- `shard_dense` (no): the huggingface loader's option; the MoE loaders shard their replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `dflash2`
@@ -168,7 +168,7 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
-- `shard_dense` (no): the huggingface loader's option (patches.dense_shard)
+- `shard_dense` (no): the huggingface loader's option; the MoE loaders shard their replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `glm5_next`
@@ -182,7 +182,7 @@ Extends `generic_moe`.
 - `lm_head.vocab_chunk_size` (no): no equivalent option
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
-- `shard_dense` (no): the huggingface loader's option (patches.dense_shard)
+- `shard_dense` (no): the huggingface loader's option; the MoE loaders shard their replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `glm_moe_dsa`
@@ -196,7 +196,7 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
-- `shard_dense` (no): the huggingface loader's option (patches.dense_shard)
+- `shard_dense` (no): the huggingface loader's option; this loader shards its replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `huggingface`
@@ -241,7 +241,7 @@ Extends `generic_moe`.
 - `numerics.fp32_parity` (no): no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
-- `shard_dense` (no): the huggingface loader's option (patches.dense_shard)
+- `shard_dense` (no): the huggingface loader's option; the MoE loaders shard their replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `qwen3_5_moe`
@@ -255,7 +255,7 @@ Extends `generic_moe`.
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
-- `shard_dense` (no): the huggingface loader's option (patches.dense_shard)
+- `shard_dense` (no): the huggingface loader's option; the MoE loaders shard their replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `qwen4_exp`
@@ -270,5 +270,5 @@ Extends `generic_moe`.
 - `lm_head.vocab_chunk_size` (no): no equivalent option
 - `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
 - `peft` (no): the loader rejects `patches.peft`: expert adapter integration is not yet supported
-- `shard_dense` (no): the huggingface loader's option (patches.dense_shard)
+- `shard_dense` (no): the huggingface loader's option; the MoE loaders shard their replicated weights with moe.shard_dense
 - `zorro_train` (no): the loader rejects `patches.zorro_train`

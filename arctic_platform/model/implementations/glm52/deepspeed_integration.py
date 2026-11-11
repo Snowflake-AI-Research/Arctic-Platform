@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
@@ -39,16 +40,19 @@ def shared_expert_bc_mlp_forward(
     return torch.matmul(F.silu(gate) * up, feed_forward.w2.T)
 
 
-def _validate_sp_size(sp_size: int) -> None:
-    if sp_size > 1:
-        raise NotImplementedError(
-            "Sequence parallelism is not implemented for GLM-5.2. "
-            f"Got sp_size={sp_size}; set training_config.sp_size=1 or omit it."
-        )
+def _apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None:
+    """Context parallelism: each rank of ``sp_group`` holds a contiguous shard of one packed sequence.
 
+    Decoder layers keep their queries local and gather only the compressed
+    keys (see ``GlmMoeDsaAttention.forward``); the MoE runs on local tokens.
+    """
+    if sp_size == 1:
+        return
+    from arctic_platform.model.implementations.moe.vlm import get_language_model
 
-def _apply_sequence_parallelism(_model: nn.Module, sp_size: int, _sp_group) -> None:
-    _validate_sp_size(sp_size)
+    rank = dist.get_rank(group=sp_group)
+    for layer in get_language_model(model).layers:
+        layer.set_context_parallel_attributes(sp_group, rank, sp_size)
 
 
 def _build_model_config(
@@ -130,7 +134,6 @@ def load_moe_model_for_deepspeed(
     sp_size: int = 1,
     sp_group=None,
 ) -> nn.Module:
-    _validate_sp_size(sp_size)
     return _load_moe_model_for_deepspeed(
         _adapter(),
         model_config,
@@ -155,7 +158,6 @@ def load_glm_moe_dsa_model(
     ep_group=None,
     options: GlmMoeDsaOptions,
 ) -> nn.Module:
-    _validate_sp_size(sp_size)
     return _load_moe_model(
         _adapter(),
         load_moe_model_for_deepspeed,

@@ -8,7 +8,7 @@ from typing import Literal
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.implementations.moe.config import DISPATCH_EP_BACKENDS, EPCommBackend
 
-SparseMlaBackend = Literal["flashmla", "ref", "tilelang", "dense"]
+SparseMlaBackend = Literal["auto", "flashmla", "flashmla_tilelang", "ref", "tilelang", "dense"]
 
 
 @dataclass
@@ -41,7 +41,7 @@ class ModelConfig:
     dp_replicate: int = 1
     ep: int = 1
     ep_comm_backend: EPCommBackend = "deepep"
-    sparse_mla_backend: SparseMlaBackend = "ref"
+    sparse_mla_backend: SparseMlaBackend = "auto"
     deepep_num_sms: int = 20
     deepep_token_chunk_size: int | None = None
     cp: int = 1

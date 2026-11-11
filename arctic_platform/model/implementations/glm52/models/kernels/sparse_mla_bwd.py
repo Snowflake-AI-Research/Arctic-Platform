@@ -316,28 +316,32 @@ def bwd(
                             if bi_i < BS // split_store:
                                 acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[bi_i + s * (BS // split_store), d_i]
 
+                    # Masked slots (a query with fewer than topk causal keys) all point at the sentinel row and
+                    # carry zeros; their atomics would serialize on that one row, so they are skipped.
                     for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
-                        T.atomic_addx4(
-                            dKV[
-                                by,
-                                idx_shared[i_i * BS + bi_i + s * (BS // split_store)],
-                                bz // NH,
-                                d_i * 4,
-                            ],
-                            acc_dkv_shared[bi_i, d_i * 4],
-                        )
-
-                    if has_tail:
-                        for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
+                        if idx_shared[i_i * BS + bi_i + s * (BS // split_store)] < sentinel:
                             T.atomic_addx4(
                                 dKV[
                                     by,
                                     idx_shared[i_i * BS + bi_i + s * (BS // split_store)],
                                     bz // NH,
-                                    D + d_i * 4,
+                                    d_i * 4,
                                 ],
-                                acc_dkv_tail_shared[bi_i, d_i * 4],
+                                acc_dkv_shared[bi_i, d_i * 4],
                             )
+
+                    if has_tail:
+                        for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
+                            if idx_shared[i_i * BS + bi_i + s * (BS // split_store)] < sentinel:
+                                T.atomic_addx4(
+                                    dKV[
+                                        by,
+                                        idx_shared[i_i * BS + bi_i + s * (BS // split_store)],
+                                        bz // NH,
+                                        D + d_i * 4,
+                                    ],
+                                    acc_dkv_tail_shared[bi_i, d_i * 4],
+                                )
 
             T.copy(acc_dq, dQ_shared)
             T.copy(dQ_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
