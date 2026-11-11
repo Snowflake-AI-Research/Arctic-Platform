@@ -763,6 +763,75 @@ def _grouped_decoded_input_grad(ctx, grad_output: Tensor) -> Tensor:
     return dx.type_as(grad_output)
 
 
+class _GroupedW8A8MmFn(torch.autograd.Function):
+    """``_GroupedDecodedFp8MmFn`` with the forward as W8A8 through DeepGEMM (``kernels/fp8_grouped_w8a8.py``).
+
+    The routed rows of ``x`` are quantized once per call into the padded layout, for every stack. The backward is
+    the decoded path's, ``dY_e @ dequant(W_e)``: straight through the activation quantization. ``deltas`` (one per
+    stack, or None) are added to the stacks' outputs in the gather back, and get the output gradient.
+    """
+
+    @staticmethod
+    def forward(ctx, x: Tensor, weight, scale, offsets: Tensor, rows: int, block_size: int, layout, *deltas):
+        from arctic_platform.model.implementations.kernels.fp8_grouped_w8a8 import grouped_gemm_padded
+        from arctic_platform.model.implementations.kernels.fp8_grouped_w8a8 import quantize_into_padded
+        from arctic_platform.model.implementations.kernels.fp8_grouped_w8a8 import unpad_rows_into
+
+        ctx.rows = rows
+        ctx.block_size = block_size
+        ctx.save_for_backward(offsets, *stash_frozen(ctx, weight, scale))
+        stacks = weight if isinstance(weight, tuple) else (weight,)
+        scales = scale if isinstance(scale, tuple) else (scale,)
+        ctx.columns = []
+        out = torch.empty(x.shape[0], sum(w.shape[-2] for w in stacks), dtype=torch.bfloat16, device=x.device)
+        q, q_scale = quantize_into_padded(x[:rows], layout)
+        col = 0
+        for w, sc, delta in zip(stacks, scales, deltas):
+            width = w.shape[-2]
+            y = grouped_gemm_padded(q, q_scale, w, sc, layout)
+            unpad_rows_into(out[:, col : col + width], y, layout, delta)
+            del y
+            ctx.columns.append((col, col + width))
+            col += width
+        if rows < out.shape[0]:
+            out[rows:].zero_()
+        return out.type_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        dx = _grouped_decoded_input_grad(ctx, grad_output)
+        rows = ctx.rows
+        deltas = [
+            grad_output[:rows, start:end] if ctx.needs_input_grad[7 + i] else None
+            for i, (start, end) in enumerate(ctx.columns)
+        ]
+        return dx, None, None, None, None, None, None, *deltas
+
+
+def grouped_fp8_w8a8_mm(
+    x: Tensor,
+    weight: Tensor | tuple[Tensor, ...],
+    scale: Tensor | tuple[Tensor, ...],
+    offsets: Tensor,
+    rows: int,
+    block_size: int,
+    layout,
+    deltas: tuple[Tensor | None, ...] | None = None,
+) -> Tensor:
+    """``grouped_fp8_decoded_mm`` with the forward GEMMs in block-FP8 W8A8 (DeepGEMM) on ``layout``
+    (``kernels.fp8_grouped_w8a8.padded_layout`` of the same offsets), plus ``deltas[i]`` (``[rows, out_i]``, or None)
+    on stack ``i``'s output columns."""
+    stacks = weight if isinstance(weight, tuple) else (weight,)
+    if offsets.numel() != stacks[0].shape[0]:
+        raise ValueError(f"{offsets.numel()} expert offsets for {stacks[0].shape[0]} FP8 experts")
+    if block_size != _FP8_BLOCK:
+        raise ValueError(f"W8A8 experts need {_FP8_BLOCK} x {_FP8_BLOCK} weight blocks, got {block_size}")
+    deltas = deltas or (None,) * len(stacks)
+    if len(deltas) != len(stacks):
+        raise ValueError(f"{len(deltas)} LoRA deltas for {len(stacks)} expert stacks")
+    return _GroupedW8A8MmFn.apply(x, weight, scale, offsets, rows, block_size, layout, *deltas)
+
+
 class _GroupedW4A8MmFn(torch.autograd.Function):
     """Grouped ``x_e @ W_e.T`` for INT4 experts: W4A8 (FP8 activations) forward, decoded BF16 input gradient.
 

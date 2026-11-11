@@ -31,6 +31,7 @@ from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 # field -> (module, reader, environment variable, value when set, value when off)
 SWITCHES = {
     "w4a8_experts": ("kernels.w4a8", "w4a8_experts_requested", "ARL_W4A8_EXPERTS", True, False),
+    "w8a8_experts": ("kernels.fp8_grouped_w8a8", "w8a8_experts_requested", "ARL_W8A8_EXPERTS", True, False),
 }
 
 
@@ -80,3 +81,16 @@ def test_unset_options_leave_the_environment_in_charge(monkeypatch):
 def test_unknown_runtime_fields_are_refused():
     with pytest.raises(ValidationError):
         GlmMoeDsaOptions.model_validate({"frozen_expert_ofload": True})
+
+
+def test_w8a8_experts_reach_the_experts_built_after_the_load():
+    """GroupedExperts read the switch when they are built, which the loader does after applying the options."""
+    from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
+
+    apply_moe_runtime_options(GlmMoeDsaOptions(w8a8_experts=True))
+    assert GroupedExperts(256, 128, 2, use_grouped_mm=True, fp8_block_size=128).w8a8
+    # A checkpoint without block-FP8 experts (BF16, or packed 4-bit) is refused rather than run W8A16.
+    with pytest.raises(ValueError, match="w8a8_experts runs block-FP8 routed experts"):
+        GroupedExperts(256, 128, 2, use_grouped_mm=True)
+    with pytest.raises(ValueError, match="w8a8_experts runs block-FP8 routed experts"):
+        GroupedExperts(256, 128, 2, use_grouped_mm=True, fp8_block_size=128, packed4="int4")
