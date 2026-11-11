@@ -37,7 +37,6 @@ back into the rank's shard.
 from __future__ import annotations
 
 import contextlib
-import os
 from collections.abc import Iterator
 from collections.abc import Sequence
 
@@ -45,7 +44,6 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-SHARD_FROZEN_DENSE_ENV = "ARL_SHARD_FROZEN_DENSE"
 # Byte alignment of every tensor inside the gathered buffer (TMA and vectorized loads need 16 B).
 _ALIGN = 256
 
@@ -262,7 +260,7 @@ def install_frozen_layer_shards(
     return shards
 
 
-_configured: bool | None = None  # loader option moe.shard_frozen_dense (moe/runtime_options.py); None: the env
+_configured: bool | None = None  # loader option moe.shard_frozen_dense (moe/runtime_options.py); None: off
 
 
 def configure_from_options(value: bool | None) -> None:
@@ -271,6 +269,4 @@ def configure_from_options(value: bool | None) -> None:
 
 
 def frozen_dense_sharding_requested() -> bool:
-    if _configured is not None:
-        return _configured
-    return os.environ.get(SHARD_FROZEN_DENSE_ENV, "0") not in ("", "0", "false", "False")
+    return bool(_configured)

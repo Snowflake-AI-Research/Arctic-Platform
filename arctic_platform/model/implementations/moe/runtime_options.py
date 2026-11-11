@@ -38,6 +38,7 @@ from typing_extensions import Self
 # field -> (module that reads it, relative to arctic_platform.model.implementations; the setter it takes it through)
 _SETTERS = {
     "frozen_expert_offload": ("moe.frozen_offload", "configure_from_options"),
+    "shard_frozen_dense": ("moe.frozen_shard", "configure_from_options"),
     "w8a8_experts": ("kernels.fp8_grouped_w8a8", "configure_from_options"),
     # One spare count for UltraEP's three paths (moe/ultraep_replicas.py picks one from the experts).
     "ultraep_spares": ("moe.ultraep_replicas", "configure_from_options"),
@@ -59,6 +60,13 @@ class MoeRuntimeOptions(BaseModel):
             "Keep the frozen routed experts' weights (codes) in pinned host memory, copied into two GPU buffers per "
             "experts call with the next layer prefetched (moe/frozen_offload.py); layers that are not recomputed keep "
             "theirs on the GPU. Unset: off."
+        ),
+    )
+    shard_frozen_dense: bool | None = Field(
+        None,
+        description=(
+            "Hold each recomputed layer's frozen replicated weights as a 1/world shard per rank, all-gathered for each "
+            "call of the layer (moe/frozen_shard.py). Unset: off."
         ),
     )
     ultraep_spares: int | None = Field(
