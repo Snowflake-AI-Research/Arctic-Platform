@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 from typing import Any
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -341,24 +342,49 @@ def _decode_workspace(shape: tuple[int, ...], device: torch.device) -> Tensor:
     return buffer[:numel].view(shape)
 
 
-def _decode_fp8_to_bf16(
-    weight: Tensor | tuple[Tensor, ...], scale: Tensor | tuple[Tensor, ...], block_size: int
-) -> Tensor:
-    """BF16 copy of a CUDA block-FP8 matrix or expert stack, for one GEMM on the current stream.
+PACKED_4BIT_DTYPES = (torch.int8,)
 
-    Tuples of stacks (e.g. gate and up) are decoded side by side along the output rows into one stack. CUDA
-    decodes land in the shared decode workspace: use the result for one GEMM and do not keep it.
+
+def is_packed_4bit(weight: Tensor) -> bool:
+    """Frozen MXFP4 codes, two per byte along the input dimension (int8 bytes)."""
+    return weight.dtype in PACKED_4BIT_DTYPES
+
+
+def logical_cols(weight: Tensor) -> int:
+    """Input features of a frozen weight: twice the stored columns for packed 4-bit codes."""
+    return weight.shape[-1] * 2 if is_packed_4bit(weight) else weight.shape[-1]
+
+
+def _decode_stack_into(weight: Tensor, scale, block_size: int | None, out: Tensor, out_row: int) -> None:
+    if weight.dtype == torch.float8_e4m3fn:
+        from arctic_platform.model.implementations.kernels.fp8_block_dequant import dequantize_fp8_blocks
+
+        dequantize_fp8_blocks(weight, scale, cast(int, block_size), out=out, out_row=out_row)
+    elif weight.dtype == torch.int8:
+        # MXFP4: FP32 or E8M0 scales per 32 inputs.
+        from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_mxfp4_packed
+
+        dequantize_mxfp4_packed(weight, scale, out=out, out_row=out_row)
+    else:
+        raise TypeError(f"no BF16 decode for frozen {weight.dtype} weights")
+
+
+def _decode_fp8_to_bf16(weight: Tensor | tuple[Tensor, ...], scale, block_size: int | None) -> Tensor:
+    """BF16 copy of a CUDA quantized matrix or expert stack, for one GEMM on the current stream.
+
+    Block FP8 (``block_size`` x ``block_size`` FP32 scales) or MXFP4 (FP32 or E8M0 scales), chosen by the weight's
+    dtype. Tuples of stacks (e.g. gate and up) are decoded side by side along the output
+    rows into one stack. CUDA decodes land in the shared decode workspace: use the result for one GEMM and do not
+    keep it.
     """
-    from arctic_platform.model.implementations.kernels.fp8_block_dequant import dequantize_fp8_blocks
-
     stacks = weight if isinstance(weight, tuple) else (weight,)
     scales = scale if isinstance(scale, tuple) else (scale,)
     first = stacks[0]
     rows = sum(w.shape[-2] for w in stacks)
-    out = _decode_workspace((*first.shape[:-2], rows, first.shape[-1]), first.device)
+    out = _decode_workspace((*first.shape[:-2], rows, logical_cols(first)), first.device)
     row = 0
     for w, sc in zip(stacks, scales):
-        dequantize_fp8_blocks(w, sc, block_size, out=out, out_row=row)
+        _decode_stack_into(w, sc, block_size, out, row)
         row += w.shape[-2]
     return out
 
