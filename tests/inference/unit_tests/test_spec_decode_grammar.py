@@ -7,10 +7,77 @@ import torch
 from arctic_platform.inference.vllm.spec_decode_grammar import (
     attach_spec_token_ids,
     clear_sample_metadata,
+    mask_unvalidated_drafts_v2,
     metadata_for_sample,
     reject_unvalidated_drafts,
     stage_sample_metadata,
 )
+from arctic_platform.testing_utils import require_torch_gpu, torch_assert_equal
+
+
+@dataclass
+class _InputBatchV2:
+    req_ids: list[str]
+    num_draft_tokens_per_req: list[int]
+    cu_num_logits_np: list[int]
+    input_ids: torch.Tensor
+    logits_indices: torch.Tensor
+
+
+def _v2_batch(device, dtype):
+    return _InputBatchV2(
+        ["a", "b", "prefill", "unstructured"],
+        [3, 2, 0, 1],
+        [0, 4, 7, 8, 10],
+        torch.arange(100, 116, dtype=dtype, device=device),
+        torch.tensor([12, 3, 10, 6, 9, 14, 2, 8, 5, 15], device=device),
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_v2_guard_rejects_only_unchecked_rows_without_mutating_drafter(dtype):
+    batch = _v2_batch("cpu", dtype)
+    original = batch.input_ids.clone()
+    # A shortened scheduler list still rejects the runner's remaining draft span.
+    grammar = SimpleNamespace(spec_token_ids={"a": [7, -1], "b": [-1, -1]})
+
+    masked = mask_unvalidated_drafts_v2(grammar, batch)
+
+    assert masked.input_ids.tolist() == [
+        100, 101, -1, 103, 104, 105, -1, 107,
+        108, 109, -1, 111, 112, 113, -1, 115,
+    ]
+    torch_assert_equal(batch.input_ids, original)
+    assert masked.logits_indices is batch.logits_indices
+    assert masked.req_ids is batch.req_ids
+
+
+@pytest.mark.parametrize("scheduled", [{}, {"a": [1, 2, 3], "b": [4, 5]}])
+def test_v2_guard_returns_original_batch_when_no_drafts_need_rejection(scheduled):
+    batch = _v2_batch("cpu", torch.int32)
+    grammar = SimpleNamespace(spec_token_ids=scheduled)
+    assert mask_unvalidated_drafts_v2(grammar, batch) is batch
+
+
+@require_torch_gpu
+def test_v2_guard_preserves_async_index_lifetime_without_stream_synchronization():
+    batch = _v2_batch("cuda", torch.int32)
+    grammar = SimpleNamespace(spec_token_ids={"a": [7, -1], "b": [-1, -1]})
+    expected = torch.tensor(
+        [100, 101, -1, 103, 104, 105, -1, 107,
+         108, 109, -1, 111, 112, 113, -1, 115],
+        dtype=torch.int32, device="cuda",
+    )
+    mask_unvalidated_drafts_v2(grammar, batch)
+    torch.cuda.synchronize()
+    with torch.profiler.profile(activities=[
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ]) as profile:
+        outputs = [mask_unvalidated_drafts_v2(grammar, batch).input_ids for _ in range(100)]
+    for output in outputs:
+        torch_assert_equal(output, expected)
+    assert not any(event.name == "cudaStreamSynchronize" for event in profile.events())
 
 
 @dataclass
