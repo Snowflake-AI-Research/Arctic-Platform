@@ -50,7 +50,7 @@ _ULTRA_EP_IPC_SYMM_ENV = "ULTRA_EP_IPC_SYMM"
 
 
 class MoeRuntimeOptions(BaseModel):
-    """Expert-balance, expert-GEMM and deepep_v2 settings of the MoE runtime. None: the environment variable
+    """Memory, expert-balance, expert-GEMM and deepep_v2 settings of the MoE runtime. None: the environment variable
     decides. UltraEP's spares and the online replicas both fill the spare expert slots, so at most one of them is
     on."""
 
