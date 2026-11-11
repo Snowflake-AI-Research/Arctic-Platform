@@ -171,12 +171,95 @@ def test_frozen_weight_gets_no_gradient_and_hidden_matches():
     torch.testing.assert_close(grad_hidden, trained[1], rtol=0, atol=0)
 
 
-def test_cuda_bf16_calls_take_the_fused_head(monkeypatch):
+@pytest.mark.parametrize("softcap", [None, 30.0], ids=["plain", "softcap"])
+def test_cuda_bf16_calls_take_the_fused_head(monkeypatch, softcap):
     def tiled_not_expected():
         raise AssertionError("the tiled composition ran for a plain CUDA BF16 call")
 
     monkeypatch.setattr(lm_head_mod, "_get_sequence_chunked_logprob_fn", tiled_not_expected)
     hidden, weight, labels, temperature = _inputs(64, 64)
     chunked_lm_head_logprobs(
-        hidden, weight, labels, temperature=temperature, token_chunk_size=16, vocab_chunk_size=8192, fp32_lm_head=False
+        hidden,
+        weight,
+        labels,
+        temperature=temperature,
+        token_chunk_size=16,
+        vocab_chunk_size=8192,
+        fp32_lm_head=False,
+        softcap=softcap,
     )
+
+
+def _softcap_reference(hidden, weight, labels, temperature, grad, softcap):
+    """float64 log-probabilities of ``softcap * tanh(logits / softcap) / temperature`` over the head's BF16 logits."""
+    logits = hidden[0] @ weight.t()
+    logits64 = logits.double().requires_grad_(True)
+    capped = torch.tanh(logits64 / softcap) * softcap
+    safe = torch.where(labels[0] == IGNORE_INDEX, 0, labels[0])
+    scaled = capped / temperature[0].double().unsqueeze(-1)
+    logprobs = torch.log_softmax(scaled, dim=-1).gather(-1, safe.unsqueeze(-1)).squeeze(-1)
+    logprobs.backward(grad.double())
+    return logprobs.detach(), logits64.grad @ weight.double(), logits64.grad.t() @ hidden[0].double()
+
+
+def _run_softcap(hidden, weight, labels, temperature, grad, *, token_chunk_size, softcap):
+    hidden = hidden.clone().requires_grad_(True)
+    weight = weight.clone().requires_grad_(True)
+    logprobs = chunked_lm_head_logprobs(
+        hidden,
+        weight,
+        labels,
+        temperature=temperature,
+        token_chunk_size=token_chunk_size,
+        vocab_chunk_size=8192,
+        fp32_lm_head=False,
+        softcap=softcap,
+    )
+    logprobs.backward(grad.reshape(logprobs.shape))
+    return logprobs.detach()[0], hidden.grad[0], weight.grad
+
+
+@pytest.mark.parametrize("scale", [1.0, 40.0], ids=["moderate", "saturated"])
+def test_fused_head_softcap_matches_float64_and_the_tiled_composition(monkeypatch, scale):
+    # Gemma's final_logit_softcapping = 30; at scale 40 the logits reach the hundreds and tanh saturates.
+    softcap = 30.0
+    tokens = 600
+    hidden, weight, labels, temperature = _inputs(tokens, 256, seed=11, scale=scale)
+    grad = torch.randn(tokens, device="cuda")
+    grad[labels[0] == IGNORE_INDEX] = 0.0
+    if scale > 1:
+        assert (hidden[0] @ weight.t()).abs().max().item() > 3 * softcap
+
+    fused = _run_softcap(hidden, weight, labels, temperature, grad, token_chunk_size=256, softcap=softcap)
+    ref_logprobs, ref_grad_hidden, ref_grad_weight = _softcap_reference(
+        hidden, weight, labels, temperature, grad, softcap
+    )
+    valid = labels[0] != IGNORE_INDEX
+    torch.testing.assert_close(fused[0][valid].double(), ref_logprobs[valid], rtol=1e-5, atol=1e-5)
+    _assert_bf16_close(fused[1], ref_grad_hidden, "grad_hidden")
+    _assert_bf16_close(fused[2], ref_grad_weight, "grad_weight")
+
+    monkeypatch.setattr(lm_head_mod, "_fused_head_applies", lambda *args, **kwargs: False)
+    tiled = _run_softcap(hidden, weight, labels, temperature, grad, token_chunk_size=256, softcap=softcap)
+    torch.testing.assert_close(fused[0][valid], tiled[0][valid], rtol=1e-3, atol=1e-3)
+    for name, a, b in (("grad_hidden", fused[1], tiled[1]), ("grad_weight", fused[2], tiled[2])):
+        _assert_bf16_close(a, b.double(), name)
+
+
+def test_fused_head_softcap_on_gemmas_vocabulary(monkeypatch):
+    # Gemma's 262,144-entry vocabulary (32 blocks of the kernel's 8192), with a token chunk that keeps the
+    # whole-vocabulary logits buffer small.
+    vocab, softcap, tokens = 262144, 30.0, 300
+    torch.manual_seed(13)
+    hidden = (torch.randn(1, tokens, 128, device="cuda") * 8).bfloat16()
+    weight = (torch.randn(vocab, 128, device="cuda") / 128**0.5).bfloat16()
+    labels = torch.randint(0, vocab, (1, tokens), device="cuda")
+    temperature = torch.ones(1, tokens, device="cuda")
+    grad = torch.randn(tokens, device="cuda")
+    fused = _run_softcap(hidden, weight, labels, temperature, grad, token_chunk_size=128, softcap=softcap)
+    ref_logprobs, ref_grad_hidden, ref_grad_weight = _softcap_reference(
+        hidden, weight, labels, temperature, grad, softcap
+    )
+    torch.testing.assert_close(fused[0].double(), ref_logprobs, rtol=1e-5, atol=1e-5)
+    _assert_bf16_close(fused[1], ref_grad_hidden, "grad_hidden")
+    _assert_bf16_close(fused[2], ref_grad_weight, "grad_weight")

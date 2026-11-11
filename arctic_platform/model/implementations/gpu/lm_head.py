@@ -439,7 +439,7 @@ def _get_fused_chunked_logprob_fn():
         """
 
         @staticmethod
-        def forward(ctx, hidden, weight, labels, inv_temperature, token_chunk_size: int):
+        def forward(ctx, hidden, weight, labels, inv_temperature, token_chunk_size: int, softcap=None):
             n_tokens = hidden.shape[0]
             vocab_size = weight.shape[0]
             labels = labels.to(torch.long).contiguous()
@@ -459,9 +459,11 @@ def _get_fused_chunked_logprob_fn():
                     logprobs[start:end],
                     logz[start:end],
                     others_minus_target[start:end],
+                    softcap,
                 )
             ctx.save_for_backward(hidden, weight, labels, inv_temperature, logz, others_minus_target)
             ctx.token_chunk_size = token_chunk_size
+            ctx.softcap = softcap
             return logprobs
 
         @staticmethod
@@ -487,6 +489,7 @@ def _get_fused_chunked_logprob_fn():
                     grad[start:end],
                     logz[start:end],
                     others_minus_target[start:end],
+                    ctx.softcap,
                 )
                 if need_hidden:
                     torch.mm(tile, weight, out=grad_hidden[start:end])
@@ -498,16 +501,17 @@ def _get_fused_chunked_logprob_fn():
                 None,
                 None,
                 None,
+                None,
             )
 
     return FusedChunkedLogProbFn
 
 
-def _fused_head_applies(hidden, weight, *, bias, fp32_lm_head, action_masks, group_token_ids, softcap) -> bool:
+def _fused_head_applies(hidden, weight, *, bias, fp32_lm_head, action_masks, group_token_ids) -> bool:
     """Whether :func:`_get_fused_chunked_logprob_fn` computes this call.
 
-    It covers the plain per-token head on CUDA in the head's own 16-bit dtype. Action masks, grouped
-    log-probabilities, a bias, Gemma's softcap and the FP32 projection keep the tiled composition.
+    It covers the plain per-token head on CUDA in the head's own 16-bit dtype, with or without Gemma's softcap.
+    Action masks, grouped log-probabilities, a bias and the FP32 projection keep the tiled composition.
     """
     import torch
 
@@ -519,7 +523,6 @@ def _fused_head_applies(hidden, weight, *, bias, fp32_lm_head, action_masks, gro
         and bias is None
         and action_masks is None
         and group_token_ids is None
-        and not softcap
     )
 
 
@@ -656,10 +659,14 @@ def chunked_lm_head_logprobs(
         fp32_lm_head=fp32_lm_head,
         action_masks=lm_head_action_masks,
         group_token_ids=group_token_ids,
-        softcap=softcap,
     ):
         logprobs = _get_fused_chunked_logprob_fn().apply(
-            hidden_flat, weight, labels_flat, inv_temperature, int(token_chunk_size)
+            hidden_flat,
+            weight,
+            labels_flat,
+            inv_temperature,
+            int(token_chunk_size),
+            float(softcap) if softcap else None,
         )
         return logprobs.reshape(batch_size, seq_len)
 
