@@ -221,6 +221,13 @@ class Patches(BaseModel):
     lm_head: LmHeadPatch | None = Field(None, description="LM-head precision and chunking.")
     zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
     peft: dict | None = Field(None, description="PEFT config; wrap after other patches, before the optimizer.")
+    fused_lora_linear: StrictBool = Field(
+        False,
+        description=(
+            "With a LoRA peft config, add each LoRA linear's low-rank update to the base output inside the lora_B"
+            " GEMM (one addmm) instead of PEFT's separate scale and add."
+        ),
+    )
 
     dense_shard: StrictBool | PositiveInt = Field(
         False,
@@ -242,6 +249,8 @@ class Patches(BaseModel):
             raise ValueError("checkpoint_keep_attention requires gradient_checkpointing")
         if isinstance(self.checkpoint_keep_attention, list) and not self.checkpoint_keep_attention:
             raise ValueError("checkpoint_keep_attention lists no op; use false to keep none")
+        if self.fused_lora_linear and self.peft is None:
+            raise ValueError("fused_lora_linear requires a peft config")
         if self.dense_shard and self.peft is not None:
             raise ValueError("dense_shard shards trainable weights for full fine-tuning; it does not support PEFT")
         if self.dense_shard and self.tiled_mlp is not None:
