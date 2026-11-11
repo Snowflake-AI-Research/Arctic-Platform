@@ -172,6 +172,63 @@ def test_peft_sizes_int4_expert_lora_from_the_logical_shape():
     assert isinstance(wrapped, peft.PeftModel)
 
 
+def test_per_tensor_fp8_dense_mlp_becomes_exact_block_fp8():
+    from arctic_platform.model.implementations.fp8 import dequantize_from_fp8_blockwise
+    from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.converting_glm_moe_dsa import (
+        convert_hf_layer_to_tt,
+    )
+
+    weight = (torch.randn(300, 256) * 50).to(torch.float8_e4m3fn)
+    scale = torch.tensor(0.0123)
+    state = {
+        "model.layers.0.mlp.gate_proj.weight": weight,
+        "model.layers.0.mlp.gate_proj.weight_scale": scale,
+        "model.layers.0.mlp.gate_proj.input_scale": torch.tensor(0.5),
+    }
+    convert_hf_layer_to_tt(state, 0)
+    assert set(state) == {"model.layers.0.mlp.gate_proj.weight", "model.layers.0.mlp.gate_proj.weight_scale_inv"}
+    blocks = state["model.layers.0.mlp.gate_proj.weight_scale_inv"]
+    assert blocks.shape == (3, 2)
+    restored = dequantize_from_fp8_blockwise(weight, blocks, dtype=torch.float32)
+    assert torch.equal(restored, weight.float() * scale)
+
+
+def test_nvfp4_expert_scales_stack_per_projection():
+    from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.converting_glm_moe_dsa import (
+        convert_hf_layer_to_tt,
+    )
+
+    experts, dim, hidden = 2, 64, 32
+    state = {
+        "model.layers.3.mlp.gate.weight": torch.randn(experts, dim),
+        "model.layers.3.mlp.gate.e_score_correction_bias": torch.zeros(experts),
+    }
+    for j in range(experts):
+        for proj, (rows, cols) in (
+            ("gate_proj", (hidden, dim)),
+            ("up_proj", (hidden, dim)),
+            ("down_proj", (dim, hidden)),
+        ):
+            stem = f"model.layers.3.mlp.experts.{j}.{proj}"
+            state[f"{stem}.weight"] = torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8)
+            state[f"{stem}.weight_scale"] = torch.rand(rows, cols // 16).to(torch.float8_e4m3fn)
+            state[f"{stem}.weight_scale_2"] = torch.tensor(1e-3 * (j + 1))
+            state[f"{stem}.input_scale"] = torch.tensor(1.0)
+    for proj, (rows, cols) in (("gate_proj", (hidden, dim)), ("up_proj", (hidden, dim)), ("down_proj", (dim, hidden))):
+        state[f"model.layers.3.mlp.shared_experts.{proj}.weight"] = torch.randn(rows, cols).bfloat16()
+    w1_first = state["model.layers.3.mlp.experts.1.gate_proj.weight"].clone()
+    convert_hf_layer_to_tt(state, 3)
+    prefix = "model.layers.3.mlp.experts"
+    assert state[f"{prefix}.w1"].shape == (experts, hidden, dim // 2) and torch.equal(
+        state[f"{prefix}.w1"][1], w1_first
+    )
+    assert state[f"{prefix}.w2"].shape == (experts, dim, hidden // 2)
+    assert state[f"{prefix}.w1_scale_inv"].shape == (experts, hidden, dim // 16)
+    assert state[f"{prefix}.w1_scale_inv"].dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(state[f"{prefix}.w2_scale_2"], torch.tensor([1e-3, 2e-3]))
+    assert not [k for k in state if "input_scale" in k or ".experts.0." in k]
+
+
 @cuda
 def test_w4a8_experts_match_the_decoded_bf16_experts(monkeypatch):
     monkeypatch.setenv("ARL_W4A8_EXPERTS", "1")
