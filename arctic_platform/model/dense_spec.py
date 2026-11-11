@@ -103,6 +103,7 @@ def dense_model_spec(
             tiled_mlp=tiled_mlp,
             lm_head=lm_head,
             peft=training_options.get("peft_config"),
+            dense_shard=training_options.get("shard_dense", False),
             **({"zorro_train": zorro_train} if zorro_train is not None else {}),
         ),
         **({"loader_options": loader_options} if loader_options else {}),
