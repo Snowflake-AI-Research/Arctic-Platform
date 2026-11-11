@@ -38,6 +38,8 @@ Paths in this table are relative to `arctic_platform/correctness/`.
 
 **Consolidation removes replaced modules rather than leaving forwarding files.** Maintained coverage lives in `selftest/`, not in archived drivers. Historical suite counts and receipts are run results, not guarantees about the current checkout.
 
+**Historical diagnostic campaigns are retired with their unused helpers.** The selftests no longer carry the standalone LoRA storage/scaling observers or the synthetic expert-parallel pack/prepare/send workflow. The corresponding unused debug APIs are removed. Reusable numerical comparisons, byte-bound adapter loading, compact-reference publication, ordinary disabled behavior and owned-worker cleanup retain representative coverage; the retirement does not claim equivalent coverage of every old injected failure.
+
 **One-off fixture configurations and the old naming-source exception are retired.** Job-numbered, issue-numbered and 64-token experiment configs are not maintained operator workloads. Their frozen copies remain with the original evidence. The removed historical-gradient options cannot admit consolidated sources under obsolete `names.py` hashes; current reference loading still requires an exact identity.
 
 **The documented LM-head command remains supported.** Both forms invoke the same maintained diagnostic:
