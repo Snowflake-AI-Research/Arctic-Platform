@@ -29,6 +29,8 @@ from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.converting_g
     convert_tt_to_hf_moe,
 )
 from arctic_platform.model.implementations.glm52.models.fp8 import fp8_weight_block_size
+from arctic_platform.model.implementations.glm52.models.fp8 import dense_mlp_fp8_block_size
+from arctic_platform.model.implementations.glm52.models.fp8 import routed_expert_packed4
 from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import GlmMoeDsaAttention, SparseMlaAttentionArgs
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
 from arctic_platform.model.implementations.glm52.models.layers.mlp import MLP, MLPConfig
@@ -71,6 +73,7 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
         self.skip_mlp = config.skip_mlp
         self.self_attn = GlmMoeDsaAttention(_sparse_mla_attention_args(config, layer_idx))
 
+        packed4 = routed_expert_packed4(config)
         moe_args = MoEArgs(
             num_experts=config.n_routed_experts,
             num_shared_experts=config.n_shared_experts,
@@ -82,13 +85,15 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
             load_balance_coeff=1e-3,
             use_grouped_mm=config.use_grouped_mm,
             fp8_block_size=fp8_weight_block_size(config),
+            routed_packed4=None if packed4 is None else packed4[0],
+            routed_int4_group_size=128 if packed4 is None else packed4[1],
         )
         mlp_config = MLPConfig(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             gate_act=config.hidden_act,
             bias=False,
-            fp8_block_size=fp8_weight_block_size(config),
+            fp8_block_size=dense_mlp_fp8_block_size(config),
         )
 
         if layer_idx >= config.first_k_dense_replace:

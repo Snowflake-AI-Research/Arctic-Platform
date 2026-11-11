@@ -99,9 +99,60 @@ def _routed_expert_indices(state_dict: dict[str, Tensor], layer_idx: int) -> lis
     return sorted(ids)
 
 
+def _stack_w4afp8_input_scales(state_dict: dict[str, Tensor], layer_idx: int, num_experts: int) -> None:
+    """W4AFP8's static FP8 activation scales, ``experts.{j}.w{1,2,3}.input_scale``, as ``experts.w*_input_scale`` [E]."""
+    prefix = f"model.layers.{layer_idx}.mlp.experts"
+    for name in ("w1", "w2", "w3"):
+        keys = [f"{prefix}.{j}.{name}.input_scale" for j in range(num_experts)]
+        present = [key in state_dict for key in keys]
+        if not any(present):
+            continue
+        if not all(present):
+            raise ValueError(f"layer {layer_idx}: {sum(present)} of {num_experts} experts carry {name}.input_scale")
+        state_dict[f"{prefix}.{name}_input_scale"] = torch.stack([state_dict.pop(key).reshape(()) for key in keys])
+
+
+def _stack_nvfp4_expert_scales(state_dict: dict[str, Tensor], layer_idx: int, num_experts: int) -> None:
+    """ModelOpt NVFP4 experts: E4M3 ``weight_scale`` per 16 inputs as ``experts.w*_scale_inv`` ``[E, out, in // 16]``,
+    FP32 ``weight_scale_2`` as ``experts.w*_scale_2`` ``[E]``. The NVFP4 activation ``input_scale`` is dropped: on
+    Hopper the experts run on BF16 activations."""
+    prefix = f"model.layers.{layer_idx}.mlp.experts"
+    for name, projection in (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")):
+        stems = [f"{prefix}.{j}.{projection}" for j in range(num_experts)]
+        if f"{stems[0]}.weight_scale_2" not in state_dict:
+            continue
+        state_dict[f"{prefix}.{name}_scale_inv"] = torch.stack([state_dict.pop(f"{stem}.weight_scale") for stem in stems])
+        state_dict[f"{prefix}.{name}_scale_2"] = torch.stack(
+            [state_dict.pop(f"{stem}.weight_scale_2").float().reshape(()) for stem in stems]
+        )
+        for stem in stems:
+            state_dict.pop(f"{stem}.input_scale", None)
+
+
+def _per_tensor_fp8_to_blocks(state_dict: dict[str, Tensor], layer_idx: int, block_size: int = 128) -> None:
+    """Per-tensor FP8 linears (ModelOpt ``FP8``: ``weight`` E4M3 and one FP32 ``weight_scale``) as block FP8.
+
+    The same E4M3 codes with the one scale repeated in every ``block_size`` x ``block_size`` block are exactly the
+    same weight, and load as ``BlockFp8Linear``. The static activation ``input_scale`` is dropped.
+    """
+    prefix = f"model.layers.{layer_idx}."
+    for key in [k for k in state_dict if k.startswith(prefix) and k.endswith(".weight_scale")]:
+        stem = key[: -len(".weight_scale")]
+        weight = state_dict.get(f"{stem}.weight")
+        scale = state_dict[key]
+        if weight is None or weight.dtype != torch.float8_e4m3fn or scale.numel() != 1:
+            continue
+        rows, cols = weight.shape
+        blocks = ((rows + block_size - 1) // block_size, (cols + block_size - 1) // block_size)
+        state_dict[f"{stem}.weight_scale_inv"] = scale.float().reshape(1, 1).expand(blocks).contiguous()
+        del state_dict[key]
+        state_dict.pop(f"{stem}.input_scale", None)
+
+
 def convert_hf_layer_to_tt(state_dict: dict[str, Tensor], layer_idx: int):
     i = layer_idx
 
+    _per_tensor_fp8_to_blocks(state_dict, i)
     if not _is_moe_layer(state_dict, i):
         return
 
@@ -146,11 +197,15 @@ def convert_hf_layer_to_tt(state_dict: dict[str, Tensor], layer_idx: int):
             )
         num_experts = len(expert_ids)
 
-        dim, moe_dim = state_dict[f"model.layers.{i}.mlp.experts.0.down_proj.weight"].shape
-        dtype = state_dict[f"model.layers.{i}.mlp.experts.0.down_proj.weight"].dtype
-        w1 = torch.empty((num_experts, moe_dim, dim), dtype=dtype)
-        w2 = torch.empty((num_experts, dim, moe_dim), dtype=dtype)
-        w3 = torch.empty((num_experts, moe_dim, dim), dtype=dtype)
+        # Shapes come from each projection: packed 4-bit codes halve the input dimension, so gate's shape is not
+        # down's transposed.
+        first = {
+            name: state_dict[f"model.layers.{i}.mlp.experts.0.{name}.weight"]
+            for name in ("gate_proj", "down_proj", "up_proj")
+        }
+        w1 = torch.empty((num_experts, *first["gate_proj"].shape), dtype=first["gate_proj"].dtype)
+        w2 = torch.empty((num_experts, *first["down_proj"].shape), dtype=first["down_proj"].dtype)
+        w3 = torch.empty((num_experts, *first["up_proj"].shape), dtype=first["up_proj"].dtype)
         w1_scales: list[Tensor] = []
         w2_scales: list[Tensor] = []
         w3_scales: list[Tensor] = []
@@ -179,6 +234,8 @@ def convert_hf_layer_to_tt(state_dict: dict[str, Tensor], layer_idx: int):
             state_dict[f"model.layers.{i}.mlp.experts.w1_scale_inv"] = torch.stack(w1_scales)
             state_dict[f"model.layers.{i}.mlp.experts.w2_scale_inv"] = torch.stack(w2_scales)
             state_dict[f"model.layers.{i}.mlp.experts.w3_scale_inv"] = torch.stack(w3_scales)
+        _stack_w4afp8_input_scales(state_dict, i, num_experts)
+        _stack_nvfp4_expert_scales(state_dict, i, num_experts)
 
     state_dict[f"model.layers.{i}.mlp.experts.w1"] = w1
     state_dict[f"model.layers.{i}.mlp.experts.w2"] = w2
