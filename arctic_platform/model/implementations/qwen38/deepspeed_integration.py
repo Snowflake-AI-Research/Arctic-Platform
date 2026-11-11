@@ -123,6 +123,10 @@ def load_qwen4_exp_model(
 ) -> nn.Module:
     """Load Qwen3.8-Flash-Next. Weight sync stays on the Hugging Face iterator."""
     _validate_parallelism(sp_size, sp_group)
+    from .host_table import configure as configure_host_table
+
+    # Read by the n-gram embedding's first forward, after the checkpoint load.
+    configure_host_table(getattr(options, "ngram_table_on_host", None))
     model = qwen_ds._load_moe_model(
         _adapter(),
         load_qwen4_exp_model_for_deepspeed,
