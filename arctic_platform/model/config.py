@@ -191,6 +191,13 @@ class Patches(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     liger: bool = Field(False, description="Apply Liger kernels.")
+    fused_qk_norm_rope: StrictBool = Field(
+        False,
+        description=(
+            "Qwen3 / Qwen3-MoE on the huggingface loader: run each attention layer's per-head q_norm / k_norm and"
+            " rotary embedding as one fused kernel per tensor each way."
+        ),
+    )
     gradient_checkpointing: StrictBool | PositiveInt = Field(
         False,
         description="False disables; True checkpoints every layer; an integer checkpoints every Nth layer.",
