@@ -37,7 +37,12 @@ from arctic_platform.model.implementations.moe.layers.checkpointing import (
 from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, MoE, install_combine_replay
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.moe.vlm import get_language_model, is_vlm_architecture
-from arctic_platform.model.implementations.moe.weights import load_state_dict, load_state_dict_keys, save_state_dict
+from arctic_platform.model.implementations.moe.weights import (
+    dcp_planning_group,
+    load_state_dict,
+    load_state_dict_keys,
+    save_state_dict,
+)
 from arctic_platform.model.implementations.moe.world import get_world
 from arctic_platform.model.implementations.debug.determinism import CHECKPOINT_PRESERVE_RNG_STATE
 
@@ -351,6 +356,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         dcp_load(
             state_dict,
             storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
+            process_group=dcp_planning_group(),
         )
     if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:
         model.tie_weights()
@@ -381,13 +387,14 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
     fallback_layer_types: set[str] = set()
     model_supported_targets: set[str] = set()
 
+    offload_manager = None
     if ac_config.offload_config.enabled:
         if ac_config.mode == "selective":
             raise ValueError(
                 "Activation-checkpoint CPU offload (ac_config.offload_config.enabled=True) requires "
                 f"ac_config.mode='full', but the active mode is '{ac_config.mode}'."
             )
-        install_activation_offload(model, config=ac_config.offload_config)
+        offload_manager = install_activation_offload(model, config=ac_config.offload_config)
         logger.info(
             "Activation CPU offload enabled (saved-tensor hooks, "
             f"keep_last_n={ac_config.offload_config.keep_last_n}, "
@@ -398,6 +405,9 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
     ac_config.check_layers_exist(len(language_model.layers))
     for layer_id, (layer_name, transformer_block) in enumerate(language_model.layers.named_children()):
         if not ac_config.checkpoints(layer_id):
+            if offload_manager is not None:
+                # Not recomputed: its saved intermediates stay on the GPU (the memory spent instead).
+                offload_manager.keep_on_gpu(transformer_block)
             continue
 
         if ac_config.mode == "selective" and supports_selective_activation_checkpointing(transformer_block):

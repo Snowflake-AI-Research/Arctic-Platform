@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The HF DCP loads of the carved MoE builders (qwen35) plan over one gloo group
+"""The HF DCP loads of the carved MoE builders (glm52: GLM-5 / GLM-5.2 / GLM-5.3, qwen35) plan over one gloo group
 (moe/weights.py ``dcp_planning_group``), not the NCCL world group. CPU only: two ranks on a gloo world load a small
 safetensors checkpoint through each builder's ``load_dcp_from_hf``."""
 
@@ -32,7 +32,10 @@ from torch import nn
 
 from arctic_platform.model.implementations.moe import weights
 
-BUILDERS = ("arctic_platform.model.implementations.qwen35.model_builder",)
+BUILDERS = (
+    "arctic_platform.model.implementations.glm52.model_builder",
+    "arctic_platform.model.implementations.qwen35.model_builder",
+)
 
 
 class _Tiny(nn.Module):
@@ -88,7 +91,7 @@ def _free_port() -> int:
 
 
 @pytest.mark.timeout(300)
-def test_the_qwen_dcp_load_plans_over_the_gloo_group(tmp_path):
+def test_glm_and_qwen_dcp_loads_plan_over_the_gloo_group(tmp_path):
     save_file(_reference(), str(tmp_path / "model.safetensors"), metadata={"format": "pt"})
     world = 2
     results = mp.Manager().dict()
