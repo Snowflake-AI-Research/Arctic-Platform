@@ -212,12 +212,33 @@ def _remap_lora_key(name: str, served_prefix: str) -> str:
 _FUSED_EXPERT_PROJS = ("w1", "w2", "w3")
 
 
-def _pack_fused_expert_loras(lora_model) -> int:
+def _has_non_gated_experts(model) -> bool:
+    """Whether the served model's fused MoE layers are non-gated (``act(x W1) W2``,
+    e.g. Nemotron-H's squared-ReLU experts): vLLM sets ``moe_config.is_act_and_mul``
+    False for them and keeps one w13 slice."""
+    if model is None:
+        return False
+    try:
+        gated = {
+            bool(module.moe_config.is_act_and_mul)
+            for _, module in model.named_modules()
+            if getattr(module, "moe_config", None) is not None
+        }
+    except Exception:
+        return False
+    return gated == {False}
+
+
+def _pack_fused_expert_loras(lora_model, non_gated: bool = False) -> int:
     """Collapse stacked ``experts.w{1,2,3}`` into one ``pack_moe_stacked`` entry.
 
     Trainer broadcasts one 3-D tensor per projection instead of one 2-D
     tensor per expert. ``add_adapter`` then finds the packed ``...experts``
     key and skips the per-expert ``pack_moe`` expansion.
+
+    Non-gated experts (``non_gated``) have only ``w1`` (up) and ``w2`` (down):
+    ``w1`` fills the third slot, as vLLM's per-expert ``pack_moe`` does for
+    them; ``FusedMoEWithLoRA.set_lora`` copies only ``w1`` and ``w2`` there.
     """
     from vllm.lora.lora_weights import PackedLoRALayerWeights
 
@@ -236,6 +257,8 @@ def _pack_fused_expert_loras(lora_model) -> int:
 
     packed = 0
     for experts_mod, parts in grouped.items():
+        if non_gated and "w3" not in parts and "w1" in parts:
+            parts["w3"] = parts["w1"]
         missing = [p for p in _FUSED_EXPERT_PROJS if p not in parts]
         if missing:
             have = sorted(parts)
@@ -310,7 +333,9 @@ def _build_lora_model(
         weights_mapper=weights_mapper,
         skip_prefixes=lora_skip_prefixes,
     )
-    packed_layers = _pack_fused_expert_loras(lora_model)
+    packed_layers = _pack_fused_expert_loras(
+        lora_model, non_gated=_has_non_gated_experts(model)
+    )
     if packed_layers:
         logger.info(
             "Packed %d fused expert LoRA layer(s) via pack_moe_stacked",
