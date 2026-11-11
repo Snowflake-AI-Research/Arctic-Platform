@@ -194,7 +194,8 @@ def _decode_steps(layout: Any):
         yield active, layout.starts[active] + layout.prompt_lens[active] + step
 
 
-def _kda_conv_kernel(qkv: torch.Tensor, conv_weight: torch.Tensor, *, layout: Any, trace: dict, **_) -> torch.Tensor:
+def _kda_conv_kernel(qkv: torch.Tensor, conv_weight: torch.Tensor, *, layout: Any, trace: dict | None = None,
+                     **_) -> torch.Tensor:  # fmt: skip
     """vLLM's q|k|v causal conv with SiLU: ``causal_conv1d_fn`` over each prompt from a zero state, then one
     ``causal_conv1d_update`` per decode step on the request's conv state slot. ``[tokens, 3 * projection]``."""
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
@@ -213,7 +214,8 @@ def _kda_conv_kernel(qkv: torch.Tensor, conv_weight: torch.Tensor, *, layout: An
         cache_indices=layout.slots,
         query_start_loc=layout.prompt_cu,
     ).transpose(0, 1)
-    trace.update(conv_in=qkv_p.transpose(0, 1), conv_weight=conv_weight, conv_out=conv_p)
+    if trace is not None:
+        trace.update(conv_in=qkv_p.transpose(0, 1), conv_weight=conv_weight, conv_out=conv_p)
     if layout.prompt_rows is None:
         return conv_p
     conv = qkv.new_empty(qkv.shape)
@@ -224,8 +226,8 @@ def _kda_conv_kernel(qkv: torch.Tensor, conv_weight: torch.Tensor, *, layout: An
     return conv
 
 
-def _kda_core_kernel(q, k, v, g, beta, a_log, dt_bias, *, layout: Any, lower_bound: float, trace: dict,
-                     **_) -> torch.Tensor:  # fmt: skip
+def _kda_core_kernel(q, k, v, g, beta, a_log, dt_bias, *, layout: Any, lower_bound: float,
+                     trace: dict | None = None, **_) -> torch.Tensor:  # fmt: skip
     """vLLM's KDA core on ``[1, tokens, heads, head_dim]`` q/k/v/g and ``[tokens, heads]`` beta logits: FlashKDA over
     each prompt from a zero state, then one ``fused_recurrent_kda`` step per decode step (gate and beta sigmoid in the
     kernel) from the fp32 state the request reached, in its recurrent state slot."""
@@ -237,7 +239,8 @@ def _kda_core_kernel(q, k, v, g, beta, a_log, dt_bias, *, layout: Any, lower_bou
     q_p, k_p, v_p, g_p = (t if rows_p is None else t[:, rows_p] for t in (q, k, v, g))
     beta_p = beta if rows_p is None else beta[rows_p]
     q_p, k_p, v_p = (t.contiguous() for t in (q_p, k_p, v_p))
-    trace.update(q=q_p, k=k_p, v=v_p, g=g_p, beta=beta_p.unsqueeze(0))
+    if trace is not None:
+        trace.update(q=q_p, k=k_p, v=v_p, g=g_p, beta=beta_p.unsqueeze(0))
     prompt_tokens, num_seqs = q_p.shape[1], layout.num_seqs
     state = torch.zeros((num_seqs, heads, head_dim, head_dim), dtype=torch.float32, device=q.device)
     final_state = torch.empty_like(state)
@@ -328,7 +331,6 @@ def _kda_rank(w: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, pr
               trace: dict | None) -> torch.Tensor:  # fmt: skip
     import types
 
-    trace = {} if trace is None else trace
     heads, head_dim = w.heads, w.head_dim
     projection = heads * head_dim
     tokens, num_seqs = x.shape[0], cu_seqlens.numel() - 1
@@ -354,9 +356,11 @@ def _kda_rank(w: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, pr
     q, k, v = (t.reshape(1, tokens, heads, head_dim) for t in conv.split(projection, dim=-1))
     core = _op(_kda_core_kernel, "ref_kda_core", q, k, v, g1, beta, w.a_log, w.dt_bias, layout=layout,
                lower_bound=config.linear_lower_bound, trace=trace, cu_seqlens=cu_seqlens)  # fmt: skip
-    trace.update(core=core, g2=g2)
+    if trace is not None:
+        trace.update(core=core, g2=g2)
     core = _op(_gated_norm_kernel, "ref_gated_rms_norm", core, g2, w.o_norm, eps=KDA_O_NORM_EPS).reshape(tokens, -1)
-    trace.update(normed=core)
+    if trace is not None:
+        trace.update(normed=core)
     return add_lora(_linear(core, w.o_weight), core, [w.o_lora], (w.o_weight.shape[0],))
 
 
