@@ -186,18 +186,17 @@ class _AlignedLayer(torch.autograd.Function):
 KDA_O_NORM_EPS = 1e-5  # vLLM builds the gated output norm with FusedRMSNormGated's default eps, not rms_norm_eps
 
 
-def _decode_steps(layout: Any):
-    """Each decode step's active requests and their rows, as vLLM's decode steps take them."""
-    steps = layout.lengths - layout.prompt_lens
-    for step in range(int(steps.max())):
-        active = torch.nonzero(steps > step).flatten()
-        yield active, layout.starts[active] + layout.prompt_lens[active] + step
+def _length_bucket(n: int) -> int:
+    return 1 << max(n - 1, 0).bit_length()
 
 
 def _kda_conv_kernel(qkv: torch.Tensor, conv_weight: torch.Tensor, *, layout: Any, trace: dict | None = None,
                      **_) -> torch.Tensor:  # fmt: skip
-    """vLLM's q|k|v causal conv with SiLU: ``causal_conv1d_fn`` over each prompt from a zero state, then one
-    ``causal_conv1d_update`` per decode step on the request's conv state slot. ``[tokens, 3 * projection]``."""
+    """vLLM's q|k|v causal conv with SiLU: ``causal_conv1d_fn`` over each prompt from a zero state, then the decode
+    steps' ``causal_conv1d_update`` from the request's conv state slot. ``[tokens, 3 * projection]``.
+
+    The decoded tokens of every request go through one varlen ``causal_conv1d_update``: its per-token arithmetic is a
+    decode step's, the window carried in registers instead of the state slot (bitwise equal to a call per step)."""
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
 
@@ -220,17 +219,24 @@ def _kda_conv_kernel(qkv: torch.Tensor, conv_weight: torch.Tensor, *, layout: An
         return conv_p
     conv = qkv.new_empty(qkv.shape)
     conv[layout.prompt_rows] = conv_p
-    for active, rows in _decode_steps(layout):
-        conv[rows] = causal_conv1d_update(qkv[rows], conv_states, conv_weight, None, activation="silu",
-                                          conv_state_indices=layout.slots[active])  # fmt: skip
+    rows = layout.decode_rows
+    # The length bound is a compile-time constant of the kernel; bucketing it bounds the recompiles.
+    conv[rows] = causal_conv1d_update(qkv[rows], conv_states, conv_weight, None, activation="silu",
+                                      conv_state_indices=layout.slots, query_start_loc=layout.decode_cu,
+                                      max_query_len=_length_bucket(layout.decode_max))  # fmt: skip
     return conv
 
 
 def _kda_core_kernel(q, k, v, g, beta, a_log, dt_bias, *, layout: Any, lower_bound: float,
                      trace: dict | None = None, **_) -> torch.Tensor:  # fmt: skip
     """vLLM's KDA core on ``[1, tokens, heads, head_dim]`` q/k/v/g and ``[tokens, heads]`` beta logits: FlashKDA over
-    each prompt from a zero state, then one ``fused_recurrent_kda`` step per decode step (gate and beta sigmoid in the
-    kernel) from the fp32 state the request reached, in its recurrent state slot."""
+    each prompt from a zero state, then the decode steps' ``fused_recurrent_kda`` (gate and beta sigmoid in the
+    kernel) from the fp32 state the request reached, in its recurrent state slot.
+
+    The decoded tokens of every request go through one varlen ``fused_recurrent_kda``: the kernel carries the fp32
+    state in registers through a decode step's per-token arithmetic, where the steps reload it from the fp32 slot
+    (lossless), so the outputs are bitwise a call per step's. The state indices are per token (the request's slot
+    each time), so each token's state store lands in its own request's slot."""
     import vllm._flashkda_C  # noqa: F401
     from vllm.models.glm5next.nvidia.ops.third_party.kda import fused_recurrent_kda
 
@@ -258,16 +264,15 @@ def _kda_core_kernel(q, k, v, g, beta, a_log, dt_bias, *, layout: Any, lower_bou
     core[:, rows_p] = core_p
     recurrent = torch.zeros((num_seqs + 1, heads, head_dim, head_dim), dtype=torch.float32, device=q.device)
     recurrent[1:] = final_state
-    for active, rows in _decode_steps(layout):
-        batch = rows.numel()
-        out, _ = fused_recurrent_kda(
-            q=q[:, rows], k=k[:, rows], v=v[:, rows], g=g[:, rows], beta=beta[rows].unsqueeze(0),
-            initial_state=recurrent, use_qk_l2norm_in_kernel=True,
-            cu_seqlens=torch.arange(batch + 1, dtype=torch.int32, device=q.device),
-            ssm_state_indices=layout.slots[active], sigmoid_beta=True, a_log=a_log.reshape(1, 1, heads, 1),
-            g_bias=dt_bias, compute_gate=True, lower_bound=lower_bound,
-        )  # fmt: skip
-        core[:, rows] = out.to(core.dtype)
+    rows = layout.decode_rows
+    slots = layout.slots[:, None].expand(num_seqs, max(layout.decode_max, 1)).contiguous()
+    out, _ = fused_recurrent_kda(
+        q=q[:, rows], k=k[:, rows], v=v[:, rows], g=g[:, rows], beta=beta[rows].unsqueeze(0),
+        initial_state=recurrent, use_qk_l2norm_in_kernel=True, cu_seqlens=layout.decode_cu, ssm_state_indices=slots,
+        sigmoid_beta=True, a_log=a_log.reshape(1, 1, heads, 1), g_bias=dt_bias, compute_gate=True,
+        lower_bound=lower_bound,
+    )  # fmt: skip
+    core[:, rows] = out.to(core.dtype)
     return core
 
 
@@ -336,15 +341,21 @@ def _kda_rank(w: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, pr
     tokens, num_seqs = x.shape[0], cu_seqlens.numel() - 1
     starts, lengths = cu_seqlens[:-1].long(), (cu_seqlens[1:] - cu_seqlens[:-1]).long()
     prompt_lens = lengths if prompt_lens is None else prompt_lens.long()
+    decode_rows = decode_cu = decode_max = None
     if bool((prompt_lens < lengths).any()):
         seq_of_token = torch.repeat_interleave(torch.arange(num_seqs, device=x.device), lengths)
         in_prompt = torch.arange(tokens, device=x.device) - starts[seq_of_token] < prompt_lens[seq_of_token]
         prompt_rows = torch.nonzero(in_prompt).flatten()
         prompt_cu = torch.cat([cu_seqlens.new_zeros(1), torch.cumsum(prompt_lens, 0).to(cu_seqlens.dtype)])
+        decode_lens = lengths - prompt_lens
+        decode_rows = torch.nonzero(~in_prompt).flatten()
+        decode_cu = torch.cat([decode_lens.new_zeros(1), torch.cumsum(decode_lens, 0)]).to(torch.int32)
+        decode_max = int(decode_lens.max())
     else:
         prompt_rows, prompt_cu = None, cu_seqlens
     layout = types.SimpleNamespace(num_seqs=num_seqs, starts=starts, lengths=lengths, prompt_lens=prompt_lens,
-                                   prompt_rows=prompt_rows, prompt_cu=prompt_cu,
+                                   prompt_rows=prompt_rows, prompt_cu=prompt_cu, decode_rows=decode_rows,
+                                   decode_cu=decode_cu, decode_max=decode_max,
                                    slots=torch.arange(1, num_seqs + 1, dtype=torch.int32, device=x.device))  # fmt: skip
     projected = _linear(x, w.merged)
     qkv, beta, f_a, g_a = projected.split([3 * projection, heads, head_dim, head_dim], dim=-1)
