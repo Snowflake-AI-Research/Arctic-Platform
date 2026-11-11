@@ -154,6 +154,17 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "moe.w4a8_experts",
+        runs_in="trainer",
+        goal="speed",
+        why=(
+            "INT4 routed experts run with FP8 activations at the checkpoint's static scales instead of decoded to"
+            " BF16."
+        ),
+        source="`loader_options.w4a8_experts`; `ARL_W4A8_EXPERTS` when unset",
+        registry=registry,
+    )
+    register_option(
         "attention.backend",
         runs_in="trainer",
         goal="speed",

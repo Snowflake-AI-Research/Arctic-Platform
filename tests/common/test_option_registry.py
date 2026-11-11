@@ -68,6 +68,7 @@ EXPECTED_KEYS = {
     "compile.fullgraph": ("trainer", "speed"),
     "peft": ("trainer", "mode"),
     "zorro_train": ("trainer", "mode"),
+    "moe.w4a8_experts": ("trainer", "speed"),
 }
 EXPECTED_PROFILES = {
     "huggingface",
@@ -535,7 +536,7 @@ class TestCommandLine(TestCasePlus):
     def test_check_passes_on_real_data(self):
         out = self._run("check")
         assert len(out) == 1
-        assert out[0].startswith("check passed: 25 options x 10 profiles = 250 cells, ")
+        assert out[0].startswith("check passed: 26 options x 10 profiles = 260 cells, ")
 
     def test_matrix_write_reproduces_committed_file(self):
         tmp_dir = Path(self.get_auto_remove_tmp_dir())
