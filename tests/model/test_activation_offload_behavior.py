@@ -304,6 +304,32 @@ def test_persistent_buffer_views_are_not_copied_to_host():
     assert manager.stats.offloaded_bytes == 0
 
 
+def _checkpointed_then_plain(keep_plain_on_gpu: bool):
+    torch.manual_seed(0)
+    net = nn.Sequential(checkpoint_wrapper(_Block(HIDDEN), preserve_rng_state=False), _Block(HIDDEN)).cuda()
+    manager = install_activation_offload(net, keep_last_n=0, use_streams=False)
+    if keep_plain_on_gpu:
+        manager.keep_on_gpu(net[1])
+    torch.manual_seed(1)
+    x = torch.randn(1024, HIDDEN, device="cuda", requires_grad=True)
+    net(x).float().pow(2).mean().backward()
+    return manager, [p.grad.detach().clone() for p in net.parameters()]
+
+
+@pytest.mark.integration
+@requires_cuda
+def test_blocks_kept_on_gpu_are_not_offloaded():
+    """A block left out of checkpointing saves all its intermediates; ``keep_on_gpu`` leaves those resident."""
+    streamed, streamed_grads = _checkpointed_then_plain(keep_plain_on_gpu=False)
+    kept, kept_grads = _checkpointed_then_plain(keep_plain_on_gpu=True)
+    # The plain block's linear inputs and relu output (8 MiB each) no longer go to host; the checkpointed
+    # block's boundary still does.
+    assert 0 < kept.stats.offloaded_tensors < streamed.stats.offloaded_tensors
+    assert kept._resident_depth == 0
+    for a, b in zip(streamed_grads, kept_grads):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
 class _FakeSlot:
     def __init__(self, seq_len: int, hidden: int = 256, dtype: torch.dtype = torch.float16):
         self.shape = (seq_len, hidden)
