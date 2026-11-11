@@ -154,4 +154,9 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
         )
 
         configure_transformers_sequence_parallel_model(model, groups["sp_group"], fp32_beta=options.fp32_parity)
+    else:
+        from arctic_platform.model.implementations.gpu.gated_delta_net_fused import apply_fused_gated_delta_net
+
+        # The head-parallel forward above fuses the input projections itself.
+        apply_fused_gated_delta_net(model, fp32_beta=options.fp32_parity)
     return LoadedModel(model=model)
