@@ -110,6 +110,9 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
     are both 1. Sequence parallelism reduces the
     data-parallel degree, and therefore ``train_batch_size``, to
     ``world_size // sequence_parallel``.
+    Unspecified BF16 gradient accumulation uses FP32 where DeepSpeed supports
+    it, based on the effective precision after overrides. FP16 and FP32 retain
+    DeepSpeed's native defaults; explicit accumulation dtypes are preserved.
     """
     dtype = (spec.dtype or "bfloat16").lower()
     is_bf16 = dtype in ("bfloat16", "bf16")
@@ -150,6 +153,7 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
             ds_config["zero_optimization"] = {**ds_config["zero_optimization"], **zero_overrides}
         elif zero_overrides is not None:
             ds_config["zero_optimization"] = zero_overrides
+    apply_default_grad_accum_dtype(ds_config, bf16_only=True)
     _require_fp32_gradient_reduction(ds_config)
     logger.info(
         "Resolved DeepSpeed precision: bf16=%s fp16=%s communication_data_type=%s",
@@ -158,6 +162,49 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
         ds_config.get("communication_data_type"),
     )
     return ds_config
+
+
+def apply_default_grad_accum_dtype(ds_config: dict[str, Any], *, bf16_only: bool = False) -> None:
+    """Default unspecified accumulation to FP32 without mutating a caller-owned block.
+
+    The builder opts into BF16-only defaulting; the worker retains its existing FP32 default for all supported
+    precisions. Preserve other ``data_types`` fields and explicit dtypes, and leave invalid blocks to
+    DeepSpeed's config validation.
+
+    Mixed-precision ZeRO0 rejects FP32 accumulation. BF16 ZeRO1 without CPU offload selects DeepSpeed's BF16
+    optimizer when gradient norms are disabled, and that optimizer refuses this configuration. Leave the native
+    default in those cases instead of making a previously accepted job fail initialization.
+    """
+    data_types = ds_config.get("data_types")
+    if data_types is not None and not isinstance(data_types, dict):
+        return
+    if (data_types or {}).get("grad_accum_dtype") is not None:
+        return
+    if not _deepspeed_accepts_fp32_grad_accumulation(ds_config, bf16_only=bf16_only):
+        return
+    ds_config["data_types"] = {**(data_types or {}), "grad_accum_dtype": "fp32"}
+
+
+def _deepspeed_accepts_fp32_grad_accumulation(ds_config: dict[str, Any], *, bf16_only: bool) -> bool:
+    """Whether the effective config supports FP32 accumulation within the caller's precision policy."""
+    from deepspeed.runtime.precision_config import get_bfloat16_config
+    from deepspeed.runtime.precision_config import get_float16_config
+    from deepspeed.runtime.zero.config import ZeroStageEnum
+    from deepspeed.runtime.zero.config import get_zero_config
+    from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
+
+    # Use the same typed parsers as DeepSpeedConfig, including "auto" and deprecated fields.
+    zero = get_zero_config(ds_config)
+    bf16 = get_bfloat16_config(ds_config).enabled
+    fp16 = get_float16_config(ds_config).enabled
+    if bf16_only and not bf16:
+        return False
+    if zero.stage == ZeroStageEnum.disabled:
+        return not (bf16 or fp16)
+    cpu_offload = zero.offload_optimizer is not None and zero.offload_optimizer.device == OffloadDeviceEnum.cpu
+    if zero.stage == ZeroStageEnum.optimizer_states and bf16 and not cpu_offload and not zero.compute_grad_norm:
+        return False
+    return True
 
 
 def split_expert_param_groups(param_groups: list) -> list:
@@ -367,8 +414,11 @@ def _optimizer_cpu_offload_enabled(ds_config: dict) -> bool:
         return False
     offload = zero_config.get("offload_optimizer")
     if isinstance(offload, dict):
-        # DeepSpeed reads ``device: none`` as no offload.
-        return str(offload.get("device", "none")).lower() != "none"
+        from deepspeed.runtime.zero.offload_config import DeepSpeedZeroOffloadOptimizerConfig
+        from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
+
+        # Same default as DeepSpeed: missing device is none. Extra keys raise.
+        return DeepSpeedZeroOffloadOptimizerConfig(**offload).device != OffloadDeviceEnum.none
     return bool(offload)
 
 

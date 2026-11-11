@@ -31,6 +31,7 @@ import torch
 import torch.distributed as dist
 from deepspeed.accelerator import get_accelerator
 
+from arctic_platform.common.deepspeed_engine import apply_default_grad_accum_dtype
 from arctic_platform.common.deepspeed_engine import build_deepspeed_config
 from arctic_platform.common.deepspeed_engine import initialize_training_engine
 from arctic_platform.common.deepspeed_engine import training_engine_spec
@@ -79,7 +80,7 @@ def onprem_deepspeed_config(training: WorkerTrainingSettings, *, dtype: str, wor
     No mpu is passed, so DeepSpeed counts every rank as data-parallel unless
     ``training.ds_config`` sets ``sequence_parallel_size``. Unless
     ``training.ds_config`` says otherwise, the engine autocasts to bf16 and
-    accumulates gradients in FP32.
+    accumulates gradients in FP32 wherever DeepSpeed accepts it.
     """
     sequence_parallel = int((training.ds_config or {}).get("sequence_parallel_size") or 1)
     spec = training_engine_spec(
@@ -87,13 +88,7 @@ def onprem_deepspeed_config(training: WorkerTrainingSettings, *, dtype: str, wor
     )
     ds_config = build_deepspeed_config(spec)
     ds_config.setdefault("torch_autocast", {"enabled": True, "dtype": "bfloat16"})
-    # DeepSpeed accumulates in the model dtype when ``grad_accum_dtype`` is unset, so the FP32 default belongs to
-    # the key, not the block: a supplied ``data_types`` without it still accumulates in FP32. ``None`` is how
-    # DeepSpeed spells unset. A new block is built so a caller's shared ``data_types`` dict is never mutated.
-    data_types = dict(ds_config.get("data_types") or {})
-    if data_types.get("grad_accum_dtype") is None:
-        data_types["grad_accum_dtype"] = "fp32"
-    ds_config["data_types"] = data_types
+    apply_default_grad_accum_dtype(ds_config)
     return ds_config
 
 
