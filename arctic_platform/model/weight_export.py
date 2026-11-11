@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import logging
@@ -23,6 +24,8 @@ import os
 from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Iterator
+from collections.abc import Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -64,6 +67,46 @@ def transfer_weight_export(source: nn.Module, target: nn.Module) -> None:
 
 def weight_export_contract(model: nn.Module) -> WeightExportContract | None:
     return _WEIGHT_EXPORTS.get(model)
+
+
+@dataclass(frozen=True)
+class HeldParameters:
+    """Parameters a model keeps outside their owners' ``_parameters`` (node shards of them, say).
+
+    ``named_parameters(model)`` lists ``model``'s parameters as the model without that holding lists them, names and
+    order, with a placeholder for each held one; a placeholder holds no data. ``materialize(tensors)`` is a context
+    inside which the placeholders among ``tensors`` hold their whole values (it may fill them on the exporting rank
+    only); it is collective: every rank enters it with the same tensors in the same order.
+    """
+
+    named_parameters: Callable[[nn.Module], Iterator[tuple[str, torch.Tensor]]]
+    materialize: Callable[[Sequence[torch.Tensor]], AbstractContextManager[None]]
+
+
+_HELD_PARAMETERS: WeakKeyDictionary[nn.Module, HeldParameters] = WeakKeyDictionary()
+
+
+def register_held_parameters(model: nn.Module, held: HeldParameters) -> None:
+    _HELD_PARAMETERS[model] = held
+
+
+def export_named_parameters(model: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
+    """``model.named_parameters()`` as the weight export sees them: a model's held parameters (``HeldParameters``)
+    appear under their own names, as placeholders whose data is read only inside ``materialized_parameters``."""
+    held = _HELD_PARAMETERS.get(model)
+    return held.named_parameters(model) if held is not None else model.named_parameters()
+
+
+@contextlib.contextmanager
+def materialized_parameters(model: nn.Module, tensors: Sequence[torch.Tensor]) -> Iterator[None]:
+    """Inside, the placeholders among ``tensors`` (from ``export_named_parameters``) hold their values on the exporting
+    rank. Collective: every rank passes the same tensors in the same order. A no-op for a model that holds none."""
+    held = _HELD_PARAMETERS.get(model)
+    if held is None:
+        yield
+        return
+    with held.materialize(tensors):
+        yield
 
 
 def supports_weight_format(model: nn.Module, weight_format: WeightFormat) -> bool:
@@ -198,7 +241,7 @@ def hf_sync_name_map(model: nn.Module, checkpoint_dir: str | None = None) -> dic
     if saved:
         renames: dict[str, str] = {}
         unmapped: list[str] = []
-        for name, _ in model.named_parameters():
+        for name, _ in export_named_parameters(model):
             export_name = hf_export_parameter_name(name)
             if export_name is None:
                 continue
@@ -234,7 +277,7 @@ def requires_hf_weight_sync(model: nn.Module, checkpoint_dir: str | None = None)
     if contract is not None and contract.vllm is not None:
         return False
     # Composite VLMs (Gemma 4) load without renames, but vLLM serves model.language_model.* as language_model.model.*.
-    for name, _ in model.named_parameters():
+    for name, _ in export_named_parameters(model):
         export_name = hf_export_parameter_name(name)
         if export_name is not None and export_name.startswith("model.language_model."):
             return True
