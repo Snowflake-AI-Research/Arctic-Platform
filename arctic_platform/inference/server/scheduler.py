@@ -24,6 +24,10 @@ _LOG_AFFINITY = os.environ.get("ARCTIC_LOG_AFFINITY", "") == "1"
 _MAX_KEYS = 500_000
 # Requests a worker may hold, as a multiple of capacity, before the rest wait here for whichever worker frees first.
 _BACKLOG = 2
+# Ray max_concurrency of each worker actor. Every call it serves takes a slot, generate or control alike.
+WORKER_MAX_CONCURRENCY = 2048
+# Slots the generate backlog leaves free for streams and control calls such as health checks and weight sync.
+_CONTROL_SLOTS = 4 * MAX_WORKER_STREAMS
 
 
 @dataclass
@@ -102,7 +106,7 @@ class Scheduler:
 
         self._workers = [WorkerState(handle=w) for w in workers]
         self._capacity = capacity
-        self._backlog = _BACKLOG * capacity
+        self._backlog = min(_BACKLOG * capacity, WORKER_MAX_CONCURRENCY - _CONTROL_SLOTS)
         self._prefix_routing = prefix_routing
         self._keys: OrderedDict[Hashable, int] = OrderedDict()
         # Requests no worker could take yet, dispatched in order by `_drain`.
@@ -362,12 +366,27 @@ class Scheduler:
         self._wake = asyncio.Event()
 
     def _drain(self) -> None:
-        """Dispatch waiting requests in order, until one can't go anywhere yet."""
+        """Dispatch waiting requests in order, passing over sticky ones whose worker is full.
+
+        Stops at any other request that can't go, or once every worker is
+        known to be full, since nothing behind it can go either.
+        """
+        passed: list[_Request] = []
+        full: set[int] = set()
+        schedulable = sum(ws.schedulable for ws in self._workers)
         while self._waiting:
-            req = self._waiting[0]
-            if not req.future.done() and not self._dispatch(req):
-                return
-            self._waiting.popleft()
+            req = self._waiting.popleft()
+            if req.future.done() or self._dispatch(req):
+                continue
+            passed.append(req)
+            idx = self._keys.get(req.key)
+            if (not req.sticky or self._paused or self._stopped or idx is None
+                    or idx >= len(self._workers) or not self._workers[idx].schedulable):
+                break
+            full.add(idx)
+            if len(full) >= schedulable:
+                break
+        self._waiting.extendleft(reversed(passed))
 
     def _request(self, prompt, sampling_params, future, routing_key, strict) -> _Request:
         if routing_key is not None:
@@ -436,6 +455,8 @@ class Scheduler:
             return ws.schedulable and self._has_room(ws, stream)
 
         n = len(self._workers)
+        if not n:
+            return None
         i = random.randrange(n)
         j = (i + 1 + random.randrange(n - 1)) % n if n > 1 else i
         a, b = self._workers[i], self._workers[j]
@@ -445,11 +466,16 @@ class Scheduler:
         return min(candidates, key=lambda k: self._workers[k].active_requests, default=None)
 
     def _dispatch(self, req: _Request) -> bool:
-        """Send ``req`` to a worker, or False while none can take it."""
+        """Send ``req`` to a worker, failing it if the send raises, or False while none can take it."""
         ws = self._take(req)
         if ws is None:
             return False
-        future = ws.handle.generate.remote(req.prompt, req.sampling_params).as_future()
+        try:
+            future = ws.handle.generate.remote(req.prompt, req.sampling_params).as_future()
+        except Exception as exc:
+            ws.active_requests -= 1
+            req.future.set_exception(exc)
+            return True
         ws.inflight.add(future)
         future.add_done_callback(functools.partial(self._done, req, ws, time.time()))
         return True
@@ -457,7 +483,6 @@ class Scheduler:
     def _done(self, req: _Request, ws: WorkerState, submitted_time: float, future: asyncio.Future) -> None:
         ws.inflight.discard(future)
         ws.active_requests -= 1
-        self._drain()
         if future.cancelled():
             error: BaseException | None = RuntimeError("Request cancelled for weight update")
         elif (error := future.exception()) is not None:
@@ -468,8 +493,11 @@ class Scheduler:
         if error is not None:
             if not req.future.done():
                 req.future.set_exception(error)
-            return
-        result = future.result()
+        else:
+            self._finish(req, submitted_time, future.result())
+        self._drain()
+
+    def _finish(self, req: _Request, submitted_time: float, result: Any) -> None:
         if not req.future.done():
             req.future.set_result(result)
         if isinstance(result, dict):

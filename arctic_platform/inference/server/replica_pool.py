@@ -13,7 +13,7 @@ import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from arctic_platform.inference.server.config import ModelConfig
-from arctic_platform.inference.server.scheduler import Scheduler
+from arctic_platform.inference.server.scheduler import Scheduler, WORKER_MAX_CONCURRENCY
 from arctic_platform.inference.server.token_prompts import compact_token_tensor, is_token_tensor
 from arctic_platform.inference.server.worker import InferenceWorker
 
@@ -308,7 +308,7 @@ class ReplicaPool:
         """
         options: dict[str, Any] = dict(
             num_gpus=num_gpus,
-            max_concurrency=2048,
+            max_concurrency=WORKER_MAX_CONCURRENCY,
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=self._engine_pg,
                 placement_group_bundle_index=bundle_index,
@@ -335,7 +335,7 @@ class ReplicaPool:
 
     def _colocate_worker_options(self, replica_idx: int) -> dict[str, Any]:
         """Pin one colocated replica onto its training bundle."""
-        opts: dict[str, Any] = {"max_concurrency": 2048}
+        opts: dict[str, Any] = {"max_concurrency": WORKER_MAX_CONCURRENCY}
         groups = self._colocate_pgs or []
         pg = groups[replica_idx % len(groups)]
         bundles = self._colocate_bundles
@@ -385,7 +385,7 @@ class ReplicaPool:
             options: dict[str, Any] = dict(
                 num_gpus=0,
                 num_cpus=0,
-                max_concurrency=2048,
+                max_concurrency=WORKER_MAX_CONCURRENCY,
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=self._engine_pg,
                     placement_group_bundle_index=0,
@@ -411,7 +411,7 @@ class ReplicaPool:
             return self._worker_cls.options(**options).remote()
         return self._worker_cls.options(
             num_gpus=self._ray_num_gpus,
-            max_concurrency=2048,
+            max_concurrency=WORKER_MAX_CONCURRENCY,
         ).remote()
 
     @staticmethod
