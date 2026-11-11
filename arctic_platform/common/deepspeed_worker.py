@@ -668,7 +668,10 @@ class DeepSpeedWorker:
 
     def save_checkpoint(self, path: str, export_hf: bool = False) -> dict:
         """Save DeepSpeed checkpoint; optionally export HF weights to ``{path}/hf/`` (rank 0)."""
-        self.engine.save_checkpoint(path)
+        from arctic_platform.common.utils.checkpoint import has_ep_sharded_parameters
+
+        # Rank 0's module state cannot hold other ranks' expert shards; frozen weights reload from the base model.
+        self.engine.save_checkpoint(path, exclude_frozen_parameters=has_ep_sharded_parameters(self.engine.module))
         hf_path = None
         if export_hf:
             hf_path = self.export_hf_checkpoint(path)
@@ -680,7 +683,13 @@ class DeepSpeedWorker:
 
     def load_checkpoint(self, path: str) -> int:
         """Restore DeepSpeed state. Returns restored ``global_steps``, or 0 if none found."""
-        load_path, _ = self.engine.load_checkpoint(path)
+        from arctic_platform.common.utils.checkpoint import has_ep_sharded_parameters
+        from arctic_platform.common.utils.checkpoint import load_module_state_skipping_ep_shards
+
+        custom_load_fn = None
+        if has_ep_sharded_parameters(self.engine.module):
+            custom_load_fn = load_module_state_skipping_ep_shards
+        load_path, _ = self.engine.load_checkpoint(path, custom_load_fn=custom_load_fn)
         if load_path is None:
             return 0
         return int(self.engine.global_steps)

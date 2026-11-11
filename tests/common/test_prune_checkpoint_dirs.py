@@ -21,6 +21,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import torch
+from torch import nn
+
+from arctic_platform.common.utils.checkpoint import load_module_state_skipping_ep_shards
 from arctic_platform.common.utils.checkpoint import prune_checkpoint_dirs
 from arctic_platform.common.utils.checkpoint import resolve_checkpoint_save_paths
 from arctic_platform.testing_utils import TestCasePlus
@@ -90,3 +94,42 @@ class TestSaveTotalLimitPruneRoot(TestCasePlus):
         save_dir, prune_root = resolve_checkpoint_save_paths(str(job), step=7)
         self.assertEqual(save_dir, str(job / "checkpoint-7"))
         self.assertEqual(prune_root, str(job))
+
+
+class TestLoadModuleStateSkippingEpShards(TestCasePlus):
+    def _model(self) -> nn.Module:
+        model = nn.Module()
+        model.experts = nn.Parameter(torch.zeros(2, 3), requires_grad=False)
+        model.experts.group_name = "ep_size_2"
+        model.experts.allreduce = False
+        model.base = nn.Parameter(torch.zeros(3), requires_grad=False)
+        model.adapter = nn.Parameter(torch.zeros(3))
+        return model
+
+    def test_skips_rank_zero_experts_and_absent_frozen_weights(self):
+        model = self._model()
+        load_module_state_skipping_ep_shards({"experts": torch.ones(2, 3), "adapter": torch.ones(3)}, model)
+        torch.testing.assert_close(model.experts, torch.zeros(2, 3))
+        torch.testing.assert_close(model.adapter, torch.ones(3))
+
+    def test_matches_names_through_activation_checkpoint_wrappers(self):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+        model = nn.Module()
+        model.layer = checkpoint_wrapper(self._model())
+        self.assertIn("layer._checkpoint_wrapped_module.experts", dict(model.named_parameters()))
+        load_module_state_skipping_ep_shards(
+            {"layer.experts": torch.ones(2, 3), "layer.adapter": torch.ones(3)}, model
+        )
+        torch.testing.assert_close(model.layer.experts, torch.zeros(2, 3))
+        torch.testing.assert_close(model.layer.adapter, torch.ones(3))
+        with self.assertRaisesRegex(RuntimeError, "adapter"):
+            load_module_state_skipping_ep_shards({"layer.base": torch.ones(3)}, model)
+
+    def test_missing_trainable_parameter_raises(self):
+        with self.assertRaisesRegex(RuntimeError, "adapter"):
+            load_module_state_skipping_ep_shards({"base": torch.ones(3)}, self._model())
+
+    def test_unexpected_key_raises(self):
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            load_module_state_skipping_ep_shards({"adapter": torch.ones(3), "stale": torch.ones(1)}, self._model())

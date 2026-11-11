@@ -37,6 +37,31 @@ def resolve_checkpoint_save_paths(root: str, step: int | None) -> tuple[str, str
     return save_dir, root
 
 
+def has_ep_sharded_parameters(module) -> bool:
+    from arctic_platform.model.weight_export import _has_ep_sharded_parameters
+
+    return _has_ep_sharded_parameters(module)
+
+
+def load_module_state_skipping_ep_shards(src: dict, dst) -> None:
+    """``custom_load_fn`` for ``engine.load_checkpoint`` on expert-parallel models.
+
+    DeepSpeed writes module state from rank 0 only, so its EP-sharded tensors are rank 0's experts and must not be
+    loaded elsewhere. Frozen parameters may be absent (saved with ``exclude_frozen_parameters``); every other key must
+    load.
+    """
+    from arctic_platform.model.weight_export import _is_ep_sharded_parameter
+    from arctic_platform.model.weight_export import strip_activation_checkpoint_segments as strip
+
+    parameters = {strip(name): p for name, p in dst.named_parameters(remove_duplicate=False)}
+    skipped = {name for name, parameter in parameters.items() if _is_ep_sharded_parameter(parameter)}
+    frozen = {name for name, parameter in parameters.items() if not parameter.requires_grad}
+    result = dst.load_state_dict({k: v for k, v in src.items() if strip(k) not in skipped}, strict=False)
+    missing = [k for k in result.missing_keys if strip(k) not in skipped and strip(k) not in frozen]
+    if missing or result.unexpected_keys:
+        raise RuntimeError(f"Checkpoint module state mismatch: missing={missing} unexpected={result.unexpected_keys}")
+
+
 def prune_checkpoint_dirs(parent_dir: str, keep: int) -> int:
     """Keep the newest ``keep`` ``checkpoint-*`` dirs under ``parent_dir``; remove older.
 
