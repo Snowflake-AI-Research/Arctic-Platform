@@ -42,6 +42,13 @@ from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
 # field -> (module, reader, environment variable, value when set, value when off)
 SWITCHES = {
+    "frozen_expert_offload": (
+        "moe.frozen_offload",
+        "frozen_expert_offload_requested",
+        "ARL_OFFLOAD_FROZEN_EXPERTS",
+        True,
+        False,
+    ),
     "w4a8_experts": ("kernels.w4a8", "w4a8_experts_requested", "ARL_W4A8_EXPERTS", True, False),
     "w8a8_experts": ("kernels.fp8_grouped_w8a8", "w8a8_experts_requested", "ARL_W8A8_EXPERTS", True, False),
     "ultraep_spares": ("moe.ultraep_replicas", "ultraep_spares", "ARL_ULTRAEP_SPARES", 2, 0),
@@ -99,6 +106,13 @@ def test_unset_options_leave_the_environment_in_charge(monkeypatch):
     for spec in SWITCHES.values():
         monkeypatch.setenv(spec[2], _env_value(spec[3]))
     assert _switches() == {field: spec[3] for field, spec in SWITCHES.items()}
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "False"])
+def test_offload_environment_off_values(monkeypatch, value):
+    monkeypatch.setenv("ARL_OFFLOAD_FROZEN_EXPERTS", value)
+    apply_moe_runtime_options(MoeRuntimeOptions())
+    assert not _module("moe.frozen_offload").frozen_expert_offload_requested()
 
 
 def test_ipc_symm_is_written_for_ultraep():

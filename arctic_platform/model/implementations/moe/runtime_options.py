@@ -38,6 +38,7 @@ from typing_extensions import Self
 
 # field -> (module that reads it, relative to arctic_platform.model.implementations; the setter it takes it through)
 _SETTERS = {
+    "frozen_expert_offload": ("moe.frozen_offload", "configure_from_options"),
     "w4a8_experts": ("kernels.w4a8", "configure_from_options"),
     "w8a8_experts": ("kernels.fp8_grouped_w8a8", "configure_from_options"),
     # One spare count for UltraEP's three paths (moe/ultraep_replicas.py picks one from the experts).
@@ -56,6 +57,14 @@ class MoeRuntimeOptions(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
+    frozen_expert_offload: bool | None = Field(
+        None,
+        description=(
+            "Keep the frozen routed experts' weights (codes) in pinned host memory, copied into two GPU buffers per "
+            "experts call with the next layer prefetched (moe/frozen_offload.py); layers that are not recomputed keep "
+            "theirs on the GPU. Unset: ARL_OFFLOAD_FROZEN_EXPERTS."
+        ),
+    )
     w4a8_experts: bool | None = Field(
         None,
         description=(
