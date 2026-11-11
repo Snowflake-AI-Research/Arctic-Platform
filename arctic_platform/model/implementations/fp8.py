@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 from typing import Any
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -76,7 +77,7 @@ def _remark_keep_fp32(model) -> int:
     for name, param in model.named_parameters():
         if param.dtype != torch.float32:
             continue
-        if name.endswith("_scale_inv") or (family_keeps is not None and family_keeps(name)):
+        if name.endswith(("_scale_inv", "_scale_2")) or (family_keeps is not None and family_keeps(name)):
             mark_keep_fp32(param)
             marked += 1
     return marked
@@ -341,24 +342,70 @@ def _decode_workspace(shape: tuple[int, ...], device: torch.device) -> Tensor:
     return buffer[:numel].view(shape)
 
 
-def _decode_fp8_to_bf16(
-    weight: Tensor | tuple[Tensor, ...], scale: Tensor | tuple[Tensor, ...], block_size: int
-) -> Tensor:
-    """BF16 copy of a CUDA block-FP8 matrix or expert stack, for one GEMM on the current stream.
+class Nvfp4Scales:
+    """The two NVFP4 scales of one matrix or expert stack: E4M3 per 16 inputs and FP32 per matrix (``[E]``)."""
 
-    Tuples of stacks (e.g. gate and up) are decoded side by side along the output rows into one stack. CUDA
-    decodes land in the shared decode workspace: use the result for one GEMM and do not keep it.
+    __slots__ = ("block", "per_matrix")
+
+    def __init__(self, block: Tensor, per_matrix: Tensor) -> None:
+        self.block = block
+        self.per_matrix = per_matrix
+
+
+PACKED_4BIT_DTYPES = (torch.int8, torch.uint8)
+
+
+def is_packed_4bit(weight: Tensor) -> bool:
+    """Frozen 4-bit codes, two per byte along the input dimension: INT4 or MXFP4 (int8 bytes), NVFP4 (uint8 bytes)."""
+    return weight.dtype in PACKED_4BIT_DTYPES
+
+
+def logical_cols(weight: Tensor) -> int:
+    """Input features of a frozen weight: twice the stored columns for packed 4-bit codes."""
+    return weight.shape[-1] * 2 if is_packed_4bit(weight) else weight.shape[-1]
+
+
+def _decode_stack_into(weight: Tensor, scale, block_size: int | None, out: Tensor, out_row: int) -> None:
+    if weight.dtype == torch.float8_e4m3fn:
+        from arctic_platform.model.implementations.kernels.fp8_block_dequant import dequantize_fp8_blocks
+
+        dequantize_fp8_blocks(weight, scale, cast(int, block_size), out=out, out_row=out_row)
+    elif weight.dtype == torch.int8 and isinstance(scale, Tensor) and scale.dtype != torch.bfloat16:
+        # int8 bytes carry INT4 (BF16 group scales) or MXFP4 (FP32 or E8M0 scales per 32 inputs).
+        from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_mxfp4_packed
+
+        dequantize_mxfp4_packed(weight, scale, out=out, out_row=out_row)
+    elif weight.dtype == torch.int8:
+        from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_int4_groups
+
+        dequantize_int4_groups(weight, scale, out=out, out_row=out_row)
+    elif weight.dtype == torch.uint8:
+        from arctic_platform.model.implementations.kernels.packed4_dequant import dequantize_nvfp4
+
+        if not isinstance(scale, Nvfp4Scales):
+            raise TypeError(f"NVFP4 weights decode with Nvfp4Scales, got {type(scale).__name__}")
+        dequantize_nvfp4(weight, scale.block, scale.per_matrix, out=out, out_row=out_row)
+    else:
+        raise TypeError(f"no BF16 decode for frozen {weight.dtype} weights")
+
+
+def _decode_fp8_to_bf16(weight: Tensor | tuple[Tensor, ...], scale, block_size: int | None) -> Tensor:
+    """BF16 copy of a CUDA quantized matrix or expert stack, for one GEMM on the current stream.
+
+    Block FP8 (``block_size`` x ``block_size`` FP32 scales), group-scaled INT4 (BF16 scales, or
+    ``Int4InterleavedScales`` in the W4A8 layout), MXFP4 (FP32 or E8M0 scales) or NVFP4 (``Nvfp4Scales``), chosen by
+    the weight's and the scale's dtypes. Tuples of stacks (e.g. gate and up) are decoded side by side along the output
+    rows into one stack. CUDA decodes land in the shared decode workspace: use the result for one GEMM and do not
+    keep it.
     """
-    from arctic_platform.model.implementations.kernels.fp8_block_dequant import dequantize_fp8_blocks
-
     stacks = weight if isinstance(weight, tuple) else (weight,)
     scales = scale if isinstance(scale, tuple) else (scale,)
     first = stacks[0]
     rows = sum(w.shape[-2] for w in stacks)
-    out = _decode_workspace((*first.shape[:-2], rows, first.shape[-1]), first.device)
+    out = _decode_workspace((*first.shape[:-2], rows, logical_cols(first)), first.device)
     row = 0
     for w, sc in zip(stacks, scales):
-        dequantize_fp8_blocks(w, sc, block_size, out=out, out_row=row)
+        _decode_stack_into(w, sc, block_size, out, row)
         row += w.shape[-2]
     return out
 
@@ -673,17 +720,61 @@ def grouped_fp8_mm(
     return _GroupedBlockFp8MmFn.apply(x, weight, scale, num_tokens_per_expert, block_size)
 
 
-def fp8_weight_block_size(config: Any) -> int | None:
-    """Return the HF block size when ``config`` is a finegrained FP8 checkpoint."""
+def _quantization_config(config: Any) -> dict:
     qc = getattr(config, "quantization_config", None)
     if qc is None:
-        return None
+        return {}
     if not isinstance(qc, dict):
         qc = getattr(qc, "to_dict", lambda: {})()
+    return qc
+
+
+def fp8_weight_block_size(config: Any) -> int | None:
+    """Return the HF block size when ``config`` is a finegrained FP8 checkpoint.
+
+    W4AFP8 checkpoints (SGLang's ``w4afp8``: INT4 routed experts) keep every other quantized layer in the FP8
+    release's 128 x 128 blocks, so they report that block size for those layers.
+    """
+    qc = _quantization_config(config)
+    if qc.get("quant_method") == "w4afp8":
+        return 128
     if qc.get("quant_method") != "fp8":
         return None
     weight_block_size = qc.get("weight_block_size") or [128, 128]
     return int(weight_block_size[0])
+
+
+def dense_mlp_fp8_block_size(config: Any) -> int | None:
+    """Block size of the dense MLP layers: ``fp8_weight_block_size``, or 128 when a ModelOpt checkpoint stores them in
+    per-tensor FP8 (the conversion repeats that scale per 128 x 128 block)."""
+    block = fp8_weight_block_size(config)
+    if block is not None:
+        return block
+    qc = _quantization_config(config)
+    if qc.get("quant_method") == "modelopt":
+        layers = qc.get("quantized_layers") or {}
+        if any(
+            name.endswith(("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")) and spec.get("quant_algo") == "FP8"
+            for name, spec in layers.items()
+        ):
+            return 128
+    return None
+
+
+def routed_expert_packed4(config: Any) -> tuple[str, int] | None:
+    """``("int4", group)`` or ``("nvfp4", 16)`` when the checkpoint stores routed experts as packed 4-bit codes.
+
+    INT4: SGLang's ``w4afp8`` (int8 bytes, BF16 scales per ``group_size`` inputs). NVFP4: a ModelOpt
+    ``MIXED_PRECISION`` checkpoint whose ``mlp.experts`` layers are ``NVFP4``.
+    """
+    qc = _quantization_config(config)
+    if qc.get("quant_method") == "w4afp8":
+        return "int4", int(qc.get("group_size", 128))
+    if qc.get("quant_method") == "modelopt":
+        layers = qc.get("quantized_layers") or {}
+        if any(name.endswith("mlp.experts") and spec.get("quant_algo") == "NVFP4" for name, spec in layers.items()):
+            return "nvfp4", 16
+    return None
 
 
 def quantize_to_fp8_blockwise(weight: Tensor, block_size: int = 128) -> tuple[Tensor, Tensor]:

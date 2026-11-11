@@ -21,6 +21,24 @@ from torch import nn
 from arctic_platform.testing_utils import single_rank_process_group
 
 
+@pytest.fixture(autouse=True)
+def _undo_unfused_expert_lora_activation():
+    """``install_unfused_expert_lora_activation`` (and ``apply_peft`` on an FP8 or packed 4-bit model) patches PEFT's
+    ``ParamWrapper`` for the whole process, as a trainer wants; undo it after each test, or every later test's BF16
+    expert LoRA runs without its delta."""
+    try:
+        from peft.tuners.lora.layer import ParamWrapper
+    except ImportError:
+        yield
+        return
+    original = ParamWrapper.__dict__.get("_ap_activate_lora_original", ParamWrapper._activate_lora)
+    yield
+    ParamWrapper._activate_lora = original
+    for attr in ("_ap_activate_lora_original", "_ap_skip_fused_expert_delta"):
+        if attr in ParamWrapper.__dict__:
+            delattr(ParamWrapper, attr)
+
+
 @pytest.fixture
 def single_rank_group():
     """The default process group, with one rank; see ``single_rank_process_group``."""
