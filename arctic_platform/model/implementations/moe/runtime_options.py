@@ -47,7 +47,7 @@ _ULTRA_EP_IPC_SYMM_ENV = "ULTRA_EP_IPC_SYMM"
 
 
 class MoeRuntimeOptions(BaseModel):
-    """Expert-balance and expert-GEMM settings of the MoE runtime. None: off. UltraEP's spares and the online
+    """Memory, expert-balance and expert-GEMM settings of the MoE runtime. None: off. UltraEP's spares and the online
     replicas both fill the spare expert slots, so at most one of them is on."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
