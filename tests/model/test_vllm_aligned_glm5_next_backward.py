@@ -21,7 +21,7 @@ def test_op_routes_through_vllm_op_only_in_differentiable_mode():
 
     x = torch.randn(3, 4, requires_grad=True)
     weight = torch.randn(2, 4)
-    kernel = lambda x, weight, *, scale: x @ weight.t() * scale  # noqa: E731
+    kernel = lambda x, weight, *, scale: x @ weight.t() * scale
     assert torch.equal(glm5_next._op(kernel, "ref_linear", x, weight, scale=1.0), x @ weight.t())
     with glm5_next.differentiable():
         out = glm5_next._op(kernel, "ref_linear", x, weight, scale=2.0)
@@ -49,7 +49,7 @@ def test_routed_experts_reference_runs_the_stock_dispatch_and_shares_its_gradien
     x = torch.randn(3, 4, requires_grad=True)
     weights = torch.rand(3, 2, requires_grad=True)
     ids = torch.tensor([[0, 1], [1, 2], [2, 0]], dtype=torch.int32)
-    kernel = lambda x, weights, ids, *, tp: tuple(x * weights.sum(-1, keepdim=True) / tp for _ in range(tp))  # noqa: E731
+    kernel = lambda x, weights, ids, *, tp: tuple(x * weights.sum(-1, keepdim=True) / tp for _ in range(tp))
     with glm5_next.differentiable():
         parts = glm5_next._op(kernel, "ref_routed_experts_ep", x, weights, ids, moe=moe, tp=4)
     assert len(parts) == 4 and moe.seen is None  # the reference runs only in the backward

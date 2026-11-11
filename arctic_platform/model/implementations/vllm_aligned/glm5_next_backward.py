@@ -265,7 +265,9 @@ def ref_routed_experts_ep(x, weights, ids, *, moe, tp: int = 1):
     """:func:`ref_routed_experts`' math through the stock MoE's expert-parallel dispatch, so no rank holds every
     expert's weights. The forward's ``tp`` per-rank outputs are summed (``tp_sum``) and so get the same gradient:
     their VJPs add up to the unsharded experts', and each output here carries ``1 / tp`` of them."""
-    from arctic_platform.model.implementations.vllm_aligned.glm5_next import stock_routed_experts
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import (
+        stock_routed_experts,
+    )
 
     out = stock_routed_experts(moe, x, ids, weights)
     return tuple(out / tp for _ in range(tp))
