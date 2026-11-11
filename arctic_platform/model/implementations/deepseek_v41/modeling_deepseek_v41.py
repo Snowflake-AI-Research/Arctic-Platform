@@ -220,7 +220,12 @@ class DeepseekV41PreTrainedModel(PreTrainedModelPrimeRL):
         return apply_hf_to_prime(state_dict, self.conversion_chain(self.config))
 
     def convert_to_hf(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:  # type: ignore[override]
-        return apply_prime_to_hf(state_dict, self.conversion_chain(self.config))
+        out = apply_prime_to_hf(state_dict, self.conversion_chain(self.config))
+        # Packed experts keep their scales as E8M0 exponent bytes in memory: the checkpoint's own dtype.
+        for key, value in out.items():
+            if value.dtype == torch.uint8 and key.endswith(".scale") and ".ffn.experts." in key:
+                out[key] = value.view(torch.float8_e8m0fnu)
+        return out
 
     def convert_layer_to_hf(self, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:  # type: ignore[override]
         # The chain skips keys a group does not hold, so one decoder layer or the

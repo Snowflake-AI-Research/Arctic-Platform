@@ -290,7 +290,7 @@ _OFFICIAL_QUANTIZATION = {
 
 
 def test_lora_keeps_official_experts_packed_through_streaming_conversion(tmp_path):
-    from arctic_platform.model.implementations.deepseek_v4.moe import Mxfp4GroupedExperts
+    from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
 
     config = _config()
     config.hidden_size = 32
@@ -308,7 +308,7 @@ def test_lora_keeps_official_experts_packed_through_streaming_conversion(tmp_pat
     config.quantization_config = dict(_OFFICIAL_QUANTIZATION)
     model = DeepseekV41ForCausalLM(config)
     experts = model.model.layers[1].mlp.experts
-    assert isinstance(experts, Mxfp4GroupedExperts)
+    assert isinstance(experts, GroupedExperts) and experts.packed4 == "mxfp4"
     assert not any(param.requires_grad for param in experts.parameters())
 
     expected = model.convert_to_prime(copy.deepcopy(source))
