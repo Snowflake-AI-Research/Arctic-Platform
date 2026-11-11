@@ -43,9 +43,11 @@ def text_decoder(model: nn.Module, *, patch_name: str) -> nn.Module:
 
 
 def transformer_layers(model: nn.Module, *, patch_name: str):
-    target = model
-    for part in ("model", "layers"):
-        target = getattr(target, part, None)
-        if target is None:
-            raise ValueError(f"{patch_name} patch requires model.model.layers")
-    return target
+    """The decoder layers: ``model.model.layers``, else the text decoder's (a multimodal model's language model)."""
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    if layers is not None:
+        return layers
+    try:
+        return text_decoder(model, patch_name=patch_name).layers
+    except ValueError as error:
+        raise ValueError(f"{patch_name} patch requires model.model.layers or one text decoder: {error}") from None
