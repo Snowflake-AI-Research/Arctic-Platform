@@ -15,9 +15,12 @@ def named_weight_sync_tensors(
 
     Weight sync passes ``include_export_buffers=False``: declared buffers are constant
     checkpoint state the sampler loads with the model, and the receiver only accepts
-    parameter destinations.
+    parameter destinations. Parameters the model holds elsewhere (``moe/dense_shard.py``)
+    come as placeholders: read their data inside ``materialized_parameters``.
     """
-    yield from model.named_parameters()
+    from arctic_platform.model.weight_export import export_named_parameters
+
+    yield from export_named_parameters(model)
     for name, buffer in model.named_buffers():
         if name.endswith(".expert_bias"):
             yield name, buffer
@@ -188,6 +191,7 @@ def build_iter_full_vllm_weights(model: nn.Module):
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist
 
+    from arctic_platform.model.weight_export import materialized_parameters
     from arctic_platform.model.weight_export import wait_for_export_collective
 
     is_vlm = bool(getattr(model, "_is_vlm", False))
@@ -223,14 +227,9 @@ def build_iter_full_vllm_weights(model: nn.Module):
         for name, tensor in named_weight_sync_tensors(model, include_export_buffers=False):
             by_layer.setdefault(_layer_idx(name), []).append((name, tensor))
 
-        ordered_layers: list[int] = []
-        if -1 in by_layer:
-            ordered_layers.append(-1)
-        ordered_layers.extend(sorted(k for k in by_layer if k >= 0))
-
-        for layer_idx in ordered_layers:
+        def export_layer(layer_idx: int, tensors: list[tuple[str, torch.Tensor]]):
             layer_sd: dict[str, torch.Tensor] = {}
-            for name, tensor in by_layer[layer_idx]:
+            for name, tensor in tensors:
                 if (
                     hasattr(tensor, "group_name")
                     and getattr(tensor, "allreduce", True) is False
@@ -251,7 +250,7 @@ def build_iter_full_vllm_weights(model: nn.Module):
                     layer_sd[name] = tensor.data
 
             if not is_master:
-                continue
+                return
 
             layer_sd = {_strip_ac_wrapper(k): v for k, v in layer_sd.items()}
 
@@ -266,5 +265,16 @@ def build_iter_full_vllm_weights(model: nn.Module):
             for name, tensor in layer_sd.items():
                 out_name = to_vllm_vlm_name(name) if is_vlm else name
                 yield out_name, tensor
+
+        ordered_layers: list[int] = []
+        if -1 in by_layer:
+            ordered_layers.append(-1)
+        ordered_layers.extend(sorted(k for k in by_layer if k >= 0))
+
+        for layer_idx in ordered_layers:
+            # Held parameters (moe/dense_shard.py's node shards) are whole only for this layer; its tensors live in
+            # export_layer's frame, which ends before the next layer is materialized.
+            with materialized_parameters(model, [tensor for _, tensor in by_layer[layer_idx]]):
+                yield from export_layer(layer_idx, by_layer[layer_idx])
 
     return _iter
