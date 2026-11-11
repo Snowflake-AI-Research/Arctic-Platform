@@ -98,6 +98,7 @@ def dense_model_spec(
         patches=Patches(
             liger=liger,
             gradient_checkpointing=training_options.get("activation_checkpointing", False),
+            checkpoint_keep_attention=training_options.get("checkpoint_keep_attention", False),
             activation_offload=activation_offload,
             compile=training_options.get("compile"),
             tiled_mlp=tiled_mlp,
