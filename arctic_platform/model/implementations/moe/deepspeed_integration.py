@@ -251,6 +251,13 @@ def build_iter_full_hf_weights(model: nn.Module):
         from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
         from arctic_platform.model.implementations.moe.vllm_weights import weight_sync_skip_rule
 
+        # EP-sharded tables whose rows moved to pinned host memory (Qwen3.8's n-gram embedding with
+        # ngram_table_on_host): the parameter is emptied on the GPU, so export the host copy instead.
+        host_rows = {
+            id(module.weight): module._host_weight
+            for module in model.modules()
+            if getattr(module, "_host_weight", None) is not None
+        }
         skipped = weight_sync_skip_rule(model)
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
         for name, tensor in named_weight_sync_tensors(model, include_export_buffers=include_skipped):
@@ -269,7 +276,7 @@ def build_iter_full_hf_weights(model: nn.Module):
                     if 0 not in dist.get_process_group_ranks(ep_group):
                         continue
                     if skipped(tensor):
-                        local = tensor.data.contiguous()
+                        local = host_rows.get(id(tensor), tensor.data).contiguous()
                         world = dist.get_world_size(group=ep_group)
                         full = _gather_to_master(local, world, ep_group, is_master)
                     else:
