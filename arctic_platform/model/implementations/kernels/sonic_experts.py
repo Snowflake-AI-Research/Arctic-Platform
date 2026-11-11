@@ -178,6 +178,10 @@ def sonic_relu2_experts(
     token_ids = torch.arange(tokens, device=hidden_states.device).unsqueeze(1).expand(tokens, topk)[mask].int()
     local_ids = expert_indices[mask].int()
     w1, w2 = experts.w1, experts.w2  # [E, I, H] and [E, H, I], LoRA-merged inside the PEFT wrappers
+    replica_call = getattr(experts, "_arl_replica_call", None)
+    if replica_call is not None:
+        # Spare expert slots (moe/expert_replicas.py) after the native experts, from their owners' current weights.
+        w1, w2 = replica_call.extend(w1, w2)
     num_experts, inter, hidden = w1.shape
     note_feature_dims(num_experts, num_experts + 1, inter, hidden)
     out, _ = moe_general_routing_inputs(

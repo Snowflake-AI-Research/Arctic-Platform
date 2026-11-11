@@ -295,3 +295,56 @@ def test_sonic_relu2_experts_match_the_grouped_path():
     assert rel(sonic_out, grouped) < 1e-2
     for got, want in zip(sonic_grads, grouped_grads):
         assert rel(got, want) < 2e-2
+
+
+class _SpareCopies:
+    """Stands in for the online replicas' _ReplicaCall: spare slots holding copies of the first experts."""
+
+    def __init__(self, spares):
+        self.spares = spares
+
+    def extend(self, *weights):
+        return tuple(torch.cat([w, w[: self.spares]], dim=0) for w in weights)
+
+
+@pytest.mark.parametrize("sonic", [False, True])
+def test_relu2_experts_route_spare_slots_to_their_owners_weights(sonic):
+    """Rows sent to a spare slot see the copied expert's weights, on both expert paths."""
+    if sonic:
+        _require_sonicmoe()
+    elif not torch.cuda.is_available():
+        pytest.skip("grouped GEMM experts run on CUDA")
+    from arctic_platform.model.implementations.moe.layers.moe import NonGatedGroupedExperts
+
+    torch.manual_seed(0)
+    tokens, topk, experts, spares, hidden, inter = 1500, 2, 4, 2, 256, 384
+    module = NonGatedGroupedExperts(hidden, inter, experts, use_grouped_mm=True)
+    module.set_ep_comm_backend("deepep")
+    module = module.cuda().bfloat16()
+    with torch.no_grad():
+        for w in (module.w1, module.w2):
+            w.normal_(std=0.05)
+    idx = torch.randint(0, experts, (tokens, topk), device="cuda")
+    on_spare = torch.where(idx < spares, idx + experts, idx)  # experts 0, 1 served by their spare copies 4, 5
+    scores = torch.rand(tokens, topk, device="cuda")
+    x = torch.randn(tokens, hidden, device="cuda").bfloat16()
+
+    def run(indices, replicas):
+        module._arl_replica_call = replicas
+        try:
+            if sonic:
+                return module(x, None, scores, expert_indices=indices)
+            mask = indices >= 0
+            token_ids = torch.arange(tokens, device="cuda").unsqueeze(1).expand(tokens, topk)[mask]
+            slots, pair_scores = indices[mask], scores[mask]
+            order = torch.argsort(slots, stable=True)
+            counts = torch.bincount(slots, minlength=experts + (spares if replicas else 0))
+            rows = module(x[token_ids[order]], counts)
+            out = torch.zeros(tokens, hidden, device="cuda", dtype=torch.float32)
+            return out.index_add(0, token_ids[order], rows.float() * pair_scores[order, None])
+        finally:
+            module._arl_replica_call = None
+
+    torch.testing.assert_close(
+        run(on_spare, _SpareCopies(spares)).float(), run(idx, None).float(), rtol=2e-2, atol=2e-3
+    )
