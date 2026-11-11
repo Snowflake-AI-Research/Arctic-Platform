@@ -394,6 +394,16 @@ class GroupedExperts(nn.Module):
         self.use_grouped_mm = use_grouped_mm
         self.swiglu_limit = swiglu_limit
         self.ep_comm_backend: EPCommBackend = "deepep"
+        from arctic_platform.model.implementations.kernels.fp8_grouped_w8a8 import w8a8_experts_requested
+
+        # moe.w8a8_experts: the forward GEMMs as block-FP8 W8A8 (kernels/fp8_grouped_w8a8.py).
+        self.w8a8 = w8a8_experts_requested()
+        if self.w8a8 and (self.fp8_block_size != 128 or not use_grouped_mm):
+            raise ValueError(
+                "moe.w8a8_experts runs block-FP8 routed experts (128 x 128 weight blocks, an FP8 checkpoint) through "
+                f"the grouped GEMMs (moe.grouped_mm); these experts have fp8_block_size={self.fp8_block_size}, "
+                f"packed4={packed4}, use_grouped_mm={use_grouped_mm}"
+            )
         if packed4 is not None:
             self._init_packed4(dim, hidden_dim, num_experts, packed4, int4_group_size)
             return
@@ -590,8 +600,11 @@ class GroupedExperts(nn.Module):
         One routed-token count serves every projection; tokens need no per-expert padding and
         activations are not quantized. Routing ``scores`` without down-projection LoRA are folded into
         the down projection, which then keeps no copy of its output for their gradient, and gate and up
-        are decoded side by side for one GEMM each way.
+        are decoded side by side for one GEMM each way. With ``w8a8`` the forward GEMMs run W8A8
+        instead (``_forward_fp8_w8a8``).
         """
+        if self.w8a8:
+            return self._forward_fp8_w8a8(x, num_tokens_per_expert, weights, scales, ab, scores)
         from arctic_platform.model.implementations.fp8 import grouped_expert_lora_rows
         from arctic_platform.model.implementations.fp8 import grouped_fp8_decoded_mm
         from arctic_platform.model.implementations.kernels.fused_swiglu import fused_swiglu
@@ -640,6 +653,51 @@ class GroupedExperts(nn.Module):
         out = project(fused_swiglu(gate, up, self.swiglu_limit), "w2")
         return out if scores is None else apply_routing_weights(out, scores)
 
+    def _forward_fp8_w8a8(
+        self,
+        x: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        scales: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ab: dict,
+        scores: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``_forward_fp8_decoded`` with the forward GEMMs as block-FP8 W8A8 through DeepGEMM.
+
+        One padded layout serves every projection; ``x`` is quantized once for gate and up, which run side by side
+        into one ``[rows, 2 * hidden]`` output with their LoRA deltas added in the gather back. Input gradients are
+        the decoded path's BF16 GEMMs (straight through the activation quantization); the LoRA factors and deltas
+        stay BF16.
+        """
+        from arctic_platform.model.implementations.fp8 import grouped_expert_lora_rows
+        from arctic_platform.model.implementations.fp8 import grouped_fp8_w8a8_mm
+        from arctic_platform.model.implementations.kernels.fp8_grouped_w8a8 import check_w8a8_device
+        from arctic_platform.model.implementations.kernels.fp8_grouped_w8a8 import padded_layout
+        from arctic_platform.model.implementations.kernels.fused_swiglu import packed_swiglu
+        from arctic_platform.model.implementations.kernels.scored_swiglu_down import scored_swiglu_down
+
+        check_w8a8_device(x.device)
+        offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+        _offsets_must_cover_no_more_than_the_rows("fp8 w8a8", x, num_tokens_per_expert, offsets)
+        rows = int(offsets[-1])
+        block_size = cast(int, self.fp8_block_size)
+        (w1, w2, w3), (s1, s2, s3) = weights, scales
+        layout = padded_layout(offsets, rows)
+
+        def lora(inputs: torch.Tensor, name: str) -> torch.Tensor | None:
+            return grouped_expert_lora_rows(inputs, ab[name], offsets, rows) if name in ab else None
+
+        gate_up = grouped_fp8_w8a8_mm(
+            x, (w1, w3), (s1, s3), offsets, rows, block_size, layout, deltas=(lora(x, "w1"), lora(x, "w3"))
+        )
+        if scores is not None and "w2" not in ab:
+            return scored_swiglu_down(
+                gate_up, scores, w2, s2, offsets, rows, block_size, self.swiglu_limit, layout=layout
+            )
+        h = packed_swiglu(gate_up, self.swiglu_limit)
+        out = grouped_fp8_w8a8_mm(h, w2, s2, offsets, rows, block_size, layout, deltas=(lora(h, "w2"),))
+        return out if scores is None else apply_routing_weights(out, scores)
+
     def _forward_deepep(
         self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor, scores: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -685,6 +743,11 @@ class GroupedExperts(nn.Module):
             ab = getattr(self, "_ap_lora_ab", getattr(self, "_dss_lora_ab", {}))
             if self.use_grouped_mm and x.is_cuda and d1 is None and d2 is None and d3 is None:
                 return self._forward_fp8_decoded(x, num_tokens_per_expert, (w1, w2, w3), (s1, s2, s3), ab, scores)
+            if self.w8a8:
+                raise NotImplementedError(
+                    "moe.w8a8_experts runs the grouped block-FP8 experts on CUDA with unfused expert LoRA, not a "
+                    f"fused PEFT delta or {x.device} activations"
+                )
             if self.use_grouped_mm:
                 lora = self._grouped_lora_fn(x, num_tokens_per_expert, ab, (d1, d2, d3))
                 gate = grouped_fp8_mm(x, w1, s1, num_tokens_per_expert, self.fp8_block_size) + lora(x, "w1", d1)
