@@ -114,6 +114,7 @@ class DeepseekV41MoE(MoE):
             )
         with torch.no_grad():
             self.tokens_per_expert.add_(num_tokens_per_expert)
+        selected, num_tokens_per_expert = self._to_expert_slots(selected, num_tokens_per_expert)
 
         # With expert LoRA, self.experts is PEFT's ParamWrapper chain around the experts.
         experts = _unwrap_experts(self.experts)

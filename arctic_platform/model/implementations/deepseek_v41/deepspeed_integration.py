@@ -178,4 +178,25 @@ def load_deepseek_v41_model(
     if sp_size > 1:
         _install_context_parallel(model, sp_group, sp_size)
     install_tokenizer_compressed_map(model, model_name)
+    from arctic_platform.model.implementations.moe.frozen_shard import frozen_dense_sharding_requested
+
+    if frozen_dense_sharding_requested():
+        from arctic_platform.model.implementations.moe.frozen_shard import install_frozen_layer_shards
+        from arctic_platform.model.implementations.moe.logging_utils import get_logger
+        from arctic_platform.model.implementations.moe.vlm import get_language_model
+
+        layers = get_language_model(model).layers
+        install_frozen_layer_shards(layers, root=model)
+        get_logger().info(f"Frozen replicated weights of {len(layers)} decoder layers sharded over all ranks")
+    from arctic_platform.model.implementations.moe.frozen_offload import frozen_expert_offload_requested
+
+    if frozen_expert_offload_requested():
+        from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
+        from arctic_platform.model.implementations.moe.logging_utils import get_logger
+        from arctic_platform.model.implementations.moe.vlm import get_language_model
+
+        offload = install_frozen_expert_offload(get_language_model(model).layers, root=model)
+        get_logger().info(
+            f"Frozen routed-expert codes of {len(offload.layers)} layers offloaded to host memory at the first call"
+        )
     return model
