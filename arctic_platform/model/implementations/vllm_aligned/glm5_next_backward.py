@@ -171,39 +171,50 @@ def ref_causal_conv_silu(x: torch.Tensor, weight: torch.Tensor, cu_seqlens: torc
 
 
 def _kda_steps(q, k, v, g, beta, h, a_amp, g_bias, lower_bound, scale):
-    """One chunk of the gated delta rule (``fused_recurrent_kda``'s per-token math) from state ``h [H, V, K]``."""
+    """One chunk of the gated delta rule (``fused_recurrent_kda``'s per-token math) for a batch of requests from
+    states ``h [B, H, V, K]``: ``q/k/g [B, C, H, K]``, ``v [B, C, H, V]``, ``beta [B, C, H]``."""
     outs = []
-    for t in range(q.shape[0]):
-        qt = q[t] / torch.sqrt((q[t] * q[t]).sum(-1, keepdim=True) + 1e-6) * scale
-        kt = k[t] / torch.sqrt((k[t] * k[t]).sum(-1, keepdim=True) + 1e-6)
-        gate = lower_bound / (1.0 + torch.exp(-(a_amp * (g[t] + g_bias))))
+    for t in range(q.shape[1]):
+        qt = q[:, t] / torch.sqrt((q[:, t] * q[:, t]).sum(-1, keepdim=True) + 1e-6) * scale
+        kt = k[:, t] / torch.sqrt((k[:, t] * k[:, t]).sum(-1, keepdim=True) + 1e-6)
+        gate = lower_bound / (1.0 + torch.exp(-(a_amp * (g[:, t] + g_bias))))
         h = h * torch.exp(gate).unsqueeze(-2)
-        vt = (v[t] - (h * kt.unsqueeze(-2)).sum(-1)) * torch.sigmoid(beta[t]).unsqueeze(-1)
+        vt = (v[:, t] - (h * kt.unsqueeze(-2)).sum(-1)) * torch.sigmoid(beta[:, t]).unsqueeze(-1)
         h = h + vt.unsqueeze(-1) * kt.unsqueeze(-2)
         outs.append((h * qt.unsqueeze(-2)).sum(-1))
-    return torch.stack(outs), h
+    return torch.stack(outs, dim=1), h
 
 
 def ref_kda_core(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, lower_bound: float, chunk: int = 64, **_):
     """The KDA core over packed requests from a zero state: ``q/k/v/g [(1,) T, H, D]``, ``beta [T, H]`` raw logits,
-    ``a_log [H]``, ``dt_bias [H * D]``; returns ``[T, H, D]`` in ``q``'s dtype. Checkpointed every ``chunk`` tokens."""
+    ``a_log [H]``, ``dt_bias [H * D]``; returns ``[T, H, D]`` in ``q``'s dtype. The requests step together, padded
+    to the longest (a padded position's output is dropped, so it gets no gradient); checkpointed every ``chunk``
+    steps."""
     from torch.utils.checkpoint import checkpoint
 
     q, k, v, g = (t.reshape(t.shape[-3:]) for t in (q, k, v, g))
-    heads, dim = q.shape[1:]
+    heads, dim, dtype = *q.shape[1:], q.dtype
     scale = dim**-0.5
     a_amp = torch.exp(a_log.float()).reshape(heads, 1)
     g_bias = dt_bias.float().reshape(heads, dim)
+    starts, lengths = cu_seqlens[:-1].long(), (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+    steps = torch.arange(int(lengths.max()), device=q.device)
+    valid = steps[None, :] < lengths[:, None]
+    index = (starts[:, None] + steps[None, :]).clamp_max(q.shape[0] - 1)
+
+    def padded(t):
+        rows = t[index].float()
+        return rows * valid.reshape(*valid.shape, *[1] * (rows.dim() - 2))
+
+    q, k, v, g, beta = (padded(t) for t in (q, k, v, g, beta))
+    h = q.new_zeros((lengths.numel(), heads, v.shape[-1], dim))
     out = []
-    bounds = cu_seqlens.tolist()
-    for start, stop in zip(bounds[:-1], bounds[1:]):
-        h = q.new_zeros((heads, v.shape[-1], dim), dtype=torch.float32)
-        for c0 in range(start, stop, chunk):
-            c1 = min(c0 + chunk, stop)
-            o, h = checkpoint(_kda_steps, q[c0:c1].float(), k[c0:c1].float(), v[c0:c1].float(), g[c0:c1].float(),
-                              beta[c0:c1].float(), h, a_amp, g_bias, lower_bound, scale, use_reentrant=False)  # fmt: skip
-            out.append(o)
-    return torch.cat(out).to(q.dtype)
+    for c0 in range(0, steps.numel(), chunk):
+        c1 = c0 + chunk
+        o, h = checkpoint(_kda_steps, q[:, c0:c1], k[:, c0:c1], v[:, c0:c1], g[:, c0:c1], beta[:, c0:c1], h,
+                          a_amp, g_bias, lower_bound, scale, use_reentrant=False)  # fmt: skip
+        out.append(o)
+    return torch.cat(out, dim=1)[valid].to(dtype)
 
 
 def _sparse_mla_chunk(q_rope, q_v, k_all, v_all, idx, mask, softmax_scale):
