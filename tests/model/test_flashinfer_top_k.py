@@ -175,3 +175,28 @@ def test_the_prepared_module_selects_the_largest_scores():
     want = torch.topk(scores, 2048, dim=-1).indices
     assert torch.equal(got[1:].sort(-1).values, want[1:].sort(-1).values)
     assert torch.equal(got[0].sort().values, torch.arange(2048, device="cuda"))
+
+
+def _prepares_before_loading(monkeypatch, loader, **kwargs) -> list:
+    """The order of ``loader``'s calls of prepare_flashinfer_top_k and of the shared MoE load (stopped there)."""
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
+
+    order = []
+    monkeypatch.setattr(flashinfer_top_k, "prepare_flashinfer_top_k", lambda: order.append("prepare"))
+
+    def load(*args, **kwargs):
+        order.append("load")
+        raise _Stop
+
+    monkeypatch.setattr(qwen_ds, "_load_moe_model", load)
+    with pytest.raises(_Stop):
+        loader(model_name="m", optimization_dtype="bfloat16", ep_size=1, **kwargs)
+    return order
+
+
+def test_the_qwen38_loader_prepares_the_module_before_it_loads(monkeypatch):
+    from arctic_platform.model.implementations.qwen38.deepspeed_integration import load_qwen4_exp_model
+
+    options = types.SimpleNamespace(ngram_table_on_host=None)
+    order = _prepares_before_loading(monkeypatch, load_qwen4_exp_model, attn_implementation="sdpa", options=options)
+    assert order == ["prepare", "load"]

@@ -123,6 +123,11 @@ def load_qwen4_exp_model(
 ) -> nn.Module:
     """Load Qwen3.8-Flash-Next. Weight sync stays on the Hugging Face iterator."""
     _validate_parallelism(sp_size, sp_group)
+    from arctic_platform.model.implementations.kernels.flashinfer_top_k import prepare_flashinfer_top_k
+
+    # Every rank, before the checkpoint load: a node whose FlashInfer cache lacks the indexer's top-k builds it now
+    # (~10 minutes) while the others wait on the CPU, not in a step's collective.
+    prepare_flashinfer_top_k()
     from .host_table import configure as configure_host_table
 
     # Read by the n-gram embedding's first forward, after the checkpoint load.
