@@ -198,9 +198,12 @@ class Patches(BaseModel):
             " rotary embedding as one fused kernel per tensor each way."
         ),
     )
-    gradient_checkpointing: StrictBool | PositiveInt = Field(
+    gradient_checkpointing: StrictBool | PositiveInt | list[NonNegativeInt] = Field(
         False,
-        description="False disables; True checkpoints every layer; an integer checkpoints every Nth layer.",
+        description=(
+            "False disables; True checkpoints every layer; an integer checkpoints every Nth layer; a list of layer"
+            " indices checkpoints exactly those layers."
+        ),
     )
     checkpoint_keep_attention: StrictBool | list[str] = Field(
         False,
@@ -242,6 +245,10 @@ class Patches(BaseModel):
 
     @model_validator(mode="after")
     def _validate_patch_combinations(self) -> Self:
+        if isinstance(self.gradient_checkpointing, list) and len(set(self.gradient_checkpointing)) != len(
+            self.gradient_checkpointing
+        ):
+            raise ValueError(f"gradient_checkpointing lists a layer twice: {self.gradient_checkpointing}")
         if self.activation_offload is not None:
             if self.gradient_checkpointing is False:
                 raise ValueError("activation_offload requires gradient_checkpointing")

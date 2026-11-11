@@ -106,7 +106,7 @@ def _cases():
             yield pytest.param("cuda", torch.bfloat16, "flash_attention_3", id="cuda-fa3")
 
 
-@pytest.mark.parametrize("frequency", [True, 2], ids=["every-layer", "every-2nd-layer"])
+@pytest.mark.parametrize("frequency", [True, 2, [1]], ids=["every-layer", "every-2nd-layer", "layer-list"])
 @pytest.mark.parametrize("device,dtype,attn_implementation", list(_cases()))
 def test_keep_attention_matches_whole_layer_recompute(device, dtype, attn_implementation, frequency):
     base = _model(device, dtype, attn_implementation)
@@ -123,7 +123,10 @@ def test_keep_attention_matches_whole_layer_recompute(device, dtype, attn_implem
     plain_loss, plain_grads, plain_calls = _train_step(plain, input_ids)
     kept_loss, kept_grads, kept_calls = _train_step(kept, input_ids)
 
-    checkpointed = LAYERS if frequency is True else (LAYERS + frequency - 1) // frequency
+    if isinstance(frequency, list):
+        checkpointed = len(frequency)
+    else:
+        checkpointed = LAYERS if frequency is True else (LAYERS + frequency - 1) // frequency
     assert reference_calls == LAYERS
     assert plain_calls == LAYERS + checkpointed
     assert kept_calls == LAYERS
@@ -146,6 +149,19 @@ def test_keep_attention_requires_gradient_checkpointing():
     with pytest.raises(ValueError, match="checkpoint_keep_attention requires gradient_checkpointing"):
         Patches(checkpoint_keep_attention=True)
     assert Patches(gradient_checkpointing=True, checkpoint_keep_attention=True).checkpoint_keep_attention
+
+
+def test_layer_list_checkpoints_exactly_those_layers():
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+    model = _model("cpu", torch.float32, "sdpa")
+    apply_gradient_checkpointing(model, _ctx([1]))
+    wrapped = [isinstance(layer, CheckpointWrapper) for layer in model.model.layers]
+    assert wrapped == [False, True]
+    with pytest.raises(ValueError, match=r"lists layers \[5\], but the model has 2"):
+        apply_gradient_checkpointing(_model("cpu", torch.float32, "sdpa"), _ctx([0, 5]))
+    with pytest.raises(ValueError, match="lists a layer twice"):
+        Patches(gradient_checkpointing=[1, 1])
 
 
 _CUSTOM_KERNEL_CALLS = []
