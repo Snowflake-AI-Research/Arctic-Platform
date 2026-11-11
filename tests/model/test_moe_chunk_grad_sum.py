@@ -18,6 +18,7 @@ import dataclasses
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from arctic_platform.model.implementations.moe.distributed import expert_parallel
 from arctic_platform.model.implementations.moe.distributed.token_permute import permute_tokens
@@ -60,11 +61,12 @@ class _OneRankDispatch:
         pass
 
 
-@pytest.mark.parametrize("selective_ac", [False, True])
-def test_expert_gradients_sum_over_dispatch_chunks_in_fp32(monkeypatch, selective_ac):
+@pytest.mark.parametrize("recompute", ["none", "selective", "full"])
+def test_expert_gradients_sum_over_dispatch_chunks_in_fp32(monkeypatch, recompute):
     """Eight chunks of the same tokens, the last weighted 1 and the others 2**-10 in the output gradient. Summed in
-    fp32 (one dispatch over all tokens, or the chunk sum), each expert-weight gradient grows by about 7 * 2**-10; a
-    bf16 running sum meets the last chunk first in backward and drops the rest."""
+    fp32 (one dispatch over all tokens, or the chunk sum), each expert-weight gradient grows by about 7 * 2**-10, and
+    the chunked gradient equals the single dispatch's to bf16 rounding; a bf16 running sum meets the last chunk first
+    in backward and drops the rest. Holds under selective (routed experts) and full-layer recompute."""
     histc = torch.histc
     monkeypatch.setattr(torch, "histc", lambda values, *args, **kwargs: histc(values.float(), *args, **kwargs))
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
@@ -79,21 +81,24 @@ def test_expert_gradients_sum_over_dispatch_chunks_in_fp32(monkeypatch, selectiv
         for parameter in layer.parameters():
             parameter.normal_(std=0.5)
     layer.set_ep_comm_backend("deepep")
-    if selective_ac:  # the routed-experts target recomputes each chunk's expert matmuls in backward
+    if recompute == "selective":
         checkpoint_method(layer, "_run_local_routed_experts")
+    forward = (lambda x: checkpoint(layer, x, use_reentrant=False)) if recompute == "full" else layer
     tokens = torch.randn(1, TOKENS, 256).to(torch.bfloat16).repeat(1, CHUNKS, 1)
     last_chunk = (torch.arange(CHUNKS * TOKENS) >= (CHUNKS - 1) * TOKENS)[None, :, None]
 
-    def growth(chunk_size: int | None) -> torch.Tensor:
+    def expert_grads(chunk_size: int | None, small: float) -> list[torch.Tensor]:
         layer.set_deepep_token_chunk_size(chunk_size)
-        grads = []
-        for small in (0.0, SMALL):
-            layer.zero_grad(set_to_none=True)
-            output = layer(tokens)
-            output.backward(torch.where(last_chunk, 1.0, small).expand_as(output).to(output.dtype).contiguous())
-            grads.append(torch.stack([getattr(layer.experts, n).grad.float().norm() for n in ("w1", "w2", "w3")]))
-        return grads[1] / grads[0] - 1
+        layer.zero_grad(set_to_none=True)
+        output = forward(tokens)
+        output.backward(torch.where(last_chunk, 1.0, small).expand_as(output).to(output.dtype).contiguous())
+        return [getattr(layer.experts, name).grad for name in ("w1", "w2", "w3")]
 
-    whole, chunked = growth(None), growth(TOKENS)
-    assert (whole > 0.5 * (CHUNKS - 1) * SMALL).all(), whole
-    torch.testing.assert_close(chunked, whole, rtol=0.1, atol=0)
+    for whole, chunked in zip(expert_grads(None, SMALL), expert_grads(TOKENS, SMALL)):
+        torch.testing.assert_close(chunked, whole)
+    growth = {}
+    for chunk_size in (None, TOKENS):
+        big, both = (torch.stack([g.float().norm() for g in expert_grads(chunk_size, s)]) for s in (0.0, SMALL))
+        growth[chunk_size] = both / big - 1
+    assert (growth[None] > 0.5 * (CHUNKS - 1) * SMALL).all(), growth
+    torch.testing.assert_close(growth[TOKENS], growth[None], rtol=0.1, atol=0)
