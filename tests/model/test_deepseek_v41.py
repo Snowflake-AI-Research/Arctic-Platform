@@ -76,6 +76,20 @@ def test_defaults_match_v41_flash():
     assert not hasattr(config, "num_hash_layers")
 
 
+def test_fp8_checkpoint_marks_engram_quantized_at_any_depth():
+    from arctic_platform.model.implementations.deepseek_v41 import DeepseekV41Config
+
+    fp8 = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
+    # A layer-sliced FP8 checkpoint is not Flash-shaped, but its Engram table is still FP8 with block scales.
+    assert DeepseekV41Config(num_hidden_layers=6, num_nextn_predict_layers=0, quantization_config=fp8).engram_quantized
+    assert not DeepseekV41Config(num_hidden_layers=6, num_nextn_predict_layers=0).engram_quantized
+    assert DeepseekV41Config().engram_quantized
+    explicit = DeepseekV41Config(
+        num_hidden_layers=6, num_nextn_predict_layers=0, quantization_config=fp8, engram_quantized=False
+    )
+    assert not explicit.engram_quantized
+
+
 def test_nested_text_config_flattens_and_keeps_outer_type():
     from arctic_platform.model.implementations.deepseek_v41 import DeepseekV41Config
 
