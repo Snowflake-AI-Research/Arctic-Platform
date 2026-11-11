@@ -18,6 +18,10 @@
 V4 collapses a sublayer with the ``pre`` that sublayer just computed. V4.1 applies ``post`` and
 ``comb`` immediately and hands ``pre`` to the next sublayer. The stack starts from a one-hot
 ``pre`` on stream 0, and the last FFN ``pre`` is the collapse in front of the final norm.
+
+On CUDA the four-stream logits, gates, collapse and write-back run through GLM-5.3-Flash's fused mHC kernels,
+which compute the same functions (unweighted RMS, sigmoid gates, the same Sinkhorn steps) and read the streams
+once per direction instead of making FP32 copies of them.
 """
 
 import torch
@@ -26,6 +30,14 @@ from torch import nn
 
 from arctic_platform.model.implementations.deepseek_v4.hyperconnections import DeepseekV4UnweightedRMSNorm
 from arctic_platform.model.implementations.deepseek_v41.configuration_deepseek_v41 import DeepseekV41Config
+from arctic_platform.model.implementations.glm53.hyper_connections import collapse_streams
+from arctic_platform.model.implementations.glm53.hyper_connections import hyper_connection_gates
+from arctic_platform.model.implementations.glm53.hyper_connections import mix_streams
+
+
+def _fused(mhc_states: torch.Tensor) -> bool:
+    """The fused kernels take CUDA tensors and are written for four streams."""
+    return mhc_states.is_cuda and mhc_states.shape[-2] == 4
 
 
 def sinkhorn(logits: torch.Tensor, num_iterations: int, eps: float) -> torch.Tensor:
@@ -53,6 +65,8 @@ def identity_pre(mhc_states: torch.Tensor) -> torch.Tensor:
 
 def collapse(mhc_states: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
     """Weighted sum of the residual streams. ``pre`` is ``(batch, seq, hc_mult)``."""
+    if _fused(mhc_states):
+        return collapse_streams(mhc_states, pre)
     collapsed = (pre.unsqueeze(-1) * mhc_states.float()).sum(dim=2)
     return collapsed.to(dtype=mhc_states.dtype)
 
@@ -64,6 +78,8 @@ def write_back(
 
     ``comb`` is summed over its source axis, the same contraction as ``comb^T @ residual``.
     """
+    if _fused(residual):
+        return mix_streams(post, comb, sublayer_out, residual)
     mixed = torch.einsum("bsij,bsid->bsjd", comb.float(), residual.float())
     written = post.unsqueeze(-1) * sublayer_out.unsqueeze(-2).float() + mixed
     return written.to(dtype=sublayer_out.dtype)
@@ -88,6 +104,8 @@ class DeepseekV41HyperConnection(nn.Module):
         self.scale = nn.Parameter(torch.empty(3))
 
     def mixes(self, mhc_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _fused(mhc_states):
+            return hyper_connection_gates(self, mhc_states)
         hc = self.hc_mult
         flat_states = mhc_states.flatten(start_dim=2)
         # Quack's RMSNorm is selected whenever a GPU is present, and it rejects CPU tensors.
