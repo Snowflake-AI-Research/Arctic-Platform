@@ -158,11 +158,15 @@ def _get_sequence_chunked_logprob_fn():
 
     from arctic_platform.model.implementations.gpu.grouped_lm_head import GroupedLogProbAccumulator
 
-    def online_logsumexp_update(m, s, chunk_logits, target_rows, target_columns):
+    def online_logsumexp_update(m, s, chunk_logits, in_tile, target_columns):
         """Streaming logsumexp over every logit but each row's target: combine
         the running ``(max, sum_exp)`` state ``(m, s)`` with a new ``[N, k]``
         chunk's logits, returning the updated state. Standard max-shift trick
         keeps every exp() in [0, 1].
+
+        ``in_tile`` marks rows whose label falls in this vocab tile.
+        ``target_columns`` is each row's ``[N, 1]`` column, clamped so a row
+        outside the tile stays in bounds and is written back unchanged.
         """
         chunk_m = torch.amax(chunk_logits, dim=-1)
         m_new = torch.maximum(m, chunk_m)
@@ -171,7 +175,13 @@ def _get_sequence_chunked_logprob_fn():
         shifted = torch.where(finite_chunk, chunk_logits - m_new.unsqueeze(-1), torch.zeros_like(chunk_logits))
         chunk_exp = torch.where(finite_chunk, torch.exp(shifted), torch.zeros_like(chunk_logits))
         # A near-certain target's exp(0) = 1 would absorb the rest of the sum in fp32.
-        chunk_exp[target_rows, target_columns] = 0.0
+        # Clear it with a scatter so a tile does not sync on nonzero().
+        gathered = chunk_exp.gather(1, target_columns)
+        chunk_exp.scatter_(
+            1,
+            target_columns,
+            torch.where(in_tile.unsqueeze(-1), torch.zeros_like(gathered), gathered),
+        )
         return m_new, s * exp_old + chunk_exp.sum(dim=-1)
 
     def softcap_logits(logits, softcap):
@@ -180,6 +190,15 @@ def _get_sequence_chunked_logprob_fn():
             return logits, None
         squashed = torch.tanh(logits / softcap)
         return squashed * softcap, squashed
+
+    def _labels_in_tile(labels, vocab_start, vocab_end):
+        """Which rows' labels fall in ``[vocab_start, vocab_end)``, and each row's ``[N, 1]`` column in that tile.
+
+        Rows outside the tile get a clamped column so a gather or scatter stays in bounds; callers mask them.
+        """
+        local = labels - vocab_start
+        in_tile = (local >= 0) & (local < vocab_end - vocab_start)
+        return in_tile, local.clamp(0, vocab_end - vocab_start - 1).to(torch.long).unsqueeze(-1)
 
     class SequenceChunkedLogProbFn(torch.autograd.Function):
         """Compute ``log_softmax(softcap(hidden @ weight.T) / temperature)[label]``
@@ -275,11 +294,10 @@ def _get_sequence_chunked_logprob_fn():
                         vocab_end=vocab_end,
                     )
 
-                    # Pick out logits at target labels that fall in this vocab tile.
-                    rows = ((labels_chunk >= vocab_start) & (labels_chunk < vocab_end)).nonzero().squeeze(-1)
-                    idx = (labels_chunk[rows] - vocab_start).to(torch.long)
-                    target_logits[rows] = scaled_logits[rows, idx]
-                    m, s = online_logsumexp_update(m, s, scaled_logits, rows, idx)
+                    # Pick out logits at target labels that fall in this vocab tile, without a host sync.
+                    in_tile, idx = _labels_in_tile(labels_chunk, vocab_start, vocab_end)
+                    target_logits = torch.where(in_tile, scaled_logits.gather(1, idx).squeeze(-1), target_logits)
+                    m, s = online_logsumexp_update(m, s, scaled_logits, in_tile, idx)
                     if grouped is not None:
                         grouped.accumulate_forward_tile(scaled_logits, start, vocab_start)
 
@@ -327,11 +345,14 @@ def _get_sequence_chunked_logprob_fn():
             n_tokens = hidden.shape[0]
             vocab_size = weight.shape[0]
 
+            # A frozen LM head (LoRA elsewhere) needs no [vocab, hidden] weight gradient and no GEMM per tile.
             # Sum the tiles in fp32 even when the projection runs in bf16: a bf16 running sum rounds once per
             # tile. We cast back to input dtypes once on return.
-            grad_hidden = torch.zeros_like(hidden, dtype=torch.float32)
-            grad_weight = torch.zeros_like(weight, dtype=torch.float32)
-            grad_bias = torch.zeros_like(bias, dtype=torch.float32) if bias is not None else None
+            need_hidden, need_weight = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
+            need_bias = bias is not None and ctx.needs_input_grad[4]
+            grad_hidden = torch.zeros_like(hidden, dtype=torch.float32) if need_hidden else None
+            grad_weight = torch.zeros_like(weight, dtype=torch.float32) if need_weight else None
+            grad_bias = torch.zeros_like(bias, dtype=torch.float32) if need_bias else None
 
             for start in range(0, n_tokens, token_chunk_size):
                 end = min(start + token_chunk_size, n_tokens)
@@ -374,15 +395,15 @@ def _get_sequence_chunked_logprob_fn():
 
                     # d log_softmax(z)[t] / d z = onehot(t) - softmax(z).
                     grad_logits = (-normalizer_gradients).unsqueeze(-1) * probs
-                    rows = ((labels_chunk >= vocab_start) & (labels_chunk < vocab_end)).nonzero().squeeze(-1)
-                    idx = (labels_chunk[rows] - vocab_start).to(torch.long)
                     # At the target, 1 - softmax = sigmoid(logsumexp_{j != t} - z[t]), which stays nonzero
-                    # where 1 - exp(z[t] - logz) rounds to 0.
-                    target_complement = torch.sigmoid(others_minus_target[start:end][rows])
-                    grad_logits[rows, idx] = (
-                        grad_chunk[rows] * target_complement
-                        - (normalizer_gradients - grad_chunk)[rows] * probs[rows, idx]
-                    )
+                    # where 1 - exp(z[t] - logz) rounds to 0. The mask writes that entry without a host sync;
+                    # rows whose label is outside this tile write their clamped column back unchanged.
+                    in_tile, idx = _labels_in_tile(labels_chunk, vocab_start, vocab_end)
+                    target_probs = probs.gather(1, idx).squeeze(-1)
+                    target_complement = torch.sigmoid(others_minus_target[start:end])
+                    target_grad = grad_chunk * target_complement - (normalizer_gradients - grad_chunk) * target_probs
+                    current = grad_logits.gather(1, idx).squeeze(-1)
+                    grad_logits.scatter_(1, idx, torch.where(in_tile, target_grad, current).unsqueeze(-1))
                     if grouped is not None:
                         grouped.add_group_gradients_to_tile(
                             grad_logits,
@@ -396,17 +417,20 @@ def _get_sequence_chunked_logprob_fn():
                         grad_logits = grad_logits * (1 - squashed * squashed)
 
                     grad_logits_proj = grad_logits.to(w_proj.dtype)
-                    grad_hidden[start:end].add_(grad_logits_proj @ w_proj)
-                    grad_weight[vocab_start:vocab_end].add_(grad_logits_proj.t() @ h_proj)
-                    if grad_bias is not None:
+                    if need_hidden:
+                        grad_hidden[start:end].add_(grad_logits_proj @ w_proj)
+                    if need_weight:
+                        grad_weight[vocab_start:vocab_end].add_(grad_logits_proj.t() @ h_proj)
+                    if need_bias:
                         grad_bias[vocab_start:vocab_end].add_(grad_logits.sum(dim=0))
 
             return (
-                grad_hidden.to(hidden.dtype),
-                grad_weight.to(weight.dtype),
+                grad_hidden.to(hidden.dtype) if need_hidden else None,
+                grad_weight.to(weight.dtype) if need_weight else None,
                 None,
                 None,
-                grad_bias.to(bias.dtype) if grad_bias is not None else None,
+                grad_bias.to(bias.dtype) if need_bias else None,
+                None,
                 None,
                 None,
                 None,
