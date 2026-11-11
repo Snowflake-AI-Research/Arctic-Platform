@@ -43,6 +43,8 @@ from arctic_platform.model.implementations.moe.config_validation import validate
 from arctic_platform.model.implementations.moe.conversion_cache import conversion_cache_is_node_local
 from arctic_platform.model.implementations.moe.conversion_cache import conversion_cache_ready
 from arctic_platform.model.implementations.moe.conversion_cache import resolve_conversion_cache_path
+from arctic_platform.model.implementations.moe.dense_shard import full_state_dict
+from arctic_platform.model.implementations.moe.dense_shard import is_dense_shard
 from arctic_platform.model.implementations.moe.layers.moe import ROUTER_REPLAY_FRESH
 from arctic_platform.model.implementations.moe.vlm import get_language_model
 from arctic_platform.model.implementations.moe.vlm import get_vision_encoder
@@ -106,6 +108,7 @@ __all__ = [
     "ds_worker_moe_model_spec",
     "effective_fused_cross_entropy",
     "freeze_fp8_weights_and_scales",
+    "full_state_dict",
     "gather_peft_adapter_state_dict",
     "get_language_model",
     "hf_text_model_type",
@@ -114,6 +117,7 @@ __all__ = [
     "hf_export_parameter_name",
     "hf_sync_name_map",
     "iter_lora_weights",
+    "is_dense_shard",
     "is_glm_moe_model",
     "iter_model_weights",
     "keeps_fp32",

@@ -332,3 +332,8 @@ def test_a_model_with_sharded_weights_and_offloaded_experts_exports_and_saves_th
     results = mp.Manager().dict()
     mp.spawn(_composite_worker, args=(world, f"file://{tmp_path}/rendezvous", results), nprocs=world, join=True)
     assert dict(results) == {0: True, 1: True}
+
+
+def test_a_sharded_model_without_an_export_contract_exports_the_unsharded_models_weights_cpu(tmp_path):
+    """The generic export of a model without a family contract materializes the held parameters too."""
+    _spawn_export("cpu", False, tmp_path)
