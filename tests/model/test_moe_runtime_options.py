@@ -59,3 +59,12 @@ def test_loader_options_carry_the_runtime_fields(options_cls):
     apply_moe_runtime_options(options)
     assert _switches(switches) == {field: spec[2] for field, spec in switches.items()}
     assert os.environ["ULTRA_EP_IPC_SYMM"] == "1"
+
+
+def test_the_placement_option_sets_the_placement():
+    placement = _module("moe.expert_placement")
+    configured = {"ep_size": 2, "layers": {"3": [1, 0]}}
+    apply_moe_runtime_options(GlmMoeDsaOptions(expert_placement=configured))
+    assert placement.placement_value() == configured
+    apply_moe_runtime_options(GlmMoeDsaOptions())
+    assert placement.placement_value() is None

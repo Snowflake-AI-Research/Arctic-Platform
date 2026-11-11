@@ -30,8 +30,8 @@ expert``, so that every node and rank receives about the same routed load. Only 
 - every export of EP-sharded expert tensors gathers them back into logical order (``cat_expert_shards``,
   ``expert_export_rows``). Resumable checkpoints keep slot order and resume only under the same placement.
 
-The placement is the job's ``loader_options.expert_placement`` or, when that is unset, ``ARL_EXPERT_PLACEMENT``: a
-JSON file path, the JSON itself, or (loader options only) the parsed object: ``{"ep_size": ep, "gpus_per_node": g
+The placement is the job's ``loader_options.expert_placement``: a JSON file path, the JSON itself, or the parsed
+object: ``{"ep_size": ep, "gpus_per_node": g
 (optional), "layers": {"<decoder layer index>": perm, ...}}``, fitted offline from router histograms (DSS
 ``debug.router_tokens_per_expert``). Layers the file omits keep the contiguous placement; a listed layer that is not a
 ``MoE`` layer of the model is an error. With ``gpus_per_node`` the loader checks that EP rank ``r`` sits on node
@@ -41,7 +41,6 @@ JSON file path, the JSON itself, or (loader options only) the parsed object: ``{
 from __future__ import annotations
 
 import json
-import os
 import re
 import socket
 import zlib
@@ -51,28 +50,24 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-PLACEMENT_ENV = "ARL_EXPERT_PLACEMENT"
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 # Set on every placed expert tensor (and expert LoRA factor): logical expert id -> slot, on the CPU, for the exports.
 _SLOT_ATTR = "_arl_expert_slot"
 
 
-# The job's ``loader_options.expert_placement`` (``runtime_options.apply_moe_runtime_options``); None leaves
-# ``ARL_EXPERT_PLACEMENT`` in charge.
+# The job's ``loader_options.expert_placement`` (``runtime_options.apply_moe_runtime_options``); None: contiguous.
 _configured: str | dict | None = None
 
 
 def configure_from_options(value: str | dict | None) -> None:
-    """Set this process's placement from the job's loader options; None keeps ``ARL_EXPERT_PLACEMENT``."""
+    """Set this process's placement from the job's loader options; None keeps the contiguous placement."""
     global _configured
     _configured = value
 
 
 def placement_value() -> str | dict | None:
-    """The placement this process applies: the configured one, else ``ARL_EXPERT_PLACEMENT``, else None."""
-    if _configured is not None:
-        return _configured
-    return os.environ.get(PLACEMENT_ENV) or None
+    """The placement this process applies: the configured one, else None."""
+    return _configured
 
 
 def read_placement(value: str | dict) -> dict:
