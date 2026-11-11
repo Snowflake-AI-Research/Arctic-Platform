@@ -148,6 +148,11 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
         if model.loss_function is ForCausalLMLoss:
             model.loss_function = chunked_causal_lm_loss
     apply_loader_numerics(model, options, sequence_parallel=parallelism.sequence_parallel > 1)
+    if ctx.spec.yarn_factors:
+        from arctic_platform.model.yarn_factors import install_yarn_factors
+
+        # After the numerics patch, which replaces the text backbone forward that this wraps.
+        install_yarn_factors(model, ctx.spec.yarn_factors)
     if parallelism.sequence_parallel > 1:
         from arctic_platform.model.implementations.gpu.sp.transformers import (
             configure_transformers_sequence_parallel_model,
