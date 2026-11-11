@@ -20,6 +20,7 @@ from arctic_platform.model.implementations.debug.determinism import resolve_flas
 from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
 from arctic_platform.model.implementations.fp8 import make_linear
 from arctic_platform.model.implementations.gpu.action_masks import slice_action_masks_for_logits_to_keep
+from arctic_platform.model.implementations.gpu.core_replay import kept
 from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
 from arctic_platform.model.implementations.gpu.lm_head import slice_temperature_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import head_parallel_gated_delta_net
@@ -271,6 +272,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         # Select best available kernel
         self._causal_conv1d_fn = causal_conv1d_fn
         self._chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
+        # The chunk rule is this layer's core kernel for ac_config.core_replay (gpu/core_replay.py).
+        self._arl_keeps_core = True
 
     def forward(
         self,
@@ -292,13 +295,14 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
+        chunk_gated_delta_rule = kept(getattr(self, "_arl_core_replay", None), self._chunk_gated_delta_rule)
         if getattr(self, "cp_group", None) is not None:
             global_cu_seqlens = getattr(self, "_dss_sp_global_cu_seqlens", None)
             if not torch.is_tensor(global_cu_seqlens):
                 raise RuntimeError("head-parallel GatedDeltaNet requires global packed cu_seqlens")
             core_attn_out, _ = head_parallel_gated_delta_net(
                 self._causal_conv1d_fn,
-                self._chunk_gated_delta_rule,
+                chunk_gated_delta_rule,
                 query,
                 key,
                 value,
@@ -357,7 +361,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             query, key = repeat_query_key_for_value_heads(
                 query, key, self.num_k_heads, self.num_v_heads, self._chunk_gated_delta_rule
             )
-            core_attn_out, _ = self._chunk_gated_delta_rule(
+            core_attn_out, _ = chunk_gated_delta_rule(
                 query,
                 key,
                 value,
