@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import contextlib
 import logging
 import os
 import random
@@ -10,6 +11,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -35,6 +37,7 @@ from arctic_platform.inference.vllm.spec_decode_grammar import (
 from arctic_platform.inference.vllm.startup_error import (
     ENV_VAR as _STARTUP_ERROR_DIR_ENV,
     earliest_startup_error,
+    recorded_pids,
 )
 from arctic_platform.inference.vllm.xgrammar_stop_mask import (
     ensure_xgrammar_stop_mask_fix,
@@ -342,6 +345,155 @@ def _engine_startup_error(exc: BaseException, directory: str | None) -> RuntimeE
         logger.info("Engine startup root cause not appended: no engine process recorded a failure in %s", directory)
         return None
     return RuntimeError(f"{exc}\n{root_cause}")
+
+
+# vLLM's title for its engine processes (setproctitle), e.g. "VLLM::EngineCore".
+_VLLM_PROCESS_TITLE = "VLLM::"
+# How long past one poll interval the watchdog may take to stop.
+_WATCHDOG_JOIN_SLACK_S = 5.0
+
+
+def _process_title(proc: Any) -> str:
+    """A process's title as setproctitle leaves it in ``/proc/<pid>/comm`` (15 chars).
+
+    Read directly: psutil's ``name()`` falls back to ``cmdline()`` for a
+    15-char comm, and reading ``/proc/<pid>/cmdline`` can block on a process
+    stuck in uninterruptible sleep, which is what a wedged engine process can be.
+    """
+    if not os.path.isdir("/proc"):
+        return proc.name()  # no procfs (macOS): nothing here can block that way
+    with open(f"/proc/{proc.pid}/comm", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def _is_zombie(proc: Any) -> bool:
+    """Whether ``proc`` has exited and awaits reaping, from ``/proc/<pid>/stat``."""
+    if not os.path.isdir("/proc"):
+        import psutil
+
+        return proc.status() == psutil.STATUS_ZOMBIE
+    with open(f"/proc/{proc.pid}/stat", "rb") as f:
+        return f.read().rsplit(b")", 1)[1].split()[0] == b"Z"
+
+
+def _kill_failed_engine_processes(failed_pids: set[int], stop: threading.Event | None = None) -> list[int]:
+    """SIGKILL this process's engine processes after one recorded a startup failure.
+
+    Kills every descendant under vLLM's process title (the EngineCore the front
+    end waits on and its TP workers, which can be wedged on the GPU too) and every
+    descendant that recorded a failure. The tree is listed before anything is
+    signalled, so a TP worker cannot be reparented out of reach first, and only
+    descendants are considered, so a recorded pid that was reused is left alone.
+    Stops as soon as ``stop`` is set: a watchdog that outlived its startup
+    attempt must not kill a later attempt's processes. Returns the pids signalled.
+    """
+    import psutil
+
+    if stop is not None and stop.is_set():
+        return []
+
+    try:
+        descendants = psutil.Process().children(recursive=True)
+    except psutil.Error:
+        logger.warning("Could not list this worker's engine processes", exc_info=True)
+        return []
+    targets = []
+    for proc in descendants:
+        try:
+            # A zombie holds nothing and cannot be killed; it is a descendant
+            # only when this process is a subreaper (e.g. PID 1 in a container).
+            if _is_zombie(proc):
+                continue
+            if proc.pid in failed_pids or _process_title(proc).startswith(_VLLM_PROCESS_TITLE):
+                targets.append(proc)
+        except (OSError, psutil.Error):
+            continue
+    killed = []
+    for proc in targets:
+        if stop is not None and stop.is_set():
+            break
+        try:
+            proc.kill()
+            killed.append(proc.pid)
+        except psutil.Error:
+            continue
+    return killed
+
+
+class _FailedStartupWatchdog:
+    """Fail an engine startup that recorded its failure but never raised.
+
+    vLLM's front end waits for the EngineCore's READY or for its process to
+    exit. An EngineCore that fails in warmup logs ``EngineCore failed to
+    start.``, which the startup error handler records, and normally exits. On a
+    CUDA illegal memory access it can instead hang on the way out, and then
+    ``AsyncLLM.from_vllm_config`` blocks this actor forever. A watchdog thread,
+    because that call also blocks the actor's event loop, sees the record and,
+    once vLLM has had ``grace_s`` to raise on its own, kills the engine
+    processes so the front end's wait ends and startup raises. A startup with
+    no record is never touched, however slow, so a long warmup is safe.
+
+    Only the local multiprocessing engine is covered: the EngineCore and its
+    TP workers are this actor's descendants. Engine processes this actor does
+    not parent (Ray data-parallel engine actors, whose wait has no process
+    sentinels, and TP ranks on other nodes under Ray's executor) are left to
+    the caller's own bound on initialize, which dss-platform sets.
+    """
+
+    def __init__(self, directory: str, grace_s: float, poll_s: float = 1.0) -> None:
+        self._directory = directory
+        self._grace_s = grace_s
+        self._poll_s = poll_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="ArcticEngineStartupWatchdog", daemon=True)
+        self.killed: list[int] = []
+
+    def __enter__(self) -> _FailedStartupWatchdog:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self._stop.set()
+        # Bounded: a watchdog stuck reading a wedged process must not keep
+        # startup from returning or raising once vLLM has done so.
+        self._thread.join(timeout=self._poll_s + _WATCHDOG_JOIN_SLACK_S)
+        if self._thread.is_alive():
+            logger.warning("Engine startup watchdog did not stop; leaving it behind as a daemon thread")
+
+    def _run(self) -> None:
+        try:
+            self._watch()
+        except Exception:
+            logger.warning("Engine startup watchdog stopped", exc_info=True)
+
+    def _watch(self) -> None:
+        kill_at = None
+        while not self._stop.wait(self._poll_s):
+            failed = recorded_pids(self._directory)
+            if len(failed) == 0:
+                continue
+            if kill_at is None:
+                kill_at = time.monotonic() + self._grace_s
+                logger.warning(
+                    "vLLM engine process(es) %s recorded a startup failure; "
+                    "killing the engine in %.1fs unless vLLM raises first",
+                    sorted(failed),
+                    self._grace_s,
+                )
+            if time.monotonic() < kill_at:
+                continue
+            killed = _kill_failed_engine_processes(failed, self._stop)
+            self.killed.extend(killed)
+            logger.error(
+                "vLLM engine startup failed but did not exit within %.1fs; killed engine "
+                "processes %s so startup raises. %s",
+                self._grace_s,
+                killed,
+                earliest_startup_error(self._directory),
+            )
+            # Keep watching: if the front end is still waiting (nothing was left
+            # to kill, or it waits on something else), try again and say so.
+            kill_at = time.monotonic() + self._grace_s
 
 
 def _is_address_in_use_error(exc: BaseException) -> bool:
@@ -1008,8 +1160,13 @@ class InferenceWorker(StreamingWorkerMixin):
         )
         max_attempts = _env_int("ARCTIC_VLLM_ENGINE_STARTUP_ATTEMPTS", 5)
         retry_base_s = _env_float("ARCTIC_VLLM_ENGINE_STARTUP_RETRY_BASE_S", 1.0)
+        # vLLM raises within seconds of an engine recording its startup failure:
+        # the EngineCore exits once its executor has stopped the TP workers,
+        # which takes at most ~10s (5s grace, 4s after SIGTERM, then SIGKILL).
+        failed_startup_grace_s = _env_float("ARCTIC_VLLM_ENGINE_FAILED_STARTUP_GRACE_S", 30.0)
         for attempt in range(1, max_attempts + 1):
             startup_error_dir = _begin_engine_startup_capture()
+            watchdog: _FailedStartupWatchdog | None = None
             try:
                 attempt_kwargs = dict(engine_kwargs)
                 engine_args = _create_async_engine_args(
@@ -1046,10 +1203,13 @@ class InferenceWorker(StreamingWorkerMixin):
                     from arctic_platform.inference.server.semip_asyncllm import restore_and_attach
                     self.llm = await restore_and_attach(engine_kwargs, semi_p_agents, vllm_config)
                 else:
-                    self.llm = AsyncLLM.from_vllm_config(
-                        vllm_config,
-                        stat_loggers=[RingStatLogger],
-                    )
+                    if startup_error_dir is not None:
+                        watchdog = _FailedStartupWatchdog(startup_error_dir, failed_startup_grace_s)
+                    with watchdog or contextlib.nullcontext():
+                        self.llm = AsyncLLM.from_vllm_config(
+                            vllm_config,
+                            stat_loggers=[RingStatLogger],
+                        )
                 break
             except BaseException as exc:
                 self._cleanup_registered_router_replay_shm()
@@ -1059,6 +1219,11 @@ class InferenceWorker(StreamingWorkerMixin):
                     tail = _console_tail()
                     startup_exc = _engine_startup_error(exc, startup_error_dir)
                     target = startup_exc if startup_exc is not None else exc
+                    if watchdog is not None and len(watchdog.killed) > 0:
+                        target.add_note(
+                            "The engine recorded its startup failure but did not exit; "
+                            f"the startup watchdog killed engine processes {watchdog.killed}"
+                        )
                     if len(tail) > 0:
                         target.add_note(f"Engine console tail (stdout, stderr):\n{tail}")
                     if startup_exc is not None:

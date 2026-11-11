@@ -194,6 +194,8 @@ inference = [
     "exceptiongroup>=1.0; python_version < '3.11'",
     "fastapi",
     "kvcached==0.1.4",
+    # InferenceWorker kills an engine that failed to start but never exited.
+    "psutil",
     "pydantic>=2.0",
     "ray",
     "tqdm",

@@ -208,3 +208,133 @@ def test_shutdown_times_out_hung_workers_and_kills_all(monkeypatch, caplog):
     assert sorted(killed) == list(range(n))
     assert "shutdown RPCs still running for workers [0]" in caplog.text
     assert "shutdown RPCs not yet started for workers [1, 2]" in caplog.text
+
+
+def test_initialize_names_the_failed_worker_and_stops_waiting_on_the_rest(monkeypatch, caplog):
+    """One worker's init raises (its actor died) while the other's never returns:
+    initialize raises on the failure, names that worker, and cancels its wait on
+    the healthy-but-slow one instead of leaving it unobserved."""
+    killed: list[int] = []
+    never = None
+    waits_cancelled: list[int] = []
+
+    class ActorDiedError(Exception):
+        pass
+
+    class Actor(_FakeActor):
+        async def _initialize(self, *args, **kwargs):
+            if self.index == 0:
+                try:
+                    await never.wait()
+                except asyncio.CancelledError:
+                    waits_cancelled.append(self.index)
+                    raise
+            await asyncio.sleep(0.05)
+            raise ActorDiedError("The actor died unexpectedly before finishing this task.")
+
+    class WorkerClass(_FakeWorkerClass):
+        def remote(self):
+            actor = Actor(index=len(self.actors), fail_init=False)
+            self.actors.append(actor)
+            return actor
+
+    async def run():
+        nonlocal never
+        never = asyncio.Event()
+        pool = ReplicaPool(worker_cls=worker_cls)
+        config = SimpleNamespace(
+            tensor_parallel_size=1,
+            ray_num_gpus=None,
+            extra_env={},
+            clear_cache_on_weight_sync=True,
+            to_engine_kwargs=lambda: {"model": "test-model"},
+        )
+        start = time.monotonic()
+        with pytest.raises(ActorDiedError):
+            await asyncio.wait_for(pool.initialize(config, model_id="job-1", num_replicas=2), timeout=5)
+        assert time.monotonic() - start < 2
+        assert pool._workers == []
+
+    worker_cls = WorkerClass()
+    monkeypatch.setattr(replica_pool_mod.ray, "kill", lambda actor: killed.append(actor.index))
+    caplog.set_level(logging.ERROR, logger="arctic_platform.inference.server")
+
+    asyncio.run(run())
+
+    assert [actor.shutdown_called for actor in worker_cls.actors] == [True, True]
+    assert sorted(killed) == [0, 1]
+    assert waits_cancelled == [0]
+    assert "Worker 2/2 initialization failed: ActorDiedError: The actor died unexpectedly" in caplog.text
+
+
+def _pool_config():
+    return SimpleNamespace(
+        tensor_parallel_size=1,
+        ray_num_gpus=None,
+        extra_env={},
+        clear_cache_on_weight_sync=True,
+        to_engine_kwargs=lambda: {"model": "test-model"},
+    )
+
+
+class _ScriptedWorkerClass(_FakeWorkerClass):
+    """Workers whose ``initialize`` runs ``init(index)``."""
+
+    def __init__(self, init) -> None:
+        super().__init__()
+        self._init = init
+
+    def remote(self):
+        actor = _FakeActor(index=len(self.actors), fail_init=False)
+        init = self._init
+        actor.initialize = _RemoteMethod(lambda *args, **kwargs: init(actor.index))
+        self.actors.append(actor)
+        return actor
+
+
+def test_batched_initialize_does_not_start_the_next_batch_after_a_failure(monkeypatch):
+    started: list[int] = []
+
+    async def init(index):
+        started.append(index)
+        raise RuntimeError(f"worker {index} engine died")
+
+    worker_cls = _ScriptedWorkerClass(init)
+    monkeypatch.setattr(replica_pool_mod.ray, "kill", lambda actor: None)
+    monkeypatch.setenv("ARCTIC_WORKER_INIT_CONCURRENCY", "1")
+
+    with pytest.raises(RuntimeError, match="worker 0 engine died"):
+        asyncio.run(ReplicaPool(worker_cls=worker_cls).initialize(_pool_config(), model_id="job-1", num_replicas=2))
+
+    assert started == [0]
+    assert [actor.shutdown_called for actor in worker_cls.actors] == [True, True]
+
+
+def test_cancelled_initialize_cancels_the_worker_waits_and_cleans_up(monkeypatch):
+    waits_cancelled: list[int] = []
+    killed: list[int] = []
+
+    async def init(index):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            waits_cancelled.append(index)
+            raise
+
+    worker_cls = _ScriptedWorkerClass(init)
+    monkeypatch.setattr(replica_pool_mod.ray, "kill", lambda actor: killed.append(actor.index))
+
+    async def run():
+        pool = ReplicaPool(worker_cls=worker_cls)
+        task = asyncio.create_task(pool.initialize(_pool_config(), model_id="job-1", num_replicas=2))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert pool._workers == []
+
+    asyncio.run(run())
+
+    assert sorted(waits_cancelled) == [0, 1]
+    assert sorted(killed) == [0, 1]
+    assert [actor.shutdown_called for actor in worker_cls.actors] == [True, True]
