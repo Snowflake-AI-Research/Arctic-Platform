@@ -1083,6 +1083,7 @@ def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, tmp_path, ent
         _load_batched=load_batched,
         _build_result=lambda *args: {"status": "done"},
         _validate_weight_sync_names=lambda *args, **kwargs: None,
+        _validate_skipped_sources=lambda *args, **kwargs: None,
     )
     extension._load_cpu_weights_into_model = lambda weights: WeightSyncExtension._load_cpu_weights_into_model(
         extension, weights

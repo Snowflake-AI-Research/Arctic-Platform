@@ -1180,6 +1180,29 @@ class WeightSyncExtension:
             return
         raise RuntimeError(msg)
 
+    def _validate_skipped_sources(self, skipped_source_names, *, context: str = "") -> None:
+        """Raise when the model's loader placed a shipped tensor nowhere.
+
+        Judged by what the loader reports it wrote, so any renaming or fusion the loader applies is accepted.
+        Under expert parallelism a rank skips the experts it does not own, so a skip there only warns.
+        """
+        from arctic_platform.inference.server.weight_sync.utils import _name_is_non_synced
+
+        skipped = sorted(n for n in skipped_source_names if not _name_is_non_synced(n))
+        if not skipped:
+            return
+        ctx = f" [{context}]" if context else ""
+        extra = "" if len(skipped) <= 10 else f" ... (+{len(skipped) - 10} more)"
+        msg = (
+            f"Weight-sync param name mismatch{ctx}: sender shipped {len(skipped)} names the model did not load: "
+            f"{', '.join(skipped[:10])}{extra}"
+        )
+        parallel_config = getattr(self.model_runner, "parallel_config", None)
+        if getattr(parallel_config, "enable_expert_parallel", False) or not _weight_sync_names_are_strict():
+            logger.warning("%s\n(continuing: expert parallel or non-strict mode)", msg)
+            return
+        raise RuntimeError(msg)
+
     def load_weights_cuda_ipc(self, ipc_payload: dict) -> dict:
         """Load weights from CUDA IPC handles (zero-copy, same GPU).
 
@@ -1291,27 +1314,33 @@ class WeightSyncExtension:
         return self._load_cpu_weights_into_model(weights)
 
     def _load_cpu_weights_into_model(self, weights: list) -> dict:
-        """``recv_l2_sq`` squares each full tensor on the GPU, before ``model.load_weights``."""
+        """Place the weights as the NCCL receiver's batched path does, then check every name landed.
+
+        ``recv_l2_sq`` squares each full tensor on the GPU, before placement.
+        """
         start = time.time()
         model = self.model_runner.model
         torch.cuda.reset_peak_memory_stats(self.device)
         mem_before = torch.cuda.memory_allocated(self.device)
-        self._validate_weight_sync_names(model, (name for name, _ in weights), context="cpu_to_gpu")
         self._offloaded_state = {}
+        device = self.device
 
-        loaded = 0
-        recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
-        for name, cpu_tensor in weights:
-            tensor = cpu_tensor.to(self.device)
-            recv_l2_sq.add_(_tensor_l2_sq(tensor))
-            model.load_weights([(name, tensor)])
-            loaded += 1
+        class _CpuWeights:
+            def receive_weights(self):
+                for name, cpu_tensor in weights:
+                    yield name, cpu_tensor.to(device)
 
+        loaded, recv_l2_sq, applied_source_l2_sq, _, skipped_source_names = self._load_batched(
+            model, _CpuWeights()
+        )
         refreshed = _refresh_cached_weight_copies(model)
+        self._validate_skipped_sources(skipped_source_names, context="cpu_to_gpu")
         torch.cuda.synchronize()
         result = self._build_result(start, mem_before, "cpu_to_gpu", loaded)
         result["cached_weight_copies_refreshed"] = refreshed
-        result["recv_l2_sq"] = recv_l2_sq.item()
+        result["recv_l2_sq"] = recv_l2_sq
+        result["applied_source_l2_sq"] = applied_source_l2_sq
+        result["skipped_source_count"] = len(skipped_source_names)
         return result
 
     def compute_weight_norm(self) -> dict:
