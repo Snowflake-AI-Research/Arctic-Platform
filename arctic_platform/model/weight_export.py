@@ -621,8 +621,18 @@ def _rewrite_adapter_target_modules(
 
 
 def save_hf_pretrained(model: nn.Module, output_dir: str) -> None:
-    """Write an unmerged HF base checkpoint on the calling rank."""
+    """Write an unmerged HF base checkpoint on the calling rank.
+
+    Refuses a model that holds parameters outside their data (``HeldParameters``: ``moe/frozen_held.py``'s frozen
+    holdings), which the calling rank alone cannot gather: write its HF tree from ``iter_model_weights`` on every rank.
+    """
     base = pretrained_module_for_hf_save(model)
+    if _HELD_PARAMETERS.get(base) is not None or _HELD_PARAMETERS.get(model) is not None:
+        raise NotImplementedError(
+            f"save_hf_pretrained writes on one rank, and {type(base).__name__} holds parameters outside their data "
+            "that only every rank together can gather: write its HF tree from iter_model_weights(model, 'hf', "
+            "include_skipped=True) on every rank"
+        )
     if not is_peft_model(model):
         base.save_pretrained(output_dir, safe_serialization=True, max_shard_size="4GB")
         return
