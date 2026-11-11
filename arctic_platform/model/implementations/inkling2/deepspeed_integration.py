@@ -17,9 +17,11 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 
 import torch
+import torch.distributed as dist
 from transformers import PretrainedConfig
 
 from arctic_platform.model.implementations.inkling2.configuration_inkling2 import Inkling2TextConfig
@@ -53,9 +55,19 @@ def _configure_lm_head(model, *, chunk_size, fused_cross_entropy, fp32_lm_head):
     model._dss_chunked_lm_head_logprobs = chunk_size is not None
 
 
-def _apply_sequence_parallelism(model, sp_size, sp_group):
-    if sp_size > 1:
-        raise ValueError("Inkling2 training does not support sequence parallelism yet")
+def apply_sequence_parallelism(model, sp_size, sp_group):
+    """Shard each sequence over ``sp_group``: Ulysses attention and short-convolution halos."""
+    if sp_size == 1:
+        return
+    if sp_group is None or dist.get_world_size(sp_group) != sp_size:
+        raise ValueError("Inkling2 SP group size must match sp_size")
+    for layer in model.model.layers:
+        heads, kv_heads = layer.attn.num_heads, layer.attn.num_key_value_heads
+        if heads % sp_size or not (kv_heads % sp_size == 0 or sp_size % kv_heads == 0):
+            raise ValueError("Inkling2 SP must divide the query heads and divide or be divided by the KV heads")
+    # Finish asynchronous expert backward before entering SP collectives.
+    os.environ.setdefault("ARCTIC_UCCLEP_BACKWARD_BARRIER", "1")
+    model.model._sp_group = sp_group
 
 
 def _adapter_for_inkling2(options=None):
@@ -68,7 +80,7 @@ def _adapter_for_inkling2(options=None):
         _adapter(),
         get_model=configured_model,
         inject_lm_head=_configure_lm_head,
-        apply_sequence_parallelism=_apply_sequence_parallelism,
+        apply_sequence_parallelism=apply_sequence_parallelism,
         load_dcp_from_hf=load_weights,
         vllm_weight_export=None,
     )

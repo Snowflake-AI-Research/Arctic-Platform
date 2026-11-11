@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Inkling2 text training with expert parallelism."""
+"""Inkling2 text training with expert and sequence parallelism."""
 
 from __future__ import annotations
 
@@ -72,8 +72,6 @@ def _validate_spec(spec: ModelSpec) -> None:
         spec.attn_implementation = "flex_attention"
     if spec.attn_implementation != "flex_attention":
         raise ValueError("Inkling2 training requires flex_attention for its relative-position bias and sinks")
-    if spec.parallelism.sequence_parallel > 1:
-        raise ValueError("Inkling2 training does not support sequence parallelism yet")
     if spec.dtype not in {"bfloat16", "float32"}:
         raise ValueError("Inkling2 training dtype must be bfloat16 or float32")
     patches = spec.patches.model_dump(exclude={"peft"})
@@ -89,6 +87,8 @@ def load_inkling2(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.inkling2.deepspeed_integration import load_inkling2_model
 
     groups = ctx.parallel_groups or {}
+    if ctx.spec.parallelism.sequence_parallel > 1 and groups.get("sp_group") is None:
+        raise ValueError("Inkling2 requires parallel_groups['sp_group'] when sequence_parallel > 1")
     if ctx.spec.parallelism.expert_parallel > 1 and groups.get("ep_group") is None:
         from arctic_platform.model.parallel.groups import expert_parallel_group
         from arctic_platform.model.parallel.groups import setup_replicated_expert_groups
@@ -101,6 +101,8 @@ def load_inkling2(ctx: LoaderContext) -> LoadedModel:
             optimization_dtype=ctx.spec.dtype,
             attn_implementation=ctx.spec.attn_implementation,
             ep_size=ctx.spec.parallelism.expert_parallel,
+            sp_size=ctx.spec.parallelism.sequence_parallel,
+            sp_group=groups.get("sp_group"),
             ep_group=groups.get("ep_group"),
             options=Inkling2Options.model_validate(ctx.spec.loader_options),
         )

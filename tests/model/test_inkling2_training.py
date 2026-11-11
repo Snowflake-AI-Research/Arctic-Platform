@@ -255,6 +255,90 @@ class TestInkling2Training(TestCasePlus):
                     torch_assert_close(grad, expected_grads[name], atol=2e-5, rtol=1e-4, msg=name)
 
     @require_torch_gpu
+    def test_variable_lengths_with_checkpointing_compile_without_failure(self):
+        from arctic_platform.model import ActivationCheckpointConfig
+        from arctic_platform.model.implementations.qwen35.model_builder import apply_ac
+
+        # Earlier tests' batch sizes and grad modes would otherwise count against the recompile limit.
+        torch._dynamo.reset()
+        set_seed(11)
+        reference = tiny_model().cuda()
+        model = copy.deepcopy(reference)
+        set_query_chunk_size(model, 8)
+        apply_ac(model, ActivationCheckpointConfig(router_replay_recompute=False))
+        for length in range(17, 38):
+            ids = torch.randint(0, 61, (1, length), device="cuda")
+            model.zero_grad(set_to_none=True)
+            result = model(input_ids=ids, labels=ids)
+            result.loss.backward()
+            with torch.no_grad():
+                expected = reference_logits(reference, ids[0])[None]
+            torch_assert_close(result.logits, expected, atol=2e-5, rtol=0, msg=f"length {length}")
+            self.assertTrue(all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None))
+
+    @require_torch_gpu
+    def test_relative_attention_far_keys_match_dense_reference(self):
+        from arctic_platform.model.implementations.inkling.attention import relative_attention
+
+        set_seed(5)
+        heads, kv_heads, dim, d_rel, extent, start, q_len = 4, 2, 16, 4, 64, 600, 96
+        keys = start + q_len
+        query = torch.randn(1, heads, q_len, dim, device="cuda", requires_grad=True)
+        key = torch.randn(1, kv_heads, keys, dim, device="cuda", requires_grad=True)
+        value = torch.randn(1, kv_heads, keys, dim, device="cuda", requires_grad=True)
+        relative = torch.randn(1, q_len, heads, d_rel, device="cuda", requires_grad=True)
+        projection = torch.randn(d_rel, extent, device="cuda", requires_grad=True)
+        tensors = (query, key, value, relative, projection)
+        sequence_ids = torch.zeros(1, keys, dtype=torch.int64, device="cuda")
+        sequence_ids[:, 200:] = 1
+        sequence_ids[:, start + 40 :] = 2
+        padding = torch.ones(1, keys, dtype=torch.bool, device="cuda")
+        padding[:, 300:330] = False
+        padding[:, start + 40 : start + 42] = False
+        q_pos = torch.arange(start, keys, device="cuda")[:, None]
+        k_pos = torch.arange(keys, device="cuda")[None]
+        valid = (k_pos <= q_pos) & (sequence_ids[0, q_pos] == sequence_ids[0, k_pos]) & padding[0, k_pos]
+        upstream = torch.randn(1, q_len, heads, dim, device="cuda")
+        lse_upstream = torch.randn(1, heads, q_len, device="cuda")
+
+        def run(fn):
+            output, lse = fn(*tensors)
+            finite = torch.isfinite(lse)
+            loss = (output.transpose(1, 2) * upstream).sum() + (torch.where(finite, lse, 0) * lse_upstream).sum()
+            grads = torch.autograd.grad(loss, tensors)
+            return output.detach(), lse.detach(), grads
+
+        def dense(query, key, value, relative, projection):
+            key, value = (tensor.repeat_interleave(heads // kv_heads, dim=1) for tensor in (key, value))
+            distance = q_pos - k_pos
+            bank = (relative @ projection).transpose(1, 2)
+            bias = bank.gather(-1, distance.clamp(0, extent - 1).expand(1, heads, -1, -1))
+            scores = query @ key.transpose(-1, -2) * dim**-0.5 + torch.where(distance < extent, bias, 0)
+            scores = scores.masked_fill(~valid, float("-inf"))
+            rows = valid.any(-1)
+            lse = torch.where(rows[..., None], scores, 0).logsumexp(-1)
+            weights = torch.where(rows[..., None], (scores - lse[..., None]).exp(), 0)
+            return weights @ value, torch.where(rows, lse, float("-inf"))
+
+        def flex(*args):
+            return relative_attention(
+                *args,
+                query_offset=start,
+                padding_mask=padding,
+                sequence_ids=sequence_ids,
+                scaling=dim**-0.5,
+                return_lse=True,
+            )
+
+        expected, actual = run(dense), run(flex)
+        self.assertTrue(torch.isneginf(expected[1][..., 40:42]).all())
+        torch_assert_close(actual[0], expected[0], atol=2e-5, rtol=0)
+        torch_assert_close(actual[1], expected[1], atol=2e-5, rtol=0)
+        for name, grad, baseline in zip(("q", "k", "v", "relative", "projection"), actual[2], expected[2]):
+            self.assertTrue(torch.isfinite(grad).all(), name)
+            torch_assert_close(grad, baseline, atol=1e-4, rtol=1e-4, msg=name)
+
+    @require_torch_gpu
     def test_packed_and_padded_rows_match_separate_sequences(self):
         set_seed(7)
         model = tiny_model().cuda()
@@ -447,8 +531,8 @@ class TestInkling2Training(TestCasePlus):
         self.assertEqual(spec.attn_implementation, "flex_attention")
         with self.assertRaisesRegex(ValueError, "flex_attention"):
             ModelSpec(model_path_or_name=path, attn_implementation="sdpa")
-        with self.assertRaisesRegex(ValueError, "sequence parallelism"):
-            ModelSpec(model_path_or_name=path, parallelism=ParallelismConfig(sequence_parallel=2))
+        spec = ModelSpec(model_path_or_name=path, parallelism=ParallelismConfig(sequence_parallel=2))
+        self.assertEqual(spec.parallelism.sequence_parallel, 2)
         with self.assertRaisesRegex(ValueError, "full activation checkpointing"):
             ModelSpec(
                 model_path_or_name=path,
@@ -474,7 +558,7 @@ class TestInkling2Training(TestCasePlus):
         adapter.inject_lm_head(model, chunk_size=32, fused_cross_entropy=False, fp32_lm_head=True)
         self.assertEqual(model._inkling2_lm_head_token_chunk_size, 32)
         self.assertTrue(model._inkling2_fp32_lm_head)
-        with self.assertRaisesRegex(ValueError, "sequence parallelism"):
+        with self.assertRaisesRegex(ValueError, "SP group size"):
             adapter.apply_sequence_parallelism(model, 2, None)
         with self.assertRaisesRegex(ValueError, "divisible"):
             get_model(SimpleNamespace(name=path, ep=3, moe_use_grouped_mm=False), device=torch.device("meta"))

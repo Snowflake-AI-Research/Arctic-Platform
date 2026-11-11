@@ -22,14 +22,18 @@ experts, which use AP's ``w1``/``w3``/``w2`` for the checkpoint's interleaved ``
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import field
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from arctic_platform.model.implementations.gpu.sp.collectives import gather_sequence
+from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 from arctic_platform.model.implementations.inkling2.configuration_inkling2 import Inkling2TextConfig
 from arctic_platform.model.implementations.inkling.attention import relative_attention
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
@@ -58,13 +62,20 @@ def softcap(x, cap):
 
 @dataclass
 class Inkling2Batch:
-    """Per-forward token metadata shared by every layer."""
+    """Per-forward token metadata shared by every layer.
+
+    Under sequence parallelism ``tau`` and ``conv_masks`` cover this rank's shard, while ``padding_mask`` and
+    ``sequence_ids`` cover the whole sequence that the head-sharded attention sees. Attention block masks depend
+    only on these, so every layer and the checkpoint recompute share ``mask_cache``.
+    """
 
     tau: torch.Tensor | None
     conv_masks: list[torch.Tensor] | None
     padding_mask: torch.Tensor | None
     sequence_ids: torch.Tensor | None
     query_chunk_size: int
+    sp_group: dist.ProcessGroup | None = None
+    mask_cache: dict = field(default_factory=dict, repr=False)
 
 
 class Inkling2RMSNorm(nn.Module):
@@ -93,15 +104,29 @@ class Inkling2RelativeProjection(nn.Module):
         self.proj = nn.Parameter(torch.empty(d_rel, extent))
 
 
-def short_conv(x, lag_weights, conv_masks, scale):
+def previous_tokens(x, width, group):
+    """The ``width`` tokens before this rank's shard of ``x`` ``[B, L, C]``, zeros before the first token."""
+    if group is None:
+        return x.new_zeros(x.shape[0], width, x.shape[2])
+    halo = min(width, x.shape[1])
+    tails = gather_sequence(x[:, -halo:], group)
+    end = dist.get_rank(group) * halo
+    previous = tails[:, max(0, end - width) : end]
+    # A zero dependency keeps every rank in the gather's backward.
+    zeros = tails[:, :1] * 0
+    return torch.cat((zeros.expand(-1, width - previous.shape[1], -1), previous), dim=1)
+
+
+def short_conv(x, lag_weights, batch, scale):
     """FP32 ``scale * (x + sum_lag lag_weights[lag] * x[t - lag])`` within each sequence of ``x`` ``[B, L, C]``."""
     x = x.float()
-    length = x.shape[1]
+    length, width = x.shape[1], len(lag_weights) - 1
+    extended = torch.cat((previous_tokens(x, width, batch.sp_group), x), dim=1)
     out = x + x * lag_weights[0]
-    for lag in range(1, len(lag_weights)):
-        shifted = F.pad(x, (0, 0, lag, 0))[:, :length]
-        if conv_masks is not None:
-            shifted = shifted * conv_masks[lag - 1]
+    for lag in range(1, width + 1):
+        shifted = extended[:, width - lag : width - lag + length]
+        if batch.conv_masks is not None:
+            shifted = shifted * batch.conv_masks[lag - 1]
         out = out + shifted * lag_weights[lag]
     return out * scale
 
@@ -113,10 +138,10 @@ class Inkling2ShortConv(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(dim, 1, kernel_size))
 
-    def forward(self, x, conv_masks):
+    def forward(self, x, batch):
         width = self.weight.shape[-1]
         taps = self.weight.float().squeeze(1)
-        return short_conv(x, [taps[:, width - 1 - lag] for lag in range(width)], conv_masks, (width + 1) ** -0.5)
+        return short_conv(x, [taps[:, width - 1 - lag] for lag in range(width)], batch, (width + 1) ** -0.5)
 
 
 class Inkling2DynamicShortConv(nn.Module):
@@ -127,19 +152,46 @@ class Inkling2DynamicShortConv(nn.Module):
         self.static_w = nn.Parameter(torch.empty(kernel_size, dim))
         self.weight_proj = nn.Parameter(torch.empty(num_heads * kernel_size, input_size))
 
-    def forward(self, x, dynamic_input, conv_masks):
+    def forward(self, x, dynamic_input, batch):
         width, dim = self.static_w.shape
         heads = self.weight_proj.shape[0] // width
         taps = F.linear(dynamic_input, self.weight_proj.to(dynamic_input.dtype)).float()
         taps = taps.view(*taps.shape[:-1], heads, 1, width)
         static = self.static_w.float().view(width, heads, dim // heads)
         lag_weights = [(static[lag] + taps[..., lag]).flatten(-2) for lag in range(width)]
-        return short_conv(x, lag_weights, conv_masks, (2 * width + 1) ** -0.5)
+        return short_conv(x, lag_weights, batch, (2 * width + 1) ** -0.5)
 
 
-def attn_res(blocks, last, addend, query, norms, normalize, eps):
+def attn_res(blocks, last, addend, query, norms, normalize, eps, token_chunk_size=None):
     """Block attention residual: per query row, softmax-mix the RMS-normalized ``[*blocks, last (+ addend)]`` over
-    blocks, then apply that row's norm. Mixes in FP32, like the sampler's fused kernel."""
+    blocks, then apply that row's norm. Mixes in FP32, like the sampler's fused kernel.
+
+    The mix is per token, so long inputs run in checkpointed token chunks: the FP32 working set then scales with
+    ``token_chunk_size`` rather than the sequence.
+    """
+    length = last.shape[1]
+    if token_chunk_size is None or length <= token_chunk_size:
+        return _attn_res(blocks, last, addend, query, norms, normalize, eps)
+    count = len(blocks)
+
+    def mix(*tensors):
+        return tuple(
+            _attn_res(list(tensors[:count]), tensors[count], tensors[count + 1], query, norms, normalize, eps)
+        )
+
+    chunks = []
+    for start in range(0, length, token_chunk_size):
+        window = slice(start, start + token_chunk_size)
+        args = (
+            *(block[:, window] for block in blocks),
+            last[:, window],
+            None if addend is None else addend[:, window],
+        )
+        chunks.append(checkpoint(mix, *args, use_reentrant=False) if torch.is_grad_enabled() else mix(*args))
+    return [torch.cat(parts, dim=1) for parts in zip(*chunks)]
+
+
+def _attn_res(blocks, last, addend, query, norms, normalize, eps):
     dtype = last.dtype
     last = last.float() if addend is None else last.float() + addend.float()
     values = torch.stack([*(block.float() for block in blocks), last])
@@ -208,36 +260,46 @@ class Inkling2Attention(nn.Module):
             query = (query.float() * tau).to(dtype)
             relative = (relative.float() * tau).to(dtype)
         if self.is_local:
-            key = self.k_sconv(self.wk_dv(x_k), batch.conv_masks)
-            value = self.v_sconv(self.wv_dv(x_v), batch.conv_masks)
+            key = self.k_sconv(self.wk_dv(x_k), batch)
+            value = self.v_sconv(self.wv_dv(x_v), batch)
         else:
-            key = self.k_sconv(self.wk_dv(x_k), x_k, batch.conv_masks)
-            value = self.v_sconv(self.wv_dv(x_v), x_v, batch.conv_masks)
+            key = self.k_sconv(self.wk_dv(x_k), x_k, batch)
+            value = self.v_sconv(self.wv_dv(x_v), x_v, batch)
         key = l2_clip(key.to(dtype).float().view(size, length, kv_heads, dim), self.qk_clip).to(dtype)
         value = rms_norm(value.to(dtype).view(size, length, kv_heads, dim), None, self.eps).to(dtype)
-        gate = self.gate_attn(x_q)
+        gate = self.gate_attn(x_q).view(size, length, heads, dim)
         sink = self.attn_sink_proj(x_q)
+        group = batch.sp_group
+        if group is not None:
+            # Ulysses: attend over the whole sequence with this rank's share of the heads.
+            ranks = dist.get_world_size(group)
+            if ranks > kv_heads:
+                key, value = (tensor.repeat_interleave(ranks // kv_heads, dim=2) for tensor in (key, value))
+            query, relative, key, value, gate, sink = (
+                sequence_head_all_to_all(group, tensor, scatter_dim=2, gather_dim=1)
+                for tensor in (query, relative, key, value, gate, sink)
+            )
+            length = query.shape[1]
         query, key, value = (tensor.transpose(1, 2).contiguous() for tensor in (query, key, value))
         chunk_size = batch.query_chunk_size
         chunks = []
         for start in range(0, length, chunk_size):
             end = min(start + chunk_size, length)
-            key_start = max(0, start - self.window + 1) if self.is_local else 0
 
-            def attend(q, k, v, r, projection, g, s, start=start, key_start=key_start):
+            def attend(q, k, v, r, projection, g, s, start=start):
                 output, lse = relative_attention(
-                    q,
+                    q.contiguous(),
                     k,
                     v,
                     r,
                     projection,
                     query_offset=start,
-                    key_offset=key_start,
                     padding_mask=batch.padding_mask,
                     sequence_ids=batch.sequence_ids,
                     window=self.window,
                     scaling=dim**-0.5,
                     return_lse=True,
+                    mask_cache=batch.mask_cache,
                 )
                 output = output.transpose(1, 2).float()
                 gated = output * torch.sigmoid(g.float().view(output.shape))
@@ -246,8 +308,8 @@ class Inkling2Attention(nn.Module):
 
             args = (
                 query[:, :, start:end],
-                key[:, :, key_start:end],
-                value[:, :, key_start:end],
+                key,
+                value,
                 relative[:, start:end].contiguous(),
                 self.rel_logits_proj.proj,
                 gate[:, start:end],
@@ -257,7 +319,11 @@ class Inkling2Attention(nn.Module):
                 chunks.append(checkpoint(attend, *args, use_reentrant=False, preserve_rng_state=False))
             else:
                 chunks.append(attend(*args))
-        return self.wo_ud(torch.cat(chunks, dim=1))
+        output = torch.cat(chunks, dim=1)
+        if group is not None:
+            output = output.unflatten(2, (-1, dim))
+            output = sequence_head_all_to_all(group, output, scatter_dim=1, gather_dim=2).flatten(2)
+        return self.wo_ud(output)
 
 
 class Inkling2Router(nn.Module):
@@ -376,8 +442,8 @@ class Inkling2DecoderLayer(nn.Module):
         self.attn_sconv = Inkling2ShortConv(hidden, config.sconv_kernel_size)
         self.mlp_sconv = Inkling2ShortConv(hidden, config.sconv_kernel_size)
 
-    def _mix(self, blocks, last, addend, query, norms):
-        return attn_res(blocks, last, addend, query, norms, self.normalize_values, self.eps)
+    def _mix(self, blocks, last, addend, query, norms, batch):
+        return attn_res(blocks, last, addend, query, norms, self.normalize_values, self.eps, batch.query_chunk_size)
 
     def forward(self, blocks, partial, attn_query, mlp_query, batch):
         """Return the completed blocks and the running block after this layer.
@@ -389,17 +455,17 @@ class Inkling2DecoderLayer(nn.Module):
         if len(blocks) == 0:
             inputs = [norm(partial) for norm in norms]
         else:
-            inputs = self._mix(blocks, partial, None, attn_query, norms)
+            inputs = self._mix(blocks, partial, None, attn_query, norms, batch)
         x_q, x_k, x_v = inputs if len(inputs) == 3 else inputs * 3
-        attn_out = self.attn_sconv(self.attn(x_q, x_k, x_v, batch), batch.conv_masks).to(partial.dtype)
+        attn_out = self.attn_sconv(self.attn(x_q, x_k, x_v, batch), batch).to(partial.dtype)
         if self.starts_block:
             blocks = [*blocks, partial]
-            (mlp_in,) = self._mix(blocks, attn_out, None, mlp_query, [self.mlp_norm])
+            (mlp_in,) = self._mix(blocks, attn_out, None, mlp_query, [self.mlp_norm], batch)
             residual = attn_out.float()
         else:
-            (mlp_in,) = self._mix(blocks, partial, attn_out, mlp_query, [self.mlp_norm])
+            (mlp_in,) = self._mix(blocks, partial, attn_out, mlp_query, [self.mlp_norm], batch)
             residual = partial.float() + attn_out.float()
-        partial = (residual + self.mlp_sconv(self.mlp(mlp_in), batch.conv_masks)).to(partial.dtype)
+        partial = (residual + self.mlp_sconv(self.mlp(mlp_in), batch)).to(partial.dtype)
         return blocks, partial
 
 
@@ -422,6 +488,8 @@ class Inkling2AttnRes(nn.Module):
 
 
 class Inkling2TextModel(nn.Module):
+    _sp_group = None
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -433,30 +501,33 @@ class Inkling2TextModel(nn.Module):
 
     def _batch(self, hidden, attention_mask, position_ids):
         size, length = hidden.shape[:2]
-        config = self.config
+        config, group = self.config, self._sp_group
+        offset = dist.get_rank(group) * length if group is not None else 0
         padding = attention_mask.bool() if attention_mask is not None else None
+        positions = position_ids.expand(size, -1).contiguous() if position_ids is not None else None
+        global_positions = positions
+        if group is not None:
+            padding = gather_sequence(padding, group) if padding is not None else None
+            global_positions = gather_sequence(positions, group) if positions is not None else None
         sequence_ids = None
-        if position_ids is not None:
-            position_ids = position_ids.expand(size, -1)
-            resets = position_ids[:, 1:] != position_ids[:, :-1] + 1
+        if global_positions is not None:
+            resets = global_positions[:, 1:] != global_positions[:, :-1] + 1
             sequence_ids = F.pad(resets.to(torch.int64).cumsum(-1), (1, 0))
         conv_masks = None
         if padding is not None or sequence_ids is not None:
+            total = (padding if padding is not None else sequence_ids).shape[1]
             conv_masks = []
             for lag in range(1, config.sconv_kernel_size):
-                valid = torch.ones(size, length, dtype=torch.bool, device=hidden.device)
+                valid = torch.ones(size, total, dtype=torch.bool, device=hidden.device)
                 if sequence_ids is not None:
                     valid[:, lag:] &= sequence_ids[:, lag:] == sequence_ids[:, :-lag]
                 if padding is not None:
                     valid[:, lag:] &= padding[:, :-lag]
-                conv_masks.append(valid[..., None].float())
+                conv_masks.append(valid[:, offset : offset + length, None].float())
         tau = None
         if config.log_scaling_n_floor is not None:
-            positions = (
-                position_ids
-                if position_ids is not None
-                else torch.arange(length, device=hidden.device).expand(size, -1)
-            )
+            if positions is None:
+                positions = torch.arange(offset, offset + length, device=hidden.device).expand(size, -1)
             ratio = ((positions + 1).float() / config.log_scaling_n_floor).clamp(min=1.0)
             tau = 1.0 + config.log_scaling_alpha * torch.log(ratio)
         return Inkling2Batch(
@@ -465,6 +536,7 @@ class Inkling2TextModel(nn.Module):
             padding_mask=padding,
             sequence_ids=sequence_ids,
             query_chunk_size=getattr(config, "inkling2_attention_query_chunk_size", 2048),
+            sp_group=group,
         )
 
     def forward(self, input_ids=None, attention_mask=None, position_ids=None, inputs_embeds=None):
@@ -488,6 +560,7 @@ class Inkling2TextModel(nn.Module):
             [self.norm],
             config.attn_res_normalize_values,
             config.rms_norm_eps,
+            batch.query_chunk_size,
         )[0]
 
 
@@ -566,6 +639,8 @@ class Inkling2ForCausalLMPrimeRL(PreTrainedModelPrimeRL, GenerationMixin):
             raise ValueError("Inkling2 training does not support KV caching")
         num_items = kwargs.pop("num_items_in_batch", None)
         shifted = kwargs.pop("shift_labels", None)
+        if labels is not None and shifted is None and not dss_compute_logprobs and self.model._sp_group is not None:
+            raise ValueError("Inkling2 sequence parallelism requires shift_labels; a shard cannot shift its labels")
         hidden = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
