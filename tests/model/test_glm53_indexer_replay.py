@@ -129,8 +129,6 @@ def test_trainer_selects_the_samplers_tokens_in_packed_rows():
     # The cache narrows the capture to uint16 and the trainer widens the replay window to int64, as for routes.
     replayed = _attended(model, tokens, positions, boundaries, capture.to(torch.uint16).to(torch.int64)[None])
 
-    with pytest.raises(ValueError, match="rows per token"):  # a capture of another width cannot be split
-        _attended(model, tokens, positions, boundaries, capture[None, :, :-1].to(torch.int64))
     assert len(replayed) == LAYERS
     for layer in range(LAYERS):  # the pool rows leave each layer's expert routes as they were
         torch.testing.assert_close(moe_routes[LAYERS + layer], moe_routes[layer])
@@ -138,6 +136,8 @@ def test_trainer_selects_the_samplers_tokens_in_packed_rows():
         assert replayed[layer] == expected[layer]
         # The two selections differ for most sparse queries, so the assertion above can fail.
         assert sum(a != b for a, b in zip(own[layer], expected[layer])) > length // 3
+    with pytest.raises(ValueError, match="rows per token"):  # a capture of another width cannot be split
+        _attended(model, tokens, positions, boundaries, capture[None, :, :-1].to(torch.int64))
 
 
 def test_sampler_captures_each_sparse_layers_pools_past_the_decoder_layers(monkeypatch):
