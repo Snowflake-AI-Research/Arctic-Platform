@@ -117,3 +117,16 @@ def test_keep_attention_matches_whole_layer_recompute():
     torch.testing.assert_close(kept_loss, reference_loss, rtol=0, atol=0)
     for name, grad in reference_grads.items():
         torch.testing.assert_close(kept_grads[name], grad, rtol=0, atol=0, msg=name)
+
+
+def test_layer_list_checkpoints_exactly_those_layers():
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+    model = _model("cpu", torch.float32, "sdpa")
+    apply_gradient_checkpointing(model, _ctx([1]))
+    wrapped = [isinstance(layer, CheckpointWrapper) for layer in model.model.layers]
+    assert wrapped == [False, True]
+    with pytest.raises(ValueError, match=r"lists layers \[5\], but the model has 2"):
+        apply_gradient_checkpointing(_model("cpu", torch.float32, "sdpa"), _ctx([0, 5]))
+    with pytest.raises(ValueError, match="lists a layer twice"):
+        Patches(gradient_checkpointing=[1, 1])
