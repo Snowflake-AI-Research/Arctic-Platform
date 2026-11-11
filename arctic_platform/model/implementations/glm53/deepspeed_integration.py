@@ -120,6 +120,11 @@ def load_glm5_next_model(
     options: Qwen3_5MoeOptions,
 ) -> nn.Module:
     """Load GLM-5.3-Flash with sparse MLA and context-parallel KDA."""
+    from arctic_platform.model.implementations.kernels.flashinfer_top_k import prepare_flashinfer_top_k
+
+    # Every rank, before the checkpoint load: a node whose FlashInfer cache lacks the indexer's top-k builds it now
+    # (~10 minutes) while the others wait on the CPU, not in a step's collective.
+    prepare_flashinfer_top_k()
     model = qwen_ds._load_moe_model(
         _adapter(),
         load_glm5_next_model_for_deepspeed,

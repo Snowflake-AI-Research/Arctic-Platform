@@ -200,3 +200,12 @@ def test_the_qwen38_loader_prepares_the_module_before_it_loads(monkeypatch):
     options = types.SimpleNamespace(ngram_table_on_host=None)
     order = _prepares_before_loading(monkeypatch, load_qwen4_exp_model, attn_implementation="sdpa", options=options)
     assert order == ["prepare", "load"]
+
+
+def test_the_glm53_flash_loader_prepares_the_module_before_it_loads(monkeypatch):
+    from arctic_platform.model.implementations.glm53.deepspeed_integration import load_glm5_next_model
+
+    order = _prepares_before_loading(
+        monkeypatch, load_glm5_next_model, attn_implementation="sparse_mla", options=types.SimpleNamespace()
+    )
+    assert order == ["prepare", "load"]
