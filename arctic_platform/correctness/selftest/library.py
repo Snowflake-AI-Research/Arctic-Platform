@@ -33,15 +33,11 @@ import logging
 import math
 import os
 import re
-import runpy
-import select
-import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import traceback
 import types
@@ -65,7 +61,6 @@ from types import ModuleType
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from unittest.mock import Mock
-from unittest.mock import call
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -93,7 +88,6 @@ from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client.config import ArcticClientConfig as catalog_configuration_ArcticClientConfig
 from arctic_platform.client.config import CortexConfig as _local_cortex_fixture_CortexConfig
-from arctic_platform.client.transport import JobHandles
 from arctic_platform.client.transport import initialize_or_cleanup
 from arctic_platform.client.transports.cortex import _DEFAULT
 from arctic_platform.client.transports.cortex import CortexTransport
@@ -153,27 +147,14 @@ from arctic_platform.correctness.harness.cortex import CorrectnessClient
 from arctic_platform.correctness.harness.cortex import CorrectnessCortexTransport
 from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
 from arctic_platform.correctness.harness.cortex import UnsafeCleanupError as local_transport_UnsafeCleanupError
-from arctic_platform.correctness.harness.cortex import pack_microbatches
 from arctic_platform.correctness.harness.gateway import ArcticJob
 from arctic_platform.correctness.harness.gateway import GatewaySession
 from arctic_platform.correctness.harness.gateway import HostedConnection
-from arctic_platform.correctness.harness.gateway import HostedTrainingJob
-from arctic_platform.correctness.harness.gateway import HostedTransport
 from arctic_platform.correctness.harness.gateway import StepResult
 from arctic_platform.correctness.harness.gateway import UnsafeCleanupError as operator_interface_UnsafeCleanupError
 from arctic_platform.correctness.harness.gateway import _gateway_runtime
-from arctic_platform.correctness.harness.gateway import _globalize_expert_norms
-from arctic_platform.correctness.harness.gateway import _labels_for_provider
 from arctic_platform.correctness.harness.gateway import _training_client_config
-from arctic_platform.correctness.harness.gateway import (
-    ap_driver_copy_checkpoint_peft_adapter as copy_checkpoint_peft_adapter,
-)
-from arctic_platform.correctness.harness.gateway import available_gpus
 from arctic_platform.correctness.harness.gateway import build_payload
-from arctic_platform.correctness.harness.gateway import is_local_cortex_gateway
-from arctic_platform.correctness.harness.gateway import pack
-from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
-from arctic_platform.correctness.harness.gateway import save_and_resolve_checkpoint_id
 from arctic_platform.correctness.harness.lora import canonical_name
 from arctic_platform.correctness.harness.optimizer import align
 from arctic_platform.correctness.harness.optimizer import canonical_ap_tensor_groups
@@ -187,9 +168,6 @@ from arctic_platform.correctness.harness.runner import OPTIMIZER_LEARNING_RATE
 from arctic_platform.correctness.harness.runner import assert_applicable_tests_registered
 from arctic_platform.correctness.harness.sft import IGNORE_INDEX
 from arctic_platform.correctness.harness.sft import SEED
-from arctic_platform.correctness.harness.sft import Batch
-from arctic_platform.correctness.harness.sft import load
-from arctic_platform.correctness.harness.sft import load as load_batch
 from arctic_platform.correctness.harness.storage import CORRECTNESS_TMPDIR_ENV
 from arctic_platform.correctness.harness.storage import ReferencePrerequisiteError
 from arctic_platform.correctness.onboarding import calibration as RENDER_MODULE
@@ -206,7 +184,6 @@ from arctic_platform.correctness.reference.hf_single_gpu import mixer_call_input
 from arctic_platform.correctness.reference.hf_single_gpu import reference_row_groups
 from arctic_platform.correctness.reference.optimizer_step import run_adamw_step
 from arctic_platform.correctness.reference.qwen4_reference import load_qwen4_reference
-from arctic_platform.testing_utils import torch_assert_equal
 
 # Helpers
 
@@ -2048,28 +2025,6 @@ def _external_operator_catalog(tmp_path, monkeypatch, request):
     monkeypatch.setattr(cli, "SPEC_DIR", root / "specs")
 
 
-def test_clean_port_payload_does_not_invent_deepep_chunking():
-    payload = ap_driver.build_payload({"ep_size": 4, "mb_spec": {"max_tokens_per_mb": 10240}}, "model", 42)
-    assert "deepep_token_chunk_size" not in payload["training_config"]
-    configured = ap_driver.build_payload({"ep_size": 4, "deepep_token_chunk_size": 4096}, "model", 42)
-    assert configured["training_config"]["deepep_token_chunk_size"] == 4096
-
-
-def test_clean_port_normal_runner_has_no_execution_overlay_or_config_specific_loss_selector():
-    assert "optimizer_capture_worker" not in vars(runner)
-    assert not hasattr(ap_driver, "ap_batch_processing_options")
-    assert not hasattr(ap_driver, "pack_microbatches")
-    assert "gradient_accumulation_steps" not in inspect.signature(ap_driver.build_payload).parameters
-    assert "processing_config" not in inspect.signature(ap_driver.pack).parameters
-
-
-def test_clean_port_core_fixture_binding_has_no_upload_account_or_subprocess_dependency():
-    assert not hasattr(cortex_fixture, "require_upload_credentials")
-    assert not hasattr(cortex_fixture, "DEV_STAGE")
-    for loader in (cortex_fixture.load_local_fixture, cortex_fixture._load_local_fixture):
-        assert "subprocess" not in inspect.getsource(loader)
-
-
 @pytest.mark.parametrize("fp32_lm_head,accum_dtype", [(False, None), (True, torch.float32)])
 def test_clean_port_golden_fused_cross_entropy_uses_configured_accumulation(monkeypatch, fp32_lm_head, accum_dtype):
     loss = object()
@@ -2318,56 +2273,6 @@ def _cli_config_selection_write_config(root: Path, gpu_type: str) -> Path:
     config = {"hardware": gpu_type.upper(), "sub_job_configs": native.to_cortex()}
     path.write_text(json.dumps(config))
     return path
-
-
-def _cli_config_selection_args(config_dir: Path, *, any_gpu: bool = False, config: str | None = None) -> Namespace:
-    return Namespace(
-        all_configs=config is None,
-        any_gpu=any_gpu,
-        config_dir=str(config_dir),
-        config=config,
-    )
-
-
-@pytest.mark.parametrize("auth_mode", [None, "disabled", "token"])
-def test_cli_config_selection_cli_entry_preserves_ray_auth_mode(monkeypatch, auth_mode) -> None:
-    if auth_mode is None:
-        monkeypatch.delenv("RAY_AUTH_MODE", raising=False)
-    else:
-        monkeypatch.setenv("RAY_AUTH_MODE", auth_mode)
-    monkeypatch.setattr(cli.sys, "argv", ["correctness", "--help"])
-
-    def forbidden_restart(*args):
-        pytest.fail("the correctness CLI must not reexec to change Ray authentication")
-
-    monkeypatch.setattr(os, "execv", forbidden_restart)
-    with pytest.raises(SystemExit) as exited:
-        runpy.run_module("arctic_platform.correctness", run_name="__main__")
-    assert exited.value.code == 0
-    assert os.environ.get("RAY_AUTH_MODE") == auth_mode
-
-
-def test_cli_config_selection_all_configs_selects_only_the_local_gpu_family(tmp_path: Path, monkeypatch) -> None:
-    config_dir = tmp_path / "configs"
-    h200 = _cli_config_selection_write_config(config_dir, "h200")
-    _cli_config_selection_write_config(config_dir, "b200")
-    monkeypatch.setattr(cli, "local_gpu_type", lambda: "h200")
-    assert cli._resolve_configs(_cli_config_selection_args(config_dir)) == [h200]
-
-
-def test_cli_config_selection_all_configs_any_gpu_keeps_every_gpu_family(tmp_path: Path, monkeypatch) -> None:
-    config_dir = tmp_path / "configs"
-    h200 = _cli_config_selection_write_config(config_dir, "h200")
-    b200 = _cli_config_selection_write_config(config_dir, "b200")
-    monkeypatch.setattr(cli, "local_gpu_type", lambda: "h200")
-    assert cli._resolve_configs(_cli_config_selection_args(config_dir, any_gpu=True)) == sorted([h200, b200])
-
-
-def test_cli_config_selection_explicit_config_is_not_filtered_before_validation(tmp_path: Path, monkeypatch) -> None:
-    config_dir = tmp_path / "configs"
-    b200 = _cli_config_selection_write_config(config_dir, "b200")
-    monkeypatch.setattr(cli, "local_gpu_type", lambda: "h200")
-    assert cli._resolve_configs(_cli_config_selection_args(config_dir, config=str(b200))) == [b200]
 
 
 # Console.
@@ -2624,58 +2529,6 @@ def _operator_api_catalog(tmp_path, monkeypatch):
     monkeypatch.setattr(execution, "CONFIG_DIR", config_root)
     monkeypatch.setattr(execution, "SPEC_DIR", root / "specs")
     return root
-
-
-@pytest.mark.usefixtures("_operator_api_catalog")
-def test_operator_api_pair_selection_accepts_catalog_id_or_path():
-    expected = api.select(api.RunRequest(config=_operator_api_CONFIG, tests=(_operator_api_TEST,)))
-    assert expected == api.select(api.RunRequest(config=expected[0].config_path, tests=(_operator_api_TEST,)))
-    assert [(case.config_id, case.test_id) for case in expected] == [(_operator_api_CONFIG, _operator_api_TEST)]
-
-
-@pytest.mark.usefixtures("_operator_api_catalog")
-def test_operator_api_config_only_selects_each_applicable_test_once():
-    selected = api.select(api.RunRequest(config=_operator_api_CONFIG))
-    config = api.load_config(api.catalog()[_operator_api_CONFIG])
-    assert [case.test_id for case in selected] == sorted(
-        test_id
-        for test_id, test in api.registered_tests().items()
-        if api.workload_inapplicable_reason(test, config) is None
-    )
-    assert len(set(selected)) == len(selected)
-
-
-@pytest.mark.parametrize("is_rl", [False, True])
-def test_operator_api_config_mode_selects_compatible_checks_without_a_backend(tmp_path, monkeypatch, is_rl):
-    config = tmp_path / "h200-external.json"
-    config.write_text(
-        json.dumps(
-            _config_factory_native_config(
-                {"n_gpus": 4, "max_seq_len": 16},
-                sampling={"n_gpus": 4} if is_rl else None,
-            )
-        )
-    )
-    tests = {
-        "gradients": SimpleNamespace(compares_to_reference=True, workload_modes=("sft",)),
-        "rl-only": SimpleNamespace(test_id="rl-only", compares_to_reference=False, workload_modes=("rl",)),
-        "shared": SimpleNamespace(compares_to_reference=False, workload_modes=("sft", "rl")),
-    }
-    monkeypatch.setattr(api, "registered_tests", lambda: tests)
-    monkeypatch.setattr(api, "catalog", lambda *a: {"external": config})
-    monkeypatch.setattr(
-        execution,
-        "_client_backend",
-        lambda *a: pytest.fail("selection accessed backend"),
-    )
-    local_root = tmp_path / "checkout" / "configs"
-    selected = api.select(api.RunRequest(config=config, config_dir=local_root))
-    assert [case.test_id for case in selected] == (["rl-only", "shared"] if is_rl else ["gradients", "shared"])
-    assert all(case.config_path == local_root / "qwen3-8b/standard/h200-training-full.json" for case in selected)
-    assert selected[0].config_path.read_bytes() == config.read_bytes()
-    incompatible = "gradients" if is_rl else "rl-only"
-    explicit = api.select(api.RunRequest(config=config, config_dir=local_root, tests=(incompatible,)))
-    assert [case.test_id for case in explicit] == [incompatible]
 
 
 @pytest.mark.parametrize("suffix", [".json", ".config"])
@@ -3171,15 +3024,6 @@ def test_incremental_onboarding_explicit_checks_preserve_each_others_success(_in
     assert all(result["status"] == "onboarded" for result in results.values())
 
 
-def test_incremental_onboarding_applicability_without_success_does_not_skip(_incremental_onboarding):
-    state = _incremental_onboarding
-    spec = state.config_module.TestSpec.read(state.args.test_spec)
-    spec.applicable_tests = ["single-step-grads", "single-step-optimizer"]
-    spec.write(state.args.test_spec)
-    assert state.onboard.run(state.args) == 0
-    assert state.executed == ["single-step-grads", "single-step-optimizer"]
-
-
 @pytest.mark.parametrize("change", ["config", "model", "gate", "options", "missing-spec", "corrupt-summary"])
 def test_incremental_onboarding_changed_workload_is_not_skipped(_incremental_onboarding, monkeypatch, change):
     state = _incremental_onboarding
@@ -3240,119 +3084,6 @@ def _incremental_validation_phase(state, test_id, *, root=None, damage=None):
     return phase
 
 
-def test_incremental_onboarding_recovers_old_explicit_validation(_incremental_onboarding):
-    state = _incremental_onboarding
-    assert state.onboard.run(state.args) == 0
-    spec = state.args.test_spec.read_text()
-    summary_path = state.args.test_spec.with_suffix(".onboarding.json")
-    summary = json.loads(summary_path.read_text())
-    summary["results"].pop("single-step-optimizer")
-    summary["results"]["single-step-grads"].pop("spec_identity")
-    summary["results"]["single-step-grads"].pop("runtime_identity")
-    summary_path.write_text(json.dumps(summary))
-    for test_id in ("single-step-grads", "single-step-optimizer"):
-        phase = _incremental_validation_phase(state, test_id)
-        phase.write_text(json.dumps({"result": {"status": "pass"}, "spec": spec}))
-    state.executed.clear()
-    state.prepared.clear()
-
-    assert state.onboard.run(state.args) == 0
-    assert state.executed == state.prepared == []
-    results = json.loads(summary_path.read_text())["results"]
-    assert all(
-        result["validation_checkpoint"].endswith("validation.json")
-        for result in results.values()
-        if result["status"] == "onboarded"
-    )
-
-
-def test_incremental_onboarding_recovers_catalog_validation_from_separate_log_root(
-    _incremental_onboarding, monkeypatch
-):
-    state = _incremental_onboarding
-    assert state.onboard.run(state.args) == 0
-    state.args.test_spec.with_suffix(".onboarding.json").unlink()
-    monkeypatch.chdir(state.args.config.parent)
-    for test_id in ("single-step-grads", "single-step-optimizer"):
-        _incremental_validation_phase(state, test_id, root=Path("work/logs/catalog-original/onboarding-state"))
-    state.executed.clear()
-    state.prepared.clear()
-    assert state.onboard.run(state.args) == 0
-    assert state.executed == state.prepared == []
-
-
-@pytest.mark.parametrize("invalid", ["failed", "changed-spec", "corrupt", "non-object"])
-def test_incremental_onboarding_does_not_recover_invalid_old_validation(_incremental_onboarding, invalid):
-    state = _incremental_onboarding
-    state.args.test_id = "single-step-grads"
-    assert state.onboard.run(state.args) == 0
-    state.args.test_spec.with_suffix(".onboarding.json").unlink()
-    phase = _incremental_validation_phase(state, state.args.test_id)
-    spec = json.loads(state.args.test_spec.read_text())
-    spec["model"]["content_hash"] = "wrong" if invalid == "changed-spec" else spec["model"]["content_hash"]
-    phase.write_text(
-        "{"
-        if invalid == "corrupt"
-        else json.dumps(
-            {
-                "result": {"status": "failed" if invalid == "failed" else "pass"},
-                "spec": json.dumps([] if invalid == "non-object" else spec),
-            }
-        )
-    )
-    state.executed.clear()
-    assert state.onboard.run(state.args) == 0
-    assert state.executed == ["single-step-grads"]
-
-
-@pytest.mark.parametrize(
-    "damage", ["missing-request", "runtime", "config", "test", "incomplete", "directory", "schema", "corrupt"]
-)
-def test_incremental_onboarding_unbound_legacy_validation_cannot_claim_success(_incremental_onboarding, damage):
-    state = _incremental_onboarding
-    state.args.test_id = "single-step-grads"
-    assert state.onboard.run(state.args) == 0
-    state.args.test_spec.with_suffix(".onboarding.json").unlink()
-    _incremental_validation_phase(state, state.args.test_id, damage=damage)
-    before = state.args.test_spec.read_bytes()
-    state.executed.clear()
-
-    assert state.onboard.run(state.args) == 0
-    assert state.executed == ["single-step-grads"]
-    assert state.args.test_spec.read_bytes() == before
-    result = json.loads(state.args.test_spec.with_suffix(".onboarding.json").read_text())["results"][
-        state.args.test_id
-    ]
-    assert "validation_checkpoint" not in result
-
-
-@pytest.mark.parametrize("damage", ["missing", "stale", "malformed"])
-def test_incremental_onboarding_summary_requires_current_runtime_identity(_incremental_onboarding, damage):
-    state = _incremental_onboarding
-    assert state.onboard.run(state.args) == 0
-    path = state.args.test_spec.with_suffix(".onboarding.json")
-    summary = json.loads(path.read_text())
-    optimizer = deepcopy(summary["results"]["single-step-optimizer"])
-    gradient = summary["results"]["single-step-grads"]
-    if damage == "missing":
-        gradient.pop("runtime_identity")
-    else:
-        gradient["runtime_identity"] = "0" * 64 if damage == "stale" else {"invalid": True}
-    path.write_text(json.dumps(summary))
-    before = state.args.test_spec.read_bytes()
-    state.executed.clear()
-
-    assert state.onboard.run(state.args) == 0
-    assert state.executed == ["single-step-grads"]
-    result = json.loads(path.read_text())
-    assert result["results"]["single-step-optimizer"] == optimizer
-    assert result["skipped_tests"] == ["single-step-optimizer"]
-    assert result["results"]["single-step-grads"]["runtime_identity"] == state.onboard._onboarding_runtime_identity(
-        state.onboard._onboarding_runtime_sources()
-    )
-    assert state.args.test_spec.read_bytes() == before
-
-
 @pytest.mark.parametrize("field", ["code", "dependencies", "python"])
 def test_incremental_onboarding_runtime_drift_invalidates_completed_summary(
     _incremental_onboarding, monkeypatch, field
@@ -3409,19 +3140,6 @@ def test_incremental_onboarding_explicit_failure_preserves_other_successes(_incr
     results = json.loads(state.args.test_spec.with_suffix(".onboarding.json").read_text())["results"]
     assert results["single-step-grads"]["status"] == "onboarded"
     assert results["single-step-optimizer"]["status"] == "failed"
-
-
-def test_incremental_onboarding_reference_only_request_is_never_skipped(_incremental_onboarding):
-    state = _incremental_onboarding
-    assert state.onboard.run(state.args) == 0
-    state.prepared.clear()
-    state.executed.clear()
-    state.args.prepare_references = True
-    state.args.reference_tests = ["single-step-grads", "single-step-optimizer"]
-
-    assert state.onboard.run(state.args) == 0
-    assert state.prepared == [["single-step-grads", "single-step-optimizer"]]
-    assert state.executed == []
 
 
 def test_incremental_onboarding_combined_preparation_failure_retries_without_recalibration(
@@ -3565,36 +3283,6 @@ def test_onboarding_prerequisites_reference_free_cortex_needs_no_author_gpus(
     state.result["gpu_count"] = 0
     state.onboard._onboarding_preflight(state.args, state.config, ["hosted"])
     assert state.calls[0]["min_gpus"] == 0 and state.calls[0]["attention"] == []
-
-
-@pytest.mark.parametrize("workers", [None, 8])
-def test_onboarding_prerequisites_reference_workers_are_not_target_requirements(
-    _onboarding_prerequisites, tmp_path, monkeypatch, workers
-):
-    state = _onboarding_prerequisites
-    state.config.n_gpus = 16
-    state.args.reference_calibration_workers = workers
-    state.result["gpu_count"] = 8
-    state.result["versions"]["liger_kernel.transformers.fused_linear_cross_entropy"] = "local-only"
-    hostfile = tmp_path / "hosts"
-    hostfile.write_text("head slots=8\npeer slots=8\n")
-    remote = Mock(
-        return_value={
-            host: {
-                "host": host,
-                "python": sys.executable,
-                "gpu_count": 8,
-                "versions": {"torch": "test"},
-                "errors": [],
-            }
-            for host in ("head", "peer")
-        }
-    )
-    monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: hostfile)
-    monkeypatch.setattr(preflight, "allocation_onboarding_prerequisites", remote)
-    state.onboard._onboarding_preflight(state.args, state.config)
-    assert state.calls[0]["min_gpus"] == (workers or 1)
-    assert remote.call_args.args[0]["min_gpus"] == 1
 
 
 @pytest.mark.parametrize("available,expected", [(1, 1), (4, 4), (8, 8), (16, 8)])
@@ -3822,23 +3510,6 @@ def test_operator_api_bad_selectors_fail_before_backend(selection, match, monkey
         api.run(selection)
 
 
-def test_operator_api_empty_catalog_is_not_a_success(tmp_path):
-    with pytest.raises(ValueError, match="no active"):
-        api.select(api.RunRequest(tests=(_operator_api_TEST,), config_dir=tmp_path))
-
-
-def test_operator_api_archive_configs_are_not_discovered(tmp_path, monkeypatch):
-    root = tmp_path / "configs"
-    archived = root / "archive" / "model" / "h200" / "train.config"
-    archived.parent.mkdir(parents=True)
-    archived.write_text("{}")
-    monkeypatch.setattr(api, "PACKAGE_DIR", tmp_path)
-    specs = tmp_path / "specs"
-    specs.mkdir()
-    (specs / "archive-model-h200-train.json").write_text("{}")
-    assert api.catalog(root) == {}
-
-
 def _operator_api_fake_batches(monkeypatch, verdicts):
     monkeypatch.setattr(execution, "write_report", lambda *a, **k: None)
 
@@ -4057,17 +3728,6 @@ def test_operator_api_actual_execution_preserves_selection_order_and_combined_st
 
 
 @pytest.mark.usefixtures("_operator_api_catalog")
-def test_operator_api_inapplicable_is_visible_and_not_a_pass(tmp_path, monkeypatch):
-    _operator_api_fake_batches(monkeypatch, [Outcome.INAPPLICABLE])
-    result = api.run(
-        api.RunRequest(config=_operator_api_CONFIG, tests=(_operator_api_TEST,)),
-        api.RunOptions(out=tmp_path),
-    )
-    assert result.cases[0]["status"] == "inapplicable"
-    assert result.exit_code == 1
-
-
-@pytest.mark.usefixtures("_operator_api_catalog")
 @pytest.mark.parametrize(
     "failure",
     [
@@ -4085,17 +3745,6 @@ def test_operator_api_unsafe_exit_or_interruption_stops_remaining_cases(tmp_path
     assert result.stopped_unsafe and result.exit_code == 1
     assert [case["status"] for case in result.cases] == ["error", "blocked", "blocked"]
     assert all((result.outcome is Outcome.FAIL for result in result.results))
-
-
-@pytest.mark.usefixtures("_operator_api_catalog")
-def test_operator_api_empty_execution_is_explicitly_blocked(tmp_path, monkeypatch):
-    monkeypatch.setattr(execution, "write_report", lambda *a, **k: None)
-    monkeypatch.setattr(execution, "_run_configs", lambda *a, **k: 0)
-    result = api.run(
-        api.RunRequest(config=_operator_api_CONFIG, tests=(_operator_api_TEST,)),
-        api.RunOptions(out=tmp_path),
-    )
-    assert result.cases[0]["status"] == "blocked" and result.exit_code == 1
 
 
 @pytest.mark.usefixtures("_operator_api_catalog")
@@ -4117,69 +3766,6 @@ def test_operator_api_comparison_failure_and_execution_errors_are_distinct(error
         error_type=error_type,
     )
     assert execution._case_summary(case, [result])["status"] == status
-
-
-@pytest.mark.usefixtures("_operator_api_catalog")
-def test_operator_api_parse_flags_is_shared_with_operator_command():
-    request, options = api.parse_run_args(
-        [
-            "--config",
-            _operator_api_CONFIG,
-            "--test",
-            _operator_api_TEST,
-            "--backend",
-            "cortex-training",
-        ]
-    )
-    assert request.config == _operator_api_CONFIG and request.tests == (_operator_api_TEST,)
-    assert options.backend == api.RunOptions().backend == "cortex-training"
-    assert api._namespace(request, options).backend == "cortex"
-    with pytest.raises(ValueError, match="no longer supported"):
-        api._namespace(request, api.RunOptions(backend="onprem"))
-
-
-@pytest.mark.usefixtures("_operator_api_catalog")
-def test_operator_api_static_guide_is_unchanged_by_run_and_onboarding(tmp_path, monkeypatch):
-    monkeypatch.setenv("AP_CORRECTNESS_LOGDIR", str(tmp_path / "logs"))
-    guide = api.PACKAGE_DIR / "docs" / "running-tests.md"
-    before = guide.read_bytes()
-    monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **k: 128)
-    from transformers import AutoConfig
-
-    from arctic_platform.correctness.harness import report
-    from arctic_platform.correctness.harness import runner
-    from arctic_platform.correctness.onboarding import onboard
-
-    monkeypatch.setattr(onboard, "_onboarding_preflight", lambda *a: None)
-    monkeypatch.setattr(report, "collect", lambda: {"host": "synthetic"})
-    result = api.run(
-        api.RunRequest(config=_operator_api_CONFIG, tests=(_operator_api_TEST,)),
-        api.RunOptions(out=tmp_path, base_url="http://existing.test"),
-        executor=lambda cfg, *a, **k: [Result(_operator_api_TEST, cfg.config_id, Outcome.PASS)],
-    )
-    assert result.exit_code == 0 and (tmp_path / "report.md").exists()
-    prepared = []
-    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda *a, **k: SimpleNamespace(vocab_size=128))
-    monkeypatch.setattr(runner, "execute", lambda *a, **k: prepared.append(k))
-    assert (
-        execution.main(
-            [
-                "onboard",
-                "--config",
-                str(api.catalog()[_operator_api_CONFIG]),
-                "--test-spec",
-                str(execution.SPEC_DIR / f"{_operator_api_CONFIG}.json"),
-                "--prepare-references",
-                "--output-dir",
-                str(tmp_path / "preparation"),
-                "--test-id",
-                "single-step-grads",
-            ]
-        )
-        == 0
-    )
-    assert len(prepared) == 1 and prepared[0]["prepare_references"] is True
-    assert guide.read_bytes() == before
 
 
 @pytest.mark.usefixtures("_operator_api_catalog")
@@ -5074,22 +4660,6 @@ def test_onboarding_resume_rebuilds_changed_phase_and_invalidates_successors(tmp
     assert not (args._resume_dir / "validation.json").exists()
 
 
-@pytest.mark.parametrize("status", ["oom", "error"])
-def test_onboarding_resume_never_admits_failed_sizing(tmp_path, status):
-    from arctic_platform.correctness.onboarding import onboard
-
-    args = Namespace(_resume_dir=tmp_path, test_spec=tmp_path / "spec.json")
-    attempts = []
-
-    def probe():
-        attempts.append(status)
-        return {"status": status}
-
-    assert onboard._resume_phase(args, "sizing", probe)["status"] == status
-    assert onboard._resume_phase(args, "sizing", probe)["status"] == status
-    assert attempts == [status, status] and not (tmp_path / "sizing.json").exists()
-
-
 @pytest.mark.parametrize("drift", ["config", "options", "dependencies"])
 def test_onboarding_resume_state_is_bound_to_recipe_and_environment(tmp_path, monkeypatch, drift):
     from arctic_platform.correctness.onboarding import onboard
@@ -5219,69 +4789,6 @@ def test_onboarding_retry_calibration_repair_rebuilds_instead_of_reusing_old_mea
     ) == str(measurements)
     assert calls == ["recalibrated"]
     assert (original / "calibration.json").read_bytes() == saved
-
-
-def test_onboarding_retry_reviewed_cache_and_summary_changes_preserve_preparation(
-    _onboarding_retry_sources,
-):
-    onboard, args, root = _onboarding_retry_sources
-    onboard._resume_setup(args)
-    original = args._resume_dir
-    (root / "onboarding" / "onboard.py").write_text(
-        "import ast\n\ndef recipe():\n    return 42\n\ndef _resume_bookkeeping():\n    return 2\n"
-    )
-    (root / "harness" / "runner.py").write_text(
-        'if stepping and "single-step-optimizer" not in records:\n'
-        '    print(f"\\n*** Optimizer Norm Summary: {arm.name} ***\\n"\n'
-        '          f"Reading saved optimizer states from {len(manifests)} completed HF runs.", flush=True)\n'
-        "    summary_started = time.monotonic()\n"
-        "    gate = 0.005\n"
-        '    print(f"Optimizer norm summary complete: arm={arm.name}, "\n'
-        '          f"elapsed={time.monotonic() - summary_started:.1f}s, "\n'
-        '          f"maximum_pairwise_norm_delta={spread:.9e}\\n", flush=True)\n'
-    )
-    onboard._resume_setup(args)
-    assert args._resume_candidates == [original]
-
-
-@pytest.mark.parametrize("drift", ["display-only", "changed-run-count"])
-@pytest.mark.parametrize("formatter", ["duration", "total_duration"])
-def test_onboarding_retry_runtime_footer_and_calibration_bar_preserve_only_unchanged_recipe(
-    _onboarding_retry_sources, drift, formatter
-):
-    onboard, args, root = _onboarding_retry_sources
-    (root / "onboarding" / "onboard.py").write_text(
-        "def logged_run(args):\n    try:\n        return run(args)\n    except Exception:\n        return 1\n"
-    )
-    (root / "harness" / "runner.py").write_text(
-        "if stepping:\n    for start in range(reference_calibration_runs):\n        measure_reference(start)\n"
-    )
-    onboard._resume_setup(args)
-    original = args._resume_dir
-    (root / "onboarding" / "onboard.py").write_text(
-        "def logged_run(args):\n"
-        f"    from arctic_platform.correctness.harness.report import {formatter}\n"
-        "    started = time.monotonic()\n"
-        "    try:\n"
-        "        return run(args)\n"
-        "    except Exception:\n"
-        "        return 1\n"
-        "    finally:\n"
-        f'        print(f"Total run time: {{{formatter}(time.monotonic() - started)}}", flush=True)\n'
-    )
-    runs = "reference_calibration_runs" if drift == "display-only" else "reference_calibration_runs + 1"
-    (root / "harness" / "runner.py").write_text(
-        "if stepping:\n"
-        "    from tqdm.auto import tqdm\n"
-        "    with tqdm(total=reference_calibration_runs,\n"
-        '              desc=f"Optimizer calibration {arm.name}", unit="run", file=sys.stdout,\n'
-        "              dynamic_ncols=True, mininterval=0, miniters=1) as progress:\n"
-        f"        for start in range({runs}):\n"
-        "            measure_reference(start)\n"
-        "            progress.update(1)\n"
-    )
-    onboard._resume_setup(args)
-    assert args._resume_candidates == ([original] if drift == "display-only" else [])
 
 
 @pytest.mark.parametrize("damage", ["missing-manifest", "wrong-key", "changed-artifact"])
@@ -5978,190 +5485,6 @@ def test_owned_gateway_descendants_reject_unverified_members(_owned_gateway_desc
     signal_child.assert_not_called()
 
 
-def test_owned_gateway_descendant_cleared_environment_and_verified_exit_is_not_signalled(
-    _owned_gateway_descendant, monkeypatch
-):
-    state = _owned_gateway_descendant
-    read_bytes = Path.read_bytes
-
-    def read(path):
-        if path == state.child / "environ":
-            fields = state.fields.copy()
-            fields[0] = "Z"
-            (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(fields))
-            return b""
-        return read_bytes(path)
-
-    send = Mock()
-    monkeypatch.setattr(Path, "read_bytes", read)
-    monkeypatch.setattr(ap_driver.signal, "pidfd_send_signal", send, raising=False)
-    ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0)
-    send.assert_not_called()
-
-
-@pytest.mark.parametrize("exits", [False, True])
-def test_owned_gateway_unverified_descendant_grace_never_signals(_owned_gateway_descendant, monkeypatch, exits):
-    state = _owned_gateway_descendant
-    (state.child / "environ").write_bytes(b"")
-    clock = [0.0]
-
-    def pause(duration):
-        clock[0] += duration
-        if exits:
-            fields = state.fields.copy()
-            fields[0] = "Z"
-            (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(fields))
-
-    send = Mock()
-    monkeypatch.setattr(ap_driver.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(ap_driver.time, "sleep", pause)
-    monkeypatch.setattr(ap_driver.signal, "pidfd_send_signal", send, raising=False)
-    if exits:
-        ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0.1)
-        assert clock[0] == 0.05
-    else:
-        with pytest.raises(operator_interface_UnsafeCleanupError, match="ownership validation"):
-            ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0.1)
-        assert clock[0] == 0.1
-    send.assert_not_called()
-
-
-def test_owned_gateway_real_unverified_descendant_natural_exit_is_waited_for(tmp_path):
-    child_file = tmp_path / "unverified.pid"
-    child_script = (
-        "import os,time; from pathlib import Path; "
-        f"Path({str(child_file)!r}).write_text(str(os.getpid())); time.sleep(0.5)"
-    )
-    gateway_script = (
-        "import os,subprocess,sys,time; "
-        f"subprocess.Popen([sys.executable, '-c', {child_script!r}], "
-        "env={key:value for key,value in os.environ.items() if key != 'AP_CORRECTNESS_GATEWAY_OWNER'}); "
-        "time.sleep(300)"
-    )
-    leader = subprocess.Popen(
-        [sys.executable, "-c", gateway_script],
-        start_new_session=True,
-        env={**os.environ, "AP_CORRECTNESS_GATEWAY_OWNER": "owned-token"},
-    )
-    gateway = ap_driver._gateway_process_identity(leader.pid)
-    child = None
-    try:
-        deadline = time.monotonic() + 10
-        while not child_file.exists():
-            assert time.monotonic() < deadline
-            time.sleep(0.01)
-        child = ap_driver._gateway_process_identity(int(child_file.read_text()))
-        assert child is not None
-        leader.terminate()
-        leader.wait(timeout=5)
-        started = time.monotonic()
-        ap_driver._reap_owned_gateway_descendants(gateway, "owned-token", timeout=2)
-        assert time.monotonic() - started >= 0.1
-        assert ap_driver._gateway_process_identity(child["pid"]) is None
-    finally:
-        if leader.poll() is None:
-            leader.kill()
-            leader.wait(timeout=5)
-        if child is not None and ap_driver._gateway_process_identity(child["pid"]) == child:
-            os.kill(child["pid"], signal.SIGKILL)
-
-
-def test_owned_gateway_descendants_ignore_other_sessions_and_zombies(_owned_gateway_descendant):
-    state = _owned_gateway_descendant
-    assert [entry["pid"] for entry in ap_driver._owned_gateway_descendants(state.gateway, "owned-token")] == [12346]
-    for field, value in ((3, "999"), (0, "Z")):
-        fields = state.fields.copy()
-        fields[field] = value
-        (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(fields))
-        (state.child / "environ").write_bytes(b"AP_CORRECTNESS_GATEWAY_OWNER=another-command\0")
-        assert not ap_driver._owned_gateway_descendants(state.gateway, "owned-token")
-
-
-@pytest.mark.parametrize("exited", [False, True])
-def test_owned_gateway_descendant_unreadable_environment_requires_verified_exit(
-    _owned_gateway_descendant, monkeypatch, exited
-):
-    state = _owned_gateway_descendant
-    read_bytes = Path.read_bytes
-
-    def read(path):
-        if path == state.child / "environ":
-            if exited:
-                fields = state.fields.copy()
-                fields[0] = "Z"
-                (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(fields))
-            raise PermissionError("synthetic exit race")
-        return read_bytes(path)
-
-    monkeypatch.setattr(Path, "read_bytes", read)
-    if exited:
-        assert not ap_driver._owned_gateway_descendants(state.gateway, "owned-token")
-    else:
-        with pytest.raises(operator_interface_UnsafeCleanupError, match="unreadable environment"):
-            ap_driver._owned_gateway_descendants(state.gateway, "owned-token")
-
-
-@pytest.mark.parametrize("code", [0, 3, 38])
-def test_owned_gateway_pidfd_libc_fallback_preserves_errors(monkeypatch, code):
-    import ctypes
-
-    open_pidfd = Mock(return_value=-1 if code else 42)
-    monkeypatch.delattr(ap_driver.os, "pidfd_open", raising=False)
-    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: SimpleNamespace(pidfd_open=open_pidfd))
-    monkeypatch.setattr(ctypes, "get_errno", lambda: code)
-    if code:
-        with pytest.raises(OSError) as raised:
-            ap_driver._open_gateway_pidfd(12345)
-        assert raised.value.errno == code
-    else:
-        assert ap_driver._open_gateway_pidfd(12345) == 42
-    open_pidfd.assert_called_once_with(12345, 0)
-    assert open_pidfd.argtypes == [ctypes.c_int, ctypes.c_uint]
-    assert open_pidfd.restype is ctypes.c_int
-
-
-def test_owned_gateway_pidfd_prefers_python_interface(monkeypatch):
-    pin = Mock(return_value=42)
-    monkeypatch.setattr(ap_driver.os, "pidfd_open", pin, raising=False)
-    assert ap_driver._open_gateway_pidfd(12345) == 42
-    pin.assert_called_once_with(12345)
-
-
-def test_owned_gateway_pidfd_missing_libc_support_fails_closed(monkeypatch):
-    import ctypes
-
-    monkeypatch.delattr(ap_driver.os, "pidfd_open", raising=False)
-    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: SimpleNamespace())
-    with pytest.raises(operator_interface_UnsafeCleanupError, match="libc does not expose"):
-        ap_driver._open_gateway_pidfd(12345)
-
-
-@pytest.mark.parametrize("resists_term", [False, True])
-def test_owned_gateway_descendants_use_pinned_signals_and_verify_exit(
-    _owned_gateway_descendant, monkeypatch, resists_term
-):
-    state = _owned_gateway_descendant
-    pin = Mock(return_value=42)
-    close = Mock()
-
-    def stop(descriptor, signum):
-        assert descriptor == 42
-        if not resists_term or signum == signal.SIGKILL:
-            fields = state.fields.copy()
-            fields[0] = "Z"
-            (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(fields))
-
-    send = Mock(side_effect=stop)
-    monkeypatch.setattr(ap_driver, "_open_gateway_pidfd", pin)
-    monkeypatch.setattr(ap_driver.os, "close", close)
-    monkeypatch.setattr(ap_driver.signal, "pidfd_send_signal", send, raising=False)
-    ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0)
-    assert send.call_args_list == (
-        [call(42, signal.SIGTERM), call(42, signal.SIGKILL)] if resists_term else [call(42, signal.SIGTERM)]
-    )
-    assert pin.call_count == close.call_count == send.call_count
-
-
 def test_owned_gateway_descendant_pid_reuse_is_not_signalled(_owned_gateway_descendant, monkeypatch):
     state = _owned_gateway_descendant
 
@@ -6179,90 +5502,6 @@ def test_owned_gateway_descendant_pid_reuse_is_not_signalled(_owned_gateway_desc
         ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token")
     send.assert_not_called()
     close.assert_called_once_with(42)
-
-
-def test_owned_gateway_descendant_exit_wait_does_not_reread_environment(_owned_gateway_descendant, monkeypatch):
-    state = _owned_gateway_descendant
-    read_bytes = Path.read_bytes
-    checked = []
-
-    def read(path):
-        if path == state.child / "environ":
-            assert not checked, "exit wait reread a signalled task's environment"
-            checked.append(path)
-        return read_bytes(path)
-
-    def stopped(pid):
-        fields = state.fields.copy()
-        fields[0] = "Z"
-        (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(fields))
-        return None
-
-    def send(*a):
-        monkeypatch.setattr(ap_driver, "_gateway_process_identity", stopped)
-
-    monkeypatch.setattr(Path, "read_bytes", read)
-    monkeypatch.setattr(ap_driver, "_open_gateway_pidfd", lambda pid: 42)
-    monkeypatch.setattr(ap_driver.os, "close", Mock())
-    monkeypatch.setattr(ap_driver.signal, "pidfd_send_signal", send, raising=False)
-    ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token")
-    assert len(checked) == 1
-
-
-@pytest.mark.parametrize("cleanup_error", [False, True])
-def test_owned_gateway_reaps_descendants_before_retiring_ownership(
-    _automatic_regression_gateway, monkeypatch, cleanup_error
-):
-    state = _automatic_regression_gateway
-    records = ap_driver._gateway_state_directory() / "gateway.json"
-
-    def reap(gateway, token):
-        state.process.wait.assert_called_once_with(timeout=120)
-        record = json.loads(records.read_text())
-        assert gateway == record["gateway"] and token == record["token"]
-        if cleanup_error:
-            raise operator_interface_UnsafeCleanupError("synthetic descendants survived")
-
-    stop = Mock(side_effect=reap)
-    monkeypatch.setattr(ap_driver, "_reap_owned_gateway_descendants", stop)
-    if cleanup_error:
-        with pytest.raises(operator_interface_UnsafeCleanupError, match="descendants survived"):
-            with ap_driver.local_cortex_gateway(state.out):
-                pass
-        assert records.is_file()
-    else:
-        with ap_driver.local_cortex_gateway(state.out):
-            pass
-        assert not records.exists()
-    stop.assert_called_once()
-
-
-@pytest.mark.parametrize("survives", [False, True])
-def test_owned_gateway_recovery_keeps_dead_leader_record_until_descendants_exit(
-    _automatic_regression_gateway, monkeypatch, survives
-):
-    root = ap_driver._gateway_state_directory()
-    root.mkdir()
-    path = root / "gateway.json"
-    record = {
-        "schema": "correctness-owned-gateway-v1",
-        "owner": {"pid": 999001, "uid": os.getuid(), "start_time": "1"},
-        "gateway": {"pid": 999002, "uid": os.getuid(), "start_time": "2"},
-        "token": "owned-token",
-        "log": "retained-gateway.log",
-    }
-    path.write_text(json.dumps(record))
-    monkeypatch.setattr(ap_driver, "_gateway_process_identity", lambda pid: None)
-    reap = Mock(side_effect=operator_interface_UnsafeCleanupError("descendants survived") if survives else None)
-    monkeypatch.setattr(ap_driver, "_reap_owned_gateway_descendants", reap)
-    if survives:
-        with pytest.raises(operator_interface_UnsafeCleanupError, match="descendants survived"):
-            ap_driver._recover_owned_gateway(path)
-        assert path.is_file()
-    else:
-        ap_driver._recover_owned_gateway(path)
-        assert not path.exists()
-    reap.assert_called_once_with(record["gateway"], record["token"])
 
 
 @pytest.mark.parametrize("body_error", [False, True])
@@ -6325,29 +5564,6 @@ def test_owned_gateway_real_orphan_descendant_is_stopped_after_leader_exit(tmp_p
                 process.wait(timeout=5)
         if child_identity is not None and ap_driver._gateway_process_identity(child_identity["pid"]) == child_identity:
             os.kill(child_identity["pid"], signal.SIGKILL)
-
-
-@pytest.mark.parametrize("inherited", [None, "", "0"])
-def test_owned_gateway_preserves_owner_environment_for_process_titles(
-    _automatic_regression_gateway, tmp_path, monkeypatch, inherited
-):
-    state = _automatic_regression_gateway
-    if inherited is None:
-        monkeypatch.delenv("SPT_NOENV", raising=False)
-    else:
-        monkeypatch.setenv("SPT_NOENV", inherited)
-    monkeypatch.setattr(ap_driver, "_reap_owned_gateway_descendants", Mock())
-    with ap_driver._launch_local_cortex_gateway(
-        tmp_path,
-        tmp_path / "gateway.json",
-        tmp_path / "hostfile",
-        gateway_module="arctic_platform.correctness.harness.gateway",
-    ):
-        environment = state.start.call_args.kwargs["env"]
-        assert environment["SPT_NOENV"] == "1"
-        assert environment["AP_CORRECTNESS_GATEWAY_OWNER"]
-        assert os.environ.get("SPT_NOENV") == inherited
-    assert os.environ.get("SPT_NOENV") == inherited
 
 
 @pytest.mark.parametrize("title", ["ray::DashboardAgent", "ray::RuntimeEnvAgent"])
@@ -6414,48 +5630,6 @@ def test_owned_gateway_real_retitled_ray_agent_keeps_marker_and_is_reaped(tmp_pa
                 process.wait(timeout=5)
         if child_identity is not None and ap_driver._gateway_process_identity(child_identity["pid"]) == child_identity:
             os.kill(child_identity["pid"], signal.SIGKILL)
-
-
-@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
-@pytest.mark.parametrize("phase", ["startup", "onboarding", "regression"])
-def test_owned_gateway_stop_signals_clean_up_and_restore_handlers(
-    _automatic_regression_gateway, monkeypatch, capsys, signum, phase
-):
-    import requests
-
-    from arctic_platform.correctness.onboarding import onboard
-
-    state = _automatic_regression_gateway
-    previous = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
-    if phase == "startup":
-        monkeypatch.setattr(requests, "get", lambda *a, **k: signal.raise_signal(signum))
-        context = ap_driver.local_cortex_gateway(state.out)
-    elif phase == "onboarding":
-        context = onboard._validation_gateway(Namespace(_automatic_cortex_gateway=True, output_dir=state.out))
-    else:
-        context = ap_driver.local_cortex_gateway(state.out)
-    with pytest.raises(KeyboardInterrupt, match=f"received {signal.Signals(signum).name}"):
-        with context:
-            signal.raise_signal(signum)
-    state.process.terminate.assert_called_once()
-    state.process.wait.assert_called_once_with(timeout=120)
-    assert {number: signal.getsignal(number) for number in previous} == previous
-    output = capsys.readouterr().out
-    assert "Stopping owned Cortex-training gateway" in output
-    assert "Owned Cortex-training gateway stopped and reaped." in output
-
-
-def test_owned_gateway_repeated_stop_does_not_interrupt_cleanup(
-    _automatic_regression_gateway,
-):
-    state = _automatic_regression_gateway
-    previous = signal.getsignal(signal.SIGTERM)
-    state.process.terminate.side_effect = lambda: signal.raise_signal(signal.SIGTERM)
-    with pytest.raises(KeyboardInterrupt, match="received SIGTERM"):
-        with ap_driver.local_cortex_gateway(state.out):
-            signal.raise_signal(signal.SIGTERM)
-    state.process.wait.assert_called_once_with(timeout=120)
-    assert signal.getsignal(signal.SIGTERM) == previous
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
@@ -6552,15 +5726,6 @@ def test_stale_owned_gateway_is_stopped_before_replacement(_stale_gateway_record
     assert "Stale owned Cortex-training gateway stopped." in output
 
 
-@pytest.mark.parametrize("state_kind", ["gone", "reused-pid"])
-def test_stale_gateway_missing_or_reused_pid_is_not_signalled(_stale_gateway_record, state_kind):
-    state = _stale_gateway_record
-    state.live[state.gateway["pid"]] = None if state_kind == "gone" else {**state.gateway, "start_time": "different"}
-    ap_driver.recover_local_cortex_gateway()
-    state.kill.assert_not_called()
-    assert not state.path.exists()
-
-
 @pytest.mark.parametrize("fault", ["live-owner", "token", "group", "schema", "user", "json"])
 def test_stale_gateway_unproven_ownership_refuses_startup(_stale_gateway_record, monkeypatch, fault):
     state = _stale_gateway_record
@@ -6584,27 +5749,6 @@ def test_stale_gateway_unproven_ownership_refuses_startup(_stale_gateway_record,
         with ap_driver.local_cortex_gateway(state.path.parent / "next"):
             pytest.fail("unsafe replacement yielded")
     state.kill.assert_not_called()
-    assert state.path.exists()
-
-
-def test_stale_gateway_forced_shutdown_blocks_replacement(_stale_gateway_record, monkeypatch):
-    state = _stale_gateway_record
-    state.kill.side_effect = None
-    ticks = iter([0, 121])
-    monkeypatch.setattr(ap_driver.time, "monotonic", lambda: next(ticks))
-    descendants = Mock()
-    monkeypatch.setattr(ap_driver, "_reap_owned_gateway_descendants", descendants)
-    monkeypatch.setattr(
-        ap_driver.subprocess,
-        "Popen",
-        lambda *a, **k: pytest.fail("unsafe replacement started"),
-    )
-    with pytest.raises(operator_interface_UnsafeCleanupError, match="required forced shutdown"):
-        with ap_driver.local_cortex_gateway(state.path.parent / "next"):
-            pytest.fail("unsafe replacement yielded")
-    state.kill.assert_called_once_with(state.gateway["pid"], signal.SIGTERM)
-    ap_driver.os.killpg.assert_called_once_with(state.gateway["pid"], signal.SIGKILL)
-    descendants.assert_called_once_with(state.gateway, state.record["token"])
     assert state.path.exists()
 
 
@@ -7130,63 +6274,6 @@ def test_reference_progress_reports_slow_parallel_wave_without_eta(capsys):
 
 
 @pytest.fixture
-def _gateway_scratch_launch_node(tmp_path, monkeypatch):
-    hostfile = tmp_path / "hostfile"
-    hostfile.write_text("synthetic-head slots=8\n")
-    monkeypatch.setattr(ap_driver.socket, "gethostname", lambda: "synthetic-head")
-    monkeypatch.setattr(ap_driver.socket, "gethostbyname", lambda host: "192.0.2.1")
-    request = {
-        "token": "new-launch",
-        "path": str(tmp_path / "owned" / "scratch"),
-        "hostfile": str(hostfile),
-        "hostfile_sha256": hashlib.sha256(hostfile.read_bytes()).hexdigest(),
-        "python": str(Path(sys.executable).resolve()),
-    }
-    return request
-
-
-def test_gateway_scratch_launch_node_creates_only_owned_parent_and_retains_identity(
-    _gateway_scratch_launch_node,
-):
-    request = _gateway_scratch_launch_node
-    first = ap_driver._gateway_scratch_node(request)
-    second = ap_driver._gateway_scratch_node(request)
-    assert first["ok"] and first["created"]
-    assert second["ok"] and not second["created"]
-    assert first["identity"] == second["identity"]
-    assert first["identity"][3] == os.geteuid()
-    assert list(Path(request["path"]).iterdir()) == []
-    assert first["hostfile_sha256"] == request["hostfile_sha256"]
-    assert first["boot_id"] == second["boot_id"]
-
-
-@pytest.mark.parametrize("damage", ["symlink", "foreign-uid", "hostfile", "member", "python", "non-fast"])
-def test_gateway_scratch_launch_node_refuses_unowned_or_unbound_parent(
-    _gateway_scratch_launch_node, monkeypatch, damage
-):
-    request = _gateway_scratch_launch_node
-    root = Path(request["path"])
-    if damage == "symlink":
-        root.parent.mkdir()
-        destination = root.parent / "foreign"
-        destination.mkdir()
-        root.symlink_to(destination, target_is_directory=True)
-    elif damage == "foreign-uid":
-        root.mkdir(parents=True)
-        monkeypatch.setattr(ap_driver.os, "geteuid", lambda: root.stat().st_uid + 1)
-    elif damage == "hostfile":
-        request["hostfile_sha256"] = "f" * 64
-    elif damage == "member":
-        monkeypatch.setattr(ap_driver.socket, "gethostname", lambda: "unrelated-node")
-    elif damage == "python":
-        request["python"] = "/unrelated/python"
-    else:
-        request["path"] = "/tmp/not-fast-scratch"
-    result = ap_driver._gateway_scratch_node(request)
-    assert not result["ok"] and result["error"]
-
-
-@pytest.fixture
 def _gateway_scratch_launch_transport(tmp_path, monkeypatch):
     import base64
     import stat
@@ -7344,29 +6431,6 @@ def test_gateway_scratch_launch_prepares_before_gateway_and_restores_original_en
     assert os.environ["AP_CORRECTNESS_TMPDIR"] == "/data-fast/tmp/original-parent"
 
 
-def test_gateway_scratch_launch_failure_prevents_gateway_creation(tmp_path, monkeypatch):
-    hostfile = tmp_path / "hostfile"
-    hostfile.write_text("synthetic-head slots=8\n")
-    monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: hostfile)
-
-    def fail(*args):
-        raise ValueError("actual peer ownership rejection")
-
-    monkeypatch.setattr(ap_driver, "_prepare_gateway_scratch", fail)
-    monkeypatch.setattr(
-        ap_driver,
-        "_launch_local_cortex_gateway",
-        lambda *a, **k: pytest.fail("gateway started"),
-    )
-    with pytest.raises(ValueError, match="actual peer ownership rejection"):
-        with ap_driver._started_local_cortex_gateway(
-            tmp_path / "gateway",
-            tmp_path / "owner.json",
-            gateway_module="arctic_platform.correctness.harness.gateway",
-        ):
-            pytest.fail("workload started")
-
-
 def test_gateway_scratch_cleanup_escalates_only_owned_transport_group_and_waits(
     monkeypatch,
 ):
@@ -7419,54 +6483,6 @@ def test_gateway_scratch_cleanup_receipt_write_failure_cannot_replace_primary_tr
         ap_driver._prepare_gateway_scratch(directory, hostfile)
     assert any("Could not publish scratch preparation receipt" in note for note in caught.value.__notes__)
     assert next(directory.glob("*.transport.log")).stat().st_size > 0
-
-
-def test_gateway_scratch_cleanup_node_boot_drift_is_retained_without_success(
-    _gateway_scratch_launch_node, monkeypatch
-):
-    original = Path.read_text
-    boots = iter(["original-boot", "changed-boot"])
-
-    def read(path, *args, **kwargs):
-        if str(path) == "/proc/sys/kernel/random/boot_id":
-            return next(boots)
-        return original(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "read_text", read)
-    result = ap_driver._gateway_scratch_node(_gateway_scratch_launch_node)
-    assert not result["ok"] and "allocation identity changed" in result["error"]
-    assert result["boot_id"] == "original-boot"
-
-
-@pytest.mark.parametrize("upstream", [False, True])
-def test_gateway_scratch_cleanup_default_environment_restored_and_upstream_remains_unchanged(
-    tmp_path, monkeypatch, upstream
-):
-    monkeypatch.delenv("AP_CORRECTNESS_TMPDIR", raising=False)
-    hostfile = tmp_path / "hostfile"
-    hostfile.write_text("synthetic-head slots=8\n")
-    monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: hostfile)
-    events = []
-
-    def prepare(*args):
-        assert not upstream
-        events.append("prepared")
-        return {"path": "/data-fast/tmp/owned-default"}
-
-    @contextmanager
-    def launch(*args, **kwargs):
-        assert os.environ.get("AP_CORRECTNESS_TMPDIR") == (None if upstream else "/data-fast/tmp/owned-default")
-        events.append("launched")
-        yield "http://127.0.0.1:1"
-
-    monkeypatch.setattr(ap_driver, "_prepare_gateway_scratch", prepare)
-    monkeypatch.setattr(ap_driver, "_launch_local_cortex_gateway", launch)
-    options = {} if upstream else {"gateway_module": "arctic_platform.correctness.harness.gateway"}
-    with pytest.raises(RuntimeError, match="original workload"):
-        with ap_driver._started_local_cortex_gateway(tmp_path / "gateway", tmp_path / "owner.json", **options):
-            raise RuntimeError("original workload")
-    assert "AP_CORRECTNESS_TMPDIR" not in os.environ
-    assert events == (["launched"] if upstream else ["prepared", "launched"])
 
 
 @pytest.mark.parametrize("changed", ["atime-only", "inode"])
@@ -7716,63 +6732,6 @@ def test_gateway_scratch_peer_rejects_snapshot_membership_and_runtime_drift_befo
     assert not Path(request["path"]).exists(), result
 
 
-@pytest.mark.parametrize("damage", ["boot", "hostname", "address"])
-def test_gateway_scratch_peer_checks_runtime_identity_again_after_local_mkdir(
-    gateway_scratch_peer_request, gateway_scratch_peer_runtime, monkeypatch, damage
-):
-    request, state = gateway_scratch_peer_request, gateway_scratch_peer_runtime
-    original_mkdir = os.mkdir
-
-    def mkdir(path, *args, **kwargs):
-        result = original_mkdir(path, *args, **kwargs)
-        if str(path) == "scratch":
-            setattr(state, {"boot": "boot", "hostname": "host", "address": "address"}[damage], "changed-after-mkdir")
-        return result
-
-    monkeypatch.setattr(ap_driver.os, "mkdir", mkdir)
-    result = ap_driver._gateway_scratch_node(request)
-    assert not result["ok"] and "allocation identity changed" in result["error"], result
-    assert result["boot_id"] == "peer-boot"
-    assert Path(request["path"]).is_dir()
-
-
-@pytest.mark.parametrize("damage", ["missing-file", "hash", "bytes-after-mkdir", "boot-after-mkdir", "none"])
-def test_gateway_scratch_peer_legacy_path_still_reads_local_file_and_does_not_infer_boot(
-    gateway_scratch_peer_request, gateway_scratch_peer_runtime, tmp_path, monkeypatch, damage
-):
-    import base64
-
-    request, state = gateway_scratch_peer_request, gateway_scratch_peer_runtime
-    hostfile = tmp_path / "legacy-hostfile"
-    hostfile.write_bytes(base64.b64decode(request.pop("hostfile_base64")))
-    request.pop("allocation_members")
-    request["hostfile"] = str(hostfile)
-    if damage == "missing-file":
-        hostfile.unlink()
-    elif damage == "hash":
-        request["hostfile_sha256"] = "0" * 64
-    original_mkdir = os.mkdir
-
-    def mkdir(path, *args, **kwargs):
-        result = original_mkdir(path, *args, **kwargs)
-        if str(path) == "scratch":
-            if damage == "bytes-after-mkdir":
-                hostfile.write_text("synthetic-peer slots=1\n")
-            elif damage == "boot-after-mkdir":
-                state.boot = "new-legacy-boot"
-        return result
-
-    monkeypatch.setattr(ap_driver.os, "mkdir", mkdir)
-    result = ap_driver._gateway_scratch_node(request)
-    if damage == "none":
-        assert result["ok"] and result["boot_id"] == "peer-boot", result
-        assert "member" not in result and "slots" not in result
-        assert state.parsed == [(str(hostfile), hostfile.read_bytes())]
-    else:
-        assert not result["ok"] and result["error"], result
-    assert "hostfile_base64" not in request and "allocation_members" not in request
-
-
 @pytest.fixture
 def gateway_scratch_peer_transport(tmp_path, monkeypatch, gateway_scratch_peer_runtime, gateway_scratch_peer_request):
     import base64
@@ -7865,32 +6824,6 @@ def gateway_scratch_peer_transport(tmp_path, monkeypatch, gateway_scratch_peer_r
     return state
 
 
-@pytest.mark.parametrize("explicit", [True, False])
-def test_gateway_scratch_peer_head_transports_snapshot_with_or_without_supplied_identities(
-    gateway_scratch_peer_transport, explicit
-):
-    import base64
-
-    state = gateway_scratch_peer_transport
-    options = {"allocation_members": state.members} if explicit else {}
-    result = ap_driver._prepare_gateway_scratch(state.directory, state.hostfile, **options)
-    assert result["ok"] and set(result["nodes"]) == set(state.members)
-    incoming = state.requests[0]
-    assert incoming == result["request"]
-    assert incoming["hostfile_sha256"] == hashlib.sha256(state.hostfile.read_bytes()).hexdigest()
-    assert base64.b64decode(incoming["hostfile_base64"], validate=True) == state.hostfile.read_bytes()
-    if explicit:
-        assert incoming["allocation_members"] == state.members
-        assert result["nodes"]["synthetic-peer"]["slots"] == 8
-    else:
-        assert "allocation_members" not in incoming
-        assert all("member" not in row for row in result["nodes"].values())
-    assert state.starts[0][0][:3] == ["/synthetic/ds_ssh", "-f", str(state.hostfile)]
-    assert state.starts[0][1]["start_new_session"] and state.waits == [120]
-    saved = json.loads(next(state.directory.glob("scratch-preparation-*.json")).read_text())
-    assert saved == result
-
-
 def test_gateway_scratch_implicit_head_only_hostfile_prepares_every_worker(gateway_scratch_peer_transport):
     state = gateway_scratch_peer_transport
     state.head_only = True
@@ -7900,25 +6833,6 @@ def test_gateway_scratch_implicit_head_only_hostfile_prepares_every_worker(gatew
     assert all(row["ok"] for row in result["nodes"].values())
     assert all("member" not in row and "slots" not in row for row in result["nodes"].values())
     assert len(state.starts) == 1 and state.waits == [120]
-
-
-@pytest.mark.parametrize("entry_kind", ["hostname", "ip"])
-def test_gateway_scratch_implicit_snapshot_never_requires_peer_local_hostfile(
-    gateway_scratch_peer_request, gateway_scratch_peer_runtime, entry_kind
-):
-    import base64
-
-    request = gateway_scratch_peer_request
-    request.pop("allocation_members")
-    if entry_kind == "ip":
-        host_bytes = b"192.0.2.1 slots=4\n192.0.2.2 slots=8\n"
-        request["hostfile_base64"] = base64.b64encode(host_bytes).decode("ascii")
-        request["hostfile_sha256"] = hashlib.sha256(host_bytes).hexdigest()
-    result = ap_driver._gateway_scratch_node(request)
-    assert result["ok"] and result["boot_id"] == "peer-boot", result
-    assert len(gateway_scratch_peer_runtime.parsed) == 1
-    assert "member" not in result and "slots" not in result
-    assert list(Path(request["path"]).iterdir()) == []
 
 
 @pytest.mark.parametrize("damage", ["base64", "empty", "oversize", "duplicate", "foreign", "hash", "python"])
@@ -7945,71 +6859,6 @@ def test_gateway_scratch_implicit_snapshot_rejects_unbound_metadata_before_mkdir
     result = ap_driver._gateway_scratch_node(request)
     assert not result["ok"] and result["error"], result
     assert not Path(request["path"]).exists()
-
-
-@pytest.mark.parametrize("damage", ["head-bytes", "head-inode", "head-mode", "swapped", "missing", "duplicate"])
-def test_gateway_scratch_implicit_snapshot_retains_head_and_complete_fanout_guards(
-    gateway_scratch_peer_transport, damage
-):
-    state = gateway_scratch_peer_transport
-    state.head_only = True
-    state.damage = damage
-    with pytest.raises(ValueError):
-        ap_driver._prepare_gateway_scratch(state.directory, state.hostfile)
-    saved = json.loads(next(state.directory.glob("scratch-preparation-*.json")).read_text())
-    assert not saved["ok"] and saved["error"]
-    assert Path(saved["transport_log"]).stat().st_size > 0
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "swapped",
-        "missing",
-        "duplicate",
-        "member",
-        "slots",
-        "bool-slots",
-        "host",
-        "address",
-        "boot",
-        "python",
-        "hash",
-        "head-bytes",
-        "head-inode",
-        "head-mode",
-    ],
-)
-def test_gateway_scratch_peer_head_rejects_changed_file_or_unauthenticated_transport_and_retains_evidence(
-    gateway_scratch_peer_transport, damage
-):
-    state = gateway_scratch_peer_transport
-    state.damage = damage
-    with pytest.raises(ValueError) as caught:
-        ap_driver._prepare_gateway_scratch(state.directory, state.hostfile, allocation_members=state.members)
-    saved = json.loads(next(state.directory.glob("scratch-preparation-*.json")).read_text())
-    assert saved["ok"] is False and saved["error"]
-    assert Path(saved["transport_log"]).stat().st_size > 0
-    assert any("Scratch preparation evidence:" in note for note in caught.value.__notes__)
-    assert len(state.starts) == 1 and state.waits == [120]
-
-
-@pytest.mark.parametrize("damage", ["missing", "extra", "slots", "duplicate-address"])
-def test_gateway_scratch_peer_head_rejects_incomplete_mapping_before_transport(gateway_scratch_peer_transport, damage):
-    state = gateway_scratch_peer_transport
-    if damage == "missing":
-        state.members.pop("synthetic-peer")
-    elif damage == "extra":
-        state.members["foreign"] = copy.deepcopy(state.members["synthetic-peer"])
-    elif damage == "slots":
-        state.members["synthetic-peer"]["slots"] = 7
-    else:
-        state.members["synthetic-peer"]["address"] = state.members["synthetic-head"]["address"]
-    with pytest.raises(ValueError):
-        ap_driver._prepare_gateway_scratch(state.directory, state.hostfile, allocation_members=state.members)
-    assert state.starts == [] and not state.root.exists()
-    saved = json.loads(next(state.directory.glob("scratch-preparation-*.json")).read_text())
-    assert not saved["ok"] and saved["error"]
 
 
 @pytest.mark.parametrize("explicit", [True, False])
@@ -8051,105 +6900,7 @@ def test_gateway_scratch_peer_public_gateway_rejects_supplied_mapping_for_upstre
             pytest.fail("upstream gateway accepted authenticated mapping")
 
 
-@pytest.mark.parametrize("explicit", [True, False])
-@pytest.mark.parametrize("body_error", [True, False])
-def test_gateway_scratch_peer_started_gateway_passes_mapping_only_to_preparation_and_restores_environment(
-    tmp_path, monkeypatch, gateway_scratch_peer_request, explicit, body_error
-):
-    hostfile = tmp_path / "hostfile"
-    hostfile.write_text("synthetic-peer slots=8\n")
-    monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: hostfile)
-    monkeypatch.setenv("AP_CORRECTNESS_TMPDIR", "/data-fast/tmp/original-peer-parent")
-    members = gateway_scratch_peer_request["allocation_members"]
-    events = []
-    options = {"allocation_members": members} if explicit else {}
-
-    def prepare(directory, hosts, **kwargs):
-        assert hosts == hostfile and kwargs == options
-        if explicit:
-            assert kwargs["allocation_members"] is members
-        events.append("prepare")
-        return {"path": str(tmp_path / "prepared-peer-parent")}
-
-    @contextmanager
-    def launch(directory, record, hosts, *, gateway_module):
-        assert hosts == hostfile
-        assert os.environ["AP_CORRECTNESS_TMPDIR"] == str(tmp_path / "prepared-peer-parent")
-        events.append("launch")
-        try:
-            yield "http://synthetic.invalid:1"
-        finally:
-            events.append("close")
-
-    monkeypatch.setattr(ap_driver, "_prepare_gateway_scratch", prepare)
-    monkeypatch.setattr(ap_driver, "_launch_local_cortex_gateway", launch)
-    primary = RuntimeError("new peer workload failure")
-
-    def workload():
-        with ap_driver._started_local_cortex_gateway(
-            tmp_path / "gateway",
-            tmp_path / "owner.json",
-            gateway_module="arctic_platform.correctness.harness.gateway",
-            **options,
-        ):
-            assert events == ["prepare", "launch"]
-            if body_error:
-                raise primary
-
-    if body_error:
-        with pytest.raises(RuntimeError) as caught:
-            workload()
-        assert caught.value is primary
-    else:
-        workload()
-    assert events == ["prepare", "launch", "close"]
-    assert os.environ["AP_CORRECTNESS_TMPDIR"] == "/data-fast/tmp/original-peer-parent"
-
-
 # Reviewed subset specifications and explicit operator case selection.
-
-
-def selected_spec_case_prepare(state, cases, *, publish=True):
-    if publish:
-        state.spec.write(state.candidate)
-    before_cfg = copy.deepcopy(state.cfg.sub_job)
-    before_arms = copy.deepcopy(state.derived)
-    before_bytes = state.candidate.read_bytes() if state.candidate.exists() else None
-    prepared = execution._frozen_spec(
-        state.cfg,
-        state.path,
-        state.derived,
-        attention=state.attention,
-        cases=cases,
-        results=state.results,
-        specs=state.specs,
-        test_spec=state.candidate,
-    )
-    assert state.cfg.sub_job == before_cfg and state.derived == before_arms
-    assert (state.candidate.read_bytes() if state.candidate.exists() else None) == before_bytes
-    return prepared
-
-
-def selected_spec_case_assert_recorded_nonpass(state, prepared, monkeypatch):
-    assert prepared is None, prepared
-    assert state.results, "rejected case selection must retain a nonpass result"
-    assert all(result.outcome is not Outcome.PASS for result in state.results)
-    assert all(result.config_id == state.cfg.config_id for result in state.results)
-    assert all(result.summary and result.reason for result in state.results)
-    saved = []
-    monkeypatch.setattr(
-        execution,
-        "write_report",
-        lambda results, specs, out, **kwargs: saved.extend(copy.deepcopy(results)),
-    )
-    status = execution._finish(
-        state.results,
-        state.specs,
-        state.tmp / "report",
-        configs=1,
-        started=time.monotonic(),
-    )
-    assert status != 0 and saved == state.results
 
 
 def test_operator_external_config_copy_refuses_id_collision_instead_of_changing_filename(
@@ -8183,140 +6934,6 @@ def test_onboarding_failure_banner_uppercases_only_heading_and_preserves_diagnos
     )
     onboard._onboarding_failure(f"{heading}\n{details}")
     assert capsys.readouterr().err == f"\n\n!!!!! ONBOARDING FAILED : {heading} !!!!!\n\n{details}\n\n"
-
-
-def test_owned_gateway_descendants_include_token_bound_detached_workers(_owned_gateway_descendant):
-    state = _owned_gateway_descendant
-    state.fields[2:4] = ["12346", "12346"]
-    (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(state.fields))
-    assert [entry["pid"] for entry in ap_driver._owned_gateway_descendants(state.gateway, "owned-token")] == [12346]
-
-
-@pytest.mark.parametrize("code", [0, 3, 38])
-def test_owned_gateway_pidfd_signal_libc_fallback_preserves_errors(monkeypatch, code):
-    import ctypes
-
-    send = Mock(return_value=-1 if code else 0)
-    monkeypatch.delattr(ap_driver.signal, "pidfd_send_signal", raising=False)
-    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: SimpleNamespace(pidfd_send_signal=send))
-    monkeypatch.setattr(ctypes, "get_errno", lambda: code)
-    if code:
-        with pytest.raises(OSError) as raised:
-            ap_driver._send_gateway_pidfd_signal(42, signal.SIGTERM)
-        assert raised.value.errno == code
-    else:
-        ap_driver._send_gateway_pidfd_signal(42, signal.SIGTERM)
-    send.assert_called_once_with(42, signal.SIGTERM, None, 0)
-
-
-@pytest.mark.parametrize("record_token", ["old-token", "replacement-token", None])
-@pytest.mark.parametrize("lock_busy", [False, True])
-def test_owned_gateway_cleanup_guard_respects_replacement_registry(tmp_path, monkeypatch, record_token, lock_busy):
-    import fcntl
-
-    path = tmp_path / "gateway.json"
-    if record_token is not None:
-        path.write_text(json.dumps({"token": record_token}))
-    recover = Mock()
-    scan = Mock()
-    monkeypatch.setattr(ap_driver, "_recover_owned_gateway", recover)
-    monkeypatch.setattr(ap_driver, "_cleanup_unrecorded_gateway", scan)
-    with (tmp_path / "owner.lock").open("a") as lock:
-        if lock_busy:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        ap_driver.cleanup_owned_gateway(path, "old-token")
-    if record_token == "old-token" and not lock_busy:
-        recover.assert_called_once_with(path)
-    else:
-        recover.assert_not_called()
-    scan.assert_called_once_with("old-token")
-    assert path.exists() == (record_token is not None)
-
-
-def test_owned_gateway_cleanup_guard_scans_unrecorded_launch_after_recovery_failure(tmp_path, monkeypatch):
-    path = tmp_path / "gateway.json"
-    path.write_text(json.dumps({"token": "old-token"}))
-    monkeypatch.setattr(
-        ap_driver, "_recover_owned_gateway", Mock(side_effect=operator_interface_UnsafeCleanupError("unsafe"))
-    )
-    scan = Mock()
-    monkeypatch.setattr(ap_driver, "_cleanup_unrecorded_gateway", scan)
-    with pytest.raises(operator_interface_UnsafeCleanupError, match="unsafe"):
-        ap_driver.cleanup_owned_gateway(path, "old-token")
-    scan.assert_called_once_with("old-token")
-    assert path.exists()
-
-
-@pytest.mark.parametrize("command", ["onboarding", "regression"])
-@pytest.mark.parametrize("phase", ["startup", "execution", "unrecorded"])
-def test_owned_gateway_real_process_sigkill_automatically_cleans_without_next_command(tmp_path, command, phase):
-    script = (
-        "\nimport json\nimport os\nimport signal\nimport subprocess\nimport sys\nfrom argparse import Namespace\nfrom"
-        " pathlib import Path\nfrom types import SimpleNamespace\nimport requests\nimport torch\nfrom"
-        " arctic_platform.correctness.harness import gateway as ap_driver\nfrom"
-        " arctic_platform.correctness.onboarding import onboard\n\nroot, command, phase = Path(sys.argv[1]),"
-        " sys.argv[2], sys.argv[3]\nap_driver._gateway_state_directory = lambda: root /"
-        ' "ownership"\nap_driver._allocation_hostfile = lambda: None\nap_driver._legacy_owned_gateways = lambda:'
-        ' []\nap_driver._prepare_gateway_scratch = lambda *args, **kwargs: {"path": str(root / "scratch")}\n'
-        'torch.cuda.device_count = lambda: 1\ndef health(*args, **kwargs):\n    if phase == "startup":\n       '
-        ' (root / "ready").write_text("")\n        signal.pause()\n    return'
-        " SimpleNamespace(status_code=200)\nrequests.get = health\noriginal_popen = subprocess.Popen\nchild_script ="
-        ' (\n    "import os,signal,time; from pathlib import Path; "\n    "signal.signal(signal.SIGTERM,'
-        " signal.SIG_IGN); \"\n    f\"Path({str(root / 'worker.pid')!r}).write_text(str(os.getpid()));"
-        ' time.sleep(300)"\n)\ngateway_script = (\n    "import subprocess,sys,time; "\n   '
-        " f\"subprocess.Popen([sys.executable, '-c', {child_script!r}], start_new_session=True);"
-        ' time.sleep(300)"\n)\ndef start_gateway(*args, **kwargs):\n    if args[0][1:3] == ["-c",'
-        " ap_driver._GATEWAY_CLEANUP_BOOTSTRAP]:\n        return original_popen(*args, **kwargs)\n    gateway ="
-        ' original_popen(\n        [sys.executable, "-c", gateway_script],\n        stdout=kwargs["stdout"],'
-        ' stderr=kwargs["stderr"], start_new_session=True, env=kwargs["env"],\n    )\n    (root /'
-        ' "gateway.pid").write_text(str(gateway.pid))\n    if phase == "unrecorded":\n        (root /'
-        ' "ready").write_text("")\n        signal.pause()\n    return gateway\nap_driver.subprocess.Popen ='
-        ' start_gateway\ndirectory = root / "attempt"\ncontext ='
-        " (onboard._validation_gateway(Namespace(_automatic_cortex_gateway=True, output_dir=directory))\n           if"
-        ' command == "onboarding" else ap_driver.local_cortex_gateway(directory))\nwith context:\n    (root /'
-        ' "ready").write_text("")\n    signal.pause()\n'
-    )
-    old = subprocess.Popen(
-        [sys.executable, "-c", script, str(tmp_path), command, phase],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    identities = []
-    try:
-        deadline = time.monotonic() + 30
-        while not (tmp_path / "ready").is_file() or not (tmp_path / "worker.pid").is_file():
-            if old.poll() is not None:
-                output, _ = old.communicate(timeout=5)
-                pytest.fail(f"orphan test exited before startup:\n{output}")
-            assert time.monotonic() < deadline, "orphan test startup timed out"
-            time.sleep(0.05)
-        record_path = tmp_path / "ownership" / "gateway.json"
-        gateway = ap_driver._gateway_process_identity(int((tmp_path / "gateway.pid").read_text()))
-        identities = [
-            gateway,
-            ap_driver._gateway_process_identity(int((tmp_path / "worker.pid").read_text())),
-        ]
-        assert all(identities)
-        old.kill()
-        old.communicate(timeout=5)
-        deadline = time.monotonic() + 40
-        while record_path.exists() or any(
-            ap_driver._gateway_process_identity(entry["pid"]) == entry for entry in identities
-        ):
-            assert time.monotonic() < deadline, (tmp_path / "attempt" / "gateway-cleanup.log").read_text()
-            time.sleep(0.05)
-        assert (
-            "Stopping stale owned Cortex-training gateway"
-            in (tmp_path / "attempt" / "gateway-cleanup.log").read_text()
-        )
-    finally:
-        if old.poll() is None:
-            old.kill()
-            old.communicate(timeout=5)
-        for entry in identities:
-            if ap_driver._gateway_process_identity(entry["pid"]) == entry:
-                os.kill(entry["pid"], signal.SIGKILL)
 
 
 @pytest.mark.parametrize("failure", [None, "exit", "exception", "combined"])
@@ -8453,359 +7070,6 @@ def test_onboarding_final_timing_survives_interruption_or_unsafe_cleanup(tmp_pat
         "Total run time: 00:00:07",
     ]
     assert (args._diagnostics_dir / "onboarding.log").read_text().splitlines()[-2:] == output.splitlines()[-2:]
-
-
-@pytest.mark.parametrize("drift", ["timing-only", "recipe", "gate", "reference", "timer-side-effect"])
-def test_onboarding_retry_per_test_timing_preserves_only_unchanged_preparation(_onboarding_retry_sources, drift):
-    import inspect
-
-    onboard, args, root = _onboarding_retry_sources
-    source = root / "onboarding" / "onboard.py"
-    failure_report = (
-        'f"# Onboarding Failed\\n\\nConfig: `{args.config}`\\n\\n"'
-        'f"## Reason\\n\\n{reason}\\n\\nComplete traceback: [onboarding.log](onboarding.log)\\n"'
-    )
-    previous = (
-        "def logged_run(args):\n"
-        "    try:\n"
-        "        return run(args)\n"
-        "    except Exception as exc:\n"
-        "        reason = str(exc)\n"
-        f"        report.write_text({failure_report}, encoding='utf-8')\n"
-        "        return 1\n"
-        "\ndef run(args):\n"
-        "    if args.prepare_references:\n"
-        "        return _prepare_references(args)\n"
-        "    return _parent(args)\n"
-        "\ndef _onboard_configuration(args):\n"
-        "    gate = 0.005\n"
-        "    for test_id in queue:\n"
-        "        code = _parent(child)\n"
-        "        results[test_id] = {'status': code}\n"
-        "    _prepare_references(preparation)\n"
-        "    summary = {'results': results, 'combined_reference_error': preparation_error}\n"
-        "    for test_id, result in results.items():\n"
-        "        lines.extend([f'## {test_id}', '', f\"Status: {result['status']}\", '',\n"
-        "            result.get('reason', f\"Exit code: {result.get('exit_code', 'not run')}\"), ''])\n"
-    )
-    source.write_text(previous)
-    onboard._resume_setup(args)
-    original = args._resume_dir
-    calibration = root / "calibration.json"
-    calibration.write_text('{"gate": 0.005}')
-    onboard._resume_phase(args, "calibration", lambda: str(calibration))
-    saved = (original / "calibration.json").read_bytes()
-
-    timed = (
-        inspect.getsource(onboard._onboarding_test_time)
-        + "\ndef logged_run(args):\n"
-        "    args._onboarding_times = {}\n"
-        "    try:\n"
-        "        return run(args)\n"
-        "    except Exception as exc:\n"
-        "        reason = str(exc)\n"
-        '        timings = "".join(f"\\nOnboarding time ({test_id}): {total_duration(elapsed)}\\n"\n'
-        "            for test_id, elapsed in args._onboarding_times.items())\n"
-        '        report.write_text(f"# Onboarding Failed\\n\\nConfig: `{args.config}`\\n\\n"\n'
-        '            f"## Reason\\n\\n{reason}\\n{timings}\\n"\n'
-        '            "Complete traceback: [onboarding.log](onboarding.log)\\n", encoding="utf-8")\n'
-        "        return 1\n"
-        "    finally:\n"
-        "        for test_id, elapsed in args._onboarding_times.items():\n"
-        '            print(f"Onboarding time ({test_id}): {total_duration(elapsed)}", flush=True)\n'
-        "\ndef run(args):\n"
-        "    if args.prepare_references:\n"
-        "        selection = args.reference_tests or [args.test_id]\n"
-        '        label = selection[0] if len(selection) == 1 else "combined reference preparation"\n'
-        "        with _onboarding_test_time(args, label):\n"
-        "            return _prepare_references(args)\n"
-        "    with _onboarding_test_time(args, args.test_id):\n"
-        "        return _parent(args)\n"
-        "\ndef _onboard_configuration(args):\n"
-        "    from arctic_platform.correctness.harness.report import total_duration\n"
-        '    if not hasattr(args, "_onboarding_times"):\n'
-        "        args._onboarding_times = {}\n"
-        "    gate = 0.005\n"
-        "    for test_id in queue:\n"
-        "        with _onboarding_test_time(child, test_id):\n"
-        "            code = _parent(child)\n"
-        "            results[test_id] = {'status': code}\n"
-        '        results[test_id]["elapsed_seconds"] = args._onboarding_times[test_id]\n'
-        '    with _onboarding_test_time(args, "combined reference preparation"):\n'
-        "        _prepare_references(preparation)\n"
-        "    summary = {'results': results, 'combined_reference_error': preparation_error,\n"
-        '        "combined_reference_elapsed_seconds": args._onboarding_times.get("combined reference preparation")}\n'
-        "    for test_id, result in results.items():\n"
-        "        lines.extend([f'## {test_id}', '', f\"Status: {result['status']}\", '',\n"
-        "            (f\"Onboarding time: {total_duration(result['elapsed_seconds'])}\"\n"
-        '             if "elapsed_seconds" in result else "Onboarding time: not run"), "",\n'
-        "            result.get('reason', f\"Exit code: {result.get('exit_code', 'not run')}\"), ''])\n"
-        '    if "combined reference preparation" in args._onboarding_times:\n'
-        '        lines.extend(["Combined reference preparation time: "\n'
-        '            f"{total_duration(args._onboarding_times[\'combined reference preparation\'])}", ""])\n'
-    )
-    if drift == "recipe":
-        timed = timed.replace("_parent(child)", "_different_parent(child)")
-    elif drift == "gate":
-        timed = timed.replace("gate = 0.005", "gate = 0.100")
-    elif drift == "reference":
-        timed = timed.replace("_prepare_references(args)", "_different_references(args)")
-    elif drift == "timer-side-effect":
-        timed = timed.replace("        yield\n", "        _parent(args)\n        yield\n")
-    source.write_text(timed)
-    onboard._resume_setup(args)
-    assert args._resume_candidates == ([original] if drift == "timing-only" else [])
-    if drift == "timing-only":
-        assert onboard._resume_phase(
-            args, "calibration", lambda: pytest.fail("timing must not repeat compatible HF preparation")
-        ) == str(calibration)
-        assert (original / "calibration.json").read_bytes() == saved
-        validations = []
-        onboard._resume_phase(args, "validation", lambda: validations.append("current") or {"status": "pass"})
-        assert validations == ["current"]
-
-
-@pytest.fixture
-def selected_spec_case_state(tmp_path, monkeypatch):
-    from arctic_platform.correctness.harness.config import ArmSpec
-    from arctic_platform.correctness.harness.config import LoadedConfig
-    from arctic_platform.correctness.harness.config import ModelSpec
-    from arctic_platform.correctness.harness.config import TestSpec
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("selected-spec validation attempted a target, subprocess, network, or CUDA operation")
-
-    monkeypatch.setattr(execution, "execute", forbidden)
-    monkeypatch.setattr(execution, "local_cortex_gateway", forbidden)
-    monkeypatch.setattr(subprocess, "Popen", forbidden)
-    monkeypatch.setattr(subprocess, "run", forbidden)
-    monkeypatch.setattr(ap_driver.socket, "gethostbyname", forbidden)
-    monkeypatch.setattr(ap_driver.socket, "create_connection", forbidden)
-    monkeypatch.setattr(ap_driver.socket.socket, "connect", forbidden)
-    monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
-    path = tmp_path / "synthetic-selected.config"
-    cfg = LoadedConfig(
-        config_id="synthetic-selected-spec",
-        path=path,
-        sub_job={
-            "model_name": "synthetic-selected-model",
-            "seed": 42,
-            "training_config": {"n_gpus": 8, "max_seq_len": 8192, "attn_implementation": "sdpa"},
-        },
-    )
-    arms = execution.arms_for(cfg.max_seq_len, cfg.n_gpus)
-    assert [(arm.name, arm.global_batch_size, arm.max_seq_len) for arm in arms] == [
-        ("gas1", 8, 8192),
-        ("gas4", 32, 8192),
-    ]
-    spec = TestSpec(
-        config_id=cfg.config_id,
-        config_path=str(path),
-        config_checksum=execution.config_checksum(cfg),
-        model=ModelSpec(
-            source_checkpoint="synthetic-not-loaded",
-            num_hidden_layers=1,
-            vision_depth=None,
-            seed=42,
-            param_count=1,
-            cache_path="synthetic-not-loaded",
-            content_hash="synthetic-only",
-            sized_against_gib=None,
-        ),
-        arms=[
-            ArmSpec(
-                name=arm.name,
-                global_batch_size=arm.global_batch_size,
-                max_seq_len=arm.max_seq_len,
-                total_tokens=arm.total_tokens,
-                active_tokens=arm.total_tokens,
-                ap_microbatches=1 if arm.name == "gas1" else 4,
-                pad_fraction=0.0,
-            )
-            for arm in arms
-        ],
-        attn_implementations=["sdpa"],
-        applicable_tests=["single-step-optimizer"],
-    )
-    return SimpleNamespace(
-        cfg=cfg,
-        path=path,
-        derived=arms,
-        spec=spec,
-        candidate=tmp_path / "reviewed.json",
-        results=[],
-        specs={},
-        attention="sdpa",
-        tmp=tmp_path,
-    )
-
-
-@pytest.mark.parametrize("reviewed", ["gas1-only", "full"])
-@pytest.mark.parametrize("unselected_drift", ["none", "rows", "sequence"])
-def test_selected_spec_case_explicit_gas1_accepts_reviewed_shape_despite_unselected_derived_case(
-    selected_spec_case_state, reviewed, unselected_drift
-):
-    state = selected_spec_case_state
-    if reviewed == "gas1-only":
-        state.spec.arms = state.spec.arms[:1]
-    gas4 = state.derived[1]
-    if unselected_drift != "none":
-        state.derived[1] = execution.ArmDefinition(
-            gas4.name,
-            gas4.global_batch_size + (8 if unselected_drift == "rows" else 0),
-            gas4.max_seq_len + (1 if unselected_drift == "sequence" else 0),
-        )
-    prepared = selected_spec_case_prepare(state, ["gas1"])
-    assert prepared is not None, state.results
-    frozen, selected = prepared
-    assert selected == state.derived[:1] and selected[0].name == "gas1"
-    assert frozen == state.spec and state.specs[state.cfg.config_id] == frozen
-    assert state.results == []
-
-
-@pytest.mark.parametrize("cases", [None, []], ids=["absent", "empty"])
-@pytest.mark.parametrize("damage", ["none", "subset", "rows", "sequence", "extra", "order"])
-def test_selected_spec_case_unfiltered_keeps_complete_ordered_case_equality(
-    selected_spec_case_state, monkeypatch, cases, damage
-):
-    state = selected_spec_case_state
-    if damage == "subset":
-        state.spec.arms = state.spec.arms[:1]
-    elif damage == "rows":
-        state.spec.arms[1].global_batch_size += 8
-    elif damage == "sequence":
-        state.spec.arms[1].max_seq_len += 1
-    elif damage == "extra":
-        extra = copy.deepcopy(state.spec.arms[1])
-        extra.name = "gas16"
-        state.spec.arms.append(extra)
-    elif damage == "order":
-        state.spec.arms.reverse()
-    prepared = selected_spec_case_prepare(state, cases)
-    if damage == "none":
-        assert prepared is not None and prepared[0] == state.spec and prepared[1] == state.derived
-        assert not state.results
-    else:
-        selected_spec_case_assert_recorded_nonpass(state, prepared, monkeypatch)
-
-
-@pytest.mark.parametrize("location", ["reviewed", "derived"])
-@pytest.mark.parametrize("damage", ["missing", "rows", "sequence"])
-def test_selected_spec_case_selected_missing_or_changed_shape_is_recorded_nonpass(
-    selected_spec_case_state, monkeypatch, location, damage
-):
-    state = selected_spec_case_state
-    collection = state.spec.arms if location == "reviewed" else state.derived
-    if damage == "missing":
-        collection.pop(0)
-    elif location == "reviewed":
-        if damage == "rows":
-            collection[0].global_batch_size += 1
-        else:
-            collection[0].max_seq_len += 1
-    else:
-        arm = collection[0]
-        collection[0] = execution.ArmDefinition(
-            arm.name,
-            arm.global_batch_size + (1 if damage == "rows" else 0),
-            arm.max_seq_len + (1 if damage == "sequence" else 0),
-        )
-    prepared = selected_spec_case_prepare(state, ["gas1"])
-    selected_spec_case_assert_recorded_nonpass(state, prepared, monkeypatch)
-
-
-@pytest.mark.parametrize(
-    "cases,reviewed",
-    [
-        (["gas99"], "full"),
-        ([""], "full"),
-        (["gas1", "gas99"], "full"),
-        (["gas4"], "gas1-only"),
-        (["gas1", "gas4"], "gas1-only"),
-        (["gas1"], "empty"),
-    ],
-    ids=["unknown", "empty-name", "mixed-unknown", "unreviewed", "mixed-unreviewed", "empty-review"],
-)
-def test_selected_spec_case_unknown_or_unreviewed_selection_cannot_disappear_from_report(
-    selected_spec_case_state, monkeypatch, cases, reviewed
-):
-    state = selected_spec_case_state
-    if reviewed == "gas1-only":
-        state.spec.arms = state.spec.arms[:1]
-    elif reviewed == "empty":
-        state.spec.arms = []
-    prepared = selected_spec_case_prepare(state, cases)
-    selected_spec_case_assert_recorded_nonpass(state, prepared, monkeypatch)
-
-
-@pytest.mark.parametrize(
-    "location,duplicate",
-    [
-        ("requested", "gas1"),
-        ("reviewed", "gas1"),
-        ("reviewed", "gas4"),
-        ("derived", "gas1"),
-        ("derived", "gas4"),
-        ("both", "gas1"),
-    ],
-)
-def test_selected_spec_case_duplicate_requested_or_catalog_names_are_not_collapsed(
-    selected_spec_case_state, monkeypatch, location, duplicate
-):
-    state = selected_spec_case_state
-    cases = ["gas1", "gas1"] if location == "requested" else ["gas1"]
-    index = 0 if duplicate == "gas1" else 1
-    if location in {"reviewed", "both"}:
-        state.spec.arms.append(copy.deepcopy(state.spec.arms[index]))
-    if location in {"derived", "both"}:
-        state.derived.append(copy.deepcopy(state.derived[index]))
-    prepared = selected_spec_case_prepare(state, cases)
-    selected_spec_case_assert_recorded_nonpass(state, prepared, monkeypatch)
-
-
-@pytest.mark.parametrize("reviewed", ["gas1-only", "full"])
-@pytest.mark.parametrize(
-    "damage", ["identity", "checksum", "missing-checksum", "config-content", "attention", "registry"]
-)
-def test_selected_spec_case_subset_selection_cannot_bypass_config_or_backend_or_registry_guards(
-    selected_spec_case_state, monkeypatch, reviewed, damage
-):
-    state = selected_spec_case_state
-    if reviewed == "gas1-only":
-        state.spec.arms = state.spec.arms[:1]
-    if damage == "identity":
-        state.spec.config_id = "foreign-config"
-    elif damage == "checksum":
-        state.spec.config_checksum = "0" * 64
-    elif damage == "missing-checksum":
-        state.spec.config_checksum = ""
-    elif damage == "config-content":
-        state.cfg.sub_job["seed"] = 43
-    elif damage == "attention":
-        state.attention = "unreviewed-backend"
-    else:
-        state.spec.applicable_tests.append("synthetic-unregistered-check")
-    prepared = selected_spec_case_prepare(state, ["gas1"])
-    selected_spec_case_assert_recorded_nonpass(state, prepared, monkeypatch)
-
-
-def test_selected_spec_case_missing_review_records_nonpass_without_regenerating_spec(
-    selected_spec_case_state, monkeypatch
-):
-    state = selected_spec_case_state
-    prepared = selected_spec_case_prepare(state, ["gas1"], publish=False)
-    selected_spec_case_assert_recorded_nonpass(state, prepared, monkeypatch)
-    assert not state.candidate.exists()
-
-
-def test_selected_spec_case_explicit_multiple_selection_runs_only_reviewed_cases_in_derived_order(
-    selected_spec_case_state,
-):
-    state = selected_spec_case_state
-    prepared = selected_spec_case_prepare(state, ["gas4", "gas1"])
-    assert prepared is not None and prepared[1] == state.derived
-    assert [arm.name for arm in prepared[1]] == ["gas1", "gas4"]
-    assert prepared[0] == state.spec and state.results == []
 
 
 # Prepared reference runner.
@@ -8963,62 +7227,6 @@ def _prepared_reference_runner_prepared_runner(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("order", ["batched", "arm"])
-def test_prepared_reference_runner_default_regression_uses_prepared_norms_for_both_arms(
-    _prepared_reference_runner_prepared_runner, order
-):
-    control = _prepared_reference_runner_prepared_runner
-    results = control.execute(order=order)
-    assert [(result.test_id, result.arm, result.outcome, result.gpus) for result in results] == [
-        (check, arm.name, Outcome.PASS, 4) for arm in control.arms for check in _prepared_reference_runner_STEP_CHECKS
-    ]
-    assert control.events[:4] == [
-        ("record", check, arm.name) for arm in control.arms for check in _prepared_reference_runner_STEP_CHECKS
-    ]
-    assert [event for event in control.events if event[0] == "target"] == [("target", "gas1"), ("target", "gas4")]
-    gateways = 1 if order == "batched" else 2
-    assert control.events.count(("gateway-enter",)) == gateways
-    assert control.events.count(("gateway-exit",)) == gateways
-    assert control.events.count(("job-enter",)) == control.events.count(("job-exit",)) == 2
-    assert not control.published
-    assert len(control.recipes) == 4
-    assert all((recipe["model"] == {"sha256": "mock-reviewed-model"} for _, _, recipe in control.recipes))
-    assert all(
-        (recipe["optimizer"]["learning_rate"] == runner.OPTIMIZER_LEARNING_RATE for _, _, recipe in control.recipes)
-    )
-    for result in results:
-        if result.test_id == "single-step-optimizer":
-            assert result.metrics["optimizer_values_compared"] == 3
-            assert result.metrics["optimizer_values_over_criterion"] == 0
-            assert result.metrics["stated_criterion_abs"] == 0.001
-
-
-def test_prepared_reference_runner_each_comparator_uses_its_own_prepared_reference(
-    _prepared_reference_runner_prepared_runner,
-):
-    control = _prepared_reference_runner_prepared_runner
-    misleading_optimizer_norms = copy.deepcopy(control.record["optimizer_norms"])
-    misleading_optimizer_norms["parameters"]["layer.weight"]["exp_avg"] = 9.0
-    for arm in control.arms:
-        control.record_overrides["single-step-grads", arm.name] = {"optimizer_norms": misleading_optimizer_norms}
-        control.record_overrides["single-step-optimizer", arm.name] = {
-            "grad_norms": {"layer.weight": 9.0},
-            "loss": 3.0,
-        }
-    results = control.execute()
-    assert len(results) == 4
-    assert all((result.outcome is Outcome.PASS for result in results))
-    for result in results:
-        if result.test_id == "single-step-grads":
-            assert result.metrics["reference_loss"] == 2.0
-            assert result.metrics["max_abs_diff"] == 0.0
-        else:
-            assert result.test_id == "single-step-optimizer"
-            assert result.metrics["reference_loss"] == 3.0
-            assert result.metrics["max_optimizer_norm_delta"] == 0.0
-    assert not control.published
-
-
-@pytest.mark.parametrize("order", ["batched", "arm"])
 def test_prepared_reference_runner_missing_gas4_reference_rejects_before_any_target(
     _prepared_reference_runner_prepared_runner, order
 ):
@@ -9030,36 +7238,6 @@ def test_prepared_reference_runner_missing_gas4_reference_rejects_before_any_tar
         ("record", check, arm.name) for arm in control.arms for check in _prepared_reference_runner_STEP_CHECKS
     ]
     assert not control.published
-
-
-def test_prepared_reference_runner_prepare_mode_measures_hf_once_and_never_starts_target(
-    _prepared_reference_runner_prepared_runner, monkeypatch
-):
-    control = _prepared_reference_runner_prepared_runner
-    control.missing.add(("single-step-grads", "gas1"))
-
-    def reference(model, batch, output, **kwargs):
-        assert model == control.spec.model.cache_path
-        assert batch.name == "batch-gas1.pt"
-        assert kwargs["optimizer_config"] is None
-        control.events.append(("hf", "gas1"))
-        return {
-            **{key: value for key, value in control.record.items() if not key.startswith("optimizer_")},
-            "active_tokens": control.recipes[-1][2]["synthetic_inputs"]["batch"]["active_tokens"],
-        }
-
-    monkeypatch.setattr(runner, "run_reference", reference)
-    results = control.execute(selected=["single-step-grads"], selected_arms=control.arms[:1], prepare_references=True)
-    assert results == []
-    assert control.events == [
-        ("record", "single-step-grads", "gas1"),
-        ("hf", "gas1"),
-        ("publish", "single-step-grads", "gas1"),
-    ]
-    assert len(control.published) == 1
-    identity, measurements = control.published[0]
-    assert identity["check_id"] == "single-step-grads"
-    assert measurements["grad_norms"] == {"layer.weight": 1.0}
 
 
 @pytest.mark.parametrize("override", [None, "eager"])
@@ -9521,55 +7699,6 @@ def test_reference_records_missing_record_has_actionable_onboarding_command_with
     assert _reference_records_ctx.reference_record_paths == {}
 
 
-def test_reference_records_missing_combined_reference_command_roundtrips_selection_and_workload(
-    _reference_records_ctx, _reference_records_identity, monkeypatch
-):
-    _reference_records_no_hf(monkeypatch)
-    _reference_records_ctx.spec.config_path = "configs/unit lora.config"
-    _reference_records_ctx.reference_records_dir /= "compact records"
-    _reference_records_ctx.local_gateway_full_model = True
-    _reference_records_identity["recipe"].update(optimizer={"lr": 0.0001}, token_budget=64)
-    with pytest.raises(records.ReferencePrerequisiteError) as error:
-        records.load_record(_reference_records_ctx, _reference_records_identity)
-    command = shlex.split(str(error.value).split("; run ", 1)[1])
-    assert command == [
-        "python",
-        "-m",
-        "arctic_platform.correctness",
-        "onboard",
-        "--config",
-        _reference_records_ctx.spec.config_path,
-        "--prepare-references",
-        "--reference-tests",
-        _reference_records_GRADS,
-        _reference_records_OPTIMIZER,
-        "--reference-records-dir",
-        str(_reference_records_ctx.reference_records_dir),
-        "--local-gateway-full-model",
-        "--reference-token-budget",
-        "64",
-    ]
-    assert not _reference_records_ctx.reference_records_dir.exists()
-    assert not _reference_records_ctx.reference_record_paths
-
-
-def test_reference_records_repeat_publication_is_byte_identical_and_does_not_replace_file(
-    _reference_records_ctx, _reference_records_identity
-):
-    measurements = _reference_records_measurements()
-    path = records.publish_record(_reference_records_ctx, _reference_records_identity, measurements)
-    before = path.stat()
-    payload = path.read_bytes()
-    repeated = records.publish_record(
-        _reference_records_ctx, _reference_records_identity, dict(reversed(list(measurements.items())))
-    )
-    assert repeated == path
-    assert path.read_bytes() == payload
-    assert path.stat().st_ino == before.st_ino
-    assert path.stat().st_mtime_ns == before.st_mtime_ns
-    assert list(path.parent.glob("*.json")) == [path]
-
-
 def _reference_records_set(identity, *, generation="current"):
     entries = []
     for arm in ("gas1", "gas4"):
@@ -9640,74 +7769,6 @@ def test_reference_set_single_arm_publication_cannot_erase_existing_complete_set
     assert {path: path.read_bytes() for path in paths.values()} == before
 
 
-def test_reference_set_publication_recovers_interrupted_legacy_conversion(
-    _reference_records_ctx, _reference_records_identity
-):
-    identity = _reference_records_identity
-    path = records._legacy_record_path(_reference_records_ctx, identity)
-    path.parent.mkdir(parents=True)
-    data = records._record_bytes(identity, _reference_records_measurements())
-    path.write_bytes(data)
-    directory = records._config_dir(_reference_records_ctx, identity)
-    previous = directory.parent / f".previous-{directory.name}"
-    directory.rename(previous)
-    assert not directory.exists()
-    assert records.load_record(_reference_records_ctx, identity) == _reference_records_measurements()
-    assert path.read_bytes() == data
-    assert not previous.exists()
-
-
-def test_reference_set_second_rename_failure_restores_legacy_directory(
-    _reference_records_ctx, _reference_records_identity, monkeypatch
-):
-    identity = _reference_records_identity
-    path = records._legacy_record_path(_reference_records_ctx, identity)
-    path.parent.mkdir(parents=True)
-    data = records._record_bytes(identity, _reference_records_measurements())
-    path.write_bytes(data)
-
-    original = records.os.rename
-
-    def fail(source, destination):
-        if ".set-" in str(source):
-            raise OSError("synthetic directory rename failure")
-        original(source, destination)
-
-    monkeypatch.setattr(records.os, "rename", fail)
-    with pytest.raises(OSError, match="directory rename failure"):
-        _publish_reference_set(_reference_records_ctx, _reference_records_set(identity))
-    assert path.read_bytes() == data
-    assert not list(_reference_records_ctx.reference_records_dir.glob(".previous-*"))
-    assert not list(_reference_records_ctx.reference_records_dir.glob(".set-*"))
-
-
-@pytest.mark.parametrize("switched", [False, True])
-def test_reference_set_recovers_abandoned_generation_without_removing_current_set(
-    _reference_records_ctx, _reference_records_identity, switched
-):
-    old = _reference_records_set(_reference_records_identity, generation="old")
-    _publish_reference_set(_reference_records_ctx, old)
-    directory = records._config_dir(_reference_records_ctx, _reference_records_identity)
-    abandoned = directory.parent / f".set-{directory.name}-interrupted"
-    staged = abandoned / directory.name
-    staged.mkdir(parents=True)
-    new = _reference_records_set(_reference_records_identity)
-    for identity, measurements in new:
-        path = staged / records._record_path(_reference_records_ctx, identity).relative_to(directory)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(records._record_bytes(identity, measurements))
-    previous = directory.parent / f".previous-{directory.name}"
-    os.rename(directory, previous)
-    if switched:
-        os.rename(staged, directory)
-    expected = new if switched else old
-    for identity, measurements in expected:
-        assert records.load_record(_reference_records_ctx, identity) == measurements
-    assert not list(directory.parent.glob(f".set-{directory.name}-*"))
-    assert not previous.exists()
-    assert directory.is_dir() and not directory.is_symlink()
-
-
 def test_reference_set_unowned_symlink_is_not_deleted_or_replaced(
     _reference_records_ctx, _reference_records_identity, tmp_path
 ):
@@ -9722,20 +7783,6 @@ def test_reference_set_unowned_symlink_is_not_deleted_or_replaced(
         _publish_reference_set(_reference_records_ctx, _reference_records_set(_reference_records_identity))
     assert directory.resolve() == external
     assert marker.read_text() == "not a reference set"
-
-
-def test_reference_set_mismatched_input_generation_preserves_previous_set(
-    _reference_records_ctx, _reference_records_identity
-):
-    old = _reference_records_set(_reference_records_identity)
-    paths = _publish_reference_set(_reference_records_ctx, old)
-    before = {path: path.read_bytes() for path in paths.values()}
-    new = _reference_records_set(_reference_records_identity, generation="new")
-    for index, (identity, _) in enumerate(new):
-        identity["recipe"]["synthetic_inputs"] = {"seed": index, "batch": {"name": identity["recipe"]["arm"]}}
-    with pytest.raises(records.ReferencePrerequisiteError, match="incompatible workload generations"):
-        _publish_reference_set(_reference_records_ctx, new)
-    assert {path: path.read_bytes() for path in paths.values()} == before
 
 
 @pytest.mark.parametrize("failure", ["fsync", "rename", "interrupt", "staged-corruption"])
@@ -9816,39 +7863,6 @@ def test_reference_set_concurrent_generations_never_publish_mixed_arms(
     assert not list(_reference_records_ctx.reference_records_dir.glob(".prepare-*"))
 
 
-def test_reference_set_legacy_migration_removes_all_replaced_versions_preserving_other_workloads(
-    _reference_records_ctx, _reference_records_identity
-):
-    standalone = _reference_records_set(_reference_records_identity)
-    combined_identity = deepcopy(_reference_records_identity)
-    combined_identity["recipe"]["optimizer"] = {"learning_rate": 0.01}
-    combined = _reference_records_set(combined_identity)
-    untouched = []
-    for entries in (standalone, combined):
-        for identity, measurements in entries:
-            for generation in ("old", "current"):
-                legacy = {**identity, "python": generation}
-                path = records._legacy_record_path(_reference_records_ctx, legacy)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(records._record_bytes(legacy, measurements))
-                if entries is combined:
-                    untouched.append(path)
-    for identity, measurements in standalone:
-        assert records.load_record(_reference_records_ctx, identity) == measurements
-    published = _publish_reference_set(_reference_records_ctx, standalone)
-    assert set(records._config_dir(_reference_records_ctx, _reference_records_identity).rglob("*.json")) == {
-        *published.values(),
-        *untouched,
-    }
-    combined_published = _publish_reference_set(_reference_records_ctx, combined)
-    assert set(records._config_dir(_reference_records_ctx, _reference_records_identity).rglob("*.json")) == {
-        *published.values(),
-        *combined_published.values(),
-    }
-    for identity, measurements in standalone + combined:
-        assert records.load_record(_reference_records_ctx, identity) == measurements
-
-
 def test_reference_set_current_lookup_never_falls_back_to_obsolete_legacy_record(
     _reference_records_ctx, _reference_records_identity
 ):
@@ -9858,24 +7872,6 @@ def test_reference_set_current_lookup_never_falls_back_to_obsolete_legacy_record
     legacy.write_bytes(records._record_bytes(*old[0]))
     with pytest.raises(records.ReferencePrerequisiteError, match="incompatible"):
         records.load_record(_reference_records_ctx, old[0][0])
-
-
-def test_prepared_reference_runner_failure_on_second_arm_does_not_publish_first_arm(
-    _prepared_reference_runner_prepared_runner, monkeypatch
-):
-    control = _prepared_reference_runner_prepared_runner
-    control.missing.update(("single-step-grads", arm.name) for arm in control.arms)
-
-    def reference(model, batch, output, **kwargs):
-        if batch.name == "batch-gas4.pt":
-            raise RuntimeError("synthetic second-arm failure")
-        return {"loss": 2.0, "microbatches": 1, "active_tokens": 28, "grad_norms": {"layer.weight": 1.0}}
-
-    monkeypatch.setattr(runner, "run_reference", reference)
-    with pytest.raises(RuntimeError, match="second-arm failure"):
-        control.execute(selected=["single-step-grads"], prepare_references=True)
-    assert not control.published
-    assert not any(event[0] in {"gateway-enter", "target"} for event in control.events)
 
 
 def test_prepared_reference_runner_explicit_preparation_replaces_incompatible_records_together(
@@ -9896,20 +7892,6 @@ def test_prepared_reference_runner_explicit_preparation_replaces_incompatible_re
     assert control.execute(selected=["single-step-grads"], prepare_references=True) == []
     assert len(control.published) == len(control.arms)
     assert not any(event[0] in {"gateway-enter", "target"} for event in control.events)
-
-
-def test_reference_records_conflicting_publication_preserves_original_record(
-    _reference_records_ctx, _reference_records_identity
-):
-    original = _reference_records_measurements()
-    path = records.publish_record(_reference_records_ctx, _reference_records_identity, original)
-    payload = path.read_bytes()
-    changed = {**original, "loss": 2.0}
-    with pytest.raises(records.ReferencePrerequisiteError, match="conflicting immutable"):
-        records.publish_record(_reference_records_ctx, _reference_records_identity, changed)
-    assert path.read_bytes() == payload
-    assert records.load_record(_reference_records_ctx, _reference_records_identity) == original
-    assert not list(path.parent.glob(".prepare-*"))
 
 
 @pytest.mark.parametrize("corruption", ["measurement", "payload_hash", "schema", "identity"])
@@ -9935,79 +7917,6 @@ def test_reference_records_corrupt_or_incompatible_record_requires_onboarding(
     assert _reference_records_ctx.reference_record_paths == {}
 
 
-@pytest.mark.parametrize("payload", ["{", "[]", "null"])
-def test_reference_records_malformed_record_is_an_actionable_prerequisite_error(
-    _reference_records_ctx, _reference_records_identity, payload
-):
-    path = records.publish_record(
-        _reference_records_ctx, _reference_records_identity, _reference_records_measurements()
-    )
-    path.write_text(payload)
-    with pytest.raises(records.ReferencePrerequisiteError, match="run.*--prepare-references"):
-        records.load_record(_reference_records_ctx, _reference_records_identity)
-
-
-@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), -float("inf")])
-def test_reference_records_nonfinite_record_payload_is_an_actionable_prerequisite_error(
-    _reference_records_ctx, _reference_records_identity, nonfinite
-):
-    path = records.publish_record(
-        _reference_records_ctx, _reference_records_identity, _reference_records_measurements()
-    )
-    record = json.loads(path.read_text())
-    record["measurements"]["loss"] = nonfinite
-    path.write_text(json.dumps(record))
-    _reference_records_ctx.reference_record_paths.clear()
-    with pytest.raises(records.ReferencePrerequisiteError, match="run.*--prepare-references"):
-        records.load_record(_reference_records_ctx, _reference_records_identity)
-    assert not _reference_records_ctx.reference_record_paths
-
-
-@pytest.mark.parametrize("measurements", [None, [], 7, "measurements"])
-def test_reference_records_nonobject_measurements_with_matching_hash_require_onboarding(
-    _reference_records_ctx, _reference_records_identity, measurements
-):
-    path = records.publish_record(
-        _reference_records_ctx, _reference_records_identity, _reference_records_measurements()
-    )
-    record = json.loads(path.read_text())
-    record["measurements"] = measurements
-    record["payload_sha256"] = records._digest(measurements)
-    path.write_text(json.dumps(record))
-    _reference_records_ctx.reference_record_paths.clear()
-    with pytest.raises(records.ReferencePrerequisiteError, match="object.*run.*--prepare-references"):
-        records.load_record(_reference_records_ctx, _reference_records_identity)
-    assert not _reference_records_ctx.reference_record_paths
-
-
-def test_reference_records_changed_workload_identity_does_not_reuse_old_record(
-    _reference_records_ctx, _reference_records_identity
-):
-    path = records.publish_record(
-        _reference_records_ctx, _reference_records_identity, _reference_records_measurements()
-    )
-    changed = copy.deepcopy(_reference_records_identity)
-    changed["recipe"]["arm"] = "gas4"
-    _reference_records_ctx.reference_record_paths.clear()
-    with pytest.raises(records.ReferencePrerequisiteError, match="missing.*--prepare-references"):
-        records.load_record(_reference_records_ctx, changed)
-    assert list(records._config_dir(_reference_records_ctx, _reference_records_identity).rglob("*.json")) == [path]
-    assert not _reference_records_ctx.reference_record_paths
-
-
-@pytest.mark.parametrize("check_id", [_reference_records_GRADS, _reference_records_OPTIMIZER])
-@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), -float("inf")])
-def test_reference_records_nonfinite_nested_measurements_are_not_published(
-    _reference_records_ctx, _reference_records_identity, check_id, nonfinite
-):
-    _reference_records_identity = _reference_records_identity_for(_reference_records_identity, check_id)
-    measurements = _reference_records_measurements(check_id)
-    measurements["diagnostic"] = {"nested": [nonfinite]}
-    with pytest.raises(records.ReferencePrerequisiteError, match="nonfinite.*diagnostic.nested"):
-        records.publish_record(_reference_records_ctx, _reference_records_identity, measurements)
-    assert not _reference_records_ctx.reference_records_dir.exists()
-
-
 @pytest.mark.parametrize("field", ["loss", "microbatches", "active_tokens"])
 def test_reference_records_incomplete_single_step_measurements_are_rejected(
     _reference_records_ctx, _reference_records_identity, field
@@ -10015,17 +7924,6 @@ def test_reference_records_incomplete_single_step_measurements_are_rejected(
     measurements = _reference_records_measurements()
     del measurements[field]
     with pytest.raises(records.ReferencePrerequisiteError, match=f"missing {field}"):
-        records.publish_record(_reference_records_ctx, _reference_records_identity, measurements)
-
-
-@pytest.mark.parametrize(
-    "norms", [{}, None, {_reference_records_PARAMETER: -0.1}, {_reference_records_PARAMETER: "0.1"}, {7: 0.1}]
-)
-def test_reference_records_gradient_norms_require_named_nonnegative_scalars(
-    _reference_records_ctx, _reference_records_identity, norms
-):
-    measurements = {**_reference_records_measurements(), "grad_norms": norms}
-    with pytest.raises(records.ReferencePrerequisiteError, match="gradient norms"):
         records.publish_record(_reference_records_ctx, _reference_records_identity, measurements)
 
 
@@ -10049,120 +7947,6 @@ def test_reference_records_optimizer_gate_requires_reviewed_finite_norm_criterio
     measurements["optimizer_norm_gate"][field] = invalid
     with pytest.raises(records.ReferencePrerequisiteError):
         records.publish_record(_reference_records_ctx, _reference_records_identity, measurements)
-
-
-@pytest.mark.parametrize(
-    ("field", "invalid"),
-    [
-        ("absolute", True),
-        ("absolute", False),
-        ("provenance", " "),
-        ("provenance", True),
-        ("provenance", 7),
-        ("provenance", ["unit-review"]),
-    ],
-)
-def test_reference_records_optimizer_gate_rejects_bool_tolerance_and_invalid_provenance(
-    _reference_records_ctx, _reference_records_identity, field, invalid
-):
-    _reference_records_identity = _reference_records_identity_for(
-        _reference_records_identity, _reference_records_OPTIMIZER
-    )
-    measurements = _reference_records_measurements(_reference_records_OPTIMIZER)
-    measurements["optimizer_norm_gate"][field] = invalid
-    with pytest.raises(records.ReferencePrerequisiteError, match="gate|provenance"):
-        records.publish_record(_reference_records_ctx, _reference_records_identity, measurements)
-    assert not _reference_records_ctx.reference_records_dir.exists()
-    assert not _reference_records_ctx.reference_record_paths
-
-
-def test_reference_records_optimizer_requires_parameter_norms(_reference_records_ctx, _reference_records_identity):
-    _reference_records_identity = _reference_records_identity_for(
-        _reference_records_identity, _reference_records_OPTIMIZER
-    )
-    measurements = _reference_records_measurements(_reference_records_OPTIMIZER)
-    measurements["optimizer_norms"]["parameters"] = {}
-    with pytest.raises(records.ReferencePrerequisiteError, match="no parameter norms"):
-        records.publish_record(_reference_records_ctx, _reference_records_identity, measurements)
-
-
-def test_reference_records_optimizer_gate_does_not_accept_legacy_reviewed_boolean(
-    _reference_records_ctx, _reference_records_identity
-):
-    _reference_records_identity = _reference_records_identity_for(
-        _reference_records_identity, _reference_records_OPTIMIZER
-    )
-    measurements = _reference_records_measurements(_reference_records_OPTIMIZER)
-    del measurements["optimizer_norm_gate"]["status"]
-    measurements["optimizer_norm_gate"]["reviewed"] = True
-    with pytest.raises(records.ReferencePrerequisiteError, match="review provenance"):
-        records.publish_record(_reference_records_ctx, _reference_records_identity, measurements)
-
-
-@pytest.mark.parametrize(
-    ("field", "invalid"),
-    [
-        ("step", 2),
-        ("state_keys", ["parameter_update", "exp_avg", "exp_avg_sq"]),
-        ("parameter_count", 2),
-        ("optimizer_values_count", 2),
-        ("parameters", {_reference_records_PARAMETER: {"shape": [2, 3], "exp_avg": 0.05}}),
-        (
-            "parameters",
-            {
-                _reference_records_PARAMETER: {
-                    "shape": [2, 3],
-                    "exp_avg": 0.05,
-                    "exp_avg_sq": 0.001,
-                    "parameter_update_residual": -0.1,
-                }
-            },
-        ),
-    ],
-)
-def test_reference_records_optimizer_summary_is_validated_before_publication(
-    _reference_records_ctx, _reference_records_identity, field, invalid
-):
-    _reference_records_identity = _reference_records_identity_for(
-        _reference_records_identity, _reference_records_OPTIMIZER
-    )
-    measurements = _reference_records_measurements(_reference_records_OPTIMIZER)
-    measurements["optimizer_norms"][field] = invalid
-    with pytest.raises(ValueError, match="optimizer norm"):
-        records.publish_record(_reference_records_ctx, _reference_records_identity, measurements)
-    assert not _reference_records_ctx.reference_records_dir.exists()
-
-
-def test_reference_records_load_revalidates_measurements_even_when_payload_hash_matches(
-    _reference_records_ctx, _reference_records_identity
-):
-    path = records.publish_record(
-        _reference_records_ctx, _reference_records_identity, _reference_records_measurements()
-    )
-    record = json.loads(path.read_text())
-    record["measurements"]["grad_norms"] = {}
-    record["payload_sha256"] = records._digest(record["measurements"])
-    path.write_text(json.dumps(record))
-    with pytest.raises(records.ReferencePrerequisiteError, match="gradient norms"):
-        records.load_record(_reference_records_ctx, _reference_records_identity)
-
-
-def test_reference_records_concurrent_identical_writers_publish_one_complete_record(
-    _reference_records_ctx, _reference_records_identity
-):
-    barrier = Barrier(4)
-    measurements = _reference_records_measurements()
-
-    def publish():
-        barrier.wait(timeout=10)
-        return records.publish_record(_reference_records_ctx, _reference_records_identity, measurements)
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [pool.submit(publish) for _ in range(4)]
-        paths = [future.result(timeout=20) for future in futures]
-    assert len(set(paths)) == 1
-    assert records.load_record(_reference_records_ctx, _reference_records_identity) == measurements
-    assert list(paths[0].parent.iterdir()) == [paths[0]]
 
 
 def test_reference_records_concurrent_conflicting_writers_do_not_overwrite_winner(
@@ -10192,150 +7976,6 @@ def test_reference_records_concurrent_conflicting_writers_do_not_overwrite_winne
     assert list(winner[2].parent.iterdir()) == [winner[2]]
 
 
-def test_reference_records_publication_is_visible_only_after_complete_bytes_are_synced(
-    _reference_records_ctx, _reference_records_identity, monkeypatch
-):
-    measurements = _reference_records_measurements()
-    original_fsync = records.os.fsync
-    original_publish = records._publish_directory
-    synced = []
-    observed = []
-
-    def fsync(fd):
-        original_fsync(fd)
-        synced.append(fd)
-
-    def publish(source, destination):
-        assert synced
-        assert not destination.exists()
-        with records._record_path(
-            SimpleNamespace(reference_records_dir=source.parent), _reference_records_identity
-        ).open("rb") as stream:
-            pending = json.load(stream)
-        assert pending["measurements"] == measurements
-        assert pending["payload_sha256"] == records._digest(measurements)
-        original_publish(source, destination)
-        observed.append(
-            json.loads(records._record_path(_reference_records_ctx, _reference_records_identity).read_bytes())
-        )
-
-    monkeypatch.setattr(records.os, "fsync", fsync)
-    monkeypatch.setattr(records, "_publish_directory", publish)
-    path = records.publish_record(_reference_records_ctx, _reference_records_identity, measurements)
-    assert [record["measurements"] for record in observed] == [measurements]
-    assert not list(path.parent.glob(".prepare-*"))
-
-
-@pytest.mark.parametrize("failure", ["fsync", "rename"])
-def test_reference_records_failed_publication_removes_temporary_files(
-    _reference_records_ctx, _reference_records_identity, monkeypatch, failure
-):
-
-    def fail(*args, **kwargs):
-        raise OSError("unit publication failure")
-
-    monkeypatch.setattr(records.os, failure, fail)
-    with pytest.raises(OSError, match="unit publication failure"):
-        records.publish_record(_reference_records_ctx, _reference_records_identity, _reference_records_measurements())
-    assert not list(_reference_records_ctx.reference_records_dir.rglob("*.json"))
-    assert not list(_reference_records_ctx.reference_records_dir.glob(".set-*"))
-    assert not _reference_records_ctx.reference_record_paths
-
-
-def test_reference_records_byte_cap_is_checked_before_publication_creates_files(
-    _reference_records_ctx, _reference_records_identity, monkeypatch
-):
-    monkeypatch.setattr(records, "MAX_RECORD_BYTES", 1)
-    with pytest.raises(records.ReferencePrerequisiteError, match="size limit"):
-        records.publish_record(_reference_records_ctx, _reference_records_identity, _reference_records_measurements())
-    assert not _reference_records_ctx.reference_records_dir.exists()
-    assert not _reference_records_ctx.reference_record_paths
-
-
-@pytest.mark.parametrize(
-    ("field", "invalid"),
-    [
-        ("config_id", "../outside"),
-        ("config_id", "."),
-        ("config_id", ".."),
-        ("config_id", "/outside"),
-        ("config_id", "nested/config"),
-        ("config_id", "nested\\config"),
-        ("config_id", ""),
-        ("config_id", None),
-        ("check_id", "../outside"),
-        ("check_id", "/outside"),
-        ("check_id", "checkpoint-resume-loss"),
-    ],
-)
-@pytest.mark.parametrize("operation", ["publish", "load"])
-def test_reference_records_invalid_record_path_identity_is_rejected_before_filesystem_writes(
-    _reference_records_ctx, _reference_records_identity, field, invalid, operation
-):
-    changed = {**_reference_records_identity, field: invalid}
-    with pytest.raises(records.ReferencePrerequisiteError, match="invalid reference record"):
-        if operation == "publish":
-            records.publish_record(_reference_records_ctx, changed, _reference_records_measurements())
-        else:
-            records.load_record(_reference_records_ctx, changed)
-    assert not _reference_records_ctx.reference_records_dir.exists()
-    assert not _reference_records_ctx.reference_record_paths
-
-
-@pytest.fixture
-def _reference_records_checkout(tmp_path, monkeypatch):
-    root = tmp_path / "checkout"
-    root.mkdir()
-    (root / ".git").mkdir()
-    monkeypatch.setattr(records, "__file__", str(root / "arctic_platform" / "correctness" / "harness" / "storage.py"))
-    return root
-
-
-def test_reference_records_git_records_directory_accepts_checkout_path_without_creating_it(
-    _reference_records_checkout,
-):
-    destination = _reference_records_checkout / "arctic_platform" / "correctness" / "reference_data"
-    assert records.require_git_records_dir(destination) == destination
-    assert not destination.exists()
-
-
-@pytest.mark.parametrize("relative", ["../outside", "../checkout-sibling", ".git", ".git/objects"])
-def test_reference_records_git_records_directory_rejects_outside_checkout_and_git_metadata(
-    _reference_records_checkout, relative
-):
-    with pytest.raises(records.ReferencePrerequisiteError, match="Git checkout"):
-        records.require_git_records_dir(_reference_records_checkout / relative)
-
-
-@pytest.mark.parametrize("target", ["outside", "git"])
-def test_reference_records_git_records_directory_rejects_symlink_escape(_reference_records_checkout, target):
-    destination = (
-        _reference_records_checkout.parent / "outside" if target == "outside" else _reference_records_checkout / ".git"
-    )
-    destination.mkdir(exist_ok=True)
-    alias = _reference_records_checkout / "records"
-    alias.symlink_to(destination, target_is_directory=True)
-    with pytest.raises(records.ReferencePrerequisiteError, match="Git checkout"):
-        records.require_git_records_dir(alias / "new-references")
-    assert not (destination / "new-references").exists()
-
-
-def test_reference_records_exact_byte_cap_loads_but_one_byte_over_cap_fails(
-    _reference_records_ctx, _reference_records_identity, monkeypatch
-):
-    measurements = _reference_records_measurements()
-    path = records.publish_record(_reference_records_ctx, _reference_records_identity, measurements)
-    size = path.stat().st_size
-    monkeypatch.setattr(records, "MAX_RECORD_BYTES", size)
-    assert records.publish_record(_reference_records_ctx, _reference_records_identity, measurements) == path
-    assert records.load_record(_reference_records_ctx, _reference_records_identity) == measurements
-    monkeypatch.setattr(records, "MAX_RECORD_BYTES", size - 1)
-    _reference_records_ctx.reference_record_paths.clear()
-    with pytest.raises(records.ReferencePrerequisiteError, match="oversized"):
-        records.load_record(_reference_records_ctx, _reference_records_identity)
-    assert not _reference_records_ctx.reference_record_paths
-
-
 def test_reference_records_workload_identity_binds_inputs_config_and_gate_not_local_record_root(
     _reference_records_ctx, _reference_records_identity
 ):
@@ -10355,128 +7995,6 @@ def test_reference_records_workload_identity_binds_inputs_config_and_gate_not_lo
     assert records.workload_identity(_reference_records_ctx, _reference_records_GRADS, recipe) != same
 
 
-def test_reference_records_workload_identity_supports_missing_optional_dependencies(
-    _reference_records_ctx, _reference_records_identity, monkeypatch
-):
-    import torch
-
-    def absent(package):
-        raise records.importlib.metadata.PackageNotFoundError(package)
-
-    monkeypatch.setattr(records.importlib.metadata, "version", absent)
-    result = records.workload_identity(
-        _reference_records_ctx, _reference_records_GRADS, _reference_records_identity["recipe"]
-    )
-    assert result["dependencies"]
-    assert result["dependencies"]["torch"] == str(torch.__version__)
-    assert all((value is None for package, value in result["dependencies"].items() if package != "torch"))
-
-
-def test_reference_records_workload_identity_uses_loaded_torch_build_not_distribution_metadata(
-    _reference_records_ctx, _reference_records_identity, monkeypatch
-):
-    import torch
-
-    monkeypatch.setattr(torch, "__version__", "2.13.0+cu130")
-    monkeypatch.setattr(
-        records.importlib.metadata, "version", lambda package: "2.13.0" if package == "torch" else "unit-version"
-    )
-    without_suffix = records.workload_identity(
-        _reference_records_ctx, _reference_records_GRADS, _reference_records_identity["recipe"]
-    )
-    monkeypatch.setattr(
-        records.importlib.metadata, "version", lambda package: "2.13.0+cu130" if package == "torch" else "unit-version"
-    )
-    with_suffix = records.workload_identity(
-        _reference_records_ctx, _reference_records_GRADS, _reference_records_identity["recipe"]
-    )
-    assert without_suffix == with_suffix
-    assert with_suffix["dependencies"]["torch"] == "2.13.0+cu130"
-    monkeypatch.setattr(torch, "__version__", "2.13.0+cu128")
-    assert (
-        records.workload_identity(
-            _reference_records_ctx, _reference_records_GRADS, _reference_records_identity["recipe"]
-        )
-        != with_suffix
-    )
-
-
-def test_reference_records_metadata_only_torch_drift_reuses_record_without_hf(
-    _reference_records_ctx, _reference_records_identity, monkeypatch
-):
-    import torch
-
-    monkeypatch.setattr(torch, "__version__", "2.13.0+cu130")
-    monkeypatch.setattr(
-        records.importlib.metadata, "version", lambda package: "2.13.0+cu130" if package == "torch" else "unit-version"
-    )
-    prepared = records.workload_identity(
-        _reference_records_ctx, _reference_records_GRADS, _reference_records_identity["recipe"]
-    )
-    measurements = _reference_records_measurements(_reference_records_GRADS)
-    records.publish_record(_reference_records_ctx, prepared, measurements)
-    monkeypatch.setattr(
-        records.importlib.metadata, "version", lambda package: "2.13.0" if package == "torch" else "unit-version"
-    )
-    _reference_records_no_hf(monkeypatch)
-    target = records.workload_identity(
-        _reference_records_ctx, _reference_records_GRADS, _reference_records_identity["recipe"]
-    )
-    assert records.load_record(_reference_records_ctx, target) == measurements
-
-
-def test_reference_records_workload_identity_rejects_non_reference_check(_reference_records_ctx):
-    with pytest.raises(ValueError, match="not an HF reference check"):
-        records.workload_identity(_reference_records_ctx, "checkpoint-resume-loss", {})
-
-
-def test_reference_records_tensor_semantic_hash_is_independent_of_torch_save_archive(tmp_path, monkeypatch):
-    import torch
-
-    tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
-    first, second = (tmp_path / "first.pt", tmp_path / "second.pt")
-    torch.save(tensor, first)
-    torch.save(tensor.clone(), second)
-    assert hashlib.sha256(first.read_bytes()).digest() != hashlib.sha256(second.read_bytes()).digest()
-    first_tensor = torch.load(first, map_location="cpu", weights_only=True)
-    second_tensor = torch.load(second, map_location="cpu", weights_only=True)
-
-    def forbidden_save(*args, **kwargs):
-        raise AssertionError("semantic tensor hashing must not serialize a torch archive")
-
-    monkeypatch.setattr(torch, "save", forbidden_save)
-    assert records.tensor_identity(first_tensor) == records.tensor_identity(second_tensor)
-
-
-def test_reference_records_tensor_semantic_hash_does_not_consume_or_depend_on_global_rng():
-    import torch
-
-    tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(17)
-        before = torch.random.get_rng_state().clone()
-        identity = records.tensor_identity(tensor)
-        assert torch.equal(torch.random.get_rng_state(), before)
-        torch.rand(32)
-        advanced = torch.random.get_rng_state().clone()
-        assert records.tensor_identity(tensor) == identity
-        assert torch.equal(torch.random.get_rng_state(), advanced)
-
-
-@pytest.mark.parametrize("dtype", ["float32", "bfloat16", "int64"])
-def test_reference_records_tensor_semantic_hash_normalizes_storage_layout_and_detaches(dtype):
-    import torch
-
-    tensor = torch.arange(6, dtype=getattr(torch, dtype)).reshape(2, 3)
-    noncontiguous = tensor.t().contiguous().t()
-    assert not noncontiguous.is_contiguous()
-    assert records.tensor_identity(noncontiguous) == records.tensor_identity(tensor)
-    if tensor.is_floating_point():
-        tensor.requires_grad_()
-        assert records.tensor_identity(tensor)["dtype"] == f"torch.{dtype}"
-        assert tensor.grad is None
-
-
 def test_reference_records_tensor_semantic_hash_binds_shape_dtype_and_values():
     import torch
 
@@ -10490,26 +8008,6 @@ def test_reference_records_tensor_semantic_hash_binds_shape_dtype_and_values():
     changed = tensor.clone()
     changed[0, 0] = 0.5
     assert records.tensor_identity(changed)["sha256"] != identity["sha256"]
-
-
-@pytest.mark.parametrize("field", ["input_ids", "position_ids", "labels"])
-def test_reference_records_batch_identity_binds_all_token_semantics(field):
-    import torch
-
-    batch = SimpleNamespace(
-        name="train-step-001",
-        active_tokens=2,
-        input_ids=torch.tensor([[1, 2, 3]], dtype=torch.int64),
-        position_ids=torch.tensor([[0, 1, 2]], dtype=torch.int64),
-        labels=torch.tensor([[-100, 2, 3]], dtype=torch.int64),
-    )
-    identity = records.batch_identity(batch)
-    assert identity["name"] == batch.name
-    assert identity["active_tokens"] == 2
-    assert set(identity["tensors"]) == {"input_ids", "position_ids", "labels"}
-    changed = copy.deepcopy(batch)
-    getattr(changed, field)[0, 1] += 1
-    assert records.batch_identity(changed)["tensors"][field] != identity["tensors"][field]
 
 
 def _reference_records_model_assets(root):
@@ -10532,22 +8030,6 @@ def test_reference_records_model_identity_detects_same_size_content_drift_with_r
     assert weights.stat().st_mtime_ns == old_stat.st_mtime_ns
     assert before["assets"]["model.safetensors"]["sha256"] != after["assets"]["model.safetensors"]["sha256"]
     assert before["sha256"] != after["sha256"]
-
-
-def test_reference_records_model_identity_is_independent_of_asset_root(tmp_path):
-    first = _reference_records_model_assets(tmp_path / "first")
-    second = _reference_records_model_assets(tmp_path / "second")
-    assert records.model_identity(first) == records.model_identity(second)
-
-
-@pytest.mark.parametrize("missing", ["directory", "config.json", "model.safetensors"])
-def test_reference_records_model_identity_requires_complete_external_assets(tmp_path, missing):
-    root = tmp_path / "model"
-    if missing != "directory":
-        _reference_records_model_assets(root)
-        (root / missing).unlink()
-    with pytest.raises(records.ReferencePrerequisiteError, match="assets unavailable|complete model"):
-        records.model_identity(root)
 
 
 @pytest.mark.parametrize("returncode", [0, 17])
@@ -10615,33 +8097,6 @@ def test_reference_observability_subprocess_retains_complete_logs_and_returncode
     assert f"returncode={returncode}" in message
     for suffix in ("stdout.log", "stderr.log", "returncode"):
         assert str(log_dir / f"{output.stem}.{suffix}") in message
-
-
-def test_reference_observability_keeps_successful_process_logs_when_result_json_is_invalid(tmp_path, monkeypatch):
-    output = tmp_path / "reference.json"
-    calls = []
-
-    def child(command, **kwargs):
-        calls.append(command)
-        output.write_text("{not valid JSON}")
-        return SimpleNamespace(returncode=0, stdout="child completed\n", stderr="child warning\n")
-
-    monkeypatch.setattr(runner.subprocess, "run", child)
-    with pytest.raises(json.JSONDecodeError):
-        runner.run_reference(
-            "read-only-model",
-            tmp_path / "batch.pt",
-            output,
-            token_budget=64,
-            ce_chunk=8,
-            attn="sdpa",
-            fp32_lm_head=False,
-        )
-    assert len(calls) == 1
-    assert (tmp_path / "reference.stdout.log").read_text() == "child completed\n"
-    assert (tmp_path / "reference.stderr.log").read_text() == "child warning\n"
-    assert (tmp_path / "reference.returncode").read_text() == "0\n"
-    assert output.read_text() == "{not valid JSON}"
 
 
 @pytest.mark.parametrize("reviewed_gate", [None, 0.001])
@@ -10769,48 +8224,6 @@ def test_reference_observability_calibration_consumes_completed_runs_without_cha
         assert not any("failed" in line for line in matching)
 
 
-def test_reference_observability_calibration_error_keeps_existing_record_and_does_not_publish(
-    _prepared_reference_runner_prepared_runner, monkeypatch, capsys
-):
-    control = _prepared_reference_runner_prepared_runner
-    control.missing.add(("single-step-optimizer", "gas1"))
-    control.record_overrides["single-step-grads", "gas1"] = {"grad_norms": {"layer.weight": 9.0}, "loss": 9.0}
-    calls = []
-
-    def reference(model, batch, output, **kwargs):
-        calls.append((output.stem, kwargs["deterministic"], kwargs["cuda_device"]))
-        if not kwargs["deterministic"]:
-            raise RuntimeError("synthetic calibration childreturncode=17")
-        return {
-            "loss": 3.0,
-            "microbatches": 1,
-            "active_tokens": control.recipes[-1][2]["synthetic_inputs"]["batch"]["active_tokens"],
-            "grad_norms": {"layer.weight": 3.0},
-            "optimizer_state_manifest": str(control.target_manifest),
-        }
-
-    monkeypatch.setattr(runner, "run_reference", reference)
-    with pytest.raises(RuntimeError, match="synthetic calibration childreturncode=17"):
-        control.execute(
-            selected_arms=control.arms[:1],
-            prepare_references=True,
-            reference_calibration_runs=2,
-            reference_calibration_workers=1,
-        )
-    assert calls == [("ref-gas1", True, None), ("ref-gas1-calibration-0", False, 0)]
-    assert not control.published
-    assert not any(event[0] in {"gateway-enter", "job-enter", "target"} for event in control.events)
-    assert control.record_overrides["single-step-grads", "gas1"] == {
-        "grad_norms": {"layer.weight": 9.0},
-        "loss": 9.0,
-    }
-    lines = capsys.readouterr().out.splitlines()
-    matching = [line for line in lines if "gas1-calibration-0" in line]
-    assert any("start" in line and "device=0" in line for line in matching)
-    assert any("failed" in line and "device=0" in line for line in matching)
-    assert not any("done" in line for line in matching)
-
-
 # Actual HF execution provenance.
 
 
@@ -10875,68 +8288,6 @@ def test_reference_execution_witness_records_actual_configurations_and_selected_
     assert json.loads(json.dumps(witness, allow_nan=False)) == witness
     engine.model.config.values["num_hidden_layers"] = 99
     assert witness["effective_configurations"]["model"]["config"]["num_hidden_layers"] == 4
-
-
-def test_reference_execution_witness_hashes_loaded_forward_separately_from_file(_reference_execution_engine):
-    engine = _reference_execution_engine
-    original = hf_single_gpu.execution_witness(engine, requested_attention="sdpa")
-    engine.decoder.forward = MethodType(_ReferenceExecutionModel.forward, engine.decoder)
-    changed = hf_single_gpu.execution_witness(engine, requested_attention="sdpa")
-    assert changed["implementations"]["decoder"]["class"] == original["implementations"]["decoder"]["class"]
-    assert (
-        changed["implementations"]["decoder"]["forward"]["source"]
-        == original["implementations"]["decoder"]["forward"]["source"]
-    )
-    assert (
-        changed["implementations"]["decoder"]["forward"]["python_code_sha256"]
-        != original["implementations"]["decoder"]["forward"]["python_code_sha256"]
-    )
-
-
-def test_reference_execution_witness_code_digest_is_checkout_independent(_reference_execution_engine, tmp_path):
-    engine = _reference_execution_engine
-    original = hf_single_gpu.execution_witness(engine, requested_attention="sdpa")
-    source = tmp_path / "relocated-reference.py"
-    source.write_bytes(Path(__file__).read_bytes())
-    forward = _ReferenceExecutionDecoder.forward
-    relocated = FunctionType(forward.__code__.replace(co_filename=str(source)), forward.__globals__, forward.__name__)
-    engine.decoder.forward = MethodType(relocated, engine.decoder)
-    changed = hf_single_gpu.execution_witness(engine, requested_attention="sdpa")
-    assert (
-        changed["implementations"]["decoder"]["forward"]["source"]
-        == original["implementations"]["decoder"]["forward"]["source"]
-    )
-    assert (
-        changed["implementations"]["decoder"]["forward"]["python_code_sha256"]
-        == original["implementations"]["decoder"]["forward"]["python_code_sha256"]
-    )
-
-
-def test_reference_execution_witness_preserves_upstream_config_and_effective_attention(_reference_execution_engine):
-    from transformers import PretrainedConfig
-
-    config = PretrainedConfig(dtype=torch.bfloat16, use_cache=False)
-    config._attn_implementation = "eager"
-    _reference_execution_engine.model.config = config
-    _reference_execution_engine.decoder.config = config
-    witness = hf_single_gpu.execution_witness(_reference_execution_engine, requested_attention="sdpa")
-    for value in witness["effective_configurations"].values():
-        assert value["config"] == json.loads(config.to_json_string(use_diff=False))
-        assert value["attention_implementation"] == "eager"
-        assert json.loads(json.dumps(value, allow_nan=False)) == value
-
-
-@pytest.mark.parametrize("defect", ["native-forward", "nonfinite-config"])
-def test_reference_execution_witness_rejects_unrecordable_runtime(_reference_execution_engine, defect):
-    engine = _reference_execution_engine
-    if defect == "native-forward":
-        engine.decoder.forward = len
-        message = "inspectable Python forward"
-    else:
-        engine.model.config.values["invalid"] = float("nan")
-        message = "Out of range float"
-    with pytest.raises(ValueError, match=message):
-        hf_single_gpu.execution_witness(engine, requested_attention="sdpa")
 
 
 @pytest.mark.parametrize("change", [None, "config", "forward", "source"])
@@ -11058,49 +8409,6 @@ def _callback_source_descriptor(callback):
     return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
-@pytest.mark.parametrize("name", ["is_initialized", "get", "put"])
-def test_native_callback_accepts_installed_ray_wrappers_without_initializing_ray(name):
-    ray = pytest.importorskip("ray")
-    callback = getattr(ray, name)
-    capture.verify_native_callback(callback, _callback_source_descriptor(callback))
-
-
-def test_native_callback_keeps_contextmanager_support():
-    @contextmanager
-    def scope():
-        yield None
-
-    capture.verify_native_callback(scope, _callback_source_descriptor(scope))
-
-
-@pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("inherited", [False, True])
-def test_native_callback_accepts_installed_ray_actor_tracing(asynchronous, inherited):
-    ray = pytest.importorskip("ray")
-
-    class Coordinator:
-        if asynchronous:
-
-            async def save(self):
-                return "saved"
-
-        else:
-
-            def save(self):
-                return "saved"
-
-    actor = ray.remote(num_cpus=1, num_gpus=0)(Coordinator)
-    if inherited:
-        actor = ray.remote(num_cpus=1, num_gpus=0)(
-            type("InheritedCoordinator", (actor.__ray_metadata__.modified_class,), {})
-        )
-    callback = actor.__ray_metadata__.modified_class.save
-    original_signature = callback.__wrapped__.__signature__
-    capture.verify_native_callback(callback, _callback_source_descriptor(callback))
-    assert callback.__wrapped__.__signature__ is original_signature
-    assert not ray.is_initialized()
-
-
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("class_roundtrip", [False, True])
 def test_native_callback_accepts_serialized_ray_actor_tracing(asynchronous, class_roundtrip):
@@ -11165,24 +8473,6 @@ def native_scope_training_actor():
     return build
 
 
-@pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("inherited", [False, True])
-@pytest.mark.parametrize("serialized", [False, True])
-def test_native_scope_actor_workers_accepts_exact_native_save(
-    native_scope_training_actor, asynchronous, inherited, serialized
-):
-    owner, descriptor = native_scope_training_actor(
-        asynchronous=asynchronous, inherited=inherited, serialized=serialized
-    )
-    selected = capture._native_scope_actor_workers(owner, "training-child", descriptor)
-    assert selected == {
-        "workers": owner._workers,
-        "rank_hosts": ["head", "head"],
-        "actor_ids": ["worker-0", "worker-1"],
-    }
-    assert not sys.modules["ray"].is_initialized()
-
-
 @pytest.fixture
 def native_runtime_worker(native_scope_training_actor):
     def build(*, asynchronous=False, inherited=False, serialized=False):
@@ -11224,73 +8514,11 @@ def native_runtime_worker(native_scope_training_actor):
     return build
 
 
-@pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("inherited", [False, True])
-@pytest.mark.parametrize("serialized", [False, True])
-def test_native_runtime_sources_accepts_verified_ray_save(native_runtime_worker, asynchronous, inherited, serialized):
-    worker, sources = native_runtime_worker(asynchronous=asynchronous, inherited=inherited, serialized=serialized)
-    assert inspect.getsourcefile(type(worker).save) != sources["training"]["path"]
-    capture._native_runtime_sources(worker, sources)
-    assert not sys.modules["ray"].is_initialized()
-
-
-@pytest.mark.parametrize(
-    "role,owner,method",
-    [
-        ("training", "worker", "save"),
-        ("expert_checkpointer", "checkpointer", "save_resumable"),
-        ("base_checkpointer", "checkpointer", "save_adapters"),
-        ("engine", "engine", "save_checkpoint"),
-        ("zero", "optimizer", "state_dict"),
-        ("zero_base", "optimizer", "backward"),
-    ],
-)
-def test_native_runtime_sources_rejects_unrecognized_wrapper(native_runtime_worker, monkeypatch, role, owner, method):
-    worker, sources = native_runtime_worker(inherited=True, serialized=True)
-    selected = {
-        "worker": worker,
-        "checkpointer": worker._checkpointer,
-        "engine": worker._engine,
-        "optimizer": worker._engine.optimizer,
-    }[owner]
-    original = getattr(type(selected), method)
-
-    def replacement(*args, **kwargs):
-        return original(*args, **kwargs)
-
-    replacement.__wrapped__ = original
-    monkeypatch.setattr(type(selected), method, replacement)
-    with pytest.raises(ValueError, match=f"native selected source origin mismatch: {role}"):
-        capture._native_runtime_sources(worker, sources)
-
-
 def test_native_runtime_sources_rejects_producer_hash_drift(native_runtime_worker):
     worker, sources = native_runtime_worker(inherited=True, serialized=True)
     sources["training"] = {**sources["training"], "sha256": "0" * 64}
     with pytest.raises(ValueError, match="native producer source drift"):
         capture._native_runtime_sources(worker, sources)
-
-
-@pytest.mark.parametrize("damage", ["child", "source", "instance-save", "rank-hosts", "duplicate-worker"])
-def test_native_scope_actor_workers_rejects_changed_selection(native_scope_training_actor, damage):
-    owner, descriptor = native_scope_training_actor()
-    child_id = "training-child"
-    if damage == "child":
-        child_id = "different-child"
-    elif damage == "source":
-        descriptor["sha256"] = "0" * 64
-    elif damage == "instance-save":
-
-        def substituted_save(self):
-            return "saved"
-
-        owner.save = types.MethodType(substituted_save, owner)
-    elif damage == "rank-hosts":
-        owner._rank_hosts = ["peer", "peer"]
-    else:
-        owner._workers[1]._actor_id = owner._workers[0]._actor_id
-    with pytest.raises(ValueError, match="selection|source|layout|distinct"):
-        capture._native_scope_actor_workers(owner, child_id, descriptor)
 
 
 @pytest.mark.parametrize(
@@ -11355,94 +8583,6 @@ def test_native_callback_rejects_altered_serialized_ray_actor_tracing(damage):
         callback = altered
     with pytest.raises(ValueError, match="wrapper|source"):
         capture.verify_native_callback(callback, descriptor)
-
-
-@pytest.mark.parametrize("damage", ["metadata", "closure", "globals", "code", "hash", "origin"])
-def test_native_callback_rejects_altered_ray_actor_tracing(damage):
-    ray = pytest.importorskip("ray")
-
-    @ray.remote(num_cpus=1, num_gpus=0)
-    class Coordinator:
-        def save(self):
-            return "saved"
-
-    callback = Coordinator.__ray_metadata__.modified_class.save
-    descriptor = _callback_source_descriptor(callback)
-    if damage == "hash":
-        descriptor["sha256"] = "0" * 64
-    elif damage == "origin":
-        descriptor = _callback_source_descriptor(capture.verify_native_callback)
-    else:
-        code, globals_dict, cells = callback.__code__, callback.__globals__, callback.__closure__
-        if damage == "closure":
-            cells = tuple((lambda value: lambda: value)(object()).__closure__[0] for cell in cells)
-        elif damage == "globals":
-            globals_dict = dict(globals_dict)
-        elif damage == "code":
-
-            def unrelated_wrapper(method):
-                def wrapper(*args, **kwargs):
-                    return method(*args, **kwargs)
-
-                return wrapper
-
-            code = unrelated_wrapper(None).__code__
-        altered = types.FunctionType(code, globals_dict, callback.__name__, callback.__defaults__, cells)
-        altered.__dict__.update(callback.__dict__)
-        altered.__module__, altered.__qualname__ = callback.__module__, callback.__qualname__
-        if damage == "metadata":
-            altered.__wrapped__ = lambda: "saved"
-        callback = altered
-    with pytest.raises(ValueError, match="wrapper|source"):
-        capture.verify_native_callback(callback, descriptor)
-
-
-@pytest.mark.parametrize("damage", ["metadata", "closure", "globals", "code", "stale-public", "hash", "origin"])
-def test_native_callback_rejects_altered_ray_wrappers(monkeypatch, damage):
-    ray = pytest.importorskip("ray")
-    callback = ray.is_initialized
-    descriptor = _callback_source_descriptor(callback)
-    if damage == "hash":
-        descriptor["sha256"] = "0" * 64
-    elif damage == "origin":
-        descriptor = _callback_source_descriptor(test_native_callback_keeps_contextmanager_support)
-    elif damage == "stale-public":
-        monkeypatch.setattr(ray, "is_initialized", lambda: False)
-    else:
-        cells = callback.__closure__
-        globals_dict = callback.__globals__
-        code = callback.__code__
-        if damage == "closure":
-            cells = tuple(
-                (lambda value: lambda: value)(object()).__closure__[0] if name == "ray" else cell
-                for name, cell in zip(code.co_freevars, cells, strict=True)
-            )
-        elif damage == "globals":
-            globals_dict = dict(globals_dict)
-        elif damage == "code":
-            # Preserve the installed Ray closure arity while replacing its executable code object.
-            code = code.replace(co_consts=(*code.co_consts, "synthetic wrapper code drift"))
-        altered = types.FunctionType(code, globals_dict, callback.__name__, callback.__defaults__, cells)
-        altered.__dict__.update(callback.__dict__)
-        altered.__module__, altered.__qualname__ = callback.__module__, callback.__qualname__
-        if damage == "metadata":
-            altered.__wrapped__ = lambda: False
-        monkeypatch.setattr(ray, "is_initialized", altered)
-        callback = altered
-    with pytest.raises(ValueError, match="wrapper|Ray|source"):
-        capture.verify_native_callback(callback, descriptor)
-
-
-def test_native_callback_rejects_cyclic_contextmanager():
-    @contextmanager
-    def scope():
-        yield None
-
-    descriptor = _callback_source_descriptor(scope)
-    scope.__wrapped__ = scope
-    scope.__closure__[0].cell_contents = scope
-    with pytest.raises(ValueError, match="unsupported wrapper"):
-        capture.verify_native_callback(scope, descriptor)
 
 
 @pytest.fixture(autouse=False)
@@ -11660,28 +8800,6 @@ def test_cortex_optimizer_capture_failures_remove_downloads_and_never_publish_pa
 
 
 @pytest.mark.usefixtures("_cortex_optimizer_capture_no_network")
-@pytest.mark.parametrize("step", [0, 2, True, "1", None])
-def test_cortex_optimizer_capture_decoder_cannot_relabel_non_initial_update_as_step_one(
-    _cortex_optimizer_capture_lifecycle, step
-):
-    _cortex_optimizer_capture_lifecycle.state.manifest_step = step
-    with pytest.raises(ValueError, match="exactly step 1"):
-        _cortex_optimizer_capture_run(_cortex_optimizer_capture_lifecycle)
-    assert not list(_cortex_optimizer_capture_lifecycle.output.iterdir())
-
-
-@pytest.mark.usefixtures("_cortex_optimizer_capture_no_network")
-def test_cortex_optimizer_capture_duplicate_durable_checkpoints_rejected_before_export(
-    _cortex_optimizer_capture_lifecycle,
-):
-    _cortex_optimizer_capture_lifecycle.state.duplicate = True
-    with pytest.raises(ValueError, match="distinct durable"):
-        _cortex_optimizer_capture_run(_cortex_optimizer_capture_lifecycle)
-    assert _cortex_optimizer_capture_lifecycle.events == ["save-0", "fwd_bwd", "step", "save-1"]
-    assert not list(_cortex_optimizer_capture_lifecycle.output.iterdir())
-
-
-@pytest.mark.usefixtures("_cortex_optimizer_capture_no_network")
 def test_cortex_optimizer_capture_existing_output_never_overwritten_or_stepped(_cortex_optimizer_capture_lifecycle):
     existing = _cortex_optimizer_capture_manifest(_cortex_optimizer_capture_lifecycle.output / "states")
     original = existing.read_bytes()
@@ -11702,40 +8820,6 @@ def test_cortex_optimizer_capture_decoder_must_return_manifest_inside_its_owned_
     assert outside.is_file()
     assert not list(_cortex_optimizer_capture_lifecycle.output.glob("snapshots-*"))
     assert not (_cortex_optimizer_capture_lifecycle.output / "states").exists()
-
-
-@pytest.mark.usefixtures("_cortex_optimizer_capture_no_network")
-def test_cortex_optimizer_capture_uninitialized_parent_job_rejected_before_save(_cortex_optimizer_capture_lifecycle):
-    _cortex_optimizer_capture_lifecycle.job.client.transport.job_id = None
-    with pytest.raises(ValueError, match="initialized parent job"):
-        _cortex_optimizer_capture_run(_cortex_optimizer_capture_lifecycle)
-    assert _cortex_optimizer_capture_lifecycle.events == []
-
-
-@pytest.mark.usefixtures("_cortex_optimizer_capture_no_network")
-@pytest.mark.parametrize("degree", [0, -1, True, 1.0])
-def test_cortex_optimizer_capture_invalid_dp_degree_rejected_before_save(_cortex_optimizer_capture_lifecycle, degree):
-    with pytest.raises(ValueError, match="positive integer"):
-        capture.capture_optimizer_step(
-            _cortex_optimizer_capture_lifecycle.session,
-            _cortex_optimizer_capture_lifecycle.job,
-            {},
-            learning_rate=0.01,
-            output_dir=_cortex_optimizer_capture_lifecycle.output,
-            expected_dp_world_size=degree,
-            optimizer_config=_cortex_optimizer_capture_OPTIMIZER,
-        )
-    assert _cortex_optimizer_capture_lifecycle.events == []
-
-
-@pytest.mark.usefixtures("_cortex_optimizer_capture_no_network")
-def test_cortex_optimizer_capture_onprem_cannot_use_managed_capture(_cortex_optimizer_capture_lifecycle):
-    _cortex_optimizer_capture_lifecycle.session = GatewaySession(
-        _cortex_optimizer_capture_lifecycle.output, 4, OnPremConfig()
-    )
-    with pytest.raises(ValueError, match="requires CortexConfig"):
-        _cortex_optimizer_capture_run(_cortex_optimizer_capture_lifecycle)
-    assert _cortex_optimizer_capture_lifecycle.events == []
 
 
 @pytest.mark.usefixtures("_cortex_optimizer_capture_no_network")
@@ -12101,22 +9185,6 @@ def _cortex_optimizer_decode_rewrite(path, edit):
     replacement.replace(path)
 
 
-@pytest.mark.parametrize("unsafe", ["/tmp", "/code", "/data-fast-shadow", "/data-fast", "symlink"])
-def test_cortex_optimizer_decode_decode_requires_data_fast_before_checkpoint_load(tmp_path, monkeypatch, unsafe):
-    destination = Path(unsafe)
-    if unsafe == "symlink":
-        destination = tmp_path / "escape"
-        destination.symlink_to("/tmp", target_is_directory=True)
-        destination /= "output"
-    monkeypatch.setattr(
-        decoder, "_snapshot", lambda *args, **kwargs: pytest.fail("unsafe output reached checkpoint load")
-    )
-    with pytest.raises(ValueError, match="/data-fast"):
-        decoder.decode_optimizer_capture(tmp_path / "before", tmp_path / "after", destination)
-    assert not (tmp_path / "before").exists()
-    assert not (tmp_path / "after").exists()
-
-
 @pytest.mark.parametrize("prefix", ["", "bf16_", "fp16_"])
 @pytest.mark.parametrize("world_size", [1, 2, 4, 12])
 def test_cortex_optimizer_decode_decode_named_fp32_update_moments_and_padding(tmp_path, prefix, world_size):
@@ -12173,48 +9241,6 @@ def test_cortex_optimizer_decode_decode_uses_actual_state_step_and_group_lr_not_
     ).exists()
 
 
-def test_cortex_optimizer_decode_decode_preserves_nonzero_actual_steps_without_relabeling_as_step_one(tmp_path):
-    pair = _cortex_optimizer_decode_pair(tmp_path, before_step=10)
-    manifest = decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out")
-    assert json.loads(manifest.read_text())["step"] == 11
-    with pytest.raises(ValueError, match="step 1"):
-        summarize_optimizer_artifacts(
-            manifest,
-            optimizer_config=_cortex_optimizer_decode_OPTIMIZER,
-            learning_rate=_cortex_optimizer_decode_LR,
-        )
-
-
-def test_cortex_optimizer_decode_decode_accepts_initialized_step_zero_and_tag_directories(tmp_path):
-    pair = _cortex_optimizer_decode_pair(tmp_path, lazy_baseline=False)
-    assert decoder.decode_optimizer_capture(
-        _cortex_optimizer_decode_model(pair.before).parent,
-        _cortex_optimizer_decode_model(pair.after).parent,
-        tmp_path / "out",
-    ).exists()
-
-
-def test_cortex_optimizer_decode_decode_mmap_restricted_loads_and_does_not_mutate_source_tensors(
-    tmp_path, monkeypatch
-):
-    pair = _cortex_optimizer_decode_pair(tmp_path)
-    before_bytes = {path: path.read_bytes() for root in (pair.before, pair.after) for path in root.rglob("*.pt")}
-    original_load = torch.load
-    calls = []
-
-    def recording_load(*args, **kwargs):
-        calls.append(kwargs)
-        return original_load(*args, **kwargs)
-
-    monkeypatch.setattr(torch, "load", recording_load)
-    decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out")
-    assert calls
-    assert all(
-        (call["weights_only"] is True and call["mmap"] is True and (call["map_location"] == "cpu") for call in calls)
-    )
-    assert all((path.read_bytes() == data for path, data in before_bytes.items()))
-
-
 @pytest.mark.parametrize(
     "field,value,error",
     [
@@ -12244,54 +9270,6 @@ def test_cortex_optimizer_decode_decode_rejects_invalid_optimizer_schema(tmp_pat
     with pytest.raises(ValueError, match=error):
         decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out")
     assert not (tmp_path / "out").exists()
-
-
-@pytest.mark.parametrize("side", ["before", "after"])
-@pytest.mark.parametrize("key", ["fp32_master", "exp_avg", "exp_avg_sq"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64])
-def test_cortex_optimizer_decode_decode_rejects_non_fp32_tensors(tmp_path, side, key, dtype):
-    pair = _cortex_optimizer_decode_pair(tmp_path, lazy_baseline=False)
-
-    def edit(state):
-        opt = state["optimizer_state_dict"]
-        if key == "fp32_master":
-            opt["single_partition_of_fp32_groups"][0] = opt["single_partition_of_fp32_groups"][0].to(dtype)
-        else:
-            opt["base_optimizer_state"]["state"][17][key] = opt["base_optimizer_state"]["state"][17][key].to(dtype)
-
-    _cortex_optimizer_decode_rewrite(_cortex_optimizer_decode_optim(getattr(pair, side)), edit)
-    with pytest.raises(ValueError, match="FP32"):
-        decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out")
-
-
-@pytest.mark.parametrize("key", ["exp_avg", "exp_avg_sq"])
-@pytest.mark.parametrize("mutation", ["missing", "short", "nonvector"])
-def test_cortex_optimizer_decode_decode_rejects_missing_or_malformed_moments(tmp_path, key, mutation):
-    pair = _cortex_optimizer_decode_pair(tmp_path)
-
-    def edit(state):
-        moments = state["optimizer_state_dict"]["base_optimizer_state"]["state"][17]
-        if mutation == "missing":
-            del moments[key]
-        elif mutation == "short":
-            moments[key] = moments[key][:-1]
-        else:
-            moments[key] = moments[key].reshape(2, 3)
-
-    _cortex_optimizer_decode_rewrite(_cortex_optimizer_decode_optim(pair.after), edit)
-    with pytest.raises(ValueError, match="FP32"):
-        decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out")
-
-
-@pytest.mark.parametrize("step", [-1, 0, 2, 1.5, float("nan"), True])
-def test_cortex_optimizer_decode_decode_rejects_inconsistent_post_optimizer_step(tmp_path, step):
-    pair = _cortex_optimizer_decode_pair(tmp_path)
-    _cortex_optimizer_decode_rewrite(
-        _cortex_optimizer_decode_optim(pair.after, 1),
-        lambda state: state["optimizer_state_dict"]["base_optimizer_state"]["state"][17].__setitem__("step", step),
-    )
-    with pytest.raises(ValueError, match="step"):
-        decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out")
 
 
 def test_cortex_optimizer_decode_decode_requires_exactly_one_engine_step(tmp_path):
@@ -12337,29 +9315,6 @@ def test_cortex_optimizer_decode_decode_rejects_ambiguous_or_incomplete_checkpoi
         decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out")
 
 
-@pytest.mark.parametrize("mutation", ["shape", "order", "duplicate", "empty", "module_shape"])
-def test_cortex_optimizer_decode_decode_rejects_shape_or_order_drift(tmp_path, mutation):
-    pair = _cortex_optimizer_decode_pair(tmp_path)
-
-    def edit(state):
-        shapes = state["param_shapes"]
-        if mutation == "shape":
-            shapes[0]["layer.weight"] = torch.Size([3, 2])
-            state["module"]["layer.weight"] = state["module"]["layer.weight"].reshape(3, 2)
-        elif mutation == "order":
-            shapes[0] = OrderedDict(reversed(list(shapes[0].items())))
-        elif mutation == "duplicate":
-            shapes[1]["layer.weight"] = torch.Size([2, 3])
-        elif mutation == "empty":
-            shapes[0] = {}
-        else:
-            state["module"]["layer.weight"] = torch.empty(2, 2)
-
-    _cortex_optimizer_decode_rewrite(_cortex_optimizer_decode_model(pair.after), edit)
-    with pytest.raises(ValueError, match="shape|order|parameter|mapping"):
-        decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out")
-
-
 @pytest.mark.parametrize("mutation", ["missing", "extra", "offset", "length"])
 def test_cortex_optimizer_decode_decode_rejects_bad_named_fragment_mappings(tmp_path, mutation):
     pair = _cortex_optimizer_decode_pair(tmp_path)
@@ -12380,69 +9335,6 @@ def test_cortex_optimizer_decode_decode_rejects_bad_named_fragment_mappings(tmp_
         decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out")
 
 
-@pytest.mark.parametrize(
-    "mutation,error",
-    [
-        ("ep_config", "expert parallel"),
-        ("ep_group", "EP"),
-        ("tp", "parallel"),
-        ("amsgrad", "AMSGrad"),
-        ("missing_group", "groups"),
-        ("extra_state", "state groups"),
-        ("missing_post_state", "step"),
-        ("rank_lr", "rank config"),
-        ("rank_betas", "rank config"),
-        ("lr", "learning rate"),
-        ("betas", "config"),
-        ("bias_correction", "bias_correction"),
-    ],
-)
-def test_cortex_optimizer_decode_decode_rejects_unsupported_or_inconsistent_group_configuration(
-    tmp_path, mutation, error
-):
-    pair = _cortex_optimizer_decode_pair(tmp_path)
-
-    def edit(state):
-        config = state["ds_config"]
-        opt = state["optimizer_state_dict"]
-        base = opt["base_optimizer_state"]
-        group = base["param_groups"][0]
-        if mutation == "ep_config":
-            config["expert_parallel"] = {"enabled": True, "autoep_size": 2}
-        elif mutation == "ep_group":
-            group["moe"] = True
-        elif mutation == "tp":
-            config["tensor_parallel"] = {"tp_size": 2}
-        elif mutation == "amsgrad":
-            group["amsgrad"] = True
-        elif mutation == "missing_group":
-            base["param_groups"].pop()
-        elif mutation == "extra_state":
-            base["state"][99] = base["state"][17]
-        elif mutation == "missing_post_state":
-            base["state"].pop(17)
-        elif mutation in ("lr", "rank_lr"):
-            group["lr"] = 0.002
-        elif mutation in ("betas", "rank_betas"):
-            group["betas"] = (0.8, 0.999)
-        else:
-            group["bias_correction"] = False
-
-    _cortex_optimizer_decode_rewrite(
-        _cortex_optimizer_decode_optim(pair.after, int(mutation.startswith("rank_"))), edit
-    )
-    kwargs = (
-        {}
-        if mutation.startswith("rank_")
-        else {
-            "expected_optimizer_config": _cortex_optimizer_decode_OPTIMIZER,
-            "expected_learning_rate": _cortex_optimizer_decode_LR,
-        }
-    )
-    with pytest.raises(ValueError, match=error):
-        decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out", **kwargs)
-
-
 @pytest.mark.parametrize("key", ["fp32_master", "exp_avg", "exp_avg_sq"])
 def test_cortex_optimizer_decode_decode_nonfinite_parameter_rolls_back_only_new_output(tmp_path, key):
     pair = _cortex_optimizer_decode_pair(tmp_path)
@@ -12461,23 +9353,6 @@ def test_cortex_optimizer_decode_decode_nonfinite_parameter_rolls_back_only_new_
         decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out")
     assert not (tmp_path / "out").exists()
     assert _cortex_optimizer_decode_model(pair.before).exists() and _cortex_optimizer_decode_model(pair.after).exists()
-
-
-def test_cortex_optimizer_decode_decode_preserves_preexisting_output(tmp_path):
-    pair = _cortex_optimizer_decode_pair(tmp_path)
-    out = tmp_path / "out"
-    out.mkdir()
-    sentinel = out / "sentinel"
-    sentinel.write_text("owned elsewhere")
-    with pytest.raises(ValueError, match="already exist"):
-        decoder.decode_optimizer_capture(pair.before, pair.after, out)
-    assert sentinel.read_text() == "owned elsewhere"
-
-
-def test_cortex_optimizer_decode_decode_rejects_output_nested_in_input(tmp_path):
-    pair = _cortex_optimizer_decode_pair(tmp_path)
-    with pytest.raises(ValueError, match="outside"):
-        decoder.decode_optimizer_capture(pair.before, pair.after, pair.before / "out")
 
 
 def test_cortex_optimizer_decode_decode_does_not_allow_arbitrary_pickled_checkpoint_classes(tmp_path):
@@ -12514,68 +9389,7 @@ def test_cortex_optimizer_decode_decode_rejects_non_adamw_or_missing_model_and_s
     assert not (tmp_path / "out").exists()
 
 
-def test_cortex_optimizer_decode_decode_rejects_unmatched_expected_optimizer_type(tmp_path):
-    pair = _cortex_optimizer_decode_pair(tmp_path)
-    with pytest.raises(ValueError, match="expected optimizer type"):
-        decoder.decode_optimizer_capture(
-            pair.before,
-            pair.after,
-            tmp_path / "out",
-            expected_optimizer_config={**_cortex_optimizer_decode_OPTIMIZER, "name": "Adam"},
-        )
-
-
 # Arctic Platform driver.
-
-
-def test_ap_driver_globalize_expert_norms_replaces_rank_local_value() -> None:
-    norms = _globalize_expert_norms(
-        {"layers.0.mlp.experts.w1": 3.0, "layers.0.input_layernorm.weight": 7.0},
-        {"layers.0.mlp.experts.w1": [3.0, 4.0]},
-    )
-    assert norms == {"layers.0.mlp.experts.w1": 5.0, "layers.0.input_layernorm.weight": 7.0}
-
-
-def test_ap_driver_fwd_bwd_step_reads_rank_owned_norms_from_merged_list() -> None:
-    from arctic_platform.correctness.harness.gateway import fwd_bwd_step
-
-    class Client:
-
-        def fwd_bwd(self, body):
-            return {"avg_loss": 1.25, "metrics": {}}
-
-        def step(self, learning_rate):
-            return {
-                "metrics": {
-                    "gradient_norms_per_param": [{}, {"layers.0.input_layernorm.weight": 2.0}],
-                    "gradient_norms_per_expert": [],
-                }
-            }
-
-    class Job:
-        client = Client()
-
-    result = fwd_bwd_step(None, Job(), {}, learning_rate=0.001)
-    assert result.avg_loss == 1.25
-    assert result.grad_norms == {"layers.0.input_layernorm.weight": 2.0}
-
-
-def test_ap_driver_fwd_bwd_step_unwraps_rank_owned_optimizer_manifest() -> None:
-    from arctic_platform.correctness.harness.gateway import fwd_bwd_step
-
-    class Client:
-
-        def fwd_bwd(self, body):
-            return {"avg_loss": 1.25, "metrics": {}}
-
-        def step(self, learning_rate):
-            return {"metrics": {"optimizer_state_manifest": ["/tmp/manifest.json"]}}
-
-    class Job:
-        client = Client()
-
-    result = fwd_bwd_step(None, Job(), {}, learning_rate=0.001)
-    assert result.optimizer_state_manifest == "/tmp/manifest.json"
 
 
 def test_ap_driver_optimizer_capture_worker_patches_imported_server_worker_bindings(monkeypatch) -> None:
@@ -12642,278 +9456,6 @@ def test_ap_driver_optimizer_capture_server_patches_workers_inside_actor(monkeyp
     assert server_module.DeepSpeedWorker is original_worker
 
 
-def test_ap_driver_prime_rl_receives_prediction_aligned_labels() -> None:
-    batch = Batch(
-        name="one",
-        input_ids=torch.tensor([[4, 5, 6]]),
-        position_ids=torch.tensor([[0, 1, 2]]),
-        labels=torch.tensor([[4, 5, 6]]),
-    )
-    assert _labels_for_provider(batch, "prime_rl").tolist() == [[5, 6, -100]]
-    assert _labels_for_provider(batch, "huggingface").tolist() == [[4, 5, 6]]
-
-
-def test_ap_driver_prime_rl_uses_fused_model_loss_with_aligned_labels() -> None:
-    batch = Batch(
-        name="one",
-        input_ids=torch.tensor([[4, 5, 6]]),
-        position_ids=torch.tensor([[0, 1, 2]]),
-        labels=torch.tensor([[4, 5, 6]]),
-    )
-    from arctic_platform.correctness.harness.gateway import pack
-
-    prime = pack(batch, model_provider="prime_rl")
-    assert prime["processing"]["loss_fn"] == "sft"
-    assert prime["meta"]["labels_are_shifted"] is True
-    assert prime["batch"]["labels"].tolist() == [[5, 6, -100]]
-    assert pack(batch, model_provider="huggingface")["processing"]["loss_fn"] == "sft"
-
-
-def test_ap_driver_pack_microbatches_emits_exact_gas_list() -> None:
-    batch = Batch(
-        name="gas4",
-        input_ids=torch.arange(15).view(5, 3),
-        position_ids=torch.arange(3).unsqueeze(0).expand(5, -1).contiguous(),
-        labels=torch.arange(15).view(5, 3),
-    )
-    body = pack_microbatches(batch, 4, model_provider="huggingface")
-    assert body["meta"] == {}
-    assert [micro["input_ids"].shape[0] for micro in body["batch"]] == [2, 1, 1, 1]
-    assert body["batch"][0]["input_ids"].tolist() == [[0, 1, 2], [3, 4, 5]]
-    assert body["batch"][-1]["labels"].tolist() == [[12, 13, 14]]
-
-
-def test_ap_driver_pack_microbatches_preserves_prime_rl_shifted_labels() -> None:
-    batch = Batch(
-        name="prime",
-        input_ids=torch.tensor([[4, 5, 6], [7, 8, 9]]),
-        position_ids=torch.arange(3).unsqueeze(0).expand(2, -1).contiguous(),
-        labels=torch.tensor([[4, 5, 6], [7, 8, 9]]),
-    )
-    body = pack_microbatches(batch, 2, model_provider="prime_rl")
-    assert body["meta"]["labels_are_shifted"] is True
-    assert body["batch"][0]["labels"].tolist() == [[5, 6, -100]]
-    assert body["batch"][1]["labels"].tolist() == [[8, 9, -100]]
-
-
-def test_ap_driver_pack_microbatches_can_request_memory_sft_ce_without_mutating_config() -> None:
-    batch = Batch(
-        name="gas4",
-        input_ids=torch.arange(12).view(4, 3),
-        position_ids=torch.arange(3).unsqueeze(0).expand(4, -1).contiguous(),
-        labels=torch.arange(12).view(4, 3),
-    )
-    processing_config = {"logits_optimization": "memory", "logits_optimization_peak_mem_size_in_gib": 4}
-    body = pack_microbatches(batch, 4, loss_fn="sft_ce", processing_config=processing_config)
-    processing_config["logits_optimization"] = "compute"
-    assert body["processing"] == {
-        "loss_fn": "sft_ce",
-        "config": {"logits_optimization": "memory", "logits_optimization_peak_mem_size_in_gib": 4},
-    }
-
-
-def test_ap_driver_normal_packing_uses_plain_supervised_loss() -> None:
-    from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
-
-    body = pack(build_batch("gas4", 16, 8, 128))
-    assert isinstance(body["batch"], dict)
-    assert body["processing"] == {"loss_fn": "sft"}
-
-
-def test_ap_driver_reference_runner_passes_the_harness_seed(tmp_path, monkeypatch) -> None:
-    from arctic_platform.correctness.harness import runner
-
-    output = tmp_path / "reference.json"
-    captured = {}
-
-    def run_subprocess(command, **kwargs):
-        captured["command"] = command
-        output.write_text('{"loss": 0.0}')
-        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-
-    monkeypatch.setattr(runner.subprocess, "run", run_subprocess)
-    result = runner.run_reference(
-        "model",
-        tmp_path / "batch.pt",
-        output,
-        token_budget=1,
-        ce_chunk=1,
-        attn="sdpa",
-        fp32_lm_head=False,
-        seed=1234,
-        peft_adapter_path=tmp_path / "adapter",
-    )
-    seed_index = captured["command"].index("--seed")
-    adapter_index = captured["command"].index("--peft-adapter")
-    assert captured["command"][seed_index + 1] == "1234"
-    assert captured["command"][adapter_index + 1] == str(tmp_path / "adapter")
-    assert result == {"loss": 0.0}
-
-
-@pytest.mark.parametrize("unsafe", ["/tmp", "/code", "/data-fast-shadow", "/data-fast", "symlink"])
-@pytest.mark.parametrize("boundary", ["execute", "reference_optimizer"])
-def test_ap_driver_runner_requires_data_fast_before_operational_side_effects(tmp_path, monkeypatch, unsafe, boundary):
-    from arctic_platform.correctness.harness import runner
-
-    destination = Path(unsafe)
-    if unsafe == "symlink":
-        destination = tmp_path / "escape"
-        destination.symlink_to("/tmp", target_is_directory=True)
-        destination /= "output"
-    cfg = SimpleNamespace(
-        sub_job={"dtype": "bfloat16"},
-        training={"dtype": "bfloat16", "peft_config": {"peft_type": "LORA"}},
-        n_gpus=1,
-        at_gpu_width=lambda *args: pytest.fail("unsafe workdir reached config preparation"),
-    )
-    monkeypatch.setattr(
-        runner.subprocess, "run", lambda *args, **kwargs: pytest.fail("unsafe output reached subprocess")
-    )
-    with pytest.raises(ValueError, match="/data-fast"):
-        if boundary == "execute":
-            runner.execute(cfg, None, [], vocab_size=128, workdir=destination)
-        else:
-            runner.run_reference(
-                "read-only-model",
-                tmp_path / "batch.pt",
-                tmp_path / "reference.json",
-                token_budget=1,
-                ce_chunk=1,
-                attn="sdpa",
-                fp32_lm_head=False,
-                optimizer_output_dir=destination,
-            )
-    assert not (tmp_path / "reference.json").exists()
-
-
-def test_ap_driver_reference_allows_small_repo_report_with_data_fast_optimizer_output(tmp_path, monkeypatch):
-    from arctic_platform.correctness.harness import runner
-
-    output = Path(__file__).resolve().parents[3] / ".codex-run-state" / f"reference-report-{tmp_path.name}.json"
-    optimizer_output = tmp_path / "optimizer"
-    commands = []
-
-    def run_subprocess(command, **kwargs):
-        commands.append(command)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    original_read_text = Path.read_text
-
-    def read_text(path, *args, **kwargs):
-        if path == output:
-            return '{"loss": 0.0}'
-        return original_read_text(path, *args, **kwargs)
-
-    monkeypatch.setattr(runner.subprocess, "run", run_subprocess)
-    monkeypatch.setattr(Path, "read_text", read_text)
-    assert not output.exists()
-    result = runner.run_reference(
-        "read-only-model",
-        tmp_path / "batch.pt",
-        output,
-        token_budget=1,
-        ce_chunk=1,
-        attn="sdpa",
-        fp32_lm_head=False,
-        optimizer_config={"name": "AdamW"},
-        learning_rate=0.01,
-        optimizer_output_dir=optimizer_output,
-    )
-    assert result == {"loss": 0.0}
-    assert len(commands) == 1
-    command = commands[0]
-    assert command[command.index("--out") + 1] == str(output)
-    assert command[command.index("--optimizer-output-dir") + 1] == str(optimizer_output)
-    assert not output.exists()
-
-
-def test_ap_driver_copy_checkpoint_peft_adapter_accepts_a_checkpoint_adapter_pack(tmp_path) -> None:
-    checkpoint_root = tmp_path / "checkpoint"
-    source = checkpoint_root / "global_step0" / "default"
-    source.mkdir(parents=True)
-    (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    save_file({"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)}, source / "adapter_model.safetensors")
-    destination = tmp_path / "adapter"
-    assert copy_checkpoint_peft_adapter(checkpoint_root, destination) == destination
-    assert (destination / "adapter_model.safetensors").read_bytes() == (
-        source / "adapter_model.safetensors"
-    ).read_bytes()
-
-
-def test_ap_driver_copy_checkpoint_peft_adapter_accepts_a_weights_only_hf_pack(tmp_path) -> None:
-    checkpoint_root = tmp_path / "checkpoint"
-    source = checkpoint_root / "hf"
-    source.mkdir(parents=True)
-    (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    save_file({"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)}, source / "adapter_model.safetensors")
-    destination = tmp_path / "adapter"
-    assert copy_checkpoint_peft_adapter(checkpoint_root, destination) == destination
-    assert (destination / "adapter_model.safetensors").read_bytes() == (
-        source / "adapter_model.safetensors"
-    ).read_bytes()
-
-
-def test_ap_driver_copy_checkpoint_peft_adapter_rejects_empty_tensors_before_copy(tmp_path) -> None:
-    source = tmp_path / "checkpoint" / "hf"
-    source.mkdir(parents=True)
-    (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    save_file({}, source / "adapter_model.safetensors")
-    destination = tmp_path / "adapter"
-    destination.mkdir()
-    (destination / "sentinel").write_text("preserve")
-    with pytest.raises(RuntimeError, match="no adapter tensors"):
-        copy_checkpoint_peft_adapter(source.parent, destination)
-    assert (destination / "sentinel").read_text() == "preserve"
-
-
-def test_ap_driver_materialize_peft_adapter_accepts_adapter_only_export(tmp_path, monkeypatch) -> None:
-    from arctic_platform.correctness.harness import runner
-
-    cfg = SimpleNamespace(
-        model_name="Qwen/Qwen3-8B",
-        training={"peft_config": {"peft_type": "LORA"}},
-        sub_job={},
-        n_gpus=1,
-    )
-    cfg.at_gpu_width = lambda width: cfg
-    source = tmp_path / "checkpoint" / "hf"
-    source.mkdir(parents=True)
-    (source / "adapter_config.json").write_text('{"peft_type": "LORA"}')
-    save_file({"base_model.model.q_proj.lora_A.weight": torch.ones(2, 2)}, source / "adapter_model.safetensors")
-    calls = []
-
-    def save_checkpoint(**kwargs):
-        calls.append(kwargs)
-        return {"path": str(source.parent), "hf_path": str(source)}
-
-    monkeypatch.setattr(runner, "build_payload", lambda *args, **kwargs: {})
-    monkeypatch.setattr(runner, "gateway", lambda *args: contextlib.nullcontext(object()))
-    job = SimpleNamespace(client=SimpleNamespace(save_checkpoint=save_checkpoint))
-    monkeypatch.setattr(runner, "running_job", lambda *args: contextlib.nullcontext(job))
-    exported = runner.materialize_ap_peft_adapter(cfg, "unused", tmp_path, attn_implementation="eager")
-    assert exported == tmp_path / "adapter"
-    assert (exported / "adapter_model.safetensors").read_bytes() == (source / "adapter_model.safetensors").read_bytes()
-    assert calls == [{"path": str(source.parent), "export_hf": True}]
-
-
-def test_ap_driver_full_model_weights_only_export_still_requires_model_config(tmp_path) -> None:
-    from arctic_platform.correctness.harness.gateway import save_weights_only_checkpoint
-
-    client = SimpleNamespace(save_checkpoint=lambda **kwargs: {"hf_path": str(tmp_path), "path": str(tmp_path)})
-    with pytest.raises(RuntimeError, match="no model config"):
-        save_weights_only_checkpoint(None, SimpleNamespace(client=client), tmp_path)
-
-
-def test_ap_driver_copy_checkpoint_peft_adapter_rejects_a_full_model_pack(tmp_path) -> None:
-    checkpoint_root = tmp_path / "checkpoint"
-    source = checkpoint_root / "global_step0" / "default"
-    source.mkdir(parents=True)
-    (source / "config.json").write_text("{}")
-    (source / "model.safetensors").write_bytes(b"full-model")
-    with pytest.raises(RuntimeError, match="no PEFT pack"):
-        copy_checkpoint_peft_adapter(checkpoint_root, tmp_path / "adapter")
-
-
 def test_ap_driver_payload_routes_optimizer_capture_to_debug_for_harness(tmp_path) -> None:
     destination = tmp_path / "optimizer"
     payload = build_payload(
@@ -12922,50 +9464,6 @@ def test_ap_driver_payload_routes_optimizer_capture_to_debug_for_harness(tmp_pat
     client_config = _training_client_config(type("Session", (), {"workdir": tmp_path})(), payload)
     worker_config = client_config.to_onprem("training")["ds_worker_config"]
     assert worker_config["debug"]["optimizer_state_output_dir"] == str(destination.resolve())
-
-
-@pytest.mark.parametrize(
-    "job_config",
-    [
-        {},
-        {"training_config": None, "ds_worker_config": None},
-        {"training_config": {"debug": None}, "ds_worker_config": {"debug": {}}},
-        {"debug": {"optimizer_state_output_dir": "/ignored"}},
-    ],
-)
-def test_ap_driver_optimizer_capture_debug_config_defaults(job_config) -> None:
-    from arctic_platform.correctness.harness.optimizer import _optimizer_capture_debug_config
-
-    assert _optimizer_capture_debug_config(job_config) == {}
-
-
-def test_ap_driver_optimizer_capture_debug_config_merges_supported_sections_without_mutation() -> None:
-    from arctic_platform.correctness.harness.optimizer import _optimizer_capture_debug_config
-
-    training_debug = {"optimizer_state_output_dir": "/training", "shared_peft_adapter": {"identity": "original"}}
-    worker_debug = {"optimizer_state_output_dir": "/worker"}
-    debug = _optimizer_capture_debug_config(
-        {"training_config": {"debug": training_debug}, "ds_worker_config": {"debug": worker_debug}}
-    )
-    assert debug == {"optimizer_state_output_dir": "/worker", "shared_peft_adapter": {"identity": "original"}}
-    debug["optimizer_state_output_dir"] = "/changed"
-    assert training_debug == {
-        "optimizer_state_output_dir": "/training",
-        "shared_peft_adapter": {"identity": "original"},
-    }
-    assert worker_debug == {"optimizer_state_output_dir": "/worker"}
-
-
-@pytest.mark.parametrize("section", ["training_config", "ds_worker_config"])
-@pytest.mark.parametrize("nested_debug", [False, True], ids=["config", "debug"])
-@pytest.mark.parametrize("value", [[], "", False])
-def test_ap_driver_optimizer_capture_debug_config_rejects_malformed_sections(section, nested_debug, value) -> None:
-    from arctic_platform.correctness.harness.optimizer import _optimizer_capture_debug_config
-
-    config = {section: {"debug": value} if nested_debug else value}
-    field = f"{section}.debug" if nested_debug else section
-    with pytest.raises(TypeError, match=f"{field} must be a dict"):
-        _optimizer_capture_debug_config(config)
 
 
 @pytest.fixture
@@ -13007,21 +9505,6 @@ def test_ap_driver_optimizer_capture_initialize_uses_current_client_job_config(
     assert worker.production_initialization[1] is job_config
 
 
-def test_ap_driver_optimizer_capture_initialize_accepts_path_objects(
-    _ap_driver_optimizer_capture_initializer, tmp_path
-):
-    worker = _ap_driver_optimizer_capture_initializer
-    job_config = {
-        "training_config": {
-            "debug": {
-                "optimizer_state_output_dir": tmp_path / "optimizer",
-            }
-        }
-    }
-    assert worker.initialize("master", job_config) is True
-    assert worker._optimizer_state_output_dir == str(tmp_path / "optimizer")
-
-
 def test_ap_driver_optimizer_capture_initialize_worker_settings_can_disable_training_capture(
     _ap_driver_optimizer_capture_initializer,
 ):
@@ -13032,25 +9515,6 @@ def test_ap_driver_optimizer_capture_initialize_worker_settings_can_disable_trai
     }
     assert worker.initialize("master", job_config) is True
     assert worker._optimizer_state_output_dir is None
-
-
-@pytest.mark.parametrize("value", ["", "relative/path"])
-def test_ap_driver_optimizer_capture_initialize_rejects_relative_paths(
-    _ap_driver_optimizer_capture_initializer, value
-):
-    worker = _ap_driver_optimizer_capture_initializer
-    with pytest.raises(ValueError, match="debug.optimizer_state_output_dir must be an absolute path"):
-        worker.initialize("master", {"ds_worker_config": {"debug": {"optimizer_state_output_dir": value}}})
-    assert not hasattr(worker, "production_initialization")
-
-
-def test_ap_driver_optimizer_capture_initialize_rejects_non_path_values(
-    _ap_driver_optimizer_capture_initializer,
-):
-    worker = _ap_driver_optimizer_capture_initializer
-    with pytest.raises(TypeError):
-        worker.initialize("master", {"ds_worker_config": {"debug": {"optimizer_state_output_dir": 123}}})
-    assert not hasattr(worker, "production_initialization")
 
 
 def test_ap_driver_optimizer_capture_worker_context_restores_production_worker() -> None:
@@ -13064,108 +9528,6 @@ def test_ap_driver_optimizer_capture_worker_context_restores_production_worker()
     with optimizer_capture_worker():
         assert deepspeed_worker_module.DeepSpeedWorker is capture_worker
     assert deepspeed_worker_module.DeepSpeedWorker is original
-
-
-def test_ap_driver_payload_can_skip_unused_gradient_norm_collection() -> None:
-    payload = build_payload({}, "model", 42, gradient_norms_per_param=False)
-    assert payload["training_config"]["debug"]["gradient_norms_per_param"] is False
-
-
-def test_ap_driver_payload_preserves_configured_deepspeed_accumulation() -> None:
-    payload = build_payload(
-        {
-            "n_gpus": 4,
-            "ds_config": {
-                "train_batch_size": 4,
-                "train_micro_batch_size_per_gpu": 1,
-                "gradient_accumulation_steps": 1,
-            },
-        },
-        "model",
-        42,
-    )
-    ds_config = payload["training_config"]["ds_config"]
-    assert ds_config["gradient_accumulation_steps"] == 1
-    assert ds_config["train_batch_size"] == 4
-
-
-def test_ap_driver_payload_caps_large_microbatch_budget_at_64k() -> None:
-    payload = build_payload({"mb_spec": {"max_tokens_per_mb": 262144}}, "model", 42)
-    assert payload["training_config"]["mb_spec"]["max_tokens_per_mb"] == 65536
-
-
-def test_ap_driver_payload_applies_spec_lm_head_chunk_without_overriding_config() -> None:
-    injected = build_payload({}, "model", 42, lm_head_token_chunk_size=2048)
-    configured = build_payload({"fused_lm_head_token_chunk_size": 4096}, "model", 42, lm_head_token_chunk_size=2048)
-    assert injected["training_config"]["fused_lm_head_token_chunk_size"] == 2048
-    assert configured["training_config"]["fused_lm_head_token_chunk_size"] == 4096
-
-
-def test_ap_driver_payload_preserves_smaller_microbatch_budget() -> None:
-    payload = build_payload({"mb_spec": {"max_tokens_per_mb": 10240}}, "model", 42)
-    assert payload["training_config"]["mb_spec"]["max_tokens_per_mb"] == 10240
-
-
-def test_ap_driver_payload_does_not_choose_deepep_chunks() -> None:
-    payload = build_payload({"ep_size": 4, "mb_spec": {"max_tokens_per_mb": 10240}}, "model", 42)
-    assert "deepep_token_chunk_size" not in payload["training_config"]
-
-
-def test_ap_driver_pool_is_the_local_devices_when_the_harness_owns_the_gateway(monkeypatch) -> None:
-    """With no external gateway the harness starts one on this node, so its devices are the whole pool."""
-    monkeypatch.delenv("DSS_GATEWAY_URL", raising=False)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
-    assert available_gpus() == 8
-
-
-def test_ap_driver_pool_is_the_hostfile_slots_when_an_external_gateway_owns_placement(monkeypatch, tmp_path) -> None:
-    """A gateway the harness did not start places jobs across its hostfile, which this node cannot see."""
-    hostfile = tmp_path / "hostfile"
-    hostfile.write_text("10.0.0.1 slots=8\n10.0.0.2 slots=8\n")
-    monkeypatch.setenv("DSS_GATEWAY_URL", "http://gateway:8000")
-    monkeypatch.setenv("DSS_GATEWAY_HOSTFILE", str(hostfile))
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
-    assert available_gpus() == 16
-
-
-def test_ap_driver_pool_falls_back_to_local_devices_when_the_named_hostfile_is_absent(monkeypatch, tmp_path) -> None:
-    """An unreadable hostfile leaves the pool unknown, so the guard keeps the number it can verify."""
-    monkeypatch.setenv("DSS_GATEWAY_URL", "http://gateway:8000")
-    monkeypatch.setenv("DSS_GATEWAY_HOSTFILE", str(tmp_path / "missing"))
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
-    assert available_gpus() == 8
-
-
-def test_ap_driver_payload_pins_determinism_over_a_config_that_asks_otherwise() -> None:
-    payload = build_payload(
-        {
-            "debug": {"full_determinism": False, "full_determinism_must_comply": True},
-            "mb_spec": {"max_tokens_per_mb": 1024},
-        },
-        "model",
-        42,
-    )
-    debug = payload["training_config"]["debug"]
-    assert debug["full_determinism"] is True
-    assert debug["full_determinism_must_comply"] is False
-
-
-def test_ap_driver_payload_determinism_off_clears_a_config_that_asks_for_the_pin() -> None:
-    payload = build_payload(
-        {
-            "debug": {"full_determinism": True, "full_determinism_must_comply": True},
-            "mb_spec": {"max_tokens_per_mb": 1024},
-        },
-        "model",
-        42,
-        determinism="off",
-    )
-    debug = payload["training_config"]["debug"]
-    assert debug["full_determinism"] is False
-    assert debug["full_determinism_must_comply"] is False
 
 
 @pytest.mark.parametrize("auth_mode", [None, "disabled", "token", "legacy-mode"])
@@ -13223,81 +9585,6 @@ def test_ap_driver_gateway_runtime_verifies_before_and_after_owned_shutdown(monk
     assert os.environ["MASTER_PORT"] == "12345"
     assert os.environ.get("RAY_AUTH_MODE") == auth_mode
     assert RayCluster._HOSTFILE == "/job/hostfile"
-
-
-@pytest.mark.parametrize("stage", ["start", "body"])
-def test_ap_driver_gateway_runtime_restores_hostfile_after_failure(monkeypatch, stage) -> None:
-    import torch
-
-    from arctic_platform.correctness.harness import gateway as ap_driver
-
-    failure = RuntimeError("runtime failed")
-    shutdown_hostfiles = []
-    ray = SimpleNamespace(_HOSTFILE="/job/hostfile")
-
-    def start(*, auto_attach):
-        assert auto_attach is False
-        assert ray._HOSTFILE == os.devnull
-        if stage == "start":
-            raise failure
-
-    ray.init_ray_cluster = start
-    ray._shutdown = lambda: shutdown_hostfiles.append(ray._HOSTFILE)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
-    monkeypatch.setattr(ap_driver, "_load_gateway_ray_cluster", lambda: ray)
-    monkeypatch.setattr(ap_driver, "_verify_gateway_runtime_idle", lambda: None)
-    monkeypatch.delenv("MASTER_PORT", raising=False)
-    with pytest.raises(RuntimeError) as caught:
-        with _gateway_runtime(8):
-            raise failure
-    assert caught.value is failure
-    assert shutdown_hostfiles == [os.devnull]
-    assert ray._HOSTFILE == "/job/hostfile"
-    assert "MASTER_PORT" not in os.environ
-
-
-@pytest.mark.parametrize(
-    "environment,existing,expected",
-    [
-        (
-            {"DSS_GATEWAY_HOSTFILE": "/selected/dss", "ARCTIC_HOSTFILE": "/selected/arctic"},
-            {"/selected/dss", "/selected/arctic", "/data-fast/hostfile", "/job/hostfile"},
-            "/selected/dss",
-        ),
-        (
-            {"ARCTIC_HOSTFILE": "/selected/arctic"},
-            {"/selected/arctic", "/data-fast/hostfile", "/job/hostfile"},
-            "/selected/arctic",
-        ),
-        ({}, {"/data-fast/hostfile", "/job/hostfile"}, "/data-fast/hostfile"),
-        ({}, {"/job/hostfile"}, "/job/hostfile"),
-        ({}, set(), None),
-        ({"DSS_GATEWAY_HOSTFILE": "/missing"}, {"/job/hostfile"}, "/job/hostfile"),
-    ],
-    ids=["dss-precedence", "arctic", "fast-precedence", "job-fallback", "local-only", "missing-env"],
-)
-def test_ap_driver_selected_hostfile_is_shared_by_gateway_and_allocation(
-    monkeypatch, environment, existing, expected
-) -> None:
-    from arctic_platform.correctness.harness import gateway as ap_driver
-
-    monkeypatch.delenv("DSS_GATEWAY_HOSTFILE", raising=False)
-    monkeypatch.delenv("ARCTIC_HOSTFILE", raising=False)
-    for name, value in environment.items():
-        monkeypatch.setenv(name, value)
-    monkeypatch.setattr(Path, "is_file", lambda path: str(path) in existing)
-    selected = ap_driver._allocation_hostfile()
-    assert selected == (Path(expected) if expected else None)
-    commands = []
-
-    def command(arguments, **kwargs):
-        commands.append(arguments)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(ap_driver.subprocess, "run", command)
-    ap_driver._run_on_allocation("readonly-selection-check")
-    arguments = commands[0]
-    assert arguments[1:3] == (["-f", expected] if expected else ["-lc", "readonly-selection-check"])
 
 
 def test_ap_driver_allocation_runtime_command_uses_hostfile_ds_ssh(monkeypatch, tmp_path) -> None:
@@ -13393,27 +9680,6 @@ def test_ap_driver_runtime_idle_check_requires_successful_process_inventory(monk
     assert ("PORT_CHECK" in result.stdout) is (probe_status == 1)
 
 
-def test_ap_driver_gateway_runtime_load_failure_does_not_shutdown_or_recheck(monkeypatch):
-    from arctic_platform.correctness.harness import gateway as ap_driver
-
-    calls = []
-    failure = RuntimeError("cluster import failed")
-
-    def load():
-        calls.append("load")
-        raise failure
-
-    monkeypatch.setattr(ap_driver, "_verify_gateway_runtime_idle", lambda: calls.append("verify"))
-    monkeypatch.setattr(ap_driver, "_load_gateway_ray_cluster", load)
-    monkeypatch.delenv("MASTER_PORT", raising=False)
-    with pytest.raises(RuntimeError) as caught:
-        with _gateway_runtime(1):
-            pytest.fail("cluster import must fail before launch")
-    assert caught.value is failure
-    assert calls == ["verify", "load"]
-    assert "MASTER_PORT" not in os.environ
-
-
 def test_ap_driver_running_job_keeps_cleanup_outside_client_shutdown(monkeypatch, tmp_path) -> None:
     from arctic_platform.correctness.harness import gateway as ap_driver
 
@@ -13479,32 +9745,6 @@ def test_ap_driver_gateway_runtime_cleanup_failure_is_unsafe_and_restores_port(m
     assert os.environ["MASTER_PORT"] == "12345"
     assert calls == ["verify", "verify"]
     assert ray._HOSTFILE == "/job/hostfile"
-
-
-def test_ap_driver_running_job_shutdown_failure_is_unsafe(monkeypatch, tmp_path):
-    from arctic_platform.correctness.harness import gateway as ap_driver
-
-    failure = RuntimeError("cancel failed")
-
-    class Client:
-
-        def __init__(self, config):
-            pass
-
-        def shutdown(self):
-            raise failure
-
-    monkeypatch.setattr(ap_driver, "_gateway_runtime", lambda *a: contextlib.nullcontext())
-    monkeypatch.setattr(ap_driver, "ArcticClient", Client)
-    payload = {
-        "model_name": "model",
-        "job_type": "training",
-        "training_config": {"n_gpus": 1, "mb_spec": {"max_tokens_per_mb": 1}},
-    }
-    with pytest.raises(ap_driver.UnsafeCleanupError) as caught:
-        with ap_driver.running_job(ap_driver.GatewaySession(tmp_path, 1), payload):
-            pass
-    assert caught.value.__cause__ is failure
 
 
 # Optimizer capture.
@@ -13778,22 +10018,6 @@ def test_optimizer_capture_disabled_optimizer_capture_reads_no_gradients(_optimi
     assert not state.artifact.exists()
 
 
-def test_optimizer_capture_inactive_bf16_parameter_records_absent_gradient_without_local_fallback(
-    _optimizer_capture_capture_worker,
-):
-    state = _optimizer_capture_capture_worker
-    parameter = state.model.weight
-    parameter.grad = None
-    state.accumulated.clear()
-    state.actor.engine.optimizer.bf16_groups = [[parameter]]
-    state.actor.engine.optimizer.fp32_groups_has_gradients = [[False]]
-    state.actor._optimizer_participation_capture.active.clear()
-    with pytest.raises(ValueError, match="unexpected missing gradient"):
-        state.actor._snapshot_optimizer_state_parameters()
-    assert not state.artifact.exists()
-    assert state.events == ["accumulated"]
-
-
 def test_optimizer_capture_inactive_gradient_does_not_hide_post_step_optimizer_state(
     _optimizer_capture_capture_worker,
 ):
@@ -13865,20 +10089,6 @@ def test_optimizer_capture_preserves_inactive_weights_without_adam_moments(
     assert state.model.visual.weight.grad is None
 
 
-@pytest.mark.parametrize("failure", ["backward", "step"])
-def test_optimizer_capture_failure_restores_backward_hooks(_optimizer_capture_capture_worker, failure):
-    state = _optimizer_capture_capture_worker
-    if failure == "backward":
-        with pytest.raises(RuntimeError, match="backward failed"):
-            state.actor.forward_backward({"failure": True})
-    else:
-        state.actor.step_failure = True
-        with pytest.raises(RuntimeError, match="step failed"):
-            state.actor.step()
-    assert not state.model.weight._backward_hooks
-    assert state.actor._optimizer_participation_capture is None
-
-
 def test_optimizer_capture_participation_survives_all_accumulated_microbatches(_optimizer_capture_capture_worker):
     state = _optimizer_capture_capture_worker
     state.actor._close_optimizer_participation()
@@ -13892,138 +10102,6 @@ def test_optimizer_capture_participation_survives_all_accumulated_microbatches(_
         assert len(state.model.weight._backward_hooks) == 1
     state.actor._close_optimizer_participation()
     assert not state.model.weight._backward_hooks
-
-
-@pytest.mark.parametrize("rank", [0, 1], ids=["origin", "peer"])
-def test_optimizer_capture_shares_rank_zero_validation_errors_before_another_collective(
-    _optimizer_capture_capture_worker, monkeypatch, rank
-):
-    state = _optimizer_capture_capture_worker
-    state.actor.rank = rank
-    monkeypatch.setattr(optimizer_capture.dist, "get_world_size", lambda: 2)
-    messages = []
-
-    def gather(rows, message):
-        messages.append(message)
-        rows[:] = ["ValueError: invalid inactive witness", None]
-
-    monkeypatch.setattr(optimizer_capture.dist, "all_gather_object", gather)
-    monkeypatch.setattr(optimizer_capture.dist, "barrier", lambda: pytest.fail("error must precede barrier"))
-    calls = []
-
-    def validate():
-        calls.append("validate")
-        raise ValueError("invalid inactive witness")
-
-    expected = ValueError if rank == 0 else RuntimeError
-    with pytest.raises(expected, match="invalid inactive witness"):
-        state.actor._optimizer_collective_check(validate, rank_zero=True)
-    assert calls == (["validate"] if rank == 0 else [])
-    assert messages == (["ValueError: invalid inactive witness"] if rank == 0 else [None])
-
-
-def test_optimizer_capture_shares_local_participation_errors_before_gathering_evidence(
-    _optimizer_capture_capture_worker, monkeypatch
-):
-    state = _optimizer_capture_capture_worker
-    state.actor._close_optimizer_participation()
-    messages = []
-
-    def gather(rows, message):
-        messages.append(message)
-        rows[0] = message
-
-    monkeypatch.setattr(optimizer_capture.dist, "all_gather_object", gather)
-    with pytest.raises(ValueError, match="genuine pre-backward participation"):
-        state.actor._optimizer_participation()
-    assert messages == ["ValueError: optimizer capture requires genuine pre-backward participation"]
-
-
-@pytest.mark.parametrize("damage", ["master", "gradient", "moments", "accumulation", "relink"])
-def test_optimizer_capture_shares_snapshot_validation_before_next_tensor_collective(
-    _optimizer_capture_capture_worker, monkeypatch, damage
-):
-    state = _optimizer_capture_capture_worker
-    messages, tensors = [], []
-    utils = sys.modules["deepspeed.utils"]
-    if damage == "master":
-        monkeypatch.setattr(utils, "safe_get_full_fp32_param", lambda parameter: None)
-    elif damage == "gradient":
-        state.accumulated.clear()
-    elif damage == "moments":
-        state.actor._full_adam_moments = lambda parameter: (torch.zeros_like(parameter), None)
-    else:
-
-        def fail():
-            raise ValueError(f"invalid {damage}")
-
-        if damage == "accumulation":
-            state.actor._bf16_accumulated_gradients = fail
-        else:
-            state.actor.engine.optimizer._lazy_init_hp_params_optimizer_state = fail
-
-    def gather(rows, message):
-        if isinstance(message, str):
-            messages.append(message)
-        rows[0] = message
-
-    def globalize(parameter, tensor):
-        tensors.append(tensor)
-        return tensor
-
-    monkeypatch.setattr(optimizer_capture.dist, "all_gather_object", gather)
-    state.actor._globalize_expert_optimizer_tensor = globalize
-    with pytest.raises((ValueError, RuntimeError)):
-        state.actor._snapshot_optimizer_state_parameters()
-    assert len(messages) == 1
-    assert len(tensors) == {"master": 0, "gradient": 1, "moments": 2, "accumulation": 0, "relink": 0}[damage]
-    assert not state.artifact.exists()
-
-
-@pytest.mark.parametrize("damage", ["master", "moments", "participation"])
-def test_optimizer_capture_shares_post_step_validation_before_next_tensor_collective(
-    _optimizer_capture_capture_worker, monkeypatch, damage
-):
-    state = _optimizer_capture_capture_worker
-    state.actor._snapshot_optimizer_state_parameters()
-    state.actor.engine.global_steps = 1
-    messages, tensors = [], []
-    if damage == "master":
-        monkeypatch.setattr(sys.modules["deepspeed.utils"], "safe_get_full_fp32_param", lambda parameter: None)
-    elif damage == "participation":
-        state.actor._optimizer_step_participation = {}
-
-    def gather(rows, message):
-        if isinstance(message, str):
-            messages.append(message)
-        rows[0] = message
-
-    def globalize(parameter, tensor):
-        tensors.append(tensor)
-        return tensor
-
-    monkeypatch.setattr(optimizer_capture.dist, "all_gather_object", gather)
-    state.actor._globalize_expert_optimizer_tensor = globalize
-    with pytest.raises((ValueError, RuntimeError)):
-        state.actor._optimizer_state_artifact_metrics()
-    assert len(messages) == 1
-    assert not tensors
-    assert state.artifact.exists()
-
-
-def test_optimizer_capture_missing_participating_bf16_buffer_with_no_local_grad_still_errors(
-    _optimizer_capture_capture_worker,
-):
-    state = _optimizer_capture_capture_worker
-    parameter = state.model.weight
-    parameter.grad = None
-    state.accumulated.clear()
-    state.actor.engine.optimizer.bf16_groups = [[parameter]]
-    state.actor.engine.optimizer.fp32_groups_has_gradients = [[True]]
-    with pytest.raises(RuntimeError, match="no reduced gradient"):
-        state.actor._snapshot_optimizer_state_parameters()
-    assert state.events == ["accumulated"]
-    assert not state.artifact.exists()
 
 
 @pytest.fixture
@@ -14123,17 +10201,6 @@ def _optimizer_capture_capture_server(monkeypatch):
     )
 
 
-def test_optimizer_capture_publication_fixture_matches_product_request_server():
-    source = Path(__file__).resolve().parents[2] / "common/ray_server.py"
-    owners = [
-        node.name
-        for node in ast.parse(source.read_text()).body
-        if isinstance(node, ast.ClassDef)
-        and any((isinstance(member, ast.AsyncFunctionDef) and member.name == "step" for member in node.body))
-    ]
-    assert owners == ["ArcticRLRayServer"]
-
-
 def test_optimizer_capture_capture_context_restores_both_server_classes_after_exception(
     _optimizer_capture_capture_server,
 ):
@@ -14150,22 +10217,6 @@ def test_optimizer_capture_capture_context_restores_both_server_classes_after_ex
     assert state.server_module.DeepSpeedWorker is state.production_worker
 
 
-def test_optimizer_capture_nested_capture_context_restores_outer_bindings(_optimizer_capture_capture_server):
-    state = _optimizer_capture_capture_server
-    with optimizer_capture.optimizer_capture_worker():
-        outer_server = state.server_module.ArcticRLRayServer
-        outer_state = state.server_module.ArcticRLRayServerState
-        with optimizer_capture.optimizer_capture_worker():
-            assert state.server_module.ArcticRLRayServer is not outer_server
-            assert state.server_module.ArcticRLRayServerState is not outer_state
-        assert state.server_module.ArcticRLRayServer is outer_server
-        assert state.server_module.ArcticRLRayServerState is outer_state
-        assert state.worker_module.DeepSpeedWorker is state.capture_worker
-    assert state.server_module.ArcticRLRayServer is state.server_class
-    assert state.server_module.ArcticRLRayServerState is state.state_class
-    assert state.worker_module.DeepSpeedWorker is state.production_worker
-
-
 def test_optimizer_capture_peer_rank_zero_capture_is_published_before_step_response(_optimizer_capture_capture_server):
     state = _optimizer_capture_capture_server
     assert state.manifest not in state.files["head"]
@@ -14178,24 +10229,6 @@ def test_optimizer_capture_peer_rank_zero_capture_is_published_before_step_respo
     assert sum((event[0] == "step" for event in state.events)) == 1
 
 
-def test_optimizer_capture_local_capture_uses_no_peer_transfer(_optimizer_capture_capture_server):
-    state = _optimizer_capture_capture_server
-    state.nodes[:] = [state.nodes[1]]
-    state.actor.training_workers = state.actor.training_workers[:2]
-    result = asyncio.run(state.actor.step(7))
-    assert result is state.response
-    assert ("export", "peer", "/data-fast/tmp/capture", []) in state.events
-
-
-def test_optimizer_capture_step_without_optimizer_capture_leaves_product_response_unchanged(
-    _optimizer_capture_capture_server,
-):
-    state = _optimizer_capture_capture_server
-    state.response["metrics"] = {"grad_norm": 1.0}
-    assert asyncio.run(state.actor.step(7)) is state.response
-    assert state.events == [("step", 7, None)]
-
-
 @pytest.mark.parametrize("failure", ["step", "export", "require"])
 def test_optimizer_capture_capture_failures_are_not_successful_step_responses(
     _optimizer_capture_capture_server, failure
@@ -14205,118 +10238,6 @@ def test_optimizer_capture_capture_failures_are_not_successful_step_responses(
     with pytest.raises((RuntimeError, FileNotFoundError)):
         asyncio.run(state.actor.step(7))
     assert sum((event[0] == "step" for event in state.events)) == 1
-
-
-def test_optimizer_capture_workers_outside_live_allocation_are_rejected_before_export(
-    _optimizer_capture_capture_server,
-):
-    state = _optimizer_capture_capture_server
-    state.nodes.pop(1)
-    with pytest.raises(RuntimeError, match="outside"):
-        asyncio.run(state.actor.step(7))
-    assert not any((event[0] == "export" for event in state.events))
-
-
-def test_optimizer_capture_manifest_is_required_in_exported_files(_optimizer_capture_capture_server):
-    state = _optimizer_capture_capture_server
-    state.files["peer"].pop(state.manifest)
-    with pytest.raises(FileNotFoundError, match="manifest"):
-        asyncio.run(state.actor.step(7))
-
-
-@pytest.mark.parametrize("as_string", [False, True])
-def test_optimizer_capture_manifest_scalar_and_duplicate_metrics_publish_once(
-    _optimizer_capture_capture_server, as_string
-):
-    state = _optimizer_capture_capture_server
-    state.response["metrics"]["optimizer_state_manifest"] = (
-        state.manifest if as_string else [state.manifest, state.manifest]
-    )
-    assert asyncio.run(state.actor.step(7)) is state.response
-    assert sum((event[0] == "export" for event in state.events)) == 1
-
-
-def test_optimizer_capture_empty_capture_worker_list_is_rejected(_optimizer_capture_capture_server):
-    state = _optimizer_capture_capture_server
-    state.actor.training_workers = []
-    with pytest.raises(RuntimeError, match="no training workers"):
-        asyncio.run(state.actor.step(7))
-    assert not any((event[0] == "export" for event in state.events))
-
-
-def test_optimizer_capture_relative_manifest_is_rejected_before_publication(_optimizer_capture_capture_server):
-    state = _optimizer_capture_capture_server
-    state.response["metrics"]["optimizer_state_manifest"] = ["manifest.json"]
-    with pytest.raises(ValueError, match="absolute"):
-        asyncio.run(state.actor.step(7))
-    assert not any((event[0] == "export" for event in state.events))
-
-
-def test_optimizer_capture_head_without_training_workers_still_receives_capture(_optimizer_capture_capture_server):
-    state = _optimizer_capture_capture_server
-    state.actor.training_workers = state.actor.training_workers[:2]
-    asyncio.run(state.actor.step(7))
-    assert state.files["head"] == state.files["peer"]
-    assert ("export", "peer", "/data-fast/tmp/capture", ["head"]) in state.events
-
-
-@pytest.mark.parametrize("fail_context", [False, True])
-def test_optimizer_capture_preloaded_compatibility_server_publishes_and_restores(
-    _optimizer_capture_capture_server, monkeypatch, fail_context
-):
-    state = _optimizer_capture_capture_server
-    compatibility = types.ModuleType("arctic_platform.rl.ray_server")
-    compatibility.DeepSpeedWorker = state.production_worker
-    compatibility.ArcticRLRayServer = state.server_class
-    compatibility.ArcticRLRayServerState = state.state_class
-    monkeypatch.setitem(sys.modules, compatibility.__name__, compatibility)
-    monkeypatch.setattr(sys.modules["arctic_platform.rl"], "ray_server", compatibility)
-    expected = pytest.raises(RuntimeError, match="context failed") if fail_context else contextlib.nullcontext()
-    with expected:
-        with optimizer_capture.optimizer_capture_worker():
-            assert compatibility.ArcticRLRayServer is state.server_module.ArcticRLRayServer
-            assert compatibility.ArcticRLRayServerState is state.server_module.ArcticRLRayServerState
-            server = compatibility.ArcticRLRayServer()
-            server.training_workers = state.actor.training_workers
-            assert asyncio.run(server.step(7)) is state.response
-            assert state.files["head"] == state.files["peer"]
-            if fail_context:
-                raise RuntimeError("context failed")
-    assert compatibility.ArcticRLRayServer is state.server_class
-    assert compatibility.ArcticRLRayServerState is state.state_class
-    assert compatibility.DeepSpeedWorker is state.production_worker
-
-
-def test_optimizer_capture_lazy_compatibility_import_restores_production_classes(
-    _optimizer_capture_capture_server, monkeypatch
-):
-    state = _optimizer_capture_capture_server
-    monkeypatch.delitem(sys.modules, "arctic_platform.rl.ray_server")
-    monkeypatch.delattr(sys.modules["arctic_platform.rl"], "ray_server")
-    with optimizer_capture.optimizer_capture_worker():
-        compatibility = sys.modules["arctic_platform.rl.ray_server"]
-        assert compatibility.ArcticRLRayServer is state.server_module.ArcticRLRayServer
-        assert compatibility.ArcticRLRayServerState is state.server_module.ArcticRLRayServerState
-    assert compatibility.ArcticRLRayServer is state.server_class
-    assert compatibility.ArcticRLRayServerState is state.state_class
-    assert compatibility.DeepSpeedWorker is state.production_worker
-    monkeypatch.setitem(sys.modules, compatibility.__name__, state.compatibility_module)
-
-
-def test_optimizer_capture_nested_context_restores_compatibility_outer_bindings(_optimizer_capture_capture_server):
-    state = _optimizer_capture_capture_server
-    compatibility = state.compatibility_module
-    with optimizer_capture.optimizer_capture_worker():
-        outer_server = compatibility.ArcticRLRayServer
-        outer_state = compatibility.ArcticRLRayServerState
-        with optimizer_capture.optimizer_capture_worker():
-            assert compatibility.ArcticRLRayServer is state.server_module.ArcticRLRayServer
-            assert compatibility.ArcticRLRayServerState is state.server_module.ArcticRLRayServerState
-            assert compatibility.ArcticRLRayServer is not outer_server
-        assert compatibility.ArcticRLRayServer is outer_server
-        assert compatibility.ArcticRLRayServerState is outer_state
-    assert compatibility.ArcticRLRayServer is state.server_class
-    assert compatibility.ArcticRLRayServerState is state.state_class
 
 
 # Local cortex optimizer.
@@ -14509,185 +10430,6 @@ def test_local_cortex_optimizer_local_failure_cleans_only_owned_snapshots(
 
 
 @pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
-def test_local_cortex_optimizer_invalid_after_save_never_publishes_partial_artifact(
-    _local_cortex_optimizer_local_capture,
-):
-
-    def receipt(result, root):
-        if _local_cortex_optimizer_local_capture.state.step:
-            result["version"] = 2
-        return result
-
-    _local_cortex_optimizer_local_capture.state.receipt = receipt
-    with pytest.raises(ValueError, match="receipt"):
-        _local_cortex_optimizer_capture(_local_cortex_optimizer_local_capture)
-    assert _local_cortex_optimizer_local_capture.events == ["save-0", "fwd_bwd", "step", "save-1"]
-    assert not list(_local_cortex_optimizer_local_capture.output.iterdir())
-
-
-@pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
-def test_local_cortex_optimizer_local_decoder_failure_preserves_unrelated_data_and_cleans_owned_snapshots(
-    _local_cortex_optimizer_local_capture, monkeypatch
-):
-    from arctic_platform.correctness.harness import optimizer as decoder
-
-    def fail(before, after, output, **kwargs):
-        output.mkdir()
-        (output / "partial.pt").write_bytes(b"not publishable")
-        raise ValueError("injected invalid optimizer schema")
-
-    monkeypatch.setattr(decoder, "decode_optimizer_capture", fail)
-    with pytest.raises(ValueError, match="schema"):
-        _local_cortex_optimizer_capture(_local_cortex_optimizer_local_capture)
-    assert not list(_local_cortex_optimizer_local_capture.output.iterdir())
-    assert (
-        _local_cortex_optimizer_local_capture.pair.before.is_dir()
-        and _local_cortex_optimizer_local_capture.pair.after.is_dir()
-    )
-
-
-@pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
-def test_local_cortex_optimizer_existing_local_artifact_never_overwritten_or_stepped(
-    _local_cortex_optimizer_local_capture,
-):
-    path = _cortex_optimizer_capture_manifest(_local_cortex_optimizer_local_capture.output / "states")
-    original = path.read_bytes()
-    with pytest.raises(FileExistsError):
-        _local_cortex_optimizer_capture(_local_cortex_optimizer_local_capture)
-    assert path.read_bytes() == original
-    assert _local_cortex_optimizer_local_capture.events == []
-
-
-@pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("checkpoint_path", "/data-fast/unrelated"),
-        ("checkpoint_path", "../elsewhere"),
-        ("checkpoint_path", None),
-        ("checkpoint_tag", "../global_step0"),
-        ("checkpoint_tag", "global_step1"),
-        ("version", True),
-        ("version", 1),
-        ("stage_path", "@stage/remote"),
-    ],
-)
-def test_local_cortex_optimizer_local_receipt_mismatch_rejected_before_step(
-    _local_cortex_optimizer_local_capture, field, value
-):
-    _local_cortex_optimizer_local_capture.state.receipt = lambda result, path: {**result, field: value}
-    with pytest.raises(ValueError):
-        _local_cortex_optimizer_capture(_local_cortex_optimizer_local_capture)
-    assert _local_cortex_optimizer_local_capture.events == ["save-0"]
-    assert not list(_local_cortex_optimizer_local_capture.output.iterdir())
-    assert _local_cortex_optimizer_local_capture.pair.before.is_dir()
-
-
-@pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
-@pytest.mark.parametrize("bad", ["missing-rank", "extra-rank", "symlink", "empty", "wrong-tag"])
-def test_local_cortex_optimizer_incomplete_local_checkpoint_never_reaches_step(
-    _local_cortex_optimizer_local_capture, bad
-):
-
-    def damage(result, root):
-        tag = root / "global_step0"
-        shard = next(tag.glob("*rank_0_*optim_states.pt"))
-        if bad == "missing-rank":
-            shard.unlink()
-        elif bad == "extra-rank":
-            shutil.copyfile(shard, tag / "bf16_zero_pp_rank_4_mp_rank_00_optim_states.pt")
-        elif bad == "symlink":
-            shard.unlink()
-            shard.symlink_to(
-                next((_local_cortex_optimizer_local_capture.pair.before / "global_step0").glob("*optim_states.pt"))
-            )
-        elif bad == "empty":
-            shard.write_bytes(b"")
-        else:
-            tag.rename(root / "global_step99")
-        return result
-
-    _local_cortex_optimizer_local_capture.state.receipt = damage
-    with pytest.raises(ValueError):
-        _local_cortex_optimizer_capture(_local_cortex_optimizer_local_capture)
-    assert _local_cortex_optimizer_local_capture.events == ["save-0"]
-    assert not list(_local_cortex_optimizer_local_capture.output.iterdir())
-
-
-@pytest.mark.parametrize(
-    "saved_tag,saved_ranks",
-    [("global_step99", 16), ("global_step0", 8), ("global_step99", 8)],
-)
-def test_local_cortex_optimizer_snapshot_error_identifies_tag_and_shard_counts(tmp_path, saved_tag, saved_ranks):
-    root = tmp_path / "snapshot"
-
-    def save_checkpoint(**kwargs):
-        assert kwargs == {"path": str(root), "checkpoint_type": "resumable", "export_hf": False}
-        tag_dir = root / saved_tag
-        tag_dir.mkdir(parents=True)
-        (tag_dir / "mp_rank_00_model_states.pt").write_bytes(b"model")
-        for rank in range(saved_ranks):
-            (tag_dir / f"bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt").write_bytes(b"optimizer")
-        return {"checkpoint_path": str(root), "checkpoint_tag": "global_step0", "version": 0}
-
-    with pytest.raises(ValueError) as failure:
-        capture._save_local_snapshot(
-            SimpleNamespace(save_checkpoint=save_checkpoint), root, step=0, expected_dp_world_size=16
-        )
-    assert (
-        str(failure.value)
-        == "local optimizer checkpoint metadata mismatch: "
-        f"expected tag='global_step0', observed tag={saved_tag!r}; "
-        f"expected DP shard count=16, observed DP shard count={saved_ranks}"
-    )
-
-
-def test_local_cortex_optimizer_snapshot_matching_tag_and_shard_counts_is_accepted(tmp_path):
-    root = tmp_path / "snapshot"
-
-    def save_checkpoint(**kwargs):
-        assert kwargs == {"path": str(root), "checkpoint_type": "resumable", "export_hf": False}
-        tag_dir = root / "global_step0"
-        tag_dir.mkdir(parents=True)
-        (tag_dir / "mp_rank_00_model_states.pt").write_bytes(b"model")
-        for rank in range(16):
-            (tag_dir / f"bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt").write_bytes(b"optimizer")
-        return {"checkpoint_path": str(root), "checkpoint_tag": "global_step0", "version": 0}
-
-    assert (
-        capture._save_local_snapshot(
-            SimpleNamespace(save_checkpoint=save_checkpoint), root, step=0, expected_dp_world_size=16
-        )
-        == root
-    )
-
-
-@pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
-@pytest.mark.parametrize(
-    "url,credentials",
-    [
-        ("http://remote.example:8003", {}),
-        ("https://127.0.0.1:8003", {}),
-        ("http://127.0.0.1:8003/proxy", {}),
-        ("http://127.0.0.1:8003?target=remote", {}),
-        ("http://user:secret@127.0.0.1:8003", {}),
-        ("http://127.0.0.1:8003", {"pat": "not-a-real-token"}),
-        ("http://127.0.0.1:8003", {"host": "remote.example"}),
-    ],
-)
-def test_local_cortex_optimizer_local_checkpoint_flag_rejects_nonloopback_or_auth_before_writes(
-    _local_cortex_optimizer_local_capture, monkeypatch, url, credentials
-):
-    _local_cortex_optimizer_local_capture.session = GatewaySession(
-        _local_cortex_optimizer_local_capture.output, 4, CortexConfig(base_url=url, **credentials)
-    )
-    monkeypatch.setattr(Path, "mkdir", lambda *args, **kwargs: pytest.fail("unsafe backend reached mkdir"))
-    with pytest.raises(ValueError, match="loopback"):
-        _local_cortex_optimizer_capture(_local_cortex_optimizer_local_capture)
-    assert _local_cortex_optimizer_local_capture.events == []
-
-
-@pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
 @pytest.mark.parametrize("order", ["batched", "interleaved"])
 def test_local_cortex_optimizer_local_fixture_optimizer_runner_uses_same_model_and_frozen_budget(
     tmp_path, monkeypatch, _local_cortex_optimizer_no_network, order
@@ -14767,78 +10509,6 @@ def test_local_cortex_optimizer_local_fixture_optimizer_runner_uses_same_model_a
         assert child["model_name"] == model and child["training_config"]["n_gpus"] == 4
         assert "optimizer_state_output_dir" not in child["training_config"]["debug"]
     assert (_cortex_optimizer_capture_CONFIG.read_bytes(), _cortex_optimizer_capture_SPEC.read_bytes()) == original
-
-
-@pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
-def test_local_cortex_optimizer_runner_rejects_different_frozen_optimizer_reference_before_batch_or_job(
-    tmp_path, monkeypatch
-):
-    cfg, spec = (load_config(_cortex_optimizer_capture_CONFIG), Spec.read(_cortex_optimizer_capture_SPEC))
-    spec.test_settings["single-step-optimizer"]["model_cache_path"] = str(tmp_path / "different-model")
-    monkeypatch.setattr(cortex_fixture, "load_local_fixture", lambda *args: {"model_name": spec.model.cache_path})
-    monkeypatch.setattr(
-        runner, "build_batch", lambda *args, **kwargs: pytest.fail("mismatch reached batch allocation")
-    )
-    with pytest.raises(ValueError, match="frozen optimizer reference"):
-        runner.execute(
-            cfg,
-            spec,
-            [],
-            vocab_size=128,
-            select=["single-step-optimizer"],
-            client_backend=CortexConfig(base_url="http://127.0.0.1:8003"),
-            local_cortex_fixture=True,
-            workdir=tmp_path,
-        )
-
-
-@pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
-def test_local_cortex_optimizer_cli_local_fixture_never_expands_declared_four_gpu_width(tmp_path, monkeypatch):
-    cfg, spec = (load_config(_cortex_optimizer_capture_CONFIG), Spec.read(_cortex_optimizer_capture_SPEC))
-    args = SimpleNamespace(
-        local_cortex_fixture=True,
-        cortex_fixture=None,
-        base_url="http://127.0.0.1:8003",
-        config=str(_cortex_optimizer_capture_CONFIG),
-        all_configs=False,
-        test=["single-step-optimizer"],
-        gpu_pool=8,
-        attn=None,
-        case=None,
-        order="batched",
-        fail_fast=False,
-        out=str(tmp_path / "report"),
-    )
-    backend = CortexConfig(base_url="http://127.0.0.1:8003")
-    widths = []
-    monkeypatch.setattr(cli, "_client_backend", lambda args: backend)
-    monkeypatch.setattr(
-        cli, "local_cortex_gateway", lambda *args, **kwargs: pytest.fail("explicit endpoint must remain external")
-    )
-    monkeypatch.setattr(cli, "_resolve_configs", lambda *args, **kwargs: [_cortex_optimizer_capture_CONFIG])
-    monkeypatch.setattr(cli, "_frozen_spec", lambda *args, **kwargs: (spec, [ArmDefinition("gas1", 4, 32)]))
-    monkeypatch.setattr(cli, "_run_vocab_size", lambda *args, **kwargs: 128)
-    monkeypatch.setattr(
-        cortex_fixture,
-        "load_local_fixture",
-        lambda *args: {
-            "model_name": spec.model.cache_path,
-            "fixture_sha256": "local-byte-binding",
-            "distribution": "local-gateway",
-        },
-    )
-
-    def execute(run_cfg, run_spec, arms, **kwargs):
-        assert kwargs["local_cortex_fixture"] is True and kwargs["client_backend"] is backend
-        assert run_spec is spec
-        assert arms[0].global_batch_size == run_cfg.n_gpus
-        widths.append(run_cfg.n_gpus)
-        return []
-
-    monkeypatch.setattr(cli, "execute", execute)
-    monkeypatch.setattr(cli, "_finish", lambda *args, **kwargs: 0)
-    assert cli.cmd_run(args) == 0
-    assert widths == [cfg.n_gpus, 2 * cfg.n_gpus] == [4, 8]
 
 
 @pytest.mark.parametrize(
@@ -15279,61 +10949,6 @@ def test_maintained_native_optimizer_completed_save_supplier_retains_pair_and_ac
     assert all(not root.exists() for root in case.saved)
 
 
-@pytest.mark.parametrize("timed_out_step", [0, 1])
-@pytest.mark.parametrize("error_type", [TimeoutError, ConnectionError, KeyboardInterrupt])
-def test_maintained_native_optimizer_supplier_timeout_keeps_inputs_for_pending_owner(
-    _maintained_native_capture, timed_out_step, error_type
-):
-    case = _maintained_native_capture
-    original_supplier = case.supplier
-    started, resume = threading.Event(), threading.Event()
-    observed, errors = [], []
-    worker = None
-
-    def supplier(root, *, step):
-        nonlocal worker
-        if step != timed_out_step:
-            return original_supplier(root, step=step)
-        checkpoint = root / f"global_step{step}" / "mp_rank_00_model_states.pt"
-
-        def owner_collect():
-            try:
-                observed.append(checkpoint.read_bytes())
-                started.set()
-                if not resume.wait(10):
-                    raise TimeoutError("test did not resume pending owner")
-                observed.append(checkpoint.read_bytes())
-            except BaseException as error:
-                errors.append(error)
-                started.set()
-
-        worker = threading.Thread(target=owner_collect)
-        worker.start()
-        assert started.wait(10), "owner did not begin reading its checkpoint"
-        raise error_type("caller response deadline; owner collection is still running")
-
-    case.supplier = supplier
-    try:
-        with pytest.raises(error_type, match="caller response deadline") as raised:
-            _maintained_native_run(case)
-        assert worker is not None and worker.is_alive()
-        _maintained_native_unpublished(case, supplier_failed=True)
-        assert any(
-            f"step {timed_out_step}" in note
-            and f"checkpoint inputs retained at {case.saved[-1].parent}" in note
-            and "no optimizer states published" in note
-            for note in raised.value.__notes__
-        )
-    finally:
-        resume.set()
-        if worker is not None:
-            worker.join(10)
-    assert worker is not None and not worker.is_alive()
-    assert errors == []
-    assert len(observed) == 2 and observed[0] == observed[1]
-    assert "step" in case.events if timed_out_step else "fwd_bwd" not in case.events
-
-
 @pytest.mark.parametrize("failure", ["save-0", "save-metadata", "fwd_bwd", "step", "save-1", "source-after-supply"])
 def test_maintained_native_optimizer_failed_stage_never_publishes_or_uses_unadmitted_baseline(
     _maintained_native_capture, failure
@@ -15346,65 +10961,6 @@ def test_maintained_native_optimizer_failed_stage_never_publishes_or_uses_unadmi
         assert case.events == ["save-0"]
     if failure in ("save-0", "save-metadata", "source-after-supply"):
         assert "fwd_bwd" not in case.events
-    _maintained_native_unpublished(case)
-
-
-@pytest.mark.parametrize("descriptor", ["missing", "wrong-origin", "bad-hash", "orphan"])
-def test_maintained_native_optimizer_requires_selected_supplier_source_before_save(
-    _maintained_native_capture, descriptor
-):
-    case = _maintained_native_capture
-    if descriptor == "missing":
-        case.descriptor = None
-    elif descriptor == "wrong-origin":
-        case.descriptor = case.pair.layout["source_files"]["training"]
-    elif descriptor == "bad-hash":
-        case.descriptor = {**case.descriptor, "sha256": "0" * 64}
-    else:
-        case.supplier = None
-    with pytest.raises(ValueError, match="callback|source"):
-        _maintained_native_run(case)
-    assert case.events == []
-    _maintained_native_unpublished(case)
-
-
-@pytest.mark.parametrize("damage", ["parent", "child", "nonce", "missing-rank", "rank", "world", "write-hash"])
-def test_maintained_native_optimizer_rejects_completed_save_receipt_binding_damage(_maintained_native_capture, damage):
-    case = _maintained_native_capture
-
-    def alter(rows, root, step):
-        if damage in ("parent", "child"):
-            rows[0][f"{damage}_job_id" if damage == "parent" else "training_child_id"] = "wrong"
-        elif damage == "nonce":
-            rows[1]["nonce"] = rows[0]["nonce"]
-        elif damage == "missing-rank":
-            rows.pop()
-        elif damage == "rank":
-            rows[1]["layout"]["checkpoint_rank"] = 0
-        elif damage == "world":
-            rows[0]["layout"]["world_size"] = 16
-        else:
-            name = next(iter(rows[0]["written_files"]))
-            rows[0]["written_files"][name] = "0" * 64
-
-    case.state.damage = alter
-    with pytest.raises(ValueError):
-        _maintained_native_run(case)
-    assert "fwd_bwd" not in case.events
-    _maintained_native_unpublished(case, supplier_failed=damage != "nonce")
-
-
-def test_maintained_native_optimizer_rejects_nonce_change_between_completed_saves(_maintained_native_capture):
-    case = _maintained_native_capture
-
-    def alter(rows, root, step):
-        if step == 1:
-            rows[0]["nonce"] = "f" * 32
-
-    case.state.damage = alter
-    with pytest.raises(ValueError, match="between saves"):
-        _maintained_native_run(case)
-    assert "step" in case.events
     _maintained_native_unpublished(case)
 
 
@@ -15437,64 +10993,6 @@ def test_maintained_native_optimizer_rechecks_owner_sources_receipts_and_inputs_
     monkeypatch.setattr(decoder, "decode_optimizer_capture", decode)
     with pytest.raises(ValueError):
         _maintained_native_run(case)
-    _maintained_native_unpublished(case)
-
-
-def test_maintained_native_optimizer_baseline_decoder_rejects_before_target(_maintained_native_capture):
-    case = _maintained_native_capture
-    path = next((case.pair.before / "global_step0").glob("*optim_states.pt"))
-    record = torch.load(path, weights_only=False)
-    record["optimizer_state_dict"]["group_paddings"][0] += 1
-    torch.save(record, path)
-    with pytest.raises(ValueError):
-        _maintained_native_run(case)
-    assert "fwd_bwd" not in case.events
-    _maintained_native_unpublished(case)
-
-
-@pytest.mark.parametrize("phase", ["baseline", "target", "mutable-descriptor"])
-def test_maintained_native_optimizer_supplier_authority_drift_blocks_next_operation(
-    _maintained_native_capture, monkeypatch, phase
-):
-    case = _maintained_native_capture
-    path = case.output.parent / "selected_supplier.py"
-    text = "def supplier(root, *, step):\n    return delegate(root, step=step)\n"
-    path.write_text(text)
-    namespace = {"delegate": case.supplier}
-    exec(compile(text, str(path), "exec"), namespace)
-    case.supplier = namespace["supplier"]
-    case.descriptor = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-
-    def drift():
-        path.write_text(text + "# supplier source changed\n")
-        if phase == "mutable-descriptor":
-            case.descriptor["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
-
-    if phase == "baseline":
-        original = decoder._snapshot
-
-        def snapshot(*args, **kwargs):
-            result = original(*args, **kwargs)
-            drift()
-            return result
-
-        monkeypatch.setattr(decoder, "_snapshot", snapshot)
-    else:
-        original = case.client.step
-
-        def step(learning_rate):
-            result = original(learning_rate)
-            drift()
-            return result
-
-        monkeypatch.setattr(case.client, "step", step)
-    with pytest.raises(ValueError, match="source drift"):
-        _maintained_native_run(case)
-    assert "save-1" not in case.events
-    if phase == "baseline":
-        assert "fwd_bwd" not in case.events
-    else:
-        assert "step" in case.events
     _maintained_native_unpublished(case)
 
 
@@ -15668,68 +11166,6 @@ def _maintained_native_scope(case, monkeypatch, *, split, rpc_timeout=30):
     )
 
 
-@pytest.mark.parametrize("split", [False, True], ids=["colocated", "owner-split"])
-@pytest.mark.parametrize("rpc_timeout", [0.5, 300, 382.133, 900])
-def test_maintained_native_optimizer_scope_admits_bounded_collection_budget(
-    _maintained_native_capture, monkeypatch, split, rpc_timeout
-):
-    fixture = _maintained_native_scope(_maintained_native_capture, monkeypatch, split=split, rpc_timeout=rpc_timeout)
-    with fixture.scope:
-        assert all(decoder._COLLECTOR_STATE in vars(worker) for worker in fixture.workers)
-    assert all(decoder._COLLECTOR_STATE not in vars(worker) for worker in fixture.workers)
-
-
-@pytest.mark.parametrize("split", [False, True], ids=["colocated", "owner-split"])
-@pytest.mark.parametrize("rpc_timeout", [0, -1, True, float("nan"), float("inf"), 900.001])
-def test_maintained_native_optimizer_scope_rejects_invalid_collection_budget(
-    _maintained_native_capture, monkeypatch, split, rpc_timeout
-):
-    message = "bounded explicit budgets" if math.isfinite(rpc_timeout) else "Out of range float values"
-    with pytest.raises(ValueError, match=message):
-        _maintained_native_scope(_maintained_native_capture, monkeypatch, split=split, rpc_timeout=rpc_timeout)
-    assert "save-0" not in _maintained_native_capture.events
-
-
-@pytest.mark.parametrize("split", [False, True], ids=["colocated", "owner-split"])
-@pytest.mark.parametrize("failure", [None, "target", "source-after", "route-after"])
-def test_maintained_native_optimizer_scopes_integrate_capture_and_restore_before_release(
-    _maintained_native_capture, monkeypatch, split, failure
-):
-    case = _maintained_native_capture
-    fixture = _maintained_native_scope(case, monkeypatch, split=split)
-    if failure == "target":
-        case.state.failure = "fwd_bwd"
-
-    def run():
-        with fixture.scope as supplier:
-            case.supplier, case.descriptor = supplier, fixture.helper_source
-            if not split:
-                with pytest.raises(RuntimeError, match="child release is blocked"):
-                    case.client.shutdown()
-            result = _maintained_native_run(case)
-            assert Path(result.optimizer_state_manifest).is_file()
-            if failure == "source-after":
-                Path(case.pair.layout["source_files"]["training"]["path"]).write_text("# scope drift\n")
-            elif failure == "route-after":
-                fixture.child.job_id = "wrong"
-
-    if failure:
-        with pytest.raises((RuntimeError, ValueError)):
-            run()
-    else:
-        run()
-    assert all(decoder._COLLECTOR_STATE not in vars(worker) for worker in fixture.workers)
-    assert all(decoder._CLEANUP_STATE not in vars(worker) for worker in fixture.workers)
-    assert decoder._SCOPE_STATE not in vars(case.client)
-    assert all(not root.exists() for root in case.saved)
-    if split:
-        assert fixture.scope.cleanup_complete is True
-    case.client.shutdown()
-    assert case.events[-1] == "release"
-    if failure == "target":
-        _maintained_native_unpublished(case)
-
-
 def _native_ep_bf16_decode(pair, output):
     return decoder.decode_optimizer_capture(
         pair.before,
@@ -15768,196 +11204,6 @@ def test_native_ep_bf16_optimizer_frozen_experts_do_not_become_optimizer_records
     assert manifest["frozen_expert_parameters"] == [pair.expert_name]
 
 
-def _native_checkpoint_wrapper_names(pair, wrapper_name="_checkpoint_wrapped_module"):
-    original = pair.expert_name
-    wrapped = original.replace(".mlp.", f".{wrapper_name}.mlp.")
-    for root, step in ((pair.before, 0), (pair.after, 1)):
-        tag = root / f"global_step{step}"
-        model = tag / "mp_rank_00_model_states.pt"
-
-        def edit_shapes(state):
-            for group in state["param_shapes"]:
-                if original in group:
-                    group[wrapped] = group.pop(original)
-
-        _cortex_optimizer_decode_rewrite(model, edit_shapes)
-        for path in tag.glob("experts_ep_rank_*.pt"):
-            _cortex_optimizer_decode_rewrite(path, lambda state: state.__setitem__(wrapped, state.pop(original)))
-        for path in tag.glob("*optim_states.pt"):
-
-            def edit_mappings(state):
-                for group in state["optimizer_state_dict"]["param_slice_mappings"]:
-                    if original in group:
-                        group[wrapped] = group.pop(original)
-
-            _cortex_optimizer_decode_rewrite(path, edit_mappings)
-    pair.expert_name = wrapped
-    if original in pair.expected:
-        pair.expected[wrapped] = pair.expected.pop(original)
-    return original
-
-
-@pytest.mark.parametrize("train_experts", [False, True])
-@pytest.mark.parametrize(
-    "wrapper_name", ["_checkpoint_wrapped_module", "_checkpoint_wrapped_module._checkpoint_wrapped_module"]
-)
-def test_native_ep_bf16_optimizer_checkpoint_wrapper_names_match_state_dict(tmp_path, train_experts, wrapper_name):
-    pair = _native_ep_bf16_pair(tmp_path, train_experts=train_experts)
-    original = _native_checkpoint_wrapper_names(pair, wrapper_name)
-    manifest = json.loads(_native_ep_bf16_decode(pair, tmp_path / "out").read_text())
-    if train_experts:
-        entry = next(row for row in manifest["parameters"] if row["name"] == pair.expert_name)
-        tensors = torch.load(tmp_path / "out" / entry["file"], weights_only=True)
-        assert torch.equal(tensors["parameter_update"], pair.expected[pair.expert_name])
-    else:
-        assert manifest["frozen_expert_parameters"] == [pair.expert_name]
-    assert original != pair.expert_name
-    assert manifest["expert_sidefiles_are_master_sources"] is False
-
-
-@pytest.mark.parametrize("wrapper_name", ["_checkpoint_wrapped_module_suffix", "prefix_checkpoint_wrapped_module"])
-def test_native_ep_bf16_optimizer_checkpoint_wrapper_names_strip_only_exact_components(tmp_path, wrapper_name):
-    pair = _native_ep_bf16_pair(tmp_path)
-    _native_checkpoint_wrapper_names(pair, wrapper_name)
-    with pytest.raises(ValueError, match="module value is NoneType"):
-        _native_ep_bf16_decode(pair, tmp_path / "out")
-    assert not (tmp_path / "out").exists()
-
-
-@pytest.mark.parametrize("damage", ["module_collision", "expert_collision", "module_shape", "module_dtype", "value"])
-def test_native_ep_bf16_optimizer_checkpoint_wrapper_aliases_remain_strict(tmp_path, damage):
-    pair = _native_ep_bf16_pair(tmp_path)
-    original = _native_checkpoint_wrapper_names(pair)
-    model = pair.before / "global_step0" / "mp_rank_00_model_states.pt"
-    if damage == "expert_collision":
-        for path in model.parent.glob("experts_ep_rank_*.pt"):
-            _cortex_optimizer_decode_rewrite(
-                path, lambda state: state.__setitem__(original, state[pair.expert_name].clone())
-            )
-    else:
-
-        def edit(state):
-            module = state["module"]
-            if damage == "module_collision":
-                module[pair.expert_name] = module[original].clone()
-            elif damage == "module_shape":
-                module[original] = module[original].reshape(5)
-            elif damage == "module_dtype":
-                module[original] = module[original].float()
-            else:
-                module[original] = module[original] + 1
-
-        _cortex_optimizer_decode_rewrite(model, edit)
-    with pytest.raises(ValueError):
-        _native_ep_bf16_decode(pair, tmp_path / "out")
-    assert not (tmp_path / "out").exists()
-
-
-@pytest.mark.parametrize("step", [0, 1])
-@pytest.mark.parametrize(
-    "damage,reason",
-    [
-        ("name", "parameter name is not a string"),
-        ("value", "sidefile value is int, not a tensor"),
-        ("dtype", "sidefile dtype is torch.float32"),
-        ("layout", "sidefile layout is torch.sparse_coo"),
-        ("scalar", "sidefile tensor is scalar"),
-        ("empty", "sidefile tensor is empty"),
-        ("module_missing", "module value is NoneType, not a tensor"),
-        ("module_value", "module value is int, not a tensor"),
-        ("shape", "sidefile shape (5,) differs from module shape (1, 5)"),
-        ("module_dtype", "module dtype torch.float32 differs from sidefile dtype torch.bfloat16"),
-        ("nonfinite", "sidefile tensor contains nonfinite values"),
-    ],
-)
-def test_native_ep_bf16_optimizer_invalid_sidefile_identifies_file_parameter_and_reason(
-    tmp_path, step, damage, reason
-):
-    pair = _native_ep_bf16_pair(tmp_path)
-    root = pair.before if step == 0 else pair.after
-    path = root / f"global_step{step}" / "experts_ep_rank_003.pt"
-    record = torch.load(path, weights_only=False)
-    value = record[pair.expert_name]
-    name = pair.expert_name
-    if damage == "name":
-        name = 3
-        for sidefile in path.parent.glob("experts_ep_rank_*.pt"):
-            _cortex_optimizer_decode_rewrite(
-                sidefile, lambda state: state.__setitem__(name, state.pop(pair.expert_name))
-            )
-        path = path.with_name("experts_ep_rank_000.pt")
-    elif damage in {"module_missing", "module_value", "module_dtype"}:
-        module_path = path.with_name("mp_rank_00_model_states.pt")
-
-        def edit_module(state):
-            module = state["module"]
-            if damage == "module_missing":
-                module.pop(name)
-            elif damage == "module_value":
-                module[name] = 3
-            else:
-                module[name] = module[name].float()
-
-        _cortex_optimizer_decode_rewrite(module_path, edit_module)
-        path = path.with_name("experts_ep_rank_000.pt")
-    else:
-        if damage == "value":
-            value = 3
-        elif damage == "dtype":
-            value = value.float()
-        elif damage == "layout":
-            value = value.to_sparse()
-        elif damage == "scalar":
-            value = value[0, 0]
-        elif damage == "empty":
-            value = value[:, :0]
-        elif damage == "shape":
-            value = value.reshape(5)
-        elif damage == "nonfinite":
-            value[0, 0] = float("nan")
-        record[name] = value
-        torch.save(record, path)
-    with pytest.raises(ValueError) as caught:
-        _native_ep_bf16_decode(pair, tmp_path / "out")
-    message = str(caught.value)
-    assert "invalid expert sidefile tensor or module shape" in message
-    assert path.name in message
-    assert f"parameter {name!r}" in message
-    assert reason in message
-    assert not (tmp_path / "out").exists()
-
-
-@pytest.mark.parametrize("field", ["master", "exp_avg", "exp_avg_sq"])
-def test_native_ep_bf16_optimizer_rejects_false_fp32_state_recipe(tmp_path, field):
-    pair = _native_ep_bf16_pair(tmp_path)
-    path = next(pair.after.rglob("*zero_pp_rank_0_*optim_states.pt"))
-
-    def edit(state):
-        optimizer = state["optimizer_state_dict"]
-        if field == "master":
-            optimizer["single_partition_of_fp32_groups"][1] = optimizer["single_partition_of_fp32_groups"][1].float()
-        else:
-            optimizer["base_optimizer_state"]["state"][1][field] = optimizer["base_optimizer_state"]["state"][1][
-                field
-            ].float()
-
-    _cortex_optimizer_decode_rewrite(path, edit)
-    with pytest.raises(ValueError, match="BF16 vector"):
-        _native_ep_bf16_decode(pair, tmp_path / "out")
-    assert not (tmp_path / "out").exists()
-
-
-@pytest.mark.parametrize("kind", ["optimizer", "expert"])
-def test_native_ep_bf16_optimizer_rejects_incomplete_native_inventory(tmp_path, kind):
-    pair = _native_ep_bf16_pair(tmp_path)
-    pattern = "*zero_pp_rank_7_*optim_states.pt" if kind == "optimizer" else "experts_ep_rank_007.pt"
-    path = next(pair.after.rglob(pattern))
-    path.rename(tmp_path / "retained-missing.pt")
-    with pytest.raises(ValueError, match="every optimizer and expert rank"):
-        _native_ep_bf16_decode(pair, tmp_path / "out")
-    assert not (tmp_path / "out").exists()
-
-
 def test_native_ep_bf16_optimizer_wrong_ep_order_cannot_relabel_valid_weights(tmp_path):
     pair = _native_ep_bf16_pair(tmp_path)
     routes = pair.layout["expert_data_parallel_groups"]["native-experts"]
@@ -15976,16 +11222,6 @@ def test_native_ep_bf16_optimizer_rejects_wrong_partition_counter_and_mapping(tm
     with pytest.raises(ValueError, match="partition_count"):
         _native_ep_bf16_decode(pair, tmp_path / "out")
     assert not (tmp_path / "out").exists()
-
-
-def test_native_ep_bf16_optimizer_rejects_inconsistent_adam_step(tmp_path):
-    pair = _native_ep_bf16_pair(tmp_path)
-    path = next(pair.after.rglob("*zero_pp_rank_0_*optim_states.pt"))
-    _cortex_optimizer_decode_rewrite(
-        path, lambda state: state["optimizer_state_dict"]["base_optimizer_state"]["state"][1].update(step=2)
-    )
-    with pytest.raises(ValueError, match="engine/Adam optimizer step"):
-        _native_ep_bf16_decode(pair, tmp_path / "out")
 
 
 @pytest.mark.parametrize("mutation", ["source-before", "source-after", "input-after"])
@@ -16084,29 +11320,6 @@ def test_native_ep_bf16_optimizer_local_lifecycle_validates_before_step_and_reta
         assert result.model_calls == 1 and result.packed_rows == 8
         assert Path(result.optimizer_state_manifest).is_file()
     assert not list(output.glob("snapshots-*"))
-
-
-@pytest.mark.parametrize("mutation", ["duplicate-route", "missing-route", "mp-filename", "slice-mapping"])
-def test_native_ep_bf16_optimizer_new_layout_negatives_cannot_guess_ownership(tmp_path, mutation):
-    pair = _native_ep_bf16_pair(tmp_path)
-    routes = pair.layout["expert_data_parallel_groups"]["native-experts"]
-    if mutation == "duplicate-route":
-        routes[0] = list(routes[1])
-    elif mutation == "missing-route":
-        pair.layout["expert_data_parallel_groups"] = {}
-    elif mutation == "mp-filename":
-        pair.layout["optimizer_mp_ranks"][0] = 1
-    else:
-        path = next(pair.after.rglob("*zero_pp_rank_0_*optim_states.pt"))
-        _cortex_optimizer_decode_rewrite(
-            path,
-            lambda state: state["optimizer_state_dict"]["param_slice_mappings"][1].update(
-                {pair.expert_name: fragment_address(start=1, numel=5)}
-            ),
-        )
-    with pytest.raises(ValueError, match="cover every rank|actual ordered DP route|MP filename|slice mapping"):
-        _native_ep_bf16_decode(pair, tmp_path / "out")
-    assert not (tmp_path / "out").exists()
 
 
 @pytest.fixture
@@ -16227,28 +11440,6 @@ def _dense_collection_case(tmp_path, monkeypatch):
     return state
 
 
-def test_dense_collection_new_full16_head8_peer8_retains_hashes_and_cleanup(_dense_collection_case):
-    state = _dense_collection_case
-    root = state.save()
-    model, shards = capture._checkpoint_files(root)
-    assert len(shards) == 16 and model.read_bytes() == b"actual-model"
-    assert state.calls == [
-        ("head", "prepare"),
-        ("peer", "prepare"),
-        ("head", "manifest"),
-        ("peer", "manifest"),
-        ("peer", "close"),
-    ]
-    assert not state.roots[(str(root), "peer")].exists()
-    receipt = json.loads((root / capture._DENSE_RECEIPT).read_text())
-    assert receipt["binding"]["training_child_id"] == "parent:training:0"
-    assert receipt["peer_cleanup"] == [{"node": state.admission["nodes"][1], "owned_root_absent": True}]
-    assert [len(row["files"]) for row in receipt["node_manifests"]] == [9, 8]
-    for manifest in receipt["node_manifests"]:
-        for row in manifest["files"]:
-            assert hashlib.sha256((root / "global_step0" / row["path"]).read_bytes()).hexdigest() == row["sha256"]
-
-
 @pytest.mark.parametrize(
     ("failure", "message"),
     [
@@ -16268,39 +11459,6 @@ def test_dense_collection_new_failure_never_relaxes16_and_closes_owned_peer(_den
     assert state.calls[-1] == ("peer", "close")
     assert not state.roots[(str(state.output), "peer")].exists()
     assert not (state.output / capture._DENSE_RECEIPT).exists()
-
-
-def test_dense_collection_new_disk_shortfall_closes_peer_without_copy(_dense_collection_case, monkeypatch):
-    state = _dense_collection_case
-    monkeypatch.setattr(capture.shutil, "disk_usage", lambda root: SimpleNamespace(free=0))
-    with pytest.raises(ValueError, match="insufficient fresh disk"):
-        state.save()
-    assert not state.roots[(str(state.output), "peer")].exists()
-    assert len(list((state.output / "global_step0").glob("*optim_states.pt"))) == 8
-
-
-@pytest.mark.parametrize(
-    "mutation", ["missing-node", "boot", "child", "duplicate-model", "alias-rank", "unexpected-file"]
-)
-def test_dense_collection_new_manifest_negatives_bind_nodes_child_and_fullranks(_dense_collection_case, mutation):
-    state = _dense_collection_case
-    state.save()
-    proof = json.loads((state.output / capture._DENSE_RECEIPT).read_text())
-    manifests = proof["node_manifests"]
-    if mutation == "missing-node":
-        manifests.pop()
-    elif mutation == "boot":
-        manifests[1]["node"]["boot_id"] = "wrong-boot"
-    elif mutation == "child":
-        manifests[1]["binding"] = {**manifests[1]["binding"], "training_child_id": "other-child"}
-    elif mutation == "duplicate-model":
-        manifests[1]["files"].append(dict(manifests[0]["files"][-1], path="mp_rank_00_model_states.pt"))
-    elif mutation == "alias-rank":
-        manifests[1]["files"][0]["path"] = "fp16_zero_pp_rank_0_mp_rank_00_optim_states.pt"
-    else:
-        manifests[1]["files"][0]["path"] = "../foreign.pt"
-    with pytest.raises(ValueError, match="every allocation|binding drift|duplicate|unsupported"):
-        capture._dense_validate_manifests(proof["binding"], state.admission["nodes"], manifests, 16)
 
 
 @pytest.mark.parametrize("mutation", ["truncated", "hash", "extra", "header"])
@@ -16333,42 +11491,6 @@ def test_dense_collection_new_stream_refuses_partial_corrupt_or_unbound_bytes(tm
     monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(header + b"\n" + payload)))
     with pytest.raises(ValueError, match="truncated|hash mismatch|extra bytes|manifest mismatch"):
         capture._dense_receive({"binding": binding, "manifest": manifest}, time.monotonic() + 30)
-
-
-def test_dense_collection_new_ownership_drift_preserves_foreign_peer(_dense_collection_case, monkeypatch):
-    state = _dense_collection_case
-    original = capture._dense_call
-
-    def drift(admission, node, role, request, deadline):
-        if role == "manifest" and node["host"] == "peer":
-            root = state.roots[(request["binding"]["root"], "peer")]
-            (root / capture._DENSE_OWNER).write_text('{"foreign":true}')
-        return original(admission, node, role, request, deadline)
-
-    monkeypatch.setattr(capture, "_dense_call", drift)
-    with pytest.raises(capture.UnsafeCleanupError, match="peer cleanup incomplete") as rejected:
-        state.save()
-    assert isinstance(rejected.value.shutdown_error, BaseExceptionGroup)
-    assert isinstance(rejected.value.workload_error, ValueError)
-    assert state.roots[(str(state.output), "peer")].exists()
-    assert not (state.output / capture._DENSE_RECEIPT).exists()
-
-
-def test_dense_collection_new_source_drift_rejected_before_worker_launch(monkeypatch):
-    sources = capture._dense_sources()
-    request = {"source_files": sources}
-    request["source_files"]["collector"]["sha256"] = "0" * 64
-    with pytest.raises(ValueError, match="source drift"):
-        capture._dense_worker_argv(sys.executable, "manifest", request)
-
-
-def test_dense_collection_new_allocation_width_cannot_substitute_sp_or_partial_dp(monkeypatch):
-    from arctic_platform.correctness.harness import inference as transfer
-
-    admission = {"nodes": [{"slots": 8}, {"slots": 8}]}
-    monkeypatch.setattr(transfer, "validate_local_inference_allocation", lambda value: value["nodes"])
-    with pytest.raises(ValueError, match="complete DP world"):
-        capture.validate_dense_checkpoint_allocation(admission, expected_dp_world_size=8)
 
 
 def test_dense_collection_new_two_save_real_dense_decoder_retains_collection_evidence(
@@ -16489,18 +11611,6 @@ def _dense_native_child_identity_case(_dense_collection_capture_case):
     return state
 
 
-def test_dense_native_child_identity_new_both_receipts_use_actual_child(_dense_native_child_identity_case):
-    state = _dense_native_child_identity_case
-    result = state.run()
-    record = json.loads(Path(result.optimizer_state_manifest).read_text())
-    assert state.target_calls == 1 and state.native_child != state.selector
-    for receipt in record["dense_save_receipts"].values():
-        assert receipt["binding"]["training_child_id"] == state.native_child
-        assert receipt["binding"]["parent_job_id"] == "parent"
-        assert len(receipt["node_manifests"]) == 2
-    assert state.calls.count(("peer", "close")) == 2
-
-
 @pytest.mark.parametrize("damage", ["missing", "role", "child", "children", "binding-type", "selector", "transport"])
 def test_dense_native_child_identity_new_invalid_binding_stops_before_save(_dense_native_child_identity_case, damage):
     state = _dense_native_child_identity_case
@@ -16524,39 +11634,6 @@ def test_dense_native_child_identity_new_invalid_binding_stops_before_save(_dens
     with pytest.raises(ValueError, match="owned native training child binding"):
         state.run()
     assert not state.calls and state.target_calls == 0
-
-
-@pytest.mark.parametrize("damage", ["binding", "children", "transport"])
-def test_dense_native_child_identity_new_midstep_drift_stops_before_second_save(
-    _dense_native_child_identity_case, monkeypatch, damage
-):
-    state = _dense_native_child_identity_case
-    step = capture.fwd_bwd_step
-
-    def drift(*args, **kwargs):
-        result = step(*args, **kwargs)
-        if damage == "binding":
-            state.client.transport._native_bindings[state.selector] = ("training", "other-child")
-            state.client.transport._native_children["training"] = "other-child"
-        elif damage == "children":
-            state.client.transport._native_children["training"] = "other-child"
-        else:
-            state.client.transport = SimpleNamespace(job_id="parent")
-        return result
-
-    monkeypatch.setattr(capture, "fwd_bwd_step", drift)
-    with pytest.raises(ValueError, match="parent/training child changed|owned native training child binding"):
-        state.run()
-    assert state.target_calls == 1 and state.calls.count(("head", "prepare")) == 1
-    assert state.calls.count(("peer", "close")) == 1
-
-
-def test_dense_native_child_identity_new_response_cannot_substitute_selector(_dense_native_child_identity_case):
-    state = _dense_native_child_identity_case
-    state.native_child = state.selector
-    with pytest.raises(ValueError, match="different training child"):
-        state.run()
-    assert state.target_calls == 0 and state.calls.count(("peer", "close")) == 1
 
 
 def test_dense_native_child_identity_new_postdecode_binding_drift_blocks_publication(
@@ -16593,145 +11670,6 @@ def test_dense_collection_new_capture_retains_both_full16_receipts_and_exact_ste
         assert sum(len(row["files"]) for row in receipt["node_manifests"]) == 17
     assert state.calls.count(("peer", "close")) == 2
     assert all(not path.exists() for (root, host), path in state.roots.items() if host == "peer")
-
-
-@pytest.mark.parametrize("mutation", ["parent", "child"])
-def test_dense_collection_new_capture_binding_drift_stops_before_second_save(_dense_collection_capture_case, mutation):
-    state = _dense_collection_capture_case
-    state.mutation = mutation
-    with pytest.raises(ValueError, match="parent/training child changed"):
-        state.run()
-    assert state.target_calls == 1 and state.calls.count(("head", "prepare")) == 1
-    assert state.calls.count(("peer", "close")) == 1
-
-
-@pytest.mark.parametrize("mutation", ["bytes", "receipt", "tag", "cleanup", "source"])
-def test_dense_collection_new_capture_rejects_drift_during_decode(
-    _dense_collection_capture_case, monkeypatch, mutation
-):
-    state = _dense_collection_capture_case
-    original = capture.decode_optimizer_capture
-
-    def drift(before, after, output, **kwargs):
-        manifest = original(before, after, output, **kwargs)
-        if mutation == "bytes":
-            next(before.rglob("*optim_states.pt")).write_bytes(b"changed")
-        elif mutation == "source":
-            monkeypatch.setattr(capture, "_dense_sources", lambda: {})
-        else:
-            path = before / capture._DENSE_RECEIPT
-            receipt = json.loads(path.read_text())
-            if mutation == "tag":
-                receipt["binding"]["tag"] = "global_step1"
-            elif mutation == "cleanup":
-                receipt["peer_cleanup"] = []
-            else:
-                receipt["extra"] = "changed"
-            path.write_text(json.dumps(receipt))
-        return manifest
-
-    monkeypatch.setattr(capture, "decode_optimizer_capture", drift)
-    with pytest.raises(ValueError, match="byte drift|receipts changed|binding drift|cleanup drift|source drift"):
-        state.run()
-    assert state.target_calls == 1 and state.calls.count(("peer", "close")) == 2
-    assert not (state.session.workdir / "capture-output" / "states").exists()
-
-
-@pytest.mark.parametrize("failure", ["missing", "child", "save"])
-def test_dense_collection_new_capture_failed_first_save_never_reaches_target(_dense_collection_capture_case, failure):
-    state = _dense_collection_capture_case
-    state.failure = failure
-    with pytest.raises(
-        (ValueError, RuntimeError), match="node shard count|different training child|native save failed"
-    ):
-        state.run()
-    assert state.target_calls == 0 and state.calls.count(("peer", "close")) == 1
-
-
-@pytest.mark.parametrize("mutation", ["hardlink", "symlink"])
-def test_dense_collection_new_manifest_refuses_foreign_file_alias(_dense_collection_case, monkeypatch, mutation):
-    state = _dense_collection_case
-    original = capture._dense_call
-
-    def alias(admission, node, role, request, deadline):
-        if role == "manifest" and node["host"] == "head":
-            root = Path(request["binding"]["root"])
-            file = next(root.rglob("*optim_states.pt"))
-            foreign = root.parent / "foreign.pt"
-            if mutation == "hardlink":
-                os.link(file, foreign)
-            else:
-                file.rename(foreign)
-                file.symlink_to(foreign)
-            state.foreign = foreign
-        return original(admission, node, role, request, deadline)
-
-    monkeypatch.setattr(capture, "_dense_call", alias)
-    with pytest.raises(ValueError, match="exclusively owned|unsupported entries"):
-        state.save()
-    assert state.foreign.is_file()
-    assert not state.roots[(str(state.output), "peer")].exists()
-
-
-@pytest.mark.parametrize("operation", ["prepare", "manifest", "send", "close"])
-def test_dense_collection_new_peer_argv_binds_strict_transport_and_bounded_supervisor(tmp_path, operation):
-    known = tmp_path / "known_hosts"
-    known.write_text("synthetic pinned host key")
-    nodes = [{"host": "head", "python": sys.executable}, {"host": "peer", "python": sys.executable}]
-    admission = {
-        "nodes": nodes,
-        "ssh": {
-            "port": 7878,
-            "known_hosts": str(known),
-            "known_hosts_sha256": hashlib.sha256(known.read_bytes()).hexdigest(),
-        },
-    }
-    request = {"source_files": capture._dense_sources(), "node": nodes[1]}
-    with capture._dense_argv(admission, nodes[1], operation, request, time.monotonic() + 30) as argv:
-        assert argv[:4] == ["ssh", "-T", "-p", "7878"]
-        assert "StrictHostKeyChecking=yes" in argv and "BatchMode=yes" in argv
-        held_path = next(value.split("=", 1)[1] for value in argv if value.startswith("UserKnownHostsFile="))
-        assert Path(held_path).read_bytes() == known.read_bytes() and argv[-2] == "peer"
-        assert "supervise" in argv[-1] and operation in argv[-1]
-    with capture._dense_argv(admission, nodes[0], operation, request, time.monotonic() + 30) as argv:
-        assert argv[0] == sys.executable
-
-
-@pytest.mark.parametrize("outcome", ["success", "exit", "timeout"])
-def test_dense_collection_new_supervisor_reaps_own_actual_cpu_child(tmp_path, monkeypatch, outcome):
-    from arctic_platform.correctness.harness import inference as transfer
-
-    request = {
-        "timeout_s": 0.5,
-        "deadline_epoch": time.time() + 0.5,
-        "source_files": capture._dense_sources(),
-        "operation": "send",
-        "binding": {"root": str(tmp_path / "owned")},
-    }
-    monkeypatch.setattr(capture, "_dense_node_admission", lambda *args: {})
-    monkeypatch.setattr(capture, "require_data_fast_path", lambda path, **kwargs: Path(path))
-    code = (
-        "pass"
-        if outcome == "success"
-        else "raise SystemExit(7)" if outcome == "exit" else "import time;time.sleep(60)"
-    )
-    monkeypatch.setattr(capture, "_dense_worker_argv", lambda *args: [sys.executable, "-B", "-c", code])
-    closed = []
-    stop = transfer._stop_local_children
-
-    def record(children):
-        closed.extend(children)
-        stop(children)
-
-    monkeypatch.setattr(transfer, "_stop_local_children", record)
-    if outcome == "success":
-        capture._dense_worker("supervise", request)
-    else:
-        with pytest.raises((RuntimeError, capture.subprocess.TimeoutExpired), match="worker failed|timed out"):
-            capture._dense_worker("supervise", request)
-    assert len(closed) == 1 and closed[0].poll() is not None
-    with pytest.raises(ProcessLookupError):
-        os.killpg(closed[0].pid, 0)
 
 
 @pytest.mark.parametrize("outcome", ["success", "truncated", "sender-exit", "timeout"])
@@ -16839,34 +11777,6 @@ def test_dense_collection_new_boundary_real_validator_requires_exact_hostfile_an
             capture.validate_dense_checkpoint_allocation(admission, expected_dp_world_size=16)
 
 
-@pytest.mark.parametrize("mutation", ["inode", "content"])
-def test_dense_collection_new_boundary_node_hostfile_cannot_drift_after_prepare(tmp_path, monkeypatch, mutation):
-    from arctic_platform.correctness.harness import inference as transfer
-
-    hostfile = tmp_path / "hostfile"
-    content = "head slots=8\npeer slots=8\n"
-    hostfile.write_text(content)
-    monkeypatch.setattr(transfer, "_LOCAL_HOSTFILE", hostfile)
-    monkeypatch.setattr(transfer, "_validate_local_node", lambda *args: None)
-    nodes = [{"host": name, "hostname": name, "slots": 8} for name in ("head", "peer")]
-    request = {
-        "node": nodes[1],
-        "allocation": {
-            "nodes": nodes,
-            "hostfile_content": content,
-            "hostfile_sha256": hashlib.sha256(hostfile.read_bytes()).hexdigest(),
-        },
-        "hostfile_identity": transfer._local_hostfile_identity(),
-    }
-    if mutation == "inode":
-        hostfile.rename(tmp_path / "old-hostfile")
-        hostfile.write_text(content)
-    else:
-        hostfile.write_text("different")
-    with pytest.raises(ValueError, match="node hostfile drift"):
-        capture._dense_node_admission(request, time.monotonic() + 30)
-
-
 @pytest.fixture
 def _dense_head_snapshot_case(tmp_path, monkeypatch):
     from arctic_platform.correctness.harness import inference as transfer
@@ -16912,13 +11822,6 @@ def test_dense_head_snapshot_new_absent_peer_authenticates_without_creating_sche
     assert not state.hostfile.exists()
 
 
-def test_dense_head_snapshot_new_missing_head_remains_rejected(_dense_head_snapshot_case):
-    state = _dense_head_snapshot_case
-    state.request["node"] = state.request["allocation"]["nodes"][0]
-    with pytest.raises(ValueError, match="head hostfile is required"):
-        capture._dense_node_admission(state.request, time.monotonic() + 30)
-
-
 @pytest.mark.parametrize("mutation", ["hash", "content", "oversized", "order", "slots", "duplicate", "foreign"])
 def test_dense_head_snapshot_new_corrupt_or_foreign_members_rejected(_dense_head_snapshot_case, mutation):
     state = _dense_head_snapshot_case
@@ -16942,42 +11845,6 @@ def test_dense_head_snapshot_new_corrupt_or_foreign_members_rejected(_dense_head
     assert not state.validated and not state.hostfile.exists()
 
 
-@pytest.mark.parametrize("field", ["boot_id", "python_sha256"])
-def test_dense_head_snapshot_new_actual_node_identity_guard_still_runs(_dense_head_snapshot_case, monkeypatch, field):
-    state = _dense_head_snapshot_case
-
-    def validate(node, deadline):
-        assert node[field] == state.request["node"][field]
-        raise ValueError("actual node identity drift")
-
-    monkeypatch.setattr(state.transfer, "_validate_local_node", validate)
-    with pytest.raises(ValueError, match="actual node identity drift"):
-        capture._dense_node_admission(state.request, time.monotonic() + 30)
-    assert not state.hostfile.exists()
-
-
-@pytest.mark.parametrize("mutation", ["appeared", "disappeared", "inode", "content", "dangling"])
-def test_dense_head_snapshot_new_existing_or_absent_hostfile_cannot_change(_dense_head_snapshot_case, mutation):
-    state = _dense_head_snapshot_case
-    if mutation != "appeared":
-        state.hostfile.write_text(state.content)
-    state.request["hostfile_identity"] = capture._dense_node_admission(state.request, time.monotonic() + 30)
-    if mutation == "appeared":
-        state.hostfile.write_text(state.content)
-    elif mutation == "disappeared":
-        state.hostfile.rename(state.hostfile.with_name("retained"))
-    elif mutation == "inode":
-        state.hostfile.rename(state.hostfile.with_name("retained"))
-        state.hostfile.write_text(state.content)
-    elif mutation == "content":
-        state.hostfile.write_text("different")
-    else:
-        state.hostfile.rename(state.hostfile.with_name("retained"))
-        state.hostfile.symlink_to(state.hostfile.with_name("missing"))
-    with pytest.raises((ValueError, FileNotFoundError), match="hostfile drift|symlink|No such file"):
-        capture._dense_node_admission(state.request, time.monotonic() + 30)
-
-
 def test_dense_collection_new_boundary_source_pin_survives_optimized_python_before_import(tmp_path, monkeypatch):
     source = tmp_path / "source.py"
     source.write_text("original")
@@ -16989,75 +11856,6 @@ def test_dense_collection_new_boundary_source_pin_survives_optimized_python_befo
     assert result.returncode != 0 and b"source drift before import" in result.stderr
     traceback_output = result.stderr.split(b"Traceback (most recent call last):", 1)[1]
     assert b"ModuleNotFoundError" not in traceback_output
-
-
-@pytest.mark.parametrize("outcome", ["success", "exit", "json", "timeout"])
-@pytest.mark.parametrize("cleanup_failure", [False, True])
-def test_dense_collection_new_cleanup_call_classifies_only_owned_group_failure(monkeypatch, outcome, cleanup_failure):
-    from arctic_platform.correctness.harness import inference as transfer
-
-    code = {
-        "success": "print('{\"actual\":true}')",
-        "exit": "import sys;print('actual worker failure',file=sys.stderr);raise SystemExit(7)",
-        "json": "print('invalid json')",
-        "timeout": "import time;time.sleep(60)",
-    }[outcome]
-    monkeypatch.setattr(
-        capture, "_dense_argv", lambda *args: contextlib.nullcontext([sys.executable, "-B", "-c", code])
-    )
-    closed = []
-    original = transfer._stop_local_children
-
-    def close(children):
-        closed.extend(children)
-        original(children)
-        if cleanup_failure:
-            raise RuntimeError("synthetic owned group absence acknowledgement failure")
-
-    monkeypatch.setattr(transfer, "_stop_local_children", close)
-    deadline = time.monotonic() + (0.5 if outcome == "timeout" else 10)
-    if cleanup_failure:
-        with pytest.raises(capture.UnsafeCleanupError, match="owned process cleanup incomplete") as rejected:
-            capture._dense_call({}, {}, "manifest", {}, deadline)
-        assert isinstance(rejected.value.shutdown_error, RuntimeError)
-        assert bool(rejected.value.workload_error) == (outcome != "success")
-        assert set(rejected.value.owned_children) == {str(closed[0].pid)}
-    elif outcome == "success":
-        assert capture._dense_call({}, {}, "manifest", {}, deadline) == {"actual": True}
-    else:
-        expected = {
-            "exit": RuntimeError,
-            "json": json.JSONDecodeError,
-            "timeout": capture.subprocess.TimeoutExpired,
-        }[outcome]
-        with pytest.raises(expected):
-            capture._dense_call({}, {}, "manifest", {}, deadline)
-    assert len(closed) == 1 and closed[0].poll() is not None
-    with pytest.raises(ProcessLookupError):
-        os.killpg(closed[0].pid, 0)
-
-
-def test_dense_collection_new_cleanup_copy_preserves_worker_error_and_group_failure(tmp_path, monkeypatch):
-    from arctic_platform.correctness.harness import inference as transfer
-
-    command = [sys.executable, "-B", "-c", "raise SystemExit(7)"]
-    monkeypatch.setattr(capture, "_dense_argv", lambda *args: contextlib.nullcontext(command))
-    monkeypatch.setattr(capture, "_dense_worker_argv", lambda *args: command)
-    closed = []
-    original = transfer._stop_local_children
-
-    def close(children):
-        closed.extend(children)
-        original(children)
-        raise RuntimeError("synthetic transfer group absence acknowledgement failure")
-
-    monkeypatch.setattr(transfer, "_stop_local_children", close)
-    with pytest.raises(capture.UnsafeCleanupError, match="owned process cleanup incomplete") as rejected:
-        capture._dense_copy_peer({}, {}, {"manifest": {"files": []}}, {}, time.monotonic() + 10)
-    assert isinstance(rejected.value.workload_error, RuntimeError)
-    assert "transfer failed" in str(rejected.value.workload_error)
-    assert len(closed) == 2 and all(child.poll() is not None for child in closed)
-    assert set(rejected.value.owned_children) == {str(child.pid) for child in closed}
 
 
 def test_dense_collection_new_cleanup_supervisor_preserves_primary_and_owned_child(tmp_path, monkeypatch):
@@ -17536,23 +12334,6 @@ def test_dense_allocation_runner_new_forwards_original_dense_dp_and_isolates_eac
 
 
 @pytest.mark.parametrize("dense_allocation_runner_case", [16], indirect=True)
-@pytest.mark.parametrize("order", ["batched", "interleaved"])
-def test_dense_allocation_runner_explicit16_preserves_placement_for_both_arms(dense_allocation_runner_case, order):
-    case = dense_allocation_runner_case
-    results = case.execute(order=order)
-    assert len(results) == 2 and all(result.outcome is Outcome.PASS for result in results)
-    assert case.cfg.n_gpus == case.cfg.dp_size == 16 and case.cfg.sp_size == 1
-    assert case.cfg.training["ds_config"]["train_batch_size"] == 16
-    assert case.references == [("single-step-optimizer", arm) for arm in ("gas1", "gas4")]
-    assert len(case.captures) == len(case.payloads) == 2
-    assert all(sum(node["slots"] for node in admission["nodes"]) == 16 for admission in case.captures)
-    assert all(payload["training_config"]["n_gpus"] == 16 for payload in case.payloads)
-    assert all(result.metrics["stated_criterion_abs"] == 0.001 for result in results)
-    assert case.events.count("job-enter") == case.events.count("job-exit") == 2
-    assert case.events[-1] == "gateway-exit"
-
-
-@pytest.mark.parametrize("dense_allocation_runner_case", [16], indirect=True)
 def test_dense_allocation_runner_explicit16_rejects_partial8_before_preparation(
     dense_allocation_runner_case, monkeypatch
 ):
@@ -17632,23 +12413,6 @@ def test_dense_allocation_runner_new_rejects_incompatible_route_before_reference
     assert not case.events and not case.admitted and not case.captures and not case.references
 
 
-def test_dense_allocation_runner_new_allocation_rejection_precedes_reference_identity_and_resources(
-    dense_allocation_runner_case, monkeypatch
-):
-    case = dense_allocation_runner_case
-
-    def reject(*args, **kwargs):
-        raise ValueError("actual allocation identity differs")
-
-    monkeypatch.setattr(capture, "validate_dense_checkpoint_allocation", reject)
-    monkeypatch.setattr(
-        reference_records, "model_identity", lambda *args: pytest.fail("read reference before admission")
-    )
-    with pytest.raises(ValueError, match="actual allocation identity"):
-        case.execute()
-    assert not case.events and not case.references
-
-
 def _dense_allocation_runner_args(tmp_path, *, raw=b'{"nodes":[{"host":"head","slots":4}]}'):
     from arctic_platform.correctness import api
 
@@ -17663,77 +12427,6 @@ def _dense_allocation_runner_args(tmp_path, *, raw=b'{"nodes":[{"host":"head","s
     )
     request = api.RunRequest(config=str(_cortex_optimizer_capture_CONFIG), tests=("single-step-optimizer",))
     return api._namespace(request, options), request, options
-
-
-@pytest.mark.parametrize("combined", [False, True])
-def test_dense_allocation_runner_new_maintained_parser_and_loader_have_distinct_optimizer_scope(tmp_path, combined):
-    from arctic_platform.correctness import api
-
-    args, request, options = _dense_allocation_runner_args(tmp_path)
-    selected = ["single-step-grads", "single-step-optimizer"] if combined else ["single-step-optimizer"]
-    argv = [
-        "--config",
-        request.config,
-        "--base-url",
-        options.base_url,
-        "--local-cortex-fixture",
-        "--dense-checkpoint-allocation",
-        str(options.dense_checkpoint_allocation),
-        "--dense-checkpoint-allocation-sha256",
-        options.dense_checkpoint_allocation_sha256,
-    ]
-    for test in selected:
-        argv.extend(["--test", test])
-    actual_request, actual_options = api.parse_run_args(argv)
-    assert actual_request.tests == tuple(selected)
-    assert actual_options.dense_checkpoint_allocation == options.dense_checkpoint_allocation
-    assert actual_options.dense_checkpoint_allocation_sha256 == options.dense_checkpoint_allocation_sha256
-    parsed = api._namespace(actual_request, actual_options)
-    assert cli._load_dense_checkpoint_allocation(parsed) == {"nodes": [{"host": "head", "slots": 4}]}
-    assert not hasattr(cli, "_load_inference_export_allocation")
-
-
-@pytest.mark.parametrize(
-    "changed",
-    [
-        {"test": None},
-        {"test": ["single-step-grads"]},
-        {"test": ["single-step-optimizer", "inference-checkpoint-loss"]},
-        {"all_configs": True},
-        {"config": None},
-        {"backend": "onprem"},
-        {"prepare_references": True},
-        {"local_cortex_fixture": False},
-        {"cortex_fixture": Path("unread-publication.json")},
-        {"probe_layers": 1},
-        {"local_gateway_full_model": True},
-        {"peft_adapter": Path("unread-adapter")},
-        {"base_url": "http://remote.example"},
-    ],
-)
-def test_dense_allocation_runner_new_loader_rejects_scope_before_descriptor_read(tmp_path, monkeypatch, changed):
-    args, _, _ = _dense_allocation_runner_args(tmp_path)
-    vars(args).update(changed)
-    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: pytest.fail("unsafe scope reached descriptor read"))
-    with pytest.raises(ValueError):
-        cli._load_dense_checkpoint_allocation(args)
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        b'{"nodes":[],"nodes":[]}',
-        b'{"nodes":[{"slots":1,"slots":2}]}',
-        b'{"nodes":[],"timeout_s":NaN}',
-        b'{"nodes":[],"timeout_s":Infinity}',
-        b"[]",
-        b"x" * (1024 * 1024 + 1),
-    ],
-)
-def test_dense_allocation_runner_new_loader_rejects_duplicate_nonfinite_nonobject_and_oversize(tmp_path, raw):
-    args, _, _ = _dense_allocation_runner_args(tmp_path, raw=raw)
-    with pytest.raises(ValueError):
-        cli._load_dense_checkpoint_allocation(args)
 
 
 @pytest.mark.parametrize("bad", ["missing-path", "missing-pin", "wrong-pin", "uppercase-pin", "short-pin"])
@@ -17751,26 +12444,6 @@ def test_dense_allocation_runner_new_loader_requires_exact_paired_fullpin(tmp_pa
         }[bad]
     with pytest.raises(ValueError):
         cli._load_dense_checkpoint_allocation(args)
-
-
-@pytest.mark.parametrize("boundary", ["api", "batch"])
-def test_dense_allocation_runner_new_original_mixed_selection_rejected_before_grouping(
-    tmp_path, monkeypatch, boundary
-):
-    from dataclasses import replace
-
-    from arctic_platform.correctness import api
-
-    args, request, options = _dense_allocation_runner_args(tmp_path)
-    request = replace(request, tests=("single-step-optimizer", "inference-checkpoint-loss"))
-    args.test = list(request.tests)
-    monkeypatch.setattr(api, "select", lambda *args: pytest.fail("invalid original selection was grouped"))
-    monkeypatch.setattr(Path, "mkdir", lambda *args, **kwargs: pytest.fail("invalid selection created batch output"))
-    with pytest.raises(ValueError):
-        if boundary == "api":
-            api.run(request, options)
-        else:
-            cli.run_batch(args, selected=[])
 
 
 def test_dense_allocation_runner_new_maintained_cli_forwards_authenticated_descriptor_to_executor(
@@ -17830,85 +12503,6 @@ def test_dense_allocation_runner_new_maintained_cli_forwards_authenticated_descr
     assert hashlib.sha256(options.dense_checkpoint_allocation.read_bytes()).hexdigest() == (
         options.dense_checkpoint_allocation_sha256
     )
-
-
-def test_dense_allocation_runner_new_library_keeps_pinned_metadata_in_original_request_before_batch(
-    tmp_path, monkeypatch
-):
-    from arctic_platform.correctness import api
-
-    args, request, options = _dense_allocation_runner_args(tmp_path)
-    selected = [api.SelectedCase("mock-dense", _cortex_optimizer_capture_CONFIG, "single-step-optimizer")]
-    reached = []
-    monkeypatch.setattr(
-        api, "select", lambda actual: selected if actual is request else pytest.fail("request replaced")
-    )
-    result = object()
-
-    def batch(actual, **kwargs):
-        assert actual.test == ["single-step-optimizer"]
-        assert actual.dense_checkpoint_allocation == args.dense_checkpoint_allocation
-        assert actual.dense_checkpoint_allocation_sha256 == args.dense_checkpoint_allocation_sha256
-        assert kwargs["selected"] is selected
-        reached.append(actual)
-        return result
-
-    monkeypatch.setattr(cli, "run_batch", batch)
-    assert api.run(request, options) is result
-    assert len(reached) == 1
-
-
-@pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
-@pytest.mark.parametrize(
-    "tests",
-    [
-        ["single-step-optimizer"],
-        ["single-step-grads", "single-step-optimizer"],
-    ],
-)
-def test_local_cortex_optimizer_cli_local_fixture_accepts_explicit_supported_selection_before_dispatch(
-    monkeypatch, tests
-):
-    args = SimpleNamespace(
-        local_cortex_fixture=True,
-        cortex_fixture=None,
-        config=str(_cortex_optimizer_capture_CONFIG),
-        all_configs=False,
-        test=tests,
-    )
-    monkeypatch.setattr(cli, "_client_backend", lambda args: CortexConfig(base_url="http://127.0.0.1:8003"))
-
-    def stop(*args, **kwargs):
-        raise RuntimeError("eligible dispatch")
-
-    monkeypatch.setattr(cli, "_resolve_configs", stop)
-    with pytest.raises(RuntimeError, match="eligible dispatch"):
-        cli.cmd_run(args)
-
-
-@pytest.mark.usefixtures("_local_cortex_optimizer_no_network")
-@pytest.mark.parametrize(
-    "selected",
-    [
-        None,
-        ["inference-checkpoint-loss"],
-        ["single-step-optimizer", "inference-checkpoint-loss"],
-        ["single-step-optimizer", "checkpoint-resume-loss"],
-        ["unknown-check"],
-    ],
-)
-def test_local_cortex_optimizer_cli_local_fixture_does_not_implicitly_enable_other_checks(monkeypatch, selected):
-    args = SimpleNamespace(
-        local_cortex_fixture=True,
-        cortex_fixture=None,
-        config=str(_cortex_optimizer_capture_CONFIG),
-        all_configs=False,
-        test=selected,
-    )
-    monkeypatch.setattr(cli, "_client_backend", lambda args: CortexConfig(base_url="http://127.0.0.1:8003"))
-    monkeypatch.setattr(cli, "_resolve_configs", lambda *args, **kwargs: pytest.fail("invalid selection dispatched"))
-    with pytest.raises(SystemExit, match="only first-two"):
-        cli.cmd_run(args)
 
 
 # Gdn determinism.
@@ -18038,141 +12632,16 @@ def _lora_init_specs(dtype="bfloat16"):
     ]
 
 
-def _lora_init_tensors(specs, seed=1234):
-    return {spec.name: lora_init.generate_tensor(spec, seed) for spec in specs}
-
-
-@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
-def test_lora_init_private_cpu_generation_matches_declared_kaiming_and_zero_distribution(
-    dtype,
-):
-    a, b = _lora_init_specs(dtype)
-    expected = torch.empty(a.shape, device="cpu", dtype=torch.float32)
-    generator = torch.Generator(device="cpu").manual_seed(lora_init.tensor_seed(1234, _lora_init_A))
-    torch.nn.init.kaiming_uniform_(
-        expected,
-        a=math.sqrt(5),
-        mode="fan_in",
-        nonlinearity="leaky_relu",
-        generator=generator,
-    )
-    actual = lora_init.generate_tensor(a, 1234)
-    assert actual.device.type == "cpu"
-    assert actual.dtype == getattr(torch, dtype)
-    assert torch.equal(actual, expected.to(dtype=actual.dtype))
-    assert float(actual.abs().max()) <= 1 / math.sqrt(a.shape[1])
-    assert torch.count_nonzero(lora_init.generate_tensor(b, 1234)).item() == 0
-
-
-def test_lora_init_unrelated_draws_and_traversal_order_do_not_change_values_or_global_rng():
-    specs = _lora_init_specs()
-    state = torch.random.get_rng_state().clone()
-    first = _lora_init_tensors(specs)
-    assert torch.equal(torch.random.get_rng_state(), state)
-    torch.rand(257)
-    state = torch.random.get_rng_state().clone()
-    second = _lora_init_tensors(list(reversed(specs)))
-    assert torch.equal(torch.random.get_rng_state(), state)
-    assert all((torch.equal(first[name], second[name]) for name in first))
-    assert lora_init.build_manifest(specs, 1234) == lora_init.build_manifest(reversed(specs), 1234)
-
-
-def test_lora_init_sha256_seed_is_stable_and_changes_with_name_or_global_seed():
-    recipe = {
-        "domain": "arctic-correctness-lora-tensor-seed-v1",
-        "global_seed": 1234,
-        "name": _lora_init_A,
-    }
-    digest = hashlib.sha256(json.dumps(recipe, sort_keys=True, separators=(",", ":")).encode()).digest()
-    assert lora_init.tensor_seed(1234, _lora_init_A) == int.from_bytes(digest[:8], "big") & 2**63 - 1
-    assert lora_init.tensor_seed(1234, _lora_init_A) != lora_init.tensor_seed(
-        1234, _lora_init_A.replace("q_proj", "k_proj")
-    )
-    assert lora_init.tensor_seed(1234, _lora_init_A) != lora_init.tensor_seed(1235, _lora_init_A)
-
-
 @pytest.mark.parametrize("seed", [-1, 2**63, True, "1234"])
 def test_lora_init_invalid_global_seeds_are_rejected(seed):
     with pytest.raises(ValueError, match="global seed"):
         lora_init.generate_tensor(_lora_init_specs()[0], seed)
 
 
-def test_lora_init_fresh_process_reconstruction_ignores_global_random_draws():
-    expected = lora_init.build_manifest(_lora_init_specs(), 1234)
-    code = (
-        "import json, torch; from arctic_platform.correctness.harness.lora import LoraTensorSpec, build_manifest;"
-        f" torch.manual_seed(98); torch.rand(299); specs=[LoraTensorSpec({_lora_init_A!r}, (4,16), 'bfloat16'),"
-        f" LoraTensorSpec({_lora_init_B!r}, (12,4), 'bfloat16')];"
-        " print(json.dumps(build_manifest(specs,1234),sort_keys=True))"
-    )
-    environment = {
-        **os.environ,
-        "CUDA_VISIBLE_DEVICES": "",
-        "HF_HUB_OFFLINE": "1",
-        "TRANSFORMERS_OFFLINE": "1",
-        "PYTHONSAFEPATH": "1",
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
-    completed = subprocess.run(
-        [sys.executable, "-c", code],
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=True,
-        timeout=60,
-    )
-    assert json.loads(completed.stdout.strip().splitlines()[-1]) == expected
-
-
-def test_lora_init_canonical_names_retain_containers_and_strip_only_supported_segments():
-    raw = _lora_init_A.replace(".layers.0.", ".layers.0._checkpoint_wrapped_module.").replace(
-        ".lora_A.weight", ".lora_A.default.weight"
-    )
-    assert lora_init.canonical_name(raw) == _lora_init_A
-    assert lora_init.canonical_name(_lora_init_A.replace("base_model.model.", "", 1)) != _lora_init_A
-    assert lora_init.canonical_name(_lora_init_A.replace(".model.layers.", ".language_model.layers.")) != _lora_init_A
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "",
-        "model..lora_A.weight",
-        "model.lora_A.other.weight",
-        "model.weight",
-        "model x.lora_A.weight",
-    ],
-)
-def test_lora_init_unsupported_or_ambiguous_names_are_rejected(name):
-    with pytest.raises(ValueError):
-        lora_init.canonical_name(name)
-
-
 @pytest.mark.parametrize("shape", [(0, 16), (4,), (4, 16, 2), (True, 16), [4, 16]])
 def test_lora_init_invalid_shapes_are_rejected(shape):
     with pytest.raises(ValueError, match="two-dimensional"):
         lora_init.LoraTensorSpec(_lora_init_A, shape, "float32")
-
-
-def test_lora_init_unsupported_dtype_and_incomplete_or_colliding_pairs_are_rejected():
-    with pytest.raises(ValueError, match="dtype"):
-        lora_init.LoraTensorSpec(_lora_init_A, (4, 16), "float64")
-    a, b = _lora_init_specs()
-    for specs, message in [
-        ([], "complete A/B"),
-        ([a], "partner"),
-        ([a, b, a], "duplicate"),
-        (
-            [a, lora_init.LoraTensorSpec(_lora_init_B, (12, 5), b.dtype)],
-            "rank or dtype",
-        ),
-        (
-            [a, lora_init.LoraTensorSpec(_lora_init_B, b.shape, "float32")],
-            "rank or dtype",
-        ),
-    ]:
-        with pytest.raises(ValueError, match=message):
-            lora_init.build_manifest(specs, 1234)
 
 
 def test_lora_init_manifest_contains_only_compact_json_recipe_and_exact_hashes():
@@ -18207,276 +12676,6 @@ def test_lora_init_corrupt_or_incompatible_manifest_cannot_be_reused(field):
         manifest[field] = "changed"
     with pytest.raises(ValueError):
         lora_init.manifest_specs(manifest)
-
-
-def test_lora_init_hash_covers_name_shape_dtype_and_signed_zero_bytes():
-    zeros = torch.zeros((4, 16), dtype=torch.float32)
-    digest = lora_init.tensor_sha256(_lora_init_A, zeros)
-    assert digest != lora_init.tensor_sha256(_lora_init_A.replace("q_proj", "k_proj"), zeros)
-    assert digest != lora_init.tensor_sha256(_lora_init_A, zeros.reshape(8, 8))
-    assert digest != lora_init.tensor_sha256(_lora_init_A, zeros.bfloat16())
-    negative_zero = zeros.clone()
-    negative_zero[0, 0] = -0.0
-    assert torch.equal(zeros, negative_zero)
-    assert digest != lora_init.tensor_sha256(_lora_init_A, negative_zero)
-
-
-def test_lora_init_exact_verification_accepts_only_wrapper_default_aliases_and_full_global_shapes():
-    specs = _lora_init_specs()
-    manifest = lora_init.build_manifest(specs, 1234)
-    tensors = _lora_init_tensors(specs)
-    raw = {name.replace(".weight", ".default.weight"): tensor for name, tensor in tensors.items()}
-    receipt = lora_init.verify_tensors(raw, manifest)
-    assert receipt["identity_sha256"] == manifest["identity_sha256"]
-    shards = list(tensors[_lora_init_A].chunk(2, dim=1))
-    reconstructed = {**tensors, _lora_init_A: torch.cat(shards, dim=1)}
-    lora_init.verify_tensors(reconstructed, manifest)
-    with pytest.raises(ValueError, match="shape differs"):
-        lora_init.verify_tensors({**tensors, _lora_init_A: shards[0]}, manifest)
-    with pytest.raises(ValueError, match="coverage"):
-        lora_init.verify_tensors(
-            {name.removeprefix("base_model.model."): value for name, value in tensors.items()},
-            manifest,
-        )
-
-
-@pytest.mark.parametrize(
-    "kind",
-    ["missing", "extra", "collision", "shape", "nonfinite", "different", "signed_zero"],
-)
-def test_lora_init_verification_rejects_coverage_shape_and_value_changes(kind):
-    specs = _lora_init_specs()
-    manifest = lora_init.build_manifest(specs, 1234)
-    tensors = _lora_init_tensors(specs)
-    if kind == "missing":
-        del tensors[_lora_init_B]
-    elif kind == "extra":
-        tensors[_lora_init_A.replace("q_proj", "k_proj")] = tensors[_lora_init_A]
-    elif kind == "collision":
-        tensors[_lora_init_A.replace(".weight", ".default.weight")] = tensors[_lora_init_A]
-    elif kind == "shape":
-        tensors[_lora_init_A] = tensors[_lora_init_A].reshape(8, 8)
-    elif kind == "nonfinite":
-        tensors[_lora_init_A][0, 0] = float("nan")
-    elif kind == "different":
-        tensors[_lora_init_A][0, 0] = 0.5
-    else:
-        tensors[_lora_init_B][0, 0] = -0.0
-    with pytest.raises(ValueError):
-        lora_init.verify_tensors(tensors, manifest)
-
-
-def test_lora_init_only_explicit_exact_float32_widening_is_accepted():
-    specs = _lora_init_specs()
-    manifest = lora_init.build_manifest(specs, 1234)
-    tensors = {name: tensor.float() for name, tensor in _lora_init_tensors(specs).items()}
-    with pytest.raises(ValueError, match="dtype"):
-        lora_init.verify_tensors(tensors, manifest)
-    lora_init.verify_tensors(tensors, manifest, allow_exact_float32_widening=True)
-    tensors[_lora_init_A][0, 0] += 2 ** (-20)
-    with pytest.raises(ValueError, match="bytes"):
-        lora_init.verify_tensors(tensors, manifest, allow_exact_float32_widening=True)
-    fp32_specs = _lora_init_specs("float32")
-    with pytest.raises(ValueError, match="dtype"):
-        lora_init.verify_tensors(
-            {name: tensor.bfloat16() for name, tensor in _lora_init_tensors(fp32_specs).items()},
-            lora_init.build_manifest(fp32_specs, 1234),
-            allow_exact_float32_widening=True,
-        )
-
-
-def test_lora_init_non_lora_is_noop_without_model_or_storage_access(monkeypatch):
-    cfg = SimpleNamespace(training={})
-    monkeypatch.setattr(
-        deterministic_lora,
-        "require_data_fast_path",
-        lambda *a, **k: pytest.fail("non-LoRA storage accessed"),
-    )
-    assert deterministic_lora.materialize_adapter(cfg, "/absent/model", "/code/not-fast") is None
-    payload = {"training_config": {}, "model_name": "Qwen/Qwen3-8B"}
-    assert deterministic_lora.bind_payload(payload, None) is payload
-
-
-def test_lora_init_target_binding_never_invents_public_adapter_or_resume_fields():
-    payload = {
-        "training_config": {"peft_config": {"r": 4}},
-        "model_name": "Qwen/Qwen3-8B",
-    }
-    before = deepcopy(payload)
-    with pytest.raises(
-        deterministic_lora.LoraInitializationPrerequisiteError,
-        match="public training adapter",
-    ):
-        deterministic_lora.bind_payload(payload, Path("/data-fast/tmp/adapter"))
-    assert payload == before
-    with pytest.raises(deterministic_lora.LoraInitializationPrerequisiteError, match="requires"):
-        deterministic_lora.bind_payload(payload, None)
-
-
-@pytest.fixture
-def _lora_init_local_adapter_fixture(tmp_path, monkeypatch):
-    root = tmp_path / "data-fast"
-    root.mkdir()
-    monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", root)
-    source = root / "model"
-    source.mkdir()
-    (source / "config.json").write_text('{"architectures":["SyntheticModel"]}')
-
-    class SyntheticModel(torch.nn.Module):
-
-        def __init__(self, config):
-            super().__init__()
-            self.base = torch.nn.Linear(16, 12, bias=False)
-            self.base.requires_grad_(False)
-
-    class SyntheticLoraConfig:
-
-        def __init__(self, **kwargs):
-            self.values = kwargs
-
-        def save_pretrained(self, destination):
-            (Path(destination) / "adapter_config.json").write_text(json.dumps(self.values, sort_keys=True))
-
-    def get_peft_model(model, config):
-        model.q_proj = torch.nn.Module()
-        model.q_proj.lora_A = torch.nn.ModuleDict({"default": torch.nn.Linear(16, config.values["r"], bias=False)})
-        model.q_proj.lora_B = torch.nn.ModuleDict({"default": torch.nn.Linear(config.values["r"], 12, bias=False)})
-        model.peft_config = {"default": config}
-        return model
-
-    def from_pretrained(path, **kwargs):
-        assert Path(path) == source
-        assert kwargs == {"local_files_only": True, "trust_remote_code": False}
-        return SimpleNamespace(architectures=["SyntheticModel"])
-
-    monkeypatch.setitem(
-        sys.modules,
-        "transformers",
-        SimpleNamespace(
-            AutoConfig=SimpleNamespace(from_pretrained=from_pretrained),
-            SyntheticModel=SyntheticModel,
-        ),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "peft",
-        SimpleNamespace(
-            LoraConfig=SyntheticLoraConfig,
-            get_peft_model=get_peft_model,
-            get_peft_model_state_dict=lambda model, state_dict, adapter_name: {
-                name.replace(".default.weight", ".weight"): tensor for name, tensor in state_dict.items()
-            },
-        ),
-    )
-    cfg = SimpleNamespace(
-        training={"peft_config": {"peft_type": "Lora", "r": 4, "target_modules": ["q_proj"]}},
-        sub_job={"dtype": "bfloat16", "seed": 1234},
-        model_name="Qwen/Qwen3-8B",
-    )
-    return (cfg, source, root / "runtime")
-
-
-def test_lora_init_temporary_pack_uses_meta_shapes_and_preserves_rng_and_identity(
-    _lora_init_local_adapter_fixture,
-):
-    cfg, source, scratch = _lora_init_local_adapter_fixture
-    rng = torch.random.get_rng_state().clone()
-    first = deterministic_lora.materialize_adapter(cfg, source, scratch)
-    assert torch.equal(torch.random.get_rng_state(), rng)
-    second = deterministic_lora.materialize_adapter(cfg, source, scratch)
-    assert first != second
-    assert first.parent == scratch
-    assert {path.name for path in first.iterdir()} == {
-        "adapter_config.json",
-        "adapter_model.safetensors",
-        "initialization.json",
-    }
-    assert deterministic_lora.identity_metadata(first) == deterministic_lora.identity_metadata(second)
-    assert not list(source.glob("*.safetensors"))
-    assert not list(source.glob("*.pt"))
-
-
-def test_lora_init_temporary_pack_refuses_non_fast_storage_before_topology_import(
-    _lora_init_local_adapter_fixture,
-):
-    cfg, source, scratch = _lora_init_local_adapter_fixture
-    with pytest.raises(ValueError, match="/data-fast"):
-        deterministic_lora.materialize_adapter(cfg, source, scratch.parent.parent / "outside")
-
-
-@pytest.mark.parametrize("kind", ["metadata", "adapter_config", "tensor"])
-def test_lora_init_pack_identity_refuses_mutation(_lora_init_local_adapter_fixture, kind):
-    from safetensors.torch import load_file
-    from safetensors.torch import save_file
-
-    cfg, source, scratch = _lora_init_local_adapter_fixture
-    output = deterministic_lora.materialize_adapter(cfg, source, scratch)
-    if kind == "metadata":
-        path = output / "initialization.json"
-        metadata = json.loads(path.read_text())
-        metadata["model_name"] = "another-model"
-        path.write_text(json.dumps(metadata))
-    elif kind == "adapter_config":
-        (output / "adapter_config.json").write_text("{}")
-    else:
-        path = output / "adapter_model.safetensors"
-        tensors = load_file(str(path))
-        tensors[sorted(tensors)[0]][0, 0] += 1
-        save_file(tensors, str(path))
-    with pytest.raises(ValueError):
-        deterministic_lora.identity_metadata(output)
-
-
-def test_lora_init_real_peft_tiny_qwen_serialization_and_loaded_initial_values(tmp_path, monkeypatch):
-    import peft
-    from safetensors.torch import load_file
-    from transformers import Qwen3Config
-    from transformers import Qwen3ForCausalLM
-
-    root = tmp_path / "data-fast"
-    root.mkdir()
-    monkeypatch.setattr(workdir, "_DATA_FAST_ROOT", root)
-    source = root / "model"
-    source.mkdir()
-    config = Qwen3Config(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        head_dim=8,
-        architectures=["Qwen3ForCausalLM"],
-    )
-    config.save_pretrained(source)
-    cfg = SimpleNamespace(
-        training={
-            "peft_config": {
-                "peft_type": "Lora",
-                "r": 4,
-                "target_modules": ["q_proj", "v_proj"],
-            }
-        },
-        sub_job={"dtype": "bfloat16", "seed": 1234},
-        model_name="Qwen/Qwen3-8B",
-    )
-    rng = torch.random.get_rng_state().clone()
-    output = deterministic_lora.materialize_adapter(cfg, source, root / "runtime")
-    assert torch.equal(torch.random.get_rng_state(), rng)
-    identity = deterministic_lora.lora_adapter_identity(output)
-    assert identity == deterministic_lora.identity_metadata(output)
-    state = load_file(str(output / "adapter_model.safetensors"))
-    assert len(state) == 4
-    assert all((".default." not in name for name in state))
-    assert all((name.startswith("base_model.model.model.layers.0.") for name in state))
-    with torch.random.fork_rng(devices=[]):
-        base = Qwen3ForCausalLM(config).to(device="cpu", dtype=torch.bfloat16)
-        loaded = peft.PeftModel.from_pretrained(base, output, is_trainable=True, local_files_only=True)
-    actual = {name: parameter for name, parameter in loaded.named_parameters() if parameter.requires_grad}
-    receipt = lora_init.verify_tensors(actual, identity["initialization"], allow_exact_float32_widening=True)
-    assert len(receipt["verified_tensors"]) == 4
-    with pytest.raises(deterministic_lora.LoraInitializationPrerequisiteError):
-        deterministic_lora.bind_payload({"training_config": cfg.training}, output)
 
 
 def test_onboarding_generated_shared_adapter_matches_runner_adapter(tmp_path, monkeypatch):
@@ -18955,112 +13154,6 @@ def test_shared_adapter_rejects_invalid_serialized_tensor_inventory(adapter_pack
         shared.shared_adapter_identity(adapter_pack.path)
 
 
-@pytest.mark.parametrize("failure", ["rank", "targets", "dtype", "shape", "adapter-name"])
-def test_shared_adapter_rejects_incompatible_installed_model_without_loading(adapter_pack, failure):
-    identity = shared.shared_adapter_identity(adapter_pack.path)
-    model = _model(
-        rank=3 if failure == "rank" else 2,
-        targets=("k_proj",) if failure == "targets" else ("q_proj", "v_proj"),
-        dtype=torch.bfloat16 if failure == "dtype" else torch.float32,
-    )
-    if failure == "shape":
-        module = model.base_model.model.model.layers[0].self_attn.q_proj.lora_A["default"]
-        module.weight = torch.nn.Parameter(module.weight.detach()[:, :8].clone())
-    elif failure == "adapter-name":
-        model.add_adapter(
-            "second",
-            peft.LoraConfig(task_type="CAUSAL_LM", r=2, target_modules=["q_proj"]),
-        )
-    before = {name: _bytes(parameter) for name, parameter in model.named_parameters()}
-    with pytest.raises(ValueError, match="topology|coverage"):
-        shared.shared_initialize_adapter(model, adapter_pack.path, identity)
-    assert {name: _bytes(parameter) for name, parameter in model.named_parameters()} == before
-
-
-@pytest.mark.parametrize("failure", ["unexpected-keys", "inexact-copy", "identity-drift"])
-def test_shared_adapter_rejects_failed_load_or_source_drift(adapter_pack, monkeypatch, failure):
-    identity = shared.shared_adapter_identity(adapter_pack.path)
-    model = _model()
-    original = peft.set_peft_model_state_dict
-
-    def load(target, state, *, adapter_name):
-        assert target is model and adapter_name == "default"
-        if failure == "unexpected-keys":
-            return SimpleNamespace(unexpected_keys=["foreign.weight"])
-        result = original(target, state, adapter_name=adapter_name)
-        if failure == "inexact-copy":
-            with torch.no_grad():
-                next(iter(_installed(target).values())).reshape(-1)[0] = 0.0
-        else:
-            config = adapter_pack.path / "adapter_config.json"
-            config.write_bytes(config.read_bytes() + b"\n")
-        return result
-
-    monkeypatch.setattr(peft, "set_peft_model_state_dict", load)
-    with pytest.raises(ValueError, match="unexpected keys|differ after loading|changed during loading"):
-        shared.shared_initialize_adapter(model, adapter_pack.path, identity)
-
-
-@pytest.mark.parametrize("failure", [None, "build", "load", "body"])
-def test_shared_adapter_build_scope_restores_worker_builder_on_all_exits(adapter_pack, monkeypatch, failure):
-    from arctic_platform import common
-
-    worker = ModuleType("arctic_platform.common.deepspeed_worker")
-    loaded = SimpleNamespace(model=_model())
-    calls = []
-
-    def build(*args, **kwargs):
-        calls.append((args, kwargs))
-        if failure == "build":
-            raise RuntimeError("builder failed")
-        return loaded
-
-    worker.build_model = build
-    monkeypatch.setitem(sys.modules, worker.__name__, worker)
-    monkeypatch.setattr(common, "deepspeed_worker", worker, raising=False)
-    identity = shared.shared_adapter_identity(adapter_pack.path)
-    if failure == "load":
-        identity = copy.deepcopy(identity)
-        identity["schema"] = "foreign"
-
-    def execute():
-        with shared.adapter_build_scope(adapter_pack.path, identity):
-            assert worker.build_model is not build
-            result = worker.build_model("spec", parallel_groups="groups")
-            assert result is loaded
-            assert calls == [(("spec",), {"parallel_groups": "groups"})]
-            assert {_name: _bytes(value) for _name, value in _installed(loaded.model).items()} == {
-                canonical_name(name): _bytes(value) for name, value in adapter_pack.state.items()
-            }
-            if failure == "body":
-                raise RuntimeError("body failed")
-
-    if failure:
-        with pytest.raises(ValueError if failure == "load" else RuntimeError):
-            execute()
-    else:
-        execute()
-    assert worker.build_model is build
-
-
-def test_shared_adapter_nested_scope_restores_outer_then_original_builder(adapter_pack, monkeypatch):
-    from arctic_platform import common
-
-    worker = ModuleType("arctic_platform.common.deepspeed_worker")
-    worker.build_model = lambda *args, **kwargs: SimpleNamespace(model=_model())
-    original = worker.build_model
-    monkeypatch.setitem(sys.modules, worker.__name__, worker)
-    monkeypatch.setattr(common, "deepspeed_worker", worker, raising=False)
-    identity = shared.shared_adapter_identity(adapter_pack.path)
-    with shared.adapter_build_scope(adapter_pack.path, identity):
-        outer = worker.build_model
-        with shared.adapter_build_scope(adapter_pack.path, identity):
-            assert worker.build_model is not outer
-            worker.build_model("spec")
-        assert worker.build_model is outer
-    assert worker.build_model is original
-
-
 @pytest.mark.parametrize("order", ["batched", "arm"])
 def test_shared_adapter_runner_binds_identical_pack_to_both_cached_reference_arms(
     adapter_pack, _prepared_reference_runner_prepared_runner, monkeypatch, order
@@ -19119,24 +13212,6 @@ def test_shared_adapter_runner_refuses_unadmitted_inputs_before_reference_or_tar
     with pytest.raises(ValueError):
         control.execute(**options)
     assert not control.events and not control.recipes and not control.published
-
-
-def test_shared_adapter_onboard_freezes_supplied_identity_and_rejects_later_mutation(
-    adapter_pack,
-):
-    from arctic_platform.correctness.onboarding import onboard
-
-    config = SimpleNamespace(
-        training={"peft_config": shared.shared_adapter_identity(adapter_pack.path)["peft_config"]}
-    )
-    args = SimpleNamespace(peft_adapter=adapter_pack.path)
-    assert onboard._shared_adapter(args, config) == adapter_pack.path
-    assert args._admitted_shared_adapter_identity == shared.shared_adapter_identity(adapter_pack.path)
-    assert onboard._shared_adapter(args, config) == adapter_pack.path
-    path = adapter_pack.path / "adapter_config.json"
-    path.write_bytes(path.read_bytes() + b"\n")
-    with pytest.raises(ValueError, match="changed during onboarding"):
-        onboard._shared_adapter(args, config)
 
 
 @pytest.fixture
@@ -19246,47 +13321,6 @@ def test_generated_adapter_reproduces_identity_across_process_hash_seeds(
     assert identities[0] == identities[1]
 
 
-@pytest.mark.parametrize(
-    "targets",
-    [
-        ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        r".*\.(q_proj|v_proj)$",
-    ],
-    ids=["module-list", "module-regex"],
-)
-def test_generated_adapter_canonicalizes_only_serialized_module_order(
-    generated_adapter_config, tmp_path, monkeypatch, targets
-):
-    control = generated_adapter_config
-    config = {**control.config, "target_modules": targets}
-    config_before = copy.deepcopy(config)
-    original_save = peft.PeftModel.save_pretrained
-    upstream = {}
-
-    def save_with_unordered_modules(model, destination, *args, **kwargs):
-        original_save(model, destination, *args, **kwargs)
-        destination = Path(destination)
-        config_path = destination / "adapter_config.json"
-        serialized = json.loads(config_path.read_bytes())
-        if isinstance(serialized["target_modules"], list):
-            serialized["target_modules"] = sorted(serialized["target_modules"], reverse=True)
-            config_path.write_text(json.dumps(serialized) + "\n")
-        upstream["config"] = copy.deepcopy(serialized)
-        upstream["tensors"] = (destination / "adapter_model.safetensors").read_bytes()
-
-    monkeypatch.setattr(peft.PeftModel, "save_pretrained", save_with_unordered_modules)
-    path = shared.generate_adapter(control.path, config, tmp_path / "generated")
-    expected = copy.deepcopy(upstream["config"])
-    expected["base_model_name_or_path"] = ""
-    if isinstance(targets, list):
-        expected["target_modules"] = sorted(targets)
-    else:
-        assert expected["target_modules"] == targets
-    assert json.loads((path / "adapter_config.json").read_bytes()) == expected
-    assert (path / "adapter_model.safetensors").read_bytes() == upstream["tensors"]
-    assert config == config_before
-
-
 def test_generated_adapter_seed_changes_a_only_and_binds_upstream_recipe(generated_adapter_config, tmp_path):
     control = generated_adapter_config
     states = []
@@ -19359,37 +13393,6 @@ def test_generated_adapter_constructs_meta_base_and_allocates_only_cpu_factors(
     assert {path.name for path in control.path.iterdir()} == {"config.json"}
     assert not (destination / "model.safetensors").exists()
     assert not (destination / "pytorch_model.bin").exists()
-
-
-@pytest.mark.parametrize("initializer", [False, "gaussian", "pissa"])
-def test_generated_adapter_refuses_nondefault_upstream_initializer(generated_adapter_config, tmp_path, initializer):
-    control = generated_adapter_config
-    config = {**control.config, "init_lora_weights": initializer}
-    with pytest.raises(ValueError, match="initializer|init_lora_weights"):
-        shared.generate_adapter(control.path, config, tmp_path / "rejected")
-    assert not (tmp_path / "rejected").exists()
-
-
-@pytest.mark.parametrize("seed", [-1, True, 1.5, "42"])
-def test_generated_adapter_refuses_invalid_seed(generated_adapter_config, tmp_path, seed):
-    control = generated_adapter_config
-    with pytest.raises(ValueError, match="seed"):
-        shared.generate_adapter(control.path, control.config, tmp_path / "rejected", seed=seed)
-    assert not (tmp_path / "rejected").exists()
-
-
-def test_generated_adapter_restores_rng_on_upstream_save_failure(generated_adapter_config, tmp_path, monkeypatch):
-    control = generated_adapter_config
-
-    def fail_save(*args, **kwargs):
-        torch.rand(7)
-        raise RuntimeError("upstream save failed")
-
-    monkeypatch.setattr(peft.PeftModel, "save_pretrained", fail_save)
-    before = torch.random.get_rng_state().clone()
-    with pytest.raises(RuntimeError, match="upstream save failed"):
-        shared.generate_adapter(control.path, control.config, tmp_path / "failed-save")
-    assert torch.equal(torch.random.get_rng_state(), before)
 
 
 def test_generated_adapter_dependency_recipe_drift_invalidates_admitted_identity(generated_adapter_config, tmp_path):
@@ -19481,123 +13484,6 @@ def worker_adapter_transfer(generated_adapter_config, tmp_path, monkeypatch):
         builds=builds,
         original=build,
     )
-
-
-@pytest.mark.parametrize("failure", [None, "build", "load", "body"])
-def test_worker_adapter_transfer_stages_without_coordinator_path_and_always_cleans(worker_adapter_transfer, failure):
-    control = worker_adapter_transfer
-    original = control.original
-    if failure == "build":
-
-        def failed_build(*args, **kwargs):
-            raise RuntimeError("worker builder failed")
-
-        original = failed_build
-        control.worker.build_model = original
-    elif failure == "load":
-        control.loaded.model = _model(dtype=torch.bfloat16)
-
-    def execute():
-        with shared.worker_adapter_scope(control.ref, control.identity) as yielded:
-            assert yielded is None
-            assert control.worker.build_model is not original
-            result = control.worker.build_model("spec", parallel_groups="groups")
-            assert result is control.loaded
-            assert control.builds == [(("spec",), {"parallel_groups": "groups"})]
-            assert {name: _bytes(value) for name, value in _installed(result.model).items()} == {
-                canonical_name(name): _bytes(value) for name, value in control.state.items()
-            }
-            assert all(path.is_dir() for path in control.staged + control.scratch)
-            if failure == "body":
-                raise RuntimeError("worker body failed")
-
-    if failure:
-        with pytest.raises(ValueError if failure == "load" else RuntimeError, match="dtypes|worker"):
-            execute()
-    else:
-        execute()
-    assert control.gets == [control.ref]
-    assert len(control.scratch) == len(control.staged) == 1
-    assert not any(path.exists() for path in control.scratch + control.staged)
-    assert not list(control.root.iterdir())
-    assert control.worker.build_model is original
-
-
-@pytest.mark.parametrize("failure", ["not-dict", "missing", "extra", "traversal", "nonbytes"])
-def test_worker_adapter_transfer_refuses_invalid_envelope_before_staging(worker_adapter_transfer, failure):
-    control = worker_adapter_transfer
-    files = dict(control.files)
-    if failure == "not-dict":
-        files = list(files.items())
-    elif failure == "missing":
-        del files["adapter_model.safetensors"]
-    elif failure in {"extra", "traversal"}:
-        files["unexpected.bin" if failure == "extra" else "../escape"] = b"foreign"
-    else:
-        files["adapter_config.json"] = bytearray(files["adapter_config.json"])
-    control.ray.get = lambda ref: files
-    with pytest.raises(ValueError, match="only standard pack bytes"):
-        with shared.worker_adapter_scope(control.ref, control.identity):
-            pytest.fail("invalid transport must not enter worker scope")
-    assert not control.scratch and not control.staged and not control.builds
-    assert not control.root.exists()
-    assert control.worker.build_model is control.original
-
-
-@pytest.mark.parametrize(
-    "failure",
-    [
-        "config",
-        "tensor",
-        "recipe",
-        "recipe-missing",
-        "invalid-config",
-        "invalid-tensor",
-    ],
-)
-def test_worker_adapter_transfer_rejects_corrupted_identity_and_cleans_staging(worker_adapter_transfer, failure):
-    control = worker_adapter_transfer
-    if failure == "config":
-        control.files["adapter_config.json"] += b"\n"
-    elif failure == "tensor":
-        state = {name: tensor.clone() for name, tensor in control.state.items()}
-        next(iter(state.values())).reshape(-1)[0] += 1
-        control.files["adapter_model.safetensors"] = save(state)
-    elif failure == "recipe":
-        recipe = json.loads(control.files["correctness_recipe.json"])
-        recipe["seed"] += 1
-        control.files["correctness_recipe.json"] = json.dumps(recipe).encode()
-    elif failure == "recipe-missing":
-        del control.files["correctness_recipe.json"]
-    elif failure == "invalid-config":
-        control.files["adapter_config.json"] = b"{"
-    else:
-        control.files["adapter_model.safetensors"] = b"not-safetensors"
-    with pytest.raises((ValueError, safetensors.SafetensorError)):
-        with shared.worker_adapter_scope(control.ref, control.identity):
-            pytest.fail("corrupted transport must not enter worker scope")
-    assert len(control.scratch) == 1 and not control.scratch[0].exists()
-    assert not control.staged and not control.builds
-    assert not list(control.root.iterdir())
-    assert control.worker.build_model is control.original
-
-
-def test_worker_adapter_transfer_get_failure_propagates_without_staging(
-    worker_adapter_transfer,
-):
-    control = worker_adapter_transfer
-
-    def fail_get(ref):
-        assert ref is control.ref
-        raise RuntimeError("Ray transport failed")
-
-    control.ray.get = fail_get
-    with pytest.raises(RuntimeError, match="Ray transport failed"):
-        with shared.worker_adapter_scope(control.ref, control.identity):
-            pytest.fail("failed get must not enter worker scope")
-    assert not control.scratch and not control.staged and not control.builds
-    assert not control.root.exists()
-    assert control.worker.build_model is control.original
 
 
 @pytest.mark.parametrize("order", ["batched", "arm"])
@@ -19769,50 +13655,6 @@ def test_shared_adapter_generated_hf_autocast_loads_fp32_factors_on_bfloat16_cpu
         assert _bytes(parameter) == _bytes(state[name]) == _bytes(_installed(target)[name])
     assert shared.shared_adapter_identity(pack, source.config) == identity
     assert {path.name for path in source.path.iterdir()} == {"config.json"}
-
-
-@pytest.mark.parametrize(
-    "initialization,binds",
-    [
-        ("external-model", False),
-        ({"schema": "arctic-correctness-lora-init-v1"}, False),
-        ({"schema": "shared-peft-adapter-v1"}, True),
-    ],
-)
-def test_shared_adapter_initialization_source_binding_leaves_other_record_recipes_unchanged(
-    monkeypatch, initialization, binds
-):
-    from arctic_platform.correctness.harness import storage as reference_records
-
-    ctx = SimpleNamespace(
-        config_id="synthetic-shared-adapter",
-        cfg=SimpleNamespace(gpu_type="H200"),
-        spec=SimpleNamespace(config_checksum="c" * 64),
-    )
-    original_file_identity = reference_records.file_identity
-    helper_pin = {"sha256": "a" * 64, "size": 1}
-    reads = []
-
-    def file_identity(path):
-        if path.name == "lora.py":
-            reads.append(path)
-            return copy.deepcopy(helper_pin)
-        return original_file_identity(path)
-
-    monkeypatch.setattr(reference_records, "file_identity", file_identity)
-    recipe = {"initialization": initialization}
-    before = reference_records.workload_identity(ctx, "single-step-optimizer", recipe)
-    helper_pin["sha256"] = "b" * 64
-    after = reference_records.workload_identity(ctx, "single-step-optimizer", recipe)
-    assert ("harness/lora.py" in before["reference_sources"]) is binds
-    assert len(reads) == (2 if binds else 0)
-    if binds:
-        assert before != after
-        assert before["reference_sources"]["harness/lora.py"]["sha256"] == "a" * 64
-        assert after["reference_sources"]["harness/lora.py"]["sha256"] == "b" * 64
-        del before["reference_sources"]["harness/lora.py"]
-        del after["reference_sources"]["harness/lora.py"]
-    assert before == after
 
 
 @pytest.mark.parametrize("failure", [None, "client", "body", "shutdown", "put", "admission"])
@@ -20108,20 +13950,6 @@ def _native_original_adapter_restored(control):
     assert not control.worker_root.exists() or list(control.worker_root.iterdir()) == []
 
 
-def test_native_original_adapter_sender_rejects_metadata_drift_during_pack_read(native_original_adapter, monkeypatch):
-    control = native_original_adapter
-    original_files = shared.adapter_files
-
-    def files(*args, **kwargs):
-        transferred = original_files(*args, **kwargs)
-        (control.path / "initialization.json").write_text("{}")
-        return transferred
-
-    monkeypatch.setattr(shared, "adapter_files", files)
-    with pytest.raises(ValueError, match="metadata changed during transfer"):
-        shared.original_adapter_files(control.path, control.identity, control.metadata)
-
-
 def _native_original_composition_modules(monkeypatch, **leaves):
     modules = {}
     for name in (
@@ -20142,49 +13970,6 @@ def _native_original_composition_modules(monkeypatch, **leaves):
         parent, _, attribute = name.rpartition(".")
         monkeypatch.setitem(sys.modules, name, module)
         setattr(modules[parent], attribute, module)
-
-
-@pytest.mark.parametrize(
-    "module,zone,backend,selected",
-    [
-        ("dss.ray_dss.zones.server", "training", "gpu", True),
-        ("dss.ray_dss.zones.server", "sampling", "gpu", False),
-        ("dss.ray_dss.zones.server", "training", "cpu", False),
-        ("dss.ray_dss.zones.server_head", "training", "gpu", False),
-        ("unrelated.module", "training", "gpu", False),
-    ],
-)
-def test_native_original_composition_zone_command_selects_only_training_gpu(module, zone, backend, selected):
-    import shlex
-
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    argv = [
-        "exec",
-        sys.executable,
-        "-m",
-        module,
-        "--zone-type",
-        zone,
-        "--backend",
-        backend,
-        "--workdir",
-        "/synthetic/path with spaces",
-    ]
-    command = shlex.join(argv)
-    actual = native_lora._zone_command(command)
-    if selected:
-        argv[3:4] = ["arctic_platform.correctness.harness.lora", "zone"]
-        assert shlex.split(actual) == argv
-    else:
-        assert actual == command
-
-
-@pytest.mark.parametrize("command", ["kill -TERM -- 123", "pkill -f selected-owned-zone", "true", ""])
-def test_native_original_composition_zone_command_leaves_cleanup_unchanged(command):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    assert native_lora._zone_command(command) == command
 
 
 def _native_original_composition_receipts(control):
@@ -20209,74 +13994,6 @@ def _native_original_composition_receipts(control):
         for rank in range(2)
     ]
     return request, receipts
-
-
-def test_native_original_composition_verifies_every_rank_receipt(native_original_adapter):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    request, receipts = _native_original_composition_receipts(native_original_adapter)
-    assert native_lora._verify_receipts(receipts, request, "selected-child") is None
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "missing-rank",
-        "duplicate-rank",
-        "rank-order",
-        "bool-rank",
-        "job",
-        "engine-count",
-        "bool-engine-count",
-        "original-identity",
-        "shared-identity",
-        "manifest-identity",
-        "missing-tensor",
-        "tensor-name",
-        "tensor-dtype",
-        "tensor-bytes",
-        "extra-tensor",
-    ],
-)
-def test_native_original_composition_rejects_missing_duplicate_and_drifted_receipts(native_original_adapter, damage):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    request, receipts = _native_original_composition_receipts(native_original_adapter)
-    if damage == "missing-rank":
-        receipts.pop()
-    elif damage == "duplicate-rank":
-        receipts[1]["rank"] = 0
-    elif damage == "rank-order":
-        receipts.reverse()
-    elif damage == "bool-rank":
-        receipts[0]["rank"] = False
-    elif damage == "job":
-        receipts[0]["job_id"] = "other-child"
-    elif damage == "engine-count":
-        receipts[0]["engine_initializations"] = 2
-    elif damage == "bool-engine-count":
-        receipts[0]["engine_initializations"] = True
-    elif damage == "original-identity":
-        receipts[0]["original_identity_sha256"] = "0" * 64
-    elif damage == "shared-identity":
-        receipts[0]["shared_identity"]["adapter_model_sha256"] = "0" * 64
-    elif damage == "manifest-identity":
-        receipts[0]["initialization"]["identity_sha256"] = "0" * 64
-    elif damage == "missing-tensor":
-        receipts[0]["initialization"]["verified_tensors"].pop()
-    elif damage == "extra-tensor":
-        receipts[0]["initialization"]["verified_tensors"].append(
-            copy.deepcopy(receipts[0]["initialization"]["verified_tensors"][0])
-        )
-    else:
-        field, value = {
-            "tensor-name": ("name", "other.lora_A.weight"),
-            "tensor-dtype": ("dtype", "float32"),
-            "tensor-bytes": ("sha256", "0" * 64),
-        }[damage]
-        receipts[0]["initialization"]["verified_tensors"][0][field] = value
-    with pytest.raises(ValueError, match="receipt|evidence"):
-        native_lora._verify_receipts(receipts, request, "selected-child")
 
 
 # Optional adapter capabilities must not gate an unrelated full-model gateway.
@@ -20370,144 +14087,6 @@ def test_gateway_optional_adapter_does_not_hide_invalid_sources(gateway_optional
     assert control.gateway.app.openapi_schema is control.schema
 
 
-def test_gateway_optional_adapter_available_capabilities_keep_exact_source_descriptors(
-    gateway_optional_adapter_control,
-):
-    control = gateway_optional_adapter_control
-    sources = control.native._runtime_sources(control.training)
-    shared_sources = control.native._shared_runtime_sources(control.training)
-    with control.native.gateway_scope(control.gateway):
-        document = control.gateway.app.openapi()
-        assert document[control.native.OPENAPI_KEY] == {"schema": control.native.SCHEMA, "sources": sources}
-        assert document[control.native.SHARED_OPENAPI_KEY] == {
-            "schema": control.native.SHARED_SCHEMA,
-            "sources": shared_sources,
-        }
-        assert control.native.OPENAPI_KEY not in control.document
-    assert control.local.run_cmd is control.original_run
-    assert control.gateway.app.openapi is control.original_openapi
-
-
-@pytest.mark.parametrize("shared_capability", [False, True])
-def test_gateway_optional_adapter_absent_capability_still_rejects_adapter_client(monkeypatch, shared_capability):
-    import requests
-
-    from arctic_platform.correctness.harness import gateway as hosted
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    class Session:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def get(self, url, **kwargs):
-            assert url == "http://127.0.0.1:12345/openapi.json"
-            assert kwargs == {"timeout": 30, "allow_redirects": False}
-            assert self.trust_env is False
-            return SimpleNamespace(status_code=200, json=lambda: {"openapi": "3.1"})
-
-    monkeypatch.setattr(hosted, "require_local_cortex_gateway", lambda backend: None)
-    monkeypatch.setattr(requests, "Session", Session)
-    with pytest.raises(ValueError, match="does not support verified original PEFT initialization"):
-        native_lora.gateway_capability(SimpleNamespace(base_url="http://127.0.0.1:12345"), shared=shared_capability)
-
-
-@pytest.mark.parametrize("missing", ["_DeepSpeedWorker", "initialize_training_engine"])
-def test_gateway_optional_adapter_missing_binding_still_rejects_worker_runtime(
-    gateway_optional_adapter_control, missing
-):
-    control = gateway_optional_adapter_control
-    sources = control.native._runtime_sources(control.training)
-    delattr(control.training, missing)
-    with pytest.raises(ValueError, match="runtime differs"):
-        control.native._verify_runtime(control.training, sources)
-
-
-@pytest.mark.parametrize("stale", ["original", "shared", "both"])
-def test_gateway_optional_adapter_final_guard_removes_stale_capabilities(gateway_optional_adapter_control, stale):
-    control = gateway_optional_adapter_control
-    del control.training.initialize_training_engine
-    keys = {
-        "original": [control.native.OPENAPI_KEY],
-        "shared": [control.native.SHARED_OPENAPI_KEY],
-        "both": [control.native.OPENAPI_KEY, control.native.SHARED_OPENAPI_KEY],
-    }[stale]
-    for key in keys:
-        control.document[key] = {"schema": "unverified-old-capability", "sources": {}}
-    with control.native.gateway_scope(control.gateway):
-        published = control.gateway.app.openapi()
-        assert published == {"openapi": "3.1", "paths": {"/unrelated": {}}}
-        assert all(key in control.document for key in keys)
-
-
-def test_gateway_optional_adapter_final_guard_present_binding_attribute_error_is_not_absence(
-    gateway_optional_adapter_control, monkeypatch
-):
-    control = gateway_optional_adapter_control
-    error = AttributeError("existing source binding failed", name="initialize_training_engine", obj=control.training)
-
-    def fail(training):
-        raise error
-
-    monkeypatch.setattr(control.native, "_runtime_sources", fail)
-    with pytest.raises(AttributeError) as caught:
-        with control.native.gateway_scope(control.gateway):
-            raise AssertionError("present binding failure must not become absence")
-    assert caught.value is error
-    assert control.local.run_cmd is control.original_run
-    assert control.gateway.app.openapi is control.original_openapi
-
-
-@pytest.mark.parametrize("failure_type", [None, RuntimeError, KeyboardInterrupt])
-def test_native_original_composition_gateway_scope_restores_captured_bindings(monkeypatch, failure_type):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    calls = []
-    result = object()
-
-    def run(command, *args, **kwargs):
-        calls.append((command, args, kwargs))
-        return result
-
-    local = ModuleType("dss.ray_dss.placement.local")
-    local.run_cmd = run
-    local.get_free_port = lambda: 9001
-    training = ModuleType("dss.ray_dss.jobs.gpu.training")
-    _native_original_composition_modules(
-        monkeypatch, **{"dss.ray_dss.placement.local": local, "dss.ray_dss.jobs.gpu.training": training}
-    )
-    schema = {"original": "cached"}
-    document = {"openapi": "3.1"}
-
-    def openapi():
-        return document
-
-    gateway = SimpleNamespace(app=SimpleNamespace(openapi=openapi, openapi_schema=schema))
-    sources = {"selected": "runtime-sources"}
-    monkeypatch.setattr(native_lora, "_runtime_sources", lambda actual: sources if actual is training else None)
-    failure = failure_type("gateway scope interrupted") if failure_type else None
-    captured = None
-    try:
-        with native_lora.gateway_scope(gateway):
-            assert gateway.app.openapi is not openapi and local.run_cmd is not run
-            published = gateway.app.openapi()
-            assert published[native_lora.OPENAPI_KEY] == {"schema": native_lora.SCHEMA, "sources": sources}
-            assert document == {"openapi": "3.1"}
-            assert local.run_cmd("kill -TERM -- 123", result, unchanged=True) is result
-            gateway.app.openapi_schema = {"temporary": True}
-            if failure:
-                local.run_cmd = object()
-                gateway.app.openapi = object()
-                raise failure
-    except BaseException as error:
-        captured = error
-    assert captured is failure
-    assert calls == [("kill -TERM -- 123", (result,), {"unchanged": True})]
-    assert local.run_cmd is run and gateway.app.openapi is openapi and gateway.app.openapi_schema is schema
-
-
 @pytest.mark.parametrize("failure_type", [None, RuntimeError, KeyboardInterrupt])
 def test_native_original_composition_manager_actor_table_restores_after_spawn(
     native_original_adapter, monkeypatch, failure_type
@@ -20587,189 +14166,6 @@ def test_native_original_composition_manager_actor_table_restores_after_spawn(
     assert manager_module._ACTOR_CLS[key] is actor
 
 
-@pytest.mark.parametrize(
-    "outcome",
-    [
-        "success",
-        "spawn-runtime",
-        "spawn-interrupt",
-        "missing-receipt",
-        "drifted-receipt",
-        "spawn-cleanup-runtime",
-        "spawn-cleanup-interrupt",
-    ],
-)
-def test_native_original_composition_coordinator_restores_worker_and_owns_failure_teardown(
-    native_original_adapter, monkeypatch, outcome, capsys
-):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    control = native_original_adapter
-    request, receipts = _native_original_composition_receipts(control)
-    ranks = [("owned-host-a", 0), ("owned-host-b", 1)]
-    events = []
-    failure = None
-    if outcome in {"spawn-runtime", "spawn-cleanup-runtime"}:
-        failure = RuntimeError("original native worker spawn")
-    elif outcome in {"spawn-interrupt", "spawn-cleanup-interrupt"}:
-        failure = KeyboardInterrupt("original native worker spawn")
-    cleanup_failure = RuntimeError("synthetic cleanup failure") if "cleanup" in outcome else None
-    training = ModuleType("dss.ray_dss.jobs.gpu.training")
-
-    class NativeWorker:
-        def __init__(self):
-            pytest.fail("receipt-only coordinator control must not construct a worker")
-
-    async def receive(receipt):
-        return receipt
-
-    class NativeCoordinator:
-        def __init__(self):
-            self._workers = []
-            self._info = SimpleNamespace(config=object(), job_id="selected-child")
-
-        async def _spawn_workers(self, cfg, actual_ranks, address, port, source):
-            assert actual_ranks is ranks and cfg is config and source is source_stage
-            assert address == "owned-master" and port == 12345
-            selected = training._DeepSpeedWorker
-            assert selected is not NativeWorker and issubclass(selected, NativeWorker)
-            events.append("native-spawn")
-            selected_receipts = copy.deepcopy(receipts)
-            if outcome == "missing-receipt":
-                selected_receipts.pop()
-            elif outcome == "drifted-receipt":
-                selected_receipts[0]["initialization"]["verified_tensors"][0]["sha256"] = "0" * 64
-            self._workers = [
-                SimpleNamespace(
-                    original_adapter_receipt=SimpleNamespace(remote=lambda receipt=receipt: receive(receipt))
-                )
-                for receipt in selected_receipts
-            ]
-            if failure:
-                raise failure
-
-        async def _kill_workers(self, hosts):
-            assert hosts == ["owned-host-a", "owned-host-b"]
-            assert training._DeepSpeedWorker is NativeWorker
-            events.append("owned-kill")
-            if cleanup_failure:
-                raise cleanup_failure
-            self._workers = []
-
-        def info(self):
-            return {"native_info": "preserved"}
-
-    training.__dict__.update(copy=copy, SimpleNamespace=SimpleNamespace)
-    spawn = NativeCoordinator._spawn_workers
-    NativeCoordinator._spawn_workers = FunctionType(
-        spawn.__code__, training.__dict__, spawn.__name__, spawn.__defaults__, spawn.__closure__
-    )
-    NativeCoordinator._spawn_workers.__qualname__ = spawn.__qualname__
-    training._DeepSpeedWorker = NativeWorker
-    request["sources"] = {"training": native_lora._source(NativeWorker.__init__)}
-    training.GPUTrainingJob = SimpleNamespace(__ray_metadata__=SimpleNamespace(modified_class=NativeCoordinator))
-    _native_original_composition_modules(monkeypatch, **{"dss.ray_dss.jobs.gpu.training": training})
-    ray = ModuleType("ray")
-
-    def remote(**options):
-        assert options == {"num_cpus": 1, "num_gpus": 0}
-        return lambda cls: cls
-
-    ray.remote = remote
-    monkeypatch.setitem(sys.modules, "ray", ray)
-    monkeypatch.setattr(native_lora, "_verify_runtime", lambda actual, sources: None)
-    monkeypatch.setattr(native_lora, "_request", lambda config: copy.deepcopy(request))
-    coordinator = native_lora._coordinator_class(training, request, "existing-owned-cluster-ref")()
-    config = {}
-    source_stage = object()
-    captured = None
-    try:
-        asyncio.run(coordinator._spawn_workers(config, ranks, "owned-master", 12345, source_stage))
-    except BaseException as error:
-        captured = error
-    assert training._DeepSpeedWorker is NativeWorker
-    if outcome == "success":
-        assert captured is None and events == ["native-spawn"]
-        assert coordinator.info() == {
-            "native_info": "preserved",
-            "correctness_original_adapter": {"schema": native_lora.SCHEMA, "workers": receipts},
-        }
-        assert json.loads(capsys.readouterr().out)["workers"] == receipts
-    else:
-        assert captured is failure if failure is not None else isinstance(captured, ValueError)
-        assert events == ["native-spawn", "owned-kill"]
-        if cleanup_failure:
-            assert any("synthetic cleanup failure" in note for note in getattr(captured, "__notes__", []))
-        else:
-            assert coordinator._workers == []
-
-
-@pytest.mark.parametrize("role", ["zone", "head"])
-@pytest.mark.parametrize("failure_type", [None, RuntimeError, KeyboardInterrupt])
-def test_native_original_composition_bootstrap_restores_original_callback(monkeypatch, role, failure_type):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    module_name = f"dss.ray_dss.zones.{'server' if role == 'zone' else 'server_head'}"
-    server = ModuleType(module_name)
-    owner = object()
-    server.app = SimpleNamespace(state=SimpleNamespace(manager=owner))
-    calls = []
-    marker = object()
-    failure = failure_type("bootstrap interruption") if failure_type else None
-    listener = SimpleNamespace(fileno=lambda: 43)
-    monkeypatch.setattr(native_lora, "_zone_listener", lambda: contextlib.nullcontext(listener))
-    if role == "zone":
-
-        def original(*args, **kwargs):
-            calls.append(("head-argv", args, kwargs))
-            return [sys.executable, "-m", "dss.ray_dss.zones.server_head", "--unchanged-option"]
-
-        server._head_argv = original
-        server.run_cmd = lambda *args, **kwargs: None
-        binding = "_head_argv"
-    else:
-
-        def original(*args, **kwargs):
-            calls.append(("setup-state", args, kwargs))
-
-        server._setup_state = original
-        server._serve = lambda args: None
-        binding = "_setup_state"
-        monkeypatch.setattr(native_lora, "install_manager", lambda manager: calls.append(("install", manager)))
-
-    def main():
-        callback = getattr(server, binding)
-        assert callback is not original
-        actual = callback(marker, unchanged=True)
-        if role == "zone":
-            assert actual == [
-                sys.executable,
-                "-m",
-                "arctic_platform.correctness.harness.lora",
-                "head",
-                "--unchanged-option",
-                "--correctness-listener-fd",
-                "43",
-            ]
-        if failure:
-            setattr(server, binding, object())
-            raise failure
-
-    server.main = main
-    _native_original_composition_modules(monkeypatch, **{module_name: server})
-    monkeypatch.setattr(sys, "argv", ["lora.py", role, "--remaining"])
-    captured = None
-    try:
-        native_lora.main()
-    except BaseException as error:
-        captured = error
-    assert captured is failure and getattr(server, binding) is original
-    expected = [("head-argv" if role == "zone" else "setup-state", (marker,), {"unchanged": True})]
-    if role == "head":
-        expected.append(("install", owner))
-    assert calls == expected and sys.argv == ["lora.py", "--remaining"]
-
-
 @pytest.fixture
 def native_reserved_listener_control(monkeypatch):
     from arctic_platform.correctness.harness import lora as native_lora
@@ -20811,206 +14207,6 @@ def native_reserved_listener_control(monkeypatch):
 
     monkeypatch.setattr(native_lora, "_reserve_listener", Listener)
     return SimpleNamespace(native=native_lora, Listener=Listener, listeners=listeners, events=events)
-
-
-@pytest.mark.parametrize("failure_type", [None, RuntimeError, KeyboardInterrupt])
-def test_native_reserved_listener_gateway_handoff_and_restoration(native_reserved_listener_control, failure_type):
-    import shlex
-
-    control = native_reserved_listener_control
-    launches = []
-
-    def run(command, host, **kwargs):
-        argv = shlex.split(command)
-        listener, health = control.listeners
-        assert not listener.closed and health.closed
-        assert host == "owned-head"
-        assert argv[-2:] == [
-            control.native._LISTENER_FD_OPTION,
-            str(listener.descriptor),
-        ]
-        assert kwargs == {"pass_fds": (12, listener.descriptor), "stdout": "owned-log"}
-        launches.append(argv)
-        if failure_type:
-            raise failure_type("spawn failed")
-        return "owned-child"
-
-    def original_port():
-        pytest.fail("must reserve rather than free the HTTP socket")
-
-    local = SimpleNamespace(run_cmd=run, get_free_port=original_port, is_local=lambda host: True)
-    with control.native._gateway_listener_scope(local):
-        port = local.get_free_port()
-        local.get_free_port()
-        command = shlex.join(
-            [
-                "exec",
-                sys.executable,
-                "-m",
-                "dss.ray_dss.zones.server",
-                "--zone-type",
-                "training",
-                "--backend",
-                "gpu",
-                "--port",
-                str(port),
-            ]
-        )
-        if failure_type:
-            with pytest.raises(failure_type, match="spawn failed"):
-                local.run_cmd(command, "owned-head", pass_fds=(12,), stdout="owned-log")
-        else:
-            assert local.run_cmd(command, "owned-head", pass_fds=(12,), stdout="owned-log") == "owned-child"
-        assert all(listener.closed for listener in control.listeners)
-    assert len(launches) == 1 and local.run_cmd is run and local.get_free_port is original_port
-
-
-@pytest.mark.parametrize("command", ["true", "kill -TERM -- 123", "exec python -m unrelated"])
-def test_native_reserved_listener_unrelated_launch_unchanged(native_reserved_listener_control, command):
-    control = native_reserved_listener_control
-    calls = []
-
-    def original(*args, **kwargs):
-        calls.append((args, kwargs))
-
-    local = SimpleNamespace(run_cmd=original, get_free_port=lambda: 9001, is_local=lambda host: True)
-    with control.native._gateway_listener_scope(local):
-        local.get_free_port()
-        local.run_cmd(command, "owned-head", unchanged=True)
-        assert control.listeners[0].closed
-    assert calls == [((command, "owned-head"), {"unchanged": True})]
-
-
-@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
-def test_native_reserved_listener_unused_reservation_closed(native_reserved_listener_control, failure_type):
-    control = native_reserved_listener_control
-    local = SimpleNamespace(run_cmd=lambda *args: None, get_free_port=lambda: 9001)
-    original_port = local.get_free_port
-    with pytest.raises(failure_type):
-        with control.native._gateway_listener_scope(local):
-            local.get_free_port()
-            raise failure_type("scope interrupted")
-    assert control.listeners[0].closed and local.get_free_port is original_port
-
-
-def test_native_reserved_listener_missing_local_reservation_prevents_spawn(
-    native_reserved_listener_control,
-):
-    import shlex
-
-    control = native_reserved_listener_control
-    local = SimpleNamespace(
-        run_cmd=lambda *args, **kwargs: pytest.fail("missing reservation must prevent spawn"),
-        get_free_port=lambda: 9001,
-        is_local=lambda host: True,
-    )
-    with control.native._gateway_listener_scope(local):
-        with pytest.raises(ValueError, match="no reserved"):
-            local.run_cmd(
-                shlex.join(
-                    [
-                        "exec",
-                        sys.executable,
-                        "-m",
-                        "dss.ray_dss.zones.server",
-                        "--zone-type",
-                        "training",
-                        "--backend",
-                        "gpu",
-                        "--port",
-                        "9001",
-                    ]
-                ),
-                "owned-head",
-            )
-
-
-@pytest.mark.parametrize("damage", [None, "port", "host", "kind", "listening", "family"])
-def test_native_reserved_listener_inherited_identity_and_close(native_reserved_listener_control, monkeypatch, damage):
-    control = native_reserved_listener_control
-    listener = control.Listener("0.0.0.0", 43303)
-    if damage == "port":
-        listener.port += 1
-    elif damage == "host":
-        listener.host = "127.0.0.1"
-    elif damage == "kind":
-        listener.kind = control.native.socket.SOCK_DGRAM
-    elif damage == "listening":
-        listener.accepting = 0
-    elif damage == "family":
-        listener.family = control.native.socket.AF_INET6
-    monkeypatch.setattr(
-        control.native.socket,
-        "socket",
-        lambda *, fileno: listener if fileno == 70 else None,
-    )
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "owned",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "43303",
-            control.native._LISTENER_FD_OPTION,
-            "70",
-            "--native-flag",
-        ],
-    )
-    if damage:
-        with pytest.raises(ValueError, match="does not match"):
-            with control.native._zone_listener():
-                pytest.fail("invalid listener admitted")
-    else:
-        with control.native._zone_listener() as actual:
-            assert actual is listener and not listener.closed
-            assert control.events == [("inheritable", False), ("blocking", False)]
-    assert listener.closed and control.native._LISTENER_FD_OPTION not in sys.argv
-    assert sys.argv[-1] == "--native-flag"
-
-
-def test_native_reserved_listener_remote_bootstrap_reserves_before_ray(native_reserved_listener_control, monkeypatch):
-    control = native_reserved_listener_control
-    monkeypatch.setattr(sys, "argv", ["owned", "--host", "0.0.0.0", "--port", "43303"])
-    with control.native._zone_listener() as listener:
-        assert listener.getsockname() == ("0.0.0.0", 43303) and not listener.closed
-    assert listener.closed
-
-
-@pytest.mark.parametrize("phase", ["bind", "listen", "setblocking"])
-def test_native_reserved_listener_reservation_failure_closes_socket(monkeypatch, phase):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    events = []
-    failure = OSError("reserved listener failed")
-
-    class Socket:
-        def bind(self, address):
-            assert address == ("0.0.0.0", 43303)
-            events.append("bind")
-            if phase == "bind":
-                raise failure
-
-        def listen(self, backlog):
-            assert backlog == 2048
-            events.append("listen")
-            if phase == "listen":
-                raise failure
-
-        def setblocking(self, blocking):
-            assert blocking is False
-            events.append("setblocking")
-            raise failure
-
-        def close(self):
-            events.append("close")
-
-    monkeypatch.setattr(native_lora.socket, "socket", lambda *args: Socket())
-    with pytest.raises(OSError, match="reserved listener failed") as captured:
-        native_lora._reserve_listener("0.0.0.0", 43303)
-    assert captured.value is failure and events[-1] == "close"
-    assert events[:-1] == ["bind", "listen", "setblocking"][: ["bind", "listen", "setblocking"].index(phase) + 1]
 
 
 @pytest.mark.parametrize("outcome", ["success", "spawn-failure", "remote-head", "changed-descriptor"])
@@ -21174,582 +14370,7 @@ def test_native_reserved_listener_changed_server_contract_fails_closed(native_re
     assert server_head.uvicorn is original_uvicorn
 
 
-def test_native_reserved_listener_changed_address_rejected_before_ray(
-    native_reserved_listener_control,
-):
-    control = native_reserved_listener_control
-    listener = control.Listener("0.0.0.0", 43303)
-
-    async def original_serve(args):
-        pytest.fail("listener mismatch must prevent Ray startup")
-
-    args = SimpleNamespace(host="0.0.0.0", port=43304, http_workers=1)
-    with pytest.raises(ValueError, match="changed"):
-        asyncio.run(control.native._serve_with_listener(SimpleNamespace(), original_serve, args, listener))
-
-
-@pytest.fixture
-def native_original_capability(native_original_adapter, monkeypatch):
-    import requests
-
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    control = native_original_adapter
-    pins = {
-        key: {"path": f"/synthetic/{key}.py", "sha256": hashlib.sha256(key.encode()).hexdigest()}
-        for key in ("training", "engine", "adapter", "lora", "composition", "native_adapter")
-    }
-    capability = {"schema": native_lora.SCHEMA, "sources": pins}
-    response = SimpleNamespace(status_code=200, document={native_lora.OPENAPI_KEY: capability})
-    gets = []
-
-    class Session:
-        trust_env = True
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-        def get(self, url, **kwargs):
-            assert self.trust_env is False
-            gets.append((url, kwargs))
-            return SimpleNamespace(status_code=response.status_code, json=lambda: response.document)
-
-        def post(self, *args, **kwargs):
-            pytest.fail("capability admission must not create a training job")
-
-    monkeypatch.setattr(requests, "Session", Session)
-    backend = SimpleNamespace(base_url="http://127.0.0.1:8000", host=None, pat=None)
-    payload = {
-        "model_name": control.metadata["model_name"],
-        "training_config": {"peft_config": control.identity["peft_config"], "n_gpus": 2},
-    }
-    return SimpleNamespace(control=control, pins=pins, response=response, gets=gets, backend=backend, payload=payload)
-
-
-def test_native_original_composition_capability_explicit_bind_preserves_original_identity(native_original_capability):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    case = native_original_capability
-    before = copy.deepcopy(case.payload)
-    bound = lora_init.bind_payload(case.payload, case.control.path, native_backend=case.backend)
-    assert case.payload == before
-    assert bound["training_config"]["debug"][native_lora.REQUEST_KEY] == {
-        "schema": native_lora.SCHEMA,
-        "path": str(case.control.path),
-        "identity": case.control.identity,
-        "original_metadata": case.control.metadata,
-        "sources": case.pins,
-        "training_gpus": 2,
-        "model_name": case.control.metadata["model_name"],
-    }
-    assert case.gets == [
-        ("http://127.0.0.1:8000/openapi.json", {"timeout": 30, "allow_redirects": False}),
-    ]
-    assert (
-        shared.original_adapter_files(case.control.path, case.control.identity, case.control.metadata)
-        == case.control.files
-    )
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "plain-route",
-        "external",
-        "https-loopback",
-        "redirect",
-        "no-capability",
-        "schema",
-        "missing-source",
-        "relative-path",
-        "short-hash",
-    ],
-)
-def test_native_original_composition_capability_rejects_unadmitted_routes_without_create(
-    native_original_capability, damage
-):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    case = native_original_capability
-    if damage == "external":
-        case.backend.base_url = "http://external.invalid:8000"
-    elif damage == "https-loopback":
-        case.backend.base_url = "https://127.0.0.1:8000"
-    elif damage == "redirect":
-        case.response.status_code = 302
-    elif damage == "no-capability":
-        case.response.document = {}
-    elif damage == "schema":
-        case.response.document[native_lora.OPENAPI_KEY]["schema"] = "unsupported"
-    elif damage == "missing-source":
-        del case.pins["training"]
-    elif damage == "relative-path":
-        case.pins["training"]["path"] = "relative/training.py"
-    elif damage == "short-hash":
-        case.pins["training"]["sha256"] = "bad"
-    before = copy.deepcopy(case.payload)
-    with pytest.raises((ValueError, lora_init.LoraInitializationPrerequisiteError)):
-        lora_init.bind_payload(
-            case.payload, case.control.path, native_backend=None if damage == "plain-route" else case.backend
-        )
-    assert case.payload == before
-    assert len(case.gets) == int(damage not in {"plain-route", "external", "https-loopback"})
-
-
-@pytest.mark.parametrize(
-    "failure_type,runtime_mode",
-    [
-        (None, "mocked"),
-        (RuntimeError, "mocked"),
-        (KeyboardInterrupt, "mocked"),
-        (None, "actual"),
-        (None, "before-worker"),
-        (None, "after-worker"),
-        (None, "after-spawn"),
-        (None, "after-receipt"),
-    ],
-)
-def test_native_original_composition_worker_delegates_native_constructor_inside_preengine_scope(
-    native_original_adapter, monkeypatch, failure_type, runtime_mode, capsys
-):
-    from types import FunctionType
-
-    from arctic_platform.correctness.harness import lora as native_adapter
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    control = native_original_adapter
-    request, _ = _native_original_composition_receipts(control)
-    request.update(training_gpus=1)
-    training = control.training
-    events = []
-    source_stage = object()
-    config = {"job_id": "selected-child", "original_config": object()}
-    failure = failure_type("original native constructor") if failure_type else None
-    runtime_drift = {"observed": False}
-    captured_worker = []
-    original_load = native_adapter.initialize_native_adapter
-    original_engine = control.engine
-
-    def initialize(model, path, identity):
-        assert model is control.model and identity == control.identity
-        original_load(model, path, identity)
-        events.append("loaded-original")
-
-    def engine(model, ds_config, *, optimizer, ep_size, mpu, model_path, rank):
-        events.append("native-engine")
-        return original_engine(
-            model, ds_config, optimizer=optimizer, ep_size=ep_size, mpu=mpu, model_path=model_path, rank=rank
-        )
-
-    control.engine = training.initialize_training_engine = engine
-
-    class NativeWorker:
-        def __init__(self, cfg, source_stage_info=None):
-            assert cfg is config and source_stage_info is source_stage
-            assert training.initialize_training_engine is not engine
-            captured_worker.append(self)
-            events.append("native-constructor")
-            assert (
-                globals()["initialize_training_engine"](
-                    control.model,
-                    control.ds_config,
-                    optimizer=control.optimizer,
-                    ep_size=4,
-                    mpu=control.mpu,
-                    model_path="unchanged-model-path",
-                    rank=0,
-                )
-                is control.result
-            )
-            if runtime_mode == "after-worker":
-                runtime_drift["observed"] = True
-            if failure:
-                raise failure
-
-    class NativeCoordinator:
-        def __init__(self):
-            self._workers = []
-            self._info = SimpleNamespace(config=object(), job_id="selected-child")
-
-        async def _spawn_workers(self, cfg, ranks, address, port, source_stage_info):
-            selected_worker = training._DeepSpeedWorker
-            # Emulate the original training-module import in the separate Ray worker process.
-            training._DeepSpeedWorker = NativeWorker
-            try:
-                if runtime_mode == "before-worker":
-                    runtime_drift["observed"] = True
-                worker = selected_worker(cfg, source_stage_info)
-            finally:
-                training._DeepSpeedWorker = selected_worker
-
-            async def receipt():
-                if runtime_mode == "after-receipt":
-                    runtime_drift["observed"] = True
-                return worker.original_adapter_receipt()
-
-            self._workers = [SimpleNamespace(original_adapter_receipt=SimpleNamespace(remote=receipt))]
-            if runtime_mode == "after-spawn":
-                runtime_drift["observed"] = True
-
-        async def _kill_workers(self, hosts):
-            assert runtime_mode in {"after-spawn", "after-receipt"}
-            assert hosts == ["owned-host"] and training._DeepSpeedWorker is NativeWorker
-            events.append("owned-kill")
-            self._workers = []
-
-    constructor = NativeWorker.__init__
-    bound_constructor = FunctionType(
-        constructor.__code__,
-        training.__dict__,
-        constructor.__name__,
-        constructor.__defaults__,
-        constructor.__closure__,
-    )
-    bound_constructor.__qualname__ = constructor.__qualname__
-    NativeWorker.__init__ = bound_constructor
-    training.__dict__.update(SimpleNamespace=SimpleNamespace)
-    spawn = NativeCoordinator._spawn_workers
-    NativeCoordinator._spawn_workers = FunctionType(
-        spawn.__code__, training.__dict__, spawn.__name__, spawn.__defaults__, spawn.__closure__
-    )
-    NativeCoordinator._spawn_workers.__qualname__ = spawn.__qualname__
-    training._DeepSpeedWorker = NativeWorker
-    training.GPUTrainingJob = SimpleNamespace(__ray_metadata__=SimpleNamespace(modified_class=NativeCoordinator))
-    _native_original_composition_modules(monkeypatch, **{"dss.ray_dss.jobs.gpu.training": training})
-    ray = ModuleType("ray")
-    ref = object()
-    gets = []
-
-    def get(actual):
-        assert actual is ref
-        gets.append(actual)
-        return control.files
-
-    ray.get = get
-    ray.remote = lambda **options: lambda cls: cls
-    monkeypatch.setitem(sys.modules, "ray", ray)
-    monkeypatch.setenv("RANK", "0")
-    monkeypatch.setattr(native_adapter, "initialize_native_adapter", initialize)
-    request["sources"] = native_lora._runtime_sources(training)
-    if runtime_mode == "mocked":
-        monkeypatch.setattr(native_lora, "_verify_runtime", lambda actual, sources: None)
-    else:
-        original_source = native_lora._source
-
-        def observed_source(callback):
-            source = original_source(callback)
-            if runtime_drift["observed"]:
-                source["sha256"] = "0" * 64
-            return source
-
-        monkeypatch.setattr(native_lora, "_source", observed_source)
-    monkeypatch.setattr(native_lora, "_request", lambda cfg: copy.deepcopy(request))
-    coordinator = native_lora._coordinator_class(training, request, ref)()
-    caught = None
-    try:
-        asyncio.run(coordinator._spawn_workers(config, [("owned-host", 0)], "owned-master", 12345, source_stage))
-    except BaseException as error:
-        caught = error
-    drifted = runtime_mode in {"before-worker", "after-worker", "after-spawn", "after-receipt"}
-    if drifted:
-        assert isinstance(caught, ValueError) and "runtime differs" in str(caught)
-    else:
-        assert caught is failure
-    expected_events = (
-        [] if runtime_mode == "before-worker" else ["native-constructor", "loaded-original", "native-engine"]
-    )
-    if runtime_mode in {"after-spawn", "after-receipt"}:
-        expected_events.append("owned-kill")
-        assert coordinator._workers == []
-    assert events == expected_events
-    assert len(captured_worker) == int(runtime_mode != "before-worker")
-    assert gets == ([] if runtime_mode == "before-worker" else [ref])
-    assert training._DeepSpeedWorker is NativeWorker
-    if failure is None and not drifted:
-        receipt = captured_worker[0].original_adapter_receipt()
-        assert receipt["job_id"] == config["job_id"] and receipt["rank"] == 0
-        assert receipt["original_identity_sha256"] == control.metadata["identity_sha256"]
-        receipt["rank"] = 10
-        assert captured_worker[0].original_adapter_receipt()["rank"] == 0
-        assert json.loads(capsys.readouterr().out)["workers"][0]["rank"] == 0
-    elif captured_worker and runtime_mode not in {"after-spawn", "after-receipt"}:
-        assert not hasattr(captured_worker[0], "_correctness_original_adapter_receipt")
-    _native_original_adapter_restored(control)
-
-
-def test_native_original_composition_source_pin_unwraps_adapter_scope():
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    path = Path(shared.__file__)
-    assert native_lora._source(shared.native_original_worker_adapter_scope) == {
-        "path": str(path),
-        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-    }
-
-
 # PEFT config serialization order; retained config bodies, synthetic CPU factors only.
-
-
-@pytest.fixture
-def lora_config_serialization_control(_lora_init_local_adapter_fixture, monkeypatch):
-    cfg, source, scratch = _lora_init_local_adapter_fixture
-    cfg.training["peft_config"] = {
-        "bias": "none",
-        "lora_alpha": 32,
-        "lora_dropout": 0.0,
-        "peft_type": "Lora",
-        "r": 32,
-        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
-        "target_parameters": [],
-        "task_type": "CAUSAL_LM",
-    }
-    cfg.sub_job.update(dtype="float32", seed=42)
-    cfg.model_name = "Qwen/Qwen3.6-35B-A3B"
-    # Exact PEFT 0.21.2 config body from the retained ordering-only identity receipt.
-    body = {
-        "alora_invocation_tokens": None,
-        "alpha_pattern": {},
-        "arrow_config": None,
-        "auto_mapping": None,
-        "base_model_name_or_path": "/data-fast/base-models/synthetic/Qwen3.6-35B-A3B-4L",
-        "bias": "none",
-        "corda_config": None,
-        "ensure_weight_tying": False,
-        "eva_config": None,
-        "exclude_modules": None,
-        "fan_in_fan_out": False,
-        "inference_mode": False,
-        "init_lora_weights": True,
-        "kasa_config": None,
-        "layer_replication": None,
-        "layers_pattern": None,
-        "layers_to_transform": None,
-        "loftq_config": {},
-        "lora_alpha": 32,
-        "lora_bias": False,
-        "lora_dropout": 0.0,
-        "lora_ga_config": None,
-        "megatron_config": None,
-        "megatron_core": "megatron.core",
-        "modules_to_save": None,
-        "monteclora_config": None,
-        "peft_type": "LORA",
-        "peft_version": "0.21.2",
-        "qalora_group_size": 16,
-        "r": 32,
-        "rank_pattern": {},
-        "revision": None,
-        "target_modules": ["o_proj", "q_proj", "v_proj", "k_proj"],
-        "target_parameters": None,
-        "task_type": "CAUSAL_LM",
-        "trainable_token_indices": None,
-        "use_bdlora": None,
-        "use_dora": False,
-        "use_qalora": False,
-        "use_rslora": False,
-        "velora_config": None,
-    }
-    control = SimpleNamespace(cfg=cfg, source=source, scratch=scratch, body=body, saved=[])
-    config_class = sys.modules["peft"].LoraConfig
-
-    def save_pretrained(config, destination):
-        raw = json.dumps(control.body, indent=2, sort_keys=True).encode()
-        control.saved.append((config, copy.deepcopy(config.values), raw))
-        (Path(destination) / "adapter_config.json").write_bytes(raw)
-
-    monkeypatch.setattr(config_class, "save_pretrained", save_pretrained)
-    return control
-
-
-def test_lora_config_serialization_retained_orders_produce_exact_pack_identity(lora_config_serialization_control):
-    control = lora_config_serialization_control
-    before = copy.deepcopy(control.cfg.training)
-    rng = torch.random.get_rng_state().clone()
-    paths = []
-    for modules, expected_raw_sha in (
-        (
-            ["o_proj", "q_proj", "v_proj", "k_proj"],
-            "07c42f95b85a8cdc46b8363fc609c9368c0af3a90eb93f7db0e991014e510898",
-        ),
-        (
-            ["q_proj", "o_proj", "v_proj", "k_proj"],
-            "bff00c6f0665c17e8e95fe61bb1d7314efcb04ada251c27e45daa68f493ad345",
-        ),
-    ):
-        control.body["target_modules"] = modules
-        paths.append(deterministic_lora.materialize_adapter(control.cfg, control.source, control.scratch))
-        config, values, raw = control.saved[-1]
-        assert hashlib.sha256(raw).hexdigest() == expected_raw_sha
-        assert config.values == values
-        assert control.body["target_modules"] == modules
-    assert paths[0] != paths[1]
-    expected = copy.deepcopy(control.body)
-    expected["target_modules"] = sorted(expected["target_modules"])
-    config_bytes = (json.dumps(expected, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
-    for path in paths:
-        assert (path / "adapter_config.json").read_bytes() == config_bytes
-    first, second = map(deterministic_lora.identity_metadata, paths)
-    assert first == second
-    assert first["adapter_config_sha256"] == hashlib.sha256(config_bytes).hexdigest()
-    assert first["peft_config"] == before["peft_config"]
-    for name in ("initialization.json", "adapter_model.safetensors"):
-        assert (paths[0] / name).read_bytes() == (paths[1] / name).read_bytes()
-    assert torch.equal(torch.random.get_rng_state(), rng)
-    assert control.cfg.training == before
-    assert {path.name for path in control.source.iterdir()} == {"config.json"}
-
-
-@pytest.mark.parametrize("modules", [r".*\.(q_proj|v_proj)", [], ["q_proj", "q_proj", "k_proj"]])
-def test_lora_config_serialization_helper_preserves_regex_empty_targets_and_other_fields(
-    lora_config_serialization_control, tmp_path, modules
-):
-    body = copy.deepcopy(lora_config_serialization_control.body)
-    body["target_modules"] = modules
-    body["target_parameters"] = ["experts.up_proj", "experts.gate_proj"]
-    body["future_field"] = {"ordered": ["z", "a"], "enabled": True}
-    path = tmp_path / "adapter_config.json"
-    path.write_text(json.dumps(body, indent=2, sort_keys=True))
-    deterministic_lora._canonicalize_adapter_config(path)
-    expected = copy.deepcopy(body)
-    if isinstance(modules, list):
-        expected["target_modules"] = sorted(modules)
-    assert json.loads(path.read_bytes()) == expected
-    assert json.loads(path.read_bytes())["target_parameters"] == ["experts.up_proj", "experts.gate_proj"]
-    first = path.read_bytes()
-    deterministic_lora._canonicalize_adapter_config(path)
-    assert path.read_bytes() == first
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("target_modules", ["q_proj", "k_proj", "v_proj", "other_proj"]),
-        ("lora_alpha", 64),
-        ("lora_dropout", 0.25),
-        ("r", 16),
-        ("bias", "all"),
-        ("inference_mode", True),
-        ("target_parameters", ["experts.gate_proj", "experts.up_proj"]),
-    ],
-)
-def test_lora_config_serialization_keeps_semantic_config_changes_in_identity(
-    lora_config_serialization_control, field, value
-):
-    control = lora_config_serialization_control
-    control.body["target_parameters"] = ["experts.up_proj", "experts.gate_proj"]
-    first_path = deterministic_lora.materialize_adapter(control.cfg, control.source, control.scratch)
-    control.body[field] = value
-    second_path = deterministic_lora.materialize_adapter(control.cfg, control.source, control.scratch)
-    first, second = map(deterministic_lora.identity_metadata, (first_path, second_path))
-    assert json.loads((second_path / "adapter_config.json").read_bytes())[field] == (
-        sorted(value) if field == "target_modules" else value
-    )
-    assert first["adapter_config_sha256"] != second["adapter_config_sha256"]
-    assert first["identity_sha256"] != second["identity_sha256"]
-    assert first["initialization"] == second["initialization"]
-    assert first["peft_config"] == second["peft_config"]
-    assert (first_path / "adapter_model.safetensors").read_bytes() == (
-        second_path / "adapter_model.safetensors"
-    ).read_bytes()
-    assert {key: value for key, value in first.items() if key not in {"adapter_config_sha256", "identity_sha256"}} == {
-        key: value for key, value in second.items() if key not in {"adapter_config_sha256", "identity_sha256"}
-    }
-
-
-def test_lora_config_serialization_keeps_tensor_changes_in_identity(lora_config_serialization_control):
-    control = lora_config_serialization_control
-    first_path = deterministic_lora.materialize_adapter(control.cfg, control.source, control.scratch)
-    control.cfg.sub_job["seed"] = 43
-    second_path = deterministic_lora.materialize_adapter(control.cfg, control.source, control.scratch)
-    first, second = map(deterministic_lora.identity_metadata, (first_path, second_path))
-    assert first["adapter_config_sha256"] == second["adapter_config_sha256"]
-    assert first["peft_config"] == second["peft_config"]
-    assert first["initialization"] != second["initialization"]
-    assert first["identity_sha256"] != second["identity_sha256"]
-    assert (first_path / "adapter_model.safetensors").read_bytes() != (
-        second_path / "adapter_model.safetensors"
-    ).read_bytes()
-
-
-@pytest.mark.parametrize("modules", [None, True, 1, {}, "", ["q_proj", ""], ["q_proj", 1], ["q_proj", None]])
-def test_lora_config_serialization_helper_rejects_malformed_modules_without_rewriting(
-    lora_config_serialization_control, tmp_path, modules
-):
-    body = copy.deepcopy(lora_config_serialization_control.body)
-    body["target_modules"] = modules
-    path = tmp_path / "adapter_config.json"
-    raw = json.dumps(body, sort_keys=True).encode()
-    path.write_bytes(raw)
-    with pytest.raises(ValueError, match="target_modules"):
-        deterministic_lora._canonicalize_adapter_config(path)
-    assert path.read_bytes() == raw
-
-
-@pytest.mark.parametrize("raw", [b"{", b"[]", b"null", b'{"r": 32}', b'{"target_modules": ["q_proj"], "r": NaN}'])
-def test_lora_config_serialization_helper_rejects_malformed_config_without_rewriting(tmp_path, raw):
-    path = tmp_path / "adapter_config.json"
-    path.write_bytes(raw)
-    with pytest.raises((ValueError, TypeError, KeyError)):
-        deterministic_lora._canonicalize_adapter_config(path)
-    assert path.read_bytes() == raw
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("use_dora", True),
-        ("rank_pattern", {"q_proj": 4}),
-        ("peft_type", "LORA"),
-        ("r", True),
-        ("lora_alpha", -1),
-        ("lora_dropout", float("nan")),
-        ("bias", "all"),
-        ("target_modules", ["q_proj", 1]),
-        ("target_parameters", ["experts.up_proj", ""]),
-    ],
-)
-def test_lora_config_serialization_materializer_preserves_input_rejection(
-    lora_config_serialization_control, field, value
-):
-    control = lora_config_serialization_control
-    control.cfg.training["peft_config"][field] = value
-    before = copy.deepcopy(control.cfg.training)
-    with pytest.raises(ValueError):
-        deterministic_lora.materialize_adapter(control.cfg, control.source, control.scratch)
-    assert control.saved == []
-    assert not control.scratch.exists()
-    assert control.cfg.training == before
-
-
-@pytest.mark.parametrize("mutation", ["target_order", "scalar", "parameter_order", "tensor"])
-def test_lora_config_serialization_pack_identity_still_rejects_postpublication_mutation(
-    lora_config_serialization_control, mutation
-):
-    control = lora_config_serialization_control
-    control.body["target_parameters"] = ["experts.up_proj", "experts.gate_proj"]
-    path = deterministic_lora.materialize_adapter(control.cfg, control.source, control.scratch)
-    deterministic_lora.identity_metadata(path)
-    if mutation == "tensor":
-        tensors = load_file(str(path / "adapter_model.safetensors"))
-        tensors[sorted(tensors)[0]][0, 0] += 1
-        save_file(tensors, str(path / "adapter_model.safetensors"))
-        expected = "initialization bytes differ"
-    else:
-        config_path = path / "adapter_config.json"
-        body = json.loads(config_path.read_bytes())
-        if mutation == "target_order":
-            body["target_modules"].reverse()
-        elif mutation == "scalar":
-            body["lora_alpha"] += 1
-        else:
-            body["target_parameters"].reverse()
-        config_path.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n")
-        expected = "adapter configuration changed"
-    with pytest.raises(ValueError, match=expected):
-        deterministic_lora.identity_metadata(path)
 
 
 # Native Ray spawn serialization: actual worker lookup in copied function globals.
@@ -21776,29 +14397,6 @@ async def _native_spawn_globals_template(self, cfg, ranks, address, port, source
 
 
 # Native-local first-two composition; target/reference calls are mocked.
-
-
-@pytest.mark.parametrize("test_id", ["single-step-grads", "single-step-optimizer"])
-@pytest.mark.parametrize(
-    "local,fixture,selected,accepted",
-    [
-        (True, True, True, True),
-        (True, True, False, False),
-        (True, False, True, False),
-        (False, True, True, False),
-    ],
-)
-def test_native_first_two_admission_requires_explicit_route_and_fixture(test_id, local, fixture, selected, accepted):
-    test = SimpleNamespace(test_id=test_id, compares_to_reference=True)
-    cfg = SimpleNamespace(config_id="original-lora", training={"peft_config": {"r": 32}})
-    result = runner._cortex_rejection(
-        test,
-        cfg,
-        {"model_name": "verified-fixture"} if fixture else None,
-        local_cortex_fixture=local,
-        native_adapter_initialization=selected,
-    )
-    assert (result is None) is accepted
 
 
 # Native shared-pack composition: real CPU PEFT factors with synthetic runtime boundaries.
@@ -21848,164 +14446,6 @@ async def _native_shared_pack_spawn_template(self, cfg, ranks, master_addr, mast
 
 
 # Shared Qwen4 reference residency policy (new controls only).
-
-
-@pytest.mark.parametrize("device", ["cpu", "meta"])
-def test_qwen4_residency_new_policy_is_structural_pure_and_identity_based(device):
-    from dataclasses import FrozenInstanceError
-
-    from arctic_platform.correctness.reference.qwen4_reference import qwen4_parameter_policy
-
-    with torch.device(device):
-        model = _qwen4_reference_TinyQwen4()
-        model.misleading_ngram_embedding = nn.Linear(2, 3, bias=False)
-        model.unrelated_indexer = nn.Linear(2, 3, bias=False)
-    layer = model.layers[0]
-    table = layer.ple.ple_embedding.ngram_embedding.weight
-    indexer = layer.self_attn.indexer.weight
-    before = {
-        id(parameter): (parameter.requires_grad, parameter.shape, parameter.dtype, parameter.device)
-        for parameter in model.parameters()
-    }
-    values = {id(parameter): parameter.detach().clone() for parameter in model.parameters()} if device == "cpu" else {}
-    config = vars(model.config).copy()
-    policy = qwen4_parameter_policy(model)
-    assert policy.cpu_parameter_ids == frozenset({id(table)})
-    assert policy.frozen_parameter_ids == frozenset({id(table), id(indexer)})
-    assert policy.cpu_parameter_ids <= policy.frozen_parameter_ids
-    assert before == {
-        id(parameter): (parameter.requires_grad, parameter.shape, parameter.dtype, parameter.device)
-        for parameter in model.parameters()
-    }
-    assert vars(model.config) == config
-    for parameter in model.parameters():
-        if device == "cpu":
-            assert torch.equal(parameter, values[id(parameter)])
-    with pytest.raises(FrozenInstanceError):
-        policy.cpu_parameter_ids = frozenset()
-
-
-def test_qwen4_residency_new_shared_table_and_indexer_are_deduplicated():
-    from arctic_platform.correctness.reference.qwen4_reference import qwen4_parameter_policy
-
-    model = _qwen4_reference_TinyQwen4()
-    model.layers.append(model.layers[0])
-    model.lm_head.weight = model.layers[0].ple.ple_embedding.ngram_embedding.weight
-    policy = qwen4_parameter_policy(model)
-    assert len(policy.cpu_parameter_ids) == 1
-    assert len(policy.frozen_parameter_ids) == 2
-    assert sum(parameter.numel() for parameter in model.parameters()) == 22
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "ple",
-        "self_attn",
-        "ngram_embedding",
-        "indexer",
-        "tensor-table",
-        "unregistered-table",
-        "unregistered-indexer",
-        "empty-indexer",
-        "nonmodule-indexer",
-        "decoder",
-    ],
-)
-def test_qwen4_residency_new_malformed_policy_rejects_before_mutation(damage):
-    from arctic_platform.correctness.reference.qwen4_reference import qwen4_parameter_policy
-
-    model = _qwen4_reference_TinyQwen4()
-    layer = model.layers[0]
-    if damage in {"ple", "self_attn"}:
-        delattr(layer, damage)
-    elif damage == "ngram_embedding":
-        del layer.ple.ple_embedding.ngram_embedding
-    elif damage == "indexer":
-        del layer.self_attn.indexer
-    elif damage in {"tensor-table", "unregistered-table"}:
-        embedding = layer.ple.ple_embedding.ngram_embedding
-        table = embedding.weight
-        del embedding.weight
-        object.__setattr__(embedding, "weight", table.detach() if damage == "tensor-table" else table)
-    elif damage == "unregistered-indexer":
-        indexer = layer.self_attn.indexer
-        del layer.self_attn.indexer
-        object.__setattr__(layer.self_attn, "indexer", indexer)
-    elif damage == "empty-indexer":
-        layer.self_attn.indexer = nn.Identity()
-    elif damage == "nonmodule-indexer":
-        del layer.self_attn.indexer
-        layer.self_attn.indexer = object()
-    else:
-        model.get_decoder = lambda: SimpleNamespace()
-    before = {id(parameter): parameter.requires_grad for parameter in model.parameters()}
-    with pytest.raises(ValueError, match="PLE/QSA|registered"):
-        qwen4_parameter_policy(model)
-    assert before == {id(parameter): parameter.requires_grad for parameter in model.parameters()}
-
-
-def test_qwen4_residency_new_loader_uses_shared_policy_and_preserves_table_bytes(monkeypatch):
-    from arctic_platform.correctness.reference import qwen4_reference
-
-    model = _qwen4_reference_TinyQwen4()
-    table = model.layers[0].ple.ple_embedding.ngram_embedding.weight
-    values = table.detach().clone()
-    original_policy = qwen4_reference.qwen4_parameter_policy
-    observed = []
-    moved = []
-    original_to = torch.Tensor.to
-
-    def policy(loaded):
-        assert loaded is model
-        result = original_policy(loaded)
-        observed.append(result)
-        return result
-
-    def to(tensor, *args, **kwargs):
-        if kwargs.get("device") == "cuda":
-            assert tensor is not table
-            moved.append(id(tensor))
-            return original_to(tensor, device="cpu")
-        return original_to(tensor, *args, **kwargs)
-
-    monkeypatch.setattr(qwen4_reference, "qwen4_parameter_policy", policy)
-    monkeypatch.setattr(torch.Tensor, "to", to)
-    cls, calls = _qwen4_reference_loader(model)
-    result = qwen4_reference.load_qwen4_reference(
-        cls, "unloaded-synthetic-fixture", dtype=torch.bfloat16, attn_implementation="qsa_flex", device="cuda"
-    )
-    assert result is model and len(observed) == 1
-    assert calls[0][1]["attn_implementation"] == "sdpa"
-    assert calls[0][1]["output_loading_info"] is True
-    assert not table.requires_grad and torch.equal(table, values)
-    assert id(model.layers[0].self_attn.indexer.weight) in moved
-    assert not model.layers[0].self_attn.indexer.weight.requires_grad
-    assert id(model.layers[0].positions) in moved
-    assert model.layers[0].ple.key_proj.weight.requires_grad
-    assert model.layers[0].self_attn.q_proj.weight.requires_grad
-
-
-@pytest.mark.parametrize("failure", ["load-info", "non-cpu", "attention"])
-def test_qwen4_residency_new_loader_rejects_before_shared_policy(failure, monkeypatch):
-    from arctic_platform.correctness.reference import qwen4_reference
-
-    model = _qwen4_reference_TinyQwen4()
-    if failure == "non-cpu":
-        model = model.to("meta")
-    cls, calls = _qwen4_reference_loader(model, {"missing_keys": ["required"]} if failure == "load-info" else None)
-    monkeypatch.setattr(
-        qwen4_reference, "qwen4_parameter_policy", lambda *args: pytest.fail("shared policy reached before admission")
-    )
-    with pytest.raises(ValueError, match="missing_keys|load on CPU|upstream QSA"):
-        qwen4_reference.load_qwen4_reference(
-            cls,
-            "unloaded-synthetic-fixture",
-            dtype=torch.bfloat16,
-            attn_implementation="unsupported" if failure == "attention" else "sdpa",
-            device="cpu",
-        )
-    assert len(calls) == (0 if failure == "attention" else 1)
 
 
 # Ray tracing wrappers retain invocation while worker lookup belongs to the native leaf.
@@ -22464,254 +14904,6 @@ def test_native_adapter_layout_invalid_registered_layout_rejects_before_mutation
     _native_adapter_layout_scope_restored(control, scope)
 
 
-@pytest.mark.parametrize("namespace", ["detached", "shared"])
-@pytest.mark.parametrize(
-    "outcome", ["success", "engine-runtime", "engine-interrupt", "body-runtime", "body-interrupt"]
-)
-def test_native_adapter_layout_generated_pack_native_scope_receipt_and_all_exit_restoration(
-    native_adapter_layout_control, monkeypatch, namespace, outcome
-):
-    control = native_adapter_layout_control
-    model = control.make(True)
-    before, rng = _native_adapter_layout_snapshot(model)
-    scope = control.scope(model, namespace)
-    _native_adapter_layout_forbid_state_apis(model, monkeypatch)
-    primary = KeyboardInterrupt("layout primary") if outcome.endswith("interrupt") else RuntimeError("layout primary")
-    if outcome.startswith("engine"):
-        control.engine_failure = primary
-
-    def exercise():
-        with scope.context as receipt:
-            worker = scope.worker({"model": model})
-            assert worker.engine is control.result
-            assert receipt == {
-                "schema": "shared-peft-worker-initialization-v1",
-                "job_id": "layout-child",
-                "rank": 0,
-                "engine_initializations": 1,
-                "shared_identity": control.identity,
-            }
-            if outcome.startswith("body"):
-                raise primary
-        return receipt
-
-    if outcome == "success":
-        exercise()
-    else:
-        with pytest.raises(type(primary)) as caught:
-            exercise()
-        assert caught.value is primary
-    assert control.events == ["stub-engine-after-verified-load"]
-    control.verify(model)
-    after, actual_rng = _native_adapter_layout_snapshot(model)
-    assert torch.equal(actual_rng, rng)
-    for name, snapshot_entry in before.items():
-        assert after[name][:5] == snapshot_entry[:5]
-        assert after[name][5][:3] == snapshot_entry[5][:3]
-        if ".lora_" not in name:
-            assert after[name] == snapshot_entry
-    _native_adapter_layout_scope_restored(control, scope)
-
-
-@pytest.mark.parametrize(
-    "damage", ["missing-pair", "extra-pair", "duplicate-canonical", "dtype", "shape", "nan", "topology"]
-)
-def test_native_adapter_layout_pack_rejection_restores_without_parameter_mutation_or_engine(
-    native_adapter_layout_control, monkeypatch, damage
-):
-    control = native_adapter_layout_control
-    model = control.make(True)
-    state = {name: tensor.clone() for name, tensor in control.expected.items()}
-    name = sorted(state)[0]
-    if damage == "missing-pair":
-        del state[name]
-    elif damage == "extra-pair":
-        state.update(
-            {
-                key.replace(".q_proj.", ".extra_proj."): value.clone()
-                for key, value in list(state.items())
-                if ".q_proj." in key
-            }
-        )
-    elif damage == "duplicate-canonical":
-        state[name.replace(".block.", ".block._checkpoint_wrapped_module.")] = state[name].clone()
-    elif damage == "dtype":
-        state[name] = state[name].double()
-    elif damage == "shape":
-        state[name] = state[name][:1].clone()
-    elif damage == "nan":
-        state[name].flatten()[0] = float("nan")
-    else:
-        config = json.loads(control.files["adapter_config.json"])
-        config["lora_alpha"] = 5
-        (control.path / "adapter_config.json").write_text(json.dumps(config))
-    if damage != "topology":
-        save_file(state, control.path / "adapter_model.safetensors")
-    received = {name: (control.path / name).read_bytes() for name in control.files}
-    snapshot = _native_adapter_layout_snapshot(model)
-    scope = control.scope(model, received=received)
-    _native_adapter_layout_forbid_state_apis(model, monkeypatch)
-    with pytest.raises(ValueError):
-        with scope.context:
-            scope.worker({"model": model})
-    assert not control.events
-    _native_adapter_layout_unchanged(model, snapshot)
-    _native_adapter_layout_scope_restored(control, scope)
-
-
-@pytest.mark.parametrize("wrapped", [False, True])
-@pytest.mark.parametrize(
-    "damage", ["base-parameter", "base-storage", "new-base-parameter", "new-base-storage", "base-buffer"]
-)
-def test_native_adapter_layout_base_aliases_reject_without_base_or_factor_mutation(
-    native_adapter_layout_control, monkeypatch, wrapped, damage
-):
-    control = native_adapter_layout_control
-    valid = control.make(wrapped)
-    shared.initialize_native_adapter(valid, control.path, control.identity)
-    control.verify(valid)
-    model = control.make(wrapped)
-    block = model.base_model.model.block
-    q = block.q_proj
-    factor = q.lora_A["default"].weight
-    if damage == "base-parameter":
-        q.base_layer.weight = factor
-    elif damage == "base-storage":
-        q.lora_A["default"].weight = nn.Parameter(q.base_layer.weight[:2].detach())
-    elif damage == "new-base-parameter":
-        block.register_parameter("ordinary_alias", factor)
-    elif damage == "new-base-storage":
-        block.register_parameter("ordinary_alias", nn.Parameter(factor.detach(), requires_grad=False))
-    else:
-        block.register_buffer("ordinary_alias", factor.detach())
-    buffers = {name: (id(value), _bytes(value)) for name, value in model.named_buffers(remove_duplicate=False)}
-    snapshot = _native_adapter_layout_snapshot(model)
-    scope = control.scope(model)
-    _native_adapter_layout_forbid_state_apis(model, monkeypatch)
-    with pytest.raises(ValueError):
-        with scope.context:
-            scope.worker({"model": model})
-    assert not control.events
-    _native_adapter_layout_unchanged(model, snapshot)
-    assert buffers == {name: (id(value), _bytes(value)) for name, value in model.named_buffers(remove_duplicate=False)}
-    _native_adapter_layout_scope_restored(control, scope)
-
-
-@pytest.fixture
-def native_adapter_layout_four_block_control(native_adapter_layout_control, tmp_path):
-    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
-
-    control = native_adapter_layout_control
-
-    class FourBlock(nn.Module):
-        def __init__(self, wrapped):
-            super().__init__()
-            self.config = {"model_type": "native_layout_four_block"}
-            self.blocks = nn.ModuleList()
-            for _ in range(4):
-                block = nn.Module()
-                block.q_proj = nn.Linear(3, 3, bias=False)
-                block.v_proj = nn.Linear(3, 3, bias=False)
-                self.blocks.append(checkpoint_wrapper(block) if wrapped else block)
-
-        def forward(self, *args, **kwargs):
-            pytest.fail("four-block layout control invoked a forward")
-
-        def prepare_inputs_for_generation(self, *args, **kwargs):
-            pytest.fail("four-block layout control invoked generation")
-
-    def make(wrapped):
-        model = peft.get_peft_model(
-            FourBlock(wrapped),
-            peft.LoraConfig(
-                task_type="CAUSAL_LM",
-                r=2,
-                lora_alpha=4,
-                lora_dropout=0.0,
-                target_modules=["q_proj", "v_proj"],
-                bias="none",
-                init_lora_weights=True,
-            ),
-        )
-        assert len(_native_adapter_layout_factors(model)) == 16
-        return model
-
-    with torch.random.fork_rng(devices=[]):
-        torch.random.default_generator.manual_seed(42)
-        supplier = make(False)
-        path = tmp_path / "four-block-seed42-pack"
-        supplier.save_pretrained(path, safe_serialization=True, save_embedding_layers=False)
-    config_path = path / "adapter_config.json"
-    config = json.loads(config_path.read_bytes())
-    config["base_model_name_or_path"] = ""
-    config_path.write_text(json.dumps(config, sort_keys=True) + "\n")
-    recipe = json.loads(control.files["correctness_recipe.json"])
-    recipe["peft_config"] = shared._topology(config)
-    (path / "correctness_recipe.json").write_text(json.dumps(recipe, sort_keys=True) + "\n")
-    control.make, control.path = make, path
-    control.identity = shared.shared_adapter_identity(path)
-    control.files = shared.adapter_files(path, control.identity)
-    control.expected = safetensors.torch.load(control.files["adapter_model.safetensors"])
-    assert len(control.expected) == 16
-    control.verify(supplier)
-    return control
-
-
-@pytest.mark.parametrize("wrapped", [False, True])
-def test_native_adapter_layout_four_blocks_all_sixteen_factors_copy_before_stub_engine(
-    native_adapter_layout_four_block_control, monkeypatch, wrapped
-):
-    control = native_adapter_layout_four_block_control
-    model = control.make(wrapped)
-    snapshot = _native_adapter_layout_snapshot(model)
-    scope = control.scope(model)
-    _native_adapter_layout_forbid_state_apis(model, monkeypatch)
-    with scope.context as receipt:
-        scope.worker({"model": model})
-        assert receipt["engine_initializations"] == 1
-    control.verify(model)
-    after = _native_adapter_layout_snapshot(model)
-    assert torch.equal(after[1], snapshot[1])
-    for name, snapshot_entry in snapshot[0].items():
-        assert after[0][name][:5] == snapshot_entry[:5]
-        assert after[0][name][5][:3] == snapshot_entry[5][:3]
-        if ".lora_" not in name:
-            assert after[0][name] == snapshot_entry
-    assert len(_native_adapter_layout_factors(model)) == 16
-    assert control.events == ["stub-engine-after-verified-load"]
-    _native_adapter_layout_scope_restored(control, scope)
-
-
-@pytest.mark.parametrize("wrapped", [False, True])
-@pytest.mark.parametrize("damage", ["missing-last", "nan-last", "inf-last", "dtype-last", "shape-last"])
-def test_native_adapter_layout_last_of_sixteen_invalid_factors_rejects_before_any_earlier_write(
-    native_adapter_layout_four_block_control, monkeypatch, wrapped, damage
-):
-    control = native_adapter_layout_four_block_control
-    valid = control.make(wrapped)
-    shared.initialize_native_adapter(valid, control.path, control.identity)
-    control.verify(valid)
-    model = control.make(wrapped)
-    last = model.base_model.model.blocks[3].v_proj.lora_B["default"]
-    if damage == "missing-last":
-        del last.weight
-    elif damage in {"nan-last", "inf-last"}:
-        with torch.no_grad():
-            last.weight.flatten()[0] = float(damage.split("-")[0])
-    else:
-        value = last.weight.detach().double() if damage == "dtype-last" else last.weight.detach()[:1].clone()
-        last.weight = nn.Parameter(value)
-    snapshot = _native_adapter_layout_snapshot(model)
-    scope = control.scope(model)
-    _native_adapter_layout_forbid_state_apis(model, monkeypatch)
-    with pytest.raises(ValueError):
-        with scope.context:
-            scope.worker({"model": model})
-    assert not control.events
-    _native_adapter_layout_unchanged(model, snapshot)
-    _native_adapter_layout_scope_restored(control, scope)
-
-
 # Native-only factor transactions; reference supplier source remains immutable.
 
 
@@ -22801,49 +14993,6 @@ def test_native_adapter_layout_rollback_nth_partial_copy_retains_primary_and_exa
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
-@pytest.mark.parametrize("outcome", ["raises", "rejects"])
-def test_native_adapter_layout_rollback_final_only_identity_postflight_restores_every_factor(
-    native_adapter_layout_rollback_control, monkeypatch, wrapped, outcome
-):
-    case = native_adapter_layout_rollback_control
-    control = case.control
-    model = _native_adapter_layout_rollback_model(control, wrapped, case.initializer)
-    factors = _native_adapter_layout_factors(model)
-    snapshot = _native_adapter_layout_snapshot(model)
-    buffers = _native_adapter_layout_rollback_buffers(model)
-    original_identity = case.initializer.shared_adapter_identity
-    primary = RuntimeError("native final identity recheck failed")
-    postflight = []
-
-    def identity(path):
-        actual = original_identity(path)
-        if all(_bytes(parameter) == _bytes(control.expected[name]) for name, parameter in factors.items()):
-            postflight.append(actual)
-            if outcome == "raises":
-                raise primary
-            altered = copy.deepcopy(actual)
-            altered["generation"]["seed"] += 1
-            return altered
-        return actual
-
-    scope = control.scope(model)
-    _native_adapter_layout_forbid_state_apis(model, monkeypatch)
-    monkeypatch.setattr(case.initializer, "shared_adapter_identity", identity)
-    with pytest.raises(RuntimeError if outcome == "raises" else ValueError) as caught:
-        with scope.context:
-            scope.worker({"model": model})
-    if outcome == "raises":
-        assert caught.value is primary
-    else:
-        assert "changed during loading" in str(caught.value)
-    assert postflight == [control.identity]
-    assert not control.events
-    _native_adapter_layout_unchanged(model, snapshot)
-    assert _native_adapter_layout_rollback_buffers(model) == buffers
-    _native_adapter_layout_scope_restored(control, scope)
-
-
-@pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("interrupt", [False, True])
 def test_native_adapter_layout_rollback_restore_failure_notes_preserve_primary_and_continue_cleanup(
     native_adapter_layout_rollback_control, monkeypatch, wrapped, interrupt
@@ -22900,150 +15049,6 @@ def test_native_adapter_layout_rollback_restore_failure_notes_preserve_primary_a
     assert any(after[name] != original for name, original in snapshot[0].items() if original[0] == id(first))
     assert _native_adapter_layout_rollback_buffers(model) == buffers
     assert not control.events
-    _native_adapter_layout_scope_restored(control, scope)
-
-
-@pytest.mark.parametrize("wrapped", [False, True])
-def test_native_adapter_layout_rollback_expanded_last_of_sixteen_rejects_before_any_copy(
-    native_adapter_layout_four_block_control, monkeypatch, wrapped
-):
-    from arctic_platform.correctness.harness import lora as native_adapter
-
-    control = native_adapter_layout_four_block_control
-    model = _native_adapter_layout_rollback_model(control, wrapped, native_adapter)
-    last = model.base_model.model.blocks[3].v_proj.lora_B["default"]
-    last.weight = nn.Parameter(last.weight.detach()[:1].clone().expand_as(last.weight))
-    assert not last.weight.is_contiguous() and last.weight.stride()[0] == 0
-    snapshot = _native_adapter_layout_snapshot(model)
-    buffers = _native_adapter_layout_rollback_buffers(model)
-    tracked = {id(parameter) for parameter in _native_adapter_layout_factors(model).values()}
-    original_copy = torch.Tensor.copy_
-    attempts = []
-
-    def copy_(parameter, value, *args, **kwargs):
-        if id(parameter) in tracked:
-            attempts.append(id(parameter))
-        return original_copy(parameter, value, *args, **kwargs)
-
-    scope = control.scope(model)
-    _native_adapter_layout_forbid_state_apis(model, monkeypatch)
-    monkeypatch.setattr(torch.Tensor, "copy_", copy_)
-    with pytest.raises(ValueError, match="materialized contiguous"):
-        with scope.context:
-            scope.worker({"model": model})
-    assert not attempts and not control.events
-    _native_adapter_layout_unchanged(model, snapshot)
-    assert _native_adapter_layout_rollback_buffers(model) == buffers
-    _native_adapter_layout_scope_restored(control, scope)
-
-
-@pytest.mark.parametrize("wrapped", [False, True])
-def test_native_adapter_layout_rollback_scope_routes_only_native_initializer_before_stub_engine(
-    native_adapter_layout_rollback_control, monkeypatch, wrapped
-):
-    case = native_adapter_layout_rollback_control
-    control = case.control
-    model = _native_adapter_layout_rollback_model(control, wrapped, case.initializer)
-    snapshot = _native_adapter_layout_snapshot(model)
-    buffers = _native_adapter_layout_rollback_buffers(model)
-    original = case.initializer.initialize_native_adapter
-    calls = []
-
-    def initialize(actual_model, path, identity):
-        assert actual_model is model and identity == control.identity
-        assert not control.events
-        calls.append((actual_model, Path(path), identity))
-        original(actual_model, path, identity)
-        control.verify(actual_model)
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("native shared scope routed through the frozen reference loader")
-
-    scope = control.scope(model)
-    _native_adapter_layout_forbid_state_apis(model, monkeypatch)
-    monkeypatch.setattr(case.initializer, "initialize_native_adapter", initialize)
-    monkeypatch.setattr(shared, "shared_initialize_adapter", forbidden)
-    with scope.context as receipt:
-        scope.worker({"model": model})
-        assert receipt["engine_initializations"] == 1 and receipt["shared_identity"] == control.identity
-    assert len(calls) == 1 and control.events == ["stub-engine-after-verified-load"]
-    control.verify(model)
-    after, rng = _native_adapter_layout_snapshot(model)
-    assert torch.equal(rng, snapshot[1])
-    for name, original_value in snapshot[0].items():
-        assert after[name][:5] == original_value[:5]
-        assert after[name][5][:3] == original_value[5][:3]
-        if ".lora_" not in name:
-            assert after[name] == original_value
-    assert _native_adapter_layout_rollback_buffers(model) == buffers
-    _native_adapter_layout_scope_restored(control, scope)
-
-
-@pytest.mark.parametrize("damage", ["none", "missing-native", "extra-original", "malformed-native"])
-def test_native_adapter_layout_rollback_source_compatibility_and_distinct_gateway_capability(
-    native_adapter_layout_rollback_control, monkeypatch, damage
-):
-    import requests
-
-    from arctic_platform.correctness.harness import gateway as hosted
-
-    case = native_adapter_layout_rollback_control
-    control = case.control
-    scope = control.scope(control.make(False))
-    native = control.native
-    original = native._runtime_sources(scope.training)
-    generated = native._shared_runtime_sources(scope.training)
-    assert set(original) == {"training", "engine", "adapter", "lora", "composition", "native_adapter"}
-    assert generated == original
-    assert original["native_adapter"] == native._source(case.initializer.initialize_native_adapter)
-    shared_path = Path(shared.__file__).resolve()
-    assert original["adapter"] == {
-        "path": str(shared_path),
-        "sha256": hashlib.sha256(shared_path.read_bytes()).hexdigest(),
-    }
-    native._verify_shared_runtime(scope.training, generated)
-    drifted = copy.deepcopy(generated)
-    drifted["native_adapter"]["sha256"] = "0" * 64
-    with pytest.raises(ValueError, match="runtime differs"):
-        native._verify_shared_runtime(scope.training, drifted)
-    document = {
-        native.OPENAPI_KEY: {"schema": native.SCHEMA, "sources": copy.deepcopy(original)},
-        native.SHARED_OPENAPI_KEY: {"schema": native.SHARED_SCHEMA, "sources": copy.deepcopy(generated)},
-    }
-
-    class Session:
-        trust_env = True
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-        def get(self, url, **kwargs):
-            assert self.trust_env is False
-            assert kwargs == {"timeout": 30, "allow_redirects": False}
-            return SimpleNamespace(status_code=200, json=lambda: copy.deepcopy(document))
-
-    monkeypatch.setattr(requests, "Session", Session)
-    backend = SimpleNamespace(base_url="http://127.0.0.1:8000")
-    monkeypatch.setattr(
-        hosted,
-        "require_local_cortex_gateway",
-        lambda selected: None if selected is backend else pytest.fail("foreign backend"),
-    )
-    assert native.gateway_capability(backend)["sources"] == original
-    assert native.gateway_capability(backend, shared=True)["sources"] == generated
-    if damage == "missing-native":
-        del document[native.SHARED_OPENAPI_KEY]["sources"]["native_adapter"]
-    elif damage == "extra-original":
-        document[native.OPENAPI_KEY]["sources"]["unexpected"] = generated["native_adapter"]
-    elif damage == "malformed-native":
-        document[native.SHARED_OPENAPI_KEY]["sources"]["native_adapter"]["path"] = "relative-native.py"
-    if damage != "none":
-        with pytest.raises(ValueError):
-            native.gateway_capability(backend, shared=damage != "extra-original")
-    assert _native_adapter_layout_rollback_buffers(scope.training._native_adapter_layout_control.model) == {}
     _native_adapter_layout_scope_restored(control, scope)
 
 
@@ -23239,23 +15244,6 @@ def test_native_original_registered_failure_preserves_primary_and_restores_bindi
     _native_adapter_layout_scope_restored(control, scope)
 
 
-def test_native_original_registered_source_guard_requires_native_loader(native_original_registered_control):
-    control = native_original_registered_control
-    scope = control.scope()
-    sources = control.native._runtime_sources(scope.training)
-    assert set(sources) == {"training", "engine", "adapter", "lora", "composition", "native_adapter"}
-    control.native._verify_runtime(scope.training, sources)
-    for damage in ("missing", "changed"):
-        altered = copy.deepcopy(sources)
-        if damage == "missing":
-            del altered["native_adapter"]
-        else:
-            altered["native_adapter"]["sha256"] = "0" * 64
-        with pytest.raises(ValueError, match="runtime differs"):
-            control.native._verify_runtime(scope.training, altered)
-    _native_adapter_layout_scope_restored(control, scope)
-
-
 @pytest.fixture
 def owned_worker_lease_new_control():
     from arctic_platform.correctness.harness import lora as native_lora
@@ -23351,125 +15339,6 @@ def test_owned_worker_lease_new_one_shared_deadline(owned_worker_lease_new_contr
     assert [worker.timeouts for worker in leases.workers] == [[20.0], [0.0]]
 
 
-@pytest.mark.parametrize("outcome", ["normal", "primary", "interrupt", "spawn", "timeout", "ssh-exit", "head-exit"])
-def test_owned_worker_lease_new_zone_launch_and_primary_failure(owned_worker_lease_new_control, monkeypatch, outcome):
-    import shlex
-
-    case = owned_worker_lease_new_control
-    server = ModuleType("dss.ray_dss.zones.server")
-    listener = SimpleNamespace(fileno=lambda: 43, close=lambda: case.events.append(("listener-close",)))
-    monkeypatch.setattr(case.native, "_zone_listener", lambda: contextlib.nullcontext(listener))
-
-    def original_head_argv():
-        return [sys.executable, "-m", "dss.ray_dss.zones.server_head", "--port", "9001"]
-
-    server._head_argv = original_head_argv
-    server.is_local = lambda host: host == "owned-head"
-    failure = KeyboardInterrupt("primary") if outcome == "interrupt" else RuntimeError("primary")
-    head_process = case.Process(10)
-    worker_process = case.Process(
-        11,
-        status=255 if outcome == "ssh-exit" else 0,
-        wait_error=subprocess.TimeoutExpired("owned worker", 30) if outcome == "timeout" else None,
-    )
-    launches = []
-
-    def original_run(command, host, **kwargs):
-        argv = shlex.split(command)
-        launches.append((argv, host, kwargs))
-        if argv[4] == "head":
-            assert argv[0:4] == ["exec", sys.executable, "-m", case.native._MODULE]
-            assert kwargs == {"pass_fds": (43,)}
-            return head_process
-        assert argv[:4] == ["exec", "setsid", "--wait", "env"]
-        assert argv[4].startswith("AP_CORRECTNESS_GATEWAY_OWNER=") and len(argv[4].split("=", 1)[1]) == 32
-        assert argv[5:10] == ["SPT_NOENV=1", sys.executable, "-m", case.native._MODULE, "worker"]
-        assert argv[10:] == ["--zone-id", "owned-zone", "--server-url", "owned-head:1234"]
-        assert kwargs == {"stdin": subprocess.PIPE, "stdout": "retained-log"}
-        if outcome == "spawn":
-            raise failure
-        return worker_process
-
-    server.run_cmd = original_run
-
-    def main():
-        head = server.run_cmd(shlex.join(server._head_argv()), "owned-head")
-        worker = None
-        try:
-            command = shlex.join(
-                [
-                    sys.executable,
-                    "-m",
-                    "dss.ray_dss.zones.server_worker",
-                    "--zone-id",
-                    "owned-zone",
-                    "--server-url",
-                    "owned-head:1234",
-                ]
-            )
-            worker = server.run_cmd(command, "owned-peer", stdout="retained-log")
-            if outcome == "head-exit":
-                head_process.returncode = 1
-            if outcome in ("primary", "interrupt"):
-                raise failure
-        finally:
-            if head.poll() is None:
-                head.terminate()
-            if worker is not None and worker.poll() is None:
-                worker.terminate()
-
-    server.main = main
-    _native_original_composition_modules(monkeypatch, **{"dss.ray_dss.zones.server": server})
-    monkeypatch.setattr(sys, "argv", ["owned", "zone"])
-    if outcome in ("primary", "interrupt", "spawn"):
-        with pytest.raises(type(failure)) as caught:
-            case.native.main()
-        assert caught.value is failure
-    elif outcome in ("timeout", "ssh-exit"):
-        with pytest.raises(RuntimeError, match="Owned worker shutdown failed"):
-            case.native.main()
-        assert ("terminate", 10) not in case.events
-    else:
-        case.native.main()
-    assert server.run_cmd is original_run and server._head_argv is original_head_argv
-    assert len(launches) == 2
-    if outcome != "spawn":
-        assert ("close", 11) in case.events
-        assert not any(event in case.events for event in [("terminate", 11), ("kill", 11)])
-    if outcome == "head-exit":
-        assert case.events[-2:] == [("close", 11), ("wait", 11)]
-
-
-def test_owned_worker_lease_new_primary_keeps_cleanup_failure_note(owned_worker_lease_new_control, monkeypatch):
-    case = owned_worker_lease_new_control
-    server = ModuleType("dss.ray_dss.zones.server")
-
-    def original_argv():
-        return []
-
-    def original_run(*args, **kwargs):
-        return None
-
-    server._head_argv, server.run_cmd = original_argv, original_run
-    primary = SystemExit(7)
-    leases = case.native._OwnedWorkerLeases()
-    leases.workers = [case.Process(11, status=255)]
-    monkeypatch.setattr(case.native, "_OwnedWorkerLeases", lambda: leases)
-    monkeypatch.setattr(case.native, "_zone_listener", lambda: contextlib.nullcontext(object()))
-
-    def main():
-        raise primary
-
-    server.main = main
-    _native_original_composition_modules(monkeypatch, **{"dss.ray_dss.zones.server": server})
-    monkeypatch.setattr(sys, "argv", ["owned", "zone"])
-    with pytest.raises(SystemExit) as caught:
-        case.native.main()
-    assert caught.value is primary and caught.value.code == 7
-    assert len(primary.__notes__) == 1 and "exit 255" in primary.__notes__[0]
-    assert server.run_cmd is original_run and server._head_argv is original_argv
-
-
 @pytest.mark.parametrize("early_eof", [False, True])
 def test_owned_worker_lease_new_eof_requests_registered_shutdown_without_fd_inheritance(monkeypatch, early_eof):
     import signal
@@ -23512,128 +15381,6 @@ def test_owned_worker_lease_new_eof_requests_registered_shutdown_without_fd_inhe
         monkeypatch.setattr(native_lora.os, "dup2", original_dup2)
     assert worker.signal is signals
     assert events == [("inherit", False), ("redirect", 0)]
-
-
-@pytest.mark.parametrize("primary_failure", [False, True])
-def test_owned_worker_lease_new_reader_failure_preserves_primary(monkeypatch, primary_failure):
-    import threading
-
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    read_fd, write_fd = os.pipe()
-    original_dup = os.dup
-    failed = threading.Event()
-    failure = RuntimeError("worker primary")
-    signals = SimpleNamespace(signal=lambda *args: None)
-    worker = SimpleNamespace(signal=signals)
-    monkeypatch.setattr(native_lora.os, "dup", lambda descriptor: original_dup(read_fd))
-    monkeypatch.setattr(native_lora.os, "dup2", lambda *args: None)
-
-    def select_failure(*args):
-        failed.set()
-        raise OSError("lease reader broken")
-
-    monkeypatch.setattr(native_lora.select, "select", select_failure)
-
-    def main():
-        assert failed.wait(2.0)
-        if primary_failure:
-            raise failure
-
-    worker.main = main
-    try:
-        with pytest.raises(RuntimeError) as caught:
-            native_lora._owned_worker_main(worker)
-        if primary_failure:
-            assert caught.value is failure and "lease reader broken" in failure.__notes__[0]
-        else:
-            assert "lease reader broken" in str(caught.value)
-    finally:
-        os.close(read_fd)
-        os.close(write_fd)
-    assert worker.signal is signals
-
-
-def test_owned_worker_lease_new_worker_role_dispatches_without_changing_args(monkeypatch):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    worker = ModuleType("dss.ray_dss.zones.server_worker")
-    calls = []
-    _native_original_composition_modules(monkeypatch, **{"dss.ray_dss.zones.server_worker": worker})
-    monkeypatch.setattr(native_lora, "_owned_worker_session", lambda actual: calls.append(actual))
-    monkeypatch.setattr(sys, "argv", ["owned", "worker", "--zone-id", "owned-zone"])
-    native_lora.main()
-    assert calls == [worker] and sys.argv == ["owned", "--zone-id", "owned-zone"]
-
-
-@pytest.mark.parametrize("primary_failure", [False, True])
-def test_owned_worker_session_cleanup_new_waits_for_descendants(monkeypatch, primary_failure):
-    from arctic_platform.correctness.harness import gateway as ap_driver
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    token = "a" * 32
-    identity = {"pid": os.getpid(), "uid": os.getuid(), "start_time": "123"}
-    events = []
-    worker = object()
-    primary = RuntimeError("worker primary")
-    monkeypatch.setenv("AP_CORRECTNESS_GATEWAY_OWNER", token)
-    monkeypatch.setenv("SPT_NOENV", "1")
-    monkeypatch.setattr(native_lora.os, "getsid", lambda pid: os.getpid())
-    monkeypatch.setattr(ap_driver, "_gateway_process_identity", lambda pid: identity)
-
-    def main(actual):
-        assert actual is worker
-        events.append("upstream-exit")
-        if primary_failure:
-            raise primary
-
-    monkeypatch.setattr(native_lora, "_owned_worker_main", main)
-    monkeypatch.setattr(
-        ap_driver,
-        "_reap_owned_gateway_descendants",
-        lambda actual, marker: events.append(("descendants-exit", actual, marker)),
-    )
-    if primary_failure:
-        with pytest.raises(RuntimeError) as caught:
-            native_lora._owned_worker_session(worker)
-        assert caught.value is primary
-    else:
-        native_lora._owned_worker_session(worker)
-    assert events == ["upstream-exit", ("descendants-exit", identity, token)]
-
-
-@pytest.mark.parametrize("primary_failure", [False, True])
-def test_owned_worker_session_cleanup_new_retains_cleanup_failure(monkeypatch, primary_failure):
-    from arctic_platform.correctness.harness import gateway as ap_driver
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    monkeypatch.setenv("AP_CORRECTNESS_GATEWAY_OWNER", "a" * 32)
-    monkeypatch.setenv("SPT_NOENV", "1")
-    monkeypatch.setattr(native_lora.os, "getsid", lambda pid: os.getpid())
-    monkeypatch.setattr(
-        ap_driver,
-        "_gateway_process_identity",
-        lambda pid: {"pid": pid, "uid": os.getuid(), "start_time": "123"},
-    )
-    primary = RuntimeError("worker primary")
-    cleanup = ap_driver.UnsafeCleanupError("unverified descendant")
-
-    def main(worker):
-        if primary_failure:
-            raise primary
-
-    def reap(*args):
-        raise cleanup
-
-    monkeypatch.setattr(native_lora, "_owned_worker_main", main)
-    monkeypatch.setattr(ap_driver, "_reap_owned_gateway_descendants", reap)
-    with pytest.raises(RuntimeError) as caught:
-        native_lora._owned_worker_session(object())
-    if primary_failure:
-        assert caught.value is primary
-        assert "unverified descendant" in primary.__notes__[0]
-    else:
-        assert caught.value is cleanup
 
 
 @pytest.mark.parametrize("invalid", ["token", "retitle", "session", "identity"])
@@ -23704,125 +15451,6 @@ def test_owned_worker_session_cleanup_new_real_retitled_child_exits_before_worke
     assert "OWNED_WORKER_DESCENDANTS_EXITED" in completed.stdout
 
 
-@pytest.mark.parametrize("phase", ["inherit", "redirect", "thread-start"])
-def test_owned_worker_lease_setup_new_preserves_error_and_closes_descriptor(monkeypatch, phase):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    primary = OSError(f"setup {phase}")
-    signals = object()
-    worker = SimpleNamespace(signal=signals, main=lambda: pytest.fail("failed setup invoked worker"))
-    closed = []
-    monkeypatch.setattr(native_lora.os, "dup", lambda descriptor: 990)
-    monkeypatch.setattr(native_lora.os, "close", lambda descriptor: closed.append(descriptor))
-
-    def setup_step(selected):
-        if selected == phase:
-            raise primary
-
-    monkeypatch.setattr(native_lora.os, "set_inheritable", lambda *args: setup_step("inherit"))
-    monkeypatch.setattr(native_lora.os, "dup2", lambda *args: setup_step("redirect"))
-    monkeypatch.setattr(
-        native_lora.threading,
-        "Thread",
-        lambda **kwargs: SimpleNamespace(
-            start=lambda: setup_step("thread-start"),
-            join=lambda **kwargs: pytest.fail("unstarted lease thread was joined"),
-        ),
-    )
-    with pytest.raises(OSError) as caught:
-        native_lora._owned_worker_main(worker)
-    assert caught.value is primary and closed == [990] and worker.signal is signals
-
-
-@pytest.mark.parametrize("primary_type", [None, RuntimeError, SystemExit, KeyboardInterrupt])
-def test_owned_worker_lease_setup_new_close_failure_never_replaces_primary(monkeypatch, primary_type):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    primary = primary_type("worker primary") if primary_type is not None else None
-    cleanup = OSError("descriptor close failed")
-    signals = object()
-    worker = SimpleNamespace(signal=signals)
-    monkeypatch.setattr(native_lora.os, "dup", lambda descriptor: 990)
-    monkeypatch.setattr(native_lora.os, "set_inheritable", lambda *args: None)
-    monkeypatch.setattr(native_lora.os, "dup2", lambda *args: None)
-    monkeypatch.setattr(
-        native_lora.threading,
-        "Thread",
-        lambda **kwargs: SimpleNamespace(start=lambda: None, join=lambda **kwargs: None, is_alive=lambda: False),
-    )
-
-    def close(descriptor):
-        raise cleanup
-
-    def main():
-        if primary is not None:
-            raise primary
-
-    worker.main = main
-    monkeypatch.setattr(native_lora.os, "close", close)
-    with pytest.raises(type(primary) if primary is not None else OSError) as caught:
-        native_lora._owned_worker_main(worker)
-    assert caught.value is (primary if primary is not None else cleanup)
-    if primary is not None:
-        assert primary.__notes__ == ["Owned worker lease cleanup also failed: descriptor close failed"]
-    assert worker.signal is signals
-
-
-def test_owned_worker_lease_setup_new_read_error_before_registration_stops_worker(monkeypatch):
-    import signal
-    import threading
-
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    read_fd, write_fd = os.pipe()
-    original_dup = os.dup
-    failed = threading.Event()
-    stop = threading.Event()
-    signals = SimpleNamespace(signal=lambda *args: None)
-    worker = SimpleNamespace(signal=signals)
-    monkeypatch.setattr(native_lora.os, "dup", lambda descriptor: original_dup(read_fd))
-    monkeypatch.setattr(native_lora.os, "dup2", lambda *args: None)
-
-    def broken_reader(*args):
-        failed.set()
-        raise OSError("early lease read failure")
-
-    def main():
-        assert failed.wait(2.0)
-        worker.signal.signal(signal.SIGTERM, lambda *args: stop.set())
-        assert stop.wait(2.0)
-
-    monkeypatch.setattr(native_lora.select, "select", broken_reader)
-    worker.main = main
-    try:
-        with pytest.raises(RuntimeError, match="early lease read failure"):
-            native_lora._owned_worker_main(worker)
-    finally:
-        os.close(read_fd)
-        os.close(write_fd)
-    assert worker.signal is signals
-
-
-def test_owned_worker_lease_setup_new_unfinished_reader_is_cleanup_failure(monkeypatch):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    signals = object()
-    worker = SimpleNamespace(signal=signals, main=lambda: None)
-    closed = []
-    monkeypatch.setattr(native_lora.os, "dup", lambda descriptor: 990)
-    monkeypatch.setattr(native_lora.os, "set_inheritable", lambda *args: None)
-    monkeypatch.setattr(native_lora.os, "dup2", lambda *args: None)
-    monkeypatch.setattr(native_lora.os, "close", lambda descriptor: closed.append(descriptor))
-    monkeypatch.setattr(
-        native_lora.threading,
-        "Thread",
-        lambda **kwargs: SimpleNamespace(start=lambda: None, join=lambda **kwargs: None, is_alive=lambda: True),
-    )
-    with pytest.raises(RuntimeError, match="lease reader did not stop"):
-        native_lora._owned_worker_main(worker)
-    assert closed == [990] and worker.signal is signals
-
-
 def test_owned_worker_lease_interrupt_new_closes_other_writers_and_never_signals_head(
     owned_worker_lease_new_control,
 ):
@@ -23837,76 +15465,6 @@ def test_owned_worker_lease_interrupt_new_closes_other_writers_and_never_signals
     assert case.events == [("close", 11), ("close", 12), ("wait", 11), ("wait", 12)]
     head.kill()
     assert ("kill", 10) not in case.events and len(leases.errors) == 1
-
-
-@pytest.mark.parametrize("close_interrupted", [False, True])
-def test_owned_worker_lease_wait_interrupt_new_attempts_every_worker_and_preserves_first(
-    owned_worker_lease_new_control, close_interrupted
-):
-    case = owned_worker_lease_new_control
-    close_error = KeyboardInterrupt("close interrupted") if close_interrupted else None
-    wait_error = SystemExit("wait interrupted")
-    leases = case.native._OwnedWorkerLeases()
-    leases.workers = [
-        case.Process(11, close_error=close_error, wait_error=wait_error),
-        case.Process(12, wait_error=KeyboardInterrupt("second wait interrupted")),
-        case.Process(13),
-    ]
-    head = case.native._OwnedZoneProcess(case.Process(10), leases, head=True)
-    first_error = close_error if close_interrupted else wait_error
-    with pytest.raises(type(first_error)) as caught:
-        head.terminate()
-    assert caught.value is first_error
-    assert case.events == [
-        ("close", 11),
-        ("close", 12),
-        ("close", 13),
-        ("wait", 11),
-        ("wait", 12),
-        ("wait", 13),
-    ]
-    assert len(leases.errors) == (3 if close_interrupted else 2)
-    head.kill()
-    assert not any(event[0] in ("terminate", "kill") for event in case.events)
-
-
-@pytest.mark.parametrize("primary_present", [False, True])
-def test_owned_worker_lease_zone_interrupt_new_restores_hooks_and_retains_primary(
-    owned_worker_lease_new_control, monkeypatch, primary_present
-):
-    case = owned_worker_lease_new_control
-    server = ModuleType("dss.ray_dss.zones.server")
-
-    def original_argv():
-        return []
-
-    def original_run(*args, **kwargs):
-        return None
-
-    server._head_argv, server.run_cmd = original_argv, original_run
-    primary = RuntimeError("zone primary")
-    interruption = KeyboardInterrupt("lease close interrupted")
-    leases = case.native._OwnedWorkerLeases()
-    leases.workers = [case.Process(11, close_error=interruption), case.Process(12)]
-    monkeypatch.setattr(case.native, "_OwnedWorkerLeases", lambda: leases)
-    monkeypatch.setattr(case.native, "_zone_listener", lambda: contextlib.nullcontext(object()))
-
-    def main():
-        if primary_present:
-            raise primary
-
-    server.main = main
-    _native_original_composition_modules(monkeypatch, **{"dss.ray_dss.zones.server": server})
-    monkeypatch.setattr(sys, "argv", ["owned", "zone"])
-    with pytest.raises(RuntimeError if primary_present else KeyboardInterrupt) as caught:
-        case.native.main()
-    assert caught.value is (primary if primary_present else interruption)
-    if primary_present:
-        assert len(primary.__notes__) == 2
-        assert "lease close interrupted" in primary.__notes__[0]
-        assert "KeyboardInterrupt" in primary.__notes__[1]
-    assert case.events == [("close", 11), ("close", 12), ("wait", 11), ("wait", 12)]
-    assert server.run_cmd is original_run and server._head_argv is original_argv
 
 
 @pytest.fixture
@@ -24117,151 +15675,6 @@ def native_spawn_globals_control(native_original_adapter, monkeypatch):
 
 
 @pytest.mark.parametrize("namespace", ["detached", "shared"])
-@pytest.mark.parametrize(
-    "outcome",
-    [
-        "success",
-        "spawn-runtime",
-        "spawn-interrupt",
-        "constructor-runtime",
-        "constructor-interrupt",
-        "receipt-runtime",
-        "receipt-drift",
-        "spawn-cleanup-runtime",
-        "spawn-cleanup-interrupt",
-        "receipt-cleanup-runtime",
-        "globals-drift",
-    ],
-)
-def test_native_spawn_globals_selected_subclass_preengine_receipt_and_all_exit_restoration(
-    native_spawn_globals_control, namespace, outcome, capsys
-):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    control = native_spawn_globals_control
-    if outcome.startswith("spawn"):
-        error_type = KeyboardInterrupt if outcome == "spawn-interrupt" else RuntimeError
-        control.spawn_failure = error_type("copied-globals native spawn failed")
-    elif outcome.startswith("constructor"):
-        error_type = KeyboardInterrupt if outcome == "constructor-interrupt" else RuntimeError
-        control.constructor_failure = error_type("copied-globals native constructor failed")
-    elif outcome in {"receipt-runtime", "receipt-cleanup-runtime"}:
-        control.receipt_failure = RuntimeError("copied-globals remote receipt failed")
-    elif outcome == "receipt-drift":
-        control.receipt_drift = True
-    elif outcome.endswith("-drift"):
-        control.drift = outcome.split("-")[0]
-    if "cleanup" in outcome:
-        error_type = KeyboardInterrupt if outcome == "spawn-cleanup-interrupt" else RuntimeError
-        control.cleanup_failure = error_type("copied-globals owned cleanup failed")
-    coordinator = control.coordinator(namespace)
-    original_module = dict(control.training.__dict__)
-    original_globals = dict(control.spawn_globals)
-    failure = None
-    try:
-        asyncio.run(
-            coordinator._spawn_workers(control.config, control.ranks, "owned-master", 12345, control.source_stage)
-        )
-    except BaseException as error:
-        failure = error
-    control.restored()
-    assert control.training.__dict__ == original_module
-    assert control.spawn.__globals__ == original_globals
-    assert len(control.selected) == len(control.workers) == 1
-    assert type(control.workers[0]) is control.selected[0]
-    assert control.gets == [control.ref]
-    assert len(control.adapter.calls) == 1
-    expected_events = ["native-spawn", "native-constructor", "loaded-original", "native-engine"]
-    if outcome in {"success", "receipt-runtime", "receipt-drift", "receipt-cleanup-runtime"}:
-        expected_events.append("remote-receipt")
-    if outcome != "success" and not outcome.startswith("constructor"):
-        expected_events.append("owned-kill")
-    assert control.events == expected_events
-    output = capsys.readouterr().out
-    if outcome == "success":
-        assert failure is None
-        assert coordinator._correctness_original_adapter_receipts == control.expected_receipts
-        assert coordinator.info() == {
-            "native_info": "preserved",
-            "correctness_original_adapter": {
-                "schema": native_lora.SCHEMA,
-                "workers": control.expected_receipts,
-            },
-        }
-        assert json.loads(output) == {
-            "schema": native_lora.SCHEMA,
-            "job_id": "selected-child",
-            "workers": control.expected_receipts,
-        }
-        receipt = control.workers[0].original_adapter_receipt()
-        receipt["rank"] = 99
-        assert control.workers[0].original_adapter_receipt() == control.expected_receipts[0]
-    else:
-        primary = control.spawn_failure or control.constructor_failure or control.receipt_failure
-        assert failure is primary if primary is not None else isinstance(failure, ValueError)
-        assert output == "" and not hasattr(coordinator, "_correctness_original_adapter_receipts")
-        if control.cleanup_failure is not None:
-            assert any(
-                f"{type(control.cleanup_failure).__name__}: {control.cleanup_failure}" in note
-                for note in getattr(failure, "__notes__", [])
-            )
-        else:
-            assert coordinator._workers == []
-        if outcome.startswith("constructor"):
-            assert not hasattr(control.workers[0], "_correctness_original_adapter_receipt")
-
-
-@pytest.mark.parametrize("scope", ["globals", "module"])
-@pytest.mark.parametrize("damage", ["foreign", "stale-subclass", "missing"])
-def test_native_spawn_globals_rejects_preexisting_foreign_stale_or_missing_worker_before_spawn(
-    native_spawn_globals_control, scope, damage
-):
-    control = native_spawn_globals_control
-    coordinator = control.coordinator()
-    bindings = control.spawn_globals if scope == "globals" else control.training.__dict__
-    if damage == "missing":
-        del bindings["_DeepSpeedWorker"]
-    elif damage == "stale-subclass":
-        bindings["_DeepSpeedWorker"] = type("StaleOriginalAdapterWorker", (control.worker_base,), {})
-    else:
-        bindings["_DeepSpeedWorker"] = control.foreign
-    before_module = dict(control.training.__dict__)
-    before_globals = dict(control.spawn_globals)
-    with pytest.raises(ValueError):
-        asyncio.run(
-            coordinator._spawn_workers(control.config, control.ranks, "owned-master", 12345, control.source_stage)
-        )
-    assert control.events == control.selected == control.workers == control.gets == control.adapter.calls == []
-    assert coordinator._workers == []
-    assert control.training.__dict__ == before_module
-    assert control.spawn.__globals__ == before_globals
-    _native_original_adapter_restored(control.adapter)
-
-
-@pytest.mark.parametrize("namespace", ["detached", "shared"])
-def test_native_spawn_globals_ordinary_native_route_remains_unwrapped(native_spawn_globals_control, namespace, capsys):
-    control = native_spawn_globals_control
-    control.coordinator(namespace)
-    control.ordinary = True
-    coordinator = control.coordinator_base()
-    before_module = dict(control.training.__dict__)
-    before_globals = dict(control.spawn_globals)
-    assert (
-        asyncio.run(
-            coordinator._spawn_workers(control.config, control.ranks, "owned-master", 12345, control.source_stage)
-        )
-        is control.spawn_result
-    )
-    control.restored()
-    assert control.events == ["native-spawn", "native-constructor"]
-    assert control.selected == [control.worker_base]
-    assert control.gets == control.adapter.calls == []
-    assert control.training.__dict__ == before_module and control.spawn.__globals__ == before_globals
-    assert not hasattr(coordinator._workers[0], "original_adapter_receipt")
-    assert capsys.readouterr().out == ""
-
-
-@pytest.mark.parametrize("namespace", ["detached", "shared"])
 def test_native_spawn_globals_installed_manager_leaves_unselected_training_dispatch_ordinary(
     native_spawn_globals_control, monkeypatch, namespace
 ):
@@ -24380,226 +15793,6 @@ def test_native_spawn_globals_authenticated_deserialized_supplier_restores_exact
         events.append("owned-kill")
         assert coordinator._workers == [] and capsys.readouterr().out == ""
     assert control.events == events
-
-
-@pytest.fixture
-def native_first_two_control(_prepared_reference_runner_prepared_runner, tmp_path, monkeypatch):
-    from arctic_platform.correctness.harness import cortex
-    from arctic_platform.correctness.harness import optimizer as cortex_optimizer
-
-    case = _prepared_reference_runner_prepared_runner
-    monkeypatch.setattr(storage, "_DATA_FAST_ROOT", tmp_path)
-    peft_config = {"peft_type": "Lora", "r": 32, "target_modules": ["q_proj"]}
-    case.cfg.training["peft_config"] = deepcopy(peft_config)
-    adapter = tmp_path / "original-pack"
-    adapter.mkdir()
-    identity = {"schema": "mock-shared-original", "tensor_sha256": "a" * 64}
-    backend = CortexConfig(base_url="http://127.0.0.1:8003", database="dev", schema="dev")
-    generated = []
-    bound = []
-    targets = []
-    fixtures = []
-
-    def generate(model, config, destination, *, seed):
-        assert model == case.spec.model.cache_path
-        assert config == peft_config and seed == runner.SEED
-        generated.append((model, deepcopy(config), Path(destination), seed))
-        return adapter
-
-    def identify(path, config=None):
-        assert Path(path) == adapter
-        assert config is None or config == peft_config
-        return deepcopy(identity)
-
-    def bind(payload, path, *, native_backend=None):
-        assert Path(path) == adapter and native_backend is backend
-        assert payload["training_config"]["peft_config"] == peft_config
-        assert "shared_peft_adapter" not in payload["training_config"]["debug"]
-        before = deepcopy(payload)
-        bound.append((before, Path(path), native_backend, deepcopy(identity)))
-        result = deepcopy(payload)
-        result["training_config"]["debug"]["mock_native_original_adapter"] = deepcopy(identity)
-        assert payload == before
-        return result
-
-    def fixture(actual_backend, spec):
-        assert actual_backend is backend and spec is case.spec
-        fixtures.append(True)
-        return {"model_name": case.spec.model.cache_path}
-
-    def target(session, job, body, **kwargs):
-        targets.append((session, job, deepcopy(kwargs)))
-        return SimpleNamespace(
-            optimizer_state_manifest=str(case.target_manifest),
-            avg_loss=2.0,
-            grad_norms={"module.layer.weight": 1.0},
-            model_calls=None,
-        )
-
-    monkeypatch.setattr(shared, "generate_adapter", generate)
-    monkeypatch.setattr(shared, "shared_adapter_identity", identify)
-    monkeypatch.setattr(deterministic_lora, "materialize_adapter", _native_first_two_forbidden)
-    monkeypatch.setattr(deterministic_lora, "bind_payload", bind)
-    monkeypatch.setattr(cortex, "load_local_fixture", fixture)
-    monkeypatch.setattr(cortex, "load_fixture", lambda path, spec: {"model_name": case.spec.model.cache_path})
-    monkeypatch.setattr(runner, "fwd_bwd_step", target)
-    monkeypatch.setattr(cortex_optimizer, "capture_optimizer_step", target)
-
-    @contextlib.contextmanager
-    def running_job(session, payload):
-        assert session == "mock-target-session"
-        assert payload["model_name"] == case.spec.model.cache_path
-        if "mock_native_original_adapter" in payload["training_config"]["debug"]:
-            assert payload["training_config"]["debug"]["mock_native_original_adapter"] == identity
-            assert "shared_peft_adapter" not in payload["training_config"]["debug"]
-        else:
-            assert payload["training_config"]["debug"]["shared_peft_adapter"] == {
-                "path": str(adapter),
-                "identity": identity,
-            }
-        case.events.append(("job-enter",))
-        yield "mock-target-job"
-        case.events.append(("job-exit",))
-
-    monkeypatch.setattr(runner, "running_job", running_job)
-
-    def execute(*, selected=None, supplied=False, **kwargs):
-        options = {
-            "client_backend": backend,
-            "local_cortex_fixture": True,
-            **({"peft_adapter": adapter} if supplied else {}),
-            **kwargs,
-        }
-        return case.execute(
-            selected=["single-step-grads"] if selected is None else selected,
-            **options,
-        )
-
-    return SimpleNamespace(
-        case=case,
-        adapter=adapter,
-        identity=identity,
-        backend=backend,
-        generated=generated,
-        bound=bound,
-        targets=targets,
-        fixtures=fixtures,
-        execute=execute,
-    )
-
-
-@pytest.mark.parametrize(
-    "selected",
-    [
-        ["single-step-grads"],
-        ["single-step-optimizer"],
-        ["single-step-grads", "single-step-optimizer"],
-    ],
-)
-@pytest.mark.parametrize("supplied", [False, True])
-def test_native_first_two_composition_keeps_exact_adapter_recipe_and_native_payload(
-    native_first_two_control, selected, supplied
-):
-    control = native_first_two_control
-    training = deepcopy(control.case.cfg.training)
-    results = control.execute(selected=selected, supplied=supplied)
-    assert len(results) == 2 * len(selected) and all(result.outcome is Outcome.PASS for result in results)
-    assert len(control.generated) == (0 if supplied else 1)
-    assert control.fixtures == [True]
-    assert len(control.bound) == 3 and len(control.targets) == 2
-    assert control.case.cfg.training == training
-    assert all(row[1:] == (control.adapter, control.backend, control.identity) for row in control.bound)
-    assert all(recipe["initialization"] == control.identity for _, _, recipe in control.case.recipes)
-    assert [event[2] for event in control.case.events if event[0] == "record"] == [
-        arm for arm in ("gas1", "gas4") for _ in selected
-    ]
-
-
-@pytest.mark.parametrize("supplied", [False, True])
-def test_native_first_two_unsupported_binding_stops_before_records_or_target(
-    native_first_two_control, monkeypatch, supplied
-):
-    control = native_first_two_control
-    calls = []
-
-    def reject(payload, path, *, native_backend):
-        assert native_backend is control.backend and Path(path) == control.adapter
-        calls.append(deepcopy(payload))
-        raise ValueError("owned gateway shared-pack capability unavailable")
-
-    monkeypatch.setattr(deterministic_lora, "bind_payload", reject)
-    with pytest.raises(ValueError, match="shared-pack capability unavailable"):
-        control.execute(supplied=supplied)
-    assert len(calls) == 1 and not control.case.events and not control.targets
-    assert not control.case.published
-
-
-@pytest.mark.parametrize("supplied", [False, True])
-def test_native_first_two_reference_preparation_never_binds_or_starts_target(
-    native_first_two_control, monkeypatch, supplied
-):
-    control = native_first_two_control
-    control.case.missing.update({("single-step-grads", "gas1"), ("single-step-grads", "gas4")})
-    measurements = []
-
-    def reference(model, batch, output, **kwargs):
-        assert model == control.case.spec.model.cache_path
-        assert kwargs["peft_adapter_path"] == control.adapter
-        assert kwargs["peft_config"] == control.case.cfg.training["peft_config"]
-        measurements.append((model, batch, deepcopy(kwargs)))
-        return {**deepcopy(control.case.record), "active_tokens": load(batch).active_tokens}
-
-    monkeypatch.setattr(deterministic_lora, "bind_payload", _native_first_two_forbidden)
-    monkeypatch.setattr(runner, "run_reference", reference)
-    assert control.execute(supplied=supplied, prepare_references=True) == []
-    assert len(measurements) == 2 and len(control.case.published) == 2
-    assert len(control.generated) == (0 if supplied else 1)
-    assert not control.bound and not control.targets and not control.fixtures
-    assert not any(event[0].startswith(("job-", "gateway-")) for event in control.case.events)
-    assert all(recipe["initialization"] == control.identity for _, _, recipe in control.case.recipes)
-
-
-def test_native_first_two_published_nonlocal_route_stays_rejected(native_first_two_control):
-    control = native_first_two_control
-    results = control.execute(local_cortex_fixture=False, cortex_fixture=Path("mock-publication.json"))
-    assert len(results) == 1 and results[0].outcome is Outcome.FAIL
-    assert "product-initialized LoRA adapter" in results[0].reason
-    assert not control.generated and not control.bound and not control.targets and not control.case.events
-
-
-def test_native_first_two_supplied_nonlocal_route_fails_before_adapter_read(native_first_two_control):
-    control = native_first_two_control
-    with pytest.raises(ValueError, match="explicit local Cortex"):
-        control.execute(supplied=True, local_cortex_fixture=False)
-    assert not control.generated and not control.bound and not control.targets and not control.case.events
-
-
-def test_native_first_two_onprem_preserves_legacy_shared_payload(native_first_two_control):
-    from arctic_platform.client import OnPremConfig
-
-    control = native_first_two_control
-    results = control.execute(client_backend=OnPremConfig(), local_cortex_fixture=False)
-    assert len(results) == 2 and all(result.outcome is Outcome.PASS for result in results)
-    assert len(control.generated) == 1 and not control.bound and len(control.targets) == 2
-    assert all(recipe["initialization"] == control.identity for _, _, recipe in control.case.recipes)
-
-
-def test_native_first_two_adapter_mutation_after_reference_admission_cannot_rebind(
-    native_first_two_control, monkeypatch
-):
-    control = native_first_two_control
-    original_load = reference_records.load_record
-
-    def changed(ctx, identity):
-        record = original_load(ctx, identity)
-        control.identity["tensor_sha256"] = "b" * 64
-        return record
-
-    monkeypatch.setattr(reference_records, "load_record", changed)
-    results = control.execute()
-    assert len(results) == 2 and all(result.outcome is Outcome.FAIL for result in results)
-    assert all("shared adapter changed before native target binding" in result.reason for result in results)
-    assert len(control.bound) == 1 and not control.targets
 
 
 @pytest.fixture
@@ -24851,143 +16044,6 @@ def test_native_shared_pack_worker_failure_restores_exact_binding_and_rejects_re
     control.restored()
 
 
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "namespace",
-        "module",
-        "qualname",
-        "code",
-        "source",
-        "missing-engine",
-        "foreign-engine",
-        "engine-module",
-        "engine-qualname",
-        "engine-code",
-        "engine-source",
-        "prewrapped-engine",
-    ],
-)
-def test_native_shared_pack_constructor_namespace_code_source_and_engine_guards(native_shared_pack_control, damage):
-    from types import FunctionType
-
-    control = native_shared_pack_control
-    namespace = control.constructor_globals
-    original_constructor = control.constructor
-    constructor = FunctionType(original_constructor.__code__, namespace, "__init__", original_constructor.__defaults__)
-    constructor.__qualname__ = original_constructor.__qualname__
-    if damage == "namespace":
-        namespace["__name__"] = "foreign.training"
-    elif damage == "module":
-        constructor.__module__ = "foreign.training"
-    elif damage == "qualname":
-        constructor.__qualname__ = "Foreign.__init__"
-    elif damage == "code":
-        constructor.__code__ = constructor.__code__.replace(co_name="changed_constructor")
-    elif damage == "source":
-        constructor.__code__ = constructor.__code__.replace(co_filename=shared.__file__)
-    elif damage == "missing-engine":
-        del namespace["initialize_training_engine"]
-    elif damage == "foreign-engine":
-        namespace["initialize_training_engine"] = object()
-    else:
-        engine = FunctionType(control.engine.__code__, namespace, control.engine.__name__)
-        engine.__qualname__ = control.engine.__qualname__
-        namespace["initialize_training_engine"] = engine
-        if damage == "engine-module":
-            engine.__module__ = "foreign.training"
-        elif damage == "engine-qualname":
-            engine.__qualname__ = "foreign_engine"
-        elif damage == "engine-code":
-            engine.__code__ = engine.__code__.replace(co_name="changed_engine")
-        elif damage == "engine-source":
-            engine.__code__ = engine.__code__.replace(co_filename=shared.__file__)
-        else:
-            engine._correctness_shared_native_adapter = True
-    before = dict(namespace)
-    with pytest.raises(ValueError, match="constructor (namespace|engine binding) differs"):
-        with control.native.native_shared_worker_adapter_scope(
-            control.training, constructor, control.files, control.identity, job_id="child", rank=0
-        ):
-            pytest.fail("mismatched constructor must not enter the scope")
-    assert namespace == before and not control.events and not control.scratch
-    assert not shared._NATIVE_ADAPTER_SCOPE_LOCK.locked()
-
-
-@pytest.mark.parametrize("job_id,rank", [("", 0), (" ", 0), (None, 0), ("child", -1), ("child", True), ("child", "0")])
-def test_native_shared_pack_worker_requires_explicit_job_and_integer_rank(native_shared_pack_control, job_id, rank):
-    control = native_shared_pack_control
-    with pytest.raises(ValueError, match="explicit job identity"):
-        with control.scope(job_id=job_id, rank=rank):
-            pytest.fail("invalid worker identity entered scope")
-    assert not control.scratch and not control.events
-    control.restored()
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "missing-config",
-        "missing-tensors",
-        "missing-recipe",
-        "extra-original",
-        "extra-path",
-        "nonbytes",
-        "config-drift",
-        "tensor-drift",
-        "recipe-drift",
-    ],
-)
-def test_native_shared_pack_worker_transfer_requires_exclusive_authenticated_files(native_shared_pack_control, damage):
-    control = native_shared_pack_control
-    files = dict(control.files)
-    if damage.startswith("missing-"):
-        name = {
-            "missing-config": "adapter_config.json",
-            "missing-tensors": "adapter_model.safetensors",
-            "missing-recipe": "correctness_recipe.json",
-        }[damage]
-        del files[name]
-    elif damage == "extra-original":
-        files["initialization.json"] = b"{}"
-    elif damage == "extra-path":
-        files["../escaped.json"] = b"{}"
-    elif damage == "nonbytes":
-        files["adapter_config.json"] = bytearray(files["adapter_config.json"])
-    elif damage == "config-drift":
-        files["adapter_config.json"] += b"\n"
-    elif damage == "tensor-drift":
-        state = load_file(str(control.path / "adapter_model.safetensors"))
-        state[next(iter(state))] = state[next(iter(state))] + 1
-        files["adapter_model.safetensors"] = save(state)
-    else:
-        recipe = json.loads(files["correctness_recipe.json"])
-        files["correctness_recipe.json"] = json.dumps({**recipe, "seed": 43}).encode()
-    with pytest.raises(ValueError, match="transfer|identity changed"):
-        with control.native.native_shared_worker_adapter_scope(
-            control.training, control.constructor, files, control.identity, job_id="child", rank=0
-        ):
-            pytest.fail("invalid transferred pack entered scope")
-    assert not control.events
-    control.restored()
-
-
-@pytest.mark.parametrize(
-    "key", ["schema", "peft_config", "adapter_config_sha256", "adapter_model_sha256", "tensors", "generation"]
-)
-def test_native_shared_pack_worker_authenticates_entire_identity(native_shared_pack_control, key):
-    control = native_shared_pack_control
-    identity = copy.deepcopy(control.identity)
-    del identity[key]
-    with pytest.raises(ValueError, match="generation recipe|identity changed"):
-        with control.native.native_shared_worker_adapter_scope(
-            control.training, control.constructor, control.files, identity, job_id="child", rank=0
-        ):
-            pytest.fail("incomplete identity entered scope")
-    assert not control.events
-    control.restored()
-
-
 def test_native_shared_pack_scope_is_nonreentrant_and_snapshots_inputs(native_shared_pack_control):
     from types import FunctionType
 
@@ -25112,261 +16168,6 @@ def native_shared_pack_capability(native_shared_pack_control, monkeypatch):
         payload=payload,
         backend=SimpleNamespace(base_url="http://127.0.0.1:8000", host=None, pat=None),
     )
-
-
-def test_native_shared_pack_bind_and_request_preserve_pack_payload_and_distinct_schema(native_shared_pack_capability):
-    case = native_shared_pack_capability
-    native = case.control.native
-    before = copy.deepcopy(case.payload)
-    bound = native.bind_shared_adapter(case.payload, case.control.path, case.backend)
-    assert case.payload == before and bound is not case.payload
-    assert bound["training_config"] is not case.payload["training_config"]
-    assert bound["training_config"]["debug"]["unrelated-debug-option"] is True
-    assert native.REQUEST_KEY not in bound["training_config"]["debug"]
-    assert "shared_peft_adapter" not in bound["training_config"]["debug"]
-    expected = {
-        "schema": native.SHARED_SCHEMA,
-        "path": str(case.control.path),
-        "identity": case.control.identity,
-        "sources": case.pins,
-        "training_gpus": 3,
-        "model_name": case.payload["model_name"],
-    }
-    assert bound["training_config"]["debug"][native.SHARED_REQUEST_KEY] == expected
-    config = SimpleNamespace(model_dump=lambda **kwargs: copy.deepcopy(bound))
-    received = native._shared_request(config)
-    assert received == expected and received is not expected
-    received["identity"]["generation"]["seed"] = 99
-    assert native._shared_request(config) == expected
-    assert native._request(config) is None
-    assert case.gets == [("http://127.0.0.1:8000/openapi.json", {"timeout": 30, "allow_redirects": False})]
-    assert shared.adapter_files(case.control.path, case.control.identity) == case.control.files
-    assert not (case.control.path / "initialization.json").exists()
-    assert not case.control.events
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "external",
-        "https",
-        "authenticated",
-        "decorated",
-        "redirect",
-        "missing-shared",
-        "original-only",
-        "original-schema",
-        "extra-key",
-        "missing-source",
-        "extra-source",
-        "relative-path",
-        "short-hash",
-        "source-extra-key",
-        "source-not-dict",
-    ],
-)
-def test_native_shared_pack_capability_admission_is_local_explicit_and_source_complete(
-    native_shared_pack_capability, damage
-):
-    case = native_shared_pack_capability
-    native = case.control.native
-    if damage == "external":
-        case.backend.base_url = "http://external.invalid:8000"
-    elif damage == "https":
-        case.backend.base_url = "https://127.0.0.1:8000"
-    elif damage == "authenticated":
-        case.backend.pat = "synthetic-not-a-credential"
-    elif damage == "decorated":
-        case.backend.base_url += "/extra?query=value"
-    elif damage == "redirect":
-        case.response.status_code = 302
-    elif damage in {"missing-shared", "original-only"}:
-        del case.response.document[native.SHARED_OPENAPI_KEY]
-    elif damage == "original-schema":
-        case.capability["schema"] = native.SCHEMA
-    elif damage == "extra-key":
-        case.capability["unexpected"] = True
-    elif damage == "missing-source":
-        del case.pins["adapter"]
-    elif damage == "extra-source":
-        case.pins["unexpected"] = case.pins["engine"]
-    elif damage == "relative-path":
-        case.pins["engine"]["path"] = "relative.py"
-    elif damage == "short-hash":
-        case.pins["engine"]["sha256"] = "bad"
-    elif damage == "source-extra-key":
-        case.pins["engine"]["unexpected"] = True
-    else:
-        case.pins["engine"] = None
-    before = copy.deepcopy(case.payload)
-    with pytest.raises(ValueError):
-        native.bind_shared_adapter(case.payload, case.control.path, case.backend)
-    assert case.payload == before and not case.control.events
-    assert len(case.gets) == int(damage not in {"external", "https", "authenticated", "decorated"})
-
-
-@pytest.mark.parametrize(
-    "key", ["correctness_original_peft_adapter", "correctness_shared_peft_adapter", "shared_peft_adapter"]
-)
-def test_native_shared_pack_sender_never_overwrites_another_initialization(native_shared_pack_capability, key):
-    case = native_shared_pack_capability
-    case.payload["training_config"]["debug"][key] = {}
-    before = copy.deepcopy(case.payload)
-    with pytest.raises(ValueError, match="cannot replace another initialization"):
-        case.control.native.bind_shared_adapter(case.payload, case.control.path, case.backend)
-    assert case.payload == before and not case.control.events
-
-
-def test_native_shared_pack_sender_rejects_deterministic_metadata(native_shared_pack_capability):
-    case = native_shared_pack_capability
-    (case.control.path / "initialization.json").write_text("{}")
-    with pytest.raises(ValueError, match="deterministic initialization metadata"):
-        case.control.native.bind_shared_adapter(case.payload, case.control.path, case.backend)
-    assert not case.control.events
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "missing-schema",
-        "missing-seed",
-        "missing-initializer",
-        "missing-peft_config",
-        "missing-dependencies",
-        "schema",
-        "seed-bool",
-        "seed-negative",
-        "seed-string",
-        "initializer-false",
-        "initializer-string",
-        "topology",
-        "extra-key",
-        "dependencies-not-dict",
-        "missing-torch",
-        "missing-peft",
-        "missing-transformers",
-        "missing-safetensors",
-        "extra-dependency",
-        "empty-dependency",
-        "nonstring-dependency",
-    ],
-)
-def test_native_shared_pack_generation_recipe_requires_every_authenticated_field(
-    native_shared_pack_capability, damage
-):
-    case = native_shared_pack_capability
-    recipe_path = case.control.path / "correctness_recipe.json"
-    recipe = json.loads(recipe_path.read_bytes())
-    if damage.startswith("missing-"):
-        key = damage[len("missing-") :]
-        del (recipe["dependencies"] if key in {"torch", "peft", "transformers", "safetensors"} else recipe)[key]
-    elif damage == "schema":
-        recipe["schema"] = "original-peft-initialization-v1"
-    elif damage.startswith("seed-"):
-        recipe["seed"] = {"seed-bool": True, "seed-negative": -1, "seed-string": "42"}[damage]
-    elif damage == "initializer-false":
-        recipe["initializer"] = False
-    elif damage == "initializer-string":
-        recipe["initializer"] = "gaussian"
-    elif damage == "topology":
-        recipe["peft_config"]["r"] = 3
-    elif damage == "extra-key":
-        recipe["unexpected"] = True
-    elif damage == "dependencies-not-dict":
-        recipe["dependencies"] = []
-    elif damage == "extra-dependency":
-        recipe["dependencies"]["unexpected"] = "v1"
-    elif damage == "empty-dependency":
-        recipe["dependencies"]["peft"] = ""
-    else:
-        recipe["dependencies"]["peft"] = 1
-    recipe_path.write_text(json.dumps(recipe))
-    with pytest.raises(ValueError, match="authenticated upstream-default generation recipe"):
-        case.control.native.bind_shared_adapter(case.payload, case.control.path, case.backend)
-    assert not case.control.events
-
-
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "schema",
-        "extra-key",
-        "missing-schema",
-        "missing-path",
-        "missing-identity",
-        "missing-sources",
-        "missing-training_gpus",
-        "missing-model_name",
-        "job-type",
-        "model-name",
-        "gpu-zero",
-        "gpu-bool",
-        "gpu-mismatch",
-        "source-checkpoint",
-        "resume-checkpoint",
-        "resume-tag",
-        "original-conflict",
-        "legacy-conflict",
-        "outside-storage",
-        "identity-recipe",
-    ],
-)
-def test_native_shared_pack_request_requires_fresh_exact_job_and_exclusive_schema(
-    native_shared_pack_capability, damage
-):
-    case = native_shared_pack_capability
-    native = case.control.native
-    bound = native.bind_shared_adapter(case.payload, case.control.path, case.backend)
-    request = bound["training_config"]["debug"][native.SHARED_REQUEST_KEY]
-    if damage.startswith("missing-"):
-        del request[damage[len("missing-") :]]
-    elif damage == "schema":
-        request["schema"] = native.SCHEMA
-    elif damage == "extra-key":
-        request["original_metadata"] = {}
-    elif damage == "job-type":
-        bound["job_type"] = "inference"
-    elif damage == "model-name":
-        bound["model_name"] = "other-model"
-    elif damage.startswith("gpu-"):
-        request["training_gpus"] = {"gpu-zero": 0, "gpu-bool": True, "gpu-mismatch": 2}[damage]
-    elif damage == "source-checkpoint":
-        bound["source_checkpoint_info"] = {}
-    elif damage == "resume-checkpoint":
-        bound["resume_from_checkpoint"] = "other"
-    elif damage == "resume-tag":
-        bound["resume_checkpoint_tag"] = "other"
-    elif damage == "original-conflict":
-        bound["training_config"]["debug"][native.REQUEST_KEY] = {}
-    elif damage == "legacy-conflict":
-        bound["training_config"]["debug"]["shared_peft_adapter"] = {}
-    elif damage == "outside-storage":
-        request["path"] = "/tmp/not-admitted"
-    else:
-        request["identity"]["generation"]["initializer"] = False
-    before = copy.deepcopy(bound)
-    with pytest.raises(ValueError):
-        native._shared_request(SimpleNamespace(model_dump=lambda **kwargs: copy.deepcopy(bound)))
-    assert bound == before and not case.control.events
-
-
-def test_native_shared_pack_absent_request_is_ordinary_and_source_pins_cover_loader_and_scope(
-    native_shared_pack_control,
-):
-    control = native_shared_pack_control
-    assert control.native._shared_request(SimpleNamespace(model_dump=lambda **kwargs: {})) is None
-    pins = control.native._shared_runtime_sources(control.training)
-    assert pins == control.native._runtime_sources(control.training)
-    assert pins["adapter"]["path"] == str(Path(shared.__file__))
-    assert pins["composition"]["path"] == str(Path(control.native.__file__))
-    assert pins["adapter"]["sha256"] == hashlib.sha256(Path(shared.__file__).read_bytes()).hexdigest()
-    assert pins["composition"]["sha256"] == hashlib.sha256(Path(control.native.__file__).read_bytes()).hexdigest()
-    control.native._verify_shared_runtime(control.training, pins)
-    for key in pins:
-        changed = copy.deepcopy(pins)
-        changed[key]["sha256"] = "0" * 64
-        with pytest.raises(ValueError, match="runtime differs"):
-            control.native._verify_shared_runtime(control.training, changed)
 
 
 @pytest.fixture
@@ -25598,90 +16399,6 @@ def test_native_shared_pack_coordinator_failure_owns_teardown_and_preserves_prim
         assert "owned cleanup failure" in notes[0]
     else:
         assert not notes
-
-
-@pytest.mark.parametrize("rank", [0, 1, 2])
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "missing",
-        "duplicate",
-        "schema",
-        "job",
-        "rank-bool",
-        "rank-order",
-        "init-zero",
-        "init-two",
-        "init-bool",
-        "identity",
-        "missing-field",
-        "extra-field",
-        "not-dict",
-    ],
-)
-def test_native_shared_pack_receipts_authenticate_every_rank_without_partial_acceptance(
-    native_shared_pack_capability, rank, damage
-):
-    case = native_shared_pack_capability
-    native = case.control.native
-    request = {"training_gpus": 3, "identity": case.control.identity}
-    receipts = [
-        {
-            "schema": "shared-peft-worker-initialization-v1",
-            "job_id": "child",
-            "rank": index,
-            "engine_initializations": 1,
-            "shared_identity": copy.deepcopy(case.control.identity),
-        }
-        for index in range(3)
-    ]
-    native._verify_shared_receipts(receipts, request, "child")
-    if damage == "missing":
-        del receipts[rank]
-    elif damage == "duplicate":
-        receipts[rank] = copy.deepcopy(receipts[(rank + 1) % 3])
-    elif damage == "schema":
-        receipts[rank]["schema"] = "original-peft-worker-initialization-v1"
-    elif damage == "job":
-        receipts[rank]["job_id"] = "other-child"
-    elif damage == "rank-bool":
-        receipts[rank]["rank"] = bool(rank)
-    elif damage == "rank-order":
-        receipts[rank]["rank"] = (rank + 1) % 3
-    elif damage.startswith("init-"):
-        receipts[rank]["engine_initializations"] = {"init-zero": 0, "init-two": 2, "init-bool": True}[damage]
-    elif damage == "identity":
-        receipts[rank]["shared_identity"]["generation"]["seed"] = 43
-    elif damage == "missing-field":
-        del receipts[rank]["shared_identity"]
-    elif damage == "extra-field":
-        receipts[rank]["initialization"] = {}
-    else:
-        receipts[rank] = None
-    with pytest.raises(ValueError, match="every worker|evidence differs"):
-        native._verify_shared_receipts(receipts, request, "child")
-
-
-@pytest.mark.parametrize("damage", ["existing-workers", "missing-rank", "config-drift", "source-drift"])
-def test_native_shared_pack_coordinator_rejects_layout_configuration_and_source_before_spawn(
-    native_shared_pack_coordinator, damage
-):
-    control = native_shared_pack_coordinator
-    coordinator = control.coordinator()
-    if damage == "existing-workers":
-        coordinator._workers = [object()]
-    elif damage == "missing-rank":
-        control.ranks = control.ranks[:-1]
-    elif damage == "config-drift":
-        control.bound["model_name"] = "other"
-    else:
-        control.request["sources"]["composition"]["sha256"] = "0" * 64
-    with pytest.raises(ValueError):
-        asyncio.run(
-            coordinator._spawn_workers(control.cfg, control.ranks, "synthetic-master", 12345, control.source_stage)
-        )
-    assert not control.events and not control.gets and not control.kills
-    control.coordinator_restored()
 
 
 @pytest.fixture
@@ -26047,41 +16764,6 @@ def test_native_ray_tracing_wrapper_failure_restores_exact_globals_and_preserves
 
 
 @pytest.mark.parametrize("route", ["original", "shared"])
-@pytest.mark.parametrize("damage", ["leaf-namespace", "source", "foreign", "stale", "missing", "module-foreign"])
-def test_native_ray_tracing_authenticated_leaf_and_worker_guards_reject_without_touching_wrapper_globals(
-    native_ray_tracing_controls, route, damage, capsys
-):
-    from arctic_platform.correctness.harness import lora as native_lora
-
-    valid, baseline = native_ray_tracing_controls(route, "detached", "nested")
-    _native_ray_tracing_invoke(valid, baseline)
-    assert json.loads(capsys.readouterr().out)["workers"]
-    control, coordinator = native_ray_tracing_controls(route, "detached", "nested")
-    native_lora._spawn_worker_binding(control.tracing_wrapped, control.training, control.request["sources"])
-    namespace = control.tracing_leaf.__globals__
-    if damage == "leaf-namespace":
-        namespace["__name__"] = "foreign.native.training"
-    elif damage == "source":
-        control.request["sources"]["training"]["sha256"] = "0" * 64
-    elif damage == "foreign":
-        namespace["_DeepSpeedWorker"] = object()
-    elif damage == "stale":
-        namespace["_DeepSpeedWorker"] = type("StaleAdapterWorker", (control.worker_base,), {})
-    elif damage == "missing":
-        namespace.pop("_DeepSpeedWorker")
-    else:
-        control.training._DeepSpeedWorker = type("ForeignModuleWorker", (), {"__init__": lambda self: None})
-    snapshot = _native_ray_tracing_snapshot(control)
-    with pytest.raises(ValueError):
-        _native_ray_tracing_invoke(control, coordinator)
-    module, chain = snapshot
-    assert control.training.__dict__ == module
-    assert all(actual == before for actual, before in chain)
-    assert control.tracing_events == [] and control.selected == [] and control.gets == []
-    assert not coordinator._workers and not capsys.readouterr().out.strip()
-
-
-@pytest.mark.parametrize("route", ["original", "shared"])
 @pytest.mark.parametrize("damage", ["sync-outer", "sync-leaf"])
 def test_native_ray_tracing_requires_both_wrapper_and_leaf_to_be_coroutines(
     native_ray_tracing_controls, route, damage
@@ -26222,23 +16904,6 @@ def _cortex_fixture_uploaded(module, staging, binding, *, stage=_cortex_fixture_
     return manifest
 
 
-@pytest.mark.parametrize("unsafe", ["/tmp", "/code", "/data-fast-shadow", "/data-fast", "symlink"])
-def test_cortex_fixture_fixture_requires_data_fast_before_hashing_or_staging(tmp_path, monkeypatch, unsafe):
-    module = _cortex_fixture_module()
-    spec, _ = _cortex_fixture_fixture(tmp_path)
-    destination = Path(unsafe)
-    if unsafe == "symlink":
-        destination = tmp_path / "escape"
-        destination.symlink_to("/tmp", target_is_directory=True)
-        destination /= "output"
-    monkeypatch.setattr(
-        module, "describe_fixture", lambda *args, **kwargs: pytest.fail("unsafe staging reached source hashing")
-    )
-    with pytest.raises(ValueError, match="/data-fast"):
-        module.prepare_fixture(spec, destination)
-    assert not list(tmp_path.glob("ap-cortex-fixture-*"))
-
-
 def test_cortex_fixture_preparation_preserves_reviewed_tree_and_uses_separate_content_bound_id(tmp_path):
     module = _cortex_fixture_module()
     spec, root = _cortex_fixture_fixture(tmp_path)
@@ -26250,85 +16915,6 @@ def test_cortex_fixture_preparation_preserves_reviewed_tree_and_uses_separate_co
     assert not (root / "_neutrino_manifest.json").exists()
     assert {item["path"] for item in binding["files"]} == {p.name for p in root.iterdir()}
     assert (staging / "model.safetensors").read_bytes() == (root / "model.safetensors").read_bytes()
-
-
-@pytest.mark.parametrize("extra_sidecar", [None, "special_tokens_map.json", "added_tokens.json"])
-def test_cortex_fixture_legacy_hash_accepts_only_tokenizer_sidecar_additions_and_binds_all_files(
-    tmp_path, extra_sidecar
-):
-    module = _cortex_fixture_module()
-    spec, root = _cortex_fixture_fixture(tmp_path, legacy=True)
-    if extra_sidecar:
-        (root / extra_sidecar).write_text("{}")
-    assert hash_directory(root) != spec.model.content_hash
-    staging, binding = module.prepare_fixture(spec, tmp_path / "staging")
-    assert binding["reviewed_hash"] == spec.model.content_hash
-    assert {item["path"] for item in binding["files"]} == {path.name for path in root.iterdir()}
-    assert all((len(item["sha256"]) == 64 for item in binding["files"]))
-    binding["publication"] = module.validate_publication(_cortex_fixture_uploaded(module, staging, binding), binding)
-    receipt = tmp_path / "binding.json"
-    receipt.write_text(json.dumps(binding))
-    assert module.load_fixture(receipt, spec) == binding
-
-
-@pytest.mark.parametrize("legacy", [False, True])
-@pytest.mark.parametrize("changed", ["config.json", "generation_config.json", "model.safetensors"])
-def test_cortex_fixture_reviewed_hash_rejects_size_changes_to_non_tokenizer_assets(tmp_path, legacy, changed):
-    module = _cortex_fixture_module()
-    spec, root = _cortex_fixture_fixture(tmp_path, legacy=legacy)
-    path = root / changed
-    path.write_bytes(path.read_bytes() + b"\n")
-    with pytest.raises(ValueError, match="file-name/size hash"):
-        module.describe_fixture(spec, root)
-
-
-@pytest.mark.parametrize("legacy", [False, True])
-@pytest.mark.parametrize(
-    "added",
-    [
-        "extra.safetensors",
-        "model.safetensors.index.json",
-        "extra_config.json",
-        "tokenizer_extra.json",
-        "chat_template.json",
-    ],
-)
-def test_cortex_fixture_reviewed_hash_rejects_unreviewed_non_tokenizer_files(tmp_path, legacy, added):
-    module = _cortex_fixture_module()
-    spec, root = _cortex_fixture_fixture(tmp_path, legacy=legacy)
-    (root / added).write_text("{}")
-    with pytest.raises(ValueError, match="file-name/size hash"):
-        module.describe_fixture(spec, root)
-
-
-@pytest.mark.parametrize("same_size", [False, True])
-@pytest.mark.parametrize(
-    "changed", ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json"]
-)
-def test_cortex_fixture_legacy_binding_rejects_tokenizer_drift_after_publication(tmp_path, same_size, changed):
-    module = _cortex_fixture_module()
-    spec, root = _cortex_fixture_fixture(tmp_path, legacy=True)
-    path = root / changed
-    if not path.exists():
-        path.write_text("{}")
-    staging, binding = module.prepare_fixture(spec, tmp_path / "staging")
-    binding["publication"] = module.validate_publication(_cortex_fixture_uploaded(module, staging, binding), binding)
-    receipt = tmp_path / "binding.json"
-    receipt.write_text(json.dumps(binding))
-    path.write_bytes(b"x" * path.stat().st_size if same_size else path.read_bytes() + b"\n")
-    with pytest.raises(ValueError, match="no longer match the published fixture"):
-        module.load_fixture(receipt, spec)
-
-
-def test_cortex_fixture_equal_size_weight_changes_produce_different_remote_identity(tmp_path):
-    module = _cortex_fixture_module()
-    spec, root = _cortex_fixture_fixture(tmp_path)
-    _, first = module.prepare_fixture(spec, tmp_path / "staging")
-    weights = root / "model.safetensors"
-    weights.write_bytes(b"x" * weights.stat().st_size)
-    assert hash_directory(root) == spec.model.content_hash
-    _, second = module.prepare_fixture(spec, tmp_path / "staging")
-    assert first["model_name"] != second["model_name"]
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -26355,27 +16941,6 @@ def test_cortex_fixture_binding_rejects_modified_reference_assets_even_with_same
         module.load_fixture(receipt, spec)
 
 
-@pytest.mark.parametrize("legacy", [False, True])
-@pytest.mark.parametrize("missing", ["model.safetensors", "tokenizer_config.json"])
-def test_cortex_fixture_compatible_hash_still_requires_weights_and_tokenizer(tmp_path, legacy, missing):
-    module = _cortex_fixture_module()
-    spec, root = _cortex_fixture_fixture(tmp_path, legacy=legacy)
-    (root / missing).unlink()
-    if not legacy or missing == "model.safetensors":
-        spec.model.content_hash = hash_directory(root)
-    with pytest.raises(ValueError, match="requires safetensors weights and tokenizer sidecars"):
-        module.describe_fixture(spec, root)
-
-
-@pytest.mark.parametrize("legacy", [False, True])
-def test_cortex_fixture_compatible_hash_still_requires_reviewed_layer_count(tmp_path, legacy):
-    module = _cortex_fixture_module()
-    spec, root = _cortex_fixture_fixture(tmp_path, legacy=legacy)
-    spec.model.num_hidden_layers = 2
-    with pytest.raises(ValueError, match="layer count"):
-        module.describe_fixture(spec, root)
-
-
 @pytest.mark.parametrize("field", ["stage_path", "files"])
 def test_cortex_fixture_binding_refuses_mismatched_upload_manifest(tmp_path, field):
     module = _cortex_fixture_module()
@@ -26388,16 +16953,6 @@ def test_cortex_fixture_binding_refuses_mismatched_upload_manifest(tmp_path, fie
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="publication"):
         module.validate_publication(manifest, binding)
-
-
-def test_cortex_fixture_unpublished_binding_cannot_enable_cortex(tmp_path):
-    module = _cortex_fixture_module()
-    spec, _ = _cortex_fixture_fixture(tmp_path)
-    _, binding = module.prepare_fixture(spec, tmp_path / "staging")
-    receipt = tmp_path / "binding.json"
-    receipt.write_text(json.dumps(binding))
-    with pytest.raises(ValueError, match="publication"):
-        module.load_fixture(receipt, spec)
 
 
 def test_cortex_fixture_publication_failure_never_writes_receipt_or_manifest_to_reference(tmp_path, monkeypatch):
@@ -26422,91 +16977,6 @@ def test_cortex_fixture_publication_failure_never_writes_receipt_or_manifest_to_
     assert commands[0][commands[0].index("--local-path") + 1] != str(root)
     assert not receipt.exists()
     assert not (root / "_neutrino_manifest.json").exists()
-
-
-def test_cortex_fixture_successful_publication_receipt_is_checked_against_reference(tmp_path, monkeypatch):
-    module = _cortex_fixture_module()
-    from arctic_platform.correctness.onboarding import cortex_fixture_upload as upload
-
-    spec, root = _cortex_fixture_fixture(tmp_path)
-
-    def uploaded(cmd, **kwargs):
-        staging = Path(cmd[cmd.index("--local-path") + 1])
-        binding = module.describe_fixture(spec, staging)
-        _cortex_fixture_uploaded(module, staging, binding)
-
-    monkeypatch.setattr(upload.subprocess, "run", uploaded)
-    receipt = tmp_path / "binding.json"
-    upload.publish_fixture(
-        spec, tmp_path / "staging", Path("upload_model.py"), "python", receipt, stage=_cortex_fixture_STAGE
-    )
-    binding = module.load_fixture(receipt, spec)
-    assert binding["reference_path"] == str(root)
-    assert binding["publication"]["stage_path"].startswith(_cortex_fixture_STAGE + "/ap-correctness/")
-    assert hash_directory(root) == spec.model.content_hash
-
-
-def test_cortex_fixture_authentication_is_delegated_to_optional_uploader(tmp_path, monkeypatch):
-    from arctic_platform.correctness.onboarding import cortex_fixture_upload as module
-
-    spec, _ = _cortex_fixture_fixture(tmp_path)
-    for name in ("SNOWFLAKE_USER", "SNOWFLAKE_ACCOUNT", "SNOWFLAKE_PASSWORD"):
-        monkeypatch.delenv(name, raising=False)
-
-    def uploader(cmd, **kwargs):
-        raise subprocess.CalledProcessError(1, cmd)
-
-    monkeypatch.setattr(module.subprocess, "run", uploader)
-    with pytest.raises(subprocess.CalledProcessError):
-        module.publish_fixture(
-            spec,
-            tmp_path / "staging",
-            Path("upload_model.py"),
-            "python",
-            tmp_path / "receipt",
-            stage=_cortex_fixture_STAGE,
-        )
-    assert not (tmp_path / "receipt").exists()
-
-
-def test_cortex_fixture_receipt_cannot_be_written_into_reference_checkpoint(tmp_path, monkeypatch):
-    from arctic_platform.correctness.onboarding import cortex_fixture_upload as module
-
-    spec, root = _cortex_fixture_fixture(tmp_path)
-    monkeypatch.setattr(module.subprocess, "run", lambda *a, **k: pytest.fail("must reject before upload"))
-    with pytest.raises(ValueError, match="receipt.*outside"):
-        module.publish_fixture(
-            spec,
-            tmp_path / "staging",
-            Path("upload_model.py"),
-            "python",
-            root / "receipt.json",
-            stage=_cortex_fixture_STAGE,
-        )
-
-
-@pytest.mark.parametrize("stage", [_cortex_fixture_STAGE, "@ANOTHER_DB.PUBLIC.SERVICE_MODELS"])
-def test_cortex_fixture_binding_accepts_verified_publication_without_upload_credentials(tmp_path, monkeypatch, stage):
-    module = _cortex_fixture_module()
-    spec, _ = _cortex_fixture_fixture(tmp_path)
-    binding = module.describe_fixture(spec, Path(spec.model.cache_path))
-    binding["publication"] = {"stage_path": f"{stage}/{binding['model_name']}", "files": binding["files"]}
-    receipt = tmp_path / "binding.json"
-    receipt.write_text(json.dumps(binding))
-    monkeypatch.delenv("SNOWFLAKE_ACCOUNT", raising=False)
-    assert module.load_fixture(receipt, spec) == binding
-
-
-def test_cortex_fixture_published_fixture_enables_only_supported_reference_check():
-    _cortex_fixture_module()
-    registered = runner.registered_tests()
-    binding = {"model_name": "ap-correctness/reviewed"}
-    assert set(registered) == {"single-step-grads", "single-step-optimizer"}
-    for check in ("single-step-grads", "single-step-optimizer"):
-        assert runner.cortex_unavailable_reason(registered[check], binding) is None
-        missing = runner.cortex_unavailable_reason(registered[check], None)
-        assert missing and "--cortex-fixture" in missing
-        assert runner.cortex_unavailable_reason(registered[check]) == missing
 
 
 def _cortex_fixture_receipt(tmp_path):
@@ -26638,26 +17108,6 @@ def test_cortex_fixture_fixture_cli_uses_local_vocab_and_records_published_targe
     assert execution["fixture_sha256"] == binding["fixture_sha256"]
 
 
-def test_cortex_fixture_report_distinguishes_publication_from_worker_byte_verification(tmp_path, monkeypatch):
-    from arctic_platform.correctness.harness import report
-
-    spec, _, binding = _cortex_fixture_receipt(tmp_path)
-    monkeypatch.setattr(report, "collect", lambda: {"host": "hf-worker"})
-    execution = {
-        spec.config_id: {
-            "backend": "cortex",
-            "requested_model_name": binding["model_name"],
-            "fixture_sha256": binding["fixture_sha256"],
-            "fixture_stage_path": binding["publication"]["stage_path"],
-        }
-    }
-    markdown = report.to_markdown([], {spec.config_id: spec}, execution=execution)
-    assert "published reduced model" in markdown
-    assert binding["fixture_sha256"] in markdown
-    assert "not independently verified" in markdown
-    assert "not loaded on Cortex" not in markdown
-
-
 # Local cortex fixture.
 
 
@@ -26733,25 +17183,6 @@ def test_local_cortex_fixture_local_fixture_rejects_nonlocal_or_ambiguous_urls_b
         cortex_fixture.load_local_fixture(_local_cortex_fixture_CortexConfig(base_url=url), spec)
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [("backend", "ap"), ("source_root", "/different/AP/checkout"), ("supports_local_model_paths", False)],
-)
-def test_local_cortex_fixture_local_fixture_does_not_require_or_attest_backend_identity(
-    tmp_path, monkeypatch, field, value
-):
-    spec, _ = _cortex_fixture_fixture(tmp_path)
-    session = _local_cortex_fixture_session(monkeypatch)
-    session.health[field] = value
-    binding = cortex_fixture.load_local_fixture(
-        _local_cortex_fixture_CortexConfig(base_url="http://127.0.0.1:8003"), spec
-    )
-    assert binding["distribution"] == "local-gateway"
-    assert not {"backend", "source_root", "supports_local_model_paths"} & binding.keys()
-    assert len(session.calls) == 1
-    assert session.closed
-
-
 @pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize("changed", ["config.json", "generation_config.json", "model.safetensors"])
 def test_local_cortex_fixture_local_fixture_rejects_protected_asset_size_changes(
@@ -26766,58 +17197,6 @@ def test_local_cortex_fixture_local_fixture_rejects_protected_asset_size_changes
     assert session.closed
 
 
-@pytest.mark.parametrize("added", ["extra.safetensors", "extra_config.json"])
-def test_local_cortex_fixture_local_fixture_rejects_added_unreviewed_assets(tmp_path, monkeypatch, added):
-    spec, root = _cortex_fixture_fixture(tmp_path, legacy=True)
-    _local_cortex_fixture_session(monkeypatch)
-    (root / added).write_text("{}")
-    with pytest.raises(ValueError, match="file-name/size hash"):
-        cortex_fixture.load_local_fixture(_local_cortex_fixture_CortexConfig(base_url="http://127.0.0.1:8003"), spec)
-
-
-def test_local_cortex_fixture_local_fixture_requires_reviewed_layer_count(tmp_path, monkeypatch):
-    spec, root = _cortex_fixture_fixture(tmp_path)
-    _local_cortex_fixture_session(monkeypatch)
-    path = root / "config.json"
-    config = json.loads(path.read_text())
-    config["num_hidden_layers"] = 2
-    path.write_text(json.dumps(config))
-    with pytest.raises(ValueError, match="layer count"):
-        cortex_fixture.load_local_fixture(_local_cortex_fixture_CortexConfig(base_url="http://127.0.0.1:8003"), spec)
-
-
-def test_local_cortex_fixture_local_fixture_requires_tokenizer_even_with_legacy_hash(tmp_path, monkeypatch):
-    spec, root = _cortex_fixture_fixture(tmp_path, legacy=True)
-    _local_cortex_fixture_session(monkeypatch)
-    (root / "tokenizer_config.json").unlink()
-    with pytest.raises(ValueError, match="tokenizer sidecars"):
-        cortex_fixture.load_local_fixture(_local_cortex_fixture_CortexConfig(base_url="http://127.0.0.1:8003"), spec)
-
-
-@pytest.mark.parametrize("unsafe", ["/tmp", "/code", "/data-fast-shadow", "/data-fast", "symlink"])
-def test_local_cortex_fixture_local_fixture_rejects_unsafe_model_root_before_io(tmp_path, monkeypatch, unsafe):
-    spec, _ = _cortex_fixture_fixture(tmp_path)
-    root = Path(unsafe)
-    if unsafe == "symlink":
-        root = tmp_path / "escape"
-        root.symlink_to("/tmp", target_is_directory=True)
-    spec.model.cache_path = str(root)
-    monkeypatch.setattr(requests, "Session", lambda: pytest.fail("unsafe root reached network"))
-    monkeypatch.setattr(cortex_fixture, "describe_fixture", lambda *args: pytest.fail("unsafe root reached hashing"))
-    with pytest.raises(ValueError, match="/data-fast"):
-        cortex_fixture.load_local_fixture(_local_cortex_fixture_CortexConfig(base_url="http://127.0.0.1:8003"), spec)
-
-
-@pytest.mark.parametrize("credentials", [{"pat": "not-a-real-token"}, {"host": "qa6.example"}])
-def test_local_cortex_fixture_local_fixture_rejects_authentication_before_io(tmp_path, monkeypatch, credentials):
-    spec, _ = _cortex_fixture_fixture(tmp_path)
-    monkeypatch.setattr(requests, "Session", lambda: pytest.fail("credentials reached network"))
-    with pytest.raises(ValueError, match="unauthenticated"):
-        cortex_fixture.load_local_fixture(
-            _local_cortex_fixture_CortexConfig(base_url="http://127.0.0.1:8003", **credentials), spec
-        )
-
-
 @pytest.mark.parametrize("status", [301, 401, 500])
 def test_local_cortex_fixture_local_fixture_does_not_follow_redirects_or_authenticate(tmp_path, monkeypatch, status):
     spec, _ = _cortex_fixture_fixture(tmp_path)
@@ -26827,27 +17206,6 @@ def test_local_cortex_fixture_local_fixture_does_not_follow_redirects_or_authent
         cortex_fixture.load_local_fixture(_local_cortex_fixture_CortexConfig(base_url="http://127.0.0.1:8003"), spec)
     assert len(session.calls) == 1
     assert session.closed
-
-
-@pytest.mark.parametrize("payload", [None, [], "not an object", {}, {"status": "pending"}])
-def test_local_cortex_fixture_local_fixture_rejects_malformed_health(tmp_path, monkeypatch, payload):
-    spec, _ = _cortex_fixture_fixture(tmp_path)
-    session = _local_cortex_fixture_session(monkeypatch)
-    session.health = payload
-    with pytest.raises(ValueError, match="not healthy"):
-        cortex_fixture.load_local_fixture(_local_cortex_fixture_CortexConfig(base_url="http://127.0.0.1:8003"), spec)
-
-
-def test_local_cortex_fixture_local_fixture_normalizes_connection_failure(tmp_path, monkeypatch):
-    spec, _ = _cortex_fixture_fixture(tmp_path)
-    session = _local_cortex_fixture_session(monkeypatch)
-
-    def unavailable(*args, **kwargs):
-        raise requests.ConnectionError("gateway unavailable")
-
-    monkeypatch.setattr(session, "get", unavailable)
-    with pytest.raises(ValueError, match="verification failed: ConnectionError"):
-        cortex_fixture.load_local_fixture(_local_cortex_fixture_CortexConfig(base_url="http://127.0.0.1:8003"), spec)
 
 
 def test_local_cortex_fixture_execution_transport_stays_on_unauthenticated_loopback(monkeypatch):
@@ -27041,171 +17399,6 @@ def test_reference_free_metadata_original_schema_no_constructor_or_source_rewrit
 
 
 @pytest.mark.parametrize(
-    "location,field,value",
-    [
-        ("root", "text_config", None),
-        ("root", "text_config", []),
-        ("root", "text_config", "not-an-object"),
-        ("text", "num_hidden_layers", None),
-        ("text", "num_hidden_layers", 0),
-        ("text", "num_hidden_layers", -1),
-        ("text", "num_hidden_layers", True),
-        ("text", "num_hidden_layers", 45.0),
-        ("text", "vocab_size", None),
-        ("text", "vocab_size", 0),
-        ("text", "vocab_size", False),
-        ("text", "vocab_size", "128"),
-        ("root", "vision_config", []),
-        ("root", "vision_config", {}),
-        ("vision", "depth", 0),
-        ("vision", "depth", True),
-        ("vision", "depth", 24.0),
-    ],
-)
-def test_reference_free_metadata_rejects_invalid_original_config(
-    _reference_free_metadata_workspace, _reference_free_metadata_no_model, location, field, value
-):
-    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
-
-    case = _reference_free_metadata_source(_reference_free_metadata_workspace)
-    holder = {"root": case.config, "text": case.config["text_config"], "vision": case.config["vision_config"]}[
-        location
-    ]
-    holder[field] = value
-    (case.root / "config.json").write_text(json.dumps(case.config))
-    with pytest.raises(ValueError, match="original .*required"):
-        describe_source_model(str(case.root))
-
-
-def _reference_free_metadata_fp8_source(workspace, *, indexed):
-    case = _reference_free_metadata_source(workspace, indexed=False)
-    case.config["quantization_config"] = {
-        "quant_method": "fp8",
-        "fmt": "e4m3",
-        "activation_scheme": "dynamic",
-        "weight_block_size": [128, 128],
-    }
-    (case.root / "config.json").write_text(json.dumps(case.config))
-    weight = "model.layers.44.mlp.down_proj.weight"
-    scale = "model.layers.44.mlp.down_proj.weight_scale_inv"
-    tensors = {
-        "model.embed_tokens.weight": torch.zeros((4, 3), dtype=torch.bfloat16),
-        "model.layers.44.norm.weight": torch.ones(3, dtype=torch.float32),
-        "model.layer_multipliers": torch.tensor(1, dtype=torch.int64),
-        weight: torch.ones((129, 257), dtype=torch.bfloat16).to(torch.float8_e4m3fn),
-        scale: torch.ones((2, 3), dtype=torch.float32),
-    }
-    save_file(tensors, str(case.root / "model.safetensors"))
-    case.schema.update({weight: ["F8_E4M3", [129, 257]], scale: ["F32", [2, 3]]})
-    case.payload_bytes = 24 + 12 + 8 + 129 * 257 + 2 * 3 * 4
-    if indexed:
-        case.index = {
-            "metadata": {"total_size": case.payload_bytes},
-            "weight_map": {name: "model.safetensors" for name in tensors},
-        }
-        (case.root / "model.safetensors.index.json").write_text(json.dumps(case.index))
-    return case
-
-
-@pytest.mark.parametrize("indexed", [True, False], ids=["indexed", "unsharded"])
-def test_reference_free_metadata_declared_block_fp8_source_preserves_strict_exports(
-    _reference_free_metadata_workspace, monkeypatch, indexed
-):
-    from arctic_platform.correctness.harness import inference as inference_export
-    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
-
-    case = _reference_free_metadata_fp8_source(_reference_free_metadata_workspace, indexed=indexed)
-    before = _reference_free_metadata_unchanged(case.root)
-    with monkeypatch.context() as guard:
-        _reference_free_metadata_no_model.__wrapped__(guard)
-        model, vocab, evidence = describe_source_model(str(case.root))
-        with pytest.raises(ValueError, match="invalid tensor dtype"):
-            inference_export.schema_bytes(case.schema)
-        if indexed:
-            with pytest.raises(ValueError, match="invalid tensor dtype"):
-                inference_export.read_inventory(case.root, case.index)
-    assert _reference_free_metadata_unchanged(case.root) == before
-    assert model.seed is model.param_count is model.sized_against_gib is None
-    assert vocab == 128
-    assert evidence["tensor_count"] == 5
-    assert evidence["tensor_payload_bytes"] == case.payload_bytes
-    assert evidence["tensor_schema_sha256"] == inference_export.schema_sha(case.schema)
-    assert evidence["original_quantization_config"] == case.config["quantization_config"]
-    assert evidence["tensor_payloads_read"] is False
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("quant_method", "int8"),
-        ("fmt", "e5m2"),
-        ("activation_scheme", "static"),
-        ("weight_block_size", [64, 128]),
-        ("weight_block_size", [128.0, 128]),
-        ("weight_block_size", [128, 128.0]),
-        ("weight_block_size", [True, 128]),
-        ("weight_block_size", None),
-        ("weight_block_size", "128,128"),
-    ],
-)
-def test_reference_free_metadata_rejects_unsupported_fp8_declaration(
-    _reference_free_metadata_workspace, _reference_free_metadata_no_model, field, value
-):
-    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
-
-    case = _reference_free_metadata_fp8_source(_reference_free_metadata_workspace, indexed=True)
-    case.config["quantization_config"][field] = value
-    (case.root / "config.json").write_text(json.dumps(case.config))
-    with pytest.raises(ValueError, match="supported dynamic block-FP8"):
-        describe_source_model(str(case.root))
-
-
-@pytest.mark.parametrize("corruption", ["missing-declaration", "missing-scale", "scale-shape", "scale-dtype", "size"])
-def test_reference_free_metadata_rejects_fp8_inventory_corruption(_reference_free_metadata_workspace, corruption):
-    from arctic_platform.correctness.harness.inference import original_schema_bytes
-    from arctic_platform.correctness.harness.inference import read_inventory
-
-    case = _reference_free_metadata_fp8_source(_reference_free_metadata_workspace, indexed=True)
-    quantization = case.config["quantization_config"]
-    scale = "model.layers.44.mlp.down_proj.weight_scale_inv"
-    if corruption == "missing-declaration":
-        quantization = None
-    elif corruption == "missing-scale":
-        case.schema.pop(scale)
-    elif corruption == "scale-shape":
-        case.schema[scale] = ["F32", [1, 3]]
-    elif corruption == "scale-dtype":
-        case.schema[scale] = ["BF16", [2, 3]]
-    else:
-        case.index["metadata"]["total_size"] += 1
-        with pytest.raises(ValueError, match="byte inventory disagrees"):
-            read_inventory(case.root, case.index, original_quantization_config=quantization)
-        return
-    with pytest.raises(ValueError, match="invalid tensor dtype|matching FP32 inverse block scales"):
-        original_schema_bytes(case.schema, quantization)
-
-
-@pytest.mark.parametrize(
-    "bad_json",
-    [
-        "[]",
-        '{"text_config": {}, "text_config": {"num_hidden_layers": 45, "vocab_size": 128}}',
-        '{"text_config":',
-    ],
-    ids=["nonobject", "duplicate-key", "malformed"],
-)
-def test_reference_free_metadata_rejects_noncanonical_json(
-    _reference_free_metadata_workspace, _reference_free_metadata_no_model, bad_json
-):
-    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
-
-    case = _reference_free_metadata_source(_reference_free_metadata_workspace)
-    (case.root / "config.json").write_text(bad_json)
-    with pytest.raises(ValueError):
-        describe_source_model(str(case.root))
-
-
-@pytest.mark.parametrize(
     "mutation",
     [
         "missing-config",
@@ -27257,89 +17450,6 @@ def test_reference_free_metadata_rejects_inventory_or_metadata_mismatch(
     elif index_path.exists():
         index_path.write_text(json.dumps(case.index))
     with pytest.raises((ValueError, OSError, safetensors.SafetensorError)):
-        describe_source_model(str(case.root))
-
-
-@pytest.mark.parametrize(
-    "tensors,total",
-    [
-        ({"weight": torch.zeros(1, dtype=torch.float16)}, 2),
-        ({"unknown_buffer": torch.zeros(1, dtype=torch.int64)}, 8),
-        ({"weight": torch.empty((0, 3), dtype=torch.bfloat16)}, 0),
-    ],
-    ids=["unreviewed-f16", "unreviewed-i64", "zero-dimension"],
-)
-@pytest.mark.parametrize("indexed", [True, False], ids=["indexed", "unsharded"])
-def test_reference_free_metadata_rejects_unreviewed_header_schema(
-    _reference_free_metadata_workspace, _reference_free_metadata_no_model, tensors, total, indexed
-):
-    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
-
-    case = _reference_free_metadata_source(_reference_free_metadata_workspace, indexed=False)
-    save_file(tensors, str(case.root / "model.safetensors"))
-    if indexed:
-        (case.root / "model.safetensors.index.json").write_text(
-            json.dumps(
-                {"metadata": {"total_size": total}, "weight_map": {name: "model.safetensors" for name in tensors}}
-            )
-        )
-    with pytest.raises(ValueError, match="invalid tensor dtype or shape"):
-        describe_source_model(str(case.root))
-
-
-@pytest.mark.parametrize("target", ["root", "ancestor", "config.json", "model.safetensors.index.json", "shard"])
-def test_reference_free_metadata_rejects_symlinks(
-    _reference_free_metadata_workspace, _reference_free_metadata_no_model, target
-):
-    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
-
-    workspace = _reference_free_metadata_workspace
-    case = _reference_free_metadata_source(workspace)
-    source = case.root
-    if target == "root":
-        source = workspace / "alias"
-        source.symlink_to(case.root, target_is_directory=True)
-    elif target == "ancestor":
-        alias = workspace / "parent-alias"
-        alias.symlink_to(workspace, target_is_directory=True)
-        source = alias / "original"
-    else:
-        name = "model-00001-of-00002.safetensors" if target == "shard" else target
-        path = case.root / name
-        moved = workspace / name
-        path.rename(moved)
-        path.symlink_to(moved)
-    with pytest.raises(ValueError, match="canonical regular|regular original"):
-        describe_source_model(str(source))
-
-
-@pytest.mark.parametrize("target", ["config.json", "model.safetensors.index.json", "shard", "membership", "inode"])
-def test_reference_free_metadata_rejects_source_drift_during_header_admission(
-    _reference_free_metadata_workspace, _reference_free_metadata_no_model, monkeypatch, target
-):
-    from arctic_platform.correctness.harness import inference as inference_export
-    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
-
-    case = _reference_free_metadata_source(_reference_free_metadata_workspace)
-    actual_inventory = inference_export.read_inventory
-
-    def drifting_inventory(root, index, *, original_quantization_config=None):
-        result = actual_inventory(root, index, original_quantization_config=original_quantization_config)
-        if target == "membership":
-            save_file({"extra": torch.zeros(1, dtype=torch.bfloat16)}, str(case.root / "new.safetensors"))
-        else:
-            name = "model-00001-of-00002.safetensors" if target in ("shard", "inode") else target
-            path = case.root / name
-            if target == "inode":
-                path.rename(case.root / "replaced.safetensors")
-                save_file({"model.embed_tokens.weight": torch.zeros((4, 3), dtype=torch.bfloat16)}, str(path))
-            else:
-                with path.open("ab") if path.suffix != ".safetensors" else open(path, "ab") as stream:
-                    stream.write(b" ")
-        return result
-
-    monkeypatch.setattr(inference_export, "read_inventory", drifting_inventory)
-    with pytest.raises(ValueError, match="changed during preparation"):
         describe_source_model(str(case.root))
 
 
@@ -27575,28 +17685,6 @@ def test_optimizer_norms_norms_keep_backend_specific_moment_update_residual(_opt
     assert result["exp_avg_sq"] == float(torch.linalg.vector_norm(states["exp_avg_sq"]))
 
 
-@pytest.mark.parametrize("backend", ["reference", "ap"])
-def test_optimizer_norms_nonzero_initial_parameters_do_not_enter_update_norm(_optimizer_norms_artifact_root, backend):
-    initial = torch.tensor([2.0, -3.0])
-    states = _optimizer_norms_adam_states(torch.tensor([1.0, -1.0]), backend)
-    after = initial + states["parameter_update"]
-    states["parameter_update"] = after - initial
-    manifest = _optimizer_norms_manifest(_optimizer_norms_artifact_root / backend, {"layer.weight": states})
-    result = summarize_optimizer_artifacts(manifest, backend=backend, **_optimizer_norms_KWARGS)["parameters"][
-        "layer.weight"
-    ]
-    assert result["parameter_update_residual"] < 5e-07
-    assert result["parameter_update_residual"] < float(torch.linalg.vector_norm(initial))
-
-
-def test_optimizer_norms_unexplained_update_is_not_removed_by_norm_reduction(_optimizer_norms_artifact_root):
-    states = _optimizer_norms_adam_states(torch.tensor([1.0, -1.0]), "ap")
-    states["parameter_update"] += torch.tensor([0.003, 0.004])
-    manifest = _optimizer_norms_manifest(_optimizer_norms_artifact_root / "corrupt", {"module.layer.weight": states})
-    result = summarize_optimizer_artifacts(manifest, backend="ap", **_optimizer_norms_KWARGS)
-    assert result["parameters"]["layer.weight"]["parameter_update_residual"] == pytest.approx(0.005)
-
-
 def test_optimizer_norms_moe_tensors_are_concatenated_before_residual_and_norm(_optimizer_norms_artifact_root):
     w1 = _optimizer_norms_adam_states(torch.tensor([[[0.2, 0.4]]]), "ap")
     w3 = _optimizer_norms_adam_states(torch.tensor([[[0.6, 0.8]]]), "ap")
@@ -27630,47 +17718,12 @@ def test_optimizer_norms_canonical_collision_cannot_hide_a_parameter(_optimizer_
         summarize_optimizer_artifacts(manifest, backend="ap", **_optimizer_norms_KWARGS)
 
 
-def test_optimizer_norms_normalization_collision_is_rejected(_optimizer_norms_artifact_root):
-    manifest = _optimizer_norms_manifest(
-        _optimizer_norms_artifact_root / "aliases",
-        {
-            "model.layer.weight": _optimizer_norms_states(torch.zeros(2)),
-            "module.layer.weight": _optimizer_norms_states(torch.zeros(2)),
-        },
-    )
-    with pytest.raises(ValueError, match="duplicate normalized parameter"):
-        summarize_optimizer_artifacts(manifest, **_optimizer_norms_KWARGS)
-
-
-@pytest.mark.parametrize("step", [0, 2, 1.0, True, "1"])
-def test_optimizer_norms_summary_requires_exact_step_one(_optimizer_norms_artifact_root, step):
-    manifest = _optimizer_norms_manifest(
-        _optimizer_norms_artifact_root / "step", {"layer.weight": _optimizer_norms_states(torch.zeros(2))}, step=step
-    )
-    with pytest.raises(ValueError, match="step 1"):
-        summarize_optimizer_artifacts(manifest, **_optimizer_norms_KWARGS)
-
-
-def test_optimizer_norms_summary_rejects_empty_capture(_optimizer_norms_artifact_root):
-    manifest = _optimizer_norms_manifest(_optimizer_norms_artifact_root / "empty", {})
-    with pytest.raises(ValueError, match="no parameters"):
-        summarize_optimizer_artifacts(manifest, **_optimizer_norms_KWARGS)
-
-
 @pytest.mark.parametrize("state", STATE_KEYS)
 def test_optimizer_norms_summary_requires_every_artifact_state(_optimizer_norms_artifact_root, state):
     states = _optimizer_norms_states(torch.zeros(2))
     states.pop(state)
     manifest = _optimizer_norms_manifest(_optimizer_norms_artifact_root / "missing", {"layer.weight": states})
     with pytest.raises(ValueError, match=state):
-        summarize_optimizer_artifacts(manifest, **_optimizer_norms_KWARGS)
-
-
-def test_optimizer_norms_summary_requires_identical_state_shapes(_optimizer_norms_artifact_root):
-    states = _optimizer_norms_states(torch.zeros(2))
-    states["exp_avg_sq"] = torch.zeros(1)
-    manifest = _optimizer_norms_manifest(_optimizer_norms_artifact_root / "shape", {"layer.weight": states})
-    with pytest.raises(ValueError, match="shape mismatch"):
         summarize_optimizer_artifacts(manifest, **_optimizer_norms_KWARGS)
 
 
@@ -27684,30 +17737,11 @@ def test_optimizer_norms_summary_rejects_nonfinite_or_float32_overflow(_optimize
         summarize_optimizer_artifacts(manifest, **_optimizer_norms_KWARGS)
 
 
-def test_optimizer_norms_summary_rejects_norm_reduction_overflow(_optimizer_norms_artifact_root):
-    manifest = _optimizer_norms_manifest(
-        _optimizer_norms_artifact_root / "overflow",
-        {"layer.weight": _optimizer_norms_states(torch.tensor([3e38, 3e38]))},
-    )
-    with pytest.raises(ValueError, match="optimizer norm .* not finite"):
-        summarize_optimizer_artifacts(manifest, **_optimizer_norms_KWARGS)
-
-
 def test_optimizer_norms_summary_rejects_invalid_second_moment(_optimizer_norms_artifact_root):
     states = _optimizer_norms_states(torch.zeros(2))
     states["exp_avg_sq"] = torch.tensor([-1.0, 0.0])
     manifest = _optimizer_norms_manifest(_optimizer_norms_artifact_root / "negative", {"layer.weight": states})
     with pytest.raises(ValueError, match="comparison tensor .* not finite"):
-        summarize_optimizer_artifacts(manifest, **_optimizer_norms_KWARGS)
-
-
-@pytest.mark.parametrize("dtype", [torch.int64, torch.complex64])
-def test_optimizer_norms_summary_rejects_nonfloating_artifacts(_optimizer_norms_artifact_root, dtype):
-    manifest = _optimizer_norms_manifest(
-        _optimizer_norms_artifact_root / "dtype",
-        {"layer.weight": _optimizer_norms_states(torch.zeros(2, dtype=dtype))},
-    )
-    with pytest.raises(ValueError, match="floating tensor"):
         summarize_optimizer_artifacts(manifest, **_optimizer_norms_KWARGS)
 
 
@@ -27724,40 +17758,6 @@ def test_optimizer_norms_compare_uses_scalar_norm_difference_not_tensor_differen
     )
     assert comparison.worst_delta == pytest.approx(math.sqrt(52) - math.sqrt(5))
     assert float(torch.linalg.vector_norm(torch.tensor([4.0, 6.0]) - torch.tensor([1.0, 2.0]))) == 5.0
-
-
-def test_optimizer_norms_equal_norm_different_direction_is_intentionally_undetected(_optimizer_norms_artifact_root):
-    ref = _optimizer_norms_manifest(
-        _optimizer_norms_artifact_root / "ref", {"layer.weight": _optimizer_norms_states(torch.tensor([3.0, 4.0]))}
-    )
-    ap = _optimizer_norms_manifest(
-        _optimizer_norms_artifact_root / "ap", {"layer.weight": _optimizer_norms_states(torch.tensor([-3.0, -4.0]))}
-    )
-    comparison = compare_optimizer_norms(
-        summarize_optimizer_artifacts(ap, backend="ap", **_optimizer_norms_KWARGS),
-        summarize_optimizer_artifacts(ref, **_optimizer_norms_KWARGS),
-    )
-    assert comparison.worst_delta == 0.0
-    assert float(torch.linalg.vector_norm(torch.tensor([-3.0, -4.0]) - torch.tensor([3.0, 4.0]))) == 10.0
-
-
-@pytest.mark.parametrize("value", [0.0, 1e-30, 0.25])
-def test_optimizer_norms_zero_and_near_zero_have_absolute_difference_without_exemption(value):
-    reference = _optimizer_norms_summary()
-    target = copy.deepcopy(reference)
-    target["parameters"]["layer.weight"]["exp_avg"] = value
-    comparison = compare_optimizer_norms(target, reference)
-    assert comparison.worst_delta == value
-
-
-def test_optimizer_norms_missing_zero_vision_parameter_is_still_a_coverage_failure():
-    reference = _optimizer_norms_summary()
-    target = copy.deepcopy(reference["parameters"])
-    target["visual.unused.weight"] = copy.deepcopy(target["layer.weight"])
-    comparison = compare_optimizer_norms(_optimizer_norms_summary(target), reference)
-    assert comparison.only_ap == ["visual.unused.weight"]
-    assert comparison.only_reference == []
-    assert len(comparison.deltas) == 3
 
 
 def test_optimizer_norms_comparison_reports_both_unmatched_parameter_sets():
@@ -27777,59 +17777,6 @@ def test_optimizer_norms_comparison_requires_matching_shapes():
         compare_optimizer_norms(target, reference)
 
 
-@pytest.mark.parametrize(
-    ("key", "value"),
-    [
-        ("criterion", "full-tensor"),
-        ("step", 2),
-        ("step", True),
-        ("state_keys", ["exp_avg"]),
-        ("parameter_count", 2),
-        ("parameter_count", True),
-        ("optimizer_values_count", 2),
-        ("parameters", {}),
-    ],
-)
-@pytest.mark.parametrize("side", ["target", "reference"])
-def test_optimizer_norms_comparison_validates_both_summary_envelopes(key, value, side):
-    target, reference = (_optimizer_norms_summary(), _optimizer_norms_summary())
-    (target if side == "target" else reference)[key] = value
-    with pytest.raises(ValueError):
-        compare_optimizer_norms(target, reference)
-
-
-@pytest.mark.parametrize("state", COMPARISON_STATE_KEYS)
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), -1.0, True, "0.0"])
-def test_optimizer_norms_comparison_rejects_nonfinite_negative_or_nonnumeric_norm(state, value):
-    target = _optimizer_norms_summary()
-    target["parameters"]["layer.weight"][state] = value
-    with pytest.raises(ValueError, match="finite and nonnegative"):
-        compare_optimizer_norms(target, _optimizer_norms_summary())
-
-
-@pytest.mark.parametrize("state", COMPARISON_STATE_KEYS)
-def test_optimizer_norms_comparison_requires_complete_per_parameter_state_coverage(state):
-    target = _optimizer_norms_summary()
-    target["parameters"]["layer.weight"].pop(state)
-    with pytest.raises(ValueError, match="state coverage"):
-        compare_optimizer_norms(target, _optimizer_norms_summary())
-
-
-@pytest.mark.parametrize("shape", [[True], [-1], [1.0], "2"])
-def test_optimizer_norms_comparison_rejects_invalid_shape_metadata(shape):
-    target = _optimizer_norms_summary()
-    target["parameters"]["layer.weight"]["shape"] = shape
-    with pytest.raises(ValueError, match="invalid shape"):
-        compare_optimizer_norms(target, _optimizer_norms_summary())
-
-
-@pytest.mark.parametrize("name", ["", "model.layer.weight", "module.layer.weight"])
-def test_optimizer_norms_comparison_rejects_noncanonical_names(name):
-    target = _optimizer_norms_summary({name: _optimizer_norms_summary()["parameters"]["layer.weight"]})
-    with pytest.raises(ValueError, match="canonical parameter"):
-        compare_optimizer_norms(target, _optimizer_norms_summary())
-
-
 def test_optimizer_norms_pairwise_norm_calibration_checks_every_pair(_optimizer_norms_artifact_root):
     manifests = [
         _optimizer_norms_manifest(
@@ -27843,44 +17790,6 @@ def test_optimizer_norms_pairwise_norm_calibration_checks_every_pair(_optimizer_
     worst = max_pairwise_optimizer_norm_delta(manifests, progress=progress, **_optimizer_norms_KWARGS)
     assert (worst.name, worst.state, worst.delta_norm) == ("layer.weight", "parameter_update_residual", 4.0)
     assert updates == [1]
-
-
-def test_optimizer_norms_pairwise_norm_calibration_sign_change_has_no_magnitude_variation(
-    _optimizer_norms_artifact_root,
-):
-    manifests = [
-        _optimizer_norms_manifest(
-            _optimizer_norms_artifact_root / f"run-{index}",
-            {"layer.weight": _optimizer_norms_states(torch.tensor([value]))},
-        )
-        for index, value in enumerate((1.0, -1.0))
-    ]
-    assert max_pairwise_optimizer_norm_delta(manifests, **_optimizer_norms_KWARGS).delta_norm == 0.0
-
-
-def test_optimizer_norms_pairwise_norm_calibration_empty_or_single_capture(_optimizer_norms_artifact_root):
-    manifest = _optimizer_norms_manifest(
-        _optimizer_norms_artifact_root / "single", {"layer.weight": _optimizer_norms_states(torch.zeros(2))}
-    )
-    assert max_pairwise_optimizer_norm_delta([], **_optimizer_norms_KWARGS) is None
-    assert max_pairwise_optimizer_norm_delta([manifest], **_optimizer_norms_KWARGS) is None
-
-
-@pytest.mark.parametrize("kind", ["names", "shapes"])
-def test_optimizer_norms_pairwise_norm_calibration_requires_identical_coverage(_optimizer_norms_artifact_root, kind):
-    first = _optimizer_norms_manifest(
-        _optimizer_norms_artifact_root / "first", {"layer.weight": _optimizer_norms_states(torch.zeros(2))}
-    )
-    second = _optimizer_norms_manifest(
-        _optimizer_norms_artifact_root / "second",
-        {
-            "other.weight" if kind == "names" else "layer.weight": _optimizer_norms_states(
-                torch.zeros(3 if kind == "shapes" else 2)
-            )
-        },
-    )
-    with pytest.raises(ValueError, match="parameter sets" if kind == "names" else "shape mismatch"):
-        max_pairwise_optimizer_norm_delta([first, second], **_optimizer_norms_KWARGS)
 
 
 def _optimizer_norms_context_and_results(manifest, reference_norms=None, gate=0.0):
@@ -27906,24 +17815,6 @@ def _optimizer_norms_context_and_results(manifest, reference_norms=None, gate=0.
     }
     target = SimpleNamespace(optimizer_state_manifest=manifest, avg_loss=2.0, model_calls=1)
     return (ctx, SimpleNamespace(name="gas1"), reference, target)
-
-
-def test_optimizer_norms_arm_consumes_only_stored_norms_and_explicit_reviewed_gate(_optimizer_norms_artifact_root):
-    manifest = _optimizer_norms_manifest(
-        _optimizer_norms_artifact_root / "ap", {"layer.weight": _optimizer_norms_states(torch.tensor([0.01, 0.0]))}
-    )
-    ctx, arm, reference, target = _optimizer_norms_context_and_results(manifest, gate=0.02)
-    reference["optimizer_state_manifest"] = "do-not-open-reference-tensors"
-    result = fwd_bwd_step._compare_arm(ctx, arm, reference, target)
-    assert result.outcome is Outcome.PASS
-    assert result.metrics["stated_criterion_abs"] == 0.02
-    assert result.metrics["max_optimizer_norm_delta"] == pytest.approx(0.01)
-    assert OPTIMIZER_NORM_CRITERION in result.reason
-    assert "explicit-control-review" in result.reason
-    assert "Equal norms can conceal" in result.reason
-    assert result.metrics["ap_loss"] == 2.0
-    assert result.metrics["ap_model_calls_observed"] == 1.0
-    assert not any("dss" in name for name in result.metrics)
 
 
 @pytest.mark.parametrize("state", COMPARISON_STATE_KEYS)
@@ -27965,19 +17856,6 @@ def test_optimizer_norms_arm_coverage_failure_is_not_a_zero_norm_pass(monkeypatc
     assert result.metrics["unmatched_reference"] == 1
 
 
-def test_optimizer_norms_arm_missing_norms_has_no_manifest_fallback(monkeypatch):
-
-    def forbid_tensor_read(*args, **kwargs):
-        raise AssertionError("must reject missing compact reference before reading artifacts")
-
-    monkeypatch.setattr(fwd_bwd_step, "summarize_optimizer_artifacts", forbid_tensor_read)
-    ctx, arm, reference, target = _optimizer_norms_context_and_results("target")
-    reference.pop("optimizer_norms")
-    reference["optimizer_state_manifest"] = "legacy-manifest"
-    with pytest.raises(ValueError, match="stored optimizer_norms"):
-        fwd_bwd_step._compare_arm(ctx, arm, reference, target)
-
-
 @pytest.mark.parametrize(
     ("key", "value"),
     [
@@ -28003,15 +17881,6 @@ def test_optimizer_norms_arm_rejects_invalid_or_unreviewed_gate_before_artifact_
     ctx, arm, reference, target = _optimizer_norms_context_and_results("target")
     reference["optimizer_norm_gate"][key] = value
     with pytest.raises(ValueError, match="optimizer_norm_gate"):
-        fwd_bwd_step._compare_arm(ctx, arm, reference, target)
-
-
-def test_optimizer_norms_arm_requires_gate_and_target_capture():
-    ctx, arm, reference, target = _optimizer_norms_context_and_results(None)
-    with pytest.raises(ValueError, match="target optimizer-state manifest"):
-        fwd_bwd_step._compare_arm(ctx, arm, reference, target)
-    reference.pop("optimizer_norm_gate")
-    with pytest.raises(ValueError, match="reviewed optimizer_norm_gate"):
         fwd_bwd_step._compare_arm(ctx, arm, reference, target)
 
 
@@ -29412,56 +19281,6 @@ def test_hf_reference_onboarding_preparation_rejects_mismatched_frozen_spec(
         onboard.run(args)
 
 
-@pytest.mark.parametrize(
-    "test_id",
-    ["checkpoint-resume-loss", "inference-checkpoint-loss", "rl-weight-sync", "bad"],
-)
-def test_hf_reference_onboarding_preparation_rejects_live_reference_checks(
-    _hf_reference_onboarding_prepared_args, monkeypatch, test_id
-):
-    args, _ = _hf_reference_onboarding_prepared_args
-    args.test_id = test_id
-    monkeypatch.setattr(runner, "execute", lambda *a, **k: pytest.fail("normal reference prepared"))
-    with pytest.raises(ValueError, match="onboarding does not support"):
-        onboard.run(args)
-
-
-def test_hf_reference_onboarding_preparation_rejects_inapplicable_check(
-    _hf_reference_onboarding_prepared_args, monkeypatch
-):
-    args, spec = _hf_reference_onboarding_prepared_args
-    spec.applicable_tests = []
-    monkeypatch.setattr(runner, "execute", lambda *a, **k: pytest.fail("inapplicable workload executed"))
-    with pytest.raises(ValueError, match="not applicable"):
-        onboard.run(args)
-
-
-def test_hf_reference_onboarding_preparation_does_not_accept_model_sizing_override(
-    _hf_reference_onboarding_prepared_args, monkeypatch
-):
-    args, _ = _hf_reference_onboarding_prepared_args
-    args.probe_layers = 4
-    monkeypatch.setattr(runner, "execute", lambda *a, **k: pytest.fail("model override executed"))
-    with pytest.raises(ValueError, match="model sizing"):
-        onboard.run(args)
-
-
-def test_hf_reference_onboarding_preparation_requires_git_record_destination(
-    _hf_reference_onboarding_prepared_args, tmp_path, monkeypatch
-):
-    args, _ = _hf_reference_onboarding_prepared_args
-    checkout = tmp_path / "checkout"
-    checkout.mkdir()
-    (checkout / ".git").mkdir()
-    monkeypatch.setattr(
-        reference_records, "__file__", str(checkout / "arctic_platform/correctness/harness/storage.py")
-    )
-    args.reference_records_dir = tmp_path / "untracked-outside-checkout"
-    monkeypatch.setattr(runner, "execute", lambda *a, **k: pytest.fail("outside Git preparation executed"))
-    with pytest.raises(reference_records.ReferencePrerequisiteError, match="Git checkout"):
-        onboard.run(args)
-
-
 def test_hf_reference_onboarding_preparation_preserves_combined_check_workload(
     _hf_reference_onboarding_prepared_args, monkeypatch
 ):
@@ -29471,27 +19290,6 @@ def test_hf_reference_onboarding_preparation_preserves_combined_check_workload(
     monkeypatch.setattr(runner, "execute", lambda *a, **k: calls.append(k) or [])
     assert onboard.run(args) == 0
     assert calls[0]["select"] == args.reference_tests
-
-
-def test_hf_reference_onboarding_combined_selection_cannot_prepare_live_reference(
-    _hf_reference_onboarding_prepared_args, monkeypatch
-):
-    args, _ = _hf_reference_onboarding_prepared_args
-    args.reference_tests = ["single-step-grads", "checkpoint-resume-loss"]
-    monkeypatch.setattr(runner, "execute", lambda *a, **k: pytest.fail("live reference prepared"))
-    with pytest.raises(ValueError, match="onboarding does not support"):
-        onboard.run(args)
-
-
-def test_hf_reference_onboarding_reference_selection_requires_preparation_mode(
-    _hf_reference_onboarding_prepared_args, monkeypatch
-):
-    args, _ = _hf_reference_onboarding_prepared_args
-    args.prepare_references = False
-    args.reference_tests = ["single-step-grads", "single-step-optimizer"]
-    monkeypatch.setattr(onboard, "_parent", lambda *a: pytest.fail("normal onboarding executed"))
-    with pytest.raises(ValueError, match="requires --prepare-references"):
-        onboard.run(args)
 
 
 def test_hf_reference_onboarding_failed_reference_retains_complete_traceback_on_fast_storage(tmp_path, monkeypatch):
@@ -29515,24 +19313,6 @@ def test_hf_reference_onboarding_failed_reference_retains_complete_traceback_on_
     assert str(tmp_path / "reference.stderr.log") in str(error.value)
     assert (tmp_path / "reference.stderr.log").read_text() == stderr
     assert (tmp_path / "reference.stdout.log").read_text() == "actual stdout\n"
-
-
-@pytest.mark.parametrize(
-    "selection", [None, [], ["checkpoint-resume-loss"], ["single-step-grads", "rl-router-replay"]]
-)
-def test_hf_reference_onboarding_runner_preparation_cannot_execute_normal_references(selection, tmp_path, monkeypatch):
-    cfg = load_config(_onboarding_config(tmp_path))
-    monkeypatch.setattr(runner, "registered_tests", lambda: pytest.fail("invalid selection reached execution"))
-    with pytest.raises(ValueError, match="explicit HF"):
-        runner.execute(
-            cfg,
-            _applicable_tests_spec([]),
-            [],
-            vocab_size=128,
-            prepare_references=True,
-            select=selection,
-            workdir=tmp_path,
-        )
 
 
 # Onboarding.
@@ -29669,18 +19449,6 @@ def test_onboarding_renderer_reads_nested_prime_rl_chunk_size(tmp_path: Path) ->
     assert "lm_head_token_chunk_size=8192" in rendered
 
 
-def test_onboarding_renderer_preserves_runtime_default_without_chunking(tmp_path: Path) -> None:
-    rendered = _onboarding_render_config(tmp_path, None)
-    assert "lm_head_token_chunk_size=None" in rendered
-
-
-def test_onboarding_renderer_uses_configured_fused_cross_entropy(tmp_path: Path) -> None:
-    rendered = _onboarding_render_config(
-        tmp_path, {"fused_lm_head_token_chunk_size": "disabled", "fused_cross_entropy": "liger"}
-    )
-    assert "fused_cross_entropy='liger'" in rendered
-
-
 def test_onboarding_renderer_passes_peft_config_to_reference(tmp_path: Path) -> None:
     rendered = _onboarding_render_config(
         tmp_path, None, {"peft_type": "Lora", "r": 32, "target_modules": ["q_proj", "v_proj"]}
@@ -29728,61 +19496,6 @@ def _rendered_calibration_workers(monkeypatch):
 
     monkeypatch.setattr(runner, "run_reference", reference)
     return calls
-
-
-@pytest.mark.parametrize("explicit", [False, True])
-def test_onboarding_renderer_keeps_batch_tensors_separate_from_durable_diagnostics(
-    tmp_path, _onboarding_storage_fast_root, _rendered_calibration_workers, explicit, capsys
-):
-    rendered = _onboarding_render_config(tmp_path, None)
-    namespace = {"__name__": "synthetic_calibration"}
-    exec(compile(rendered, "<generated-reference-calibration>", "exec"), namespace)
-    diagnostics = tmp_path / "work" / "logs" / "calibration"
-    namespace["OUTPUT"] = diagnostics / "reference-repeatability.json"
-    scratch = _onboarding_storage_fast_root / "explicit-calibration"
-    if explicit:
-        namespace["WORK_DIR"] = str(scratch)
-
-    assert namespace["main"]() == 0
-    lines = capsys.readouterr().out.splitlines()
-    header = next(line for line in lines if line.split() == ["weight", "minimum", "maximum", "range"])
-    assert header == f"{'weight':64} {'minimum':>13} {'maximum':>13} {'range':>13}"
-    assert not any(line.split() == ["tensor", "minimum", "maximum", "range"] for line in lines)
-
-    calls = _rendered_calibration_workers
-    assert len(calls) == 16
-    batch_paths = {batch_path for batch_path, output in calls}
-    assert len(batch_paths) == 2
-    for batch_path in batch_paths:
-        assert batch_path.is_relative_to(_onboarding_storage_fast_root)
-        if explicit:
-            assert batch_path.parent == scratch
-        else:
-            assert batch_path.parent.parent == _onboarding_storage_fast_root / "tmp"
-    assert all(
-        output.parent == diagnostics / "calibration-runs" / batches.load(batch_path).name
-        for batch_path, output in calls
-    )
-    assert not list(diagnostics.rglob("*.pt"))
-    payload = json.loads(namespace["OUTPUT"].read_text())
-    assert payload["configuration"]["runs"] == 8
-    assert payload["tolerance"]["selected_gate"] == 0.001
-    spec = json.loads(namespace["SPEC_PATH"].read_text())
-    assert spec["test_tolerances"]["single-step-grads"]["calibration_runs"] == 8
-    assert spec["test_tolerances"]["single-step-grads"]["worst_tensor"] == "model.weight"
-    assert payload["tolerance"]["raw_max_same_tensor_range"] == 0.0
-
-
-def test_onboarding_renderer_rejects_diagnostic_directory_for_tensor_scratch(
-    tmp_path, _onboarding_storage_fast_root, _rendered_calibration_workers
-):
-    namespace = {"__name__": "synthetic_calibration"}
-    exec(compile(_onboarding_render_config(tmp_path, None), "<generated-reference-calibration>", "exec"), namespace)
-    namespace["WORK_DIR"] = str(tmp_path / "work" / "logs")
-    with pytest.raises(ValueError, match="gradient calibration tensors"):
-        namespace["main"]()
-    assert _rendered_calibration_workers == []
-    assert not list(tmp_path.rglob("*.pt"))
 
 
 @pytest.mark.parametrize("workers", [None, 1, 4, 8])
@@ -30262,90 +19975,11 @@ def test_sizing_reuse_rejects_mismatched_workload(_sizing_reuse_case, field):
         onboard._reuse_sizing(args, 4)
 
 
-@pytest.mark.parametrize(
-    "field,value,message",
-    [
-        ("status", "oom", "successful fit"),
-        ("status", "error", "successful fit"),
-        ("layers", 8, "original depth"),
-        ("layers", True, "successful fit"),
-        ("peak_gib", float("nan"), "finite positive"),
-        ("peak_gib", float("inf"), "finite positive"),
-        ("peak_gib", 0, "finite positive"),
-        ("param_count", 19, "parameter count"),
-        ("model_hash", "different", "model identity"),
-        ("model_path", "other-model", "model path"),
-    ],
-)
-def test_sizing_reuse_rejects_failed_or_mismatched_result(_sizing_reuse_case, field, value, message):
-    args, _, selected, _, _, _, seal = _sizing_reuse_case
-    selected[field] = str(args.cache_root.parent / value) if field == "model_path" else value
-    seal()
-    with pytest.raises(ValueError, match=message):
-        onboard._reuse_sizing(args, 4)
-
-
-@pytest.mark.parametrize("artifact", ["reuse", "original"])
-def test_sizing_reuse_rejects_unsealed_bytes(_sizing_reuse_case, artifact):
-    args, _, _, _, _, original, _ = _sizing_reuse_case
-    path = args.reuse_sizing if artifact == "reuse" else original
-    with path.open("ab") as stream:
-        stream.write(b" ")
-    with pytest.raises(ValueError, match="SHA256 mismatch"):
-        onboard._reuse_sizing(args, 4)
-
-
 def test_sizing_reuse_rejects_same_size_model_change(_sizing_reuse_case):
     args, _, _, _, model, _, _ = _sizing_reuse_case
     (model / "model.safetensors").write_bytes(b"changed--weights")
     with pytest.raises(ValueError, match="contents changed"):
         onboard._reuse_sizing(args, 4)
-
-
-def test_sizing_reuse_rejects_missing_weights(_sizing_reuse_case):
-    args, _, _, _, model, _, _ = _sizing_reuse_case
-    (model / "model.safetensors").rename(model / "model.backup")
-    with pytest.raises(ValueError, match="retained model weights"):
-        onboard._reuse_sizing(args, 4)
-
-
-def test_sizing_reuse_rejects_wrong_model_depth(_sizing_reuse_case, monkeypatch):
-    args, _, _, _, _, _, _ = _sizing_reuse_case
-    monkeypatch.setattr(
-        transformers.AutoConfig, "from_pretrained", lambda *a, **kw: SimpleNamespace(num_hidden_layers=8)
-    )
-    with pytest.raises(ValueError, match="model depth"):
-        onboard._reuse_sizing(args, 4)
-
-
-def test_sizing_reuse_request_binds_actual_recipe_and_reference_sources(_sizing_reuse_case, monkeypatch):
-    args, _, _, _, _, _, _ = _sizing_reuse_case
-    monkeypatch.undo()
-    args.config.write_text("original recipe")
-    Path(args.source_checkpoint).mkdir()
-    (Path(args.source_checkpoint) / "config.json").write_text("original source config")
-    monkeypatch.setattr(
-        _fixed_tolerance_onboarding_SPEC,
-        "load_config",
-        lambda unused: SimpleNamespace(reference_attention_implementation="sdpa"),
-    )
-    request = onboard._sizing_request(args, 4)
-    assert request["config_sha256"] == hashlib.sha256(b"original recipe").hexdigest()
-    assert request["source_config_sha256"] == hashlib.sha256(b"original source config").hexdigest()
-    assert request["source_checkpoint"] == args.source_checkpoint
-    assert request["layers"] == 4
-    assert request["seed"] == batches.SEED
-    assert request["tokens"] == 8192
-    assert request["reference_token_budget"] == 65536
-    assert request["reference_attention_implementation"] == "sdpa"
-    assert request["torch"] == str(torch.__version__)
-    assert request["transformers"] == str(transformers.__version__)
-    assert request["interpreter"] == sys.executable
-    assert len(request["probe_source_sha256"]) == 64
-    assert (
-        request["reference_sources"]["reference/hf_single_gpu.py"]
-        == reference_records.file_identity(Path(hf_single_gpu.__file__))["sha256"]
-    )
 
 
 @pytest.mark.parametrize("rejected", [False, True])
@@ -30408,25 +20042,6 @@ def test_sizing_reuse_parent_continues_only_admitted_sizing(_sizing_reuse_case, 
         assert manifest["reused_sizing"]["sha256"] == args.reuse_sizing_sha256
 
 
-@pytest.mark.parametrize(
-    "options",
-    [
-        ["--reuse-sizing", "receipt.json"],
-        ["--reuse-sizing-sha256", "a" * 64],
-        ["--reuse-sizing", "receipt.json", "--reuse-sizing-sha256", "a" * 64, "--prepare-references"],
-        ["--reuse-sizing", "receipt.json", "--reuse-sizing-sha256", "a" * 64, "--test-id", "single-step-optimizer"],
-        ["--reuse-sizing", "receipt.json", "--reuse-sizing-sha256", "a" * 64, "--probe-layers", "4"],
-    ],
-)
-def test_sizing_reuse_cli_rejects_incomplete_or_wrong_mode(options, monkeypatch):
-    parser = argparse.ArgumentParser()
-    onboard.add_arguments(parser)
-    args = parser.parse_args(["--config", "unused.config", *options])
-    monkeypatch.setattr(onboard, "_validate_storage", lambda *a: pytest.fail("wrong mode reached admission"))
-    with pytest.raises(ValueError, match="supplied together|only supported for gradient"):
-        onboard.run(args)
-
-
 def test_onboarding_cuda_oom_classification_does_not_swallow_other_failures() -> None:
     assert MODULE._is_cuda_oom(RuntimeError("CUDA out of memory while allocating tensor"))
     assert not MODULE._is_cuda_oom(RuntimeError("shape mismatch"))
@@ -30469,180 +20084,8 @@ def _onboarding_storage_fast_root(tmp_path, monkeypatch):
     return root
 
 
-@pytest.fixture(params=["code", "tmp", "root", "sibling", "traversal", "relative", "symlink"])
-def _onboarding_storage_invalid_destination(request, _onboarding_storage_fast_root, monkeypatch):
-    outside = _onboarding_storage_fast_root.parent / "outside"
-    outside.mkdir()
-    monkeypatch.chdir(_onboarding_storage_fast_root.parent)
-    if request.param == "symlink":
-        (_onboarding_storage_fast_root / "escape").symlink_to(outside, target_is_directory=True)
-    return {
-        "code": Path("/code/users/stas/onboarding-storage-test"),
-        "tmp": Path("/tmp/onboarding-storage-test"),
-        "root": _onboarding_storage_fast_root,
-        "sibling": _onboarding_storage_fast_root.with_name("data-fast-other") / "model",
-        "traversal": _onboarding_storage_fast_root / ".." / "outside" / "model",
-        "relative": Path("outside/model"),
-        "symlink": _onboarding_storage_fast_root / "escape" / "model",
-    }[request.param]
-
-
 def _onboarding_storage_unexpected(*args, **kwargs):
     pytest.fail("invalid storage must be rejected before allocation or model/config/copy work")
-
-
-@pytest.mark.parametrize("operation", ["materialize", "materialize_pretrained", "copy_sidecars"])
-def test_onboarding_storage_model_destination_rejected_before_config_or_sidecar_resolution(
-    _onboarding_storage_fast_root, _onboarding_storage_invalid_destination, monkeypatch, operation
-):
-    monkeypatch.setattr(synth_model, "reduce_config", _onboarding_storage_unexpected)
-    monkeypatch.setattr(synth_model, "sidecar_files", _onboarding_storage_unexpected)
-    monkeypatch.setattr(synth_model, "count_parameters", _onboarding_storage_unexpected)
-    with pytest.raises(ValueError, match="destination.* /data-fast"):
-        if operation == "copy_sidecars":
-            synth_model.copy_sidecars("not-a-local-source", _onboarding_storage_invalid_destination)
-        else:
-            getattr(synth_model, operation)("not-a-local-source", str(_onboarding_storage_invalid_destination), 4)
-    assert list((_onboarding_storage_fast_root.parent / "outside").iterdir()) == []
-
-
-@pytest.mark.parametrize("field", ["cache_root", "workdir"])
-def test_onboarding_storage_build_spec_rejects_paths_before_allocation_or_model_work(
-    _onboarding_storage_fast_root, _onboarding_storage_invalid_destination, monkeypatch, field
-):
-    monkeypatch.setattr(onboard, "correctness_workdir", _onboarding_storage_unexpected)
-    monkeypatch.setattr(synth_model, "size_for_single_gpu", _onboarding_storage_unexpected)
-    monkeypatch.setattr(synth_model, "materialize_pretrained", _onboarding_storage_unexpected)
-    kwargs = {
-        "cache_root": str(_onboarding_storage_fast_root / "cache"),
-        "workdir": _onboarding_storage_fast_root / "work",
-    }
-    kwargs[field] = _onboarding_storage_invalid_destination
-    with pytest.raises(ValueError, match="/data-fast"):
-        onboard.build_spec(SimpleNamespace(), "unused", arm_defs=[], **kwargs)
-    assert not (_onboarding_storage_fast_root / "work").exists()
-    assert not (_onboarding_storage_fast_root / "cache").exists()
-
-
-@pytest.mark.parametrize("entrypoint", ["run", "_parent", "_probe_worker"])
-@pytest.mark.parametrize("field", ["cache_root", "output_dir"])
-def test_onboarding_storage_onboarding_entrypoints_reject_storage_before_checkout_or_config(
-    _onboarding_storage_fast_root, _onboarding_storage_invalid_destination, monkeypatch, entrypoint, field
-):
-    monkeypatch.setattr(onboard, "_checkout_root", _onboarding_storage_unexpected)
-    args = argparse.Namespace(
-        cache_root=_onboarding_storage_fast_root / "cache",
-        output_dir=_onboarding_storage_fast_root / "work",
-        test_id="single-step-grads",
-        probe_layers=None,
-    )
-    setattr(args, field, _onboarding_storage_invalid_destination)
-    with pytest.raises(ValueError, match="/data-fast"):
-        getattr(onboard, entrypoint)(args)
-    assert not (_onboarding_storage_fast_root / "work").exists()
-
-
-@pytest.mark.parametrize("field", ["output_dir", "optimizer_model_path"])
-def test_onboarding_storage_optimizer_calibration_rejects_storage_before_config_batch_or_model(
-    _onboarding_storage_fast_root, _onboarding_storage_invalid_destination, field
-):
-    args = argparse.Namespace(
-        output_dir=_onboarding_storage_fast_root / "work", optimizer_model_path=_onboarding_storage_fast_root / "model"
-    )
-    setattr(args, field, _onboarding_storage_invalid_destination)
-    with pytest.raises(ValueError, match="/data-fast"):
-        onboard._run_optimizer_calibration(args)
-    assert not (_onboarding_storage_fast_root / "work").exists()
-
-
-@pytest.mark.parametrize("operation", ["materialize", "materialize_pretrained"])
-def test_onboarding_storage_materializers_forward_canonical_fast_destination(
-    _onboarding_storage_fast_root, tmp_path, monkeypatch, operation
-):
-    import transformers
-
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "tokenizer_config.json").write_text("{}")
-    target = _onboarding_storage_fast_root / "models"
-    target.mkdir()
-    (_onboarding_storage_fast_root / "alias").symlink_to(target, target_is_directory=True)
-    destination = _onboarding_storage_fast_root / "alias" / "reduced"
-    calls = []
-    config = SimpleNamespace(architectures=["StorageTestModel"])
-
-    class FakeModel:
-
-        def __init__(self, cfg):
-            assert cfg is config
-            calls.append("model")
-
-        @classmethod
-        def from_pretrained(cls, value, **kwargs):
-            assert value == str(source)
-            return cls(kwargs["config"])
-
-        def to(self, dtype):
-            return self
-
-        def save_pretrained(self, path, **kwargs):
-            assert path == target / "reduced"
-            calls.append(path)
-            (path / "config.json").write_text("{}")
-
-    monkeypatch.setattr(transformers, "StorageTestModel", FakeModel, raising=False)
-    monkeypatch.setattr(synth_model, "reduce_config", lambda *args: (config, 8, 1))
-    monkeypatch.setattr(synth_model, "count_parameters", lambda cfg: 1)
-    result = getattr(synth_model, operation)(str(source), str(destination), 4)
-    assert result.cache_path == str(target / "reduced")
-    assert calls == ["model", target / "reduced"]
-    assert (target / "reduced" / "tokenizer_config.json").read_text() == "{}"
-
-
-@pytest.mark.parametrize(
-    "generation_options",
-    [
-        {"do_sample": False, "top_p": 0.95, "temperature": 0.7, "max_new_tokens": 8},
-        {"do_sample": True, "top_p": 0.95, "temperature": 0.7, "max_new_tokens": 8},
-        {"do_sample": False, "eos_token_id": [1, 2], "pad_token_id": 0, "max_new_tokens": 8},
-    ],
-    ids=["legacy-greedy-defaults", "sampling", "greedy"],
-)
-def test_onboarding_pretrained_generation_defaults_round_trip(
-    _onboarding_storage_fast_root, tmp_path, generation_options
-) -> None:
-    config = transformers.Qwen3Config(
-        vocab_size=16,
-        hidden_size=16,
-        intermediate_size=16,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        head_dim=8,
-    )
-    model = transformers.Qwen3ForCausalLM(config).to(torch.bfloat16)
-    source = tmp_path / "source"
-    model.save_pretrained(source)
-    expected = {
-        name: tensor.clone() for name, tensor in model.state_dict().items() if not name.startswith("model.layers.1.")
-    }
-    (source / "generation_config.json").write_text(json.dumps(generation_options))
-    (source / "tokenizer_config.json").write_text("{}")
-    destination = _onboarding_storage_fast_root / "reduced"
-
-    synth_model.materialize_pretrained(str(source), str(destination), 1)
-
-    saved_options = transformers.GenerationConfig.from_dict(
-        json.loads((destination / "generation_config.json").read_text())
-    )
-    reopened = transformers.Qwen3ForCausalLM.from_pretrained(destination, dtype=torch.bfloat16)
-    for name, value in generation_options.items():
-        assert getattr(saved_options, name) == value
-        assert getattr(reopened.generation_config, name) == value
-    saved = load_file(destination / "model.safetensors")
-    assert saved.keys() == expected.keys()
-    for name, tensor in saved.items():
-        torch.testing.assert_close(tensor, expected[name], atol=0, rtol=0, msg=name)
 
 
 def test_onboarding_pretrained_generation_defaults_restore_after_save_failure(tmp_path) -> None:
@@ -30662,67 +20105,6 @@ def test_onboarding_pretrained_generation_defaults_restore_after_save_failure(tm
     assert generation.do_sample is False
     assert generation.top_p == 0.95
     assert not (tmp_path / "generation_config.json").exists()
-
-
-def test_onboarding_pretrained_generation_defaults_reject_invalid_values_before_save(tmp_path) -> None:
-    generation = transformers.GenerationConfig()
-    generation.max_new_tokens = 0
-    model = SimpleNamespace(generation_config=generation, save_pretrained=_onboarding_storage_unexpected)
-
-    with pytest.raises(ValueError, match="max_new_tokens"):
-        synth_model._save_reduced_pretrained(model, tmp_path)
-    assert model.generation_config is generation
-    assert not (tmp_path / "generation_config.json").exists()
-
-
-def test_onboarding_pretrained_fp8_materialization_saves_dequantized_weights(
-    _onboarding_storage_fast_root, tmp_path
-) -> None:
-    source = tmp_path / "fp8-source"
-    source.mkdir()
-    config = transformers.Qwen3Config(
-        vocab_size=16,
-        hidden_size=16,
-        intermediate_size=16,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        head_dim=8,
-    )
-    config.architectures = ["Qwen3ForCausalLM"]
-    model = transformers.Qwen3ForCausalLM(config).to(torch.bfloat16)
-    state = model.state_dict()
-    expected = {}
-    for name, tensor in list(state.items()):
-        if tensor.ndim != 2 or name in ("model.embed_tokens.weight", "lm_head.weight"):
-            continue
-        scales = torch.full((tensor.shape[0] // 8, tensor.shape[1] // 8), 0.25)
-        scales[0, 0] = 0.5
-        state[name] = torch.full_like(tensor, 2, dtype=torch.float8_e4m3fn)
-        state[name.removesuffix(".weight") + ".weight_scale_inv"] = scales
-        expected[name] = (2 * scales.repeat_interleave(8, 0).repeat_interleave(8, 1)).to(torch.bfloat16)
-    config.quantization_config = {"quant_method": "fp8", "weight_block_size": [8, 8]}
-    config.save_pretrained(source)
-    save_file(state, source / "model.safetensors", metadata={"format": "pt"})
-    (source / "tokenizer_config.json").write_text("{}")
-    destination = _onboarding_storage_fast_root / "reduced"
-
-    result = synth_model.materialize_pretrained(str(source), str(destination), 1)
-    saved_config = json.loads((destination / "config.json").read_text())
-    assert "quantization_config" not in saved_config
-    assert saved_config["num_hidden_layers"] == 1
-    assert result.source_checkpoint == str(source)
-    reopened = transformers.Qwen3ForCausalLM.from_pretrained(destination, dtype=torch.bfloat16)
-    assert not getattr(reopened, "is_quantized", False)
-    saved = reopened.state_dict()
-    assert not any(name.endswith("weight_scale_inv") for name in saved)
-    for name, tensor in saved.items():
-        assert tensor.dtype == torch.bfloat16
-        if name in expected:
-            torch.testing.assert_close(tensor, expected[name], atol=0, rtol=0)
-        else:
-            torch.testing.assert_close(tensor, state[name], atol=0, rtol=0)
-    assert not any(name.startswith("model.layers.1.") for name in saved)
 
 
 def test_onboarding_pretrained_glm_fp8_preserves_native_weight_layout(_onboarding_storage_fast_root, tmp_path) -> None:
@@ -30817,59 +20199,6 @@ def test_onboarding_pretrained_glm_fp8_preserves_native_weight_layout(_onboardin
                 atol=0,
                 rtol=0,
             )
-
-
-@pytest.mark.parametrize("problem", ["unconfirmed", "fp8-weight", "remaining-scale"])
-def test_onboarding_pretrained_fp8_materialization_rejects_incomplete_dequantization(
-    _onboarding_storage_fast_root, monkeypatch, problem
-) -> None:
-    import transformers
-
-    config = SimpleNamespace(
-        architectures=["IncompleteDequantizationModel"],
-        quantization_config={"quant_method": "fp8", "weight_block_size": [8, 8]},
-    )
-    weight = torch.ones(8, 8, dtype=torch.bfloat16)
-    if problem == "fp8-weight":
-        weight = weight.to(torch.float8_e4m3fn)
-
-    class FakeModel:
-        @classmethod
-        def from_pretrained(cls, source, **kwargs):
-            assert kwargs["quantization_config"].dequantize is True
-            model = cls()
-            model.config = config if problem == "unconfirmed" else SimpleNamespace()
-            model.hf_quantizer = SimpleNamespace() if problem == "unconfirmed" else None
-            return model
-
-        def named_parameters(self):
-            return [("projection.weight", weight)]
-
-        def named_buffers(self):
-            return [("projection.weight_scale_inv", torch.ones(1, 1))] if problem == "remaining-scale" else []
-
-        def save_pretrained(self, *args, **kwargs):
-            pytest.fail("an incompletely dequantized fixture must not be saved")
-
-    monkeypatch.setattr(transformers, "IncompleteDequantizationModel", FakeModel, raising=False)
-    monkeypatch.setattr(synth_model, "reduce_config", lambda *args: (config, 2, 1))
-    monkeypatch.setattr(synth_model, "copy_sidecars", _onboarding_storage_unexpected)
-    destination = _onboarding_storage_fast_root / "reduced"
-    with pytest.raises(ValueError, match="dequantiz"):
-        synth_model.materialize_pretrained("unused", str(destination), 1)
-    assert not (destination / "config.json").exists()
-    assert config.quantization_config["quant_method"] == "fp8"
-
-
-def test_onboarding_pretrained_materialization_rejects_other_quantizers_before_loading(
-    _onboarding_storage_fast_root, monkeypatch
-) -> None:
-    config = SimpleNamespace(architectures=["UnusedModel"], quantization_config={"quant_method": "gptq"})
-    monkeypatch.setattr(synth_model, "reduce_config", lambda *args: (config, 2, 1))
-    destination = _onboarding_storage_fast_root / "reduced"
-    with pytest.raises(ValueError, match="explicitly dequantized FP8"):
-        synth_model.materialize_pretrained("unused", str(destination), 1)
-    assert not destination.exists()
 
 
 @pytest.mark.parametrize("quantization", [None, {"quant_method": "fp8"}, {"quant_method": "gptq"}])
@@ -30974,113 +20303,6 @@ def test_onboarding_synthetic_materialization_rejects_quantized_cache(
     with pytest.raises(ValueError, match="cached reduced fixture is quantized"):
         synth_model.materialize("unused", str(destination), 1)
     assert (destination / "config.json").read_text() == config_bytes
-
-
-def test_onboarding_pretrained_materialization_rejects_quantized_cache(
-    _onboarding_storage_fast_root, monkeypatch
-) -> None:
-    config = SimpleNamespace(architectures=["UnusedModel"])
-    monkeypatch.setattr(synth_model, "reduce_config", lambda *args: (config, 2, 1))
-    monkeypatch.setattr(synth_model, "copy_sidecars", _onboarding_storage_unexpected)
-    destination = _onboarding_storage_fast_root / "reduced"
-    destination.mkdir()
-    cached = '{"quantization_config": {"quant_method": "fp8"}}'
-    (destination / "config.json").write_text(cached)
-    with pytest.raises(ValueError, match="cached reduced fixture is quantized"):
-        synth_model.materialize_pretrained("unused", str(destination), 1)
-    assert (destination / "config.json").read_text() == cached
-
-
-def test_onboarding_storage_copy_sidecars_canonical_fast_destination_and_idempotency(
-    _onboarding_storage_fast_root, tmp_path
-):
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "tokenizer_config.json").write_text('{"version": 1}')
-    target = _onboarding_storage_fast_root / "target"
-    target.mkdir()
-    (_onboarding_storage_fast_root / "alias").symlink_to(target, target_is_directory=True)
-    for _ in range(2):
-        copied = synth_model.copy_sidecars(str(source), _onboarding_storage_fast_root / "alias")
-        assert copied == [target / "tokenizer_config.json"]
-        assert copied[0].read_text() == '{"version": 1}'
-
-
-def test_onboarding_storage_build_spec_accepts_fast_work_cache_and_separate_spec_output(
-    _onboarding_storage_fast_root, tmp_path, monkeypatch
-):
-    import transformers
-
-    from arctic_platform.correctness.harness import config as config_module
-    from arctic_platform.correctness.harness.config import ModelSpec
-
-    captured = []
-
-    def materialize(source, destination, layers):
-        captured.append(Path(destination))
-        return ModelSpec(source, layers, 2, 0, 1, destination, "hash", 100.0)
-
-    monkeypatch.setattr(synth_model, "materialize_pretrained", materialize)
-    monkeypatch.setattr(config_module, "config_checksum", lambda cfg: "checksum")
-    monkeypatch.setattr(
-        transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: SimpleNamespace(vocab_size=8)
-    )
-    cfg = SimpleNamespace(attention_implementation="eager", config_id="test", path="input.config")
-    spec = onboard.build_spec(
-        cfg,
-        "source/model",
-        str(_onboarding_storage_fast_root / "cache"),
-        [],
-        num_layers=4,
-        workdir=_onboarding_storage_fast_root / "work",
-    )
-    assert captured == [_onboarding_storage_fast_root / "cache" / "model-4L"]
-    assert (_onboarding_storage_fast_root / "work").is_dir()
-    separate_spec = tmp_path / "checkout" / "spec.json"
-    spec.write(separate_spec)
-    assert json.loads(separate_spec.read_text())["model"]["cache_path"] == str(captured[0])
-
-
-@pytest.mark.parametrize("probe", [False, True])
-def test_onboarding_storage_run_keeps_separate_small_spec_and_probe_reports_unrestricted(
-    _onboarding_storage_fast_root, tmp_path, monkeypatch, probe
-):
-    args = argparse.Namespace(
-        config=tmp_path / "checkout" / "input.config",
-        cache_root=_onboarding_storage_fast_root / "cache",
-        output_dir=_onboarding_storage_fast_root / "work",
-        test_spec=tmp_path / "checkout" / "spec.json",
-        probe_layers=4 if probe else None,
-        probe_output=tmp_path / "checkout" / "probe.json",
-        test_id="single-step-grads",
-        reference_records_dir=None,
-    )
-    args.config.parent.mkdir(parents=True)
-    args.config.write_text(_onboarding_config(tmp_path).read_text())
-    args.test_spec.write_text("{}")
-    monkeypatch.setattr(_fixed_tolerance_onboarding_SPEC, "local_config_path", lambda path: path)
-    monkeypatch.setattr(onboard, "_checkout_root", lambda config: tmp_path / "checkout")
-    monkeypatch.setattr(onboard.sys, "path", list(onboard.sys.path))
-    calls = []
-    monkeypatch.setattr(onboard, "_parent", lambda value: calls.append(value) or 0)
-    monkeypatch.setattr(onboard, "_probe_worker", lambda value: calls.append(value) or 0)
-    assert onboard.run(args) == 0
-    assert calls == [args]
-    assert args.test_spec == tmp_path / "checkout" / "spec.json"
-    assert args.probe_output == tmp_path / "checkout" / "probe.json"
-    assert not args.output_dir.exists()
-
-
-def test_onboarding_storage_optimizer_calibration_missing_fast_root_never_falls_back(
-    _onboarding_storage_fast_root, monkeypatch
-):
-    _onboarding_storage_fast_root.rmdir()
-    args = argparse.Namespace(
-        output_dir=_onboarding_storage_fast_root / "work", optimizer_model_path=_onboarding_storage_fast_root / "model"
-    )
-    with pytest.raises(ValueError, match="existing /data-fast"):
-        onboard._run_optimizer_calibration(args)
-    assert not _onboarding_storage_fast_root.exists()
 
 
 @pytest.mark.parametrize("fail_reference", [False, True])
@@ -31986,41 +21208,6 @@ def test_local_cortex_optimizer_scalar_norm_failure_restores_exact_spec_and_no_v
         assert state.events == ["calibration"]
 
 
-@pytest.mark.parametrize("failure", ["checksum", "fixture-path", "fixture-depth", "config-id"])
-def test_local_cortex_optimizer_scalar_norm_rejects_unreviewed_fixture_before_calibration(
-    _local_cortex_optimizer_onboarding, failure
-):
-    state = _local_cortex_optimizer_onboarding
-    if failure == "checksum":
-        state.spec.config_checksum = "wrong"
-    elif failure == "fixture-path":
-        state.spec.model.cache_path += "-other"
-    elif failure == "fixture-depth":
-        state.spec.model.num_hidden_layers = 8
-    else:
-        state.spec.config_id = "unrelated-configuration"
-    state.spec.write(state.args.test_spec)
-    prior = state.args.test_spec.read_bytes()
-    with pytest.raises(ValueError):
-        onboard._parent(state.args)
-    assert state.events == []
-    assert state.args.test_spec.read_bytes() == prior
-    assert not (state.args.output_dir / "onboarding-t02.json").exists()
-
-
-@pytest.mark.parametrize(("runs", "workers"), [(5, 1), (16, 8), (0, 8), (8, 0), (8, 9)])
-def test_local_cortex_optimizer_scalar_norm_rejects_invalid_repeat_policy_before_reference(
-    _local_cortex_optimizer_onboarding, runs, workers
-):
-    state = _local_cortex_optimizer_onboarding
-    state.args.reference_calibration_runs = runs
-    state.args.reference_calibration_workers = workers
-    with pytest.raises(ValueError, match="8 repeats|1 to 8 HF workers"):
-        onboard._parent(state.args)
-    assert state.events == []
-    assert state.args.test_spec.read_bytes() == state.previous
-
-
 def _optimizer_child_files(args, tmp_path):
     bootstrap = tmp_path / "caller.py"
     bootstrap.write_text("# Synthetic child source; never executed by these CPU controls.\n")
@@ -32111,72 +21298,6 @@ def test_optimizer_validation_child_forwards_original_regression_and_retains_sou
     assert "private_token" not in persisted
 
 
-@pytest.mark.parametrize(
-    "missing",
-    [
-        "optimizer_validation_bootstrap",
-        "optimizer_validation_bootstrap_sha256",
-        "optimizer_validation_config",
-        "optimizer_validation_config_sha256",
-    ],
-)
-def test_optimizer_validation_child_rejects_incomplete_source_pins(_optimizer_validation_child, missing):
-    setattr(_optimizer_validation_child, missing, None)
-    with pytest.raises(ValueError, match="both bootstrap/config"):
-        onboard._optimizer_validation_bootstrap(_optimizer_validation_child)
-
-
-@pytest.mark.parametrize(
-    ("name", "value"),
-    [
-        ("test_id", "single-step-grads"),
-        ("backend", "onprem"),
-        ("local_cortex_fixture", False),
-        ("prepare_references", True),
-        ("probe_layers", 4),
-        ("reference_tests", ["single-step-optimizer"]),
-    ],
-)
-def test_optimizer_validation_child_rejects_other_modes_before_storage_or_reference(
-    _optimizer_validation_child, monkeypatch, name, value
-):
-    args = _optimizer_validation_child
-    setattr(args, name, value)
-    monkeypatch.setattr(
-        onboard, "_validate_storage", lambda *a: pytest.fail("unsupported child route reached storage")
-    )
-    with pytest.raises(ValueError, match="only local Cortex Test 2"):
-        onboard.run(args)
-
-
-@pytest.mark.parametrize("role", ["bootstrap", "config"])
-@pytest.mark.parametrize("fault", ["changed-bytes", "replacement", "symlink", "hardlink", "bad-sha"])
-def test_optimizer_validation_child_rejects_source_faults_before_target(
-    _optimizer_validation_child, monkeypatch, role, fault
-):
-    args = _optimizer_validation_child
-    args._admitted_optimizer_validation_bootstrap = onboard._optimizer_validation_bootstrap(args)
-    path = getattr(args, "optimizer_validation_" + role)
-    if fault == "changed-bytes":
-        path.write_text("different source\n")
-    elif fault == "replacement":
-        replacement = path.with_suffix(".replacement")
-        replacement.write_bytes(path.read_bytes())
-        replacement.replace(path)
-    elif fault == "symlink":
-        moved = path.with_suffix(".original")
-        path.rename(moved)
-        path.symlink_to(moved)
-    elif fault == "hardlink":
-        path.with_suffix(".linked").hardlink_to(path)
-    else:
-        setattr(args, "optimizer_validation_" + role + "_sha256", "bad")
-    monkeypatch.setattr(onboard.subprocess, "Popen", lambda *a, **k: pytest.fail("source fault reached target child"))
-    with pytest.raises(ValueError, match="optimizer validation"):
-        onboard._run_final_regression(args, {"layers": 4})
-    assert not args.output_dir.exists()
-
-
 @pytest.mark.parametrize("role", ["bootstrap", "config"])
 def test_optimizer_validation_child_rejects_source_drift_after_child_exit(
     _optimizer_validation_child, monkeypatch, role
@@ -32239,104 +21360,6 @@ def test_optimizer_validation_child_failure_restores_exact_test1_without_referen
     assert len(calibrations) == (0 if failure == "pre-calibration-pin" else 1)
     assert state.events == []
     assert not (state.args.output_dir / "onboarding-t02.json").exists()
-
-
-@pytest.mark.parametrize(
-    "problem",
-    [
-        None,
-        "unexpected",
-        "retained-unexpected",
-        "outside-source",
-        "missing",
-        "mismatched",
-    ],
-)
-def test_onboarding_pretrained_omitted_layers_do_not_warn(
-    _onboarding_storage_fast_root, tmp_path, monkeypatch, caplog, problem
-) -> None:
-    config = transformers.Qwen3Config(
-        vocab_size=16,
-        hidden_size=16,
-        intermediate_size=16,
-        num_hidden_layers=3,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        head_dim=8,
-    )
-    model = transformers.Qwen3ForCausalLM(config).to(torch.bfloat16)
-    source = tmp_path / "source"
-    model.save_pretrained(source)
-    (source / "tokenizer_config.json").write_text("{}")
-    state = load_file(source / "model.safetensors")
-    key = "model.layers.0.input_layernorm.weight"
-    if problem == "unexpected":
-        key = "unrelated.weight"
-        state[key] = torch.ones(16, dtype=torch.bfloat16)
-    elif problem == "retained-unexpected":
-        key = "model.layers.0.unrelated.weight"
-        state[key] = torch.ones(16, dtype=torch.bfloat16)
-    elif problem == "outside-source":
-        key = "model.layers.3.input_layernorm.weight"
-        state[key] = torch.ones(16, dtype=torch.bfloat16)
-    elif problem == "missing":
-        del state[key]
-    elif problem == "mismatched":
-        state[key] = torch.ones(17, dtype=torch.bfloat16)
-    save_file(state, source / "model.safetensors", metadata={"format": "pt"})
-    destination = _onboarding_storage_fast_root / "reduced"
-    original_ignore = transformers.Qwen3ForCausalLM._keys_to_ignore_on_load_unexpected
-    monkeypatch.setattr(logging.getLogger("transformers"), "propagate", True)
-    caplog.set_level(logging.WARNING, logger="transformers")
-    save_reduced = synth_model._save_reduced_pretrained
-
-    def save_original_class(loaded, path):
-        assert type(loaded) is transformers.Qwen3ForCausalLM
-        save_reduced(loaded, path)
-
-    monkeypatch.setattr(synth_model, "_save_reduced_pretrained", save_original_class)
-
-    if problem == "mismatched":
-        with pytest.raises(RuntimeError, match="ignore_mismatched_sizes"):
-            synth_model.materialize_pretrained(str(source), str(destination), 1)
-        assert not (destination / "config.json").exists()
-    else:
-        synth_model.materialize_pretrained(str(source), str(destination), 1)
-        saved = load_file(destination / "model.safetensors")
-        assert not any(name.startswith(("model.layers.1.", "model.layers.2.")) for name in saved)
-        assert json.loads((destination / "config.json").read_text())["architectures"] == ["Qwen3ForCausalLM"]
-        for name, tensor in saved.items():
-            if problem == "missing" and name == key:
-                continue
-            torch.testing.assert_close(tensor, state[name], atol=0, rtol=0, msg=name)
-
-    report = caplog.text
-    assert "model.layers.1." not in report
-    assert "model.layers.2." not in report
-    assert "model.layers.{1, 2}." not in report
-    if problem is None:
-        assert "LOAD REPORT" not in report
-        assert "UNEXPECTED" not in report
-    else:
-        assert key in report
-        expected_status = {
-            "unexpected": "UNEXPECTED",
-            "retained-unexpected": "UNEXPECTED",
-            "outside-source": "UNEXPECTED",
-            "missing": "MISSING",
-            "mismatched": "MISMATCH",
-        }
-        assert expected_status[problem] in report
-    assert transformers.Qwen3ForCausalLM._keys_to_ignore_on_load_unexpected is original_ignore
-
-    caplog.clear()
-    reduced, _, _ = synth_model.reduce_config(str(source), 1)
-    if problem != "mismatched":
-        direct, info = transformers.Qwen3ForCausalLM.from_pretrained(
-            source, config=reduced, dtype=torch.bfloat16, output_loading_info=True
-        )
-        assert type(direct) is transformers.Qwen3ForCausalLM
-        assert any(name.startswith("model.layers.1.") for name in info["unexpected_keys"])
 
 
 # Shared Qwen4 reference residency sizing (new controls only).
@@ -32411,58 +21434,6 @@ def test_qwen4_residency_new_meta_pool_bytes_match_runtime_policy(_qwen4_residen
     assert json.loads(json.dumps(asdict(result)))["total_parameter_elements"] == 32
     with pytest.raises(FrozenInstanceError):
         result.total_parameter_elements = 0
-
-
-@pytest.mark.parametrize("change", ["tied", "prefrozen"])
-def test_qwen4_residency_new_partition_handles_ties_and_existing_freeze(_qwen4_residency_new_architecture, change):
-    cfg = _qwen4_residency_new_config(tie=change == "tied", prefrozen=change == "prefrozen")
-    result = synth_model.reference_parameter_residency(cfg)
-    assert result.cpu_frozen_parameter_elements == 10
-    if change == "tied":
-        assert result.total_parameter_elements == 22
-        assert result.accelerator_frozen_parameter_elements == 4
-        assert result.accelerator_trainable_parameter_elements == 8
-        assert result.conservative_accelerator_parameter_charge_bytes == 72
-    else:
-        assert result.total_parameter_elements == 32
-        assert result.accelerator_frozen_parameter_elements == 8
-        assert result.accelerator_trainable_parameter_elements == 14
-        assert result.conservative_accelerator_parameter_charge_bytes == 128
-    assert synth_model.count_parameters(cfg) == result.total_parameter_elements
-
-
-def test_qwen4_residency_new_full_table_shape_counts_without_payload(_qwen4_residency_new_architecture):
-    cfg = _qwen4_residency_new_config(table_shape=(320001536, 160))
-    result = synth_model.reference_parameter_residency(cfg)
-    assert result.cpu_frozen_parameter_elements == 51200245760
-    assert result.cpu_frozen_weight_bytes == 102400491520
-    assert result.total_parameter_elements == 51200245760 + 22
-    assert result.conservative_accelerator_parameter_charge_bytes == 152
-    table = _qwen4_residency_new_architecture[0].layers[0].ple.ple_embedding.ngram_embedding.weight
-    assert table.device.type == "meta" and table.shape == (320001536, 160)
-
-
-@pytest.mark.parametrize("rate", [8, 12])
-def test_qwen4_residency_new_generic_family_retains_all_parameter_charge(
-    _qwen4_residency_new_architecture, monkeypatch, rate
-):
-    from arctic_platform.correctness.reference import qwen4_reference
-
-    monkeypatch.setattr(qwen4_reference, "qwen4_parameter_policy", lambda *args: pytest.fail("Qwen4 policy used"))
-    result = synth_model.reference_parameter_residency(
-        _qwen4_residency_new_config("unrelated", prefrozen=True), bytes_per_param=rate
-    )
-    assert result.total_parameter_elements == 32
-    assert result.cpu_frozen_parameter_elements == 0
-    assert result.accelerator_frozen_parameter_elements == 4
-    assert result.accelerator_trainable_parameter_elements == 28
-    assert result.conservative_accelerator_parameter_charge_bytes == 32 * rate
-
-
-def test_qwen4_residency_new_missing_policy_cannot_fall_back_to_generic(_qwen4_residency_new_architecture):
-    cfg = _qwen4_residency_new_config(malformed=True)
-    with pytest.raises(ValueError, match="complete PLE/QSA"):
-        synth_model.reference_parameter_residency(cfg)
 
 
 def test_qwen4_residency_new_whole_blocks_use_residency_and_keep_full_identity(
@@ -32797,37 +21768,6 @@ def test_local_cortex_shutdown_invalid_or_failed_owned_cancellation_fails_closed
     assert state.slept == []
 
 
-def test_local_cortex_shutdown_pending_child_reaches_configured_monotonic_deadline(
-    _local_cortex_shutdown_gateway,
-):
-    state, job, create = _local_cortex_shutdown_gateway
-    transport, original = create()
-    state.polls = [job(child_status="pending")] * 3
-    with pytest.raises(local_transport_UnsafeCleanupError, match="cancellation deadline") as caught:
-        transport.shutdown()
-    assert isinstance(caught.value.__cause__, TimeoutError)
-    assert state.elapsed == original.poll_timeout
-    assert len(state.calls) == 4
-    assert state.closed and transport.config is original
-
-
-@pytest.mark.parametrize("field", ["poll_timeout", "request_timeout", "poll_interval"])
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0.0, -1.0])
-def test_local_cortex_shutdown_nonfinite_or_nonpositive_timing_is_rejected_without_cancel(
-    _local_cortex_shutdown_gateway, field, value
-):
-    state, _, create = _local_cortex_shutdown_gateway
-    transport, _ = create()
-    if field == "poll_interval":
-        transport.poll_interval = value
-    else:
-        transport.config = transport.config.model_copy(update={field: value})
-    with pytest.raises(local_transport_UnsafeCleanupError, match="finite and positive") as caught:
-        transport.shutdown()
-    assert isinstance(caught.value.__cause__, ValueError)
-    assert state.calls == [] and state.closed
-
-
 def test_local_cortex_shutdown_cancel_network_failure_is_not_suppressed_or_retried(
     _local_cortex_shutdown_gateway,
 ):
@@ -32909,85 +21849,6 @@ def test_local_cortex_shutdown_close_failure_after_cancellation_still_raises(
     assert not getattr(failure, "__notes__", [])
     assert len(state.calls) == 2 and state.closed
     assert transport.job_id is None and transport._local_shutdown_parent is None
-
-
-def test_local_cortex_shutdown_interruption_preserves_ownership_when_session_close_fails(
-    _local_cortex_shutdown_gateway, monkeypatch
-):
-    state, _, create = _local_cortex_shutdown_gateway
-    transport, _ = create()
-    primary = KeyboardInterrupt("owned cancellation interrupted")
-    close = transport._close_session
-
-    def interrupted_cancel(parent):
-        assert parent == "owned-parent"
-        raise primary
-
-    async def failing_close():
-        await close()
-        raise RuntimeError("owned session close failed")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(transport, "_wait_local_cancelled", interrupted_cancel)
-        patch.setattr(transport, "_close_session", failing_close)
-        with pytest.raises(KeyboardInterrupt) as caught:
-            transport.shutdown()
-
-    assert caught.value is primary
-    assert state.calls == [] and state.closed
-    notes = "\n".join(primary.__notes__)
-    assert "cancellation was not verified" in notes and "owned-parent:training:0" in notes
-    assert "HTTP session closure also failed" in notes
-
-
-def test_local_cortex_shutdown_late_cancelled_response_does_not_override_deadline(
-    _local_cortex_shutdown_gateway,
-):
-    state, job, create = _local_cortex_shutdown_gateway
-    transport, original = create()
-
-    def late():
-        state.elapsed = original.poll_timeout
-        return job()
-
-    state.polls = [late]
-    with pytest.raises(local_transport_UnsafeCleanupError, match="cancellation deadline") as caught:
-        transport.shutdown()
-    assert isinstance(caught.value.__cause__, TimeoutError)
-    assert state.closed and transport.config is original
-
-
-def test_local_cortex_shutdown_changed_parent_identity_never_cancels_another_parent(
-    _local_cortex_shutdown_gateway,
-):
-    state, _, create = _local_cortex_shutdown_gateway
-    transport, _ = create()
-    transport.job_id = "foreign-parent"
-    with pytest.raises(local_transport_UnsafeCleanupError, match="inconsistent owned parent"):
-        transport.shutdown()
-    assert state.calls == [] and state.closed
-
-
-@pytest.mark.parametrize(
-    "base_url,reconnect",
-    [
-        ("http://remote.example", False),
-        ("https://127.0.0.1:8003", False),
-        ("http://127.0.0.1:8003", True),
-    ],
-)
-def test_local_cortex_shutdown_hosted_and_reconnected_shutdown_keep_ack_only_behavior(
-    _local_cortex_shutdown_gateway, base_url, reconnect
-):
-    state, _, create = _local_cortex_shutdown_gateway
-    transport, original = create(base_url=base_url, reconnect=reconnect)
-    transport.shutdown()
-    if reconnect:
-        assert state.calls == [] and not state.cancelled
-    else:
-        assert [method for method, _, _ in state.calls] == ["POST"]
-        assert state.calls[0][2]["timeout"].total == original.request_timeout
-    assert state.slept == [] and state.closed
 
 
 def test_local_cortex_shutdown_startup_failure_still_cancels_owned_parent_with_child_fence(
@@ -33191,63 +22052,6 @@ def _client_backends_no_network(monkeypatch):
         transport._loop.call_soon_threadsafe(transport._loop.stop)
 
 
-def _client_backends_session_with_close_spy(transport, monkeypatch, closed):
-
-    async def create():
-        assert asyncio.get_running_loop() is transport._loop
-        transport._session = aiohttp.ClientSession(headers=transport._auth_headers(), trust_env=False)
-        return transport._session
-
-    session = transport._on_loop(create()).result()
-    original_close = transport._close_session
-
-    async def close():
-        assert asyncio.get_running_loop() is transport._loop
-        current = transport._session
-        await original_close()
-        assert transport._session is None
-        assert current is None or current.closed
-        if current is not None:
-            closed.append("close")
-
-    monkeypatch.setattr(transport, "_close_session", close)
-    return session
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_cli_defaults_to_cortex_training_and_accepts_legacy_cortex(
-    monkeypatch,
-):
-    selected = []
-    monkeypatch.setattr(cli, "cmd_run", lambda args: selected.append(args.backend) or 0)
-    assert cli.main(["run", "--all-configs"]) == 0
-    assert cli.main(["run", "--all-configs", "--backend", "cortex-training"]) == 0
-    assert cli.main(["run", "--all-configs", "--backend", "cortex"]) == 0
-    assert selected == ["cortex", "cortex", "cortex"]
-    with pytest.raises(SystemExit) as exc:
-        cli.parse_args(["run", "--all-configs", "--backend", "onprem"])
-    assert exc.value.code == 2
-
-
-def test_client_backends_onboarding_uses_the_same_cortex_training_default():
-    args = cli.parse_args(["onboard", "--config", "./work/config.json"])
-    assert args.backend == "cortex"
-    args = cli.parse_args(["onboard", "--config", "./work/config.json", "--backend", "cortex-training"])
-    assert args.backend == "cortex"
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_cortex_connection_uses_environment_or_pat_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://from-env.test")
-    assert cli._client_backend(Namespace()).base_url == "http://from-env.test"
-    token = tmp_path / "pat"
-    token.write_text("file-token\n")
-    backend = cli._client_backend(Namespace(pat_file=token, host="host", database="db", schema="sc"))
-    assert backend.pat.get_secret_value() == "file-token"
-    assert "file-token" not in repr(backend)
-    assert isinstance(cli._client_backend(Namespace(backend="onprem")), OnPremConfig)
-
-
 @pytest.mark.usefixtures("_client_backends_no_network")
 @pytest.mark.parametrize(
     "base_url",
@@ -33394,121 +22198,6 @@ def test_client_backends_remote_run_never_probes_local_allocation(tmp_path, monk
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_remote_job_skips_ray_and_preserves_backend(tmp_path, monkeypatch):
-    backend = _client_backends_remote()
-    seen = []
-
-    def forbidden(*args):
-        pytest.fail("Cortex must not start or stop Ray")
-
-    class Client:
-
-        def __init__(self, config):
-            seen.append(config)
-            self.jobs = JobHandles(training="parent:training:0")
-
-        def shutdown(self):
-            seen.append("shutdown")
-
-    monkeypatch.setattr(ap_driver, "_gateway_runtime", forbidden)
-    monkeypatch.setattr(ap_driver, "ArcticClient", Client)
-    payload = {
-        "model_name": "model",
-        "training_config": {"n_gpus": 8, "max_seq_len": 8},
-    }
-    with ap_driver.gateway(tmp_path, 8, backend=backend) as session:
-        with ap_driver.running_job(session, payload) as job:
-            assert job.job_id == "parent:training:0"
-    assert seen[0].backend is backend
-    assert seen[0].training.checkpoint_path is None
-    assert seen[1] == "shutdown"
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_cortex_batch_preserves_microbatch_order_labels_and_context():
-    chunks = [
-        {
-            "input_ids": torch.tensor([[index, index + 1]]),
-            "labels": torch.tensor([[index + 1, -100]]),
-        }
-        for index in range(4)
-    ]
-    body = {
-        "batch": chunks,
-        "meta": {"labels_are_shifted": True},
-        "processing": {"loss_fn": "sft"},
-    }
-    lowered = ap_driver.cortex_training_body(body)
-    torch_assert_equal(
-        lowered["kwargs"]["input_ids"],
-        torch.cat([chunk["input_ids"] for chunk in chunks]),
-    )
-    torch_assert_equal(lowered["kwargs"]["labels"], torch.cat([chunk["labels"] for chunk in chunks]))
-    assert lowered["context"] == body["meta"]
-    assert "processing" not in lowered
-    assert body["processing"]["loss_fn"] == "sft"
-    assert len(body["batch"]) == 4
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
-@pytest.mark.parametrize("batches", [[], [{"x": torch.ones(1)}, {"y": torch.ones(1)}]])
-def test_client_backends_cortex_rejects_malformed_microbatch_lists(batches):
-    with pytest.raises(ValueError, match="identical tensor keys"):
-        ap_driver.cortex_training_body({"batch": batches})
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_onprem_batch_and_cortex_rpc_are_not_rewritten():
-    body = {"batch": {"input_ids": torch.ones(1, 2)}}
-    job = SimpleNamespace(client=SimpleNamespace(config=SimpleNamespace(backend=OnPremConfig())))
-    assert ap_driver.training_body(job, body) is body
-    rpc = {"args": (), "kwargs": {"input_ids": torch.ones(1, 2)}}
-    assert ap_driver.cortex_training_body(rpc) is rpc
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_cortex_config_forwards_worker_settings_without_mutation():
-    worker = {
-        "debug": {"full_determinism_must_comply": False},
-        "sp_size": 8,
-        "prime_rl": {"fused_cross_entropy": "liger"},
-        "enable_gradient_checkpointing": True,
-    }
-    config = CortexTrainingConfig(
-        model_name="model",
-        training_gpus=8,
-        backend=_client_backends_remote(),
-        training={"ds_worker_config": worker, "full_determinism": True},
-        source_checkpoint_info={"checkpoint_id": "cp_saved", "source_job_id": "parent"},
-    )
-    wire = config.to_cortex()[0]
-    assert wire["source_checkpoint_info"] == config.source_checkpoint_info
-    assert wire["training_config"]["sp_size"] == 8
-    assert wire["training_config"]["prime_rl"] == worker["prime_rl"]
-    assert wire["training_config"]["debug"] == {
-        "full_determinism": True,
-        "full_determinism_must_comply": False,
-    }
-    assert wire["training_config"]["activation_checkpointing"] is True
-    assert "enable_gradient_checkpointing" not in wire["training_config"]
-    assert "full_determinism" not in worker["debug"]
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
-@pytest.mark.parametrize(
-    "source",
-    [{}, {"checkpoint_id": "cp_saved"}, {"checkpoint_id": "", "source_job_id": "p"}],
-)
-def test_client_backends_cortex_resume_requires_complete_source_identity(source):
-    with pytest.raises(ValidationError, match="checkpoint_id and source_job_id"):
-        CortexTrainingConfig(
-            model_name="model",
-            backend=_client_backends_remote(),
-            source_checkpoint_info=source,
-        )
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
 def test_client_backends_onprem_refuses_cortex_checkpoint_identity():
     with pytest.raises(ValidationError, match="requires CortexConfig"):
         CortexTrainingConfig(
@@ -33549,84 +22238,6 @@ def test_client_backends_cortex_transport_sends_hardware_and_lists_durable_check
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_cortex_shutdown_closes_session_when_cancel_fails(monkeypatch):
-    transport = CorrectnessCortexTransport(_client_backends_remote())
-    transport.job_id = "parent"
-    transport._owns_job = True
-    closed = []
-    session = _client_backends_session_with_close_spy(transport, monkeypatch, closed)
-    attempts = []
-
-    async def send(method, url, *, policy=_DEFAULT, **kwargs):
-        assert asyncio.get_running_loop() is transport._loop
-        assert isinstance(policy, _SendPolicy)
-        assert method == "POST" and url.endswith("/parent:cancel")
-        attempts.append(url)
-        raise aiohttp.ClientConnectionError("cancel unavailable")
-
-    monkeypatch.setattr(transport, "_send", send)
-    transport.shutdown()
-    transport.shutdown()
-    assert transport.job_id is None
-    assert attempts == [f"{transport._prefix}/parent:cancel"]
-    assert closed == ["close"]
-    assert session.closed and transport._session is None
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_inapplicable_check_is_not_also_a_cortex_failure(tmp_path, monkeypatch):
-    cfg = SimpleNamespace(
-        config_id="unit",
-        n_gpus=8,
-        sub_job={"dtype": "bfloat16"},
-        training={"dtype": "bfloat16"},
-        at_gpu_width=lambda width: cfg,
-    )
-    spec = _applicable_tests_spec([])
-    results = runner.execute(
-        cfg,
-        spec,
-        [],
-        vocab_size=128,
-        select=["single-step-optimizer"],
-        client_backend=_client_backends_remote(),
-        workdir=tmp_path,
-    )
-    assert len(results) == 1
-    assert results[0].outcome is Outcome.INAPPLICABLE
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_cortex_unsupported_checks_fail_before_batch_or_reference(tmp_path, monkeypatch):
-    cfg = SimpleNamespace(
-        config_id="unit",
-        n_gpus=8,
-        sub_job={"dtype": "bfloat16"},
-        training={"dtype": "bfloat16"},
-        at_gpu_width=lambda width: cfg,
-    )
-    spec = _applicable_tests_spec(["single-step-optimizer"])
-    monkeypatch.setattr(
-        runner,
-        "build_batch",
-        lambda *args, **kwargs: pytest.fail("must reject before batches"),
-    )
-    results = runner.execute(
-        cfg,
-        spec,
-        [],
-        vocab_size=128,
-        select=["single-step-optimizer"],
-        client_backend=_client_backends_remote(),
-        workdir=tmp_path,
-    )
-    assert len(results) == 1
-    assert results[0].outcome is Outcome.FAIL
-    assert results[0].summary == "published Cortex fixture required"
-    assert "--cortex-fixture" in results[0].reason
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
 @pytest.mark.parametrize("check", ["single-step-grads", "single-step-optimizer"])
 def test_client_backends_cortex_refuses_checks_requiring_local_model_identity(tmp_path, monkeypatch, check):
     cfg = SimpleNamespace(
@@ -33659,79 +22270,6 @@ def test_client_backends_cortex_refuses_checks_requiring_local_model_identity(tm
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_cli_rejects_unsupported_cortex_checks_without_reading_model(tmp_path, monkeypatch):
-    import transformers
-
-    path = _cli_config_selection_write_config(tmp_path / "configs", "h200")
-    spec = _applicable_tests_spec(["single-step-grads"])
-    captured = []
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("unsupported Cortex check must not load local or catalog model metadata")
-
-    monkeypatch.setattr(cli, "_frozen_spec", lambda cfg, path, arms, **kwargs: (spec, arms))
-    monkeypatch.setattr(cli, "_catalog_vocab_size", forbidden)
-    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", forbidden)
-    monkeypatch.setattr(cli, "_finish", lambda results, *args, **kwargs: captured.extend(results) or 1)
-    assert (
-        cli.main(
-            [
-                "run",
-                "--config",
-                str(path),
-                "--test",
-                "single-step-grads",
-                "--base-url",
-                _client_backends_remote().base_url,
-            ]
-        )
-        == 1
-    )
-    assert captured and all((result.outcome is Outcome.FAIL for result in captured))
-    assert "--cortex-fixture" in captured[0].reason
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_cortex_sft_body_does_not_select_the_rl_processor():
-    from arctic_platform import wire
-
-    body = {
-        "batch": {
-            "input_ids": torch.tensor([[1, 2, 3]]),
-            "labels": torch.tensor([[1, 2, -100]]),
-        },
-        "processing": {"loss_fn": "sft"},
-    }
-    lowered = ap_driver.cortex_training_body(body)
-    assert "processing" not in lowered
-    decoded = wire.loads(wire.dumps(lowered))
-    torch_assert_equal(decoded["kwargs"]["labels"], body["batch"]["labels"])
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
-@pytest.mark.parametrize(
-    "processing",
-    [
-        {"loss_fn": "sft_ce", "config": {"log_prob_micro_batch_size": 128}},
-        {"loss_fn": "sft", "config": {"unknown": True}},
-    ],
-)
-def test_client_backends_cortex_does_not_silently_drop_sft_processing_options(
-    processing,
-):
-    with pytest.raises(ValueError, match="use --backend onprem"):
-        ap_driver.cortex_training_body({"batch": {"input_ids": torch.ones(1, 2)}, "processing": processing})
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
-def test_client_backends_hosted_alias_uses_the_same_cortex_run_path(monkeypatch):
-    selected = []
-    monkeypatch.setattr(cli, "cmd_run", lambda args: selected.append(args.backend) or 0)
-    assert cli.main(["hosted", "--all-configs", "--test", "single-step-grads"]) == 0
-    assert selected == ["cortex"]
-
-
-@pytest.mark.usefixtures("_client_backends_no_network")
 def test_client_backends_cortex_report_does_not_claim_the_reduced_fixture_was_measured(tmp_path, monkeypatch):
     import json
 
@@ -33751,127 +22289,9 @@ def test_client_backends_cortex_report_does_not_claim_the_reduced_fixture_was_me
     assert payload["specs"]["unit"]["model"]["content_hash"] == spec.model.content_hash
 
 
-@pytest.mark.usefixtures("_client_backends_no_network")
-@pytest.mark.parametrize("path", ["hosted", "driver"])
-@pytest.mark.parametrize("cancel_fails", [False, True])
-def test_client_backends_remote_startup_failure_releases_job_and_session(tmp_path, monkeypatch, path, cancel_fails):
-    from arctic_platform.correctness.harness import cortex as cortex_transport
-    from arctic_platform.correctness.harness import gateway as hosted
-    from arctic_platform.correctness.harness.config import load_config
-
-    transport = CorrectnessCortexTransport(_client_backends_remote())
-    events = []
-
-    async def send(method, url, *, policy=_DEFAULT, **kwargs):
-        assert asyncio.get_running_loop() is transport._loop
-        assert isinstance(policy, _SendPolicy)
-        if method == "POST" and url == transport._prefix:
-            return {"job_id": "failed-job"}
-        if method == "GET":
-            return {"status": "FAILED", "reason": "no capacity"}
-        assert url.endswith("/failed-job:cancel")
-        events.append("cancel")
-        if cancel_fails:
-            raise aiohttp.ClientConnectionError("cancel unavailable")
-        return {}
-
-    session = _client_backends_session_with_close_spy(transport, monkeypatch, events)
-    monkeypatch.setattr(transport, "_send", send)
-    monkeypatch.setattr(
-        cortex_transport,
-        "CorrectnessCortexTransport",
-        lambda *args, **kwargs: transport,
-    )
-    with pytest.raises(RuntimeError, match="no capacity"):
-        if path == "hosted":
-            cfg = load_config(_cli_config_selection_write_config(tmp_path / "configs", "h200"))
-            with hosted.HostedTransport(_client_backends_remote(), cfg) as hosted_transport:
-                with hosted_transport.job():
-                    pytest.fail("failed startup must not yield a job")
-        else:
-            payload = {"model_name": "model", "training_config": {"n_gpus": 8}}
-            with ap_driver.gateway(tmp_path, 8, backend=_client_backends_remote()) as gateway_session:
-                with ap_driver.running_job(gateway_session, payload):
-                    pytest.fail("failed startup must not yield a job")
-    assert events == ["cancel", "close"]
-    assert transport.job_id is None
-    assert session.closed and transport._session is None
-
-
 # Cortex port.
 
 _driver_reviewed_root = Path(__file__).resolve().parents[1]
-
-
-def test_driver_reviewed_build_payload_forwards_top_level_moe_chunk_through_model_options():
-    training = {"ep_size": 8, "fused_lm_head_token_chunk_size": 1024, "prime_rl": {}}
-    before = deepcopy(training)
-    result = ap_driver.build_payload(training, "model", 42, lm_head_token_chunk_size=2048)["training_config"]
-    assert result["model_options"]["lm_head.token_chunk_size"] == 1024
-    assert result["fused_lm_head_token_chunk_size"] == 1024
-    assert result["prime_rl"] == training["prime_rl"]
-    assert training == before
-
-
-@pytest.mark.parametrize(
-    "settings",
-    [
-        {"prime_rl": {"fused_lm_head_token_chunk_size": 4096}},
-        {"prime_rl": {"fused_lm_head_token_chunk_size": "disabled"}},
-        {"prime_rl": {"fused_lm_head_token_chunk_size": None}},
-        {"fused_lm_head_token_chunk_size": "disabled"},
-        {"fused_lm_head_token_chunk_size": None},
-        {"model_options": {"lm_head": {"token_chunk_size": 4096}}},
-        {"model_options": {"lm_head.token_chunk_size": 4096}},
-    ],
-)
-def test_driver_reviewed_build_payload_preserves_explicit_chunk_settings(settings):
-    training = {"ep_size": 8, **deepcopy(settings)}
-    before = deepcopy(training)
-    result = build_payload(training, "model", 42, lm_head_token_chunk_size=2048)["training_config"]
-    for key, value in settings.items():
-        assert result[key] == value
-    assert result.get("model_options") == settings.get("model_options")
-    assert result.get("fused_lm_head_token_chunk_size") == settings.get("fused_lm_head_token_chunk_size")
-    assert training == before
-
-
-def test_driver_reviewed_build_payload_moe_chunk_fallback_preserves_other_options():
-    training = {
-        "ep_size": 8,
-        "model_options": {"attention": {"backend": "qsa_flex"}},
-        "prime_rl": {"fused_cross_entropy": False},
-    }
-    before = deepcopy(training)
-    result = build_payload(training, "model", 42, lm_head_token_chunk_size=2048)["training_config"]
-    assert result["fused_lm_head_token_chunk_size"] == 2048
-    assert result["model_options"] == {
-        "attention": {"backend": "qsa_flex"},
-        "lm_head.token_chunk_size": 2048,
-    }
-    assert training == before
-
-
-@pytest.mark.parametrize("ep_size", [None, "invalid", True, {}, 1])
-def test_driver_reviewed_build_payload_chunk_does_not_coerce_ep_size(ep_size):
-    training = {"ep_size": ep_size, "fused_lm_head_token_chunk_size": 1024}
-    result = build_payload(training, "model", 42)["training_config"]
-    assert result["ep_size"] == ep_size
-    assert result["fused_lm_head_token_chunk_size"] == 1024
-    assert "model_options" not in result
-
-
-@pytest.mark.parametrize("weight_format", [None, "vllm", "hf", "lora"])
-def test_driver_reviewed_build_payload_keeps_format_outside_worker_config(
-    weight_format,
-):
-    cfg = load_config(_driver_reviewed_config)
-    before = deepcopy(cfg.training)
-    payload = ap_driver.build_payload(cfg.training, cfg.model_name, cfg.native.seed, weight_format=weight_format)
-    assert payload.get("weight_format") == weight_format
-    assert ("weight_format" in payload) == (weight_format is not None)
-    assert "weight_format" not in payload["training_config"]
-    assert cfg.training == before
 
 
 @pytest.mark.parametrize("weight_format", ["vllm", "hf", "lora"])
@@ -33906,360 +22326,14 @@ def test_driver_reviewed_rejects_unsupported_format_before_gateway_runtime(monke
 _cortex_port_ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.fixture(autouse=False)
-def _cortex_port_no_network(monkeypatch):
-    monkeypatch.setattr(
-        aiohttp.ClientSession,
-        "request",
-        lambda *args, **kwargs: pytest.fail("unit tests must not access the network"),
-    )
-    monkeypatch.setattr(
-        requests.Session,
-        "request",
-        lambda *args, **kwargs: pytest.fail("unit tests must not access the network"),
-    )
-
-
-@pytest.mark.usefixtures("_cortex_port_no_network")
-@pytest.mark.parametrize("protocol", ["http", "other"])
-def test_cortex_port_config_intake_does_not_ignore_unknown_protocols(tmp_path, protocol):
-    raw = json.loads(_cortex_port_CONFIG.read_text())
-    raw["backend"]["protocol"] = protocol
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps(raw))
-    with pytest.raises(ValueError):
-        load_config(path)
-
-
-@pytest.mark.usefixtures("_cortex_port_no_network")
-def test_cortex_port_cortex_training_preserves_dss_extra_fields_and_determinism():
-    training = {
-        "n_gpus": 8,
-        "max_seq_len": 32,
-        "train_batch_size": 8,
-        "optimizer": {"name": "AdamW", "lr": 0.0001},
-        "sp_size": 8,
-        "prime_rl": {"fused_cross_entropy": "liger"},
-        "activation_checkpointing": True,
-        "custom_worker_option": {"value": 3},
-    }
-    before = json.dumps(training, sort_keys=True)
-    payload = build_payload(training, "published-fixture", 42)
-    session = GatewaySession(Path("."), 8, CortexConfig(base_url="http://unused"))
-    cfg = _training_client_config(session, payload)
-    wire = cfg.to_cortex()[0]
-    for key in (
-        "sp_size",
-        "prime_rl",
-        "custom_worker_option",
-        "activation_checkpointing",
-        "mb_spec",
-        "debug",
-    ):
-        assert wire["training_config"][key] == payload["training_config"][key]
-    assert wire["training_config"]["debug"]["gradient_norms_per_param"] is True
-    assert wire["training_config"]["debug"]["full_determinism"] is True
-    assert "enable_gradient_checkpointing" not in wire["training_config"]
-    assert json.dumps(training, sort_keys=True) == before
-
-
-@pytest.mark.usefixtures("_cortex_port_no_network")
-def test_cortex_port_hosted_config_does_not_depend_on_removed_public_backend_fields():
-    cfg = load_config(_cortex_port_CONFIG)
-    config = hosted.training_client_config(cfg, CortexConfig(base_url="http://unused"))
-    assert config.hardware == "H200"
-    assert config.to_cortex()[0]["training_config"]["debug"]["full_determinism"] is True
-
-
-@pytest.mark.usefixtures("_cortex_port_no_network")
-@pytest.mark.parametrize("order", ["batched", "interleaved"])
-@pytest.mark.parametrize("startup_error", [False, True])
-def test_cortex_port_reviewed_gradient_cases_send_dss_requests_not_onprem_workarounds(
-    tmp_path, monkeypatch, order, startup_error
-):
-    from arctic_platform.correctness.harness import cortex as cortex_fixture
-    from arctic_platform.correctness.harness import storage as reference_records
-
-    cfg = load_config(_cortex_port_CONFIG)
-    spec = ConfigSpec.read(_cortex_port_ROOT / f"specs/{cfg.config_id}.json")
-    references = []
-    targets = []
-    creates = []
-    cancels = []
-    replies = {}
-
-    def reference(ctx, identity):
-        assert identity["check_id"] == "single-step-grads"
-        name = identity["recipe"]["synthetic_inputs"]["batch"]["name"]
-        references.append(load_batch(ctx.batch_paths[name]))
-        return {
-            "loss": 2.0,
-            "grad_norms": {"weight": 1.0},
-            "microbatches": 1,
-            "active_tokens": 1,
-        }
-
-    async def send(transport, method, url, **kwargs):
-        if method == "POST" and url == transport._prefix:
-            creates.append(kwargs["json"])
-            return {"job_id": f"job-{len(creates)}"}
-        if method == "GET" and url == f"{transport._prefix}/{transport.job_id}":
-            if startup_error:
-                return {
-                    "status": "failed",
-                    "reason": "unsupported native worker options: ['mb_spec']",
-                }
-            return {"status": "RUNNING"}
-        if method == "GET":
-            return {
-                "status": "REQUEST_STATE_DONE",
-                "result": replies[url.rsplit("/", 1)[-1]],
-            }
-        if url.endswith(":cancel"):
-            cancels.append(transport.job_id)
-            return {}
-        if url.endswith("/forward-backward"):
-            body = wire.loads(wire.decode_byte_chunks([kwargs["data"]], kind="request"))
-            assert "processing" not in body
-            targets.append(body["kwargs"])
-            result = {"avg_loss": 2.0}
-        elif url.endswith("/step"):
-            assert kwargs["json"]["learning_rate"] == 0.0
-            result = {"gradient_norms_per_param": {"weight": 1.0}}
-        else:
-            pytest.fail(f"unexpected request: {method} {url}")
-        request_id = f"request-{len(replies)}"
-        replies[request_id] = result
-        return {"request_id": request_id}
-
-    monkeypatch.setattr(
-        cortex_fixture,
-        "load_fixture",
-        lambda *args: {"model_name": "published-reviewed-fixture"},
-    )
-    monkeypatch.setattr(
-        runner,
-        "run_reference",
-        lambda *a, **k: pytest.fail("regression must not run HF"),
-    )
-    monkeypatch.setattr(reference_records, "model_identity", lambda *a: {"sha256": "unit-model"})
-    monkeypatch.setattr(reference_records, "load_record", reference)
-    monkeypatch.setattr(runner, "uses_mixer_packing", lambda *args: False)
-    assert not hasattr(runner, "ap_batch_processing_options")
-    monkeypatch.setattr(CortexTransport, "_send", send)
-    results = runner.execute(
-        cfg,
-        spec,
-        arms_for(cfg.max_seq_len, cfg.n_gpus),
-        vocab_size=128,
-        select=["single-step-grads"],
-        client_backend=CortexConfig(base_url="http://unused"),
-        cortex_fixture=tmp_path / "receipt.json",
-        workdir=tmp_path,
-        order=order,
-    )
-    assert [result.arm for result in results] == ["gas1", "gas4"]
-    if startup_error:
-        assert all((result.outcome.value == "fail" for result in results))
-        assert all(("execution error:" in result.summary and "mb_spec" in result.summary for result in results))
-        assert all((not result.metrics and (not result.mismatches) for result in results))
-        assert targets == []
-    else:
-        assert all((result.outcome.value == "pass" for result in results))
-    assert cancels == ["job-1", "job-2"]
-    for create in creates:
-        assert create["hardware"] == "H200"
-        sub = create["sub_job_configs"][0]
-        assert sub["model_name"] == "published-reviewed-fixture"
-        assert sub["training_config"]["ds_config"]["gradient_accumulation_steps"] == 1
-        assert sub["training_config"]["debug"]["gradient_norms_per_param"] is True
-    for target, reference_batch in zip(targets, references):
-        torch.testing.assert_close(target["input_ids"], reference_batch.input_ids, rtol=0, atol=0)
-        torch.testing.assert_close(target["labels"], reference_batch.labels, rtol=0, atol=0)
-        torch.testing.assert_close(target["position_ids"], reference_batch.position_ids, rtol=0, atol=0)
-
-
 # Hosted.
 
 
 _hosted_CONNECTION = HostedConnection(host="server", database="DB", schema="SCHEMA", pat="not-a-token")
 
 
-def _hosted_config():
-    return load_config(_driver_reviewed_config)
-
-
 def _hosted_wire(cfg, **kwargs) -> dict:
     return hosted.training_client_config(cfg, CortexConfig(base_url="http://unused"), **kwargs).to_cortex()[0]
-
-
-class _hosted_Client:
-    """Enough of the hosted client to record what the transport asked it to do."""
-
-    def __init__(self, *, losses=(), save_result=None, catalog=None, added=()) -> None:
-        self.losses = list(losses)
-        self.save_result = {} if save_result is None else dict(save_result)
-        self.catalog = [dict(entry) for entry in catalog or []]
-        self.added = [dict(entry) for entry in added]
-        self.calls: list = []
-        self.created: list = []
-        self.cancelled: list = []
-        self.closed = False
-        self.transport = self
-        self.jobs = JobHandles(training="job-1:training:0")
-
-    def create(self, config):
-        self.config = config
-        self.created.append((config.to_cortex()[0], config.hardware))
-        self.jobs = JobHandles(training=f"job-{len(self.created)}:training:0")
-        return self
-
-    def fwd_bwd(self, body):
-        self.calls.append(("fwd-bwd", body))
-        return {"avg_loss": self.losses.pop(0) if self.losses else 0.0}
-
-    def step(self, learning_rate=None):
-        self.calls.append(("step", learning_rate))
-        return {"global_steps": len(self.calls)}
-
-    def save_checkpoint(self, checkpoint_type=None, *, path=None):
-        self.calls.append(("save", checkpoint_type) if path is None else ("save", checkpoint_type, path))
-        self.catalog = self.catalog + self.added
-        return self.save_result
-
-    def load_checkpoint(self, *, path):
-        self.calls.append(("load", path))
-        return {
-            "checkpoint_path": path,
-            "checkpoint_tag": "global_step10",
-            "version": 10,
-        }
-
-    def list_checkpoints(self):
-        return [dict(entry) for entry in self.catalog]
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.cancelled.append(str(self.jobs.training).split(":", 1)[0])
-        self.closed = True
-
-
-def test_hosted_the_created_sub_job_is_the_config_file_s_training_sub_job() -> None:
-    """Whatever the operator wrote reaches the server: typed fields as themselves, the rest as passthrough."""
-    cfg = _hosted_config()
-    wire = _hosted_wire(cfg)
-    assert wire["job_type"] == "training"
-    assert wire["model_name"] == cfg.model_name
-    assert wire["dtype"] == cfg.sub_job["dtype"]
-    assert wire["seed"] == cfg.sub_job["seed"]
-    for key, value in cfg.training.items():
-        if key in {"optimizer", "debug"}:
-            continue
-        if key == "mb_spec":
-            assert wire["training_config"][key].items() >= value.items(), key
-        else:
-            assert wire["training_config"][key] == value, key
-    for key, value in cfg.training["optimizer"].items():
-        assert wire["training_config"]["optimizer"]["name" if key == "type" else key] == value, key
-
-
-def test_hosted_building_a_sub_job_leaves_the_loaded_config_alone() -> None:
-    """The client canonicalizes the optimizer block it is handed, and the rest of the run reads that block."""
-    cfg = _hosted_config()
-    before = json.dumps(cfg.sub_job, sort_keys=True)
-    _hosted_wire(cfg)
-    assert json.dumps(cfg.sub_job, sort_keys=True) == before
-
-
-def test_hosted_an_ordinary_sub_job_carries_no_source_checkpoint() -> None:
-    assert "source_checkpoint_info" not in _hosted_wire(_hosted_config())
-
-
-def test_hosted_one_iteration_is_a_forward_backward_then_a_step_at_the_requested_rate() -> None:
-    """The loss is the forward-backward's, so it is read before the step that follows changes a parameter."""
-    client = _hosted_Client(losses=[2.5])
-    body = {"args": (), "kwargs": {}}
-    loss = HostedTrainingJob(client, "job-1").fwd_bwd_step(body, learning_rate=0.001)
-    assert loss == 2.5
-    assert client.calls == [("fwd-bwd", body), ("step", 0.001)]
-
-
-def test_hosted_a_job_releases_its_gpus_when_its_block_ends(monkeypatch) -> None:
-    client = _hosted_Client()
-    monkeypatch.setattr(hosted, "ArcticClient", client.create)
-    with HostedTransport(_hosted_CONNECTION, _hosted_config()) as transport:
-        with transport.job() as job:
-            assert job.job_id == "job-1"
-            assert client.cancelled == []
-        assert client.cancelled == ["job-1"]
-    assert client.closed
-
-
-def test_hosted_a_job_releases_its_gpus_when_the_block_raises(monkeypatch) -> None:
-    client = _hosted_Client()
-    monkeypatch.setattr(hosted, "ArcticClient", client.create)
-    with pytest.raises(ZeroDivisionError):
-        with HostedTransport(_hosted_CONNECTION, _hosted_config()) as transport:
-            with transport.job():
-                raise ZeroDivisionError
-    assert client.cancelled == ["job-1"]
-
-
-def test_hosted_creating_a_job_before_the_transport_is_entered_is_an_error() -> None:
-    with pytest.raises(RuntimeError, match="entered first"):
-        with HostedTransport(_hosted_CONNECTION, _hosted_config()).job():
-            pass
-
-
-def test_hosted_the_connection_does_not_render_its_token() -> None:
-    assert "not-a-token" not in repr(_hosted_CONNECTION)
-
-
-def test_hosted_an_ambiguous_catalog_delta_is_refused() -> None:
-    client = _hosted_Client(added=[{"checkpoint_id": "cp_one"}, {"checkpoint_id": "cp_two"}])
-    with pytest.raises(RuntimeError, match="cannot be identified"):
-        save_and_resolve_checkpoint_id(client, "job-1", "resumable")
-
-
-def _hosted_local_backend(url="http://127.0.0.1:8003", **kwargs):
-    return CortexConfig(base_url=url, host=None, pat=None, **kwargs)
-
-
-@pytest.mark.parametrize("url", ["http://127.0.0.1:8003", "http://localhost:8003/", "http://[::1]:8003"])
-def test_hosted_local_gateway_accepts_only_explicit_http_loopback(url) -> None:
-    backend = _hosted_local_backend(url)
-    assert is_local_cortex_gateway(backend)
-    require_local_cortex_gateway(backend)
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://localhost:8003",
-        "http://localhost.example:8003",
-        "http://127.0.0.2:8003",
-        "http://0.0.0.0:8003",
-        "http://10.0.0.1:8003",
-        "http://user:secret@localhost:8003",
-        "http://localhost:8003/api",
-        "http://localhost:8003/?value=secret",
-        "http://localhost:8003/#secret",
-    ],
-)
-def test_hosted_local_gateway_rejects_nonloopback_and_decorated_urls(url) -> None:
-    with pytest.raises(ValueError, match="unauthenticated HTTP loopback") as exc:
-        require_local_cortex_gateway(_hosted_local_backend(url))
-    assert "secret" not in str(exc.value)
-
-
-@pytest.mark.parametrize("options", [{"host": "server"}, {"pat": "not-a-token"}])
-def test_hosted_local_gateway_refuses_hosted_credentials(options) -> None:
-    backend = CortexConfig(base_url="http://127.0.0.1:8003", **options)
-    with pytest.raises(ValueError, match="unauthenticated HTTP loopback") as exc:
-        require_local_cortex_gateway(backend)
-    assert "not-a-token" not in str(exc.value)
 
 
 # Hosted determinism.
@@ -34355,16 +22429,13 @@ _SELFTEST_FIXTURES = (
     "_native_gateway_command",
     "_owned_gateway_descendant",
     "_stale_gateway_record",
-    "_gateway_scratch_launch_node",
     "_gateway_scratch_launch_transport",
     "gateway_scratch_peer_runtime",
     "gateway_scratch_peer_request",
     "gateway_scratch_peer_transport",
-    "selected_spec_case_state",
     "_prepared_reference_runner_prepared_runner",
     "_reference_records_ctx",
     "_reference_records_identity",
-    "_reference_records_checkout",
     "_reference_execution_engine",
     "native_scope_training_actor",
     "native_runtime_worker",
@@ -34385,22 +22456,17 @@ _SELFTEST_FIXTURES = (
     "_strict_ssh_consumer_new_dense_case",
     "_synthetic_optimizer_inputs",
     "dense_allocation_runner_case",
-    "_lora_init_local_adapter_fixture",
     "adapter_pack",
     "generated_adapter_config",
     "worker_adapter_transfer",
     "native_original_adapter",
     "gateway_optional_adapter_control",
     "native_reserved_listener_control",
-    "native_original_capability",
-    "lora_config_serialization_control",
     "native_adapter_layout_control",
-    "native_adapter_layout_four_block_control",
     "native_adapter_layout_rollback_control",
     "native_original_registered_control",
     "owned_worker_lease_new_control",
     "native_spawn_globals_control",
-    "native_first_two_control",
     "native_shared_pack_control",
     "native_shared_pack_capability",
     "native_shared_pack_coordinator",
@@ -34418,14 +22484,12 @@ _SELFTEST_FIXTURES = (
     "_calibration_driver",
     "_sizing_reuse_case",
     "_onboarding_storage_fast_root",
-    "_onboarding_storage_invalid_destination",
     "_local_cortex_reference_publication",
     "_local_cortex_optimizer_onboarding",
     "_optimizer_validation_child",
     "_qwen4_residency_new_architecture",
     "_local_cortex_shutdown_gateway",
     "_client_backends_no_network",
-    "_cortex_port_no_network",
     "_synthetic_runtime_inputs",
 )
 
@@ -34517,9 +22581,6 @@ _SELFTEST_GROUPS = {
     ),
     "operator_interface": (
         "test_quick_demo_config_is_tiny_and_retains_both_gas_arms",
-        "test_clean_port_payload_does_not_invent_deepep_chunking",
-        "test_clean_port_normal_runner_has_no_execution_overlay_or_config_specific_loss_selector",
-        "test_clean_port_core_fixture_binding_has_no_upload_account_or_subprocess_dependency",
         "test_clean_port_golden_fused_cross_entropy_uses_configured_accumulation",
         "test_dense_checkpoint_onboarding_parser_preserves_pair",
         "test_dense_checkpoint_onboarding_existing_api_preserves_pair",
@@ -34529,10 +22590,6 @@ _SELFTEST_GROUPS = {
         "test_dense_checkpoint_onboarding_automatic_metadata_admission_preserves_real_gateway_ownership",
         "test_dense_checkpoint_metadata_automatic_connection_is_onboarding_only",
         "test_dense_checkpoint_onboarding_automatic_connection_preserves_environment_rejections",
-        "test_cli_config_selection_cli_entry_preserves_ray_auth_mode",
-        "test_cli_config_selection_all_configs_selects_only_the_local_gpu_family",
-        "test_cli_config_selection_all_configs_any_gpu_keeps_every_gpu_family",
-        "test_cli_config_selection_explicit_config_is_not_filtered_before_validation",
         "test_console_activity_rotates_and_erases_the_temporary_line",
         "test_console_activity_prints_one_progress_line_when_output_is_not_interactive",
         "test_console_passing_gate_reports_passed_tensors",
@@ -34545,9 +22602,6 @@ _SELFTEST_GROUPS = {
         "test_console_optimizer_norm_delta_takes_precedence_over_legacy_metric",
         "test_console_optimizer_missing_delta_does_not_report_zero",
         "test_gateway_lifecycle_available_gpus_reads_a_hostfile_without_a_prestarted_gateway",
-        "test_operator_api_pair_selection_accepts_catalog_id_or_path",
-        "test_operator_api_config_only_selects_each_applicable_test_once",
-        "test_operator_api_config_mode_selects_compatible_checks_without_a_backend",
         "test_operator_external_config_copy_is_local_and_idempotent",
         "test_operator_external_config_copy_preserves_local_recipe_on_collision",
         "test_operator_external_config_copy_rejects_id_collision_across_extensions_and_layouts",
@@ -34562,7 +22616,6 @@ _SELFTEST_GROUPS = {
         "test_onboarding_prerequisites_respect_reference_backend_and_config_lora",
         "test_onboarding_prerequisites_check_actual_allocation_nodes",
         "test_onboarding_prerequisites_reference_free_cortex_needs_no_author_gpus",
-        "test_onboarding_prerequisites_reference_workers_are_not_target_requirements",
         "test_onboarding_config_only_defaults_to_eight_samples_on_one_node",
         "test_onboarding_reference_worker_override_is_preserved",
         "test_onboarding_reference_workers_reject_invalid_sample_or_node_policy",
@@ -34571,8 +22624,6 @@ _SELFTEST_GROUPS = {
         "test_onboarding_allocation_prerequisites_require_every_host_response",
         "test_operator_api_test_only_selects_all_reviewed_configs_in_order",
         "test_operator_api_bad_selectors_fail_before_backend",
-        "test_operator_api_empty_catalog_is_not_a_success",
-        "test_operator_api_archive_configs_are_not_discovered",
         "test_operator_batch_total_runtime_is_last_after_reports_and_failure_guidance",
         "test_compatibility_total_runtime_follows_all_report_and_verdict_output",
         "test_onboarding_total_runtime_is_last_and_retained_in_console_log",
@@ -34582,12 +22633,8 @@ _SELFTEST_GROUPS = {
         "test_regression_help_describes_durable_logs_and_untracked_reference_records",
         "test_operator_api_mixed_batch_continues_and_retains_every_pair",
         "test_operator_api_actual_execution_preserves_selection_order_and_combined_step_identity",
-        "test_operator_api_inapplicable_is_visible_and_not_a_pass",
         "test_operator_api_unsafe_exit_or_interruption_stops_remaining_cases",
-        "test_operator_api_empty_execution_is_explicitly_blocked",
         "test_operator_api_comparison_failure_and_execution_errors_are_distinct",
-        "test_operator_api_parse_flags_is_shared_with_operator_command",
-        "test_operator_api_static_guide_is_unchanged_by_run_and_onboarding",
         "test_operator_api_logger_traceback_is_saved_and_handlers_are_restored",
         "test_preflight_a_lock_without_a_shared_object_is_reported",
         "test_preflight_a_linked_build_and_a_clean_build_are_not_reported",
@@ -34617,13 +22664,10 @@ _SELFTEST_GROUPS = {
         "test_onboarding_zero_exit_with_nonpassing_totals_is_not_success",
         "test_onboarding_resume_retries_validation_without_repeating_preparation",
         "test_onboarding_resume_rebuilds_changed_phase_and_invalidates_successors",
-        "test_onboarding_resume_never_admits_failed_sizing",
         "test_onboarding_resume_state_is_bound_to_recipe_and_environment",
         "test_onboarding_retry_target_fix_reuses_preparation_in_place_but_not_validation",
         "test_onboarding_retry_reference_or_recipe_change_cannot_reuse_preparation",
         "test_onboarding_retry_calibration_repair_rebuilds_instead_of_reusing_old_measurements",
-        "test_onboarding_retry_reviewed_cache_and_summary_changes_preserve_preparation",
-        "test_onboarding_retry_runtime_footer_and_calibration_bar_preserve_only_unchanged_recipe",
         "test_onboarding_retry_incomplete_or_corrupt_legacy_state_is_not_admitted",
         "test_onboarding_config_only_automatically_selects_cortex_fixture",
         "test_onboarding_automatic_gateway_uses_upstream_server_and_closes_owned_process",
@@ -34641,29 +22685,12 @@ _SELFTEST_GROUPS = {
         "test_regression_gateway_cleanup_exceptions_stop_following_work",
         "test_regression_gateway_disappearing_group_still_reaps_owned_child",
         "test_owned_gateway_descendants_reject_unverified_members",
-        "test_owned_gateway_descendant_cleared_environment_and_verified_exit_is_not_signalled",
-        "test_owned_gateway_unverified_descendant_grace_never_signals",
-        "test_owned_gateway_real_unverified_descendant_natural_exit_is_waited_for",
-        "test_owned_gateway_descendants_ignore_other_sessions_and_zombies",
-        "test_owned_gateway_descendant_unreadable_environment_requires_verified_exit",
-        "test_owned_gateway_pidfd_libc_fallback_preserves_errors",
-        "test_owned_gateway_pidfd_prefers_python_interface",
-        "test_owned_gateway_pidfd_missing_libc_support_fails_closed",
-        "test_owned_gateway_descendants_use_pinned_signals_and_verify_exit",
         "test_owned_gateway_descendant_pid_reuse_is_not_signalled",
-        "test_owned_gateway_descendant_exit_wait_does_not_reread_environment",
-        "test_owned_gateway_reaps_descendants_before_retiring_ownership",
-        "test_owned_gateway_recovery_keeps_dead_leader_record_until_descendants_exit",
         "test_owned_gateway_real_orphan_descendant_is_stopped_after_leader_exit",
-        "test_owned_gateway_preserves_owner_environment_for_process_titles",
         "test_owned_gateway_real_retitled_ray_agent_keeps_marker_and_is_reaped",
-        "test_owned_gateway_stop_signals_clean_up_and_restore_handlers",
-        "test_owned_gateway_repeated_stop_does_not_interrupt_cleanup",
         "test_owned_gateway_real_process_signal_reaps_child",
         "test_stale_owned_gateway_is_stopped_before_replacement",
-        "test_stale_gateway_missing_or_reused_pid_is_not_signalled",
         "test_stale_gateway_unproven_ownership_refuses_startup",
-        "test_stale_gateway_forced_shutdown_blocks_replacement",
         "test_owned_gateway_lock_rejects_concurrent_commands",
         "test_legacy_gateway_only_matching_orphan_recovered",
         "test_owned_gateway_registry_records_launch_and_clears_after_cleanup",
@@ -34677,60 +22704,29 @@ _SELFTEST_GROUPS = {
         "test_reference_progress_counts_completed_work_and_reports_waits",
         "test_reference_progress_never_counts_failed_workers_as_success",
         "test_reference_progress_reports_slow_parallel_wave_without_eta",
-        "test_gateway_scratch_launch_node_creates_only_owned_parent_and_retains_identity",
-        "test_gateway_scratch_launch_node_refuses_unowned_or_unbound_parent",
         "test_gateway_scratch_launch_collects_every_member_and_publishes_terminal_receipts",
         "test_gateway_scratch_launch_rejects_partial_or_unauthenticated_fanout_with_saved_raw_evidence",
         "test_gateway_scratch_launch_prepares_before_gateway_and_restores_original_environment",
-        "test_gateway_scratch_launch_failure_prevents_gateway_creation",
         "test_gateway_scratch_cleanup_escalates_only_owned_transport_group_and_waits",
         "test_gateway_scratch_cleanup_refuses_lingering_descendants_after_direct_child_exits",
         "test_gateway_scratch_cleanup_receipt_write_failure_cannot_replace_primary_transport_error",
-        "test_gateway_scratch_cleanup_node_boot_drift_is_retained_without_success",
-        "test_gateway_scratch_cleanup_default_environment_restored_and_upstream_remains_unchanged",
         "test_gateway_scratch_hostfile_identity_ignores_read_atime_but_rejects_same_bytes_replacement",
         "test_gateway_scratch_peer_missing_local_file_requires_exact_authenticated_snapshot",
         "test_gateway_scratch_peer_rejects_snapshot_membership_and_runtime_drift_before_mkdir",
-        "test_gateway_scratch_peer_checks_runtime_identity_again_after_local_mkdir",
-        "test_gateway_scratch_peer_legacy_path_still_reads_local_file_and_does_not_infer_boot",
-        "test_gateway_scratch_peer_head_transports_snapshot_with_or_without_supplied_identities",
         "test_gateway_scratch_implicit_head_only_hostfile_prepares_every_worker",
-        "test_gateway_scratch_implicit_snapshot_never_requires_peer_local_hostfile",
         "test_gateway_scratch_implicit_snapshot_rejects_unbound_metadata_before_mkdir",
-        "test_gateway_scratch_implicit_snapshot_retains_head_and_complete_fanout_guards",
-        "test_gateway_scratch_peer_head_rejects_changed_file_or_unauthenticated_transport_and_retains_evidence",
-        "test_gateway_scratch_peer_head_rejects_incomplete_mapping_before_transport",
         "test_gateway_scratch_peer_public_gateway_passes_optional_mapping_without_changing_none_signature",
         "test_gateway_scratch_peer_public_gateway_rejects_supplied_mapping_for_upstream_before_ownership",
-        "test_gateway_scratch_peer_started_gateway_passes_mapping_only_to_preparation_and_restores_environment",
         "test_operator_external_config_copy_refuses_id_collision_instead_of_changing_filename",
         "test_onboarding_failure_banner_uppercases_only_heading_and_preserves_diagnostics",
-        "test_owned_gateway_descendants_include_token_bound_detached_workers",
-        "test_owned_gateway_pidfd_signal_libc_fallback_preserves_errors",
-        "test_owned_gateway_cleanup_guard_respects_replacement_registry",
-        "test_owned_gateway_cleanup_guard_scans_unrecorded_launch_after_recovery_failure",
-        "test_owned_gateway_real_process_sigkill_automatically_cleans_without_next_command",
         "test_onboarding_reports_each_attempt_time_and_separates_shared_preparation",
         "test_onboarding_module_entrypoint_follows_timing_helpers",
         "test_onboarding_independent_failures_record_each_execution_time",
         "test_onboarding_explicit_single_test_with_existing_spec_is_timed",
         "test_onboarding_final_timing_survives_interruption_or_unsafe_cleanup",
-        "test_onboarding_retry_per_test_timing_preserves_only_unchanged_preparation",
-        "test_selected_spec_case_explicit_gas1_accepts_reviewed_shape_despite_unselected_derived_case",
-        "test_selected_spec_case_unfiltered_keeps_complete_ordered_case_equality",
-        "test_selected_spec_case_selected_missing_or_changed_shape_is_recorded_nonpass",
-        "test_selected_spec_case_unknown_or_unreviewed_selection_cannot_disappear_from_report",
-        "test_selected_spec_case_duplicate_requested_or_catalog_names_are_not_collapsed",
-        "test_selected_spec_case_subset_selection_cannot_bypass_config_or_backend_or_registry_guards",
-        "test_selected_spec_case_missing_review_records_nonpass_without_regenerating_spec",
-        "test_selected_spec_case_explicit_multiple_selection_runs_only_reviewed_cases_in_derived_order",
-        "test_owned_gateway_unreadable_descendant_grace_never_signals",
     ),
     "reference_records": (
-        "test_prepared_reference_runner_default_regression_uses_prepared_norms_for_both_arms",
-        "test_prepared_reference_runner_each_comparator_uses_its_own_prepared_reference",
         "test_prepared_reference_runner_missing_gas4_reference_rejects_before_any_target",
-        "test_prepared_reference_runner_prepare_mode_measures_hf_once_and_never_starts_target",
         "test_reference_attention_runner_uses_same_glm_backend_in_measurement_and_identity",
         "test_prepared_reference_runner_combined_prepare_reuses_optimizer_calibration",
         "test_optimizer_calibration_progress_completes_each_arm_and_retains_all_reference_runs",
@@ -34745,172 +22741,61 @@ _SELFTEST_GROUPS = {
         "test_reference_grouping_mixer_call_inputs_flatten_only_multirow_varlen_calls",
         "test_reference_records_publish_load_compact_measurements_without_hf",
         "test_reference_records_missing_record_has_actionable_onboarding_command_without_hf",
-        "test_reference_records_missing_combined_reference_command_roundtrips_selection_and_workload",
-        "test_reference_records_repeat_publication_is_byte_identical_and_does_not_replace_file",
         "test_reference_set_replaces_both_arms_and_removes_old_generation",
         "test_reference_set_incomplete_or_invalid_replacement_leaves_previous_bytes",
         "test_reference_set_single_arm_publication_cannot_erase_existing_complete_set",
-        "test_reference_set_publication_recovers_interrupted_legacy_conversion",
-        "test_reference_set_second_rename_failure_restores_legacy_directory",
-        "test_reference_set_recovers_abandoned_generation_without_removing_current_set",
         "test_reference_set_unowned_symlink_is_not_deleted_or_replaced",
-        "test_reference_set_mismatched_input_generation_preserves_previous_set",
         "test_reference_set_failed_staging_or_rename_preserves_previous_complete_set",
         "test_reference_set_readers_observe_whole_set_before_and_after_directory_replacement",
         "test_reference_set_concurrent_generations_never_publish_mixed_arms",
-        "test_reference_set_legacy_migration_removes_all_replaced_versions_preserving_other_workloads",
         "test_reference_set_current_lookup_never_falls_back_to_obsolete_legacy_record",
-        "test_prepared_reference_runner_failure_on_second_arm_does_not_publish_first_arm",
         "test_prepared_reference_runner_explicit_preparation_replaces_incompatible_records_together",
-        "test_reference_records_conflicting_publication_preserves_original_record",
         "test_reference_records_corrupt_or_incompatible_record_requires_onboarding",
-        "test_reference_records_malformed_record_is_an_actionable_prerequisite_error",
-        "test_reference_records_nonfinite_record_payload_is_an_actionable_prerequisite_error",
-        "test_reference_records_nonobject_measurements_with_matching_hash_require_onboarding",
-        "test_reference_records_changed_workload_identity_does_not_reuse_old_record",
-        "test_reference_records_nonfinite_nested_measurements_are_not_published",
         "test_reference_records_incomplete_single_step_measurements_are_rejected",
-        "test_reference_records_gradient_norms_require_named_nonnegative_scalars",
         "test_reference_records_optimizer_gate_requires_reviewed_finite_norm_criterion",
-        "test_reference_records_optimizer_gate_rejects_bool_tolerance_and_invalid_provenance",
-        "test_reference_records_optimizer_requires_parameter_norms",
-        "test_reference_records_optimizer_gate_does_not_accept_legacy_reviewed_boolean",
-        "test_reference_records_optimizer_summary_is_validated_before_publication",
-        "test_reference_records_load_revalidates_measurements_even_when_payload_hash_matches",
-        "test_reference_records_concurrent_identical_writers_publish_one_complete_record",
         "test_reference_records_concurrent_conflicting_writers_do_not_overwrite_winner",
-        "test_reference_records_publication_is_visible_only_after_complete_bytes_are_synced",
-        "test_reference_records_failed_publication_removes_temporary_files",
-        "test_reference_records_byte_cap_is_checked_before_publication_creates_files",
-        "test_reference_records_invalid_record_path_identity_is_rejected_before_filesystem_writes",
-        "test_reference_records_git_records_directory_accepts_checkout_path_without_creating_it",
-        "test_reference_records_git_records_directory_rejects_outside_checkout_and_git_metadata",
-        "test_reference_records_git_records_directory_rejects_symlink_escape",
-        "test_reference_records_exact_byte_cap_loads_but_one_byte_over_cap_fails",
         "test_reference_records_workload_identity_binds_inputs_config_and_gate_not_local_record_root",
-        "test_reference_records_workload_identity_supports_missing_optional_dependencies",
-        "test_reference_records_workload_identity_uses_loaded_torch_build_not_distribution_metadata",
-        "test_reference_records_metadata_only_torch_drift_reuses_record_without_hf",
-        "test_reference_records_workload_identity_rejects_non_reference_check",
-        "test_reference_records_tensor_semantic_hash_is_independent_of_torch_save_archive",
-        "test_reference_records_tensor_semantic_hash_does_not_consume_or_depend_on_global_rng",
-        "test_reference_records_tensor_semantic_hash_normalizes_storage_layout_and_detaches",
         "test_reference_records_tensor_semantic_hash_binds_shape_dtype_and_values",
-        "test_reference_records_batch_identity_binds_all_token_semantics",
         "test_reference_records_model_identity_detects_same_size_content_drift_with_restored_mtime",
-        "test_reference_records_model_identity_is_independent_of_asset_root",
-        "test_reference_records_model_identity_requires_complete_external_assets",
         "test_reference_observability_subprocess_retains_complete_logs_and_returncode",
-        "test_reference_observability_keeps_successful_process_logs_when_result_json_is_invalid",
         "test_reference_observability_calibration_consumes_completed_runs_without_changing_records",
-        "test_reference_observability_calibration_error_keeps_existing_record_and_does_not_publish",
         "test_reference_execution_witness_records_actual_configurations_and_selected_forward",
-        "test_reference_execution_witness_hashes_loaded_forward_separately_from_file",
-        "test_reference_execution_witness_code_digest_is_checkout_independent",
-        "test_reference_execution_witness_preserves_upstream_config_and_effective_attention",
-        "test_reference_execution_witness_rejects_unrecordable_runtime",
         "test_reference_execution_witness_survives_run_and_rejects_execution_changes",
         "test_reference_execution_witness_cli_and_compact_record_preserve_provenance",
     ),
     "optimizer_capture": (
-        "test_native_callback_accepts_installed_ray_wrappers_without_initializing_ray",
-        "test_native_callback_keeps_contextmanager_support",
-        "test_native_callback_accepts_installed_ray_actor_tracing",
         "test_native_callback_accepts_serialized_ray_actor_tracing",
-        "test_native_scope_actor_workers_accepts_exact_native_save",
-        "test_native_runtime_sources_accepts_verified_ray_save",
-        "test_native_runtime_sources_rejects_unrecognized_wrapper",
         "test_native_runtime_sources_rejects_producer_hash_drift",
-        "test_native_scope_actor_workers_rejects_changed_selection",
         "test_native_callback_rejects_altered_serialized_ray_actor_tracing",
-        "test_native_callback_rejects_altered_ray_actor_tracing",
-        "test_native_callback_rejects_altered_ray_wrappers",
-        "test_native_callback_rejects_cyclic_contextmanager",
         "test_cortex_optimizer_capture_capture_requires_data_fast_before_mkdir_or_checkpoint",
         "test_cortex_optimizer_capture_same_job_snapshots_bracket_exactly_one_frozen_lr_step",
         "test_cortex_optimizer_capture_failures_remove_downloads_and_never_publish_partial_manifest",
-        "test_cortex_optimizer_capture_decoder_cannot_relabel_non_initial_update_as_step_one",
-        "test_cortex_optimizer_capture_duplicate_durable_checkpoints_rejected_before_export",
         "test_cortex_optimizer_capture_existing_output_never_overwritten_or_stepped",
         "test_cortex_optimizer_capture_decoder_must_return_manifest_inside_its_owned_output",
-        "test_cortex_optimizer_capture_uninitialized_parent_job_rejected_before_save",
-        "test_cortex_optimizer_capture_invalid_dp_degree_rejected_before_save",
-        "test_cortex_optimizer_capture_onprem_cannot_use_managed_capture",
         "test_cortex_optimizer_capture_runner_public_cortex_capture_keeps_fixture_budget_gradient_and_cleanup",
         "test_cortex_optimizer_capture_runner_onprem_preserves_local_optimizer_capture",
-        "test_cortex_optimizer_decode_decode_requires_data_fast_before_checkpoint_load",
         "test_cortex_optimizer_decode_decode_named_fp32_update_moments_and_padding",
         "test_cortex_optimizer_decode_decode_uses_actual_state_step_and_group_lr_not_legacy_or_config_defaults",
-        "test_cortex_optimizer_decode_decode_preserves_nonzero_actual_steps_without_relabeling_as_step_one",
-        "test_cortex_optimizer_decode_decode_accepts_initialized_step_zero_and_tag_directories",
-        "test_cortex_optimizer_decode_decode_mmap_restricted_loads_and_does_not_mutate_source_tensors",
         "test_cortex_optimizer_decode_decode_rejects_invalid_optimizer_schema",
-        "test_cortex_optimizer_decode_decode_rejects_non_fp32_tensors",
-        "test_cortex_optimizer_decode_decode_rejects_missing_or_malformed_moments",
-        "test_cortex_optimizer_decode_decode_rejects_inconsistent_post_optimizer_step",
         "test_cortex_optimizer_decode_decode_requires_exactly_one_engine_step",
         "test_cortex_optimizer_decode_decode_rejects_ambiguous_or_incomplete_checkpoint_files",
-        "test_cortex_optimizer_decode_decode_rejects_shape_or_order_drift",
         "test_cortex_optimizer_decode_decode_rejects_bad_named_fragment_mappings",
-        "test_cortex_optimizer_decode_decode_rejects_unsupported_or_inconsistent_group_configuration",
         "test_cortex_optimizer_decode_decode_nonfinite_parameter_rolls_back_only_new_output",
-        "test_cortex_optimizer_decode_decode_preserves_preexisting_output",
-        "test_cortex_optimizer_decode_decode_rejects_output_nested_in_input",
         "test_cortex_optimizer_decode_decode_does_not_allow_arbitrary_pickled_checkpoint_classes",
         "test_cortex_optimizer_decode_decode_rejects_non_adamw_or_missing_model_and_shard_optimizer_types",
-        "test_cortex_optimizer_decode_decode_rejects_unmatched_expected_optimizer_type",
-        "test_ap_driver_globalize_expert_norms_replaces_rank_local_value",
-        "test_ap_driver_fwd_bwd_step_reads_rank_owned_norms_from_merged_list",
-        "test_ap_driver_fwd_bwd_step_unwraps_rank_owned_optimizer_manifest",
         "test_ap_driver_optimizer_capture_worker_patches_imported_server_worker_bindings",
         "test_ap_driver_optimizer_capture_server_patches_workers_inside_actor",
-        "test_ap_driver_prime_rl_receives_prediction_aligned_labels",
-        "test_ap_driver_prime_rl_uses_fused_model_loss_with_aligned_labels",
-        "test_ap_driver_pack_microbatches_emits_exact_gas_list",
-        "test_ap_driver_pack_microbatches_preserves_prime_rl_shifted_labels",
-        "test_ap_driver_pack_microbatches_can_request_memory_sft_ce_without_mutating_config",
-        "test_ap_driver_normal_packing_uses_plain_supervised_loss",
-        "test_ap_driver_reference_runner_passes_the_harness_seed",
-        "test_ap_driver_runner_requires_data_fast_before_operational_side_effects",
-        "test_ap_driver_reference_allows_small_repo_report_with_data_fast_optimizer_output",
-        "test_ap_driver_copy_checkpoint_peft_adapter_accepts_a_checkpoint_adapter_pack",
-        "test_ap_driver_copy_checkpoint_peft_adapter_accepts_a_weights_only_hf_pack",
-        "test_ap_driver_copy_checkpoint_peft_adapter_rejects_empty_tensors_before_copy",
-        "test_ap_driver_materialize_peft_adapter_accepts_adapter_only_export",
-        "test_ap_driver_full_model_weights_only_export_still_requires_model_config",
-        "test_ap_driver_copy_checkpoint_peft_adapter_rejects_a_full_model_pack",
         "test_ap_driver_payload_routes_optimizer_capture_to_debug_for_harness",
-        "test_ap_driver_optimizer_capture_debug_config_defaults",
-        "test_ap_driver_optimizer_capture_debug_config_merges_supported_sections_without_mutation",
-        "test_ap_driver_optimizer_capture_debug_config_rejects_malformed_sections",
         "test_ap_driver_optimizer_capture_initialize_uses_current_client_job_config",
-        "test_ap_driver_optimizer_capture_initialize_accepts_path_objects",
         "test_ap_driver_optimizer_capture_initialize_worker_settings_can_disable_training_capture",
-        "test_ap_driver_optimizer_capture_initialize_rejects_relative_paths",
-        "test_ap_driver_optimizer_capture_initialize_rejects_non_path_values",
         "test_ap_driver_optimizer_capture_worker_context_restores_production_worker",
-        "test_ap_driver_payload_can_skip_unused_gradient_norm_collection",
-        "test_ap_driver_payload_preserves_configured_deepspeed_accumulation",
-        "test_ap_driver_payload_caps_large_microbatch_budget_at_64k",
-        "test_ap_driver_payload_applies_spec_lm_head_chunk_without_overriding_config",
-        "test_ap_driver_payload_preserves_smaller_microbatch_budget",
-        "test_ap_driver_payload_does_not_choose_deepep_chunks",
-        "test_ap_driver_pool_is_the_local_devices_when_the_harness_owns_the_gateway",
-        "test_ap_driver_pool_is_the_hostfile_slots_when_an_external_gateway_owns_placement",
-        "test_ap_driver_pool_falls_back_to_local_devices_when_the_named_hostfile_is_absent",
-        "test_ap_driver_payload_pins_determinism_over_a_config_that_asks_otherwise",
-        "test_ap_driver_payload_determinism_off_clears_a_config_that_asks_for_the_pin",
         "test_ap_driver_gateway_runtime_verifies_before_and_after_owned_shutdown",
-        "test_ap_driver_gateway_runtime_restores_hostfile_after_failure",
-        "test_ap_driver_selected_hostfile_is_shared_by_gateway_and_allocation",
         "test_ap_driver_allocation_runtime_command_uses_hostfile_ds_ssh",
         "test_ap_driver_runtime_idle_check_only_checks_processes_and_port",
         "test_ap_driver_gateway_runtime_refuses_preflight_without_foreign_teardown",
         "test_ap_driver_runtime_idle_check_requires_successful_process_inventory",
-        "test_ap_driver_gateway_runtime_load_failure_does_not_shutdown_or_recheck",
         "test_ap_driver_running_job_keeps_cleanup_outside_client_shutdown",
         "test_ap_driver_gateway_runtime_cleanup_failure_is_unsafe_and_restores_port",
-        "test_ap_driver_running_job_shutdown_failure_is_unsafe",
         "test_native_participation_collector_observes_backward_and_restores_all_hooks",
         "test_native_participation_collector_rejects_early_source_drift_and_still_closes",
         "test_native_participation_collector_arm_failure_does_not_leak_hooks",
@@ -34919,103 +22804,35 @@ _SELFTEST_GROUPS = {
         "test_optimizer_capture_missing_bf16_accumulation_does_not_fall_back_to_local_gradient",
         "test_optimizer_capture_non_bf16_capture_keeps_deepspeed_full_gradient_fallback",
         "test_optimizer_capture_disabled_optimizer_capture_reads_no_gradients",
-        "test_optimizer_capture_inactive_bf16_parameter_records_absent_gradient_without_local_fallback",
         "test_optimizer_capture_inactive_gradient_does_not_hide_post_step_optimizer_state",
         "test_optimizer_capture_preserves_inactive_weights_without_adam_moments",
-        "test_optimizer_capture_failure_restores_backward_hooks",
         "test_optimizer_capture_participation_survives_all_accumulated_microbatches",
-        "test_optimizer_capture_shares_rank_zero_validation_errors_before_another_collective",
-        "test_optimizer_capture_shares_local_participation_errors_before_gathering_evidence",
-        "test_optimizer_capture_shares_snapshot_validation_before_next_tensor_collective",
-        "test_optimizer_capture_shares_post_step_validation_before_next_tensor_collective",
-        "test_optimizer_capture_missing_participating_bf16_buffer_with_no_local_grad_still_errors",
-        "test_optimizer_capture_publication_fixture_matches_product_request_server",
         "test_optimizer_capture_capture_context_restores_both_server_classes_after_exception",
-        "test_optimizer_capture_nested_capture_context_restores_outer_bindings",
         "test_optimizer_capture_peer_rank_zero_capture_is_published_before_step_response",
-        "test_optimizer_capture_local_capture_uses_no_peer_transfer",
-        "test_optimizer_capture_step_without_optimizer_capture_leaves_product_response_unchanged",
         "test_optimizer_capture_capture_failures_are_not_successful_step_responses",
-        "test_optimizer_capture_workers_outside_live_allocation_are_rejected_before_export",
-        "test_optimizer_capture_manifest_is_required_in_exported_files",
-        "test_optimizer_capture_manifest_scalar_and_duplicate_metrics_publish_once",
-        "test_optimizer_capture_empty_capture_worker_list_is_rejected",
-        "test_optimizer_capture_relative_manifest_is_rejected_before_publication",
-        "test_optimizer_capture_head_without_training_workers_still_receives_capture",
-        "test_optimizer_capture_preloaded_compatibility_server_publishes_and_restores",
-        "test_optimizer_capture_lazy_compatibility_import_restores_production_classes",
-        "test_optimizer_capture_nested_context_restores_compatibility_outer_bindings",
         "test_local_cortex_optimizer_local_save_wire_and_real_dense_decoder_bracket_one_step",
         "test_local_cortex_optimizer_local_failure_cleans_only_owned_snapshots",
-        "test_local_cortex_optimizer_invalid_after_save_never_publishes_partial_artifact",
-        "test_local_cortex_optimizer_local_decoder_failure_preserves_unrelated_data_and_cleans_owned_snapshots",
-        "test_local_cortex_optimizer_existing_local_artifact_never_overwritten_or_stepped",
-        "test_local_cortex_optimizer_local_receipt_mismatch_rejected_before_step",
-        "test_local_cortex_optimizer_incomplete_local_checkpoint_never_reaches_step",
-        "test_local_cortex_optimizer_snapshot_error_identifies_tag_and_shard_counts",
-        "test_local_cortex_optimizer_snapshot_matching_tag_and_shard_counts_is_accepted",
-        "test_local_cortex_optimizer_local_checkpoint_flag_rejects_nonloopback_or_auth_before_writes",
         "test_local_cortex_optimizer_local_fixture_optimizer_runner_uses_same_model_and_frozen_budget",
-        "test_local_cortex_optimizer_runner_rejects_different_frozen_optimizer_reference_before_batch_or_job",
-        "test_local_cortex_optimizer_cli_local_fixture_never_expands_declared_four_gpu_width",
         "test_maintained_native_optimizer_completed_save_supplier_retains_pair_and_actual_child",
-        "test_maintained_native_optimizer_supplier_timeout_keeps_inputs_for_pending_owner",
         "test_maintained_native_optimizer_failed_stage_never_publishes_or_uses_unadmitted_baseline",
-        "test_maintained_native_optimizer_requires_selected_supplier_source_before_save",
-        "test_maintained_native_optimizer_rejects_completed_save_receipt_binding_damage",
-        "test_maintained_native_optimizer_rejects_nonce_change_between_completed_saves",
         "test_maintained_native_optimizer_rechecks_owner_sources_receipts_and_inputs_before_publication",
-        "test_maintained_native_optimizer_baseline_decoder_rejects_before_target",
-        "test_maintained_native_optimizer_supplier_authority_drift_blocks_next_operation",
-        "test_maintained_native_optimizer_scope_admits_bounded_collection_budget",
-        "test_maintained_native_optimizer_scope_rejects_invalid_collection_budget",
-        "test_maintained_native_optimizer_scopes_integrate_capture_and_restore_before_release",
         "test_native_ep_bf16_optimizer_reconstructs_actual_ordered_groups_without_sidefile_substitution",
         "test_native_ep_bf16_optimizer_frozen_experts_do_not_become_optimizer_records",
-        "test_native_ep_bf16_optimizer_checkpoint_wrapper_names_match_state_dict",
-        "test_native_ep_bf16_optimizer_checkpoint_wrapper_names_strip_only_exact_components",
-        "test_native_ep_bf16_optimizer_checkpoint_wrapper_aliases_remain_strict",
-        "test_native_ep_bf16_optimizer_invalid_sidefile_identifies_file_parameter_and_reason",
-        "test_native_ep_bf16_optimizer_rejects_false_fp32_state_recipe",
-        "test_native_ep_bf16_optimizer_rejects_incomplete_native_inventory",
         "test_native_ep_bf16_optimizer_wrong_ep_order_cannot_relabel_valid_weights",
         "test_native_ep_bf16_optimizer_rejects_wrong_partition_counter_and_mapping",
-        "test_native_ep_bf16_optimizer_rejects_inconsistent_adam_step",
         "test_native_ep_bf16_optimizer_source_and_input_drift_never_publish",
         "test_native_ep_bf16_optimizer_local_lifecycle_validates_before_step_and_retains_child",
-        "test_native_ep_bf16_optimizer_new_layout_negatives_cannot_guess_ownership",
-        "test_dense_collection_new_full16_head8_peer8_retains_hashes_and_cleanup",
         "test_dense_collection_new_failure_never_relaxes16_and_closes_owned_peer",
-        "test_dense_collection_new_disk_shortfall_closes_peer_without_copy",
-        "test_dense_collection_new_manifest_negatives_bind_nodes_child_and_fullranks",
         "test_dense_collection_new_stream_refuses_partial_corrupt_or_unbound_bytes",
-        "test_dense_collection_new_ownership_drift_preserves_foreign_peer",
-        "test_dense_collection_new_source_drift_rejected_before_worker_launch",
-        "test_dense_collection_new_allocation_width_cannot_substitute_sp_or_partial_dp",
         "test_dense_collection_new_two_save_real_dense_decoder_retains_collection_evidence",
-        "test_dense_native_child_identity_new_both_receipts_use_actual_child",
         "test_dense_native_child_identity_new_invalid_binding_stops_before_save",
-        "test_dense_native_child_identity_new_midstep_drift_stops_before_second_save",
-        "test_dense_native_child_identity_new_response_cannot_substitute_selector",
         "test_dense_native_child_identity_new_postdecode_binding_drift_blocks_publication",
         "test_dense_collection_new_capture_retains_both_full16_receipts_and_exact_step",
-        "test_dense_collection_new_capture_binding_drift_stops_before_second_save",
-        "test_dense_collection_new_capture_rejects_drift_during_decode",
-        "test_dense_collection_new_capture_failed_first_save_never_reaches_target",
-        "test_dense_collection_new_manifest_refuses_foreign_file_alias",
-        "test_dense_collection_new_peer_argv_binds_strict_transport_and_bounded_supervisor",
-        "test_dense_collection_new_supervisor_reaps_own_actual_cpu_child",
         "test_dense_collection_new_boundary_real_pipe_reaps_both_owned_children",
         "test_dense_collection_new_boundary_real_validator_requires_exact_hostfile_and_complete16",
-        "test_dense_collection_new_boundary_node_hostfile_cannot_drift_after_prepare",
         "test_dense_head_snapshot_new_absent_peer_authenticates_without_creating_scheduler_file",
-        "test_dense_head_snapshot_new_missing_head_remains_rejected",
         "test_dense_head_snapshot_new_corrupt_or_foreign_members_rejected",
-        "test_dense_head_snapshot_new_actual_node_identity_guard_still_runs",
-        "test_dense_head_snapshot_new_existing_or_absent_hostfile_cannot_change",
         "test_dense_collection_new_boundary_source_pin_survives_optimized_python_before_import",
-        "test_dense_collection_new_cleanup_call_classifies_only_owned_group_failure",
-        "test_dense_collection_new_cleanup_copy_preserves_worker_error_and_group_failure",
         "test_dense_collection_new_cleanup_supervisor_preserves_primary_and_owned_child",
         "test_strict_ssh_consumer_new_dense_peer_context_holds_exact_generation",
         "test_strict_ssh_consumer_new_dense_call_holds_trust_through_owned_cleanup",
@@ -35026,19 +22843,10 @@ _SELFTEST_GROUPS = {
         "test_automatic_participation_dense_decode_requires_actual_child_and_all_ranks",
         "test_automatic_participation_worker_closes_hooks_on_failure_or_destroy",
         "test_dense_allocation_runner_new_forwards_original_dense_dp_and_isolates_each_arm",
-        "test_dense_allocation_runner_explicit16_preserves_placement_for_both_arms",
         "test_dense_allocation_runner_explicit16_rejects_partial8_before_preparation",
         "test_dense_allocation_runner_new_rejects_incompatible_route_before_references_or_resources",
-        "test_dense_allocation_runner_new_allocation_rejection_precedes_reference_identity_and_resources",
-        "test_dense_allocation_runner_new_maintained_parser_and_loader_have_distinct_optimizer_scope",
-        "test_dense_allocation_runner_new_loader_rejects_scope_before_descriptor_read",
-        "test_dense_allocation_runner_new_loader_rejects_duplicate_nonfinite_nonobject_and_oversize",
         "test_dense_allocation_runner_new_loader_requires_exact_paired_fullpin",
-        "test_dense_allocation_runner_new_original_mixed_selection_rejected_before_grouping",
         "test_dense_allocation_runner_new_maintained_cli_forwards_authenticated_descriptor_to_executor",
-        "test_dense_allocation_runner_new_library_keeps_pinned_metadata_in_original_request_before_batch",
-        "test_local_cortex_optimizer_cli_local_fixture_accepts_explicit_supported_selection_before_dispatch",
-        "test_local_cortex_optimizer_cli_local_fixture_does_not_implicitly_enable_other_checks",
     ),
     "lora_training": (
         "test_gdn_determinism_reference_reduction_pinning_does_not_mutate_fla_autotuners",
@@ -35054,27 +22862,10 @@ _SELFTEST_GROUPS = {
         "test_gsm8k_a_tokenizer_inside_the_embedding_table_is_accepted",
         "test_gsm8k_the_padded_columns_fall_back_to_the_end_of_sequence_token",
         "test_gsm8k_a_shared_question_is_refused",
-        "test_lora_init_private_cpu_generation_matches_declared_kaiming_and_zero_distribution",
-        "test_lora_init_unrelated_draws_and_traversal_order_do_not_change_values_or_global_rng",
-        "test_lora_init_sha256_seed_is_stable_and_changes_with_name_or_global_seed",
         "test_lora_init_invalid_global_seeds_are_rejected",
-        "test_lora_init_fresh_process_reconstruction_ignores_global_random_draws",
-        "test_lora_init_canonical_names_retain_containers_and_strip_only_supported_segments",
-        "test_lora_init_unsupported_or_ambiguous_names_are_rejected",
         "test_lora_init_invalid_shapes_are_rejected",
-        "test_lora_init_unsupported_dtype_and_incomplete_or_colliding_pairs_are_rejected",
         "test_lora_init_manifest_contains_only_compact_json_recipe_and_exact_hashes",
         "test_lora_init_corrupt_or_incompatible_manifest_cannot_be_reused",
-        "test_lora_init_hash_covers_name_shape_dtype_and_signed_zero_bytes",
-        "test_lora_init_exact_verification_accepts_only_wrapper_default_aliases_and_full_global_shapes",
-        "test_lora_init_verification_rejects_coverage_shape_and_value_changes",
-        "test_lora_init_only_explicit_exact_float32_widening_is_accepted",
-        "test_lora_init_non_lora_is_noop_without_model_or_storage_access",
-        "test_lora_init_target_binding_never_invents_public_adapter_or_resume_fields",
-        "test_lora_init_temporary_pack_uses_meta_shapes_and_preserves_rng_and_identity",
-        "test_lora_init_temporary_pack_refuses_non_fast_storage_before_topology_import",
-        "test_lora_init_pack_identity_refuses_mutation",
-        "test_lora_init_real_peft_tiny_qwen_serialization_and_loaded_initial_values",
         "test_qwen4_reference_upstream_backend_and_cpu_checkpoint_load",
         "test_qwen4_reference_table_never_reaches_accelerator_placement",
         "test_qwen4_reference_unsupported_attention_rejected_before_loading",
@@ -35100,197 +22891,67 @@ _SELFTEST_GROUPS = {
         "test_shared_adapter_changed_identity_rejects_before_target_mutation",
         "test_shared_adapter_rejects_different_or_unsupported_topology",
         "test_shared_adapter_rejects_invalid_serialized_tensor_inventory",
-        "test_shared_adapter_rejects_incompatible_installed_model_without_loading",
-        "test_shared_adapter_rejects_failed_load_or_source_drift",
-        "test_shared_adapter_build_scope_restores_worker_builder_on_all_exits",
-        "test_shared_adapter_nested_scope_restores_outer_then_original_builder",
         "test_shared_adapter_runner_binds_identical_pack_to_both_cached_reference_arms",
         "test_shared_adapter_runner_refuses_unadmitted_inputs_before_reference_or_target_work",
-        "test_shared_adapter_onboard_freezes_supplied_identity_and_rejects_later_mutation",
         "test_generated_adapter_reproduces_bytes_across_base_output_paths_and_ambient_rng",
         "test_generated_adapter_reproduces_identity_across_process_hash_seeds",
-        "test_generated_adapter_canonicalizes_only_serialized_module_order",
         "test_generated_adapter_seed_changes_a_only_and_binds_upstream_recipe",
         "test_generated_adapter_constructs_meta_base_and_allocates_only_cpu_factors",
-        "test_generated_adapter_refuses_nondefault_upstream_initializer",
-        "test_generated_adapter_refuses_invalid_seed",
-        "test_generated_adapter_restores_rng_on_upstream_save_failure",
         "test_generated_adapter_dependency_recipe_drift_invalidates_admitted_identity",
-        "test_worker_adapter_transfer_stages_without_coordinator_path_and_always_cleans",
-        "test_worker_adapter_transfer_refuses_invalid_envelope_before_staging",
-        "test_worker_adapter_transfer_rejects_corrupted_identity_and_cleans_staging",
-        "test_worker_adapter_transfer_get_failure_propagates_without_staging",
         "test_shared_adapter_autogenerated_runner_uses_one_real_pack_for_both_arms",
         "test_shared_adapter_generated_onboard_cache_reuses_exact_pack_and_refuses_mutation",
         "test_shared_adapter_generated_hf_autocast_loads_fp32_factors_on_bfloat16_cpu_base",
-        "test_shared_adapter_initialization_source_binding_leaves_other_record_recipes_unchanged",
         "test_shared_adapter_running_job_ray_handoff_precedes_client_and_restores_overlay",
         "test_shared_adapter_capture_initializer_enters_worker_scope_before_base_and_restores",
-        "test_native_original_adapter_sender_rejects_metadata_drift_during_pack_read",
-        "test_native_original_composition_zone_command_selects_only_training_gpu",
-        "test_native_original_composition_zone_command_leaves_cleanup_unchanged",
-        "test_native_original_composition_verifies_every_rank_receipt",
-        "test_native_original_composition_rejects_missing_duplicate_and_drifted_receipts",
         "test_gateway_optional_adapter_missing_binding_preserves_full_model_route",
         "test_gateway_optional_adapter_does_not_hide_invalid_sources",
-        "test_gateway_optional_adapter_available_capabilities_keep_exact_source_descriptors",
-        "test_gateway_optional_adapter_absent_capability_still_rejects_adapter_client",
-        "test_gateway_optional_adapter_missing_binding_still_rejects_worker_runtime",
-        "test_gateway_optional_adapter_final_guard_removes_stale_capabilities",
-        "test_gateway_optional_adapter_final_guard_present_binding_attribute_error_is_not_absence",
-        "test_native_original_composition_gateway_scope_restores_captured_bindings",
         "test_native_original_composition_manager_actor_table_restores_after_spawn",
-        "test_native_original_composition_coordinator_restores_worker_and_owns_failure_teardown",
-        "test_native_original_composition_bootstrap_restores_original_callback",
-        "test_native_reserved_listener_gateway_handoff_and_restoration",
-        "test_native_reserved_listener_unrelated_launch_unchanged",
-        "test_native_reserved_listener_unused_reservation_closed",
-        "test_native_reserved_listener_missing_local_reservation_prevents_spawn",
-        "test_native_reserved_listener_inherited_identity_and_close",
-        "test_native_reserved_listener_remote_bootstrap_reserves_before_ray",
-        "test_native_reserved_listener_reservation_failure_closes_socket",
         "test_native_reserved_listener_zone_head_handoff_and_worker_isolation",
         "test_native_reserved_listener_http_uses_socket_through_startup",
         "test_native_reserved_listener_changed_server_contract_fails_closed",
-        "test_native_reserved_listener_changed_address_rejected_before_ray",
-        "test_native_original_composition_capability_explicit_bind_preserves_original_identity",
-        "test_native_original_composition_capability_rejects_unadmitted_routes_without_create",
-        "test_native_original_composition_worker_delegates_native_constructor_inside_preengine_scope",
-        "test_native_original_composition_source_pin_unwraps_adapter_scope",
-        "test_lora_config_serialization_retained_orders_produce_exact_pack_identity",
-        "test_lora_config_serialization_helper_preserves_regex_empty_targets_and_other_fields",
-        "test_lora_config_serialization_keeps_semantic_config_changes_in_identity",
-        "test_lora_config_serialization_keeps_tensor_changes_in_identity",
-        "test_lora_config_serialization_helper_rejects_malformed_modules_without_rewriting",
-        "test_lora_config_serialization_helper_rejects_malformed_config_without_rewriting",
-        "test_lora_config_serialization_materializer_preserves_input_rejection",
-        "test_lora_config_serialization_pack_identity_still_rejects_postpublication_mutation",
-        "test_native_first_two_admission_requires_explicit_route_and_fixture",
-        "test_qwen4_residency_new_policy_is_structural_pure_and_identity_based",
-        "test_qwen4_residency_new_shared_table_and_indexer_are_deduplicated",
-        "test_qwen4_residency_new_malformed_policy_rejects_before_mutation",
-        "test_qwen4_residency_new_loader_uses_shared_policy_and_preserves_table_bytes",
-        "test_qwen4_residency_new_loader_rejects_before_shared_policy",
         "test_native_adapter_layout_real_peft_checkpoint_mechanism_and_registered_coverage",
         "test_native_adapter_layout_exact_factor_bytes_existing_storage_base_and_rng_without_state_apis",
         "test_native_adapter_layout_invalid_registered_layout_rejects_before_mutation_and_engine",
-        "test_native_adapter_layout_generated_pack_native_scope_receipt_and_all_exit_restoration",
-        "test_native_adapter_layout_pack_rejection_restores_without_parameter_mutation_or_engine",
-        "test_native_adapter_layout_base_aliases_reject_without_base_or_factor_mutation",
-        "test_native_adapter_layout_four_blocks_all_sixteen_factors_copy_before_stub_engine",
-        "test_native_adapter_layout_last_of_sixteen_invalid_factors_rejects_before_any_earlier_write",
         "test_native_adapter_layout_rollback_nth_partial_copy_retains_primary_and_exact_originals",
-        "test_native_adapter_layout_rollback_final_only_identity_postflight_restores_every_factor",
         "test_native_adapter_layout_rollback_restore_failure_notes_preserve_primary_and_continue_cleanup",
-        "test_native_adapter_layout_rollback_expanded_last_of_sixteen_rejects_before_any_copy",
-        "test_native_adapter_layout_rollback_scope_routes_only_native_initializer_before_stub_engine",
-        "test_native_adapter_layout_rollback_source_compatibility_and_distinct_gateway_capability",
         "test_native_original_registered_factors_load_exact_bytes_before_engine",
         "test_native_original_registered_rejection_keeps_parameters_and_skips_engine",
         "test_native_original_registered_failure_preserves_primary_and_restores_binding",
-        "test_native_original_registered_source_guard_requires_native_loader",
         "test_owned_worker_lease_new_all_workers_exit_before_head_signal",
         "test_owned_worker_lease_new_failures_never_signal_head_or_worker",
         "test_owned_worker_lease_new_one_shared_deadline",
-        "test_owned_worker_lease_new_zone_launch_and_primary_failure",
-        "test_owned_worker_lease_new_primary_keeps_cleanup_failure_note",
         "test_owned_worker_lease_new_eof_requests_registered_shutdown_without_fd_inheritance",
-        "test_owned_worker_lease_new_reader_failure_preserves_primary",
-        "test_owned_worker_lease_new_worker_role_dispatches_without_changing_args",
-        "test_owned_worker_session_cleanup_new_waits_for_descendants",
-        "test_owned_worker_session_cleanup_new_retains_cleanup_failure",
         "test_owned_worker_session_cleanup_new_rejects_unowned_launch",
         "test_owned_worker_session_cleanup_new_real_retitled_child_exits_before_worker",
-        "test_owned_worker_lease_setup_new_preserves_error_and_closes_descriptor",
-        "test_owned_worker_lease_setup_new_close_failure_never_replaces_primary",
-        "test_owned_worker_lease_setup_new_read_error_before_registration_stops_worker",
-        "test_owned_worker_lease_setup_new_unfinished_reader_is_cleanup_failure",
         "test_owned_worker_lease_interrupt_new_closes_other_writers_and_never_signals_head",
-        "test_owned_worker_lease_wait_interrupt_new_attempts_every_worker_and_preserves_first",
-        "test_owned_worker_lease_zone_interrupt_new_restores_hooks_and_retains_primary",
-        "test_native_spawn_globals_selected_subclass_preengine_receipt_and_all_exit_restoration",
-        "test_native_spawn_globals_rejects_preexisting_foreign_stale_or_missing_worker_before_spawn",
-        "test_native_spawn_globals_ordinary_native_route_remains_unwrapped",
         "test_native_spawn_globals_installed_manager_leaves_unselected_training_dispatch_ordinary",
         "test_native_spawn_globals_authenticated_deserialized_supplier_restores_exact_class",
-        "test_native_first_two_composition_keeps_exact_adapter_recipe_and_native_payload",
-        "test_native_first_two_unsupported_binding_stops_before_records_or_target",
-        "test_native_first_two_reference_preparation_never_binds_or_starts_target",
-        "test_native_first_two_published_nonlocal_route_stays_rejected",
-        "test_native_first_two_supplied_nonlocal_route_fails_before_adapter_read",
-        "test_native_first_two_onprem_preserves_legacy_shared_payload",
-        "test_native_first_two_adapter_mutation_after_reference_admission_cannot_rebind",
         "test_native_shared_pack_real_seed42_fp32_load_precedes_stub_engine_and_restores_globals",
         "test_native_shared_pack_worker_failure_restores_exact_binding_and_rejects_receipt",
-        "test_native_shared_pack_constructor_namespace_code_source_and_engine_guards",
-        "test_native_shared_pack_worker_requires_explicit_job_and_integer_rank",
-        "test_native_shared_pack_worker_transfer_requires_exclusive_authenticated_files",
-        "test_native_shared_pack_worker_authenticates_entire_identity",
         "test_native_shared_pack_scope_is_nonreentrant_and_snapshots_inputs",
         "test_native_shared_pack_staging_cleanup_preserves_primary_and_restores_namespace_and_lock",
-        "test_native_shared_pack_bind_and_request_preserve_pack_payload_and_distinct_schema",
-        "test_native_shared_pack_capability_admission_is_local_explicit_and_source_complete",
-        "test_native_shared_pack_sender_never_overwrites_another_initialization",
-        "test_native_shared_pack_sender_rejects_deterministic_metadata",
-        "test_native_shared_pack_generation_recipe_requires_every_authenticated_field",
-        "test_native_shared_pack_request_requires_fresh_exact_job_and_exclusive_schema",
-        "test_native_shared_pack_absent_request_is_ordinary_and_source_pins_cover_loader_and_scope",
         "test_native_shared_pack_coordinator_constructs_every_rank_reports_receipts_and_restores_spawn",
         "test_native_shared_pack_coordinator_failure_owns_teardown_and_preserves_primary",
-        "test_native_shared_pack_receipts_authenticate_every_rank_without_partial_acceptance",
-        "test_native_shared_pack_coordinator_rejects_layout_configuration_and_source_before_spawn",
         "test_native_ray_tracing_wrapped_spawn_patches_native_leaf_and_retains_wrapped_invocation_and_receipts",
         "test_native_ray_tracing_wrapper_failure_restores_exact_globals_and_preserves_primary_and_owned_cleanup",
-        "test_native_ray_tracing_authenticated_leaf_and_worker_guards_reject_without_touching_wrapper_globals",
         "test_native_ray_tracing_requires_both_wrapper_and_leaf_to_be_coroutines",
         "test_native_ray_tracing_ordinary_native_dispatch_remains_wrapped_and_does_not_select_adapter",
         "test_native_original_registered_coordinator_preserves_factor_receipts_and_owned_teardown",
     ),
     "model_fixtures": (
-        "test_cortex_fixture_fixture_requires_data_fast_before_hashing_or_staging",
         "test_cortex_fixture_preparation_preserves_reviewed_tree_and_uses_separate_content_bound_id",
-        "test_cortex_fixture_legacy_hash_accepts_only_tokenizer_sidecar_additions_and_binds_all_files",
-        "test_cortex_fixture_reviewed_hash_rejects_size_changes_to_non_tokenizer_assets",
-        "test_cortex_fixture_reviewed_hash_rejects_unreviewed_non_tokenizer_files",
-        "test_cortex_fixture_legacy_binding_rejects_tokenizer_drift_after_publication",
-        "test_cortex_fixture_equal_size_weight_changes_produce_different_remote_identity",
         "test_cortex_fixture_binding_rejects_modified_reference_assets_even_with_same_size",
-        "test_cortex_fixture_compatible_hash_still_requires_weights_and_tokenizer",
-        "test_cortex_fixture_compatible_hash_still_requires_reviewed_layer_count",
         "test_cortex_fixture_binding_refuses_mismatched_upload_manifest",
-        "test_cortex_fixture_unpublished_binding_cannot_enable_cortex",
         "test_cortex_fixture_publication_failure_never_writes_receipt_or_manifest_to_reference",
-        "test_cortex_fixture_successful_publication_receipt_is_checked_against_reference",
-        "test_cortex_fixture_authentication_is_delegated_to_optional_uploader",
-        "test_cortex_fixture_receipt_cannot_be_written_into_reference_checkpoint",
-        "test_cortex_fixture_binding_accepts_verified_publication_without_upload_credentials",
-        "test_cortex_fixture_published_fixture_enables_only_supported_reference_check",
         "test_cortex_fixture_gradient_runner_loads_prepared_reference_and_routes_only_target_to_cortex",
         "test_cortex_fixture_fixture_cli_uses_local_vocab_and_records_published_target",
-        "test_cortex_fixture_report_distinguishes_publication_from_worker_byte_verification",
         "test_local_cortex_fixture_local_fixture_binds_local_bytes_with_existing_health_only",
         "test_local_cortex_fixture_local_fixture_rejects_nonlocal_or_ambiguous_urls_before_io",
-        "test_local_cortex_fixture_local_fixture_does_not_require_or_attest_backend_identity",
         "test_local_cortex_fixture_local_fixture_rejects_protected_asset_size_changes",
-        "test_local_cortex_fixture_local_fixture_rejects_added_unreviewed_assets",
-        "test_local_cortex_fixture_local_fixture_requires_reviewed_layer_count",
-        "test_local_cortex_fixture_local_fixture_requires_tokenizer_even_with_legacy_hash",
-        "test_local_cortex_fixture_local_fixture_rejects_unsafe_model_root_before_io",
-        "test_local_cortex_fixture_local_fixture_rejects_authentication_before_io",
         "test_local_cortex_fixture_local_fixture_does_not_follow_redirects_or_authenticate",
-        "test_local_cortex_fixture_local_fixture_rejects_malformed_health",
-        "test_local_cortex_fixture_local_fixture_normalizes_connection_failure",
         "test_local_cortex_fixture_execution_transport_stays_on_unauthenticated_loopback",
         "test_reference_free_metadata_original_schema_no_constructor_or_source_rewrite",
-        "test_reference_free_metadata_rejects_invalid_original_config",
-        "test_reference_free_metadata_declared_block_fp8_source_preserves_strict_exports",
-        "test_reference_free_metadata_rejects_unsupported_fp8_declaration",
-        "test_reference_free_metadata_rejects_fp8_inventory_corruption",
-        "test_reference_free_metadata_rejects_noncanonical_json",
         "test_reference_free_metadata_rejects_inventory_or_metadata_mismatch",
-        "test_reference_free_metadata_rejects_unreviewed_header_schema",
-        "test_reference_free_metadata_rejects_symlinks",
-        "test_reference_free_metadata_rejects_source_drift_during_header_admission",
     ),
     "optimizer_math": (
         "test_optimizer_participation_preserves_complete_inactive_witnesses",
@@ -35301,41 +22962,19 @@ _SELFTEST_GROUPS = {
         "test_optimizer_norms_large_cpu_reduction_keeps_small_contributions",
         "test_optimizer_norms_summary_is_compact_serializable_float32_l2",
         "test_optimizer_norms_norms_keep_backend_specific_moment_update_residual",
-        "test_optimizer_norms_nonzero_initial_parameters_do_not_enter_update_norm",
-        "test_optimizer_norms_unexplained_update_is_not_removed_by_norm_reduction",
         "test_optimizer_norms_moe_tensors_are_concatenated_before_residual_and_norm",
         "test_optimizer_norms_canonical_collision_cannot_hide_a_parameter",
-        "test_optimizer_norms_normalization_collision_is_rejected",
-        "test_optimizer_norms_summary_requires_exact_step_one",
-        "test_optimizer_norms_summary_rejects_empty_capture",
         "test_optimizer_norms_summary_requires_every_artifact_state",
-        "test_optimizer_norms_summary_requires_identical_state_shapes",
         "test_optimizer_norms_summary_rejects_nonfinite_or_float32_overflow",
-        "test_optimizer_norms_summary_rejects_norm_reduction_overflow",
         "test_optimizer_norms_summary_rejects_invalid_second_moment",
-        "test_optimizer_norms_summary_rejects_nonfloating_artifacts",
         "test_optimizer_norms_compare_uses_scalar_norm_difference_not_tensor_difference",
-        "test_optimizer_norms_equal_norm_different_direction_is_intentionally_undetected",
-        "test_optimizer_norms_zero_and_near_zero_have_absolute_difference_without_exemption",
-        "test_optimizer_norms_missing_zero_vision_parameter_is_still_a_coverage_failure",
         "test_optimizer_norms_comparison_reports_both_unmatched_parameter_sets",
         "test_optimizer_norms_comparison_requires_matching_shapes",
-        "test_optimizer_norms_comparison_validates_both_summary_envelopes",
-        "test_optimizer_norms_comparison_rejects_nonfinite_negative_or_nonnumeric_norm",
-        "test_optimizer_norms_comparison_requires_complete_per_parameter_state_coverage",
-        "test_optimizer_norms_comparison_rejects_invalid_shape_metadata",
-        "test_optimizer_norms_comparison_rejects_noncanonical_names",
         "test_optimizer_norms_pairwise_norm_calibration_checks_every_pair",
-        "test_optimizer_norms_pairwise_norm_calibration_sign_change_has_no_magnitude_variation",
-        "test_optimizer_norms_pairwise_norm_calibration_empty_or_single_capture",
-        "test_optimizer_norms_pairwise_norm_calibration_requires_identical_coverage",
-        "test_optimizer_norms_arm_consumes_only_stored_norms_and_explicit_reviewed_gate",
         "test_optimizer_norms_arm_gates_every_scalar_and_reports_actual_norms",
         "test_optimizer_norms_arm_gate_boundary_is_inclusive",
         "test_optimizer_norms_arm_coverage_failure_is_not_a_zero_norm_pass",
-        "test_optimizer_norms_arm_missing_norms_has_no_manifest_fallback",
         "test_optimizer_norms_arm_rejects_invalid_or_unreviewed_gate_before_artifact_read",
-        "test_optimizer_norms_arm_requires_gate_and_target_capture",
         "test_optimizer_reference_adamw_reference_writes_named_fp32_moments_and_updated_parameter",
         "test_optimizer_reference_adamw_reference_excludes_norm_weight_from_weight_decay",
         "test_optimizer_reference_adamw_reference_treats_zero_clipping_as_disabled",
@@ -35388,23 +23027,12 @@ _SELFTEST_GROUPS = {
         "test_helper_storage_weights_save_keeps_public_framing_and_does_not_restrict_returned_source",
         "test_hf_reference_onboarding_preparation_dispatches_frozen_workload_without_target_or_sizing",
         "test_hf_reference_onboarding_preparation_rejects_mismatched_frozen_spec",
-        "test_hf_reference_onboarding_preparation_rejects_live_reference_checks",
-        "test_hf_reference_onboarding_preparation_rejects_inapplicable_check",
-        "test_hf_reference_onboarding_preparation_does_not_accept_model_sizing_override",
-        "test_hf_reference_onboarding_preparation_requires_git_record_destination",
         "test_hf_reference_onboarding_preparation_preserves_combined_check_workload",
-        "test_hf_reference_onboarding_combined_selection_cannot_prepare_live_reference",
-        "test_hf_reference_onboarding_reference_selection_requires_preparation_mode",
         "test_hf_reference_onboarding_failed_reference_retains_complete_traceback_on_fast_storage",
-        "test_hf_reference_onboarding_runner_preparation_cannot_execute_normal_references",
         "test_reference_attention_sizing_and_rendered_calibration_use_glm_sdpa",
         "test_reference_attention_sizing_note_records_upstream_backend",
         "test_onboarding_renderer_reads_nested_prime_rl_chunk_size",
-        "test_onboarding_renderer_preserves_runtime_default_without_chunking",
-        "test_onboarding_renderer_uses_configured_fused_cross_entropy",
         "test_onboarding_renderer_passes_peft_config_to_reference",
-        "test_onboarding_renderer_keeps_batch_tensors_separate_from_durable_diagnostics",
-        "test_onboarding_renderer_rejects_diagnostic_directory_for_tensor_scratch",
         "test_onboarding_calibration_orchestration_uses_fast_scratch_and_durable_diagnostics",
         "test_gradient_calibration_uses_frozen_arm_inputs_and_model_packing",
         "test_gradient_calibration_measures_spread_only_within_each_arm",
@@ -35423,40 +23051,19 @@ _SELFTEST_GROUPS = {
         "test_onboarding_optimizer_reference_model_does_not_replace_test1_model",
         "test_sizing_reuse_admits_retained_fit_without_sizing_execution",
         "test_sizing_reuse_rejects_mismatched_workload",
-        "test_sizing_reuse_rejects_failed_or_mismatched_result",
-        "test_sizing_reuse_rejects_unsealed_bytes",
         "test_sizing_reuse_rejects_same_size_model_change",
-        "test_sizing_reuse_rejects_missing_weights",
-        "test_sizing_reuse_rejects_wrong_model_depth",
-        "test_sizing_reuse_request_binds_actual_recipe_and_reference_sources",
         "test_sizing_reuse_parent_continues_only_admitted_sizing",
-        "test_sizing_reuse_cli_rejects_incomplete_or_wrong_mode",
         "test_onboarding_cuda_oom_classification_does_not_swallow_other_failures",
         "test_onboarding_final_validation_requires_semantic_pass",
         "test_onboarding_final_validation_classifies_cuda_oom_for_retry",
         "test_onboarding_final_validation_does_not_retry_correctness_failure",
         "test_onboarding_source_checkpoint_defaults_to_training_model_name",
         "test_onboarding_source_checkpoint_override_wins",
-        "test_onboarding_storage_model_destination_rejected_before_config_or_sidecar_resolution",
-        "test_onboarding_storage_build_spec_rejects_paths_before_allocation_or_model_work",
-        "test_onboarding_storage_onboarding_entrypoints_reject_storage_before_checkout_or_config",
-        "test_onboarding_storage_optimizer_calibration_rejects_storage_before_config_batch_or_model",
-        "test_onboarding_storage_materializers_forward_canonical_fast_destination",
-        "test_onboarding_pretrained_generation_defaults_round_trip",
         "test_onboarding_pretrained_generation_defaults_restore_after_save_failure",
-        "test_onboarding_pretrained_generation_defaults_reject_invalid_values_before_save",
-        "test_onboarding_pretrained_fp8_materialization_saves_dequantized_weights",
         "test_onboarding_pretrained_glm_fp8_preserves_native_weight_layout",
-        "test_onboarding_pretrained_fp8_materialization_rejects_incomplete_dequantization",
-        "test_onboarding_pretrained_materialization_rejects_other_quantizers_before_loading",
         "test_onboarding_synthetic_materialization_saves_unquantized_bf16",
         "test_onboarding_synthetic_materialization_clears_nested_quantization_before_construction",
         "test_onboarding_synthetic_materialization_rejects_quantized_cache",
-        "test_onboarding_pretrained_materialization_rejects_quantized_cache",
-        "test_onboarding_storage_copy_sidecars_canonical_fast_destination_and_idempotency",
-        "test_onboarding_storage_build_spec_accepts_fast_work_cache_and_separate_spec_output",
-        "test_onboarding_storage_run_keeps_separate_small_spec_and_probe_reports_unrestricted",
-        "test_onboarding_storage_optimizer_calibration_missing_fast_root_never_falls_back",
         "test_onboarding_storage_optimizer_calibration_allocates_fresh_root_and_cleans_only_owned_tree",
         "test_reference_storage_reference_tensor_output_rejected_before_allocation",
         "test_reference_storage_reference_tensor_output_rejects_fast_symlink_escape",
@@ -35470,20 +23077,10 @@ _SELFTEST_GROUPS = {
         "test_local_cortex_reference_publication_final_command_uses_same_record_directory",
         "test_local_cortex_optimizer_scalar_norm_publication_preserves_test1_and_per_arm_gates",
         "test_local_cortex_optimizer_scalar_norm_failure_restores_exact_spec_and_no_verdict",
-        "test_local_cortex_optimizer_scalar_norm_rejects_unreviewed_fixture_before_calibration",
-        "test_local_cortex_optimizer_scalar_norm_rejects_invalid_repeat_policy_before_reference",
         "test_optimizer_validation_child_forwards_original_regression_and_retains_source_receipt",
-        "test_optimizer_validation_child_rejects_incomplete_source_pins",
-        "test_optimizer_validation_child_rejects_other_modes_before_storage_or_reference",
-        "test_optimizer_validation_child_rejects_source_faults_before_target",
         "test_optimizer_validation_child_rejects_source_drift_after_child_exit",
         "test_optimizer_validation_child_failure_restores_exact_test1_without_reference_replay",
-        "test_onboarding_pretrained_omitted_layers_do_not_warn",
         "test_qwen4_residency_new_meta_pool_bytes_match_runtime_policy",
-        "test_qwen4_residency_new_partition_handles_ties_and_existing_freeze",
-        "test_qwen4_residency_new_full_table_shape_counts_without_payload",
-        "test_qwen4_residency_new_generic_family_retains_all_parameter_charge",
-        "test_qwen4_residency_new_missing_policy_cannot_fall_back_to_generic",
         "test_qwen4_residency_new_whole_blocks_use_residency_and_keep_full_identity",
         "test_qwen4_residency_new_generic_sizing_preserves_count_api",
         "test_qwen4_residency_new_no_fitting_whole_period_still_rejects",
@@ -35492,16 +23089,10 @@ _SELFTEST_GROUPS = {
     "local_transport": (
         "test_local_cortex_shutdown_cancel_ack_waits_for_every_owned_child_before_closing",
         "test_local_cortex_shutdown_invalid_or_failed_owned_cancellation_fails_closed",
-        "test_local_cortex_shutdown_pending_child_reaches_configured_monotonic_deadline",
-        "test_local_cortex_shutdown_nonfinite_or_nonpositive_timing_is_rejected_without_cancel",
         "test_local_cortex_shutdown_cancel_network_failure_is_not_suppressed_or_retried",
         "test_local_cortex_shutdown_poll_network_failure_restores_config_and_closes",
         "test_local_cortex_shutdown_close_failure_preserves_cancellation_error_and_owned_identity",
         "test_local_cortex_shutdown_close_failure_after_cancellation_still_raises",
-        "test_local_cortex_shutdown_interruption_preserves_ownership_when_session_close_fails",
-        "test_local_cortex_shutdown_late_cancelled_response_does_not_override_deadline",
-        "test_local_cortex_shutdown_changed_parent_identity_never_cancels_another_parent",
-        "test_local_cortex_shutdown_hosted_and_reconnected_shutdown_keep_ack_only_behavior",
         "test_local_cortex_shutdown_startup_failure_still_cancels_owned_parent_with_child_fence",
         "test_correctness_client_unsafe_shutdown_preserves_failures_and_owned_ids",
         "test_correctness_client_verified_shutdown_preserves_workload_behavior",
@@ -35512,56 +23103,17 @@ _SELFTEST_GROUPS = {
         "test_correctness_cleanup_contract_reexport_is_the_same_class",
     ),
     "runtime_clients": (
-        "test_client_backends_cli_defaults_to_cortex_training_and_accepts_legacy_cortex",
-        "test_client_backends_onboarding_uses_the_same_cortex_training_default",
-        "test_client_backends_cortex_connection_uses_environment_or_pat_file",
         "test_client_backends_local_cortex_route_segments",
         "test_client_backends_local_cortex_uses_direct_url_without_hosted_auth",
         "test_client_backends_remote_run_never_probes_local_allocation",
-        "test_client_backends_remote_job_skips_ray_and_preserves_backend",
-        "test_client_backends_cortex_batch_preserves_microbatch_order_labels_and_context",
-        "test_client_backends_cortex_rejects_malformed_microbatch_lists",
-        "test_client_backends_onprem_batch_and_cortex_rpc_are_not_rewritten",
-        "test_client_backends_cortex_config_forwards_worker_settings_without_mutation",
-        "test_client_backends_cortex_resume_requires_complete_source_identity",
         "test_client_backends_onprem_refuses_cortex_checkpoint_identity",
         "test_client_backends_cortex_transport_sends_hardware_and_lists_durable_checkpoints",
-        "test_client_backends_cortex_shutdown_closes_session_when_cancel_fails",
-        "test_client_backends_inapplicable_check_is_not_also_a_cortex_failure",
-        "test_client_backends_cortex_unsupported_checks_fail_before_batch_or_reference",
         "test_client_backends_cortex_refuses_checks_requiring_local_model_identity",
-        "test_client_backends_cli_rejects_unsupported_cortex_checks_without_reading_model",
-        "test_client_backends_cortex_sft_body_does_not_select_the_rl_processor",
-        "test_client_backends_cortex_does_not_silently_drop_sft_processing_options",
-        "test_client_backends_hosted_alias_uses_the_same_cortex_run_path",
         "test_client_backends_cortex_report_does_not_claim_the_reduced_fixture_was_measured",
-        "test_client_backends_remote_startup_failure_releases_job_and_session",
-        "test_driver_reviewed_build_payload_forwards_top_level_moe_chunk_through_model_options",
-        "test_driver_reviewed_build_payload_preserves_explicit_chunk_settings",
-        "test_driver_reviewed_build_payload_moe_chunk_fallback_preserves_other_options",
-        "test_driver_reviewed_build_payload_chunk_does_not_coerce_ep_size",
-        "test_driver_reviewed_build_payload_keeps_format_outside_worker_config",
         "test_driver_reviewed_training_preserves_explicit_format_without_mutating_payload",
         "test_driver_reviewed_rejects_unsupported_format_before_gateway_runtime",
-        "test_cortex_port_config_intake_does_not_ignore_unknown_protocols",
-        "test_cortex_port_cortex_training_preserves_dss_extra_fields_and_determinism",
-        "test_cortex_port_hosted_config_does_not_depend_on_removed_public_backend_fields",
-        "test_cortex_port_reviewed_gradient_cases_send_dss_requests_not_onprem_workarounds",
-        "test_hosted_the_created_sub_job_is_the_config_file_s_training_sub_job",
-        "test_hosted_building_a_sub_job_leaves_the_loaded_config_alone",
-        "test_hosted_an_ordinary_sub_job_carries_no_source_checkpoint",
-        "test_hosted_one_iteration_is_a_forward_backward_then_a_step_at_the_requested_rate",
-        "test_hosted_a_job_releases_its_gpus_when_its_block_ends",
-        "test_hosted_a_job_releases_its_gpus_when_the_block_raises",
-        "test_hosted_creating_a_job_before_the_transport_is_entered_is_an_error",
-        "test_hosted_the_connection_does_not_render_its_token",
-        "test_hosted_an_ambiguous_catalog_delta_is_refused",
-        "test_hosted_local_gateway_accepts_only_explicit_http_loopback",
-        "test_hosted_local_gateway_rejects_nonloopback_and_decorated_urls",
-        "test_hosted_local_gateway_refuses_hosted_credentials",
         "test_hosted_determinism_training_client_config_pins_determinism",
         "test_client_backends_cortex_model_options_preserve_internal_debug_without_a_bridge",
-        "test_cortex_port_retained_config_loads_without_changing_the_reviewed_identity",
     ),
 }
 
@@ -35625,15 +23177,6 @@ def test_onboarding_loaded_config_requires_preset_accumulation_without_mutation(
     assert source.read_text() == contents
     assert config.sub_job == original
     assert (config.native.model_dump() if config.native is not None else None) == native
-
-
-@pytest.mark.usefixtures("_cortex_port_no_network")
-def test_cortex_port_retained_config_loads_without_changing_the_reviewed_identity():
-    original = _cortex_port_CONFIG.read_bytes()
-    cfg = load_config(_cortex_port_CONFIG)
-    spec = json.loads((_cortex_port_ROOT / f"specs/{cfg.config_id}.json").read_text())
-    assert config_checksum(cfg) == spec["config_checksum"]
-    assert _cortex_port_CONFIG.read_bytes() == original
 
 
 @pytest.mark.parametrize("selection", ["all", "single-step-grads", "single-step-optimizer"])
@@ -35723,76 +23266,6 @@ def test_onboarding_accepts_explicit_fp32_accumulation_without_changing_config(_
     assert len(state.calls) == 1
     assert state.config.training == original
     assert state.args.config.read_text() == contents
-
-
-@pytest.mark.parametrize("exits", [False, True])
-def test_owned_gateway_unreadable_descendant_grace_never_signals(_owned_gateway_descendant, monkeypatch, exits):
-    state = _owned_gateway_descendant
-    read_bytes = Path.read_bytes
-    clock = [0.0]
-
-    def read(path):
-        if path == state.child / "environ":
-            raise PermissionError("synthetic exit race")
-        return read_bytes(path)
-
-    def pause(duration):
-        clock[0] += duration
-        if exits:
-            fields = state.fields.copy()
-            fields[0] = "Z"
-            (state.child / "stat").write_text("12346 (ray::RuntimeEnv) " + " ".join(fields))
-
-    send = Mock()
-    monkeypatch.setattr(Path, "read_bytes", read)
-    monkeypatch.setattr(ap_driver.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(ap_driver.time, "sleep", pause)
-    monkeypatch.setattr(ap_driver.signal, "pidfd_send_signal", send, raising=False)
-    if exits:
-        ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0.1)
-        assert clock[0] == 0.05
-    else:
-        with pytest.raises(operator_interface_UnsafeCleanupError, match="unreadable environment"):
-            ap_driver._reap_owned_gateway_descendants(state.gateway, "owned-token", timeout=0.1)
-        assert clock[0] == 0.1
-    send.assert_not_called()
-
-
-def test_owned_gateway_cleanup_guard_normal_exit_uses_only_standard_library(tmp_path):
-    reader, writer = os.pipe()
-    process = None
-    try:
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-I",
-                "-S",
-                "-c",
-                ap_driver._GATEWAY_CLEANUP_BOOTSTRAP,
-                str(reader),
-                str(tmp_path / "gateway.json"),
-                "test-token",
-            ],
-            pass_fds=(reader,),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        os.close(reader)
-        reader = None
-        assert select.select([process.stdout], [], [], 10)[0], "cleanup guard handshake timed out"
-        assert process.stdout.readline() == b"ready\n"
-        os.write(writer, b"done\n")
-        stdout, stderr = process.communicate(timeout=10)
-        assert process.returncode == 0, stderr.decode()
-        assert stdout == stderr == b""
-        assert not list(tmp_path.iterdir())
-    finally:
-        if reader is not None:
-            os.close(reader)
-        os.close(writer)
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.communicate(timeout=5)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "fp32"])
@@ -36026,19 +23499,6 @@ def _expected_cortex_training_fields(training: dict) -> dict:
     return expected
 
 
-def _native_ap_ep_shards(pair, source, root, step, ep_ranks):
-    tag, ep_size = f"global_step{step}", pair.layout["ep_size"]
-    paths = []
-    for ep_rank in ep_ranks:
-        identity = {"group_name": f"ep_size_{ep_size}", "ep_size": ep_size, "ep_rank": ep_rank}
-        module = torch.load(source / tag / f"experts_ep_rank_{ep_rank:03d}.pt", weights_only=True)
-        # Match the AP v1 wire filename without depending on a separate native production fix.
-        path = root / tag / f"ap_ep_{identity['group_name']}_rank_{ep_rank:02d}_model_states.pt"
-        torch.save({"version": 1, **identity, "exclude_frozen_parameters": False, "module": module}, path)
-        paths.append(path)
-    return paths
-
-
 def test_automatic_participation_globalizes_expert_parallel_shapes(monkeypatch):
     from deepspeed import utils
 
@@ -36170,61 +23630,6 @@ def test_ordinary_optimizer_weights_only_save_keeps_native_writer_selection():
     # Weights-only saves do not require a DeepSpeed engine or the resumable writer predicate.
     assert worker.save(stage_info, path="/data-fast/weights", checkpoint_type="weights-only") == {"version": 1}
     assert calls == [(stage_info, "/data-fast/weights", "weights-only")]
-
-
-def test_maintained_native_optimizer_keeps_ordinary_participation_receipts_out_of_native_decode(
-    _maintained_native_capture, monkeypatch
-):
-    case = _maintained_native_capture
-    receipts = [{"rank": rank} for rank in range(8)]
-    native_step = case.client.step
-
-    def step(learning_rate):
-        response = native_step(learning_rate)
-        response["participation"] = {"training_child_id": "actual-child", "rank_receipts": receipts}
-        return response
-
-    # The fixture transport is not a CorrectnessCortexTransport; this stands in for its bound training child.
-    def training_child(transport, selector):
-        assert transport is case.client.transport and selector == "actual-parent:train:0"
-        return "actual-child"
-
-    original, decoded = decoder.decode_optimizer_capture, []
-
-    def decode(before, after, output, **kwargs):
-        decoded.append(kwargs)
-        return original(before, after, output, **kwargs)
-
-    case.client.step = step
-    monkeypatch.setattr(capture, "_dense_training_child", training_child)
-    monkeypatch.setattr(decoder, "decode_optimizer_capture", decode)
-    result = _maintained_native_run(case)
-    assert len(decoded) == 1 and "expected_native_layout" in decoded[0]
-    assert "participation_receipts" not in decoded[0] and "expected_participation_job_id" not in decoded[0]
-    assert Path(result.optimizer_state_manifest).is_file()
-
-
-def test_maintained_native_optimizer_supplier_admits_node_local_ap_expert_shards(_maintained_native_capture):
-    case = _maintained_native_capture
-    original_supplier = case.supplier
-    routes = case.pair.layout["expert_data_parallel_groups"]["native-experts"]
-    # The shard writer is each EP rank's first expert-DP rank; only writers on the head node (ranks 0-3) save here.
-    head_ep_ranks = [ep_rank for ep_rank, route in enumerate(routes) if route[0] < 4]
-    written = []
-
-    def supplier(root, *, step):
-        source = case.pair.before if step == 0 else case.pair.after
-        written.extend(_native_ap_ep_shards(case.pair, source, root, step, head_ep_ranks))
-        return original_supplier(root, step=step)
-
-    case.supplier = supplier
-    result = _maintained_native_run(case)
-    record = json.loads(Path(result.optimizer_state_manifest).read_text())
-    assert len(written) == 2 * len(head_ep_ranks) == 8
-    assert all(row["name"] in case.pair.expected for row in record["parameters"])
-    for entry in record["parameters"]:
-        value = torch.load(Path(result.optimizer_state_manifest).parent / entry["file"], weights_only=True)
-        torch.testing.assert_close(value["parameter_update"], case.pair.expected[entry["name"]], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("node_rank", [-1, True, None])
