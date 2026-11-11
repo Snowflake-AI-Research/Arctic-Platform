@@ -165,6 +165,14 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "moe.shard_frozen_dense",
+        runs_in="trainer",
+        goal="memory",
+        why="Each recomputed layer's frozen replicated weights sharded over the ranks, all-gathered per call (LoRA).",
+        source="`loader_options.shard_frozen_dense`; `ARL_SHARD_FROZEN_DENSE` when unset",
+        registry=registry,
+    )
+    register_option(
         "moe.w4a8_experts",
         runs_in="trainer",
         goal="speed",
