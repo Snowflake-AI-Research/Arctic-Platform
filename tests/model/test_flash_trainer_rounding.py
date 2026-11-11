@@ -516,3 +516,26 @@ def test_weighted_experts_with_fp32_parameters_under_bf16_autocast():
         results.append((output, *(grad.float() for grad in grads)))
     for actual, expected in zip(*results, strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_qwen38_qsa_fp32_gate_matches_autograd_bit_for_bit(dtype):
+    """``gate_fp32`` keeps only its inputs for the backward; its output and gradients are autograd's on the fp32
+    expression it replaces."""
+    from arctic_platform.model.implementations.qwen38.qsa_flex import gate_fp32
+
+    torch.manual_seed(0)
+    attention = (torch.randn(3, 17, 40) * 3).to(dtype)
+    gate = (torch.randn(3, 17, 40) * 4).to(dtype)
+    upstream = torch.randn(3, 17, 40).to(dtype)
+
+    a1, g1 = attention.clone().requires_grad_(), gate.clone().requires_grad_()
+    reference = (a1.float() * torch.sigmoid(g1.float())).to(g1.dtype)
+    reference.backward(upstream)
+    a2, g2 = attention.clone().requires_grad_(), gate.clone().requires_grad_()
+    output = gate_fp32(a2, g2)
+    output.backward(upstream)
+
+    for actual, expected in ((output, reference), (a2.grad, a1.grad), (g2.grad, g1.grad)):
+        assert actual.dtype == expected.dtype == dtype
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
