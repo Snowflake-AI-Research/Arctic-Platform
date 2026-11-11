@@ -1,3 +1,4 @@
+import re
 import warnings
 from typing import Optional, Union
 
@@ -145,6 +146,17 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
         return hidden_states, cached_indices
 
 
+# vLLM's GLM-5 (DeepseekV2-style MoE) projections for the experts' w1 / w2 / w3.
+_VLLM_EXPERT_PROJECTIONS = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+_PRIME_SHARED_EXPERT = re.compile(r"\.mlp\.shared_expert\.(w[123])\.")
+
+
+def vllm_lora_name(name: str) -> str:
+    """A LoRA tensor's name in vLLM's GLM-5 module tree: the shared expert's w1 / w2 / w3 are
+    ``mlp.shared_experts.gate_proj`` / ``down_proj`` / ``up_proj`` (gate and up packed into ``gate_up_proj``)."""
+    return _PRIME_SHARED_EXPERT.sub(lambda m: f".mlp.shared_experts.{_VLLM_EXPERT_PROJECTIONS[m.group(1)]}.", name)
+
+
 @auto_docstring
 class GlmMoeDsaPreTrainedModel(PreTrainedModelPrimeRL):
     config: GlmMoeDsaConfig
@@ -160,6 +172,11 @@ class GlmMoeDsaPreTrainedModel(PreTrainedModelPrimeRL):
     _can_record_outputs = {
         "hidden_states": GlmMoeDsaDecoderLayer,
     }
+    # LoRA weight sync and the sampler's adapter pack (weight_export.py) name tensors after vLLM's modules; the pack
+    # carries the routed experts' LoRA one expert at a time (experts.{e}.gate_proj / down_proj / up_proj), which is
+    # how vLLM's GLM-5 maps it: PEFT's 3-D layout nests one wrapper per expert parameter and vLLM reads two.
+    vllm_lora_name = staticmethod(vllm_lora_name)
+    vllm_lora_expert_projections = dict(_VLLM_EXPERT_PROJECTIONS)
 
     def _init_weights(self, module):
         if isinstance(module, RotaryEmbedding):
