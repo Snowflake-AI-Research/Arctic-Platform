@@ -511,7 +511,12 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
     os.makedirs(adapter_dir, exist_ok=True)
     model.save_pretrained(adapter_dir, state_dict=state, safe_serialization=True, save_embedding_layers=False)
     # The sampler loads this pack into vLLM as is, so families whose served module names differ rename here.
-    rename = getattr(type(_family_model_for_export(model)), "vllm_lora_name", None) or (lambda name: name)
+    family = type(_family_model_for_export(model))
+    rename = getattr(family, "vllm_lora_name", None) or (lambda name: name)
+    # Families whose served MoE takes expert LoRA per expert ({parameter: served projection}) get their
+    # target_parameters LoRAs (PEFT's 3-D layout) written as {experts}.{e}.{projection}.lora_{A,B}.weight.
+    expert_projections = getattr(family, "vllm_lora_expert_projections", None) or {}
+    wrapped_parameters = _param_wrapper_parameter_names(model) if expert_projections else {}
     # PEFT must select against live wrapped names before we make the pack portable.
     for adapter_name in model.peft_config:
         output_dir = adapter_dir if adapter_name == "default" else os.path.join(adapter_dir, adapter_name)
@@ -521,13 +526,30 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
             saved_names = list(handle.keys())
             portable = {}
             renamed = False
+            per_expert = False
             for name in saved_names:
                 unwrapped = strip_activation_checkpoint_segments(name)
-                export_name = rename(unwrapped)
-                renamed = renamed or export_name != unwrapped
-                if export_name in portable:
-                    raise ValueError(f"PEFT checkpoint names collide after unwrapping: {export_name}")
-                portable[export_name] = handle.get_tensor(name)
+                module_name, _, leaf = unwrapped.rpartition(".lora_")
+                projection = expert_projections.get(wrapped_parameters.get(module_name))
+                if projection is None:
+                    exports = {rename(unwrapped): handle.get_tensor(name)}
+                else:
+                    kind = leaf.split(".", 1)[0]
+                    rank = _peft_adapter_rank(model, f"lora_{kind}.{adapter_name}.weight")
+                    stacked = _reshape_expert_lora_for_ep(handle.get_tensor(name), kind, rank, label=unwrapped)
+                    experts = module_name
+                    while experts.endswith(".base_layer"):
+                        experts = experts.removesuffix(".base_layer")
+                    exports = {
+                        rename(f"{experts}.{expert}.{projection}.lora_{kind}.weight"): stacked[expert].clone()
+                        for expert in range(stacked.shape[0])
+                    }
+                    per_expert = True
+                for export_name, tensor in exports.items():
+                    renamed = renamed or export_name != unwrapped
+                    if export_name in portable:
+                        raise ValueError(f"PEFT checkpoint names collide after unwrapping: {export_name}")
+                    portable[export_name] = tensor
         if len(portable) == 0:
             raise ValueError(f"PEFT saved an empty adapter: {adapter_name}")
         if list(portable) == saved_names:
@@ -537,16 +559,35 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
             save_file(portable, temporary_path, metadata=metadata)
             os.replace(temporary_path, weights_path)
         if renamed:
-            _rewrite_adapter_target_modules(output_dir, portable)
+            _rewrite_adapter_target_modules(output_dir, portable, drop_target_parameters=per_expert)
 
 
-def _rewrite_adapter_target_modules(output_dir: str, names: Iterable[str]) -> None:
+def _param_wrapper_parameter_names(model: nn.Module) -> dict[str, str]:
+    """``{module name without activation-checkpoint segments: parameter name}`` of every PEFT ``ParamWrapper``
+    (a ``target_parameters`` LoRA) in ``model``; nested wrappers of one module end in ``.base_layer``."""
+    try:
+        from peft.tuners.lora.layer import ParamWrapper
+    except ImportError:
+        return {}
+    return {
+        strip_activation_checkpoint_segments(name): module.parameter_name
+        for name, module in model.named_modules()
+        if isinstance(module, ParamWrapper)
+    }
+
+
+def _rewrite_adapter_target_modules(
+    output_dir: str, names: Iterable[str], *, drop_target_parameters: bool = False
+) -> None:
     config_path = os.path.join(output_dir, "adapter_config.json")
     with open(config_path) as f:
         config = json.load(f)
     config["target_modules"] = sorted(
         {name.split(".lora_", 1)[0].rsplit(".", 1)[-1] for name in names if ".lora_" in name}
     )
+    if drop_target_parameters:
+        # The expert LoRAs are per-expert modules now; the sampler reads target_parameters as the 3-D layout.
+        config.pop("target_parameters", None)
     with TemporaryDirectory(prefix=".adapter-", dir=output_dir) as temporary_dir:
         temporary_path = os.path.join(temporary_dir, "adapter_config.json")
         with open(temporary_path, "w") as f:
