@@ -22,6 +22,7 @@ from functools import lru_cache
 import torch
 import torch.distributed as dist
 from packaging.version import Version
+from torch.nn.attention.flex_attention import AuxRequest
 from torch.nn.attention.flex_attention import BlockMask
 from torch.nn.attention.flex_attention import flex_attention
 from torch.utils.checkpoint import checkpoint
@@ -56,8 +57,12 @@ def relative_attention(
     window=None,
     scaling=None,
     bias_scale=None,
+    return_lse=False,
 ):
-    """One query chunk; no token-by-token attention or bias matrix is allocated."""
+    """One query chunk; no token-by-token attention or bias matrix is allocated.
+
+    With ``return_lse``, also returns the FP32 log-sum-exp of the scores, ``[batch, heads, q_len]``.
+    """
     batch, heads, q_len, dim = query.shape
     kv_len = key.shape[2]
     extent = projection.shape[1]
@@ -105,7 +110,9 @@ def relative_attention(
         seq_lengths=(q_len, kv_len),
     )
     geometry = (query.dtype, heads, key.shape[1], dim, window, padding_mask is not None, sequence_ids is not None)
-    return _compiled_attention(geometry)(
+    if return_lse:
+        geometry += ("lse",)
+    output = _compiled_attention(geometry)(
         query,
         key,
         value,
@@ -114,7 +121,12 @@ def relative_attention(
         enable_gqa=heads != key.shape[1],
         scale=scaling if scaling is not None else 1 / dim,
         kernel_options={"BACKEND": "TRITON"},
+        return_aux=AuxRequest(lse=True) if return_lse else None,
     )
+    if return_lse:
+        output, aux = output
+        return output, aux.lse
+    return output
 
 
 class InklingFlexAttention(NativeInklingAttention):
