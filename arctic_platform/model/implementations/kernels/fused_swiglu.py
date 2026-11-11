@@ -16,7 +16,7 @@
 
 The PyTorch composition launches two clamps, a SiLU and a product, and autograd keeps their intermediates; at the
 256K routed-expert batch each is a full pass over ``[rows, hidden]``. Math runs in FP32 per element; gradients pass
-the clamps where ``torch.clamp``'s do (bounds inclusive).
+the clamps where ``torch.clamp``'s do (bounds exclusive: a value at a bound takes no gradient).
 """
 
 import torch
@@ -48,8 +48,8 @@ def _swiglu_bwd_kernel(
     u = tl.load(up_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     dh = tl.load(grad_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     if HAS_LIMIT:
-        pass_g = g <= limit
-        pass_u = (u >= -limit) & (u <= limit)
+        pass_g = g < limit
+        pass_u = (u > -limit) & (u < limit)
         g = tl.minimum(g, limit)
         u = tl.minimum(tl.maximum(u, -limit), limit)
     s = tl.sigmoid(g)
