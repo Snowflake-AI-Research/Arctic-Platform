@@ -25,7 +25,7 @@ _MAX_KEYS = 500_000
 # Requests a worker may hold, as a multiple of capacity, before the rest wait here for whichever worker frees first.
 _BACKLOG = 2
 # Ray max_concurrency of each worker actor. Every call it serves takes a slot, generate or control alike.
-WORKER_MAX_CONCURRENCY = 2048
+WORKER_MAX_CONCURRENCY = 4096
 # Slots the generate backlog leaves free for streams and control calls such as health checks and weight sync.
 _CONTROL_SLOTS = 4 * MAX_WORKER_STREAMS
 
@@ -53,6 +53,8 @@ class WorkerState:
     quarantined: bool = False
     # Futures of the generate calls running on this worker.
     inflight: set = field(default_factory=set)
+    # Sticky requests waiting for this worker to free up.
+    waiting: deque = field(default_factory=deque)
 
     @property
     def schedulable(self) -> bool:
@@ -89,9 +91,10 @@ class Scheduler:
     keyed one goes to the worker its key was first given, chosen that way then;
     a prefix-hash key spills while its worker holds ``capacity`` requests and
     another has room, and a sticky one never spills. A worker takes up to
-    ``_BACKLOG * capacity`` generate requests; past that on every worker, or
-    while paused, requests wait here in order and go to the first worker that
-    frees up.
+    ``_BACKLOG * capacity`` generate requests, never fewer than ``capacity``,
+    and short of the worker actor's Ray slots by ``_CONTROL_SLOTS``. Past that,
+    or while paused, requests wait here in order and go to the first worker
+    that frees up; a sticky one waits on its own worker's queue.
     """
 
     def __init__(
@@ -106,7 +109,7 @@ class Scheduler:
 
         self._workers = [WorkerState(handle=w) for w in workers]
         self._capacity = capacity
-        self._backlog = min(_BACKLOG * capacity, WORKER_MAX_CONCURRENCY - _CONTROL_SLOTS)
+        self._backlog = max(capacity, min(_BACKLOG * capacity, WORKER_MAX_CONCURRENCY - _CONTROL_SLOTS))
         self._prefix_routing = prefix_routing
         self._keys: OrderedDict[Hashable, int] = OrderedDict()
         # Requests no worker could take yet, dispatched in order by `_drain`.
@@ -133,7 +136,7 @@ class Scheduler:
         state = self.__dict__.copy()
         state["_wake"] = None
         state["_waiting"] = deque()
-        state["_workers"] = [replace(ws, inflight=set()) for ws in self._workers]
+        state["_workers"] = [replace(ws, inflight=set(), waiting=deque()) for ws in self._workers]
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -340,10 +343,15 @@ class Scheduler:
         if not self._workers:
             raise RuntimeError("No workers to remove")
         self.cancel_worker_inflight(len(self._workers) - 1)
-        self._workers.pop()
+        ws = self._workers.pop()
+        self._waiting.extendleft(reversed(ws.waiting))
+        ws.waiting.clear()
 
     async def shutdown(self) -> None:
         self._stopped = True
+        for ws in self._workers:
+            self._waiting.extend(ws.waiting)
+            ws.waiting.clear()
         for req in self._waiting:
             if not req.future.done():
                 req.future.set_exception(RuntimeError("Scheduler stopped"))
@@ -361,32 +369,40 @@ class Scheduler:
 
     def _notify(self) -> None:
         """Retry waiting requests, and wake every stream waiter to try again."""
+        for ws in self._workers:
+            self._drain_worker(ws)
         self._drain()
         self._wake.set()
         self._wake = asyncio.Event()
 
     def _drain(self) -> None:
-        """Dispatch waiting requests in order, passing over sticky ones whose worker is full.
+        """Dispatch waiting requests in order, moving a sticky one whose worker is full to that worker's queue.
 
-        Stops at any other request that can't go, or once every worker is
-        known to be full, since nothing behind it can go either.
+        Stops at any other request that can't go, since then no worker can
+        take more.
         """
-        passed: list[_Request] = []
-        full: set[int] = set()
-        schedulable = sum(ws.schedulable for ws in self._workers)
         while self._waiting:
-            req = self._waiting.popleft()
+            req = self._waiting[0]
             if req.future.done() or self._dispatch(req):
+                self._waiting.popleft()
                 continue
-            passed.append(req)
-            idx = self._keys.get(req.key)
-            if (not req.sticky or self._paused or self._stopped or idx is None
-                    or idx >= len(self._workers) or not self._workers[idx].schedulable):
-                break
-            full.add(idx)
-            if len(full) >= schedulable:
-                break
-        self._waiting.extendleft(reversed(passed))
+            idx = self._keys.get(req.key) if req.sticky else None
+            if (self._paused or self._stopped or idx is None or idx >= len(self._workers)
+                    or not self._workers[idx].schedulable):
+                return
+            self._workers[idx].waiting.append(self._waiting.popleft())
+
+    def _drain_worker(self, ws: WorkerState) -> None:
+        """Dispatch ``ws``'s sticky waiters while it has room, or requeue them all if it can't take any."""
+        if not ws.schedulable:
+            self._waiting.extendleft(reversed(ws.waiting))
+            ws.waiting.clear()
+            return
+        while ws.waiting:
+            req = ws.waiting[0]
+            if not req.future.done() and not self._dispatch(req):
+                return
+            ws.waiting.popleft()
 
     def _request(self, prompt, sampling_params, future, routing_key, strict) -> _Request:
         if routing_key is not None:
@@ -495,6 +511,7 @@ class Scheduler:
                 req.future.set_exception(error)
         else:
             self._finish(req, submitted_time, future.result())
+        self._drain_worker(ws)
         self._drain()
 
     def _finish(self, req: _Request, submitted_time: float, result: Any) -> None:

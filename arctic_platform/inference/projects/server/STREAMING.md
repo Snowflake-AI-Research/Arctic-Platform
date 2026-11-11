@@ -351,11 +351,12 @@ the end of a stream needs up to 2n + 2 slots. A merge that would exceed the
 per-event byte limit starts a new event instead.
 
 Defaults: 128 queued events, 1 MiB queued serialized payload, 256 KiB per event,
-and 128 sessions per worker. Streaming and legacy
+and 128 sessions per worker.
 Streams and `generate()` requests are routed alike, by each worker's
 `active_requests`, and both queue in the engine beyond its `max_num_seqs`.
 `generate()` requests wait in the scheduler once every worker they can go to
-holds a backlog of twice `max_num_seqs`. Streams are instead capped per worker
+holds a backlog of twice `max_num_seqs` (less above `max_num_seqs` 1792, but
+never less than `max_num_seqs`). Streams are instead capped per worker
 by `MAX_WORKER_STREAMS` (128): a stream goes to the less loaded of two random
 workers with a free stream slot, and waits while none has one, or while its
 routing key's worker has none. For example, two replicas can run 256 streams, with further streams

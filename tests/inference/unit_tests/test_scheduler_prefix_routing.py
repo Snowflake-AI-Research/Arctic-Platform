@@ -235,3 +235,99 @@ class TestSchedulerRoutingKey:
             ]
 
         asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Dispatch and the waiting queues
+# ---------------------------------------------------------------------------
+
+class _Worker:
+    """A worker handle whose generate calls finish when the test resolves them."""
+
+    def __init__(self) -> None:
+        self.calls: list[asyncio.Future] = []
+        self.generate = MagicMock()
+        self.generate.remote = self._remote
+
+    def _remote(self, prompt, sampling_params):
+        future = asyncio.get_running_loop().create_future()
+        self.calls.append(future)
+        return MagicMock(as_future=lambda: future)
+
+
+async def _settle() -> None:
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+class TestDispatch:
+    def test_completion_sends_next_waiting_request_to_freed_worker(self):
+        async def run() -> None:
+            workers = [_Worker(), _Worker()]
+            sch = Scheduler(workers, capacity=1)  # backlog 2 per worker
+            futures = [sch.submit(f"p{i}", {}) for i in range(5)]
+            assert [len(w.calls) for w in workers] == [2, 2]
+            workers[1].calls[0].set_result({"text": "done"})
+            await _settle()
+            assert sum(f.done() for f in futures) == 1
+            assert [len(w.calls) for w in workers] == [2, 3]
+            await sch.shutdown()
+
+        asyncio.run(run())
+
+    def test_sticky_request_on_full_worker_does_not_block_others(self):
+        async def run() -> None:
+            workers = [_Worker(), _Worker()]
+            sch = Scheduler(workers, capacity=1)
+            for _ in range(3):
+                sch.submit("turn", {}, routing_key="k")
+            hot = sch._keys["k"]
+            cold = 1 - hot
+            assert len(workers[hot].calls) == 2 and len(sch._workers[hot].waiting) == 1
+            sch.submit("other", {})
+            assert len(workers[cold].calls) == 1
+            workers[hot].calls[0].set_result({"text": "done"})
+            await _settle()
+            assert len(workers[hot].calls) == 3 and not sch._workers[hot].waiting
+            await sch.shutdown()
+
+        asyncio.run(run())
+
+    def test_send_that_raises_fails_only_that_request(self):
+        async def run() -> None:
+            worker = _Worker()
+            worker.generate.remote = MagicMock(side_effect=RuntimeError("send failed"))
+            sch = Scheduler([worker], capacity=4)
+            with pytest.raises(RuntimeError, match="send failed"):
+                await asyncio.wait_for(sch.submit("p", {}), 1.0)
+            assert sch._workers[0].active_requests == 0
+            await sch.shutdown()
+
+        asyncio.run(run())
+
+    def test_failed_generate_fails_the_request(self):
+        async def run() -> None:
+            worker = _Worker()
+            sch = Scheduler([worker], capacity=4)
+            future = sch.submit("p", {})
+            worker.calls[0].set_exception(ValueError("engine error"))
+            with pytest.raises(ValueError, match="engine error"):
+                await asyncio.wait_for(future, 1.0)
+            assert sch._workers[0].active_requests == 0
+            await sch.shutdown()
+
+        asyncio.run(run())
+
+    def test_cancel_worker_inflight_fails_its_requests(self):
+        async def run() -> None:
+            worker = _Worker()
+            sch = Scheduler([worker], capacity=4)
+            futures = [sch.submit(f"p{i}", {}) for i in range(2)]
+            assert sch.cancel_worker_inflight(0) == 2
+            for future in futures:
+                with pytest.raises(RuntimeError, match="cancelled for weight update"):
+                    await asyncio.wait_for(future, 1.0)
+            assert sch._workers[0].active_requests == 0
+            await sch.shutdown()
+
+        asyncio.run(run())

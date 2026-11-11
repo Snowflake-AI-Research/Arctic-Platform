@@ -5,6 +5,7 @@ import pytest
 
 from arctic_platform.inference.server import replica_pool as replica_pool_mod
 from arctic_platform.inference.server.replica_pool import ReplicaPool
+from arctic_platform.inference.server.scheduler import WORKER_MAX_CONCURRENCY
 
 
 class _RemoteMethod:
@@ -283,7 +284,7 @@ def test_single_node_initialization_reserves_tp_times_pp_gpus(monkeypatch):
         assert worker_cls.options_calls == [
             {
                 "num_gpus": 4.0,
-                "max_concurrency": 2048,
+                "max_concurrency": WORKER_MAX_CONCURRENCY,
             }
         ]
         await pool.shutdown()
@@ -439,7 +440,7 @@ def test_single_node_restart_keeps_normal_actor_path(monkeypatch):
         assert worker_cls.options_calls == [
             {
                 "num_gpus": 4.0,
-                "max_concurrency": 2048,
+                "max_concurrency": WORKER_MAX_CONCURRENCY,
             }
         ]
         assert pool._workers == [worker_cls.actors[0]]
