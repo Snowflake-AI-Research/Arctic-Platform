@@ -22,6 +22,8 @@ that forms ``1 - softmax`` at the target then reports exactly 0 there while ever
 so the logit gradient no longer sums to zero (https://jonbarron.info/softmaxfix/).
 """
 
+import math
+
 import pytest
 import torch
 
@@ -76,6 +78,32 @@ def test_near_certain_target_matches_float64_log_softmax(kind, margin):
     if entropy is not None:
         expected_entropy = -(log_probs.exp() * log_probs).sum(-1).detach()
         torch_assert_close(entropy.reshape(-1).double(), expected_entropy, rtol=0.0, atol=1e-5)
+
+
+@pytest.mark.parametrize("certain_token", [0, 77_440, 154_879])
+def test_near_certain_entropy_keeps_its_tail(certain_token):
+    """A near-certain row's entropy, 4.49e-7 here, comes back to float32 relative precision.
+
+    One logit of 30 and 154,879 zeros: logsumexp(z) and E_p[z] are both within one float32 step of 30, so their
+    difference is 0. The vocabulary spans 19 tiles, so the running max moves when the certain token is in a later
+    one. The second row is an ordinary distribution.
+    """
+    vocab = 154_880
+    weight = torch.zeros(vocab, 2)
+    weight[certain_token, 0] = TARGET_LOGIT
+    weight[:, 1] = torch.linspace(-3.0, 3.0, vocab)
+    hidden = torch.eye(2).reshape(1, 2, 2)
+    head = FusedOutputLinear(2, vocab, 2, fp32_lm_head=True)
+    labels = torch.tensor([[certain_token, 5]])
+    entropy = torch.func.functional_call(head, {"weight": weight}, (hidden, labels))["entropy"]
+
+    tail = (vocab - 1) * math.exp(-TARGET_LOGIT)
+    log_probs = torch.log_softmax(weight[:, 1].double(), -1)
+    expected = torch.tensor(
+        [math.log1p(tail) + TARGET_LOGIT * tail / (1 + tail), float(-(log_probs.exp() * log_probs).sum())],
+        dtype=torch.float64,
+    )
+    torch_assert_close(entropy.reshape(-1).double(), expected, rtol=1e-5, atol=0.0)
 
 
 def _near_certain_logits(margin, target_logit=TARGET_LOGIT):
