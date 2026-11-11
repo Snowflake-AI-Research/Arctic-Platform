@@ -185,6 +185,9 @@ def topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     """
     if _flashinfer_top_k is None or not scores.is_cuda:
         return torch.topk(scores, k, dim=-1).indices
+    # A segment shorter than one key pool has nothing to select; FlashInfer rejects k == 0.
+    if k == 0:
+        return scores.new_empty((*scores.shape[:-1], 0), dtype=torch.long)
     return _flashinfer_top_k(scores, k, sorted=False, deterministic=True, tie_break=TopKTieBreak.SMALL)[1]
 
 
