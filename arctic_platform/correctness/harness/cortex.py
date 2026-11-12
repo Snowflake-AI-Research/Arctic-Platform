@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import math
@@ -1049,3 +1050,25 @@ class CorrectnessCortexTransport(CortexTransport):
                 if primary is None:
                     raise
                 primary.add_note(f"HTTP session closure also failed: {type(error).__name__}: {error}")
+
+
+@contextlib.contextmanager
+def local_checkpoint_bridge():
+    """Route resumable saves and loads through the owned correctness gateway's retained checkpoint catalog.
+
+    A loopback DSS gateway's own save returns only a node-local FAST path and tag, which a later job cannot resolve, so
+    cross-job resume on a local gateway needs the ``/correctness`` checkpoint routes that ``gateway.main`` installs.
+    The transport refuses a gateway without those routes before allocating jobs. Child processes started inside the
+    block inherit the setting.
+    """
+    names = (LOCAL_NATIVE_FORWARD_ENV, LOCAL_CHECKPOINT_BRIDGE_ENV)
+    previous = {name: os.environ.get(name) for name in names}
+    try:
+        os.environ.update({name: "1" for name in names})
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value

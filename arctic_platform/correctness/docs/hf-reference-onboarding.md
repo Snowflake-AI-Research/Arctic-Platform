@@ -1,6 +1,6 @@
 # HF Reference Onboarding
 
-**Config-only onboarding prepares independent Hugging Face (HF) references automatically.** The two supported checks are `single-step-grads` and `single-step-optimizer`. Onboarding runs on an already prepared allocation and publishes compact JSON measurements for individual and combined selections in the same invocation; no separate reference-preparation command is required. Regression consumes those measurements without falling back to fresh HF computation.
+**Config-only onboarding selects all applicable checks from this checkout's five-check registry.** `single-step-grads` and `single-step-optimizer` use the HF scalar/norm records described below; `e2e-sft-train-validate` uses its own ordered-trajectory HF record. `checkpoint-resume-loss` compares AP uninterrupted and resumed training, and `inference-checkpoint-loss` compares training and sampling losses for the saved weights. Neither is admitted by a first-two HF record. Both RL judges, `rl-weight-sync` and `rl-router-replay`, are excluded. Onboarding prepares compatible selected references automatically; regression never recomputes missing references. See [check-specific prerequisites](running-tests.md#check-specific-prerequisites).
 
 ## Configuration And Reference Layout
 
@@ -41,7 +41,7 @@ python -m arctic_platform.correctness onboard \
   --config ./work/configs/tiny-qwen3-129m-one-h200--fp32.json
 ```
 
-**Default-all onboarding prepares gradients followed by optimizer state, then their combined reference selection.** Inspect `arctic_platform/correctness/specs/tiny-qwen3-129m-standard-h200-training-full--fp32.json` and the adjacent `.onboarding.json` summary before accepting the gates, confirming the resolved ID printed by onboarding. This new variant does not use the historical manifest-frozen ID. To select only one check, add `--test single-step-grads` or `--test single-step-optimizer`; missing fixture prerequisites are automatic. Both checks are inapplicable to RL configs.
+**Default-all onboarding attempts applicable checks independently and retains each outcome.** The two first-step checks prepare individual and compatible combined HF selections; E2E has a separate trajectory record, while resume and inference retain their own calibration/execution contracts. Inspect the generated spec and `.onboarding.json` summary using the resolved config ID before accepting gates. Explicit check selectors are optional, not extra default steps. Successful first-two preparation does not establish the other checks' runtime prerequisites.
 
 **Repeating a failed command resumes verified completed preparation.** Recovery records under `./work/logs/onboarding-state/` bind configuration, options, source, code and dependency versions to retained artifacts. Missing or changed artifacts invalidate the affected phase and its successors; failed phases are not completion checkpoints. An optimizer validation failure can therefore retry without recalibrating its compatible references. See [diagnostics and retry](running-tests.md#onboarding) for retained reports.
 

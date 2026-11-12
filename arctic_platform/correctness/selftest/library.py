@@ -35,6 +35,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,7 @@ import time
 import traceback
 import types
 import weakref
+import zlib
 from argparse import Namespace
 from collections import OrderedDict
 from concurrent.futures import Future
@@ -50,6 +52,7 @@ from contextlib import contextmanager
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
+from dataclasses import replace
 from decimal import ROUND_CEILING
 from decimal import Decimal
 from pathlib import Path
@@ -79,8 +82,10 @@ from safetensors.torch import load_file
 from safetensors.torch import save
 from safetensors.torch import save_file
 from torch import nn
+from transformers import AutoConfig
 from transformers import Qwen3Config
 from transformers import Qwen3ForCausalLM
+from transformers.utils import hub
 
 from arctic_platform import wire
 from arctic_platform.client import ArcticClientConfig as runtime_clients_ArcticClientConfig
@@ -93,7 +98,10 @@ from arctic_platform.client.transports.cortex import _DEFAULT
 from arctic_platform.client.transports.cortex import CortexTransport
 from arctic_platform.client.transports.cortex import _SendPolicy
 from arctic_platform.correctness import api
+from arctic_platform.correctness.checks import checkpoint_resume
+from arctic_platform.correctness.checks import e2e_sft_train_validate as lora_training_check
 from arctic_platform.correctness.checks import fwd_bwd_step
+from arctic_platform.correctness.checks import inference_checkpoint_loss as inference_rl_check
 from arctic_platform.correctness.checks.optimizer_state import COMPARISON_STATE_KEYS
 from arctic_platform.correctness.checks.optimizer_state import OPTIMIZER_NORM_CRITERION
 from arctic_platform.correctness.checks.optimizer_state import STATE_KEYS
@@ -109,6 +117,9 @@ from arctic_platform.correctness.harness import execution
 from arctic_platform.correctness.harness import execution as cli
 from arctic_platform.correctness.harness import gateway as ap_driver
 from arctic_platform.correctness.harness import gateway as hosted
+from arctic_platform.correctness.harness import gateway as rl_driver
+from arctic_platform.correctness.harness import inference as export
+from arctic_platform.correctness.harness import inference as projection
 from arctic_platform.correctness.harness import lora as deterministic_lora
 from arctic_platform.correctness.harness import lora as lora_init
 from arctic_platform.correctness.harness import lora as native_adapter
@@ -143,6 +154,7 @@ from arctic_platform.correctness.harness.config import placement_widths
 from arctic_platform.correctness.harness.config import scaled_for_placement
 from arctic_platform.correctness.harness.config import validate_against_host
 from arctic_platform.correctness.harness.cortex import LOCAL_NATIVE_FORWARD_ENV
+from arctic_platform.correctness.harness.cortex import Checkpoint
 from arctic_platform.correctness.harness.cortex import CorrectnessClient
 from arctic_platform.correctness.harness.cortex import CorrectnessCortexTransport
 from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
@@ -155,6 +167,9 @@ from arctic_platform.correctness.harness.gateway import UnsafeCleanupError as op
 from arctic_platform.correctness.harness.gateway import _gateway_runtime
 from arctic_platform.correctness.harness.gateway import _training_client_config
 from arctic_platform.correctness.harness.gateway import build_payload
+from arctic_platform.correctness.harness.gateway import pack
+from arctic_platform.correctness.harness.gateway import pack_logit_aligned
+from arctic_platform.correctness.harness.gateway import sampling_payload
 from arctic_platform.correctness.harness.lora import canonical_name
 from arctic_platform.correctness.harness.optimizer import align
 from arctic_platform.correctness.harness.optimizer import canonical_ap_tensor_groups
@@ -168,6 +183,8 @@ from arctic_platform.correctness.harness.runner import OPTIMIZER_LEARNING_RATE
 from arctic_platform.correctness.harness.runner import assert_applicable_tests_registered
 from arctic_platform.correctness.harness.sft import IGNORE_INDEX
 from arctic_platform.correctness.harness.sft import SEED
+from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
+from arctic_platform.correctness.harness.sft import load
 from arctic_platform.correctness.harness.storage import CORRECTNESS_TMPDIR_ENV
 from arctic_platform.correctness.harness.storage import ReferencePrerequisiteError
 from arctic_platform.correctness.onboarding import calibration as RENDER_MODULE
@@ -177,6 +194,7 @@ from arctic_platform.correctness.onboarding import synth_model
 from arctic_platform.correctness.reference import hf_single_gpu
 from arctic_platform.correctness.reference import optimizer_step
 from arctic_platform.correctness.reference import process_determinism
+from arctic_platform.correctness.reference.adamw_trajectory import AdamWTrajectory
 from arctic_platform.correctness.reference.hf_single_gpu import build_engine
 from arctic_platform.correctness.reference.hf_single_gpu import fixed_row_groups
 from arctic_platform.correctness.reference.hf_single_gpu import mixer_boundaries
@@ -10546,9 +10564,9 @@ def test_native_optimizer_owner_split_cli_guarded_forwarding(
     config.at_gpu_width = lambda width: SimpleNamespace(
         config_id=config.config_id, n_gpus=width, sub_job=dict(config.sub_job), training=dict(config.training)
     )
-    spec = SimpleNamespace(model=SimpleNamespace(cache_path=str(tmp_path / "model")))
     backend = CortexConfig(base_url="http://127.0.0.1:8003")
     tests = selected or ["single-step-grads", "single-step-optimizer"]
+    spec = SimpleNamespace(model=SimpleNamespace(cache_path=str(tmp_path / "model")), applicable_tests=tests)
     owners = []
     calls = []
 
@@ -14147,13 +14165,19 @@ def test_native_original_composition_manager_actor_table_restores_after_spawn(
     monkeypatch.setattr(native_lora, "_request", lambda cfg: request)
     monkeypatch.setattr(native_lora, "_verify_runtime", lambda actual, sources: events.append(("verify", actual)))
 
-    def coordinator(actual, actual_request, ref):
+    def coordinator(actual, actual_request, ref, *, first_two):
         assert actual is training and actual_request is request and ref == "owned-existing-cluster-ref"
+        assert first_two is False
         return selected
 
     monkeypatch.setattr(native_lora, "_coordinator_class", coordinator)
     manager = ZoneManager()
-    info = SimpleNamespace(config=object(), layout=[SimpleNamespace(gpu_ids=[0, 1])])
+    info = SimpleNamespace(
+        config=SimpleNamespace(
+            model_dump=lambda **kwargs: {"training_config": {"debug": {"correctness_first_two": False}}}
+        ),
+        layout=[SimpleNamespace(gpu_ids=[0, 1])],
+    )
     native_lora.install_manager(manager)
     captured = None
     try:
@@ -15685,7 +15709,7 @@ def test_native_spawn_globals_installed_manager_leaves_unselected_training_dispa
     control = native_spawn_globals_control
     control.coordinator(namespace)
     control.ordinary = True
-    control.participation = True
+    control.participation = False
     actor = control.training.GPUTrainingJob
     ordinary_config = SimpleNamespace(
         model_dump=lambda **kwargs: {
@@ -15714,9 +15738,8 @@ def test_native_spawn_globals_installed_manager_leaves_unselected_training_dispa
         def _spawn_actor(self, actual_info):
             assert actual_info is info
             selected = manager_module._ACTOR_CLS[actor_key]
-            assert issubclass(selected, actor.__ray_metadata__.modified_class)
-            assert selected.__name__ == "ParticipationCoordinator"
-            coordinator = selected()
+            assert selected is actor
+            coordinator = selected.__ray_metadata__.modified_class()
             spawned.append(coordinator)
             return asyncio.run(
                 coordinator._spawn_workers(control.config, control.ranks, "owned-master", 12345, control.source_stage)
@@ -15729,11 +15752,10 @@ def test_native_spawn_globals_installed_manager_leaves_unselected_training_dispa
     before_globals = dict(control.spawn_globals)
     manager = ZoneManager()
     native_lora.install_manager(manager)
-    assert manager._spawn_actor(info) is None
+    assert manager._spawn_actor(info) is control.spawn_result
     control.restored()
     assert control.events == ["native-spawn", "native-constructor"]
-    assert len(control.selected) == 1 and issubclass(control.selected[0], control.worker_base)
-    assert control.selected[0] is not control.worker_base
+    assert control.selected == [control.worker_base]
     assert not hasattr(spawned[0], "_correctness_original_adapter_receipts")
     assert control.gets == control.adapter.calls == []
     assert not hasattr(spawned[0]._workers[0], "original_adapter_receipt")
@@ -18886,7 +18908,7 @@ def test_fixed_tolerance_onboarding_reference_checks_keep_their_own_paths() -> N
             False,
             8,
             "http://127.0.0.1:8003",
-            "does not support test id",
+            "local Cortex fixture onboarding requires supervised Cortex",
         ),
     ],
 )
@@ -20681,7 +20703,7 @@ def test_local_cortex_reference_publication_runs_after_frozen_gate_before_valida
         assert keywords["reference_records_dir"] == state.args.reference_records_dir
         assert keywords["reference_token_budget"] == state.args.reference_token_budget
         assert keywords["workdir"] == state.args.output_dir / f"gpu{state.cfg.n_gpus}"
-        assert "local_gateway_full_model" not in keywords
+        assert keywords.get("local_gateway_full_model", False) is False
     else:
         assert state.calls == []
     manifest = json.loads((state.args.output_dir / "onboarding.json").read_text())
@@ -22242,6 +22264,7 @@ def test_client_backends_cortex_transport_sends_hardware_and_lists_durable_check
 def test_client_backends_cortex_refuses_checks_requiring_local_model_identity(tmp_path, monkeypatch, check):
     cfg = SimpleNamespace(
         config_id="unit",
+        is_rl=False,
         n_gpus=8,
         sub_job={"dtype": "bfloat16"},
         training={"dtype": "bfloat16"},
@@ -22491,10 +22514,23 @@ _SELFTEST_FIXTURES = (
     "_local_cortex_shutdown_gateway",
     "_client_backends_no_network",
     "_synthetic_runtime_inputs",
+    "_inference_export_case",
+    "_inference_rendezvous_inference_run",
+    "_native_checkpoint_bridge",
+    "_remaining_selected_later_recipe",
 )
 
 
 _SELFTEST_GROUPS = {
+    "remaining_selection_and_checkpoint_regressions": (
+        "test_remaining_selected_later_float32_onboarding_reaches_fixture_without_first_two_guard",
+        "test_remaining_selected_later_float32_runner_reaches_placement_without_first_two_guard",
+        "test_remaining_selected_later_float32_regression_reaches_spec_without_first_two_guard",
+        "test_remaining_checkpoint_unmarked_training_bypasses_first_two_runtime_capture",
+        "test_remaining_gateway_invalid_first_two_boolean_fails_before_runtime_or_dispatch",
+        "test_remaining_checkpoint_native_training_completes_multiple_steps_without_first_two_capture",
+        "test_remaining_checkpoint_bridge_restores_flags_on_success_failure_and_interrupt",
+    ),
     "catalog_configuration": (
         "test_cortex_recipe_import_preserves_bytes_settings_and_training_wire",
         "test_cortex_recipe_invalid_hardware_fails_before_import",
@@ -23115,6 +23151,12 @@ _SELFTEST_GROUPS = {
         "test_hosted_determinism_training_client_config_pins_determinism",
         "test_client_backends_cortex_model_options_preserve_internal_debug_without_a_bridge",
     ),
+    "remaining_checkpoint_resume_checkpoint_state": ("test_native_checkpoint_bridge_rejects_wrong_restored_state",),
+    "remaining_inference_schema": (
+        "test_inference_export_header_schema_coverage_fail_closed",
+        "test_inference_export_cleanup_exited_leader_stubborn_descendant_is_killed_and_group_empty",
+        "test_reviewed_weight_format_callers_inference_training_and_reload_preserve_format_and_recipe",
+    ),
 }
 
 
@@ -23129,6 +23171,9 @@ _SELFTEST_AUTO_FIXTURES = {
     "onboarding_storage": ["_synthetic_onboarding_environment"],
     "local_transport": [],
     "runtime_clients": ["_synthetic_runtime_inputs", "_external_operator_catalog"],
+    "remaining_checkpoint_resume_checkpoint_state": (),
+    "remaining_inference_schema": ("_inference_sampling_model_configs",),
+    "remaining_selection_and_checkpoint_regressions": (),
 }
 
 
@@ -24245,3 +24290,3389 @@ def test_no_debug_reduced_fixture_rejects_invalid_authenticated_binding(tmp_path
     with pytest.raises(ValueError, match="differs|differ|does not match"):
         validate_reduced_fixture_support(payload, spec, binding)
     assert (spec, binding, payload) == before
+
+
+# Standalone checkpoint, inference and SFT trajectory controls.
+
+
+@pytest.mark.parametrize("failure", [None, "comparison", "executor", "interrupt"])
+@pytest.mark.parametrize("inherited", [False, True], ids=["unset-flags", "prior-flags"])
+def test_checkpoint_regression_owns_bridge_and_restores_flags_after_both_arms(
+    _automatic_regression_gateway, monkeypatch, failure, inherited
+):
+    state = _automatic_regression_gateway
+    names = (
+        cortex_fixture.LOCAL_NATIVE_FORWARD_ENV,
+        cortex_fixture.LOCAL_CHECKPOINT_BRIDGE_ENV,
+    )
+    for name in names:
+        if inherited:
+            monkeypatch.setenv(name, "prior-value")
+        else:
+            monkeypatch.delenv(name, raising=False)
+    observed = []
+
+    def execute(cfg, spec, arms, **options):
+        assert state.process.terminate.call_count == 0
+        assert {name: os.environ.get(name) for name in names} == dict.fromkeys(names, "1")
+        assert options["client_backend"].base_url == "http://127.0.0.1:54321"
+        assert options["select"] == ["checkpoint-resume-loss"]
+        assert options["local_cortex_fixture"] is True
+        observed.extend(arm.name for arm in arms)
+        if failure == "executor":
+            raise RuntimeError("synthetic checkpoint execution failed")
+        if failure == "interrupt":
+            raise KeyboardInterrupt()
+        return [
+            Result(
+                "checkpoint-resume-loss",
+                cfg.config_id,
+                Outcome.FAIL if failure == "comparison" else Outcome.PASS,
+                arm=arm.name,
+            )
+            for arm in arms
+        ]
+
+    result = api.run(
+        api.RunRequest(config=_operator_api_CONFIG, tests=("checkpoint-resume-loss",)),
+        api.RunOptions(out=state.out, case=("gas1", "gas4")),
+        executor=execute,
+    )
+    assert observed == ["gas1", "gas4"]
+    assert result.exit_code == (0 if failure is None else 1)
+    assert [case["status"] for case in result.cases] == [
+        {None: "pass", "comparison": "fail", "executor": "error", "interrupt": "error"}[failure]
+    ]
+    state.start.assert_called_once()
+    assert state.start.call_args.args[0][:3] == [
+        sys.executable,
+        "-m",
+        "arctic_platform.correctness.harness.gateway",
+    ]
+    assert {name: state.start.call_args.kwargs["env"][name] for name in names} == dict.fromkeys(names, "1")
+    state.process.terminate.assert_called_once()
+    state.process.wait.assert_called_once_with(timeout=120)
+    assert {name: os.environ.get(name) for name in names} == dict.fromkeys(names, "prior-value" if inherited else None)
+    assert (state.out / "full.log").is_file() and (state.out / "report.json").is_file()
+    assert checkpoint_resume.ITERATIONS == 20 and checkpoint_resume.CHECKPOINT_ITERATION == 10
+
+
+@pytest.mark.parametrize("mode", ["endpoint", "environment", "onprem", "publication", "later-check"])
+def test_checkpoint_automatic_bridge_does_not_replace_unsupported_or_external_target(
+    _automatic_regression_gateway, monkeypatch, mode
+):
+    args = execution.parse_args(["run", "--config", _operator_api_CONFIG, "--test", "checkpoint-resume-loss"])
+    if mode == "endpoint":
+        args.base_url = "http://127.0.0.1:8003"
+    elif mode == "environment":
+        monkeypatch.setenv("ARCTIC_CORTEX_BASE_URL", "http://127.0.0.1:8003")
+    elif mode == "onprem":
+        args.backend = "onprem"
+    elif mode == "publication":
+        args.cortex_fixture = Path("publication.json")
+    else:
+        args.test = ["checkpoint-resume-loss", "inference-checkpoint-loss"]
+    assert execution._configure_regression_target(args) is args
+    assert not getattr(args, "_automatic_checkpoint_bridge", False)
+    _automatic_regression_gateway.start.assert_not_called()
+
+
+def test_checkpoint_automatic_bridge_does_not_mix_first_two_fixture_contracts(
+    _automatic_regression_gateway,
+):
+    args = execution.parse_args(
+        [
+            "run",
+            "--config",
+            _operator_api_CONFIG,
+            "--test",
+            "checkpoint-resume-loss",
+            "--test",
+            "single-step-grads",
+        ]
+    )
+    assert execution._configure_regression_target(args) is args
+    assert not getattr(args, "_automatic_checkpoint_bridge", False)
+    _automatic_regression_gateway.start.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["startup", "cleanup"])
+def test_checkpoint_bridge_failure_restores_flags_and_retains_unsafe_shutdown(
+    _automatic_regression_gateway, monkeypatch, failure
+):
+    state = _automatic_regression_gateway
+    names = (
+        cortex_fixture.LOCAL_NATIVE_FORWARD_ENV,
+        cortex_fixture.LOCAL_CHECKPOINT_BRIDGE_ENV,
+    )
+    for name in names:
+        monkeypatch.setenv(name, "prior-value")
+    if failure == "startup":
+        state.process.poll.return_value = 7
+        state.process.returncode = 7
+    else:
+        state.process.wait.side_effect = [
+            subprocess.TimeoutExpired("checkpoint gateway", 120),
+            0,
+        ]
+        monkeypatch.setattr(ap_driver.os, "killpg", Mock())
+    observed = []
+
+    def execute(cfg, *a, **k):
+        observed.append("target")
+        return [Result("checkpoint-resume-loss", cfg.config_id, Outcome.PASS)]
+
+    result = api.run(
+        api.RunRequest(config=_operator_api_CONFIG, tests=("checkpoint-resume-loss",)),
+        api.RunOptions(out=state.out),
+        executor=execute,
+    )
+    assert result.exit_code == 1 and result.cases[0]["status"] == "error"
+    assert result.stopped_unsafe
+    assert observed == (["target"] if failure == "cleanup" else [])
+    assert {name: os.environ.get(name) for name in names} == dict.fromkeys(names, "prior-value")
+    assert ("did not shut down cleanly" if failure == "cleanup" else "exited 7") in (
+        state.out / "full.log"
+    ).read_text()
+    state.start.assert_called_once()
+    if failure == "cleanup":
+        ap_driver.os.killpg.assert_called_once_with(12345, ap_driver.signal.SIGKILL)
+    else:
+        state.process.wait.assert_called_once_with()
+
+
+@pytest.mark.parametrize("slots,sp_size", [(8, 1), (16, 1), (8, 8), (16, 8)])
+@pytest.mark.parametrize("provider", ["huggingface", "prime_rl"])
+@pytest.mark.parametrize("reviewed_arms", [False, True])
+def test_checkpoint_calibration_calibration_preserves_config_accumulation_and_identical_work(
+    monkeypatch, tmp_path, slots, sp_size, provider, reviewed_arms
+):
+    reviewed_spec = object()
+    training = {
+        "n_gpus": slots,
+        "sp_size": sp_size,
+        "model_provider": provider,
+        "mb_spec": {"max_tokens_per_mb": 64},
+        "ds_config": {"gradient_accumulation_steps": 1},
+    }
+    original = deepcopy(training)
+    definitions = [ArmDefinition(name, slots * gas, 64) for name, gas in (("gas1", 1), ("gas4", 4))]
+    arms = [
+        (
+            ArmSpec(arm.name, arm.global_batch_size, arm.max_seq_len, arm.total_tokens, 1, 1, 0.0)
+            if reviewed_arms
+            else arm
+        )
+        for arm in definitions
+    ]
+    transports = []
+
+    class Transport:
+
+        def __init__(self, workdir, config, model, seed, **kwargs):
+            assert config == original
+            assert model == "/models/reduced" and seed == SEED
+            self.workdir, self.options, self.jobs = (workdir, kwargs, [])
+            transports.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        @contextlib.contextmanager
+        def job(self):
+            calls = []
+            self.jobs.append(calls)
+
+            def step(body, *, learning_rate):
+                calls.append((body, learning_rate))
+                return float(len(calls))
+
+            yield SimpleNamespace(fwd_bwd_step=step)
+
+    monkeypatch.setattr(checkpoint_resume, "GatewayTransport", Transport)
+    raw, where = checkpoint_resume.measure_undeterministic_loss_range(
+        training,
+        "/models/reduced",
+        slots=slots,
+        vocab_size=128,
+        arms=arms,
+        workdir=tmp_path,
+        attn_implementation="flash_attention_3",
+        spec=reviewed_spec,
+    )
+    assert len(transports) == 2
+    assert raw == 0.0 and where == "gas1 loss at iteration 1"
+    for arm, transport in zip(definitions, transports, strict=True):
+        assert transport.workdir == tmp_path / arm.name
+        assert transport.options == {
+            "slots": slots,
+            "attn_implementation": "flash_attention_3",
+            "determinism": "off",
+            "spec": reviewed_spec,
+        }
+        assert len(transport.jobs) == 3
+        for job in transport.jobs:
+            assert len(job) == 10
+            for iteration, (body, rate) in enumerate(job, start=1):
+                batch = build_batch(arm.name, arm.global_batch_size, arm.max_seq_len, 128, seed=SEED + iteration)
+                assert isinstance(body["batch"], dict)
+                wire = body["batch"]
+                for field in ("input_ids", "position_ids"):
+                    assert torch.equal(wire[field], getattr(batch, field))
+                labels = batch.shifted_labels() if provider == "prime_rl" else batch.labels
+                assert torch.equal(wire["labels"], labels)
+                assert body["processing"] == {"loss_fn": "sft"}
+                assert rate == checkpoint_resume.LEARNING_RATE
+        for run in transport.jobs[1:]:
+            assert all((body is prior for (body, _), (prior, _) in zip(run, transport.jobs[0], strict=True)))
+    assert training == original
+
+
+class _e2e_reference_records_Tokenizer:
+    pad_token_id = 0
+    bos_token_id = 1
+    eos_token_id = 2
+    padding_side = "right"
+    offset = 0
+
+    def __len__(self):
+        return 1000
+
+    def __call__(self, text, *, add_special_tokens):
+        assert add_special_tokens is True
+        return {"input_ids": [1, *[ord(value) + 10 + self.offset for value in text]]}
+
+
+def _e2e_reference_records_forbidden(*args, **kwargs):
+    raise AssertionError("HF, product initialization, or an extra allocation was reached")
+
+
+@pytest.fixture
+def _e2e_reference_records_ctx(tmp_path, monkeypatch):
+    model = tmp_path / "full-model"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"vocab_size": 1000, "layer_types": ["full_attention"]}))
+    (model / "model.safetensors").write_bytes(b"mock full-model content")
+    (model / "tokenizer.json").write_text('{"mock":true}')
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "train.parquet").write_bytes(b"ordered train source")
+    (dataset / "test.parquet").write_bytes(b"ordered held-out source")
+    monkeypatch.setenv(lora_training_check.GSM8K_DATA_ROOT_ENV, str(dataset))
+    tokenizer = _e2e_reference_records_Tokenizer()
+    monkeypatch.setattr(lora_training_check.gsm8k, "load_tokenizer", lambda path: tokenizer)
+
+    def rows(path, *, start=0, count=None):
+        values = [(f"train-{index}", str(index)) for index in range(200)]
+        if Path(path).name == "test.parquet":
+            values = [(f"held-{index}", str(index)) for index in range(8)]
+        return values[start:] if count is None else values[start : start + count]
+
+    monkeypatch.setattr(lora_training_check.gsm8k, "read_rows", rows)
+    training = {"train_batch_size": 2, "optimizer": {"name": "AdamW", "lr": 0.0001}}
+    cfg = SimpleNamespace(
+        training=training,
+        effective_training=training,
+        max_tokens_per_mb=512,
+        n_gpus=4,
+        dp_size=4,
+        gpu_type="h200",
+        sub_job={"dtype": "bfloat16"},
+        optimizer_dtype="float32",
+        fused_cross_entropy=False,
+        lm_head_token_chunk_size=None,
+    )
+    context = SimpleNamespace(
+        cfg=cfg,
+        config_id="full-model-h200-e2e",
+        spec=SimpleNamespace(
+            model=SimpleNamespace(cache_path=str(model)),
+            config_checksum="frozen-config",
+            config_path=tmp_path / "config",
+        ),
+        workdir=tmp_path / "work",
+        attn_implementation="sdpa",
+        prepare_references=False,
+        reference_records_dir=tmp_path / "records",
+        reference_record_paths={},
+        tokenizer=tokenizer,
+        dataset=dataset,
+    )
+    return context
+
+
+def _e2e_reference_records_measurements(inputs):
+    return {
+        "train_losses": [2.0] * 100,
+        "train_gradient_norms": [1.0] * 100,
+        "optimizer_steps": 100,
+        "validation_cross_entropy": 1.5,
+        "scored_answer_tokens": inputs.recipe["scored_answer_tokens"],
+        "active_tokens": [batch["active_tokens"] for batch in inputs.recipe["train_batches"]],
+        "peak_gib": 3.0,
+        "trainable_parameters": 8,
+    }
+
+
+def _e2e_reference_records_publish(ctx, inputs=None):
+    inputs = lora_training_check.prepare_inputs(ctx) if inputs is None else inputs
+    identity = reference_records.workload_identity(ctx, lora_training_check.TEST_ID, inputs.recipe)
+    reference = _e2e_reference_records_measurements(inputs)
+    path = reference_records.publish_record(ctx, identity, reference)
+    return (inputs, identity, reference, path)
+
+
+def _e2e_reference_records_guard_launches(monkeypatch):
+    monkeypatch.setattr(lora_training_check, "run_reference_trajectory", _e2e_reference_records_forbidden)
+    monkeypatch.setattr(lora_training_check.subprocess, "Popen", _e2e_reference_records_forbidden)
+    monkeypatch.setattr(lora_training_check, "gateway", _e2e_reference_records_forbidden)
+    monkeypatch.setattr(lora_training_check, "running_job", _e2e_reference_records_forbidden)
+
+
+def test_e2e_reference_records_prepared_regression_runs_one_target_and_zero_hf(
+    _e2e_reference_records_ctx, monkeypatch
+):
+    inputs, _, reference, _ = _e2e_reference_records_publish(_e2e_reference_records_ctx)
+    _e2e_reference_records_guard_launches(monkeypatch)
+    monkeypatch.setattr(reference_records, "publish_record", _e2e_reference_records_forbidden)
+    calls = []
+
+    def target(context, replay, directory, adapter):
+        assert context is _e2e_reference_records_ctx
+        assert directory == inputs.workdir / "ap"
+        assert adapter is None
+        lora_training_check.validate_replay(inputs)
+        calls.append(replay.steps)
+        return (
+            [2.0] * 100,
+            torch.full(
+                (
+                    len(inputs.validation_examples),
+                    int(inputs.measured["validation_padded_width"]),
+                ),
+                -1.5,
+            ),
+        )
+
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", target)
+    result = lora_training_check.run(_e2e_reference_records_ctx)[0]
+    assert result.outcome is Outcome.PASS
+    assert calls == [100]
+    assert result.metrics["n_gpus_ap"] == _e2e_reference_records_ctx.cfg.n_gpus
+    assert "n_gpus_dss" not in result.metrics
+    assert result.metrics["gated_quantities"] == 2
+    assert result.metrics["train_steps_recorded"] == 100
+    assert result.metrics["scored_answer_tokens"] == reference["scored_answer_tokens"]
+    diagnostic = json.loads((inputs.workdir / "trajectories.json").read_text())
+    assert diagnostic["reference_train_losses"] == reference["train_losses"]
+    assert diagnostic["reference_train_gradient_norms"] == reference["train_gradient_norms"]
+    assert not any(("logprobs" in key for key in diagnostic))
+    assert len([key for key in result.metrics if key.startswith("train_loss_abs_diff_step_")]) == 100
+
+
+def test_e2e_reference_records_missing_record_stops_before_target_and_prints_full_traceback(
+    _e2e_reference_records_ctx, monkeypatch, caplog
+):
+    _e2e_reference_records_guard_launches(monkeypatch)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
+    with caplog.at_level(logging.ERROR):
+        result = lora_training_check.run(_e2e_reference_records_ctx)[0]
+    assert result.outcome is Outcome.FAIL
+    assert "prepared HF reference missing" in result.summary
+    assert "--prepare-references" in result.summary
+    assert "Traceback (most recent call last)" in caplog.text
+
+
+def test_e2e_reference_records_corrupt_record_cannot_fall_back_to_hf(_e2e_reference_records_ctx, monkeypatch):
+    _, _, _, path = _e2e_reference_records_publish(_e2e_reference_records_ctx)
+    record = json.loads(path.read_text())
+    record["measurements"]["train_losses"][0] = 123.0
+    path.write_text(json.dumps(record))
+    _e2e_reference_records_guard_launches(monkeypatch)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
+    with pytest.raises(reference_records.ReferencePrerequisiteError, match="corrupt or incompatible"):
+        lora_training_check._run(_e2e_reference_records_ctx)
+
+
+def test_e2e_reference_records_shared_sft_source_is_bound_and_drift_requires_explicit_preparation(
+    _e2e_reference_records_ctx, monkeypatch
+):
+    _, identity, _, _ = _e2e_reference_records_publish(_e2e_reference_records_ctx)
+    source = reference_records.file_identity(Path(lora_training_check.__file__).parents[1] / "harness" / "sft.py")
+    assert identity["sft_source"] == source
+    original = reference_records.file_identity
+
+    def changed(path, *, refresh=False):
+        value = original(path, refresh=refresh)
+        return {**value, "sha256": "0" * 64} if Path(path).name == "sft.py" else value
+
+    monkeypatch.setattr(reference_records, "file_identity", changed)
+    _e2e_reference_records_guard_launches(monkeypatch)
+    with pytest.raises(
+        reference_records.ReferencePrerequisiteError,
+        match="prepared HF reference incompatible",
+    ):
+        lora_training_check._run(_e2e_reference_records_ctx)
+
+
+def test_e2e_reference_records_old_unbound_e2e_record_is_not_silently_relabelled(
+    _e2e_reference_records_ctx, monkeypatch
+):
+    inputs = lora_training_check.prepare_inputs(_e2e_reference_records_ctx)
+    identity = reference_records.workload_identity(
+        _e2e_reference_records_ctx, lora_training_check.TEST_ID, inputs.recipe
+    )
+    old = {key: value for key, value in identity.items() if key != "sft_source"}
+    path = reference_records.publish_record(
+        _e2e_reference_records_ctx, old, _e2e_reference_records_measurements(inputs)
+    )
+    before = path.read_bytes()
+    _e2e_reference_records_guard_launches(monkeypatch)
+    with pytest.raises(
+        reference_records.ReferencePrerequisiteError,
+        match="prepared HF reference incompatible",
+    ):
+        lora_training_check._run(_e2e_reference_records_ctx)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("train_losses", [2.0] * 99),
+        ("train_losses", [float("nan")] * 100),
+        ("train_gradient_norms", [1.0] * 99),
+        ("train_gradient_norms", [-1.0] * 100),
+        ("train_gradient_norms", [True] * 100),
+        ("optimizer_steps", 99),
+        ("validation_cross_entropy", float("inf")),
+        ("scored_answer_tokens", 999999),
+        ("scored_answer_tokens", True),
+        ("active_tokens", [0] * 100),
+        ("validation_logprobs", [[-1.5]]),
+    ],
+)
+def test_e2e_reference_records_incomplete_or_nonfinite_scalars_stop_before_target(
+    _e2e_reference_records_ctx, monkeypatch, key, value
+):
+    inputs = lora_training_check.prepare_inputs(_e2e_reference_records_ctx)
+    reference = _e2e_reference_records_measurements(inputs)
+    reference[key] = value
+    _e2e_reference_records_guard_launches(monkeypatch)
+    monkeypatch.setattr(reference_records, "load_record", lambda context, identity: reference)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
+    with pytest.raises(reference_records.ReferencePrerequisiteError):
+        lora_training_check._run(_e2e_reference_records_ctx)
+
+
+@pytest.mark.parametrize("change", ["dataset", "tokenizer", "model", "grouping", "budget", "gate"])
+def test_e2e_reference_records_input_or_workload_drift_requires_a_new_record_before_target(
+    _e2e_reference_records_ctx, monkeypatch, change
+):
+    _e2e_reference_records_publish(_e2e_reference_records_ctx)
+    if change == "dataset":
+        (_e2e_reference_records_ctx.dataset / "train.parquet").write_bytes(b"different ordered source")
+    elif change == "tokenizer":
+        _e2e_reference_records_ctx.tokenizer.offset = 1
+    elif change == "model":
+        (Path(_e2e_reference_records_ctx.spec.model.cache_path) / "model.safetensors").write_bytes(
+            b"different full-model content"
+        )
+    elif change == "grouping":
+        _e2e_reference_records_ctx.cfg.training["train_batch_size"] = 1
+    elif change == "budget":
+        _e2e_reference_records_ctx.cfg.max_tokens_per_mb = 256
+    else:
+        monkeypatch.setattr(lora_training_check, "TOLERANCE", 0.04)
+    _e2e_reference_records_guard_launches(monkeypatch)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
+    with pytest.raises(
+        reference_records.ReferencePrerequisiteError,
+        match="prepared HF reference incompatible",
+    ):
+        lora_training_check._run(_e2e_reference_records_ctx)
+
+
+def test_e2e_reference_records_relocated_source_paths_preserve_identity_and_sequential_selection(
+    _e2e_reference_records_ctx, tmp_path, monkeypatch
+):
+    first = lora_training_check.prepare_inputs(_e2e_reference_records_ctx)
+    staged = tmp_path / "relocated-dataset"
+    staged.mkdir()
+    for name in ("train.parquet", "test.parquet"):
+        (staged / name).write_bytes((_e2e_reference_records_ctx.dataset / name).read_bytes())
+    monkeypatch.setenv(lora_training_check.GSM8K_DATA_ROOT_ENV, str(staged))
+    second = lora_training_check.prepare_inputs(_e2e_reference_records_ctx)
+    assert first.recipe == second.recipe
+    assert first.replay.steps == 100
+    assert first.recipe["dataset"]["train"] == {
+        "start": 0,
+        "count": 200,
+        "rows_per_step": 2,
+    }
+    assert first.recipe["dataset"]["train_groups"] == [{"start": step * 2, "count": 2} for step in range(100)]
+    assert str(tmp_path) not in json.dumps(first.recipe)
+    assert first.recipe["preprocessing"]["labels"] == "answer-only-huggingface"
+    assert first.recipe["dataset"]["validation"]["minimum_rows"] == 4
+
+
+def test_e2e_reference_records_replay_tampering_after_record_load_stops_before_target(
+    _e2e_reference_records_ctx, monkeypatch
+):
+    inputs, _, reference, _ = _e2e_reference_records_publish(_e2e_reference_records_ctx)
+    monkeypatch.setattr(lora_training_check, "prepare_inputs", lambda context: inputs)
+
+    def load_record(context, identity):
+        batch = lora_training_check.load(inputs.replay.train_batch_paths[0])
+        batch.labels[0, -1] += 1
+        lora_training_check.save(batch, inputs.replay.train_batch_paths[0])
+        return reference
+
+    monkeypatch.setattr(reference_records, "load_record", load_record)
+    _e2e_reference_records_guard_launches(monkeypatch)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
+    with pytest.raises(reference_records.ReferencePrerequisiteError, match="replay differs"):
+        lora_training_check._run(_e2e_reference_records_ctx)
+
+
+@pytest.mark.parametrize("lora", [False, True])
+def test_e2e_reference_records_explicit_preparation_runs_hf_once_publishes_scalars_and_never_runs_target(
+    _e2e_reference_records_ctx, monkeypatch, lora
+):
+    _e2e_reference_records_ctx.prepare_references = True
+    adapter = None
+    if lora:
+        _e2e_reference_records_ctx.cfg.training["peft_config"] = {"r": 4}
+        adapter = _e2e_reference_records_ctx.workdir / "adapter"
+        monkeypatch.setattr(deterministic_lora, "materialize_adapter", lambda *args: adapter)
+        monkeypatch.setattr(deterministic_lora, "identity_metadata", lambda path: {"mock": "exact-init"})
+    monkeypatch.setattr(deterministic_lora, "bind_payload", _e2e_reference_records_forbidden)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
+    calls = []
+
+    def reference(context, replay, directory, prepared_adapter):
+        assert prepared_adapter == adapter
+        inputs = lora_training_check.prepare_inputs(context)
+        values = _e2e_reference_records_measurements(inputs)
+        calls.append(replay.steps)
+        values.pop("validation_cross_entropy")
+        values.pop("scored_answer_tokens")
+        values["validation_logprobs"] = torch.full(
+            (
+                len(inputs.validation_examples),
+                int(inputs.measured["validation_padded_width"]),
+            ),
+            -1.5,
+        ).tolist()
+        return values
+
+    monkeypatch.setattr(lora_training_check, "run_reference_trajectory", reference)
+    assert lora_training_check.run(_e2e_reference_records_ctx) == []
+    assert calls == [100]
+    paths = list(_e2e_reference_records_ctx.reference_records_dir.rglob("*.json"))
+    assert len(paths) == 1
+    record = json.loads(paths[0].read_text())
+    assert record["measurements"]["validation_cross_entropy"] == 1.5
+    assert len(record["measurements"]["train_losses"]) == 100
+    assert len(record["measurements"]["train_gradient_norms"]) == 100
+    assert "validation_logprobs" not in record["measurements"]
+    assert list(_e2e_reference_records_ctx.reference_records_dir.rglob("*.pt")) == []
+    assert list(_e2e_reference_records_ctx.reference_records_dir.rglob("*.safetensors")) == []
+    monkeypatch.setattr(lora_training_check, "run_reference_trajectory", _e2e_reference_records_forbidden)
+    assert lora_training_check.run(_e2e_reference_records_ctx) == []
+    assert calls == [100]
+
+
+def test_e2e_reference_records_preparation_exception_propagates_instead_of_becoming_empty_success(
+    _e2e_reference_records_ctx, monkeypatch
+):
+    _e2e_reference_records_ctx.prepare_references = True
+
+    def fail(context):
+        raise RuntimeError("actual preparation traceback")
+
+    monkeypatch.setattr(lora_training_check, "prepare_reference_record", fail)
+    with pytest.raises(RuntimeError, match="actual preparation traceback"):
+        lora_training_check.run(_e2e_reference_records_ctx)
+
+
+def test_e2e_reference_records_preparation_requires_explicit_mode(_e2e_reference_records_ctx, monkeypatch):
+    monkeypatch.setattr(lora_training_check, "prepare_inputs", _e2e_reference_records_forbidden)
+    with pytest.raises(reference_records.ReferencePrerequisiteError, match="explicit"):
+        lora_training_check.prepare_reference_record(_e2e_reference_records_ctx)
+
+
+def test_e2e_reference_records_corrupt_existing_record_is_not_reprepared(_e2e_reference_records_ctx, monkeypatch):
+    _, _, _, path = _e2e_reference_records_publish(_e2e_reference_records_ctx)
+    path.write_text("invalid JSON")
+    _e2e_reference_records_ctx.prepare_references = True
+    _e2e_reference_records_guard_launches(monkeypatch)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
+    with pytest.raises(
+        reference_records.ReferencePrerequisiteError,
+        match="prepared HF reference corrupt",
+    ):
+        lora_training_check.run(_e2e_reference_records_ctx)
+
+
+def test_e2e_reference_records_unsupported_lora_init_fails_before_hf_or_target(
+    _e2e_reference_records_ctx, monkeypatch
+):
+    _e2e_reference_records_ctx.cfg.training["peft_config"] = {"r": 4}
+    monkeypatch.setattr(
+        deterministic_lora,
+        "materialize_adapter",
+        lambda *args: _e2e_reference_records_ctx.workdir / "adapter",
+    )
+    monkeypatch.setattr(deterministic_lora, "identity_metadata", _e2e_reference_records_forbidden)
+    _e2e_reference_records_guard_launches(monkeypatch)
+    monkeypatch.setattr(lora_training_check, "run_ap_trajectory", _e2e_reference_records_forbidden)
+    with pytest.raises(deterministic_lora.LoraInitializationPrerequisiteError, match="public"):
+        lora_training_check._run(_e2e_reference_records_ctx)
+
+
+def test_e2e_reference_records_staged_dataset_root_must_be_fast_storage(_e2e_reference_records_ctx, monkeypatch):
+    monkeypatch.setenv(lora_training_check.GSM8K_DATA_ROOT_ENV, "/code/staged-gsm8k")
+    with pytest.raises(ValueError, match="/data-fast"):
+        lora_training_check.dataset_paths()
+
+
+def test_e2e_reference_records_reference_options_are_shared_with_hf_command(
+    _e2e_reference_records_ctx,
+):
+    options = lora_training_check.reference_options(
+        _e2e_reference_records_ctx, _e2e_reference_records_ctx.spec.model.cache_path
+    )
+    command = lora_training_check.reference_command(
+        _e2e_reference_records_ctx, None, Path("replay"), Path("output"), None
+    )
+    assert command[command.index("--ce-chunk") + 1] == str(options["ce_chunk"])
+    assert command[command.index("--token-budget") + 1] == str(options["token_budget"])
+    assert command[command.index("--learning-rate") + 1] == str(options["learning_rate"])
+    assert json.loads(command[command.index("--optimizer-config") + 1]) == options["optimizer_config"]
+
+
+def _e2e_sft_train_validate_assert_nested_equal(left, right):
+    import torch
+
+    if isinstance(left, torch.Tensor):
+        assert torch.equal(left, right)
+    elif isinstance(left, dict):
+        assert left.keys() == right.keys()
+        for key in left:
+            _e2e_sft_train_validate_assert_nested_equal(left[key], right[key])
+    elif isinstance(left, list):
+        assert len(left) == len(right)
+        for left_item, right_item in zip(left, right):
+            _e2e_sft_train_validate_assert_nested_equal(left_item, right_item)
+    else:
+        assert left == right
+
+
+_e2e_sft_train_validate_STEPS = 4
+
+_e2e_sft_train_validate_ROWS_PER_STEP = 2
+
+_e2e_sft_train_validate_ADAMW = {
+    "name": "AdamW",
+    "lr": 2e-05,
+    "weight_decay": 0.0,
+    "betas": [0.9, 0.999],
+    "eps": 1e-08,
+}
+
+_e2e_sft_train_validate_OVER_GATE = lora_training_check.TOLERANCE * 3
+
+
+def _e2e_sft_train_validate_examples(count: int, *, first: int = 0):
+    """Rows of unequal length, each with a distinct token stream, so no two steps share a batch."""
+    return [
+        gsm8k.Example(
+            question=f"q{first + index}",
+            prompt="Question: q\nAnswer:",
+            completion=" a",
+            input_ids=tuple(range(10 * (first + index) + 1, 10 * (first + index) + 4 + index % 3)),
+            n_prompt=2,
+        )
+        for index in range(count)
+    ]
+
+
+def _e2e_sft_train_validate_a_replay(
+    tmp_path: Path, steps: int = _e2e_sft_train_validate_STEPS
+) -> lora_training_check.Replay:
+    rows = _e2e_sft_train_validate_examples(steps * _e2e_sft_train_validate_ROWS_PER_STEP)
+    return lora_training_check.materialize_replay(
+        lora_training_check.replay_batches(rows, _e2e_sft_train_validate_ROWS_PER_STEP, steps, pad_id=0),
+        gsm8k.build_batch("validation", _e2e_sft_train_validate_examples(3, first=100), pad_id=0),
+        tmp_path / "replay",
+    )
+
+
+def test_e2e_sft_train_validate_mixer_packing_is_selected_from_checkpoint_layers(
+    tmp_path,
+) -> None:
+    from arctic_platform.correctness.reference.model_features import uses_mixer_packing
+
+    (tmp_path / "config.json").write_text(json.dumps({"layer_types": ["linear_attention", "full_attention"]}))
+    assert uses_mixer_packing(tmp_path) is True
+    (tmp_path / "config.json").write_text(json.dumps({"layer_types": ["full_attention"]}))
+    assert uses_mixer_packing(tmp_path) is False
+
+
+def test_e2e_sft_train_validate_mixer_packing_keeps_each_sequence_in_its_own_reference_call() -> None:
+    from arctic_platform.correctness.reference.hf_single_gpu import reference_row_groups
+
+    lengths = [4, 4]
+    assert reference_row_groups(lengths, 4, 64, mixer_packing=True) == [[0], [1]]
+    assert reference_row_groups(lengths, 4, 64, mixer_packing=False) == [[0, 1]]
+
+
+def test_e2e_sft_train_validate_every_step_gets_its_own_batch_from_the_training_slice() -> None:
+    rows = _e2e_sft_train_validate_examples(_e2e_sft_train_validate_STEPS * _e2e_sft_train_validate_ROWS_PER_STEP)
+    batches = lora_training_check.replay_batches(
+        rows,
+        _e2e_sft_train_validate_ROWS_PER_STEP,
+        _e2e_sft_train_validate_STEPS,
+        pad_id=0,
+    )
+    assert len(batches) == _e2e_sft_train_validate_STEPS
+    assert all((batch.rows == _e2e_sft_train_validate_ROWS_PER_STEP for batch in batches))
+    seen = [tuple(row) for batch in batches for row in batch.input_ids.tolist()]
+    assert len(set(seen)) == len(rows)
+
+
+def test_e2e_sft_train_validate_a_slice_that_does_not_fill_the_steps_is_refused() -> None:
+    with pytest.raises(ValueError, match="need 8 examples"):
+        lora_training_check.replay_batches(
+            _e2e_sft_train_validate_examples(7),
+            _e2e_sft_train_validate_ROWS_PER_STEP,
+            _e2e_sft_train_validate_STEPS,
+            pad_id=0,
+        )
+
+
+def test_e2e_sft_train_validate_both_engines_are_handed_the_same_replay_files_in_the_same_order(
+    tmp_path,
+) -> None:
+    """The one property that makes the comparison a comparison: one list of files, read by both sides."""
+    replay = _e2e_sft_train_validate_a_replay(tmp_path)
+    manifest = json.loads(lora_training_check.write_replay_manifest(replay, tmp_path / "replay.json").read_text())
+    training_bodies, _ = lora_training_check.request_bodies(replay, model_provider="huggingface")
+    assert manifest["train_batches"] == [str(path) for path in replay.train_batch_paths]
+    assert manifest["validation_batch"] == str(replay.validation_batch_path)
+    assert len(training_bodies) == replay.steps
+    expected = [pack(load(path), model_provider="huggingface") for path in replay.train_batch_paths]
+    _e2e_sft_train_validate_assert_nested_equal(training_bodies, expected)
+    assert (
+        len({body["batch"]["input_ids"].detach().cpu().numpy().tobytes() for body in training_bodies}) == replay.steps
+    )
+
+
+def test_e2e_sft_train_validate_the_held_out_request_carries_logit_aligned_labels(
+    tmp_path,
+) -> None:
+    import torch
+
+    "The forward-only route shifts nothing, so the same bytes ``/fwd-bwd`` takes would score one off."
+    replay = _e2e_sft_train_validate_a_replay(tmp_path)
+    validation_batch = load(replay.validation_batch_path)
+    _, validation_body = lora_training_check.request_bodies(replay, model_provider="huggingface")
+    _e2e_sft_train_validate_assert_nested_equal(validation_body, pack_logit_aligned(validation_batch))
+    assert not torch.equal(
+        validation_body["batch"]["labels"],
+        pack(validation_batch, model_provider="huggingface")["batch"]["labels"],
+    )
+
+
+def test_e2e_sft_train_validate_the_training_requests_carry_the_convention_their_dispatch_expects(
+    tmp_path,
+) -> None:
+    """``/fwd-bwd`` shifts HuggingFace-convention labels itself; pre-shifting them would double it."""
+    replay = _e2e_sft_train_validate_a_replay(tmp_path)
+    packed = {"train": [], "validation": []}
+
+    def record_train(batch, *, model_provider):
+        packed["train"].append(batch.name)
+        return f"train:{batch.name}".encode()
+
+    def record_validation(batch):
+        packed["validation"].append(batch.name)
+        return f"validation:{batch.name}".encode()
+
+    original = (lora_training_check.pack, lora_training_check.pack_logit_aligned)
+    lora_training_check.pack, lora_training_check.pack_logit_aligned = (record_train, record_validation)
+    try:
+        training_bodies, validation_body = lora_training_check.request_bodies(replay, model_provider="huggingface")
+    finally:
+        lora_training_check.pack, lora_training_check.pack_logit_aligned = original
+    assert packed["train"] == [f"train-step-{step:03d}" for step in range(1, replay.steps + 1)]
+    assert packed["validation"] == ["validation"]
+    assert validation_body == b"validation:validation"
+    assert len(training_bodies) == replay.steps
+
+
+def _e2e_sft_train_validate_a_verdict(reference, target, reference_validation=1.5, target_validation=1.5):
+    return lora_training_check.verdict(
+        SimpleNamespace(config_id="example"),
+        reference,
+        target,
+        reference_validation,
+        target_validation,
+    )
+
+
+def test_e2e_sft_train_validate_the_verdict_gates_on_the_final_training_loss_and_the_validation_loss() -> None:
+    assert lora_training_check.gated_training_steps(100) == (100,)
+    result = _e2e_sft_train_validate_a_verdict([2.5] * 100, [2.5] * 100)
+    assert result.metrics["gated_quantities"] == 2.0
+    assert result.metrics["train_steps_recorded"] == 100.0
+
+
+def test_e2e_sft_train_validate_two_identical_trajectories_pass_and_still_record_every_step() -> None:
+    losses = [2.5 - 0.01 * step for step in range(10)]
+    result = _e2e_sft_train_validate_a_verdict(losses, list(losses))
+    assert result.outcome is Outcome.PASS
+    assert result.mismatches == []
+    assert result.reason == ""
+    assert result.metrics["stated_criterion_abs"] == lora_training_check.TOLERANCE
+    assert result.metrics["first_disagreeing_train_step"] == 0.0
+    assert [f"train_loss_abs_diff_step_{step:03d}" in result.metrics for step in range(1, 11)] == [True] * 10
+
+
+def test_e2e_sft_train_validate_a_mid_run_disagreement_that_closes_by_the_final_step_does_not_decide_the_outcome() -> (
+    None
+):
+    """The trajectory is reported and not gated, so the widest step does not reach ``max_abs_diff``."""
+    reference = [2.5] * 10
+    target = [
+        2.5,
+        2.5,
+        2.5 + _e2e_sft_train_validate_OVER_GATE * 2,
+        2.5 + _e2e_sft_train_validate_OVER_GATE,
+    ] + [2.5] * 6
+    result = _e2e_sft_train_validate_a_verdict(reference, target)
+    assert result.outcome is Outcome.PASS
+    assert result.metrics["final_train_loss_abs_diff"] == pytest.approx(0.0)
+    assert result.metrics["max_abs_diff"] == pytest.approx(0.0)
+    assert result.metrics["trajectory_steps_over_gate"] == 2.0
+    assert result.metrics["worst_train_loss_step"] == 3.0
+    assert result.metrics["worst_train_loss_abs_diff"] == pytest.approx(_e2e_sft_train_validate_OVER_GATE * 2)
+    assert result.metrics["first_disagreeing_train_step"] == 3.0
+
+
+def test_e2e_sft_train_validate_a_disagreement_at_step_one_is_read_as_the_forward_and_not_as_accumulation() -> None:
+    result = _e2e_sft_train_validate_a_verdict([2.5] * 10, [2.5 + _e2e_sft_train_validate_OVER_GATE] * 10)
+    assert result.outcome is Outcome.FAIL
+    assert result.metrics["first_disagreeing_train_step"] == 1.0
+    assert "step 1" in result.reason
+    assert "not one that accumulated" in result.reason
+
+
+def test_e2e_sft_train_validate_a_disagreement_that_appears_later_is_read_as_accumulation() -> None:
+    """The distinction the trajectory exists for: same final magnitude, opposite cause."""
+    result = _e2e_sft_train_validate_a_verdict([2.5] * 10, [2.5] * 5 + [2.5 + _e2e_sft_train_validate_OVER_GATE] * 5)
+    assert result.outcome is Outcome.FAIL
+    assert result.metrics["first_disagreeing_train_step"] == 6.0
+    assert "step 6 of 10" in result.reason
+    assert "accumulated over 5 optimizer steps" in result.reason
+
+
+def test_e2e_sft_train_validate_an_onset_at_the_second_step_counts_one_elapsed_optimizer_step() -> None:
+    """The sentence counts optimizer steps, and one of them is a step rather than steps."""
+    result = _e2e_sft_train_validate_a_verdict([2.5] * 10, [2.5] + [2.5 + _e2e_sft_train_validate_OVER_GATE] * 9)
+    assert result.outcome is Outcome.FAIL
+    assert result.metrics["first_disagreeing_train_step"] == 2.0
+    assert "first disagree at step 2 of 10" in result.reason
+    assert "accumulated over 1 optimizer step rather" in result.reason
+
+
+def test_e2e_sft_train_validate_the_final_training_loss_fails_on_its_own() -> None:
+    result = _e2e_sft_train_validate_a_verdict([2.5] * 10, [2.5] * 9 + [2.5 + _e2e_sft_train_validate_OVER_GATE])
+    assert result.outcome is Outcome.FAIL
+    assert [mismatch.name for mismatch in result.mismatches] == [
+        lora_training_check.TRAIN_LOSS_QUANTITY.format(step=10)
+    ]
+    assert result.metrics["final_train_loss_abs_diff"] == pytest.approx(_e2e_sft_train_validate_OVER_GATE)
+
+
+def test_e2e_sft_train_validate_a_validation_disagreement_fails_on_its_own() -> None:
+    result = _e2e_sft_train_validate_a_verdict(
+        [2.5] * 10,
+        [2.5] * 10,
+        reference_validation=1.75,
+        target_validation=1.75 + _e2e_sft_train_validate_OVER_GATE,
+    )
+    assert result.outcome is Outcome.FAIL
+    assert [mismatch.name for mismatch in result.mismatches] == [lora_training_check.VALIDATION_QUANTITY]
+    assert result.reason == ""
+    assert result.metrics["validation_abs_diff"] == pytest.approx(_e2e_sft_train_validate_OVER_GATE)
+
+
+def test_e2e_sft_train_validate_the_first_and_widest_step_are_reported_whatever_the_verdict() -> None:
+    """A passing run still states where the two runs started and how far apart they ever got."""
+    under = lora_training_check.TOLERANCE / 2
+    result = _e2e_sft_train_validate_a_verdict([2.5] * 10, [2.5] + [2.5 + under] * 8 + [2.5])
+    assert result.outcome is Outcome.PASS
+    assert result.metrics["first_train_loss_abs_diff"] == 0.0
+    assert result.metrics["worst_train_loss_abs_diff"] == pytest.approx(under)
+    assert "step 1 0.000e-03" in result.summary
+    assert "neither gated" in result.summary
+
+
+def test_e2e_sft_train_validate_the_stated_gate_decides_the_outcome() -> None:
+    """The stated gate, asserted where it acts: either side of ``TOLERANCE`` decides the outcome."""
+    inside, outside = (lora_training_check.TOLERANCE * 0.9, lora_training_check.TOLERANCE * 1.1)
+    assert _e2e_sft_train_validate_a_verdict([2.5] * 10, [2.5] * 9 + [2.5 + inside]).outcome is Outcome.PASS
+    assert _e2e_sft_train_validate_a_verdict([2.5] * 10, [2.5] * 9 + [2.5 + outside]).outcome is Outcome.FAIL
+    assert _e2e_sft_train_validate_a_verdict([2.5] * 10, [2.5] * 10, 1.75, 1.75 + inside).outcome is Outcome.PASS
+    assert _e2e_sft_train_validate_a_verdict([2.5] * 10, [2.5] * 10, 1.75, 1.75 + outside).outcome is Outcome.FAIL
+
+
+def test_e2e_sft_train_validate_reference_fused_cross_entropy_matches_product_selection(
+    tmp_path,
+) -> None:
+    from arctic_platform.correctness.harness.config import LoadedConfig
+
+    def cfg(training):
+        return LoadedConfig(
+            "example",
+            tmp_path / "example.config",
+            {"model_name": "example", "training_config": training},
+        )
+
+    assert cfg({"model_provider": "prime_rl"}).fused_cross_entropy == "liger"
+    assert cfg({"model_provider": "prime_rl", "fused_cross_entropy": False}).fused_cross_entropy is False
+    assert cfg({"model_provider": "huggingface"}).fused_cross_entropy is False
+
+
+@pytest.mark.parametrize("name", ["AdamW", "FusedAdam", "torch_adamw"])
+def test_e2e_sft_train_validate_reference_uses_independent_unfused_pytorch_adamw(
+    name,
+) -> None:
+    trajectory = AdamWTrajectory(
+        _e2e_sft_train_validate_model(),
+        {**_e2e_sft_train_validate_ADAMW, "name": name},
+        learning_rate=0.01,
+        gradient_clipping=None,
+        optimizer_dtype="float32",
+    )
+    trajectory.step(_e2e_sft_train_validate_gradients(trajectory._model))
+    assert type(trajectory._optimizer) is torch.optim.AdamW
+    assert trajectory._optimizer.defaults["fused"] is False
+    assert trajectory._optimizer.defaults["foreach"] is False
+
+
+def test_e2e_sft_train_validate_trajectories_of_different_lengths_are_refused() -> None:
+    with pytest.raises(ValueError, match="one loss per step"):
+        _e2e_sft_train_validate_a_verdict([2.5] * 5, [2.5] * 4)
+
+
+def _e2e_sft_train_validate_model() -> torch.nn.Module:
+    """A weight and a bias, so the no-decay group is populated as it is for a real model."""
+    torch.manual_seed(0)
+    return torch.nn.Linear(4, 3, bias=True)
+
+
+def _e2e_sft_train_validate_gradients(model, value: float = 0.1) -> dict:
+    return {name: torch.full_like(parameter, value) for name, parameter in model.named_parameters()}
+
+
+def _e2e_sft_train_validate_trajectory(model) -> AdamWTrajectory:
+    return AdamWTrajectory(
+        model,
+        _e2e_sft_train_validate_ADAMW,
+        learning_rate=0.01,
+        gradient_clipping=None,
+        optimizer_dtype="float32",
+    )
+
+
+def test_e2e_sft_train_validate_the_optimizer_moments_persist_across_steps() -> None:
+    """Adam's step counter and both moments carry forward; a rebuilt optimizer would report step 1."""
+    model = _e2e_sft_train_validate_model()
+    trajectory = _e2e_sft_train_validate_trajectory(model)
+    gradients = _e2e_sft_train_validate_gradients(model)
+    trajectory.step(gradients)
+    after_one = trajectory.state_norms()
+    trajectory.step(gradients)
+    after_two = trajectory.state_norms()
+    assert trajectory.steps == 2
+    assert {entry["step"] for entry in after_one.values()} == {1.0}
+    assert {entry["step"] for entry in after_two.values()} == {2.0}
+    assert after_two["weight"]["exp_avg_sq"] > after_one["weight"]["exp_avg_sq"]
+
+
+def test_e2e_sft_train_validate_a_step_reads_the_moments_the_step_before_it_wrote() -> None:
+    """One gradient, two optimizers: the update differs by exactly the history one of them carries.
+
+    An Adam update at zero weight decay depends on the gradient and on the moments, not on the parameter
+    value, so the two deltas below differ for one reason only. A trajectory that rebuilt its optimizer per
+    step, or cleared its state, would produce the fresh delta at every step of a hundred-step run.
+    """
+    carried = _e2e_sft_train_validate_model()
+    trajectory = _e2e_sft_train_validate_trajectory(carried)
+    trajectory.step(_e2e_sft_train_validate_gradients(carried, 0.1))
+    before = carried.weight.detach().clone()
+    trajectory.step(_e2e_sft_train_validate_gradients(carried, 0.5))
+    carried_delta = carried.weight.detach() - before
+    fresh = _e2e_sft_train_validate_model()
+    start = fresh.weight.detach().clone()
+    _e2e_sft_train_validate_trajectory(fresh).step(_e2e_sft_train_validate_gradients(fresh, 0.5))
+    fresh_delta = fresh.weight.detach() - start
+    assert not torch.allclose(carried_delta, fresh_delta, atol=1e-09)
+    assert carried_delta.abs().max().item() < fresh_delta.abs().max().item()
+
+
+def test_e2e_sft_train_validate_the_step_is_written_back_into_the_model() -> None:
+    """The next step's forward reads the model, so a step that only moved the master copy is lost."""
+    model = _e2e_sft_train_validate_model()
+    trajectory = _e2e_sft_train_validate_trajectory(model)
+    before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    trajectory.step(_e2e_sft_train_validate_gradients(model))
+    for name, parameter in model.named_parameters():
+        assert not torch.equal(parameter.detach(), before[name])
+
+
+def test_e2e_sft_train_validate_the_single_step_reference_cannot_be_looped(
+    tmp_path,
+) -> None:
+    """Why the trajectory exists: ``run_adamw_step`` clears its state, so twice is once, twice over."""
+    model = _e2e_sft_train_validate_model()
+    gradients = _e2e_sft_train_validate_gradients(model)
+    updates = []
+    manifests = []
+    for attempt in (1, 2):
+        artifact = run_adamw_step(
+            model,
+            gradients,
+            _e2e_sft_train_validate_ADAMW,
+            learning_rate=0.01,
+            gradient_clipping=None,
+            optimizer_dtype="float32",
+            output_dir=tmp_path / f"attempt-{attempt}",
+        )
+        manifests.append(json.loads(artifact.manifest_path.read_text()))
+        updates.append({entry["name"]: entry["parameter_update_norm"] for entry in manifests[-1]["parameters"]})
+    assert updates[0] == updates[1]
+    assert [manifest["step"] for manifest in manifests] == [1, 1]
+
+
+def test_e2e_sft_train_validate_a_gradient_missing_for_an_owned_parameter_is_refused() -> None:
+    model = _e2e_sft_train_validate_model()
+    trajectory = _e2e_sft_train_validate_trajectory(model)
+    gradients = _e2e_sft_train_validate_gradients(model)
+    trajectory.step(gradients)
+    with pytest.raises(ValueError, match="the trainable set changed mid-run"):
+        trajectory.step({"weight": gradients["weight"]})
+
+
+def test_e2e_sft_train_validate_an_optimizer_that_is_not_adamw_is_refused() -> None:
+    with pytest.raises(ValueError, match="AdamW semantics"):
+        AdamWTrajectory(
+            _e2e_sft_train_validate_model(),
+            {"name": "SGD"},
+            learning_rate=0.01,
+            gradient_clipping=None,
+            optimizer_dtype="float32",
+        )
+
+
+_checkpoint_resume_CONTROL = checkpoint_resume.CHECKPOINT_ITERATION
+
+_checkpoint_resume_FINAL = checkpoint_resume.ITERATIONS
+
+
+class _checkpoint_resume_Gate:
+
+    def tolerance_for(self, test_id: str) -> float:
+        assert test_id == checkpoint_resume.TEST_ID
+        return 0.001
+
+
+def _checkpoint_resume_verdict(reference: dict, target: dict):
+    return checkpoint_resume._verdict(
+        SimpleNamespace(config_id="example", spec=_checkpoint_resume_Gate()),
+        SimpleNamespace(name="gas1"),
+        reference,
+        target,
+    )
+
+
+def test_checkpoint_resume_identical_losses_pass() -> None:
+    result = _checkpoint_resume_verdict(
+        {_checkpoint_resume_CONTROL: 2.5, _checkpoint_resume_FINAL: 1.75},
+        {_checkpoint_resume_CONTROL: 2.5, _checkpoint_resume_FINAL: 1.75},
+    )
+    assert result.outcome is Outcome.PASS
+    assert result.mismatches == []
+    assert result.metrics["max_abs_diff"] == 0.0
+    assert result.metrics["stated_criterion_abs"] == 0.001
+
+
+def test_checkpoint_resume_a_final_loss_inside_the_tolerance_passes() -> None:
+    result = _checkpoint_resume_verdict(
+        {_checkpoint_resume_CONTROL: 2.5, _checkpoint_resume_FINAL: 1.75},
+        {_checkpoint_resume_CONTROL: 2.5, _checkpoint_resume_FINAL: 1.7505},
+    )
+    assert result.outcome is Outcome.PASS
+    assert result.metrics[f"target_loss_iteration_{_checkpoint_resume_FINAL}"] == 1.7505
+
+
+def test_checkpoint_resume_a_final_loss_outside_the_tolerance_fails() -> None:
+    """The resume verdict: ten steps run from restored weights, optimizer moments and scheduler state."""
+    result = _checkpoint_resume_verdict(
+        {_checkpoint_resume_CONTROL: 2.5, _checkpoint_resume_FINAL: 1.75},
+        {_checkpoint_resume_CONTROL: 2.5, _checkpoint_resume_FINAL: 1.753},
+    )
+    assert result.outcome is Outcome.FAIL
+    assert [mismatch.name for mismatch in result.mismatches] == [f"loss at iteration {_checkpoint_resume_FINAL}"]
+    assert result.worst_name == f"loss at iteration {_checkpoint_resume_FINAL}"
+    assert result.metrics[f"reference_loss_iteration_{_checkpoint_resume_FINAL}"] == 1.75
+
+
+def test_checkpoint_resume_a_control_disagreement_is_explained_rather_than_blamed_on_the_resume() -> None:
+    """Before the checkpoint the two runs are one computation, so a difference there does not measure the resume."""
+    result = _checkpoint_resume_verdict(
+        {_checkpoint_resume_CONTROL: 2.5, _checkpoint_resume_FINAL: 1.75},
+        {_checkpoint_resume_CONTROL: 2.6, _checkpoint_resume_FINAL: 1.75},
+    )
+    assert result.outcome is Outcome.FAIL
+    assert [mismatch.name for mismatch in result.mismatches] == [f"loss at iteration {_checkpoint_resume_CONTROL}"]
+    assert str(_checkpoint_resume_CONTROL) in result.reason
+    assert (
+        _checkpoint_resume_verdict(
+            {_checkpoint_resume_CONTROL: 2.5, _checkpoint_resume_FINAL: 1.75},
+            {_checkpoint_resume_CONTROL: 2.5, _checkpoint_resume_FINAL: 1.9},
+        ).reason
+        == ""
+    )
+
+
+def test_checkpoint_resume_a_resumed_arctic_job_loads_the_saved_path_after_creation(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    class Client:
+
+        def load_checkpoint(self, *, path):
+            calls.append(("load", path))
+
+    @contextlib.contextmanager
+    def running_job(session, payload):
+        calls.append(("create", payload["model_name"]))
+        yield SimpleNamespace(client=Client())
+
+    monkeypatch.setattr(ap_driver, "running_job", running_job)
+    transport = ap_driver.GatewayTransport(tmp_path, {"n_gpus": 1}, "/models/reduced", 1234, slots=1)
+    checkpoint = Checkpoint(reference="/checkpoints/global_step10", source_job="/checkpoints/global_step10")
+    with transport.job(resume_from=checkpoint):
+        pass
+    assert calls == [("create", "/models/reduced"), ("load", "/checkpoints/global_step10")]
+
+
+def test_checkpoint_resume_arctic_checkpoint_reference_is_the_saved_path(tmp_path) -> None:
+
+    class Client:
+
+        def save_checkpoint(self):
+            return {"path": "/checkpoints/global_step10", "global_step": 10}
+
+    wrapped = ap_driver.GatewayTrainingJob(ap_driver.GatewaySession(tmp_path, 1), SimpleNamespace(client=Client()))
+    checkpoint = wrapped.save_resumable()
+    assert checkpoint.reference == "/checkpoints/global_step10"
+    assert checkpoint.source_job == "/checkpoints/global_step10"
+
+
+def test_checkpoint_resume_every_iteration_gets_its_own_batch() -> None:
+    """A run that replayed one batch instead of advancing would reach iteration 20 on the wrong data."""
+    batches = checkpoint_resume.iteration_batches(
+        SimpleNamespace(vocab_size=128), SimpleNamespace(name="gas1", global_batch_size=2, max_seq_len=64)
+    )
+    assert len(batches) == _checkpoint_resume_FINAL
+    rows = {tuple(batch.input_ids.flatten().tolist()) for batch in batches}
+    assert len(rows) == _checkpoint_resume_FINAL
+
+
+class _checkpoint_resume_Job:
+    """A job that answers every request with a loss decided by the request's own bytes.
+
+    Two jobs sent the same body therefore report the same loss, so a run whose halves consumed the
+    intended batches agrees at both recorded iterations and one that replayed or skipped a batch does not.
+    """
+
+    def __init__(self, resume_from) -> None:
+        self.resume_from = resume_from
+        self.bodies: list = []
+        self.rates: list = []
+        self.saved = None
+
+    def fwd_bwd_step(self, body: bytes, *, learning_rate: float) -> float:
+        self.bodies.append(body)
+        self.rates.append(learning_rate)
+        batches = body["batch"] if isinstance(body["batch"], list) else [body["batch"]]
+        tokens = torch.cat([batch["input_ids"] for batch in batches]).detach().cpu().numpy().tobytes()
+        return float(zlib.crc32(tokens))
+
+    def save_resumable(self) -> Checkpoint:
+        self.saved = Checkpoint(reference="cp_saved", source_job="job-1")
+        return self.saved
+
+
+class _checkpoint_resume_Transport:
+    """Records every job a check creates, in the order it created them."""
+
+    def __init__(self) -> None:
+        self.jobs: list = []
+
+    def __enter__(self) -> "_checkpoint_resume_Transport":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        return None
+
+    @contextlib.contextmanager
+    def job(self, *, resume_from=None):
+        created = _checkpoint_resume_Job(resume_from)
+        self.jobs.append(created)
+        yield created
+
+
+def _checkpoint_resume_context(transport, tmp_path):
+    return SimpleNamespace(
+        config_id="example",
+        workdir=tmp_path,
+        vocab_size=128,
+        cfg=SimpleNamespace(training={}),
+        spec=_checkpoint_resume_Gate(),
+        arms=[SimpleNamespace(name="gas1", global_batch_size=2, max_seq_len=64, ap_microbatches=1)],
+        transport_for=lambda workdir: transport,
+    )
+
+
+def test_checkpoint_resume_the_resumed_job_continues_the_data_order_at_batch_11(tmp_path) -> None:
+    """Three jobs: twenty iterations uninterrupted, then ten, then iterations 11 to 20 from the checkpoint."""
+    transport = _checkpoint_resume_Transport()
+    ctx = _checkpoint_resume_context(transport, tmp_path)
+    results = checkpoint_resume.run(ctx)
+    bodies = checkpoint_resume._iteration_bodies(ctx, ctx.arms[0])
+    uninterrupted, first_half, resumed = transport.jobs
+
+    def body_tokens(values):
+        return [body["batch"]["input_ids"].tolist() for body in values]
+
+    assert body_tokens(uninterrupted.bodies) == body_tokens(bodies)
+    assert uninterrupted.resume_from is None
+    assert body_tokens(first_half.bodies) == body_tokens(bodies[:_checkpoint_resume_CONTROL])
+    assert body_tokens(resumed.bodies) == body_tokens(bodies[_checkpoint_resume_CONTROL:])
+    assert len(resumed.bodies) == _checkpoint_resume_FINAL - _checkpoint_resume_CONTROL
+    assert resumed.resume_from == first_half.saved
+    assert [result.outcome for result in results] == [Outcome.PASS]
+
+
+def test_checkpoint_resume_every_iteration_steps_at_the_check_s_own_learning_rate(tmp_path) -> None:
+    transport = _checkpoint_resume_Transport()
+    checkpoint_resume.run(_checkpoint_resume_context(transport, tmp_path))
+    rates = {rate for job in transport.jobs for rate in job.rates}
+    assert rates == {checkpoint_resume.LEARNING_RATE}
+
+
+def test_checkpoint_resume_gas4_uses_identical_plain_requests_for_uninterrupted_and_resumed_jobs(tmp_path) -> None:
+    transport = _checkpoint_resume_Transport()
+    ctx = _checkpoint_resume_context(transport, tmp_path)
+    ctx.config_id = "qwen3-8b-h200-train-sft-full-4gpus-64k"
+    ctx.arms = [SimpleNamespace(name="gas4", global_batch_size=8, max_seq_len=64, ap_microbatches=4)]
+    calls = []
+
+    def transport_for(workdir):
+        calls.append(workdir)
+        return transport
+
+    ctx.transport_for = transport_for
+    results = checkpoint_resume.run(ctx)
+    assert calls == [tmp_path / checkpoint_resume.TEST_ID / "gas4"]
+    assert [result.outcome for result in results] == [Outcome.PASS]
+    bodies = checkpoint_resume._iteration_bodies(ctx, ctx.arms[0])
+    expected = checkpoint_resume.iteration_batches(ctx, ctx.arms[0])
+    for body, batch in zip(bodies, expected):
+        assert isinstance(body["batch"], dict)
+        assert body["batch"]["input_ids"].shape == (8, 64)
+        assert torch.equal(body["batch"]["input_ids"], batch.input_ids)
+        assert torch.equal(body["batch"]["labels"], batch.labels)
+        assert body["processing"] == {"loss_fn": "sft"}
+    uninterrupted, first_half, resumed = transport.jobs
+    for full_body, split_body in zip(uninterrupted.bodies, first_half.bodies + resumed.bodies):
+        assert torch.equal(full_body["batch"]["input_ids"], split_body["batch"]["input_ids"])
+    assert resumed.resume_from == first_half.saved
+
+
+def test_checkpoint_resume_gateway_transport_preserves_config_accumulation_for_all_three_jobs(
+    tmp_path, monkeypatch
+) -> None:
+    payloads = []
+
+    @contextlib.contextmanager
+    def running_job(session, payload):
+        payloads.append(payload)
+        yield SimpleNamespace(client=SimpleNamespace(load_checkpoint=lambda **kwargs: None))
+
+    monkeypatch.setattr(ap_driver, "running_job", running_job)
+    transport = ap_driver.GatewayTransport(
+        tmp_path,
+        {
+            "n_gpus": 4,
+            "ds_config": {
+                "train_micro_batch_size_per_gpu": 1,
+                "train_batch_size": 4,
+                "gradient_accumulation_steps": 1,
+            },
+        },
+        "/models/reduced",
+        1234,
+        slots=4,
+    )
+    for checkpoint in (None, None, Checkpoint(reference="/saved/step10", source_job="/saved/step10")):
+        with transport.job(resume_from=checkpoint):
+            pass
+    assert len(payloads) == 3
+    assert all((payload["training_config"]["ds_config"]["gradient_accumulation_steps"] == 1 for payload in payloads))
+    assert all((payload["training_config"]["ds_config"]["train_batch_size"] == 4 for payload in payloads))
+
+
+def test_checkpoint_resume_a_case_that_raises_fails_that_case_alone(tmp_path) -> None:
+
+    class Refusing(_checkpoint_resume_Transport):
+
+        @contextlib.contextmanager
+        def job(self, *, resume_from=None):
+            raise RuntimeError("no capacity")
+            yield
+
+    results = checkpoint_resume.run(_checkpoint_resume_context(Refusing(), tmp_path))
+    assert [result.outcome for result in results] == [Outcome.FAIL]
+    assert results[0].summary == "RuntimeError: no capacity"
+
+
+def test_checkpoint_resume_loss_range_gate_is_twice_the_range_rounded_up() -> None:
+    gate = checkpoint_resume.loss_range_gate(0.1001, "gas1 loss at iteration 10")
+    assert gate.calibration_runs == 3
+    assert gate.multiplier == 2.0
+    assert gate.computed_gate == 0.2002
+    assert gate.absolute == 0.201
+    assert gate.worst_tensor == "gas1 loss at iteration 10"
+
+
+def test_checkpoint_resume_a_zero_loss_range_still_meets_the_minimum_gate() -> None:
+    gate = checkpoint_resume.loss_range_gate(0.0, "gas1 loss at iteration 1")
+    assert gate.absolute == 0.001
+
+
+def test_checkpoint_resume_owned_cancellation_failure_stops_before_next_arm(
+    _local_cortex_shutdown_gateway, monkeypatch, tmp_path
+):
+    from arctic_platform.correctness.checks import checkpoint_resume
+
+    state, _, create = _local_cortex_shutdown_gateway
+    transport, original = create()
+    client = object.__new__(CorrectnessClient)
+    client.transport = transport
+    client.jobs = transport.jobs
+    config_path, _ = _synthetic_config_spec(tmp_path / "inputs")
+    config = load_config(config_path)
+    workload = RuntimeError("checkpoint create failed: rc=0, receipts={}")
+    state.error = aiohttp.ClientConnectionError("owned cancellation failed")
+    admissions = []
+    monkeypatch.setattr(hosted, "ArcticClient", lambda cfg: client)
+
+    def transport_for(workdir):
+        admissions.append(workdir.name)
+        return hosted.HostedTransport(original, config)
+
+    def run_arm(ctx, actual_transport, arm):
+        with actual_transport.job():
+            raise workload
+
+    monkeypatch.setattr(checkpoint_resume, "_run_arm", run_arm)
+    context = SimpleNamespace(
+        config_id=config.config_id,
+        workdir=tmp_path,
+        arms=[SimpleNamespace(name="gas1"), SimpleNamespace(name="gas4")],
+        transport_for=transport_for,
+    )
+    with pytest.raises(local_transport_UnsafeCleanupError) as caught:
+        checkpoint_resume.run(context)
+    assert admissions == ["gas1"]
+    assert caught.value.workload_error is workload and caught.value.shutdown_error is state.error
+    assert "checkpoint create failed" in str(caught.value) and "owned-parent:training:0" in str(caught.value)
+    assert len(state.calls) == 1 and state.closed
+
+
+_inference_checkpoint_loss_ROWS = [
+    gsm8k.Example(
+        question="q0",
+        prompt="Question: q0\nAnswer:",
+        completion=" a0",
+        input_ids=(11, 12, 13, 14, 15, 16),
+        n_prompt=3,
+    ),
+    gsm8k.Example(
+        question="q1",
+        prompt="Question: q1\nAnswer:",
+        completion=" a1",
+        input_ids=(21, 22, 23, 24),
+        n_prompt=2,
+    ),
+]
+
+
+def _inference_checkpoint_loss_positional_logprobs_tensor(rows, width: int) -> torch.Tensor:
+    """What the forward-only route returns if the log-probability at logit position ``s`` were ``s``."""
+    return torch.arange(width, dtype=torch.float32).repeat(len(rows), 1)
+
+
+def _inference_checkpoint_loss_positional_log_prob_results(rows):
+    """What the sampling zone returns for the same model: position 0 absent, entry ``k`` scoring ``k + 1``."""
+    return [
+        {
+            "token_ids": list(row.input_ids[1:]),
+            "logprobs": [float(k) for k in range(row.length - 1)],
+            "seq_len": row.length - 1,
+        }
+        for row in rows
+    ]
+
+
+def test_inference_checkpoint_loss_exported_checkpoint_reuses_the_validated_tokenizer(
+    tmp_path,
+) -> None:
+
+    class Tokenizer:
+
+        def __init__(self):
+            self.saved_to = None
+
+        def save_pretrained(self, path):
+            self.saved_to = path
+
+    tokenizer = Tokenizer()
+    checkpoint = tmp_path / "hf"
+    checkpoint.mkdir()
+    inference_rl_check.materialize_checkpoint_tokenizer(tokenizer, checkpoint)
+    assert tokenizer.saved_to == checkpoint
+
+
+def test_inference_checkpoint_loss_correctness_sampling_disables_cuda_graphs() -> None:
+    from arctic_platform.correctness.harness.gateway import sampling_payload
+
+    payload = sampling_payload("/checkpoint", 42, dtype="bfloat16", n_gpus=1, max_seq_len=4096)
+    extra = payload["inference_config"]["vllm_config"]["extra_engine_kwargs"]
+    assert extra["enforce_eager"] is True
+    assert extra["disable_custom_all_reduce"] is True
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32"])
+def test_inference_checkpoint_loss_sampling_payload_accepts_real_server_schema(dtype):
+    from arctic_platform.inference.server.config import ModelConfig
+
+    payload = sampling_payload("/checkpoint", 42, dtype=dtype, n_gpus=4, max_seq_len=4096)
+    engine_config = ModelConfig(model=payload["model_name"], **payload["inference_config"]["vllm_config"])
+    engine = engine_config.to_engine_kwargs()
+    assert payload["dtype"] == engine["dtype"] == dtype
+    assert engine["disable_custom_all_reduce"] is True
+    assert engine["enforce_eager"] is True
+    assert engine["tensor_parallel_size"] == 4
+    assert engine["max_model_len"] == 4096
+    assert engine["gpu_memory_utilization"] == 0.85
+
+
+def test_inference_checkpoint_loss_forward_request_asks_for_per_token_logprobs() -> None:
+    batch = gsm8k.build_batch("validation", _inference_checkpoint_loss_ROWS, pad_id=0)
+    body = inference_rl_check.pack_logit_aligned(batch)
+    assert body["processing"]["return_logprobs"] is True
+    assert body["meta"]["labels_are_shifted"] is True
+
+
+def test_inference_checkpoint_loss_forward_request_attends_to_prompts_and_masks_only_padding() -> None:
+    batch = gsm8k.build_batch("validation", _inference_checkpoint_loss_ROWS, pad_id=0)
+    attention_mask = inference_rl_check.pack_logit_aligned(batch)["batch"]["attention_mask"]
+    for index, row in enumerate(_inference_checkpoint_loss_ROWS):
+        assert attention_mask[index, : row.length].tolist() == [1] * row.length
+        assert attention_mask[index, row.length :].tolist() == [0] * (attention_mask.shape[1] - row.length)
+
+
+def test_inference_checkpoint_loss_the_reduction_is_the_negative_mean_over_every_answer_token() -> None:
+    value, count = inference_rl_check.cross_entropy([[-1.0, -2.0], [-3.0]])
+    assert count == 3
+    assert value == pytest.approx(2.0)
+
+
+def test_inference_checkpoint_loss_the_reduction_pools_across_rows_rather_than_averaging_row_means() -> None:
+    """A per-row mean would weight a one-token answer as heavily as a hundred-token one."""
+    pooled, _ = inference_rl_check.cross_entropy([[-1.0, -1.0, -1.0, -1.0], [-5.0]])
+    assert pooled == pytest.approx(1.8)
+
+
+def test_inference_checkpoint_loss_the_reduction_refuses_an_empty_batch() -> None:
+    with pytest.raises(ValueError, match="not a measurement"):
+        inference_rl_check.cross_entropy([[], []])
+
+
+def test_inference_checkpoint_loss_the_training_side_reads_the_logits_that_predict_the_answer_tokens() -> None:
+    """Answer tokens of a row of length L beginning at p are predicted by logits p-1 through L-2."""
+    width = max((row.length for row in _inference_checkpoint_loss_ROWS))
+    spans = inference_rl_check.reference_answer_logprobs(
+        _inference_checkpoint_loss_positional_logprobs_tensor(_inference_checkpoint_loss_ROWS, width),
+        _inference_checkpoint_loss_ROWS,
+    )
+    assert spans == [[2.0, 3.0, 4.0], [1.0, 2.0]]
+    assert [len(span) for span in spans] == [row.answer_tokens for row in _inference_checkpoint_loss_ROWS]
+
+
+def test_inference_checkpoint_loss_the_sampling_side_reads_the_same_logit_positions() -> None:
+    """The arrays differ in length by the position vLLM does not report, and the slice is the same."""
+    spans = inference_rl_check.target_answer_logprobs(
+        _inference_checkpoint_loss_positional_log_prob_results(_inference_checkpoint_loss_ROWS),
+        _inference_checkpoint_loss_ROWS,
+    )
+    assert spans == [[2.0, 3.0, 4.0], [1.0, 2.0]]
+
+
+def test_inference_checkpoint_loss_the_two_sides_agree_when_the_model_does() -> None:
+    """The whole point: one set of per-position log-probabilities reduces to one number on both paths."""
+    width = max((row.length for row in _inference_checkpoint_loss_ROWS))
+    reference, _ = inference_rl_check.cross_entropy(
+        inference_rl_check.reference_answer_logprobs(
+            _inference_checkpoint_loss_positional_logprobs_tensor(_inference_checkpoint_loss_ROWS, width),
+            _inference_checkpoint_loss_ROWS,
+        )
+    )
+    target, _ = inference_rl_check.cross_entropy(
+        inference_rl_check.target_answer_logprobs(
+            _inference_checkpoint_loss_positional_log_prob_results(_inference_checkpoint_loss_ROWS),
+            _inference_checkpoint_loss_ROWS,
+        )
+    )
+    assert reference == target
+
+
+def test_inference_checkpoint_loss_a_row_carrying_a_logprob_for_position_zero_is_refused() -> None:
+    """An entry per position, rather than one per position after the first, shifts every answer token."""
+    results = _inference_checkpoint_loss_positional_log_prob_results(_inference_checkpoint_loss_ROWS)
+    results[0]["logprobs"] = [0.0] + results[0]["logprobs"]
+    with pytest.raises(RuntimeError, match="one per position after the first"):
+        inference_rl_check.target_answer_logprobs(results, _inference_checkpoint_loss_ROWS)
+
+
+def test_inference_checkpoint_loss_a_row_scored_against_other_tokens_is_refused() -> None:
+    """What a ranked ``top_k`` or a mismatched tokenizer in the served tree produces."""
+    results = _inference_checkpoint_loss_positional_log_prob_results(_inference_checkpoint_loss_ROWS)
+    results[1]["token_ids"] = [99, 99, 99]
+    with pytest.raises(RuntimeError, match="token stream"):
+        inference_rl_check.target_answer_logprobs(results, _inference_checkpoint_loss_ROWS)
+
+
+def test_inference_checkpoint_loss_unshifted_labels_would_score_the_wrong_span() -> None:
+    """Why the forward-only request is packed with shifted labels.
+
+    ``pack`` sends HuggingFace-convention labels for a ``huggingface`` provider because ``/fwd-bwd``
+    shifts them at dispatch. The forward-only route does not, so those labels would make the route report
+    the log-probability of the token AT each position instead of the one after it -- the span below,
+    shifted by one, which is a different measurement rather than a noisier one.
+    """
+    batch = gsm8k.build_batch("validation", _inference_checkpoint_loss_ROWS, pad_id=0)
+    shifted = batch.shifted_labels()
+    row, example = (0, _inference_checkpoint_loss_ROWS[0])
+    span = slice(example.n_prompt - 1, example.length - 1)
+    assert shifted[row, span].tolist() == list(example.input_ids[example.n_prompt :])
+    assert batch.labels[row, span].tolist() != list(example.input_ids[example.n_prompt :])
+
+
+def test_inference_checkpoint_loss_the_steps_consume_the_training_slice_once_each() -> None:
+    rows_per_step = 2
+    examples = [
+        gsm8k.Example(
+            question=f"q{index}",
+            prompt="p",
+            completion=" a",
+            input_ids=(index + 1, index + 2, index + 3),
+            n_prompt=1,
+        )
+        for index in range(inference_rl_check.TRAIN_STEPS * rows_per_step)
+    ]
+    batches = inference_rl_check.training_batches(examples, rows_per_step, pad_id=0)
+    assert len(batches) == inference_rl_check.TRAIN_STEPS
+    assert all((batch.rows == rows_per_step for batch in batches))
+    seen = [tuple(row) for batch in batches for row in batch.input_ids.tolist()]
+    assert len(set(seen)) == len(examples)
+
+
+@pytest.mark.parametrize(
+    "composite,ngram,kernel,expected",
+    [(True, 3, 4, 144), (False, 2, 7, 192), (True, 5, 1, 64)],
+)
+@pytest.mark.parametrize(
+    "config_id",
+    [inference_rl_check._FLASHNEXT_CONFIG_ID, "qwen3.8-flash-next-h200-train-rl-32gpus-sp16-256k"],
+)
+@pytest.mark.parametrize("layers", [4, 48])
+def test_inference_ple_padding_floor_uses_effective_offline_config(
+    monkeypatch, composite, ngram, kernel, expected, config_id, layers
+):
+    text = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        num_hidden_layers=layers,
+        ngram_size=ngram,
+        ple_conv_kernel_size=kernel,
+    )
+    source = SimpleNamespace(model_type="qwen4_exp", text_config=text) if composite else text
+    cfg = SimpleNamespace(
+        config_id=config_id,
+        sp_size=16,
+        training={"model_provider": "prime_rl"},
+    )
+    calls = []
+
+    def offline(path, **kwargs):
+        calls.append((path, kwargs))
+        return source
+
+    monkeypatch.setattr(AutoConfig, "from_pretrained", offline)
+    assert (
+        inference_rl_check._minimum_context_parallel_row_tokens(SimpleNamespace(cfg=cfg), "/actual/local/model")
+        == expected
+    )
+    assert calls == [("/actual/local/model", {"local_files_only": True})]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("ngram_size", True),
+        ("ngram_size", 0),
+        ("ngram_size", None),
+        ("ple_conv_kernel_size", -1),
+        ("ple_conv_kernel_size", 4.0),
+        ("num_hidden_layers", 0),
+        ("num_hidden_layers", -1),
+        ("num_hidden_layers", True),
+        ("num_hidden_layers", 4.0),
+        ("num_hidden_layers", None),
+        ("model_type", "qwen3"),
+    ],
+)
+def test_inference_ple_padding_refuses_missing_or_invalid_config(monkeypatch, field, value):
+    text = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        num_hidden_layers=48,
+        ngram_size=3,
+        ple_conv_kernel_size=4,
+    )
+    setattr(text, field, value)
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda *args, **kwargs: text)
+    cfg = SimpleNamespace(
+        config_id=inference_rl_check._FLASHNEXT_CONFIG_ID,
+        sp_size=16,
+        training={"model_provider": "prime_rl"},
+    )
+    with pytest.raises(ValueError, match="context-parallel Flash-Next requires"):
+        inference_rl_check._minimum_context_parallel_row_tokens(SimpleNamespace(cfg=cfg), "/actual/local/model")
+
+
+@pytest.mark.parametrize(
+    "config_id,provider,sp",
+    [
+        ("other", "prime_rl", 16),
+        (inference_rl_check._FLASHNEXT_CONFIG_ID, "huggingface", 16),
+        (inference_rl_check._FLASHNEXT_CONFIG_ID, "prime_rl", 1),
+    ],
+)
+def test_inference_ple_padding_leaves_unaffected_routes_without_config_reads(monkeypatch, config_id, provider, sp):
+    monkeypatch.setattr(
+        AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: pytest.fail("unaffected route config read"),
+    )
+    cfg = SimpleNamespace(config_id=config_id, sp_size=sp, training={"model_provider": provider})
+    assert inference_rl_check._minimum_context_parallel_row_tokens(SimpleNamespace(cfg=cfg), "unused") == 0
+    sentinel = object()
+    assert inference_rl_check._extend_short_causal_rows(sentinel, 0, 0) is sentinel
+
+
+@pytest.mark.parametrize("long_row", [False, True])
+@pytest.mark.parametrize("shifted", [False, True])
+def test_inference_ple_padding_survives_real_pack_and_all_sequence_shards(long_row, shifted):
+    from arctic_platform.common.packing.pack import IGNORE_INDEX
+    from arctic_platform.common.packing.pack import pack_microbatch
+    from arctic_platform.common.packing.pack import pad_packed_microbatch
+    from arctic_platform.common.packing.windows import cu_seqlens_from_position_ids
+    from arctic_platform.common.packing.windows import token_shard
+
+    rows = list(_inference_checkpoint_loss_ROWS)
+    if long_row:
+        rows[0] = replace(rows[0], input_ids=tuple(range(1, 182)))
+    batch = gsm8k.build_batch("validation", rows, pad_id=0)
+    original = copy.deepcopy(batch)
+    padded = inference_rl_check._extend_short_causal_rows(batch, 144, pad_id=0)
+    assert padded.name == batch.name and padded.rows == batch.rows
+    assert padded.active_tokens == batch.active_tokens
+    for field in ("input_ids", "position_ids", "labels"):
+        assert torch.equal(getattr(batch, field), getattr(original, field))
+    for index, row in enumerate(rows):
+        for field in ("input_ids", "position_ids", "labels"):
+            assert torch.equal(
+                getattr(padded, field)[index, : row.length],
+                getattr(batch, field)[index, : row.length],
+            )
+        assert padded.labels[index, row.length :].eq(IGNORE_INDEX).all()
+        assert padded.input_ids[index, row.length :].eq(0).all()
+        assert padded.position_ids[index, : max(row.length, 144)].tolist() == list(range(max(row.length, 144)))
+
+    body = (
+        inference_rl_check.pack_logit_aligned(padded)
+        if shifted
+        else inference_rl_check.pack(padded, model_provider="huggingface")
+    )
+    original_body = (
+        inference_rl_check.pack_logit_aligned(batch)
+        if shifted
+        else inference_rl_check.pack(batch, model_provider="huggingface")
+    )
+    # A token-budget group may contain just the shortest row, even in a wider ragged batch.
+    for indices in ([0], [1], [0, 1]):
+        group = {key: value[indices] for key, value in body["batch"].items()}
+        packed, metadata = pack_microbatch(group)
+        assert metadata.valid_lengths.tolist() == [max(rows[index].length, 144) for index in indices]
+        expected_labels = original_body["batch"]["labels"][indices]
+        assert torch.equal(
+            packed["labels"][packed["labels"] != IGNORE_INDEX],
+            expected_labels[expected_labels != IGNORE_INDEX],
+        )
+        assert cu_seqlens_from_position_ids(packed["position_ids"]).tolist() == metadata.cu_seqlens.tolist()
+        packed, metadata = pad_packed_microbatch(packed, metadata, 16)
+        shards = [token_shard(packed, metadata, 16, rank) for rank in range(16)]
+        assert all(shard["input_ids"].shape[1] >= 9 for shard in shards)
+        for field in ("input_ids", "position_ids", "labels"):
+            assert torch.equal(torch.cat([shard[field] for shard in shards], dim=1), packed[field])
+
+
+def test_inference_ple_padding_already_long_rows_are_identity_noop():
+    rows = [replace(row, input_ids=tuple(range(1, 162))) for row in _inference_checkpoint_loss_ROWS]
+    batch = gsm8k.build_batch("train", rows, pad_id=0)
+    assert inference_rl_check._extend_short_causal_rows(batch, 144, 0) is batch
+
+
+@pytest.mark.parametrize("token_budget", [128, 256])
+def test_inference_ple_padding_real_run_packs_training_and_validation_without_reselecting(
+    tmp_path, monkeypatch, token_budget
+):
+    train = [replace(_inference_checkpoint_loss_ROWS[0], question=f"train{index}") for index in range(10)]
+    validation = [_inference_checkpoint_loss_ROWS[1]]
+    cfg = SimpleNamespace(
+        config_id=inference_rl_check._FLASHNEXT_CONFIG_ID,
+        model_name="/actual/local/model",
+        n_gpus=16,
+        sp_size=16,
+        dp_size=1,
+        max_tokens_per_mb=token_budget,
+        sub_job={},
+        training={
+            "model_provider": "prime_rl",
+            "train_batch_size": 1,
+            "optimizer": {"lr": 2e-5},
+        },
+    )
+    ctx = SimpleNamespace(cfg=cfg, workdir=tmp_path, attn_implementation="qsa_flex")
+    monkeypatch.setattr(
+        inference_rl_check.gsm8k,
+        "load_tokenizer",
+        lambda path: SimpleNamespace(pad_token_id=0, eos_token_id=0),
+    )
+    monkeypatch.setattr(
+        inference_rl_check.gsm8k,
+        "read_rows",
+        lambda split, **kwargs: train if split == inference_rl_check.TRAIN_SPLIT else validation,
+    )
+    monkeypatch.setattr(inference_rl_check.gsm8k, "tokenize_examples", lambda tokenizer, rows: rows)
+    monkeypatch.setattr(inference_rl_check.gsm8k, "select_by_token_budget", lambda *args: (validation, 4))
+    monkeypatch.setattr(
+        AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(
+            model_type="qwen4_exp_text",
+            num_hidden_layers=48,
+            ngram_size=3,
+            ple_conv_kernel_size=4,
+        ),
+    )
+    monkeypatch.setattr(inference_rl_check, "build_payload", lambda *args, **kwargs: {})
+    real_pack, real_validation_pack = inference_rl_check.pack, inference_rl_check.pack_logit_aligned
+    packed = []
+
+    def training_body(batch, **kwargs):
+        packed.append(batch)
+        return real_pack(batch, **kwargs)
+
+    def validation_body(batch):
+        packed.append(batch)
+        return real_validation_pack(batch)
+
+    monkeypatch.setattr(inference_rl_check, "pack", training_body)
+    monkeypatch.setattr(inference_rl_check, "pack_logit_aligned", validation_body)
+
+    def no_gateway(*args, **kwargs):
+        raise RuntimeError("stop before network")
+
+    monkeypatch.setattr(inference_rl_check, "gateway", no_gateway)
+    if token_budget == 128:
+        with pytest.raises(ValueError, match="unchanged token budget; rows cannot be dropped"):
+            inference_rl_check._run(ctx)
+        assert packed == []
+    else:
+        with pytest.raises(RuntimeError, match="stop before network"):
+            inference_rl_check._run(ctx)
+        assert len(packed) == inference_rl_check.TRAIN_STEPS + 1
+        for batch, row in zip(packed, validation + train):
+            assert batch.rows == 1 and batch.seq_len == 144
+            assert batch.input_ids[0, : row.length].tolist() == list(row.input_ids)
+            assert batch.active_tokens == row.answer_tokens
+
+
+def test_inference_checkpoint_loss_agreement_inside_the_gate_passes_and_outside_it_fails() -> None:
+    context = SimpleNamespace(config_id="example", cfg=SimpleNamespace(gpu_type="h200"))
+    inside = inference_rl_check.verdict(context, 1.75, 1.7505)
+    outside = inference_rl_check.verdict(context, 1.75, 1.753)
+    assert inside.outcome is Outcome.PASS
+    assert inside.mismatches == []
+    assert inside.metrics["stated_criterion_abs"] == 0.001
+    assert outside.outcome is Outcome.FAIL
+    assert [mismatch.name for mismatch in outside.mismatches] == [inference_rl_check.QUANTITY]
+    assert outside.metrics["reference_cross_entropy"] == 1.75
+    assert outside.metrics["target_cross_entropy"] == 1.753
+    assert outside.metrics["max_abs_diff"] == pytest.approx(0.003)
+
+
+def test_inference_checkpoint_loss_b200_uses_three_milliabsolute_gate() -> None:
+    context = SimpleNamespace(config_id="b200-example", cfg=SimpleNamespace(gpu_type="b200"))
+    result = inference_rl_check.verdict(context, 4.299332, 4.297708)
+    assert result.outcome is Outcome.PASS
+    assert result.metrics["stated_criterion_abs"] == 0.003
+    assert result.metrics["max_abs_diff"] == pytest.approx(0.001624)
+
+
+def _inference_checkpoint_loss_generate_results():
+    return [
+        {
+            "prompt_len": row.length,
+            "prompt_logprobs": [
+                None,
+                *[
+                    {999: {"logprob": -99.0}, str(token): {"logprob": -float(position)}}
+                    for position, token in enumerate(row.input_ids[1:])
+                ],
+            ],
+            "token_ids": [999],
+        }
+        for row in _inference_checkpoint_loss_ROWS
+    ]
+
+
+def test_inference_checkpoint_loss_cortex_selects_expected_prompt_tokens_not_first_dictionary_entries():
+    results = _inference_checkpoint_loss_generate_results()
+    results[0]["prompt_logprobs"][1] = {
+        999: {"logprob": -99.0},
+        _inference_checkpoint_loss_ROWS[0].input_ids[1]: -0.0,
+    }
+    normalized = inference_rl_check.cortex_prompt_logprobs(results, _inference_checkpoint_loss_ROWS)
+    assert [row["token_ids"] for row in normalized] == [
+        list(row.input_ids[1:]) for row in _inference_checkpoint_loss_ROWS
+    ]
+    assert inference_rl_check.target_answer_logprobs(normalized, _inference_checkpoint_loss_ROWS) == [
+        [-2.0, -3.0, -4.0],
+        [-1.0, -2.0],
+    ]
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        None,
+        {},
+        [],
+        _inference_checkpoint_loss_generate_results()[:1],
+        _inference_checkpoint_loss_generate_results() + [{}],
+    ],
+)
+def test_inference_checkpoint_loss_cortex_rejects_wrong_generate_row_counts(results):
+    with pytest.raises(RuntimeError, match="one row per validation example"):
+        inference_rl_check.cortex_prompt_logprobs(results, _inference_checkpoint_loss_ROWS)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "non_dict_row",
+        "missing_positions",
+        "short_positions",
+        "long_positions",
+        "initial_dict",
+        "interior_none",
+        "empty_position",
+        "missing_token",
+        "duplicate_token",
+        "wrong_prompt_length",
+        "missing_logprob",
+        "nan",
+        "inf",
+        "bool",
+        "text",
+    ],
+)
+def test_inference_checkpoint_loss_cortex_rejects_malformed_prompt_logprobs(change):
+    results = _inference_checkpoint_loss_generate_results()
+    row = results[0]
+    token = _inference_checkpoint_loss_ROWS[0].input_ids[1]
+    if change == "non_dict_row":
+        results[0] = None
+    elif change == "missing_positions":
+        del row["prompt_logprobs"]
+    elif change == "short_positions":
+        row["prompt_logprobs"].pop()
+    elif change == "long_positions":
+        row["prompt_logprobs"].append({token: -1.0})
+    elif change == "initial_dict":
+        row["prompt_logprobs"][0] = {}
+    elif change == "wrong_prompt_length":
+        row["prompt_len"] += 1
+    else:
+        values = {
+            "interior_none": None,
+            "empty_position": {},
+            "missing_token": {999: {"logprob": -1.0}},
+            "duplicate_token": {token: -1.0, str(token): -1.0},
+            "missing_logprob": {token: {"rank": 1}},
+            "nan": {token: {"logprob": float("nan")}},
+            "inf": {token: {"logprob": float("-inf")}},
+            "bool": {token: {"logprob": True}},
+            "text": {token: {"logprob": "-1.0"}},
+        }
+        row["prompt_logprobs"][1] = values[change]
+    with pytest.raises(RuntimeError):
+        inference_rl_check.cortex_prompt_logprobs(results, _inference_checkpoint_loss_ROWS)
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        0,
+        -1,
+        _inference_checkpoint_loss_ROWS[0].length,
+        _inference_checkpoint_loss_ROWS[0].length + 1,
+    ],
+)
+def test_inference_checkpoint_loss_cortex_rejects_invalid_answer_boundaries(boundary):
+    examples = [
+        replace(_inference_checkpoint_loss_ROWS[0], n_prompt=boundary),
+        _inference_checkpoint_loss_ROWS[1],
+    ]
+    with pytest.raises(RuntimeError, match="answer span"):
+        inference_rl_check.cortex_prompt_logprobs(_inference_checkpoint_loss_generate_results(), examples)
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        [],
+        _inference_checkpoint_loss_positional_log_prob_results(_inference_checkpoint_loss_ROWS)[:1],
+        _inference_checkpoint_loss_positional_log_prob_results(_inference_checkpoint_loss_ROWS) + [{}],
+    ],
+)
+def test_inference_checkpoint_loss_target_extraction_does_not_silently_truncate_rows(
+    results,
+):
+    with pytest.raises(RuntimeError, match="validation examples"):
+        inference_rl_check.target_answer_logprobs(results, _inference_checkpoint_loss_ROWS)
+
+
+@pytest.mark.parametrize("shape", [(1, 6), (3, 6), (2, 6, 1)])
+def test_inference_checkpoint_loss_reference_extraction_requires_exact_rows_and_rank(
+    shape,
+):
+    with pytest.raises(RuntimeError, match="two-dimensional row"):
+        inference_rl_check.reference_answer_logprobs(torch.zeros(shape), _inference_checkpoint_loss_ROWS)
+
+
+def test_inference_checkpoint_loss_nonfinite_answer_scores_fail_instead_of_passing_the_gate():
+    values = _inference_checkpoint_loss_positional_logprobs_tensor(_inference_checkpoint_loss_ROWS, 6)
+    values[0, _inference_checkpoint_loss_ROWS[0].n_prompt] = float("nan")
+    with pytest.raises(RuntimeError, match="finite"):
+        inference_rl_check.reference_answer_logprobs(values, _inference_checkpoint_loss_ROWS)
+    results = _inference_checkpoint_loss_positional_log_prob_results(_inference_checkpoint_loss_ROWS)
+    results[0]["logprobs"][0] = float("nan")
+    with pytest.raises(RuntimeError, match="finite"):
+        inference_rl_check.target_answer_logprobs(results, _inference_checkpoint_loss_ROWS)
+
+
+@pytest.mark.parametrize("model_name", [None, "", "   ", "/node/local/model"])
+def test_inference_checkpoint_loss_cortex_requires_full_configured_model_before_loading_tokenizer(
+    model_name, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        inference_rl_check.gsm8k,
+        "load_tokenizer",
+        lambda *args: pytest.fail("must reject before tokenizer load"),
+    )
+    ctx = SimpleNamespace(
+        client_backend=CortexConfig(base_url="http://unused"),
+        cfg=SimpleNamespace(model_name=model_name),
+        target_model_name="published-reduced-fixture",
+        spec=SimpleNamespace(model=SimpleNamespace(cache_path="/local/reference")),
+    )
+    with pytest.raises(ValueError, match="full configured model"):
+        inference_rl_check._run(ctx)
+
+
+def _inference_export_locality_node(host="127.0.0.1", slots=8):
+    return {
+        "host": host,
+        "slots": slots,
+        "hostname": socket.gethostname(),
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "python": sys.executable,
+        "python_sha256": hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest(),
+    }
+
+
+@pytest.fixture
+def _inference_export_locality_admission(monkeypatch, tmp_path):
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("127.0.0.1 slots=8\n")
+    monkeypatch.setattr(export, "_LOCAL_HOSTFILE", hostfile)
+    return {
+        "allocation_id": "test-allocation",
+        "hostfile_content": hostfile.read_text(),
+        "hostfile_sha256": hashlib.sha256(hostfile.read_bytes()).hexdigest(),
+        "nodes": [_inference_export_locality_node()],
+    }
+
+
+@pytest.fixture
+def _inference_export_prescribed_hostfile(_inference_export_locality_admission, monkeypatch, tmp_path):
+    hostfile = export._LOCAL_HOSTFILE
+    target = tmp_path / "data-fast-hostfile"
+    hostfile.rename(target)
+    hostfile.symlink_to(target)
+    monkeypatch.setattr(export, "_LOCAL_HOSTFILE_TARGET", target)
+    return _inference_export_locality_admission
+
+
+_inference_sampling_topology_MODEL_EXPERTS = {
+    "Qwen/Qwen3-8B": {},
+    "Qwen/Qwen3.8-Flash-Next": {"num_experts": 512},
+    "zai-org/GLM-5.3-Flash": {"n_routed_experts": 288},
+    "zai-org/GLM-5.3-Flash-BF16": {"n_routed_experts": 288},
+}
+
+
+@pytest.fixture(autouse=False)
+def _inference_sampling_model_configs(monkeypatch):
+    read = inference_rl_check._model_config
+
+    def model_config(source):
+        if source in _inference_sampling_topology_MODEL_EXPERTS:
+            return {"text_config": dict(_inference_sampling_topology_MODEL_EXPERTS[source])}
+        return read(source)
+
+    monkeypatch.setattr(inference_rl_check, "_model_config", model_config)
+
+
+_local_cortex_inference_FULL_CONFIG = {
+    "model_type": "qwen3",
+    "architectures": ["Qwen3ForCausalLM"],
+    "num_hidden_layers": 36,
+    "hidden_size": 4096,
+    "intermediate_size": 12288,
+    "vocab_size": 151936,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "tie_word_embeddings": False,
+}
+
+_local_cortex_inference_ROWS = [
+    gsm8k.Example(
+        question="validation0",
+        prompt="p",
+        completion=" a",
+        input_ids=(1, 2, 3),
+        n_prompt=1,
+    ),
+    gsm8k.Example(
+        question="validation1",
+        prompt="p",
+        completion=" b",
+        input_ids=(1, 4, 5),
+        n_prompt=1,
+    ),
+]
+
+
+class _local_cortex_inference_Tokenizer:
+    special_tokens_map = {"eos_token": "eos"}
+
+    def get_vocab(self):
+        return {"p": 1, "a": 2, "b": 4, "eos": 5}
+
+    def save_pretrained(self, path):
+        (path / "tokenizer.json").write_text(json.dumps({"model": {"vocab": self.get_vocab()}}))
+        (path / "tokenizer_config.json").write_text(json.dumps(self.special_tokens_map))
+
+
+@pytest.fixture
+def _local_cortex_inference_export_factory(tmp_path, monkeypatch):
+    source = tmp_path / "source-index.json"
+    index = {
+        "metadata": {"total_size": 4},
+        "weight_map": {"model.weight": "model.safetensors"},
+    }
+    source.write_text(json.dumps(index))
+    monkeypatch.setattr(
+        AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(**_local_cortex_inference_FULL_CONFIG),
+    )
+    monkeypatch.setattr(hub, "cached_file", lambda *args, **kwargs: str(source))
+    monkeypatch.setattr(inference_rl_check.gsm8k, "load_tokenizer", lambda *args: _local_cortex_inference_Tokenizer())
+
+    def create(path):
+        path.mkdir(parents=True)
+        (path / "config.json").write_text(json.dumps(_local_cortex_inference_FULL_CONFIG))
+        (path / "model.safetensors.index.json").write_text(json.dumps(index))
+        save_file(
+            {"model.weight": torch.ones(2, dtype=torch.bfloat16)},
+            str(path / "model.safetensors"),
+        )
+        return path
+
+    return create
+
+
+def _local_cortex_inference_context(tmp_path, backend=None):
+    config_path, _ = _synthetic_config_spec(tmp_path / "inputs")
+    cfg = load_config(config_path)
+    return SimpleNamespace(
+        cfg=cfg,
+        config_id=cfg.config_id,
+        client_backend=backend or CortexConfig(base_url="http://127.0.0.1:8003"),
+        attn_implementation="sdpa",
+        workdir=tmp_path,
+        target_model_name="must-not-use-reduced",
+        spec=SimpleNamespace(model=SimpleNamespace(cache_path="/unavailable-reduced")),
+    )
+
+
+def test_local_cortex_inference_local_sampling_uses_exact_export_same_backend_one_gpu_no_source(
+    tmp_path,
+    _local_cortex_inference_export_factory,
+    _inference_export_prescribed_hostfile,
+):
+    ctx = _local_cortex_inference_context(tmp_path)
+    weights = _local_cortex_inference_export_factory(tmp_path / "global_step10")
+    ctx.inference_export_allocation = _inference_export_prescribed_hostfile
+    _local_cortex_inference_Tokenizer().save_pretrained(weights)
+    ctx._inference_export_locality = export.distribute_local_inference_export(
+        weights, ctx.inference_export_allocation, timeout_s=30
+    )
+    config = inference_rl_check.local_cortex_sampling_config(ctx, ctx.client_backend, weights, 10240)
+    payload = config.to_cortex()[0]
+    assert config.backend == ctx.client_backend
+    assert config.hardware == "H200"
+    assert payload["model_name"] == str(weights)
+    assert payload["inference_config"]["n_gpus"] == 1
+    assert config.source_checkpoint_info is None
+    assert "source_checkpoint_info" not in payload
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        CortexConfig(base_url="https://remote"),
+        CortexConfig(base_url="http://127.0.0.1:8003", pat="test-not-a-credential"),
+        CortexConfig(base_url="http://127.0.0.1:8003/invalid"),
+    ],
+)
+def test_local_cortex_inference_local_sampling_refuses_nonlocal_or_authenticated_backend(tmp_path, backend):
+    with pytest.raises(ValueError, match="local Cortex"):
+        inference_rl_check.local_cortex_sampling_config(
+            _local_cortex_inference_context(tmp_path, backend), backend, tmp_path, 10240
+        )
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "reduced_config",
+        "missing_config",
+        "remote_code",
+        "missing_index",
+        "missing_tensor",
+        "unsafe_shard",
+        "missing_shard",
+        "extra_shard",
+        "symlink_shard",
+        "wrong_dtype",
+        "wrong_byte_count",
+        "invalid_metadata",
+        "truncated_weights",
+    ],
+)
+def test_local_cortex_inference_local_export_rejects_incomplete_or_mismatched_weights(
+    tmp_path, _local_cortex_inference_export_factory, broken
+):
+    weights = _local_cortex_inference_export_factory(tmp_path / "weights")
+    if broken in {"reduced_config", "remote_code"}:
+        config = dict(_local_cortex_inference_FULL_CONFIG)
+        config.update({"num_hidden_layers": 4} if broken == "reduced_config" else {"auto_map": {"x": "y"}})
+        (weights / "config.json").write_text(json.dumps(config))
+    elif broken == "missing_config":
+        (weights / "config.json").rename(weights / "missing-config")
+    elif broken == "missing_index":
+        (weights / "model.safetensors.index.json").rename(weights / "missing-index")
+    elif broken in {"missing_tensor", "unsafe_shard", "wrong_byte_count"}:
+        index = json.loads((weights / "model.safetensors.index.json").read_text())
+        if broken == "missing_tensor":
+            index["weight_map"] = {"different": "model.safetensors"}
+        elif broken == "unsafe_shard":
+            index["weight_map"]["model.weight"] = "../model.safetensors"
+        else:
+            index["metadata"]["total_size"] = 999
+        (weights / "model.safetensors.index.json").write_text(json.dumps(index))
+    elif broken == "missing_shard":
+        (weights / "model.safetensors").rename(weights / "missing-shard")
+    elif broken == "extra_shard":
+        save_file({"x": torch.zeros(1)}, str(weights / "extra.safetensors"))
+    elif broken == "symlink_shard":
+        (weights / "model.safetensors").rename(tmp_path / "outside.safetensors")
+        (weights / "model.safetensors").symlink_to(tmp_path / "outside.safetensors")
+    elif broken == "wrong_dtype":
+        save_file({"model.weight": torch.ones(2)}, str(weights / "model.safetensors"))
+    elif broken == "invalid_metadata":
+        (weights / "config.json").write_text("[]")
+    elif broken == "truncated_weights":
+        (weights / "model.safetensors").write_bytes(b"bad")
+    with pytest.raises(Exception):
+        inference_rl_check.validate_local_inference_export(_local_cortex_inference_context(tmp_path), weights)
+
+
+@pytest.mark.parametrize("broken", ["path", "tag", "version", "wrong_step", "tokenizer"])
+def test_local_cortex_inference_save_receipt_and_tokenizer_fail_closed(
+    tmp_path, _local_cortex_inference_export_factory, monkeypatch, broken
+):
+    ctx = _local_cortex_inference_context(tmp_path)
+    root = tmp_path / "save"
+    root.mkdir()
+    _local_cortex_inference_export_factory(root / "global_step10")
+    monkeypatch.setattr(inference_rl_check, "correctness_workdir", lambda prefix: root)
+    result = {
+        "checkpoint_path": str(root),
+        "checkpoint_tag": "global_step10",
+        "version": 10,
+    }
+    if broken == "path":
+        result["checkpoint_path"] = str(tmp_path)
+    elif broken == "tag":
+        result["checkpoint_tag"] = "cp_unsupported"
+    elif broken == "version":
+        result["version"] = 9
+    elif broken == "wrong_step":
+        result.update(checkpoint_tag="global_step9", version=9)
+    elif broken == "tokenizer":
+
+        class WrongTokenizer(_local_cortex_inference_Tokenizer):
+
+            def get_vocab(self):
+                return {"wrong": 999}
+
+        monkeypatch.setattr(inference_rl_check.gsm8k, "load_tokenizer", lambda path: WrongTokenizer())
+    client = SimpleNamespace(save_checkpoint=lambda **kwargs: result)
+    with pytest.raises(RuntimeError):
+        inference_rl_check.save_local_inference_checkpoint(
+            ctx, ctx.client_backend, client, _local_cortex_inference_Tokenizer()
+        )
+    assert root.exists()
+    assert (root / "global_step10/model.safetensors").exists()
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_local_cortex_inference_local_execution_preserves_recipe_and_closes_owned_clients(
+    tmp_path,
+    _local_cortex_inference_export_factory,
+    _inference_export_prescribed_hostfile,
+    monkeypatch,
+    malformed,
+):
+    ctx = _local_cortex_inference_context(tmp_path)
+    ctx.inference_export_allocation = _inference_export_prescribed_hostfile
+    events = []
+    saved = []
+
+    def save(**kwargs):
+        saved.append(kwargs)
+        root = inference_rl_check.Path(kwargs["path"])
+        _local_cortex_inference_export_factory(root / "global_step10")
+        return {
+            "checkpoint_path": str(root),
+            "checkpoint_tag": "global_step10",
+            "version": 10,
+        }
+
+    @contextmanager
+    def gateway(directory, slots, **kwargs):
+        assert kwargs["backend"] is ctx.client_backend
+        assert slots == 5
+        events.append("gateway-enter")
+        try:
+            yield "session"
+        finally:
+            events.append("gateway-exit")
+
+    @contextmanager
+    def training(session, payload):
+        assert payload["model_name"] == "Qwen/Qwen3-8B"
+        events.append("training-enter")
+        try:
+            yield SimpleNamespace(client=SimpleNamespace(save_checkpoint=save))
+        finally:
+            events.append("training-exit")
+
+    @contextmanager
+    def sampling(config):
+        assert events[-1] == "training-exit"
+        assert config.source_checkpoint_info is None
+        assert config.to_cortex()[0]["model_name"].endswith("/global_step10")
+        events.append("sampling-enter")
+        results = [
+            {
+                "prompt_len": row.length,
+                "prompt_logprobs": [
+                    None,
+                    *[{str(token): {"logprob": -1.0}} for token in row.input_ids[1:]],
+                ],
+            }
+            for row in _local_cortex_inference_ROWS
+        ]
+        if malformed:
+            results[0]["prompt_logprobs"][1] = {999: -1.0}
+        try:
+            yield SimpleNamespace(generate=lambda *args, **kwargs: results)
+        finally:
+            events.append("sampling-exit")
+
+    def read_rows(path, count=None):
+        return (
+            [
+                gsm8k.Example(
+                    question=f"train{i}",
+                    prompt="p",
+                    completion=" a",
+                    input_ids=(1, 2, 3),
+                    n_prompt=1,
+                )
+                for i in range(count)
+            ]
+            if count is not None
+            else _local_cortex_inference_ROWS
+        )
+
+    learning_rates = []
+    monkeypatch.setattr(inference_rl_check, "gateway", gateway)
+    monkeypatch.setattr(inference_rl_check, "running_job", training)
+    monkeypatch.setattr(inference_rl_check, "CorrectnessClient", sampling)
+    monkeypatch.setattr(inference_rl_check.gsm8k, "read_rows", read_rows)
+    monkeypatch.setattr(inference_rl_check.gsm8k, "tokenize_examples", lambda tokenizer, rows: rows)
+    monkeypatch.setattr(inference_rl_check.gsm8k, "padding_token_id", lambda tokenizer: 0)
+    monkeypatch.setattr(
+        inference_rl_check.gsm8k,
+        "select_by_token_budget",
+        lambda *args: (_local_cortex_inference_ROWS, 3),
+    )
+    monkeypatch.setattr(
+        inference_rl_check,
+        "fwd_bwd_step",
+        lambda *args, **kwargs: learning_rates.append(kwargs["learning_rate"]) or SimpleNamespace(avg_loss=2.0),
+    )
+    monkeypatch.setattr(inference_rl_check, "forward_logprobs", lambda *args: torch.full((2, 3), -1.0))
+    monkeypatch.setattr(
+        inference_rl_check,
+        "save_and_resolve_checkpoint_id",
+        lambda *args: pytest.fail("no hosted catalog"),
+    )
+    monkeypatch.setattr(
+        inference_rl_check,
+        "_onprem_sampling_and_reload",
+        lambda *args: pytest.fail("no reload diagnostic"),
+    )
+    result = inference_rl_check.run(ctx)[0]
+    assert result.outcome is (TestOutcome.FAIL if malformed else TestOutcome.PASS)
+    assert learning_rates == [inference_rl_check.configured_learning_rate(ctx.cfg)] * 10
+    assert len(saved) == 1
+    assert saved[0]["checkpoint_type"] == "weights-only"
+    assert saved[0]["export_hf"] is False
+    assert saved[0]["path"].startswith("/data-fast/")
+    assert events == [
+        "gateway-enter",
+        "training-enter",
+        "training-exit",
+        "sampling-enter",
+        "sampling-exit",
+        "gateway-exit",
+    ]
+    if not malformed:
+        assert result.metrics["train_steps"] == 10
+        assert result.metrics["stated_criterion_abs"] == 0.001
+        assert result.metrics["learning_rate"] == inference_rl_check.configured_learning_rate(ctx.cfg)
+
+
+@pytest.fixture
+def _standalone_checkpoint_catalog(_operator_api_catalog):
+    for spec_path in (_operator_api_catalog / "specs").glob("*.json"):
+        spec = Spec.read(spec_path)
+        if "checkpoint-resume-loss" not in spec.applicable_tests:
+            spec.applicable_tests.append("checkpoint-resume-loss")
+        spec.test_tolerances["checkpoint-resume-loss"] = Tolerance(absolute=0.001)
+        spec.write(spec_path)
+    return _operator_api_catalog
+
+
+_SELFTEST_FIXTURES += (
+    "_e2e_reference_records_ctx",
+    "_inference_export_locality_admission",
+    "_inference_export_prescribed_hostfile",
+    "_inference_sampling_model_configs",
+    "_local_cortex_inference_export_factory",
+    "_standalone_checkpoint_catalog",
+)
+_SELFTEST_GROUPS["operator_interface"] += (
+    "test_checkpoint_regression_owns_bridge_and_restores_flags_after_both_arms",
+    "test_checkpoint_automatic_bridge_does_not_replace_unsupported_or_external_target",
+    "test_checkpoint_automatic_bridge_does_not_mix_first_two_fixture_contracts",
+    "test_checkpoint_bridge_failure_restores_flags_and_retains_unsafe_shutdown",
+)
+_SELFTEST_GROUPS["reference_records"] += (
+    "test_checkpoint_calibration_calibration_preserves_config_accumulation_and_identical_work",
+)
+_SELFTEST_GROUPS["lora_training"] += (
+    "test_e2e_reference_records_prepared_regression_runs_one_target_and_zero_hf",
+    "test_e2e_reference_records_missing_record_stops_before_target_and_prints_full_traceback",
+    "test_e2e_reference_records_corrupt_record_cannot_fall_back_to_hf",
+    "test_e2e_reference_records_shared_sft_source_is_bound_and_drift_requires_explicit_preparation",
+    "test_e2e_reference_records_old_unbound_e2e_record_is_not_silently_relabelled",
+    "test_e2e_reference_records_incomplete_or_nonfinite_scalars_stop_before_target",
+    "test_e2e_reference_records_input_or_workload_drift_requires_a_new_record_before_target",
+    "test_e2e_reference_records_relocated_source_paths_preserve_identity_and_sequential_selection",
+    "test_e2e_reference_records_replay_tampering_after_record_load_stops_before_target",
+    "test_e2e_reference_records_explicit_preparation_runs_hf_once_publishes_scalars_and_never_runs_target",
+    "test_e2e_reference_records_preparation_exception_propagates_instead_of_becoming_empty_success",
+    "test_e2e_reference_records_preparation_requires_explicit_mode",
+    "test_e2e_reference_records_corrupt_existing_record_is_not_reprepared",
+    "test_e2e_reference_records_unsupported_lora_init_fails_before_hf_or_target",
+    "test_e2e_reference_records_staged_dataset_root_must_be_fast_storage",
+    "test_e2e_reference_records_reference_options_are_shared_with_hf_command",
+    "test_e2e_sft_train_validate_mixer_packing_is_selected_from_checkpoint_layers",
+    "test_e2e_sft_train_validate_mixer_packing_keeps_each_sequence_in_its_own_reference_call",
+    "test_e2e_sft_train_validate_every_step_gets_its_own_batch_from_the_training_slice",
+    "test_e2e_sft_train_validate_a_slice_that_does_not_fill_the_steps_is_refused",
+    "test_e2e_sft_train_validate_both_engines_are_handed_the_same_replay_files_in_the_same_order",
+    "test_e2e_sft_train_validate_the_held_out_request_carries_logit_aligned_labels",
+    "test_e2e_sft_train_validate_the_training_requests_carry_the_convention_their_dispatch_expects",
+    "test_e2e_sft_train_validate_the_verdict_gates_on_the_final_training_loss_and_the_validation_loss",
+    "test_e2e_sft_train_validate_two_identical_trajectories_pass_and_still_record_every_step",
+    "test_e2e_sft_train_validate_a_mid_run_disagreement_that_closes_by_the_final_step_does_not_decide_the_outcome",
+    "test_e2e_sft_train_validate_a_disagreement_at_step_one_is_read_as_the_forward_and_not_as_accumulation",
+    "test_e2e_sft_train_validate_a_disagreement_that_appears_later_is_read_as_accumulation",
+    "test_e2e_sft_train_validate_an_onset_at_the_second_step_counts_one_elapsed_optimizer_step",
+    "test_e2e_sft_train_validate_the_final_training_loss_fails_on_its_own",
+    "test_e2e_sft_train_validate_a_validation_disagreement_fails_on_its_own",
+    "test_e2e_sft_train_validate_the_first_and_widest_step_are_reported_whatever_the_verdict",
+    "test_e2e_sft_train_validate_the_stated_gate_decides_the_outcome",
+    "test_e2e_sft_train_validate_reference_fused_cross_entropy_matches_product_selection",
+    "test_e2e_sft_train_validate_reference_uses_independent_unfused_pytorch_adamw",
+    "test_e2e_sft_train_validate_trajectories_of_different_lengths_are_refused",
+    "test_e2e_sft_train_validate_the_optimizer_moments_persist_across_steps",
+    "test_e2e_sft_train_validate_a_step_reads_the_moments_the_step_before_it_wrote",
+    "test_e2e_sft_train_validate_the_step_is_written_back_into_the_model",
+    "test_e2e_sft_train_validate_the_single_step_reference_cannot_be_looped",
+    "test_e2e_sft_train_validate_a_gradient_missing_for_an_owned_parameter_is_refused",
+    "test_e2e_sft_train_validate_an_optimizer_that_is_not_adamw_is_refused",
+)
+_SELFTEST_GROUPS["checkpoint_state"] = (
+    "test_checkpoint_resume_identical_losses_pass",
+    "test_checkpoint_resume_a_final_loss_inside_the_tolerance_passes",
+    "test_checkpoint_resume_a_final_loss_outside_the_tolerance_fails",
+    "test_checkpoint_resume_a_control_disagreement_is_explained_rather_than_blamed_on_the_resume",
+    "test_checkpoint_resume_a_resumed_arctic_job_loads_the_saved_path_after_creation",
+    "test_checkpoint_resume_arctic_checkpoint_reference_is_the_saved_path",
+    "test_checkpoint_resume_every_iteration_gets_its_own_batch",
+    "test_checkpoint_resume_the_resumed_job_continues_the_data_order_at_batch_11",
+    "test_checkpoint_resume_every_iteration_steps_at_the_check_s_own_learning_rate",
+    "test_checkpoint_resume_gas4_uses_identical_plain_requests_for_uninterrupted_and_resumed_jobs",
+    "test_checkpoint_resume_gateway_transport_preserves_config_accumulation_for_all_three_jobs",
+    "test_checkpoint_resume_a_case_that_raises_fails_that_case_alone",
+    "test_checkpoint_resume_loss_range_gate_is_twice_the_range_rounded_up",
+    "test_checkpoint_resume_a_zero_loss_range_still_meets_the_minimum_gate",
+)
+_SELFTEST_GROUPS["local_transport"] += ("test_checkpoint_resume_owned_cancellation_failure_stops_before_next_arm",)
+_SELFTEST_GROUPS["inference_checkpoint_loss"] = (
+    "test_inference_checkpoint_loss_exported_checkpoint_reuses_the_validated_tokenizer",
+    "test_inference_checkpoint_loss_correctness_sampling_disables_cuda_graphs",
+    "test_inference_checkpoint_loss_sampling_payload_accepts_real_server_schema",
+    "test_inference_checkpoint_loss_forward_request_asks_for_per_token_logprobs",
+    "test_inference_checkpoint_loss_forward_request_attends_to_prompts_and_masks_only_padding",
+    "test_inference_checkpoint_loss_the_reduction_is_the_negative_mean_over_every_answer_token",
+    "test_inference_checkpoint_loss_the_reduction_pools_across_rows_rather_than_averaging_row_means",
+    "test_inference_checkpoint_loss_the_reduction_refuses_an_empty_batch",
+    "test_inference_checkpoint_loss_the_training_side_reads_the_logits_that_predict_the_answer_tokens",
+    "test_inference_checkpoint_loss_the_sampling_side_reads_the_same_logit_positions",
+    "test_inference_checkpoint_loss_the_two_sides_agree_when_the_model_does",
+    "test_inference_checkpoint_loss_a_row_carrying_a_logprob_for_position_zero_is_refused",
+    "test_inference_checkpoint_loss_a_row_scored_against_other_tokens_is_refused",
+    "test_inference_checkpoint_loss_unshifted_labels_would_score_the_wrong_span",
+    "test_inference_checkpoint_loss_the_steps_consume_the_training_slice_once_each",
+    "test_inference_ple_padding_floor_uses_effective_offline_config",
+    "test_inference_ple_padding_refuses_missing_or_invalid_config",
+    "test_inference_ple_padding_leaves_unaffected_routes_without_config_reads",
+    "test_inference_ple_padding_survives_real_pack_and_all_sequence_shards",
+    "test_inference_ple_padding_already_long_rows_are_identity_noop",
+    "test_inference_ple_padding_real_run_packs_training_and_validation_without_reselecting",
+    "test_inference_checkpoint_loss_agreement_inside_the_gate_passes_and_outside_it_fails",
+    "test_inference_checkpoint_loss_b200_uses_three_milliabsolute_gate",
+    "test_inference_checkpoint_loss_cortex_selects_expected_prompt_tokens_not_first_dictionary_entries",
+    "test_inference_checkpoint_loss_cortex_rejects_wrong_generate_row_counts",
+    "test_inference_checkpoint_loss_cortex_rejects_malformed_prompt_logprobs",
+    "test_inference_checkpoint_loss_cortex_rejects_invalid_answer_boundaries",
+    "test_inference_checkpoint_loss_target_extraction_does_not_silently_truncate_rows",
+    "test_inference_checkpoint_loss_reference_extraction_requires_exact_rows_and_rank",
+    "test_inference_checkpoint_loss_nonfinite_answer_scores_fail_instead_of_passing_the_gate",
+    "test_inference_checkpoint_loss_cortex_requires_full_configured_model_before_loading_tokenizer",
+    "test_local_cortex_inference_local_sampling_uses_exact_export_same_backend_one_gpu_no_source",
+    "test_local_cortex_inference_local_sampling_refuses_nonlocal_or_authenticated_backend",
+    "test_local_cortex_inference_local_export_rejects_incomplete_or_mismatched_weights",
+    "test_local_cortex_inference_save_receipt_and_tokenizer_fail_closed",
+    "test_local_cortex_inference_local_execution_preserves_recipe_and_closes_owned_clients",
+)
+_SELFTEST_AUTO_FIXTURES["inference_checkpoint_loss"] = ("_inference_sampling_model_configs",)
+
+
+@pytest.fixture
+def _native_checkpoint_bridge(monkeypatch):
+    from fastapi import FastAPI
+
+    from arctic_platform.correctness.harness import gateway
+
+    parents = {}
+    snowapi = SimpleNamespace(_parents=parents)
+    monkeypatch.setitem(sys.modules, "dss.ray_dss", SimpleNamespace(gateway_snowapi=snowapi))
+    state = SimpleNamespace(
+        calls=[],
+        verified=[],
+        roots=[],
+        counter=0,
+        response={},
+        create_error=None,
+        closed=False,
+        created=[],
+        replicated=[],
+        replication_error=None,
+        events=[],
+    )
+    zone = SimpleNamespace(num_gpus=4, nodes=[SimpleNamespace(model_dump=lambda **kw: {"host": "node-a", "gpus": 4})])
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            state.closed = True
+
+    gw = SimpleNamespace(app=FastAPI(lifespan=lifespan), _jobs={})
+
+    async def create(config):
+        if state.create_error:
+            raise state.create_error
+        state.created.append(config.model_dump(mode="json", by_alias=True))
+        state.counter += 1
+        child = f"child-{state.counter}"
+        gw._jobs[child] = zone
+        parents[child] = SimpleNamespace(
+            state="running",
+            cancel_requested=False,
+            children={"training": SimpleNamespace(job_id=child, status="ready")},
+        )
+        return child
+
+    async def request(zone_arg, method, path, **kwargs):
+        assert zone_arg is zone
+        state.calls.append((method, path, copy.deepcopy(kwargs)))
+        state.events.append(path.rsplit("/", 1)[-1])
+        child = path.split("/")[-2]
+        body = kwargs["json_body"]
+        return {
+            "job_id": child,
+            "checkpoint_path": body.get("path", "/tmp/dss.ray_dss/ds/job-owned-store"),
+            "checkpoint_tag": "global_step10",
+            "version": 10,
+            "checkpoint_id": body.get("checkpoint_id"),
+            "stage_path": "",
+            **state.response,
+        }
+
+    def retain(root):
+        state.roots.append(str(root))
+        return {
+            "path": str(root),
+            "source_job_id": "owned-store",
+            "native_path": "/tmp/dss.ray_dss/ds/job-owned-store",
+        }
+
+    gw._create_child_job = create
+    gw._zone_for_job = lambda child: gw._jobs[child]
+    gw._zone_request_and_wait = request
+
+    def verify(binding):
+        state.verified.append(copy.deepcopy(binding))
+        state.events.append("verify")
+
+    def replicate(binding, tag, hosts, ep_size):
+        state.replicated.append((copy.deepcopy(binding), tag, list(hosts), ep_size))
+        state.events.append("replicate")
+        if state.replication_error is not None:
+            raise state.replication_error
+
+    store = SimpleNamespace(create=retain, verify=verify, materialize_expert_replicas=replicate)
+    gateway.install_checkpoint_routes(gw, store)
+    state.gw, state.parents, state.zone, state.store = gw, parents, zone, store
+    state.config = {
+        "job_type": "training",
+        "job_id": "generated",
+        "model_name": "control-model",
+        "training_config": {"load_optimizer_states": True, "optimizer": {"lr": 1e-5}},
+    }
+
+    async def child(config=None):
+        class Config:
+            def __init__(self, raw):
+                self.raw = copy.deepcopy(raw)
+                self.job_id = self.raw["job_id"]
+
+            def model_dump(self, **kwargs):
+                return copy.deepcopy(self.raw)
+
+            @classmethod
+            def model_validate(cls, raw):
+                return cls(raw)
+
+        raw = copy.deepcopy(state.config if config is None else config)
+        return await gw._create_child_job(Config(raw))
+
+    async def invoke(route, child_id, **body):
+        endpoint = next(route_obj.endpoint for route_obj in gw.app.routes if route_obj.path == route)
+        return await endpoint(job_id=child_id, body=endpoint.__annotations__["body"](**body))
+
+    state.child, state.invoke = child, invoke
+    return state
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"job_id": "other-child"},
+        {"checkpoint_path": "/data-fast/control-resume"},
+        {"checkpoint_tag": "global_step9", "version": 9},
+        {"checkpoint_id": "global_step9"},
+    ],
+)
+def test_native_checkpoint_bridge_rejects_wrong_restored_state(_native_checkpoint_bridge, response):
+    state = _native_checkpoint_bridge
+
+    async def scenario():
+        source = await state.child()
+        saved = await state.invoke(
+            "/correctness/save-checkpoint", source, path="/data-fast/control-resume", checkpoint_type="resumable"
+        )
+        del state.gw._jobs[source]
+        target = await state.child()
+        state.response = response
+        with pytest.raises(RuntimeError):
+            await state.invoke("/correctness/load-checkpoint", target, checkpoint_id=saved["checkpoint_id"])
+
+    asyncio.run(scenario())
+
+
+@pytest.fixture(params=["qwen3_5", "qwen3_5_moe"])
+def _inference_export_case(request):
+    family = request.param
+    original_class, text_type, exported_class = projection.FAMILIES[family]
+    text = {
+        "model_type": text_type,
+        "num_hidden_layers": 2,
+        "hidden_size": 4,
+        "intermediate_size": 8,
+        "vocab_size": 8,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "tie_word_embeddings": False,
+        "dtype": "bfloat16",
+        "use_cache": True,
+        "layer_types": ["linear_attention", "full_attention"],
+        "rope_parameters": {"rope_theta": 10000000, "partial_rotary_factor": 0.25},
+        "linear_conv_kernel_dim": 4,
+        "mtp_num_hidden_layers": 1,
+    }
+    if family.endswith("_moe"):
+        text["num_experts"] = 4
+        text["num_experts_per_tok"] = 2
+    source = {
+        "model_type": family,
+        "architectures": [original_class],
+        "text_config": text,
+        "vision_config": {"depth": 1},
+    }
+    exported = {
+        **copy.deepcopy(text),
+        "architectures": [exported_class],
+        "transformers_version": "synthetic-only",
+        "use_cache": False,
+    }
+    schema = {
+        "model.language_model.layers.0.norm.weight": ["F32", [4]],
+        "model.language_model.layers.1.norm.weight": ["BF16", [4]],
+        "model.language_model.embed_tokens.weight": ["BF16", [8, 4]],
+        "lm_head.weight": ["BF16", [8, 4]],
+        "model.visual.block.weight": ["BF16", [4, 4]],
+        "mtp.fc.weight": ["BF16", [4, 8]],
+    }
+    if family.endswith("_moe"):
+        schema["model.language_model.layers.0.mlp.experts.gate_up_proj"] = [
+            "BF16",
+            [4, 16, 4],
+        ]
+    output = {
+        name: ["BF16", list(row[1])]
+        for name, row in schema.items()
+        if name.startswith("model.language_model.") or name == "lm_head.weight"
+    }
+    return (source, exported, schema, output)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing-text",
+        "extra-text",
+        "vision-export",
+        "mtp-export",
+        "rename",
+        "same-byte-shape",
+        "fp32",
+        "bool-shape",
+        "unknown-source",
+        "source-layer-missing",
+    ],
+)
+def test_inference_export_header_schema_coverage_fail_closed(_inference_export_case, failure):
+    _, _, source, exported = _inference_export_case
+    name = "model.language_model.layers.1.norm.weight"
+    if failure == "missing-text":
+        exported.pop(name)
+    elif failure == "extra-text":
+        exported["model.language_model.extra.weight"] = ["BF16", [4]]
+    elif failure == "vision-export":
+        exported["model.visual.block.weight"] = ["BF16", [4, 4]]
+    elif failure == "mtp-export":
+        exported["mtp.fc.weight"] = ["BF16", [4, 8]]
+    elif failure == "rename":
+        exported["model.layers.1.norm.weight"] = exported.pop(name)
+    elif failure == "same-byte-shape":
+        exported[name][1] = [2, 2]
+    elif failure == "fp32":
+        exported[name] = ["F32", [4]]
+    elif failure == "bool-shape":
+        exported[name][1] = [True, 4]
+    elif failure == "unknown-source":
+        source["unreviewed.weight"] = ["BF16", [4]]
+    else:
+        source.pop(name)
+        exported.pop(name)
+    with pytest.raises(ValueError):
+        projection.validate_text_projection(*_inference_export_case)
+
+
+@pytest.fixture
+def _inference_rendezvous_inference_run(tmp_path, monkeypatch):
+    tokenizer = SimpleNamespace(save_pretrained=lambda path: None)
+    distribution = {
+        "examples": 1,
+        "minimum_tokens": 4,
+        "median_tokens": 4,
+        "maximum_tokens": 4,
+    }
+    cfg = SimpleNamespace(
+        model_name="Qwen/Qwen3-8B",
+        training={"model_provider": "huggingface", "dtype": "bfloat16"},
+        sub_job={},
+        n_gpus=16,
+        dp_size=16,
+        max_tokens_per_mb=8192,
+    )
+    ctx = SimpleNamespace(
+        cfg=cfg,
+        spec=SimpleNamespace(model=SimpleNamespace(cache_path=str(tmp_path / "model"))),
+        workdir=tmp_path,
+        attn_implementation="flash_attention_3",
+    )
+    monkeypatch.setattr(inference_rl_check, "configured_learning_rate", lambda cfg: 0.01)
+    monkeypatch.setattr(inference_rl_check, "configured_rows_per_step", lambda cfg: 1)
+    monkeypatch.setattr(inference_rl_check.gsm8k, "load_tokenizer", lambda path: tokenizer)
+    monkeypatch.setattr(inference_rl_check.gsm8k, "padding_token_id", lambda value: 0)
+    monkeypatch.setattr(inference_rl_check.gsm8k, "read_rows", lambda *args, **kwargs: [])
+    monkeypatch.setattr(inference_rl_check.gsm8k, "tokenize_examples", lambda *args: [])
+    monkeypatch.setattr(inference_rl_check.gsm8k, "length_distribution", lambda rows: distribution)
+    example = SimpleNamespace(prompt="question", completion=" answer")
+    monkeypatch.setattr(inference_rl_check.gsm8k, "select_by_token_budget", lambda *args: ([example], 4))
+    monkeypatch.setattr(inference_rl_check.gsm8k, "assert_disjoint", lambda *args: None)
+    monkeypatch.setattr(inference_rl_check.gsm8k, "build_batch", lambda *args: object())
+    monkeypatch.setattr(
+        inference_rl_check, "training_batches", lambda *args: [object()] * inference_rl_check.TRAIN_STEPS
+    )
+    monkeypatch.setattr(inference_rl_check, "pack_logit_aligned", lambda batch: {})
+    monkeypatch.setattr(inference_rl_check, "pack", lambda *args, **kwargs: {})
+    monkeypatch.setattr(inference_rl_check, "build_payload", lambda *args, **kwargs: {"job_type": "training"})
+    monkeypatch.setattr(inference_rl_check, "sampling_payload", lambda *args, **kwargs: {"job_type": "sampling"})
+    monkeypatch.setattr(inference_rl_check, "fwd_bwd_step", lambda *args, **kwargs: SimpleNamespace(avg_loss=2.0))
+    monkeypatch.setattr(inference_rl_check, "forward_logprobs", lambda *args: None)
+    monkeypatch.setattr(inference_rl_check, "reference_answer_logprobs", lambda *args: [[-2.0]])
+    monkeypatch.setattr(inference_rl_check, "target_answer_logprobs", lambda *args: [[-2.0]])
+    monkeypatch.setattr(inference_rl_check, "log_probs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(inference_rl_check, "save_weights_only_checkpoint", lambda *args: str(tmp_path / "hf"))
+    monkeypatch.setattr(inference_rl_check, "verdict", lambda *args: "verified")
+    ports, jobs, allocations = ([], [], [])
+
+    @contextmanager
+    def gateway(path, slots, *, backend):
+        assert isinstance(backend, OnPremConfig)
+        yield object()
+
+    @contextmanager
+    def running_job(url, payload):
+        ports.append(os.environ.get("MASTER_PORT"))
+        jobs.append(payload["job_type"])
+        if len(jobs) == 3 and failure[0]:
+            raise RuntimeError("reload failed")
+        yield object()
+
+    def allocate_port(*args, **kwargs):
+        allocations.append((args, kwargs))
+        return 30001
+
+    failure = [False]
+    monkeypatch.setattr(inference_rl_check, "gateway", gateway)
+    monkeypatch.setattr(inference_rl_check, "running_job", running_job)
+    monkeypatch.setattr(inference_rl_check, "get_unique_port_number", lambda: 30000, raising=False)
+    monkeypatch.setattr(inference_rl_check, "reserve_free_port", allocate_port, raising=False)
+    return SimpleNamespace(context=ctx, ports=ports, jobs=jobs, allocations=allocations, failure=failure)
+
+
+def _reviewed_weight_format_callers_config(tmp_path, weight_format, *, lora=False):
+    training = {
+        "ds_config": {
+            "train_batch_size": 1,
+            "train_micro_batch_size_per_gpu": 1,
+            "gradient_accumulation_steps": 1,
+            "bf16": {"enabled": True},
+            "data_types": {"grad_accum_dtype": "fp32"},
+            "optimizer": {"type": "AdamW", "params": {"lr": 0.001}},
+        },
+        "ds_worker_config": {"sp_size": 1, "attn_implementation": "sdpa"},
+    }
+    if weight_format is not None:
+        training["weight_format"] = weight_format
+    if lora:
+        training["peft"] = {"type": "lora", "rank": 2, "alpha": 4, "target_modules": ["q_proj"]}
+    recipe = {
+        "model_name": "Qwen/Qwen3-8B",
+        "seed": SEED,
+        "dtype": "bfloat16",
+        "max_seq_len": 4096,
+        "training_gpus": 1,
+        "sampling_gpus": 0,
+        "training": training,
+        "sampling": {},
+        "backend": {"type": "onprem"},
+    }
+    path = tmp_path / "synthetic-weight-format.json"
+    path.write_text(json.dumps(recipe))
+    return load_config(path)
+
+
+def _reviewed_weight_format_callers_assert_payload(payload, cfg, model_path, *, gradient_norms_per_param=True):
+    expected = rl_driver.build_payload(
+        cfg.training,
+        model_path,
+        SEED,
+        attn_implementation="sdpa",
+        gradient_norms_per_param=gradient_norms_per_param,
+    )
+    observed = deepcopy(payload)
+    assert ("weight_format" in observed) == (cfg.sub_job.get("weight_format") is not None)
+    assert observed.pop("weight_format", None) == cfg.sub_job.get("weight_format")
+    assert observed == expected
+    assert "weight_format" not in observed["training_config"]
+
+
+@pytest.mark.parametrize("weight_format", [None, "vllm", "hf", "lora"])
+def test_reviewed_weight_format_callers_inference_training_and_reload_preserve_format_and_recipe(
+    _inference_rendezvous_inference_run, tmp_path, monkeypatch, weight_format
+):
+    run = _inference_rendezvous_inference_run
+    run.context.cfg = _reviewed_weight_format_callers_config(tmp_path, weight_format)
+    run.context.attn_implementation = "sdpa"
+    before = deepcopy(run.context.cfg)
+    captured = []
+
+    @contextmanager
+    def running_job(session, payload):
+        captured.append(payload)
+        yield "job"
+
+    monkeypatch.setattr(inference_rl_check, "running_job", running_job)
+    monkeypatch.setattr(inference_rl_check, "build_payload", rl_driver.build_payload)
+    monkeypatch.setattr(inference_rl_check, "materialize_checkpoint_tokenizer", lambda *args: None)
+    assert inference_rl_check._run(run.context) == "verified"
+    assert [payload["job_type"] for payload in captured] == [
+        "training",
+        "sampling",
+        "training",
+    ]
+    _reviewed_weight_format_callers_assert_payload(
+        captured[0],
+        run.context.cfg,
+        run.context.cfg.model_name,
+        gradient_norms_per_param=False,
+    )
+    _reviewed_weight_format_callers_assert_payload(
+        captured[2],
+        run.context.cfg,
+        str(tmp_path / "hf"),
+        gradient_norms_per_param=False,
+    )
+    assert run.context.cfg == before
+
+
+def test_inference_export_cleanup_exited_leader_stubborn_descendant_is_killed_and_group_empty():
+    import ctypes
+    import signal
+    import threading
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    assert libc.prctl(37, ctypes.byref(previous), 0, 0, 0) == 0
+    assert libc.prctl(36, 1, 0, 0, 0) == 0
+    leader = None
+    sentinel = None
+    reaper = None
+    try:
+        sentinel = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"], start_new_session=True)
+        leader = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os,signal,time\n"
+                    "reader,writer=os.pipe()\n"
+                    "child=os.fork()\n"
+                    "if child==0:\n"
+                    " os.close(reader)\n"
+                    " signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+                    " os.write(writer,b'ready');os.close(writer)\n"
+                    " while True: time.sleep(1)\n"
+                    "os.close(writer);os.read(reader,5);os.close(reader)\n"
+                    "print(child,flush=True)\n"
+                    "os._exit(0)\n"
+                ),
+            ],
+            stdout=subprocess.PIPE,
+            start_new_session=True,
+        )
+        descendant = int(leader.stdout.readline())
+        assert leader.wait(timeout=5) == 0
+        reaped = []
+        reaper = threading.Thread(target=lambda: reaped.append(os.waitpid(descendant, 0)), daemon=True)
+        reaper.start()
+        started = time.monotonic()
+        export._stop_local_children([leader])
+        reaper.join(timeout=1)
+        assert time.monotonic() - started < 7
+        assert len(reaped) == 1 and reaped[0][0] == descendant
+        assert os.WIFSIGNALED(reaped[0][1]) and os.WTERMSIG(reaped[0][1]) == signal.SIGKILL
+        with pytest.raises(ProcessLookupError):
+            os.killpg(leader.pid, 0)
+        assert sentinel.poll() is None
+    finally:
+        if leader is not None:
+            try:
+                os.killpg(leader.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            leader.wait(timeout=5)
+            leader.stdout.close()
+        if reaper is not None:
+            reaper.join(timeout=5)
+        if sentinel is not None:
+            sentinel.terminate()
+            sentinel.wait(timeout=5)
+        assert libc.prctl(36, previous.value, 0, 0, 0) == 0
+
+
+@pytest.fixture(params=["native", "cortex"])
+def _remaining_selected_later_recipe(tmp_path, request):
+    from arctic_platform.correctness.harness.config import load_config
+
+    ds = {"bf16": {"enabled": False}, "data_types": {"grad_accum_dtype": "fp32"}}
+    training = {"n_gpus": 1, "sp_size": 1, "max_seq_len": 128, "ds_config": ds, "attn_implementation": "sdpa"}
+    if request.param == "native":
+        raw = {
+            "model_name": "unused/no-download-model",
+            "dtype": "float32",
+            "training_gpus": 1,
+            "max_seq_len": 128,
+            "training": {"ds_config": ds, "ds_worker_config": {"sp_size": 1, "attn_implementation": "sdpa"}},
+        }
+    else:
+        raw = {
+            "sub_job_configs": [
+                {
+                    "job_type": "training",
+                    "model_name": "unused/no-download-model",
+                    "dtype": "float32",
+                    "training_config": training,
+                }
+            ]
+        }
+    source = tmp_path / "selected-later.json"
+    source.write_text(json.dumps(raw) + "\n")
+    return load_config(source)
+
+
+def _remaining_selected_later_identity(config):
+    from arctic_platform.correctness.harness.config import config_checksum
+
+    return (
+        config.path.read_bytes(),
+        copy.deepcopy(config.sub_job),
+        config.native.model_dump() if config.native is not None else None,
+        config_checksum(config),
+    )
+
+
+@pytest.mark.parametrize("test_id", ["checkpoint-resume-loss", "inference-checkpoint-loss", "e2e-sft-train-validate"])
+def test_remaining_selected_later_float32_onboarding_reaches_fixture_without_first_two_guard(
+    _remaining_selected_later_recipe, monkeypatch, test_id
+):
+    from arctic_platform.correctness.harness import engine_admission
+    from arctic_platform.correctness.harness import execution
+    from arctic_platform.correctness.onboarding import onboard
+
+    config = _remaining_selected_later_recipe
+    before = _remaining_selected_later_identity(config)
+    args = execution.parse_args(["onboard", "--config", str(config.path), "--test-id", test_id])
+    args._prerequisites_checked = True
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("selected later check reached the first-two dtype or accumulation guard")
+
+    calls = []
+    monkeypatch.setattr(onboard, "validate_first_two_model_dtype", forbidden)
+    monkeypatch.setattr(engine_admission, "validate_reference_accumulation", forbidden)
+    monkeypatch.setattr(onboard, "_configure_fixture_target", lambda *args: calls.append(args[2]))
+    onboard._onboarding_preflight(args, config, [test_id])
+    assert calls == [[test_id]]
+    assert _remaining_selected_later_identity(config) == before
+
+
+@pytest.mark.parametrize("test_id", ["checkpoint-resume-loss", "inference-checkpoint-loss", "e2e-sft-train-validate"])
+def test_remaining_selected_later_float32_runner_reaches_placement_without_first_two_guard(
+    _remaining_selected_later_recipe, monkeypatch, test_id
+):
+    from arctic_platform.correctness.harness import runner
+
+    config = _remaining_selected_later_recipe
+    before = _remaining_selected_later_identity(config)
+    calls = []
+
+    def placement(width):
+        calls.append(width)
+        raise RuntimeError("selected later placement sentinel")
+
+    monkeypatch.setattr(
+        runner,
+        "validate_first_two_model_dtype",
+        lambda *args: pytest.fail("selected later check reached the first-two dtype guard"),
+    )
+    monkeypatch.setattr(config, "at_gpu_width", placement)
+    with pytest.raises(RuntimeError, match="selected later placement sentinel"):
+        runner.execute(config, None, [], vocab_size=128, select=[test_id])
+    assert calls == [1]
+    assert _remaining_selected_later_identity(config) == before
+
+
+@pytest.mark.parametrize("test_id", ["checkpoint-resume-loss", "inference-checkpoint-loss", "e2e-sft-train-validate"])
+def test_remaining_selected_later_float32_regression_reaches_spec_without_first_two_guard(
+    _remaining_selected_later_recipe, monkeypatch, tmp_path, test_id
+):
+    from arctic_platform.client import CortexConfig
+    from arctic_platform.correctness.harness import engine_admission
+    from arctic_platform.correctness.harness import execution
+
+    config = _remaining_selected_later_recipe
+    before = _remaining_selected_later_identity(config)
+    args = execution.parse_args(["run", "--config", str(config.path), "--test", test_id])
+    args.out = tmp_path / "report"
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("selected later check reached the first-two guard or target execution")
+
+    monkeypatch.setattr(execution, "_configure_regression_target", lambda args: args)
+    monkeypatch.setattr(execution, "_client_backend", lambda args: CortexConfig(base_url="http://unused.invalid"))
+    monkeypatch.setattr(execution, "_resolve_configs", lambda *args, **kwargs: [config.path])
+    monkeypatch.setattr(execution, "ensure_no_interrupted_builds", lambda: None)
+    monkeypatch.setattr(execution, "validate_first_two_model_dtype", forbidden)
+    monkeypatch.setattr(engine_admission, "validate_reference_accumulation", forbidden)
+    monkeypatch.setattr(execution, "_frozen_spec", lambda *args, **kwargs: calls.append("spec"))
+    monkeypatch.setattr(execution, "_finish", lambda *args, **kwargs: 0)
+    assert execution._run_configs(args, executor=forbidden) == 0
+    assert calls == ["spec"]
+    assert _remaining_selected_later_identity(config) == before
+
+
+@pytest.mark.parametrize("debug", [None, {}, {"correctness_first_two": False}])
+def test_remaining_checkpoint_unmarked_training_bypasses_first_two_runtime_capture(monkeypatch, tmp_path, debug):
+    from arctic_platform.correctness.harness import engine_admission
+
+    monkeypatch.setenv(engine_admission.RUNTIME_ADMISSION_ENV, "{}")
+    monkeypatch.setitem(sys.modules, "dss.ray_dss.jobs.gpu", None)
+    monkeypatch.setitem(sys.modules, "dss.ray_dss.stage_info", None)
+    config = SimpleNamespace(training_config=SimpleNamespace(debug=copy.deepcopy(debug)))
+    before = copy.deepcopy(config.training_config.debug)
+    calls = []
+
+    async def original(zone, submitted, job_id):
+        calls.append((zone, submitted, job_id))
+        return "created"
+
+    service = SimpleNamespace(_create_job_v0=original)
+
+    async def create():
+        with engine_admission.gateway_runtime_scope(service, tmp_path / "unused-hostfile", first_two_only=True):
+            assert await service._create_job_v0("checkpoint-zone", config, "checkpoint-child") == "created"
+
+    asyncio.run(create())
+    assert calls == [("checkpoint-zone", config, "checkpoint-child")]
+    assert config.training_config.debug == before
+    assert service._create_job_v0 is original
+
+
+@pytest.mark.parametrize("marker", [0, 1, "false", "true", None, [], {}])
+def test_remaining_gateway_invalid_first_two_boolean_fails_before_runtime_or_dispatch(monkeypatch, tmp_path, marker):
+    from arctic_platform.correctness.harness import engine_admission
+
+    monkeypatch.setenv(engine_admission.RUNTIME_ADMISSION_ENV, "{}")
+    monkeypatch.setitem(sys.modules, "dss.ray_dss.jobs.gpu", None)
+    monkeypatch.setitem(sys.modules, "dss.ray_dss.stage_info", None)
+    config = SimpleNamespace(training_config=SimpleNamespace(debug={"correctness_first_two": marker}))
+
+    async def forbidden(*args):
+        pytest.fail("invalid first-two marker reached job dispatch")
+
+    service = SimpleNamespace(_create_job_v0=forbidden)
+
+    async def create():
+        with engine_admission.gateway_runtime_scope(service, tmp_path / "unused-hostfile", first_two_only=True):
+            with pytest.raises(ValueError, match="correctness_first_two must be an explicit boolean"):
+                await service._create_job_v0("checkpoint-zone", config, "checkpoint-child")
+
+    asyncio.run(create())
+    assert service._create_job_v0 is forbidden
+    assert config.training_config.debug == {"correctness_first_two": marker}
+
+
+def test_remaining_checkpoint_native_training_completes_multiple_steps_without_first_two_capture(tmp_path):
+    import torch
+
+    from arctic_platform.correctness.harness import gateway
+
+    calls = []
+
+    class Client:
+        config = SimpleNamespace(backend=object())
+
+        def fwd_bwd(self, body):
+            calls.append(("backward", body))
+            return {"avg_loss": float(3 - len([kind for kind, value in calls if kind == "backward"]))}
+
+        def step(self, learning_rate):
+            calls.append(("step", learning_rate))
+            return {"gradient_norms_per_param": {"weight": 1.0}}
+
+    client = Client()
+    job = gateway.ArcticJob(client=client, job_type="training")
+    session = gateway.GatewaySession(workdir=tmp_path, slots=1)
+    bodies = [
+        {
+            "batch": {
+                "input_ids": torch.tensor([[step, step + 1]]),
+                "labels": torch.tensor([[step, step + 1]]),
+            },
+            "processing": {"loss_fn": "sft"},
+        }
+        for step in (1, 2)
+    ]
+    results = [gateway.fwd_bwd_step(session, job, body, learning_rate=0.001) for body in bodies]
+    assert [result.avg_loss for result in results] == [2.0, 1.0]
+    assert [result.grad_norms for result in results] == [{"weight": 1.0}, {"weight": 1.0}]
+    assert all(result.participation is None and result.optimizer_state_manifest is None for result in results)
+    assert [kind for kind, value in calls] == ["backward", "step", "backward", "step"]
+    assert calls[0][1] is bodies[0] and calls[2][1] is bodies[1]
+
+
+@pytest.mark.parametrize("inherited", [False, True])
+@pytest.mark.parametrize("failure", [None, RuntimeError, KeyboardInterrupt])
+def test_remaining_checkpoint_bridge_restores_flags_on_success_failure_and_interrupt(monkeypatch, inherited, failure):
+    from arctic_platform.correctness.harness import cortex
+
+    names = (cortex.LOCAL_NATIVE_FORWARD_ENV, cortex.LOCAL_CHECKPOINT_BRIDGE_ENV)
+    for name in names:
+        if inherited:
+            monkeypatch.setenv(name, "prior-value")
+        else:
+            monkeypatch.delenv(name, raising=False)
+    previous = {name: os.environ.get(name) for name in names}
+
+    def exercise():
+        with cortex.local_checkpoint_bridge():
+            assert {name: os.environ.get(name) for name in names} == dict.fromkeys(names, "1")
+            if failure is not None:
+                raise failure("checkpoint bridge sentinel")
+
+    if failure is None:
+        exercise()
+    else:
+        with pytest.raises(failure, match="checkpoint bridge sentinel"):
+            exercise()
+    assert {name: os.environ.get(name) for name in names} == previous
+
+
+@pytest.mark.parametrize("family", ["qwen3_5_moe_text", "qwen4_exp_text", "glm5_next_text"])
+@pytest.mark.parametrize("count", [None, 0, 1])
+@pytest.mark.parametrize("legacy_hash", [False, True])
+def test_remaining_checkpoint_local_transport_checks_prediction_admission_before_job(
+    tmp_path, monkeypatch, family, count, legacy_hash
+):
+    from arctic_platform.correctness.harness import gateway
+
+    spec, _, _ = _no_debug_reduced_fixture(tmp_path, family, count)
+    (tmp_path / "model.safetensors").write_bytes(b"reviewed fixture weights")
+    if legacy_hash:
+        spec.model.content_hash = hash_directory(tmp_path)
+    (tmp_path / "tokenizer_config.json").write_text("{}")
+    if not legacy_hash:
+        spec.model.content_hash = hash_directory(tmp_path)
+    training = {"model_provider": "prime_rl", "ds_config": {}}
+    before = deepcopy(training)
+    original_bytes = (tmp_path / "config.json").read_bytes()
+    monkeypatch.setattr(gateway, "require_data_fast_path", lambda path, **kwargs: Path(path))
+    monkeypatch.setattr(gateway, "running_job", lambda *args: pytest.fail("fixture admission started a target job"))
+
+    def transport():
+        return gateway.GatewayTransport(tmp_path / "work", training, spec.model.cache_path, SEED, slots=1, spec=spec)
+
+    if count == 1:
+        with pytest.raises(ValueError, match="cannot authorize omitted MTP weights"):
+            transport()
+    else:
+        admitted = transport()
+        assert admitted.payload["model_name"] == spec.model.cache_path
+        assert admitted.payload["training_config"]["model_provider"] == "prime_rl"
+    assert training == before
+    assert (tmp_path / "config.json").read_bytes() == original_bytes
+    assert not (tmp_path / "work").exists()
+
+
+@pytest.mark.parametrize("damage", ["config", "weights", "model-path"])
+def test_remaining_checkpoint_local_transport_refuses_changed_fixture_inventory(tmp_path, monkeypatch, damage):
+    from arctic_platform.correctness.harness import gateway
+
+    spec, _, _ = _no_debug_reduced_fixture(tmp_path, "qwen4_exp_text", 0)
+    weights = tmp_path / "model.safetensors"
+    weights.write_bytes(b"reviewed fixture weights")
+    spec.model.content_hash = hash_directory(tmp_path)
+    model_path = spec.model.cache_path
+    if damage == "model-path":
+        model_path = str(tmp_path / "another-model")
+    elif damage == "weights":
+        weights.write_bytes(b"modified fixture weights with a different size")
+    else:
+        config = tmp_path / "config.json"
+        config.write_bytes(config.read_bytes() + b"\n")
+    monkeypatch.setattr(gateway, "require_data_fast_path", lambda path, **kwargs: Path(path))
+    monkeypatch.setattr(gateway, "running_job", lambda *args: pytest.fail("unreviewed fixture started a target job"))
+    with pytest.raises(ValueError, match="differs|differ"):
+        gateway.GatewayTransport(
+            tmp_path / "work", {"model_provider": "prime_rl"}, model_path, SEED, slots=1, spec=spec
+        )
+    assert not (tmp_path / "work").exists()
+
+
+@pytest.mark.parametrize("provider,seed", [("huggingface", 0), ("prime_rl", None), ("prime_rl", 17)])
+def test_remaining_checkpoint_nonreduced_transport_does_not_scan_fixture(tmp_path, monkeypatch, provider, seed):
+    from arctic_platform.correctness.harness import gateway
+
+    spec = SimpleNamespace(model=SimpleNamespace(seed=seed, cache_path=str(tmp_path / "absent")))
+    monkeypatch.setattr(gateway, "require_data_fast_path", lambda path, **kwargs: Path(path))
+    monkeypatch.setattr(gateway, "hash_directory", lambda *args, **kwargs: pytest.fail("nonreduced model was scanned"))
+    transport = gateway.GatewayTransport(
+        tmp_path / "work", {"model_provider": provider}, spec.model.cache_path, SEED, slots=1, spec=spec
+    )
+    assert transport.payload["model_name"] == spec.model.cache_path
+    assert not (tmp_path / "work").exists()
+
+
+def test_remaining_checkpoint_onprem_runner_forwards_reviewed_spec_to_transport(tmp_path, monkeypatch):
+    from arctic_platform.client import OnPremConfig
+    from arctic_platform.correctness.harness import gateway
+    from arctic_platform.correctness.harness import runner
+
+    spec = SimpleNamespace(model=SimpleNamespace(cache_path="/models/reviewed"))
+    cfg = SimpleNamespace(training={"model_provider": "prime_rl"}, n_gpus=4)
+    context = SimpleNamespace(
+        transport_factory=None,
+        client_backend=OnPremConfig(),
+        cfg=cfg,
+        spec=spec,
+        attn_implementation="sdpa",
+    )
+    calls = []
+    sentinel = object()
+
+    def create(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(gateway, "GatewayTransport", create)
+    assert runner.RunContext.transport_for(context, tmp_path) is sentinel
+    assert calls == [
+        (
+            (tmp_path, cfg.training, spec.model.cache_path, SEED),
+            {"slots": 4, "attn_implementation": "sdpa", "spec": spec},
+        )
+    ]

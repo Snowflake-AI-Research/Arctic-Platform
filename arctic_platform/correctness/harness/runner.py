@@ -34,6 +34,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Callable
 from typing import Dict
 from typing import List
 from typing import Optional
@@ -48,6 +50,7 @@ from arctic_platform.correctness.harness.gateway import build_payload
 from arctic_platform.correctness.harness.gateway import fwd_bwd_step
 from arctic_platform.correctness.harness.gateway import gateway
 from arctic_platform.correctness.harness.gateway import pack
+from arctic_platform.correctness.harness.gateway import rl_gpu_count
 from arctic_platform.correctness.harness.gateway import running_job
 from arctic_platform.correctness.harness.gateway import validate_reduced_fixture_support
 from arctic_platform.correctness.harness.sft import SEED
@@ -55,8 +58,9 @@ from arctic_platform.correctness.harness.sft import build_synthetic_batch as bui
 from arctic_platform.correctness.harness.sft import save
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import require_data_fast_path
-from arctic_platform.model.implementations.debug.determinism import CUBLAS_WORKSPACE
+from arctic_platform.correctness.reference.process_determinism import CUBLAS_WORKSPACE
 
+from ..models import validate_local_full_model
 from ..reference.model_features import uses_mixer_packing
 from . import report as console
 from .config import DEFAULT_REFERENCE_CALIBRATION_RUNS
@@ -72,26 +76,6 @@ from .registry import TestResult
 from .registry import registered_tests
 
 
-def supports_dense_checkpoint_allocation(cfg: LoadedConfig) -> bool:
-    ds_config = cfg.training.get("ds_config") or {}
-    expert = ds_config.get("expert_parallel") or {}
-    tensor = ds_config.get("tensor_parallel") or {}
-    return bool(
-        not cfg.is_rl
-        and not cfg.training.get("peft_config")
-        and cfg.sp_size == 1
-        and cfg.dp_size == cfg.n_gpus
-        and cfg.training.get("ep_size", 1) == 1
-        and isinstance(expert, dict)
-        and not expert.get("enabled", False)
-        and expert.get("ep_size", 1) == 1
-        and expert.get("autoep_size", 1) == 1
-        and not ds_config.get("moe")
-        and isinstance(tensor, dict)
-        and tensor.get("tp_size", 1) == 1
-    )
-
-
 @dataclass
 class RunContext:
     config_id: str
@@ -105,10 +89,18 @@ class RunContext:
     # range the runner's cases were drawn from.
     vocab_size: int
     reference_adapter_path: Path | None = None
+    # Optional test/onboarding override; normal regression chooses the transport from client_backend.
+    transport_factory: Optional[Callable[[Path], object]] = None
     client_backend: OnPremConfig | CortexConfig = field(default_factory=OnPremConfig)
     # Populated only from a fixture binding validated against the reviewed local weights.
     target_model_name: str | None = None
     published_fixture: dict | None = None
+    local_gateway_full_model: bool = False
+    local_full_model_path: str | None = None
+    inference_sampling_topology: tuple[int, int, int] | None = None
+    inference_export_allocation: dict | None = None
+    inference_initial_model_dir: Path | None = None
+    _inference_export_locality: dict | None = field(default=None, init=False, repr=False)
     prepare_references: bool = False
     reference_records_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1] / "reference_data")
     reference_record_paths: Dict[str, str] = field(default_factory=dict)
@@ -126,6 +118,34 @@ class RunContext:
             return self.reference_attn_implementation
         reference = self.cfg.reference_attention_implementation
         return reference if reference != self.cfg.attention_implementation else self.attn_implementation
+
+    def transport_for(self, workdir: Path, *, arm: ArmSpec | None = None):
+        """The transport a check creates its jobs through, entered by the caller and exited when it ends."""
+        if self.transport_factory is not None:
+            return self.transport_factory(workdir)
+        if isinstance(self.client_backend, CortexConfig):
+            from arctic_platform.correctness.harness.gateway import HostedTransport
+
+            return HostedTransport(
+                self.client_backend,
+                self.cfg,
+                attn_implementation=self.attn_implementation,
+                **({"model_name": self.target_model_name} if self.target_model_name is not None else {}),
+                **({"preserve_native_topology": True} if self.cfg.is_rl else {}),
+                spec=self.spec,
+                published_fixture=self.published_fixture,
+            )
+        from arctic_platform.correctness.harness.gateway import GatewayTransport
+
+        return GatewayTransport(
+            workdir,
+            self.cfg.training,
+            self.spec.model.cache_path,
+            SEED,
+            slots=self.cfg.n_gpus,
+            attn_implementation=self.attn_implementation,
+            spec=self.spec,
+        )
 
     def reference_for(self, arm: ArmSpec) -> dict:
         return self._reference[arm.name]
@@ -264,64 +284,6 @@ def run_reference(
     return json.loads(out_path.read_text())
 
 
-def materialize_ap_peft_adapter(
-    cfg: LoadedConfig,
-    model_path: str,
-    workdir: Path,
-    *,
-    attn_implementation: str,
-) -> Path | None:
-    """Export the product-initialized adapter so the independent reference starts from identical bytes."""
-    if not cfg.training.get("peft_config"):
-        return None
-    workdir = require_data_fast_path(workdir, label="PEFT adapter workdir")
-    cfg = cfg.at_gpu_width(cfg.n_gpus)
-    backend = None
-    if cfg.model_name in {"zai-org/GLM-5.3-Flash", "zai-org/GLM-5.3-Flash-BF16"}:
-        from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
-
-        if cfg.native is None or not isinstance(cfg.native.backend, CortexConfig):
-            raise ValueError("GLM adapter initialization requires its configured local Cortex gateway")
-        backend = cfg.native.backend
-        require_local_cortex_gateway(backend)
-        if cfg.training.get("model_provider") != "prime_rl" or cfg.sp_size != 8 or cfg.training.get("ep_size") != 8:
-            raise ValueError("GLM adapter initialization requires the reviewed PrimeRL/SP8/EP8 route")
-    workdir.mkdir(parents=True, exist_ok=True)
-    gateway_dir = workdir / "gateway"
-    gateway_dir.mkdir(parents=True, exist_ok=True)
-    adapter_dir = workdir / "adapter"
-    payload = build_payload(
-        cfg.training,
-        model_path,
-        SEED,
-        attn_implementation=attn_implementation,
-        weight_format=cfg.sub_job.get("weight_format"),
-    )
-    checkpoint_root = workdir / "checkpoint"
-    if backend is not None:
-        checkpoint_root = require_data_fast_path(checkpoint_root, label="GLM initial checkpoint")
-        adapter_dir = require_data_fast_path(adapter_dir, label="GLM initial adapter")
-        if adapter_dir.exists():
-            raise FileExistsError(f"GLM initial adapter already exists: {adapter_dir}")
-        checkpoint_root.mkdir()
-        payload["hardware"] = cfg.gpu_type.upper() if cfg.gpu_type is not None else None
-    with gateway(gateway_dir, cfg.n_gpus, **({"backend": backend} if backend is not None else {})) as session:
-        with running_job(session, payload) as job:
-            if backend is not None:
-                from arctic_platform.correctness.harness.gateway import _local_checkpoint_metadata
-
-                # The native EP checkpointer writes the unmerged adapter under global_step0/default.
-                saved = job.client.save_checkpoint(path=str(checkpoint_root), checkpoint_type="weights-only")
-                tag = _local_checkpoint_metadata(saved, checkpoint_root, "initial adapter save")
-                if tag != "global_step0":
-                    raise RuntimeError("GLM initial adapter save must report step zero")
-                exported_root = checkpoint_root
-            else:
-                saved = job.client.save_checkpoint(path=str(checkpoint_root), export_hf=True)
-                exported_root = Path(saved.get("hf_path") or saved["path"]).parent
-    return copy_checkpoint_peft_adapter(exported_root, adapter_dir)
-
-
 # The optimizer comparison needs a step large enough to separate a real disagreement from rounding, so
 # the shared step runs at this rate rather than the config's. Gradient norms are captured after reduction
 # and before clipping and the optimizer, so the rate does not affect them.
@@ -354,15 +316,12 @@ def _at_width(results: List[TestResult], gpus: int) -> List[TestResult]:
 
 def cortex_unavailable_reason(test, published_fixture: dict | None = None) -> str | None:
     """Reject checks whose artifacts or reviewed target identity are unavailable."""
-    if test.test_id in {
-        "single-step-grads",
-        "single-step-optimizer",
-    }:
+    if test.test_id in {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}:
         if published_fixture is not None:
             return None
         return (
-            "Cortex comparison requires the reviewed reduced HF weights to be published; "
-            "publish through a supported model-distribution route and pass the binding with --cortex-fixture"
+            "Cortex comparison requires the reviewed reduced HF weights to be published; publish through a supported"
+            " model-distribution route and pass the binding with --cortex-fixture"
         )
     if test.compares_to_reference:
         return "Cortex cannot load the reviewed node-local reduced reference checkpoint"
@@ -374,25 +333,34 @@ def _cortex_rejection(
     cfg,
     published_fixture: dict | None = None,
     *,
+    local_gateway_full_model: bool = False,
     local_cortex_fixture: bool = False,
     native_adapter_initialization: bool = False,
 ) -> TestResult | None:
-    reason = cortex_unavailable_reason(test, published_fixture)
+    reason = (
+        None
+        if local_gateway_full_model and test.test_id == "e2e-sft-train-validate"
+        else cortex_unavailable_reason(test, published_fixture)
+    )
+    native_e2e_adapter = local_cortex_fixture and test.test_id == "e2e-sft-train-validate"
     native_first_two_adapter = (
         local_cortex_fixture
         and native_adapter_initialization
-        and test.test_id in {"single-step-grads", "single-step-optimizer"}
+        and (test.test_id in {"single-step-grads", "single-step-optimizer"})
     )
     if (
         reason is None
         and test.compares_to_reference
         and cfg.training.get("peft_config")
-        and not native_first_two_adapter
+        and (not (native_e2e_adapter or native_first_two_adapter))
     ):
         reason = "Cortex reference comparisons cannot export the product-initialized LoRA adapter"
     if reason is None:
         return None
-    missing_fixture = test.test_id in {"single-step-grads", "single-step-optimizer"} and published_fixture is None
+    missing_fixture = (
+        test.test_id in {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}
+        and published_fixture is None
+    )
     return TestResult(
         test_id=test.test_id,
         config_id=cfg.config_id,
@@ -419,7 +387,11 @@ def execute(
     client_backend: OnPremConfig | CortexConfig | None = None,
     cortex_fixture: Path | None = None,
     local_cortex_fixture: bool = False,
+    local_gateway_full_model: bool = False,
     local_gateway_lora_save0: bool = False,
+    inference_sampling_topology: tuple[int, int, int] | None = None,
+    inference_export_allocation: dict | None = None,
+    inference_initial_model_dir: Path | None = None,
     prepare_references: bool = False,
     reference_records_dir: Path | None = None,
     peft_adapter: Path | None = None,
@@ -436,19 +408,29 @@ def execute(
     their target attention default. Onboarding calibrates the selected reference backend; the HF side keeps
     samples in separate rows while Arctic Platform exercises packed/SP execution.
     """
-    validate_first_two_model_dtype(cfg)
+    first_two_ids = {"single-step-grads", "single-step-optimizer"}
+    if not cfg.is_rl and set(registered_tests() if select is None else select) & first_two_ids:
+        validate_first_two_model_dtype(cfg)
     if workdir is not None:
         workdir = require_data_fast_path(workdir, label="correctness workdir")
     cfg = cfg.at_gpu_width(cfg.n_gpus)
-    if prepare_references and (not select or not set(select) <= {"single-step-grads", "single-step-optimizer"}):
+    if inference_sampling_topology is not None:
+        from ..checks.inference_checkpoint_loss import _sampling_topology
+
+        if select != ["inference-checkpoint-loss"] or prepare_references:
+            raise ValueError("explicit inference sampling topology requires only inference-checkpoint-loss")
+        _sampling_topology(SimpleNamespace(cfg=cfg, inference_sampling_topology=inference_sampling_topology))
+    if prepare_references and (
+        not select or not set(select) <= {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}
+    ):
         raise ValueError("reference preparation supports only explicit HF reference check selection")
     client_backend = client_backend if client_backend is not None else OnPremConfig()
     native_first_two_adapter = bool(
         local_cortex_fixture
         and isinstance(client_backend, CortexConfig)
-        and not cfg.is_rl
+        and (not cfg.is_rl)
         and select
-        and set(select) <= {"single-step-grads", "single-step-optimizer"}
+        and (set(select) <= {"single-step-grads", "single-step-optimizer"})
     )
     if local_gateway_lora_save0:
         raise ValueError("deterministic LoRA SAVE0 execution is retired; use --peft-adapter on-prem")
@@ -459,17 +441,17 @@ def execute(
         if (
             cfg.is_rl
             or not cfg.training.get("peft_config")
-            or not select
-            or not set(select) <= {"single-step-grads", "single-step-optimizer"}
+            or (not select)
+            or (not set(select) <= {"single-step-grads", "single-step-optimizer"})
             or (
                 not prepare_references
-                and not isinstance(client_backend, OnPremConfig)
-                and not native_first_two_adapter
+                and (not isinstance(client_backend, OnPremConfig))
+                and (not native_first_two_adapter)
             )
         ):
             raise ValueError(
-                "supplied PEFT adapter requires on-prem or explicit local Cortex first-two SFT checks "
-                "or their reference preparation"
+                "supplied PEFT adapter requires on-prem or explicit local Cortex first-two SFT checks or their"
+                " reference preparation"
             )
         peft_adapter = require_data_fast_path(peft_adapter, label="shared PEFT adapter").resolve(strict=True)
         shared_adapter_identity = adapter_identity(peft_adapter, cfg.training["peft_config"])
@@ -480,14 +462,14 @@ def execute(
         if (
             not local_cortex_fixture
             or prepare_references
-            or not supports_dense_checkpoint_allocation(cfg)
-            or not isinstance(client_backend, CortexConfig)
-            or not select
-            or "single-step-optimizer" not in select
-            or not set(select) <= {"single-step-grads", "single-step-optimizer"}
-            or native_optimizer_scope is not None
-            or native_optimizer_scope_source is not None
-            or native_optimizer_supplier_source is not None
+            or (not supports_dense_checkpoint_allocation(cfg))
+            or (not isinstance(client_backend, CortexConfig))
+            or (not select)
+            or ("single-step-optimizer" not in select)
+            or (not set(select) <= {"single-step-grads", "single-step-optimizer"})
+            or (native_optimizer_scope is not None)
+            or (native_optimizer_scope_source is not None)
+            or (native_optimizer_supplier_source is not None)
         ):
             raise ValueError("dense checkpoint allocation requires exclusive local Cortex SP1/EP1 optimizer capture")
         require_local_cortex_gateway(client_backend)
@@ -505,26 +487,59 @@ def execute(
             not local_cortex_fixture
             or prepare_references
             or cfg.is_rl
-            or not select
-            or "single-step-optimizer" not in select
-            or not set(select) <= {"single-step-grads", "single-step-optimizer"}
-            or not isinstance(client_backend, CortexConfig)
+            or (not select)
+            or ("single-step-optimizer" not in select)
+            or (not set(select) <= {"single-step-grads", "single-step-optimizer"})
+            or (not isinstance(client_backend, CortexConfig))
         ):
             raise ValueError("native optimizer scope requires explicit local Cortex optimizer selection")
         require_local_cortex_gateway(client_backend)
         verify_native_callback(native_optimizer_scope, native_optimizer_scope_source)
+    if inference_export_allocation is not None:
+        from arctic_platform.correctness.harness.inference import validate_local_inference_allocation
+
+        from ..checks.inference_checkpoint_loss import is_local_cortex_gateway
+
+        if (
+            select != ["inference-checkpoint-loss"]
+            or prepare_references
+            or (not isinstance(client_backend, CortexConfig))
+            or (not is_local_cortex_gateway(client_backend))
+        ):
+            raise ValueError("export locality admission requires only local Cortex inference-checkpoint-loss")
+        validate_local_inference_allocation(inference_export_allocation)
+    if inference_initial_model_dir is not None:
+        from arctic_platform.correctness.harness.inference import validate_initial_training_model_dir
+
+        if inference_export_allocation is None:
+            raise ValueError("inference initial model directory requires local inference export allocation")
+        inference_initial_model_dir = validate_initial_training_model_dir(inference_initial_model_dir)
     tests = registered_tests()
     assert_applicable_tests_registered(spec, cfg.config_id)
     chosen = [t for t in tests.values() if select is None or t.test_id in select]
     results: List[TestResult] = []
     published_fixture = None
-    if local_cortex_fixture and not prepare_references:
+    local_full_model_path = None
+    if local_gateway_full_model:
+        if (
+            not isinstance(client_backend, CortexConfig)
+            or cortex_fixture is not None
+            or local_cortex_fixture
+            or (not select)
+            or (not set(select) <= {"e2e-sft-train-validate", "inference-checkpoint-loss"})
+        ):
+            raise ValueError("local full model requires one loopback Cortex backend and only full-model checks")
+        local_full_model_path = str(validate_local_full_model(client_backend, cfg, spec))
+    if local_cortex_fixture and (not prepare_references):
         from arctic_platform.correctness.harness.cortex import load_local_fixture
 
         if not isinstance(client_backend, CortexConfig) or cortex_fixture is not None:
             raise ValueError("local Cortex fixture requires CortexConfig without a publication receipt")
-        if not select or not set(select) <= {"single-step-grads", "single-step-optimizer"}:
-            raise ValueError("local Cortex fixture supports only first-two checks")
+        if not select or not (
+            set(select) <= {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}
+            or set(select) == {"checkpoint-resume-loss"}
+        ):
+            raise ValueError("local Cortex fixture supports only first-two, E2E or checkpoint checks")
         try:
             published_fixture = load_local_fixture(client_backend, spec)
         except ValueError as exc:
@@ -547,7 +562,7 @@ def execute(
         if not isinstance(client_backend, CortexConfig):
             raise ValueError("--cortex-fixture requires --backend cortex")
         published_fixture = load_fixture(cortex_fixture, spec)
-    if isinstance(client_backend, CortexConfig) and not prepare_references:
+    if isinstance(client_backend, CortexConfig) and (not prepare_references):
         rejected = []
         for test in chosen:
             if test.test_id not in spec.applicable_tests:
@@ -556,6 +571,7 @@ def execute(
                 test,
                 cfg,
                 published_fixture,
+                local_gateway_full_model=local_gateway_full_model,
                 local_cortex_fixture=local_cortex_fixture,
                 native_adapter_initialization=native_first_two_adapter,
             )
@@ -563,7 +579,6 @@ def execute(
                 results.append(rejection)
                 rejected.append(test)
         chosen = [test for test in chosen if test not in rejected]
-
     for test in tests.values():
         if select is not None and test.test_id not in select:
             continue
@@ -577,19 +592,13 @@ def execute(
                     reason=spec.inapplicable.get(test.test_id, "not listed as applicable in the spec"),
                 )
             )
-
     chosen = [t for t in chosen if t.test_id in spec.applicable_tests]
     if not chosen:
         return _at_width(results, cfg.n_gpus)
-
     if reference_token_budget is None:
         reference_token_budget = correctness_microbatch_tokens(cfg.max_tokens_per_mb)
-
-    # Both checks read one execution. The optimizer comparison is the constrained side -- it holds an fp32
-    # master and two Adam states per parameter -- so where the two disagree on a model slice or a token
-    # budget, its choice is the one that fits both.
     stepping = next((t for t in chosen if t.test_id == "single-step-optimizer"), None)
-    optimizer_settings = (spec.test_settings.get("single-step-optimizer") or {}) if stepping else {}
+    optimizer_settings = spec.test_settings.get("single-step-optimizer") or {} if stepping else {}
     optimizer_config = cfg.training.get("optimizer") if stepping else None
     if stepping:
         if not isinstance(optimizer_config, dict):
@@ -608,7 +617,6 @@ def execute(
     tmp = workdir if workdir is not None else correctness_workdir("ap-correctness-")
     tmp.mkdir(parents=True, exist_ok=True)
     attn_impl = attn or cfg.attention_implementation
-
     batch_paths: Dict[str, Path] = {}
     arm_specs: List[ArmSpec] = []
     for definition in arm_defs:
@@ -631,7 +639,6 @@ def execute(
                 pad_fraction=batch.pad_fraction,
             )
         )
-
     context = RunContext(
         config_id=cfg.config_id,
         cfg=cfg,
@@ -645,19 +652,26 @@ def execute(
         client_backend=client_backend,
         target_model_name=published_fixture["model_name"] if published_fixture is not None else None,
         published_fixture=deepcopy(published_fixture),
+        local_gateway_full_model=local_gateway_full_model,
+        local_full_model_path=local_full_model_path,
+        inference_sampling_topology=inference_sampling_topology,
+        inference_export_allocation=deepcopy(inference_export_allocation),
+        inference_initial_model_dir=inference_initial_model_dir,
         prepare_references=prepare_references,
-        **({"reference_records_dir": reference_records_dir} if reference_records_dir is not None else {}),
+        **{"reference_records_dir": reference_records_dir} if reference_records_dir is not None else {},
     )
-
     run_started = time.monotonic()
     per_arm_tests = [t for t in chosen if t.per_arm is not None]
     whole_run_tests = [t for t in chosen if t.per_arm is None]
-    collect_gradient_norms = any(t.test_id == "single-step-grads" for t in chosen)
+    collect_gradient_norms = any((t.test_id == "single-step-grads" for t in chosen))
+    first_two_payload = bool(
+        not cfg.is_rl and per_arm_tests and all((test.test_id in first_two_ids for test in per_arm_tests))
+    )
 
     def payload_for(arm: ArmSpec) -> dict:
         """One job per case, asking for the optimizer artifacts only when the step check reads them."""
         optimizer_state_output_dir = None
-        if stepping and not isinstance(client_backend, CortexConfig):
+        if stepping and (not isinstance(client_backend, CortexConfig)):
             optimizer_state_output_dir = require_data_fast_path(
                 tmp / "optimizer" / "ap" / arm.name, label="optimizer artifact output"
             )
@@ -671,7 +685,11 @@ def execute(
             gradient_norms_per_param=collect_gradient_norms,
             weight_format=cfg.sub_job.get("weight_format"),
         )
-        validate_reduced_fixture_support(payload, spec, published_fixture)
+        if first_two_payload:
+            validate_reduced_fixture_support(payload, spec, published_fixture)
+            payload["training_config"]["debug"]["correctness_first_two"] = True
+        else:
+            validate_reduced_fixture_support(payload, spec, published_fixture)
         if isinstance(client_backend, CortexConfig):
             payload["training_config"]["debug"].pop("optimizer_state_output_dir", None)
             if cfg.gpu_type is not None:
@@ -683,11 +701,7 @@ def execute(
 
                 if adapter_identity(context.reference_adapter_path) != shared_adapter_identity:
                     raise ValueError("shared adapter changed before native target binding")
-                return bind_payload(
-                    payload,
-                    context.reference_adapter_path,
-                    native_backend=client_backend,
-                )
+                return bind_payload(payload, context.reference_adapter_path, native_backend=client_backend)
             payload["training_config"]["debug"]["shared_peft_adapter"] = {
                 "path": str(context.reference_adapter_path),
                 "identity": deepcopy(shared_adapter_identity),
@@ -708,17 +722,14 @@ def execute(
                     output_dir=tmp / "optimizer" / "ap" / arm.name,
                     expected_dp_world_size=cfg.n_gpus if supplier is not None else cfg.dp_size,
                     optimizer_config=optimizer_config,
-                    **({"local_checkpoint": True} if local_cortex_fixture else {}),
+                    **{"local_checkpoint": True} if local_cortex_fixture else {},
                     **(
                         {"dense_checkpoint_allocation": deepcopy(dense_checkpoint_allocation)}
                         if dense_checkpoint_allocation is not None
                         else {}
                     ),
                     **(
-                        {
-                            "native_layout_supplier": supplier,
-                            "native_layout_supplier_source": supplier_source,
-                        }
+                        {"native_layout_supplier": supplier, "native_layout_supplier_source": supplier_source}
                         if supplier is not None
                         else {}
                     ),
@@ -749,12 +760,7 @@ def execute(
                     if primary is None:
                         raise
                     primary.add_note(f"Native optimizer scope source verification also failed: {error}")
-        return fwd_bwd_step(
-            session,
-            job,
-            body,
-            learning_rate=OPTIMIZER_LEARNING_RATE if stepping else 0.0,
-        )
+        return fwd_bwd_step(session, job, body, learning_rate=OPTIMIZER_LEARNING_RATE if stepping else 0.0)
 
     def body_for(arm: ArmSpec) -> dict:
         batch = load_batch(batch_paths[arm.name])
@@ -769,8 +775,8 @@ def execute(
 
             if (
                 not prepare_references
-                and not isinstance(client_backend, OnPremConfig)
-                and not native_first_two_adapter
+                and (not isinstance(client_backend, OnPremConfig))
+                and (not native_first_two_adapter)
             ):
                 raise ValueError("shared PEFT adapter initialization requires the on-prem correctness worker")
             peft_adapter = generate_adapter(
@@ -783,23 +789,17 @@ def execute(
     context.reference_adapter_path = reference_adapter_path
     if (
         reference_adapter_path is not None
-        and not prepare_references
-        and not isinstance(client_backend, OnPremConfig)
-        and not native_first_two_adapter
+        and (not prepare_references)
+        and (not isinstance(client_backend, OnPremConfig))
+        and (not native_first_two_adapter)
     ):
         raise ValueError("supplied PEFT adapters require the on-prem correctness worker")
-    if reference_adapter_path is not None and native_first_two_adapter and not prepare_references and arm_specs:
-        # Reject an unsupported native pack before reading references or allocating target resources.
+    if reference_adapter_path is not None and native_first_two_adapter and (not prepare_references) and arm_specs:
         payload_for(arm_specs[0])
-
     from arctic_platform.correctness.harness.sft import load as load_batch
 
     def measure_reference(
-        arm: ArmSpec,
-        *,
-        output_name: str | None = None,
-        cuda_device: int | None = None,
-        deterministic: bool = True,
+        arm: ArmSpec, *, output_name: str | None = None, cuda_device: int | None = None, deterministic: bool = True
     ) -> dict:
         started = time.monotonic()
         output_name = output_name or arm.name
@@ -851,8 +851,8 @@ def execute(
                 raise ValueError("shared adapter changed during HF reference execution")
         except Exception:
             print(
-                f"HF reference failed: arm={arm.name}, run={output_name}, device={device}, "
-                f"elapsed={time.monotonic() - started:.1f}s",
+                f"HF reference failed: arm={arm.name}, run={output_name}, device={device},"
+                f" elapsed={time.monotonic() - started:.1f}s",
                 flush=True,
             )
             raise
@@ -924,8 +924,10 @@ def execute(
                 records[test_id] = load_record(context, identity)
             except ReferencePrerequisiteError as exc:
                 if not prepare_references or not any(
-                    message in str(exc)
-                    for message in ("prepared HF reference missing:", "prepared HF reference incompatible:")
+                    (
+                        message in str(exc)
+                        for message in ("prepared HF reference missing:", "prepared HF reference incompatible:")
+                    )
                 ):
                     raise
         if len(records) != len(identities):
@@ -950,8 +952,8 @@ def execute(
                     learning_rate=OPTIMIZER_LEARNING_RATE,
                 )
                 print(
-                    f"Onboarding optimizer norm gate: {reference_calibration_runs} HF runs, "
-                    f"{calibration_workers} worker(s), arm={arm.name}",
+                    f"Onboarding optimizer norm gate: {reference_calibration_runs} HF runs,"
+                    f" {calibration_workers} worker(s), arm={arm.name}",
                     flush=True,
                 )
                 manifests = []
@@ -976,10 +978,10 @@ def execute(
                             completed=len(manifests),
                         ):
                             completed[index] = Path(result["optimizer_state_manifest"])
-                        manifests.extend(completed[index] for index in indices)
+                        manifests.extend((completed[index] for index in indices))
                 print(
-                    f"\n*** Optimizer Norm Summary: {arm.name} ***\n"
-                    f"Reading saved optimizer states from {len(manifests)} completed HF runs.",
+                    f"\n*** Optimizer Norm Summary: {arm.name} ***\nReading saved optimizer states from"
+                    f" {len(manifests)} completed HF runs.",
                     flush=True,
                 )
                 summary_started = time.monotonic()
@@ -988,9 +990,8 @@ def execute(
                 )
                 spread = worst.delta_norm if worst is not None else 0.0
                 print(
-                    f"Optimizer norm summary complete: arm={arm.name}, "
-                    f"elapsed={time.monotonic() - summary_started:.1f}s, "
-                    f"maximum_pairwise_norm_delta={spread:.9e}\n",
+                    f"Optimizer norm summary complete: arm={arm.name},"
+                    f" elapsed={time.monotonic() - summary_started:.1f}s, maximum_pairwise_norm_delta={spread:.9e}\n",
                     flush=True,
                 )
                 quantum = Decimal("0.001")
@@ -1029,13 +1030,12 @@ def execute(
                 if test_id not in records:
                     records[test_id] = compact
         if prepare_references:
-            prepared_entries.extend((identity, records[test_id]) for test_id, identity in identities.items())
+            prepared_entries.extend(((identity, records[test_id]) for test_id, identity in identities.items()))
         primary = "single-step-optimizer" if stepping else "single-step-grads"
         context._reference_by_check[arm.name] = records
         context._reference[arm.name] = records[primary]
         context._timing.setdefault(arm.name, {})["reference"] = 0.0
 
-    # Validate every prerequisite before allocating any target job, including arm-at-a-time runs.
     for arm in arm_specs if per_arm_tests else []:
         prepared_reference(arm)
     if prepare_references:
@@ -1043,9 +1043,7 @@ def execute(
             list(test.fn(context))
         if prepared_entries:
             publish_record_set(
-                context,
-                prepared_entries,
-                expected_identities=[identity for identity, _ in prepared_entries],
+                context, prepared_entries, expected_identities=[identity for identity, _ in prepared_entries]
             )
         print(f"HF reference preparation complete: {len(context.reference_record_paths)} record(s)", flush=True)
         return []
@@ -1059,7 +1057,7 @@ def execute(
                 result = test.per_arm(context, arm)
             except UnsafeCleanupError:
                 raise
-            except Exception as exc:  # noqa: BLE001 - one failing test must not hide the rest
+            except Exception as exc:
                 traceback.print_exc()
                 result = TestResult(
                     test_id=test.test_id,
@@ -1085,7 +1083,7 @@ def execute(
                     context._timing.setdefault(arm.name, {})["ap"] = time.monotonic() - started
         except UnsafeCleanupError:
             raise
-        except Exception as exc:  # noqa: BLE001 - startup failures must also reach the report
+        except Exception as exc:
             traceback.print_exc()
             execution_errors.add(arm.name)
             for test in per_arm_tests:
@@ -1106,10 +1104,6 @@ def execute(
     measured: List[ArmSpec] = []
     if per_arm_tests:
         if order == "batched":
-            # One job per case, sharing the gateway. Reading the gradient norms costs an optimizer update,
-            # because ``/step`` is the only endpoint that returns them, so a job that has served one case is
-            # no longer holding the checkpoint's weights. Sharing it would make each case depend on the ones
-            # before it and on the order they ran in.
             with ExitStack() as stack:
                 with console.activity("Starting Arctic Platform gateway"):
                     url = stack.enter_context(gateway(tmp, cfg.n_gpus, backend=client_backend))
@@ -1133,7 +1127,6 @@ def execute(
                 measured.append(arm)
                 if judge(arm) and fail_fast:
                     break
-
     skipped = (
         [a.name for a in arm_specs if a not in measured and a.name not in execution_errors] if per_arm_tests else []
     )
@@ -1142,14 +1135,13 @@ def execute(
             print(console.stopped_early(skipped), flush=True)
         print(console.runtime_table(context._timing, time.monotonic() - run_started), flush=True)
         return _at_width(results, cfg.n_gpus)
-
     by_name = {arm.name: arm for arm in arm_specs}
     for test in whole_run_tests:
         try:
             produced = list(test.fn(context))
         except UnsafeCleanupError:
             raise
-        except Exception as exc:  # noqa: BLE001 - one failing test must not hide the rest
+        except Exception as exc:
             traceback.print_exc()
             produced = [
                 TestResult(
@@ -1160,8 +1152,6 @@ def execute(
                     error_type=type(exc).__name__,
                 )
             ]
-        # Printed here as well as in judge(): a result that is computed but never shown reads as a test
-        # that silently did not run.
         for result in produced:
             print(
                 console.arm_verdict(result, by_name.get(result.arm), context._timing.get(result.arm or "")), flush=True
@@ -1169,3 +1159,201 @@ def execute(
         results.extend(produced)
     print(console.runtime_table(context._timing, time.monotonic() - run_started), flush=True)
     return _at_width(results, cfg.n_gpus)
+
+
+def execute_rl(
+    cfg: LoadedConfig,
+    spec: TestSpec,
+    *,
+    vocab_size: int,
+    attn: Optional[str] = None,
+    select: Optional[List[str]] = None,
+    cases: Optional[List[str]] = None,
+    workdir: Optional[Path] = None,
+    client_backend: OnPremConfig | CortexConfig | None = None,
+    local_cortex_fixture: bool = False,
+    inference_sampling_topology: tuple[int, int, int] | None = None,
+    inference_export_allocation: dict | None = None,
+    inference_initial_model_dir: Path | None = None,
+) -> List[TestResult]:
+    """Run only registered reference-free checkpoint and inference checks for a rollout recipe; this is not RL judge coverage."""
+    if workdir is not None:
+        workdir = require_data_fast_path(workdir, label="RL correctness workdir")
+    client_backend = client_backend if client_backend is not None else OnPremConfig()
+    published_fixture = None
+    if local_cortex_fixture:
+        from arctic_platform.correctness.harness.cortex import load_local_fixture
+        from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+
+        if select != ["checkpoint-resume-loss"] or not isinstance(client_backend, CortexConfig):
+            raise ValueError("RL local fixtures require only local Cortex checkpoint-resume-loss")
+        require_local_cortex_gateway(client_backend)
+        published_fixture = load_local_fixture(client_backend, spec)
+    if inference_export_allocation is not None:
+        from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+        from arctic_platform.correctness.harness.inference import validate_local_inference_allocation
+
+        if select != ["inference-checkpoint-loss"] or not isinstance(client_backend, CortexConfig):
+            raise ValueError("export locality admission requires only local Cortex inference-checkpoint-loss")
+        require_local_cortex_gateway(client_backend)
+        inference_export_allocation = deepcopy(inference_export_allocation)
+        validate_local_inference_allocation(inference_export_allocation)
+    if inference_initial_model_dir is not None:
+        from arctic_platform.correctness.harness.inference import validate_initial_training_model_dir
+
+        if inference_export_allocation is None:
+            raise ValueError("inference initial model directory requires local inference export allocation")
+        inference_initial_model_dir = validate_initial_training_model_dir(inference_initial_model_dir)
+    arms = list(spec.arms)
+    if cases:
+        wanted = set(cases)
+        names = [arm.name for arm in arms]
+        if len(wanted) != len(cases) or len(set(names)) != len(names):
+            raise ValueError("selected and reviewed case names must be unique")
+        if unknown := (wanted - set(names)):
+            raise ValueError(f"unreviewed case selection: {', '.join(sorted(unknown))}")
+        arms = [arm for arm in arms if arm.name in wanted]
+    cfg = cfg.at_gpu_width(cfg.n_gpus)
+    if inference_sampling_topology is not None:
+        from ..checks.inference_checkpoint_loss import _sampling_topology
+
+        if select != ["inference-checkpoint-loss"]:
+            raise ValueError("explicit inference sampling topology requires only inference-checkpoint-loss")
+        _sampling_topology(SimpleNamespace(cfg=cfg, inference_sampling_topology=inference_sampling_topology))
+    assert_applicable_tests_registered(spec, cfg.config_id)
+    tmp = workdir if workdir is not None else correctness_workdir("ap-correctness-rl-")
+    tmp.mkdir(parents=True, exist_ok=True)
+    context = RunContext(
+        config_id=cfg.config_id,
+        cfg=cfg,
+        spec=spec,
+        arms=arms,
+        attn_implementation=attn or cfg.attention_implementation,
+        workdir=tmp,
+        batch_paths={},
+        vocab_size=vocab_size,
+        client_backend=client_backend,
+        target_model_name=published_fixture["model_name"] if published_fixture is not None else None,
+        published_fixture=deepcopy(published_fixture),
+        inference_sampling_topology=inference_sampling_topology,
+        inference_export_allocation=deepcopy(inference_export_allocation),
+        inference_initial_model_dir=inference_initial_model_dir,
+    )
+    results: List[TestResult] = []
+    for test in registered_tests().values():
+        if test.compares_to_reference or (select is not None and test.test_id not in select):
+            continue
+        if test.test_id not in spec.applicable_tests:
+            results.append(
+                TestResult(
+                    test_id=test.test_id,
+                    config_id=cfg.config_id,
+                    outcome=TestOutcome.INAPPLICABLE,
+                    summary="not applicable to this config",
+                    reason=spec.inapplicable.get(test.test_id, "not listed as applicable in the spec"),
+                )
+            )
+            continue
+        if isinstance(context.client_backend, CortexConfig):
+            rejection = _cortex_rejection(test, cfg, context.published_fixture)
+            if rejection is not None:
+                results.append(rejection)
+                continue
+        with console.activity(f"Running {test.test_id}"):
+            try:
+                produced = list(test.fn(context))
+            except UnsafeCleanupError:
+                raise
+            except Exception as exc:
+                traceback.print_exc()
+                produced = [
+                    TestResult(
+                        test_id=test.test_id,
+                        config_id=cfg.config_id,
+                        outcome=TestOutcome.FAIL,
+                        summary=f"{type(exc).__name__}: {exc}",
+                        error_type=type(exc).__name__,
+                    )
+                ]
+        for result in produced:
+            print(console.arm_verdict(result, None), flush=True)
+        results.extend(produced)
+    return _at_width(results, rl_gpu_count(cfg))
+
+
+def supports_dense_checkpoint_allocation(cfg: LoadedConfig) -> bool:
+    ds_config = cfg.training.get("ds_config") or {}
+    expert = ds_config.get("expert_parallel") or {}
+    tensor = ds_config.get("tensor_parallel") or {}
+    return bool(
+        not cfg.is_rl
+        and not cfg.training.get("peft_config")
+        and cfg.sp_size == 1
+        and cfg.dp_size == cfg.n_gpus
+        and cfg.training.get("ep_size", 1) == 1
+        and isinstance(expert, dict)
+        and not expert.get("enabled", False)
+        and expert.get("ep_size", 1) == 1
+        and expert.get("autoep_size", 1) == 1
+        and not ds_config.get("moe")
+        and isinstance(tensor, dict)
+        and tensor.get("tp_size", 1) == 1
+    )
+
+
+def materialize_ap_peft_adapter(
+    cfg: LoadedConfig,
+    model_path: str,
+    workdir: Path,
+    *,
+    attn_implementation: str,
+) -> Path | None:
+    """Export the product-initialized adapter so the independent reference starts from identical bytes."""
+    if not cfg.training.get("peft_config"):
+        return None
+    workdir = require_data_fast_path(workdir, label="PEFT adapter workdir")
+    cfg = cfg.at_gpu_width(cfg.n_gpus)
+    backend = None
+    if cfg.model_name in {"zai-org/GLM-5.3-Flash", "zai-org/GLM-5.3-Flash-BF16"}:
+        from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+
+        if cfg.native is None or not isinstance(cfg.native.backend, CortexConfig):
+            raise ValueError("GLM adapter initialization requires its configured local Cortex gateway")
+        backend = cfg.native.backend
+        require_local_cortex_gateway(backend)
+        if cfg.training.get("model_provider") != "prime_rl" or cfg.sp_size != 8 or cfg.training.get("ep_size") != 8:
+            raise ValueError("GLM adapter initialization requires the reviewed PrimeRL/SP8/EP8 route")
+    workdir.mkdir(parents=True, exist_ok=True)
+    gateway_dir = workdir / "gateway"
+    gateway_dir.mkdir(parents=True, exist_ok=True)
+    adapter_dir = workdir / "adapter"
+    payload = build_payload(
+        cfg.training,
+        model_path,
+        SEED,
+        attn_implementation=attn_implementation,
+        weight_format=cfg.sub_job.get("weight_format"),
+    )
+    checkpoint_root = workdir / "checkpoint"
+    if backend is not None:
+        checkpoint_root = require_data_fast_path(checkpoint_root, label="GLM initial checkpoint")
+        adapter_dir = require_data_fast_path(adapter_dir, label="GLM initial adapter")
+        if adapter_dir.exists():
+            raise FileExistsError(f"GLM initial adapter already exists: {adapter_dir}")
+        checkpoint_root.mkdir()
+        payload["hardware"] = cfg.gpu_type.upper() if cfg.gpu_type is not None else None
+    with gateway(gateway_dir, cfg.n_gpus, **({"backend": backend} if backend is not None else {})) as session:
+        with running_job(session, payload) as job:
+            if backend is not None:
+                from arctic_platform.correctness.harness.gateway import _local_checkpoint_metadata
+
+                # The native EP checkpointer writes the unmerged adapter under global_step0/default.
+                saved = job.client.save_checkpoint(path=str(checkpoint_root), checkpoint_type="weights-only")
+                tag = _local_checkpoint_metadata(saved, checkpoint_root, "initial adapter save")
+                if tag != "global_step0":
+                    raise RuntimeError("GLM initial adapter save must report step zero")
+                exported_root = checkpoint_root
+            else:
+                saved = job.client.save_checkpoint(path=str(checkpoint_root), export_hf=True)
+                exported_root = Path(saved.get("hf_path") or saved["path"]).parent
+    return copy_checkpoint_peft_adapter(exported_root, adapter_dir)

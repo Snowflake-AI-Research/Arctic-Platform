@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any
 from typing import Dict
 from typing import Iterator
+from typing import List
 from typing import Optional
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -55,11 +56,15 @@ from uuid import uuid4
 from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
+from arctic_platform.client.requests import log_probs_request
 from arctic_platform.correctness.harness.config import LoadedConfig
 from arctic_platform.correctness.harness.config import ReviewedClientConfig
+from arctic_platform.correctness.harness.config import ReviewedSamplingConfig
 from arctic_platform.correctness.harness.config import ReviewedTrainingConfig
 from arctic_platform.correctness.harness.config import TestSpec
 from arctic_platform.correctness.harness.config import correctness_microbatch_tokens
+from arctic_platform.correctness.harness.config import hash_directory
+from arctic_platform.correctness.harness.cortex import TOKENIZER_JSON_SIDECARS
 from arctic_platform.correctness.harness.cortex import Checkpoint
 from arctic_platform.correctness.harness.cortex import CorrectnessClient as ArcticClient
 from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
@@ -1257,7 +1262,11 @@ def _training_client_config(session: GatewaySession, payload: dict) -> ArcticCli
 @contextlib.contextmanager
 def running_job(session: GatewaySession, payload: dict) -> Iterator[ArcticJob]:
     job_type = str(payload.get("job_type", "training"))
-    config = _training_client_config(session, payload)
+    config = (
+        _training_client_config(session, payload)
+        if job_type == "training"
+        else _inference_client_config(payload, backend=session.backend)
+    )
     if isinstance(session.backend, OnPremConfig):
         config.to_onprem(job_type)
     runtime = (
@@ -1576,6 +1585,7 @@ class GatewayTransport:
         slots: int,
         attn_implementation: Optional[str] = None,
         determinism: str = "best-effort",
+        spec: TestSpec | None = None,
     ) -> None:
         self.session = GatewaySession(require_data_fast_path(workdir, label="gateway transport workdir"), slots)
         self.payload = build_payload(
@@ -1585,6 +1595,42 @@ class GatewayTransport:
             attn_implementation=attn_implementation,
             determinism=determinism,
         )
+        fixture = None
+        if (
+            spec is not None
+            and type(spec.model.seed) is int
+            and spec.model.seed == 0
+            and self.payload["training_config"].get("model_provider") == "prime_rl"
+        ):
+            if self.payload["model_name"] != spec.model.cache_path:
+                raise ValueError("local reduced fixture path differs from the reviewed spec")
+            root = Path(spec.model.cache_path)
+            # Frozen specifications bind filenames and sizes, not a digest of all file bytes.
+            if (
+                hash_directory(root) != spec.model.content_hash
+                and hash_directory(root, exclude_names=TOKENIZER_JSON_SIDECARS) != spec.model.content_hash
+            ):
+                raise ValueError("local reduced fixture files differ from the reviewed spec")
+            path = root / "config.json"
+            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC), "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ValueError("local reduced fixture config must be a regular file")
+                raw = stream.read((16 << 20) + 1)
+            if not 0 < len(raw) <= 16 << 20:
+                raise ValueError("local reduced fixture config exceeds its metadata bound")
+            files = [{"path": "config.json", "size_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}]
+            fixture = {
+                "schema_version": 1,
+                "config_id": spec.config_id,
+                "reference_path": spec.model.cache_path,
+                "reviewed_hash": spec.model.content_hash,
+                "model_name": self.payload["model_name"],
+                "fixture_sha256": (
+                    hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                ),
+                "files": files,
+            }
+        validate_reduced_fixture_support(self.payload, spec, fixture)
 
     def __enter__(self) -> "GatewayTransport":
         require_data_fast_path(self.session.workdir, label="gateway transport workdir").mkdir(
@@ -2296,7 +2342,7 @@ def main() -> None:
     store = NativeCheckpointStore(Path(hostfiles[0]))
     install_checkpoint_routes(gateway_server, store)
     install_gateway_route(gateway_server)
-    with gateway_scope(gateway_server), gateway_runtime_scope(gateway_server, Path(hostfiles[0])):
+    with gateway_scope(gateway_server), gateway_runtime_scope(gateway_server, Path(hostfiles[0]), first_two_only=True):
         gateway_server.main()
 
 
@@ -2328,3 +2374,130 @@ def ap_driver_copy_checkpoint_peft_adapter(checkpoint_root: Path, destination: P
     shutil.rmtree(destination, ignore_errors=True)
     shutil.copytree(source, destination)
     return destination
+
+
+def _inference_client_config(
+    payload: dict, *, backend: OnPremConfig | CortexConfig | None = None
+) -> ArcticClientConfig:
+    inf = deepcopy(payload.get("inference_config") or {})
+    n_gpus = int(inf.pop("n_gpus"))
+    max_seq_len = int(inf.pop("max_seq_len", 8192))
+    vllm = deepcopy(inf.pop("vllm_config", {}))
+    vllm.setdefault("max_model_len", max_seq_len)
+    job_type = payload.get("job_type")
+    config = ReviewedClientConfig(
+        model_name=payload["model_name"],
+        seed=payload.get("seed"),
+        dtype=payload.get("dtype"),
+        max_seq_len=max_seq_len,
+        sampling_gpus=n_gpus if job_type == "sampling" else 0,
+        log_prob_gpus=n_gpus if job_type == "log_prob" else 0,
+        sampling=ReviewedSamplingConfig(
+            weight_format=payload.get("weight_format"),
+            vllm=vllm,
+            arctic_inference_config=inf or None,
+        ),
+        backend=backend if backend is not None else OnPremConfig(),
+    )
+    return CortexTrainingConfig.from_reviewed(config) if isinstance(config.backend, CortexConfig) else config
+
+
+def pack_logit_aligned(batch) -> dict:
+    body = _batch_body(batch, batch.shifted_labels(), labels_are_shifted=True)
+    body["processing"]["return_logprobs"] = True
+    return body
+
+
+def sampling_payload(model_dir: str | Path, seed: int, *, dtype: str, n_gpus: int, max_seq_len: int) -> dict:
+    return {
+        "model_name": str(model_dir),
+        "job_type": "log_prob",
+        "dtype": dtype,
+        "seed": seed,
+        "inference_config": {
+            "n_gpus": n_gpus,
+            "max_seq_len": max_seq_len,
+            "vllm_config": {
+                "tensor_parallel_size": n_gpus,
+                "max_model_len": max_seq_len,
+                "trust_remote_code": True,
+                "gpu_memory_utilization": 0.85,
+                "extra_engine_kwargs": {
+                    "dtype": dtype,
+                    "disable_custom_all_reduce": True,
+                    "enforce_eager": True,
+                },
+            },
+        },
+    }
+
+
+def log_probs(
+    session: GatewaySession,
+    job: ArcticJob,
+    prompts: List[str],
+    completions: List[str],
+    *,
+    top_k: int,
+) -> List[dict]:
+    response = job.client._call(log_probs_request(job.client.jobs, prompts, completions, top_k))
+    results = response["results"]
+    if len(results) != len(prompts):
+        raise RuntimeError(f"log-probs returned {len(results)} results for {len(prompts)} prompts")
+    return list(results)
+
+
+def forward_logprobs(session: GatewaySession, job: ArcticJob, body: dict):
+    import torch
+
+    response = job.client.fwd_no_grad(training_body(job, body))
+    if "logprobs" not in response:
+        metrics = response.get("metrics") or {}
+        if "logprobs" in metrics:
+            response = metrics
+        else:
+            raise RuntimeError(f"forward response carries no logprobs: {sorted(response)}")
+    return torch.as_tensor(response["logprobs"], dtype=torch.float32)
+
+
+def minimum_context_parallel_row_tokens(cfg, model_path: str) -> int:
+    """Read PLE's required shard context from the effective Flash-Next model, including reduced fixtures."""
+    if (
+        getattr(cfg, "config_id", None)
+        not in (
+            "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k",
+            "qwen3.8-flash-next-h200-train-rl-32gpus-sp16-256k",
+        )
+        or cfg.training.get("model_provider") != "prime_rl"
+        or cfg.sp_size <= 1
+    ):
+        return 0
+    from transformers import AutoConfig
+
+    source = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    text = getattr(source, "text_config", source)
+    if (
+        source.model_type not in ("qwen4_exp", "qwen4_exp_text")
+        or text.model_type != "qwen4_exp_text"
+        or type(text.num_hidden_layers) is not int
+        or text.num_hidden_layers <= 0
+    ):
+        raise ValueError("context-parallel Flash-Next requires a qwen4_exp_text configuration with positive layers")
+    ngram = getattr(text, "ngram_size", None)
+    kernel = getattr(text, "ple_conv_kernel_size", None)
+    if any(type(value) is not int or value <= 0 for value in (ngram, kernel)):
+        raise ValueError("context-parallel Flash-Next requires positive integer PLE ngram and convolution sizes")
+    return cfg.sp_size * max(ngram - 1, (kernel - 1) * ngram)
+
+
+def sub_job_of_type(cfg, job_type: str) -> dict:
+    matches = [sub for sub in cfg.sub_jobs if sub.get("job_type") == job_type]
+    if len(matches) != 1:
+        raise ValueError(f"{cfg.config_id}: expected one {job_type} sub-job, found {len(matches)}")
+    return matches[0]
+
+
+def rl_gpu_count(cfg) -> int:
+    """GPUs the two sub-jobs need at once: each takes its own devices, so the count is the sum."""
+    sampling = int(sub_job_of_type(cfg, "sampling")["inference_config"]["n_gpus"])
+    return int(cfg.n_gpus) + sampling
