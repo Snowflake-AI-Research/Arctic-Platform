@@ -418,6 +418,111 @@ def _get_sequence_chunked_logprob_fn():
     return SequenceChunkedLogProbFn
 
 
+@functools.lru_cache(maxsize=None)
+def _get_fused_chunked_logprob_fn():
+    """Build (and cache) the CUDA chunked head: one whole-vocabulary GEMM per token chunk and one fused pass over
+    its logits each way (``kernels/fused_logprobs.py``). It serves the calls :func:`_fused_head_applies` admits."""
+    import torch
+
+    from arctic_platform.model.implementations.kernels.fused_logprobs import target_logprobs_backward_
+    from arctic_platform.model.implementations.kernels.fused_logprobs import target_logprobs_forward
+
+    class FusedChunkedLogProbFn(torch.autograd.Function):
+        """``log_softmax(hidden @ weight.T * inv_temperature)[label]`` per row of ``hidden``, as
+        ``SequenceChunkedLogProbFn`` computes it, with the logits of ``token_chunk_size`` rows at a time.
+
+        Each chunk's ``[tokens, vocab]`` logits come from one GEMM in the head's dtype (FP32 accumulation, rounded
+        once, as each vocabulary tile of the composition is); forward reads them once for the target log-probability
+        and backward recomputes them, overwrites them with their gradient in that dtype and feeds them to the two
+        gradient GEMMs. The hidden gradient is one GEMM over the whole vocabulary (rounded once), and the weight
+        gradient is accumulated across token chunks in FP32 and rounded once. A frozen weight (LoRA) skips its GEMM.
+        """
+
+        @staticmethod
+        def forward(ctx, hidden, weight, labels, inv_temperature, token_chunk_size: int):
+            n_tokens = hidden.shape[0]
+            vocab_size = weight.shape[0]
+            labels = labels.to(torch.long).contiguous()
+            inv_temperature = inv_temperature.to(torch.float32).contiguous()
+            logprobs = torch.empty(n_tokens, device=hidden.device, dtype=torch.float32)
+            logz = torch.empty_like(logprobs)
+            others_minus_target = torch.empty_like(logprobs)
+            chunk = max(1, min(token_chunk_size, n_tokens))
+            logits = torch.empty(chunk, vocab_size, device=hidden.device, dtype=hidden.dtype)
+            for start in range(0, n_tokens, token_chunk_size):
+                end = min(start + token_chunk_size, n_tokens)
+                tile = torch.mm(hidden[start:end], weight.t(), out=logits[: end - start])
+                target_logprobs_forward(
+                    tile,
+                    labels[start:end],
+                    inv_temperature[start:end],
+                    logprobs[start:end],
+                    logz[start:end],
+                    others_minus_target[start:end],
+                )
+            ctx.save_for_backward(hidden, weight, labels, inv_temperature, logz, others_minus_target)
+            ctx.token_chunk_size = token_chunk_size
+            return logprobs
+
+        @staticmethod
+        def backward(ctx, grad_logprobs):
+            hidden, weight, labels, inv_temperature, logz, others_minus_target = ctx.saved_tensors
+            need_hidden, need_weight = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
+            token_chunk_size: int = ctx.token_chunk_size
+            n_tokens = hidden.shape[0]
+            vocab_size = weight.shape[0]
+            grad = grad_logprobs.to(torch.float32).contiguous()
+            grad_hidden = torch.empty_like(hidden) if need_hidden else None
+            grad_weight = torch.zeros(weight.shape, device=weight.device, dtype=torch.float32) if need_weight else None
+            chunk = max(1, min(token_chunk_size, n_tokens))
+            logits = torch.empty(chunk, vocab_size, device=hidden.device, dtype=hidden.dtype)
+            for start in range(0, n_tokens, token_chunk_size):
+                end = min(start + token_chunk_size, n_tokens)
+                hidden_chunk = hidden[start:end]
+                tile = torch.mm(hidden_chunk, weight.t(), out=logits[: end - start])
+                target_logprobs_backward_(
+                    tile,
+                    labels[start:end],
+                    inv_temperature[start:end],
+                    grad[start:end],
+                    logz[start:end],
+                    others_minus_target[start:end],
+                )
+                if need_hidden:
+                    torch.mm(tile, weight, out=grad_hidden[start:end])
+                if need_weight:
+                    torch.addmm(grad_weight, tile.t(), hidden_chunk, out_dtype=torch.float32, out=grad_weight)
+            return (
+                grad_hidden,
+                grad_weight.to(weight.dtype) if grad_weight is not None else None,
+                None,
+                None,
+                None,
+            )
+
+    return FusedChunkedLogProbFn
+
+
+def _fused_head_applies(hidden, weight, *, bias, fp32_lm_head, action_masks, group_token_ids, softcap) -> bool:
+    """Whether :func:`_get_fused_chunked_logprob_fn` computes this call.
+
+    It covers the plain per-token head on CUDA in the head's own 16-bit dtype. Action masks, grouped
+    log-probabilities, a bias, Gemma's softcap and the FP32 projection keep the tiled composition.
+    """
+    import torch
+
+    return (
+        hidden.is_cuda
+        and hidden.dtype in (torch.bfloat16, torch.float16)
+        and weight.dtype == hidden.dtype
+        and not fp32_lm_head
+        and bias is None
+        and action_masks is None
+        and group_token_ids is None
+        and not softcap
+    )
+
+
 def inv_temperature_for_tokens(temperature, batch_size: int, seq_len: int, device) -> torch.Tensor:
     """Reciprocal temperature as float32 ``[B * S]``.
 
@@ -543,6 +648,20 @@ def chunked_lm_head_logprobs(
     )
 
     inv_temperature = inv_temperature_for_tokens(temperature, batch_size, seq_len, hidden_states.device)
+
+    if _fused_head_applies(
+        hidden_flat,
+        weight,
+        bias=bias,
+        fp32_lm_head=fp32_lm_head,
+        action_masks=lm_head_action_masks,
+        group_token_ids=group_token_ids,
+        softcap=softcap,
+    ):
+        logprobs = _get_fused_chunked_logprob_fn().apply(
+            hidden_flat, weight, labels_flat, inv_temperature, int(token_chunk_size)
+        )
+        return logprobs.reshape(batch_size, seq_len)
 
     fn = _get_sequence_chunked_logprob_fn()
     outputs = fn.apply(
