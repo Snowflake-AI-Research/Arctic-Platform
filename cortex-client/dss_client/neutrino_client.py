@@ -258,9 +258,10 @@ class TrainingConfig:
     n_gpus: int
     gradient_clipping: float | None = None
     multiplex_job_id: str | None = None
-    # When False, resuming from a checkpoint loads weights only and starts the
-    # optimizer fresh. Required to change DP size (the DP-sharded optimizer
-    # cannot be resized); None leaves the server default (True).
+    # When False, resuming from a checkpoint keeps the saved fp32 master weights
+    # and starts the optimizer and LR scheduler fresh. It keeps the DP-size
+    # requirement; a DP-size change also needs extra["load_module_only"]=True.
+    # None leaves the server default (True).
     load_optimizer_states: bool | None = None
     extra: dict = field(default_factory=dict)
 
@@ -376,9 +377,11 @@ class SubJobConfig:
             gradient_clipping: Optional gradient clipping threshold.
             multiplex_job_id: Optional multiplex job identifier.
             load_optimizer_states: Whether to load optimizer states from
-                checkpoints. Set to ``False`` when loading across different DP
-                sizes (``n_gpus``) since optimizer states are DP-sharded and
-                cannot be resized. When ``None``, uses server default (True).
+                checkpoints. ``False`` keeps the saved fp32 master weights and
+                starts the optimizer and LR scheduler fresh; it only works at the
+                same DP size (``n_gpus``). To change DP size, also pass
+                ``extra_training={"load_module_only": True}``. When ``None``, uses
+                server default (True).
                 **This is a creation-time setting and cannot be changed later.**
             extra_training: Additional training config keys (passthrough).
             global_batch_size: Global batch size across all GPUs.
@@ -1655,9 +1658,11 @@ class NeutrinoClient:
 
         If the target sub-job has a different DP size (``n_gpus``) than the
         checkpoint was saved from, you **must** have created the job with
-        ``load_optimizer_states=False`` in the ``SubJobConfig``. The optimizer
-        states are DP-sharded and cannot be resized. This setting is configured
-        at job creation time and cannot be changed at runtime.
+        ``load_optimizer_states=False`` in the ``SubJobConfig`` and
+        ``extra_training={"load_module_only": True}``. The optimizer states are
+        DP-sharded and cannot be resized, so the load restores model weights only
+        and the fp32 master weights are rebuilt from bf16. These settings are
+        configured at job creation time and cannot be changed at runtime.
 
         **Server validation:**
 
