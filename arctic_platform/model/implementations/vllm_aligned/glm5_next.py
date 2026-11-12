@@ -1429,20 +1429,23 @@ def turn_layout(plan: torch.Tensor, cu_seqlens: torch.Tensor, *, block_size: int
 
 
 def plan_block_size(plan: torch.Tensor, cu_seqlens: torch.Tensor) -> int:
-    """The cache page of a packed turn plan: the greatest common divisor of where its rows' columns start (each hit is
-    a whole number of pages); the longest row if nothing resumes."""
+    """The cache page of a packed turn plan, as far as the plan shows it: the greatest common divisor of where its
+    rows' columns start and where the column a span reads from changes (both are page boundaries); the longest row
+    if nothing resumes."""
     import math
 
     plan = plan.reshape(-1, *plan.shape[-2:]).to("cpu")
     bounds = cu_seqlens.to(torch.long).tolist()
-    hits = []
+    boundaries = []
     for lo, hi in zip(bounds[:-1], bounds[1:]):
-        computed = plan[lo:hi, :, 0] > 0
-        for column in range(computed.shape[1]):
-            where = torch.nonzero(computed[:, column]).flatten()
+        role = plan[lo:hi, :, 0]
+        for column in range(role.shape[1]):
+            where = torch.nonzero(role[:, column] > 0).flatten()
             if where.numel() and int(where[0]) > 0:
-                hits.append(int(where[0]))
-    return math.gcd(*hits) if hits else max(hi - lo for lo, hi in zip(bounds[:-1], bounds[1:]))
+                boundaries.append(int(where[0]))
+            changes = torch.nonzero(role[1:, column] != role[:-1, column]).flatten() + 1
+            boundaries += [int(p) for p in changes.tolist() if int(role[p - 1, column]) < 0 and int(role[p, column]) < 0]
+    return math.gcd(*boundaries) if boundaries else max(hi - lo for lo, hi in zip(bounds[:-1], bounds[1:]))
 
 
 def _sequence_of_tokens(cu_seqlens: torch.Tensor) -> torch.Tensor:

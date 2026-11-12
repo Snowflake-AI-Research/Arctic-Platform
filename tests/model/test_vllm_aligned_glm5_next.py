@@ -582,6 +582,12 @@ def test_turn_layout_reads_cached_pages_from_their_writer_and_resumes_its_state(
                         block_size=4)  # fmt: skip
     cu = torch.tensor([0, 12], dtype=torch.int32)
     assert plan_block_size(plan, cu) == 8
+    # Hits at 4 and 8, but the third request's [4, 8) comes from two writers (pages 2 and 3): the page is 2.
+    later = encode_turns(16, [{"start": 0, "chunk_ends": [4, 6], "prompt_end": 6, "end": 7, "outputs": [5]},
+                              {"start": 4, "chunk_ends": [8, 9], "prompt_end": 9, "end": 10, "outputs": [8]},
+                              {"start": 8, "chunk_ends": [13], "prompt_end": 13, "end": 14, "outputs": [12]}],
+                         block_size=2)  # fmt: skip
+    assert plan_block_size(later, torch.tensor([0, 16], dtype=torch.int32)) == 2
     turns = turn_layout(plan, cu, block_size=4, device=torch.device("cpu"))
     assert turns.expand_index.tolist() == list(range(10)) + [8, 9, 10, 11]
     assert turns.positions.tolist() == list(range(10)) + [8, 9, 10, 11]
