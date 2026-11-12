@@ -166,6 +166,46 @@ def test_offloaded_expert_codes_match_resident_ones(lora, expert_gemms):
 
 
 @requires_cuda
+def test_the_codes_leave_the_gpu_when_the_first_layer_runs():
+    """Before the first step allocates anything, and after a restore, whose load (inside whole_frozen_weights, before
+    the first call) writes the codes on the GPU: GLM-5.3's restored LoRA job, its optimizer state loaded beside the
+    resident codes, ran out of memory in layer 0's attention. The restored model computes as a resident one holding its
+    weights."""
+    from arctic_platform.model.implementations.moe.frozen_held import whole_frozen_weights
+    from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
+    from arctic_platform.model.implementations.moe.frozen_offload import offloaded_code_stack
+
+    restored, saved = _model(0), _model(1)
+    offload = install_frozen_expert_offload(restored, root=restored)
+    experts = [layer._checkpoint_wrapped_module.experts for layer in restored]
+    with whole_frozen_weights(restored):
+        restored.load_state_dict(saved.state_dict())
+    assert not offload.offloaded and offloaded_code_stack(experts[0], "w2") is None
+    x = torch.randn(sum(COUNTS), DIM, device="cuda", dtype=torch.bfloat16)
+    xr, xs = x.clone().requires_grad_(True), x.clone().requires_grad_(True)
+    code_bytes = EXPERTS * HIDDEN * DIM * 3
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    seen = []
+
+    def probe(module, args):  # layer 0's own computation, ahead of its experts
+        seen.append(
+            (before - torch.cuda.memory_allocated(), [e.w1.numel() + e.w2.numel() + e.w3.numel() for e in experts])
+        )
+
+    restored[0]._checkpoint_wrapped_module.proj.register_forward_pre_hook(probe)
+    got, want = _run(restored, xr), _run(saved, xs)
+    freed, sizes = seen[0]
+    # Every layer's codes left the GPU; the offload's two persistent buffers hold two layers' worth.
+    assert freed >= (LAYERS - 2) * code_bytes - 4096 and sizes == [0] * LAYERS, (freed / code_bytes, sizes)
+    like, w2 = offloaded_code_stack(experts[0], "w2"), saved[0]._checkpoint_wrapped_module.experts.w2
+    assert like.device.type == "meta" and like.shape == w2.shape and like.dtype == w2.dtype
+    got.float().square().sum().backward()
+    want.float().square().sum().backward()
+    assert torch.equal(got, want) and torch.equal(xr.grad, xs.grad)
+
+
+@requires_cuda
 def test_offload_refuses_to_overwrite_a_buffer_in_use():
     from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
 

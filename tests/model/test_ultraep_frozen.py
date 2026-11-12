@@ -19,9 +19,10 @@ Multi-GPU, run directly:  torchrun --nproc-per-node 8 tests/model/test_ultraep_f
 
 With ``offload``, three activation-checkpointed layers run under the frozen expert offload (moe/frozen_offload.py):
 their codes exist only in its two persistent buffers by layer parity, which UltraEP's pointer pools read in place,
-through the forward and the reverse recompute. With ``w8a8`` the experts' forward GEMMs run W8A8
-(moe.w8a8_experts) on the native + spare stacks, and the reference emulates its activation quantization (and the
-BF16 roundings ahead of each one), straight through. Under pytest (CPU) only the LoRA staging round trip runs.
+through the forward and the reverse recompute; they run first, so the group's UltraEP state is built after the offload
+took the codes to the host (when the first layer ran), from the stacks' shapes. With ``w8a8`` the experts' forward
+GEMMs run W8A8 (moe.w8a8_experts) on the native + spare stacks, and the reference emulates its activation quantization
+(and the BF16 roundings ahead of each one), straight through. Under pytest (CPU) only the LoRA staging round trip runs.
 """
 
 import os
@@ -277,10 +278,14 @@ def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     group = dist.new_group(list(range(world)))
     owner = nn.Module()
-    before, after = _single_layer(rank, world, group, owner)
     if offload:
+        # First, as in a job: the UltraEP state is built at the first MoE call, after the offload took the codes.
+        from arctic_platform.model.implementations.moe import ultraep_frozen
+
+        assert id(group) not in ultraep_frozen._STATES
         state = _offloaded_layers(rank, world, group)
         assert state.offloaded and state.copies >= len(state.layers), state.copies
+    before, after = _single_layer(rank, world, group, owner)
     if rank == 0:
         print(
             f"ok (fp8{' + w8a8' if _W8A8 else ''}{' + offload' if offload else ''}): EP{world}, {S} spares: copies"
