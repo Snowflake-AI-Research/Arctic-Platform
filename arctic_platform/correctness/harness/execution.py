@@ -27,7 +27,6 @@ import sys
 import time
 import traceback
 from contextlib import contextmanager
-from contextlib import nullcontext
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -56,7 +55,7 @@ from .config import TestSpec
 from .config import arms_for
 from .config import config_checksum
 from .config import config_id
-from .config import config_paths as discover_config_paths
+from .config import config_paths
 from .config import load_config
 from .config import local_config_path
 from .config import local_gpu_type
@@ -73,6 +72,8 @@ from .report import write as write_report
 from .runner import assert_applicable_tests_registered
 from .runner import cortex_unavailable_reason
 from .runner import execute
+from .runner import execute_rl
+from .runner import validate_local_full_model
 
 CORRECTNESS_DIR = Path(__file__).resolve().parents[1]
 CONFIG_DIR = CORRECTNESS_DIR / "configs"
@@ -84,7 +85,7 @@ def _resolve_configs(args, *, filter_by_local_gpu: bool = True) -> List[Path]:
     if getattr(args, "resolved_paths", None) is not None:
         return list(args.resolved_paths)
     if args.all_configs:
-        paths = discover_config_paths(Path(args.config_dir))
+        paths = config_paths(Path(args.config_dir))
         if not filter_by_local_gpu or args.any_gpu:
             return paths
         gpu_type = local_gpu_type()
@@ -318,8 +319,132 @@ def _client_backend(args) -> OnPremConfig | CortexConfig:
     return backend
 
 
-def _run_vocab_size(cfg, spec, select, backend, published_fixture: dict | None = None) -> int:
+def _load_inference_export_allocation(args) -> dict | None:
+    """Read pinned allocation metadata only for one explicit local inference check."""
+    path = getattr(args, "inference_export_allocation", None)
+    expected = getattr(args, "inference_export_allocation_sha256", None)
+    if (path is None) != (expected is None):
+        raise ValueError(
+            "--inference-export-allocation and --inference-export-allocation-sha256 are required together"
+        )
+    if path is None:
+        return None
+    if (
+        not getattr(args, "config", None)
+        or getattr(args, "all_configs", False)
+        or getattr(args, "test", None) != ["inference-checkpoint-loss"]
+        or getattr(args, "backend", "cortex") != "cortex"
+        or getattr(args, "prepare_references", False)
+        or getattr(args, "probe_layers", None) is not None
+        or getattr(args, "local_cortex_fixture", False)
+        or getattr(args, "cortex_fixture", None) is not None
+    ):
+        raise ValueError("export allocation requires one explicit local Cortex inference-checkpoint-loss config")
+    require_local_cortex_gateway(_client_backend(args))
+    if not isinstance(expected, str) or len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+        raise ValueError("export allocation requires a full lowercase SHA256")
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError("inference export allocation SHA256 mismatch")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate inference export allocation key: {key}")
+            result[key] = value
+        return result
+
+    admission = json.loads(raw, object_pairs_hook=unique_object)
+    if not isinstance(admission, dict):
+        raise ValueError("inference export allocation must be a JSON object")
+    json.dumps(admission, allow_nan=False)
+    return admission
+
+
+def _load_dense_checkpoint_allocation(args, *, allow_automatic_gateway: bool = False) -> dict | None:
+    """Read a pinned same-job allocation before optimizer selection can be grouped."""
+    path = getattr(args, "dense_checkpoint_allocation", None)
+    expected = getattr(args, "dense_checkpoint_allocation_sha256", None)
+    if (path is None) != (expected is None):
+        raise ValueError(
+            "--dense-checkpoint-allocation and --dense-checkpoint-allocation-sha256 are required together"
+        )
+    if path is None:
+        return None
+    selected = getattr(args, "test", None)
+    if (
+        not getattr(args, "config", None)
+        or getattr(args, "all_configs", False)
+        or not selected
+        or "single-step-optimizer" not in selected
+        or not set(selected) <= {"single-step-grads", "single-step-optimizer"}
+        or getattr(args, "backend", "cortex") != "cortex"
+        or getattr(args, "prepare_references", False)
+        or getattr(args, "probe_layers", None) is not None
+        or not getattr(args, "local_cortex_fixture", False)
+        or getattr(args, "cortex_fixture", None) is not None
+        or getattr(args, "local_gateway_full_model", False)
+        or getattr(args, "peft_adapter", None) is not None
+    ):
+        raise ValueError("dense checkpoint allocation requires one explicit local Cortex first-two optimizer config")
+    backend_args = args
+    if allow_automatic_gateway and not any(
+        getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}") for name in ("base_url", "host")
+    ):
+        # Metadata admission precedes onboarding's owned gateway; never supply this URL to the target.
+        backend_args = copy.copy(args)
+        backend_args.base_url = "http://127.0.0.1:1"
+    require_local_cortex_gateway(_client_backend(backend_args))
+    if not isinstance(expected, str) or len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+        raise ValueError("dense checkpoint allocation requires a full lowercase SHA256")
+    with Path(path).open("rb") as handle:
+        raw = handle.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024 or hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError("dense checkpoint allocation exceeds metadata bound or SHA256 mismatch")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate dense checkpoint allocation key: {key}")
+            result[key] = value
+        return result
+
+    admission = json.loads(raw, object_pairs_hook=unique_object)
+    if not isinstance(admission, dict):
+        raise ValueError("dense checkpoint allocation must be a JSON object")
+    json.dumps(admission, allow_nan=False)
+    return admission
+
+
+def _load_inference_initial_model_dir(args) -> Path | None:
+    """Forward an explicit initial training root without changing the configured model identity."""
+    value = getattr(args, "inference_initial_model_dir", None)
+    if value is None:
+        return None
+    if _load_inference_export_allocation(args) is None:
+        raise ValueError("inference initial model directory requires a pinned local inference export allocation")
+    from arctic_platform.correctness.harness.inference import validate_initial_training_model_dir
+
+    return validate_initial_training_model_dir(value)
+
+
+def _run_vocab_size(
+    cfg, spec, select, backend, published_fixture: dict | None = None, *, local_full_model_path: Path | None = None
+) -> int:
     from transformers import AutoConfig
+
+    if local_full_model_path is not None:
+        model_cfg = AutoConfig.from_pretrained(local_full_model_path, local_files_only=True, trust_remote_code=True)
+        return int(getattr(model_cfg, "text_config", model_cfg).vocab_size)
+    if (
+        select
+        and set(select) == {"inference-checkpoint-loss"}
+        and "inference-checkpoint-loss" in spec.applicable_tests
+    ):
+        with console.activity("Reading configured model vocabulary"):
+            return _catalog_vocab_size(cfg.model_name)
 
     if isinstance(backend, CortexConfig):
         runnable = any(
@@ -339,13 +464,16 @@ def _run_vocab_size(cfg, spec, select, backend, published_fixture: dict | None =
 
 
 def _configure_regression_target(args):
-    """First-two config regression owns a local service only when no endpoint is configured."""
+    """Supported config regression owns a local service only when no endpoint is configured."""
     if (
         getattr(args, "backend", "cortex") == "onprem"
         or not args.config
         or args.all_configs
         or not args.test
-        or not set(args.test) <= {"single-step-grads", "single-step-optimizer"}
+        or not (
+            set(args.test) <= {"single-step-grads", "single-step-optimizer"}
+            or set(args.test) == {"checkpoint-resume-loss"}
+        )
         or getattr(args, "cortex_fixture", None) is not None
         or getattr(args, "local_gateway_full_model", False)
         or any(
@@ -354,23 +482,63 @@ def _configure_regression_target(args):
         )
     ):
         return args
-    if load_config(_resolve_configs(args, filter_by_local_gpu=False)[0]).is_rl:
+    if load_config(_resolve_configs(args, filter_by_local_gpu=False)[0]).is_rl and args.test != [
+        "checkpoint-resume-loss"
+    ]:
         return args
     args = copy.copy(args)
     args._automatic_cortex_gateway = True
+    args._automatic_checkpoint_bridge = "checkpoint-resume-loss" in args.test
     args.local_cortex_fixture = True
     args.base_url = "http://127.0.0.1:1"
     require_local_cortex_gateway(_client_backend(args))
     return args
 
 
+@contextmanager
+def _regression_gateway(args, *, runtime_admission: dict | None = None):
+    if not getattr(args, "_automatic_cortex_gateway", False):
+        yield None
+        return
+    if not getattr(args, "_automatic_checkpoint_bridge", False):
+        with local_cortex_gateway(
+            Path(args.out),
+            gateway_module="arctic_platform.correctness.harness.gateway",
+            **({"runtime_admission": runtime_admission} if runtime_admission is not None else {}),
+        ) as url:
+            yield url
+        return
+    from arctic_platform.correctness.harness.cortex import local_checkpoint_bridge
+
+    with local_checkpoint_bridge():
+        with local_cortex_gateway(Path(args.out), gateway_module="arctic_platform.correctness.harness.gateway") as url:
+            yield url
+
+
 def _run_configs(args, *, executor=None, snapshot=None) -> int:
     started = time.monotonic()
     args = _configure_regression_target(args)
     dense_checkpoint_allocation = _load_dense_checkpoint_allocation(args)
+    inference_export_allocation = _load_inference_export_allocation(args)
+    inference_initial_model_dir = _load_inference_initial_model_dir(args)
     test_spec = getattr(args, "test_spec", None)
+    topology = getattr(args, "inference_sampling_topology", None)
+    training_gpus = getattr(args, "inference_training_gpus", None)
+    checkpoint_gpus = getattr(args, "checkpoint_training_gpus", None)
     if test_spec is not None and (not args.config or args.all_configs):
         raise SystemExit("--test-spec requires one explicit --config")
+    if checkpoint_gpus is not None:
+        if not args.config or args.all_configs or args.test != ["checkpoint-resume-loss"]:
+            raise SystemExit("--checkpoint-training-gpus requires one config and only checkpoint-resume-loss")
+        if type(checkpoint_gpus) is not int or checkpoint_gpus <= 0:
+            raise SystemExit("--checkpoint-training-gpus must be a positive integer")
+    if topology is not None and (not args.config or args.all_configs or args.test != ["inference-checkpoint-loss"]):
+        raise SystemExit("--inference-sampling-topology requires one config and only inference-checkpoint-loss")
+    if training_gpus is not None:
+        if not args.config or args.all_configs or args.test != ["inference-checkpoint-loss"]:
+            raise SystemExit("--inference-training-gpus requires one config and only inference-checkpoint-loss")
+        if type(training_gpus) is not int or training_gpus <= 0:
+            raise SystemExit("--inference-training-gpus must be a positive integer")
     if getattr(args, "out", None) is None:
         args.out = correctness_logdir("ap-correctness-run-")
     backend = _client_backend(args)
@@ -381,24 +549,44 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
     remote = isinstance(backend, CortexConfig)
     fixture_path = getattr(args, "cortex_fixture", None)
     local_fixture = getattr(args, "local_cortex_fixture", False)
+    local_full_model = getattr(args, "local_gateway_full_model", False)
     if fixture_path is not None and (not remote or not args.config or args.all_configs):
         raise SystemExit("--cortex-fixture requires one --config and --backend cortex")
     if local_fixture and (
         not remote
         or not args.config
         or args.all_configs
-        or fixture_path is not None
-        or not args.test
-        or not set(args.test) <= {"single-step-grads", "single-step-optimizer"}
+        or (fixture_path is not None)
+        or (not args.test)
+        or (
+            not (
+                set(args.test) <= {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}
+                or set(args.test) == {"checkpoint-resume-loss"}
+            )
+        )
     ):
-        raise SystemExit("--local-cortex-fixture requires one Cortex config and only first-two checks")
-    if local_fixture:
+        raise SystemExit(
+            "--local-cortex-fixture requires one Cortex config and only first-two, E2E or checkpoint checks"
+        )
+    if local_full_model and (
+        not remote
+        or not args.config
+        or args.all_configs
+        or local_fixture
+        or (fixture_path is not None)
+        or (not args.test)
+        or (not set(args.test) <= {"e2e-sft-train-validate", "inference-checkpoint-loss"})
+    ):
+        raise SystemExit("--local-gateway-full-model requires one Cortex config and only e2e/inference")
+    if local_fixture or local_full_model:
         require_local_cortex_gateway(backend)
     config_paths = _resolve_configs(args, filter_by_local_gpu=not remote)
-    if dense_checkpoint_allocation is not None and len(config_paths) != 1:
-        raise ValueError("dense checkpoint allocation requires exactly one resolved config")
     if test_spec is not None and len(config_paths) != 1:
         raise SystemExit("--test-spec requires exactly one resolved config")
+    if inference_export_allocation is not None and len(config_paths) != 1:
+        raise ValueError("export allocation requires exactly one resolved config")
+    if dense_checkpoint_allocation is not None and len(config_paths) != 1:
+        raise ValueError("dense checkpoint allocation requires exactly one resolved config")
     results: List[TestResult] = []
     specs: Dict[str, TestSpec] = {}
     execution: Dict[str, dict] = {}
@@ -409,33 +597,69 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
     unknown = sorted(set(args.test or []) - set(tests))
     if unknown:
         raise SystemExit(f"unknown check(s): {', '.join(unknown)}")
-
+    selected_ids = set(args.test or tests)
+    first_two_ids = {"single-step-grads", "single-step-optimizer"}
+    first_two_selection = bool(selected_ids and selected_ids <= first_two_ids)
+    automatic_first_two = bool(
+        getattr(args, "_automatic_cortex_gateway", False)
+        and args.test
+        and (selected_ids <= first_two_ids)
+        and (not getattr(args, "_automatic_checkpoint_bridge", False))
+    )
     for path in config_paths:
         automatic_allocation = None
         try:
             cfg = load_config(path)
-            validate_first_two_model_dtype(cfg)
-            if any(tests[test_id].compares_to_reference for test_id in (args.test or tests)):
+            if not cfg.is_rl and selected_ids & first_two_ids:
+                validate_first_two_model_dtype(cfg)
                 from .engine_admission import validate_reference_accumulation
 
-                validate_reference_accumulation(
-                    cfg, automatically_owned_local=getattr(args, "_automatic_cortex_gateway", False)
-                )
+                validate_reference_accumulation(cfg, automatically_owned_local=automatic_first_two)
+            if topology is not None:
+                from types import SimpleNamespace
+
+                from ..checks.inference_checkpoint_loss import _sampling_topology
+
+                topology = tuple(topology)
+                _sampling_topology(SimpleNamespace(cfg=cfg, inference_sampling_topology=topology))
             execution[cfg.config_id] = {
                 "backend": "cortex" if remote else "onprem",
                 **({"requested_model_name": cfg.model_name} if remote else {}),
             }
-            pool = (args.gpu_pool or cfg.n_gpus) if remote else available_gpus()
+            pool = args.gpu_pool or cfg.n_gpus if remote else available_gpus()
             if remote:
                 if pool < cfg.n_gpus:
                     raise ValueError(f"GPU pool {pool} is smaller than declared training width {cfg.n_gpus}")
             else:
                 validate_against_host(cfg, pool, check_gpu_type=not args.any_gpu)
-            # Both are read from the config as written. The cases belong to the reviewed spec and do not
-            # move with the placement, so every width measures the same work on a different topology.
+            if training_gpus is not None:
+                if cfg.is_rl:
+                    raise ValueError("--inference-training-gpus applies only to supervised training configs")
+                if training_gpus > pool:
+                    raise ValueError(f"requested training width {training_gpus} exceeds GPU pool {pool}")
+                cfg.at_gpu_width(training_gpus)
+            if checkpoint_gpus is not None:
+                if cfg.is_rl:
+                    raise ValueError("--checkpoint-training-gpus applies only to supervised training configs")
+                if checkpoint_gpus > pool:
+                    raise ValueError(f"requested checkpoint training width {checkpoint_gpus} exceeds GPU pool {pool}")
+                cfg.at_gpu_width(checkpoint_gpus)
             arm_defs = arms_for(cfg.max_seq_len, cfg.n_gpus)
-            widths = placement_widths(cfg.n_gpus, pool)
-            if getattr(args, "_automatic_cortex_gateway", False):
+            selected_gpus = training_gpus if training_gpus is not None else checkpoint_gpus
+            widths = (
+                [selected_gpus]
+                if selected_gpus is not None
+                else (
+                    [cfg.n_gpus]
+                    if local_fixture
+                    and (not first_two_selection)
+                    or local_full_model
+                    or topology is not None
+                    or (inference_export_allocation is not None)
+                    else placement_widths(cfg.n_gpus, pool)
+                )
+            )
+            if automatic_first_two and (not cfg.is_rl):
                 for width in widths:
                     validate_reference_accumulation(cfg.at_gpu_width(width), automatically_owned_local=True)
                 import torch
@@ -459,6 +683,12 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         if cfg.is_rl:
             if dense_checkpoint_allocation is not None:
                 raise ValueError("dense checkpoint allocation does not support reinforcement-learning configs")
+            if (
+                fixture_path is not None
+                or local_full_model
+                or (local_fixture and args.test != ["checkpoint-resume-loss"])
+            ):
+                raise SystemExit("RL local fixtures support only checkpoint-resume-loss on a local Cortex gateway")
             for test in reference_tests().values():
                 if args.test and test.test_id not in args.test:
                     continue
@@ -469,6 +699,88 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                         outcome=TestOutcome.INAPPLICABLE,
                         summary="reinforcement-learning config",
                         reason=RL_INAPPLICABLE_REASON,
+                    )
+                )
+            prepared = _frozen_spec(
+                cfg,
+                path,
+                arm_defs,
+                attention=args.attn[0] if args.attn else cfg.attention_implementation,
+                cases=getattr(args, "case", None),
+                results=results,
+                specs=specs,
+                test_spec=test_spec,
+            )
+            if prepared is None:
+                continue
+            spec, _ = prepared
+            if (
+                remote
+                and "inference-checkpoint-loss" in spec.applicable_tests
+                and (not args.test or "inference-checkpoint-loss" in args.test)
+            ):
+                execution[cfg.config_id]["inference_model_name"] = cfg.model_name
+            print(f"=== {cfg.config_id} (reinforcement learning) ===", flush=True)
+            with _regression_gateway(args) as gateway_url:
+                if gateway_url is not None:
+                    backend.base_url = gateway_url
+                    execution[cfg.config_id]["gateway_url"] = gateway_url
+                published_fixture = None
+                if local_fixture:
+                    from arctic_platform.correctness.harness.cortex import load_local_fixture
+
+                    try:
+                        published_fixture = load_local_fixture(backend, spec)
+                    except ValueError as exc:
+                        results.append(
+                            TestResult(
+                                test_id="checkpoint-resume-loss",
+                                config_id=cfg.config_id,
+                                outcome=TestOutcome.FAIL,
+                                summary="local Cortex fixture identity unavailable",
+                                reason=str(exc),
+                            )
+                        )
+                        continue
+                    execution[cfg.config_id].update(
+                        requested_model_name=published_fixture["model_name"],
+                        fixture_sha256=published_fixture["fixture_sha256"],
+                        fixture_distribution="local-gateway",
+                        gateway_url=backend.base_url,
+                    )
+                vocab_size = _run_vocab_size(
+                    cfg,
+                    spec,
+                    args.test,
+                    backend,
+                    published_fixture,
+                    **(
+                        {"local_full_model_path": inference_initial_model_dir}
+                        if inference_initial_model_dir is not None
+                        else {}
+                    ),
+                )
+                results.extend(
+                    execute_rl(
+                        cfg,
+                        spec,
+                        vocab_size=vocab_size,
+                        select=args.test or None,
+                        cases=getattr(args, "case", None),
+                        attn=args.attn[0] if args.attn else None,
+                        client_backend=backend,
+                        **{"local_cortex_fixture": True} if local_fixture else {},
+                        **{"inference_sampling_topology": topology} if topology is not None else {},
+                        **(
+                            {"inference_export_allocation": inference_export_allocation}
+                            if inference_export_allocation is not None
+                            else {}
+                        ),
+                        **(
+                            {"inference_initial_model_dir": inference_initial_model_dir}
+                            if inference_initial_model_dir is not None
+                            else {}
+                        ),
                     )
                 )
             continue
@@ -485,7 +797,22 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         if prepared is None:
             continue
         spec, selected_cases = prepared
+        if (
+            remote
+            and "inference-checkpoint-loss" in spec.applicable_tests
+            and (not args.test or "inference-checkpoint-loss" in args.test)
+        ):
+            execution[cfg.config_id]["inference_model_name"] = cfg.model_name
         published_fixture = None
+        local_full_model_path = None
+        if local_full_model:
+            local_full_model_path = validate_local_full_model(backend, cfg, spec)
+            execution[cfg.config_id].update(
+                requested_model_name=cfg.model_name,
+                local_full_model_path=str(local_full_model_path),
+                full_model_distribution="local-gateway",
+                gateway_url=backend.base_url,
+            )
         if fixture_path is not None:
             from arctic_platform.correctness.harness.cortex import load_fixture
 
@@ -508,16 +835,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 fixture_sha256=published_fixture["fixture_sha256"],
                 fixture_stage_path=published_fixture["publication"]["stage_path"],
             )
-        managed_gateway = (
-            local_cortex_gateway(
-                Path(args.out),
-                gateway_module="arctic_platform.correctness.harness.gateway",
-                **({"runtime_admission": automatic_allocation} if automatic_allocation is not None else {}),
-            )
-            if getattr(args, "_automatic_cortex_gateway", False)
-            else nullcontext(None)
-        )
-        with managed_gateway as gateway_url:
+        with _regression_gateway(args, runtime_admission=automatic_allocation) as gateway_url:
             if gateway_url is not None:
                 backend.base_url = gateway_url
                 execution[cfg.config_id]["gateway_url"] = gateway_url
@@ -552,7 +870,6 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                     fixture_distribution="local-gateway",
                     gateway_url=backend.base_url,
                 )
-
             print(f"=== {cfg.config_id} ===", flush=True)
             vocab_size = _run_vocab_size(
                 cfg,
@@ -560,8 +877,12 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 args.test,
                 backend,
                 published_fixture,
+                **(
+                    {"local_full_model_path": inference_initial_model_dir}
+                    if inference_initial_model_dir is not None
+                    else {"local_full_model_path": local_full_model_path} if local_full_model else {}
+                ),
             )
-
             for width in widths:
                 multiple = width // cfg.n_gpus
                 run_cfg = cfg.at_gpu_width(width)
@@ -570,24 +891,23 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                     print(f"--- {cfg.config_id} on {width} GPU(s) ---", flush=True)
                 native_optimizer = {}
                 run_dense_allocation = dense_checkpoint_allocation
-                from .runner import supports_dense_checkpoint_allocation
+                if automatic_allocation is not None:
+                    from .runner import supports_dense_checkpoint_allocation
 
-                if (
-                    run_dense_allocation is None
-                    and automatic_allocation is not None
-                    and "single-step-optimizer" in args.test
-                    and supports_dense_checkpoint_allocation(run_cfg)
-                    and set(args.test) <= {"single-step-grads", "single-step-optimizer"}
-                    and sum(node["slots"] for node in automatic_allocation["nodes"]) == run_cfg.dp_size
-                ):
-                    run_dense_allocation = automatic_allocation
+                    if (
+                        run_dense_allocation is None
+                        and "single-step-optimizer" in selected_ids
+                        and (selected_ids <= first_two_ids)
+                        and supports_dense_checkpoint_allocation(run_cfg)
+                        and (sum((node["slots"] for node in automatic_allocation["nodes"])) == run_cfg.dp_size)
+                    ):
+                        run_dense_allocation = automatic_allocation
                 if (
                     local_fixture
-                    and "single-step-optimizer" in args.test
-                    and set(args.test) <= {"single-step-grads", "single-step-optimizer"}
-                    and run_cfg.training.get("ep_size", 1) > 1
+                    and "single-step-optimizer" in selected_ids
+                    and (selected_ids <= first_two_ids)
+                    and (run_cfg.training.get("ep_size", 1) > 1)
                 ):
-                    # Expert-parallel optimizer checkpoints require the native rank-local decoder.
                     from arctic_platform.correctness.harness.native_optimizer import owner_split_execution
 
                     native_optimizer = owner_split_execution(run_cfg)
@@ -602,16 +922,18 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                         select=args.test or None,
                         attn=args.attn[0] if args.attn else None,
                         client_backend=backend,
+                        **{"cortex_fixture": fixture_path} if fixture_path is not None else {},
+                        **{"local_cortex_fixture": True} if local_fixture else {},
+                        **{"local_gateway_full_model": True} if local_full_model else {},
+                        **{"inference_sampling_topology": topology} if topology is not None else {},
                         **(
-                            {"dense_checkpoint_allocation": copy.deepcopy(run_dense_allocation)}
-                            if run_dense_allocation is not None
+                            {"inference_export_allocation": inference_export_allocation}
+                            if inference_export_allocation is not None
                             else {}
                         ),
-                        **({"cortex_fixture": fixture_path} if fixture_path is not None else {}),
-                        **({"local_cortex_fixture": True} if local_fixture else {}),
                         **(
-                            {"peft_adapter": Path(args.peft_adapter)}
-                            if getattr(args, "peft_adapter", None) is not None
+                            {"inference_initial_model_dir": inference_initial_model_dir}
+                            if inference_initial_model_dir is not None
                             else {}
                         ),
                         **(
@@ -619,10 +941,19 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                             if getattr(args, "reference_records_dir", None) is not None
                             else {}
                         ),
+                        **(
+                            {"peft_adapter": Path(args.peft_adapter)}
+                            if getattr(args, "peft_adapter", None) is not None
+                            else {}
+                        ),
+                        **(
+                            {"dense_checkpoint_allocation": copy.deepcopy(run_dense_allocation)}
+                            if run_dense_allocation is not None
+                            else {}
+                        ),
                         **native_optimizer,
                     )
                 )
-
     if snapshot is not None:
         snapshot(results, specs, execution)
     return _finish(results, specs, Path(args.out), configs=len(config_paths), started=started, execution=execution)
@@ -943,8 +1274,8 @@ def parse_args(argv=None):
             choices=["batched", "per-arm"],
             default="batched",
             help=(
-                "batched pays one gateway startup for all arms; per-arm runs "
-                "reference then Arctic Platform for one arm before the next begins"
+                "batched pays one gateway startup for all arms; per-arm runs reference then Arctic Platform for one"
+                " arm before the next begins"
             ),
         )
         p.add_argument("--fail-fast", action="store_true", help="stop after the first arm whose verdict is not a pass")
@@ -953,8 +1284,8 @@ def parse_args(argv=None):
             "--any-gpu",
             action="store_true",
             help=(
-                "run a config on a GPU type its path does not name; the budgets and offload "
-                "choices in it were sized for another accelerator"
+                "run a config on a GPU type its path does not name; the budgets and offload choices in it were sized"
+                " for another accelerator"
             ),
         )
 
@@ -964,17 +1295,46 @@ def parse_args(argv=None):
     r.add_argument(
         "--test-spec", type=Path, help="reviewed private spec for one explicit config; integrity checks apply"
     )
+    r.add_argument(
+        "--peft-adapter",
+        type=Path,
+        help="optional standard PEFT adapter under /data-fast; otherwise generate upstream-default LoRA factors",
+    )
+    r.add_argument(
+        "--checkpoint-training-gpus",
+        type=int,
+        help="explicit supervised training placement for checkpoint-resume-loss; requires a sufficient GPU pool",
+    )
+    r.add_argument(
+        "--inference-training-gpus",
+        type=int,
+        help="explicit supervised training placement for inference-checkpoint-loss; requires a sufficient GPU pool",
+    )
+    r.add_argument(
+        "--inference-sampling-topology",
+        type=int,
+        nargs=3,
+        metavar=("GPUS", "TP", "PP"),
+        help="explicit inference sampling allocation, tensor parallelism and pipeline parallelism",
+    )
+    r.add_argument("--inference-export-allocation", type=Path, help="same-job local inference allocation JSON")
+    r.add_argument("--inference-export-allocation-sha256", help="full SHA256 of the allocation JSON bytes")
     r.add_argument("--dense-checkpoint-allocation", type=Path, help="same-job local dense optimizer allocation JSON")
     r.add_argument(
         "--dense-checkpoint-allocation-sha256", help="full SHA256 of the dense optimizer allocation JSON bytes"
+    )
+    r.add_argument(
+        "--inference-initial-model-dir",
+        type=Path,
+        help="already admitted absolute FAST model directory for initial local Cortex inference training only",
     )
     r.add_argument("--test", action="append", help="test id (repeatable); default every applicable test")
     r.add_argument(
         "--case",
         action="append",
         help=(
-            "case name to run, e.g. gas1 (repeatable); default every case in the spec. "
-            "Use this to see the output quickly: gas1 is one sequence and no accumulation"
+            "case name to run, e.g. gas1 (repeatable); default every case in the spec. Use this to see the output"
+            " quickly: gas1 is one sequence and no accumulation"
         ),
     )
     r.add_argument(
@@ -985,12 +1345,7 @@ def parse_args(argv=None):
     r.add_argument(
         "--reference-records-dir",
         type=Path,
-        help="prepared HF records; missing records require explicit onboarding",
-    )
-    r.add_argument(
-        "--peft-adapter",
-        type=Path,
-        help="optional standard PEFT adapter under /data-fast; otherwise generate upstream-default LoRA factors",
+        help="prepared HF records inside the checkout; missing records require explicit onboarding",
     )
     r.add_argument(
         "--cortex-fixture",
@@ -1002,8 +1357,12 @@ def parse_args(argv=None):
         action="store_true",
         help="bind reviewed local HF weights to the existing loopback gateway for single-step comparisons",
     )
+    r.add_argument(
+        "--local-gateway-full-model",
+        action="store_true",
+        help="use the pinned original offline model on the existing loopback gateway for e2e/inference",
+    )
     r.set_defaults(func=cmd_run, compact_output=True)
-
     publish = sub.add_parser("publish-fixture", help="publish reviewed reduced weights as a separate dev model")
     publish.add_argument("--config", required=True)
     publish.add_argument("--staging-dir", default="/data-fast/tmp/ap-cortex-fixtures")
@@ -1014,98 +1373,34 @@ def parse_args(argv=None):
     )
     publish.add_argument("--out", required=True, help="new publication receipt JSON path")
     publish.set_defaults(func=cmd_publish_fixture)
-
     list_parser = sub.add_parser("list", help="show registered tests")
     list_parser.add_argument("--config-dir", default=str(CONFIG_DIR))
     list_parser.set_defaults(func=cmd_list)
-
     h = sub.add_parser(
         "hosted",
-        help="run gradient and optimizer comparisons using hosted training GPUs",
+        help="run Arctic Platform-against-Arctic Platform checks on the hosted server, which supplies the GPUs",
     )
     shared(h)
     add_connection_arguments(h)
     h.add_argument(
-        "--test",
-        action="append",
-        required=True,
-        help="check id to run (repeatable); requires reviewed applicability",
+        "--test", action="append", required=True, help="check id to run (repeatable); requires reviewed applicability"
     )
     h.add_argument(
         "--case", action="append", help="case name to run, e.g. gas1 (repeatable); default every case in the spec"
     )
     h.add_argument("--out", default="correctness-report-hosted")
     h.set_defaults(func=cmd_hosted, compact_output=True)
-
     s = sub.add_parser("selftest", help="check the harness itself; no GPU and no config needed")
     s.add_argument("runner_args", nargs="*", help="extra arguments forwarded to the runner")
     s.set_defaults(func=cmd_selftest)
-
     from ..onboarding import add_arguments
 
     o = sub.add_parser("onboard", help="size, calibrate, and freeze one config")
     add_arguments(o)
     o.set_defaults(func=cmd_onboard)
-
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
     return args.func(args)
-
-
-def _load_dense_checkpoint_allocation(args, *, allow_automatic_gateway: bool = False) -> dict | None:
-    """Read a pinned same-job allocation before optimizer selection can be grouped."""
-    path = getattr(args, "dense_checkpoint_allocation", None)
-    expected = getattr(args, "dense_checkpoint_allocation_sha256", None)
-    if (path is None) != (expected is None):
-        raise ValueError(
-            "--dense-checkpoint-allocation and --dense-checkpoint-allocation-sha256 are required together"
-        )
-    if path is None:
-        return None
-    selected = getattr(args, "test", None)
-    if (
-        not getattr(args, "config", None)
-        or getattr(args, "all_configs", False)
-        or not selected
-        or "single-step-optimizer" not in selected
-        or not set(selected) <= {"single-step-grads", "single-step-optimizer"}
-        or getattr(args, "backend", "cortex") != "cortex"
-        or getattr(args, "prepare_references", False)
-        or getattr(args, "probe_layers", None) is not None
-        or not getattr(args, "local_cortex_fixture", False)
-        or getattr(args, "cortex_fixture", None) is not None
-        or getattr(args, "local_gateway_full_model", False)
-        or getattr(args, "peft_adapter", None) is not None
-    ):
-        raise ValueError("dense checkpoint allocation requires one explicit local Cortex first-two optimizer config")
-    backend_args = args
-    if allow_automatic_gateway and not any(
-        getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}") for name in ("base_url", "host")
-    ):
-        # Metadata admission precedes onboarding's owned gateway; never supply this URL to the target.
-        backend_args = copy.copy(args)
-        backend_args.base_url = "http://127.0.0.1:1"
-    require_local_cortex_gateway(_client_backend(backend_args))
-    if not isinstance(expected, str) or len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
-        raise ValueError("dense checkpoint allocation requires a full lowercase SHA256")
-    with Path(path).open("rb") as handle:
-        raw = handle.read(1024 * 1024 + 1)
-    if len(raw) > 1024 * 1024 or hashlib.sha256(raw).hexdigest() != expected:
-        raise ValueError("dense checkpoint allocation exceeds metadata bound or SHA256 mismatch")
-
-    def unique_object(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError(f"duplicate dense checkpoint allocation key: {key}")
-            result[key] = value
-        return result
-
-    admission = json.loads(raw, object_pairs_hook=unique_object)
-    if not isinstance(admission, dict):
-        raise ValueError("dense checkpoint allocation must be a JSON object")
-    json.dumps(admission, allow_nan=False)
-    return admission

@@ -129,16 +129,16 @@ class ArmSpec:
 
 @dataclass
 class ModelSpec:
-    """The synthetic model recipe. Regenerable from the seed, so the path is a cache and not an input."""
+    """Prepared synthetic recipe or pinned original source; unmeasured reference-free metadata may be None."""
 
     source_checkpoint: str
     num_hidden_layers: int
-    vision_depth: int
-    seed: int
-    param_count: int
+    vision_depth: Optional[int]
+    seed: Optional[int]
+    param_count: Optional[int]
     cache_path: str
     content_hash: str
-    sized_against_gib: float
+    sized_against_gib: Optional[float]
     measured_reference_peak_gib: Optional[float] = None
 
 

@@ -71,7 +71,14 @@ class RunOptions:
     peft_adapter: Path | None = None
     cortex_fixture: Path | None = None
     local_cortex_fixture: bool = False
+    local_gateway_full_model: bool = False
     test_spec: Path | None = None
+    checkpoint_training_gpus: int | None = None
+    inference_training_gpus: int | None = None
+    inference_sampling_topology: tuple[int, int, int] | None = None
+    inference_export_allocation: Path | None = None
+    inference_export_allocation_sha256: str | None = None
+    inference_initial_model_dir: Path | None = None
     dense_checkpoint_allocation: Path | None = None
     dense_checkpoint_allocation_sha256: str | None = None
 
@@ -188,7 +195,7 @@ def options_from_args(args: Namespace) -> RunOptions:
         for name in RunOptions.__dataclass_fields__
         if hasattr(args, name) and getattr(args, name) is not None
     }
-    for name in ("attn", "case"):
+    for name in ("attn", "case", "inference_sampling_topology"):
         if name in values:
             values[name] = tuple(values[name])
     if "out" in values:
@@ -201,13 +208,31 @@ def options_from_args(args: Namespace) -> RunOptions:
 def run(request: RunRequest, options: RunOptions | None = None, *, executor: Callable | None = None) -> BatchResult:
     """Run selected cases sequentially with short output and complete saved logs."""
     from .harness.execution import _load_dense_checkpoint_allocation
+    from .harness.execution import _load_inference_export_allocation
+    from .harness.execution import _load_inference_initial_model_dir
     from .harness.execution import run_batch
 
     options = options or RunOptions()
     if options.test_spec is not None and (request.config is None or request.all_configs):
         raise ValueError("--test-spec requires one explicit --config")
+    if options.checkpoint_training_gpus is not None:
+        if request.config is None or request.all_configs or request.tests != ("checkpoint-resume-loss",):
+            raise ValueError("--checkpoint-training-gpus requires one config and only checkpoint-resume-loss")
+        if type(options.checkpoint_training_gpus) is not int or options.checkpoint_training_gpus <= 0:
+            raise ValueError("--checkpoint-training-gpus must be a positive integer")
+    if options.inference_sampling_topology is not None and (
+        request.config is None or request.all_configs or request.tests != ("inference-checkpoint-loss",)
+    ):
+        raise ValueError("--inference-sampling-topology requires one config and only inference-checkpoint-loss")
+    if options.inference_training_gpus is not None:
+        if request.config is None or request.all_configs or request.tests != ("inference-checkpoint-loss",):
+            raise ValueError("--inference-training-gpus requires one config and only inference-checkpoint-loss")
+        if type(options.inference_training_gpus) is not int or options.inference_training_gpus <= 0:
+            raise ValueError("--inference-training-gpus must be a positive integer")
     args = _namespace(request, options)
     _load_dense_checkpoint_allocation(args)
+    _load_inference_export_allocation(args)
+    _load_inference_initial_model_dir(args)
     selected = select(request)
     return run_batch(args, selected=selected, executor=executor)
 

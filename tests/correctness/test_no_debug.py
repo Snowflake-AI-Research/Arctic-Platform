@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU CLI admission without added debug modules, model downloads or a target service."""
+"""CPU admission controls and five-check CLI registration without model downloads or a target service."""
 
 import json
 import re
@@ -79,21 +79,39 @@ class TestNoDebugCorrectness(TestCasePlus):
             *arguments,
         )
 
-    def test_list_registers_only_two_supervised_checks_without_debug(self):
+    def test_list_registers_all_five_checks(self):
         config_root = self.get_auto_remove_tmp_dir()
         result = self._cli("list", "--config-dir", str(config_root))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         tests = result.stdout.split("Tests:", 1)[1]
         identifiers = re.findall(r"^([a-z][a-z0-9-]+)\s+", tests, re.MULTILINE)
-        self.assertEqual(identifiers, ["single-step-grads", "single-step-optimizer"])
+        self.assertEqual(len(identifiers), 5)
+        self.assertCountEqual(
+            identifiers,
+            [
+                "single-step-grads",
+                "single-step-optimizer",
+                "checkpoint-resume-loss",
+                "inference-checkpoint-loss",
+                "e2e-sft-train-validate",
+            ],
+        )
 
     def test_onboard_help_loads_without_debug(self):
         result = self._cli("onboard", "--help")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("--test-id", result.stdout)
-        self.assertIn("single-step-grads", result.stdout)
-        self.assertIn("single-step-optimizer", result.stdout)
-        self.assertNotIn("inference-checkpoint-loss", result.stdout)
+        help_text = re.sub(r"-[ \t]*\r?\n[ \t]*", "-", result.stdout)
+        for identifier in [
+            "single-step-grads",
+            "single-step-optimizer",
+            "checkpoint-resume-loss",
+            "inference-checkpoint-loss",
+            "e2e-sft-train-validate",
+        ]:
+            self.assertIn(identifier, help_text)
+        self.assertNotIn("rl-weight-sync", help_text)
+        self.assertNotIn("rl-router-replay", help_text)
 
     def test_run_help_loads_without_debug(self):
         result = self._cli("run", "--help")

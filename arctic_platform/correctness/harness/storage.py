@@ -808,6 +808,7 @@ DEFAULT_RECORDS_DIR = Path(__file__).resolve().parents[1] / "reference_data"
 CRITERIA = {
     "single-step-grads": "gradient-l2-norm-v1",
     "single-step-optimizer": "optimizer-state-l2-norm-v1",
+    "e2e-sft-train-validate": "sft-trajectory-ce-v1",
 }
 MAX_RECORD_BYTES = 8 * 1024 * 1024
 
@@ -966,8 +967,10 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
             not isinstance(norms, dict)
             or not norms
             or any(
-                not isinstance(name, str) or not isinstance(value, (int, float)) or value < 0
-                for name, value in norms.items()
+                (
+                    not isinstance(name, str) or not isinstance(value, (int, float)) or value < 0
+                    for name, value in norms.items()
+                )
             )
         ):
             raise ReferencePrerequisiteError("reference gradient norms must be complete finite nonnegative scalars")
@@ -984,8 +987,8 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
             if (
                 gate.get("status") != "reviewed"
                 or not isinstance(provenance, (str, dict))
-                or not provenance
-                or (isinstance(provenance, str) and not provenance.strip())
+                or (not provenance)
+                or (isinstance(provenance, str) and (not provenance.strip()))
             ):
                 raise ReferencePrerequisiteError("optimizer norm gate has no onboarding review provenance")
             if type(gate.get("absolute")) not in {int, float} or gate["absolute"] < 0:
@@ -1000,6 +1003,21 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
             validate_optimizer_participation(summary, backend="reference")
             if measurements.get("participation") is not None or summary.get("participation") is not None:
                 compare_participation(measurements.get("participation"), summary.get("participation"))
+    elif check == "e2e-sft-train-validate":
+        for key in ("train_losses", "train_gradient_norms"):
+            values = measurements.get(key)
+            if (
+                not isinstance(values, list)
+                or len(values) != 100
+                or (not all((isinstance(value, (int, float)) for value in values)))
+            ):
+                raise ReferencePrerequisiteError(f"reference requires all 100 scalar {key}")
+        if measurements.get("optimizer_steps") != 100:
+            raise ReferencePrerequisiteError("reference requires 100 optimizer steps")
+        if not isinstance(measurements.get("validation_cross_entropy"), (int, float)):
+            raise ReferencePrerequisiteError("reference requires validation cross-entropy")
+        if not isinstance(measurements.get("scored_answer_tokens"), int) or measurements["scored_answer_tokens"] <= 0:
+            raise ReferencePrerequisiteError("reference requires positive scored-answer-token count")
 
 
 def _config_dir(ctx, identity: dict) -> Path:
