@@ -1131,8 +1131,8 @@ class WeightSyncExtension:
         and updating it never affects the base model's output correctness —
         at worst, speculative acceptance rate degrades transiently.
         """
-        drafter = getattr(self.model_runner, "drafter", None)
-        if drafter is None or getattr(drafter, "model", None) is None:
+        spec_model = self.model_runner.get_draft_model()
+        if spec_model is None:
             raise RuntimeError(
                 "sync_spec_weights called but no drafter model is loaded"
             )
@@ -1147,7 +1147,6 @@ class WeightSyncExtension:
             return {"status": "engine_ready", "rank": 1, "world_size": 2}
 
         start = time.time()
-        spec_model = drafter.model
         torch.cuda.reset_peak_memory_stats(self.device)
         mem_before = torch.cuda.memory_allocated(self.device)
 

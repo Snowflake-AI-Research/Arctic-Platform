@@ -27,6 +27,7 @@ from typing_extensions import Self
 from arctic_platform.debug.training import ReducedFixtureMTP
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
+from arctic_platform.model.implementations.moe.config import EPCommBackend
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
@@ -54,7 +55,7 @@ class Qwen3_5MoeOptions(BaseModel):
 
     seq_len: int = Field(4096, gt=0, description="Training sequence length.")
     trust_remote_code: bool = False
-    ep_comm_backend: Literal["deepep", "uccl"] = Field("deepep", description="Expert-parallel comm backend.")
+    ep_comm_backend: EPCommBackend = Field("deepep", description="Expert-parallel comm backend.")
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     reduce_dtype: Literal["bfloat16", "float32"] = Field("float32", description="Gradient reduction dtype.")
     moe_use_grouped_mm: bool = Field(True, description="Use grouped matmul for experts.")
