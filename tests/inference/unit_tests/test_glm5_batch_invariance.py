@@ -256,3 +256,39 @@ def test_block_fp8_moe_takes_one_fixed_config_at_every_batch_size(monkeypatch):
     assert configs[0] is not glm5_batch_invariance.FP8_BLOCK_MOE_CONFIG
     assert fused_moe.get_default_config(7, 256, 512, 4096, 8, None) == {"BLOCK_SIZE_M": 7}
     assert fused_moe.get_default_config(7, 256, 512, 4096, 8, "fp8_w8a8", None) == {"BLOCK_SIZE_M": 7}
+
+
+def test_prefill_chunks_end_at_whole_kpools(monkeypatch):
+    import sys
+    import types
+
+    from arctic_platform.inference.vllm import glm5_batch_invariance
+
+    assert glm5_batch_invariance.kpool_aligned_chunk_tokens(0, 1001, 6000, 4) == 1000
+    assert glm5_batch_invariance.kpool_aligned_chunk_tokens(1000, 1001, 6000, 4) == 1000
+    assert glm5_batch_invariance.kpool_aligned_chunk_tokens(4000, 1001, 6000, 4) == 1000
+    assert glm5_batch_invariance.kpool_aligned_chunk_tokens(5000, 1003, 6000, 4) == 1003  # the prompt's last chunk
+    assert glm5_batch_invariance.kpool_aligned_chunk_tokens(4352, 3, 6000, 4) == 0  # waits for a whole pool
+    assert glm5_batch_invariance.kpool_aligned_chunk_tokens(0, 1001, 6000, 1) == 1001
+
+    class Scheduler:
+        def __init__(self, vllm_config, mamba_split):
+            self.vllm_config = vllm_config
+            self.need_mamba_block_aligned_split = mamba_split
+
+        def _mamba_block_aligned_split(self, request, num_new_tokens, local=0, external=0):
+            return min(num_new_tokens, 4352 - request.num_computed_tokens - local - external)
+
+    module = types.ModuleType("vllm.v1.core.sched.scheduler")
+    module.Scheduler = Scheduler
+    for name in ("vllm", "vllm.v1", "vllm.v1.core", "vllm.v1.core.sched"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.sched.scheduler", module)
+    glm5_batch_invariance._kpool_aligned_chunks()
+    config = types.SimpleNamespace(model_config=types.SimpleNamespace(hf_text_config=types.SimpleNamespace(index_kpool=4)))
+    request = types.SimpleNamespace(num_computed_tokens=0, num_prompt_tokens=6000, num_tokens=6000)
+    plain = Scheduler(config, False)
+    assert plain.need_mamba_block_aligned_split
+    assert plain._mamba_block_aligned_split(request, 4097) == 4096
+    aligned = Scheduler(config, True)
+    assert aligned._mamba_block_aligned_split(request, 5000) == 4352

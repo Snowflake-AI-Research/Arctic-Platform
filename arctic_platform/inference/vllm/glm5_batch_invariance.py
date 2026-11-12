@@ -407,6 +407,51 @@ def _fixed_fp8_block_moe_config() -> None:
     fused_moe.get_default_config = get_default_config
 
 
+def kpool_aligned_chunk_tokens(start: int, num_new_tokens: int, prefill_end: int, kpool: int) -> int:
+    """The tokens of a prefill chunk from ``start`` once its end is floored to a multiple of ``kpool``; the prompt's
+    last chunk is unchanged, and ``0`` means the request waits this step."""
+    if kpool <= 1 or num_new_tokens <= 0 or start + num_new_tokens >= prefill_end:
+        return num_new_tokens
+    return max((start + num_new_tokens) // kpool * kpool - start, 0)
+
+
+def _kpool_aligned_chunks() -> None:
+    """End every prefill chunk but a prompt's last at a multiple of ``index_kpool``.
+
+    The indexer compresses each complete pool in the prefill step where its last token arrives, from that token and
+    the ``index_kpool - 1`` tokens before it in the step's batch (``_kpool_compress_insert`` assumes pool-aligned
+    chunk starts). A chunk starting inside a pool takes the pool's earlier tokens from whatever precedes it in the
+    batch, another request's tokens or none, so its pooled key depends on the batch.
+    """
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    original_init = Scheduler.__init__
+    original_split = Scheduler._mamba_block_aligned_split
+
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        text = self.vllm_config.model_config.hf_text_config
+        self._arctic_kpool = int(getattr(text, "index_kpool", 1) or 1)
+        self._arctic_kpool_mamba_split = self.need_mamba_block_aligned_split
+        if self._arctic_kpool > 1:
+            # The scheduler calls the split hook only when this is set.
+            self.need_mamba_block_aligned_split = True
+
+    def _mamba_block_aligned_split(self, request, num_new_tokens, num_new_local_computed_tokens=0,
+                                   num_external_computed_tokens=0):  # fmt: skip
+        if getattr(self, "_arctic_kpool_mamba_split", True):
+            num_new_tokens = original_split(self, request, num_new_tokens, num_new_local_computed_tokens,
+                                            num_external_computed_tokens)  # fmt: skip
+        start = request.num_computed_tokens + num_new_local_computed_tokens + num_external_computed_tokens
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start >= prefill_end:
+            return num_new_tokens
+        return kpool_aligned_chunk_tokens(start, num_new_tokens, prefill_end, getattr(self, "_arctic_kpool", 1))
+
+    Scheduler.__init__ = __init__
+    Scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
+
+
 def _sparse_mla_always_mqa() -> None:
     """Run every sparse MLA token through the absorbed ``forward_mqa`` path.
 
@@ -425,7 +470,7 @@ PROXY_ENV_VAR = "ARCTIC_GLM5_PROXY_LAYERS"
 SKIP_ENV_VAR = "ARCTIC_GLM5_BI_SKIP"
 PATCHES = ("gdn", "one_split", "mhc_split", "mhc_unfused", "router_gate", "mla_mqa", "fp8_linear", "kda_mixed",
            "indexer_topk", "causal_rows", "indexer_knorm", "indexer_weights", "grouped_topk", "kda_pin",
-           "moe_config")  # fmt: skip
+           "moe_config", "kpool_chunks")  # fmt: skip
 
 
 def _load_proxy_layers_only(num_layers: int) -> None:
@@ -491,7 +536,7 @@ def ensure_glm5_batch_invariance() -> None:
                         ("indexer_topk", _deterministic_indexer_topk), ("causal_rows", _causal_indices_per_token),
                         ("indexer_knorm", _eager_indexer_k_norm),
                         ("indexer_weights", _batch_invariant_indexer_head_weights),
-                        ("moe_config", _fixed_fp8_block_moe_config)):  # fmt: skip
+                        ("moe_config", _fixed_fp8_block_moe_config), ("kpool_chunks", _kpool_aligned_chunks)):  # fmt: skip
         if name not in skip:
             apply()
     if "grouped_topk" not in skip:
