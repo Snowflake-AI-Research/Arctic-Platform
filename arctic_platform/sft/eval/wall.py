@@ -119,6 +119,9 @@ def classify_failure(exc: BaseException) -> str:
         return "gpu_oom"
     if "killed" in lowered or "sigkill" in lowered:
         return "host_kill"
+    # The FlashAttention-3 stable-ABI wrapper reports a failed tensor allocation without the OOM text.
+    if "aoti_torch" in lowered and "api call failed" in lowered:
+        return "gpu_alloc_failed"
     if "cuda" in lowered and ("fault" in lowered or "illegal" in lowered):
         return "cuda_fault"
     return text.splitlines()[0][:200]
