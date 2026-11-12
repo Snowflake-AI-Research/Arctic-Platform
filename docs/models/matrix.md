@@ -8,34 +8,34 @@ that the loader accepts. `no` means the loader offers no way to set it, and `n/a
 rules the option out. Restrictions that depend on the platform, the parallelism or the value stay in
 each loader's own validation. The reasons follow the table.
 
-| Option | Runs in | Goal | `deepseek_v4` | `deepseek_v41` | `dflash2` | `generic_moe` | `glm5_next` | `glm_moe_dsa` | `huggingface` | `qwen3_5_moe` | `qwen4_exp` |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `attention.backend` | trainer | speed | yes | yes | yes | yes | yes | yes | yes | yes | yes |
-| `attention.sparse_mla` | trainer | speed | n/a | n/a | n/a | n/a | yes | yes | no | n/a | n/a |
-| `checkpointing.freq` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes |
-| `checkpointing.mode` | trainer | memory | yes | yes | no | yes | yes | yes | no | yes | yes |
-| `checkpointing.offload` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes |
-| `checkpointing.targets` | trainer | memory | yes | yes | no | yes | yes | yes | no | yes | yes |
-| `compile.fullgraph` | trainer | speed | no | no | no | no | no | no | yes | no | no |
-| `liger` | trainer | speed | no | no | no | no | no | no | yes | no | no |
-| `lm_head.cross_entropy` | trainer | memory | yes | yes | no | yes | yes | yes | no | yes | yes |
-| `lm_head.fp32` | both | parity | yes | yes | no | yes | yes | yes | yes | yes | yes |
-| `lm_head.token_chunk_size` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes |
-| `lm_head.vocab_chunk_size` | trainer | memory | no | no | no | no | no | no | yes | no | no |
-| `moe.comm_backend` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
-| `moe.comm_sms` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
-| `moe.comm_token_chunk` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
-| `moe.grouped_mm` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
-| `moe.sonicmoe` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes |
-| `numerics.fp32_parity` | trainer | parity | no | no | no | no | yes | no | yes | yes | yes |
-| `numerics.fp32_residual` | trainer | parity | no | no | no | no | no | no | yes | no | no |
-| `numerics.fp32_routed_weighting` | trainer | parity | no | no | no | no | yes | no | no | no | yes |
-| `numerics.optimization_dtype` | trainer | parity | yes | yes | yes | yes | yes | yes | no | yes | yes |
-| `numerics.reduce_dtype` | trainer | parity | yes | yes | no | yes | yes | yes | no | yes | yes |
-| `peft` | trainer | mode | no | no | no | no | no | no | yes | no | no |
-| `tiled_mlp.token_chunk_size` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes |
-| `tiled_remat.token_budget` | trainer | memory | no | no | no | no | no | no | yes | no | no |
-| `zorro_train` | trainer | mode | no | no | no | no | no | no | yes | no | no |
+| Option | Runs in | Goal | `deepseek_v4` | `deepseek_v41` | `dflash2` | `generic_moe` | `glm5_next` | `glm_moe_dsa` | `huggingface` | `inkling` | `qwen3_5_moe` | `qwen4_exp` |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `attention.backend` | trainer | speed | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
+| `attention.sparse_mla` | trainer | speed | n/a | n/a | n/a | n/a | yes | yes | no | n/a | n/a | n/a |
+| `checkpointing.freq` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes | yes |
+| `checkpointing.mode` | trainer | memory | yes | yes | no | yes | yes | yes | no | yes | yes | yes |
+| `checkpointing.offload` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes | yes |
+| `checkpointing.targets` | trainer | memory | yes | yes | no | yes | yes | yes | no | no | yes | yes |
+| `compile.fullgraph` | trainer | speed | no | no | no | no | no | no | yes | no | no | no |
+| `liger` | trainer | speed | no | no | no | no | no | no | yes | no | no | no |
+| `lm_head.cross_entropy` | trainer | memory | yes | yes | no | yes | yes | yes | no | no | yes | yes |
+| `lm_head.fp32` | both | parity | yes | yes | no | yes | yes | yes | yes | yes | yes | yes |
+| `lm_head.token_chunk_size` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes | yes |
+| `lm_head.vocab_chunk_size` | trainer | memory | no | no | no | no | no | no | yes | no | no | no |
+| `moe.comm_backend` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes | yes |
+| `moe.comm_sms` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes | yes |
+| `moe.comm_token_chunk` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes | yes |
+| `moe.grouped_mm` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | yes | yes | yes |
+| `moe.sonicmoe` | trainer | speed | yes | yes | n/a | yes | yes | yes | n/a | no | yes | yes |
+| `numerics.fp32_parity` | trainer | parity | no | no | no | no | yes | no | yes | no | yes | yes |
+| `numerics.fp32_residual` | trainer | parity | no | no | no | no | no | no | yes | no | no | no |
+| `numerics.fp32_routed_weighting` | trainer | parity | no | no | no | no | yes | no | no | no | no | yes |
+| `numerics.optimization_dtype` | trainer | parity | yes | yes | yes | yes | yes | yes | no | yes | yes | yes |
+| `numerics.reduce_dtype` | trainer | parity | yes | yes | no | yes | yes | yes | no | yes | yes | yes |
+| `peft` | trainer | mode | no | no | no | no | no | no | yes | yes | no | no |
+| `tiled_mlp.token_chunk_size` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes | yes |
+| `tiled_remat.token_budget` | trainer | memory | no | no | no | no | no | no | yes | no | no | no |
+| `zorro_train` | trainer | mode | no | no | no | no | no | no | yes | no | no | no |
 
 ## Options
 
@@ -188,6 +188,25 @@ Extends `generic_moe`.
 - `numerics.fp32_routed_weighting` (no): no equivalent option; only glm5_next and qwen4_exp have one
 - `numerics.optimization_dtype` (no): the key has no effect on this route: the job sets the model dtype, not this key
 - `numerics.reduce_dtype` (no): no equivalent option
+
+## `inkling`
+
+Extends `generic_moe`.
+
+11 of 26 options unsupported.
+
+- `attention.sparse_mla` (n/a): no model family behind this loader uses sparse MLA attention
+- `checkpointing.targets` (no): only full activation checkpointing is supported
+- `compile.fullgraph` (no): the loader rejects `patches.compile`
+- `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
+- `lm_head.cross_entropy` (no): native Inkling causal LM loss is used
+- `lm_head.vocab_chunk_size` (no): no equivalent option
+- `moe.sonicmoe` (no): routed experts use grouped GEMM or the expert loop
+- `numerics.fp32_parity` (no): no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp
+- `numerics.fp32_residual` (no): this loader has no fp32_residual option; only huggingface has one
+- `numerics.fp32_routed_weighting` (no): no fp32_routed_weighting option; see glm5_next, qwen4_exp
+- `tiled_remat.token_budget` (no): packed mixer tiling is only on the huggingface SFT path
+- `zorro_train` (no): the loader rejects `patches.zorro_train`
 
 ## `qwen3_5_moe`
 

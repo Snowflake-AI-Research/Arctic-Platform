@@ -57,7 +57,7 @@ from arctic_platform.common import profiles  # noqa: F401
 
 assert len(option_registry.options()) == 26
 assert "tiled_remat.token_budget" in {option.key for option in option_registry.options()}
-assert len(option_registry.profiles()) == 9
+assert len(option_registry.profiles()) == 10
 assert option_registry.check_coverage() == []
 loaded = sorted(name for name in sys.modules if name.split(".")[0] in HEAVY)
 assert loaded == [], loaded
