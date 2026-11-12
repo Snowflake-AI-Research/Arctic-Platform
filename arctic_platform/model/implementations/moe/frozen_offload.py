@@ -23,12 +23,16 @@ same addresses (which UltraEP's spare slots, ``moe/ultraep_frozen.py``, read in 
 next layer in call order (forward: the next one; backward: the previous one) is prefetched while the current one runs,
 so the copy overlaps compute.
 
-The offload happens at the first call, after PEFT and DeepSpeed have wrapped the model; the expert parameters keep
-their objects with empty data, and during a call each is replaced by a temporary parameter viewing the copied bytes.
-The temporaries are tagged ``_ap_transient``: the expert GEMMs then save them with ``save_for_backward``
-(``fp8.stash_frozen``), so the checkpointed forward drops them after the layer and only the recompute's copy lives
-until that layer's backward. Only the code stacks ``w1`` / ``w2`` / ``w3`` move; their scales stay on the GPU (block
-FP8's FP32 scales are a 4,096th of the codes' bytes; W4A8 rewrites INT4 group scales in place on first use).
+The offload happens when the model's first decoder layer first runs, after PEFT and DeepSpeed have wrapped the model
+and after a restore: before the first step allocates (its attention, the first MoE layer's DeepEP buffer) and not
+beside a restore's optimizer state (a restored GLM-5.3 LoRA job ran out of memory in layer 0's attention with the codes
+still on the GPU). UltraEP's spare slots build their state from the stacks' shapes then (``offloaded_code_stack``). The
+expert parameters keep their objects with empty data, and during a call each is replaced by a temporary parameter
+viewing the copied bytes. The temporaries are tagged ``_ap_transient``: the expert GEMMs then save them with
+``save_for_backward`` (``fp8.stash_frozen``), so the checkpointed forward drops them after the layer and only the
+recompute's copy lives until that layer's backward. Only the code stacks ``w1`` / ``w2`` / ``w3`` move; their scales
+stay on the GPU (block FP8's FP32 scales are a 4,096th of the codes' bytes; W4A8 rewrites INT4 group scales in place on
+first use).
 
 The offload is a holding of the model's frozen weights (``moe/frozen_held.py``): the weight export copies a layer's
 codes into its buffer and points the parameters at them for that layer's export unit, so a weights-only checkpoint
@@ -106,6 +110,7 @@ class FrozenExpertOffload:
     """The host copies of every managed layer's expert codes, and the per-call copies in."""
 
     def __init__(self, layers: list[nn.Module]) -> None:
+        _OFFLOADS.add(self)
         self.layers = layers
         # Per layer: [(experts module, name, param, shape, dtype, offset in the layer's bytes, nbytes)], its offset
         # in the host buffer, and its size.
@@ -331,6 +336,22 @@ class FrozenExpertOffload:
                 self.resident = [-1, -1]
 
 
+_OFFLOADS: weakref.WeakSet[FrozenExpertOffload] = weakref.WeakSet()
+
+
+def offloaded_code_stack(experts: nn.Module, name: str) -> torch.Tensor | None:
+    """A meta tensor of the shape and dtype of ``experts``' code stack ``name`` while an offload holds its codes on the
+    host (the parameter holds no data outside its layer's calls), else None."""
+    for offload in _OFFLOADS:
+        if not offload.offloaded:
+            continue
+        for entries in offload.entries:
+            for module, key, _, shape, dtype, *_ in entries:
+                if module is experts and key == name:
+                    return torch.empty(shape, dtype=dtype, device="meta")
+    return None
+
+
 def experts_recomputed(layer: nn.Module) -> bool:
     """Whether a decoder layer's routed experts run again in its backward: the whole block checkpointed, or a selective
     checkpoint around them. Otherwise their saved tensors keep the codes alive until backward."""
@@ -368,7 +389,7 @@ def install_frozen_expert_offload(layers: nn.ModuleList, *, root: nn.Module) -> 
     installed before PEFT registers its parametrization over the weights), so they run for every call of the experts:
     each dispatch chunk, the forward and the recompute, a selective recompute of the experts alone included. PEFT may
     wrap the experts after this returns (the trainer applies LoRA to the loaded model), so each layer binds its hooks
-    to the call sites at its first call.
+    to the call sites at its first call. The codes move to the host when the first of ``layers`` first runs.
 
     Layers whose experts are not recomputed (``ac_config.layers`` leaves them out) keep their codes on the GPU: their
     saved tensors hold them until backward.
@@ -385,10 +406,25 @@ def install_frozen_expert_offload(layers: nn.ModuleList, *, root: nn.Module) -> 
     offload = FrozenExpertOffload(managed)
     for i, inner in enumerate(managed):
         _bind_at_first_call(offload, i, inner)
+    if managed:
+        _offload_at_first_call(offload, _inner_layer(layers[0]))
     from .frozen_held import hold_frozen_weights
 
     hold_frozen_weights(root, offload)
     return offload
+
+
+def _offload_at_first_call(offload: FrozenExpertOffload, first: nn.Module) -> None:
+    """Move every managed layer's codes to the host when ``first`` (the first decoder layer) first runs, then drop this
+    hook. A load before then (inside ``whole_frozen_weights``) writes the codes on the GPU."""
+    handle = None
+
+    def offload_all(module, args):
+        if not offload.offloaded:
+            offload._offload_all()
+        handle.remove()
+
+    handle = first.register_forward_pre_hook(offload_all)
 
 
 def _bind_at_first_call(offload: FrozenExpertOffload, i: int, layer: nn.Module) -> None:
