@@ -216,7 +216,7 @@ def _kda_steps(q, k, v, g, beta, h, a_amp, g_bias, lower_bound, scale):
     return torch.stack(outs, dim=1), h
 
 
-def ref_kda_core(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, lower_bound: float, chunk: int = 32,
+def ref_kda_core(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, lower_bound: float, chunk: int = 64,
                  stepwise: bool = False, **_):
     """The KDA core over packed requests from a zero state: ``q/k/v/g [(1,) T, H, D]``, ``beta [T, H]`` raw logits,
     ``a_log [H]``, ``dt_bias [H * D]``; returns ``[T, H, D]`` in ``q``'s dtype. The requests step together, padded
