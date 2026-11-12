@@ -29,6 +29,8 @@ def _production_loading_failure_process(rank, rendezvous, source, results):
     from arctic_platform.model.implementations.qwen35 import model_builder as builder
 
     class Model:
+        config = SimpleNamespace(tie_word_embeddings=False)
+
         def to_empty(self, *, device):
             pass
 
@@ -1065,6 +1067,8 @@ def test_production_loading_propagates_fresh_attempt_and_early_failure(monkeypat
     builder = importlib.import_module(f"arctic_platform.model.implementations.{family}.model_builder")
 
     class Model:
+        config = SimpleNamespace(tie_word_embeddings=False)
+
         def to_empty(self, *, device):
             return self
 
