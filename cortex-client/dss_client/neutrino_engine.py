@@ -144,8 +144,10 @@ class NeutrinoTrainingEngine(Module):
             ]
 
         **Important:** If loading across different DP sizes (``n_gpus``), the
-        job must have been created with ``load_optimizer_states=False`` in its
-        ``SubJobConfig``. This cannot be changed after job creation.
+        job must have been created with ``load_optimizer_states=False`` and
+        ``extra_training={"load_module_only": True}`` in its ``SubJobConfig``. The
+        fp32 master weights are then rebuilt from bf16. This cannot be changed after
+        job creation.
         """
         request_id = self._client.load(
             self.job_id,
