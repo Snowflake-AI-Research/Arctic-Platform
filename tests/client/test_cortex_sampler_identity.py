@@ -87,7 +87,7 @@ def test_submit_prepares_the_translated_request_only_for_forward(transport, monk
             prepared.append(forwarded)
             return "test-url", []
 
-    monkeypatch.setattr(transport, "_deliver", lambda *args: args)
+    monkeypatch.setattr(transport, "_deliver", lambda *args, **kwargs: args)
     monkeypatch.setattr(transport, "_on_loop", lambda value: value)
     transport._submit(request, Route())
     assert prepared[0].body["router_replay"]["sampling_job_id"] == (
@@ -120,7 +120,7 @@ def test_bootstrapped_pair_is_sent_in_zone_visible_frame_metadata(transport, mon
         ),
     )
     captured = []
-    monkeypatch.setattr(transport, "_deliver", lambda route, request, url, sends: captured.extend(sends))
+    monkeypatch.setattr(transport, "_deliver", lambda route, request, url, sends, **kwargs: captured.extend(sends))
     monkeypatch.setattr(transport, "_on_loop", lambda result: result)
     transport._submit(request, cortex_module._route(operation))
     frames = [
