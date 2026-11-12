@@ -1571,17 +1571,18 @@ def _run_sync_entry_point(entry_point, extension, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "entry_point",
+    "entry_point,draft_attribute",
     [
-        "sync_weights",
-        "sync_weights_broadcast",
-        "sync_spec_weights",
-        "load_weights_cuda_ipc",
-        "load_weights_cuda_ipc_chunk",
-        "load_weights_from_shm_path",
+        ("sync_weights", "drafter"),
+        ("sync_weights_broadcast", "drafter"),
+        ("sync_spec_weights", "drafter"),
+        ("sync_spec_weights", "speculator"),
+        ("load_weights_cuda_ipc", "drafter"),
+        ("load_weights_cuda_ipc_chunk", "drafter"),
+        ("load_weights_from_shm_path", "drafter"),
     ],
 )
-def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, tmp_path, entry_point):
+def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, tmp_path, entry_point, draft_attribute):
     parallel_state = types.ModuleType("vllm.distributed.parallel_state")
     parallel_state.get_tensor_model_parallel_world_size = lambda: 2
     parallel_state.get_world_group = lambda: SimpleNamespace(rank=0)
@@ -1638,7 +1639,9 @@ def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, tmp_path, ent
     model = Model({"kda": kda, "indexer": indexer})
     extension = SimpleNamespace(
         device=torch.device("cpu"),
-        model_runner=SimpleNamespace(model=model, drafter=SimpleNamespace(model=model)),
+        model_runner=SimpleNamespace(
+            model=model, get_draft_model=lambda: model, **{draft_attribute: SimpleNamespace(model=model)}
+        ),
         model_config=SimpleNamespace(quantization=None),
         _get_or_create_engine=lambda *args, **kwargs: _FakeEngine([("w", torch.ones(1))]),
         _get_or_create_broadcast_engine=lambda *args: object(),
