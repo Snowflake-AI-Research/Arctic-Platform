@@ -6,6 +6,7 @@ conversion cache. The distributed gather / LoRA helpers are dropped.
 """
 
 import json
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Literal
 
@@ -52,6 +53,59 @@ def load_state_dict(save_dir: Path) -> dict[str, Tensor]:
             for key in f.keys():
                 state_dict[key] = f.get_tensor(key)
     return state_dict
+
+
+def convert_safetensor_checkpoint(
+    source_dir: Path,
+    save_dir: Path,
+    convert_fn: Callable[[dict[str, Tensor]], object],
+    partition_fn: Callable[[tuple[str, ...]], Iterable[Iterable[str]]],
+) -> None:
+    """Convert complete dependency groups, retaining only one group in memory."""
+    locations: dict[str, Path] = {}
+    for shard_path in sorted(source_dir.glob("*.safetensors")):
+        with safe_open(shard_path, framework="pt", device="cpu") as shard:
+            for name in shard.keys():
+                if name in locations:
+                    raise ValueError(f"Duplicate checkpoint tensor: {name}")
+                locations[name] = shard_path
+    if not locations:
+        raise ValueError(f"No safetensors weights in {source_dir}")
+    groups = [tuple(group) for group in partition_fn(tuple(locations))]
+    names = [name for group in groups for name in group]
+    if any(not group for group in groups) or len(names) != len(set(names)) or set(names) != set(locations):
+        raise ValueError("Checkpoint conversion groups must cover every source tensor exactly once")
+
+    save_dir.mkdir(parents=True, exist_ok=False)
+    weight_map: dict[str, str] = {}
+    total_size = 0
+    for group_index, group in enumerate(groups):
+        state: dict[str, Tensor] = {}
+        by_shard: dict[Path, list[str]] = {}
+        for name in group:
+            by_shard.setdefault(locations[name], []).append(name)
+        for shard_path, selected in by_shard.items():
+            with safe_open(shard_path, framework="pt", device="cpu") as shard:
+                for name in selected:
+                    state[name] = shard.get_tensor(name)
+        convert_fn(state)
+        if not state or set(state).intersection(weight_map):
+            raise ValueError("Checkpoint conversion produced empty or overlapping groups")
+        split = split_torch_state_dict_into_shards(
+            state, filename_pattern=f"model-group{group_index:05d}{{suffix}}.safetensors"
+        )
+        for filename, tensor_names in split.filename_to_tensors.items():
+            output = {name: state.pop(name).contiguous() for name in tensor_names}
+            save_file(output, save_dir / filename, metadata={"format": "pt"})
+            del output
+        weight_map.update(split.tensor_to_filename)
+        total_size += split.metadata["total_size"]
+        del state
+
+    # The root index is the cache's completion marker; never publish a partial conversion.
+    with (save_dir / SAFE_WEIGHTS_INDEX_NAME).open("x", encoding="utf-8") as stream:
+        json.dump({"metadata": {"total_size": total_size}, "weight_map": weight_map}, stream, indent=2, sort_keys=True)
+        stream.write("\n")
 
 
 def save_state_dict(

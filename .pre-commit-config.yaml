@@ -17,11 +17,15 @@ repos:
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
+        exclude: ^arctic_platform/correctness/configs/
       - id: end-of-file-fixer
+        exclude: ^arctic_platform/correctness/configs/
       - id: check-yaml
       - id: requirements-txt-fixer
       - id: pretty-format-json
         args: [--autofix]
+        # Correctness recipes are byte-preserving copies of operator inputs.
+        exclude: ^arctic_platform/correctness/configs/
   - repo: https://github.com/PyCQA/isort
     rev: 6.0.1
     hooks:
