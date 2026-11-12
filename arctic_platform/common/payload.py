@@ -92,6 +92,69 @@ def execute_payload(
     )
 
 
+def build_packed_schedule(
+    windows: Sequence[dict],
+    pack_metas: Sequence[Any],
+    *,
+    sp_size: int,
+    sp_rank: int,
+    request_call_count: int | None,
+    processing: dict,
+    loss_object: Any,
+) -> list[ScheduledAPPayload]:
+    """Turn one rank's packed windows into a padded call schedule.
+
+    Each window is one ``APPayload``. ``batch_data`` keeps the ``[1, T]``
+    window. ``meta_data`` is that window squeezed to ``[T]``, plus this rank's
+    ``cu_seqlens`` and the window's ``packed_loss_scale_factor``. A shard with
+    fewer windows than ``request_call_count`` repeats its last window. Those
+    repeated slots set ``is_padding`` and share the source payload so a later
+    edit of the real call is the call the padding slot runs.
+    """
+    from arctic_platform.common.packing.windows import window_cu_seqlens
+
+    if len(windows) != len(pack_metas):
+        raise ValueError(
+            f"packed windows ({len(windows)}) must match pack metadata ({len(pack_metas)})"
+        )
+    if not windows:
+        return []
+    import torch
+
+    call_count = max(len(windows), int(request_call_count or len(windows)))
+    source_payloads: list[APPayload] = []
+    for window, pack_meta in zip(windows, pack_metas, strict=True):
+        meta = {
+            key: value.squeeze(0)
+            if torch.is_tensor(value) and value.ndim == 2 and value.shape[0] == 1
+            else value
+            for key, value in window.items()
+        }
+        meta["cu_seqlens"] = window_cu_seqlens(pack_meta, sp_size, sp_rank)
+        meta["packed_loss_scale_factor"] = pack_meta.sequence_length
+        source_payloads.append(
+            APPayload(
+                batch_data=dict(window),
+                meta_data=meta,
+                processing=processing,
+                loss_object=loss_object,
+                args=(),
+            )
+        )
+    calls: list[ScheduledAPPayload] = []
+    last = len(source_payloads) - 1
+    for call_index in range(call_count):
+        source_index = min(call_index, last)
+        calls.append(
+            ScheduledAPPayload(
+                source_payloads[source_index],
+                source_index=source_index,
+                is_padding=call_index >= len(source_payloads),
+            )
+        )
+    return calls
+
+
 def execute_payload_schedule(
     engine: Any,
     calls: Sequence[ScheduledAPPayload],
