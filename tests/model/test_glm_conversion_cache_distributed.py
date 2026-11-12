@@ -88,6 +88,8 @@ def _load(root, wave, *, kill_writer=False, prepare=False):
             os.kill(os.getpid(), signal.SIGKILL)
 
     model.stream_convert_to_prime = convert
+    # Exercise real streamed-cache publication and recovery, not direct HF loading.
+    model_builder.supports_direct_hf_loading = lambda model: False
     if prepare:
         model_builder.prepare_weight_conversion(
             model, config, source, rank=rank, local_rank=int(os.environ["LOCAL_RANK"])

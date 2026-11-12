@@ -974,6 +974,8 @@ def test_glm53_load_selects_streaming_checkpoint_converter(
     save_file({"stray.weight": torch.ones(1)}, source / "stray.safetensors")
     cache = tmp_path / "prime"
     monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: cache)
+    # This test selects the streamed fallback; supported direct loading is covered separately.
+    monkeypatch.setattr(builder, "supports_direct_hf_loading", lambda model: False)
     monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", scope)
     monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "streamed-load-test")
     monkeypatch.setattr(builder, "get_world", lambda: SimpleNamespace(rank=0, local_rank=0, is_master=True))
@@ -1178,6 +1180,7 @@ def test_shared_conversion_cache_failure_stops_both_loaders_before_barrier(tmp_p
     monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", "shared")
     monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "shared-failure-test")
     monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: cache)
+    monkeypatch.setattr(builder, "supports_direct_hf_loading", lambda model: False)
     monkeypatch.setattr(
         builder, "get_world", lambda: SimpleNamespace(rank=local.rank, local_rank=0, is_master=local.rank == 0)
     )

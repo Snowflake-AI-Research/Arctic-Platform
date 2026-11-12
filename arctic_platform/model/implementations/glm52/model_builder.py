@@ -29,7 +29,10 @@ from arctic_platform.model.implementations.moe.conversion_cache import (
     record_conversion_preparation_failure,
     resolve_conversion_cache_path,
     wait_for_conversion_cache,
+    resolve_ready_conversion_cache_path,
+    _write_conversion_cache,
 )
+from arctic_platform.model.implementations.moe.hf_loader import load_hf_weights, supports_direct_hf_loading
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.checkpointing import (
@@ -357,9 +360,18 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
 
     snapshot_path = resolve_weight_source(config)
     world = get_world()
-    converted_path = prepare_weight_conversion(
-        model, config, snapshot_path, rank=world.rank, local_rank=world.local_rank
-    )
+    converted_path = None
+    direct_hf_load = False
+    if isinstance(model, PreTrainedModelPrimeRL) and supports_direct_hf_loading(model):
+        snapshot_keys = dict.fromkeys(load_state_dict_keys(snapshot_path))
+        model_keys = dict.fromkeys(model.state_dict().keys())
+        if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
+            converted_path = resolve_ready_conversion_cache_path(config, snapshot_path, "prime")
+            direct_hf_load = converted_path is None
+    if converted_path is None and not direct_hf_load:
+        converted_path = prepare_weight_conversion(
+            model, config, snapshot_path, rank=world.rank, local_rank=world.local_rank
+        )
 
     # All ranks wait for the selected cache writer before loading.
     torch.distributed.barrier()
@@ -372,22 +384,25 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     if converted_path is not None:
         snapshot_path = converted_path
 
-    logger.info(f"Loading weights using HF DCP from {snapshot_path}")
+    logger.info(f"Loading weights using {'direct HF loading' if direct_hf_load else 'HF DCP'} from {snapshot_path}")
     load_dcp_start_time = time.perf_counter()
     state_dict = model.state_dict()
     state_dict = strip_lora_from_state_dict(state_dict)
     if model.config.tie_word_embeddings:
         del state_dict["lm_head.weight"]
-    dcp_load(
-        state_dict,
-        storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
-    )
+    if direct_hf_load:
+        load_hf_weights(state_dict, snapshot_path, model.convert_layer_to_prime)
+    else:
+        dcp_load(
+            state_dict,
+            storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
+        )
     if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:
         model.tie_weights()
     _init_buffers_post_meta(model)
 
     _move_buffers_to_cuda(model, config)
-    logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
+    logger.debug(f"Loaded weights in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
 
 
 def _reset_runtime_moe_buffers(model: nn.Module) -> None:
