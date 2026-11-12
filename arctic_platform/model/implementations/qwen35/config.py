@@ -31,7 +31,7 @@ class ModelConfig:
     # ``vlm`` is always None on the DSS text-only path; kept for API parity.
     vlm: object | None = None
 
-    # Optional explicit override for the one-time HF<->Prime conversion cache.
+    # Cache override for models requiring offline conversion (including packed DeepSeek).
     # A ready sibling ``<checkpoint>/prime`` is preferred; otherwise resolution
     # falls back to ``DSS_WEIGHT_CONVERSION_CACHE_DIR`` and then /data-fast.
     # Empty string restores write-to-sibling when no pre-baked cache exists.
