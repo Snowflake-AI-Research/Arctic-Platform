@@ -601,10 +601,9 @@ class ChatEngine:
         wraps it in its final channel) and combines it with any tool grammar.
         """
         from jinja2 import TemplateError
-        from vllm.renderers.chat_utils import ChatTemplateResolutionError
         from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
         from vllm.entrypoints.serve.engine.protocol import ErrorResponse
-        from vllm.exceptions import VLLMClientError
+        from vllm.exceptions import ChatTemplateResolutionError, VLLMClientError
         from vllm.renderers.inputs.preprocess import extract_prompt_len
 
         check_chat_input(prompt, structured_outputs)

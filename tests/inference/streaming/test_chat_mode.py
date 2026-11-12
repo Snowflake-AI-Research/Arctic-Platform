@@ -1302,12 +1302,12 @@ def _stub_vllm_chat_modules(monkeypatch):
     class VLLMClientError(Exception):
         pass
 
+    class ChatTemplateResolutionError(VLLMClientError):
+        pass
+
     modules = {
         "jinja2": {"TemplateError": type("TemplateError", (Exception,), {})},
         "vllm.entrypoints": {},
-        "vllm.renderers.chat_utils": {
-            "ChatTemplateResolutionError": type("ChatTemplateResolutionError", (ValueError,), {})
-        },
         "vllm.entrypoints.openai": {},
         "vllm.entrypoints.openai.chat_completion": {},
         "vllm.entrypoints.openai.chat_completion.protocol": {
@@ -1326,6 +1326,12 @@ def _stub_vllm_chat_modules(monkeypatch):
             setattr(module, key, value)
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(sys.modules["vllm.exceptions"], "VLLMClientError", VLLMClientError, raising=False)
+    monkeypatch.setattr(
+        sys.modules["vllm.exceptions"],
+        "ChatTemplateResolutionError",
+        ChatTemplateResolutionError,
+        raising=False,
+    )
 
 
 def _engine_whose_renderer_raises(error):
@@ -1482,7 +1488,7 @@ def test_model_without_a_chat_template_is_chat_unsupported(monkeypatch, caplog):
     import sys
 
     _stub_vllm_chat_modules(monkeypatch)
-    error = sys.modules["vllm.renderers.chat_utils"].ChatTemplateResolutionError
+    error = sys.modules["vllm.exceptions"].ChatTemplateResolutionError
     engine = _engine_whose_renderer_raises(error("you must provide a chat template"))
 
     async def run_twice():
