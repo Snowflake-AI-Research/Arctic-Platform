@@ -21,6 +21,7 @@ experts, which use AP's ``w1``/``w3``/``w2`` for the checkpoint's interleaved ``
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from dataclasses import field
 
@@ -32,6 +33,8 @@ from torch.utils.checkpoint import checkpoint
 from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from arctic_platform.model.implementations.fp8 import expert_lora_output
+from arctic_platform.model.implementations.fp8 import grouped_expert_lora_rows
 from arctic_platform.model.implementations.gpu.sp.collectives import gather_sequence
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 from arctic_platform.model.implementations.inkling2.configuration_inkling2 import Inkling2TextConfig
@@ -42,6 +45,8 @@ from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
 from arctic_platform.model.implementations.moe.layers.moe import MoE
 from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 from arctic_platform.model.implementations.moe.layers.moe import _maybe_to_local
+
+_EXPERT_LORA_NAME = re.compile(r"(.*\.experts)\.(w[123])\.lora_([AB])\.weight")
 
 
 def rms_norm(x, weight, eps):
@@ -347,10 +352,15 @@ class Inkling2Router(nn.Module):
 
 class Inkling2Experts(GroupedExperts):
     """Routed experts with ``softcap(gate) * sigmoid(gate) * softcap(up)``; each row's routing weight scales the
-    activation before the down projection, as in the sampler."""
+    activation before the down projection, as in the sampler.
+
+    PEFT expert LoRA (``target_parameters`` on ``w1``/``w2``/``w3``) is added to each GEMM's output from the
+    attached A/B factors (``_ap_lora_ab``), without a merged ``[experts, out, in]`` delta.
+    """
 
     gate_softcap: float
     up_softcap: float
+    unfused_expert_lora = True
 
     def _activation(self, gate, up, scores, dtype):
         gate, up = gate.float(), up.float()
@@ -362,24 +372,41 @@ class Inkling2Experts(GroupedExperts):
     def _forward_deepep(self, x, num_tokens_per_expert, scores=None):
         if self.fp8_block_size is not None:
             raise ValueError("Inkling2 experts train in BF16 or FP32")
-        w1, w2, w3 = (_maybe_to_local(weight) for weight in (self.w1, self.w2, self.w3))
+        weights = dict(zip(("w1", "w2", "w3"), (_maybe_to_local(w).to(x.dtype) for w in (self.w1, self.w2, self.w3))))
+        lora = {
+            name: (a.to(x.dtype), b.to(x.dtype), rank, scaling)
+            for name, (a, b, rank, scaling) in getattr(self, "_ap_lora_ab", {}).items()
+        }
         if self.use_grouped_mm and x.is_cuda and x.dtype == torch.bfloat16:
             offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-            gate = torch._grouped_mm(x, w1.to(x.dtype).transpose(-2, -1), offs=offsets)
-            up = torch._grouped_mm(x, w3.to(x.dtype).transpose(-2, -1), offs=offsets)
-            hidden = self._activation(gate, up, scores, x.dtype)
-            return torch._grouped_mm(hidden, w2.to(x.dtype).transpose(-2, -1), offs=offsets)
+
+            def project(inputs, name):
+                out = torch._grouped_mm(inputs, weights[name].transpose(-2, -1), offs=offsets)
+                if name in lora:
+                    # Rows past the routed ones stay unused, as in the base GEMM.
+                    out = out + grouped_expert_lora_rows(inputs, lora[name], offsets, inputs.shape[0])
+                return out
+
+            hidden = self._activation(project(x, "w1"), project(x, "w3"), scores, x.dtype)
+            return project(hidden, "w2")
+
+        def project_expert(inputs, name, expert):
+            out = inputs @ weights[name][expert].T
+            if name in lora:
+                out = out + expert_lora_output(inputs, fused_delta=None, ab=lora[name], expert_idx=expert)
+            return out
+
         counts = num_tokens_per_expert.tolist()
         rows = sum(counts)
         outputs = []
         start = 0
         for expert, count in enumerate(counts):
             tokens = x[start : start + count]
-            gate, up = tokens @ w1[expert].to(x.dtype).T, tokens @ w3[expert].to(x.dtype).T
+            gate, up = project_expert(tokens, "w1", expert), project_expert(tokens, "w3", expert)
             expert_scores = None if scores is None else scores[start : start + count]
-            outputs.append(self._activation(gate, up, expert_scores, x.dtype) @ w2[expert].to(x.dtype).T)
+            outputs.append(project_expert(self._activation(gate, up, expert_scores, x.dtype), "w2", expert))
             start += count
-        outputs.append(x.new_zeros(x.shape[0] - rows, w2.shape[1]))
+        outputs.append(x.new_zeros(x.shape[0] - rows, weights["w2"].shape[1]))
         return torch.cat(outputs)
 
 
@@ -723,6 +750,35 @@ class Inkling2ForCausalLMPrimeRL(PreTrainedModelPrimeRL, GenerationMixin):
         for module in self.modules():
             if isinstance(module, Inkling2MoE):
                 module.tokens_per_expert.zero_()
+
+    @staticmethod
+    def vllm_lora_tensors(tensors):
+        """Synced LoRA tensors in the served checkpoint's adapter layout.
+
+        Expert adapters are 3D, ``lora_A`` ``[E, r, in]`` and ``lora_B`` ``[E, out, r]``, on ``w13_weight`` and
+        ``w2_weight``. The ``w1`` and ``w3`` adapters merge into one ``w13_weight`` adapter of twice the rank whose
+        output rows interleave gate and up like the base weight.
+        """
+        pending = {}
+        for name, tensor in tensors:
+            match = _EXPERT_LORA_NAME.fullmatch(name)
+            if match is None:
+                yield name, tensor
+                continue
+            prefix, projection, kind = match.groups()
+            if projection == "w2":
+                yield f"{prefix}.w2_weight.lora_{kind}.weight", tensor
+                continue
+            factors = pending.setdefault(prefix, {})
+            factors[projection, kind] = tensor
+            if len(factors) == 4:
+                factors = pending.pop(prefix)
+                rank = factors["w1", "A"].shape[1]
+                gate, up = F.pad(factors["w1", "B"], (0, rank)), F.pad(factors["w3", "B"], (rank, 0))
+                yield f"{prefix}.w13_weight.lora_A.weight", torch.cat((factors["w1", "A"], factors["w3", "A"]), 1)
+                yield f"{prefix}.w13_weight.lora_B.weight", torch.stack((gate, up), 2).flatten(1, 2)
+        if pending:
+            raise ValueError(f"Inkling2 expert LoRA needs adapters on both w1 and w3: {sorted(pending)}")
 
     @classmethod
     def convert_layer_to_hf(cls, state_dict, layer_idx):

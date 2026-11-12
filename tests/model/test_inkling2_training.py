@@ -43,6 +43,8 @@ from arctic_platform.testing_utils import torch_assert_close
 from arctic_platform.testing_utils import torch_assert_equal
 
 LORA = dict(peft_type="LORA", task_type="CAUSAL_LM", r=2, lora_alpha=4, target_modules=["wq_du", "wv_dv"])
+# Rank 8: grouped GEMMs need 16-byte strides of the BF16 factors.
+EXPERT_LORA = dict(LORA, r=8, lora_alpha=16, target_parameters=["experts.w1", "experts.w2", "experts.w3"])
 
 
 def tiny_config(**overrides):
@@ -431,6 +433,107 @@ class TestInkling2Training(TestCasePlus):
                 torch_assert_close(
                     grad, expected_grads[name.replace("._checkpoint_wrapped_module", "")], atol=1e-6, rtol=0
                 )
+
+    @require_torch_gpu
+    def test_unfused_expert_lora_matches_merged_deltas(self):
+        """Expert LoRA from the attached A/B factors matches PEFT's merged per-expert deltas."""
+        from peft.tuners.lora.layer import ParamWrapper
+
+        from arctic_platform.model.loader import LoaderContext
+        from arctic_platform.model.patches.peft import apply_peft_patch
+
+        original = ParamWrapper._activate_lora
+
+        def restore_param_wrapper():
+            ParamWrapper._activate_lora = original
+            for attr in ("_ap_activate_lora_original", "_ap_skip_fused_expert_delta"):
+                if hasattr(ParamWrapper, attr):
+                    delattr(ParamWrapper, attr)
+
+        self.addCleanup(restore_param_wrapper)
+        spec = SimpleNamespace(
+            dtype="auto",
+            patches=SimpleNamespace(peft=EXPERT_LORA),
+            parallelism=SimpleNamespace(expert_parallel=1),
+        )
+        set_seed(5)
+        initial = tiny_model().cuda()
+        hidden = torch.randn(40, initial.config.hidden_size, device="cuda")
+        probe = torch.randn_like(hidden)
+
+        def run(unfused, grouped=False, dtype=torch.float32):
+            model = copy.deepcopy(initial)
+            for name, parameter in model.named_parameters():
+                if not model.keeps_fp32_parameter(name):
+                    parameter.data = parameter.data.to(dtype)
+            for module in model.modules():
+                if isinstance(module, Inkling2MoE):
+                    module.experts.use_grouped_mm = grouped
+            set_seed(6)
+            if unfused:
+                model = apply_peft_patch(model, LoaderContext(spec=spec))
+                experts = model.base_model.model.model.layers[0].mlp.experts
+                while isinstance(experts, ParamWrapper):
+                    experts = experts.get_base_layer()
+                self.assertEqual(set(experts._ap_lora_ab), {"w1", "w2", "w3"})
+            else:
+                model = apply_peft(model, EXPERT_LORA)
+            with torch.no_grad():
+                for name, parameter in model.named_parameters():
+                    if ".lora_B." in name and ".experts." in name:
+                        parameter.normal_(std=0.5)
+            moe = model.base_model.model.model.layers[0].mlp
+            x = hidden.to(dtype, copy=True).requires_grad_()
+            out = moe(x)
+            (out.float() * probe).sum().backward()
+            restore_param_wrapper()
+            grads = [p.grad for p in moe.parameters() if p.requires_grad]
+            self.assertEqual(len(grads), 6)
+            return [t.detach().double() for t in (out, x.grad, *grads)]
+
+        def error(actual, expected):
+            return max((a - e).norm().item() / e.norm().item() for a, e in zip(actual, expected))
+
+        merged = run(unfused=False)
+        self.assertLess(error(run(unfused=True), merged), 1e-5)
+        # BF16 weights with the deltas merged in are off by about 1% too.
+        self.assertLess(error(run(unfused=True, grouped=True, dtype=torch.bfloat16), merged), 2e-2)
+
+    def test_lora_sync_serves_expert_adapters_as_checkpoint_projections(self):
+        """Synced expert adapters are the served ``w13_weight`` / ``w2_weight`` ones and carry PEFT's deltas."""
+        from peft.tuners.lora.layer import ParamWrapper
+
+        from arctic_platform.model.weight_export import iter_lora_weights
+
+        set_seed(8)
+        model = apply_peft(tiny_model(), EXPERT_LORA)
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if ".lora_B." in name:
+                    parameter.normal_()
+        tensors = dict(iter_lora_weights(model, is_master=True, is_zero3=False))
+        prefix = "base_model.model.model.layers.0.mlp.experts."
+        self.assertEqual(
+            {name.removeprefix(prefix) for name in tensors if name.startswith(prefix)},
+            {f"{projection}_weight.lora_{kind}.weight" for projection in ("w13", "w2") for kind in "AB"},
+        )
+        self.assertIn("base_model.model.model.layers.0.attn.wq_du.lora_A.weight", tensors)
+        expected = {
+            module.parameter_name: module.get_delta_weight("default")
+            for module in model.base_model.model.model.layers[0].mlp.modules()
+            if isinstance(module, ParamWrapper)
+        }
+        scaling = EXPERT_LORA["lora_alpha"] / EXPERT_LORA["r"]
+
+        def delta(projection):
+            a, b = (tensors[f"{prefix}{projection}_weight.lora_{kind}.weight"] for kind in "AB")
+            return scaling * b @ a
+
+        w13 = delta("w13")
+        self.assertEqual(w13.shape[0], tiny_config().n_routed_experts)
+        torch_assert_close(w13[:, 0::2], expected["w1"], atol=1e-5, rtol=1e-5)
+        torch_assert_close(w13[:, 1::2], expected["w3"], atol=1e-5, rtol=1e-5)
+        torch_assert_close(delta("w2"), expected["w2"], atol=1e-5, rtol=1e-5)
 
     @require_torch_gpu
     def test_bf16_grouped_experts_backward_keeps_fp32_parameters(self):
