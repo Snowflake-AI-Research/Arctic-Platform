@@ -12,6 +12,7 @@ from typing import cast
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from ..config import DISPATCH_EP_BACKENDS
 from ..config import EPCommBackend
@@ -815,6 +816,8 @@ class MoE(nn.Module):
         self.experts.set_ep_comm_backend(self.ep_comm_backend)
         # Set by full activation checkpointing (see CombineReplay); the EP backends replay the combine on recompute.
         self.combine_replay: CombineReplay | None = None
+        self.sync_combine_per_chunk = False
+        self.checkpoint_dispatch_chunks = False
         self.use_sonicmoe = moe_args.use_sonicmoe
         self.router = TokenChoiceTopKRouter(
             dim=dim,
@@ -938,6 +941,12 @@ class MoE(nn.Module):
             and sonic_routed_experts_applicable(experts)
         )
         combine_kwargs = {}
+        checkpoint_chunks = (
+            self.checkpoint_dispatch_chunks
+            and self.deepep_token_chunk_size is not None
+            and torch.is_grad_enabled()
+            and self.combine_replay is None
+        )
         if self.combine_replay is not None and self.ep_comm_backend in ("uccl", "deepep"):
             self.combine_replay.start()
             combine_kwargs["replay"] = self.combine_replay
@@ -961,8 +970,11 @@ class MoE(nn.Module):
             # Routing weights still owed after the experts are applied by them, which can fold them into the
             # down projection; combine then only sums.
             scores = dispatch_state.permuted_scores
-            routed_output = self._run_local_routed_experts(
-                hidden_states, num_tokens_per_expert, scores, experts=chunk_experts()
+            call_experts = chunk_experts()
+            routed_output = (
+                call_experts(hidden_states, num_tokens_per_expert, scores)
+                if checkpoint_chunks
+                else self._run_local_routed_experts(hidden_states, num_tokens_per_expert, scores, call_experts)
             )
             # Keep combine outside the checkpointed routed-expert region so
             # selective AC only recomputes local expert matmuls.
@@ -987,15 +999,43 @@ class MoE(nn.Module):
         chunk_bounds += [(0, 1)] * (num_chunks - len(chunk_bounds))
         chunk_experts = _experts_per_chunk(self.experts, num_chunks)
 
-        pending_state = dispatch_chunk(*chunk_bounds[0])
         routed_outputs: list[torch.Tensor] = []
+        if checkpoint_chunks:
 
-        for chunk_start, chunk_end in chunk_bounds[1:]:
-            next_pending_state = dispatch_chunk(chunk_start, chunk_end)
+            def run_chunk(hidden, indices, scores):
+                pending = dispatch_tokens_async(
+                    hidden,
+                    indices,
+                    scores,
+                    num_experts=experts.num_experts,
+                    group=group,
+                    score_before_experts=self.score_before_experts,
+                )
+                output = run_pending_chunk(pending)
+                sync_combine()
+                return output
+
+            for start, end in chunk_bounds:
+                # Complete recompute on every rank so all collective handles are consumed.
+                routed_outputs.append(
+                    checkpoint(
+                        run_chunk,
+                        x[start:end],
+                        selected_experts_indices[start:end],
+                        top_scores[start:end],
+                        use_reentrant=False,
+                        early_stop=False,
+                    )
+                )
+        else:
+            pending_state = dispatch_chunk(*chunk_bounds[0])
+            for chunk_start, chunk_end in chunk_bounds[1:]:
+                next_pending_state = dispatch_chunk(chunk_start, chunk_end)
+                routed_outputs.append(run_pending_chunk(pending_state))
+                if self.sync_combine_per_chunk:
+                    sync_combine()
+                pending_state = next_pending_state
             routed_outputs.append(run_pending_chunk(pending_state))
-            pending_state = next_pending_state
-
-        routed_outputs.append(run_pending_chunk(pending_state))
 
         shared_output = self.shared_expert(x) if self.shared_expert is not None else None
         sync_combine()
@@ -1102,6 +1142,8 @@ def install_combine_replay(block: nn.Module) -> None:
     """
     for module in block.modules():
         if isinstance(module, MoE):
+            if module.ep_comm_backend == "nccl":
+                raise ValueError("NCCL expert dispatch requires combine_replay=False")
             module.combine_replay = CombineReplay()
 
 

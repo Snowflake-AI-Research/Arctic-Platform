@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Upstream-TRL bridge for the CPU-only Cortex GSM8K recipe.
 
 Upstream ``AsyncGRPOTrainer`` owns the policy loss.  This module replaces only
@@ -8,7 +23,6 @@ hook submits the corresponding server-side GRPO backward.
 from __future__ import annotations
 
 import math
-import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -288,13 +302,13 @@ def _pad_rows(rows: list[dict[str, torch.Tensor]], num_processes: int, pad_token
 
 def make_trainer_class() -> type:
     """Build lazily so importing this recipe does not import TRL at install time."""
+    import trl.experimental.async_grpo.async_grpo_trainer as trainer_module
     from trl.experimental.async_grpo import AsyncGRPOTrainer
     from trl.experimental.async_grpo.async_grpo_trainer import DataCollatorForRollout
     from trl.experimental.async_grpo.async_grpo_trainer import FixedCountBatcher
     from trl.experimental.async_grpo.async_grpo_trainer import RolloutQueueDataset
     from trl.experimental.async_grpo.async_grpo_trainer import TokenBudgetBatcher
     from trl.experimental.async_grpo.async_grpo_trainer import _EmptyIterableDataset
-    import trl.experimental.async_grpo.async_grpo_trainer as trainer_module
 
     class CortexAsyncGRPOTrainer(AsyncGRPOTrainer):
         def __init__(self, *args: Any, arctic_client: Any, cortex_bridge: CortexModelBridge, **kwargs: Any) -> None:
@@ -366,11 +380,27 @@ def make_trainer_class() -> type:
         def _set_signature_columns_if_needed(self) -> None:
             if self._signature_columns is None:
                 self._signature_columns = [
-                    "input_ids", "attention_mask", "position_ids", "completion_mask", "shift_labels",
-                    "token_index", "old_log_probs", "advantages", "segment_id", "sampling_mask",
-                    "sampling_mask_counts", "sampler_ids", "sampler_log_probs", "tree_kv_index",
-                    "tree_cu_seqlens_q", "tree_cu_seqlens_k", "tree_segment_parents",
-                    "tree_segment_depths", "tree_sizes", "global_n_tokens", "global_n_forward_tokens",
+                    "input_ids",
+                    "attention_mask",
+                    "position_ids",
+                    "completion_mask",
+                    "shift_labels",
+                    "token_index",
+                    "old_log_probs",
+                    "advantages",
+                    "segment_id",
+                    "sampling_mask",
+                    "sampling_mask_counts",
+                    "sampler_ids",
+                    "sampler_log_probs",
+                    "tree_kv_index",
+                    "tree_cu_seqlens_q",
+                    "tree_cu_seqlens_k",
+                    "tree_segment_parents",
+                    "tree_segment_depths",
+                    "tree_sizes",
+                    "global_n_tokens",
+                    "global_n_forward_tokens",
                     "mean_seq_len",
                 ]
 

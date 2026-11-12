@@ -387,7 +387,7 @@ def _glm5_next_checkpointed_flops_per_token(config, batch_seqlens) -> list[float
     hidden = config.hidden_size
     heads = config.num_attention_heads
     layers = list(config.layer_types)
-    sparse = "deepseek_sparse_attention"
+    sparse = "indexed_attention"
     n_sparse = sum(layer == sparse for layer in layers)
     n_linear = sum(layer == "linear_attention" for layer in layers)
     mlp_types = list(getattr(config, "mlp_layer_types", None) or [])
