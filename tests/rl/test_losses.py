@@ -1592,7 +1592,7 @@ class TestWeightedLogprobSum(TestCasePlus):
     def test_two_microbatches_sum_to_the_single_window(self):
         from types import SimpleNamespace
 
-        from arctic_platform.rl.processors.pipeline import run_pipeline
+        from arctic_platform.common.unpacked_gas import run_unpacked_gas
         from arctic_platform.rl.processors.weighted_logprob import weighted_logprob_sum
 
         self.assertIsNotNone(getattr(weighted_logprob_sum, PACKED_LOSS_REDUCTION_ATTR))
@@ -1602,7 +1602,7 @@ class TestWeightedLogprobSum(TestCasePlus):
             "attention_mask": torch.ones(2, 4, dtype=torch.long),
             "logprob_weights_shifted": torch.tensor([[1.0, 0.5, 0.0, 2.0], [1.0, 1.0, 0.0, 0.5]]),
         }
-        meta = {"pad_token_id": 0}
+        meta = {"pad_token_id": 0, "drop_position_ids": True}
         processing = {"loss_fn": "weighted_logprob_sum", "post": []}
 
         class Engine:
@@ -1624,13 +1624,21 @@ class TestWeightedLogprobSum(TestCasePlus):
             def backward(self, loss, scale_wrt_gas=True):
                 self.backward_losses.append((float(loss.detach()), scale_wrt_gas))
 
-        one = run_pipeline(
-            Engine(), (), batch, meta, processing, "cpu", backward=True, pack=True, max_tokens_per_mb=16
-        )
+        def run(engine, gas):
+            return run_unpacked_gas(
+                engine,
+                gas=gas,
+                batch_data=batch,
+                meta_data=meta,
+                processing=processing,
+                backward=True,
+                device="cpu",
+                step_fn=lambda: None,
+            )
+
+        one = run(Engine(), 1)
         split_engine = Engine()
-        two = run_pipeline(
-            split_engine, (), batch, meta, processing, "cpu", backward=True, pack=True, max_tokens_per_mb=4
-        )
+        two = run(split_engine, 2)
         self.assertGreater(len(split_engine.backward_losses), 1)
         self.assertAlmostEqual(one["avg_loss"], two["avg_loss"], places=5)
         self.assertAlmostEqual(sum(loss for loss, _ in split_engine.backward_losses), one["avg_loss"], places=5)

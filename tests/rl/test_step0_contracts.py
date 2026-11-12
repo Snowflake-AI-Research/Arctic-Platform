@@ -27,6 +27,7 @@ import arctic_platform.sft.processor  # noqa: F401
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.registry import POST_PROCESSORS
+from arctic_platform.common.unpacked_gas import run_unpacked_gas
 from arctic_platform.rl.processors.grpo import grpo_echo_v1_loss
 from arctic_platform.rl.processors.grpo import grpo_loss
 from arctic_platform.rl.processors.packed_reduction import PackedLossReduction
@@ -434,7 +435,6 @@ class TestIsolation(TestCasePlus):
                 {"loss_fn": None, "post": ["identity"], "config": {}},
                 "cpu",
                 backward=False,
-                pack=False,
             )
             return engine.conv_out[0, -probe.numel() :]
 
@@ -489,8 +489,8 @@ class _SegmentedConvEngine(_StubEngine):
         return outputs
 
 
-class TestPackedInnerCall(TestCasePlus):
-    def test_packing_path_no_typeerror_and_filters_forward(self):
+class TestUnpackedGasCall(TestCasePlus):
+    def test_unpacked_gas_path_no_typeerror_and_filters_forward(self):
         engine = _StubEngine()
         batch = {
             "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
@@ -499,24 +499,23 @@ class TestPackedInnerCall(TestCasePlus):
             "loss_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool),
             "old_log_probs_shifted": torch.zeros(2, 4),
         }
-        meta = {"pad_token_id": 0, "calculate_entropy": False}
-        out = run_pipeline(
+        meta = {"pad_token_id": 0, "drop_position_ids": True, "calculate_entropy": False}
+        out = run_unpacked_gas(
             engine,
-            (),
-            batch,
-            meta,
-            {"loss_fn": "ap_grpo", "post": [], "config": {}},
-            "cpu",
+            gas=2,
+            batch_data=batch,
+            meta_data=meta,
+            processing={"loss_fn": "ap_grpo", "post": [], "config": {}},
             backward=True,
-            pack=True,
-            max_tokens_per_mb=3,
+            device="cpu",
+            step_fn=lambda: None,
         )
         self.assertIn("avg_loss", out)
+        self.assertEqual(engine.backward_scale, [False, False])
         self.assertNotIn("advantages", engine.last_kwargs)
         self.assertNotIn("loss_mask", engine.last_kwargs)
         self.assertIn("input_ids", engine.last_kwargs)
         self.assertIn("position_ids", engine.last_kwargs)
-        self.assertIn("use_cache", engine.last_kwargs)
         self.assertIs(engine.last_kwargs["calculate_entropy"], False)
 
 
