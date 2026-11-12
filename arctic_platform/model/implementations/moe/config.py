@@ -1,4 +1,4 @@
 from typing import Literal
 
-EPCommBackend = Literal["deepep", "uccl", "nccl"]
-DISPATCH_EP_BACKENDS: tuple[EPCommBackend, ...] = ("deepep", "uccl", "nccl")
+EPCommBackend = Literal["deepep", "deepep_v2", "uccl", "nccl"]
+DISPATCH_EP_BACKENDS: tuple[EPCommBackend, ...] = ("deepep", "deepep_v2", "uccl", "nccl")

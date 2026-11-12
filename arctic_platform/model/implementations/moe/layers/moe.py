@@ -1210,9 +1210,12 @@ class MoE(nn.Module):
                 "spare expert slots (ultraep_spares, expert_replicas) need the experts recomputed inside their MoE "
                 "call: checkpoint_dispatch_chunks recomputes each dispatch chunk after it, without the call's spares"
             )
-        if self.combine_replay is not None and self.ep_comm_backend in ("uccl", "deepep"):
+        dispatch_kwargs = {}
+        if self.combine_replay is not None and self.ep_comm_backend in ("uccl", "deepep", "deepep_v2"):
             self.combine_replay.start()
             combine_kwargs["replay"] = self.combine_replay
+            if self.ep_comm_backend == "deepep_v2":
+                dispatch_kwargs["replay"] = self.combine_replay
 
         def dispatch_chunk(start: int, end: int):
             return dispatch_tokens_async(
@@ -1222,6 +1225,7 @@ class MoE(nn.Module):
                 num_experts=num_experts,
                 group=group,
                 score_before_experts=self.score_before_experts,
+                **dispatch_kwargs,
             )
 
         def run_pending_chunk(pending_state):
