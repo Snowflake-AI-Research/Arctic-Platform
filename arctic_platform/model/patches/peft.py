@@ -135,6 +135,32 @@ def _resolve_peft_config_class(peft_module: Any, peft_config: dict[str, Any]) ->
     return getattr(peft_module, config_class_name)
 
 
+def _keep_prime_peft_targets() -> None:
+    """Make PEFT apply the LoRA config of Arctic's prime-rl model trees as written (installed once, process-wide).
+
+    PEFT rewrites the config of transformers-v5 MoE model types (qwen3_moe, glm_moe_dsa, deepseek_v3, minimax, ...)
+    for their fused v5 experts: target_modules gate_proj / up_proj / down_proj move into target_parameters
+    gate_up_proj / down_proj with a doubled rank_pattern. Arctic's trees keep experts as w1 / w2 / w3 and dense
+    MLPs and shared experts as modules, so the rewrite matched nothing and dropped those LoRAs, and the doubled
+    rank_pattern sized the sampler's max_lora_rank. Other models keep PEFT's rewrite."""
+    try:
+        import peft.utils.transformers_weight_conversion as conversion
+    except ImportError:
+        return
+    convert = conversion.convert_peft_config_for_transformers
+    if getattr(convert, "_arl_keeps_prime_trees", False):
+        return
+    from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
+
+    def convert_unless_prime(peft_config, model, conversions):
+        if isinstance(model, PreTrainedModelPrimeRL):
+            return None
+        return convert(peft_config, model, conversions)
+
+    setattr(convert_unless_prime, "_arl_keeps_prime_trees", True)
+    conversion.convert_peft_config_for_transformers = convert_unless_prime
+
+
 def apply_peft(
     model: nn.Module,
     peft_config: dict[str, Any] | None,
@@ -155,6 +181,7 @@ def apply_peft(
 
     import peft
 
+    _keep_prime_peft_targets()
     config = _resolve_peft_config_class(peft, peft_config)(**peft_config)
     if model_has_fp8_weights(model):
         model = peft.get_peft_model(model, config, autocast_adapter_dtype=False)

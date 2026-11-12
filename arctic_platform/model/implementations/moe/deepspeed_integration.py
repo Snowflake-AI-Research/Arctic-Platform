@@ -167,6 +167,7 @@ def build_iter_full_hf_weights(model: nn.Module):
     import torch.distributed as dist
 
     from arctic_platform.model.implementations.moe.weights import hf_export_param_name
+    from arctic_platform.model.weight_export import materialized_parameters
     from arctic_platform.model.weight_export import wait_for_export_collective
 
     def layer_index(name: str) -> int:
@@ -179,21 +180,40 @@ def build_iter_full_hf_weights(model: nn.Module):
             return -1
         return int(index) if index.isdigit() else -1
 
+    def _shard_rows(local: torch.Tensor, world: int, ep_group, device: torch.device) -> list[int]:
+        """Rows of every EP rank's shard of ``local``. DTensor's ``Shard(0)`` uses ceil chunks, so a table whose rows
+        the group does not divide (DeepSeek-V4.1's Engram tables) has a short last shard."""
+        mine = torch.tensor([local.shape[0]], dtype=torch.long, device=device)
+        counts = [torch.empty_like(mine) for _ in range(world)]
+        dist.all_gather(counts, mine, group=ep_group)
+        return [int(count) for count in counts]
+
     def _gather_to_master(local: torch.Tensor, world: int, ep_group, is_master: bool):
-        """Gather checkpoint-only shards into host memory without an all-gather copy on every rank."""
+        """Gather checkpoint-only shards into host memory without an all-gather copy on every rank.
+
+        Shards shorter than the longest (``_shard_rows``) are padded for the collectives and the padding is dropped
+        on the master. A shard in pinned host memory (Qwen3.8's n-gram table under ARL_NGRAM_TABLE_ON_HOST) is
+        gathered through this rank's GPU, a slice at a time; any other shard is gathered where it lives (the CPU
+        tests' gloo groups).
+        """
+        # Gathered as bytes: NCCL has no type for some export dtypes (e8m0 block scales, packed fp4).
         if local.dtype != torch.uint8:
             full = _gather_to_master(local.view(torch.uint8), world, ep_group, is_master)
             return None if full is None else full.view(local.dtype)
-        rows = local.shape[0]
+        device = torch.device("cuda", torch.cuda.current_device()) if local.is_pinned() else local.device
+        counts = _shard_rows(local, world, ep_group, device)
+        rows, total = max(counts), sum(counts)
+        offsets = [sum(counts[:rank]) for rank in range(world)]
+        if local.shape[0] < rows:
+            local = torch.cat([local, local.new_zeros((rows - local.shape[0], *local.shape[1:]))])
         row_bytes = (local.numel() // max(rows, 1)) * local.element_size()
         step = max(1, _EXPORT_GATHER_BYTES // max(row_bytes * world, 1))
         step = min(step, max(rows, 1))
-        full = (
-            torch.empty((world * rows, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
-        )
+        full = torch.empty((total, *local.shape[1:]), dtype=local.dtype, device="cpu") if is_master else None
+        # Host shards of equal length are gathered straight into the output; others go through a bounded buffer.
         buffer = (
-            torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=local.device)
-            if is_master and local.device.type != "cpu"
+            torch.empty((world, step, *local.shape[1:]), dtype=local.dtype, device=device)
+            if is_master and (device.type != "cpu" or total != world * rows)
             else None
         )
         for start in range(0, rows, step):
@@ -206,13 +226,15 @@ def build_iter_full_hf_weights(model: nn.Module):
                 ]
             else:
                 outputs = None
-            chunk = local[start : start + count].contiguous()
+            chunk = local[start : start + count].to(device).contiguous()
             dist.gather(chunk, outputs, dst=0, group=ep_group)
             if not is_master:
                 wait_for_export_collective(chunk)
             if full is not None and buffer is not None:
                 for rank in range(world):
-                    full[rank * rows + start : rank * rows + start + count].copy_(buffer[rank, :count])
+                    valid = min(count, counts[rank] - start)
+                    if valid > 0:
+                        full[offsets[rank] + start : offsets[rank] + start + valid].copy_(buffer[rank, :valid])
         return full
 
     def iterator(*, include_skipped: bool = False):
@@ -236,10 +258,9 @@ def build_iter_full_hf_weights(model: nn.Module):
             if hf_name is not None:
                 by_layer.setdefault(layer_index(hf_name), []).append((hf_name, tensor))
 
-        ordered_layers = ([-1] if -1 in by_layer else []) + sorted(index for index in by_layer if index >= 0)
-        for index in ordered_layers:
+        def export_layer(index: int, tensors: list[tuple[str, torch.Tensor]]):
             layer_state: dict[str, torch.Tensor] = {}
-            for name, tensor in by_layer[index]:
+            for name, tensor in tensors:
                 if hasattr(tensor, "group_name") and getattr(tensor, "allreduce", True) is False:
                     ep_group = ds_groups._get_expert_parallel_group(tensor.group_name)
                     # Only the master's EP replica participates; gather its shards into bounded CPU output.
@@ -247,26 +268,31 @@ def build_iter_full_hf_weights(model: nn.Module):
                         continue
                     if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
                         local = tensor.data.contiguous()
-                        full = _gather_to_master(local, dist.get_world_size(group=ep_group), ep_group, is_master)
-                        if is_master:
-                            layer_state[name] = full
-                        del full
-                        continue
-                    full = _gather_ep_weight_to_cpu(
-                        tensor, ep_group, is_master=is_master, max_gather_bytes=_EXPORT_GATHER_BYTES
-                    )
+                        world = dist.get_world_size(group=ep_group)
+                        full = _gather_to_master(local, world, ep_group, is_master)
+                    else:
+                        full = _gather_ep_weight_to_cpu(
+                            tensor, ep_group, is_master=is_master, max_gather_bytes=_EXPORT_GATHER_BYTES
+                        )
                     if is_master:
                         layer_state[name] = full
                 elif is_master:
                     layer_state[name] = tensor.data
 
             if not is_master:
-                continue
+                return
             layer_state = {
                 name.replace("._checkpoint_wrapped_module", ""): tensor for name, tensor in layer_state.items()
             }
             convert_layer_to_hf(layer_state, index)
             yield from layer_state.items()
+
+        ordered_layers = ([-1] if -1 in by_layer else []) + sorted(index for index in by_layer if index >= 0)
+        for index in ordered_layers:
+            # Parameters the model holds elsewhere (weight_export.HeldParameters) are whole only for this layer;
+            # its tensors live in export_layer's frame, which ends before the next layer is materialized.
+            with materialized_parameters(model, [tensor for _, tensor in by_layer[index]]):
+                yield from export_layer(index, by_layer[index])
 
     return iterator
 
@@ -375,6 +401,11 @@ def load_moe_model(
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist
 
+    from .runtime_options import apply_moe_runtime_options
+
+    # Before the model is built: the modules these settings steer read them while it is built and run, so every
+    # module reads this load's settings.
+    apply_moe_runtime_options(options)
     world_size = dist.get_world_size()
     if world_size % ep_size:
         raise ValueError(f"world_size={world_size} must be divisible by ep_size={ep_size}")
