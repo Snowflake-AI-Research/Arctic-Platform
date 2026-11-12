@@ -177,9 +177,14 @@ class _AlignedLayer(torch.autograd.Function):
     def backward(ctx, grad_out: torch.Tensor):
         (streams,) = ctx.saved_tensors
         # Index and scatter accumulations accumulate with atomics by default (0.2-0.8% run to run at a MoE layer);
-        # torch's deterministic implementations make the layer's backward bitwise reproducible.
-        previous = torch.are_deterministic_algorithms_enabled(), torch.is_deterministic_algorithms_warn_only_enabled()
+        # torch's deterministic implementations make the layer's backward bitwise reproducible. Its fill of new
+        # tensors stays off: DeepEP writes its receive buffers from its own stream, which the fill would race.
+        import torch.utils.deterministic as deterministic
+
+        previous = (torch.are_deterministic_algorithms_enabled(), torch.is_deterministic_algorithms_warn_only_enabled(),
+                    deterministic.fill_uninitialized_memory)  # fmt: skip
         torch.use_deterministic_algorithms(True, warn_only=True)
+        deterministic.fill_uninitialized_memory = False
         try:
             with torch.enable_grad():
                 replay = streams.detach().requires_grad_(streams.requires_grad)
@@ -187,6 +192,7 @@ class _AlignedLayer(torch.autograd.Function):
             torch.autograd.backward(out, grad_out)
         finally:
             torch.use_deterministic_algorithms(previous[0], warn_only=previous[1])
+            deterministic.fill_uninitialized_memory = previous[2]
         return (replay.grad if streams.requires_grad else None), None, None
 
 
