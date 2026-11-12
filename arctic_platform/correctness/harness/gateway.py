@@ -30,6 +30,7 @@ import os
 import re
 import select
 import shlex
+import shutil
 import signal
 import socket
 import stat
@@ -74,9 +75,6 @@ from arctic_platform.correctness.harness.storage import correctness_environment
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import parse_hostfile
 from arctic_platform.correctness.harness.storage import require_data_fast_path
-from arctic_platform.debug.training import maybe_bind_reduced_fixture_mtp
-from arctic_platform.debug.training import maybe_configure_router_replay_sampling
-from arctic_platform.debug.weight_sync import maybe_configure_broadcast_sampling
 
 # Arctic Platform Driver
 
@@ -295,6 +293,7 @@ def local_cortex_gateway(
     *,
     gateway_module: str = "dss.ray_dss.gateway_server",
     allocation_members: dict | None = None,
+    runtime_admission: dict | None = None,
     gateway_command_builder=None,
     gateway_command_source: dict | None = None,
 ) -> Iterator[str]:
@@ -308,6 +307,10 @@ def local_cortex_gateway(
     if allocation_members is not None and gateway_module != "arctic_platform.correctness.harness.gateway":
         raise ValueError("explicit allocation identities require the correctness gateway")
     options = {} if allocation_members is None else {"allocation_members": allocation_members}
+    if runtime_admission is not None:
+        if gateway_module != "arctic_platform.correctness.harness.gateway":
+            raise ValueError("runtime admission requires the correctness-owned gateway")
+        options["runtime_admission"] = deepcopy(runtime_admission)
     if gateway_command_builder is not None or gateway_command_source is not None:
         from arctic_platform.correctness.harness.optimizer import verify_native_callback
 
@@ -330,6 +333,7 @@ def _started_local_cortex_gateway(
     *,
     gateway_module: str = "dss.ray_dss.gateway_server",
     allocation_members: dict | None = None,
+    runtime_admission: dict | None = None,
     gateway_command_builder=None,
     gateway_command_source: dict | None = None,
 ) -> Iterator[str]:
@@ -347,6 +351,8 @@ def _started_local_cortex_gateway(
         prepared = _prepare_gateway_scratch(directory, hostfile, **options)
         os.environ["AP_CORRECTNESS_TMPDIR"] = prepared["path"]
     command_options = {}
+    if runtime_admission is not None:
+        command_options["runtime_admission"] = runtime_admission
     if gateway_command_builder is not None or gateway_command_source is not None:
         command_options.update(
             gateway_command_builder=gateway_command_builder,
@@ -946,6 +952,7 @@ def _launch_local_cortex_gateway(
     gateway_module: str,
     gateway_command_builder=None,
     gateway_command_source: dict | None = None,
+    runtime_admission: dict | None = None,
 ) -> Iterator[str]:
     import requests
 
@@ -1002,6 +1009,13 @@ def _launch_local_cortex_gateway(
                     or list(command[-len(options) :]) != options
                 ):
                     raise ValueError("native gateway command builder must preserve interpreter and runtime options")
+            from .engine_admission import RUNTIME_ADMISSION_ENV
+
+            admission_env = (
+                {RUNTIME_ADMISSION_ENV: json.dumps(runtime_admission, sort_keys=True, allow_nan=False)}
+                if runtime_admission is not None
+                else {}
+            )
             process = subprocess.Popen(
                 command,
                 stdout=log,
@@ -1012,6 +1026,7 @@ def _launch_local_cortex_gateway(
                     **os.environ,
                     "AP_CORRECTNESS_GATEWAY_OWNER": token,
                     "SPT_NOENV": "1",
+                    **admission_env,
                 },
             )
             owner = _gateway_process_identity(os.getpid())
@@ -1430,11 +1445,20 @@ def build_payload(
             require_data_fast_path(optimizer_state_output_dir, label="optimizer artifact output")
         )
     tc["debug"] = debug
+    dtype = tc.get("dtype")
+    if dtype is None:
+        dtype = "bfloat16"
+    if isinstance(dtype, str):
+        dtype = dtype.lower()
+        if dtype == "bf16":
+            dtype = "bfloat16"
+    if "dtype" in tc:
+        tc["dtype"] = dtype
     payload = {
         "model_name": model_path,
         "job_type": "training",
         "seed": seed,
-        "dtype": tc.get("dtype", "bfloat16"),
+        "dtype": dtype,
         "training_config": tc,
     }
     if weight_format is not None:
@@ -1698,6 +1722,9 @@ def running_rl_client(
     router_replay_verification: bool = False,
 ) -> Iterator[ArcticClient]:
     """Create one native client whose training and sampling jobs share the reviewed config."""
+    from arctic_platform.debug.training import maybe_configure_router_replay_sampling
+    from arctic_platform.debug.weight_sync import maybe_configure_broadcast_sampling
+
     if cfg.native is None:
         raise ValueError(f"{cfg.config_id}: native ArcticClientConfig is required")
     session = GatewaySession(
@@ -1969,6 +1996,8 @@ def training_client_config(
     published_fixture: dict | None = None,
 ):
     """Build reviewed training, optionally retaining the native RL sampling placement."""
+    from arctic_platform.debug.training import maybe_bind_reduced_fixture_mtp
+
     if preserve_native_topology and (not cfg.is_rl or cfg.native is None):
         raise ValueError("native checkpoint topology requires a reviewed RL configuration")
     payload = build_payload(
@@ -2461,6 +2490,7 @@ def install_checkpoint_routes(gw, store) -> None:
 def main() -> None:
     from dss.ray_dss import gateway_server
 
+    from arctic_platform.correctness.harness.engine_admission import gateway_runtime_scope
     from arctic_platform.correctness.harness.lora import gateway_scope
     from arctic_platform.correctness.harness.native_optimizer import install_gateway_route
     from arctic_platform.correctness.harness.storage import NativeCheckpointStore
@@ -2474,8 +2504,123 @@ def main() -> None:
     store = NativeCheckpointStore(Path(hostfiles[0]))
     install_checkpoint_routes(gateway_server, store)
     install_gateway_route(gateway_server)
-    with gateway_scope(gateway_server):
+    with gateway_scope(gateway_server), gateway_runtime_scope(gateway_server, Path(hostfiles[0]), first_two_only=True):
         gateway_server.main()
+
+
+def validate_reduced_fixture_support(payload: dict, spec: TestSpec | None, published_fixture: dict | None) -> None:
+    """Admit reviewed fixtures without asking unchanged native loaders to ignore missing prediction weights."""
+    training = payload["training_config"]
+    prime = training.get("prime_rl") or {}
+    if not isinstance(prime, dict):
+        raise ValueError("prime_rl must be a configuration object")
+    options = prime.get("debug") or {}
+    if not isinstance(options, dict):
+        raise ValueError("prime_rl.debug must be a configuration object")
+    if "reduced_fixture_mtp" in options:
+        raise ValueError("reduced fixture MTP descriptors require unavailable native loader hooks")
+    if published_fixture is None or training.get("model_provider") != "prime_rl":
+        return
+    if spec is None:
+        raise ValueError("published fixture requires its reviewed spec")
+    if type(spec.model.seed) is not int or spec.model.seed != 0:
+        return
+    if (
+        published_fixture.get("schema_version") != 1
+        or published_fixture.get("config_id") != spec.config_id
+        or published_fixture.get("reference_path") != spec.model.cache_path
+        or published_fixture.get("reviewed_hash") != spec.model.content_hash
+        or published_fixture.get("model_name") != payload["model_name"]
+    ):
+        raise ValueError("reduced fixture does not match the reviewed spec and native model")
+    files = published_fixture.get("files")
+    if not isinstance(files, list) or not files or any(not isinstance(row, dict) for row in files):
+        raise ValueError("published fixture requires its bound file inventory")
+    names = [row.get("path") for row in files]
+    if any(not isinstance(name, str) for name in names) or names != sorted(set(names)):
+        raise ValueError("published fixture file inventory is invalid")
+    digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if digest != published_fixture.get("fixture_sha256"):
+        raise ValueError("published fixture inventory digest differs")
+    config_row = next((row for row in files if row["path"] == "config.json"), None)
+    if (
+        config_row is None
+        or type(config_row.get("size_bytes")) is not int
+        or not 0 < config_row["size_bytes"] <= 16 << 20
+        or not isinstance(config_row.get("sha256"), str)
+        or re.fullmatch("[0-9a-f]{64}", config_row["sha256"]) is None
+    ):
+        raise ValueError("published fixture has no valid config binding")
+    path = Path(spec.model.cache_path) / "config.json"
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC), "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        identity = tuple(getattr(metadata, name) for name in fields)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != config_row["size_bytes"]:
+            raise ValueError("fixture config size or file type differs")
+        raw = stream.read((16 << 20) + 1)
+        if (
+            hashlib.sha256(raw).hexdigest() != config_row["sha256"]
+            or tuple(getattr(os.fstat(stream.fileno()), name) for name in fields) != identity
+            or tuple(getattr(path.stat(), name) for name in fields) != identity
+        ):
+            raise ValueError("fixture config bytes or file identity differ")
+    config = json.loads(raw, object_pairs_hook=_fixture_config_object)
+    text = config.get("text_config", config) if isinstance(config, dict) else None
+    if (
+        not isinstance(text, dict)
+        or type(text.get("num_hidden_layers")) is not int
+        or text["num_hidden_layers"] != spec.model.num_hidden_layers
+    ):
+        raise ValueError("fixture text configuration or reduced depth differs")
+    model_type = text.get("model_type")
+    if model_type in {"qwen3_5_moe_text", "qwen4_exp_text", "glm5_next_text"}:
+        count_name = "num_nextn_predict_layers" if model_type == "glm5_next_text" else "mtp_num_hidden_layers"
+        count = text.get(count_name, 0)
+        if type(count) is not int or count < 0:
+            raise ValueError(f"fixture {count_name} must be a nonnegative integer")
+        if count == 0:
+            return
+        raise ValueError(
+            f"Reduced pretrained prime_rl fixture {model_type} with {count_name}={count} requires native"
+            " prediction-weight loading and authentication unavailable on unchanged main; this correctness-only"
+            " package cannot authorize omitted MTP weights"
+        )
+
+
+def _fixture_config_object(pairs: list[tuple[str, Any]]) -> dict:
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError(f"fixture config has a duplicate key: {name}")
+        result[name] = value
+    return result
+
+
+def ap_driver_copy_checkpoint_peft_adapter(checkpoint_root: Path, destination: Path) -> Path:
+    """Copy the PEFT pack from a weights-only checkpoint when the exporter retained one."""
+    destination = require_data_fast_path(destination, label="PEFT adapter output")
+    from safetensors import safe_open
+
+    candidates = [
+        checkpoint_root / "hf",
+        checkpoint_root / "default",
+        *sorted(checkpoint_root.glob("global_step*/default"), reverse=True),
+    ]
+    source = next(
+        (path for path in candidates if (path / "adapter_model.safetensors").is_file()),
+        None,
+    )
+    if source is None or not (source / "adapter_config.json").is_file():
+        raise RuntimeError(f"initial adapter checkpoint produced no PEFT pack under {checkpoint_root}")
+    if not json.loads((source / "adapter_config.json").read_text()).get("peft_type"):
+        raise RuntimeError(f"initial adapter checkpoint produced no PEFT type under {source}")
+    with safe_open(source / "adapter_model.safetensors", framework="pt") as adapter:
+        if not adapter.keys():
+            raise RuntimeError(f"initial adapter checkpoint produced no adapter tensors under {source}")
+    shutil.rmtree(destination, ignore_errors=True)
+    shutil.copytree(source, destination)
+    return destination
 
 
 if __name__ == "__main__":

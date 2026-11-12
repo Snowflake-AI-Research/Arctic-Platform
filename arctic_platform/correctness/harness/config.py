@@ -122,6 +122,10 @@ class ArmSpec:
     ap_microbatches: int
     pad_fraction: float
 
+    @property
+    def exercises_accumulation(self) -> bool:
+        return self.ap_microbatches > 1
+
 
 @dataclass
 class ModelSpec:
@@ -454,7 +458,13 @@ class LoadedConfig:
                 update={"training_gpus": gpus, "training": native_training},
                 deep=True,
             )
-        return replace(self, sub_job=sub_job, sub_jobs=sub_jobs, native=native)
+        return replace(
+            self,
+            sub_job=sub_job,
+            sub_jobs=sub_jobs,
+            native=native,
+            placement_base_gpus=self.placement_base_gpus or self.n_gpus,
+        )
 
     @property
     def sp_size(self) -> int:
@@ -523,6 +533,8 @@ class LoadedConfig:
         from arctic_platform.rl.processors.microbatch import DEFAULT_MAX_TOKENS_PER_MB
 
         return int((self.training.get("mb_spec") or {}).get("max_tokens_per_mb") or DEFAULT_MAX_TOKENS_PER_MB)
+
+    placement_base_gpus: int | None = None
 
 
 def normalize_ints(obj: Any) -> Any:
@@ -1007,3 +1019,21 @@ def arms_for(max_row_tokens: int, gpu_count: int) -> List[ArmDefinition]:
     """One and four GAS groups, each with one variable-length row per configured GPU."""
     row_tokens = max_sequence_tokens(max_row_tokens, gpu_count)
     return [ArmDefinition(f"gas{gas}", gpu_count * gas, row_tokens) for gas in GAS_VALUES]
+
+
+def validate_first_two_model_dtype(config: LoadedConfig) -> None:
+    """Admit only BF16 model parameters, independently of accumulator and optimizer-state precision."""
+    # The declared model dtype and the first-two payload's training override are separate inputs.
+    for location, dtype in (
+        ("sub_job.dtype", config.sub_job.get("dtype")),
+        ("training_config.dtype", config.training.get("dtype")),
+    ):
+        if dtype is None:
+            continue
+        if not isinstance(dtype, str) or dtype.lower() not in {"bf16", "bfloat16"}:
+            raise ValueError(
+                f"{config.config_id}: first-two correctness onboarding, reference preparation and regression "
+                f"support only BF16 model dtype ('bfloat16' or 'bf16'); got {location}={dtype!r}. "
+                "Non-BF16 model execution is not admitted; the target and HF reference use BF16. "
+                "FP32 gradient accumulation is a separate setting and remains supported."
+            )

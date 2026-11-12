@@ -62,6 +62,7 @@ from .config import local_gpu_type
 from .config import placement_widths
 from .config import scaled_for_placement
 from .config import validate_against_host
+from .config import validate_first_two_model_dtype
 from .registry import RL_INAPPLICABLE_REASON
 from .registry import TestOutcome
 from .registry import TestResult
@@ -495,12 +496,16 @@ def _configure_regression_target(args):
 
 
 @contextmanager
-def _regression_gateway(args):
+def _regression_gateway(args, *, runtime_admission: dict | None = None):
     if not getattr(args, "_automatic_cortex_gateway", False):
         yield None
         return
     if not getattr(args, "_automatic_checkpoint_bridge", False):
-        with local_cortex_gateway(Path(args.out), gateway_module="arctic_platform.debug.training") as url:
+        with local_cortex_gateway(
+            Path(args.out),
+            gateway_module="arctic_platform.correctness.harness.gateway",
+            **({"runtime_admission": runtime_admission} if runtime_admission is not None else {}),
+        ) as url:
             yield url
         return
     from arctic_platform.correctness.harness.cortex import local_checkpoint_bridge
@@ -608,10 +613,24 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
     unknown = sorted(set(args.test or []) - set(tests))
     if unknown:
         raise SystemExit(f"unknown check(s): {', '.join(unknown)}")
+    selected_ids = set(args.test or tests)
+    first_two_ids = {"single-step-grads", "single-step-optimizer"}
+    automatic_first_two = bool(
+        getattr(args, "_automatic_cortex_gateway", False)
+        and args.test
+        and selected_ids <= first_two_ids
+        and not getattr(args, "_automatic_checkpoint_bridge", False)
+    )
 
     for path in config_paths:
+        automatic_allocation = None
         try:
             cfg = load_config(path)
+            if not cfg.is_rl and selected_ids & first_two_ids:
+                validate_first_two_model_dtype(cfg)
+                from .engine_admission import validate_reference_accumulation
+
+                validate_reference_accumulation(cfg, automatically_owned_local=automatic_first_two)
             if topology is not None:
                 from types import SimpleNamespace
 
@@ -652,7 +671,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 else (
                     [cfg.n_gpus]
                     if (
-                        local_fixture
+                        (local_fixture and not automatic_first_two)
                         or local_full_model
                         or topology is not None
                         or inference_export_allocation is not None
@@ -660,6 +679,15 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                     else placement_widths(cfg.n_gpus, pool)
                 )
             )
+            if automatic_first_two and not cfg.is_rl:
+                for width in widths:
+                    validate_reference_accumulation(cfg.at_gpu_width(width), automatically_owned_local=True)
+                import torch
+
+                if local_fixture and max(widths) > torch.cuda.device_count():
+                    from .engine_admission import owned_allocation_admission
+
+                    automatic_allocation = owned_allocation_admission(cfg.at_gpu_width(max(widths)))
         except (ValueError, KeyError) as exc:
             results.append(
                 TestResult(
@@ -827,14 +855,19 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 fixture_sha256=published_fixture["fixture_sha256"],
                 fixture_stage_path=published_fixture["publication"]["stage_path"],
             )
-        with _regression_gateway(args) as gateway_url:
+        with _regression_gateway(args, runtime_admission=automatic_allocation) as gateway_url:
             if gateway_url is not None:
                 backend.base_url = gateway_url
                 execution[cfg.config_id]["gateway_url"] = gateway_url
             if local_fixture:
+                from arctic_platform.correctness.harness.cortex import distribute_local_fixture
                 from arctic_platform.correctness.harness.cortex import load_local_fixture
 
                 try:
+                    if automatic_allocation is not None:
+                        execution[cfg.config_id]["fixture_locality"] = distribute_local_fixture(
+                            spec, automatic_allocation
+                        )
                     published_fixture = load_local_fixture(backend, spec)
                 except ValueError as exc:
                     results.extend(
@@ -846,7 +879,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                                 summary="local Cortex fixture identity unavailable",
                                 reason=str(exc),
                             )
-                            for test_id in args.test
+                            for test_id in args.test or tests
                         ]
                     )
                     print(f"skip {path.name}: {exc}", flush=True)
@@ -879,10 +912,22 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 if len(widths) > 1:
                     print(f"--- {cfg.config_id} on {width} GPU(s) ---", flush=True)
                 native_optimizer = {}
+                run_dense_allocation = dense_checkpoint_allocation
+                if automatic_allocation is not None:
+                    from .runner import supports_dense_checkpoint_allocation
+
+                    if (
+                        run_dense_allocation is None
+                        and "single-step-optimizer" in selected_ids
+                        and selected_ids <= first_two_ids
+                        and supports_dense_checkpoint_allocation(run_cfg)
+                        and sum(node["slots"] for node in automatic_allocation["nodes"]) == run_cfg.dp_size
+                    ):
+                        run_dense_allocation = automatic_allocation
                 if (
                     local_fixture
-                    and "single-step-optimizer" in args.test
-                    and set(args.test) <= {"single-step-grads", "single-step-optimizer"}
+                    and "single-step-optimizer" in selected_ids
+                    and selected_ids <= first_two_ids
                     and run_cfg.training.get("ep_size", 1) > 1
                 ):
                     # EP checkpoints shard optimizer state per expert rank; only the native layout decodes them.
@@ -925,8 +970,8 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                             else {}
                         ),
                         **(
-                            {"dense_checkpoint_allocation": copy.deepcopy(dense_checkpoint_allocation)}
-                            if dense_checkpoint_allocation is not None
+                            {"dense_checkpoint_allocation": copy.deepcopy(run_dense_allocation)}
+                            if run_dense_allocation is not None
                             else {}
                         ),
                         **native_optimizer,

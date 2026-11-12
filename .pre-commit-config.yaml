@@ -24,7 +24,7 @@ repos:
       - id: requirements-txt-fixer
       - id: pretty-format-json
         args: [--autofix]
-        # Correctness recipes are byte-preserving copies of operator inputs.
+        # Imported correctness recipes retain the operator's exact bytes.
         exclude: ^arctic_platform/correctness/configs/
   - repo: https://github.com/PyCQA/isort
     rev: 6.0.1

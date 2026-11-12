@@ -22,6 +22,7 @@ and reconstructed inputs before allocating any target GPUs. Normal-workload refe
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -42,12 +43,16 @@ from typing import Optional
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
+from arctic_platform.correctness.harness.gateway import (
+    ap_driver_copy_checkpoint_peft_adapter as copy_checkpoint_peft_adapter,
+)
 from arctic_platform.correctness.harness.gateway import build_payload
 from arctic_platform.correctness.harness.gateway import fwd_bwd_step
 from arctic_platform.correctness.harness.gateway import gateway
 from arctic_platform.correctness.harness.gateway import pack
 from arctic_platform.correctness.harness.gateway import rl_gpu_count
 from arctic_platform.correctness.harness.gateway import running_job
+from arctic_platform.correctness.harness.gateway import validate_reduced_fixture_support
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
 from arctic_platform.correctness.harness.sft import save
@@ -66,6 +71,7 @@ from .config import LoadedConfig
 from .config import TestSpec
 from .config import correctness_microbatch_tokens
 from .config import reference_calibration_worker_count
+from .config import validate_first_two_model_dtype
 from .registry import TestOutcome
 from .registry import TestResult
 from .registry import registered_tests
@@ -419,6 +425,9 @@ def execute(
     their target attention default. Onboarding calibrates the selected reference backend; the HF side keeps
     samples in separate rows while Arctic Platform exercises packed/SP execution.
     """
+    first_two_ids = {"single-step-grads", "single-step-optimizer"}
+    if not cfg.is_rl and set(registered_tests() if select is None else select) & first_two_ids:
+        validate_first_two_model_dtype(cfg)
     if workdir is not None:
         workdir = require_data_fast_path(workdir, label="correctness workdir")
     cfg = cfg.at_gpu_width(cfg.n_gpus)
@@ -467,27 +476,14 @@ def execute(
         from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
         from arctic_platform.correctness.harness.optimizer import validate_dense_checkpoint_allocation
 
-        ds_config = cfg.training.get("ds_config") or {}
-        expert = ds_config.get("expert_parallel") or {}
-        tensor = ds_config.get("tensor_parallel") or {}
         if (
             not local_cortex_fixture
             or prepare_references
-            or cfg.is_rl
-            or cfg.training.get("peft_config")
+            or not supports_dense_checkpoint_allocation(cfg)
             or not isinstance(client_backend, CortexConfig)
             or not select
             or "single-step-optimizer" not in select
             or not set(select) <= {"single-step-grads", "single-step-optimizer"}
-            or cfg.sp_size != 1
-            or cfg.dp_size != cfg.n_gpus
-            or not isinstance(expert, dict)
-            or expert.get("enabled", False)
-            or expert.get("ep_size", 1) != 1
-            or expert.get("autoep_size", 1) != 1
-            or ds_config.get("moe")
-            or not isinstance(tensor, dict)
-            or tensor.get("tp_size", 1) != 1
             or native_optimizer_scope is not None
             or native_optimizer_scope_source is not None
             or native_optimizer_supplier_source is not None
@@ -696,6 +692,9 @@ def execute(
     per_arm_tests = [t for t in chosen if t.per_arm is not None]
     whole_run_tests = [t for t in chosen if t.per_arm is None]
     collect_gradient_norms = any(t.test_id == "single-step-grads" for t in chosen)
+    first_two_payload = bool(
+        not cfg.is_rl and per_arm_tests and all(test.test_id in first_two_ids for test in per_arm_tests)
+    )
 
     def payload_for(arm: ArmSpec) -> dict:
         """One job per case, asking for the optimizer artifacts only when the step check reads them."""
@@ -714,7 +713,11 @@ def execute(
             gradient_norms_per_param=collect_gradient_norms,
             weight_format=cfg.sub_job.get("weight_format"),
         )
-        maybe_bind_reduced_fixture_mtp(payload, spec, published_fixture)
+        if first_two_payload:
+            validate_reduced_fixture_support(payload, spec, published_fixture)
+            payload["training_config"]["debug"]["correctness_first_two"] = True
+        else:
+            maybe_bind_reduced_fixture_mtp(payload, spec, published_fixture)
         if isinstance(client_backend, CortexConfig):
             payload["training_config"]["debug"].pop("optimizer_state_output_dir", None)
             if cfg.gpu_type is not None:
@@ -1058,6 +1061,18 @@ def execute(
                         "minimum_gate": 0.001,
                     },
                 }
+                reviewed_gate = optimizer_settings.get("reviewed_absolute_gate")
+                if reviewed_gate is not None:
+                    if (
+                        type(reviewed_gate) not in {int, float}
+                        or not math.isfinite(reviewed_gate)
+                        or reviewed_gate <= 0
+                    ):
+                        raise ValueError("reviewed optimizer absolute gate must be positive and finite")
+                    compact["optimizer_norm_gate"]["absolute"] = reviewed_gate
+                    compact["optimizer_norm_gate"]["provenance"].update(
+                        calibrated_gate=absolute, reviewed_absolute_gate=reviewed_gate
+                    )
             for test_id, identity in identities.items():
                 if test_id not in records:
                     records[test_id] = compact
@@ -1339,3 +1354,81 @@ def execute_rl(
             print(console.arm_verdict(result, None), flush=True)
         results.extend(produced)
     return _at_width(results, rl_gpu_count(cfg))
+
+
+def supports_dense_checkpoint_allocation(cfg: LoadedConfig) -> bool:
+    ds_config = cfg.training.get("ds_config") or {}
+    expert = ds_config.get("expert_parallel") or {}
+    tensor = ds_config.get("tensor_parallel") or {}
+    return bool(
+        not cfg.is_rl
+        and not cfg.training.get("peft_config")
+        and cfg.sp_size == 1
+        and cfg.dp_size == cfg.n_gpus
+        and cfg.training.get("ep_size", 1) == 1
+        and isinstance(expert, dict)
+        and not expert.get("enabled", False)
+        and expert.get("ep_size", 1) == 1
+        and expert.get("autoep_size", 1) == 1
+        and not ds_config.get("moe")
+        and isinstance(tensor, dict)
+        and tensor.get("tp_size", 1) == 1
+    )
+
+
+def materialize_ap_peft_adapter(
+    cfg: LoadedConfig,
+    model_path: str,
+    workdir: Path,
+    *,
+    attn_implementation: str,
+) -> Path | None:
+    """Export the product-initialized adapter so the independent reference starts from identical bytes."""
+    if not cfg.training.get("peft_config"):
+        return None
+    workdir = require_data_fast_path(workdir, label="PEFT adapter workdir")
+    cfg = cfg.at_gpu_width(cfg.n_gpus)
+    backend = None
+    if cfg.model_name in {"zai-org/GLM-5.3-Flash", "zai-org/GLM-5.3-Flash-BF16"}:
+        from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+
+        if cfg.native is None or not isinstance(cfg.native.backend, CortexConfig):
+            raise ValueError("GLM adapter initialization requires its configured local Cortex gateway")
+        backend = cfg.native.backend
+        require_local_cortex_gateway(backend)
+        if cfg.training.get("model_provider") != "prime_rl" or cfg.sp_size != 8 or cfg.training.get("ep_size") != 8:
+            raise ValueError("GLM adapter initialization requires the reviewed PrimeRL/SP8/EP8 route")
+    workdir.mkdir(parents=True, exist_ok=True)
+    gateway_dir = workdir / "gateway"
+    gateway_dir.mkdir(parents=True, exist_ok=True)
+    adapter_dir = workdir / "adapter"
+    payload = build_payload(
+        cfg.training,
+        model_path,
+        SEED,
+        attn_implementation=attn_implementation,
+        weight_format=cfg.sub_job.get("weight_format"),
+    )
+    checkpoint_root = workdir / "checkpoint"
+    if backend is not None:
+        checkpoint_root = require_data_fast_path(checkpoint_root, label="GLM initial checkpoint")
+        adapter_dir = require_data_fast_path(adapter_dir, label="GLM initial adapter")
+        if adapter_dir.exists():
+            raise FileExistsError(f"GLM initial adapter already exists: {adapter_dir}")
+        checkpoint_root.mkdir()
+        payload["hardware"] = cfg.gpu_type.upper() if cfg.gpu_type is not None else None
+    with gateway(gateway_dir, cfg.n_gpus, **({"backend": backend} if backend is not None else {})) as session:
+        with running_job(session, payload) as job:
+            if backend is not None:
+                from arctic_platform.correctness.harness.gateway import _local_checkpoint_metadata
+
+                # The native EP checkpointer writes the unmerged adapter under global_step0/default.
+                saved = job.client.save_checkpoint(path=str(checkpoint_root), checkpoint_type="weights-only")
+                tag = _local_checkpoint_metadata(saved, checkpoint_root, "initial adapter save")
+                if tag != "global_step0":
+                    raise RuntimeError("GLM initial adapter save must report step zero")
+                exported_root = checkpoint_root
+            else:
+                saved = job.client.save_checkpoint(path=str(checkpoint_root), export_hf=True)
+                exported_root = Path(saved.get("hf_path") or saved["path"]).parent
+    return copy_checkpoint_peft_adapter(exported_root, adapter_dir)

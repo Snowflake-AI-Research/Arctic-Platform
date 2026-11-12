@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 _DSS_COMPARISON_ADAPTERS = {
+    "correctness/harness/engine_admission.py",
     "correctness/harness/gateway.py",
     "correctness/harness/lora.py",
     "correctness/harness/native_optimizer.py",
@@ -29,38 +30,16 @@ _DSS_COMPARISON_ADAPTERS = {
 }
 
 
-def _dss_import_violations(package_root: Path) -> list[str]:
+def _dss_import_violations(package_root: Path | str, relative_path: Path | None = None) -> list[str]:
+    if relative_path is not None:
+        return _source_dss_import_violations(package_root, relative_path)
     violations = []
     for path in package_root.rglob("*.py"):
         relative_path = path.relative_to(package_root)
         # These tests compare AP against DSS; they are not AP runtime dependencies.
         if relative_path.parts[:2] == ("correctness", "selftest"):
             continue
-        tree = ast.parse(path.read_text(), filename=str(path))
-        # Only these reference adapters may load DSS, and only inside a function.
-        reference_imports = set()
-        if relative_path.as_posix() in _DSS_COMPARISON_ADAPTERS:
-            reference_imports = {
-                node
-                for function in ast.walk(tree)
-                if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
-                for node in ast.walk(function)
-                if isinstance(node, (ast.Import, ast.ImportFrom))
-            }
-        for node in ast.walk(tree):
-            if node in reference_imports:
-                continue
-            if isinstance(node, ast.Import):
-                imported = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom):
-                imported = [node.module or ""]
-            else:
-                continue
-            violations.extend(
-                f"{relative_path}:{node.lineno}: {module}"
-                for module in imported
-                if module == "dss" or module.startswith("dss.")
-            )
+        violations.extend(_source_dss_import_violations(path.read_text(), relative_path))
     return violations
 
 
@@ -109,3 +88,46 @@ def test_dependency_check_rejects_lazy_dss_imports_outside_comparison_adapters(t
     path.parent.mkdir(parents=True)
     path.write_text("def run():\n    import dss\n")
     assert _dss_import_violations(tmp_path) == [f"{relative_path}:2: dss"]
+
+
+def _source_dss_import_violations(source: str, path: Path) -> list[str]:
+    # Only the correctness integration can depend on the optional DSS runtime,
+    # and its imports must wait until a runtime-dependent function is called.
+    optional_adapter = path.as_posix() in _DSS_COMPARISON_ADAPTERS
+    violations = []
+
+    def visit(node, inside_function=False):
+        inside_function = inside_function or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        if isinstance(node, ast.Import):
+            imported = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            imported = [node.module or ""]
+        else:
+            imported = []
+        violations.extend(
+            f"{path}:{node.lineno}: {module}"
+            for module in imported
+            if (module == "dss" or module.startswith("dss.")) and not (optional_adapter and inside_function)
+        )
+        for child in ast.iter_child_nodes(node):
+            visit(child, inside_function)
+
+    visit(ast.parse(source, filename=str(path)))
+    return violations
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["model/loader.py", "common/deepspeed_engine.py", "correctness/harness/runner.py", *_DSS_COMPARISON_ADAPTERS],
+)
+@pytest.mark.parametrize("statement", ["import dss", "from dss.ray_dss.models import JobConfig"])
+@pytest.mark.parametrize("scope", ["module", "function", "async-function"])
+def test_dss_dependency_boundary_requires_a_deferred_correctness_adapter(path, statement, scope):
+    source = (
+        statement
+        if scope == "module"
+        else f"{'async ' if scope == 'async-function' else ''}def load():\n    {statement}"
+    )
+    violations = _dss_import_violations(source, Path(path))
+    permitted = path in _DSS_COMPARISON_ADAPTERS and scope != "module"
+    assert bool(violations) is not permitted

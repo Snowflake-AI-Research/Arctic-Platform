@@ -48,6 +48,9 @@ from typing import Iterable
 from typing import Mapping
 
 from arctic_platform.common.peft import normalize_lora_peft_config
+from arctic_platform.correctness.harness.optimizer import participation_step_class as first_two_step_class
+from arctic_platform.correctness.harness.optimizer import participation_worker_class as first_two_worker_class
+from arctic_platform.correctness.harness.optimizer import select_participation_coordinator
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.storage import correctness_environment
 from arctic_platform.correctness.harness.storage import correctness_workdir
@@ -332,6 +335,10 @@ def materialize_adapter(cfg, model_path: str | Path, workdir: str | Path) -> Pat
     seed = cfg.sub_job.get("seed")
     seed = SEED if seed is None else seed
     dtype = cfg.sub_job.get("dtype") or cfg.training.get("dtype") or "bfloat16"
+    if isinstance(dtype, str):
+        dtype = dtype.lower()
+        if dtype == "bf16":
+            dtype = "bfloat16"
     if dtype not in {"float32", "float16", "bfloat16"}:
         raise ValueError(f"unsupported deterministic LoRA model dtype: {dtype!r}")
     config_digest = hashlib.sha256((source / "config.json").read_bytes()).hexdigest()
@@ -1372,15 +1379,16 @@ def _spawn_worker_binding(spawn, training, sources: dict) -> tuple[dict, type]:
     return namespace, worker
 
 
-def _coordinator_class(training, request: dict, files_ref):
+def _coordinator_class(training, request: dict, files_ref, *, first_two: bool = False):
     """Use native creation/placement/teardown with an initialization-only worker subclass."""
     import ray
 
     _verify_runtime(training, request["sources"])
-    capture = participation_capture_enabled()
+    capture = first_two or participation_capture_enabled()
     coordinator_base = training.GPUTrainingJob.__ray_metadata__.modified_class
     if capture:
-        coordinator_base = participation_step_class(coordinator_base)
+        selected_step_class = first_two_step_class if first_two else participation_step_class
+        coordinator_base = selected_step_class(coordinator_base)
     worker_base = training._DeepSpeedWorker
 
     class OriginalAdapterWorker(worker_base):
@@ -1409,7 +1417,8 @@ def _coordinator_class(training, request: dict, files_ref):
         def original_adapter_receipt(self):
             return deepcopy(self._correctness_original_adapter_receipt)
 
-    selected_worker = participation_worker_class(OriginalAdapterWorker) if capture else OriginalAdapterWorker
+    selected_worker_class = first_two_worker_class if first_two else participation_worker_class
+    selected_worker = selected_worker_class(OriginalAdapterWorker) if capture else OriginalAdapterWorker
 
     class OriginalAdapterCoordinator(coordinator_base):
         async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
@@ -1469,15 +1478,16 @@ def _coordinator_class(training, request: dict, files_ref):
     return ray.remote(num_cpus=1, num_gpus=0)(OriginalAdapterCoordinator)
 
 
-def _shared_coordinator_class(training, request: dict, files_ref):
+def _shared_coordinator_class(training, request: dict, files_ref, *, first_two: bool = False):
     """Keep ordinary native placement and teardown for a separately identified shared pack."""
     import ray
 
     _verify_shared_runtime(training, request["sources"])
-    capture = participation_capture_enabled()
+    capture = first_two or participation_capture_enabled()
     coordinator_base = training.GPUTrainingJob.__ray_metadata__.modified_class
     if capture:
-        coordinator_base = participation_step_class(coordinator_base)
+        selected_step_class = first_two_step_class if first_two else participation_step_class
+        coordinator_base = selected_step_class(coordinator_base)
     worker_base = training._DeepSpeedWorker
 
     class SharedAdapterWorker(worker_base):
@@ -1505,7 +1515,8 @@ def _shared_coordinator_class(training, request: dict, files_ref):
         def shared_adapter_receipt(self):
             return deepcopy(self._correctness_shared_adapter_receipt)
 
-    selected_worker = participation_worker_class(SharedAdapterWorker) if capture else SharedAdapterWorker
+    selected_worker_class = first_two_worker_class if first_two else participation_worker_class
+    selected_worker = selected_worker_class(SharedAdapterWorker) if capture else SharedAdapterWorker
 
     class SharedAdapterCoordinator(coordinator_base):
         async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
@@ -1584,9 +1595,16 @@ def install_manager(manager) -> None:
         raise ValueError("native original adapter coordinator was already replaced")
 
     def spawn(owner, info):
+        raw = info.config.model_dump(mode="json", by_alias=True)
+        marker = ((raw.get("training_config") or {}).get("debug") or {}).get("correctness_first_two", False)
+        if type(marker) is not bool:
+            raise ValueError("correctness_first_two must be an explicit boolean")
         request = _request(info.config)
         shared_request = _shared_request(info.config) if request is None else None
         if request is None and shared_request is None:
+            if marker:
+                with select_participation_coordinator(manager_module, actor_key, original_actor, training):
+                    return original_spawn(info)
             with maybe_select_participation_coordinator(manager_module, actor_key, original_actor, training):
                 return original_spawn(info)
         selected_request = shared_request if shared_request is not None else request
@@ -1598,11 +1616,11 @@ def install_manager(manager) -> None:
             if (root / "initialization.json").exists():
                 raise ValueError("native shared adapter cannot contain deterministic initialization metadata")
             files = adapter_files(root, shared_request["identity"])
-            selected = _shared_coordinator_class(training, shared_request, ray.put(files))
+            selected = _shared_coordinator_class(training, shared_request, ray.put(files), first_two=marker)
         else:
             _verify_runtime(training, request["sources"])
             files = original_adapter_files(request["path"], request["identity"], request["original_metadata"])
-            selected = _coordinator_class(training, request, ray.put(files))
+            selected = _coordinator_class(training, request, ray.put(files), first_two=marker)
         # The original spawn is synchronous: no other create can observe this temporary table entry.
         manager_module._ACTOR_CLS[actor_key] = selected
         try:

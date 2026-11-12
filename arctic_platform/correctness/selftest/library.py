@@ -41594,6 +41594,15 @@ _SELFTEST_GROUPS = {
         "test_durable_startup_error_new_disabled_binding_keeps_payload_exact",
         "test_durable_startup_error_new_binding_rejects_invalid_identity_or_collision",
     ),
+    "runtime_admission_467": (
+        "test_owned_runtime_admission_requires_shared_defaults_and_engine_inventory",
+        "test_owned_runtime_admission_rejects_actual_worker_rank_drift",
+        "test_owned_runtime_admission_rejection_precedes_native_worker_constructor",
+        "test_owned_runtime_admission_final_request_rejects_drift",
+        "test_owned_runtime_admission_final_request_keeps_only_native_runtime_metadata_outside_identity",
+        "test_owned_runtime_admission_initializer_is_checked_before_engine_creation",
+        "test_owned_runtime_admission_fixture_supervisor_forwards_the_incoming_stream",
+    ),
 }
 
 _SELFTEST_AUTO_FIXTURES = {
@@ -41612,4 +41621,198 @@ _SELFTEST_AUTO_FIXTURES = {
     "sampler_evidence": [],
     "ep_weight_sync_evidence": [],
     "inference_rl": ["_inference_sampling_model_configs"],
+    "runtime_admission_467": [],
 }
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "arctic_platform.common.deepspeed_engine",
+        "deepspeed.runtime.constants",
+        "deepspeed.runtime.engine",
+        "loaded_callables",
+    ],
+)
+def test_owned_runtime_admission_requires_shared_defaults_and_engine_inventory(missing):
+    from arctic_platform.correctness.harness import engine_admission
+
+    sources = {
+        name: {"path": "/runtime/" + name + ".py", "sha256": "a" * 64} for name in engine_admission._RUNTIME_MODULES
+    }
+    sources["loaded_callables"] = {name: "b" * 64 for name in engine_admission._RUNTIME_CALLABLES}
+    engine_admission._validate_runtime_sources(sources)
+    del sources[missing]
+    with pytest.raises(ValueError, match="complete runtime source"):
+        engine_admission._validate_runtime_sources(sources)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("RANK", "16"),
+        ("WORLD_SIZE", "8"),
+        ("DSS_RANK_HOST", "other"),
+        ("DSS_RANK_GPU_ID", "7"),
+        ("CUDA_VISIBLE_DEVICES", "0,1"),
+    ],
+)
+def test_owned_runtime_admission_rejects_actual_worker_rank_drift(monkeypatch, field, value):
+    from arctic_platform.correctness.harness import engine_admission
+
+    for key, item in {
+        "RANK": "0",
+        "WORLD_SIZE": "16",
+        "DSS_RANK_HOST": "head",
+        "DSS_RANK_GPU_ID": "0",
+        "CUDA_VISIBLE_DEVICES": "0",
+    }.items():
+        monkeypatch.setenv(key, item)
+    monkeypatch.setenv(field, value)
+    monkeypatch.setattr(
+        engine_admission, "verify_runtime_node", lambda *args: pytest.fail("drift must precede import")
+    )
+    admission = {"nodes": [{"host": "head", "slots": 8}]}
+    with pytest.raises(ValueError, match="actual worker rank"):
+        engine_admission.verify_worker_runtime({"job_id": "native-child"}, admission, [("head", 0)] * 16, 16, 1)
+
+
+def test_owned_runtime_admission_rejection_precedes_native_worker_constructor(monkeypatch):
+    from arctic_platform.correctness.harness import engine_admission
+
+    events = []
+
+    class NativeWorker:
+        def __init__(self, cfg):
+            events.append("native")
+
+    def reject(*args):
+        events.append("admission")
+        raise ValueError("runtime drift")
+
+    monkeypatch.setattr(engine_admission, "verify_worker_runtime", reject)
+    worker = decoder.participation_worker_class(
+        NativeWorker, runtime_admission={"nodes": []}, runtime_ranks=[], runtime_world_size=16, runtime_sp_size=1
+    )
+    with pytest.raises(ValueError, match="runtime drift"):
+        worker({"job_id": "native-child"})
+    assert events == ["admission"]
+
+
+@pytest.mark.parametrize("change", ["width", "sp", "child", "payload"])
+def test_owned_runtime_admission_final_request_rejects_drift(change):
+    from arctic_platform.correctness.harness import engine_admission
+
+    cfg = {
+        "job_id": "native-child",
+        "training_config": {"ds_config": {"checkpoint": {"use_node_local_storage": True}}},
+    }
+    admission = {
+        "training_child_id": "native-child",
+        "runtime_request": {"payload": deepcopy(cfg), "n_gpus": 16, "sp_size": 1},
+    }
+    width, sp_size = 16, 1
+    if change == "width":
+        width = 8
+    elif change == "sp":
+        sp_size = 2
+    elif change == "child":
+        cfg["job_id"] = "other-child"
+    else:
+        cfg["training_config"]["ds_config"]["checkpoint"]["use_node_local_storage"] = False
+    with pytest.raises(ValueError, match="final native request"):
+        engine_admission.verify_final_runtime_request(cfg, admission, width, sp_size)
+
+
+def test_owned_runtime_admission_final_request_keeps_only_native_runtime_metadata_outside_identity():
+    from arctic_platform.correctness.harness import engine_admission
+
+    payload = {"job_id": "native-child", "training_config": {"ds_config": {"bf16": {"enabled": True}}}}
+    admission = {
+        "training_child_id": "native-child",
+        "runtime_request": {"payload": deepcopy(payload), "n_gpus": 8, "sp_size": 1},
+    }
+    cfg = {
+        **deepcopy(payload),
+        "master_addr": "allocation-head",
+        "master_port": 12345,
+        "zone_id": "training-zone",
+        "_sp_model_parallelism_metadata": {"ep_size": 1},
+    }
+    cfg["training_config"]["debug"] = {engine_admission.RUNTIME_ADMISSION_KEY: admission}
+    engine_admission.verify_final_runtime_request(cfg, admission, 8, 1)
+    assert engine_admission.runtime_request_from_config(cfg) == admission
+    assert cfg["training_config"]["debug"][engine_admission.RUNTIME_ADMISSION_KEY] == admission
+
+
+@pytest.mark.parametrize("change", [None, "rank", "config", "builder", "missing", "second"])
+def test_owned_runtime_admission_initializer_is_checked_before_engine_creation(monkeypatch, change):
+    from arctic_platform.correctness.harness import engine_admission
+
+    events = []
+
+    def initialize(model, ds_config, *, rank):
+        events.append("engine")
+        return "initialized"
+
+    namespace = {"initialize_training_engine": initialize}
+    training = SimpleNamespace(
+        _DeepSpeedWorker=SimpleNamespace(__init__=SimpleNamespace(__globals__=namespace)),
+        _build_ds_config=object(),
+        TrainingEngineSpec=object(),
+    )
+    package = ModuleType("dss.ray_dss.jobs.gpu")
+    package.training = training
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    monkeypatch.setattr(engine_admission, "_RUNTIME_MODULES", ())
+    monkeypatch.setattr(engine_admission, "_validate_engine_config", lambda cfg: events.append("parsers"))
+    receipt = {"rank": 3, "resolved": {"bf16": {"enabled": True}}, "sources": {}}
+
+    def run():
+        with engine_admission.runtime_engine_scope(receipt):
+            if change == "missing":
+                return
+            if change == "builder":
+                training._build_ds_config = object()
+            rank = 4 if change == "rank" else 3
+            config = {} if change == "config" else deepcopy(receipt["resolved"])
+            assert namespace["initialize_training_engine"](None, config, rank=rank) == "initialized"
+            if change == "second":
+                namespace["initialize_training_engine"](None, config, rank=rank)
+
+    if change is None:
+        run()
+        assert events == ["parsers", "engine"]
+    else:
+        with pytest.raises(ValueError, match="engine initializ"):
+            run()
+        assert events == (["parsers", "engine"] if change == "second" else [])
+    assert namespace["initialize_training_engine"] is initialize
+
+
+def test_owned_runtime_admission_fixture_supervisor_forwards_the_incoming_stream(monkeypatch):
+    from arctic_platform.correctness.harness import cortex
+    from arctic_platform.correctness.harness import inference
+
+    incoming = io.BytesIO(b'{"files":[]}\nfixture bytes')
+    monkeypatch.setattr(cortex.sys, "stdin", SimpleNamespace(buffer=incoming))
+    calls = []
+
+    class Receiver:
+        returncode = 0
+
+        def communicate(self, timeout):
+            assert timeout > 0
+            return b'{"files":[]}', b""
+
+    def launch(argv, **kwargs):
+        calls.append(kwargs)
+        assert kwargs["stdin"] is incoming
+        assert kwargs["stdin"].read().endswith(b"fixture bytes")
+        return Receiver()
+
+    monkeypatch.setattr(cortex.subprocess, "Popen", launch)
+    monkeypatch.setattr(cortex, "_fixture_worker_argv", lambda *args: ["receiver"])
+    monkeypatch.setattr(inference, "_stop_local_children", lambda children: None)
+    cortex._fixture_worker("supervise", {"timeout_s": 30, "deadline_epoch": time.time() + 30})
+    assert len(calls) == 1
