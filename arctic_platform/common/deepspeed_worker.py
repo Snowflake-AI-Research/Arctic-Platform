@@ -685,6 +685,7 @@ class DeepSpeedWorker:
         """Restore DeepSpeed state. Returns restored ``global_steps``, or 0 if none found."""
         from arctic_platform.common.utils.checkpoint import has_ep_sharded_parameters
         from arctic_platform.common.utils.checkpoint import load_module_state_skipping_ep_shards
+        from arctic_platform.common.utils.checkpoint import restore_trainable_ep_shards
 
         custom_load_fn = None
         if has_ep_sharded_parameters(self.engine.module):
@@ -692,6 +693,8 @@ class DeepSpeedWorker:
         load_path, _ = self.engine.load_checkpoint(path, custom_load_fn=custom_load_fn)
         if load_path is None:
             return 0
+        if custom_load_fn is not None:
+            restore_trainable_ep_shards(self.engine)
         return int(self.engine.global_steps)
 
     def export_hf_checkpoint(self, checkpoint_dir: str) -> str | None:

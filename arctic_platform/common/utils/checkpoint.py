@@ -62,6 +62,25 @@ def load_module_state_skipping_ep_shards(src: dict, dst) -> None:
         raise RuntimeError(f"Checkpoint module state mismatch: missing={missing} unexpected={result.unexpected_keys}")
 
 
+def restore_trainable_ep_shards(engine) -> None:
+    """After ``load_module_state_skipping_ep_shards``, set this rank's trainable EP-sharded parameters (e.g. expert
+    LoRA) from its restored optimizer state.
+
+    ZeRO-1/2 restores every rank's own fp32 partitions, expert groups included, but copies them into the module's
+    parameters only on universal-checkpoint loads.
+    """
+    from arctic_platform.model.weight_export import _is_ep_sharded_parameter
+
+    if not any(p.requires_grad and _is_ep_sharded_parameter(p) for p in engine.module.parameters()):
+        return
+    update_lp_params = getattr(engine.optimizer, "update_lp_params", None)
+    if update_lp_params is None:
+        raise NotImplementedError(
+            f"Resuming trainable expert-parallel parameters is not supported with {type(engine.optimizer).__name__}"
+        )
+    update_lp_params()
+
+
 def prune_checkpoint_dirs(parent_dir: str, keep: int) -> int:
     """Keep the newest ``keep`` ``checkpoint-*`` dirs under ``parent_dir``; remove older.
 

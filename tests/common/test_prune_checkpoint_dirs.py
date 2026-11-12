@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from torch import nn
@@ -27,6 +28,7 @@ from torch import nn
 from arctic_platform.common.utils.checkpoint import load_module_state_skipping_ep_shards
 from arctic_platform.common.utils.checkpoint import prune_checkpoint_dirs
 from arctic_platform.common.utils.checkpoint import resolve_checkpoint_save_paths
+from arctic_platform.common.utils.checkpoint import restore_trainable_ep_shards
 from arctic_platform.testing_utils import TestCasePlus
 
 
@@ -133,3 +135,25 @@ class TestLoadModuleStateSkippingEpShards(TestCasePlus):
     def test_unexpected_key_raises(self):
         with self.assertRaisesRegex(RuntimeError, "stale"):
             load_module_state_skipping_ep_shards({"adapter": torch.ones(3), "stale": torch.ones(1)}, self._model())
+
+
+class TestRestoreTrainableEpShards(TestCasePlus):
+    def _engine(self, trainable_experts: bool, optimizer) -> SimpleNamespace:
+        module = nn.Module()
+        module.experts = nn.Parameter(torch.zeros(2, 3), requires_grad=trainable_experts)
+        module.experts.group_name = "ep_size_2"
+        module.experts.allreduce = False
+        module.adapter = nn.Parameter(torch.zeros(3))
+        return SimpleNamespace(module=module, optimizer=optimizer)
+
+    def test_refreshes_parameters_from_the_optimizer_with_trainable_experts(self):
+        calls = []
+        restore_trainable_ep_shards(self._engine(True, SimpleNamespace(update_lp_params=lambda: calls.append(1))))
+        self.assertEqual(calls, [1])
+
+    def test_skips_frozen_experts(self):
+        restore_trainable_ep_shards(self._engine(False, SimpleNamespace()))
+
+    def test_unsupported_optimizer_raises(self):
+        with self.assertRaisesRegex(NotImplementedError, "SimpleNamespace"):
+            restore_trainable_ep_shards(self._engine(True, SimpleNamespace()))
