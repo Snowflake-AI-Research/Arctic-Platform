@@ -504,7 +504,7 @@ def _padded_batch() -> dict:
 
 def _log_prob(wrapper, batch, *, ref=False):
     return asyncio.run(
-        wrapper.compute_log_prob(batch, ref=ref, calculate_entropy=True, rollout_n=2, temperature=1.0, pad_token_id=0)
+        wrapper.compute_log_prob(batch, ref=ref, calculate_entropy=False, rollout_n=2, temperature=1.0, pad_token_id=0)
     )
 
 
