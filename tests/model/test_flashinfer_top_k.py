@@ -130,27 +130,38 @@ class _Stop(Exception):
 
 
 def _barrier_worker(rank: int, rendezvous: str, results) -> None:
+    import logging
     import time
 
     import torch.distributed as dist
 
+    class _Ready(logging.Handler):
+        def emit(self, record):
+            self.args = record.args  # (host, own build seconds, seconds until every rank is ready)
+
+    ready = _Ready()
+    flashinfer_top_k.logger.addHandler(ready)
+    flashinfer_top_k.logger.setLevel(logging.INFO)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
     calls = _fake_flashinfer(pytest.MonkeyPatch(), compiled=False, build=(lambda: time.sleep(3)) if rank else None)
+    dist.barrier()  # both ranks start together, after their imports
     start = time.monotonic()
     flashinfer_top_k.prepare_flashinfer_top_k()
-    results[rank] = (calls["build"], time.monotonic() - start)
+    results[rank] = (calls["build"], time.monotonic() - start, ready.args[1])
     dist.destroy_process_group()
 
 
 def test_the_ranks_of_warm_nodes_wait_for_a_cold_build_on_the_cpu(tmp_path):
-    """Rank 1's build takes 3 s; rank 0 (warm) returns from the load step only after it, from a gloo barrier."""
+    """Rank 1's build takes 3 s; rank 0 (warm) returns from the load step only after it, from a gloo barrier. Each
+    rank logs its own build time, before the wait."""
     pytest.importorskip("flashinfer")
     import torch.multiprocessing as mp
 
     results = mp.Manager().dict()
     mp.spawn(_barrier_worker, args=(f"file://{tmp_path}/rendezvous", results), nprocs=2, join=True)
     assert results[0][0] == results[1][0] == 1
-    assert results[0][1] >= 2.5, results
+    assert results[0][1] >= 2.5, dict(results)
+    assert results[0][2] < 1.0 <= 2.5 <= results[1][2], dict(results)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

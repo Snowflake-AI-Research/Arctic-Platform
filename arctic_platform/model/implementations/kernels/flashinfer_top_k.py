@@ -85,9 +85,10 @@ def prepare_flashinfer_top_k() -> None:
     import torch.distributed as dist
 
     if dist.is_available() and dist.is_initialized():
-        # The warm ranks wait for a cold node's build here, on the CPU, in no NCCL collective.
-        group = dist.new_group(backend="gloo", timeout=PREPARE_BARRIER_TIMEOUT)
         built = time.monotonic() - start
+        # The warm ranks wait for a cold node's build here, on the CPU, in no NCCL collective (creating the gloo
+        # group already connects every rank).
+        group = dist.new_group(backend="gloo", timeout=PREPARE_BARRIER_TIMEOUT)
         dist.barrier(group=group)
         dist.destroy_process_group(group)
         logger.info(
