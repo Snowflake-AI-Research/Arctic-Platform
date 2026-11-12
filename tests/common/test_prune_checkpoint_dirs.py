@@ -26,6 +26,7 @@ import torch
 from torch import nn
 
 from arctic_platform.common.utils.checkpoint import load_module_state_skipping_ep_shards
+from arctic_platform.common.utils.checkpoint import omit_frozen_parameters
 from arctic_platform.common.utils.checkpoint import prune_checkpoint_dirs
 from arctic_platform.common.utils.checkpoint import resolve_checkpoint_save_paths
 from arctic_platform.common.utils.checkpoint import restore_trainable_ep_shards
@@ -157,3 +158,63 @@ class TestRestoreTrainableEpShards(TestCasePlus):
     def test_unsupported_optimizer_raises(self):
         with self.assertRaisesRegex(NotImplementedError, "SimpleNamespace"):
             restore_trainable_ep_shards(self._engine(True, SimpleNamespace()))
+
+
+def _wrapped_lora_model() -> nn.Module:
+    from peft import LoraConfig
+    from peft import get_peft_model
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
+    layer = nn.Module()
+    layer.q_proj = nn.Linear(2, 2, bias=False)
+    layer.k_proj = nn.Linear(2, 2, bias=False)
+    root = nn.Module()
+    root.layer = checkpoint_wrapper(layer)
+    return get_peft_model(root, LoraConfig(r=1, target_modules=["q_proj"]))
+
+
+def _deepspeed_module_state(engine, exclude_frozen_parameters: bool) -> dict:
+    from deepspeed.runtime.engine import DeepSpeedEngine
+
+    engine.random_ltd_enabled = lambda: False
+    return DeepSpeedEngine.module_state_dict(engine, exclude_frozen_parameters=exclude_frozen_parameters)
+
+
+class TestOmitFrozenParameters(TestCasePlus):
+    def test_drops_frozen_weights_through_activation_checkpoint_wrappers(self):
+        model = _wrapped_lora_model()
+        adapters = sorted(key for key in model.state_dict() if ".lora_" in key)
+        with omit_frozen_parameters(model):
+            state = _deepspeed_module_state(SimpleNamespace(module=model), exclude_frozen_parameters=True)
+        self.assertEqual(sorted(state), adapters)
+        self.assertNotIn("state_dict", vars(model))
+        self.assertEqual(len(model.state_dict()), len(adapters) + 2)
+
+
+class TestDeepSpeedWorkerFrozenWeights(TestCasePlus):
+    def _checkpoint(self, module: nn.Module, zero_stage: int = 2) -> tuple[list, dict]:
+        from arctic_platform.common.deepspeed_worker import DeepSpeedWorker as DeepSpeedWorkerActor
+
+        saved, loaded = [], {}
+        engine = SimpleNamespace(module=module, global_steps=3, zero_optimization_stage=lambda: zero_stage)
+        engine.save_checkpoint = lambda path, exclude_frozen_parameters: saved.append(
+            sorted(_deepspeed_module_state(engine, exclude_frozen_parameters))
+        )
+        engine.load_checkpoint = lambda path, custom_load_fn: (loaded.update(fn=custom_load_fn), (path, {}))[1]
+        worker = object.__new__(DeepSpeedWorkerActor.__ray_actor_class__)
+        worker.engine = engine
+        worker.save_checkpoint(self.get_auto_remove_tmp_dir())
+        self.assertEqual(worker.load_checkpoint(self.get_auto_remove_tmp_dir()), 3)
+        return saved[0], loaded
+
+    def test_lora_checkpoints_keep_only_adapters(self):
+        model = _wrapped_lora_model()
+        saved, loaded = self._checkpoint(model)
+        self.assertEqual(saved, sorted(key for key in model.state_dict() if ".lora_" in key))
+        self.assertIs(loaded["fn"], load_module_state_skipping_ep_shards)
+
+    def test_zero3_lora_and_full_fine_tuning_keep_every_weight(self):
+        for module, zero_stage in ((_wrapped_lora_model(), 3), (nn.Linear(2, 2), 2)):
+            saved, loaded = self._checkpoint(module, zero_stage)
+            self.assertEqual(saved, sorted(module.state_dict()))
+            self.assertIsNone(loaded["fn"])

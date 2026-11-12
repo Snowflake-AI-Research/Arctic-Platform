@@ -19,9 +19,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
+from collections.abc import Iterator
 
 
 def resolve_checkpoint_save_paths(root: str, step: int | None) -> tuple[str, str]:
@@ -41,6 +43,36 @@ def has_ep_sharded_parameters(module) -> bool:
     from arctic_platform.model.weight_export import _has_ep_sharded_parameters
 
     return _has_ep_sharded_parameters(module)
+
+
+@contextlib.contextmanager
+def omit_frozen_parameters(module) -> Iterator[None]:
+    """Leave frozen parameters out of ``module.state_dict``, which every DeepSpeed save path reads.
+
+    DeepSpeed's ``exclude_frozen_parameters`` matches parameter names against state-dict keys, which drop
+    activation-checkpoint wrapper segments (``_checkpoint_wrapped_module.``), so it keeps wrapped frozen weights.
+    """
+    from torch import nn
+
+    frozen = {
+        key
+        for key, value in module.state_dict(keep_vars=True).items()
+        if isinstance(value, nn.Parameter) and not value.requires_grad
+    }
+    original = module.state_dict
+
+    def state_dict(*args, **kwargs):
+        state = original(*args, **kwargs)
+        prefix = kwargs.get("prefix", "")
+        for key in frozen:
+            state.pop(prefix + key, None)
+        return state
+
+    module.state_dict = state_dict
+    try:
+        yield
+    finally:
+        del module.state_dict
 
 
 def load_module_state_skipping_ep_shards(src: dict, dst) -> None:
