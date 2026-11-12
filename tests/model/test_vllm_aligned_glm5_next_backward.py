@@ -189,3 +189,44 @@ def test_mhc_pre_reference_mixes_streams_with_a_doubly_normalized_comb():
     assert torch.allclose(comb.sum(-2), torch.ones(tokens, n), atol=1e-4)
     assert torch.allclose(comb.sum(-1), torch.ones(tokens, n), atol=1e-2)
     assert bool((post > 0).all() and (post < 2.0).all())
+
+
+def test_kda_and_conv_references_resume_a_span_from_its_providers_prefix():
+    import types
+
+    torch.manual_seed(9)
+    heads, dim, provider_len, offset, own_len = 2, 8, 13, 9, 7
+    tokens = provider_len + own_len
+    layout = types.SimpleNamespace(spans=[(0, provider_len, None), (provider_len, own_len, (0, offset))])
+    cu = torch.tensor([0, provider_len, tokens])
+    base = [torch.randn(1, tokens, heads, dim) for _ in range(4)] + [torch.randn(tokens, heads), torch.randn(heads),
+                                                                     torch.randn(heads * dim)]  # fmt: skip
+    weight = torch.randn(6, 4)
+    x_conv = torch.randn(tokens, 6)
+    # The resumed span is the provider's first ``offset`` tokens followed by its own, as one request.
+    joined = torch.cat([torch.arange(offset), torch.arange(provider_len, tokens)])
+
+    def per_token(t):
+        return t[:, joined] if t.dim() == 4 else t[joined]
+
+    leaves = [t.clone().requires_grad_(True) for t in base[:5]]
+    out = bw.ref_kda_core(*leaves, *base[5:], cu, -5.0, chunk=4, layout=layout)
+    seen = torch.linspace(-1, 1, own_len * heads * dim).reshape(own_len, heads, dim)
+    (out[provider_len:] * seen).sum().backward()
+    direct = [t.clone().requires_grad_(True) for t in base[:5]]
+    whole = bw.ref_kda_core(*[per_token(t) for t in direct], *base[5:], torch.tensor([0, offset + own_len]), -5.0,
+                            chunk=4)  # fmt: skip
+    (whole[offset:] * seen).sum().backward()
+    assert torch.allclose(out[provider_len:], whole[offset:], atol=1e-5)
+    assert torch.allclose(out[:provider_len], bw.ref_kda_core(*base[:5], *base[5:], cu, -5.0)[:provider_len], atol=1e-5)
+    for a, b in zip(leaves, direct):
+        assert torch.allclose(a.grad, b.grad, atol=1e-5, rtol=1e-4)
+
+    x = x_conv.clone().requires_grad_(True)
+    conv = bw.ref_causal_conv_silu(x, weight, cu, layout=layout)
+    (conv[provider_len:] * torch.linspace(-1, 1, own_len * 6).reshape(own_len, 6)).sum().backward()
+    x2 = x_conv.clone().requires_grad_(True)
+    conv2 = bw.ref_causal_conv_silu(x2[joined], weight, torch.tensor([0, offset + own_len]))
+    (conv2[offset:] * torch.linspace(-1, 1, own_len * 6).reshape(own_len, 6)).sum().backward()
+    assert torch.allclose(conv[provider_len:], conv2[offset:], atol=1e-6)
+    assert torch.allclose(x.grad, x2.grad, atol=1e-6)

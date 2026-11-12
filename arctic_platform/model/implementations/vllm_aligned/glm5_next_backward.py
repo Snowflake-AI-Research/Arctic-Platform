@@ -158,19 +158,41 @@ def ref_mhc_post(x: torch.Tensor, streams: torch.Tensor, post: torch.Tensor, com
     return (mixed + post.float().reshape(*post.shape[:2], 1) * x.float().unsqueeze(-2)).to(streams.dtype)
 
 
-def ref_causal_conv_silu(x: torch.Tensor, weight: torch.Tensor, cu_seqlens: torch.Tensor, **_) -> torch.Tensor:
-    """Depthwise causal conv (``weight [C, W]``) with SiLU over each packed request, zero initial state: ``x [T, C]``."""
+def _resumed_spans(layout) -> list | None:
+    """A turn plan's KDA spans ``(start, length, resume)`` if any resumes from another span's state, else ``None``."""
+    spans = getattr(layout, "spans", None)
+    return spans if spans and any(resume is not None for _, _, resume in spans) else None
+
+
+def ref_causal_conv_silu(x: torch.Tensor, weight: torch.Tensor, cu_seqlens: torch.Tensor, layout=None,
+                         **_) -> torch.Tensor:  # fmt: skip
+    """Depthwise causal conv (``weight [C, W]``) with SiLU over each packed request, zero initial state: ``x [T, C]``.
+
+    With a turn plan's spans (``layout.spans``), a span resuming at offset ``o`` of its provider starts from the
+    provider's last ``W - 1`` inputs before ``o`` (vLLM's saved conv state), so its gradient reaches them."""
     width = weight.shape[-1]
+    spans = _resumed_spans(layout)
+    if spans is None:
+        bounds = cu_seqlens.tolist()
+        spans = [(lo, hi - lo, None) for lo, hi in zip(bounds[:-1], bounds[1:])]
     out = []
-    bounds = cu_seqlens.tolist()
-    for start, stop in zip(bounds[:-1], bounds[1:]):
-        seq = x[start:stop].float().t().unsqueeze(0)
-        y = F.conv1d(F.pad(seq, (width - 1, 0)), weight.float().unsqueeze(1), groups=weight.shape[0])
+    for start, length, resume in spans:
+        seq = x[start : start + length]
+        lead = 0
+        if resume is not None:
+            provider, offset = resume
+            p_start = spans[provider][0]
+            lo = p_start + max(offset - (width - 1), 0)
+            prefix = x[lo : p_start + offset]
+            seq, lead = torch.cat([prefix, seq]), prefix.shape[0]
+        # ``W - 1`` inputs of context (the provider's, zero-padded on the left) give one output per own token.
+        seq = F.pad(seq.float().t().unsqueeze(0), (width - 1 - lead, 0))
+        y = F.conv1d(seq, weight.float().unsqueeze(1), groups=weight.shape[0])
         out.append(F.silu(y[0].t()))
     return torch.cat(out).to(x.dtype)
 
 
-def _kda_chunk(q, k, v, g, beta, h, a_amp, g_bias, lower_bound, scale):
+def _kda_chunk(q, k, v, g, beta, h, a_amp, g_bias, lower_bound, scale, mask=None):
     """One chunk of the gated delta rule in its chunked form, for a batch of requests from states ``h [B, H, V, K]``
     (``q/k/g [B, C, H, K]``, ``v [B, C, H, V]``, ``beta [B, C, H]``): the same math as :func:`_kda_steps`, the
     chunk's delta-rule corrections from one unit-lower-triangular solve instead of one token at a time.
@@ -178,10 +200,13 @@ def _kda_chunk(q, k, v, g, beta, h, a_amp, g_bias, lower_bound, scale):
     With ``G`` the within-chunk cumulative log-decay and ``S`` the state entering the chunk,
     ``u_i + sum_{j<i} b_i (k_i . e^{G_i - G_j} k_j) u_j = b_i (v_i - S e^{G_i} k_i)``,
     ``o_i = S e^{G_i} q_i + sum_{j<=i} (q_i . e^{G_i - G_j} k_j) u_j`` and the state leaving it
-    ``S e^{G_C} + sum_j u_j (e^{G_C - G_j} k_j)^T``; decays enter only as differences ``G_i - G_j <= 0``."""
+    ``S e^{G_C} + sum_j u_j (e^{G_C - G_j} k_j)^T``; decays enter only as differences ``G_i - G_j <= 0``.
+    ``mask [B, C]`` zeroes the decay of padded positions, which then leave the state as it is."""
     q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6) * scale
     k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
     gate = lower_bound / (1.0 + torch.exp(-(a_amp * (g + g_bias))))
+    if mask is not None:
+        gate = gate * mask[:, :, None, None]
     G = gate.cumsum(1)  # [B, C, H, K]
     b = torch.sigmoid(beta)  # [B, C, H]
     diff = (G[:, :, None] - G[:, None, :]).permute(0, 3, 1, 2, 4)  # [B, H, C(i), C(j), K]
@@ -201,7 +226,7 @@ def _kda_chunk(q, k, v, g, beta, h, a_amp, g_bias, lower_bound, scale):
     return out, h
 
 
-def _kda_steps(q, k, v, g, beta, h, a_amp, g_bias, lower_bound, scale):
+def _kda_steps(q, k, v, g, beta, h, a_amp, g_bias, lower_bound, scale, mask=None):
     """One chunk of the gated delta rule (``fused_recurrent_kda``'s per-token math) for a batch of requests from
     states ``h [B, H, V, K]``: ``q/k/g [B, C, H, K]``, ``v [B, C, H, V]``, ``beta [B, C, H]``."""
     outs = []
@@ -209,6 +234,8 @@ def _kda_steps(q, k, v, g, beta, h, a_amp, g_bias, lower_bound, scale):
         qt = q[:, t] / torch.sqrt((q[:, t] * q[:, t]).sum(-1, keepdim=True) + 1e-6) * scale
         kt = k[:, t] / torch.sqrt((k[:, t] * k[:, t]).sum(-1, keepdim=True) + 1e-6)
         gate = lower_bound / (1.0 + torch.exp(-(a_amp * (g[:, t] + g_bias))))
+        if mask is not None:
+            gate = gate * mask[:, t, None, None]
         h = h * torch.exp(gate).unsqueeze(-2)
         vt = (v[:, t] - (h * kt.unsqueeze(-2)).sum(-1)) * torch.sigmoid(beta[:, t]).unsqueeze(-1)
         h = h + vt.unsqueeze(-1) * kt.unsqueeze(-2)
@@ -216,20 +243,13 @@ def _kda_steps(q, k, v, g, beta, h, a_amp, g_bias, lower_bound, scale):
     return torch.stack(outs, dim=1), h
 
 
-def ref_kda_core(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, lower_bound: float, chunk: int = 64,
-                 stepwise: bool = False, **_):
-    """The KDA core over packed requests from a zero state: ``q/k/v/g [(1,) T, H, D]``, ``beta [T, H]`` raw logits,
-    ``a_log [H]``, ``dt_bias [H * D]``; returns ``[T, H, D]`` in ``q``'s dtype. The requests step together, padded
-    to the longest (a padded position's output is dropped, so it gets no gradient), ``chunk`` tokens at a time in the
-    chunked form (:func:`_kda_chunk`; ``stepwise``: token by token, :func:`_kda_steps`), checkpointed per chunk."""
+def _kda_pieces(q, k, v, g, beta, pieces, h, a_amp, g_bias, lower_bound, scale, chunk, stepwise):
+    """The gated delta rule over the token ranges ``pieces`` of ``[T, H, D]`` q/k/v/g (``beta [T, H]``) from states
+    ``h [B, H, V, K]``, the pieces padded to the longest: their outputs, in piece order, and their final states."""
     from torch.utils.checkpoint import checkpoint
 
-    q, k, v, g = (t.reshape(t.shape[-3:]) for t in (q, k, v, g))
-    heads, dim, dtype = *q.shape[1:], q.dtype
-    scale = dim**-0.5
-    a_amp = torch.exp(a_log.float()).reshape(heads, 1)
-    g_bias = dt_bias.float().reshape(heads, dim)
-    starts, lengths = cu_seqlens[:-1].long(), (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+    starts = torch.tensor([lo for lo, _ in pieces], device=q.device)
+    lengths = torch.tensor([hi - lo for lo, hi in pieces], device=q.device)
     steps = torch.arange(int(lengths.max()), device=q.device)
     valid = steps[None, :] < lengths[:, None]
     index = (starts[:, None] + steps[None, :]).clamp_max(q.shape[0] - 1)
@@ -239,14 +259,56 @@ def ref_kda_core(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, lower_bound: floa
         return rows * valid.reshape(*valid.shape, *[1] * (rows.dim() - 2))
 
     q, k, v, g, beta = (padded(t) for t in (q, k, v, g, beta))
-    h = q.new_zeros((lengths.numel(), heads, v.shape[-1], dim))
+    mask = valid.float()
     out = []
     for c0 in range(0, steps.numel(), chunk):
         c1 = c0 + chunk
-        o, h = checkpoint(_kda_steps if stepwise else _kda_chunk, q[:, c0:c1], k[:, c0:c1], v[:, c0:c1], g[:, c0:c1], beta[:, c0:c1], h,
-                          a_amp, g_bias, lower_bound, scale, use_reentrant=False)  # fmt: skip
+        o, h = checkpoint(_kda_steps if stepwise else _kda_chunk, q[:, c0:c1], k[:, c0:c1], v[:, c0:c1], g[:, c0:c1],
+                          beta[:, c0:c1], h, a_amp, g_bias, lower_bound, scale, mask[:, c0:c1], use_reentrant=False)  # fmt: skip
         out.append(o)
-    return torch.cat(out, dim=1)[valid].to(dtype)
+    return torch.cat(out, dim=1)[valid], h
+
+
+def ref_kda_core(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, lower_bound: float, chunk: int = 64,
+                 stepwise: bool = False, layout=None, **_):
+    """The KDA core over packed requests from a zero state: ``q/k/v/g [(1,) T, H, D]``, ``beta [T, H]`` raw logits,
+    ``a_log [H]``, ``dt_bias [H * D]``; returns ``[T, H, D]`` in ``q``'s dtype. The requests step together, padded
+    to the longest (a padded position's output is dropped, so it gets no gradient), ``chunk`` tokens at a time in the
+    chunked form (:func:`_kda_chunk`; ``stepwise``: token by token, :func:`_kda_steps`), checkpointed per chunk.
+
+    With a turn plan's spans (``layout.spans``) a span resuming at offset ``o`` of its provider starts from the
+    provider's state after its first ``o`` tokens, so its gradient flows back into the provider's tokens; spans run
+    level by level, each cut where other spans resume from it."""
+    q, k, v, g = (t.reshape(t.shape[-3:]) for t in (q, k, v, g))
+    heads, dim, dtype = *q.shape[1:], q.dtype
+    args = (torch.exp(a_log.float()).reshape(heads, 1), dt_bias.float().reshape(heads, dim), lower_bound, dim**-0.5,
+            chunk, stepwise)  # fmt: skip
+    spans = _resumed_spans(layout)
+    if spans is None:
+        bounds = cu_seqlens.tolist()
+        pieces = list(zip(bounds[:-1], bounds[1:]))
+        h = q.new_zeros((len(pieces), heads, v.shape[-1], dim), dtype=torch.float32)
+        return _kda_pieces(q, k, v, g, beta, pieces, h, *args)[0].to(dtype)
+    wanted = {resume for _, _, resume in spans if resume is not None}
+    cuts = [sorted({offset for span, offset in wanted if span == i} | {length}) for i, (_, length, _) in enumerate(spans)]
+    levels: list[int] = []
+    for _, _, resume in spans:
+        levels.append(0 if resume is None else levels[resume[0]] + 1)
+    saved, outputs = {}, [[] for _ in spans]
+    zero = q.new_zeros((heads, v.shape[-1], dim), dtype=torch.float32)
+    for level in range(max(levels) + 1):
+        members = [i for i, value in enumerate(levels) if value == level]
+        state = {i: zero if spans[i][2] is None else saved[spans[i][2]] for i in members}
+        done = {i: 0 for i in members}
+        for j in range(max(len(cuts[i]) for i in members)):
+            batch = [i for i in members if j < len(cuts[i])]
+            pieces = [(spans[i][0] + done[i], spans[i][0] + cuts[i][j]) for i in batch]
+            out, h = _kda_pieces(q, k, v, g, beta, pieces, torch.stack([state[i] for i in batch]), *args)
+            for i, o, h_i in zip(batch, out.split([hi - lo for lo, hi in pieces]), h):
+                outputs[i].append(o)
+                state[i], done[i] = h_i, cuts[i][j]
+                saved[(i, cuts[i][j])] = h_i
+    return torch.cat([o for span_out in outputs for o in span_out]).to(dtype)
 
 
 def _sparse_mla_chunk(q_rope, q_v, k_all, v_all, idx, mask, softmax_scale):

@@ -426,7 +426,8 @@ def _kda_steps_layout(spans: list[tuple[int, list[tuple[bool, int, int]], tuple[
                 step.exports = [(i + 1, (i, hi)) for i, _, hi in pieces if (i, hi) in wanted]
                 steps.append(step)
         steps[first].imports = [(i + 1, normalized[i][2]) for i in members if normalized[i][2] is not None]
-    return types.SimpleNamespace(num_slots=len(spans), steps=steps, single=False)
+    return types.SimpleNamespace(num_slots=len(spans), steps=steps, single=False,
+                                 spans=[(start, segments[-1][2], resume) for start, segments, resume in normalized])
 
 
 def _single_turn_kda_layout(cu_seqlens: torch.Tensor, prompt_lens: torch.Tensor, prefill_chunk: int,
@@ -1475,9 +1476,11 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
     layout = ops.PackedLayout.build(position_ids, block_size=1, cu_seqlens=cu_seqlens)
     cu = layout.cu_seqlens.to(torch.int32)
     turns = None
+    mode = getattr(model, "_vllm_aligned_backward", "stock")
     if plan is not None:
-        if torch.is_grad_enabled():
-            raise NotImplementedError("the vLLM-aligned GLM-5.3-Flash backward does not cover turn plans yet")
+        if mode == "stock" and torch.is_grad_enabled():
+            raise NotImplementedError("the stock backward cannot resume a request from another's state: with a turn "
+                                      "plan use vllm_aligned_backward 'vllm' or 'vllm_op'")  # fmt: skip
         plan = plan.reshape(-1, *plan.shape[-2:])
         block_size = getattr(model, "_vllm_aligned_kv_block_size", 0) or plan_block_size(plan, cu)
         turns = turn_layout(plan, cu, block_size=block_size, device=input_ids.device)
@@ -1493,12 +1496,14 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
                                 ep_group=getattr(model, "_vllm_aligned_ep_group", None),
                                 tp=getattr(model, "_vllm_aligned_tensor_parallel", 1),
                                 prefill_chunk=getattr(model, "_vllm_aligned_prefill_chunk", 0))  # fmt: skip
-    mode = getattr(model, "_vllm_aligned_backward", "stock")
     if mode == "vllm_op":
         ctx.keep_moe_out = ctx.replay is not None
         run_backward = _per_op_backward_runner(ctx)
     elif mode == "vllm" and ctx.replay is not None:
-        run_backward = _vllm_backward_runner(input_ids, position_ids, kwargs, ctx)
+        # With a turn plan the mixers take the per-op backward: the stock KDA cannot start from another request's
+        # state, and the per-op references follow the plan's spans.
+        per_op = frozenset({"mixer"}) if turns is not None else frozenset()
+        run_backward = _vllm_backward_runner(input_ids, position_ids, kwargs, ctx, per_op=per_op)
     else:
         run_backward = _stock_layer_runner(backbone, input_ids, position_ids, kwargs, ctx.replay)
     hidden = aligned_hidden(backbone, input_ids, config, ctx, run_backward)
