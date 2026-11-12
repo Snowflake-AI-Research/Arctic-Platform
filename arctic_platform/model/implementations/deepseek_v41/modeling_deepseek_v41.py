@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import torch
@@ -29,7 +30,9 @@ from transformers.modeling_outputs import MoeModelOutputWithPast
 from arctic_platform.model.implementations.deepseek_v4.attention import PackedContext
 from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_hf_to_prime
 from arctic_platform.model.implementations.deepseek_v4.conversion_ops import apply_prime_to_hf
-from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import vllm_lora_name
+from arctic_platform.model.implementations.deepseek_v4.converting_deepseek_v4 import (
+    vllm_lora_name as _attention_lora_name,
+)
 from arctic_platform.model.implementations.deepseek_v4.cp import CPContext
 from arctic_platform.model.implementations.deepseek_v4.cp import gather_for_cp
 from arctic_platform.model.implementations.deepseek_v4.rotary import DeepseekV4RotaryEmbedding
@@ -37,6 +40,7 @@ from arctic_platform.model.implementations.deepseek_v41.attention import Deepsee
 from arctic_platform.model.implementations.deepseek_v41.attention import SharedAttentionState
 from arctic_platform.model.implementations.deepseek_v41.attention import build_packed
 from arctic_platform.model.implementations.deepseek_v41.configuration_deepseek_v41 import DeepseekV41Config
+from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import EXPORT_SOURCE_NAMESPACES
 from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import conversion_chain
 from arctic_platform.model.implementations.deepseek_v41.converting_deepseek_v41 import log_deferred_checkpoint_keys
 from arctic_platform.model.implementations.deepseek_v41.dequantize import dequantize_state_dict_
@@ -152,6 +156,8 @@ class DeepseekV41PreTrainedModel(PreTrainedModelPrimeRL):
     _can_compile_fullgraph = False
     _supports_attention_backend = True
     _can_record_outputs = {"hidden_states": DeepseekV41DecoderLayer}
+    # Published tensors the text model does not build that an HF export copies from the source checkpoint.
+    hf_export_source_prefixes = EXPORT_SOURCE_NAMESPACES
 
     @classmethod
     def cp_blocker(cls, config, cp: int) -> str | None:
@@ -220,12 +226,28 @@ class DeepseekV41PreTrainedModel(PreTrainedModelPrimeRL):
         return apply_hf_to_prime(state_dict, self.conversion_chain(self.config))
 
     def convert_to_hf(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:  # type: ignore[override]
-        return apply_prime_to_hf(state_dict, self.conversion_chain(self.config))
+        out = apply_prime_to_hf(state_dict, self.conversion_chain(self.config))
+        # Packed experts keep their scales as E8M0 exponent bytes in memory: the checkpoint's own dtype.
+        for key, value in out.items():
+            if value.dtype == torch.uint8 and key.endswith(".scale") and ".ffn.experts." in key:
+                out[key] = value.view(torch.float8_e8m0fnu)
+        return out
 
-    def convert_layer_to_hf(self, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:  # type: ignore[override]
-        # The chain skips keys a group does not hold, so one decoder layer or the
-        # top-level group (``layer_idx == -1``) goes through it whole. No layer has a hash router to restore.
+    def convert_layer_to_hf(  # type: ignore[override]
+        self, state_dict: dict[str, Tensor], layer_idx: int
+    ) -> dict[str, Tensor]:
+        """One export group in the published names, in place: decoder layer ``layer_idx``, or the top-level group
+        (embedding, final norm, LM head) for ``-1``.
+
+        Every op of the chain skips keys the group does not hold, so each group goes through the whole chain. The
+        experts arrive gathered over EP in logical order (``build_iter_full_hf_weights`` undoes a static placement).
+        Packed MXFP4 experts (LoRA on the official checkpoint) get their UE8M0 scales back, as published.
+        """
         del layer_idx
+        if packs_experts(self.config):
+            for key, value in list(state_dict.items()):
+                if ".mlp.experts." in key and key.endswith("_scale_inv") and value.dtype != torch.float8_e8m0fnu:
+                    state_dict[key] = value.to(dtype=torch.float8_e8m0fnu)
         return self.convert_to_hf(state_dict)
 
     def stream_convert_to_prime(self, source_path: Path, output_path: Path) -> None:
@@ -383,11 +405,29 @@ class DeepseekV41Model(DeepseekV41PreTrainedModel):
         return hashes, token_mask
 
 
+_PRIME_MOE_LORA_MODULE = re.compile(r"(^|\.)model\.layers\.(\d+)\.mlp\.(experts|shared_expert)\.")
+
+
+def vllm_lora_name(name: str) -> str:
+    """A LoRA tensor's name in vLLM's DeepSeek-V4.1 tree: the attention projections as published
+    (converting_deepseek_v4.vllm_lora_name), the routed experts ``layers.N.ffn.experts`` and the shared expert's w1 /
+    w2 / w3 ``layers.N.ffn.shared_experts.w1|w2|w3``, which vLLM's DeepSeek-V4 weights mapper names gate_up_proj (w1,
+    w3) and down_proj."""
+    return _PRIME_MOE_LORA_MODULE.sub(
+        lambda m: f"{m.group(1)}layers.{m.group(2)}.ffn.{'experts' if m.group(3) == 'experts' else 'shared_experts'}.",
+        _attention_lora_name(name),
+    )
+
+
 class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_gather_output"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    # LoRA weight sync and the sampler's adapter pack (weight_export.py) name tensors after vLLM's modules; the pack
+    # carries the routed experts' LoRA one expert at a time (ffn.experts.{e}.w1 / w2 / w3, vLLM's expert mapping):
+    # PEFT's 3-D layout nests one wrapper per expert parameter and vLLM reads two of them.
     vllm_lora_name = staticmethod(vllm_lora_name)
+    vllm_lora_expert_projections = {"w1": "w1", "w2": "w2", "w3": "w3"}
 
     def __init__(self, config: DeepseekV41Config):
         super().__init__(config)

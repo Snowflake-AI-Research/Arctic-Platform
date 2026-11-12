@@ -20,6 +20,8 @@ from ..config import EPCommBackend
 from ..distributed.combine_replay import CombineReplay
 from ..distributed.ep_backend import get_ep_comm_module
 from ..distributed.ep_backend import uses_dispatch_ep
+from ...kernels.sonic_experts import sonic_relu2_experts
+from ...kernels.sonic_experts import sonic_relu2_experts_applicable
 from ...kernels.sonic_experts import sonic_routed_experts
 from ...kernels.sonic_experts import sonic_routed_experts_applicable
 from ..routing_weights import apply_routing_weights
@@ -1470,7 +1472,7 @@ def install_combine_replay(block: nn.Module) -> None:
     returns the forward's combined output instead and releases the recompute's dispatch handle.
     """
     for module in block.modules():
-        if isinstance(module, MoE):
+        if isinstance(module, (MoE, LatentMoE)):
             if module.ep_comm_backend == "nccl":
                 raise ValueError("NCCL expert dispatch requires combine_replay=False")
             module.combine_replay = CombineReplay()
@@ -1545,6 +1547,7 @@ class NonGatedGroupedExperts(nn.Module):
         w1 = _maybe_to_local(self.w1)
         w2 = _maybe_to_local(self.w2)
         w3 = _maybe_to_local(self.w3)
+        w1, w2 = _with_replica_slots(self, w1, w2)  # online replicas' spare slots after the native experts
         if self.use_grouped_mm:
             return _run_nongated_experts_grouped_mm_impl(w1, w2, w3, x, num_tokens_per_expert)
         return _run_nongated_experts_for_loop_impl(w1, w2, w3, x, num_tokens_per_expert)
@@ -1552,8 +1555,16 @@ class NonGatedGroupedExperts(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        num_tokens_per_expert: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor | None,
+        scores: torch.Tensor | None = None,
+        expert_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Routed experts for tokens packed by expert. With ``expert_indices`` the rows are the EP receive buffer as
+        delivered instead (one row per token, ``[tokens, top_k]`` local expert ids, ``-1`` elsewhere, and their
+        ``scores``), run through SonicMoE and summed per token with the scores applied. Called through the PEFT
+        wrappers, so LoRA-trained experts see their merged weights here."""
+        if expert_indices is not None:
+            return sonic_relu2_experts(self, x, expert_indices, scores)
         if not uses_dispatch_ep(self.ep_comm_backend):
             raise NotImplementedError(
                 f"EP comm backend must be one of {DISPATCH_EP_BACKENDS}, got {self.ep_comm_backend!r}."
@@ -1695,6 +1706,13 @@ class LatentMoE(nn.Module):
         self.reorderer = TokenReorderer(num_experts=num_experts, top_k=top_k)
         self.shared_expert = BCNonGatedFeedForward(dim=dim, hidden_dim=shared_expert_intermediate_size)
         self.deepep_token_chunk_size: int | None = None
+        # As on MoE: SonicMoE on the receive buffer (relu^2 epilogue), and the combine replayed on a full recompute.
+        self.use_sonicmoe = False
+        self.combine_replay: CombineReplay | None = None
+        # Online redundant experts (moe/expert_replicas.py), as on MoE: registered on the first forward.
+        self._replica_index = -1
+        self._replica_manager: ExpertReplicaManager | None = None
+        self._replica_counts: torch.Tensor | None = None
 
         if latent_dim is not None:
             self.fc1_latent_proj = nn.Linear(dim, latent_dim, bias=False)
@@ -1726,6 +1744,9 @@ class LatentMoE(nn.Module):
 
     def set_deepep_token_chunk_size(self, chunk_size: int | None) -> None:
         self.deepep_token_chunk_size = chunk_size
+
+    def set_use_sonicmoe(self, enabled: bool) -> None:
+        self.use_sonicmoe = enabled
 
     def _run_local_routed_experts(
         self,
@@ -1759,6 +1780,7 @@ class LatentMoE(nn.Module):
         x: torch.Tensor,
         selected_experts_indices: torch.Tensor,
         top_scores: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor | None = None,
     ) -> torch.Tensor:
         ep_comm = get_ep_comm_module(self.ep_comm_backend)
         combine_tokens = ep_comm.combine_tokens
@@ -1772,40 +1794,85 @@ class LatentMoE(nn.Module):
 
         experts = _unwrap_experts(self.experts)
         group = get_ep_group(experts)
+        num_experts = experts.num_experts
+        from ..ultraep_replicas import ultraep_spares
+
+        if ultraep_spares() and group is not None:
+            raise NotImplementedError(
+                "UltraEP's spare slots serve GroupedExperts; Nemotron-H's LatentMoE takes Arctic's online replicas "
+                "(moe.expert_replicas)"
+            )
+        # Arctic's online replicas (moe/expert_replicas.py) through MoE's planner: tokens go to physical slots, and
+        # the experts extend w1 / w2 with the spares' current weights once per call (_ReplicaCall).
+        plan = MoE._expert_replica_plan(self, experts, group, selected_experts_indices, num_tokens_per_expert)
+        if plan is not None:
+            selected_experts_indices = plan.remap(selected_experts_indices)
+            num_experts = plan.num_slots
+            experts._arl_replica_call = _ReplicaCall(plan, group)
         # Project before dispatch so DeepEP communicates the smaller latent activations.
         latent_x = self.fc1_latent_proj(x)
-        chunk_size = min(self.deepep_token_chunk_size or latent_x.shape[0], latent_x.shape[0])
+        chunk_size = self.deepep_token_chunk_size or latent_x.shape[0]
+        # SonicMoE runs the relu^2 experts on the receive buffer as delivered, with the routing weights and the
+        # per-token sum in its down projection; the routed scaling factor rides on the weights there.
+        use_sonic = (
+            self.use_sonicmoe
+            and hasattr(ep_comm, "finalize_dispatch_rows")
+            and sonic_relu2_experts_applicable(experts)
+        )
+        if use_sonic:
+            top_scores = top_scores * self.routed_scaling_factor
+        combine_kwargs = {}
+        if self.combine_replay is not None and self.ep_comm_backend in ("uccl", "deepep"):
+            self.combine_replay.start()
+            combine_kwargs["replay"] = self.combine_replay
 
         def dispatch_chunk(start: int, end: int):
             return dispatch_tokens_async(
                 latent_x[start:end],
                 selected_experts_indices[start:end],
                 top_scores[start:end],
-                num_experts=experts.num_experts,
+                num_experts=num_experts,
                 group=group,
                 score_before_experts=False,
             )
 
         def run_pending_chunk(pending_state):
+            if use_sonic:
+                hidden_states, indices, scores = ep_comm.finalize_dispatch_rows(pending_state)
+                routed = self.experts(hidden_states, None, scores, expert_indices=indices)
+                return ep_comm.combine_rows(routed, pending_state, **combine_kwargs)
             hidden_states, num_tokens_per_expert, dispatch_state = finalize_dispatch_tokens(pending_state)
             routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert)
-            return combine_tokens(routed_output, dispatch_state)
+            return combine_tokens(routed_output, dispatch_state, **combine_kwargs)
 
-        pending_state = dispatch_chunk(0, chunk_size)
+        # Every EP rank must issue the same number of dispatch / combine collectives (see MoE): agree on a chunk
+        # count and pad with 1-token dummy chunks, whose rows are sliced off below.
+        num_chunks = 1
+        if self.deepep_token_chunk_size:
+            local_num_chunks = (latent_x.shape[0] + chunk_size - 1) // chunk_size
+            num_chunks_tensor = torch.tensor([local_num_chunks], device=x.device, dtype=torch.int64)
+            torch.distributed.all_reduce(num_chunks_tensor, op=torch.distributed.ReduceOp.MAX, group=group)
+            num_chunks = int(num_chunks_tensor.item())
+        chunk_bounds = [
+            (start, min(start + chunk_size, latent_x.shape[0])) for start in range(0, latent_x.shape[0], chunk_size)
+        ]
+        chunk_bounds += [(0, 1)] * (num_chunks - len(chunk_bounds))
+
+        pending_state = dispatch_chunk(*chunk_bounds[0])
         routed_outputs: list[torch.Tensor] = []
-
-        for chunk_start in range(chunk_size, latent_x.shape[0], chunk_size):
-            chunk_end = min(chunk_start + chunk_size, latent_x.shape[0])
+        for chunk_start, chunk_end in chunk_bounds[1:]:
             next_pending_state = dispatch_chunk(chunk_start, chunk_end)
             routed_outputs.append(run_pending_chunk(pending_state))
             pending_state = next_pending_state
-
         routed_outputs.append(run_pending_chunk(pending_state))
+        experts._arl_replica_call = None
 
         shared_output = self.shared_expert(x)
         sync_combine()
         routed_output = routed_outputs[0] if len(routed_outputs) == 1 else torch.cat(routed_outputs, dim=0)
-        routed_output = routed_output * self.routed_scaling_factor
+        routed_output = routed_output[: latent_x.shape[0]]
+        if not use_sonic:
+            routed_output = routed_output * self.routed_scaling_factor
         routed_output = self.fc2_latent_proj(routed_output)
         return shared_output + routed_output
 
@@ -1819,7 +1886,9 @@ class LatentMoE(nn.Module):
             self.tokens_per_expert.add_(num_tokens_per_expert)
 
         if uses_dispatch_ep(self.ep_comm_backend):
-            routed_output = self._run_deepep_routed_experts(x_flat, selected_experts_indices, top_scores)
+            routed_output = self._run_deepep_routed_experts(
+                x_flat, selected_experts_indices, top_scores, num_tokens_per_expert
+            )
             return routed_output.reshape(bs, slen, dim)
 
         (

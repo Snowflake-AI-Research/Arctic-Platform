@@ -444,6 +444,37 @@ def _sparse_gqa_chunk(
     return output, safe_ids, selected_key, selected_value
 
 
+class _GateFp32(torch.autograd.Function):
+    """``attention * sigmoid(gate)`` in fp32, rounded once to the gate's dtype, as vLLM's output gate is.
+
+    Autograd would keep the fp32 copy of ``attention`` and the fp32 sigmoid for the backward, twice the bytes of the
+    bf16 inputs, which this keeps instead, recomputing the sigmoid. Over a 128K-token Qwen3.8 job's QSA layers that are
+    not recomputed it is the 2+ GiB that pushed the GPUs into the caching allocator's free-and-retry path. The
+    gradients are the ones autograd computes for that expression, operation for operation.
+    """
+
+    @staticmethod
+    def forward(ctx, attention: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(attention, gate)
+        return (attention.float() * torch.sigmoid(gate.float())).to(gate.dtype)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        attention, gate = ctx.saved_tensors
+        sigmoid = torch.sigmoid(gate.float())
+        grad = grad.float()
+        grad_attention = (grad * sigmoid).to(attention.dtype) if ctx.needs_input_grad[0] else None
+        grad_gate = None
+        if ctx.needs_input_grad[1]:
+            grad_gate = torch.ops.aten.sigmoid_backward(grad * attention.float(), sigmoid).to(gate.dtype)
+        return grad_attention, grad_gate
+
+
+def gate_fp32(attention: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """``(attention.float() * sigmoid(gate.float())).to(gate.dtype)``, keeping only the inputs for the backward."""
+    return _GateFp32.apply(attention, gate)
+
+
 class _SparseGQAAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query, key, value, selected_token_ids, softmax_scale, chunk_rows, fp32_parity):
@@ -604,7 +635,7 @@ def _qsa_attention_forward(
     )
     attention_output = attention_output.reshape(*input_shape, -1).contiguous()
     if self._qsa_fp32_parity:
-        attention_output = (attention_output.float() * torch.sigmoid(gate.float())).to(gate.dtype)
+        attention_output = gate_fp32(attention_output, gate)
     else:
         attention_output = attention_output * torch.sigmoid(gate)
     return self.o_proj(attention_output), None

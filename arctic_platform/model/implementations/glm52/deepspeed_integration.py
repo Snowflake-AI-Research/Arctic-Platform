@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
@@ -39,16 +40,19 @@ def shared_expert_bc_mlp_forward(
     return torch.matmul(F.silu(gate) * up, feed_forward.w2.T)
 
 
-def _validate_sp_size(sp_size: int) -> None:
-    if sp_size > 1:
-        raise NotImplementedError(
-            "Sequence parallelism is not implemented for GLM-5.2. "
-            f"Got sp_size={sp_size}; set training_config.sp_size=1 or omit it."
-        )
+def _apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None:
+    """Context parallelism: each rank of ``sp_group`` holds a contiguous shard of one packed sequence.
 
+    Decoder layers keep their queries local and gather only the compressed
+    keys (see ``GlmMoeDsaAttention.forward``); the MoE runs on local tokens.
+    """
+    if sp_size == 1:
+        return
+    from arctic_platform.model.implementations.moe.vlm import get_language_model
 
-def _apply_sequence_parallelism(_model: nn.Module, sp_size: int, _sp_group) -> None:
-    _validate_sp_size(sp_size)
+    rank = dist.get_rank(group=sp_group)
+    for layer in get_language_model(model).layers:
+        layer.set_context_parallel_attributes(sp_group, rank, sp_size)
 
 
 def _build_model_config(
@@ -130,7 +134,6 @@ def load_moe_model_for_deepspeed(
     sp_size: int = 1,
     sp_group=None,
 ) -> nn.Module:
-    _validate_sp_size(sp_size)
     return _load_moe_model_for_deepspeed(
         _adapter(),
         model_config,
@@ -155,8 +158,19 @@ def load_glm_moe_dsa_model(
     ep_group=None,
     options: GlmMoeDsaOptions,
 ) -> nn.Module:
-    _validate_sp_size(sp_size)
-    return _load_moe_model(
+    from arctic_platform.model.implementations.kernels.flashinfer_top_k import prepare_flashinfer_top_k
+
+    # Every rank, before the checkpoint load: a node whose FlashInfer cache lacks the indexer's top-k builds it now
+    # (~10 minutes) while the others wait on the CPU, not in a step's collective.
+    prepare_flashinfer_top_k()
+    from arctic_platform.model.implementations.moe.dense_shard import resolve_dense_sharding
+
+    if resolve_dense_sharding(options.shard_dense) and options.tiled_mlp_token_chunk_size is not None:
+        raise ValueError(
+            "shard_dense gathers a layer's weights only around its calls, and the tiled MLP reads the shared "
+            "experts' weights again in its backward: unset tiled_mlp_token_chunk_size"
+        )
+    model = _load_moe_model(
         _adapter(),
         load_moe_model_for_deepspeed,
         model_name=model_name,
@@ -170,3 +184,38 @@ def load_glm_moe_dsa_model(
         patch_moe_detection=patch_deepspeed_moe_detection,
         device_mesh_type=DeviceMesh,
     )
+    from arctic_platform.model.implementations.moe.dense_shard import dense_sharding_requested
+    from arctic_platform.model.implementations.moe.frozen_offload import frozen_expert_offload_requested
+    from arctic_platform.model.implementations.moe.frozen_shard import frozen_dense_sharding_requested
+
+    if dense_sharding_requested():
+        if frozen_expert_offload_requested():
+            raise ValueError("shard_dense is for full fine-tuning; frozen_expert_offload is for frozen (LoRA) experts")
+        if frozen_dense_sharding_requested():
+            raise ValueError(
+                "shard_dense shards the trainable replicated weights (full fine-tuning) and shard_frozen_dense the "
+                "frozen ones (LoRA), both around the same layer calls: set one of them"
+            )
+    if frozen_dense_sharding_requested():
+        from arctic_platform.model.implementations.moe.frozen_shard import install_frozen_layer_shards
+        from arctic_platform.model.implementations.moe.logging_utils import get_logger
+        from arctic_platform.model.implementations.moe.vlm import get_language_model
+
+        layers = get_language_model(model).layers
+        install_frozen_layer_shards(layers, root=model)
+        get_logger().info(f"Frozen replicated weights of {len(layers)} decoder layers sharded over all ranks")
+    if dense_sharding_requested():
+        from arctic_platform.model.implementations.moe.dense_shard import configured_group_size
+        from arctic_platform.model.implementations.moe.dense_shard import install_model_dense_shards
+
+        install_model_dense_shards(model, configured_group_size())
+    if frozen_expert_offload_requested():
+        from arctic_platform.model.implementations.moe.frozen_offload import install_frozen_expert_offload
+        from arctic_platform.model.implementations.moe.logging_utils import get_logger
+        from arctic_platform.model.implementations.moe.vlm import get_language_model
+
+        offload = install_frozen_expert_offload(get_language_model(model).layers, root=model)
+        get_logger().info(
+            f"Frozen routed-expert codes of {len(offload.layers)} layers offloaded to host memory at the first call"
+        )
+    return model

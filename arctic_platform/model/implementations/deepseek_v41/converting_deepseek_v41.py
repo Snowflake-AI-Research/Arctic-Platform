@@ -34,6 +34,11 @@ from arctic_platform.model.implementations.deepseek_v41.dequantize import packs_
 logger = logging.getLogger(__name__)
 
 DEFERRED_CHECKPOINT_NAMESPACES = ("vision.", "aligner.", "image_", "mtp.")
+# The deferred namespaces an HF export copies from the source checkpoint unchanged (see ``iter_hf_source_tensors``):
+# vLLM's V4.1 always builds the vision tower, aligner and image embeddings (BF16 in the published checkpoint), and
+# with a BF16 config it refuses to leave their parameters uninitialized. MTP is not copied: vLLM reads it only for
+# speculative decoding, and the published draft layers would not match the trained trunk.
+EXPORT_SOURCE_NAMESPACES = ("vision.", "aligner.", "image_")
 
 _TOP_LEVEL = {"embed.weight", "norm.weight", "lm_head.weight"}
 _LAYER_MARKERS = (

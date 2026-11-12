@@ -30,11 +30,7 @@ import torch
 import triton
 import triton.language as tl
 
-try:
-    from flashinfer import top_k as _flashinfer_top_k
-    from flashinfer.topk import TopKTieBreak
-except ImportError:  # pragma: no cover - FlashInfer is optional
-    _flashinfer_top_k = None
+from arctic_platform.model.implementations.kernels.flashinfer_top_k import topk_indices
 
 
 @triton.jit
@@ -119,7 +115,5 @@ def qsa_index_scores(queries: torch.Tensor, keys: torch.Tensor, visible_blocks: 
 
 
 def top_block_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
-    """Indices of the ``k`` largest scores per row (any order), ties to the smaller index."""
-    if _flashinfer_top_k is None or not scores.is_cuda:
-        return torch.topk(scores, k=k, dim=-1).indices
-    return _flashinfer_top_k(scores, k, sorted=False, deterministic=True, tie_break=TopKTieBreak.SMALL)[1].long()
+    """Indices of the ``k`` largest scores per row (any order), ties to the smaller index (``flashinfer_top_k``)."""
+    return topk_indices(scores, k).long()

@@ -11,11 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-try:
-    from flashinfer import top_k as _flashinfer_top_k
-    from flashinfer.topk import TopKTieBreak
-except ImportError:  # optional: torch.topk selects the same keys, more slowly
-    _flashinfer_top_k = None
+from arctic_platform.model.implementations.kernels.flashinfer_top_k import topk_indices
 
 FP8_MAX = 448.0
 FP8_MIN = -448.0
@@ -177,17 +173,6 @@ def _triton_fp8_indexer_kernel(
     tl.store(out_ptrs, acc, mask=out_mask)
 
 
-def topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
-    """Column indices of each row's ``k`` largest scores, in no particular order.
-
-    FlashInfer's radix select is about 4x faster than ``torch.topk`` on 128K-wide rows. Ties at the
-    selection boundary go to the smaller column, so the selected set is deterministic.
-    """
-    if _flashinfer_top_k is None or not scores.is_cuda:
-        return torch.topk(scores, k, dim=-1).indices
-    return _flashinfer_top_k(scores, k, sorted=False, deterministic=True, tie_break=TopKTieBreak.SMALL)[1]
-
-
 @functools.cache
 def _deep_gemm_mqa_logits(capability_major: int):
     """DeepGEMM's FP8 MQA-logits kernel, bundled with vLLM, on SM90; else ``None``.
@@ -280,7 +265,9 @@ def fp8_indexer(q, k, w, ks, ke, topk, weight_scale=1.0):
     w = (w * q_scales).contiguous()
     k_scales = k_scales.view(N)
 
-    mqa_logits = _deep_gemm_mqa_logits(torch.cuda.get_device_capability(device)[0]) if q.is_cuda else None
+    # DeepGEMM's MQA-logits kernel is built for 32 or 64 heads (GLM-5.2/5.3 index with 32).
+    deep_gemm_heads = q.is_cuda and H in (32, 64)
+    mqa_logits = _deep_gemm_mqa_logits(torch.cuda.get_device_capability(device)[0]) if deep_gemm_heads else None
     if mqa_logits is None:
         q_fp8 = q_fp8.view(M, H, D).permute(1, 0, 2).contiguous()
     else:

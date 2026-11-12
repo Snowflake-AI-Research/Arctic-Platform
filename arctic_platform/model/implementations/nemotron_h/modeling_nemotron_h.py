@@ -6,6 +6,7 @@ Hybrid Mamba-Transformer-MoE architecture with three distinct layer types:
 - Attention layers (using shared FlashAttention/SDPA from prime-rl)
 """
 
+import re
 from typing import Optional
 
 import torch
@@ -18,7 +19,12 @@ from transformers.utils import auto_docstring, logging
 
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.layers.attn import ATTN_IMPL2CLASS, AttentionConfig
+from arctic_platform.model.implementations.gpu.core_replay import keep_core
+from arctic_platform.model.implementations.layers.cp_mamba import fused_mamba_available
+from arctic_platform.model.implementations.layers.cp_mamba import fused_mamba_mixer
 from arctic_platform.model.implementations.layers.cp_mamba import mamba_cp_forward
+from arctic_platform.model.implementations.layers.cp_mamba import mamba_cp_forward_fused
+from arctic_platform.model.implementations.layers.cp_mamba import packed_seq_idx
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
 from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, NemotronHRouter, NonGatedGroupedExperts
 from arctic_platform.model.implementations.layers.rms_norm import RMSNorm, RMSNormConfig
@@ -124,7 +130,9 @@ def _patch_mamba2_use_triton_ssd():
                 seq_idx[s:e] = i
         seq_idx = seq_idx.unsqueeze(0)  # (1, L)
 
-        scan_output = _mamba_chunk_scan_combined(
+        scan_output = keep_core(
+            getattr(self, "_arl_core_replay", None),
+            _mamba_chunk_scan_combined,
             hidden_states.view(batch_size, seq_len, -1, self.head_dim),
             time_step,
             A,
@@ -143,8 +151,19 @@ def _patch_mamba2_use_triton_ssd():
         scan_output = self.norm(scan_output, gate)
         return self.out_proj(scan_output)
 
+    def _fused_varlen_mamba_forward(self, hidden_states, cu_seqlens):
+        """in_proj -> mamba_ssm's fused conv + scan + gated norm (``fused_mamba_mixer``) -> out_proj."""
+        batch_size, seq_len, _ = hidden_states.shape
+        assert batch_size == 1, "varlen mamba expects batch_size=1 (packed)"
+        scan_output = fused_mamba_mixer(self, self.in_proj(hidden_states), packed_seq_idx(cu_seqlens, seq_len))
+        return self.out_proj(scan_output)
+
+    fused = fused_mamba_available()
+
     def _patched_forward(self, hidden_states, cache_params=None, attention_mask=None, cu_seqlens=None):
         if cu_seqlens is not None and cache_params is None and "cuda" in self.in_proj.weight.device.type:
+            if fused:
+                return _fused_varlen_mamba_forward(self, hidden_states, cu_seqlens)
             return _varlen_mamba_forward(self, hidden_states, cu_seqlens)
         if "cuda" in self.in_proj.weight.device.type:
             # Disable fused training path (needs causal_conv1d CUDA extension)
@@ -157,7 +176,10 @@ def _patch_mamba2_use_triton_ssd():
 
     _nemotron_h_mamba2_mixer_cls().forward = _patched_forward
     _patch_applied = True
-    logger.info("Patched NemotronHMamba2Mixer: Triton SSD kernels + varlen (cu_seqlens) support")
+    logger.info(
+        "Patched NemotronHMamba2Mixer: Triton SSD kernels + varlen (cu_seqlens) support"
+        + (" (fused conv1d + scan + gated norm)" if fused else "")
+    )
 
 
 def _ensure_zamba2_compat(config: NemotronHConfig):
@@ -206,6 +228,8 @@ class NemotronHMambaLayer(GradientCheckpointingLayer):
         _ensure_zamba2_compat(config)
         self.norm = RMSNorm(RMSNormConfig(hidden_size=config.hidden_size, eps=config.layer_norm_epsilon))
         self.mamba = _nemotron_h_mamba2_mixer_cls()(config, layer_idx=layer_idx)
+        # The chunked scan is this layer's core kernel for ac_config.core_replay (gpu/core_replay.py).
+        self.mamba._arl_keeps_core = True
         self.mlp = None  # No MoE in this layer type
 
     def set_context_parallel_attributes(self, cp_group: dist.ProcessGroup, cp_rank: int, cp_world_size: int) -> None:
@@ -236,7 +260,8 @@ class NemotronHMambaLayer(GradientCheckpointingLayer):
         if self.cp_enabled:
             # Global boundaries. The cu_seqlens argument is this rank's shard, which does not
             # index the sequence gathered by the context-parallel all-to-all.
-            hidden_states = mamba_cp_forward(
+            cp_forward = mamba_cp_forward_fused if fused_mamba_available() else mamba_cp_forward
+            hidden_states = cp_forward(
                 self.mamba,
                 hidden_states,
                 self._cp_group,
@@ -336,6 +361,18 @@ def _build_layer(config: NemotronHConfig, layer_idx: int):
     return cls(config)
 
 
+# A block's mixer in prime-rl's tree (self_attn, mamba, mlp, and the MoE's shared expert).
+_PRIME_MIXER = re.compile(r"((?:^|\.)layers\.\d+)\.(self_attn|mamba|mlp\.shared_expert|mlp)\.")
+
+
+def vllm_lora_name(name: str) -> str:
+    """A LoRA tensor's name in vLLM's Nemotron-H module tree, where every block's mixer is ``mixer`` (attention,
+    Mamba-2 and MoE alike) and the MoE's shared expert is ``mixer.shared_experts``."""
+    return _PRIME_MIXER.sub(
+        lambda m: f"{m.group(1)}.mixer.{'shared_experts.' if m.group(2) == 'mlp.shared_expert' else ''}", name
+    )
+
+
 @auto_docstring
 class NemotronHPreTrainedModel(PreTrainedModelPrimeRL):
     config: NemotronHConfig
@@ -345,6 +382,11 @@ class NemotronHPreTrainedModel(PreTrainedModelPrimeRL):
     _supports_flash_attn = True
     _supports_sdpa = True
     _can_compile_fullgraph = False
+    # LoRA weight sync and the sampler's adapter pack (weight_export.py) name tensors after vLLM's modules.
+    vllm_lora_name = staticmethod(vllm_lora_name)
+    # vLLM serves the non-gated experts' LoRA one expert at a time (up_proj, down_proj): the PEFT 3-D expert format
+    # it also reads assumes a gated gate_up and would split w1 in halves.
+    vllm_lora_expert_projections = {"w1": "up_proj", "w2": "down_proj"}
 
     def _init_weights(self, module):
         std = self.config.initializer_range

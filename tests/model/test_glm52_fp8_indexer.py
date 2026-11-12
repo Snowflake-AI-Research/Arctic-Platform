@@ -36,6 +36,9 @@ def test_fast_indexer_path_selects_the_portable_paths_keys(monkeypatch):
     """DeepGEMM scores + FlashInfer top-k (when installed) pick the keys of Triton scores + torch.topk, over two packed
     sequences and an unaligned query range (as under context parallelism)."""
     from arctic_platform.model.implementations.glm52.models.kernels import fp8_indexer as indexer
+    from arctic_platform.model.implementations.kernels import flashinfer_top_k
+
+    flashinfer_top_k.prepare_flashinfer_top_k()  # as the GLM loader does
 
     if indexer._deep_gemm_mqa_logits(torch.cuda.get_device_capability()[0]) is None:
         pytest.skip("the indexer scores with DeepGEMM on SM90, where vLLM bundles it")
@@ -51,7 +54,7 @@ def test_fast_indexer_path_selects_the_portable_paths_keys(monkeypatch):
     shard = slice(1234, S)  # an unaligned query range, as under context parallelism
     fast = indexer.fp8_indexer(q[shard], k, w[shard], ks[shard], ke[shard], topk)
     monkeypatch.setattr(indexer, "_deep_gemm_mqa_logits", lambda capability_major: None)
-    monkeypatch.setattr(indexer, "_flashinfer_top_k", None)
+    monkeypatch.setattr(flashinfer_top_k, "_flashinfer", lambda: None)
     portable = indexer.fp8_indexer(q[shard], k, w[shard], ks[shard], ke[shard], topk)
 
     assert torch.equal((fast == S).sum(-1), (portable == S).sum(-1))

@@ -149,7 +149,15 @@ class DeepseekV41Config(PretrainedConfig):
         self.engram_head_dim = kwargs.pop("engram_head_dim", 256)
         self.engram_pad_token_id = kwargs.pop("engram_pad_token_id", 2)
         self.engram_compressed_vocab_size = kwargs.pop("engram_compressed_vocab_size", 99092)
-        self.engram_quantized = kwargs.pop("engram_quantized", bool(flash_shape))
+        # An FP8 checkpoint keeps its Engram tables FP8 (the conversion never dequantizes them), whatever its depth:
+        # a layer-sliced checkpoint is not Flash-shaped but still needs the block scales applied on lookup.
+        quantization = kwargs.get("quantization_config") or {}
+        quant_method = (
+            quantization.get("quant_method")
+            if isinstance(quantization, dict)
+            else getattr(quantization, "quant_method", None)
+        )
+        self.engram_quantized = kwargs.pop("engram_quantized", bool(flash_shape) or quant_method == "fp8")
 
         self.dspark_block_size = kwargs.pop("dspark_block_size", 5)
         self.dspark_noise_token_id = kwargs.pop("dspark_noise_token_id", 128799)

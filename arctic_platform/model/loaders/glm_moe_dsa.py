@@ -59,7 +59,7 @@ class GlmMoeDsaOptions(MoeRuntimeOptions):
     seq_len: int = Field(4096, gt=0)
     trust_remote_code: bool = True
     ep_comm_backend: Literal["deepep", "deepep_v2", "uccl"] = "deepep"
-    sparse_mla_backend: Literal["flashmla", "ref", "tilelang", "dense"] = "ref"
+    sparse_mla_backend: Literal["auto", "flashmla", "flashmla_tilelang", "ref", "tilelang", "dense"] = "auto"
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     deepep_token_chunk_size: int | None = Field(None, gt=0)
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
@@ -71,6 +71,27 @@ class GlmMoeDsaOptions(MoeRuntimeOptions):
     tiled_mlp_token_chunk_size: int | None = Field(None, gt=0)
     weight_conversion_cache_dir: str | None = None
     ac_config: ActivationCheckpointConfig | None = None
+    # Only this loader installs the dense shards, so these two are its fields, not MoeRuntimeOptions' (whose other
+    # loaders would accept and ignore them); apply_moe_runtime_options still hands them to moe/dense_shard.py.
+    shard_dense: bool | None = Field(
+        None,
+        description=(
+            "Full fine-tuning: shard the trainable weights every GPU holds whole (each decoder layer's attention, DSA "
+            "indexer, shared experts, dense MLP, router and norms; the embedding; the LM head) over the GPUs of each "
+            "node, all-gathered around each call of the layer and reduce-scattered in its backward "
+            "(moe/dense_shard.py). The weight export (weights-only checkpoints, weight sync) and the state dict hold "
+            "the whole weights; resumable checkpoints resume at the same world size, group size and EP. Not with "
+            "LoRA. Unset: ARL_SHARD_DENSE."
+        ),
+    )
+    shard_dense_group_size: int | None = Field(
+        None,
+        ge=2,
+        description=(
+            "GPUs per shard_dense group: consecutive ranks on one host. Unset: ARL_SHARD_DENSE_GROUP_SIZE, else the "
+            "ranks of one host."
+        ),
+    )
     debug: GlmMoeDsaDebugOptions | None = None
 
     @model_validator(mode="after")
@@ -97,8 +118,6 @@ def _validate_spec(spec: ModelSpec) -> None:
         spec.attn_implementation = "flash_attention_2"
     if spec.dtype not in ("bfloat16", "float32"):
         raise ValueError("glm_moe_dsa dtype must be 'bfloat16' or 'float32'")
-    if spec.parallelism.sequence_parallel > 1:
-        raise ValueError("glm_moe_dsa does not support sequence parallelism")
     if spec.patches.liger:
         raise ValueError(
             "the glm_moe_dsa loader does not support the liger patch; "
@@ -130,6 +149,12 @@ def load_glm_moe_dsa(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.glm52 import load_glm_moe_dsa_model
 
     options = GlmMoeDsaOptions.model_validate(ctx.spec.loader_options)
+    from arctic_platform.model.implementations.moe.dense_shard import resolve_dense_sharding
+
+    if ctx.spec.patches.peft and resolve_dense_sharding(options.shard_dense):
+        raise ValueError(
+            "shard_dense shards trainable weights for full fine-tuning; it does not support PEFT (LoRA) models"
+        )
     assert ctx.spec.attn_implementation is not None
     model = load_glm_moe_dsa_model(
         model_name=ctx.spec.model_path_or_name,

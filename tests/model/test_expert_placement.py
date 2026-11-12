@@ -368,6 +368,7 @@ def _generic_moes(**overrides):
 
 # GLM-5.2/5.3's MoE (glm_moe_dsa/modeling_glm_moe_dsa.py): sigmoid scores, normalized and scaled, a shared expert.
 _FAMILIES = {
+    "v41": lambda: _v41_moes(),
     "generic": lambda: _generic_moes(),
     "glm": lambda: _generic_moes(score_func="sigmoid", route_scale=2.5, num_shared_experts=1),
 }

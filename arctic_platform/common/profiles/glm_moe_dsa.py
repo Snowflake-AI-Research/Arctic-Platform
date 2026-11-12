@@ -52,13 +52,16 @@ def register(registry: Registry) -> None:
             "moe.expert_replicas",
             "moe.expert_replicas_ema",
             "moe.expert_placement",
+            "moe.shard_dense",
             "attention.sparse_mla",
             "attention.backend",
             "numerics.reduce_dtype",
             "numerics.optimization_dtype",
         ],
         unsupported={
-            "shard_dense": "the huggingface loader's option (patches.dense_shard)",
+            "shard_dense": (
+                "the huggingface loader's option; this loader shards its replicated weights with moe.shard_dense"
+            ),
             "numerics.fp32_parity": "no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp",
             "numerics.fp32_residual": "this loader has no fp32_residual option; only huggingface has one",
             "numerics.fp32_routed_weighting": "no fp32_routed_weighting option; see glm5_next, qwen4_exp",

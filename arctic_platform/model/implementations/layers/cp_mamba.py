@@ -14,6 +14,10 @@ Communication pattern per Mamba layer:
 
 from __future__ import annotations
 
+import functools
+import os
+import weakref
+
 import torch
 import torch.distributed as dist
 
@@ -152,6 +156,8 @@ def mamba_cp_forward(
     """
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
+    from arctic_platform.model.implementations.gpu.core_replay import keep_core
+
     batch_size, seq_len, _ = hidden_states.shape  # seq_len = S/cp here
 
     # ── 1. in_proj (token-parallel, no communication needed) ──
@@ -240,7 +246,9 @@ def mamba_cp_forward(
         else _seq_idx_from_cu_seqlens(cu_seqlens, full_seq_len, hidden_states_local.device)
     )
 
-    scan_output, _ = mamba_chunk_scan_combined(
+    scan_output, _ = keep_core(
+        getattr(mixer, "_arl_core_replay", None),
+        mamba_chunk_scan_combined,
         hidden_states_local.view(batch_size, full_seq_len, local_num_heads, mixer.head_dim),
         time_step,
         local_A,
@@ -288,3 +296,132 @@ def _gated_rms_norm(
     x_grouped = x_grouped * torch.rsqrt(variance + eps)
     x = x_grouped.view(*prefix_dims, last_dim)
     return (weight * x).to(input_dtype)
+
+
+@functools.cache
+def fused_mamba_available() -> bool:
+    """Whether mamba_ssm's fused conv + scan + gated-norm function and its causal_conv1d kernels are importable, and
+    not turned off with ``ARL_FUSED_MAMBA=0`` (worker environment)."""
+    if os.environ.get("ARL_FUSED_MAMBA", "1") == "0":
+        return False
+    try:
+        import causal_conv1d  # noqa: F401
+        from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+# The last cu_seqlens' row ids: every Mamba layer of a forward (and its recompute) reads the same cu_seqlens tensor.
+_seq_idx_cache: tuple[weakref.ref, int, torch.Tensor] | None = None
+
+
+def packed_seq_idx(cu_seqlens: torch.Tensor, seq_len: int) -> torch.Tensor:
+    """(1, seq_len) int32 row ids of a packed sequence, built on the device without a host sync, once per
+    ``cu_seqlens`` tensor. ``cu_seqlens[-1]`` must be ``seq_len``."""
+    global _seq_idx_cache
+    if _seq_idx_cache is not None:
+        ref, length, seq_idx = _seq_idx_cache
+        if ref() is cu_seqlens and length == seq_len:
+            return seq_idx
+    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)
+    ids = torch.arange(lengths.numel(), dtype=torch.int32, device=cu_seqlens.device)
+    seq_idx = torch.repeat_interleave(ids, lengths, output_size=seq_len).unsqueeze(0)
+    _seq_idx_cache = (weakref.ref(cu_seqlens), seq_len, seq_idx)
+    return seq_idx
+
+
+def fused_mamba_mixer(
+    mixer, zxbcdt: torch.Tensor, seq_idx: torch.Tensor | None, rank: int = 0, size: int = 1
+) -> torch.Tensor:
+    """Conv1d, SiLU, the chunked scan, the D skip and the gated RMSNorm of a Mamba-2 mixer in one autograd node
+    (mamba_ssm's ``mamba_split_conv1d_scan_combined``: causal_conv1d's kernel with ``seq_idx`` boundaries, the
+    Triton scan and gated norm, the conv recomputed in its backward). ``zxbcdt`` is the in_proj output
+    ``[z | x | B | C | dt]``, of this rank's ``1/size`` heads (and groups) under context parallelism; returns the
+    normed ``[batch, seq, heads * head_dim]`` before out_proj."""
+    from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+
+    from arctic_platform.model.implementations.gpu.core_replay import keep_core
+
+    heads = mixer.num_heads // size
+    dim = heads * mixer.head_dim
+    groups = mixer.n_groups // size
+    state = groups * mixer.ssm_state_size
+    head_slice = slice(rank * heads, (rank + 1) * heads)
+    weight, bias = mixer.conv1d.weight.squeeze(1), mixer.conv1d.bias
+    if size > 1:
+        start_b = mixer.intermediate_size + rank * state
+        start_c = mixer.intermediate_size + mixer.n_groups * mixer.ssm_state_size + rank * state
+        channels = torch.cat(
+            [
+                torch.arange(rank * dim, (rank + 1) * dim, device=weight.device),
+                torch.arange(start_b, start_b + state, device=weight.device),
+                torch.arange(start_c, start_c + state, device=weight.device),
+            ]
+        )
+        weight = weight[channels]
+        bias = None if bias is None else bias[channels]
+    norm_weight = mixer.norm.weight[rank * dim : (rank + 1) * dim]
+    return keep_core(
+        getattr(mixer, "_arl_core_replay", None),
+        mamba_split_conv1d_scan_combined,
+        zxbcdt,
+        weight,
+        bias,
+        mixer.dt_bias[head_slice],
+        -torch.exp(mixer.A_log[head_slice].float()),
+        mixer.D[head_slice],
+        mixer.chunk_size,
+        seq_idx=seq_idx,
+        dt_limit=(0.0, float("inf")) if mixer.time_step_limit is None else tuple(mixer.time_step_limit),
+        activation=mixer.activation,
+        rmsnorm_weight=norm_weight,
+        rmsnorm_eps=mixer.norm.variance_epsilon,
+        headdim=mixer.head_dim,
+        ngroups=groups,
+        norm_before_gate=False,
+    )
+
+
+class _PackedSeqToHead(torch.autograd.Function):
+    """``[B, S/cp, sum(widths)]`` -> ``[B, S, sum(widths) / cp]`` in one all-to-all: each column block of ``widths``
+    (z, x, B, C, dt of the in_proj output) is split over the ranks by heads, and every rank receives its share of
+    each block side by side, in the block order."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, widths: tuple[int, ...], group: dist.ProcessGroup, size: int) -> torch.Tensor:
+        batch, local_len, _ = x.shape
+        parts = x.split(list(widths), dim=-1)
+        send = torch.cat([p.reshape(batch, local_len, size, -1).permute(2, 0, 1, 3) for p in parts], dim=-1)
+        recv = torch.empty_like(send)
+        dist.all_to_all_single(recv, send, group=group)
+        ctx.shape, ctx.widths, ctx.group, ctx.size = (batch, local_len), widths, group, size
+        return recv.permute(1, 0, 2, 3).reshape(batch, size * local_len, -1)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        (batch, local_len), size = ctx.shape, ctx.size
+        send = grad.reshape(batch, size, local_len, -1).permute(1, 0, 2, 3).contiguous()
+        recv = torch.empty_like(send)
+        dist.all_to_all_single(recv, send, group=ctx.group)
+        parts = recv.split([w // size for w in ctx.widths], dim=-1)
+        grad_x = torch.cat([p.permute(1, 2, 0, 3).reshape(batch, local_len, -1) for p in parts], dim=-1)
+        return grad_x, None, None, None
+
+
+def mamba_cp_forward_fused(
+    mixer,
+    hidden_states: torch.Tensor,
+    cp_group: dist.ProcessGroup,
+    cp_rank: int,
+    cp_size: int,
+    cu_seqlens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``mamba_cp_forward`` with one all-to-all for the in_proj output (instead of five) and the fused mixer
+    (``fused_mamba_mixer``) on the gathered sequence's local heads."""
+    groups_state = mixer.n_groups * mixer.ssm_state_size
+    widths = (mixer.intermediate_size, mixer.intermediate_size, groups_state, groups_state, mixer.num_heads)
+    zxbcdt = _PackedSeqToHead.apply(mixer.in_proj(hidden_states), widths, cp_group, cp_size)
+    seq_idx = None if cu_seqlens is None else packed_seq_idx(cu_seqlens, zxbcdt.shape[1])
+    scan_output = fused_mamba_mixer(mixer, zxbcdt, seq_idx, cp_rank, cp_size)
+    return mixer.out_proj(head_to_seq_parallel(scan_output, cp_group, cp_size))
