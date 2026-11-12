@@ -14,21 +14,22 @@
 # limitations under the License.
 """Frozen weights a model holds outside their parameters' data, as its weight export and its state dict see them.
 
-The frozen expert offload (``moe/frozen_offload.py``: each rank's routed-expert codes in host memory) keeps every
-parameter object in its owner, with empty data, outside the calls of its layer, and so may any other holding of frozen
-weights. Each registers its ``FrozenHolding`` with the model (``hold_frozen_weights``), and the model's weight export
-then sees the unheld model: one ``weight_export.HeldParameters`` for all of the model's holdings lists the parameters
-by their own names and in their order, and materializes the held parameters among the tensors of one export unit (the
-MoE families' builders: a decoder layer) whole, each holding pointing their data at a whole copy and emptying them
-again after. ``iter_model_weights`` (a weights-only checkpoint's HF tree, the weight sync) therefore exports the unheld
-model's tensors, bit for bit, holding one layer's whole weights at a time. A family export builder that reads the
-parameters without ``weight_export.materialized_parameters`` is refused, as is ``weight_export.save_hf_pretrained``
-(one rank alone cannot gather what a holding keeps on every rank).
+The frozen expert offload (``moe/frozen_offload.py``: each rank's routed-expert codes in host memory) and the frozen
+shard (``moe/frozen_shard.py``: each layer's frozen replicated weights as ``1 / world`` byte shards) keep every
+parameter object in its owner, with empty data, outside the calls of its layer. Each registers its ``FrozenHolding``
+with the model (``hold_frozen_weights``), and the model's weight export then sees the unheld model: one
+``weight_export.HeldParameters`` for all of the model's holdings lists the parameters by their own names and in their
+order, and materializes the held parameters among the tensors of one export unit (the MoE families' builders: a
+decoder layer) whole, each holding pointing their data at a whole copy and emptying them again after.
+``iter_model_weights`` (a weights-only checkpoint's HF tree, the weight sync) therefore exports the unheld model's
+tensors, bit for bit, holding one layer's whole weights at a time. A family export builder that reads the parameters
+without ``weight_export.materialized_parameters`` is refused, as is ``weight_export.save_hf_pretrained`` (one rank
+alone cannot gather the shards).
 
-``state_dict`` / ``load_state_dict``, and DeepSpeed's checkpoint (which also reads frozen parameters directly), see the
-whole weights only inside ``whole_frozen_weights(model)``, entered on every rank (a holding may gather collectively):
-there every held parameter's data is its whole value in host memory, and what a load writes there becomes the
-holding's. Outside it, a model that holds frozen weights refuses its state dict, which would hold empty tensors.
+``state_dict`` / ``load_state_dict``, and DeepSpeed's checkpoint (which also reads frozen parameters directly), see
+the whole weights only inside ``whole_frozen_weights(model)``, entered on every rank (the shards' gather is
+collective): there every held parameter's data is its whole value in host memory, and what a load writes there becomes
+the holding's. Outside it, a model that holds frozen weights refuses its state dict, which would hold empty tensors.
 """
 
 from __future__ import annotations
@@ -105,8 +106,8 @@ def whole_frozen_weights(model: nn.Module) -> Iterator[None]:
     """Inside, every frozen parameter ``model`` (or a model it wraps) holds outside its data holds its whole value in
     host memory, for ``state_dict``, ``load_state_dict`` and DeepSpeed's checkpoint; what a load writes is kept.
 
-    Enter it on every rank: a holding may gather collectively when it is entered. A no-op for a model that holds
-    nothing.
+    Enter it on every rank: the frozen shards are gathered when it is entered (collective, a layer at a time). A
+    no-op for a model that holds nothing.
     """
     with contextlib.ExitStack() as stack:
         for holding in _holdings_under(model):
@@ -135,7 +136,7 @@ def _check_state_dict(holdings: list[FrozenHolding], module: nn.Module, *args, *
     if any(holding.held for holding in holdings):
         raise RuntimeError(
             f"{type(module).__name__} holds frozen weights outside their parameters (moe/frozen_offload.py, "
-            "moe/frozen_held.py), so its state dict would hold empty tensors for them: take or load it inside "
+            "moe/frozen_shard.py), so its state dict would hold empty tensors for them: take or load it inside "
             "moe/frozen_held.whole_frozen_weights(model), entered on every rank, and export its weights with "
             "iter_model_weights"
         )
@@ -153,7 +154,7 @@ def _export_builder(builder, weight_format: str):
 
     def refuse(model):
         raise NotImplementedError(
-            f"weight_format={weight_format!r} with frozen weights held outside their parameters: {label} reads the "
+            f"weight_format={weight_format!r} with the frozen expert offload or the frozen shard: {label} reads the "
             "parameters directly, which hold no data outside their layer's calls; it must read them through "
             "weight_export.export_named_parameters and materialized_parameters, as build_iter_full_hf_weights does"
         )

@@ -23,6 +23,7 @@ import logging
 import os
 from collections.abc import Callable
 from collections.abc import Collection
+from collections.abc import Hashable
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Sequence
@@ -72,16 +73,20 @@ def weight_export_contract(model: nn.Module) -> WeightExportContract | None:
 
 @dataclass(frozen=True)
 class HeldParameters:
-    """Parameters a model keeps outside their owners' ``_parameters`` (node shards of them, say).
+    """Parameters a model keeps outside their owners' ``_parameters`` (``moe/dense_shard.py``: shards of them).
 
     ``named_parameters(model)`` lists ``model``'s parameters as the model without that holding lists them, names and
     order, with a placeholder for each held one; a placeholder holds no data. ``materialize(tensors)`` is a context
     inside which the placeholders among ``tensors`` hold their whole values (it may fill them on the exporting rank
-    only); it is collective: every rank enters it with the same tensors in the same order.
+    only); it is collective: every rank enters it with the same tensors in the same order. ``unit(tensor)``, when
+    given, names the unit a placeholder is materialized with (``moe/dense_shard.py``: its sharded module), ``None``
+    for a tensor the model does not hold: an export that walks the parameters materializes the placeholders of one
+    unit together. Without it, each placeholder is materialized alone.
     """
 
     named_parameters: Callable[[nn.Module], Iterator[tuple[str, torch.Tensor]]]
     materialize: Callable[[Sequence[torch.Tensor]], AbstractContextManager[None]]
+    unit: Callable[[torch.Tensor], Hashable | None] | None = None
 
 
 _HELD_PARAMETERS: WeakKeyDictionary[nn.Module, HeldParameters] = WeakKeyDictionary()
@@ -108,6 +113,36 @@ def materialized_parameters(model: nn.Module, tensors: Sequence[torch.Tensor]) -
         return
     with held.materialize(tensors):
         yield
+
+
+def _materialized(model: nn.Module, named: Sequence[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
+    """``named`` (from ``export_named_parameters``) in order, each held placeholder yielded while it holds its value.
+
+    Consecutive tensors whose placeholders belong to one ``HeldParameters.unit`` are materialized together (tensors
+    the model does not hold join the run around them), and each run's values are dropped before the next run is
+    gathered: rank 0 holds one unit's whole values at a time. Collective, as ``materialized_parameters``.
+    """
+    held = _HELD_PARAMETERS.get(model)
+    if held is None:
+        yield from named
+        return
+    unit = held.unit
+    runs: list[list[tuple[str, torch.Tensor]]] = []
+    key = None
+    for name, tensor in named:
+        if unit is None:  # each placeholder alone
+            runs.append([(name, tensor)])
+            continue
+        tensor_key = unit(tensor)
+        if not runs or (tensor_key is not None and key is not None and tensor_key != key):
+            runs.append([])
+            key = None
+        runs[-1].append((name, tensor))
+        if tensor_key is not None:
+            key = tensor_key
+    for run in runs:
+        with materialized_parameters(model, [tensor for _, tensor in run]):
+            yield from run
 
 
 def supports_weight_format(model: nn.Module, weight_format: WeightFormat) -> bool:
@@ -157,6 +192,12 @@ def hf_checkpoint_name_map(model: nn.Module) -> dict[str, str]:
     Only names that change are returned. Names consumed by a tensor converter
     are left alone because they do not map one-to-one.
     """
+    names = (hf_export_parameter_name(name) for name, _ in export_named_parameters(model))
+    return _hf_checkpoint_names(model, [name for name in names if name is not None])
+
+
+def _hf_checkpoint_names(model: nn.Module, export_names: Sequence[str]) -> dict[str, str]:
+    """``hf_checkpoint_name_map`` for ``export_names`` (exported names of any of the model's tensors)."""
     from transformers import PreTrainedModel
     from transformers.core_model_loading import PrefixChange
     from transformers.core_model_loading import WeightConverter
@@ -184,10 +225,7 @@ def hf_checkpoint_name_map(model: nn.Module) -> dict[str, str]:
     renamings = [transform for transform in reverse if isinstance(transform, WeightRenaming)]
     converters = [transform for transform in reverse if isinstance(transform, WeightConverter)]
     names: dict[str, str] = {}
-    for name, _ in model.named_parameters():
-        export_name = hf_export_parameter_name(name)
-        if export_name is None:
-            continue
+    for export_name in export_names:
         checkpoint_name, converter_pattern = rename_source_key(export_name, renamings, converters, reverse=True)
         if converter_pattern is None and checkpoint_name != export_name:
             names[export_name] = checkpoint_name
@@ -404,7 +442,9 @@ def _is_ep_sharded_parameter(parameter: Any) -> bool:
 
 
 def _has_ep_sharded_parameters(model: nn.Module) -> bool:
-    return any(_is_ep_sharded_parameter(parameter) for parameter in model.parameters())
+    """Expert-parallel parameters among those the export sees (``export_named_parameters``): a model's held
+    parameters count by their placeholders, never by the node shards that hold them (``moe/dense_shard.py``)."""
+    return any(_is_ep_sharded_parameter(parameter) for _, parameter in export_named_parameters(model))
 
 
 def _expert_parallel_group(parameter: Any):
@@ -840,12 +880,17 @@ def _iter_generic_weights(
     *,
     is_master: bool,
     is_zero3: bool,
+    include_skipped: bool,
     checkpoint_dir: str | None,
 ) -> WeightIterator:
-    if _has_ep_sharded_parameters(model):
+    """``model``'s parameters as the model holds them, its held ones (``moe/dense_shard.py``'s node shards) whole: the
+    unsharded model's export, names and order, gathered onto rank 0 one sharded module at a time. ``include_skipped``
+    (``"hf"``, a weights-only checkpoint) adds the persistent buffers ``save_pretrained`` writes."""
+    named = list(export_named_parameters(model))
+    if any(_is_ep_sharded_parameter(parameter) for _, parameter in named):
         raise RuntimeError("EP-sharded models require an AP weight-export contract")
     names = hf_sync_name_map(model, checkpoint_dir) if weight_format == "hf" else {}
-    for name, parameter in model.named_parameters():
+    for name, parameter in _materialized(model, named):
         if weight_format == "hf":
             export_name = hf_export_parameter_name(name)
             if export_name is None:
@@ -864,6 +909,28 @@ def _iter_generic_weights(
         if is_master:
             assert tensor is not None
             yield export_name, tensor
+        # Not kept while the next sharded module is gathered: a held tensor is a view of its module's whole buffer.
+        del tensor
+    if weight_format == "hf" and include_skipped:
+        # Checkpoint state the model loaded with and no optimizer changes (Gemma 4's per-layer ``layer_scalar``): a
+        # weights-only checkpoint without it would serve its default instead. The weight sync leaves it out.
+        buffers = [
+            (export_name, buffer)
+            for name, buffer in _persistent_buffers(model)
+            if (export_name := hf_export_parameter_name(name)) is not None
+        ]
+        buffer_names = _hf_checkpoint_names(model, [export_name for export_name, _ in buffers])
+        if is_master:
+            for export_name, buffer in buffers:
+                yield buffer_names.get(export_name, export_name), buffer
+
+
+def _persistent_buffers(model: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
+    """The buffers ``model.state_dict()`` holds, by name."""
+    for name, buffer in model.named_buffers():
+        module_name, _, buffer_name = name.rpartition(".")
+        if buffer_name not in model.get_submodule(module_name)._non_persistent_buffers_set:
+            yield name, buffer
 
 
 def iter_model_weights(
@@ -879,7 +946,9 @@ def iter_model_weights(
 
     Models without a family contract stream ``named_parameters()``: unchanged for
     ``"vllm"`` (direct copy), and in the checkpoint's layout for ``"hf"`` (see
-    :func:`hf_sync_name_map`, which uses ``checkpoint_dir`` when given).
+    :func:`hf_sync_name_map`, which uses ``checkpoint_dir`` when given). Their held
+    parameters (``moe/dense_shard.py``'s node shards) come whole, as the unsharded
+    model's, and ``include_skipped`` adds the persistent buffers.
 
     ``include_skipped=True`` exports the unmerged PEFT base for a weights-only checkpoint.
     Other full-weight streams refuse trainable LoRA adapters; synchronize those with ``weight_format="lora"``.
@@ -910,5 +979,6 @@ def iter_model_weights(
         weight_format,
         is_master=is_master,
         is_zero3=is_zero3,
+        include_skipped=include_skipped,
         checkpoint_dir=checkpoint_dir,
     )

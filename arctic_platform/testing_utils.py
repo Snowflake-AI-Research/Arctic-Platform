@@ -203,6 +203,36 @@ def require_deepspeed(test_case):
         return test_case
 
 
+# Why ``overlap_comm`` is unsafe on some DeepSpeed versions. Since DeepSpeed #8749 ("ZeRO2: preserve fp32 grad
+# accumulation precision in partition storage", in 0.19.9), ZeRO-1/2 reduces a parameter larger than
+# ``reduce_bucket_size`` straight from its FP32 accumulation buffer, and ZeRO-2 drops that buffer right after queuing
+# the reduction. Under ``overlap_comm`` the reduction runs on the reduction stream, and nothing records that stream on
+# the buffer. The caching allocator can then hand the memory to the next kernels before the reduction has read it, so
+# the gradients come out wrong, or every step is skipped as an overflow. DeepSpeed 31f47f19 ("ZeRO-1/2: keep a bucket
+# reduction's input alive until the reduction stream has read it", branch jaelee/zero-memory-upstream) records the
+# reduction stream on the whole input, through ``DeepSpeedZeroOptimizer._record_reduction_input``.
+DEEPSPEED_OVERLAP_COMM_RACE = (
+    "DeepSpeed #8749 frees a gradient larger than reduce_bucket_size while overlap_comm still reduces it, and this "
+    "DeepSpeed lacks the fix (DeepSpeed 31f47f19, DeepSpeedZeroOptimizer._record_reduction_input)"
+)
+
+
+def deepspeed_reduces_safely_with_overlap_comm() -> bool:
+    """Whether the installed DeepSpeed's ZeRO-1/2 can run ``overlap_comm`` without the race described above.
+
+    True when it predates #8749 (no ``DeepSpeedZeroOptimizer._use_compact_grad_partition_buffer``) or has the fix
+    (``_record_reduction_input``). The probe checks the methods each change adds to the class. A behavioural probe
+    would need a multi-GPU reduction racing the allocator, which no quick check reproduces reliably. A DeepSpeed that
+    fixes the race under another name reads as unsafe: a test then loses its ``overlap_comm`` coverage but stays
+    correct.
+    """
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+
+    if not hasattr(DeepSpeedZeroOptimizer, "_use_compact_grad_partition_buffer"):
+        return True
+    return hasattr(DeepSpeedZeroOptimizer, "_record_reduction_input")
+
+
 def require_flash_attn(test_case):
     """
     Decorator marking a test that requires Flash Attention.
@@ -880,7 +910,7 @@ def get_unique_port_number():
     return DEFAULT_MASTER_PORT + 8 * get_xdist_worker_id()
 
 
-def reserve_free_port(start: int, span: int = 7) -> int:
+def reserve_free_port(start: int, span: int = 7, *, reuse_addr: bool = False) -> int:
     """First bindable TCP port in ``[start, start + span)``.
 
     Prefer this over ``socket.bind(('', 0))`` (or a fixed port) when launching servers under
@@ -888,9 +918,16 @@ def reserve_free_port(start: int, span: int = 7) -> int:
     probing within that block keeps concurrent workers from racing on the same listen port.
     Re-probe per session (not once at import) so a port left squatted by a prior run in this
     worker is stepped over rather than reused.
+
+    ``reuse_addr``: probe with ``SO_REUSEADDR``, as torch.distributed's TCPStore binds. A finished
+    process group leaves its store's port in TIME_WAIT for about a minute. Without the option
+    that port reads as taken, so a few multi-process tests in a row use up the span, though
+    the next TCPStore could bind it. A port with a live listener stays taken either way.
     """
     for port in range(start, start + span):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if reuse_addr:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 s.bind(("", port))
             except OSError:
