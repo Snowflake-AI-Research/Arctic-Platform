@@ -231,3 +231,28 @@ def test_indexer_key_norm_runs_eagerly_with_the_reference_math(monkeypatch):
     assert out.dtype == torch.bfloat16
     assert torch.equal(out, F.layer_norm(x.float(), (128,), weight, bias, 1e-6).to(torch.bfloat16))
     assert torch.equal(attention._fused_indexer_k_norm(x[3:4], weight, bias, 128, 1e-6), out[3:4])
+
+
+def test_block_fp8_moe_takes_one_fixed_config_at_every_batch_size(monkeypatch):
+    import sys
+    import types
+
+    from arctic_platform.inference.vllm import glm5_batch_invariance
+
+    fused_moe = types.ModuleType("vllm.model_executor.layers.fused_moe.fused_moe")
+    fused_moe.get_default_config = lambda M, E, N, K, topk, dtype, block_shape=None: {"BLOCK_SIZE_M": M}
+    package = types.ModuleType("vllm.model_executor.layers.fused_moe")
+    package.fused_moe = fused_moe
+    for name, module in (("vllm", types.ModuleType("vllm")),
+                         ("vllm.model_executor", types.ModuleType("vllm.model_executor")),
+                         ("vllm.model_executor.layers", types.ModuleType("vllm.model_executor.layers")),
+                         ("vllm.model_executor.layers.fused_moe", package),
+                         ("vllm.model_executor.layers.fused_moe.fused_moe", fused_moe)):  # fmt: skip
+        monkeypatch.setitem(sys.modules, name, module)
+    glm5_batch_invariance._fixed_fp8_block_moe_config()
+
+    configs = [fused_moe.get_default_config(m, 256, 512, 4096, 8, "fp8_w8a8", [128, 128]) for m in (1, 37, 4096)]
+    assert configs == [glm5_batch_invariance.FP8_BLOCK_MOE_CONFIG] * 3
+    assert configs[0] is not glm5_batch_invariance.FP8_BLOCK_MOE_CONFIG
+    assert fused_moe.get_default_config(7, 256, 512, 4096, 8, None) == {"BLOCK_SIZE_M": 7}
+    assert fused_moe.get_default_config(7, 256, 512, 4096, 8, "fp8_w8a8", None) == {"BLOCK_SIZE_M": 7}

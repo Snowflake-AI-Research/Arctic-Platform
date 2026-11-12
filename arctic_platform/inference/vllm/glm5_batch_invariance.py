@@ -382,6 +382,31 @@ def _batch_invariant_router_gate() -> None:
     GateLinear.forward = forward
 
 
+# Every config of the fused MoE kernel that does not depend on the batch is batch-invariant. On GLM-5.3-Flash's
+# block-FP8 experts this one is as fast as vLLM's tuned per-batch-size configs (2.1x vLLM's batch-invariant default
+# at TP 1, 1.7x at TP 4). BLOCK_SIZE_K and BLOCK_SIZE_M change the bits; BLOCK_SIZE_N, the warps and stages do not.
+FP8_BLOCK_MOE_CONFIG = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1,
+                        "SPLIT_K": 1, "num_warps": 4, "num_stages": 4}  # fmt: skip
+
+
+def _fixed_fp8_block_moe_config() -> None:
+    """Run the block-FP8 fused MoE kernel with :data:`FP8_BLOCK_MOE_CONFIG` at every batch size.
+
+    vLLM's batch-invariant mode replaces the tuned configs with one generic config (BLOCK_SIZE_K 32), which with
+    128 x 128 weight blocks scales and accumulates four partial products per block.
+    """
+    from vllm.model_executor.layers.fused_moe import fused_moe
+
+    original = fused_moe.get_default_config
+
+    def get_default_config(M, E, N, K, topk, dtype, block_shape=None):
+        if dtype == "fp8_w8a8" and block_shape is not None and list(block_shape) == [128, 128]:
+            return dict(FP8_BLOCK_MOE_CONFIG)
+        return original(M, E, N, K, topk, dtype, block_shape)
+
+    fused_moe.get_default_config = get_default_config
+
+
 def _sparse_mla_always_mqa() -> None:
     """Run every sparse MLA token through the absorbed ``forward_mqa`` path.
 
@@ -399,7 +424,8 @@ PROXY_ENV_VAR = "ARCTIC_GLM5_PROXY_LAYERS"
 # Debug, for ablations: comma-separated patches of ``PATCHES`` to leave out. The backend gating always applies.
 SKIP_ENV_VAR = "ARCTIC_GLM5_BI_SKIP"
 PATCHES = ("gdn", "one_split", "mhc_split", "mhc_unfused", "router_gate", "mla_mqa", "fp8_linear", "kda_mixed",
-           "indexer_topk", "causal_rows", "indexer_knorm", "indexer_weights", "grouped_topk", "kda_pin")  # fmt: skip
+           "indexer_topk", "causal_rows", "indexer_knorm", "indexer_weights", "grouped_topk", "kda_pin",
+           "moe_config")  # fmt: skip
 
 
 def _load_proxy_layers_only(num_layers: int) -> None:
@@ -464,7 +490,8 @@ def ensure_glm5_batch_invariance() -> None:
                         ("fp8_linear", _batch_invariant_fp8_block_linear), ("kda_mixed", _split_mixed_kda_steps),
                         ("indexer_topk", _deterministic_indexer_topk), ("causal_rows", _causal_indices_per_token),
                         ("indexer_knorm", _eager_indexer_k_norm),
-                        ("indexer_weights", _batch_invariant_indexer_head_weights)):  # fmt: skip
+                        ("indexer_weights", _batch_invariant_indexer_head_weights),
+                        ("moe_config", _fixed_fp8_block_moe_config)):  # fmt: skip
         if name not in skip:
             apply()
     if "grouped_topk" not in skip:
