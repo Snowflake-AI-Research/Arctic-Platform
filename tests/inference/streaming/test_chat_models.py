@@ -32,6 +32,7 @@ LOADER_ARCHITECTURES = {
     },
     "qwen3_5_moe": {"Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"},
     "inkling": {"InklingForCausalLM", "InklingForConditionalGeneration"},
+    "inkling2": {"Inkling2ForConditionalGeneration"},
     "glm_moe_dsa": {"GlmMoeDsaForCausalLM"},
     "generic_moe": {
         "Qwen3MoeForCausalLM",
@@ -123,6 +124,7 @@ def test_every_trainable_architecture_has_a_chat_decision():
         ("NemotronHForCausalLM", "nemotron_v3", "qwen3_coder", True),
         ("InklingForCausalLM", "inkling", "inkling", True),
         ("InklingForConditionalGeneration", "inkling", "inkling", True),
+        ("Inkling2ForConditionalGeneration", "inkling", "inkling", True),
     ],
 )
 def test_catalog_architectures_get_their_parsers(
@@ -246,6 +248,7 @@ ANY = None
 TEMPLATE_EFFORTS = {
     "InklingForCausalLM": REASONING_EFFORTS,
     "InklingForConditionalGeneration": REASONING_EFFORTS,
+    "Inkling2ForConditionalGeneration": REASONING_EFFORTS,
     "Qwen3ForCausalLM": ANY,
     "Qwen3MoeForCausalLM": ANY,
     "Qwen3_5ForCausalLM": {"low", "medium", "xhigh"},

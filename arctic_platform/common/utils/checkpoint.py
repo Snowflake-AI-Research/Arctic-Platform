@@ -19,9 +19,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
+from collections.abc import Iterator
 
 
 def resolve_checkpoint_save_paths(root: str, step: int | None) -> tuple[str, str]:
@@ -35,6 +37,80 @@ def resolve_checkpoint_save_paths(root: str, step: int | None) -> tuple[str, str
     else:
         save_dir = root
     return save_dir, root
+
+
+def has_ep_sharded_parameters(module) -> bool:
+    from arctic_platform.model.weight_export import _has_ep_sharded_parameters
+
+    return _has_ep_sharded_parameters(module)
+
+
+@contextlib.contextmanager
+def omit_frozen_parameters(module) -> Iterator[None]:
+    """Leave frozen parameters out of ``module.state_dict``, which every DeepSpeed save path reads.
+
+    DeepSpeed's ``exclude_frozen_parameters`` matches parameter names against state-dict keys, which drop
+    activation-checkpoint wrapper segments (``_checkpoint_wrapped_module.``), so it keeps wrapped frozen weights.
+    """
+    from torch import nn
+
+    frozen = {
+        key
+        for key, value in module.state_dict(keep_vars=True).items()
+        if isinstance(value, nn.Parameter) and not value.requires_grad
+    }
+    original = module.state_dict
+
+    def state_dict(*args, **kwargs):
+        state = original(*args, **kwargs)
+        prefix = kwargs.get("prefix", "")
+        for key in frozen:
+            state.pop(prefix + key, None)
+        return state
+
+    module.state_dict = state_dict
+    try:
+        yield
+    finally:
+        del module.state_dict
+
+
+def load_module_state_skipping_ep_shards(src: dict, dst) -> None:
+    """``custom_load_fn`` for ``engine.load_checkpoint`` on expert-parallel models.
+
+    DeepSpeed writes module state from rank 0 only, so its EP-sharded tensors are rank 0's experts and must not be
+    loaded elsewhere. Frozen parameters may be absent (saved with ``exclude_frozen_parameters``); every other key must
+    load.
+    """
+    from arctic_platform.model.weight_export import _is_ep_sharded_parameter
+    from arctic_platform.model.weight_export import strip_activation_checkpoint_segments as strip
+
+    parameters = {strip(name): p for name, p in dst.named_parameters(remove_duplicate=False)}
+    skipped = {name for name, parameter in parameters.items() if _is_ep_sharded_parameter(parameter)}
+    frozen = {name for name, parameter in parameters.items() if not parameter.requires_grad}
+    result = dst.load_state_dict({k: v for k, v in src.items() if strip(k) not in skipped}, strict=False)
+    missing = [k for k in result.missing_keys if strip(k) not in skipped and strip(k) not in frozen]
+    if missing or result.unexpected_keys:
+        raise RuntimeError(f"Checkpoint module state mismatch: missing={missing} unexpected={result.unexpected_keys}")
+
+
+def restore_trainable_ep_shards(engine) -> None:
+    """After ``load_module_state_skipping_ep_shards``, set this rank's trainable EP-sharded parameters (e.g. expert
+    LoRA) from its restored optimizer state.
+
+    ZeRO-1/2 restores every rank's own fp32 partitions, expert groups included, but copies them into the module's
+    parameters only on universal-checkpoint loads.
+    """
+    from arctic_platform.model.weight_export import _is_ep_sharded_parameter
+
+    if not any(p.requires_grad and _is_ep_sharded_parameter(p) for p in engine.module.parameters()):
+        return
+    update_lp_params = getattr(engine.optimizer, "update_lp_params", None)
+    if update_lp_params is None:
+        raise NotImplementedError(
+            f"Resuming trainable expert-parallel parameters is not supported with {type(engine.optimizer).__name__}"
+        )
+    update_lp_params()
 
 
 def prune_checkpoint_dirs(parent_dir: str, keep: int) -> int:

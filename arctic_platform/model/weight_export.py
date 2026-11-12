@@ -600,7 +600,17 @@ def iter_lora_weights(
     is_master: bool,
     is_zero3: bool,
 ) -> WeightIterator:
-    """Yield vLLM LoRA tensors; every rank participates in EP gathers."""
+    """Yield vLLM LoRA tensors; every rank participates in EP gathers.
+
+    Families whose served adapter layout differs (e.g. packed expert projections) convert the master's stream with
+    a ``vllm_lora_tensors`` class method.
+    """
+    tensors = _iter_lora_tensors(model, is_master=is_master, is_zero3=is_zero3)
+    convert = getattr(type(_family_model_for_export(model)), "vllm_lora_tensors", None)
+    yield from tensors if convert is None else convert(tensors)
+
+
+def _iter_lora_tensors(model: nn.Module, *, is_master: bool, is_zero3: bool) -> WeightIterator:
     if is_zero3:
         raise NotImplementedError("weight_format='lora' does not support ZeRO-3")
     if not is_peft_model(model):

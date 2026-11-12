@@ -106,6 +106,7 @@ LOADER_OPTION_FIELDS: dict[str, str | None] = {
 LOADER_FIELD_OVERRIDES: dict[str, dict[str, str | None]] = {
     "glm5_next": {"attention.sparse_mla": "ModelSpec.attn_implementation"},
     "inkling": {"peft": "ModelSpec.patches.peft", "checkpointing.targets": None},
+    "inkling2": {"peft": "ModelSpec.patches.peft", "checkpointing.targets": None},
 }
 
 _MODEL_SPEC_PREFIX = "ModelSpec."

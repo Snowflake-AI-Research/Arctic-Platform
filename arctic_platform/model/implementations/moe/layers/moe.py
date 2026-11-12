@@ -895,6 +895,13 @@ class MoE(nn.Module):
             and torch.is_grad_enabled()
             and self.combine_replay is None
         )
+        # Combine replay keeps the chunk collectives out of any checkpoint; the local experts can still recompute.
+        checkpoint_experts = (
+            self.checkpoint_dispatch_chunks
+            and self.deepep_token_chunk_size is not None
+            and torch.is_grad_enabled()
+            and self.combine_replay is not None
+        )
         if self.combine_replay is not None and self.ep_comm_backend in ("uccl", "deepep"):
             self.combine_replay.start()
             combine_kwargs["replay"] = self.combine_replay
@@ -918,11 +925,18 @@ class MoE(nn.Module):
             # Routing weights still owed after the experts are applied by them, which can fold them into the
             # down projection; combine then only sums.
             scores = dispatch_state.permuted_scores
-            routed_output = (
-                self.experts(hidden_states, num_tokens_per_expert, scores)
-                if checkpoint_chunks
-                else self._run_local_routed_experts(hidden_states, num_tokens_per_expert, scores)
-            )
+            if checkpoint_chunks:
+                routed_output = self.experts(hidden_states, num_tokens_per_expert, scores)
+            elif checkpoint_experts:
+                routed_output = checkpoint(
+                    self._run_local_routed_experts,
+                    hidden_states,
+                    num_tokens_per_expert,
+                    scores,
+                    use_reentrant=False,
+                )
+            else:
+                routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert, scores)
             # Keep combine outside the checkpointed routed-expert region so
             # selective AC only recomputes local expert matmuls.
             return combine_tokens(routed_output, replace(dispatch_state, permuted_scores=None), **combine_kwargs)

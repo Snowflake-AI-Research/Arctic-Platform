@@ -33,6 +33,7 @@ from arctic_platform.common.profiles import glm5_next
 from arctic_platform.common.profiles import glm_moe_dsa
 from arctic_platform.common.profiles import huggingface
 from arctic_platform.common.profiles import inkling
+from arctic_platform.common.profiles import inkling2
 from arctic_platform.common.profiles import qwen3_5_moe
 from arctic_platform.common.profiles import qwen4_exp
 
@@ -40,6 +41,7 @@ _PROFILE_MODULES = (
     huggingface,
     generic_moe,
     inkling,
+    inkling2,
     qwen3_5_moe,
     glm_moe_dsa,
     glm5_next,

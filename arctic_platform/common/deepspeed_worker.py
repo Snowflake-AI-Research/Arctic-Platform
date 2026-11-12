@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import numbers
 import os
@@ -668,7 +669,13 @@ class DeepSpeedWorker:
 
     def save_checkpoint(self, path: str, export_hf: bool = False) -> dict:
         """Save DeepSpeed checkpoint; optionally export HF weights to ``{path}/hf/`` (rank 0)."""
-        self.engine.save_checkpoint(path)
+        from arctic_platform.common.utils.checkpoint import omit_frozen_parameters
+
+        # Frozen weights reload from the base model: rank 0's module state cannot hold other ranks' expert shards,
+        # and a LoRA base needs no copy.
+        exclude_frozen = self._frozen_weights_reload_from_base()
+        with omit_frozen_parameters(self.engine.module) if exclude_frozen else contextlib.nullcontext():
+            self.engine.save_checkpoint(path, exclude_frozen_parameters=exclude_frozen)
         hf_path = None
         if export_hf:
             hf_path = self.export_hf_checkpoint(path)
@@ -680,10 +687,29 @@ class DeepSpeedWorker:
 
     def load_checkpoint(self, path: str) -> int:
         """Restore DeepSpeed state. Returns restored ``global_steps``, or 0 if none found."""
-        load_path, _ = self.engine.load_checkpoint(path)
+        from arctic_platform.common.utils.checkpoint import load_module_state_skipping_ep_shards
+        from arctic_platform.common.utils.checkpoint import restore_trainable_ep_shards
+
+        custom_load_fn = None
+        if self._frozen_weights_reload_from_base():
+            custom_load_fn = load_module_state_skipping_ep_shards
+        load_path, _ = self.engine.load_checkpoint(path, custom_load_fn=custom_load_fn)
         if load_path is None:
             return 0
+        if custom_load_fn is not None:
+            restore_trainable_ep_shards(self.engine)
         return int(self.engine.global_steps)
+
+    def _frozen_weights_reload_from_base(self) -> bool:
+        """Whether checkpoints leave frozen weights out, for expert-parallel models and LoRA below ZeRO-3 (whose
+        module state holds partitioned placeholders)."""
+        from arctic_platform.common.utils.checkpoint import has_ep_sharded_parameters
+        from arctic_platform.model.weight_export import is_peft_model
+
+        module = self.engine.module
+        return has_ep_sharded_parameters(module) or (
+            is_peft_model(module) and self.engine.zero_optimization_stage() < 3
+        )
 
     def export_hf_checkpoint(self, checkpoint_dir: str) -> str | None:
         """Convert a DeepSpeed checkpoint dir to HF ``save_pretrained`` under ``hf/``.
