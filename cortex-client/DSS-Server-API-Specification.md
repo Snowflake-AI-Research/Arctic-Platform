@@ -702,9 +702,18 @@ the default. Use it when:
 
 If the target sub-job has a different `n_gpus` than the checkpoint's source
 sub-job (changing DP size), the target sub-job **must** have been created with
-`load_optimizer_states: false` in its `SubJobConfig`. The optimizer states are
-DP-sharded and cannot be resized. This is a **creation-time** setting; it cannot
-be changed at runtime. The server will reject incompatible loads.
+both of these settings:
+
+- `load_optimizer_states: false` in its `SubJobConfig`.
+- `load_module_only: true` in its `extra_training` (sent in `training_config`).
+
+The ZeRO optimizer states are DP-sharded and cannot be resized, so with
+`load_module_only: true` the server loads model weights only and skips them. The
+fp32 master weights are rebuilt from the bf16 weights, and the optimizer and LR
+scheduler start fresh. A DP-size change therefore does not keep the fp32 master
+weights. Both settings are **creation-time** settings and cannot be changed at
+runtime. If the DP size differs and `load_module_only` is not set, the resume
+fails with an error.
 
 ### 6.5 Create-time checkpoint initialization
 
@@ -728,9 +737,10 @@ longer needs to be running after the checkpoint has been saved.
 
 For training initialization from a `resumable` checkpoint, set
 `training_config.load_optimizer_states=false` (see
-[section 8.2](#82-trainingconfig)) to restore weights only with a fresh
-optimizer. This is required when the new job changes data-parallel size, since
-the DP-sharded optimizer cannot be resized.
+[section 8.2](#82-trainingconfig)) to keep the saved fp32 master weights and
+start the optimizer and LR scheduler fresh. This works only at the same DP size.
+To change DP size, also set `training_config.load_module_only=true`; see
+[DP size compatibility](#dp-size-compatibility).
 
 ### 6.6 Generate - `POST /{job_id}/generate`
 
@@ -1171,11 +1181,19 @@ Optional typed fields:
 
 `load_optimizer_states` controls checkpoint resume behavior for this training
 sub-job. When `false`, resuming a `resumable` checkpoint (via
-`source_checkpoint_info` or the runtime `/load` endpoint) restores model weights
-only and starts the optimizer fresh. Set it `false` to change data-parallel size
-while keeping expert parallelism, because the DP-sharded optimizer cannot be
-resized; a `true`/default resume against a different DP/world size fails fast
-with an actionable error. `None` (omitted) uses the server default (`true`).
+`source_checkpoint_info` or the runtime `/load` endpoint) keeps the saved fp32
+master weights and starts the Adam moments and LR scheduler fresh. This works
+only at the same DP size as the checkpoint; a `true`/default resume against a
+different DP/world size fails fast with an actionable error. `None` (omitted)
+uses the server default (`true`).
+
+`load_module_only` is not a typed field. Pass it in `extra_training`, which is
+merged into `training_config`. When `true`, resume loads model weights only and
+skips the ZeRO optimizer shards, which is what allows a different DP size. The
+fp32 master weights are rebuilt from the bf16 weights. It must be paired with
+`load_optimizer_states=false`; `load_module_only=true` with `load_optimizer_states`
+true or omitted is rejected. Both settings are fixed at creation time, including
+for resumes through the runtime `/load` endpoint.
 
 `extra_training` is merged as open passthrough data, without overriding typed
 keys. Examples include `model_provider`, `ep_size`, `ds_config`,

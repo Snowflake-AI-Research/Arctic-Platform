@@ -277,20 +277,24 @@ omitted. Use it when:
 
 If loading a checkpoint into a sub-job with a **different DP size** (different
 `n_gpus`) than the checkpoint was saved from, the job **must** have been created
-with `load_optimizer_states=False`:
+with `load_optimizer_states=False` and `load_module_only=True`:
 
 ```python
 training = SubJobConfig.training_job(
     model_name="...",
     n_gpus=16,  # Different from source checkpoint's DP size
     load_optimizer_states=False,  # REQUIRED for DP size change
+    extra_training={"load_module_only": True},  # REQUIRED for DP size change
     ...
 )
 ```
 
-This setting is configured at **job creation time** and cannot be changed later.
-The optimizer states are DP-sharded and cannot be resized. If you forget this,
-the load will fail at runtime.
+With these settings the load restores model weights only. The fp32 master weights
+are rebuilt from the bf16 weights, and the optimizer and LR scheduler start fresh.
+
+These settings are configured at **job creation time** and cannot be changed later.
+The optimizer states are DP-sharded and cannot be resized. If you forget either
+setting, the load will fail at runtime.
 
 This is the runtime load path. Create-time resume still uses
 `source_checkpoint_info` in the submitted sub-job JSON.
