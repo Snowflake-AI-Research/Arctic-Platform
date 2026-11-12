@@ -23,6 +23,7 @@ from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
 from arctic_platform.model.implementations.qwen38.converting_qwen4_exp import convert_hf_to_prime
 from arctic_platform.model.implementations.qwen38.converting_qwen4_exp import convert_prime_to_hf
+from arctic_platform.testing_utils import tiny_qwen4_exp_config
 
 
 def _require():
@@ -40,74 +41,6 @@ def _require():
     from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import EPShardedEmbedding
     from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpForConditionalGenerationPrimeRL
     from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpSparseMoePrimeRL
-
-
-def _tiny_config():
-    _require()
-    text_config = {
-        "vocab_size": 32,
-        "hidden_size": 16,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 2,
-        "num_key_value_heads": 1,
-        "head_dim": 8,
-        "linear_key_head_dim": 4,
-        "linear_value_head_dim": 4,
-        "linear_num_key_heads": 2,
-        "linear_num_value_heads": 2,
-        "linear_conv_kernel_dim": 2,
-        "moe_intermediate_size": 8,
-        "shared_expert_intermediate_size": 8,
-        "num_experts": 4,
-        "num_experts_per_tok": 2,
-        "layer_types": ["linear_attention", "full_attention"],
-        "hc_count": 2,
-        "hc_lowrank": 4,
-        "ple_layer_ids": [1],
-        "ple_embed_dim": 8,
-        "ple_conv_kernel_size": 2,
-        "ngram_size": 3,
-        "heads_per_ngram": 1,
-        "ngram_vocab_size_base": 11,
-        "make_ngram_vocab_size_divisible_by": 4,
-        "split_ngram_parts": 2,
-        "indexer_n_heads": 1,
-        "indexer_kv_heads": 1,
-        "indexer_head_dim": 4,
-        "indexer_budget": 4,
-        "indexer_compress_ratio": 2,
-        "output_gate_type": "sigmoid",
-        "eos_token_id": 1,
-        "pad_token_id": 0,
-        "rope_parameters": {
-            "rope_type": "default",
-            "rope_theta": 10_000.0,
-            "partial_rotary_factor": 0.5,
-            "mrope_section": [1, 1, 0],
-            "mrope_interleaved": True,
-        },
-    }
-    vision_config = {
-        "depth": 1,
-        "hidden_size": 16,
-        "intermediate_size": 32,
-        "num_heads": 2,
-        "out_hidden_size": 16,
-        "patch_size": 2,
-        "spatial_merge_size": 1,
-        "temporal_patch_size": 1,
-        "num_position_embeddings": 16,
-    }
-    config = Qwen4ExpConfig(
-        text_config=text_config,
-        vision_config=vision_config,
-        image_token_id=29,
-        video_token_id=30,
-        vision_start_token_id=27,
-        vision_end_token_id=28,
-    )
-    config.use_grouped_mm = False
-    return config
 
 
 def _checkpoint(tmp_path, model_type: str) -> str:
@@ -134,7 +67,8 @@ def test_qwen38_family_dispatch_and_custom_vlm_registration(tmp_path):
 
 
 def test_qwen38_custom_vlm_registration():
-    config = _tiny_config()
+    _require()
+    config = tiny_qwen4_exp_config()
     assert get_custom_vlm_cls(config) is Qwen4ExpForConditionalGenerationPrimeRL
 
 
@@ -142,7 +76,7 @@ def test_qwen38_replaces_moe_and_shards_ple_embedding():
     _require()
     from arctic_platform.model.implementations.moe.vlm import get_language_model
 
-    model = Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config())
+    model = Qwen4ExpForConditionalGenerationPrimeRL(tiny_qwen4_exp_config())
     language_model = get_language_model(model)
 
     assert model._requires_hf_weight_sync
@@ -159,7 +93,7 @@ def test_qwen38_gated_delta_net_output_norms_round_once():
     from arctic_platform.model.implementations.gpu import vllm_rounding
     from arctic_platform.model.implementations.moe.vlm import get_language_model
 
-    language_model = get_language_model(Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config()))
+    language_model = get_language_model(Qwen4ExpForConditionalGenerationPrimeRL(tiny_qwen4_exp_config()))
     norms = [layer.linear_attn.norm for layer in language_model.layers if layer.layer_type == "linear_attention"]
 
     # The rounding of each stock class is checked in test_gated_norm_rounding.py; here, that every norm uses it.
@@ -182,7 +116,7 @@ def test_qwen38_decoder_forwards_its_physical_layer_routes():
             self.routed_experts = routed_experts
             return torch.zeros_like(hidden_states)
 
-    model = Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config())
+    model = Qwen4ExpForConditionalGenerationPrimeRL(tiny_qwen4_exp_config())
     layer = get_language_model(model).layers[0]
     layer.ple = None
     layer.linear_attn = LinearAttention()
@@ -200,7 +134,7 @@ def test_qwen38_decoder_forwards_its_physical_layer_routes():
 
 def test_qwen38_model_builder_selects_custom_vlm(tmp_path):
     _require()
-    _tiny_config().save_pretrained(tmp_path)
+    tiny_qwen4_exp_config().save_pretrained(tmp_path)
     model = get_model(
         ModelConfig(
             name=str(tmp_path),
@@ -316,7 +250,7 @@ def test_qwen38_full_forward_backward():
     from arctic_platform.model.implementations.qwen38.qsa_flex import apply_qsa_flex
     from arctic_platform.model.implementations.qwen38.qsa_flex import register_qsa_flex_backend
 
-    config = _tiny_config()
+    config = tiny_qwen4_exp_config()
     config.text_config.head_dim = 16
     config.text_config.indexer_head_dim = 8
     config.use_cache = False
@@ -348,7 +282,7 @@ def test_qwen38_full_forward_backward():
 def test_qwen38_initializes_meta_buffers():
     _require()
     with torch.device("meta"):
-        model = Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config())
+        model = Qwen4ExpForConditionalGenerationPrimeRL(tiny_qwen4_exp_config())
     model.to_empty(device="cpu")
     model.init_buffers_post_meta()
 
@@ -402,7 +336,7 @@ def test_qwen38_hf_checkpoint_includes_frozen_ple_table(monkeypatch):
     _require()
     from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
 
-    model = Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config())
+    model = Qwen4ExpForConditionalGenerationPrimeRL(tiny_qwen4_exp_config())
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
     ngram_name = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.weight"
 
@@ -484,7 +418,7 @@ def test_qwen38_packed_ple_components_reset_at_position_boundaries():
     from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpTextNGramEmbeddingPrimeRL
     from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpTextPLELayerPrimeRL
 
-    config = _tiny_config().text_config
+    config = tiny_qwen4_exp_config().text_config
     positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
     first = torch.tensor([[2, 3, 4, 5]])
     second = torch.tensor([[6, 7, 8, 9]])
@@ -581,7 +515,7 @@ def test_qwen38_supports_selective_activation_checkpointing():
         supports_selective_activation_checkpointing,
     )
 
-    model = Qwen4ExpForConditionalGenerationPrimeRL(_tiny_config())
+    model = Qwen4ExpForConditionalGenerationPrimeRL(tiny_qwen4_exp_config())
     linear_layer = model.model.language_model.layers[0]
 
     assert supports_selective_activation_checkpointing(linear_layer)
@@ -701,7 +635,7 @@ def test_qwen38_sparse_gqa_custom_backward_matches_autograd(fp32_parity):
 
 def test_qwen38_rejects_native_fp8_training():
     _require()
-    config = _tiny_config()
+    config = tiny_qwen4_exp_config()
     config.quantization_config = {"quant_method": "fp8"}
     with pytest.raises(NotImplementedError, match="Native-FP8"):
         Qwen4ExpForConditionalGenerationPrimeRL(config)
@@ -713,7 +647,7 @@ def test_packed_ple_survives_custom_lm_head():
 
     from arctic_platform.model.implementations.moe.layers.lm_head import _patch_model_forward
 
-    config = _tiny_config()
+    config = tiny_qwen4_exp_config()
     config.text_config.layer_types = ["linear_attention"] * config.text_config.num_hidden_layers
     config.text_config.use_cache = False
     set_seed(37)
