@@ -43,6 +43,8 @@ def register(registry: Registry) -> None:
             "moe.comm_backend",
             "moe.comm_sms",
             "moe.comm_token_chunk",
+            "moe.w4a8_experts",
+            "moe.w8a8_experts",
             "attention.sparse_mla",
             "attention.backend",
             "numerics.reduce_dtype",

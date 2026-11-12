@@ -62,6 +62,46 @@ def _swiglu_bwd_kernel(
     tl.store(dup_ptr + offs, du.to(dup_ptr.dtype.element_ty), mask=mask)
 
 
+@triton.jit
+def _packed_swiglu_fwd_kernel(gu_ptr, out_ptr, D, stride_gu, limit, HAS_LIMIT: tl.constexpr, BLOCK_D: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    for start in range(0, D, BLOCK_D):
+        cols = start + tl.arange(0, BLOCK_D)
+        mask = cols < D
+        g = tl.load(gu_ptr + row * stride_gu + cols, mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(gu_ptr + row * stride_gu + D + cols, mask=mask, other=0.0).to(tl.float32)
+        if HAS_LIMIT:
+            g = tl.minimum(g, limit)
+            u = tl.minimum(tl.maximum(u, -limit), limit)
+        tl.store(out_ptr + row * D + cols, (g * tl.sigmoid(g) * u).to(out_ptr.dtype.element_ty), mask=mask)
+
+
+@triton.jit
+def _packed_swiglu_bwd_kernel(
+    gu_ptr, grad_ptr, dgu_ptr, D, stride_gu, stride_grad, limit, HAS_LIMIT: tl.constexpr, BLOCK_D: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    for start in range(0, D, BLOCK_D):
+        cols = start + tl.arange(0, BLOCK_D)
+        mask = cols < D
+        g = tl.load(gu_ptr + row * stride_gu + cols, mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(gu_ptr + row * stride_gu + D + cols, mask=mask, other=0.0).to(tl.float32)
+        dh = tl.load(grad_ptr + row * stride_grad + cols, mask=mask, other=0.0).to(tl.float32)
+        if HAS_LIMIT:
+            pass_g = g <= limit
+            pass_u = (u >= -limit) & (u <= limit)
+            g = tl.minimum(g, limit)
+            u = tl.minimum(tl.maximum(u, -limit), limit)
+        s = tl.sigmoid(g)
+        dg = dh * u * s * (1.0 + g * (1.0 - s))
+        du = dh * g * s
+        if HAS_LIMIT:
+            dg = tl.where(pass_g, dg, 0.0)
+            du = tl.where(pass_u, du, 0.0)
+        tl.store(dgu_ptr + row * stride_gu + cols, dg.to(dgu_ptr.dtype.element_ty), mask=mask)
+        tl.store(dgu_ptr + row * stride_gu + D + cols, du.to(dgu_ptr.dtype.element_ty), mask=mask)
+
+
 class _SwiGLUFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, gate: torch.Tensor, up: torch.Tensor, limit: float | None) -> torch.Tensor:
@@ -103,3 +143,54 @@ def fused_swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float | None) -> t
     if gate.shape != up.shape or gate.dtype != up.dtype:
         raise ValueError(f"gate {tuple(gate.shape)} {gate.dtype} and up {tuple(up.shape)} {up.dtype} must match")
     return _SwiGLUFn.apply(gate, up, limit)
+
+
+_PACKED_BLOCK_D = 1024
+
+
+class _PackedSwiGLUFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate_up: torch.Tensor, limit: float | None) -> torch.Tensor:
+        gate_up = gate_up.contiguous()
+        ctx.save_for_backward(gate_up)
+        ctx.limit = limit
+        hidden = gate_up.shape[1] // 2
+        out = torch.empty(gate_up.shape[0], hidden, dtype=gate_up.dtype, device=gate_up.device)
+        if out.numel():
+            _packed_swiglu_fwd_kernel[(out.shape[0],)](
+                gate_up,
+                out,
+                hidden,
+                gate_up.stride(0),
+                0.0 if limit is None else float(limit),
+                HAS_LIMIT=limit is not None,
+                BLOCK_D=_PACKED_BLOCK_D,
+            )
+        return out
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        (gate_up,) = ctx.saved_tensors
+        grad = grad.contiguous()
+        d_gate_up = torch.empty_like(gate_up)
+        if grad.numel():
+            limit = ctx.limit
+            _packed_swiglu_bwd_kernel[(grad.shape[0],)](
+                gate_up,
+                grad,
+                d_gate_up,
+                grad.shape[1],
+                gate_up.stride(0),
+                grad.stride(0),
+                0.0 if limit is None else float(limit),
+                HAS_LIMIT=limit is not None,
+                BLOCK_D=_PACKED_BLOCK_D,
+            )
+        return d_gate_up, None
+
+
+def packed_swiglu(gate_up: torch.Tensor, limit: float | None) -> torch.Tensor:
+    """``fused_swiglu`` of the halves of a packed ``[rows, 2 * hidden]`` gate|up tensor; its gradient stays packed."""
+    if gate_up.ndim != 2 or gate_up.shape[1] % 2:
+        raise ValueError(f"gate_up must be [rows, 2 * hidden], got {tuple(gate_up.shape)}")
+    return _PackedSwiGLUFn.apply(gate_up, limit)

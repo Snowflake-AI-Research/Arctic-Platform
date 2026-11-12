@@ -29,15 +29,36 @@ from typing import Any
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
+from pydantic import Field
 
 # field -> (module that reads it, relative to arctic_platform.model.implementations; the setter it takes it through)
-_SETTERS: dict[str, tuple[str, str]] = {}
+_SETTERS = {
+    "w4a8_experts": ("kernels.w4a8", "configure_from_options"),
+    "w8a8_experts": ("kernels.fp8_grouped_w8a8", "configure_from_options"),
+}
 
 
 class MoeRuntimeOptions(BaseModel):
     """Settings of the MoE runtime, one field per module setting. None: the environment variable decides."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    w4a8_experts: bool | None = Field(
+        None,
+        description=(
+            "Run INT4 routed experts with FP8 activations (W4A8, the checkpoint's static activation scales) instead of "
+            "decoding them to BF16 (kernels/w4a8). Unset: ARL_W4A8_EXPERTS."
+        ),
+    )
+    w8a8_experts: bool | None = Field(
+        None,
+        description=(
+            "Run the frozen block-FP8 routed experts' forward GEMMs as W8A8 (activations quantized to E4M3 per token "
+            "per 128 inputs) through DeepGEMM on Hopper, instead of decoding the weights to BF16; input gradients "
+            "stay BF16 GEMMs on the decoded weights (kernels/fp8_grouped_w8a8.py). Refused for experts that are not "
+            "block FP8. Unset: ARL_W8A8_EXPERTS."
+        ),
+    )
 
 
 def apply_moe_runtime_options(options: Any) -> None:
