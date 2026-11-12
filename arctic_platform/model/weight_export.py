@@ -277,6 +277,10 @@ def requires_hf_weight_sync(model: nn.Module, checkpoint_dir: str | None = None)
     contract = weight_export_contract(model)
     if contract is not None and contract.vllm is not None:
         return False
+    if contract is not None and contract.hf is not None:
+        # A family export with no direct vLLM layout (GLM-5.2 / 5.3's MoE adapter): iter_model_weights refuses
+        # weight_format="vllm" for it, so a full-weight sync has to stream the HF-named tensors.
+        return True
     # Composite VLMs (Gemma 4) load without renames, but vLLM serves model.language_model.* as language_model.model.*.
     for name, _ in export_named_parameters(model):
         export_name = hf_export_parameter_name(name)
