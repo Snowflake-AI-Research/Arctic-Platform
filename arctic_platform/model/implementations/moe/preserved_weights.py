@@ -39,7 +39,14 @@ class PreservedWeight:
 
 
 def file_identity(metadata: os.stat_result) -> tuple[int, ...]:
-    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size, metadata.st_mtime_ns)
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
 
 def unique_json_object(pairs):

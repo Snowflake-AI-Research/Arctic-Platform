@@ -556,6 +556,9 @@ def test_qwen_full_hf_export_rejects_live_name_collision(monkeypatch):
 @pytest.mark.parametrize("family", ["qwen", "glm"])
 @pytest.mark.parametrize("replacement", [False, True])
 def test_preserved_prediction_export_rechecks_shards_between_tensors(tmp_path, monkeypatch, family, replacement):
+    import os
+    import time
+
     import torch
     from safetensors.torch import save_file
 
@@ -573,6 +576,7 @@ def test_preserved_prediction_export_rechecks_shards_between_tensors(tmp_path, m
         capture, iterator = qwen.capture_mtp_weights, qwen.iter_preserved_mtp_weights
     shard = tmp_path / "model.safetensors"
     save_file(tensors, shard)
+    original_metadata = shard.stat()
     capture(model, tmp_path)
     export = iterator(model)
     next(export)
@@ -582,6 +586,14 @@ def test_preserved_prediction_export_rechecks_shards_between_tensors(tmp_path, m
         substitute.replace(shard)
     else:
         save_file({name: tensor + 1 for name, tensor in tensors.items()}, shard)
+        # An immediate rewrite can share the original filesystem timestamp tick.
+        for _ in range(100):
+            os.utime(shard, ns=(original_metadata.st_atime_ns, original_metadata.st_mtime_ns))
+            if shard.stat().st_ctime_ns != original_metadata.st_ctime_ns:
+                break
+            time.sleep(0.01)
+        assert shard.stat().st_mtime_ns == original_metadata.st_mtime_ns
+        assert shard.stat().st_ctime_ns != original_metadata.st_ctime_ns
     with pytest.raises(RuntimeError, match="shard changed"):
         next(export)
 
