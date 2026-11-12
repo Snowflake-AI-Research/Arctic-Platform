@@ -166,9 +166,9 @@ def adapter_coordinator(monkeypatch, kind):
     monkeypatch.setenv(debug_training.CAPTURE_ENV, "1")
     request = {"training_gpus": WORLD_SIZE, "identity": IDENTITY}
     if kind == "original":
+        monkeypatch.setattr(lora, "native_original_worker_adapter_scope", adapter_scope(original_receipt))
         request.update(sources=lora._runtime_sources(training), original_metadata=ORIGINAL_METADATA)
         monkeypatch.setattr(lora, "_request", lambda config: deepcopy(request))
-        monkeypatch.setattr(lora, "native_original_worker_adapter_scope", adapter_scope(original_receipt))
         coordinator_class = lora._coordinator_class(training, request, files_ref=None)
         receipts = [original_receipt(rank) for rank in range(WORLD_SIZE)]
     else:
