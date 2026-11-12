@@ -82,12 +82,14 @@ class Glm5NextOptions(FlashMoeOptions):
         ),
     )
     vllm_aligned_backward: Literal["stock", "vllm", "vllm_op"] = Field(
-        "stock",
+        "vllm",
         description=(
-            "Experimental, with vllm_aligned. 'stock': each layer's backward recomputes the stock layer on the layer's"
-            " input. 'vllm': each sublayer's gradient is taken at the aligned forward's exact values, through stock"
-            " sublayers made to compute vLLM's math (replayed choices, bf16 MLA projections, FP8 activation quantization)."
-            " 'vllm_op': each vLLM kernel's gradient is that of its reference math at the kernel's exact inputs."
+            "Experimental, with vllm_aligned. 'vllm' (default): each sublayer's gradient is taken at the aligned"
+            " forward's exact values, through stock sublayers made to compute vLLM's math (replayed choices, bf16 MLA"
+            " projections, FP8 activation quantization). 'stock': each layer's backward recomputes the stock layer on"
+            " the layer's input (faster; its gradient differs from the other two by 1-3% per layer). 'vllm_op':"
+            " each vLLM kernel's gradient is that of its reference math at the kernel's exact inputs (a reference,"
+            " about 3x the time)."
         ),
     )
     vllm_aligned_prefill_chunk: int = Field(
@@ -104,7 +106,7 @@ class _FlashLoadOptions(Qwen3_5MoeOptions):
     fp32_routed_weighting: bool = False
     vllm_aligned: bool = False
     vllm_aligned_tensor_parallel: int = 1
-    vllm_aligned_backward: str = "stock"
+    vllm_aligned_backward: str = "vllm"
     vllm_aligned_prefill_chunk: int = 0
 
 

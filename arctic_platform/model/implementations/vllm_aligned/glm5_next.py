@@ -176,10 +176,17 @@ class _AlignedLayer(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         (streams,) = ctx.saved_tensors
-        with torch.enable_grad():
-            replay = streams.detach().requires_grad_(streams.requires_grad)
-            out = ctx.run_stock(replay)
-        torch.autograd.backward(out, grad_out)
+        # Index and scatter accumulations accumulate with atomics by default (0.2-0.8% run to run at a MoE layer);
+        # torch's deterministic implementations make the layer's backward bitwise reproducible.
+        previous = torch.are_deterministic_algorithms_enabled(), torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        try:
+            with torch.enable_grad():
+                replay = streams.detach().requires_grad_(streams.requires_grad)
+                out = ctx.run_stock(replay)
+            torch.autograd.backward(out, grad_out)
+        finally:
+            torch.use_deterministic_algorithms(previous[0], warn_only=previous[1])
         return (replay.grad if streams.requires_grad else None), None, None
 
 
@@ -1378,15 +1385,16 @@ def check_tensor_parallel(config: Any, tp: int) -> None:
 
 
 def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_fp32: bool = False,
-                                 ep_group: Any = None, tensor_parallel: int = 1, backward: str = "stock",
+                                 ep_group: Any = None, tensor_parallel: int = 1, backward: str = "vllm",
                                  prefill_chunk: int = 0) -> None:  # fmt: skip
     """Make a GLM-5.3-Flash model's ``dss_compute_logprobs`` forward compute the batch-invariant sampler's logprobs.
 
     ``tensor_parallel`` is the sampler's TP size: every rank's share of the split layers runs on its own weight shard,
-    and the partial sums are reduced as vLLM's batch-invariant all-reduce reduces them. ``backward`` is ``"stock"``
-    (each layer's backward recomputes the stock layer on the layer's input), ``"vllm"`` (each sublayer's gradient is
-    taken at the aligned forward's exact values, :func:`_vllm_backward_runner`) or ``"vllm_op"`` (each vLLM kernel's
-    gradient is its reference math's at its exact inputs, :func:`_per_op_backward_runner`). ``prefill_chunk`` is the
+    and the partial sums are reduced as vLLM's batch-invariant all-reduce reduces them. ``backward`` is ``"vllm"``
+    (each sublayer's gradient is taken at the aligned forward's exact values, :func:`_vllm_backward_runner`; about
+    0.7% from the per-op backward per layer, at about a third of its time), ``"stock"`` (each layer's backward
+    recomputes the stock layer on the layer's input) or ``"vllm_op"`` (each vLLM kernel's gradient is its reference
+    math's at its exact inputs, :func:`_per_op_backward_runner`). ``prefill_chunk`` is the
     sampler's ``ARCTIC_PREFILL_CHUNK_ALIGN`` with a token budget of that size, so every prompt is prefilled that many
     tokens at a time from the sequence start (the KDA layers resume each chunk from the state the previous one left).
     """

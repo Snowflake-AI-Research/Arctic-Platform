@@ -516,6 +516,20 @@ def test_lm_head_logits_are_the_ranks_vocabulary_slices(monkeypatch):
     assert torch.allclose(one, four)
 
 
+def test_aligned_layer_backward_runs_with_deterministic_algorithms_and_restores_the_setting():
+    seen = []
+
+    def stock(s):
+        seen.append(torch.are_deterministic_algorithms_enabled())
+        return s * 2
+
+    streams = torch.randn(3, 4, requires_grad=True)
+    assert not torch.are_deterministic_algorithms_enabled()
+    _AlignedLayer.apply(streams, lambda s: s * 2, stock).sum().backward()
+    assert seen == [True]
+    assert not torch.are_deterministic_algorithms_enabled()
+    assert torch.equal(streams.grad, torch.full((3, 4), 2.0))
+
 def test_prefill_rounds_cut_each_prompt_every_chunk_tokens_from_its_start():
     from arctic_platform.model.implementations.vllm_aligned.glm5_next import _prefill_rounds
 
