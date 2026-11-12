@@ -1009,6 +1009,16 @@ def test_requires_hf_weight_sync_honors_model_flag_and_vllm_contract():
     assert not requires_hf_weight_sync(nn.Linear(2, 2))
 
 
+def test_requires_hf_weight_sync_for_a_family_export_without_a_vllm_layout():
+    # iter_model_weights refuses weight_format="vllm" for such a model, so the server must upgrade the sync to "hf".
+    hf_only = nn.Linear(2, 2)
+    register_weight_export(hf_only, WeightExportContract(hf=lambda _model: lambda: iter(())))
+
+    assert requires_hf_weight_sync(hf_only)
+    with pytest.raises(ValueError, match="does not provide direct vLLM weight export"):
+        next(iter_model_weights(hf_only, "vllm", is_master=True, is_zero3=False))
+
+
 @pytest.mark.parametrize(
     "name",
     [
