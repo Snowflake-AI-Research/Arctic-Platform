@@ -106,6 +106,51 @@ def test_sparse_mla_reference_attends_to_each_tokens_rows():
         assert torch.allclose(out[t], torch.softmax(scores, -1) @ v[sel], atol=1e-6)
 
 
+def test_sparse_mla_reference_runs_causal_rows_dense_and_matches_the_gather_in_value_and_gradient():
+    torch.manual_seed(5)
+    heads, rope, latent, width = 3, 4, 6, 8
+    # Request A: 6 causal tokens. Request B: 3 causal tokens, then 2 that attend to a subset (the sparse path).
+    rows = [list(range(t + 1)) for t in range(6)] + [[6 + j for j in range(t + 1)] for t in range(3)]
+    rows += [[6, 8, 9], [7, 9, 10]]
+    tokens = len(rows)
+    rows = torch.tensor([r + [-1] * (width - len(r)) for r in rows], dtype=torch.int32)
+    valid = (rows >= 0).sum(-1).to(torch.int32)
+    leaves = [torch.randn(tokens, heads, rope), torch.randn(tokens, 1, 1, rope), torch.randn(tokens, 1, 1, latent),
+              torch.randn(tokens, heads, latent)]  # fmt: skip
+    leaves = [t.requires_grad_(True) for t in leaves]
+    out = bw.ref_sparse_mla(leaves[0], leaves[1], leaves[2], leaves[3], rows, valid, 0.7, chunk=2)
+    expected = []
+    k, v = leaves[1].reshape(tokens, rope), leaves[2].reshape(tokens, latent)
+    for t in range(tokens):
+        sel = rows[t, : valid[t]].long()
+        scores = (leaves[0][t] @ k[sel].t() + leaves[3][t] @ v[sel].t()) * 0.7
+        expected.append(torch.softmax(scores, -1) @ v[sel])
+    expected = torch.stack(expected)
+    assert torch.allclose(out, expected, atol=1e-6)
+    R = torch.randn(out.shape)
+    got = torch.autograd.grad((out * R).sum(), leaves, retain_graph=True)
+    want = torch.autograd.grad((expected * R).sum(), leaves)
+    assert all(torch.allclose(a, b, atol=1e-5) for a, b in zip(got, want))
+
+
+def test_chunked_kda_reference_matches_the_token_by_token_one_in_value_and_gradient():
+    torch.manual_seed(6)
+    heads, dim = 2, 8
+    cu = torch.tensor([0, 37, 42, 106, 107])
+    tokens = int(cu[-1])
+    base = [torch.randn(1, tokens, heads, dim) for _ in range(4)] + [torch.randn(tokens, heads), torch.randn(heads),
+                                                                     torch.randn(heads * dim)]  # fmt: skip
+    runs = []
+    for stepwise in (True, False):
+        leaves = [t.clone().requires_grad_(True) for t in base]
+        out = bw.ref_kda_core(*leaves, cu, -5.0, chunk=16, stepwise=stepwise)
+        out.backward(torch.linspace(-1, 1, out.numel()).reshape(out.shape))
+        runs.append((out.detach(), [t.grad for t in leaves]))
+    (o1, g1), (o2, g2) = runs
+    assert torch.allclose(o1, o2, atol=1e-5, rtol=1e-4)
+    assert all(torch.allclose(a, b, atol=1e-4, rtol=1e-3) for a, b in zip(g1, g2))
+
+
 def test_causal_conv_reference_restarts_at_each_request():
     torch.manual_seed(2)
     x, weight = torch.randn(6, 3), torch.randn(3, 4)

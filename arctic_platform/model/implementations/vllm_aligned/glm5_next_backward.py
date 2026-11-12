@@ -170,6 +170,37 @@ def ref_causal_conv_silu(x: torch.Tensor, weight: torch.Tensor, cu_seqlens: torc
     return torch.cat(out).to(x.dtype)
 
 
+def _kda_chunk(q, k, v, g, beta, h, a_amp, g_bias, lower_bound, scale):
+    """One chunk of the gated delta rule in its chunked form, for a batch of requests from states ``h [B, H, V, K]``
+    (``q/k/g [B, C, H, K]``, ``v [B, C, H, V]``, ``beta [B, C, H]``): the same math as :func:`_kda_steps`, the
+    chunk's delta-rule corrections from one unit-lower-triangular solve instead of one token at a time.
+
+    With ``G`` the within-chunk cumulative log-decay and ``S`` the state entering the chunk,
+    ``u_i + sum_{j<i} b_i (k_i . e^{G_i - G_j} k_j) u_j = b_i (v_i - S e^{G_i} k_i)``,
+    ``o_i = S e^{G_i} q_i + sum_{j<=i} (q_i . e^{G_i - G_j} k_j) u_j`` and the state leaving it
+    ``S e^{G_C} + sum_j u_j (e^{G_C - G_j} k_j)^T``; decays enter only as differences ``G_i - G_j <= 0``."""
+    q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6) * scale
+    k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+    gate = lower_bound / (1.0 + torch.exp(-(a_amp * (g + g_bias))))
+    G = gate.cumsum(1)  # [B, C, H, K]
+    b = torch.sigmoid(beta)  # [B, C, H]
+    diff = (G[:, :, None] - G[:, None, :]).permute(0, 3, 1, 2, 4)  # [B, H, C(i), C(j), K]
+    decay = torch.exp(diff.clamp_max(0))  # only j <= i is used
+    kk = torch.einsum("bihk,bhijk,bjhk->bhij", k, decay, k)
+    qk = torch.einsum("bihk,bhijk,bjhk->bhij", q, decay, k)
+    chunk = q.shape[1]
+    strict = torch.ones(chunk, chunk, dtype=torch.bool, device=q.device).tril(-1)
+    eye = torch.eye(chunk, dtype=q.dtype, device=q.device)
+    lower = eye + (kk * b.permute(0, 2, 1)[..., None]).masked_fill(~strict, 0.0)
+    eg = torch.exp(G)  # e^{G_i} <= 1
+    rhs = b.permute(0, 2, 1)[..., None] * (v.transpose(1, 2) - torch.einsum("bhvk,bihk->bhiv", h, k * eg))
+    u = torch.linalg.solve_triangular(lower, rhs, upper=False, unitriangular=True)  # [B, H, C, V]
+    out = torch.einsum("bhvk,bihk->bihv", h, q * eg) + torch.einsum("bhij,bhjv->bihv", qk.masked_fill(~(strict | eye.bool()), 0.0), u)
+    last = torch.exp(G[:, -1:] - G)  # e^{G_C - G_j}, [B, C, H, K]
+    h = h * eg[:, -1][..., None, :] + torch.einsum("bhjv,bjhk->bhvk", u, k * last)
+    return out, h
+
+
 def _kda_steps(q, k, v, g, beta, h, a_amp, g_bias, lower_bound, scale):
     """One chunk of the gated delta rule (``fused_recurrent_kda``'s per-token math) for a batch of requests from
     states ``h [B, H, V, K]``: ``q/k/g [B, C, H, K]``, ``v [B, C, H, V]``, ``beta [B, C, H]``."""
@@ -185,11 +216,12 @@ def _kda_steps(q, k, v, g, beta, h, a_amp, g_bias, lower_bound, scale):
     return torch.stack(outs, dim=1), h
 
 
-def ref_kda_core(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, lower_bound: float, chunk: int = 64, **_):
+def ref_kda_core(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, lower_bound: float, chunk: int = 32,
+                 stepwise: bool = False, **_):
     """The KDA core over packed requests from a zero state: ``q/k/v/g [(1,) T, H, D]``, ``beta [T, H]`` raw logits,
     ``a_log [H]``, ``dt_bias [H * D]``; returns ``[T, H, D]`` in ``q``'s dtype. The requests step together, padded
-    to the longest (a padded position's output is dropped, so it gets no gradient); checkpointed every ``chunk``
-    steps."""
+    to the longest (a padded position's output is dropped, so it gets no gradient), ``chunk`` tokens at a time in the
+    chunked form (:func:`_kda_chunk`; ``stepwise``: token by token, :func:`_kda_steps`), checkpointed per chunk."""
     from torch.utils.checkpoint import checkpoint
 
     q, k, v, g = (t.reshape(t.shape[-3:]) for t in (q, k, v, g))
@@ -211,7 +243,7 @@ def ref_kda_core(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, lower_bound: floa
     out = []
     for c0 in range(0, steps.numel(), chunk):
         c1 = c0 + chunk
-        o, h = checkpoint(_kda_steps, q[:, c0:c1], k[:, c0:c1], v[:, c0:c1], g[:, c0:c1], beta[:, c0:c1], h,
+        o, h = checkpoint(_kda_steps if stepwise else _kda_chunk, q[:, c0:c1], k[:, c0:c1], v[:, c0:c1], g[:, c0:c1], beta[:, c0:c1], h,
                           a_amp, g_bias, lower_bound, scale, use_reentrant=False)  # fmt: skip
         out.append(o)
     return torch.cat(out, dim=1)[valid].to(dtype)
@@ -224,22 +256,56 @@ def _sparse_mla_chunk(q_rope, q_v, k_all, v_all, idx, mask, softmax_scale):
     return torch.einsum("tnk,tkl->tnl", torch.softmax(scores, dim=-1), v)
 
 
+def _causal_mla(q_rope, q_v, k, v, softmax_scale):
+    """Dense causal QV attention of one sequence's tokens over themselves: ``[L, N, R]``, ``[L, N, V]``, ``[L, R]``,
+    ``[L, V]`` -> ``[L, N, V]``."""
+    scores = (torch.einsum("tnr,sr->nts", q_rope.float(), k) + torch.einsum("tnl,sl->nts", q_v.float(), v)) * softmax_scale
+    causal = torch.ones(scores.shape[-2:], dtype=torch.bool, device=scores.device).tril()
+    probs = torch.softmax(scores.masked_fill(~causal, float("-inf")), dim=-1)
+    return torch.einsum("nts,sl->tnl", probs, v)
+
+
 def ref_sparse_mla(q_rope, k_cache, v_cache, q_v, rows, valid, softmax_scale: float, chunk: int = 128, **_):
     """FA3's sparse QV attention as vLLM calls it: token ``t`` attends to the rows ``rows[t, :valid[t]]`` of the
     one-token pages, ``softmax((q_rope . k + q_v . v) * scale) v``; ``q_rope [T, N, R]``, ``q_v [T, N, L]``,
-    ``k_cache [rows, 1, 1, R]``, ``v_cache [rows, 1, 1, L]``. Returns ``[T, N, L]``; checkpointed per token chunk."""
+    ``k_cache [rows, 1, 1, R]``, ``v_cache [rows, 1, 1, L]``. Returns ``[T, N, L]``.
+
+    A token whose rows are every token from its own row ``t - valid[t] + 1`` through ``t`` in order (each token below
+    ``index_topk``) attends causally within its sequence, so each sequence's run of such tokens is one dense causal
+    attention; the other tokens gather their rows, checkpointed per ``chunk`` tokens."""
     from torch.utils.checkpoint import checkpoint
 
     k_all, v_all = k_cache.reshape(k_cache.shape[0], -1).float(), v_cache.reshape(v_cache.shape[0], -1).float()
-    out = []
-    width = rows.shape[1]
-    for c0 in range(0, q_v.shape[0], chunk):
-        c1 = min(c0 + chunk, q_v.shape[0])
-        idx = rows[c0:c1].clamp_min(0).long()
-        mask = torch.arange(width, device=rows.device)[None, :] < valid[c0:c1, None]
-        out.append(checkpoint(_sparse_mla_chunk, q_rope[c0:c1], q_v[c0:c1], k_all, v_all, idx, mask, softmax_scale,
-                              use_reentrant=False))  # fmt: skip
-    return torch.cat(out).to(q_v.dtype)
+    tokens, width = rows.shape
+    col = torch.arange(width, device=rows.device)
+    t = torch.arange(tokens, device=rows.device)
+    in_range = col[None, :] < valid[:, None]
+    expected = (t - valid + 1)[:, None] + col[None, :]
+    causal = ((rows == expected) | ~in_range).all(-1) & (valid > 0)
+    # A causal run starts where the token is causal and its first row is itself (valid == 1, a sequence's first token).
+    starts = torch.nonzero(causal & (valid == 1)).flatten().tolist()
+    pieces, index = [], []
+    covered = torch.zeros(tokens, dtype=torch.bool, device=rows.device)
+    for i, s in enumerate(starts):
+        stop = starts[i + 1] if i + 1 < len(starts) else tokens
+        # The run's causal prefix: each token attends from the run's start, so its valid counts 1, 2, ...
+        run = causal[s:stop] & (valid[s:stop] == torch.arange(1, stop - s + 1, device=valid.device))
+        n = int(run.long().cumprod(0).sum())
+        pieces.append(checkpoint(_causal_mla, q_rope[s : s + n], q_v[s : s + n], k_all[s : s + n], v_all[s : s + n],
+                                 softmax_scale, use_reentrant=False))  # fmt: skip
+        index.append(t[s : s + n])
+        covered[s : s + n] = True
+    rest = torch.nonzero(~covered).flatten()
+    for c0 in range(0, rest.numel(), chunk):
+        sel = rest[c0 : c0 + chunk]
+        idx = rows[sel].clamp_min(0).long()
+        mask = col[None, :] < valid[sel, None]
+        pieces.append(checkpoint(_sparse_mla_chunk, q_rope[sel], q_v[sel], k_all, v_all, idx, mask, softmax_scale,
+                                 use_reentrant=False))  # fmt: skip
+        index.append(sel)
+    order = torch.cat(index)
+    out = torch.cat(pieces)
+    return out.new_zeros((tokens, *out.shape[1:])).index_copy(0, order, out).to(q_v.dtype)
 
 
 def ref_router_weights(logits: torch.Tensor, ids: torch.Tensor, renormalize: bool, scaling: float) -> torch.Tensor:
