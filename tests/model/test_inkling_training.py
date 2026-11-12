@@ -519,9 +519,11 @@ class TestInklingTraining(TestCasePlus):
         self.assertEqual(spec.parallelism.sequence_parallel, 2)
 
     def test_worker_uses_native_head_by_default(self):
-        from arctic_platform.model import ds_worker_moe_model_spec
+        from arctic_platform.common.model_settings import ModelSettings
+        from arctic_platform.model import settings_moe_model_spec
 
-        spec = ds_worker_moe_model_spec(self.checkpoint_config(), {"attn_implementation": "eager", "ep_size": 8})
+        settings = ModelSettings(model_provider="arctic", attn_implementation="eager", ep_size=8)
+        spec = settings_moe_model_spec(settings, model_path=self.checkpoint_config(), sequence_parallel=1)
         self.assertEqual(spec.loader, "inkling")
         self.assertNotIn("fused_cross_entropy", spec.loader_options)
 
