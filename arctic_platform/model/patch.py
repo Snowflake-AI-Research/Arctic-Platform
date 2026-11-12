@@ -34,13 +34,16 @@ Patch = Callable[[nn.Module, LoaderContext], nn.Module | None]
 # under ZoRRo is a no-op for activation savings (same as the old inline worker path).
 PATCH_ORDER: tuple[str, ...] = (
     "liger",
+    "fused_qk_norm_rope",
     "gradient_checkpointing",
+    "checkpoint_keep_attention",
     "activation_offload",
     "compile",
     "tiled_mlp",
     "lm_head",
     "zorro_train",
     "peft",
+    "fused_lora_linear",
     "dense_shard",
 )
 
