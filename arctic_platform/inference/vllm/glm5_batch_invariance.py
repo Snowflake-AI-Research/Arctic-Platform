@@ -31,6 +31,7 @@ router's fp32 logits go through vLLM's batch-invariant matmul instead of a kerne
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import torch
 
@@ -299,6 +300,45 @@ def _batch_invariant_indexer_head_weights() -> None:
     attention.torch = proxy
 
 
+def _prefill_checkpoint(checkpoint: Any, num_decodes: int) -> Any:
+    """A step's prefill checkpoint metadata (built for every request, decodes first) for its prefill requests."""
+    import dataclasses
+
+    if checkpoint is None or num_decodes == 0:
+        return checkpoint
+
+    def rows(t):
+        return None if t is None else t[num_decodes:]
+
+    return dataclasses.replace(
+        checkpoint,
+        checkpoint_offsets=checkpoint.checkpoint_offsets[num_decodes:],
+        state_indices=checkpoint.state_indices[num_decodes:],
+        offsets=None if checkpoint.offsets is None else checkpoint.offsets[num_decodes:],
+        request_rows=rows(checkpoint.request_rows),
+        block_cols=rows(checkpoint.block_cols),
+    )
+
+
+def _no_kda_prefill_checkpoints() -> None:
+    """Save KDA states for the prefix cache only at prefill chunk ends.
+
+    With FlashKDA, vLLM can also export a request's state at a cacheable position inside a prefill call (a prefill
+    checkpoint) instead of ending the chunk there. Without checkpoint blocks the scheduler ends the chunk at that
+    position, so every state a later request resumes from is the end state of a chunk, as a trainer replays it."""
+    import dataclasses
+
+    from vllm.models.glm5next.common.kda import Glm5NextLinearAttention
+
+    original = Glm5NextLinearAttention.get_kv_cache_spec
+
+    def get_kv_cache_spec(self, vllm_config):
+        return dataclasses.replace(original(self, vllm_config), num_prefill_checkpoint_blocks=0,
+                                   prefill_checkpoint_alignment=None)  # fmt: skip
+
+    Glm5NextLinearAttention.get_kv_cache_spec = get_kv_cache_spec
+
+
 def _split_mixed_kda_steps() -> None:
     """Run a mixed step's decode requests through KDA's decode path, as a decode-only step runs them.
 
@@ -327,6 +367,7 @@ def _split_mixed_kda_steps() -> None:
             num_prefill_tokens=0,
             num_actual_tokens=d,
             has_initial_state=None,
+            checkpoint=None,
             non_spec_query_start_loc=md.non_spec_query_start_loc[: md.num_decodes + 1],
             non_spec_state_indices_tensor=md.non_spec_state_indices_tensor[: md.num_decodes],
         )
@@ -345,6 +386,7 @@ def _split_mixed_kda_steps() -> None:
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            checkpoint=_prefill_checkpoint(md.checkpoint, md.num_decodes),
         )
         try:
             raw[self.prefix] = decode
@@ -470,7 +512,7 @@ PROXY_ENV_VAR = "ARCTIC_GLM5_PROXY_LAYERS"
 SKIP_ENV_VAR = "ARCTIC_GLM5_BI_SKIP"
 PATCHES = ("gdn", "one_split", "mhc_split", "mhc_unfused", "router_gate", "mla_mqa", "fp8_linear", "kda_mixed",
            "indexer_topk", "causal_rows", "indexer_knorm", "indexer_weights", "grouped_topk", "kda_pin",
-           "moe_config", "kpool_chunks")  # fmt: skip
+           "moe_config", "kpool_chunks", "kda_checkpoints")  # fmt: skip
 
 
 def _load_proxy_layers_only(num_layers: int) -> None:
@@ -536,7 +578,8 @@ def ensure_glm5_batch_invariance() -> None:
                         ("indexer_topk", _deterministic_indexer_topk), ("causal_rows", _causal_indices_per_token),
                         ("indexer_knorm", _eager_indexer_k_norm),
                         ("indexer_weights", _batch_invariant_indexer_head_weights),
-                        ("moe_config", _fixed_fp8_block_moe_config), ("kpool_chunks", _kpool_aligned_chunks)):  # fmt: skip
+                        ("moe_config", _fixed_fp8_block_moe_config), ("kpool_chunks", _kpool_aligned_chunks),
+                        ("kda_checkpoints", _no_kda_prefill_checkpoints)):  # fmt: skip
         if name not in skip:
             apply()
     if "grouped_topk" not in skip:
