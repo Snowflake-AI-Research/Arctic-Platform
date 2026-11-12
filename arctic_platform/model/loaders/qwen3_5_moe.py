@@ -24,6 +24,7 @@ from pydantic import Field
 from pydantic import model_validator
 from typing_extensions import Self
 
+from arctic_platform.debug.training import ReducedFixtureMTP
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config import EPCommBackend
@@ -44,6 +45,7 @@ class DebugModelOptions(BaseModel):
     num_layers: int | None = Field(None, gt=0)
     gradient_sample_max_numel: int = Field(0, ge=0)
     full_determinism: bool = False
+    reduced_fixture_mtp: ReducedFixtureMTP | None = None
 
 
 class Qwen3_5MoeOptions(BaseModel):
