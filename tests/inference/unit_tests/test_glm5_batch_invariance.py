@@ -292,3 +292,44 @@ def test_prefill_chunks_end_at_whole_kpools(monkeypatch):
     assert plain._mamba_block_aligned_split(request, 4097) == 4096
     aligned = Scheduler(config, True)
     assert aligned._mamba_block_aligned_split(request, 5000) == 4352
+
+
+def test_kda_prefill_checkpoints_are_off_and_narrowed_to_a_mixed_steps_prefills(monkeypatch):
+    import dataclasses
+    import sys
+    import types
+
+    import torch
+
+    from arctic_platform.inference.vllm import glm5_batch_invariance
+
+    @dataclasses.dataclass
+    class Checkpoint:
+        checkpoint_offsets: torch.Tensor
+        state_indices: torch.Tensor
+        offsets: list | None = None
+        request_rows: torch.Tensor | None = None
+        block_cols: torch.Tensor | None = None
+
+    full = Checkpoint(torch.tensor([0, 0, 5, 7]), torch.tensor([1, 2, 3, 4]), [0, 0, 5, 7], torch.arange(4), None)
+    narrowed = glm5_batch_invariance._prefill_checkpoint(full, 2)
+    assert narrowed.checkpoint_offsets.tolist() == [5, 7] and narrowed.state_indices.tolist() == [3, 4]
+    assert narrowed.offsets == [5, 7] and narrowed.request_rows.tolist() == [2, 3] and narrowed.block_cols is None
+    assert glm5_batch_invariance._prefill_checkpoint(None, 2) is None
+
+    @dataclasses.dataclass
+    class Spec:
+        num_prefill_checkpoint_blocks: int = 1
+        prefill_checkpoint_alignment: int | None = 64
+
+    class Glm5NextLinearAttention:
+        def get_kv_cache_spec(self, vllm_config):
+            return Spec()
+
+    module = types.ModuleType("vllm.models.glm5next.common.kda")
+    module.Glm5NextLinearAttention = Glm5NextLinearAttention
+    for name in ("vllm", "vllm.models", "vllm.models.glm5next", "vllm.models.glm5next.common"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "vllm.models.glm5next.common.kda", module)
+    glm5_batch_invariance._no_kda_prefill_checkpoints()
+    assert Glm5NextLinearAttention().get_kv_cache_spec(None) == Spec(0, None)
