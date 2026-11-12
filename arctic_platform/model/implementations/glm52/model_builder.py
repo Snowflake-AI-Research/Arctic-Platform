@@ -28,7 +28,10 @@ from arctic_platform.model.implementations.moe.conversion_cache import conversio
 from arctic_platform.model.implementations.moe.conversion_cache import conversion_cache_ready
 from arctic_platform.model.implementations.moe.conversion_cache import ensure_node_local_conversion_cache
 from arctic_platform.model.implementations.moe.conversion_cache import resolve_conversion_cache_path
+from arctic_platform.model.implementations.moe.conversion_cache import resolve_ready_conversion_cache_path
 from arctic_platform.model.implementations.moe.distributed.ep_backend import uses_dispatch_ep
+from arctic_platform.model.implementations.moe.hf_loader import load_hf_weights
+from arctic_platform.model.implementations.moe.hf_loader import supports_direct_hf_loading
 from arctic_platform.model.implementations.moe.layers.checkpointing import get_supported_targets
 from arctic_platform.model.implementations.moe.layers.checkpointing import set_selective_activation_checkpointing
 from arctic_platform.model.implementations.moe.layers.checkpointing import supports_selective_activation_checkpointing
@@ -312,6 +315,20 @@ def prepare_weight_conversion(
     return snapshot_path
 
 
+def _select_hf_load_source(
+    model: nn.Module, config: ModelConfig, source_path: Path
+) -> tuple[bool, Path | None]:
+    """Select direct HF loading or an existing ready cache before attempting conversion."""
+    if not isinstance(model, PreTrainedModelPrimeRL) or not supports_direct_hf_loading(model):
+        return False, None
+    snapshot_keys = dict.fromkeys(load_state_dict_keys(source_path))
+    model_keys = dict.fromkeys(model.state_dict().keys())
+    if not (model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys)):
+        return False, None
+    cache_path = resolve_ready_conversion_cache_path(config, source_path, "prime")
+    return cache_path is None, cache_path
+
+
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)
@@ -334,9 +351,11 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
 
     snapshot_path = resolve_weight_source(config)
     world = get_world()
-    converted_path = prepare_weight_conversion(
-        model, config, snapshot_path, rank=world.rank, local_rank=world.local_rank
-    )
+    direct_hf_load, converted_path = _select_hf_load_source(model, config, snapshot_path)
+    if not direct_hf_load and converted_path is None:
+        converted_path = prepare_weight_conversion(
+            model, config, snapshot_path, rank=world.rank, local_rank=world.local_rank
+        )
 
     torch.distributed.barrier()
     if converted_path is not None and not conversion_cache_ready(converted_path):
@@ -348,22 +367,25 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     if converted_path is not None:
         snapshot_path = converted_path
 
-    logger.info(f"Loading weights using HF DCP from {snapshot_path}")
+    logger.info(f"Loading weights using {'direct HF loading' if direct_hf_load else 'HF DCP'} from {snapshot_path}")
     load_dcp_start_time = time.perf_counter()
     state_dict = model.state_dict()
     state_dict = strip_lora_from_state_dict(state_dict)
     if model.config.tie_word_embeddings:
         del state_dict["lm_head.weight"]
-    dcp_load(
-        state_dict,
-        storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
-    )
+    if direct_hf_load:
+        load_hf_weights(state_dict, snapshot_path, model.convert_layer_to_prime)
+    else:
+        dcp_load(
+            state_dict,
+            storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
+        )
     if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:
         model.tie_weights()
     _init_buffers_post_meta(model)
 
     _move_buffers_to_cuda(model, config)
-    logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
+    logger.debug(f"Loaded weights in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
 
 
 def _reset_runtime_moe_buffers(model: nn.Module) -> None:

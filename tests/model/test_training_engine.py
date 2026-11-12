@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 
 import pytest
 import torch
@@ -706,6 +707,60 @@ def test_initialize_splits_expert_groups_and_respects_glm_optimizer_choice(
     assert optimizer.param_groups == [{"params": [], "name": "experts"}]
 
 
+@pytest.mark.parametrize("model_type", ["glm_moe_dsa", "glm5_next_text"])
+@pytest.mark.parametrize(
+    "name,fused,expected",
+    [
+        ("AdamW", None, "deepspeed_cpu_adam"),
+        ("AdamW", True, "deepspeed_cpu_adam"),
+        ("AdamW", False, "deepspeed_cpu_adam_nonfused"),
+        ("torch_adamw", None, "deepspeed_cpu_adam_nonfused"),
+        ("cpu_adam", False, "deepspeed_cpu_adam"),
+    ],
+)
+def test_glm_preserves_cpu_offload_optimizer_choice(monkeypatch, tmp_path, model_type, name, fused, expected):
+    native_ops = object()
+    calls = {}
+
+    class _CPUAdam(torch.optim.Optimizer):
+        def __init__(self, param_groups, **kwargs):
+            super().__init__(param_groups, {})
+            self.adam_w_mode = kwargs["adamw_mode"]
+            self.fp32_optimizer_states = kwargs["fp32_optimizer_states"]
+            self.ds_opt_adam = native_ops
+
+    def _initialize(*, model, config, **kwargs):
+        calls["config"] = config
+        calls["optimizer"] = kwargs["optimizer"]
+        return "engine", kwargs["optimizer"], None, None
+
+    monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
+    monkeypatch.setattr("deepspeed.initialize", _initialize)
+    monkeypatch.setattr("deepspeed.ops.adam.DeepSpeedCPUAdam", _CPUAdam)
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    ds_config = deepcopy(_OFFLOAD)
+    supplied_config = deepcopy(ds_config)
+
+    _, optimizer, choice = initialize_training_engine(
+        torch.nn.Linear(2, 2, bias=False),
+        ds_config,
+        optimizer=OptimizerSettings(name=name, fused=fused),
+        ep_size=1,
+        mpu=None,
+        model_path=str(tmp_path),
+        rank=0,
+    )
+
+    assert choice["implementation"] == expected
+    assert calls["optimizer"] is optimizer
+    assert calls["config"] is ds_config
+    assert ds_config == supplied_config
+    if expected == "deepspeed_cpu_adam":
+        assert optimizer.ds_opt_adam is native_ops
+    else:
+        assert optimizer.ds_opt_adam.native_ops is native_ops
+
+
 @pytest.mark.parametrize("force_cpu_optimizer", [None, True, False])
 def test_initialize_cpu_offload_honors_explicit_nonfused_policy(monkeypatch, force_cpu_optimizer):
     calls = {}
@@ -894,6 +949,9 @@ def test_nonfused_cpu_adam_bounds_updates_with_exact_partition_parity(
     def bounded_adamw(parameters, gradients, first_moments, second_moments, max_moments, steps, **kwargs):
         calls.append((parameters[0].numel(), steps[0].item()))
         assert parameters[0].numel() <= 5
+        assert gradients[0].numel() <= 5
+        for chunk, original in zip((parameters[0], first_moments[0], second_moments[0]), (parameter, *moments)):
+            assert chunk.untyped_storage().data_ptr() == original.untyped_storage().data_ptr()
         return adamw(parameters, gradients, first_moments, second_moments, max_moments, steps, **kwargs)
 
     monkeypatch.setattr(cpu_adam, "adamw", bounded_adamw)
@@ -923,20 +981,22 @@ def test_nonfused_cpu_adam_bounds_updates_with_exact_partition_parity(
         cpu_adam._NonfusedAdamWOps(None).adam_update(
             0, step, 0.003, 0.8, 0.95, 1e-6, weight_decay, True, parameter, gradient, *moments
         )
-        torch_assert_equal(parameter, expected)
+        torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
         for actual, baseline in zip(moments, expected_moments):
-            torch_assert_equal(actual, baseline)
+            torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
         assert sum(count for count, _ in calls) == elements
         assert all(counter == step - 1 for _, counter in calls)
 
 
-@pytest.mark.parametrize("layout", ["matrix", "parameter_view", "gradient_view", "moment_view"])
+@pytest.mark.parametrize(
+    "layout", ["matrix", "parameter_view", "gradient_view", "first_moment_view", "second_moment_view", "offset_view"]
+)
 def test_nonfused_cpu_adam_preserves_matrix_and_strided_updates(monkeypatch, layout):
     from torch.optim.adamw import adamw
 
     from arctic_platform.common import cpu_adam
 
-    monkeypatch.setattr(cpu_adam, "_UPDATE_CHUNK_ELEMENTS", 5)
+    monkeypatch.setattr(cpu_adam, "_UPDATE_CHUNK_ELEMENTS", 5, raising=False)
     parameter = torch.linspace(-0.25, 0.25, 21).reshape(3, 7)
     gradient = torch.linspace(-0.3, 0.4, 21).reshape(3, 7)
     moments = [torch.zeros_like(parameter) for _ in range(2)]
@@ -948,8 +1008,12 @@ def test_nonfused_cpu_adam_preserves_matrix_and_strided_updates(monkeypatch, lay
         parameter = strided_view(parameter)
     elif layout == "gradient_view":
         gradient = strided_view(gradient)
-    elif layout == "moment_view":
-        moments = [strided_view(moment) for moment in moments]
+    elif layout == "first_moment_view":
+        moments[0] = strided_view(moments[0])
+    elif layout == "second_moment_view":
+        moments[1] = strided_view(moments[1])
+    elif layout == "offset_view":
+        parameter = torch.cat((torch.zeros(1), parameter.view(-1), torch.zeros(1)))[1:-1].view(3, 7)
     expected = parameter.clone()
     expected_moments = [moment.clone() for moment in moments]
     calls = []
@@ -984,10 +1048,38 @@ def test_nonfused_cpu_adam_preserves_matrix_and_strided_updates(monkeypatch, lay
         cpu_adam._NonfusedAdamWOps(None).adam_update(
             0, step, 0.003, 0.8, 0.95, 1e-6, 0.1, True, parameter, gradient, *moments
         )
-        assert calls == ([5, 5, 5, 5, 1] if layout == "matrix" else [21])
-        torch_assert_equal(parameter, expected)
+        assert calls == ([5, 5, 5, 5, 1] if layout in ("matrix", "offset_view") else [21])
+        torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
         for actual, baseline in zip(moments, expected_moments):
-            torch_assert_equal(actual, baseline)
+            torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
+        if layout == "offset_view":
+            storage = parameter.as_strided((23,), (1,), storage_offset=0)
+            assert storage[0].item() == storage[-1].item() == 0
+
+
+def test_nonfused_cpu_adam_default_bound_splits_real_sized_partition(monkeypatch):
+    from torch.optim.adamw import adamw
+
+    from arctic_platform.common import cpu_adam
+
+    elements = cpu_adam._UPDATE_CHUNK_ELEMENTS + 1
+    parameter = torch.zeros(elements)
+    gradient = torch.ones_like(parameter, dtype=torch.bfloat16)
+    moments = [torch.zeros_like(parameter) for _ in range(2)]
+    calls = []
+
+    def observed_adamw(parameters, gradients, *args, **kwargs):
+        calls.append((parameters[0].numel(), gradients[0].dtype))
+        return adamw(parameters, gradients, *args, **kwargs)
+
+    monkeypatch.setattr(cpu_adam, "adamw", observed_adamw)
+    cpu_adam._NonfusedAdamWOps(None).adam_update(
+        0, 1, 0.003, 0.8, 0.95, 1e-6, 0.1, True, parameter, gradient, *moments
+    )
+    assert calls == [(cpu_adam._UPDATE_CHUNK_ELEMENTS, torch.float32), (1, torch.float32)]
+    torch.testing.assert_close(parameter[:-1], parameter[-1].expand(elements - 1), rtol=0, atol=0)
+    for moment in moments:
+        torch.testing.assert_close(moment[:-1], moment[-1].expand(elements - 1), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
