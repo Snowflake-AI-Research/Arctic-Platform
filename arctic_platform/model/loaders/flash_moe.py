@@ -90,6 +90,14 @@ class Glm5NextOptions(FlashMoeOptions):
             " 'vllm_op': each vLLM kernel's gradient is that of its reference math at the kernel's exact inputs."
         ),
     )
+    vllm_aligned_prefill_chunk: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Experimental, with vllm_aligned. The sampler's ARCTIC_PREFILL_CHUNK_ALIGN, its max_num_batched_tokens"
+            " set to the same size: prompts are then prefilled that many tokens at a time, as the sampler cuts them."
+        ),
+    )
 
 
 class _FlashLoadOptions(Qwen3_5MoeOptions):
@@ -97,6 +105,7 @@ class _FlashLoadOptions(Qwen3_5MoeOptions):
     vllm_aligned: bool = False
     vllm_aligned_tensor_parallel: int = 1
     vllm_aligned_backward: str = "stock"
+    vllm_aligned_prefill_chunk: int = 0
 
 
 def _matches(family: str):
@@ -213,6 +222,7 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
             ep_group=(ctx.parallel_groups or {}).get("ep_group"),
             tensor_parallel=options.vllm_aligned_tensor_parallel,
             backward=options.vllm_aligned_backward,
+            prefill_chunk=options.vllm_aligned_prefill_chunk,
         )
     return loaded
 

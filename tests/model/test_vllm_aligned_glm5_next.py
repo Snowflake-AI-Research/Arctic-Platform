@@ -514,3 +514,18 @@ def test_lm_head_logits_are_the_ranks_vocabulary_slices(monkeypatch):
     four = ops.lm_head_logprobs_kernel(hidden, weight, labels, 1.0, 8, 64, tensor_parallel=4)
     assert shapes == [(32, 4)] * 4
     assert torch.allclose(one, four)
+
+
+def test_prefill_rounds_cut_each_prompt_every_chunk_tokens_from_its_start():
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import _prefill_rounds
+
+    rounds = _prefill_rounds([0, 5, 8], [4, 3, 10], 4, torch.device("cpu"))
+    assert [r.rows.tolist() for r in rounds] == [
+        [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11],
+        [12, 13, 14, 15],
+        [16, 17],
+    ]
+    assert [r.cu.tolist() for r in rounds] == [[0, 4, 7, 11], [0, 4], [0, 2]]
+    assert [r.slots.tolist() for r in rounds] == [[1, 2, 3], [3], [3]]
+    assert [r.has_initial_state.tolist() for r in rounds] == [[False] * 3, [True], [True]]
+    assert all(r.cu.dtype == torch.int32 and r.slots.dtype == torch.int32 for r in rounds)

@@ -192,8 +192,9 @@ def _length_bucket(n: int) -> int:
 
 def _kda_conv_kernel(qkv: torch.Tensor, conv_weight: torch.Tensor, *, layout: Any, trace: dict | None = None,
                      **_) -> torch.Tensor:  # fmt: skip
-    """vLLM's q|k|v causal conv with SiLU: ``causal_conv1d_fn`` over each prompt from a zero state, then the decode
-    steps' ``causal_conv1d_update`` from the request's conv state slot. ``[tokens, 3 * projection]``.
+    """vLLM's q|k|v causal conv with SiLU: ``causal_conv1d_fn`` over each prompt (chunk by chunk, each resuming from
+    the conv state the previous chunk left, with a prefill chunk size), then the decode steps'
+    ``causal_conv1d_update`` from the request's conv state slot. ``[tokens, 3 * projection]``.
 
     The decoded tokens of every request go through one varlen ``causal_conv1d_update``: its per-token arithmetic is a
     decode step's, the window carried in registers instead of the state slot (bitwise equal to a call per step)."""
@@ -202,23 +203,26 @@ def _kda_conv_kernel(qkv: torch.Tensor, conv_weight: torch.Tensor, *, layout: An
 
     # State slot 0 is vLLM's null block, which the conv kernel treats as padding, so the slots start at 1.
     conv_states = qkv.new_zeros((layout.num_seqs + 1, qkv.shape[-1], conv_weight.shape[-1] - 1))
-    qkv_p = qkv if layout.prompt_rows is None else qkv[layout.prompt_rows]
-    conv_p = causal_conv1d_fn(
-        qkv_p.transpose(0, 1),
-        conv_weight,
-        None,
-        activation="silu",
-        conv_states=conv_states,
-        has_initial_state=torch.zeros(layout.num_seqs, dtype=torch.bool, device=qkv.device),
-        cache_indices=layout.slots,
-        query_start_loc=layout.prompt_cu,
-    ).transpose(0, 1)
-    if trace is not None:
-        trace.update(conv_in=qkv_p.transpose(0, 1), conv_weight=conv_weight, conv_out=conv_p)
-    if layout.prompt_rows is None:
-        return conv_p
-    conv = qkv.new_empty(qkv.shape)
-    conv[layout.prompt_rows] = conv_p
+    conv = None if layout.prompt_rows is None and len(layout.rounds) == 1 else qkv.new_empty(qkv.shape)
+    for chunk in layout.rounds:
+        qkv_p = qkv if chunk.rows is None else qkv[chunk.rows]
+        conv_p = causal_conv1d_fn(
+            qkv_p.transpose(0, 1),
+            conv_weight,
+            None,
+            activation="silu",
+            conv_states=conv_states,
+            has_initial_state=chunk.has_initial_state,
+            cache_indices=chunk.slots,
+            query_start_loc=chunk.cu,
+        ).transpose(0, 1)
+        if conv is None:
+            if trace is not None:
+                trace.update(conv_in=qkv_p.transpose(0, 1), conv_weight=conv_weight, conv_out=conv_p)
+            return conv_p
+        conv[chunk.rows] = conv_p
+    if layout.decode_rows is None:
+        return conv
     rows = layout.decode_rows
     # The length bound is a compile-time constant of the kernel; bucketing it bounds the recompiles.
     conv[rows] = causal_conv1d_update(qkv[rows], conv_states, conv_weight, None, activation="silu",
@@ -241,29 +245,36 @@ def _kda_core_kernel(q, k, v, g, beta, a_log, dt_bias, *, layout: Any, lower_bou
     from vllm.models.glm5next.nvidia.ops.third_party.kda import fused_recurrent_kda
 
     heads, head_dim = q.shape[2:]
-    rows_p = layout.prompt_rows
-    q_p, k_p, v_p, g_p = (t if rows_p is None else t[:, rows_p] for t in (q, k, v, g))
-    beta_p = beta if rows_p is None else beta[rows_p]
-    q_p, k_p, v_p = (t.contiguous() for t in (q_p, k_p, v_p))
-    if trace is not None:
-        trace.update(q=q_p, k=k_p, v=v_p, g=g_p, beta=beta_p.unsqueeze(0))
-    prompt_tokens, num_seqs = q_p.shape[1], layout.num_seqs
-    state = torch.zeros((num_seqs, heads, head_dim, head_dim), dtype=torch.float32, device=q.device)
-    final_state = torch.empty_like(state)
-    workspace = torch.empty(torch.ops._flashkda_C.get_workspace_size(prompt_tokens, heads, num_seqs),
-                            dtype=torch.uint8, device=q.device)  # fmt: skip
-    core_p = torch.empty((1, prompt_tokens, heads, head_dim), dtype=q.dtype, device=q.device)
-    torch.ops._flashkda_C.fwd(
-        q_p, k_p, v_p, g_p.contiguous(), beta_p.unsqueeze(0), head_dim**-0.5, core_p, workspace,
-        a_log, dt_bias.view(-1, head_dim), lower_bound,
-        state, final_state, layout.prompt_cu.contiguous(), None, None,
-    )  # fmt: skip
-    if rows_p is None:
-        return core_p
-    core = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    core[:, rows_p] = core_p
+    num_seqs = layout.num_seqs
+    # The fp32 recurrent state of each request's slot; slot 0 is the null block.
     recurrent = torch.zeros((num_seqs + 1, heads, head_dim, head_dim), dtype=torch.float32, device=q.device)
-    recurrent[1:] = final_state
+    single = layout.prompt_rows is None and len(layout.rounds) == 1
+    core = None if single else torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    for chunk in layout.rounds:
+        rows_p = chunk.rows
+        q_p, k_p, v_p, g_p = (t if rows_p is None else t[:, rows_p] for t in (q, k, v, g))
+        beta_p = beta if rows_p is None else beta[rows_p]
+        q_p, k_p, v_p = (t.contiguous() for t in (q_p, k_p, v_p))
+        if trace is not None and len(layout.rounds) == 1:
+            trace.update(q=q_p, k=k_p, v=v_p, g=g_p, beta=beta_p.unsqueeze(0))
+        prompt_tokens, chunk_seqs = q_p.shape[1], chunk.slots.numel()
+        slots = chunk.slots.long()
+        state = recurrent[slots]
+        final_state = torch.empty_like(state)
+        workspace = torch.empty(torch.ops._flashkda_C.get_workspace_size(prompt_tokens, heads, chunk_seqs),
+                                dtype=torch.uint8, device=q.device)  # fmt: skip
+        core_p = torch.empty((1, prompt_tokens, heads, head_dim), dtype=q.dtype, device=q.device)
+        torch.ops._flashkda_C.fwd(
+            q_p, k_p, v_p, g_p.contiguous(), beta_p.unsqueeze(0), head_dim**-0.5, core_p, workspace,
+            a_log, dt_bias.view(-1, head_dim), lower_bound,
+            state, final_state, chunk.cu.contiguous(), None, None,
+        )  # fmt: skip
+        if core is None:
+            return core_p
+        core[:, rows_p] = core_p
+        recurrent[slots] = final_state
+    if layout.decode_rows is None:
+        return core
     rows = layout.decode_rows
     slots = layout.slots[:, None].expand(num_seqs, max(layout.decode_max, 1)).contiguous()
     out, _ = fused_recurrent_kda(
@@ -314,8 +325,10 @@ def _kda_weights(attn: Any, tp: int = 1, rank: int = 0) -> Any:
 
 
 def kda_forward(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any,
-                prompt_lens: torch.Tensor | None = None, trace: dict | None = None, tp: int = 1) -> torch.Tensor:  # fmt: skip
-    """vLLM's ``Glm5NextLinearAttention`` on packed requests: each prompt prefilled whole, then the rest decoded.
+                prompt_lens: torch.Tensor | None = None, trace: dict | None = None, tp: int = 1,
+                prefill_chunk: int = 0) -> torch.Tensor:  # fmt: skip
+    """vLLM's ``Glm5NextLinearAttention`` on packed requests: each prompt prefilled (whole, or ``prefill_chunk``
+    tokens at a time as the sampler's ``ARCTIC_PREFILL_CHUNK_ALIGN`` cuts it), then the rest decoded.
 
     ``x`` is ``[tokens, hidden]`` (the layer input after the hyper-connection pre-norm), ``cu_seqlens`` the int32
     request boundaries and ``prompt_lens`` how many leading tokens of each request were prefilled (all by default).
@@ -328,12 +341,32 @@ def kda_forward(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
     ``o_proj`` partials are all-reduced (:func:`tp_sum`).
     """
     partials = [_kda_rank(_kda_weights(attn, tp, rank), x, cu_seqlens, config, prompt_lens,
-                          trace if rank == 0 else None) for rank in range(tp)]  # fmt: skip
+                          trace if rank == 0 else None, prefill_chunk) for rank in range(tp)]  # fmt: skip
     return tp_sum(partials)
 
 
+def _prefill_rounds(starts: list[int], prompt_lens: list[int], chunk: int, device: torch.device) -> list[Any]:
+    """The prompts' prefill cut every ``chunk`` tokens from the sequence start: round ``r`` is every request's chunk
+    ``r`` (its token rows, ``cu`` boundaries, state slots, and whether it resumes from an earlier chunk's state).
+    Requests are independent in the batch-invariant kernels, so which requests share a step does not matter."""
+    import types
+
+    rounds = []
+    for r in range(-(-max(prompt_lens) // chunk)):
+        seqs = [s for s, n in enumerate(prompt_lens) if n > r * chunk]
+        pieces = [(starts[s] + r * chunk, starts[s] + min((r + 1) * chunk, prompt_lens[s])) for s in seqs]
+        sizes = torch.tensor([hi - lo for lo, hi in pieces], dtype=torch.int32)
+        rounds.append(types.SimpleNamespace(
+            rows=torch.cat([torch.arange(lo, hi) for lo, hi in pieces]).to(device),
+            cu=torch.cat([sizes.new_zeros(1), torch.cumsum(sizes, 0, dtype=torch.int32)]).to(device),
+            slots=torch.tensor([s + 1 for s in seqs], dtype=torch.int32, device=device),
+            has_initial_state=torch.full((len(seqs),), r > 0, dtype=torch.bool, device=device),
+        ))  # fmt: skip
+    return rounds
+
+
 def _kda_rank(w: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, prompt_lens: torch.Tensor | None,
-              trace: dict | None) -> torch.Tensor:  # fmt: skip
+              trace: dict | None, prefill_chunk: int = 0) -> torch.Tensor:  # fmt: skip
     import types
 
     heads, head_dim = w.heads, w.head_dim
@@ -341,6 +374,9 @@ def _kda_rank(w: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, pr
     tokens, num_seqs = x.shape[0], cu_seqlens.numel() - 1
     starts, lengths = cu_seqlens[:-1].long(), (cu_seqlens[1:] - cu_seqlens[:-1]).long()
     prompt_lens = lengths if prompt_lens is None else prompt_lens.long()
+    if prefill_chunk > 0:
+        # vLLM runs a one-token chunk as a decode step.
+        prompt_lens = prompt_lens - ((prompt_lens > 1) & (prompt_lens % prefill_chunk == 1)).long()
     decode_rows = decode_cu = decode_max = None
     if bool((prompt_lens < lengths).any()):
         seq_of_token = torch.repeat_interleave(torch.arange(num_seqs, device=x.device), lengths)
@@ -353,10 +389,14 @@ def _kda_rank(w: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, pr
         decode_max = int(decode_lens.max())
     else:
         prompt_rows, prompt_cu = None, cu_seqlens
+    slots = torch.arange(1, num_seqs + 1, dtype=torch.int32, device=x.device)
+    rounds = [types.SimpleNamespace(rows=prompt_rows, cu=prompt_cu, slots=slots,
+                                    has_initial_state=torch.zeros(num_seqs, dtype=torch.bool, device=x.device))]  # fmt: skip
+    if prefill_chunk > 0 and int(prompt_lens.max()) > prefill_chunk:
+        rounds = _prefill_rounds(starts.tolist(), prompt_lens.tolist(), prefill_chunk, x.device)
     layout = types.SimpleNamespace(num_seqs=num_seqs, starts=starts, lengths=lengths, prompt_lens=prompt_lens,
                                    prompt_rows=prompt_rows, prompt_cu=prompt_cu, decode_rows=decode_rows,
-                                   decode_cu=decode_cu, decode_max=decode_max,
-                                   slots=torch.arange(1, num_seqs + 1, dtype=torch.int32, device=x.device))  # fmt: skip
+                                   decode_cu=decode_cu, decode_max=decode_max, slots=slots, rounds=rounds)  # fmt: skip
     projected = _linear(x, w.merged)
     qkv, beta, f_a, g_a = projected.split([3 * projection, heads, head_dim, head_dim], dim=-1)
     g1 = _linear(f_a, w.f_b).reshape(1, tokens, heads, head_dim)
@@ -681,7 +721,8 @@ def _mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     prompt_lens = getattr(ctx, "prompt_lens", None)
     tp = getattr(ctx, "tp", 1)
     if layer.block_type == "linear_attention":
-        return kda_forward(layer.self_attn, x, ctx.cu_seqlens, ctx.config, prompt_lens, tp=tp)
+        return kda_forward(layer.self_attn, x, ctx.cu_seqlens, ctx.config, prompt_lens, tp=tp,
+                           prefill_chunk=getattr(ctx, "prefill_chunk", 0))
     return mla_attention(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config, _record(ctx, layer), tp=tp)
 
 
@@ -1266,7 +1307,8 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
                                 prompt_lens=prompt_lengths(trained, cu),
                                 replay={} if torch.is_grad_enabled() else None,
                                 ep_group=getattr(model, "_vllm_aligned_ep_group", None),
-                                tp=getattr(model, "_vllm_aligned_tensor_parallel", 1))  # fmt: skip
+                                tp=getattr(model, "_vllm_aligned_tensor_parallel", 1),
+                                prefill_chunk=getattr(model, "_vllm_aligned_prefill_chunk", 0))  # fmt: skip
     mode = getattr(model, "_vllm_aligned_backward", "stock")
     if mode == "vllm_op":
         ctx.keep_moe_out = ctx.replay is not None
@@ -1336,15 +1378,20 @@ def check_tensor_parallel(config: Any, tp: int) -> None:
 
 
 def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_fp32: bool = False,
-                                 ep_group: Any = None, tensor_parallel: int = 1, backward: str = "stock") -> None:  # fmt: skip
+                                 ep_group: Any = None, tensor_parallel: int = 1, backward: str = "stock",
+                                 prefill_chunk: int = 0) -> None:  # fmt: skip
     """Make a GLM-5.3-Flash model's ``dss_compute_logprobs`` forward compute the batch-invariant sampler's logprobs.
 
     ``tensor_parallel`` is the sampler's TP size: every rank's share of the split layers runs on its own weight shard,
     and the partial sums are reduced as vLLM's batch-invariant all-reduce reduces them. ``backward`` is ``"stock"``
     (each layer's backward recomputes the stock layer on the layer's input), ``"vllm"`` (each sublayer's gradient is
     taken at the aligned forward's exact values, :func:`_vllm_backward_runner`) or ``"vllm_op"`` (each vLLM kernel's
-    gradient is its reference math's at its exact inputs, :func:`_per_op_backward_runner`).
+    gradient is its reference math's at its exact inputs, :func:`_per_op_backward_runner`). ``prefill_chunk`` is the
+    sampler's ``ARCTIC_PREFILL_CHUNK_ALIGN`` with a token budget of that size, so every prompt is prefilled that many
+    tokens at a time from the sequence start (the KDA layers resume each chunk from the state the previous one left).
     """
+    if prefill_chunk < 0:
+        raise ValueError("prefill_chunk must be non-negative")
     if backward not in ("stock", "vllm", "vllm_op"):
         raise ValueError(f"backward must be 'stock', 'vllm' or 'vllm_op', got {backward!r}")
     import types
@@ -1362,6 +1409,7 @@ def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_f
     model._vllm_aligned_ep_group = ep_group
     model._vllm_aligned_tensor_parallel = int(tensor_parallel)
     model._vllm_aligned_backward = backward
+    model._vllm_aligned_prefill_chunk = int(prefill_chunk)
     model._vllm_aligned_token_chunk_size = int(token_chunk_size)
     model._vllm_aligned_lm_head_fp32 = bool(lm_head_fp32)
     model._vllm_aligned_stock_forward = model.forward
