@@ -56,7 +56,7 @@ ROLLOUT_NAME=arctic
 USE_ARCTIC_RL=True
 USE_ARCTIC_ZORRO=True
 COLOCATE=True
-ARCTIC_ZERO_STAGE=3
+ARCTIC_ZERO_STAGE=2
 
 # colocate=True: training + sampling span all NGPU_PER_JOB bundles. log_prob off (no-KL + Zorro recompute).
 NGPU_PER_JOB=$((NGPU_PER_NODE*NNODES))

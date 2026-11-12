@@ -54,10 +54,37 @@ def test_bfloat16_job_reduces_gradients_in_float32_with_bf16_masters():
     assert ds_config["communication_data_type"] == "fp32"
     assert ds_config["train_micro_batch_size_per_gpu"] == 1
     assert ds_config["gradient_accumulation_steps"] == 1
+    assert ds_config["managed_gradient_accumulation"] is True
     assert ds_config["train_batch_size"] == 4
     assert ds_config["zero_optimization"] == {"stage": 2}
     assert "seed" not in ds_config
     assert "sequence_parallel_size" not in ds_config
+
+
+def test_unmanaged_gradient_accumulation_is_an_engine_contract():
+    ds_config = build_deepspeed_config(
+        _spec(
+            managed_gradient_accumulation=False,
+            ds_overrides={"managed_gradient_accumulation": True},
+        )
+    )
+
+    assert ds_config["managed_gradient_accumulation"] is False
+
+
+def test_batch_knobs_apply_only_to_managed_accumulation():
+    knobs = dict(train_micro_batch_size_per_gpu=2, gradient_accumulation_steps=3, train_batch_size=24)
+
+    managed = build_deepspeed_config(_spec(world_size=4, **knobs))
+    assert managed["train_micro_batch_size_per_gpu"] == 2
+    assert managed["gradient_accumulation_steps"] == 3
+    assert managed["train_batch_size"] == 24
+
+    # Unmanaged accumulation: the caller's token budget sets the packet and loop count, so the knobs are ignored.
+    unmanaged = build_deepspeed_config(_spec(world_size=4, managed_gradient_accumulation=False, **knobs))
+    assert unmanaged["train_micro_batch_size_per_gpu"] == 1
+    assert unmanaged["gradient_accumulation_steps"] == 1
+    assert unmanaged["train_batch_size"] == 4
 
 
 def test_float32_job_disables_reduced_precision_and_leaves_the_reduction_unset():

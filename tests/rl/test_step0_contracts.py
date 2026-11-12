@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Step-0 contracts: arity, isolation, packed inner call, decorator storage."""
+"""Step-0 contracts: arity, isolation of the unpadded and packed forward, decorator storage."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ import arctic_platform.sft.processor  # noqa: F401
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import PACKED_LOSS_REDUCTION_ATTR
 from arctic_platform.common.registry import POST_PROCESSORS
+from arctic_platform.common.unpacked_gas import run_unpacked_gas
 from arctic_platform.rl.processors.grpo import grpo_echo_v1_loss
 from arctic_platform.rl.processors.grpo import grpo_loss
 from arctic_platform.rl.processors.packed_reduction import PackedLossReduction
@@ -202,7 +203,6 @@ class TestIsolation(TestCasePlus):
             {"loss_fn": None, "post": ["identity"], "config": {}},
             "cpu",
             backward=False,
-            pack=False,
         )
         self.assertIsNotNone(engine.last_kwargs)
         self.assertNotIn("advantages", engine.last_kwargs)
@@ -227,7 +227,6 @@ class TestIsolation(TestCasePlus):
                 {"loss_fn": None, "post": [], "config": {}},
                 "cpu",
                 backward=False,
-                pack=False,
             )
         self.assertIn("meta-only", str(ctx.exception))
 
@@ -246,9 +245,89 @@ class TestIsolation(TestCasePlus):
                 {"loss_fn": None, "post": [], "config": {}},
                 "cpu",
                 backward=False,
-                pack=False,
             )
         self.assertIn("attention_mask", str(ctx.exception))
+
+    def test_unpadded_batch_requires_position_ids_without_drop_contract(self):
+        engine = _StubEngine()
+        with self.assertRaisesRegex(ValueError, "position_ids"):
+            run_pipeline(
+                engine,
+                (),
+                {
+                    "input_ids": torch.tensor([[1, 2, 0]]),
+                    "attention_mask": torch.tensor([[1, 1, 0]]),
+                },
+                {"pad_token_id": 0},
+                {"loss_fn": None, "post": [], "config": {}},
+                "cpu",
+                backward=False,
+            )
+
+    def test_drop_position_ids_reconstructs_canonical_positions(self):
+        engine = _StubEngine()
+        run_pipeline(
+            engine,
+            (),
+            {
+                "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
+                "attention_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]),
+            },
+            {"pad_token_id": 0, "drop_position_ids": True},
+            {"loss_fn": None, "post": [], "config": {}},
+            "cpu",
+            backward=False,
+        )
+        self.assertTrue(
+            torch.equal(
+                engine.last_kwargs["position_ids"],
+                torch.tensor([[0, 1, 0, 1, 2]]),
+            )
+        )
+
+    def test_ap_normalizes_liger_forward_without_an_engine_wrapper(self):
+        def liger_forward():
+            pass
+
+        liger_forward.__module__ = "liger_kernel.transformers.test_model"
+
+        padded_engine = _StubEngine()
+        padded_engine.module = SimpleNamespace(forward=liger_forward)
+        padded_batch = {
+            "input_ids": torch.tensor([[1, 2, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 0]]),
+            "position_ids": torch.tensor([[0, 1, 0]]),
+            "labels": torch.tensor([[2, 3, -100]]),
+        }
+        run_pipeline(
+            padded_engine,
+            (),
+            padded_batch,
+            {"pad_token_id": 0},
+            {"loss_fn": None, "post": [], "config": {}},
+            "cpu",
+            backward=False,
+        )
+        self.assertIs(padded_engine.last_kwargs["skip_logits"], False)
+        self.assertNotIn("labels", padded_engine.last_kwargs)
+
+        packed_engine = _StubEngine()
+        packed_engine.module = SimpleNamespace(forward=liger_forward)
+        run_pipeline(
+            packed_engine,
+            (),
+            {
+                "input_ids": torch.tensor([[1, 2]]),
+                "position_ids": torch.tensor([[0, 1]]),
+                "labels": torch.tensor([[2, 3]]),
+            },
+            {"cu_seqlens": torch.tensor([0, 2], dtype=torch.int32)},
+            {"loss_fn": None, "post": [], "config": {}},
+            "cpu",
+            backward=False,
+        )
+        self.assertIs(packed_engine.last_kwargs["skip_logits"], False)
+        self.assertIn("labels", packed_engine.last_kwargs)
 
     def test_missing_loss_fn_raises_when_backward(self):
         engine = _StubEngine()
@@ -267,7 +346,6 @@ class TestIsolation(TestCasePlus):
                 {"post": [], "config": {}},
                 "cpu",
                 backward=True,
-                pack=False,
             )
 
     def test_none_loss_fn_raises_when_backward(self):
@@ -302,7 +380,6 @@ class TestIsolation(TestCasePlus):
             {"loss_fn": None, "post": ["compute_logprobs"], "config": {}},
             "cpu",
             backward=False,
-            pack=False,
             return_tensors=True,
         )
         self.assertIn("logprobs", out["batch"])
@@ -329,7 +406,6 @@ class TestIsolation(TestCasePlus):
             {"loss_fn": "ap_grpo", "post": [], "config": {}},
             "cpu",
             backward=True,
-            pack=False,
         )
         self.assertEqual(engine.backward_scale, [False])
 
@@ -359,13 +435,45 @@ class TestIsolation(TestCasePlus):
                 {"loss_fn": None, "post": ["identity"], "config": {}},
                 "cpu",
                 backward=False,
-                pack=False,
             )
             return engine.conv_out[0, -probe.numel() :]
 
         self.assertTrue(
             torch.equal(probe_output(torch.tensor([1, 2, 3, 4])), probe_output(torch.tensor([5, 6, 1, 3])))
         )
+
+    def test_unpadded_backward_forwards_meta_scalars_and_drops_loss_and_meta_only_inputs(self):
+        engine = _StubEngine()
+        batch = {
+            "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]),
+            "position_ids": torch.tensor([[0, 1, 0, 0], [0, 1, 2, 0]]),
+            "advantages": torch.ones(2, 4),
+            "loss_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool),
+            "old_log_probs_shifted": torch.zeros(2, 4),
+        }
+        meta = {
+            "pad_token_id": 0,
+            "temperature": 0.5,
+            "calculate_entropy": True,
+            "pixel_values": torch.ones(2, 4, 3),
+        }
+        out = run_pipeline(
+            engine,
+            (),
+            batch,
+            meta,
+            {"loss_fn": "ap_grpo", "post": [], "config": {}},
+            "cpu",
+            backward=True,
+        )
+        self.assertIn("avg_loss", out)
+        self.assertEqual(tuple(engine.last_kwargs["input_ids"].shape), (1, 5))
+        self.assertNotIn("advantages", engine.last_kwargs)
+        self.assertNotIn("loss_mask", engine.last_kwargs)
+        self.assertNotIn("pixel_values", engine.last_kwargs)
+        self.assertEqual(engine.last_kwargs["temperature"], 0.5)
+        self.assertIs(engine.last_kwargs["calculate_entropy"], True)
 
 
 class _SegmentedConvEngine(_StubEngine):
@@ -381,8 +489,8 @@ class _SegmentedConvEngine(_StubEngine):
         return outputs
 
 
-class TestPackedInnerCall(TestCasePlus):
-    def test_packing_path_no_typeerror_and_filters_forward(self):
+class TestUnpackedGasCall(TestCasePlus):
+    def test_unpacked_gas_path_no_typeerror_and_filters_forward(self):
         engine = _StubEngine()
         batch = {
             "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
@@ -391,55 +499,24 @@ class TestPackedInnerCall(TestCasePlus):
             "loss_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool),
             "old_log_probs_shifted": torch.zeros(2, 4),
         }
-        meta = {"pad_token_id": 0, "calculate_entropy": False}
-        out = run_pipeline(
+        meta = {"pad_token_id": 0, "drop_position_ids": True, "calculate_entropy": False}
+        out = run_unpacked_gas(
             engine,
-            (),
-            batch,
-            meta,
-            {"loss_fn": "ap_grpo", "post": [], "config": {}},
-            "cpu",
+            gas=2,
+            batch_data=batch,
+            meta_data=meta,
+            processing={"loss_fn": "ap_grpo", "post": [], "config": {}},
             backward=True,
-            pack=True,
-            max_tokens_per_mb=3,
+            device="cpu",
+            step_fn=lambda: None,
         )
         self.assertIn("avg_loss", out)
+        self.assertEqual(engine.backward_scale, [False, False])
         self.assertNotIn("advantages", engine.last_kwargs)
         self.assertNotIn("loss_mask", engine.last_kwargs)
         self.assertIn("input_ids", engine.last_kwargs)
         self.assertIn("position_ids", engine.last_kwargs)
-        self.assertIn("use_cache", engine.last_kwargs)
         self.assertIs(engine.last_kwargs["calculate_entropy"], False)
-
-    def test_pack_forwards_meta_scalar_and_drops_meta_only_model_input(self):
-        engine = _StubEngine()
-        batch = {
-            "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
-            "attention_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]]),
-            "advantages": torch.ones(2, 4),
-            "loss_mask": torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.bool),
-            "old_log_probs_shifted": torch.zeros(2, 4),
-        }
-        meta = {
-            "pad_token_id": 0,
-            "temperature": 0.5,
-            "calculate_entropy": True,
-            "pixel_values": torch.ones(2, 4, 3),
-        }
-        run_pipeline(
-            engine,
-            (),
-            batch,
-            meta,
-            {"loss_fn": "ap_grpo", "post": [], "config": {}},
-            "cpu",
-            backward=True,
-            pack=True,
-            max_tokens_per_mb=3,
-        )
-        self.assertEqual(engine.last_kwargs["temperature"], 0.5)
-        self.assertTrue(engine.last_kwargs["calculate_entropy"])
-        self.assertNotIn("pixel_values", engine.last_kwargs)
 
 
 class TestGrpoContracts(TestCasePlus):
@@ -515,7 +592,6 @@ class TestPostChainWithinCall(TestCasePlus):
                 {"loss_fn": None, "post": ["_step0_write_flag", "_step0_read_flag"], "config": {}},
                 "cpu",
                 backward=False,
-                pack=False,
             )
             self.assertEqual(seen["chain_flag"], 7)
             self.assertEqual(seen["from_model"], 7)
@@ -537,7 +613,6 @@ class TestMetaForwardScalars(TestCasePlus):
                 {"loss_fn": None, "post": [], "config": {}},
                 "cpu",
                 backward=False,
-                pack=False,
             )
 
     def test_one_element_temperature_becomes_a_float_and_bool_is_rejected(self):
@@ -545,7 +620,11 @@ class TestMetaForwardScalars(TestCasePlus):
         run_pipeline(
             engine,
             (),
-            {"input_ids": torch.tensor([[1, 2]]), "attention_mask": torch.ones(1, 2, dtype=torch.long)},
+            {
+                "input_ids": torch.tensor([[1, 2]]),
+                "attention_mask": torch.ones(1, 2, dtype=torch.long),
+                "position_ids": torch.arange(2).view(1, 2),
+            },
             {
                 "temperature": torch.tensor(0.7),
                 "calculate_entropy": torch.tensor(1),
@@ -554,7 +633,6 @@ class TestMetaForwardScalars(TestCasePlus):
             {"loss_fn": None, "post": [], "config": {}},
             "cpu",
             backward=False,
-            pack=False,
         )
         self.assertAlmostEqual(engine.last_kwargs["temperature"], 0.7)
         self.assertIs(engine.last_kwargs["calculate_entropy"], True)
@@ -567,7 +645,6 @@ class TestMetaForwardScalars(TestCasePlus):
                 {"loss_fn": None, "post": [], "config": {}},
                 "cpu",
                 backward=False,
-                pack=False,
             )
 
     def test_inv_temperature_broadcasts_a_scalar_and_slices_a_row(self):

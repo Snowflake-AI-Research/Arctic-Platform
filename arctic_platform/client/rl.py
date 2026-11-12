@@ -31,12 +31,16 @@ from arctic_platform.client.requests import log_probs_request
 class ArcticRLClient(ArcticClient):
     """The blocking RL client. Use `AsyncArcticRLClient` to await calls instead."""
 
+    _allows_zorro_train = True
+
     def log_probs(self, prompts: list, completions: list | None = None, top_k: int = 1) -> dict:
         return self._call(log_probs_request(self.jobs, prompts, completions, top_k))
 
 
 class AsyncArcticRLClient(AsyncArcticClient):
     """The async RL client; what the verl adapter and skyrl recipes await."""
+
+    _allows_zorro_train = True
 
     async def log_probs(self, prompts: list, completions: list | None = None, top_k: int = 1) -> dict:
         return await self._acall(log_probs_request(self.jobs, prompts, completions, top_k))

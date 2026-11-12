@@ -1155,12 +1155,9 @@ def _rebalance_ratio_mask_mass(
     ``ratio_mask_rebalance`` therefore needs exactly one model call per worker, which
     ``_grpo_model_call_count_callback`` (grpo.py) checks before any forward. DSS runs the check once, when it
     prepares the request, on the counts of all shards, and its dispatch gives every shard the same request-wide count.
-    The native paths run it on each worker and do not exchange the verdict: the native worker (deepspeed_worker.py)
-    passes the number of gradient-accumulation microbatches it received, and ``run_pipeline(pack=True)`` (pipeline.py)
-    its number of packed microbatches, which the splitter has first raised to the maximum over the ranks when
-    torch.distributed is initialised (a rank with fewer rows than that maximum fails in the splitter instead). Under
-    data parallelism every worker must therefore see a count of one (one gradient-accumulation step and, with
-    ``pack=True``, every worker's tokens within ``max_tokens_per_mb``): a worker that rejects the request on its own
+    The native worker (deepspeed_worker.py) runs it on each worker and does not exchange the verdict: it passes the
+    number of gradient-accumulation microbatches it received. Under data parallelism every worker must therefore see
+    a count of one (one gradient-accumulation step): a worker that rejects the request on its own
     while a peer has passed the check leaves that peer waiting in this collective until the timeout instead of the
     request failing. A caller that reaches ``cispo_actor_loss_fn`` without that guard, or on only some ranks of the
     group, hangs instead of failing.

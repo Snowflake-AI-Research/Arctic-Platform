@@ -29,6 +29,7 @@ import torch
 
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.common.registry import PUBLIC_LOSS_FNS
+from arctic_platform.common.unpacked_gas import run_unpacked_gas
 from arctic_platform.common.utils.batch import finalize_fwd_bwd_metrics
 from arctic_platform.common.utils.batch import ray_split_batch
 from arctic_platform.common.utils.batch import unpack_batch
@@ -217,7 +218,12 @@ class TestNativeServer(TestCasePlus):
         objective = float(-(request["weights"] * token_logprobs[request["input_ids"]]).sum())
         frame = {
             "kwargs": {"input_ids": request["input_ids"], "attention_mask": request["attention_mask"]},
-            "context": {"loss_mask": request["loss_mask"], WEIGHTS_KEY: request["weights"]},
+            "context": {
+                "loss_mask": request["loss_mask"],
+                WEIGHTS_KEY: request["weights"],
+                "pad_token_id": 0,
+                "drop_position_ids": True,
+            },
             "processing": {"loss_fn": _LOSS, "post": ["compute_logprobs"], "config": {}},
         }
 
@@ -225,7 +231,7 @@ class TestNativeServer(TestCasePlus):
             def remote(self, shard):
                 _, batch, meta, processing = unpack_batch(shard)
                 engine = _TableEngine(token_logprobs.clone().requires_grad_(True))
-                out = run_pipeline(engine, (), batch, meta, processing, "cpu", backward=True, pack=True)
+                out = run_pipeline(engine, (), batch, meta, processing, "cpu", backward=True)
                 return _awaitable({"avg_loss": out["avg_loss"], "metrics": out["metrics"]})
 
         original_get = ray_server.ray.get
@@ -294,22 +300,21 @@ class TestPackedMicrobatches(TestCasePlus):
         request = _request(seed=3)
         token_logprobs = -torch.rand(4 * 8 + 1) * 3.0
         processing = {"loss_fn": _LOSS, "post": [], "config": {}}
-        meta = {"pad_token_id": 0, "batch_num_tokens": 16.0, "dp_size": 2}
+        meta = {"pad_token_id": 0, "drop_position_ids": True, "batch_num_tokens": 16.0, "dp_size": 2}
         expected_objective = float(-(request["weights"] * token_logprobs[request["input_ids"]]).sum())
 
         runs = []
-        for max_tokens_per_mb in (64, 8):
+        for gas in (1, 4):
             engine = _TableEngine(token_logprobs.clone().requires_grad_(True))
-            out = run_pipeline(
+            out = run_unpacked_gas(
                 engine,
-                (),
-                _pipeline_batch(request),
-                meta,
-                processing,
-                "cpu",
+                gas=gas,
+                batch_data=_pipeline_batch(request),
+                meta_data=meta,
+                processing=processing,
                 backward=True,
-                pack=True,
-                max_tokens_per_mb=max_tokens_per_mb,
+                device="cpu",
+                step_fn=lambda: None,
             )
             self.assertTrue(all(scale is False for scale in engine.backward_scales))
             runs.append((len(engine.backward_scales), out, engine.table.grad))
@@ -402,18 +407,25 @@ class TestRejections(TestCasePlus):
                 with self.subTest(name=name, form=form), self.assertRaisesRegex(ValueError, pattern):
                     prepare_request_loss(request)
 
-    def test_a_packed_call_is_rejected_before_the_forward(self):
+    def test_an_unpacked_gas_call_is_rejected_before_the_forward(self):
         for name, (update, config, pattern) in _REJECTIONS.items():
             context = _rejected_context(update)
             batch = {"attention_mask": torch.ones(1, 3, dtype=torch.long)}
-            meta = {"pad_token_id": 0}
+            meta = {"pad_token_id": 0, "drop_position_ids": True}
             for key, value in context.items():
                 # Forward scalars ride on meta; everything else is per token.
                 (meta if key == "temperature" else batch)[key] = value
             processing = {"loss_fn": _LOSS, "post": [], "config": dict(config)}
             with self.subTest(name), self.assertRaisesRegex(ValueError, pattern):
-                run_pipeline(
-                    _RefusingEngine(torch.zeros(9)), (), batch, meta, processing, "cpu", backward=True, pack=True
+                run_unpacked_gas(
+                    _RefusingEngine(torch.zeros(9)),
+                    gas=1,
+                    batch_data=batch,
+                    meta_data=meta,
+                    processing=processing,
+                    backward=True,
+                    device="cpu",
+                    step_fn=lambda: None,
                 )
 
     def test_a_valid_request_passes_every_preflight(self):

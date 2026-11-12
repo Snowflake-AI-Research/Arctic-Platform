@@ -50,6 +50,10 @@ from arctic_platform.common.utils.tiled_logits import (
 )
 from arctic_platform.rl.utils.debug import pr0
 from arctic_platform.rl.utils.debug import see_memory_usage
+from arctic_platform.rl.zorro_train.model_types import MODEL_TYPE_ALIASES as MODEL_TYPE_ALIASES
+from arctic_platform.rl.zorro_train.model_types import MODEL_TYPE_TO_TEXT_BACKBONE_CLASS
+from arctic_platform.rl.zorro_train.model_types import SUPPORTED_MODEL_TYPES as SUPPORTED_MODEL_TYPES
+from arctic_platform.rl.zorro_train.model_types import require_supported_model_type
 from arctic_platform.rl.zorro_train.module_patcher import ModuleReconstructionPatcher
 from arctic_platform.rl.zorro_train.qwen_attention_patcher import QwenAttentionOncePatcher
 from arctic_platform.rl.zorro_train.qwen_attention_patcher import QwenAttentionPatcher
@@ -59,31 +63,6 @@ from arctic_platform.rl.zorro_train.zorro_train import ZoRRoTrain
 # Global debug object for storing baseline/patched tensors
 debug_object = {"baseline": None, "patched": None}
 
-SUPPORTED_MODEL_TYPES = {
-    "qwen3",
-    "qwen3_moe",
-    "qwen3_5",
-    "qwen3_5_moe",
-    "qwen3_next",
-}
-
-MODEL_TYPE_ALIASES = {
-    "qwen3_5_text": "qwen3_5",
-    "qwen3_5_moe_text": "qwen3_5_moe",
-}
-
-MODEL_TYPE_TO_TEXT_BACKBONE_CLASS = {
-    "qwen3": "Qwen3Model",
-    "qwen3_moe": "Qwen3MoeModel",
-    "qwen3_5": "Qwen3_5TextModel",
-    "qwen3_5_moe": "Qwen3_5MoeTextModel",
-    "qwen3_next": "Qwen3NextModel",
-}
-
-
-def _normalize_model_type(model_type: str) -> str:
-    return MODEL_TYPE_ALIASES.get(model_type, model_type)
-
 
 def get_supported_model_type(model) -> str:
     """Return normalized ``config.model_type`` for ZoRRO-supported Qwen model families."""
@@ -91,14 +70,7 @@ def get_supported_model_type(model) -> str:
     model_type = getattr(config, "model_type", None)
     if model_type is None:
         raise ValueError(f"Model {type(model).__name__} does not expose config.model_type")
-
-    normalized = _normalize_model_type(model_type)
-    if normalized not in SUPPORTED_MODEL_TYPES:
-        raise ValueError(
-            f"Unsupported model_type={model_type}. Supported model types: {sorted(SUPPORTED_MODEL_TYPES)} "
-            f"(aliases: {sorted(MODEL_TYPE_ALIASES.keys())})"
-        )
-    return normalized
+    return require_supported_model_type(model_type)
 
 
 def _init_dynamic_cache(dynamic_cache_cls, config):

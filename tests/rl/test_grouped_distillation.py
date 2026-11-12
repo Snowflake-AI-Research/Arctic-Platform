@@ -22,11 +22,11 @@ import math
 import pytest
 import torch
 
+from arctic_platform.common.unpacked_gas import run_unpacked_gas
 from arctic_platform.model.implementations.gpu.lm_head import chunked_lm_head_logprobs
 from arctic_platform.model.implementations.moe.layers.lm_head import FusedOutputLinear
 from arctic_platform.rl.processors import LOSS_FNS
 from arctic_platform.rl.processors import resolve_loss
-from arctic_platform.rl.processors import run_pipeline
 from arctic_platform.rl.processors.grouped_distillation import Divergence
 from arctic_platform.rl.processors.grouped_distillation import grouped_divergence
 from arctic_platform.testing_utils import set_seed
@@ -140,24 +140,28 @@ class _Bigram:
         loss.backward()
 
 
-def _run(frame, config, *, loss_fn="grpo", max_tokens_per_mb=12, context_extra=None, engine=None):
+def _run(frame, config, *, loss_fn="grpo", gas=1, context_extra=None, engine=None):
     engine = engine or _Bigram(frame["table"])
     context = {key: frame[key] for key in _CONTEXT} | (context_extra or {})
-    result = run_pipeline(
+    # Row tensors ride on the batch so each GAS call gets its own rows.
+    batch = (
+        {key: frame[key] for key in ("input_ids", "attention_mask")}
+        | ({"dss_compute_logprobs": True} if engine.grouped else {})
+        | {key: value for key, value in context.items() if value is not None}
+    )
+    result = run_unpacked_gas(
         engine,
-        (),
-        {key: frame[key] for key in ("input_ids", "attention_mask", "labels")}
-        | ({"dss_compute_logprobs": True} if engine.grouped else {}),
-        {key: value for key, value in context.items() if value is not None},
-        {
+        gas=gas,
+        batch_data=batch,
+        meta_data={"pad_token_id": 0, "drop_position_ids": True},
+        processing={
             "loss_fn": loss_fn,
             "post": [] if engine.grouped else ["compute_logprobs"],
             "config": config,
         },
-        "cpu",
         backward=True,
-        pack=True,
-        max_tokens_per_mb=max_tokens_per_mb or 10_000,
+        device="cpu",
+        step_fn=lambda: None,
     )
     return engine, result
 
@@ -184,17 +188,15 @@ def _kd_config(frame, divergence="kl", beta=1.0):
 
 
 @pytest.mark.parametrize(
-    ("divergence", "beta", "grouped_head", "max_tokens_per_mb"),
+    ("divergence", "beta", "grouped_head", "gas"),
     [
-        ("kl", 1.0, True, None),
-        ("kl", 0.0, False, 12),
-        ("jsd", 0.5, True, 6),
-        ("kl", 0.6, False, 6),
+        ("kl", 1.0, True, 1),
+        ("kl", 0.0, False, 1),
+        ("jsd", 0.5, True, 2),
+        ("kl", 0.6, False, 2),
     ],
 )
-def test_grouped_distillation_matches_float64_value_metrics_and_gradient(
-    divergence, beta, grouped_head, max_tokens_per_mb
-):
+def test_grouped_distillation_matches_float64_value_metrics_and_gradient(divergence, beta, grouped_head, gas):
     frame = _frame()
     weights = frame["kd_mask"]
     table = frame["table"].double().requires_grad_()
@@ -213,7 +215,7 @@ def test_grouped_distillation_matches_float64_value_metrics_and_gradient(
         frame,
         config,
         loss_fn="grouped_distillation",
-        max_tokens_per_mb=max_tokens_per_mb,
+        gas=gas,
         context_extra={
             "kd_mask": weights,
             "teacher_token_ids": frame["teacher_token_ids"].long(),
@@ -238,7 +240,7 @@ def test_grouped_distillation_matches_float64_value_metrics_and_gradient(
     assert set(result["batch"]) == {"logprobs"}
 
 
-def test_native_packing_validates_each_final_window_once_before_model(monkeypatch):
+def test_unpacked_gas_validates_each_call_once_before_its_model_call(monkeypatch):
     import arctic_platform.rl.processors.grouped_distillation as grouped_module
 
     frame = _frame()
@@ -247,8 +249,6 @@ def test_native_packing_validates_each_final_window_once_before_model(monkeypatc
 
     def record_validation(self, context, config):
         assert context["input_ids"].shape == (1, 6)
-        assert context["cu_seqlens"].tolist() == [0, 6]
-        assert context["packed_loss_scale_factor"] == 6
         events.append("validation")
         return original_validation(self, context, config)
 
@@ -269,7 +269,7 @@ def test_native_packing_validates_each_final_window_once_before_model(monkeypatc
             "dp_size": 1,
         },
         loss_fn="grouped_distillation",
-        max_tokens_per_mb=6,
+        gas=2,
         engine=OrderedBigram(frame["table"], grouped=True),
     )
 
@@ -278,15 +278,15 @@ def test_native_packing_validates_each_final_window_once_before_model(monkeypatc
 
 
 @pytest.mark.parametrize(
-    ("divergence", "beta", "max_tokens_per_mb"),
+    ("divergence", "beta", "gas"),
     [
-        ("kl", 1.0, None),
-        ("kl", 0.0, 12),
-        ("kl", 0.3, 6),
-        ("jsd", 0.5, 6),
+        ("kl", 1.0, 1),
+        ("kl", 0.0, 1),
+        ("kl", 0.3, 2),
+        ("jsd", 0.5, 2),
     ],
 )
-def test_grpo_kd_term_adds_float64_value_metrics_and_gradient(divergence, beta, max_tokens_per_mb):
+def test_grpo_kd_term_adds_float64_value_metrics_and_gradient(divergence, beta, gas):
     frame = _frame()
     table = frame["table"].double().requires_grad_()
     kd_sum, teacher_tail, student_tail = _reference(
@@ -298,7 +298,7 @@ def test_grpo_kd_term_adds_float64_value_metrics_and_gradient(divergence, beta, 
     config = _grpo_config(frame)
 
     (base_engine, base), (engine, result) = (
-        _run(frame, terms, max_tokens_per_mb=max_tokens_per_mb) for terms in (config, config | kd)
+        _run(frame, terms, gas=gas) for terms in (config, config | kd)
     )
 
     assert result["avg_loss"] - base["avg_loss"] == pytest.approx(

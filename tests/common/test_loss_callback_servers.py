@@ -284,6 +284,7 @@ def _native_grpo_kd_request():
             "pad_token_id": 0,
             # The gradient and group-shape asserts depend on rows staying in arrival order on each worker.
             "balance_batch": False,
+            "drop_position_ids": True,
             "old_log_probs_shifted": torch.zeros(rows, sequence_length),
             "advantages": torch.ones(rows, sequence_length),
             "loss_mask": target_mask,
@@ -335,7 +336,7 @@ def test_ray_preserves_batching_state_through_serialized_worker_execution(monkey
             "input_ids": torch.ones(1, 2, dtype=torch.long),
             "attention_mask": torch.ones(1, 2, dtype=torch.long),
         },
-        "meta": {"pad_token_id": 0},
+        "meta": {"pad_token_id": 0, "drop_position_ids": True},
         "processing": {"loss_fn": _BatchingStateLoss.name, "config": {}},
     }
 
