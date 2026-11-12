@@ -23,10 +23,11 @@ def register(registry: Registry) -> None:
     register_profile(
         "inkling2",
         extends="generic_moe",
-        supports=["peft", "lm_head.fp32", "lm_head.token_chunk_size"],
+        # lm_head.cross_entropy accepts only false: training always uses the native causal LM loss.
+        supports=["peft", "lm_head.fp32", "lm_head.token_chunk_size", "lm_head.cross_entropy"],
         unsupported={
             "checkpointing.targets": "only full activation checkpointing is supported",
-            "lm_head.cross_entropy": "native Inkling2 causal LM loss is used",
+            "liger": "native Inkling2 causal LM loss is used",
             "moe.sonicmoe": "routed experts use grouped GEMM or the expert loop",
             "tiled_mlp.token_chunk_size": "Inkling2 has no shared experts to tile",
         },

@@ -646,6 +646,22 @@ class TestInkling2Training(TestCasePlus):
         with self.assertRaisesRegex(ValueError, "positive"):
             Inkling2Options(fused_lm_head_token_chunk_size=0)
 
+    def test_worker_accepts_model_options_with_native_head(self):
+        from arctic_platform.common.option_registry import SUPPORTS
+        from arctic_platform.common.option_registry import settle
+        from arctic_platform.model import ds_worker_moe_model_spec
+
+        self.assertEqual(settle("inkling2")["lm_head.cross_entropy"].status, SUPPORTS)
+        path = self.checkpoint_path()
+        worker = {"attn_implementation": "flex_attention", "ep_size": 8}
+        head = {"cross_entropy": False, "token_chunk_size": 2048}
+        spec = ds_worker_moe_model_spec(path, {**worker, "model_options": {"lm_head": head}})
+        self.assertEqual(spec.loader, "inkling2")
+        self.assertIs(spec.loader_options["fused_cross_entropy"], False)
+        self.assertEqual(spec.loader_options["fused_lm_head_token_chunk_size"], 2048)
+        with self.assertRaisesRegex(ValueError, "native LM head"):
+            ds_worker_moe_model_spec(path, {**worker, "model_options": {"lm_head": {"cross_entropy": "liger"}}})
+
     def test_adapter_routes_options_and_validates_config(self):
         from arctic_platform.model.implementations.inkling2.deepspeed_integration import _adapter_for_inkling2
         from arctic_platform.model.loaders.inkling2 import Inkling2Options

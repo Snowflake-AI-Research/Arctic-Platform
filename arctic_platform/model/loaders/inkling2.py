@@ -44,6 +44,7 @@ class Inkling2Options(BaseModel):
     deepep_token_chunk_size: int | None = Field(None, gt=0)
     attention_query_chunk_size: int = Field(2048, gt=0, multiple_of=128)
     fused_lm_head_token_chunk_size: int | Literal["disabled"] = "disabled"
+    fused_cross_entropy: Literal[False] = False
     fp32_lm_head: bool = False
     ac_config: ActivationCheckpointConfig | None = None
 
@@ -57,10 +58,9 @@ class Inkling2Options(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _native_head(cls, value):
-        options = dict(value)
-        if options.pop("fused_cross_entropy", False) is not False:
+        if dict(value).get("fused_cross_entropy", False) is not False:
             raise ValueError("Inkling2 training uses the native LM head")
-        return options
+        return value
 
 
 def _matches(ctx: LoaderContext) -> bool:

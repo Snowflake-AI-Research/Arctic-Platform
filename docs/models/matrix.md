@@ -18,7 +18,7 @@ each loader's own validation. The reasons follow the table.
 | `checkpointing.targets` | trainer | memory | yes | yes | no | yes | yes | yes | no | no | no | yes | yes |
 | `compile.fullgraph` | trainer | speed | no | no | no | no | no | no | yes | no | no | no | no |
 | `liger` | trainer | speed | no | no | no | no | no | no | yes | no | no | no | no |
-| `lm_head.cross_entropy` | trainer | memory | yes | yes | no | yes | yes | yes | no | no | no | yes | yes |
+| `lm_head.cross_entropy` | trainer | memory | yes | yes | no | yes | yes | yes | no | yes | yes | yes | yes |
 | `lm_head.fp32` | both | parity | yes | yes | no | yes | yes | yes | yes | yes | yes | yes | yes |
 | `lm_head.token_chunk_size` | trainer | memory | yes | yes | no | yes | yes | yes | yes | yes | yes | yes | yes |
 | `lm_head.vocab_chunk_size` | trainer | memory | no | no | no | no | no | no | yes | no | no | no | no |
@@ -185,13 +185,12 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-10 of 25 options unsupported.
+9 of 25 options unsupported.
 
 - `attention.sparse_mla` (n/a): no model family behind this loader uses sparse MLA attention
 - `checkpointing.targets` (no): only full activation checkpointing is supported
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
-- `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
-- `lm_head.cross_entropy` (no): native Inkling causal LM loss is used
+- `liger` (no): native Inkling causal LM loss is used
 - `lm_head.vocab_chunk_size` (no): no equivalent option
 - `moe.sonicmoe` (no): routed experts use grouped GEMM or the expert loop
 - `numerics.fp32_parity` (no): no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp
@@ -203,13 +202,12 @@ Extends `generic_moe`.
 
 Extends `generic_moe`.
 
-11 of 25 options unsupported.
+10 of 25 options unsupported.
 
 - `attention.sparse_mla` (n/a): no model family behind this loader uses sparse MLA attention
 - `checkpointing.targets` (no): only full activation checkpointing is supported
 - `compile.fullgraph` (no): the loader rejects `patches.compile`
-- `liger` (no): the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead
-- `lm_head.cross_entropy` (no): native Inkling2 causal LM loss is used
+- `liger` (no): native Inkling2 causal LM loss is used
 - `lm_head.vocab_chunk_size` (no): no equivalent option
 - `moe.sonicmoe` (no): routed experts use grouped GEMM or the expert loop
 - `numerics.fp32_parity` (no): no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp

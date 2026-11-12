@@ -523,7 +523,7 @@ class TestInklingTraining(TestCasePlus):
 
         spec = ds_worker_moe_model_spec(self.checkpoint_config(), {"attn_implementation": "eager", "ep_size": 8})
         self.assertEqual(spec.loader, "inkling")
-        self.assertNotIn("fused_cross_entropy", spec.loader_options)
+        self.assertIs(spec.loader_options.get("fused_cross_entropy", False), False)
 
     @require_deepspeed
     def test_bf16_keeps_fp32_state_and_separate_optimizer_groups(self):
