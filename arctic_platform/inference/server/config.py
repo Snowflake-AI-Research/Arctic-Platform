@@ -175,6 +175,20 @@ class ModelConfig(BaseModel):
 
 MODEL_CONFIGS: dict[GPUType, dict[str, dict[str, Any]]] = {
     GPUType.H200: {
+        "Inkling-Small": dict(
+            model="thinkingmachines/Inkling-Small",
+            tensor_parallel_size=8,
+            max_num_seqs=64,
+            gpu_memory_utilization=0.90,
+            reasoning_parser="inkling",
+            tool_call_parser="inkling",
+            extra_engine_kwargs={
+                "tokenizer_mode": "inkling",
+                "dtype": "bfloat16",
+                "kernel_config": {"enable_flashinfer_autotune": False},
+            },
+            extra_env={"VLLM_USE_V2_MODEL_RUNNER": "1"},
+        ),
         "Qwen3-30B-A3B": dict(
             model="Qwen/Qwen3-30B-A3B",
             tensor_parallel_size=1,
