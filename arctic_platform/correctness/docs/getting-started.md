@@ -1,4 +1,4 @@
-# Five-Check Correctness
+# Seven-Test Correctness
 
 ## About
 
@@ -6,7 +6,7 @@ This doc gives a simple way to figure out how to use the correctness system via 
 
 Onboarding takes longer than regression because calibration repeats the same workload to measure the expected variation between nondeterministic runs.
 
-**This checkout registers five correctness checks without adding production hooks or debug dependencies.** `single-step-grads`, `single-step-optimizer`, `checkpoint-resume-loss`, `inference-checkpoint-loss` and `e2e-sft-train-validate` are the registered IDs. The gradient and optimizer checks retain their reduced supervised-reference workflow. Checkpoint resume, training-to-inference checkpoint loss, and end-to-end supervised fine-tuning (SFT) retain their separate workload identities and target prerequisites. `rl-weight-sync` and `rl-router-replay` and their reinforcement-learning (RL) check modules are excluded.
+**This checkout registers seven correctness tests, including two reinforcement-learning (RL) comparisons.** `single-step-grads`, `single-step-optimizer`, `checkpoint-resume-loss`, `inference-checkpoint-loss`, `e2e-sft-train-validate`, `rl-weight-sync` and `rl-router-replay` are the registered IDs. The first five tests retain their existing workload identities and prerequisites. The two RL tests require narrowly scoped, opt-in trainer/sampler evidence: actual tensor-send and receiver-write records for weight synchronization, and received routing plus forward/backward router invocations for replay. CLI discovery and help do not import these observers; ordinary training and sampling calls leave them disabled.
 
 ## Step 1. Setup
 
@@ -20,10 +20,12 @@ The assumption is that you are already inside an Arctic-Platform clone.
 
 ```
 # assuming you're already in the AP clone
-git checkout stas/correctness-testing-remaining-no-debug
+git checkout stas/correctness-testing-rl-minimal-debug
 pip install -e '.[correctness]'
 python -m arctic_platform.correctness list
 ```
+
+**Install the sampling stack on the GPU allocation when selecting inference or RL tests.** Use `python -m pip install -e '.[correctness,rl]'` in the executing environment; the `rl` extra includes the in-tree Arctic Inference sampler and its pinned vLLM dependency. The `correctness` extra alone remains sufficient for CPU selftests and training/reference dependencies. The separately installed DSS service must use a compatible runtime on every participating node.
 
 ## Step 2. Create a Job Config file
 
@@ -120,7 +122,7 @@ for all applicable registered checks.
 
 **The supplied config is copied byte for byte into the checkout's hierarchical config tree.** Recipes below `cortex-training/model-catalog/models/` retain their complete relative path under `arctic_platform/correctness/configs/`. Other `.json` and `.config` files use `<model-name>/<standard|long>/<gpu>-<training|inference>-<full|lora>.json` with any explicit `--<variant>` suffix; the [layout contract](hf-reference-onboarding.md#configuration-and-reference-layout) defines those components. This demo imports as `configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json`, and its compact reference folders mirror that relative path without the extension. Identical copies are reused; different contents at the same destination are rejected without overwriting. No automatic Git commit is made.
 
-**Give onboarding only the config; all applicable checks are attempted independently.** The five-check registry is the default selection; no test selector or separate preparation command is required. The harness prepares specifications and compatible references, calibrates reviewed gates and retains each result separately. A reduced first-two fixture does not establish resume, sampling or full-SFT prerequisites. A missing later-check capability is reported as that check's non-pass, without suppressing independent selected checks or changing the config, inputs, precision or gates. Test selectors remain optional for deliberately narrower work.
+**Give onboarding only the config; all applicable checks are attempted independently.** The seven-test registry is the default selection; no test selector or separate preparation command is required. The harness prepares specifications and compatible references, calibrates reviewed gates and retains each result separately. A reduced first-two fixture does not establish resume, sampling or full-SFT prerequisites. A missing later-check capability is reported as that check's non-pass, without suppressing independent selected checks or changing the config, inputs, precision or gates. Test selectors remain optional for deliberately narrower work.
 
 **Calibration automatically uses the visible GPUs on one node, capped at eight concurrent HF workers.** Eight samples run in one wave of eight per GAS arm when eight or more local GPUs are visible, even if sixteen GPUs are visible. A node with fewer GPUs needs more waves; this demo runs serially if only one GPU is visible. `--reference-calibration-workers` accepts an explicit override from one to eight available local GPUs. The target's GPU count does not limit calibration concurrency.
 
@@ -161,7 +163,7 @@ PY
 
 ## Step 4. Run Config Tests
 
-**Run all applicable checks with the config-only command below.** Omitting `--test` selects the applicable set from the five-check registry. Each check uses its own prepared identity and execution prerequisites; missing prerequisites remain separate non-passes. When no endpoint is configured, the supported local route manages its owned gateway. Regression never prepares missing references, changes precision or widens gates.
+**Run all applicable checks with the config-only command below.** Omitting `--test` selects the applicable set from the seven-test registry. Each check uses its own prepared identity and execution prerequisites; missing prerequisites remain separate non-passes. When no endpoint is configured, the supported local route manages its owned gateway. Regression never prepares missing references, changes precision or widens gates.
 
 ```bash
 python -m arctic_platform.correctness run \
@@ -171,7 +173,7 @@ python -m arctic_platform.correctness run \
 
 Read `./work/reports/output1/report.md`, `report.json`, and `full.log`. Every run ends with its total wall-clock runtime rounded upward to whole seconds in `HH:MM:SS` format, after the report paths and any error guidance. A missing prepared reference or failed execution is not a numerical pass. The [operator guide](running-tests.md) includes single-check and multi-config commands, plus how to adapt the example to another supported model.
 
-**The command names the selected checks before execution.** The config-only demo reports the applicable set from the five-check registry, not a fixed two-check list.
+**The command names the selected checks before execution.** The config-only demo reports the applicable set from the seven-test registry, not a fixed two-check list.
 
 **The gateway log is retained under `./work/reports/output1/cases/<config-id>/<group>/gateway.log`; no second terminal or manual shutdown is needed.** `./work/reports/output1/full.log` records the exact gateway log path and detailed execution progress. An explicitly configured `--base-url` or `ARCTIC_CORTEX_BASE_URL` connects to an existing service and leaves it running; add `--local-cortex-fixture` for reduced-fixture checks on that loopback service. Remove stale host, base URL or PAT settings when switching back to automatic local execution. A multi-node run needs the allocation's real same-job hostfile and working `ds_ssh`. Reference preparation prints per-worker progress and complete log paths under `./work/logs`; compact reference records and large tensor scratch are separate from these durable logs.
 
@@ -254,6 +256,6 @@ The `correctness` extra includes `pytest` and `pytest-instafail`, so the install
 python -m arctic_platform.correctness selftest
 ```
 
-**The first two checks compare scalar norms, not elementwise tensor equality.** Reduced fixtures do not validate a full model at its maximum sequence length. Checkpoint resume checks state restoration; inference compares training and sampling answer-token loss; E2E compares final training and held-out validation losses while retaining both trajectories. E2E and the first two checks require SFT configs. The two excluded RL judges are not claimed as supported. Compatible target runtimes, matching initial weights or adapters and reviewed references are still required.
+**The first two tests compare scalar norms, not elementwise tensor equality.** Reduced fixtures do not validate a full model at its maximum sequence length. Checkpoint resume tests state restoration; inference compares training and sampling answer-token loss; E2E compares final training and held-out validation losses while retaining both trajectories. E2E and the first two tests require SFT configs. The RL tests compare observed weight installation and router replay on a supported native training/sampling route. Compatible target runtimes, matching initial weights or adapters and reviewed references are still required.
 
 **Some reduced pretrained fixtures need native prediction-weight support absent from main.** For seed-0 `prime_rl` fixtures, positive `mtp_num_hidden_layers` in `qwen3_5_moe_text` or `qwen4_exp_text`, and positive `num_nextn_predict_layers` in `glm5_next_text`, cause an explicit prerequisite error. Absent or zero counts pass this admission check without changing the model configuration. This correctness-only branch does not add production loader hooks or silently omit prediction weights.

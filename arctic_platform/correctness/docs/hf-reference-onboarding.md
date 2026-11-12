@@ -1,6 +1,6 @@
 # HF Reference Onboarding
 
-**Config-only onboarding selects all applicable checks from this checkout's five-check registry.** `single-step-grads` and `single-step-optimizer` use the HF scalar/norm records described below; `e2e-sft-train-validate` uses its own ordered-trajectory HF record. `checkpoint-resume-loss` compares AP uninterrupted and resumed training, and `inference-checkpoint-loss` compares training and sampling losses for the saved weights. Neither is admitted by a first-two HF record. Both RL judges, `rl-weight-sync` and `rl-router-replay`, are excluded. Onboarding prepares compatible selected references automatically; regression never recomputes missing references. See [check-specific prerequisites](running-tests.md#check-specific-prerequisites).
+**Config-only onboarding selects all applicable checks from this checkout's seven-test registry.** `single-step-grads` and `single-step-optimizer` use the HF scalar/norm records described below; `e2e-sft-train-validate` uses its own ordered-trajectory HF record. `checkpoint-resume-loss` compares AP uninterrupted and resumed training, and `inference-checkpoint-loss` compares training and sampling losses for the saved weights. Neither is admitted by a first-two HF record. The RL tests compare live training/sampling evidence, not HF reference norms. Onboarding prepares compatible selected references automatically; regression never recomputes missing references. See [check-specific prerequisites](running-tests.md#check-specific-prerequisites).
 
 ## Configuration And Reference Layout
 

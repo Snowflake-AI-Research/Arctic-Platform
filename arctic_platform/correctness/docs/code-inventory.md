@@ -1,6 +1,6 @@
 # Correctness Code Map
 
-**This checkout registers five correctness checks without adding production hooks or debug dependencies.** `single-step-grads`, `single-step-optimizer`, `checkpoint-resume-loss`, `inference-checkpoint-loss` and `e2e-sft-train-validate` are the registered IDs. The gradient and optimizer checks retain their reduced supervised-reference workflow. Checkpoint resume, training-to-inference checkpoint loss, and end-to-end supervised fine-tuning (SFT) retain their separate workload identities and target prerequisites. `rl-weight-sync` and `rl-router-replay` and their reinforcement-learning (RL) check modules are excluded.
+**This checkout registers seven correctness tests, including two reinforcement-learning (RL) comparisons.** `single-step-grads`, `single-step-optimizer`, `checkpoint-resume-loss`, `inference-checkpoint-loss`, `e2e-sft-train-validate`, `rl-weight-sync` and `rl-router-replay` are the registered IDs. The first five tests retain their existing workload identities and prerequisites. The two RL tests require narrowly scoped, opt-in trainer/sampler evidence: actual tensor-send and receiver-write records for weight synchronization, and received routing plus forward/backward router invocations for replay. CLI discovery and help do not import these observers; ordinary training and sampling calls leave them disabled.
 
 Start with [the operator guide](running-tests.md). All paths below are relative to `arctic_platform/correctness/`.
 
@@ -28,4 +28,4 @@ Start with [the operator guide](running-tests.md). All paths below are relative 
 
 **Checkpoint helpers support the optimizer, resume and inference checks.** Later-check selftests add focused checkpoint identity/restoration, exporter schema/teardown, and SFT trajectory/reference-record controls to the retained baseline; retired debug campaigns are not restored.
 
-**No production change or added debug package is required by this extraction.** The correctness-owned gateway collects participation for the first two comparisons only. Later-only selection does not acquire the first-two BF16 or runtime-capture requirement. An installed target runtime, compatible model assets and check-specific execution prerequisites remain necessary.
+**The five non-RL tests retain their correctness-owned capture; the RL tests use opt-in production observers.** The correctness-owned gateway collects participation for the first two comparisons only. Later-only selection does not acquire the first-two BF16 or runtime-capture requirement. An installed target runtime, compatible model assets and check-specific execution prerequisites remain necessary.
