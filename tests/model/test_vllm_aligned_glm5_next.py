@@ -533,16 +533,65 @@ def test_aligned_layer_backward_runs_with_deterministic_algorithms_and_restores_
     assert torch.utils.deterministic.fill_uninitialized_memory
     assert torch.equal(streams.grad, torch.full((3, 4), 2.0))
 
-def test_prefill_rounds_cut_each_prompt_every_chunk_tokens_from_its_start():
-    from arctic_platform.model.implementations.vllm_aligned.glm5_next import _prefill_rounds
+def _steps(layout):
+    return [(st.decode, st.rows.tolist(), st.cu.tolist(), st.slots.tolist(), st.has_initial_state.tolist(), st.imports,
+             st.exports) for st in layout.steps]  # fmt: skip
 
-    rounds = _prefill_rounds([0, 5, 8], [4, 3, 10], 4, torch.device("cpu"))
-    assert [r.rows.tolist() for r in rounds] == [
-        [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11],
-        [12, 13, 14, 15],
-        [16, 17],
+
+def test_single_turn_kda_layout_cuts_prompts_every_chunk_tokens_then_decodes():
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import _single_turn_kda_layout
+
+    cu = torch.tensor([0, 5, 8, 18], dtype=torch.int32)
+    layout = _single_turn_kda_layout(cu, torch.tensor([4, 3, 10]), 4, torch.device("cpu"))
+    assert not layout.single and layout.num_slots == 3
+    assert _steps(layout) == [
+        (False, [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11], [0, 4, 7, 11], [1, 2, 3], [False] * 3, [], []),
+        (False, [12, 13, 14, 15], [0, 4], [3], [True], [], []),
+        (False, [16, 17], [0, 2], [3], [True], [], []),
+        (True, [4], [0, 1, 1, 1], [1, 2, 3], [True] * 3, [], []),
     ]
-    assert [r.cu.tolist() for r in rounds] == [[0, 4, 7, 11], [0, 4], [0, 2]]
-    assert [r.slots.tolist() for r in rounds] == [[1, 2, 3], [3], [3]]
-    assert [r.has_initial_state.tolist() for r in rounds] == [[False] * 3, [True], [True]]
-    assert all(r.cu.dtype == torch.int32 and r.slots.dtype == torch.int32 for r in rounds)
+    whole = _single_turn_kda_layout(cu, torch.tensor([5, 3, 10]), 0, torch.device("cpu"))
+    assert whole.single and whole.steps[0].rows is None
+
+
+def test_kda_steps_resume_from_the_providers_state_and_run_one_token_chunks_as_decode():
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import _kda_steps_layout
+
+    spans = [(0, [(False, 0, 8), (False, 8, 12), (True, 12, 14)], None),
+             (14, [(False, 0, 4), (True, 4, 6)], (0, 8)),
+             (20, [(False, 0, 5), (False, 5, 6)], None)]  # fmt: skip
+    layout = _kda_steps_layout(spans, torch.device("cpu"))
+    a, b, c = (list(range(lo, hi)) for lo, hi in ((0, 8), (14, 18), (20, 25)))
+    assert _steps(layout) == [
+        (False, a + c, [0, 8, 13], [1, 3], [False, False], [], [(1, (0, 8))]),
+        (False, [8, 9, 10, 11], [0, 4], [1], [True], [], []),
+        (True, [25], [0, 1], [3], [True], [], []),
+        (True, [12, 13], [0, 2], [1], [True], [], []),
+        (False, b, [0, 4], [2], [True], [(2, (0, 8))], []),
+        (True, [18, 19], [0, 2], [2], [True], [], []),
+    ]
+
+
+def test_turn_layout_reads_cached_pages_from_their_writer_and_resumes_its_state():
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import plan_block_size
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import turn_layout
+    from arctic_platform.model.implementations.vllm_aligned.turn_plan import encode_turns
+
+    plan = encode_turns(12, [{"start": 0, "chunk_ends": [8], "prompt_end": 8, "end": 10, "outputs": [7, 8]},
+                             {"start": 8, "chunk_ends": [11], "prompt_end": 11, "end": 12, "outputs": [10]}],
+                        block_size=4)  # fmt: skip
+    cu = torch.tensor([0, 12], dtype=torch.int32)
+    assert plan_block_size(plan, cu) == 8
+    turns = turn_layout(plan, cu, block_size=4, device=torch.device("cpu"))
+    assert turns.expand_index.tolist() == list(range(10)) + [8, 9, 10, 11]
+    assert turns.positions.tolist() == list(range(10)) + [8, 9, 10, 11]
+    assert turns.cu.tolist() == [0, 10, 14]
+    assert turns.key_index.tolist() == list(range(10)) + list(range(8)) + [10, 11, 12, 13]
+    assert turns.key_cu.tolist() == [0, 10, 22]
+    assert turns.output_index.tolist() == list(range(10)) + [12, 13]
+    assert _steps(turns.kda) == [
+        (False, list(range(8)), [0, 8], [1], [False], [], [(1, (0, 8))]),
+        (True, [8, 9], [0, 2], [1], [True], [], []),
+        (False, [10, 11, 12], [0, 3], [2], [True], [(2, (0, 8))], []),
+        (True, [13], [0, 1], [2], [True], [], []),
+    ]
