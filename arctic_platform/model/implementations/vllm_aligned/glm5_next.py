@@ -1139,12 +1139,16 @@ def _vllm_mlp_quantization(layer: Any):
             del module.forward
 
 
-def _vllm_backward_runner(input_ids: torch.Tensor, position_ids: torch.Tensor, kwargs: dict, ctx: Any) -> Callable:
+def _vllm_backward_runner(input_ids: torch.Tensor, position_ids: torch.Tensor, kwargs: dict, ctx: Any,
+                          per_op: frozenset = frozenset()) -> Callable:  # fmt: skip
     """``run(layer, streams)`` for the backward: the layer as a chain of sublayers whose values are the aligned
     forward's (vLLM's kernels, recomputed) and whose gradients are the stock sublayers' made to compute vLLM's math
     (replayed expert ids and top-k rows, bf16 MLA projections, vLLM's FP8 activation quantization), each evaluated on
     the exact input vLLM's forward gave it (:func:`substitute`). Sublayers: the attention-site hyper-connection pre
-    (with its norm), the mixer, the post; the FFN site's pre, the MLP or MoE, the post."""
+    (with its norm), the mixer, the post; the FFN site's pre, the MLP or MoE, the post.
+
+    ``per_op`` names sublayer groups (``"hc"``: both sites' pre and post; ``"mixer"``; ``"mlp"``) that take the
+    per-op backward instead (vLLM's kernels under :func:`differentiable`), for comparing the two group by group."""
     from arctic_platform.model.implementations.glm53 import modeling_glm5_next as modeling
 
     config = ctx.config
@@ -1155,6 +1159,10 @@ def _vllm_backward_runner(input_ids: torch.Tensor, position_ids: torch.Tensor, k
     layer_kwargs = {**{k: v for k, v in kwargs.items() if k not in named}, "input_ids": input_ids.reshape(1, -1)}
 
     def pre(layer, hc, norm, streams):
+        if "hc" in per_op:
+            with differentiable():
+                post, comb, x = hc_pre(streams, hc, norm, config)
+            return None, post, comb, x, (post.detach(), comb.detach(), x.detach())
         with torch.no_grad():
             exact = hc_pre(streams, hc, norm, config)
         res = streams.unsqueeze(0)
@@ -1165,6 +1173,9 @@ def _vllm_backward_runner(input_ids: torch.Tensor, position_ids: torch.Tensor, k
         return fused, post, comb, x.squeeze(0), exact
 
     def post_(layer, fused, post, comb, out, out_exact, streams, exact):
+        if "hc" in per_op:
+            with differentiable():
+                return hc_post(out, streams, post, comb)
         with torch.no_grad():
             value = hc_post(out_exact, streams, exact[0], exact[1])
         mixed = modeling._remix(fused, layer._fp32_parity, post, comb, out.unsqueeze(0), streams.unsqueeze(0))
@@ -1173,21 +1184,30 @@ def _vllm_backward_runner(input_ids: torch.Tensor, position_ids: torch.Tensor, k
     def run(layer: Any, streams: torch.Tensor) -> torch.Tensor:
         record = _record(ctx, layer) or {}
         fused, post, comb, x, exact = pre(layer, layer.attn_hc, layer.input_layernorm, streams)
-        with torch.no_grad():
-            mixed_exact = _mixer(layer, exact[2], ctx)
         with _stock_replay(layer, record, kwargs, vllm_mla_weights=True) as extra:
-            # The stock layer takes these by name before passing the rest of the packing kwargs down.
-            if layer.block_type == "linear_attention":
-                mixed = layer.self_attn(**{**layer_kwargs, "hidden_states": x.unsqueeze(0), "cache_params": None,
-                                           "attention_mask": mask})  # fmt: skip
+            if "mixer" in per_op:
+                with differentiable():
+                    mixed = _mixer(layer, x, ctx)
+                mixed_exact = mixed.detach()
             else:
-                mixed = layer.self_attn(**{**layer_kwargs, "hidden_states": x.unsqueeze(0), "attention_mask": mask,
-                                           "position_ids": position_ids.reshape(1, -1), "past_key_values": None,
-                                           "use_cache": False, "position_embeddings": None,
-                                           "prev_topk_indices": None})[0]  # fmt: skip
-            mixed = substitute(mixed.squeeze(0), mixed_exact)
+                with torch.no_grad():
+                    mixed_exact = _mixer(layer, exact[2], ctx)
+                # The stock layer takes these by name before passing the rest of the packing kwargs down.
+                if layer.block_type == "linear_attention":
+                    mixed = layer.self_attn(**{**layer_kwargs, "hidden_states": x.unsqueeze(0), "cache_params": None,
+                                               "attention_mask": mask})  # fmt: skip
+                else:
+                    mixed = layer.self_attn(**{**layer_kwargs, "hidden_states": x.unsqueeze(0), "attention_mask": mask,
+                                               "position_ids": position_ids.reshape(1, -1), "past_key_values": None,
+                                               "use_cache": False, "position_embeddings": None,
+                                               "prev_topk_indices": None})[0]  # fmt: skip
+                mixed = substitute(mixed.squeeze(0), mixed_exact)
             streams = post_(layer, fused, post, comb, mixed, mixed_exact, streams, exact)
             fused, post, comb, x, exact = pre(layer, layer.ffn_hc, layer.post_attention_layernorm, streams)
+            if "mlp" in per_op:
+                with differentiable():
+                    out = _mlp(layer, x, ctx)
+                return post_(layer, fused, post, comb, out, out.detach(), streams, exact)
             with torch.no_grad():
                 mlp_exact = _mlp(layer, exact[2], ctx)
             with _vllm_mlp_quantization(layer):
