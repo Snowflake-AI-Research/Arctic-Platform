@@ -353,10 +353,16 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
     After native reset has waited for offload copies, discard compact groups' CPU accumulators as well: their sums and
     master-gradient views belong to the completed update, not to the next update or a restored checkpoint. Noncompact
     groups retain native accumulator ownership and cleanup.
+
+    Newer DeepSpeed versions own compact offload partitions themselves and use per-group accumulator lists.
+    Leave that lifecycle untouched; these legacy wrappers require per-parameter accumulator dictionaries.
     """
     from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 
     if type(optimizer) is not DeepSpeedZeroOptimizer or not optimizer.cpu_offload:
+        return False
+    if not isinstance(optimizer.accumulated_grads_in_cpu, dict):
+        logger.info("Leaving compact offload partitions under native DeepSpeed accumulator ownership")
         return False
     compact_groups = [
         group_idx

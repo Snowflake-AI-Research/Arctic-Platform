@@ -2021,12 +2021,15 @@ def test_partition_release_leaves_non_zero_optimizers_unchanged():
 
 @require_deepspeed
 @pytest.mark.parametrize("compact", [False, True])
-def test_partition_reset_preserves_native_noncompact_accumulators(monkeypatch, compact):
+@pytest.mark.parametrize("per_group_accumulators", [False, True])
+def test_partition_reset_preserves_native_noncompact_accumulators(monkeypatch, compact, per_group_accumulators):
     class NativeOptimizer:
         def __init__(self):
             self.cpu_offload = True
             self.bit16_groups = [[0], [1]]
             self.accumulated_grads_in_cpu = {0: object(), 1: object()}
+            if per_group_accumulators:
+                self.accumulated_grads_in_cpu = list(self.accumulated_grads_in_cpu.values())
             self.averaged_gradients = {0: object(), 1: object()}
             self.reset_calls = []
 
@@ -2058,13 +2061,18 @@ def test_partition_reset_preserves_native_noncompact_accumulators(monkeypatch, c
     monkeypatch.setattr("deepspeed.runtime.zero.stage_1_and_2.DeepSpeedZeroOptimizer", NativeOptimizer)
     optimizer = NativeOptimizer()
     original_attributes = dict(vars(optimizer))
-    original_accumulators = dict(optimizer.accumulated_grads_in_cpu)
+    original_accumulators = optimizer.accumulated_grads_in_cpu.copy()
     original_partitions = dict(optimizer.averaged_gradients)
-    assert deepspeed_engine.release_offloaded_grad_partitions(optimizer) is compact
-    if not compact:
+    installed = compact and not per_group_accumulators
+    assert deepspeed_engine.release_offloaded_grad_partitions(optimizer) is installed
+    if not installed:
         assert vars(optimizer) == original_attributes
     assert optimizer.reset_cpu_buffers("request", boundary=True) == "reset"
     assert optimizer.reset_calls == [(("request",), {"boundary": True})]
+    if per_group_accumulators:
+        assert optimizer.accumulated_grads_in_cpu == original_accumulators
+        assert optimizer.averaged_gradients == original_partitions
+        return
     expected_ids = {1} if compact else {0, 1}
     assert optimizer.accumulated_grads_in_cpu.keys() == expected_ids
     for param_id in expected_ids:
