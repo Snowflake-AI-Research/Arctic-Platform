@@ -23326,6 +23326,7 @@ _SELFTEST_AUTO_FIXTURES = {
     "model_fixtures": [],
     "optimizer_math": [],
     "onboarding_storage": ["_synthetic_onboarding_environment"],
+    "checkpoint_state": [],
     "local_transport": [],
     "runtime_clients": ["_synthetic_runtime_inputs", "_external_operator_catalog"],
     "remaining_checkpoint_resume_checkpoint_state": (),
