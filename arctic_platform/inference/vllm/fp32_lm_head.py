@@ -31,7 +31,8 @@ single chokepoint every logits path runs the projection through:
     logits = torch.mm(hidden_states, lm_head.weight.t(), out_dtype=fp32)
 
 on CUDA/ROCm for a bf16/fp16 head (``F.linear`` on fp32-upcast operands
-everywhere else).
+everywhere else). It also reports ``ModelConfig.head_dtype`` as fp32, so
+buffers vLLM sizes by it (the probabilistic draft-logits cache) match those logits.
 
 Notes:
 - The lm_head **weight is not modified**: it stays in the model's
@@ -39,9 +40,9 @@ Notes:
 - This bypasses ``lm_head.quant_method.apply`` (which would error on
   dtype mismatch). For unquantized lm_heads the original ``apply`` is
   just ``F.linear`` anyway, so we lose no functionality.
-- For quantized lm_heads (rare) the patch falls back to the original
-  ``_get_logits`` so quant kernels still run; the result is the
-  upstream behavior, not fp32 logits.
+- For quantized lm_heads (rare) the patch falls back to vLLM's own
+  ``_apply_head``, which refuses the fp32 ``head_dtype`` reported here, so
+  the engine fails at startup instead of serving model-dtype logits.
 - On CUDA/ROCm the bf16/fp16 operands go straight into a GEMM that
   accumulates and writes fp32, as upstream vLLM does for
   ``head_dtype=float32``: no fp32 copy of the weight is made. bf16/fp16
@@ -58,6 +59,7 @@ import os
 from dataclasses import dataclass
 
 import torch
+from vllm.config import ModelConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -167,6 +169,19 @@ class LogitsProcessorFp32Patch(ArcticPatch[LogitsProcessor]):
         return _fp32_linear(hidden_states, lm_head.weight, embedding_bias)
 
 
+class ModelConfigFp32HeadPatch(ArcticPatch[ModelConfig]):
+    """Report the fp32 head while the toggle is on: ``gumbel_sample`` requires
+    the draft-logits cache, sized by ``head_dtype``, to match the logits."""
+
+    _orig_head_dtype = ModelConfig.head_dtype
+
+    @property
+    def head_dtype(self) -> torch.dtype:
+        if _FP32_LM_HEAD_ENABLED:
+            return torch.float32
+        return self._orig_head_dtype
+
+
 def apply_fp32_lm_head_patches() -> None:
     """Install the fp32 lm_head patch.
 
@@ -175,6 +190,7 @@ def apply_fp32_lm_head_patches() -> None:
     construction) but is a no-op when the toggle is False.
     """
     LogitsProcessorFp32Patch.apply_patch()
+    ModelConfigFp32HeadPatch.apply_patch()
 
 
 def ensure_fp32_lm_head_vllm_patches(enabled: bool | None = None) -> None:
