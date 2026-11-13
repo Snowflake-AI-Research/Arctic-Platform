@@ -48,6 +48,7 @@ from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.sft import Batch
 from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
 
+from ..harness.config import TestSpec
 from ..harness.config import TestTolerance
 from ..harness.config import tolerance_text
 from ..harness.registry import Mismatch
@@ -248,6 +249,7 @@ def measure_undeterministic_loss_range(
     arms,
     workdir,
     attn_implementation: str,
+    spec: TestSpec | None = None,
     transport_factory=None,
 ):
     """Three 10-step runs per case, determinism off. Returns the widest per-iteration loss range.
@@ -272,6 +274,7 @@ def measure_undeterministic_loss_range(
                 slots=slots,
                 attn_implementation=attn_implementation,
                 determinism="off",
+                spec=spec,
             )
         )
         with transport:

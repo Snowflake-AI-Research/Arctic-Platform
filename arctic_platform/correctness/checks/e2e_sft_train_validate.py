@@ -399,6 +399,8 @@ def run_ap_trajectory(
         weight_format=ctx.cfg.sub_job.get("weight_format"),
     )
     maybe_bind_reduced_fixture_mtp(payload, ctx.spec, getattr(ctx, "published_fixture", None))
+    if getattr(ctx, "published_fixture", None) is not None:
+        payload["training_config"]["debug"]["correctness_e2e_fixture"] = True
     if peft_adapter_path is not None:
         from arctic_platform.correctness.harness.lora import bind_payload
 
@@ -727,7 +729,7 @@ def prepare_inputs(ctx) -> PreparedInputs:
     measured: Dict[str, float] = {
         "train_rows_per_step": float(rows_per_step),
         "learning_rate": learning_rate,
-        "n_gpus_dss": float(ctx.cfg.n_gpus),
+        "n_gpus_ap": float(ctx.cfg.n_gpus),
         "validation_examples": float(len(validation_examples)),
         "validation_padded_width": float(padded_width),
         "validation_token_slots": float(len(validation_examples) * padded_width),

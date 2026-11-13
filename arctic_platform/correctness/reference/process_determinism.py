@@ -27,6 +27,8 @@ instead of the engine.
 
 from __future__ import annotations
 
+CUBLAS_WORKSPACE = ":16:8"
+
 
 def pin_reduction_order(model_path: str, attn_implementation: str) -> None:
     """Pin every reduction order this process can pin.

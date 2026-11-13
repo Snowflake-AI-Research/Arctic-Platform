@@ -1,4 +1,4 @@
-# Part One: Gradient And Optimizer Correctness
+# Five-Check Correctness
 
 ## About
 
@@ -18,7 +18,6 @@ The assumption is that you are already inside an Arctic-Platform clone.
 
 ```
 # assuming you're already in the AP clone
-git checkout -b stas/correctness-testing-p1
 pip install -e '.[correctness]'
 python -m arctic_platform.correctness list
 ```
@@ -109,7 +108,7 @@ python -m arctic_platform.correctness onboard --config ./work/configs/tiny-qwen3
 
 **Inspect the generated specification and onboarding summary before accepting the gates.** In this checkout, the migrated manifest retains `tiny-qwen3-129m-one-h200`, so the files are `arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.json` and `arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.onboarding.json`. Without that manifest entry, use the path-derived ID printed by onboarding. The imported config is `configs/tiny-qwen3-129m/standard/h200-training-full.json`, and compact measurements use `reference_data/tiny-qwen3-129m/standard/h200-training-full/<check-id>/...`. No model or adapter tensors belong in Git; moving placement does not remeasure historical records.
 
-**Onboarding numbers the queued checks: `### Onboarding 1/2: Single Step Grads ###`, then `### Onboarding 2/2: Single Step Optimizer ###` for this demo.** Inner phases retain `***` markers. A single selected check uses `1/1` when its fixture already exists; prerequisite gradient onboarding is included in the total when needed.
+**Onboarding numbers the actual queued checks.** Default-all onboarding includes each applicable check and any missing fixture prerequisites; the denominator is not fixed at two. An optional optimizer-only selection may queue its gradient prerequisite first.
 
 **Gradient calibration uses eight nondeterministic HF runs per GAS arm with that arm's frozen inputs and model-specific packing.** GAS1 and GAS4 are measured separately; calibration uses the largest within-arm gradient-norm spread with the existing 4x rounding policy. After a calibration-code repair, repeat the same onboarding command: incompatible old calibration is rebuilt automatically, without deleting logs or manually changing a tolerance.
 
@@ -134,7 +133,7 @@ python -m arctic_platform.correctness onboard \
 
 ## Step 4. Run Config Tests
 
-**Run both checks with one command in one terminal, just like onboarding.** When no Cortex host or base URL is configured, regression selects the reduced fixture, starts the installed upstream DSS gateway on an available loopback port, supplies local database/schema segments, and closes only its owned gateway after execution or failure. No separate gateway command or fixture flag is required. Omitting `--test` selects both P1 checks. Regression never generates missing references or widens reviewed tolerances.
+**Run all applicable checks with the config-only command below.** Omitting `--test` selects the applicable set from the five-check registry. Each check uses its own prepared identity and execution prerequisites; missing prerequisites remain separate non-passes. When no endpoint is configured, the supported local route manages its owned gateway. Regression never prepares missing references, changes precision or widens gates.
 
 ```bash
 python -m arctic_platform.correctness run \
@@ -144,7 +143,7 @@ python -m arctic_platform.correctness run \
 
 Read `./work/reports/output1/report.md`, `report.json`, and `full.log`. Every run ends with its total wall-clock runtime rounded upward to whole seconds in `HH:MM:SS` format, after the report paths and any error guidance. A missing prepared reference or failed execution is not a numerical pass. The [operator guide](https://github.com/Snowflake-AI-Research/Arctic-Platform/blob/stas/correctness-testing-p1/arctic_platform/correctness/docs/running-tests.md) includes single-check and multi-config commands, plus how to adapt the example to another supported model.
 
-**The command names the selected checks before execution.** For the unflagged demo above, it prints `Selected tests: single-step-grads, single-step-optimizer` beneath the configuration/test-pair count.
+**The command names the selected checks before execution.** The config-only demo reports the applicable set from the five-check registry, not a fixed two-check list.
 
 **The gateway log is retained under `./work/reports/output1/cases/<config-id>/<group>/gateway.log`; no second terminal or manual shutdown is needed.** `./work/reports/output1/full.log` records the exact gateway log path and detailed execution progress. An explicitly configured `--base-url` or `ARCTIC_CORTEX_BASE_URL` connects to an existing service and leaves it running; add `--local-cortex-fixture` for reduced-fixture checks on that loopback service. Remove stale host, base URL or PAT settings when switching back to automatic local execution. A multi-node run needs the allocation's real same-job hostfile and working `ds_ssh`. Reference preparation prints per-worker progress and complete log paths under `./work/logs`; compact reference records and large tensor scratch are separate from these durable logs.
 

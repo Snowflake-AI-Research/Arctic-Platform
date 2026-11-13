@@ -200,9 +200,10 @@ def _configure_fixture_target(args: argparse.Namespace, config, selection: list[
     if (
         getattr(args, "prepare_references", False)
         or getattr(args, "probe_layers", None) is not None
+        or getattr(args, "local_gateway_full_model", False)
         or getattr(args, "backend", "onprem") not in {"cortex", "cortex-training"}
         or (config.is_rl and getattr(args, "test_id", None) != "checkpoint-resume-loss")
-        or not set(selection).intersection((*CALIBRATED_TEST_IDS, "checkpoint-resume-loss"))
+        or not set(selection).intersection((*CALIBRATED_TEST_IDS, "checkpoint-resume-loss", "e2e-sft-train-validate"))
     ):
         return
     from arctic_platform.correctness.harness.execution import _client_backend
@@ -223,7 +224,7 @@ def _configure_fixture_target(args: argparse.Namespace, config, selection: list[
             "Remove hosted ARCTIC_CORTEX_HOST/PAT settings to use the automatically managed local gateway, "
             "or pass --base-url for an existing local gateway. Hosted reduced-model onboarding is unsupported."
         ) from exc
-    if args.test_id in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss"):
+    if args.test_id in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss", "e2e-sft-train-validate"):
         args.local_cortex_fixture = True
     if args.test_id == "checkpoint-resume-loss":
         args._automatic_checkpoint_bridge = True
@@ -1361,7 +1362,7 @@ def _require_validation_pass(validation: dict, description: str, *, config_id: s
     details = validation.get("reason") or "The target did not complete a passing comparison."
     context = f" for {config_id}" if config_id is not None else ""
     raise RuntimeError(
-        f"{description} {validation['status']}{context}\n{details}\n"
+        f"{details}\n{description} {validation['status']}{context}\n"
         f"Report: {validation.get('report') or 'not written'}\nComplete log: {validation['log']}"
     )
 
@@ -1426,7 +1427,10 @@ def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
 
 def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: str = "Validation") -> dict:
     """Run the frozen config exactly as future regression runs will execute it."""
-    automatic_gateway = getattr(args, "_automatic_cortex_gateway", False) and args.test_id in CALIBRATED_TEST_IDS
+    automatic_gateway = getattr(args, "_automatic_cortex_gateway", False) and args.test_id in (
+        *CALIBRATED_TEST_IDS,
+        "e2e-sft-train-validate",
+    )
     bootstrap = _optimizer_validation_bootstrap(args)
     if bootstrap != getattr(args, "_admitted_optimizer_validation_bootstrap", bootstrap):
         raise ValueError("optimizer validation bootstrap/config changed after pre-calibration admission")
@@ -1551,6 +1555,15 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
         if row.get("outcome") not in {"pass", "inapplicable"}
     ]
     reason = "\n".join(failures)
+    batch_path = out_dir / "batch.json"
+    if batch_path.exists() and json.loads(batch_path.read_text()).get("stopped_unsafe") is True:
+        from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
+
+        raise UnsafeCleanupError(
+            f"{reason or 'Target execution stopped because owned cleanup could not be verified.'}\n"
+            "Further onboarding stopped; owned worker cleanup must be verified before another test.\n"
+            f"Report: {report_path if report is not None else 'not written'}\nComplete log: {log_path}"
+        )
     try:
         outcome = _validation_outcome(returncode, output, report)
     except RuntimeError as exc:
@@ -1965,7 +1978,7 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
                 "optimizer reference preparation returned target results instead of reference-only success"
             )
         paths = sorted(
-            (ctx.reference_records_dir / reference_config_subpath(config.path, config.config_id) / test_id).glob(
+            (ctx.reference_records_dir / reference_config_subpath(config.path, config.config_id) / test_id).rglob(
                 "*.json"
             )
         )
@@ -2204,10 +2217,11 @@ def _parent(args: argparse.Namespace) -> int:
         getattr(args, "backend", "onprem") != "cortex"
         or (config.is_rl and args.test_id != "checkpoint-resume-loss")
         or getattr(args, "local_gateway_full_model", False)
-        or args.test_id not in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss")
+        or args.test_id not in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss", "e2e-sft-train-validate")
     ):
         raise ValueError(
-            "local Cortex fixture onboarding requires supervised Cortex gradients or optimizer, or checkpoint-resume"
+            "local Cortex fixture onboarding requires supervised Cortex gradients, optimizer or E2E, "
+            "or checkpoint-resume"
         )
     if getattr(args, "backend", "onprem") == "cortex":
         from arctic_platform.correctness.harness.execution import _client_backend

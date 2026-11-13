@@ -14,7 +14,7 @@
 - `lora` means the selected job has nonempty parameter-efficient fine-tuning (PEFT) settings for low-rank adaptation (LoRA); otherwise use `full`. Inspect the selected training or sampling job, not an unrelated sub-job.
 - `<gpu>` comes from explicit recipe hardware, an existing accelerator directory or filename, or the executing GPU. If none identifies the hardware, report the missing prerequisite rather than guess a GPU type.
 
-**Reference folders mirror the config-relative path with the extension removed.** A config at `configs/qwen3-8b/standard/h200-training-full.json` uses `reference_data/qwen3-8b/standard/h200-training-full/<check-id>/...`. An explicit `--reference-records-dir` changes only the root prefix; the model, sequence-choice and recipe-stem directories remain. Check-specific subdirectories and measurement filenames are unchanged.
+**Reference folders mirror the config-relative path with the extension removed.** A config at `configs/qwen3-8b/standard/h200-training-full.json` uses `reference_data/qwen3-8b/standard/h200-training-full/<check-id>/...`. An explicit `--reference-records-dir` changes only the root prefix; the model, sequence-choice and recipe-stem directories remain. Each first-two workload has a `rows-per-gas-<count>` subdirectory, where `<count>` is the synthetic batch's row count divided by its gradient accumulation steps (GAS). For example, an eight-GPU recipe uses eight GAS1 rows and thirty-two GAS4 rows under `rows-per-gas-8`; its sixteen-GPU placement uses sixteen and sixty-four rows under `rows-per-gas-16`. The two reference sets coexist because their inputs differ. Existing unscoped or content-addressed records remain reusable only with an exact identity match and no newer published set for that workload.
 
 **The `arctic_platform/correctness/config-layout.json` manifest preserves existing frozen config IDs independently of placement.** Moving an existing config or its reference folder does not rename its specification, relabel recorded numerical identities, remeasure references or rewrite historical measurement bytes. Use the manifest-backed ID shown by `list` and the command's resolved config output; do not infer an existing ID from the new directory name. A placement-only move is not reference preparation and does not make a historically incompatible identity compatible.
 
@@ -62,12 +62,12 @@ python -m arctic_platform.correctness onboard \
 **Each workload folder retains only its latest complete reference set.** Compact records default to the local, Git-ignored `arctic_platform/correctness/reference_data` directory; they are generated artifacts, not files to commit. Override the directory with `--reference-records-dir` on both onboarding and regression. Publication requires a location inside the checkout, not Git tracking. For `configs/qwen3-8b/standard/h200-training-full.json`, the readable filenames below are relative to that reference root:
 
 ```text
-qwen3-8b/standard/h200-training-full/single-step-grads/gradients-only/gas1.json
-qwen3-8b/standard/h200-training-full/single-step-grads/gradients-only/gas4.json
-qwen3-8b/standard/h200-training-full/single-step-grads/with-optimizer/gas1.json
-qwen3-8b/standard/h200-training-full/single-step-grads/with-optimizer/gas4.json
-qwen3-8b/standard/h200-training-full/single-step-optimizer/gas1.json
-qwen3-8b/standard/h200-training-full/single-step-optimizer/gas4.json
+qwen3-8b/standard/h200-training-full/single-step-grads/gradients-only/rows-per-gas-8/gas1.json
+qwen3-8b/standard/h200-training-full/single-step-grads/gradients-only/rows-per-gas-8/gas4.json
+qwen3-8b/standard/h200-training-full/single-step-grads/with-optimizer/rows-per-gas-8/gas1.json
+qwen3-8b/standard/h200-training-full/single-step-grads/with-optimizer/rows-per-gas-8/gas4.json
+qwen3-8b/standard/h200-training-full/single-step-optimizer/rows-per-gas-8/gas1.json
+qwen3-8b/standard/h200-training-full/single-step-optimizer/rows-per-gas-8/gas4.json
 qwen3-8b/standard/h200-training-full/e2e-sft-train-validate/trajectory.json
 ```
 

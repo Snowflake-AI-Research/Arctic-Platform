@@ -52,7 +52,6 @@ from arctic_platform.correctness.harness.gateway import gateway
 from arctic_platform.correctness.harness.gateway import pack
 from arctic_platform.correctness.harness.gateway import rl_gpu_count
 from arctic_platform.correctness.harness.gateway import running_job
-from arctic_platform.correctness.harness.gateway import validate_reduced_fixture_support
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
 from arctic_platform.correctness.harness.sft import save
@@ -333,8 +332,8 @@ def cortex_unavailable_reason(test, published_fixture: dict | None = None) -> st
         if published_fixture is not None:
             return None
         return (
-            "Cortex comparison requires the reviewed reduced HF weights to be published; "
-            "publish through a supported model-distribution route and pass the binding with --cortex-fixture"
+            "Cortex comparison requires the reviewed reduced HF weights to be published; publish through a supported"
+            " model-distribution route and pass the binding with --cortex-fixture"
         )
     if test.compares_to_reference:
         return "Cortex cannot load the reviewed node-local reduced reference checkpoint"
@@ -363,7 +362,7 @@ def _cortex_rejection(
     native_first_two_adapter = (
         local_cortex_fixture
         and native_adapter_initialization
-        and test.test_id in {"single-step-grads", "single-step-optimizer"}
+        and (test.test_id in {"single-step-grads", "single-step-optimizer"})
     )
     if (
         reason is None
@@ -445,9 +444,9 @@ def execute(
     native_first_two_adapter = bool(
         local_cortex_fixture
         and isinstance(client_backend, CortexConfig)
-        and not cfg.is_rl
+        and (not cfg.is_rl)
         and select
-        and set(select) <= {"single-step-grads", "single-step-optimizer"}
+        and (set(select) <= {"single-step-grads", "single-step-optimizer"})
     )
     if local_gateway_lora_save0:
         raise ValueError("deterministic LoRA SAVE0 execution is retired; use --peft-adapter on-prem")
@@ -458,17 +457,17 @@ def execute(
         if (
             cfg.is_rl
             or not cfg.training.get("peft_config")
-            or not select
-            or not set(select) <= {"single-step-grads", "single-step-optimizer"}
+            or (not select)
+            or (not set(select) <= {"single-step-grads", "single-step-optimizer"})
             or (
                 not prepare_references
-                and not isinstance(client_backend, OnPremConfig)
-                and not native_first_two_adapter
+                and (not isinstance(client_backend, OnPremConfig))
+                and (not native_first_two_adapter)
             )
         ):
             raise ValueError(
-                "supplied PEFT adapter requires on-prem or explicit local Cortex first-two SFT checks "
-                "or their reference preparation"
+                "supplied PEFT adapter requires on-prem or explicit local Cortex first-two SFT checks or their"
+                " reference preparation"
             )
         peft_adapter = require_data_fast_path(peft_adapter, label="shared PEFT adapter").resolve(strict=True)
         shared_adapter_identity = adapter_identity(peft_adapter, cfg.training["peft_config"])
@@ -479,14 +478,14 @@ def execute(
         if (
             not local_cortex_fixture
             or prepare_references
-            or not supports_dense_checkpoint_allocation(cfg)
-            or not isinstance(client_backend, CortexConfig)
-            or not select
-            or "single-step-optimizer" not in select
-            or not set(select) <= {"single-step-grads", "single-step-optimizer"}
-            or native_optimizer_scope is not None
-            or native_optimizer_scope_source is not None
-            or native_optimizer_supplier_source is not None
+            or (not supports_dense_checkpoint_allocation(cfg))
+            or (not isinstance(client_backend, CortexConfig))
+            or (not select)
+            or ("single-step-optimizer" not in select)
+            or (not set(select) <= {"single-step-grads", "single-step-optimizer"})
+            or (native_optimizer_scope is not None)
+            or (native_optimizer_scope_source is not None)
+            or (native_optimizer_supplier_source is not None)
         ):
             raise ValueError("dense checkpoint allocation requires exclusive local Cortex SP1/EP1 optimizer capture")
         require_local_cortex_gateway(client_backend)
@@ -504,10 +503,10 @@ def execute(
             not local_cortex_fixture
             or prepare_references
             or cfg.is_rl
-            or not select
-            or "single-step-optimizer" not in select
-            or not set(select) <= {"single-step-grads", "single-step-optimizer"}
-            or not isinstance(client_backend, CortexConfig)
+            or (not select)
+            or ("single-step-optimizer" not in select)
+            or (not set(select) <= {"single-step-grads", "single-step-optimizer"})
+            or (not isinstance(client_backend, CortexConfig))
         ):
             raise ValueError("native optimizer scope requires explicit local Cortex optimizer selection")
         require_local_cortex_gateway(client_backend)
@@ -579,7 +578,7 @@ def execute(
         if not isinstance(client_backend, CortexConfig):
             raise ValueError("--cortex-fixture requires --backend cortex")
         published_fixture = load_fixture(cortex_fixture, spec)
-    if isinstance(client_backend, CortexConfig) and not prepare_references:
+    if isinstance(client_backend, CortexConfig) and (not prepare_references):
         rejected = []
         for test in chosen:
             if test.test_id not in spec.applicable_tests:
@@ -596,7 +595,6 @@ def execute(
                 results.append(rejection)
                 rejected.append(test)
         chosen = [test for test in chosen if test not in rejected]
-
     for test in tests.values():
         if select is not None and test.test_id not in select:
             continue
@@ -610,19 +608,13 @@ def execute(
                     reason=spec.inapplicable.get(test.test_id, "not listed as applicable in the spec"),
                 )
             )
-
     chosen = [t for t in chosen if t.test_id in spec.applicable_tests]
     if not chosen:
         return _at_width(results, cfg.n_gpus)
-
     if reference_token_budget is None:
         reference_token_budget = correctness_microbatch_tokens(cfg.max_tokens_per_mb)
-
-    # Both checks read one execution. The optimizer comparison is the constrained side -- it holds an fp32
-    # master and two Adam states per parameter -- so where the two disagree on a model slice or a token
-    # budget, its choice is the one that fits both.
     stepping = next((t for t in chosen if t.test_id == "single-step-optimizer"), None)
-    optimizer_settings = (spec.test_settings.get("single-step-optimizer") or {}) if stepping else {}
+    optimizer_settings = spec.test_settings.get("single-step-optimizer") or {} if stepping else {}
     optimizer_config = cfg.training.get("optimizer") if stepping else None
     if stepping:
         if not isinstance(optimizer_config, dict):
@@ -642,7 +634,6 @@ def execute(
     tmp = workdir if workdir is not None else correctness_workdir("ap-correctness-")
     tmp.mkdir(parents=True, exist_ok=True)
     attn_impl = attn or cfg.attention_implementation
-
     batch_paths: Dict[str, Path] = {}
     arm_specs: List[ArmSpec] = []
     for definition in arm_defs:
@@ -665,7 +656,6 @@ def execute(
                 pad_fraction=batch.pad_fraction,
             )
         )
-
     context = RunContext(
         config_id=cfg.config_id,
         cfg=cfg,
@@ -685,9 +675,8 @@ def execute(
         inference_export_allocation=deepcopy(inference_export_allocation),
         inference_initial_model_dir=inference_initial_model_dir,
         prepare_references=prepare_references,
-        **({"reference_records_dir": reference_records_dir} if reference_records_dir is not None else {}),
+        **{"reference_records_dir": reference_records_dir} if reference_records_dir is not None else {},
     )
-
     run_started = time.monotonic()
     per_arm_tests = [t for t in chosen if t.per_arm is not None]
     whole_run_tests = [t for t in chosen if t.per_arm is None]
@@ -699,7 +688,7 @@ def execute(
     def payload_for(arm: ArmSpec) -> dict:
         """One job per case, asking for the optimizer artifacts only when the step check reads them."""
         optimizer_state_output_dir = None
-        if stepping and not isinstance(client_backend, CortexConfig):
+        if stepping and (not isinstance(client_backend, CortexConfig)):
             optimizer_state_output_dir = require_data_fast_path(
                 tmp / "optimizer" / "ap" / arm.name, label="optimizer artifact output"
             )
@@ -713,11 +702,9 @@ def execute(
             gradient_norms_per_param=collect_gradient_norms,
             weight_format=cfg.sub_job.get("weight_format"),
         )
+        maybe_bind_reduced_fixture_mtp(payload, spec, published_fixture)
         if first_two_payload:
-            validate_reduced_fixture_support(payload, spec, published_fixture)
             payload["training_config"]["debug"]["correctness_first_two"] = True
-        else:
-            maybe_bind_reduced_fixture_mtp(payload, spec, published_fixture)
         if isinstance(client_backend, CortexConfig):
             payload["training_config"]["debug"].pop("optimizer_state_output_dir", None)
             if cfg.gpu_type is not None:
@@ -729,11 +716,7 @@ def execute(
 
                 if adapter_identity(context.reference_adapter_path) != shared_adapter_identity:
                     raise ValueError("shared adapter changed before native target binding")
-                return bind_payload(
-                    payload,
-                    context.reference_adapter_path,
-                    native_backend=client_backend,
-                )
+                return bind_payload(payload, context.reference_adapter_path, native_backend=client_backend)
             payload["training_config"]["debug"]["shared_peft_adapter"] = {
                 "path": str(context.reference_adapter_path),
                 "identity": deepcopy(shared_adapter_identity),
@@ -754,17 +737,14 @@ def execute(
                     output_dir=tmp / "optimizer" / "ap" / arm.name,
                     expected_dp_world_size=cfg.n_gpus if supplier is not None else cfg.dp_size,
                     optimizer_config=optimizer_config,
-                    **({"local_checkpoint": True} if local_cortex_fixture else {}),
+                    **{"local_checkpoint": True} if local_cortex_fixture else {},
                     **(
                         {"dense_checkpoint_allocation": deepcopy(dense_checkpoint_allocation)}
                         if dense_checkpoint_allocation is not None
                         else {}
                     ),
                     **(
-                        {
-                            "native_layout_supplier": supplier,
-                            "native_layout_supplier_source": supplier_source,
-                        }
+                        {"native_layout_supplier": supplier, "native_layout_supplier_source": supplier_source}
                         if supplier is not None
                         else {}
                     ),
@@ -795,12 +775,7 @@ def execute(
                     if primary is None:
                         raise
                     primary.add_note(f"Native optimizer scope source verification also failed: {error}")
-        return fwd_bwd_step(
-            session,
-            job,
-            body,
-            learning_rate=OPTIMIZER_LEARNING_RATE if stepping else 0.0,
-        )
+        return fwd_bwd_step(session, job, body, learning_rate=OPTIMIZER_LEARNING_RATE if stepping else 0.0)
 
     def body_for(arm: ArmSpec) -> dict:
         batch = load_batch(batch_paths[arm.name])
@@ -815,8 +790,8 @@ def execute(
 
             if (
                 not prepare_references
-                and not isinstance(client_backend, OnPremConfig)
-                and not native_first_two_adapter
+                and (not isinstance(client_backend, OnPremConfig))
+                and (not native_first_two_adapter)
             ):
                 raise ValueError("shared PEFT adapter initialization requires the on-prem correctness worker")
             peft_adapter = generate_adapter(
@@ -829,23 +804,17 @@ def execute(
     context.reference_adapter_path = reference_adapter_path
     if (
         reference_adapter_path is not None
-        and not prepare_references
-        and not isinstance(client_backend, OnPremConfig)
-        and not native_first_two_adapter
+        and (not prepare_references)
+        and (not isinstance(client_backend, OnPremConfig))
+        and (not native_first_two_adapter)
     ):
         raise ValueError("supplied PEFT adapters require the on-prem correctness worker")
-    if reference_adapter_path is not None and native_first_two_adapter and not prepare_references and arm_specs:
-        # Reject an unsupported native pack before reading references or allocating target resources.
+    if reference_adapter_path is not None and native_first_two_adapter and (not prepare_references) and arm_specs:
         payload_for(arm_specs[0])
-
     from arctic_platform.correctness.harness.sft import load as load_batch
 
     def measure_reference(
-        arm: ArmSpec,
-        *,
-        output_name: str | None = None,
-        cuda_device: int | None = None,
-        deterministic: bool = True,
+        arm: ArmSpec, *, output_name: str | None = None, cuda_device: int | None = None, deterministic: bool = True
     ) -> dict:
         started = time.monotonic()
         output_name = output_name or arm.name
@@ -898,8 +867,8 @@ def execute(
                 raise ValueError("shared adapter changed during HF reference execution")
         except Exception:
             print(
-                f"HF reference failed: arm={arm.name}, run={output_name}, device={device}, "
-                f"elapsed={time.monotonic() - started:.1f}s",
+                f"HF reference failed: arm={arm.name}, run={output_name}, device={device},"
+                f" elapsed={time.monotonic() - started:.1f}s",
                 flush=True,
             )
             raise
@@ -972,8 +941,10 @@ def execute(
                 records[test_id] = load_record(context, identity)
             except ReferencePrerequisiteError as exc:
                 if not prepare_references or not any(
-                    message in str(exc)
-                    for message in ("prepared HF reference missing:", "prepared HF reference incompatible:")
+                    (
+                        message in str(exc)
+                        for message in ("prepared HF reference missing:", "prepared HF reference incompatible:")
+                    )
                 ):
                     raise
         if len(records) != len(identities):
@@ -998,8 +969,8 @@ def execute(
                     learning_rate=OPTIMIZER_LEARNING_RATE,
                 )
                 print(
-                    f"Onboarding optimizer norm gate: {reference_calibration_runs} HF runs, "
-                    f"{calibration_workers} worker(s), arm={arm.name}",
+                    f"Onboarding optimizer norm gate: {reference_calibration_runs} HF runs,"
+                    f" {calibration_workers} worker(s), arm={arm.name}",
                     flush=True,
                 )
                 manifests = []
@@ -1024,10 +995,10 @@ def execute(
                             completed=len(manifests),
                         ):
                             completed[index] = Path(result["optimizer_state_manifest"])
-                        manifests.extend(completed[index] for index in indices)
+                        manifests.extend((completed[index] for index in indices))
                 print(
-                    f"\n*** Optimizer Norm Summary: {arm.name} ***\n"
-                    f"Reading saved optimizer states from {len(manifests)} completed HF runs.",
+                    f"\n*** Optimizer Norm Summary: {arm.name} ***\nReading saved optimizer states from"
+                    f" {len(manifests)} completed HF runs.",
                     flush=True,
                 )
                 summary_started = time.monotonic()
@@ -1036,9 +1007,8 @@ def execute(
                 )
                 spread = worst.delta_norm if worst is not None else 0.0
                 print(
-                    f"Optimizer norm summary complete: arm={arm.name}, "
-                    f"elapsed={time.monotonic() - summary_started:.1f}s, "
-                    f"maximum_pairwise_norm_delta={spread:.9e}\n",
+                    f"Optimizer norm summary complete: arm={arm.name},"
+                    f" elapsed={time.monotonic() - summary_started:.1f}s, maximum_pairwise_norm_delta={spread:.9e}\n",
                     flush=True,
                 )
                 quantum = Decimal("0.001")
@@ -1077,13 +1047,12 @@ def execute(
                 if test_id not in records:
                     records[test_id] = compact
         if prepare_references:
-            prepared_entries.extend((identity, records[test_id]) for test_id, identity in identities.items())
+            prepared_entries.extend(((identity, records[test_id]) for test_id, identity in identities.items()))
         primary = "single-step-optimizer" if stepping else "single-step-grads"
         context._reference_by_check[arm.name] = records
         context._reference[arm.name] = records[primary]
         context._timing.setdefault(arm.name, {})["reference"] = 0.0
 
-    # Validate every prerequisite before allocating any target job, including arm-at-a-time runs.
     for arm in arm_specs if per_arm_tests else []:
         prepared_reference(arm)
     if prepare_references:
@@ -1091,9 +1060,7 @@ def execute(
             list(test.fn(context))
         if prepared_entries:
             publish_record_set(
-                context,
-                prepared_entries,
-                expected_identities=[identity for identity, _ in prepared_entries],
+                context, prepared_entries, expected_identities=[identity for identity, _ in prepared_entries]
             )
         print(f"HF reference preparation complete: {len(context.reference_record_paths)} record(s)", flush=True)
         return []
@@ -1107,7 +1074,7 @@ def execute(
                 result = test.per_arm(context, arm)
             except UnsafeCleanupError:
                 raise
-            except Exception as exc:  # noqa: BLE001 - one failing test must not hide the rest
+            except Exception as exc:
                 traceback.print_exc()
                 result = TestResult(
                     test_id=test.test_id,
@@ -1133,7 +1100,7 @@ def execute(
                     context._timing.setdefault(arm.name, {})["ap"] = time.monotonic() - started
         except UnsafeCleanupError:
             raise
-        except Exception as exc:  # noqa: BLE001 - startup failures must also reach the report
+        except Exception as exc:
             traceback.print_exc()
             execution_errors.add(arm.name)
             for test in per_arm_tests:
@@ -1154,10 +1121,6 @@ def execute(
     measured: List[ArmSpec] = []
     if per_arm_tests:
         if order == "batched":
-            # One job per case, sharing the gateway. Reading the gradient norms costs an optimizer update,
-            # because ``/step`` is the only endpoint that returns them, so a job that has served one case is
-            # no longer holding the checkpoint's weights. Sharing it would make each case depend on the ones
-            # before it and on the order they ran in.
             with ExitStack() as stack:
                 with console.activity("Starting Arctic Platform gateway"):
                     url = stack.enter_context(gateway(tmp, cfg.n_gpus, backend=client_backend))
@@ -1181,7 +1144,6 @@ def execute(
                 measured.append(arm)
                 if judge(arm) and fail_fast:
                     break
-
     skipped = (
         [a.name for a in arm_specs if a not in measured and a.name not in execution_errors] if per_arm_tests else []
     )
@@ -1190,14 +1152,13 @@ def execute(
             print(console.stopped_early(skipped), flush=True)
         print(console.runtime_table(context._timing, time.monotonic() - run_started), flush=True)
         return _at_width(results, cfg.n_gpus)
-
     by_name = {arm.name: arm for arm in arm_specs}
     for test in whole_run_tests:
         try:
             produced = list(test.fn(context))
         except UnsafeCleanupError:
             raise
-        except Exception as exc:  # noqa: BLE001 - one failing test must not hide the rest
+        except Exception as exc:
             traceback.print_exc()
             produced = [
                 TestResult(
@@ -1208,8 +1169,6 @@ def execute(
                     error_type=type(exc).__name__,
                 )
             ]
-        # Printed here as well as in judge(): a result that is computed but never shown reads as a test
-        # that silently did not run.
         for result in produced:
             print(
                 console.arm_verdict(result, by_name.get(result.arm), context._timing.get(result.arm or "")), flush=True

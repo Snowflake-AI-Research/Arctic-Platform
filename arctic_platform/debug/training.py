@@ -192,7 +192,7 @@ def maybe_bind_reduced_fixture_mtp(payload, spec, published_fixture) -> None:
         raise ValueError("reduced fixture MTP descriptor must not be supplied or overwritten")
     if (
         published_fixture is None
-        or training.get("model_provider") != "prime_rl"
+        or training.get("model_provider") not in {"arctic", "prime_rl"}
         or type(spec.model.seed) is not int
         or spec.model.seed != 0
     ):

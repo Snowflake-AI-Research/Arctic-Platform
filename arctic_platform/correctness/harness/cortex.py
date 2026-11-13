@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import hashlib
@@ -500,10 +501,110 @@ class _LocalLoadRoute(_Route):
         return reply
 
 
+def _creation_failure_detail(reason):
+    """Decode the local gateway's structured detail, including SnowAPI's HTTPException repr."""
+    if isinstance(reason, str):
+        if len(reason) > 65536:
+            return None
+        start = reason.find("{")
+        if start < 0:
+            return None
+        try:
+            reason = json.loads(reason[start:])
+        except ValueError:
+            try:
+                reason = ast.literal_eval(reason[start:])
+            except (ValueError, SyntaxError, RecursionError):
+                return None
+        except RecursionError:
+            return None
+    if not isinstance(reason, dict):
+        return None
+    return reason.get("detail", reason)
+
+
+def _creation_failure_traceback(text: str, child: str) -> str | None:
+    marker = f"Failed to create job {child}"
+    found = None
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        message = record.get("msg")
+        if message == marker and isinstance(record.get("exc"), str):
+            found = record["exc"]
+        elif isinstance(message, str) and message.startswith(marker + "\n"):
+            found = message[len(marker) + 1 :]
+    if found is not None:
+        return found
+    # Interactive servers can use the human formatter instead of JSON records.
+    match = re.search(rf"^.*{re.escape(marker)}\s*$", text, flags=re.MULTILINE)
+    if match is None:
+        return None
+    tail = text[match.end() :].lstrip()
+    end = re.search(r"^(?:\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}|\{).*", tail, flags=re.MULTILINE)
+    return tail[: end.start() if end else len(tail)].strip() or None
+
+
+def _local_creation_failure(reason, children: dict) -> str | None:
+    detail = _creation_failure_detail(reason)
+    if not isinstance(detail, dict):
+        return None
+    child = next((value for value in children.values() if detail.get("message") == f"job {value} failed"), None)
+    zone, log_path = detail.get("zone_id"), detail.get("zone_log_path")
+    if child is None or not isinstance(zone, str) or not re.fullmatch(r"[\w-]+", zone):
+        return None
+    if not isinstance(log_path, str):
+        return None
+    path = Path(log_path)
+    if not path.is_absolute() or path.name != f"{zone}.log":
+        return None
+    try:
+        if path.resolve() != path:
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                return None
+            stream.seek(max(0, info.st_size - (1 << 20)))
+            text = stream.read(1 << 20).decode("utf-8", errors="replace")
+    except (OSError, ValueError):
+        return None
+    remote_traceback = _creation_failure_traceback(text, child)
+    if remote_traceback is None:
+        return None
+    remote_traceback = re.sub(r"\x1b\[[0-9;]*m", "", remote_traceback)
+    causes = re.findall(r"^[\w.]+(?:Error|Exception):[^\n]*", remote_traceback, flags=re.MULTILINE)
+    if not causes:
+        return None
+    return f"Remote server error: {causes[-1]}\nServer log: {path}\nRemote traceback:\n{remote_traceback}"
+
+
 class CorrectnessCortexTransport(CortexTransport):
     def _is_local_gateway(self) -> bool:
         parsed = urlsplit(self.config.base_url or "")
         return parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+
+    def _job(self) -> dict:
+        job = super()._job()
+        self._startup_status = job
+        return job
+
+    def _wait_running(self) -> None:
+        self._startup_status = None
+        try:
+            super()._wait_running()
+        except RuntimeError as exc:
+            job = self._startup_status
+            if self._is_local_gateway() and isinstance(job, dict):
+                diagnostic = _local_creation_failure(job.get("reason"), self._native_children)
+                if diagnostic is not None:
+                    raise RuntimeError(f"{diagnostic}\n\n{exc}") from exc
+            raise
 
     def initialize(self, client_config: CortexTrainingConfig) -> JobHandles:
         self.hardware = client_config.hardware

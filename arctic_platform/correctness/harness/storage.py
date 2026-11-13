@@ -1196,8 +1196,10 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
             not isinstance(norms, dict)
             or not norms
             or any(
-                not isinstance(name, str) or not isinstance(value, (int, float)) or value < 0
-                for name, value in norms.items()
+                (
+                    not isinstance(name, str) or not isinstance(value, (int, float)) or value < 0
+                    for name, value in norms.items()
+                )
             )
         ):
             raise ReferencePrerequisiteError("reference gradient norms must be complete finite nonnegative scalars")
@@ -1214,8 +1216,8 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
             if (
                 gate.get("status") != "reviewed"
                 or not isinstance(provenance, (str, dict))
-                or not provenance
-                or (isinstance(provenance, str) and not provenance.strip())
+                or (not provenance)
+                or (isinstance(provenance, str) and (not provenance.strip()))
             ):
                 raise ReferencePrerequisiteError("optimizer norm gate has no onboarding review provenance")
             if type(gate.get("absolute")) not in {int, float} or gate["absolute"] < 0:
@@ -1269,7 +1271,7 @@ def _config_dir(ctx, identity: dict) -> Path:
     return directory
 
 
-def _record_path(ctx, identity: dict) -> Path:
+def _unscoped_record_path(ctx, identity: dict) -> Path:
     directory = _config_dir(ctx, identity) / identity["check_id"]
     if identity["check_id"] == "e2e-sft-train-validate":
         return directory / "trajectory.json"
@@ -1282,8 +1284,43 @@ def _record_path(ctx, identity: dict) -> Path:
     return directory / f"{arm}.json"
 
 
+def _record_path(ctx, identity: dict) -> Path:
+    path = _unscoped_record_path(ctx, identity)
+    if identity["check_id"] == "e2e-sft-train-validate":
+        return path
+    rows = identity.get("recipe", {}).get("synthetic_inputs", {}).get("rows")
+    if rows is None:
+        return path
+    gas = re.fullmatch(r"gas([1-9][0-9]*)", path.stem)
+    if type(rows) is not int or rows < 1 or gas is None or rows % int(gas[1]) != 0:
+        raise ReferencePrerequisiteError("invalid reference record rows per GAS")
+    # Wider placements scale rows, not sequence length or the reference token budget.
+    return path.parent / f"rows-per-gas-{rows // int(gas[1])}" / path.name
+
+
 def _legacy_record_path(ctx, identity: dict) -> Path:
     return _config_dir(ctx, identity) / identity["check_id"] / f"{_digest(identity)}.json"
+
+
+def _existing_record_path(ctx, identity: dict) -> Path:
+    path = _record_path(ctx, identity)
+    latest_files = [
+        item for item in path.parent.glob("*.json") if re.fullmatch(r"[0-9a-f]{64}\.json", item.name) is None
+    ]
+    if latest_files:
+        return path
+    unscoped = _unscoped_record_path(ctx, identity)
+    for candidate in unscoped.parent.glob("*.json"):
+        if re.fullmatch(r"[0-9a-f]{64}\.json", candidate.name):
+            continue
+        if candidate.stat().st_size > MAX_RECORD_BYTES:
+            raise ReferencePrerequisiteError(f"reference record is oversized: {candidate}")
+        record = _strict_record_json(candidate.read_bytes())
+        if not isinstance(record, dict) or not isinstance(record.get("identity"), dict):
+            raise ReferencePrerequisiteError(f"invalid reference record identity: {candidate}")
+        if _record_path(ctx, record["identity"]).parent == path.parent:
+            return unscoped
+    return _legacy_record_path(ctx, identity)
 
 
 @contextmanager
@@ -1376,6 +1413,8 @@ def load_record(ctx, current_identity: dict) -> dict:
         options.append("--local-gateway-full-model")
     if identity["check_id"] != "e2e-sft-train-validate" and recipe.get("token_budget") is not None:
         options.extend(["--reference-token-budget", str(recipe["token_budget"])])
+    if identity["check_id"] != "e2e-sft-train-validate" and getattr(ctx.cfg, "n_gpus", None) is not None:
+        options.extend(["--gpu-pool", str(ctx.cfg.n_gpus)])
     command = (
         "python -m arctic_platform.correctness onboard "
         f"--config {shlex.quote(str(ctx.spec.config_path))} --prepare-references "
@@ -1387,11 +1426,7 @@ def load_record(ctx, current_identity: dict) -> dict:
             raise FileNotFoundError(path)
         with _publication_lock(directory, exclusive=False):
             # Legacy reuse is exact-identity only. Never fall back past a published latest set.
-            latest_files = [
-                item for item in path.parent.glob("*.json") if re.fullmatch(r"[0-9a-f]{64}\.json", item.name) is None
-            ]
-            if not latest_files:
-                path = _legacy_record_path(ctx, identity)
+            path = _existing_record_path(ctx, identity)
             if path.stat().st_size > MAX_RECORD_BYTES:
                 raise ReferencePrerequisiteError(f"reference record is oversized: {path}")
             record = _strict_record_json(path.read_bytes())
@@ -1451,16 +1486,22 @@ def _remove_replaced_legacy_records(ctx, staged: Path, identities: list[dict]) -
     replaced = {_record_path(ctx, identity).parent for identity in identities}
     expected_config_id = identities[0]["config_id"]
     for check_id in {identity["check_id"] for identity in identities}:
-        for path in (staged / check_id).glob("*.json"):
-            if re.fullmatch(r"[0-9a-f]{64}\.json", path.name) is None:
-                continue
+        for path in (staged / check_id).rglob("*.json"):
+            relative = path.relative_to(staged)
             record = _strict_record_json(path.read_bytes())
             identity = record["identity"]
+            current = _record_path(ctx, identity)
+            if relative == current.relative_to(_config_dir(ctx, identity)):
+                continue
             if (
                 record.get("schema") != SCHEMA_VERSION
                 or identity.get("config_id") != expected_config_id
                 or identity.get("check_id") != check_id
-                or path.name != _legacy_record_path(ctx, identity).name
+                or relative
+                not in {
+                    _legacy_record_path(ctx, identity).relative_to(_config_dir(ctx, identity)),
+                    _unscoped_record_path(ctx, identity).relative_to(_config_dir(ctx, identity)),
+                }
                 or record.get("payload_sha256") != _digest(record.get("measurements"))
             ):
                 raise ReferencePrerequisiteError(f"cannot identify legacy reference for replacement: {path}")
@@ -1514,12 +1555,22 @@ def publish_record_set(ctx, entries, *, expected_identities) -> dict[str, Path]:
             existing_arms = {
                 path.name for path in parent.glob("*.json") if re.fullmatch(r"[0-9a-f]{64}\.json", path.name) is None
             }
+            for identity in groups[parent]:
+                unscoped = _unscoped_record_path(ctx, identity)
+                if unscoped.parent == parent:
+                    continue
+                for old in unscoped.parent.glob("*.json"):
+                    if re.fullmatch(r"[0-9a-f]{64}\.json", old.name):
+                        continue
+                    previous = _strict_record_json(old.read_bytes())
+                    if _record_path(ctx, previous["identity"]).parent == parent:
+                        existing_arms.add(old.name)
             expected_arms = {path.name for path in prepared if path.parent == parent}
             if existing_arms - expected_arms:
                 raise ReferencePrerequisiteError("reference replacement must include every previously published arm")
         # A repeated identity cannot silently acquire different measurements, even in a new set.
         for path, data in data_by_path.items():
-            old = path if path.exists() else _legacy_record_path(ctx, prepared[path])
+            old = _existing_record_path(ctx, prepared[path])
             if old.exists():
                 previous = _strict_record_json(old.read_bytes())
                 if previous.get("identity") == prepared[path] and old.read_bytes() != data:
@@ -1531,6 +1582,11 @@ def publish_record_set(ctx, entries, *, expected_identities) -> dict[str, Path]:
             if parent.exists()
         )
         legacy = any(list((directory / identity["check_id"]).glob("[0-9a-f]" * 64 + ".json")) for identity in expected)
+        legacy = legacy or any(
+            _unscoped_record_path(ctx, identity) != _record_path(ctx, identity)
+            and _unscoped_record_path(ctx, identity).exists()
+            for identity in expected
+        )
         if not (unchanged and exact_files and not legacy):
             temporary = Path(tempfile.mkdtemp(prefix=f".set-{directory.name}-", dir=directory.parent))
             staged = temporary / directory.name

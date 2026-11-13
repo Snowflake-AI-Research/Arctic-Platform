@@ -31,6 +31,10 @@
     "config_id": "qwen3-8b-h200-train-sft-lora-4gpus-64k",
     "previous_path": "qwen3-8b/h200/train-sft-lora-4gpus-64k.config"
   },
+  "qwen3.6-35b-a3b/standard/h200-training-full--legacy-batch8.json": {
+    "config_id": "qwen3.6-35b-a3b-h200-train-sft-8gpus-64k",
+    "previous_path": "qwen3.6-35b-a3b/h200/train-sft-8gpus-64k.config"
+  },
   "qwen3.6-35b-a3b/standard/h200-training-full--rl-16gpus-64k.json": {
     "config_id": "qwen3.6-35b-a3b-h200-train-rl-16gpus-64k",
     "previous_path": "qwen3.6-35b-a3b/h200/train-rl-16gpus-64k.config"
@@ -38,10 +42,6 @@
   "qwen3.6-35b-a3b/standard/h200-training-full--sft-8gpus-sp8-64k.json": {
     "config_id": "qwen3.6-35b-a3b-h200-train-sft-full-8gpus-sp8-64k",
     "previous_path": "qwen3.6-35b-a3b/h200/train-sft-full-8gpus-sp8-64k.config"
-  },
-  "qwen3.6-35b-a3b/standard/h200-training-full.json": {
-    "config_id": "qwen3.6-35b-a3b-h200-train-sft-8gpus-64k",
-    "previous_path": "qwen3.6-35b-a3b/h200/train-sft-8gpus-64k.config"
   },
   "qwen3.6-35b-a3b/standard/h200-training-lora.json": {
     "config_id": "qwen3.6-35b-a3b-h200-train-sft-lora-8gpus-sp8-64k",

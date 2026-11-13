@@ -1392,7 +1392,7 @@ def _coordinator_class(training, request: dict, files_ref, *, first_two: bool = 
     worker_base = training._DeepSpeedWorker
 
     class OriginalAdapterWorker(worker_base):
-        # The native constructor takes ``cfg`` alone in current DSS and ``cfg, source_stage_info`` in older DSS.
+
         def __init__(self, cfg, *args, **kwargs):
             import ray
             from dss.ray_dss.jobs.gpu import training as native_training
@@ -1421,6 +1421,7 @@ def _coordinator_class(training, request: dict, files_ref, *, first_two: bool = 
     selected_worker = selected_worker_class(OriginalAdapterWorker) if capture else OriginalAdapterWorker
 
     class OriginalAdapterCoordinator(coordinator_base):
+
         async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
             from dss.ray_dss.jobs.gpu import training as native_training
 
@@ -1429,7 +1430,6 @@ def _coordinator_class(training, request: dict, files_ref, *, first_two: bool = 
                 raise ValueError("native original adapter coordinator layout or configuration differs")
             native_spawn = super()._spawn_workers
             namespace, original_worker = _spawn_worker_binding(native_spawn, native_training, request["sources"])
-            # Ray can deserialize inherited methods with globals separate from the imported module.
             namespace["_DeepSpeedWorker"] = selected_worker
             try:
                 try:
@@ -1440,8 +1440,7 @@ def _coordinator_class(training, request: dict, files_ref, *, first_two: bool = 
                     namespace["_DeepSpeedWorker"] = original_worker
                 _verify_runtime(native_training, request["sources"])
                 receipts = await asyncio.wait_for(
-                    asyncio.gather(*(worker.original_adapter_receipt.remote() for worker in self._workers)),
-                    timeout=60,
+                    asyncio.gather(*(worker.original_adapter_receipt.remote() for worker in self._workers)), timeout=60
                 )
                 _verify_receipts(receipts, request, self._info.job_id)
                 _verify_runtime(native_training, request["sources"])
@@ -1455,7 +1454,6 @@ def _coordinator_class(training, request: dict, files_ref, *, first_two: bool = 
                     flush=True,
                 )
             except BaseException as primary:
-                # Native spawn handles its own failures; receipt failures also require its owned teardown.
                 if self._workers:
                     try:
                         await self._kill_workers([host for host, _ in ranks])
@@ -1491,7 +1489,7 @@ def _shared_coordinator_class(training, request: dict, files_ref, *, first_two: 
     worker_base = training._DeepSpeedWorker
 
     class SharedAdapterWorker(worker_base):
-        # The native constructor takes ``cfg`` alone in current DSS and ``cfg, source_stage_info`` in older DSS.
+
         def __init__(self, cfg, *args, **kwargs):
             import ray
             from dss.ray_dss.jobs.gpu import training as native_training
@@ -1519,6 +1517,7 @@ def _shared_coordinator_class(training, request: dict, files_ref, *, first_two: 
     selected_worker = selected_worker_class(SharedAdapterWorker) if capture else SharedAdapterWorker
 
     class SharedAdapterCoordinator(coordinator_base):
+
         async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
             from dss.ray_dss.jobs.gpu import training as native_training
 
@@ -1541,8 +1540,7 @@ def _shared_coordinator_class(training, request: dict, files_ref, *, first_two: 
                     namespace["_DeepSpeedWorker"] = original_worker
                 _verify_shared_runtime(native_training, request["sources"])
                 receipts = await asyncio.wait_for(
-                    asyncio.gather(*(worker.shared_adapter_receipt.remote() for worker in self._workers)),
-                    timeout=60,
+                    asyncio.gather(*(worker.shared_adapter_receipt.remote() for worker in self._workers)), timeout=60
                 )
                 _verify_shared_receipts(receipts, request, self._info.job_id)
                 _verify_shared_runtime(native_training, request["sources"])
@@ -1608,7 +1606,7 @@ def install_manager(manager) -> None:
             with maybe_select_participation_coordinator(manager_module, actor_key, original_actor, training):
                 return original_spawn(info)
         selected_request = shared_request if shared_request is not None else request
-        if sum(len(node.gpu_ids) for node in info.layout) != selected_request["training_gpus"]:
+        if sum((len(node.gpu_ids) for node in info.layout)) != selected_request["training_gpus"]:
             raise ValueError("native original adapter manager allocation differs")
         if shared_request is not None:
             _verify_shared_runtime(training, shared_request["sources"])

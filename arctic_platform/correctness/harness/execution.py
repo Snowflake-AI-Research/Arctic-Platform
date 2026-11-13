@@ -473,6 +473,7 @@ def _configure_regression_target(args):
         or not (
             set(args.test) <= {"single-step-grads", "single-step-optimizer"}
             or set(args.test) == {"checkpoint-resume-loss"}
+            or set(args.test) == {"e2e-sft-train-validate"}
         )
         or getattr(args, "cortex_fixture", None) is not None
         or getattr(args, "local_gateway_full_model", False)
@@ -621,6 +622,9 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         and selected_ids <= first_two_ids
         and not getattr(args, "_automatic_checkpoint_bridge", False)
     )
+    automatic_e2e = bool(
+        getattr(args, "_automatic_cortex_gateway", False) and selected_ids == {"e2e-sft-train-validate"}
+    )
 
     for path in config_paths:
         automatic_allocation = None
@@ -642,7 +646,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 "backend": "cortex" if remote else "onprem",
                 **({"requested_model_name": cfg.model_name} if remote else {}),
             }
-            pool = (args.gpu_pool or cfg.n_gpus) if remote else available_gpus()
+            pool = args.gpu_pool or cfg.n_gpus if remote else available_gpus()
             if remote:
                 if pool < cfg.n_gpus:
                     raise ValueError(f"GPU pool {pool} is smaller than declared training width {cfg.n_gpus}")
@@ -687,6 +691,12 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 if local_fixture and max(widths) > torch.cuda.device_count():
                     from .engine_admission import owned_allocation_admission
 
+                    automatic_allocation = owned_allocation_admission(cfg.at_gpu_width(max(widths)))
+            if automatic_e2e and local_fixture and not cfg.is_rl:
+                from .engine_admission import owned_allocation_admission
+                from .gateway import _allocation_hostfile
+
+                if _allocation_hostfile() is not None:
                     automatic_allocation = owned_allocation_admission(cfg.at_gpu_width(max(widths)))
         except (ValueError, KeyError) as exc:
             results.append(
@@ -890,7 +900,6 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                     fixture_distribution="local-gateway",
                     gateway_url=backend.base_url,
                 )
-
             print(f"=== {cfg.config_id} ===", flush=True)
             vocab_size = _run_vocab_size(
                 cfg,
@@ -904,7 +913,6 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                     else ({"local_full_model_path": local_full_model_path} if local_full_model else {})
                 ),
             )
-
             for width in widths:
                 multiple = width // cfg.n_gpus
                 run_cfg = cfg.at_gpu_width(width)
@@ -965,19 +973,18 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                             else {}
                         ),
                         **(
-                            {"peft_adapter": Path(args.peft_adapter)}
-                            if getattr(args, "peft_adapter", None) is not None
+                            {"dense_checkpoint_allocation": copy.deepcopy(run_dense_allocation)}
+                            if run_dense_allocation is not None
                             else {}
                         ),
                         **(
-                            {"dense_checkpoint_allocation": copy.deepcopy(run_dense_allocation)}
-                            if run_dense_allocation is not None
+                            {"peft_adapter": Path(args.peft_adapter)}
+                            if getattr(args, "peft_adapter", None) is not None
                             else {}
                         ),
                         **native_optimizer,
                     )
                 )
-
     if snapshot is not None:
         snapshot(results, specs, execution)
     return _finish(results, specs, Path(args.out), configs=len(config_paths), started=started, execution=execution)
@@ -1298,8 +1305,8 @@ def parse_args(argv=None):
             choices=["batched", "per-arm"],
             default="batched",
             help=(
-                "batched pays one gateway startup for all arms; per-arm runs "
-                "reference then Arctic Platform for one arm before the next begins"
+                "batched pays one gateway startup for all arms; per-arm runs reference then Arctic Platform for one"
+                " arm before the next begins"
             ),
         )
         p.add_argument("--fail-fast", action="store_true", help="stop after the first arm whose verdict is not a pass")
@@ -1308,8 +1315,8 @@ def parse_args(argv=None):
             "--any-gpu",
             action="store_true",
             help=(
-                "run a config on a GPU type its path does not name; the budgets and offload "
-                "choices in it were sized for another accelerator"
+                "run a config on a GPU type its path does not name; the budgets and offload choices in it were sized"
+                " for another accelerator"
             ),
         )
 
@@ -1362,8 +1369,8 @@ def parse_args(argv=None):
         "--case",
         action="append",
         help=(
-            "case name to run, e.g. gas1 (repeatable); default every case in the spec. "
-            "Use this to see the output quickly: gas1 is one sequence and no accumulation"
+            "case name to run, e.g. gas1 (repeatable); default every case in the spec. Use this to see the output"
+            " quickly: gas1 is one sequence and no accumulation"
         ),
     )
     r.add_argument(
@@ -1392,7 +1399,6 @@ def parse_args(argv=None):
         help="use the pinned original offline model on the existing loopback gateway for e2e/inference",
     )
     r.set_defaults(func=cmd_run, compact_output=True)
-
     publish = sub.add_parser("publish-fixture", help="publish reviewed reduced weights as a separate dev model")
     publish.add_argument("--config", required=True)
     publish.add_argument("--staging-dir", default="/data-fast/tmp/ap-cortex-fixtures")
@@ -1403,11 +1409,9 @@ def parse_args(argv=None):
     )
     publish.add_argument("--out", required=True, help="new publication receipt JSON path")
     publish.set_defaults(func=cmd_publish_fixture)
-
     list_parser = sub.add_parser("list", help="show registered tests")
     list_parser.add_argument("--config-dir", default=str(CONFIG_DIR))
     list_parser.set_defaults(func=cmd_list)
-
     h = sub.add_parser(
         "hosted",
         help="run Arctic Platform-against-Arctic Platform checks on the hosted server, which supplies the GPUs",
@@ -1415,27 +1419,21 @@ def parse_args(argv=None):
     shared(h)
     add_connection_arguments(h)
     h.add_argument(
-        "--test",
-        action="append",
-        required=True,
-        help="check id to run (repeatable); requires reviewed applicability",
+        "--test", action="append", required=True, help="check id to run (repeatable); requires reviewed applicability"
     )
     h.add_argument(
         "--case", action="append", help="case name to run, e.g. gas1 (repeatable); default every case in the spec"
     )
     h.add_argument("--out", default="correctness-report-hosted")
     h.set_defaults(func=cmd_hosted, compact_output=True)
-
     s = sub.add_parser("selftest", help="check the harness itself; no GPU and no config needed")
     s.add_argument("runner_args", nargs="*", help="extra arguments forwarded to the runner")
     s.set_defaults(func=cmd_selftest)
-
     from ..onboarding import add_arguments
 
     o = sub.add_parser("onboard", help="size, calibrate, and freeze one config")
     add_arguments(o)
     o.set_defaults(func=cmd_onboard)
-
     return parser.parse_args(argv)
 
 
