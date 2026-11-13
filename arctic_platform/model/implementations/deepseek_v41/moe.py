@@ -52,8 +52,9 @@ def _integer_histc_on_cpu():
 
 
 class DeepseekV41MoE(MoE):
-    # A weights-only checkpoint carries the image-token routing bias, as published; weight sync leaves it out.
-    _dss_weight_export_buffers = frozenset({"bias_vl"})
+    # The image-token routing bias never trains, but vLLM holds it as a parameter of the router gate, next to its
+    # weight; an online-FP8 sampler's reload rewrites every tensor of the gate, so the weight sync carries it too.
+    _dss_weight_sync_buffers = frozenset({"bias_vl"})
 
     def __init__(self, config: DeepseekV41Config, layer_idx: int):
         if config.hidden_act != "silu":

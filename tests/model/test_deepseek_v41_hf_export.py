@@ -208,14 +208,23 @@ def test_published_checkpoint_round_trips_through_the_layer_export(packed):
     _assert_same(_export_groups(model), hf)
 
 
-def test_weight_sync_groups_leave_the_routing_bias_out():
+def test_weight_sync_groups_carry_the_routing_biases():
+    """vLLM holds the image-token routing bias as a parameter of the router gate, next to its weight, and an
+    online-FP8 sampler's reload rewrites every tensor of the gate: the never-trained bias goes with the sync too."""
     config = _config()
     torch.manual_seed(0)
     model = DeepseekV41ForCausalLM(config)
     synced = _export_groups(model, include_buffers=False)
-    assert not any(name.endswith(".bias_vl") for name in synced)
-    assert all(f"layers.{i}.ffn.gate.bias" in synced for i in range(config.num_hidden_layers))
-    assert "layers.1.ffn.gate.bias_vl" in _export_groups(model)
+    for i in range(config.num_hidden_layers):
+        assert f"layers.{i}.ffn.gate.bias" in synced and f"layers.{i}.ffn.gate.bias_vl" in synced
+
+
+def test_full_weight_sync_streams_the_published_names():
+    """vLLM's DeepseekV41ForCausalLM takes the published names through its own load_weights; none of its parameters
+    has the generic vLLM layout's name."""
+    from arctic_platform.model import requires_hf_weight_sync
+
+    assert requires_hf_weight_sync(DeepseekV41ForCausalLM(_config()))
 
 
 # --- 4 ranks (gloo) --------------------------------------------------------------------------------------------------
@@ -254,26 +263,18 @@ def _shard_rows_on_ep(module, rank):
     module._dss_ep_sharded = True
 
 
-def _ep_export_worker(rank, stream, placed):
-    import deepspeed.utils.groups as ds_groups
+def _ep_sharded(rank, config, hf):
+    """``hf`` loaded and sharded over the 4 EP ranks in the loader's order (moe/deepspeed_integration.py): EP
+    sharding, DTensors to local tensors. The placement and the DeepSpeed tags come after."""
     from torch.distributed.device_mesh import DeviceMesh
     from torch.distributed.tensor.parallel import parallelize_module
 
     from arctic_platform.model.implementations.moe import deepspeed_integration
-    from arctic_platform.model.implementations.moe import expert_placement as placement
     from arctic_platform.model.implementations.moe.distributed.expert_parallel import DeepEPExpertParallel
 
-    ds_groups._get_expert_parallel_group = lambda name: dist.group.WORLD
-    if stream:
-        deepspeed_integration._EXPORT_GATHER_BYTES = 64  # streamed: shards a row, EP weights 64 / ep bytes at a time
-    config = _config()
-    hf = _published_checkpoint(config, packed=False)
     torch.manual_seed(0)
     model = DeepseekV41ForCausalLM(config)
     model.load_state_dict(model.convert_to_prime(copy.deepcopy(hf)), strict=True)
-
-    # The loader's order (moe/deepspeed_integration.py): EP sharding, DTensors to local tensors, the placement, the
-    # DeepSpeed tags.
     mesh = DeviceMesh.from_group(dist.group.WORLD, "cpu", mesh_dim_names=("ep",))
     for layer in model.model.layers:
         parallelize_module(layer.mlp.experts, device_mesh=mesh, parallelize_plan=DeepEPExpertParallel())
@@ -281,6 +282,21 @@ def _ep_export_worker(rank, stream, placed):
     for module in model.modules():
         if getattr(module, "_dss_shard_on_ep", False):
             _shard_rows_on_ep(module, rank)
+    return model
+
+
+def _ep_export_worker(rank, stream, placed):
+    import deepspeed.utils.groups as ds_groups
+
+    from arctic_platform.model.implementations.moe import deepspeed_integration
+    from arctic_platform.model.implementations.moe import expert_placement as placement
+
+    ds_groups._get_expert_parallel_group = lambda name: dist.group.WORLD
+    if stream:
+        deepspeed_integration._EXPORT_GATHER_BYTES = 64  # streamed: shards a row, EP weights 64 / ep bytes at a time
+    config = _config()
+    hf = _published_checkpoint(config, packed=False)
+    model = _ep_sharded(rank, config, hf)
     table = model.model.layers[0].engram.embed
     assert table.weight.shape[0] == (6 if rank == EP - 1 else 8)
     if placed:
@@ -307,6 +323,35 @@ def _ep_export_worker(rank, stream, placed):
 @pytest.mark.parametrize("stream", [False, True], ids=["device-gather", "host-stream"])
 def test_ep_export_restores_the_published_checkpoint(tmp_path, stream, placed):
     assert all(_run(_ep_export_worker, tmp_path, stream, placed).values())
+
+
+def _ep_weight_sync_worker(rank):
+    """Both weight-sync layouts of the EP job leave the frozen Engram table out (UE8M0 scales, a short last shard);
+    the HF one is the published checkpoint without it."""
+    import deepspeed.utils.groups as ds_groups
+
+    from arctic_platform.model.implementations.moe import deepspeed_integration
+    from arctic_platform.model.implementations.moe.vllm_weights import build_iter_full_vllm_weights
+
+    ds_groups._get_expert_parallel_group = lambda name: dist.group.WORLD
+    config = _config()
+    hf = _published_checkpoint(config, packed=False)
+    model = _ep_sharded(rank, config, hf)
+    deepspeed_integration.tag_expert_params_for_deepspeed(model, "ep_size_4")
+
+    synced = dict(deepspeed_integration.build_iter_full_hf_weights(model)())
+    vllm_names = [name for name, _ in build_iter_full_vllm_weights(model)()]
+    if rank != 0:
+        assert not synced and not vllm_names
+        return True
+    _assert_same(synced, {name: tensor for name, tensor in hf.items() if ".engram.embed." not in name})
+    assert "model.layers.0.mlp.experts.w13_weight" in vllm_names
+    assert not [name for name in vllm_names if ".engram.embed." in name]
+    return True
+
+
+def test_ep_weight_sync_leaves_the_engram_table_out(tmp_path):
+    assert all(_run(_ep_weight_sync_worker, tmp_path).values())
 
 
 def test_hf_export_config_follows_the_models_own_quantization():

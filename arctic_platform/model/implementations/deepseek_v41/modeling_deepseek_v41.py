@@ -428,6 +428,11 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel, GenerationMixin):
     # PEFT's 3-D layout nests one wrapper per expert parameter and vLLM reads two of them.
     vllm_lora_name = staticmethod(vllm_lora_name)
     vllm_lora_expert_projections = {"w1": "w1", "w2": "w2", "w3": "w3"}
+    # Full-weight sync streams the published names (convert_layer_to_hf). vLLM's DeepseekV41ForCausalLM loads those
+    # through its own load_weights (renames, fused wq_a | wkv, compressor wkv | wgate and shared w1 | w3, TP shards,
+    # EP-local experts); the generic vLLM layout's names (moe/vllm_weights.py) have no parameter there. An online-FP8
+    # sampler reloads them as checkpoint tensors (receiver.py, _load_reload).
+    _requires_hf_weight_sync = True
 
     def __init__(self, config: DeepseekV41Config):
         super().__init__(config)
