@@ -33,6 +33,15 @@ throughput and latency. Every job gets the same correctness requests: on_miss
 and off_matched must match on_hit token for token, and off_default's
 differences are reported with where they start.
 
+Any variant set that includes on_hit runs. The plain baseline for perf and
+start-up is off_default, else off_matched (which then stands in for stock plain;
+its perf gates measure semi_p's own cost), else there is none: with on_hit
+alone, perf is not measured, the start-up table's plain column is empty, and
+each correctness check is decided on on_hit's own answers where it can be (one
+answer across replicas, ignore_eos length, a seeded repeat, real token ids, sane
+logprobs, stop strings honoured, guided JSON that parses) and is info where it
+needs another job.
+
 Each job is served on its own thread: as soon as it is running it is measured
 and answers every request, its logs are read and it is cancelled, so a job that
 is up does not hold its GPUs while another is still starting (or dumping).
@@ -47,8 +56,9 @@ Arguments (``key=value``):
   models           comma-separated model names under onboarding/models/, or paths
   debug_image_tag  backend image for every job, instead of each model's entry in
                    onboarding/models/backends.json
-  variants         subset of on_hit,off_default,on_miss,off_matched (default all;
-                   on_hit and off_default are required)
+  variants         subset of on_hit,off_default,on_miss,off_matched that includes
+                   on_hit (default all), e.g. on_hit; on_hit,off_matched;
+                   on_hit,off_default
   copies           the perf pair runs copies x the published n_gpus (default: 2
                    for a whole-node config, 1 otherwise, or the model file's)
   miss_image_cache local image-cache root for on_miss, unique per run, so a copy
@@ -65,8 +75,8 @@ Arguments (``key=value``):
   keep_jobs        leave the jobs running (default false)
   job_on_hit / job_off_default / job_on_miss / job_off_matched
                    attach to running jobs instead (one model only; kept)
-  log_files_on / log_files_off   saved GPU pod logs of on_hit / off_default (files
-                   or directories); they add the per-step restore breakdown
+  log_files_on / log_files_off   saved GPU pod logs of on_hit / the plain baseline
+                   (files or directories); they add the per-step restore breakdown
   timeout_s        how long each job may take to reach running (default 3600)
   log_wait_s       how long to keep re-reading a served job's log, before
                    cancelling it, until it shows the job's start-up total
@@ -122,6 +132,7 @@ from arctic_platform.inference.semi_persistence.onboarding.jobs import JobTracke
 from arctic_platform.inference.semi_persistence.onboarding.jobs import ModelSpec
 from arctic_platform.inference.semi_persistence.onboarding.jobs import build_variant_bodies
 from arctic_platform.inference.semi_persistence.onboarding.jobs import load_model
+from arctic_platform.inference.semi_persistence.onboarding.jobs import plain_baseline
 from arctic_platform.inference.semi_persistence.onboarding.jobs import plan_variants
 from arctic_platform.inference.semi_persistence.onboarding.jobs import resolve_image_tag
 from arctic_platform.inference.semi_persistence.onboarding.jobs import copies_for
@@ -133,7 +144,17 @@ from arctic_platform.inference.semi_persistence.onboarding.client import make_cl
 logger = logging.getLogger(__name__)
 
 
-PERF_SIDES = {"on_hit": "on", "off_default": "off", "off_matched": "matched"}
+def perf_sides(variants: Any) -> dict[str, str]:
+    """The perf side each job is measured as: on_hit (``on``) against the plain
+    baseline (``off``), plus off_matched (``matched``) when off_default is the
+    baseline. Empty without a plain job, since perf only compares."""
+    plain = plain_baseline(variants)
+    if plain is None:
+        return {}
+    sides = {"on_hit": "on", plain: "off"}
+    if plain == "off_default" and "off_matched" in variants:
+        sides["off_matched"] = "matched"
+    return sides
 
 
 def utc_now() -> str:
@@ -290,7 +311,7 @@ class Runner:
                       "test_replicas": spec.replicas * copies,
                       "max_seq_len": spec.max_seq_len, "file": spec.path},
             "image_tag": image_tag, "started_at": utc_now(),
-            "variants": variants, "variants_skipped": skipped,
+            "variants": variants, "variants_skipped": skipped, "plain_baseline": plain_baseline(variants),
         }
         client = self.fast_client()
         attached = bool(self.attach)
@@ -317,7 +338,9 @@ class Runner:
                 self.submitted(runs[v].tracker.job_id, spec, v)
                 logger.info("submitted %s job %s", v, runs[v].tracker.job_id)
             result["jobs"] = {v: r.tracker.job_id for v, r in runs.items()}
-            result["on_job_id"], result["off_job_id"] = runs["on_hit"].tracker.job_id, runs["off_default"].tracker.job_id
+            result["on_job_id"] = runs["on_hit"].tracker.job_id
+            if result["plain_baseline"]:
+                result["off_job_id"] = runs[result["plain_baseline"]].tracker.job_id
             self.serve_all(spec, runs, result, copies, attached)
             self.compare(spec, runs, result, copies)
         except Exception as exc:  # noqa: BLE001 - recorded in the report
@@ -339,6 +362,8 @@ class Runner:
         nothing can be compared with it; another failed job only drops itself."""
         replicas = job_replicas(spec, copies, list(runs))
         plan = correctness.probes(replicas, spec.max_seq_len, spec.correctness) if "correctness" in self.checks else []
+        sides = perf_sides(runs)
+        pair = [v for v, s in sides.items() if s != "matched"]
         grids: dict[str, dict] = {}
         stop = threading.Event()
         deadline = time.time() + self.timeout_s
@@ -357,10 +382,10 @@ class Runner:
                     if restore["cache_miss"] and self.require_restore:
                         raise RuntimeError("semi_p job cold-started (cache miss); publish this config's image first, "
                                            "or pass require_restore=false")
-                pair_failed = any(runs[v].error for v in ("on_hit", "off_default"))
-                if "perf" in self.checks and variant in PERF_SIDES and not pair_failed:
+                pair_failed = any(runs[v].error for v in pair)
+                if "perf" in self.checks and variant in sides and not pair_failed:
                     run.perf = perf.measure(self.fast_client, t.job_id, spec.replicas * copies, spec.max_seq_len,
-                                            spec.perf, spec.thresholds, PERF_SIDES[variant], grids, stop)
+                                            spec.perf, spec.thresholds, sides[variant], grids, stop)
                 if plan:
                     run.answers = correctness.collect(client, t.job_id, plan, variant == "on_hit", stop)
                 run.served = not stop.is_set()
@@ -419,10 +444,14 @@ class Runner:
         errors = [r.error for r in runs.values() if r.error]
         if errors:
             result["error"] = "; ".join(errors)
+        sides = perf_sides(runs)
         if "perf" in self.checks:
-            measured = {PERF_SIDES[v]: r.perf for v, r in runs.items() if v in PERF_SIDES and r.perf is not None}
+            measured = {sides[v]: r.perf for v, r in runs.items() if v in sides and r.perf is not None}
             if "on" in measured and "off" in measured:
                 result["perf"] = perf.combine(measured, spec.replicas * copies, spec.perf, spec.thresholds)
+                result["perf"]["baseline"] = result["plain_baseline"]
+            elif not sides:
+                result["perf_note"] = f"not measured: {report.NO_PLAIN}, and perf compares semi_p with plain vLLM"
         if "correctness" in self.checks:
             answered = {v: r.answers for v, r in runs.items() if r.answers is not None}
             if "on_hit" in answered:
@@ -432,7 +461,7 @@ class Runner:
                                                             spec.max_seq_len, spec.correctness)
         missing = {}
         for v, r in runs.items():
-            checks = [c for c in ("perf", "correctness") if c in self.checks and (c != "perf" or v in PERF_SIDES)]
+            checks = [c for c in ("perf", "correctness") if c in self.checks and (c != "perf" or v in sides)]
             if not r.served and checks:
                 missing[v] = f"{' and '.join(checks)}: {r.error or 'stopped after ' + (errors or ['an error'])[0]}"
                 logger.warning("%s: %s job not measured for %s", spec.name, v, missing[v])
@@ -467,24 +496,28 @@ class Runner:
 
     def finish(self, client: Any, runs: dict[str, JobRun], result: dict, attached: bool) -> None:
         """Read the logs of, and cancel, any job a thread did not (an error before
-        the jobs were served), then the start-up section from every job's logs."""
+        the jobs were served), then the start-up section from every job's logs,
+        semi_p against the plain baseline (none: its columns stay empty)."""
         for v, r in runs.items():
             if r.logs is None:
                 r.logs = self.read_logs(client, v, r)
             if not (self.keep_jobs or attached):
                 self.cancel(client, v, r, result)
         st = result.setdefault("startup", {})
+        plain = result.get("plain_baseline")
         if not attached:
             st["timelines"] = {v: timeline(r.tracker) for v, r in runs.items()}
-            st["on_timeline"], st["off_timeline"] = st["timelines"]["on_hit"], st["timelines"]["off_default"]
+            st["on_timeline"] = st["timelines"].get("on_hit", {})
+            if plain in st["timelines"]:
+                st["off_timeline"] = st["timelines"][plain]
         try:
             logs = {v: r.logs for v, r in runs.items()}
             log_dir = Path(self.out_dir).expanduser() / f"{report.stem(result)}-logs"
             for v, logs_ in logs.items():
                 startup.save_logs(logs_, log_dir, v)
-            st.update(analyze_startup(logs["on_hit"], logs["off_default"],
+            st.update(analyze_startup(logs["on_hit"], logs.get(plain) or {},
                                       startup.read_files(self.log_files["on"]),
-                                      startup.read_files(self.log_files["off"])))
+                                      startup.read_files(self.log_files["off"]) if plain else {}))
             if "on_miss" in logs:
                 st["semi_p_miss"] = startup.restore_report(logs["on_miss"], {})
             if "off_matched" in logs:

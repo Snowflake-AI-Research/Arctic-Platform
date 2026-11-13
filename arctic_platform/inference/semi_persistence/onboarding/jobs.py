@@ -161,19 +161,28 @@ def pod_spanning(spec: ModelSpec, gpus_per_node: int = GPUS_PER_NODE) -> bool:
 
 
 def plan_variants(spec: ModelSpec, wanted: list[str] | None = None) -> tuple[list[str], dict[str, str]]:
-    """The jobs to run and, for any dropped, why. ``off_matched`` equals
-    ``off_default`` below TP 2, and cannot be matched for a pod-spanning engine."""
+    """The jobs to run and, for any dropped, why. Any set that includes the
+    reference ``on_hit`` runs. ``off_matched`` equals ``off_default`` below TP 2,
+    and cannot be matched for a pod-spanning engine."""
     wanted = list(wanted or VARIANTS)
     unknown = [v for v in wanted if v not in VARIANTS]
-    if unknown or "on_hit" not in wanted or "off_default" not in wanted:
-        raise ValueError(f"variants must include on_hit and off_default and come from {VARIANTS}, got {wanted}")
+    if unknown or "on_hit" not in wanted:
+        raise ValueError(f"variants must include on_hit and come from {VARIANTS}, got {wanted}")
     skipped = {}
     if "off_matched" in wanted:
         if spec.tensor_parallel_size < 2:
             skipped["off_matched"] = "TP=1: semi_p changes no collective setting, so it equals off_default"
+            if "off_default" not in wanted:
+                skipped["off_matched"] += " (add off_default for a plain baseline)"
         elif pod_spanning(spec):
             skipped["off_matched"] = "pod-spanning engine: its NCCL network pinning cannot be matched on plain workers"
     return [v for v in VARIANTS if v in wanted and v not in skipped], skipped
+
+
+def plain_baseline(variants: Any) -> str | None:
+    """The plain job semi_p's perf and start-up are compared with: off_default,
+    else off_matched, else None (no plain job in the run)."""
+    return next((v for v in ("off_default", "off_matched") if v in variants), None)
 
 
 def build_variant_bodies(spec: ModelSpec, image_tag: str | None, variants: list[str], copies: int = 1,
