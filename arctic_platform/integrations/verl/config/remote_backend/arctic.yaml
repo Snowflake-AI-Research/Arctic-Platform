@@ -79,7 +79,7 @@ train:
     # seed used by enable_full_determinism when full=True
     seed: 42
 
-  # DeepSpeed engine config: passed through (OmegaConf.to_container) and merged with train_micro_batch_size_per_gpu/train_batch_size/grad_accum/sequence_parallel_size. Mirrors recipe/rl-correctness arctic_rl.train.deepspeed.
+  # DeepSpeed engine config: passed through (OmegaConf.to_container) and merged with sequence_parallel_size; the optimizer, clipping and microbatch count come from the actor config. Mirrors recipe/rl-correctness arctic_rl.train.deepspeed.
   deepspeed:
 
 

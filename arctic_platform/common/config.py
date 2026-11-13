@@ -28,10 +28,9 @@ _DS_WORKER_SP_PATHS: tuple[tuple[str, ...], ...] = (
 )
 _TRAINING_SP_PATHS: tuple[tuple[str, ...], ...] = (
     ("training_config", "sp_size"),
-    ("ds_config", "sequence_parallel_size"),
+    ("training_config", "ds_config", "sequence_parallel_size"),
 )
 _LOG_PROB_SP_PATH: tuple[str, ...] = ("log_prob_config", "sequence_parallel_size")
-_DS_CONFIG_SP_PATH: tuple[str, ...] = ("ds_config", "sequence_parallel_size")
 
 SP_SIZE_PATHS: tuple[tuple[str, ...], ...] = _TRAINING_SP_PATHS + (_LOG_PROB_SP_PATH,) + _DS_WORKER_SP_PATHS
 
@@ -49,9 +48,7 @@ def _sp_size_paths_for_job(job_config: Mapping[str, Any]) -> tuple[tuple[str, ..
     """Log-prob jobs use their explicit SP degree instead of the training degree."""
     job_type = job_config.get("job_type") or "training"
     if job_type == "log_prob":
-        if _nested(job_config, _LOG_PROB_SP_PATH) is not None:
-            return (_LOG_PROB_SP_PATH,) + _DS_WORKER_SP_PATHS
-        return (_DS_CONFIG_SP_PATH, _LOG_PROB_SP_PATH) + _DS_WORKER_SP_PATHS
+        return (_LOG_PROB_SP_PATH,) + _DS_WORKER_SP_PATHS
     if job_type == "sampling":
         return _DS_WORKER_SP_PATHS
     return _TRAINING_SP_PATHS + _DS_WORKER_SP_PATHS

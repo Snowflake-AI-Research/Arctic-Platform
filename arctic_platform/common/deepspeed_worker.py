@@ -31,11 +31,13 @@ import torch
 import torch.distributed as dist
 from deepspeed.accelerator import get_accelerator
 
-from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
 from arctic_platform.common.deepspeed_engine import apply_default_grad_accum_dtype
 from arctic_platform.common.deepspeed_engine import build_deepspeed_config
 from arctic_platform.common.deepspeed_engine import initialize_training_engine
+from arctic_platform.common.deepspeed_engine import training_engine_spec
+from arctic_platform.common.model_settings import ModelSettings
 from arctic_platform.common.ray_cluster import primary_ip
+from arctic_platform.common.training_settings import WorkerTrainingSettings
 from arctic_platform.common.utils import combine_metric_microbatches
 from arctic_platform.common.utils import dp_sp_world_size
 from arctic_platform.common.utils import log_dp_shard_tokens
@@ -49,9 +51,11 @@ from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.common.weight_checksum import tensor_l2_sq
 from arctic_platform.model import build_model
-from arctic_platform.model import ds_worker_dense_model_spec
-from arctic_platform.model import ds_worker_moe_model_spec
+from arctic_platform.model import ds_worker_zorro_train
+from arctic_platform.model import settings_dense_model_spec
+from arctic_platform.model import settings_moe_model_spec
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
+from arctic_platform.model.option_profile import check_model_options_profile
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +72,24 @@ else:
     from arctic_platform.common.utils.debug import SynchronizedWallClockTimerSimpleDummy
 
     timers = SynchronizedWallClockTimerSimpleDummy(wall_clock_breakdown=True)
+
+
+def onprem_deepspeed_config(training: WorkerTrainingSettings, *, dtype: str, world_size: int, seed=None) -> dict:
+    """The on-prem training engine's DeepSpeed config.
+
+    No mpu is passed, so DeepSpeed counts every rank as data-parallel unless
+    ``training.ds_config`` sets ``sequence_parallel_size``. Unless
+    ``training.ds_config`` says otherwise, the engine autocasts to bf16 and
+    accumulates gradients in FP32 wherever DeepSpeed accepts it.
+    """
+    sequence_parallel = int((training.ds_config or {}).get("sequence_parallel_size") or 1)
+    spec = training_engine_spec(
+        training, dtype=dtype, world_size=world_size, sequence_parallel=sequence_parallel, seed=seed
+    )
+    ds_config = build_deepspeed_config(spec)
+    ds_config.setdefault("torch_autocast", {"enabled": True, "dtype": "bfloat16"})
+    apply_default_grad_accum_dtype(ds_config)
+    return ds_config
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +126,9 @@ class DeepSpeedWorker:
         self.master_addr = primary_ip()
         self.master_port = master_port
         self.engine = None
+        self.optimizer = None
+        self.num_micro_batches = 1
+        self._warned_manual_lr_with_scheduler = False
         self._gpu_mem_preallocation = None
         self.sp_size = 1
         self._weight_sender = None
@@ -146,46 +171,76 @@ class DeepSpeedWorker:
         deepspeed.init_distributed()
 
         model_name = job_config["model_name"]
-        ds_config = job_config.get("ds_config") or {}
         self.job_type = job_config.get("job_type")
         pr0(f"{self.job_type=} {job_config=}")
-        pr0(f"ds_worker[before_modify]: {self.job_type=} {ds_config=}")
 
         ds_worker_config = job_config.get("ds_worker_config") or {}
         ds_worker_config["world_size"] = self.world_size
         self.ds_worker_config = ds_worker_config
         self.sp_size = sp_size_from_job_config(job_config)
+        dtype = str(job_config.get("dtype") or "bfloat16")
 
-        # Build the DeepSpeed config per job type. Training engines get an
-        # optimizer; the reference/log-prob engine is forward-only and is
-        # configured from log_prob_config with no optimizer state.
+        # Training engines get an optimizer; the reference/log-prob engine is
+        # forward-only and is configured from log_prob_config with no optimizer state.
+        training = None
         if self.job_type == "log_prob":
-            log_prob_config = job_config.get("log_prob_config") or {}
-            ds_config = self.ds_inference_config(log_prob_config, ds_worker_config)
-            self._has_optimizer = False
+            ds_config = self.ds_inference_config(job_config.get("log_prob_config") or {}, ds_worker_config)
+            model_settings = ModelSettings.model_validate(job_config.get("training_config") or {})
         else:
-            ds_config = self.ds_training_config(job_config, ds_config, ds_worker_config)
-            self._has_optimizer = True
+            training = WorkerTrainingSettings.model_validate(job_config.get("training_config") or {})
+            if training.optimizer is None:
+                raise ValueError("on-prem training requires training.optimizer; a frozen model runs on Cortex only")
+            mb_spec = training.mb_spec
+            if mb_spec is not None and mb_spec.max_tokens_per_mb is not None:
+                raise ValueError(
+                    "on-prem training splits fwd-bwd batches by mb_spec.num_micro_batches; "
+                    "mb_spec.max_tokens_per_mb is supported on Cortex only"
+                )
+            self.num_micro_batches = (mb_spec.num_micro_batches if mb_spec is not None else None) or 1
+            ds_config = onprem_deepspeed_config(
+                training, dtype=dtype, world_size=self.world_size, seed=job_config.get("seed")
+            )
+            model_settings = training
+        self._has_optimizer = training is not None
 
-        pr0(f"ds_worker[after_modify]: {self.job_type=} {ds_config=} {ds_worker_config=}")
+        pr0(f"ds_worker[ds_config]: {self.job_type=} {ds_config=} {ds_worker_config=}")
 
-        debug_config = job_config.get("training_config")
-        debug = gpu_memory_debug_config(debug_config if debug_config is not None else ds_worker_config)
-        ep_size = int(ds_worker_config.get("ep_size", 1))
+        debug = gpu_memory_debug_config(
+            {
+                "debug": training.debug if training is not None else ds_worker_config.get("debug"),
+                "prime_rl": model_settings.prime_rl,
+            }
+        )
+        attn_implementation = model_settings.resolved_attn_implementation()
+        if attn_implementation is None:
+            raise ValueError("on-prem training requires training_config.attn_implementation")
+        ep_size = model_settings.ep_size or 1
+        check_model_options_profile(model_settings.model_dump(), model_path=model_name, sp_size=self.sp_size)
         # The MoE loader owns expert- and sequence-parallel layout, so only dense loading is gated here.
         if ep_size > 1:
-            spec = ds_worker_moe_model_spec(model_name, {**ds_worker_config, "debug": debug})
+            if ds_worker_config.get("zorro_train_enable"):
+                raise ValueError("expert-parallel workers do not support ZoRRo Train")
+            spec = settings_moe_model_spec(
+                model_settings,
+                model_path=model_name,
+                sequence_parallel=self.sp_size,
+                seq_len=job_config.get("max_seq_len"),
+                weight_conversion_cache_dir=ds_worker_config.get("weight_conversion_cache_dir"),
+                debug=debug,
+            )
         else:
             if self.sp_size != 1:
                 raise ValueError("on-prem sequence-parallel data dispatch is not wired; sp_size must be 1")
-            model_provider = ds_worker_config.get("model_provider", "huggingface")
-            if model_provider not in {"huggingface", "liger"}:
-                raise ValueError(f"on-prem dense training does not support model_provider={model_provider!r}")
-            spec = ds_worker_dense_model_spec(
-                model_name,
-                ds_worker_config,
-                dtype=str(job_config.get("dtype") or "bfloat16"),
+            if model_settings.model_provider != "huggingface":
+                raise ValueError(
+                    f"on-prem dense training does not support model_provider={model_settings.model_provider!r}"
+                )
+            spec = settings_dense_model_spec(
+                model_settings,
+                model_path=model_name,
+                dtype=dtype,
                 sequence_parallel=self.sp_size,
+                zorro_train=ds_worker_zorro_train(ds_worker_config, attn_implementation),
                 debug=debug,
             )
         loaded = build_model(spec)
@@ -195,29 +250,15 @@ class DeepSpeedWorker:
         zorro_train_enable = ds_worker_config.get("zorro_train_enable", False)
         self.dedup_actor_model_once_patcher = getattr(model, "_arctic_zorro_once_patcher", None)
 
-        if self._has_optimizer:
-            # No mpu is passed, so DeepSpeed counts every rank as data-parallel.
-            engine_spec = TrainingEngineSpec.from_deepspeed_config(
-                ds_config,
-                dtype=str(job_config.get("dtype") or "bfloat16"),
-                world_size=self.world_size,
-                sequence_parallel=1,
-                seed=job_config.get("seed"),
-            )
-            ds_config = build_deepspeed_config(engine_spec)
-            self.engine, _, self.optimizer_choice = initialize_training_engine(
-                model,
-                ds_config,
-                optimizer=engine_spec.optimizer,
-                ep_size=ep_size,
-                mpu=None,
-                model_path=model_name,
-                rank=self.rank,
-                adam_w_mode=engine_spec.adam_w_mode,
-            )
-        else:
-            # Forward-only/log-prob remains a separate no-optimizer contract.
-            self.engine, _, _, _ = deepspeed.initialize(model=model, config=ds_config)
+        self.engine, self.optimizer, self.optimizer_choice = initialize_training_engine(
+            model,
+            ds_config,
+            optimizer=training.optimizer if training is not None else None,
+            ep_size=ep_size,
+            mpu=None,
+            model_path=model_name,
+            rank=self.rank,
+        )
         self._device = get_accelerator().device_name(self.engine.local_rank)
 
         gpu_id = torch.cuda.current_device()
@@ -231,100 +272,6 @@ class DeepSpeedWorker:
         )
 
         return True
-
-    def ds_training_config(self, job_config: dict, ds_config: dict, ds_worker_config: dict) -> dict:
-        """Build the DeepSpeed config for a trainable engine (with optimizer).
-
-        Prefer the high-level training_config when provided (the framework sends
-        training_config and the server owns the DeepSpeed details); otherwise
-        fall back to a default AdamW optimizer.
-        """
-        training_config = job_config.get("training_config")
-        if training_config is not None:
-            opt_cfg = training_config.get("optimizer", {})
-            betas = opt_cfg.get("betas")
-            if betas is None:
-                betas = [opt_cfg.get("beta1", 0.9), opt_cfg.get("beta2", 0.999)]
-            # Forward DeepSpeed-recognized AdamW knobs (torch_adam selects
-            # torch.optim.AdamW instead of FusedAdam — required for Axolotl
-            # adamw_torch parity).
-            opt_params: dict[str, Any] = {
-                "lr": opt_cfg.get("lr", 1e-5),
-                "betas": list(betas),
-                "eps": opt_cfg.get("eps", 1e-8),
-                "weight_decay": opt_cfg.get("weight_decay", 0.0),
-            }
-            if opt_cfg.get("torch_adam"):
-                opt_params["torch_adam"] = True
-            if "adam_w_mode" in opt_cfg:
-                opt_params["adam_w_mode"] = opt_cfg["adam_w_mode"]
-            ds_config["optimizer"] = {
-                "type": "AdamW",
-                "params": opt_params,
-            }
-            if "gradient_accumulation_steps" in training_config:
-                ds_config["gradient_accumulation_steps"] = training_config["gradient_accumulation_steps"]
-            # Prefer explicit optimizer.gradient_clipping; accept top-level alias.
-            if "gradient_clipping" in opt_cfg:
-                ds_config["gradient_clipping"] = opt_cfg["gradient_clipping"]
-            elif "gradient_clipping" in training_config:
-                ds_config["gradient_clipping"] = training_config["gradient_clipping"]
-            elif "max_grad_norm" in opt_cfg:
-                ds_config["gradient_clipping"] = opt_cfg["max_grad_norm"]
-
-            sched_cfg = training_config.get("lr_scheduler", None)
-            horizon = training_config.get("training_horizon", 0)
-            if sched_cfg is not None and horizon > 0:
-                lr = opt_cfg.get("lr", 1e-5)
-                # DeepSpeed's WarmupLR/WarmupCosineLR require warmup_num_steps to
-                # be an integer; warmup_ratio * horizon (or an explicit fractional
-                # warmup_steps override) is generally fractional.
-                if "warmup_steps" in sched_cfg:
-                    warmup_steps = round(float(sched_cfg["warmup_steps"]))
-                else:
-                    warmup_steps = round(sched_cfg.get("warmup_ratio", 0.0) * horizon)
-                if sched_cfg.get("type", "constant") == "cosine":
-                    ds_config["scheduler"] = {
-                        "type": "WarmupCosineLR",
-                        "params": {
-                            "total_num_steps": horizon,
-                            "warmup_num_steps": warmup_steps,
-                            "warmup_min_ratio": 0.0,
-                            "cos_min_ratio": sched_cfg.get("min_lr_ratio") or 0.0,
-                            "warmup_type": "linear",
-                        },
-                    }
-                elif warmup_steps > 0:
-                    ds_config["scheduler"] = {
-                        "type": "WarmupLR",
-                        "params": {
-                            "warmup_min_lr": 0.0,
-                            "warmup_max_lr": lr,
-                            "warmup_num_steps": warmup_steps,
-                            "warmup_type": "linear",
-                        },
-                    }
-                else:
-                    # No LR scheduler, use constant LR
-                    pass
-
-        # Set reasonable defaults as fallbacks
-        ds_config.setdefault("train_micro_batch_size_per_gpu", 1)
-        fp16_on = bool((ds_config.get("fp16") or {}).get("enabled"))
-        if not fp16_on:
-            ds_config.setdefault("bf16", {"enabled": True})
-        ds_config.setdefault(
-            "optimizer",
-            {
-                "type": "AdamW",
-                "params": {"lr": 1e-5, "betas": [0.9, 0.999], "eps": 1e-8},
-            },
-        )
-        ds_config.setdefault("torch_autocast", {"enabled": True, "dtype": "bfloat16"})
-        ds_config.setdefault("communication_data_type", "fp32")
-        apply_default_grad_accum_dtype(ds_config)
-
-        return ds_config
 
     def ds_inference_config(self, log_prob_config: dict, ds_worker_config: dict) -> dict:
         """Build a forward-only DeepSpeed config (no optimizer state).
@@ -433,17 +380,16 @@ class DeepSpeedWorker:
             for k, v in batch_data.items():
                 pr0(f"[DeepSpeedWorker] {tag}: {k=}: shape={getattr(v, 'shape', type(v).__name__)}")
 
-        grad_accum_steps = self.engine.gradient_accumulation_steps()
         # H3: list-of-microbatches from the client skips concat→split_dict.
         if isinstance(batch_data, list):
             micro_batch_data = batch_data
-            if len(micro_batch_data) != grad_accum_steps:
+            if len(micro_batch_data) != self.num_micro_batches:
                 raise ValueError(
-                    f"Received {len(micro_batch_data)} GAS microbatches but "
-                    f"engine.gradient_accumulation_steps()={grad_accum_steps}"
+                    f"Received {len(micro_batch_data)} microbatches but "
+                    f"training.mb_spec.num_micro_batches={self.num_micro_batches}"
                 )
         else:
-            micro_batch_data = split_dict(batch_data, grad_accum_steps)
+            micro_batch_data = split_dict(batch_data, self.num_micro_batches)
         num_micro_batches = len(micro_batch_data)
         pipeline_micro_batch_outputs = []
         return_tensors = meta_data.get("worker_return_tensors", False)
@@ -484,7 +430,7 @@ class DeepSpeedWorker:
                 loss_object=loss_object,
             )
 
-        pr0(f"mbs {len(micro_batch_data)=} {grad_accum_steps=}")
+        pr0(f"mbs {len(micro_batch_data)=} {self.num_micro_batches=}")
 
         for i, micro_batch in enumerate(micro_batch_data):
 
@@ -512,14 +458,13 @@ class DeepSpeedWorker:
             if i == 0:
                 pr0(f"[DeepSpeedWorker] {tag}: {i=}/{num_micro_batches=} {meta_data.keys()=} {processing.keys()=}")
 
+            # DeepSpeed's accumulation count is 1, so only the last microbatch may be a boundary:
+            # earlier ones must not all-reduce grads or step the optimizer.
+            if backward and hasattr(self.engine, "set_gradient_accumulation_boundary"):
+                self.engine.set_gradient_accumulation_boundary(i == num_micro_batches - 1)
+
             if use_sft_pipeline:
                 from arctic_platform.sft.processor import run_sft_pipeline
-
-                # Match the GRPO packed path: only the last microbatch is an
-                # accumulation boundary so DeepSpeed does not all-reduce grads
-                # (or run optimizer bookkeeping) on every microbatch when gas>1.
-                if backward and hasattr(self.engine, "set_gradient_accumulation_boundary"):
-                    self.engine.set_gradient_accumulation_boundary(i == num_micro_batches - 1)
 
                 micro_batch_output = run_sft_pipeline(
                     self.engine,
@@ -643,9 +588,15 @@ class DeepSpeedWorker:
                 return
             raise
 
-    def step(self) -> dict:
+    def step(self, learning_rate: float | None = None) -> dict:
         from arctic_platform import sft_profile
 
+        if learning_rate is not None:
+            if getattr(self.engine, "lr_scheduler", None) is not None and not self._warned_manual_lr_with_scheduler:
+                logger.info("Overriding the scheduled learning rate; the client's per-step learning rate wins.")
+                self._warned_manual_lr_with_scheduler = True
+            for group in self.optimizer.param_groups:
+                group["lr"] = float(learning_rate)
         with sft_profile.timed("step"):
             self._engine_step()
             if sft_profile.enabled() and torch.cuda.is_available():

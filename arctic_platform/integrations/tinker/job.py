@@ -42,11 +42,6 @@ class TinkerJobConfig:
     max_prompt_length: int = 512
     max_response_length: int = 512
     learning_rate: float = 1e-6
-    # DeepSpeed needs a batch size at provisioning time; Tinker has no verb that
-    # declares one. These only have to satisfy DeepSpeed's own invariant, since
-    # Cortex chunks each forward-backward to fit whatever actually arrives.
-    micro_batch_size: int = 1
-    gradient_accumulation_steps: int = 1
     dtype: str = "bfloat16"
     seed: int = 7
     # The Cortex image ships FA3 only; FA2 dies at model load.
@@ -166,6 +161,8 @@ def _backend_from_env_or_profile(cortex_config: Any) -> Any:
 def client_config(cfg: TinkerJobConfig) -> Any:
     from arctic_platform.client import ArcticClientConfig
     from arctic_platform.client import CortexConfig
+    from arctic_platform.client import MicroBatchSpec
+    from arctic_platform.client import OptimizerSettings
     from arctic_platform.client import SamplingConfig
     from arctic_platform.client import TrainingConfig
 
@@ -189,28 +186,18 @@ def client_config(cfg: TinkerJobConfig) -> Any:
         training_gpus=cfg.training_gpus,
         sampling_gpus=cfg.sampling_gpus,
         training=TrainingConfig(
-            ds_config={
-                "train_batch_size": cfg.micro_batch_size * cfg.training_gpus * cfg.gradient_accumulation_steps,
-                "train_micro_batch_size_per_gpu": cfg.micro_batch_size,
-                "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
-                "bf16": {"enabled": cfg.dtype == "bfloat16"},
-                "zero_optimization": {"stage": cfg.zero_stage},
-                "optimizer": {
-                    "type": "AdamW",
-                    "params": {
-                        "lr": cfg.learning_rate,
-                        "betas": [cfg.adam_beta1, cfg.adam_beta2],
-                        "eps": cfg.adam_eps,
-                        "weight_decay": cfg.weight_decay,
-                    },
-                },
-                "gradient_clipping": cfg.grad_clip_norm,
-            },
-            ds_worker_config={
-                "attn_implementation": cfg.attn_implementation,
-                "model_provider": "huggingface",
-                "mb_spec": {"max_tokens_per_mb": cfg.max_tokens_per_mb},
-            },
+            optimizer=OptimizerSettings(
+                lr=cfg.learning_rate,
+                betas=[cfg.adam_beta1, cfg.adam_beta2],
+                eps=cfg.adam_eps,
+                weight_decay=cfg.weight_decay,
+            ),
+            gradient_clipping=cfg.grad_clip_norm,
+            fp32_masters=True,
+            mb_spec=MicroBatchSpec(max_tokens_per_mb=cfg.max_tokens_per_mb),
+            ds_config={"zero_optimization": {"stage": cfg.zero_stage}},
+            attn_implementation=cfg.attn_implementation,
+            model_provider="huggingface",
             peft=_peft_config(cfg),
         ),
         sampling=SamplingConfig(vllm={"gpu_memory_utilization": cfg.gpu_memory_utilization}),

@@ -28,6 +28,7 @@ from pydantic import model_validator
 from arctic_platform.common.config import SP_SIZE_PATHS
 from arctic_platform.common.config import resolve_parallelism_degree
 from arctic_platform.common.config import resolve_sp_size
+from arctic_platform.common.model_settings import worker_config_model_keys
 
 DEFAULT_SEED = 42
 
@@ -50,6 +51,8 @@ class JobConfig(BaseModel):
 
     model_name: str
     job_type: str = Field(default="training")
+    dtype: str | None = None
+    max_seq_len: int | None = Field(default=None, ge=1)
     num_devices: int | None = None
     ds_config: dict | None = None
     training_config: dict | None = None
@@ -69,6 +72,27 @@ class JobConfig(BaseModel):
     @classmethod
     def _coerce_null_seed(cls, value: Any) -> Any:
         return DEFAULT_SEED if value is None else value
+
+    @field_validator("ds_config")
+    @classmethod
+    def _reject_top_level_ds_config(cls, value: dict | None) -> dict | None:
+        if value is not None:
+            raise ValueError(
+                "ds_config is not read at the top level; set training_config.ds_config for training "
+                "and log_prob_config for a DeepSpeed log-prob engine"
+            )
+        return value
+
+    @field_validator("ds_worker_config")
+    @classmethod
+    def _reject_model_settings(cls, value: dict | None) -> dict | None:
+        moved = worker_config_model_keys(value)
+        if moved:
+            raise ValueError(
+                "ds_worker_config may not set model settings; set "
+                + ", ".join(f"training_config.{field} instead of {key}" for key, field in moved.items())
+            )
+        return value
 
     @model_validator(mode="after")
     def _validate_sp_size(self) -> "JobConfig":

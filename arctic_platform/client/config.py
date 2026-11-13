@@ -19,7 +19,7 @@ Canonical nesting (shared across backends)::
     ArcticClientConfig
     ├── model_name, seed, dtype, max_seq_len
     ├── training_gpus / sampling_gpus / log_prob_gpus
-    ├── training     # DeepSpeed engine (ds_config owns optimizer/scheduler/batch) + checkpoint
+    ├── training     # engine and model settings (optimizer, mb_spec, ds_config, attn, model_options) + checkpoint
     ├── sampling     # sampling / log-prob engines (vllm, log_prob_engine, ...)
     └── backend: OnPremConfig | CortexConfig  # connection / deployment only
 
@@ -45,6 +45,9 @@ from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
 from arctic_platform.common.config import validate_peft_config
+from arctic_platform.common.model_settings import ModelSettings
+from arctic_platform.common.model_settings import worker_config_model_keys
+from arctic_platform.common.training_settings import WorkerTrainingSettings
 
 JobId = int | str
 
@@ -175,12 +178,12 @@ class SamplingConfig(BaseModel):
     )
 
 
-class TrainingConfig(BaseModel):
-    """On-prem training job: the DeepSpeed engine config + job settings.
+class TrainingConfig(WorkerTrainingSettings):
+    """Training job: the engine and model settings every backend reads, plus job settings.
 
-    DeepSpeed owns the engine, so optimizer / scheduler / batch size / gradient
-    accumulation all live in ``ds_config`` (DeepSpeed config-json format) rather
-    than as separate typed fields. Allocation (GPUs, max_seq_len) stays on the client.
+    Each ``step`` applies one optimizer update; its ``learning_rate`` overrides a
+    ``ds_config`` scheduler. Allocation (GPUs, max_seq_len) stays on the client.
+    PEFT is ``peft``, not ``peft_config``.
     """
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
@@ -195,15 +198,9 @@ class TrainingConfig(BaseModel):
             "The default destination used by save_checkpoint()."
         ),
     )
-    ds_config: dict[str, Any] | None = Field(
-        None,
-        description=(
-            "DeepSpeed config-json for the engine (optimizer, scheduler, train_batch_size, zero_optimization, ...)."
-        ),
-    )
     ds_worker_config: dict[str, Any] | None = Field(
         None,
-        description="DeepSpeed worker knobs (attn_implementation, use_liger, enable_gradient_checkpointing, ...).",
+        description="On-prem worker runtime knobs (zorro_train_enable, use_autocast, logits_optimization, ...).",
     )
     peft: dict[str, Any] | None = Field(
         None,
@@ -231,15 +228,43 @@ class TrainingConfig(BaseModel):
 
     _validate_peft = field_validator("peft")(validate_peft_config)
 
+    @field_validator("ds_worker_config")
+    @classmethod
+    def _reject_moved_worker_keys(cls, worker: dict[str, Any] | None) -> dict[str, Any] | None:
+        if worker and "mb_spec" in worker:
+            raise ValueError("training.ds_worker_config.mb_spec moved to training.mb_spec")
+        moved = worker_config_model_keys(worker)
+        if moved:
+            raise ValueError(
+                "training.ds_worker_config may not set model settings; set "
+                + ", ".join(
+                    f"training.{'peft' if field == 'peft_config' else field} instead of {key}"
+                    for key, field in moved.items()
+                )
+            )
+        return worker
+
     @model_validator(mode="after")
-    def _resolve_worker_peft(self) -> Self:
-        worker_peft = (self.ds_worker_config or {}).get("peft_config")
-        validate_peft_config(worker_peft)
-        if worker_peft is not None:
-            if self.peft is not None and self.peft != worker_peft:
-                raise ValueError("training.peft conflicts with training.ds_worker_config.peft_config")
-            self.peft = worker_peft
+    def _reject_peft_config(self) -> Self:
+        if self.peft_config is not None:
+            raise ValueError("set training.peft, not training.peft_config")
         return self
+
+    def model_settings(self) -> dict[str, Any]:
+        """The ``ModelSettings`` the job set, after the ``model_options`` rewrite, with ``peft`` as ``peft_config``.
+
+        Unset and ``None`` fields are left out, so they keep the server's default.
+        """
+        dumped = self.model_dump(include=set(ModelSettings.model_fields) - {"peft_config"}, exclude_unset=True)
+        settings = {key: value for key, value in dumped.items() if value is not None}
+        if self.peft is not None:
+            settings["peft_config"] = dict(self.peft)
+        return settings
+
+    def engine_settings(self) -> dict[str, Any]:
+        """The on-prem ``training_config`` wire block: every engine setting explicit, plus ``model_settings``."""
+        engine = set(WorkerTrainingSettings.model_fields) - set(ModelSettings.model_fields)
+        return {**self.model_dump(include=engine), **self.model_settings()}
 
 
 class ArcticClientConfig(BaseModel):
@@ -297,26 +322,32 @@ class ArcticClientConfig(BaseModel):
         payload: dict[str, Any] = {"model_name": self.model_name, "job_type": job_type}
         if self.seed is not None:
             payload["seed"] = self.seed
+        if self.dtype is not None:
+            payload["dtype"] = self.dtype
         # log-prob runs on DeepSpeed only when asked; otherwise it's a vLLM engine.
         use_deepspeed = job_type == "training" or (job_type == "log_prob" and sc.log_prob_engine == "deepspeed")
         if use_deepspeed:
+            payload["max_seq_len"] = self.max_seq_len
             payload["full_determinism"] = tc.full_determinism
-            if tc.ds_config:
-                payload["ds_config"] = tc.ds_config
-            worker = dict(tc.ds_worker_config or {})
-            worker.pop("peft_config", None)
-            if job_type == "training" and tc.peft is not None:
-                worker["peft_config"] = dict(tc.peft)
-            if worker:
-                payload["ds_worker_config"] = worker
+            if tc.ds_worker_config:
+                payload["ds_worker_config"] = dict(tc.ds_worker_config)
             if job_type == "training":
+                payload["training_config"] = tc.engine_settings()
                 if tc.checkpoint_path:
                     payload["checkpoint_path"] = tc.checkpoint_path
                 # Bake the (static) weight-sync strategy onto the training job.
                 payload["cuda_ipc"] = tc.cuda_ipc
                 payload["low_memory"] = tc.low_memory
-            elif sc.log_prob_ds_config:
-                payload["log_prob_config"] = sc.log_prob_ds_config
+            else:
+                model_settings = tc.model_settings()
+                model_settings.pop("peft_config", None)
+                if model_settings:
+                    payload["training_config"] = model_settings
+                # Inherits the training SP degree unless it sets its own.
+                log_prob_config = dict(sc.log_prob_ds_config or {})
+                if "sequence_parallel_size" in (tc.ds_config or {}):
+                    log_prob_config.setdefault("sequence_parallel_size", tc.ds_config["sequence_parallel_size"])
+                payload["log_prob_config"] = log_prob_config
         else:
             if sc.arctic_inference_config:
                 payload["arctic_inference_config"] = sc.arctic_inference_config
@@ -329,9 +360,8 @@ class ArcticClientConfig(BaseModel):
     def to_cortex(self) -> list[dict[str, Any]]:
         """Translate into Cortex/SnowAPI ``sub_job_configs``.
 
-        Neutrino wants typed sub-job fields, so training knobs are lifted out of the
-        DeepSpeed ``ds_config`` / ``ds_worker_config`` here (temporary — drop once
-        Neutrino accepts the canonical nesting directly).
+        Neutrino reads the engine and model settings as typed ``training_config``
+        fields (temporary — drop once Neutrino accepts the canonical nesting directly).
         """
         subs: list[dict[str, Any]] = []
         if self.sampling_gpus > 0:
@@ -343,51 +373,32 @@ class ArcticClientConfig(BaseModel):
         return subs
 
     def _cortex_training_sub_job(self) -> dict[str, Any]:
-        ds = self.training.ds_config or {}
-        worker = self.training.ds_worker_config or {}
-        training: dict[str, Any] = {"max_seq_len": self.max_seq_len, "n_gpus": self.training_gpus}
-        if "train_batch_size" in ds:
-            training["train_batch_size"] = ds["train_batch_size"]
-        if "gradient_clipping" in ds:
-            training["gradient_clipping"] = ds["gradient_clipping"]
-        optimizer = _neutrino_optimizer(ds.get("optimizer"))
-        if optimizer:
-            training["optimizer"] = optimizer
-        if "enable_gradient_checkpointing" in worker:
-            training["activation_checkpointing"] = worker["enable_gradient_checkpointing"]
-        provider = worker.get("model_provider")
-        if provider == "liger":
-            raise ValueError(
-                "ds_worker_config.model_provider='liger' is not accepted. "
-                "Set use_liger=true to apply Liger kernels on a huggingface model."
-            )
-        if provider == "prime_rl":
-            provider = "arctic"
-        if provider and provider not in {"huggingface", "arctic"}:
-            raise ValueError(f"ds_worker_config.model_provider must be 'huggingface' or 'arctic', got {provider!r}.")
-        if worker.get("use_liger") and provider == "arctic":
-            raise ValueError(
-                "use_liger applies to huggingface models. On the arctic provider, "
-                "set model_options.lm_head.cross_entropy."
-            )
-        if provider:
-            training["model_provider"] = provider
-        if "model_options" in worker:
-            training["model_options"] = deepcopy(worker["model_options"])
-        if worker.get("use_liger"):
-            options = dict(training.get("model_options") or {})
-            options["liger"] = True
-            training["model_options"] = options
-        if worker.get("attn_implementation"):
-            training["attn_implementation"] = worker["attn_implementation"]
-        # Neutrino-only engine knobs ride along in ds_worker_config; on-prem ignores them.
-        for key in ("ep_size", "mb_spec", "router_replay"):
-            if key in worker:
-                training[key] = deepcopy(worker[key])
-        if ds:
-            training["ds_config"] = _without_noop_offload(ds)
-        if self.training.peft:
-            training["peft_config"] = self.training.peft
+        tc = self.training
+        worker = tc.ds_worker_config or {}
+        training: dict[str, Any] = {
+            "max_seq_len": self.max_seq_len,
+            "n_gpus": self.training_gpus,
+            "optimizer": None if tc.optimizer is None else tc.optimizer.model_dump(exclude_none=True),
+            "gradient_clipping": tc.gradient_clipping,
+            "fp32_masters": tc.fp32_masters,
+        }
+        if tc.zero_bucket_size is not None:
+            training["zero_bucket_size"] = tc.zero_bucket_size
+        if tc.mb_spec is not None:
+            if tc.mb_spec.num_micro_batches is not None:
+                raise ValueError(
+                    "Cortex splits fwd-bwd batches by mb_spec.max_tokens_per_mb; "
+                    "mb_spec.num_micro_batches is supported on-prem only"
+                )
+            training["mb_spec"] = tc.mb_spec.model_dump(exclude_none=True)
+        if tc.debug is not None:
+            training["debug"] = deepcopy(tc.debug)
+        training.update(tc.model_settings())
+        # A Neutrino-only engine knob rides along in ds_worker_config; on-prem ignores it.
+        if "router_replay" in worker:
+            training["router_replay"] = deepcopy(worker["router_replay"])
+        if tc.ds_config:
+            training["ds_config"] = _without_noop_offload(tc.ds_config)
         return self._cortex_sub_job("training", {"training_config": training})
 
     def _cortex_inference_sub_job(self, job_type: str, n_gpus: int) -> dict[str, Any]:
@@ -413,14 +424,6 @@ class ArcticClientConfig(BaseModel):
         if self.seed is not None:
             sub["seed"] = self.seed
         return sub
-
-
-def _neutrino_optimizer(ds_optimizer: Any) -> dict[str, Any] | None:
-    """DeepSpeed ``{"type", "params": {...}}`` → Neutrino ``{"name", lr, betas, ...}``."""
-    if not isinstance(ds_optimizer, dict):
-        return None
-    params = ds_optimizer.get("params") or {}
-    return {"name": ds_optimizer.get("type", "AdamW"), **params}
 
 
 def _without_noop_offload(ds_config: dict[str, Any]) -> dict[str, Any]:

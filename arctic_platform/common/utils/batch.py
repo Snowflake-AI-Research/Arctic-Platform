@@ -347,7 +347,7 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
 
     Supports two wire shapes for ``batch["batch"]``:
       * **dict** of tensors (legacy / demos): one concatenated mini-batch, later
-        re-split by ``gradient_accumulation_steps`` inside the worker.
+        re-split into ``mb_spec.num_micro_batches`` inside the worker.
       * **list** of microbatch dicts (Arctic SFT trainer, H3): each entry is one
         GAS microbatch already; DP-shard each microbatch independently so the
         worker skips concat→``split_dict`` and avoids cross-GAS re-padding.

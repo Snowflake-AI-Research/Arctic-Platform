@@ -20,8 +20,10 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from arctic_platform.common.model_settings import ModelSettings
 from arctic_platform.model.dense_spec import dense_model_spec
-from arctic_platform.model.dense_spec import ds_worker_dense_model_spec
+from arctic_platform.model.dense_spec import ds_worker_zorro_train
+from arctic_platform.model.dense_spec import settings_dense_model_spec
 
 
 def _training_options():
@@ -151,18 +153,21 @@ def test_lm_head_without_a_vocab_chunk_size_is_rejected(lm_head_options):
         _spec(training_options=lm_head_options)
 
 
-def test_ds_worker_config_translates_like_dense_training_options():
-    shared = _training_options()
-    flat = {
-        **{key: value for key, value in shared.items() if key != "activation_checkpointing"},
-        "attn_implementation": "flash_attention_3",
-        "enable_gradient_checkpointing": shared["activation_checkpointing"],
-        "use_liger": True,
-        "fp32_parity": True,
-        "fp32_residual": True,
-    }
+def _settings_spec(settings, **kwargs):
+    return settings_dense_model_spec(
+        ModelSettings.model_validate(settings),
+        model_path="Qwen/Qwen3-8B",
+        dtype="bfloat16",
+        sequence_parallel=1,
+        **kwargs,
+    )
 
-    onprem = ds_worker_dense_model_spec("Qwen/Qwen3-8B", flat, dtype="bfloat16", sequence_parallel=1)
+
+def test_model_settings_translate_like_dense_training_options():
+    shared = _training_options()
+    settings = {**shared, "attn_implementation": "flash_attention_3", "use_liger": True, "fp32_parity": True}
+    settings["fp32_residual"] = True
+
     dense = dense_model_spec(
         model_path="Qwen/Qwen3-8B",
         dtype="bfloat16",
@@ -173,13 +178,11 @@ def test_ds_worker_config_translates_like_dense_training_options():
         loader_options={"fp32_parity": True, "fp32_residual": True},
     )
 
-    assert onprem == dense
+    assert _settings_spec(settings) == dense
 
 
-def test_ds_worker_config_defaults_gradient_checkpointing_on():
-    spec = ds_worker_dense_model_spec(
-        "Qwen/Qwen3-8B", {"attn_implementation": "sdpa"}, dtype="bfloat16", sequence_parallel=1
-    )
+def test_model_settings_default_gradient_checkpointing_on():
+    spec = _settings_spec({"attn_implementation": "sdpa"})
 
     assert spec.patches.gradient_checkpointing is True
     assert spec.patches.liger is False
@@ -187,61 +190,54 @@ def test_ds_worker_config_defaults_gradient_checkpointing_on():
     assert spec.patches.zorro_train is None
     assert spec.loader_options == {"fp32_parity": True, "fp32_residual": False}
     assert spec.debug == {}
+    assert spec.text_config_overrides == {}
 
 
-def test_ds_worker_config_selects_liger_provider_zorro_train_and_debug():
-    spec = ds_worker_dense_model_spec(
-        "Qwen/Qwen3-8B",
+def test_model_options_reach_the_dense_spec_through_their_fields():
+    spec = _settings_spec(
         {
-            "attn_implementation": "flash_attention_2",
-            "model_provider": "liger",
-            "zorro_train_enable": True,
-            "rollout_n": 4,
-            "use_unpad": True,
-            "unrelated": "ignored",
-        },
-        dtype="bfloat16",
-        sequence_parallel=1,
-        debug={"gpu_mem_preallocate_gib": 2},
+            "attn_implementation": "sdpa",
+            "model_options": {"liger": True, "lm_head": {"fp32": True}, "numerics": {"fp32_parity": False}},
+            "text_config_overrides": {"rope_theta": 1.0},
+        }
     )
 
     assert spec.patches.liger is True
+    assert spec.patches.lm_head.fp32 is True
+    assert spec.patches.lm_head.vocab_chunk_size == 8192
+    assert spec.loader_options == {"fp32_parity": False, "fp32_residual": False}
+    assert spec.text_config_overrides == {"rope_theta": 1.0}
+
+
+def test_attn_impl_overrides_attn_implementation():
+    assert _settings_spec({"attn_implementation": "sdpa", "attn_impl": "eager"}).attn_implementation == "eager"
+
+
+def test_zorro_train_and_debug_reach_the_spec():
+    zorro_train = ds_worker_zorro_train(
+        {"zorro_train_enable": True, "rollout_n": 4, "use_unpad": True, "unrelated": "ignored"}, "flash_attention_2"
+    )
+    spec = _settings_spec(
+        {"attn_implementation": "flash_attention_2"}, zorro_train=zorro_train, debug={"gpu_mem_preallocate_gib": 2}
+    )
+
     assert spec.patches.zorro_train.rollout_n == 4
     assert spec.patches.zorro_train.use_unpad is True
     assert spec.debug == {"gpu_mem_preallocate_gib": 2}
 
 
-@pytest.mark.parametrize("flat", [{}, {"attn_implementation": None}])
-def test_ds_worker_config_requires_attn_implementation(flat):
-    with pytest.raises(ValueError, match="requires attn_implementation"):
-        ds_worker_dense_model_spec("Qwen/Qwen3-8B", flat, dtype="bfloat16", sequence_parallel=1)
+def test_zorro_train_is_off_unless_enabled():
+    assert ds_worker_zorro_train({"rollout_n": 4}, "sdpa") is None
 
 
-@pytest.mark.parametrize("attn_implementation", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
-def test_ds_worker_config_accepts_any_flash_attention_backend(attn_implementation):
-    spec = ds_worker_dense_model_spec(
-        "Qwen/Qwen3-8B", {"attn_implementation": attn_implementation}, dtype="bfloat16", sequence_parallel=1
-    )
-
-    assert spec.attn_implementation == attn_implementation
-
-
-def test_ds_worker_config_rejects_zorro_train_with_sdpa():
+def test_zorro_train_rejects_sdpa():
     with pytest.raises(ValueError, match="ZoRRo Train does not support attn_implementation='sdpa'"):
-        ds_worker_dense_model_spec(
-            "Qwen/Qwen3-8B",
-            {"attn_implementation": "sdpa", "zorro_train_enable": True},
-            dtype="bfloat16",
-            sequence_parallel=1,
-        )
+        ds_worker_zorro_train({"zorro_train_enable": True}, "sdpa")
 
 
-def test_ds_worker_config_accepts_zorro_train_with_eager():
-    spec = ds_worker_dense_model_spec(
-        "Qwen/Qwen3-8B",
-        {"attn_implementation": "eager", "zorro_train_enable": True},
-        dtype="bfloat16",
-        sequence_parallel=1,
+def test_zorro_train_accepts_eager():
+    spec = _settings_spec(
+        {"attn_implementation": "eager"}, zorro_train=ds_worker_zorro_train({"zorro_train_enable": True}, "eager")
     )
 
     assert spec.attn_implementation == "eager"

@@ -21,6 +21,7 @@ import torch
 from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
 from arctic_platform.common.deepspeed_engine import apply_default_grad_accum_dtype
 from arctic_platform.common.deepspeed_engine import build_deepspeed_config
+from arctic_platform.common.training_settings import WorkerTrainingSettings
 from arctic_platform.testing_utils import get_unique_port_number
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import reserve_free_port
@@ -28,37 +29,33 @@ from arctic_platform.testing_utils import set_seed
 from arctic_platform.testing_utils import torch_assert_equal
 
 
-@pytest.fixture
-def worker():
-    from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
+def _onprem_config(ds_config=None, dtype="bfloat16", **settings):
+    from arctic_platform.common.deepspeed_worker import onprem_deepspeed_config
 
-    return object.__new__(DeepSpeedWorker.__ray_metadata__.modified_class)
+    training = WorkerTrainingSettings(ds_config=ds_config, **settings)
+    return onprem_deepspeed_config(training, dtype=dtype, world_size=1)
 
 
 _ZERO2 = {"zero_optimization": {"stage": 2}}
 _REFUSED_ZERO = [{"stage": 0}, {"stage": 1, "compute_grad_norm": False}]
 
 
-def _entry_point_config(worker, entry_point, overrides, dtype="bfloat16"):
+def _entry_point_config(entry_point, overrides, dtype="bfloat16"):
     if entry_point == "builder":
         return build_deepspeed_config(
             TrainingEngineSpec(world_size=1, dtype=dtype, fp32_masters=True, ds_overrides=overrides)
         )
-    config = {
-        "train_micro_batch_size_per_gpu": 1,
-        "bf16": {"enabled": dtype in ("bf16", "bfloat16")},
-        "fp16": {"enabled": dtype in ("fp16", "float16")},
-        **deepcopy(_ZERO2),
-    }
-    config.update(overrides)
-    return worker.ds_training_config({}, config, {})
+    # On-prem takes clipping as a typed field; ``ds_config`` may not set it.
+    ds_config = dict(overrides)
+    settings = {"fp32_masters": True}
+    if "gradient_clipping" in ds_config:
+        settings["gradient_clipping"] = ds_config.pop("gradient_clipping")
+    return _onprem_config(ds_config, dtype=dtype, **settings)
 
 
-@pytest.mark.parametrize("job_config", [{}, {"training_config": {}}])
-def test_missing_data_types_retains_worker_fp32_accumulation_default(worker, job_config):
-    config = deepcopy(_ZERO2)
-    assert worker.ds_training_config(job_config, config, {}) is config
-    assert config["data_types"] == {"grad_accum_dtype": "fp32"}
+@pytest.mark.parametrize("ds_config", [None, {}])
+def test_missing_data_types_retains_worker_fp32_accumulation_default(ds_config):
+    assert _onprem_config(ds_config)["data_types"] == {"grad_accum_dtype": "fp32"}
 
 
 @pytest.mark.parametrize(
@@ -66,11 +63,12 @@ def test_missing_data_types_retains_worker_fp32_accumulation_default(worker, job
 )
 @pytest.mark.parametrize("zero", [{"stage": 2}, *_REFUSED_ZERO])
 @pytest.mark.parametrize("entry_point", ["builder", "worker"])
-def test_explicit_accumulation_precision_is_preserved(worker, entry_point, data_types, zero):
+def test_explicit_accumulation_precision_is_preserved(entry_point, data_types, zero):
     supplied = {"data_types": deepcopy(data_types), "zero_optimization": deepcopy(zero)}
-    config = _entry_point_config(worker, entry_point, supplied)
+    config = _entry_point_config(entry_point, supplied)
     assert config["data_types"] == data_types
-    assert config["data_types"] is supplied["data_types"]
+    if entry_point == "builder":
+        assert config["data_types"] is supplied["data_types"]
     assert supplied == {"data_types": data_types, "zero_optimization": zero}
 
 
@@ -79,71 +77,66 @@ def test_explicit_accumulation_precision_is_preserved(worker, entry_point, data_
     "entry_point, dtype",
     [("builder", "bfloat16"), ("worker", "bfloat16"), ("worker", "float16"), ("worker", "float32")],
 )
-def test_supplied_block_without_accumulation_precision_gets_fp32_default(worker, entry_point, dtype, data_types):
+def test_supplied_block_without_accumulation_precision_gets_fp32_default(entry_point, dtype, data_types):
     supplied = {"data_types": deepcopy(data_types)}
-    config = _entry_point_config(worker, entry_point, supplied, dtype)
+    config = _entry_point_config(entry_point, supplied, dtype)
     assert config["data_types"] == {**(data_types or {}), "grad_accum_dtype": "fp32"}
     assert supplied == {"data_types": data_types}
 
 
-@pytest.mark.parametrize("job_config", [{}, {"training_config": {}}])
-def test_worker_without_zero_does_not_insert_accumulation_precision(worker, job_config):
-    config = {}
-    assert worker.ds_training_config(job_config, config, {}) is config
-    assert "data_types" not in config
-
-
 @pytest.mark.parametrize("data_types", [{}, {"grad_accum_dtype": "bf16"}, {"grad_accum_dtype": "fp32"}])
-def test_worker_without_zero_preserves_supplied_accumulation_block(worker, data_types):
-    config = {"data_types": deepcopy(data_types)}
-    worker.ds_training_config({}, config, {})
+def test_worker_without_zero_preserves_supplied_accumulation_block(data_types):
+    config = _onprem_config({"zero_optimization": {"stage": 0}, "data_types": deepcopy(data_types)})
     assert config["data_types"] == data_types
 
 
 @pytest.mark.parametrize("zero", _REFUSED_ZERO)
-def test_worker_leaves_accumulation_unset_where_deepspeed_refuses_fp32(worker, zero):
-    config = {"zero_optimization": deepcopy(zero)}
-    worker.ds_training_config({}, config, {})
-    assert config["bf16"] == {"enabled": True}
+def test_worker_leaves_accumulation_unset_where_deepspeed_refuses_fp32(zero):
+    config = _onprem_config({"zero_optimization": deepcopy(zero)})
+    assert config["bf16"]["enabled"] is True
     assert "data_types" not in config
 
 
-@pytest.mark.parametrize("entry_point", ["builder", "worker"])
+_PRECISION_CASES = [
+    ("float16", {}, torch.float16, torch.float16),
+    ("fp16", {}, torch.float16, torch.float16),
+    ("float32", {}, torch.float32, torch.float32),
+    ("fp32", {}, torch.float32, torch.float32),
+    (
+        "bfloat16",
+        {"bf16": {"enabled": False}, "fp16": {"enabled": True}},
+        torch.float16,
+        torch.float16,
+    ),
+    ("bfloat16", {"bf16": {"enabled": False}}, torch.float32, torch.float32),
+    (
+        "float16",
+        {"bf16": {"enabled": True}, "fp16": {"enabled": False}, "communication_data_type": "fp32"},
+        torch.bfloat16,
+        torch.float32,
+    ),
+    (
+        "float32",
+        {"bf16": {"enabled": True}, "communication_data_type": "fp32"},
+        torch.bfloat16,
+        torch.float32,
+    ),
+    ("float16", {"data_types": {"grad_accum_dtype": "fp32"}}, torch.float16, torch.float32),
+    ("float32", {"data_types": {"grad_accum_dtype": "bf16"}}, torch.float32, torch.bfloat16),
+]
+
+
 @pytest.mark.parametrize(
-    "dtype, overrides, model_dtype, accumulation_dtype",
-    [
-        ("float16", {}, torch.float16, torch.float16),
-        ("fp16", {}, torch.float16, torch.float16),
-        ("float32", {}, torch.float32, torch.float32),
-        ("fp32", {}, torch.float32, torch.float32),
-        (
-            "bfloat16",
-            {"bf16": {"enabled": False}, "fp16": {"enabled": True}},
-            torch.float16,
-            torch.float16,
-        ),
-        ("bfloat16", {"bf16": {"enabled": False}}, torch.float32, torch.float32),
-        (
-            "float16",
-            {"bf16": {"enabled": True}, "fp16": {"enabled": False}, "communication_data_type": "fp32"},
-            torch.bfloat16,
-            torch.float32,
-        ),
-        (
-            "float32",
-            {"bf16": {"enabled": True}, "communication_data_type": "fp32"},
-            torch.bfloat16,
-            torch.float32,
-        ),
-        ("float16", {"data_types": {"grad_accum_dtype": "fp32"}}, torch.float16, torch.float32),
-        ("float32", {"data_types": {"grad_accum_dtype": "bf16"}}, torch.float32, torch.bfloat16),
-    ],
+    "entry_point, dtype, overrides, model_dtype, accumulation_dtype",
+    [("builder", *case) for case in _PRECISION_CASES]
+    # On-prem precision follows dtype; its ds_config may not set bf16 or fp16.
+    + [("worker", *case) for case in _PRECISION_CASES if not {"bf16", "fp16"} & case[1].keys()],
 )
 def test_effective_precision_controls_default_and_preserves_explicit_dtype(
-    worker, entry_point, dtype, overrides, model_dtype, accumulation_dtype
+    entry_point, dtype, overrides, model_dtype, accumulation_dtype
 ):
     supplied = deepcopy(overrides)
-    config = _entry_point_config(worker, entry_point, supplied, dtype)
+    config = _entry_point_config(entry_point, supplied, dtype)
     if entry_point == "worker" and "data_types" not in overrides:
         accumulation_dtype = torch.float32
     assert supplied == overrides
@@ -211,9 +204,7 @@ def _resolved_engine(config):
     [(True, True), (False, False), ("true", True), ("false", False), (1, True), (0, False)],
 )
 @pytest.mark.parametrize("entry_point", ["builder", "worker"])
-def test_typed_grad_norm_policy_matches_real_deepspeed_sanity_check(
-    worker, raw_boolean, resolved_boolean, entry_point
-):
+def test_typed_grad_norm_policy_matches_real_deepspeed_sanity_check(raw_boolean, resolved_boolean, entry_point):
     from deepspeed.runtime.zero.config import get_zero_config
 
     zero = {"stage": 1, "compute_grad_norm": raw_boolean}
@@ -223,7 +214,7 @@ def test_typed_grad_norm_policy_matches_real_deepspeed_sanity_check(
         "zero_allow_untested_optimizer": True,
     }
     assert get_zero_config(overrides).compute_grad_norm is resolved_boolean
-    defaulted = _entry_point_config(worker, entry_point, deepcopy(overrides))
+    defaulted = _entry_point_config(entry_point, deepcopy(overrides))
     assert ("data_types" in defaulted) is resolved_boolean
     engine = _resolved_engine(defaulted)
     assert engine._config.zero_config.compute_grad_norm is resolved_boolean
@@ -277,7 +268,7 @@ def test_typed_precision_policy_matches_real_deepspeed_parser(precision, raw_boo
     ],
 )
 def test_auto_and_legacy_zero_policy_matches_real_deepspeed_parser(
-    worker, entry_point, zero, resolved_stage, cpu_offload, fp32
+    entry_point, zero, resolved_stage, cpu_offload, fp32
 ):
     from deepspeed.runtime.zero.config import get_zero_config
 
@@ -292,7 +283,7 @@ def test_auto_and_legacy_zero_policy_matches_real_deepspeed_parser(
     assert (parsed.offload_optimizer is not None) is cpu_offload
     if cpu_offload:
         assert parsed.offload_optimizer.device == "cpu"
-    defaulted = _entry_point_config(worker, entry_point, overrides)
+    defaulted = _entry_point_config(entry_point, overrides)
     assert overrides == original
     assert defaulted["zero_optimization"] == zero
     assert ("data_types" in defaulted) is fp32
@@ -356,7 +347,7 @@ def test_deepspeed_resolves_float32_accumulation_without_changing_model_precisio
 
 
 @require_torch_gpu
-def test_worker_default_matches_explicit_fp32_loss_and_gradient_norm(worker):
+def test_worker_default_matches_explicit_fp32_loss_and_gradient_norm():
     """The worker default, with or without a supplied ``data_types`` block, matches explicit FP32 exactly."""
     import deepspeed
     import torch.distributed as dist
@@ -376,19 +367,18 @@ def test_worker_default_matches_explicit_fp32_loss_and_gradient_norm(worker):
         for label in ("worker_default", "block_without_dtype", "explicit_fp32"):
             set_seed(17)
             model = torch.nn.Linear(16, 8, bias=False, device="cuda", dtype=torch.bfloat16)
-            config = dict(
-                train_micro_batch_size_per_gpu=1,
-                gradient_accumulation_steps=4,
-                bf16=dict(enabled=True),
-                zero_optimization=dict(stage=2),
-                gradient_clipping=0.0,
-                steps_per_print=1000,
-            )
+            overrides = dict(steps_per_print=1000)
             if label == "explicit_fp32":
-                config["data_types"] = dict(grad_accum_dtype="fp32")
+                overrides["data_types"] = dict(grad_accum_dtype="fp32")
             elif label == "block_without_dtype":
-                config["data_types"] = {}
-            worker.ds_training_config({"training_config": {"optimizer": {"torch_adam": True, "lr": 0.01}}}, config, {})
+                overrides["data_types"] = {}
+            config = _onprem_config(overrides, gradient_clipping=0.0, fp32_masters=True)
+            # DeepSpeed's own accumulation loop, so its accumulation buffer is what gets measured.
+            config.update(
+                gradient_accumulation_steps=4,
+                train_batch_size=4,
+                optimizer={"type": "AdamW", "params": {"lr": 0.01, "torch_adam": True}},
+            )
             engine, *_ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
             assert engine.get_data_types() == (torch.bfloat16, torch.float32)
             losses = []

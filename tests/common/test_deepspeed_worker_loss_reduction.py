@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -98,9 +100,10 @@ class _Engine:
     def __init__(self):
         self.parameter = torch.tensor(-2.0, requires_grad=True)
         self.steps = 0
+        self.boundaries = []
 
-    def gradient_accumulation_steps(self):
-        return 2
+    def set_gradient_accumulation_boundary(self, boundary):
+        self.boundaries.append(boundary)
 
     def train(self):
         pass
@@ -121,17 +124,12 @@ class _ScoreEngine(_Engine):
         return {"objective_score": self.parameter.expand_as(input_ids)}
 
 
-class _SingleGASScoreEngine(_ScoreEngine):
-    def gradient_accumulation_steps(self):
-        return 1
-
-
 class _NeverForwardEngine(_Engine):
     def __call__(self, input_ids, **_kwargs):
         raise AssertionError("M2PO with GAS > 1 must fail before model forward")
 
 
-def _worker(engine):
+def _worker(engine, num_micro_batches=2):
     from arctic_platform.common.deepspeed_worker import DeepSpeedWorker
 
     worker_class = DeepSpeedWorker.__ray_metadata__.modified_class
@@ -140,6 +138,7 @@ def _worker(engine):
     worker.world_size = 1
     worker.sp_size = 1
     worker.engine = engine
+    worker.num_micro_batches = num_micro_batches
     worker._device = torch.device("cpu")
     worker.cpu_device = torch.device("cpu")
     return worker
@@ -281,7 +280,7 @@ def test_native_worker_honors_class_precedence_for_sft_name(monkeypatch):
         "meta": {"pad_token_id": 0},
         "processing": {"loss_fn": "sft", "config": {}},
     }
-    worker = _worker(_SingleGASScoreEngine())
+    worker = _worker(_ScoreEngine(), num_micro_batches=1)
 
     response = worker.forward_backward(request)
 
@@ -328,3 +327,34 @@ def test_native_worker_sums_globally_normalized_gas_losses_without_rescaling_gra
     assert response["avg_loss"] == 2.0
     assert worker.engine.parameter.grad.item() == -1.0
     assert worker.engine.steps == 1
+    assert worker.engine.boundaries == [False, True]
+
+
+def test_native_worker_rejects_a_microbatch_list_of_the_wrong_length():
+    request = {
+        "batch": [{"input_ids": torch.ones(1, 1, dtype=torch.long)}] * 2,
+        "meta": {"pad_token_id": 0},
+        "processing": {"loss_fn": "sft", "config": {}},
+    }
+
+    with pytest.raises(ValueError, match="training.mb_spec.num_micro_batches=3"):
+        _worker(_NeverForwardEngine(), num_micro_batches=3).forward_backward(request)
+
+
+def test_step_applies_the_client_learning_rate_to_every_param_group():
+    engine = _Engine()
+    engine.lr_scheduler = object()
+    engine.get_global_grad_norm = lambda: None
+    groups = [{"lr": 1.0}, {"lr": 1.0}]
+    engine.get_lr = lambda: [groups[0]["lr"]]
+    worker = _worker(engine)
+    worker.optimizer = SimpleNamespace(param_groups=groups)
+    worker._warned_manual_lr_with_scheduler = False
+
+    assert worker.step(0.25)["metrics"]["last_lr"] == 0.25
+    assert groups == [{"lr": 0.25}, {"lr": 0.25}]
+    assert engine.steps == 1
+    assert worker._warned_manual_lr_with_scheduler
+
+    worker.step()
+    assert groups == [{"lr": 0.25}, {"lr": 0.25}]

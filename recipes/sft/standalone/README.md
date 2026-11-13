@@ -105,9 +105,9 @@ python -m recipes.sft.standalone.sft_loop config=recipes/config.json lora_rank=6
 ### GPUs and batch size
 
 ```bash
-# batch_size must be a multiple of micro_batch_size * n_gpus
+# each step is one optimizer update over batch_size examples
 python -m recipes.sft.standalone.sft_loop config=recipes/config.json \
-    n_gpus=4 batch_size=4 micro_batch_size=1
+    n_gpus=4 batch_size=4
 ```
 
 ### MoE / expert parallelism (`ep_size`)
