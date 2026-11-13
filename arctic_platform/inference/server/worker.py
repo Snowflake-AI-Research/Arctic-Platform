@@ -641,6 +641,34 @@ def _sampled_logprobs_for_output(choice: Any) -> list[float]:
     return logprobs
 
 
+# vLLM's per-request phase timestamps (``RequestStateStats``): when the engine
+# core queued the request, first scheduled it, and emitted its first and last
+# output token.
+_PHASE_TIMESTAMP_KEYS = ("queued_ts", "scheduled_ts", "first_token_ts", "last_token_ts")
+
+
+def _phase_timestamps(final_output: Any) -> dict[str, float]:
+    """The request's phase timestamps as wall-clock epoch seconds.
+
+    vLLM fills ``RequestOutput.metrics`` when engine stats are on, which they
+    are here (``AsyncLLM.from_vllm_config`` and the semi-p attach both log
+    stats). The four stamps come from ``time.monotonic()`` in the engine core,
+    which runs on this host, so one offset puts them on the wall clock that
+    ``created_at`` / ``updated_at`` and the drain records use. A stamp vLLM
+    never set (0.0) is left out; no stats means no keys.
+    """
+    stats = getattr(final_output, "metrics", None)
+    if stats is None:
+        return {}
+    offset = time.time() - time.monotonic()
+    stamps: dict[str, float] = {}
+    for key in _PHASE_TIMESTAMP_KEYS:
+        value = getattr(stats, key, None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            stamps[key] = float(value) + offset
+    return stamps
+
+
 def _result_from_output(
     final_output: Any,
     *,
@@ -678,6 +706,7 @@ def _result_from_output(
         "generation_len": len(choice.token_ids),
         "prefix_cache_len": int(num_cached) if num_cached is not None else 0,
     }
+    result.update(_phase_timestamps(final_output))
 
     spec = getattr(choice, "spec_decode_metrics", None)
     if spec is not None:

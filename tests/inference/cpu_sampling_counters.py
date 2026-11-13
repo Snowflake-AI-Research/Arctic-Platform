@@ -72,6 +72,44 @@ class SamplingCounterContract(unittest.TestCase):
         result = worker._result_from_output(output, return_sampled_logprobs_only=True)
         self.assertNotIn('spec_decode_metrics', result)
 
+    def test_phase_timestamps_are_returned_on_the_wall_clock(self):
+        choice = NS(text='x', token_ids=[42], finish_reason='stop', logprobs=None,
+                    spec_decode_metrics=None)
+        stats = NS(queued_ts=10., scheduled_ts=10.25, first_token_ts=11.5, last_token_ts=0.)
+        output = NS(outputs=[choice], prompt_token_ids=[41], num_cached_tokens=0,
+                    prompt_logprobs=None, metrics=stats)
+        with patch.object(worker.time, 'time', return_value=1_000_000.), \
+                patch.object(worker.time, 'monotonic', return_value=20.):
+            result = worker._result_from_output(output, return_sampled_logprobs_only=True)
+        # offset = 1_000_000 - 20; last_token_ts was never set, so it is left out.
+        self.assertEqual({k: result.get(k) for k in worker._PHASE_TIMESTAMP_KEYS},
+                         dict(queued_ts=999_990., scheduled_ts=999_990.25,
+                              first_token_ts=999_991.5, last_token_ts=None))
+        self.assertEqual(json.loads(json.dumps(result))['first_token_ts'], 999_991.5)
+        output.metrics = None
+        result = worker._result_from_output(output, return_sampled_logprobs_only=True)
+        self.assertFalse(set(worker._PHASE_TIMESTAMP_KEYS) & set(result))
+
+    def test_non_streaming_record_carries_the_first_token_time(self):
+        replies = [dict(token_ids=[1], prompt_len=3, generation_len=1, prefix_cache_len=0,
+                        first_token_ts=123.5),
+                   dict(token_ids=[1], prompt_len=3, generation_len=1, prefix_cache_len=0)]
+
+        async def generate(prompt, sampling_params):
+            return replies.pop(0)
+
+        handle = NS(generate=NS(remote=generate), set_replica_id=NS(remote=lambda _: None))
+        sched = scheduler.Scheduler([handle], dynamic_concurrency=False)
+
+        async def run():
+            sched._ensure_background_tasks = lambda: None
+            for _ in range(2):
+                await sched.submit([1, 2, 3], {})
+                await asyncio.sleep(0)
+            return [r.first_delta_time for r in sched._request_records.drain()]
+
+        self.assertEqual(asyncio.run(run()), [123.5, None])
+
 
 if __name__ == '__main__':
     unittest.main()
