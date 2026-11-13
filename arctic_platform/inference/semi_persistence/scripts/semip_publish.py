@@ -140,6 +140,11 @@ _DERIVED_KEY_RE = re.compile(r"[0-9a-f]{12}_[0-9a-f]{12}")
 # A published skeleton name: the derived key plus the weight hash it was dumped
 # with.  Used to parse referrers back out of the bucket listing.
 _SKELETON_KEY_RE = re.compile(r"([0-9a-f]{12}_[0-9a-f]{12})_([0-9a-f]{12})$")
+_WEIGHT_HASH_RE = re.compile(r"[0-9a-f]{12}")
+_RANK_DIR_RE = re.compile(r"rank\d+")
+
+# How many other published weight sets of a model a new one is compared with.
+_DRIFT_CANDIDATES = 5
 
 # Several replicas in one pod each dump into <key>/replica<K>/ (K is the slot
 # ReplicaPool gives the replica on its node); a pod holding one replica dumps
@@ -876,6 +881,80 @@ def _skeleton_referrers(bucket: str, prefix: str, slug: str,
     return sorted(found)
 
 
+def _published_weight_sets(bucket: str, prefix: str, slug: str) -> list[str]:
+    """Published weight hashes of *slug*, most recently completed first.
+
+    Ordered by their sentinels' upload times, which only a recursive listing
+    shows; a directory listing has none for prefixes."""
+    root = f"{prefix}/{slug}/{WEIGHT_DIR}"
+    rc, out = _aws_out("s3", "ls", "--recursive", f"s3://{bucket}/{root}/")
+    if rc != 0:
+        raise RuntimeError(f"aws s3 ls exited {rc}")
+    found = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or not parts[-1].startswith(root + "/"):
+            continue
+        wt, _, name = parts[-1][len(root) + 1:].partition("/")
+        if name == MANIFEST_FILENAME and _WEIGHT_HASH_RE.fullmatch(wt):
+            found.append((f"{parts[0]} {parts[1]}", wt))
+    return [wt for _, wt in sorted(found, reverse=True)]
+
+
+def _near_duplicate(ours: list[dict], theirs: list[dict]) -> list[str] | None:
+    """The paths that differ, when two weight manifests hold the same paths
+    and differ in no more files than a buffer per rank would touch."""
+    mine = {r["path"]: (r["size_bytes"], r["sha256"]) for r in ours}
+    other = {r["path"]: (r.get("size_bytes"), r.get("sha256")) for r in theirs}
+    if not mine or mine.keys() != other.keys():
+        return None
+    ranks = len({p.split("/", 1)[0] for p in mine
+                 if "/" in p and _RANK_DIR_RE.fullmatch(p.split("/", 1)[0])})
+    differ = sorted(p for p in mine if mine[p] != other[p])
+    return differ if 0 < len(differ) <= max(ranks, len(mine) // 20, 1) else None
+
+
+def _warn_on_weight_drift(bucket: str, prefix: str, slug: str, wt_hash: str,
+                          rows: list[dict]) -> None:
+    """Say so loudly when a new weight set is a published one with a few files
+    changed.
+
+    Weights do not follow the engine config, so the configs and backends of
+    one model should share one weight hash.  A few differing shards, about
+    one per rank, is what a config- or run-dependent buffer staged as a weight
+    looks like: it forks the hash, and every config then uploads its own copy
+    of every shard.  Advisory: it never stops a publish."""
+    try:
+        others = [h for h in _published_weight_sets(bucket, prefix, slug)
+                  if h != wt_hash]
+        for other in others[:_DRIFT_CANDIDATES]:
+            rc, body = _aws_out(
+                "s3", "cp", f"s3://{bucket}/{prefix}/{slug}/{WEIGHT_DIR}/"
+                f"{other}/{MANIFEST_FILENAME}", "-")
+            if rc != 0:
+                continue
+            try:
+                theirs = json.loads(body)["files"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            differ = _near_duplicate(rows, theirs)
+            if differ is None:
+                continue
+            print(f"  ! WARNING: weight set {wt_hash} is the published {other} "
+                  f"with {len(differ)} of {len(rows)} file(s) changed:")
+            for path in differ[:16]:
+                print(f"  !     {path}")
+            if len(differ) > 16:
+                print(f"  !     ... and {len(differ) - 16} more")
+            print("  !   A config- or run-dependent buffer is probably being "
+                  "staged as a weight (see vllm_child._WEIGHT_LIKE_PATH, and the "
+                  "dump log's 'changed between init and attach' warning). "
+                  "Publishing anyway, as a new weight set.")
+            return
+    except Exception as exc:  # noqa: BLE001 - never fail a publish over a check
+        print(f"  ! weight drift check skipped ({type(exc).__name__}: {exc})")
+
+
 def _upload_dir(src: Path, dest: str, label: str) -> None:
     print(f"uploading {label} ...")
     _aws("s3", "cp", "--recursive", "--only-show-errors", str(src), dest)
@@ -1023,6 +1102,8 @@ def publish(model_dir: Path, bucket: str, prefix: str,
     elif skeleton_only:
         print("  ! --skeleton-only and these weights are NOT published; the "
               "skeleton will cold-start on every node until they are")
+    if not weights_present and not dry_run:
+        _warn_on_weight_drift(bucket, prefix, slug, wt_hash, wts["files"])
 
     # (local dir, destination, label) for every skeleton directory, in upload
     # order; a multi-replica skeleton keeps each replica under its own name.
@@ -1219,6 +1300,8 @@ def publish_nodes(model_dir: Path, bucket: str, prefix: str,
     skip_weights = skeleton_only or (weights_present and not force_weights)
     if weights_present:
         print("  = weights already published")
+    elif 0 in local:
+        _warn_on_weight_drift(bucket, prefix, slug, wt_hash, wts["files"])
 
     if skip_weights:
         print("skipping weights upload")
