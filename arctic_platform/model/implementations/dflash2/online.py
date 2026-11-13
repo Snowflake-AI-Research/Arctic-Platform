@@ -20,8 +20,8 @@ hands the model a packed ``[1, T]`` window with ``position_ids`` restarting per 
 
 1. split the window back into rows at the ``position_ids`` resets and convert each row's prediction-aligned
    ``loss_mask`` to the token alignment SpecForge trains on,
-2. run the frozen target on each row to get the hidden states of ``target_layer_ids`` (what the capture server gives
-   SpecForge),
+2. run the frozen target on each row to get the hidden states of ``target_layer_ids`` and, for the teacher metrics,
+   its final hidden state (what the capture server gives SpecForge),
 3. pad the rows into the ``[B, S]`` batch ``OnlineDFlashModel`` expects and call it, and
 4. export the draft the way SpecForge does (``save_pretrained`` + ``apply_legacy_rope_scaling``).
 """
@@ -113,13 +113,22 @@ class DFlash2OnlineModel(nn.Module):
         self._seeded = True
 
     @torch.no_grad()
-    def target_context(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Concatenated hidden states of ``target_layer_ids`` for one row, aligned with ``input_ids``."""
+    def target_features(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(context, last_hidden)`` of the target for one row, both aligned with ``input_ids``.
+
+        ``context`` concatenates the hidden states of ``target_layer_ids``. ``last_hidden`` is the final, normed hidden
+        state that the target's LM head projects to its logits.
+        """
         self.target.eval()
         out = text_backbone(self.target)(input_ids=input_ids, use_cache=False, output_hidden_states=True)
         # hidden_states[0] is the embedding output, hidden_states[i + 1] the output of layer i (SpecForge's
         # ``extract_context_feature`` uses the same offset).
-        return torch.cat([out.hidden_states[i + 1] for i in self.draft.target_layer_ids], dim=-1)
+        context = torch.cat([out.hidden_states[i + 1] for i in self.draft.target_layer_ids], dim=-1)
+        return context, out.last_hidden_state
+
+    def target_context(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Concatenated hidden states of ``target_layer_ids`` for one row, aligned with ``input_ids``."""
+        return self.target_features(input_ids)[0]
 
     def forward(
         self,
@@ -137,13 +146,20 @@ class DFlash2OnlineModel(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
         self._seed_anchor_sampling(input_ids.device)
+        # The target's final hidden state feeds only the teacher metrics, which are a detailed diagnostic.
+        teacher_metrics = self.online_model.teacher_metrics and collect_detailed_metrics
 
         rows = []
+        last_hidden_states = []
         for start, end in row_spans(position_ids):
             row_mask = trainable_row_mask(loss_mask[:, start:end])
             if row_mask is None:
                 continue  # no anchor with a supervised successor: this row cannot form a block
-            rows.append((input_ids[:, start:end], row_mask, self.target_context(input_ids[:, start:end])))
+            row_ids = input_ids[:, start:end]
+            context, last_hidden = self.target_features(row_ids)
+            rows.append((row_ids, row_mask, context))
+            if teacher_metrics:
+                last_hidden_states.append(last_hidden)
 
         if not rows:
             # No usable row in this window (e.g. a padding window): a zero that stays connected to the draft so every
@@ -165,11 +181,13 @@ class DFlash2OnlineModel(nn.Module):
         ids = torch.cat([pad(r[0]) for r in rows], dim=0)
         mask = torch.cat([pad(r[1]) for r in rows], dim=0)
         hidden = torch.cat([pad(r[2]) for r in rows], dim=0)
+        target_last_hidden = torch.cat([pad(h) for h in last_hidden_states], dim=0) if teacher_metrics else None
 
         loss, _accuracy, metrics = self.online_model(
             ids,
             hidden,
             mask,
+            target_last_hidden_states=target_last_hidden,
             selector_loss_alpha=selector_loss_alpha,
             collect_detailed_metrics=collect_detailed_metrics,
         )
@@ -250,8 +268,12 @@ def build_online_model(
     num_anchors: int = 512,
     loss_decay_gamma: Optional[float] = 7.0,
     objective_chunk_blocks: int = 128,
+    lk_loss_type: Optional[str] = None,
+    kl_scale: float = 1.0,
+    kl_decay: float = 1.0,
     selector_loss_alpha: float = 1.0,
     selector_stop_gradient: bool = False,
+    teacher_metrics: bool = True,
     seed: int = 0,
     init_from: str | Path | None = None,
 ) -> DFlash2OnlineModel:
@@ -277,9 +299,12 @@ def build_online_model(
         num_anchors=num_anchors,
         loss_decay_gamma=loss_decay_gamma,
         objective_chunk_blocks=objective_chunk_blocks,
+        lk_loss_type=lk_loss_type,
+        kl_scale=kl_scale,
+        kl_decay=kl_decay,
         selector_loss_alpha=selector_loss_alpha,
         selector_stop_gradient=selector_stop_gradient,
-        teacher_metrics=False,  # needs the target's last hidden state, which is only a diagnostic
+        teacher_metrics=teacher_metrics,
     )
     model = DFlash2OnlineModel(target, online, seed=seed)
     if init_from is not None:

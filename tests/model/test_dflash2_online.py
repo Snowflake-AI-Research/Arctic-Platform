@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 
 import pytest
 import torch
@@ -26,6 +27,7 @@ from safetensors.torch import load_file
 from transformers import Qwen3Config
 from transformers import Qwen3ForCausalLM
 
+from arctic_platform.model import PEFT_ADAPTER_DIRNAME
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
 from arctic_platform.model import Patches
@@ -112,19 +114,24 @@ def online(target):
     return make_online(target).train()
 
 
-@pytest.fixture
-def seen_by_specforge(online, monkeypatch):
-    """Record the ``(input_ids, loss_mask)`` batch that SpecForge's ``OnlineDFlashModel`` is called with."""
+def record_specforge_inputs(online, monkeypatch):
+    """Record the batch that SpecForge's ``OnlineDFlashModel`` is called with."""
     seen = {}
     original = online.online_model.forward
 
     def spy(input_ids, hidden_states, loss_mask, **kwargs):
         seen["input_ids"] = input_ids.clone()
         seen["loss_mask"] = loss_mask.clone()
+        seen["target_last_hidden_states"] = kwargs.get("target_last_hidden_states")
         return original(input_ids, hidden_states, loss_mask, **kwargs)
 
     monkeypatch.setattr(online.online_model, "forward", spy)
     return seen
+
+
+@pytest.fixture
+def seen_by_specforge(online, monkeypatch):
+    return record_specforge_inputs(online, monkeypatch)
 
 
 @pytest.mark.parametrize(
@@ -196,6 +203,45 @@ def test_forward_returns_a_connected_zero_when_no_row_can_form_a_block(online):
     assert out["loss"].requires_grad
     assert out["dflash2_terms"] == {}
     out["loss"].backward()
+
+
+def test_teacher_metrics_read_the_state_the_target_head_projects_to_its_logits(target, online, seen_by_specforge):
+    window = packed_window(PROMPT_THEN_THREE_TOKEN_RESPONSE)
+
+    out = online(**window)
+
+    with torch.no_grad():
+        target_logits = target(input_ids=window["input_ids"]).logits
+        torch.testing.assert_close(target.lm_head(seen_by_specforge["target_last_hidden_states"]), target_logits)
+    assert any(name.startswith("dflash/teacher/") for name in out["dflash2_terms"])
+
+
+@pytest.mark.parametrize(
+    "build_options, forward_options",
+    [(dict(teacher_metrics=False), {}), ({}, dict(collect_detailed_metrics=False))],
+)
+def test_the_target_final_state_is_not_gathered_without_teacher_metrics(
+    target, monkeypatch, build_options, forward_options
+):
+    online = make_online(target, **build_options).train()
+    seen = record_specforge_inputs(online, monkeypatch)
+
+    out = online(**packed_window(PROMPT_THEN_THREE_TOKEN_RESPONSE), **forward_options)
+
+    assert seen["target_last_hidden_states"] is None
+    assert not any(name.startswith("dflash/teacher/") for name in out["dflash2_terms"])
+
+
+@pytest.mark.parametrize("lk_loss_type", ["alpha", "lambda", "tv"])
+def test_an_lk_objective_replaces_the_cross_entropy_term(target, lk_loss_type):
+    online = make_online(target, lk_loss_type=lk_loss_type).train()
+
+    out = online(**packed_window(PROMPT_THEN_TWO_TOKEN_RESPONSE, PROMPT_THEN_THREE_TOKEN_RESPONSE))
+
+    assert torch.isfinite(out["loss"])
+    assert "lk_loss" in out["dflash2_terms"] and "ce_loss" not in out["dflash2_terms"]
+    out["loss"].backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in online.draft.parameters())
 
 
 @pytest.mark.parametrize(
@@ -389,10 +435,66 @@ def test_loader_rejects_a_selector_weight_that_is_not_finite_and_non_negative(ta
         build_model(loader_spec(target_dir, loader_options={"selector_loss_alpha": alpha}))
 
 
+def test_loader_hands_the_objective_options_to_specforge(target_dir):
+    options = dict(
+        objective_chunk_blocks=0,
+        lk_loss_type="lambda",
+        kl_scale=0.5,
+        kl_decay=2.0,
+        teacher_metrics=False,
+    )
+
+    online = build_model(loader_spec(target_dir, loader_options=options)).model.online_model
+
+    assert {name: getattr(online, name) for name in options} == options
+
+
 @pytest.mark.parametrize("patch", ["gradient_checkpointing", "liger"])
 def test_loader_rejects_generic_model_patches(target_dir, patch):
     with pytest.raises((ValidationError, ValueError), match="generic model patches"):
         build_model(loader_spec(target_dir, patches=Patches(**{patch: True})))
+
+
+@pytest.fixture
+def lora_fine_tune(target, tmp_path):
+    """``(adapter dir, the fine-tune as base + unmerged adapter)`` of a LoRA fine-tune of ``target``."""
+    from peft import LoraConfig
+    from peft import get_peft_model
+
+    torch.manual_seed(1)
+    # init_lora_weights=False draws both factors at random, so the adapter changes the target's outputs.
+    tuned = get_peft_model(
+        copy.deepcopy(target),
+        LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj", "v_proj", "down_proj"], init_lora_weights=False),
+    ).eval()
+    path = tmp_path / "adapter"
+    tuned.save_pretrained(path)
+    return path, tuned
+
+
+def test_loader_merges_a_lora_fine_tune_into_the_target_the_draft_reads(target_dir, lora_fine_tune):
+    adapter_dir, tuned = lora_fine_tune
+    input_ids = torch.tensor([[10, 11, 12, 13, 14]])
+    with torch.no_grad():
+        base_hidden = build_model(loader_spec(target_dir)).model.target_context(input_ids)
+    shutil.copytree(adapter_dir, target_dir / PEFT_ADAPTER_DIRNAME)
+
+    model = build_model(loader_spec(target_dir)).model
+
+    with torch.no_grad():
+        tuned_out = tuned(input_ids=input_ids, output_hidden_states=True)
+    expected = torch.cat([tuned_out.hidden_states[i + 1] for i in model.draft.target_layer_ids], dim=-1)
+    torch.testing.assert_close(model.target_context(input_ids), expected)
+    assert not torch.allclose(base_hidden, expected)
+
+
+def test_a_merged_target_is_a_plain_frozen_model(target_dir, lora_fine_tune):
+    shutil.copytree(lora_fine_tune[0], target_dir / PEFT_ADAPTER_DIRNAME)
+
+    model = build_model(loader_spec(target_dir)).model
+
+    assert type(model.target) is Qwen3ForCausalLM
+    assert not any(p.requires_grad for p in model.target.parameters())
 
 
 @pytest.mark.parametrize("parallelism", [dict(sequence_parallel=2), dict(expert_parallel=2)])

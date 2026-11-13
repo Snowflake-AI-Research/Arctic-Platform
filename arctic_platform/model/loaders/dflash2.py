@@ -15,7 +15,9 @@
 """Loader for online DFlash2 draft training: a frozen target plus a trainable DFlash2 draft.
 
 ``model_path_or_name`` is the *target* checkpoint. The draft architecture comes from
-``loader_options.draft_config`` (the content of a DFlash2 draft ``config.json``).
+``loader_options.draft_config`` (the content of a DFlash2 draft ``config.json``). A target that is a LoRA
+fine-tune arrives as its base checkpoint with the PEFT adapter pack in its ``default/`` folder; the loader finds the
+pack there and merges it in first.
 """
 
 from __future__ import annotations
@@ -63,8 +65,28 @@ class DFlash2Options(BaseModel):
     selector_stop_gradient: bool = Field(
         False, description="Detach the selector's inputs so only its own parameters train on its CE."
     )
+    lk_loss_type: Literal["alpha", "lambda", "tv"] | None = Field(
+        None,
+        description=(
+            "Acceptance-aware token objective in place of CE: 'alpha' equals CE on hard labels, 'tv' is "
+            "1 - p(label), 'lambda' mixes CE and TV with the CE weight kl_scale * exp(-kl_decay * acceptance)."
+        ),
+    )
+    kl_scale: float = Field(1.0, allow_inf_nan=False, description="Scale of the 'lambda' LK objective's CE weight.")
+    kl_decay: float = Field(
+        1.0, allow_inf_nan=False, description="Decay of the 'lambda' LK objective's CE weight with the acceptance."
+    )
     objective_chunk_blocks: int = Field(
-        128, gt=0, description="Blocks per vocabulary-projection chunk (bounds memory)."
+        128,
+        ge=0,
+        description="Anchor blocks per vocabulary-projection chunk (bounds memory); 0 projects all blocks at once.",
+    )
+    teacher_metrics: bool = Field(
+        True,
+        description=(
+            "Report the teacher-agreement diagnostics (dflash/teacher/*), which read the target's final hidden "
+            "state; they never enter the loss."
+        ),
     )
     seed: int = Field(0, description="Seed for draft initialization and anchor sampling.")
 
@@ -95,9 +117,17 @@ def _validate_spec(spec: ModelSpec) -> None:
         raise ValueError("the dflash2 loader supports data parallelism only (sequence/expert parallel size must be 1)")
 
 
+def merge_target_adapter(target: torch.nn.Module, adapter_dir: str) -> torch.nn.Module:
+    """``target`` with the LoRA adapter at ``adapter_dir`` merged into its weights, as a plain model again."""
+    from peft import PeftModel
+
+    return PeftModel.from_pretrained(target, adapter_dir, is_trainable=False).merge_and_unload()
+
+
 @register_loader("dflash2", options=DFlash2Options, validate_spec=_validate_spec)
 def load_dflash2(ctx: LoaderContext) -> LoadedModel:
     from arctic_platform.model.implementations.dflash2.online import build_online_model
+    from arctic_platform.model.weight_export import checkpoint_peft_adapter_dir
 
     options = DFlash2Options.model_validate(ctx.spec.loader_options)
     dtype = getattr(torch, ctx.spec.dtype)
@@ -106,6 +136,11 @@ def load_dflash2(ctx: LoaderContext) -> LoadedModel:
         dtype=dtype,
         attn_implementation=ctx.spec.attn_implementation,
     )
+    # A LoRA fine-tune's checkpoint is its base weights plus the adapter pack; merging it before the target is frozen
+    # makes the draft read the fine-tune's hidden states, not the base's.
+    adapter_dir = checkpoint_peft_adapter_dir(ctx.spec.model_path_or_name)
+    if adapter_dir is not None:
+        target = merge_target_adapter(target, adapter_dir)
     model = build_online_model(
         target,
         options.draft_config,
@@ -114,8 +149,12 @@ def load_dflash2(ctx: LoaderContext) -> LoadedModel:
         num_anchors=options.num_anchors,
         loss_decay_gamma=options.loss_decay_gamma,
         objective_chunk_blocks=options.objective_chunk_blocks,
+        lk_loss_type=options.lk_loss_type,
+        kl_scale=options.kl_scale,
+        kl_decay=options.kl_decay,
         selector_loss_alpha=options.selector_loss_alpha,
         selector_stop_gradient=options.selector_stop_gradient,
+        teacher_metrics=options.teacher_metrics,
         seed=options.seed,
         init_from=options.init_from,
     )
