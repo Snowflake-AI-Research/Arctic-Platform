@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import types
 from typing import TypedDict
 
@@ -247,6 +248,23 @@ def _online_logsumexp_and_weighted_update(
     return m_new, s_new, t_new
 
 
+def _fused_tiles(hidden: Tensor, fp32_lm_head: bool, action_masks, grouped) -> bool:
+    """Whether the per-tile FP32 work runs as one Triton pass per tile (kernels/lm_head_logprobs.py): BF16 tiles on
+    CUDA without action masks or grouped log-probs, whose extra per-tile terms stay on the PyTorch path, unless
+    ``ARL_LM_HEAD_FUSED_TILES=0`` (worker environment)."""
+    if not hidden.is_cuda or fp32_lm_head or grouped is not None:
+        return False
+    if os.environ.get("ARL_LM_HEAD_FUSED_TILES", "1") == "0":
+        return False
+    if action_masks is not None and getattr(action_masks, "has_constraints", True):
+        return False
+    try:
+        from arctic_platform.model.implementations.kernels import lm_head_logprobs  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
     @staticmethod
     def forward(  # type: ignore[override]
@@ -283,6 +301,9 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         entropy = torch.empty((n,), device=device, dtype=torch.float32)
         logz = torch.empty((n,), device=device, dtype=torch.float32)
         others_minus_target = torch.empty((n,), device=device, dtype=torch.float32)
+        fused = _fused_tiles(hidden, fp32_lm_head, action_masks, grouped)
+        if fused:
+            from arctic_platform.model.implementations.kernels.lm_head_logprobs import lse_tile_update_
 
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
@@ -304,6 +325,12 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
                     logits_chunk = hidden_chunk.float() @ weight_chunk.float().t()
                 else:
                     logits_chunk = hidden_chunk @ weight_chunk.t()
+                if fused:
+                    # m, s, t and the target logit in one pass over the BF16 tile, without a host sync.
+                    lse_tile_update_(
+                        logits_chunk, labels_chunk, vocab_start, inv_temperature[start:end], m, s, t, target_logits
+                    )
+                    continue
                 scaled_logits = logits_chunk.to(torch.float32) * inv_t_chunk
                 apply_lm_head_action_masks_(
                     scaled_logits,
@@ -337,6 +364,7 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
         ctx.chunk_size = chunk_size
         ctx.fp32_lm_head = fp32_lm_head
         ctx.grouped = grouped
+        ctx.fused = fused
 
         if grouped is None:
             return logprobs, entropy
@@ -392,7 +420,21 @@ class _SequenceChunkedLogProbEntropyFn(torch.autograd.Function):
                 hidden_for_logits = hidden_chunk.float() if fp32_lm_head else hidden_chunk
                 weight_for_logits = weight_chunk.float() if fp32_lm_head else weight_chunk
                 logits_chunk = hidden_for_logits @ weight_for_logits.t()
-                if grouped is None:
+                if ctx.fused:
+                    from arctic_platform.model.implementations.kernels.lm_head_logprobs import logprob_tile_grad
+
+                    # The same FP32 terms per element as below, read once from the BF16 tile, written once as BF16.
+                    grad_logits = logprob_tile_grad(
+                        logits_chunk,
+                        labels_chunk,
+                        vocab_start,
+                        inv_temperature[start:end],
+                        logz_chunk,
+                        others_minus_target[start:end],
+                        grad_chunk,
+                        hidden.dtype,
+                    )
+                elif grouped is None:
                     # The same FP32 operations in the same order, in place on one tile: at 8192 x 8192 the
                     # out-of-place chain held four 256 MiB FP32 tiles at the start of backward, the step's peak.
                     grad_logits = logits_chunk.to(torch.float32).mul_(inv_t_chunk)
