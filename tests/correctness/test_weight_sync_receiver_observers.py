@@ -150,6 +150,8 @@ def test_native_tensor_writes_survive_removing_observations(receiver, monkeypatc
         _DirectParamWriter=Writer,
         _ShardAwareFusedWriter=Writer,
     )
+    # _load_batched imports vLLM's is_pp_missing_parameter (never asked here: "weight" is a model parameter).
+    _module(monkeypatch, "vllm.model_executor.models.utils", is_pp_missing_parameter=lambda name, model: False)
     worker = _worker(receiver, model)
     result = (worker._load_direct if path == "direct" else worker._load_batched)(model, _Engine(value))
     assert result == (1, 25.0, 25.0, {"weight": ["weight"]}, [])

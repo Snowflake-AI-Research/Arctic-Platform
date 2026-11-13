@@ -87,6 +87,25 @@ if "vllm" not in sys.modules:
     sys.modules["vllm.v1.structured_output.backend_xgrammar"] = xgrammar_mod
     for name in ("vllm.v1", "vllm.v1.core", "vllm.v1.core.sched", "vllm.v1.metrics"):
         sys.modules[name].__path__ = []
+    # The batched receiver asks vLLM which destinations lie in another pipeline stage's layers.
+    models_utils = types.ModuleType("vllm.model_executor.models.utils")
+
+    class PPMissingLayer(nn.Identity):
+        pass
+
+    def is_pp_missing_parameter(name, model):  # vLLM's rule: under a missing layer's prefix
+        return any(
+            name.startswith(prefix + ".")
+            for prefix, module in model.named_modules()
+            if isinstance(module, PPMissingLayer)
+        )
+
+    models_utils.PPMissingLayer = PPMissingLayer
+    models_utils.is_pp_missing_parameter = is_pp_missing_parameter
+    for name in ("vllm.model_executor", "vllm.model_executor.models"):
+        sys.modules[name] = types.ModuleType(name)
+        sys.modules[name].__path__ = []
+    sys.modules["vllm.model_executor.models.utils"] = models_utils
 
 from arctic_platform.inference.server.weight_sync.receiver import (
     WeightSyncExtension,
@@ -1200,3 +1219,31 @@ def test_load_batched_holds_one_rebuilt_oversized_tensor_at_a_time(monkeypatch):
 
     assert loaded == 4
     assert peaks == [8, 6, 6]
+
+
+def test_load_batched_leaves_another_pipeline_stages_tensors_to_that_stage():
+    """A destination in a layer this stage holds as a PPMissingLayer is neither applied nor skipped (TP8 x PP2)."""
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(1, 1, bias=False), PPMissingLayer()])
+
+        def load_weights(self, weights):
+            name, tensor = next(iter(weights))
+            if name == "layers.0.weight":
+                self.layers[0].weight.data.copy_(tensor.view(1, 1))
+            return {name.replace(".weight", ".experts.w13_weight") if name.startswith("layers.1.") else name}
+
+    loaded, recv_l2_sq, applied_l2_sq, mappings, skipped = WeightSyncExtension._load_batched(
+        SimpleNamespace(device=torch.device("cpu")),
+        Model(),
+        _FakeEngine([("layers.0.weight", torch.tensor([2.0])), ("layers.1.weight", torch.tensor([3.0]))]),
+    )
+
+    assert loaded == 2
+    assert recv_l2_sq == 13.0
+    assert applied_l2_sq == 4.0
+    assert mappings == {"layers.0.weight": ["layers.0.weight"]}
+    assert skipped == []
