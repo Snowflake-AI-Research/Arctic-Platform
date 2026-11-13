@@ -14,10 +14,12 @@ def named_weight_sync_tensors(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield parameters, expert biases and module-declared persistent buffers.
 
-    Weight sync passes ``include_export_buffers=False``: declared buffers are constant
-    checkpoint state the sampler loads with the model, and the receiver only accepts
-    parameter destinations. Parameters the model holds elsewhere (``moe/dense_shard.py``)
-    come as placeholders: read their data inside ``materialized_parameters``.
+    Weight sync passes ``include_export_buffers=False``: buffers a module declares in
+    ``_dss_weight_export_buffers`` are constant checkpoint state the sampler loads with the
+    model, and the receiver only accepts parameter destinations. Those it declares in
+    ``_dss_weight_sync_buffers`` are parameters of the sampler's module and go with the
+    weight sync too. Parameters the model holds elsewhere (``moe/dense_shard.py``) come as
+    placeholders: read their data inside ``materialized_parameters``.
     """
     from arctic_platform.model.weight_export import export_named_parameters
 
@@ -26,11 +28,11 @@ def named_weight_sync_tensors(
         if name.endswith(".expert_bias"):
             yield name, buffer
             continue
-        if not include_export_buffers:
-            continue
         module_name, _, buffer_name = name.rpartition(".")
         owning_module = model.get_submodule(module_name)
-        sync_names = getattr(owning_module, "_dss_weight_export_buffers", ())
+        sync_names = set(getattr(owning_module, "_dss_weight_sync_buffers", ()))
+        if include_export_buffers:
+            sync_names |= set(getattr(owning_module, "_dss_weight_export_buffers", ()))
         if buffer_name not in sync_names:
             continue
         if buffer_name not in owning_module._non_persistent_buffers_set:
