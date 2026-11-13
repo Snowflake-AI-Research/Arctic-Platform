@@ -32,7 +32,10 @@ _NAMES = ("_semip_weight_pool_ranges", "_semip_unregistered_storages",
           "_semip_param_tensors", "_semip_layout", "_semip_attach", "_semip_stage",
           "_semip_restore_weights", "_semip_lora_manager", "_semip_lora_views",
           "_semip_weight_like", "_semip_state_views", "_semip_stage_state",
-          "_semip_restore_state")
+          "_semip_restore_state", "_semip_digest", "_semip_weight_like_digests",
+          "_semip_record_weight_digests", "_semip_check_weight_digests",
+          "_semip_mark_volatile")
+_CONSTANTS = ("_WEIGHT_LIKE_PATH", "_DIGEST_CHUNK")
 GiB = 2**30
 
 
@@ -113,9 +116,9 @@ def child(monkeypatch):
              if isinstance(n, ast.FunctionDef) and n.name in _NAMES]
     assert {f.name for f in funcs} == set(_NAMES)
     ns = {"torch": _Torch(), "ThreadPoolExecutor": ThreadPoolExecutor, "time": time,
-          "re": re, "_WEIGHT_LIKE_PATH": None}
+          "re": re}
     for node in tree.body:
-        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "_WEIGHT_LIKE_PATH"
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") in _CONSTANTS
                                                 for t in node.targets):
             exec(compile(ast.Module(body=[node], type_ignores=[]), path, "exec"), ns)
     exec(compile(ast.Module(body=funcs, type_ignores=[]), path, "exec"), ns)
@@ -298,3 +301,89 @@ def test_nothing_staged_leaves_state_alone(child):
     before = buf.clone()
     assert child._semip_restore_state(worker) == 0
     assert torch.equal(buf, before)
+
+
+def _with_weight_like(allocator):
+    """A dense model plus two weight-pool storages named like weights: one the
+    model reads, one a kernel writes while it serves."""
+    worker = _dense(allocator)
+    worker.model_runner.model.proj.packed_weight = allocator.alloc("weights", 4, 4)
+    worker.model_runner.model.proj.staged_weight = allocator.alloc("weights", 4, 4)
+    return worker
+
+
+_PACKED = "main:s:proj.packed_weight"
+_STAGED = "main:s:proj.staged_weight"
+
+
+def _serve(worker):
+    worker.model_runner.model.proj.staged_weight.add_(1.0)
+
+
+def test_a_weight_like_storage_written_while_serving_becomes_state(child):
+    worker = _with_weight_like(child.allocator)
+    assert child._semip_record_weight_digests(worker) == 2
+    _serve(worker)
+    assert child._semip_check_weight_digests(worker) == [_STAGED]
+    names = [name for name, *_ in child._semip_layout(worker)]
+    assert _PACKED in names and _STAGED not in names
+    assert [name for name, _ in child._semip_state_views(worker)] == [_STAGED]
+
+
+def test_weight_like_storages_left_alone_stay_weights(child):
+    worker = _with_weight_like(child.allocator)
+    child._semip_record_weight_digests(worker)
+    assert child._semip_check_weight_digests(worker) == []
+    names = [name for name, *_ in child._semip_layout(worker)]
+    assert _PACKED in names and _STAGED in names
+    assert child._semip_state_views(worker) == []
+
+
+def test_the_check_runs_once(child):
+    worker = _with_weight_like(child.allocator)
+    child._semip_record_weight_digests(worker)
+    assert child._semip_check_weight_digests(worker) == []
+    _serve(worker)
+    assert child._semip_check_weight_digests(worker) == []
+    assert _STAGED in [name for name, *_ in child._semip_layout(worker)]
+
+
+def test_without_digests_the_check_reads_nothing(child, monkeypatch):
+    worker = _with_weight_like(child.allocator)
+    _serve(worker)
+
+    def _asleep(*a, **k):
+        raise AssertionError("storages read")
+
+    monkeypatch.setitem(child._semip_check_weight_digests.__globals__,
+                        "_semip_weight_like_digests", _asleep)
+    assert child._semip_check_weight_digests(worker) == []
+    assert not getattr(worker, "_semip_volatile", None)
+    worker._semip_weight_digests = {_STAGED: (0, 0)}
+    worker._semip_digests_checked = True          # restored: checked at the dump
+    assert child._semip_check_weight_digests(worker) == []
+
+
+def test_every_rank_takes_what_any_rank_saw_change(child):
+    worker = _with_weight_like(child.allocator)
+    child._semip_record_weight_digests(worker)
+    assert child._semip_check_weight_digests(worker) == []
+    child._semip_mark_volatile(worker, [_STAGED])
+    assert _STAGED not in [name for name, *_ in child._semip_layout(worker)]
+
+
+def test_the_checksum_sees_a_permutation_and_ignores_the_chunking(child, monkeypatch):
+    base = torch.arange(40, dtype=torch.int32)
+    view = base.view(torch.uint8)
+    swapped = base.clone()
+    swapped[[3, 17]] = swapped[[17, 3]]
+    whole = child._semip_digest(view)
+    assert child._semip_digest(swapped.view(torch.uint8)) != whole
+    assert child._semip_digest(swapped.view(torch.uint8))[0] == whole[0]
+    monkeypatch.setitem(child._semip_digest.__globals__, "_DIGEST_CHUNK", 7)
+    assert child._semip_digest(view) == whole
+    odd = torch.arange(13, dtype=torch.uint8)
+    monkeypatch.setitem(child._semip_digest.__globals__, "_DIGEST_CHUNK", 1 << 22)
+    expected = child._semip_digest(odd)
+    monkeypatch.setitem(child._semip_digest.__globals__, "_DIGEST_CHUNK", 5)
+    assert child._semip_digest(odd) == expected
