@@ -25,6 +25,7 @@ def apply_required_vllm_patches() -> None:
     from arctic_platform.inference.vllm.kv_group_size import ensure_kv_group_size_patch
     from arctic_platform.inference.vllm.mamba_completion_refresh import ensure_mamba_completion_refresh
     from arctic_platform.inference.vllm.mrope_yarn import ensure_mrope_yarn_fix
+    from arctic_platform.inference.vllm.pp_kv_cache_groups import ensure_pp_kv_cache_groups_fix
     from arctic_platform.inference.vllm.pp_routed_experts import ensure_pp_routed_experts
     from arctic_platform.inference.vllm.router_replay import ensure_router_replay_vllm_patches
     from arctic_platform.inference.vllm.spec_decode_grammar import ensure_spec_decode_grammar_fix
@@ -33,6 +34,7 @@ def apply_required_vllm_patches() -> None:
 
     ensure_router_replay_vllm_patches()
     ensure_pp_routed_experts()
+    ensure_pp_kv_cache_groups_fix()
     ensure_xgrammar_stop_mask_fix()
     ensure_dense_prompt_logprobs_patch()
     ensure_spec_decode_grammar_fix()
