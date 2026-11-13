@@ -756,7 +756,7 @@ class WeightSyncExtension:
     ):
         from arctic_platform.inference.server.weight_sync.broadcast import BroadcastNCCLEngine
 
-        key = (master_addr, master_port, rank, world_size)
+        key = (master_addr, master_port, rank, world_size, bucket_size)
         engine = getattr(self, "_ws_bcast_engine", None)
         if engine is None or getattr(self, "_ws_bcast_engine_key", None) != key:
             if engine is not None:
