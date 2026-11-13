@@ -119,7 +119,25 @@ class TestNoDebugCorrectness(TestCasePlus):
         result = self._cli("run", "--help")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("--test", result.stdout)
+        self.assertIn("--tokens", result.stdout)
         self.assertIn("--reference-records-dir", result.stdout)
+
+    def test_onboarding_regression_tokens_survive_cli_and_api_without_debug(self):
+        result = self._run_isolated(
+            """
+            from arctic_platform.correctness import api
+            from arctic_platform.correctness.harness.execution import _validate_regression_tokens
+
+            for test_id in ("single-step-grads", "single-step-optimizer"):
+                request, options = api.parse_run_args([
+                    "--config", "synthetic.config", "--test", test_id, "--tokens", "128",
+                ])
+                assert request.tests == (test_id,)
+                assert options.tokens == 128
+                assert _validate_regression_tokens(api._namespace(request, options)) == 128
+            """
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_onboarding_cpu_admission_rejects_before_model_or_target_work(self):
         directory = self.get_auto_remove_tmp_dir()

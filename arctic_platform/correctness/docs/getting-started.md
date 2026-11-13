@@ -20,7 +20,6 @@ The assumption is that you are already inside an Arctic-Platform clone.
 
 ```
 # assuming you're already in the AP clone
-git checkout stas/correctness-testing-rl-minimal-debug
 pip install -e '.[correctness]'
 python -m arctic_platform.correctness list
 ```

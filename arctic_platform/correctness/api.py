@@ -66,6 +66,7 @@ class RunOptions:
     attn: tuple[str, ...] = ()
     any_gpu: bool = False
     case: tuple[str, ...] = ()
+    tokens: int | None = None
     out: Path | None = None
     reference_records_dir: Path | None = None
     peft_adapter: Path | None = None
@@ -210,6 +211,7 @@ def run(request: RunRequest, options: RunOptions | None = None, *, executor: Cal
     from .harness.execution import _load_dense_checkpoint_allocation
     from .harness.execution import _load_inference_export_allocation
     from .harness.execution import _load_inference_initial_model_dir
+    from .harness.execution import _validate_regression_tokens
     from .harness.execution import run_batch
 
     options = options or RunOptions()
@@ -230,6 +232,7 @@ def run(request: RunRequest, options: RunOptions | None = None, *, executor: Cal
         if type(options.inference_training_gpus) is not int or options.inference_training_gpus <= 0:
             raise ValueError("--inference-training-gpus must be a positive integer")
     args = _namespace(request, options)
+    _validate_regression_tokens(args)
     _load_dense_checkpoint_allocation(args)
     _load_inference_export_allocation(args)
     _load_inference_initial_model_dir(args)
