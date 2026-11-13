@@ -82,7 +82,7 @@ class TrainingEngineSpec(BaseModel):
     gradient_clipping: float | None = 1.0
     seed: int | None = None
     ds_overrides: dict[str, Any] | None = None
-    fp32_masters: bool = False
+    fp32_masters: bool = True
     zero_bucket_size: int | None = None
     optimizer: OptimizerSettings | None = None
     adam_w_mode: bool = True
@@ -138,8 +138,6 @@ def build_deepspeed_config(spec: TrainingEngineSpec) -> dict[str, Any]:
     dtype = (spec.dtype or "bfloat16").lower()
     is_bf16 = dtype in ("bfloat16", "bf16")
     is_fp16 = dtype in ("float16", "fp16")
-    # bf16 master weights match FusedAdam's training dynamics. fp32 masters
-    # are the opt-in that disables them.
     bf16_masters = is_bf16 and not spec.fp32_masters
     train_batch_size = spec.train_batch_size or (
         _data_parallel_size(spec.world_size, spec.sequence_parallel)
