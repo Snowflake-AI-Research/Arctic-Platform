@@ -17,6 +17,12 @@ from vllm.model_executor.models.interfaces import SupportsLoRA
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.models.deepseek_v41 import DeepseekV41ForCausalLM
 
+from arctic_platform.inference.vllm.deepseek_v41_pp import ensure_deepseek_v41_pp_fix
+
+# vLLM imports this entry point (ensure_deepseek_v41_lora registers it) only to
+# build a DeepSeek-V4.1 model, before constructing it.
+ensure_deepseek_v41_pp_fix()
+
 
 class DeepseekV41LoRAForCausalLM(DeepseekV41ForCausalLM, SupportsLoRA):
     packed_modules_mapping = {
