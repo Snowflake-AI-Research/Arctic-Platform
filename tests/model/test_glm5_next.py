@@ -724,6 +724,123 @@ def test_glm53_nope_sparse_mla_matches_reference_through_the_kernels():
     assert rel(kv.grad[:, :keys], kv_ref.grad[:, :keys]) < 1e-2
 
 
+def _auxiliary_model(count=1):
+    model = torch.nn.Module()
+    model.config = types.SimpleNamespace(
+        text_config=types.SimpleNamespace(
+            model_type="glm5_next_text", num_hidden_layers=2, num_nextn_predict_layers=count
+        )
+    )
+    return model
+
+
+def _auxiliary_checkpoint(tmp_path):
+    from safetensors.torch import save_file
+
+    prefix = "model.language_model.layers.2."
+    tensors = {
+        prefix + "eh_proj.weight": torch.ones(2, 4, dtype=torch.bfloat16),
+        prefix + "enorm.weight": torch.ones(4, dtype=torch.float32),
+        prefix + "hnorm.weight": torch.ones(4, dtype=torch.bfloat16),
+        prefix + "mlp.experts.0.down_proj.weight": torch.ones(4, 4).to(torch.float8_e4m3fn),
+        prefix + "mlp.experts.0.down_proj.weight_scale_inv": torch.ones(1, 1, dtype=torch.float32),
+        "model.language_model.layers.0.input_layernorm.weight": torch.zeros(4, dtype=torch.bfloat16),
+    }
+    save_file(tensors, tmp_path / "model-00001.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(tensors, "model-00001.safetensors")})
+    )
+    return {name: tensor for name, tensor in tensors.items() if name.startswith(prefix)}
+
+
+def test_glm53_captures_auxiliary_mixed_dtypes_without_trainables(tmp_path, monkeypatch):
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    original = _auxiliary_checkpoint(tmp_path)
+    model = _auxiliary_model()
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: False)
+    auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+    exported = dict(auxiliary_weights.iter_preserved_auxiliary_weights(model))
+    assert set(exported) == set(original)
+    assert not dict(model.named_parameters()) and not dict(model.named_buffers())
+    for name, value in exported.items():
+        assert value.dtype == original[name].dtype
+        torch_assert_equal(value.view(torch.uint8), original[name].view(torch.uint8))
+        assert value.device.type == "cpu"
+
+
+def test_glm53_auxiliary_capture_rejects_missing_and_changed_shards(tmp_path, monkeypatch):
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    _auxiliary_checkpoint(tmp_path)
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: False)
+    index = tmp_path / "model.safetensors.index.json"
+    mapping = json.loads(index.read_text())
+    mapping["weight_map"]["model.language_model.layers.2.enorm.weight"] = "missing.safetensors"
+    index.write_text(json.dumps(mapping))
+    with pytest.raises(RuntimeError, match="Cannot preserve"):
+        auxiliary_weights.capture_auxiliary_weights(_auxiliary_model(), tmp_path)
+
+
+def test_glm53_auxiliary_source_failure_reaches_peers(tmp_path, monkeypatch):
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    observed = []
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(auxiliary_weights.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(auxiliary_weights.dist, "broadcast_object_list", lambda value, src: observed.append(value[0]))
+    with pytest.raises(RuntimeError, match="Cannot preserve"):
+        auxiliary_weights.capture_auxiliary_weights(_auxiliary_model(), tmp_path)
+    assert observed and observed[0] is not None
+
+
+def test_glm53_auxiliary_capture_nonmaster_never_opens_source(tmp_path, monkeypatch):
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    model = _auxiliary_model()
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(auxiliary_weights.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(auxiliary_weights.dist, "broadcast_object_list", lambda value, src: None)
+    monkeypatch.setattr(auxiliary_weights, "_capture", lambda *args: pytest.fail("nonmaster read"))
+    auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+    assert not hasattr(model, auxiliary_weights.STATE_ATTRIBUTE)
+
+
+@pytest.mark.parametrize("include_skipped,rank", [(False, 0), (True, 0), (True, 1)])
+def test_glm53_full_hf_export_auxiliary_scope(monkeypatch, include_skipped, rank):
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm
+
+    model = _auxiliary_model()
+    ordinary = torch.ones(4)
+    auxiliary = torch.ones(4, dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        glm.qwen_ds,
+        "_build_iter_full_hf_weights",
+        lambda model: lambda **kwargs: iter([("trained.weight", ordinary)]),
+    )
+    monkeypatch.setattr(glm.torch.distributed, "get_rank", lambda: rank)
+    monkeypatch.setattr(glm, "iter_preserved_auxiliary_weights", lambda model: iter([("inactive.weight", auxiliary)]))
+    exported = dict(glm._build_iter_full_hf_weights_with_auxiliary(model)(include_skipped=include_skipped))
+    assert exported["trained.weight"] is ordinary
+    assert ("inactive.weight" in exported) == (include_skipped and rank == 0)
+    assert glm._adapter().hf_weight_export is glm._build_iter_full_hf_weights_with_auxiliary
+
+
+def test_glm53_full_hf_export_rejects_live_auxiliary_collision(monkeypatch):
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm
+
+    value = torch.ones(4)
+    monkeypatch.setattr(
+        glm.qwen_ds,
+        "_build_iter_full_hf_weights",
+        lambda model: lambda **kwargs: iter([("inactive.weight", value)]),
+    )
+    monkeypatch.setattr(glm.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(glm, "iter_preserved_auxiliary_weights", lambda model: iter([("inactive.weight", value)]))
+    with pytest.raises(RuntimeError, match="collides"):
+        list(glm._build_iter_full_hf_weights_with_auxiliary(_auxiliary_model())(include_skipped=True))
+
+
 @pytest.mark.parametrize("suffix", ["", ".weight"])
 def test_glm53_packed_hf_experts_convert_without_losing_weights(suffix):
     prefix = "model.language_model.layers.3.mlp"

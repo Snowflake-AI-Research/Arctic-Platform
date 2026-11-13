@@ -28,6 +28,7 @@ from arctic_platform.model import build_model
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
+from arctic_platform.testing_utils import torch_assert_equal
 
 
 @pytest.mark.parametrize("composite", [False, True])
@@ -211,3 +212,240 @@ from arctic_platform.model.implementations import fp8
 print('Standalone MoE and FP8 imports passed')
 """
         execute_subprocess_async([sys.executable, "-c", code], env=self.get_env(), timeout=60)
+
+
+def _mtp_export_model(layer_count=1):
+    from types import SimpleNamespace
+
+    model = nn.Identity()
+    model.config = SimpleNamespace(
+        text_config=SimpleNamespace(
+            model_type="qwen3_5_moe_text",
+            mtp_num_hidden_layers=layer_count,
+        )
+    )
+    return model
+
+
+def test_prediction_weight_export_builders_are_family_scoped():
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+    from arctic_platform.model.implementations.qwen38 import deepspeed_integration as flash
+
+    assert qwen._adapter().hf_weight_export is qwen._build_iter_full_hf_weights_with_mtp
+    assert flash._adapter().hf_weight_export is qwen._build_iter_full_hf_weights_with_mtp
+    assert glm._adapter().hf_weight_export is glm._build_iter_full_hf_weights_with_auxiliary
+    assert qwen._generic_adapter().hf_weight_export is qwen._build_iter_full_hf_weights_with_mtp
+
+
+@pytest.mark.parametrize("family", ["generic", "qwen35", "qwen38"])
+def test_configured_mtp_is_exported_by_each_qwen_adapter(tmp_path, monkeypatch, family):
+    import torch
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+    from arctic_platform.model.implementations.qwen38 import deepspeed_integration as flash
+
+    model = _mtp_export_model()
+    if family != "qwen35":
+        model.config.text_config.model_type = "qwen4_exp_text"
+    payload = {
+        name: torch.tensor([index], dtype=torch.bfloat16)
+        for index, name in enumerate(sorted(mtp_weights._configured_names(model)))
+    }
+    save_file(payload, tmp_path / "model.safetensors")
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    mtp_weights.capture_mtp_weights(model, tmp_path)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(
+        qwen, "_build_iter_full_hf_weights", lambda model: lambda **kwargs: iter([("model.weight", torch.ones(1))])
+    )
+    adapter = (
+        qwen._generic_adapter() if family == "generic" else qwen._adapter() if family == "qwen35" else flash._adapter()
+    )
+    exported = dict(adapter.hf_weight_export(model)(include_skipped=True))
+    assert set(exported) == {"model.weight", *payload}
+    for name, tensor in payload.items():
+        torch_assert_equal(exported[name], tensor)
+
+
+def test_qwen_hf_export_without_include_skipped_never_reads_mtp_sidecar(monkeypatch):
+    import torch
+
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+
+    model = _mtp_export_model()
+    ordinary_tensor = torch.tensor([1.0])
+    calls = []
+
+    def ordinary_builder(built_model):
+        assert built_model is model
+
+        def iterator(*, include_skipped=False):
+            calls.append(("ordinary", include_skipped))
+            yield "model.weight", ordinary_tensor
+
+        return iterator
+
+    monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", ordinary_builder)
+    monkeypatch.setattr(
+        qwen,
+        "iter_preserved_mtp_weights",
+        lambda model: (_ for _ in ()).throw(AssertionError("sidecar must not be read")),
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "get_rank",
+        lambda: (_ for _ in ()).throw(AssertionError("rank is irrelevant without include_skipped")),
+    )
+
+    exported = list(qwen._build_iter_full_hf_weights_with_mtp(model)())
+
+    assert exported == [("model.weight", ordinary_tensor)]
+    assert calls == [("ordinary", False)]
+
+
+def test_qwen_full_hf_export_appends_mtp_only_after_ordinary_stream_exhausts(monkeypatch):
+    import torch
+
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+
+    model = _mtp_export_model()
+    ordinary_tensor = torch.tensor([1.0])
+    mtp_tensor = torch.tensor([2.0], dtype=torch.bfloat16)
+    events = []
+
+    def ordinary_builder(built_model):
+        assert built_model is model
+
+        def iterator(*, include_skipped=False):
+            events.append(("ordinary-start", include_skipped))
+            yield "model.weight", ordinary_tensor
+            events.append(("ordinary-exhausted",))
+
+        return iterator
+
+    def iter_sidecar(built_model):
+        assert built_model is model
+        events.append(("sidecar-start",))
+        yield "mtp.fc.weight", mtp_tensor
+
+    monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", ordinary_builder)
+    monkeypatch.setattr(qwen, "iter_preserved_mtp_weights", iter_sidecar)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    exported = list(qwen._build_iter_full_hf_weights_with_mtp(model)(include_skipped=True))
+
+    assert exported == [("model.weight", ordinary_tensor), ("mtp.fc.weight", mtp_tensor)]
+    assert events == [("ordinary-start", True), ("ordinary-exhausted",), ("sidecar-start",)]
+
+
+def test_qwen_full_hf_export_nonmaster_finishes_ordinary_stream_without_sidecar(monkeypatch):
+    import torch
+
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+
+    model = _mtp_export_model()
+    events = []
+
+    def ordinary_builder(built_model):
+        assert built_model is model
+
+        def iterator(*, include_skipped=False):
+            events.append(("ordinary-start", include_skipped))
+            if False:
+                yield
+            events.append(("ordinary-exhausted",))
+
+        return iterator
+
+    monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", ordinary_builder)
+    monkeypatch.setattr(
+        qwen,
+        "iter_preserved_mtp_weights",
+        lambda model: (_ for _ in ()).throw(AssertionError("nonmaster must not hold or export payload")),
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+
+    assert list(qwen._build_iter_full_hf_weights_with_mtp(model)(include_skipped=True)) == []
+    assert events == [("ordinary-start", True), ("ordinary-exhausted",)]
+
+
+def test_qwen_full_hf_export_rejects_live_name_collision(monkeypatch):
+    import torch
+
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+
+    model = _mtp_export_model()
+    live = torch.tensor([1.0])
+    preserved = torch.tensor([2.0])
+
+    def ordinary_builder(built_model):
+        assert built_model is model
+
+        def iterator(*, include_skipped=False):
+            assert include_skipped is True
+            yield "mtp.fc.weight", live
+
+        return iterator
+
+    monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", ordinary_builder)
+    monkeypatch.setattr(qwen, "iter_preserved_mtp_weights", lambda built_model: iter([("mtp.fc.weight", preserved)]))
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    iterator = qwen._build_iter_full_hf_weights_with_mtp(model)(include_skipped=True)
+    assert next(iterator) == ("mtp.fc.weight", live)
+    with pytest.raises(RuntimeError, match="collides with live HF export"):
+        next(iterator)
+
+
+def test_qwen_full_hf_export_requires_capture_for_configured_mtp(monkeypatch):
+    import torch
+
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+
+    model = _mtp_export_model()
+    ordinary_tensor = torch.tensor([1.0])
+
+    def ordinary_builder(built_model):
+        assert built_model is model
+
+        def iterator(*, include_skipped=False):
+            assert include_skipped is True
+            yield "model.weight", ordinary_tensor
+
+        return iterator
+
+    monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", ordinary_builder)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    iterator = qwen._build_iter_full_hf_weights_with_mtp(model)(include_skipped=True)
+    assert next(iterator) == ("model.weight", ordinary_tensor)
+    with pytest.raises(RuntimeError, match="requires captured original MTP weights"):
+        next(iterator)
+
+
+def test_qwen_full_hf_export_without_configured_mtp_needs_no_capture(monkeypatch):
+    import torch
+
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+
+    model = _mtp_export_model(layer_count=0)
+    ordinary_tensor = torch.tensor([1.0])
+
+    def ordinary_builder(built_model):
+        assert built_model is model
+
+        def iterator(*, include_skipped=False):
+            assert include_skipped is True
+            yield "model.weight", ordinary_tensor
+
+        return iterator
+
+    monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", ordinary_builder)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    assert list(qwen._build_iter_full_hf_weights_with_mtp(model)(include_skipped=True)) == [
+        ("model.weight", ordinary_tensor)
+    ]
