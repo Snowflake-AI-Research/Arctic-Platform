@@ -47,6 +47,14 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.lower() not in {"0", "false", "no", "off"}
 
 
+def _first_token_time(result: dict[str, Any]) -> float | None:
+    """``first_token_ts`` from a worker result (epoch seconds), if it has one."""
+    value = result.get("first_token_ts")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    return None
+
+
 @dataclass
 class _Request:
     id: int
@@ -822,6 +830,9 @@ class Scheduler:
                     prompt_len=int(result.get("prompt_len", 0) or 0),
                     generation_len=int(result.get("generation_len", 0) or 0),
                     prefix_cache_len=int(result.get("prefix_cache_len", 0) or 0),
+                    # The worker's first-token time, so drain-metrics TTFT
+                    # covers non-streaming requests too.
+                    first_delta_time=_first_token_time(result),
                 ))
 
     async def _utilization_poll_loop(self) -> None:
