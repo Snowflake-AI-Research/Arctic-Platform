@@ -10,6 +10,9 @@ all-reduce workspace and forces CustomAllreduce's copy path while the CUDA
 graphs are captured. Each of those changes a reduction order, so a stock plain
 engine differs from a semi_p one in the last bits of its logits -- enough to
 flip near-tie greedy tokens, and nothing to do with checkpoint or restore.
+The same worker also routes TP all-gathers through CustomAllreduce
+(``ca_all_gather``); a gather is exact either way, but the worker class keeps
+the two engines on the same kernels.
 
 A plain job whose ``extra_env`` sets ``SEMIP_MATCH_COLLECTIVES=1`` gets the
 same setup from ``apply``, so a semi_p job can be compared against it token for
