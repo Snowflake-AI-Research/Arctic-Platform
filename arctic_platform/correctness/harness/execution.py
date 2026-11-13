@@ -1081,6 +1081,17 @@ def _saved_output(log):
         handler.close()
 
 
+def _print_failure_output(path: Path, start: int) -> None:
+    """Expose a bounded failed group's output; successful runs remain quiet."""
+    with path.open("rb") as log:
+        log.seek(0, os.SEEK_END)
+        log.seek(max(start, log.tell() - 65536))
+        tail = "\n".join(log.read().decode("utf-8", errors="replace").splitlines()[-80:])
+    if tail.strip():
+        print(f"\nLast execution output:\n{tail}", flush=True)
+    print(f"Complete execution log: {path}", flush=True)
+
+
 def run_batch(args, *, selected, executor=None):
     """Orchestrate independent groups without replacing the numerical runner."""
     from arctic_platform.correctness.harness.storage import ReferencePrerequisiteError
@@ -1115,6 +1126,10 @@ def run_batch(args, *, selected, executor=None):
     print("Selected tests: " + ", ".join(dict.fromkeys(case.test_id for case in selected)), flush=True)
     with (out / "full.log").open("w", encoding="utf-8") as log:
         for index, group in enumerate(groups):
+            log.flush()
+            output_start = log.tell()
+            failure_output_printed = False
+            started_group = not stopped
             group_results = []
             failure = None
             if stopped:
@@ -1183,6 +1198,10 @@ def run_batch(args, *, selected, executor=None):
                 print(f"{summary['status'].upper():12s} {case.config_id}  {case.test_id}", flush=True)
                 if summary["status"] in {"blocked", "error", "fail"} and summary["reason"]:
                     print(f"  Reason: {summary['reason']}\n", flush=True)
+                if summary["status"] in {"blocked", "error", "fail"} and started_group and not failure_output_printed:
+                    log.flush()
+                    _print_failure_output(out / "full.log", output_start)
+                    failure_output_printed = True
             results.extend(group_results)
     write_report(results, specs, out, execution=execution)
     elapsed = time.monotonic() - started

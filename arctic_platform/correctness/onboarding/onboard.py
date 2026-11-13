@@ -111,6 +111,70 @@ def _onboarding_failure(reason: str) -> None:
 
 
 @contextmanager
+def _logged_output(path: Path):
+    """Retain prints and logger tracebacks before entering any backend context."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as log:
+        stdout = _ConsoleLog(sys.stdout, log)
+        stderr = _ConsoleLog(sys.stderr, log)
+        logger = logging.getLogger()
+        previous = logger.handlers[:]
+        handler = logging.StreamHandler(stderr)
+        logger.handlers = [handler]
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                try:
+                    yield
+                except BaseException:
+                    # The outer boundary reports the exception to the console once.
+                    traceback.print_exc(file=log)
+                    raise
+        finally:
+            logger.handlers = previous
+            handler.close()
+
+
+@contextmanager
+def _onboarding_test_log(args: argparse.Namespace):
+    """Capture each test from preflight onward, including logger tracebacks."""
+    directory = getattr(args, "_diagnostics_dir", None)
+    if directory is None:
+        yield None
+        return
+    path = directory / "test.log"
+    with _logged_output(path):
+        print(f"Onboarding log ({args.test_id}): {path}", flush=True)
+        yield path
+
+
+def _failure_log_detail(path: Path | None) -> str:
+    if path is None:
+        return ""
+    return f"\nComplete log: {path}"
+
+
+def _log_tail(path: Path) -> str:
+    """Bound the fallback detail while leaving the full output in the saved log."""
+    with path.open("rb") as log:
+        log.seek(0, os.SEEK_END)
+        log.seek(max(0, log.tell() - 8192))
+        return "\n".join(log.read().decode("utf-8", errors="replace").splitlines()[-20:])
+
+
+def _failure_reason(error: BaseException, path: Path | None) -> str:
+    parts = []
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        parts.append(f"{type(error).__name__}: {error}")
+        error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+    reason = "\nCaused by: ".join(parts)
+    if path is not None and any(part.startswith("CalledProcessError:") for part in parts):
+        reason += f"\nLast onboarding output:\n{_log_tail(path)}"
+    return reason + _failure_log_detail(path)
+
+
+@contextmanager
 def _onboarding_test_time(args: argparse.Namespace, test_id: str):
     if not hasattr(args, "_onboarding_times"):
         args._onboarding_times = {}
@@ -148,7 +212,7 @@ def logged_run(args: argparse.Namespace) -> int:
                     try:
                         return run(args)
                     except Exception as exc:
-                        reason = f"{type(exc).__name__}: {exc}"
+                        reason = _failure_reason(exc, log_path)
                         traceback.print_exc()
                         timings = "".join(
                             f"\nOnboarding time ({test_id}): {total_duration(elapsed)}\n"
@@ -163,6 +227,12 @@ def logged_run(args: argparse.Namespace) -> int:
                         _onboarding_failure(reason)
                         print(f"Report: {args._diagnostics_dir / 'report.md'}", file=sys.stderr, flush=True)
                         return 1
+                    except KeyboardInterrupt:
+                        traceback.print_exc(file=log)
+                        raise
+                    except BaseException:
+                        traceback.print_exc()
+                        raise
                     finally:
                         for test_id, elapsed in args._onboarding_times.items():
                             print(f"Onboarding time ({test_id}): {total_duration(elapsed)}", flush=True)
@@ -1130,7 +1200,7 @@ def _probe_worker(args: argparse.Namespace) -> int:
         )
         exit_code = 0
     except Exception as error:  # CUDA OOM is an expected sizing outcome; other failures stay fatal.
-        payload.update(memory=_memory_snapshot(), error=f"{type(error).__name__}: {error}")
+        payload.update(memory=_memory_snapshot(), error=_failure_reason(error, None))
         if _is_cuda_oom(error):
             payload["status"] = "oom"
             if not cache_preexisting:
@@ -1138,6 +1208,7 @@ def _probe_worker(args: argparse.Namespace) -> int:
                 payload["model_cache_removed"] = True
             exit_code = OOM_EXIT
         else:
+            traceback.print_exc()
             payload["status"] = "error"
             exit_code = 1
     args.probe_output.parent.mkdir(parents=True, exist_ok=True)
@@ -1360,6 +1431,8 @@ def _require_validation_pass(validation: dict, description: str, *, config_id: s
     if validation["status"] == "pass":
         return
     details = validation.get("reason") or "The target did not complete a passing comparison."
+    if validation.get("execution_log"):
+        details += f"\nComplete execution log: {validation['execution_log']}"
     context = f" for {config_id}" if config_id is not None else ""
     raise RuntimeError(
         f"{details}\n{description} {validation['status']}{context}\n"
@@ -1517,37 +1590,48 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
     _stage(phase, "Target Run", description)
     lines: list[str] = []
     gateway_context = nullcontext(None) if automatic_gateway else _validation_gateway(args)
-    with gateway_context as gateway_url, log_path.open("w") as log:
-        if gateway_url is not None:
-            command += ["--base-url", gateway_url]
-        env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
-        process = subprocess.Popen(
-            command,
-            cwd=args.checkout_root,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        try:
-            for line in process.stdout:
-                print(line, end="", flush=True)
-                log.write(line)
-                lines.append(line)
-            returncode = process.wait()
-        except BaseException:
-            process.kill()
-            process.wait()
-            raise
-        finally:
-            process.stdout.close()
+    with _logged_output(log_path):
+        with gateway_context as gateway_url:
+            if gateway_url is not None:
+                command += ["--base-url", gateway_url]
+            env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+            process = subprocess.Popen(
+                command,
+                cwd=args.checkout_root,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            assert process.stdout is not None
+            try:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    lines.append(line)
+                returncode = process.wait()
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
+            finally:
+                process.stdout.close()
     if bootstrap is not None and _optimizer_validation_bootstrap(args) != bootstrap:
         raise ValueError("optimizer validation bootstrap/config changed during target validation")
     output = "".join(lines)
     report_path = out_dir / "report.json"
-    report = json.loads(report_path.read_text()) if report_path.exists() else None
+    report_error = None
+    try:
+        report = json.loads(report_path.read_text()) if report_path.exists() else None
+        if report is not None and (
+            not isinstance(report, dict)
+            or not isinstance(report.get("results", []), list)
+            or any(not isinstance(row, dict) for row in report.get("results", []))
+        ):
+            raise ValueError("target report must contain an object with a results list")
+    except (OSError, ValueError) as exc:
+        report = None
+        report_error = f"Could not read target report: {type(exc).__name__}: {exc}"
     failures = [
         f"{row.get('test_id', args.test_id)} / {row.get('arm') or '-'}: "
         f"{row.get('reason') or row.get('summary') or row.get('outcome', 'no verdict')}"
@@ -1556,13 +1640,30 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
     ]
     reason = "\n".join(failures)
     batch_path = out_dir / "batch.json"
-    if batch_path.exists() and json.loads(batch_path.read_text()).get("stopped_unsafe") is True:
+    try:
+        batch = json.loads(batch_path.read_text()) if batch_path.exists() else {}
+        if not isinstance(batch, dict):
+            raise ValueError("target batch report must contain an object")
+    except (OSError, ValueError) as exc:
         from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
 
         raise UnsafeCleanupError(
-            f"{reason or 'Target execution stopped because owned cleanup could not be verified.'}\n"
+            f"Could not verify target cleanup: {type(exc).__name__}: {exc}\n"
+            f"Last target output:\n{_log_tail(log_path)}\n"
+            f"Report: {batch_path}\nComplete log: {log_path}"
+        ) from exc
+    if batch.get("stopped_unsafe") is True:
+        from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
+
+        raise UnsafeCleanupError(
+            f"{reason or report_error or 'Target execution stopped because owned cleanup could not be verified.'}\n"
             "Further onboarding stopped; owned worker cleanup must be verified before another test.\n"
             f"Report: {report_path if report is not None else 'not written'}\nComplete log: {log_path}"
+        )
+    if report_error is not None:
+        raise RuntimeError(
+            f"{report_error}\nLast target output:\n{_log_tail(log_path)}\n"
+            f"Report: {report_path}\nComplete log: {log_path}"
         )
     try:
         outcome = _validation_outcome(returncode, output, report)
@@ -1572,8 +1673,9 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
             f"Report: {report_path if report is not None else 'not written'}\nComplete log: {log_path}"
         ) from exc
     if outcome != "pass" and not reason:
-        tail = "\n".join(line for line in output.splitlines()[-20:] if line.strip())
         reason = f"Target process exited {returncode} without a reported failure reason."
+    if outcome != "pass":
+        tail = _log_tail(log_path)
         if tail:
             reason += f"\nLast target output:\n{tail}"
     result = {
@@ -1584,6 +1686,8 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
         "report": str(report_path) if report_path.exists() else None,
         "reason": reason,
     }
+    if (out_dir / "full.log").exists():
+        result["execution_log"] = str(out_dir / "full.log")
     if bootstrap is not None:
         result["optimizer_validation_bootstrap"] = bootstrap
     (out_dir / "validation.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
@@ -2697,19 +2801,33 @@ def run(args: argparse.Namespace) -> int:
             )
             print(f"Report: {report}", flush=True)
         return 0
-    options = _onboarding_options(args)
-    runtime_identity = _onboarding_runtime_identity(_onboarding_runtime_sources())
-    try:
-        with _onboarding_test_time(args, args.test_id):
+    with _onboarding_test_log(args) as test_log, _onboarding_test_time(args, args.test_id):
+        try:
+            options = _onboarding_options(args)
+            runtime_identity = _onboarding_runtime_identity(_onboarding_runtime_sources())
             code = _parent(args)
-    except Exception as exc:
-        _save_onboarding_summary(
-            args,
-            config,
-            spec_path,
-            {**summary.get("results", {}), args.test_id: {"status": "failed", "reason": str(exc)}},
-        )
-        raise
+        except Exception as exc:
+            _save_onboarding_summary(
+                args,
+                config,
+                spec_path,
+                {
+                    **summary.get("results", {}),
+                    args.test_id: {
+                        "status": "failed",
+                        "reason": _failure_reason(exc, test_log),
+                        "log": str(test_log) if test_log is not None else None,
+                    },
+                },
+            )
+            raise
+        reason = None
+        if code != 0:
+            reason = f"Onboarding process exited {code}."
+            if test_log is not None:
+                reason += f"\nLast onboarding output:\n{_log_tail(test_log)}"
+            reason += _failure_log_detail(test_log)
+            _onboarding_failure(reason)
     spec, _ = _onboarding_state(args, config, spec_path)
     result = {
         "status": "onboarded" if code == 0 else "failed",
@@ -2720,6 +2838,10 @@ def run(args: argparse.Namespace) -> int:
         "options": options,
         "runtime_identity": runtime_identity if code == 0 else None,
     }
+    if test_log is not None:
+        result["log"] = str(test_log)
+    if reason is not None:
+        result["reason"] = reason
     _save_onboarding_summary(
         args, config, spec_path, {**summary.get("results", {}), args.test_id: result}, skipped_tests=[]
     )
@@ -2801,33 +2923,40 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
                 "output_dir": output / test_id if output is not None else None,
             }
         )
-        _stage(f"Onboarding {index}/{len(queue)}", test_id.replace("-", " "), f"Config: {config.config_id}")
-        options = _onboarding_options(child)
-        runtime_identity = _onboarding_runtime_identity(_onboarding_runtime_sources())
-        with _onboarding_test_time(child, test_id):
+        if hasattr(args, "_diagnostics_dir"):
+            child._diagnostics_dir = args._diagnostics_dir / test_id
+        with _onboarding_test_log(child) as test_log, _onboarding_test_time(child, test_id):
+            _stage(f"Onboarding {index}/{len(queue)}", test_id.replace("-", " "), f"Config: {config.config_id}")
             try:
+                options = _onboarding_options(child)
+                runtime_identity = _onboarding_runtime_identity(_onboarding_runtime_sources())
                 _onboarding_preflight(child, config, [test_id])
                 if output is None:
                     output = correctness_workdir("config-onboarding-")
                 child.output_dir = output / test_id
-                if hasattr(args, "_diagnostics_dir"):
-                    child._diagnostics_dir = args._diagnostics_dir / test_id
-                    child._diagnostics_dir.mkdir(parents=True, exist_ok=True)
                 code = _parent(child)
                 results[test_id] = {
                     "status": "onboarded" if code == 0 else "failed",
                     "exit_code": code,
                     "output_dir": str(child.output_dir),
                 }
+                if code != 0:
+                    reason = f"Onboarding process exited {code}."
+                    if test_log is not None:
+                        reason += f"\nLast onboarding output:\n{_log_tail(test_log)}"
+                    results[test_id]["reason"] = reason + _failure_log_detail(test_log)
+                    _onboarding_failure(f"{test_id}: {results[test_id]['reason']}")
             except UnsafeCleanupError as exc:
                 unsafe_cleanup = str(exc)
-                results[test_id] = {"status": "failed", "reason": str(exc), "exit_code": 1}
+                results[test_id] = {"status": "failed", "reason": _failure_reason(exc, test_log), "exit_code": 1}
                 traceback.print_exc()
-                _onboarding_failure(f"{test_id}: {exc}")
+                _onboarding_failure(f"{test_id}: {results[test_id]['reason']}")
             except Exception as exc:
-                results[test_id] = {"status": "failed", "reason": str(exc), "exit_code": 1}
+                results[test_id] = {"status": "failed", "reason": _failure_reason(exc, test_log), "exit_code": 1}
                 traceback.print_exc()
-                _onboarding_failure(f"{test_id}: {exc}")
+                _onboarding_failure(f"{test_id}: {results[test_id]['reason']}")
+        if test_log is not None:
+            results[test_id]["log"] = str(test_log)
         results[test_id]["elapsed_seconds"] = args._onboarding_times[test_id]
         if results[test_id]["status"] == "onboarded":
             current_spec, _ = _onboarding_state(args, config, spec_path)

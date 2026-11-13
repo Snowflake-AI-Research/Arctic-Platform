@@ -65,6 +65,7 @@ if runtime_stubbed and "arctic_platform.inference.server" not in sys.modules:
 
 from arctic_platform.inference.server.replica_pool import ReplicaPool
 from arctic_platform.inference.server.scheduler import Scheduler
+from arctic_platform.inference.server.testing import RemoteMock
 
 
 class _RemoteMethod:
@@ -171,7 +172,7 @@ def _scheduler_pool(
     stream_release: asyncio.Event,
 ):
     worker = MagicMock()
-    worker.generate.remote = AsyncMock(side_effect=generate)
+    worker.generate.remote = RemoteMock(side_effect=generate)
     worker.send_router_replay.remote = AsyncMock(side_effect=send_router_replay)
     worker.start_stream.remote = AsyncMock(
         return_value={"status": "registered"}
@@ -184,12 +185,7 @@ def _scheduler_pool(
 
     pool = ReplicaPool()
     pool._workers = [worker]
-    pool._scheduler = Scheduler(
-        [worker],
-        dynamic_concurrency=False,
-        initial_concurrency=4,
-    )
-    pool._scheduler._ensure_background_tasks = lambda: None
+    pool._scheduler = Scheduler([worker], capacity=4)
     return pool, worker
 
 

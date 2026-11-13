@@ -409,7 +409,7 @@ def test_initialize_logs_clear_cache_on_weight_sync(value, caplog):
         pool = ReplicaPool()
         pool._make_worker = lambda *args, **kwargs: _FakeWorker([])
         pool._initialize_workers = noop
-        pool._make_scheduler = lambda workers: _FakeScheduler([])
+        pool._make_scheduler = lambda workers, capacity: _FakeScheduler([])
         pool._monitor_health = noop
         with caplog.at_level("INFO", logger="arctic_platform.inference.server"):
             await pool.initialize(

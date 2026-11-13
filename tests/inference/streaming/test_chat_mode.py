@@ -1244,7 +1244,7 @@ def through_driver(script, prompt, params):
     async def run():
         actor = ChatWorker.remote(script)
         pool = ReplicaPool()
-        pool._scheduler = Scheduler([actor], dynamic_concurrency=False)
+        pool._scheduler = Scheduler([actor], capacity=1024)
         driver = Driver()
         driver._pools["model"] = pool
         try:
@@ -1682,7 +1682,7 @@ def chat_support_driver(supports):
     actors = [ray.remote(num_cpus=0)(ChatSupportWorker).remote(s) for s in supports]
     pool = ReplicaPool()
     pool._workers = list(actors)
-    pool._scheduler = Scheduler(actors, dynamic_concurrency=False)
+    pool._scheduler = Scheduler(actors, capacity=1024)
     driver = Driver()
     driver._pools["model"] = pool
     return driver, pool, actors
