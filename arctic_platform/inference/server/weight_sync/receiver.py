@@ -30,6 +30,19 @@ import torch
 
 from arctic_platform.common.peft import normalize_lora_peft_config
 from arctic_platform.common.weight_checksum import tensor_l2_sq as _tensor_l2_sq
+from arctic_platform.debug.weight_sync import maybe_admit_broadcast_receiver
+from arctic_platform.debug.weight_sync import maybe_bind_broadcast_loader
+from arctic_platform.debug.weight_sync import maybe_bind_fp8_updater
+from arctic_platform.debug.weight_sync import maybe_broadcast_receiver_result
+from arctic_platform.debug.weight_sync import maybe_current_broadcast_verifier
+from arctic_platform.debug.weight_sync import maybe_lora_built_receiver_result
+from arctic_platform.debug.weight_sync import maybe_observe_broadcast_load
+from arctic_platform.debug.weight_sync import maybe_observe_broadcast_tensor
+from arctic_platform.debug.weight_sync import maybe_observe_fp8_tensor
+from arctic_platform.debug.weight_sync import maybe_observe_fused_expert_loras
+from arctic_platform.debug.weight_sync import maybe_observe_lora_build
+from arctic_platform.debug.weight_sync import maybe_record_built_lora_factors
+from arctic_platform.debug.weight_sync import maybe_record_lora_remapping
 from arctic_platform.inference.utils import require_supported_vllm_version
 
 logger = logging.getLogger(__name__)
@@ -275,6 +288,7 @@ def _build_lora_model(
     # Central point for all LoRA key rewriting: strip AC wraps and remap the LM
     # root to the served model's namespace (see ``_remap_lora_key``).
     prefix = _served_lm_module_prefix(model)
+    maybe_record_lora_remapping(tensors, prefix, _remap_lora_key)
     tensors = {
         _remap_lora_key(name, prefix): tensor for name, tensor in tensors.items()
     }
@@ -310,7 +324,9 @@ def _build_lora_model(
         weights_mapper=weights_mapper,
         skip_prefixes=lora_skip_prefixes,
     )
-    packed_layers = _pack_fused_expert_loras(lora_model)
+    maybe_record_built_lora_factors(lora_model, weights_mapper, lora_skip_prefixes)
+    with maybe_observe_fused_expert_loras(lora_model):
+        packed_layers = _pack_fused_expert_loras(lora_model)
     if packed_layers:
         logger.info(
             "Packed %d fused expert LoRA layer(s) via pack_moe_stacked",
@@ -571,12 +587,15 @@ class WeightSyncExtension:
         updater = _FP8InplaceUpdater(
             model, self.model_config.dtype, self.device,
         )
+        verifier = maybe_current_broadcast_verifier()
+        replay = maybe_bind_fp8_updater(verifier, updater, lambda: _FP8InplaceUpdater(model, self.model_config.dtype, self.device))
         loaded = 0
         recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
         for name, tensor in engine.receive_weights():
             recv_l2_sq.add_(_tensor_l2_sq(tensor))
             try:
-                updater.feed(name, tensor)
+                with maybe_observe_fp8_tensor(verifier, updater, replay, name, tensor):
+                    updater.feed(name, tensor)
             except Exception as exc:
                 raise RuntimeError(
                     f"FP8 weight sync failed for {name!r} with shape "
@@ -631,6 +650,8 @@ class WeightSyncExtension:
         from arctic_platform.inference.server.weight_sync.utils import _DirectParamWriter
 
         writer = _DirectParamWriter(model, self.device)
+        verifier = maybe_current_broadcast_verifier()
+        maybe_bind_broadcast_loader(verifier, writer)
         loaded = 0
         orphans: list[str] = []
         source_to_destinations: dict[str, list[str]] = {}
@@ -640,7 +661,8 @@ class WeightSyncExtension:
             view = writer.get_view(name)
             destination = writer.get_destination(name)
             if view is not None and destination is not None:
-                view.copy_(tensor)
+                with maybe_observe_broadcast_tensor(verifier, lambda _, value: view.copy_(value), name, tensor):
+                    view.copy_(tensor)
                 source_to_destinations[name] = [destination]
             else:
                 orphans.append(name)
@@ -695,6 +717,8 @@ class WeightSyncExtension:
         )
 
         writer = _ShardAwareFusedWriter(model, self.device)
+        verifier = maybe_current_broadcast_verifier()
+        maybe_bind_broadcast_loader(verifier, writer)
         duplicating_mappers = _shard_duplicating_mappers(model)
         loaded = 0
         source_to_destinations: dict[str, list[str]] = {}
@@ -710,11 +734,13 @@ class WeightSyncExtension:
             destination = writer.destination_name(name)
             copies = 1
             if destination is not None:
-                writer.feed(name, tensor)
+                with maybe_observe_broadcast_tensor(verifier, writer.feed, name, tensor):
+                    writer.feed(name, tensor)
                 destinations = [destination]
             else:
                 copies = _loaded_copies(duplicating_mappers, name)
-                loaded_names = model.load_weights([(name, tensor)])
+                with maybe_observe_broadcast_tensor(verifier, lambda source, value: model.load_weights([(source, value)]), name, tensor):
+                    loaded_names = model.load_weights([(name, tensor)])
                 if isinstance(loaded_names, str):
                     destinations = [loaded_names]
                 else:
@@ -803,6 +829,7 @@ class WeightSyncExtension:
                 f"weight_format must be 'vllm' or 'hf'; got {weight_format!r}"
             )
 
+        maybe_admit_broadcast_receiver(self, engine_only=engine_only)
         rank = rank_offset + get_world_group().rank
         engine = self._get_or_create_broadcast_engine(
             master_addr, master_port, rank, world_size, bucket_size,
@@ -834,34 +861,38 @@ class WeightSyncExtension:
         skipped_source_names: list[str] | None = None
         if weight_format == "hf":
             path = "batched"
-            (
-                loaded,
-                recv_l2_sq,
-                applied_source_l2_sq,
-                source_to_destinations,
-                skipped_source_names,
-            ) = self._load_batched(model, engine)
+            with maybe_observe_broadcast_load(self, model, engine) as verifier:
+                (
+                    loaded,
+                    recv_l2_sq,
+                    applied_source_l2_sq,
+                    source_to_destinations,
+                    skipped_source_names,
+                ) = self._load_batched(model, engine)
         elif self.model_config.quantization:
             path = "fp8"
-            loaded, recv_l2_sq = self._load_fp8(model, engine)
+            with maybe_observe_broadcast_load(self, model, engine) as verifier:
+                loaded, recv_l2_sq = self._load_fp8(model, engine)
         elif get_tensor_model_parallel_world_size() == 1:
             path = "direct"
-            (
-                loaded,
-                recv_l2_sq,
-                applied_source_l2_sq,
-                source_to_destinations,
-                skipped_source_names,
-            ) = self._load_direct(model, engine)
+            with maybe_observe_broadcast_load(self, model, engine) as verifier:
+                (
+                    loaded,
+                    recv_l2_sq,
+                    applied_source_l2_sq,
+                    source_to_destinations,
+                    skipped_source_names,
+                ) = self._load_direct(model, engine)
         else:
             path = "batched"
-            (
-                loaded,
-                recv_l2_sq,
-                applied_source_l2_sq,
-                source_to_destinations,
-                skipped_source_names,
-            ) = self._load_batched(model, engine)
+            with maybe_observe_broadcast_load(self, model, engine) as verifier:
+                (
+                    loaded,
+                    recv_l2_sq,
+                    applied_source_l2_sq,
+                    source_to_destinations,
+                    skipped_source_names,
+                ) = self._load_batched(model, engine)
         refreshed = _refresh_cached_weight_copies(model)
 
         if (
@@ -926,6 +957,7 @@ class WeightSyncExtension:
             result["skipped_source_names"] = skipped_source_names
         if recv_l2_sq is not None:
             result["recv_l2_sq"] = recv_l2_sq
+        maybe_broadcast_receiver_result(result, verifier, rank=rank)
         return result
 
     # ------------------------------------------------------------------
@@ -1040,14 +1072,15 @@ class WeightSyncExtension:
                 tensors[name] = tensor.detach().clone()
 
         n_tensors = len(tensors)
-        lora_model = _build_lora_model(
-            lora_int_id=lora_int_id,
-            tensors=tensors,
-            lora_config=lora_config,
-            device="cpu" if staging == "cpu" else self.device,
-            dtype=self.model_config.dtype,
-            model=getattr(self.model_runner, "model", None),
-        )
+        with maybe_observe_lora_build(tensors) as build_evidence:
+            lora_model = _build_lora_model(
+                lora_int_id=lora_int_id,
+                tensors=tensors,
+                lora_config=lora_config,
+                device="cpu" if staging == "cpu" else self.device,
+                dtype=self.model_config.dtype,
+                model=getattr(self.model_runner, "model", None),
+            )
         del tensors
 
         if not evict_first:
@@ -1071,6 +1104,7 @@ class WeightSyncExtension:
 
         # Free 2×bucket staging; keep the NCCL communicator for the next sync.
         engine.release_staging_buffers()
+        maybe_lora_built_receiver_result(result, build_evidence, manager=adapter_manager, lora_int_id=lora_int_id, rank=rank, world_size=world_size)
         return result
 
     # ------------------------------------------------------------------
