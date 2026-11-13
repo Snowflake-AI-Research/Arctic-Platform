@@ -268,6 +268,11 @@ def build_iter_full_hf_weights(model: nn.Module):
             convert_layer_to_hf(layer_state, index)
             yield from layer_state.items()
 
+        # A complete checkpoint also needs the source tensors the family does not train (e.g. a vision tower).
+        passthrough = getattr(model, "iter_hf_checkpoint_passthrough", None)
+        if include_skipped and is_master and passthrough is not None:
+            yield from passthrough()
+
     return iterator
 
 

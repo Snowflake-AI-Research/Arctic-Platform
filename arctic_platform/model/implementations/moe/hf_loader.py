@@ -47,7 +47,7 @@ def supports_direct_hf_loading(model: torch.nn.Module) -> bool:
     return getattr(model.config, "model_type", None) in _DIRECT_HF_MODEL_TYPES
 
 
-_LAYER_RE = re.compile(r"^(?:model(?:\.language_model)?|backbone)\.layers\.(\d+)\.")
+_LAYER_RE = re.compile(r"^(?:language_model\.)?(?:model(?:\.language_model)?|backbone)\.layers\.(\d+)\.")
 _EXPERT_RE = re.compile(r"^(.*\.experts\.)(\d+)(\..*)$")
 _EXPERT_WEIGHT_RE = re.compile(r"\.experts\.w[123]$")
 _PLE_SHARD_RE = re.compile(r"^(.*\.ple\.ple_embedding\.ngram_embedding)\.shard_(\d+)\.weight$")
@@ -221,7 +221,7 @@ def _load_hf_weights(
                 if _PLE_SHARD_RE.match(name) is not None:
                     continue
                 shape = reader.shapes[name]
-                selection = None
+                selection: tuple[slice, ...] | None = None
                 destination_name = name
                 match = _EXPERT_RE.match(name)
                 if expert_range is not None and match is not None:

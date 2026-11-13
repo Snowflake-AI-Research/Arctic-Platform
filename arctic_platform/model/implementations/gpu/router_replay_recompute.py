@@ -117,7 +117,7 @@ def _install_recompute_detector() -> None:
 
 
 def _router_supports_routed_experts(router: object) -> bool:
-    # Replayable iff forward accepts routed_experts (TokenChoiceTopKRouter does; NemotronHRouter does not).
+    # Replayable iff forward accepts routed_experts (TokenChoiceTopKRouter and NemotronHRouter do).
     forward_method = getattr(router, "forward", None)
     if forward_method is None:
         return False
@@ -137,9 +137,8 @@ def _wrap_router(router) -> bool:
 
     original = router.forward
     router._self_replay_captures = weakref.WeakKeyDictionary()
-    # Contract read by forward below: a router that never opts into fresh routing (only
-    # TokenChoiceTopKRouter.enable_fresh_replay_routing does) keeps gather-only replay, so production replay
-    # defers to it.
+    # Contract read by forward below: a router that never opts into fresh routing (only a router's own
+    # enable_fresh_replay_routing does) keeps gather-only replay, so production replay defers to it.
     if not hasattr(router, "fresh_replay_routing"):
         router.fresh_replay_routing = False
 
