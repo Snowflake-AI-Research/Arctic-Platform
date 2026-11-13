@@ -18670,6 +18670,147 @@ def test_onboarding_checkout_root_does_not_adopt_config_git_when_library_is_not_
     assert not (library / ".git").exists()
 
 
+def test_short_sequence_regression_cli_and_api_preserve_explicit_tokens():
+    request, options = api.parse_run_args(
+        ["--config", "synthetic.config", "--test", "single-step-optimizer", "--tokens", "128"]
+    )
+    assert options.tokens == 128
+    assert execution._validate_regression_tokens(api._namespace(request, options)) == 128
+    _, defaults = api.parse_run_args(["--config", "synthetic.config"])
+    assert defaults.tokens is None
+
+
+@pytest.mark.parametrize(
+    "tokens,config,all_configs,tests",
+    [
+        (0, "synthetic.config", False, ("single-step-grads",)),
+        (-1, "synthetic.config", False, ("single-step-grads",)),
+        (True, "synthetic.config", False, ("single-step-grads",)),
+        (256, None, False, ("single-step-grads",)),
+        (256, "synthetic.config", True, ("single-step-grads",)),
+        (256, "synthetic.config", False, ()),
+        (256, "synthetic.config", False, ("checkpoint-resume-loss",)),
+        (256, "synthetic.config", False, ("single-step-grads", "inference-checkpoint-loss")),
+    ],
+)
+def test_short_sequence_regression_rejects_invalid_selection_before_work(
+    monkeypatch, tokens, config, all_configs, tests
+):
+    monkeypatch.setattr(api, "select", lambda *a: pytest.fail("invalid tokens reached catalog or target"))
+    with pytest.raises(ValueError, match="--tokens"):
+        api.run(api.RunRequest(config=config, all_configs=all_configs, tests=tests), api.RunOptions(tokens=tokens))
+
+
+@pytest.mark.parametrize("test_id", ["single-step-grads", "single-step-optimizer"])
+def test_onboarding_final_regression_child_accepts_tokens(tmp_path, monkeypatch, test_id):
+    args = execution.parse_args(["onboard", "--config", "synthetic.config", "--test", test_id, "--tokens", "128"])
+    args.output_dir = tmp_path
+    args.checkout_root = tmp_path
+    args.test_spec = tmp_path / "reviewed.json"
+    args.test_spec.write_text("unchanged frozen specification")
+    captured = []
+
+    def process(command, **kwargs):
+        parsed = execution.parse_args(command[3:])
+        request = api.request_from_args(parsed)
+        options = api.options_from_args(parsed)
+        assert request.tests == (test_id,)
+        assert options.tokens == 128 and options.test_spec == args.test_spec
+        assert execution._validate_regression_tokens(api._namespace(request, options)) == 128
+        captured.append(command)
+        (Path(parsed.out) / "report.json").write_text('{"totals": {"pass": 2, "fail": 0}}')
+        return SimpleNamespace(stdout=io.StringIO("synthetic child\n"), wait=lambda: 0)
+
+    monkeypatch.setattr(onboard.subprocess, "Popen", process)
+    assert onboard._run_final_regression(args, {"layers": 4})["status"] == "pass"
+    assert len(captured) == 1 and captured[0].count("--tokens") == 1
+    assert args.test_spec.read_text() == "unchanged frozen specification"
+
+
+@pytest.mark.parametrize("requested_tokens", [None, 128, 256, 8193])
+@pytest.mark.parametrize("damage", [None, "identity", "checksum", "rows", "attention"])
+def test_short_sequence_regression_requires_exact_frozen_cases(tmp_path, monkeypatch, requested_tokens, damage):
+    path = tmp_path / "synthetic.config"
+    path.write_text(
+        json.dumps(
+            _config_factory_native_config(
+                {
+                    "n_gpus": 8,
+                    "max_seq_len": 8192,
+                    "attn_implementation": "sdpa",
+                    "ds_config": {"data_types": {"grad_accum_dtype": "fp32"}},
+                }
+            )
+        )
+    )
+    cfg = load_config(path)
+    spec = config_module.TestSpec(
+        config_id=cfg.config_id,
+        config_path=str(path),
+        config_checksum=config_checksum(cfg),
+        model=ModelSpec("synthetic-not-loaded", 1, None, 42, 1, "synthetic-not-loaded", "synthetic-only", None),
+        arms=[
+            ArmSpec(arm.name, arm.global_batch_size, 256, arm.total_tokens, arm.total_tokens, 1, 0.0)
+            for arm in arms_for(256, cfg.n_gpus)
+        ],
+        attn_implementations=["sdpa"],
+        applicable_tests=["single-step-optimizer"],
+    )
+    if damage == "identity":
+        spec.config_id = "foreign-config"
+    elif damage == "checksum":
+        spec.config_checksum = "0" * 64
+    elif damage == "rows":
+        spec.arms[0].global_batch_size += 1
+    elif damage == "attention":
+        spec.attn_implementations = ["unreviewed"]
+    candidate = tmp_path / "reviewed.json"
+    spec.write(candidate)
+    before_spec = candidate.read_bytes()
+    original_config = copy.deepcopy(cfg.sub_job)
+    monkeypatch.setattr(execution, "_configure_regression_target", lambda args: args)
+    monkeypatch.setattr(execution, "_resolve_configs", lambda *a, **kw: [path])
+    monkeypatch.setattr(execution, "load_config", lambda *a: cfg)
+    monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **kw: 128)
+    captured = []
+    reported = []
+
+    def finish(results, *args, **kwargs):
+        reported.extend(results)
+        return 0 if len(captured) == 1 else 1
+
+    def target(config, spec, arms, **kwargs):
+        captured.append(arms)
+        return []
+
+    monkeypatch.setattr(execution, "_finish", finish)
+    args = execution.parse_args(
+        [
+            "run",
+            "--config",
+            str(path),
+            "--test",
+            "single-step-optimizer",
+            "--test-spec",
+            str(candidate),
+            "--base-url",
+            "http://127.0.0.1:8003",
+            "--out",
+            str(tmp_path / "report"),
+            *(["--tokens", str(requested_tokens)] if requested_tokens is not None else []),
+        ]
+    )
+    status = execution._run_configs(args, executor=target)
+    if requested_tokens == 256 and damage is None:
+        assert status == 0 and not reported
+        assert [(arm.global_batch_size, arm.max_seq_len) for arm in captured[0]] == [(8, 256), (32, 256)]
+    else:
+        assert status != 0 and captured == []
+        assert len(reported) == 1 and reported[0].outcome is Outcome.FAIL
+    assert candidate.read_bytes() == before_spec
+    assert cfg.sub_job == original_config
+
+
 # Data fast storage.
 
 
