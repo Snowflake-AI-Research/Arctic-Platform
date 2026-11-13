@@ -37,6 +37,8 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, PretrainedConfig
 
 from arctic_platform.model.config import ActivationCheckpointConfig
+from arctic_platform.model.implementations.glm53.auxiliary_weights import capture_auxiliary_weights
+from arctic_platform.model.implementations.qwen35.mtp_weights import capture_mtp_weights
 from arctic_platform.model.implementations.gpu.activation_offload import install_activation_offload
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.router_replay_recompute import install_self_router_replay
@@ -519,6 +521,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             fix_model_post_empty(model)
 
     logger = get_logger()
+    model.__dict__.pop("_ap_preserved_mtp_weights", None)
+    model.__dict__.pop("_ap_preserved_glm_auxiliary_weights", None)
+    model._ap_weights_random_initialized = config.debug.random_init
     if config.debug.random_init:
         logger.warning("Randomly initializing model. Skipping loading weights from HF.")
         _init_buffers_post_meta()
@@ -537,6 +542,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             f"please remove the directory {config.name} and run again"
         )
         snapshot_path = Path(config.name)
+
+    capture_mtp_weights(model, snapshot_path)
+    capture_auxiliary_weights(model, snapshot_path)
 
     # Dynamically convert between different weight formats if needed.
     conversion = None

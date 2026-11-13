@@ -75,12 +75,50 @@ def _apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> Non
     apply_context_parallelism(model, sp_size, sp_group)
 
 
+def _build_iter_full_hf_weights(model: nn.Module):
+    ordinary = qwen_ds._build_iter_full_hf_weights_with_mtp(model)
+    config = getattr(model.config, "text_config", model.config)
+    parts = getattr(config, "split_ngram_parts", 1)
+    if not isinstance(parts, int) or isinstance(parts, bool) or parts < 1:
+        raise ValueError("Qwen3.8 split_ngram_parts must be a positive integer")
+
+    def iterator(*, include_skipped: bool = False):
+        for name, tensor in ordinary(include_skipped=include_skipped):
+            if include_skipped and parts > 1 and name.endswith(".ple.ple_embedding.ngram_embedding.weight"):
+                prefix = name.removesuffix(".weight")
+                for index, shard in enumerate(tensor.tensor_split(parts, dim=0)):
+                    # HF sizes shards by backing storage, so split views need independent storage.
+                    yield f"{prefix}.shard_{index}.weight", shard.clone()
+                    del shard
+            else:
+                yield name, tensor
+            del tensor
+
+    def weight_names(*, include_skipped: bool = False):
+        names = ordinary.weight_names(include_skipped=include_skipped)
+        if not include_skipped or parts == 1:
+            return names
+        return frozenset(
+            exported
+            for name in names
+            for exported in (
+                tuple(f"{name.removesuffix('.weight')}.shard_{index}.weight" for index in range(parts))
+                if name.endswith(".ple.ple_embedding.ngram_embedding.weight")
+                else (name,)
+            )
+        )
+
+    setattr(iterator, "weight_names", weight_names)
+    return iterator
+
+
 def _adapter() -> MoEDeepSpeedAdapter:
     return replace(
         qwen_ds._generic_adapter(),
         build_model_config=_build_model_config,
         apply_sequence_parallelism=_apply_sequence_parallelism,
         vllm_weight_export=None,
+        hf_weight_export=_build_iter_full_hf_weights,
     )
 
 

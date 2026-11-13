@@ -25,7 +25,10 @@ import torch.multiprocessing as mp
 from torch import nn
 
 from arctic_platform.model.implementations.moe import deepspeed_integration as common
+from arctic_platform.model.weight_export import iter_model_weights
+from arctic_platform.model.weight_export import weight_export_contract
 from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import torch_assert_equal
 
 
 def test_shared_setup_runs_family_hooks_in_order(monkeypatch):
@@ -104,6 +107,125 @@ def test_shared_expert_tagging(monkeypatch):
         parameter.group_name == "ep_size_2" and parameter.allreduce is False
         for parameter in model[0].experts.parameters()
     )
+
+
+class _ExportRegistrationModel(nn.Module):
+    def __init__(self, *, device, dtype):
+        super().__init__()
+        self.dense = nn.Parameter(torch.empty(4, device=device, dtype=dtype))
+        self.checkpoint_only = nn.Parameter(torch.empty(2, device=device, dtype=dtype), requires_grad=False)
+
+    @staticmethod
+    def convert_layer_to_hf(layer_state, layer_index):
+        assert layer_index == -1
+        for name in list(layer_state):
+            layer_state[f"hf.{name}"] = layer_state.pop(name)
+
+
+def _load_export_registration_model(*, hf_weight_export=None):
+    vllm_models = []
+
+    def build_vllm(model):
+        vllm_models.append(model)
+
+        def iterator():
+            yield "vllm.dense", model.dense
+
+        return iterator
+
+    def no_op(*_args, **_kwargs):
+        pass
+
+    def load_weights(model, _config, _parallel_dims):
+        model.to_empty(device="cpu")
+        with torch.no_grad():
+            model.dense.copy_(torch.arange(4, dtype=model.dense.dtype))
+            model.checkpoint_only.copy_(torch.tensor([7, 9], dtype=model.checkpoint_only.dtype))
+        model.checkpoint_only._dss_skip_weight_sync = True
+
+    adapter = common.MoEDeepSpeedAdapter(
+        dtype_map={"bfloat16": torch.bfloat16},
+        get_model=lambda _config, **kwargs: _ExportRegistrationModel(**kwargs),
+        configure_moe_ep_backend=no_op,
+        configure_family_backend=no_op,
+        inject_lm_head=no_op,
+        apply_sequence_parallelism=no_op,
+        apply_ac=no_op,
+        load_dcp_from_hf=load_weights,
+        reset_runtime_moe_buffers=no_op,
+        shared_expert_type=nn.Linear,
+        shared_expert_forward=lambda module, value: module(value),
+        build_model_config=no_op,
+        hf_weight_export=hf_weight_export,
+        vllm_weight_export=build_vllm,
+    )
+    config = SimpleNamespace(
+        optimization_dtype="bfloat16",
+        fused_lm_head_token_chunk_size="disabled",
+        fp32_lm_head=False,
+        ac=None,
+    )
+    # Keep the real setup, local-tensor conversion, expert tagging and registration.
+    # Only family construction/loading hooks use a tiny CPU checkpoint fixture.
+    model = common.load_moe_model_for_deepspeed(adapter, config, SimpleNamespace(ep_enabled=False), None, "ep_size_1")
+    return model, build_vllm, vllm_models
+
+
+def test_shared_loader_registers_explicit_hf_and_vllm_exporters():
+    hf_models = []
+    hf_include_skipped = []
+
+    def build_hf(model):
+        hf_models.append(model)
+
+        def iterator(*, include_skipped=False):
+            hf_include_skipped.append(include_skipped)
+            yield "family.dense", model.dense
+            if include_skipped:
+                yield "family.checkpoint_only", model.checkpoint_only
+
+        return iterator
+
+    model, build_vllm, vllm_models = _load_export_registration_model(hf_weight_export=build_hf)
+    contract = weight_export_contract(model)
+    assert contract is not None
+    assert contract.hf is build_hf
+    assert contract.vllm is build_vllm
+
+    synchronized = dict(iter_model_weights(model, "hf", is_master=True, is_zero3=False))
+    assert set(synchronized) == {"family.dense"}
+    assert synchronized["family.dense"] is model.dense
+    checkpoint = dict(iter_model_weights(model, "hf", is_master=True, is_zero3=False, include_skipped=True))
+    assert set(checkpoint) == {"family.dense", "family.checkpoint_only"}
+    assert checkpoint["family.checkpoint_only"] is model.checkpoint_only
+    assert hf_models == [model, model]
+    assert hf_include_skipped == [False, True]
+
+    vllm = dict(iter_model_weights(model, "vllm", is_master=True, is_zero3=False))
+    assert set(vllm) == {"vllm.dense"}
+    assert vllm["vllm.dense"] is model.dense
+    assert vllm_models == [model]
+
+
+def test_shared_loader_registers_default_hf_and_preserves_vllm_exporter():
+    model, build_vllm, vllm_models = _load_export_registration_model()
+    contract = weight_export_contract(model)
+    assert contract is not None
+    assert contract.hf is common.build_iter_full_hf_weights
+    assert contract.vllm is build_vllm
+
+    synchronized = dict(iter_model_weights(model, "hf", is_master=True, is_zero3=False))
+    assert set(synchronized) == {"hf.dense"}
+    torch_assert_equal(synchronized["hf.dense"], model.dense)
+    checkpoint = dict(iter_model_weights(model, "hf", is_master=True, is_zero3=False, include_skipped=True))
+    assert set(checkpoint) == {"hf.dense", "hf.checkpoint_only"}
+    torch_assert_equal(checkpoint["hf.dense"], model.dense)
+    torch_assert_equal(checkpoint["hf.checkpoint_only"], model.checkpoint_only)
+
+    vllm = dict(iter_model_weights(model, "vllm", is_master=True, is_zero3=False))
+    assert set(vllm) == {"vllm.dense"}
+    assert vllm["vllm.dense"] is model.dense
+    assert vllm_models == [model]
 
 
 def test_family_defaults_remain_distinct():
@@ -352,6 +474,7 @@ def test_hf_export_delegates_only_master_replica_to_cpu_gather(monkeypatch, rank
     monkeypatch.setitem(sys.modules, "deepspeed", deepspeed_module)
     monkeypatch.setitem(sys.modules, "deepspeed.utils", utils_module)
     monkeypatch.setitem(sys.modules, "deepspeed.utils.groups", groups_module)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
     monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda ep_group: group_ranks)
     calls = []
@@ -379,6 +502,62 @@ def test_hf_export_delegates_only_master_replica_to_cpu_gather(monkeypatch, rank
     assert ep_group is group
     assert is_master is True
     assert max_gather_bytes == 64 * 1024 * 1024
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("skip_owner", ["parameter", "module"])
+def test_hf_export_checkpoint_only_ep_weights_use_bounded_cpu_gather(monkeypatch, rank, skip_owner):
+    import deepspeed.utils.groups as groups
+
+    class ExportableModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.expert = nn.Parameter(torch.arange(6, dtype=torch.float32).reshape(2, 3))
+            self.expert.group_name = "ep_size_2"
+            self.expert.allreduce = False
+            owner = self.expert if skip_owner == "parameter" else self
+            owner._dss_skip_weight_sync = True
+
+        @staticmethod
+        def convert_layer_to_hf(layer_state, layer_index):
+            return layer_state
+
+    group = object()
+    monkeypatch.setattr(groups, "_get_expert_parallel_group", lambda name: group)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda ep_group: [0, 1])
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    calls = []
+
+    def gather(local, outputs, *, dst, group):
+        calls.append(local.numel())
+        assert dst == 0
+        if rank == 0:
+            assert len(outputs) == 2
+            for output in outputs:
+                output.copy_(local)
+        else:
+            assert outputs is None
+
+    monkeypatch.setattr(torch.distributed, "gather", gather)
+    monkeypatch.setattr(
+        common,
+        "_gather_ep_weight_to_cpu",
+        lambda *args, **kwargs: pytest.fail("checkpoint-only weights must use the rank-0 gather"),
+    )
+    model = ExportableModel()
+    exporter = common.build_iter_full_hf_weights(model)
+    assert dict(exporter()) == {}
+    assert calls == []
+    exported = dict(exporter(include_skipped=True))
+    assert calls
+    if rank == 0:
+        assert set(exported) == {"expert"}
+        assert exported["expert"].device.type == "cpu"
+        assert torch.equal(exported["expert"], torch.cat([model.expert.detach()] * 2))
+    else:
+        assert exported == {}
 
 
 def _gloo_ep_weight_gather_worker(rank, world_size, init_method):
