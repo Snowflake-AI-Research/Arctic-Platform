@@ -18670,6 +18670,147 @@ def test_onboarding_checkout_root_does_not_adopt_config_git_when_library_is_not_
     assert not (library / ".git").exists()
 
 
+def test_short_sequence_regression_cli_and_api_preserve_explicit_tokens():
+    request, options = api.parse_run_args(
+        ["--config", "synthetic.config", "--test", "single-step-optimizer", "--tokens", "128"]
+    )
+    assert options.tokens == 128
+    assert execution._validate_regression_tokens(api._namespace(request, options)) == 128
+    _, defaults = api.parse_run_args(["--config", "synthetic.config"])
+    assert defaults.tokens is None
+
+
+@pytest.mark.parametrize(
+    "tokens,config,all_configs,tests",
+    [
+        (0, "synthetic.config", False, ("single-step-grads",)),
+        (-1, "synthetic.config", False, ("single-step-grads",)),
+        (True, "synthetic.config", False, ("single-step-grads",)),
+        (256, None, False, ("single-step-grads",)),
+        (256, "synthetic.config", True, ("single-step-grads",)),
+        (256, "synthetic.config", False, ()),
+        (256, "synthetic.config", False, ("checkpoint-resume-loss",)),
+        (256, "synthetic.config", False, ("single-step-grads", "inference-checkpoint-loss")),
+    ],
+)
+def test_short_sequence_regression_rejects_invalid_selection_before_work(
+    monkeypatch, tokens, config, all_configs, tests
+):
+    monkeypatch.setattr(api, "select", lambda *a: pytest.fail("invalid tokens reached catalog or target"))
+    with pytest.raises(ValueError, match="--tokens"):
+        api.run(api.RunRequest(config=config, all_configs=all_configs, tests=tests), api.RunOptions(tokens=tokens))
+
+
+@pytest.mark.parametrize("test_id", ["single-step-grads", "single-step-optimizer"])
+def test_onboarding_final_regression_child_accepts_tokens(tmp_path, monkeypatch, test_id):
+    args = execution.parse_args(["onboard", "--config", "synthetic.config", "--test", test_id, "--tokens", "128"])
+    args.output_dir = tmp_path
+    args.checkout_root = tmp_path
+    args.test_spec = tmp_path / "reviewed.json"
+    args.test_spec.write_text("unchanged frozen specification")
+    captured = []
+
+    def process(command, **kwargs):
+        parsed = execution.parse_args(command[3:])
+        request = api.request_from_args(parsed)
+        options = api.options_from_args(parsed)
+        assert request.tests == (test_id,)
+        assert options.tokens == 128 and options.test_spec == args.test_spec
+        assert execution._validate_regression_tokens(api._namespace(request, options)) == 128
+        captured.append(command)
+        (Path(parsed.out) / "report.json").write_text('{"totals": {"pass": 2, "fail": 0}}')
+        return SimpleNamespace(stdout=io.StringIO("synthetic child\n"), wait=lambda: 0)
+
+    monkeypatch.setattr(onboard.subprocess, "Popen", process)
+    assert onboard._run_final_regression(args, {"layers": 4})["status"] == "pass"
+    assert len(captured) == 1 and captured[0].count("--tokens") == 1
+    assert args.test_spec.read_text() == "unchanged frozen specification"
+
+
+@pytest.mark.parametrize("requested_tokens", [None, 128, 256, 8193])
+@pytest.mark.parametrize("damage", [None, "identity", "checksum", "rows", "attention"])
+def test_short_sequence_regression_requires_exact_frozen_cases(tmp_path, monkeypatch, requested_tokens, damage):
+    path = tmp_path / "synthetic.config"
+    path.write_text(
+        json.dumps(
+            _config_factory_native_config(
+                {
+                    "n_gpus": 8,
+                    "max_seq_len": 8192,
+                    "attn_implementation": "sdpa",
+                    "ds_config": {"data_types": {"grad_accum_dtype": "fp32"}},
+                }
+            )
+        )
+    )
+    cfg = load_config(path)
+    spec = config_module.TestSpec(
+        config_id=cfg.config_id,
+        config_path=str(path),
+        config_checksum=config_checksum(cfg),
+        model=ModelSpec("synthetic-not-loaded", 1, None, 42, 1, "synthetic-not-loaded", "synthetic-only", None),
+        arms=[
+            ArmSpec(arm.name, arm.global_batch_size, 256, arm.total_tokens, arm.total_tokens, 1, 0.0)
+            for arm in arms_for(256, cfg.n_gpus)
+        ],
+        attn_implementations=["sdpa"],
+        applicable_tests=["single-step-optimizer"],
+    )
+    if damage == "identity":
+        spec.config_id = "foreign-config"
+    elif damage == "checksum":
+        spec.config_checksum = "0" * 64
+    elif damage == "rows":
+        spec.arms[0].global_batch_size += 1
+    elif damage == "attention":
+        spec.attn_implementations = ["unreviewed"]
+    candidate = tmp_path / "reviewed.json"
+    spec.write(candidate)
+    before_spec = candidate.read_bytes()
+    original_config = copy.deepcopy(cfg.sub_job)
+    monkeypatch.setattr(execution, "_configure_regression_target", lambda args: args)
+    monkeypatch.setattr(execution, "_resolve_configs", lambda *a, **kw: [path])
+    monkeypatch.setattr(execution, "load_config", lambda *a: cfg)
+    monkeypatch.setattr(execution, "_run_vocab_size", lambda *a, **kw: 128)
+    captured = []
+    reported = []
+
+    def finish(results, *args, **kwargs):
+        reported.extend(results)
+        return 0 if len(captured) == 1 else 1
+
+    def target(config, spec, arms, **kwargs):
+        captured.append(arms)
+        return []
+
+    monkeypatch.setattr(execution, "_finish", finish)
+    args = execution.parse_args(
+        [
+            "run",
+            "--config",
+            str(path),
+            "--test",
+            "single-step-optimizer",
+            "--test-spec",
+            str(candidate),
+            "--base-url",
+            "http://127.0.0.1:8003",
+            "--out",
+            str(tmp_path / "report"),
+            *(["--tokens", str(requested_tokens)] if requested_tokens is not None else []),
+        ]
+    )
+    status = execution._run_configs(args, executor=target)
+    if requested_tokens == 256 and damage is None:
+        assert status == 0 and not reported
+        assert [(arm.global_batch_size, arm.max_seq_len) for arm in captured[0]] == [(8, 256), (32, 256)]
+    else:
+        assert status != 0 and captured == []
+        assert len(reported) == 1 and reported[0].outcome is Outcome.FAIL
+    assert candidate.read_bytes() == before_spec
+    assert cfg.sub_job == original_config
+
+
 # Data fast storage.
 
 
@@ -23169,6 +23310,7 @@ _SELFTEST_AUTO_FIXTURES = {
     "model_fixtures": [],
     "optimizer_math": [],
     "onboarding_storage": ["_synthetic_onboarding_environment"],
+    "checkpoint_state": [],
     "local_transport": [],
     "runtime_clients": ["_synthetic_runtime_inputs", "_external_operator_catalog"],
     "remaining_checkpoint_resume_checkpoint_state": (),
@@ -27676,3 +27818,208 @@ def test_remaining_checkpoint_onprem_runner_forwards_reviewed_spec_to_transport(
             {"slots": 4, "attn_implementation": "sdpa", "spec": spec},
         )
     ]
+
+
+_local_creation_batch_error = (
+    "AssertionError: Check batch related parameters. train_batch_size is not equal to "
+    "micro_batch_per_gpu * gradient_acc_step * world_size 8 != 1 * 1 * 2.0"
+)
+
+
+@pytest.mark.parametrize("encoding", ["mapping", "json", "http-repr", "human-log", "inline-msg"])
+def test_local_cortex_creation_failure_reports_owned_deepspeed_cause(tmp_path, encoding):
+    child = "owned-native-child"
+    path = tmp_path / "training-zone-control.log"
+    remote_traceback = (
+        "Traceback (most recent call last):\n"
+        '  File "deepspeed/runtime/config.py", line 1000, in _batch_assertion\n'
+        "    assert train_batch == micro_batch * grad_acc * self.world_size\n"
+        + _local_creation_batch_error
+    )
+    if encoding == "human-log":
+        text = f"12:00:00 ERROR [zone] Failed to create job {child}\n{remote_traceback}\n12:00:01 INFO done\n"
+    elif encoding == "inline-msg":
+        text = json.dumps({"msg": f"Failed to create job {child}\n{remote_traceback}"}) + "\n"
+    else:
+        text = json.dumps({"msg": f"Failed to create job {child}", "exc": remote_traceback}) + "\n"
+    path.write_text(text)
+    detail = {
+        "message": f"job {child} failed",
+        "zone_id": path.stem,
+        "zone_log_path": str(path),
+        "init_debug": None,
+    }
+    reason = (
+        json.dumps({"detail": detail})
+        if encoding == "json"
+        else f"sub-job training failed: 500: {detail!r}" if encoding == "http-repr" else detail
+    )
+    result = cortex_fixture._local_creation_failure(reason, {"training": child})
+    assert result.startswith(f"Remote server error: {_local_creation_batch_error}\n")
+    assert f"Server log: {path}" in result and remote_traceback in result
+    assert "INFO done" not in result
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Failed to create job owned-native-child-extra\n",
+        "Failed to create job owned-native-child \n",
+        "Failed to create job unrelated-child\n",
+        "prefix Failed to create job owned-native-child\n",
+        "Failed to create job owned-native-child: ",
+    ],
+)
+def test_local_cortex_creation_failure_rejects_inline_message_near_prefixes(message):
+    record = json.dumps({"msg": message + _local_creation_batch_error})
+    assert cortex_fixture._creation_failure_traceback(record, "owned-native-child") is None
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "different-child",
+        "different-message-child",
+        "different-zone",
+        "missing",
+        "directory",
+        "symlink",
+        "unreadable",
+        "malformed-reason",
+        "oversized-reason",
+        "no-traceback",
+    ],
+)
+def test_local_cortex_creation_failure_never_attributes_unrelated_or_unreadable_log(tmp_path, monkeypatch, broken):
+    child = "owned-native-child"
+    path = tmp_path / "training-zone-control.log"
+    detail = {"message": f"job {child} failed", "zone_id": path.stem, "zone_log_path": str(path)}
+    if broken == "directory":
+        path.mkdir()
+    elif broken != "missing":
+        path.write_text(
+            json.dumps(
+                {
+                    "msg": f"Failed to create job {('unrelated-child' if broken == 'different-child' else child)}",
+                    "exc": "no exception in this record" if broken == "no-traceback" else _local_creation_batch_error,
+                }
+            )
+            + "\n"
+        )
+    if broken == "different-message-child":
+        detail["message"] = "job unrelated-child failed"
+    elif broken == "different-zone":
+        detail["zone_id"] = "training-zone-unrelated"
+    elif broken == "symlink":
+        link = tmp_path / "training-zone-link.log"
+        link.symlink_to(path)
+        detail.update(zone_id=link.stem, zone_log_path=str(link))
+    elif broken == "unreadable":
+        original_open = os.open
+
+        def opened(value, *args, **kwargs):
+            if Path(value) == path:
+                raise PermissionError("unreadable control")
+            return original_open(value, *args, **kwargs)
+
+        monkeypatch.setattr(cortex_fixture.os, "open", opened)
+    reason = (
+        "sub-job failed: {malformed}"
+        if broken == "malformed-reason"
+        else "{" + "x" * 65536 if broken == "oversized-reason" else detail
+    )
+    assert cortex_fixture._local_creation_failure(reason, {"training": child}) is None
+
+
+def test_local_cortex_creation_failure_selects_exact_json_record_and_bounds_log_read(tmp_path):
+    path = tmp_path / "training-zone-control.log"
+    child = "owned-native-child"
+    path.write_text(
+        "x" * (1 << 20)
+        + "\n"
+        + json.dumps({"msg": f"Failed to create job {child}", "exc": _local_creation_batch_error})
+        + "\n"
+        + json.dumps({"msg": "Failed to create job unrelated-child", "exc": "ValueError: stale unrelated failure"})
+        + "\n"
+    )
+    result = cortex_fixture._local_creation_failure(
+        {"message": f"job {child} failed", "zone_id": path.stem, "zone_log_path": str(path)},
+        {"training": child},
+    )
+    assert _local_creation_batch_error in result
+    assert "stale unrelated failure" not in result and len(result) < 2000
+
+
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("recoverable", [False, True])
+def test_local_cortex_creation_failure_real_poll_preserves_cause_and_banner(
+    tmp_path, monkeypatch, capsys, local, recoverable
+):
+    from arctic_platform.correctness.onboarding import onboard
+
+    child = "owned-native-child"
+    path = tmp_path / "training-zone-control.log"
+    path.write_text(json.dumps({"msg": f"Failed to create job {child}", "exc": _local_creation_batch_error}))
+    transport = object.__new__(CorrectnessCortexTransport)
+    transport.config = CortexConfig(base_url="http://127.0.0.1:8003" if local else "http://remote.test")
+    transport.poll_interval = 0.1
+    transport.job_id = "owned-parent"
+    transport._native_children = {"training": child}
+    detail = {"message": f"job {child} failed", "zone_id": path.stem, "zone_log_path": str(path)}
+    if not recoverable:
+        detail["zone_log_path"] = str(tmp_path / "missing.log")
+    monkeypatch.setattr(CortexTransport, "_job", lambda self: {"status": "failed", "reason": detail})
+    with pytest.raises(RuntimeError) as caught:
+        transport._wait_running()
+    reason = str(caught.value)
+    assert "terminal state 'failed'" in reason
+    if local and recoverable:
+        assert reason.startswith(f"Remote server error: {_local_creation_batch_error}\n")
+        assert isinstance(caught.value.__cause__, RuntimeError)
+    else:
+        assert "Remote server error:" not in reason
+    onboard._onboarding_failure(reason)
+    assert reason.splitlines()[0] in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("unsafe_cleanup", [False, True])
+def test_onboarding_target_creation_error_leads_final_banner_and_preserves_unsafe_stop(
+    tmp_path, monkeypatch, capsys, unsafe_cleanup
+):
+    from arctic_platform.correctness.onboarding import onboard
+
+    args = execution.parse_args(["onboard", "--config", str(tmp_path / "model.json"), "--test", "single-step-grads"])
+    args.output_dir = tmp_path
+    args.checkout_root = tmp_path
+    cause = f"Remote server error: {_local_creation_batch_error}"
+    reason = cause + "\nServer log: /tmp/raydss/training-zone-control.log"
+    if unsafe_cleanup:
+        reason = "UnsafeCleanupError: Original workload failed: RuntimeError: " + reason
+
+    def child(command, **kwargs):
+        out = args.output_dir / "validation" / "4-layers"
+        (out / "report.json").write_text(
+            json.dumps(
+                {
+                    "totals": {"error": 1},
+                    "results": [{"test_id": args.test_id, "arm": "gas1", "outcome": "error", "reason": reason}],
+                }
+            )
+        )
+        (out / "batch.json").write_text(json.dumps({"stopped_unsafe": unsafe_cleanup}))
+        return SimpleNamespace(stdout=io.StringIO(reason + "\n"), wait=lambda: 1)
+
+    monkeypatch.setattr(onboard.subprocess, "Popen", child)
+    error_type = operator_interface_UnsafeCleanupError if unsafe_cleanup else RuntimeError
+    with pytest.raises(error_type, match="8 != 1") as caught:
+        validation = onboard._run_final_regression(args, {"layers": 4})
+        onboard._require_validation_pass(validation, "final 4-layer regression")
+    assert str(caught.value).splitlines()[0] == f"single-step-grads / gas1: {reason.splitlines()[0]}"
+    assert "Server log:" in str(caught.value) and "Complete log:" in str(caught.value)
+    if unsafe_cleanup:
+        assert "Further onboarding stopped" in str(caught.value)
+        assert not (tmp_path / "validation" / "4-layers" / "validation.json").exists()
+    onboard._onboarding_failure(str(caught.value))
+    printed = capsys.readouterr().err
+    assert f"!!!!! ONBOARDING FAILED : {str(caught.value).splitlines()[0]} !!!!!" in printed
+    assert "8 != 1 * 1 * 2.0" in printed
