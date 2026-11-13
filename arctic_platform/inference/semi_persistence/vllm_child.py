@@ -681,11 +681,75 @@ def _semip_param_tensors(worker, state=None):
     for ns, model in models:
         for name, view in _semip_unregistered_storages(model, f"{ns}:s:", excluded, ranges):
             excluded.add(view.untyped_storage().data_ptr())
-            if _semip_weight_like(name):
+            if _semip_weight_like(name) and name not in getattr(worker, "_semip_volatile", ()):
                 t[name] = view
             elif state is not None:
                 state.append((name, view))
     return t
+
+
+# Words per checksum chunk.  Integer sums upcast a copy of their input to
+# int64, so the chunk bounds that copy (32 MiB) however large the storage.
+_DIGEST_CHUNK = 1 << 22
+
+
+def _semip_digest(view):
+    """Content checksum of a GPU storage, computed on the device: the sum of
+    its words and their position-weighted sum, so a permutation (reordered
+    indices) shows too.  Both wrap mod 2**64."""
+    flat = view.reshape(-1)
+    if flat.numel() % 4 == 0:
+        flat = flat.view(torch.int32)
+    n = flat.numel()
+    total = torch.zeros((), dtype=torch.int64, device=flat.device)
+    weighted = torch.zeros((), dtype=torch.int64, device=flat.device)
+    pos = torch.arange(1, min(n, _DIGEST_CHUNK) + 1, dtype=torch.int64,
+                       device=flat.device)
+    for start in range(0, n, _DIGEST_CHUNK):
+        chunk = flat[start:start + _DIGEST_CHUNK].to(torch.int64)
+        s = chunk.sum()
+        total += s
+        weighted += s * start + chunk.mul_(pos[:chunk.numel()]).sum()
+    return int(total.item()), int(weighted.item())
+
+
+def _semip_weight_like_digests(worker):
+    """Checksums of the weight-like storages outside named_parameters()."""
+    return {name: _semip_digest(view)
+            for name, view in _semip_param_tensors(worker).items() if ":s:" in name}
+
+
+def _semip_record_weight_digests(worker):
+    """At the end of init: what the weight-like storages hold before serving."""
+    worker._semip_weight_digests = _semip_weight_like_digests(worker)
+    return len(worker._semip_weight_digests)
+
+
+def _semip_check_weight_digests(worker):
+    """Weights do not change while the engine serves; scratch does.  A
+    weight-like storage whose contents changed since init (the dump's warm-up
+    generate ran in between) is moved to per-config state, so it cannot fork
+    the weight hash.
+
+    Once per process, and the verdict is taken before the storages are read:
+    a restored engine inherits it with the image, and its weights are still
+    asleep (unmapped) when it attaches."""
+    before = getattr(worker, "_semip_weight_digests", None)
+    if before is None or getattr(worker, "_semip_digests_checked", False):
+        return []
+    worker._semip_digests_checked = True
+    worker._semip_weight_digests = None
+    after = _semip_weight_like_digests(worker)
+    moved = sorted(n for n, d in after.items() if n in before and before[n] != d)
+    _semip_mark_volatile(worker, moved)
+    return moved
+
+
+def _semip_mark_volatile(worker, names):
+    """Treat ``names`` as state from now on.  Every rank gets the union of
+    what any rank saw change, so the ranks agree on what a weight is."""
+    worker._semip_volatile = set(getattr(worker, "_semip_volatile", ())) | set(names)
+    return len(worker._semip_volatile)
 
 
 def _semip_state_views(worker):
@@ -4661,10 +4725,32 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                              for c in _cold])
                     log.info("  compile cache before dump: %s",
                              _compile_cache_fingerprint())
+                try:
+                    llm.collective_rpc(_semip_record_weight_digests)
+                except Exception:  # noqa: BLE001 - the check is best effort
+                    log.warning("  weight-like storage checksums failed; "
+                                "skipping the volatility check", exc_info=True)
 
             elif cmd == "attach":
                 if llm is None:
                     raise RuntimeError("attach requires init first")
+                try:
+                    _moved = sorted(set().union(
+                        *llm.collective_rpc(_semip_check_weight_digests)))
+                    if _moved:
+                        llm.collective_rpc(_semip_mark_volatile, args=(_moved,))
+                        log.warning(
+                            "  %d storage(s) outside named_parameters() look like "
+                            "weights by name but changed between init and attach "
+                            "(the warm-up generate wrote them), so they are staged "
+                            "as per-config state, not into the weight set (narrow "
+                            "_WEIGHT_LIKE_PATH so it does not match them): "
+                            "%s%s", len(_moved), _moved[:8],
+                            " ..." if len(_moved) > 8 else "")
+                except Exception:  # noqa: BLE001 - the check is best effort
+                    log.warning("  weight-like storage volatility check failed; "
+                                "scratch named like a weight may be in the "
+                                "weight set", exc_info=True)
                 # Each worker allocates a plain (unpinned) CPU buffer sized to
                 # its own shard and records the param layout on itself; pinning
                 # is the explicit repin step.  Per-worker byte counts are
