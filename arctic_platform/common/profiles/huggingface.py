@@ -54,6 +54,7 @@ def register(registry: Registry) -> None:
             "numerics.fp32_parity",
             "numerics.fp32_residual",
             "liger",
+            "shard_dense",
             "attention.backend",
             "compile.fullgraph",
             "peft",

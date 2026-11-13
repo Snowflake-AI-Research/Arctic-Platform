@@ -44,6 +44,7 @@ def register(registry: Registry) -> None:
             "moe.comm_sms",
             "moe.comm_token_chunk",
             "moe.frozen_expert_offload",
+            "moe.shard_frozen_dense",
             "moe.w4a8_experts",
             "moe.w8a8_experts",
             "moe.ultraep_spares",
@@ -57,6 +58,7 @@ def register(registry: Registry) -> None:
             "numerics.fp32_parity",
         ],
         unsupported={
+            "shard_dense": "the huggingface loader's option (patches.dense_shard)",
             "numerics.fp32_residual": "this loader has no fp32_residual option; only huggingface has one",
             "numerics.fp32_routed_weighting": "no fp32_routed_weighting option; see glm5_next, qwen4_exp",
             "lm_head.vocab_chunk_size": "no equivalent option",

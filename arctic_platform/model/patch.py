@@ -41,6 +41,7 @@ PATCH_ORDER: tuple[str, ...] = (
     "lm_head",
     "zorro_train",
     "peft",
+    "dense_shard",
 )
 
 _PATCHES: dict[str, Patch] = {}
