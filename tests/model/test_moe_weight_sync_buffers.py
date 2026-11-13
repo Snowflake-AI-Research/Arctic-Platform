@@ -244,3 +244,19 @@ def test_checkpoint_export_keeps_persistent_buffers_and_weight_sync_omits_them(
         assert actual_tensor.device == expected_tensor.device
         assert actual_tensor.data_ptr() == expected_tensor.data_ptr()
         assert actual_tensor.tolist() == expected_tensor.tolist()
+
+
+def test_weight_sync_skip_rule_reads_the_tensor_and_its_module():
+    from arctic_platform.model.implementations.moe.vllm_weights import weight_sync_skip_rule
+
+    model = nn.Module()
+    model.table = nn.Module()
+    model.table._dss_skip_weight_sync = True
+    model.table.weight = nn.Parameter(torch.ones(2), requires_grad=False)
+    model.table.child = nn.Linear(2, 2)  # the mark covers the module's own tensors only
+    model.frozen = nn.Parameter(torch.ones(2), requires_grad=False)
+    model.frozen._dss_skip_weight_sync = True
+    model.trained = nn.Parameter(torch.ones(2))
+
+    skipped = weight_sync_skip_rule(model)
+    assert {name for name, tensor in model.named_parameters() if skipped(tensor)} == {"table.weight", "frozen"}

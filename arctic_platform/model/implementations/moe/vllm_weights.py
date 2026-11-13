@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from collections.abc import Iterator
 
 import torch
@@ -34,6 +35,19 @@ def named_weight_sync_tensors(
             continue
         if buffer_name not in owning_module._non_persistent_buffers_set:
             yield name, buffer
+
+
+def weight_sync_skip_rule(model: nn.Module) -> Callable[[torch.Tensor], bool]:
+    """``tensor -> True`` for tensors a weight sync leaves out: marked ``_dss_skip_weight_sync`` themselves, or held
+    directly by a module so marked. Frozen checkpoint state the sampler keeps from its own load (DeepSeek-V4.1's
+    Engram tables, Qwen3.8's n-gram table); the marks survive the EP sharding and the DTensor unwrap."""
+    skipped = {
+        id(parameter)
+        for module in model.modules()
+        if getattr(module, "_dss_skip_weight_sync", False)
+        for parameter in module.parameters(recurse=False)
+    }
+    return lambda tensor: getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped
 
 
 def raise_unmapped_mlp_keys(packer: str, leftover: list[str]) -> None:
@@ -223,9 +237,13 @@ def build_iter_full_vllm_weights(model: nn.Module):
 
     def _iter():
         is_master = dist.get_rank() == 0
+        # The sampler keeps these from its own load. DeepSeek-V4.1's Engram table could not be gathered anyway: NCCL has
+        # no type for its UE8M0 scales, and its EP shards are uneven.
+        skipped = weight_sync_skip_rule(model)
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
         for name, tensor in named_weight_sync_tensors(model, include_export_buffers=False):
-            by_layer.setdefault(_layer_idx(name), []).append((name, tensor))
+            if not skipped(tensor):
+                by_layer.setdefault(_layer_idx(name), []).append((name, tensor))
 
         def export_layer(layer_idx: int, tensors: list[tuple[str, torch.Tensor]]):
             layer_sd: dict[str, torch.Tensor] = {}
