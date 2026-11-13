@@ -239,19 +239,12 @@ def build_iter_full_hf_weights(model: nn.Module):
     def iterator(*, include_skipped: bool = False):
         is_master = dist.get_rank() == 0
         from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
+        from arctic_platform.model.implementations.moe.vllm_weights import weight_sync_skip_rule
 
-        skipped_parameter_ids = {
-            id(parameter)
-            for module in model.modules()
-            if getattr(module, "_dss_skip_weight_sync", False)
-            for parameter in module.parameters(recurse=False)
-        }
+        skipped = weight_sync_skip_rule(model)
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
         for name, tensor in named_weight_sync_tensors(model, include_export_buffers=include_skipped):
-            if not include_skipped and (
-                getattr(tensor, "_dss_skip_weight_sync", False)
-                or id(tensor) in skipped_parameter_ids
-            ):
+            if not include_skipped and skipped(tensor):
                 continue
             hf_name = hf_export_param_name(name)
             if hf_name is not None:
@@ -265,7 +258,7 @@ def build_iter_full_hf_weights(model: nn.Module):
                     # Only the master's EP replica participates; gather its shards into bounded CPU output.
                     if 0 not in dist.get_process_group_ranks(ep_group):
                         continue
-                    if getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped_parameter_ids:
+                    if skipped(tensor):
                         local = tensor.data.contiguous()
                         world = dist.get_world_size(group=ep_group)
                         full = _gather_to_master(local, world, ep_group, is_master)

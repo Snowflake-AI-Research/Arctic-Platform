@@ -1155,3 +1155,57 @@ def test_vllm_ep_export_frees_each_gather_before_the_next(monkeypatch, rank):
     assert len(gathered) == 12  # 2 layers x 3 expert tensors x 2 buffers
     assert at_allocation == [0] * 12
     assert not any(at_yield) and bool(at_yield) == (rank == 0)
+
+
+def test_vllm_export_leaves_out_tensors_marked_skip_weight_sync(monkeypatch):
+    """Tensors marked ``_dss_skip_weight_sync`` (on the tensor or its module) are neither gathered nor yielded."""
+    import deepspeed.utils.groups as ds_groups
+
+    from arctic_platform.model.implementations.moe.deepspeed_integration import tag_expert_params_for_deepspeed
+    from arctic_platform.model.implementations.moe.vllm_weights import build_iter_full_vllm_weights
+    from arctic_platform.model.implementations.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from arctic_platform.model.implementations.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+
+    model = Qwen3MoeForCausalLM(
+        Qwen3MoeConfig(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+            num_experts=4,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            use_grouped_mm=False,
+            attn_implementation="sdpa",
+        )
+    )
+    table = nn.Module()  # this rank's rows of an EP-sharded frozen table, as DeepEPShardParallel leaves them
+    table._dss_skip_weight_sync = table._dss_ep_sharded = True
+    table.weight = nn.Parameter(torch.zeros(3, 4, dtype=torch.float8_e4m3fn), requires_grad=False)
+    table.scale = nn.Parameter(torch.zeros(3, 1, dtype=torch.uint8).view(torch.float8_e8m0fnu), requires_grad=False)
+    model.model.layers[0].table = table
+    frozen = nn.Parameter(torch.ones(4), requires_grad=False)
+    frozen._dss_skip_weight_sync = True
+    model.model.layers[1].register_parameter("frozen", frozen)
+    tag_expert_params_for_deepspeed(model, "ep_size_2")
+    assert table.weight.allreduce is False  # gathered over EP, were it synced
+
+    gathered = []
+
+    def all_gather(outputs, local, group=None):
+        gathered.append(local.dtype)
+        for output in outputs:
+            output.copy_(local)
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+    monkeypatch.setattr(ds_groups, "_get_expert_parallel_group", lambda group_name: None)
+    names = [name for name, _ in build_iter_full_vllm_weights(model)()]
+
+    assert not [name for name in names if ".table." in name or name.endswith(".frozen")]
+    assert "model.layers.0.mlp.experts.w13_weight" in names
+    assert gathered == [torch.float32] * 6  # the two layers' w1, w2, w3 shards, nothing of the table
