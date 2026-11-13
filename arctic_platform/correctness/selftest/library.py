@@ -3631,9 +3631,10 @@ def test_onboarding_total_runtime_is_last_and_retained_in_console_log(tmp_path, 
     assert onboard.logged_run(args) == int(failure)
     captured = capsys.readouterr()
     if failure:
-        banner = "\n\n!!!!! ONBOARDING FAILED : ValueError: synthetic onboarding failure !!!!!\n\n\n"
+        banner = "\n\n!!!!! ONBOARDING FAILED : ValueError: synthetic onboarding failure !!!!!\n\n"
         assert banner in captured.err
         assert banner in (args._diagnostics_dir / "onboarding.log").read_text()
+        assert f"Complete log: {args._diagnostics_dir / 'onboarding.log'}" in captured.err
     assert captured.out.splitlines()[-1] == "Total run time: 00:01:08"
     assert (args._diagnostics_dir / "onboarding.log").read_text().splitlines()[-1] == "Total run time: 00:01:08"
     assert "AP_CORRECTNESS_LOGDIR" not in os.environ
@@ -3731,7 +3732,7 @@ def test_operator_api_mixed_batch_continues_and_retains_every_pair(tmp_path, mon
     assert result.exit_code == 1 and (not result.stopped_unsafe)
     assert len(result.results) == 3
     assert "ReferencePrerequisiteError" in (tmp_path / "full.log").read_text()
-    assert "Traceback" not in capsys.readouterr().out
+    assert "ReferencePrerequisiteError: prepared reference missing" in capsys.readouterr().out
     assert (tmp_path / "batch.json").is_file()
 
 
@@ -3833,7 +3834,9 @@ def test_operator_api_logger_traceback_is_saved_and_handlers_are_restored(tmp_pa
     )
     assert result.cases[0]["status"] == "blocked"
     assert "Traceback" in (tmp_path / "full.log").read_text()
-    assert "Traceback" not in capsys.readouterr().err
+    console = capsys.readouterr()
+    assert "ReferencePrerequisiteError: missing prepared identity" in console.out
+    assert "Traceback" not in console.err
     assert root.handlers == previous
 
 
