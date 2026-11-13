@@ -16,13 +16,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import logging
 import os
 from collections.abc import Callable
+from collections.abc import Collection
 from collections.abc import Iterable
 from collections.abc import Iterator
+from collections.abc import Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -68,6 +72,46 @@ def transfer_weight_export(source: nn.Module, target: nn.Module) -> None:
 
 def weight_export_contract(model: nn.Module) -> WeightExportContract | None:
     return _WEIGHT_EXPORTS.get(model)
+
+
+@dataclass(frozen=True)
+class HeldParameters:
+    """Parameters a model keeps outside their owners' ``_parameters`` (node shards of them, say).
+
+    ``named_parameters(model)`` lists ``model``'s parameters as the model without that holding lists them, names and
+    order, with a placeholder for each held one; a placeholder holds no data. ``materialize(tensors)`` is a context
+    inside which the placeholders among ``tensors`` hold their whole values (it may fill them on the exporting rank
+    only); it is collective: every rank enters it with the same tensors in the same order.
+    """
+
+    named_parameters: Callable[[nn.Module], Iterator[tuple[str, torch.Tensor]]]
+    materialize: Callable[[Sequence[torch.Tensor]], AbstractContextManager[None]]
+
+
+_HELD_PARAMETERS: WeakKeyDictionary[nn.Module, HeldParameters] = WeakKeyDictionary()
+
+
+def register_held_parameters(model: nn.Module, held: HeldParameters) -> None:
+    _HELD_PARAMETERS[model] = held
+
+
+def export_named_parameters(model: nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
+    """``model.named_parameters()`` as the weight export sees them: a model's held parameters (``HeldParameters``)
+    appear under their own names, as placeholders whose data is read only inside ``materialized_parameters``."""
+    held = _HELD_PARAMETERS.get(model)
+    return held.named_parameters(model) if held is not None else model.named_parameters()
+
+
+@contextlib.contextmanager
+def materialized_parameters(model: nn.Module, tensors: Sequence[torch.Tensor]) -> Iterator[None]:
+    """Inside, the placeholders among ``tensors`` (from ``export_named_parameters``) hold their values on the exporting
+    rank. Collective: every rank passes the same tensors in the same order. A no-op for a model that holds none."""
+    held = _HELD_PARAMETERS.get(model)
+    if held is None:
+        yield
+        return
+    with held.materialize(tensors):
+        yield
 
 
 def supports_weight_format(model: nn.Module, weight_format: WeightFormat) -> bool:
@@ -202,7 +246,7 @@ def hf_sync_name_map(model: nn.Module, checkpoint_dir: str | None = None) -> dic
     if saved:
         renames: dict[str, str] = {}
         unmapped: list[str] = []
-        for name, _ in model.named_parameters():
+        for name, _ in export_named_parameters(model):
             export_name = hf_export_parameter_name(name)
             if export_name is None:
                 continue
@@ -237,8 +281,12 @@ def requires_hf_weight_sync(model: nn.Module, checkpoint_dir: str | None = None)
     contract = weight_export_contract(model)
     if contract is not None and contract.vllm is not None:
         return False
+    if contract is not None and contract.hf is not None:
+        # A family export with no direct vLLM layout (GLM-5.2 / 5.3's MoE adapter): iter_model_weights refuses
+        # weight_format="vllm" for it, so a full-weight sync has to stream the HF-named tensors.
+        return True
     # Composite VLMs (Gemma 4) load without renames, but vLLM serves model.language_model.* as language_model.model.*.
-    for name, _ in model.named_parameters():
+    for name, _ in export_named_parameters(model):
         export_name = hf_export_parameter_name(name)
         if export_name is not None and export_name.startswith("model.language_model."):
             return True
@@ -292,6 +340,58 @@ def pretrained_config_of(model: Any) -> Any:
         if config is not None and hasattr(config, "save_pretrained") and not getattr(config, "peft_type", None):
             return config
     return getattr(model, "config", None)
+
+
+def hf_export_config(model: Any, source_config: dict) -> dict:
+    """The source checkpoint's ``config.json`` as an HF export of ``model``'s weights needs it.
+
+    A model dequantized at load (``dequantize_checkpoint``: published FP8 / MXFP4 weights trained in BF16) has no
+    ``quantization_config`` of its own and exports BF16 tensors, so the export's config leaves the source's out: a
+    server reading it would build quantized parameters and copy the BF16 weights into them unscaled. A model that
+    kept its quantization (packed experts frozen under LoRA) keeps the source's. ``source_config`` is not modified.
+    """
+    config = json.loads(json.dumps(source_config))
+    if getattr(pretrained_config_of(model), "quantization_config", None) is None:
+        config.pop("quantization_config", None)
+        text_config = config.get("text_config")
+        if isinstance(text_config, dict):
+            text_config.pop("quantization_config", None)
+    return config
+
+
+def iter_hf_source_tensors(
+    model: nn.Module, source_model_dir: str, *, skip: Collection[str] = ()
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Source checkpoint tensors an HF export of ``model`` carries over unchanged, as ``(name, tensor)``.
+
+    These are the published tensors under the family's ``hf_export_source_prefixes`` (DeepSeek-V4.1: the vision
+    tower, aligner and image embeddings, which the text model drops at load but vLLM always builds), read from
+    ``source_model_dir`` one tensor at a time. Names in ``skip`` (the ones the export already wrote) are left out;
+    ``skip`` is read when the first tensor is requested, so an export can pass the set it is still filling.
+    """
+    prefixes = tuple(getattr(type(_family_model_for_export(model)), "hf_export_source_prefixes", ()) or ())
+    if not prefixes:
+        return
+    from safetensors import safe_open
+
+    index = os.path.join(source_model_dir, "model.safetensors.index.json")
+    if os.path.isfile(index):
+        with open(index) as f:
+            weight_map = json.load(f)["weight_map"]
+    else:
+        single = os.path.join(source_model_dir, "model.safetensors")
+        if not os.path.isfile(single):
+            raise FileNotFoundError(f"no safetensors checkpoint in {source_model_dir!r} to copy {prefixes} from")
+        with safe_open(single, framework="pt") as f:
+            weight_map = dict.fromkeys(f.keys(), "model.safetensors")
+    by_file: dict[str, list[str]] = {}
+    for name, file in sorted(weight_map.items()):
+        if name.startswith(prefixes) and name not in skip:
+            by_file.setdefault(file, []).append(name)
+    for file, names in sorted(by_file.items()):
+        with safe_open(os.path.join(source_model_dir, file), framework="pt") as f:
+            for name in names:
+                yield name, f.get_tensor(name)
 
 
 def checkpoint_peft_adapter_dir(model_dir: str) -> str | None:
@@ -419,7 +519,12 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
     os.makedirs(adapter_dir, exist_ok=True)
     model.save_pretrained(adapter_dir, state_dict=state, safe_serialization=True, save_embedding_layers=False)
     # The sampler loads this pack into vLLM as is, so families whose served module names differ rename here.
-    rename = getattr(type(_family_model_for_export(model)), "vllm_lora_name", None) or (lambda name: name)
+    family = type(_family_model_for_export(model))
+    rename = getattr(family, "vllm_lora_name", None) or (lambda name: name)
+    # Families whose served MoE takes expert LoRA per expert ({parameter: served projection}) get their
+    # target_parameters LoRAs (PEFT's 3-D layout) written as {experts}.{e}.{projection}.lora_{A,B}.weight.
+    expert_projections = getattr(family, "vllm_lora_expert_projections", None) or {}
+    wrappers = _param_wrappers(model)
     # PEFT must select against live wrapped names before we make the pack portable.
     for adapter_name in model.peft_config:
         output_dir = adapter_dir if adapter_name == "default" else os.path.join(adapter_dir, adapter_name)
@@ -429,13 +534,29 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
             saved_names = list(handle.keys())
             portable = {}
             renamed = False
+            stacked_left = False  # a tensor still in PEFT's 3-D expert layout
             for name in saved_names:
                 unwrapped = strip_activation_checkpoint_segments(name)
-                export_name = rename(unwrapped)
-                renamed = renamed or export_name != unwrapped
-                if export_name in portable:
-                    raise ValueError(f"PEFT checkpoint names collide after unwrapping: {export_name}")
-                portable[export_name] = handle.get_tensor(name)
+                module_name, _, leaf = unwrapped.rpartition(".lora_")
+                parameter_name, num_experts = wrappers.get(module_name, (None, 0))
+                projection = expert_projections.get(parameter_name) if num_experts > 1 else None
+                if projection is None:
+                    exports = {rename(_parameter_lora_name(unwrapped, wrappers)): handle.get_tensor(name)}
+                    stacked_left = stacked_left or num_experts > 1
+                else:
+                    kind = leaf.split(".", 1)[0]
+                    rank = _peft_adapter_rank(model, f"lora_{kind}.{adapter_name}.weight")
+                    stacked = _reshape_expert_lora_for_ep(handle.get_tensor(name), kind, rank, label=unwrapped)
+                    experts = _unnested(module_name)
+                    exports = {
+                        rename(f"{experts}.{expert}.{projection}.lora_{kind}.weight"): stacked[expert].clone()
+                        for expert in range(stacked.shape[0])
+                    }
+                for export_name, tensor in exports.items():
+                    renamed = renamed or export_name != unwrapped
+                    if export_name in portable:
+                        raise ValueError(f"PEFT checkpoint names collide after unwrapping: {export_name}")
+                    portable[export_name] = tensor
         if len(portable) == 0:
             raise ValueError(f"PEFT saved an empty adapter: {adapter_name}")
         if list(portable) == saved_names:
@@ -445,16 +566,55 @@ def save_peft_adapters(model: nn.Module, checkpoint_dir: str, *, is_zero3: bool 
             save_file(portable, temporary_path, metadata=metadata)
             os.replace(temporary_path, weights_path)
         if renamed:
-            _rewrite_adapter_target_modules(output_dir, portable)
+            _rewrite_adapter_target_modules(output_dir, portable, drop_target_parameters=not stacked_left)
 
 
-def _rewrite_adapter_target_modules(output_dir: str, names: Iterable[str]) -> None:
+def _param_wrappers(model: nn.Module) -> dict[str, tuple[str, int]]:
+    """``{module name without activation-checkpoint segments: (parameter name, experts)}`` of every PEFT
+    ``ParamWrapper`` (a ``target_parameters`` LoRA) in ``model``; nested wrappers of one module end in
+    ``.base_layer``, and ``experts`` is 1 for a parameter that is not an expert stack."""
+    try:
+        from peft.tuners.lora.layer import ParamWrapper
+    except ImportError:
+        return {}
+    return {
+        strip_activation_checkpoint_segments(name): (module.parameter_name, module.num_experts)
+        for name, module in model.named_modules()
+        if isinstance(module, ParamWrapper)
+    }
+
+
+def _unnested(module_name: str) -> str:
+    while module_name.endswith(".base_layer"):
+        module_name = module_name.removesuffix(".base_layer")
+    return module_name
+
+
+def _parameter_lora_name(name: str, wrappers: dict[str, tuple[str, int]]) -> str:
+    """``{module}.lora_{A,B}.weight`` of a LoRA on a parameter of a module that is not an expert stack (e.g. a shared
+    expert's w1, through target_parameters) as ``{module}.{parameter}.lora_{A,B}.weight``. PEFT names it after its
+    wrapper, one ``.base_layer`` deeper for each later parameter targeted on the module (a shared expert's w1 / w2 /
+    w3 are ``shared_expert.base_layer.base_layer`` / ``shared_expert.base_layer`` / ``shared_expert``), which no
+    served module is; families rename ``{module}.{parameter}`` to their served projection. Other names unchanged."""
+    module_name, _, leaf = name.rpartition(".lora_")
+    parameter_name, num_experts = wrappers.get(module_name, (None, 0))
+    if parameter_name in (None, "weight") or num_experts != 1:
+        return name
+    return f"{_unnested(module_name)}.{parameter_name}.lora_{leaf}"
+
+
+def _rewrite_adapter_target_modules(
+    output_dir: str, names: Iterable[str], *, drop_target_parameters: bool = False
+) -> None:
     config_path = os.path.join(output_dir, "adapter_config.json")
     with open(config_path) as f:
         config = json.load(f)
     config["target_modules"] = sorted(
         {name.split(".lora_", 1)[0].rsplit(".", 1)[-1] for name in names if ".lora_" in name}
     )
+    if drop_target_parameters:
+        # The expert LoRAs are per-expert modules now; the sampler reads target_parameters as the 3-D layout.
+        config.pop("target_parameters", None)
     with TemporaryDirectory(prefix=".adapter-", dir=output_dir) as temporary_dir:
         temporary_path = os.path.join(temporary_dir, "adapter_config.json")
         with open(temporary_path, "w") as f:
@@ -644,10 +804,11 @@ def iter_lora_weights(
         elif is_master:
             yield rename(_expert_lora_vllm_key(prefix, weight_name, kind)), local
 
+    wrappers = _param_wrappers(model)
     for name, parameter in model.named_parameters():
         if not is_peft_lora_param(name, parameter) or id(parameter) in expert_parameter_ids:
             continue
-        export_name = rename(_peft_lora_parameter_to_vllm_name(name))
+        export_name = rename(_parameter_lora_name(_peft_lora_parameter_to_vllm_name(name), wrappers))
         if _is_ep_sharded_parameter(parameter):
             import torch.distributed as dist
 
