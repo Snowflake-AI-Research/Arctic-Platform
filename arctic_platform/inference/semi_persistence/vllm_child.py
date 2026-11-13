@@ -34,7 +34,7 @@ here would be copied by value per worker and its writes discarded; each
 rank also owns a different shard of the parameters.  The same code path
 serves TP=1, where the single worker is in-process.
 """
-import ctypes, json, os, shutil, subprocess, sys, threading, time
+import ctypes, json, os, re, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -639,8 +639,26 @@ def _semip_unregistered_storages(module, prefix, excluded, ranges, max_depth=8):
     return found
 
 
-def _semip_param_tensors(worker):
-    """Every tensor the host copy holds, by namespaced name, in layout order."""
+# Which weight-pool storages outside named_parameters() are weights.  Only
+# those go into the weight set, whose bytes key ``weights_hash``: the rest is
+# scratch whose size or contents follow the engine config or the run (sparse
+# attention top-k buffers sized by max_num_batched_tokens / max_num_seqs, GEMM
+# lock workspaces, staged rows, prefetch ids, KV scales), and in the weight set
+# it forked the hash of every config and backend.  It is still staged, as
+# per-config state that rides the CRIU image (_semip_stage_state).  Anything
+# not recognised as a weight is state, so a miss costs sharing, not a restore.
+_WEIGHT_LIKE_PATH = re.compile(r"(^|\.)\w*weight(_scale\w*)?(\.|$)")
+
+
+def _semip_weight_like(name):
+    return bool(_WEIGHT_LIKE_PATH.search(name.split(":s:", 1)[-1]))
+
+
+def _semip_param_tensors(worker, state=None):
+    """Every tensor the host copy holds, by namespaced name, in layout order.
+
+    ``state``, when given, collects the ``(name, view)`` of the weight-pool
+    storages that are not weights; they are left out of the host copy."""
     mr = worker.model_runner
     models = [("main", mr.model)]
     drafter = getattr(mr, "drafter", None)
@@ -663,8 +681,48 @@ def _semip_param_tensors(worker):
     for ns, model in models:
         for name, view in _semip_unregistered_storages(model, f"{ns}:s:", excluded, ranges):
             excluded.add(view.untyped_storage().data_ptr())
-            t[name] = view
+            if _semip_weight_like(name):
+                t[name] = view
+            elif state is not None:
+                state.append((name, view))
     return t
+
+
+def _semip_state_views(worker):
+    """``(name, view)`` of the weight-pool storages that are not weights."""
+    state = []
+    _semip_param_tensors(worker, state=state)
+    return state
+
+
+def _semip_stage_state(worker):
+    """Copy the non-weight weight-pool storages to host memory before a
+    level-2 sleep discards them.  The copy is part of the process, so it rides
+    the CRIU image with the config it belongs to."""
+    views = _semip_state_views(worker)
+    bufs = [torch.empty(v.numel(), dtype=torch.uint8) for _, v in views]
+    for buf, (_, view) in zip(bufs, views):
+        buf.copy_(view)
+    torch.cuda.synchronize()
+    worker._semip_state_bufs = (tuple(n for n, _ in views), bufs)
+    return sum(b.numel() for b in bufs)
+
+
+def _semip_restore_state(worker):
+    """Put the staged state back after restore_weights.  Nothing staged
+    (a cold start) leaves the storages as they are."""
+    staged = getattr(worker, "_semip_state_bufs", None)
+    if staged is None:
+        return 0
+    names, bufs = staged
+    views = _semip_state_views(worker)
+    if tuple(n for n, _ in views) != names or \
+            [b.numel() for b in bufs] != [v.numel() for _, v in views]:
+        raise RuntimeError("weight-pool state layout changed since it was staged")
+    for buf, (_, view) in zip(bufs, views):
+        view.copy_(buf)
+    torch.cuda.synchronize()
+    return sum(b.numel() for b in bufs)
 
 
 def _semip_layout(worker):
@@ -4663,6 +4721,10 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 if _served_core is not None and _lora_enabled():
                     staged = sum(llm.collective_rpc(_semip_stage_lora))
                     log.info("  staged %.2f MiB of LoRA state", staged / 2**20)
+                staged = sum(llm.collective_rpc(_semip_stage_state))
+                if staged:
+                    log.info("  staged %.2f MiB of weight-pool state outside "
+                             "the weight set", staged / 2**20)
                 # "keep", not the default "abort": the engine is drained, so
                 # the two pause the same, and the routed-experts connector
                 # refuses the cache reset an "abort" pause makes.
@@ -4769,6 +4831,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 if _lora_enabled():
                     lora_bytes = sum(llm.collective_rpc(_semip_restore_lora))
                     log.info("  restored %.2f MiB of LoRA state", lora_bytes / 2**20)
+                state_bytes = sum(llm.collective_rpc(_semip_restore_state))
+                if state_bytes:
+                    log.info("  restored %.2f MiB of weight-pool state", state_bytes / 2**20)
 
             elif cmd == "wake_up_kv_cache":
                 llm.wake_up(tags=["kv_cache"])

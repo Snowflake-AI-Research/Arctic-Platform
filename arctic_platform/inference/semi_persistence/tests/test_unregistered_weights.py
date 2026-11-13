@@ -15,6 +15,7 @@ which storages sit in the "weights" pool.
 from __future__ import annotations
 
 import ast
+import re
 import dataclasses
 import os
 import sys
@@ -29,7 +30,9 @@ torch = pytest.importorskip("torch")
 _PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _NAMES = ("_semip_weight_pool_ranges", "_semip_unregistered_storages",
           "_semip_param_tensors", "_semip_layout", "_semip_attach", "_semip_stage",
-          "_semip_restore_weights", "_semip_lora_manager", "_semip_lora_views")
+          "_semip_restore_weights", "_semip_lora_manager", "_semip_lora_views",
+          "_semip_weight_like", "_semip_state_views", "_semip_stage_state",
+          "_semip_restore_state")
 GiB = 2**30
 
 
@@ -109,7 +112,12 @@ def child(monkeypatch):
     funcs = [n for n in tree.body
              if isinstance(n, ast.FunctionDef) and n.name in _NAMES]
     assert {f.name for f in funcs} == set(_NAMES)
-    ns = {"torch": _Torch(), "ThreadPoolExecutor": ThreadPoolExecutor, "time": time}
+    ns = {"torch": _Torch(), "ThreadPoolExecutor": ThreadPoolExecutor, "time": time,
+          "re": re, "_WEIGHT_LIKE_PATH": None}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "_WEIGHT_LIKE_PATH"
+                                                for t in node.targets):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), path, "exec"), ns)
     exec(compile(ast.Module(body=funcs, type_ignores=[]), path, "exec"), ns)
 
     allocator = _Allocator()
@@ -253,3 +261,40 @@ def test_a_sleep_that_discards_the_experts_is_undone_by_restore(child):
 
     assert out["loaded"] == n_entries
     assert all(torch.equal(a, b) for a, b in zip(before, [*unregistered, *params]))
+
+
+def _with_scratch(allocator, tokens):
+    """A dense model plus the kind of config-sized scratch a sparse-attention
+    model keeps in the weight pool (GLM-5.3's topk_indices_buffer)."""
+    worker = _dense(allocator)
+    worker.model_runner.model.topk_indices_buffer = allocator.alloc(
+        "weights", tokens, 8)
+    return worker
+
+
+def test_config_sized_scratch_stays_out_of_the_weight_layout(child):
+    small = child._semip_layout(_with_scratch(child.allocator, 4096))
+    large = child._semip_layout(_with_scratch(child.allocator, 8192))
+    assert [r for r in small if r[0].startswith("main:p:")] == \
+        [r for r in large if r[0].startswith("main:p:")]
+    assert not any(":s:" in r[0] for r in small + large)
+    state = child._semip_state_views(_with_scratch(child.allocator, 4096))
+    assert [name for name, _ in state] == ["main:s:topk_indices_buffer"]
+
+
+def test_state_is_staged_and_put_back(child):
+    worker = _with_scratch(child.allocator, 16)
+    buf = worker.model_runner.model.topk_indices_buffer
+    expected = buf.clone()
+    assert child._semip_stage_state(worker) == buf.untyped_storage().nbytes()
+    buf.zero_()
+    assert child._semip_restore_state(worker) == buf.untyped_storage().nbytes()
+    assert torch.equal(buf, expected)
+
+
+def test_nothing_staged_leaves_state_alone(child):
+    worker = _with_scratch(child.allocator, 16)
+    buf = worker.model_runner.model.topk_indices_buffer
+    before = buf.clone()
+    assert child._semip_restore_state(worker) == 0
+    assert torch.equal(buf, before)
