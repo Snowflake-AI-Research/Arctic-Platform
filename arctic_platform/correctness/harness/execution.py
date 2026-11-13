@@ -44,6 +44,7 @@ from arctic_platform.correctness.harness.gateway import is_local_cortex_gateway
 from arctic_platform.correctness.harness.gateway import local_cortex_gateway
 from arctic_platform.correctness.harness.gateway import read_pat
 from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+from arctic_platform.correctness.harness.gateway import rl_gpu_count
 from arctic_platform.correctness.harness.storage import correctness_logdir
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import ensure_no_interrupted_builds
@@ -450,7 +451,14 @@ def _run_vocab_size(
         runnable = any(
             test.test_id in spec.applicable_tests
             and (not select or test.test_id in select)
-            and cortex_unavailable_reason(test, published_fixture) is None
+            and (
+                cortex_unavailable_reason(test, published_fixture) is None
+                or (
+                    cfg.is_rl
+                    and test.test_id in {"rl-weight-sync", "rl-router-replay"}
+                    and is_local_cortex_gateway(backend)
+                )
+            )
             for test in registered_tests().values()
         )
         if not runnable:
@@ -741,6 +749,34 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 and (not args.test or "inference-checkpoint-loss" in args.test)
             ):
                 execution[cfg.config_id]["inference_model_name"] = cfg.model_name
+            rl_select = args.test or None
+            rl_judges = selected_ids & set(spec.applicable_tests) & {"rl-weight-sync", "rl-router-replay"}
+            if rl_judges and (not remote or is_local_cortex_gateway(backend)):
+                required_gpus = rl_gpu_count(cfg)
+                rl_pool = (args.gpu_pool or required_gpus) if remote else pool
+                execution[cfg.config_id]["rl_required_gpus"] = required_gpus
+                execution[cfg.config_id]["rl_gpu_pool"] = rl_pool
+                if rl_pool < required_gpus:
+                    for test_id in sorted(rl_judges):
+                        results.append(
+                            TestResult(
+                                test_id=test_id,
+                                config_id=cfg.config_id,
+                                outcome=TestOutcome.FAIL,
+                                summary="insufficient combined RL GPU capacity",
+                                reason=(
+                                    f"training and sampling require {required_gpus} GPUs concurrently; "
+                                    f"the admitted pool has {rl_pool}"
+                                ),
+                                gpus=required_gpus,
+                            )
+                        )
+                    rl_select = [test_id for test_id in (args.test or tests) if test_id not in rl_judges]
+                    if not any(
+                        test_id in spec.applicable_tests and not tests[test_id].compares_to_reference
+                        for test_id in rl_select
+                    ):
+                        continue
             print(f"=== {cfg.config_id} (reinforcement learning) ===", flush=True)
             with _regression_gateway(args) as gateway_url:
                 if gateway_url is not None:
@@ -772,7 +808,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 vocab_size = _run_vocab_size(
                     cfg,
                     spec,
-                    args.test,
+                    rl_select,
                     backend,
                     published_fixture,
                     **(
@@ -786,7 +822,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                         cfg,
                         spec,
                         vocab_size=vocab_size,
-                        select=args.test or None,
+                        select=rl_select,
                         cases=getattr(args, "case", None),
                         attn=args.attn[0] if args.attn else None,
                         client_backend=backend,

@@ -28,3 +28,8 @@ from . import e2e_sft_train_validate
 from . import inference_checkpoint_loss
 
 __all__ += ["checkpoint_resume", "inference_checkpoint_loss", "e2e_sft_train_validate"]
+
+from . import rl_router_replay
+from . import rl_weight_sync
+
+__all__ += ["rl_router_replay", "rl_weight_sync"]

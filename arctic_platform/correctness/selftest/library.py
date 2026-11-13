@@ -25,6 +25,7 @@ import builtins
 import contextlib
 import copy
 import hashlib
+import importlib.util
 import inspect
 import io
 import itertools
@@ -97,11 +98,14 @@ from arctic_platform.client.transport import initialize_or_cleanup
 from arctic_platform.client.transports.cortex import _DEFAULT
 from arctic_platform.client.transports.cortex import CortexTransport
 from arctic_platform.client.transports.cortex import _SendPolicy
+from arctic_platform.common.utils.batch import unpack_batch
 from arctic_platform.correctness import api
 from arctic_platform.correctness.checks import checkpoint_resume
 from arctic_platform.correctness.checks import e2e_sft_train_validate as lora_training_check
 from arctic_platform.correctness.checks import fwd_bwd_step
 from arctic_platform.correctness.checks import inference_checkpoint_loss as inference_rl_check
+from arctic_platform.correctness.checks import rl_router_replay
+from arctic_platform.correctness.checks import rl_weight_sync
 from arctic_platform.correctness.checks.optimizer_state import COMPARISON_STATE_KEYS
 from arctic_platform.correctness.checks.optimizer_state import OPTIMIZER_NORM_CRITERION
 from arctic_platform.correctness.checks.optimizer_state import STATE_KEYS
@@ -120,6 +124,7 @@ from arctic_platform.correctness.harness import gateway as hosted
 from arctic_platform.correctness.harness import gateway as rl_driver
 from arctic_platform.correctness.harness import inference as export
 from arctic_platform.correctness.harness import inference as projection
+from arctic_platform.correctness.harness import inference as router_replay_trace
 from arctic_platform.correctness.harness import lora as deterministic_lora
 from arctic_platform.correctness.harness import lora as lora_init
 from arctic_platform.correctness.harness import lora as native_adapter
@@ -169,6 +174,8 @@ from arctic_platform.correctness.harness.gateway import _training_client_config
 from arctic_platform.correctness.harness.gateway import build_payload
 from arctic_platform.correctness.harness.gateway import pack
 from arctic_platform.correctness.harness.gateway import pack_logit_aligned
+from arctic_platform.correctness.harness.gateway import rl_batch
+from arctic_platform.correctness.harness.gateway import rl_gpu_count
 from arctic_platform.correctness.harness.gateway import sampling_payload
 from arctic_platform.correctness.harness.lora import canonical_name
 from arctic_platform.correctness.harness.optimizer import align
@@ -176,6 +183,7 @@ from arctic_platform.correctness.harness.optimizer import canonical_ap_tensor_gr
 from arctic_platform.correctness.harness.registry import TestOutcome
 from arctic_platform.correctness.harness.registry import TestOutcome as Outcome
 from arctic_platform.correctness.harness.registry import TestResult as Result
+from arctic_platform.correctness.harness.registry import registered_tests
 from arctic_platform.correctness.harness.report import activity
 from arctic_platform.correctness.harness.report import arm_verdict
 from arctic_platform.correctness.harness.report import write
@@ -202,6 +210,14 @@ from arctic_platform.correctness.reference.hf_single_gpu import mixer_call_input
 from arctic_platform.correctness.reference.hf_single_gpu import reference_row_groups
 from arctic_platform.correctness.reference.optimizer_step import run_adamw_step
 from arctic_platform.correctness.reference.qwen4_reference import load_qwen4_reference
+from arctic_platform.debug import training as debug_router_replay_trace
+from arctic_platform.debug import training as replay_evidence
+from arctic_platform.debug import weight_sync as broadcast
+from arctic_platform.debug import weight_sync as broadcast_evidence
+from arctic_platform.debug import weight_sync as ep
+from arctic_platform.debug import weight_sync as sampler_evidence_evidence
+from arctic_platform.debug.weight_sync import global_inventory
+from arctic_platform.debug.weight_sync import tensor_manifest
 
 # Helpers
 
@@ -26963,6 +26979,7 @@ _SELFTEST_GROUPS["checkpoint_state"] = (
     "test_checkpoint_resume_loss_range_gate_is_twice_the_range_rounded_up",
     "test_checkpoint_resume_a_zero_loss_range_still_meets_the_minimum_gate",
 )
+_SELFTEST_AUTO_FIXTURES["checkpoint_state"] = ()
 _SELFTEST_GROUPS["local_transport"] += ("test_checkpoint_resume_owned_cancellation_failure_stops_before_next_arm",)
 _SELFTEST_GROUPS["inference_checkpoint_loss"] = (
     "test_inference_checkpoint_loss_exported_checkpoint_reuses_the_validated_tokenizer",
@@ -27818,6 +27835,3147 @@ def test_remaining_checkpoint_onprem_runner_forwards_reviewed_spec_to_transport(
             {"slots": 4, "attn_implementation": "sdpa", "spec": spec},
         )
     ]
+
+
+# RL Transfer And Router Evidence Controls
+
+
+class _PackedModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.packed = torch.nn.Parameter(torch.zeros(4))
+        self.other = torch.nn.Parameter(torch.zeros(1))
+
+    def load_weights(self, weights):
+        for name, value in weights:
+            if name == "left":
+                self.packed.data[:2].copy_(value)
+            elif name == "right":
+                self.packed.data[2:].copy_(value)
+            elif name == "other":
+                self.other.data.copy_(value)
+        return None
+
+
+class _sampler_evidence_Sender:
+    def __init__(self):
+        self.seen = None
+
+    def send(self, weights):
+        self.seen = weights
+        return {"status": "done", "native_receipt": 17}
+
+
+def _verifier(model):
+    return sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=1024)
+
+
+def test_native_broadcast_training_configuration_disabled_is_unchanged(monkeypatch):
+    monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "previous")
+    ds_config = {"bf16": {"enabled": True}}
+    assert broadcast.maybe_configure_broadcast_training(ds_config) is ds_config
+    assert broadcast.os.environ[sampler_evidence_evidence.VERIFY_ENV] == "previous"
+
+
+@pytest.mark.parametrize("option", [True, False])
+def test_native_broadcast_training_configuration_consumes_only_its_option(monkeypatch, option):
+    monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "previous")
+    ds_config = {"bf16": {"enabled": True}, broadcast.TRAINING_OPTION: option}
+    before = copy.deepcopy(ds_config)
+    result = broadcast.maybe_configure_broadcast_training(ds_config)
+    assert result == {"bf16": {"enabled": True}}
+    assert ds_config == before
+    assert broadcast.os.environ[sampler_evidence_evidence.VERIFY_ENV] == ("1" if option else "previous")
+
+
+@pytest.mark.parametrize("option", ["1", 1, None, {}])
+def test_native_broadcast_training_configuration_rejects_nonboolean_opt_in(monkeypatch, option):
+    monkeypatch.delenv(sampler_evidence_evidence.VERIFY_ENV, raising=False)
+    with pytest.raises(ValueError, match="must be a boolean"):
+        broadcast.maybe_configure_broadcast_training({broadcast.TRAINING_OPTION: option})
+    assert sampler_evidence_evidence.VERIFY_ENV not in broadcast.os.environ
+
+
+def test_native_broadcast_sampling_disabled_does_not_inspect_settings():
+    sampling = object()
+    assert broadcast.maybe_configure_broadcast_sampling(sampling, verify=False) is sampling
+
+
+@pytest.mark.parametrize("extra_env", [None, {}, {sampler_evidence_evidence.VERIFY_ENV: "1", "OTHER_SETTING": "kept"}])
+def test_native_broadcast_sampling_configuration_preserves_original(extra_env):
+    from arctic_platform.client.config import SamplingConfig
+
+    sampling = SamplingConfig(vllm={"extra_env": extra_env})
+    before = sampling.model_dump()
+    result = broadcast.maybe_configure_broadcast_sampling(sampling, verify=True)
+    assert result.vllm["extra_env"] == {**(extra_env or {}), sampler_evidence_evidence.VERIFY_ENV: "1"}
+    assert sampling.model_dump() == before
+    assert result is not sampling
+
+
+@pytest.mark.parametrize("extra_env", ["invalid", [], {sampler_evidence_evidence.VERIFY_ENV: "0"}])
+def test_native_broadcast_sampling_rejects_invalid_or_conflicting_settings(extra_env):
+    sampling = SimpleNamespace(vllm={"extra_env": extra_env})
+    with pytest.raises(ValueError, match="extra_env must be an object|conflicting"):
+        broadcast.maybe_configure_broadcast_sampling(sampling, verify=True)
+
+
+@pytest.mark.parametrize(
+    ("configured", "inherited", "expected"),
+    [
+        (None, None, None),
+        (None, str(16 << 30), str(16 << 30)),
+        (str(8 << 30), None, str(8 << 30)),
+        ("01024", "1024", "1024"),
+    ],
+)
+def test_native_broadcast_sampling_propagates_explicit_shadow_limit(monkeypatch, configured, inherited, expected):
+    from arctic_platform.client.config import SamplingConfig
+
+    key = broadcast.SHADOW_MAX_BYTES_ENV
+    if inherited is None:
+        monkeypatch.delenv(key, raising=False)
+    else:
+        monkeypatch.setenv(key, inherited)
+    extra_env = {"OTHER_SETTING": "kept"}
+    if configured is not None:
+        extra_env[key] = configured
+    sampling = SamplingConfig(vllm={"extra_env": extra_env})
+    before = sampling.model_dump()
+    result = broadcast.maybe_configure_broadcast_sampling(sampling, verify=True)
+    assert result.vllm["extra_env"].get(key) == expected
+    assert result.vllm["extra_env"]["OTHER_SETTING"] == "kept"
+    assert sampling.model_dump() == before
+
+
+@pytest.mark.parametrize("invalid", ["0", "-1", "", "unlimited", "1.5", 1024, True])
+def test_native_broadcast_sampling_rejects_invalid_shadow_limit(monkeypatch, invalid):
+    key = broadcast.SHADOW_MAX_BYTES_ENV
+    monkeypatch.delenv(key, raising=False)
+    sampling = SimpleNamespace(vllm={"extra_env": {key: invalid}})
+    with pytest.raises(ValueError, match="positive integer byte limit"):
+        broadcast.maybe_configure_broadcast_sampling(sampling, verify=True)
+
+
+def test_native_broadcast_sampling_rejects_conflicting_shadow_limits(monkeypatch):
+    key = broadcast.SHADOW_MAX_BYTES_ENV
+    monkeypatch.setenv(key, str(16 << 30))
+    sampling = SimpleNamespace(vllm={"extra_env": {key: str(8 << 30)}})
+    with pytest.raises(ValueError, match="conflicting weight-sync shadow byte limits"):
+        broadcast.maybe_configure_broadcast_sampling(sampling, verify=True)
+
+
+def test_native_broadcast_sampling_rejects_invalid_parent_shadow_limit(monkeypatch):
+    monkeypatch.setenv(broadcast.SHADOW_MAX_BYTES_ENV, "unlimited")
+    sampling = SimpleNamespace(vllm={})
+    with pytest.raises(ValueError, match="positive integer byte limit"):
+        broadcast.maybe_configure_broadcast_sampling(sampling, verify=True)
+
+
+@pytest.mark.parametrize("option", [None, False, True])
+def test_native_broadcast_training_engine_consumes_opt_in_before_deepspeed(monkeypatch, option):
+    from arctic_platform.common import deepspeed_engine
+
+    monkeypatch.delenv(sampler_evidence_evidence.VERIFY_ENV, raising=False)
+    ds_config = {"bf16": {"enabled": True}}
+    if option is not None:
+        ds_config[broadcast.TRAINING_OPTION] = option
+    before = copy.deepcopy(ds_config)
+    seen = []
+
+    def initialize(**kwargs):
+        seen.append((kwargs["config"], sampler_evidence_evidence.enabled()))
+        return object(), None, None, None
+
+    monkeypatch.setitem(sys.modules, "deepspeed", SimpleNamespace(initialize=initialize))
+    monkeypatch.setattr(deepspeed_engine, "preserve_fp8_params_through_ds_cast", lambda model: (0, 0))
+    engine, optimizer, choice = deepspeed_engine.initialize_training_engine(
+        object(), ds_config, optimizer=None, ep_size=1, mpu=None, model_path="unused", rank=0
+    )
+    assert seen == [({"bf16": {"enabled": True}}, option is True)]
+    assert engine is not None and optimizer is None and choice is None
+    assert ds_config == before
+
+
+@pytest.mark.parametrize("previous", [None, "original", "1"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_native_broadcast_parent_environment_is_restored(monkeypatch, previous, fail):
+    if previous is None:
+        monkeypatch.delenv(sampler_evidence_evidence.VERIFY_ENV, raising=False)
+    else:
+        monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, previous)
+    try:
+        with broadcast.weight_sync_verification_environment():
+            assert sampler_evidence_evidence.enabled()
+            if fail:
+                raise RuntimeError("synthetic sync failure")
+    except RuntimeError:
+        assert fail
+    assert broadcast.os.environ.get(sampler_evidence_evidence.VERIFY_ENV) == previous
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.int64, torch.uint8, torch.bool])
+@pytest.mark.parametrize("layout", ["dense", "transpose", "slice", "scalar", "empty", "expanded"])
+@pytest.mark.parametrize("chunk_bytes", [16, 128, 8192])
+def test_sampler_evidence_manifest_bounded_hash_preserves_exact_bytes(monkeypatch, dtype, layout, chunk_bytes):
+    base = torch.arange(240).reshape(4, 6, 10).to(dtype)
+    value = {
+        "dense": base,
+        "transpose": base.transpose(0, 2),
+        "slice": base[:, ::2, 1::3],
+        "scalar": base[0, 0, 0],
+        "empty": base[:0],
+        "expanded": base[:1].expand(3, -1, -1),
+    }[layout]
+    expected = hashlib.sha256(value.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()).hexdigest()
+    before = value.clone()
+    digest = hashlib.sha256()
+    sizes = []
+
+    def update(raw):
+        assert isinstance(raw, memoryview)
+        sizes.append(raw.nbytes)
+        digest.update(raw)
+
+    monkeypatch.setattr(sampler_evidence_evidence, "_MANIFEST_CHUNK_BYTES", chunk_bytes)
+    monkeypatch.setattr(
+        sampler_evidence_evidence.hashlib,
+        "sha256",
+        lambda: SimpleNamespace(update=update, hexdigest=digest.hexdigest),
+    )
+    record = sampler_evidence_evidence.tensor_manifest(value)
+    assert record == dict(
+        shape=list(value.shape),
+        dtype=str(dtype).removeprefix("torch."),
+        numel=value.numel(),
+        sha256=expected,
+    )
+    assert len(sizes) > 0 and max(sizes) <= chunk_bytes
+    assert sum(sizes) == value.numel() * value.element_size()
+    assert torch.equal(value, before)
+
+
+def test_sampler_evidence_shadow_view_narrow_writes_have_actual_destinations():
+    class ViewModel(_PackedModel):
+        def load_weights(self, weights):
+            for name, value in weights:
+                self.packed.data.view(2, 2).narrow(0, 1, 1).copy_(value.reshape(1, 2))
+
+    model = ViewModel()
+    verifier = _verifier(model)
+    verifier.load("tail", torch.tensor([3.0, 4.0]))
+    result = verifier.finish()
+    assert result["received"]["tail"]["destinations"] == ["packed"]
+    assert result["destinations"]["packed"] == {"uncovered": 2, "mismatched": 0}
+    assert model.packed.tolist() == [0.0, 0.0, 3.0, 4.0]
+
+
+@pytest.mark.parametrize("operation", ["write", "read"])
+def test_sampler_evidence_shadow_oversized_storage_rejected_before_use(operation):
+    model = _PackedModel()
+    size = model.packed.untyped_storage().nbytes()
+    verifier = sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=size - 1)
+
+    def loader(name, value):
+        if operation == "write":
+            model.packed.data.copy_(value)
+        else:
+            model.packed.data.clone()
+
+    with pytest.raises(ValueError, match="explicit"):
+        verifier.load("packed", torch.ones_like(model.packed), loader=loader)
+    assert model.packed.tolist() == [0.0] * 4
+    assert verifier.backings == {} and verifier.peak_bytes == 0
+
+
+def test_sampler_evidence_shadow_exception_never_exposes_nan_to_live_model():
+    class FailingModel(_PackedModel):
+        def load_weights(self, weights):
+            super().load_weights(weights)
+            raise RuntimeError("fixture loader failed")
+
+    model = FailingModel()
+    verifier = _verifier(model)
+    with pytest.raises(RuntimeError, match="fixture loader"):
+        verifier.load("left", torch.tensor([1.0, 2.0]))
+    assert model.packed.tolist() == [1.0, 2.0, 0.0, 0.0]
+    assert not torch.isnan(model.packed).any()
+    assert verifier.received == {}
+
+
+class _IntegerBufferModel(_PackedModel):
+    def __init__(self, *, persistent=True):
+        super().__init__()
+        self.register_buffer("ngram", torch.zeros(4, dtype=torch.int64), persistent=persistent)
+
+    def load_weights(self, weights):
+        for _, value in weights:
+            self.ngram.copy_(value.to(device=self.ngram.device, dtype=self.ngram.dtype))
+
+
+def test_sampler_evidence_shadow_integer_buffer_complete_copy_is_byte_verified():
+    model = _IntegerBufferModel()
+    verifier = _verifier(model)
+    original = model.ngram
+    value = torch.tensor([0, -1, 2**53 + 1, -(2**53 + 1)])
+    verifier.load("wire.ngram", value)
+    record = verifier.finish()
+    assert model.ngram is original
+    assert torch.equal(model.ngram, value)
+    assert record["received"]["wire.ngram"]["destinations"] == ["ngram"]
+    assert record["destinations"]["ngram"] == {"uncovered": 0, "mismatched": 0}
+    assert record["non_parameter_destinations"] == []
+    assert record["untouched_parameters"] == {"packed": 4, "other": 1}
+    assert record["shadow_bytes"]["peak"] == model.ngram.untyped_storage().nbytes()
+    assert verifier.backings == {}
+
+
+def test_sampler_evidence_shadow_selected_source_drift_prevents_load(monkeypatch):
+    model = _PackedModel()
+    verifier = _verifier(model)
+    verifier.sources = {__file__: "0" * 64}
+    with pytest.raises(RuntimeError, match="source changed"):
+        verifier.load("left", torch.tensor([1.0, 2.0]))
+    assert model.packed.tolist() == [0.0] * 4
+
+
+def test_sampler_evidence_shadow_custom_native_operation_fails_before_mutation():
+    library = torch.library.Library("sampler_evidence_fixture", "DEF")
+    library.define("mutate(Tensor(a!) destination, Tensor value) -> ()")
+    library.impl("mutate", lambda destination, value: destination.copy_(value), "CPU")
+
+    class CustomModel(_PackedModel):
+        def load_weights(self, weights):
+            torch.ops.sampler_evidence_fixture.mutate(self.packed.data[:2], weights[0][1])
+
+    model = CustomModel()
+    with pytest.raises(ValueError, match="unobservable native"):
+        _verifier(model).load("left", torch.tensor([1.0, 2.0]))
+    assert model.packed.tolist() == [0.0] * 4
+
+
+def test_native_broadcast_shadow_observes_real_fused_expert_callback(monkeypatch):
+    path = Path(__file__).resolve().parents[3] / "arctic_platform/inference/server/weight_sync/utils.py"
+    spec = importlib.util.spec_from_file_location("_native_broadcast_writer_control", path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+
+    class Experts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w13_weight = torch.nn.Parameter(torch.zeros(1, 4, 2))
+            self.w2_weight = torch.nn.Parameter(torch.zeros(1, 2, 2))
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id):
+            return expert_id
+
+        def weight_loader(self, parameter, value, weight_name, shard, expert_id, **kwargs):
+            target = parameter.data[expert_id]
+            if shard == "w1":
+                target = target[:2]
+            elif shard == "w3":
+                target = target[2:]
+            target.copy_(value)
+            return True
+
+    class FusedModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = Experts()
+
+        def load_weights(self, weights):
+            raise AssertionError("the fused path must not substitute model.load_weights")
+
+    model = FusedModel()
+    verifier = _verifier(model)
+    writer = module._ShardAwareFusedWriter(model, torch.device("cpu"))
+    broadcast.maybe_bind_broadcast_loader(verifier, writer)
+    w13 = torch.arange(8.0).reshape(1, 4, 2)
+    w2 = torch.arange(4.0).reshape(1, 2, 2)
+    with broadcast.maybe_observe_broadcast_tensor(verifier, writer.feed, "experts.w13_weight", w13):
+        assert writer.feed("experts.w13_weight", w13) is True
+    with broadcast.maybe_observe_broadcast_tensor(verifier, writer.feed, "experts.w2_weight", w2):
+        assert writer.feed("experts.w2_weight", w2) is True
+    result = broadcast.maybe_broadcast_receiver_result({"status": "done"}, verifier, rank=3)
+    assert result["rank"] == 3
+    assert result["weight_sync_verification"]["destinations"] == {
+        "experts.w13_weight": {"uncovered": 0, "mismatched": 0},
+        "experts.w2_weight": {"uncovered": 0, "mismatched": 0},
+    }
+    assert result["weight_sync_verification"]["untouched_parameters"] == {}
+    assert torch.equal(model.experts.w13_weight, w13)
+    assert torch.equal(model.experts.w2_weight, w2)
+
+
+def test_native_broadcast_shadow_observes_actual_direct_view_copy():
+    model = _PackedModel()
+    verifier = _verifier(model)
+    view = model.packed.data.view(2, 2)[1]
+    value = torch.tensor([3.0, 4.0])
+    with broadcast.maybe_observe_broadcast_tensor(
+        verifier, lambda name, tensor: view.copy_(tensor), "actual-view", value
+    ):
+        result = view.copy_(value)
+    assert result is view
+    assert verifier.finish()["destinations"]["packed"] == {"uncovered": 2, "mismatched": 0}
+    assert model.packed.tolist() == [0.0, 0.0, 3.0, 4.0]
+
+
+def _collect_broadcast(rows, *, world=2, offset=1, engine_only=False):
+    llm = SimpleNamespace(vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(world_size=world)))
+    return broadcast.maybe_collect_broadcast_verification(rows, engine_only=engine_only, llm=llm, rank_offset=offset)
+
+
+def test_native_broadcast_collective_preserves_every_actual_rank(monkeypatch):
+    monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
+    rows = [
+        {"status": "done", "rank": rank, "weight_sync_verification": {"status": "ok", "rank": rank}} for rank in (2, 1)
+    ]
+    result = _collect_broadcast(rows)
+    assert result[0]["all_rank_weight_sync_verification"] == [row["weight_sync_verification"] for row in rows]
+    assert result[1] is rows[1]
+    assert "all_rank_weight_sync_verification" not in rows[0]
+
+
+@pytest.mark.parametrize("case", ["missing", "duplicate", "wrong-rank", "no-proof", "wrong-proof-rank"])
+def test_native_broadcast_collective_rejects_incomplete_identity(monkeypatch, case):
+    monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
+    rows = [{"rank": rank, "weight_sync_verification": {"status": "ok", "rank": rank}} for rank in (1, 2)]
+    if case == "missing":
+        rows.pop()
+    elif case == "duplicate":
+        rows[1] = copy.deepcopy(rows[0])
+    elif case == "wrong-rank":
+        rows[1]["rank"] = 8
+    elif case == "no-proof":
+        rows[1].pop("weight_sync_verification")
+    else:
+        rows[1]["weight_sync_verification"]["rank"] = 7
+    with pytest.raises(RuntimeError, match="every actual sampler rank"):
+        _collect_broadcast(rows)
+
+
+def test_native_broadcast_disabled_and_engine_only_do_not_read_missing_configuration(monkeypatch):
+    rows = [{"status": "done"}]
+    monkeypatch.delenv(sampler_evidence_evidence.VERIFY_ENV, raising=False)
+    assert broadcast.maybe_collect_broadcast_verification(rows, engine_only=False, llm=object(), rank_offset=1) is rows
+    monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
+    assert broadcast.maybe_collect_broadcast_verification(rows, engine_only=True, llm=object(), rank_offset=1) is rows
+
+
+def test_native_broadcast_disabled_preserves_stream_callback_and_result(monkeypatch):
+    monkeypatch.delenv(sampler_evidence_evidence.VERIFY_ENV, raising=False)
+    weights = iter([("weight", torch.ones(2))])
+    result = {"status": "done"}
+
+    def send(actual):
+        assert actual is weights
+        return result
+
+    with broadcast.maybe_observe_broadcast_send(object(), weights, send) as (stream, evidence):
+        actual = send(stream)
+    assert broadcast.maybe_annotate_weight_sync_result(actual, evidence) is result
+    assert broadcast.maybe_begin_broadcast_load(object(), object(), object()) is None
+    assert broadcast.maybe_broadcast_receiver_result(result, None, rank=1) is result
+    broadcast.maybe_bind_broadcast_trainer_inventory(object(), is_master=True, is_zero3=True)
+    broadcast.maybe_admit_broadcast_receiver(object(), engine_only=False)
+    value = torch.ones(2)
+    with broadcast.maybe_observe_broadcast_tensor(None, send, "weight", value):
+        assert value.sum() == 2
+
+
+@pytest.mark.parametrize("failure", [None, "mutation", "missing-inventory", "duplicate-name", "transport"])
+def test_native_broadcast_sender_observes_once_and_always_resets_context(monkeypatch, failure):
+    monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
+    value = torch.ones(2)
+    weights = iter([("weight", value)] * (2 if failure == "duplicate-name" else 1))
+    seen = []
+
+    def send(actual):
+        state = broadcast._SEND.get()
+        if failure != "missing-inventory":
+            state.update(
+                trainer_parameters={"numel": 2, "count": 1},
+                trainer_inventory={"parameters": {"weight": {"global_numel": 2}}},
+                evidence_sources=sampler_evidence_evidence.source_files(send),
+            )
+        for name, tensor in actual:
+            seen.append((name, tensor))
+            if failure == "mutation":
+                tensor.add_(1)
+        if failure == "transport":
+            raise RuntimeError("transport failed")
+        return {"status": "done", "actual_receipt": 7}
+
+    if failure:
+        with pytest.raises((ValueError, RuntimeError)):
+            with broadcast.maybe_observe_broadcast_send(_sampler_evidence_Sender(), weights, send) as (
+                stream,
+                evidence,
+            ):
+                send(stream)
+    else:
+        with broadcast.maybe_observe_broadcast_send(_sampler_evidence_Sender(), weights, send) as (stream, evidence):
+            result = send(stream)
+        result = broadcast.maybe_annotate_weight_sync_result(result, evidence)
+        assert result["actual_receipt"] == 7
+        assert result["sent_manifest"] == {"weight": sampler_evidence_evidence.tensor_manifest(value)}
+        assert result["trainer_parameters"] == {"numel": 2, "count": 1}
+        assert len(seen) == 1 and seen[0][1] is value
+    assert broadcast._SEND.get() is None
+
+
+@pytest.fixture
+def native_broadcast_evidence_groups(monkeypatch):
+    import torch.distributed as dist
+
+    created, released = [], []
+
+    def create(*, backend):
+        assert backend == "gloo"
+        group = object()
+        created.append(group)
+        return group
+
+    def release(group):
+        released.append(group)
+
+    monkeypatch.setattr(dist, "new_group", create)
+    monkeypatch.setattr(dist, "destroy_process_group", release)
+    yield created, released
+    assert released == created
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_native_broadcast_evidence_group_released_after_collective(
+    monkeypatch, failure, native_broadcast_evidence_groups
+):
+    import torch.distributed as dist
+
+    created, released = native_broadcast_evidence_groups
+    records = [None, None]
+    local = dict(rank=0)
+
+    def gather(actual, value, *, group):
+        assert group is created[-1] and released == []
+        assert actual is records and value is local
+        if failure:
+            raise RuntimeError("evidence collective failed")
+        actual[:] = [value, dict(rank=1)]
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    if failure:
+        with pytest.raises(RuntimeError, match="evidence collective failed"):
+            broadcast._gather_broadcast_evidence(records, local)
+    else:
+        broadcast._gather_broadcast_evidence(records, local)
+        assert records == [dict(rank=0), dict(rank=1)]
+    assert len(created) == 1 and released == created
+
+
+def test_native_broadcast_inventory_collects_actual_rank_before_binding(monkeypatch, native_broadcast_evidence_groups):
+    import torch.distributed as dist
+
+    monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    model = torch.nn.Linear(2, 1, bias=False)
+    calls = []
+
+    def gather(records, local, *, group):
+        assert group is native_broadcast_evidence_groups[0][-1]
+        calls.append(local)
+        records[:] = [local, {**copy.deepcopy(local), "rank": 1}]
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    token = broadcast._SEND.set({"trainer_parameters": None, "trainer_inventory": None})
+    try:
+        broadcast.maybe_bind_broadcast_trainer_inventory(model, is_master=True, is_zero3=False)
+        state = broadcast._SEND.get()
+        assert state["trainer_parameters"] == {"numel": 2, "count": 1}
+        assert state["trainer_inventory"]["parameters"]["weight"]["global_numel"] == 2
+        assert len(calls) == 1
+    finally:
+        broadcast._SEND.reset(token)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "complete",
+        "trainable-skip",
+        "mutation",
+        "replacement",
+        "missing-completion",
+        "sent-skip",
+        "replica-drift",
+        "changed-skip",
+        "invalid-rank",
+        "missing-rank",
+    ],
+)
+def test_native_broadcast_frozen_skips_require_all_rank_unchanged_storage(
+    monkeypatch, case, native_broadcast_evidence_groups
+):
+    import torch.distributed as dist
+
+    monkeypatch.setenv(broadcast.VERIFY_ENV, "1")
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.register_parameter("frozen", torch.nn.Parameter(torch.ones(3), requires_grad=case == "trainable-skip"))
+    model.frozen._dss_skip_weight_sync = True
+    calls = []
+
+    def gather(records, local, *, group):
+        assert group is native_broadcast_evidence_groups[0][-1]
+        calls.append(local)
+        replica = copy.deepcopy(local)
+        replica["rank"] = 1
+        if case == "replica-drift" and len(calls) == 2:
+            replica["parameters"]["frozen"]["sha256"] = "0" * 64
+        elif case == "invalid-rank" and len(calls) == 2:
+            replica["world_size"] = 3
+        elif case == "missing-rank" and len(calls) == 2:
+            replica = None
+        records[:] = [local, replica]
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+
+    def send(stream):
+        broadcast.maybe_bind_broadcast_trainer_inventory(model, is_master=True, is_zero3=False)
+        list(stream)
+
+    def weights():
+        yield "weight", model.weight
+        if case == "sent-skip":
+            yield "frozen", model.frozen
+        if case == "mutation":
+            model.frozen.data.add_(1)
+        elif case == "replacement":
+            model.frozen.data = model.frozen.detach().clone()
+        elif case == "changed-skip":
+            model.frozen._dss_skip_weight_sync = False
+        if case != "missing-completion":
+            broadcast.maybe_complete_broadcast_trainer_inventory(model, is_master=True)
+
+    try:
+        if case == "complete":
+            with broadcast.maybe_observe_broadcast_send(_sampler_evidence_Sender(), weights(), send) as (
+                stream,
+                evidence,
+            ):
+                send(stream)
+            assert len(calls) == 2
+            assert evidence["trainer_parameters"]["numel"] == 5
+            assert evidence["trainer_inventory"]["parameters"]["frozen"]["skip_weight_sync"] is True
+            assert evidence["trainer_skipped_parameters"]["schema"] == "frozen-weight-sync-skip-v1"
+        else:
+            with pytest.raises((ValueError, RuntimeError), match="frozen|skip"):
+                with broadcast.maybe_observe_broadcast_send(_sampler_evidence_Sender(), weights(), send) as (
+                    stream,
+                    evidence,
+                ):
+                    send(stream)
+    finally:
+        broadcast._EXPORT.set(None)
+    assert broadcast._SEND.get() is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["complete", "unexported-drift", "exported-drift", "duplicate", "copied", "partial", "mutation"],
+)
+def test_native_broadcast_buffer_binding_requires_actual_complete_unique_replica(
+    monkeypatch, case, native_broadcast_evidence_groups
+):
+    import torch.distributed as dist
+
+    monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.register_buffer("exported", torch.arange(4, dtype=torch.float32))
+    model.register_buffer("counter", torch.ones(3))
+
+    def gather(records, local, *, group):
+        assert group is native_broadcast_evidence_groups[0][-1]
+        replica = copy.deepcopy(local)
+        replica["rank"] = 1
+        if case in ("exported-drift", "unexported-drift"):
+            name = "exported" if case == "exported-drift" else "counter"
+            replica["buffers"][name]["sha256"] = "0" * 64
+        records[:] = [local, replica]
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    value = model.exported.clone() if case == "copied" else model.exported
+    if case == "partial":
+        value = value[:2]
+    weights = [("weight", model.weight), ("native.bias", value)]
+    if case == "duplicate":
+        weights.append(("second.bias", value))
+
+    def send(stream):
+        broadcast.maybe_bind_broadcast_trainer_inventory(model, is_master=True, is_zero3=False)
+        if case == "mutation":
+            model.exported.add_(1)
+        return list(stream)
+
+    if case in ("exported-drift", "duplicate", "mutation"):
+        with pytest.raises((ValueError, RuntimeError), match="replica bytes|sent more than once|changed"):
+            with broadcast.maybe_observe_broadcast_send(_sampler_evidence_Sender(), weights, send) as (stream, _):
+                send(stream)
+    else:
+        with broadcast.maybe_observe_broadcast_send(_sampler_evidence_Sender(), weights, send) as (stream, evidence):
+            actual = send(stream)
+        assert actual[1][1] is value
+        expected = {} if case in ("copied", "partial") else {"native.bias": "exported"}
+        assert evidence["trainer_buffers"] == {
+            "numel": 7,
+            "count": 2,
+            "wire_numel": 4 if expected else 0,
+            "wire_sources": expected,
+        }
+        assert evidence["trainer_parameters"] == {"numel": 2, "count": 1}
+    assert broadcast._SEND.get() is None
+
+
+@pytest.mark.parametrize("case", ["buffer-alias", "parameter-alias", "enumeration"])
+def test_native_broadcast_invalid_buffer_inventory_fails_collectively(
+    monkeypatch, case, native_broadcast_evidence_groups
+):
+    import torch.distributed as dist
+
+    monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.register_buffer("first", torch.ones(4))
+    if case == "buffer-alias":
+        model.register_buffer("second", model.first)
+    elif case == "parameter-alias":
+        model.register_buffer("second", model.weight.detach())
+    else:
+
+        def fail_enumeration(**kwargs):
+            raise RuntimeError("buffer enumeration failed")
+
+        monkeypatch.setattr(model, "named_buffers", fail_enumeration)
+    calls = []
+
+    def gather(records, local, *, group):
+        assert group is native_broadcast_evidence_groups[0][-1]
+        calls.append(local)
+        records[:] = [local, {**copy.deepcopy(local), "rank": 1}]
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="collective trainer inventory failed"):
+        broadcast.maybe_bind_broadcast_trainer_inventory(model, is_master=True, is_zero3=False)
+    assert len(calls) == 1 and calls[0]["error"] is not None
+
+
+def test_native_broadcast_trainer_replica_disagreement_is_rejected():
+    records = [
+        {"rank": rank, "parameters": {"shared": {"sha256": digest}, "expert": {"sha256": str(rank % 2)}}}
+        for rank, digest in enumerate(["same"] * 4)
+    ]
+    inventory = {"parameters": {"shared": {"ep_groups": []}, "expert": {"ep_groups": [[0, 1], [2, 3]]}}}
+    broadcast._verify_trainer_replicas(records, inventory)
+    records[2]["parameters"]["expert"]["sha256"] = "different"
+    with pytest.raises(ValueError, match="replica bytes disagree"):
+        broadcast._verify_trainer_replicas(records, inventory)
+
+
+def test_native_broadcast_quantized_receive_rejected_before_transport(monkeypatch):
+    monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
+    for quantization in (None, "fp8"):
+        receiver = SimpleNamespace(model_config=SimpleNamespace(quantization=quantization))
+        broadcast.maybe_admit_broadcast_receiver(receiver, engine_only=False)
+    receiver = SimpleNamespace(model_config=SimpleNamespace(quantization="gptq"))
+    broadcast.maybe_admit_broadcast_receiver(receiver, engine_only=True)
+    with pytest.raises(ValueError, match="quantized"):
+        broadcast.maybe_admit_broadcast_receiver(receiver, engine_only=False)
+
+
+_FP8_FIXTURE_NAMESPACE = "ap_fp8_replay_fixture"
+
+
+_FP8_FIXTURE_LIBRARY = []
+
+
+def _fp8_fixture_operations():
+    if not _FP8_FIXTURE_LIBRARY:
+        library = torch.library.Library(_FP8_FIXTURE_NAMESPACE, "DEF")
+        library.define("dynamic_scaled_fp8_quant(Tensor(a!) result, Tensor input, Tensor(b!) scale) -> ()")
+        library.define("unrelated(Tensor(a!) result, Tensor input) -> ()")
+
+        def quantize(result, input, scale):
+            scale.copy_(input.float().abs().amax().clamp(min=1e-12).reshape(1) / 448.0)
+            result.copy_((input.float() / scale).clamp(-448.0, 448.0).to(result.dtype))
+
+        library.impl("dynamic_scaled_fp8_quant", quantize, "CPU")
+        library.impl("unrelated", lambda result, input: result.copy_(input.to(result.dtype)), "CPU")
+        _FP8_FIXTURE_LIBRARY.append(library)
+    return getattr(torch.ops, _FP8_FIXTURE_NAMESPACE)
+
+
+class _Fp8FixtureLinear(torch.nn.Module):
+    """A block-free FP8 linear in vLLM's layout: ``weight`` is stored transposed, ``weight_scale`` is per tensor."""
+
+    def __init__(self, output_sizes, input_size):
+        super().__init__()
+        self.output_sizes = list(output_sizes)
+        weight = torch.zeros(input_size, sum(output_sizes)).to(torch.float8_e4m3fn)
+        self.weight = torch.nn.Parameter(weight, requires_grad=False)
+        self.weight_scale = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+
+    def weight_loader(self, parameter, value, shard=None):
+        if shard is None:
+            parameter.data.copy_(value)
+            return
+        index = {"q": 0, "k": 1, "v": 2}.get(shard, shard)
+        start = sum(self.output_sizes[:index])
+        parameter.data.narrow(0, start, self.output_sizes[index]).copy_(value)
+
+
+class _Fp8FixtureModel(torch.nn.Module):
+    def __init__(self, linear):
+        super().__init__()
+        self.attn = torch.nn.Module()
+        self.attn.qkv_proj = linear.QKVParallelLinear([2, 2, 2], 4)
+        self.norm = torch.nn.Parameter(torch.zeros(4, dtype=torch.bfloat16), requires_grad=False)
+
+    def load_weights(self, weights):
+        raise AssertionError("the FP8 updater writes parameters directly")
+
+
+def _fp8_fixture(monkeypatch, *, corrupt=False, build=None):
+    operations = _fp8_fixture_operations()
+    names = ("dynamic_scaled_fp8_quant", "static_scaled_fp8_quant")
+    monkeypatch.setattr(broadcast, "FP8_QUANT_OPERATIONS", (_FP8_FIXTURE_NAMESPACE, names))
+
+    def scaled_fp8_quant(input, scale=None):
+        output = torch.empty(input.shape, dtype=torch.float8_e4m3fn, device=input.device)
+        scale = torch.zeros(1, dtype=torch.float32, device=input.device)
+        operations.dynamic_scaled_fp8_quant(output, input, scale)
+        return output, scale
+
+    linear = ModuleType("vllm.model_executor.layers.linear")
+    linear.ColumnParallelLinear = type("ColumnParallelLinear", (_Fp8FixtureLinear,), {})
+    linear.MergedColumnParallelLinear = type("MergedColumnParallelLinear", (linear.ColumnParallelLinear,), {})
+    linear.QKVParallelLinear = type("QKVParallelLinear", (linear.MergedColumnParallelLinear,), {})
+    linear.RowParallelLinear = type("RowParallelLinear", (_Fp8FixtureLinear,), {})
+    parameter = ModuleType("vllm.model_executor.parameter")
+    parameter.BasevLLMParameter = type("BasevLLMParameter", (torch.nn.Parameter,), {})
+    custom_ops = ModuleType("vllm._custom_ops")
+    custom_ops.scaled_fp8_quant = scaled_fp8_quant
+    package = ModuleType("vllm")
+    package.__path__ = []
+    package._custom_ops = custom_ops
+    for name, module in (
+        ("vllm", package),
+        ("vllm._custom_ops", custom_ops),
+        ("vllm.model_executor", ModuleType("vllm.model_executor")),
+        ("vllm.model_executor.layers", ModuleType("vllm.model_executor.layers")),
+        ("vllm.model_executor.layers.linear", linear),
+        ("vllm.model_executor.parameter", parameter),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    path = Path(__file__).resolve().parents[3] / "arctic_platform/inference/server/weight_sync/utils.py"
+    spec = importlib.util.spec_from_file_location("_native_broadcast_fp8_updater_control", path)
+    utils = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, utils)
+    spec.loader.exec_module(utils)
+
+    class Updater(utils._FP8InplaceUpdater):
+        corrupting = False
+
+        def _flush_module(self, mod_path):
+            super()._flush_module(mod_path)
+            mod = self._fp8_modules[mod_path]
+            if self.corrupting:
+                first = mod.weight.data[:1, :1]
+                first.copy_((-first.float() - 1.0).to(first.dtype))
+
+    model = (build or _Fp8FixtureModel)(linear)
+    updater_type = Updater if corrupt else utils._FP8InplaceUpdater
+    updater = updater_type(model, torch.bfloat16, torch.device("cpu"))
+    if corrupt:
+        updater.corrupting = True
+    verifier = sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=1024)
+    replay = broadcast.maybe_bind_fp8_updater(
+        verifier, updater, lambda: updater_type(model, torch.bfloat16, torch.device("cpu"))
+    )
+    return SimpleNamespace(
+        model=model, updater=updater, replay=replay, verifier=verifier, operations=operations, quant=scaled_fp8_quant
+    )
+
+
+def _fp8_feed(fixture, stream):
+    for name, value in stream:
+        with broadcast.maybe_observe_fp8_tensor(fixture.verifier, fixture.updater, fixture.replay, name, value):
+            fixture.updater.feed(name, value)
+
+
+def _fp8_stream():
+    generator = torch.Generator().manual_seed(7)
+    shards = [(f"attn.{leaf}_proj.weight", torch.randn(2, 4, generator=generator).bfloat16()) for leaf in "qkv"]
+    return shards + [("norm", torch.arange(4, dtype=torch.bfloat16))]
+
+
+def test_native_broadcast_fp8_replay_quantizes_fused_shards_into_private_backings(monkeypatch):
+    fixture = _fp8_fixture(monkeypatch)
+    stream = _fp8_stream()
+    _fp8_feed(fixture, stream[:1])
+    assert set(fixture.updater._bufs) == set(fixture.replay._bufs) == {"attn.qkv_proj"}
+    live_buffer, replay_buffer = fixture.updater._bufs["attn.qkv_proj"], fixture.replay._bufs["attn.qkv_proj"]
+    assert sampler_evidence_evidence._storage(live_buffer) != sampler_evidence_evidence._storage(replay_buffer)
+    assert fixture.verifier.backings == {}
+    _fp8_feed(fixture, stream[1:])
+    result = fixture.verifier.finish()
+    assert fixture.updater.pending == fixture.replay.pending == 0
+    fused = ["attn.qkv_proj.weight", "attn.qkv_proj.weight_scale"]
+    assert {name: entry["destinations"] for name, entry in result["received"].items()} == {
+        "attn.q_proj.weight": fused,
+        "attn.k_proj.weight": fused,
+        "attn.v_proj.weight": fused,
+        "norm": ["norm"],
+    }
+    assert result["destinations"] == {name: {"uncovered": 0, "mismatched": 0} for name in [*fused, "norm"]}
+    assert result["untouched_parameters"] == {} and result["changed_after_verification"] == []
+    assert list(result["admitted_native_operations"]) == [f"{_FP8_FIXTURE_NAMESPACE}.dynamic_scaled_fp8_quant.default"]
+    weight = torch.cat([value for _, value in stream[:3]])
+    expected, scale = fixture.quant(weight)
+    live = fixture.model.attn.qkv_proj.weight
+    assert torch.equal(live.view(torch.uint8), expected.t().contiguous().view(torch.uint8))
+    assert torch.equal(fixture.model.attn.qkv_proj.weight_scale, scale)
+    assert result["shadow_bytes"]["peak"] <= result["shadow_bytes"]["limit"]
+
+
+def test_native_broadcast_fp8_corrupting_updater_is_mismatched(monkeypatch):
+    fixture = _fp8_fixture(monkeypatch, corrupt=True)
+    _fp8_feed(fixture, _fp8_stream())
+    result = fixture.verifier.finish()
+    assert result["destinations"]["attn.qkv_proj.weight"] == {"uncovered": 0, "mismatched": 1}
+    assert result["destinations"]["attn.qkv_proj.weight_scale"] == {"uncovered": 0, "mismatched": 0}
+
+
+def test_native_broadcast_fp8_incomplete_fused_module_is_uncovered(monkeypatch):
+    fixture = _fp8_fixture(monkeypatch)
+    stream = _fp8_stream()
+    _fp8_feed(fixture, [stream[0], stream[1], stream[3]])
+    result = fixture.verifier.finish()
+    assert fixture.updater.pending == fixture.replay.pending == 1
+    assert result["received"]["attn.k_proj.weight"]["destinations"] == [
+        "attn.qkv_proj.weight",
+        "attn.qkv_proj.weight_scale",
+    ]
+    assert result["destinations"]["attn.qkv_proj.weight"] == {"uncovered": 24, "mismatched": 0}
+    assert result["destinations"]["attn.qkv_proj.weight_scale"] == {"uncovered": 1, "mismatched": 0}
+    assert result["untouched_parameters"] == {}
+
+
+def test_native_broadcast_fp8_unadmitted_native_operation_still_fails(monkeypatch):
+    fixture = _fp8_fixture(monkeypatch)
+    norm = fixture.model.norm
+
+    def unrelated(name, value):
+        fixture.operations.unrelated(norm.data, value)
+
+    with pytest.raises(ValueError, match="unobservable native"):
+        with fixture.verifier.observe_load("norm", torch.ones(4, dtype=torch.bfloat16), loader=unrelated):
+            unrelated("norm", torch.ones(4, dtype=torch.bfloat16))
+    assert norm.tolist() == [0.0] * 4
+
+
+def test_native_broadcast_fp8_bind_requires_independent_fresh_replay(monkeypatch):
+    fixture = _fp8_fixture(monkeypatch)
+    verifier = sampler_evidence_evidence.ShadowVerifier(fixture.model, max_shadow_bytes=1024)
+    with pytest.raises(ValueError, match="fresh independent updater"):
+        broadcast.maybe_bind_fp8_updater(verifier, fixture.updater, lambda: fixture.updater)
+    assert broadcast.maybe_bind_fp8_updater(None, fixture.updater, lambda: pytest.fail("built a replay")) is None
+
+
+def _tensor(shape, value=1, dtype=torch.bfloat16):
+    return torch.full(shape, value, dtype=dtype)
+
+
+def _records():
+    return [
+        {
+            "rank": rank,
+            "world_size": 8,
+            "parameters": {
+                "expert": {
+                    **tensor_manifest(_tensor((1, 2), rank + 1)),
+                    "requires_grad": True,
+                    "ep_ranks": list(range(8)),
+                },
+                "normal": {**tensor_manifest(_tensor((2,), 1)), "requires_grad": True, "ep_ranks": None},
+            },
+            "buffers": {
+                "bias": {**tensor_manifest(_tensor((2,), 2)), "requires_grad": False, "ep_ranks": None},
+            },
+        }
+        for rank in range(8)
+    ]
+
+
+def test_ep_evidence_global_inventory_counts_ep_shards_once_and_buffers_separately():
+    inventory = ep.global_inventory(_records())
+    assert inventory["parameters"]["expert"]["global_numel"] == 16
+    assert inventory["parameters"]["normal"]["global_numel"] == 2
+    assert inventory["buffers"]["bias"]["global_numel"] == 2
+    assert inventory["parameters"]["expert"]["ep_groups"] == [list(range(8))]
+
+
+@pytest.mark.parametrize("defect", ["duplicate_rank", "missing_tensor", "reordered_group", "geometry", "hash"])
+def test_ep_evidence_rank_inventory_omissions_or_inconsistent_groups_rejected(defect):
+    records = _records()
+    if defect == "duplicate_rank":
+        records[-1]["rank"] = 0
+    elif defect == "missing_tensor":
+        records[-1]["parameters"].pop("normal")
+    elif defect == "reordered_group":
+        records[-1]["parameters"]["expert"]["ep_ranks"].reverse()
+    elif defect == "geometry":
+        records[-1]["parameters"]["expert"]["numel"] = 3
+    else:
+        records[-1]["parameters"]["expert"]["sha256"] = "x" * 64
+    with pytest.raises(ValueError):
+        ep.global_inventory(records)
+
+
+_rl_config_TRAINING_CONFIG = {
+    "max_seq_len": 4096,
+    "n_gpus": 8,
+    "train_batch_size": 2,
+    "attn_implementation": "flash_attention_3",
+}
+
+
+_rl_config_SAMPLING_CONFIG = {"max_seq_len": 4096, "n_gpus": 8}
+
+
+def _rl_checks_config_spec(tmp_path):
+    path = tmp_path / "rl.config"
+    path.write_text(
+        json.dumps(_config_factory_native_config(_rl_config_TRAINING_CONFIG, sampling=_rl_config_SAMPLING_CONFIG))
+    )
+    cfg = load_config(path)
+    spec = _applicable_tests_spec(["rl-weight-sync", "rl-router-replay"])
+    spec.config_id = cfg.config_id
+    spec.config_path = str(path)
+    return cfg, spec
+
+
+def test_rl_checks_rl_shutdown_failure_is_unsafe(monkeypatch, tmp_path):
+    from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
+
+    failure = RuntimeError("RL cancel failed")
+    cfg, _ = _rl_checks_config_spec(tmp_path)
+
+    class Client:
+
+        __exit__ = rl_driver.ArcticClient.__exit__
+
+        def __init__(self, config):
+            pass
+
+        def shutdown(self):
+            raise failure
+
+    monkeypatch.setattr(rl_driver, "RLClient", Client)
+    payload = {"training_config": cfg.training, "model_name": cfg.model_name}
+    with pytest.raises(UnsafeCleanupError) as caught:
+        with rl_driver.running_rl_client(cfg, payload, cfg.model_name, tmp_path):
+            pass
+    assert caught.value.__cause__ is failure
+
+
+def test_rl_checks_native_broadcast_configuration_reaches_both_cortex_workers(tmp_path, monkeypatch):
+    cfg, _ = _rl_checks_config_spec(tmp_path)
+    before = cfg.native.model_dump()
+    payload = rl_driver.build_payload(cfg.training, cfg.model_name, SEED)
+    payload["training_config"].setdefault("ds_config", {})[broadcast_evidence.TRAINING_OPTION] = True
+    configurations, closed = [], []
+
+    class Client:
+        __exit__ = rl_driver.ArcticClient.__exit__
+
+        def __init__(self, config):
+            configurations.append(config)
+
+        def shutdown(self):
+            closed.append(True)
+
+    monkeypatch.setattr(rl_driver, "RLClient", Client)
+    with rl_driver.running_rl_client(
+        cfg,
+        payload,
+        cfg.model_name,
+        tmp_path,
+        backend=CortexConfig(base_url="http://127.0.0.1:8003"),
+        weight_sync_verification=True,
+    ):
+        pass
+    native = configurations[0]
+    roundtrip = CortexTrainingConfig.model_validate_json(native.model_dump_json())
+    jobs = {job["job_type"]: job for job in roundtrip.to_cortex()}
+    training = jobs["training"]["training_config"]
+    sampling = jobs["sampling"]["inference_config"]
+    assert training["ds_config"][broadcast_evidence.TRAINING_OPTION] is True
+    assert sampling["vllm_config"]["extra_env"][rl_weight_sync.VERIFY_ENV] == "1"
+    assert roundtrip.training_gpus == cfg.native.training_gpus
+    assert roundtrip.sampling_gpus == cfg.native.sampling_gpus
+    assert cfg.native.model_dump() == before
+    assert closed == [True]
+
+
+@pytest.mark.parametrize(
+    "url,host,pat",
+    [
+        ("http://127.0.0.1:8003/private", None, None),
+        ("http://127.0.0.1:8003?secret=x", None, None),
+        ("http://127.0.0.1:8003", "hosted-account", None),
+        ("http://127.0.0.1:8003", None, "secret"),
+    ],
+)
+@pytest.mark.parametrize("check_id", ["rl-weight-sync", "rl-router-replay"])
+def test_rl_checks_broadcast_rejects_decorated_or_hosted_local_routes(tmp_path, monkeypatch, url, host, pat, check_id):
+    cfg, spec = _rl_checks_config_spec(tmp_path)
+    monkeypatch.setattr(
+        registered_tests()[check_id],
+        "fn",
+        lambda ctx: pytest.fail("must reject before model work"),
+    )
+    with pytest.raises(ValueError, match="unauthenticated HTTP loopback"):
+        runner.execute_rl(
+            cfg,
+            spec,
+            vocab_size=128,
+            select=[check_id],
+            workdir=tmp_path,
+            client_backend=CortexConfig(base_url=url, host=host, pat=pat),
+        )
+
+
+def test_rl_checks_local_gateway_admits_both_observed_rl_checks(tmp_path, monkeypatch):
+    cfg, spec = _rl_checks_config_spec(tmp_path)
+    before = cfg.native.model_dump()
+    seen = []
+
+    def weight_sync(ctx):
+        seen.append(ctx.cfg.native.model_dump())
+        return [
+            rl_weight_sync.verdict(
+                ctx,
+                [],
+                {
+                    "sent_tensors": 1,
+                    "sent_elements": 2,
+                    "trainer_elements": 2,
+                    "sampler_ranks": 1,
+                },
+                weight_format="vllm",
+            )
+        ]
+
+    monkeypatch.setattr(registered_tests()["rl-weight-sync"], "fn", weight_sync)
+
+    def router_replay(ctx):
+        seen.append(ctx.cfg.native.model_dump())
+        samples = _rl_checks_samples()
+        failed, metrics = rl_router_replay.judge(samples, [_rl_checks_trace(samples)], full_recompute=True)
+        return [rl_router_replay.verdict(ctx, failed, metrics)]
+
+    monkeypatch.setattr(registered_tests()["rl-router-replay"], "fn", router_replay)
+    results = runner.execute_rl(
+        cfg,
+        spec,
+        vocab_size=128,
+        select=["rl-weight-sync", "rl-router-replay"],
+        workdir=tmp_path,
+        client_backend=CortexConfig(base_url="http://127.0.0.1:8003"),
+    )
+    assert seen == [cfg.at_gpu_width(cfg.n_gpus).native.model_dump()] * 2
+    assert cfg.native.model_dump() == before
+    assert {result.test_id: result.outcome for result in results} == {
+        "rl-weight-sync": Outcome.PASS,
+        "rl-router-replay": Outcome.PASS,
+    }
+
+
+def test_rl_checks_rl_execution_retains_traceback_for_unwrapped_check_failure(monkeypatch, tmp_path, capsys):
+    from arctic_platform.correctness.harness import runner
+    from arctic_platform.correctness.harness.registry import registered_tests
+
+    cfg, spec = _rl_checks_config_spec(tmp_path)
+
+    def fail(ctx):
+        raise RuntimeError("synthetic check failed before returning")
+
+    monkeypatch.setattr(registered_tests()["rl-weight-sync"], "fn", fail)
+    results = runner.execute_rl(cfg, spec, vocab_size=128, select=["rl-weight-sync"], workdir=tmp_path)
+    assert len(results) == 1 and results[0].outcome is Outcome.FAIL
+    assert results[0].error_type == "RuntimeError"
+    assert "RuntimeError: synthetic check failed before returning" in capsys.readouterr().err
+
+
+def _rl_checks_entry(numel, digest):
+    return {"shape": [numel], "dtype": "bfloat16", "numel": numel, "sha256": digest}
+
+
+def _rl_checks_sync(ranks=2):
+    sent = {
+        "a.weight": _rl_checks_entry(4, "aa"),
+        "b.weight": _rl_checks_entry(6, "bb"),
+    }
+    record = {
+        "status": "ok",
+        "received": {name: {**entry, "destinations": [name]} for name, entry in sent.items()},
+        "destinations": {
+            "a.weight": {"numel": 2, "uncovered": 0, "mismatched": 0, "equal": True},
+            "b.weight": {"numel": 3, "uncovered": 0, "mismatched": 0, "equal": True},
+        },
+        "untouched_parameters": {},
+        "non_parameter_destinations": [],
+        "unverifiable_destinations": [],
+    }
+    return {
+        "weight_format": "vllm",
+        "targets": [
+            {
+                "send": {
+                    "results": [
+                        {
+                            "sent_manifest": sent,
+                            "trainer_parameters": {"count": 2, "numel": 10},
+                        },
+                        {"sent_manifest": None},
+                    ]
+                },
+                "recv": {
+                    "recv": {
+                        "workers": [
+                            {"all_rank_weight_sync_verification": [copy.deepcopy(record) for _ in range(ranks)]}
+                        ]
+                    }
+                },
+            }
+        ],
+    }
+
+
+def _rl_checks_rank(sync, index):
+    return sync["targets"][0]["recv"]["recv"]["workers"][0]["all_rank_weight_sync_verification"][index]
+
+
+def test_rl_checks_weight_sync_agreement_passes():
+    failed, metrics = rl_weight_sync.judge(_rl_checks_sync())
+    assert failed == []
+    assert metrics["sent_elements"] == metrics["trainer_elements"] == 10
+    assert metrics["sampler_ranks"] == 2
+
+
+@pytest.mark.parametrize(
+    "case", ["complete", "missing-proof", "missing-rank", "changed-bytes", "trainable", "wrong-count", "extra-sent"]
+)
+def test_rl_checks_weight_sync_subtracts_only_collectively_proven_frozen_skips(case):
+    sync = _rl_checks_sync()
+    sender = sync["targets"][0]["send"]["results"][0]
+    records = []
+    for rank in range(2):
+        parameters = {
+            name: dict(**tensor_manifest(torch.ones(size, dtype=torch.bfloat16)), requires_grad=True, ep_ranks=None)
+            for name, size in (("a.weight", 4), ("b.weight", 6))
+        }
+        parameters["frozen"] = dict(
+            **tensor_manifest(torch.ones(3, dtype=torch.bfloat16)),
+            requires_grad=case == "trainable",
+            ep_ranks=None,
+            skip_weight_sync=True,
+        )
+        records.append(dict(rank=rank, world_size=2, parameters=parameters, buffers={}))
+    sender["trainer_parameters"]["numel"] = 13
+    if case == "trainable":
+        with pytest.raises(ValueError, match="explicitly frozen"):
+            broadcast.global_inventory(records)
+        return
+    sender["trainer_inventory"] = broadcast.global_inventory(records)
+    after = [
+        dict(
+            rank=record["rank"],
+            world_size=2,
+            error=None,
+            parameters={
+                "frozen": {key: record["parameters"]["frozen"][key] for key in rl_weight_sync._MANIFEST_FIELDS}
+            },
+        )
+        for record in records
+    ]
+    sender["trainer_skipped_parameters"] = dict(schema="frozen-weight-sync-skip-v1", before=records, after=after)
+    if case == "missing-proof":
+        sender.pop("trainer_skipped_parameters")
+    elif case == "missing-rank":
+        after.pop()
+    elif case == "changed-bytes":
+        after[1]["parameters"]["frozen"]["sha256"] = "0" * 64
+    elif case == "wrong-count":
+        sender["trainer_parameters"]["numel"] = 14
+    elif case == "extra-sent":
+        sender["sent_manifest"]["frozen"] = after[0]["parameters"]["frozen"]
+    if case in ("complete", "extra-sent"):
+        failed, metrics = rl_weight_sync.judge(sync)
+        assert metrics["trainer_skipped_frozen_elements"] == 3
+        assert metrics["trainer_elements"] == 10
+        assert (len(failed) == 0) is (case == "complete")
+    else:
+        with pytest.raises(RuntimeError, match="frozen"):
+            rl_weight_sync.judge(sync)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "complete",
+        "nonexported",
+        "missing-binding",
+        "missing-inventory",
+        "duplicate",
+        "wrong-shape",
+        "wrong-dtype",
+        "ep-buffer",
+        "wrong-count",
+        "arbitrary-extra",
+        "legacy-nonexported",
+    ],
+)
+def test_rl_checks_weight_sync_counts_only_bound_exported_buffers(case):
+    sync = _rl_checks_sync()
+    sender = sync["targets"][0]["send"]["results"][0]
+    sender["trainer_parameters"] = {"count": 1, "numel": 6}
+    source = {
+        "local_shape": [4],
+        "local_numel": 4,
+        "global_numel": 4,
+        "dtype": "bfloat16",
+        "requires_grad": False,
+        "ep_groups": [],
+    }
+    sender["trainer_inventory"] = {
+        "buffers": {"bias": source, "counter": {**source, "local_shape": [3], "local_numel": 3, "global_numel": 3}}
+    }
+    sender["trainer_buffers"] = {
+        "numel": 7,
+        "count": 2,
+        "wire_numel": 4,
+        "wire_sources": {"a.weight": "bias"},
+    }
+    if case in ("nonexported", "legacy-nonexported"):
+        sender["trainer_parameters"]["numel"] = 10
+        sender["trainer_buffers"].update(wire_numel=0, wire_sources={})
+        if case == "legacy-nonexported":
+            sender["trainer_buffers"].pop("wire_sources")
+            sender.pop("trainer_inventory")
+    elif case == "missing-binding":
+        sender["trainer_buffers"].pop("wire_sources")
+    elif case == "missing-inventory":
+        sender.pop("trainer_inventory")
+    elif case == "duplicate":
+        sender["trainer_buffers"]["wire_sources"]["second.bias"] = "bias"
+        sender["sent_manifest"]["second.bias"] = copy.deepcopy(sender["sent_manifest"]["a.weight"])
+    elif case == "wrong-shape":
+        source["local_shape"] = [2, 2]
+    elif case == "wrong-dtype":
+        source["dtype"] = "float32"
+    elif case == "ep-buffer":
+        source["ep_groups"] = [[0, 1]]
+    elif case == "wrong-count":
+        sender["trainer_buffers"]["wire_numel"] = 5
+    elif case == "arbitrary-extra":
+        sender["sent_manifest"]["extra.weight"] = _rl_checks_entry(4, "extra")
+        for rank in range(2):
+            _rl_checks_rank(sync, rank)["received"]["extra.weight"] = {
+                **sender["sent_manifest"]["extra.weight"],
+                "destinations": ["a.weight"],
+            }
+    if case in ("complete", "nonexported", "legacy-nonexported", "arbitrary-extra"):
+        failed, metrics = rl_weight_sync.judge(sync)
+        assert metrics["trainer_elements"] == 10
+        assert metrics["trainer_exported_buffer_elements"] == (4 if case in ("complete", "arbitrary-extra") else 0)
+        assert [failure.name for failure in failed] == (["trainer elements sent"] if case == "arbitrary-extra" else [])
+    else:
+        with pytest.raises(RuntimeError):
+            rl_weight_sync.judge(sync)
+
+
+@pytest.mark.parametrize(
+    "mutate,expected",
+    [
+        (
+            lambda s: s["targets"][0]["send"]["results"][0]["trainer_parameters"].update(numel=12),
+            "trainer elements sent",
+        ),
+        (
+            lambda s: _rl_checks_rank(s, 1)["received"].pop("b.weight"),
+            "sampler rank 1: b.weight not received",
+        ),
+        (
+            lambda s: _rl_checks_rank(s, 0)["received"]["a.weight"].update(sha256="xx"),
+            "different bytes",
+        ),
+        (
+            lambda s: _rl_checks_rank(s, 0)["received"]["a.weight"].update(destinations=[]),
+            "written to no parameter",
+        ),
+        (
+            lambda s: _rl_checks_rank(s, 0)["destinations"]["a.weight"].update(uncovered=1),
+            "no tensor wrote",
+        ),
+        (
+            lambda s: _rl_checks_rank(s, 0)["destinations"]["b.weight"].update(mismatched=2),
+            "differing from what was written",
+        ),
+        (
+            lambda s: _rl_checks_rank(s, 0)["untouched_parameters"].update({"visual.w": 5}),
+            "written by no tensor",
+        ),
+        (
+            lambda s: _rl_checks_rank(s, 1).update(changed_after_verification=["b.weight"]),
+            "sampler rank 1: b.weight changed after its shadow verification",
+        ),
+    ],
+)
+def test_rl_checks_weight_sync_disagreement_fails(mutate, expected):
+    sync = _rl_checks_sync()
+    mutate(sync)
+    failed, _ = rl_weight_sync.judge(sync)
+    assert any((expected in m.name for m in failed)), [m.name for m in failed]
+
+
+def test_rl_checks_weight_sync_without_sampler_verification_raises():
+    sync = _rl_checks_sync()
+    sync["targets"][0]["recv"] = {"recv": {"workers": [{}]}}
+    with pytest.raises(RuntimeError, match=rl_weight_sync.VERIFY_ENV):
+        rl_weight_sync.judge(sync)
+
+
+_RL_CHECKS_LORA_SHAPES = {
+    "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": (2, 4),
+    "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": (3, 2),
+    "base_model.model.model.layers.0.self_attn.o_proj.lora_A.weight": (2, 4),
+    "base_model.model.model.layers.0.self_attn.o_proj.lora_B.weight": (4, 2),
+}
+
+
+def _rl_checks_lora_adapters():
+    return {
+        name: torch.arange(rows * cols, dtype=torch.float32).reshape(rows, cols) + index
+        for index, (name, (rows, cols)) in enumerate(_RL_CHECKS_LORA_SHAPES.items())
+    }
+
+
+def _rl_checks_lora_records(sent, ranks=2):
+    return [
+        {
+            "status": "ok",
+            "weight_format": "lora",
+            "rank": rank,
+            "world_size": ranks + 1,
+            "received": {name: {**entry, "destinations": [f"{name}.installed"]} for name, entry in sent.items()},
+        }
+        for rank in range(1, ranks + 1)
+    ]
+
+
+def _rl_checks_lora_sync(records=None):
+    """A LoRA sync from two DP trainer ranks holding frozen base weights beside their trainable adapters."""
+    sent = {name: tensor_manifest(value) for name, value in _rl_checks_lora_adapters().items()}
+    parameters = {
+        name.removesuffix(".weight") + ".default.weight": dict(**entry, requires_grad=True, ep_ranks=None)
+        for name, entry in sent.items()
+    }
+    for name, shape in (
+        ("base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight", (3, 4)),
+        ("base_model.model.model.layers.0.self_attn.o_proj.base_layer.weight", (4, 4)),
+    ):
+        parameters[name] = dict(**tensor_manifest(torch.ones(shape)), requires_grad=False, ep_ranks=None)
+    inventory = global_inventory(
+        [dict(rank=rank, world_size=2, parameters=copy.deepcopy(parameters), buffers={}) for rank in range(2)]
+    )
+    return {
+        "weight_format": "lora",
+        "targets": [
+            {
+                "send": {
+                    "results": [
+                        {
+                            "weight_format": "lora",
+                            "sent_manifest": sent,
+                            "trainer_parameters": {
+                                "count": len(parameters),
+                                "numel": sum(entry["global_numel"] for entry in inventory["parameters"].values()),
+                            },
+                            "trainer_inventory": inventory,
+                            "trainer_buffers": {"numel": 0, "count": 0, "wire_numel": 0, "wire_sources": {}},
+                        },
+                        {"sent_manifest": None},
+                    ]
+                },
+                "recv": {
+                    "recv": {
+                        "weight_format": "lora",
+                        "workers": [
+                            {
+                                "all_rank_weight_sync_verification": (
+                                    _rl_checks_lora_records(sent) if records is None else records
+                                )
+                            }
+                        ],
+                    }
+                },
+            }
+        ],
+    }
+
+
+def _rl_checks_lora_ranks(sync):
+    return sync["targets"][0]["recv"]["recv"]["workers"][0]["all_rank_weight_sync_verification"]
+
+
+def test_rl_checks_lora_weight_sync_agreement_passes():
+    failed, metrics = rl_weight_sync.judge(_rl_checks_lora_sync())
+    assert failed == []
+    assert metrics["sent_elements"] == metrics["trainer_elements"] == 30
+    assert metrics["trainer_parameter_elements"] == 58
+    assert metrics["sampler_ranks"] == 2
+    assert metrics["sampler_ranks_missing"] == 0
+
+
+def test_rl_checks_lora_weight_sync_holdings_are_the_trainable_parameters():
+    sync = _rl_checks_lora_sync()
+    sync["weight_format"] = "vllm"
+    failed, metrics = rl_weight_sync.judge(sync)
+    assert failed[0].name == "trainer elements sent"
+    assert len(failed) == 9
+    assert all("has no shadow-verification record" in failure.name for failure in failed[1:])
+    assert metrics["trainer_elements"] == 58
+
+
+_Q_B = "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight"
+
+
+_O_B = "base_model.model.model.layers.0.self_attn.o_proj.lora_B.weight"
+
+
+@pytest.mark.parametrize(
+    "case,expected,metric",
+    [
+        ("trainer-unsent", "trainer elements sent", None),
+        ("uninstalled", f"sampler rank 2: {_Q_B} received but installed into no LoRA-manager module", "dropped"),
+        ("not-received", f"sampler rank 1: {_O_B} not received", "missing"),
+        ("bytes", f"sampler rank 1: {_Q_B} received with different bytes", "differing"),
+        ("extra", "sampler rank 2: extra.lora_A.weight received but not sent", "extra"),
+        ("missing-rank", "sampler rank 2: no verification record", "ranks_missing"),
+    ],
+)
+def test_rl_checks_lora_weight_sync_disagreement_fails(case, expected, metric):
+    sync = _rl_checks_lora_sync()
+    ranks = _rl_checks_lora_ranks(sync)
+    if case == "trainer-unsent":
+        sync["targets"][0]["send"]["results"][0]["sent_manifest"].pop(_O_B)
+        for record in ranks:
+            record["received"].pop(_O_B)
+    elif case == "uninstalled":
+        ranks[1]["received"][_Q_B]["destinations"] = []
+    elif case == "not-received":
+        ranks[0]["received"].pop(_O_B)
+    elif case == "bytes":
+        ranks[0]["received"][_Q_B]["sha256"] = "0" * 64
+    elif case == "extra":
+        ranks[1]["received"]["extra.lora_A.weight"] = {**ranks[1]["received"][_Q_B], "destinations": ["extra"]}
+    elif case == "missing-rank":
+        ranks.pop()
+    failed, metrics = rl_weight_sync.judge(sync)
+    assert [failure.name for failure in failed if expected in failure.name], [failure.name for failure in failed]
+    if metric is not None:
+        assert metrics[f"sampler_{metric}"] == 1
+
+
+@pytest.mark.parametrize("case", ["world-sizes-differ", "duplicate-rank", "trainer-rank", "no-inventory"])
+def test_rl_checks_lora_weight_sync_malformed_evidence_raises(case):
+    sync = _rl_checks_lora_sync()
+    ranks = _rl_checks_lora_ranks(sync)
+    if case == "world-sizes-differ":
+        ranks[1]["world_size"] = 4
+    elif case == "duplicate-rank":
+        ranks[1]["rank"] = 1
+    elif case == "trainer-rank":
+        ranks[0]["rank"] = 0
+    elif case == "no-inventory":
+        sync["targets"][0]["send"]["results"][0].pop("trainer_inventory")
+    with pytest.raises(RuntimeError):
+        rl_weight_sync.judge(sync)
+
+
+def _rl_checks_samples():
+    rows = [
+        ([5, 6, 7], 2, [[[1], [2]], [[3], [4]]]),
+        ([8, 9, 4], 1, [[[5], [6]], [[7], [0]]]),
+    ]
+    samples = []
+    for index, (tokens, prompt_len, routed_experts) in enumerate(rows):
+        marker = {
+            "replay_id": f"rr1:{index}",
+            "prompt_len": prompt_len,
+            "generation_len": len(tokens) - prompt_len,
+            "capture_len": len(routed_experts),
+            "routed_experts": routed_experts,
+            "routed_experts_shape": [len(routed_experts), 2, 1],
+            "routed_experts_dtype": "uint8",
+        }
+        samples.append({"tokens": tokens, "prompt_len": prompt_len, "marker": marker, "routing": routed_experts})
+    return samples
+
+
+def _rl_checks_trace(samples):
+    tokens = samples[0]["tokens"] + samples[1]["tokens"]
+    positions = [0, 1, 2, 0, 1, 2]
+    routed = copy.deepcopy(samples[0]["routing"] + [[[0], [0]]] + samples[1]["routing"] + [[[0], [0]]])
+    router = [
+        {
+            "layer": layer,
+            "phase": phase,
+            "replayed": True,
+            "indices": [row[layer] for row in routed],
+        }
+        for phase in ("forward", "recompute")
+        for layer in (0, 1)
+    ]
+    return {
+        "rank": 0,
+        "expected_layers": [0, 1],
+        "model_inventory": _rl_evidence_inventory(experts=16),
+        "received": {s["marker"]["replay_id"]: copy.deepcopy(s["routing"]) for s in samples},
+        "calls": [
+            {
+                "padding": False,
+                "input_ids": tokens,
+                "position_ids": positions,
+                "routed_experts": routed,
+                "router": router,
+            }
+        ],
+        "unattributed_router_calls": [],
+    }
+
+
+def test_rl_checks_router_replay_agreement_passes():
+    samples = _rl_checks_samples()
+    failed, metrics = rl_router_replay.judge(samples, [_rl_checks_trace(samples)], full_recompute=True)
+    assert failed == []
+    assert metrics["compared_positions"] == 4
+    assert metrics["forward_invocations"] == metrics["recompute_invocations"] == 2
+
+
+def test_rl_checks_router_trace_hooks_external_router_implementations():
+    import torch
+
+    class TokenChoiceTopKRouter(torch.nn.Module):
+
+        def forward(self, hidden, *, routed_experts=None):
+            indices = routed_experts if routed_experts is not None else torch.zeros_like(hidden, dtype=torch.long)
+            return (hidden, indices, torch.ones(1))
+
+    class Layer(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.router = TokenChoiceTopKRouter()
+
+    class Model(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([Layer()])
+
+    model = Model()
+    model.config = _router_replay_evidence_model().config
+    trace = debug_router_replay_trace.start(model)
+    trace.begin_call(
+        {
+            "input_ids": torch.tensor([[1]]),
+            "position_ids": torch.tensor([[0]]),
+            "routed_experts": torch.tensor([[[0]]]),
+        },
+        padding=False,
+    )
+    model.layers[0].router(torch.zeros(1, 1), routed_experts=torch.tensor([[3]]))
+    exported = debug_router_replay_trace.finish(0)
+    assert exported["calls"][0]["router"] == [{"layer": 0, "phase": "forward", "replayed": True, "indices": [[3]]}]
+    model.layers[0].router(torch.zeros(1, 1), routed_experts=torch.tensor([[2]]))
+    assert len(exported["calls"][0]["router"]) == 1
+
+
+@pytest.fixture
+def _router_replay_evidence_case(tmp_path):
+    replay_evidence.finish(0)
+    model = _router_replay_evidence_model()
+    option = {
+        "request_id": "request-1",
+        "output_dir": "/data-fast/tmp/router-replay-selftest",
+    }
+    result = replay_evidence.maybe_configure_router_replay_trace(
+        {replay_evidence.TRAINING_OPTION: option, "bf16": {"enabled": True}}, model, 0
+    )
+    assert result == {"bf16": {"enabled": True}}
+    replay_evidence._publication["output_dir"] = tmp_path
+    engine = SimpleNamespace(global_rank=0)
+    kwargs = {
+        "input_ids": torch.tensor([[1, 2]]),
+        "position_ids": torch.tensor([[0, 1]]),
+        "routed_experts": torch.tensor([[[[2]], [[3]]]]),
+    }
+    try:
+        yield engine, kwargs, tmp_path
+    finally:
+        replay_evidence.finish(0)
+
+
+def test_router_replay_evidence_disabled_helpers_leave_inputs_unchanged():
+    replay_evidence.finish(0)
+    config = {"bf16": {"enabled": True}}
+    assert replay_evidence.maybe_configure_router_replay_trace(config, None, 0) is config
+    replay_evidence.maybe_record_router_replay_received("sample", None)
+    replay_evidence.maybe_begin_router_replay_call(None, None, backward=True)
+    replay_evidence.maybe_complete_router_replay_call(None)
+    assert replay_evidence.active() is None
+
+
+@pytest.mark.parametrize("operation", ["receive", "begin", "complete"])
+def test_router_replay_evidence_rejects_publication_without_active_trace(
+    _router_replay_evidence_case, monkeypatch, operation
+):
+    engine, kwargs, _ = _router_replay_evidence_case
+    with monkeypatch.context() as patch:
+        patch.setattr(replay_evidence, "_active", None)
+        with pytest.raises(RuntimeError, match="publication has no active trace"):
+            if operation == "receive":
+                replay_evidence.maybe_record_router_replay_received("sample", None)
+            elif operation == "begin":
+                replay_evidence.maybe_begin_router_replay_call(engine, kwargs, backward=True)
+            else:
+                replay_evidence.maybe_complete_router_replay_call(engine)
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        True,
+        {},
+        {"request_id": "../escape", "output_dir": "/data-fast/tmp"},
+        {"request_id": "valid", "output_dir": "/code/tmp"},
+    ],
+)
+def test_router_replay_evidence_rejects_invalid_option_before_installing_hooks(option):
+    with pytest.raises(ValueError):
+        replay_evidence.maybe_configure_router_replay_trace({replay_evidence.TRAINING_OPTION: option}, None, 0)
+    assert replay_evidence.active() is None
+
+
+def test_router_replay_evidence_publishes_only_after_successful_backward(
+    _router_replay_evidence_case,
+):
+    engine, kwargs, output = _router_replay_evidence_case
+    replay_evidence.maybe_record_router_replay_received("rr1:sample", torch.tensor([[[2]]]))
+    replay_evidence.maybe_begin_router_replay_call(engine, kwargs, backward="loss_only")
+    assert list(output.iterdir()) == []
+    replay_evidence.maybe_complete_router_replay_call(engine)
+    record = json.loads((output / "rank-0-call-0.json").read_text())
+    assert record["schema"] == replay_evidence.TRACE_SCHEMA
+    assert record["request_id"] == "request-1" and record["rank"] == record["call_index"] == 0
+    assert record["received"] == {"rr1:sample": [[[2]]]}
+    assert record["calls"][0]["input_ids"] == [1, 2]
+    assert record["calls"][0]["routed_experts"] == [[[2]], [[3]]]
+    assert record["calls"][0]["padding"] is False
+    with pytest.raises(RuntimeError, match="unique preceding"):
+        replay_evidence.maybe_complete_router_replay_call(engine)
+
+
+def test_router_replay_evidence_rejects_incomplete_call_and_duplicate_rx(
+    _router_replay_evidence_case,
+):
+    engine, kwargs, _ = _router_replay_evidence_case
+    replay_evidence.maybe_record_router_replay_received("rr1:sample", torch.tensor([[[2]]]))
+    with pytest.raises(ValueError, match="duplicate"):
+        replay_evidence.maybe_record_router_replay_received("rr1:sample", torch.tensor([[[3]]]))
+    replay_evidence.maybe_begin_router_replay_call(engine, kwargs, backward="loss_only")
+    with pytest.raises(RuntimeError, match="no successful backward"):
+        replay_evidence.maybe_begin_router_replay_call(engine, kwargs, backward="loss_only")
+
+
+def test_router_replay_evidence_checks_rank_and_does_not_trace_forward_only(
+    _router_replay_evidence_case,
+):
+    engine, kwargs, output = _router_replay_evidence_case
+    replay_evidence.maybe_begin_router_replay_call(engine, kwargs, backward=False)
+    assert replay_evidence.active().calls == [] and list(output.iterdir()) == []
+    with pytest.raises(RuntimeError, match="rank differs"):
+        replay_evidence.maybe_begin_router_replay_call(SimpleNamespace(global_rank=1), kwargs, backward=True)
+
+
+@pytest.mark.parametrize(
+    ("device", "dtype"),
+    [("cpu", torch.float32), ("cuda", torch.float32), ("cuda", torch.bfloat16)],
+    ids=["cpu-float32", "cuda-float32", "cuda-bfloat16"],
+)
+@pytest.mark.parametrize("backward_path", ["tensor", "packed"])
+def test_router_replay_evidence_hooks_actual_nonreentrant_router_recompute(
+    monkeypatch, tmp_path, device, dtype, backward_path
+):
+    from torch.utils.checkpoint import checkpoint
+
+    from arctic_platform.model.implementations.moe.layers.moe import TokenChoiceTopKRouter
+    from arctic_platform.rl.processors.packed_reduction import apply_packed_loss_reduction
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA runtime required")
+    if device == "cpu":
+        histc = torch.histc
+        monkeypatch.setattr(torch, "histc", lambda value, **kwargs: histc(value.float(), **kwargs))
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.router = TokenChoiceTopKRouter(
+                dim=8,
+                num_experts=6,
+                top_k=2,
+                score_func="softmax",
+                route_norm=True,
+                route_scale=1.0,
+            )
+            self.projection = torch.nn.Linear(8, 8, bias=False)
+
+        def forward(self, hidden, routed):
+            scores, _, _ = self.router(hidden, routed_experts=routed)
+            return self.projection(hidden) * scores.sum(-1, keepdim=True)
+
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([Block()])
+    model.config = _router_replay_evidence_model().config
+    model.config.num_experts_per_tok = 2
+    model.to(device=device, dtype=dtype)
+    routed = torch.tensor([[1, 2], [3, 4]], device=device)
+    option = {
+        "request_id": "actual-router-backward",
+        "output_dir": "/data-fast/tmp/router-replay-selftest",
+    }
+    replay_evidence.maybe_configure_router_replay_trace({replay_evidence.TRAINING_OPTION: option}, model, 0)
+    replay_evidence._publication["output_dir"] = tmp_path
+    trace = replay_evidence.active()
+
+    def backward(loss, *, scale_wrt_gas):
+        assert scale_wrt_gas is False
+        assert list(tmp_path.iterdir()) == []
+        loss.backward()
+
+    engine = SimpleNamespace(global_rank=0, backward=backward)
+    try:
+        replay_evidence.maybe_begin_router_replay_call(
+            engine,
+            {
+                "input_ids": torch.tensor([[1, 2]], device=device),
+                "position_ids": torch.tensor([[0, 1]], device=device),
+                "routed_experts": routed[:, None, :],
+            },
+            backward="loss_only",
+        )
+        hidden = torch.randn(2, 8, device=device, dtype=dtype)
+        loss = checkpoint(model.layers[0], hidden, routed, use_reentrant=False).sum()
+        assert list(tmp_path.iterdir()) == []
+        if backward_path == "packed":
+            assert apply_packed_loss_reduction(engine, loss, 0.25, backward=True) is None
+        else:
+            loss.backward()
+            replay_evidence.maybe_complete_router_replay_call(engine)
+        observations = trace.calls[0]["router"]
+        assert [entry["phase"] for entry in observations] == ["forward", "recompute"]
+        assert all(entry["layer"] == 0 and entry["replayed"] for entry in observations)
+        assert all(entry["indices"] == routed.tolist() for entry in observations)
+        assert model.layers[0].projection.weight.grad is not None
+        assert torch.isfinite(model.layers[0].projection.weight.grad).all()
+        records = list(tmp_path.iterdir())
+        assert len(records) == 1
+        record = json.loads(records[0].read_text())
+        assert record["request_id"] == option["request_id"]
+        assert record["rank"] == record["call_index"] == 0
+        assert record["calls"][0]["router"] == observations
+    finally:
+        replay_evidence.finish(0)
+
+
+def _router_replay_collector_receipt(rank=0, calls=2, host="node-0"):
+    return {
+        "host": host,
+        "request_id": "request-1",
+        "records": [
+            {
+                "filename": f"rank-{rank}-call-{index}.json",
+                "sha256": "retained-raw-artifact-digest",
+                "record": {
+                    "schema": replay_evidence.TRACE_SCHEMA,
+                    "request_id": "request-1",
+                    "rank": rank,
+                    "call_index": index,
+                    "expected_layers": [0],
+                    "model_inventory": _rl_evidence_inventory(depth=1, expected_layers=(0,)),
+                    "received": {"sample": [[[1]]]},
+                    "calls": [{"padding": False, "router": [], "input_ids": [index]}],
+                    "unattributed_router_calls": [],
+                },
+            }
+            for index in range(calls)
+        ],
+    }
+
+
+def test_router_replay_evidence_collector_requires_every_rank_and_call():
+    receipts = [_router_replay_collector_receipt(rank) for rank in range(2)]
+    traces = router_replay_trace._merge_trace_receipts(receipts, request_id="request-1", ranks=2, calls=2)
+    assert [trace["rank"] for trace in traces] == [0, 1]
+    assert all([call["input_ids"] for call in trace["calls"]] == [[0], [1]] for trace in traces)
+    with pytest.raises(ValueError, match="rank 1 lacks"):
+        router_replay_trace._merge_trace_receipts(receipts[:1], request_id="request-1", ranks=2, calls=2)
+    receipts[1]["records"].pop()
+    with pytest.raises(ValueError, match="exact 2"):
+        router_replay_trace._merge_trace_receipts(receipts, request_id="request-1", ranks=2, calls=2)
+
+
+@pytest.mark.parametrize(
+    "mutation, expected",
+    [
+        (lambda rows: rows.append(copy.deepcopy(rows[0])), "duplicate"),
+        (lambda rows: rows[0]["records"][0]["record"].update(rank=2), "identity"),
+        (
+            lambda rows: rows[0]["records"][0]["record"].update(call_index=True),
+            "identity",
+        ),
+        (
+            lambda rows: rows[0]["records"][0]["record"].update(request_id="old"),
+            "identity",
+        ),
+        (lambda rows: rows[0]["records"][0]["record"].update(calls=[]), "exactly one"),
+        (
+            lambda rows: rows[0]["records"][1]["record"].update(received={}),
+            "RX observations changed",
+        ),
+    ],
+)
+def test_router_replay_evidence_collector_rejects_incomplete_or_mixed_identity(mutation, expected):
+    receipts = [_router_replay_collector_receipt()]
+    mutation(receipts)
+    with pytest.raises(ValueError, match=expected):
+        router_replay_trace._merge_trace_receipts(receipts, request_id="request-1", ranks=1, calls=2)
+
+
+@pytest.mark.parametrize("count", [None, 0, -1, True, 1.5])
+def test_router_replay_evidence_collector_requires_actual_model_call_count(count):
+    with pytest.raises(ValueError, match="actual rl_model_calls"):
+        router_replay_trace.collect_traces({}, {"metrics": {"rl_model_calls": count}}, ranks=1)
+
+
+@pytest.mark.parametrize("fault", [None, "missing", "duplicate", "token", "hostfile", "exit"])
+def test_router_replay_evidence_collector_checks_actual_fanout(tmp_path, monkeypatch, fault):
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("10.0.0.1 slots=1\n10.0.0.2 slots=1\n")
+    monkeypatch.setattr(rl_driver, "_allocation_hostfile", lambda: hostfile)
+    monkeypatch.setattr(storage, "require_data_fast_path", lambda path, **kwargs: tmp_path / "traces")
+    monkeypatch.setattr(storage, "_ds_ssh", lambda: "/allocation/ds_ssh")
+    commands = []
+
+    def fanout(command, **kwargs):
+        commands.append(command)
+        assert command[:3] == ["/allocation/ds_ssh", "-f", str(hostfile)]
+        encoded = command[3].split()[1]
+        import base64
+
+        script = base64.b64decode(encoded).decode()
+        import ast
+
+        call = next(line for line in script.splitlines() if line.startswith("receipt = "))
+        arguments = ast.parse(call).body[0].value.args
+        token = ast.literal_eval(arguments[-1])
+        lines = []
+        for rank in range(2):
+            receipt = _router_replay_collector_receipt(rank, host=f"node-{rank}")
+            receipt["token"] = "wrong" if fault == "token" else token
+            lines.extend(
+                f"10.0.0.{rank + 1}: {router_replay_trace._RECEIPT}{json.dumps(chunk)}"
+                for chunk in router_replay_trace._receipt_chunks(receipt)
+            )
+        if fault == "missing":
+            lines.pop()
+        elif fault == "duplicate":
+            lines.append(lines[0])
+        elif fault == "hostfile":
+            hostfile.write_text("10.0.0.3 slots=2\n")
+        return SimpleNamespace(returncode=int(fault == "exit"), stdout="\n".join(lines), stderr="")
+
+    monkeypatch.setattr(router_replay_trace.subprocess, "run", fanout)
+    option = {"request_id": "request-1", "output_dir": "/data-fast/tmp/traces"}
+    if fault:
+        with pytest.raises((ValueError, RuntimeError), match="collector|collection"):
+            router_replay_trace.collect_traces(option, {"metrics": {"rl_model_calls": 2}}, ranks=2)
+        assert not (tmp_path / "traces" / "request-1-receipts.json").exists()
+    else:
+        traces = router_replay_trace.collect_traces(option, {"metrics": {"rl_model_calls": 2}}, ranks=2)
+        assert [trace["rank"] for trace in traces] == [0, 1]
+        assert len(json.loads((tmp_path / "traces" / "request-1-receipts.json").read_text())) == 2
+    assert len(commands) == 1
+
+
+def test_router_replay_evidence_collector_transfers_large_interleaved_receipts():
+    receipts, rows = [], []
+    for rank in range(2):
+        receipt = _router_replay_collector_receipt(rank, host=f"node-{rank}")
+        receipt["token"] = "transfer-token"
+        receipt["records"][0]["record"]["received"]["sample"] = [[[index % 128] for index in range(180000)]]
+        receipts.append(receipt)
+        rows.extend((f"10.0.0.{rank + 1}", chunk) for chunk in router_replay_trace._receipt_chunks(receipt))
+    assert len(json.dumps(receipts).encode()) > 2 * 1024 * 1024
+    lines = [f"{host}: {router_replay_trace._RECEIPT}{json.dumps(chunk)}" for host, chunk in reversed(rows)]
+    assert all(len(line.encode()) < 8192 for line in lines)
+    actual = router_replay_trace._decode_trace_chunks(
+        "transport banner\n" + "\n".join(lines),
+        hosts=["10.0.0.1", "10.0.0.2"],
+        request_id="request-1",
+        token="transfer-token",
+    )
+    assert actual == receipts
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing",
+        "duplicate",
+        "data",
+        "base64",
+        "digest",
+        "token",
+        "request",
+        "node",
+        "host",
+        "count",
+        "index",
+        "size",
+    ],
+)
+def test_router_replay_evidence_collector_rejects_bad_transfer_chunks(fault):
+    receipt = _router_replay_collector_receipt()
+    receipt["token"] = "transfer-token"
+    receipt["records"][0]["record"]["calls"][0]["input_ids"] = list(range(5000))
+    chunks = list(router_replay_trace._receipt_chunks(receipt))
+    assert len(chunks) > 2
+    host = "10.0.0.1"
+    if fault == "missing":
+        chunks.pop(1)
+    elif fault == "duplicate":
+        chunks.append(copy.deepcopy(chunks[0]))
+    elif fault == "data":
+        chunks[0]["data"] = "A" + chunks[0]["data"][1:]
+    elif fault == "base64":
+        chunks[0]["data"] = "!" + chunks[0]["data"][1:]
+    elif fault == "digest":
+        for chunk in chunks:
+            chunk["sha256"] = "0" * 64
+    elif fault == "token":
+        chunks[0]["token"] = "other-token"
+    elif fault == "request":
+        chunks[0]["request_id"] = "other-request"
+    elif fault == "node":
+        chunks[0]["host"] = "other-node"
+    elif fault == "host":
+        host = "10.0.0.2"
+    elif fault == "count":
+        chunks[0]["count"] += 1
+    elif fault == "index":
+        chunks[0]["index"] = True
+    elif fault == "size":
+        chunks[0]["data"] = chunks[0]["data"][:-4]
+    output = "\n".join(f"{host}: {router_replay_trace._RECEIPT}{json.dumps(chunk)}" for chunk in chunks)
+    with pytest.raises((ValueError, RuntimeError), match="collector|collection"):
+        router_replay_trace._decode_trace_chunks(
+            output,
+            hosts=["10.0.0.1"],
+            request_id="request-1",
+            token="transfer-token",
+        )
+
+
+def test_router_replay_evidence_observes_rx_only_and_successful_packed_backward(
+    _router_replay_evidence_case, monkeypatch
+):
+    from arctic_platform.rl.processors.packed_reduction import apply_packed_loss_reduction
+
+    path = Path(__file__).resolve().parents[2] / "inference/server/router_replay/cache.py"
+    spec = importlib.util.spec_from_file_location("_router_replay_cache_control", path)
+    cache = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, cache)
+    spec.loader.exec_module(cache)
+    engine, kwargs, output = _router_replay_evidence_case
+    tx, rx = cache.RouterReplayCacheTX("cpu", 1024), cache.RouterReplayCacheRX("cpu", 1024)
+    routed = torch.tensor([[[2]]], dtype=torch.uint8)
+    tx.put("rr1:sample", routed)
+    tx.pop("rr1:sample")
+    assert replay_evidence.active().received == {}
+    rx.put("rr1:sample", routed)
+    assert torch.equal(rx.pop("rr1:sample"), routed)
+    assert replay_evidence.active().received == {"rr1:sample": [[[2]]]}
+    replay_evidence.maybe_begin_router_replay_call(engine, kwargs, backward="loss_only")
+
+    def failed_backward(*args, **kwargs):
+        raise RuntimeError("actual backward failed")
+
+    engine.backward = failed_backward
+    with pytest.raises(RuntimeError, match="actual backward"):
+        apply_packed_loss_reduction(engine, torch.tensor(1.0), 0.0, backward=True)
+    assert list(output.iterdir()) == []
+    assert replay_evidence.active() is None
+    assert replay_evidence._publication is None
+    replay_evidence.maybe_configure_router_replay_trace(
+        {
+            replay_evidence.TRAINING_OPTION: {
+                "request_id": "fresh-success",
+                "output_dir": "/data-fast/tmp/router-replay-selftest",
+            }
+        },
+        _router_replay_evidence_model(),
+        0,
+    )
+    replay_evidence._publication["output_dir"] = output
+    replay_evidence.maybe_begin_router_replay_call(engine, kwargs, backward="loss_only")
+    engine.backward = lambda loss, **kwargs: None
+    apply_packed_loss_reduction(engine, torch.tensor(1.0), 0.0, backward=True)
+    assert len(list(output.iterdir())) == 1
+    assert json.loads(next(output.iterdir()).read_text())["calls"][0]["padding"] is False
+
+
+@pytest.mark.parametrize(
+    "mutate,expected",
+    [
+        (
+            lambda t: t["received"].update({"rr1:1": [[[5], [6]], [[7], [1]]]}),
+            "routing received differs",
+        ),
+        (
+            lambda t: t["calls"][0]["routed_experts"][1].__setitem__(0, [9]),
+            "routed_experts differ",
+        ),
+        (
+            lambda t: t["calls"][0]["router"][3].update(indices=[[9]] * 6),
+            "layer 1 recompute tokens",
+        ),
+        (
+            lambda t: t["calls"][0]["router"][0].update(replayed=False),
+            "computed its own routing",
+        ),
+        (lambda t: t["calls"][0]["router"].pop(2), "layer 0 has no recompute"),
+        (
+            lambda t: t["unattributed_router_calls"].append({"layer": 0}),
+            "outside a traced call",
+        ),
+        (lambda t: t["received"].pop("rr1:0"), "sample 0: no training rank received"),
+    ],
+)
+def test_rl_checks_router_replay_disagreement_fails(mutate, expected):
+    samples = _rl_checks_samples()
+    trace = _rl_checks_trace(samples)
+    mutate(trace)
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any((expected in m.name for m in failed)), [m.name for m in failed]
+
+
+def test_rl_checks_router_replay_recompute_not_required_without_full_checkpointing():
+    samples = _rl_checks_samples()
+    trace = _rl_checks_trace(samples)
+    trace["calls"][0]["router"] = [r for r in trace["calls"][0]["router"] if r["phase"] == "forward"]
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=False)
+    assert failed == []
+    assert rl_router_replay.expects_full_recompute({"ac_config": {"mode": "full", "freq": 1}})
+    assert not rl_router_replay.expects_full_recompute({})
+
+
+def test_rl_checks_rl_batch_scores_only_answer_predictions():
+    batch = rl_batch([[5, 6, 7, 8], [9, 4]], [2, 1], pad_id=0)
+    assert batch["kwargs"]["input_ids"].tolist() == [[5, 6, 7, 8], [9, 4, 0, 0]]
+    assert batch["kwargs"]["attention_mask"].tolist() == [[1, 1, 1, 1], [1, 1, 0, 0]]
+    assert batch["context"]["loss_mask"].tolist() == [[0, 1, 1, 0], [1, 0, 0, 0]]
+
+
+def test_rl_checks_rl_batch_uses_native_scalar_temperature_boundary():
+    request = rl_batch([[5, 6, 7, 8], [9, 4]], [2, 1], pad_id=0)
+    _, batch, meta, processing = unpack_batch(request)
+    assert "temperature" not in request["kwargs"]
+    assert request["context"]["temperature"] == meta["temperature"] == 1.0
+    assert batch["input_ids"].tolist() == [[5, 6, 7, 8], [9, 4, 0, 0]]
+    assert batch["loss_mask"].tolist() == [[0, 1, 1, 0], [1, 0, 0, 0]]
+    assert batch["advantages"].eq(1).all()
+    assert processing == {
+        "post": ["compute_logprobs"],
+        "loss_fn": "grpo",
+        "config": {"loss_agg_mode": "token-mean"},
+    }
+
+
+@pytest.mark.parametrize("long_row", [False, True])
+def test_rl_checks_minimum_causal_tail_survives_packing_without_scoring_extra_tokens(long_row):
+    from arctic_platform.common.packing.pack import pack_microbatch
+    from arctic_platform.common.packing.pack import pad_packed_microbatch
+    from arctic_platform.common.packing.windows import token_shard
+
+    rows = [list(range(1, 182)) if long_row else [5, 6, 7, 8], [9, 4]]
+    starts = [2, 1]
+    original = rl_batch(rows, starts, pad_id=0)
+    request = rl_batch(rows, starts, pad_id=0, minimum_row_tokens=144)
+    _, batch, _, _ = unpack_batch(request)
+    width = batch["input_ids"].shape[1]
+    batch["position_ids"] = torch.arange(width).expand(len(rows), width).clone()
+    for index, row in enumerate(rows):
+        length = len(row)
+        assert batch["input_ids"][index, :length].tolist() == row
+        assert batch["input_ids"][index, length:].eq(0).all()
+        assert torch.equal(
+            batch["loss_mask"][index, :length],
+            original["context"]["loss_mask"][index, :length],
+        )
+        assert batch["loss_mask"][index, length - 1 :].eq(0).all()
+    for indices in ([0], [1], [0, 1]):
+        group = {key: value[indices] for key, value in batch.items()}
+        packed, metadata = pack_microbatch(group)
+        assert metadata.valid_lengths.tolist() == [max(len(rows[index]), 144) for index in indices]
+        selected = packed["loss_mask"].bool()
+        expected_targets = [rows[index][starts[index] :] for index in indices]
+        assert packed["input_ids"].roll(-1, dims=1)[selected].tolist() == [
+            token for targets in expected_targets for token in targets
+        ]
+        assert int(selected.sum()) == sum(len(rows[index]) - starts[index] for index in indices)
+        packed, metadata = pad_packed_microbatch(packed, metadata, 16)
+        shards = [token_shard(packed, metadata, 16, rank) for rank in range(16)]
+        assert all(shard["input_ids"].shape[1] >= 9 for shard in shards)
+        for field in ("input_ids", "position_ids", "loss_mask", "advantages"):
+            assert torch.equal(torch.cat([shard[field] for shard in shards], dim=1), packed[field])
+
+
+@pytest.mark.parametrize("minimum", [-1, True, 1.5])
+def test_rl_checks_rl_batch_rejects_invalid_minimum_row_tokens(minimum):
+    with pytest.raises(ValueError, match="minimum_row_tokens must be a nonnegative integer"):
+        rl_batch([[1, 2]], [1], pad_id=0, minimum_row_tokens=minimum)
+
+
+def _router_replay_examples_fixture(monkeypatch, prompt_lengths):
+    rows = [(f"question {index}", "answer") for index in range(len(prompt_lengths))]
+    reads = []
+
+    def read_rows(path, *, start=0, count=None):
+        assert path == rl_router_replay.TRAIN_SPLIT
+        reads.append(count)
+        return list(rows if count is None else rows[start : start + count])
+
+    def tokenize_examples(tokenizer, selected):
+        examples = []
+        for question, answer in selected:
+            length = prompt_lengths[int(question.split()[1])]
+            examples.append(
+                rl_router_replay.gsm8k.Example(
+                    question=question,
+                    prompt=question,
+                    completion=answer,
+                    input_ids=tuple(range(1, length + 3)),
+                    n_prompt=length,
+                )
+            )
+        return examples
+
+    monkeypatch.setattr(rl_router_replay.gsm8k, "read_rows", read_rows)
+    monkeypatch.setattr(rl_router_replay.gsm8k, "tokenize_examples", tokenize_examples)
+    return reads
+
+
+def test_rl_checks_router_replay_rows_span_the_context_parallel_minimum(monkeypatch):
+    from arctic_platform.common.packing.pack import pack_microbatch
+    from arctic_platform.common.packing.pack import pad_packed_microbatch
+    from arctic_platform.common.packing.windows import token_shard
+
+    reads = _router_replay_examples_fixture(monkeypatch, [41, 150, 143, 144, 200])
+    leading = rl_router_replay.replay_examples(object(), 2, 0)
+    assert [example.question for example in leading] == ["question 0", "question 1"]
+    assert reads == [2]
+
+    selected = rl_router_replay.replay_examples(object(), 2, 144)
+    assert [example.question for example in selected] == ["question 1", "question 3"]
+    # The replay batch attends exactly prompt plus generation, so the shortest admissible row is the prompt alone.
+    rows = [list(example.input_ids[: example.n_prompt]) for example in selected]
+    batch = rl_batch(rows, [example.n_prompt for example in selected], pad_id=0)
+    assert batch["kwargs"]["attention_mask"].sum(dim=1).tolist() == [len(row) for row in rows]
+    _, unpacked, _, _ = unpack_batch(batch)
+    width = unpacked["input_ids"].shape[1]
+    unpacked["position_ids"] = torch.arange(width).expand(len(rows), width).clone()
+    for index in range(len(rows)):
+        packed, metadata = pack_microbatch({key: value[[index]] for key, value in unpacked.items()})
+        packed, metadata = pad_packed_microbatch(packed, metadata, 16)
+        assert all(token_shard(packed, metadata, 16, rank)["input_ids"].shape[1] >= 9 for rank in range(16))
+
+
+@pytest.mark.parametrize("minimum", [-1, True, 1.5])
+def test_rl_checks_router_replay_examples_reject_invalid_minimum(monkeypatch, minimum):
+    _router_replay_examples_fixture(monkeypatch, [200])
+    with pytest.raises(ValueError, match="minimum_prompt_tokens must be a nonnegative integer"):
+        rl_router_replay.replay_examples(object(), 1, minimum)
+
+
+def test_rl_checks_router_replay_examples_refuse_a_split_without_enough_long_prompts(monkeypatch):
+    _router_replay_examples_fixture(monkeypatch, [200, 10, 143])
+    with pytest.raises(ValueError, match="holds 1 prompt\\(s\\) of at least 144 tokens"):
+        rl_router_replay.replay_examples(object(), 2, 144)
+
+
+def test_rl_checks_router_replay_selects_rows_with_the_configured_minimum(monkeypatch, tmp_path):
+    cfg, _ = _rl_checks_config_spec(tmp_path)
+    tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=1)
+    calls = []
+
+    class Selected(Exception):
+        pass
+
+    def minimum_context_parallel_row_tokens(actual_cfg, model_path):
+        calls.append(("minimum", actual_cfg, model_path))
+        return 144
+
+    def replay_examples(actual_tokenizer, rows, minimum_prompt_tokens):
+        calls.append(("examples", actual_tokenizer, rows, minimum_prompt_tokens))
+        raise Selected
+
+    monkeypatch.setattr(rl_router_replay.gsm8k, "load_tokenizer", lambda path: tokenizer)
+    monkeypatch.setattr(rl_router_replay, "minimum_context_parallel_row_tokens", minimum_context_parallel_row_tokens)
+    monkeypatch.setattr(rl_router_replay, "replay_examples", replay_examples)
+    with pytest.raises(Selected):
+        rl_router_replay._run(SimpleNamespace(cfg=cfg))
+    assert calls == [
+        ("minimum", cfg, cfg.model_name),
+        ("examples", tokenizer, rl_router_replay.configured_rows_per_step(cfg), 144),
+    ]
+
+
+def test_rl_checks_gpu_count_includes_both_sub_jobs(tmp_path):
+    path = tmp_path / "job.config"
+    path.write_text(
+        json.dumps(_config_factory_native_config(_rl_config_TRAINING_CONFIG, sampling=_rl_config_SAMPLING_CONFIG))
+    )
+    cfg = load_config(path)
+    assert rl_gpu_count(cfg) == 16
+
+
+# Architectural Router Coverage Controls
+
+
+def _router_replay_evidence_model(*, num_hidden_layers=1, mlp_only_layers=(), decoder_sparse_step=1):
+    from arctic_platform.model.implementations.moe.layers.moe import TokenChoiceTopKRouter
+    from arctic_platform.model.implementations.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+
+    model = torch.nn.Module()
+    model.config = Qwen3MoeConfig(
+        vocab_size=16,
+        hidden_size=8,
+        intermediate_size=16,
+        moe_intermediate_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_hidden_layers=num_hidden_layers,
+        num_experts=6,
+        num_experts_per_tok=1,
+        mlp_only_layers=list(mlp_only_layers),
+        decoder_sparse_step=decoder_sparse_step,
+    )
+    layers = []
+    for index in range(num_hidden_layers):
+        layer = torch.nn.Module()
+        layer.mlp = torch.nn.Module()
+        if index not in mlp_only_layers and (index + 1) % decoder_sparse_step == 0:
+            layer.mlp.router = TokenChoiceTopKRouter(
+                dim=8,
+                num_experts=6,
+                top_k=1,
+                score_func="softmax",
+                route_norm=True,
+                route_scale=1.0,
+            )
+        layers.append(layer)
+    model.layers = torch.nn.ModuleList(layers)
+    return model
+
+
+def _rl_evidence_samples():
+    routing = [[[1], [2]], [[3], [4]], [[5], [0]], [[2], [3]]]
+    return [
+        {
+            "tokens": [10, 11, 12, 13, 14],
+            "prompt_len": 2,
+            "marker": {
+                "replay_id": "rr1:coverage",
+                "prompt_len": 2,
+                "generation_len": 3,
+                "capture_len": 4,
+                "routed_experts": routing,
+                "routed_experts_shape": [4, 2, 1],
+                "routed_experts_dtype": "uint8",
+            },
+            "routing": routing,
+        }
+    ]
+
+
+def _rl_evidence_window(samples, positions, *, rank=0, expected_layers=(0, 1)):
+    sample = samples[0]
+    capture = sample["routing"]
+    routed = [copy.deepcopy(capture[position]) if position < len(capture) else [[0], [0]] for position in positions]
+    return {
+        "rank": rank,
+        "expected_layers": list(expected_layers),
+        "model_inventory": _rl_evidence_inventory(expected_layers=expected_layers),
+        "received": {
+            sample["marker"]["replay_id"]: copy.deepcopy(
+                capture[min(positions) : min(max(positions) + 1, len(capture))]
+            )
+        },
+        "calls": [
+            {
+                "padding": False,
+                "input_ids": [sample["tokens"][position] for position in positions],
+                "position_ids": list(positions),
+                "routed_experts": routed,
+                "router": [
+                    {
+                        "layer": layer,
+                        "phase": phase,
+                        "replayed": True,
+                        "indices": [row[layer] for row in routed],
+                    }
+                    for phase in ("forward", "recompute")
+                    for layer in expected_layers
+                ],
+            }
+        ],
+        "unattributed_router_calls": [],
+    }
+
+
+def test_rl_checks_router_replay_missing_entire_bound_layer_fails():
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    trace["calls"][0]["router"] = [entry for entry in trace["calls"][0]["router"] if entry["layer"] == 0]
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert [entry.name for entry in failed] == [
+        "rank 0 call 0: layer 1 has no forward router invocation",
+        "rank 0 call 0: layer 1 has no recompute router invocation",
+    ]
+
+
+@pytest.mark.parametrize("inventory", [None, [], [0, 0], [True], [0, -1], ["0"], [0, 2], (0, 1)])
+def test_rl_checks_router_replay_invalid_bound_inventory_fails(inventory):
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    if inventory is None:
+        trace.pop("expected_layers")
+    else:
+        trace["expected_layers"] = inventory
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("invalid bound router inventory" in entry.name for entry in failed)
+
+
+def test_rl_checks_router_replay_bound_inventory_must_agree_across_ranks():
+    samples = _rl_evidence_samples()
+    traces = [
+        _rl_evidence_window(samples, [0, 1]),
+        _rl_evidence_window(samples, [2, 3, 4], rank=1, expected_layers=(0,)),
+    ]
+    failed, _ = rl_router_replay.judge(samples, traces, full_recompute=True)
+    assert any("expected_layers differs across ranks" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize("across_ranks", [False, True])
+def test_rl_checks_router_replay_duplicate_positions_cannot_hide_capture_holes(across_ranks):
+    samples = _rl_evidence_samples()
+    first = _rl_evidence_window(samples, [0, 1])
+    if across_ranks:
+        traces = [first, _rl_evidence_window(samples, [0, 1], rank=1)]
+    else:
+        first["calls"].append(copy.deepcopy(first["calls"][0]))
+        traces = [first]
+    failed, metrics = rl_router_replay.judge(samples, traces, full_recompute=True)
+    assert metrics["compared_positions"] == metrics["captured_positions"] == 4
+    assert any("lack exact [0, capture_len) coverage" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize("padding", ["none", "schedule", "sp-only"])
+def test_rl_checks_router_replay_exact_sp_coverage_preserves_padding_and_last_token(padding):
+    samples = _rl_evidence_samples()
+    traces = [_rl_evidence_window(samples, [0, 1]), _rl_evidence_window(samples, [2, 3, 4], rank=1)]
+    if padding != "none":
+        traces.append(
+            {
+                "rank": 2,
+                "expected_layers": [0, 1],
+                "model_inventory": _rl_evidence_inventory(),
+                "received": {},
+                "calls": [
+                    {
+                        "padding": padding == "schedule",
+                        "input_ids": [0, 0],
+                        "position_ids": [0, 1],
+                        "routed_experts": None,
+                        "router": [],
+                    }
+                ],
+                "unattributed_router_calls": [],
+            }
+        )
+    failed, metrics = rl_router_replay.judge(samples, traces, full_recompute=True)
+    assert failed == []
+    assert metrics["compared_positions"] == 4
+    assert metrics["padding_calls"] == int(padding == "schedule")
+    assert metrics["unattributed_tokens"] == (2 if padding == "sp-only" else 0)
+
+
+def test_rl_checks_router_replay_exact_coverage_rejects_one_missing_position():
+    samples = _rl_evidence_samples()
+    traces = [_rl_evidence_window(samples, [0, 1]), _rl_evidence_window(samples, [3, 4], rank=1)]
+    failed, _ = rl_router_replay.judge(samples, traces, full_recompute=True)
+    assert any("lack exact [0, capture_len) coverage" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize("missing_rank", [0, 1])
+def test_rl_checks_router_replay_each_participating_rank_requires_its_own_rx(missing_rank):
+    samples = _rl_evidence_samples()
+    traces = [_rl_evidence_window(samples, [0, 1]), _rl_evidence_window(samples, [2, 3, 4], rank=1)]
+    traces[missing_rank]["received"] = {}
+    failed, metrics = rl_router_replay.judge(samples, traces, full_recompute=True)
+    assert [entry.name for entry in failed] == [
+        f"rank {missing_rank}: sample 0 has no RX record for its captured window"
+    ]
+    assert metrics["compared_positions"] == metrics["captured_positions"] == 4
+
+
+def test_rl_checks_router_replay_dense_decoder_layer_requires_no_router():
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5), expected_layers=(1,))
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert failed == []
+
+
+@pytest.mark.parametrize("layer", [True, -1, 2, "0"])
+def test_rl_checks_router_replay_invocations_outside_bound_inventory_fail(layer):
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    trace["calls"][0]["router"][0]["layer"] = layer
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("outside the bound inventory" in entry.name for entry in failed)
+
+
+def test_router_replay_evidence_fixture_binds_inventory_before_observations(_router_replay_evidence_case):
+    engine, kwargs, output = _router_replay_evidence_case
+    trace = replay_evidence.active()
+    exported = trace.export(0)
+    assert exported["expected_layers"] == [0]
+    assert exported["model_inventory"]["expected_layers"] == [0]
+    assert exported["model_inventory"]["model_type"] == "qwen3_moe"
+    assert exported["model_inventory"]["num_hidden_layers"] == 1
+    assert exported["model_inventory"]["num_experts_per_tok"] == 1
+    assert exported["model_inventory"]["num_experts"] == 6
+    assert replay_evidence.active().calls == []
+    replay_evidence.maybe_begin_router_replay_call(engine, kwargs, backward="loss_only")
+    replay_evidence.maybe_complete_router_replay_call(engine)
+    record = json.loads((output / "rank-0-call-0.json").read_text())
+    assert record["expected_layers"] == [0]
+    assert record["model_inventory"] == exported["model_inventory"]
+    assert record["calls"][0]["router"] == []
+
+
+@pytest.mark.parametrize(
+    "depth,dense,step,expected",
+    [(1, (), 1, [0]), (4, (1,), 2, [3]), (4, (0, 2), 1, [1, 3])],
+)
+def test_router_replay_evidence_config_roster_is_independent_of_observations(depth, dense, step, expected):
+    replay_evidence.finish(0)
+    model = _router_replay_evidence_model(num_hidden_layers=depth, mlp_only_layers=dense, decoder_sparse_step=step)
+    inventory = replay_evidence.router_replay_model_inventory(model.config.to_dict())
+    assert inventory["expected_layers"] == expected
+    assert inventory["num_experts_per_tok"] == model.config.num_experts_per_tok == 1
+    try:
+        trace = replay_evidence.start(model)
+        assert trace.calls == []
+        assert trace.export(0)["model_inventory"] == inventory
+        assert trace.export(0)["expected_layers"] == expected
+    finally:
+        replay_evidence.finish(0)
+
+
+def test_router_replay_evidence_config_roster_rejects_missing_installed_router():
+    replay_evidence.finish(0)
+    model = _router_replay_evidence_model(num_hidden_layers=2)
+    config = model.config.to_dict()
+    inventory = replay_evidence.router_replay_model_inventory(config)
+    assert inventory["expected_layers"] == [0, 1]
+    del model.layers[1].mlp.router
+    assert replay_evidence.router_replay_model_inventory(model.config.to_dict()) == inventory
+    try:
+        with pytest.raises(ValueError, match="architectural roster"):
+            replay_evidence.start(model)
+        assert replay_evidence.active() is None
+        assert model.layers[0].mlp.router._forward_hooks == {}
+    finally:
+        replay_evidence.finish(0)
+
+
+def test_router_replay_evidence_config_roster_rejects_extra_router_in_dense_layer():
+    replay_evidence.finish(0)
+    model = _router_replay_evidence_model(num_hidden_layers=2, mlp_only_layers=(0,))
+    assert replay_evidence.router_replay_model_inventory(model.config.to_dict())["expected_layers"] == [1]
+    model.layers[0].mlp.router = copy.deepcopy(model.layers[1].mlp.router)
+    try:
+        with pytest.raises(ValueError, match="architectural roster"):
+            replay_evidence.start(model)
+        assert replay_evidence.active() is None
+    finally:
+        replay_evidence.finish(0)
+
+
+def test_router_replay_evidence_config_roster_rejects_unknown_model_family():
+    config = _router_replay_evidence_model().config.to_dict()
+    config["model_type"] = "unverified_moe"
+    with pytest.raises(NotImplementedError, match="unverified router-replay layer predicate"):
+        replay_evidence.router_replay_model_inventory(config)
+
+
+@pytest.mark.parametrize("top_k", [None, True, 0, 7])
+def test_router_replay_evidence_config_roster_rejects_invalid_routing_top_k(top_k):
+    config = _router_replay_evidence_model().config.to_dict()
+    config["num_experts_per_tok"] = top_k
+    with pytest.raises(ValueError, match="routing top-k"):
+        replay_evidence.router_replay_model_inventory(config)
+
+
+def test_router_replay_evidence_collector_preserves_bound_inventory():
+    receipts = [_router_replay_collector_receipt(rank) for rank in range(2)]
+    traces = router_replay_trace._merge_trace_receipts(receipts, request_id="request-1", ranks=2, calls=2)
+    assert [trace["expected_layers"] for trace in traces] == [[0], [0]]
+    assert all(trace["model_inventory"] == _rl_evidence_inventory(depth=1, expected_layers=(0,)) for trace in traces)
+
+
+@pytest.mark.parametrize("inventory", [None, [], [0, 0], [True], [-1], ["0"], (0,)])
+def test_router_replay_evidence_collector_rejects_missing_or_invalid_inventory(inventory):
+    receipt = _router_replay_collector_receipt()
+    record = receipt["records"][0]["record"]
+    if inventory is None:
+        record.pop("expected_layers")
+    else:
+        record["expected_layers"] = inventory
+    with pytest.raises(ValueError, match="expected_layers"):
+        router_replay_trace._merge_trace_receipts([receipt], request_id="request-1", ranks=1, calls=2)
+
+
+@pytest.mark.parametrize("across_ranks", [False, True])
+def test_router_replay_evidence_collector_rejects_inventory_drift(across_ranks):
+    receipts = [_router_replay_collector_receipt()]
+    if across_ranks:
+        receipts.append(_router_replay_collector_receipt(rank=1))
+        receipts[1]["records"][0]["record"]["expected_layers"] = [0, 1]
+    else:
+        receipts[0]["records"][1]["record"]["expected_layers"] = [0, 1]
+    with pytest.raises(ValueError, match="expected_layers differs"):
+        router_replay_trace._merge_trace_receipts(receipts, request_id="request-1", ranks=len(receipts), calls=2)
+
+
+# Opt-In Router Failure Cleanup Controls
+
+
+def test_router_cleanup_disabled_identity_and_no_torch_import(monkeypatch):
+    from arctic_platform.debug import training
+
+    monkeypatch.setattr(training, "_active", None)
+    monkeypatch.setattr(training, "_publication", None)
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "torch" or name.startswith("torch."):
+            raise AssertionError("disabled cleanup imported torch")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    sentinel = object()
+
+    def native(value):
+        return value
+
+    assert training.maybe_cleanup_router_replay_on_failure(native) is native
+    assert training.maybe_cleanup_router_replay_on_failure()(native) is native
+    wrapped = training.maybe_cleanup_router_replay_on_failure(native, runtime=True)
+    assert wrapped(sentinel) is sentinel
+    assert wrapped.__wrapped__ is native
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_router_cleanup_runtime_failure_removes_hooks_and_preserves_exception(monkeypatch, failure_type):
+    from arctic_platform.debug import training
+
+    monkeypatch.setattr(training, "_active", None)
+    monkeypatch.setattr(training, "_publication", None)
+    removed = []
+    failure = failure_type("native failure")
+
+    class Handle:
+        def remove(self):
+            removed.append("removed")
+
+    trace = training.RouterReplayTrace.__new__(training.RouterReplayTrace)
+    trace._hook_handles = [Handle(), Handle()]
+
+    @training.maybe_cleanup_router_replay_on_failure(runtime=True)
+    def initialize_then_fail():
+        training._active = trace
+        training._publication = {"rank": 3, "completed": 0}
+        raise failure
+
+    with pytest.raises(failure_type) as caught:
+        initialize_then_fail()
+    assert caught.value is failure
+    assert removed == ["removed", "removed"]
+    assert trace._hook_handles == []
+    assert training.active() is None
+    assert training._publication is None
+
+
+def test_router_cleanup_failure_cannot_mask_native_failure(monkeypatch):
+    from arctic_platform.debug import training
+
+    failure = ValueError("native failure")
+    attempts = []
+    monkeypatch.setattr(training, "_active", None)
+    monkeypatch.setattr(training, "_publication", {"rank": 7})
+
+    def failing_cleanup(rank):
+        attempts.append(rank)
+        raise OSError("cleanup failure")
+
+    monkeypatch.setattr(training, "maybe_finish_router_replay_trace", failing_cleanup)
+
+    @training.maybe_cleanup_router_replay_on_failure
+    def native():
+        raise failure
+
+    with pytest.raises(ValueError) as caught:
+        native()
+    assert caught.value is failure
+    assert attempts == [7]
+
+
+def test_router_cleanup_success_preserves_active_trace(monkeypatch):
+    from arctic_platform.debug import training
+
+    trace = object()
+    publication = {"rank": 1}
+    sentinel = object()
+    monkeypatch.setattr(training, "_active", trace)
+    monkeypatch.setattr(training, "_publication", publication)
+
+    @training.maybe_cleanup_router_replay_on_failure(runtime=True)
+    def native():
+        return sentinel
+
+    assert native() is sentinel
+    assert training.active() is trace
+    assert training._publication is publication
+
+
+_SELFTEST_FIXTURES = tuple(
+    dict.fromkeys(
+        (
+            *_SELFTEST_FIXTURES,
+            *(
+                "_isolated_gateway_ownership",
+                "_external_operator_catalog",
+                "_dense_checkpoint_onboarding_cli",
+                "_operator_api_catalog",
+                "_onboarding_prerequisites",
+                "_incremental_onboarding",
+                "_independent_onboarding",
+                "_node_prerequisites",
+                "_native_optimizer_scope_runner",
+                "_onboarding_retry_sources",
+                "_automatic_regression_gateway",
+                "_native_gateway_command",
+                "_owned_gateway_descendant",
+                "_stale_gateway_record",
+                "_gateway_scratch_launch_transport",
+                "gateway_scratch_peer_runtime",
+                "gateway_scratch_peer_request",
+                "gateway_scratch_peer_transport",
+                "_prepared_reference_runner_prepared_runner",
+                "_reference_records_ctx",
+                "_reference_records_identity",
+                "_reference_execution_engine",
+                "native_scope_training_actor",
+                "native_runtime_worker",
+                "_cortex_optimizer_capture_no_network",
+                "_cortex_optimizer_capture_artifact_stubs",
+                "_cortex_optimizer_capture_lifecycle",
+                "_ap_driver_optimizer_capture_initializer",
+                "_native_participation_worker",
+                "_optimizer_capture_capture_worker",
+                "_optimizer_capture_capture_server",
+                "_local_cortex_optimizer_no_network",
+                "_local_cortex_optimizer_local_capture",
+                "_maintained_native_capture",
+                "_dense_collection_case",
+                "_dense_collection_capture_case",
+                "_dense_native_child_identity_case",
+                "_dense_head_snapshot_case",
+                "_strict_ssh_consumer_new_dense_case",
+                "_synthetic_optimizer_inputs",
+                "dense_allocation_runner_case",
+                "adapter_pack",
+                "generated_adapter_config",
+                "worker_adapter_transfer",
+                "native_original_adapter",
+                "gateway_optional_adapter_control",
+                "native_reserved_listener_control",
+                "native_adapter_layout_control",
+                "native_adapter_layout_rollback_control",
+                "native_original_registered_control",
+                "owned_worker_lease_new_control",
+                "native_spawn_globals_control",
+                "native_shared_pack_control",
+                "native_shared_pack_capability",
+                "native_shared_pack_coordinator",
+                "native_ray_tracing_controls",
+                "_reference_free_metadata_workspace",
+                "_reference_free_metadata_no_model",
+                "_optimizer_norms_artifact_root",
+                "_optimizer_reference_fast_output",
+                "_synthetic_onboarding_environment",
+                "_onboarding_checkout_roots",
+                "_data_fast_storage_fast_root",
+                "_helper_storage_unsafe_destination",
+                "_hf_reference_onboarding_prepared_args",
+                "_rendered_calibration_workers",
+                "_calibration_driver",
+                "_sizing_reuse_case",
+                "_onboarding_storage_fast_root",
+                "_local_cortex_reference_publication",
+                "_local_cortex_optimizer_onboarding",
+                "_optimizer_validation_child",
+                "_qwen4_residency_new_architecture",
+                "_local_cortex_shutdown_gateway",
+                "_client_backends_no_network",
+                "_synthetic_runtime_inputs",
+                "_e2e_reference_records_ctx",
+                "_inference_export_locality_admission",
+                "_inference_export_prescribed_hostfile",
+                "_inference_sampling_model_configs",
+                "_local_cortex_inference_export_factory",
+                "_standalone_checkpoint_catalog",
+                "_native_checkpoint_bridge",
+                "_inference_export_case",
+                "_inference_rendezvous_inference_run",
+                "_remaining_selected_later_recipe",
+                "native_broadcast_evidence_groups",
+                "_router_replay_evidence_case",
+            ),
+        )
+    )
+)
+
+
+def _rl_evidence_inventory(*, depth=2, expected_layers=(0, 1), experts=6, top_k=1):
+    return replay_evidence.router_replay_model_inventory(
+        {
+            "model_type": "qwen3_moe",
+            "num_hidden_layers": depth,
+            "num_experts": experts,
+            "num_experts_per_tok": top_k,
+            "mlp_only_layers": [layer for layer in range(depth) if layer not in expected_layers],
+            "decoder_sparse_step": 1,
+        }
+    )
+
+
+def test_rl_checks_weight_sync_requires_each_claimed_destination_record():
+    sync = _rl_checks_sync()
+    record = _rl_checks_rank(sync, 0)
+    record["destinations"].clear()
+    failed, metrics = rl_weight_sync.judge(sync)
+    assert any("has no shadow-verification record" in entry.name for entry in failed)
+    assert metrics["sampler_missing_destination_records"] == 2
+
+
+def test_native_broadcast_sender_source_inspection_failure_does_not_leave_context(monkeypatch):
+    monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
+
+    def fail(*args):
+        raise ValueError("source inspection failed")
+
+    monkeypatch.setattr(broadcast, "source_files", fail)
+    with pytest.raises(ValueError, match="source inspection failed"):
+        with broadcast.maybe_observe_broadcast_send(object(), iter(()), fail):
+            pytest.fail("source inspection should fail before entering the send")
+    assert broadcast._SEND.get() is None
+
+
+@pytest.mark.parametrize("outcome", ["close", "failure", "complete"])
+def test_native_broadcast_nonmaster_export_always_releases_its_inventory(monkeypatch, outcome):
+    from arctic_platform.model import weight_export
+
+    monkeypatch.setenv(broadcast.VERIFY_ENV, "1")
+    model = torch.nn.Linear(2, 1, bias=False)
+    completed = []
+    failure = ValueError("native exporter failed")
+
+    def bind(actual, *, is_master, is_zero3):
+        assert not is_master and not is_zero3
+        broadcast._EXPORT.set({"model": actual})
+
+    def builder(actual):
+        def weights():
+            yield "weight", actual.weight
+            if outcome == "failure":
+                raise failure
+
+        return weights
+
+    monkeypatch.setattr(weight_export, "maybe_bind_broadcast_trainer_inventory", bind)
+    monkeypatch.setattr(
+        weight_export,
+        "maybe_complete_broadcast_trainer_inventory",
+        lambda actual, **kwargs: completed.append(actual),
+    )
+    monkeypatch.setattr(weight_export, "weight_export_contract", lambda actual: SimpleNamespace(vllm=builder))
+    stream = weight_export.iter_model_weights(model, "vllm", is_master=False, is_zero3=False)
+    assert next(stream)[0] == "weight"
+    assert broadcast._EXPORT.get()["model"] is model
+    if outcome == "close":
+        stream.close()
+    elif outcome == "failure":
+        with pytest.raises(ValueError, match="native exporter failed") as caught:
+            next(stream)
+        assert caught.value is failure
+    else:
+        with pytest.raises(StopIteration):
+            next(stream)
+    assert broadcast._EXPORT.get() is None
+    assert completed == ([model] if outcome == "complete" else [])
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("unsafe", [False, True])
+def test_rl_checks_rl_shutdown_preserves_workload_and_resource_ownership(monkeypatch, tmp_path, cancelled, unsafe):
+    cfg, _ = _rl_checks_config_spec(tmp_path)
+    workload = KeyboardInterrupt("cancelled") if cancelled else ValueError("model failed")
+    cleanup = (
+        rl_driver.UnsafeCleanupError("cleanup failed", owned_parent="parent", owned_children={"training": "child"})
+        if unsafe
+        else RuntimeError("cleanup failed")
+    )
+
+    class Client:
+        __exit__ = rl_driver.ArcticClient.__exit__
+
+        def __init__(self, config):
+            pass
+
+        def shutdown(self):
+            raise cleanup
+
+    monkeypatch.setattr(rl_driver, "RLClient", Client)
+    payload = {"training_config": cfg.training, "model_name": cfg.model_name}
+    with pytest.raises(KeyboardInterrupt if cancelled else rl_driver.UnsafeCleanupError) as caught:
+        with rl_driver.running_rl_client(cfg, payload, cfg.model_name, tmp_path):
+            raise workload
+    if cancelled:
+        assert caught.value is workload
+        assert caught.value.__cause__ is cleanup
+    else:
+        assert caught.value.workload_error is workload
+        if unsafe:
+            assert caught.value is cleanup
+            assert caught.value.owned_parent == "parent"
+            assert caught.value.owned_children == {"training": "child"}
+        else:
+            assert caught.value.shutdown_error is cleanup
+
+
+@pytest.mark.parametrize(
+    "field", ["model_type", "num_hidden_layers", "num_experts_per_tok", "num_experts", "resolved_model_config_sha256"]
+)
+@pytest.mark.parametrize("across_ranks", [False, True])
+def test_router_replay_evidence_collector_rejects_full_model_binding_drift(field, across_ranks):
+    receipts = [_router_replay_collector_receipt()]
+    if across_ranks:
+        receipts.append(_router_replay_collector_receipt(rank=1))
+        changed = receipts[1]["records"][0]["record"]["model_inventory"]
+    else:
+        changed = receipts[0]["records"][1]["record"]["model_inventory"]
+    if field == "model_type":
+        changed[field] = "glm4_moe"
+    elif field == "resolved_model_config_sha256":
+        changed[field] = "f" * 64
+    else:
+        changed[field] += 1
+    with pytest.raises(ValueError, match="model_inventory differs"):
+        router_replay_trace._merge_trace_receipts(receipts, request_id="request-1", ranks=len(receipts), calls=2)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda record: record.pop("model_inventory"),
+        lambda record: record.update(model_inventory={}),
+        lambda record: record["model_inventory"].update(num_hidden_layers=True),
+        lambda record: record["model_inventory"].update(num_experts_per_tok=0),
+        lambda record: record["model_inventory"].update(num_experts=0),
+        lambda record: record["model_inventory"].update(expected_layers=[1]),
+        lambda record: record["model_inventory"].update(resolved_model_config_sha256="not-a-digest"),
+    ],
+)
+def test_router_replay_evidence_collector_rejects_invalid_full_model_binding(mutate):
+    receipt = _router_replay_collector_receipt()
+    mutate(receipt["records"][0]["record"])
+    with pytest.raises(ValueError, match="model_inventory"):
+        router_replay_trace._merge_trace_receipts([receipt], request_id="request-1", ranks=1, calls=2)
+
+
+def test_router_replay_evidence_node_collector_requires_full_model_binding(tmp_path, monkeypatch):
+    root = tmp_path / "request-1"
+    root.mkdir()
+    record = _router_replay_collector_receipt(calls=1)["records"][0]["record"]
+    record.pop("model_inventory")
+    (root / "rank-0-call-0.json").write_text(json.dumps(record))
+    from arctic_platform.correctness.harness import storage
+
+    monkeypatch.setattr(storage, "require_data_fast_path", lambda value, **kwargs: tmp_path)
+    with pytest.raises(ValueError, match="model_inventory"):
+        router_replay_trace._node_trace_receipt("/data-fast/fixture", "request-1", "transfer-token")
+
+
+def test_rl_checks_router_replay_cannot_shrink_roster_below_bound_model_inventory():
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    trace["expected_layers"] = [0]
+    trace["calls"][0]["router"] = [entry for entry in trace["calls"][0]["router"] if entry["layer"] == 0]
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("model_inventory expected_layers differs" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize("field,value", [("num_hidden_layers", 3), ("num_experts_per_tok", 2), ("num_experts", 5)])
+def test_rl_checks_router_replay_capture_geometry_must_match_bound_model(field, value):
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    trace["model_inventory"][field] = value
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("invalid captured geometry" in entry.name for entry in failed)
+
+
+def test_rl_checks_router_replay_full_model_binding_must_agree_across_ranks():
+    samples = _rl_evidence_samples()
+    traces = [_rl_evidence_window(samples, [0, 1]), _rl_evidence_window(samples, [2, 3, 4], rank=1)]
+    traces[1]["model_inventory"]["resolved_model_config_sha256"] = "f" * 64
+    failed, _ = rl_router_replay.judge(samples, traces, full_recompute=True)
+    assert any("model_inventory differs across ranks" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda sample: sample["marker"].update(capture_len=3),
+        lambda sample: sample["marker"].update(capture_len=True),
+        lambda sample: sample["marker"].update(generation_len=4),
+        lambda sample: sample["marker"].update(prompt_len=1),
+        lambda sample: sample["marker"].pop("routed_experts_shape"),
+        lambda sample: sample["marker"].update(routed_experts_shape=[4, 2, 2]),
+        lambda sample: sample["marker"].update(routed_experts_dtype="float32"),
+        lambda sample: sample["routing"][0][0].clear(),
+    ],
+)
+def test_rl_checks_router_replay_sampler_marker_and_tensor_geometry_are_required(mutate):
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    mutate(samples[0])
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("invalid captured geometry" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize("index", [True, 1.0, -1, 6])
+def test_rl_checks_router_replay_equal_invalid_expert_indices_do_not_pass(index):
+    samples = _rl_evidence_samples()
+    samples[0]["routing"][0][0][0] = index
+    trace = _rl_evidence_window(samples, range(5))
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("invalid captured geometry" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize("part", ["received", "router"])
+@pytest.mark.parametrize("index", [True, 1.0])
+def test_rl_checks_router_replay_python_equal_noninteger_observations_do_not_pass(part, index):
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    if part == "received":
+        trace["received"]["rr1:coverage"][0][0][0] = index
+    else:
+        trace["calls"][0]["router"][0]["indices"][0][0] = index
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("geometry" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize("part", ["input_ids", "position_ids", "routed_experts"])
+def test_rl_checks_router_replay_model_call_vectors_require_matching_lengths(part):
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    trace["calls"][0][part].append(copy.deepcopy(trace["calls"][0][part][-1]))
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("invalid captured geometry" in entry.name for entry in failed)
+
+
+def test_rl_checks_router_replay_sampler_replay_ids_cannot_alias():
+    samples = _rl_checks_samples()
+    samples[1]["marker"]["replay_id"] = samples[0]["marker"]["replay_id"]
+    failed, _ = rl_router_replay.judge(samples, [_rl_checks_trace(samples)], full_recompute=True)
+    assert any("replay identities are duplicated" in entry.name for entry in failed)
+
+
+def test_rl_checks_router_replay_empty_evidence_cannot_pass():
+    failed, _ = rl_router_replay.judge([], [], full_recompute=True)
+    assert [entry.name for entry in failed] == ["no generated samples to compare"]
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "uint16"])
+def test_rl_checks_router_replay_native_uint16_preserves_large_expert_indices(dtype):
+    samples = _rl_evidence_samples()
+    samples[0]["marker"]["routed_experts_dtype"] = dtype
+    samples[0]["routing"][0][0][0] = 300
+    trace = _rl_evidence_window(samples, range(5))
+    trace["model_inventory"] = _rl_evidence_inventory(experts=512)
+    failed, metrics = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    if dtype == "uint8":
+        assert any("does not fit its declared native dtype" in entry.name for entry in failed)
+    else:
+        assert failed == []
+        assert metrics["compared_positions"] == 4
 
 
 _local_creation_batch_error = (

@@ -19,6 +19,8 @@ from uuid import uuid4
 
 import ray
 
+from arctic_platform.debug.weight_sync import maybe_collect_broadcast_verification
+
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
 from arctic_platform.inference.server.chat import ChatModel, resolve_chat_model
 from arctic_platform.inference.server.metrics import RingStatLogger, get_collector
@@ -1824,6 +1826,7 @@ class InferenceWorker(StreamingWorkerMixin):
             args=(master_addr, master_port, rank_offset, world_size,
                   bucket_size, engine_only, weight_format),
         )
+        results = maybe_collect_broadcast_verification(results, engine_only=engine_only, llm=self.llm, rank_offset=rank_offset)
         if not results:
             return {}
         from arctic_platform.inference import envs
@@ -1873,6 +1876,7 @@ class InferenceWorker(StreamingWorkerMixin):
                   lora_int_id, lora_name, lora_config, bucket_size,
                   engine_only, staging, evict_first),
         )
+        results = maybe_collect_broadcast_verification(results, engine_only=engine_only, llm=self.llm, rank_offset=rank_offset)
         if not engine_only:
             self._active_lora_int_id = lora_int_id
             self._active_lora_name = lora_name

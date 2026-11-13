@@ -50,6 +50,7 @@ from typing import Dict
 from typing import Iterator
 from typing import List
 from typing import Optional
+from typing import Sequence
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -67,6 +68,7 @@ from arctic_platform.correctness.harness.config import hash_directory
 from arctic_platform.correctness.harness.cortex import TOKENIZER_JSON_SIDECARS
 from arctic_platform.correctness.harness.cortex import Checkpoint
 from arctic_platform.correctness.harness.cortex import CorrectnessClient as ArcticClient
+from arctic_platform.correctness.harness.cortex import CorrectnessClient as RLClient
 from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
 from arctic_platform.correctness.harness.cortex import UnsafeCleanupError
 from arctic_platform.correctness.harness.sft import SEED
@@ -2501,3 +2503,160 @@ def rl_gpu_count(cfg) -> int:
     """GPUs the two sub-jobs need at once: each takes its own devices, so the count is the sum."""
     sampling = int(sub_job_of_type(cfg, "sampling")["inference_config"]["n_gpus"])
     return int(cfg.n_gpus) + sampling
+
+
+@contextlib.contextmanager
+def running_rl_client(
+    cfg,
+    training_payload: dict,
+    model_path: str,
+    workdir: Path,
+    *,
+    backend: OnPremConfig | CortexConfig | None = None,
+    weight_sync_verification: bool = False,
+    router_replay_verification: bool = False,
+) -> Iterator[ArcticClient]:
+    """Create one native client whose training and sampling jobs share the reviewed config."""
+    from arctic_platform.debug.training import maybe_configure_router_replay_sampling
+    from arctic_platform.debug.weight_sync import maybe_configure_broadcast_sampling
+
+    if cfg.native is None:
+        raise ValueError(f"{cfg.config_id}: native ArcticClientConfig is required")
+    session = GatewaySession(
+        Path(workdir),
+        rl_gpu_count(cfg),
+        backend if backend is not None else OnPremConfig(),
+    )
+    payload = dict(training_payload)
+    payload.setdefault("weight_format", getattr(cfg.native.training, "weight_format", None))
+    training_only = _training_client_config(session, payload)
+    updates = {
+        "model_name": str(model_path),
+        "training": training_only.training,
+        "backend": training_only.backend,
+    }
+    updates["sampling"] = maybe_configure_broadcast_sampling(cfg.native.sampling, verify=weight_sync_verification)
+    updates["sampling"] = maybe_configure_router_replay_sampling(
+        updates["sampling"], verify=router_replay_verification
+    )
+    if isinstance(session.backend, CortexConfig):
+        native = CortexTrainingConfig.from_reviewed(cfg.native, **updates)
+    else:
+        native = ReviewedClientConfig.model_validate(
+            {
+                **cfg.native.model_dump(),
+                **updates,
+                "training": training_only.training.model_dump(),
+            }
+        )
+        native.to_onprem("training")
+        native.to_onprem("sampling")
+    client = RLClient(native)
+    try:
+        training_replay = (native.training.ds_worker_config or {}).get("router_replay") or {}
+        sampling_replay = (native.sampling.arctic_inference_config or {}).get("router_replay") or {}
+        if training_replay.get("enabled") and sampling_replay.get("enabled"):
+            client.bootstrap_router_replay(max_cache_bytes=training_replay.get("max_cache_bytes"))
+        yield client
+    finally:
+        workload = sys.exc_info()
+        try:
+            client.__exit__(*workload)
+        except UnsafeCleanupError:
+            raise
+        except Exception as exc:
+            cleanup = UnsafeCleanupError(
+                "RL client shutdown failed; inspect owned resources before retrying", shutdown_error=exc
+            )
+            if workload[1] is not None:
+                cleanup.preserve_workload(workload[1])
+            raise cleanup from exc
+
+
+def generate(client: RLClient, prompts: Sequence[Sequence[int]], sampling_params: Sequence[dict]) -> List[dict]:
+    """Generate one result per prompt, preserving each row's sampling parameters."""
+    results = client.generate(
+        [list(prompt) for prompt in prompts],
+        [dict(params) for params in sampling_params],
+    )
+    if not isinstance(results, list) or len(results) != len(prompts):
+        raise RuntimeError(f"generate returned {type(results).__name__} for {len(prompts)} prompts")
+    return results
+
+
+def sync_weights(client: RLClient) -> dict:
+    """Sync the native client's training job into its sampling job."""
+    return client.sync_weights()
+
+
+def rl_fwd_bwd(client: RLClient, batch: dict, *, replay_sampling: bool = False) -> dict:
+    """Run one RL forward-backward, optionally carrying the sampler identity for router replay."""
+    replay = None
+    if replay_sampling:
+        replay = {"sampling_job_id": str(client.jobs.sampling), "identity_version": 1}
+    return client.fwd_bwd(batch, router_replay=replay)
+
+
+def step(client: RLClient, learning_rate: float) -> dict:
+    return client.step(learning_rate)
+
+
+def rl_batch(
+    rows: Sequence[Sequence[int]],
+    loss_starts: Sequence[int],
+    pad_id: int,
+    *,
+    minimum_row_tokens: int = 0,
+) -> Dict:
+    """Right-padded RL batch in the format ``tests/sp/sp_gateway_harness.py:padded_rl_batch`` sends.
+
+    ``loss_mask`` is logit aligned: the entry at ``s`` weights the prediction of the token at ``s + 1``, so a
+    row whose scored tokens begin at ``p`` carries ones over ``p - 1`` through ``len(row) - 2``.
+    A minimum row length adds attention-active, loss-free causal tails so packing retains the shard context.
+    """
+    import torch
+
+    if type(minimum_row_tokens) is not int or minimum_row_tokens < 0:
+        raise ValueError("minimum_row_tokens must be a nonnegative integer")
+    width = max(minimum_row_tokens, max(len(row) for row in rows))
+    count = len(rows)
+    input_ids = torch.full((count, width), int(pad_id), dtype=torch.long)
+    attention_mask = torch.zeros(count, width, dtype=torch.long)
+    loss_mask = torch.zeros(count, width, dtype=torch.float32)
+    for index, (row, start) in enumerate(zip(rows, loss_starts, strict=True)):
+        input_ids[index, : len(row)] = torch.tensor(list(row), dtype=torch.long)
+        attention_mask[index, : max(len(row), minimum_row_tokens)] = 1
+        loss_mask[index, start - 1 : len(row) - 1] = 1.0
+    return {
+        "args": (),
+        "kwargs": {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        },
+        "context": {
+            "input_ids": input_ids.clone(),
+            "advantages": torch.ones(count, width, dtype=torch.float32),
+            "loss_mask": loss_mask,
+            "temperature": 1.0,
+        },
+        "processing": {
+            "post": ["compute_logprobs"],
+            "loss_fn": "grpo",
+            "config": {"loss_agg_mode": "token-mean"},
+        },
+    }
+
+
+def find_key(value, key: str) -> List:
+    """Every value stored under ``key`` anywhere in a nested response, in traversal order."""
+    found: List = []
+    if isinstance(value, dict):
+        for name, item in value.items():
+            if name == key:
+                found.append(item)
+            else:
+                found.extend(find_key(item, key))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found.extend(find_key(item, key))
+    return found

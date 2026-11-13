@@ -316,6 +316,12 @@ def _at_width(results: List[TestResult], gpus: int) -> List[TestResult]:
 
 def cortex_unavailable_reason(test, published_fixture: dict | None = None) -> str | None:
     """Reject checks whose artifacts or reviewed target identity are unavailable."""
+    unavailable = {
+        "rl-weight-sync": "weight-sync verification requires worker-local environment access",
+        "rl-router-replay": "router-replay verification requires worker-local trace instrumentation",
+    }
+    if test.test_id in unavailable:
+        return unavailable[test.test_id]
     if test.test_id in {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}:
         if published_fixture is not None:
             return None
@@ -336,10 +342,14 @@ def _cortex_rejection(
     local_gateway_full_model: bool = False,
     local_cortex_fixture: bool = False,
     native_adapter_initialization: bool = False,
+    local_weight_sync: bool = False,
+    local_router_replay: bool = False,
 ) -> TestResult | None:
     reason = (
         None
-        if local_gateway_full_model and test.test_id == "e2e-sft-train-validate"
+        if (local_gateway_full_model and test.test_id == "e2e-sft-train-validate")
+        or (local_weight_sync and test.test_id == "rl-weight-sync")
+        or (local_router_replay and test.test_id == "rl-router-replay")
         else cortex_unavailable_reason(test, published_fixture)
     )
     native_e2e_adapter = local_cortex_fixture and test.test_id == "e2e-sft-train-validate"
@@ -1176,7 +1186,7 @@ def execute_rl(
     inference_export_allocation: dict | None = None,
     inference_initial_model_dir: Path | None = None,
 ) -> List[TestResult]:
-    """Run only registered reference-free checkpoint and inference checks for a rollout recipe; this is not RL judge coverage."""
+    """Run each selected reference-free RL check independently at the declared training and sampling widths."""
     if workdir is not None:
         workdir = require_data_fast_path(workdir, label="RL correctness workdir")
     client_backend = client_backend if client_backend is not None else OnPremConfig()
@@ -1255,7 +1265,22 @@ def execute_rl(
             )
             continue
         if isinstance(context.client_backend, CortexConfig):
-            rejection = _cortex_rejection(test, cfg, context.published_fixture)
+            from arctic_platform.correctness.harness.gateway import is_local_cortex_gateway
+            from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+
+            local_weight_sync = test.test_id == "rl-weight-sync" and is_local_cortex_gateway(context.client_backend)
+            local_router_replay = test.test_id == "rl-router-replay" and is_local_cortex_gateway(
+                context.client_backend
+            )
+            if local_weight_sync or local_router_replay:
+                require_local_cortex_gateway(context.client_backend)
+            rejection = _cortex_rejection(
+                test,
+                cfg,
+                context.published_fixture,
+                local_weight_sync=local_weight_sync,
+                local_router_replay=local_router_replay,
+            )
             if rejection is not None:
                 results.append(rejection)
                 continue

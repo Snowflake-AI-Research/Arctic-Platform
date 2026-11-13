@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU admission controls and five-check CLI registration without model downloads or a target service."""
+"""CPU admission controls and seven-test CLI registration without model downloads or a target service."""
 
 import json
 import re
@@ -79,13 +79,13 @@ class TestNoDebugCorrectness(TestCasePlus):
             *arguments,
         )
 
-    def test_list_registers_all_five_checks(self):
+    def test_list_registers_all_seven_tests(self):
         config_root = self.get_auto_remove_tmp_dir()
         result = self._cli("list", "--config-dir", str(config_root))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         tests = result.stdout.split("Tests:", 1)[1]
         identifiers = re.findall(r"^([a-z][a-z0-9-]+)\s+", tests, re.MULTILINE)
-        self.assertEqual(len(identifiers), 5)
+        self.assertEqual(len(identifiers), 7)
         self.assertCountEqual(
             identifiers,
             [
@@ -94,6 +94,8 @@ class TestNoDebugCorrectness(TestCasePlus):
                 "checkpoint-resume-loss",
                 "inference-checkpoint-loss",
                 "e2e-sft-train-validate",
+                "rl-weight-sync",
+                "rl-router-replay",
             ],
         )
 
@@ -108,10 +110,10 @@ class TestNoDebugCorrectness(TestCasePlus):
             "checkpoint-resume-loss",
             "inference-checkpoint-loss",
             "e2e-sft-train-validate",
+            "rl-weight-sync",
+            "rl-router-replay",
         ]:
             self.assertIn(identifier, help_text)
-        self.assertNotIn("rl-weight-sync", help_text)
-        self.assertNotIn("rl-router-replay", help_text)
 
     def test_run_help_loads_without_debug(self):
         result = self._cli("run", "--help")
