@@ -199,6 +199,7 @@ class ActivationOffloadManager:
         self._active_depth = 0
         self._models: weakref.WeakSet[torch.nn.Module] = weakref.WeakSet()
         self._persistent_storages: set[tuple[torch.device, int]] = set()
+        self._resident_depth = 0
         self._pinned_cache_stats = _PinnedCacheStats()
         self.pinned_cache = _PinnedStagingCache(self._pinned_cache_stats)
         self.stats = _OffloadStats()
@@ -365,8 +366,25 @@ class ActivationOffloadManager:
             return False
         return True
 
+    def keep_on_gpu(self, module: torch.nn.Module) -> None:
+        """Leave every tensor ``module``'s forward saves for backward on the GPU.
+
+        For blocks left out of activation checkpointing (``ac_config.layers``): such a block saves all its
+        intermediates, not one boundary, and streaming those through host memory costs host memory and PCIe time
+        that the block was left out of recompute to save.
+        """
+
+        def enter(_module, _args):
+            self._resident_depth += 1
+
+        def leave(_module, _args, _output):
+            self._resident_depth -= 1
+
+        module.register_forward_pre_hook(enter)
+        module.register_forward_hook(leave, always_call=True)
+
     def pack(self, tensor: torch.Tensor):
-        if not self._eligible(tensor):
+        if self._resident_depth or not self._eligible(tensor):
             return (False, tensor)
         self._ensure_streams(tensor.device)
         slot_id = self._next_id
