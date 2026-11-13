@@ -24,7 +24,17 @@ from arctic_platform.debug.weight_sync import maybe_collect_broadcast_verificati
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
 from arctic_platform.inference.server.chat import ChatModel, resolve_chat_model
 from arctic_platform.inference.server.metrics import RingStatLogger, get_collector
-from arctic_platform.inference.server.streaming import StreamingWorkerMixin, stream_lifecycle_change
+from arctic_platform.inference.server.streaming import (
+    StreamingWorkerMixin,
+    stream_lifecycle_change,
+)
+from arctic_platform.inference.server.media_prompts import (
+    SUPPORTS_MEDIA,
+    decodable_modalities,
+    decode_media,
+    is_media_prompt,
+    validate_media_prompt,
+)
 from arctic_platform.inference.server.token_prompts import check_token_tensor, is_token_tensor
 from arctic_platform.inference.vllm.dense_prompt_logprobs import (
     RESULT_KEY as _DENSE_PROMPT_LOGPROBS_KEY,
@@ -717,6 +727,124 @@ def _result_from_output(
     return result
 
 
+# vllm/multimodal/processing/inputs.py (v0.33.0) lines 13-17.
+_HF_MODALITY_PROCESSOR_KWARGS = {
+    "image": "images_kwargs",
+    "video": "videos_kwargs",
+    "audio": "audio_kwargs",
+}
+
+
+def _media_hashes(
+    prompt: Mapping[str, Any], model_config: Any, renderer: Any, request_id: str
+) -> dict[str, list[str]]:
+    """The per-item media hashes vLLM uses for its processor and prefix caches.
+
+    vLLM 0.33 does not hand them back: ``RequestOutput`` (vllm/outputs.py,
+    v0.33.0, lines 137-200) has no hash field. They exist only inside the engine,
+    on the ``MultiModalInput`` the renderer's ``_process_multimodal`` builds
+    (vllm/renderers/base.py, v0.33.0, lines 944-985) and on each item's
+    ``MultiModalFeatureSpec.mm_hash`` (vllm/multimodal/inputs.py, v0.33.0, lines
+    344-373), and ``AsyncLLM.generate`` returns neither. Running the renderer a
+    second time to get them would run the HF processor again, touch the processor
+    cache and draw a new request id from its counter. So this repeats
+    ``ProcessorInputs.get_mm_hashes`` (vllm/multimodal/processing/inputs.py,
+    v0.33.0, lines 34-109) with vLLM's own ``MultiModalHasher`` and the engine's
+    ``mm_hasher_algorithm`` (vllm/config/multimodal.py, v0.33.0, line 372). The
+    items are the ones vLLM hashes: the renderer's own processor parses the data
+    (vllm/renderers/base.py, v0.33.0, line 959; a ``None`` modality is dropped,
+    vllm/multimodal/parse.py, v0.33.0, lines 861-873) and each item is taken from
+    ``get_all_items_for_hash`` (vllm/multimodal/processing/inputs.py, v0.33.0, line
+    85). That item is not always the prompt's: a decoded video
+    ``MediaWithBytes((frames, metadata), bytes)`` is hashed as
+    ``(MediaWithBytes(frames, bytes), metadata)`` (parse.py lines 412-417 and
+    650-654), and a PIL image is hashed after its RGB conversion (lines 772-777).
+    ``model_id`` is the processor info's ``model_id``, which vLLM passes
+    (vllm/multimodal/processing/processor.py, v0.33.0, lines 1396-1401). Each
+    item is hashed with ``model_id``, the item (or the caller's uuid in its place)
+    and the non-empty ``mm_processor_kwargs``, scoped to the item's modality; a
+    caller's uuid is the hash only when those are empty (inputs.py lines 70-105). vLLM's
+    other factor, ``media_io_kwargs``, is always empty here: a media prompt cannot
+    carry it (``MEDIA_PROMPT_KEYS``).
+
+    The kwargs are the prompt's own, as vLLM's renderer hands them over
+    (vllm/renderers/base.py, v0.33.0, lines 1066-1074 and 966-971): the engine's
+    ``mm_processor_kwargs`` are not on ``ProcessorInputs`` and its
+    ``media_io_kwargs`` only decode, so neither is a hash factor. With
+    ``mm_processor_cache_gb == 0`` and prefix caching off, vLLM gives every item
+    without a uuid a per-request one instead of hashing its content (lines
+    923-938); its ids come from a renderer counter this worker cannot see (line
+    957), so this does the same with ``request_id``: the hashes are per request,
+    as vLLM's are, and never shared across requests.
+    """
+    from vllm.multimodal.hasher import MultiModalHasher
+
+    mm_config = model_config.multimodal_config
+    if mm_config is None:
+        raise ValueError(f"Model {model_config.model} does not take multi_modal_data")
+    algorithm = mm_config.mm_hasher_algorithm
+    processor_kwargs = prompt.get("mm_processor_kwargs") or {}
+    synthetic_uuids = mm_config.mm_processor_cache_gb == 0 and not renderer.config.cache_config.enable_prefix_caching
+    uuids = prompt.get("multi_modal_uuids") or {}
+    info = renderer.get_mm_processor().info
+    hashes: dict[str, list[str]] = {}
+    for modality, data_items in info.parse_mm_data(prompt["multi_modal_data"]).items():
+        items = data_items.get_all_items_for_hash()
+        item_uuids = uuids.get(modality)
+        if item_uuids is None:
+            item_uuids = [None] * len(items)
+        elif not isinstance(item_uuids, list):
+            # vllm/multimodal/parse.py (v0.33.0) lines 883-890: a single uuid is a list of one.
+            item_uuids = [item_uuids]
+        if len(item_uuids) != len(items):
+            raise ValueError(f"Got {len(item_uuids)} multi_modal_uuids for {len(items)} {modality} items")
+        if synthetic_uuids:
+            item_uuids = [
+                uuid if uuid is not None else f"{request_id}-{modality}-{i}"
+                for i, uuid in enumerate(item_uuids)
+            ]
+        if modality in _HF_MODALITY_PROCESSOR_KWARGS:
+            scoped_key = _HF_MODALITY_PROCESSOR_KWARGS[modality]
+            mm_processor_kwargs = {
+                key: value
+                for key, value in processor_kwargs.items()
+                if key not in _HF_MODALITY_PROCESSOR_KWARGS.values() or key == scoped_key
+            }
+        else:
+            mm_processor_kwargs = dict(processor_kwargs)
+        hash_factors = {"mm_processor_kwargs": mm_processor_kwargs} if mm_processor_kwargs else {}
+        hashes[modality] = [
+            MultiModalHasher.hash_kwargs(
+                algorithm,
+                model_id=info.model_id,
+                **{modality: uuid if uuid is not None else item},
+                **hash_factors,
+            )
+            if uuid is None or hash_factors
+            else uuid
+            for item, uuid in zip(items, item_uuids)
+        ]
+    return hashes
+
+
+def _placeholder_ids(hf_config: Any) -> dict[str, int]:
+    """``{modality: placeholder token id}`` from a loaded HF config.
+
+    The media spec of the config's ``model_type`` gives them; a model type
+    without one falls back to the config's ``image_token_id`` /
+    ``video_token_id``, read as the Qwen-VL spec reads them.
+    """
+    # Imported here, not at module level: this keeps ``common.packing`` (and
+    # the ``torch.nn.functional`` it imports) off worker.py's import path.
+    from arctic_platform.common.packing.media_spec import config_placeholder_ids
+    from arctic_platform.common.packing.media_spec import media_spec_for
+
+    spec = media_spec_for(getattr(hf_config, "model_type", None) or "")
+    if spec is not None:
+        return spec.placeholder_ids(hf_config)
+    return config_placeholder_ids(hf_config)
+
+
 def _maybe_cache_routed_experts(
     result: dict[str, Any],
     *,
@@ -876,6 +1004,8 @@ def _ensure_actor_logging(level: int = logging.INFO) -> str:
 @ray.remote
 class InferenceWorker(StreamingWorkerMixin):
     """Ray actor that hosts an in-process vLLM AsyncLLM engine."""
+
+    supports_media = SUPPORTS_MEDIA
 
     def __init__(self) -> None:
         # First, so that everything below is loggable.  Reported rather than
@@ -1212,7 +1342,14 @@ class InferenceWorker(StreamingWorkerMixin):
         prompt: Any,
         *,
         enable_thinking: bool | None,
-    ) -> tuple[str | list[int], list[int], bool | None]:
+    ) -> tuple[str | list[int] | dict[str, Any], list[int], bool | None]:
+        if is_media_prompt(prompt):
+            # Placeholders are token ids like any other: the think check reads the
+            # unexpanded ids, and the media rides along untouched.
+            prompt_ids, _, reasoning_ended = self._prefill_think_for_generation(
+                prompt["prompt_token_ids"], enable_thinking=enable_thinking
+            )
+            return {**prompt, "prompt_token_ids": prompt_ids}, prompt_ids, reasoning_ended
         if is_token_tensor(prompt):
             return self._prefill_think_for_token_tensor(prompt, enable_thinking=enable_thinking)
         if isinstance(prompt, list):
@@ -1384,7 +1521,12 @@ class InferenceWorker(StreamingWorkerMixin):
         )
 
     async def generate(self, prompt: Any, sampling_params: dict[str, Any]) -> dict[str, Any]:
-        """Generate for one prompt: text, ``list[int]``, or a 1-D integer CPU tensor of token ids."""
+        """Generate for one prompt: text, ``list[int]``, a 1-D integer CPU tensor of token ids, or a media prompt.
+
+        A media prompt is a dict of vLLM ``TokensPrompt`` keys (``prompt_token_ids``,
+        ``multi_modal_data``, optional ``mm_processor_kwargs`` and ``multi_modal_uuids``).
+        Its result adds the expanded ``prompt_token_ids`` and ``mm_hashes``.
+        """
         if self.state != WorkerLifecycleState.READY:
             raise RuntimeError(f"Worker not ready: state={self.state.value}")
         if getattr(self, "_stream_cleanup_failed", False):
@@ -1392,9 +1534,12 @@ class InferenceWorker(StreamingWorkerMixin):
         # Anything else would be stringified and generated from as text.
         if is_token_tensor(prompt):
             check_token_tensor(prompt)
+        elif is_media_prompt(prompt):
+            prompt = validate_media_prompt(prompt)
         elif not isinstance(prompt, (str, list)):
             raise TypeError(
-                f"Expected a text prompt, a token-id list or a 1-D token-id tensor, got {type(prompt).__name__}"
+                "Expected a text prompt, a token-id list, a 1-D token-id tensor or a media prompt, "
+                f"got {type(prompt).__name__}"
             )
 
         from vllm import SamplingParams
@@ -1450,8 +1595,24 @@ class InferenceWorker(StreamingWorkerMixin):
             enable_thinking=enable_thinking,
         )
 
-        if isinstance(effective_prompt, list):
-            prompt_input: Any = {"prompt_token_ids": effective_prompt}
+        media_hashes = None
+        if isinstance(effective_prompt, dict):
+            from vllm.inputs import TokensPrompt
+
+            model_config = self.llm.model_config
+            mm_config = model_config.multimodal_config
+            if mm_config is None:
+                raise ValueError(f"Model {model_config.model} does not take multi_modal_data")
+            # Decoding is CPU work: keep it off the event loop.
+            effective_prompt = await asyncio.to_thread(
+                decode_media, effective_prompt, mm_config.media_io_kwargs
+            )
+            media_hashes = _media_hashes(
+                effective_prompt, model_config, self.llm.renderer, request_id
+            )
+            prompt_input: Any = TokensPrompt(**effective_prompt)
+        elif isinstance(effective_prompt, list):
+            prompt_input = {"prompt_token_ids": effective_prompt}
         else:
             prompt_input = effective_prompt
 
@@ -1473,6 +1634,14 @@ class InferenceWorker(StreamingWorkerMixin):
             replica_label=self._replica_label,
             return_back_router_info=return_back_router_info,
         )
+        if media_hashes is not None:
+            # RL trains on the expanded ids and keys router replay and prefix caching
+            # on them and the media hashes.
+            expanded_ids = getattr(final_output, "prompt_token_ids", None)
+            if not expanded_ids:
+                raise RuntimeError(f"vLLM returned no prompt_token_ids for media request {request_id}")
+            result["prompt_token_ids"] = list(expanded_ids)
+            result["mm_hashes"] = media_hashes
         if self._return_reasoning_content:
             self._apply_reasoning_parser(result, reasoning_ended=reasoning_ended)
         if return_action_masks:
@@ -1515,6 +1684,28 @@ class InferenceWorker(StreamingWorkerMixin):
 
     def get_state(self) -> str:
         return self.state.value
+
+    def media_modalities(self) -> dict[str, int]:
+        """``{modality: placeholder token id}`` for each modality this worker's ``generate`` decodes.
+
+        Computed here, in the process that decodes and that holds the loaded
+        model: the modalities from this engine's resolved ``media_io_kwargs``
+        and this process's environment and libraries, the ids from the
+        engine's HF config through the model type's media spec (else the
+        config's ``image_token_id`` / ``video_token_id``). A caller on another
+        host can tell neither. ``{}`` before the engine is up, when media
+        prompts are unsupported, or when the model takes no media. Raises the
+        media spec's ``ValueError`` for a config it cannot place tokens with.
+        """
+        if not self.supports_media or self.llm is None:
+            return {}
+        model_config = self.llm.model_config
+        mm_config = model_config.multimodal_config
+        if mm_config is None:
+            return {}
+        ids = _placeholder_ids(model_config.hf_config)
+        decodable = decodable_modalities(mm_config.media_io_kwargs)
+        return {modality: ids[modality] for modality in sorted(decodable) if modality in ids}
 
     def get_stats(self) -> dict[str, Any]:
         """Return the latest scheduler stats, plus liveness metadata.

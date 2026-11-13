@@ -34,6 +34,49 @@ Invariants to preserve:
 - Anything aligned against a token's neighbour -- a shift, a roll -- happens before packing. After packing, a row's neighbour is the next row.
 - A `ROW_BROADCAST_KEYS` leaf (`sampler_kl_weights`) may arrive as one value per row, `[B]`; packing writes that value on each of the row's tokens. It cannot wait for the loss: a window can hold as many tokens as rows, and then its 1-D leaves no longer say which they count.
 
+## Multimodal positions
+
+Qwen vision-language models rotate each token by temporal, height and width positions (M-RoPE). `mrope_position_ids(mm_token_type_ids, cu_seqlens, spatial_merge_size=..., image_grid_thw=..., video_grid_thw=...)` builds them for a packed call as `[4, 1, T]`:
+
+- Channel 0 is the plain text position, `0 .. len - 1` within each packed row. `cu_seqlens_from_position_ids` reads a 3-D tensor's channel 0, so varlen boundaries still derive from the positions.
+- Channels 1-3 are temporal, height and width. Text advances all three together; a run of image tokens lays out its merged patch grid from the current position, and the text after it resumes at the current position plus the grid's largest side. A video is `t` frames of `[1, h, w]`, each placed like an image.
+- Each row restarts at 0, so a packed row gets the positions it would get alone. Tail padding is 0 on every channel. A media run may not cross a row boundary, and every grid row must be used.
+
+Token types are 0 text, 1 image, 2 video; grids are `[t, h, w]` in patches before the spatial merge, in packed order.
+
+## Media
+
+A batch carries images as three top-level leaves: `pixel_values` (`[patches, patch_dim]`, every image's patches concatenated), `image_grid_thw` (`[images, 3]`) and `image_row_ids` (`[images]`, the row each image belongs to, non-decreasing). Video uses `pixel_values_videos`, `video_grid_thw` and `video_row_ids`. Image `i` owns `prod(grid_i)` consecutive patches and `prod(grid_i) / merge**2` consecutive tokens of its row. Code: `media.py`.
+
+These leaves are matched by key, never by shape. Their leading dimension counts patches or images, so the row and token rules above would mis-slice them whenever a count happened to equal the row count or the token width.
+
+- `select_rows` moves each row's media with it and renumbers the row ids to the new order.
+- `pack_microbatch` checks the media against the rows and passes it through: packing keeps rows in order, so a row id still names its row in the packed call.
+- `pad_packed_microbatch` leaves media alone.
+- `token_shard(..., spatial_merge_size=...)` gives each window every image or video whose tokens sit inside it, whole (a vision tower encodes complete items, and the window holds all of the item's placeholder tokens). An item whose tokens straddle a window boundary is refused, naming the item, its token span and the boundary, on every window of the call: each window would otherwise get all its pixels but only part of its tokens. A caller avoids a straddle by moving the boundary off the item: pad or reorder the text before it. Locating the tokens takes the packed `mm_token_type_ids` and the merge size, so a call carrying media must pass both; an image whose tokens are not in its own row, or grids that disagree with the token count, are refused.
+- Multimodal `[4, 1, T]` `position_ids` are padded with zeros and cut on their token axis like any token leaf, so gathering the windows' positions still rebuilds the call's boundaries.
+
+Media leaves ride at the top level only; one inside `context` is refused.
+
+### Media spec per model
+
+Everything above is the Qwen-VL layout. `media_spec_for(model_type)` (`media_spec.py`) returns the `MediaSpec` that states it for one model family, or `None` for a model with no registered media:
+
+- `kinds` / `modalities`: the media the model takes, each a `MediaKind` with its values, grid and row-id leaf names and its token type;
+- `placeholder_ids(config)`: `{modality: token id}` read from the model config (Qwen-VL: `image_token_id`, `video_token_id`, top-level or under `text_config`);
+- `spatial_merge_size(config)`: the vision tower's merge factor (Qwen-VL: `vision_config.spatial_merge_size`);
+- `positions`: `"mrope"` (`[4, 1, T]`) or `"1d"`.
+
+An item's token count is not in the spec: `media_token_spans`, `mrope_position_ids` and `window_media` count `t * h * w / merge**2` tokens per item, so a family that counts otherwise brings its count with them.
+
+The Qwen-VL entry is registered for `qwen4_exp` only: its Arctic modeling takes `[4, 1, T]` M-RoPE `position_ids` and both `pixel_values` and `pixel_values_videos`. Other Qwen vision-language model types are left out until their Arctic code path does the same: Arctic's `qwen3_5_moe` modeling flattens `position_ids.view(-1)` to find its packed rows and has no `pixel_values_videos` parameter, and `qwen3_vl`, `qwen3_vl_moe` and `qwen3_5` have no Arctic modeling that reads `[4, 1, T]` positions. A family with another layout adds its own with `register_media_spec(model_type, spec)`; a model type registered twice is refused.
+
+`run_pipeline` takes its media kinds, merge factor and position layout from the spec of the engine's `model_type`, and checks each item's tokens with `media_token_spans`. A model type with no spec gets `pixel_values` and `image_grid_thw` as sent, with no M-RoPE positions or row ids, and any other media key is refused for it. `mm_token_type_ids` is read to build the positions and is not forwarded to the model.
+
+### Media under context parallelism
+
+A CP rank's model call takes a media call windowed, which is what every dispatch sends: a caller's data plane and `run_pipeline`. Each rank gets `token_shard`'s window with the whole media items in it; `token_shard` refuses an item that straddles windows. The call is already sharded, so the Qwen3.8 CP wrapper (`qwen38/context_parallel.py`) runs it as it does a text-only call.
+
 ## Cost
 
 One index and one kernel per tensor, not per row. `packed_token_index(valid_lengths, cu_seqlens, sequence_length)` gives every packed token's position in the flattened `[B * S, ...]` batch; packing is an `index_select` against it and unpacking an `index_copy_`, for any trailing shape and any number of leaves. The index is built once per call and reused for every leaf, so cost tracks tokens rather than rows: on an H200, packing six `[B, S]` leaves plus a `[B, S, 512]` leaf takes 0.36 ms at 8, 32 and 128 rows.

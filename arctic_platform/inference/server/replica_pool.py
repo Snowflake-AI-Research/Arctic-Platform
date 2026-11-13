@@ -13,6 +13,7 @@ import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from arctic_platform.inference.server.config import ModelConfig
+from arctic_platform.inference.server.media_prompts import is_media_prompt
 from arctic_platform.inference.server.scheduler import (
     RoutingFn,
     Scheduler,
@@ -143,6 +144,20 @@ def ensure_ray() -> int:
         raise RuntimeError("No GPUs available in the Ray cluster")
     logger.info(f"{total} GPUs available across {len(nodes)} node(s)")
     return total
+
+
+def _media_routing_key(prompt: Any, routing_key: str | None) -> str | None:
+    """Key an unkeyed media prompt by its token ids.
+
+    The scheduler's prefix hash of a dict covers only its keys, which would pin
+    every media prompt to one worker.
+    """
+    if routing_key is not None or not is_media_prompt(prompt):
+        return routing_key
+    token_ids = prompt.get("prompt_token_ids")
+    if is_token_tensor(token_ids):
+        token_ids = token_ids.tolist()
+    return f"media-prompt:{hash(tuple(token_ids or ()))}"
 
 
 class ReplicaPool:
@@ -981,7 +996,7 @@ class ReplicaPool:
 
     async def generate(
         self,
-        prompts: str | list[int] | list[str | list[int]],
+        prompts: str | list[int] | dict[str, Any] | list[str | list[int] | dict[str, Any]],
         sampling_params: dict[str, Any] | list[dict[str, Any] | None] | None = None,
         model_id: str | None = None,
         routing_key: str | list[str | None] | None = None,
@@ -991,9 +1006,10 @@ class ReplicaPool:
 
         Args:
             prompts: A single prompt (``str``, token-id ``list[int]``, or a 1-D
-                integer CPU tensor of token ids) or a batch of prompts (a list
-                of those, or a 2-D integer tensor with one prompt per row).
-                Tensors reach the worker as tensors; see ``token_prompts``.
+                integer CPU tensor of token ids, or a media prompt dict of vLLM
+                ``TokensPrompt`` keys) or a batch of prompts (a list of those,
+                or a 2-D integer tensor with one prompt per row). Tensors reach
+                the worker as tensors; see ``token_prompts``.
             sampling_params: vLLM sampling parameters (dict or SamplingParams).
             model_id: Ignored in single-model mode.
             routing_key: Optional per-batch affinity key. A single string
@@ -1013,7 +1029,7 @@ class ReplicaPool:
 
     def submit_generate_futures(
         self,
-        prompts: str | list[int] | list[str | list[int]],
+        prompts: str | list[int] | dict[str, Any] | list[str | list[int] | dict[str, Any]],
         sampling_params: dict[str, Any] | list[dict[str, Any] | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool = False,
@@ -1055,9 +1071,12 @@ class ReplicaPool:
                     f"got shape {tuple(prompts.shape)}"
                 )
             prompts = list(prompts)
-        if isinstance(prompts, str):
+        # A dict is one prompt, never a batch of its keys: the worker takes a
+        # media prompt and refuses any other dict.
+        if isinstance(prompts, (str, dict)):
             return [self._scheduler.submit(
-                prompts, _single_params(), routing_key=_single_key(), strict=strict,
+                prompts, _single_params(),
+                routing_key=_media_routing_key(prompts, _single_key()), strict=strict,
             )]
         if prompts and isinstance(prompts[0], int):
             return [self._scheduler.submit(
@@ -1083,7 +1102,9 @@ class ReplicaPool:
         else:
             params_list = [params] * len(prompts)
         return [
-            self._scheduler.submit(prompt, param, routing_key=key, strict=strict)
+            self._scheduler.submit(
+                prompt, param, routing_key=_media_routing_key(prompt, key), strict=strict,
+            )
             for prompt, param, key in zip(prompts, params_list, keys)
         ]
 
@@ -1325,6 +1346,23 @@ class ReplicaPool:
         # Every replica loads the same model with the same engine kwargs.
         worker = await self._scheduler.wait_for_schedulable_worker(timeout)
         return await worker.get_chat_support.remote()
+
+    async def media_modalities(
+        self, model_id: str | None = None, *, timeout: float = 600.0
+    ) -> dict[str, int]:
+        """``{modality: placeholder token id}`` the loaded model's workers decode (see ``InferenceWorker.media_modalities``).
+
+        Asked of one worker the scheduler can route to, in its own process:
+        every replica runs the same image with the same engine kwargs and
+        model config. Waits up to ``timeout`` seconds for such a worker, as a
+        restarting worker is not initialized yet, and raises when none is ready
+        by then: ``{}`` means the model takes no media.
+        """
+        self._check_model_id(model_id)
+        if self._scheduler is None:
+            raise RuntimeError("ReplicaPool not initialized")
+        worker = await self._scheduler.wait_for_schedulable_worker(timeout)
+        return await worker.media_modalities.remote()
 
     # ------------------------------------------------------------------
     # Metrics

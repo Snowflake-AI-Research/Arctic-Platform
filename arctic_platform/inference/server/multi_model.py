@@ -391,6 +391,13 @@ class Driver:
     async def get_chat_support(self, model_id: str | None = None) -> dict[str, bool]:
         return await self._get_pool(model_id).get_chat_support()
 
+    async def media_modalities(self, model_id: str | None = None) -> dict[str, int]:
+        """``{modality: placeholder token id}`` the model's workers decode (see ``ReplicaPool.media_modalities``).
+
+        Raises when the model has no ready worker in time; ``KeyError`` for an unknown model.
+        """
+        return await self._get_pool(model_id).media_modalities()
+
     # ------------------------------------------------------------------
     # Metrics
     # ------------------------------------------------------------------
