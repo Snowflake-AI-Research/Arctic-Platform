@@ -199,6 +199,29 @@ def test_the_placement_option_wins_and_the_environment_is_the_fallback(monkeypat
     assert placement.placement_value() is None
 
 
+def test_deepep_v2_settings_take_the_option_then_the_environment_then_the_default(monkeypatch):
+    runtime_options = _module("moe.runtime_options")
+    monkeypatch.delenv("ARL_DEEPEP_V2_NUM_SMS", raising=False)
+    monkeypatch.delenv("ARL_DEEPEP_V2_MAX_TOKENS", raising=False)
+    apply_moe_runtime_options(GlmMoeDsaOptions())
+    assert (runtime_options.deepep_v2_num_sms(32), runtime_options.deepep_v2_max_tokens(8192)) == (32, 8192)
+    monkeypatch.setenv("ARL_DEEPEP_V2_NUM_SMS", "0")
+    monkeypatch.setenv("ARL_DEEPEP_V2_MAX_TOKENS", "16384")
+    assert (runtime_options.deepep_v2_num_sms(32), runtime_options.deepep_v2_max_tokens(8192)) == (0, 16384)
+    apply_moe_runtime_options(GlmMoeDsaOptions(deepep_v2_num_sms=24, deepep_v2_max_tokens=20000))
+    assert (runtime_options.deepep_v2_num_sms(32), runtime_options.deepep_v2_max_tokens(8192)) == (24, 20000)
+    apply_moe_runtime_options(GlmMoeDsaOptions(deepep_v2_num_sms=0))
+    assert runtime_options.deepep_v2_num_sms(32) == 0
+    apply_moe_runtime_options(GenericMoeOptions())  # a load that sets neither leaves the environment in charge
+    assert (runtime_options.deepep_v2_num_sms(32), runtime_options.deepep_v2_max_tokens(8192)) == (0, 16384)
+
+
+@pytest.mark.parametrize("fields", [{"deepep_v2_num_sms": -1}, {"deepep_v2_max_tokens": 0}])
+def test_bad_deepep_v2_settings_are_refused(fields):
+    with pytest.raises(ValidationError):
+        GlmMoeDsaOptions(**fields)
+
+
 # The loaders that reject expert parallelism, and so have no MoE runtime.
 _NO_EXPERT_PARALLEL = {"huggingface", "dflash2"}
 LOADER_OPTIONS = sorted(
@@ -334,6 +357,22 @@ def test_load_moe_model_applies_the_options_before_it_builds_the_model(monkeypat
         device_mesh_type=Mesh,
     )
     assert order == [("config", 2), ("load", 2)]
+
+
+@pytest.mark.parametrize("options_cls", LOADER_OPTIONS)
+def test_every_moe_loader_takes_the_deepep_v2_settings(options_cls):
+    assert options_cls(deepep_v2_num_sms=0, deepep_v2_max_tokens=4096).deepep_v2_num_sms == 0
+
+
+@pytest.mark.parametrize("options_cls", LOADER_OPTIONS)
+def test_every_moe_loader_refuses_deepep_v2_recompute_without_the_replay(options_cls):
+    """A whole-block recompute dispatches through DeepEP V2 with its forward's handle, which the combine replay
+    carries; every MoE loader refuses the backend under full checkpointing without it."""
+    with pytest.raises(ValidationError, match="combine_replay"):
+        options_cls(ep_comm_backend="deepep_v2", ac_config={"mode": "full"})
+    assert options_cls(ep_comm_backend="deepep_v2", ac_config={"mode": "full", "combine_replay": True}).ac_config
+    assert options_cls(ep_comm_backend="deepep_v2").ep_comm_backend == "deepep_v2"
+    assert options_cls(ep_comm_backend="uccl", ac_config={"mode": "full"}).ac_config.combine_replay is False
 
 
 def test_w8a8_experts_reach_the_experts_built_after_the_load():

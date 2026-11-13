@@ -23,10 +23,12 @@ from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import field_validator
 from pydantic import model_validator
+from typing_extensions import Self
 
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config import EPCommBackend
+from arctic_platform.model.implementations.moe.config_validation import validate_deepep_v2_recompute
 from arctic_platform.model.implementations.moe.runtime_options import MoeRuntimeOptions
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
@@ -62,6 +64,11 @@ class InklingOptions(MoeRuntimeOptions):
         if options.pop("fused_cross_entropy", False) is not False:
             raise ValueError("Inkling training uses the native LM head")
         return options
+
+    @model_validator(mode="after")
+    def _deepep_v2_recompute_needs_its_forwards_dispatch(self) -> Self:
+        validate_deepep_v2_recompute(self.ep_comm_backend, self.ac_config)
+        return self
 
 
 def _matches(ctx: LoaderContext) -> bool:
