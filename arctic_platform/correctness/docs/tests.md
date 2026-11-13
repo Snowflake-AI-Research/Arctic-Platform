@@ -64,11 +64,11 @@ Implementation: [optimizer verdict](../checks/fwd_bwd_step.py), [artifact decodi
 
 ## 3. Checkpoint Resume Loss (`checkpoint-resume-loss`)
 
-**Compare uninterrupted training with training interrupted by a checkpoint and resumed in a fresh job. Both sides use Arctic Platform; there is no Hugging Face reference.**
+**Compare uninterrupted and checkpoint-resumed Arctic Platform training losses.**
 
 ### What Runs
 
-For each selected arm, one job trains for 20 iterations without interruption. A second job consumes the identical first ten batches and saves a resumable checkpoint. A fresh third job loads that checkpoint and consumes batches 11 through 20. Both trajectories use the test's fixed learning rate of `0.001`, not the recipe's learning rate.
+Both trajectories use Arctic Platform; there is no Hugging Face reference. For each selected arm, one job trains for 20 iterations without interruption. A second job consumes the identical first ten batches and saves a resumable checkpoint. A fresh third job loads that checkpoint and consumes batches 11 through 20. Both trajectories use the test's fixed learning rate of `0.001`, not the recipe's learning rate.
 
 Every iteration has a distinct seeded batch, materialized into identical request bytes for both trajectories. The resumed job must continue the data order rather than replay the first ten batches. The checkpoint must restore weights, optimizer moments and scheduler state; a weights-only inference export is insufficient.
 
@@ -137,7 +137,7 @@ Implementation: [replay preparation, trajectory diagnostics and verdict](../chec
 
 ## 6. RL Weight Synchronization (`rl-weight-sync`)
 
-**After one reinforcement-learning optimizer step, verify that every sampling rank receives the trainer's intended tensors and installs their values correctly.**
+**After one reinforcement-learning optimizer step, verify exact tensor receipt on every sampling rank, plus installed full-weight values or LoRA destination bindings.**
 
 ### What Runs
 
