@@ -77,7 +77,11 @@ def test_training_margin_reaches_model_and_survives_engine_initialization(monkey
     assert worker._gpu_mem_preallocation is reserve
 
 
-def test_destroy_retains_buffer_through_sender_and_communicator_teardown(monkeypatch):
+@pytest.mark.parametrize("sender_fails", [False, True])
+@pytest.mark.parametrize("communicator_fails", [False, True])
+def test_destroy_retains_buffer_through_sender_and_communicator_teardown(
+    monkeypatch, sender_fails, communicator_fails
+):
     mod = worker_module()
     cls = mod.DeepSpeedWorker.__ray_metadata__.modified_class
     worker = object.__new__(cls)
@@ -89,11 +93,18 @@ def test_destroy_retains_buffer_through_sender_and_communicator_teardown(monkeyp
     def teardown(name):
         assert worker._gpu_mem_preallocation is reserve
         events.append(name)
+        if (name == "sender" and sender_fails) or (name == "communicator" and communicator_fails):
+            raise RuntimeError(name)
 
     worker._weight_sender = SimpleNamespace(destroy=lambda: teardown("sender"))
     monkeypatch.setattr(mod.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(mod.dist, "destroy_process_group", lambda: teardown("communicator"))
-    assert worker.destroy()
+    if sender_fails or communicator_fails:
+        with pytest.raises(RuntimeError, match="communicator" if communicator_fails else "sender"):
+            worker.destroy()
+    else:
+        assert worker.destroy()
     assert events == ["sender", "communicator"]
+    assert worker._weight_sender is None
     assert worker.engine is None
     assert worker._gpu_mem_preallocation is None

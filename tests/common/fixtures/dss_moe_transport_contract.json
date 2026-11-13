@@ -1,0 +1,58 @@
+{
+  "controls": {
+    "deepep_token_chunk_size": 16384,
+    "fp32_lm_head": true,
+    "fused_lm_head_token_chunk_size": 1024,
+    "fused_lm_head_vocab_chunk_size": 8192
+  },
+  "dss_revision": "3b58cc3b276b47e1f12330e047f0fee1c7ee1c92",
+  "flat_training_config": {
+    "attn_implementation": "flash_attention_3",
+    "debug": {
+      "gpu_mem_preallocate_gib": 20
+    },
+    "ep_size": 8,
+    "fp32_lm_head": true,
+    "fused_lm_head_token_chunk_size": 1024,
+    "fused_lm_head_vocab_chunk_size": 8192,
+    "max_seq_len": 262144,
+    "model_provider": "prime_rl",
+    "prime_rl": {
+      "debug": {
+        "gpu_mem_preallocate_gib": 20
+      },
+      "deepep_token_chunk_size": 16384,
+      "fp32_lm_head": true,
+      "fused_cross_entropy": false,
+      "fused_lm_head_token_chunk_size": 1024,
+      "seq_len": 262144
+    },
+    "sp_size": 4
+  },
+  "nested_training_config": {
+    "attn_implementation": "flash_attention_3",
+    "debug": {
+      "gpu_mem_preallocate_gib": 20
+    },
+    "ep_size": 8,
+    "fused_lm_head_vocab_chunk_size": 8192,
+    "max_seq_len": 262144,
+    "model_provider": "prime_rl",
+    "prime_rl": {
+      "debug": {
+        "gpu_mem_preallocate_gib": 20
+      },
+      "deepep_token_chunk_size": 16384,
+      "fp32_lm_head": true,
+      "fused_cross_entropy": false,
+      "fused_lm_head_token_chunk_size": 1024,
+      "seq_len": 262144
+    },
+    "sp_size": 4
+  },
+  "source_paths": [
+    "dss/ray_dss/models.py:TrainingConfig",
+    "dss/ray_dss/jobs/gpu/training.py:prime_rl_config",
+    "dss/ray_dss/jobs/gpu/model_loader.py:load_ap_moe"
+  ]
+}
