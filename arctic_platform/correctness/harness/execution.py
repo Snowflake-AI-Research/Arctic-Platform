@@ -471,8 +471,29 @@ def _run_vocab_size(
         return int(getattr(model_cfg, "text_config", model_cfg).vocab_size)
 
 
+def _configure_e2e_model(args, cfg, selection) -> None:
+    """Select original weights for local supervised E2E unless a fixture was explicitly requested."""
+    if (
+        cfg.is_rl
+        or getattr(args, "backend", "cortex") not in {"cortex", "cortex-training"}
+        or set(selection) != {"e2e-sft-train-validate"}
+        or getattr(args, "local_cortex_fixture", False)
+        or getattr(args, "cortex_fixture", None) is not None
+        or getattr(args, "probe_layers", None) is not None
+    ):
+        return
+    candidate = copy.copy(args)
+    if not any(
+        getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}") for name in ("base_url", "host")
+    ):
+        candidate.base_url = "http://127.0.0.1:1"
+    if is_local_cortex_gateway(_client_backend(candidate)):
+        args.local_gateway_full_model = True
+
+
 def _configure_regression_target(args):
     """Supported config regression owns a local service only when no endpoint is configured."""
+    e2e_only = set(args.test or ()) == {"e2e-sft-train-validate"}
     if (
         getattr(args, "backend", "cortex") == "onprem"
         or not args.config
@@ -484,21 +505,28 @@ def _configure_regression_target(args):
             or set(args.test) == {"e2e-sft-train-validate"}
         )
         or getattr(args, "cortex_fixture", None) is not None
-        or getattr(args, "local_gateway_full_model", False)
-        or any(
-            getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}")
-            for name in ("base_url", "host")
+        or (getattr(args, "local_gateway_full_model", False) and not e2e_only)
+        or (
+            not e2e_only
+            and any(
+                getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}")
+                for name in ("base_url", "host")
+            )
         )
     ):
         return args
-    if load_config(_resolve_configs(args, filter_by_local_gpu=False)[0]).is_rl and args.test != [
-        "checkpoint-resume-loss"
-    ]:
+    cfg = load_config(_resolve_configs(args, filter_by_local_gpu=False)[0])
+    if cfg.is_rl and args.test != ["checkpoint-resume-loss"]:
         return args
     args = copy.copy(args)
+    _configure_e2e_model(args, cfg, args.test)
+    if any(
+        getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}") for name in ("base_url", "host")
+    ):
+        return args
     args._automatic_cortex_gateway = True
     args._automatic_checkpoint_bridge = "checkpoint-resume-loss" in args.test
-    args.local_cortex_fixture = True
+    args.local_cortex_fixture = not getattr(args, "local_gateway_full_model", False)
     args.base_url = "http://127.0.0.1:1"
     require_local_cortex_gateway(_client_backend(args))
     return args

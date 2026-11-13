@@ -119,7 +119,7 @@ Implementation: [checkpoint scoring and export validation](../checks/inference_c
 
 Supervised fine-tuning (SFT) uses ordered GSM8K training examples with a separate held-out validation slice. Both engines read the same materialized batch files, start from compatible initial weights or the same deterministic LoRA adapter, and use the recipe's optimizer settings and learning rate. Each training row is consumed once in the 100-step replay.
 
-The reference record binds the complete replay, initial model/adapter identity, optimizer, tokenizer and execution options. A first-two reduced-fixture record cannot substitute for this trajectory record. Full-model execution needs its separately admitted snapshot and enough memory for the single-GPU reference's weights and optimizer state.
+The reference record binds the complete replay, initial model/adapter identity, optimizer, tokenizer and execution options. A first-two reduced-fixture record cannot substitute for this trajectory record. Local supervised E2E onboarding and E2E-only regression automatically select the admitted original full model; explicitly requested fixture execution retains its reduced scope. Full-model execution needs its separately admitted snapshot and enough memory for the single-GPU reference's weights and optimizer state.
 
 ### What Decides The Result
 

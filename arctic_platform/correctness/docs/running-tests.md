@@ -44,7 +44,17 @@ For an authenticated Cortex endpoint use `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DA
 
 **Missing capabilities remain separate non-passes.** Config-only onboarding attempts applicable checks independently; it does not infer later prerequisites from a successful first-two fixture. Unsafe cleanup stops subsequent workloads. CPU controls, command help and registration are not numerical or GPU evidence.
 
-**Automatic regression startup is narrower than registration.** This checkout's [local startup helper](../harness/execution.py) recognizes an explicit first-two-only, resume-only or E2E-only selection, subject to that selection's fixture and runtime admission. Default mixed selections, inference and RL still require an admitted execution route; listing seven IDs does not install or start missing services. Keep the config-only default example and report any missing route as a non-pass rather than silently narrow the selected tests.
+**Automatic regression startup is narrower than registration.** The [local startup helper](../harness/execution.py) recognizes an explicit first-two-only selection, a resume-only selection or a supervised E2E-only selection. Default mixed regression selections, inference and RL still need an admitted execution route; listing seven IDs does not install or start missing services. Config-only onboarding selects the execution mode independently for each test.
+
+**Local supervised E2E automatically uses the original full model.** `onboard --test e2e-sft-train-validate` and `run --test e2e-sft-train-validate` select the admitted original checkpoint without requiring `--local-gateway-full-model`. With no configured endpoint, the harness owns gateway startup and cleanup; an explicit loopback `--base-url` remains externally owned. Gradient and optimizer children, including the automatic specification prerequisite, keep their reduced fixtures. An explicit `--local-cortex-fixture` or published `--cortex-fixture` retains fixture mode; hosted, on-prem and RL execution are unchanged.
+
+**Automatic selection does not waive full-model prerequisites.** Stage the pinned snapshot and tokenizer under `/data-fast`, set `HF_HUB_CACHE` to that cache, and retain `HF_HUB_OFFLINE=1` and `DSS_ALLOW_REMOTE_MODELS=1`. Multi-node execution still needs the same-job hostfile described below. Qwen3-0.6B's original single-file safetensors checkpoint is admitted by its pinned weight digest and complete tensor schema. Missing admission, cache assets or compatible trajectory records fail explicitly; the harness never falls back to a reduced model.
+
+```bash
+python -m arctic_platform.correctness onboard \
+  --config ../cortex-training/model-catalog/models/qwen3-0.6b/standard/h200-training-full.json \
+  --test e2e-sft-train-validate
+```
 
 **RL observers record existing production operations without replacing them.** Tensor sends, receiver writes, optimizer steps and router execution stay on their ordinary paths. Descriptive one-line `maybe_...` calls delegate opt-in checks and evidence capture to `arctic_platform/debug/`; disabled calls preserve ordinary behavior. These observers do not authorize unrelated startup, allocation, model-loading or cleanup workarounds.
 
