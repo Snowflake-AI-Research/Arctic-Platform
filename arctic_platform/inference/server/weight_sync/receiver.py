@@ -737,6 +737,8 @@ class WeightSyncExtension:
         Returns the received count, all-byte and applied-source squared-L2
         norms, canonical destination mapping, and skipped source names.
         """
+        from vllm.model_executor.models.utils import is_pp_missing_parameter
+
         from arctic_platform.inference.server.weight_sync.utils import (
             _ShardAwareFusedWriter,
         )
@@ -746,6 +748,7 @@ class WeightSyncExtension:
         loaded = 0
         source_to_destinations: dict[str, list[str]] = {}
         skipped_source_names: list[str] = []
+        other_stage_sources = 0
         param_names = {pname for pname, _ in model.named_parameters()}
         recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
         applied_source_l2_sq = torch.zeros(
@@ -767,13 +770,29 @@ class WeightSyncExtension:
                 else:
                     destinations = sorted(set(loaded_names or ()))
             destinations = _canonicalize_destinations(destinations, param_names)
-            if destinations:
-                source_to_destinations[name] = destinations
+            # Under pipeline parallelism every rank receives every tensor. A tensor whose destinations all lie in
+            # another stage's layers (vLLM's PPMissingLayer here, though load_weights may still name them) is
+            # that stage's to apply: neither applied nor skipped on this rank.
+            here = [
+                destination
+                for destination in destinations
+                if destination in param_names or not is_pp_missing_parameter(destination, model)
+            ]
+            if destinations and not here:
+                other_stage_sources += 1
+            elif here:
+                source_to_destinations[name] = here
                 applied_source_l2_sq.add_(source_l2_sq * copies)
             else:
                 skipped_source_names.append(name)
             loaded += 1
             del tensor  # a rebuilt oversized tensor must not outlive its load
+        if other_stage_sources:
+            logger.info(
+                "Weight sync left %d/%d received source tensor(s) to the other pipeline stage(s)",
+                other_stage_sources,
+                loaded,
+            )
         if skipped_source_names:
             logger.warning(
                 "Weight sync skipped %d/%d received source tensor(s) because "
