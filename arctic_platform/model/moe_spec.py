@@ -104,6 +104,9 @@ def moe_model_spec(
         config["ac_config"] = _omit_none(config["ac_config"])
     if tiled_mlp_token_chunk_size is not None:
         config["tiled_mlp_token_chunk_size"] = tiled_mlp_token_chunk_size
+    model_type = hf_text_model_type(model_name)
+    if model_type in {"inkling_mm_model", "inkling_text"}:
+        config.setdefault("fused_cross_entropy", False)
     config["fused_cross_entropy"] = effective_fused_cross_entropy(config)
     validate_lm_head_fused_ce_config(config)
     return ModelSpec(

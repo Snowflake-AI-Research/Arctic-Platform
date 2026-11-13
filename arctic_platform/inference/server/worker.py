@@ -46,6 +46,8 @@ logger = logging.getLogger("arctic_platform.inference.server")
 _UNEXPECTED_KWARG_RE = re.compile(r"unexpected keyword argument '([^']+)'")
 _SAMPLE_ID_PARAM_KEY = "dss_sample_id"
 _REPLAY_ID_PARAM_KEY = "dss_router_replay_id"
+# The same trajectory's previous capture, read from extra_args, which a server without this key leaves unused.
+_REPLAY_PREFIX_ID_PARAM_KEY = "dss_router_replay_prefix_id"
 _ROUTER_REPLAY_MARKER_KEY = "router_replay"
 _ROUTER_REPLAY_RETURN_INFO_PARAM_KEY = "dss_return_back_router_info"
 _ROUTER_REPLAY_STOP_TOKEN_SEQUENCES_PARAM_KEY = "dss_stop_token_sequences"
@@ -644,6 +646,7 @@ def _result_from_output(
     cache_tx: Any = None,
     sample_id: str | None = None,
     replay_id: str | None = None,
+    prefix_replay_id: str | None = None,
     request_id: str | None = None,
     replica_label: str | None = None,
     return_back_router_info: bool = False,
@@ -704,6 +707,7 @@ def _result_from_output(
         cache_tx=cache_tx,
         sample_id=sample_id,
         replay_id=replay_id,
+        prefix_replay_id=prefix_replay_id,
         request_id=request_id,
         replica_label=replica_label,
         return_back_router_info=return_back_router_info,
@@ -718,6 +722,7 @@ def _maybe_cache_routed_experts(
     cache_tx: Any,
     sample_id: str | None,
     replay_id: str | None,
+    prefix_replay_id: str | None,
     request_id: str | None,
     replica_label: str | None,
     return_back_router_info: bool,
@@ -742,6 +747,24 @@ def _maybe_cache_routed_experts(
             f"capture_len={capture_len} expected_capture_len={expected_capture_len} "
             f"capture_shape={list(routed.shape)}"
         )
+    # This request re-prefills the prefix capture's positions; keep the routes the earlier request sampled with.
+    prefix_len = 0
+    if prefix_replay_id is not None:
+        try:
+            prefix = cache_tx.get(prefix_replay_id)
+        except KeyError:  # another replica served the earlier request, or the cache evicted it
+            prefix = None
+        if prefix is not None:
+            if prefix.shape[0] >= prompt_len or tuple(prefix.shape[1:]) != tuple(routed.shape[1:]):
+                raise ValueError(
+                    "router-replay prefix capture must end inside the prompt, with the same layer/top-k shape "
+                    f"trajectory_id={sample_id!r} replay_id={replay_id!r} prefix_replay_id={prefix_replay_id!r} "
+                    f"prefix_shape={list(prefix.shape)} prompt_len={prompt_len} capture_shape={list(routed.shape)}"
+                )
+            import torch
+
+            prefix_len = int(prefix.shape[0])
+            routed = torch.cat([prefix, torch.as_tensor(routed[prefix_len:]).to(prefix.device, prefix.dtype)])
     cache_key = replay_id or sample_id
     if replay_id is not None and replay_id.startswith("rr1:"):
         cache_tx.put_new(cache_key, routed)
@@ -756,6 +779,7 @@ def _maybe_cache_routed_experts(
         "prompt_len": prompt_len,
         "generation_len": generation_len,
         "capture_len": capture_len,
+        "prefix_len": prefix_len,
     }
     if return_back_router_info:
         tensor = routed.detach().cpu() if hasattr(routed, "detach") else routed
@@ -1382,6 +1406,7 @@ class InferenceWorker(StreamingWorkerMixin):
         return_action_masks = bool(sampling_params.pop(_RETURN_ACTION_MASKS_PARAM_KEY, False))
         extra_args = dict(sampling_params.get("extra_args", None) or {})
         extra_args.pop(_RETURN_ACTION_MASKS_PARAM_KEY, None)
+        prefix_replay_id = extra_args.pop(_REPLAY_PREFIX_ID_PARAM_KEY, None)
         if extra_args:
             sampling_params["extra_args"] = extra_args
         else:
@@ -1394,6 +1419,8 @@ class InferenceWorker(StreamingWorkerMixin):
             replay_id = str(replay_id)
         if replay_id is not None and sample_id is None:
             raise ValueError(f"{_REPLAY_ID_PARAM_KEY} requires {_SAMPLE_ID_PARAM_KEY}")
+        if prefix_replay_id is not None and replay_id is None:
+            raise ValueError(f"{_REPLAY_PREFIX_ID_PARAM_KEY} requires {_REPLAY_ID_PARAM_KEY}")
         return_back_router_info = bool(
             sampling_params.pop(_ROUTER_REPLAY_RETURN_INFO_PARAM_KEY, False)
         )
@@ -1439,6 +1466,7 @@ class InferenceWorker(StreamingWorkerMixin):
             cache_tx=self._router_replay_tx,
             sample_id=sample_id,
             replay_id=replay_id,
+            prefix_replay_id=prefix_replay_id,
             request_id=request_id,
             replica_label=self._replica_label,
             return_back_router_info=return_back_router_info,
