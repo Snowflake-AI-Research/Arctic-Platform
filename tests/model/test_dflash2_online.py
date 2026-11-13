@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 
 import pytest
 import torch
@@ -26,6 +27,7 @@ from safetensors.torch import load_file
 from transformers import Qwen3Config
 from transformers import Qwen3ForCausalLM
 
+from arctic_platform.model import PEFT_ADAPTER_DIRNAME
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import ParallelismConfig
 from arctic_platform.model import Patches
@@ -393,6 +395,39 @@ def test_loader_rejects_a_selector_weight_that_is_not_finite_and_non_negative(ta
 def test_loader_rejects_generic_model_patches(target_dir, patch):
     with pytest.raises((ValidationError, ValueError), match="generic model patches"):
         build_model(loader_spec(target_dir, patches=Patches(**{patch: True})))
+
+
+@pytest.fixture
+def lora_fine_tune(target, tmp_path):
+    """``(adapter dir, the fine-tune as base + unmerged adapter)`` of a LoRA fine-tune of ``target``."""
+    from peft import LoraConfig
+    from peft import get_peft_model
+
+    torch.manual_seed(1)
+    # init_lora_weights=False draws both factors at random, so the adapter changes the target's outputs.
+    tuned = get_peft_model(
+        copy.deepcopy(target),
+        LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj", "v_proj", "down_proj"], init_lora_weights=False),
+    ).eval()
+    path = tmp_path / "adapter"
+    tuned.save_pretrained(path)
+    return path, tuned
+
+
+def test_loader_trains_a_packed_window_through_a_lora_fine_tune(target_dir, lora_fine_tune):
+    adapter_dir, tuned = lora_fine_tune
+    shutil.copytree(adapter_dir, target_dir / PEFT_ADAPTER_DIRNAME)
+
+    model = build_model(loader_spec(target_dir)).model.train()
+
+    out = model(**packed_window(PROMPT_THEN_TWO_TOKEN_RESPONSE, PROMPT_THEN_THREE_TOKEN_RESPONSE))
+    assert torch.isfinite(out["loss"])
+    # The draft reads the fine-tune (base plus merged adapter), not the stock target.
+    input_ids = torch.tensor([[10, 11, 12, 13, 14]])
+    with torch.no_grad():
+        hidden_states = tuned(input_ids=input_ids, output_hidden_states=True).hidden_states
+    expected = torch.cat([hidden_states[i + 1] for i in model.draft.target_layer_ids], dim=-1)
+    torch.testing.assert_close(model.target_context(input_ids), expected)
 
 
 @pytest.mark.parametrize("parallelism", [dict(sequence_parallel=2), dict(expert_parallel=2)])
