@@ -74,7 +74,12 @@ class JobConfig(BaseModel):
     def _validate_sp_size(self) -> "JobConfig":
         # Resolve at input time so a bad or self-contradicting parallel degree
         # fails when the job is created, not deep inside a worker.
-        resolve_sp_size(self.model_dump())
+        sp_size = resolve_sp_size(self.model_dump())
+        if self.job_type == "log_prob" and sp_size > 1:
+            raise ValueError(
+                "log_prob/reference jobs do not support sequence parallelism; "
+                "use sp_size=1 for the reference job independently of the training job"
+            )
         return self
 
     @property

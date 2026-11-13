@@ -56,6 +56,9 @@ from arctic_platform.common.utils.server_models import JobConfig
 from arctic_platform.common.utils.server_models import LogProbsRequest
 from arctic_platform.common.utils.server_models import WeightSyncRequest
 from arctic_platform.common.utils.server_models import build_model_config
+from arctic_platform.common.utils.server_models import resolve_parallelism_degree
+from arctic_platform.model.implementations.gpu.sp.utils import collect_sequence_parallel_results
+from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_grpo
 
 if TYPE_CHECKING:
     from arctic_platform.inference.server.replica_pool import ReplicaPool
@@ -770,6 +773,7 @@ class ArcticRLRayServer:
         self._training_op_lock = asyncio.Lock()
         self._training_failed = False
         self._training_failure: BaseException | None = None
+        self._training_workers_aborted = False
         # Set to the reason ``weight_norm`` stopped. A later call returns that reason and does not touch the workers.
         self._weight_norm_disabled: str | None = None
 
@@ -803,14 +807,34 @@ class ArcticRLRayServer:
         if self._training_failure is None:
             self._training_failure = error or asyncio.CancelledError()
 
-    async def _await_training_refs(self, submit_refs, *, latch: bool = True, check_failed: bool = True):
+    def _abort_sequence_parallel_workers(self, error: BaseException) -> None:
+        """Cancellation cannot interrupt a worker thread blocked in a distributed collective."""
+        if getattr(self, "_training_workers_aborted", False) or not any(
+            job.get("job_type") == "training" and resolve_parallelism_degree(job.get("sp_size"), "sp_size") > 1
+            for job in self.jobs.values()
+        ):
+            return
+        self._mark_training_failed(error)
+        self._training_workers_aborted = True
+        for worker in self.training_workers:
+            try:
+                ray.kill(worker, no_restart=True)
+            except Exception:
+                # Keep the request's failure as the primary exception even if Ray is already disconnected.
+                logger.exception("could not terminate failed sequence-parallel worker")
+
+    async def _await_training_refs(
+        self, submit_refs, *, latch: bool = True, check_failed: bool = True, abort_on_failure: bool = False
+    ):
         """Await refs. Caller must already hold ``_training_op_lock`` for training refs.
 
         The first failure cancels every ref still running, on the worker and in
         this process, and marks the workers failed. The step result is
         discarded, and a later training op is refused while a data-parallel
         collective may still be running. Cancelling this await (client
-        disconnect, timeout) does the same.
+        disconnect, timeout) does the same. Only model requests with
+        ``abort_on_failure=True`` terminate SP actors after execution failures.
+        Collective admission rejections leave the actors and training state usable.
 
         ``latch=False`` is the sampling-worker path: a sampler error is raised
         and does not block later ``step`` / ``weight_sync``. ``check_failed=False``
@@ -829,6 +853,14 @@ class ArcticRLRayServer:
             paired.append((ref, asyncio.ensure_future(_consume())))
         tasks = [task for _, task in paired]
         cancelled_collective = False
+        preflight_rejected = False
+
+        def is_preflight(error):
+            from arctic_platform.model.implementations.gpu.sp.utils import SequenceParallelPreflightError
+
+            return isinstance(error, SequenceParallelPreflightError) or isinstance(
+                getattr(error, "cause", None), SequenceParallelPreflightError
+            )
 
         def _cancel_unfinished() -> None:
             nonlocal cancelled_collective
@@ -843,6 +875,19 @@ class ArcticRLRayServer:
             else:
                 done, pending = set(), set()
             errors = [task.exception() for task in done if not task.cancelled() and task.exception() is not None]
+            if errors and all(is_preflight(error) for error in errors):
+                # These workers have already completed the global admission collective.
+                # Drain rejections, but stop as soon as any peer reports an execution failure.
+                while pending and all(is_preflight(error) for error in errors):
+                    completed, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_EXCEPTION)
+                    errors.extend(
+                        task.exception() for task in completed if not task.cancelled() and task.exception() is not None
+                    )
+                preflight_rejected = not pending and all(is_preflight(error) for error in errors)
+                if preflight_rejected:
+                    raise errors[0]
+            # An execution failure must not be hidden by another rank's admission rejection.
+            errors.sort(key=is_preflight)
             if errors and pending:
                 _cancel_unfinished()
             if latch and (cancelled_collective or (errors and pending)):
@@ -853,10 +898,16 @@ class ArcticRLRayServer:
                 raise errors[0]
         except asyncio.CancelledError:
             cancelled_collective = True
+            if latch and abort_on_failure and not preflight_rejected:
+                self._abort_sequence_parallel_workers(asyncio.CancelledError())
+            raise
+        except BaseException as error:
+            if latch and abort_on_failure and not is_preflight(error):
+                self._abort_sequence_parallel_workers(error)
             raise
         finally:
             _cancel_unfinished()
-            if latch and cancelled_collective:
+            if latch and cancelled_collective and not preflight_rejected:
                 self._mark_training_failed(None)
         return [task.result() for _, task in paired]
 
@@ -864,7 +915,7 @@ class ArcticRLRayServer:
         """Await sampler refs. A sampler failure does not latch training workers."""
         return await self._await_training_refs(submit_refs, latch=False, check_failed=False)
 
-    async def _gather_training_refs(self, submit_refs):
+    async def _gather_training_refs(self, submit_refs, *, abort_on_failure: bool = False, job_id: int | None = None):
         """Submit and await worker ObjectRefs without blocking the transport loop.
 
         ``submit_refs`` runs inside the lock so one op's ``.remote()`` calls stay
@@ -872,8 +923,10 @@ class ArcticRLRayServer:
         """
         self._raise_if_training_failed()
         async with self._training_op_lock:
+            if job_id is not None:
+                self._verify_job(job_id, "training")
             self._raise_if_training_failed()
-            return await self._await_training_refs(submit_refs)
+            return await self._await_training_refs(submit_refs, abort_on_failure=abort_on_failure)
 
     def _verify_job(self, job_id: int, expected_types: Union[str, list[str]]) -> None:
         info = self.jobs.get(job_id)
@@ -888,7 +941,58 @@ class ArcticRLRayServer:
         return {"status": "OK"}
 
     async def destroy(self, job_id: int, job_type: str) -> dict[str, Any]:
-        return await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
+        self._verify_job(job_id, job_type)
+        if job_type != "training":
+            result = await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
+            self.jobs.pop(job_id, None)
+            return result
+        async with self._training_op_lock:
+            self._verify_job(job_id, "training")
+            result = await self.arctic_rl_ray_server_state.destroy.remote(job_id, job_type)
+            self.training_workers = []
+            self.jobs.pop(job_id, None)
+            self._training_failed = False
+            self._training_failure = None
+            self._training_workers_aborted = False
+            self._weight_norm_disabled = None
+            self.weight_sync_ready = False
+            return result
+
+    async def _split_model_batch(self, batch: dict, workers, *, sp_size: int, backward: bool):
+        worker_sp_info = None
+        if sp_size > 1:
+            _, _, meta, processing = unpack_batch(batch)
+            validate_sequence_parallel_grpo(meta, processing, backward=backward)
+            worker_sp_info = await asyncio.gather(*[worker.get_sequence_parallel_info.remote() for worker in workers])
+
+        def split_and_validate():
+            shards, reorder = ray_split_batch(batch, len(workers), sp_size=sp_size, worker_sp_info=worker_sp_info)
+            if worker_sp_info is not None:
+                from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_microbatches
+
+                groups = set()
+                for shard, info in zip(shards, worker_sp_info):
+                    group = tuple(info["sp_ranks"])
+                    if group in groups:
+                        continue
+                    groups.add(group)
+                    _, shard_batch, _, _ = unpack_batch(shard)
+                    validate_sequence_parallel_microbatches(
+                        shard_batch if isinstance(shard_batch, list) else [shard_batch], sp_info=info
+                    )
+            return shards, reorder
+
+        if sp_size > 1:
+            shards, reorder = await asyncio.to_thread(split_and_validate)
+        else:
+            shards, reorder = split_and_validate()
+        return shards, reorder, worker_sp_info
+
+    @staticmethod
+    def _logical_model_results(results, worker_sp_info, *, sp_size: int):
+        if worker_sp_info is None:
+            return results
+        return collect_sequence_parallel_results(results, worker_sp_info=worker_sp_info, sp_size=sp_size)
 
     async def shutdown(self) -> None:
         """Release state-owned resources, then terminate the state actor."""
@@ -929,7 +1033,10 @@ class ArcticRLRayServer:
 
         loss_object = prepare_request_loss(batch)
         tname = timers.start("xyz fwd_bwd: ray_split_batch")
-        shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=self.jobs[job_id].get("sp_size", 1))
+        sp_size = resolve_parallelism_degree(self.jobs[job_id].get("sp_size"), "sp_size")
+        shards, reorder_indices, worker_sp_info = await self._split_model_batch(
+            batch, workers, sp_size=sp_size, backward=True
+        )
         _attach_loss_object_to_shards(shards, loss_object)
         # The verl driver's ``update_actor`` only consumes ``metrics`` from the
         # fwd_bwd response (see arctic_rl_client.update_actor) -- the per-token
@@ -950,7 +1057,9 @@ class ArcticRLRayServer:
         prof = ProfilerContext(type=PROFILER_TYPE, name="GATHER")
         with prof():
             results = await self._gather_training_refs(
-                lambda: [w.forward_backward.remote(s) for w, s in zip(workers, shards)]
+                lambda: [w.forward_backward.remote(s) for w, s in zip(workers, shards)],
+                abort_on_failure=sp_size > 1,
+                job_id=job_id,
             )
 
         timers.stop_and_print_elapsed(tname)
@@ -958,6 +1067,7 @@ class ArcticRLRayServer:
         pr0(f"[DeepSpeedWorker] fwd_bwd: {len(results)=}")
 
         tname = timers.start("xyz fwd_bwd: epilogue")
+        results = self._logical_model_results(results, worker_sp_info, sp_size=sp_size)
         metrics, avg_loss = finalize_fwd_bwd_metrics(results)
         if loss_object is not None:
             worker_metrics = [result.get("metrics") or {} for result in results]
@@ -1003,7 +1113,10 @@ class ArcticRLRayServer:
             raise ValueError(f"Job {job_id} ({job_type}) has no DeepSpeed workers")
 
         loss_object = prepare_request_loss(batch)
-        shards, reorder_indices = ray_split_batch(batch, len(workers), sp_size=info.get("sp_size", 1))
+        sp_size = resolve_parallelism_degree(info.get("sp_size"), "sp_size")
+        shards, reorder_indices, worker_sp_info = await self._split_model_batch(
+            batch, workers, sp_size=sp_size, backward=False
+        )
         _attach_loss_object_to_shards(shards, loss_object)
         shards[0]["meta"]["worker_return_tensors"] = True
 
@@ -1011,12 +1124,13 @@ class ArcticRLRayServer:
             return [w.forward_no_grad.remote(s) for w, s in zip(workers, shards)]
 
         if job_type == "training":
-            results = await self._gather_training_refs(_submit_forward)
+            results = await self._gather_training_refs(_submit_forward, abort_on_failure=sp_size > 1, job_id=job_id)
         else:
             results = await asyncio.gather(*_submit_forward())
 
         pr0(f"[ArcticRLRayServer] fwd_no_grad: {len(results)=}")
 
+        results = self._logical_model_results(results, worker_sp_info, sp_size=sp_size)
         batch = merge_dict_shards([r["batch"] for r in results])
         if reorder_indices is not None:
             batch = restore_batch_order(batch, reorder_indices)
@@ -1038,7 +1152,9 @@ class ArcticRLRayServer:
     async def step(self, job_id: int, body: dict[str, Any] | None = None) -> dict[str, Any]:
         # `body` is unused; accepted so the client can call with (job_id, body).
         self._verify_job(job_id, "training")
-        results = await self._gather_training_refs(lambda: [w.step.remote() for w in self.training_workers])
+        results = await self._gather_training_refs(
+            lambda: [w.step.remote() for w in self.training_workers], job_id=job_id
+        )
         merged = dict(
             job_id=job_id,
             metrics=merge_dict_shards([r["metrics"] for r in results]),
@@ -1051,6 +1167,7 @@ class ArcticRLRayServer:
         self._verify_job(job_id, "training")
         workers = self.training_workers
         async with self._training_op_lock:
+            self._verify_job(job_id, "training")
             results = (
                 await self._await_training_refs(
                     lambda: [self.arctic_rl_ray_server_state._empty_training_cache.remote(workers)]
@@ -1074,6 +1191,7 @@ class ArcticRLRayServer:
         export_hf = bool(body.get("export_hf", False))
         limit = body.get("save_total_limit")
         async with self._training_op_lock:
+            self._verify_job(job_id, "training")
             results = await self._await_training_refs(
                 lambda: [w.save_checkpoint.remote(path, export_hf) for w in self.training_workers],
             )
@@ -1106,7 +1224,7 @@ class ArcticRLRayServer:
                 except ValueError:
                     pass
         steps = await self._gather_training_refs(
-            lambda: [w.load_checkpoint.remote(path) for w in self.training_workers]
+            lambda: [w.load_checkpoint.remote(path) for w in self.training_workers], job_id=job_id
         )
         return {"job_id": job_id, "path": path, "global_step": int(steps[0]) if steps else 0}
 
@@ -1184,11 +1302,17 @@ class ArcticRLRayServer:
             mode = "all"
         workers = self.training_workers
         if mode == "non_lp":
-            results = await self._gather_training_refs(lambda: [w.offload_non_lp_states.remote() for w in workers])
+            results = await self._gather_training_refs(
+                lambda: [w.offload_non_lp_states.remote() for w in workers], job_id=job_id
+            )
         elif mode == "lp_params":
-            results = await self._gather_training_refs(lambda: [w.offload_lp_params.remote() for w in workers])
+            results = await self._gather_training_refs(
+                lambda: [w.offload_lp_params.remote() for w in workers], job_id=job_id
+            )
         else:
-            results = await self._gather_training_refs(lambda: [w.offload_to_cpu.remote() for w in workers])
+            results = await self._gather_training_refs(
+                lambda: [w.offload_to_cpu.remote() for w in workers], job_id=job_id
+            )
         logger.info("Offload training (mode=%s): %s", mode, results)
         return {"job_id": job_id, "workers": results}
 
@@ -1196,7 +1320,9 @@ class ArcticRLRayServer:
         """Reload all training state to GPU (wake training workers)."""
         self._verify_job(job_id, "training")
         workers = self.training_workers
-        results = await self._gather_training_refs(lambda: [w.backload_to_gpu.remote() for w in workers])
+        results = await self._gather_training_refs(
+            lambda: [w.backload_to_gpu.remote() for w in workers], job_id=job_id
+        )
         logger.info("Wake training: %s", results)
         return {"job_id": job_id, "workers": results}
 
@@ -1281,6 +1407,8 @@ class ArcticRLRayServer:
         )
 
         async with self._training_op_lock:
+            self._verify_job(training_job_id, "training")
+            self._verify_job(sampling_job_id, "sampling")
             self._raise_if_training_failed()
             if colocate:
                 lp_pool = self.log_prob_pool
@@ -1611,6 +1739,13 @@ class ArcticRLRayServer:
             full_texts = request.prompts
 
         if info.get("engine") == "deepspeed":
+            sp_size = resolve_parallelism_degree(info.get("sp_size"), "sp_size")
+            if sp_size > 1:
+                raise ValueError(
+                    "log_probs does not support sequence-parallel DeepSpeed jobs; use forward with "
+                    "loss_fn='grpo', post=['compute_logprobs'], and the supported token-mean GRPO payload; "
+                    "pure log-probability forward requests are not supported"
+                )
             tokenizer = self.log_prob_tokenizer
             encoded = tokenizer(full_texts, return_tensors="pt", padding=True)
             workers = self.log_prob_workers
@@ -1618,7 +1753,7 @@ class ArcticRLRayServer:
             # shape fwd_no_grad sends), split it across DP workers, and forward each dict shard.
             # balance_batch false keeps request order; torch.cat does not undo a reorder.
             wrapper = dict(batch=dict(encoded), meta={"balance_batch": False}, processing={})
-            shards, _ = ray_split_batch(wrapper, len(workers), sp_size=info.get("sp_size", 1))
+            shards, _ = ray_split_batch(wrapper, len(workers), sp_size=sp_size)
             raw = await asyncio.gather(*[w.compute_log_probs.remote(s) for w, s in zip(workers, shards)])
             results = torch.cat([r.cpu() for r in raw], dim=0)
         else:
