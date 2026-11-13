@@ -1,0 +1,46 @@
+# GLM-5.3-Flash RL at 262144 tokens.
+name: glm-5.3-flash
+checkpoint: zai-org/GLM-5.3-Flash-BF16
+
+client:
+  catalog: glm-5.3-flash-bf16
+  variant: long
+  training: h200-training-full
+  sampling: h200-inference-full
+
+probe:
+  max_row_len: 4224
+  thresholds:
+    - {name: sparse_indexer_topk, position: 2048, reason: "queries past index_topk keys attend to a selected subset of key pools"}
+
+expect:
+  loader: glm5_next
+  # Parameters that legitimately receive no gradient in training.
+  no_grad_params:
+    - {pattern: "visual\\.", reason: "text-only RL does not run the vision tower"}
+    - {pattern: "self_attn\\.indexer\\.", reason: "the DSA indexer only selects keys; the reference runs it under no_grad"}
+
+known_issues:
+  trainer.short_rows_supported:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/397
+    summary: >-
+      a packed sample of 2-3 tokens (under one index_kpool) asks FlashInfer top-k for k=0 and crashes the fused
+      indexer
+  sampler.weight_sync_with_fp32_masters:
+    issue: DSS ray_dss/jobs/gpu/training.py _measured_iter
+    summary: >-
+      with FP32 masters the step runs, but the vLLM weight sync's diagnostic norm (tensor.float().pow(2).sum() on
+      each full tensor in broadcast_send_weights) asks for 18 GiB with 3.3 GiB free and OOMs; the HF sync then hits
+      the aborted NCCL communicator
+  sampler.tensor_parallel_matches_reference[tp1]:
+    issue: upstream (vLLM)
+    summary: >-
+      vLLM 0.32: at TP1 with PIECEWISE CUDA graphs a single short request scores 0.5-0.8 mean log-prob off
+      the reference (eager, FULL and TP2+ are exact; reproduces without the Arctic plugin)
+  sampler.repeatable:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/344
+    summary: >-
+      once a row's index pools exceed index_topk / index_kpool the indexer's selection varies between
+      identical runs (first differing position is exactly that point; ~0.01 log-prob)
+
+not_applicable: {}

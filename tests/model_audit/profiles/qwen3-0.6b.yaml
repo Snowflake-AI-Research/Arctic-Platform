@@ -1,0 +1,23 @@
+# Dense control. Small, stock transformers loader; a failure here is more likely a harness bug than a model bug.
+name: qwen3-0.6b
+checkpoint: Qwen/Qwen3-0.6B
+
+client:
+  catalog: qwen3-0.6b
+  training: h200-training-full
+  sampling: h200-inference-full
+  layouts:
+    - {id: sp2, training_config: {n_gpus: 2, sp_size: 2}}
+    # The launch config pins DeepSpeed's batch to one rank's.
+    - {id: dp2, training_config: {n_gpus: 2, train_batch_size: 2, ds_config: {train_batch_size: 2}}}
+
+probe:
+  row_lengths: [7, 61, 130, 1030]
+
+expect:
+  loader: huggingface
+  no_grad_params: []
+
+known_issues: {}
+
+not_applicable: {}

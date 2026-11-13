@@ -24,21 +24,23 @@ from pathlib import Path
 # tests/inference is the copied Arctic Inference suite. It imports vLLM and
 # arctic_inference at collection time, which the [sft,testing] job does not
 # install. Skip it unless the invocation names that directory or a path inside it.
+# tests/model_audit is opt-in the same way: it launches multi-minute GPU probes per model.
 _INFERENCE_TESTS = Path(__file__).resolve().parent / "inference"
+_OPT_IN_TREES = (_INFERENCE_TESTS, Path(__file__).resolve().parent / "model_audit")
 
 
-def _targets_inference_tree(config) -> bool:
+def _targets_tree(config, tree: Path) -> bool:
     for arg in config.args:
         if not arg or str(arg).startswith("-"):
             continue
-        candidate = Path(arg)
+        candidate = Path(str(arg).split("::")[0])
         if not candidate.is_absolute():
             candidate = Path.cwd() / candidate
         try:
             candidate = candidate.resolve()
         except OSError:
             continue
-        if candidate == _INFERENCE_TESTS or _INFERENCE_TESTS in candidate.parents:
+        if candidate == tree or tree in candidate.parents:
             return True
     return False
 
@@ -49,11 +51,10 @@ def pytest_ignore_collect(collection_path, config):
         path = path.resolve()
     except OSError:
         return None
-    if path != _INFERENCE_TESTS and _INFERENCE_TESTS not in path.parents:
-        return None
-    if _targets_inference_tree(config):
-        return False
-    return True
+    for tree in _OPT_IN_TREES:
+        if path == tree or tree in path.parents:
+            return not _targets_tree(config, tree)
+    return None
 
 
 # Largest GPU count any single GPU test needs (test_train_engine / test_generate / test_sync_weights_nccl use 2). A

@@ -1,0 +1,26 @@
+# GLM-5.3 RL. The catalog has no training config for it, so only the sampler is probed.
+name: glm-5.3
+checkpoint: zai-org/GLM-5.3
+
+client:
+  catalog: glm-5.3
+  sampling: h200-inference-full
+
+probe:
+  max_row_len: 4224
+  thresholds:
+    - {name: sparse_indexer_topk, position: 2048, reason: "queries past index_topk keys attend to a selected subset"}
+
+expect:
+  loader: glm_moe_dsa
+  no_grad_params:
+    - {pattern: "self_attn\\.indexer\\.", reason: "the DSA indexer only selects keys; the reference runs it under no_grad"}
+
+known_issues:
+  sampler.repeatable:
+    issue: https://github.com/Snowflake-AI-Research/Arctic-Platform/pull/401
+    summary: >-
+      once a query has more than index_topk keys the indexer's selection varies between identical runs (first
+      differing position is exactly index_topk; ~0.01 log-prob)
+
+not_applicable: {}
