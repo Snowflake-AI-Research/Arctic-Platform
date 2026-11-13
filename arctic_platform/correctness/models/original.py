@@ -49,10 +49,27 @@ class OriginalModelMetadata:
     schema_sha256: str | None
     dtype_bytes: Mapping[str, int]
     additional_config_ids: tuple[str, ...] = ()
+    weights_sha256: str | None = None
 
 
 ORIGINAL_MODELS: Mapping[str, OriginalModelMetadata] = MappingProxyType(
     {
+        "Qwen/Qwen3-0.6B": OriginalModelMetadata(
+            model_name="Qwen/Qwen3-0.6B",
+            config_id=None,
+            source_checkpoints=("Qwen/Qwen3-0.6B",),
+            revision="c1899de289a04d12100db370d81485cdf75e47ca",
+            config_sha256="660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd",
+            index_sha256=None,
+            layer_pattern=r"model\.layers\.(\d+)\.",
+            tensor_count=311,
+            shard_count=1,
+            payload_bytes=1503264768,
+            vocabulary_shape=(151936, 1024),
+            schema_sha256="99ea7fbe3cd557925fcba2ad843352e9c612b0484560f25b4eb6d07fe1ca6703",
+            dtype_bytes=MappingProxyType({"BF16": 2}),
+            weights_sha256="f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b",
+        ),
         "Qwen/Qwen3-8B": OriginalModelMetadata(
             model_name="Qwen/Qwen3-8B",
             config_id=None,
@@ -119,7 +136,10 @@ def _original_model(cfg: LoadedConfig, spec: TestSpec) -> OriginalModelMetadata:
         )
         or spec.model.source_checkpoint not in metadata.source_checkpoints
     ):
-        raise ValueError("local full model mode requires a supported pinned original source")
+        raise ValueError(
+            f"local full model mode requires a supported pinned original source for {cfg.model_name!r}; "
+            "add model admission before E2E onboarding; a reduced fixture is not a full-model substitute"
+        )
     return metadata
 
 
@@ -167,6 +187,39 @@ def validate_local_full_model(backend: CortexConfig, cfg: LoadedConfig, spec: Te
     config = json.loads(config_bytes)
     readable("tokenizer_config.json")
     readable("tokenizer.json")
+    if metadata.weights_sha256 is not None:
+        weights = readable("model.safetensors")
+        with weights.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        if digest != metadata.weights_sha256:
+            raise ValueError("offline full model weights do not match the pinned original weights")
+        tensor_schema = {}
+        tensor_bytes = 0
+        with safe_open(weights, framework="pt", device="cpu") as stream:
+            for name in stream.keys():
+                view = stream.get_slice(name)
+                shape, dtype = view.get_shape(), view.get_dtype()
+                if dtype not in dtype_bytes:
+                    raise ValueError("offline full model tensor dtype differs from the original source")
+                elements = 1
+                for size in shape:
+                    elements *= size
+                tensor_bytes += elements * dtype_bytes[dtype]
+                tensor_schema[name] = [dtype, shape]
+        schema_bytes = json.dumps(tensor_schema, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+            "ascii"
+        )
+        layers = {
+            int(match.group(1)) for name in tensor_schema if (match := re.match(layer_pattern, name)) is not None
+        }
+        if (
+            len(tensor_schema) != tensor_count
+            or tensor_bytes != payload_bytes
+            or layers != set(range(config.get("text_config", config)["num_hidden_layers"]))
+            or hashlib.sha256(schema_bytes).hexdigest() != schema_sha256
+        ):
+            raise ValueError("offline full model tensor schema differs from the pinned original source")
+        return root
     index_bytes = readable("model.safetensors.index.json").read_bytes()
     if index_sha256 is not None and hashlib.sha256(index_bytes).hexdigest() != index_sha256:
         raise ValueError("offline full model index does not match the pinned original index")

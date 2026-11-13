@@ -7736,6 +7736,20 @@ def test_reference_records_missing_record_has_actionable_onboarding_command_with
     assert _reference_records_ctx.reference_record_paths == {}
 
 
+@pytest.mark.parametrize("full_model", [False, True])
+def test_full_model_e2e_missing_record_command_preserves_scope(
+    _reference_records_ctx, _reference_records_identity, full_model
+):
+    ctx = _reference_records_ctx
+    ctx.local_gateway_full_model = full_model
+    identity = _reference_records_identity_for(_reference_records_identity, "e2e-sft-train-validate")
+    with pytest.raises(records.ReferencePrerequisiteError) as error:
+        records.load_record(ctx, identity)
+    command = str(error.value)
+    assert ("--local-gateway-full-model" in command) is full_model
+    assert ("--local-cortex-fixture" in command) is not full_model
+
+
 def _reference_records_set(identity, *, generation="current"):
     entries = []
     for arm in ("gas1", "gas4"):
@@ -19016,6 +19030,311 @@ def test_fixed_tolerance_onboarding_reference_checks_keep_their_own_paths() -> N
     assert MODULE._onboarding_kind("single-step-optimizer") == "single-step-optimizer"
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("has_spec", [False, True])
+def test_full_model_e2e_bootstrap_isolated_from_gradient_fixture(
+    _onboarding_prerequisites, monkeypatch, has_spec, explicit
+):
+    from arctic_platform.correctness.harness import registry
+
+    state = _onboarding_prerequisites
+    state.args.test_id = "e2e-sft-train-validate"
+    state.args.local_gateway_full_model = explicit
+    tests = dict(registry.registered_tests())
+    tests[state.args.test_id] = SimpleNamespace(
+        test_id=state.args.test_id,
+        compares_to_reference=True,
+        requires_hosted_control_plane=False,
+        workload_modes=("sft",),
+    )
+    monkeypatch.setattr(registry, "registered_tests", lambda: tests)
+    if has_spec:
+        state.args.test_spec.write_text("{}")
+    seen = []
+
+    def parent(child):
+        state.onboard._configure_fixture_target(child, state.config, [child.test_id])
+        full_model = child.test_id == "e2e-sft-train-validate"
+        assert child.local_gateway_full_model is full_model
+        assert child.local_cortex_fixture is not full_model
+        assert child._automatic_cortex_gateway
+        if full_model:
+            assert child.test_spec.exists()
+        seen.append(child.test_id)
+        child.test_spec.write_text("{}")
+        return 0
+
+    monkeypatch.setattr(state.onboard, "_parent", parent)
+    assert state.onboard._onboard_configuration(state.args) == 0
+    assert seen == (["e2e-sft-train-validate"] if has_spec else ["single-step-grads", "e2e-sft-train-validate"])
+    assert state.args.local_gateway_full_model is explicit
+
+
+@pytest.mark.parametrize("fixture", [False, True])
+def test_full_model_e2e_all_selection_does_not_change_other_children(_onboarding_prerequisites, monkeypatch, fixture):
+    from arctic_platform.correctness.harness import registry
+
+    state = _onboarding_prerequisites
+    state.args.local_cortex_fixture = fixture
+    tests = dict(registry.registered_tests())
+    tests.pop("hosted")
+    tests["e2e-sft-train-validate"] = SimpleNamespace(
+        test_id="e2e-sft-train-validate",
+        compares_to_reference=True,
+        requires_hosted_control_plane=False,
+        workload_modes=("sft",),
+    )
+    monkeypatch.setattr(registry, "registered_tests", lambda: tests)
+    prepared = []
+    monkeypatch.setattr(
+        state.onboard, "_prepare_references", lambda child: prepared.append(child.reference_tests) or 0
+    )
+    seen = []
+
+    def parent(child):
+        assert child.local_gateway_full_model is (child.test_id == "e2e-sft-train-validate" and not fixture)
+        seen.append(child.test_id)
+        child.test_spec.write_text("{}")
+        return 0
+
+    monkeypatch.setattr(state.onboard, "_parent", parent)
+    assert state.onboard._onboard_configuration(state.args) == 0
+    assert set(seen) == {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}
+    assert prepared == [
+        (
+            ["single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"]
+            if fixture
+            else ["single-step-grads", "single-step-optimizer"]
+        )
+    ]
+    assert not state.args.local_gateway_full_model
+
+
+@pytest.mark.parametrize(("command", "duplicate"), [("onboard", False), ("run", False), ("run", True)])
+@pytest.mark.parametrize("base_url", [None, "http://127.0.0.1:8003"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_full_model_e2e_gateway_selection(monkeypatch, tmp_path, command, base_url, explicit, duplicate):
+    from arctic_platform.correctness.harness import execution
+    from arctic_platform.correctness.onboarding import onboard
+
+    for name in ("HOST", "BASE_URL", "PAT"):
+        monkeypatch.delenv(f"ARCTIC_CORTEX_{name}", raising=False)
+    cfg = SimpleNamespace(is_rl=False)
+    argv = [command, "--config", str(tmp_path / "recipe.json"), "--test", "e2e-sft-train-validate"]
+    if duplicate:
+        argv += ["--test", "e2e-sft-train-validate"]
+    if explicit:
+        argv.append("--local-gateway-full-model")
+    if base_url is not None:
+        argv += ["--base-url", base_url]
+    args = execution.parse_args(argv)
+    if command == "onboard":
+        onboard._configure_fixture_target(args, cfg, [args.test_id])
+        configured = args
+    else:
+        monkeypatch.setattr(execution, "_resolve_configs", lambda *a, **kw: [tmp_path / "recipe.json"])
+        monkeypatch.setattr(execution, "load_config", lambda *a: cfg)
+        configured = execution._configure_regression_target(args)
+    assert getattr(configured, "_automatic_cortex_gateway", False) is (base_url is None)
+    assert not configured.local_cortex_fixture
+    assert configured.local_gateway_full_model
+    if base_url is not None:
+        assert configured.base_url == base_url
+
+
+@pytest.mark.parametrize(
+    "exception",
+    ["rl", "onprem", "hosted", "fixture", "receipt", "gradient", "mixed", "probe"],
+)
+def test_full_model_e2e_selection_preserves_other_modes(monkeypatch, tmp_path, exception):
+    from arctic_platform.correctness.harness.execution import _configure_e2e_model
+
+    for name in ("HOST", "BASE_URL", "PAT"):
+        monkeypatch.delenv(f"ARCTIC_CORTEX_{name}", raising=False)
+    args = execution.parse_args(
+        ["onboard", "--config", str(tmp_path / "recipe.json"), "--test", "e2e-sft-train-validate"]
+    )
+    cfg = SimpleNamespace(is_rl=exception == "rl")
+    selection = [args.test_id]
+    if exception == "onprem":
+        args.backend = "onprem"
+    elif exception == "hosted":
+        args.base_url = "https://example.com"
+    elif exception == "fixture":
+        args.local_cortex_fixture = True
+    elif exception == "receipt":
+        args.cortex_fixture = tmp_path / "receipt.json"
+    elif exception == "gradient":
+        selection = ["single-step-grads"]
+    elif exception == "mixed":
+        selection.append("single-step-grads")
+    elif exception == "probe":
+        args.probe_layers = 4
+    _configure_e2e_model(args, cfg, selection)
+    assert not args.local_gateway_full_model
+
+
+def test_full_model_e2e_retry_normalizes_automatic_and_explicit_selection(_incremental_onboarding, monkeypatch):
+    state = _incremental_onboarding
+    state.args.test_id = "e2e-sft-train-validate"
+    state.tests[state.args.test_id] = SimpleNamespace(
+        test_id=state.args.test_id,
+        compares_to_reference=True,
+        requires_hosted_control_plane=False,
+        workload_modes=("sft",),
+    )
+    state.args.local_gateway_full_model = True
+    assert state.onboard._onboard_configuration(state.args) == 0
+    state.args.local_gateway_full_model = False
+    monkeypatch.setattr(state.onboard, "_parent", lambda *a: pytest.fail("compatible E2E retry ran again"))
+    assert state.onboard._onboard_configuration(state.args) == 0
+
+
+@pytest.mark.parametrize("base_url", [None, "http://127.0.0.1:8003"])
+def test_full_model_e2e_final_command_keeps_model_and_gateway_ownership(monkeypatch, tmp_path, base_url):
+    args = execution.parse_args(
+        [
+            "onboard",
+            "--config",
+            str(tmp_path / "recipe.json"),
+            "--test",
+            "e2e-sft-train-validate",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ]
+    )
+    args.base_url = base_url
+    args.checkout_root = tmp_path
+    onboard._configure_fixture_target(args, SimpleNamespace(is_rl=False), [args.test_id])
+    captured = []
+
+    def process(command, **kwargs):
+        captured.append(command)
+        output = Path(command[command.index("--out") + 1])
+        (output / "report.json").write_text(json.dumps({"totals": {"pass": 1, "fail": 0}}))
+        return SimpleNamespace(stdout=io.StringIO(), wait=lambda: 0)
+
+    monkeypatch.setattr(onboard.subprocess, "Popen", process)
+    if base_url is None:
+        monkeypatch.setattr(
+            onboard, "_validation_gateway", lambda *a: pytest.fail("parent started the child-owned gateway")
+        )
+    assert onboard._run_final_regression(args, {"layers": 4})["status"] == "pass"
+    command = captured[0]
+    assert "--local-gateway-full-model" in command
+    assert "--local-cortex-fixture" not in command
+    assert ("--base-url" in command) is (base_url is not None)
+    if base_url is not None:
+        assert command[command.index("--base-url") + 1] == base_url
+
+
+def test_full_model_e2e_reference_preparation_selects_original_without_starting_gateway(tmp_path):
+    args = execution.parse_args(
+        [
+            "onboard",
+            "--config",
+            str(tmp_path / "recipe.json"),
+            "--test",
+            "e2e-sft-train-validate",
+            "--prepare-references",
+        ]
+    )
+    onboard._configure_fixture_target(args, SimpleNamespace(is_rl=False), [args.test_id])
+    assert args.local_gateway_full_model
+    assert not args.local_cortex_fixture
+    assert not getattr(args, "_automatic_cortex_gateway", False)
+    assert args.base_url is None
+
+
+@pytest.mark.parametrize("damage", [None, "weights", "schema", "layers", "config", "tokenizer", "indexed"])
+def test_original_single_file_model_admission(tmp_path, monkeypatch, damage):
+    from safetensors.torch import save_file
+    from transformers.utils import hub
+
+    from arctic_platform.client import CortexConfig
+    from arctic_platform.correctness.models import original
+
+    revision = "a" * 40
+    cache = tmp_path / "hub"
+    root = cache / "models--unit--model" / "snapshots" / revision
+    root.mkdir(parents=True)
+    config_bytes = b'{"num_hidden_layers":1}'
+    (root / "config.json").write_bytes(config_bytes)
+    for filename in ("tokenizer.json", "tokenizer_config.json"):
+        (root / filename).write_text("{}")
+    weights = root / "model.safetensors"
+    save_file({"model.layers.0.weight": torch.zeros((2, 3), dtype=torch.bfloat16)}, weights)
+    schema = {"model.layers.0.weight": ["BF16", [2, 3]]}
+    metadata = original.OriginalModelMetadata(
+        model_name="unit/model",
+        config_id=None,
+        source_checkpoints=("unit/model",),
+        revision=revision,
+        config_sha256=hashlib.sha256(config_bytes).hexdigest(),
+        index_sha256=None,
+        layer_pattern=r"model\.layers\.(\d+)\.",
+        tensor_count=1,
+        shard_count=1,
+        payload_bytes=12,
+        vocabulary_shape=None,
+        schema_sha256=hashlib.sha256(
+            json.dumps(schema, sort_keys=True, separators=(",", ":")).encode("ascii")
+        ).hexdigest(),
+        dtype_bytes={"BF16": 2},
+        weights_sha256=hashlib.sha256(weights.read_bytes()).hexdigest(),
+    )
+    if damage == "weights":
+        save_file({"model.layers.0.weight": torch.ones((2, 3), dtype=torch.bfloat16)}, weights)
+    elif damage == "schema":
+        metadata = replace(metadata, schema_sha256="0" * 64)
+    elif damage == "layers":
+        (root / "config.json").write_text('{"num_hidden_layers":2}')
+        metadata = replace(metadata, config_sha256=hashlib.sha256((root / "config.json").read_bytes()).hexdigest())
+    elif damage == "config":
+        (root / "config.json").write_text("{}")
+    elif damage == "tokenizer":
+        (root / "tokenizer.json").unlink()
+    elif damage == "indexed":
+        metadata = replace(metadata, weights_sha256=None)
+        (root / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"model.layers.0.weight": "model.safetensors"}})
+        )
+    monkeypatch.setattr(original, "ORIGINAL_MODELS", {"unit/model": metadata})
+    monkeypatch.setattr(original, "require_data_fast_path", lambda path, **kw: Path(path).resolve())
+    monkeypatch.setattr(hub, "cached_file", lambda *a, **kw: str(root / "config.json"))
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("DSS_ALLOW_REMOTE_MODELS", "1")
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache))
+    cfg = SimpleNamespace(model_name="unit/model", config_id="unit", path=tmp_path / "recipe.json")
+    spec = SimpleNamespace(model=SimpleNamespace(source_checkpoint="unit/model"))
+    backend = CortexConfig(base_url="http://127.0.0.1:1")
+    if damage in (None, "indexed"):
+        assert original.validate_local_full_model(backend, cfg, spec) == root
+    else:
+        with pytest.raises(ValueError, match="offline full model"):
+            original.validate_local_full_model(backend, cfg, spec)
+
+
+def test_original_missing_admission_never_substitutes_fixture():
+    from arctic_platform.correctness.models import original
+
+    cfg = SimpleNamespace(model_name="unadmitted/model", config_id="unit")
+    spec = SimpleNamespace(model=SimpleNamespace(source_checkpoint=cfg.model_name))
+    with pytest.raises(ValueError, match="unadmitted/model.*add model admission.*not a full-model substitute"):
+        original._original_model(cfg, spec)
+
+
+def test_original_qwen_small_model_pin():
+    from arctic_platform.correctness.models import original
+
+    cfg = SimpleNamespace(model_name="Qwen/Qwen3-0.6B", config_id="qwen-small")
+    spec = SimpleNamespace(model=SimpleNamespace(source_checkpoint=cfg.model_name))
+    metadata = original._original_model(cfg, spec)
+    assert metadata.revision == "c1899de289a04d12100db370d81485cdf75e47ca"
+    assert metadata.weights_sha256 is not None
+    assert metadata.tensor_count == 311
+
+
 # Helper storage.
 
 
@@ -19450,6 +19769,22 @@ def test_hf_reference_onboarding_preparation_dispatches_frozen_workload_without_
     assert keywords["reference_calibration_workers"] is None
     assert keywords["client_backend"].base_url == "http://127.0.0.1:1"
     assert keywords["reference_records_dir"] == reference_records.DEFAULT_RECORDS_DIR
+
+
+def test_full_model_e2e_explicit_reduced_reference_preparation(_hf_reference_onboarding_prepared_args, monkeypatch):
+    args, spec = _hf_reference_onboarding_prepared_args
+    args.test_id = "e2e-sft-train-validate"
+    args.local_cortex_fixture = True
+    calls = []
+    monkeypatch.setattr(runner, "execute", lambda *a, **k: calls.append((a, k)) or [])
+    monkeypatch.setattr(onboard, "_validation_gateway", lambda *a: pytest.fail("preparation started a target"))
+    assert onboard.run(args) == 0
+    assert len(calls) == 1
+    positional, keywords = calls[0]
+    assert positional[1] is spec
+    assert keywords["prepare_references"] is True
+    assert keywords["select"] == ["e2e-sft-train-validate"]
+    assert not keywords["local_gateway_full_model"]
 
 
 @pytest.mark.parametrize("field", ["config_checksum", "config_id"])
@@ -24844,6 +25179,7 @@ def test_e2e_reference_records_missing_record_stops_before_target_and_prints_ful
     assert result.outcome is Outcome.FAIL
     assert "prepared HF reference missing" in result.summary
     assert "--prepare-references" in result.summary
+    assert "--local-cortex-fixture" in result.summary
     assert "Traceback (most recent call last)" in caplog.text
 
 
