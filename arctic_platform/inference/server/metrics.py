@@ -5,8 +5,7 @@ Two record types:
   * :class:`ReplicaSnapshot` — emitted at fixed intervals from inside vLLM's
     ``AsyncLLM`` step loop via a custom :class:`StatLoggerBase`. One snapshot
     captures the replica's KV-cache utilisation, running/pending request
-    counts, the scheduler-side concurrency limit, and the number of tokens
-    scheduled in the most recent step.
+    counts, and the number of tokens scheduled in the most recent step.
 
   * :class:`RequestRecord` — emitted by the :class:`Scheduler` once per
     generation call. Captures the assigned replica, the arrival /
@@ -30,7 +29,6 @@ totals within one ``started_at`` epoch to measure an interval.
 
 from __future__ import annotations
 
-import bisect
 import threading
 import time
 from collections import deque
@@ -93,7 +91,6 @@ class ReplicaSnapshot:
     kv_cache_usage: float
     num_running_reqs: int
     num_waiting_reqs: int
-    max_concurrency: int        # scheduler-side WorkerState.concurrency_limit
     num_tokens_in_step: int     # decode + prefill tokens scheduled this step
 
     def to_dict(self) -> dict[str, Any]:
@@ -212,10 +209,6 @@ class WorkerMetricsCollector:
             kv_cache_usage=float(scheduler_stats.kv_cache_usage),
             num_running_reqs=int(scheduler_stats.num_running_reqs),
             num_waiting_reqs=int(scheduler_stats.num_waiting_reqs),
-            # `max_concurrency` is owned by the scheduler (in the parent
-            # process). We stamp it later in `Scheduler.drain_metrics` from
-            # the per-replica concurrency-limit history.
-            max_concurrency=0,
             num_tokens_in_step=int(tokens_in_step),
         ))
 
@@ -238,32 +231,6 @@ class WorkerMetricsCollector:
                 "num_draft_tokens": self._totals.num_draft_tokens,
                 "num_accepted_tokens": self._totals.num_accepted_tokens,
             }
-
-    def latest(self) -> dict[str, Any]:
-        """Return the latest scheduler stats without draining the ring.
-
-        Used by the legacy ``InferenceWorker.get_stats`` path (the
-        scheduler's existing utilisation poll loop), so that
-        ``Scheduler.WorkerState`` keeps getting fresh ``kv_cache_usage`` /
-        ``num_requests_running`` / ``num_requests_waiting`` values.
-        """
-        # Avoid draining: peek at the most recent push. If there's been no
-        # snapshot yet (engine just came up), return zeros.
-        with self._snapshots._lock:
-            buf = self._snapshots._buf
-            if not buf:
-                return {
-                    "gpu_cache_usage": 0.0,
-                    "num_requests_running": 0,
-                    "num_requests_waiting": 0,
-                }
-            last = buf[-1]
-        return {
-            "gpu_cache_usage": last.kv_cache_usage,
-            "num_requests_running": last.num_running_reqs,
-            "num_requests_waiting": last.num_waiting_reqs,
-        }
-
 
 # Process-singleton: vLLM's stat logger and the worker actor live in the same
 # process; both look up the collector by engine_index.
@@ -315,67 +282,3 @@ class RingStatLogger(StatLoggerBase):
 
     def log_engine_initialized(self) -> None:
         return None
-
-
-# ---------------------------------------------------------------------------
-# Scheduler-side per-replica concurrency-limit history
-# ---------------------------------------------------------------------------
-
-
-class ConcurrencyHistory:
-    """Tracks per-replica ``concurrency_limit`` over time.
-
-    Used by the scheduler's metrics drain to back-fill the
-    ``max_concurrency`` field on per-step snapshots reported by workers.
-    The history is a list of ``(timestamp, limit)`` samples; queries find
-    the most recent sample at or before a given timestamp via binary search.
-
-    Entries older than ``retention_s`` are pruned on every push so memory
-    stays bounded across long-running jobs.
-    """
-
-    def __init__(self, retention_s: float = 3600.0) -> None:
-        self._retention_s = retention_s
-        self._times: list[float] = []
-        self._limits: list[int] = []
-        self._lock = threading.Lock()
-
-    def __getstate__(self) -> dict[str, Any]:
-        return {
-            "_retention_s": self._retention_s,
-            "_times": self._times,
-            "_limits": self._limits,
-            "_lock": None,
-        }
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        self.__dict__.update(state)
-        self._lock = threading.Lock()
-
-    def record(self, limit: int) -> None:
-        now = time.time()
-        with self._lock:
-            # Skip duplicate-limit pushes that arrive close together — the
-            # adjust loop runs every 0.5s and most ticks won't change the
-            # limit.
-            if self._limits and self._limits[-1] == limit:
-                return
-            self._times.append(now)
-            self._limits.append(limit)
-            self._evict_old(now)
-
-    def _evict_old(self, now: float) -> None:
-        cutoff = now - self._retention_s
-        i = bisect.bisect_left(self._times, cutoff)
-        if i > 0:
-            del self._times[:i]
-            del self._limits[:i]
-
-    def at(self, timestamp: float) -> int:
-        with self._lock:
-            if not self._times:
-                return 0
-            i = bisect.bisect_right(self._times, timestamp)
-            if i == 0:
-                return self._limits[0]
-            return self._limits[i - 1]

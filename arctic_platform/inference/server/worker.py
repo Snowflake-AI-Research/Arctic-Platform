@@ -1516,22 +1516,6 @@ class InferenceWorker(StreamingWorkerMixin):
     def get_state(self) -> str:
         return self.state.value
 
-    def get_stats(self) -> dict[str, Any]:
-        """Return the latest scheduler stats, plus liveness metadata.
-
-        Used by the per-replica concurrency-adjust loop in
-        :class:`arctic_platform.inference.server.scheduler.Scheduler`. The keys
-        ``gpu_cache_usage`` / ``num_requests_running`` /
-        ``num_requests_waiting`` are read by the scheduler to drive the
-        ``utilization_based_concurrency`` heuristic.
-        """
-        latest = get_collector().latest()
-        return {
-            "state": self.state.value,
-            "pid": os.getpid(),
-            **latest,
-        }
-
     def drain_metrics(self) -> dict[str, Any]:
         """Drain snapshots and return lifetime counters without resetting them."""
         from arctic_platform.inference.server.action_mask_replay import (

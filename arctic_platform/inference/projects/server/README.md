@@ -1,6 +1,6 @@
 ## Arctic Inference Server
 
-Multi-model inference server built on Ray and vLLM. Serves multiple models simultaneously with automatic GPU sharing, dynamic rebalancing, and per-pool concurrency control.
+Multi-model inference server built on Ray and vLLM. Serves multiple models simultaneously with automatic GPU sharing and dynamic rebalancing.
 
 ### Architecture
 
@@ -14,7 +14,7 @@ Client ──> FastAPI ──> Driver ──> ReplicaPool (model-a) ──> Sche
 
 - **Driver** — Main server class. Tracks replica pools, manages GPU allocation with even sharing, and routes requests by `model_id`.
 - **ReplicaPool** — Manages workers for a single model. Owns a Scheduler, handles scaling, health monitoring, weight sync, and request submission.
-- **Scheduler** — Routes requests to the least-loaded worker with utilization-based concurrency adjustment.
+- **Scheduler** — Routes each request to the less loaded of two random workers, keeping requests that share a routing key (or, with prefix routing, a prompt) on one worker. Beyond `max_num_seqs`, requests queue in the engine, up to a backlog of twice that per worker (less above `max_num_seqs` 1792, leaving worker actor slots for control calls, but never less than `max_num_seqs`); past it, `generate()` requests wait in the scheduler for the first worker that frees up.
 - **Worker** — Light wrapper around a vLLM `AsyncLLM` engine.
 - **Pipeline** — High-level dataset processing supporting single or multi-model workflows.
 
