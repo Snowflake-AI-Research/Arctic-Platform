@@ -69,3 +69,15 @@ def convert_nemotron_h_layer_to_vllm(
     leftover = [key for key in layer_sd if key.startswith(f"{prefix}.mlp.")]
     raise_unmapped_mlp_keys("Nemotron-H", leftover)
     return layer_sd
+
+
+def convert_nemotron_h_omni_text_layer_to_vllm(
+    layer_sd: dict,
+    layer_idx: int,
+    *,
+    layer_prefix: str | None = None,
+) -> dict:
+    """Nemotron-H names nested under the served ``nemotron_h_omni`` model's ``language_model.``."""
+    convert_nemotron_h_layer_to_vllm(layer_sd, layer_idx, layer_prefix=layer_prefix)
+    _rename_prefix(layer_sd, "", "language_model.")
+    return layer_sd

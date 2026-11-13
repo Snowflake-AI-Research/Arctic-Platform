@@ -25,7 +25,9 @@ from arctic_platform.model.implementations.minimax_m2.modeling_minimax_m2 import
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput, cast_float_and_contiguous
 from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import NemotronHConfig
+from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import NemotronHOmniTextConfig
 from arctic_platform.model.implementations.nemotron_h.modeling_nemotron_h import NemotronHForCausalLM
+from arctic_platform.model.implementations.nemotron_h.modeling_nemotron_h import NemotronHOmniTextForCausalLMPrimeRL
 from arctic_platform.model.implementations.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from arctic_platform.model.implementations.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
 
@@ -74,6 +76,8 @@ for _config_cls, _model_cls, _model_type in (
     (DeepseekV41Config, DeepseekV41ForCausalLM, "deepseek_v41"),
 ):
     _register_causal_lm(_config_cls, _model_cls, _model_type)
+# Shares model_type "nemotron_h", so AutoConfig keeps resolving that type to NemotronHConfig.
+_CUSTOM_CAUSAL_LM_MAPPING.register(NemotronHOmniTextConfig, NemotronHOmniTextForCausalLMPrimeRL, exist_ok=True)
 
 
 def _register_flash_vlm(module: str, class_name: str, model_type: str) -> None:

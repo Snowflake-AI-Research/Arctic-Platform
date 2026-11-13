@@ -134,8 +134,9 @@ CHAT_MODELS = MappingProxyType(
         # deepseek_r1). A reasoner on a model that never closes </think> would
         # hide its whole answer as reasoning.
         "AfmoeForCausalLM": ChatModel(None, "hermes", thinking_optional=True),
-        # Nemotron 3 Nano and Super.
+        # Nemotron 3 Nano and Super, and Nemotron 3.5 Super VL.
         "NemotronHForCausalLM": ChatModel("nemotron_v3", "qwen3_coder", thinking_optional=True),
+        "NemotronH_Omni_Reasoning_V3": ChatModel("nemotron_v3", "qwen3_coder", thinking_optional=True),
         "InklingForCausalLM": ChatModel("inkling", "inkling", thinking_optional=True),
         "InklingForConditionalGeneration": ChatModel("inkling", "inkling", thinking_optional=True),
     }

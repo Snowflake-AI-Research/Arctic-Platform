@@ -39,6 +39,7 @@ LOADER_ARCHITECTURES = {
         "MiniMaxM2ForCausalLM",
         "AfmoeForCausalLM",
         "NemotronHForCausalLM",
+        "NemotronH_Omni_Reasoning_V3",
     },
     "glm5_next": {"Glm5NextForConditionalGeneration"},
     "qwen4_exp": {"Qwen4ExpForConditionalGeneration"},
@@ -121,6 +122,7 @@ def test_every_trainable_architecture_has_a_chat_decision():
         # Trinity-Large-Preview: no thinking, hermes-style JSON tool calls.
         ("AfmoeForCausalLM", None, "hermes", True),
         ("NemotronHForCausalLM", "nemotron_v3", "qwen3_coder", True),
+        ("NemotronH_Omni_Reasoning_V3", "nemotron_v3", "qwen3_coder", True),
         ("InklingForCausalLM", "inkling", "inkling", True),
         ("InklingForConditionalGeneration", "inkling", "inkling", True),
     ],
@@ -265,6 +267,7 @@ TEMPLATE_EFFORTS = {
     "MiniMaxM2ForCausalLM": ANY,
     "AfmoeForCausalLM": ANY,
     "NemotronHForCausalLM": ANY,
+    "NemotronH_Omni_Reasoning_V3": ANY,
 }
 
 

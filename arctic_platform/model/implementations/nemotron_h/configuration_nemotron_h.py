@@ -224,4 +224,36 @@ class NemotronHConfig(PretrainedConfig):
             self.layers_block_type = self.layers_block_type[:value]
 
 
-__all__ = ["NemotronHConfig"]
+NEMOTRON_H_OMNI_MODEL_TYPE = "nemotron_h_omni"
+
+
+class NemotronHOmniTextConfig(NemotronHConfig):
+    """The language model of a ``nemotron_h_omni`` (Nemotron 3.5 VL) checkpoint, for text-only training.
+
+    ``model_type`` stays ``nemotron_h``, so every NemotronH path (direct HF loading, Mamba context
+    parallelism, vLLM packing) applies unchanged. The class selects ``NemotronHOmniTextForCausalLMPrimeRL``,
+    which reads and writes the checkpoint's ``language_model.`` layout.
+    """
+
+    # Transformers generates an ``__init__`` for a config subclass that defines none, skipping NemotronHConfig's.
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    @classmethod
+    def from_omni_checkpoint(cls, model_path_or_name: str, **kwargs) -> "NemotronHOmniTextConfig":
+        """Build from the checkpoint's raw language-model config, as a standalone NemotronH config is read.
+
+        Transformers' composite config builds its own ``NemotronHConfig``, which renames the layer types
+        this model is built from, so the nested JSON is read directly.
+        """
+        config_dict, _ = PretrainedConfig.get_config_dict(model_path_or_name)
+        if config_dict.get("model_type") != NEMOTRON_H_OMNI_MODEL_TYPE:
+            raise ValueError(f"{model_path_or_name} is not a {NEMOTRON_H_OMNI_MODEL_TYPE} checkpoint")
+        # Released checkpoints name it ``llm_config``; Transformers writes ``text_config``.
+        text_config = config_dict.get("text_config", config_dict.get("llm_config"))
+        if not isinstance(text_config, dict):
+            raise ValueError(f"{model_path_or_name} has no {NEMOTRON_H_OMNI_MODEL_TYPE} language-model config")
+        return cls.from_dict(text_config, **kwargs)
+
+
+__all__ = ["NEMOTRON_H_OMNI_MODEL_TYPE", "NemotronHConfig", "NemotronHOmniTextConfig"]
