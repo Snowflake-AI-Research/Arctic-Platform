@@ -25256,12 +25256,13 @@ def test_onboarding_final_regression_scopes_inference_options_to_inference(tmp_p
         assert command[command.index("--inference-initial-model-dir") + 1] == str(args.inference_initial_model_dir)
 
 
-def test_short_sequence_regression_cli_and_api_preserve_explicit_tokens():
+@pytest.mark.parametrize("tokens", [128, 256])
+def test_short_sequence_regression_cli_and_api_preserve_explicit_tokens(tokens):
     request, options = api.parse_run_args(
-        ["--config", "synthetic.config", "--test", "single-step-optimizer", "--tokens", "256"]
+        ["--config", "synthetic.config", "--test", "single-step-optimizer", "--tokens", str(tokens)]
     )
-    assert options.tokens == 256
-    assert execution._validate_regression_tokens(api._namespace(request, options)) == 256
+    assert options.tokens == tokens
+    assert execution._validate_regression_tokens(api._namespace(request, options)) == tokens
     _, defaults = api.parse_run_args(["--config", "synthetic.config"])
     assert defaults.tokens is None
 
@@ -25287,12 +25288,40 @@ def test_short_sequence_regression_rejects_invalid_selection_before_work(
         api.run(api.RunRequest(config=config, all_configs=all_configs, tests=tests), api.RunOptions(tokens=tokens))
 
 
-@pytest.mark.parametrize("requested_tokens", [None, 128, 256])
+@pytest.mark.parametrize("test_id", ["single-step-grads", "single-step-optimizer"])
+def test_onboarding_final_regression_child_accepts_tokens(tmp_path, monkeypatch, test_id):
+    args = execution.parse_args(["onboard", "--config", "synthetic.config", "--test", test_id, "--tokens", "128"])
+    args.output_dir = tmp_path
+    args.checkout_root = tmp_path
+    args.test_spec = tmp_path / "reviewed.json"
+    args.test_spec.write_text("unchanged frozen specification")
+    captured = []
+
+    def process(command, **kwargs):
+        parsed = execution.parse_args(command[3:])
+        request = api.request_from_args(parsed)
+        options = api.options_from_args(parsed)
+        assert request.tests == (test_id,)
+        assert options.tokens == 128 and options.test_spec == args.test_spec
+        assert execution._validate_regression_tokens(api._namespace(request, options)) == 128
+        captured.append(command)
+        (Path(parsed.out) / "report.json").write_text('{"totals": {"pass": 2, "fail": 0}}')
+        return SimpleNamespace(stdout=io.StringIO("synthetic child\n"), wait=lambda: 0)
+
+    monkeypatch.setattr(onboard.subprocess, "Popen", process)
+    assert onboard._run_final_regression(args, {"layers": 4})["status"] == "pass"
+    assert len(captured) == 1 and captured[0].count("--tokens") == 1
+    assert args.test_spec.read_text() == "unchanged frozen specification"
+
+
+@pytest.mark.parametrize("requested_tokens", [None, 128, 256, 8193])
 @pytest.mark.parametrize("damage", [None, "identity", "checksum", "rows", "attention"])
 def test_short_sequence_regression_requires_exact_frozen_cases(
     selected_spec_case_state, monkeypatch, requested_tokens, damage
 ):
     state = selected_spec_case_state
+    state.cfg.training["ds_config"] = {"data_types": {"grad_accum_dtype": "fp32"}}
+    state.spec.config_checksum = config_checksum(state.cfg)
     for arm in state.spec.arms:
         arm.max_seq_len = 256
         arm.total_tokens = arm.global_batch_size * 256
