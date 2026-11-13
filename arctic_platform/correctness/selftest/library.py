@@ -23310,6 +23310,7 @@ _SELFTEST_AUTO_FIXTURES = {
     "model_fixtures": [],
     "optimizer_math": [],
     "onboarding_storage": ["_synthetic_onboarding_environment"],
+    "checkpoint_state": [],
     "local_transport": [],
     "runtime_clients": ["_synthetic_runtime_inputs", "_external_operator_catalog"],
     "remaining_checkpoint_resume_checkpoint_state": (),
@@ -27817,3 +27818,208 @@ def test_remaining_checkpoint_onprem_runner_forwards_reviewed_spec_to_transport(
             {"slots": 4, "attn_implementation": "sdpa", "spec": spec},
         )
     ]
+
+
+_local_creation_batch_error = (
+    "AssertionError: Check batch related parameters. train_batch_size is not equal to "
+    "micro_batch_per_gpu * gradient_acc_step * world_size 8 != 1 * 1 * 2.0"
+)
+
+
+@pytest.mark.parametrize("encoding", ["mapping", "json", "http-repr", "human-log", "inline-msg"])
+def test_local_cortex_creation_failure_reports_owned_deepspeed_cause(tmp_path, encoding):
+    child = "owned-native-child"
+    path = tmp_path / "training-zone-control.log"
+    remote_traceback = (
+        "Traceback (most recent call last):\n"
+        '  File "deepspeed/runtime/config.py", line 1000, in _batch_assertion\n'
+        "    assert train_batch == micro_batch * grad_acc * self.world_size\n"
+        + _local_creation_batch_error
+    )
+    if encoding == "human-log":
+        text = f"12:00:00 ERROR [zone] Failed to create job {child}\n{remote_traceback}\n12:00:01 INFO done\n"
+    elif encoding == "inline-msg":
+        text = json.dumps({"msg": f"Failed to create job {child}\n{remote_traceback}"}) + "\n"
+    else:
+        text = json.dumps({"msg": f"Failed to create job {child}", "exc": remote_traceback}) + "\n"
+    path.write_text(text)
+    detail = {
+        "message": f"job {child} failed",
+        "zone_id": path.stem,
+        "zone_log_path": str(path),
+        "init_debug": None,
+    }
+    reason = (
+        json.dumps({"detail": detail})
+        if encoding == "json"
+        else f"sub-job training failed: 500: {detail!r}" if encoding == "http-repr" else detail
+    )
+    result = cortex_fixture._local_creation_failure(reason, {"training": child})
+    assert result.startswith(f"Remote server error: {_local_creation_batch_error}\n")
+    assert f"Server log: {path}" in result and remote_traceback in result
+    assert "INFO done" not in result
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Failed to create job owned-native-child-extra\n",
+        "Failed to create job owned-native-child \n",
+        "Failed to create job unrelated-child\n",
+        "prefix Failed to create job owned-native-child\n",
+        "Failed to create job owned-native-child: ",
+    ],
+)
+def test_local_cortex_creation_failure_rejects_inline_message_near_prefixes(message):
+    record = json.dumps({"msg": message + _local_creation_batch_error})
+    assert cortex_fixture._creation_failure_traceback(record, "owned-native-child") is None
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "different-child",
+        "different-message-child",
+        "different-zone",
+        "missing",
+        "directory",
+        "symlink",
+        "unreadable",
+        "malformed-reason",
+        "oversized-reason",
+        "no-traceback",
+    ],
+)
+def test_local_cortex_creation_failure_never_attributes_unrelated_or_unreadable_log(tmp_path, monkeypatch, broken):
+    child = "owned-native-child"
+    path = tmp_path / "training-zone-control.log"
+    detail = {"message": f"job {child} failed", "zone_id": path.stem, "zone_log_path": str(path)}
+    if broken == "directory":
+        path.mkdir()
+    elif broken != "missing":
+        path.write_text(
+            json.dumps(
+                {
+                    "msg": f"Failed to create job {('unrelated-child' if broken == 'different-child' else child)}",
+                    "exc": "no exception in this record" if broken == "no-traceback" else _local_creation_batch_error,
+                }
+            )
+            + "\n"
+        )
+    if broken == "different-message-child":
+        detail["message"] = "job unrelated-child failed"
+    elif broken == "different-zone":
+        detail["zone_id"] = "training-zone-unrelated"
+    elif broken == "symlink":
+        link = tmp_path / "training-zone-link.log"
+        link.symlink_to(path)
+        detail.update(zone_id=link.stem, zone_log_path=str(link))
+    elif broken == "unreadable":
+        original_open = os.open
+
+        def opened(value, *args, **kwargs):
+            if Path(value) == path:
+                raise PermissionError("unreadable control")
+            return original_open(value, *args, **kwargs)
+
+        monkeypatch.setattr(cortex_fixture.os, "open", opened)
+    reason = (
+        "sub-job failed: {malformed}"
+        if broken == "malformed-reason"
+        else "{" + "x" * 65536 if broken == "oversized-reason" else detail
+    )
+    assert cortex_fixture._local_creation_failure(reason, {"training": child}) is None
+
+
+def test_local_cortex_creation_failure_selects_exact_json_record_and_bounds_log_read(tmp_path):
+    path = tmp_path / "training-zone-control.log"
+    child = "owned-native-child"
+    path.write_text(
+        "x" * (1 << 20)
+        + "\n"
+        + json.dumps({"msg": f"Failed to create job {child}", "exc": _local_creation_batch_error})
+        + "\n"
+        + json.dumps({"msg": "Failed to create job unrelated-child", "exc": "ValueError: stale unrelated failure"})
+        + "\n"
+    )
+    result = cortex_fixture._local_creation_failure(
+        {"message": f"job {child} failed", "zone_id": path.stem, "zone_log_path": str(path)},
+        {"training": child},
+    )
+    assert _local_creation_batch_error in result
+    assert "stale unrelated failure" not in result and len(result) < 2000
+
+
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("recoverable", [False, True])
+def test_local_cortex_creation_failure_real_poll_preserves_cause_and_banner(
+    tmp_path, monkeypatch, capsys, local, recoverable
+):
+    from arctic_platform.correctness.onboarding import onboard
+
+    child = "owned-native-child"
+    path = tmp_path / "training-zone-control.log"
+    path.write_text(json.dumps({"msg": f"Failed to create job {child}", "exc": _local_creation_batch_error}))
+    transport = object.__new__(CorrectnessCortexTransport)
+    transport.config = CortexConfig(base_url="http://127.0.0.1:8003" if local else "http://remote.test")
+    transport.poll_interval = 0.1
+    transport.job_id = "owned-parent"
+    transport._native_children = {"training": child}
+    detail = {"message": f"job {child} failed", "zone_id": path.stem, "zone_log_path": str(path)}
+    if not recoverable:
+        detail["zone_log_path"] = str(tmp_path / "missing.log")
+    monkeypatch.setattr(CortexTransport, "_job", lambda self: {"status": "failed", "reason": detail})
+    with pytest.raises(RuntimeError) as caught:
+        transport._wait_running()
+    reason = str(caught.value)
+    assert "terminal state 'failed'" in reason
+    if local and recoverable:
+        assert reason.startswith(f"Remote server error: {_local_creation_batch_error}\n")
+        assert isinstance(caught.value.__cause__, RuntimeError)
+    else:
+        assert "Remote server error:" not in reason
+    onboard._onboarding_failure(reason)
+    assert reason.splitlines()[0] in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("unsafe_cleanup", [False, True])
+def test_onboarding_target_creation_error_leads_final_banner_and_preserves_unsafe_stop(
+    tmp_path, monkeypatch, capsys, unsafe_cleanup
+):
+    from arctic_platform.correctness.onboarding import onboard
+
+    args = execution.parse_args(["onboard", "--config", str(tmp_path / "model.json"), "--test", "single-step-grads"])
+    args.output_dir = tmp_path
+    args.checkout_root = tmp_path
+    cause = f"Remote server error: {_local_creation_batch_error}"
+    reason = cause + "\nServer log: /tmp/raydss/training-zone-control.log"
+    if unsafe_cleanup:
+        reason = "UnsafeCleanupError: Original workload failed: RuntimeError: " + reason
+
+    def child(command, **kwargs):
+        out = args.output_dir / "validation" / "4-layers"
+        (out / "report.json").write_text(
+            json.dumps(
+                {
+                    "totals": {"error": 1},
+                    "results": [{"test_id": args.test_id, "arm": "gas1", "outcome": "error", "reason": reason}],
+                }
+            )
+        )
+        (out / "batch.json").write_text(json.dumps({"stopped_unsafe": unsafe_cleanup}))
+        return SimpleNamespace(stdout=io.StringIO(reason + "\n"), wait=lambda: 1)
+
+    monkeypatch.setattr(onboard.subprocess, "Popen", child)
+    error_type = operator_interface_UnsafeCleanupError if unsafe_cleanup else RuntimeError
+    with pytest.raises(error_type, match="8 != 1") as caught:
+        validation = onboard._run_final_regression(args, {"layers": 4})
+        onboard._require_validation_pass(validation, "final 4-layer regression")
+    assert str(caught.value).splitlines()[0] == f"single-step-grads / gas1: {reason.splitlines()[0]}"
+    assert "Server log:" in str(caught.value) and "Complete log:" in str(caught.value)
+    if unsafe_cleanup:
+        assert "Further onboarding stopped" in str(caught.value)
+        assert not (tmp_path / "validation" / "4-layers" / "validation.json").exists()
+    onboard._onboarding_failure(str(caught.value))
+    printed = capsys.readouterr().err
+    assert f"!!!!! ONBOARDING FAILED : {str(caught.value).splitlines()[0]} !!!!!" in printed
+    assert "8 != 1 * 1 * 2.0" in printed
