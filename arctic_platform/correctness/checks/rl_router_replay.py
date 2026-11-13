@@ -32,8 +32,8 @@ captured position of the tokens it packs; and every router invocation replayed a
 slice of that tensor. Under sequence parallelism a rank receives only the ``[start, end)`` window of the capture
 spanned by the positions its own calls carry for that sample, clipped to ``capture_len``, so that window is what
 its received routing is compared with. The capture is as wide as the decoder; a dense layer has no router, so the
-layers that must show invocations are those whose router ran in some traced call. Under ``ac_config`` mode
-``full`` with ``freq`` 1 every layer is recomputed, so each call must show a recompute invocation for every such
+layers that must show invocations come from the model's bound router inventory, not observed invocations. Under
+``ac_config`` mode ``full`` with ``freq`` 1 every layer is recomputed, so each call must show a recompute invocation for every such
 layer as well as a forward one. A router that computed its own routing, a sample whose routing reached no model
 call, no router invocation in any call, and a router invocation outside any traced call are failures.
 
@@ -65,6 +65,9 @@ from arctic_platform.correctness.harness.gateway import minimum_context_parallel
 from arctic_platform.correctness.harness.gateway import rl_batch
 from arctic_platform.correctness.harness.gateway import rl_fwd_bwd
 from arctic_platform.correctness.harness.gateway import running_rl_client
+from arctic_platform.correctness.harness.inference import router_replay_bound_inventory
+from arctic_platform.correctness.harness.inference import router_replay_expected_layers
+from arctic_platform.correctness.harness.inference import router_replay_routing_geometry
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.sft import TRAIN_SPLIT
 from arctic_platform.correctness.harness.sft import configured_rows_per_step
@@ -252,27 +255,74 @@ def _holds_sample(tokens: Sequence[int], positions: Sequence[int], samples: Sequ
     return any(_attribute(tokens, positions, start, end, samples) is not None for start, end in _segments(positions))
 
 
+def _sample_geometry(sample: dict, inventory: dict) -> None:
+    marker = sample["marker"]
+    tokens, routing = sample["tokens"], sample["routing"]
+    prompt, generated, captured = (marker.get(key) for key in ("prompt_len", "generation_len", "capture_len"))
+    if (
+        not isinstance(tokens, list)
+        or any(type(token) is not int or token < 0 for token in tokens)
+        or any(type(value) is not int or value <= 0 for value in (prompt, captured))
+        or type(generated) is not int
+        or generated < 0
+        or type(sample.get("prompt_len")) is not int
+        or sample["prompt_len"] != prompt
+        or prompt + generated != len(tokens)
+        or captured != len(tokens) - 1
+    ):
+        raise ValueError("sampler capture_len must equal prompt_len + generation_len - 1 with exact token metadata")
+    replay_id = marker.get("replay_id")
+    if not isinstance(replay_id, str) or not replay_id:
+        raise ValueError("sampler replay_id must be nonempty")
+    router_replay_routing_geometry(routing, inventory, tokens=captured)
+    shape = marker.get("routed_experts_shape")
+    if (
+        not isinstance(shape, list)
+        or any(type(size) is not int for size in shape)
+        or shape != [captured, inventory["num_hidden_layers"], inventory["num_experts_per_tok"]]
+    ):
+        raise ValueError("sampler routed_experts_shape differs from model_inventory or capture_len")
+    dtype = marker.get("routed_experts_dtype")
+    if dtype not in ("uint8", "uint16"):
+        raise ValueError("sampler routed_experts_dtype must be native uint8 or uint16")
+    limit = 256 if dtype == "uint8" else 65536
+    if any(index >= limit for row in routing for indices in row for index in indices):
+        raise ValueError("sampler expert index does not fit its declared native dtype")
+    router_replay_routing_geometry(marker.get("routed_experts"), inventory, tokens=captured)
+    if marker["routed_experts"] != routing:
+        raise ValueError("sampler marker routing differs from the compared routing")
+
+
 def judge(
     samples: Sequence[dict], traces: Sequence[Optional[dict]], *, full_recompute: bool
 ) -> Tuple[List[Mismatch], Dict[str, float]]:
     failed: List[Mismatch] = []
-    by_replay_id = {s["marker"]["replay_id"]: i for i, s in enumerate(samples)}
-    layers = len(samples[0]["routing"][0]) if samples and samples[0]["routing"] else 0
+    if not samples:
+        failed.append(Mismatch("no generated samples to compare", 1.0, 0.0))
+    layers = 0
     received_by: Dict[int, int] = {}
-    covered_positions = [0] * len(samples)
-    router_layers = sorted(
-        {
-            invocation["layer"]
-            for trace in traces
-            if trace is not None
-            for call in trace.get("calls") or []
-            if not call.get("padding")
-            for invocation in call.get("router") or []
-            if invocation.get("layer") is not None
-        }
-    )
-    if samples and not router_layers:
-        failed.append(Mismatch("no MoE router invocation in any traced call", 1.0, 0.0))
+    covered_positions = [set() for _ in samples]
+    router_layers = None
+    model_inventory = None
+    for trace_index, trace in enumerate(traces):
+        try:
+            inventory = router_replay_expected_layers(trace.get("expected_layers") if trace is not None else None)
+            binding = router_replay_bound_inventory(
+                trace.get("model_inventory") if trace is not None else None, expected_layers=inventory
+            )
+        except ValueError as exc:
+            failed.append(Mismatch(f"trace {trace_index}: invalid bound router inventory: {exc}", 1.0, 0.0))
+            continue
+        if router_layers is None:
+            router_layers = inventory
+            model_inventory = binding
+        elif inventory != router_layers:
+            failed.append(Mismatch(f"rank {trace.get('rank')}: expected_layers differs across ranks", 1.0, 0.0))
+        elif binding != model_inventory:
+            failed.append(Mismatch(f"rank {trace.get('rank')}: model_inventory differs across ranks", 1.0, 0.0))
+    if samples and router_layers is None:
+        failed.append(Mismatch("no bound model router inventory in training traces", 1.0, 0.0))
+    router_layers = router_layers or []
     counts = {
         "calls": 0,
         "padding_calls": 0,
@@ -281,6 +331,27 @@ def judge(
         "compared_positions": 0,
         "unattributed_tokens": 0,
     }
+    if model_inventory is not None:
+        layers = model_inventory["num_hidden_layers"]
+        for index, sample in enumerate(samples):
+            try:
+                _sample_geometry(sample, model_inventory)
+            except (KeyError, TypeError, ValueError) as exc:
+                failed.append(Mismatch(f"sample {index}: invalid captured geometry: {exc}", 1.0, 0.0))
+    replay_ids = [sample.get("marker", {}).get("replay_id") for sample in samples]
+    if len({str(replay_id) for replay_id in replay_ids}) != len(samples):
+        failed.append(Mismatch("sampler replay identities are duplicated", 1.0, 0.0))
+    metrics: Dict[str, float] = {
+        "samples": float(len(samples)),
+        "layers": float(layers),
+        "generated_tokens": 0.0,
+        "captured_positions": 0.0,
+        "full_recompute_expected": 1.0 if full_recompute else 0.0,
+        **{key: float(value) for key, value in counts.items()},
+    }
+    if failed:
+        return failed, metrics
+    by_replay_id = {s["marker"]["replay_id"]: i for i, s in enumerate(samples)}
 
     for trace in traces:
         if trace is None:
@@ -303,6 +374,20 @@ def judge(
             label = f"rank {rank} call {call_index}"
             routed = call.get("routed_experts")
             tokens, positions = call["input_ids"], call["position_ids"]
+            try:
+                if (
+                    not isinstance(tokens, list)
+                    or not isinstance(positions, list)
+                    or len(tokens) != len(positions)
+                    or any(type(token) is not int or token < 0 for token in tokens)
+                    or any(type(position) is not int or position < 0 for position in positions)
+                ):
+                    raise ValueError("model token and position vectors have invalid geometry")
+                if routed is not None:
+                    router_replay_routing_geometry(routed, model_inventory, tokens=len(tokens))
+            except ValueError as exc:
+                failed.append(Mismatch(f"{label}: invalid captured geometry: {exc}", 1.0, 0.0))
+                continue
             if routed is None:
                 if _holds_sample(tokens, positions, samples):
                     failed.append(Mismatch(f"{label}: no routed_experts handed to the model", 1.0, 0.0))
@@ -314,16 +399,22 @@ def judge(
                 if index is None:
                     counts["unattributed_tokens"] += end - start
                     continue
+                if positions[start:end] != list(range(positions[start], positions[start] + end - start)):
+                    failed.append(Mismatch(f"{label}: sample {index} has noncontiguous captured positions", 1.0, 0.0))
+                    continue
                 low, high = windows.get(index, (positions[start], positions[end - 1] + 1))
                 windows[index] = (min(low, positions[start]), max(high, positions[end - 1] + 1))
                 capture = samples[index]["routing"]
                 differing = 0
                 for t in range(start, end):
                     position = positions[t]
+                    if position < 0:
+                        failed.append(Mismatch(f"{label}: sample {index} has a negative captured position", 1.0, 0.0))
+                        continue
                     if position >= len(capture):
                         continue
                     counts["compared_positions"] += 1
-                    covered_positions[index] += 1
+                    covered_positions[index].add(position)
                     if routed[t] != capture[position]:
                         differing += 1
                 if differing:
@@ -337,9 +428,17 @@ def judge(
             seen = {"forward": set(), "recompute": set()}
             for invocation in call.get("router") or []:
                 layer, phase = invocation.get("layer"), invocation.get("phase")
+                if phase not in seen:
+                    failed.append(Mismatch(f"{label}: router invocation has invalid phase {phase!r}", 1.0, 0.0))
+                    continue
                 counts[f"{phase}_invocations"] += 1
                 if layer is None:
                     failed.append(Mismatch(f"{label}: router with no decoder layer index", 1.0, 0.0))
+                    continue
+                if type(layer) is not int or layer not in router_layers:
+                    failed.append(
+                        Mismatch(f"{label}: router layer {layer!r} is outside the bound inventory", 1.0, 0.0)
+                    )
                     continue
                 seen[phase].add(layer)
                 if not invocation.get("replayed"):
@@ -353,6 +452,20 @@ def judge(
                     continue
                 expected = [row[layer] for row in routed]
                 used = invocation.get("indices")
+                if (
+                    not isinstance(used, list)
+                    or len(used) != len(expected)
+                    or any(
+                        not isinstance(row, list)
+                        or len(row) != model_inventory["num_experts_per_tok"]
+                        or any(
+                            type(index) is not int or not 0 <= index < model_inventory["num_experts"] for index in row
+                        )
+                        for row in used
+                    )
+                ):
+                    failed.append(Mismatch(f"{label}: layer {layer} {phase} has invalid expert geometry", 1.0, 0.0))
+                    continue
                 if used != expected:
                     rows = sum(1 for a, b in zip(used or [], expected) if a != b)
                     rows += abs(len(used or []) - len(expected))
@@ -373,7 +486,16 @@ def judge(
                                 0.0,
                             )
                         )
-        for replay_id, routing in (trace.get("received") or {}).items():
+        received = trace.get("received") or {}
+        for index, (low, high) in windows.items():
+            if (
+                low < min(high, len(samples[index]["routing"]))
+                and samples[index]["marker"]["replay_id"] not in received
+            ):
+                failed.append(
+                    Mismatch(f"rank {rank}: sample {index} has no RX record for its captured window", 1.0, 0.0)
+                )
+        for replay_id, routing in received.items():
             index = by_replay_id.get(replay_id)
             if index is None:
                 failed.append(
@@ -387,6 +509,11 @@ def judge(
             received_by[index] = received_by.get(index, 0) + 1
             capture = samples[index]["routing"]
             low, high = windows.get(index, (0, 0))
+            try:
+                router_replay_routing_geometry(routing, model_inventory, tokens=max(0, min(high, len(capture)) - low))
+            except ValueError as exc:
+                failed.append(Mismatch(f"rank {rank}: sample {index} has invalid RX geometry: {exc}", 1.0, 0.0))
+                continue
             if routing != capture[low : min(high, len(capture))]:
                 failed.append(
                     Mismatch(
@@ -400,11 +527,12 @@ def judge(
         if index not in received_by:
             failed.append(Mismatch(f"sample {index}: no training rank received its routing", 1.0, 0.0))
         expected_positions = int(sample["marker"]["capture_len"])
-        if covered_positions[index] < expected_positions:
+        if covered_positions[index] != set(range(expected_positions)):
             failed.append(
                 Mismatch(
-                    f"sample {index}: captured positions compared in a model call",
-                    float(covered_positions[index]),
+                    f"sample {index}: captured positions compared in a model call lack exact [0, capture_len)"
+                    " coverage",
+                    float(len(covered_positions[index])),
                     float(expected_positions),
                 )
             )

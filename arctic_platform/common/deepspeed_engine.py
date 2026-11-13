@@ -35,6 +35,7 @@ from pydantic import Field
 
 from arctic_platform.common.optimizer import OptimizerSettings
 from arctic_platform.debug.deepspeed_zero_initialization import maybe_trace_zero_initialization
+from arctic_platform.debug.training import maybe_cleanup_router_replay_on_failure
 from arctic_platform.debug.training import maybe_configure_router_replay_trace
 from arctic_platform.debug.weight_sync import maybe_configure_broadcast_training
 from arctic_platform.model.implementations.fp8 import keeps_fp32
@@ -452,6 +453,7 @@ def release_offloaded_grad_partitions(optimizer) -> bool:
     return True
 
 
+@maybe_cleanup_router_replay_on_failure(runtime=True)
 def initialize_training_engine(
     model,
     ds_config: dict[str, Any],

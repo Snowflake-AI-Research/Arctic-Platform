@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU admission controls and seven-check CLI registration without model downloads or a target service."""
+"""CPU admission controls and seven-test CLI registration without model downloads or a target service."""
 
 import json
 import re
@@ -83,7 +83,7 @@ class TestNoDebugCorrectness(TestCasePlus):
             block_debug=False,
         )
 
-    def test_list_registers_all_seven_checks(self):
+    def test_list_registers_all_seven_tests(self):
         config_root = self.get_auto_remove_tmp_dir()
         result = self._cli("list", "--config-dir", str(config_root))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

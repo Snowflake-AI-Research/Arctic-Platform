@@ -54,7 +54,11 @@ from arctic_platform.debug.lora import maybe_lora_training_worker
 from arctic_platform.debug.lora import maybe_record_lora_sender
 from arctic_platform.debug.lora import maybe_release_lora_worker
 from arctic_platform.debug.lora import maybe_verify_worker_engine
+from arctic_platform.debug.training import maybe_cleanup_router_replay_on_failure
+from arctic_platform.debug.training import maybe_configure_router_replay_trace
+from arctic_platform.debug.training import maybe_finish_router_replay_after_destroy
 from arctic_platform.debug.weight_sync import maybe_annotate_weight_sync_result
+from arctic_platform.debug.weight_sync import maybe_configure_broadcast_training
 from arctic_platform.debug.weight_sync import maybe_observe_weight_send
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import build_model
@@ -155,6 +159,7 @@ class DeepSpeedWorker:
             raise RuntimeError("sequence-parallel membership disagrees with the initialized worker")
         return {"rank": rank, "world_size": world_size, "sp_size": size, "sp_rank": sp_rank, "sp_ranks": ranks}
 
+    @maybe_cleanup_router_replay_on_failure(runtime=True)
     def initialize(self, master_addr: str, job_config: dict) -> bool:
         self.master_addr = master_addr
         os.environ.update(
@@ -270,6 +275,8 @@ class DeepSpeedWorker:
             )
         else:
             # Forward-only/log-prob remains a separate no-optimizer contract.
+            ds_config = maybe_configure_broadcast_training(ds_config)
+            ds_config = maybe_configure_router_replay_trace(ds_config, model, self.rank)
             init_kwargs = {"mpu": self.mpu} if self.mpu is not None else {}
             self.engine, _, _, _ = deepspeed.initialize(model=model, config=ds_config, **init_kwargs)
         maybe_verify_worker_engine(self)
@@ -1366,6 +1373,7 @@ class DeepSpeedWorker:
         logger.info("Rank %d empty_cache: %.0f MB GPU remaining", self.rank, mem_mb)
         return {"gpu_mb": mem_mb}
 
+    @maybe_finish_router_replay_after_destroy
     def destroy(self) -> bool:
         maybe_release_lora_worker(self)
         if self._weight_sender is not None:

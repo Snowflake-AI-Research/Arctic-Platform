@@ -45,7 +45,6 @@ import requests
 from arctic_platform.client.requests import export_checkpoint_request
 from arctic_platform.correctness.harness.storage import parse_hostfile
 from arctic_platform.correctness.harness.storage import require_data_fast_path
-from arctic_platform.debug.training import TRACE_SCHEMA
 
 # Router Replay Trace
 
@@ -53,8 +52,66 @@ _RECEIPT = "ROUTER_REPLAY_TRACE_CHUNK "
 ROUTER_REPLAY_TRACE_CHUNK_BYTES = 4096
 
 
+def router_replay_expected_layers(value) -> list[int]:
+    """Validate the producer's model-bound inventory independently of observed calls."""
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(type(layer) is not int or layer < 0 for layer in value)
+        or len(set(value)) != len(value)
+    ):
+        raise ValueError("expected_layers must be a nonempty list of unique nonnegative decoder layer indices")
+    return sorted(value)
+
+
+def router_replay_bound_inventory(value, *, expected_layers) -> dict:
+    """Validate and retain the complete v2 model binding published by the native producer."""
+    layers = router_replay_expected_layers(expected_layers)
+    fields = {
+        "model_type",
+        "num_hidden_layers",
+        "num_experts_per_tok",
+        "num_experts",
+        "expected_layers",
+        "resolved_model_config_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("router-replay model_inventory lacks the exact native producer fields")
+    if value["model_type"] not in ("qwen3_moe", "qwen3_5_moe_text", "glm4_moe", "glm_moe_dsa"):
+        raise ValueError("router-replay model_inventory has an unsupported model_type")
+    depth, top_k, experts = (value[key] for key in ("num_hidden_layers", "num_experts_per_tok", "num_experts"))
+    if any(type(item) is not int or item <= 0 for item in (depth, top_k, experts)) or top_k > experts:
+        raise ValueError("router-replay model_inventory has invalid depth, top-k or expert count")
+    bound_layers = router_replay_expected_layers(value["expected_layers"])
+    if bound_layers != layers or bound_layers[-1] >= depth:
+        raise ValueError("router-replay model_inventory expected_layers differs from the bound decoder roster")
+    digest = value["resolved_model_config_sha256"]
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError("router-replay model_inventory has invalid resolved model config digest")
+    return {**value, "expected_layers": bound_layers}
+
+
+def router_replay_routing_geometry(value, inventory: dict, *, tokens: int) -> None:
+    """Check rectangular token/layer/top-k geometry against the producer's configuration."""
+    if not isinstance(value, list) or len(value) != tokens:
+        raise ValueError("routing token count differs from the captured tokens")
+    routed_layers = set(inventory["expected_layers"])
+    for row in value:
+        if not isinstance(row, list) or len(row) != inventory["num_hidden_layers"]:
+            raise ValueError("routing decoder width differs from model_inventory")
+        for layer, indices in enumerate(row):
+            if not isinstance(indices, list) or len(indices) != inventory["num_experts_per_tok"]:
+                raise ValueError("routing top-k differs from model_inventory")
+            if any(type(index) is not int or index < 0 for index in indices):
+                raise ValueError("routing expert indices must be nonnegative integers")
+            # Dense decoder slots are capture padding, not expert selections.
+            if layer in routed_layers and any(index >= inventory["num_experts"] for index in indices):
+                raise ValueError("routing expert index exceeds model_inventory")
+
+
 def _node_trace_receipt(output_dir: str, request_id: str, token: str) -> dict:
     from arctic_platform.correctness.harness.storage import require_data_fast_path
+    from arctic_platform.debug.training import TRACE_SCHEMA
 
     root = require_data_fast_path(output_dir, label="router-replay evidence") / request_id
     if re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", request_id) is None:
@@ -69,6 +126,7 @@ def _node_trace_receipt(output_dir: str, request_id: str, token: str) -> dict:
         record = json.loads(raw)
         if record.get("schema") != TRACE_SCHEMA or record.get("request_id") != request_id:
             raise ValueError("router-replay artifact schema or request differs")
+        router_replay_bound_inventory(record.get("model_inventory"), expected_layers=record.get("expected_layers"))
         records.append({"filename": path.name, "sha256": hashlib.sha256(raw).hexdigest(), "record": record})
     return {"token": token, "host": socket.gethostname(), "request_id": request_id, "records": records}
 
@@ -149,8 +207,14 @@ def _decode_trace_chunks(output: str, *, hosts: list[str], request_id: str, toke
 
 
 def _merge_trace_receipts(receipts: list[dict], *, request_id: str, ranks: int, calls: int) -> list[dict]:
+    from arctic_platform.debug.training import TRACE_SCHEMA
+
+    if type(ranks) is not int or ranks < 1 or type(calls) is not int or calls < 1:
+        raise ValueError("router-replay requires positive rank and completed call counts")
     by_rank = {rank: {} for rank in range(ranks)}
     rank_hosts = {}
+    expected_layers = None
+    model_inventory = None
     for receipt in receipts:
         if receipt.get("request_id") != request_id:
             raise ValueError("router-replay receipt request differs")
@@ -167,6 +231,16 @@ def _merge_trace_receipts(receipts: list[dict], *, request_id: str, ranks: int, 
                 or artifact["filename"] != f"rank-{rank}-call-{call}.json"
             ):
                 raise ValueError("router-replay artifact identity or call count differs")
+            inventory = router_replay_expected_layers(record.get("expected_layers"))
+            if expected_layers is None:
+                expected_layers = inventory
+            elif inventory != expected_layers:
+                raise ValueError("router-replay expected_layers differs across completed calls or ranks")
+            binding = router_replay_bound_inventory(record.get("model_inventory"), expected_layers=inventory)
+            if model_inventory is None:
+                model_inventory = binding
+            elif binding != model_inventory:
+                raise ValueError("router-replay model_inventory differs across completed calls or ranks")
             if call in by_rank[rank]:
                 raise ValueError("duplicate router-replay rank/call artifact")
             if rank in rank_hosts and rank_hosts[rank] != receipt["host"]:
@@ -185,6 +259,8 @@ def _merge_trace_receipts(receipts: list[dict], *, request_id: str, ranks: int, 
         traces.append(
             {
                 "rank": rank,
+                "expected_layers": list(expected_layers),
+                "model_inventory": {**model_inventory, "expected_layers": list(expected_layers)},
                 "received": received,
                 "calls": [records[index]["calls"][0] for index in range(calls)],
                 "unattributed_router_calls": [

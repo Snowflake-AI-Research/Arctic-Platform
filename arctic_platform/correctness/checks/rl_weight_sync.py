@@ -216,6 +216,7 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
         "uncovered": 0,
         "mismatched": 0,
         "unverifiable": 0,
+        "missing_destination_records": 0,
         "changed": 0,
         "untouched": 0,
         "untouched_elements": 0,
@@ -237,6 +238,14 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
         )
         dropped = sorted(name for name, entry in received.items() if not entry.get("destinations"))
         destinations: Dict[str, dict] = record.get("destinations") or {}
+        missing_destination_records = (
+            sorted(
+                {destination for entry in received.values() for destination in entry.get("destinations") or []}
+                - set(destinations)
+            )
+            if not lora
+            else []
+        )
         uncovered = {name: int(d["uncovered"]) for name, d in destinations.items() if int(d["uncovered"])}
         mismatched = {name: int(d["mismatched"]) for name, d in destinations.items() if int(d["mismatched"])}
         unverifiable = sorted(
@@ -253,6 +262,7 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
             ("received but not sent", extra),
             ("received with different bytes, shape, dtype or count", differing),
             (unwritten, dropped),
+            ("has no shadow-verification record", missing_destination_records),
             ("written but not shadow-verifiable", unverifiable),
             ("changed after its shadow verification", changed),
         ):
@@ -276,6 +286,7 @@ def judge(sync: dict) -> Tuple[List[Mismatch], Dict[str, float]]:
         totals["uncovered"] += sum(uncovered.values())
         totals["mismatched"] += sum(mismatched.values())
         totals["unverifiable"] += len(unverifiable)
+        totals["missing_destination_records"] += len(missing_destination_records)
         totals["changed"] += len(changed)
         totals["untouched"] += len(untouched)
         totals["untouched_elements"] += sum(untouched.values())

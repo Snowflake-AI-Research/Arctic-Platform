@@ -1803,10 +1803,18 @@ def running_rl_client(
             client.bootstrap_router_replay(max_cache_bytes=training_replay.get("max_cache_bytes"))
         yield client
     finally:
+        workload = sys.exc_info()
         try:
-            client.shutdown()
+            client.__exit__(*workload)
+        except UnsafeCleanupError:
+            raise
         except Exception as exc:
-            raise UnsafeCleanupError("RL client shutdown failed; inspect owned resources before retrying") from exc
+            cleanup = UnsafeCleanupError(
+                "RL client shutdown failed; inspect owned resources before retrying", shutdown_error=exc
+            )
+            if workload[1] is not None:
+                cleanup.preserve_workload(workload[1])
+            raise cleanup from exc
 
 
 def generate(client: RLClient, prompts: Sequence[Sequence[int]], sampling_params: Sequence[dict]) -> List[dict]:

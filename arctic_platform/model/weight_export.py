@@ -33,6 +33,7 @@ import torch
 import torch.nn as nn
 
 from arctic_platform.debug.weight_sync import maybe_bind_broadcast_trainer_inventory
+from arctic_platform.debug.weight_sync import maybe_cleanup_broadcast_export
 from arctic_platform.debug.weight_sync import maybe_complete_broadcast_trainer_inventory
 
 WeightFormat = Literal["hf", "vllm", "lora"]
@@ -699,6 +700,7 @@ def _iter_generic_weights(
             yield export_name, tensor
 
 
+@maybe_cleanup_broadcast_export
 def iter_model_weights(
     model: nn.Module,
     weight_format: WeightFormat,

@@ -33355,6 +33355,8 @@ def test_driver_replay_verification_enables_unconfigured_sampler_without_mutatin
     events = []
 
     class Client:
+        __exit__ = ap_driver.ArcticClient.__exit__
+
         def __init__(self, native):
             assert native.sampling.arctic_inference_config == {
                 **inference,
@@ -34122,7 +34124,7 @@ def test_native_broadcast_frozen_skips_require_all_rank_unchanged_storage(
     monkeypatch.setattr(dist, "get_world_size", lambda: 2)
     model = torch.nn.Linear(2, 1, bias=False)
     model.register_parameter("frozen", torch.nn.Parameter(torch.ones(3), requires_grad=case == "trainable-skip"))
-    model.frozen._ap_skip_weight_sync = True
+    model.frozen._dss_skip_weight_sync = True
     calls = []
 
     def gather(records, local, *, group):
@@ -34153,7 +34155,7 @@ def test_native_broadcast_frozen_skips_require_all_rank_unchanged_storage(
         elif case == "replacement":
             model.frozen.data = model.frozen.detach().clone()
         elif case == "changed-skip":
-            model.frozen._ap_skip_weight_sync = False
+            model.frozen._dss_skip_weight_sync = False
         if case != "missing-completion":
             broadcast.maybe_complete_broadcast_trainer_inventory(model, is_master=True)
 
@@ -34396,11 +34398,13 @@ def _fp8_fixture(monkeypatch, *, corrupt=False, build=None):
                 first.copy_((-first.float() - 1.0).to(first.dtype))
 
     model = (build or _Fp8FixtureModel)(linear)
-    updater = Updater(model, torch.bfloat16, torch.device("cpu"))
-    updater.corrupting = corrupt
+    updater_type = Updater if corrupt else utils._FP8InplaceUpdater
+    updater = updater_type(model, torch.bfloat16, torch.device("cpu"))
+    if corrupt:
+        updater.corrupting = True
     verifier = sampler_evidence_evidence.ShadowVerifier(model, max_shadow_bytes=1024)
     replay = broadcast.maybe_bind_fp8_updater(
-        verifier, updater, lambda: Updater(model, torch.bfloat16, torch.device("cpu"))
+        verifier, updater, lambda: updater_type(model, torch.bfloat16, torch.device("cpu"))
     )
     return SimpleNamespace(
         model=model, updater=updater, replay=replay, verifier=verifier, operations=operations, quant=scaled_fp8_quant
@@ -38738,9 +38742,11 @@ def test_rl_checks_rl_shutdown_failure_is_unsafe(monkeypatch, tmp_path):
     from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
 
     failure = RuntimeError("RL cancel failed")
-    cfg = load_config(_rl_config_CONFIG)
+    cfg, _ = _rl_checks_config_spec(tmp_path)
 
     class Client:
+
+        __exit__ = rl_driver.ArcticClient.__exit__
 
         def __init__(self, config):
             pass
@@ -38757,13 +38763,15 @@ def test_rl_checks_rl_shutdown_failure_is_unsafe(monkeypatch, tmp_path):
 
 
 def test_rl_checks_native_broadcast_configuration_reaches_both_cortex_workers(tmp_path, monkeypatch):
-    cfg = load_config(_rl_config_CONFIG)
+    cfg, _ = _rl_checks_config_spec(tmp_path)
     before = cfg.native.model_dump()
     payload = rl_driver.build_payload(cfg.training, cfg.model_name, SEED)
     payload["training_config"].setdefault("ds_config", {})[broadcast_evidence.TRAINING_OPTION] = True
     configurations, closed = [], []
 
     class Client:
+        __exit__ = rl_driver.ArcticClient.__exit__
+
         def __init__(self, config):
             configurations.append(config)
 
@@ -38804,8 +38812,7 @@ def test_rl_checks_native_broadcast_configuration_reaches_both_cortex_workers(tm
 )
 @pytest.mark.parametrize("check_id", ["rl-weight-sync", "rl-router-replay"])
 def test_rl_checks_broadcast_rejects_decorated_or_hosted_local_routes(tmp_path, monkeypatch, url, host, pat, check_id):
-    cfg = load_config(_rl_config_CONFIG)
-    spec = Spec.read(_rl_config_SPEC)
+    cfg, spec = _rl_checks_config_spec(tmp_path)
     monkeypatch.setattr(
         registered_tests()[check_id],
         "fn",
@@ -38823,9 +38830,8 @@ def test_rl_checks_broadcast_rejects_decorated_or_hosted_local_routes(tmp_path, 
 
 
 def test_rl_checks_local_gateway_admits_both_observed_rl_checks(tmp_path, monkeypatch):
-    cfg = load_config(_rl_config_CONFIG)
+    cfg, spec = _rl_checks_config_spec(tmp_path)
     before = cfg.native.model_dump()
-    spec = Spec.read(_rl_config_SPEC)
     seen = []
 
     def weight_sync(ctx):
@@ -38873,8 +38879,7 @@ def test_rl_checks_rl_execution_retains_traceback_for_unwrapped_check_failure(mo
     from arctic_platform.correctness.harness import runner
     from arctic_platform.correctness.harness.registry import registered_tests
 
-    cfg = load_config(_rl_config_CONFIG)
-    spec = Spec.read(_rl_config_SPEC)
+    cfg, spec = _rl_checks_config_spec(tmp_path)
 
     def fail(ctx):
         raise RuntimeError("synthetic check failed before returning")
@@ -39221,7 +39226,9 @@ def test_rl_checks_lora_weight_sync_holdings_are_the_trainable_parameters():
     sync = _rl_checks_lora_sync()
     sync["weight_format"] = "vllm"
     failed, metrics = rl_weight_sync.judge(sync)
-    assert [failure.name for failure in failed] == ["trainer elements sent"]
+    assert failed[0].name == "trainer elements sent"
+    assert len(failed) == 9
+    assert all("has no shadow-verification record" in failure.name for failure in failed[1:])
     assert metrics["trainer_elements"] == 58
 
 
@@ -39441,6 +39448,8 @@ def _rl_checks_samples():
             "generation_len": len(tokens) - prompt_len,
             "capture_len": len(routed_experts),
             "routed_experts": routed_experts,
+            "routed_experts_shape": [len(routed_experts), 2, 1],
+            "routed_experts_dtype": "uint8",
         }
         samples.append(
             {
@@ -39469,7 +39478,9 @@ def _rl_checks_trace(samples):
     ]
     return {
         "rank": 0,
-        "received": {s["marker"]["replay_id"]: s["routing"] for s in samples},
+        "expected_layers": [0, 1],
+        "model_inventory": _rl_evidence_inventory(experts=16),
+        "received": {s["marker"]["replay_id"]: copy.deepcopy(s["routing"]) for s in samples},
         "calls": [
             {
                 "padding": False,
@@ -39513,6 +39524,7 @@ def test_rl_checks_router_trace_hooks_external_router_implementations():
             self.layers = torch.nn.ModuleList([Layer()])
 
     model = Model()
+    model.config = _router_replay_evidence_model().config
     trace = debug_router_replay_trace.start(model)
     trace.begin_call(
         {
@@ -39532,7 +39544,7 @@ def test_rl_checks_router_trace_hooks_external_router_implementations():
 @pytest.fixture
 def _router_replay_evidence_case(tmp_path):
     replay_evidence.finish(0)
-    model = torch.nn.Module()
+    model = _router_replay_evidence_model()
     option = {
         "request_id": "request-1",
         "output_dir": "/data-fast/tmp/router-replay-selftest",
@@ -39675,6 +39687,8 @@ def test_router_replay_evidence_hooks_actual_nonreentrant_router_recompute(
 
     model = torch.nn.Module()
     model.layers = torch.nn.ModuleList([Block()])
+    model.config = _router_replay_evidence_model().config
+    model.config.num_experts_per_tok = 2
     model.to(device=device, dtype=dtype)
     routed = torch.tensor([[1, 2], [3, 4]], device=device)
     option = {
@@ -39738,6 +39752,8 @@ def _router_replay_collector_receipt(rank=0, calls=2, host="node-0"):
                     "request_id": "request-1",
                     "rank": rank,
                     "call_index": index,
+                    "expected_layers": [0],
+                    "model_inventory": _rl_evidence_inventory(depth=1, expected_layers=(0,)),
                     "received": {"sample": [[[1]]]},
                     "calls": [{"padding": False, "router": [], "input_ids": [index]}],
                     "unattributed_router_calls": [],
@@ -39950,6 +39966,20 @@ def test_router_replay_evidence_observes_rx_only_and_successful_packed_backward(
     with pytest.raises(RuntimeError, match="actual backward"):
         apply_packed_loss_reduction(engine, torch.tensor(1.0), 0.0, backward=True)
     assert list(output.iterdir()) == []
+    assert replay_evidence.active() is None
+    assert replay_evidence._publication is None
+    replay_evidence.maybe_configure_router_replay_trace(
+        {
+            replay_evidence.TRAINING_OPTION: {
+                "request_id": "fresh-success",
+                "output_dir": "/data-fast/tmp/router-replay-selftest",
+            }
+        },
+        _router_replay_evidence_model(),
+        0,
+    )
+    replay_evidence._publication["output_dir"] = output
+    replay_evidence.maybe_begin_router_replay_call(engine, kwargs, backward="loss_only")
     engine.backward = lambda loss, **kwargs: None
     apply_packed_loss_reduction(engine, torch.tensor(1.0), 0.0, backward=True)
     assert len(list(output.iterdir())) == 1
@@ -40135,8 +40165,8 @@ def test_rl_checks_router_replay_examples_refuse_a_split_without_enough_long_pro
         rl_router_replay.replay_examples(object(), 2, 144)
 
 
-def test_rl_checks_router_replay_selects_rows_with_the_configured_minimum(monkeypatch):
-    cfg = load_config(_rl_config_CONFIG)
+def test_rl_checks_router_replay_selects_rows_with_the_configured_minimum(monkeypatch, tmp_path):
+    cfg, _ = _rl_checks_config_spec(tmp_path)
     tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=1)
     calls = []
 
@@ -40236,6 +40266,8 @@ def test_rl_checks_rl_checks_use_configured_model_for_tokenizer_and_both_zones(
         return examples
 
     class Client:
+        __exit__ = rl_driver.ArcticClient.__exit__
+
         jobs = SimpleNamespace(sampling="native-sampling-job")
 
         def __init__(self, config):
@@ -40255,6 +40287,8 @@ def test_rl_checks_rl_checks_use_configured_model_for_tokenizer_and_both_zones(
                     "generation_len": 1,
                     "capture_len": 2,
                     "routed_experts": [[[1], [2]], [[3], [4]]],
+                    "routed_experts_shape": [2, 2, 1],
+                    "routed_experts_dtype": "uint8",
                 }
                 result = {
                     "token_ids": list(example.input_ids[example.n_prompt :]),
@@ -42658,6 +42692,721 @@ def test_remaining_checkpoint_native_training_completes_multiple_steps_without_f
     assert all(torch.equal(body["input_ids"], saved) for body, saved in zip(bodies, before, strict=True))
     assert state.config.training_config.debug == debug
     assert state.gateway._create_job_v0 is state.original
+
+
+# RL Transfer And Router Evidence Controls
+
+
+def _rl_checks_config_spec(tmp_path):
+    path = tmp_path / "rl.config"
+    path.write_text(
+        json.dumps(
+            _config_factory_native_config(
+                {**_rl_config_TRAINING_CONFIG, "train_batch_size": 2}, sampling=_rl_config_SAMPLING_CONFIG
+            )
+        )
+    )
+    cfg = load_config(path)
+    spec = _applicable_tests_spec(["rl-weight-sync", "rl-router-replay"])
+    spec.config_id = cfg.config_id
+    spec.config_path = str(path)
+    return cfg, spec
+
+
+# Architectural Router Coverage Controls
+
+
+def _router_replay_evidence_model(*, num_hidden_layers=1, mlp_only_layers=(), decoder_sparse_step=1):
+    from arctic_platform.model.implementations.moe.layers.moe import TokenChoiceTopKRouter
+    from arctic_platform.model.implementations.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+
+    model = torch.nn.Module()
+    model.config = Qwen3MoeConfig(
+        vocab_size=16,
+        hidden_size=8,
+        intermediate_size=16,
+        moe_intermediate_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_hidden_layers=num_hidden_layers,
+        num_experts=6,
+        num_experts_per_tok=1,
+        mlp_only_layers=list(mlp_only_layers),
+        decoder_sparse_step=decoder_sparse_step,
+    )
+    layers = []
+    for index in range(num_hidden_layers):
+        layer = torch.nn.Module()
+        layer.mlp = torch.nn.Module()
+        if index not in mlp_only_layers and (index + 1) % decoder_sparse_step == 0:
+            layer.mlp.router = TokenChoiceTopKRouter(
+                dim=8,
+                num_experts=6,
+                top_k=1,
+                score_func="softmax",
+                route_norm=True,
+                route_scale=1.0,
+            )
+        layers.append(layer)
+    model.layers = torch.nn.ModuleList(layers)
+    return model
+
+
+def _rl_evidence_samples():
+    routing = [[[1], [2]], [[3], [4]], [[5], [0]], [[2], [3]]]
+    return [
+        {
+            "tokens": [10, 11, 12, 13, 14],
+            "prompt_len": 2,
+            "marker": {
+                "replay_id": "rr1:coverage",
+                "prompt_len": 2,
+                "generation_len": 3,
+                "capture_len": 4,
+                "routed_experts": routing,
+                "routed_experts_shape": [4, 2, 1],
+                "routed_experts_dtype": "uint8",
+            },
+            "routing": routing,
+        }
+    ]
+
+
+def _rl_evidence_window(samples, positions, *, rank=0, expected_layers=(0, 1)):
+    sample = samples[0]
+    capture = sample["routing"]
+    routed = [copy.deepcopy(capture[position]) if position < len(capture) else [[0], [0]] for position in positions]
+    return {
+        "rank": rank,
+        "expected_layers": list(expected_layers),
+        "model_inventory": _rl_evidence_inventory(expected_layers=expected_layers),
+        "received": {
+            sample["marker"]["replay_id"]: copy.deepcopy(
+                capture[min(positions) : min(max(positions) + 1, len(capture))]
+            )
+        },
+        "calls": [
+            {
+                "padding": False,
+                "input_ids": [sample["tokens"][position] for position in positions],
+                "position_ids": list(positions),
+                "routed_experts": routed,
+                "router": [
+                    {
+                        "layer": layer,
+                        "phase": phase,
+                        "replayed": True,
+                        "indices": [row[layer] for row in routed],
+                    }
+                    for phase in ("forward", "recompute")
+                    for layer in expected_layers
+                ],
+            }
+        ],
+        "unattributed_router_calls": [],
+    }
+
+
+def test_rl_checks_router_replay_missing_entire_bound_layer_fails():
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    trace["calls"][0]["router"] = [entry for entry in trace["calls"][0]["router"] if entry["layer"] == 0]
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert [entry.name for entry in failed] == [
+        "rank 0 call 0: layer 1 has no forward router invocation",
+        "rank 0 call 0: layer 1 has no recompute router invocation",
+    ]
+
+
+@pytest.mark.parametrize("inventory", [None, [], [0, 0], [True], [0, -1], ["0"], [0, 2], (0, 1)])
+def test_rl_checks_router_replay_invalid_bound_inventory_fails(inventory):
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    if inventory is None:
+        trace.pop("expected_layers")
+    else:
+        trace["expected_layers"] = inventory
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("invalid bound router inventory" in entry.name for entry in failed)
+
+
+def test_rl_checks_router_replay_bound_inventory_must_agree_across_ranks():
+    samples = _rl_evidence_samples()
+    traces = [
+        _rl_evidence_window(samples, [0, 1]),
+        _rl_evidence_window(samples, [2, 3, 4], rank=1, expected_layers=(0,)),
+    ]
+    failed, _ = rl_router_replay.judge(samples, traces, full_recompute=True)
+    assert any("expected_layers differs across ranks" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize("across_ranks", [False, True])
+def test_rl_checks_router_replay_duplicate_positions_cannot_hide_capture_holes(across_ranks):
+    samples = _rl_evidence_samples()
+    first = _rl_evidence_window(samples, [0, 1])
+    if across_ranks:
+        traces = [first, _rl_evidence_window(samples, [0, 1], rank=1)]
+    else:
+        first["calls"].append(copy.deepcopy(first["calls"][0]))
+        traces = [first]
+    failed, metrics = rl_router_replay.judge(samples, traces, full_recompute=True)
+    assert metrics["compared_positions"] == metrics["captured_positions"] == 4
+    assert any("lack exact [0, capture_len) coverage" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize("padding", ["none", "schedule", "sp-only"])
+def test_rl_checks_router_replay_exact_sp_coverage_preserves_padding_and_last_token(padding):
+    samples = _rl_evidence_samples()
+    traces = [_rl_evidence_window(samples, [0, 1]), _rl_evidence_window(samples, [2, 3, 4], rank=1)]
+    if padding != "none":
+        traces.append(
+            {
+                "rank": 2,
+                "expected_layers": [0, 1],
+                "model_inventory": _rl_evidence_inventory(),
+                "received": {},
+                "calls": [
+                    {
+                        "padding": padding == "schedule",
+                        "input_ids": [0, 0],
+                        "position_ids": [0, 1],
+                        "routed_experts": None,
+                        "router": [],
+                    }
+                ],
+                "unattributed_router_calls": [],
+            }
+        )
+    failed, metrics = rl_router_replay.judge(samples, traces, full_recompute=True)
+    assert failed == []
+    assert metrics["compared_positions"] == 4
+    assert metrics["padding_calls"] == int(padding == "schedule")
+    assert metrics["unattributed_tokens"] == (2 if padding == "sp-only" else 0)
+
+
+def test_rl_checks_router_replay_exact_coverage_rejects_one_missing_position():
+    samples = _rl_evidence_samples()
+    traces = [_rl_evidence_window(samples, [0, 1]), _rl_evidence_window(samples, [3, 4], rank=1)]
+    failed, _ = rl_router_replay.judge(samples, traces, full_recompute=True)
+    assert any("lack exact [0, capture_len) coverage" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize("missing_rank", [0, 1])
+def test_rl_checks_router_replay_each_participating_rank_requires_its_own_rx(missing_rank):
+    samples = _rl_evidence_samples()
+    traces = [_rl_evidence_window(samples, [0, 1]), _rl_evidence_window(samples, [2, 3, 4], rank=1)]
+    traces[missing_rank]["received"] = {}
+    failed, metrics = rl_router_replay.judge(samples, traces, full_recompute=True)
+    assert [entry.name for entry in failed] == [
+        f"rank {missing_rank}: sample 0 has no RX record for its captured window"
+    ]
+    assert metrics["compared_positions"] == metrics["captured_positions"] == 4
+
+
+def test_rl_checks_router_replay_dense_decoder_layer_requires_no_router():
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5), expected_layers=(1,))
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert failed == []
+
+
+@pytest.mark.parametrize("layer", [True, -1, 2, "0"])
+def test_rl_checks_router_replay_invocations_outside_bound_inventory_fail(layer):
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    trace["calls"][0]["router"][0]["layer"] = layer
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("outside the bound inventory" in entry.name for entry in failed)
+
+
+def test_router_replay_evidence_fixture_binds_inventory_before_observations(_router_replay_evidence_case):
+    engine, kwargs, output = _router_replay_evidence_case
+    trace = replay_evidence.active()
+    exported = trace.export(0)
+    assert exported["expected_layers"] == [0]
+    assert exported["model_inventory"]["expected_layers"] == [0]
+    assert exported["model_inventory"]["model_type"] == "qwen3_moe"
+    assert exported["model_inventory"]["num_hidden_layers"] == 1
+    assert exported["model_inventory"]["num_experts_per_tok"] == 1
+    assert exported["model_inventory"]["num_experts"] == 6
+    assert replay_evidence.active().calls == []
+    replay_evidence.maybe_begin_router_replay_call(engine, kwargs, backward="loss_only")
+    replay_evidence.maybe_complete_router_replay_call(engine)
+    record = json.loads((output / "rank-0-call-0.json").read_text())
+    assert record["expected_layers"] == [0]
+    assert record["model_inventory"] == exported["model_inventory"]
+    assert record["calls"][0]["router"] == []
+
+
+@pytest.mark.parametrize(
+    "depth,dense,step,expected",
+    [(1, (), 1, [0]), (4, (1,), 2, [3]), (4, (0, 2), 1, [1, 3])],
+)
+def test_router_replay_evidence_config_roster_is_independent_of_observations(depth, dense, step, expected):
+    replay_evidence.finish(0)
+    model = _router_replay_evidence_model(num_hidden_layers=depth, mlp_only_layers=dense, decoder_sparse_step=step)
+    inventory = replay_evidence.router_replay_model_inventory(model.config.to_dict())
+    assert inventory["expected_layers"] == expected
+    assert inventory["num_experts_per_tok"] == model.config.num_experts_per_tok == 1
+    try:
+        trace = replay_evidence.start(model)
+        assert trace.calls == []
+        assert trace.export(0)["model_inventory"] == inventory
+        assert trace.export(0)["expected_layers"] == expected
+    finally:
+        replay_evidence.finish(0)
+
+
+def test_router_replay_evidence_config_roster_rejects_missing_installed_router():
+    replay_evidence.finish(0)
+    model = _router_replay_evidence_model(num_hidden_layers=2)
+    config = model.config.to_dict()
+    inventory = replay_evidence.router_replay_model_inventory(config)
+    assert inventory["expected_layers"] == [0, 1]
+    del model.layers[1].mlp.router
+    assert replay_evidence.router_replay_model_inventory(model.config.to_dict()) == inventory
+    try:
+        with pytest.raises(ValueError, match="architectural roster"):
+            replay_evidence.start(model)
+        assert replay_evidence.active() is None
+        assert model.layers[0].mlp.router._forward_hooks == {}
+    finally:
+        replay_evidence.finish(0)
+
+
+def test_router_replay_evidence_config_roster_rejects_extra_router_in_dense_layer():
+    replay_evidence.finish(0)
+    model = _router_replay_evidence_model(num_hidden_layers=2, mlp_only_layers=(0,))
+    assert replay_evidence.router_replay_model_inventory(model.config.to_dict())["expected_layers"] == [1]
+    model.layers[0].mlp.router = copy.deepcopy(model.layers[1].mlp.router)
+    try:
+        with pytest.raises(ValueError, match="architectural roster"):
+            replay_evidence.start(model)
+        assert replay_evidence.active() is None
+    finally:
+        replay_evidence.finish(0)
+
+
+def test_router_replay_evidence_config_roster_rejects_unknown_model_family():
+    config = _router_replay_evidence_model().config.to_dict()
+    config["model_type"] = "unverified_moe"
+    with pytest.raises(NotImplementedError, match="unverified router-replay layer predicate"):
+        replay_evidence.router_replay_model_inventory(config)
+
+
+@pytest.mark.parametrize("top_k", [None, True, 0, 7])
+def test_router_replay_evidence_config_roster_rejects_invalid_routing_top_k(top_k):
+    config = _router_replay_evidence_model().config.to_dict()
+    config["num_experts_per_tok"] = top_k
+    with pytest.raises(ValueError, match="routing top-k"):
+        replay_evidence.router_replay_model_inventory(config)
+
+
+def test_router_replay_evidence_collector_preserves_bound_inventory():
+    receipts = [_router_replay_collector_receipt(rank) for rank in range(2)]
+    traces = router_replay_trace._merge_trace_receipts(receipts, request_id="request-1", ranks=2, calls=2)
+    assert [trace["expected_layers"] for trace in traces] == [[0], [0]]
+    assert all(trace["model_inventory"] == _rl_evidence_inventory(depth=1, expected_layers=(0,)) for trace in traces)
+
+
+@pytest.mark.parametrize("inventory", [None, [], [0, 0], [True], [-1], ["0"], (0,)])
+def test_router_replay_evidence_collector_rejects_missing_or_invalid_inventory(inventory):
+    receipt = _router_replay_collector_receipt()
+    record = receipt["records"][0]["record"]
+    if inventory is None:
+        record.pop("expected_layers")
+    else:
+        record["expected_layers"] = inventory
+    with pytest.raises(ValueError, match="expected_layers"):
+        router_replay_trace._merge_trace_receipts([receipt], request_id="request-1", ranks=1, calls=2)
+
+
+@pytest.mark.parametrize("across_ranks", [False, True])
+def test_router_replay_evidence_collector_rejects_inventory_drift(across_ranks):
+    receipts = [_router_replay_collector_receipt()]
+    if across_ranks:
+        receipts.append(_router_replay_collector_receipt(rank=1))
+        receipts[1]["records"][0]["record"]["expected_layers"] = [0, 1]
+    else:
+        receipts[0]["records"][1]["record"]["expected_layers"] = [0, 1]
+    with pytest.raises(ValueError, match="expected_layers differs"):
+        router_replay_trace._merge_trace_receipts(receipts, request_id="request-1", ranks=len(receipts), calls=2)
+
+
+# Opt-In Router Failure Cleanup Controls
+
+
+def test_router_cleanup_disabled_identity_and_no_torch_import(monkeypatch):
+    from arctic_platform.debug import training
+
+    monkeypatch.setattr(training, "_active", None)
+    monkeypatch.setattr(training, "_publication", None)
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "torch" or name.startswith("torch."):
+            raise AssertionError("disabled cleanup imported torch")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    sentinel = object()
+
+    def native(value):
+        return value
+
+    assert training.maybe_cleanup_router_replay_on_failure(native) is native
+    assert training.maybe_cleanup_router_replay_on_failure()(native) is native
+    wrapped = training.maybe_cleanup_router_replay_on_failure(native, runtime=True)
+    assert wrapped(sentinel) is sentinel
+    assert wrapped.__wrapped__ is native
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_router_cleanup_runtime_failure_removes_hooks_and_preserves_exception(monkeypatch, failure_type):
+    from arctic_platform.debug import training
+
+    monkeypatch.setattr(training, "_active", None)
+    monkeypatch.setattr(training, "_publication", None)
+    removed = []
+    failure = failure_type("native failure")
+
+    class Handle:
+        def remove(self):
+            removed.append("removed")
+
+    trace = training.RouterReplayTrace.__new__(training.RouterReplayTrace)
+    trace._hook_handles = [Handle(), Handle()]
+
+    @training.maybe_cleanup_router_replay_on_failure(runtime=True)
+    def initialize_then_fail():
+        training._active = trace
+        training._publication = {"rank": 3, "completed": 0}
+        raise failure
+
+    with pytest.raises(failure_type) as caught:
+        initialize_then_fail()
+    assert caught.value is failure
+    assert removed == ["removed", "removed"]
+    assert trace._hook_handles == []
+    assert training.active() is None
+    assert training._publication is None
+
+
+def test_router_cleanup_failure_cannot_mask_native_failure(monkeypatch):
+    from arctic_platform.debug import training
+
+    failure = ValueError("native failure")
+    attempts = []
+    monkeypatch.setattr(training, "_active", None)
+    monkeypatch.setattr(training, "_publication", {"rank": 7})
+
+    def failing_cleanup(rank):
+        attempts.append(rank)
+        raise OSError("cleanup failure")
+
+    monkeypatch.setattr(training, "maybe_finish_router_replay_trace", failing_cleanup)
+
+    @training.maybe_cleanup_router_replay_on_failure
+    def native():
+        raise failure
+
+    with pytest.raises(ValueError) as caught:
+        native()
+    assert caught.value is failure
+    assert attempts == [7]
+
+
+def test_router_cleanup_success_preserves_active_trace(monkeypatch):
+    from arctic_platform.debug import training
+
+    trace = object()
+    publication = {"rank": 1}
+    sentinel = object()
+    monkeypatch.setattr(training, "_active", trace)
+    monkeypatch.setattr(training, "_publication", publication)
+
+    @training.maybe_cleanup_router_replay_on_failure(runtime=True)
+    def native():
+        return sentinel
+
+    assert native() is sentinel
+    assert training.active() is trace
+    assert training._publication is publication
+
+
+def _rl_evidence_inventory(*, depth=2, expected_layers=(0, 1), experts=6, top_k=1):
+    return replay_evidence.router_replay_model_inventory(
+        {
+            "model_type": "qwen3_moe",
+            "num_hidden_layers": depth,
+            "num_experts": experts,
+            "num_experts_per_tok": top_k,
+            "mlp_only_layers": [layer for layer in range(depth) if layer not in expected_layers],
+            "decoder_sparse_step": 1,
+        }
+    )
+
+
+def test_rl_checks_weight_sync_requires_each_claimed_destination_record():
+    sync = _rl_checks_sync()
+    record = _rl_checks_rank(sync, 0)
+    record["destinations"].clear()
+    failed, metrics = rl_weight_sync.judge(sync)
+    assert any("has no shadow-verification record" in entry.name for entry in failed)
+    assert metrics["sampler_missing_destination_records"] == 2
+
+
+def test_native_broadcast_sender_source_inspection_failure_does_not_leave_context(monkeypatch):
+    monkeypatch.setenv(sampler_evidence_evidence.VERIFY_ENV, "1")
+
+    def fail(*args):
+        raise ValueError("source inspection failed")
+
+    monkeypatch.setattr(broadcast, "source_files", fail)
+    with pytest.raises(ValueError, match="source inspection failed"):
+        with broadcast.maybe_observe_broadcast_send(object(), iter(()), fail):
+            pytest.fail("source inspection should fail before entering the send")
+    assert broadcast._SEND.get() is None
+
+
+@pytest.mark.parametrize("outcome", ["close", "failure", "complete"])
+def test_native_broadcast_nonmaster_export_always_releases_its_inventory(monkeypatch, outcome):
+    from arctic_platform.model import weight_export
+
+    monkeypatch.setenv(broadcast.VERIFY_ENV, "1")
+    model = torch.nn.Linear(2, 1, bias=False)
+    completed = []
+    failure = ValueError("native exporter failed")
+
+    def bind(actual, *, is_master, is_zero3):
+        assert not is_master and not is_zero3
+        broadcast._EXPORT.set({"model": actual})
+
+    def builder(actual):
+        def weights():
+            yield "weight", actual.weight
+            if outcome == "failure":
+                raise failure
+
+        return weights
+
+    monkeypatch.setattr(weight_export, "maybe_bind_broadcast_trainer_inventory", bind)
+    monkeypatch.setattr(
+        weight_export,
+        "maybe_complete_broadcast_trainer_inventory",
+        lambda actual, **kwargs: completed.append(actual),
+    )
+    monkeypatch.setattr(weight_export, "weight_export_contract", lambda actual: SimpleNamespace(vllm=builder))
+    stream = weight_export.iter_model_weights(model, "vllm", is_master=False, is_zero3=False)
+    assert next(stream)[0] == "weight"
+    assert broadcast._EXPORT.get()["model"] is model
+    if outcome == "close":
+        stream.close()
+    elif outcome == "failure":
+        with pytest.raises(ValueError, match="native exporter failed") as caught:
+            next(stream)
+        assert caught.value is failure
+    else:
+        with pytest.raises(StopIteration):
+            next(stream)
+    assert broadcast._EXPORT.get() is None
+    assert completed == ([model] if outcome == "complete" else [])
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("unsafe", [False, True])
+def test_rl_checks_rl_shutdown_preserves_workload_and_resource_ownership(monkeypatch, tmp_path, cancelled, unsafe):
+    cfg, _ = _rl_checks_config_spec(tmp_path)
+    workload = KeyboardInterrupt("cancelled") if cancelled else ValueError("model failed")
+    cleanup = (
+        rl_driver.UnsafeCleanupError("cleanup failed", owned_parent="parent", owned_children={"training": "child"})
+        if unsafe
+        else RuntimeError("cleanup failed")
+    )
+
+    class Client:
+        __exit__ = rl_driver.ArcticClient.__exit__
+
+        def __init__(self, config):
+            pass
+
+        def shutdown(self):
+            raise cleanup
+
+    monkeypatch.setattr(rl_driver, "RLClient", Client)
+    payload = {"training_config": cfg.training, "model_name": cfg.model_name}
+    with pytest.raises(KeyboardInterrupt if cancelled else rl_driver.UnsafeCleanupError) as caught:
+        with rl_driver.running_rl_client(cfg, payload, cfg.model_name, tmp_path):
+            raise workload
+    if cancelled:
+        assert caught.value is workload
+        assert caught.value.__cause__ is cleanup
+    else:
+        assert caught.value.workload_error is workload
+        if unsafe:
+            assert caught.value is cleanup
+            assert caught.value.owned_parent == "parent"
+            assert caught.value.owned_children == {"training": "child"}
+        else:
+            assert caught.value.shutdown_error is cleanup
+
+
+@pytest.mark.parametrize(
+    "field", ["model_type", "num_hidden_layers", "num_experts_per_tok", "num_experts", "resolved_model_config_sha256"]
+)
+@pytest.mark.parametrize("across_ranks", [False, True])
+def test_router_replay_evidence_collector_rejects_full_model_binding_drift(field, across_ranks):
+    receipts = [_router_replay_collector_receipt()]
+    if across_ranks:
+        receipts.append(_router_replay_collector_receipt(rank=1))
+        changed = receipts[1]["records"][0]["record"]["model_inventory"]
+    else:
+        changed = receipts[0]["records"][1]["record"]["model_inventory"]
+    if field == "model_type":
+        changed[field] = "glm4_moe"
+    elif field == "resolved_model_config_sha256":
+        changed[field] = "f" * 64
+    else:
+        changed[field] += 1
+    with pytest.raises(ValueError, match="model_inventory differs"):
+        router_replay_trace._merge_trace_receipts(receipts, request_id="request-1", ranks=len(receipts), calls=2)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda record: record.pop("model_inventory"),
+        lambda record: record.update(model_inventory={}),
+        lambda record: record["model_inventory"].update(num_hidden_layers=True),
+        lambda record: record["model_inventory"].update(num_experts_per_tok=0),
+        lambda record: record["model_inventory"].update(num_experts=0),
+        lambda record: record["model_inventory"].update(expected_layers=[1]),
+        lambda record: record["model_inventory"].update(resolved_model_config_sha256="not-a-digest"),
+    ],
+)
+def test_router_replay_evidence_collector_rejects_invalid_full_model_binding(mutate):
+    receipt = _router_replay_collector_receipt()
+    mutate(receipt["records"][0]["record"])
+    with pytest.raises(ValueError, match="model_inventory"):
+        router_replay_trace._merge_trace_receipts([receipt], request_id="request-1", ranks=1, calls=2)
+
+
+def test_router_replay_evidence_node_collector_requires_full_model_binding(tmp_path, monkeypatch):
+    root = tmp_path / "request-1"
+    root.mkdir()
+    record = _router_replay_collector_receipt(calls=1)["records"][0]["record"]
+    record.pop("model_inventory")
+    (root / "rank-0-call-0.json").write_text(json.dumps(record))
+    from arctic_platform.correctness.harness import storage
+
+    monkeypatch.setattr(storage, "require_data_fast_path", lambda value, **kwargs: tmp_path)
+    with pytest.raises(ValueError, match="model_inventory"):
+        router_replay_trace._node_trace_receipt("/data-fast/fixture", "request-1", "transfer-token")
+
+
+def test_rl_checks_router_replay_cannot_shrink_roster_below_bound_model_inventory():
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    trace["expected_layers"] = [0]
+    trace["calls"][0]["router"] = [entry for entry in trace["calls"][0]["router"] if entry["layer"] == 0]
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("model_inventory expected_layers differs" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize("field,value", [("num_hidden_layers", 3), ("num_experts_per_tok", 2), ("num_experts", 5)])
+def test_rl_checks_router_replay_capture_geometry_must_match_bound_model(field, value):
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    trace["model_inventory"][field] = value
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("invalid captured geometry" in entry.name for entry in failed)
+
+
+def test_rl_checks_router_replay_full_model_binding_must_agree_across_ranks():
+    samples = _rl_evidence_samples()
+    traces = [_rl_evidence_window(samples, [0, 1]), _rl_evidence_window(samples, [2, 3, 4], rank=1)]
+    traces[1]["model_inventory"]["resolved_model_config_sha256"] = "f" * 64
+    failed, _ = rl_router_replay.judge(samples, traces, full_recompute=True)
+    assert any("model_inventory differs across ranks" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda sample: sample["marker"].update(capture_len=3),
+        lambda sample: sample["marker"].update(capture_len=True),
+        lambda sample: sample["marker"].update(generation_len=4),
+        lambda sample: sample["marker"].update(prompt_len=1),
+        lambda sample: sample["marker"].pop("routed_experts_shape"),
+        lambda sample: sample["marker"].update(routed_experts_shape=[4, 2, 2]),
+        lambda sample: sample["marker"].update(routed_experts_dtype="float32"),
+        lambda sample: sample["routing"][0][0].clear(),
+    ],
+)
+def test_rl_checks_router_replay_sampler_marker_and_tensor_geometry_are_required(mutate):
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    mutate(samples[0])
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("invalid captured geometry" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize("index", [True, 1.0, -1, 6])
+def test_rl_checks_router_replay_equal_invalid_expert_indices_do_not_pass(index):
+    samples = _rl_evidence_samples()
+    samples[0]["routing"][0][0][0] = index
+    trace = _rl_evidence_window(samples, range(5))
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("invalid captured geometry" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize("part", ["received", "router"])
+@pytest.mark.parametrize("index", [True, 1.0])
+def test_rl_checks_router_replay_python_equal_noninteger_observations_do_not_pass(part, index):
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    if part == "received":
+        trace["received"]["rr1:coverage"][0][0][0] = index
+    else:
+        trace["calls"][0]["router"][0]["indices"][0][0] = index
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("geometry" in entry.name for entry in failed)
+
+
+@pytest.mark.parametrize("part", ["input_ids", "position_ids", "routed_experts"])
+def test_rl_checks_router_replay_model_call_vectors_require_matching_lengths(part):
+    samples = _rl_evidence_samples()
+    trace = _rl_evidence_window(samples, range(5))
+    trace["calls"][0][part].append(copy.deepcopy(trace["calls"][0][part][-1]))
+    failed, _ = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    assert any("invalid captured geometry" in entry.name for entry in failed)
+
+
+def test_rl_checks_router_replay_sampler_replay_ids_cannot_alias():
+    samples = _rl_checks_samples()
+    samples[1]["marker"]["replay_id"] = samples[0]["marker"]["replay_id"]
+    failed, _ = rl_router_replay.judge(samples, [_rl_checks_trace(samples)], full_recompute=True)
+    assert any("replay identities are duplicated" in entry.name for entry in failed)
+
+
+def test_rl_checks_router_replay_empty_evidence_cannot_pass():
+    failed, _ = rl_router_replay.judge([], [], full_recompute=True)
+    assert [entry.name for entry in failed] == ["no generated samples to compare"]
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "uint16"])
+def test_rl_checks_router_replay_native_uint16_preserves_large_expert_indices(dtype):
+    samples = _rl_evidence_samples()
+    samples[0]["marker"]["routed_experts_dtype"] = dtype
+    samples[0]["routing"][0][0][0] = 300
+    trace = _rl_evidence_window(samples, range(5))
+    trace["model_inventory"] = _rl_evidence_inventory(experts=512)
+    failed, metrics = rl_router_replay.judge(samples, [trace], full_recompute=True)
+    if dtype == "uint8":
+        assert any("does not fit its declared native dtype" in entry.name for entry in failed)
+    else:
+        assert failed == []
+        assert metrics["compared_positions"] == 4
 
 
 @pytest.mark.parametrize(

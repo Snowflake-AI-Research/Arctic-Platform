@@ -324,11 +324,7 @@ def cortex_unavailable_reason(test, published_fixture: dict | None = None) -> st
     }
     if test.test_id in unavailable:
         return unavailable[test.test_id]
-    if test.test_id in {
-        "single-step-grads",
-        "single-step-optimizer",
-        "e2e-sft-train-validate",
-    }:
+    if test.test_id in {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}:
         if published_fixture is not None:
             return None
         return (
@@ -1290,7 +1286,11 @@ def execute_rl(
             if local_weight_sync or local_router_replay:
                 require_local_cortex_gateway(context.client_backend)
             rejection = _cortex_rejection(
-                test, cfg, local_weight_sync=local_weight_sync, local_router_replay=local_router_replay
+                test,
+                cfg,
+                context.published_fixture,
+                local_weight_sync=local_weight_sync,
+                local_router_replay=local_router_replay,
             )
             if rejection is not None:
                 results.append(rejection)
