@@ -23,6 +23,7 @@ from arctic_platform.inference.server.router_replay.cache import (
     RouterReplayDuplicateError,
     RouterReplayMissingError,
 )
+from arctic_platform.inference.server.router_replay_request import RouterReplayPrefixMissingError
 
 __all__ = [
     "RouterReplayCacheRX",
@@ -30,5 +31,6 @@ __all__ = [
     "RouterReplayDuplicateError",
     "RouterReplayGroup",
     "RouterReplayMissingError",
+    "RouterReplayPrefixMissingError",
     "init_router_replay_group",
 ]

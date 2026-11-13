@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import replace
 from enum import Enum
 from typing import Any
@@ -22,6 +23,12 @@ import ray
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
 from arctic_platform.inference.server.chat import ChatModel, resolve_chat_model
 from arctic_platform.inference.server.metrics import RingStatLogger, get_collector
+from arctic_platform.inference.server.router_replay_request import (
+    PREFIX_REPLICA_KEY,
+    STRICT_REPLAY_KEY,
+    RouterReplayPrefixMissingError,
+    strict_replay_options,
+)
 from arctic_platform.inference.server.streaming import StreamingWorkerMixin, stream_lifecycle_change
 from arctic_platform.inference.server.token_prompts import check_token_tensor, is_token_tensor
 from arctic_platform.inference.vllm.dense_prompt_logprobs import (
@@ -46,6 +53,8 @@ logger = logging.getLogger("arctic_platform.inference.server")
 _UNEXPECTED_KWARG_RE = re.compile(r"unexpected keyword argument '([^']+)'")
 _SAMPLE_ID_PARAM_KEY = "dss_sample_id"
 _REPLAY_ID_PARAM_KEY = "dss_router_replay_id"
+# The same trajectory's previous capture, read from extra_args, which a server without this key leaves unused.
+_REPLAY_PREFIX_ID_PARAM_KEY = "dss_router_replay_prefix_id"
 _ROUTER_REPLAY_MARKER_KEY = "router_replay"
 _ROUTER_REPLAY_RETURN_INFO_PARAM_KEY = "dss_return_back_router_info"
 _ROUTER_REPLAY_STOP_TOKEN_SEQUENCES_PARAM_KEY = "dss_stop_token_sequences"
@@ -644,11 +653,16 @@ def _result_from_output(
     cache_tx: Any = None,
     sample_id: str | None = None,
     replay_id: str | None = None,
+    prefix_replay_id: str | None = None,
+    strict_replay: bool = False,
+    prefix_capture: Any = None,
     request_id: str | None = None,
     replica_label: str | None = None,
     return_back_router_info: bool = False,
 ) -> dict[str, Any]:
     if not final_output or not final_output.outputs:
+        if strict_replay:
+            raise RuntimeError("strict router replay generation returned no output")
         return {
             "text": "",
             "token_ids": [],
@@ -704,6 +718,9 @@ def _result_from_output(
         cache_tx=cache_tx,
         sample_id=sample_id,
         replay_id=replay_id,
+        prefix_replay_id=prefix_replay_id,
+        strict_replay=strict_replay,
+        prefix_capture=prefix_capture,
         request_id=request_id,
         replica_label=replica_label,
         return_back_router_info=return_back_router_info,
@@ -718,16 +735,23 @@ def _maybe_cache_routed_experts(
     cache_tx: Any,
     sample_id: str | None,
     replay_id: str | None,
+    prefix_replay_id: str | None,
+    strict_replay: bool,
+    prefix_capture: Any,
     request_id: str | None,
     replica_label: str | None,
     return_back_router_info: bool,
 ) -> None:
     if cache_tx is None or sample_id is None:
+        if strict_replay:
+            raise RuntimeError("strict router replay requires an enabled capture cache")
         return
     routed = getattr(final_output, "routed_experts", None)
     if routed is None and getattr(final_output, "outputs", None):
         routed = getattr(final_output.outputs[0], "routed_experts", None)
     if routed is None:
+        if strict_replay:
+            raise RuntimeError("strict router replay generation returned no routed_experts")
         logger.warning("router-replay: routed_experts missing for sample_id=%s", sample_id)
         return
     capture_len = int(routed.shape[0])
@@ -742,9 +766,35 @@ def _maybe_cache_routed_experts(
             f"capture_len={capture_len} expected_capture_len={expected_capture_len} "
             f"capture_shape={list(routed.shape)}"
         )
+    # This request re-prefills the prefix capture's positions; keep the routes the earlier request sampled with.
+    prefix_len = 0
+    if prefix_replay_id is not None:
+        if strict_replay:
+            prefix = prefix_capture
+            if prefix is None:
+                raise RouterReplayPrefixMissingError("strict router-replay prefix was not acquired")
+        else:
+            try:
+                prefix = cache_tx.get(prefix_replay_id)
+            except KeyError:  # another replica served the earlier request, or the cache evicted it
+                prefix = None
+        if prefix is not None:
+            if prefix.shape[0] >= prompt_len or tuple(prefix.shape[1:]) != tuple(routed.shape[1:]):
+                raise ValueError(
+                    "router-replay prefix capture must end inside the prompt, with the same layer/top-k shape "
+                    f"trajectory_id={sample_id!r} replay_id={replay_id!r} prefix_replay_id={prefix_replay_id!r} "
+                    f"prefix_shape={list(prefix.shape)} prompt_len={prompt_len} capture_shape={list(routed.shape)}"
+                )
+            import torch
+
+            prefix_len = int(prefix.shape[0])
+            routed = torch.cat([prefix, torch.as_tensor(routed[prefix_len:]).to(prefix.device, prefix.dtype)])
     cache_key = replay_id or sample_id
     if replay_id is not None and replay_id.startswith("rr1:"):
-        cache_tx.put_new(cache_key, routed)
+        if strict_replay:
+            cache_tx.put_new(cache_key, routed, retain=True)
+        else:
+            cache_tx.put_new(cache_key, routed)
     else:
         cache_tx.put(cache_key, routed)
     marker = {
@@ -756,7 +806,10 @@ def _maybe_cache_routed_experts(
         "prompt_len": prompt_len,
         "generation_len": generation_len,
         "capture_len": capture_len,
+        "prefix_len": prefix_len,
     }
+    if strict_replay:
+        marker["strict"] = True
     if return_back_router_info:
         tensor = routed.detach().cpu() if hasattr(routed, "detach") else routed
         marker.update(
@@ -1280,7 +1333,7 @@ class InferenceWorker(StreamingWorkerMixin):
             device=tx_device,
             max_bytes=max_bytes,
         )
-        self._replica_label = f"pid={os.getpid()}"
+        self._replica_label = str(uuid4())
         logger.info(
             "router-replay TX cache initialized max_bytes=%d device=%s",
             max_bytes,
@@ -1374,6 +1427,7 @@ class InferenceWorker(StreamingWorkerMixin):
         from vllm import SamplingParams
 
         sampling_params = dict(sampling_params)
+        strict_replay, _, prefix_replica = strict_replay_options(sampling_params)
         enable_thinking = _optional_bool(
             sampling_params.pop(_ENABLE_THINKING_PARAM_KEY, None),
             name=_ENABLE_THINKING_PARAM_KEY,
@@ -1382,6 +1436,9 @@ class InferenceWorker(StreamingWorkerMixin):
         return_action_masks = bool(sampling_params.pop(_RETURN_ACTION_MASKS_PARAM_KEY, False))
         extra_args = dict(sampling_params.get("extra_args", None) or {})
         extra_args.pop(_RETURN_ACTION_MASKS_PARAM_KEY, None)
+        prefix_replay_id = extra_args.pop(_REPLAY_PREFIX_ID_PARAM_KEY, None)
+        extra_args.pop(STRICT_REPLAY_KEY, None)
+        extra_args.pop(PREFIX_REPLICA_KEY, None)
         if extra_args:
             sampling_params["extra_args"] = extra_args
         else:
@@ -1394,6 +1451,13 @@ class InferenceWorker(StreamingWorkerMixin):
             replay_id = str(replay_id)
         if replay_id is not None and sample_id is None:
             raise ValueError(f"{_REPLAY_ID_PARAM_KEY} requires {_SAMPLE_ID_PARAM_KEY}")
+        if prefix_replay_id is not None and replay_id is None:
+            raise ValueError(f"{_REPLAY_PREFIX_ID_PARAM_KEY} requires {_REPLAY_ID_PARAM_KEY}")
+        if strict_replay:
+            if self._router_replay_tx is None:
+                raise RuntimeError("strict router replay requires an enabled capture cache")
+            if prefix_replay_id is not None and prefix_replica != self._replica_label:
+                raise RouterReplayPrefixMissingError("strict router-replay prefix belongs to another replica")
         return_back_router_info = bool(
             sampling_params.pop(_ROUTER_REPLAY_RETURN_INFO_PARAM_KEY, False)
         )
@@ -1426,23 +1490,31 @@ class InferenceWorker(StreamingWorkerMixin):
         else:
             prompt_input = effective_prompt
 
-        final_output = await self._generate_once(
-            prompt_input,
-            params,
-            request_id,
-            reasoning_ended=reasoning_ended,
-            lora_request=self._active_lora_request(),
+        prefix_context = (
+            self._router_replay_tx.borrow_prefix(prefix_replay_id)
+            if strict_replay and prefix_replay_id is not None else nullcontext(None)
         )
-        result = _result_from_output(
-            final_output,
-            return_sampled_logprobs_only=return_sampled_logprobs_only,
-            cache_tx=self._router_replay_tx,
-            sample_id=sample_id,
-            replay_id=replay_id,
-            request_id=request_id,
-            replica_label=self._replica_label,
-            return_back_router_info=return_back_router_info,
-        )
+        with prefix_context as prefix_capture:
+            final_output = await self._generate_once(
+                prompt_input,
+                params,
+                request_id,
+                reasoning_ended=reasoning_ended,
+                lora_request=self._active_lora_request(),
+            )
+            result = _result_from_output(
+                final_output,
+                return_sampled_logprobs_only=return_sampled_logprobs_only,
+                cache_tx=self._router_replay_tx,
+                sample_id=sample_id,
+                replay_id=replay_id,
+                prefix_replay_id=prefix_replay_id,
+                strict_replay=strict_replay,
+                prefix_capture=prefix_capture,
+                request_id=request_id,
+                replica_label=self._replica_label,
+                return_back_router_info=return_back_router_info,
+            )
         if self._return_reasoning_content:
             self._apply_reasoning_parser(result, reasoning_ended=reasoning_ended)
         if return_action_masks:

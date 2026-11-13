@@ -17,10 +17,13 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import numpy as np
 import torch
+
+from arctic_platform.inference.server.router_replay_request import RouterReplayCacheFull, RouterReplayPrefixMissingError
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +55,6 @@ class RouterReplayMissingError(RuntimeError):
             f"sample_id(s): {self.missing_sample_ids[:8]}"
             + ("..." if len(self.missing_sample_ids) > 8 else "")
         )
-
-
-class RouterReplayCacheFull(RuntimeError):
-    """Raised by ``put`` when adding the entry would exceed ``max_bytes``."""
 
 
 class RouterReplayDuplicateError(RuntimeError):
@@ -113,6 +112,7 @@ class _RouterReplayCacheBase:
         self._sizes: dict[str, int] = {}
         self._created_at: dict[str, float] = {}
         self._last_touched: dict[str, float] = {}
+        self._retained: set[str] = set()
         self._bytes_in_use: int = 0
         self._peak_bytes_in_use: int = 0
         # Lifetime counters for observability.
@@ -151,6 +151,7 @@ class _RouterReplayCacheBase:
         value: torch.Tensor | np.ndarray,
         *,
         replace: bool,
+        retain: bool = False,
     ) -> None:
         tensor = self._coerce(value)
         new_bytes = tensor.element_size() * tensor.numel()
@@ -158,6 +159,8 @@ class _RouterReplayCacheBase:
         now = time.monotonic()
         with self._lock:
             if not replace and self._suppress_put_new_locked(sample_id, now):
+                if retain:
+                    raise RouterReplayPrefixMissingError("strict router-replay capture was discarded")
                 return
             if not replace and sample_id in self._data:
                 self._n_duplicate_rejected += 1
@@ -183,6 +186,8 @@ class _RouterReplayCacheBase:
             else:
                 self._created_at[sample_id] = now
             self._data[sample_id] = tensor
+            if retain:
+                self._retained.add(sample_id)
             self._sizes[sample_id] = new_bytes
             self._last_touched[sample_id] = now
             self._bytes_in_use = projected
@@ -240,6 +245,7 @@ class _RouterReplayCacheBase:
             self._sizes.clear()
             self._created_at.clear()
             self._last_touched.clear()
+            self._retained.clear()
             self._bytes_in_use = 0
         return removed
 
@@ -377,6 +383,7 @@ class _RouterReplayCacheBase:
         removed_bytes = self._sizes.pop(sample_id, 0)
         self._created_at.pop(sample_id, None)
         self._last_touched.pop(sample_id, None)
+        self._retained.discard(sample_id)
         self._bytes_in_use -= removed_bytes
         return removed_bytes
 
@@ -386,12 +393,13 @@ class RouterReplayCacheTX(_RouterReplayCacheBase):
 
     Each turn of a multi-turn rollout emits a full capture covering the
     conversation up to that turn, so the latest put is authoritative.
-    Group-affinity routing keeps the same worker per sample_id; failover
-    is benign because the new replica re-prefills its own complete capture.
+    Strict captures are retained against pressure eviction until explicit
+    discard or TTL expiry. In-use prefixes are held through generation.
     """
 
     def __init__(self, device: torch.device, max_bytes: int) -> None:
         super().__init__(device=device, max_bytes=max_bytes)
+        self._borrowers: dict[str, int] = {}
         self._tombstones: OrderedDict[str, float] = OrderedDict()
         self._tombstone_order_locks = [
             threading.Lock() for _ in range(_TOMBSTONE_ORDER_LOCK_STRIPES)
@@ -406,7 +414,9 @@ class RouterReplayCacheTX(_RouterReplayCacheBase):
             max(0.1, float(os.environ.get("ARCTIC_ROUTER_REPLAY_TX_LOW_WATERMARK_RATIO", "0.85"))),
         )
 
-    def put_new(self, sample_id: str, value: torch.Tensor | np.ndarray) -> None:
+    def put_new(self, sample_id: str, value: torch.Tensor | np.ndarray, *, retain: bool = False) -> None:
+        if retain and not is_exact_replay_id(sample_id):
+            raise ValueError("retained router-replay captures require an exact replay id")
         if not is_exact_replay_id(sample_id):
             super().put_new(sample_id, value)
             return
@@ -414,8 +424,32 @@ class RouterReplayCacheTX(_RouterReplayCacheBase):
             now = time.monotonic()
             with self._lock:
                 if self._suppress_put_new_locked(sample_id, now):
+                    if retain:
+                        raise RouterReplayPrefixMissingError("strict router-replay capture was discarded")
                     return
-            super().put_new(sample_id, value)
+            self._put(sample_id, value, replace=False, retain=retain)
+
+    @contextmanager
+    def borrow_prefix(self, sample_id: str):
+        """Hold a prefix through generation and cache insertion, including TTL eviction."""
+        with self._lock:
+            now = time.monotonic()
+            if sample_id not in self._data or (
+                self.ttl_s > 0 and now - self._created_at[sample_id] >= self.ttl_s
+            ):
+                raise RouterReplayPrefixMissingError(f"strict router-replay prefix unavailable: {sample_id!r}")
+            tensor = self._data[sample_id]
+            self._borrowers[sample_id] = self._borrowers.get(sample_id, 0) + 1
+            self._last_touched[sample_id] = now
+        try:
+            yield tensor
+        finally:
+            with self._lock:
+                count = self._borrowers[sample_id] - 1
+                if count:
+                    self._borrowers[sample_id] = count
+                else:
+                    self._borrowers.pop(sample_id)
 
     def snapshot(self) -> dict[str, torch.Tensor]:
         """Return strong tensor refs for a race-safe router-replay send.
@@ -477,6 +511,7 @@ class RouterReplayCacheTX(_RouterReplayCacheBase):
             self._sizes.clear()
             self._created_at.clear()
             self._last_touched.clear()
+            self._retained.clear()
             self._tombstones.clear()
             self._bytes_in_use = 0
         return removed
@@ -511,7 +546,7 @@ class RouterReplayCacheTX(_RouterReplayCacheBase):
             )
             expired = [
                 sid for sid, created_at in self._created_at.items()
-                if sid != sample_id and now - created_at >= self.ttl_s
+                if sid != sample_id and sid not in self._borrowers and now - created_at >= self.ttl_s
             ]
             for sid in expired:
                 if sid in self._data:
@@ -569,7 +604,7 @@ class RouterReplayCacheTX(_RouterReplayCacheBase):
             (
                 (self._last_touched.get(sid, self._created_at.get(sid, now)), sid)
                 for sid in self._data
-                if sid != sample_id
+                if sid != sample_id and sid not in self._retained and sid not in self._borrowers
             ),
             key=lambda item: item[0],
         )

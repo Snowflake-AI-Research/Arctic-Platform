@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, model_validator
 
 from arctic_platform.inference.server.config import ModelConfig
+from arctic_platform.inference.server.router_replay_request import RouterReplayCacheFull, RouterReplayPrefixMissingError
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +103,10 @@ async def generate_endpoint(request: GenerateRequest):
     try:
         results = await backend.generate(**request.model_dump())
         return {"results": results}
+    except RouterReplayPrefixMissingError as e:
+        raise HTTPException(status_code=410, detail=str(e))
+    except RouterReplayCacheFull as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except RuntimeError as e:
         msg = str(e).lower()
         if "paused" in msg or "cancelled" in msg:
