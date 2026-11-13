@@ -9,6 +9,7 @@ repository root::
 
 import base64
 import json
+import re
 import signal
 import threading
 import time
@@ -911,6 +912,135 @@ def test_the_suite_reports_a_start_up_total_a_stalled_log_never_showed(monkeypat
         "(last at 2026-11-10 20:41:16) do not have it")}}
     assert "Start-up totals unknown: plain, default `engine_init_s` (log stream stalled" in report.markdown(result)
     assert "job-off_default" in cluster.cancelled
+
+
+def test_plan_variants_accepts_any_set_with_on_hit():
+    assert jobs.plan_variants(_spec(tp=2), ["on_hit"]) == (["on_hit"], {})
+    assert jobs.plan_variants(_spec(tp=2), ["off_matched", "on_hit"]) == (["on_hit", "off_matched"], {})
+    variants, skipped = jobs.plan_variants(_spec(tp=1, n_gpus=1), ["on_hit", "off_matched"])
+    assert variants == ["on_hit"] and "add off_default" in skipped["off_matched"]
+    assert "add off_default" not in jobs.plan_variants(_spec(tp=1, n_gpus=1))[1]["off_matched"]
+    with pytest.raises(ValueError, match="must include on_hit"):
+        jobs.plan_variants(_spec(tp=2), ["off_default", "off_matched"])
+    assert [jobs.plain_baseline(v) for v in (["on_hit"], ["on_hit", "off_matched"], list(jobs.VARIANTS))] == [
+        None, "off_matched", "off_default"]
+
+
+_MATCHED_INIT = _INIT_LINE.replace("137.22", "99.50")
+
+
+class _NoDefaultCluster(_Cluster):
+    """A cluster on which the off_default job must never be submitted, polled,
+    read, asked or cancelled; off_matched's engine init is 99.5 s."""
+
+    logs = {**_JOB_LOGS, "off_matched": [jobs.MATCH_APPLIED_MARKER, _MATCHED_INIT]}
+
+    def _touch(self, job_id):
+        assert job_id != "job-off_default", "the off_default job was touched"
+        return job_id
+
+    def create_job_from_body(self, body):
+        return {"job_id": self._touch(super().create_job_from_body(body)["job_id"])}
+
+    def get_job(self, job_id):
+        return super().get_job(self._touch(job_id))
+
+    def tail_logs(self, job_id, cursor=None, max_lines=1000, sub_job_type=None):
+        return {"entries": [{"_raw": line} for line in self.logs[self._touch(job_id)[len("job-"):]]], "eof": True}
+
+    def generate(self, job_id, prompts, sampling_params, routing_key=None):
+        return super().generate(self._touch(job_id), prompts, sampling_params, routing_key)
+
+    def cancel_job(self, job_id):
+        super().cancel_job(self._touch(job_id))
+
+
+def test_on_hit_alone_passes_on_its_own_answers_with_the_plain_columns_empty(monkeypatch, tmp_path):
+    from arctic_platform.inference.semi_persistence.onboarding import book
+    from arctic_platform.inference.semi_persistence.onboarding import rereport
+
+    cluster = _NoDefaultCluster()
+    result = _runner(monkeypatch, tmp_path, cluster, variants="on_hit").run_one(_spec(tp=2, n_gpus=8))
+    assert report.verdict(result) == ("PASS", []) and "error" not in result and "not_measured" not in result
+    assert cluster.cancelled == ["job-on_hit"] and result["jobs"] == {"on_hit": "job-on_hit"}
+    assert result["plain_baseline"] is None and "off_job_id" not in result
+    assert "perf" not in result and result["perf_note"].startswith("not measured: no plain job in this run")
+
+    checks = {c["name"]: c for c in result["correctness"]}
+    assert all(not c["variants"] for c in checks.values())
+    info = {n for n, c in checks.items() if c["passed"] is None}
+    assert info == {"greedy, one prompt at a time", "greedy, batched"}
+    assert all(not checks[n]["required"] for n in info)
+    gated = {n for n, c in checks.items() if c["required"]}
+    assert gated == {"ignore_eos runs to max_tokens", "same answer from every replica (16 routing keys)",
+                     "sampled logprobs", "top-k logprobs shape", "prompt logprobs", "guided JSON", "stop strings",
+                     "seeded sampling", "token ids are real"}
+    assert all(checks[n]["passed"] for n in gated)
+
+    st = result["startup"]
+    assert st["semi_p"]["restored"] and st["semi_p"]["key_to_ready_s"] == 20.0
+    assert st["on_timeline"]["submit_to_running_s"] >= 0 and "off_timeline" not in st
+    assert st["vllm_off"] == {} and st["off_sources"] == []
+    md = report.markdown(result)
+    assert "Plain columns are empty: no plain job in this run." in md
+    assert re.search(r"\| submit to running \| \d+ s \| - s \|", md)
+    assert "| semi_p key to ready (slowest replica) / vLLM engine init | 20 s | - s |" in md
+    assert "| Variants | on_hit; plain baseline: none, no plain job in this run |" in md
+    assert "Perf not measured: no plain job in this run" in md and "Only the reference" in md
+
+    text = book.build(tmp_path)
+    assert "| on_hit | " in text and "| m (no plain job) | " in text and "(two-job run" not in text
+    assert "| m (semi_p only) | " in text
+    saved = next(tmp_path.glob("m-*.json"))
+    rereport.rebuild(saved, [], [], None)
+    assert json.loads(saved.read_text())["verdict"] == "PASS"
+
+
+def test_on_hit_alone_reports_what_needs_another_job_and_fails_its_own_checks():
+    from arctic_platform.inference.semi_persistence.onboarding import correctness
+
+    class Prose(_FakeClient):
+        """Guided JSON comes back as prose, and the stop request runs past a stop string."""
+
+        def generate(self, job_id, prompts, sampling_params, routing_key=None):
+            rid = super().generate(job_id, prompts, sampling_params, routing_key)
+            for r in self.pending[rid]:
+                if sampling_params.get("guided_json"):
+                    r["text"] = "Paris"
+                if sampling_params.get("stop"):
+                    r["text"] += ". More"
+            return rid
+
+    checks = {c["name"]: c for c in correctness.run(Prose(), {"on_hit": "H"}, "on_hit", set(), {"on_hit": 2}, 128)}
+    guided = checks["guided JSON"]
+    assert guided["passed"] is None and not guided["required"]
+    assert "no plain job ran to compare with" in guided["detail"]
+    assert checks["stop strings"]["passed"] is False and "'.'" in checks["stop strings"]["detail"]
+    assert report.verdict({"model": {"name": "m"}, "correctness": list(checks.values())})[0] == "FAIL"
+    table = "\n".join(report.correctness_table(list(checks.values())))
+    assert "reference does not parse: 'Paris'; reference does not parse and no plain job" in table
+
+
+def test_on_hit_with_off_matched_uses_it_as_the_plain_baseline(monkeypatch, tmp_path):
+    from arctic_platform.inference.semi_persistence.onboarding import book
+
+    cluster = _NoDefaultCluster()
+    result = _runner(monkeypatch, tmp_path, cluster, variants="on_hit,off_matched").run_one(_spec(tp=2, n_gpus=8))
+    assert report.verdict(result) == ("PASS", []) and sorted(cluster.cancelled) == ["job-off_matched", "job-on_hit"]
+    assert result["plain_baseline"] == "off_matched" and result["off_job_id"] == "job-off_matched"
+    st = result["startup"]
+    assert st["off_timeline"] == st["timelines"]["off_matched"]
+    assert st["vllm_off"] == {"engine_init_s": 99.5} == st["vllm_matched"]
+    assert result["perf"]["baseline"] == "off_matched" and not result["perf"]["breakdown"]
+    assert "matched" not in result["perf"]["rows"][0] and all(c["passed"] for c in report.gated_perf_checks(result))
+    greedy = result["correctness"][0]["variants"]
+    assert list(greedy) == ["off_matched"] and greedy["off_matched"]["gated"] and greedy["off_matched"]["passed"]
+    md = report.markdown(result)
+    assert "| | semi_p | plain, matched |" in md
+    assert "| semi_p key to ready (slowest replica) / vLLM engine init | 20 s | 100 s |" in md
+    assert "Plain is off_matched (plain, matched): no off_default in this run, so the gates" in md
+    text = book.build(tmp_path)
+    assert "| m (plain matched) | " in text and "| m (vs off_matched) | " in text
 
 
 def _fake_kubectl(ready_after):

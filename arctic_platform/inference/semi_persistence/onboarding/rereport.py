@@ -90,7 +90,7 @@ def rebuild(path: Path, on_paths: list[str], off_paths: list[str], out_dir: str 
         st["semi_p"] = startup.restore_report(on_api, on_pods)
         st["generate_counts"] = startup.generate_counts(on_pods)
         st["on_sources"] = sorted(on_api) + sorted(on_pods)
-    if off_api or off_pods:
+    if report.plain_baseline(result) and (off_api or off_pods):
         st["vllm_off"] = startup.parse_vllm([x for logs in (off_api, off_pods) for v in logs.values() for x in v])
         st["off_sources"] = sorted(off_api) + sorted(off_pods)
     unknown = {v: u for v, u in (st.pop("unknown", None) or {}).items()

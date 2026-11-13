@@ -62,6 +62,23 @@ def _status(passed) -> str:
     return {True: "PASS", False: "FAIL", None: "info"}[passed]
 
 
+NO_PLAIN = "no plain job in this run"
+
+
+def plain_baseline(result: dict) -> str | None:
+    """The plain job semi_p was compared with for perf and start-up (reports from
+    before the variant sets always had off_default)."""
+    return result.get("plain_baseline", "off_default")
+
+
+def variants_line(result: dict) -> str:
+    """Which jobs ran, and the plain baseline among them."""
+    ran = result.get("variants") or list(result.get("jobs") or {}) or ["on_hit", "off_default"]
+    plain = plain_baseline(result)
+    baseline = f"{plain} ({VARIANT_LABELS.get(plain, plain)})" if plain else f"none, {NO_PLAIN}"
+    return f"{', '.join(ran)}; plain baseline: {baseline}"
+
+
 def gated_perf_checks(result: dict) -> list[dict]:
     return [c for c in (result.get("perf") or {}).get("checks") or [] if c.get("gated", True)]
 
@@ -121,10 +138,13 @@ def correctness_table(checks: list[dict]) -> list[str]:
     reference, and whether that job is gated); the check's overall result."""
     variants = list(dict.fromkeys(v for c in checks for v in c.get("variants") or {}))
     head = ["check", "result"] + [f"{VARIANT_LABELS.get(v, v)} vs reference" for v in variants] + ["reference"]
-    out = ["## Correctness", "",
-           "Every job got the same requests; each column says whether it matched the reference (semi_p from the "
-           "published image) token for token. Gated columns must match; *info* columns are expected to differ "
-           "and show where.", "",
+    intro = ("Every job got the same requests; each column says whether it matched the reference (semi_p from the "
+             "published image) token for token. Gated columns must match; *info* columns are expected to differ "
+             "and show where.")
+    if not variants:
+        intro = ("Only the reference (semi_p from the published image) answered, so each check is decided on its "
+                 "own answers; a check that needs another job to compare with is *info*.")
+    out = ["## Correctness", "", intro, "",
            "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for c in checks:
         cells = [c["name"], _status(c["passed"])]
@@ -135,7 +155,10 @@ def correctness_table(checks: list[dict]) -> list[str]:
                 continue
             mark = "match" if r["passed"] else "**differs**"
             cells.append(f"{mark}{'' if r['gated'] else ' *(info)*'}: {r['detail']}")
-        cells.append(c.get("reference_detail") or ("" if c.get("variants") else c.get("detail", "")))
+        if c.get("variants"):
+            cells.append(c.get("reference_detail") or "")
+        else:
+            cells.append("; ".join(dict.fromkeys(filter(None, [c.get("reference_detail"), c.get("detail")]))))
         out.append("| " + " | ".join(str(x).replace("|", "/") for x in cells) + " |")
     return out
 
@@ -159,6 +182,7 @@ def markdown(result: dict) -> str:
         f"| Tested as | {spec.get('copies', 1)} copies: {spec.get('test_n_gpus', spec['n_gpus'])} GPUs, "
         f"{spec.get('test_replicas', spec['replicas'])} replica(s) per job |",
         f"| Image tag | `{result.get('image_tag') or 'default'}` |",
+        f"| Variants | {variants_line(result)} |",
         *([f"| Published image | {result['published_image']} |"] if result.get("published_image") else []),
         f"| Run | {result.get('started_at')} to {result.get('finished_at')} UTC |",
         "",
@@ -177,9 +201,15 @@ def markdown(result: dict) -> str:
     lines.append("")
 
     st = result.get("startup") or {}
+    plain = plain_baseline(result)
+    plain_head = "plain" if plain in (None, "off_default") else VARIANT_LABELS.get(plain, plain)
     if st:
-        lines += ["## Start-up", "",
-                  "| | semi_p | plain |", "|---|---|---|"]
+        lines += ["## Start-up", ""]
+        if plain is None:
+            lines += [f"Plain columns are empty: {NO_PLAIN}.", ""]
+        elif plain != "off_default":
+            lines += [f"Plain is {plain} ({plain_head}): no off_default in this run.", ""]
+        lines += [f"| | semi_p | {plain_head} |", "|---|---|---|"]
         on_t, off_t = st.get("on_timeline", {}), st.get("off_timeline", {})
         for key, label in (("submit_to_running_s", "submit to running"),
                            ("initializing_to_running_s", "initializing to running")):
@@ -205,15 +235,23 @@ def markdown(result: dict) -> str:
         if st.get("unknown"):
             lines += ["Start-up totals unknown: " + "; ".join(
                 f"{VARIANT_LABELS.get(v, v)} `{u['field']}` ({u['why']})" for v, u in st["unknown"].items()), ""]
-        lines += [f"Log sources: semi_p {st.get('on_sources') or ['none']}; plain {st.get('off_sources') or ['none']}", ""]
+        off_sources = (st.get("off_sources") or ["none"]) if plain else f"none, {NO_PLAIN}"
+        lines += [f"Log sources: semi_p {st.get('on_sources') or ['none']}; plain {off_sources}", ""]
 
     corr = result.get("correctness") or []
     if corr:
         lines += correctness_table(corr) + [""]
 
+    if result.get("perf_note"):
+        lines += ["## Throughput and latency", "", f"Perf {result['perf_note']}.", ""]
     perf = result.get("perf") or {}
     if perf:
-        lines += ["## Throughput and latency", "", "| check | value | limit | result |", "|---|---|---|---|"]
+        lines += ["## Throughput and latency", ""]
+        if perf.get("baseline", "off_default") != "off_default":
+            lines += [f"Plain is {perf['baseline']} ({VARIANT_LABELS.get(perf['baseline'], perf['baseline'])}): "
+                      "no off_default in this run, so the gates measure semi_p's own cost, without the cost of its "
+                      "collective settings.", ""]
+        lines += ["| check | value | limit | result |", "|---|---|---|---|"]
         lines += [f"| {c['name']} | {_num(c['value'])} | {c['limit']} | {_perf_status(c)} |" for c in perf["checks"]]
         lat = perf.get("latency", {})
         if lat:

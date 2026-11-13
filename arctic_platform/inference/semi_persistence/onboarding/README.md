@@ -44,6 +44,29 @@ matched on plain workers). The perf layout is twice the published `n_gpus` for a
 whole-node config, so two pods restore the same image, and the published size
 otherwise (`copies=` overrides).
 
+### Variant sets
+
+`variants=` takes any subset that includes `on_hit`. The plain baseline, which
+perf and the start-up table compare semi_p with, is `off_default`, else
+`off_matched`, else there is none.
+
+| `variants` | Plain baseline | What changes |
+|---|---|---|
+| all four (default), or any set with `off_default` | `off_default` | nothing: everything above |
+| `on_hit,off_matched` (plus `on_miss`) | `off_matched` | perf gates semi_p against plain matched (semi_p's own cost, without its collective settings, so no breakdown); start-up's plain column is `off_matched`'s; correctness gates `off_matched` as always |
+| `on_hit` (plus `on_miss`) | none | perf is not measured; start-up's plain columns are `-` ("no plain job in this run"); with `on_hit` alone each correctness check is decided on its own answers (below) |
+
+With `on_hit` alone no job can be compared with the reference, so these checks
+are gated on its own answers: `ignore_eos` length, one answer from every replica,
+the seeded repeat, real token ids, sampled logprobs (one per generated token,
+each finite and <= 0), top-k logprobs (one entry per generated token with 1 to 3
+candidates), prompt logprobs (one position per prompt token, the first may be
+left out), stop strings (none in the text) and guided JSON that parses. Greedy
+agreement and batched greedy need another job and are *info*, and so is guided
+JSON that does not parse, since no plain job ran to tell a reasoning model's free
+text from a defect. The verdict is PASS when every gated check passes. The report
+and the onboarding book say which variants ran.
+
 ### semi_p's collective setup at TP >= 2
 
 The semi_p engine moves vLLM's collectives onto paths a checkpoint can carry: no
@@ -103,7 +126,7 @@ model with no entry stops the run before anything is submitted.
 |---|---|---|
 | `models` | required | Comma-separated names under `models/`, or paths to model files |
 | `debug_image_tag` | the model's entry in `backends.json` | Backend image for every job |
-| `variants` | all four | Subset of `on_hit,off_default,on_miss,off_matched`; the first two are required |
+| `variants` | all four | Subset of `on_hit,off_default,on_miss,off_matched` that includes `on_hit` (see [Variant sets](#variant-sets)) |
 | `copies` | 2 for whole-node configs, else 1 | Perf pair size, as a multiple of the published `n_gpus` |
 | `miss_image_cache` | none | Local image-cache root for `on_miss`; a per-run subdirectory is used, so a copy left by an earlier job cannot turn the miss into a hit |
 | `checks` | `correctness,perf` | Run a subset |
@@ -115,7 +138,7 @@ model with no entry stops the run before anything is submitted.
 | `out_dir` | `onboarding_reports` | Where reports go |
 | `keep_jobs` | `false` | Leave the jobs running |
 | `job_<variant>` | none | Attach to running jobs instead of submitting (`on_job_id` / `off_job_id` still work) |
-| `log_files_on`, `log_files_off` | none | Saved GPU pod logs of `on_hit` / `off_default` (per-step restore breakdown) |
+| `log_files_on`, `log_files_off` | none | Saved GPU pod logs of `on_hit` / the plain baseline (per-step restore breakdown) |
 | `timeout_s` | `3600` | How long each job may take to reach `running` |
 | `log_wait_s` | `90` | How long to keep re-reading a served job's log, before cancelling it, until it shows the job's start-up total |
 | `publish_dir` | `<out_dir>/publish` | Where `publish` wrote `<image_tag>/summary.json` |

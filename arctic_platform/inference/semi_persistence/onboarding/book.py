@@ -36,6 +36,7 @@ from arctic_platform.inference.semi_persistence.onboarding.common import parse_k
 from arctic_platform.inference.semi_persistence.onboarding.perf import engine_tok_s
 from arctic_platform.inference.semi_persistence.onboarding.perf import ratio
 from arctic_platform.inference.semi_persistence.onboarding.report import gated_perf_checks
+from arctic_platform.inference.semi_persistence.onboarding.report import plain_baseline
 from arctic_platform.inference.semi_persistence.onboarding.report import verdict
 
 logger = logging.getLogger(__name__)
@@ -81,16 +82,38 @@ def _image(r: dict) -> str:
     return r.get("image_tag") or "default"
 
 
+def _variants(r: dict) -> str:
+    return ", ".join(r.get("variants") or r.get("jobs") or ["on_hit", "off_default"])
+
+
+def _plain_tag(r: dict) -> str:
+    """Marks a start-up row whose plain numbers are not off_default's."""
+    plain = plain_baseline(r)
+    return "" if plain == "off_default" else " (plain matched)" if plain == "off_matched" else " (no plain job)"
+
+
+def _perf_tag(r: dict) -> str:
+    """Marks a perf row measured against plain matched instead of stock plain."""
+    baseline = (r.get("perf") or {}).get("baseline", "off_default")
+    return "" if baseline == "off_default" else f" (vs {baseline})"
+
+
+def _no_perf_tag(r: dict) -> str:
+    """Why a run has no perf row, when it is that it ran no plain job."""
+    return " (no plain job)" if plain_baseline(r) is None else ""
+
+
 def overview(runs: list[dict]) -> list[str]:
     out = ["## Overview", "",
-           "| model config | model | layout | backend image | date (UTC) | verdict | correctness | perf | notes |",
-           "|---|---|---|---|---|---|---|---|---|"]
+           "| model config | model | layout | backend image | variants | date (UTC) | verdict | correctness | perf "
+           "| notes |",
+           "|---|---|---|---|---|---|---|---|---|---|"]
     for r in runs:
         v, reasons = verdict(r)
         corr = [c for c in r.get("correctness") or [] if c["required"]]
         perf = gated_perf_checks(r)
         out.append(f"| {r['model']['name']} | `{r['model']['model_name']}` | {_layout(r)} | `{_image(r)}` | "
-                   f"{r['started_at'][:16].replace('T', ' ')} | **{v}** | "
+                   f"{_variants(r)} | {r['started_at'][:16].replace('T', ' ')} | **{v}** | "
                    f"{sum(bool(c['passed']) for c in corr)}/{len(corr)} | "
                    f"{sum(bool(c['passed']) for c in perf)}/{len(perf)} | {'; '.join(reasons)[:200]} |")
     return out + [""]
@@ -130,7 +153,8 @@ def startup_table(runs: list[dict]) -> list[str]:
         on_t, off_t = st.get("on_timeline") or {}, st.get("off_timeline") or {}
         source = ("published image" if sp.get("restored") else "cold start (cache miss)" if sp.get("cache_miss")
                   else "not confirmed")
-        out.append(f"| {r['model']['name']} | {_f(copy)} | {_f(restore)} | {_f(attach)} | {_f(k2r)} | {mark}{_f(cold)} | "
+        out.append(f"| {r['model']['name']}{_plain_tag(r)} | {_f(copy)} | {_f(restore)} | {_f(attach)} | {_f(k2r)} | "
+                   f"{mark}{_f(cold)} | "
                    f"{mark}{_f(speedup, 1, 'x')} | {_f(on_t.get('submit_to_running_s'), 0)} / "
                    f"{_f(off_t.get('submit_to_running_s'), 0)} | {source} ({len(reps)} replica(s)) |")
     return out + [""]
@@ -154,7 +178,8 @@ def cold_start_table(runs: list[dict]) -> list[str]:
            "|---|" + "---|" * len(VLLM_PHASES)]
     for r in runs:
         vl = (r.get("startup") or {}).get("vllm_off") or {}
-        out.append(f"| {r['model']['name']} | " + " | ".join(_f(vl.get(k)) for k, _ in VLLM_PHASES) + " |")
+        out.append(f"| {r['model']['name']}{_plain_tag(r)} | " + " | ".join(_f(vl.get(k)) for k, _ in VLLM_PHASES)
+                   + " |")
     return out + [""]
 
 
@@ -169,13 +194,13 @@ def latency_table(runs: list[dict]) -> list[str]:
         perf = r.get("perf") or {}
         lat = perf.get("latency") or {}
         if not lat:
-            out.append(f"| {r['model']['name']} | - | - | - | - | - | - |")
+            out.append(f"| {r['model']['name']}{_no_perf_tag(r)} | - | - | - | - | - | - |")
             continue
         on, off = lat["on"], lat["off"]
         gap = 1000 * max(on["ttft_short_s"] - off["ttft_short_s"], on["ttft_long_s"] - off["ttft_long_s"])
         ovh = perf.get("client_overhead_s") or {}
         out.append(
-            f"| {r['model']['name']} | {_f(on['ttft_short_s'] * 1000)} / {_f(off['ttft_short_s'] * 1000)} | "
+            f"| {r['model']['name']}{_perf_tag(r)} | {_f(on['ttft_short_s'] * 1000)} / {_f(off['ttft_short_s'] * 1000)} | "
             f"{_f(on['ttft_long_s'] * 1000)} / {_f(off['ttft_long_s'] * 1000)} | "
             f"{_f(on['tpot_s'] * 1000, 2)} / {_f(off['tpot_s'] * 1000, 2)} | {_f(gap)} | "
             f"{_f(on['tpot_s'] / off['tpot_s'] if off['tpot_s'] else None, 2)} | "
@@ -197,7 +222,7 @@ def throughput_table(runs: list[dict]) -> list[str]:
         perf = r.get("perf") or {}
         rows = perf.get("rows") or []
         if not rows:
-            out.append(f"| {r['model']['name']} | - | - | - | - | - | - |")
+            out.append(f"| {r['model']['name']}{_no_perf_tag(r)} | - | - | - | - | - | - |")
             continue
         p, o = max(((x["on"]["prompt"], x["on"]["output"]) for x in rows), key=lambda s: s[1])
         cells = sorted((x for x in rows if (x["on"]["prompt"], x["on"]["output"]) == (p, o)),
@@ -211,7 +236,7 @@ def throughput_table(runs: list[dict]) -> list[str]:
         client_worst = min(ratio(x["on"]["tok_s"], x["off"]["tok_s"]) for x in loaded)
         sc = perf.get("scaling") or {}
         scaling = f"{_f(sc.get('on'), 2)} / {_f(sc.get('off'), 2)}" if sc else "- (one replica)"
-        out.append(f"| {r['model']['name']} | {p}/{o} | {engine} | {client} | {_f(engine_median, 2)} | "
+        out.append(f"| {r['model']['name']}{_perf_tag(r)} | {p}/{o} | {engine} | {client} | {_f(engine_median, 2)} | "
                    f"{_f(client_worst, 2)} | {scaling} |")
     return out + [""]
 
@@ -262,7 +287,7 @@ def correctness_table(runs: list[dict]) -> list[str]:
            "| model config | semi_p forced miss | plain, matched | plain, default |",
            "|---|---|---|---|"]
     for r in runs:
-        if not any(c.get("variants") for c in r.get("correctness") or []):
+        if _legacy(r):
             out.append(f"| {r['model']['name']} | (two-job run) | - | - |")
             continue
         out.append(f"| {r['model']['name']} | {_variant_summary(r, 'on_miss')} | "
@@ -285,9 +310,16 @@ def correctness_table(runs: list[dict]) -> list[str]:
             if default is not None and not default["passed"]:
                 cell += " (default differs)"
             cells.append(cell)
-        legacy = "" if any(c.get("variants") for c in r.get("correctness") or []) else " (two-job run, vs plain)"
-        out.append(f"| {r['model']['name']}{legacy} | " + " | ".join(cells) + " |")
+        legacy = " (two-job run, vs plain)" if _legacy(r) else ""
+        alone = " (semi_p only)" if r.get("variants") == ["on_hit"] else ""
+        out.append(f"| {r['model']['name']}{legacy}{alone} | " + " | ".join(cells) + " |")
     return out + [""]
+
+
+def _legacy(r: dict) -> bool:
+    """A report from before per-job comparison: checks against plain, with no
+    per-job columns (a run of on_hit alone has none either, but is not one)."""
+    return "variants" not in r and not any(c.get("variants") for c in r.get("correctness") or [])
 
 
 def build(directory: Path) -> str:
