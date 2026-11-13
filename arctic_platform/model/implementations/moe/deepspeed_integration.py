@@ -21,6 +21,9 @@ from .config import DISPATCH_EP_BACKENDS
 from .distributed.ep_backend import uses_dispatch_ep
 from .distributed.expert_parallel import DeepEPExpertParallel
 from .distributed.expert_parallel import DeepEPShardParallel
+from .expert_placement import apply_expert_placement
+from .expert_placement import expert_export_rows
+from .expert_placement import tag_expert_adapter
 from .layers.moe import LatentMoE
 from .layers.moe import MoE
 from .logging_utils import get_logger
@@ -152,6 +155,7 @@ def tag_expert_lora_adapters_for_deepspeed(model: nn.Module, ep_group_name: str)
             if parameter.requires_grad and getattr(parameter, "group_name", None) is None:
                 parameter.allreduce = False
                 parameter.group_name = ep_group_name
+                tag_expert_adapter(parameter, module)
                 count += 1
     return count
 
@@ -275,6 +279,10 @@ def build_iter_full_hf_weights(model: nn.Module):
                             tensor, ep_group, is_master=is_master, max_gather_bytes=_EXPORT_GATHER_BYTES
                         )
                     if is_master:
+                        # A static expert placement holds the experts in slot order; export them in logical order.
+                        dest = expert_export_rows(tensor, full.shape[0])
+                        if dest is not None:
+                            full = torch.empty_like(full).index_copy_(0, dest.to(full.device), full)
                         layer_state[name] = full
                 elif is_master:
                     layer_state[name] = tensor.data
@@ -336,6 +344,8 @@ def setup_model_local_no_train(
     adapter.reset_runtime_moe_buffers(model)
     count = convert_dtensors_to_local(model)
     logger.info(f"Unwrapped {count} DTensor parameters into local tensors")
+    # Before DeepSpeed partitions the experts: their rows, gradients and optimizer state are in placement slot order.
+    apply_expert_placement(model, logger)
     enable_tiled_mlp(
         model,
         is_target=lambda module: isinstance(module, adapter.shared_expert_type),
