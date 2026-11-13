@@ -48,6 +48,8 @@ from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.common.weight_checksum import tensor_l2_sq
+from arctic_platform.debug.weight_sync import maybe_annotate_weight_sync_result
+from arctic_platform.debug.weight_sync import maybe_observe_weight_send
 from arctic_platform.model import build_model
 from arctic_platform.model import ds_worker_dense_model_spec
 from arctic_platform.model import ds_worker_moe_model_spec
@@ -810,9 +812,10 @@ class DeepSpeedWorker:
         weights = self.get_weights()
         if self._weight_sender is not None:
             sent_l2_sq = self._weights_l2_sq(weights)
-            result = self._weight_sender.send(weights)
+            with maybe_observe_weight_send(self, weights) as evidence:
+                result = self._weight_sender.send(weights)
             result["sent_l2_sq"] = sent_l2_sq
-            return result
+            return maybe_annotate_weight_sync_result(result, evidence)
         return {"status": "not_initialized"}
 
     def get_cuda_ipc_handles(self) -> dict:
