@@ -674,7 +674,7 @@ def _replay_register_graph_buffers(ca, my_handle, my_offset) -> dict:
 # The per-peer signal-pad pointers (meta_ptrs) are baked by value into the CA
 # all-reduce kernel nodes (RankSignals sg, Signal* self_sg) and move on reinit.
 # We walk each captured graph, identify CA kernels BY NAME (cuFuncGetName ->
-# "cross_device_reduce*") so we never deref a non-CA node's params, then
+# `_ca_kernel_kind`) so we never deref a non-CA node's params, then
 # value-match old->new meta_ptrs in sg/self_sg and commit with
 # cuGraphExecKernelNodeSetParams. No vLLM CustomAllreduce source is touched.
 # ---------------------------------------------------------------------------
@@ -865,6 +865,26 @@ def _func_name(cu, func):
         return namep.value.decode("utf-8", "replace")
     except Exception:  # noqa: BLE001
         return ""
+
+
+# The CustomAllreduce kernels whose nodes the rebind may rewrite. All three
+# take (RankData* _dp, RankSignals sg, Signal* self_sg, T* result, int rank,
+# int size) -- csrc/custom_all_reduce.cuh and
+# custom_all_gather_reduce_scatter.cuh at v0.32.0 -- so kp[0..2] mean the same
+# thing in each. The mnnvl_* kernels take a different list and must not match.
+# reduce_scatter precedes cross_device_reduce, a prefix of it.
+_CA_KERNEL_KINDS = (("cross_device_all_gather", "all_gather"),
+                    ("cross_device_reduce_scatter", "reduce_scatter"),
+                    ("cross_device_reduce", "all_reduce"))
+
+
+def _ca_kernel_kind(name):
+    """'all_reduce' / 'all_gather' / 'reduce_scatter' for a CustomAllreduce
+    kernel name (mangled or not), else None."""
+    for tag, kind in _CA_KERNEL_KINDS:
+        if tag in name:
+            return kind
+    return None
 
 
 def _graph_manager_holders(worker):
@@ -1657,12 +1677,16 @@ def nccl_node_census(worker=None) -> dict:
     no retained topology, a child graph or a conditional body we cannot open,
     an incomplete discovery -- because a zero over a partial walk proves
     nothing. Read-only; never raises.
+
+    ``ca_kernels`` counts the CustomAllreduce nodes by kind -- what the rebind
+    will rewrite -- and ``n_mnnvl_nodes`` the multicast ones it cannot.
     """
     _ensure_worker_log_handler()
     out = {"step": "nccl_node_census", "ok": False, "complete": False,
            "incomplete_why": None, "n_graphs": 0, "n_graphs_scanned": 0,
            "n_child_graphs": 0, "n_kernel_nodes": 0, "n_nccl_nodes": 0,
-           "n_unidentified_kernels": 0, "nccl_kernels": {}}
+           "n_unidentified_kernels": 0, "nccl_kernels": {},
+           "n_ca_nodes": 0, "ca_kernels": {}, "n_mnnvl_nodes": 0}
     why = []
     try:
         entries, diag = _collect_graph_entries(worker)
@@ -1735,6 +1759,14 @@ def nccl_node_census(worker=None) -> dict:
                         out["n_nccl_nodes"] += 1
                         out["nccl_kernels"][name] = (
                             out["nccl_kernels"].get(name, 0) + 1)
+                        continue
+                    kind = _ca_kernel_kind(name)
+                    if kind is not None:
+                        out["n_ca_nodes"] += 1
+                        out["ca_kernels"][kind] = (
+                            out["ca_kernels"].get(kind, 0) + 1)
+                    elif "mnnvl" in name:
+                        out["n_mnnvl_nodes"] += 1
             out["n_graphs_scanned"] += 1
         if n_topo_fail:
             why.append(f"{n_topo_fail} graph(s) without a retained topology")
@@ -1747,20 +1779,24 @@ def nccl_node_census(worker=None) -> dict:
     out["incomplete_why"] = "; ".join(why) or None
     log.info("NCCL NODE CENSUS: graphs=%d scanned=%d child_graphs=%d "
              "kernel_nodes=%d nccl_nodes=%d unidentified=%d complete=%s "
-             "kernels=%s why=%s", out["n_graphs"], out["n_graphs_scanned"],
+             "kernels=%s ca_nodes=%d ca_kernels=%s mnnvl_nodes=%d why=%s",
+             out["n_graphs"], out["n_graphs_scanned"],
              out["n_child_graphs"], out["n_kernel_nodes"],
              out["n_nccl_nodes"], out["n_unidentified_kernels"],
-             out["complete"], out["nccl_kernels"], out["incomplete_why"])
+             out["complete"], out["nccl_kernels"], out["n_ca_nodes"],
+             out["ca_kernels"], out["n_mnnvl_nodes"], out["incomplete_why"])
     return out
 
 
-def _patch_node(cu, exec_handle, node, meta_map, vfy=None):
-    """If `node` is a CA all-reduce kernel, value-match old->new meta_ptrs in its
-    sg (kernelParams[1], 8 ptrs) and self_sg (kernelParams[2], 1 ptr) and commit.
+def _patch_node(cu, exec_handle, node, meta_map, vfy=None, kinds=None):
+    """If `node` is a CA collective kernel (all-reduce, all-gather or
+    reduce-scatter), value-match old->new meta_ptrs in its sg (kernelParams[1],
+    8 ptrs) and self_sg (kernelParams[2], 1 ptr) and commit.
     Returns the number of pointer slots rewritten (0 if not a CA node / no match).
 
     `vfy`: optional counter dict for the transactional topology readback at the end
     of this function (keys k_topo_ok / k_topo_bad / topo_readback_err). None skips it.
+    `kinds`: optional dict, bumped per rewritten node by `_ca_kernel_kind`.
     """
     t = ctypes.c_int(-1)
     if cu.cuGraphNodeGetType(node, ctypes.byref(t)) != 0:
@@ -1771,7 +1807,8 @@ def _patch_node(cu, exec_handle, node, meta_map, vfy=None):
     if cu.cuGraphKernelNodeGetParams_v2(node, ctypes.byref(params)) != 0:
         return 0
     name = _func_name(cu, params.func)
-    if "cross_device_reduce" not in name:
+    kind = _ca_kernel_kind(name)
+    if kind is None:
         return 0
     kp = params.kernelParams
     if not kp:
@@ -1871,6 +1908,8 @@ def _patch_node(cu, exec_handle, node, meta_map, vfy=None):
             if new_dp is not None and bkp[0]:
                 got_dp = int((ctypes.c_uint64 * 1).from_address(bkp[0])[0])
                 vfy["k_topo_ok" if got_dp == new_dp else "k_topo_bad"] += 1
+    if kinds is not None:
+        kinds[kind] = kinds.get(kind, 0) + 1
     # keep new_sg_buf/new_self_buf/new_dp_buf/new_kp alive until the calls return
     return rewrites
 
@@ -1976,7 +2015,8 @@ def _audit_stale_ca_addrs(cu, pairs, addr_map, ca=None) -> dict:
            "kernel_definite": 0, "memcpy_definite": 0, "memset_definite": 0,
            "memfree_definite": 0, "sg_tail_stale": 0,
            "kernel_ambiguous": 0, "memcpy_ambiguous": 0, "sg_tail_nonzero": 0,
-           "n_ca_kernel": 0, "n_memset": 0, "n_memfree": 0, "n_memalloc": 0,
+           "n_ca_kernel": 0, "n_ca_kernel_by_kind": {},
+           "n_memset": 0, "n_memfree": 0, "n_memalloc": 0,
            "n_child": 0, "legacy_hits": 0, "pos_checked": False, "why": None,
            "err": None}
 
@@ -2029,12 +2069,15 @@ def _audit_stale_ca_addrs(cu, pairs, addr_map, ca=None) -> dict:
                     continue
                 if not params.func:
                     continue
-                if "cross_device_reduce" not in _func_name(cu, params.func):
+                kind = _ca_kernel_kind(_func_name(cu, params.func))
+                if kind is None:
                     continue
                 kp = params.kernelParams
                 if not kp or not kp[1] or not kp[2]:
                     continue
                 out["n_ca_kernel"] += 1
+                by_kind = out["n_ca_kernel_by_kind"]
+                by_kind[kind] = by_kind.get(kind, 0) + 1
                 sg = (ctypes.c_uint64 * 8).from_address(kp[1])
                 for i in range(8):
                     v = int(sg[i])
@@ -2137,11 +2180,11 @@ def _audit_stale_ca_addrs(cu, pairs, addr_map, ca=None) -> dict:
 # rewrite path used on the WORKING ckpt-wake (addr_map!={}) stays byte-for-byte
 # identical -- all risk is isolated to the disk-wake no-op branch.
 # ---------------------------------------------------------------------------
-def _recommit_ca_kernel_node(cu, exec_handle, node) -> int:
-    """Force the driver to re-accept a CA all-reduce kernel node's params with
+def _recommit_ca_kernel_node(cu, exec_handle, node, kinds=None) -> int:
+    """Force the driver to re-accept a CA collective kernel node's params with
     IDENTICAL current values (topology + exec). Mirrors _patch_node's struct
     handling but rewrites nothing. Returns 1 iff this was a CA kernel node and it
-    was recommitted, else 0."""
+    was recommitted, else 0. `kinds` as in _patch_node."""
     t = ctypes.c_int(-1)
     if cu.cuGraphNodeGetType(node, ctypes.byref(t)) != 0:
         return 0
@@ -2151,7 +2194,8 @@ def _recommit_ca_kernel_node(cu, exec_handle, node) -> int:
     if cu.cuGraphKernelNodeGetParams_v2(node, ctypes.byref(params)) != 0:
         return 0
     name = _func_name(cu, params.func)
-    if "cross_device_reduce" not in name:
+    kind = _ca_kernel_kind(name)
+    if kind is None:
         return 0
     kp = params.kernelParams
     if not kp:
@@ -2178,6 +2222,8 @@ def _recommit_ca_kernel_node(cu, exec_handle, node) -> int:
         _ck("cuGraphExecKernelNodeSetParams_v2(recommit)",
             cu.cuGraphExecKernelNodeSetParams_v2(exec_handle, node,
                                                  ctypes.byref(params)))
+    if kinds is not None:
+        kinds[kind] = kinds.get(kind, 0) + 1
     # keep new_sg_buf/new_self_buf/new_kp alive until the calls return
     return 1
 
@@ -2223,11 +2269,13 @@ def _force_recommit_ca_nodes(worker, out) -> dict:
         out["graph_discovery"] = gdiag
         out["n_graphs"] = len(pairs)
         kn = mn = 0
+        kinds: dict = {}
         for g, e in pairs:
             for node in _graph_nodes(cu, g):
-                kn += _recommit_ca_kernel_node(cu, e, node)
+                kn += _recommit_ca_kernel_node(cu, e, node, kinds)
                 mn += _recommit_ca_memcpy_node(cu, e, node, ctx, ca_buf_set)
         out["kernel_nodes_recommitted"] = kn
+        out["kernel_nodes_recommitted_by_kind"] = kinds
         out["memcpy_nodes_recommitted"] = mn
         # Same gate as the rewrite path: this is the other way out of
         # rewrite_addrs_in_graphs, so leaving it ungated would keep the
@@ -2238,8 +2286,8 @@ def _force_recommit_ca_nodes(worker, out) -> dict:
                             f"{gdiag.get('incomplete_why')}")
             log.error("force_recommit: %s -- refusing to report success",
                       out["error"])
-        log.info("FORCE_RECOMMIT: %d graphs; recommitted kernel=%d memcpy=%d "
-                 "(identical values, addr_map empty)", len(pairs), kn, mn)
+        log.info("FORCE_RECOMMIT: %d graphs; recommitted kernel=%d %s memcpy=%d "
+                 "(identical values, addr_map empty)", len(pairs), kn, kinds, mn)
     except Exception as ex:  # noqa: BLE001
         out["ok"] = False
         out["error"] = f"{type(ex).__name__}: {ex}"
@@ -2282,10 +2330,11 @@ def rewrite_addrs_in_graphs(worker, addr_map) -> dict:
         # m_topo_ok == memcpy_ptrs_rewritten, with the *_bad/err counters 0.
         vfy = {"k_topo_ok": 0, "k_topo_bad": 0, "m_topo_ok": 0, "m_topo_bad": 0,
                "topo_readback_err": 0}
+        kinds: dict = {}
         for g, e in pairs:
             is_mgr = g in mgr_handles
             for node in _graph_nodes(cu, g):
-                r = _patch_node(cu, e, node, addr_map, vfy)
+                r = _patch_node(cu, e, node, addr_map, vfy, kinds)
                 if r:
                     kn += 1
                     kr += r
@@ -2298,6 +2347,7 @@ def rewrite_addrs_in_graphs(worker, addr_map) -> dict:
                     if is_mgr:
                         mmn += 1
         out["kernel_nodes_patched"] = kn
+        out["kernel_nodes_patched_by_kind"] = kinds
         out["kernel_slots_rewritten"] = kr
         out["memcpy_nodes_patched"] = mn
         out["memcpy_ptrs_rewritten"] = mr
@@ -2336,10 +2386,10 @@ def rewrite_addrs_in_graphs(worker, addr_map) -> dict:
                       "successful rebind; the unpatched graphs would fault on "
                       "first replay", out["error"])
         log.info("rewrite_addrs_in_graphs: %d graphs (%d from manager); kernel %d "
-                 "nodes/%d slots (manager %d); memcpy %d nodes/%d ptrs (manager %d); "
-                 "topo_readback ok=%s(%d/%d ok, %d bad, %d err); audit bad=%s "
-                 "(pos_checked=%s ambiguous=%d legacy_hits=%d)",
-                 len(pairs), len(mgr_handles), kn, kr, mkn, mn, mr, mmn,
+                 "nodes %s/%d slots (manager %d); memcpy %d nodes/%d ptrs "
+                 "(manager %d); topo_readback ok=%s(%d/%d ok, %d bad, %d err); "
+                 "audit bad=%s (pos_checked=%s ambiguous=%d legacy_hits=%d)",
+                 len(pairs), len(mgr_handles), kn, kinds, kr, mkn, mn, mr, mmn,
                  vfy["ok"], vfy["k_topo_ok"] + vfy["m_topo_ok"], kr + mr,
                  vfy["k_topo_bad"] + vfy["m_topo_bad"], vfy["topo_readback_err"],
                  out["stale_ca_audit"].get("bad"),
@@ -2410,7 +2460,7 @@ def _collect_dp_slots(cu, base_rd, nbytes, worker=None):
             params = _KernelNodeParams()
             if cu.cuGraphKernelNodeGetParams_v2(node, ctypes.byref(params)) != 0:
                 continue
-            if "cross_device_reduce" not in _func_name(cu, params.func):
+            if _ca_kernel_kind(_func_name(cu, params.func)) is None:
                 continue
             kp = params.kernelParams
             if not kp or not kp[0]:
@@ -2848,7 +2898,7 @@ def probe_ca_signal_pads(worker, do_zero: bool = False) -> dict:
 
         out["pre"] = _dump(local, meta_size)
 
-        # --- graph-baked signal-pointer validation: for each cross_device_reduce
+        # --- graph-baked signal-pointer validation: for each CA kernel
         # node assert self_sg == meta_ptrs[rank] and every nonzero sg[i] is a
         # current meta_ptr. Closes the "over-attribute failures to dirty flags"
         # hole before we act on the pad dump. ---
@@ -2868,7 +2918,7 @@ def probe_ca_signal_pads(worker, do_zero: bool = False) -> dict:
                     if cu.cuGraphKernelNodeGetParams_v2(
                             node, ctypes.byref(params)) != 0:
                         continue
-                    if "cross_device_reduce" not in _func_name(cu, params.func):
+                    if _ca_kernel_kind(_func_name(cu, params.func)) is None:
                         continue
                     kp = params.kernelParams
                     if not kp or not kp[1] or not kp[2]:
@@ -2990,8 +3040,8 @@ def probe_ca_signal_pads(worker, do_zero: bool = False) -> dict:
                             if cu2.cuGraphKernelNodeGetParams_v2(
                                     node, ctypes.byref(params)) != 0:
                                 continue
-                            if ("cross_device_reduce"
-                                    not in _func_name(cu2, params.func)):
+                            if _ca_kernel_kind(
+                                    _func_name(cu2, params.func)) is None:
                                 continue
                             kp = params.kernelParams
                             if not kp or not kp[0] or not kp[3]:
@@ -3409,7 +3459,7 @@ def e4_pre_inventory(worker) -> dict:
 def e4_post_inventory(worker) -> dict:
     """E4 POST hook (rebind_after_reinit, post-reinit, after CA rewrite/refresh,
     before warmup). Re-read each pre-snapshotted baked pointer at its (gi, ni, arg)
-    and bucket it. The rebind rewrites ONLY CA (cross_device_reduce) node params +
+    and bucket it. The rebind rewrites ONLY CA (`_ca_kernel_kind`) node params +
     CA-buffer memcpy endpoints, so every OTHER baked pointer keeps its cold value; a
     non-CA arg that was valid pre and is now unmapped (pre_valid_post_invalid) or now
     maps to a different allocation (value_same_range_changed) is the stale baked VA
@@ -3442,7 +3492,7 @@ def e4_post_inventory(worker) -> dict:
         samples: dict = {}  # bucket -> [few dicts]
         SAMP = 8
         for (gi, ni, kind, func, arg, pre_val, pre_base, pre_size) in inv:
-            is_ca = ("cross_device_reduce" in func)
+            is_ca = _ca_kernel_kind(func) is not None
             key = (gi, ni, arg)
             if key not in cur:
                 b = "node_mismatch"
