@@ -19,6 +19,7 @@ from arctic_platform.model.patches import compile  # noqa: F401
 from arctic_platform.model.patches import gradient_checkpointing  # noqa: F401
 from arctic_platform.model.patches import liger  # noqa: F401
 from arctic_platform.model.patches import lm_head  # noqa: F401
+from arctic_platform.model.patches import packed_seq_tiled_remat  # noqa: F401
 from arctic_platform.model.patches import peft  # noqa: F401
 from arctic_platform.model.patches import tiled_mlp  # noqa: F401
 from arctic_platform.model.patches import zorro_train  # noqa: F401

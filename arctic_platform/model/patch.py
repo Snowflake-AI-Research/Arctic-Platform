@@ -38,6 +38,7 @@ PATCH_ORDER: tuple[str, ...] = (
     "activation_offload",
     "compile",
     "tiled_mlp",
+    "tiled_remat",
     "lm_head",
     "zorro_train",
     "peft",
