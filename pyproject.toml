@@ -183,7 +183,7 @@ tinker = [
 sft = [
     # [rl], [onprem] and [verl] include [sft], so a training install gets SonicMoE with the rest of the stack.
     "arctic_platform[sonicmoe]",
-    "deepspeed>=0.19.9",  # preserve grads #8949
+    "deepspeed>=0.19.9,<0.20",  # preserve grads #8949; compact-offload hooks require the 0.19 API
     "huggingface-hub>=2.0,<3",
     "liger-kernel>=0.8.5", # more patches than earlier
     "numpy",
