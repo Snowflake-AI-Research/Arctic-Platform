@@ -350,6 +350,45 @@ def test_nccl_kernels_are_counted_by_name(libcuda):
     assert out["nccl_kernels"] == {_AG[1]: 2, _AR[1]: 1}
 
 
+_CA_AG = (_KERNEL, "_ZN4vllm23cross_device_all_gatherILi8EEEvPNS_8RankData"
+                   "ENS_11RankSignalsEPNS_6SignalEPNS_7array_tImLi2EEEii")
+_MNNVL_AG = (_KERNEL, "mnnvl_lamport_all_gather<bf16, 8>")
+
+
+def test_routed_deepseek_graphs_hold_no_nccl_and_are_kept(libcuda):
+    """DeepSeek-V4.1-Flash with ``ca_all_gather``: the four Engram gathers per
+    FULL graph (``embed`` + ``wkv`` x 2 layers), and the two in each Engram
+    piecewise segment, are ``cross_device_all_gather``. They were 816
+    ``ncclDevKernel_AllGather_RING_LL`` per rank; now the gate keeps the
+    graphs and the restore rebinds them."""
+    full = [_CA, _CA_AG, _CA_AG, _GEMM, _CA, _CA_AG, _CA_AG, _GEMM]
+    piece = [_CA_AG, _CA_AG, _GEMM, _CA]
+    libcuda({1: full, 2: piece}, [1, 2])
+    out = cgr.nccl_node_census(None)
+    assert out["complete"] is True, out["incomplete_why"]
+    assert out["n_nccl_nodes"] == 0
+    assert out["ca_kernels"] == {"all_reduce": 3, "all_gather": 6}
+    assert out["n_ca_nodes"] == 9 and out["n_mnnvl_nodes"] == 0
+    decision = decide([dict(out, rank=r) for r in range(8)], 8)
+    assert decision["graphs_dropped"] is False
+
+
+def test_unrouted_gathers_still_drop(libcuda):
+    libcuda({1: [_CA, _AG, _CA_AG, _GEMM]}, [1])
+    out = cgr.nccl_node_census(None)
+    assert out["n_nccl_nodes"] == 1 and out["ca_kernels"] == {
+        "all_reduce": 1, "all_gather": 1}
+    assert decide([dict(out, rank=0)], 1)["graphs_dropped"] is True
+
+
+def test_multicast_kernels_are_counted_apart(libcuda):
+    """Not NCCL, and not something the rebind can rewrite either."""
+    libcuda({1: [_MNNVL_AG, _CA]}, [1])
+    out = cgr.nccl_node_census(None)
+    assert out["n_nccl_nodes"] == 0 and out["n_mnnvl_nodes"] == 1
+    assert out["ca_kernels"] == {"all_reduce": 1}
+
+
 def test_child_graphs_are_walked(libcuda):
     """A collective one level down is still a persistent ref on the comm."""
     libcuda({1: [_GEMM, (_CHILD_GRAPH, 7)], 7: [(_CHILD_GRAPH, 8)],
