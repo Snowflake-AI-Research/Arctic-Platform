@@ -2936,14 +2936,16 @@ def _bf16_vector(value, length: int, description: str) -> torch.Tensor:
     return value
 
 
-def _config(config, description: str) -> None:
+def _config(config, description: str, *, allow_external_optimizer: bool = False) -> None:
     if not isinstance(config, dict):
         raise ValueError(f"{description} requires ds_config")
     zero = config.get("zero_optimization", {})
     if not isinstance(zero, dict) or _integer(zero.get("stage"), "configured ZeRO stage") != 2:
         raise ValueError("only dense ZeRO2 checkpoints are supported")
     optimizer = config.get("optimizer")
-    if (
+    if optimizer is None and allow_external_optimizer:
+        pass
+    elif (
         not isinstance(optimizer, dict)
         or not isinstance(optimizer.get("type"), str)
         or optimizer["type"].strip().lower() != "adamw"
@@ -2989,6 +2991,12 @@ def _checkpoint_files(root: Path) -> tuple[Path, list[Path]]:
     return model, [ranks[rank] for rank in range(len(ranks))]
 
 
+def load_dense_checkpoint_model(root: Path) -> dict:
+    """Load the model metadata from a complete dense checkpoint export."""
+    model, _ = _checkpoint_files(root)
+    return _load(model)
+
+
 @dataclass
 class _Snapshot:
     step: int
@@ -3024,7 +3032,15 @@ def _snapshot(
     expected_optimizer_config: dict | None,
     expected_learning_rate: float | None,
     expected_native_layout: dict | None = None,
+    allow_external_optimizer_config: bool = False,
 ) -> _Snapshot:
+    if allow_external_optimizer_config and (
+        expected_native_layout is not None
+        or not isinstance(expected_optimizer_config, dict)
+        or str(expected_optimizer_config.get("name", "")).strip().lower() != "adamw"
+        or expected_optimizer_config.get("weight_decay", 0) != 0
+    ):
+        raise ValueError("external optimizer settings require dense zero-weight-decay AdamW")
     native = expected_native_layout
     experts, input_hashes, expert_files = None, None, []
     if native is None:
@@ -3138,8 +3154,12 @@ def _snapshot(
         if _integer(optimizer.get("zero_stage"), "ZeRO stage") != 2:
             raise ValueError("only dense ZeRO2 checkpoints are supported")
         if native is None:
-            _config(model_config, "model checkpoint")
-            _config(state.get("ds_config"), "optimizer checkpoint")
+            _config(model_config, "model checkpoint", allow_external_optimizer=allow_external_optimizer_config)
+            _config(
+                state.get("ds_config"),
+                "optimizer checkpoint",
+                allow_external_optimizer=allow_external_optimizer_config,
+            )
         else:
             if state.get("ds_config") != model_config:
                 raise ValueError("native optimizer ds_config mismatch")
@@ -3351,16 +3371,26 @@ def decode_optimizer_capture(
     expected_native_layout: dict | None = None,
     participation_receipts: list[dict] | None = None,
     expected_participation_job_id: str | None = None,
+    allow_external_optimizer_config: bool = False,
+    expected_gradient_clipping: float | None = None,
+    output_root: Path | None = None,
 ) -> Path:
     """Validate one real optimizer step and write named comparison tensors.
 
-    Input roots may contain one checkpoint tag plus metadata/export receipts. Output must be new.
+    Input roots may contain one checkpoint tag plus metadata/export receipts. Output must be new. An explicit
+    output root permits a descendant outside the default fast-storage root.
     The manifest retains the actual post-step counter; the existing single-step comparison requires step 1.
     Native layouts must come from the owner's selected runtime and ordered process groups. Source hashes
     protect those supplied bytes, not their runtime provenance. BF16 moments remain BF16; updates are the
     FP32 difference of the actual saved BF16 masters, never of model sidefiles.
     """
-    output_dir = require_data_fast_path(output_dir, label="optimizer artifact output")
+    if output_root is None:
+        output_dir = require_data_fast_path(output_dir, label="optimizer artifact output")
+    else:
+        root = Path(output_root).expanduser().resolve(strict=True)
+        output_dir = Path(output_dir).expanduser().resolve()
+        if not root.is_dir() or output_dir == root or not output_dir.is_relative_to(root):
+            raise ValueError("optimizer artifact output must be inside the supplied output root")
     before_dir, after_dir = Path(before_dir), Path(after_dir)
     native = None if expected_native_layout is None else _native_layout(expected_native_layout)
     if expected_optimizer_config is not None:
@@ -3372,7 +3402,9 @@ def decode_optimizer_capture(
     for source in (before_dir, after_dir):
         if output_dir.resolve().is_relative_to(source.resolve()):
             raise ValueError("optimizer artifact output must be outside checkpoint inputs")
-    options = {} if native is None else {"expected_native_layout": native}
+    options = {"allow_external_optimizer_config": allow_external_optimizer_config}
+    if native is not None:
+        options["expected_native_layout"] = native
     before = _snapshot(
         before_dir, expected_optimizer_config=expected_optimizer_config, expected_learning_rate=None, **options
     )
@@ -3382,6 +3414,12 @@ def decode_optimizer_capture(
         expected_learning_rate=expected_learning_rate,
         **options,
     )
+    if expected_gradient_clipping is not None and any(
+        shard.get("clip_grad") != expected_gradient_clipping
+        for snapshot in (before, after)
+        for shard in snapshot.shards
+    ):
+        raise ValueError("optimizer gradient clipping mismatch")
     if after.step != before.step + 1:
         raise ValueError("optimizer capture requires exactly one step between snapshots")
     if (

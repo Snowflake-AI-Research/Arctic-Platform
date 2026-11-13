@@ -121,6 +121,13 @@ def _comparison_tensors(
     }
 
 
+def optimizer_comparison_tensors(tensors, *, step: int, optimizer_config: dict, learning_rate: float, backend: str):
+    """Return Adam moments and the portion of the update not explained by those moments."""
+    return _comparison_tensors(
+        tensors, step=step, optimizer_config=optimizer_config, learning_rate=learning_rate, backend=backend
+    )
+
+
 def _load_norm_group(entries: Dict[str, Path], group: CanonicalTensorGroup) -> Dict[str, "torch.Tensor"]:
     artifacts = []
     for name in group.originals:
@@ -159,6 +166,11 @@ def _optimizer_l2_norm(value: "torch.Tensor") -> float:
     squares = (float(chunk.double().square().sum()) for chunk in value.detach().reshape(-1).split(1_000_000))
     norm = math.sqrt(math.fsum(squares))
     return float(torch.tensor(norm, dtype=value.dtype))
+
+
+def optimizer_tensor_norm(value: "torch.Tensor") -> float:
+    """Use the optimizer check's FP32 norm reduction for a captured tensor."""
+    return _optimizer_l2_norm(value.detach().to(device="cpu", dtype=torch.float32))
 
 
 def summarize_optimizer_artifacts(
