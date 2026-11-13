@@ -39,6 +39,18 @@ def _weight_sync_names_are_strict() -> bool:
     return os.environ.get("ARCTIC_WEIGHT_SYNC_STRICT_NAMES", "1") != "0"
 
 
+def _rank_holds_part_of_the_model(extension) -> bool:
+    """Whether vLLM places some of this model's parameters only on other ranks of the replica.
+
+    Expert parallelism leaves experts another rank owns, and pipeline parallelism leaves layers another stage owns,
+    out of ``model.load_weights`` on this rank. Under tensor parallelism alone every rank holds a shard of every
+    parameter, so a source with no destination is a dropped tensor.
+    """
+    parallel = getattr(extension, "parallel_config", None)
+    expert_parallel = bool(getattr(parallel, "enable_expert_parallel", False))
+    return expert_parallel or getattr(parallel, "pipeline_parallel_size", 1) > 1
+
+
 def _model_parameter_l2(
     model,
     device,
@@ -72,12 +84,13 @@ def _model_parameter_l2(
             loaded_l2_sq.add_(value)
             found.add(name)
 
+    if loaded_destinations is not None:
+        found.update(name for name, _ in model.named_buffers() if name in loaded_destinations)
     missing = loaded_destinations - found if loaded_destinations is not None else set()
     if missing:
         sample = sorted(missing)[:8]
         raise RuntimeError(
-            "Weight sync resolved destination names that are not model parameters: "
-            f"{sample}"
+            f"Weight sync resolved destination names that are not model parameters or registered buffers: {sample}"
         )
 
     param_l2 = None
@@ -567,9 +580,13 @@ class WeightSyncExtension:
 
     def _load_fp8(self, model, engine) -> tuple[int, float]:
         from arctic_platform.inference.server.weight_sync.utils import _FP8InplaceUpdater
+        from arctic_platform.inference.server.weight_sync.utils import _is_lora_adapter_name
 
         updater = _FP8InplaceUpdater(
-            model, self.model_config.dtype, self.device,
+            model,
+            self.model_config.dtype,
+            self.device,
+            source_config=getattr(self.model_config, "hf_config", None),
         )
         loaded = 0
         recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
@@ -584,10 +601,23 @@ class WeightSyncExtension:
                 ) from exc
             loaded += 1
             del tensor  # a rebuilt oversized tensor must not outlive its load
-        if updater.pending:
-            logger.warning(
-                "FP8 updater has %d incomplete modules", updater.pending,
+        unplaced = list(updater.unplaced)
+        if unplaced:
+            adapters = [name for name in unplaced if _is_lora_adapter_name(name)]
+            sample = "\n".join(f"  - {n}" for n in unplaced[:10])
+            more = f"\n  ... and {len(unplaced) - 10} more" if len(unplaced) > 10 else ""
+            message = (
+                f"Weight sync (_load_fp8) received {len(unplaced)}/{loaded} tensor(s) that reached no vLLM "
+                f"parameter; the inference model keeps stale values for them.\n\nSample names:\n{sample}{more}"
             )
+            if adapters:
+                message += (
+                    f"\n\n{len(adapters)} of them are LoRA adapter tensors, which have no full-weight destination: "
+                    "vLLM serves adapters through its LoRA manager, which weight_format='lora' loads."
+                )
+            raise RuntimeError(message)
+        if updater.pending:
+            raise RuntimeError(f"FP8 updater has {updater.pending} incomplete modules; inference weights remain stale")
         return loaded, recv_l2_sq.item()
 
     def _load_direct_zero_copy(self, model, engine) -> int:
@@ -623,11 +653,14 @@ class WeightSyncExtension:
     ) -> tuple[int, float, float, dict[str, list[str]], list[str]]:
         """Bucket path for TP=1 non-quantized models.
 
-        Copies from the engine's bucket buffer into pre-computed parameter views.
+        Uses the model loader for mapped names, otherwise pre-computed views.
         Returns the received count, all-byte and applied-source squared-L2
-        norms, canonical destination mapping, and skipped names. Direct loading
-        never skips a source: unresolved names fail after the receive completes.
+        norms, canonical destination mapping, and skipped names. Mapped loaders
+        retain nonlocal expert/pipeline sources; unresolved local names fail.
         """
+        if getattr(model, "hf_to_vllm_mapper", None) is not None:
+            return self._load_batched(model, engine)
+
         from arctic_platform.inference.server.weight_sync.utils import _DirectParamWriter
 
         writer = _DirectParamWriter(model, self.device)
@@ -687,12 +720,15 @@ class WeightSyncExtension:
         ``weight_loader`` to shard correctly.  Non-fused names fall through
         untouched, so the HF-named (``weight_format="hf"``) path is unaffected.
 
-        Returns the received count, all-byte and applied-source squared-L2
-        norms, canonical destination mapping, and skipped source names.
+        Returns the received count, all-byte and applied-parameter-source
+        squared-L2 norms, canonical destination mapping, and skipped sources.
+        Registered buffers are loaded and mapped but excluded from parameter norms.
+
+        A source with no destination fails after the receive completes, as in :meth:`_load_direct`, unless this rank
+        holds only part of the model (see :func:`_rank_holds_part_of_the_model`); there it is returned as skipped.
         """
-        from arctic_platform.inference.server.weight_sync.utils import (
-            _ShardAwareFusedWriter,
-        )
+        from arctic_platform.inference.server.weight_sync.utils import _is_lora_adapter_name
+        from arctic_platform.inference.server.weight_sync.utils import _ShardAwareFusedWriter
 
         writer = _ShardAwareFusedWriter(model, self.device)
         duplicating_mappers = _shard_duplicating_mappers(model)
@@ -722,11 +758,27 @@ class WeightSyncExtension:
             destinations = _canonicalize_destinations(destinations, param_names)
             if destinations:
                 source_to_destinations[name] = destinations
-                applied_source_l2_sq.add_(source_l2_sq * copies)
+                if any(destination in param_names for destination in destinations):
+                    applied_source_l2_sq.add_(source_l2_sq * copies)
             else:
                 skipped_source_names.append(name)
             loaded += 1
             del tensor  # a rebuilt oversized tensor must not outlive its load
+        if skipped_source_names and not _rank_holds_part_of_the_model(self):
+            sample = "\n".join(f"  - {n}" for n in skipped_source_names[:10])
+            more = f"\n  ... and {len(skipped_source_names) - 10} more" if len(skipped_source_names) > 10 else ""
+            message = (
+                f"Weight sync (_load_batched) received {len(skipped_source_names)}/{loaded} tensor(s) whose names "
+                "have no destination in the model loader -- they were dropped on the floor, which corrupts the "
+                f"inference model.\n\nSample orphan names:\n{sample}{more}"
+            )
+            adapters = [name for name in skipped_source_names if _is_lora_adapter_name(name)]
+            if adapters:
+                message += (
+                    f"\n\n{len(adapters)} of them are LoRA adapter tensors, which have no full-weight destination: "
+                    "vLLM serves adapters through its LoRA manager, which weight_format='lora' loads."
+                )
+            raise AssertionError(message)
         if skipped_source_names:
             logger.warning(
                 "Weight sync skipped %d/%d received source tensor(s) because "
