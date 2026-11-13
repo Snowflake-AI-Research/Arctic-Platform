@@ -1360,7 +1360,7 @@ def _require_validation_pass(validation: dict, description: str, *, config_id: s
     details = validation.get("reason") or "The target did not complete a passing comparison."
     context = f" for {config_id}" if config_id is not None else ""
     raise RuntimeError(
-        f"{description} {validation['status']}{context}\n{details}\n"
+        f"{details}\n{description} {validation['status']}{context}\n"
         f"Report: {validation.get('report') or 'not written'}\nComplete log: {validation['log']}"
     )
 
@@ -1549,6 +1549,15 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
         if row.get("outcome") not in {"pass", "inapplicable"}
     ]
     reason = "\n".join(failures)
+    batch_path = out_dir / "batch.json"
+    if batch_path.exists() and json.loads(batch_path.read_text()).get("stopped_unsafe") is True:
+        from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
+
+        raise UnsafeCleanupError(
+            f"{reason or 'Target execution stopped because owned cleanup could not be verified.'}\n"
+            "Further onboarding stopped; owned worker cleanup must be verified before another test.\n"
+            f"Report: {report_path if report is not None else 'not written'}\nComplete log: {log_path}"
+        )
     try:
         outcome = _validation_outcome(returncode, output, report)
     except RuntimeError as exc:
