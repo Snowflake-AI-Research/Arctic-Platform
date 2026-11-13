@@ -554,12 +554,41 @@ def _pad_sparse_indices(indices: torch.Tensor, multiple: int = 128) -> torch.Ten
     return F.pad(indices, (0, padded_width - width), value=-1)
 
 
+def _replayed_sparse_indices(
+    pools: torch.Tensor,
+    own: torch.Tensor,
+    global_cu_seqlens: torch.Tensor,
+    query_offset: int,
+    kpool: int,
+) -> torch.Tensor:
+    """``own`` with each query that has replayed pools attending to exactly those pools plus its tail.
+
+    ``pools`` is ``[1, queries, index_topk // kpool]``: the pool ids the sampler's indexer selected for each local query,
+    relative to the query's packed row, ``-1`` where it selected none; a query with no pool id keeps ``own``.
+    """
+    positions = query_offset + torch.arange(pools.shape[1], device=own.device)
+    boundaries = global_cu_seqlens.long()
+    start = boundaries[torch.searchsorted(boundaries, positions, right=True) - 1]
+    seen = positions - start + 1
+    pools = pools[0].to(device=own.device, dtype=torch.long)
+    # A pool counts only once its last token is visible, so a replayed selection stays causal by construction.
+    pools = pools.masked_fill(pools >= torch.div(seen, kpool, rounding_mode="floor")[:, None], -1)
+    offsets = torch.arange(kpool, device=own.device)
+    tokens = torch.where(pools[..., None] >= 0, start[:, None, None] + pools[..., None] * kpool + offsets, -1)
+    tail_count = seen % kpool
+    tail = ((seen - tail_count + start)[:, None] + offsets[:-1]).masked_fill(offsets[:-1] >= tail_count[:, None], -1)
+    replayed = torch.cat([tokens.flatten(1), tail], dim=1)[:, : own.shape[-1]]
+    replayed = F.pad(replayed, (0, own.shape[-1] - replayed.shape[-1]), value=-1).to(own.dtype)
+    return torch.where((pools >= 0).any(-1)[None, :, None], replayed[None], own)
+
+
 def _sparse_attention_forward(
     self,
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor | None,
     past_key_values=None,
     prev_topk_indices: torch.Tensor | None = None,
+    indexer_pools: torch.Tensor | None = None,
     **_kwargs,
 ):
     if past_key_values is not None:
@@ -608,6 +637,14 @@ def _sparse_attention_forward(
             cp_group=self._cp_group,
             cp_rank=self._cp_rank,
         )
+        if indexer_pools is not None:
+            topk_indices = _replayed_sparse_indices(
+                indexer_pools,
+                topk_indices,
+                global_cu_seqlens,
+                self._cp_rank * local_length,
+                self.indexer.index_kpool,
+            )
     elif prev_topk_indices is None:
         raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
     else:
