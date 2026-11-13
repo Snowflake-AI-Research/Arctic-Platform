@@ -57,8 +57,6 @@ from arctic_platform.correctness.harness.sft import build_synthetic_batch as bui
 from arctic_platform.correctness.harness.sft import save
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import require_data_fast_path
-from arctic_platform.debug.training import maybe_bind_reduced_fixture_mtp
-from arctic_platform.model.implementations.debug.determinism import CUBLAS_WORKSPACE
 
 from ..models import validate_local_full_model
 from ..reference.model_features import uses_mixer_packing
@@ -242,6 +240,8 @@ def run_reference(
     # 18.6 GiB reserved but unallocated. Expandable segments return that.
     env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
     if deterministic:
+        from arctic_platform.model.implementations.debug.determinism import CUBLAS_WORKSPACE
+
         # A comparison has to be repeatable to mean anything, so both arms pin every reduction order that can
         # be pinned. The reference decides for itself whether to ask flash attention for a deterministic
         # backward, because only the process holding the kernel can ask it.
@@ -687,6 +687,8 @@ def execute(
 
     def payload_for(arm: ArmSpec) -> dict:
         """One job per case, asking for the optimizer artifacts only when the step check reads them."""
+        from arctic_platform.debug.training import maybe_bind_reduced_fixture_mtp
+
         optimizer_state_output_dir = None
         if stepping and (not isinstance(client_backend, CortexConfig)):
             optimizer_state_output_dir = require_data_fast_path(

@@ -91,8 +91,6 @@ from arctic_platform.correctness.harness.sft import cross_entropy
 from arctic_platform.correctness.harness.sft import reference_answer_logprobs
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import require_data_fast_path
-from arctic_platform.debug.inference import maybe_bind_inference_startup_error
-from arctic_platform.debug.inference import maybe_bind_inference_warmup_observer
 
 from ..harness.config import correctness_microbatch_tokens
 from ..harness.registry import Mismatch
@@ -200,6 +198,9 @@ def _has_routed_experts(ctx) -> bool:
 
 
 def _sampling_payload(ctx, model_path, token_budget: int) -> dict:
+    from arctic_platform.debug.inference import maybe_bind_inference_startup_error
+    from arctic_platform.debug.inference import maybe_bind_inference_warmup_observer
+
     allocation, tensor, pipeline = _sampling_topology(ctx)
     payload = sampling_payload(
         model_path,

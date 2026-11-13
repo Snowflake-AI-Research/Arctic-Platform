@@ -40298,7 +40298,7 @@ def test_rl_checks_rl_checks_use_configured_model_for_tokenizer_and_both_zones(
             collected.append(option)
             return [_rl_checks_trace(generated_samples[i : i + 2]) for i in range(0, len(generated_samples), 2)]
 
-        monkeypatch.setattr(check, "collect_traces", collect)
+        monkeypatch.setattr(router_replay_trace, "collect_traces", collect)
     monkeypatch.setenv(rl_weight_sync.VERIFY_ENV, "test-original")
     result = check._run(ctx)
     assert result.outcome is Outcome.PASS

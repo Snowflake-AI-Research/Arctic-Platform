@@ -74,8 +74,6 @@ from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.sft import TRAIN_SPLIT
 from arctic_platform.correctness.harness.sft import configured_learning_rate
 from arctic_platform.correctness.harness.sft import configured_rows_per_step
-from arctic_platform.debug.weight_sync import TRAINING_OPTION
-from arctic_platform.debug.weight_sync import weight_sync_verification_environment
 
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
@@ -120,6 +118,9 @@ def run(ctx) -> List[TestResult]:
 
 
 def _run(ctx) -> TestResult:
+    from arctic_platform.debug.weight_sync import TRAINING_OPTION
+    from arctic_platform.debug.weight_sync import weight_sync_verification_environment
+
     cfg = ctx.cfg
     model_path = cfg.model_name
     tokenizer = gsm8k.load_tokenizer(model_path)

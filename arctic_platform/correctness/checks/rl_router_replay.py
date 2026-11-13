@@ -65,11 +65,9 @@ from arctic_platform.correctness.harness.gateway import minimum_context_parallel
 from arctic_platform.correctness.harness.gateway import rl_batch
 from arctic_platform.correctness.harness.gateway import rl_fwd_bwd
 from arctic_platform.correctness.harness.gateway import running_rl_client
-from arctic_platform.correctness.harness.inference import collect_traces
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.sft import TRAIN_SPLIT
 from arctic_platform.correctness.harness.sft import configured_rows_per_step
-from arctic_platform.debug.training import TRAINING_OPTION
 
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
@@ -125,6 +123,9 @@ def expects_full_recompute(training_config: dict) -> bool:
 
 
 def _run(ctx) -> TestResult:
+    from arctic_platform.correctness.harness.inference import collect_traces
+    from arctic_platform.debug.training import TRAINING_OPTION
+
     cfg = ctx.cfg
     model_path = cfg.model_name
     tokenizer = gsm8k.load_tokenizer(model_path)
