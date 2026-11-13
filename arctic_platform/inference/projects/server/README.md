@@ -65,6 +65,46 @@ $ python projects/server/pipeline_example.py
 | `GET` | `/status` | GPU allocation and per-model replica status. |
 | `POST` | `/shutdown` | Shut down one or all models. Pass `model_id` query param to shut down a single model. |
 
+### Strict Router Replay
+
+With `enable_return_routed_experts=True`, `/generate` can retain router captures
+across turns. Set `extra_args.dss_router_replay_strict=true` on every turn,
+provide `dss_sample_id`, and use a fresh `rr1:` replay ID for every backend
+attempt. For example, the first turn's sampling parameters are:
+
+```json
+{
+  "max_tokens": 32,
+  "dss_sample_id": "trajectory-1",
+  "dss_router_replay_id": "rr1:attempt-1",
+  "extra_args": {"dss_router_replay_strict": true}
+}
+```
+
+For a continuation, copy `router_replay.replay_id` from the accepted response
+into `extra_args.dss_router_replay_prefix_id`, and copy `router_replay.replica`
+into `extra_args.dss_router_replay_prefix_replica`. Use a new replay ID for the
+continuation. The server routes it to that capture's owner, waits for capacity
+there, and holds the prefix through generation and capture insertion. The
+client must check `router_replay.strict == true` to confirm server support;
+`prefix_len` reports how many earlier capture rows were reused.
+
+Retained captures count toward `router_replay_max_cache_bytes` and resist
+pressure eviction. Release unneeded captures with the existing
+`discard_router_replay` API only after acknowledging the continuation; keeping
+the earlier capture until then permits retries after a lost response. Retention
+expires at `ARCTIC_ROUTER_REPLAY_TX_TTL_S` (24 hours by default; zero disables
+expiry), but expiry cannot evict a prefix already held by an active request.
+
+A missing/expired prefix or unavailable owner returns HTTP 410 instead of
+falling back to freshly computed prefix routes. A full cache returns HTTP 503;
+release unneeded captures or increase capacity before retrying with a new
+attempt ID. Replica/service loss requires restarting or dropping the affected
+trajectory; captures are not replicated. The caller must extend the same token
+prefix as the earlier request. Strict replay applies to `/generate`; prepared
+streaming does not accept router-replay parameters. Requests without the strict
+flag retain best-effort behavior.
+
 ### Multi-Model GPU Sharing
 
 When multiple models are loaded, GPUs are split evenly. Loading a new model automatically scales down existing pools:

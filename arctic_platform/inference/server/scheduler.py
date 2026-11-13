@@ -11,6 +11,10 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 import ray
+from arctic_platform.inference.server.router_replay_request import (
+    RouterReplayPrefixMissingError,
+    strict_replay_options,
+)
 from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
 from arctic_platform.inference.server.token_prompts import is_token_tensor
@@ -58,6 +62,7 @@ class _Request:
     prefix_hash: int | None = None
     routing_key: str | None = None
     strict: bool = False
+    replay_prefix_replica: str | None = None
 
 
 @dataclass
@@ -71,6 +76,7 @@ class WorkerState:
     waiting_reqs: int = 0
     streaming_requests: int = 0
     quarantined: bool = False
+    replay_replica: str | None = None
 
     @property
     def schedulable(self) -> bool:
@@ -350,6 +356,7 @@ class Scheduler:
         if self._stopped:
             raise RuntimeError("Scheduler is stopped")
 
+        _, _, prefix_replica = strict_replay_options(sampling_params)
         self._ensure_background_tasks()
 
         loop = asyncio.get_running_loop()
@@ -368,6 +375,7 @@ class Scheduler:
             prefix_hash=prefix_hash,
             routing_key=routing_key,
             strict=strict,
+            replay_prefix_replica=prefix_replica,
         )
         self._next_id += 1
         asyncio.create_task(self._process_request(req))
@@ -734,7 +742,14 @@ class Scheduler:
                     await self._pause_event.wait()
                     continue
                 route_diagnostics: _RouteDiagnostics | None = None
-                if routing_fn is None:
+                if req.replay_prefix_replica is not None:
+                    idx = next((
+                        i for i, worker in enumerate(self._workers)
+                        if worker.replay_replica == req.replay_prefix_replica and worker.schedulable
+                    ), None)
+                    if idx is None:
+                        raise RouterReplayPrefixMissingError("strict router-replay prefix replica unavailable")
+                elif routing_fn is None:
                     idx = self._group_affinity_routing(req)
                     route_diagnostics = self._last_route_diagnostics
                 else:
@@ -778,6 +793,9 @@ class Scheduler:
 
             try:
                 result = await ws.handle.generate.remote(req.prompt, req.sampling_params)
+                marker = result.get("router_replay") if isinstance(result, dict) else None
+                if isinstance(marker, dict) and isinstance(marker.get("replica"), str):
+                    ws.replay_replica = marker["replica"]
                 if not req.future.done():
                     req.future.set_result(result)
             except asyncio.CancelledError:
@@ -803,7 +821,7 @@ class Scheduler:
         finally:
             if current_task is not None and tracked_worker_idx is not None:
                 self._inflight_tasks[tracked_worker_idx].discard(current_task)
-            if ws is not None:
+            if ws is not None and tracked_worker_idx is not None:
                 ws.active_requests = max(0, ws.active_requests - 1)
             # Record the per-request metric — only if we successfully
             # submitted to a worker. Skipping cancelled / failed requests
