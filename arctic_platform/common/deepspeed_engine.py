@@ -39,17 +39,6 @@ from arctic_platform.model.implementations.fp8 import preserve_fp8_params_throug
 
 logger = logging.getLogger(__name__)
 
-# Qwen3.8-Flash-Next's PLE names its RMSNorms norm_key/norm_query/norm_conv, which "norm.weight" does not match.
-_NO_DECAY = (
-    "bias",
-    "layer_norm.weight",
-    "layernorm.weight",
-    "norm.weight",
-    "ln_f.weight",
-    "norm_key.weight",
-    "norm_query.weight",
-    "norm_conv.weight",
-)
 _OPTIMIZER_ALIASES = {
     "fusedadam": "fused_adam",
     "fused_adam": "fused_adam",
@@ -369,7 +358,7 @@ def cpu_adam_fp32_optimizer_states(ds_config: dict) -> bool:
 def build_training_optimizer(
     model, optimizer: OptimizerSettings, ds_config: dict, *, fused: bool, adam_w_mode: bool = True
 ):
-    """Build AdamW with decay disabled on bias and norm parameters.
+    """Build AdamW with decay disabled on biases and on every 1-D parameter (norm weights, gains, decay rates).
 
     Generic AdamW uses fused implementations unless the model or caller disables
     them. Explicit CPUAdam remains selected regardless of that policy.
@@ -380,16 +369,9 @@ def build_training_optimizer(
             "training_config.ds_config.zero_optimization.offload_optimizer is configured; using optimizer=%r",
             optimizer_name,
         )
-    decay_params = [
-        param
-        for name, param in model.named_parameters()
-        if param.requires_grad and not any(token in name.lower() for token in _NO_DECAY)
-    ]
-    no_decay_params = [
-        param
-        for name, param in model.named_parameters()
-        if param.requires_grad and any(token in name.lower() for token in _NO_DECAY)
-    ]
+    trainable = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+    decay_params = [param for name, param in trainable if param.ndim >= 2 and "bias" not in name.lower()]
+    no_decay_params = [param for name, param in trainable if param.ndim < 2 or "bias" in name.lower()]
     # ZeRO flattens each group into one buffer of its first parameter's dtype, so
     # parameters kept in FP32 through the bf16 cast need groups of their own.
     param_groups = [
