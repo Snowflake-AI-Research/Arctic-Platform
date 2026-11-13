@@ -101,6 +101,16 @@ class ActivationCheckpointConfig(BaseModel):
             "layer until that layer's backward."
         ),
     )
+    core_replay: bool | Literal["attention"] = Field(
+        False,
+        description=(
+            "On a fully checkpointed block, keep the token mixer's core kernel from the forward for the recompute "
+            "instead of running it again (gpu/core_replay.py): FlashAttention-3's output and log-sum-exp, and the "
+            "linear-attention / state-space scans with their saved tensors. Costs those tensors per checkpointed "
+            "layer until that layer's backward. 'attention' keeps FlashAttention only, for when the scans' saved "
+            "tensors do not fit."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_offload_mode(self) -> Self:
@@ -191,9 +201,30 @@ class Patches(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
     liger: bool = Field(False, description="Apply Liger kernels.")
-    gradient_checkpointing: StrictBool | PositiveInt = Field(
+    fused_qk_norm_rope: StrictBool = Field(
         False,
-        description="False disables; True checkpoints every layer; an integer checkpoints every Nth layer.",
+        description=(
+            "Qwen3 / Qwen3-MoE on the huggingface loader: run each attention layer's per-head q_norm / k_norm and"
+            " rotary embedding as one fused kernel per tensor each way."
+        ),
+    )
+    gradient_checkpointing: StrictBool | PositiveInt | list[NonNegativeInt] = Field(
+        False,
+        description=(
+            "False disables; True checkpoints every layer; an integer checkpoints every Nth layer; a list of layer"
+            " indices checkpoints exactly those layers."
+        ),
+    )
+    checkpoint_keep_attention: StrictBool | list[str] = Field(
+        False,
+        description=(
+            "With gradient_checkpointing, keep each checkpointed layer's attention-kernel outputs (the attention"
+            " output and its log-sum-exp) from the forward pass, so the backward recompute runs everything in the"
+            " layer except the attention kernel. Costs one attention output per checkpointed layer. True keeps every"
+            " known attention kernel (FlashAttention 3 / 2, SDPA's kernels, and ops registered with"
+            " register_attention_kernel_op); a list of op names ('namespace::name' or 'namespace::name.overload')"
+            " keeps only those kernels and recomputes the others."
+        ),
     )
     activation_offload: ActivationOffloadPatch | None = Field(
         None, description="CPU offload for activations saved by checkpointed layers."
@@ -203,6 +234,13 @@ class Patches(BaseModel):
     lm_head: LmHeadPatch | None = Field(None, description="LM-head precision and chunking.")
     zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
     peft: dict | None = Field(None, description="PEFT config; wrap after other patches, before the optimizer.")
+    fused_lora_linear: StrictBool = Field(
+        False,
+        description=(
+            "With a LoRA peft config, add each LoRA linear's low-rank update to the base output inside the lora_B"
+            " GEMM (one addmm) instead of PEFT's separate scale and add."
+        ),
+    )
 
     dense_shard: StrictBool | PositiveInt = Field(
         False,
@@ -217,9 +255,19 @@ class Patches(BaseModel):
 
     @model_validator(mode="after")
     def _validate_patch_combinations(self) -> Self:
+        if isinstance(self.gradient_checkpointing, list) and len(set(self.gradient_checkpointing)) != len(
+            self.gradient_checkpointing
+        ):
+            raise ValueError(f"gradient_checkpointing lists a layer twice: {self.gradient_checkpointing}")
         if self.activation_offload is not None:
             if self.gradient_checkpointing is False:
                 raise ValueError("activation_offload requires gradient_checkpointing")
+        if self.checkpoint_keep_attention and self.gradient_checkpointing is False:
+            raise ValueError("checkpoint_keep_attention requires gradient_checkpointing")
+        if isinstance(self.checkpoint_keep_attention, list) and not self.checkpoint_keep_attention:
+            raise ValueError("checkpoint_keep_attention lists no op; use false to keep none")
+        if self.fused_lora_linear and self.peft is None:
+            raise ValueError("fused_lora_linear requires a peft config")
         if self.dense_shard and self.peft is not None:
             raise ValueError("dense_shard shards trainable weights for full fine-tuning; it does not support PEFT")
         if self.dense_shard and self.tiled_mlp is not None:
