@@ -556,15 +556,7 @@ def verdict(
     )
 
 
-@correctness_test(
-    TEST_ID,
-    title="Training and validation loss agreement over a 100-step SFT run replayed in Arctic Platform",
-    criterion=(
-        "the final training loss and the held-out validation loss of a 100-step SFT run agree between "
-        "Arctic Platform and the single-GPU Hugging Face reference on the same replayed batches; the whole per-step "
-        "trajectory is recorded and reported as a diagnostic"
-    ),
-)
+@correctness_test(TEST_ID)
 def run(ctx) -> List[TestResult]:
     """Prepare HF explicitly, or run one target job against a validated compact reference.
 

@@ -250,16 +250,7 @@ def _cortex_sampling_parallelism(ctx) -> dict:
     return {"inference_tensor_parallel_size": _sampling_topology(ctx)[1]}
 
 
-@correctness_test(
-    TEST_ID,
-    title="Validation loss agreement between the training zone and a sampling zone on its checkpoint",
-    criterion=(
-        "the answer-token cross entropy of a held-out GSM8K batch agrees between the training zone that "
-        "trained the weights and a sampling zone serving the checkpoint it saved, within 3e-3 on "
-        "B200 and 1e-3 on other GPU families"
-    ),
-    compares_to_reference=False,
-)
+@correctness_test(TEST_ID)
 def run(ctx) -> List[TestResult]:
     """One gateway, one training job, one sampling job. The check owns all three."""
     try:
