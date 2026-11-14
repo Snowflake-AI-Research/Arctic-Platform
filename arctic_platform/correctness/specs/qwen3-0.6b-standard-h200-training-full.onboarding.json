@@ -1,0 +1,15 @@
+{
+  "combined_reference_elapsed_seconds": null,
+  "combined_reference_error": null,
+  "config": "/code/users/stas/github/sf/stas-dss-repro/arctic-platform-correctness-testing/arctic_platform/correctness/configs/qwen3-0.6b/standard/h200-training-full.json",
+  "config_id": "qwen3-0.6b-standard-h200-training-full",
+  "results": {
+    "single-step-grads": {
+      "elapsed_seconds": 320.4833592623472,
+      "exit_code": 0,
+      "output_dir": "/data-fast/tmp/catalog-onboarding-BvocnTI7/config-onboarding-zrqbxk_p/single-step-grads",
+      "status": "onboarded"
+    }
+  },
+  "test_spec": "/code/users/stas/github/sf/stas-dss-repro/arctic-platform-correctness-testing/arctic_platform/correctness/specs/qwen3-0.6b-standard-h200-training-full.json"
+}

@@ -182,9 +182,11 @@ onboarding_reports/
 
 # Local correctness measurements and execution state; recipes and references are selected separately.
 /work/
-/.correctness-tmp/
-/.codex-run-state/
-/.agent-work/
 /correctness-progress.md
+/.correctness-tmp/
+/.agent-work/
+/.codex-run-state/
+/correctness-backup/
+/.onprem-cleanup-backup/
 /local-correctness-records/
 /arctic_platform/correctness/specs/

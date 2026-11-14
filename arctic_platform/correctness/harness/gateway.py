@@ -303,6 +303,7 @@ def local_cortex_gateway(
     if gateway_module not in (
         "dss.ray_dss.gateway_server",
         "arctic_platform.correctness.harness.gateway",
+        "arctic_platform.debug.training",
     ):
         raise ValueError("unsupported correctness gateway module")
     if allocation_members is not None and gateway_module != "arctic_platform.correctness.harness.gateway":
@@ -1261,6 +1262,32 @@ def _training_client_config(session: GatewaySession, payload: dict) -> ArcticCli
     )
 
 
+def _inference_client_config(
+    payload: dict, *, backend: OnPremConfig | CortexConfig | None = None
+) -> ArcticClientConfig:
+    inf = deepcopy(payload.get("inference_config") or {})
+    n_gpus = int(inf.pop("n_gpus"))
+    max_seq_len = int(inf.pop("max_seq_len", 8192))
+    vllm = deepcopy(inf.pop("vllm_config", {}))
+    vllm.setdefault("max_model_len", max_seq_len)
+    job_type = payload.get("job_type")
+    config = ReviewedClientConfig(
+        model_name=payload["model_name"],
+        seed=payload.get("seed"),
+        dtype=payload.get("dtype"),
+        max_seq_len=max_seq_len,
+        sampling_gpus=n_gpus if job_type == "sampling" else 0,
+        log_prob_gpus=n_gpus if job_type == "log_prob" else 0,
+        sampling=ReviewedSamplingConfig(
+            weight_format=payload.get("weight_format"),
+            vllm=vllm,
+            arctic_inference_config=inf or None,
+        ),
+        backend=backend if backend is not None else OnPremConfig(),
+    )
+    return CortexTrainingConfig.from_reviewed(config) if isinstance(config.backend, CortexConfig) else config
+
+
 @contextlib.contextmanager
 def running_job(session: GatewaySession, payload: dict) -> Iterator[ArcticJob]:
     job_type = str(payload.get("job_type", "training"))
@@ -1488,6 +1515,12 @@ def pack(
     )
 
 
+def pack_logit_aligned(batch) -> dict:
+    body = _batch_body(batch, batch.shifted_labels(), labels_are_shifted=True)
+    body["processing"]["return_logprobs"] = True
+    return body
+
+
 def _scalar(value: Any) -> float:
     if isinstance(value, (list, tuple)):
         value = value[0]
@@ -1560,6 +1593,58 @@ def fwd_bwd_step(session: GatewaySession, job: ArcticJob, body: dict, learning_r
         ),
         participation=stepped.get("participation") or step_metrics.get("participation"),
     )
+
+
+def sampling_payload(model_dir: str | Path, seed: int, *, dtype: str, n_gpus: int, max_seq_len: int) -> dict:
+    return {
+        "model_name": str(model_dir),
+        "job_type": "log_prob",
+        "dtype": dtype,
+        "seed": seed,
+        "inference_config": {
+            "n_gpus": n_gpus,
+            "max_seq_len": max_seq_len,
+            "vllm_config": {
+                "tensor_parallel_size": n_gpus,
+                "max_model_len": max_seq_len,
+                "trust_remote_code": True,
+                "gpu_memory_utilization": 0.85,
+                "extra_engine_kwargs": {
+                    "dtype": dtype,
+                    "disable_custom_all_reduce": True,
+                    "enforce_eager": True,
+                },
+            },
+        },
+    }
+
+
+def log_probs(
+    session: GatewaySession,
+    job: ArcticJob,
+    prompts: List[str],
+    completions: List[str],
+    *,
+    top_k: int,
+) -> List[dict]:
+    response = job.client._call(log_probs_request(job.client.jobs, prompts, completions, top_k))
+    results = response["results"]
+    if len(results) != len(prompts):
+        raise RuntimeError(f"log-probs returned {len(results)} results for {len(prompts)} prompts")
+    return list(results)
+
+
+def forward_logprobs(session: GatewaySession, job: ArcticJob, body: dict):
+    import torch
+
+    response = job.client.fwd_no_grad(training_body(job, body))
+    if "logprobs" not in response:
+        metrics = response.get("metrics") or {}
+        if "logprobs" in metrics:
+            response = metrics
+        else:
+            raise RuntimeError(f"forward response carries no logprobs: {sorted(response)}")
+    return torch.as_tensor(response["logprobs"], dtype=torch.float32)
 
 
 @dataclass
@@ -1649,6 +1734,206 @@ class GatewayTransport:
             if resume_from is not None:
                 job.client.load_checkpoint(path=resume_from.reference)
             yield GatewayTrainingJob(self.session, job)
+
+
+def sub_job_of_type(cfg, job_type: str) -> dict:
+    matches = [sub for sub in cfg.sub_jobs if sub.get("job_type") == job_type]
+    if len(matches) != 1:
+        raise ValueError(f"{cfg.config_id}: expected one {job_type} sub-job, found {len(matches)}")
+    return matches[0]
+
+
+def rl_gpu_count(cfg) -> int:
+    """GPUs the two sub-jobs need at once: each takes its own devices, so the count is the sum."""
+    sampling = int(sub_job_of_type(cfg, "sampling")["inference_config"]["n_gpus"])
+    return int(cfg.n_gpus) + sampling
+
+
+@contextlib.contextmanager
+def running_rl_client(
+    cfg,
+    training_payload: dict,
+    model_path: str,
+    workdir: Path,
+    *,
+    backend: OnPremConfig | CortexConfig | None = None,
+    weight_sync_verification: bool = False,
+    router_replay_verification: bool = False,
+) -> Iterator[ArcticClient]:
+    """Create one native client whose training and sampling jobs share the reviewed config."""
+    from arctic_platform.debug.training import maybe_configure_router_replay_sampling
+    from arctic_platform.debug.weight_sync import maybe_configure_broadcast_sampling
+
+    if cfg.native is None:
+        raise ValueError(f"{cfg.config_id}: native ArcticClientConfig is required")
+    session = GatewaySession(
+        Path(workdir),
+        rl_gpu_count(cfg),
+        backend if backend is not None else OnPremConfig(),
+    )
+    payload = dict(training_payload)
+    payload.setdefault("weight_format", getattr(cfg.native.training, "weight_format", None))
+    training_only = _training_client_config(session, payload)
+    updates = {
+        "model_name": str(model_path),
+        "training": training_only.training,
+        "backend": training_only.backend,
+    }
+    updates["sampling"] = maybe_configure_broadcast_sampling(cfg.native.sampling, verify=weight_sync_verification)
+    updates["sampling"] = maybe_configure_router_replay_sampling(
+        updates["sampling"], verify=router_replay_verification
+    )
+    if isinstance(session.backend, CortexConfig):
+        native = CortexTrainingConfig.from_reviewed(cfg.native, **updates)
+    else:
+        native = ReviewedClientConfig.model_validate(
+            {
+                **cfg.native.model_dump(),
+                **updates,
+                "training": training_only.training.model_dump(),
+            }
+        )
+        native.to_onprem("training")
+        native.to_onprem("sampling")
+    client = RLClient(native)
+    try:
+        training_replay = (native.training.ds_worker_config or {}).get("router_replay") or {}
+        sampling_replay = (native.sampling.arctic_inference_config or {}).get("router_replay") or {}
+        if training_replay.get("enabled") and sampling_replay.get("enabled"):
+            client.bootstrap_router_replay(max_cache_bytes=training_replay.get("max_cache_bytes"))
+        yield client
+    finally:
+        workload = sys.exc_info()
+        try:
+            client.__exit__(*workload)
+        except UnsafeCleanupError:
+            raise
+        except Exception as exc:
+            cleanup = UnsafeCleanupError(
+                "RL client shutdown failed; inspect owned resources before retrying", shutdown_error=exc
+            )
+            if workload[1] is not None:
+                cleanup.preserve_workload(workload[1])
+            raise cleanup from exc
+
+
+def generate(client: RLClient, prompts: Sequence[Sequence[int]], sampling_params: Sequence[dict]) -> List[dict]:
+    """Generate one result per prompt, preserving each row's sampling parameters."""
+    results = client.generate(
+        [list(prompt) for prompt in prompts],
+        [dict(params) for params in sampling_params],
+    )
+    if not isinstance(results, list) or len(results) != len(prompts):
+        raise RuntimeError(f"generate returned {type(results).__name__} for {len(prompts)} prompts")
+    return results
+
+
+def sync_weights(client: RLClient) -> dict:
+    """Sync the native client's training job into its sampling job."""
+    return client.sync_weights()
+
+
+def rl_fwd_bwd(client: RLClient, batch: dict, *, replay_sampling: bool = False) -> dict:
+    """Run one RL forward-backward, optionally carrying the sampler identity for router replay."""
+    replay = None
+    if replay_sampling:
+        replay = {"sampling_job_id": str(client.jobs.sampling), "identity_version": 1}
+    return client.fwd_bwd(batch, router_replay=replay)
+
+
+def step(client: RLClient, learning_rate: float) -> dict:
+    return client.step(learning_rate)
+
+
+def minimum_context_parallel_row_tokens(cfg, model_path: str) -> int:
+    """Read PLE's required shard context from the effective Flash-Next model, including reduced fixtures."""
+    if (
+        getattr(cfg, "config_id", None)
+        not in (
+            "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k",
+            "qwen3.8-flash-next-h200-train-rl-32gpus-sp16-256k",
+        )
+        or cfg.training.get("model_provider") != "prime_rl"
+        or cfg.sp_size <= 1
+    ):
+        return 0
+    from transformers import AutoConfig
+
+    source = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    text = getattr(source, "text_config", source)
+    if (
+        source.model_type not in ("qwen4_exp", "qwen4_exp_text")
+        or text.model_type != "qwen4_exp_text"
+        or type(text.num_hidden_layers) is not int
+        or text.num_hidden_layers <= 0
+    ):
+        raise ValueError("context-parallel Flash-Next requires a qwen4_exp_text configuration with positive layers")
+    ngram = getattr(text, "ngram_size", None)
+    kernel = getattr(text, "ple_conv_kernel_size", None)
+    if any(type(value) is not int or value <= 0 for value in (ngram, kernel)):
+        raise ValueError("context-parallel Flash-Next requires positive integer PLE ngram and convolution sizes")
+    return cfg.sp_size * max(ngram - 1, (kernel - 1) * ngram)
+
+
+def rl_batch(
+    rows: Sequence[Sequence[int]],
+    loss_starts: Sequence[int],
+    pad_id: int,
+    *,
+    minimum_row_tokens: int = 0,
+) -> Dict:
+    """Right-padded RL batch in the format ``tests/sp/sp_gateway_harness.py:padded_rl_batch`` sends.
+
+    ``loss_mask`` is logit aligned: the entry at ``s`` weights the prediction of the token at ``s + 1``, so a
+    row whose scored tokens begin at ``p`` carries ones over ``p - 1`` through ``len(row) - 2``.
+    A minimum row length adds attention-active, loss-free causal tails so packing retains the shard context.
+    """
+    import torch
+
+    if type(minimum_row_tokens) is not int or minimum_row_tokens < 0:
+        raise ValueError("minimum_row_tokens must be a nonnegative integer")
+    width = max(minimum_row_tokens, max(len(row) for row in rows))
+    count = len(rows)
+    input_ids = torch.full((count, width), int(pad_id), dtype=torch.long)
+    attention_mask = torch.zeros(count, width, dtype=torch.long)
+    loss_mask = torch.zeros(count, width, dtype=torch.float32)
+    for index, (row, start) in enumerate(zip(rows, loss_starts, strict=True)):
+        input_ids[index, : len(row)] = torch.tensor(list(row), dtype=torch.long)
+        attention_mask[index, : max(len(row), minimum_row_tokens)] = 1
+        loss_mask[index, start - 1 : len(row) - 1] = 1.0
+    return {
+        "args": (),
+        "kwargs": {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        },
+        "context": {
+            "input_ids": input_ids.clone(),
+            "advantages": torch.ones(count, width, dtype=torch.float32),
+            "loss_mask": loss_mask,
+            "temperature": 1.0,
+        },
+        "processing": {
+            "post": ["compute_logprobs"],
+            "loss_fn": "grpo",
+            "config": {"loss_agg_mode": "token-mean"},
+        },
+    }
+
+
+def find_key(value, key: str) -> List:
+    """Every value stored under ``key`` anywhere in a nested response, in traversal order."""
+    found: List = []
+    if isinstance(value, dict):
+        for name, item in value.items():
+            if name == key:
+                found.append(item)
+            else:
+                found.extend(find_key(item, key))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found.extend(find_key(item, key))
+    return found
 
 
 # Hosted
@@ -1758,6 +2043,8 @@ def training_client_config(
     published_fixture: dict | None = None,
 ):
     """Build reviewed training, optionally retaining the native RL sampling placement."""
+    from arctic_platform.debug.training import maybe_bind_reduced_fixture_mtp
+
     if preserve_native_topology and (not cfg.is_rl or cfg.native is None):
         raise ValueError("native checkpoint topology requires a reviewed RL configuration")
     payload = build_payload(
@@ -1773,7 +2060,7 @@ def training_client_config(
     payload["hardware"] = cfg.gpu_type.upper() if cfg.gpu_type is not None else None
     if "weight_format" in cfg.sub_job:
         payload["weight_format"] = cfg.sub_job["weight_format"]
-    validate_reduced_fixture_support(payload, spec, published_fixture)
+    maybe_bind_reduced_fixture_mtp(payload, spec, published_fixture)
     client_config = _training_client_config(GatewaySession(Path("."), cfg.n_gpus, backend), payload)
     if preserve_native_topology:
         from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
@@ -1793,95 +2080,6 @@ def training_client_config(
             }
         )
     return client_config
-
-
-def validate_reduced_fixture_support(payload: dict, spec: TestSpec | None, published_fixture: dict | None) -> None:
-    """Admit reviewed fixtures without asking unchanged native loaders to ignore missing prediction weights."""
-    training = payload["training_config"]
-    prime = training.get("prime_rl") or {}
-    if not isinstance(prime, dict):
-        raise ValueError("prime_rl must be a configuration object")
-    options = prime.get("debug") or {}
-    if not isinstance(options, dict):
-        raise ValueError("prime_rl.debug must be a configuration object")
-    if "reduced_fixture_mtp" in options:
-        raise ValueError("reduced fixture MTP descriptors require unavailable native loader hooks")
-    if published_fixture is None or training.get("model_provider") != "prime_rl":
-        return
-    if spec is None:
-        raise ValueError("published fixture requires its reviewed spec")
-    if type(spec.model.seed) is not int or spec.model.seed != 0:
-        return
-    if (
-        published_fixture.get("schema_version") != 1
-        or published_fixture.get("config_id") != spec.config_id
-        or published_fixture.get("reference_path") != spec.model.cache_path
-        or published_fixture.get("reviewed_hash") != spec.model.content_hash
-        or published_fixture.get("model_name") != payload["model_name"]
-    ):
-        raise ValueError("reduced fixture does not match the reviewed spec and native model")
-    files = published_fixture.get("files")
-    if not isinstance(files, list) or not files or any(not isinstance(row, dict) for row in files):
-        raise ValueError("published fixture requires its bound file inventory")
-    names = [row.get("path") for row in files]
-    if any(not isinstance(name, str) for name in names) or names != sorted(set(names)):
-        raise ValueError("published fixture file inventory is invalid")
-    digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    if digest != published_fixture.get("fixture_sha256"):
-        raise ValueError("published fixture inventory digest differs")
-    config_row = next((row for row in files if row["path"] == "config.json"), None)
-    if (
-        config_row is None
-        or type(config_row.get("size_bytes")) is not int
-        or not 0 < config_row["size_bytes"] <= 16 << 20
-        or not isinstance(config_row.get("sha256"), str)
-        or re.fullmatch("[0-9a-f]{64}", config_row["sha256"]) is None
-    ):
-        raise ValueError("published fixture has no valid config binding")
-    path = Path(spec.model.cache_path) / "config.json"
-    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC), "rb") as stream:
-        metadata = os.fstat(stream.fileno())
-        fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
-        identity = tuple(getattr(metadata, name) for name in fields)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != config_row["size_bytes"]:
-            raise ValueError("fixture config size or file type differs")
-        raw = stream.read((16 << 20) + 1)
-        if (
-            hashlib.sha256(raw).hexdigest() != config_row["sha256"]
-            or tuple(getattr(os.fstat(stream.fileno()), name) for name in fields) != identity
-            or tuple(getattr(path.stat(), name) for name in fields) != identity
-        ):
-            raise ValueError("fixture config bytes or file identity differ")
-    config = json.loads(raw, object_pairs_hook=_fixture_config_object)
-    text = config.get("text_config", config) if isinstance(config, dict) else None
-    if (
-        not isinstance(text, dict)
-        or type(text.get("num_hidden_layers")) is not int
-        or text["num_hidden_layers"] != spec.model.num_hidden_layers
-    ):
-        raise ValueError("fixture text configuration or reduced depth differs")
-    model_type = text.get("model_type")
-    if model_type in {"qwen3_5_moe_text", "qwen4_exp_text", "glm5_next_text"}:
-        count_name = "num_nextn_predict_layers" if model_type == "glm5_next_text" else "mtp_num_hidden_layers"
-        count = text.get(count_name, 0)
-        if type(count) is not int or count < 0:
-            raise ValueError(f"fixture {count_name} must be a nonnegative integer")
-        if count == 0:
-            return
-        raise ValueError(
-            f"Reduced pretrained prime_rl fixture {model_type} with {count_name}={count} requires native"
-            " prediction-weight loading and authentication unavailable on unchanged main; this correctness-only"
-            " package cannot authorize omitted MTP weights"
-        )
-
-
-def _fixture_config_object(pairs: list[tuple[str, Any]]) -> dict:
-    result = {}
-    for name, value in pairs:
-        if name in result:
-            raise ValueError(f"fixture config has a duplicate key: {name}")
-        result[name] = value
-    return result
 
 
 def save_and_resolve_checkpoint_id(client: ArcticClient, job_id: str, checkpoint_type: str) -> str:
@@ -2250,6 +2448,15 @@ def install_checkpoint_routes(gw, store) -> None:
                 no_keepalive=True,
             )
             tag, version = _metadata(result, child=job_id, path=str(root))
+            ep_size = binding["config"]["training_config"].get("ep_size")
+            if ep_size is not None and 1 < ep_size < binding["num_gpus"]:
+                await asyncio.to_thread(
+                    store.materialize_expert_replicas,
+                    retained,
+                    tag,
+                    [node["host"] for node in binding["nodes"]],
+                    ep_size,
+                )
             await asyncio.to_thread(store.verify, retained)
             checkpoint_id = f"cp_{uuid4().hex}"
             checkpoints[checkpoint_id] = _SavedCheckpoint(
@@ -2344,12 +2551,100 @@ def main() -> None:
     store = NativeCheckpointStore(Path(hostfiles[0]))
     install_checkpoint_routes(gateway_server, store)
     install_gateway_route(gateway_server)
-    with gateway_scope(gateway_server), gateway_runtime_scope(gateway_server, Path(hostfiles[0]), first_two_only=True):
+    with (
+        gateway_scope(gateway_server),
+        gateway_runtime_scope(gateway_server, Path(hostfiles[0]), first_two_only=True, local_fixture_e2e=True),
+    ):
         gateway_server.main()
 
 
-if __name__ == "__main__":
-    main()
+def validate_reduced_fixture_support(payload: dict, spec: TestSpec | None, published_fixture: dict | None) -> None:
+    """Admit reviewed fixtures without asking unchanged native loaders to ignore missing prediction weights."""
+    training = payload["training_config"]
+    prime = training.get("prime_rl") or {}
+    if not isinstance(prime, dict):
+        raise ValueError("prime_rl must be a configuration object")
+    options = prime.get("debug") or {}
+    if not isinstance(options, dict):
+        raise ValueError("prime_rl.debug must be a configuration object")
+    if "reduced_fixture_mtp" in options:
+        raise ValueError("reduced fixture MTP descriptors require unavailable native loader hooks")
+    if published_fixture is None or training.get("model_provider") != "prime_rl":
+        return
+    if spec is None:
+        raise ValueError("published fixture requires its reviewed spec")
+    if type(spec.model.seed) is not int or spec.model.seed != 0:
+        return
+    if (
+        published_fixture.get("schema_version") != 1
+        or published_fixture.get("config_id") != spec.config_id
+        or published_fixture.get("reference_path") != spec.model.cache_path
+        or published_fixture.get("reviewed_hash") != spec.model.content_hash
+        or published_fixture.get("model_name") != payload["model_name"]
+    ):
+        raise ValueError("reduced fixture does not match the reviewed spec and native model")
+    files = published_fixture.get("files")
+    if not isinstance(files, list) or not files or any(not isinstance(row, dict) for row in files):
+        raise ValueError("published fixture requires its bound file inventory")
+    names = [row.get("path") for row in files]
+    if any(not isinstance(name, str) for name in names) or names != sorted(set(names)):
+        raise ValueError("published fixture file inventory is invalid")
+    digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if digest != published_fixture.get("fixture_sha256"):
+        raise ValueError("published fixture inventory digest differs")
+    config_row = next((row for row in files if row["path"] == "config.json"), None)
+    if (
+        config_row is None
+        or type(config_row.get("size_bytes")) is not int
+        or not 0 < config_row["size_bytes"] <= 16 << 20
+        or not isinstance(config_row.get("sha256"), str)
+        or re.fullmatch("[0-9a-f]{64}", config_row["sha256"]) is None
+    ):
+        raise ValueError("published fixture has no valid config binding")
+    path = Path(spec.model.cache_path) / "config.json"
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC), "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        identity = tuple(getattr(metadata, name) for name in fields)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != config_row["size_bytes"]:
+            raise ValueError("fixture config size or file type differs")
+        raw = stream.read((16 << 20) + 1)
+        if (
+            hashlib.sha256(raw).hexdigest() != config_row["sha256"]
+            or tuple(getattr(os.fstat(stream.fileno()), name) for name in fields) != identity
+            or tuple(getattr(path.stat(), name) for name in fields) != identity
+        ):
+            raise ValueError("fixture config bytes or file identity differ")
+    config = json.loads(raw, object_pairs_hook=_fixture_config_object)
+    text = config.get("text_config", config) if isinstance(config, dict) else None
+    if (
+        not isinstance(text, dict)
+        or type(text.get("num_hidden_layers")) is not int
+        or text["num_hidden_layers"] != spec.model.num_hidden_layers
+    ):
+        raise ValueError("fixture text configuration or reduced depth differs")
+    model_type = text.get("model_type")
+    if model_type in {"qwen3_5_moe_text", "qwen4_exp_text", "glm5_next_text"}:
+        count_name = "num_nextn_predict_layers" if model_type == "glm5_next_text" else "mtp_num_hidden_layers"
+        count = text.get(count_name, 0)
+        if type(count) is not int or count < 0:
+            raise ValueError(f"fixture {count_name} must be a nonnegative integer")
+        if count == 0:
+            return
+        raise ValueError(
+            f"Reduced pretrained prime_rl fixture {model_type} with {count_name}={count} requires native"
+            " prediction-weight loading and authentication unavailable on unchanged main; this correctness-only"
+            " package cannot authorize omitted MTP weights"
+        )
+
+
+def _fixture_config_object(pairs: list[tuple[str, Any]]) -> dict:
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError(f"fixture config has a duplicate key: {name}")
+        result[name] = value
+    return result
 
 
 def ap_driver_copy_checkpoint_peft_adapter(checkpoint_root: Path, destination: Path) -> Path:
@@ -2378,285 +2673,5 @@ def ap_driver_copy_checkpoint_peft_adapter(checkpoint_root: Path, destination: P
     return destination
 
 
-def _inference_client_config(
-    payload: dict, *, backend: OnPremConfig | CortexConfig | None = None
-) -> ArcticClientConfig:
-    inf = deepcopy(payload.get("inference_config") or {})
-    n_gpus = int(inf.pop("n_gpus"))
-    max_seq_len = int(inf.pop("max_seq_len", 8192))
-    vllm = deepcopy(inf.pop("vllm_config", {}))
-    vllm.setdefault("max_model_len", max_seq_len)
-    job_type = payload.get("job_type")
-    config = ReviewedClientConfig(
-        model_name=payload["model_name"],
-        seed=payload.get("seed"),
-        dtype=payload.get("dtype"),
-        max_seq_len=max_seq_len,
-        sampling_gpus=n_gpus if job_type == "sampling" else 0,
-        log_prob_gpus=n_gpus if job_type == "log_prob" else 0,
-        sampling=ReviewedSamplingConfig(
-            weight_format=payload.get("weight_format"),
-            vllm=vllm,
-            arctic_inference_config=inf or None,
-        ),
-        backend=backend if backend is not None else OnPremConfig(),
-    )
-    return CortexTrainingConfig.from_reviewed(config) if isinstance(config.backend, CortexConfig) else config
-
-
-def pack_logit_aligned(batch) -> dict:
-    body = _batch_body(batch, batch.shifted_labels(), labels_are_shifted=True)
-    body["processing"]["return_logprobs"] = True
-    return body
-
-
-def sampling_payload(model_dir: str | Path, seed: int, *, dtype: str, n_gpus: int, max_seq_len: int) -> dict:
-    return {
-        "model_name": str(model_dir),
-        "job_type": "log_prob",
-        "dtype": dtype,
-        "seed": seed,
-        "inference_config": {
-            "n_gpus": n_gpus,
-            "max_seq_len": max_seq_len,
-            "vllm_config": {
-                "tensor_parallel_size": n_gpus,
-                "max_model_len": max_seq_len,
-                "trust_remote_code": True,
-                "gpu_memory_utilization": 0.85,
-                "extra_engine_kwargs": {
-                    "dtype": dtype,
-                    "disable_custom_all_reduce": True,
-                    "enforce_eager": True,
-                },
-            },
-        },
-    }
-
-
-def log_probs(
-    session: GatewaySession,
-    job: ArcticJob,
-    prompts: List[str],
-    completions: List[str],
-    *,
-    top_k: int,
-) -> List[dict]:
-    response = job.client._call(log_probs_request(job.client.jobs, prompts, completions, top_k))
-    results = response["results"]
-    if len(results) != len(prompts):
-        raise RuntimeError(f"log-probs returned {len(results)} results for {len(prompts)} prompts")
-    return list(results)
-
-
-def forward_logprobs(session: GatewaySession, job: ArcticJob, body: dict):
-    import torch
-
-    response = job.client.fwd_no_grad(training_body(job, body))
-    if "logprobs" not in response:
-        metrics = response.get("metrics") or {}
-        if "logprobs" in metrics:
-            response = metrics
-        else:
-            raise RuntimeError(f"forward response carries no logprobs: {sorted(response)}")
-    return torch.as_tensor(response["logprobs"], dtype=torch.float32)
-
-
-def minimum_context_parallel_row_tokens(cfg, model_path: str) -> int:
-    """Read PLE's required shard context from the effective Flash-Next model, including reduced fixtures."""
-    if (
-        getattr(cfg, "config_id", None)
-        not in (
-            "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k",
-            "qwen3.8-flash-next-h200-train-rl-32gpus-sp16-256k",
-        )
-        or cfg.training.get("model_provider") != "prime_rl"
-        or cfg.sp_size <= 1
-    ):
-        return 0
-    from transformers import AutoConfig
-
-    source = AutoConfig.from_pretrained(model_path, local_files_only=True)
-    text = getattr(source, "text_config", source)
-    if (
-        source.model_type not in ("qwen4_exp", "qwen4_exp_text")
-        or text.model_type != "qwen4_exp_text"
-        or type(text.num_hidden_layers) is not int
-        or text.num_hidden_layers <= 0
-    ):
-        raise ValueError("context-parallel Flash-Next requires a qwen4_exp_text configuration with positive layers")
-    ngram = getattr(text, "ngram_size", None)
-    kernel = getattr(text, "ple_conv_kernel_size", None)
-    if any(type(value) is not int or value <= 0 for value in (ngram, kernel)):
-        raise ValueError("context-parallel Flash-Next requires positive integer PLE ngram and convolution sizes")
-    return cfg.sp_size * max(ngram - 1, (kernel - 1) * ngram)
-
-
-def sub_job_of_type(cfg, job_type: str) -> dict:
-    matches = [sub for sub in cfg.sub_jobs if sub.get("job_type") == job_type]
-    if len(matches) != 1:
-        raise ValueError(f"{cfg.config_id}: expected one {job_type} sub-job, found {len(matches)}")
-    return matches[0]
-
-
-def rl_gpu_count(cfg) -> int:
-    """GPUs the two sub-jobs need at once: each takes its own devices, so the count is the sum."""
-    sampling = int(sub_job_of_type(cfg, "sampling")["inference_config"]["n_gpus"])
-    return int(cfg.n_gpus) + sampling
-
-
-@contextlib.contextmanager
-def running_rl_client(
-    cfg,
-    training_payload: dict,
-    model_path: str,
-    workdir: Path,
-    *,
-    backend: OnPremConfig | CortexConfig | None = None,
-    weight_sync_verification: bool = False,
-    router_replay_verification: bool = False,
-) -> Iterator[ArcticClient]:
-    """Create one native client whose training and sampling jobs share the reviewed config."""
-    from arctic_platform.debug.training import maybe_configure_router_replay_sampling
-    from arctic_platform.debug.weight_sync import maybe_configure_broadcast_sampling
-
-    if cfg.native is None:
-        raise ValueError(f"{cfg.config_id}: native ArcticClientConfig is required")
-    session = GatewaySession(
-        Path(workdir),
-        rl_gpu_count(cfg),
-        backend if backend is not None else OnPremConfig(),
-    )
-    payload = dict(training_payload)
-    payload.setdefault("weight_format", getattr(cfg.native.training, "weight_format", None))
-    training_only = _training_client_config(session, payload)
-    updates = {
-        "model_name": str(model_path),
-        "training": training_only.training,
-        "backend": training_only.backend,
-    }
-    updates["sampling"] = maybe_configure_broadcast_sampling(cfg.native.sampling, verify=weight_sync_verification)
-    updates["sampling"] = maybe_configure_router_replay_sampling(
-        updates["sampling"], verify=router_replay_verification
-    )
-    if isinstance(session.backend, CortexConfig):
-        native = CortexTrainingConfig.from_reviewed(cfg.native, **updates)
-    else:
-        native = ReviewedClientConfig.model_validate(
-            {
-                **cfg.native.model_dump(),
-                **updates,
-                "training": training_only.training.model_dump(),
-            }
-        )
-        native.to_onprem("training")
-        native.to_onprem("sampling")
-    client = RLClient(native)
-    try:
-        training_replay = (native.training.ds_worker_config or {}).get("router_replay") or {}
-        sampling_replay = (native.sampling.arctic_inference_config or {}).get("router_replay") or {}
-        if training_replay.get("enabled") and sampling_replay.get("enabled"):
-            client.bootstrap_router_replay(max_cache_bytes=training_replay.get("max_cache_bytes"))
-        yield client
-    finally:
-        workload = sys.exc_info()
-        try:
-            client.__exit__(*workload)
-        except UnsafeCleanupError:
-            raise
-        except Exception as exc:
-            cleanup = UnsafeCleanupError(
-                "RL client shutdown failed; inspect owned resources before retrying", shutdown_error=exc
-            )
-            if workload[1] is not None:
-                cleanup.preserve_workload(workload[1])
-            raise cleanup from exc
-
-
-def generate(client: RLClient, prompts: Sequence[Sequence[int]], sampling_params: Sequence[dict]) -> List[dict]:
-    """Generate one result per prompt, preserving each row's sampling parameters."""
-    results = client.generate(
-        [list(prompt) for prompt in prompts],
-        [dict(params) for params in sampling_params],
-    )
-    if not isinstance(results, list) or len(results) != len(prompts):
-        raise RuntimeError(f"generate returned {type(results).__name__} for {len(prompts)} prompts")
-    return results
-
-
-def sync_weights(client: RLClient) -> dict:
-    """Sync the native client's training job into its sampling job."""
-    return client.sync_weights()
-
-
-def rl_fwd_bwd(client: RLClient, batch: dict, *, replay_sampling: bool = False) -> dict:
-    """Run one RL forward-backward, optionally carrying the sampler identity for router replay."""
-    replay = None
-    if replay_sampling:
-        replay = {"sampling_job_id": str(client.jobs.sampling), "identity_version": 1}
-    return client.fwd_bwd(batch, router_replay=replay)
-
-
-def step(client: RLClient, learning_rate: float) -> dict:
-    return client.step(learning_rate)
-
-
-def rl_batch(
-    rows: Sequence[Sequence[int]],
-    loss_starts: Sequence[int],
-    pad_id: int,
-    *,
-    minimum_row_tokens: int = 0,
-) -> Dict:
-    """Right-padded RL batch in the format ``tests/sp/sp_gateway_harness.py:padded_rl_batch`` sends.
-
-    ``loss_mask`` is logit aligned: the entry at ``s`` weights the prediction of the token at ``s + 1``, so a
-    row whose scored tokens begin at ``p`` carries ones over ``p - 1`` through ``len(row) - 2``.
-    A minimum row length adds attention-active, loss-free causal tails so packing retains the shard context.
-    """
-    import torch
-
-    if type(minimum_row_tokens) is not int or minimum_row_tokens < 0:
-        raise ValueError("minimum_row_tokens must be a nonnegative integer")
-    width = max(minimum_row_tokens, max(len(row) for row in rows))
-    count = len(rows)
-    input_ids = torch.full((count, width), int(pad_id), dtype=torch.long)
-    attention_mask = torch.zeros(count, width, dtype=torch.long)
-    loss_mask = torch.zeros(count, width, dtype=torch.float32)
-    for index, (row, start) in enumerate(zip(rows, loss_starts, strict=True)):
-        input_ids[index, : len(row)] = torch.tensor(list(row), dtype=torch.long)
-        attention_mask[index, : max(len(row), minimum_row_tokens)] = 1
-        loss_mask[index, start - 1 : len(row) - 1] = 1.0
-    return {
-        "args": (),
-        "kwargs": {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-        },
-        "context": {
-            "input_ids": input_ids.clone(),
-            "advantages": torch.ones(count, width, dtype=torch.float32),
-            "loss_mask": loss_mask,
-            "temperature": 1.0,
-        },
-        "processing": {
-            "post": ["compute_logprobs"],
-            "loss_fn": "grpo",
-            "config": {"loss_agg_mode": "token-mean"},
-        },
-    }
-
-
-def find_key(value, key: str) -> List:
-    """Every value stored under ``key`` anywhere in a nested response, in traversal order."""
-    found: List = []
-    if isinstance(value, dict):
-        for name, item in value.items():
-            if name == key:
-                found.append(item)
-            else:
-                found.extend(find_key(item, key))
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            found.extend(find_key(item, key))
-    return found
+if __name__ == "__main__":
+    main()

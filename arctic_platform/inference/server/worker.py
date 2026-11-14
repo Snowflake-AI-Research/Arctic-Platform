@@ -19,8 +19,9 @@ from uuid import uuid4
 
 import ray
 
+from arctic_platform.debug.inference import maybe_begin_inference_startup_attempt
+from arctic_platform.debug.inference import maybe_finish_inference_startup_attempt
 from arctic_platform.debug.weight_sync import maybe_collect_broadcast_verification
-
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
 from arctic_platform.inference.server.chat import ChatModel, resolve_chat_model
 from arctic_platform.inference.server.metrics import RingStatLogger, get_collector
@@ -1035,6 +1036,9 @@ class InferenceWorker(StreamingWorkerMixin):
         max_attempts = _env_int("ARCTIC_VLLM_ENGINE_STARTUP_ATTEMPTS", 5)
         retry_base_s = _env_float("ARCTIC_VLLM_ENGINE_STARTUP_RETRY_BASE_S", 1.0)
         for attempt in range(1, max_attempts + 1):
+            durable_attempt = maybe_begin_inference_startup_attempt(attempt)
+            attempt_error = None
+            attempt_outcome = "ready"
             startup_error_dir = _begin_engine_startup_capture()
             try:
                 attempt_kwargs = dict(engine_kwargs)
@@ -1078,10 +1082,12 @@ class InferenceWorker(StreamingWorkerMixin):
                     )
                 break
             except BaseException as exc:
+                attempt_error = exc
                 self._cleanup_registered_router_replay_shm()
                 # semi_p is not retried here: the restore retries its own
                 # ports, so another attempt would only repeat a whole restore.
                 if semi_p or attempt >= max_attempts or not _is_address_in_use_error(exc):
+                    attempt_outcome = "error"
                     tail = _console_tail()
                     startup_exc = _engine_startup_error(exc, startup_error_dir)
                     target = startup_exc if startup_exc is not None else exc
@@ -1090,6 +1096,7 @@ class InferenceWorker(StreamingWorkerMixin):
                     if startup_exc is not None:
                         raise startup_exc from exc
                     raise
+                attempt_outcome = "retry"
                 delay_s = retry_base_s * attempt + random.uniform(0.0, retry_base_s)
                 logger.warning(
                     "vLLM engine startup hit address-in-use on attempt %d/%d; "
@@ -1102,6 +1109,11 @@ class InferenceWorker(StreamingWorkerMixin):
                 await asyncio.sleep(delay_s)
             finally:
                 _end_engine_startup_capture(startup_error_dir)
+                maybe_finish_inference_startup_attempt(
+                    durable_attempt,
+                    attempt_outcome,
+                    attempt_error,
+                )
         self._maybe_init_router_replay_tx(engine_kwargs, router_replay_engine_kwargs)
         # The live grammar now always masks the sampler's stop set, so replay
         # mirrors it unconditionally. get_tokenizer() raises under
@@ -1860,7 +1872,9 @@ class InferenceWorker(StreamingWorkerMixin):
                   lora_int_id, lora_name, lora_config, bucket_size,
                   engine_only, staging, evict_first),
         )
-        results = maybe_collect_broadcast_verification(results, engine_only=engine_only, llm=self.llm, rank_offset=rank_offset)
+        results = maybe_collect_broadcast_verification(
+            results, engine_only=engine_only, llm=self.llm, rank_offset=rank_offset
+        )
         if not engine_only:
             self._active_lora_int_id = lora_int_id
             self._active_lora_name = lora_name

@@ -25,10 +25,72 @@ _DSS_COMPARISON_ADAPTERS = {
     "correctness/harness/native_optimizer.py",
     "correctness/harness/optimizer.py",
     "correctness/harness/storage.py",
+    "correctness/harness/weight_cache.py",
+    "debug/training.py",
 }
 
 
-def _dss_import_violations(source: str, path: Path) -> list[str]:
+def _dss_import_violations(package_root: Path | str, relative_path: Path | None = None) -> list[str]:
+    if relative_path is not None:
+        return _source_dss_import_violations(package_root, relative_path)
+    violations = []
+    for path in package_root.rglob("*.py"):
+        relative_path = path.relative_to(package_root)
+        # These tests compare AP against DSS; they are not AP runtime dependencies.
+        if relative_path.parts[:2] == ("correctness", "selftest"):
+            continue
+        violations.extend(_source_dss_import_violations(path.read_text(), relative_path))
+    return violations
+
+
+def test_arctic_platform_does_not_import_dss():
+    package_root = Path(__file__).resolve().parents[2] / "arctic_platform"
+    assert _dss_import_violations(package_root) == []
+
+
+@pytest.mark.parametrize("relative_path", ["model/loader.py", "correctness/harness/runner.py"])
+@pytest.mark.parametrize("statement", ["import dss", "import dss.ray_dss", "from dss.ray_dss import models"])
+def test_dependency_check_rejects_dss_in_runtime_code(tmp_path, relative_path, statement):
+    path = tmp_path / relative_path
+    path.parent.mkdir(parents=True)
+    path.write_text(statement)
+    assert _dss_import_violations(tmp_path) == [f"{relative_path}:1: {statement.split()[1]}"]
+
+
+def test_dependency_check_allows_correctness_selftest_reference_imports(tmp_path):
+    path = tmp_path / "correctness" / "selftest" / "check_reference.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("from dss.ray_dss import models")
+    assert _dss_import_violations(tmp_path) == []
+
+
+def test_dependency_check_does_not_exempt_other_selftest_directories(tmp_path):
+    path = tmp_path / "model" / "selftest" / "loader.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("import dss")
+    assert _dss_import_violations(tmp_path) == ["model/selftest/loader.py:1: dss"]
+
+
+@pytest.mark.parametrize("relative_path", sorted(_DSS_COMPARISON_ADAPTERS))
+def test_dependency_check_allows_only_lazy_comparison_adapter_imports(tmp_path, relative_path):
+    path = tmp_path / relative_path
+    path.parent.mkdir(parents=True)
+    path.write_text("def compare():\n    from dss.ray_dss import models\n")
+    assert _dss_import_violations(tmp_path) == []
+
+    path.write_text("from dss.ray_dss import models\n")
+    assert _dss_import_violations(tmp_path) == [f"{relative_path}:1: dss.ray_dss"]
+
+
+@pytest.mark.parametrize("relative_path", ["common/deepspeed_engine.py", "correctness/harness/runner.py"])
+def test_dependency_check_rejects_lazy_dss_imports_outside_comparison_adapters(tmp_path, relative_path):
+    path = tmp_path / relative_path
+    path.parent.mkdir(parents=True)
+    path.write_text("def run():\n    import dss\n")
+    assert _dss_import_violations(tmp_path) == [f"{relative_path}:2: dss"]
+
+
+def _source_dss_import_violations(source: str, path: Path) -> list[str]:
     # Only the correctness integration can depend on the optional DSS runtime,
     # and its imports must wait until a runtime-dependent function is called.
     optional_adapter = path.as_posix() in _DSS_COMPARISON_ADAPTERS
@@ -52,16 +114,6 @@ def _dss_import_violations(source: str, path: Path) -> list[str]:
 
     visit(ast.parse(source, filename=str(path)))
     return violations
-
-
-def test_arctic_platform_does_not_import_dss():
-    package_root = Path(__file__).resolve().parents[2] / "arctic_platform"
-    violations = [
-        violation
-        for path in package_root.rglob("*.py")
-        for violation in _dss_import_violations(path.read_text(), path.relative_to(package_root))
-    ]
-    assert violations == []
 
 
 @pytest.mark.parametrize(

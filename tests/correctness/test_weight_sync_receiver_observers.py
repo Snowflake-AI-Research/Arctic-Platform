@@ -149,6 +149,7 @@ def test_native_tensor_writes_survive_removing_observations(receiver, monkeypatc
         "arctic_platform.inference.server.weight_sync.utils",
         _DirectParamWriter=Writer,
         _ShardAwareFusedWriter=Writer,
+        _is_lora_adapter_name=lambda name: False,
     )
     worker = _worker(receiver, model)
     result = (worker._load_direct if path == "direct" else worker._load_batched)(model, _Engine(value))
@@ -170,6 +171,7 @@ def test_native_fp8_feed_survives_removing_observations(receiver, monkeypatch, f
 
     class Updater:
         pending = 0
+        unplaced = ()
 
         def __init__(self, model, dtype, device):
             pass
@@ -180,7 +182,12 @@ def test_native_fp8_feed_survives_removing_observations(receiver, monkeypatch, f
                 raise ValueError("native quantizer failed")
             model.weight.copy_(tensor)
 
-    _module(monkeypatch, "arctic_platform.inference.server.weight_sync.utils", _FP8InplaceUpdater=Updater)
+    _module(
+        monkeypatch,
+        "arctic_platform.inference.server.weight_sync.utils",
+        _FP8InplaceUpdater=Updater,
+        _is_lora_adapter_name=lambda name: False,
+    )
     worker = _worker(receiver, model)
     if failure:
         with pytest.raises(RuntimeError, match="FP8 weight sync failed") as caught:

@@ -149,14 +149,62 @@ _STACKED_PARAMS = {
     "v_proj": "qkv_proj",
     "gate_proj": "gate_up_proj",
     "up_proj": "gate_up_proj",
+    "q_a_proj": "fused_qkv_a_proj",
+    "kv_a_proj_with_mqa": "fused_qkv_a_proj",
 }
 
 _SHARD_IDS = {
     "q_proj": "q", "k_proj": "k", "v_proj": "v",
     "gate_proj": 0, "up_proj": 1,
+    "q_a_proj": 0, "kv_a_proj_with_mqa": 1,
 }
 
-_SHARD_COUNTS = {"qkv_proj": 3, "gate_up_proj": 2}
+_SHARD_COUNTS = {"qkv_proj": 3, "gate_up_proj": 2, "fused_qkv_a_proj": 2}
+
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+# Wrapper levels that change a parameter's path without changing the parameter: vLLM's and PEFT's LoRA wrappers keep
+# the wrapped layer as ``base_layer``, and activation checkpointing nests ``_checkpoint_wrapped_module``.
+_WRAPPER_SEGMENTS = frozenset({"base_layer", "_checkpoint_wrapped_module"})
+
+
+def _canonical_name(name: str) -> str:
+    return ".".join(part for part in name.split(".") if part not in _WRAPPER_SEGMENTS)
+
+
+def _canonical_index(names) -> dict[str, str]:
+    """Map each canonical name to the one real name it stands for; a canonical name shared by two real names is
+    ambiguous and left out."""
+    index: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for name in names:
+        key = _canonical_name(name)
+        if index.setdefault(key, name) != name:
+            ambiguous.add(key)
+    for key in ambiguous:
+        del index[key]
+    return index
+
+
+def _is_lora_adapter_name(name: str) -> bool:
+    return ".lora_A." in name or ".lora_B." in name
+
+
+def _dequant_fp8_block(weight: torch.Tensor, scale_inv: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Dequantize a block-FP8 weight with its per-block inverse scale, as vLLM's GLM-5 checkpoint loader does.
+
+    The block edge is ``in_features / scale columns``; a partial last block on either axis is zero-padded for the
+    scale broadcast and trimmed afterwards (``kv_a_proj_with_mqa`` has 576 rows = 4 * 128 + 64).
+    """
+    out_dim, in_dim = weight.shape
+    block = in_dim // scale_inv.shape[1]
+    if block <= 0 or scale_inv.shape != (-(-out_dim // block), -(-in_dim // block)):
+        raise ValueError(
+            f"block-FP8 scale shape {tuple(scale_inv.shape)} does not tile weight shape {tuple(weight.shape)}"
+        )
+    padded = torch.nn.functional.pad(weight.to(torch.float32), (0, (-in_dim) % block, 0, (-out_dim) % block))
+    scale = scale_inv.to(torch.float32).repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)
+    return (padded * scale).to(dtype)[:out_dim, :in_dim].contiguous()
 
 
 class _FP8InplaceUpdater:
@@ -193,9 +241,72 @@ class _FP8InplaceUpdater:
             ):
                 self._fp8_modules[name] = mod
 
+        self._modules: dict[str, nn.Module] = dict(model.named_modules())
+        self._param_index = _canonical_index(self._params)
+        self._fp8_module_index = _canonical_index(self._fp8_modules)
         self._bufs: dict[str, nn.Parameter] = {}
         self._shards_left: dict[str, int] = {}
+        # Canonical wire projection path -> the block-FP8 weight or scale received so far, its unquantized
+        # destination, and the fused shard it fills.
+        self._dequant: dict[str, dict] = {}
+        self._unplaced: list[str] = []
         self._fused_writer = _ShardAwareFusedWriter(model, device)
+
+    def _param_name(self, name: str) -> str | None:
+        """The vLLM parameter a wire name denotes, matching across LoRA and checkpoint wrapper levels."""
+        if name in self._params:
+            return name
+        return self._param_index.get(_canonical_name(name))
+
+    def _fp8_module_path(self, path: str) -> str | None:
+        if path in self._fp8_modules:
+            return path
+        return self._fp8_module_index.get(_canonical_name(path))
+
+    def _unquantized_target(self, wire_module: str) -> tuple[str, object] | None:
+        """The unquantized vLLM parameter, and fused shard, that a block-FP8 wire projection loads into."""
+        name = self._param_name(f"{wire_module}.weight")
+        if name is not None:
+            return (name, None) if self._params[name].dtype not in _FP8_DTYPES else None
+        prefix, _, leaf = _canonical_name(wire_module).rpartition(".")
+        merged = _STACKED_PARAMS.get(leaf)
+        if not merged or not prefix:
+            return None
+        name = self._param_name(f"{prefix}.{merged}.weight")
+        if name is None or self._params[name].dtype in _FP8_DTYPES:
+            return None
+        return name, _SHARD_IDS[leaf]
+
+    def _stage_dequant(self, wire_name: str, wire_module: str, part: str, tensor: torch.Tensor) -> bool:
+        target = self._unquantized_target(wire_module)
+        if target is None:
+            return False
+        key = _canonical_name(wire_module)
+        entry = self._dequant.setdefault(key, {"names": [], "destination": target[0], "shard": target[1]})
+        if part in entry:
+            raise ValueError(f"block-FP8 {part} for {key!r} arrived twice before its partner")
+        # Allocate, then copy: the received tensor is a view of the transport buffer.
+        entry[part] = torch.empty_like(tensor)
+        entry[part].copy_(tensor)
+        entry["names"].append(wire_name)
+        if "weight" in entry and "scale" in entry:
+            del self._dequant[key]
+            self._load_dequantized(entry)
+        return True
+
+    def _load_dequantized(self, entry: dict) -> None:
+        param = self._params[entry["destination"]]
+        weight = _dequant_fp8_block(entry["weight"], entry["scale"], param.dtype)
+        shard = entry["shard"]
+        if shard is None:
+            self._copy_param(param, weight)
+            return
+        # vLLM's loader zero-fills the rows a NoPE checkpoint omits (``kv_a`` lacks the rope rows of its shard).
+        module = self._modules[entry["destination"].rpartition(".")[0]]
+        rows = module.output_sizes[shard]
+        if weight.shape[0] < rows:
+            weight = torch.cat([weight, weight.new_zeros((rows - weight.shape[0], weight.shape[1]))])
+        param.weight_loader(param, weight, shard)
 
     def _ensure_buf(self, mod_path: str) -> nn.Parameter:
         if mod_path in self._bufs:
@@ -212,7 +323,7 @@ class _FP8InplaceUpdater:
             buf.input_dim = 1
         else:
             buf.output_dim = 0
-        merged_name = mod_path.rsplit(".", 1)[-1]
+        merged_name = _canonical_name(mod_path).rsplit(".", 1)[-1]
         self._shards_left[mod_path] = _SHARD_COUNTS.get(merged_name, 1)
         self._bufs[mod_path] = buf
         return buf
@@ -341,64 +452,107 @@ class _FP8InplaceUpdater:
 
     def feed(self, sf_key: str, tensor: torch.Tensor):
         """Route one received BF16 tensor to the correct module."""
+        if not self._route(sf_key, tensor):
+            self._unplaced.append(sf_key)
+
+    def _route(self, sf_key: str, tensor: torch.Tensor) -> bool:
+        """Write or stage ``tensor``; ``False`` when no vLLM parameter takes it."""
         if sf_key.endswith(".weight"):
             mod_candidate = sf_key[: -len(".weight")]
-            prefix, _, leaf = mod_candidate.rpartition(".")
+            prefix, _, leaf = _canonical_name(mod_candidate).rpartition(".")
 
-            param = self._params.get(sf_key)
-            if (
-                tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-                and param is not None
-                and mod_candidate in self._fp8_modules
-            ):
+            param_name = self._param_name(sf_key)
+            mod_path = self._fp8_module_path(mod_candidate)
+            if tensor.dtype in _FP8_DTYPES and param_name is not None and mod_path is not None:
                 self._copy_native_fp8_param(
-                    self._fp8_modules[mod_candidate], param, tensor
+                    self._fp8_modules[mod_path], self._params[param_name], tensor
                 )
-                return
+                return True
 
             merged = _STACKED_PARAMS.get(leaf)
             if merged and prefix:
-                mod_path = f"{prefix}.{merged}"
-                if mod_path in self._fp8_modules:
-                    self._feed_fp8_module(mod_path, tensor, _SHARD_IDS[leaf])
-                    return
+                merged_path = self._fp8_module_path(f"{prefix}.{merged}")
+                if merged_path is not None:
+                    self._feed_fp8_module(merged_path, tensor, _SHARD_IDS[leaf])
+                    return True
 
-            if mod_candidate in self._fp8_modules:
-                self._feed_fp8_module(mod_candidate, tensor)
-                return
+            if mod_path is not None:
+                self._feed_fp8_module(mod_path, tensor)
+                return True
+
+            if tensor.dtype in _FP8_DTYPES and self._stage_dequant(sf_key, mod_candidate, "weight", tensor):
+                return True
 
         if sf_key.endswith(".weight_scale_inv"):
             mod_candidate = sf_key[: -len(".weight_scale_inv")]
-            param = self._params.get(sf_key)
-            if param is not None and mod_candidate in self._fp8_modules:
+            param_name = self._param_name(sf_key)
+            mod_path = self._fp8_module_path(mod_candidate)
+            if param_name is not None and mod_path is not None:
                 self._copy_native_fp8_scale(
-                    self._fp8_modules[mod_candidate], param, tensor
+                    self._fp8_modules[mod_path], self._params[param_name], tensor
                 )
-                return
+                return True
+            if param_name is None and self._stage_dequant(sf_key, mod_candidate, "scale", tensor):
+                return True
 
+        family = self._fused_writer.family(sf_key)
         if (
-            tensor.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+            family is not None
+            and (family.startswith("moe_") or tensor.dtype not in _FP8_DTYPES)
             and self._fused_writer.feed(sf_key, tensor)
         ):
-            return
+            return True
 
-        param = self._params.get(sf_key)
-        if param is not None:
-            if param.data.shape == tensor.shape:
-                self._copy_param(param, tensor)
-                return
-            # Shape mismatch — the param is likely FP8-transposed.
-            # Quantize the BF16 tensor to FP8 and copy with transposition.
-            if param.data.dtype == torch.float8_e4m3fn:
-                scale_name = sf_key.replace(".weight", ".weight_scale")
-                scale_param = self._params.get(scale_name)
-                self._quant_and_copy(param, tensor, scale_param)
-                return
+        param_name = self._param_name(sf_key)
+        if param_name is None:
+            return self._feed_stacked_unquantized(sf_key, tensor)
+        param = self._params[param_name]
+        if param.data.shape == tensor.shape:
             self._copy_param(param, tensor)
+            return True
+        # Shape mismatch — the param is likely FP8-transposed.
+        # Quantize the BF16 tensor to FP8 and copy with transposition.
+        if param.data.dtype == torch.float8_e4m3fn:
+            scale_name = self._param_name(sf_key.replace(".weight", ".weight_scale"))
+            scale_param = self._params[scale_name] if scale_name is not None else None
+            self._quant_and_copy(param, tensor, scale_param)
+            return True
+        self._copy_param(param, tensor)
+        return True
+
+    def _feed_stacked_unquantized(self, sf_key: str, tensor: torch.Tensor) -> bool:
+        """Load one unfused projection (``gate_proj.bias``, ``up_proj.weight``, ...) into the shard of the unquantized
+        merged vLLM parameter that holds it."""
+        module_path, _, suffix = _canonical_name(sf_key).rpartition(".")
+        prefix, _, leaf = module_path.rpartition(".")
+        merged = _STACKED_PARAMS.get(leaf)
+        if tensor.dtype in _FP8_DTYPES or not merged or not prefix:
+            return False
+        name = self._param_name(f"{prefix}.{merged}.{suffix}")
+        if name is None or self._params[name].dtype in _FP8_DTYPES:
+            return False
+        param = self._params[name]
+        param.weight_loader(param, tensor, _SHARD_IDS[leaf])
+        return True
 
     @property
     def pending(self) -> int:
-        return len(self._bufs)
+        return len(self._bufs) + len(self._dequant)
+
+    @property
+    def unplaced(self) -> list[str]:
+        """Received names that reached no vLLM parameter, including block-FP8 halves whose partner never arrived."""
+        stranded = [name for entry in self._dequant.values() for name in entry["names"]]
+        return [*self._unplaced, *stranded]
+
+    def staged(self):
+        """Each staging tensor this updater holds across received tensors, with the parameters it will write."""
+        for path, buffer in self._bufs.items():
+            yield buffer, [f"{path}.weight", f"{path}.weight_scale"]
+        for entry in self._dequant.values():
+            for part in ("weight", "scale"):
+                if part in entry:
+                    yield entry[part], [entry["destination"]]
 
 
 # Param-name patterns that are legitimately NOT shipped by a BF16 sender:
@@ -623,6 +777,9 @@ class _ShardAwareFusedWriter:
         self._register_gdn(modules)
         self._register_sparse_indexer(modules)
         self._register_moe(modules)
+        # A LoRA wrapper moves the wrapped layer under ``base_layer``; the wire names it without that level.
+        for name, canonical in [(name, _canonical_name(name)) for name in self._handlers]:
+            self._handlers.setdefault(canonical, self._handlers[name])
 
     # -- registration ------------------------------------------------------
 
@@ -648,7 +805,8 @@ class _ShardAwareFusedWriter:
         for mod_path, mod in modules.items():
             if not isinstance(mod, MergedColumnParallelLinear):
                 continue
-            parent_path = mod_path.rsplit(".", 1)[0] if "." in mod_path else ""
+            canonical_path = _canonical_name(mod_path)
+            parent_path = canonical_path.rsplit(".", 1)[0] if "." in canonical_path else ""
             parent = modules.get(parent_path)
             if parent is None or not isinstance(parent, GatedDeltaNetAttention):
                 continue
@@ -674,7 +832,7 @@ class _ShardAwareFusedWriter:
         for mod_path, mod in modules.items():
             if not (
                 isinstance(mod, MergedColumnParallelLinear)
-                and mod_path.endswith(".indexer.wk_weights_proj")
+                and _canonical_name(mod_path).endswith(".indexer.wk_weights_proj")
             ):
                 continue
             wname = f"{mod_path}.weight"
@@ -701,7 +859,9 @@ class _ShardAwareFusedWriter:
                     and callable(getattr(mod, "weight_loader", None))):
                 continue
             for leaf, family in (("w13_weight", "moe_w13"),
-                                 ("w2_weight", "moe_w2")):
+                                 ("w2_weight", "moe_w2"),
+                                 ("w13_weight_scale_inv", "moe_w13"),
+                                 ("w2_weight_scale_inv", "moe_w2")):
                 reg_name = f"{mod_path}.{leaf}"
                 param = self._params.get(reg_name)
                 if param is None:
@@ -711,6 +871,7 @@ class _ShardAwareFusedWriter:
                     "module": mod,
                     "param": param,
                     "destination": reg_name,
+                    "weight_name": leaf,
                 }
                 self._handlers[reg_name] = handler
                 wire_name = reg_name.replace(".routed_experts.", ".")
@@ -723,7 +884,11 @@ class _ShardAwareFusedWriter:
         handler = self._handlers.get(name)
         if handler is not None:
             return handler
-        return self._handlers.get(name.replace("._checkpoint_wrapped_module", ""))
+        return self._handlers.get(_canonical_name(name))
+
+    def family(self, name: str) -> str | None:
+        handler = self._handler_for(name)
+        return handler["family"] if handler is not None else None
 
     def destination_name(self, name: str) -> str | None:
         handler = self._handler_for(name)
@@ -780,33 +945,57 @@ class _ShardAwareFusedWriter:
             gated = True if moe_config is None else bool(
                 getattr(moe_config, "is_act_and_mul", True)
             )
+            weight_name = handler["weight_name"]
+            tensor = self._refined_block_scale(module, param, weight_name, tensor)
             for expert_id in range(tensor.shape[0]):
                 if gated:
                     inter = tensor.shape[1] // 2
                     module.weight_loader(
                         param, tensor[expert_id, :inter, :],
-                        "w13_weight", "w1", expert_id, return_success=True,
+                        weight_name, "w1", expert_id, return_success=True,
                     )
                     module.weight_loader(
                         param, tensor[expert_id, inter:, :],
-                        "w13_weight", "w3", expert_id, return_success=True,
+                        weight_name, "w3", expert_id, return_success=True,
                     )
                 else:
                     module.weight_loader(
                         param, tensor[expert_id],
-                        "w13_weight", "w1", expert_id, return_success=True,
+                        weight_name, "w1", expert_id, return_success=True,
                     )
             return True
 
         if family == "moe_w2":
+            weight_name = handler["weight_name"]
+            tensor = self._refined_block_scale(module, param, weight_name, tensor)
             for expert_id in range(tensor.shape[0]):
                 module.weight_loader(
                     param, tensor[expert_id],
-                    "w2_weight", "w2", expert_id, return_success=True,
+                    weight_name, "w2", expert_id, return_success=True,
                 )
             return True
 
         return False
+
+    @staticmethod
+    def _refined_block_scale(module, param, weight_name: str, tensor: torch.Tensor) -> torch.Tensor:
+        """Upsample checkpoint block scales to a TP-refined scale grid the expert loader can no longer see.
+
+        ``RoutedExperts.weight_loader`` upsamples block scales by ``quant_method.weight_scale_refine``. vLLM's LoRA
+        wrapper replaces that quant method with a modular wrapper which keeps the attribute on ``old_quant_method``, so
+        the loader would slice unrefined scales into a refined parameter.
+        """
+        quant_method = getattr(module, "quant_method", None)
+        if (
+            "scale" not in weight_name
+            or getattr(param, "quant_method", None) != "block"
+            or getattr(quant_method, "weight_scale_refine", None) is not None
+        ):
+            return tensor
+        refine = getattr(getattr(quant_method, "old_quant_method", None), "weight_scale_refine", None)
+        if refine is None:
+            return tensor
+        return tensor.repeat_interleave(refine[0], dim=-2).repeat_interleave(refine[1], dim=-1)
 
 
 # ---------------------------------------------------------------------------

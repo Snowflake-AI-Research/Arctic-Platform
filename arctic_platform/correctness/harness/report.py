@@ -28,6 +28,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED
 from concurrent.futures import wait
+from contextvars import ContextVar
 from dataclasses import asdict
 from datetime import datetime
 from datetime import timezone
@@ -112,6 +113,65 @@ def collect(repo: Optional[Path] = None) -> Dict[str, str]:
 RULE = "  " + "-" * 99
 SEPARATOR = ["", RULE, ""]
 SPINNER_FRAMES = "|/-\\"
+_RUN_PROGRESS = ContextVar("correctness_run_progress", default=None)
+
+
+class RunProgress:
+    """Keep the operator informed while detailed execution output goes to a log."""
+
+    def __init__(self, label: str, *, stream: TextIO, interval: float = 30, clock=None) -> None:
+        self.label = label
+        self.stream = stream
+        self.interval = interval
+        self.clock = clock if clock is not None else time.monotonic
+        self.phase = "Preparing configuration, references and target runtime"
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def update(self, phase: str, *, announce: bool = True) -> str:
+        with self._lock:
+            previous = self.phase
+            self.phase = phase
+        if announce:
+            print(f"  {self.label}: {phase}", file=self.stream, flush=True)
+        return previous
+
+    def _wait(self) -> None:
+        while not self._stop.wait(self.interval):
+            with self._lock:
+                phase = self.phase
+            try:
+                print(
+                    f"  Still waiting: {self.label}; {phase}; "
+                    f"elapsed {total_duration(self.clock() - self.started)} "
+                    "(controller waiting; backend completion not yet reported)",
+                    file=self.stream,
+                    flush=True,
+                )
+            except (OSError, ValueError):
+                return
+
+    def __enter__(self) -> "RunProgress":
+        self.started = self.clock()
+        self.update(self.phase)
+        self._token = _RUN_PROGRESS.set(self)
+        self._thread = threading.Thread(target=self._wait, name="correctness-run-progress", daemon=True)
+        try:
+            self._thread.start()
+        except BaseException:
+            _RUN_PROGRESS.reset(self._token)
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self._stop.set()
+        try:
+            if self._thread is not None:
+                # A blocked log consumer must not prevent backend cleanup.
+                self._thread.join(timeout=0.1)
+        finally:
+            _RUN_PROGRESS.reset(self._token)
 
 
 class Activity:
@@ -119,6 +179,7 @@ class Activity:
 
     def __init__(self, message: str, *, stream: TextIO | None = None, interval: float = 0.1) -> None:
         self.message = message
+        self._progress = _RUN_PROGRESS.get() if stream is None else None
         self.stream = stream if stream is not None else sys.stdout
         self.interval = interval
         self._stop = threading.Event()
@@ -142,6 +203,8 @@ class Activity:
             self._render()
 
     def __enter__(self) -> "Activity":
+        if self._progress is not None:
+            self._previous_phase = self._progress.update(self.message)
         if not self._interactive:
             print(f"  {self.message} ...", file=self.stream, flush=True)
             return self
@@ -151,6 +214,8 @@ class Activity:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
+        if self._progress is not None:
+            self._progress.update(self._previous_phase, announce=False)
         if not self._interactive:
             return
         self._stop.set()

@@ -135,7 +135,8 @@ formatting = [
     "autoflake",
 ]
 
-# Correctness onboarding, HF references and CPU selftests; GPU kernels remain separately installed.
+# Correctness onboarding, HF references, target execution, and CPU selftests.
+# Sampling and model-specific attention kernels are installed separately.
 correctness = [
     "arctic_platform[cortex]",
     "arctic_platform[sft]",

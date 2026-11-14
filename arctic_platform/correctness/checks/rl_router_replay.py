@@ -65,7 +65,6 @@ from arctic_platform.correctness.harness.gateway import minimum_context_parallel
 from arctic_platform.correctness.harness.gateway import rl_batch
 from arctic_platform.correctness.harness.gateway import rl_fwd_bwd
 from arctic_platform.correctness.harness.gateway import running_rl_client
-from arctic_platform.correctness.harness.inference import collect_traces
 from arctic_platform.correctness.harness.inference import router_replay_bound_inventory
 from arctic_platform.correctness.harness.inference import router_replay_expected_layers
 from arctic_platform.correctness.harness.inference import router_replay_routing_geometry
@@ -127,6 +126,7 @@ def expects_full_recompute(training_config: dict) -> bool:
 
 
 def _run(ctx) -> TestResult:
+    from arctic_platform.correctness.harness.inference import collect_traces
     from arctic_platform.debug.training import TRAINING_OPTION
 
     cfg = ctx.cfg

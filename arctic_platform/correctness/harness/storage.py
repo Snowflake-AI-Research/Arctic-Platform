@@ -38,6 +38,8 @@ import sys
 import tempfile
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import as_completed
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict
@@ -530,6 +532,195 @@ def _verified_identity(root: Path, native: Path, binding: dict, request: dict, e
     return actual
 
 
+def _checkpoint_script(body: str) -> str:
+    source = Path(__file__).resolve(strict=True)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    import_roots = list(
+        dict.fromkeys(
+            [str(source.parents[3]), *(str(Path(root).resolve()) for root in sys.path if isinstance(root, str))]
+        )
+    )
+    script = (
+        f"import hashlib, json, sys\nfrom pathlib import Path\nsys.path[:] = {import_roots!r}\n"
+        f"source = Path({str(source)!r})\nexpected_sha = {source_sha!r}\n"
+        "if hashlib.sha256(source.read_bytes()).hexdigest() != expected_sha:\n"
+        "    raise RuntimeError('checkpoint store source SHA256 differs')\n"
+        "from arctic_platform.correctness.harness import storage as module\n"
+        "if Path(module.__file__).resolve() != source:\n"
+        "    raise RuntimeError('checkpoint store imported source path differs')\n"
+        "if hashlib.sha256(source.read_bytes()).hexdigest() != expected_sha:\n"
+        "    raise RuntimeError('checkpoint store source SHA256 differs after import')\n"
+        + body
+    )
+    encoded = base64.b64encode(script.encode()).decode()
+    return f"echo {encoded} | base64 -d | {shlex.quote(sys.executable)} -"
+
+
+def _expert_directory(root: Path, tag: str) -> Path:
+    if not isinstance(tag, str) or not re.fullmatch(r"global_step[0-9]+", tag):
+        raise ValueError("expert replicas require an exact native checkpoint tag")
+    directory = root / tag
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise ValueError("expert checkpoint directory is not an owned real directory")
+    return directory
+
+
+def _expert_file_identity(path: Path) -> dict:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or info.st_size <= 0
+            or _identity(path.lstat()) != _identity(info)
+        ):
+            raise ValueError(f"expert shard is not a nonempty owned regular file: {path.name}")
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        current = os.fstat(descriptor)
+        fields = ("st_size", "st_mtime_ns", "st_ctime_ns", "st_ino", "st_dev")
+        if any(getattr(info, field) != getattr(current, field) for field in fields):
+            raise ValueError("expert shard changed while hashing")
+        if _identity(path.lstat()) != _identity(current):
+            raise ValueError("expert shard was replaced while hashing")
+        return {"size": info.st_size, "sha256": digest.hexdigest()}
+    finally:
+        os.close(descriptor)
+
+
+def _is_checkpoint_expert_shard(name: str) -> bool:
+    if not isinstance(name, str):
+        return False
+    if re.fullmatch(r"experts_ep_rank_[0-9]{3}\.pt", name):
+        return True
+    match = re.fullmatch(r"ap_ep_ep_size_([0-9]+)_rank_([0-9]+)_model_states\.pt", name)
+    if match is None:
+        return False
+    degree, rank = map(int, match.groups())
+    return (
+        1 <= degree <= 1000
+        and 0 <= rank < degree
+        and name == f"ap_ep_ep_size_{degree}_rank_{rank:02d}_model_states.pt"
+    )
+
+
+def _expert_manifest(inventories: dict, ep_size: int) -> dict:
+    if type(ep_size) is not int or not 1 <= ep_size <= 1000:
+        raise ValueError("expert replica inventory requires a supported positive EP degree")
+    required = {f"experts_ep_rank_{rank:03d}.pt" for rank in range(ep_size)}
+    for host, inventory in inventories.items():
+        if not isinstance(inventory, dict) or any(not isinstance(name, str) for name in inventory):
+            raise ValueError(f"unexpected expert shards on {host}")
+        if any(name.startswith("ap_ep_") for name in inventory):
+            required.update(f"ap_ep_ep_size_{ep_size}_rank_{rank:02d}_model_states.pt" for rank in range(ep_size))
+    manifest = {}
+    for host, inventory in inventories.items():
+        if not isinstance(inventory, dict) or not inventory.keys() <= required:
+            raise ValueError(f"unexpected expert shards on {host}")
+        for name, identity in inventory.items():
+            if (
+                not isinstance(identity, dict)
+                or set(identity) != {"size", "sha256"}
+                or type(identity["size"]) is not int
+                or identity["size"] <= 0
+                or not isinstance(identity["sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", identity["sha256"])
+            ):
+                raise ValueError(f"invalid expert shard identity on {host}: {name}")
+            if name in manifest:
+                if manifest[name]["identity"] != identity:
+                    raise ValueError(f"conflicting expert shard replicas: {name}")
+            else:
+                manifest[name] = {"host": host, "identity": identity}
+    if manifest.keys() != required:
+        raise ValueError(f"missing expert shards: {sorted(required - manifest.keys())}")
+    return manifest
+
+
+def _stream_checkpoint_expert(request: dict, name: str, identity: dict) -> None:
+    if not _is_checkpoint_expert_shard(name):
+        raise ValueError("only expert weight shards may be transferred")
+    binding = request["binding"]
+    root = _canonical_root(binding["path"])
+    native = _native_path(binding["source_job_id"])
+    with _native_lock(native, exclusive=False) as lock:
+        _verified_identity(root, native, binding, request, request["expected"][socket.gethostname()], lock)
+        path = _expert_directory(root, request["payload"]["tag"]) / name
+        if _expert_file_identity(path) != identity:
+            raise ValueError("source expert shard differs from its acknowledged inventory")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as stream:
+            shutil.copyfileobj(stream, sys.stdout.buffer, length=8 * 1024 * 1024)
+        sys.stdout.buffer.flush()
+
+
+def _replicate_checkpoint_experts(directory: Path, request: dict) -> dict:
+    payload = request["payload"]
+    result = {}
+    transfers = []
+    for name, source in payload["manifest"].items():
+        if not _is_checkpoint_expert_shard(name):
+            raise ValueError("only expert weight shards may be transferred")
+        target = directory / name
+        identity = source["identity"]
+        peer = payload["training_hosts"].get(source["host"])
+        if peer is None or source["host"] not in request["expected"]:
+            raise ValueError("expert source is outside the acknowledged training allocation")
+        if os.path.lexists(target):
+            if _expert_file_identity(target) != identity:
+                raise ValueError(f"conflicting destination expert shard: {name}")
+        else:
+            transfers.append((target, peer, identity))
+        result[name] = identity
+
+    def transfer(target: Path, peer: str, identity: dict) -> None:
+        name = target.name
+        body = (
+            f"module._stream_checkpoint_expert(json.loads({json.dumps(request)!r}),"
+            f" {name!r}, json.loads({json.dumps(identity)!r}))\n"
+        )
+        descriptor, temporary = tempfile.mkstemp(prefix=".expert-replica-", dir=directory)
+        temporary = Path(temporary)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                done = subprocess.run(
+                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", peer, _checkpoint_script(body)],
+                    stdout=stream,
+                    stderr=subprocess.PIPE,
+                    timeout=payload["timeout"],
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            if done.returncode:
+                raise RuntimeError(f"expert shard transfer failed: {done.stderr.decode(errors='replace')}")
+            if _expert_file_identity(temporary) != identity:
+                raise ValueError(f"transferred expert shard digest differs: {name}")
+            # A racing writer must never be overwritten, even with matching contents.
+            os.link(temporary, target)
+        finally:
+            temporary.unlink()
+        if _expert_file_identity(target) != identity:
+            raise ValueError(f"published expert shard digest differs: {name}")
+
+    if len(transfers) > 0:
+        # Admit the complete manifest first; settle running transfers before releasing the native read lock.
+        with ThreadPoolExecutor(max_workers=min(4, len(transfers))) as executor:
+            futures = [executor.submit(transfer, *arguments) for arguments in transfers]
+            try:
+                for future in as_completed(futures):
+                    future.result()
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+    return result
+
+
 def _node_receipt(request: dict) -> dict:
     receipt = {
         "host": socket.gethostname(),
@@ -554,9 +745,9 @@ def _node_receipt(request: dict) -> dict:
             raise ValueError("native checkpoint path differs from the native resolver")
         binding["native_path"] = str(native)
         operation = request["operation"]
-        if operation not in {"create", "verify", "close"}:
+        if operation not in {"create", "verify", "close", "expert-inventory", "expert-replicate"}:
             raise ValueError("unknown checkpoint store operation")
-        with _native_lock(native, exclusive=operation != "verify") as lock:
+        with _native_lock(native, exclusive=operation in {"create", "close"}) as lock:
             if operation == "create":
                 if os.path.lexists(native):
                     raise FileExistsError(f"native checkpoint namespace already exists: {native}")
@@ -585,6 +776,25 @@ def _node_receipt(request: dict) -> dict:
                     receipt["identity"] = _verified_identity(root, native, binding, request, expected, lock)
                     if operation == "verify" and receipt["identity"]["link"] is None:
                         raise ValueError("checkpoint native link is absent")
+                    if operation in {"expert-inventory", "expert-replicate"}:
+                        payload = request["payload"]
+                        receipt["expert_shards"] = {}
+                        if receipt["host"] in payload["training_hosts"]:
+                            if receipt["identity"]["link"] is None:
+                                raise ValueError("checkpoint native link is absent")
+                            directory = _expert_directory(root, payload["tag"])
+                            if operation == "expert-inventory":
+                                receipt["expert_shards"] = {
+                                    path.name: _expert_file_identity(path)
+                                    for path in sorted(
+                                        [
+                                            *directory.glob("experts_ep_rank_*.pt"),
+                                            *directory.glob("ap_ep_*_model_states.pt"),
+                                        ]
+                                    )
+                                }
+                            else:
+                                receipt["expert_shards"] = _replicate_checkpoint_experts(directory, request)
                     if operation == "close":
                         if not shutil.rmtree.avoids_symlink_attacks:
                             raise RuntimeError("checkpoint cleanup requires symlink-safe tree removal")
@@ -600,13 +810,19 @@ def _node_receipt(request: dict) -> dict:
 
 
 class NativeCheckpointStore:
-    """Keep source namespaces until all native consumers have quiesced."""
+    """Keep source namespaces until all native consumers have quiesced.
 
-    def __init__(self, hostfile: Path, *, timeout: float = 120) -> None:
+    Ownership operations have a short control deadline. Expert inventory and copying
+    use a separate finite deadline because they read complete model-weight payloads.
+    """
+
+    def __init__(self, hostfile: Path, *, timeout: float = 120, expert_timeout: float = 14400) -> None:
         self.hostfile = Path(hostfile).absolute()
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout < float("inf"):
-            raise ValueError("checkpoint fanout timeout must be finite and positive")
+        for name, value in (("control", timeout), ("expert payload", expert_timeout)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < float("inf"):
+                raise ValueError(f"checkpoint {name} timeout must be finite and positive")
         self.timeout = timeout
+        self.expert_timeout = expert_timeout
         self.store_id = uuid.uuid4().hex
         self._host_identity = self._hostfile_identity()
         entries = parse_hostfile(self.hostfile)
@@ -650,8 +866,9 @@ class NativeCheckpointStore:
                 f"allocation hostfile changed: path={self.hostfile}; differences={json.dumps(changes, sort_keys=True)}"
             )
 
-    def _fanout(self, operation: str, binding: dict, identities: dict) -> dict:
+    def _fanout(self, operation: str, binding: dict, identities: dict, *, payload: dict | None = None) -> dict:
         self._check_hostfile()
+        timeout = self.expert_timeout if operation in {"expert-inventory", "expert-replicate"} else self.timeout
         request = {
             "operation": operation,
             "binding": binding,
@@ -660,39 +877,20 @@ class NativeCheckpointStore:
             "token": uuid.uuid4().hex,
             "expected": {receipt["host"]: receipt["identity"] for receipt in identities.values()},
         }
+        if payload is not None:
+            request["payload"] = payload
         results = {}
         done = None
         try:
-            source = Path(__file__).resolve(strict=True)
-            source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
-            # SSH login cwd/environment need not retain the gateway's private overlay.
-            import_roots = list(
-                dict.fromkeys(
-                    [
-                        str(source.parents[3]),
-                        *(str(Path(root).resolve()) for root in sys.path if isinstance(root, str)),
-                    ]
-                )
+            command = _checkpoint_script(
+                f"receipt = module._node_receipt(json.loads({json.dumps(request)!r}))\n"
+                f"print({_RECEIPT!r} + json.dumps(receipt), flush=True)\n"
             )
-            script = (
-                f"import hashlib, json, sys\nfrom pathlib import Path\nsys.path[:] = {import_roots!r}\nsource ="
-                f" Path({str(source)!r})\nexpected_sha = {source_sha!r}\nif"
-                " hashlib.sha256(source.read_bytes()).hexdigest() != expected_sha:\n    raise"
-                " RuntimeError('checkpoint store source SHA256 differs')\nfrom arctic_platform.correctness.harness"
-                " import storage as module\nif Path(module.__file__).resolve() != source:\n    raise"
-                " RuntimeError('checkpoint store imported source path differs')\nif"
-                " hashlib.sha256(source.read_bytes()).hexdigest() != expected_sha:\n    raise"
-                " RuntimeError('checkpoint store source SHA256 differs after import')\nreceipt ="
-                f" module._node_receipt(json.loads({json.dumps(request)!r}))\nprint({_RECEIPT!r} +"
-                " json.dumps(receipt), flush=True)\n"
-            )
-            # ds_ssh forwards unquoted arguments to pdsh, flattening multiline source.
-            encoded = base64.b64encode(script.encode()).decode()
             done = subprocess.run(
-                [_ds_ssh(), "-f", str(self.hostfile), f"echo {encoded} | base64 -d | {shlex.quote(sys.executable)} -"],
+                [_ds_ssh(), "-f", str(self.hostfile), command],
                 capture_output=True,
                 text=True,
-                timeout=self.timeout,
+                timeout=timeout,
             )
             for line in done.stdout.splitlines():
                 prefix, separator, raw = line.partition(_RECEIPT)
@@ -743,7 +941,7 @@ class NativeCheckpointStore:
         except Exception as exc:
             output = exc if isinstance(exc, subprocess.TimeoutExpired) else done
             raise CheckpointStoreError(
-                f"allocation checkpoint {operation}: {exc}",
+                f"allocation checkpoint {operation} (timeout={timeout}s): {exc}",
                 results,
                 transport_stdout=getattr(output, "stdout", None),
                 transport_stderr=getattr(output, "stderr", None),
@@ -774,6 +972,37 @@ class NativeCheckpointStore:
         if record is None or record[0] != binding:
             raise CheckpointStoreError("checkpoint binding is not owned by this store")
         self._fanout("verify", record[0], record[1])
+
+    def materialize_expert_replicas(self, binding: dict, tag: str, training_hosts: list[str], ep_size: int) -> None:
+        record = self._records.get(binding.get("source_job_id"))
+        if record is None or record[0] != binding:
+            raise CheckpointStoreError("checkpoint binding is not owned by this store")
+        if (
+            not training_hosts
+            or len(set(training_hosts)) != len(training_hosts)
+            or not set(training_hosts) <= self.hosts
+        ):
+            raise CheckpointStoreError("expert replicas require exact training nodes within this allocation")
+        payload = {
+            "tag": tag,
+            "timeout": self.expert_timeout,
+            "training_hosts": {record[1][host]["host"]: host for host in training_hosts},
+        }
+        inventories = self._fanout("expert-inventory", *record, payload=payload)
+        selected = {
+            receipt["host"]: receipt["expert_shards"]
+            for host, receipt in inventories.items()
+            if host in training_hosts
+        }
+        manifest = _expert_manifest(selected, ep_size)
+        payload["manifest"] = manifest
+        # Fully populated nodes are sources, not transfer destinations.
+        if all(set(shards) == set(manifest) for shards in selected.values()):
+            return
+        receipts = self._fanout("expert-replicate", *record, payload=payload)
+        expected = {name: source["identity"] for name, source in manifest.items()}
+        if any(receipts[host].get("expert_shards") != expected for host in training_hosts):
+            raise CheckpointStoreError("expert replica receipts differ from the complete inventory", receipts)
 
     @property
     def bindings(self) -> tuple[dict, ...]:
@@ -898,12 +1127,17 @@ def workload_identity(ctx, check_id: str, recipe: dict) -> dict:
 
     dependencies["torch"] = str(torch.__version__)
     root = Path(__file__).resolve().parents[1]
+    package = root.parent
     sources = {
-        str(path.relative_to(root)): file_identity(path)
+        str(path.relative_to(package if path.is_relative_to(package / "model") else root)): file_identity(path)
         for path in [
             *sorted((root / "reference").glob("*.py")),
             root / "harness" / "sft.py",
             root / "harness" / "optimizer.py",
+            # The reference applies the target loader's rounding through these modules.
+            package / "model" / "loaders" / "huggingface.py",
+            package / "model" / "implementations" / "gpu" / "vllm_rounding.py",
+            package / "model" / "implementations" / "gpu" / "qwen3_5_dense_parity.py",
             *(
                 [root / "harness" / "lora.py"]
                 if isinstance(recipe.get("initialization"), dict)
@@ -925,9 +1159,6 @@ def workload_identity(ctx, check_id: str, recipe: dict) -> dict:
         "python": platform.python_version(),
         "recipe": recipe,
     }
-    base_width = getattr(ctx.cfg, "placement_base_gpus", None)
-    if base_width is not None and ctx.cfg.n_gpus != base_width:
-        identity["placement_gpus"] = ctx.cfg.n_gpus
     if check_id == "single-step-grads":
         identity["gate"] = asdict(ctx.spec.test_tolerances[check_id])
     elif check_id == "single-step-optimizer":
@@ -952,8 +1183,6 @@ def _finite(value, trail="measurements") -> None:
 
 
 def validate_measurements(identity: dict, measurements: dict) -> None:
-    if identity["check_id"] not in CRITERIA:
-        raise ReferencePrerequisiteError(f"not an HF reference check: {identity['check_id']}")
     if not isinstance(measurements, dict):
         raise ReferencePrerequisiteError("reference measurements must be an object")
     _finite(measurements)
@@ -1009,7 +1238,7 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
             if (
                 not isinstance(values, list)
                 or len(values) != 100
-                or (not all((isinstance(value, (int, float)) for value in values)))
+                or not all(isinstance(value, (int, float)) for value in values)
             ):
                 raise ReferencePrerequisiteError(f"reference requires all 100 scalar {key}")
         if measurements.get("optimizer_steps") != 100:
@@ -1042,13 +1271,8 @@ def _config_dir(ctx, identity: dict) -> Path:
     return directory
 
 
-def _record_path(ctx, identity: dict) -> Path:
+def _unscoped_record_path(ctx, identity: dict) -> Path:
     directory = _config_dir(ctx, identity) / identity["check_id"]
-    width = identity.get("placement_gpus")
-    if width is not None:
-        if type(width) is not int or width < 1:
-            raise ReferencePrerequisiteError("invalid reference placement width")
-        directory /= f"gpu{width}"
     if identity["check_id"] == "e2e-sft-train-validate":
         return directory / "trajectory.json"
     recipe = identity.get("recipe", {})
@@ -1060,8 +1284,43 @@ def _record_path(ctx, identity: dict) -> Path:
     return directory / f"{arm}.json"
 
 
+def _record_path(ctx, identity: dict) -> Path:
+    path = _unscoped_record_path(ctx, identity)
+    if identity["check_id"] == "e2e-sft-train-validate":
+        return path
+    rows = identity.get("recipe", {}).get("synthetic_inputs", {}).get("rows")
+    if rows is None:
+        return path
+    gas = re.fullmatch(r"gas([1-9][0-9]*)", path.stem)
+    if type(rows) is not int or rows < 1 or gas is None or rows % int(gas[1]) != 0:
+        raise ReferencePrerequisiteError("invalid reference record rows per GAS")
+    # Wider placements scale rows, not sequence length or the reference token budget.
+    return path.parent / f"rows-per-gas-{rows // int(gas[1])}" / path.name
+
+
 def _legacy_record_path(ctx, identity: dict) -> Path:
     return _config_dir(ctx, identity) / identity["check_id"] / f"{_digest(identity)}.json"
+
+
+def _existing_record_path(ctx, identity: dict) -> Path:
+    path = _record_path(ctx, identity)
+    latest_files = [
+        item for item in path.parent.glob("*.json") if re.fullmatch(r"[0-9a-f]{64}\.json", item.name) is None
+    ]
+    if latest_files:
+        return path
+    unscoped = _unscoped_record_path(ctx, identity)
+    for candidate in unscoped.parent.glob("*.json"):
+        if re.fullmatch(r"[0-9a-f]{64}\.json", candidate.name):
+            continue
+        if candidate.stat().st_size > MAX_RECORD_BYTES:
+            raise ReferencePrerequisiteError(f"reference record is oversized: {candidate}")
+        record = _strict_record_json(candidate.read_bytes())
+        if not isinstance(record, dict) or not isinstance(record.get("identity"), dict):
+            raise ReferencePrerequisiteError(f"invalid reference record identity: {candidate}")
+        if _record_path(ctx, record["identity"]).parent == path.parent:
+            return unscoped
+    return _legacy_record_path(ctx, identity)
 
 
 @contextmanager
@@ -1152,8 +1411,12 @@ def load_record(ctx, current_identity: dict) -> dict:
     options = ["--reference-records-dir", str(getattr(ctx, "reference_records_dir", DEFAULT_RECORDS_DIR))]
     if getattr(ctx, "local_gateway_full_model", False):
         options.append("--local-gateway-full-model")
+    elif identity["check_id"] == "e2e-sft-train-validate":
+        options.append("--local-cortex-fixture")
     if identity["check_id"] != "e2e-sft-train-validate" and recipe.get("token_budget") is not None:
         options.extend(["--reference-token-budget", str(recipe["token_budget"])])
+    if identity["check_id"] != "e2e-sft-train-validate" and getattr(ctx.cfg, "n_gpus", None) is not None:
+        options.extend(["--gpu-pool", str(ctx.cfg.n_gpus)])
     command = (
         "python -m arctic_platform.correctness onboard "
         f"--config {shlex.quote(str(ctx.spec.config_path))} --prepare-references "
@@ -1165,11 +1428,7 @@ def load_record(ctx, current_identity: dict) -> dict:
             raise FileNotFoundError(path)
         with _publication_lock(directory, exclusive=False):
             # Legacy reuse is exact-identity only. Never fall back past a published latest set.
-            latest_files = [
-                item for item in path.parent.glob("*.json") if re.fullmatch(r"[0-9a-f]{64}\.json", item.name) is None
-            ]
-            if not latest_files:
-                path = _legacy_record_path(ctx, identity)
+            path = _existing_record_path(ctx, identity)
             if path.stat().st_size > MAX_RECORD_BYTES:
                 raise ReferencePrerequisiteError(f"reference record is oversized: {path}")
             record = _strict_record_json(path.read_bytes())
@@ -1229,16 +1488,22 @@ def _remove_replaced_legacy_records(ctx, staged: Path, identities: list[dict]) -
     replaced = {_record_path(ctx, identity).parent for identity in identities}
     expected_config_id = identities[0]["config_id"]
     for check_id in {identity["check_id"] for identity in identities}:
-        for path in (staged / check_id).glob("*.json"):
-            if re.fullmatch(r"[0-9a-f]{64}\.json", path.name) is None:
-                continue
+        for path in (staged / check_id).rglob("*.json"):
+            relative = path.relative_to(staged)
             record = _strict_record_json(path.read_bytes())
             identity = record["identity"]
+            current = _record_path(ctx, identity)
+            if relative == current.relative_to(_config_dir(ctx, identity)):
+                continue
             if (
                 record.get("schema") != SCHEMA_VERSION
                 or identity.get("config_id") != expected_config_id
                 or identity.get("check_id") != check_id
-                or path.name != _legacy_record_path(ctx, identity).name
+                or relative
+                not in {
+                    _legacy_record_path(ctx, identity).relative_to(_config_dir(ctx, identity)),
+                    _unscoped_record_path(ctx, identity).relative_to(_config_dir(ctx, identity)),
+                }
                 or record.get("payload_sha256") != _digest(record.get("measurements"))
             ):
                 raise ReferencePrerequisiteError(f"cannot identify legacy reference for replacement: {path}")
@@ -1292,12 +1557,22 @@ def publish_record_set(ctx, entries, *, expected_identities) -> dict[str, Path]:
             existing_arms = {
                 path.name for path in parent.glob("*.json") if re.fullmatch(r"[0-9a-f]{64}\.json", path.name) is None
             }
+            for identity in groups[parent]:
+                unscoped = _unscoped_record_path(ctx, identity)
+                if unscoped.parent == parent:
+                    continue
+                for old in unscoped.parent.glob("*.json"):
+                    if re.fullmatch(r"[0-9a-f]{64}\.json", old.name):
+                        continue
+                    previous = _strict_record_json(old.read_bytes())
+                    if _record_path(ctx, previous["identity"]).parent == parent:
+                        existing_arms.add(old.name)
             expected_arms = {path.name for path in prepared if path.parent == parent}
             if existing_arms - expected_arms:
                 raise ReferencePrerequisiteError("reference replacement must include every previously published arm")
         # A repeated identity cannot silently acquire different measurements, even in a new set.
         for path, data in data_by_path.items():
-            old = path if path.exists() else _legacy_record_path(ctx, prepared[path])
+            old = _existing_record_path(ctx, prepared[path])
             if old.exists():
                 previous = _strict_record_json(old.read_bytes())
                 if previous.get("identity") == prepared[path] and old.read_bytes() != data:
@@ -1309,6 +1584,11 @@ def publish_record_set(ctx, entries, *, expected_identities) -> dict[str, Path]:
             if parent.exists()
         )
         legacy = any(list((directory / identity["check_id"]).glob("[0-9a-f]" * 64 + ".json")) for identity in expected)
+        legacy = legacy or any(
+            _unscoped_record_path(ctx, identity) != _record_path(ctx, identity)
+            and _unscoped_record_path(ctx, identity).exists()
+            for identity in expected
+        )
         if not (unchanged and exact_files and not legacy):
             temporary = Path(tempfile.mkdtemp(prefix=f".set-{directory.name}-", dir=directory.parent))
             staged = temporary / directory.name

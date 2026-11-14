@@ -52,13 +52,11 @@ from arctic_platform.correctness.harness.gateway import gateway
 from arctic_platform.correctness.harness.gateway import pack
 from arctic_platform.correctness.harness.gateway import rl_gpu_count
 from arctic_platform.correctness.harness.gateway import running_job
-from arctic_platform.correctness.harness.gateway import validate_reduced_fixture_support
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
 from arctic_platform.correctness.harness.sft import save
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import require_data_fast_path
-from arctic_platform.correctness.reference.process_determinism import CUBLAS_WORKSPACE
 
 from ..models import validate_local_full_model
 from ..reference.model_features import uses_mixer_packing
@@ -144,7 +142,6 @@ class RunContext:
             SEED,
             slots=self.cfg.n_gpus,
             attn_implementation=self.attn_implementation,
-            spec=self.spec,
         )
 
     def reference_for(self, arm: ArmSpec) -> dict:
@@ -175,6 +172,7 @@ def run_reference(
     learning_rate: float | None = None,
     gradient_clipping: float | None = None,
     optimizer_dtype: str = "float32",
+    optimizer_compute_dtype: str | None = None,
     optimizer_output_dir: Path | None = None,
     cuda_device: int | None = None,
     deterministic: bool = True,
@@ -230,6 +228,8 @@ def run_reference(
             str(learning_rate),
             "--optimizer-dtype",
             optimizer_dtype,
+            "--optimizer-compute-dtype",
+            optimizer_compute_dtype or optimizer_dtype,
             "--optimizer-output-dir",
             str(optimizer_output_dir),
         ]
@@ -240,6 +240,8 @@ def run_reference(
     # 18.6 GiB reserved but unallocated. Expandable segments return that.
     env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
     if deterministic:
+        from arctic_platform.model.implementations.debug.determinism import CUBLAS_WORKSPACE
+
         # A comparison has to be repeatable to mean anything, so both arms pin every reduction order that can
         # be pinned. The reference decides for itself whether to ask flash attention for a deterministic
         # backward, because only the process holding the kernel can ask it.
@@ -362,7 +364,7 @@ def _cortex_rejection(
         reason is None
         and test.compares_to_reference
         and cfg.training.get("peft_config")
-        and (not (native_e2e_adapter or native_first_two_adapter))
+        and not (native_e2e_adapter or native_first_two_adapter)
     ):
         reason = "Cortex reference comparisons cannot export the product-initialized LoRA adapter"
     if reason is None:
@@ -513,8 +515,8 @@ def execute(
         if (
             select != ["inference-checkpoint-loss"]
             or prepare_references
-            or (not isinstance(client_backend, CortexConfig))
-            or (not is_local_cortex_gateway(client_backend))
+            or not isinstance(client_backend, CortexConfig)
+            or not is_local_cortex_gateway(client_backend)
         ):
             raise ValueError("export locality admission requires only local Cortex inference-checkpoint-loss")
         validate_local_inference_allocation(inference_export_allocation)
@@ -535,12 +537,12 @@ def execute(
             not isinstance(client_backend, CortexConfig)
             or cortex_fixture is not None
             or local_cortex_fixture
-            or (not select)
-            or (not set(select) <= {"e2e-sft-train-validate", "inference-checkpoint-loss"})
+            or not select
+            or not set(select) <= {"e2e-sft-train-validate", "inference-checkpoint-loss"}
         ):
             raise ValueError("local full model requires one loopback Cortex backend and only full-model checks")
         local_full_model_path = str(validate_local_full_model(client_backend, cfg, spec))
-    if local_cortex_fixture and (not prepare_references):
+    if local_cortex_fixture and not prepare_references:
         from arctic_platform.correctness.harness.cortex import load_local_fixture
 
         if not isinstance(client_backend, CortexConfig) or cortex_fixture is not None:
@@ -623,6 +625,7 @@ def execute(
             spec.model.cache_path, label="local Cortex reference model"
         ):
             raise ValueError("local optimizer fixture must match the frozen optimizer reference model")
+    optimizer_compute_dtype = cfg.optimizer_compute_dtype(reference_model_path) if stepping else None
     target_model = published_fixture["model_name"] if published_fixture is not None else reference_model_path
     tmp = workdir if workdir is not None else correctness_workdir("ap-correctness-")
     tmp.mkdir(parents=True, exist_ok=True)
@@ -673,13 +676,15 @@ def execute(
     run_started = time.monotonic()
     per_arm_tests = [t for t in chosen if t.per_arm is not None]
     whole_run_tests = [t for t in chosen if t.per_arm is None]
-    collect_gradient_norms = any((t.test_id == "single-step-grads" for t in chosen))
+    collect_gradient_norms = any(t.test_id == "single-step-grads" for t in chosen)
     first_two_payload = bool(
-        not cfg.is_rl and per_arm_tests and all((test.test_id in first_two_ids for test in per_arm_tests))
+        not cfg.is_rl and per_arm_tests and all(test.test_id in first_two_ids for test in per_arm_tests)
     )
 
     def payload_for(arm: ArmSpec) -> dict:
         """One job per case, asking for the optimizer artifacts only when the step check reads them."""
+        from arctic_platform.debug.training import maybe_bind_reduced_fixture_mtp
+
         optimizer_state_output_dir = None
         if stepping and (not isinstance(client_backend, CortexConfig)):
             optimizer_state_output_dir = require_data_fast_path(
@@ -695,11 +700,9 @@ def execute(
             gradient_norms_per_param=collect_gradient_norms,
             weight_format=cfg.sub_job.get("weight_format"),
         )
+        maybe_bind_reduced_fixture_mtp(payload, spec, published_fixture)
         if first_two_payload:
-            validate_reduced_fixture_support(payload, spec, published_fixture)
             payload["training_config"]["debug"]["correctness_first_two"] = True
-        else:
-            validate_reduced_fixture_support(payload, spec, published_fixture)
         if isinstance(client_backend, CortexConfig):
             payload["training_config"]["debug"].pop("optimizer_state_output_dir", None)
             if cfg.gpu_type is not None:
@@ -850,6 +853,7 @@ def execute(
                 learning_rate=OPTIMIZER_LEARNING_RATE if stepping else None,
                 gradient_clipping=cfg.training.get("gradient_clipping"),
                 optimizer_dtype=cfg.optimizer_dtype,
+                optimizer_compute_dtype=optimizer_compute_dtype,
                 optimizer_output_dir=optimizer_output_dir,
                 cuda_device=cuda_device,
                 deterministic=deterministic,
@@ -917,6 +921,7 @@ def execute(
                     "learning_rate": OPTIMIZER_LEARNING_RATE,
                     "gradient_clipping": cfg.training.get("gradient_clipping"),
                     "dtype": cfg.optimizer_dtype,
+                    "compute_dtype": optimizer_compute_dtype,
                 }
                 if stepping
                 else None
@@ -1186,7 +1191,13 @@ def execute_rl(
     inference_export_allocation: dict | None = None,
     inference_initial_model_dir: Path | None = None,
 ) -> List[TestResult]:
-    """Run each selected reference-free RL check independently at the declared training and sampling widths."""
+    """Run the checks of a reinforcement-learning config that compare its two zones with each other.
+
+    Tests against the single-GPU reference are the caller's to report as inapplicable. Every other applicable
+    test runs once, and both sub-jobs run at the widths the config declares. The RL checks build their own
+    requests from the training and sampling sub-jobs; a check that trains on generated batches, such as
+    ``checkpoint-resume-loss``, runs the selected reviewed cases in the spec's order.
+    """
     if workdir is not None:
         workdir = require_data_fast_path(workdir, label="RL correctness workdir")
     client_backend = client_backend if client_backend is not None else OnPremConfig()
@@ -1220,7 +1231,7 @@ def execute_rl(
         names = [arm.name for arm in arms]
         if len(wanted) != len(cases) or len(set(names)) != len(names):
             raise ValueError("selected and reviewed case names must be unique")
-        if unknown := (wanted - set(names)):
+        if unknown := wanted - set(names):
             raise ValueError(f"unreviewed case selection: {', '.join(sorted(unknown))}")
         arms = [arm for arm in arms if arm.name in wanted]
     cfg = cfg.at_gpu_width(cfg.n_gpus)
@@ -1289,7 +1300,7 @@ def execute_rl(
                 produced = list(test.fn(context))
             except UnsafeCleanupError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - one failing check must not hide the rest
                 traceback.print_exc()
                 produced = [
                     TestResult(

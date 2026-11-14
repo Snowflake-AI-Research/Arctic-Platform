@@ -26,6 +26,7 @@ import os
 import sys
 import time
 import traceback
+from contextlib import ExitStack
 from contextlib import contextmanager
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
@@ -471,8 +472,29 @@ def _run_vocab_size(
         return int(getattr(model_cfg, "text_config", model_cfg).vocab_size)
 
 
+def _configure_e2e_model(args, cfg, selection) -> None:
+    """Select original weights for local supervised E2E unless a fixture was explicitly requested."""
+    if (
+        cfg.is_rl
+        or getattr(args, "backend", "cortex") not in {"cortex", "cortex-training"}
+        or set(selection) != {"e2e-sft-train-validate"}
+        or getattr(args, "local_cortex_fixture", False)
+        or getattr(args, "cortex_fixture", None) is not None
+        or getattr(args, "probe_layers", None) is not None
+    ):
+        return
+    candidate = copy.copy(args)
+    if not any(
+        getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}") for name in ("base_url", "host")
+    ):
+        candidate.base_url = "http://127.0.0.1:1"
+    if is_local_cortex_gateway(_client_backend(candidate)):
+        args.local_gateway_full_model = True
+
+
 def _configure_regression_target(args):
     """Supported config regression owns a local service only when no endpoint is configured."""
+    e2e_only = set(args.test or ()) == {"e2e-sft-train-validate"}
     if (
         getattr(args, "backend", "cortex") == "onprem"
         or not args.config
@@ -481,23 +503,31 @@ def _configure_regression_target(args):
         or not (
             set(args.test) <= {"single-step-grads", "single-step-optimizer"}
             or set(args.test) == {"checkpoint-resume-loss"}
+            or set(args.test) == {"e2e-sft-train-validate"}
         )
         or getattr(args, "cortex_fixture", None) is not None
-        or getattr(args, "local_gateway_full_model", False)
-        or any(
-            getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}")
-            for name in ("base_url", "host")
+        or (getattr(args, "local_gateway_full_model", False) and not e2e_only)
+        or (
+            not e2e_only
+            and any(
+                getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}")
+                for name in ("base_url", "host")
+            )
         )
     ):
         return args
-    if load_config(_resolve_configs(args, filter_by_local_gpu=False)[0]).is_rl and args.test != [
-        "checkpoint-resume-loss"
-    ]:
+    cfg = load_config(_resolve_configs(args, filter_by_local_gpu=False)[0])
+    if cfg.is_rl and args.test != ["checkpoint-resume-loss"]:
         return args
     args = copy.copy(args)
+    _configure_e2e_model(args, cfg, args.test)
+    if any(
+        getattr(args, name, None) or os.environ.get(f"ARCTIC_CORTEX_{name.upper()}") for name in ("base_url", "host")
+    ):
+        return args
     args._automatic_cortex_gateway = True
     args._automatic_checkpoint_bridge = "checkpoint-resume-loss" in args.test
-    args.local_cortex_fixture = True
+    args.local_cortex_fixture = not getattr(args, "local_gateway_full_model", False)
     args.base_url = "http://127.0.0.1:1"
     require_local_cortex_gateway(_client_backend(args))
     return args
@@ -508,19 +538,20 @@ def _regression_gateway(args, *, runtime_admission: dict | None = None):
     if not getattr(args, "_automatic_cortex_gateway", False):
         yield None
         return
-    if not getattr(args, "_automatic_checkpoint_bridge", False):
-        with local_cortex_gateway(
-            Path(args.out),
-            gateway_module="arctic_platform.correctness.harness.gateway",
-            **({"runtime_admission": runtime_admission} if runtime_admission is not None else {}),
-        ) as url:
-            yield url
-        return
-    from arctic_platform.correctness.harness.cortex import local_checkpoint_bridge
+    with ExitStack() as stack:
+        if getattr(args, "_automatic_checkpoint_bridge", False):
+            from arctic_platform.correctness.harness.cortex import local_checkpoint_bridge
 
-    with local_checkpoint_bridge():
-        with local_cortex_gateway(Path(args.out), gateway_module="arctic_platform.correctness.harness.gateway") as url:
-            yield url
+            stack.enter_context(local_checkpoint_bridge())
+        with console.activity("Starting Arctic Platform gateway"):
+            url = stack.enter_context(
+                local_cortex_gateway(
+                    Path(args.out),
+                    gateway_module="arctic_platform.correctness.harness.gateway",
+                    **({"runtime_admission": runtime_admission} if runtime_admission is not None else {}),
+                )
+            )
+        yield url
 
 
 def _validate_regression_tokens(args) -> int | None:
@@ -582,13 +613,11 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         not remote
         or not args.config
         or args.all_configs
-        or (fixture_path is not None)
-        or (not args.test)
-        or (
-            not (
-                set(args.test) <= {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}
-                or set(args.test) == {"checkpoint-resume-loss"}
-            )
+        or fixture_path is not None
+        or not args.test
+        or not (
+            set(args.test) <= {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}
+            or set(args.test) == {"checkpoint-resume-loss"}
         )
     ):
         raise SystemExit(
@@ -599,9 +628,9 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         or not args.config
         or args.all_configs
         or local_fixture
-        or (fixture_path is not None)
-        or (not args.test)
-        or (not set(args.test) <= {"e2e-sft-train-validate", "inference-checkpoint-loss"})
+        or fixture_path is not None
+        or not args.test
+        or not set(args.test) <= {"e2e-sft-train-validate", "inference-checkpoint-loss"}
     ):
         raise SystemExit("--local-gateway-full-model requires one Cortex config and only e2e/inference")
     if local_fixture or local_full_model:
@@ -625,13 +654,16 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         raise SystemExit(f"unknown check(s): {', '.join(unknown)}")
     selected_ids = set(args.test or tests)
     first_two_ids = {"single-step-grads", "single-step-optimizer"}
-    first_two_selection = bool(selected_ids and selected_ids <= first_two_ids)
     automatic_first_two = bool(
         getattr(args, "_automatic_cortex_gateway", False)
         and args.test
-        and (selected_ids <= first_two_ids)
-        and (not getattr(args, "_automatic_checkpoint_bridge", False))
+        and selected_ids <= first_two_ids
+        and not getattr(args, "_automatic_checkpoint_bridge", False)
     )
+    automatic_e2e = bool(
+        getattr(args, "_automatic_cortex_gateway", False) and selected_ids == {"e2e-sft-train-validate"}
+    )
+
     for path in config_paths:
         automatic_allocation = None
         try:
@@ -680,15 +712,16 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 if selected_gpus is not None
                 else (
                     [cfg.n_gpus]
-                    if local_fixture
-                    and (not first_two_selection)
-                    or local_full_model
-                    or topology is not None
-                    or (inference_export_allocation is not None)
+                    if (
+                        (local_fixture and not automatic_first_two)
+                        or local_full_model
+                        or topology is not None
+                        or inference_export_allocation is not None
+                    )
                     else placement_widths(cfg.n_gpus, pool)
                 )
             )
-            if automatic_first_two and (not cfg.is_rl):
+            if automatic_first_two and not cfg.is_rl:
                 for width in widths:
                     validate_reference_accumulation(cfg.at_gpu_width(width), automatically_owned_local=True)
                 import torch
@@ -696,6 +729,12 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 if local_fixture and max(widths) > torch.cuda.device_count():
                     from .engine_admission import owned_allocation_admission
 
+                    automatic_allocation = owned_allocation_admission(cfg.at_gpu_width(max(widths)))
+            if automatic_e2e and local_fixture and not cfg.is_rl:
+                from .engine_admission import owned_allocation_admission
+                from .gateway import _allocation_hostfile
+
+                if _allocation_hostfile() is not None:
                     automatic_allocation = owned_allocation_admission(cfg.at_gpu_width(max(widths)))
         except (ValueError, KeyError) as exc:
             results.append(
@@ -826,8 +865,8 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                         cases=getattr(args, "case", None),
                         attn=args.attn[0] if args.attn else None,
                         client_backend=backend,
-                        **{"local_cortex_fixture": True} if local_fixture else {},
-                        **{"inference_sampling_topology": topology} if topology is not None else {},
+                        **({"local_cortex_fixture": True} if local_fixture else {}),
+                        **({"inference_sampling_topology": topology} if topology is not None else {}),
                         **(
                             {"inference_export_allocation": inference_export_allocation}
                             if inference_export_allocation is not None
@@ -937,7 +976,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 **(
                     {"local_full_model_path": inference_initial_model_dir}
                     if inference_initial_model_dir is not None
-                    else {"local_full_model_path": local_full_model_path} if local_full_model else {}
+                    else ({"local_full_model_path": local_full_model_path} if local_full_model else {})
                 ),
             )
             for width in widths:
@@ -954,17 +993,18 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                     if (
                         run_dense_allocation is None
                         and "single-step-optimizer" in selected_ids
-                        and (selected_ids <= first_two_ids)
+                        and selected_ids <= first_two_ids
                         and supports_dense_checkpoint_allocation(run_cfg)
-                        and (sum((node["slots"] for node in automatic_allocation["nodes"])) == run_cfg.dp_size)
+                        and sum(node["slots"] for node in automatic_allocation["nodes"]) == run_cfg.dp_size
                     ):
                         run_dense_allocation = automatic_allocation
                 if (
                     local_fixture
                     and "single-step-optimizer" in selected_ids
-                    and (selected_ids <= first_two_ids)
-                    and (run_cfg.training.get("ep_size", 1) > 1)
+                    and selected_ids <= first_two_ids
+                    and run_cfg.training.get("ep_size", 1) > 1
                 ):
+                    # EP checkpoints shard optimizer state per expert rank; only the native layout decodes them.
                     from arctic_platform.correctness.harness.native_optimizer import owner_split_execution
 
                     native_optimizer = owner_split_execution(run_cfg)
@@ -979,10 +1019,10 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                         select=args.test or None,
                         attn=args.attn[0] if args.attn else None,
                         client_backend=backend,
-                        **{"cortex_fixture": fixture_path} if fixture_path is not None else {},
-                        **{"local_cortex_fixture": True} if local_fixture else {},
-                        **{"local_gateway_full_model": True} if local_full_model else {},
-                        **{"inference_sampling_topology": topology} if topology is not None else {},
+                        **({"cortex_fixture": fixture_path} if fixture_path is not None else {}),
+                        **({"local_cortex_fixture": True} if local_fixture else {}),
+                        **({"local_gateway_full_model": True} if local_full_model else {}),
+                        **({"inference_sampling_topology": topology} if topology is not None else {}),
                         **(
                             {"inference_export_allocation": inference_export_allocation}
                             if inference_export_allocation is not None
@@ -999,13 +1039,13 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                             else {}
                         ),
                         **(
-                            {"peft_adapter": Path(args.peft_adapter)}
-                            if getattr(args, "peft_adapter", None) is not None
+                            {"dense_checkpoint_allocation": copy.deepcopy(run_dense_allocation)}
+                            if run_dense_allocation is not None
                             else {}
                         ),
                         **(
-                            {"dense_checkpoint_allocation": copy.deepcopy(run_dense_allocation)}
-                            if run_dense_allocation is not None
+                            {"peft_adapter": Path(args.peft_adapter)}
+                            if getattr(args, "peft_adapter", None) is not None
                             else {}
                         ),
                         **native_optimizer,
@@ -1114,6 +1154,8 @@ def run_batch(args, *, selected, executor=None):
                 groups.append([case])
     print(f"Selected {len(selected)} configuration/test pair(s); running sequentially.", flush=True)
     print("Selected tests: " + ", ".join(dict.fromkeys(case.test_id for case in selected)), flush=True)
+    print(f"Complete execution log (available during the run): {out / 'full.log'}", flush=True)
+    progress_stream = sys.stdout
     with (out / "full.log").open("w", encoding="utf-8") as log:
         for index, group in enumerate(groups):
             log.flush()
@@ -1137,7 +1179,8 @@ def run_batch(args, *, selected, executor=None):
                     specs.update(reviewed)
                     execution.update(metadata)
 
-                with _saved_output(log):
+                label = f"{group[0].config_id} / {', '.join(run_args.test)}"
+                with console.RunProgress(label, stream=progress_stream), _saved_output(log):
                     try:
                         _run_configs(run_args, executor=executor, snapshot=collect)
                     except KeyboardInterrupt:
@@ -1240,15 +1283,59 @@ def cmd_hosted(args) -> int:
 
 
 def cmd_list(args) -> int:
-    from ..api import catalog
+    from dataclasses import asdict
+
+    from ..api import RunRequest
+    from ..api import onboarding_status
+
+    try:
+        selector = getattr(args, "config", None)
+        if isinstance(selector, list):
+            selectors = list(dict.fromkeys(selector))
+            if len(selectors) > 1:
+                raise ValueError("give one unique --config selector")
+            selector = selectors[0] if selectors else None
+        statuses = onboarding_status(
+            RunRequest(
+                config=selector,
+                tests=tuple(getattr(args, "test", None) or ()),
+                config_dir=Path(args.config_dir),
+            ),
+            reference_records_dir=getattr(args, "reference_records_dir", None),
+        )
+    except ValueError as exc:
+        print(f"Cannot list: {exc}", file=sys.stderr)
+        return 2
+    tests = sorted(registered_tests().values(), key=lambda test: test.test_id)
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "schema": "correctness-onboarding-status-v1",
+                    "statuses": [asdict(status) for status in statuses],
+                    "tests": [
+                        {"test_id": test.test_id, "title": test.title, "criterion": test.criterion} for test in tests
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
 
     print("Configurations:")
-    for identifier in catalog(Path(args.config_dir)):
+    for identifier in sorted({status.config_id for status in statuses}):
         print(f"  {identifier}")
     print("Tests:")
-    for test in sorted(registered_tests().values(), key=lambda test: test.test_id):
+    for test in tests:
         print(f"{test.test_id:24s} {test.title}")
         print(f"{'':24s} criterion: {test.criterion}")
+    print("Config/test status (metadata only; historical outcomes do not establish current readiness):")
+    for status in statuses:
+        history = status.historical
+        print(f"  {status.config_id} / {status.test_id}: {status.status}")
+        print(f"    {status.reason}")
+        print(f"    recorded onboarding: {history.outcome or 'none'} ({history.state}); {history.reason}")
     return 0
 
 
@@ -1334,6 +1421,7 @@ def add_connection_arguments(parser, *, default_backend="cortex-training"):
 
 
 def parse_args(argv=None):
+    argv = list(argv) if argv is not None else sys.argv[1:]
     parser = argparse.ArgumentParser(prog="arctic_platform.correctness")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1454,8 +1542,14 @@ def parse_args(argv=None):
     )
     publish.add_argument("--out", required=True, help="new publication receipt JSON path")
     publish.set_defaults(func=cmd_publish_fixture)
-    list_parser = sub.add_parser("list", help="show registered tests")
+    list_parser = sub.add_parser("list", help="show tests and read-only config/test onboarding status")
     list_parser.add_argument("--config-dir", default=str(CONFIG_DIR))
+    list_parser.add_argument(
+        "--config", action="append", help="exact config ID or existing path; never imports the config"
+    )
+    list_parser.add_argument("--test", action="append", help="test ID filter (repeatable; duplicates collapsed)")
+    list_parser.add_argument("--reference-records-dir", type=Path, help="compact HF reference root to inspect")
+    list_parser.add_argument("--json", action="store_true", help="emit structured metadata and recorded outcomes")
     list_parser.set_defaults(func=cmd_list)
     h = sub.add_parser(
         "hosted",
@@ -1474,10 +1568,11 @@ def parse_args(argv=None):
     s = sub.add_parser("selftest", help="check the harness itself; no GPU and no config needed")
     s.add_argument("runner_args", nargs="*", help="extra arguments forwarded to the runner")
     s.set_defaults(func=cmd_selftest)
-    from ..onboarding import add_arguments
-
     o = sub.add_parser("onboard", help="size, calibrate, and freeze one config")
-    add_arguments(o)
+    if argv and argv[0] == "onboard":
+        from ..onboarding import add_arguments
+
+        add_arguments(o)
     o.set_defaults(func=cmd_onboard)
     return parser.parse_args(argv)
 

@@ -1,14 +1,35 @@
 # Running The Seven Correctness Tests
 
-**Run these commands from an already prepared, allocated head node.** The library does not allocate machines, install a runtime, download a missing reference during regression, or modify reviewed numerical gates. Onboarding and regression can start and stop their owned installed local DSS gateway. The correctness backend is `cortex-training`; `cortex` remains a compatibility alias.
+**Run these commands from the repository root on a prepared compute node.** Use the Python environment in which Arctic Platform and the required model runtimes are installed. The operator provides enough nodes, CPU memory, GPUs, GPU memory, and fast storage for the selected configuration. The harness does not allocate machines or install a GPU runtime. First-two onboarding and regression can manage their own installed local DSS gateway; later checks require their supported target runtime. Multi-node tests must use nodes within one allocation, never nodes from separate jobs.
 
 **This checkout registers seven correctness tests, including two reinforcement-learning (RL) comparisons.** `single-step-grads`, `single-step-optimizer`, `checkpoint-resume-loss`, `inference-checkpoint-loss`, `e2e-sft-train-validate`, `rl-weight-sync` and `rl-router-replay` are the registered IDs. The first five tests retain their existing workload identities and prerequisites. The two RL tests require narrowly scoped, opt-in trainer/sampler evidence: actual tensor-send and receiver-write records for weight synchronization, and received routing plus forward/backward router invocations for replay. CLI discovery and help do not import these observers; ordinary training and sampling calls leave them disabled.
 
-**Reduced first-two fixtures still need compatible native model loading.** A positive prediction-layer count that the installed loader cannot authenticate is an explicit prerequisite failure, not permission to drop layers or add production hooks. Later-only selection does not inherit this reduced-fixture workflow.
+## Before Running
+
+**A regression needs a reviewed configuration and its prerequisites.** Confirm:
+
+- The selected configuration has a reviewed specification under `arctic_platform/correctness/specs/`, or supplied with `--test-spec` for one explicit config.
+- The installed runtime supports the model, attention implementation, training topology, and checkpoint operations required by the test.
+- Required model files and checkpoints are accessible from this allocation.
+- Hugging Face reference measurements are already prepared for tests that need them. Regression never creates or replaces a missing baseline.
+- `/data-fast/tmp` is writable for generated fixtures and calibration scratch. Keep model weights and checkpoints out of Git; the demo uses `/checkpoint/huggingface` for model weights and the Git-ignored `./work/` directory inside the checkout for its native config and final reports.
+- The target runtime is installed. The default backend is `cortex-training`; supervised first-two regression starts its local gateway automatically when no Cortex host or base URL is configured. An explicitly configured endpoint must already be available.
+
+**Connection defaults come from environment variables; command-line options override them.** For an existing direct development gateway, for example:
+
+```bash
+export ARCTIC_CORTEX_BASE_URL=http://127.0.0.1:8003
+export ARCTIC_CORTEX_DATABASE=dev
+export ARCTIC_CORTEX_SCHEMA=dev
+```
+
+For an authenticated Cortex endpoint use `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DATABASE`, `ARCTIC_CORTEX_SCHEMA`, and `ARCTIC_CORTEX_PAT` instead of a direct URL. Supply the token through a protected environment or `--pat-file`, not through a configuration file or a pasted command. The operator-facing backend is `cortex-training`; `cortex` is a compatibility alias and `onprem` is rejected. For a local multi-node gateway, provide the same-job hostfile through `DSS_GATEWAY_HOSTFILE` and working allocation-local `ds_ssh`.
+
+**Large artifacts and small diagnostics have separate defaults.** Temporary model fixtures and tensor scratch use `/data-fast/tmp`; `AP_CORRECTNESS_TMPDIR` can select another directory under `/data-fast`. Small reports and complete logs use `./work/logs`, overridden by `AP_CORRECTNESS_LOGDIR` or a regression `--out` directory. Compact reference JSON files default to the locally retained `arctic_platform/correctness/reference_data` and remain untracked, not Git-ignored, until explicitly selected for publication; `--reference-records-dir` must select a directory inside the checkout, not scratch storage.
 
 ## Check-Specific Prerequisites
 
-**Registration is not proof that a target runtime can execute a check.** Install the compatible training/reference environment and the separately installed DSS gateway on the selected allocation. Inference additionally needs a compatible sampling runtime; CUDA and the configured attention kernels are separate prerequisites. Each participating host must import the admitted sources and read identical model, tokenizer and adapter assets. Use supported same-allocation distribution and node-local fast scratch; a head-node path is not shared storage.
+**Registration is not proof that a target runtime can execute a test.** Each participating host must import compatible training and sampling sources and read identical model, tokenizer and adapter assets. Use supported same-allocation distribution and node-local fast scratch; a head-node path is not shared storage. Reduced first-two fixtures still require authenticated native prediction-weight loading when configured prediction layers are present. Missing loader capability is a prerequisite error, not permission to drop layers or add an RL observer workaround.
 
 | Check | Required execution evidence |
 | --- | --- |
@@ -17,13 +38,25 @@
 | `inference-checkpoint-loss` | Supported training-to-sampling checkpoint export, validated weights/config/tokenizer schema, identical saved weights available on each sampling node, supported sampling payload/runtime and matching answer-token coverage. Successful export alone does not establish sampler initialization or loss agreement. |
 | `e2e-sft-train-validate` | SFT configuration, matching initial weights or adapters, the same ordered 100-step replay and held-out validation inputs, compatible HF trajectory records and the target training runtime. Full-model mode requires its separately admitted local snapshot; reduced first-two records cannot substitute for an E2E record. |
 | `rl-weight-sync` | A native local training/sampling route, one completed RL optimizer step, collective trainer inventory, every sampling rank's received-tensor records and actual destination-write or LoRA-install proof. FP8 replay needs a supported independent updater. Sender checksums alone are insufficient. |
-| `rl-router-replay` | A supported MoE model with identifiable routers, sampler routing capture, trainer RX-cache observations, immutable successful-backward records for every actual rank and model call, and model-bound router-layer inventory. Routing and captured-token coverage must match exactly. |
+| `rl-router-replay` | A supported mixture-of-experts (MoE) model with identifiable routers, sampler routing capture, trainer received-routing-cache observations, immutable successful-backward records for every actual rank and model call, and model-bound router-layer inventory. Routing and captured-token coverage must match exactly. |
 
 **Later-only selection retains its configured supported precision and ordinary training lifecycle.** The first-two BF16/FP32 admission and participation/optimizer capture do not become requirements for a selected later check. Do not change the recipe, widen a reviewed gate or add unrelated production changes to obtain a pass. The RL tests additionally require their enabled evidence observers and compatible native training/sampling runtimes.
 
 **Missing capabilities remain separate non-passes.** Config-only onboarding attempts applicable checks independently; it does not infer later prerequisites from a successful first-two fixture. Unsafe cleanup stops subsequent workloads. CPU controls, command help and registration are not numerical or GPU evidence.
 
-**Automatic regression startup is narrower than registration.** The current local startup helper recognizes an explicit first-two-only selection or a resume-only selection. A default mixed selection, inference or E2E still needs the admitted execution route; listing seven IDs does not install or start missing services. Keep the config-only default example and report any missing route as a non-pass rather than silently narrow the selected checks.
+**Automatic regression startup is narrower than registration.** The [local startup helper](../harness/execution.py) recognizes an explicit first-two-only selection, a resume-only selection or a supervised E2E-only selection. Default mixed regression selections, inference and RL still need an admitted execution route; listing seven IDs does not install or start missing services. Config-only onboarding selects the execution mode independently for each test.
+
+**Local supervised E2E automatically uses the original full model.** `onboard --test e2e-sft-train-validate` and `run --test e2e-sft-train-validate` select the admitted original checkpoint without requiring `--local-gateway-full-model`. With no configured endpoint, the harness owns gateway startup and cleanup; an explicit loopback `--base-url` remains externally owned. Gradient and optimizer children, including the automatic specification prerequisite, keep their reduced fixtures. An explicit `--local-cortex-fixture` or published `--cortex-fixture` retains fixture mode; hosted, on-prem and RL execution are unchanged.
+
+**Automatic selection does not waive full-model prerequisites.** Stage the pinned snapshot and tokenizer under `/data-fast`, set `HF_HUB_CACHE` to that cache, and retain `HF_HUB_OFFLINE=1` and `DSS_ALLOW_REMOTE_MODELS=1`. Multi-node execution still needs the same-job hostfile described below. Qwen3-0.6B's original single-file safetensors checkpoint is admitted by its pinned weight digest and complete tensor schema. Missing admission, cache assets or compatible trajectory records fail explicitly; the harness never falls back to a reduced model.
+
+```bash
+python -m arctic_platform.correctness onboard \
+  --config ../cortex-training/model-catalog/models/qwen3-0.6b/standard/h200-training-full.json \
+  --test e2e-sft-train-validate
+```
+
+**RL observers record existing production operations without replacing them.** Tensor sends, receiver writes, optimizer steps and router execution stay on their ordinary paths. Descriptive one-line `maybe_...` calls delegate opt-in checks and evidence capture to `arctic_platform/debug/`; disabled calls preserve ordinary behavior. These observers do not authorize unrelated startup, allocation, model-loading or cleanup workarounds.
 
 ## Prerequisites
 
@@ -36,6 +69,8 @@
 - Choose persistent locations for the checkout, downloaded source model, native config and final reports. Supply the native config (`.config` or `.json`) to onboarding; it creates the specification and references. Regression requires those reviewed inputs. No real configurations, specifications or measurements are bundled.
 
 ## Checks
+
+**Execution reports the active configuration and test before backend work starts.** After `Selected tests`, the command prints the complete log path, preparation status, and gateway or test-arm phases as they begin. While a phase is waiting, a status line appears every 30 seconds with elapsed time. These lines confirm that the controller is waiting, not that a remote backend is healthy or making numerical progress. Detailed output stays in `full.log`, available during the run; completion and failure diagnostics retain their existing format.
 
 **Seven correctness tests are registered.** Config-only selection includes every applicable check. An explicit check ID selects that workload without changing its inputs, precision or reviewed gate.
 
@@ -51,19 +86,43 @@
 
 **Optimizer norm agreement is not elementwise agreement.** Equal L2 norms can hide a sign change, permutation, or directional error. Regression uses the reviewed criterion and calibrated gate stored in the prepared record; regression never widens that gate.
 
+## Query Onboarding Status
+
+**`list` inspects configuration/test metadata without running workloads.** It reads existing recipes, specifications, compact Hugging Face (HF) reference records and onboarding summaries; it does not import external configs, publish records, start a gateway or inspect GPUs. Unreviewed recipes remain visible, including configs whose specification is missing.
+
+```bash
+python -m arctic_platform.correctness list
+python -m arctic_platform.correctness list --config <ID-or-path> --test single-step-grads
+python -m arctic_platform.correctness list --config <ID-or-path> --json
+```
+
+**The Python API returns one structured result per selected config/test pair.** `onboarding_status(RunRequest(...))` uses the same IDs and recipe parser as regression. Omit the config selector to inspect every discovered recipe, including unreviewed configs. Repeated test IDs are collapsed; unknown IDs and conflicting config selectors are errors. External paths are read in place; when explicit recipe/path hardware permits deriving the import identity, the query uses that identity without creating a local config or probing hardware. `--config-dir` changes recipe discovery and `--reference-records-dir` changes the inspected reference root; reviewed specifications and summaries remain under this package's `specs/`.
+
+```python
+from dataclasses import asdict
+from arctic_platform.correctness.api import RunRequest, onboarding_status
+
+rows = onboarding_status(RunRequest(config="<ID-or-path>", tests=("single-step-grads",)))
+data = [asdict(row) for row in rows]
+```
+
+**Metadata validity is not runtime readiness or a passing validation.** Each result separates `spec`, `references` and `historical`. Specs are checked against the current config checksum, case shapes, attention and per-test coverage; missing, stale and malformed artifacts include a reason. Current reference filenames are checked for schema, payload integrity, config/check identity, frozen gradient gate, case shape and complete scalar measurements. `metadata_valid` does not authenticate the complete reference workload, installed dependencies, model/adapter bytes, wider placements or current target capabilities; regression performs its own admission checks. Legacy content-addressed records are not authenticated by this query and require regression's full identity check. Selecting gradients alone inspects `gradients-only` records; selecting gradients with an applicable optimizer check inspects `with-optimizer` records.
+
+**Recorded onboarding outcomes remain historical.** `historical.outcome` preserves the recorded outcome, while `historical.state` distinguishes matching current per-test spec identity (`current_spec`), stale identity, older unbound evidence, missing evidence and malformed evidence. A matching identity does not authenticate today's runtime or options, and a recorded success cannot substitute for missing references. A missing summary does not invalidate an imported reviewed spec or change regression selection. JSON output uses schema `correctness-onboarding-status-v1`; querying missing artifacts succeeds and reports their status, while invalid selectors return exit code 2.
+
+**Rerun onboarding when compatible references are missing.** The config-only `onboard --config <ID-or-path>` workflow prepares the selected references automatically, including the combined gradient/optimizer records; no separate operator preparation step is needed.
+
 ## Setup
 
-**This quick demo uses `axolotl-ai-co/tiny-qwen3-129m`, a 129M-parameter Qwen3 model, with 128-token sequences on one exclusively allocated H200 GPU.** Activate a Python 3.12+ environment with working CUDA, FlashAttention-3 kernels and the installed upstream DSS GPU gateway first. The `correctness` extra installs the Cortex client, training and Hugging Face reference dependencies, and CPU selftest tools; it does not install the separate DSS service, CUDA or model-specific attention kernels. Use the existing `/checkpoint/huggingface` cache; Hugging Face downloads missing model files there automatically, requiring network access and sufficient cache space. The gateway uses the allocation's Ray runtime, so do not run on a shared cluster. No fresh GPU verification is established by the controls for gateway, progress and timing changes.
+**This quick demo uses `axolotl-ai-co/tiny-qwen3-129m` and 128-token sequences on one exclusively allocated H200 GPU in the seven-test checkout.** The first-two comparisons use a reduced supervised fixture; later tests retain their own prerequisites, and the training-only demo does not supply a sampling service or RL workload. Activate a Python 3.12+ environment with working CUDA, FlashAttention-3 kernels and the installed upstream DSS GPU gateway first. The `correctness` extra installs the Cortex client, training and Hugging Face (HF) reference dependencies, and CPU selftest tools; it does not install the separate DSS service, CUDA, model-specific kernels, or the sampling runtime needed by later tests. Hugging Face reuses `/checkpoint/huggingface` and downloads missing model files there automatically.
 
-**Only the first two checks require BF16 model weights and verified FP32 gradient accumulation.** An explicit `data_types.grad_accum_dtype: "fp32"` is accepted without runtime-default inspection. An omitted value requires the automatically owned local service to verify the installed engine's resolved default. No recipe override is applied. Explicit later-only selection retains the config's supported dtype and does not arm first-two participation or optimizer-state capture. The demo's `--fp32` suffix denotes accumulation, not model dtype.
-
-**Start in the directory where you want to keep the checkout and results, then copy the blocks in order.** No pre-existing config, specification or measurement is needed. After cloning, remain in the Arctic Platform checkout: the demo config and final reports use its Git-ignored `./work/` directory. Model weights stay in `/checkpoint/huggingface`, not the checkout. A specification is generated JSON describing the reduced fixture, input batches, applicable checks and calibrated tolerances. Reference records contain compact measurements from independent single-GPU Hugging Face runs, not tensor payloads. Records must be inside the executing library's checkout, but that checkout need not be on temporary storage. Generated fixtures and calibration scratch use temporary allocation-local defaults; retain printed preparation logs separately if the allocation will disappear.
+**Start in the directory where you want to keep the checkout and results, then copy the blocks in order.** After cloning, remain in the Arctic Platform checkout: the demo config and final reports use its Git-ignored `./work/` directory. Model weights stay in `/checkpoint/huggingface`, not the checkout. Specifications describe the reduced model fixture, input batches, applicable checks and calibrated tolerances; compact reference records contain independent single-GPU Hugging Face measurements. Onboarding creates both automatically. Compact records must be inside the executing library's checkout, but that checkout need not be on temporary storage. Generated fixtures and calibration tensor scratch use allocation-local fast storage and may disappear when the node is recycled. Onboarding automatically retains logs and recovery metadata under the checkout's `./work/logs/`.
 
 ```bash
 set -e
-mkdir -p ./correctness-no-debug
-cd ./correctness-no-debug
-git clone --single-branch --branch stas/correctness-testing-rl-minimal-debug \
+mkdir -p ./correctness-demo
+cd ./correctness-demo
+git clone --single-branch --branch stas/correctness-testing \
   https://github.com/Snowflake-AI-Research/Arctic-Platform.git \
   ./Arctic-Platform
 cd ./Arctic-Platform
@@ -105,7 +164,6 @@ config = {
             "gradient_accumulation_steps": 1,
             "zero_optimization": {"stage": 2},
             "bf16": {"enabled": True},
-            "data_types": {"grad_accum_dtype": "fp32"},
             "gradient_clipping": 1.0,
             "optimizer": {
                 "type": "AdamW",
@@ -132,7 +190,7 @@ config = {
         "schema": "dev",
     },
 }
-Path("./work/configs/tiny-qwen3-129m-one-h200--fp32.json").write_text(
+Path("./work/configs/tiny-qwen3-129m-one-h200.json").write_text(
     json.dumps(config, indent=2) + "\n"
 )
 PY
@@ -140,7 +198,7 @@ PY
 
 **The config uses the remote Cortex protocol, matching the correctness commands' `cortex-training` backend.** The loopback URL on port 1 is a non-serving placeholder required by the client schema. Onboarding and regression replace that placeholder with their automatically started gateway's actual URL. Do not start a server on port 1 or export the placeholder as `ARCTIC_CORTEX_BASE_URL`; an explicit endpoint selects an externally managed service. `--backend onprem` is rejected.
 
-**The example uses full fine-tuning, not low-rank adaptation (LoRA).** Native `training.peft` or `training.ds_worker_config.peft_config` is detected automatically. For local first-two testing, the correctness-owned gateway installs the same generated adapter used by the HF reference and checks its identity and parameter coverage. Hosted Cortex does not admit this reduced-fixture shared-adapter workflow. See [LoRA without adapter inputs](#lora-without-adapter-inputs).
+**The example uses full fine-tuning, not low-rank adaptation (LoRA).** Native `training.peft` or `training.ds_worker_config.peft_config` enables automatic reference generation and the admitted local first-two shared-adapter route. That route does not establish hosted or later-test LoRA support. See [LoRA without adapter inputs](#lora-without-adapter-inputs).
 
 ### Imported Config And Reference Locations
 
@@ -148,15 +206,11 @@ PY
 
 **Catalog recipes keep their complete path below `cortex-training/model-catalog/models/`.** Replace that prefix with `arctic_platform/correctness/configs/`, preserving every remaining directory and filename. For example, `qwen3.5-2b/standard/h200-inference-lora.json` retains that relative path even though the recipe is inference-only. Import recipe JSON, not the catalog's `model.json` metadata.
 
-**Noncatalog configs use `<model-name>/<standard|long>/<gpu>-<training|inference>-<full|lora>.json` with any explicit `--<variant>` suffix.** The model name is the lowercase model basename without the repository owner; an HF cache snapshot uses the model component, not the snapshot hash. Only an explicit `max_tokens_per_mb >= 262144` selects `long`, including a training sub-job's `mb_spec` or native `training.ds_worker_config.mb_spec`; missing or smaller budgets select `standard`, regardless of `max_seq_len` or runtime defaults. Training takes precedence over sampling when both exist, and `lora` comes from the selected job's nonempty parameter-efficient fine-tuning (PEFT) settings; otherwise use `full`. Resolve the GPU from explicit recipe hardware, an existing accelerator directory or filename, or the executing GPU; missing hardware identity is not permission to guess. The demo imports as `configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json`, retaining the source filename's explicit `--fp32` suffix.
+**Noncatalog configs use `<model-name>/<standard|long>/<gpu>-<training|inference>-<full|lora>.json`.** The model name is the lowercase model basename without the repository owner; an HF cache snapshot uses the model component, not the snapshot hash. Only an explicit `max_tokens_per_mb >= 262144` selects `long`, including a training sub-job's `mb_spec` or native `training.ds_worker_config.mb_spec`; missing or smaller budgets select `standard`, regardless of `max_seq_len` or runtime defaults. Training takes precedence over sampling when both exist, and `lora` comes from the selected job's nonempty parameter-efficient fine-tuning (PEFT) settings; otherwise use `full`. Resolve the GPU from explicit recipe hardware, an existing accelerator directory or filename, or the executing GPU; missing hardware identity is not permission to guess. The demo therefore imports as `configs/tiny-qwen3-129m/standard/h200-training-full.json`, regardless of its source filename.
 
-**Reference folders mirror the imported config path without its extension.** The new demo's compact records use `arctic_platform/correctness/reference_data/tiny-qwen3-129m/standard/h200-training-full--fp32/<check-id>/...`. `--reference-records-dir` changes only the root prefix. Existing check-specific subdirectories and measurement filenames remain unchanged; see the [reference layout](hf-reference-onboarding.md#configuration-and-reference-layout) for examples.
+**Reference folders mirror the imported config path without its extension.** The demo's compact records use `arctic_platform/correctness/reference_data/tiny-qwen3-129m/standard/h200-training-full/<check-id>/...`. `--reference-records-dir` changes only the root prefix. Existing check-specific subdirectories and measurement filenames remain unchanged; see the [reference layout](hf-reference-onboarding.md#configuration-and-reference-layout) for examples.
 
-**Migrated config IDs remain frozen through `arctic_platform/correctness/config-layout.json`; new IDs derive from relative paths when no manifest entry exists.** New IDs join the config-relative path components, without the extension, with `-`. The new demo derives `tiny-qwen3-129m-standard-h200-training-full--fp32`; the historical unsuffixed tiny config keeps the manifest-frozen `tiny-qwen3-129m-one-h200` ID. Specifications remain `specs/<config-id>.json` and summaries remain `specs/<config-id>.onboarding.json`; use the resolved ID printed by the command or `list`, not the original filename. Historical measurement bytes and recorded identities are not rewritten or remeasured.
-
-**Recipe variants distinguish different bytes at the same derived placement.** Distinct migrated recipes retain descriptive `--<variant>` filename suffixes and their frozen IDs. For a new noncatalog variant, append a lowercase descriptive suffix such as `--sft-4gpus` to the source filename stem before importing; changing the source basename alone does not distinguish recipes. Catalog imports retain their exact relative filenames, and conflicting bytes at that destination are rejected.
-
-**The demo uses a new explicit FP32 variant for the first-two comparisons.** The explicit accumulation setting does not change the BF16 model dtype. Keep the historical recipe, specifications and reference bytes unchanged; the new variant needs compatible preparation. Default-all selection also attempts applicable later checks, but this training-only config does not supply a sampling runtime or establish resume/export/full-SFT capabilities.
+**Existing config IDs remain frozen through `arctic_platform/correctness/config-layout.json`, even after their files move.** Specifications remain `specs/<config-id>.json` and summaries remain `specs/<config-id>.onboarding.json`; use the ID printed by the command or `list`, not a guess based on the new folder. Historical measurement bytes and recorded identities are not rewritten or remeasured. Distinct old recipes sharing a derived placement retain descriptive `--<variant>` filename suffixes. New imports with conflicting bytes require an explicit distinct variant, not an overwrite.
 
 ## Onboarding
 
@@ -164,63 +218,53 @@ PY
 
 **Automatically managed local Cortex-training onboarding checks the target allocation too.** When the configured GPU count exceeds the local node's visible GPUs, onboarding checks every host using the existing `ds_ssh` transport and invoking Python executable. It requires every host to respond, checks GPU counts against the hostfile slots and rejects differing target dependency versions. Set `ARCTIC_HOSTFILE` or `DSS_GATEWAY_HOSTFILE` to the same-job hostfile, or use the allocation's `/job/hostfile`. Without a hostfile, a single-node gateway gets an automatically generated local hostfile. Reference dependencies and the original checkpoint are checked on the reference node; target dependencies and writable scratch/cache locations are checked on each host without assuming `/data-fast` is shared. An explicitly supplied gateway is not owned or inspected by this command. These checks do not predict model memory use or prove successful kernel execution; sizing and validation still follow.
 
-**Give onboarding only the config; all applicable checks are attempted independently.** No test selector or separate reference-preparation command is required for default-all onboarding. The first-two checks retain their reduced fixture workflow. Later checks need resumable state for checkpoint resume, checkpoint export plus a compatible sampler for inference, or full ordered SFT inputs and a prepared HF record for E2E. A missing capability remains that check's reported non-pass and does not suppress independent selected checks. The config-only demo is not proof that all seven tests or their numerical comparisons passed.
+**Give onboarding only the config; all applicable tests are attempted independently.** No test selector or separate reference-preparation command is required for default-all onboarding. The harness derives the checkpoint from `model_name`, prepares fixture prerequisites, calibrates gates, publishes individual and combined-selection references, and validates each target. The first-two tests retain their reduced fixture workflow. Later tests need resumable state for checkpoint resume, checkpoint export plus a compatible sampler for inference, full ordered SFT inputs and a prepared HF record for E2E, or live training/sampling evidence for RL. A missing capability remains that test's reported non-pass and does not suppress independent selected tests. The config-only demo is not proof that all seven numerical comparisons passed.
+
+**The first-two demo uses a four-layer fixture, 128-token sequences and one target GPU.** Calibration uses eight nondeterministic samples per gradient accumulation step (GAS) arm, GAS1 and GAS4; eight samples is also the default for real-model onboarding. Reduced-fixture results do not establish full-model, distributed-training or maximum-sequence-length correctness.
+
+**HF calibration uses the visible GPUs on one node, with at most eight concurrent workers by default.** Eight samples run in one wave of eight per GAS arm when eight or more local GPUs are visible, even with sixteen visible GPUs. With only one local GPU, the eight samples run serially. Use `--reference-calibration-workers` to select one to eight available local GPUs explicitly; the target's GPU count does not select calibration concurrency. Multi-node HF calibration is future work; target execution can still use its configured same-allocation topology.
 
 ```bash
 python -m arctic_platform.correctness onboard \
-  --config ./work/configs/tiny-qwen3-129m-one-h200--fp32.json
+  --config ./work/configs/tiny-qwen3-129m-one-h200.json
 ```
 
-**No separate gateway command is required for the supported automatically managed local route.** The harness owns startup and cleanup when no endpoint is supplied. That ownership does not supply missing resumable-state, sampler or model-loading capabilities. An explicitly supplied service remains externally owned and must satisfy the selected check's admission.
+**The first two reduced-fixture checks manage local validation automatically.** Without a configured Cortex host or base URL, onboarding selects the local fixture, starts the installed `dss.ray_dss.gateway_server` on loopback for validation and closes its owned gateway afterwards. No manual fixture flag or gateway command is needed. An explicitly supplied loopback gateway is left running; a hosted account endpoint cannot accept this reduced-fixture workflow. This automation does not add target capabilities for later checks.
 
-**Every onboarding attempt retains diagnostics in `./work/logs/`.** The printed attempt directory contains `onboarding.log`, reports, summaries and complete worker logs; `AP_CORRECTNESS_LOGDIR` overrides the root. Queue numbering follows the actual selected checks and fixture prerequisites, not a fixed `1/2` and `2/2`. Each result and elapsed time remains independent; unsafe cleanup stops later work. Fixtures, adapters and tensor scratch remain on fast storage.
+**Every onboarding attempt retains diagnostics in `./work/logs/`.** The printed attempt directory contains `onboarding.log`, `report.md`, the summary, sizing results, calibration summaries, target reports and complete reference-worker logs. `AP_CORRECTNESS_LOGDIR` overrides this root. Stage headings use vertical spacing and `***` prefixes. Queued tests are numbered against the actual selected queue, including required fixture prerequisites; the denominator is not fixed at two. Model fixtures, adapters and tensor scratch remain on fast storage, never Git.
 
-**After fixing a reported failure, repeat exactly the same command.** Small recovery records live in `./work/logs/onboarding-state/`. The harness reuses completed sizing, fixture, calibration, reference preparation and successful validation only when their inputs, source, environment and retained artifacts match. It retries failed phases and rebuilds missing or changed artifacts. A failed optimizer validation does not force another gradient calibration. Removing temporary model fixtures after an allocation ends can require rebuilding those phases; logs alone are not reusable model data.
+**Repeat the same command after resolving a reported failure.** Recovery records in `./work/logs/onboarding-state/` reuse completed phases only when configuration, options, source, code, dependencies and retained artifacts match. Missing or changed artifacts rebuild the affected phase and its successors. Failed validation is retried, not counted as complete; compatible sizing and calibration do not repeat. Recycling a node can remove temporary fixtures and require rebuilding them, even though the diagnostic logs remain.
 
-**Inspect the generated specification and summary before accepting the gates.** Use the resolved ID printed by onboarding to find `arctic_platform/correctness/specs/<config-id>.json` and `arctic_platform/correctness/specs/<config-id>.onboarding.json`; the [layout rules](#imported-config-and-reference-locations) distinguish migrated frozen IDs from newly derived IDs. The summary records each check's result and work directory, plus any combined-reference preparation error. Compact records are generated locally and untracked under the mirrored location in `arctic_platform/correctness/reference_data`; generated tensors never belong in Git. Importing the tiny model leaves existing 8B recipes and their records untouched. A preparation or validation failure is not a numerical pass.
+**Inspect the generated specification and summary before accepting the gates.** Use the resolved ID printed by onboarding to find `arctic_platform/correctness/specs/<config-id>.json` and `arctic_platform/correctness/specs/<config-id>.onboarding.json`. A migrated existing demo retains its `tiny-qwen3-129m-one-h200` ID through the layout manifest. The summary records each check's result and work directory, plus any combined-reference preparation error. Compact records use the mirrored [reference location](#imported-config-and-reference-locations); generated tensors never belong in Git. Importing the tiny model leaves existing 8B recipes and their records untouched. Import or preparation alone, and any validation failure, are not numerical passes.
 
-**To onboard one check, add `--test single-step-grads` or `--test single-step-optimizer`.** Missing fixture prerequisites are automatic. RL configs are reported as inapplicable to both supervised-reference checks; onboarding does not manufacture SFT measurements for RL. No separate specification, record directory or prerequisite command is needed for default onboarding.
+**To onboard one check, add `--test single-step-grads` or another listed test ID.** Missing gradient-fixture prerequisites are automatic. For RL configs, the harness skips supervised-reference checks and selects compatible RL checks. Unsupported hosted-only checks are reported as inapplicable to local onboarding. List available IDs with `python -m arctic_platform.correctness list`; no configuration-specific specification or record arguments are required for default onboarding.
 
-**Existing Cortex-training recipe JSON can be supplied without converting it to the native client schema.** Import accepts `sub_job_configs` and preserves the original bytes and engine settings, including sampling-only recipes. P1's two supervised checks still require exactly one training sub-job and reject an inference-only recipe before model preparation; import acceptance does not make a recipe eligible for numerical onboarding. Training plus sampling remains an RL configuration, not supervised training. The first-two checks still select a reduced fixture and apply their existing correctness token cap; acceptance by the loader does not establish full-model runtime support.
-
-**Import this catalog recipe separately from onboarding.** The existing config helper copies only the recipe bytes and prints the local path; it does not prepare models, specifications or references, or run target validation. Identical existing copies are reused; conflicting bytes are rejected.
+**Existing Cortex-training recipe JSON can be supplied without converting it to the native client schema.** Import accepts `sub_job_configs` and preserves the original bytes and engine settings, including sampling-only recipes. Existing correctness checks still require exactly one training sub-job and reject an inference-only recipe before model preparation; import acceptance does not make a recipe eligible for numerical onboarding. Training plus sampling remains a reinforcement learning (RL) configuration, not supervised training. The first-two checks still select a reduced fixture and apply their existing correctness token cap; acceptance by the loader does not establish full-model runtime support.
 
 ```bash
-python - <<'PY'
-from arctic_platform.correctness.harness.config import local_config_path
-
-recipe = "../cortex-training/model-catalog/models/qwen3.8-flash-next/long/h200-training-full.json"
-print(local_config_path(recipe))
-PY
+python -m arctic_platform.correctness onboard \
+  --config ../cortex-training/model-catalog/models/qwen3.8-flash-next/long/h200-training-full.json
 ```
 
-**This 32-GPU catalog example demonstrates import, not numerical onboarding.** Omitted accumulation requires an automatically owned local service whose installed builder resolves FP32 accumulation and selects only local workers. Nonlocal or supplied-service defaults cannot be verified by this check. Import acceptance neither applies a precision setting nor establishes numerical support; continue with the tiny explicit-FP32 demo and preserve catalog and historical reference bytes.
-
-**Use the recipe path present in your Cortex-training checkout.** The current recipe declares 32 H200 GPUs and 256K context. The imported path is `arctic_platform/correctness/configs/qwen3.8-flash-next/long/h200-training-full.json`; another model or sequence directory can contain the same filename without conflict. Different bytes at that exact relative path require a distinct variant. Deleted Cortex source paths have no automatic replacement; old migrated correctness-config paths remain aliases only within their original config root through `config-layout.json`.
-
-**Calibration automatically uses the visible GPUs on one node, capped at eight concurrent HF workers.** Eight samples require one wave of eight per GAS arm when eight or more local GPUs are visible, even if sixteen GPUs are visible. A node with fewer GPUs needs more waves; this demo runs serially if only one GPU is visible. `--reference-calibration-workers` accepts an explicit override from one to eight available local GPUs. The target's GPU count does not limit calibration concurrency.
-
-**TODO: Use every available GPU within one allocation for calibration.** Multi-node support must handle remote worker launches, node-local model and input staging, unique GPU assignments, and result and failure collection before removing the one-node limit.
-
-**Onboarding reports elapsed time per attempted test before the final total.** Each test's time includes its sizing, calibration, reference preparation, target validation and owned cleanup performed during this invocation, including failed attempts. Reused phases contribute only the time spent checking and reusing them. Config-wide `onboarding.json` records each attempted result's `elapsed_seconds`, and `report.md` shows its formatted duration; skipped tests say `not run`. Combined reference preparation is timed separately because it serves both tests. Shared prerequisites and report writing remain in the overall total, so test durations need not sum to that total.
+**Use the recipe path present in your Cortex-training checkout.** The model catalog replaced `recipes/sft/configs/qwen38_flash_next.json`; the example above selects the Qwen3.8-Flash-Next full-training config for eight H200 GPUs and 256K context. Deleted Cortex recipe paths have no automatic replacement. Migrated correctness config paths remain resolvable through `config-layout.json`. The imported path is `arctic_platform/correctness/configs/qwen3.8-flash-next/long/h200-training-full.json`; another model or sequence directory can contain the same filename without conflict. Different bytes at that exact relative path require a distinct variant.
 
 ## Running
 
+**Regression names the selected tests before running them.** The selected-pair count and test IDs reflect the applicable seven-test registry selection, not a fixed first-two list. Workload mode and the reviewed specification determine applicability.
+
 **Run all applicable checks with one config-only command in one terminal.** Omitting `--test` selects the applicable set from the seven-test registry, not only the two reduced-fixture checks. No separate gateway command is needed for a supported automatically managed local route. Each check requires its own prepared identity and target capabilities; missing prerequisites remain separate non-passes. Regression never prepares missing references, changes precision or widens reviewed gates.
+
+**An explicit first-two-only regression can manage its local gateway automatically.** With no Cortex host or base URL configured, regression selects the reduced fixture, starts the installed DSS service on an available loopback port, and closes its owned gateway after execution or failure. No separate gateway command, database/schema exports or fixture flag are needed for that admitted route. The [startup boundary](#check-specific-prerequisites) distinguishes this selection from default-all regression and later-test routes.
 
 ```bash
 python -m arctic_platform.correctness run \
-  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
-  --out ./work/reports/both
+  --config ./work/configs/tiny-qwen3-129m-one-h200.json \
+  --out ./work/reports/all
 ```
 
-Read `./work/reports/both/report.md`, `report.json`, and `full.log`. Every run ends with its total wall-clock runtime, after the report paths and any error guidance. A missing prepared reference or failed execution is not a numerical pass. The [workload selection section](#select-a-workload) includes single-check and multi-config commands, plus how to adapt the example to another supported model.
+**Reports and the owned gateway log remain in the requested directory.** Read `./work/reports/all/report.md`, `report.json` and `full.log`. Gateway logs are under `./work/reports/all/cases/<config-id>/<group>/gateway.log`; `full.log` records the exact gateway log path and detailed execution progress. The harness supplies nonempty local database/schema segments automatically. It uses the same allocation hostfile selection as onboarding, or generates a local hostfile from visible GPUs. For multi-node execution, supply the real same-job hostfile and working `ds_ssh`; no machines are allocated by this command. Regression consumes prepared references and never regenerates them or changes their gates.
 
-**Regression names the selected checks before running them.** The config-only demo reports every applicable selected check, not a fixed two-check list.
-
-**The gateway log is retained under `./work/reports/both/cases/<config-id>/<group>/gateway.log`; no second terminal or manual shutdown is needed.** `./work/reports/both/full.log` records the exact gateway log path and detailed execution progress. An explicitly configured `--base-url` or `ARCTIC_CORTEX_BASE_URL` connects to an existing service and leaves it running; add `--local-cortex-fixture` for reduced-fixture checks on that loopback service. Remove stale host, base URL or PAT settings when switching back to automatic local execution. A multi-node run needs the allocation's real same-job hostfile and working `ds_ssh`. Reference preparation prints per-worker progress and complete log paths under `./work/logs`; compact reference records and large tensor scratch are separate from these durable logs.
-
-**A gateway shutdown failure stops subsequent workloads and makes the command fail, even when the numerical comparisons passed.** Inspect `full.log` and the recorded `gateway.log` before retrying; automatic gateway shutdown is not proof that every detached Ray worker has exited.
+**Explicit connection settings remain supported and are never replaced.** `--base-url` or `ARCTIC_CORTEX_BASE_URL` connects to an existing gateway, which the command leaves running; add `--local-cortex-fixture` for first-two reduced-fixture checks on that loopback service. `--host` or `ARCTIC_CORTEX_HOST` selects the configured account endpoint instead. Remove stale host, base URL or PAT settings from the environment when switching back to automatically managed local execution. To select only one check, add `--test` with the desired ID. Default-all onboarding prepares both individual records and the combined applicable reference selection; a custom multi-check subset may need [explicit preparation](#explicit-preparation) for its exact reference identity.
 
 **Ctrl-C, SIGTERM and SIGHUP stop the automatically owned gateway during startup or execution.** The command reports shutdown, waits for its owned process, and restores the previous signal handlers; repeated stop signals do not interrupt that bounded cleanup. This applies to onboarding and regression, not an explicitly configured external service.
 
@@ -230,97 +274,11 @@ Read `./work/reports/both/report.md`, `report.json`, and `full.log`. Every run e
 
 **Confirm the resolved config file, model source and configured sequence length printed before model work.** The quick demo must show the tiny Qwen3 snapshot and 128 configured tokens. HF calibration uses those settings independently of the gateway; output naming an old 8B configuration is not the tiny demo.
 
-**The automatically started gateway's loopback readiness check ignores environment proxies.** No proxy changes are required for that startup check; explicitly configured service connections keep their existing behavior.
+**To onboard another supported model, supply its native job config to the same command.** In this example replace `repo_id` in `snapshot_download()` with the intended model's Hugging Face ID; keep `model_name` set to the returned snapshot path. Set GPU counts, dtype, attention, optimizer and supported LoRA options for the intended job. Check the resolved imported path and config ID; different source filenames alone do not distinguish recipes with the same derived placement. Use an explicit distinct variant for conflicting recipes. Do not copy Qwen's records or calibrated gates. Multi-node jobs need the real hostfile, `ds_ssh`, and model/code distribution within that one allocation; a path on the head node is not shared storage.
 
-## Explicit Reference Preparation
+### LoRA Without Adapter Inputs
 
-**Preparation-only runs use an existing reviewed specification.** Default onboarding handles preparation; this advanced command explicitly prepares or reuses records without target execution. Combined and single-check workloads have different identities. See [HF reference onboarding](hf-reference-onboarding.md) for immutable publication and identity requirements.
-
-```bash
-python -m arctic_platform.correctness onboard \
-  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
-  --prepare-references \
-  --reference-tests single-step-grads single-step-optimizer
-```
-
-## Select A Workload
-
-**A config-only selection runs every applicable registered test; a test-only selection runs that test across discovered configs.** Use repeated `--test` flags for an intentional subset. The RL tests require their opt-in evidence and a supported native training/sampling route. Discovery accepts `.config` and `.json`, excludes archive/spec directories and rejects duplicate config IDs.
-
-**Default-all onboarding prepares compatible references for each independently successful selected workload.** Retain every check's result separately, including failed or missing later-check prerequisites. The examples below are optional narrower regression selections, not additional steps required by config-only onboarding. The explicit reference-preparation command above remains an advanced preparation-only operation.
-
-```bash
-# One config and one check.
-python -m arctic_platform.correctness run \
-  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
-  --test single-step-grads \
-  --out ./work/reports/grads
-
-python -m arctic_platform.correctness run \
-  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
-  --test single-step-optimizer \
-  --out ./work/reports/optimizer
-
-# Optional: both first-two checks with their compatible combined reference.
-python -m arctic_platform.correctness run \
-  --test single-step-grads --test single-step-optimizer \
-  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
-  --out ./work/reports/config
-```
-
-**Multi-config runs use the specs generated by onboarding under each config ID.** This example has one config; onboard every additional config separately before adding it to a batch. A custom `--test-spec` is restricted to one explicit `--config`.
-
-```bash
-# One check and every externally supplied config.
-python -m arctic_platform.correctness run \
-  --config-dir ./work/configs \
-  --test single-step-optimizer \
-  --out ./work/reports/all-optimizers
-
-# Every config and all applicable registered checks.
-python -m arctic_platform.correctness run \
-  --config-dir ./work/configs --all-configs \
-  --out ./work/reports/all
-```
-
-## Onboard Another Model
-
-**A new model starts with a supported native AP training config and its actual checkpoint.** In the complete example, replace `repo_id` in `snapshot_download()` with the intended model's Hugging Face ID; keep `model_name` set to the returned snapshot path. Hugging Face reuses or populates `/checkpoint/huggingface/hub` automatically. Keep the checkpoint's configuration, tokenizer sidecars, and weights together; downloading only `config.json` is insufficient.
-
-**Change the training config to describe the intended job, not just the model name.** Set supported GPU counts, dtype, attention, optimizer and adapter settings for the selected test. The first-two and E2E reference comparisons require SFT configs; the two RL tests require RL training and sampling sub-jobs. Import preserves recipe bytes and identity, while each numerical test has separate execution admission. Use a distinct variant for a different workload and retain existing reviewed references.
-
-**Supply the new config to the same config-only onboarding command.** Do not copy Qwen's measured gate or records onto another model. Failed onboarding is not an admitted regression input. Compact records default to this checkout's `arctic_platform/correctness/reference_data`. For multiple nodes, set `DSS_GATEWAY_HOSTFILE` to the real allocation hostfile and provide supported model/code distribution within that allocation; a head-node path is not shared storage.
-
-**Regression defaults to `cortex-training` and manages its owned local gateway when no endpoint is configured.** Hosted execution requires the account connection and a verified fixture publication receipt supplied with `--cortex-fixture`. Existing unauthenticated loopback DSS gateways use `--base-url http://127.0.0.1:<port> --local-cortex-fixture`; that explicit endpoint remains externally owned. `cortex` is a compatibility alias; `onprem` is not a supported CLI backend.
-
-## Results And Diagnostics
-
-**Every regression ends with total wall-clock runtime after the report paths and any error guidance.** The final runtime is rounded upward to whole seconds in `HH:MM:SS` format and includes gateway startup, execution, owned shutdown and report writing. Reports and complete logs default to `./work/logs`, overridden by `AP_CORRECTNESS_LOGDIR` or `--out`; tensor scratch remains on fast storage.
-
-**Optimizer calibration displays a `tqdm` progress bar for each GAS arm.** The bar counts eight nondeterministic HF runs by default and updates elapsed time and ETA after each completed run. Onboarding ends with total wall-clock runtime rounded upward to whole seconds in `HH:MM:SS` format in the terminal and `onboarding.log`, including when onboarding fails.
-
-**Reports retain comparison results and complete execution errors.** Read the report directory's `report.md`, `report.json`, `batch.json`, and `full.log`. A missing reference, an execution exception, an unsafe cleanup, or an empty selection is not a numerical pass. Unsafe cleanup stops the remaining batch.
-
-**HF preparation also reports each worker's progress and complete subprocess logs.** Start and completion or failure messages identify the arm, run and device, with elapsed time. After a worker exits, the console prints its `ref-<run>.stdout.log`, `ref-<run>.stderr.log` and `ref-<run>.returncode` paths under `./work/logs`, including successful workers. These files are separate from compact reference records; `AP_CORRECTNESS_LOGDIR` overrides their root. Output remains captured until that subprocess exits; a start message alone is not evidence of continuing computation.
-
-**The LM-head diagnostic changes the workload and is not a canonical result.** It sets `model_options["lm_head.token_chunk_size"]` to `"disabled"` in a copied in-memory config, including an existing nested `model_options["lm_head"]["token_chunk_size"]`, without editing the source config or spec. The explicit option takes precedence over legacy settings and prevents the runner from restoring the spec's chunk size. Compatible diagnostic reference records are still required; do not relabel canonical records.
-
-```bash
-python -m arctic_platform.correctness.diagnostics list
-python -m arctic_platform.correctness.diagnostics run lm_head_chunking \
-  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
-  --test single-step-grads
-```
-
-**CPU selftests validate the library, not a model's numerical correctness.**
-
-```bash
-python -m arctic_platform.correctness selftest
-```
-
-## LoRA Without Adapter Inputs
-
-**The supplied config determines whether LoRA is used.** Native `training.peft` and `training.ds_worker_config.peft_config` settings are recognized automatically; a config without LoRA settings remains full fine-tuning. Local onboarding generates one shared adapter for HF calibration and target validation, then regression reuses the prepared identity. No separate adapter-generation command is needed. This route belongs to the correctness-owned gateway, not production hooks; an external gateway needs compatible correctness route installation, and hosted Cortex remains unsupported for reduced-fixture LoRA testing.
+**The supplied config determines whether LoRA is used.** Native `training.peft` and `training.ds_worker_config.peft_config` settings are recognized automatically; a config without LoRA settings remains full fine-tuning. Local first-two onboarding generates one shared adapter for HF calibration and target validation, then regression reuses the prepared identity. No separate adapter-generation command is needed. This route belongs to the correctness-owned gateway, not production hooks; an external loopback gateway needs compatible correctness routes, and hosted Cortex remains unsupported for reduced-fixture LoRA testing. Select both first-two tests explicitly during regression when only that adapter route is intended; later-test support is not implied.
 
 **Reference preparation generates one adapter using upstream PEFT's default initializer.** Onboarding and regression explicitly use the harness seed `1234`, a metadata-only base architecture and CPU adapter factors. The compact reference identity records the recipe, dependency versions, topology, tensor shapes/dtypes and hashes. Keep the reference environment unchanged when reusing its records; regeneration is not permission to replace measured references.
 
@@ -328,15 +286,186 @@ python -m arctic_platform.correctness selftest
 
 **Optional pre-existing adapters are reference-preparation inputs only for the supported CLI backend.** Use `--prepare-references --peft-adapter /data-fast/path/to/adapter` with standard `adapter_config.json` and `adapter_model.safetensors` files; their exact contents become part of the reference identity. Automatic generation supports dense `target_modules` LoRA with upstream default initialization, not expert `target_parameters`, DoRA, rank patterns or initializers that modify base weights. Loading validates complete tensor coverage and exact dtype; unsupported runtime layouts fail explicitly.
 
-## When A Step Fails
+## Select And Run
 
+**All seven test IDs are available in this full-suite checkout, but each needs its own prepared inputs and target runtime.** P1 remains a separate first-two-only checkout; replaying shared harness changes must not expand P1's registry.
+
+**List available configuration IDs and test IDs first.**
+
+```bash
+python -m arctic_platform.correctness list
+```
+
+**Run one configuration/test pair.** `--config` accepts an exact listed ID or an existing `.config` or `.json` file path. Existing IDs such as the one below remain valid through the layout manifest; moving the config does not rename its frozen ID:
+
+```bash
+python -m arctic_platform.correctness run \
+  --config qwen3-8b-h200-train-sft-full-4gpus-64k \
+  --test checkpoint-resume-loss
+```
+
+**Omit `--test` to automatically select all checks appropriate for one configuration.**
+
+```bash
+python -m arctic_platform.correctness run \
+  --config qwen3-8b-h200-train-sft-full-4gpus-64k
+```
+
+**Omit `--config` to run one test across every active reviewed configuration.**
+
+```bash
+python -m arctic_platform.correctness run --test inference-checkpoint-loss
+```
+
+**Selections run sequentially in configuration-ID order.** Tests within a configuration use test-ID order; single-step tests run together to preserve their combined reference identity. Repeating a test ID does not repeat the comparison. Tests that do not apply remain visible; insufficient resources and missing prerequisites are reported as blocked, not silently omitted. An argument-free `run` is rejected. Explicit `--all-configs` selects the full reviewed catalog, and repeatable `--test` flags select a subset.
+
+**External directories support the same selection workflow.** Discovery accepts `.config` and `.json`, excludes archive/spec directories and rejects duplicate config IDs. A test-only selection runs that test across discovered configs; repeated `--test` flags select an intentional subset. RL tests require their opt-in evidence and supported native training/sampling route.
+
+```bash
+# One test and every externally supplied config.
+python -m arctic_platform.correctness run \
+  --config-dir ./work/configs \
+  --test single-step-optimizer \
+  --out ./work/reports/all-optimizers
+
+# Every config and all applicable registered tests.
+python -m arctic_platform.correctness run \
+  --config-dir ./work/configs --all-configs \
+  --out ./work/reports/all
+```
+
+**Use the local full-model mode only for supported, pinned original models.** It requires an existing loopback gateway and a populated offline model cache, and supports only `e2e-sft-train-validate` and `inference-checkpoint-loss`:
+
+```bash
+export HF_HUB_OFFLINE=1
+export DSS_ALLOW_REMOTE_MODELS=1
+# This advanced mode requires its reviewed snapshot in a populated fast-storage cache.
+export HF_HUB_CACHE=/data-fast/path/to/populated/hub
+
+python -m arctic_platform.correctness run \
+  --config qwen3-8b-h200-train-sft-full-4gpus-64k \
+  --test inference-checkpoint-loss \
+  --local-gateway-full-model \
+  --out ./work/reports/qwen3-8b-inference
+```
+
+For reviewed reduced-fixture single-step checks with an explicitly configured loopback gateway, `--local-cortex-fixture` binds that service to matching local weights. Without an endpoint, first-two regression selects this mode and starts its owned service automatically. A published reduced fixture instead uses `--cortex-fixture <publication.json>` with an existing endpoint. Fixture identity validation does not download model files. `--gpu-pool` describes available target placement capacity and does not reserve or acquire GPUs. Do not use `--any-gpu` to bypass a hardware mismatch without separately reviewing the configuration.
+
+### Same-Allocation Inference Export
+
+**A local multi-node inference check can use a hash-pinned allocation descriptor.** The descriptor is a JSON object supplied by the allocation owner after admitting the current nodes. The descriptor binds checkpoint export to the nodes in that one allocation; it does not establish model-file readiness, install a runtime, start a gateway, reserve GPUs or provide keepalive protection. This advanced route is separate from the complete first-two onboarding example above.
+
+**The descriptor must describe the actual allocation hostfile and node identities.** [The live validator](../harness/inference.py) requires these fields:
+
+| Field | Required value |
+| ----- | -------------- |
+| `allocation_id` | The current allocation identifier, using letters, digits, underscores or hyphens. |
+| `hostfile_content` | Exact text of the allocation's prescribed `/job/hostfile`, including its original host order. |
+| `hostfile_sha256` | Full lowercase SHA256 of that hostfile's bytes. |
+| `nodes` | One object per hostfile row, in the identical order. |
+| Each node's `host` and `slots` | The original hostfile address and positive integer slot count, not a hostname substitution. |
+| Each node's `hostname` and `boot_id` | The actual node hostname and current boot identifier. |
+| Each node's `python` and `python_sha256` | Absolute interpreter path and full lowercase SHA256 of that executable. |
+
+**Supply the descriptor path and its byte hash together, with one explicit config and only `inference-checkpoint-loss`.** The following command assumes the owner has published the admitted descriptor at `./work/inference-allocation.json`, prepared the selected GLM model and sampling runtime, and provided an unauthenticated loopback gateway on port 8003. It computes the descriptor hash directly rather than relying on an undefined shell variable:
+
+```bash
+python -m arctic_platform.correctness run \
+  --config arctic_platform/correctness/configs/glm-5.3-flash-bf16/long/h200-training-full--rl-32gpus-sp16-256k.json \
+  --test inference-checkpoint-loss \
+  --backend cortex-training --base-url http://127.0.0.1:8003 \
+  --database dev --schema dev \
+  --inference-export-allocation ./work/inference-allocation.json \
+  --inference-export-allocation-sha256 "$(sha256sum ./work/inference-allocation.json | cut -d ' ' -f 1)" \
+  --out ./work/reports/glm-inference
+```
+
+**The paired options also apply to final inference onboarding.** Use `onboard --test-id inference-checkpoint-loss` with the same pair and connection options; onboarding resolves a relative descriptor path before changing the final child's working directory. The child verifies the original byte hash again. These options cannot be combined with all-config selection, another test, reference preparation, sizing probes or reduced-fixture mode. The file hash is checked before JSON parsing; duplicate keys, nonfinite numbers and a non-object root are rejected. The runner checks live allocation identity before training, and checkpoint export verifies worker receipts before sampling. The descriptor does not widen the config's declared placement or replace its reviewed numerical gate.
+
+**Use `--inference-initial-model-dir` only when initial training needs an already admitted local full-model directory.** With the descriptor pair above, this optional argument supplies the native training subjob's top-level `local_model_dir` instead of letting the training worker resolve its default model cache. The path must be an absolute, canonical, existing directory under `/data-fast`, with no symlink components. For example, after admitting `/data-fast/models/GLM-5.3-Flash-BF16` on every node in the allocation, add `--inference-initial-model-dir /data-fast/models/GLM-5.3-Flash-BF16` to that command. The same option is forwarded to the final `onboard` validation child. Relative paths are rejected.
+
+**Directory validation does not verify model contents or their presence on other nodes.** The allocation owner must separately establish that the directory contains the unchanged configured model and is accessible at the identical path on every training node. This option does not download weights, change the canonical config/model identity or tokenizer source, alter training steps or tolerances, or provide allocation maintenance. It is restricted to the single-config, unauthenticated loopback Cortex inference route and is rejected without the pinned allocation descriptor.
+
+**The sampler still loads the learned checkpoint, never the initial training directory.** After training finishes, the check validates and distributes the exported learned weights within the allocation, shuts down the training job, and starts sampling from the export's absolute directory. The initial-directory option is absent from that sampling subjob. It does not bypass export, tokenizer or same-allocation validation.
+
+## Explicit Preparation
+
+**Onboarding is a deliberate preparation operation, not a regression fallback.** Use a configuration path for onboarding. Preparing references requires the existing reviewed specification, matching assets, and enough resources; preparation does not run the target test.
+
+```bash
+python -m arctic_platform.correctness onboard \
+  --config arctic_platform/correctness/configs/qwen3-8b/standard/h200-training-full.json \
+  --prepare-references --test-id single-step-grads
+```
+
+**Prepare gradients and optimizer together when regression selects both.** A combined workload has a different identity from independently prepared scalar checks:
+
+```bash
+python -m arctic_platform.correctness onboard \
+  --config arctic_platform/correctness/configs/qwen3-8b/standard/h200-training-full.json \
+  --prepare-references \
+  --reference-tests single-step-grads single-step-optimizer
+```
+
+**The calibration example automatically uses up to eight GPUs on the reference node.** Eight samples need one wave with eight available GPUs, or more waves with fewer GPUs. Calibration establishes an optimizer-norm gate; it is not a target pass. For detailed reference identity, original-model admission, and calibration requirements, see [HF reference onboarding](hf-reference-onboarding.md). Changing a specification or reference to hide a mismatch is not a valid remedy.
+
+**Source moves can invalidate older references.** The current E2E identity also binds shared training helpers in `harness/sft.py`. Historical records remain unchanged; a record without the current identity cannot be used as if it measured the new source. Resolve missing or incompatible records through explicit, reviewed preparation, never an automatic migration during regression.
+
+## Read Results
+
+**The terminal prints one short result row per selected pair and the report directory, then ends with total wall-clock runtime rounded upward to whole seconds in `HH:MM:SS` format.** The final runtime line follows any error guidance and includes gateway startup, execution, owned shutdown and report writing. Detailed arm and placement results are saved in `report.md` and the report's JSON file. `batch.json` records each selected pair, its reason, counts, elapsed time, and whether the batch stopped for safety. `full.log` retains detailed execution output and full Python tracebacks; individual execution groups also have reports under `cases/`.
+
+**HF preparation also reports each worker's progress and complete subprocess logs.** Start and completion or failure messages identify the arm, run and device, with elapsed time. During onboarding, the console prints each worker's stdout, stderr and exit-code files under the attempt's `./work/logs/onboarding-*/hf-reference-*/` directory, including successful workers. These files are separate from compact reference records and tensor scratch. Output remains captured until the subprocess exits; a start message alone is not evidence of continuing computation.
+
+**Parallel HF calibration reports completed workers rather than a sequential progress bar or ETA.** Each GAS arm uses eight nondeterministic HF runs by default. Each wave reports the completed count, unfinished run IDs and elapsed time at startup, after successful completions and every 30 seconds while waiting. Starting a worker does not advance the completed count; a worker exception is reported as a failure.
+
+**Each onboarding phase announces its work and reports elapsed time on exit, including failure.** The first-two checks each number sizing, calibration and target validation as phases 1/3, 2/3 and 3/3. Intermediate sizing probes are steps within phase 1, not additional phase headers. Onboarding ends with total wall-clock time rounded upward to whole seconds in `HH:MM:SS` format in the terminal and `onboarding.log`.
+
+**Onboarding also reports elapsed time per attempted test before the final total.** Each test's time includes its sizing, calibration, reference preparation, target validation and owned cleanup performed during this invocation, including failed attempts. Reused phases contribute only the time spent checking and reusing them. Config-wide `onboarding.json` records each attempted result's `elapsed_seconds`, and `report.md` shows its formatted duration; skipped tests say `not run`. Combined reference preparation is timed separately because it serves multiple tests. Shared prerequisites and report writing remain in the overall total, so test durations need not sum to that total.
+
+| Status | Meaning |
+| --- | --- |
+| `PASS` | The selected numerical comparison passed. |
+| `FAIL` | At least one comparison failed. Read the detailed measurements. |
+| `BLOCKED` | A required specification, asset, reference, resource, or connection setting is missing or incompatible. |
+| `ERROR` | Execution raised an unexpected error, or the operator interrupted the run. |
+| `INAPPLICABLE` | The test does not apply to this configuration. This is not a pass. |
+
+**Exit code zero requires a pass and no failed, blocked, or errored comparison.** An entirely inapplicable batch is nonzero because it measured nothing. Invalid selectors produce exit code `2`. Missing prerequisites do not prevent independent cases from running; an unexpected escaping error or interruption stops the remaining cases conservatively.
+
+**Interrupt with Ctrl-C and inspect cleanup before starting another run.** The harness attempts the existing backend's owned-context cleanup, saves the interruption traceback, and blocks the remaining batch. A stopped batch is not proof that all remote resources were released. Check retained cleanup detail and use the backend's supported cleanup procedure for resources owned by that run; do not stop another user's processes.
+
+## Library Checks And Diagnostics
+
+**Check the harness implementation without a model or GPU test.**
+
+```bash
+python -m pip install -e '.[correctness]'
+CUDA_VISIBLE_DEVICES= python -m arctic_platform.correctness selftest
+```
+
+This collects the controls in `selftest/library.py` through the single `selftest/check_suite.py` driver using installed test dependencies. Implementation passes do not establish a full-model numerical pass.
+
+**Maintained experiments use one diagnostic command.**
+
+```bash
+python -m arctic_platform.correctness.diagnostics list
+python -m arctic_platform.correctness.diagnostics run <diagnostic-id> --help
+```
+
+Diagnostics have their own resource requirements and are not substitutes for the reviewed regression tests.
+
+**The LM-head diagnostic changes the workload and is not a canonical result.** It sets `model_options["lm_head.token_chunk_size"]` to `"disabled"` in a copied in-memory config, including an existing nested `model_options["lm_head"]["token_chunk_size"]`, without editing the source config or spec. The explicit option takes precedence over legacy settings and prevents the runner from restoring the spec's chunk size. Compatible diagnostic reference records are still required; do not relabel canonical records.
+
+**This guide is static.** Onboarding and test execution never append results, status, receipts, or logs here. Run artifacts belong in the selected report directory.
+
+## When A Step Fails
 
 **Give the coding agent only the config path and the operation you intended.** If any manual step fails, ask:
 
 ```text
 Use skills/correctness/SKILL.md to fix onboarding for
-arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json,
-then run both single-step-grads and single-step-optimizer.
+./work/configs/tiny-qwen3-129m-one-h200.json, then run its applicable tests.
 Discover the environment, reports, logs and prepared artifacts yourself.
 ```
 
@@ -344,37 +473,38 @@ For a regression-only failure, say "run both checks" or name the desired check I
 
 ## Add To Repo
 
-**For a real config addition, review and stage only explicitly selected configs and reviewed specifications after onboarding and regression succeed.** The demo does not require a commit. The paths below select only this demo's new FP32 variant; for another recipe, substitute its resolved imported path and config ID. Configs and compact reference records are untracked, not ignored; only specs require `-f`. Review the selected files without staging other local recipes or historical evidence.
+**For a real config addition, review and stage only explicitly selected configs and reviewed specifications after onboarding and regression succeed.** The demo does not require a commit. The harness imports the config into the hierarchy under `configs/`; `specs/` contains the reviewed gates and onboarding summary keyed by config ID. Preserve existing ID bindings in `config-layout.json` when reviewing layout changes. Configs and compact references remain local and untracked until selected for publication; only `specs/` requires `-f`. The documentation-only commands below select this demo's exact paths, not whole directories or other local recipes.
 
 ```bash
+git add -- \
+  arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full.json
 git add -f -- \
-  arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
-  arctic_platform/correctness/specs/tiny-qwen3-129m-standard-h200-training-full--fp32.json \
-  arctic_platform/correctness/specs/tiny-qwen3-129m-standard-h200-training-full--fp32.onboarding.json
+  arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.json \
+  arctic_platform/correctness/specs/tiny-qwen3-129m-one-h200.onboarding.json
 git diff --cached --stat
 ```
 
-**Do not stage `reference_data/`, `work/`, logs, model weights, adapter tensors, optimizer snapshots or fast-storage scratch.** Compact HF records in `reference_data/` are generated local artifacts, not files to commit. Retain those records alongside the Hugging Face source cache and reduced fixtures for later regression; deleting the records requires explicit reference preparation before regression can run again.
+**Do not stage unselected `reference_data/` records, `work/`, logs, model weights, adapter tensors, optimizer snapshots or fast-storage scratch.** Compact HF records remain local unless explicitly selected for a later commit; the [finished-work template](../../../skills/correctness/references/group-report-format.md#finished-work-selection) lists only successful selected tests' exact reference directories. Retain compatible records alongside the Hugging Face source cache and reduced fixtures for later regression; deleting the records requires explicit reference preparation before regression can run again. These examples do not authorize Git actions.
 
 ## Cleanup
 
 **Clean up only local checkout files after both commands succeed and you have reviewed their results.** Remove the duplicate original config under `./work/configs/`, keeping the imported config, reviewed specification and local compact references for later regression. Allocation scratch is left untouched and will be removed automatically on job reset.
 
 ```bash
-rm ./work/configs/tiny-qwen3-129m-one-h200--fp32.json
+rm ./work/configs/tiny-qwen3-129m-one-h200.json
 ```
 
-**Optionally remove these two explicit directories once you no longer need the diagnostic evidence.** `./work/logs/correctness-demo/` contains this demo's onboarding logs and retry state; `./work/reports/both/` contains its regression reports. Keep both while investigating a failure; deleting retry state may require preparation again on a later onboarding attempt. Run from the checkout root. These literal paths do not use environment variables or wildcards and do not select other runs' log directories or reusable regression inputs.
+**Optionally remove these two explicit directories once you no longer need the diagnostic evidence.** `./work/logs/correctness-demo/` contains this demo's onboarding logs and retry state; `./work/reports/all/` contains its regression reports. Keep both while investigating a failure; deleting retry state may require preparation again on a later onboarding attempt. Run from the checkout root. These literal paths do not use environment variables or wildcards and do not select other runs' log directories or reusable regression inputs.
 
 ```bash
 rm -r ./work/logs/correctness-demo/
-rm -r ./work/reports/both/
+rm -r ./work/reports/all/
 ```
 
 **Use the retained imported config for future runs after cleanup.**
 
 ```bash
 python -m arctic_platform.correctness run \
-  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json \
-  --out ./work/reports/both
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full.json \
+  --out ./work/reports/all
 ```

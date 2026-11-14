@@ -198,6 +198,9 @@ def _has_routed_experts(ctx) -> bool:
 
 
 def _sampling_payload(ctx, model_path, token_budget: int) -> dict:
+    from arctic_platform.debug.inference import maybe_bind_inference_startup_error
+    from arctic_platform.debug.inference import maybe_bind_inference_warmup_observer
+
     allocation, tensor, pipeline = _sampling_topology(ctx)
     payload = sampling_payload(
         model_path,
@@ -241,6 +244,8 @@ def _sampling_payload(ctx, model_path, token_budget: int) -> dict:
         if adapter_dir is not None:
             engine = payload["inference_config"]["vllm_config"]
             engine.setdefault("extra_engine_kwargs", {})["lora_adapter_path"] = adapter_dir
+    maybe_bind_inference_warmup_observer(payload, ctx)
+    maybe_bind_inference_startup_error(payload, ctx)
     return payload
 
 

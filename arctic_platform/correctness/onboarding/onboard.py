@@ -265,14 +265,18 @@ def _stream_subprocess(command, *, cwd, env) -> int:
 
 
 def _configure_fixture_target(args: argparse.Namespace, config, selection: list[str]) -> None:
+    from arctic_platform.correctness.harness.execution import _configure_e2e_model
+
+    _configure_e2e_model(args, config, selection)
     if getattr(args, "backend", None) == "cortex-training":
         args.backend = "cortex"
     if (
         getattr(args, "prepare_references", False)
         or getattr(args, "probe_layers", None) is not None
+        or (getattr(args, "local_gateway_full_model", False) and set(selection) != {"e2e-sft-train-validate"})
         or getattr(args, "backend", "onprem") not in {"cortex", "cortex-training"}
         or (config.is_rl and getattr(args, "test_id", None) != "checkpoint-resume-loss")
-        or not set(selection).intersection((*CALIBRATED_TEST_IDS, "checkpoint-resume-loss"))
+        or not set(selection).intersection((*CALIBRATED_TEST_IDS, "checkpoint-resume-loss", "e2e-sft-train-validate"))
     ):
         return
     from arctic_platform.correctness.harness.execution import _client_backend
@@ -289,11 +293,13 @@ def _configure_fixture_target(args: argparse.Namespace, config, selection: list[
         require_local_cortex_gateway(_client_backend(args))
     except ValueError as exc:
         raise ValueError(
-            "Reduced-model onboarding requires an unauthenticated HTTP loopback Cortex-training gateway. "
+            "Local model onboarding requires an unauthenticated HTTP loopback Cortex-training gateway. "
             "Remove hosted ARCTIC_CORTEX_HOST/PAT settings to use the automatically managed local gateway, "
-            "or pass --base-url for an existing local gateway. Hosted reduced-model onboarding is unsupported."
+            "or pass --base-url for an existing local gateway. Hosted local-model onboarding is unsupported."
         ) from exc
-    if args.test_id in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss"):
+    if args.test_id in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss") or (
+        args.test_id == "e2e-sft-train-validate" and not getattr(args, "local_gateway_full_model", False)
+    ):
         args.local_cortex_fixture = True
     if args.test_id == "checkpoint-resume-loss":
         args._automatic_checkpoint_bridge = True
@@ -326,6 +332,7 @@ def _validation_gateway(args: argparse.Namespace):
         if getattr(args, "_automatic_checkpoint_bridge", False):
             from arctic_platform.correctness.harness.cortex import local_checkpoint_bridge
 
+            # A configured loopback gateway still needs the bridge: its plain save has no durable catalog entry.
             with local_checkpoint_bridge():
                 yield None
             return
@@ -340,7 +347,7 @@ def _validation_gateway(args: argparse.Namespace):
         with _regression_gateway(SimpleNamespace(**{**vars(args), "out": directory})) as url:
             yield url
         return
-    with local_cortex_gateway(directory, gateway_module="arctic_platform.correctness.harness.gateway") as url:
+    with local_cortex_gateway(directory, gateway_module="arctic_platform.debug.training") as url:
         yield url
 
 
@@ -1457,6 +1464,7 @@ def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
         or args.test_id != "single-step-optimizer"
         or getattr(args, "prepare_references", False)
         or getattr(args, "probe_layers", None) is not None
+        or getattr(args, "local_gateway_full_model", False)
         or getattr(args, "reference_tests", None)
     ):
         raise ValueError("optimizer validation bootstrap requires only local Cortex Test 2 onboarding")
@@ -1497,7 +1505,10 @@ def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
 
 def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: str = "Validation") -> dict:
     """Run the frozen config exactly as future regression runs will execute it."""
-    automatic_gateway = getattr(args, "_automatic_cortex_gateway", False) and args.test_id in CALIBRATED_TEST_IDS
+    automatic_gateway = getattr(args, "_automatic_cortex_gateway", False) and args.test_id in (
+        *CALIBRATED_TEST_IDS,
+        "e2e-sft-train-validate",
+    )
     bootstrap = _optimizer_validation_bootstrap(args)
     if bootstrap != getattr(args, "_admitted_optimizer_validation_bootstrap", bootstrap):
         raise ValueError("optimizer validation bootstrap/config changed after pre-calibration admission")
@@ -1785,7 +1796,6 @@ def _onboard_checkpoint_resume(args: argparse.Namespace, config) -> int:
             arms=arms,
             workdir=args.output_dir / "checkpoint-resume-calibration",
             attn_implementation=config.attention_implementation,
-            spec=spec,
             **transport_options,
         )
     gate = loss_range_gate(raw_range, where)
@@ -1943,7 +1953,9 @@ def _onboard_fixed_tolerance_test(args: argparse.Namespace, config) -> int:
 
     layers = int(spec.model.num_hidden_layers)
     already_listed = not bootstrap and test_id in spec.applicable_tests
-    full_model = config.is_rl or test_id == "inference-checkpoint-loss"
+    full_model = (
+        config.is_rl or test_id == "inference-checkpoint-loss" or getattr(args, "local_gateway_full_model", False)
+    )
     model_description = (
         f"configured full model {config.model_name}"
         if full_model
@@ -2077,7 +2089,7 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
                 "optimizer reference preparation returned target results instead of reference-only success"
             )
         paths = sorted(
-            (ctx.reference_records_dir / reference_config_subpath(config.path, config.config_id) / test_id).glob(
+            (ctx.reference_records_dir / reference_config_subpath(config.path, config.config_id) / test_id).rglob(
                 "*.json"
             )
         )
@@ -2121,6 +2133,7 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
                 "learning_rate": OPTIMIZER_LEARNING_RATE,
                 "gradient_clipping": config.training.get("gradient_clipping"),
                 "dtype": config.optimizer_dtype,
+                "compute_dtype": config.optimizer_compute_dtype(str(args.optimizer_model_path)),
             }
             if (
                 recipe.get("model") != expected_model
@@ -2315,10 +2328,11 @@ def _parent(args: argparse.Namespace) -> int:
         getattr(args, "backend", "onprem") != "cortex"
         or (config.is_rl and args.test_id != "checkpoint-resume-loss")
         or getattr(args, "local_gateway_full_model", False)
-        or args.test_id not in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss")
+        or args.test_id not in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss", "e2e-sft-train-validate")
     ):
         raise ValueError(
-            "local Cortex fixture onboarding requires supervised Cortex gradients or optimizer, or checkpoint-resume"
+            "local Cortex fixture onboarding requires supervised Cortex gradients, optimizer or E2E, "
+            "or checkpoint-resume"
         )
     if getattr(args, "backend", "onprem") == "cortex":
         from arctic_platform.correctness.harness.execution import _client_backend
@@ -2598,7 +2612,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--local-gateway-full-model",
         action="store_true",
-        help="use the admitted offline full model for E2E preparation or inference/e2e validation",
+        help="explicit full-model selection for inference; local supervised E2E selects it automatically",
     )
     parser.add_argument(
         "--local-cortex-fixture",
@@ -2713,9 +2727,16 @@ def run(args: argparse.Namespace) -> int:
     _load_inference_initial_model_dir(SimpleNamespace(**{**vars(args), "test": [args.test_id], "all_configs": False}))
     _optimizer_validation_bootstrap(args)
     if getattr(args, "local_cortex_fixture", False) and (
-        getattr(args, "prepare_references", False) or args.probe_layers is not None
+        args.probe_layers is not None
+        or (
+            getattr(args, "prepare_references", False)
+            and (args.reference_tests or [args.test_id]) != ["e2e-sft-train-validate"]
+        )
     ):
-        raise ValueError("local Cortex fixture selection is only for onboarding with final target validation")
+        raise ValueError(
+            "local Cortex fixture selection is only for onboarding with final target validation "
+            "or reduced E2E reference preparation"
+        )
     topology = getattr(args, "inference_sampling_topology", None)
     if topology is not None and (
         getattr(args, "prepare_references", False)
@@ -2741,6 +2762,9 @@ def run(args: argparse.Namespace) -> int:
             f"{config.config_id}: correctness onboarding requires a training sub-job; this is inference-only"
         )
     selection = args.reference_tests or (list(registered_tests()) if args.test_id == "all" else [args.test_id])
+    from arctic_platform.correctness.harness.execution import _configure_e2e_model
+
+    _configure_e2e_model(args, config, selection)
     if not config.is_rl and set(selection).intersection(CALIBRATED_TEST_IDS):
         validate_first_two_model_dtype(config)
     if args.reference_records_dir is not None:
@@ -2844,6 +2868,7 @@ def run(args: argparse.Namespace) -> int:
 def _onboard_configuration(args: argparse.Namespace) -> int:
     """Resolve a config-only onboarding request and retain each check's actual result."""
     from arctic_platform.correctness.harness.config import load_config
+    from arctic_platform.correctness.harness.execution import _configure_e2e_model
     from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
     from arctic_platform.correctness.harness.registry import onboarding_inapplicable_reason
     from arctic_platform.correctness.harness.registry import registered_tests
@@ -2916,11 +2941,15 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
                 "output_dir": output / test_id if output is not None else None,
             }
         )
+        if test_id == "single-step-grads" and test_id not in selected:
+            # A full-model E2E request still builds its shared spec with a reduced gradient fixture.
+            child.local_gateway_full_model = False
         if hasattr(args, "_diagnostics_dir"):
             child._diagnostics_dir = args._diagnostics_dir / test_id
         with _onboarding_test_log(child) as test_log, _onboarding_test_time(child, test_id):
             _stage(f"Onboarding {index}/{len(queue)}", test_id.replace("-", " "), f"Config: {config.config_id}")
             try:
+                _configure_e2e_model(child, config, [test_id])
                 options = _onboarding_options(child)
                 runtime_identity = _onboarding_runtime_identity(_onboarding_runtime_sources())
                 _onboarding_preflight(child, config, [test_id])
@@ -2965,7 +2994,13 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
                 queue.append(completed_id)
                 print(f"rebuilding {completed_id}: its frozen workload changed during onboarding", flush=True)
     references = [
-        test_id for test_id in requested if test_id in CRITERIA and results[test_id]["status"] == "onboarded"
+        test_id
+        for test_id in requested
+        if test_id in CRITERIA and results[test_id]["status"] == "onboarded"
+        # Full-model E2E references were prepared independently; do not replace them with reduced records.
+        and not (
+            test_id == "e2e-sft-train-validate" and results[test_id].get("options", {}).get("local_gateway_full_model")
+        )
     ]
     preparation_error = previous.get("combined_reference_error")
     if (
@@ -3247,6 +3282,7 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
             learning_rate=1e-2,
             gradient_clipping=config.training.get("gradient_clipping"),
             optimizer_dtype=config.optimizer_dtype,
+            optimizer_compute_dtype=config.optimizer_compute_dtype(str(model_path)),
             optimizer_output_dir=run_dir / "states",
             cuda_device=run_index % lanes,
             deterministic=False,
@@ -3428,6 +3464,12 @@ def _completed_onboarding(args: argparse.Namespace, spec: dict, summary: dict, t
     saved = summary.get("results", {}).get(test_id, {})
     if not isinstance(saved, dict):
         saved = {}
+    if test_id == "e2e-sft-train-validate":
+        from arctic_platform.correctness.harness.config import load_config
+        from arctic_platform.correctness.harness.execution import _configure_e2e_model
+
+        args = argparse.Namespace(**vars(args))
+        _configure_e2e_model(args, load_config(args.config), [test_id])
     options = _onboarding_options(args)
     runtime_identity = _onboarding_runtime_identity(_onboarding_runtime_sources())
     if (

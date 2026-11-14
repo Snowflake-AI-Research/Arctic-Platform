@@ -1,0 +1,15 @@
+{
+  "combined_reference_elapsed_seconds": null,
+  "combined_reference_error": null,
+  "config": "/code/users/stas/github/sf/stas-dss-repro/arctic-platform-correctness-testing/arctic_platform/correctness/configs/glm5.3-flash/h200/train-rl-lora-16gpus-sp8-256k.config",
+  "config_id": "glm5.3-flash-h200-train-rl-lora-16gpus-sp8-256k",
+  "results": {
+    "checkpoint-resume-loss": {
+      "elapsed_seconds": 11258.316483213566,
+      "exit_code": 0,
+      "output_dir": "/data-fast/tmp/nokvb-rl-fast-rE2ePBhr/onboarding-checkpoint-resume-loss/checkpoint-resume-loss",
+      "status": "onboarded"
+    }
+  },
+  "test_spec": "/code/users/stas/github/sf/stas-dss-repro/arctic-platform-correctness-testing/arctic_platform/correctness/specs/glm5.3-flash-h200-train-rl-lora-16gpus-sp8-256k.json"
+}

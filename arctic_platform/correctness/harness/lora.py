@@ -55,6 +55,10 @@ from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.storage import correctness_environment
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import require_data_fast_path
+from arctic_platform.debug.training import maybe_select_participation_coordinator
+from arctic_platform.debug.training import participation_capture_enabled
+from arctic_platform.debug.training import participation_step_class
+from arctic_platform.debug.training import participation_worker_class
 
 # Lora
 
@@ -1380,10 +1384,10 @@ def _coordinator_class(training, request: dict, files_ref, *, first_two: bool = 
     import ray
 
     _verify_runtime(training, request["sources"])
-    capture = first_two
+    capture = first_two or participation_capture_enabled()
     coordinator_base = training.GPUTrainingJob.__ray_metadata__.modified_class
     if capture:
-        selected_step_class = first_two_step_class
+        selected_step_class = first_two_step_class if first_two else participation_step_class
         coordinator_base = selected_step_class(coordinator_base)
     worker_base = training._DeepSpeedWorker
 
@@ -1413,7 +1417,7 @@ def _coordinator_class(training, request: dict, files_ref, *, first_two: bool = 
         def original_adapter_receipt(self):
             return deepcopy(self._correctness_original_adapter_receipt)
 
-    selected_worker_class = first_two_worker_class
+    selected_worker_class = first_two_worker_class if first_two else participation_worker_class
     selected_worker = selected_worker_class(OriginalAdapterWorker) if capture else OriginalAdapterWorker
 
     class OriginalAdapterCoordinator(coordinator_base):
@@ -1477,10 +1481,10 @@ def _shared_coordinator_class(training, request: dict, files_ref, *, first_two: 
     import ray
 
     _verify_shared_runtime(training, request["sources"])
-    capture = first_two
+    capture = first_two or participation_capture_enabled()
     coordinator_base = training.GPUTrainingJob.__ray_metadata__.modified_class
     if capture:
-        selected_step_class = first_two_step_class
+        selected_step_class = first_two_step_class if first_two else participation_step_class
         coordinator_base = selected_step_class(coordinator_base)
     worker_base = training._DeepSpeedWorker
 
@@ -1509,7 +1513,7 @@ def _shared_coordinator_class(training, request: dict, files_ref, *, first_two: 
         def shared_adapter_receipt(self):
             return deepcopy(self._correctness_shared_adapter_receipt)
 
-    selected_worker_class = first_two_worker_class
+    selected_worker_class = first_two_worker_class if first_two else participation_worker_class
     selected_worker = selected_worker_class(SharedAdapterWorker) if capture else SharedAdapterWorker
 
     class SharedAdapterCoordinator(coordinator_base):
@@ -1599,7 +1603,8 @@ def install_manager(manager) -> None:
             if marker:
                 with select_participation_coordinator(manager_module, actor_key, original_actor, training):
                     return original_spawn(info)
-            return original_spawn(info)
+            with maybe_select_participation_coordinator(manager_module, actor_key, original_actor, training):
+                return original_spawn(info)
         selected_request = shared_request if shared_request is not None else request
         if sum((len(node.gpu_ids) for node in info.layout)) != selected_request["training_gpus"]:
             raise ValueError("native original adapter manager allocation differs")
@@ -1614,6 +1619,7 @@ def install_manager(manager) -> None:
             _verify_runtime(training, request["sources"])
             files = original_adapter_files(request["path"], request["identity"], request["original_metadata"])
             selected = _coordinator_class(training, request, ray.put(files), first_two=marker)
+        # The original spawn is synchronous: no other create can observe this temporary table entry.
         manager_module._ACTOR_CLS[actor_key] = selected
         try:
             return original_spawn(info)

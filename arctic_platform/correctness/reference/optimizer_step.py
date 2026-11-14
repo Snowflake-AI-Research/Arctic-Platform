@@ -64,7 +64,8 @@ def build_adamw(named_masters, optimizer_config: dict, *, learning_rate: float):
     """One AdamW over the config's hyperparameters, with weight decay withheld from biases and norms.
 
     Single-step and trajectory references both use independent PyTorch AdamW with fused and foreach
-    implementations disabled. Product optimizer rounding remains a measured difference.
+    implementations disabled. The single-step reference runs it in the precision the product's implementation
+    computes in and rounds to the optimizer dtype on store; other product rounding remains a measured difference.
     """
     import torch
 
@@ -93,6 +94,7 @@ def _write_adamw_parameter(
     optimizer_config,
     *,
     dtype,
+    compute_dtype,
     learning_rate,
     coefficient,
     foreach_clip,
@@ -101,25 +103,27 @@ def _write_adamw_parameter(
 ):
     master = initial_master = optimizer = state = tensors = None
     try:
-        master = torch.nn.Parameter(source.detach().to(dtype).clone(), requires_grad=True)
+        master = torch.nn.Parameter(source.detach().to(dtype).to(compute_dtype, copy=True), requires_grad=True)
         # Initialization precision conversion is not part of the optimizer update.
         initial_master = master.detach().float().clone()
         gradient = gradients.pop(name) if consume_gradients else gradients[name]
-        master.grad = gradient.detach().to(device=master.device, dtype=dtype).clone()
+        clipped = gradient.detach().to(device=master.device, dtype=dtype).clone()
         del gradient
         if coefficient is not None:
             if foreach_clip:
-                torch._foreach_mul_([master.grad], coefficient)
+                torch._foreach_mul_([clipped], coefficient)
             else:
-                master.grad.mul_(coefficient)
+                clipped.mul_(coefficient)
+        master.grad = clipped.to(compute_dtype)
+        del clipped
         optimizer = build_adamw([(name, master)], optimizer_config, learning_rate=learning_rate)
         optimizer.step()
         master.grad = None
         state = optimizer.state[master]
         tensors = {
-            "parameter_update": master.detach().float().sub(initial_master).cpu(),
-            "exp_avg": state["exp_avg"].detach().cpu(),
-            "exp_avg_sq": state["exp_avg_sq"].detach().cpu(),
+            "parameter_update": master.detach().to(dtype).float().sub(initial_master).cpu(),
+            "exp_avg": state["exp_avg"].detach().to(dtype).cpu(),
+            "exp_avg_sq": state["exp_avg_sq"].detach().to(dtype).cpu(),
         }
         torch.save(tensors, path)
         return {
@@ -154,6 +158,7 @@ def run_adamw_step(
     gradient_clipping: float | None,
     optimizer_dtype: str,
     output_dir: Path,
+    optimizer_compute_dtype: str | None = None,
     consume_gradients: bool = False,
     participation: dict | None = None,
 ) -> OptimizerStepArtifact:
@@ -163,6 +168,7 @@ def run_adamw_step(
     from torch.utils._foreach_utils import _has_foreach_support
 
     dtype = master_dtype(optimizer_dtype)
+    compute_dtype = master_dtype(optimizer_compute_dtype or optimizer_dtype)
     assert_adamw_semantics(optimizer_config)
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError("reference optimizer output directory must be empty")
@@ -250,6 +256,7 @@ def run_adamw_step(
                 gradients,
                 optimizer_config,
                 dtype=dtype,
+                compute_dtype=compute_dtype,
                 learning_rate=learning_rate,
                 coefficient=coefficient,
                 foreach_clip=foreach_clip,

@@ -459,217 +459,31 @@ def _load_local_fixture(backend: CortexConfig, spec: TestSpec) -> dict:
     return {**binding, "model_name": str(model_path), "distribution": "local-gateway"}
 
 
-def _fixture_inventory(root: Path, deadline: float) -> list[dict]:
-    from . import inference as transfer
-
-    if root != transfer._destination_parent(root) or not root.is_dir():
-        raise ValueError("canonical FAST fixture directory required")
-    files = []
-    for path in sorted(root.rglob("*")):
-        relative = path.relative_to(root)
-        if path.is_symlink():
-            raise ValueError("fixture must not contain symlinks")
-        if path.name == MANIFEST or any(part in {".cache", ".git"} for part in relative.parts):
-            continue
-        if path.is_dir():
-            continue
-        if not stat.S_ISREG(path.lstat().st_mode):
-            raise ValueError("fixture must contain only regular files")
-        files.append(
-            {
-                "path": transfer._relative_filename(relative.as_posix()),
-                "size_bytes": path.stat().st_size,
-                "sha256": transfer._regular_sha(path, deadline),
-            }
-        )
-    return files
-
-
-def _fixture_worker_argv(python: str, role: str, request: dict) -> list[str]:
-    from . import inference
-    from . import storage
-
-    source_root = Path(__file__).resolve().parents[3]
-    pins = {
-        str(Path(module.__file__).resolve()): _sha256(Path(module.__file__))
-        for module in (sys.modules[__name__], inference, storage)
-    }
-    code = (
-        "import hashlib,pathlib,sys;"
-        f"sys.path.insert(0,{str(source_root)!r});"
-        f"assert all(hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()==h for p,h in {pins!r}.items());"
-        "from arctic_platform.correctness.harness.cortex import _fixture_worker;"
-        f"_fixture_worker({role!r},{request!r})"
-    )
-    return [python, "-B", "-c", code]
-
-
-def _fixture_worker(role: str, request: dict) -> None:
-    from . import inference as transfer
-
-    budget = min(request["timeout_s"], request["deadline_epoch"] - time.time())
-    deadline = time.monotonic() + budget
-    transfer._local_remaining(deadline)
-    if role == "send":
-        transfer._stream_local_export(request["root"], request["binding"], deadline)
-        return
-    if role == "supervise":
-        child = subprocess.Popen(
-            _fixture_worker_argv(sys.executable, "receive", request),
-            stdin=sys.stdin.buffer,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            output, error = child.communicate(timeout=transfer._local_remaining(deadline))
-            if child.returncode or len(output) > transfer._LOCAL_METADATA_LIMIT:
-                raise ValueError("fixture receiver failed: " + error.decode(errors="replace")[-8000:])
-            result = json.loads(output, object_pairs_hook=transfer._unique_object)
-        finally:
-            transfer._stop_local_children([child])
-    else:
-        transfer._validate_local_node(request["node"], deadline)
-        root = Path(request["root"])
-        if root != transfer._destination_parent(root):
-            raise ValueError("canonical FAST fixture destination required")
-        if role == "inspect":
-            result = {"files": _fixture_inventory(root, deadline) if root.exists() else None}
-        elif role == "receive":
-            binding = json.loads(
-                sys.stdin.buffer.readline(transfer._LOCAL_METADATA_LIMIT + 1),
-                object_pairs_hook=transfer._unique_object,
-            )
-            if binding != request["binding"]:
-                raise ValueError("fixture stream binding differs")
-            root.parent.mkdir(parents=True, exist_ok=True)
-            root.mkdir(mode=0o700)
-            names = set()
-            for row in binding["files"]:
-                name = transfer._relative_filename(row["path"])
-                if (
-                    name in names
-                    or type(row["size_bytes"]) is not int
-                    or row["size_bytes"] < 0
-                    or re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is None
-                ):
-                    raise ValueError("invalid fixture file inventory")
-                names.add(name)
-                remaining = row["size_bytes"]
-                digest = hashlib.sha256()
-                with transfer._open_exclusive(root, name) as output:
-                    while remaining:
-                        transfer._local_remaining(deadline)
-                        chunk = sys.stdin.buffer.read(min(1024**2, remaining))
-                        if not chunk:
-                            raise ValueError("truncated fixture stream")
-                        output.write(chunk)
-                        digest.update(chunk)
-                        remaining -= len(chunk)
-                    output.flush()
-                    os.fsync(output.fileno())
-                if digest.hexdigest() != row["sha256"]:
-                    raise ValueError("fixture stream bytes differ")
-            if sys.stdin.buffer.read(1) or _fixture_inventory(root, deadline) != binding["files"]:
-                raise ValueError("persisted fixture bytes differ")
-            result = {"files": binding["files"]}
-        else:
-            raise ValueError("unknown fixture transfer operation")
-        transfer._validate_local_node(request["node"], deadline)
-        result.update(node=request["node"], root=str(root), allocation_id=request["allocation_id"])
-    print(json.dumps(result, sort_keys=True, allow_nan=False), flush=True)
-
-
-def distribute_local_fixture(spec: TestSpec, admission: dict, *, timeout_s: float = 1800.0) -> dict:
-    """Stage the exact reviewed fixture on every same-job node before worker loading."""
-    from . import inference as transfer
-
-    if type(timeout_s) not in (int, float) or not math.isfinite(timeout_s) or timeout_s <= 0:
-        raise ValueError("finite positive fixture transfer deadline required")
-    deadline = time.monotonic() + timeout_s
-    hostfile_identity = {}
-    nodes = transfer._validate_local_allocation(admission, deadline, hostfile_identity)
-    root = Path(spec.model.cache_path)
-    binding = describe_fixture(spec, root)
-    if _fixture_inventory(root, deadline) != binding["files"]:
-        raise ValueError("fixture inventory differs from reviewed binding")
-    receipts = []
-    for node in nodes[1:]:
-        request = {
-            "node": node,
-            "root": str(root),
-            "binding": binding,
-            "allocation_id": admission["allocation_id"],
-            "timeout_s": transfer._local_remaining(deadline),
-            "deadline_epoch": time.time() + transfer._local_remaining(deadline),
-        }
-        with transfer._strict_ssh_argv(
-            admission, node, shlex.join(_fixture_worker_argv(node["python"], "inspect", request)), deadline
-        ) as argv:
-            receipt = transfer._bounded_local_json(argv, deadline)
-        expected = {
-            "files": binding["files"],
-            "node": node,
-            "root": str(root),
-            "allocation_id": admission["allocation_id"],
-        }
-        if receipt.get("files") is None:
-            children = []
-            with (
-                transfer._strict_ssh_argv(
-                    admission, node, shlex.join(_fixture_worker_argv(node["python"], "supervise", request)), deadline
-                ) as argv,
-                tempfile.TemporaryFile() as sender_error,
-                tempfile.TemporaryFile() as receiver_error,
-            ):
-                try:
-                    sender = subprocess.Popen(
-                        _fixture_worker_argv(sys.executable, "send", request),
-                        stdout=subprocess.PIPE,
-                        stderr=sender_error,
-                        start_new_session=True,
-                    )
-                    children.append(sender)
-                    receiver = subprocess.Popen(
-                        argv,
-                        stdin=sender.stdout,
-                        stdout=subprocess.PIPE,
-                        stderr=receiver_error,
-                        start_new_session=True,
-                    )
-                    children.append(receiver)
-                    sender.stdout.close()
-                    output, _ = receiver.communicate(timeout=transfer._local_remaining(deadline))
-                    sender.wait(timeout=transfer._local_remaining(deadline))
-                    if sender.returncode or receiver.returncode:
-                        details = []
-                        for error in (sender_error, receiver_error):
-                            error.seek(max(0, error.tell() - 8000))
-                            details.append(error.read().decode(errors="replace"))
-                        raise RuntimeError("fixture transfer failed: " + "\n".join(details))
-                    if len(output) > transfer._LOCAL_METADATA_LIMIT:
-                        raise ValueError("fixture receipt exceeds metadata bound")
-                    receipt = json.loads(output, object_pairs_hook=transfer._unique_object)
-                finally:
-                    transfer._stop_local_children(children)
-        if receipt != expected:
-            raise ValueError("worker fixture bytes or node identity differ")
-        receipts.append(receipt)
-    transfer._validate_local_allocation(admission, deadline, hostfile_identity)
-    if describe_fixture(spec, root) != binding or _fixture_inventory(root, deadline) != binding["files"]:
-        raise ValueError("head fixture changed during distribution")
-    result = {
-        "fixture_sha256": binding["fixture_sha256"],
-        "allocation_id": admission["allocation_id"],
-        "remote_receipts": receipts,
-    }
-    print("CORRECTNESS_FIXTURE_DISTRIBUTION " + json.dumps(result, sort_keys=True), flush=True)
-    return result
-
-
 LOCAL_NATIVE_FORWARD_ENV = "ARCTIC_CORRECTNESS_LOCAL_NATIVE_FORWARD"
 LOCAL_CHECKPOINT_BRIDGE_ENV = "ARCTIC_CORRECTNESS_LOCAL_CHECKPOINT_BRIDGE"
 _NATIVE_ROLES = {"training": "training", "sampling": "sampling", "log_prob": "log_probability"}
+
+
+@contextlib.contextmanager
+def local_checkpoint_bridge():
+    """Route resumable saves and loads through the owned correctness gateway's retained checkpoint catalog.
+
+    A loopback DSS gateway's own save returns only a node-local FAST path and tag, which a later job cannot resolve, so
+    cross-job resume on a local gateway needs the ``/correctness`` checkpoint routes that ``gateway.main`` installs.
+    The transport refuses a gateway without those routes before allocating jobs. Child processes started inside the
+    block inherit the setting.
+    """
+    names = (LOCAL_NATIVE_FORWARD_ENV, LOCAL_CHECKPOINT_BRIDGE_ENV)
+    previous = {name: os.environ.get(name) for name in names}
+    try:
+        os.environ.update({name: "1" for name in names})
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 class _LocalLoadRoute(_Route):
@@ -809,6 +623,11 @@ class CorrectnessCortexTransport(CortexTransport):
                     "local native forward requires newly created, owned child jobs; reconnect is unsupported"
                 )
             self._validate_native_api(client_config)
+        if self._is_local_gateway() and not JobHandles.from_config(client_config).any_set:
+            from arctic_platform.correctness.harness.weight_cache import maybe_prepare_allocation_weights
+
+            # A cold conversion inside the job would spend DSS's training creation deadline before it is ready.
+            maybe_prepare_allocation_weights(client_config)
         jobs = super().initialize(client_config)
         if self._native_children:
             for role, gateway_role in _NATIVE_ROLES.items():
@@ -1153,23 +972,209 @@ class CorrectnessCortexTransport(CortexTransport):
                 primary.add_note(f"HTTP session closure also failed: {type(error).__name__}: {error}")
 
 
-@contextlib.contextmanager
-def local_checkpoint_bridge():
-    """Route resumable saves and loads through the owned correctness gateway's retained checkpoint catalog.
+def _fixture_inventory(root: Path, deadline: float) -> list[dict]:
+    from . import inference as transfer
 
-    A loopback DSS gateway's own save returns only a node-local FAST path and tag, which a later job cannot resolve, so
-    cross-job resume on a local gateway needs the ``/correctness`` checkpoint routes that ``gateway.main`` installs.
-    The transport refuses a gateway without those routes before allocating jobs. Child processes started inside the
-    block inherit the setting.
-    """
-    names = (LOCAL_NATIVE_FORWARD_ENV, LOCAL_CHECKPOINT_BRIDGE_ENV)
-    previous = {name: os.environ.get(name) for name in names}
-    try:
-        os.environ.update({name: "1" for name in names})
-        yield
-    finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+    if root != transfer._destination_parent(root) or not root.is_dir():
+        raise ValueError("canonical FAST fixture directory required")
+    files = []
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if path.is_symlink():
+            raise ValueError("fixture must not contain symlinks")
+        if path.name == MANIFEST or any(part in {".cache", ".git"} for part in relative.parts):
+            continue
+        if path.is_dir():
+            continue
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise ValueError("fixture must contain only regular files")
+        files.append(
+            {
+                "path": transfer._relative_filename(relative.as_posix()),
+                "size_bytes": path.stat().st_size,
+                "sha256": transfer._regular_sha(path, deadline),
+            }
+        )
+    return files
+
+
+def _fixture_worker_argv(python: str, role: str, request: dict) -> list[str]:
+    from . import inference
+    from . import storage
+
+    source_root = Path(__file__).resolve().parents[3]
+    pins = {
+        str(Path(module.__file__).resolve()): _sha256(Path(module.__file__))
+        for module in (sys.modules[__name__], inference, storage)
+    }
+    code = (
+        "import hashlib,pathlib,sys;"
+        f"sys.path.insert(0,{str(source_root)!r});"
+        f"assert all(hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()==h for p,h in {pins!r}.items());"
+        "from arctic_platform.correctness.harness.cortex import _fixture_worker;"
+        f"_fixture_worker({role!r},{request!r})"
+    )
+    return [python, "-B", "-c", code]
+
+
+def _fixture_worker(role: str, request: dict) -> None:
+    from . import inference as transfer
+
+    budget = min(request["timeout_s"], request["deadline_epoch"] - time.time())
+    deadline = time.monotonic() + budget
+    transfer._local_remaining(deadline)
+    if role == "send":
+        transfer._stream_local_export(request["root"], request["binding"], deadline)
+        return
+    if role == "supervise":
+        child = subprocess.Popen(
+            _fixture_worker_argv(sys.executable, "receive", request),
+            stdin=sys.stdin.buffer,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            output, error = child.communicate(timeout=transfer._local_remaining(deadline))
+            if child.returncode or len(output) > transfer._LOCAL_METADATA_LIMIT:
+                raise ValueError("fixture receiver failed: " + error.decode(errors="replace")[-8000:])
+            result = json.loads(output, object_pairs_hook=transfer._unique_object)
+        finally:
+            transfer._stop_local_children([child])
+    else:
+        transfer._validate_local_node(request["node"], deadline)
+        root = Path(request["root"])
+        if root != transfer._destination_parent(root):
+            raise ValueError("canonical FAST fixture destination required")
+        if role == "inspect":
+            result = {"files": _fixture_inventory(root, deadline) if root.exists() else None}
+        elif role == "receive":
+            binding = json.loads(
+                sys.stdin.buffer.readline(transfer._LOCAL_METADATA_LIMIT + 1),
+                object_pairs_hook=transfer._unique_object,
+            )
+            if binding != request["binding"]:
+                raise ValueError("fixture stream binding differs")
+            root.parent.mkdir(parents=True, exist_ok=True)
+            root.mkdir(mode=0o700)
+            names = set()
+            for row in binding["files"]:
+                name = transfer._relative_filename(row["path"])
+                if (
+                    name in names
+                    or type(row["size_bytes"]) is not int
+                    or row["size_bytes"] < 0
+                    or re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is None
+                ):
+                    raise ValueError("invalid fixture file inventory")
+                names.add(name)
+                remaining = row["size_bytes"]
+                digest = hashlib.sha256()
+                with transfer._open_exclusive(root, name) as output:
+                    while remaining:
+                        transfer._local_remaining(deadline)
+                        chunk = sys.stdin.buffer.read(min(1024**2, remaining))
+                        if not chunk:
+                            raise ValueError("truncated fixture stream")
+                        output.write(chunk)
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+                if digest.hexdigest() != row["sha256"]:
+                    raise ValueError("fixture stream bytes differ")
+            if sys.stdin.buffer.read(1) or _fixture_inventory(root, deadline) != binding["files"]:
+                raise ValueError("persisted fixture bytes differ")
+            result = {"files": binding["files"]}
+        else:
+            raise ValueError("unknown fixture transfer operation")
+        transfer._validate_local_node(request["node"], deadline)
+        result.update(node=request["node"], root=str(root), allocation_id=request["allocation_id"])
+    print(json.dumps(result, sort_keys=True, allow_nan=False), flush=True)
+
+
+def distribute_local_fixture(spec: TestSpec, admission: dict, *, timeout_s: float = 1800.0) -> dict:
+    """Stage the exact reviewed fixture on every same-job node before worker loading."""
+    from . import inference as transfer
+
+    if type(timeout_s) not in (int, float) or not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError("finite positive fixture transfer deadline required")
+    deadline = time.monotonic() + timeout_s
+    hostfile_identity = {}
+    nodes = transfer._validate_local_allocation(admission, deadline, hostfile_identity)
+    root = Path(spec.model.cache_path)
+    binding = describe_fixture(spec, root)
+    if _fixture_inventory(root, deadline) != binding["files"]:
+        raise ValueError("fixture inventory differs from reviewed binding")
+    receipts = []
+    for node in nodes[1:]:
+        request = {
+            "node": node,
+            "root": str(root),
+            "binding": binding,
+            "allocation_id": admission["allocation_id"],
+            "timeout_s": transfer._local_remaining(deadline),
+            "deadline_epoch": time.time() + transfer._local_remaining(deadline),
+        }
+        with transfer._strict_ssh_argv(
+            admission, node, shlex.join(_fixture_worker_argv(node["python"], "inspect", request)), deadline
+        ) as argv:
+            receipt = transfer._bounded_local_json(argv, deadline)
+        expected = {
+            "files": binding["files"],
+            "node": node,
+            "root": str(root),
+            "allocation_id": admission["allocation_id"],
+        }
+        if receipt.get("files") is None:
+            children = []
+            with (
+                transfer._strict_ssh_argv(
+                    admission, node, shlex.join(_fixture_worker_argv(node["python"], "supervise", request)), deadline
+                ) as argv,
+                tempfile.TemporaryFile() as sender_error,
+                tempfile.TemporaryFile() as receiver_error,
+            ):
+                try:
+                    sender = subprocess.Popen(
+                        _fixture_worker_argv(sys.executable, "send", request),
+                        stdout=subprocess.PIPE,
+                        stderr=sender_error,
+                        start_new_session=True,
+                    )
+                    children.append(sender)
+                    receiver = subprocess.Popen(
+                        argv,
+                        stdin=sender.stdout,
+                        stdout=subprocess.PIPE,
+                        stderr=receiver_error,
+                        start_new_session=True,
+                    )
+                    children.append(receiver)
+                    sender.stdout.close()
+                    output, _ = receiver.communicate(timeout=transfer._local_remaining(deadline))
+                    sender.wait(timeout=transfer._local_remaining(deadline))
+                    if sender.returncode or receiver.returncode:
+                        details = []
+                        for error in (sender_error, receiver_error):
+                            error.seek(max(0, error.tell() - 8000))
+                            details.append(error.read().decode(errors="replace"))
+                        raise RuntimeError("fixture transfer failed: " + "\n".join(details))
+                    if len(output) > transfer._LOCAL_METADATA_LIMIT:
+                        raise ValueError("fixture receipt exceeds metadata bound")
+                    receipt = json.loads(output, object_pairs_hook=transfer._unique_object)
+                finally:
+                    transfer._stop_local_children(children)
+        if receipt != expected:
+            raise ValueError("worker fixture bytes or node identity differ")
+        receipts.append(receipt)
+    transfer._validate_local_allocation(admission, deadline, hostfile_identity)
+    if describe_fixture(spec, root) != binding or _fixture_inventory(root, deadline) != binding["files"]:
+        raise ValueError("head fixture changed during distribution")
+    result = {
+        "fixture_sha256": binding["fixture_sha256"],
+        "allocation_id": admission["allocation_id"],
+        "remote_receipts": receipts,
+    }
+    print("CORRECTNESS_FIXTURE_DISTRIBUTION " + json.dumps(result, sort_keys=True), flush=True)
+    return result

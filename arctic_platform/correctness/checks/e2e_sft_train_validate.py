@@ -71,7 +71,6 @@ from arctic_platform.correctness.harness.gateway import pack
 from arctic_platform.correctness.harness.gateway import pack_logit_aligned
 from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
 from arctic_platform.correctness.harness.gateway import running_job
-from arctic_platform.correctness.harness.gateway import validate_reduced_fixture_support
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.sft import TRAIN_SPLIT
 from arctic_platform.correctness.harness.sft import VALIDATION_SPLIT
@@ -84,7 +83,6 @@ from arctic_platform.correctness.harness.sft import reference_answer_logprobs
 from arctic_platform.correctness.harness.sft import save
 from arctic_platform.correctness.harness.storage import correctness_environment
 from arctic_platform.correctness.harness.storage import require_data_fast_path
-from arctic_platform.correctness.reference.process_determinism import CUBLAS_WORKSPACE
 
 from ..harness.config import correctness_microbatch_tokens
 from ..harness.config import tolerance_text
@@ -315,6 +313,8 @@ def reference_command(
 
 def run_reference_trajectory(ctx, replay: Replay, workdir: Path, peft_adapter_path: Path | None = None) -> dict:
     """The single-GPU trajectory's losses and held-out log-probabilities."""
+    from arctic_platform.model.implementations.debug.determinism import CUBLAS_WORKSPACE
+
     workdir.mkdir(parents=True, exist_ok=True)
     manifest = write_replay_manifest(replay, workdir / "replay.json")
     out_path = workdir / "trajectory.json"
@@ -376,6 +376,8 @@ def run_ap_trajectory(
     One job for the whole trajectory: a job restarted mid-run would reload the checkpoint, and the point
     of a hundred steps is that step 100 stands on the ninety-nine before it.
     """
+    from arctic_platform.debug.training import maybe_bind_reduced_fixture_mtp
+
     backend = getattr(ctx, "client_backend", None)
     model_name = reference_model_path(ctx)
     if isinstance(backend, CortexConfig):
@@ -398,7 +400,9 @@ def run_ap_trajectory(
         attn_implementation=ctx.attn_implementation,
         weight_format=ctx.cfg.sub_job.get("weight_format"),
     )
-    validate_reduced_fixture_support(payload, ctx.spec, getattr(ctx, "published_fixture", None))
+    maybe_bind_reduced_fixture_mtp(payload, ctx.spec, getattr(ctx, "published_fixture", None))
+    if getattr(ctx, "published_fixture", None) is not None:
+        payload["training_config"]["debug"]["correctness_e2e_fixture"] = True
     if peft_adapter_path is not None:
         from arctic_platform.correctness.harness.lora import bind_payload
 
