@@ -1152,6 +1152,8 @@ def load_record(ctx, current_identity: dict) -> dict:
     options = ["--reference-records-dir", str(getattr(ctx, "reference_records_dir", DEFAULT_RECORDS_DIR))]
     if getattr(ctx, "local_gateway_full_model", False):
         options.append("--local-gateway-full-model")
+    elif identity["check_id"] == "e2e-sft-train-validate":
+        options.append("--local-cortex-fixture")
     if identity["check_id"] != "e2e-sft-train-validate" and recipe.get("token_budget") is not None:
         options.extend(["--reference-token-budget", str(recipe["token_budget"])])
     command = (
