@@ -50,11 +50,7 @@ from ..harness.registry import TestResult
 from ..harness.registry import correctness_test
 
 
-@correctness_test(
-    "single-step-grads",
-    title="Forward-backward gradient correctness for a single step",
-    criterion="per-tensor gradient L2 norms stay within the config-specific reference-repeatability gate",
-)
+@correctness_test("single-step-grads")
 def run(ctx) -> List[TestResult]:
     results: List[TestResult] = []
     for arm in ctx.arms:

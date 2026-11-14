@@ -86,15 +86,40 @@ python -m arctic_platform.correctness onboard \
 
 **Optimizer norm agreement is not elementwise agreement.** Equal L2 norms can hide a sign change, permutation, or directional error. Regression uses the reviewed criterion and calibrated gate stored in the prepared record; regression never widens that gate.
 
-## Query Onboarding Status
+## Discover Tests And Runnable Metadata
 
-**`list` inspects configuration/test metadata without running workloads.** It reads existing recipes, specifications, compact Hugging Face (HF) reference records and onboarding summaries; it does not import external configs, publish records, start a gateway or inspect GPUs. Unreviewed recipes remain visible, including configs whose specification is missing.
+**`list` shows only onboardable test IDs, titles and criteria.** It does not list configurations, inspect onboarding artifacts or generate a report. Use the separate `report-runnable` command for config-by-test metadata.
 
 ```bash
 python -m arctic_platform.correctness list
-python -m arctic_platform.correctness list --config <ID-or-path> --test single-step-grads
-python -m arctic_platform.correctness list --config <ID-or-path> --json
+python -m arctic_platform.correctness report-runnable
+python -m arctic_platform.correctness report-runnable --help
 ```
+
+**`report-runnable` writes `correctness-runnable.md` in the current directory by default.** The Markdown table has one row per discovered config and one column per selected test, with links to detailed metadata checks, specifications, reference records and separately recorded onboarding outcomes. Configs without reviewed specifications remain visible. Omitting selectors inspects all discovered configs and registered tests.
+
+| Option | Effect |
+| --- | --- |
+| `--out <file.md>` | Write or replace this Markdown file instead of `correctness-runnable.md`. |
+| `--config-dir <directory>` | Discover recipes in this directory instead of `arctic_platform/correctness/configs/`. |
+| `--config <ID-or-path>` | Inspect one exact config ID or existing recipe path; external files are read in place, not imported. |
+| `--test <ID>` | Select one test; repeat for a subset. Duplicate IDs are collapsed. |
+| `--reference-records-dir <directory>` | Inspect this compact Hugging Face (HF) reference root instead of `arctic_platform/correctness/reference_data/`. |
+
+**Custom discovery roots do not relocate specifications or onboarding summaries.** Those remain under this package's `specs/`. The output must be a `.md` file outside the inspected config, specification and reference directories, and must not be named `correctness-progress.md`; that file is the separate operator progress tracker.
+
+```bash
+python -m arctic_platform.correctness report-runnable \
+  --config tiny-qwen3-129m-one-h200 \
+  --test single-step-grads --test single-step-optimizer \
+  --out ./work/reports/correctness-runnable.md
+```
+
+**Report symbols describe local metadata, not numerical results.** `R` means reviewed metadata is available, `S` stale metadata, `E` invalid metadata, `?` onboarding or reference preparation needed, and `-` inapplicable. `R` is neither a numerical pass nor full workload/runtime admission: current hardware, backend availability and complete reference/runtime identity are not verified. Historical successes remain separate recorded outcomes, even when their per-test specification identity matches.
+
+**Available absolute gates follow `R` cells in scientific notation.** Gradient and checkpoint-resume gates come from the frozen specification, optimizer gates from each prepared arm's reviewed record, and inference/E2E gates from their fixed criteria. Equal arm gates appear once; different gates appear in specification order, for example `3e-3/1e-3` for GAS1/GAS4. Exact-equality tests have no numeric gate. These are reviewed metadata, not gates proven by a new measured pass; the onboarding progress report uses gates recovered from each actual passing run.
+
+**Artifact inspection is read-only; only the requested Markdown report is written.** Both discovery commands can run on a CPU host without importing executable checks or starting Ray, PyTorch workloads or GPU jobs. They do not probe GPUs, import configs into the checkout, prepare models or references, change gates, or publish onboarding artifacts. See [the shared API](../api.py) for the discovery flags and metadata report implementation.
 
 **The Python API returns one structured result per selected config/test pair.** `onboarding_status(RunRequest(...))` uses the same IDs and recipe parser as regression. Omit the config selector to inspect every discovered recipe, including unreviewed configs. Repeated test IDs are collapsed; unknown IDs and conflicting config selectors are errors. External paths are read in place; when explicit recipe/path hardware permits deriving the import identity, the query uses that identity without creating a local config or probing hardware. `--config-dir` changes recipe discovery and `--reference-records-dir` changes the inspected reference root; reviewed specifications and summaries remain under this package's `specs/`.
 
@@ -108,7 +133,7 @@ data = [asdict(row) for row in rows]
 
 **Metadata validity is not runtime readiness or a passing validation.** Each result separates `spec`, `references` and `historical`. Specs are checked against the current config checksum, case shapes, attention and per-test coverage; missing, stale and malformed artifacts include a reason. Current reference filenames are checked for schema, payload integrity, config/check identity, frozen gradient gate, case shape and complete scalar measurements. `metadata_valid` does not authenticate the complete reference workload, installed dependencies, model/adapter bytes, wider placements or current target capabilities; regression performs its own admission checks. Legacy content-addressed records are not authenticated by this query and require regression's full identity check. Selecting gradients alone inspects `gradients-only` records; selecting gradients with an applicable optimizer check inspects `with-optimizer` records.
 
-**Recorded onboarding outcomes remain historical.** `historical.outcome` preserves the recorded outcome, while `historical.state` distinguishes matching current per-test spec identity (`current_spec`), stale identity, older unbound evidence, missing evidence and malformed evidence. A matching identity does not authenticate today's runtime or options, and a recorded success cannot substitute for missing references. A missing summary does not invalidate an imported reviewed spec or change regression selection. JSON output uses schema `correctness-onboarding-status-v1`; querying missing artifacts succeeds and reports their status, while invalid selectors return exit code 2.
+**Recorded onboarding outcomes remain historical.** `historical.outcome` preserves the recorded outcome, while `historical.state` distinguishes matching current per-test spec identity (`current_spec`), stale identity, older unbound evidence, missing evidence and malformed evidence. A matching identity does not authenticate today's runtime or options, and a recorded success cannot substitute for missing references. A missing summary does not invalidate an imported reviewed spec or change regression selection. `report-runnable` reports missing artifacts in the table, while invalid selectors return exit code 2.
 
 **Rerun onboarding when compatible references are missing.** The config-only `onboard --config <ID-or-path>` workflow prepares the selected references automatically, including the combined gradient/optimizer records; no separate operator preparation step is needed.
 
@@ -210,7 +235,7 @@ PY
 
 **Reference folders mirror the imported config path without its extension.** The demo's compact records use `arctic_platform/correctness/reference_data/tiny-qwen3-129m/standard/h200-training-full/<check-id>/...`. `--reference-records-dir` changes only the root prefix. Existing check-specific subdirectories and measurement filenames remain unchanged; see the [reference layout](hf-reference-onboarding.md#configuration-and-reference-layout) for examples.
 
-**Existing config IDs remain frozen through `arctic_platform/correctness/config-layout.json`, even after their files move.** Specifications remain `specs/<config-id>.json` and summaries remain `specs/<config-id>.onboarding.json`; use the ID printed by the command or `list`, not a guess based on the new folder. Historical measurement bytes and recorded identities are not rewritten or remeasured. Distinct old recipes sharing a derived placement retain descriptive `--<variant>` filename suffixes. New imports with conflicting bytes require an explicit distinct variant, not an overwrite.
+**Existing config IDs remain frozen through `arctic_platform/correctness/config-layout.json`, even after their files move.** Specifications remain `specs/<config-id>.json` and summaries remain `specs/<config-id>.onboarding.json`; use the ID printed by onboarding or recorded in the specification linked from `report-runnable`, not a guess based on the new folder. Historical measurement bytes and recorded identities are not rewritten or remeasured. Distinct old recipes sharing a derived placement retain descriptive `--<variant>` filename suffixes. New imports with conflicting bytes require an explicit distinct variant, not an overwrite.
 
 ## Onboarding
 
@@ -290,13 +315,14 @@ python -m arctic_platform.correctness run \
 
 **All seven test IDs are available in this full-suite checkout, but each needs its own prepared inputs and target runtime.** P1 remains a separate first-two-only checkout; replaying shared harness changes must not expand P1's registry.
 
-**List available configuration IDs and test IDs first.**
+**List onboardable test IDs first; inspect configuration metadata with the separate report.**
 
 ```bash
 python -m arctic_platform.correctness list
+python -m arctic_platform.correctness report-runnable
 ```
 
-**Run one configuration/test pair.** `--config` accepts an exact listed ID or an existing `.config` or `.json` file path. Existing IDs such as the one below remain valid through the layout manifest; moving the config does not rename its frozen ID:
+**Run one configuration/test pair.** `--config` accepts an exact config ID from its specification or an existing `.config` or `.json` file path. Existing IDs such as the one below remain valid through the layout manifest; moving the config does not rename its frozen ID:
 
 ```bash
 python -m arctic_platform.correctness run \

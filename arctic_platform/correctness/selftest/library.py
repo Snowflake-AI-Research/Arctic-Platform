@@ -5229,7 +5229,7 @@ def _onboarding_status_request(root, *, tests=("single-step-grads",), config=_op
     return api.RunRequest(config=config, tests=tests, config_dir=root / "configs")
 
 
-def _onboarding_status_record(root, test_id="single-step-grads", *, combined=False):
+def _onboarding_status_record(root, test_id="single-step-grads", *, combined=False, participation=False):
     path = api.catalog(root / "configs")[_operator_api_CONFIG]
     cfg = load_config(path)
     spec = ConfigSpec.read(root / "specs" / f"{cfg.config_id}.json")
@@ -5253,7 +5253,38 @@ def _onboarding_status_record(root, test_id="single-step-grads", *, combined=Fal
             identity["gate"] = asdict(spec.test_tolerances[test_id])
         destination = records._record_path(ctx, identity)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(records._record_bytes(identity, _reference_records_measurements(test_id)))
+        measurements = _reference_records_measurements(test_id)
+        if participation:
+            inventory = {
+                "schema": "trainable-parameter-participation-v1",
+                "parameters": {
+                    _reference_records_PARAMETER: {"shape": [2, 3], "state": "active"},
+                    "visual.weight": {
+                        "shape": [2, 3],
+                        "state": "inactive",
+                        "evidence": {
+                            "kind": "text-decoder-bypass",
+                            "module": "visual",
+                            "calls": 0,
+                            "outside_decoder_and_head": True,
+                            "forward_sha256": "a" * 64,
+                        },
+                    },
+                },
+            }
+            measurements["participation"] = inventory
+            if test_id == "single-step-optimizer":
+                witness = {"shape": [2, 3], "dtype": "torch.float32", "sha256": "b" * 64}
+                measurements["optimizer_norms"].update(
+                    participation=deepcopy(inventory),
+                    inactive_weights={
+                        "visual.weight": {
+                            kind: {"before": deepcopy(witness), "after": deepcopy(witness)}
+                            for kind in ("parameter", "master")
+                        }
+                    },
+                )
+        destination.write_bytes(records._record_bytes(identity, measurements))
         paths.append(destination)
     return paths
 
@@ -5326,7 +5357,9 @@ def test_onboarding_status_missing_specs_are_not_hidden_from_catalog(_operator_a
     assert any(item.config_id == _operator_api_CONFIG and item.spec.state == "missing" for item in statuses)
 
 
-@pytest.mark.parametrize("fault", [None, "checksum", "identity", "shape", "gate", "scalar", "json", "duplicate"])
+@pytest.mark.parametrize(
+    "fault", [None, "checksum", "identity", "shape", "arm", "optimizer-mode", "gate", "scalar", "json", "duplicate"]
+)
 def test_onboarding_status_reference_metadata_is_checked_without_claiming_readiness(_operator_api_catalog, fault):
     root = _operator_api_catalog
     paths = _onboarding_status_record(root)
@@ -5337,6 +5370,10 @@ def test_onboarding_status_reference_metadata_is_checked_without_claiming_readin
         raw["identity"]["config_checksum"] = "old"
     elif fault == "shape":
         raw["identity"]["recipe"]["synthetic_inputs"]["rows"] += 1
+    elif fault == "arm":
+        raw["identity"]["recipe"]["synthetic_inputs"]["batch"] = {"name": "gas4"}
+    elif fault == "optimizer-mode":
+        raw["identity"]["recipe"]["optimizer"] = {}
     elif fault == "gate":
         raw["identity"]["gate"]["absolute"] += 0.1
     elif fault == "scalar":
@@ -5350,7 +5387,9 @@ def test_onboarding_status_reference_metadata_is_checked_without_claiming_readin
         paths[0].write_text(json.dumps(raw))
     result = api.onboarding_status(_onboarding_status_request(root))[0]
     expected = (
-        "metadata_valid" if fault is None else "stale" if fault in {"identity", "shape", "gate"} else "malformed"
+        "metadata_valid"
+        if fault is None
+        else "stale" if fault in {"identity", "shape", "arm", "optimizer-mode", "gate"} else "malformed"
     )
     assert result.references.state == expected
     assert result.status == expected
@@ -5445,13 +5484,16 @@ def test_onboarding_status_other_row_width_cannot_satisfy_reviewed_case(_operato
     assert result.references.state == "missing"
 
 
-@pytest.mark.parametrize("state", ["parameter_update_residual", "exp_avg", "exp_avg_sq"])
+@pytest.mark.parametrize("state", ["parameter_update_residual", "exp_avg", "exp_avg_sq", "gate"])
 def test_onboarding_status_optimizer_norm_overflow_is_reported_as_malformed(_operator_api_catalog, capsys, state):
     root = _operator_api_catalog
     _onboarding_status_record(root, combined=True)
     paths = _onboarding_status_record(root, "single-step-optimizer", combined=True)
     raw = json.loads(paths[0].read_text())
-    raw["measurements"]["optimizer_norms"]["parameters"][_reference_records_PARAMETER][state] = 10**400
+    if state == "gate":
+        raw["measurements"]["optimizer_norm_gate"]["absolute"] = 10**400
+    else:
+        raw["measurements"]["optimizer_norms"]["parameters"][_reference_records_PARAMETER][state] = 10**400
     raw["payload_sha256"] = records._digest(raw["measurements"])
     paths[0].write_text(json.dumps(raw))
     assert paths[0].stat().st_size < records.MAX_RECORD_BYTES
@@ -5466,22 +5508,26 @@ def test_onboarding_status_optimizer_norm_overflow_is_reported_as_malformed(_ope
     assert "cannot validate reference metadata" in result.reason
     assert "too large" in result.reason
 
-    args = execution.parse_args(
-        [
-            "list",
-            "--config-dir",
-            str(root / "configs"),
-            "--config",
-            _operator_api_CONFIG,
-            "--test",
-            "single-step-optimizer",
-            "--json",
-        ]
+    output = root.parent / "optimizer-overflow.md"
+    assert (
+        api.main(
+            [
+                "report-runnable",
+                "--config-dir",
+                str(root / "configs"),
+                "--config",
+                _operator_api_CONFIG,
+                "--test",
+                "single-step-optimizer",
+                "--out",
+                str(output),
+            ]
+        )
+        == 0
     )
-    assert execution.cmd_list(args) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["statuses"][0]["status"] == "malformed"
-    assert "too large" in payload["statuses"][0]["references"]["reason"]
+    assert "Runnable report:" in capsys.readouterr().out
+    text = output.read_text()
+    assert "`malformed`" in text and "too large" in text
     assert {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in paths} == before
 
 
@@ -5658,52 +5704,334 @@ def test_onboarding_status_malformed_or_unsupported_configs_return_actionable_re
     assert all(item.references.state == "unverified" and item.historical.state == "unverified" for item in statuses)
 
 
-def test_onboarding_status_list_help_does_not_import_onboarding_or_inspect_artifacts(monkeypatch, capsys):
-    original_import = builtins.__import__
-
-    def guarded_import(name, *args, **kwargs):
-        if "onboard" in name:
-            pytest.fail(f"help imported heavyweight onboarding: {name}")
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", guarded_import)
+@pytest.mark.parametrize("command", ["list", "report-runnable"])
+def test_discovery_help_does_not_inspect_artifacts(monkeypatch, capsys, command):
     monkeypatch.setattr(api, "onboarding_status", lambda *a, **kw: pytest.fail("help inspected artifacts"))
     with pytest.raises(SystemExit) as caught:
-        execution.parse_args(["list", "--help"])
+        api.main([command, "--help"])
     assert caught.value.code == 0
     output = capsys.readouterr().out
-    assert "--json" in output and "--config" in output and "--test" in output
+    assert "--json" not in output
+    assert ("--config" in output) is (command == "report-runnable")
+    assert ("--test" in output) is (command == "report-runnable")
 
 
-def test_onboarding_status_list_json_and_duplicate_selectors(_operator_api_catalog, capsys):
+def test_discovery_list_only_shows_onboardable_tests(monkeypatch, capsys):
+    from arctic_platform.correctness.harness import registry
+
+    definitions = registry.test_definitions()
+    hosted = replace(next(iter(definitions.values())), test_id="hosted-only", requires_hosted_control_plane=True)
+    monkeypatch.setattr(api, "test_definitions", lambda: {**definitions, hosted.test_id: hosted})
+    monkeypatch.setattr(api, "catalog", lambda *a, **kw: pytest.fail("list inspected configs"))
+    monkeypatch.setattr(api, "onboarding_status", lambda *a, **kw: pytest.fail("list inspected artifacts"))
+    assert api.main(["list"]) == 0
+    output = capsys.readouterr().out
+    assert output.startswith("Tests:\n")
+    assert "Configurations:" not in output and "hosted-only" not in output
+    assert re.findall(r"^([a-z][a-z0-9-]+)\s+", output, re.MULTILINE) == sorted(definitions)
+    for definition in definitions.values():
+        assert definition.title in output and definition.criterion in output
+
+
+@pytest.mark.parametrize(
+    "flags", [["--json"], ["--config", "unknown"], ["--test", "single-step-grads"], ["--config-dir", "unused"]]
+)
+def test_discovery_list_rejects_old_status_options(capsys, flags):
+    with pytest.raises(SystemExit) as caught:
+        api.main(["list", *flags])
+    assert caught.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+def _discovery_artifact_snapshot(root):
+    return {
+        str(path.relative_to(root)): (path.read_bytes(), path.stat().st_mtime_ns) if path.is_file() else None
+        for path in root.rglob("*")
+    }
+
+
+def test_report_runnable_matrix_filters_and_duplicate_tests(_operator_api_catalog, capsys):
     root = _operator_api_catalog
-    args = execution.parse_args(
-        [
-            "list",
-            "--config-dir",
-            str(root / "configs"),
-            "--config",
-            _operator_api_CONFIG,
-            "--config",
-            _operator_api_CONFIG,
-            "--test",
-            "single-step-grads",
-            "--test",
-            "single-step-grads",
-            "--json",
-        ]
+    _onboarding_status_record(root, combined=True, participation=True)
+    _onboarding_status_record(root, "single-step-optimizer", combined=True, participation=True)
+    output = root.parent / "reports" / "runnable.md"
+    before = _discovery_artifact_snapshot(root)
+    assert (
+        api.main(
+            [
+                "report-runnable",
+                "--config-dir",
+                str(root / "configs"),
+                "--test",
+                "single-step-optimizer",
+                "--test",
+                "single-step-grads",
+                "--test",
+                "single-step-grads",
+                "--out",
+                str(output),
+            ]
+        )
+        == 0
     )
-    assert execution.cmd_list(args) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["schema"] == "correctness-onboarding-status-v1"
-    assert len(payload["statuses"]) == 1
-    assert len(payload["tests"]) == len(registered_tests())
-    args.config.append("other")
-    assert execution.cmd_list(args) == 2
-    assert "one unique --config" in capsys.readouterr().err
+    assert "Runnable report:" in capsys.readouterr().out
+    text = output.read_text()
+    table = text.split("Legend:", 1)[0]
+    assert "| config | single-step-grads | single-step-optimizer |" in table
+    assert len(re.findall(r"^\| \[", table, re.MULTILINE)) == 3
+    assert table.count("[R](") == 2 and table.count("[?](") == 4
+    assert "R+S+E+?+- 6(2+0+0+4+0)" in table
+    assert "current hardware, backend and runtime" in text
+    assert "Recorded onboarding:" in text and "not proof" in text
+    assert _discovery_artifact_snapshot(root) == before
 
 
-def test_onboarding_status_list_and_api_are_read_only_without_onboarding_import(_operator_api_catalog, monkeypatch):
+@pytest.mark.parametrize(
+    "gates, expected",
+    [
+        ((0.001, 0.001), "1e-3"),
+        ((0.003, 0.001), "3e-3/1e-3"),
+        ((0.0, 0.0), "0e0"),
+    ],
+)
+def test_report_runnable_gates_use_reviewed_arm_records(_operator_api_catalog, gates, expected):
+    root = _operator_api_catalog
+    _onboarding_status_record(root, combined=True)
+    paths = _onboarding_status_record(root, "single-step-optimizer", combined=True)
+    for path, gate in zip(paths, gates, strict=True):
+        raw = json.loads(path.read_text())
+        raw["measurements"]["optimizer_norm_gate"]["absolute"] = gate
+        raw["payload_sha256"] = records._digest(raw["measurements"])
+        path.write_text(json.dumps(raw))
+    before = _discovery_artifact_snapshot(root)
+    request = _onboarding_status_request(root, tests=("single-step-grads", "single-step-optimizer"))
+    statuses = {status.test_id: status for status in api.onboarding_status(request)}
+    assert statuses["single-step-optimizer"].references.gates == gates
+    text = api.runnable_report(request)
+    table = text.split("Legend:", 1)[0]
+    assert re.search(r"\[R\]\(#[^)]+\) 5e-3", table)
+    assert re.search(rf"\[R\]\(#[^)]+\) {re.escape(expected)}", table)
+    assert f"Absolute gate: `{expected}`" in text
+    assert "not a measured pass" in text
+    assert _discovery_artifact_snapshot(root) == before
+
+
+@pytest.mark.parametrize("precision", [2, 28])
+@pytest.mark.parametrize(
+    "gates, expected",
+    [
+        ((0.029,), "2.9e-2"),
+        ((0.001, 0.001), "1e-3"),
+        ((0.003, 0.001), "3e-3/1e-3"),
+        ((31.778,), "3.1778e1"),
+        ((300,), "3e2"),
+        ((123456789012345678901234567890123456789,), "1.23456789012345678901234567890123456789e38"),
+        ((0.0,), "0e0"),
+    ],
+)
+def test_report_runnable_gate_text_preserves_exact_values(gates, expected, precision):
+    from decimal import localcontext
+
+    with localcontext() as context:
+        context.prec = precision
+        assert api._gate_text(gates) == expected
+
+
+@pytest.mark.parametrize(
+    "test_id, expected",
+    [
+        ("inference-checkpoint-loss", 1e-3),
+        ("e2e-sft-train-validate", 3e-2),
+        ("checkpoint-resume-loss", 0.029),
+    ],
+)
+def test_report_runnable_gates_follow_fixed_or_frozen_criteria(_operator_api_catalog, test_id, expected):
+    root = _operator_api_catalog
+    path = root / "specs" / f"{_operator_api_CONFIG}.json"
+    spec = ConfigSpec.read(path)
+    spec.applicable_tests.append(test_id)
+    if test_id == "checkpoint-resume-loss":
+        spec.test_tolerances[test_id] = config_module.TestTolerance(absolute=expected)
+    spec.write(path)
+    request = _onboarding_status_request(root, tests=(test_id,))
+    status = api.onboarding_status(request)[0]
+    assert status.spec.gates == (expected,)
+    text = api.runnable_report(request)
+    if status.status == "metadata_valid":
+        assert f" {api._gate_text((expected,))}" in text.split("Legend:", 1)[0]
+    else:
+        assert "Absolute gate:" not in text
+
+
+@pytest.mark.parametrize("selector", ["id", "path"])
+def test_report_runnable_exact_config_selection_and_custom_reference_root(_operator_api_catalog, capsys, selector):
+    root = _operator_api_catalog
+    _onboarding_status_record(root, participation=True)
+    references = root.parent / "custom-references"
+    (root / "reference_data").rename(references)
+    selected = _operator_api_CONFIG if selector == "id" else str(api.catalog(root / "configs")[_operator_api_CONFIG])
+    output = root.parent / "selected.md"
+    before = _discovery_artifact_snapshot(root)
+    reference_before = _discovery_artifact_snapshot(references)
+    assert (
+        api.main(
+            [
+                "report-runnable",
+                "--config-dir",
+                str(root / "configs"),
+                "--config",
+                selected,
+                "--config",
+                selected,
+                "--test",
+                "single-step-grads",
+                "--reference-records-dir",
+                str(references),
+                "--out",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert "Runnable report:" in capsys.readouterr().out
+    table = output.read_text().split("Legend:", 1)[0]
+    assert len(re.findall(r"^\| \[", table, re.MULTILINE)) == 1
+    assert "[R](" in table and "--second" not in table and "--third" not in table
+    assert _discovery_artifact_snapshot(root) == before
+    assert _discovery_artifact_snapshot(references) == reference_before
+
+
+@pytest.mark.parametrize(
+    "flags,reason",
+    [
+        (["--test", "unknown"], "unknown check"),
+        (["--config", "unknown"], "unknown configuration"),
+        (["--config", _operator_api_CONFIG, "--config", _operator_api_CONFIG + "--second"], "one unique --config"),
+    ],
+)
+def test_report_runnable_invalid_filters_do_not_write(_operator_api_catalog, capsys, flags, reason):
+    root = _operator_api_catalog
+    output = root.parent / "not-created" / "report.md"
+    before = _discovery_artifact_snapshot(root)
+    argv = ["report-runnable", "--config-dir", str(root / "configs"), "--out", str(output), *flags]
+    assert api.main(argv) == 2
+    assert reason in capsys.readouterr().err
+    assert not output.parent.exists()
+    assert _discovery_artifact_snapshot(root) == before
+
+
+@pytest.mark.parametrize("destination", ["config", "spec", "reference", "progress", "json", "symlink"])
+def test_report_runnable_output_safety_preserves_artifacts(_operator_api_catalog, capsys, destination):
+    root = _operator_api_catalog
+    references = root / "reference_data"
+    references.mkdir(exist_ok=True)
+    outputs = {
+        "config": root / "configs" / "report.md",
+        "spec": root / "specs" / "report.md",
+        "reference": references / "report.md",
+        "progress": root.parent / "correctness-progress.md",
+        "json": root.parent / "report.json",
+        "symlink": root.parent / "linked.md",
+    }
+    output = outputs[destination]
+    if destination == "symlink":
+        target = root / "specs" / "protected.md"
+        target.write_text("retain this artifact\n")
+        output.symlink_to(target)
+    else:
+        output.write_text("retain this artifact\n")
+    before = _discovery_artifact_snapshot(root)
+    assert api.main(["report-runnable", "--config-dir", str(root / "configs"), "--out", str(output)]) == 2
+    assert "Cannot report runnable tests:" in capsys.readouterr().err
+    assert output.read_text() == "retain this artifact\n"
+    assert _discovery_artifact_snapshot(root) == before
+
+
+def test_report_runnable_empty_catalog_is_not_a_pass(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "empty"
+    monkeypatch.setattr(api, "PACKAGE_DIR", root)
+    output = tmp_path / "empty.md"
+    assert api.main(["report-runnable", "--config-dir", str(root / "configs"), "--out", str(output)]) == 0
+    assert "Runnable report:" in capsys.readouterr().out
+    text = output.read_text()
+    assert "R+S+E+?+- 0(0+0+0+0+0)" in text
+    assert not re.findall(r"^\| \[", text, re.MULTILINE)
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("fault", ["config", "spec", "reference"])
+def test_report_runnable_malformed_artifacts_are_reported_not_passed(_operator_api_catalog, capsys, fault):
+    root = _operator_api_catalog
+    paths = _onboarding_status_record(root, participation=True)
+    path = {
+        "config": api.catalog(root / "configs")[_operator_api_CONFIG],
+        "spec": root / "specs" / f"{_operator_api_CONFIG}.json",
+        "reference": paths[0],
+    }[fault]
+    path.write_text("{broken")
+    before = _discovery_artifact_snapshot(root)
+    output = root.parent / "malformed.md"
+    assert (
+        api.main(
+            [
+                "report-runnable",
+                "--config-dir",
+                str(root / "configs"),
+                "--config",
+                _operator_api_CONFIG,
+                "--test",
+                "single-step-grads",
+                "--out",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert "Runnable report:" in capsys.readouterr().out
+    text = output.read_text()
+    assert "[E](" in text and "[R](" not in text
+    assert "`malformed`" in text and "Expecting" in text
+    assert _discovery_artifact_snapshot(root) == before
+
+
+def test_report_runnable_escapes_literal_markdown_in_reasons_and_config_labels(_operator_api_catalog):
+    root = _operator_api_catalog
+    original = api.catalog(root / "configs")[_operator_api_CONFIG]
+    config = original.with_stem(original.stem + "[literal]")
+    config.write_bytes(original.read_bytes())
+    identifier = config_module.config_id(config)
+    reason = "![remote](https://example.com/pixel) | <script>bad</script>\nnext"
+    summary = {
+        "config_id": identifier,
+        "results": {"single-step-grads": {"status": "failed", "exit_code": 1, "reason": reason}},
+    }
+    (root / "specs" / f"{identifier}.onboarding.json").write_text(json.dumps(summary))
+    before = _discovery_artifact_snapshot(root)
+    text = api.runnable_report(_onboarding_status_request(root, config=identifier))
+    assert "![remote](https://example.com/pixel)" not in text
+    assert "&#91;remote&#93;" in text and "https://example.com/pixel" in text
+    assert "&#91;literal&#93;" in text
+    assert "[literal]" not in text
+    assert "&#124;" in text and "&lt;script&gt;bad&lt;/script&gt; next" in text
+    assert _discovery_artifact_snapshot(root) == before
+
+
+@pytest.mark.parametrize("value", ["1e999", "-1", "true"])
+def test_onboarding_status_checkpoint_gate_rejects_nonfinite_or_invalid_scalars(_operator_api_catalog, value):
+    root = _operator_api_catalog
+    path = root / "specs" / f"{_operator_api_CONFIG}.json"
+    raw = json.loads(path.read_text())
+    raw["applicable_tests"].append("checkpoint-resume-loss")
+    raw["test_tolerances"]["checkpoint-resume-loss"] = {"absolute": "GATE_VALUE"}
+    path.write_text(json.dumps(raw).replace('"GATE_VALUE"', value))
+    before = _discovery_artifact_snapshot(root)
+    result = api.onboarding_status(_onboarding_status_request(root, tests=("checkpoint-resume-loss",)))[0]
+    assert result.status == result.spec.state == "malformed"
+    assert result.reason
+    assert _discovery_artifact_snapshot(root) == before
+
+
+def test_report_runnable_and_api_are_read_only_without_onboarding_import(_operator_api_catalog, monkeypatch):
     root = _operator_api_catalog
     _onboarding_status_record(root)
     paths = [path for path in root.rglob("*") if path.is_file()]
@@ -5720,21 +6048,204 @@ def test_onboarding_status_list_and_api_are_read_only_without_onboarding_import(
     monkeypatch.setattr(config_module, "local_gpu_type", lambda: pytest.fail("query probed GPUs"))
     monkeypatch.setattr(execution, "_client_backend", lambda *a: pytest.fail("query initialized backend"))
     monkeypatch.setattr(records, "_publication_lock", lambda *a, **kw: pytest.fail("query opened writable lock"))
-    args = execution.parse_args(
+    assert (
+        api.main(
+            [
+                "report-runnable",
+                "--config-dir",
+                str(root / "configs"),
+                "--config",
+                _operator_api_CONFIG,
+                "--test",
+                "single-step-grads",
+                "--out",
+                str(root.parent / "read-only.md"),
+            ]
+        )
+        == 0
+    )
+    assert api.onboarding_status(_onboarding_status_request(root))[0].status == "metadata_valid"
+    assert {
+        str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in root.rglob("*") if path.is_file()
+    } == before
+
+
+def _discovery_fresh_process(root, *, argv=None, config=None, tests=()):
+    repository = Path(__file__).resolve().parents[3]
+    program = """
+import importlib.abc
+import json
+import runpy
+import sys
+from dataclasses import asdict
+from pathlib import Path
+
+blocked = (
+    "torch", "ray", "deepspeed", "dss", "transformers", "vllm", "peft",
+    "arctic_platform.model", "arctic_platform.inference",
+    "arctic_platform.correctness.models", "arctic_platform.correctness.checks",
+    "arctic_platform.correctness.onboarding", "arctic_platform.correctness.reference",
+    "arctic_platform.correctness.harness.execution",
+    "arctic_platform.correctness.harness.gateway",
+    "arctic_platform.correctness.harness.cortex",
+    "arctic_platform.correctness.harness.optimizer",
+    "arctic_platform.correctness.harness.runner",
+)
+def forbidden(name):
+    return any(name == prefix or name.startswith(prefix + ".") for prefix in blocked)
+
+assert not any(forbidden(name) for name in sys.modules), "interpreter already initialized a backend"
+class BlockBackend(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if forbidden(fullname):
+            raise AssertionError("discovery attempted runtime/model import: " + fullname)
+sys.meta_path.insert(0, BlockBackend())
+sys.path.insert(0, sys.argv[1])
+root = Path(sys.argv[2])
+payload = json.loads(sys.argv[3])
+from arctic_platform.correctness import api
+from arctic_platform.correctness.harness import registry
+api.PACKAGE_DIR = root
+assert len(registry.test_definitions()) == 7
+assert all(entry.fn is None for entry in registry.test_definitions().values())
+if payload["argv"] is None:
+    request = api.RunRequest(config=payload["config"], tests=tuple(payload["tests"]), config_dir=root / "configs")
+    statuses = api.onboarding_status(request)
+    text = api.runnable_report(request, output=root.parent / "api-only.md")
+    print(json.dumps({"statuses": [asdict(item) for item in statuses], "report": text}))
+else:
+    sys.argv = ["arctic_platform.correctness", *payload["argv"]]
+    try:
+        runpy.run_module("arctic_platform.correctness", run_name="__main__")
+    except SystemExit as exc:
+        assert exc.code in (None, 0), exc.code
+assert not any(forbidden(name) for name in sys.modules), "discovery loaded a backend or model"
+"""
+    return subprocess.run(
         [
-            "list",
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            program,
+            str(repository),
+            str(root),
+            json.dumps({"argv": argv, "config": str(config) if config is not None else None, "tests": tests}),
+        ],
+        cwd=repository,
+        env={
+            **os.environ,
+            "CUDA_VISIBLE_DEVICES": "",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "HF_HUB_DISABLE_TELEMETRY": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+@pytest.mark.parametrize("argv", [["list"], ["list", "--help"], ["report-runnable", "--help"]])
+def test_discovery_fresh_cli_never_imports_backends_or_models(tmp_path, argv):
+    root = tmp_path / "absent-catalog"
+    result = _discovery_fresh_process(root, argv=argv)
+    assert result.returncode == 0, result.stdout + result.stderr
+    if argv == ["list"]:
+        assert "Tests:" in result.stdout and "Configurations:" not in result.stdout
+        assert len(re.findall(r"^([a-z][a-z0-9-]+)\s+", result.stdout, re.MULTILINE)) == 7
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("entrypoint", ["cli", "api"])
+def test_discovery_fresh_empty_report_never_imports_backends_or_writes_metadata(tmp_path, entrypoint):
+    root = tmp_path / "absent-catalog"
+    output = tmp_path / "empty-report.md"
+    argv = (
+        ["report-runnable", "--config-dir", str(root / "configs"), "--out", str(output)]
+        if entrypoint == "cli"
+        else None
+    )
+    result = _discovery_fresh_process(root, argv=argv)
+    assert result.returncode == 0, result.stdout + result.stderr
+    text = output.read_text() if entrypoint == "cli" else json.loads(result.stdout)["report"]
+    assert "R+S+E+?+- 0(0+0+0+0+0)" in text
+    assert output.exists() is (entrypoint == "cli")
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("entrypoint", ["cli", "api"])
+def test_discovery_fresh_valid_scalar_participation_records_are_read_only(_operator_api_catalog, entrypoint):
+    root = _operator_api_catalog
+    tests = ("single-step-grads", "single-step-optimizer")
+    for test_id in tests:
+        _onboarding_status_record(root, test_id, combined=True, participation=True)
+    before = _discovery_artifact_snapshot(root)
+    output = root.parent / "fresh-report.md"
+    argv = (
+        [
+            "report-runnable",
             "--config-dir",
             str(root / "configs"),
             "--config",
             _operator_api_CONFIG,
             "--test",
-            "single-step-grads",
+            tests[0],
+            "--test",
+            tests[1],
+            "--out",
+            str(output),
         ]
+        if entrypoint == "cli"
+        else None
     )
-    assert execution.cmd_list(args) == 0
-    assert {
-        str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in root.rglob("*") if path.is_file()
-    } == before
+    result = _discovery_fresh_process(root, argv=argv, config=_operator_api_CONFIG, tests=tests)
+    assert result.returncode == 0, result.stdout + result.stderr
+    if entrypoint == "cli":
+        text = output.read_text()
+    else:
+        payload = json.loads(result.stdout)
+        assert len(payload["statuses"]) == 2
+        assert all(item["status"] == "metadata_valid" for item in payload["statuses"])
+        assert all(len(item["references"]["paths"]) == 2 for item in payload["statuses"])
+        text = payload["report"]
+    assert text.count("[R](") == 2 and "R+S+E+?+- 2(2+0+0+0+0)" in text
+    assert output.exists() is (entrypoint == "cli")
+    assert _discovery_artifact_snapshot(root) == before
+
+
+def test_discovery_metadata_parity_and_custom_decorator_support(monkeypatch):
+    from arctic_platform.correctness.harness import registry
+
+    definitions = registry.test_definitions()
+    executable = registry.registered_tests()
+    assert len(definitions) == len(executable) == 7
+    assert list(definitions) == list(registry._TEST_DEFINITIONS)
+    assert set(definitions) == set(executable)
+    for identifier, definition in definitions.items():
+        assert definition.fn is None
+        assert callable(executable[identifier].fn)
+        assert asdict(definition) == asdict(replace(executable[identifier], fn=None))
+        assert asdict(definition) == asdict(registry._TEST_DEFINITIONS[identifier])
+    monkeypatch.setattr(registry, "_REGISTRY", dict(executable))
+
+    @registry.correctness_test(
+        "custom-discovery",
+        title="Custom test",
+        criterion="Custom criterion",
+        compares_to_reference=False,
+        requires_hosted_control_plane=True,
+        workload_modes=("rl",),
+    )
+    def custom():
+        pass
+
+    entry = registry.registered_tests()["custom-discovery"]
+    assert entry.fn is custom
+    assert entry.title == "Custom test" and entry.criterion == "Custom criterion"
+    assert not entry.compares_to_reference and entry.requires_hosted_control_plane
+    assert entry.workload_modes == ("rl",)
+    assert asdict(registry.test_definitions()["custom-discovery"]) == asdict(replace(entry, fn=None))
 
 
 @pytest.mark.usefixtures("_operator_api_catalog")
@@ -43048,6 +43559,22 @@ _SELFTEST_GROUPS = {
         "test_onboarding_native_sampling_uses_provider_version_guard",
         "test_onboarding_allocation_prerequisites_require_every_host_response",
         "test_operator_api_test_only_selects_all_reviewed_configs_in_order",
+        "test_discovery_help_does_not_inspect_artifacts",
+        "test_discovery_list_only_shows_onboardable_tests",
+        "test_discovery_list_rejects_old_status_options",
+        "test_report_runnable_matrix_filters_and_duplicate_tests",
+        "test_report_runnable_exact_config_selection_and_custom_reference_root",
+        "test_report_runnable_invalid_filters_do_not_write",
+        "test_report_runnable_output_safety_preserves_artifacts",
+        "test_report_runnable_empty_catalog_is_not_a_pass",
+        "test_report_runnable_malformed_artifacts_are_reported_not_passed",
+        "test_report_runnable_escapes_literal_markdown_in_reasons_and_config_labels",
+        "test_onboarding_status_checkpoint_gate_rejects_nonfinite_or_invalid_scalars",
+        "test_report_runnable_and_api_are_read_only_without_onboarding_import",
+        "test_discovery_fresh_cli_never_imports_backends_or_models",
+        "test_discovery_fresh_empty_report_never_imports_backends_or_writes_metadata",
+        "test_discovery_fresh_valid_scalar_participation_records_are_read_only",
+        "test_discovery_metadata_parity_and_custom_decorator_support",
         "test_operator_api_bad_selectors_fail_before_backend",
         "test_operator_batch_total_runtime_is_last_after_reports_and_failure_guidance",
         "test_compatibility_total_runtime_follows_all_report_and_verdict_output",

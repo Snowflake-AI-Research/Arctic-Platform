@@ -91,17 +91,7 @@ _MARKER_IDENTITY_FIELDS = (
 )
 
 
-@correctness_test(
-    TEST_ID,
-    title="Router replay: the training zone routes exactly as the sampling zone did",
-    criterion=(
-        "for every generated sample, the expert indices the sampling zone returns, the indices the training "
-        "zone receives for it, and the indices every MoE router uses on the forward pass and on the "
-        "activation-checkpoint recompute are identical, element for element"
-    ),
-    compares_to_reference=False,
-    workload_modes=("rl",),
-)
+@correctness_test(TEST_ID)
 def run(ctx) -> List[TestResult]:
     try:
         return [_run(ctx)]

@@ -22,16 +22,23 @@ The API never allocates nodes, installs software or changes numerical gates.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
+import math
+import os
+import sys
+from argparse import ArgumentParser
 from argparse import ArgumentTypeError
 from argparse import Namespace
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
+from decimal import Decimal
 from decimal import DecimalException
 from pathlib import Path
 from typing import Callable
 from typing import Sequence
+from urllib.parse import quote
 
 from .harness.config import TestSpec
 from .harness.config import arms_for
@@ -42,9 +49,13 @@ from .harness.config import config_paths
 from .harness.config import load_config
 from .harness.config import local_config_path
 from .harness.config import resolve_config_path
+from .harness.registry import E2E_TOLERANCE
+from .harness.registry import INFERENCE_B200_TOLERANCE
+from .harness.registry import INFERENCE_DEFAULT_TOLERANCE
 from .harness.registry import TestOutcome
 from .harness.registry import TestResult
 from .harness.registry import registered_tests
+from .harness.registry import test_definitions
 from .harness.registry import workload_inapplicable_reason
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -103,6 +114,7 @@ class ArtifactStatus:
     state: str
     reason: str
     paths: tuple[str, ...] = ()
+    gates: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -162,6 +174,15 @@ def _status_json(path: Path) -> dict:
     value = _strict_record_json(path.read_bytes())
     if not isinstance(value, dict):
         raise ValueError(f"metadata record must be an object: {path}")
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("metadata numbers must be finite")
     return value
 
 
@@ -180,7 +201,7 @@ def _status_spec(cfg, path: Path, *, source_path: Path) -> tuple[TestSpec | None
             raise ValueError("attn_implementations must be a list of names")
         if not isinstance(spec.inapplicable, dict) or not isinstance(spec.test_settings, dict):
             raise ValueError("inapplicable and test_settings must be objects")
-        unknown = set(spec.applicable_tests) - registered_tests().keys()
+        unknown = set(spec.applicable_tests) - test_definitions().keys()
         if unknown:
             raise ValueError(f"spec names unknown check(s): {', '.join(sorted(unknown))}")
         if spec.config_id != cfg.config_id or spec.config_checksum != config_checksum(cfg):
@@ -208,6 +229,7 @@ def _status_references(cfg, spec, test_id: str, root: Path, *, combined: bool) -
     ctx = SimpleNamespace(cfg=cfg, spec=spec, reference_records_dir=root)
     arms = [None] if test_id == "e2e-sft-train-validate" else spec.arms
     paths = []
+    gates = []
     try:
         identities = []
         for arm in arms:
@@ -259,14 +281,26 @@ def _status_references(cfg, spec, test_id: str, root: Path, *, combined: bool) -
             if test_id == "single-step-grads" and saved.get("gate") != asdict(spec.test_tolerances[test_id]):
                 return ArtifactStatus("stale", f"reference frozen gate differs: {path}", tuple(paths))
             if arm is not None:
-                inputs = saved.get("recipe", {}).get("synthetic_inputs", {})
+                recipe = saved.get("recipe", {})
+                inputs = recipe.get("synthetic_inputs", {})
+                saved_arm = inputs.get("batch", {}).get("name", recipe.get("arm"))
+                if saved_arm != arm.name:
+                    return ArtifactStatus("stale", f"reference arm differs: {path}", tuple(paths))
                 if inputs.get("rows") != arm.global_batch_size or inputs.get("max_seq_len") != arm.max_seq_len:
                     return ArtifactStatus("stale", f"reference case shape differs: {path}", tuple(paths))
+                if test_id == "single-step-grads" and (recipe.get("optimizer") is not None) != combined:
+                    return ArtifactStatus("stale", f"reference optimizer selection differs: {path}", tuple(paths))
             storage.validate_measurements(saved, record["measurements"])
+            if test_id == "single-step-optimizer":
+                gate = record["measurements"]["optimizer_norm_gate"]["absolute"]
+                if not math.isfinite(gate):
+                    raise ValueError("optimizer norm gate must be finite and representable")
+                gates.append(gate)
         return ArtifactStatus(
             "metadata_valid",
             "reference identity fields and scalar payload valid; full workload/runtime identity not checked",
             tuple(paths),
+            tuple(gates),
         )
     except FileNotFoundError as exc:
         return ArtifactStatus("missing", f"prepared reference missing: {exc.filename}; rerun onboarding", tuple(paths))
@@ -322,7 +356,7 @@ def _status_history(path: Path, spec: TestSpec | None, config_identifier: str, t
 def onboarding_status(
     request: RunRequest | None = None, *, reference_records_dir: Path | None = None
 ) -> tuple[OnboardingStatus, ...]:
-    """Read config/test metadata only; no imports, publication, backend or readiness claim.
+    """Read metadata without importing checks, publishing artifacts or starting a backend.
 
     Missing summaries do not make reviewed imported specifications unusable. Recorded
     successes are historical, even when their per-check specification identity matches.
@@ -330,7 +364,7 @@ def onboarding_status(
     request = request or RunRequest(config_dir=PACKAGE_DIR / "configs")
     if request.config is not None and request.all_configs:
         raise ValueError("choose --config or --all-configs, not both")
-    tests = registered_tests()
+    tests = test_definitions()
     unknown = set(request.tests) - tests.keys()
     if unknown:
         raise ValueError(f"unknown check(s): {', '.join(sorted(unknown))}; use the list command")
@@ -379,9 +413,26 @@ def onboarding_status(
                     "checkpoint-resume-loss",
                 }:
                     try:
-                        spec.tolerance_for(test_id)
+                        tolerance = spec.tolerance_for(test_id)
                     except ValueError as exc:
                         pair_spec = ArtifactStatus("not_reviewed", str(exc), spec_status.paths)
+                    else:
+                        if type(tolerance) not in {int, float} or not 0 < tolerance < float("inf"):
+                            pair_spec = ArtifactStatus(
+                                "malformed", "test tolerance must be a finite positive number", spec_status.paths
+                            )
+                        else:
+                            pair_spec = ArtifactStatus("valid", pair_spec.reason, pair_spec.paths, (tolerance,))
+                if pair_spec.state == "valid" and test_id in {
+                    "inference-checkpoint-loss",
+                    "e2e-sft-train-validate",
+                }:
+                    tolerance = (
+                        E2E_TOLERANCE
+                        if test_id == "e2e-sft-train-validate"
+                        else INFERENCE_B200_TOLERANCE if cfg.gpu_type == "b200" else INFERENCE_DEFAULT_TOLERANCE
+                    )
+                    pair_spec = ArtifactStatus("valid", pair_spec.reason, pair_spec.paths, (tolerance,))
                 if test_id == "single-step-optimizer" and pair_spec.state == "valid":
                     settings = spec.test_settings.get(test_id)
                     if settings is None or isinstance(settings, dict) and "reference_token_budget" not in settings:
@@ -466,7 +517,7 @@ def select(request: RunRequest) -> tuple[SelectedCase, ...]:
         elif resolve_config_path(selector).is_file() and Path(selector).suffix in {".config", ".json"}:
             paths = [local_config_path(selector, request.config_dir)]
         else:
-            raise ValueError(f"unknown configuration: {selector}; use the list command or an existing config path")
+            raise ValueError(f"unknown configuration: {selector}; use report-runnable or give an existing config path")
     else:
         paths = list(configs.values())
     if not paths:
@@ -581,6 +632,199 @@ def aggregate_exit_code(results: Sequence[TestResult]) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in {"list", "report-runnable"}:
+        parser = ArgumentParser(prog="arctic_platform.correctness")
+        add_discovery_parsers(parser.add_subparsers(dest="command", required=True))
+        args = parser.parse_args(argv)
+        return args.func(args)
     from .harness.execution import main as command_main
 
     return command_main(argv)
+
+
+def cmd_list(args: Namespace) -> int:
+    """List only onboardable tests; do not inspect configurations or import executors."""
+    print("Tests:")
+    for test in sorted(test_definitions().values(), key=lambda test: test.test_id):
+        if test.requires_hosted_control_plane:
+            continue
+        print(f"{test.test_id:24s} {test.title}")
+        print(f"{'':24s} criterion: {test.criterion}")
+    return 0
+
+
+def add_discovery_parsers(subparsers) -> None:
+    listing = subparsers.add_parser("list", help="show onboardable tests")
+    listing.set_defaults(func=cmd_list)
+    report = subparsers.add_parser(
+        "report-runnable", help="write a config-by-test Markdown report from local onboarding metadata"
+    )
+    report.add_argument("--config-dir", type=Path, default=PACKAGE_DIR / "configs")
+    report.add_argument(
+        "--config", action="append", help="exact config ID or existing config path; never copies the config"
+    )
+    report.add_argument("--test", action="append", help="test ID filter (repeatable; duplicates collapsed)")
+    report.add_argument("--reference-records-dir", type=Path, help="compact HF reference root to inspect")
+    report.add_argument("--out", type=Path, default=Path("correctness-runnable.md"), help="Markdown output file")
+    report.set_defaults(func=cmd_report_runnable)
+
+
+def _markdown_text(value: str) -> str:
+    literal = html.escape(str(value), quote=False).replace("\n", " ").replace("\r", " ")
+    return literal.translate(str.maketrans({char: f"&#{ord(char)};" for char in r"\`*_{}[]()#+-!|~"}))
+
+
+def _metadata_link(path: str | Path, output: Path, *, label: str | None = None) -> str:
+    path = Path(path).resolve()
+    relative = os.path.relpath(path, output.resolve().parent)
+    return f"[{_markdown_text(label or str(path))}]({quote(relative, safe='/.-')})"
+
+
+def _gate_text(gates: tuple[float, ...]) -> str:
+    values = gates[:1] if len(set(gates)) == 1 else gates
+    formatted = []
+    for value in values:
+        number = Decimal(str(value))
+        if number.is_zero():
+            formatted.append("0e0")
+            continue
+        mantissa, exponent = format(number, "e").split("e")
+        if "." in mantissa:
+            mantissa = mantissa.rstrip("0").rstrip(".")
+        formatted.append(f"{mantissa}e{int(exponent)}")
+    return "/".join(formatted)
+
+
+def runnable_report(
+    request: RunRequest | None = None,
+    *,
+    reference_records_dir: Path | None = None,
+    output: Path = Path("correctness-runnable.md"),
+) -> str:
+    """Render metadata readiness, not a numerical verdict or a hardware/runtime admission."""
+    statuses = onboarding_status(request, reference_records_dir=reference_records_dir)
+    definitions = test_definitions()
+    selected = set(request.tests) if request and request.tests else definitions.keys()
+    test_ids = [test_id for test_id in definitions if test_id in selected]
+    symbols = {
+        "metadata_valid": "R",
+        "stale": "S",
+        "malformed": "E",
+        "inapplicable": "-",
+        "missing": "?",
+        "not_reviewed": "?",
+        "unverified": "?",
+    }
+    counts = dict.fromkeys(("R", "S", "E", "?", "-"), 0)
+    cells = {}
+    configs = {}
+    details = []
+    root = Path(request.config_dir if request else PACKAGE_DIR / "configs").resolve()
+    for number, status in enumerate(statuses, 1):
+        symbol = symbols[status.status]
+        counts[symbol] += 1
+        cells[status.config_id, status.test_id] = f"[{symbol}](#case-{number})"
+        gates = status.references.gates or status.spec.gates
+        if status.status == "metadata_valid" and gates:
+            cells[status.config_id, status.test_id] += f" {_gate_text(gates)}"
+        path = Path(status.config_path).resolve()
+        label = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
+        configs[status.config_id] = _metadata_link(path, output, label=label)
+        details.extend(
+            (
+                f'<a id="case-{number}"></a>',
+                f"### {_markdown_text(label)} / {status.test_id}",
+                "",
+                f"- Metadata: `{status.status}`. {_markdown_text(status.reason)}",
+            )
+        )
+        for kind, artifact in (("Specification", status.spec), ("References", status.references)):
+            details.append(f"- {kind}: `{artifact.state}`. {_markdown_text(artifact.reason)}")
+            for artifact_path in artifact.paths:
+                details.append(f"  {_metadata_link(artifact_path, output)}")
+        if status.status == "metadata_valid" and gates:
+            details.append(f"- Absolute gate: `{_gate_text(gates)}` (reviewed metadata, not a measured pass).")
+        history = status.historical
+        details.append(
+            f"- Recorded onboarding: `{history.outcome or 'none'}` (`{history.state}`). "
+            f"{_markdown_text(history.reason)}"
+        )
+        if history.path:
+            details.append(f"  {_metadata_link(history.path, output)}")
+        if history.runtime_identity:
+            details.append(f"- Recorded runtime identity: {_markdown_text(history.runtime_identity)}")
+        details.append("")
+    lines = [
+        "# Correctness Runnable Report",
+        "",
+        (
+            "Local metadata inspection only: `R` means reviewed artifacts are present and their metadata is valid. "
+            "It does not mean a numerical pass or that the current hardware, backend and runtime can run the test. "
+            "Recorded onboarding outcomes are shown separately in Details."
+        ),
+        "",
+        "## Configs And Tests",
+        "",
+        f"R+S+E+?+- {len(statuses)}({'+'.join(str(value) for value in counts.values())})",
+        "",
+        "| config | " + " | ".join(test_ids) + " |",
+        "| ------ | " + " | ".join("---" for _ in test_ids) + " |",
+    ]
+    for identifier, config in configs.items():
+        lines.append("| " + config + " | " + " | ".join(cells[identifier, test_id] for test_id in test_ids) + " |")
+    lines.extend(
+        (
+            "",
+            "Legend:",
+            "",
+            (
+                "- `R` reviewed metadata is available; `S` stale metadata; `E` invalid metadata; "
+                "`?` onboarding or reference preparation needed; `-` inapplicable."
+            ),
+            "- Each cell links to its metadata checks and recorded onboarding outcome.",
+            (
+                "- Numeric suffixes are absolute gates in scientific notation; differing arm gates use `/` "
+                "in specification order. Exact-equality tests have no numeric gate."
+            ),
+            "",
+            "## Details",
+            "",
+            *details,
+        )
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def cmd_report_runnable(args: Namespace) -> int:
+    output = Path(args.out).resolve()
+    try:
+        configs = tuple(dict.fromkeys(args.config or ()))
+        if len(configs) > 1:
+            raise ValueError("give one unique --config selector")
+        request = RunRequest(
+            config=configs[0] if configs else None,
+            tests=tuple(args.test or ()),
+            config_dir=Path(args.config_dir),
+        )
+        if output.suffix != ".md":
+            raise ValueError("--out must name a Markdown (.md) file")
+        if output.name == "correctness-progress.md":
+            raise ValueError("use a separate output file; correctness-progress.md is the operator's progress tracker")
+        if any(
+            output.is_relative_to(root.resolve())
+            for root in (
+                request.config_dir,
+                PACKAGE_DIR / "specs",
+                Path(args.reference_records_dir) if args.reference_records_dir else PACKAGE_DIR / "reference_data",
+            )
+        ):
+            raise ValueError("--out must be outside config, specification and reference directories")
+        content = runnable_report(request, reference_records_dir=args.reference_records_dir, output=output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(content, encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        print(f"Cannot report runnable tests: {exc}", file=sys.stderr)
+        return 2
+    print(f"Runnable report: {output}", flush=True)
+    return 0

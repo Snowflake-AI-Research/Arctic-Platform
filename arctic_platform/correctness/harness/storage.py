@@ -1134,6 +1134,7 @@ def workload_identity(ctx, check_id: str, recipe: dict) -> dict:
             *sorted((root / "reference").glob("*.py")),
             root / "harness" / "sft.py",
             root / "harness" / "optimizer.py",
+            root / "harness" / "norms.py",
             # The reference applies the target loader's rounding through these modules.
             package / "model" / "loaders" / "huggingface.py",
             package / "model" / "implementations" / "gpu" / "vllm_rounding.py",
@@ -1204,7 +1205,7 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
         ):
             raise ReferencePrerequisiteError("reference gradient norms must be complete finite nonnegative scalars")
         if measurements.get("participation") is not None:
-            from arctic_platform.correctness.harness.optimizer import active_gradient_norms
+            from arctic_platform.correctness.harness.norms import active_gradient_norms
 
             active_gradient_norms(measurements["participation"], norms)
         if check == "single-step-optimizer":
@@ -1224,9 +1225,9 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
                 raise ReferencePrerequisiteError("optimizer norm gate must be a finite nonnegative scalar")
             if not summary.get("parameters"):
                 raise ReferencePrerequisiteError("optimizer reference has no parameter norms")
-            from arctic_platform.correctness.harness.optimizer import compare_participation
-            from arctic_platform.correctness.harness.optimizer import validate_optimizer_norm_summary
-            from arctic_platform.correctness.harness.optimizer import validate_optimizer_participation
+            from arctic_platform.correctness.harness.norms import compare_participation
+            from arctic_platform.correctness.harness.norms import validate_optimizer_norm_summary
+            from arctic_platform.correctness.harness.norms import validate_optimizer_participation
 
             validate_optimizer_norm_summary(summary)
             validate_optimizer_participation(summary, backend="reference")
