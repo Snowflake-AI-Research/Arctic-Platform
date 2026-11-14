@@ -88,6 +88,7 @@ from arctic_platform.correctness.reference.process_determinism import CUBLAS_WOR
 
 from ..harness.config import correctness_microbatch_tokens
 from ..harness.config import tolerance_text
+from ..harness.registry import E2E_TOLERANCE
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
@@ -103,11 +104,9 @@ TRAIN_STEPS = 100
 
 # The gate both compared losses must meet: an absolute difference of at most 3e-2.
 #
-# Fixed rather than calibrated, and held here the way the other fixed gates in this package are
-# (``checkpoint_resume.TOLERANCE``, ``inference_checkpoint_loss.TOLERANCE``): the number is a stated
-# criterion, not a measured spread, so onboarding calibrates nothing for it and no measurement this
-# check takes may be used to move it.
-TOLERANCE = 3e-2
+# The shared metadata registry also exposes this fixed criterion without importing the executable check.
+# Onboarding calibrates nothing for it and no measurement this check takes may be used to move it.
+TOLERANCE = E2E_TOLERANCE
 
 TRAIN_LOSS_QUANTITY = "training loss at step {step}"
 VALIDATION_QUANTITY = "validation cross entropy over answer tokens"
@@ -556,15 +555,7 @@ def verdict(
     )
 
 
-@correctness_test(
-    TEST_ID,
-    title="Training and validation loss agreement over a 100-step SFT run replayed in Arctic Platform",
-    criterion=(
-        "the final training loss and the held-out validation loss of a 100-step SFT run agree between "
-        "Arctic Platform and the single-GPU Hugging Face reference on the same replayed batches; the whole per-step "
-        "trajectory is recorded and reported as a diagnostic"
-    ),
-)
+@correctness_test(TEST_ID)
 def run(ctx) -> List[TestResult]:
     """Prepare HF explicitly, or run one target job against a validated compact reference.
 

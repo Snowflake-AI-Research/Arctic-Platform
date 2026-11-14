@@ -24,6 +24,8 @@ pip install -e '.[correctness]'
 python -m arctic_platform.correctness list
 ```
 
+**`list` shows only onboardable test IDs, titles and criteria, not configurations or onboarding status.** It does not inspect artifacts or start Ray, PyTorch workloads or GPU jobs. Use the separate `report-runnable` command below to inspect config-by-test metadata.
+
 **Install the sampling stack on the GPU allocation when selecting inference or RL tests.** Use `python -m pip install -e '.[correctness,rl]'` in the executing environment; the `rl` extra includes the in-tree Arctic Inference sampler and its pinned vLLM dependency. The `correctness` extra alone remains sufficient for CPU selftests and training/reference dependencies. The separately installed DSS service must use a compatible runtime on every participating node.
 
 ## Step 2. Create a Job Config file
@@ -161,6 +163,15 @@ PY
 **Conflicting recipes require explicit variants, not arbitrary source filenames.** For a noncatalog config, append a lowercase descriptive suffix such as `--sft-4gpus` to the source filename stem; the importer retains that suffix in the derived filename and mirrored reference folder. Catalog imports preserve the exact catalog-relative filename. A sampling-only catalog recipe can be imported unchanged, but P1's two supervised checks reject it before model preparation because no training sub-job exists.
 
 ## Step 4. Run Config Tests
+
+**Optionally inspect the demo's recorded metadata before regression.** This command writes a config-by-test Markdown table to `correctness-runnable.md` in the current directory. Artifact inspection is read-only: no configs are imported, no references or gates are changed, and no Ray, PyTorch workload or GPU job starts. The report can also be generated on a CPU host.
+
+```bash
+python -m arctic_platform.correctness report-runnable \
+  --config arctic_platform/correctness/configs/tiny-qwen3-129m/standard/h200-training-full--fp32.json
+```
+
+**An `R` cell means reviewed metadata is available, not a numerical pass or full runtime admission.** Historical onboarding outcomes appear separately in linked details; current hardware, backend availability and complete reference/runtime identity are not verified. Optional `--out`, `--config-dir`, `--config`, repeatable `--test` and `--reference-records-dir` control the report location and selection; see [the discovery options](running-tests.md#discover-tests-and-runnable-metadata). Without a config selector, the report covers every discovered config, including configs missing reviewed specifications.
 
 **Run all applicable checks with the config-only command below.** Omitting `--test` selects the applicable set from the seven-test registry. Each check uses its own prepared identity and execution prerequisites; missing prerequisites remain separate non-passes. When no endpoint is configured, the supported local route manages its owned gateway. Regression never prepares missing references, changes precision or widens gates.
 
