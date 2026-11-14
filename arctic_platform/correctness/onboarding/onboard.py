@@ -815,6 +815,13 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
                     "Cortex recipes) before onboarding. Onboarding does not change this setting."
                 )
     _configure_fixture_target(args, config, selection)
+    if getattr(args, "local_gateway_full_model", False):
+        from arctic_platform.correctness.harness import report as console
+        from arctic_platform.correctness.harness.execution import _client_backend
+        from arctic_platform.correctness.models.original import onboard_original_model
+
+        with console.activity("Verifying the configured original checkpoint and saving its identity"):
+            onboard_original_model(_client_backend(args), config, records_dir=args.reference_records_dir)
     if first_two_compares:
         validate_reference_accumulation(
             config, automatically_owned_local=getattr(args, "_automatic_cortex_gateway", False)
@@ -3432,6 +3439,7 @@ def _onboarding_options(args: argparse.Namespace) -> dict:
         "dense_checkpoint_allocation",
         "dense_checkpoint_allocation_sha256",
         "local_gateway_full_model",
+        "reference_records_dir",
     )
     return json.loads(json.dumps({name: getattr(args, name, None) for name in names}, default=str))
 
@@ -3479,6 +3487,28 @@ def _completed_onboarding(args: argparse.Namespace, spec: dict, summary: dict, t
         and saved.get("options") == options
         and saved.get("runtime_identity") == runtime_identity
     ):
+        if getattr(args, "local_gateway_full_model", False):
+            from arctic_platform.correctness.harness.config import TestSpec
+            from arctic_platform.correctness.harness.config import load_config
+            from arctic_platform.correctness.harness.execution import _client_backend
+            from arctic_platform.correctness.models.original import _admission_path
+            from arctic_platform.correctness.models.original import validate_local_full_model
+
+            cfg = load_config(args.config)
+            if not _admission_path(cfg, args.reference_records_dir).is_file():
+                return None
+            try:
+                _configure_fixture_target(args, cfg, [test_id])
+                validate_local_full_model(
+                    _client_backend(args),
+                    cfg,
+                    TestSpec.read(
+                        args.test_spec or Path(__file__).resolve().parents[1] / "specs" / f"{cfg.config_id}.json"
+                    ),
+                    records_dir=args.reference_records_dir,
+                )
+            except (OSError, ValueError, TypeError):
+                return None
         return dict(saved)
     # Older explicit-check runs did not update the summary. Recover only a passing
     # validation whose original request binds the current runtime and frozen spec.
