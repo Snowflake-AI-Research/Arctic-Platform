@@ -22,11 +22,16 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
+from pydantic import ConfigDict
+from pydantic import TypeAdapter
+
 from arctic_platform.client import CortexConfig
+from arctic_platform.correctness.harness.storage import _strict_record_json
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 
 from ..harness.config import LoadedConfig
@@ -35,6 +40,8 @@ from ..harness.config import TestSpec
 
 @dataclass(frozen=True)
 class OriginalModelMetadata:
+    __pydantic_config__ = ConfigDict(extra="forbid")
+
     model_name: str
     config_id: str | None
     source_checkpoints: tuple[str, ...]
@@ -52,78 +59,33 @@ class OriginalModelMetadata:
     weights_sha256: str | None = None
 
 
-ORIGINAL_MODELS: Mapping[str, OriginalModelMetadata] = MappingProxyType(
-    {
-        "Qwen/Qwen3-0.6B": OriginalModelMetadata(
-            model_name="Qwen/Qwen3-0.6B",
-            config_id=None,
-            source_checkpoints=("Qwen/Qwen3-0.6B",),
-            revision="c1899de289a04d12100db370d81485cdf75e47ca",
-            config_sha256="660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd",
-            index_sha256=None,
-            layer_pattern=r"model\.layers\.(\d+)\.",
-            tensor_count=311,
-            shard_count=1,
-            payload_bytes=1503264768,
-            vocabulary_shape=(151936, 1024),
-            schema_sha256="99ea7fbe3cd557925fcba2ad843352e9c612b0484560f25b4eb6d07fe1ca6703",
-            dtype_bytes=MappingProxyType({"BF16": 2}),
-            weights_sha256="f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b",
-        ),
-        "Qwen/Qwen3-8B": OriginalModelMetadata(
-            model_name="Qwen/Qwen3-8B",
-            config_id=None,
-            source_checkpoints=("Qwen/Qwen3-8B",),
-            revision="b968826d9c46dd6066d109eabc6255188de91218",
-            config_sha256="f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
-            index_sha256=None,
-            layer_pattern=r"model\.layers\.(\d+)\.",
-            tensor_count=None,
-            shard_count=None,
-            payload_bytes=None,
-            vocabulary_shape=None,
-            schema_sha256=None,
-            dtype_bytes=MappingProxyType({}),
-        ),
-        "Qwen/Qwen3.8-27B": OriginalModelMetadata(
-            model_name="Qwen/Qwen3.8-27B",
-            config_id="qwen3.8-27b-b200-train-sft-8gpus-2k",
-            source_checkpoints=("Qwen/Qwen3.8-27B", "/data-fast/base-models/Qwen/Qwen3.8-27B"),
-            revision="1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
-            config_sha256="191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
-            index_sha256="77042094076611b69791a610065f28b7013b8c621795fa86ddccc8bac7d1b9df",
-            layer_pattern=r"model\.language_model\.layers\.(\d+)\.",
-            tensor_count=1199,
-            shard_count=18,
-            payload_bytes=55562855904,
-            vocabulary_shape=(248320, 5120),
-            schema_sha256="9c0eb904ed294a62882adb287b81e36fdb48e5fb8e006ee25b084341ac78fd55",
-            dtype_bytes=MappingProxyType({"BF16": 2, "F32": 4}),
-        ),
-        "Qwen/Qwen3.8-Flash-Next": OriginalModelMetadata(
-            model_name="Qwen/Qwen3.8-Flash-Next",
-            config_id="qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k",
-            source_checkpoints=(
-                "Qwen/Qwen3.8-Flash-Next",
-                (
-                    "/checkpoint/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next/"
-                    "snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540"
-                ),
-            ),
-            revision="de4b8e4d43b917e7706784d8bb445c9af86a3540",
-            config_sha256="889658f2508e8c61d409b02e70e0d78d8d4452ec65aaafbe129805d213d2e74b",
-            index_sha256="99e815241ef03325536b0aaa4441deea45174c17fae31e10f0bb456410c590de",
-            layer_pattern=r"model\.language_model\.layers\.(\d+)\.",
-            tensor_count=1658,
-            shard_count=131,
-            payload_bytes=359999963128,
-            vocabulary_shape=(248320, 2560),
-            schema_sha256="1d55a6d3f64b1b2b004302864c0e74e11871ddf9f3481b10fc21fc8b0ec53d26",
-            dtype_bytes=MappingProxyType({"BF16": 2, "I64": 8}),
-            additional_config_ids=("qwen3.8-flash-next-h200-train-sft-full-8gpus-sp8-256k",),
-        ),
-    }
-)
+ORIGINAL_MODELS_PATH = Path(__file__).resolve().parents[1] / "reference_data" / "original-models.json"
+
+
+def _load_original_models(path: Path = ORIGINAL_MODELS_PATH) -> Mapping[str, OriginalModelMetadata]:
+    """Load reviewed pins from package data, retaining immutable metadata and strict JSON types."""
+    try:
+        records = _strict_record_json(path.read_bytes())
+        models = TypeAdapter(dict[str, OriginalModelMetadata]).validate_json(json.dumps(records), strict=True)
+        if not models:
+            raise ValueError("original model registry is empty")
+        for name, metadata in models.items():
+            if not name or name != metadata.model_name or not metadata.source_checkpoints:
+                raise ValueError(f"original model key or source identity is invalid: {name!r}")
+            if any(not source for source in metadata.source_checkpoints):
+                raise ValueError(f"original model source identity is empty: {name!r}")
+            re.compile(metadata.layer_pattern)
+        return MappingProxyType(
+            {
+                name: replace(metadata, dtype_bytes=MappingProxyType(dict(metadata.dtype_bytes)))
+                for name, metadata in models.items()
+            }
+        )
+    except (OSError, ValueError, re.error) as exc:
+        raise ValueError(f"cannot load original model reference metadata from {path}: {exc}") from exc
+
+
+ORIGINAL_MODELS = _load_original_models()
 
 
 def _original_model(cfg: LoadedConfig, spec: TestSpec) -> OriginalModelMetadata:
