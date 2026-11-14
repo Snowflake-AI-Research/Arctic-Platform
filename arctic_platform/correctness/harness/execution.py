@@ -1274,59 +1274,15 @@ def cmd_hosted(args) -> int:
 
 
 def cmd_list(args) -> int:
-    from dataclasses import asdict
-
-    from ..api import RunRequest
-    from ..api import onboarding_status
-
-    try:
-        selector = getattr(args, "config", None)
-        if isinstance(selector, list):
-            selectors = list(dict.fromkeys(selector))
-            if len(selectors) > 1:
-                raise ValueError("give one unique --config selector")
-            selector = selectors[0] if selectors else None
-        statuses = onboarding_status(
-            RunRequest(
-                config=selector,
-                tests=tuple(getattr(args, "test", None) or ()),
-                config_dir=Path(args.config_dir),
-            ),
-            reference_records_dir=getattr(args, "reference_records_dir", None),
-        )
-    except ValueError as exc:
-        print(f"Cannot list: {exc}", file=sys.stderr)
-        return 2
-    tests = sorted(registered_tests().values(), key=lambda test: test.test_id)
-    if getattr(args, "json", False):
-        print(
-            json.dumps(
-                {
-                    "schema": "correctness-onboarding-status-v1",
-                    "statuses": [asdict(status) for status in statuses],
-                    "tests": [
-                        {"test_id": test.test_id, "title": test.title, "criterion": test.criterion} for test in tests
-                    ],
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        return 0
+    from ..api import catalog
 
     print("Configurations:")
-    for identifier in sorted({status.config_id for status in statuses}):
+    for identifier in catalog(Path(args.config_dir)):
         print(f"  {identifier}")
     print("Tests:")
-    for test in tests:
+    for test in sorted(registered_tests().values(), key=lambda test: test.test_id):
         print(f"{test.test_id:24s} {test.title}")
         print(f"{'':24s} criterion: {test.criterion}")
-    print("Config/test status (metadata only; historical outcomes do not establish current readiness):")
-    for status in statuses:
-        history = status.historical
-        print(f"  {status.config_id} / {status.test_id}: {status.status}")
-        print(f"    {status.reason}")
-        print(f"    recorded onboarding: {history.outcome or 'none'} ({history.state}); {history.reason}")
     return 0
 
 
@@ -1412,7 +1368,6 @@ def add_connection_arguments(parser, *, default_backend="cortex-training"):
 
 
 def parse_args(argv=None):
-    argv = list(argv) if argv is not None else sys.argv[1:]
     parser = argparse.ArgumentParser(prog="arctic_platform.correctness")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1533,14 +1488,8 @@ def parse_args(argv=None):
     )
     publish.add_argument("--out", required=True, help="new publication receipt JSON path")
     publish.set_defaults(func=cmd_publish_fixture)
-    list_parser = sub.add_parser("list", help="show tests and read-only config/test onboarding status")
+    list_parser = sub.add_parser("list", help="show registered tests")
     list_parser.add_argument("--config-dir", default=str(CONFIG_DIR))
-    list_parser.add_argument(
-        "--config", action="append", help="exact config ID or existing path; never imports the config"
-    )
-    list_parser.add_argument("--test", action="append", help="test ID filter (repeatable; duplicates collapsed)")
-    list_parser.add_argument("--reference-records-dir", type=Path, help="compact HF reference root to inspect")
-    list_parser.add_argument("--json", action="store_true", help="emit structured metadata and recorded outcomes")
     list_parser.set_defaults(func=cmd_list)
     h = sub.add_parser(
         "hosted",
@@ -1559,11 +1508,10 @@ def parse_args(argv=None):
     s = sub.add_parser("selftest", help="check the harness itself; no GPU and no config needed")
     s.add_argument("runner_args", nargs="*", help="extra arguments forwarded to the runner")
     s.set_defaults(func=cmd_selftest)
-    o = sub.add_parser("onboard", help="size, calibrate, and freeze one config")
-    if argv and argv[0] == "onboard":
-        from ..onboarding import add_arguments
+    from ..onboarding import add_arguments
 
-        add_arguments(o)
+    o = sub.add_parser("onboard", help="size, calibrate, and freeze one config")
+    add_arguments(o)
     o.set_defaults(func=cmd_onboard)
     return parser.parse_args(argv)
 
