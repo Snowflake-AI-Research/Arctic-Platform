@@ -4,13 +4,14 @@ DeepSeek-V4.1-Flash TP=8 graphs held 816 ``ncclDevKernel_AllGather_RING_LL``
 nodes per rank -- Engram's ``embed`` (768 KiB per rank at 512 tokens) and
 ``wkv`` (3.125 MiB) gathers -- so every dump dropped 4692 graphs and every
 restore recaptured them, ~85 s. ``ca_all_gather`` sends those gathers to
-``CustomAllreduce.custom_all_gather`` (kernel ``cross_device_all_gather``),
-and ``ca_graph_rebind`` rewrites that kernel's baked signal pads like an
-all-reduce's: both take ``(RankData* _dp, RankSignals sg, Signal* self_sg,
-T* result, int rank, int size)`` (csrc/custom_all_reduce.cuh,
-custom_all_gather_reduce_scatter.cuh at v0.32.0).
+CustomAllreduce's classic all-gather kernel, ``cross_device_all_gather``,
+even when the CA has a multicast buffer, and ``ca_graph_rebind`` rewrites
+that kernel's baked signal pads like an all-reduce's: both take
+``(RankData* _dp, RankSignals sg, Signal* self_sg, T* result, int rank,
+int size)`` (csrc/custom_all_reduce.cuh, custom_all_gather_reduce_scatter.cuh
+at v0.32.0).
 
-The routing is tested on CPU tensors against a CustomAllreduce double that
+The routing is tested on CPU tensors against a ``_custom_ops`` double that
 concatenates the peers' shards; the rebind against a libcuda double that keeps
 each kernel node's arguments in real ctypes storage, so ``_patch_node`` reads
 and writes them exactly as it does on the driver's.
@@ -54,46 +55,87 @@ def _load(path, name):
 cgr = _load(_REBIND, "ca_graph_rebind_custom_ag_test")
 
 
-@pytest.fixture
-def cag():
-    """A fresh router per test: its counters are module state."""
-    mod = _load(_ROUTER, "ca_all_gather_under_test")
-    yield mod
-    mod.restore()
-
-
 # --------------------------------------------------------------------------
 # Doubles.
 # --------------------------------------------------------------------------
 
+_CAS: dict = {}
+
+
+class _FakeOps:
+    """``vllm._custom_ops`` as the router calls it. ``custom_all_gather``
+    writes the rank-major concatenation of every rank's shard, this rank's
+    being the input, into ``out``, after the checks the C++ op makes
+    (csrc/custom_all_gather_reduce_scatter.cu:250-269 at v0.32.0)."""
+
+    def __init__(self):
+        self.calls = []
+        self.mnnvl_calls = 0
+
+    def custom_all_gather(self, fa, inp, out, reg_buffer, reg_buffer_sz_bytes):
+        ca = _CAS[fa]
+        self.calls.append((fa, inp, out, reg_buffer, reg_buffer_sz_bytes))
+        nbytes = inp.numel() * inp.element_size()
+        assert inp.dtype == out.dtype
+        assert inp.numel() * ca.world_size == out.numel()
+        assert reg_buffer and nbytes <= reg_buffer_sz_bytes
+        assert nbytes % 16 == 0
+        peers = list(ca.peers or [inp] * ca.world_size)
+        peers[ca.rank] = inp
+        out.copy_(torch.cat(peers, dim=0))
+
+    def mnnvl_lamport_all_gather(self, *args):
+        self.mnnvl_calls += 1
+        raise AssertionError("the multicast all-gather was launched")
+
+
 class _FakeCA:
-    """CustomAllreduce as the router sees it. ``custom_all_gather`` returns
-    the rank-major concatenation of every rank's shard, this rank's being the
-    input; it refuses what vLLM's ``should_custom_all_gather`` refuses."""
+    """CustomAllreduce as the router sees it. Its own ``custom_all_gather``
+    is the one the router must not call: vLLM 0.32 sends it to the multicast
+    kernel whenever ``mnnvl_multicast_ptr`` is set."""
 
     def __init__(self, world=8, rank=3, disabled=False, multicast=0,
-                 max_size=8 * _MiB, max_all_gather_size=2 * _MiB,
+                 fully_connected=True, max_size=8 * _MiB,
+                 max_all_gather_size=2 * _MiB, max_mnnvl_all_gather_size=None,
                  max_reduce_scatter_size=16 * _MiB):
         self.world_size = world
         self.rank = rank
         self.disabled = disabled
         self.mnnvl_multicast_ptr = multicast
+        self.fully_connected = fully_connected
         self.max_size = max_size
         self.max_all_gather_size = max_all_gather_size
+        self.max_mnnvl_all_gather_size = (
+            2 * _MiB if max_mnnvl_all_gather_size is None
+            else max_mnnvl_all_gather_size)
         self.max_reduce_scatter_size = max_reduce_scatter_size
+        self._ptr = 0x5000 + len(_CAS)
+        _CAS[self._ptr] = self
+        self.buffer_ptrs = [0x7D0000000000 + i * 0x1000000
+                            for i in range(world)]
         self.peers = None
         self.calls = 0
 
     def custom_all_gather(self, inp):
         self.calls += 1
-        if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-            return None
-        nbytes = inp.numel() * inp.element_size()
-        if not 0 < nbytes <= self.max_all_gather_size or nbytes % 16:
-            return None
-        peers = list(self.peers or [inp] * self.world_size)
-        peers[self.rank] = inp
-        return torch.cat(peers, dim=0)
+        raise AssertionError("the router called CustomAllreduce's own "
+                             "custom_all_gather")
+
+
+@pytest.fixture
+def ops():
+    return _FakeOps()
+
+
+@pytest.fixture
+def cag(ops):
+    """A fresh router per test: its counters are module state. ``route`` is
+    reached only through ``install``, which supplies ``_custom_ops``."""
+    mod = _load(_ROUTER, "ca_all_gather_under_test")
+    mod._state["ops"] = ops
+    yield mod
+    mod.restore()
+    _CAS.clear()
 
 
 def _comm(ca, name="tp:0", world=8):
@@ -113,12 +155,12 @@ def _shards(shape, world=8, dtype=torch.float32):
 # The routing decision.
 # --------------------------------------------------------------------------
 
-def test_an_eligible_tp_gather_takes_the_custom_path(cag):
+def test_an_eligible_tp_gather_takes_the_classic_kernel(cag, ops):
     ca = _FakeCA()
     x = torch.zeros(4, 16)
     out = cag.route(_comm(ca), x, 0)
-    assert out is not None and ca.calls == 1
-    assert out.shape == (32, 16)
+    assert out is not None and out.shape == (32, 16)
+    assert len(ops.calls) == 1 and ca.calls == 0
     assert cag.state()["custom"] == 1 and cag.state()["fallback"] == {}
 
 
@@ -126,27 +168,61 @@ def test_an_eligible_tp_gather_takes_the_custom_path(cag):
     ({"name": "ep:0"}, {}, torch.zeros(4, 16), "not_tp"),
     ({}, None, torch.zeros(4, 16), "no_ca"),
     ({}, {"disabled": True}, torch.zeros(4, 16), "no_ca"),
-    ({}, {"multicast": 0xABC000}, torch.zeros(4, 16), "multicast"),
     ({"world": 16}, {"world": 16}, torch.zeros(4, 16), "world_size"),
+    ({}, {"fully_connected": False}, torch.zeros(4, 16),
+     "not_fully_connected"),
+    ({}, {}, torch.zeros(4, 16, dtype=torch.int32), "dtype"),
     ({}, {}, torch.zeros(16, 4).t(), "non_contiguous"),
     ({}, {}, torch.zeros(2 * _MiB // 4 + 4), "size"),
-    ({}, {}, torch.zeros(4, 16, dtype=torch.int32), "ca_refused"),
-    ({}, {}, torch.zeros(3), "ca_refused"),
-], ids=["not_tp", "no_ca", "disabled", "multicast", "world16",
-        "non_contiguous", "over_limit", "int_dtype", "unaligned"])
-def test_what_custom_cannot_take_falls_back(cag, comm_kw, ca_kw, tensor, why):
+    ({}, {}, torch.zeros(0, 16), "size"),
+    ({}, {}, torch.zeros(3), "unaligned"),
+], ids=["not_tp", "no_ca", "disabled", "world16", "not_fully_connected",
+        "int_dtype", "non_contiguous", "over_limit", "empty", "unaligned"])
+def test_what_custom_cannot_take_falls_back(cag, ops, comm_kw, ca_kw, tensor,
+                                            why):
     ca = None if ca_kw is None else _FakeCA(**ca_kw)
     assert cag.route(_comm(ca, **comm_kw), tensor, 0) is None
     assert cag.state()["fallback"] == {why: 1}
     assert cag.state()["custom"] == 0
+    assert ops.calls == []
 
 
-def test_the_multicast_branch_is_never_entered(cag):
-    """custom_all_gather would take the MNNVL Lamport kernel, whose multicast
-    mapping cuCheckpointProcess* cannot carry; the router must not call it."""
-    ca = _FakeCA(multicast=0x1000)
-    cag.route(_comm(ca), torch.zeros(4, 16), 0)
-    assert ca.calls == 0
+def test_a_multicast_ca_takes_the_classic_kernel(cag, ops):
+    """vLLM 0.32's ``custom_all_gather`` would launch
+    ``mnnvl_lamport_all_gather``, whose multicast and epoch arguments the
+    rebind cannot patch. The router launches the classic kernel with the
+    arguments of vLLM's non-multicast branch, staging through
+    ``buffer_ptrs[rank]`` (RankData slot 0)."""
+    ca = _FakeCA(multicast=0xABC000)
+    x = torch.arange(64, dtype=torch.bfloat16).reshape(4, 16)
+    out = cag.route(_comm(ca), x, 0)
+    assert out is not None and out.shape == (32, 16)
+    assert ops.mnnvl_calls == 0 and ca.calls == 0
+    [(fa, inp, raw, reg, sz)] = ops.calls
+    assert (fa, reg, sz) == (ca._ptr, ca.buffer_ptrs[ca.rank],
+                             ca.max_all_gather_size)
+    assert inp is x
+    assert raw.shape == (32, 16) and raw.dtype == torch.bfloat16
+    assert cag.state()["fallback"] == {}
+
+
+@pytest.mark.parametrize("ag,mnnvl_ag,nbytes,why", [
+    (2 * _MiB, 8 * _MiB, 4 * _MiB, "size"),
+    (16 * _MiB, 2 * _MiB, 4 * _MiB, None),
+], ids=["mnnvl_limit_larger", "mnnvl_limit_smaller"])
+def test_the_limit_is_the_classic_one_even_with_multicast(
+        cag, ops, ag, mnnvl_ag, nbytes, why):
+    """vLLM gates a multicast CA on ``max_mnnvl_all_gather_size``; the
+    classic kernel stages into ``buffer_ptrs``, whose bound is
+    ``max_all_gather_size``."""
+    ca = _FakeCA(multicast=0xABC000, max_all_gather_size=ag,
+                 max_mnnvl_all_gather_size=mnnvl_ag)
+    out = cag.route(_comm(ca), torch.zeros(nbytes // 4), 0)
+    if why is None:
+        assert out is not None and ops.calls[0][4] == ag
+    else:
+        assert out is None and cag.state()["fallback"] == {why: 1}
+        assert ops.calls == []
 
 
 def test_a_fallback_inside_a_capture_is_reported(cag, monkeypatch):
@@ -216,7 +292,7 @@ def test_a_disabled_ca_is_not_widened(cag):
 # --------------------------------------------------------------------------
 
 @pytest.fixture
-def vllm_stub(monkeypatch):
+def vllm_stub(monkeypatch, ops):
     class CudaCommunicator:
         def __init__(self, ca, unique_name="tp:0", world_size=8):
             self.ca_comm, self.unique_name = ca, unique_name
@@ -245,8 +321,9 @@ def vllm_stub(monkeypatch):
     dist = types.ModuleType("vllm.distributed")
     dist.device_communicators, dist.parallel_state = dc, ps
     root = types.ModuleType("vllm")
-    root.distributed = dist
-    for name, mod in (("vllm", root), ("vllm.distributed", dist),
+    root.distributed, root._custom_ops = dist, ops
+    for name, mod in (("vllm", root), ("vllm._custom_ops", ops),
+                      ("vllm.distributed", dist),
                       ("vllm.distributed.parallel_state", ps),
                       ("vllm.distributed.device_communicators", dc),
                       (cc.__name__, cc), (car.__name__, car)):
@@ -285,6 +362,25 @@ def test_install_widens_the_ca_already_built_and_every_later_one(
     assert compiled.state()["widened"] == 2
 
 
+def test_install_reports_cas_with_a_multicast_buffer(compiled, vllm_stub):
+    """On H200 every vLLM 0.32 CA has one; the routing is unchanged, but the
+    ``[custom-ag]`` line has to show it."""
+    vllm_stub.live_ca.mnnvl_multicast_ptr = 0xABC000
+    info = compiled.install(environ={})
+    assert info["multicast_present"] == 1
+    rebuilt = vllm_stub.CustomAllreduce(multicast=0xDEF000)
+    vllm_stub.CustomAllreduce(disabled=True, multicast=0xDEF000)
+    vllm_stub.CustomAllreduce()
+    assert compiled.state()["multicast_present"] == 2
+    comm = vllm_stub.CudaCommunicator(rebuilt)
+    assert isinstance(comm.all_gather(torch.zeros(4, 16), 0), torch.Tensor)
+    assert comm.nccl_calls == [] and rebuilt.calls == 0
+
+
+def test_install_without_multicast_reports_none(compiled, vllm_stub):
+    assert compiled.install(environ={})["multicast_present"] == 0
+
+
 def test_install_is_idempotent_and_restore_undoes_it(compiled, vllm_stub):
     compiled.install(environ={})
     patched = vllm_stub.CudaCommunicator.all_gather
@@ -309,6 +405,22 @@ def test_a_build_without_the_op_installs_nothing(cag, vllm_stub):
     info = cag.install(environ={})
     assert info["active"] is False and "not in this build" in info["err"]
     assert vllm_stub.CudaCommunicator.all_gather is vllm_stub.orig_ag
+
+
+def test_a_vllm_without_the_python_op_installs_nothing(
+        compiled, vllm_stub, monkeypatch):
+    bare = types.ModuleType("vllm._custom_ops")
+    monkeypatch.setitem(sys.modules, "vllm._custom_ops", bare)
+    monkeypatch.setattr(sys.modules["vllm"], "_custom_ops", bare)
+    info = compiled.install(environ={})
+    assert info["active"] is False and "custom_all_gather" in info["err"]
+    assert vllm_stub.CudaCommunicator.all_gather is vllm_stub.orig_ag
+
+
+def test_the_worker_logs_multicast_present():
+    src = ast.get_source_segment(
+        open(_WORKER).read(), _worker_method("_semip_install_custom_all_gather"))
+    assert "multicast_present={info['multicast_present']}" in src
 
 
 # --------------------------------------------------------------------------

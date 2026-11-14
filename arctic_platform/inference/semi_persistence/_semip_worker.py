@@ -112,6 +112,7 @@ class SemipGPUWorker(Worker):
         info = ca_all_gather.install()
         print(f"[custom-ag] install({where}): active={info['active']} "
               f"err={info['err']} widened={info['widened']} "
+              f"multicast_present={info['multicast_present']} "
               f"custom={info['custom']} fallback={info['fallback']} "
               f"capture_fallback={info['capture_fallback']} "
               f"max_custom_bytes={info['max_custom_bytes']}", flush=True)
