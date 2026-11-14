@@ -3661,6 +3661,131 @@ def test_onboarding_status_reference_metadata_is_checked_without_claiming_readin
         assert len(result.references.paths) == 2
 
 
+@pytest.fixture
+def _onboarding_status_scoped_paths(monkeypatch):
+    ordinary_path = records._record_path
+
+    def scoped_path(ctx, identity):
+        path = ordinary_path(ctx, identity)
+        rows = identity.get("recipe", {}).get("synthetic_inputs", {}).get("rows")
+        if rows is None or path.parent.name.startswith("rows-per-gas-"):
+            return path
+        gas = int(path.stem.removeprefix("gas"))
+        return path.parent / f"rows-per-gas-{rows // gas}" / path.name
+
+    monkeypatch.setattr(records, "_record_path", scoped_path)
+
+
+@pytest.mark.usefixtures("_onboarding_status_scoped_paths")
+@pytest.mark.parametrize("test_id", ["single-step-grads", "single-step-optimizer"])
+@pytest.mark.parametrize("layout", ["scoped", "unscoped"])
+def test_onboarding_status_reads_scoped_or_older_complete_reference_set(_operator_api_catalog, test_id, layout):
+    root = _operator_api_catalog
+    paths = _onboarding_status_record(root, test_id)
+    if layout == "unscoped":
+        older_paths = [path.parent.parent / path.name for path in paths]
+        for path, older in zip(paths, older_paths):
+            path.rename(older)
+        paths[0].parent.rmdir()
+        paths = older_paths
+    before = {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in root.rglob("*") if path.is_file()}
+    result = api.onboarding_status(_onboarding_status_request(root, tests=(test_id,)))[0]
+    assert result.references.state == "metadata_valid"
+    assert result.references.paths == tuple(map(str, paths))
+    assert {
+        str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in root.rglob("*") if path.is_file()
+    } == before
+
+
+@pytest.mark.usefixtures("_onboarding_status_scoped_paths")
+@pytest.mark.parametrize("test_id", ["single-step-grads", "single-step-optimizer"])
+@pytest.mark.parametrize(
+    "fault,expected", [("missing", "missing"), ("empty", "missing"), ("json", "malformed"), ("shape", "stale")]
+)
+def test_onboarding_status_current_set_never_borrows_older_arms(_operator_api_catalog, test_id, fault, expected):
+    root = _operator_api_catalog
+    paths = _onboarding_status_record(root, test_id)
+    for path in paths:
+        (path.parent.parent / path.name).write_bytes(path.read_bytes())
+    if fault == "missing":
+        paths[-1].unlink()
+    elif fault == "empty":
+        for path in paths:
+            path.unlink()
+    elif fault == "json":
+        paths[0].write_text("{broken")
+    else:
+        raw = json.loads(paths[0].read_text())
+        raw["identity"]["recipe"]["synthetic_inputs"]["rows"] *= 2
+        paths[0].write_text(json.dumps(raw))
+    result = api.onboarding_status(_onboarding_status_request(root, tests=(test_id,)))[0]
+    assert result.references.state == expected
+    assert all("rows-per-gas-" in path for path in result.references.paths)
+
+
+@pytest.mark.usefixtures("_onboarding_status_scoped_paths")
+@pytest.mark.parametrize("test_id", ["single-step-grads", "single-step-optimizer"])
+def test_onboarding_status_current_set_ignores_corrupt_older_records(_operator_api_catalog, test_id):
+    root = _operator_api_catalog
+    paths = _onboarding_status_record(root, test_id)
+    for path in paths:
+        (path.parent.parent / path.name).write_text("{broken")
+    result = api.onboarding_status(_onboarding_status_request(root, tests=(test_id,)))[0]
+    assert result.references.state == "metadata_valid"
+    assert result.references.paths == tuple(map(str, paths))
+
+
+@pytest.mark.usefixtures("_onboarding_status_scoped_paths")
+@pytest.mark.parametrize("test_id", ["single-step-grads", "single-step-optimizer"])
+def test_onboarding_status_other_row_width_cannot_satisfy_reviewed_case(_operator_api_catalog, test_id):
+    root = _operator_api_catalog
+    paths = _onboarding_status_record(root, test_id)
+    width = int(paths[0].parent.name.removeprefix("rows-per-gas-"))
+    paths[0].parent.rename(paths[0].parent.with_name(f"rows-per-gas-{width * 2}"))
+    result = api.onboarding_status(_onboarding_status_request(root, tests=(test_id,)))[0]
+    assert result.references.state == "missing"
+
+
+@pytest.mark.parametrize("state", ["parameter_update_residual", "exp_avg", "exp_avg_sq"])
+def test_onboarding_status_optimizer_norm_overflow_is_reported_as_malformed(_operator_api_catalog, capsys, state):
+    root = _operator_api_catalog
+    _onboarding_status_record(root, combined=True)
+    paths = _onboarding_status_record(root, "single-step-optimizer", combined=True)
+    raw = json.loads(paths[0].read_text())
+    raw["measurements"]["optimizer_norms"]["parameters"][_reference_records_PARAMETER][state] = 10**400
+    raw["payload_sha256"] = records._digest(raw["measurements"])
+    paths[0].write_text(json.dumps(raw))
+    assert paths[0].stat().st_size < records.MAX_RECORD_BYTES
+    before = {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+
+    request = _onboarding_status_request(root, tests=("single-step-grads", "single-step-optimizer"))
+    results = {result.test_id: result for result in api.onboarding_status(request)}
+    assert results["single-step-grads"].status == "metadata_valid"
+    result = results["single-step-optimizer"]
+    assert result.spec.state == "valid"
+    assert result.status == result.references.state == "malformed"
+    assert "cannot validate reference metadata" in result.reason
+    assert "too large" in result.reason
+
+    args = execution.parse_args(
+        [
+            "list",
+            "--config-dir",
+            str(root / "configs"),
+            "--config",
+            _operator_api_CONFIG,
+            "--test",
+            "single-step-optimizer",
+            "--json",
+        ]
+    )
+    assert execution.cmd_list(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["statuses"][0]["status"] == "malformed"
+    assert "too large" in payload["statuses"][0]["references"]["reason"]
+    assert {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in paths} == before
+
+
 def test_onboarding_status_combined_gradient_and_optimizer_records_are_selection_specific(_operator_api_catalog):
     root = _operator_api_catalog
     _onboarding_status_record(root, combined=True)
@@ -22986,6 +23111,7 @@ def test_client_backends_cortex_model_options_preserve_internal_debug_without_a_
 
 
 _SELFTEST_FIXTURES = (
+    "_onboarding_status_scoped_paths",
     "_isolated_gateway_ownership",
     "_operator_api_catalog",
     "_external_operator_catalog",

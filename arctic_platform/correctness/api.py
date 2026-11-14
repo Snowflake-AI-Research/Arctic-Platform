@@ -209,11 +209,34 @@ def _status_references(cfg, spec, test_id: str, root: Path, *, combined: bool) -
     arms = [None] if test_id == "e2e-sft-train-validate" else spec.arms
     paths = []
     try:
+        identities = []
         for arm in arms:
             identity = {"check_id": test_id, "config_id": cfg.config_id}
             if arm is not None:
-                identity["recipe"] = {"arm": arm.name, "optimizer": {} if combined else None}
-            path = storage._record_path(ctx, identity)
+                identity["recipe"] = {
+                    "arm": arm.name,
+                    "optimizer": {} if combined else None,
+                    "synthetic_inputs": {"rows": arm.global_batch_size, "max_seq_len": arm.max_seq_len},
+                }
+            identities.append(identity)
+        record_paths = [storage._record_path(ctx, identity) for identity in identities]
+        # A partially published current set must not borrow arms from an older set.
+        if not any(path.parent.exists() for path in record_paths):
+            record_paths = [
+                storage._record_path(
+                    ctx,
+                    {
+                        **identity,
+                        "recipe": {
+                            key: value
+                            for key, value in identity.get("recipe", {}).items()
+                            if key != "synthetic_inputs"
+                        },
+                    },
+                )
+                for identity in identities
+            ]
+        for arm, path in zip(arms, record_paths):
             paths.append(str(path))
             record = _status_json(path)
             saved = record["identity"]
@@ -247,7 +270,7 @@ def _status_references(cfg, spec, test_id: str, root: Path, *, combined: bool) -
         )
     except FileNotFoundError as exc:
         return ArtifactStatus("missing", f"prepared reference missing: {exc.filename}; rerun onboarding", tuple(paths))
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError) as exc:
         return ArtifactStatus("malformed", f"cannot validate reference metadata: {exc}", tuple(paths))
 
 
