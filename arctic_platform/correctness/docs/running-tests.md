@@ -63,32 +63,6 @@ python -m arctic_platform.correctness onboard \
 
 **Optimizer norm agreement is not elementwise agreement.** Equal L2 norms can hide a sign change, permutation, or directional error. Regression uses the reviewed criterion and calibrated gate stored in the prepared record; regression never widens that gate.
 
-## Query Onboarding Status
-
-**`list` inspects configuration/test metadata without running workloads.** It reads existing recipes, specifications, compact Hugging Face (HF) reference records and onboarding summaries; it does not import external configs, publish records, start a gateway or inspect GPUs. Unreviewed recipes remain visible, including configs whose specification is missing.
-
-```bash
-python -m arctic_platform.correctness list
-python -m arctic_platform.correctness list --config <ID-or-path> --test single-step-grads
-python -m arctic_platform.correctness list --config <ID-or-path> --json
-```
-
-**The Python API returns one structured result per selected config/test pair.** `onboarding_status(RunRequest(...))` uses the same IDs and recipe parser as regression. Omit the config selector to inspect every discovered recipe, including unreviewed configs. Repeated test IDs are collapsed; unknown IDs and conflicting config selectors are errors. External paths are read in place; when explicit recipe/path hardware permits deriving the import identity, the query uses that identity without creating a local config or probing hardware. `--config-dir` changes recipe discovery and `--reference-records-dir` changes the inspected reference root; reviewed specifications and summaries remain under this package's `specs/`.
-
-```python
-from dataclasses import asdict
-from arctic_platform.correctness.api import RunRequest, onboarding_status
-
-rows = onboarding_status(RunRequest(config="<ID-or-path>", tests=("single-step-grads",)))
-data = [asdict(row) for row in rows]
-```
-
-**Metadata validity is not runtime readiness or a passing validation.** Each result separates `spec`, `references` and `historical`. Specs are checked against the current config checksum, case shapes, attention and per-test coverage; missing, stale and malformed artifacts include a reason. Current reference filenames are checked for schema, payload integrity, config/check identity, frozen gradient gate, case shape and complete scalar measurements. `metadata_valid` does not authenticate the complete reference workload, installed dependencies, model/adapter bytes, wider placements or current target capabilities; regression performs its own admission checks. Legacy content-addressed records are not authenticated by this query and require regression's full identity check. Selecting gradients alone inspects `gradients-only` records; selecting gradients with an applicable optimizer check inspects `with-optimizer` records.
-
-**Recorded onboarding outcomes remain historical.** `historical.outcome` preserves the recorded outcome, while `historical.state` distinguishes matching current per-test spec identity (`current_spec`), stale identity, older unbound evidence, missing evidence and malformed evidence. A matching identity does not authenticate today's runtime or options, and a recorded success cannot substitute for missing references. A missing summary does not invalidate an imported reviewed spec or change regression selection. JSON output uses schema `correctness-onboarding-status-v1`; querying missing artifacts succeeds and reports their status, while invalid selectors return exit code 2.
-
-**Rerun onboarding when compatible references are missing.** The config-only `onboard --config <ID-or-path>` workflow prepares the selected references automatically, including the combined gradient/optimizer records; no separate operator preparation step is needed.
-
 ## Setup
 
 **This quick demo uses `axolotl-ai-co/tiny-qwen3-129m`, a 129M-parameter Qwen3 model, with 128-token sequences on one exclusively allocated H200 GPU.** Activate a Python 3.12+ environment with working CUDA, FlashAttention-3 kernels and the installed upstream DSS GPU gateway first. The `correctness` extra installs the Cortex client, training and Hugging Face reference dependencies, and CPU selftest tools; it does not install the separate DSS service, CUDA or model-specific attention kernels. Use the existing `/checkpoint/huggingface` cache; Hugging Face downloads missing model files there automatically, requiring network access and sufficient cache space. The gateway uses the allocation's Ray runtime, so do not run on a shared cluster. No fresh GPU verification is established by the controls for gateway, progress and timing changes.
