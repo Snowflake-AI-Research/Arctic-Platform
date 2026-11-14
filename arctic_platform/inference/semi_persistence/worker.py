@@ -519,6 +519,10 @@ def _is_userspace_spin(pid):
     yield loop never ends. Measured 2026-09-22 across 29 restores: that
     inequality predicted quiescence failure every time, 29 for 29.
 
+    TP workers now install ``spin_clock`` before the dump, which times that
+    loop on the wall clock, so images dumped since then restore idle. This
+    stays for images dumped before it.
+
     Conservative on error. If either file cannot be read the answer is False,
     which keeps the old behaviour of failing the restore.
     """
@@ -729,6 +733,56 @@ def _dump_slot():
             os.close(fd)
 
 
+# criu's own default for --ghost-limit (DEFAULT_GHOST_LIMIT in cr_options.h).
+_CRIU_DEFAULT_GHOST_LIMIT = 1 << 20
+# tmpfs may back a file with 2 MiB huge pages, so its st_blocks can run past
+# the last mapped 4 KiB page up to the next 2 MiB boundary.
+_GHOST_LIMIT_ALIGN = 2 << 20
+
+
+def _shm_ghost_limit(pids, proc="/proc"):
+    """The ``--ghost-limit`` that lets criu carry every deleted ``/dev/shm``
+    file *pids* still map.
+
+    prepare_criu_dump unlinks the tree's ``sem.*`` and each rank its ``psm_*``
+    while the mappings stay, and criu stores a deleted file that is mapped
+    ``MAP_SHARED`` as a ghost file inside the image -- the only form that
+    restores on another pod, since nothing else keeps a copy.  criu refuses a
+    ghost whose allocated size (``st_blocks * 512``) exceeds the limit, 1 MiB
+    by default ("Can't dump ghost file ... increase limit").  vLLM's response
+    rings are ten 24 MiB chunks each, and their allocated part grows with the
+    largest message a rank has sent: with router replay, rank 0's outputs
+    carry every token's routed experts and pass 1 MiB.
+
+    No file can have more allocated than its mapped extent, rounded up to a
+    huge page, so the largest extent bounds every ghost these unlinks create.
+    criu copies a ghost by SEEK_DATA, so the image carries only what is
+    allocated, not the extent.
+    """
+    extent = 0
+    for pid in pids:
+        try:
+            with open(f"{proc}/{pid}/maps") as handle:
+                for line in handle:
+                    parts = line.split(None, 5)
+                    if len(parts) < 6:
+                        continue
+                    path = parts[5].strip()
+                    if not (path.startswith("/dev/shm/")
+                            and path.endswith("(deleted)")):
+                        continue
+                    try:
+                        start, end = (int(x, 16) for x in parts[0].split("-"))
+                        offset = int(parts[2], 16)
+                    except ValueError:
+                        continue
+                    extent = max(extent, offset + end - start)
+        except OSError:
+            continue
+    extent = -(-extent // _GHOST_LIMIT_ALIGN) * _GHOST_LIMIT_ALIGN
+    return max(_CRIU_DEFAULT_GHOST_LIMIT, extent)
+
+
 def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
                       meta_extra=None):
     """Dump the vLLM child process tree to disk via CRIU (destructive).
@@ -769,7 +823,8 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
     # live one back with --inherit-fd under this name.
     stdout_resource = _resolve_fd_resource(child_pid, 1)
     stray_stdio = []
-    for scan_pid in _get_descendant_pids(child_pid) + [child_pid]:
+    tree_pids = _get_descendant_pids(child_pid) + [child_pid]
+    for scan_pid in tree_pids:
         proc_fd_dir = f"/proc/{scan_pid}/fd"
         try:
             fd_names = os.listdir(proc_fd_dir)
@@ -838,6 +893,7 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
         "--tcp-close",
         "--ext-unix-sk",
         "--link-remap",
+        "--ghost-limit", str(_shm_ghost_limit(tree_pids)),
         "--libdir", empty_libdir,
         "-v4",
     ]
@@ -1940,6 +1996,12 @@ def _worker_criu_load_lowcap(image_dir, new_pipe_fd):
 # Child thread -- communicates with the vLLM child process via pipe
 # ---------------------------------------------------------------------------
 
+# The commands between the last forward pass and the checkpoint that decide
+# whether the image can restore: a failure in any of them refuses the dump,
+# and the graph drop they report goes into meta.json.
+_NCCL_TEARDOWN_CMDS = ("drop_graphs", "drop_graphs_if_nccl", "destroy_nccl")
+
+
 def _child_thread(instance_id, gpus, child_pid, pipe,
                   child_queue, result_queue, completed_counter,
                   initial_state="alive", capture_gpu_uuids=None,
@@ -2057,6 +2119,14 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
     # engine that did not sleep still holds its weights and KV cache, so a
     # checkpoint would capture all of it; refuse instead.
     sleep_error = None
+    # Set by a failed graph drop or NCCL teardown.  A comm whose abort never
+    # finished still holds peer memory, which checkpoints and then fails
+    # cuda_restore with CUresult=801; refuse instead.
+    nccl_error = None
+    # What the child did with its graphs before destroy_nccl (its
+    # ``graph_drop`` reply), recorded into meta.json so the restore knows
+    # whether to rebind or recapture.
+    graph_drop = None
 
     while True:
         cmd, kwargs = _get_next_command()
@@ -2080,6 +2150,13 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
                       cmd, sleep_error)
             _emit_result(cmd, 0.0,
                          f"refused: the engine failed to sleep ({sleep_error})", {})
+            continue
+
+        if cmd in ("cuda_checkpoint", "criu_dump") and nccl_error is not None:
+            log.error("<<< %s FAILED (NCCL teardown failed: %s)",
+                      cmd, nccl_error)
+            _emit_result(cmd, 0.0,
+                         f"refused: NCCL teardown failed ({nccl_error})", {})
             continue
 
         if cmd == "cuda_checkpoint":
@@ -2279,9 +2356,12 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
                             f"{len(_bad)} inet socket(s) would go into a "
                             f"multi-node image: {_bad}")
 
+                meta_extra = dict(kwargs.get("meta_extra") or {})
+                if graph_drop:
+                    meta_extra.update(graph_drop)
                 meta = _worker_criu_save(
                     child_pid, image_dir, child_pipe_fd, pipe_resource, gpus,
-                    meta_extra=kwargs.get("meta_extra"),
+                    meta_extra=meta_extra,
                 )
                 info["image_dir"] = image_dir
                 info["meta"] = meta
@@ -2397,9 +2477,15 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
             break
         # Track child pause state so `_drain_pipe_generates` can no-op
         # for the duration of the pause/save/restore/resume cycle.
-        _result_cmd, _, _result_error, _ = result
+        _result_cmd, _, _result_error, _result_info = result
         if _result_cmd == "sleep":
             sleep_error = _result_error
+        if _result_cmd in _NCCL_TEARDOWN_CMDS:
+            if _result_error is not None:
+                nccl_error = f"{_result_cmd}: {_result_error}"
+            elif isinstance(_result_info, dict) and _result_info.get(
+                    "graph_drop"):
+                graph_drop = dict(_result_info["graph_drop"])
         if _result_error is None:
             if _result_cmd == "pause":
                 _worker_paused = True

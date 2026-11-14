@@ -24,6 +24,13 @@ the withdrawal stays in the warmup ``finally``.
 registration for that earlier capture alone, as the fallback if the copy path
 turns out not to cover every pointer it records. Off by default.
 
+``init_device`` also installs ``spin_clock`` for good, so a rank restored on a
+host that booted later than the dump host is idle rather than spinning.
+
+It also routes TP all-gathers through CustomAllreduce (``ca_all_gather``) for
+good, so the captured graphs hold no NCCL all-gather and the dump keeps them
+for rebind instead of dropping them for a recapture.
+
 Both hooks return whatever the base class returns, so this stays agnostic to
 the ``compile_or_warm_up_model`` return type (a float on older vLLM, a
 ``CompilationTimes`` on newer).
@@ -82,8 +89,47 @@ class SemipGPUWorker(Worker):
         # nothing for Python to catch. Install here so both captures record
         # only the pre-registered staging buffer.
         self._semip_install_force_copy("init_device")
+        self._semip_install_custom_all_gather("init_device")
         self._semip_arm_profile_register_guard()
+        self._semip_install_spin_clock()
         return result
+
+    def _semip_install_custom_all_gather(self, where):
+        """Route TP all-gathers through CustomAllreduce and say what stuck.
+
+        Never withdrawn: the restore's ``reinit_nccl`` builds a fresh
+        CustomAllreduce whose all-gather limit the patch has to widen, and a
+        recapture after a dropped dump has to capture the kernels the cold
+        start did. Idempotent, so a later call re-states the counts; a
+        non-empty ``capture_fallback`` after the warmup capture is an NCCL
+        all-gather in a kept graph, which the dump-time census will count."""
+        try:
+            import ca_all_gather
+        except Exception as exc:  # noqa: BLE001
+            print(f"[custom-ag] install({where}): ca_all_gather unavailable: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            return
+        info = ca_all_gather.install()
+        print(f"[custom-ag] install({where}): active={info['active']} "
+              f"err={info['err']} widened={info['widened']} "
+              f"multicast_present={info['multicast_present']} "
+              f"custom={info['custom']} fallback={info['fallback']} "
+              f"capture_fallback={info['capture_fallback']} "
+              f"max_custom_bytes={info['max_custom_bytes']}", flush=True)
+
+    def _semip_install_spin_clock(self):
+        """Time the shm_broadcast idle spin on the wall clock (see
+        `spin_clock`). Never withdrawn: it has to ride into the CRIU image,
+        so that a restored rank is idle when `cuda_restore` waits for it."""
+        try:
+            import spin_clock
+        except Exception as exc:  # noqa: BLE001
+            print(f"[spin-clock] unavailable: {type(exc).__name__}: {exc}",
+                  flush=True)
+            return
+        info = spin_clock.install()
+        print(f"[spin-clock] install: active={info['active']} err={info['err']}",
+              flush=True)
 
     def _semip_install_fi_ar_probe(self, where):
         """Install the workspace probe and say what stuck. Idempotent: the
@@ -97,7 +143,7 @@ class SemipGPUWorker(Worker):
         info = ca_graph_rebind.install_fi_ar_workspace_probe()
         print(f"[fi-ar-probe] install({where}): patched={info['patched']} "
               f"missing={info['missing']} suppress={info['suppress']} "
-              f"err={info['err']}", flush=True)
+              f"latched={info.get('latched')} err={info['err']}", flush=True)
 
     def _semip_install_force_copy(self, where):
         """Install the CustomAllreduce copy-path patch and say what stuck.
@@ -202,6 +248,7 @@ class SemipGPUWorker(Worker):
             if keep_graphs:
                 ca_graph_rebind.restore_keepgraph_patch()
             ca_graph_rebind.restore_fi_ar_workspace_probe()
+        self._semip_install_custom_all_gather("warmup")
         if not keep_graphs:
             print("[semip] multi-node: keep-graph patch, instantiate pass and "
                   "census skipped; graphs are dropped at dump and recaptured "

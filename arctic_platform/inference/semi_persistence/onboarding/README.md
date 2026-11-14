@@ -9,8 +9,19 @@ by running it next to plain vLLM on the same backend image:
    throughput unchanged against stock vLLM, and does load spread across replicas?
 3. **Start-up:** how long does each phase take, and how much does semi_p save?
 
-One command per model (or a list of models) submits the jobs, waits for them,
-runs the checks, cancels them and writes a Markdown and a JSON report.
+One command per model (or a list of models) submits the jobs, runs the checks,
+cancels them and writes a Markdown and a JSON report.
+
+Each job is served on its own as soon as it is running: it is measured for perf,
+answers every correctness request, its logs are read and it is cancelled, without
+waiting for the others. A semi_p job is typically up in 1-5 minutes and a plain
+one in 3-20, so the fast job no longer holds its GPUs while the slow one starts.
+The checks compare the stored results once every job is done; they compare
+token ids and server latencies, so when each job answered does not change them.
+A job that fails to start drops out of the comparison (the report marks it
+**not measured** and the run fails); a failed `on_hit` stops the others, since
+nothing can be compared with it.
+
 ## The four jobs
 
 | Job | What it is | Size | Used for |
@@ -32,6 +43,29 @@ expected to differ at TP >= 2; the report gives where it first differs.
 matched on plain workers). The perf layout is twice the published `n_gpus` for a
 whole-node config, so two pods restore the same image, and the published size
 otherwise (`copies=` overrides).
+
+### Variant sets
+
+`variants=` takes any subset that includes `on_hit`. The plain baseline, which
+perf and the start-up table compare semi_p with, is `off_default`, else
+`off_matched`, else there is none.
+
+| `variants` | Plain baseline | What changes |
+|---|---|---|
+| all four (default), or any set with `off_default` | `off_default` | nothing: everything above |
+| `on_hit,off_matched` (plus `on_miss`) | `off_matched` | perf gates semi_p against plain matched (semi_p's own cost, without its collective settings, so no breakdown); start-up's plain column is `off_matched`'s; correctness gates `off_matched` as always |
+| `on_hit` (plus `on_miss`) | none | perf is not measured; start-up's plain columns are `-` ("no plain job in this run"); with `on_hit` alone each correctness check is decided on its own answers (below) |
+
+With `on_hit` alone no job can be compared with the reference, so these checks
+are gated on its own answers: `ignore_eos` length, one answer from every replica,
+the seeded repeat, real token ids, sampled logprobs (one per generated token,
+each finite and <= 0), top-k logprobs (one entry per generated token with 1 to 3
+candidates), prompt logprobs (one position per prompt token, the first may be
+left out), stop strings (none in the text) and guided JSON that parses. Greedy
+agreement and batched greedy need another job and are *info*, and so is guided
+JSON that does not parse, since no plain job ran to tell a reasoning model's free
+text from a defect. The verdict is PASS when every gated check passes. The report
+and the onboarding book say which variants ran.
 
 ### semi_p's collective setup at TP >= 2
 
@@ -61,7 +95,8 @@ backend applies when it supports it. The report says whether it did; if not,
 - `kubectl` access to the cluster, to wait for the published image to be
   verified on every node (below). Without it the suite warns and submits anyway.
 - Free GPUs for all of a model's jobs at once: `copies x n_gpus` for each perf job
-  (`on_hit`, `off_default`, `off_matched`) plus `n_gpus` for `on_miss`.
+  (`on_hit`, `off_default`, `off_matched`) plus `n_gpus` for `on_miss`. They are
+  submitted together, and each is released as soon as it is done.
 - `on_miss` leaves its fresh image on the node's local disk; point
   `miss_image_cache` at a scratch root you clean up.
 
@@ -91,7 +126,7 @@ model with no entry stops the run before anything is submitted.
 |---|---|---|
 | `models` | required | Comma-separated names under `models/`, or paths to model files |
 | `debug_image_tag` | the model's entry in `backends.json` | Backend image for every job |
-| `variants` | all four | Subset of `on_hit,off_default,on_miss,off_matched`; the first two are required |
+| `variants` | all four | Subset of `on_hit,off_default,on_miss,off_matched` that includes `on_hit` (see [Variant sets](#variant-sets)) |
 | `copies` | 2 for whole-node configs, else 1 | Perf pair size, as a multiple of the published `n_gpus` |
 | `miss_image_cache` | none | Local image-cache root for `on_miss`; a per-run subdirectory is used, so a copy left by an earlier job cannot turn the miss into a hit |
 | `checks` | `correctness,perf` | Run a subset |
@@ -103,8 +138,9 @@ model with no entry stops the run before anything is submitted.
 | `out_dir` | `onboarding_reports` | Where reports go |
 | `keep_jobs` | `false` | Leave the jobs running |
 | `job_<variant>` | none | Attach to running jobs instead of submitting (`on_job_id` / `off_job_id` still work) |
-| `log_files_on`, `log_files_off` | none | Saved GPU pod logs of `on_hit` / `off_default` (per-step restore breakdown) |
-| `timeout_s` | `3600` | How long to wait for the jobs to reach `running` |
+| `log_files_on`, `log_files_off` | none | Saved GPU pod logs of `on_hit` / the plain baseline (per-step restore breakdown) |
+| `timeout_s` | `3600` | How long each job may take to reach `running` |
+| `log_wait_s` | `90` | How long to keep re-reading a served job's log, before cancelling it, until it shows the job's start-up total |
 | `publish_dir` | `<out_dir>/publish` | Where `publish` wrote `<image_tag>/summary.json` |
 | `verify_timeout_s` | `3600` | How long to wait for the published image to be verified on every node |
 
@@ -124,7 +160,7 @@ The command needs no interaction once started; run it under `nohup` (and
 `caffeinate -i` on a Mac, so the machine does not sleep). Before every model it
 waits until that model's jobs fit within `max_gpus` / `max_nodes` with
 `reserve_gpus` still free, so it never takes the last GPUs on the cluster, and
-it cancels each model's jobs as soon as that model is done.
+it cancels each job as soon as that job is done.
 
 Every job is appended to `<out_dir>/jobs-<time>.jsonl` when submitted and when
 cancelled. SIGINT, SIGTERM and SIGHUP cancel every job still held before the
@@ -159,7 +195,11 @@ python -m arctic_platform.inference.semi_persistence.onboarding.publish config=c
 
 It submits one job per model with the flag, waits for the engine's
 `semi_p: published` line in the sub-job log (or a restore from an image that is
-published already), saves the log and cancels the job. Results are in
+published already), saves the log and cancels the job. If the job ends first
+(an idle timeout can end it while the upload runs on) and neither its sub-job
+log nor its archived execution logs say how the publish went, the model's
+status is `unknown`, not `FAILED`: look for the skeleton in the bucket or for
+the `semi_p: published` line in the device-manager pod's log. Results are in
 `onboarding_reports/publish/<image_tag>/summary.json`; a re-run for some models
 keeps the other models' entries. Publishing ends with the upload: `onboard` is the
 one that waits for the nodes to verify the image. Then point the models' entries in
@@ -213,15 +253,15 @@ job disagrees. Requests go one prompt at a time unless noted.
 Closed-loop threads send single-prompt greedy requests with `ignore_eos`, token-id
 prompts varied per request so prefix caching and prefix-affinity routing cannot
 favour either job. The grid is concurrency `1, replicas, 4 x replicas` (or
-`1, 8, 32` for one replica) by three prompt/output shapes, alternating jobs cell
-by cell. Server latency is the request's `updated_at - created_at`; client
-latency adds submission and polling.
+`1, 8, 32` for one replica) by three prompt/output shapes, each job measured on
+its own while it is up. Server latency is the request's `updated_at - created_at`;
+client latency adds submission and polling.
 
 | Check | Measured as | Default limit |
 |---|---|---|
 | TTFT ratio | server p50 of 16 `max_tokens 1` requests, short and long prompt; worst of the two | semi_p / plain <= 1.10, or within 12 ms (a restored TP=1 engine sits about 1 or about 11 ms above plain) |
 | TPOT ratio | (server p50 at N tokens - TTFT) / (N - 1), N up to 128 | <= 1.10, or within 0.5 ms |
-| Worst server p50 latency ratio | across every grid cell; a cell over the limit is measured up to twice more on every job with fresh prompts and keeps each job's median, so a single noisy measurement cannot fail it | <= 1.15 |
+| Worst server p50 latency ratio | across every grid cell; a cell over the limit counts up to two more measurements on every job with fresh prompts and keeps each job's median, so a single noisy measurement cannot fail it (a job measured before the semi_p / plain pair is complete takes those repeats for every cell, since it cannot tell yet which will need them) | <= 1.15 |
 | Worst throughput ratio | generated tokens / cell wall time, across cells with concurrency > 1 | >= 0.90 |
 | Request errors and zero-id responses | every perf request | 0 |
 | Replica scaling (multi-replica) | tok/s at concurrency = replicas over replicas x tok/s at concurrency 1 | >= 0.90 x the plain job's scaling |
@@ -247,7 +287,9 @@ published size. Override with `copies=` or a model file's `"copies"`.
 
 ### Start-up (reported; a cold start fails the run)
 
-- Job timeline for both jobs: submit to `running`, and `initializing` to `running`.
+- Job timeline for both jobs: submit to `running`, and `initializing` to `running`;
+  the JSON also has each job's `running_to_cancelled_s`, how long it held its GPUs
+  once up.
 - semi_p, per replica, from the job log: whether it restored from the published
   image (`materialized`, `reading weights in place`) or cold-started (`cache
   miss`), the image copy time, restore time and key-to-ready time.
@@ -265,6 +307,14 @@ published size. Override with `copies=` or a model file's `"copies"`.
 If neither the live log nor the archived execution logs carry the semi_p
 markers, the verdict is `WARN` (restore not confirmed); pass saved logs with
 `log_files_on` / `log_files_off`.
+
+The service's tail of a long sub-job log can stop advancing while the job runs
+on, and reads answer 409 Conflict once the job has ended. So each job's log is
+followed: lines already read are kept, the newest page is added when a read from
+the start brings nothing new, and before a served job is cancelled its log is
+re-read for up to `log_wait_s` until it shows the job's start-up total (semi_p
+key to ready, or vLLM's engine init). A total still missing is listed under
+"Start-up totals unknown" with why (`log stream stalled`), not left blank.
 
 ## Reports and verdict
 

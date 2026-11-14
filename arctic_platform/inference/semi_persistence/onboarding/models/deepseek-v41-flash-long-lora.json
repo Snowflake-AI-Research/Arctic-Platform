@@ -1,0 +1,40 @@
+{
+  "name": "deepseek-v41-flash-long-lora",
+  "description": "deepseek-ai/DeepSeek-V4.1-Flash-1017, TP=8, 1 replica(s) on 8 GPU(s); catalog deepseek-v4.1-flash-1017/long/h200-inference-lora.json",
+  "sub_job": {
+    "job_type": "sampling",
+    "model_name": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "dtype": "bfloat16",
+    "seed": 42,
+    "inference_config": {
+      "n_gpus": 8,
+      "max_seq_len": 262144,
+      "vllm_config": {
+        "tensor_parallel_size": 8,
+        "enable_expert_parallel": true,
+        "gpu_memory_utilization": 0.8,
+        "reasoning_parser": "deepseek_v41",
+        "extra_engine_kwargs": {
+          "swa_bounded_replay": false
+        }
+      },
+      "peft_config": {
+        "peft_type": "Lora",
+        "r": 32,
+        "lora_alpha": 32,
+        "lora_dropout": 0.0,
+        "bias": "none",
+        "target_modules": [
+          "wq_a",
+          "wkv",
+          "wq_b",
+          "wo_b"
+        ]
+      },
+      "router_replay": {
+        "enabled": true,
+        "max_cache_bytes": 4294967296
+      }
+    }
+  }
+}

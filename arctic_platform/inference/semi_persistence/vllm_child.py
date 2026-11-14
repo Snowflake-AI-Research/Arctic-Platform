@@ -14,8 +14,9 @@ to accept new generate requests (and other commands) while the engine
 is actively decoding, enabling concurrent request handling without
 asyncio or extra threads.
 
-Attach allocates CPU memory sized to model.named_parameters().  Stage
-snapshots the post-processed GPU parameters into that buffer.
+Attach allocates CPU memory sized to model.named_parameters() plus any
+weight-pool storage they do not cover (see _semip_param_tensors).  Stage
+snapshots the post-processed GPU weights into that buffer.
 plan_restore_weights walks the param index once and caches a chunk plan
 (chunk_lo, chunk_hi, members) bounded by max_buffer_bytes.  If the host
 buffer is pageable it also forms a small pinned double buffer (buffer_bytes
@@ -33,7 +34,7 @@ here would be copied by value per worker and its writes discarded; each
 rank also owns a different shard of the parameters.  The same code path
 serves TP=1, where the single worker is in-process.
 """
-import ctypes, json, os, shutil, subprocess, sys, threading, time
+import ctypes, json, os, re, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -551,31 +552,246 @@ def _cuda_restore_probe(worker):
 #
 # Param names are namespaced ``main:p:`` / ``drafter:p:`` to match the layout
 # built at attach so stage/restore dispatch each entry to the right tensor.
+#
+# Parameters are not all of the weights.  vLLM's triton_kernels MXFP4 MoE
+# backends (gpt-oss on sm90) delete the expert Parameters in
+# process_weights_after_loading and keep the swizzled experts as plain layer
+# attributes, their scales in the quant method's PrecisionConfig.  A level-2
+# sleep discards those with the rest of the "weights" pool, and wake_up maps
+# memory under them that nothing refills.  So every storage in that pool which
+# no parameter or buffer owns, and which a module reaches through its
+# attributes, travels in the host copy too, as a ``main:s:`` / ``drafter:s:``
+# entry: a flat uint8 view of the whole storage.  They follow every parameter,
+# so a model that has none keeps the layout -- and the weight hash -- it had.
 # ---------------------------------------------------------------------------
-def _semip_layout(worker):
-    layout = []
+def _semip_weight_pool_ranges():
+    """Sorted ``(start, end)`` of every CuMemAllocator allocation tagged "weights".
+
+    Asleep allocations count: attach runs before wake_up_weights on a restore,
+    and only addresses are compared, never contents.  ``None`` without vLLM's
+    allocator, which semi-p always enables through sleep mode.
+    """
+    try:
+        from vllm.device_allocator.cumem import CuMemAllocator
+    except Exception:  # noqa: BLE001
+        return None
+    allocator = CuMemAllocator.instance
+    if allocator is None:
+        return None
+    return sorted((int(ptr), int(ptr) + int(data.handle[1]))
+                  for ptr, data in allocator.pointer_to_data.items()
+                  if data.tag == "weights")
+
+
+def _semip_unregistered_storages(module, prefix, excluded, ranges, max_depth=8):
+    """``(name, uint8 view)`` of each weight-pool storage ``module`` reaches
+    through attributes that is not in ``excluded``, named by its shortest path.
+
+    The walk enters containers, dataclasses and plain objects (triton_kernels
+    wraps its tensors in both), but not modules: ``named_modules`` visits those
+    in the tree, and anything outside it is not this model's.  Breadth first,
+    so the depth cap never hides an object a shorter path also reaches.
+    """
+    import bisect
+    import collections
+    import inspect
+    starts = [lo for lo, _ in ranges]
+
+    def in_pool(ptr):
+        i = bisect.bisect_right(starts, ptr) - 1
+        return i >= 0 and ptr < ranges[i][1]
+
+    queue = collections.deque()
+    for mod_name, mod in module.named_modules():
+        for attr, value in vars(mod).items():
+            if attr not in ("_parameters", "_buffers", "_modules"):
+                queue.append((f"{mod_name}.{attr}" if mod_name else attr, value, 1))
+    found, seen, visited = [], set(excluded), set()
+    while queue:
+        path, value, depth = queue.popleft()
+        if isinstance(value, torch.Tensor):
+            if not value.is_cuda:
+                continue
+            try:
+                storage = value.untyped_storage()
+                ptr = storage.data_ptr()
+            except (RuntimeError, NotImplementedError):  # fake / meta tensors
+                continue
+            if storage.nbytes() and ptr not in seen and in_pool(ptr):
+                seen.add(ptr)
+                found.append((f"{prefix}{path}", torch.empty(
+                    0, dtype=torch.uint8, device=value.device).set_(storage)))
+            continue
+        if (depth >= max_depth or id(value) in visited
+                or isinstance(value, (torch.nn.Module, type, str, bytes))
+                or inspect.ismodule(value) or inspect.isroutine(value)):
+            continue
+        if isinstance(value, dict):
+            items = [(str(k), v) for k, v in value.items()]
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            items = list(enumerate(value))
+        elif hasattr(value, "__dict__"):
+            items = list(vars(value).items())
+        else:
+            continue
+        visited.add(id(value))
+        queue.extend((f"{path}.{key}", item, depth + 1) for key, item in items)
+    return found
+
+
+# Which weight-pool storages outside named_parameters() are weights.  Only
+# those go into the weight set, whose bytes key ``weights_hash``: the rest is
+# scratch whose size or contents follow the engine config or the run (sparse
+# attention top-k buffers sized by max_num_batched_tokens / max_num_seqs, GEMM
+# lock workspaces, staged rows, prefetch ids, KV scales), and in the weight set
+# it forked the hash of every config and backend.  It is still staged, as
+# per-config state that rides the CRIU image (_semip_stage_state).  Anything
+# not recognised as a weight is state, so a miss costs sharing, not a restore.
+_WEIGHT_LIKE_PATH = re.compile(r"(^|\.)\w*weight(_scale\w*)?(\.|$)")
+
+
+def _semip_weight_like(name):
+    return bool(_WEIGHT_LIKE_PATH.search(name.split(":s:", 1)[-1]))
+
+
+def _semip_param_tensors(worker, state=None):
+    """Every tensor the host copy holds, by namespaced name, in layout order.
+
+    ``state``, when given, collects the ``(name, view)`` of the weight-pool
+    storages that are not weights; they are left out of the host copy."""
     mr = worker.model_runner
-    for name, p in mr.model.named_parameters():
-        d = p.data
-        layout.append((f"main:p:{name}", d.nbytes, d.dtype, tuple(d.shape)))
+    models = [("main", mr.model)]
     drafter = getattr(mr, "drafter", None)
     dm = getattr(drafter, "model", None) if drafter is not None else None
     if dm is not None:
-        for name, p in dm.named_parameters():
-            d = p.data
-            layout.append((f"drafter:p:{name}", d.nbytes, d.dtype, tuple(d.shape)))
-    return layout
-
-
-def _semip_param_tensors(worker):
-    mr = worker.model_runner
-    t = {f"main:p:{n}": p.data for n, p in mr.model.named_parameters()}
-    drafter = getattr(mr, "drafter", None)
-    dm = getattr(drafter, "model", None) if drafter is not None else None
-    if dm is not None:
-        for n, p in dm.named_parameters():
-            t[f"drafter:p:{n}"] = p.data
+        models.append(("drafter", dm))
+    t = {}
+    for ns, model in models:
+        for n, p in model.named_parameters():
+            t[f"{ns}:p:{n}"] = p.data
+    ranges = _semip_weight_pool_ranges()
+    if not ranges:
+        return t
+    # Buffers ride vLLM's own level-2 sleep snapshot and LoRA state its own
+    # host copy (_semip_stage_lora), so neither is taken twice.
+    excluded = {x.untyped_storage().data_ptr()
+                for _, model in models
+                for x in [*model.parameters(), *model.buffers()]}
+    excluded |= {v.untyped_storage().data_ptr() for v in _semip_lora_views(worker)}
+    for ns, model in models:
+        for name, view in _semip_unregistered_storages(model, f"{ns}:s:", excluded, ranges):
+            excluded.add(view.untyped_storage().data_ptr())
+            if _semip_weight_like(name) and name not in getattr(worker, "_semip_volatile", ()):
+                t[name] = view
+            elif state is not None:
+                state.append((name, view))
     return t
+
+
+# Words per checksum chunk.  Integer sums upcast a copy of their input to
+# int64, so the chunk bounds that copy (32 MiB) however large the storage.
+_DIGEST_CHUNK = 1 << 22
+
+
+def _semip_digest(view):
+    """Content checksum of a GPU storage, computed on the device: the sum of
+    its words and their position-weighted sum, so a permutation (reordered
+    indices) shows too.  Both wrap mod 2**64."""
+    flat = view.reshape(-1)
+    if flat.numel() % 4 == 0:
+        flat = flat.view(torch.int32)
+    n = flat.numel()
+    total = torch.zeros((), dtype=torch.int64, device=flat.device)
+    weighted = torch.zeros((), dtype=torch.int64, device=flat.device)
+    pos = torch.arange(1, min(n, _DIGEST_CHUNK) + 1, dtype=torch.int64,
+                       device=flat.device)
+    for start in range(0, n, _DIGEST_CHUNK):
+        chunk = flat[start:start + _DIGEST_CHUNK].to(torch.int64)
+        s = chunk.sum()
+        total += s
+        weighted += s * start + chunk.mul_(pos[:chunk.numel()]).sum()
+    return int(total.item()), int(weighted.item())
+
+
+def _semip_weight_like_digests(worker):
+    """Checksums of the weight-like storages outside named_parameters()."""
+    return {name: _semip_digest(view)
+            for name, view in _semip_param_tensors(worker).items() if ":s:" in name}
+
+
+def _semip_record_weight_digests(worker):
+    """At the end of init: what the weight-like storages hold before serving."""
+    worker._semip_weight_digests = _semip_weight_like_digests(worker)
+    return len(worker._semip_weight_digests)
+
+
+def _semip_check_weight_digests(worker):
+    """Weights do not change while the engine serves; scratch does.  A
+    weight-like storage whose contents changed since init (the dump's warm-up
+    generate ran in between) is moved to per-config state, so it cannot fork
+    the weight hash.
+
+    Once per process, and the verdict is taken before the storages are read:
+    a restored engine inherits it with the image, and its weights are still
+    asleep (unmapped) when it attaches."""
+    before = getattr(worker, "_semip_weight_digests", None)
+    if before is None or getattr(worker, "_semip_digests_checked", False):
+        return []
+    worker._semip_digests_checked = True
+    worker._semip_weight_digests = None
+    after = _semip_weight_like_digests(worker)
+    moved = sorted(n for n, d in after.items() if n in before and before[n] != d)
+    _semip_mark_volatile(worker, moved)
+    return moved
+
+
+def _semip_mark_volatile(worker, names):
+    """Treat ``names`` as state from now on.  Every rank gets the union of
+    what any rank saw change, so the ranks agree on what a weight is."""
+    worker._semip_volatile = set(getattr(worker, "_semip_volatile", ())) | set(names)
+    return len(worker._semip_volatile)
+
+
+def _semip_state_views(worker):
+    """``(name, view)`` of the weight-pool storages that are not weights."""
+    state = []
+    _semip_param_tensors(worker, state=state)
+    return state
+
+
+def _semip_stage_state(worker):
+    """Copy the non-weight weight-pool storages to host memory before a
+    level-2 sleep discards them.  The copy is part of the process, so it rides
+    the CRIU image with the config it belongs to."""
+    views = _semip_state_views(worker)
+    bufs = [torch.empty(v.numel(), dtype=torch.uint8) for _, v in views]
+    for buf, (_, view) in zip(bufs, views):
+        buf.copy_(view)
+    torch.cuda.synchronize()
+    worker._semip_state_bufs = (tuple(n for n, _ in views), bufs)
+    return sum(b.numel() for b in bufs)
+
+
+def _semip_restore_state(worker):
+    """Put the staged state back after restore_weights.  Nothing staged
+    (a cold start) leaves the storages as they are."""
+    staged = getattr(worker, "_semip_state_bufs", None)
+    if staged is None:
+        return 0
+    names, bufs = staged
+    views = _semip_state_views(worker)
+    if tuple(n for n, _ in views) != names or \
+            [b.numel() for b in bufs] != [v.numel() for _, v in views]:
+        raise RuntimeError("weight-pool state layout changed since it was staged")
+    for buf, (_, view) in zip(bufs, views):
+        view.copy_(buf)
+    torch.cuda.synchronize()
+    return sum(b.numel() for b in bufs)
+
+
+def _semip_layout(worker):
+    return [(name, d.nbytes, d.dtype, tuple(d.shape))
+            for name, d in _semip_param_tensors(worker).items()]
 
 
 def _semip_attach(worker):
@@ -591,7 +807,8 @@ def _semip_attach(worker):
     worker._semip_chunk_plan = None
     worker._semip_chunk_size = None
     worker._semip_pinned = False
-    return (total_size, len(layout))
+    storages = [nb for name, nb, _, _ in layout if ":s:" in name]
+    return (total_size, len(layout), len(storages), sum(storages))
 
 
 def _semip_stage(worker):
@@ -1054,8 +1271,43 @@ def _semip_load_weights(worker, weights_dir, io_workers=None):
 # ---------------------------------------------------------------------------
 
 
-_COMPILE_CACHE_ENVS = ("TRITON_CACHE_DIR", "VLLM_CACHE_ROOT",
-                       "TORCHINDUCTOR_CACHE_DIR", "FLASHINFER_WORKSPACE_BASE")
+# (env var, directory under <model_dir>/compilation). Every library here loads
+# what it compiled by path -- dlopen() of a .so, cuModuleLoad() of a .cubin --
+# so CRIU records the file and needs it at restore. Defaults are node-local:
+# ~/.triton, ~/.cache/vllm, /tmp/torchinductor_*, ~/.cache/flashinfer,
+# ~/.humming/cache, ~/.tilelang/cache, ~/.cache/tvm-ffi,
+# ~/.cache/torch_extensions, /tmp/<user>/quack_cache.
+#
+# DG_JIT_CACHE_DIR is where vLLM points DeepGEMM anyway (VLLM_CACHE_ROOT/
+# deep_gemm), but only once its lazy init runs; pinning it here covers a
+# DeepGEMM JIT that happens before that.
+_COMPILE_CACHE_DIRS = (
+    ("TRITON_CACHE_DIR", "triton"),
+    ("VLLM_CACHE_ROOT", "vllm"),
+    ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+    ("FLASHINFER_WORKSPACE_BASE", "flashinfer"),
+    ("DG_JIT_CACHE_DIR", os.path.join("vllm", "deep_gemm")),
+    ("HUMMING_CACHE_DIR", "humming"),
+    ("TILELANG_CACHE_DIR", "tilelang"),
+    ("TVM_FFI_CACHE_DIR", "tvm-ffi"),
+    ("TORCH_EXTENSIONS_DIR", "torch_extensions"),
+    ("QUACK_CACHE_DIR", "quack"),
+)
+_COMPILE_CACHE_ENVS = tuple(env for env, _ in _COMPILE_CACHE_DIRS)
+
+
+def _pin_compile_caches(model_dir):
+    """Point every JIT cache at ``<model_dir>/compilation/<name>``.
+
+    Has to run before vLLM is imported: FlashInfer resolves its root at import
+    and humming memoizes its cache dir on first use.
+    """
+    _compile_root = os.path.join(model_dir, "compilation")
+    for env, sub in _COMPILE_CACHE_DIRS:
+        cache_dir = os.path.join(_compile_root, sub)
+        os.environ[env] = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+    return _compile_root
 
 
 def _compile_cache_fingerprint(budget_s=2.0):
@@ -1184,7 +1436,10 @@ def _nccl_abort_comms_concurrent(targets, timeout=60.0, after_fire=None):
     abort deadlocks on DeepSeek-style overlapping world/tp/dp/ep comms: the
     shared per-rank proxy only drains once every comm's abort flag is set.  The
     ``after_fire`` hook sets the torch ProcessGroupNCCL abort flags while the
-    pynccl aborts are in flight, so all flags are set together."""
+    pynccl aborts are in flight, so all flags are set together.
+
+    Returns ``(results, stuck)``: ``stuck`` names the comms whose abort was
+    still running at the deadline."""
     import threading
     import time as _t
     results = {}
@@ -1208,7 +1463,8 @@ def _nccl_abort_comms_concurrent(targets, timeout=60.0, after_fire=None):
     deadline = _t.monotonic() + timeout
     for th in threads:
         th.join(max(0.0, deadline - _t.monotonic()))
-    return results
+    stuck = [nm for (nm, _ptr), th in zip(targets, threads) if th.is_alive()]
+    return results, stuck
 
 
 def _abort_torch_process_groups():
@@ -1317,6 +1573,12 @@ _MQ_PARK = {}
 # between mq_begin_unpark and mq_finish_unpark.
 _FOLLOWER = {}
 _UNPARK = {}
+
+# What the dump did with the captured graphs, as recorded into ``meta.json``:
+# ``graphs_dropped``, ``graphs_dropped_reason`` and ``graph_nccl_nodes``. Rides
+# into the image, so a restored child knows there is nothing to rebind; cleared
+# by a successful ``recapture_graphs``.
+_GRAPH_DROP = {}
 
 # Node identity when this child is one node-partition of a TP group that spans pods:
 # ``MultiNode.as_init_kwargs()``, set once at spawn.  ``None`` means
@@ -2003,9 +2265,13 @@ def _destroy_nccl(worker):
 
     Always graph-preserving: abort (unilateral ncclCommAbort) rather than
     collective-destroy, because a live captured graph pins the comm and the
-    MoE/EP topology would deadlock a collective destroy.  The graphs are always
-    preserved now, so the collective path is gone with the `full` mode that was
-    its only caller.
+    MoE/EP topology would deadlock a collective destroy.  The collective path
+    is gone with the `full` mode that was its only caller.
+
+    The abort itself still waits for any live graph holding one of the comm's
+    collectives, so graphs with NCCL kernels must be dropped first (see
+    ``drop_graphs_if_nccl``).  A comm whose abort outlives the deadline raises
+    here rather than riding into an image that cannot restore.
     """
     import torch.distributed as dist
 
@@ -2095,7 +2361,24 @@ def _destroy_nccl(worker):
                 group.mq_broadcaster = None
 
     if abort_targets:
-        _nccl_abort_comms_concurrent(abort_targets)
+        results, stuck = _nccl_abort_comms_concurrent(abort_targets)
+        if stuck:
+            # Never dump past this. The comm keeps its P2P/cuMem peer mappings,
+            # which cuCheckpointProcessCheckpoint accepts and
+            # cuCheckpointProcessRestore rejects with CUresult=801.
+            raise RuntimeError(
+                f"rank {getattr(worker, 'rank', '?')}: ncclCommAbort did not "
+                f"return for {', '.join(stuck)} within the deadline. NCCL waits "
+                f"for every CUDA graph that captured one of a comm's "
+                f"collectives to be destroyed (localPersistentRefs != 0), so "
+                f"the kept graphs likely captured NCCL collectives; they must "
+                f"be dropped before destroy_nccl. Dumping now would fail "
+                f"cuda_restore with CUresult=801.")
+        failed = {nm: r for nm, r in results.items()
+                  if r[0] != "ok" or r[1] != 0}
+        if failed:
+            print(f"[semip] rank {getattr(worker, 'rank', '?')} "
+                  f"ncclCommAbort reported {failed}", flush=True)
         for pynccl in abort_pynccls:
             pynccl.comm = None
 
@@ -2870,8 +3153,9 @@ def _prepare_worker_dump(worker):
     # PSM (IB/EFA) shm: do NOT munmap -- the mapping may still be referenced by
     # a live provider thread even after NCCL teardown, so munmap SIGSEGVs the
     # worker.  Instead unlink the /dev/shm/psm_* file while keeping the mapping;
-    # the inode stays alive so the worker is unaffected, and CRIU then captures
-    # the mapping as anonymous memory (no file to reopen on restore).
+    # the inode stays alive so the worker is unaffected, and CRIU then carries
+    # the file inside the image as a ghost (no file to reopen on restore).  The
+    # ghost must fit criu's --ghost-limit; see _shm_ghost_limit in worker.py.
     removed_psm = _unlink_paths(own_psm)
     return {"closed_fds": closed_fds, "unmapped": unmapped,
             "removed_psm": removed_psm,
@@ -2882,10 +3166,10 @@ def _prepare_worker_dump(worker):
 # CUDA graph handling around CRIU (worker-local, via collective_rpc).
 #
 # Graphs are preserved in the CRIU image and their stale CustomAllreduce
-# addresses are rewritten after reinit by ca_graph_rebind.  Nothing is ever
-# recaptured: the `full` path that dropped the graphs and rebuilt them with
-# capture_model() was retired 2026-09-24, along with the cleargraph primitive
-# that only it could reach.
+# addresses are rewritten after reinit by ca_graph_rebind -- unless they hold
+# NCCL kernels (always across nodes; single-node models whose graphs capture a
+# PyNccl collective), which ncclCommAbort cannot outlive.  Those are dropped
+# before destroy_nccl and recaptured after the restore.
 # ---------------------------------------------------------------------------
 def _semip_prepare_graph_reuse_snapshot(worker):
     """Cold-start hook: record the CA meta/buffer/rank_data snapshot the
@@ -2902,6 +3186,36 @@ def _semip_prepare_graph_reuse_snapshot(worker):
         return {"available": True, "ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+def _semip_cudagraphs_disabled(worker):
+    """True when vLLM was configured to capture no CUDA graphs at all.
+
+    ``enforce_eager`` is the catalog spelling (GLM-5.3 standard); vLLM turns it
+    into ``compilation_config.cudagraph_mode = NONE``, which is also reachable
+    directly, so both are read."""
+    cfg = getattr(worker, "vllm_config", None)
+    if getattr(getattr(cfg, "model_config", None), "enforce_eager", False):
+        return True
+    mode = getattr(getattr(cfg, "compilation_config", None),
+                   "cudagraph_mode", None)
+    return getattr(mode, "name", mode) == "NONE"
+
+
+def _semip_confirmed_graphless(worker):
+    """The census, if it proves this rank holds no captured graph; else None.
+
+    The config alone is not proof: it says what vLLM was asked for, not what
+    the process holds.  The census walks both registries and then the heap, so
+    zero from a scan that completed is the absence of a graph.  ``gc_scanned``
+    tells that apart from a heap scan that raised, whose zero proves nothing.
+    """
+    census = ca_graph_rebind.graph_exec_census(worker)
+    disc = census.get("discovery") or {}
+    if (census.get("ok") and census.get("n_graphs") == 0
+            and disc.get("gc_scanned")):
+        return census
+    return None
+
+
 def _semip_rebind_graphs(worker):
     """Repair preserved CUDA graphs against the post-restore runtime by rewriting
     the moved CustomAllreduce addresses (ca_graph_rebind).  No capture_model().
@@ -2914,6 +3228,13 @@ def _semip_rebind_graphs(worker):
     new addresses -- 144126 kernel argument slots and 16014 memcpy pointers per
     rank on that run.  No amount of dump-time warming can pre-empt that; the
     addresses only go stale after the restore.
+
+    An eager engine (``enforce_eager``, cudagraph mode NONE) has no graphs, so
+    nothing holds a pre-restore address: its all-reduces read the CA object
+    ``reinit_nccl`` just built.  The rebind would find nothing to patch and
+    report that as failure, so it is skipped -- but only once the census
+    confirms zero graphs.  A config that says eager while a graph exists goes
+    through the rebind and is judged by it like any other.
     """
     if _semip_tp_size(worker) <= 1:
         torch.cuda.synchronize()
@@ -2923,6 +3244,14 @@ def _semip_rebind_graphs(worker):
     if not _CA_REBIND_AVAILABLE or ca_graph_rebind is None:
         return {"ok": False, "error": "ca_graph_rebind unavailable",
                 "rank": getattr(worker, "rank", "?")}
+    if _semip_cudagraphs_disabled(worker):
+        census = _semip_confirmed_graphless(worker)
+        if census is not None:
+            torch.cuda.synchronize()
+            return {"ok": True, "recaptured": False,
+                    "skipped": "no_cuda_graphs",
+                    "n_graphs": census.get("n_graphs"),
+                    "rank": getattr(worker, "rank", "?")}
     ca_rebind = ca_graph_rebind.rebind_after_reinit(worker)
     torch.cuda.synchronize()
     return {"ok": bool(ca_rebind.get("ok")), "recaptured": False,
@@ -2947,11 +3276,12 @@ def _graph_wrappers():
 def _semip_drop_graphs(worker):
     """Destroy every captured CUDA graph and empty the containers holding them.
 
-    Across nodes vLLM has no custom all-reduce, so every all-reduce a graph
-    captured is an NCCL kernel, and ``ncclCommAbort`` does not return while a
-    graph that captured the communicator is alive. A multi-node dump therefore
-    drops the graphs before ``destroy_nccl``, and the restore captures them
-    again with ``capture_model()``.
+    ``ncclCommAbort`` does not return while a graph that captured the
+    communicator is alive. So a dump whose graphs hold NCCL kernels drops them
+    before ``destroy_nccl``, and the restore captures them again with
+    ``capture_model()``. That is every multi-node dump, where vLLM has no
+    custom all-reduce, and any single-node one whose graphs captured a PyNccl
+    collective (``_semip_nccl_graph_census``).
 
     On vLLM 0.30 the graphs sit in three places: the wrapper entries, the V2
     runner's manager, and piecewise segments reachable only through bound
@@ -3052,6 +3382,12 @@ def _semip_recapture_graphs(worker):
     happens the workspace refuses any allocation bigger than the current one.
     Unlocking first puts the recapture back in the state the cold-start capture
     ran in; ``capture_model()`` locks it again on the way out.
+
+    A single-node rank still has CustomAllreduce, and its stock capture exports
+    every activation it all-reduced through the legacy IPC API on exit, which
+    fails on the cuMem-backed memory sleep mode puts in play (the fault
+    ``install_force_copy_patch`` documents). The cold start captured on the
+    copy path for that reason, so the recapture does too.
     """
     rank = getattr(worker, "rank", "?")
     torch.cuda.synchronize()
@@ -3063,8 +3399,15 @@ def _semip_recapture_graphs(worker):
         unlocked = True
     except Exception:  # noqa: BLE001
         pass
+    ca_copy = bool(_CA_REBIND_AVAILABLE and ca_graph_rebind is not None
+                   and ca_graph_rebind._find_ca(worker) is not None
+                   and ca_graph_rebind.install_force_copy_patch())
     t0 = time.monotonic()
-    worker.model_runner.capture_model()
+    try:
+        worker.model_runner.capture_model()
+    finally:
+        if ca_copy:
+            ca_graph_rebind.restore_force_copy_patch()
     torch.cuda.synchronize()
     seconds = time.monotonic() - t0
     free_after = torch.cuda.mem_get_info()[0]
@@ -3087,11 +3430,97 @@ def _semip_recapture_graphs(worker):
     return {"ok": n_graphs > 0 and n_exec_ok == n_graphs, "rank": rank,
             "seconds": round(seconds, 2),
             "unlocked_workspace": unlocked,
+            "ca_copy_path": ca_copy,
             "used_mib": used_mib,
             "estimate_mib": (int(estimate) >> 20) if estimate else None,
             "free_after_mib": free_after >> 20,
             "n_graphs": n_graphs,
             "n_exec_ok": n_exec_ok}
+
+
+def _semip_nccl_graph_census(worker):
+    """This rank's count of NCCL kernel nodes in its kept graphs.
+
+    A config with graphs off is answered without a walk once the census proves
+    the rank graphless, the same proof ``_semip_rebind_graphs`` skips on.
+    """
+    rank = getattr(worker, "rank", "?")
+    if _semip_tp_size(worker) <= 1:
+        return {"ok": True, "complete": True, "rank": rank,
+                "n_nccl_nodes": 0, "skipped": "tp1"}
+    if not _CA_REBIND_AVAILABLE or ca_graph_rebind is None:
+        return {"ok": False, "complete": False, "rank": rank,
+                "incomplete_why": "ca_graph_rebind unavailable"}
+    if _semip_cudagraphs_disabled(worker):
+        if _semip_confirmed_graphless(worker) is not None:
+            return {"ok": True, "complete": True, "rank": rank,
+                    "n_graphs": 0, "n_nccl_nodes": 0,
+                    "skipped": "no_cuda_graphs"}
+    out = ca_graph_rebind.nccl_node_census(worker)
+    out["rank"] = rank
+    return out
+
+
+def _semip_graph_drop_decision(censuses, n_ranks):
+    """Whether the dump must drop its graphs, from every rank's NCCL census.
+
+    The meta fields the dump records: ``graphs_dropped``,
+    ``graphs_dropped_reason`` (``nccl_in_graphs`` / ``census_incomplete``) and
+    ``graph_nccl_nodes`` (rank -> count, None where the rank's census is not a
+    full reading). A rank with no reading counts as one holding NCCL: keeping
+    a graph that does stalls ``destroy_nccl`` and makes an unrestorable image,
+    while dropping one that does not only costs a recapture.
+    """
+    counts = {}
+    unknown = []
+    for i, c in enumerate(censuses or ()):
+        if not isinstance(c, dict):
+            unknown.append(str(i))
+            continue
+        rank = str(c.get("rank", i))
+        n = c.get("n_nccl_nodes")
+        n = n if isinstance(n, int) and not isinstance(n, bool) else None
+        complete = bool(c.get("ok") and c.get("complete")) and n is not None
+        # A partial walk that already found NCCL is a reading; its zero is not.
+        counts[rank] = n if (complete or n) else None
+        if not complete:
+            unknown.append(rank)
+    missing = max(0, int(n_ranks or 0) - len(censuses or ()))
+    if missing:
+        unknown.append(f"{missing} rank(s) unreported")
+    if any(n for n in counts.values()):
+        reason = "nccl_in_graphs"
+    elif unknown:
+        reason = "census_incomplete"
+    else:
+        reason = None
+    return {"graphs_dropped": reason is not None,
+            "graphs_dropped_reason": reason,
+            "graph_nccl_nodes": counts,
+            "census_unknown": unknown}
+
+
+def _semip_graph_drop_message(decision, censuses=()):
+    """The one line that says what the dump did with its graphs, and why."""
+    counts = decision.get("graph_nccl_nodes") or {}
+    known = {r: n for r, n in counts.items() if n is not None}
+    reason = decision.get("graphs_dropped_reason")
+    if reason == "nccl_in_graphs":
+        rank, n = next((r, v) for r, v in known.items() if v)
+        return (f"semi_p: kept graphs hold {n} NCCL kernel node(s) on rank "
+                f"{rank} (max {max(known.values())}); dropping graphs before "
+                f"destroy_nccl, restore will recapture. Per rank: {counts}")
+    if reason == "census_incomplete":
+        why = {str(c.get("rank", "?")): c.get("incomplete_why")
+               or c.get("error") for c in censuses or ()
+               if isinstance(c, dict) and not c.get("complete")}
+        return (f"semi_p: NCCL census of the kept graphs is incomplete on "
+                f"{decision.get('census_unknown')} ({why}); treating it as "
+                f"NCCL present, dropping graphs before destroy_nccl, restore "
+                f"will recapture. Per rank: {counts}")
+    return (f"semi_p: kept graphs hold no NCCL kernel nodes on any of "
+            f"{len(counts)} rank(s); keeping them for rebind_graphs. "
+            f"Per rank: {counts}")
 
 
 def _semip_graph_census(worker):
@@ -3357,12 +3786,11 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
         # the config is known.
         os.environ["SEMIP_MULTINODE_IFNAME"] = _mn_ifname
 
-    # JIT/compile caches (Triton, vLLM torch.compile, torch inductor,
-    # FlashInfer) all produce .so's that get dlopen()'d into the process.
-    # CRIU records those mappings by absolute path and requires the files
-    # to exist at restore; their defaults live in node-local dirs
-    # ($HOME/.triton, ~/.cache/vllm, /tmp/torchinductor_*), so on another
-    # node they are absent and restore fails with "Can't open file ...".
+    # JIT/compile caches (_COMPILE_CACHE_DIRS) all produce files that get
+    # mapped into the process. CRIU records those mappings by absolute path
+    # and requires the files to exist at restore; their defaults live in
+    # node-local dirs, so on another node they are absent and restore fails
+    # with "Can't open file ...".
     #
     # When the Instance supplies a model_dir, the cache lives at
     # <model_dir>/compilation -- embedded next to the CRIU image so the
@@ -3375,18 +3803,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
     # Must be set before vLLM (and FlashInfer, whose env module resolves
     # these at import) is imported.
     if model_dir:
-        _compile_root = os.path.join(model_dir, "compilation")
-        os.environ["TRITON_CACHE_DIR"] = os.path.join(_compile_root, "triton")
-        os.environ["VLLM_CACHE_ROOT"] = os.path.join(_compile_root, "vllm")
-        os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(
-            _compile_root, "inductor")
-        os.environ["FLASHINFER_WORKSPACE_BASE"] = os.path.join(
-            _compile_root, "flashinfer")
-        for _cache_dir in (os.environ["TRITON_CACHE_DIR"],
-                           os.environ["VLLM_CACHE_ROOT"],
-                           os.environ["TORCHINDUCTOR_CACHE_DIR"],
-                           os.environ["FLASHINFER_WORKSPACE_BASE"]):
-            os.makedirs(_cache_dir, exist_ok=True)
+        _pin_compile_caches(model_dir)
 
     # vLLM's own lines carry the replica tag too, since several replicas share
     # one pod log. Before vLLM is imported: its logger formats this in once.
@@ -4105,10 +4522,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     # Compile-cache roots: CRIU bakes the resulting .so
                     # paths into the image, so a user override here would
                     # make the image unrestorable.
-                    "TRITON_CACHE_DIR",
-                    "VLLM_CACHE_ROOT",
-                    "TORCHINDUCTOR_CACHE_DIR",
-                    "FLASHINFER_WORKSPACE_BASE",
+                    *_COMPILE_CACHE_ENVS,
                 }
                 for k, v in (vllm_config.pop("_env", None) or {}).items():
                     if k in _RESERVED_ENV:
@@ -4311,10 +4725,32 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                              for c in _cold])
                     log.info("  compile cache before dump: %s",
                              _compile_cache_fingerprint())
+                try:
+                    llm.collective_rpc(_semip_record_weight_digests)
+                except Exception:  # noqa: BLE001 - the check is best effort
+                    log.warning("  weight-like storage checksums failed; "
+                                "skipping the volatility check", exc_info=True)
 
             elif cmd == "attach":
                 if llm is None:
                     raise RuntimeError("attach requires init first")
+                try:
+                    _moved = sorted(set().union(
+                        *llm.collective_rpc(_semip_check_weight_digests)))
+                    if _moved:
+                        llm.collective_rpc(_semip_mark_volatile, args=(_moved,))
+                        log.warning(
+                            "  %d storage(s) outside named_parameters() look like "
+                            "weights by name but changed between init and attach "
+                            "(the warm-up generate wrote them), so they are staged "
+                            "as per-config state, not into the weight set (narrow "
+                            "_WEIGHT_LIKE_PATH so it does not match them): "
+                            "%s%s", len(_moved), _moved[:8],
+                            " ..." if len(_moved) > 8 else "")
+                except Exception:  # noqa: BLE001 - the check is best effort
+                    log.warning("  weight-like storage volatility check failed; "
+                                "scratch named like a weight may be in the "
+                                "weight set", exc_info=True)
                 # Each worker allocates a plain (unpinned) CPU buffer sized to
                 # its own shard and records the param layout on itself; pinning
                 # is the explicit repin step.  Per-worker byte counts are
@@ -4328,6 +4764,11 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 info["max_pinned_bytes_per_worker"] = max(worker_bytes, default=0)
                 log.info("  attached %.2f GiB across %d worker(s)",
                          total_size / 2**30, len(results))
+                if any(r[2] for r in results):
+                    log.info("  of it %.2f GiB in %d weight storage(s) outside "
+                             "named_parameters()",
+                             sum(r[3] for r in results) / 2**30,
+                             sum(r[2] for r in results))
 
             elif cmd == "attach_pinned":
                 raise RuntimeError(
@@ -4366,6 +4807,10 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 if _served_core is not None and _lora_enabled():
                     staged = sum(llm.collective_rpc(_semip_stage_lora))
                     log.info("  staged %.2f MiB of LoRA state", staged / 2**20)
+                staged = sum(llm.collective_rpc(_semip_stage_state))
+                if staged:
+                    log.info("  staged %.2f MiB of weight-pool state outside "
+                             "the weight set", staged / 2**20)
                 # "keep", not the default "abort": the engine is drained, so
                 # the two pause the same, and the routed-experts connector
                 # refuses the cache reset an "abort" pause makes.
@@ -4472,6 +4917,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 if _lora_enabled():
                     lora_bytes = sum(llm.collective_rpc(_semip_restore_lora))
                     log.info("  restored %.2f MiB of LoRA state", lora_bytes / 2**20)
+                state_bytes = sum(llm.collective_rpc(_semip_restore_state))
+                if state_bytes:
+                    log.info("  restored %.2f MiB of weight-pool state", state_bytes / 2**20)
 
             elif cmd == "wake_up_kv_cache":
                 llm.wake_up(tags=["kv_cache"])
@@ -5044,6 +5492,13 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
             elif cmd == "rebind_graphs":
                 if llm is None:
                     raise RuntimeError("rebind_graphs requires init/load first")
+                if _GRAPH_DROP.get("graphs_dropped"):
+                    raise RuntimeError(
+                        "rebind_graphs: the dump dropped this engine's graphs "
+                        "before destroy_nccl (reason: "
+                        f"{_GRAPH_DROP.get('graphs_dropped_reason')}), so there "
+                        "is nothing to rebind. Call recapture_graphs() after "
+                        "wake_up_kv_cache().")
                 results = llm.collective_rpc(_semip_rebind_graphs)
                 failures = [r for r in results
                             if not (isinstance(r, dict) and r.get("ok", False))]
@@ -5058,9 +5513,9 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 # there was no way to see what it thought it had done.
                 for _r in results:
                     if isinstance(_r, dict):
-                        log.info("    rebind rank=%s ok=%s ca_rebind=%s",
+                        log.info("    rebind rank=%s ok=%s skipped=%s ca_rebind=%s",
                                  _r.get("rank", "?"), _r.get("ok"),
-                                 _r.get("ca_rebind"))
+                                 _r.get("skipped"), _r.get("ca_rebind"))
                 # Verify the rebind before live traffic sees it.  This used to
                 # be a warmup, on the premise that "restore drops most
                 # cudaGraphExec handles" and they had to be re-instantiated in
@@ -5096,7 +5551,16 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                             if not (isinstance(r, dict) and r.get("ok"))]
                 if failures:
                     raise RuntimeError(f"semip {cmd} failed: {failures}")
+                if cmd == "drop_graphs":
+                    _GRAPH_DROP.clear()
+                    _GRAPH_DROP.update(
+                        graphs_dropped=True,
+                        graphs_dropped_reason=kwargs.get("reason")
+                        or "requested",
+                        graph_nccl_nodes=None)
+                    info["graph_drop"] = dict(_GRAPH_DROP)
                 if cmd == "recapture_graphs":
+                    _GRAPH_DROP.clear()
                     # G5: what the capture cost against what the cold start
                     # reserved for it, and what is left.  One line, because the
                     # ranks differ only in the low tens of MiB and the useful
@@ -5117,6 +5581,42 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                             _est if _est is not None else "?",
                             min(r.get("free_after_mib") or 0 for r in _ok))
                 info[cmd] = results
+
+            elif cmd == "drop_graphs_if_nccl":
+                if llm is None:
+                    raise RuntimeError(f"{cmd} requires init/load first")
+                try:
+                    _expected = int(llm.llm_engine.vllm_config
+                                    .parallel_config.world_size)
+                except Exception:  # noqa: BLE001
+                    _expected = 0
+                try:
+                    censuses = list(llm.collective_rpc(
+                        _semip_nccl_graph_census))
+                except Exception:  # noqa: BLE001 - an absent reading drops
+                    log.warning("  NCCL graph census failed", exc_info=True)
+                    censuses = []
+                for _c in censuses:
+                    log.info("  nccl census %s", _c)
+                decision = _semip_graph_drop_decision(censuses, _expected)
+                log.info("  %s", _semip_graph_drop_message(decision, censuses))
+                if decision["graphs_dropped"]:
+                    results = llm.collective_rpc(_semip_drop_graphs)
+                    for _r in results:
+                        log.info("  drop_graphs %s", _r)
+                    failures = [r for r in results
+                                if not (isinstance(r, dict) and r.get("ok"))]
+                    if failures:
+                        raise RuntimeError(
+                            "semip drop_graphs failed ("
+                            f"{decision['graphs_dropped_reason']}): {failures}")
+                    info["drop_graphs"] = results
+                _GRAPH_DROP.clear()
+                _GRAPH_DROP.update(
+                    {k: decision[k] for k in ("graphs_dropped",
+                                              "graphs_dropped_reason",
+                                              "graph_nccl_nodes")})
+                info["graph_drop"] = dict(_GRAPH_DROP)
 
             elif cmd == "save_weights":
                 if llm is None:

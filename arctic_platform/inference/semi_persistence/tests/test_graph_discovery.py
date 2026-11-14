@@ -633,6 +633,67 @@ def test_the_switch_is_off_unless_the_env_says_otherwise():
     assert calls == ["mnnvl"]
 
 
+def _add_vllm_getter(mod, collectives):
+    """vLLM 0.32's getter shape: cached workspace or failed flag short-circuits,
+    otherwise a CPU-group collective resolves the backend before allocating."""
+    mod._fi_ar_workspace = None
+    mod._fi_ar_workspace_failed = False
+    mod._fi_ar_quant_workspace_failed = False
+
+    def get_fi_ar_workspace(**kwargs):
+        if mod._fi_ar_workspace is not None or mod._fi_ar_workspace_failed:
+            return mod._fi_ar_workspace
+        collectives.append("node_count")
+        mod._fi_ar_workspace = mod._create_workspace("mnnvl", 8, 0)
+        return mod._fi_ar_workspace
+
+    mod.get_fi_ar_workspace = get_fi_ar_workspace
+
+
+def test_suppress_reaches_a_caller_that_imported_the_getter_before_the_probe(monkeypatch):
+    """Job 198ef66e: `fused_allreduce_rms_norm` binds `get_fi_ar_workspace` by
+    name at import. On TP0 that binding predated the probe, so TP0 alone
+    entered the backend collective and TP1-7, refused by the wrapper, never
+    joined. The failed flag is read inside the real getter, so it holds either
+    way."""
+    monkeypatch.setenv("SEMIP_SUPPRESS_FI_AR_WORKSPACE", "1")
+    collectives = []
+    with _fake_fiar() as (mod, calls):
+        _add_vllm_getter(mod, collectives)
+        bound_early = mod.get_fi_ar_workspace
+        out = cgr.install_fi_ar_workspace_probe()
+        assert out["latched"] == ["_fi_ar_workspace_failed", "_fi_ar_quant_workspace_failed"]
+        assert bound_early(world_size=8) is None
+        assert mod.get_fi_ar_workspace(world_size=8) is None
+    assert collectives == [] and calls == [], "a rank entered the collective or allocated"
+
+
+def test_the_latch_outlives_the_probe(monkeypatch):
+    """An eager model asks for the workspace on every forward, long after the
+    warmup window withdraws the wrappers; it must still get None."""
+    monkeypatch.setenv("SEMIP_SUPPRESS_FI_AR_WORKSPACE", "1")
+    collectives = []
+    with _fake_fiar() as (mod, calls):
+        _add_vllm_getter(mod, collectives)
+        original = mod.get_fi_ar_workspace
+        cgr.install_fi_ar_workspace_probe()
+        cgr.restore_fi_ar_workspace_probe()
+        assert mod.get_fi_ar_workspace is original
+        assert mod._fi_ar_workspace_failed and mod._fi_ar_quant_workspace_failed
+        assert original(world_size=8) is None
+    assert collectives == [] and calls == []
+
+
+def test_no_latch_without_the_switch():
+    collectives = []
+    with _fake_fiar() as (mod, calls):
+        _add_vllm_getter(mod, collectives)
+        assert cgr.install_fi_ar_workspace_probe()["latched"] == []
+        assert mod._fi_ar_workspace_failed is False
+        assert mod.get_fi_ar_workspace(world_size=8) == "ws:mnnvl"
+    assert collectives == ["node_count"] and calls == ["mnnvl"]
+
+
 def _worker_method_src(name):
     tree = ast.parse(open(_WORKER).read())
     for node in ast.walk(tree):

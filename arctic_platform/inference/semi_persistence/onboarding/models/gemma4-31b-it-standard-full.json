@@ -1,0 +1,18 @@
+{
+  "name": "gemma4-31b-it-standard-full",
+  "description": "google/gemma-4-31B-it, TP=1, 1 replica(s) on 1 GPU(s); catalog gemma-4-31b-it/standard/h200-inference-full.json",
+  "sub_job": {
+    "job_type": "sampling",
+    "model_name": "google/gemma-4-31B-it",
+    "dtype": "bfloat16",
+    "seed": 42,
+    "inference_config": {
+      "max_seq_len": 65536,
+      "n_gpus": 1,
+      "vllm_config": {
+        "tensor_parallel_size": 1,
+        "gpu_memory_utilization": 0.8
+      }
+    }
+  }
+}
