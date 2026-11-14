@@ -26,6 +26,7 @@ import os
 import sys
 import time
 import traceback
+from contextlib import ExitStack
 from contextlib import contextmanager
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
@@ -537,19 +538,20 @@ def _regression_gateway(args, *, runtime_admission: dict | None = None):
     if not getattr(args, "_automatic_cortex_gateway", False):
         yield None
         return
-    if not getattr(args, "_automatic_checkpoint_bridge", False):
-        with local_cortex_gateway(
-            Path(args.out),
-            gateway_module="arctic_platform.correctness.harness.gateway",
-            **({"runtime_admission": runtime_admission} if runtime_admission is not None else {}),
-        ) as url:
-            yield url
-        return
-    from arctic_platform.correctness.harness.cortex import local_checkpoint_bridge
+    with ExitStack() as stack:
+        if getattr(args, "_automatic_checkpoint_bridge", False):
+            from arctic_platform.correctness.harness.cortex import local_checkpoint_bridge
 
-    with local_checkpoint_bridge():
-        with local_cortex_gateway(Path(args.out), gateway_module="arctic_platform.correctness.harness.gateway") as url:
-            yield url
+            stack.enter_context(local_checkpoint_bridge())
+        with console.activity("Starting Arctic Platform gateway"):
+            url = stack.enter_context(
+                local_cortex_gateway(
+                    Path(args.out),
+                    gateway_module="arctic_platform.correctness.harness.gateway",
+                    **({"runtime_admission": runtime_admission} if runtime_admission is not None else {}),
+                )
+            )
+        yield url
 
 
 def _validate_regression_tokens(args) -> int | None:
@@ -1143,6 +1145,8 @@ def run_batch(args, *, selected, executor=None):
                 groups.append([case])
     print(f"Selected {len(selected)} configuration/test pair(s); running sequentially.", flush=True)
     print("Selected tests: " + ", ".join(dict.fromkeys(case.test_id for case in selected)), flush=True)
+    print(f"Complete execution log (available during the run): {out / 'full.log'}", flush=True)
+    progress_stream = sys.stdout
     with (out / "full.log").open("w", encoding="utf-8") as log:
         for index, group in enumerate(groups):
             log.flush()
@@ -1166,7 +1170,8 @@ def run_batch(args, *, selected, executor=None):
                     specs.update(reviewed)
                     execution.update(metadata)
 
-                with _saved_output(log):
+                label = f"{group[0].config_id} / {', '.join(run_args.test)}"
+                with console.RunProgress(label, stream=progress_stream), _saved_output(log):
                     try:
                         _run_configs(run_args, executor=executor, snapshot=collect)
                     except KeyboardInterrupt:

@@ -47,6 +47,8 @@ python -m arctic_platform.correctness onboard \
 
 ## Checks
 
+**Execution reports the active configuration and test before backend work starts.** After `Selected tests`, the command prints the complete log path, preparation status, and gateway or test-arm phases as they begin. While a phase is waiting, a status line appears every 30 seconds with elapsed time. These lines confirm that the controller is waiting, not that a remote backend is healthy or making numerical progress. Detailed output stays in `full.log`, available during the run; completion and failure diagnostics retain their existing format.
+
 **Seven correctness tests are registered.** Config-only selection includes every applicable check. An explicit check ID selects that workload without changing its inputs, precision or reviewed gate.
 
 | Check ID | Comparison |

@@ -2338,6 +2338,146 @@ def test_console_activity_prints_one_progress_line_when_output_is_not_interactiv
     assert stream.getvalue() == "  Running Arctic Platform gas1 ...\n"
 
 
+def test_console_run_progress_reports_phases_outside_the_saved_log(tmp_path):
+    stream = io.StringIO()
+    with (tmp_path / "full.log").open("w") as log:
+        with execution.console.RunProgress("recipe / single-step-grads", stream=stream):
+            with execution._saved_output(log):
+                print("private execution details")
+                with execution.console.activity("Starting Arctic Platform gateway"):
+                    with execution.console.activity("Running Arctic Platform gas1"):
+                        print("private tensor measurements")
+    output = stream.getvalue()
+    assert "recipe / single-step-grads: Preparing configuration" in output
+    assert "recipe / single-step-grads: Starting Arctic Platform gateway" in output
+    assert "recipe / single-step-grads: Running Arctic Platform gas1" in output
+    assert "private" not in output
+    saved = (tmp_path / "full.log").read_text()
+    assert "private execution details" in saved
+    assert "Running Arctic Platform gas1" in saved
+    assert "private tensor measurements" in saved
+    assert execution.console._RUN_PROGRESS.get() is None
+
+
+def test_console_run_progress_periodic_wait_stops_when_the_context_exits():
+    import threading
+
+    notified = threading.Event()
+
+    class Stream(io.StringIO):
+        def write(self, value):
+            count = super().write(value)
+            if "backend completion not yet reported" in value:
+                notified.set()
+            return count
+
+    stream = Stream()
+    clock = [100.0]
+    progress = execution.console.RunProgress(
+        "recipe / single-step-grads", stream=stream, interval=0.01, clock=lambda: clock[0]
+    )
+    with progress:
+        clock[0] = 165.0
+        with execution.console.activity("Running Arctic Platform gas4", stream=None):
+            assert notified.wait(2)
+    assert "Still waiting: recipe / single-step-grads; Running Arctic Platform gas4" in stream.getvalue()
+    assert "elapsed 00:01:05" in stream.getvalue()
+    assert progress._thread is not None and not progress._thread.is_alive()
+    assert execution.console._RUN_PROGRESS.get() is None
+
+
+@pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt])
+def test_console_run_progress_restores_context_and_joins_after_failure(error):
+    progress = execution.console.RunProgress("recipe / test", stream=io.StringIO())
+    with pytest.raises(error):
+        with progress:
+            raise error("synthetic failure")
+    assert progress._thread is not None and not progress._thread.is_alive()
+    assert execution.console._RUN_PROGRESS.get() is None
+
+
+def test_console_run_progress_nested_activity_restores_the_waiting_phase():
+    progress = execution.console.RunProgress("recipe / test", stream=io.StringIO())
+    with progress:
+        initial_phase = progress.phase
+        with execution.console.activity("Starting Arctic Platform gateway"):
+            assert progress.phase == "Starting Arctic Platform gateway"
+            with execution.console.activity("Running Arctic Platform gas1"):
+                assert progress.phase == "Running Arctic Platform gas1"
+            assert progress.phase == "Starting Arctic Platform gateway"
+        assert progress.phase == initial_phase
+
+
+def test_console_run_progress_restores_context_if_reporting_thread_cannot_start(monkeypatch):
+    def fail(thread):
+        raise RuntimeError("synthetic thread startup failure")
+
+    monkeypatch.setattr(execution.console.threading.Thread, "start", fail)
+    progress = execution.console.RunProgress("recipe / test", stream=io.StringIO())
+    with pytest.raises(RuntimeError, match="synthetic thread startup failure"):
+        with progress:
+            pytest.fail("execution must not start")
+    assert execution.console._RUN_PROGRESS.get() is None
+
+
+def test_console_run_progress_blocked_output_does_not_block_context_cleanup():
+    import threading
+
+    blocked = threading.Event()
+    release = threading.Event()
+
+    class Stream(io.StringIO):
+        def write(self, value):
+            if "Still waiting:" in value:
+                blocked.set()
+                release.wait(5)
+            return super().write(value)
+
+    progress = execution.console.RunProgress("recipe / test", stream=Stream(), interval=0.01)
+    try:
+        with pytest.raises(RuntimeError, match="synthetic backend failure"):
+            with progress:
+                assert blocked.wait(2)
+                progress.update("Backend cleanup", announce=False)
+                raise RuntimeError("synthetic backend failure")
+        assert progress._stop.is_set()
+        assert progress._thread is not None and progress._thread.is_alive()
+        assert execution.console._RUN_PROGRESS.get() is None
+    finally:
+        release.set()
+        if progress._thread is not None:
+            progress._thread.join(timeout=2)
+    assert not progress._thread.is_alive()
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_console_run_progress_reports_automatic_gateway_startup(monkeypatch, tmp_path, checkpoint):
+    stream = io.StringIO()
+    progress = execution.console.RunProgress("recipe / test", stream=stream)
+    observed = []
+    admission = {"fixture": "reviewed"}
+
+    @contextmanager
+    def gateway(directory, **options):
+        assert progress.phase == "Starting Arctic Platform gateway"
+        assert directory == tmp_path
+        assert options["runtime_admission"] is admission
+        observed.append("start")
+        yield "http://127.0.0.1:1234"
+        observed.append("stop")
+
+    monkeypatch.setattr(execution, "local_cortex_gateway", gateway)
+    monkeypatch.setattr(cortex_fixture, "local_checkpoint_bridge", nullcontext)
+    args = SimpleNamespace(_automatic_cortex_gateway=True, _automatic_checkpoint_bridge=checkpoint, out=tmp_path)
+    with progress:
+        initial_phase = progress.phase
+        with execution._regression_gateway(args, runtime_admission=admission) as url:
+            assert url == "http://127.0.0.1:1234"
+            assert progress.phase == initial_phase
+    assert observed == ["start", "stop"]
+    assert "recipe / test: Starting Arctic Platform gateway" in stream.getvalue()
+
+
 def test_console_passing_gate_reports_passed_tensors() -> None:
     result = Result(
         test_id="single-step-grads",
@@ -3581,7 +3721,7 @@ def test_operator_batch_total_runtime_is_last_after_reports_and_failure_guidance
     tmp_path, monkeypatch, capsys, verdict
 ):
     _operator_api_fake_batches(monkeypatch, [verdict])
-    ticks = iter([100.0, 165.0, 167.01])
+    ticks = iter([100.0, 100.0, 165.0, 167.01])
     monkeypatch.setattr(execution.time, "monotonic", lambda: next(ticks))
     result = api.run(
         api.RunRequest(config=_operator_api_CONFIG, tests=(_operator_api_TEST,)),
@@ -3591,6 +3731,8 @@ def test_operator_batch_total_runtime_is_last_after_reports_and_failure_guidance
     assert lines[-1] == "Total run time: 00:01:08"
     assert sum(line.startswith("Total run time:") for line in lines) == 1
     assert f"Selected tests: {_operator_api_TEST}" in lines
+    assert any("Complete execution log (available during the run):" in line for line in lines)
+    assert any(f"{_operator_api_CONFIG} / {_operator_api_TEST}: Preparing configuration" in line for line in lines)
     assert any(line.startswith("Report:") for line in lines[:-1])
     if isinstance(verdict, Exception):
         assert lines[-2].startswith("Action required:")
