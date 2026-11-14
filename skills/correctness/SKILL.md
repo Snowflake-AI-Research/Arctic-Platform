@@ -19,6 +19,8 @@ description: Implement, debug, onboard, and validate the Arctic Platform correct
 
 ## Onboarding And Regression
 
+**Full-model checkpoint admission is automatic, not a manual model-table edit.** The selected local full-model onboarding captures `original-model.json` beside the config's per-test reference folders, binding the unchanged recipe and the resolved original checkpoint's files and tensor schema. Preserve that compact record with the successful references and forward the same reference-root override to regression. Regression verifies the record without publishing one, and changed assets or a different source are errors. Reduced first-two onboarding does not require this full-model record. Identity capture does not establish model implementation support, test applicability or a numerical pass; retain the existing prerequisites and reviewed gates.
+
 **An onboarding request needs only the configs and tests to onboard.** Discover the execution context, run the selected tests independently, prepare their compatible references and maintain `correctness-progress.md` using [the exact report template](references/group-report-format.md). Add requested configs with pending `?` outcomes before execution; preserve compatible prior successes. These are skill responsibilities, not extra instructions the operator must repeat. Respect supplied GPU-job details and existing authorization boundaries.
 
 ### Multi-Node Job Operation
@@ -116,6 +118,8 @@ description: Implement, debug, onboard, and validate the Arctic Platform correct
 **End the report with exactly `## Add finished work`, once after all groups and runtime tallies.** Include a config only when at least one selected test is successfully onboarded with compatible current config, source, fixture, reference and gate identities. Include that test's reference directory only when every required gradient accumulation step (GAS) arm and every selected placement is `P`; `PF`, `PP(8) | ??(16)`, failed, pending, inapplicable or stale evidence is not eligible. Another selected test's failure does not exclude an independently successful test's config or references.
 
 **List explicit successful paths, never whole trees.** Replace every placeholder below with the actual config path and mirrored `reference_data/<model>/<sequence>/<recipe>/<test-id>/` directory. Include each config once and only its successful selected tests' reference directories; remove unselected or unsuccessful test lines. Never include `correctness-progress.md`, an entire `configs/`, `reference_data/` or recipe directory, unrelated files, logs or scratch. When nothing qualifies, retain the final heading without a command block. The following block illustrates the selection when both first-two tests qualify; it does not claim they passed.
+
+**Include the original identity for a successful full-model test.** Add the explicit `reference_data/<model>/<sequence>/<recipe>/original-model.json` path when publishing a successful local full-model E2E or inference test. Regression needs that config-level identity as well as the test's compact references. Do not add it for reduced-fixture tests or publish an identity alone as a numerical success.
 
 **The commands are instructions for manual publication, not actions to execute from the template.** Rendering or updating the report does not authorize staging, committing or pushing. Before separately authorized execution, review the Git index so the commit contains only the intended successful artifacts.
 
