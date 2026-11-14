@@ -52,6 +52,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import replace
 from decimal import ROUND_CEILING
@@ -3663,6 +3664,518 @@ def test_operator_api_test_only_selects_all_reviewed_configs_in_order():
     assert [case.config_id for case in selected] == sorted(api.catalog())
     assert all((case.test_id == _operator_api_TEST for case in selected))
     assert len(set(selected)) == len(selected)
+
+
+def _onboarding_status_request(root, *, tests=("single-step-grads",), config=_operator_api_CONFIG):
+    return api.RunRequest(config=config, tests=tests, config_dir=root / "configs")
+
+
+def _onboarding_status_record(root, test_id="single-step-grads", *, combined=False):
+    path = api.catalog(root / "configs")[_operator_api_CONFIG]
+    cfg = load_config(path)
+    spec = ConfigSpec.read(root / "specs" / f"{cfg.config_id}.json")
+    ctx = SimpleNamespace(cfg=cfg, spec=spec, reference_records_dir=root / "reference_data")
+    paths = []
+    for arm in spec.arms:
+        identity = {
+            "schema": records.SCHEMA_VERSION,
+            "check_id": test_id,
+            "criterion": records.CRITERIA[test_id],
+            "config_id": cfg.config_id,
+            "config_checksum": spec.config_checksum,
+            "parameter_name_map": spec.param_name_map,
+            "recipe": {
+                "arm": arm.name,
+                "optimizer": {} if combined else None,
+                "synthetic_inputs": {"rows": arm.global_batch_size, "max_seq_len": arm.max_seq_len},
+            },
+        }
+        if test_id == "single-step-grads":
+            identity["gate"] = asdict(spec.test_tolerances[test_id])
+        destination = records._record_path(ctx, identity)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(records._record_bytes(identity, _reference_records_measurements(test_id)))
+        paths.append(destination)
+    return paths
+
+
+@pytest.mark.usefixtures("_operator_api_catalog")
+def test_onboarding_status_queries_every_registered_pair_and_deduplicates_filters(_operator_api_catalog):
+    request = _onboarding_status_request(_operator_api_catalog, tests=(), config=None)
+    statuses = api.onboarding_status(request)
+    assert len(statuses) == 3 * len(registered_tests())
+    assert len({(item.config_id, item.test_id) for item in statuses}) == len(statuses)
+    request = _onboarding_status_request(_operator_api_catalog, tests=("single-step-grads",) * 2)
+    assert len(api.onboarding_status(request)) == 1
+    assert api.onboarding_status(request)[0].references.state == "missing"
+    assert "rerun onboarding" in api.onboarding_status(request)[0].references.reason
+    assert api.onboarding_status(request)[0].historical.state == "missing"
+
+
+@pytest.mark.parametrize(
+    "fault,expected",
+    [
+        ("missing", "missing"),
+        ("checksum", "stale"),
+        ("identity", "stale"),
+        ("cases", "stale"),
+        ("attention", "stale"),
+        ("malformed", "malformed"),
+        ("duplicates", "malformed"),
+        ("unknown", "malformed"),
+        ("tolerance", "not_reviewed"),
+        ("decimal", "malformed"),
+    ],
+)
+def test_onboarding_status_missing_stale_and_malformed_specs(_operator_api_catalog, fault, expected):
+    root = _operator_api_catalog
+    path = root / "specs" / f"{_operator_api_CONFIG}.json"
+    raw = json.loads(path.read_text())
+    if fault == "missing":
+        path.unlink()
+    elif fault == "malformed":
+        path.write_text("{broken")
+    else:
+        if fault == "checksum":
+            raw["config_checksum"] = "stale"
+        elif fault == "identity":
+            raw["config_id"] = "other"
+        elif fault == "cases":
+            raw["arms"][0]["global_batch_size"] += 1
+        elif fault == "attention":
+            raw["attn_implementations"] = ["sdpa"]
+        elif fault == "duplicates":
+            raw["applicable_tests"] *= 2
+        elif fault == "unknown":
+            raw["applicable_tests"].append("unknown")
+        elif fault == "tolerance":
+            raw["test_tolerances"].pop("single-step-grads")
+        elif fault == "decimal":
+            raw["test_tolerances"]["single-step-grads"]["computed_gate"] = "invalid"
+        path.write_text(json.dumps(raw))
+    result = api.onboarding_status(_onboarding_status_request(root))[0]
+    assert result.spec.state == expected
+    assert result.status == expected
+    assert result.reason
+
+
+def test_onboarding_status_missing_specs_are_not_hidden_from_catalog(_operator_api_catalog):
+    root = _operator_api_catalog
+    (root / "specs" / f"{_operator_api_CONFIG}.json").unlink()
+    assert _operator_api_CONFIG not in api.catalog(root / "configs")
+    statuses = api.onboarding_status(_onboarding_status_request(root, config=None))
+    assert any(item.config_id == _operator_api_CONFIG and item.spec.state == "missing" for item in statuses)
+
+
+@pytest.mark.parametrize("fault", [None, "checksum", "identity", "shape", "gate", "scalar", "json", "duplicate"])
+def test_onboarding_status_reference_metadata_is_checked_without_claiming_readiness(_operator_api_catalog, fault):
+    root = _operator_api_catalog
+    paths = _onboarding_status_record(root)
+    raw = json.loads(paths[0].read_text())
+    if fault == "checksum":
+        raw["payload_sha256"] = "corrupt"
+    elif fault == "identity":
+        raw["identity"]["config_checksum"] = "old"
+    elif fault == "shape":
+        raw["identity"]["recipe"]["synthetic_inputs"]["rows"] += 1
+    elif fault == "gate":
+        raw["identity"]["gate"]["absolute"] += 0.1
+    elif fault == "scalar":
+        raw["measurements"].pop("grad_norms")
+        raw["payload_sha256"] = records._digest(raw["measurements"])
+    if fault == "json":
+        paths[0].write_text("[]")
+    elif fault == "duplicate":
+        paths[0].write_text('{"schema":1,"schema":1}')
+    else:
+        paths[0].write_text(json.dumps(raw))
+    result = api.onboarding_status(_onboarding_status_request(root))[0]
+    expected = (
+        "metadata_valid" if fault is None else "stale" if fault in {"identity", "shape", "gate"} else "malformed"
+    )
+    assert result.references.state == expected
+    assert result.status == expected
+    if fault is None:
+        assert "not proof" in result.reason
+        assert "full workload/runtime identity not checked" in result.references.reason
+        assert len(result.references.paths) == 2
+
+
+@pytest.fixture
+def _onboarding_status_scoped_paths(monkeypatch):
+    ordinary_path = records._record_path
+
+    def scoped_path(ctx, identity):
+        path = ordinary_path(ctx, identity)
+        rows = identity.get("recipe", {}).get("synthetic_inputs", {}).get("rows")
+        if rows is None or path.parent.name.startswith("rows-per-gas-"):
+            return path
+        gas = int(path.stem.removeprefix("gas"))
+        return path.parent / f"rows-per-gas-{rows // gas}" / path.name
+
+    monkeypatch.setattr(records, "_record_path", scoped_path)
+
+
+@pytest.mark.usefixtures("_onboarding_status_scoped_paths")
+@pytest.mark.parametrize("test_id", ["single-step-grads", "single-step-optimizer"])
+@pytest.mark.parametrize("layout", ["scoped", "unscoped"])
+def test_onboarding_status_reads_scoped_or_older_complete_reference_set(_operator_api_catalog, test_id, layout):
+    root = _operator_api_catalog
+    paths = _onboarding_status_record(root, test_id)
+    if layout == "unscoped":
+        older_paths = [path.parent.parent / path.name for path in paths]
+        for path, older in zip(paths, older_paths):
+            path.rename(older)
+        paths[0].parent.rmdir()
+        paths = older_paths
+    before = {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in root.rglob("*") if path.is_file()}
+    result = api.onboarding_status(_onboarding_status_request(root, tests=(test_id,)))[0]
+    assert result.references.state == "metadata_valid"
+    assert result.references.paths == tuple(map(str, paths))
+    assert {
+        str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in root.rglob("*") if path.is_file()
+    } == before
+
+
+@pytest.mark.usefixtures("_onboarding_status_scoped_paths")
+@pytest.mark.parametrize("test_id", ["single-step-grads", "single-step-optimizer"])
+@pytest.mark.parametrize(
+    "fault,expected", [("missing", "missing"), ("empty", "missing"), ("json", "malformed"), ("shape", "stale")]
+)
+def test_onboarding_status_current_set_never_borrows_older_arms(_operator_api_catalog, test_id, fault, expected):
+    root = _operator_api_catalog
+    paths = _onboarding_status_record(root, test_id)
+    for path in paths:
+        (path.parent.parent / path.name).write_bytes(path.read_bytes())
+    if fault == "missing":
+        paths[-1].unlink()
+    elif fault == "empty":
+        for path in paths:
+            path.unlink()
+    elif fault == "json":
+        paths[0].write_text("{broken")
+    else:
+        raw = json.loads(paths[0].read_text())
+        raw["identity"]["recipe"]["synthetic_inputs"]["rows"] *= 2
+        paths[0].write_text(json.dumps(raw))
+    result = api.onboarding_status(_onboarding_status_request(root, tests=(test_id,)))[0]
+    assert result.references.state == expected
+    assert all("rows-per-gas-" in path for path in result.references.paths)
+
+
+@pytest.mark.usefixtures("_onboarding_status_scoped_paths")
+@pytest.mark.parametrize("test_id", ["single-step-grads", "single-step-optimizer"])
+def test_onboarding_status_current_set_ignores_corrupt_older_records(_operator_api_catalog, test_id):
+    root = _operator_api_catalog
+    paths = _onboarding_status_record(root, test_id)
+    for path in paths:
+        (path.parent.parent / path.name).write_text("{broken")
+    result = api.onboarding_status(_onboarding_status_request(root, tests=(test_id,)))[0]
+    assert result.references.state == "metadata_valid"
+    assert result.references.paths == tuple(map(str, paths))
+
+
+@pytest.mark.usefixtures("_onboarding_status_scoped_paths")
+@pytest.mark.parametrize("test_id", ["single-step-grads", "single-step-optimizer"])
+def test_onboarding_status_other_row_width_cannot_satisfy_reviewed_case(_operator_api_catalog, test_id):
+    root = _operator_api_catalog
+    paths = _onboarding_status_record(root, test_id)
+    width = int(paths[0].parent.name.removeprefix("rows-per-gas-"))
+    paths[0].parent.rename(paths[0].parent.with_name(f"rows-per-gas-{width * 2}"))
+    result = api.onboarding_status(_onboarding_status_request(root, tests=(test_id,)))[0]
+    assert result.references.state == "missing"
+
+
+@pytest.mark.parametrize("state", ["parameter_update_residual", "exp_avg", "exp_avg_sq"])
+def test_onboarding_status_optimizer_norm_overflow_is_reported_as_malformed(_operator_api_catalog, capsys, state):
+    root = _operator_api_catalog
+    _onboarding_status_record(root, combined=True)
+    paths = _onboarding_status_record(root, "single-step-optimizer", combined=True)
+    raw = json.loads(paths[0].read_text())
+    raw["measurements"]["optimizer_norms"]["parameters"][_reference_records_PARAMETER][state] = 10**400
+    raw["payload_sha256"] = records._digest(raw["measurements"])
+    paths[0].write_text(json.dumps(raw))
+    assert paths[0].stat().st_size < records.MAX_RECORD_BYTES
+    before = {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+
+    request = _onboarding_status_request(root, tests=("single-step-grads", "single-step-optimizer"))
+    results = {result.test_id: result for result in api.onboarding_status(request)}
+    assert results["single-step-grads"].status == "metadata_valid"
+    result = results["single-step-optimizer"]
+    assert result.spec.state == "valid"
+    assert result.status == result.references.state == "malformed"
+    assert "cannot validate reference metadata" in result.reason
+    assert "too large" in result.reason
+
+    args = execution.parse_args(
+        [
+            "list",
+            "--config-dir",
+            str(root / "configs"),
+            "--config",
+            _operator_api_CONFIG,
+            "--test",
+            "single-step-optimizer",
+            "--json",
+        ]
+    )
+    assert execution.cmd_list(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["statuses"][0]["status"] == "malformed"
+    assert "too large" in payload["statuses"][0]["references"]["reason"]
+    assert {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in paths} == before
+
+
+def test_onboarding_status_combined_gradient_and_optimizer_records_are_selection_specific(_operator_api_catalog):
+    root = _operator_api_catalog
+    _onboarding_status_record(root, combined=True)
+    _onboarding_status_record(root, "single-step-optimizer", combined=True)
+    request = _onboarding_status_request(root, tests=("single-step-grads", "single-step-optimizer"))
+    result = api.onboarding_status(request)
+    assert all(item.references.state == "metadata_valid" for item in result)
+    assert "with-optimizer" in result[0].references.paths[0]
+    assert api.onboarding_status(_onboarding_status_request(root))[0].references.state == "missing"
+
+
+@pytest.mark.parametrize(
+    "fault,expected",
+    [
+        ("settings", "not_reviewed"),
+        ("budget", "not_reviewed"),
+        ("object", "malformed"),
+        ("zero", "malformed"),
+        ("negative", "malformed"),
+        ("boolean", "malformed"),
+        ("null", "malformed"),
+    ],
+)
+def test_onboarding_status_optimizer_requires_frozen_reference_budget(_operator_api_catalog, fault, expected):
+    root = _operator_api_catalog
+    _onboarding_status_record(root, "single-step-optimizer", combined=True)
+    spec_path = root / "specs" / f"{_operator_api_CONFIG}.json"
+    raw = json.loads(spec_path.read_text())
+    settings = raw["test_settings"]["single-step-optimizer"]
+    if fault == "settings":
+        raw["test_settings"].pop("single-step-optimizer")
+    elif fault == "budget":
+        settings.pop("reference_token_budget")
+    elif fault == "object":
+        raw["test_settings"]["single-step-optimizer"] = []
+    else:
+        settings["reference_token_budget"] = {"zero": 0, "negative": -1, "boolean": True, "null": None}[fault]
+    spec_path.write_text(json.dumps(raw))
+    result = api.onboarding_status(_onboarding_status_request(root, tests=("single-step-optimizer",)))[0]
+    assert result.spec.state == result.status == expected
+    assert "optimizer" in result.reason
+    assert result.references.state == "unverified"
+
+
+@pytest.mark.parametrize(
+    "fault", [None, "stale", "unbound", "bad_success", "missing_pair", "malformed", "wrong_config", "failed"]
+)
+def test_onboarding_status_historical_success_is_separate_and_bound_to_per_test_spec(_operator_api_catalog, fault):
+    root = _operator_api_catalog
+    spec_path = root / "specs" / f"{_operator_api_CONFIG}.json"
+    spec = ConfigSpec.read(spec_path)
+    # Compare with the existing writer, so query-side identity cannot drift silently.
+    identity = onboard._onboarding_spec_identity(json.loads(spec.to_json()), "single-step-grads")
+    saved = {"status": "onboarded", "exit_code": 0, "spec_identity": identity, "runtime_identity": "past-runtime"}
+    if fault == "stale":
+        saved["spec_identity"] = "old"
+    elif fault == "unbound":
+        saved.pop("spec_identity")
+    elif fault == "bad_success":
+        saved["exit_code"] = 1
+    elif fault == "failed":
+        saved.update(status="failed", exit_code=1, reason="original validation exception")
+    summary = {"config_id": _operator_api_CONFIG, "results": {"single-step-grads": saved}}
+    if fault == "missing_pair":
+        summary["results"] = {}
+    elif fault == "wrong_config":
+        summary["config_id"] = "other"
+    summary_path = spec_path.with_suffix(".onboarding.json")
+    summary_path.write_text("[]" if fault == "malformed" else json.dumps(summary))
+    result = api.onboarding_status(_onboarding_status_request(root))[0]
+    expected = {
+        "stale": "stale",
+        "unbound": "unbound",
+        "bad_success": "malformed",
+        "missing_pair": "missing",
+        "malformed": "malformed",
+        "wrong_config": "stale",
+    }.get(fault, "current_spec")
+    assert result.historical.state == expected
+    assert result.status == "missing"  # Historical success cannot replace missing references.
+    if fault is None:
+        assert result.historical.outcome == "onboarded"
+        assert result.historical.runtime_identity == "past-runtime"
+    if fault == "failed":
+        assert "original validation exception" in result.historical.reason
+
+
+def test_onboarding_status_unknown_selectors_fail_without_backend(_operator_api_catalog, monkeypatch):
+    monkeypatch.setattr(api, "local_config_path", lambda *a: pytest.fail("query imported config"))
+    monkeypatch.setattr(execution, "_client_backend", lambda *a: pytest.fail("query initialized backend"))
+    with pytest.raises(ValueError, match="unknown check"):
+        api.onboarding_status(_onboarding_status_request(_operator_api_catalog, tests=("unknown",)))
+    with pytest.raises(ValueError, match="unknown configuration"):
+        api.onboarding_status(_onboarding_status_request(_operator_api_catalog, config="unknown"))
+
+
+def test_onboarding_status_external_paths_use_import_identity_without_importing(
+    _operator_api_catalog, tmp_path, monkeypatch
+):
+    root = _operator_api_catalog
+    native = api.catalog(root / "configs")[_operator_api_CONFIG]
+    source = tmp_path / "cortex-training/model-catalog/models/external/standard/h200-training-full.json"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(native.read_bytes())
+    monkeypatch.setattr(api, "local_config_path", lambda *a: pytest.fail("query imported config"))
+    monkeypatch.setattr(config_module, "local_gpu_type", lambda: pytest.fail("query probed GPUs"))
+    before = sorted(str(path) for path in root.rglob("*"))
+    result = api.onboarding_status(_onboarding_status_request(root, config=source))[0]
+    assert result.config_id == "external-standard-h200-training-full"
+    assert result.spec.state == "missing"
+    assert result.reason == f"no spec; run onboarding for {source}"
+    assert sorted(str(path) for path in root.rglob("*")) == before
+
+
+@pytest.mark.parametrize("catalog_source", [False, True])
+def test_onboarding_status_external_and_imported_configs_share_reviewed_identity(
+    _operator_api_catalog, tmp_path, monkeypatch, catalog_source
+):
+    root = _operator_api_catalog
+    native = api.catalog(root / "configs")[_operator_api_CONFIG]
+    directory = (
+        tmp_path / "cortex-training/model-catalog/models/qwen3-8b/standard"
+        if catalog_source
+        else tmp_path / "incoming"
+    )
+    directory.mkdir(parents=True)
+    source = directory / "h200-training-full.json"
+    source.write_bytes(native.read_bytes())
+    imported = config_module.local_config_path(source, root / "configs")
+    cfg = load_config(imported)
+    spec = ConfigSpec.read(root / "specs" / f"{_operator_api_CONFIG}.json")
+    spec.config_id = cfg.config_id
+    spec.config_path = str(imported)
+    spec.write(root / "specs" / f"{cfg.config_id}.json")
+    before = {str(path): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    monkeypatch.setattr(api, "local_config_path", lambda *a: pytest.fail("query imported config"))
+    monkeypatch.setattr(config_module, "local_gpu_type", lambda: pytest.fail("query probed GPUs"))
+    external_status = api.onboarding_status(_onboarding_status_request(root, config=source))[0]
+    imported_status = api.onboarding_status(_onboarding_status_request(root, config=imported))[0]
+    id_status = api.onboarding_status(_onboarding_status_request(root, config=cfg.config_id))[0]
+    assert external_status.config_id == imported_status.config_id == id_status.config_id
+    assert external_status.spec == imported_status.spec == id_status.spec
+    assert external_status.spec.state == "valid"
+    assert external_status.historical.state == "missing"
+    assert external_status.references == imported_status.references == id_status.references
+    assert {str(path): path.read_bytes() for path in root.rglob("*") if path.is_file()} == before
+    # Imported reviewed workflows do not require a historical summary to select regression.
+    assert len(api.select(_onboarding_status_request(root, config=cfg.config_id))) == 1
+
+
+@pytest.mark.parametrize(
+    "contents,reason",
+    [
+        ("{broken", "Expecting"),
+        ("[]", "configuration must be a JSON object"),
+        (json.dumps({**_cortex_recipe(), "hardware": "A100"}), "hardware must be one of"),
+        (json.dumps({"backend": {"type": "unsupported"}}), "validation error"),
+    ],
+)
+def test_onboarding_status_malformed_or_unsupported_configs_return_actionable_reasons(
+    _operator_api_catalog, contents, reason
+):
+    root = _operator_api_catalog
+    source = root / "configs" / "h200-invalid.json"
+    source.write_text(contents)
+    statuses = api.onboarding_status(
+        _onboarding_status_request(root, tests=("single-step-grads", "e2e-sft-train-validate"), config=source)
+    )
+    assert len(statuses) == 2
+    assert all(item.status == "malformed" and reason in item.reason for item in statuses)
+    assert all(item.references.state == "unverified" and item.historical.state == "unverified" for item in statuses)
+
+
+def test_onboarding_status_list_help_does_not_import_onboarding_or_inspect_artifacts(monkeypatch, capsys):
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if "onboard" in name:
+            pytest.fail(f"help imported heavyweight onboarding: {name}")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr(api, "onboarding_status", lambda *a, **kw: pytest.fail("help inspected artifacts"))
+    with pytest.raises(SystemExit) as caught:
+        execution.parse_args(["list", "--help"])
+    assert caught.value.code == 0
+    output = capsys.readouterr().out
+    assert "--json" in output and "--config" in output and "--test" in output
+
+
+def test_onboarding_status_list_json_and_duplicate_selectors(_operator_api_catalog, capsys):
+    root = _operator_api_catalog
+    args = execution.parse_args(
+        [
+            "list",
+            "--config-dir",
+            str(root / "configs"),
+            "--config",
+            _operator_api_CONFIG,
+            "--config",
+            _operator_api_CONFIG,
+            "--test",
+            "single-step-grads",
+            "--test",
+            "single-step-grads",
+            "--json",
+        ]
+    )
+    assert execution.cmd_list(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == "correctness-onboarding-status-v1"
+    assert len(payload["statuses"]) == 1
+    assert len(payload["tests"]) == len(registered_tests())
+    args.config.append("other")
+    assert execution.cmd_list(args) == 2
+    assert "one unique --config" in capsys.readouterr().err
+
+
+def test_onboarding_status_list_and_api_are_read_only_without_onboarding_import(_operator_api_catalog, monkeypatch):
+    root = _operator_api_catalog
+    _onboarding_status_record(root)
+    paths = [path for path in root.rglob("*") if path.is_file()]
+    before = {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if "onboard" in name:
+            pytest.fail(f"query imported heavyweight onboarding: {name}")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr(api, "local_config_path", lambda *a: pytest.fail("query imported config"))
+    monkeypatch.setattr(config_module, "local_gpu_type", lambda: pytest.fail("query probed GPUs"))
+    monkeypatch.setattr(execution, "_client_backend", lambda *a: pytest.fail("query initialized backend"))
+    monkeypatch.setattr(records, "_publication_lock", lambda *a, **kw: pytest.fail("query opened writable lock"))
+    args = execution.parse_args(
+        [
+            "list",
+            "--config-dir",
+            str(root / "configs"),
+            "--config",
+            _operator_api_CONFIG,
+            "--test",
+            "single-step-grads",
+        ]
+    )
+    assert execution.cmd_list(args) == 0
+    assert {
+        str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in root.rglob("*") if path.is_file()
+    } == before
 
 
 @pytest.mark.usefixtures("_operator_api_catalog")
@@ -23075,6 +23588,7 @@ def test_client_backends_cortex_model_options_preserve_internal_debug_without_a_
 
 
 _SELFTEST_FIXTURES = (
+    "_onboarding_status_scoped_paths",
     "_isolated_gateway_ownership",
     "_operator_api_catalog",
     "_external_operator_catalog",
@@ -23296,6 +23810,20 @@ _SELFTEST_GROUPS = {
         "test_onboarding_missing_module_install_hint_follows_provider",
         "test_onboarding_allocation_prerequisites_require_every_host_response",
         "test_operator_api_test_only_selects_all_reviewed_configs_in_order",
+        "test_onboarding_status_queries_every_registered_pair_and_deduplicates_filters",
+        "test_onboarding_status_missing_stale_and_malformed_specs",
+        "test_onboarding_status_missing_specs_are_not_hidden_from_catalog",
+        "test_onboarding_status_reference_metadata_is_checked_without_claiming_readiness",
+        "test_onboarding_status_combined_gradient_and_optimizer_records_are_selection_specific",
+        "test_onboarding_status_optimizer_requires_frozen_reference_budget",
+        "test_onboarding_status_historical_success_is_separate_and_bound_to_per_test_spec",
+        "test_onboarding_status_unknown_selectors_fail_without_backend",
+        "test_onboarding_status_external_paths_use_import_identity_without_importing",
+        "test_onboarding_status_external_and_imported_configs_share_reviewed_identity",
+        "test_onboarding_status_malformed_or_unsupported_configs_return_actionable_reasons",
+        "test_onboarding_status_list_help_does_not_import_onboarding_or_inspect_artifacts",
+        "test_onboarding_status_list_json_and_duplicate_selectors",
+        "test_onboarding_status_list_and_api_are_read_only_without_onboarding_import",
         "test_operator_api_bad_selectors_fail_before_backend",
         "test_operator_batch_total_runtime_is_last_after_reports_and_failure_guidance",
         "test_compatibility_total_runtime_follows_all_report_and_verdict_output",
