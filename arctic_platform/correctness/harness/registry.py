@@ -26,6 +26,10 @@ from typing import Dict
 from typing import List
 from typing import Optional
 
+INFERENCE_DEFAULT_TOLERANCE = 1e-3
+INFERENCE_B200_TOLERANCE = 3e-3
+E2E_TOLERANCE = 3e-2
+
 
 class TestOutcome(enum.Enum):
     """Pass, fail, and the case where a test does not apply to a config at all.

@@ -93,6 +93,8 @@ python -m arctic_platform.correctness report-runnable \
 
 **Report symbols describe local metadata, not numerical results.** `R` means reviewed metadata is available, `S` stale metadata, `E` invalid metadata, `?` onboarding or reference preparation needed, and `-` inapplicable. `R` is neither a numerical pass nor full workload/runtime admission: current hardware, backend availability and complete reference/runtime identity are not verified. Historical successes remain separate recorded outcomes, even when their per-test specification identity matches.
 
+**Available absolute gates follow `R` cells in scientific notation.** Gradient and checkpoint-resume gates come from the frozen specification, optimizer gates from each prepared arm's reviewed record, and inference/E2E gates from their fixed criteria. Equal arm gates appear once; different gates appear in specification order, for example `3e-3/1e-3` for GAS1/GAS4. Exact-equality tests have no numeric gate. These are reviewed metadata, not gates proven by a new measured pass; the onboarding progress report uses gates recovered from each actual passing run.
+
 **The Python API still returns one structured result per selected config/test pair.** `onboarding_status(RunRequest(...))` separates `spec`, `references` and `historical`; omit the config selector to inspect every discovered recipe, including unreviewed configs. External paths are read in place; explicit recipe/path hardware can determine the imported config identity without creating a local config or probing hardware.
 
 ```python

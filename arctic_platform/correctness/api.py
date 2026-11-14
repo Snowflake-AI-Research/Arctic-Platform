@@ -33,6 +33,7 @@ from argparse import Namespace
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
+from decimal import Decimal
 from decimal import DecimalException
 from pathlib import Path
 from typing import Callable
@@ -48,6 +49,9 @@ from .harness.config import config_paths
 from .harness.config import load_config
 from .harness.config import local_config_path
 from .harness.config import resolve_config_path
+from .harness.registry import E2E_TOLERANCE
+from .harness.registry import INFERENCE_B200_TOLERANCE
+from .harness.registry import INFERENCE_DEFAULT_TOLERANCE
 from .harness.registry import TestOutcome
 from .harness.registry import TestResult
 from .harness.registry import registered_tests
@@ -110,6 +114,7 @@ class ArtifactStatus:
     state: str
     reason: str
     paths: tuple[str, ...] = ()
+    gates: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -224,6 +229,7 @@ def _status_references(cfg, spec, test_id: str, root: Path, *, combined: bool) -
     ctx = SimpleNamespace(cfg=cfg, spec=spec, reference_records_dir=root)
     arms = [None] if test_id == "e2e-sft-train-validate" else spec.arms
     paths = []
+    gates = []
     try:
         identities = []
         for arm in arms:
@@ -285,10 +291,16 @@ def _status_references(cfg, spec, test_id: str, root: Path, *, combined: bool) -
                 if test_id == "single-step-grads" and (recipe.get("optimizer") is not None) != combined:
                     return ArtifactStatus("stale", f"reference optimizer selection differs: {path}", tuple(paths))
             storage.validate_measurements(saved, record["measurements"])
+            if test_id == "single-step-optimizer":
+                gate = record["measurements"]["optimizer_norm_gate"]["absolute"]
+                if not math.isfinite(gate):
+                    raise ValueError("optimizer norm gate must be finite and representable")
+                gates.append(gate)
         return ArtifactStatus(
             "metadata_valid",
             "reference identity fields and scalar payload valid; full workload/runtime identity not checked",
             tuple(paths),
+            tuple(gates),
         )
     except FileNotFoundError as exc:
         return ArtifactStatus("missing", f"prepared reference missing: {exc.filename}; rerun onboarding", tuple(paths))
@@ -409,6 +421,18 @@ def onboarding_status(
                             pair_spec = ArtifactStatus(
                                 "malformed", "test tolerance must be a finite positive number", spec_status.paths
                             )
+                        else:
+                            pair_spec = ArtifactStatus("valid", pair_spec.reason, pair_spec.paths, (tolerance,))
+                if pair_spec.state == "valid" and test_id in {
+                    "inference-checkpoint-loss",
+                    "e2e-sft-train-validate",
+                }:
+                    tolerance = (
+                        E2E_TOLERANCE
+                        if test_id == "e2e-sft-train-validate"
+                        else INFERENCE_B200_TOLERANCE if cfg.gpu_type == "b200" else INFERENCE_DEFAULT_TOLERANCE
+                    )
+                    pair_spec = ArtifactStatus("valid", pair_spec.reason, pair_spec.paths, (tolerance,))
                 if test_id == "single-step-optimizer" and pair_spec.state == "valid":
                     settings = spec.test_settings.get(test_id)
                     if settings is None or isinstance(settings, dict) and "reference_token_budget" not in settings:
@@ -657,6 +681,21 @@ def _metadata_link(path: str | Path, output: Path, *, label: str | None = None) 
     return f"[{_markdown_text(label or str(path))}]({quote(relative, safe='/.-')})"
 
 
+def _gate_text(gates: tuple[float, ...]) -> str:
+    values = gates[:1] if len(set(gates)) == 1 else gates
+    formatted = []
+    for value in values:
+        number = Decimal(str(value))
+        if number.is_zero():
+            formatted.append("0e0")
+            continue
+        mantissa, exponent = format(number, "e").split("e")
+        if "." in mantissa:
+            mantissa = mantissa.rstrip("0").rstrip(".")
+        formatted.append(f"{mantissa}e{int(exponent)}")
+    return "/".join(formatted)
+
+
 def runnable_report(
     request: RunRequest | None = None,
     *,
@@ -686,6 +725,9 @@ def runnable_report(
         symbol = symbols[status.status]
         counts[symbol] += 1
         cells[status.config_id, status.test_id] = f"[{symbol}](#case-{number})"
+        gates = status.references.gates or status.spec.gates
+        if status.status == "metadata_valid" and gates:
+            cells[status.config_id, status.test_id] += f" {_gate_text(gates)}"
         path = Path(status.config_path).resolve()
         label = str(path.relative_to(root)) if path.is_relative_to(root) else str(path)
         configs[status.config_id] = _metadata_link(path, output, label=label)
@@ -701,6 +743,8 @@ def runnable_report(
             details.append(f"- {kind}: `{artifact.state}`. {_markdown_text(artifact.reason)}")
             for artifact_path in artifact.paths:
                 details.append(f"  {_metadata_link(artifact_path, output)}")
+        if status.status == "metadata_valid" and gates:
+            details.append(f"- Absolute gate: `{_gate_text(gates)}` (reviewed metadata, not a measured pass).")
         history = status.historical
         details.append(
             f"- Recorded onboarding: `{history.outcome or 'none'}` (`{history.state}`). "
@@ -739,6 +783,10 @@ def runnable_report(
                 "`?` onboarding or reference preparation needed; `-` inapplicable."
             ),
             "- Each cell links to its metadata checks and recorded onboarding outcome.",
+            (
+                "- Numeric suffixes are absolute gates in scientific notation; differing arm gates use `/` "
+                "in specification order. Exact-equality tests have no numeric gate."
+            ),
             "",
             "## Details",
             "",

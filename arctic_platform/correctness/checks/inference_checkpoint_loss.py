@@ -93,6 +93,8 @@ from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 
 from ..harness.config import correctness_microbatch_tokens
+from ..harness.registry import INFERENCE_B200_TOLERANCE
+from ..harness.registry import INFERENCE_DEFAULT_TOLERANCE
 from ..harness.registry import Mismatch
 from ..harness.registry import TestOutcome
 from ..harness.registry import TestResult
@@ -110,8 +112,8 @@ _PROCESSOR_METADATA_NAMES = ("preprocessor_config.json", "video_preprocessor_con
 # Fixed, and deliberately not calibrated. The two sides are one set of weights read by two engines, so
 # there is no engine-to-engine spread for a calibration to size: a checkpoint that carries the model
 # reproduces the loss. A measurement above the accelerator-family gate is the check's finding, not noise.
-DEFAULT_TOLERANCE = 1e-3
-B200_TOLERANCE = 3e-3
+DEFAULT_TOLERANCE = INFERENCE_DEFAULT_TOLERANCE
+B200_TOLERANCE = INFERENCE_B200_TOLERANCE
 
 # The zone reads the first key of each position's log-probability dictionary, so zero -- which asks vLLM
 # for the sequence's own token and nothing else -- is the only value that scores the row that was sent. A

@@ -3925,13 +3925,16 @@ def test_onboarding_status_other_row_width_cannot_satisfy_reviewed_case(_operato
     assert result.references.state == "missing"
 
 
-@pytest.mark.parametrize("state", ["parameter_update_residual", "exp_avg", "exp_avg_sq"])
+@pytest.mark.parametrize("state", ["parameter_update_residual", "exp_avg", "exp_avg_sq", "gate"])
 def test_onboarding_status_optimizer_norm_overflow_is_reported_as_malformed(_operator_api_catalog, capsys, state):
     root = _operator_api_catalog
     _onboarding_status_record(root, combined=True)
     paths = _onboarding_status_record(root, "single-step-optimizer", combined=True)
     raw = json.loads(paths[0].read_text())
-    raw["measurements"]["optimizer_norms"]["parameters"][_reference_records_PARAMETER][state] = 10**400
+    if state == "gate":
+        raw["measurements"]["optimizer_norm_gate"]["absolute"] = 10**400
+    else:
+        raw["measurements"]["optimizer_norms"]["parameters"][_reference_records_PARAMETER][state] = 10**400
     raw["payload_sha256"] = records._digest(raw["measurements"])
     paths[0].write_text(json.dumps(raw))
     assert paths[0].stat().st_size < records.MAX_RECORD_BYTES
@@ -4222,6 +4225,83 @@ def test_report_runnable_matrix_filters_and_duplicate_tests(_operator_api_catalo
     assert "current hardware, backend and runtime" in text
     assert "Recorded onboarding:" in text and "not proof" in text
     assert _discovery_artifact_snapshot(root) == before
+
+
+@pytest.mark.parametrize(
+    "gates, expected",
+    [
+        ((0.001, 0.001), "1e-3"),
+        ((0.003, 0.001), "3e-3/1e-3"),
+        ((0.0, 0.0), "0e0"),
+    ],
+)
+def test_report_runnable_gates_use_reviewed_arm_records(_operator_api_catalog, gates, expected):
+    root = _operator_api_catalog
+    _onboarding_status_record(root, combined=True)
+    paths = _onboarding_status_record(root, "single-step-optimizer", combined=True)
+    for path, gate in zip(paths, gates, strict=True):
+        raw = json.loads(path.read_text())
+        raw["measurements"]["optimizer_norm_gate"]["absolute"] = gate
+        raw["payload_sha256"] = records._digest(raw["measurements"])
+        path.write_text(json.dumps(raw))
+    before = _discovery_artifact_snapshot(root)
+    request = _onboarding_status_request(root, tests=("single-step-grads", "single-step-optimizer"))
+    statuses = {status.test_id: status for status in api.onboarding_status(request)}
+    assert statuses["single-step-optimizer"].references.gates == gates
+    text = api.runnable_report(request)
+    table = text.split("Legend:", 1)[0]
+    assert re.search(r"\[R\]\(#[^)]+\) 5e-3", table)
+    assert re.search(rf"\[R\]\(#[^)]+\) {re.escape(expected)}", table)
+    assert f"Absolute gate: `{expected}`" in text
+    assert "not a measured pass" in text
+    assert _discovery_artifact_snapshot(root) == before
+
+
+@pytest.mark.parametrize("precision", [2, 28])
+@pytest.mark.parametrize(
+    "gates, expected",
+    [
+        ((0.029,), "2.9e-2"),
+        ((0.001, 0.001), "1e-3"),
+        ((0.003, 0.001), "3e-3/1e-3"),
+        ((31.778,), "3.1778e1"),
+        ((300,), "3e2"),
+        ((123456789012345678901234567890123456789,), "1.23456789012345678901234567890123456789e38"),
+        ((0.0,), "0e0"),
+    ],
+)
+def test_report_runnable_gate_text_preserves_exact_values(gates, expected, precision):
+    from decimal import localcontext
+
+    with localcontext() as context:
+        context.prec = precision
+        assert api._gate_text(gates) == expected
+
+
+@pytest.mark.parametrize(
+    "test_id, expected",
+    [
+        ("inference-checkpoint-loss", 1e-3),
+        ("e2e-sft-train-validate", 3e-2),
+        ("checkpoint-resume-loss", 0.029),
+    ],
+)
+def test_report_runnable_gates_follow_fixed_or_frozen_criteria(_operator_api_catalog, test_id, expected):
+    root = _operator_api_catalog
+    path = root / "specs" / f"{_operator_api_CONFIG}.json"
+    spec = ConfigSpec.read(path)
+    spec.applicable_tests.append(test_id)
+    if test_id == "checkpoint-resume-loss":
+        spec.test_tolerances[test_id] = config_module.TestTolerance(absolute=expected)
+    spec.write(path)
+    request = _onboarding_status_request(root, tests=(test_id,))
+    status = api.onboarding_status(request)[0]
+    assert status.spec.gates == (expected,)
+    text = api.runnable_report(request)
+    if status.status == "metadata_valid":
+        assert f" {api._gate_text((expected,))}" in text.split("Legend:", 1)[0]
+    else:
+        assert "Absolute gate:" not in text
 
 
 @pytest.mark.parametrize("selector", ["id", "path"])
