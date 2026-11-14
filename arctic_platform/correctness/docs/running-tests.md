@@ -48,7 +48,7 @@ For an authenticated Cortex endpoint use `ARCTIC_CORTEX_HOST`, `ARCTIC_CORTEX_DA
 
 **Local supervised E2E automatically uses the original full model.** `onboard --test e2e-sft-train-validate` and `run --test e2e-sft-train-validate` select the admitted original checkpoint without requiring `--local-gateway-full-model`. With no configured endpoint, the harness owns gateway startup and cleanup; an explicit loopback `--base-url` remains externally owned. Gradient and optimizer children, including the automatic specification prerequisite, keep their reduced fixtures. An explicit `--local-cortex-fixture` or published `--cortex-fixture` retains fixture mode; hosted, on-prem and RL execution are unchanged.
 
-**Automatic selection does not waive full-model prerequisites.** Stage the pinned snapshot and tokenizer under `/data-fast`, set `HF_HUB_CACHE` to that cache, and retain `HF_HUB_OFFLINE=1` and `DSS_ALLOW_REMOTE_MODELS=1`. Multi-node execution still needs the same-job hostfile described below. Qwen3-0.6B's original single-file safetensors checkpoint is admitted by its pinned weight digest and complete tensor schema. Missing admission, cache assets or compatible trajectory records fail explicitly; the harness never falls back to a reduced model.
+**Automatic selection does not waive full-model prerequisites.** Stage the configured original checkpoint and tokenizer under `/data-fast`, set `HF_HUB_CACHE` to the populated offline cache, and retain `HF_HUB_OFFLINE=1` and `DSS_ALLOW_REMOTE_MODELS=1`. Onboarding captures its config-bound `original-model.json` automatically; regression verifies that identity without requiring a manual `ORIGINAL_MODELS` entry. Existing reviewed pins remain a compatibility fallback. Multi-node execution still needs the same-job hostfile described below. Missing cache assets, incompatible checkpoint identities or missing compatible trajectory records fail explicitly; the harness never falls back to a reduced model.
 
 ```bash
 python -m arctic_platform.correctness onboard \
@@ -360,17 +360,18 @@ python -m arctic_platform.correctness run \
   --out ./work/reports/all
 ```
 
-**Use the local full-model mode only for supported, pinned original models.** It requires an existing loopback gateway and a populated offline model cache, and supports only `e2e-sft-train-validate` and `inference-checkpoint-loss`:
+**Full-model regression verifies the original identity captured during onboarding.** It supports only `e2e-sft-train-validate` and `inference-checkpoint-loss` and requires a populated offline model cache; existing reviewed pins remain a compatibility fallback. Local supervised E2E selects full-model mode automatically and can own gateway startup. The explicit inference example below uses an existing loopback gateway:
 
 ```bash
 export HF_HUB_OFFLINE=1
 export DSS_ALLOW_REMOTE_MODELS=1
-# This advanced mode requires its reviewed snapshot in a populated fast-storage cache.
+# Use the populated fast-storage cache containing the onboarded original checkpoint.
 export HF_HUB_CACHE=/data-fast/path/to/populated/hub
 
 python -m arctic_platform.correctness run \
   --config qwen3-8b-h200-train-sft-full-4gpus-64k \
   --test inference-checkpoint-loss \
+  --base-url http://127.0.0.1:8003 \
   --local-gateway-full-model \
   --out ./work/reports/qwen3-8b-inference
 ```
