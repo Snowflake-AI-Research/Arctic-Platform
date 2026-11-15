@@ -1300,7 +1300,7 @@ def _apply_recorded_modes(meta: dict[str, Any], scope: str) -> int:
     when it was dumped has to be 0755 again when it is re-opened. Copying
     preserves mode faithfully, but the mirror is downstream of S3, which has no
     POSIX mode at all -- so what a materialize copies is already flattened to
-    0644 and there is nothing left for ``copy2`` to preserve. The recorded mode
+    0644 and there is nothing left for the copy to preserve. The recorded mode
     from ``_record_env_files`` is the only place the original survives.
 
     ``scope`` is the subtree a materialize just put in place, and it is a

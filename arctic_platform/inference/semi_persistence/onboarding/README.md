@@ -201,7 +201,12 @@ log nor its archived execution logs say how the publish went, the model's
 status is `unknown`, not `FAILED`: look for the skeleton in the bucket or for
 the `semi_p: published` line in the device-manager pod's log. Results are in
 `onboarding_reports/publish/<image_tag>/summary.json`; a re-run for some models
-keeps the other models' entries. Publishing ends with the upload: `onboard` is the
+keeps the other models' entries. A published entry also carries the fields of the
+publisher's last line, `publish summary: {...}`: `format` (`zstd1` for
+compressed skeleton pages, `raw` otherwise), `raw_bytes`, `stored_bytes`,
+`ratio`, `compressed_files`, `zero_frames`, `hash_compress_s` and `upload_s`
+(none from a publisher older than compression; see
+`skills/IMAGE_CACHE.md` §9). Publishing ends with the upload: `onboard` is the
 one that waits for the nodes to verify the image. Then point the models' entries in
 `models/backends.json` at the image.
 
