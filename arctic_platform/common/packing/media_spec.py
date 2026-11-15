@@ -28,11 +28,19 @@ spatial merge factor and its position layout from the spec of the engine's ``mod
 keeps what ``run_pipeline`` did before specs: ``pixel_values`` and ``image_grid_thw`` reach the engine as sent (no
 M-RoPE positions, no row ids; the model builds its own positions), and any other media key is refused for it.
 
-Only ``qwen4_exp`` is registered: its Arctic modeling takes ``[4, 1, T]`` M-RoPE ``position_ids`` and both
-``pixel_values`` and ``pixel_values_videos``. Other Qwen vision-language model types are left out until their Arctic
-code path does the same: Arctic's own ``qwen3_5_moe`` modeling flattens ``position_ids.view(-1)`` to find its packed
-rows and has no ``pixel_values_videos`` parameter, and ``qwen3_vl``, ``qwen3_vl_moe`` and ``qwen3_5`` have no Arctic
-modeling that reads ``[4, 1, T]`` positions. Spec'd media for them would reach a forward that misreads it.
+Two model types are registered:
+
+* ``qwen4_exp``: its Arctic modeling takes ``[4, 1, T]`` M-RoPE ``position_ids`` and both ``pixel_values`` and
+  ``pixel_values_videos``. Other Qwen vision-language model types are left out until their Arctic code path does the
+  same: Arctic's own ``qwen3_5_moe`` modeling flattens ``position_ids.view(-1)`` to find its packed rows and has no
+  ``pixel_values_videos`` parameter, and ``qwen3_vl``, ``qwen3_vl_moe`` and ``qwen3_5`` have no Arctic modeling that
+  reads ``[4, 1, T]`` positions. Spec'd media for them would reach a forward that misreads it.
+* ``nemotron_h_omni`` (Nemotron 3.5 Super VL), images only, with ``"1d"`` positions: its Nemotron-H language model
+  has no rotary embedding, so the packed text positions only mark where rows start. Its processor returns a
+  ``[images, 2]`` ``image_grid_hw``; a caller sends it as ``image_grid_thw`` rows ``[1, h, w]``, so each image takes
+  ``h * w / merge**2`` tokens like a Qwen image, with the merge factor from its pixel shuffle
+  (``1 / downsample_ratio``). Video is left out: the model's video frames share the image placeholder and are pruned
+  inside its forward, so their tokens cannot be placed before the forward runs.
 """
 
 from __future__ import annotations
@@ -129,6 +137,35 @@ QWEN_VL_MEDIA_SPEC = MediaSpec(
 # Model types whose Arctic modeling takes media.py's layout and [4, 1, T] positions; see the module docstring.
 QWEN_VL_MODEL_TYPES = ("qwen4_exp",)
 
+
+def _nemotron_placeholder_ids(config: Any) -> Dict[str, int]:
+    """``{"image": id}``: transformers' config names it ``image_token_id``, the checkpoint's own config.json
+    ``img_context_token_id``."""
+    for key in ("image_token_id", "img_context_token_id"):
+        value = _config_value(config, key)
+        if value is not None:
+            return {"image": int(value)}
+    return {}
+
+
+def _nemotron_spatial_merge_size(config: Any) -> int:
+    """The pixel shuffle's merge factor, ``1 / downsample_ratio`` (2 for Nemotron 3.5 Super VL's 0.5)."""
+    ratio = _config_value(config, "downsample_ratio")
+    if ratio is None:
+        raise ValueError("a Nemotron-H Omni config needs downsample_ratio")
+    merge = round(1 / float(ratio))
+    if merge < 1 or abs(merge * float(ratio) - 1) > 1e-6:
+        raise ValueError(f"downsample_ratio {ratio} is not 1 / an integer merge factor")
+    return merge
+
+
+NEMOTRON_H_OMNI_MEDIA_SPEC = MediaSpec(
+    kinds=(IMAGE_MEDIA,),
+    placeholder_ids=_nemotron_placeholder_ids,
+    spatial_merge_size=_nemotron_spatial_merge_size,
+    positions="1d",
+)
+
 _MEDIA_SPECS: Dict[str, MediaSpec] = {}
 
 
@@ -151,3 +188,4 @@ def media_spec_for(model_type: str) -> Optional[MediaSpec]:
 for _model_type in QWEN_VL_MODEL_TYPES:
     register_media_spec(_model_type, QWEN_VL_MEDIA_SPEC)
 del _model_type
+register_media_spec("nemotron_h_omni", NEMOTRON_H_OMNI_MEDIA_SPEC)

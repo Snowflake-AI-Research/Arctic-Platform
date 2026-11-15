@@ -166,12 +166,9 @@ def vllm_layer_converter(model: nn.Module):
         raise RuntimeError(
             "Qwen3.5-MoE vLLM packing stays on the qwen3_5_moe path"
         )
-    if cls_name.startswith("NemotronHOmniText"):
-        from arctic_platform.model.implementations.nemotron_h.vllm_weights import (
-            convert_nemotron_h_omni_text_layer_to_vllm,
-        )
-
-        return convert_nemotron_h_omni_text_layer_to_vllm
+    if cls_name.startswith("NemotronHOmni"):
+        # vLLM fuses the vision tower's q/k/v into a tensor-parallel projection behind its own loader.
+        raise RuntimeError(f"{cls_name} syncs in the checkpoint layout (weight_format='hf'), not direct vLLM names")
     if cls_name.startswith("NemotronH"):
         from arctic_platform.model.implementations.nemotron_h.vllm_weights import (
             convert_nemotron_h_layer_to_vllm,

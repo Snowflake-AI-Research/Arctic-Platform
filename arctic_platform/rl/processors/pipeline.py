@@ -271,8 +271,8 @@ def _media_spec(engine, media: dict) -> tuple[MediaSpec, int] | None:
     id checks (the model builds its own positions, as an HF Qwen-VL does). Media keys run_pipeline did not forward
     then (video, row ids, window ranges) are refused for such a model with a ValueError naming its model type.
 
-    With a spec, media takes the spec path: refused with a ValueError are a spec whose positions are not M-RoPE (the
-    only ones built here) and media of a kind the spec does not take.
+    With a spec, media takes the spec path: media of a kind the spec does not take is refused with a ValueError, and
+    positions are built here in the spec's layout (``_packed_media_kwargs``).
     """
     sent = {key for key, value in media.items() if value is not None}
     if not sent:
@@ -287,11 +287,6 @@ def _media_spec(engine, media: dict) -> tuple[MediaSpec, int] | None:
                 f" sent, not {sorted(sent - _UNSPECCED_MEDIA_KEYS)}"
             )
         return None
-    if spec.positions != "mrope":
-        raise ValueError(
-            f"run_pipeline builds M-RoPE positions for media; model_type {model_type!r} has"
-            f" {spec.positions!r} positions"
-        )
     sent_values = [kind.values_key for kind in MEDIA_KINDS if media.get(kind.values_key) is not None]
     taken = {kind.values_key for kind in spec.kinds}
     if not set(sent_values) <= taken:
@@ -301,15 +296,25 @@ def _media_spec(engine, media: dict) -> tuple[MediaSpec, int] | None:
     return spec, spec.spatial_merge_size(config)
 
 
+def _text_position_ids(cu_seqlens: torch.Tensor, mm_token_type_ids: torch.Tensor) -> torch.Tensor:
+    """``[1, T]`` positions restarting at 0 in every packed row; tail padding past the last row gets 0."""
+    position_ids = torch.zeros(1, mm_token_type_ids.numel(), dtype=torch.long, device=mm_token_type_ids.device)
+    boundaries = [int(value) for value in cu_seqlens.tolist()]
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        position_ids[0, start:end] = torch.arange(end - start, device=position_ids.device)
+    return position_ids
+
+
 def _packed_media_kwargs(
     media: dict, mm_token_type_ids, cu_seqlens: torch.Tensor, spec: MediaSpec, spatial_merge_size: int
 ) -> dict:
-    """Model inputs for row-owned ``media`` in one packed call: its pixels, grids and M-RoPE ``position_ids``.
+    """Model inputs for row-owned ``media`` in one packed call: its pixels, grids and ``position_ids``.
 
     Each item's tokens must be where ``media_token_spans`` places them: in packed order, contiguous, inside the
     row its row id names, and as many as its grid expands to. A kind with no item in the call is
-    left out, so a text-only microbatch of a media batch runs no vision forward. ``position_ids`` is
-    ``[4, 1, T]`` and every row restarts at 0, which is what the row gets alone.
+    left out, so a text-only microbatch of a media batch runs no vision forward. ``position_ids`` restart at 0 in
+    every row, which is what the row gets alone: ``[4, 1, T]`` M-RoPE ids for an ``"mrope"`` spec, ``[1, T]`` text
+    positions for a ``"1d"`` one. The unpadded path forwards no attention mask, so these are its only row boundaries.
     """
     if mm_token_type_ids is None:
         raise ValueError("a batch with media needs mm_token_type_ids to place image and video tokens")
@@ -322,6 +327,9 @@ def _packed_media_kwargs(
         if grid.shape[0]:
             kwargs[kind.values_key] = media[kind.values_key]
             kwargs[kind.grid_key] = grid
+    if spec.positions == "1d":
+        kwargs["position_ids"] = _text_position_ids(cu_seqlens, mm_token_type_ids)
+        return kwargs
     kwargs["position_ids"] = mrope_position_ids(
         mm_token_type_ids,
         cu_seqlens,

@@ -501,11 +501,29 @@ def test_media_of_a_kind_the_spec_does_not_take_is_refused(model, monkeypatch, p
 
 
 @pytest.mark.parametrize("pack", [True, False], ids=["packed", "unpacked"])
-def test_media_for_a_spec_without_mrope_positions_is_refused(model, monkeypatch, pack):
-    _with_spec(monkeypatch, "qwen4_exp", dataclasses.replace(QWEN_VL_MEDIA_SPEC, positions="1d"))
+def test_media_for_a_1d_spec_gets_text_positions_that_restart_every_row(model, monkeypatch, pack):
+    _with_spec(monkeypatch, "qwen4_exp", dataclasses.replace(QWEN_VL_MEDIA_SPEC, kinds=(IMAGE_MEDIA,), positions="1d"))
     rows = _with_pixels(model, _rows())
-    with pytest.raises(ValueError, match="model_type 'qwen4_exp' has '1d' positions"):
-        _run(model, _padded_batch([rows[0]]), pack=pack)
+    rows = [rows[0], rows[2], rows[3]]
+    batch = _padded_batch(rows)
+
+    call = _first_model_call(model, batch, pack=pack)
+
+    # Read the call's row order back off its tokens (the packed splitter reorders rows; every row's tokens differ).
+    packed_ids = call["input_ids"][0].tolist()
+    order = []
+    while sum(len(rows[index]["tokens"]) for index in order) < len(packed_ids):
+        offset = sum(len(rows[index]["tokens"]) for index in order)
+        (index,) = [i for i, row in enumerate(rows) if packed_ids[offset:][: len(row["tokens"])] == row["tokens"]]
+        order.append(index)
+    assert sorted(order) == [0, 1, 2]
+    expected = torch.cat([torch.arange(len(rows[index]["tokens"])) for index in order])[None]
+    torch_assert_equal(call["position_ids"], expected)
+    image_owners = [index for index in order if "image_grid" in rows[index]]
+    torch_assert_equal(call["pixel_values"], torch.cat([rows[index]["pixel_values"] for index in image_owners]))
+    torch_assert_equal(call["image_grid_thw"], torch.cat([rows[index]["image_grid"] for index in image_owners]))
+    assert "attention_mask" not in call
+    assert "mm_token_type_ids" not in call and "image_row_ids" not in call
 
 
 @pytest.mark.parametrize("pack", [True, False], ids=["packed", "unpacked"])

@@ -6,8 +6,6 @@ Hybrid Mamba-Transformer-MoE architecture with three distinct layer types:
 - Attention layers (using shared FlashAttention/SDPA from prime-rl)
 """
 
-from collections.abc import Iterator
-from pathlib import Path
 from typing import Optional
 
 import torch
@@ -24,18 +22,12 @@ from arctic_platform.model.implementations.layers.cp_mamba import mamba_cp_forwa
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
 from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, NemotronHRouter, NonGatedGroupedExperts
 from arctic_platform.model.implementations.layers.rms_norm import RMSNorm, RMSNormConfig
-from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import (
-    NemotronHConfig,
-    NemotronHOmniTextConfig,
-)
+from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import NemotronHConfig
 from arctic_platform.model.implementations.nemotron_h.converting_nemotron_h import (
-    add_omni_prefix,
     convert_hf_layer_to_prime,
     convert_hf_to_prime,
     convert_prime_layer_to_hf,
     convert_prime_to_hf,
-    is_omni_language_model_tensor,
-    strip_omni_prefix,
 )
 from arctic_platform.model.implementations.layers.sequence import get_cu_seqlens_from_position_ids
 
@@ -609,62 +601,8 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         pass
 
 
-class NemotronHOmniTextForCausalLMPrimeRL(NemotronHForCausalLM):
-    """The language model of a ``nemotron_h_omni`` (Nemotron 3.5 VL) checkpoint, trained text-only.
-
-    Conversions strip the checkpoint's ``language_model.`` prefix on load and restore it on export. A
-    complete export also carries the checkpoint's other tensors (vision tower, projector, MTP head) unchanged
-    from the source checkpoint, so the result still loads as the multimodal model.
-    """
-
-    config_class = NemotronHOmniTextConfig
-
-    @classmethod
-    def convert_to_hf(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-        super().convert_to_hf(state_dict)
-        add_omni_prefix(state_dict)
-        return state_dict
-
-    @classmethod
-    def convert_to_prime(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-        for key in [k for k in state_dict if not is_omni_language_model_tensor(k)]:
-            del state_dict[key]
-        strip_omni_prefix(state_dict)
-        return super().convert_to_prime(state_dict)
-
-    @classmethod
-    def convert_layer_to_hf(cls, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:
-        super().convert_layer_to_hf(state_dict, layer_idx)
-        add_omni_prefix(state_dict)
-        return state_dict
-
-    @classmethod
-    def convert_layer_to_prime(cls, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:
-        strip_omni_prefix(state_dict)
-        return super().convert_layer_to_prime(state_dict, layer_idx)
-
-    def iter_hf_checkpoint_passthrough(self) -> Iterator[tuple[str, Tensor]]:
-        """Yield the source checkpoint's tensors this model does not train, unchanged."""
-        from safetensors import safe_open
-
-        source = getattr(self, "hf_source_path", None)
-        if source is None:
-            raise RuntimeError(
-                f"{type(self).__name__} was not loaded from a checkpoint, so a complete export cannot carry "
-                "its vision tower, projector and MTP head"
-            )
-        files = {}
-        for path in sorted(Path(source).glob("*.safetensors")):
-            with safe_open(path, framework="pt") as handle:
-                files.update({name: path for name in handle.keys() if not is_omni_language_model_tensor(name)})
-        for name in sorted(files):
-            with safe_open(files[name], framework="pt") as handle:
-                yield name, handle.get_tensor(name)
-
-
 __all__ = [
     "NemotronHForCausalLM",
     "NemotronHModel",
-    "NemotronHOmniTextForCausalLMPrimeRL",
     "NemotronHPreTrainedModel",
 ]
