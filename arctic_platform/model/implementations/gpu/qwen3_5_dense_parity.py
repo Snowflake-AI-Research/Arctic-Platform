@@ -62,7 +62,7 @@ from arctic_platform.model.implementations.gpu.vllm_rounding import FusedAddRMSN
 from arctic_platform.model.implementations.gpu.vllm_rounding import FusedAddRMSNormFp32Residual
 from arctic_platform.model.implementations.gpu.vllm_rounding import rope_rotary_slice_fp32
 
-VERIFIED_TRANSFORMERS_VERSION = "5.17.0"
+VERIFIED_TRANSFORMERS_VERSION = "5.20.2"
 
 # The Hugging Face model types of the dense Qwen3.5 family, for a loader that checks before loading weights.
 QWEN3_5_DENSE_MODEL_TYPES = ("qwen3_5", "qwen3_5_text")

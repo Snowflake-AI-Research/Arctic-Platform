@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import torch
 
+from arctic_platform.common.chunked_cross_entropy import chunked_causal_lm_loss
 from arctic_platform.common.registry import LOSS_FNS
 from arctic_platform.sft.processor import LOGIT_LOSS_FNS
 from arctic_platform.sft.processor import SFT_GLOBAL_TOKEN_LOSS_FNS
@@ -490,3 +491,72 @@ class TestSftCeMemoryGradientReductionGPU(TestSftCeMemoryGradientReduction):
     """Repeat loss/gradient/reduction checks with the installed CUDA CE kernel."""
 
     device = "cuda"
+
+
+class TestChunkedCausalLMLoss(TestCasePlus):
+    def _compare(self, *, dtype=torch.float32, num_items=None, shifted=False, noncontiguous=False):
+        from transformers.loss.loss_utils import ForCausalLMLoss
+
+        set_seed(37)
+        base = torch.randn(2, 11, 29, dtype=dtype)
+        if noncontiguous:
+            base = base.transpose(0, 1).contiguous().transpose(0, 1)
+        labels = torch.randint(0, 29, base.shape[:-1])
+        labels[..., 1::3] = -100
+        options = {"shift_labels": labels} if shifted else {}
+        original = base.detach().contiguous().clone().requires_grad_(True)
+        candidate = base.detach().clone().requires_grad_(True)
+        expected = ForCausalLMLoss(original, labels, 29, num_items_in_batch=num_items, **options)
+        actual = chunked_causal_lm_loss(candidate, labels, 29, num_items_in_batch=num_items, chunk_rows=3, **options)
+        (expected * 0.7).backward()
+        (actual * 0.7).backward()
+        torch_assert_close(actual, expected, rtol=0, atol=1e-6)
+        torch_assert_close(candidate.grad, original.grad, rtol=0, atol=1e-7)
+
+    def test_masked_loss_and_backward(self):
+        self._compare()
+
+    def test_bfloat16_logits_and_gradient(self):
+        self._compare(dtype=torch.bfloat16)
+
+    def test_explicit_integer_denominator(self):
+        self._compare(num_items=43)
+
+    def test_explicit_tensor_denominator_and_shift(self):
+        self._compare(num_items=torch.tensor(43), shifted=True)
+
+    def test_fractional_denominator(self):
+        self._compare(num_items=0.5)
+
+    def test_double_precision_denominator(self):
+        self._compare(num_items=torch.tensor(43.0, dtype=torch.float64))
+
+    def test_zero_explicit_denominator_keeps_hf_behavior(self):
+        from transformers.loss.loss_utils import ForCausalLMLoss
+
+        set_seed(37)
+        original = torch.randn(2, 4, 13, requires_grad=True)
+        candidate = original.detach().clone().requires_grad_(True)
+        labels = torch.randint(0, 13, (2, 4))
+        labels[:, 2] = -100
+        expected = ForCausalLMLoss(original, labels, 13, num_items_in_batch=0)
+        actual = chunked_causal_lm_loss(candidate, labels, 13, num_items_in_batch=0, chunk_rows=3)
+        expected.backward()
+        actual.backward()
+        torch_assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+        torch_assert_close(candidate.grad, original.grad, rtol=0, atol=0, equal_nan=True)
+
+    def test_noncontiguous_logits(self):
+        self._compare(noncontiguous=True)
+
+    def test_all_ignored_keeps_hf_nan_and_zero_gradient(self):
+        logits = torch.randn(2, 4, 13, requires_grad=True)
+        labels = torch.full((2, 4), -100)
+        loss = chunked_causal_lm_loss(logits, labels, 13, chunk_rows=3)
+        self.assertTrue(torch.isnan(loss))
+        loss.backward()
+        torch_assert_close(logits.grad, torch.zeros_like(logits), rtol=0, atol=0)
+
+    def test_invalid_chunk_size(self):
+        with self.assertRaisesRegex(ValueError, "chunk_rows"):
+            chunked_causal_lm_loss(torch.zeros(1, 2, 3), torch.zeros(1, 2, dtype=torch.long), 3, chunk_rows=0)

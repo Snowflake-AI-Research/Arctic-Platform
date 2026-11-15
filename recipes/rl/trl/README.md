@@ -7,6 +7,7 @@ on top of [TRL](https://github.com/huggingface/trl) async-GRPO
 Available recipes:
 
 * [GSM8K](gsm8k) — smallest end-to-end loop (HF GSM8K + built-in `accuracy_reward`)
+* [GSM8K on Cortex](gsm8k_cortex) — the same loop with training and sampling dispatched to Cortex; the driver needs no GPU, and ZoRRo is off
 * [Txt2SQL (BIRD)](txt2sql) — Qwen3-1.7B on BIRD, native-TRL baseline **+** Arctic (no ZoRRo) **+** Arctic+ZoRRo
 
 These recipes drive TRL's async-GRPO trainer with either:

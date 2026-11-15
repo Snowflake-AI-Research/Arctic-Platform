@@ -17,9 +17,7 @@
 
 from __future__ import annotations
 
-from numbers import Integral
 from typing import Any
-from typing import Mapping
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
@@ -27,75 +25,24 @@ from pydantic import Field
 from pydantic import field_validator
 from pydantic import model_validator
 
+from arctic_platform.common.config import SP_SIZE_PATHS
+from arctic_platform.common.config import resolve_parallelism_degree
+from arctic_platform.common.config import resolve_sp_size
+
 DEFAULT_SEED = 42
 
-# Nested paths that may carry a sequence-parallel degree, one per live writer:
-# VeRL sends ``ds_config.sequence_parallel_size`` (from
-# ``ulysses_sequence_parallel_size``), DSS sends ``training_config.sp_size``,
-# and ``ds_worker_config`` / ``ModelSpec.parallelism.sequence_parallel`` carry
-# it on the worker-shaped configs.
-_DS_WORKER_SP_PATHS: tuple[tuple[str, ...], ...] = (
-    ("ds_worker_config", "sequence_parallel"),
-    ("ds_worker_config", "sequence_parallel_size"),
-    ("ds_worker_config", "parallelism", "sequence_parallel"),
-)
-_TRAINING_SP_PATHS: tuple[tuple[str, ...], ...] = (
-    ("training_config", "sp_size"),
-    ("ds_config", "sequence_parallel_size"),
-)
-_LOG_PROB_SP_PATH: tuple[str, ...] = ("log_prob_config", "sequence_parallel_size")
-_DS_CONFIG_SP_PATH: tuple[str, ...] = ("ds_config", "sequence_parallel_size")
-
-# Union of every nested path that may carry SP, for docs / grep.
-SP_SIZE_PATHS: tuple[tuple[str, ...], ...] = _TRAINING_SP_PATHS + (_LOG_PROB_SP_PATH,) + _DS_WORKER_SP_PATHS
-
-
-def _nested(mapping: Mapping[str, Any], path: tuple[str, ...]) -> Any:
-    node: Any = mapping
-    for part in path:
-        node = node.get(part) if isinstance(node, dict) else None
-        if node is None:
-            return None
-    return node
-
-
-def _sp_size_paths_for_job(job_config: Mapping[str, Any]) -> tuple[tuple[str, ...], ...]:
-    """SP sources that are live for this job. Log-prob init sends training ``ds_config``
-    plus optional ``log_prob_config``; those must not be compared as peers."""
-    job_type = job_config.get("job_type") or "training"
-    if job_type == "log_prob":
-        if _nested(job_config, _LOG_PROB_SP_PATH) is not None:
-            return (_LOG_PROB_SP_PATH,) + _DS_WORKER_SP_PATHS
-        return (_DS_CONFIG_SP_PATH, _LOG_PROB_SP_PATH) + _DS_WORKER_SP_PATHS
-    if job_type == "sampling":
-        return _DS_WORKER_SP_PATHS
-    return _TRAINING_SP_PATHS + _DS_WORKER_SP_PATHS
-
-
-def resolve_parallelism_degree(value: Any, name: str) -> int:
-    """Unset → 1 (disabled); else a non-bool integer ``>= 1`` (no float/bool coerce)."""
-    if value is None:
-        return 1
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        raise ValueError(f"{name} must be an integer >= 1 (1 = disabled); got {value!r}")
-    parallelism_degree = int(value)
-    if parallelism_degree < 1:
-        raise ValueError(f"{name} must be an integer >= 1 (1 = disabled); got {value!r}")
-    return parallelism_degree
-
-
-def resolve_sp_size(job_config: Mapping[str, Any]) -> int:
-    """SP degree from the nested blobs of a job config. Unset → 1; disagreeing live sources raise."""
-    candidates: dict[str, int] = {}
-    for path in _sp_size_paths_for_job(job_config):
-        node = _nested(job_config, path)
-        if node is not None:
-            candidates[".".join(path)] = resolve_parallelism_degree(node, path[-1])
-
-    values = set(candidates.values())
-    if len(values) > 1:
-        raise ValueError(f"conflicting sequence-parallel degrees: {candidates}")
-    return values.pop() if values else 1
+__all__ = [
+    "SP_SIZE_PATHS",
+    "resolve_parallelism_degree",
+    "resolve_sp_size",
+    "JobConfig",
+    "sp_size_from_job_config",
+    "GenerateRequest",
+    "LogProbsRequest",
+    "WeightSyncRequest",
+    "parse_arctic_inference_rollout",
+    "build_model_config",
+]
 
 
 class JobConfig(BaseModel):

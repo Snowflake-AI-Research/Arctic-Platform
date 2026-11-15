@@ -4,7 +4,7 @@ import re
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
 
@@ -27,6 +27,9 @@ class ModelConfig(BaseModel):
     Field names match AsyncEngineArgs where possible so to_engine_kwargs()
     can pass them through directly.
     """
+
+    # A key that is not a field would otherwise be dropped without an error; other engine args go in extra_engine_kwargs.
+    model_config = ConfigDict(extra="forbid")
 
     model: str = Field(description="Model name, HuggingFace ID, or local path")
     tensor_parallel_size: int = 1
@@ -172,6 +175,20 @@ class ModelConfig(BaseModel):
 
 MODEL_CONFIGS: dict[GPUType, dict[str, dict[str, Any]]] = {
     GPUType.H200: {
+        "Inkling-Small": dict(
+            model="thinkingmachines/Inkling-Small",
+            tensor_parallel_size=8,
+            max_num_seqs=64,
+            gpu_memory_utilization=0.90,
+            reasoning_parser="inkling",
+            tool_call_parser="inkling",
+            extra_engine_kwargs={
+                "tokenizer_mode": "inkling",
+                "dtype": "bfloat16",
+                "kernel_config": {"enable_flashinfer_autotune": False},
+            },
+            extra_env={"VLLM_USE_V2_MODEL_RUNNER": "1"},
+        ),
         "Qwen3-30B-A3B": dict(
             model="Qwen/Qwen3-30B-A3B",
             tensor_parallel_size=1,

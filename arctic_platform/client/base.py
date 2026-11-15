@@ -106,6 +106,17 @@ def _check_weight_format(config: ArcticClientConfig, weight_format: str | None) 
         )
 
 
+def _resolve_weight_format(config: ArcticClientConfig, weight_format: str | None) -> str | None:
+    """The weight_format a sync sends: ``"lora"`` for a PEFT training job when the caller names none.
+
+    The sampler serves the adapter through vLLM's LoRA manager. A full-weight format copies tensors onto vLLM
+    parameters by name, so the adapter factors reach no parameter and the sampler keeps the base model.
+    """
+    if weight_format is None and config.training.peft is not None:
+        return "lora"
+    return weight_format
+
+
 def _raise_on_weight_sync_mismatch(out: dict, strict_checksum: bool) -> None:
     """Fail loudly when the server proved the sync did not land on the sampler.
 
@@ -377,14 +388,16 @@ class ArcticClient(_ArcticClientCore):
         """Sync training weights to sampling (staged wake → operation → wake → reset).
 
         ``cuda_ipc`` / ``low_memory`` default to the training job's ``TrainingConfig``; pass a value to override this
-        call. ``weight_format="lora"`` broadcasts only the adapter tensors (Cortex only). ``bucket_size`` (bytes,
-        Cortex only) raises the transfer bucket when one tensor exceeds the server default.
+        call. ``weight_format="lora"`` broadcasts only the adapter tensors (Cortex only); it is the default when the
+        training job is PEFT, and an explicit value is sent as given. ``bucket_size`` (bytes, Cortex only) raises the
+        transfer bucket when one tensor exceeds the server default.
 
         ``strict_checksum`` (default ``True``) raises if the server reports ``checksum_match=False``: the sampler
         has stale or corrupt weights and training must not continue silently. Pass ``False`` to only log it (see
         ``out["checksum_error"]``) and keep going.
         """
         _check_weight_format(self.config, weight_format)
+        weight_format = _resolve_weight_format(self.config, weight_format)
         self.wake_inference(tags=["weights"])
         out = self._call(
             sync_weights_request(
@@ -602,6 +615,7 @@ class AsyncArcticClient(_ArcticClientCore):
     ) -> dict:
         """Async twin of ArcticClient.sync_weights (staged wake → operation → wake → reset)."""
         _check_weight_format(self.config, weight_format)
+        weight_format = _resolve_weight_format(self.config, weight_format)
         await self.wake_inference(tags=["weights"])
         out = await self._acall(
             sync_weights_request(

@@ -67,13 +67,13 @@ def _merge_distributed_config(config: dict, batch: dict, meta: dict) -> dict:
     return cfg
 
 
-def _validate_neutral_temperature(context: dict) -> None:
+def _validate_neutral_temperature(context: dict, objective: str = "causal_cross_entropy") -> None:
     temperature = context.get("temperature")
     if temperature is None:
         return
     if torch.is_tensor(temperature):
         if torch.is_complex(temperature) or not torch.isfinite(temperature).all().item():
-            raise ValueError("causal_cross_entropy temperature must be finite and real")
+            raise ValueError(f"{objective} temperature must be finite and real")
         neutral = (temperature == 1).all().item()
     else:
         neutral = (
@@ -84,8 +84,7 @@ def _validate_neutral_temperature(context: dict) -> None:
         )
     if not neutral:
         raise ValueError(
-            "causal_cross_entropy requires untempered model log probabilities; "
-            "omit temperature or set every value to 1"
+            f"{objective} requires untempered model log probabilities; omit temperature or set every value to 1"
         )
 
 

@@ -4,7 +4,7 @@ Derived from prime-rl's ``trainer/model.py`` but reduced to exactly what the
 DSS (DeepSpeed + EP + DeepEP) load path needs:
 
 - ``get_model`` (text-only / custom impl selection)
-- ``load_dcp_from_hf`` (HF -> Prime weight conversion cache + DCP load)
+- ``load_dcp_from_hf`` (direct HF loading or native-layout DCP loading)
 - ``apply_ac`` (activation checkpointing)
 - ``configure_moe_ep_backend`` (set the DeepEP backend on MoE layers)
 - ``_reset_runtime_moe_buffers``
@@ -52,8 +52,10 @@ from arctic_platform.model.implementations.moe.conversion_cache import (
     conversion_cache_ready,
     ensure_node_local_conversion_cache,
     resolve_conversion_cache_path,
+    resolve_ready_conversion_cache_path,
     _write_conversion_cache,
 )
+from arctic_platform.model.implementations.moe.hf_loader import load_hf_weights, supports_direct_hf_loading
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from .models import (
     AutoModelForCausalLMPrimeRL,
@@ -538,13 +540,21 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
 
     # Dynamically convert between different weight formats if needed.
     conversion = None
+    direct_hf_load = False
     if isinstance(model, PreTrainedModelPrimeRL):
         snapshot_keys = dict.fromkeys(load_state_dict_keys(snapshot_path))
         model_keys = dict.fromkeys(model.state_dict().keys())
 
         source_path = snapshot_path
         if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
-            conversion = ("prime", model.convert_to_prime, "HF", "PrimeRL")
+            if supports_direct_hf_loading(model):
+                cache_path = resolve_ready_conversion_cache_path(config, source_path, "prime")
+                if cache_path is None:
+                    direct_hf_load = True
+                else:
+                    snapshot_path = cache_path
+            else:
+                conversion = ("prime", model.convert_to_prime, "HF", "PrimeRL")
         elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(model_keys):
             conversion = ("hf", model.convert_to_hf, "PrimeRL", "HF")
 
@@ -599,23 +609,26 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             f"scope={os.environ.get(WEIGHT_CONVERSION_CACHE_SCOPE_ENV, 'auto')}"
         )
 
-    logger.info(f"Loading weights using HF DCP from {snapshot_path}")
+    logger.info(f"Loading weights using {'direct HF loading' if direct_hf_load else 'HF DCP'} from {snapshot_path}")
     load_dcp_start_time = time.perf_counter()
     state_dict = model.state_dict()
     state_dict = strip_lora_from_state_dict(state_dict)
     if model.config.tie_word_embeddings:
         del state_dict["lm_head.weight"]
-    dcp_load(
-        state_dict,
-        storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
-    )
+    if direct_hf_load:
+        load_hf_weights(state_dict, snapshot_path, model.convert_layer_to_prime)
+    else:
+        dcp_load(
+            state_dict,
+            storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
+        )
     # Restore weight tying broken by to_empty() for HF models
     if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:
         model.tie_weights()
     _init_buffers_post_meta()
 
     _move_buffers_to_cuda(model, config)
-    logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
+    logger.debug(f"Loaded weights in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
 
 
 _RANDOM_INIT_BASE_SEED = 1234567

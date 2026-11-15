@@ -271,7 +271,6 @@ def test_action_mask_cache_stats_reach_scheduler_metrics(monkeypatch):
     scheduler._workers = [
         SimpleNamespace(handle=SimpleNamespace(drain_metrics=DrainRemote()))
     ]
-    scheduler._concurrency_history = []
     scheduler._request_records = SimpleNamespace(drain=lambda: [])
 
     metrics = asyncio.run(scheduler.drain_metrics())
@@ -1259,8 +1258,12 @@ def test_worker_does_not_inject_resolve_reasoning_parser_plugin(monkeypatch):
         def create_engine_config(self):
             return SimpleNamespace(
                 parallel_config=SimpleNamespace(data_parallel_rank=0),
-                structured_outputs_config=SimpleNamespace(enable_in_reasoning=False),
-                model_config=SimpleNamespace(skip_tokenizer_init=True),
+                structured_outputs_config=SimpleNamespace(
+                    enable_in_reasoning=False, reasoning_parser="qwen3"
+                ),
+                model_config=SimpleNamespace(
+                    skip_tokenizer_init=True, architecture="Qwen3ForCausalLM",
+                ),
             )
 
     captured = {}

@@ -196,8 +196,11 @@ class NCCLEngine:
                         offset = 0
                         n_buckets += 1
                 n_params += 1
+                del weight, w, w_bytes  # a gathered export allocates its next tensor while we hold this one
                 continue
 
+            element_size = w.element_size()
+            offset = (offset + element_size - 1) // element_size * element_size
             entry = {
                 "name": name,
                 "shape": list(weight.shape),
@@ -237,6 +240,7 @@ class NCCLEngine:
             bucket_meta.append(entry)
             offset += nbytes
             n_params += 1
+            del weight, w, w_bytes
 
         self._flush_bucket_send(pack_idx, bucket_meta, is_last=True,
                                 prev_idx=prev_idx)
@@ -329,6 +333,8 @@ class NCCLEngine:
                 tensor_offset = int(tm.get("tensor_offset", 0))
                 tensor_nbytes = int(tm.get("tensor_nbytes", chunk_nbytes))
                 if tensor_offset == 0 and tensor_nbytes == chunk_nbytes:
+                    if chunk.storage_offset() % dtype.itemsize:
+                        chunk = chunk.clone()
                     yield tm["name"], chunk.view(dtype).reshape(shape)
                     continue
 
@@ -417,6 +423,7 @@ class NCCLEngine:
             w = weight.contiguous()
             self._send_one_direct(name, w, nccl_s)
             n_params += 1
+            del weight, w
 
         self._write_meta(0, [], is_last=True)
         self._send_buf(self._meta_bufs[0], nccl_s)

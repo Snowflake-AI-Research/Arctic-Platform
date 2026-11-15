@@ -105,6 +105,7 @@ LOADER_OPTION_FIELDS: dict[str, str | None] = {
 # ``attn_implementation``, which ``_validate_glm5_next`` requires to name a sparse MLA backend.
 LOADER_FIELD_OVERRIDES: dict[str, dict[str, str | None]] = {
     "glm5_next": {"attention.sparse_mla": "ModelSpec.attn_implementation"},
+    "inkling": {"peft": "ModelSpec.patches.peft", "checkpointing.targets": None},
 }
 
 _MODEL_SPEC_PREFIX = "ModelSpec."

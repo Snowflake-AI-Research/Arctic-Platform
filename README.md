@@ -60,6 +60,7 @@ client = create_arctic_rl_client(config)
 ### Integrated
 
 1. [SkyRL](https://github.com/NovaSky-AI/SkyRL/pull/1837). [Documentation](https://github.com/NovaSky-AI/SkyRL/tree/main/integrations/arctic_rl)
+2. TRL on Cortex. GSM8K GRPO from a CPU driver: [recipes/rl/trl/gsm8k_cortex](recipes/rl/trl/gsm8k_cortex).
 
 ### Integration is done but not yet merged
 
@@ -125,12 +126,6 @@ git clone https://github.com/Snowflake-AI-Research/Arctic-Platform.git
 cd Arctic-Platform
 pip install -e ".[rl]"
 ```
-
-# Use of AI Disclaimer
-
-In these early days of transitioning to AI-supported projects it's important to communicate to users how AI was used in the code base.
-
-As of this writing the heavy lifting of designing and writing the core was done by humans. The test suite creation and various consistency checking was done by Claude, while super-vised and guided by humans.
 
 # Citation
 

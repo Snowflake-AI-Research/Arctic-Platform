@@ -62,7 +62,9 @@ Nothing inside TRL. `AsyncGRPOTrainer` takes an instantiated model and has no
 `training_client` argument. `ArcticAsyncGRPOTrainer` keeps the Arctic client as its
 own argument, overrides `get_train_dataloader` to collate each tree row's samples into
 a flat packed `[1, T]` row, and routes optimizer step, save, and load through the
-client. Tree attention stays inside TRL.
+client. Tree attention stays inside TRL. The flattened row is not a ZoRRo packet;
+see [Prompt-deduplicated packets](../../../docs/rl.md#prompt-deduplicated-packets)
+for the dense layout the server accepts.
 
 ## Open items
 

@@ -62,6 +62,7 @@ def test_initialize_cleans_created_workers_on_init_failure(monkeypatch):
     config = SimpleNamespace(
         tensor_parallel_size=1,
         ray_num_gpus=None,
+        semi_p=False,
         extra_env={},
         clear_cache_on_weight_sync=True,
         to_engine_kwargs=lambda: {"model": "test-model"},
