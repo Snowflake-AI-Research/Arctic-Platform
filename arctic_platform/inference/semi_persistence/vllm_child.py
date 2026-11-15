@@ -1161,6 +1161,63 @@ def _semip_restore_lora(worker):
     return sum(v.numel() for v in views)
 
 
+def _semip_lora_wrappers(worker):
+    """``{namespace: names of the modules that are vLLM LoRA wrappers}``.
+
+    With LoRA enabled vLLM replaces each layer it can adapt by a
+    ``BaseLayerWithLoRA`` holding the original as ``base_layer``, so the
+    layer's parameters gain a ``.base_layer.`` segment while their bytes,
+    order and shapes stay what they are without LoRA.  Empty without LoRA."""
+    if _semip_lora_manager(worker) is None:
+        return {}
+    from vllm.lora.layers import BaseLayerWithLoRA
+
+    mr = worker.model_runner
+    models = [("main", mr.model)]
+    drafter = getattr(mr, "drafter", None)
+    dm = getattr(drafter, "model", None) if drafter is not None else None
+    if dm is not None:
+        models.append(("drafter", dm))
+    return {ns: {name for name, m in model.named_modules()
+                 if isinstance(m, BaseLayerWithLoRA)}
+            for ns, model in models}
+
+
+def _semip_canonical_name(name, wrappers):
+    """``name`` without the ``base_layer`` segments LoRA wrappers inserted:
+    only one that follows the path of a module in ``wrappers`` is dropped."""
+    ns, _, rest = name.partition(":")
+    wrapped = wrappers.get(ns)
+    if not wrapped:
+        return name
+    kind, _, path = rest.partition(":")
+    parts, prefix = [], ""
+    for part in path.split("."):
+        dropped = part == "base_layer" and prefix in wrapped
+        prefix = f"{prefix}.{part}" if prefix else part
+        if not dropped:
+            parts.append(part)
+    return f"{ns}:{kind}:{'.'.join(parts)}"
+
+
+def _semip_canonical_names(worker, names):
+    """The names the weight set records for ``names``: a LoRA engine's are the
+    full engine's, so the two share one weight set.  Raises if two map to one."""
+    wrappers = _semip_lora_wrappers(worker)
+    if not any(wrappers.values()):
+        return list(names)
+    out, seen = [], {}
+    for name in names:
+        canonical = _semip_canonical_name(name, wrappers)
+        if canonical in seen:
+            raise RuntimeError(
+                f"{seen[canonical]} and {name} would both be {canonical} in the "
+                f"weight set once the LoRA wrappers' base_layer is dropped")
+        seen[canonical] = name
+        out.append(canonical)
+    return out
+
+
 def _semip_segments(worker):
     """The weight set's bytes as ``(lo, hi, source)`` runs, in order.
 
@@ -1196,7 +1253,8 @@ def _semip_read_into(path, pos, dst):
 
 def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
     buf = worker._semip_buf
-    index = worker._semip_index
+    rows = worker._semip_rows
+    names = _semip_canonical_names(worker, [name for name, *_ in rows])
     shard_bytes = int(shard_bytes or _WEIGHTS_SHARD_BYTES)
     workers = int(io_workers or _WEIGHTS_IO_WORKERS)
     # TP1 keeps the flat weights/ layout; TP>1 fans out per-rank shards into
@@ -1213,7 +1271,6 @@ def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
                 f"as that user and re-run save_weights()") from e
     os.makedirs(rank_dir, exist_ok=True)
 
-    rows = worker._semip_rows
     host = getattr(worker, "_semip_host", None) or {}
     total = sum(nbytes for _, _, nbytes, _, _ in rows)
     mv = memoryview(buf.numpy())
@@ -1257,7 +1314,7 @@ def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
         "shards": [{"name": f"shard_{i:04d}.bin", "offset": lo, "nbytes": hi - lo}
                    for (i, lo, hi) in ranges],
         "layout": [[name, off, nbytes, str(dtype), list(shape)]
-                   for name, off, nbytes, dtype, shape in rows],
+                   for name, (_, off, nbytes, dtype, shape) in zip(names, rows)],
     }
     with open(os.path.join(rank_dir, "weights_meta.json"), "w") as f:
         json.dump(manifest, f)
@@ -1266,7 +1323,11 @@ def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
 
 def _semip_load_weights(worker, weights_dir, io_workers=None):
     """Read the shards into the host copy.  Parameters kept in their own
-    mapping are skipped: refill_host_weights reads those."""
+    mapping are skipped: refill_host_weights reads those.
+
+    Names are compared canonically (``_semip_canonical_names``) on both
+    sides, so a LoRA engine loads a full engine's weight set, the other way
+    round, and its own from before the names were canonical."""
     buf = worker._semip_buf
     workers = int(io_workers or _WEIGHTS_IO_WORKERS)
     rank_dir = (weights_dir if _semip_tp_size(worker) <= 1
@@ -1281,11 +1342,15 @@ def _semip_load_weights(worker, weights_dir, io_workers=None):
         raise RuntimeError(
             f"weights size mismatch: manifest {manifest['total_bytes']}B but "
             f"attached layout {total}B (config/model changed?)")
-    cur_layout = [[name, off, nbytes] for name, off, nbytes, _, _ in rows]
-    man_layout = [[row[0], row[1], row[2]] for row in manifest.get("layout", [])]
+    wrappers = _semip_lora_wrappers(worker)
+    names = _semip_canonical_names(worker, [name for name, *_ in rows])
+    cur_layout = [[name, off, nbytes, str(dtype)]
+                  for name, (_, off, nbytes, dtype, _) in zip(names, rows)]
+    man_layout = [[_semip_canonical_name(row[0], wrappers), row[1], row[2], row[3]]
+                  for row in manifest.get("layout", [])]
     if man_layout and man_layout != cur_layout:
         raise RuntimeError("weights layout mismatch between manifest and "
-                           "attached model (param order/sizes differ)")
+                           "attached model (param order/sizes/dtypes differ)")
 
     mv = memoryview(buf.numpy())
     shards = manifest["shards"]
@@ -1352,14 +1417,15 @@ def _semip_refill_host_weights(worker, weights_dir, io_workers=None):
                     else os.path.join(weights_dir, f"rank{worker.rank}"))
         with open(os.path.join(rank_dir, "weights_meta.json")) as f:
             manifest = json.load(f)
-        where = {row[0]: (int(row[1]), int(row[2]))
+        wrappers = _semip_lora_wrappers(worker)
+        where = {_semip_canonical_name(row[0], wrappers): (int(row[1]), int(row[2]))
                  for row in manifest.get("layout", [])}
         shards = [(os.path.join(rank_dir, s["name"]), int(s["offset"]),
                    int(s["offset"]) + int(s["nbytes"])) for s in manifest["shards"]]
         pieces = []
         for name in released:
             entry = host[name]
-            off, nbytes = where.get(name, (None, None))
+            off, nbytes = where.get(_semip_canonical_name(name, wrappers), (None, None))
             if nbytes != entry.nbytes:
                 raise RuntimeError(
                     f"{name}: {entry.nbytes} B in the image but "
