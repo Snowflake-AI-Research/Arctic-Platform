@@ -72,6 +72,10 @@ from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.moe.vlm import get_language_model, is_vlm_architecture
 from arctic_platform.model.implementations.moe.weights import load_state_dict, load_state_dict_keys, save_state_dict
 from arctic_platform.model.implementations.moe.world import get_world
+from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import (
+    NEMOTRON_H_OMNI_MODEL_TYPE,
+    NemotronHOmniTextConfig,
+)
 
 
 def _patch_qwen3_5_moe_conversion_mapping():
@@ -360,6 +364,9 @@ def get_model(
             config.name, attn_implementation=config.attn, trust_remote_code=config.trust_remote_code
         ),
     )
+    if getattr(model_config, "model_type", None) == NEMOTRON_H_OMNI_MODEL_TYPE:
+        # Text-only: train the language model; the vision tower and MTP head stay in the checkpoint.
+        model_config = NemotronHOmniTextConfig.from_omni_checkpoint(config.name, attn_implementation=config.attn)
     model_config.use_cache = False
     if config.dequantize_checkpoint and hasattr(model_config, "quantization_config"):
         del model_config.quantization_config
@@ -543,6 +550,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         model_keys = dict.fromkeys(model.state_dict().keys())
 
         source_path = snapshot_path
+        model.hf_source_path = source_path
         if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
             conversion = ("prime", model.convert_to_prime, "HF", "PrimeRL")
         elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(model_keys):
