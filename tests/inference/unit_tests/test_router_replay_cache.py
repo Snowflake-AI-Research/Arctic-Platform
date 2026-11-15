@@ -56,6 +56,28 @@ def test_tx_cache_evicts_lru_when_full(monkeypatch):
     assert cache.stats()["n_evicted_lru"] == 1
 
 
+def test_tx_cache_allocates_on_its_device_only_within_max_bytes(monkeypatch):
+    monkeypatch.setenv("ARCTIC_ROUTER_REPLAY_TX_EVICT_MIN_AGE_S", "0")
+    one = _tensor(seq_len=4)
+    bytes_one = one.numel()
+    cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=2 * bytes_one)
+    footprint_at_copy = []
+    coerce = cache._coerce
+
+    def recording_coerce(value):
+        footprint_at_copy.append(cache._bytes_in_use + bytes_one)
+        return coerce(value)
+
+    monkeypatch.setattr(cache, "_coerce", recording_coerce)
+    for sid in ("rr1:a", "rr1:b", "rr1:c"):
+        cache.put_new(sid, one)
+    with pytest.raises(RouterReplayDuplicateError):
+        cache.put_new("rr1:c", one)
+
+    assert footprint_at_copy == [bytes_one, 2 * bytes_one, 2 * bytes_one]
+    assert cache.stats()["n_evicted_lru"] == 1
+
+
 def test_tx_cache_logs_lru_eviction(monkeypatch, caplog):
     monkeypatch.setenv("ARCTIC_ROUTER_REPLAY_TX_EVICT_MIN_AGE_S", "0")
     one = _tensor(seq_len=4)

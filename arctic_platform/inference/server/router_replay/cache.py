@@ -102,7 +102,8 @@ class _RouterReplayCacheBase:
 
     A side dict tracks per-entry byte counts for O(1) ``max_bytes`` accounting.
     A single ``threading.Lock`` guards the dicts (vLLM async loop + per-step
-    NCCL task; contention is low). Tensor copy runs outside the lock.
+    NCCL task; contention is low). The copy onto ``self.device`` runs under the
+    lock after eviction, so ``max_bytes`` bounds what the cache allocates there.
     """
 
     def __init__(self, device: torch.device, max_bytes: int) -> None:
@@ -152,9 +153,16 @@ class _RouterReplayCacheBase:
         *,
         replace: bool,
     ) -> None:
-        tensor = self._coerce(value)
-        new_bytes = tensor.element_size() * tensor.numel()
-        new_shape = list(tensor.shape)
+        if isinstance(value, np.ndarray):
+            value = torch.from_numpy(value)
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"router-replay cache.put expects torch.Tensor or np.ndarray, "
+                f"got {type(value).__name__}"
+            )
+        dtype = value.dtype if value.dtype in ROUTER_REPLAY_CACHE_DTYPES else ROUTER_REPLAY_CACHE_DTYPE
+        new_bytes = dtype.itemsize * value.numel()
+        new_shape = list(value.shape)
         now = time.monotonic()
         with self._lock:
             if not replace and self._suppress_put_new_locked(sample_id, now):
@@ -176,8 +184,9 @@ class _RouterReplayCacheBase:
                 raise RouterReplayCacheFull(
                     f"router-replay cache would exceed max_bytes "
                     f"({projected} > {self.max_bytes}) on put({sample_id!r}, "
-                    f"shape={list(tensor.shape)}, dtype={tensor.dtype})"
+                    f"shape={new_shape}, dtype={dtype})"
                 )
+            tensor = self._coerce(value)
             if sample_id in self._data:
                 self._n_overwrite += 1
             else:
@@ -294,16 +303,7 @@ class _RouterReplayCacheBase:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _coerce(self, value: torch.Tensor | np.ndarray) -> torch.Tensor:
-        if isinstance(value, np.ndarray):
-            t = torch.from_numpy(value)
-        elif isinstance(value, torch.Tensor):
-            t = value
-        else:
-            raise TypeError(
-                f"router-replay cache.put expects torch.Tensor or np.ndarray, "
-                f"got {type(value).__name__}"
-            )
+    def _coerce(self, t: torch.Tensor) -> torch.Tensor:
         source_ptr = t.data_ptr()
         if t.dtype not in ROUTER_REPLAY_CACHE_DTYPES:
             t = t.to(ROUTER_REPLAY_CACHE_DTYPE)
