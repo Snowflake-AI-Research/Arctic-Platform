@@ -1,10 +1,10 @@
-"""Unit tests for gathering a published skeleton from peer nodes.
+"""Unit tests for materializing a published skeleton from the node's mirror.
 
 ``server/semip_gather.py`` imports only the standard library, so it is loaded
-from its file and driven against real HTTP servers on loopback that serve a
-temporary mirror the way the model-cache daemon's ``/image-cache/`` route does
--- or refuse, cut a body short, or lie about it, which is what the fallback to
-the local mirror exists for.
+from its file (by ``test_image_cache_key``, under the name the engine imports)
+and driven against a temporary mirror. Compressed skeletons have their own
+tests in ``test_semip_compress.py``; these cover the raw copy every skeleton
+goes through.
 
 Run from the package directory::
 
@@ -14,114 +14,28 @@ Run from the package directory::
 from __future__ import annotations
 
 import hashlib
-import http.server
-import importlib.util
 import json
 import logging
 import os
-import re
 import stat
 import sys
-import threading
-import urllib.parse
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from test_image_cache_key import (  # noqa: E402
-    _PKG, _fake_published, _fresh_model_dir, _weight_hash_of, _weight_root, se)
-
-_GATHER_NAME = "arctic_platform.inference.server.semip_gather"
-
-
-def _load_semip_gather():
-    spec = importlib.util.spec_from_file_location(
-        _GATHER_NAME,
-        os.path.join(os.path.dirname(_PKG), "server", "semip_gather.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-sg = _load_semip_gather()
-# What semip_engine imports by name when SEMIP_GATHER is set.
-sys.modules[_GATHER_NAME] = sg
+    _fake_published, _fresh_model_dir, _weight_hash_of, _weight_root, se, sg)
 
 _BIG = 300 * 1024 + 17
 
 
-class _Peer:
-    """A loopback stand-in for one node's daemon, serving ``mirror`` at /image-cache/."""
-
-    def __init__(self, mirror: str, behaviour: str = "ok"):
-        self.mirror = mirror
-        self.behaviour = behaviour
-        self.requests = 0
-        peer = self
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
-            def do_GET(self):
-                peer.requests += 1
-                if peer.behaviour == "refuse":
-                    self.send_error(409)
-                    return
-                rel = urllib.parse.unquote(self.path[len("/image-cache/"):])
-                with open(os.path.join(peer.mirror, rel), "rb") as handle:
-                    data = handle.read()
-                match = re.fullmatch(r"bytes=(\d+)-(\d+)",
-                                     self.headers.get("Range", ""))
-                start, last = int(match.group(1)), int(match.group(2))
-                body = data[start:last + 1]
-                if peer.behaviour == "lie":
-                    body = bytes(len(body))
-                self.send_response(206)
-                self.send_header("Content-Range",
-                                 f"bytes {start}-{last}/{len(data)}")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                if peer.behaviour == "short":
-                    body = body[:len(body) // 2]
-                self.wfile.write(body)
-
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
-        self.port = self.server.server_address[1]
-        self.thread = threading.Thread(target=self.server.serve_forever,
-                                       daemon=True)
-        self.thread.start()
-
-    def close(self):
-        self.server.shutdown()
-        self.server.server_close()
-
-
-@pytest.fixture
-def peers():
-    started = []
-
-    def start(mirror, *behaviours):
-        for b in behaviours:
-            started.append(_Peer(mirror, b))
-        return started[-len(behaviours):]
-
-    yield start
-    for p in started:
-        p.close()
-
-
-def _use(monkeypatch, peers_, *, chunk="64Ki", verify=None):
-    monkeypatch.setenv(sg.MODE_ENV, "peers")
-    monkeypatch.setenv(sg.SERVICE_ENV,
-                       ",".join(f"127.0.0.1:{p.port}" for p in peers_)
-                       or "127.0.0.1:1")
-    monkeypatch.setenv(sg.CHUNK_ENV, chunk)
+@pytest.fixture(autouse=True)
+def _knobs(monkeypatch):
+    for name in (sg.CHUNK_ENV, sg.THREADS_ENV, sg.VERIFY_ENV, sg.DIRECT_ENV):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(sg.CHUNK_ENV, "64Ki")
     monkeypatch.setenv(sg.THREADS_ENV, "8")
-    if verify:
-        monkeypatch.setenv(sg.VERIFY_ENV, verify)
 
 
 def _write_manifest(verified_dir: str) -> None:
@@ -165,15 +79,20 @@ def _tree(root):
     return out
 
 
-def _gather(source, incoming, mirror, verified=None):
-    return sg.gather(source, verified or source, incoming, se._COPY_SUBDIRS,
-                     mirror)
+def _gather(source, incoming, verified=None):
+    return sg.gather(source, verified or source, incoming, se._COPY_SUBDIRS)
 
 
 def _same_subdirs(source, incoming):
     for sub in se._COPY_SUBDIRS:
         assert _tree(os.path.join(incoming, sub)) == _tree(
             os.path.join(source, sub))
+
+
+def _overwrite(path, at, data):
+    with open(path, "r+b") as handle:
+        handle.seek(at)
+        handle.write(data)
 
 
 # --------------------------------------------------------------------------
@@ -183,41 +102,44 @@ def _same_subdirs(source, incoming):
 
 def test_plan_takes_one_replicas_subdirs_from_the_key_manifest(tmp_path):
     """A multi-replica skeleton has one manifest at the key, over every replica."""
-    mirror = tmp_path / "mirror"
-    key = mirror / "M" / "skeleton" / "k"
+    key = tmp_path / "mirror" / "M" / "skeleton" / "k"
     for rel in ("replica0/image/a", "replica1/image/a b",
                 "replica1/compilation/c", "replica1/other/d"):
         (key / rel).parent.mkdir(parents=True, exist_ok=True)
         (key / rel).write_bytes(b"x")
     _write_manifest(str(key))
-    files = sg.plan(str(key / "replica1"), str(key), "/inc",
-                    se._COPY_SUBDIRS, str(mirror))
-    assert sorted((f.dest, f.url) for f in files) == [
-        ("/inc/compilation/c", "/image-cache/M/skeleton/k/replica1/compilation/c"),
-        ("/inc/image/a b", "/image-cache/M/skeleton/k/replica1/image/a%20b"),
-    ]
+    files = sg.plan(str(key / "replica1"), str(key), "/inc", se._COPY_SUBDIRS)
+    assert sorted(f.dest for f in files) == ["/inc/compilation/c",
+                                             "/inc/image/a b"]
     assert all(f.src.startswith(str(key / "replica1")) for f in files)
+    assert all(f.frames is None and f.size == 1 for f in files)
 
 
-def test_a_skeleton_outside_the_image_source_is_copied_locally(
-        tmp_path, monkeypatch, peers):
-    """Peers cannot address it, so even peer mode reads it all from the mirror."""
+def test_plan_without_a_manifest_lists_the_files_as_they_are(tmp_path):
     source = _published(tmp_path, str(tmp_path / "cache" / "k"))
-    started = peers(str(tmp_path / "mirror"), "ok")
-    _use(monkeypatch, started)
-    incoming = str(tmp_path / "incoming")
-    stats = _gather(source, incoming, str(tmp_path / "elsewhere"))
-    _same_subdirs(source, incoming)
-    assert started[0].requests == 0 and stats.peers == 0
-    assert stats.local_bytes == stats.total_bytes
+    os.remove(os.path.join(source, sg._MANIFEST))
+    files = sg.plan(source, source, "/inc", se._COPY_SUBDIRS)
+    assert sorted(os.path.relpath(f.dest, "/inc") for f in files) == sorted(
+        os.path.relpath(os.path.join(d, n), source)
+        for sub in se._COPY_SUBDIRS
+        for d, _, names in os.walk(os.path.join(source, sub)) for n in names)
+    assert not any(f.sha256 for f in files)
 
 
-def test_ranges_are_dealt_round_robin_largest_first():
-    big = sg._File("s", "d", "/u", 10, "")
-    small = sg._File("s2", "d2", "/u2", 3, "")
-    out = sg._ranges([small, big], 4, [("a", 1), ("b", 2)])
-    assert [(r.file.size, r.start, r.end, r.peer[0]) for r in out] == [
-        (10, 0, 4, "a"), (10, 4, 8, "b"), (10, 8, 10, "a"), (3, 0, 3, "b")]
+def test_plan_refuses_compressed_pages_without_a_manifest(tmp_path):
+    source = _published(tmp_path, str(tmp_path / "cache" / "k"))
+    os.remove(os.path.join(source, sg._MANIFEST))
+    open(os.path.join(source, "image", sg.INDEX_NAME), "w").close()
+    with pytest.raises(RuntimeError, match="no _neutrino_manifest.json"):
+        sg.plan(source, source, "/inc", se._COPY_SUBDIRS)
+
+
+def test_ranges_are_cut_by_chunk_largest_first():
+    big = sg._File("s", "d", 10, "")
+    small = sg._File("s2", "d2", 3, "")
+    out = sg._ranges([small, big], 4)
+    assert [(r.file.size, r.start, r.end) for r in out] == [
+        (10, 0, 4), (10, 4, 8), (3, 0, 3), (10, 8, 10)]
 
 
 def test_chunk_accepts_binary_suffixes(monkeypatch):
@@ -225,16 +147,6 @@ def test_chunk_accepts_binary_suffixes(monkeypatch):
     assert sg._env_int(sg.CHUNK_ENV, 1, sg._parse_bytes) == 65536
     monkeypatch.setenv(sg.CHUNK_ENV, "lots")
     assert sg._env_int(sg.CHUNK_ENV, 7, sg._parse_bytes) == 7
-
-
-def test_mode_defaults_to_local(monkeypatch):
-    monkeypatch.delenv(sg.MODE_ENV, raising=False)
-    assert sg.mode() == "local"
-    for raw, want in (("", "local"), ("off", "off"), ("peers", "peers"),
-                      ("PEERS", "peers"), ("local", "local"), ("s3", "off")):
-        monkeypatch.setenv(sg.MODE_ENV, raw)
-        assert sg.mode() == want
-        assert sg.enabled() is (want != "off")
 
 
 def test_engine_and_gather_name_the_same_manifest():
@@ -271,87 +183,54 @@ def test_direct_writes_only_aligned_heads(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_gather_from_every_peer_matches_the_mirror(tmp_path, monkeypatch, peers):
-    mirror = str(tmp_path / "mirror")
+def test_gather_matches_the_mirror(tmp_path):
     source = _published(tmp_path, str(tmp_path / "cache" / "k"))
-    started = peers(mirror, "ok", "ok", "ok")
-    _use(monkeypatch, started)
     incoming = str(tmp_path / "incoming")
-    stats = _gather(source, incoming, mirror)
+    stats = _gather(source, incoming)
     _same_subdirs(source, incoming)
-    assert stats.local_bytes == 0 and stats.local_ranges == 0
-    assert stats.peer_bytes == stats.total_bytes > _BIG
-    assert (stats.peers, stats.failed_peers) == (3, 0)
-    assert all(p.requests > 0 for p in started)
+    assert stats.copied_bytes == stats.total_bytes > _BIG
+    assert stats.compressed_files == 0 and stats.stored_bytes == 0
     kernel = os.path.join("triton", "kernel.so")
     assert os.stat(os.path.join(incoming, "compilation", kernel)).st_mtime == \
         os.stat(os.path.join(source, "compilation", kernel)).st_mtime
 
 
-@pytest.mark.parametrize("behaviour", ["refuse", "short"])
-def test_a_failing_peers_ranges_come_from_the_local_mirror(
-        tmp_path, monkeypatch, peers, behaviour):
-    mirror = str(tmp_path / "mirror")
+def test_every_chunk_is_its_own_range(tmp_path, monkeypatch):
     source = _published(tmp_path, str(tmp_path / "cache" / "k"))
-    _use(monkeypatch, peers(mirror, "ok", behaviour))
+    monkeypatch.setenv(sg.CHUNK_ENV, "1000")
     incoming = str(tmp_path / "incoming")
-    stats = _gather(source, incoming, mirror)
+    stats = _gather(source, incoming)
     _same_subdirs(source, incoming)
-    assert stats.failed_peers == 1
-    assert stats.local_bytes > 0 and stats.peer_bytes > 0
-    assert stats.local_bytes + stats.peer_bytes == stats.total_bytes
-
-
-def test_no_reachable_peer_is_a_local_copy(tmp_path, monkeypatch):
-    mirror = str(tmp_path / "mirror")
-    source = _published(tmp_path, str(tmp_path / "cache" / "k"))
-    _use(monkeypatch, [])
-    monkeypatch.setenv(sg.SERVICE_ENV, "no-such-host.invalid:8081")
-    incoming = str(tmp_path / "incoming")
-    stats = _gather(source, incoming, mirror)
-    _same_subdirs(source, incoming)
-    assert stats.peers == 0 and stats.peer_bytes == 0
-    assert stats.local_bytes == stats.total_bytes
-
-
-def test_local_mode_never_asks_a_peer(tmp_path, monkeypatch, peers):
-    mirror = str(tmp_path / "mirror")
-    source = _published(tmp_path, str(tmp_path / "cache" / "k"))
-    started = peers(mirror, "ok")
-    _use(monkeypatch, started, chunk="1000")
-    monkeypatch.setenv(sg.MODE_ENV, "local")
-    incoming = str(tmp_path / "incoming")
-    stats = _gather(source, incoming, mirror)
-    _same_subdirs(source, incoming)
-    assert started[0].requests == 0
-    assert stats.peers == 0 and stats.local_bytes == stats.total_bytes
     # 1000 rounds up to one 4 KiB block per range.
-    assert stats.local_ranges == sum(
+    assert stats.ranges == sum(
         -(-os.path.getsize(os.path.join(d, n)) // sg._ALIGN)
         for sub in se._COPY_SUBDIRS
         for d, _, names in os.walk(os.path.join(source, sub)) for n in names)
 
 
-def test_past_the_deadline_ranges_come_from_the_local_mirror(
-        tmp_path, monkeypatch, peers):
-    mirror = str(tmp_path / "mirror")
+def test_a_file_cut_short_on_the_mirror_fails(tmp_path):
     source = _published(tmp_path, str(tmp_path / "cache" / "k"))
-    started = peers(mirror, "ok")
-    _use(monkeypatch, started)
-    monkeypatch.setattr(sg, "_DEADLINE_S", 0.0)
-    incoming = str(tmp_path / "incoming")
-    stats = _gather(source, incoming, mirror)
-    _same_subdirs(source, incoming)
-    assert stats.peer_bytes == 0 and started[0].requests == 0
+    os.truncate(os.path.join(source, "image", "pages-1.img"), _BIG // 2)
+    with pytest.raises(RuntimeError, match="ended early on the mirror"):
+        _gather(source, str(tmp_path / "incoming"))
 
 
-def test_sha256_catches_a_peer_serving_wrong_bytes(tmp_path, monkeypatch, peers):
+def test_only_sha256_sees_wrong_bytes_of_the_right_size(tmp_path, monkeypatch):
     """``size`` trusts the range accounting; only ``sha256`` sees the bytes."""
-    mirror = str(tmp_path / "mirror")
     source = _published(tmp_path, str(tmp_path / "cache" / "k"))
-    _use(monkeypatch, peers(mirror, "lie"), verify="sha256")
+    _overwrite(os.path.join(source, "image", "pages-1.img"), 100, b"\xff" * 8)
+    _gather(source, str(tmp_path / "size"))
+    monkeypatch.setenv(sg.VERIFY_ENV, "sha256")
     with pytest.raises(RuntimeError, match="fail their manifest sha256"):
-        _gather(source, str(tmp_path / "incoming"), mirror)
+        _gather(source, str(tmp_path / "sha256"))
+
+
+def test_sha256_needs_a_manifest(tmp_path, monkeypatch):
+    source = _published(tmp_path, str(tmp_path / "cache" / "k"))
+    os.remove(os.path.join(source, sg._MANIFEST))
+    monkeypatch.setenv(sg.VERIFY_ENV, "sha256")
+    with pytest.raises(RuntimeError, match="no manifest sha256"):
+        _gather(source, str(tmp_path / "incoming"))
 
 
 # --------------------------------------------------------------------------
@@ -359,66 +238,46 @@ def test_sha256_catches_a_peer_serving_wrong_bytes(tmp_path, monkeypatch, peers)
 # --------------------------------------------------------------------------
 
 
-def test_materialize_gathers_when_asked(tmp_path, monkeypatch, peers, caplog):
-    model_dir = _fresh_model_dir(str(tmp_path))
-    source = _published(tmp_path, model_dir)
-    mirror = str(tmp_path / "mirror")
-    monkeypatch.setenv(se._IMAGE_SOURCE_ENV, mirror)
-    _use(monkeypatch, peers(mirror, "ok", "ok"))
-    with caplog.at_level(logging.INFO, logger=se.logger.name):
-        assert se._materialize_from_source(
-            source, model_dir, _weight_root(source), _weight_hash_of(source))
-    _same_subdirs(source, model_dir)
-    assert not os.path.exists(os.path.join(model_dir, se._INCOMING_NAME))
-    line = next(r.getMessage() for r in caplog.records
-                if "semi_p: materialized" in r.getMessage())
-    assert "from 2/2 peer(s)" in line and "0.00 GiB (0 range(s))" in line
-
-
 def _materialized_line(caplog, source, model_dir):
     with caplog.at_level(logging.INFO, logger=se.logger.name):
         assert se._materialize_from_source(
             source, model_dir, _weight_root(source), _weight_hash_of(source))
     _same_subdirs(source, model_dir)
+    assert not os.path.exists(os.path.join(model_dir, se._INCOMING_NAME))
     return next(r.getMessage() for r in caplog.records
                 if "semi_p: materialized" in r.getMessage())
 
 
-def test_materialize_copies_locally_by_default(tmp_path, monkeypatch, caplog):
+def test_materialize_copies_from_the_mirror(tmp_path, caplog):
     model_dir = _fresh_model_dir(str(tmp_path))
     source = _published(tmp_path, model_dir)
-    for name in (sg.MODE_ENV, sg.SERVICE_ENV, sg.CHUNK_ENV, sg.THREADS_ENV):
-        monkeypatch.delenv(name, raising=False)
     line = _materialized_line(caplog, source, model_dir)
-    assert "from 0/0 peer(s)" in line and "over " in line
+    assert " range(s) over " in line and "pages:" not in line
 
 
-def test_materialize_off_copies_with_copytree(tmp_path, monkeypatch, caplog):
-    model_dir = _fresh_model_dir(str(tmp_path))
-    source = _published(tmp_path, model_dir)
-    monkeypatch.setenv(sg.MODE_ENV, "off")
-    assert "gathered" not in _materialized_line(caplog, source, model_dir)
-
-
-def test_materialize_without_a_manifest_copies_with_copytree(tmp_path,
-                                                             monkeypatch,
-                                                             caplog):
+def test_materialize_without_a_manifest_still_copies(tmp_path, caplog):
     model_dir = _fresh_model_dir(str(tmp_path))
     source = _published(tmp_path, model_dir)
     os.remove(os.path.join(source, sg._MANIFEST))
-    monkeypatch.delenv(sg.MODE_ENV, raising=False)
-    assert "gathered" not in _materialized_line(caplog, source, model_dir)
+    assert " range(s) over " in _materialized_line(caplog, source, model_dir)
 
 
-def test_a_failed_gather_is_a_cold_start_unless_strict(tmp_path, monkeypatch,
-                                                       peers):
+def test_the_retired_gather_knob_changes_nothing(tmp_path, monkeypatch,
+                                                 caplog):
     model_dir = _fresh_model_dir(str(tmp_path))
     source = _published(tmp_path, model_dir)
-    mirror = str(tmp_path / "mirror")
-    monkeypatch.setenv(se._IMAGE_SOURCE_ENV, mirror)
-    _use(monkeypatch, peers(mirror, "lie"), verify="sha256")
+    monkeypatch.setenv("SEMIP_GATHER", "off")
+    assert " range(s) over " in _materialized_line(caplog, source, model_dir)
+
+
+def test_a_failed_gather_is_a_cold_start_unless_strict(tmp_path, monkeypatch):
+    model_dir = _fresh_model_dir(str(tmp_path))
+    source = _published(tmp_path, model_dir)
+    _overwrite(os.path.join(source, "image", "pages-1.img"), 0, b"\0" * 8)
+    monkeypatch.setenv(sg.VERIFY_ENV, "sha256")
     args = (source, model_dir, _weight_root(source), _weight_hash_of(source))
     assert se._materialize_from_source(*args) is False
     assert not os.path.exists(os.path.join(model_dir, "image", "meta.json"))
+    assert not os.path.exists(os.path.join(model_dir, se._INCOMING_NAME))
     with pytest.raises(RuntimeError, match="materializing"):
         se._materialize_from_source(*args, strict=True)

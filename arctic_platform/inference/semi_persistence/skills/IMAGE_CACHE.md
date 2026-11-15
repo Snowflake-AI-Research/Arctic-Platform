@@ -683,6 +683,7 @@ SEMIP_IMAGE_SOURCE  /mnt/neutrino/base-models/image-cache  readOnly mirror, outl
 
 <cfg12>_<env12>/
   image/         6.4 GB   COPY   CRIU's -D dir; a restore writes into it
+                                 (pages-<N>.img decompressed on the way)
   compilation/   306 MB   COPY   the child's live compile cache
   weight/       ~66 GB    READ IN PLACE
 ```
@@ -753,6 +754,45 @@ mappings. `image/` cannot either: it is CRIU's `-D` dir, and the restore writes
 `restore.log` and a pidfile into it. Read-only would need `--work-dir` plumbing
 for 6.4 GB of savings.
 
+### How the two are copied, and compressed pages
+
+One path, `server/semip_gather.py`: the files of `compilation/` and `image/`
+are planned from the daemon's `_neutrino_manifest.json`, preallocated at full
+size with `posix_fallocate`, cut into ranges, and copied by 32 threads with
+O_DIRECT writes wherever offset and length are block-aligned. On p5en that
+moved GLM-5.3's 79 GB in ~4.2 s against `shutil.copytree`'s ~20. A source
+with no manifest (one placed by hand) has its files listed as they are.
+There is no knob choosing the path: the peer mode and the copytree fallback
+`SEMIP_GATHER` used to select are gone, since every node mirrors every file
+and the destination disk, not the source, is the bound.
+
+**Compressed pages.** `semip_publish.py` compresses every non-empty
+`image/**/pages-<N>.img` (directly under an image directory, any replica or
+node) into `pages-<N>.img.zst` at publish: zstd level 1, independent 1 MiB
+frames, each with its checksum. A frame table, `compression.json`, sits beside
+them in each image directory, and the manifest carries a `compression` block
+(`format: 1`) plus, on each compressed row, `raw_path`/`raw_size_bytes`/
+`raw_sha256` beside the stored `path`/`size_bytes`/`sha256` the daemon
+verifies. Every other file, `compilation/` included, stays raw. Each frame is
+decoded and compared before upload. The publisher runs under `nice 10`,
+stages under `<key_dir>/.semip-publish/`, and publishes raw when libzstd is
+missing, when the disk cannot hold the staging, or with
+`SEMIP_PUBLISH_COMPRESS=0`. A key is published in one format only:
+republishing it in the other refuses until it is unpublished.
+
+The materialize decodes each `.zst` back into the raw file CRIU reads, in the
+same worker pool. All-zero frames (flagged in the frame table) are never read,
+decoded or written: the file was preallocated, and a preallocated range nobody
+wrote reads back as zeros. Every decoded frame must carry its checksum and
+decode to exactly its share of the file; `SEMIP_GATHER_VERIFY=sha256` also
+hashes the result against `raw_sha256`. Any failure aborts before the flip,
+like any failed copy. A raw skeleton goes through the same pool as raw ranges.
+The `materialized` line ends with `; pages: X GiB stored -> R GiB raw in N
+file(s), Z GiB zero frames left unwritten, W GiB written, decode C core-s`
+for a compressed skeleton, and the publisher's last line is `publish
+summary: {...}` (format, raw and stored bytes, compressed files, zero frames,
+hash+compress and upload seconds), which onboarding records.
+
 ### Every way it declines, and why none of them is an error
 
 All of these log and return `False`, and the caller cold-starts. **Nothing in
@@ -779,7 +819,8 @@ failing, its post-copy size check -- raises and fails the job (all-or-none).
 | the `weight/<wt12>/` the skeleton names holds no `weights_meta.json` (nor `rank0/`), or carries no `.neutrino_verified` | We never copy weights, so the skeleton is unrestorable. Either the hash was unpublished while this skeleton still referenced it, or it has not finished syncing |
 | more than one `skeleton/<cfg12>_<env12>_*` | Two weight versions for one config and backend. Which one a job should serve is an operator's decision, so this declines and names the candidates rather than tie-breaking |
 | an `env_files` size mismatch outside `model_dir` | This node is not the environment the image was dumped in, despite `env12` agreeing. Run `imgdiff.py` |
-| the copy raises | Any I/O failure, disk-full included |
+| the manifest's compression `format` is newer than this engine reads | Decided before any copy, so even several replicas are a miss rather than a failed job |
+| the copy raises | Any I/O failure, disk-full included. For compressed pages also a frame that fails its checksum or length, a frame table that disagrees with the manifest, compressed pages without a manifest, or no libzstd |
 | an `env_files` size mismatch under `model_dir`, after the copy | The copied compile cache is short or wrong; the flipped `compilation/` is removed too, so the cold start does not inherit it |
 
 ### The four properties the copy depends on
@@ -792,8 +833,9 @@ failing, its post-copy size check -- raises and fails the job (all-or-none).
    and `os.replace`d in the order `compilation`, `image`. `image/meta.json` is
    the hit predicate, so a materialize interrupted anywhere leaves a directory
    that reads as a miss. Same discipline as the DaemonSet's manifest.
-3. **Preserve mode, then repair it.** `shutil.copytree` defaults to `copy2`,
-   which preserves mode -- necessary, because CRIU re-validates the recorded
+3. **Preserve mode, then repair it.** The copy keeps each file's mode and
+   times from the mirror, as `shutil.copy2` would (`_copy_stats`) --
+   necessary, because CRIU re-validates the recorded
    mode of every path it re-maps, but not sufficient, because the source is
    downstream of S3 and its modes are already flattened. `_apply_recorded_modes`
    puts them back from `env_files` after each `os.replace`; see "The second

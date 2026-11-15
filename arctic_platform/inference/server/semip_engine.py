@@ -250,13 +250,10 @@ _INCOMING_NAME = ".incoming"
 # publisher's SKELETON_DIRS, whose order is only its upload order.
 _COPY_SUBDIRS = (_COMPILATION_DIR, _IMAGE_DIR)
 
-# How those directories are copied. Unset is "local": a parallel ranged copy
-# from the mirror with O_DIRECT writes, ~4 s for GLM-5.3's 79 GB where copytree
-# takes ~20. "peers" pulls the ranges from every node's model-cache daemon
-# instead, "off" is copytree. See semip_gather.py.
-_GATHER_ENV = "SEMIP_GATHER"
-# The ranged copy plans from the daemon's manifest, which every verified mirror
-# directory carries; a source without one is copied with copytree.
+# How those directories are copied: semip_gather's parallel ranged copy from
+# the mirror with O_DIRECT writes, ~4 s for GLM-5.3's 79 GB where copytree
+# takes ~20, which also decodes a compressed skeleton's pages. It plans from
+# the daemon's manifest, which every verified mirror directory carries.
 _DAEMON_MANIFEST = "_neutrino_manifest.json"
 
 # Written by _semip_save_weights beside the shards it indexes; TP>1 fans out
@@ -1701,29 +1698,23 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
         # By name rather than `from ... import`: the tests load this module
         # from its file, without the package, and register the gather in
         # sys.modules the same way.
-        planned = os.path.isfile(os.path.join(verified_dir or source_dir,
-                                              _DAEMON_MANIFEST))
-        semip_gather = (importlib.import_module(
+        semip_gather = importlib.import_module(
             "arctic_platform.inference.server.semip_gather")
-            if planned and os.environ.get(_GATHER_ENV, "").strip().lower()
-            != "off" else None)
-        if semip_gather is not None and semip_gather.enabled():
-            gathered = semip_gather.gather(
-                source_dir, verified_dir or source_dir, incoming,
-                _COPY_SUBDIRS, _image_source_root())
-        else:
-            for sub in _COPY_SUBDIRS:
-                # copytree defaults to copy2, which preserves mode. Necessary
-                # but not sufficient: CRIU re-validates the recorded mode of
-                # every path it re-maps, and the source is downstream of S3,
-                # which carries no POSIX mode -- so these bytes arrive already
-                # flattened to the mirroring daemon's umask and there is
-                # nothing left here to preserve. _apply_recorded_modes repairs
-                # that after the flip. Do not shell out to `cp -a` instead --
-                # it implies -p, tries to chown as a non-root user, and returns
-                # non-zero after copying fine.
-                shutil.copytree(os.path.join(source_dir, sub),
-                                os.path.join(incoming, sub))
+        fmt = semip_gather.compression_format(verified_dir or source_dir)
+        if fmt > semip_gather.FORMAT:
+            # Every replica reads the same manifest, so even strict is a miss.
+            logger.warning(
+                "semi_p: %s: skeleton format %d is newer than this engine, "
+                "which reads format %d; cold-starting", source_dir, fmt,
+                semip_gather.FORMAT)
+            return False
+        # The gather keeps the mirror's modes, which is necessary but not
+        # sufficient: CRIU re-validates the recorded mode of every path it
+        # re-maps, and the source is downstream of S3, which carries no POSIX
+        # mode -- so these bytes arrive already flattened to the mirroring
+        # daemon's umask. _apply_recorded_modes repairs that after the flip.
+        gathered = semip_gather.gather(
+            source_dir, verified_dir or source_dir, incoming, _COPY_SUBDIRS)
         files, total = _dir_bytes(incoming)
 
         for sub in _COPY_SUBDIRS:
@@ -1762,14 +1753,15 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
         shutil.rmtree(incoming, ignore_errors=True)
 
     elapsed = time.perf_counter() - t0
-    how = ""
-    if gathered is not None:
-        how = (f"; gathered {gathered.peer_bytes / 2**30:.2f} GiB from "
-               f"{gathered.peers - gathered.failed_peers}/{gathered.peers} "
-               f"peer(s) and {gathered.local_bytes / 2**30:.2f} GiB "
-               f"({gathered.local_ranges} range(s)) from the local mirror "
-               f"over {gathered.flows} flow(s)"
-               f"{', O_DIRECT' if gathered.direct else ''}")
+    how = (f"; {gathered.ranges} range(s) over {gathered.flows} flow(s)"
+           f"{', O_DIRECT' if gathered.direct else ''}")
+    if gathered.compressed_files:
+        raw = gathered.written_bytes + gathered.zero_bytes
+        how += (f"; pages: {gathered.stored_bytes / 2**30:.2f} GiB stored -> "
+                f"{raw / 2**30:.2f} GiB raw in {gathered.compressed_files} "
+                f"file(s), {gathered.zero_bytes / 2**30:.2f} GiB zero frames "
+                f"left unwritten, {gathered.written_bytes / 2**30:.2f} GiB "
+                f"written, decode {gathered.decode_cpu_s:.1f} core-s")
     logger.info(
         "semi_p: materialized %s from %s: %d file(s), %.2f GiB in %.1fs "
         "(%.0f MB/s); weights stay on the mirror%s",
