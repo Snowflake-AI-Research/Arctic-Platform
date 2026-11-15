@@ -37,7 +37,6 @@ def _disable_kv_cache(config) -> None:
 @register_patch("gradient_checkpointing")
 def apply_gradient_checkpointing(model: nn.Module, ctx: LoaderContext) -> None:
     value = ctx.spec.patches.gradient_checkpointing
-    frequency = 1 if value is True else int(value)
     root_config = getattr(model, "config", None)
     config = _text_config(model)
     is_qwen3 = getattr(config, "model_type", "") == "qwen3"
@@ -45,7 +44,7 @@ def apply_gradient_checkpointing(model: nn.Module, ctx: LoaderContext) -> None:
     if config is not root_config:
         _disable_kv_cache(config)
 
-    if frequency == 1:
+    if value is True or value == 1:
         if is_qwen3:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         else:
@@ -55,8 +54,16 @@ def apply_gradient_checkpointing(model: nn.Module, ctx: LoaderContext) -> None:
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 
         layers = transformer_layers(model, patch_name="periodic gradient checkpointing")
+        num_layers = len(layers._modules)
+        if isinstance(value, list):
+            missing = sorted(index for index in value if index >= num_layers)
+            if missing:
+                raise ValueError(f"gradient_checkpointing layers {missing} are past the model's {num_layers} layers")
+            checkpointed = set(value)
+        else:
+            checkpointed = set(range(0, num_layers, int(value)))
         for layer_index, layer_name in enumerate(list(layers._modules)):
-            if layer_index % frequency == 0:
+            if layer_index in checkpointed:
                 layers._modules[layer_name] = checkpoint_wrapper(
                     layers._modules[layer_name],
                     checkpoint_impl=CheckpointImpl.NO_REENTRANT,
