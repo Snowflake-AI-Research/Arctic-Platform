@@ -795,15 +795,26 @@ def _semip_layout(worker):
 
 
 def _semip_attach(worker):
+    """Size the host copy and record the layout.
+
+    ``_semip_rows`` is the weight set's layout, every entry at its offset in
+    the shards.  ``_semip_index`` is the host copy's: a parameter kept in its
+    own mapping (``worker._semip_host``, see host_weights) is read and written
+    in place, so it has no room in the buffer and nothing stages or restores
+    it.  Without one the two offsets agree."""
     layout = _semip_layout(worker)
-    total_size = sum(nb for _, nb, _, _ in layout)
-    index = {}
-    offset = 0
+    host = getattr(worker, "_semip_host", None) or {}
+    index, rows = {}, []
+    offset = total_size = 0
     for name, nbytes, dtype, shape in layout:
-        index[name] = (offset, nbytes, dtype, shape)
+        rows.append((name, offset, nbytes, dtype, shape))
         offset += nbytes
+        if name not in host:
+            index[name] = (total_size, nbytes, dtype, shape)
+            total_size += nbytes
     worker._semip_buf = torch.empty(total_size, dtype=torch.uint8)
     worker._semip_index = index
+    worker._semip_rows = rows
     worker._semip_chunk_plan = None
     worker._semip_chunk_size = None
     worker._semip_pinned = False
@@ -1050,6 +1061,7 @@ def _semip_detach(worker):
         _unpin_buffer(buf)
     worker._semip_buf = None
     worker._semip_index = None
+    worker._semip_rows = None
     worker._semip_chunk_plan = None
     worker._semip_chunk_size = None
     worker._semip_pinned = False
@@ -1149,6 +1161,39 @@ def _semip_restore_lora(worker):
     return sum(v.numel() for v in views)
 
 
+def _semip_segments(worker):
+    """The weight set's bytes as ``(lo, hi, source)`` runs, in order.
+
+    ``source`` is the run's offset in the host copy, or the name of a
+    parameter that lives in its own mapping (``worker._semip_host``).
+    Neighbouring host-copy entries merge, so a model with no such parameter
+    is one run, the whole buffer."""
+    host = getattr(worker, "_semip_host", None) or {}
+    segments = []
+    for name, off, nbytes, _, _ in worker._semip_rows:
+        if name in host:
+            segments.append((off, off + nbytes, name))
+        elif segments and isinstance(segments[-1][2], int) and segments[-1][1] == off:
+            segments[-1] = (segments[-1][0], off + nbytes, segments[-1][2])
+        else:
+            segments.append((off, off + nbytes, worker._semip_index[name][0]))
+    return segments
+
+
+def _semip_read_into(path, pos, dst):
+    """Read ``len(dst)`` bytes of ``path`` from ``pos`` into ``dst``; how many arrived."""
+    got = 0
+    with open(path, "rb", buffering=0) as f:
+        if pos:
+            f.seek(pos)
+        while got < len(dst):
+            r = f.readinto(dst[got:])
+            if not r:
+                break
+            got += r
+    return got
+
+
 def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
     buf = worker._semip_buf
     index = worker._semip_index
@@ -1168,8 +1213,11 @@ def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
                 f"as that user and re-run save_weights()") from e
     os.makedirs(rank_dir, exist_ok=True)
 
-    total = buf.numel()
+    rows = worker._semip_rows
+    host = getattr(worker, "_semip_host", None) or {}
+    total = sum(nbytes for _, _, nbytes, _, _ in rows)
     mv = memoryview(buf.numpy())
+    segments = _semip_segments(worker)
     ranges = []
     lo = 0
     i = 0
@@ -1183,9 +1231,17 @@ def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
         fd = os.open(os.path.join(rank_dir, f"shard_{i:04d}.bin"),
                      os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
-            pos = lo
-            while pos < hi:
-                pos += os.write(fd, mv[pos:hi])
+            for s_lo, s_hi, src in segments:
+                a, b = max(lo, s_lo), min(hi, s_hi)
+                if a >= b:
+                    continue
+                if isinstance(src, int):
+                    view = mv[src + a - s_lo:src + b - s_lo]
+                else:
+                    view = host[src].view()[a - s_lo:b - s_lo]
+                pos = 0
+                while pos < len(view):
+                    pos += os.write(fd, view[pos:])
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -1196,12 +1252,12 @@ def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
 
     manifest = {
         "total_bytes": total,
-        "n_params": len(index),
+        "n_params": len(rows),
         "shard_bytes": shard_bytes,
         "shards": [{"name": f"shard_{i:04d}.bin", "offset": lo, "nbytes": hi - lo}
                    for (i, lo, hi) in ranges],
         "layout": [[name, off, nbytes, str(dtype), list(shape)]
-                   for name, (off, nbytes, dtype, shape) in index.items()],
+                   for name, off, nbytes, dtype, shape in rows],
     }
     with open(os.path.join(rank_dir, "weights_meta.json"), "w") as f:
         json.dump(manifest, f)
@@ -1209,8 +1265,9 @@ def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
 
 
 def _semip_load_weights(worker, weights_dir, io_workers=None):
+    """Read the shards into the host copy.  Parameters kept in their own
+    mapping are skipped: refill_host_weights reads those."""
     buf = worker._semip_buf
-    index = worker._semip_index
     workers = int(io_workers or _WEIGHTS_IO_WORKERS)
     rank_dir = (weights_dir if _semip_tp_size(worker) <= 1
                 else os.path.join(weights_dir, f"rank{worker.rank}"))
@@ -1218,13 +1275,13 @@ def _semip_load_weights(worker, weights_dir, io_workers=None):
     with open(meta_path) as f:
         manifest = json.load(f)
 
-    total = buf.numel()
+    rows = worker._semip_rows
+    total = sum(nbytes for _, _, nbytes, _, _ in rows)
     if int(manifest["total_bytes"]) != total:
         raise RuntimeError(
             f"weights size mismatch: manifest {manifest['total_bytes']}B but "
-            f"attached buffer {total}B (config/model changed?)")
-    cur_layout = [[name, off, nbytes]
-                  for name, (off, nbytes, dtype, shape) in index.items()]
+            f"attached layout {total}B (config/model changed?)")
+    cur_layout = [[name, off, nbytes] for name, off, nbytes, _, _ in rows]
     man_layout = [[row[0], row[1], row[2]] for row in manifest.get("layout", [])]
     if man_layout and man_layout != cur_layout:
         raise RuntimeError("weights layout mismatch between manifest and "
@@ -1232,25 +1289,105 @@ def _semip_load_weights(worker, weights_dir, io_workers=None):
 
     mv = memoryview(buf.numpy())
     shards = manifest["shards"]
+    segments = [s for s in _semip_segments(worker) if isinstance(s[2], int)]
 
     def _read_shard(s):
         lo = int(s["offset"])
-        n = int(s["nbytes"])
-        dst = mv[lo:lo + n]
-        got = 0
-        with open(os.path.join(rank_dir, s["name"]), "rb", buffering=0) as f:
-            while got < n:
-                r = f.readinto(dst[got:])
-                if r == 0:
-                    break
-                got += r
-        if got != n:
-            raise RuntimeError(f"{s['name']}: read {got} != {n}")
+        hi = lo + int(s["nbytes"])
+        path = os.path.join(rank_dir, s["name"])
+        for s_lo, s_hi, src in segments:
+            a, b = max(lo, s_lo), min(hi, s_hi)
+            if a >= b:
+                continue
+            got = _semip_read_into(path, a - lo, mv[src + a - s_lo:src + b - s_lo])
+            if got != b - a:
+                raise RuntimeError(f"{s['name']}: read {got} != {b - a}")
 
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(shards)))) as ex:
         for fu in [ex.submit(_read_shard, s) for s in shards]:
             fu.result()
-    return total
+    return buf.numel()
+
+
+# Parameters kept in their own mapping (host_weights, on the worker as
+# ``_semip_host``).  Each target reports ``down``: whether any of them is
+# unregistered, which the child refuses to serve on.
+def _semip_host_census(worker):
+    host = getattr(worker, "_semip_host", None)
+    return host.census() if host else {"n": 0, "bytes": 0, "down": False}
+
+
+def _semip_unpin_host(worker):
+    host = getattr(worker, "_semip_host", None)
+    return host.unpin() if host else {"n": 0, "bytes": 0, "down": False}
+
+
+def _semip_repin_host(worker):
+    host = getattr(worker, "_semip_host", None)
+    return host.repin() if host else {"n": 0, "bytes": 0, "down": False}
+
+
+def _semip_release_host_weights(worker):
+    host = getattr(worker, "_semip_host", None)
+    if not host:
+        return {"n": 0, "bytes": 0, "released": [], "kept": [], "seconds": 0.0,
+                "down": False}
+    return {"rank": worker.rank, **host.release()}
+
+
+def _semip_refill_host_weights(worker, weights_dir, io_workers=None):
+    """Read each released parameter's bytes from the shards straight into its
+    mapping, then register and check them all (``HostWeights.finish_refill``).
+
+    Raises before anything serves on a missing or mismatched manifest entry,
+    a short read, a failed registration or a wrong checksum."""
+    host = getattr(worker, "_semip_host", None)
+    if not host:
+        return {"n": 0, "refilled": 0, "refilled_bytes": 0, "down": False}
+    released = [name for name, e in host.items() if e.dropped]
+    t0 = time.perf_counter()
+    if released:
+        workers = int(io_workers or _WEIGHTS_IO_WORKERS)
+        rank_dir = (weights_dir if _semip_tp_size(worker) <= 1
+                    else os.path.join(weights_dir, f"rank{worker.rank}"))
+        with open(os.path.join(rank_dir, "weights_meta.json")) as f:
+            manifest = json.load(f)
+        where = {row[0]: (int(row[1]), int(row[2]))
+                 for row in manifest.get("layout", [])}
+        shards = [(os.path.join(rank_dir, s["name"]), int(s["offset"]),
+                   int(s["offset"]) + int(s["nbytes"])) for s in manifest["shards"]]
+        pieces = []
+        for name in released:
+            entry = host[name]
+            off, nbytes = where.get(name, (None, None))
+            if nbytes != entry.nbytes:
+                raise RuntimeError(
+                    f"{name}: {entry.nbytes} B in the image but "
+                    f"{'absent' if nbytes is None else f'{nbytes} B'} in "
+                    f"{rank_dir}/weights_meta.json")
+            entry.open()
+            dst = entry.view()
+            for path, lo, hi in shards:
+                a, b = max(lo, off), min(hi, off + nbytes)
+                if a < b:
+                    pieces.append((name, path, a - lo, dst[a - off:b - off]))
+            covered = sum(len(p[3]) for p in pieces if p[0] == name)
+            if covered != nbytes:
+                raise RuntimeError(f"{name}: the shards in {rank_dir} cover "
+                                   f"{covered} of its {nbytes} B")
+
+        def _read(piece):
+            name, path, pos, dst = piece
+            got = _semip_read_into(path, pos, dst)
+            if got != len(dst):
+                raise RuntimeError(f"{name}: {os.path.basename(path)} read "
+                                   f"{got} != {len(dst)}")
+
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(pieces)))) as ex:
+            for fu in [ex.submit(_read, p) for p in pieces]:
+                fu.result()
+    out = host.finish_refill(released, read_s=time.perf_counter() - t0)
+    return {"rank": worker.rank, **out}
 
 
 # ---------------------------------------------------------------------------
@@ -3573,6 +3710,17 @@ def _log_graph_census(llm, log, when):
 _SERVING_REFUSED_CMDS = frozenset(
     {"generate", "pause", "resume", "prepare_criu_dump", "serve_core"})
 
+# Commands that run the model, or hand it to something that will, refused
+# while a host-resident parameter is unregistered: its kernels would read an
+# unmapped (released: PROT_NONE and empty) address.
+_HOST_DOWN_REFUSED_CMDS = frozenset(
+    {"wake_up_kv_cache", "rebind_graphs", "recapture_graphs", "serve_core",
+     "resume"})
+_HOST_DOWN_ERROR = (
+    "{cmd} refused: host-resident parameters are not registered (released at "
+    "the dump, or unpinned); refill_host_weights after a restore, or repin, "
+    "registers them")
+
 # How long an idle serving child waits for a request before checking the pipe.
 _SERVING_IDLE_WAIT_S = 0.005
 
@@ -3894,6 +4042,13 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
     # dormant-engine wedge".
     _paused = False
     _dormant = False
+    # Parameters the workers keep in their own mappings (host_weights): how
+    # many across ranks, their bytes, and whether any is unregistered --
+    # released by the dump or unpinned -- in which case nothing may run the
+    # model until refill_host_weights or repin registers it again.
+    _host_n = 0
+    _host_bytes = 0
+    _host_down = False
     _saved_requests = []
     # The core once ``serve_core`` has handed it to a front end; from then on
     # the main loop drives it through ``_semip_serving_tick``.
@@ -3943,6 +4098,8 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
 
     def _submit_generate(req_id, prompts, sampling_params_dict,
                          reasoning_ended=None):
+        if _host_down and not _paused:
+            raise RuntimeError(_HOST_DOWN_ERROR.format(cmd="generate"))
         if _dormant and not _paused:
             # Defense-in-depth fail-fast: the orchestrator should
             # never enqueue a generate cmd onto an engine that has
@@ -4431,11 +4588,14 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
         nonlocal llm, engine
         nonlocal _paused, _dormant
         nonlocal _served_core
+        nonlocal _host_n, _host_bytes, _host_down
 
         error = None
         info = {}
 
         try:
+            if _host_down and cmd in _HOST_DOWN_REFUSED_CMDS:
+                raise RuntimeError(_HOST_DOWN_ERROR.format(cmd=cmd))
             if cmd == "init":
                 vllm_config = dict(kwargs["vllm_config"])
                 vllm_config["enable_sleep_mode"] = True
@@ -4730,6 +4890,14 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                 except Exception:  # noqa: BLE001 - the check is best effort
                     log.warning("  weight-like storage checksums failed; "
                                 "skipping the volatility check", exc_info=True)
+                _census = llm.collective_rpc(_semip_host_census)
+                _host_n = sum(c["n"] for c in _census)
+                _host_bytes = sum(c["bytes"] for c in _census)
+                if _host_n:
+                    log.info("  %d host-resident parameter(s), %.2f GiB across "
+                             "%d worker(s), leave the image at the dump: %s",
+                             _host_n, _host_bytes / 2**30, len(_census),
+                             _census[0].get("names"))
 
             elif cmd == "attach":
                 if llm is None:
@@ -4769,6 +4937,10 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                              "named_parameters()",
                              sum(r[3] for r in results) / 2**30,
                              sum(r[2] for r in results))
+                if _host_n:
+                    log.info("  besides it %.2f GiB in %d host-resident "
+                             "parameter(s), read and written in place",
+                             _host_bytes / 2**30, _host_n)
 
             elif cmd == "attach_pinned":
                 raise RuntimeError(
@@ -4786,12 +4958,72 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     raise RuntimeError("unpin requires attach first")
                 results = llm.collective_rpc(_semip_unpin)
                 log.info("  unpinned %.2f GiB", sum(results) / 2**30)
+                if _host_n:
+                    _host_down = any(r["down"] for r in
+                                     llm.collective_rpc(_semip_unpin_host))
+                    log.info("  unpinned %.2f GiB of host-resident parameters",
+                             _host_bytes / 2**30)
 
             elif cmd == "repin":
                 if llm is None:
                     raise RuntimeError("repin requires attach first")
                 results = llm.collective_rpc(_semip_repin)
                 log.info("  repinned %.2f GiB", sum(results) / 2**30)
+                if _host_n:
+                    _host_down = any(r["down"] for r in
+                                     llm.collective_rpc(_semip_repin_host))
+                    log.info("  repinned host-resident parameters%s",
+                             " -- some are still released, refill_host_weights "
+                             "has to read them" if _host_down else "")
+
+            elif cmd == "release_host_weights":
+                if llm is None:
+                    raise RuntimeError("release_host_weights requires init first")
+                results = (llm.collective_rpc(_semip_release_host_weights)
+                           if _host_n else [])
+                _host_down = any(r["down"] for r in results)
+                for r in results:
+                    log.info("  released host weights rank=%s: %d of %d "
+                             "param(s), %.2f GiB, dropped from the image in "
+                             "%.2fs; unchanged since load %d/%d",
+                             r.get("rank"), len(r["released"]), r["n"],
+                             sum(nb for _, nb in r["released"]) / 2**30,
+                             r["seconds"], len(r["released"]),
+                             len(r["released"]) + len(r["kept"]))
+                    if r["kept"]:
+                        log.warning(
+                            "  WARNING rank=%s: host-resident parameter(s) %s "
+                            "CHANGED between load and dump, so they stay in "
+                            "the CRIU image (%.2f GiB) instead of being "
+                            "refilled from the weight set", r.get("rank"),
+                            [n for n, _ in r["kept"]],
+                            sum(nb for _, nb in r["kept"]) / 2**30)
+                if results:
+                    info["host_weights"] = {
+                        "entries": results[0]["released"] + results[0]["kept"],
+                        "bytes_per_rank": [sum(nb for _, nb in r["released"])
+                                           for r in results],
+                        "kept": [[r.get("rank"), n] for r in results
+                                 for n, _ in r["kept"]],
+                        "released": True,
+                    }
+
+            elif cmd == "refill_host_weights":
+                if llm is None:
+                    raise RuntimeError("refill_host_weights requires init first")
+                results = (llm.collective_rpc(
+                    _semip_refill_host_weights,
+                    args=(kwargs["weights_dir"], kwargs.get("io_workers")))
+                    if _host_n else [])
+                _host_down = any(r["down"] for r in results)
+                for r in results:
+                    log.info("  refilled host weights rank=%s: %d param(s) "
+                             "%.2f GiB read in %.2fs, %d registered in %.2fs, "
+                             "checksums ok in %.2fs", r.get("rank"),
+                             r["refilled"], r["refilled_bytes"] / 2**30,
+                             r["read_s"], r["registered"], r["register_s"],
+                             r["verify_s"])
+                info["bytes"] = sum(r["refilled_bytes"] for r in results)
 
             elif cmd == "sleep":
                 # Invariant: while `_paused` is True, `_active_reqs`

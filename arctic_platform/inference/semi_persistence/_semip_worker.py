@@ -31,6 +31,9 @@ It also routes TP all-gathers through CustomAllreduce (``ca_all_gather``) for
 good, so the captured graphs hold no NCCL all-gather and the dump keeps them
 for rebind instead of dropping them for a recapture.
 
+``load_model`` moves large pinned host parameters into mappings semi_p can
+empty at the dump (``host_weights``), before anything captures their address.
+
 Both hooks return whatever the base class returns, so this stays agnostic to
 the ``compile_or_warm_up_model`` return type (a float on older vLLM, a
 ``CompilationTimes`` on newer).
@@ -93,6 +96,37 @@ class SemipGPUWorker(Worker):
         self._semip_arm_profile_register_guard()
         self._semip_install_spin_clock()
         return result
+
+    def load_model(self, *args, **kwargs):
+        result = super().load_model(*args, **kwargs)
+        self._semip_thin_pinned_params()
+        return result
+
+    def _semip_thin_pinned_params(self):
+        """Rehome the large pinned host parameters (``host_weights``) and say
+        what moved.  Before ``determine_available_memory``'s profiling
+        capture, the first thing to bake a parameter's address into a graph.
+        A failure costs the thinning, not the load: whatever moved before it
+        stays tracked in ``_semip_host``."""
+        try:
+            import host_weights
+        except Exception as exc:  # noqa: BLE001
+            print(f"[semip-host] rank={self.rank} host_weights unavailable: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            return
+        if not host_weights.enabled():
+            print(f"[semip-host] rank={self.rank} off ({host_weights.FLAG_ENV}=0)",
+                  flush=True)
+            return
+        self._semip_host = host_weights.HostWeights()
+        try:
+            host_weights.rehome(self, self._semip_host)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[semip-host] rank={self.rank} rehome failed after "
+                  f"{len(self._semip_host)} param(s): {type(exc).__name__}: {exc}",
+                  flush=True)
+        print(f"[semip-host] rank={self.rank} "
+              f"{host_weights.describe(self._semip_host)}", flush=True)
 
     def _semip_install_custom_all_gather(self, where):
         """Route TP all-gathers through CustomAllreduce and say what stuck.

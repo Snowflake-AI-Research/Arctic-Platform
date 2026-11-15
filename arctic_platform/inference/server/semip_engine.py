@@ -2385,6 +2385,7 @@ def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
         inst.attach()
         inst.stage()
         inst.save_weights()
+        inst.release_host_weights()
         inst.detach()
         inst.sleep()
         # Checked before the checkpoint: an engine that failed to sleep still
@@ -2395,7 +2396,8 @@ def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
         inst.criu_dump(meta_extra={"image_ref": image_ref,
                                    "driver_version": driver_version,
                                    "pid_floor": pid_floor,
-                                   "unprivileged": _unprivileged_mode()})
+                                   "unprivileged": _unprivileged_mode(),
+                                   **_host_weights_meta(inst)})
         inst.wait()             # criu_dump destroys the child
     except BaseException:
         _discard_image(model_dir)
@@ -2413,6 +2415,14 @@ def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
     _record_env_files(model_dir)
     logger.info("semi_p: dump complete model_dir=%s in %.1fs",
                 model_dir, time.perf_counter() - t0)
+
+
+def _host_weights_meta(inst: Any) -> dict[str, Any]:
+    """``{"host_weights": ...}`` for ``meta.json`` when the dump released any
+    host-resident parameter (``release_host_weights``), else nothing.  A record
+    of what the image left out; the restore reads it from the image itself."""
+    released = inst.last_info.get("release_host_weights") or {}
+    return {"host_weights": released["host_weights"]} if released.get("host_weights") else {}
 
 
 def _unprivileged_mode() -> bool:
@@ -2501,6 +2511,7 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
         inst.cuda_restore(gpus=gpus).wait()
         inst.reinit_nccl().wait()
         inst.attach().load_weights(weights_dir=weights_dir).wait()
+        inst.refill_host_weights(weights_dir=weights_dir).wait()
         inst.wake_up_weights().wait()
         _check_staging_budget(inst, model_dir)
         inst.plan_restore_weights().wait()
@@ -2698,6 +2709,7 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
         inst.attach()
         inst.stage()
         inst.save_weights(weights_dir=weights_dir)
+        inst.release_host_weights()
         inst.detach()
         inst.sleep()
         inst.wait()             # a failed sleep is never checkpointed; see _dump
@@ -2710,7 +2722,7 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
         # Issued before the leader's dump so the wait inside them overlaps it.
         dumping = [agent.criu_dump.remote(_meta(k + 1))
                    for k, agent in enumerate(agents)]
-        inst.criu_dump(meta_extra=_meta(0))
+        inst.criu_dump(meta_extra={**_meta(0), **_host_weights_meta(inst)})
         inst.wait()
         ray.get(dumping)
     except BaseException:
@@ -2808,6 +2820,7 @@ def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
         inst.reinit_nccl(master_addr=leader_ip,
                          ifname=_multinode_ifname()).wait()
         inst.attach().load_weights(weights_dir=weights_dir).wait()
+        inst.refill_host_weights(weights_dir=weights_dir).wait()
         inst.wake_up_weights().wait()
         _check_staging_budget(inst, model_dir)
         inst.plan_restore_weights().wait()

@@ -89,6 +89,8 @@ restoring job sets is visible there.
 | `stage()` | Snapshot main + drafter params GPU -> that worker's CPU buffer |
 | `save_weights()` | Write each worker's buffer to `<model_dir>/weights` as shards + `weights_meta.json`. Call after `stage()`, before `detach()`, so the image stays small |
 | `load_weights()` | Read those shards back into the buffer. Requires a prior `attach()` on the restore side |
+| `release_host_weights()` | After `save_weights()`: unregister the large pinned host parameters `SemipGPUWorker.load_model` moved into their own mappings (`host_weights.py`; DeepSeek-V4.1's Engram tables), drop their pages and make them PROT_NONE, so the image keeps an empty mapping at each address. One changed since load stays in the image, with a warning. No-op without such parameters or with `SEMIP_THIN_PINNED_PARAMS=0` |
+| `refill_host_weights()` | After `load_weights()`: read those parameters' shard ranges back into their mappings, re-register them and check their checksums. Until then the child refuses `generate`, `wake_up_kv_cache`, `rebind_graphs`, `recapture_graphs`, `serve_core` and `resume` |
 | `plan_restore_weights()` | Build and cache a chunk plan under a computed byte budget; if the buffer is pageable, also form a small pinned double buffer (`SEMIP_PINNED_BUFFER_*`) |
 | `restore_weights()` | Execute the cached plan: buffer -> (pinned double buffer, if formed) -> one reused GPU staging buffer -> scatter |
 

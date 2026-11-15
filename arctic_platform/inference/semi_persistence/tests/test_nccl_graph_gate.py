@@ -689,7 +689,7 @@ def test_an_image_that_dropped_its_graphs_recaptures(tmp_path, monkeypatch):
         "graph_nccl_nodes": {"0": 816}})
     assert "rebind_graphs" not in calls
     assert calls == ["criu_restore", "cuda_restore", "reinit_nccl", "attach",
-                     "load_weights", "wake_up_weights",
+                     "load_weights", "refill_host_weights", "wake_up_weights",
                      "plan_restore_weights", "restore_weights",
                      "wake_up_kv_cache", "recapture_graphs"]
 
