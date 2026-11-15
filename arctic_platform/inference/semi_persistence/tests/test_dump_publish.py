@@ -223,6 +223,7 @@ def test_publish_command_names_the_script_and_the_bucket():
     assert os.path.isfile(command[1])
     assert command[2] == "/data-fast/image-cache_neutrino/k"
     assert command[command.index("--bucket") + 1] == se._PUBLISH_BUCKET
+    assert command[command.index("--nice") + 1] == str(se._PUBLISH_NICE)
 
 
 def _record_publishes(monkeypatch):
