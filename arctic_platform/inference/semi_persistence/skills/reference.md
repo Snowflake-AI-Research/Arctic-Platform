@@ -87,8 +87,8 @@ restoring job sets is visible there.
 | `detach()` | Free each worker's CPU buffer |
 | `repin()` / `unpin()` | `cudaHostRegister` / `cudaHostUnregister` each worker's buffer. Idempotent |
 | `stage()` | Snapshot main + drafter params GPU -> that worker's CPU buffer |
-| `save_weights()` | Write each worker's buffer to `<model_dir>/weights` as shards + `weights_meta.json`. Call after `stage()`, before `detach()`, so the image stays small |
-| `load_weights()` | Read those shards back into the buffer. Requires a prior `attach()` on the restore side |
+| `save_weights()` | Write each worker's buffer to `<model_dir>/weights` as shards + `weights_meta.json`. Call after `stage()`, before `detach()`, so the image stays small. The manifest records canonical names (a LoRA wrapper's `.base_layer.` dropped), so a LoRA config writes its full config's weight set; see [IMAGE_CACHE.md](IMAGE_CACHE.md) §1 |
+| `load_weights()` | Read those shards back into the buffer. Requires a prior `attach()` on the restore side. Checks size, and names (canonical on both sides), offsets, sizes and dtypes against the attached model |
 | `release_host_weights()` | After `save_weights()`: unregister the large pinned host parameters `SemipGPUWorker.load_model` moved into their own mappings (`host_weights.py`; DeepSeek-V4.1's Engram tables), drop their pages and make them PROT_NONE, so the image keeps an empty mapping at each address. One changed since load stays in the image, with a warning. No-op without such parameters or with `SEMIP_THIN_PINNED_PARAMS=0` |
 | `refill_host_weights()` | After `load_weights()`: read those parameters' shard ranges back into their mappings, re-register them and check their checksums. Until then the child refuses `generate`, `wake_up_kv_cache`, `rebind_graphs`, `recapture_graphs`, `serve_core` and `resume` |
 | `plan_restore_weights()` | Build and cache a chunk plan under a computed byte budget; if the buffer is pageable, also form a small pinned double buffer (`SEMIP_PINNED_BUFFER_*`) |
@@ -108,6 +108,30 @@ sizes. See [instance_DESIGN.md](instance_DESIGN.md).
 The drafter contributes extra parameter entries only when it exposes a `.model`
 (Eagle / Medusa / DraftModel / ArcticProposer). Ngram and Suffix drafters are
 skipped, collapsing the layout to main params only.
+
+### Host-resident parameters
+
+Large pinned CPU parameters (DeepSeek-V4.1-Flash's Engram tables, 23.6 GiB per
+rank) are moved at load into mappings semi_p empties at the dump and refills at
+the restore; the host copy leaves them out. Mechanism and rules in
+[instance_DESIGN.md](instance_DESIGN.md) *Host-Resident Parameters*. What the
+log shows, per rank unless noted:
+
+| When | Line |
+|---|---|
+| load (`SemipGPUWorker.load_model`) | `[semip-host] rank=R rehomed N param(s) X GiB in Ts (torch pinned A -> B GiB) skipped K [(name, reason), ...] uva_identity=ok` (the last field only when N > 0); `[semip-host] rank=R off (SEMIP_THIN_PINNED_PARAMS=0)` when disabled |
+| ... old blocks still allocated | the load line ends with `WARNING: torch pinned memory dropped by only Y of X GiB; an old storage is still referenced, so its pinned block stays in host memory and in the image` (drop < 90% of the rehomed bytes) |
+| end of `init`, once | `N host-resident parameter(s), X GiB across W worker(s), leave the image at the dump: [names]` |
+| `attach`, once | `besides it X GiB in N host-resident parameter(s), read and written in place` |
+| `release_host_weights` | `released host weights rank=R: N of M param(s), X GiB, dropped from the image in Ts; unchanged since load N/M` |
+| ... an entry changed since load | `WARNING rank=R: host-resident parameter(s) [names] CHANGED between load and dump, so they stay in the CRIU image (X GiB) instead of being refilled from the weight set` |
+| `refill_host_weights` | `refilled host weights rank=R: N param(s) X GiB read in Ts, N registered in Ts, checksums ok in Ts`, then `<<< refill_host_weights OK (Ts)` |
+| a refused command | `<cmd> refused: host-resident parameters are not registered (released at the dump, or unpinned); refill_host_weights after a restore, or repin, registers them` |
+
+`torch pinned A -> B` is torch's pinned-allocator total before and after the
+rehome (`reserved_bytes.current`, or `allocated_bytes.current` on torch 2.13,
+which has no `reserved_bytes` keys; `?` if neither). The drop is torch's old
+blocks going back to the driver.
 
 ### Serving
 
@@ -319,6 +343,7 @@ on reboot and lets `criu_restore` validate the image against the instance.
 | `SEMIP_PINNED_BUFFER_BYTES` | Pinned bytes per worker for the double buffer `plan_restore_weights` forms when the host copy is pageable, split into two halves: one fills from the pageable copy while the other copies to the GPU. Default 1 GiB (2 x 512 MiB); `0` forms none, and `restore_weights` copies straight from pageable memory (slow). The copy is bound by the fill, so more halves or bigger ones copied no faster on GLM TP=8 or Qwen TP=1. Read by `Instance` at plan time, so a restore job's `extra_env` reaches it |
 | `SEMIP_PINNED_BUFFER_THREADS` | Threads filling each half from the pageable copy. Default 8. On Qwen3.6 TP=1 (65 GiB per worker, 16 CPUs per GPU), `restore_weights` took 4.9 s with 4, 2.8 s with 8 and 2.6 s with 16, and nothing was throttled |
 | `SEMIP_PIN_HOST_COPY=0` | Keep the host copy pageable. Default on: the first sleep of a `SemiPAsyncLLM` front end pins it (`repin`, which also frees the double buffer) in the background, and every later wake copies it to the GPU directly. Eight Qwen3.6 TP=1 replicas waking at once on one node took 7–12 s per `restore_weights` through the double buffer (bound by host memory bandwidth, whatever the thread count) and 2.3–3.1 s pinned. Pinning took 2.8 s for one replica and 10–16 s for eight at once; a wake that comes sooner waits for it. Read by the front end, in the job's own process |
+| `SEMIP_THIN_PINNED_PARAMS=0` | Leave large pinned host parameters where vLLM put them, inside the CRIU image (the old behaviour). Default on: at TP>1 `SemipGPUWorker.load_model` moves each qualifying one into a mapping the dump empties (`release_host_weights`) and the restore refills from the weight set (`refill_host_weights`). Only DeepSeek-V4.1-Flash's Engram tables qualify today. Needed for a weight sync that updates those parameters. Read by the vLLM workers at load, so it acts on a cold start only; it is in neither cache hash (`extra_env`), and a restore follows whatever the image did |
 | `_SEMIP_CHILD_DROP_CAPS=1` | Internal only, set by the worker across the child's spawn. Not a user flag |
 
 ---
