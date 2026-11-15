@@ -17,6 +17,11 @@ time, and a restored rank is blocked in the poller (state S) from its first
 wait. It is installed in every TP worker before the dump and never withdrawn,
 so the CRIU image carries it. The clock only chooses between yielding and
 blocking: a wall-clock step can at worst lengthen or shorten one busy window.
+
+vLLM 0.33's ``record_read`` also polls the notify socket at most every
+``SHM_NOTIFY_POLL_INTERVAL_S`` (vllm#63165): a reader that never goes idle
+otherwise lets libzmq queue a command per write notification, without bound.
+The replacement keeps that poll, timed on the same wall clock.
 """
 from __future__ import annotations
 
@@ -40,9 +45,19 @@ def install() -> dict:
         _state["err"] = "shm_broadcast has no SpinCondition.record_read/wait"
         return dict(_state)
     upstream_wait = cls.wait
+    poll_interval_s = getattr(shm_broadcast, "SHM_NOTIFY_POLL_INTERVAL_S", None)
 
     def record_read(self):
         self.last_read = time.time()
+        if poll_interval_s is None:
+            return
+        # last_notify_poll is on the monotonic clock until the first poll here
+        # (the reader may predate install), and ahead of now after a wall-clock
+        # step back; either way, poll now rather than wait for it.
+        if not 0 <= self.last_read - self.last_notify_poll < poll_interval_s:
+            self.last_notify_poll = self.last_read
+            if self.local_notify_socket.poll(timeout=0):
+                self.local_notify_socket.recv(flags=shm_broadcast.zmq.NOBLOCK, copy=False)
 
     def wait(self, timeout_ms=None):
         assert self.is_reader, "Only readers can wait"
