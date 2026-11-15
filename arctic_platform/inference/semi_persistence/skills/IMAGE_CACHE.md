@@ -149,7 +149,27 @@ job `2469a638-2290-44eb-897e-16075046c00a`:
 layout: dtype-converted, fused, quantized, and TP-sharded per rank. Producing it
 requires loading the model, which is the cost the cache exists to avoid. So the
 73 GB is the price of a durable cache, not an artifact that can be trimmed by
-pointing at `/mnt/neutrino/base-models`.
+pointing at `/mnt/neutrino/base-models`. Host-resident parameters (DeepSeek's
+Engram tables) are not in the buffer but are written straight from their own
+mappings at their place in the layout, so the shards, the manifest and the hash
+are what they would be without them; see `instance_DESIGN.md` *Host-Resident
+Parameters*.
+
+**The layout records canonical names.** With LoRA enabled vLLM wraps each
+layer it can adapt in a `BaseLayerWithLoRA` that holds the original as
+`base_layer`, so parameter names gain a segment
+(`main:p:language_model.model.embed_tokens.base_layer.weight`) while the bytes,
+offsets, dtypes and shapes stay the full config's. `weights_meta.json` is
+hashed with the shards, so recording those names forked every LoRA config's
+`wt12` and uploaded a second copy of the same weights. `_semip_save_weights`
+now drops a `base_layer` segment only where it follows the path of a module
+that is a LoRA wrapper (nested ones included), so a module merely named that
+keeps it, and fails before clearing the old shards if two parameters would
+collide. `_semip_load_weights` canonicalizes both sides with the engine's own
+wrappers and compares names, offsets, sizes and now dtypes, so a LoRA engine
+loads its full config's weight set, the other way round, and a LoRA weight set
+written before the change. Without LoRA nothing is renamed and the manifest is
+byte-identical to before.
 
 The one real lever is that `compilation/` is **reused and never cleared** on
 re-dump (see `semi-p_DESIGN.md` §2), so it is the cheapest thing to make durable
@@ -680,7 +700,8 @@ the A/B switch -- which is distinct from leaving it unset.
 
 `env_files` from the first successful dump has **0 of 416** mappings under
 `weight/`, so no absolute path is baked into the shards. The dump order is
-why: `save_weights` → `detach` → `sleep` → `cuda_checkpoint` → `criu_dump`, so
+why: `save_weights` → `release_host_weights` → `detach` → `sleep` →
+`cuda_checkpoint` → `criu_dump`, so
 the files are outputs and the writer has detached before CRIU runs. The seam
 already existed too — the restore calls `inst.attach().load_weights()`, and
 `load_weights(weights_dir=...)` takes the override; `_semip_load_weights` is
@@ -712,6 +733,12 @@ the staged buffer is per-rank, so TP1/2/4/8 of one model measured 70.2 / 70.3 /
 per-rank shard padding and replicated parameters. Those are four distinct weight
 hashes by construction, and `tensor_parallel_size` is in `cfg12` anyway, so they
 were never candidates for sharing.
+
+The **LoRA** dimension collapses since the manifest records canonical names
+(§1): a LoRA config now writes its full config's weight set. Qwen3.8's LoRA
+config hashes to the full config's `64e76626e58c` (was `970d92031a24`), and
+GLM-5.3-Flash long LoRA to `f858d7580d72` (was `dda747885ca6`). Non-LoRA
+manifests and hashes are unchanged.
 
 **The hazard the split introduces is the dangling reference**, and it is silent.
 Weights are shared, so retiring a hash can orphan a skeleton that still names it;

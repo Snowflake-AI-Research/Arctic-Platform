@@ -524,7 +524,7 @@ sweep that runs at TP1/2/4/8:
 inst.criu_restore().wait()
 inst.cuda_restore(gpus=gpus).wait()
 inst.reinit_nccl().wait()
-inst.attach().load_weights().wait()
+inst.attach().load_weights().refill_host_weights().wait()
 inst.wake_up_weights().wait()
 inst.plan_restore_weights().wait()   # forms the pinned double buffer; no repin()
 inst.restore_weights().wait()
@@ -534,7 +534,7 @@ inst.rebind_graphs().wait()
 
 The adapter must follow this, not the shorter sequence the July prototype
 used — and it must copy the `.wait()` boundaries too, which are part of the
-contract rather than formatting. Four differences, each with real consequences:
+contract rather than formatting. Five differences, each with real consequences:
 
 | Difference | Consequence if skipped |
 |---|---|
@@ -542,6 +542,7 @@ contract rather than formatting. Four differences, each with real consequences:
 | `plan_restore_weights()` before `restore_weights()` | `restore_weights` falls back to a single unbounded chunk, so the staging buffer is sized to the whole weight set and leaves no room for `wake_up_kv_cache` |
 | `rebind_graphs()` after `wake_up_kv_cache` | The graphs keep the CustomAllreduce addresses they were captured with, which `reinit_nccl` has just invalidated |
 | `attach()` / `load_weights()`, **waited on**, before `plan_restore_weights()` | The plan is computed with no budget and degrades to the unbounded path. See the correction below |
+| `refill_host_weights()` after `load_weights()` | The dump emptied DeepSeek's Engram tables (`release_host_weights` after `save_weights`), so the child refuses `wake_up_kv_cache` and everything after it until the refill reads them back. A no-op for any other model. See [`instance_DESIGN.md`](instance_DESIGN.md) *Host-Resident Parameters* |
 
 `plan_restore_weights` is the one that bites at 35B, and the reason is subtler
 than "call it".
