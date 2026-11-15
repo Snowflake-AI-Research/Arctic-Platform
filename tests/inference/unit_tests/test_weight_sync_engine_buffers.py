@@ -231,10 +231,7 @@ def test_bucket_transfer_chunks_and_reassembles_oversized_tensor(monkeypatch):
         False,
         True,
     ]
-    assert [
-        metadata["tensors"][0].get("tensor_offset")
-        for _, metadata, _ in buckets
-    ] == [0, 4, 8]
+    assert [metadata["tensors"][0].get("tensor_offset") for _, metadata, _ in buckets] == [0, 4, 8]
     assert buckets[-1][1]["tensors"][1]["name"] == "tail"
     assert [data.tolist() for _, _, data in buckets] == [
         [0, 1, 2, 3],
@@ -264,13 +261,9 @@ def test_bucket_transfer_chunks_and_reassembles_oversized_tensor(monkeypatch):
     receiver._recv_pair = recv_pair
     receiver._parse_meta = lambda idx: receiver._meta_by_buf[idx]
 
-    received = {
-        name: tensor.clone() for name, tensor in receiver.receive_weights()
-    }
+    received = {name: tensor.clone() for name, tensor in receiver.receive_weights()}
     torch.testing.assert_close(received["large"], torch.arange(10, dtype=torch.uint8))
-    torch.testing.assert_close(
-        received["tail"], torch.tensor([10, 11], dtype=torch.uint8)
-    )
+    torch.testing.assert_close(received["tail"], torch.tensor([10, 11], dtype=torch.uint8))
 
 
 @pytest.mark.parametrize("direct", [False, True])
@@ -306,3 +299,80 @@ def test_sender_lets_go_of_each_tensor_before_asking_for_the_next(monkeypatch, d
     (sender.send_weights_direct if direct else sender.send_weights)(gathered())
 
     assert still_held == [False, False, False]
+
+
+@pytest.mark.parametrize("bucket_size", [11, 12, 32])
+def test_mixed_dtype_bucket_roundtrip_preserves_exact_values(monkeypatch, bucket_size):
+    default = _FakeStream()
+    monkeypatch.setattr(torch.cuda, "Event", _FakeEvent)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: default)
+    sender = NCCLEngine.__new__(NCCLEngine)
+    sender.is_sender = True
+    sender.device = torch.device("cpu")
+    sender.bucket_size = bucket_size
+    sender._port = 1234
+    sender._nccl_stream = _FakeStream()
+    sender._data_bufs = [torch.zeros(bucket_size, dtype=torch.uint8) for _ in range(2)]
+    buckets = []
+
+    def flush(idx, meta, *, is_last, prev_idx):
+        buckets.append((idx, {"tensors": [dict(x) for x in meta], "is_last": is_last}, sender._data_bufs[idx].clone()))
+
+    sender._flush_bucket_send = flush
+    weights = [
+        ("bf16_scalar", torch.tensor([1.5], dtype=torch.bfloat16)),
+        ("fp32_gate", torch.tensor([0.125, -3.5], dtype=torch.float32)),
+        ("byte", torch.tensor([7], dtype=torch.uint8)),
+        ("fp64_scale", torch.tensor([2.75], dtype=torch.float64)),
+        ("large", torch.arange(10, dtype=torch.float32)),
+        ("tail", torch.tensor([0.5], dtype=torch.bfloat16)),
+    ]
+    sender.send_weights(weights)
+    for _, metadata, _ in buckets:
+        for entry in metadata["tensors"]:
+            if "tensor_offset" not in entry:
+                dtype = getattr(torch, entry["dtype"].removeprefix("torch."))
+                assert entry["offset"] % dtype.itemsize == 0
+            assert entry["offset"] + entry["nbytes"] <= bucket_size
+
+    receiver = NCCLEngine.__new__(NCCLEngine)
+    receiver.is_sender = False
+    receiver.device = torch.device("cpu")
+    receiver._nccl_stream = _FakeStream()
+    receiver._data_bufs = [torch.zeros(bucket_size, dtype=torch.uint8) for _ in range(2)]
+    metadata_by_buffer = {}
+
+    def receive(idx, stream):
+        expected, metadata, data = buckets.pop(0)
+        assert idx == expected
+        receiver._data_bufs[idx].copy_(data)
+        metadata_by_buffer[idx] = metadata
+
+    receiver._recv_pair = receive
+    receiver._parse_meta = metadata_by_buffer.__getitem__
+    received = {name: value.clone() for name, value in receiver.receive_weights()}
+    assert received.keys() == dict(weights).keys()
+    for name, expected in weights:
+        assert received[name].dtype == expected.dtype
+        assert torch.equal(received[name], expected)
+
+
+def test_receiver_accepts_unaligned_fp32_from_older_sender(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "Event", _FakeEvent)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: _FakeStream())
+    expected = torch.tensor([0.125, -3.5], dtype=torch.float32)
+    receiver = NCCLEngine.__new__(NCCLEngine)
+    receiver.is_sender = False
+    receiver.device = torch.device("cpu")
+    receiver._nccl_stream = _FakeStream()
+    data = torch.zeros(16, dtype=torch.uint8)
+    data[2:10].copy_(expected.view(torch.uint8))
+    receiver._data_bufs = [data, torch.zeros_like(data)]
+    receiver._recv_pair = lambda idx, stream: None
+    receiver._parse_meta = lambda idx: {
+        "is_last": True,
+        "tensors": [{"name": "gate", "shape": [2], "dtype": "torch.float32", "offset": 2, "nbytes": 8}],
+    }
+    received = dict(receiver.receive_weights())["gate"]
+    assert torch.equal(received, expected)
+    assert received.storage_offset() % expected.element_size() == 0
