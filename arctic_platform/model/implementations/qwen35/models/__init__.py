@@ -98,6 +98,11 @@ _register_flash_vlm(
     "Qwen4ExpForConditionalGenerationPrimeRL",
     "qwen4_exp",
 )
+_register_flash_vlm(
+    "arctic_platform.model.implementations.nemotron_h.modeling_nemotron_h_omni",
+    "NemotronHOmniForConditionalGenerationPrimeRL",
+    "nemotron_h_omni",
+)
 
 
 class AutoModelForCausalLMPrimeRL(_BaseAutoModelClass):

@@ -277,10 +277,11 @@ class NemotronHMoELayer(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         cu_seqlens: torch.LongTensor | None = None,
         max_seqlen: int | None = None,
+        routed_experts: torch.LongTensor | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, routed_experts=routed_experts)
         return residual + hidden_states
 
 
@@ -509,7 +510,13 @@ class NemotronHModel(NemotronHPreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        routed_experts: Optional[torch.LongTensor] = None,
     ) -> BaseModelOutputWithPast:
+        """
+        routed_experts (`torch.LongTensor` of shape `(batch_size, sequence_length, num_hidden_layers, num_experts_per_tok)`, *optional*):
+            Routed experts for each token in the sequence, indexed by decoder layer. Only MoE layers read their
+            slice. Only used for router replay.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -527,12 +534,16 @@ class NemotronHModel(NemotronHPreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids) if self.rotary_emb is not None else None
 
-        for decoder_layer in self.layers:
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            layer_kwargs = {}
+            if routed_experts is not None and self.config.layers_block_type[layer_idx] == "moe":
+                layer_kwargs["routed_experts"] = routed_experts[:, :, layer_idx, :]
             hidden_states = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                **layer_kwargs,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -561,6 +572,7 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         logits_to_keep: int = 0,
         temperature: Optional[torch.Tensor] = None,
+        routed_experts: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> PrimeLmOutput:
         if position_ids is None:
@@ -574,6 +586,7 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
+            routed_experts=routed_experts,
         )
 
         hidden_states = outputs.last_hidden_state

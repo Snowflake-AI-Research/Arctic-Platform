@@ -120,6 +120,32 @@ def test_qwen_vl_leaf_names_are_the_ones_media_uses():
         QWEN_VL_MEDIA_SPEC.kind("audio")
 
 
+def test_nemotron_h_omni_gets_an_image_only_1d_spec():
+    spec = media_spec_for("nemotron_h_omni")
+    assert spec is media_spec_module.NEMOTRON_H_OMNI_MEDIA_SPEC
+    assert spec.modalities == ("image",)
+    assert spec.kind("image") is IMAGE_MEDIA
+    assert spec.positions == "1d"
+
+
+def test_nemotron_h_omni_placeholder_id_under_either_name():
+    spec = media_spec_module.NEMOTRON_H_OMNI_MEDIA_SPEC
+    # transformers' config, and the checkpoint's own config.json.
+    assert spec.placeholder_ids({"image_token_id": 18}) == {"image": 18}
+    assert spec.placeholder_ids({"img_context_token_id": 18, "llm_config": {}}) == {"image": 18}
+    assert spec.placeholder_ids({"vocab_size": 64}) == {}
+
+
+def test_nemotron_h_omni_merge_factor_from_the_downsample_ratio():
+    spec = media_spec_module.NEMOTRON_H_OMNI_MEDIA_SPEC
+    assert spec.spatial_merge_size({"downsample_ratio": 0.5}) == 2
+    assert spec.spatial_merge_size({"downsample_ratio": 0.25}) == 4
+    with pytest.raises(ValueError, match="needs downsample_ratio"):
+        spec.spatial_merge_size({})
+    with pytest.raises(ValueError, match="not 1 / an integer"):
+        spec.spatial_merge_size({"downsample_ratio": 0.4})
+
+
 def test_register_a_second_spec(registry):
     image = MediaKind("image", "images", "image_sizes", "image_rows", 1)
     spec = MediaSpec(

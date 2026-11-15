@@ -543,6 +543,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         model_keys = dict.fromkeys(model.state_dict().keys())
 
         source_path = snapshot_path
+        model.hf_source_path = source_path
         if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
             conversion = ("prime", model.convert_to_prime, "HF", "PrimeRL")
         elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(model_keys):
