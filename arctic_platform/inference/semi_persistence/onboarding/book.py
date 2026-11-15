@@ -41,8 +41,9 @@ from arctic_platform.inference.semi_persistence.onboarding.report import verdict
 
 logger = logging.getLogger(__name__)
 
-RESTORE_STEPS = ["criu_restore", "cuda_restore", "reinit_nccl", "load_weights", "wake_up_weights", "repin",
-                 "restore_weights", "wake_up_kv_cache", "rebind_graphs", "recapture_graphs", "serve_core"]
+RESTORE_STEPS = ["criu_restore", "cuda_restore", "reinit_nccl", "load_weights", "refill_host_weights",
+                 "wake_up_weights", "repin", "restore_weights", "wake_up_kv_cache", "rebind_graphs",
+                 "recapture_graphs", "serve_core"]
 VLLM_PHASES = [("load_weights_s", "load weights"), ("model_loading_s", "model loading"),
                ("torch_compile_s", "torch.compile"), ("profiling_s", "profiling"),
                ("graph_capture_s", "graph capture"), ("engine_init_s", "engine init")]

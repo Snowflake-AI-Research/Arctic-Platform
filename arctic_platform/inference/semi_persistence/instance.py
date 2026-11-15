@@ -937,6 +937,34 @@ class Instance:
         return self._send("load_weights", weights_dir=weights_dir,
                           io_workers=io_workers)
 
+    def release_host_weights(self):
+        """Drop the host-resident parameters' pages before the checkpoint.
+
+        Call after ``save_weights()``, which wrote their bytes, and before
+        ``cuda_checkpoint()``: each one unchanged since load is unregistered
+        and emptied, so the CRIU image holds an empty mapping at its address.
+        Until ``refill_host_weights()`` the engine refuses to run the model.
+        A no-op for a model without such parameters (see host_weights).
+        """
+        self._log("release_host_weights")
+        return self._send("release_host_weights")
+
+    def refill_host_weights(self, io_workers=None, weights_dir=None):
+        """Read the released host-resident parameters back from the shards.
+
+        Call after ``criu_restore()`` and ``load_weights()``, before anything
+        runs the model; registers each parameter at its own address again and
+        checks its checksum, raising if any of it is missing or wrong.
+        """
+        weights_dir = self._resolve_weights_dir(weights_dir)
+        if weights_dir is None:
+            raise RuntimeError(
+                "refill_host_weights() requires a weights_dir, a model_dir, or "
+                "a prior criu_restore()")
+        self._log(f"refill_host_weights({weights_dir})")
+        return self._send("refill_host_weights", weights_dir=weights_dir,
+                          io_workers=io_workers)
+
     def generate(self, prompts, sampling_params, reasoning_ended=None):
         """``reasoning_ended`` is AsyncLLM.generate's argument of that name:
         whether the prompt already closed its reasoning section, which decides
