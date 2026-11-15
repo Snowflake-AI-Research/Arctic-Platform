@@ -102,8 +102,9 @@ class _RouterReplayCacheBase:
 
     A side dict tracks per-entry byte counts for O(1) ``max_bytes`` accounting.
     A single ``threading.Lock`` guards the dicts (vLLM async loop + per-step
-    NCCL task; contention is low). The copy onto ``self.device`` runs under the
-    lock after eviction, so ``max_bytes`` bounds what the cache allocates there.
+    NCCL task; contention is low). Tensor copy runs outside the lock, after
+    eviction has reserved the entry's bytes, so ``max_bytes`` bounds what the
+    cache allocates on ``self.device``.
     """
 
     def __init__(self, device: torch.device, max_bytes: int) -> None:
@@ -115,6 +116,7 @@ class _RouterReplayCacheBase:
         self._created_at: dict[str, float] = {}
         self._last_touched: dict[str, float] = {}
         self._bytes_in_use: int = 0
+        self._reserved_bytes: int = 0
         self._peak_bytes_in_use: int = 0
         # Lifetime counters for observability.
         self._n_put = 0
@@ -167,12 +169,9 @@ class _RouterReplayCacheBase:
         with self._lock:
             if not replace and self._suppress_put_new_locked(sample_id, now):
                 return
-            if not replace and sample_id in self._data:
-                self._n_duplicate_rejected += 1
-                raise RouterReplayDuplicateError([sample_id])
-            old_bytes = self._sizes.get(sample_id, 0)
+            self._reject_duplicate_locked(sample_id, replace)
             bytes_before = self._bytes_in_use
-            projected = self._bytes_in_use - old_bytes + new_bytes
+            projected = self._bytes_in_use + self._reserved_bytes - self._sizes.get(sample_id, 0) + new_bytes
             projected_before_eviction = projected
             projected, evictions = self._evict_for_put_locked(
                 sample_id=sample_id,
@@ -186,17 +185,7 @@ class _RouterReplayCacheBase:
                     f"({projected} > {self.max_bytes}) on put({sample_id!r}, "
                     f"shape={new_shape}, dtype={dtype})"
                 )
-            tensor = self._coerce(value)
-            if sample_id in self._data:
-                self._n_overwrite += 1
-            else:
-                self._created_at[sample_id] = now
-            self._data[sample_id] = tensor
-            self._sizes[sample_id] = new_bytes
-            self._last_touched[sample_id] = now
-            self._bytes_in_use = projected
-            self._peak_bytes_in_use = max(self._peak_bytes_in_use, projected)
-            self._n_put += 1
+            self._reserved_bytes += new_bytes
             if evictions:
                 self._log_evictions_locked(
                     evictions,
@@ -206,6 +195,30 @@ class _RouterReplayCacheBase:
                     bytes_before=bytes_before,
                     projected_before_eviction=projected_before_eviction,
                 )
+        try:
+            tensor = self._coerce(value)
+        except BaseException:
+            with self._lock:
+                self._reserved_bytes -= new_bytes
+            raise
+        with self._lock:
+            self._reserved_bytes -= new_bytes
+            self._reject_duplicate_locked(sample_id, replace)
+            if sample_id in self._data:
+                self._n_overwrite += 1
+            else:
+                self._created_at[sample_id] = now
+            self._bytes_in_use += new_bytes - self._sizes.get(sample_id, 0)
+            self._data[sample_id] = tensor
+            self._sizes[sample_id] = new_bytes
+            self._last_touched[sample_id] = now
+            self._peak_bytes_in_use = max(self._peak_bytes_in_use, self._bytes_in_use)
+            self._n_put += 1
+
+    def _reject_duplicate_locked(self, sample_id: str, replace: bool) -> None:
+        if not replace and sample_id in self._data:
+            self._n_duplicate_rejected += 1
+            raise RouterReplayDuplicateError([sample_id])
 
     def pop(self, sample_id: str) -> torch.Tensor:
         """Remove and return the entry; raises KeyError if absent."""
