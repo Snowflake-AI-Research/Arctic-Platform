@@ -1,0 +1,18 @@
+{
+  "name": "qwen3-0.6b-standard-full",
+  "description": "Qwen/Qwen3-0.6B, TP=1, 1 replica(s) on 1 GPU(s); catalog qwen3-0.6b/standard/h200-inference-full.json",
+  "sub_job": {
+    "job_type": "sampling",
+    "model_name": "Qwen/Qwen3-0.6B",
+    "dtype": "bfloat16",
+    "seed": 42,
+    "inference_config": {
+      "max_seq_len": 32768,
+      "n_gpus": 1,
+      "vllm_config": {
+        "tensor_parallel_size": 1,
+        "gpu_memory_utilization": 0.8
+      }
+    }
+  }
+}
