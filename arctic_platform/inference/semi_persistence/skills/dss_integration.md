@@ -686,7 +686,8 @@ it be re-derived, and re-dump if it is gone.
 **A miss can now be filled by a copy instead of a cold start.** With
 `SEMIP_IMAGE_SOURCE` set, `_materialize_from_source` copies `image/` and
 `compilation/` out of `$SEMIP_IMAGE_SOURCE/<cfg12>_<env12>` into the derived
-`model_dir` — the two directories bound to that absolute path — and leaves
+`model_dir` — the two directories bound to that absolute path, decoding the
+compressed page files a publish stores — and leaves
 `weights/` on the read-only mirror to be read in place. Every way it declines
 is a cache miss that cold-starts, never an error, so nothing about it can fail
 a job that would otherwise have run. See [`IMAGE_CACHE.md`](IMAGE_CACHE.md)

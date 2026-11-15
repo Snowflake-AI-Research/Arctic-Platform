@@ -13,8 +13,8 @@ cache has to meet.
 
 Sections 1-8 are requirements and measurements. **Section 9 is built and in
 use**: an image published to the mirror is materialized into the derived
-`model_dir` by copying the two path-bound directories and reading the weights
-in place. Section 10 is the publish-side measurement that decided its shape.
+`model_dir` by copying the two path-bound directories (decoding compressed
+pages on the way) and reading the weights in place. Section 10 is the publish-side measurement that decided its shape.
 **Section 11 is the multi-replica roll** (several replicas per pod, one
 single-node dump serving `n_gpus=16`), measured end to end on 2026-10-03.
 
@@ -754,44 +754,94 @@ mappings. `image/` cannot either: it is CRIU's `-D` dir, and the restore writes
 `restore.log` and a pidfile into it. Read-only would need `--work-dir` plumbing
 for 6.4 GB of savings.
 
-### How the two are copied, and compressed pages
+### How the two are copied
 
-One path, `server/semip_gather.py`: the files of `compilation/` and `image/`
-are planned from the daemon's `_neutrino_manifest.json`, preallocated at full
-size with `posix_fallocate`, cut into ranges, and copied by 32 threads with
-O_DIRECT writes wherever offset and length are block-aligned. On p5en that
-moved GLM-5.3's 79 GB in ~4.2 s against `shutil.copytree`'s ~20. A source
-with no manifest (one placed by hand) has its files listed as they are.
-There is no knob choosing the path: the peer mode and the copytree fallback
-`SEMIP_GATHER` used to select are gone, since every node mirrors every file
-and the destination disk, not the source, is the bound.
+One path, `server/semip_gather.py`: a parallel local copy from this node's
+mirror into `<model_dir>/.incoming/`. The files of `compilation/` and `image/`
+are planned from the daemon's `_neutrino_manifest.json` (a source with no
+manifest, one placed by hand, is listed by walking it), every file is
+preallocated at its full size with `posix_fallocate`, and the work is cut into
+ranges copied by 32 threads with O_DIRECT writes wherever offset and length
+are block-aligned. On p5en that moved GLM-5.3's 79 GB in ~4.2 s against
+`shutil.copytree`'s ~20. Every node mirrors every file and the destination
+disk, not the source, is the bound, so no knob chooses another path.
 
-**Compressed pages.** `semip_publish.py` compresses every non-empty
-`image/**/pages-<N>.img` (directly under an image directory, any replica or
-node) into `pages-<N>.img.zst` at publish: zstd level 1, independent 1 MiB
-frames, each with its checksum. A frame table, `compression.json`, sits beside
-them in each image directory, and the manifest carries a `compression` block
-(`format: 1`) plus, on each compressed row, `raw_path`/`raw_size_bytes`/
-`raw_sha256` beside the stored `path`/`size_bytes`/`sha256` the daemon
-verifies. Every other file, `compilation/` included, stays raw. Each frame is
-decoded and compared before upload. The publisher runs under `nice 10`,
-stages under `<key_dir>/.semip-publish/`, and publishes raw when libzstd is
-missing, when the disk cannot hold the staging, or with
-`SEMIP_PUBLISH_COMPRESS=0`. A key is published in one format only:
-republishing it in the other refuses until it is unpublished.
+The same workers handle both skeleton formats. A compressed page file
+(`pages-<N>.img.zst`, below) is decoded into the raw `pages-<N>.img` CRIU
+reads; every other file, and every file of a raw skeleton, is copied as raw
+ranges, so skeletons published before compression still restore. A
+compressed file's ranges are its runs of non-zero frames: the all-zero frames
+the frame table lists are never read, decoded or written, and stay
+preallocated ranges that read back as zeros. The checks:
 
-The materialize decodes each `.zst` back into the raw file CRIU reads, in the
-same worker pool. All-zero frames (flagged in the frame table) are never read,
-decoded or written: the file was preallocated, and a preallocated range nobody
-wrote reads back as zeros. Every decoded frame must carry its checksum and
-decode to exactly its share of the file; `SEMIP_GATHER_VERIFY=sha256` also
-hashes the result against `raw_sha256`. Any failure aborts before the flip,
-like any failed copy. A raw skeleton goes through the same pool as raw ranges.
-The `materialized` line ends with `; pages: X GiB stored -> R GiB raw in N
-file(s), Z GiB zero frames left unwritten, W GiB written, decode C core-s`
-for a compressed skeleton, and the publisher's last line is `publish
-summary: {...}` (format, raw and stored bytes, compressed files, zero frames,
-hash+compress and upload seconds), which onboarding records.
+- every frame must be a checksummed, dictionary-free zstd frame, and decode
+  (checksum verified) to exactly its share of the raw file;
+- the bytes copied, decoded and left as zero frames must add up to the
+  planned total, and every file must end at its manifest size (the default,
+  `SEMIP_GATHER_VERIFY=size`);
+- `SEMIP_GATHER_VERIFY=sha256` also hashes every result against the manifest,
+  `raw_sha256` for a decoded file.
+
+The plan also refuses a frame table that disagrees with the manifest (format,
+codec, frame size, rows, frame sizes against the stored size, zero runs), and
+compressed pages without a manifest. Any failure raises out of the copy before
+the flip, so before CRIU sees anything, and `.incoming` is removed: a miss, or
+a failed job with several replicas, as for any failed copy. A manifest whose
+`compression.format` is newer than this engine reads is a miss decided before
+anything is copied.
+
+The `materialized` line reports `N range(s) over F flow(s)[, O_DIRECT]` and,
+for a compressed skeleton, `; pages: X GiB stored -> R GiB raw in N file(s),
+Z GiB zero frames left unwritten, W GiB written, decode C core-s`.
+
+### Compressed skeletons (format 1)
+
+`semip_publish.py` publishes each **non-empty `pages-<N>.img` directly under
+an image directory** (flat `image/`, `replica<K>/image/` or `node<k>/image/`)
+as `pages-<N>.img.zst`: zstd level 1, one independent frame per 1 MiB of raw
+bytes (the last one shorter), each carrying its checksum and content size.
+About a third of the frames are all zeros; they are stored too, as tiny
+frames, and flagged. Every other file stays raw: `compilation/`, every other
+image file, zero-byte pages files and the weights. The weight hash is
+unchanged.
+
+- **`compression.json`**, one per image directory with compressed pages and
+  published as an ordinary raw row: `{format, frame_bytes, files}`, where each
+  `.zst` maps to its `raw_size_bytes`, `frame_stored_bytes` (the stored size of
+  every frame) and `zero_runs` (all-zero frames as `[start, count]` runs).
+- **Manifest rows** of a compressed file keep `path`/`size_bytes`/`sha256` for
+  the stored `.zst` -- all the daemon verifies and digests -- and add
+  `raw_path`/`raw_size_bytes`/`raw_sha256`, which the materialize rebuilds.
+- **A top-level `compression` block** marks the format: `{format: 1, codec,
+  level, frame_bytes, index, raw_total_bytes, stored_total_bytes,
+  zstd_version}`. A manifest without it is a raw skeleton.
+
+**Publish.** One pass per pages file, in the dump pod, hashes the raw bytes,
+compresses each frame, decodes it back and compares it with its input, hashes
+the stored bytes, and writes them under `<key_dir>/.semip-publish/` (removed
+at the start and end of every publish). A frame that does not decode back
+fails the publish before anything is uploaded. The engine runs the publisher
+with `--nice 10` beside the job it serves, and compression uses
+`min(--hash-workers, 32, the cgroup's CPU quota)` threads. libzstd is reached
+through ctypes (`libzstd.so.1`, shipped in the backend image). The image
+directory uploads with the compressed pages' raw names excluded, then the
+staged `.zst` files and frame table, and the sentinel still goes last.
+
+Pages are published raw, with the reason printed, when
+`SEMIP_PUBLISH_COMPRESS=0` or `--no-compress`, on a dry run, when libzstd
+cannot be loaded, or when the staging disk has less free space than the raw
+pages. A key is published in one format only: republishing it in the other
+is refused until it is unpublished, since the old format's files would stay in
+the bucket beside the new sentinel. A pod-spanning publish compresses each
+pod's own pages, and node 0 derives the `compression` block from the union of
+the rows.
+
+The publisher logs `- image/ hashed+compressed: ... GiB raw -> ... GiB stored
+(...x), N pages file(s), Z zero frame(s), ...` per image directory, and its
+last line is `publish summary: {...}` with `format` (`zstd1` or `raw`),
+`raw_bytes`, `stored_bytes`, `compressed_files`, `zero_frames`,
+`hash_compress_s` and `upload_s`. Onboarding's `publish.py` records those
+fields, plus `ratio` (raw / stored), in its `summary.json`.
 
 ### Every way it declines, and why none of them is an error
 
@@ -820,7 +870,7 @@ failing, its post-copy size check -- raises and fails the job (all-or-none).
 | more than one `skeleton/<cfg12>_<env12>_*` | Two weight versions for one config and backend. Which one a job should serve is an operator's decision, so this declines and names the candidates rather than tie-breaking |
 | an `env_files` size mismatch outside `model_dir` | This node is not the environment the image was dumped in, despite `env12` agreeing. Run `imgdiff.py` |
 | the manifest's compression `format` is newer than this engine reads | Decided before any copy, so even several replicas are a miss rather than a failed job |
-| the copy raises | Any I/O failure, disk-full included. For compressed pages also a frame that fails its checksum or length, a frame table that disagrees with the manifest, compressed pages without a manifest, or no libzstd |
+| the copy raises | Any I/O failure, disk-full included. For compressed pages also a frame that fails its checksum or length, a frame table that disagrees with the manifest, compressed pages without a manifest, or no libzstd. `.incoming` is removed either way |
 | an `env_files` size mismatch under `model_dir`, after the copy | The copied compile cache is short or wrong; the flipped `compilation/` is removed too, so the cold start does not inherit it |
 
 ### The four properties the copy depends on
