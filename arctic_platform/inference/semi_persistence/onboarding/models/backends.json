@@ -44,18 +44,6 @@
  "gpt-oss-120b-long-full": {
   "image_tag": "dev_20261114_232141_7e083d3a866"
  },
- "inkling2-small-long-full": {
-  "image_tag": "dev_20261114_232141_7e083d3a866"
- },
- "inkling2-small-long-lora": {
-  "image_tag": "dev_20261114_232141_7e083d3a866"
- },
- "inkling2-small-standard-full": {
-  "image_tag": "dev_20261114_232141_7e083d3a866"
- },
- "inkling2-small-standard-lora": {
-  "image_tag": "dev_20261114_232141_7e083d3a866"
- },
  "medgemma-4b-it-long-full": {
   "image_tag": "dev_20261114_232141_7e083d3a866"
  },
