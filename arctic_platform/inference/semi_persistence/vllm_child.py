@@ -3859,6 +3859,8 @@ def _semip_serve_core(core, input_address, output_address):
         inputs=[input_address], outputs=[output_address])
     core.process_input_queue_block = False
     core.enable_fault_tolerance = False
+    # vLLM 0.33 reads it for every ADD (pause_generation/resume_scheduler set it).
+    core.reject_new_requests = False
     core.model_executor.register_failure_callback(
         lambda: core.input_queue.put_nowait(
             (EngineCoreRequestType.EXECUTOR_FAILED, b"")))
