@@ -303,12 +303,14 @@ class _FakeClient:
                  "prompt_len": 10, "generation_len": n}
             if sampling_params.get("guided_json"):
                 r["text"] = json.dumps({"capital": str(ids)})
+            # As the worker serializes them: sampled-only logprobs are floats, top-k and
+            # prompt positions map token id -> {"logprob", "rank"}, prompt position 0 is None.
             if sampling_params.get("logprobs") == 1:
                 r["logprobs"] = [-0.5] * n
             elif sampling_params.get("logprobs"):
-                r["logprobs"] = [{"a": -0.1, "b": -2.0}] * n
+                r["logprobs"] = [{11: {"logprob": -0.1, "rank": 1}, 22: {"logprob": -2.0, "rank": 2}}] * n
             if sampling_params.get("prompt_logprobs"):
-                r["prompt_logprobs"] = [None] + [{"x": -1.0}] * 9
+                r["prompt_logprobs"] = [None] + [{33: {"logprob": -1.0, "rank": 1}}] * 9
             out.append(r)
         self.pending[rid] = out
         return rid
@@ -1019,6 +1021,38 @@ def test_on_hit_alone_reports_what_needs_another_job_and_fails_its_own_checks():
     assert report.verdict({"model": {"name": "m"}, "correctness": list(checks.values())})[0] == "FAIL"
     table = "\n".join(report.correctness_table(list(checks.values())))
     assert "reference does not parse: 'Paris'; reference does not parse and no plain job" in table
+
+
+def test_own_logprob_checks_read_the_servers_candidates_and_stay_strict():
+    from arctic_platform.inference.semi_persistence.onboarding import correctness
+
+    def top_k(*positions):
+        return {"logprobs": list(positions), "generation_len": len(positions)}
+
+    def cand(lp, rank=1):
+        return {"logprob": lp, "rank": rank}
+
+    ok, detail = correctness._own_top_k(top_k({5: cand(-0.1), 6: cand(-2.3, 2)}, {7: cand(0.0)},
+                                              {8: cand(-0.2), 9: cand(-1.0, 2), 3: cand(-7.5, 40)}))
+    assert ok and detail == "shape [2, 1, 3] for 3 generated tokens, logprobs=2"
+    assert correctness._own_top_k(top_k({5: -0.1, 6: -2.3}, {"7": 0.0}))[0]
+    for bad in (float("nan"), float("-inf"), float("inf"), 0.5, None, "x"):
+        ok, detail = correctness._own_top_k(top_k({5: cand(-0.1), 6: cand(bad, 2)}))
+        assert not ok and detail.endswith("not every candidate a finite logprob <= 0"), bad
+    assert not correctness._own_top_k(top_k({5: {"rank": 1}}))[0]
+    assert not correctness._own_top_k(top_k([cand(-0.1)]))[0]
+    assert not correctness._own_top_k(top_k({}))[0]
+    assert not correctness._own_top_k(top_k({1: cand(-1.0), 2: cand(-2.0), 3: cand(-3.0), 4: cand(-4.0)}))[0]
+    assert not correctness._own_top_k({"logprobs": [{5: cand(-0.1)}], "generation_len": 2})[0]
+
+    assert correctness._own_logprobs({"logprobs": [-0.5, 0.0], "generation_len": 2}) == (
+        True, "2 logprobs for 2 generated tokens, max 0")
+    assert correctness._own_logprobs({"logprobs": [cand(-0.5)], "generation_len": 1})[0]
+    assert not correctness._own_logprobs({"logprobs": [cand(0.5)], "generation_len": 1})[0]
+    assert not correctness._own_logprobs({"logprobs": [-0.5, float("nan")], "generation_len": 2})[0]
+
+    plp = {"prompt_logprobs": [None, {3: cand(-1.0)}, {4: cand(-0.2)}], "prompt_len": 3}
+    assert correctness._own_prompt_logprobs(plp) == (True, "3 positions for a 3-token prompt")
 
 
 def test_on_hit_with_off_matched_uses_it_as_the_plain_baseline(monkeypatch, tmp_path):

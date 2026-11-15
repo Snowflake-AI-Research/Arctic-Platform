@@ -205,11 +205,17 @@ class Checker:
                             "reference_detail": "", "detail": detail})
 
 
+def _logprob_value(x: Any) -> float:
+    """One logprob as the server sends it: a number (sampled-only logprobs) or,
+    per candidate of a top-k or prompt position, ``{"logprob": x, "rank": r}``."""
+    return float(x["logprob"] if isinstance(x, dict) else x)
+
+
 def _logprob_values_ok(values: list) -> bool:
     """Every value a finite log-probability (at most 0, with float slack)."""
     try:
-        return all(math.isfinite(float(x)) and float(x) <= 1e-4 for x in values)
-    except (TypeError, ValueError):
+        return all(math.isfinite(v) and v <= 1e-4 for v in map(_logprob_value, values))
+    except (TypeError, ValueError, KeyError):
         return False
 
 
@@ -220,20 +226,24 @@ def _own_logprobs(r: dict) -> tuple[bool, str]:
         return False, f"{len(lp) if isinstance(lp, list) else None} logprobs for {n} generated tokens"
     if not _logprob_values_ok(lp):
         return False, f"{len(lp)} logprobs, not all finite and <= 0"
-    return True, f"{len(lp)} logprobs for {n} generated tokens, max {max(map(float, lp)):.4g}"
+    return True, f"{len(lp)} logprobs for {n} generated tokens, max {max(map(_logprob_value, lp)):.4g}"
 
 
 def _own_top_k(r: dict) -> tuple[bool, str]:
     """Top-k logprobs: one entry per generated token, each with 1 to k + 1
-    candidates (the sampled token is added when outside the top k)."""
+    candidates (the sampled token is added when outside the top k), every
+    candidate a log-probability."""
     lp, n = r.get("logprobs"), r.get("generation_len")
     try:
         shape = [len(p) for p in lp] if isinstance(lp, list) else None
     except TypeError:
         shape = None
-    ok = (bool(shape) and len(shape) == n and all(1 <= k <= TOP_K + 1 for k in shape)
-          and all(_logprob_values_ok(list(p.values())) for p in lp if isinstance(p, dict)))
-    return ok, f"shape {shape} for {n} generated tokens, logprobs={TOP_K}"
+    detail = f"shape {shape} for {n} generated tokens, logprobs={TOP_K}"
+    if not (bool(shape) and len(shape) == n and all(1 <= k <= TOP_K + 1 for k in shape)):
+        return False, detail
+    if not all(isinstance(p, dict) and _logprob_values_ok(list(p.values())) for p in lp):
+        return False, f"{detail}; not every candidate a finite logprob <= 0"
+    return True, detail
 
 
 def _own_prompt_logprobs(r: dict) -> tuple[bool, str]:
