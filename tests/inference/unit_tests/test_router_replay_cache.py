@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from arctic_platform.inference.server.router_replay import (
+    RouterReplayCacheRX,
     RouterReplayCacheTX,
     RouterReplayDuplicateError,
 )
@@ -14,6 +15,7 @@ from arctic_platform.inference.server.router_replay.all2all import (
     _compute_plan,
     _PerRankManifest,
 )
+from arctic_platform.inference.server.router_replay.cache import RouterReplayCacheFull
 
 
 def _tensor(seq_len: int = 4, n_layers: int = 2, top_k: int = 2, base: int = 1) -> torch.Tensor:
@@ -69,14 +71,55 @@ def test_tx_cache_allocates_on_its_device_only_within_max_bytes(monkeypatch):
         return coerce(value)
 
     monkeypatch.setattr(cache, "_coerce", recording_coerce)
-    for sid in ("rr1:a", "rr1:b", "rr1:c"):
+    for sid in ("rr1:a", "rr1:b", "rr1:c", "rr1:d"):
         cache.put_new(sid, one)
+    cache.put("rr1:c", one)
     with pytest.raises(RouterReplayDuplicateError):
         cache.put_new("rr1:c", one)
 
-    assert len(footprint_at_copy) == 3
+    assert len(footprint_at_copy) == 5
     assert max(footprint_at_copy) <= cache.max_bytes
     assert cache.stats()["n_evicted_lru"] > 0
+
+
+@pytest.mark.parametrize("cache_type", [RouterReplayCacheTX, RouterReplayCacheRX])
+def test_cache_reserves_inflight_copy_through_clear_and_releases_on_failure(monkeypatch, cache_type):
+    one = _tensor()
+    cache = cache_type(device=torch.device("cpu"), max_bytes=2 * one.numel())
+    cache.put("old", one)
+    started = threading.Event()
+    finish = threading.Event()
+    errors = []
+    coerce = cache._coerce
+
+    def failing_coerce(value):
+        started.set()
+        assert finish.wait(timeout=5)
+        raise RuntimeError("copy failed")
+
+    def put():
+        try:
+            cache.put("pending", one)
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(cache, "_coerce", failing_coerce)
+    thread = threading.Thread(target=put)
+    thread.start()
+    try:
+        assert started.wait(timeout=1)
+        cache.clear()
+        with pytest.raises(RouterReplayCacheFull):
+            cache.put("contender", _tensor(seq_len=8))
+    finally:
+        finish.set()
+        thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1 and str(errors[0]) == "copy failed"
+    monkeypatch.setattr(cache, "_coerce", coerce)
+    cache.put("after", _tensor(seq_len=8))
+    assert cache.stats()["bytes_in_use"] == cache.max_bytes
 
 
 def test_tx_cache_logs_lru_eviction(monkeypatch, caplog):
