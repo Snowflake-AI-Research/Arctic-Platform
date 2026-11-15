@@ -507,10 +507,28 @@ def _gib(n):
     return "?" if n is None else f"{n / 2**30:.2f}"
 
 
+def unfreed_bytes(host):
+    """Rehomed bytes torch's pinned pool did not give back, or None when the
+    pool reports no stats. A stray reference to an old storage keeps its
+    pinned block alive, so its bytes still ride the image and host memory
+    holds the table twice."""
+    before, after = host.torch_reserved
+    if not host or before is None or after is None:
+        return None
+    return max(0, host.nbytes() - (before - after))
+
+
 def describe(host):
     """The one line ``rehome``'s outcome gets in the log."""
     before, after = host.torch_reserved
-    return (f"rehomed {len(host)} param(s) {_gib(host.nbytes())} GiB in "
+    line = (f"rehomed {len(host)} param(s) {_gib(host.nbytes())} GiB in "
             f"{host.seconds:.1f}s (torch pinned {_gib(before)} -> "
             f"{_gib(after)} GiB) skipped {len(host.skipped)} {host.skipped}"
             + (" uva_identity=ok" if host else ""))
+    left = unfreed_bytes(host)
+    if left is not None and left > 0.1 * host.nbytes():
+        line += (f" WARNING: torch pinned memory dropped by only "
+                 f"{_gib(host.nbytes() - left)} of {_gib(host.nbytes())} GiB; "
+                 f"an old storage is still referenced, so its pinned block stays "
+                 f"in host memory and in the image")
+    return line

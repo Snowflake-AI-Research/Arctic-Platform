@@ -215,6 +215,21 @@ def test_a_model_on_the_device_has_nothing_to_move(hw):
     assert host_weights.describe(host).startswith("rehomed 0 param(s)")
 
 
+def test_old_pinned_blocks_that_stay_referenced_are_reported(hw):
+    host = host_weights.rehome(_engram_worker(hw.reg), host_weights.HostWeights(),
+                               min_bytes=MIN)
+    moved = host.nbytes()
+    host.torch_reserved = (10 * moved, 9 * moved)
+    assert host_weights.unfreed_bytes(host) == 0
+    assert "WARNING" not in host_weights.describe(host)
+    host.torch_reserved = (10 * moved, 10 * moved)
+    assert host_weights.unfreed_bytes(host) == moved
+    assert "still referenced" in host_weights.describe(host)
+    host.torch_reserved = (None, None)
+    assert host_weights.unfreed_bytes(host) is None
+    assert "WARNING" not in host_weights.describe(host)
+
+
 def test_without_proc_maps_nothing_moves(hw, monkeypatch):
     monkeypatch.setattr(host_weights, "_mappings", lambda: None)
     host = host_weights.rehome(_engram_worker(hw.reg), host_weights.HostWeights(),
