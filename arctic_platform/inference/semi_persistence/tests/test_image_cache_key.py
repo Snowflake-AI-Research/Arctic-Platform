@@ -43,25 +43,36 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG = os.path.dirname(_HERE)                      # .../semi_persistence
 _INFERENCE = os.path.dirname(_PKG)                 # .../arctic_platform/inference
 _ENGINE = os.path.join(_INFERENCE, "server", "semip_engine.py")
+_GATHER = os.path.join(_INFERENCE, "server", "semip_gather.py")
+_GATHER_NAME = "arctic_platform.inference.server.semip_gather"
+
+
+def _load(name: str, path: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _load_semip_engine():
-    """Import semip_engine.py without executing the arctic_platform packages."""
+    """Import semip_engine.py without executing the arctic_platform packages.
+
+    Materializing imports semip_gather by name, so it is registered under that
+    name from its file too.
+    """
     pkg = types.ModuleType("arctic_platform.inference")
     pkg.__path__ = []
     semip = types.ModuleType("arctic_platform.inference.semi_persistence")
     semip.Instance = object  # only referenced at call time, never here
     sys.modules.setdefault("arctic_platform.inference", pkg)
     sys.modules.setdefault("arctic_platform.inference.semi_persistence", semip)
-
-    spec = importlib.util.spec_from_file_location("semip_engine_under_test",
-                                                  _ENGINE)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    if _GATHER_NAME not in sys.modules:
+        sys.modules[_GATHER_NAME] = _load(_GATHER_NAME, _GATHER)
+    return _load("semip_engine_under_test", _ENGINE)
 
 
 se = _load_semip_engine()
+sg = sys.modules[_GATHER_NAME]
 
 
 BASE_CONFIG = {

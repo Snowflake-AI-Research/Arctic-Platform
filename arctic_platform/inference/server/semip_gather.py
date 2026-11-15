@@ -1,57 +1,49 @@
-"""Gather a published skeleton from the model-cache daemons on other nodes.
+"""Materialize a published skeleton from this node's mirror.
 
-Every node's neutrino-model-cache DaemonSet mirrors the same published tree and
-serves byte ranges of its verified ``image-cache/`` files over HTTP
-(``image_cache_peer.py`` in cortex's ``neutrino/scripts``). A materialize that
-reads its skeleton from the local mirror is bound by one node's copy path --
-measured at ~3.3 GB/s through ``shutil.copytree`` -- while pulling ranges of the
-same files from every node at once is bound by the pod network and the
-destination disk instead.
+The neutrino-model-cache DaemonSet mirrors the published tree onto every node,
+so a materialize is a local copy: the files of ``compilation/`` and ``image/``
+are cut into ranges and copied by a pool of threads, with O_DIRECT writes
+wherever offset and length are block-aligned. On p5en that moves GLM-5.3's
+79 GB in ~4.2 s, against ~20 s through ``shutil.copytree``.
 
-Nothing is distributed: every node still holds every file. So any range a peer
-does not deliver (refused, timed out, short, gone, or simply never assigned
-because there were no peers) is read from the local mirror and written at the
-same offset. There is no S3 path and no retry against another peer, and a
-gather with no reachable peer is a parallel local copy -- which is also the
-default mode, ``local``. On p5en that local copy with O_DIRECT writes moves
-GLM-5.3's 79 GB in ~4.2 s against copytree's ~20; three peers took ~4.9 s, since
-the destination disk, not the network, is the bound.
+A compressed skeleton (``semip_publish.py``, "Compressed pages") goes through
+the same workers: each ``pages-<N>.img.zst`` becomes the raw ``pages-<N>.img``
+CRIU reads, decoded frame by frame straight into the write buffer. The file is
+preallocated at its full raw size and only non-zero frames are written; the
+all-zero frames stay preallocated, unwritten ranges, which read as zeros.
+Every frame's checksum and decoded length are checked on the way, and
+``sha256`` mode also hashes the result against the raw sha256. Every other
+file, and every file of a raw skeleton, is copied as raw ranges.
 
 Standard library only, like ``semip_engine``: the tests load both straight from
-their files, without the packages that pull in ray and torch.
+their files, without the packages that pull in ray and torch. libzstd is
+reached through ctypes, and only for a compressed skeleton.
 """
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import hashlib
-import http.client
 import json
 import logging
 import mmap
 import os
+import posixpath
 import queue
 import re
 import shutil
-import socket
 import threading
 import time
-import urllib.parse
 from typing import NamedTuple
 
 logger = logging.getLogger("arctic_platform.inference.server.semip")
 
-# "local" (the default, unset or "") is a ranged, parallel copy from this
-# node's mirror alone; "peers" gathers the same ranges from every node's
-# daemon; "off" keeps shutil.copytree.
-MODE_ENV = "SEMIP_GATHER"
-MODES = ("peers", "local")
-# host:port of the daemons, or several comma-separated. A hostname resolves to
-# every address it carries, which for the headless Service is every ready node.
-SERVICE_ENV = "SEMIP_GATHER_SERVICE"
 CHUNK_ENV = "SEMIP_GATHER_CHUNK"
 THREADS_ENV = "SEMIP_GATHER_THREADS"
-# "size" trusts the range accounting; "sha256" also hashes every gathered file
-# against the manifest.
+# "size" trusts the range accounting (and, for compressed pages, every frame's
+# checksum and length); "sha256" also hashes every gathered file against the
+# manifest's raw sha256.
 VERIFY_ENV = "SEMIP_GATHER_VERIFY"
 # On by default ("0" turns it off): write through O_DIRECT wherever offset and
 # length are block-aligned. Buffered writes cap at ~11 GB/s on ~45 cores of
@@ -60,7 +52,6 @@ VERIFY_ENV = "SEMIP_GATHER_VERIFY"
 # nothing measurable (10-11 s either way).
 DIRECT_ENV = "SEMIP_GATHER_DIRECT"
 
-DEFAULT_SERVICE = "neutrino-model-cache.neutrino.svc.cluster.local:8081"
 DEFAULT_CHUNK = 128 * 2**20
 DEFAULT_THREADS = 32
 
@@ -69,17 +60,6 @@ DEFAULT_THREADS = 32
 # directory over every replica<K>/.
 _MANIFEST = "_neutrino_manifest.json"
 
-# The daemon serves <cache-dir>/image-cache/<rel> at this prefix, and the pod
-# mounts <cache-dir>/image-cache as the image source -- so a file's URL is its
-# path relative to the image source root.
-_URL_PREFIX = "/image-cache/"
-
-# Past this, every range not yet started is read from the local mirror instead.
-_DEADLINE_S = 120.0
-# Short, because a peer that does not answer is a peer whose ranges go local,
-# and a NetworkPolicy that drops the SYN would otherwise cost this per flow.
-_CONNECT_TIMEOUT_S = 2.0
-_READ_TIMEOUT_S = 10.0
 _BUF_BYTES = 8 * 2**20
 # O_DIRECT wants offset, length and buffer address all aligned to the logical
 # block size; 4 KiB covers every block device here. Ranges start on multiples
@@ -89,51 +69,56 @@ _ALIGN = 4096
 _SIZE_SUFFIXES = {"": 1, "k": 10**3, "m": 10**6, "g": 10**9,
                   "ki": 2**10, "mi": 2**20, "gi": 2**30}
 
+# The compressed format this engine reads, and its spellings: pinned to
+# semip_publish's by tests/test_layout_names.py.
+FORMAT = 1
+CODEC = "zstd"
+COMPRESSED_SUFFIX = ".zst"
+INDEX_NAME = "compression.json"
+_LIBZSTD_SONAME = "libzstd.so.1"
+# A zstd frame starts with this magic and a descriptor byte whose bit 2 says a
+# checksum follows the frame and whose low two bits size a dictionary id.
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+_ZSTD_CHECKSUM_BIT = 0x04
+_ZSTD_DICT_BITS = 0x03
+
 
 class GatherStats(NamedTuple):
     files: int
-    total_bytes: int
-    peer_bytes: int
-    local_bytes: int
-    peers: int
-    failed_peers: int
+    total_bytes: int        # raw bytes now under incoming
+    copied_bytes: int       # of those, copied as raw ranges
+    ranges: int
     flows: int
-    local_ranges: int
     direct: bool
     elapsed_s: float
+    # Of the compressed files: bytes on the mirror, raw bytes decoded and
+    # written, raw bytes of all-zero frames left unwritten, and decode CPU.
+    stored_bytes: int = 0
+    written_bytes: int = 0
+    zero_bytes: int = 0
+    compressed_files: int = 0
+    decode_cpu_s: float = 0.0
+
+
+class _Frames(NamedTuple):
+    """A compressed file's frame table, from its image dir's index."""
+    frame_bytes: int
+    offsets: list[int]      # stored offset of every frame, then the stored size
+    zero: bytes             # 1 for every all-zero frame
 
 
 class _File(NamedTuple):
     src: str
     dest: str
-    url: str
-    size: int
-    sha256: str
+    size: int               # bytes at dest: raw, for a compressed file
+    sha256: str             # of the bytes at dest
+    frames: _Frames | None = None
 
 
 class _Range(NamedTuple):
     file: _File
     start: int
     end: int
-    peer: tuple[str, int] | None
-
-
-class _PeerFailed(Exception):
-    pass
-
-
-def mode() -> str:
-    """One of MODES, or "off"."""
-    raw = os.environ.get(MODE_ENV, "").strip().lower() or "local"
-    if raw == "off" or raw in MODES:
-        return raw
-    logger.warning("semi_p: %s=%r is not one of off, %s; copying with "
-                   "copytree", MODE_ENV, raw, ", ".join(MODES))
-    return "off"
-
-
-def enabled() -> bool:
-    return mode() != "off"
 
 
 def _parse_bytes(raw: str) -> int:
@@ -167,73 +152,224 @@ def _verify_mode() -> str:
     return raw
 
 
-def resolve_peers(service: str) -> list[tuple[str, int]]:
-    """Every address the service names. Empty, with a warning, if none resolve."""
-    peers: list[tuple[str, int]] = []
-    for item in service.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        host, _, port = item.rpartition(":")
-        try:
-            infos = socket.getaddrinfo(host.strip("[]"), int(port),
-                                       type=socket.SOCK_STREAM)
-        except (OSError, ValueError) as exc:
-            logger.warning("semi_p: cannot resolve gather peers %r (%s)", item, exc)
-            continue
-        for info in infos:
-            peer = (info[4][0], int(info[4][1]))
-            if peer not in peers:
-                peers.append(peer)
-    return peers
+def compression_format(verified_dir: str) -> int:
+    """The skeleton's compression format, from its manifest: 0 for raw.
+
+    Also 0 when there is no readable manifest, which ``plan`` then handles.
+    """
+    try:
+        with open(os.path.join(verified_dir, _MANIFEST)) as handle:
+            block = json.load(handle).get("compression")
+    except (OSError, ValueError, AttributeError):
+        return 0
+    if block is None:
+        return 0
+    fmt = block.get("format") if isinstance(block, dict) else None
+    return fmt if isinstance(fmt, int) and fmt > 0 else FORMAT
+
+
+def _compression(doc: dict, entries: list, manifest_path: str
+                 ) -> tuple[dict | None, set[str]]:
+    """``(compression block, index paths)``, once the rows agree with the block.
+
+    Raises on anything ``plan`` must not guess about.
+    """
+    block = doc.get("compression")
+    compressed = [e for e in entries if "raw_path" in e]
+    if block is None:
+        if compressed:
+            raise RuntimeError(f"{manifest_path} has compressed rows but no "
+                               f"'compression' block")
+        return None, set()
+    if not isinstance(block, dict):
+        raise RuntimeError(f"{manifest_path}: 'compression' is not an object")
+    if block.get("format") != FORMAT:
+        raise RuntimeError(f"skeleton format {block.get('format')!r} is newer "
+                           f"than this engine, which reads format {FORMAT}")
+    frame = block.get("frame_bytes")
+    index = block.get("index")
+    if (block.get("codec") != CODEC or not isinstance(frame, int)
+            or frame <= 0 or frame % _ALIGN or not isinstance(index, str)
+            or not index or "/" in index):
+        raise RuntimeError(f"{manifest_path}: unusable 'compression' block "
+                           f"{block!r}")
+    if not compressed:
+        raise RuntimeError(f"{manifest_path} has a 'compression' block but no "
+                           f"compressed rows")
+    listed = {str(e.get("path") or "") for e in entries}
+    indexes = set()
+    for e in compressed:
+        path, raw = str(e.get("path") or ""), str(e.get("raw_path") or "")
+        if path != raw + COMPRESSED_SUFFIX:
+            raise RuntimeError(f"{manifest_path}: {path!r} is not "
+                               f"{raw!r} + {COMPRESSED_SUFFIX}")
+        if raw in listed:
+            raise RuntimeError(f"{manifest_path} lists {raw!r} both raw and "
+                               f"compressed")
+        where = posixpath.join(posixpath.dirname(path), index)
+        if where not in listed:
+            raise RuntimeError(f"{manifest_path} lists {path!r} but not its "
+                               f"index {where!r}")
+        indexes.add(where)
+    return block, indexes
+
+
+def _frames(entry: dict, block: dict, verified_dir: str,
+            index_docs: dict[str, dict]) -> _Frames:
+    """``entry``'s frame table from its index, checked against its row."""
+    path = entry["path"]
+    where = posixpath.join(posixpath.dirname(path), block["index"])
+    if where not in index_docs:
+        with open(os.path.join(verified_dir, where)) as handle:
+            index_docs[where] = json.load(handle)
+    doc = index_docs[where]
+    frame = block["frame_bytes"]
+    item = ((doc.get("files") or {}).get(posixpath.basename(path))
+            if isinstance(doc, dict) else None)
+    if (not isinstance(item, dict) or doc.get("format") != FORMAT
+            or doc.get("frame_bytes") != frame):
+        raise RuntimeError(f"{where} does not describe {path} in format "
+                           f"{FORMAT} with {frame}-byte frames")
+    raw = entry.get("raw_size_bytes")
+    sizes = item.get("frame_stored_bytes")
+    if (not isinstance(raw, int) or raw <= 0
+            or item.get("raw_size_bytes") != raw
+            or not isinstance(sizes, list)
+            or len(sizes) != -(-raw // frame)
+            or not all(isinstance(n, int) and n > 0 for n in sizes)
+            or sum(sizes) != entry.get("size_bytes")):
+        raise RuntimeError(f"{where}'s frame table for {path} disagrees with "
+                           f"its manifest row")
+    zero = bytearray(len(sizes))
+    for run in item.get("zero_runs") or ():
+        if (not isinstance(run, list) or len(run) != 2
+                or not all(isinstance(x, int) for x in run)
+                or run[0] < 0 or run[1] <= 0 or sum(run) > len(sizes)):
+            raise RuntimeError(f"{where}: bad zero run {run!r} for {path}")
+        zero[run[0]:sum(run)] = b"\x01" * run[1]
+    offsets = [0]
+    for n in sizes:
+        offsets.append(offsets[-1] + n)
+    return _Frames(frame, offsets, bytes(zero))
+
+
+def _walk_plan(source_dir: str, incoming: str,
+               subdirs: tuple[str, ...]) -> list[_File]:
+    """Every file of ``subdirs``, raw, for a source with no daemon manifest."""
+    files = []
+    for sub in subdirs:
+        root = os.path.join(source_dir, sub)
+        for dirpath, _, names in os.walk(root):
+            if INDEX_NAME in names:
+                raise RuntimeError(
+                    f"{dirpath} holds compressed pages but {source_dir} has "
+                    f"no {_MANIFEST} to decode them by")
+            for name in sorted(names):
+                src = os.path.join(dirpath, name)
+                files.append(_File(
+                    src=src,
+                    dest=os.path.join(incoming, sub,
+                                      os.path.relpath(src, root)),
+                    size=os.stat(src).st_size, sha256=""))
+    return files
 
 
 def plan(source_dir: str, verified_dir: str, incoming: str,
-         subdirs: tuple[str, ...], source_root: str) -> list[_File]:
-    """The files of ``subdirs`` under ``source_dir``, from the manifest beside them."""
+         subdirs: tuple[str, ...]) -> list[_File]:
+    """The files of ``subdirs`` under ``source_dir``, from the manifest beside them.
+
+    A compressed row becomes its raw file at ``dest``, read from the ``.zst``
+    at ``src``; the index it was described by is consumed, not copied. The
+    daemon writes the manifest before the verified marker, so a source with
+    no manifest is one placed by hand: its files are listed as they are.
+    """
     manifest_path = os.path.join(verified_dir, _MANIFEST)
+    if not os.path.exists(manifest_path):
+        return _walk_plan(source_dir, incoming, subdirs)
     with open(manifest_path) as handle:
         doc = json.load(handle)
     entries = doc.get("files") if isinstance(doc, dict) else None
     if not isinstance(entries, list):
         raise RuntimeError(f"{manifest_path} has no 'files' list")
+    if not all(isinstance(e, dict) for e in entries):
+        raise RuntimeError(f"{manifest_path} has a row that is not an object")
+    block, indexes = _compression(doc, entries, manifest_path)
+    index_docs: dict[str, dict] = {}
 
     rel = os.path.relpath(source_dir, verified_dir)
     prefix = "" if rel == "." else rel.replace(os.sep, "/") + "/"
-    # Empty URLs when the source is not under the image source root: peers
-    # cannot address it, but the local mirror can still copy it.
-    url_base = None
-    if source_root:
-        rel_root = os.path.relpath(verified_dir, source_root).replace(os.sep, "/")
-        if rel_root != ".." and not rel_root.startswith("../"):
-            url_base = rel_root
-
     files = []
     for entry in entries:
         path = str(entry.get("path") or "")
+        if path in indexes:
+            continue
         for sub in subdirs:
             head = f"{prefix}{sub}/"
-            if path.startswith(head):
+            if not path.startswith(head):
+                continue
+            if "raw_path" in entry:
+                frames = _frames(entry, block, verified_dir, index_docs)
+                src = os.path.join(verified_dir, path)
+                stored = os.stat(src).st_size
+                if stored != frames.offsets[-1]:
+                    raise RuntimeError(
+                        f"{src} is {stored} bytes on the mirror, the manifest "
+                        f"says {frames.offsets[-1]}")
+                raw = entry["raw_path"]
                 files.append(_File(
-                    src=os.path.join(verified_dir, path),
-                    dest=os.path.join(incoming, sub, path[len(head):]),
-                    url=(_URL_PREFIX + urllib.parse.quote(f"{url_base}/{path}")
-                         if url_base is not None else ""),
-                    size=int(entry.get("size_bytes") or 0),
-                    sha256=str(entry.get("sha256") or "").lower()))
+                    src=src,
+                    dest=os.path.join(incoming, sub, raw[len(head):]),
+                    size=entry["raw_size_bytes"],
+                    sha256=str(entry.get("raw_sha256") or "").lower(),
+                    frames=frames))
                 break
+            files.append(_File(
+                src=os.path.join(verified_dir, path),
+                dest=os.path.join(incoming, sub, path[len(head):]),
+                size=int(entry.get("size_bytes") or 0),
+                sha256=str(entry.get("sha256") or "").lower()))
+            break
     return files
 
 
-def _ranges(files: list[_File], chunk: int,
-            peers: list[tuple[str, int]]) -> list[_Range]:
-    """Largest file first, cut into ``chunk``-byte ranges dealt round-robin."""
+def _ranges(files: list[_File], chunk: int) -> list[_Range]:
+    """Every range to copy or decode, largest first.
+
+    A raw file is cut into ``chunk``-byte ranges. A compressed one becomes runs
+    of non-zero frames of up to ``chunk`` raw bytes; its zero frames become no
+    range at all.
+    """
     pieces = []
-    for f in sorted(files, key=lambda f: f.size, reverse=True):
-        for start in range(0, f.size, chunk):
-            pieces.append((f, start, min(start + chunk, f.size)))
-    return [_Range(f, start, end, peers[i % len(peers)] if peers else None)
-            for i, (f, start, end) in enumerate(pieces)]
+    for f in files:
+        if f.frames is None:
+            for start in range(0, f.size, chunk):
+                pieces.append(_Range(f, start, min(start + chunk, f.size)))
+            continue
+        frame, zero = f.frames.frame_bytes, f.frames.zero
+        step = max(1, chunk // frame)
+        for first in range(0, len(zero), step):
+            last = min(first + step, len(zero))
+            i = first
+            while i < last:
+                if zero[i]:
+                    i += 1
+                    continue
+                j = i
+                while j < last and not zero[j]:
+                    j += 1
+                pieces.append(_Range(f, i * frame, min(j * frame, f.size)))
+                i = j
+    pieces.sort(key=lambda r: r.end - r.start, reverse=True)
+    return pieces
+
+
+def _zero_bytes(f: _File) -> int:
+    """Raw bytes of ``f``'s all-zero frames."""
+    if f.frames is None:
+        return 0
+    frame = f.frames.frame_bytes
+    return sum(min(frame, f.size - i * frame)
+               for i, z in enumerate(f.frames.zero) if z)
 
 
 def _pwrite_all(fd: int, view: memoryview, offset: int) -> None:
@@ -246,8 +382,9 @@ class _Writer:
     """``pwrite`` into one file, through O_DIRECT wherever alignment allows.
 
     Only a file's tail is ever unaligned, since every range starts on a chunk
-    boundary and every write but a range's last fills the whole buffer; that
-    tail goes through an ordinary descriptor onto pages no direct write touches.
+    or frame boundary and every write but a range's last fills the whole
+    buffer; that tail goes through an ordinary descriptor onto pages no direct
+    write touches.
     """
 
     def __init__(self, path: str, direct: bool):
@@ -274,8 +411,9 @@ class _Writer:
             os.close(self.dfd)
 
 
-def _transfer(rng: _Range, buf: memoryview, read_into, direct: bool) -> None:
-    """Fill ``buf`` from ``read_into(view, offset) -> n`` and write it out, to ``rng.end``."""
+def _copy_local(rng: _Range, buf: memoryview, direct: bool = False) -> None:
+    """Copy ``rng`` of a raw file from the mirror and write it in place."""
+    src = os.open(rng.file.src, os.O_RDONLY)
     out = _Writer(rng.file.dest, direct)
     try:
         offset = rng.start
@@ -283,54 +421,171 @@ def _transfer(rng: _Range, buf: memoryview, read_into, direct: bool) -> None:
             want = min(len(buf), rng.end - offset)
             filled = 0
             while filled < want:
-                got = read_into(buf[filled:want], offset + filled)
+                got = os.preadv(src, [buf[filled:want]], offset + filled)
                 if not got:
-                    raise EOFError(f"{offset + filled - rng.start} of "
-                                   f"{rng.end - rng.start} bytes")
+                    raise RuntimeError(
+                        f"{rng.file.src} ended early on the mirror, at "
+                        f"{offset + filled - rng.start} of "
+                        f"{rng.end - rng.start} bytes")
                 filled += got
             out.write(buf[:want], offset)
             offset += want
     finally:
+        os.close(src)
         out.close()
 
 
-def _fetch(rng: _Range, buf: memoryview, direct: bool = False) -> None:
-    """GET ``rng`` from its peer and write it in place. _PeerFailed on any fault."""
-    host, port = rng.peer
-    conn = http.client.HTTPConnection(host, port, timeout=_CONNECT_TIMEOUT_S)
-    try:
-        conn.connect()
-        conn.sock.settimeout(_READ_TIMEOUT_S)
-        conn.request("GET", rng.file.url,
-                     headers={"Range": f"bytes={rng.start}-{rng.end - 1}"})
-        resp = conn.getresponse()
-        expected = f"bytes {rng.start}-{rng.end - 1}/{rng.file.size}"
-        if resp.status != 206 or resp.getheader("Content-Range") != expected:
-            raise _PeerFailed(f"HTTP {resp.status} "
-                              f"{resp.getheader('Content-Range')!r} for {expected}")
-        _transfer(rng, buf, lambda view, _: resp.readinto(view), direct)
-    except EOFError as exc:
-        raise _PeerFailed(f"short body at {exc}") from exc
-    except (OSError, http.client.HTTPException) as exc:
-        raise _PeerFailed(f"{type(exc).__name__}: {exc}") from exc
-    finally:
-        conn.close()
+class _Zstd:
+    """libzstd's decoder through ctypes, which drops the GIL around each call."""
+
+    def __init__(self, lib):
+        size_t, ptr = ctypes.c_size_t, ctypes.c_void_p
+        lib.ZSTD_compressBound.argtypes = [size_t]
+        lib.ZSTD_compressBound.restype = size_t
+        lib.ZSTD_isError.argtypes = [size_t]
+        lib.ZSTD_isError.restype = ctypes.c_uint
+        lib.ZSTD_getErrorName.argtypes = [size_t]
+        lib.ZSTD_getErrorName.restype = ctypes.c_char_p
+        lib.ZSTD_createDCtx.restype = ptr
+        lib.ZSTD_freeDCtx.argtypes = [ptr]
+        lib.ZSTD_decompressDCtx.argtypes = [ptr, ptr, size_t, ptr, size_t]
+        lib.ZSTD_decompressDCtx.restype = size_t
+        self.lib = lib
+
+    def bound(self, n: int) -> int:
+        return int(self.lib.ZSTD_compressBound(n))
+
+    def decode(self, dctx: int, dst: int, cap: int, src: int, n: int) -> int:
+        """Decode the one frame at ``src``; raises unless it checks out."""
+        got = self.lib.ZSTD_decompressDCtx(dctx, dst, cap, src, n)
+        if self.lib.ZSTD_isError(got):
+            raise ValueError(self.lib.ZSTD_getErrorName(got).decode())
+        return got
 
 
-def _copy_local(rng: _Range, buf: memoryview, direct: bool = False) -> None:
-    src = os.open(rng.file.src, os.O_RDONLY)
+_ZSTD: list[_Zstd] = []
+_ZSTD_LOCK = threading.Lock()
+
+
+def _load_zstd() -> _Zstd:
+    """libzstd, loaded once. The backend image ships ``libzstd.so.1``."""
+    with _ZSTD_LOCK:
+        if not _ZSTD:
+            errors = []
+            for name in dict.fromkeys((_LIBZSTD_SONAME,
+                                       ctypes.util.find_library("zstd"))):
+                if not name:
+                    continue
+                try:
+                    _ZSTD.append(_Zstd(ctypes.CDLL(name)))
+                    break
+                except (OSError, AttributeError) as exc:
+                    errors.append(f"{name}: {exc}")
+            else:
+                raise RuntimeError(
+                    "this skeleton is compressed and libzstd cannot be loaded "
+                    f"({'; '.join(errors) or 'not found'})")
+        return _ZSTD[0]
+
+
+def _addr(buf) -> int:
+    return ctypes.addressof(ctypes.c_char.from_buffer(buf))
+
+
+class _Decoder:
+    """One worker's decode context and stored-bytes buffer, made on first use."""
+
+    def __init__(self, zstd: _Zstd):
+        self.zstd = zstd
+        self.dctx = zstd.lib.ZSTD_createDCtx()
+        if not self.dctx:
+            raise MemoryError("libzstd could not allocate a decode context")
+        self.frame = 0
+        self.inbuf = self.outbuf = None
+        self.cpu_s = 0.0
+
+    def buffers(self, frame: int, buf: memoryview
+                ) -> tuple[memoryview, memoryview]:
+        """``(stored, raw)`` buffers for frames of ``frame`` bytes: the
+        worker's own page-aligned ``buf`` holds the raw side when it fits."""
+        if frame != self.frame:
+            raw = buf if frame <= len(buf) else memoryview(mmap.mmap(-1, frame))
+            batch = len(raw) // frame
+            self.inbuf = memoryview(mmap.mmap(-1, batch * self.zstd.bound(frame)))
+            self.outbuf = raw[:batch * frame]
+            self.frame = frame
+        return self.inbuf, self.outbuf
+
+    def close(self) -> None:
+        self.zstd.lib.ZSTD_freeDCtx(self.dctx)
+
+
+def _decode_local(rng: _Range, buf: memoryview, dec: _Decoder,
+                  direct: bool) -> int:
+    """Decode ``rng``'s frames from the mirror and write them in place.
+
+    Every frame is read whole, must carry a checksum, and must decode, with
+    that checksum verified, to exactly its share of the raw file. Returns the
+    stored bytes read.
+    """
+    f, fr = rng.file, rng.file.frames
+    frame = fr.frame_bytes
+    inbuf, outbuf = dec.buffers(frame, buf)
+    in_addr, out_addr = _addr(inbuf), _addr(outbuf)
+    batch = len(outbuf) // frame
+    first, end = rng.start // frame, -(-rng.end // frame)
+    src = os.open(f.src, os.O_RDONLY)
+    out = _Writer(f.dest, direct)
+    read = 0
     try:
-        _transfer(rng, buf, lambda view, offset: os.preadv(src, [view], offset),
-                  direct)
-    except EOFError as exc:
-        raise RuntimeError(f"{rng.file.src} ended early on the mirror, at "
-                           f"{exc}") from exc
+        k = first
+        while k < end:
+            m = min(k + batch, end)
+            base, span = fr.offsets[k], fr.offsets[m] - fr.offsets[k]
+            if span > len(inbuf):
+                raise RuntimeError(f"{f.src}: frames {k}-{m - 1} take {span} "
+                                   f"bytes, more than {frame}-byte frames can")
+            filled = 0
+            while filled < span:
+                got = os.preadv(src, [inbuf[filled:span]], base + filled)
+                if not got:
+                    raise RuntimeError(
+                        f"{f.src} ended early on the mirror, at stored byte "
+                        f"{base + filled} (frame {k}+)")
+                filled += got
+            cpu = time.thread_time()
+            for j in range(k, m):
+                at = fr.offsets[j] - base
+                head = inbuf[at:at + 5]
+                want = min(frame, f.size - j * frame)
+                try:
+                    if (len(head) < 5 or head[:4] != _ZSTD_MAGIC
+                            or not head[4] & _ZSTD_CHECKSUM_BIT
+                            or head[4] & _ZSTD_DICT_BITS):
+                        raise ValueError("not a checksummed, dictionary-free "
+                                         "zstd frame")
+                    got = dec.zstd.decode(
+                        dec.dctx, out_addr + (j - k) * frame, want,
+                        in_addr + at, fr.offsets[j + 1] - fr.offsets[j])
+                    if got != want:
+                        raise ValueError(f"decoded {got} bytes, expected {want}")
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"{f.src}: frame {j} (raw offset {j * frame}) fails "
+                        f"to decode: {exc}") from None
+            dec.cpu_s += time.thread_time() - cpu
+            out.write(outbuf[:min(m * frame, f.size) - k * frame], k * frame)
+            read += span
+            k = m
     finally:
         os.close(src)
+        out.close()
+    return read
 
 
 def _preallocate(files: list[_File], incoming: str,
                  subdirs: tuple[str, ...]) -> None:
+    """Every file at its full size up front, so a short disk fails here."""
     for sub in subdirs:
         os.makedirs(os.path.join(incoming, sub), exist_ok=True)
     for f in files:
@@ -391,11 +646,11 @@ def _sha256_mismatches(files: list[_File], threads: int) -> list[str]:
 
 
 def gather(source_dir: str, verified_dir: str, incoming: str,
-           subdirs: tuple[str, ...], source_root: str) -> GatherStats:
-    """Assemble ``subdirs`` of ``source_dir`` under ``incoming`` from every peer.
+           subdirs: tuple[str, ...]) -> GatherStats:
+    """Assemble ``subdirs`` of ``source_dir`` under ``incoming`` from the mirror.
 
-    Raises if a range cannot be had from the local mirror either, or if a
-    gathered file fails verification; the caller treats that like a failed copy.
+    Raises if a file cannot be read or decoded, or fails verification; the
+    caller treats that like a failed copy.
     """
     t0 = time.perf_counter()
     chunk = _env_int(CHUNK_ENV, DEFAULT_CHUNK, _parse_bytes)
@@ -405,58 +660,47 @@ def gather(source_dir: str, verified_dir: str, incoming: str,
     direct = (os.environ.get(DIRECT_ENV, "").strip() != "0"
               and hasattr(os, "O_DIRECT"))
 
-    files = plan(source_dir, verified_dir, incoming, subdirs, source_root)
-    peers: list[tuple[str, int]] = []
-    if mode() == "peers" and files and not files[0].url:
-        logger.warning("semi_p: %s is not under the image source %s, so peers "
-                       "cannot address it; reading every range from the local "
-                       "mirror", verified_dir, source_root)
-    elif mode() == "peers":
-        peers = resolve_peers(os.environ.get(SERVICE_ENV, "").strip()
-                              or DEFAULT_SERVICE)
-        if not peers:
-            logger.warning("semi_p: no gather peers; reading every range of "
-                           "%s from the local mirror", source_dir)
+    files = plan(source_dir, verified_dir, incoming, subdirs)
+    compressed = [f for f in files if f.frames is not None]
+    zstd = _load_zstd() if compressed else None
+    if verify == "sha256" and not all(f.sha256 for f in files):
+        raise RuntimeError(f"{VERIFY_ENV}=sha256, but {verified_dir} has no "
+                           f"manifest sha256 for every file")
     _preallocate(files, incoming, subdirs)
 
     work: queue.Queue[_Range] = queue.Queue()
-    for rng in _ranges(files, chunk, peers):
+    for rng in _ranges(files, chunk):
         work.put(rng)
-    deadline = t0 + _DEADLINE_S
     lock = threading.Lock()
-    failed: dict[tuple[str, int], str] = {}
-    counts = {"peer": 0, "local": 0, "local_ranges": 0}
+    counts = {"copied": 0, "ranges": 0, "stored": 0, "written": 0}
     errors: list[BaseException] = []
+    decoders: list[_Decoder] = []
 
     def worker() -> None:
         # Page-aligned, as O_DIRECT requires of the buffer address.
         buf = memoryview(mmap.mmap(-1, _BUF_BYTES))
+        dec = None
         while not errors:
             try:
                 rng = work.get_nowait()
             except queue.Empty:
                 return
             try:
-                if (rng.peer is not None and rng.peer not in failed
-                        and time.perf_counter() < deadline):
-                    try:
-                        _fetch(rng, buf, direct)
-                        with lock:
-                            counts["peer"] += rng.end - rng.start
-                        continue
-                    except _PeerFailed as exc:
-                        with lock:
-                            if rng.peer not in failed:
-                                failed[rng.peer] = str(exc)
-                                logger.warning(
-                                    "semi_p: gather peer %s:%d failed on %s "
-                                    "(%s); its ranges come from the local "
-                                    "mirror", rng.peer[0], rng.peer[1],
-                                    rng.file.url, exc)
-                _copy_local(rng, buf, direct)
+                if rng.file.frames is None:
+                    _copy_local(rng, buf, direct)
+                    with lock:
+                        counts["copied"] += rng.end - rng.start
+                        counts["ranges"] += 1
+                    continue
+                if dec is None:
+                    dec = _Decoder(zstd)
+                    with lock:
+                        decoders.append(dec)
+                read = _decode_local(rng, buf, dec, direct)
                 with lock:
-                    counts["local"] += rng.end - rng.start
-                    counts["local_ranges"] += 1
+                    counts["stored"] += read
+                    counts["written"] += rng.end - rng.start
+                    counts["ranges"] += 1
             except BaseException as exc:
                 with lock:
                     errors.append(exc)
@@ -469,14 +713,19 @@ def gather(source_dir: str, verified_dir: str, incoming: str,
         t.start()
     for t in pool:
         t.join()
+    decode_cpu_s = sum(d.cpu_s for d in decoders)
+    for d in decoders:
+        d.close()
     if errors:
         raise RuntimeError(f"gathering {source_dir} failed: {errors[0]}") \
             from errors[0]
 
     total = sum(f.size for f in files)
-    if counts["peer"] + counts["local"] != total:
-        raise RuntimeError(f"gathered {counts['peer'] + counts['local']} of "
-                           f"{total} bytes of {source_dir}")
+    zero = sum(_zero_bytes(f) for f in compressed)
+    if counts["copied"] + counts["written"] + zero != total:
+        raise RuntimeError(f"gathered {counts['copied'] + counts['written']} "
+                           f"bytes and skipped {zero} zero bytes of {total} "
+                           f"bytes of {source_dir}")
     for f in files:
         if os.stat(f.dest).st_size != f.size:
             raise RuntimeError(f"{f.dest} is {os.stat(f.dest).st_size} bytes, "
@@ -488,8 +737,9 @@ def gather(source_dir: str, verified_dir: str, incoming: str,
                                f"manifest sha256, e.g. {bad[0]}")
     _copy_stats(files, source_dir, incoming, subdirs)
     return GatherStats(
-        files=len(files), total_bytes=total, peer_bytes=counts["peer"],
-        local_bytes=counts["local"], peers=len(peers),
-        failed_peers=len(failed), flows=flows,
-        local_ranges=counts["local_ranges"], direct=direct,
-        elapsed_s=time.perf_counter() - t0)
+        files=len(files), total_bytes=total, copied_bytes=counts["copied"],
+        ranges=counts["ranges"], flows=flows, direct=direct,
+        elapsed_s=time.perf_counter() - t0,
+        stored_bytes=sum(f.frames.offsets[-1] for f in compressed),
+        written_bytes=counts["written"], zero_bytes=zero,
+        compressed_files=len(compressed), decode_cpu_s=decode_cpu_s)
