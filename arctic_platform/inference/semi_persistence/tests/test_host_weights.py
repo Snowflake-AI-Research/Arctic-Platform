@@ -51,7 +51,8 @@ _CHILD_NAMES = (
     "_semip_attach", "_semip_stage", "_semip_detach", "_semip_free_double_buffer",
     "_semip_segments", "_semip_read_into", "_semip_save_weights", "_semip_load_weights",
     "_semip_config_value", "_semip_tp_size", "_semip_host_census", "_semip_unpin_host",
-    "_semip_repin_host", "_semip_release_host_weights", "_semip_refill_host_weights")
+    "_semip_repin_host", "_semip_release_host_weights", "_semip_refill_host_weights",
+    "_semip_lora_wrappers", "_semip_canonical_name", "_semip_canonical_names")
 _CHILD_CONSTANTS = ("_WEIGHT_LIKE_PATH", "_WEIGHTS_SHARD_BYTES", "_WEIGHTS_IO_WORKERS")
 
 
