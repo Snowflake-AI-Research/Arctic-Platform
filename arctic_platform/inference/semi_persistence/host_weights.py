@@ -132,10 +132,16 @@ def _mappings():
 
 
 def _host_reserved_bytes():
+    # torch 2.13 reports cudaHostAlloc'd bytes as allocated_bytes.current and
+    # has no reserved_bytes.* keys.
     try:
-        return int(torch.cuda.host_memory_stats()["reserved_bytes.current"])
+        stats = torch.cuda.host_memory_stats()
     except Exception:  # noqa: BLE001 - reporting only; older torch has no stats
         return None
+    for key in ("reserved_bytes.current", "allocated_bytes.current"):
+        if key in stats:
+            return int(stats[key])
+    return None
 
 
 def _host_empty_cache():
@@ -505,6 +511,6 @@ def describe(host):
     """The one line ``rehome``'s outcome gets in the log."""
     before, after = host.torch_reserved
     return (f"rehomed {len(host)} param(s) {_gib(host.nbytes())} GiB in "
-            f"{host.seconds:.1f}s (torch pinned reserved {_gib(before)} -> "
+            f"{host.seconds:.1f}s (torch pinned {_gib(before)} -> "
             f"{_gib(after)} GiB) skipped {len(host.skipped)} {host.skipped}"
             + (" uva_identity=ok" if host else ""))
