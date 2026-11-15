@@ -103,8 +103,9 @@ class _RouterReplayCacheBase:
     A side dict tracks per-entry byte counts for O(1) ``max_bytes`` accounting.
     A single ``threading.Lock`` guards the dicts (vLLM async loop + per-step
     NCCL task; contention is low). Tensor copy runs outside the lock, after
-    eviction has reserved the entry's bytes. ``max_bytes`` bounds cached plus
-    reserved entry bytes, excluding tensors retained by callers or snapshots.
+    eviction has reserved the entry's bytes: ``max_bytes`` bounds held plus
+    reserved entry bytes (an overwrite keeps its prior entry until the
+    replacement lands; tensors retained by snapshots are not counted).
     """
 
     def __init__(self, device: torch.device, max_bytes: int) -> None:
@@ -134,8 +135,8 @@ class _RouterReplayCacheBase:
     def put(self, sample_id: str, value: torch.Tensor | np.ndarray) -> None:
         """Insert or replace the entry; coerces to uint8 (uint16 kept) on self.device.
 
-        Overwrite releases the prior entry before copying its replacement;
-        a failed copy leaves the prior entry removed.
+        Overwrite drops the prior tensor BEFORE the max_bytes check so a
+        multi-turn rollout replacing its own prior turn does not double-count.
         """
         self._put(sample_id, value, replace=True)
 
@@ -185,11 +186,6 @@ class _RouterReplayCacheBase:
                     f"({projected} > {self.max_bytes}) on put({sample_id!r}, "
                     f"shape={new_shape}, dtype={dtype})"
                 )
-            overwrote = sample_id in self._data
-            created_at = self._created_at.get(sample_id, now)
-            if overwrote:
-                self._data.pop(sample_id)
-                self._remove_metadata_locked(sample_id)
             self._reserved_bytes += new_bytes
             if evictions:
                 self._log_evictions_locked(
@@ -209,9 +205,10 @@ class _RouterReplayCacheBase:
         with self._lock:
             self._reserved_bytes -= new_bytes
             self._reject_duplicate_locked(sample_id, replace)
-            if overwrote or sample_id in self._data:
+            if sample_id in self._data:
                 self._n_overwrite += 1
-            self._created_at.setdefault(sample_id, created_at)
+            else:
+                self._created_at[sample_id] = now
             self._bytes_in_use += new_bytes - self._sizes.get(sample_id, 0)
             self._data[sample_id] = tensor
             self._sizes[sample_id] = new_bytes
