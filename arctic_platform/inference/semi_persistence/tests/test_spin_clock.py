@@ -79,6 +79,45 @@ def _fake_shm_broadcast(clocks, with_class=True):
     return mod
 
 
+class _NotifySocket:
+    def __init__(self, calls):
+        self.calls = calls
+        self.pending = 0
+
+    def poll(self, timeout=None):
+        self.calls.append(("notify_poll", timeout))
+        return self.pending
+
+    def recv(self, flags=0, copy=True):
+        self.calls.append(("notify_recv", flags))
+        self.pending = 0
+
+
+def _fake_shm_broadcast_033(clocks):
+    """``shm_broadcast`` at 0.33.0, whose busy readers poll the notify socket
+    (vllm#63165)."""
+    mod = _fake_shm_broadcast(clocks)
+    mod.SHM_NOTIFY_POLL_INTERVAL_S = 2.0
+    mod.zmq = types.SimpleNamespace(NOBLOCK=1)
+    base = mod.SpinCondition
+
+    class SpinCondition(base):
+        def __init__(self, is_reader=True, busy_loop_s=1):
+            super().__init__(is_reader, busy_loop_s)
+            self.last_notify_poll = self.last_read
+            self.local_notify_socket = _NotifySocket(mod.calls)
+
+        def record_read(self):
+            self.last_read = mod.time.monotonic()
+            if self.last_read - self.last_notify_poll >= mod.SHM_NOTIFY_POLL_INTERVAL_S:
+                self.last_notify_poll = self.last_read
+                if self.local_notify_socket.poll(timeout=0):
+                    self.local_notify_socket.recv(flags=mod.zmq.NOBLOCK, copy=False)
+
+    mod.SpinCondition = SpinCondition
+    return mod
+
+
 @contextlib.contextmanager
 def _vllm(shm_broadcast):
     """Register ``vllm.distributed.device_communicators.shm_broadcast``."""
@@ -172,6 +211,53 @@ def test_idle_branch_restores_busy_window_when_upstream_raises(clocks, spin_cloc
     with pytest.raises(RuntimeError):
         cond.wait()
     assert cond.busy_loop_s == 1
+
+
+def _notify_polls(sb):
+    return [c for c in sb.calls if c[0] == "notify_poll"]
+
+
+def test_installed_busy_reader_polls_the_notify_socket_every_interval(clocks, spin_clock):
+    sb = _fake_shm_broadcast_033(clocks)
+    with _vllm(sb):
+        spin_clock.install()
+    cond = sb.SpinCondition()
+    cond.record_read()              # last_notify_poll still on the monotonic clock
+    assert _notify_polls(sb) == [("notify_poll", 0)]
+    for _ in range(3):
+        clocks.wall += 0.5
+        cond.record_read()
+    assert len(_notify_polls(sb)) == 1
+    clocks.wall += 0.5
+    cond.local_notify_socket.pending = 1
+    cond.record_read()
+    assert len(_notify_polls(sb)) == 2
+    assert sb.calls[-1] == ("notify_recv", 1)
+    assert cond.last_notify_poll == cond.last_read == clocks.wall
+
+
+def test_installed_busy_reader_keeps_polling_after_restore(clocks, spin_clock):
+    sb = _fake_shm_broadcast_033(clocks)
+    with _vllm(sb):
+        spin_clock.install()
+    cond = sb.SpinCondition()
+    cond.record_read()
+    clocks.restore()
+    cond.record_read()
+    assert len(_notify_polls(sb)) == 2
+    cond.wait()
+    assert sb.calls[-1] == "yield"
+
+
+def test_wall_clock_step_back_polls_instead_of_stalling(clocks, spin_clock):
+    sb = _fake_shm_broadcast_033(clocks)
+    with _vllm(sb):
+        spin_clock.install()
+    cond = sb.SpinCondition()
+    cond.record_read()
+    clocks.wall -= 3600.0
+    cond.record_read()
+    assert len(_notify_polls(sb)) == 2
 
 
 def test_install_is_idempotent(clocks, spin_clock):
