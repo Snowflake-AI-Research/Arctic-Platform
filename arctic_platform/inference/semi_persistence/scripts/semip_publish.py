@@ -78,13 +78,17 @@ see ``publish_nodes``.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import hashlib
 import json
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -169,6 +173,35 @@ STAGING_DIR = "_staging"
 _STAGE_DONE_SUFFIX = ".done"
 _RENDEZVOUS_POLL_S = 15.0
 _RENDEZVOUS_TIMEOUT_S = 3600.0
+
+# Compressed pages (format 1). Each non-empty pages-<N>.img directly under an
+# image/ directory of the skeleton is published as pages-<N>.img.zst: one
+# independent zstd frame per FRAME_BYTES of raw bytes (the last one shorter),
+# each carrying its content size and checksum. Every other file stays raw.
+# A compressed row keeps path/size_bytes/sha256 for the stored file -- all the
+# node cache verifies -- and adds raw_path/raw_size_bytes/raw_sha256, which
+# the engine rebuilds. Each such image directory gets a COMPRESSION_INDEX with
+# the frame table, published as an ordinary raw row; a top-level
+# "compression" block in the skeleton manifest marks the format. The
+# spellings are pinned to semip_gather's by tests/test_layout_names.py.
+#
+# On unless SEMIP_PUBLISH_COMPRESS=0. The engine reads both formats.
+COMPRESS_ENV = "SEMIP_PUBLISH_COMPRESS"
+COMPRESSION_FORMAT = 1
+COMPRESSION_CODEC = "zstd"
+COMPRESSION_LEVEL = 1
+FRAME_BYTES = 1 << 20
+COMPRESSED_SUFFIX = ".zst"
+COMPRESSION_INDEX = "compression.json"
+_PAGES_NAME_RE = re.compile(r"pages-\d+\.img")
+# Under the dumped directory, dot-prefixed like the engine's .incoming, and
+# outside every directory build_manifest hashes. Holds the stored pages until
+# they are uploaded; removed at the start and the end of every publish.
+PUBLISH_STAGING_DIR = ".semip-publish"
+_READ_BYTES = 8 * FRAME_BYTES
+# Compression runs beside the job that is serving, at nice 10 (--nice).
+_COMPRESS_THREADS_MAX = 32
+_LIBZSTD_SONAME = "libzstd.so.1"
 
 
 def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
@@ -660,12 +693,359 @@ def wait_verified(bucket: str, prefix: str, slug: str, skel_key: str,
 
 
 # ---------------------------------------------------------------------------
+# Compressed pages
+# ---------------------------------------------------------------------------
+
+
+class _Zstd:
+    """The few libzstd calls the format needs, through ctypes.
+
+    The backend image ships libzstd.so.1 but no Python binding, and this
+    script stays stdlib-only. ctypes releases the GIL around each call, so the
+    hashing pool compresses on as many cores as it has threads.
+    """
+
+    _C_LEVEL, _C_CONTENT_SIZE, _C_CHECKSUM = 100, 200, 201
+
+    def __init__(self, lib):
+        size_t, ptr = ctypes.c_size_t, ctypes.c_void_p
+        lib.ZSTD_versionNumber.restype = ctypes.c_uint
+        lib.ZSTD_compressBound.argtypes = [size_t]
+        lib.ZSTD_compressBound.restype = size_t
+        lib.ZSTD_isError.argtypes = [size_t]
+        lib.ZSTD_isError.restype = ctypes.c_uint
+        lib.ZSTD_getErrorName.argtypes = [size_t]
+        lib.ZSTD_getErrorName.restype = ctypes.c_char_p
+        lib.ZSTD_createCCtx.restype = ptr
+        lib.ZSTD_freeCCtx.argtypes = [ptr]
+        lib.ZSTD_CCtx_setParameter.argtypes = [ptr, ctypes.c_int, ctypes.c_int]
+        lib.ZSTD_CCtx_setParameter.restype = size_t
+        lib.ZSTD_compress2.argtypes = [ptr, ptr, size_t, ptr, size_t]
+        lib.ZSTD_compress2.restype = size_t
+        lib.ZSTD_createDCtx.restype = ptr
+        lib.ZSTD_freeDCtx.argtypes = [ptr]
+        lib.ZSTD_decompressDCtx.argtypes = [ptr, ptr, size_t, ptr, size_t]
+        lib.ZSTD_decompressDCtx.restype = size_t
+        self.lib = lib
+        self.version = int(lib.ZSTD_versionNumber())
+        self.bound = int(lib.ZSTD_compressBound(FRAME_BYTES))
+
+    def check(self, ret: int, what: str) -> int:
+        if self.lib.ZSTD_isError(ret):
+            raise RuntimeError(
+                f"{what}: {self.lib.ZSTD_getErrorName(ret).decode()}")
+        return ret
+
+
+def _load_zstd() -> tuple[_Zstd | None, str]:
+    """``(binding, "")``, or ``(None, why)`` when libzstd cannot be loaded."""
+    errors = []
+    for name in dict.fromkeys((_LIBZSTD_SONAME, ctypes.util.find_library("zstd"))):
+        if not name:
+            continue
+        try:
+            return _Zstd(ctypes.CDLL(name)), ""
+        except (OSError, AttributeError) as exc:
+            errors.append(f"{name}: {exc}")
+    return None, "; ".join(errors) or "no libzstd found"
+
+
+def _addr(buf, offset: int = 0) -> int:
+    return ctypes.addressof(ctypes.c_char.from_buffer(buf)) + offset
+
+
+class _FrameCodec:
+    """One file's compression and decode-check context; one thread at a time."""
+
+    def __init__(self, zstd: _Zstd):
+        self.zstd = zstd
+        lib = zstd.lib
+        self.cctx = lib.ZSTD_createCCtx()
+        self.dctx = lib.ZSTD_createDCtx()
+        if not self.cctx or not self.dctx:
+            self.close()
+            raise MemoryError("libzstd could not allocate a context")
+        for param, value in ((_Zstd._C_LEVEL, COMPRESSION_LEVEL),
+                             (_Zstd._C_CHECKSUM, 1),
+                             (_Zstd._C_CONTENT_SIZE, 1)):
+            zstd.check(lib.ZSTD_CCtx_setParameter(self.cctx, param, value),
+                       "ZSTD_CCtx_setParameter")
+        self.out = bytearray(zstd.bound)
+        self.back = bytearray(FRAME_BYTES)
+        self._zero: dict[int, bytes] = {}
+
+    def compress(self, buf: bytearray, start: int, n: int) -> int:
+        """One frame of ``buf[start:start + n]`` into ``self.out``; its length."""
+        return self.zstd.check(self.zstd.lib.ZSTD_compress2(
+            self.cctx, _addr(self.out), len(self.out), _addr(buf, start), n),
+            "ZSTD_compress2")
+
+    def decodes_back(self, stored: int, buf: bytearray, start: int,
+                     n: int) -> bool:
+        """Whether the frame in ``self.out`` decodes to ``buf[start:start + n]``."""
+        lib = self.zstd.lib
+        got = lib.ZSTD_decompressDCtx(self.dctx, _addr(self.back), n,
+                                      _addr(self.out), stored)
+        return (not lib.ZSTD_isError(got) and got == n
+                and self.back[:n] == buf[start:start + n])
+
+    def zero_frame(self, n: int) -> bytes:
+        """The frame ``n`` zero bytes compress to: a frame is all zeros iff it
+        equals this, since decoding is a function."""
+        if n not in self._zero:
+            zeros = bytearray(n)
+            self._zero[n] = bytes(self.out[:self.compress(zeros, 0, n)])
+        return self._zero[n]
+
+    def close(self) -> None:
+        if self.cctx:
+            self.zstd.lib.ZSTD_freeCCtx(self.cctx)
+        if self.dctx:
+            self.zstd.lib.ZSTD_freeDCtx(self.dctx)
+        self.cctx = self.dctx = None
+
+
+def _read_full(src, view: memoryview) -> int:
+    """Fill ``view`` unless the file ends first, so frames stay FRAME_BYTES apart."""
+    filled = 0
+    while filled < len(view):
+        got = src.readinto(view[filled:])
+        if not got:
+            break
+        filled += got
+    return filled
+
+
+def _zero_runs(frames: list[int]) -> list[list[int]]:
+    """Sorted frame numbers as ``[first, count]`` runs."""
+    runs: list[list[int]] = []
+    for i in frames:
+        if runs and runs[-1][0] + runs[-1][1] == i:
+            runs[-1][1] += 1
+        else:
+            runs.append([i, 1])
+    return runs
+
+
+def _compress_pages(path: Path, staged: Path, zstd: _Zstd) -> dict:
+    """Hash, compress, decode-check and hash again, in one read of ``path``.
+
+    Every frame is decoded back and compared with its input before it is
+    written, so a bad stream fails the publish rather than every restore.
+    """
+    size = path.stat().st_size
+    raw_hash, stored_hash = hashlib.sha256(), hashlib.sha256()
+    frames: list[int] = []
+    zeros: list[int] = []
+    buf = bytearray(_READ_BYTES)
+    view = memoryview(buf)
+    done = 0
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    codec = _FrameCodec(zstd)
+    try:
+        with path.open("rb", buffering=0) as src, staged.open("wb") as out:
+            while True:
+                got = _read_full(src, view)
+                if not got:
+                    break
+                raw_hash.update(view[:got])
+                for start in range(0, got, FRAME_BYTES):
+                    n = min(FRAME_BYTES, got - start)
+                    zero = codec.zero_frame(n)
+                    stored = codec.compress(buf, start, n)
+                    if not codec.decodes_back(stored, buf, start, n):
+                        raise RuntimeError(
+                            f"{path}: frame {len(frames)} (raw offset "
+                            f"{done + start}) does not decode back to its "
+                            f"input; not publishing it")
+                    frame = memoryview(codec.out)[:stored]
+                    if stored == len(zero) and frame == zero:
+                        zeros.append(len(frames))
+                    stored_hash.update(frame)
+                    out.write(frame)
+                    frames.append(stored)
+                done += got
+    finally:
+        codec.close()
+    if done != size:
+        raise RuntimeError(f"{path} changed while it was compressed "
+                           f"({size} bytes, then {done})")
+    return {"raw_sha256": raw_hash.hexdigest(),
+            "stored_sha256": stored_hash.hexdigest(),
+            "frame_stored_bytes": frames, "zero_runs": _zero_runs(zeros)}
+
+
+def _cpu_budget() -> int:
+    """CPUs this container may use: its cgroup quota, else its affinity."""
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()[:2]
+        if quota != "max":
+            return max(1, int(quota) // int(period))
+    except (OSError, ValueError):
+        pass
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
+def _is_image_subdir(sub: str) -> bool:
+    return sub.rsplit("/", 1)[-1] == IMAGE_DIR
+
+
+def _pages_files(model_dir: Path, sub: str) -> list[Path]:
+    """The compressible pages files of one hashed subdir: non-empty
+    ``pages-<N>.img`` directly under an image/ directory."""
+    root = model_dir / sub
+    if not _is_image_subdir(sub) or not root.is_dir():
+        return []
+    return [p for p in sorted(root.iterdir())
+            if _PAGES_NAME_RE.fullmatch(p.name) and p.is_file()
+            and p.stat().st_size > 0]
+
+
+class _Compression:
+    """How one publish compresses its pages, and its totals for the summary."""
+
+    def __init__(self, zstd: _Zstd, staging: Path, threads: int):
+        self.zstd = zstd
+        self.staging = staging
+        self.threads = threads
+        self.lock = threading.Lock()
+        self.raw_bytes = 0
+        self.stored_bytes = 0
+        self.frames = 0
+        self.zero_frames = 0
+
+    def file(self, model_dir: Path, path: Path) -> dict:
+        rel = str(path.relative_to(model_dir))
+        out = _compress_pages(path, self.staging / (rel + COMPRESSED_SUFFIX),
+                              self.zstd)
+        out["raw_size_bytes"] = path.stat().st_size
+        with self.lock:
+            self.raw_bytes += out["raw_size_bytes"]
+            self.stored_bytes += sum(out["frame_stored_bytes"])
+            self.frames += len(out["frame_stored_bytes"])
+            self.zero_frames += sum(n for _, n in out["zero_runs"])
+        return out
+
+    def staged_dir(self, rel_dir: str) -> Path:
+        return self.staging / rel_dir
+
+
+def _compression_for(model_dir: Path, subdirs: list[str], wanted: bool,
+                     dry_run: bool, workers: int | None
+                     ) -> _Compression | None:
+    """A ``_Compression`` for this publish, or ``None`` (and why) to publish raw."""
+    shutil.rmtree(model_dir / PUBLISH_STAGING_DIR, ignore_errors=True)
+    pages = [p for sub in subdirs for p in _pages_files(model_dir, sub)]
+    if not pages:
+        return None
+    raw = sum(p.stat().st_size for p in pages)
+    if not wanted:
+        print(f"pages       : raw ({COMPRESS_ENV}=0 or --no-compress)")
+        return None
+    if dry_run:
+        print("pages       : hashed raw; a dry run does not compress them "
+              "(a publish would)")
+        return None
+    zstd, why = _load_zstd()
+    if zstd is None:
+        print(f"  ! pages published raw: libzstd cannot be loaded ({why})")
+        return None
+    free = shutil.disk_usage(model_dir).free
+    if free < raw:
+        print(f"  ! pages published raw: {free / 2**30:.1f} GiB free under "
+              f"{model_dir}, less than the {raw / 2**30:.1f} GiB of pages "
+              f"staging could need")
+        return None
+    threads = max(1, min(workers or _COMPRESS_THREADS_MAX,
+                         _COMPRESS_THREADS_MAX, _cpu_budget()))
+    print(f"pages       : {COMPRESSION_CODEC}-{COMPRESSION_LEVEL}, "
+          f"{FRAME_BYTES // 2**20} MiB frames, {len(pages)} file(s), "
+          f"{raw / 2**30:.1f} GiB raw, {threads} thread(s), staged under "
+          f"{model_dir / PUBLISH_STAGING_DIR}")
+    return _Compression(zstd, model_dir / PUBLISH_STAGING_DIR, threads)
+
+
+def _compress_wanted(flag: bool | None) -> bool:
+    if flag is not None:
+        return flag
+    return os.environ.get(COMPRESS_ENV, "").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _compression_block(rows: list[dict],
+                       compress: _Compression | None) -> dict | None:
+    """The manifest's format marker, present iff a row is compressed."""
+    if not any("raw_path" in r for r in rows):
+        return None
+    index_dirs = {r["path"].rsplit("/", 1)[0] for r in rows if "raw_path" in r}
+    raw = sum(r.get("raw_size_bytes", r["size_bytes"]) for r in rows
+              if r["path"] not in {f"{d}/{COMPRESSION_INDEX}"
+                                   for d in index_dirs})
+    return {"format": COMPRESSION_FORMAT, "codec": COMPRESSION_CODEC,
+            "level": COMPRESSION_LEVEL, "frame_bytes": FRAME_BYTES,
+            "index": COMPRESSION_INDEX, "raw_total_bytes": raw,
+            "stored_total_bytes": sum(r["size_bytes"] for r in rows),
+            "zstd_version": _zstd_version(compress)}
+
+
+def _zstd_version(compress: _Compression | None) -> int | None:
+    if compress is not None:
+        return compress.zstd.version
+    zstd, _ = _load_zstd()
+    return zstd.version if zstd is not None else None
+
+
+def _format_name(manifest: dict) -> str:
+    return "zstd" if manifest.get("compression") else "raw"
+
+
+def _pages_upload(rows: list[dict], rel_dir: str,
+                  compress: _Compression | None
+                  ) -> tuple[list[str], Path | None]:
+    """``(names to leave out, staged dir to add)`` for uploading ``rel_dir``.
+
+    Exact names rather than ``pages-*.img``: the aws CLI's ``*`` crosses
+    ``/``, so a pattern would also drop raw files in subdirectories.
+    """
+    if compress is None:
+        return [], None
+    prefix = rel_dir + "/"
+    names = sorted(r["raw_path"][len(prefix):] for r in rows
+                   if "raw_path" in r and r["raw_path"].startswith(prefix)
+                   and "/" not in r["raw_path"][len(prefix):])
+    if not names:
+        return [], None
+    return names, compress.staged_dir(rel_dir)
+
+
+def _print_summary(skel: dict, compress: _Compression | None, hash_s: float,
+                   upload_s: float) -> None:
+    """The last line of a publish, which onboarding reads from the engine's log."""
+    rows = skel["files"]
+    block = skel.get("compression")
+    print("publish summary: " + json.dumps({
+        "format": (f"{COMPRESSION_CODEC}{COMPRESSION_LEVEL}" if block
+                   else "raw"),
+        "raw_bytes": block["raw_total_bytes"] if block else skel["total_bytes"],
+        "stored_bytes": skel["total_bytes"],
+        "compressed_files": sum(1 for r in rows if "raw_path" in r),
+        "zero_frames": compress.zero_frames if compress else 0,
+        "hash_compress_s": round(hash_s, 1),
+        "upload_s": round(upload_s, 1),
+    }, sort_keys=True))
+
+
+# ---------------------------------------------------------------------------
 # Manifest + upload
 # ---------------------------------------------------------------------------
 
 
 def build_manifest(model_dir: Path, subdirs: list[str],
-                   workers: int | None = None) -> dict:
+                   workers: int | None = None,
+                   compress: _Compression | None = None) -> dict:
     """Per-file sizes and SHA-256s for the sentinel, and so for the weight hash.
 
     This is the expensive half of a publish: every byte of every subdir is read,
@@ -681,6 +1061,10 @@ def build_manifest(model_dir: Path, subdirs: list[str],
     ``ex.map`` preserves input order, so rows stay in sorted path order whatever
     order the hashes complete in. The weight hash sorts its own rows anyway, but
     a manifest whose order wandered between runs would be needlessly hard to diff.
+
+    With ``compress``, an image/ subdir's pages files get the fused pass of
+    ``_compress_pages`` in the same pool instead, on at most
+    ``compress.threads`` threads, and the subdir gains its frame index.
     """
     if workers is None:
         workers = max(1, min(16, os.cpu_count() or 8))
@@ -692,22 +1076,75 @@ def build_manifest(model_dir: Path, subdirs: list[str],
             print(f"  - {sub}/ absent, skipping")
             continue
         paths = [p for p in sorted(root.rglob("*")) if p.is_file()]
+        pages = set(_pages_files(model_dir, sub)) if compress else set()
+        names = {p.name for p in paths}
+        if pages and (COMPRESSION_INDEX in names or any(
+                p.name + COMPRESSED_SUFFIX in names for p in pages)):
+            print(f"  ! {sub}/ already holds a {COMPRESSION_INDEX} or "
+                  f"{COMPRESSED_SUFFIX} file; publishing its pages raw")
+            pages = set()
+        threads = min(workers, compress.threads) if pages else workers
+
+        def hash_one(path: Path):
+            if path in pages:
+                return compress.file(model_dir, path)
+            return _sha256_file(path)
+
         started = time.time()
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            digests = list(pool.map(_sha256_file, paths))
-        nbytes = 0
+        with ThreadPoolExecutor(max_workers=threads) as pool:
+            digests = list(pool.map(hash_one, paths))
+        nbytes = stored = zero = 0
+        index = {}
         for path, digest in zip(paths, digests):
             size = path.stat().st_size
+            rel = str(path.relative_to(model_dir))
+            nbytes += size
+            if path in pages:
+                frames = digest["frame_stored_bytes"]
+                files.append({
+                    "path": rel + COMPRESSED_SUFFIX,
+                    "size_bytes": sum(frames),
+                    "sha256": digest["stored_sha256"],
+                    "raw_path": rel,
+                    "raw_size_bytes": size,
+                    "raw_sha256": digest["raw_sha256"],
+                })
+                index[path.name + COMPRESSED_SUFFIX] = {
+                    "raw_size_bytes": size,
+                    "frame_stored_bytes": frames,
+                    "zero_runs": digest["zero_runs"],
+                }
+                total += sum(frames)
+                stored += sum(frames)
+                zero += sum(n for _, n in digest["zero_runs"])
+                continue
             files.append(
                 {
-                    "path": str(path.relative_to(model_dir)),
+                    "path": rel,
                     "size_bytes": size,
                     "sha256": digest,
                 }
             )
             total += size
-            nbytes += size
+            stored += size
+        if index:
+            local = compress.staged_dir(sub) / COMPRESSION_INDEX
+            local.write_text(json.dumps(
+                {"format": COMPRESSION_FORMAT, "frame_bytes": FRAME_BYTES,
+                 "files": index}, sort_keys=True, separators=(",", ":")))
+            files.append({"path": f"{sub}/{COMPRESSION_INDEX}",
+                          "size_bytes": local.stat().st_size,
+                          "sha256": _sha256_file(local)})
+            total += local.stat().st_size
+            stored += local.stat().st_size
         elapsed = max(time.time() - started, 1e-9)
+        if index:
+            print(f"  - {sub}/ hashed+compressed: {len(paths)} files, "
+                  f"{nbytes / 2**30:.1f} GiB raw -> {stored / 2**30:.2f} GiB "
+                  f"stored ({nbytes / max(stored, 1):.1f}x), {len(index)} "
+                  f"pages file(s), {zero} zero frame(s), in {elapsed:.1f}s "
+                  f"({nbytes / 2**30 / elapsed:.2f} GiB/s, {threads} threads)")
+            continue
         print(f"  - {sub}/ hashed: {len(paths)} files, "
               f"{nbytes / 2**30:.1f} GiB in {elapsed:.1f}s "
               f"({nbytes / 2**30 / elapsed:.2f} GiB/s, {workers} threads)")
@@ -791,6 +1228,34 @@ def _published_node_count(bucket: str, key: str) -> int | None:
         return int(json.loads(out).get("nodes", 1))
     except (OSError, ValueError, TypeError):
         return None
+
+
+def _published_format(bucket: str, key: str) -> str | None:
+    """``"raw"`` or ``"zstd"`` for the skeleton already published at *key*;
+    ``None`` if none or unknown."""
+    if not _published(bucket, key):
+        return None
+    try:
+        rc, out = _aws_out("s3", "cp", f"s3://{bucket}/{key}/{MANIFEST_FILENAME}",
+                           "-")
+        if rc != 0:
+            return None
+        return _format_name(json.loads(out))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _refuse_format_switch(bucket: str, skel_rel: str, skel: dict) -> None:
+    """One key, one format: republishing in the other one would leave the old
+    format's files in the bucket beside the new sentinel, unlisted."""
+    already = _published_format(bucket, skel_rel)
+    mine = _format_name(skel)
+    if already is not None and already != mine:
+        raise SystemExit(
+            f"{skel_rel} is already published with {already} pages; this "
+            f"publish would write {mine} pages. Unpublish it first "
+            f"(--unpublish-skeleton --key ...), or publish with "
+            f"{COMPRESS_ENV}={'0' if already == 'raw' else '1'}.")
 
 
 # The rendezvous between the pods of one pod-spanning dump. Plain objects under
@@ -955,9 +1420,18 @@ def _warn_on_weight_drift(bucket: str, prefix: str, slug: str, wt_hash: str,
         print(f"  ! weight drift check skipped ({type(exc).__name__}: {exc})")
 
 
-def _upload_dir(src: Path, dest: str, label: str) -> None:
+def _upload_dir(src: Path, dest: str, label: str,
+                exclude: list[str] | tuple[str, ...] = (),
+                staged: Path | None = None) -> None:
+    """``src`` to ``dest``, less ``exclude``; then ``staged`` (compressed
+    pages and their index) into the same ``dest``."""
     print(f"uploading {label} ...")
-    _aws("s3", "cp", "--recursive", "--only-show-errors", str(src), dest)
+    skip = [arg for name in exclude for arg in ("--exclude", name)]
+    _aws("s3", "cp", "--recursive", "--only-show-errors", *skip, str(src), dest)
+    if staged is not None:
+        print(f"uploading {label} compressed pages ...")
+        _aws("s3", "cp", "--recursive", "--only-show-errors", str(staged),
+             dest)
 
 
 def _write_sentinel(model_dir: Path, manifest: dict, dest: str,
@@ -976,7 +1450,8 @@ def publish(model_dir: Path, bucket: str, prefix: str,
             skeleton_only: bool = False, dry_run: bool = False,
             force_weights: bool = False,
             hash_workers: int | None = None,
-            wait_timeout: float | None = None) -> str:
+            wait_timeout: float | None = None,
+            compress: bool | None = None) -> str:
     """Publish the skeleton, and the weights only if that hash is new.
 
     Returns the published skeleton key.
@@ -984,13 +1459,25 @@ def publish(model_dir: Path, bucket: str, prefix: str,
     *model_dir* is the dumped ``<root>/<cfg12>_<env12>``, whether it holds one
     flat image or ``replica<K>/`` directories; see ``load_layout``. A pod's
     ``node<k>/`` node-partition of a pod-spanning dump goes to ``publish_nodes``.
+
+    *compress* overrides ``SEMIP_PUBLISH_COMPRESS`` (unset means on).
     """
     if node_dirs(model_dir):
         return publish_nodes(model_dir, bucket, prefix,
                              skeleton_only=skeleton_only, dry_run=dry_run,
                              force_weights=force_weights,
                              hash_workers=hash_workers,
-                             wait_timeout=wait_timeout)
+                             wait_timeout=wait_timeout, compress=compress)
+    try:
+        return _publish(model_dir, bucket, prefix, skeleton_only, dry_run,
+                        force_weights, hash_workers, wait_timeout, compress)
+    finally:
+        shutil.rmtree(model_dir / PUBLISH_STAGING_DIR, ignore_errors=True)
+
+
+def _publish(model_dir: Path, bucket: str, prefix: str, skeleton_only: bool,
+             dry_run: bool, force_weights: bool, hash_workers: int | None,
+             wait_timeout: float | None, compress_flag: bool | None) -> str:
     key, meta, replicas = load_layout(model_dir)
     slug = model_slug(meta)
 
@@ -1014,9 +1501,15 @@ def publish(model_dir: Path, bucket: str, prefix: str,
     # decides whether to upload them, so it cannot be skipped. This is the one
     # expensive step -- a full read of weight/ -- and it is why the dump-side
     # alternative exists as a later option.
+    subdirs = _payload_subdirs(replicas)
+    compress = _compression_for(model_dir, subdirs,
+                                _compress_wanted(compress_flag), dry_run,
+                                hash_workers)
     print("hashing files ...")
-    full = build_manifest(model_dir, _payload_subdirs(replicas),
-                          workers=hash_workers)
+    started = time.time()
+    full = build_manifest(model_dir, subdirs, workers=hash_workers,
+                          compress=compress)
+    hash_s = time.time() - started
     names = [r.name for r in replicas]
     if replicas:
         # Every replica saved its own copy of the same weights; one is uploaded.
@@ -1059,6 +1552,9 @@ def publish(model_dir: Path, bucket: str, prefix: str,
     else:
         skel = _scoped_manifest(full["files"], SKELETON_DIRS)
         wts = _scoped_manifest(full["files"], (WEIGHT_DIR,), strip=WEIGHT_DIR)
+    block = _compression_block(skel["files"], compress)
+    if block:
+        skel["compression"] = block
 
     # One key, one shape. Overwriting a skeleton of another replica count would
     # leave the old shape's files under the new sentinel, which the node cache
@@ -1068,6 +1564,8 @@ def publish(model_dir: Path, bucket: str, prefix: str,
         raise SystemExit(
             f"{skel_rel} is already published with {already} replica(s); this "
             f"dump has {len(names) or 1}. Unpublish it first if it is stale.")
+    if not dry_run:
+        _refuse_format_switch(bucket, skel_rel, skel)
 
     for m, extra in ((skel, {"cache_key": skel_key}),
                      (wts, {"weight_hash": wt_hash})):
@@ -1105,17 +1603,19 @@ def publish(model_dir: Path, bucket: str, prefix: str,
     if not weights_present and not dry_run:
         _warn_on_weight_drift(bucket, prefix, slug, wt_hash, wts["files"])
 
-    # (local dir, destination, label) for every skeleton directory, in upload
-    # order; a multi-replica skeleton keeps each replica under its own name.
+    # (local dir, destination, label, rel dir) for every skeleton directory, in
+    # upload order; a multi-replica skeleton keeps each replica under its own
+    # name.
     skel_uploads = [
         (model_dir / name / sub, f"{skel_dest}/{name + '/' if name else ''}{sub}",
-         f"{name + '/' if name else ''}{sub}/")
+         f"{name + '/' if name else ''}{sub}/",
+         f"{name + '/' if name else ''}{sub}")
         for name in (names or [""]) for sub in SKELETON_DIRS
         if (model_dir / name / sub).is_dir()]
 
     if dry_run:
         print("DRY RUN -- nothing uploaded. Would have written:")
-        for _, dest, _ in skel_uploads:
+        for _, dest, _, _ in skel_uploads:
             print(f"  {dest}/")
         print(f"  {skel_dest}/{MANIFEST_FILENAME}")
         print(f"  {wt_dest}/  (subject to the published-hash check)")
@@ -1124,6 +1624,7 @@ def publish(model_dir: Path, bucket: str, prefix: str,
     # Weights first. A skeleton is what a restore resolves, so publishing it
     # before its weights exist opens a window where every node materializes an
     # image it cannot load and cold-starts instead.
+    started = time.time()
     if skip_weights:
         print("skipping weights upload")
     else:
@@ -1131,9 +1632,11 @@ def publish(model_dir: Path, bucket: str, prefix: str,
                     f"{weight_src + '/' if weight_src else ''}{WEIGHT_DIR}/")
         _write_sentinel(model_dir, wts, wt_dest, WEIGHT_DIR)
 
-    for src, dest, label in skel_uploads:
-        _upload_dir(src, dest, label)
+    for src, dest, label, rel in skel_uploads:
+        _upload_dir(src, dest, label,
+                    *_pages_upload(full["files"], rel, compress))
     _write_sentinel(model_dir, skel, skel_dest, SKELETON_DIR)
+    upload_s = time.time() - started
 
     print(f"published. expect it on every node within 300 s at:\n"
           f"  /mnt/neutrino/base-models/{prefix}/{slug}/"
@@ -1142,6 +1645,7 @@ def publish(model_dir: Path, bucket: str, prefix: str,
           f"{WEIGHT_DIR}/{wt_hash}/")
     if wait_timeout is not None:
         wait_verified(bucket, prefix, slug, skel_key, wt_hash, wait_timeout)
+    _print_summary(skel, compress, hash_s, upload_s)
     return skel_key
 
 
@@ -1176,7 +1680,8 @@ def publish_nodes(model_dir: Path, bucket: str, prefix: str,
                   force_weights: bool = False,
                   hash_workers: int | None = None,
                   wait_timeout: float | None = None,
-                  rendezvous_timeout: float = _RENDEZVOUS_TIMEOUT_S) -> str:
+                  rendezvous_timeout: float = _RENDEZVOUS_TIMEOUT_S,
+                  compress: bool | None = None) -> str:
     """Publish this pod's node-partition of a pod-spanning dump; node-partition 0
     completes it.
 
@@ -1192,8 +1697,24 @@ def publish_nodes(model_dir: Path, bucket: str, prefix: str,
     holds, and node 0 writes the sentinels after every pod reports done, so the
     node cache only ever discovers complete directories.
 
+    Each pod compresses its own pages (or not: a mixed skeleton is readable),
+    and node 0 derives the ``compression`` block from the union of the rows.
+
     Returns the published skeleton key.
     """
+    try:
+        return _publish_nodes(model_dir, bucket, prefix, skeleton_only,
+                              dry_run, force_weights, hash_workers,
+                              wait_timeout, rendezvous_timeout, compress)
+    finally:
+        shutil.rmtree(model_dir / PUBLISH_STAGING_DIR, ignore_errors=True)
+
+
+def _publish_nodes(model_dir: Path, bucket: str, prefix: str,
+                   skeleton_only: bool, dry_run: bool, force_weights: bool,
+                   hash_workers: int | None, wait_timeout: float | None,
+                   rendezvous_timeout: float,
+                   compress_flag: bool | None) -> str:
     key, metas = load_node_layout(model_dir)
     first = metas[min(metas)]
     nnodes = int(first["nnodes"])
@@ -1212,9 +1733,14 @@ def publish_nodes(model_dir: Path, bucket: str, prefix: str,
 
     names = [f"{NODE_DIR_PREFIX}{k}" for k in local]
     subdirs = [f"{n}/{sub}" for n in names for sub in SKELETON_DIRS]
+    compress = _compression_for(model_dir, subdirs,
+                                _compress_wanted(compress_flag), dry_run,
+                                hash_workers)
     print("hashing files ...")
+    started = time.time()
     mine = build_manifest(model_dir, subdirs + [WEIGHT_DIR],
-                          workers=hash_workers)
+                          workers=hash_workers, compress=compress)
+    hash_s = time.time() - started
     if weights_hash(mine["files"]) is None:
         raise SystemExit(
             f"{model_dir}/{WEIGHT_DIR}/ holds no files; every pod must have "
@@ -1270,6 +1796,9 @@ def publish_nodes(model_dir: Path, bucket: str, prefix: str,
     skel = _replica_skeleton_manifest(union, node_names)
     skel["nodes"] = nnodes
     skel["dump_id"] = dump_id
+    block = _compression_block(skel["files"], compress)
+    if block:
+        skel["compression"] = block
     wts = _scoped_manifest(union, (WEIGHT_DIR,), strip=WEIGHT_DIR)
 
     skel_key = f"{key}_{wt_hash}"
@@ -1295,6 +1824,7 @@ def publish_nodes(model_dir: Path, bucket: str, prefix: str,
         raise SystemExit(
             f"{skel_rel} is already published with {already} node(s); this "
             f"dump has {nnodes}. Unpublish it first if it is stale.")
+    _refuse_format_switch(bucket, skel_rel, skel)
     weights_present = _published(bucket, f"{prefix}/{slug}/"
                                 f"{WEIGHT_DIR}/{wt_hash}")
     skip_weights = skeleton_only or (weights_present and not force_weights)
@@ -1303,6 +1833,7 @@ def publish_nodes(model_dir: Path, bucket: str, prefix: str,
     elif 0 in local:
         _warn_on_weight_drift(bucket, prefix, slug, wt_hash, wts["files"])
 
+    started = time.time()
     if skip_weights:
         print("skipping weights upload")
     else:
@@ -1314,7 +1845,9 @@ def publish_nodes(model_dir: Path, bucket: str, prefix: str,
         for sub in SKELETON_DIRS:
             if (model_dir / name / sub).is_dir():
                 _upload_dir(model_dir / name / sub, f"{skel_dest}/{name}/{sub}",
-                            f"{name}/{sub}/")
+                            f"{name}/{sub}/",
+                            *_pages_upload(mine["files"], f"{name}/{sub}",
+                                           compress))
     _stage_put(bucket, stage, f"{me}{_STAGE_DONE_SUFFIX}", {}, model_dir)
     print(f"uploads done; staged {me}{_STAGE_DONE_SUFFIX}")
 
@@ -1329,6 +1862,7 @@ def publish_nodes(model_dir: Path, bucket: str, prefix: str,
                     f" check the {NODE_DIR_PREFIX}0 pod's publish")
             time.sleep(_RENDEZVOUS_POLL_S)
         print(f"published by {NODE_DIR_PREFIX}0: {skel_dest}")
+        _print_summary(skel, compress, hash_s, time.time() - started)
         return skel_key
 
     _wait_staged(bucket, stage, nnodes, _STAGE_DONE_SUFFIX, rendezvous_timeout)
@@ -1338,6 +1872,7 @@ def publish_nodes(model_dir: Path, bucket: str, prefix: str,
         _write_sentinel(model_dir, wts, wt_dest, WEIGHT_DIR)
     _write_sentinel(model_dir, skel, skel_dest, SKELETON_DIR)
     _stage_clear(bucket, stage)
+    upload_s = time.time() - started
     print(f"published. expect it on every node within 300 s at:\n"
           f"  /mnt/neutrino/base-models/{prefix}/{slug}/"
           f"{SKELETON_DIR}/{skel_key}/\n"
@@ -1345,6 +1880,7 @@ def publish_nodes(model_dir: Path, bucket: str, prefix: str,
           f"{WEIGHT_DIR}/{wt_hash}/")
     if wait_timeout is not None:
         wait_verified(bucket, prefix, slug, skel_key, wt_hash, wait_timeout)
+    _print_summary(skel, compress, hash_s, upload_s)
     return skel_key
 
 
@@ -1459,6 +1995,13 @@ def main(argv: list[str] | None = None) -> int:
                              "min(16, cpu_count)). hashlib drops the GIL, so "
                              "this scales with cores; raise it for a large "
                              "weights directory")
+    parser.add_argument("--compress", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help=f"publish the skeleton's pages as zstd frames "
+                             f"(default: on unless ${COMPRESS_ENV}=0)")
+    parser.add_argument("--nice", type=int, default=0, metavar="N",
+                        help="lower this process's priority by N first; the "
+                             "engine publishes beside a job that serves")
     parser.add_argument("--dry-run", action="store_true",
                         help="hash and report the destinations without uploading")
     parser.add_argument("--rendezvous-timeout", type=float,
@@ -1537,19 +2080,22 @@ def main(argv: list[str] | None = None) -> int:
         unpublish_skeleton(model_dir, args.bucket, args.prefix, key=args.key)
         return 0
 
+    if args.nice:
+        os.nice(args.nice)
     if node_dirs(model_dir):
         publish_nodes(model_dir, args.bucket, args.prefix,
                       skeleton_only=args.skeleton_only, dry_run=args.dry_run,
                       force_weights=args.force_weights,
                       hash_workers=args.hash_workers,
                       wait_timeout=args.wait_verified,
-                      rendezvous_timeout=args.rendezvous_timeout)
+                      rendezvous_timeout=args.rendezvous_timeout,
+                      compress=args.compress)
         return 0
     publish(model_dir, args.bucket, args.prefix,
             skeleton_only=args.skeleton_only, dry_run=args.dry_run,
             force_weights=args.force_weights,
             hash_workers=args.hash_workers,
-            wait_timeout=args.wait_verified)
+            wait_timeout=args.wait_verified, compress=args.compress)
     return 0
 
 

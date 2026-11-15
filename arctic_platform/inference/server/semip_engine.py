@@ -112,6 +112,8 @@ _PUBLISHER = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "semi_persistence", "scripts", "semip_publish.py")
 _PUBLISH_HASH_WORKERS = 32
+# The publisher hashes and compresses beside the job it publishes for.
+_PUBLISH_NICE = 10
 # Outside the image cache, so nothing here is ever uploaded. Each replica of a
 # pod marks itself ready here once its dump has restored; slot 0 publishes the
 # pod's key when every slot has.
@@ -3022,7 +3024,8 @@ def _publish_ready_marker(key_dir: str, slot: int) -> str:
 
 def _publish_command(key_dir: str) -> list[str]:
     return [sys.executable, _PUBLISHER, key_dir, "--bucket", _PUBLISH_BUCKET,
-            "--hash-workers", str(_PUBLISH_HASH_WORKERS)]
+            "--hash-workers", str(_PUBLISH_HASH_WORKERS),
+            "--nice", str(_PUBLISH_NICE)]
 
 
 def _run_publisher(key_dir: str) -> int:
