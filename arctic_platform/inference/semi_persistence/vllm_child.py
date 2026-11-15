@@ -3841,6 +3841,7 @@ def _semip_serve_core(core, input_address, output_address):
 
     from vllm.v1.engine import EngineCoreRequestType
     from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
+    from vllm.v1.engine.utils import EngineZmqAddresses
 
     core.__class__ = EngineCoreProc
     core.input_queue = queue.Queue()
@@ -3853,7 +3854,9 @@ def _semip_serve_core(core, input_address, output_address):
     core.frontend_stats_publish_address = None
     core.publish_dp_lb_stats = False
     core.last_counts = (0, 0)
-    core.addresses = None
+    # vLLM 0.33's ready response reads addresses.coordinator_input.
+    core.addresses = EngineZmqAddresses(
+        inputs=[input_address], outputs=[output_address])
     core.process_input_queue_block = False
     core.enable_fault_tolerance = False
     core.model_executor.register_failure_callback(

@@ -18,6 +18,7 @@ Run from the package directory::
 from __future__ import annotations
 
 import ast
+import dataclasses
 import enum
 import os
 import queue
@@ -80,6 +81,15 @@ class _ShutdownState(enum.IntEnum):
     REQUESTED = 1
 
 
+@dataclasses.dataclass
+class _ZmqAddresses:
+    inputs: list
+    outputs: list
+    coordinator_input: str | None = None
+    coordinator_output: str | None = None
+    frontend_stats_publish_address: str | None = None
+
+
 class _FakeEngineCoreProc:
     """Stands in for ``EngineCoreProc``: socket threads that just record."""
 
@@ -87,6 +97,8 @@ class _FakeEngineCoreProc:
 
     def process_input_sockets(self, addresses, coord, identity, ready):
         self.socket_calls.append(("input", list(addresses), coord, identity))
+        # vLLM 0.33's ready response reads these before setting ready.
+        self.addresses.coordinator_input, self.addresses.coordinator_output
         if not self.fail_input_thread:
             ready.set()
 
@@ -101,10 +113,13 @@ def fake_vllm(monkeypatch):
     core = types.ModuleType("vllm.v1.engine.core")
     core.EngineCoreProc = _FakeEngineCoreProc
     core.EngineShutdownState = _ShutdownState
+    utils = types.ModuleType("vllm.v1.engine.utils")
+    utils.EngineZmqAddresses = _ZmqAddresses
     for name, mod in (("vllm", types.ModuleType("vllm")),
                       ("vllm.v1", types.ModuleType("vllm.v1")),
                       ("vllm.v1.engine", engine),
-                      ("vllm.v1.engine.core", core)):
+                      ("vllm.v1.engine.core", core),
+                      ("vllm.v1.engine.utils", utils)):
         monkeypatch.setitem(sys.modules, name, mod)
     _FakeEngineCoreProc.fail_input_thread = False
     return core
@@ -202,6 +217,8 @@ def test_serve_core_swaps_class_and_sets_proc_state(child, fake_vllm):
     assert core.last_counts == (0, 0)
     assert core.process_input_queue_block is False
     assert core.enable_fault_tolerance is False
+    assert core.addresses == _ZmqAddresses(inputs=["ipc:///tmp/in"],
+                                           outputs=["ipc:///tmp/out"])
     assert summary == child["_semip_core_summary"](core.vllm_config)
 
     core.output_thread.join(timeout=5)
