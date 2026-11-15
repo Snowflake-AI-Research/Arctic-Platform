@@ -74,6 +74,10 @@ PUBLISHING = re.compile(r"semi_p: publishing (\S+) to ")
 NOT_PUBLISHED = re.compile(r"semi_p: (?:publishing \S+ failed|publishing \S+ raised|"
                            r"dumped \S+ but not publishing it|not publishing \S+)")
 SKELETON = re.compile(r"image-cache/([^/\s]+)/skeleton/([0-9a-f]{12}_[0-9a-f]{12}_[0-9a-f]{12})")
+# semip_publish.py's last line, inside the tail the engine logs after "published".
+SUMMARY = re.compile(r"publish summary: (\{.*\})")
+SUMMARY_FIELDS = ("format", "raw_bytes", "stored_bytes", "compressed_files", "zero_frames",
+                  "hash_compress_s", "upload_s")
 POLL_S = 30.0
 
 
@@ -110,8 +114,29 @@ def publish_outcome(lines: list[str]) -> dict | None:
             if skeleton:
                 out.update(slug=skeleton.group(1), skeleton=skeleton.group(2),
                            weight_hash=skeleton.group(2)[-12:])
+            out.update(publish_summary(lines[i:]))
             return out
     return None
+
+
+def publish_summary(lines: list[str]) -> dict:
+    """The publisher's summary fields, plus ``ratio`` (raw / stored); ``{}`` if
+    the line is absent (a publisher older than compression) or unreadable."""
+    for line in lines:
+        found = SUMMARY.search(line)
+        if not found:
+            continue
+        try:
+            doc = json.loads(found.group(1))
+        except ValueError:
+            return {}
+        if not isinstance(doc, dict):
+            return {}
+        out = {k: doc[k] for k in SUMMARY_FIELDS if k in doc}
+        if out.get("stored_bytes") and isinstance(out.get("raw_bytes"), (int, float)):
+            out["ratio"] = round(out["raw_bytes"] / out["stored_bytes"], 2)
+        return out
+    return {}
 
 
 class Publisher:

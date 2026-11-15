@@ -728,6 +728,25 @@ def test_publish_outcome_reads_the_published_skeleton():
     out = publish.publish_outcome(lines)
     assert out["status"] == "published" and out["key_dir"] == _KEY and out["publish_s"] == 655
     assert out["slug"] == "Qwen3.8-27B" and out["weight_hash"] == "cccccccccccc"
+    assert "raw_bytes" not in out and "ratio" not in out
+
+
+def test_publish_outcome_records_the_publishers_summary():
+    from arctic_platform.inference.semi_persistence.onboarding import publish
+
+    lines = _engine_log(f"published {_KEY} in 655s:")
+    lines += ["  skeleton s3://b/image-cache/Qwen3.8-27B/skeleton/"
+              "aaaaaaaaaaaa_bbbbbbbbbbbb_cccccccccccc/ expect it on every node",
+              'publish summary: {"compressed_files": 8, "format": "zstd1", '
+              '"hash_compress_s": 41.2, "raw_bytes": 4000, "stored_bytes": 1000, '
+              '"upload_s": 12.5, "zero_frames": 3}']
+    out = publish.publish_outcome(lines)
+    assert out["status"] == "published" and out["skeleton"].endswith("cccccccccccc")
+    assert (out["format"], out["raw_bytes"], out["stored_bytes"], out["ratio"]) == \
+        ("zstd1", 4000, 1000, 4.0)
+    assert (out["compressed_files"], out["zero_frames"]) == (8, 3)
+    assert (out["hash_compress_s"], out["upload_s"]) == (41.2, 12.5)
+    assert publish.publish_summary(["publish summary: {not json}"]) == {}
 
 
 def test_publish_outcome_reports_a_publish_the_engine_declined_or_failed():

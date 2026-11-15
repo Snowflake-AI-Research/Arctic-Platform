@@ -41,6 +41,7 @@ _PKG = os.path.dirname(_HERE)                      # .../semi_persistence
 _INFERENCE = os.path.dirname(_PKG)                 # .../arctic_platform/inference
 
 _ENGINE = os.path.join(_INFERENCE, "server", "semip_engine.py")
+_GATHER = os.path.join(_INFERENCE, "server", "semip_gather.py")
 _PUBLISH = os.path.join(_PKG, "scripts", "semip_publish.py")
 _INSTANCE = os.path.join(_PKG, "instance.py")
 _CHILD = os.path.join(_PKG, "vllm_child.py")
@@ -276,6 +277,32 @@ def test_engine_and_publisher_spell_the_node_level_alike():
     skeleton the publisher wrote; ``_node_source`` names it from this prefix."""
     assert (_ENGINE_CONSTS["_NODE_DIR_PREFIX"]
             == _PUBLISH_CONSTS["NODE_DIR_PREFIX"] == "node")
+
+
+def _literals(path):
+    """Module-level ``NAME = <str or int literal>`` assignments."""
+    return {node.targets[0].id: node.value.value
+            for node in _parse(path).body
+            if isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Constant)}
+
+
+def test_the_gather_reads_the_compressed_format_the_publisher_writes():
+    """A compressed skeleton's spellings, in the publisher and the gather.
+
+    Disagreeing on the suffix or the index name fails every compressed
+    materialize's plan, and on the format number reads every skeleton as one
+    from a newer engine: a miss on every node, with nothing above WARNING.
+    """
+    gather = _literals(_GATHER)
+    publish = _literals(_PUBLISH)
+    for pub, gat in (("COMPRESSED_SUFFIX", "COMPRESSED_SUFFIX"),
+                     ("COMPRESSION_INDEX", "INDEX_NAME"),
+                     ("COMPRESSION_FORMAT", "FORMAT"),
+                     ("COMPRESSION_CODEC", "CODEC"),
+                     ("_LIBZSTD_SONAME", "_LIBZSTD_SONAME")):
+        assert publish[pub] == gather[gat], (pub, publish[pub], gather[gat])
 
 
 if __name__ == "__main__":
