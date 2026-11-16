@@ -1,3 +1,18 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Copyright 2026 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 """PR 95 Cortex ``fwd_no_grad``: JSON ``/operation`` + Cortex RPC envelope.
@@ -90,15 +105,12 @@ def _split_forward_bodies(body: dict) -> list[dict]:
         if len(frame) <= max_raw:
             return [body]
         raise RuntimeError(
-            f"cortex /forward DSSST1 is {len(frame)} bytes but a single row cannot be split "
-            f"(cap {max_raw} bytes)"
+            f"cortex /forward DSSST1 is {len(frame)} bytes but a single row cannot be split (cap {max_raw} bytes)"
         )
 
     probe = _dump_forward_frame(_slice_forward_body(body, 0, 1))
     if len(probe) > max_raw:
-        raise RuntimeError(
-            f"cortex /forward single-row DSSST1 is {len(probe)} bytes (cap {max_raw} bytes)"
-        )
+        raise RuntimeError(f"cortex /forward single-row DSSST1 is {len(probe)} bytes (cap {max_raw} bytes)")
     rows_hint = max(1, min(n, max_raw // max(len(probe), 1)))
     if rows_hint >= n:
         full = _dump_forward_frame(body)
@@ -119,9 +131,7 @@ def _split_forward_bodies(body: dict) -> list[dict]:
                 rows_hint = width
                 break
             if width == 1:
-                raise RuntimeError(
-                    f"cortex /forward row {start} DSSST1 is {len(frame)} bytes (cap {max_raw})"
-                )
+                raise RuntimeError(f"cortex /forward row {start} DSSST1 is {len(frame)} bytes (cap {max_raw})")
             width = max(1, width // 2)
     print(
         f"[e2e] cortex /forward split {n} rows into {len(slices)} /operation posts (cap={max_raw})",
@@ -205,6 +215,7 @@ def to_cortex_fwd_payload(batch: dict) -> dict:
 def normalize_forward_result(result: dict) -> dict:
     """Zone ``{job_id, logprobs}`` or ``payload_b64`` → on-prem ``{batch: {logprobs, entropy}}``."""
     import torch
+
     from arctic_platform import wire
 
     if isinstance(result, dict) and isinstance(result.get("payload_b64"), str) and result.get("wire_format") is None:
@@ -239,7 +250,7 @@ def _envelope_for_frame(request, frame: bytes) -> dict:
     if len(frame) > max_raw:
         raise RuntimeError(
             f"cortex /forward DSSST1 is {len(frame)} bytes; cap is {max_raw} "
-            f"(JSON /operation is not octet request-chunked)"
+            "(JSON /operation is not octet request-chunked)"
         )
     envelope = {
         "operation_type": "forward",
@@ -335,8 +346,7 @@ def patch_cortex_transport() -> None:
             return {}
         if request.op == "forward":
             parts = [
-                normalize_forward_result(_poll(self, request_id))
-                for request_id in _submit_forward(self, request)
+                normalize_forward_result(_poll(self, request_id)) for request_id in _submit_forward(self, request)
             ]
             return _concat_forward_results(parts)
         if request.op in ("step", "save", "operation"):

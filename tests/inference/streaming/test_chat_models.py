@@ -31,6 +31,7 @@ LOADER_ARCHITECTURES = {
         "Qwen3_5ForCausalLM",
     },
     "qwen3_5_moe": {"Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"},
+    "inkling": {"InklingForCausalLM", "InklingForConditionalGeneration"},
     "glm_moe_dsa": {"GlmMoeDsaForCausalLM"},
     "generic_moe": {
         "Qwen3MoeForCausalLM",
@@ -120,6 +121,8 @@ def test_every_trainable_architecture_has_a_chat_decision():
         # Trinity-Large-Preview: no thinking, hermes-style JSON tool calls.
         ("AfmoeForCausalLM", None, "hermes", True),
         ("NemotronHForCausalLM", "nemotron_v3", "qwen3_coder", True),
+        ("InklingForCausalLM", "inkling", "inkling", True),
+        ("InklingForConditionalGeneration", "inkling", "inkling", True),
     ],
 )
 def test_catalog_architectures_get_their_parsers(
@@ -241,6 +244,8 @@ ANY = None
 # (harmony_utils.py:68); vLLM's DeepSeek-V4 tokenizer maps every value
 # (tokenizers/deepseek_v4.py:51).
 TEMPLATE_EFFORTS = {
+    "InklingForCausalLM": REASONING_EFFORTS,
+    "InklingForConditionalGeneration": REASONING_EFFORTS,
     "Qwen3ForCausalLM": ANY,
     "Qwen3MoeForCausalLM": ANY,
     "Qwen3_5ForCausalLM": {"low", "medium", "xhigh"},
