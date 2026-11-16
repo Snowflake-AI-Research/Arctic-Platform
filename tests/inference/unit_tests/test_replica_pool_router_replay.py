@@ -262,12 +262,7 @@ def test_router_replay_preserves_preexisting_scheduler_pause():
         await pool.send_router_replay()
 
         assert pool._scheduler.paused
-        assert events == [
-            "scheduler.pause",
-            "freeze_generation:0",
-            "send_router_replay:0",
-            "resume_generation:0",
-        ]
+        assert events == ["scheduler.pause", "send_router_replay:0"]
 
     asyncio.run(run())
 
@@ -435,5 +430,44 @@ def test_router_replay_cancellation_waits_for_unsettled_collective():
                 return_exceptions=True,
             )
             await scheduler.shutdown()
+
+    asyncio.run(run())
+
+
+def test_router_replay_cancellation_during_freeze_resumes_after_it_settles():
+    async def run():
+        events = []
+        pool = _recording_pool(events, {"status": "ok"})
+        freeze_started = asyncio.Event()
+        freeze_release = asyncio.Event()
+
+        async def freeze_generation():
+            freeze_started.set()
+            await freeze_release.wait()
+            events.append("freeze_generation:0")
+            return {"status": "ok"}
+
+        pool._workers[0].freeze_generation = _RemoteMethod(freeze_generation)
+        replay = asyncio.create_task(pool.send_router_replay())
+        try:
+            await freeze_started.wait()
+            replay.cancel()
+            await asyncio.sleep(0.02)
+            assert pool._lock.locked()
+            assert events == ["scheduler.pause"]
+
+            freeze_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(replay, 1)
+            assert events == [
+                "scheduler.pause",
+                "freeze_generation:0",
+                "send_router_replay:0",
+                "resume_generation:0",
+                "scheduler.resume",
+            ]
+        finally:
+            freeze_release.set()
+            await asyncio.gather(replay, return_exceptions=True)
 
     asyncio.run(run())
