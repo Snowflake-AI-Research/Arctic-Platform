@@ -53,6 +53,7 @@ def test_empty_comment_env_is_unset(monkeypatch):
 def test_create_body_carries_only_the_fields_that_are_set(monkeypatch):
     monkeypatch.delenv("ARCTIC_CORTEX_JOB_COMMENT", raising=False)
     monkeypatch.delenv("CORTEX_JOB_COMMENT", raising=False)
+    monkeypatch.delenv("ARCTIC_CORTEX_IMAGE_TAG", raising=False)
     sub_jobs = [{"role": "training"}]
     assert job_create_payload(sub_jobs, _backend()) == {"sub_job_configs": sub_jobs}
     assert job_create_payload(sub_jobs, _backend(job_comment="")) == {"sub_job_configs": sub_jobs}
@@ -64,6 +65,18 @@ def test_create_body_carries_only_the_fields_that_are_set(monkeypatch):
         "idle_timeout_seconds": 600,
         "pending_timeout_seconds": 3600,
     }
+
+
+def test_image_tag_is_read_from_the_cortex_env(monkeypatch):
+    monkeypatch.setenv("ARCTIC_CORTEX_IMAGE_TAG", "dev_test_tag")
+    cfg = _backend()
+    assert cfg.image_tag == "dev_test_tag"
+    assert job_create_payload([{"role": "training"}], cfg)["debug"] == {"job": {"image_tag": "dev_test_tag"}}
+
+
+def test_image_tag_is_omitted_when_unset(monkeypatch):
+    monkeypatch.delenv("ARCTIC_CORTEX_IMAGE_TAG", raising=False)
+    assert "debug" not in job_create_payload([{"role": "training"}], _backend())
 
 
 def test_idle_timeout_zero_disables_reclaim_and_is_sent():

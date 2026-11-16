@@ -32,6 +32,7 @@ from arctic_platform.rl.processors.grpo import grpo_echo_v1_loss
 from arctic_platform.rl.processors.grpo import grpo_loss
 from arctic_platform.rl.processors.packed_reduction import PackedLossReduction
 from arctic_platform.rl.processors.pipeline import _engine_forward_kwargs
+from arctic_platform.rl.processors.pipeline import register_loss_fn
 from arctic_platform.rl.processors.pipeline import register_post_processor
 from arctic_platform.rl.processors.pipeline import run_pipeline
 from arctic_platform.testing_utils import TestCasePlus
@@ -665,3 +666,51 @@ class TestMetaForwardScalars(TestCasePlus):
             {"temperature": 0.5, "fwd_meta_keys": ("temperature",)},
         )
         self.assertEqual(kwargs["temperature"], 0.5)
+
+
+class TestPaddedRowScaleFactor(TestCasePlus):
+    def test_unpadded_rows_set_packed_loss_scale_factor_to_row_width(self):
+        captured = {}
+
+        def capture(model_outputs, batch, meta, config, device):
+            del model_outputs, batch, config, device
+            captured["cu_seqlens"] = meta["cu_seqlens"].tolist()
+            captured["packed_loss_scale_factor"] = meta["packed_loss_scale_factor"]
+            captured["tokens"] = int(meta["cu_seqlens"][-1])
+            return torch.zeros((), requires_grad=True), {}
+
+        register_loss_fn("_capture_packed_scale")(capture)
+        try:
+            run_pipeline(
+                _StubEngine(),
+                (),
+                {
+                    "input_ids": torch.tensor([[1, 2, 3, 0], [4, 5, 6, 7]]),
+                    "attention_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 1, 1]]),
+                    "position_ids": torch.tensor([[0, 1, 2, 0], [0, 1, 2, 3]]),
+                    "advantages": torch.ones(2, 4),
+                    "loss_mask": torch.tensor([[0, 1, 1, 0], [0, 1, 1, 1]]),
+                },
+                {"pad_token_id": 0},
+                {"loss_fn": "_capture_packed_scale", "post": [], "config": {}},
+                "cpu",
+                backward="loss_only",
+            )
+        finally:
+            LOSS_FNS.pop("_capture_packed_scale", None)
+        self.assertEqual(captured["packed_loss_scale_factor"], 4)
+        self.assertEqual(captured["cu_seqlens"], [0, 3, 7])
+        from arctic_platform.rl.processors.functional import agg_loss
+
+        loss = torch.ones(7)
+        mask = torch.ones(7)
+        scaled = agg_loss(
+            loss,
+            mask,
+            loss_agg_mode="seq-mean-token-sum-norm",
+            cu_seqlens=torch.tensor(captured["cu_seqlens"]),
+            loss_scale_factor=captured["packed_loss_scale_factor"],
+            global_batch_size=2,
+        )
+        # Two sequences, token sums 3 and 4, mean 3.5, divide by padded width 4.
+        self.assertAlmostEqual(float(scaled), 3.5 / 4.0, places=6)

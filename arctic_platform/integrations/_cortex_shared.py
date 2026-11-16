@@ -322,12 +322,13 @@ def to_cortex_fwd_bwd_payload(
     ``compute_logprobs`` and scores the predict-next frame, so every packed
     request is rewritten to ``grpo`` as described below.
 
-    Any ``old_log_probs`` in the batch are dropped: server-side GRPO defaults
-    π_old to ``logprobs.detach()`` (π_old ≡ π_new), correct for single-epoch
-    on-policy. A caller whose ratio is against another policy, such as the
-    sampler's, passes ``old_log_probs_shifted`` -- ``[B, S]`` in the frame
-    Cortex scores in, entry ``i`` being the log-prob of token ``i + 1`` -- and
-    it is sent as π_old.
+    ``old_log_probs`` in the batch are the token-aligned snapshot (SkyRL and
+    verl). On the packed path they become ``old_log_probs_shifted`` after
+    left-alignment, and when ``response_aligned`` they are shifted into the
+    predict-next frame Cortex scores. A caller that already has that frame
+    passes ``old_log_probs_shifted`` and it is not shifted again. If neither
+    is present, server-side GRPO defaults π_old to ``logprobs.detach()``
+    (π_old ≡ π_new), which is only correct for a single on-policy mini-batch.
 
     Requires ``loss_mask`` or ``response_mask``; falling back to
     ``attention_mask`` would train on prompt tokens.
@@ -338,16 +339,17 @@ def to_cortex_fwd_bwd_payload(
     ``[:, max_prompt_len]``. A packed job that also sets ZoRRo is rejected.
     ZoRRo sends ``prompt_group_ids`` from the prompt block and the snapshot as
     ``context["old_log_probs_shifted"]`` in the caller's columns. Only a real
-    ``True`` selects the ZoRRo path. The packed path drops ``old_log_probs``
-    and the server re-derives π_old.
+    ``    True`` selects the ZoRRo path. The packed path sends the snapshot as
+    ``old_log_probs_shifted``; it does not re-derive π_old from the live
+    forward.
 
     ``response_aligned`` says ``loss_mask`` and ``advantages`` sit on the token
     they score (SkyRL and verl), while Cortex weights position ``i`` by its
     prediction of token ``i + 1``. Non-ZoRRo rows are then shifted one column
     after left alignment, because the frame is defined on the rows Cortex
     receives. ZoRRo is never shifted: its patched forward returns one log-prob
-    per response token. ``old_log_probs_shifted`` is already in the Cortex
-    frame and is never shifted.
+    per response token. An explicit ``old_log_probs_shifted`` is already in the
+    Cortex frame and is never shifted; a token-aligned ``old_log_probs`` is.
     """
     import torch
 
@@ -381,6 +383,10 @@ def to_cortex_fwd_bwd_payload(
     if advantages is None:
         raise ValueError("cortex fwd_bwd requires 'advantages' [B, S]")
     old_log_probs = tensors.pop("old_log_probs", None)
+    shift_batch_old_log_probs = False
+    if old_log_probs_shifted is None and torch.is_tensor(old_log_probs):
+        old_log_probs_shifted = old_log_probs
+        shift_batch_old_log_probs = True
 
     job_packs = _resolve_packed(meta, packed)
     if meta.get("zorro_train_enable") is True:
@@ -410,6 +416,8 @@ def to_cortex_fwd_bwd_payload(
     if response_aligned:
         for key in ("loss_mask", "advantages"):
             scored[key] = _to_predict_next_frame(key, scored[key])
+        if shift_batch_old_log_probs and "old_log_probs_shifted" in scored:
+            scored["old_log_probs_shifted"] = _to_predict_next_frame("old_log_probs", scored["old_log_probs_shifted"])
     input_ids = forwarded["input_ids"]
     context: dict[str, Any] = {
         "input_ids": input_ids,
@@ -504,13 +512,6 @@ def _to_cortex_zorro_fwd_bwd(
         kwargs_out["labels"] = tensors["labels"]
 
     proc_config = _resolve_proc_config(meta, processing_in)
-    # The unpacked ZoRRo call flattens every response into one row with no
-    # cu_seqlens, so a per-sequence mean would treat the shard as one sequence.
-    if proc_config["loss_agg_mode"] != "token-mean":
-        raise ValueError(
-            f"ZoRRo on Cortex supports only loss_agg_mode='token-mean', got {proc_config['loss_agg_mode']!r}: "
-            "its responses reach the loss flattened, without sequence boundaries"
-        )
 
     context: dict[str, Any] = {
         "input_ids": input_ids,
@@ -685,15 +686,6 @@ def _verl_grpo_wire(
 
     if not torch.is_tensor(old_log_probs):
         raise ValueError(f"{path} verl_grpo fwd_bwd requires batch['old_log_probs'] [B, S]")
-    actor = meta.get("actor_config") if isinstance(meta.get("actor_config"), dict) else {}
-    loss_agg_mode = actor.get("loss_agg_mode", "token-mean")
-    # The unpacked call flattens every response into one row with no
-    # cu_seqlens, so a per-sequence mean would treat the shard as one sequence.
-    if loss_agg_mode != "token-mean":
-        raise ValueError(
-            f"{path} on Cortex supports only loss_agg_mode='token-mean', got {loss_agg_mode!r}: "
-            "its responses reach the loss flattened, without sequence boundaries"
-        )
     kwargs_out: dict[str, Any] = {"input_ids": input_ids, "attention_mask": attention_mask, "prompts": prompts}
     if torch.is_tensor(tensors.get("position_ids")):
         kwargs_out["position_ids"] = tensors["position_ids"]

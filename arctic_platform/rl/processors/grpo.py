@@ -1483,8 +1483,32 @@ def _packed_grpo_validation_context(context: dict) -> dict:
     return normalized
 
 
+def _require_sequence_boundaries(context: dict, config: dict) -> None:
+    """``seq-mean-*`` / ``prompt-mean`` need per-sequence rows or ``cu_seqlens``.
+
+    A flattened ZoRRo / packed-without-boundaries call is one sequence, so those
+    modes silently mean over the shard. ``token-mean`` does not need this.
+    """
+    mode = config.get("loss_agg_mode", "token-mean")
+    if mode in (None, "token-mean"):
+        return
+    cu_seqlens = context.get("cu_seqlens")
+    if torch.is_tensor(cu_seqlens) and int(cu_seqlens.numel()) >= 2:
+        return
+    mask = context.get("loss_mask")
+    if not torch.is_tensor(mask):
+        mask = context.get("response_mask")
+    if torch.is_tensor(mask) and mask.ndim >= 2:
+        return
+    raise ValueError(
+        f"loss_agg_mode={mode!r} needs per-sequence boundaries (cu_seqlens or [B, S] rows). "
+        "This call is a 1-D buffer with no cu_seqlens, so a sequence mean would be over the shard."
+    )
+
+
 def _validate_grpo_context(context: dict, config: dict, variant: _GrpoVariant) -> tuple[dict, torch.Tensor]:
     context = _packed_grpo_validation_context(context)
+    _require_sequence_boundaries(context, config)
     _validate_grpo_scale(context, config, variant)
     _validate_loss_denominators(config.get("batch_num_tokens"), config.get("global_batch_size"))
     mask = _grpo_preflight_mask(context)

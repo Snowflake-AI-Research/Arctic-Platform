@@ -33,8 +33,7 @@
 #                   to grpo and pi_old is the live policy (ratio 1). ZoRRo never packs.
 #
 # Required env:
-#   ARCTIC_CORTEX_IMAGE_TAG   exactly dev_20261026_083954_a6ba7da36f6. The client's
-#                             job_create_payload sends it as the job's image tag.
+#   ARCTIC_CORTEX_IMAGE_TAG   optional; pins debug.job.image_tag via CortexConfig.
 #   ARCTIC_CORTEX_HOST, ARCTIC_CORTEX_PAT (or CORTEX_PAT), ARCTIC_CORTEX_DATABASE,
 #   ARCTIC_CORTEX_SCHEMA. Source them with `set +x`; this script never prints the PAT.
 #
@@ -58,17 +57,12 @@ if [[ ! -d "${VERL_HOME}/verl/remote_backend" ]]; then
 fi
 export AP_ROOT VERL_HOME
 
-EXPECTED_IMAGE_TAG="dev_20261026_083954_a6ba7da36f6"
 if [[ -z "${ARCTIC_CORTEX_IMAGE_TAG:-}" ]]; then
-    echo "ERROR: ARCTIC_CORTEX_IMAGE_TAG is unset. Export ARCTIC_CORTEX_IMAGE_TAG=${EXPECTED_IMAGE_TAG};" >&2
-    echo "       without it the job runs the release image." >&2
-    exit 2
+    echo "WARN: ARCTIC_CORTEX_IMAGE_TAG is unset; the job uses the account's default image." >&2
 fi
-if [[ "${ARCTIC_CORTEX_IMAGE_TAG}" != "${EXPECTED_IMAGE_TAG}" ]]; then
-    echo "ERROR: ARCTIC_CORTEX_IMAGE_TAG=${ARCTIC_CORTEX_IMAGE_TAG}; this recipe is pinned to ${EXPECTED_IMAGE_TAG}." >&2
-    exit 2
+if [[ -z "${UV_PYTHON:-}" ]]; then
+    echo "WARN: UV_PYTHON is unset; uv will pick an interpreter." >&2
 fi
-export EXPECTED_IMAGE_TAG
 
 if [[ -z "${ARCTIC_CORTEX_PAT:-}" && -n "${CORTEX_PAT:-}" ]]; then
     export ARCTIC_CORTEX_PAT="${CORTEX_PAT}"
@@ -85,9 +79,6 @@ ARCTIC_VERL_CONFIG_DIR="${AP_ROOT}/arctic_platform/integrations/verl/config"
 # Cortex owns the GPUs; the driver has none.
 export CUDA_VISIBLE_DEVICES=""
 export UV_NO_CACHE=1
-if [[ -z "${UV_PYTHON:-}" && -x /home/yak/miniconda3/envs/dev/bin/python3.12 ]]; then
-    export UV_PYTHON=/home/yak/miniconda3/envs/dev/bin/python3.12
-fi
 export CORTEX_ALLOW_LARGE_PAYLOAD="${CORTEX_ALLOW_LARGE_PAYLOAD:-1}"
 export ARCTIC_CORTEX_JOB_READY_TIMEOUT="${ARCTIC_CORTEX_JOB_READY_TIMEOUT:-3600}"
 # Ray otherwise replays the driver's `uv run` line on every worker, which breaks

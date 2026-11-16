@@ -34,10 +34,13 @@ runs correctly here:
   caller's `attention_mask` raises.
 * **Log-prob calls keep arrival order.** `to_cortex_fwd_payload` stamps
   `balance_batch` false and does not send `prompt_group_ids`.
-* **Non-ZoRRo clipping stays inert.** That training request drops
-  `old_log_probs`, so the server re-derives π_old from the live forward.
-  The returned logprobs are the caller's snapshot; they are not sent back
-  as `old_log_probs_shifted`.
+* **Non-ZoRRo packed requests send the snapshot as `old_log_probs_shifted`.**
+  Token-aligned `old_log_probs` (SkyRL, verl) are left-aligned with the
+  tokens and shifted into the predict-next frame. An explicit
+  `old_log_probs_shifted` is already in that frame and is not shifted
+  again. If neither is present, the server re-derives π_old from the live
+  forward (`π_old ≡ π_new`), which is only correct for a single on-policy
+  mini-batch.
 * **ZoRRo training sends that snapshot.** `fwd_bwd` places it on
   `context.old_log_probs_shifted`, in the caller's columns and unshifted,
   because ZoRRo log-probs sit on the response token they score. There is
@@ -151,3 +154,4 @@ entrypoint the recipe names.
 | `ARCTIC_CORTEX_DATABASE` | *(required for PAT auth)* | Snowflake database. |
 | `ARCTIC_CORTEX_SCHEMA` | *(required for PAT auth)* | Snowflake schema. |
 | `ARCTIC_CORTEX_ENDPOINT` | `cortex-training` | SnowAPI endpoint name. |
+| `ARCTIC_CORTEX_IMAGE_TAG` | *(unset)* | Internal testing only. Pins `debug.job.image_tag` via `CortexConfig.image_tag`. |
