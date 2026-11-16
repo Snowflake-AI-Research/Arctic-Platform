@@ -1,0 +1,34 @@
+{
+  "name": "inkling2-small-standard-full",
+  "description": "thinkingmachines/Inkling-2-Small-MXFP8, TP=8, 1 replica(s) on 8 GPU(s); catalog inkling-2-small-mxfp8/standard/h200-inference-full.json",
+  "sub_job": {
+    "inference_config": {
+      "max_seq_len": 65536,
+      "n_gpus": 8,
+      "max_num_batched_tokens": 8192,
+      "router_replay": {
+        "enabled": false
+      },
+      "vllm_config": {
+        "tensor_parallel_size": 8,
+        "max_num_seqs": 64,
+        "gpu_memory_utilization": 0.9,
+        "enable_chunked_prefill": true,
+        "reasoning_parser": "inkling",
+        "tool_call_parser": "inkling",
+        "extra_engine_kwargs": {
+          "tokenizer_mode": "inkling",
+          "dtype": "bfloat16",
+          "kernel_config": {
+            "enable_flashinfer_autotune": false
+          }
+        },
+        "extra_env": {
+          "VLLM_USE_V2_MODEL_RUNNER": "1"
+        }
+      }
+    },
+    "job_type": "sampling",
+    "model_name": "thinkingmachines/Inkling-2-Small-MXFP8"
+  }
+}
