@@ -20,6 +20,7 @@ import pytest
 from arctic_platform.inference.semi_persistence.onboarding import jobs
 from arctic_platform.inference.semi_persistence.onboarding import perf
 from arctic_platform.inference.semi_persistence.onboarding import report
+from arctic_platform.inference.semi_persistence.onboarding import rereport
 from arctic_platform.inference.semi_persistence.onboarding import startup
 from arctic_platform.inference.semi_persistence.onboarding.common import log_text
 from arctic_platform.inference.semi_persistence.onboarding.common import parse_kv_args
@@ -205,6 +206,24 @@ def test_parse_semi_p_sub_job_log_format_two_pods():
     assert sorted(r["replicas"]) == ["10.0.0.1 replica0", "10.0.0.2 replica0"]
     assert r["restored"] and r["key_to_ready_s"] == 30.0
     assert r["replicas"]["10.0.0.2 replica0"]["materialize_s"] == 2.0
+
+
+def test_rereport_reads_the_logs_saved_under_the_variant(tmp_path):
+    log_dir = tmp_path / "m-20261116T000000-logs"
+    log_dir.mkdir()
+    (log_dir / "on_hit-sub-job.log").write_text("\n".join(RESTORE_LOG) + "\n")
+    src = tmp_path / "m-20261116T000000.json"
+    src.write_text(json.dumps({"model": {"name": "m", "model_name": "org/m", "n_gpus": 1, "tensor_parallel_size": 1,
+                                         "replicas": 1, "max_seq_len": 8},
+                               "started_at": "2026-11-16T00:00:00", "plain_baseline": None,
+                               "startup": {"semi_p": {"key_to_ready_s": 99.0}, "log_dir": str(log_dir)}}))
+    out = tmp_path / "out"
+    rereport.rebuild(src, [], [], str(out))
+    st = json.loads((out / src.name).read_text())["startup"]
+    assert st["on_sources"] == ["sub-job.log"]
+    assert st["semi_p"]["key_to_ready_s"] == 20.0
+    assert st["semi_p"]["replicas"]["r0"]["restore_s"] == 17.3
+    assert json.loads(src.read_text())["startup"]["semi_p"] == {"key_to_ready_s": 99.0}
 
 
 def test_parse_semi_p_cache_miss_and_invisible_markers():

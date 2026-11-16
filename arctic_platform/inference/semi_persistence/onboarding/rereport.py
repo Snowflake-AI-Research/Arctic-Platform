@@ -45,11 +45,18 @@ from arctic_platform.inference.semi_persistence.onboarding.common import parse_k
 logger = logging.getLogger(__name__)
 
 
-def _saved_api_logs(log_dir: Path, side: str) -> dict[str, list[str]]:
+def _saved_api_logs(log_dir: Path, *prefixes: str) -> dict[str, list[str]]:
+    """The saved API logs under the first of ``prefixes`` that has any: the
+    variant (``on_hit``, ``off_default``, ...), or ``semi_p`` / ``plain`` in
+    runs from before the variants."""
     if not log_dir.is_dir():
         return {}
-    return {p.name[len(side) + 1:]: p.read_text(encoding="utf-8", errors="replace").splitlines()
-            for p in sorted(log_dir.glob(f"{side}-*"))}
+    for prefix in prefixes:
+        logs = {p.name[len(prefix) + 1:]: p.read_text(encoding="utf-8", errors="replace").splitlines()
+                for p in sorted(log_dir.glob(f"{prefix}-*"))}
+        if logs:
+            return logs
+    return {}
 
 
 def _pod_logs(paths: list[str], job_id: str | None) -> dict[str, list[str]]:
@@ -83,16 +90,24 @@ def rebuild(path: Path, on_paths: list[str], off_paths: list[str], out_dir: str 
     result.pop("reasons", None)
     st = result.setdefault("startup", {})
     log_dir = Path(st.get("log_dir") or path.with_name(f"{path.stem}-logs"))
-    on_api, off_api = _saved_api_logs(log_dir, "semi_p"), _saved_api_logs(log_dir, "plain")
+    plain = report.plain_baseline(result)
+    on_api = _saved_api_logs(log_dir, "on_hit", "semi_p")
+    off_api = _saved_api_logs(log_dir, plain, "plain") if plain else {}
     on_pods = _pod_logs(on_paths, result.get("on_job_id"))
     off_pods = _pod_logs(off_paths, result.get("off_job_id"))
     if on_api or on_pods:
         st["semi_p"] = startup.restore_report(on_api, on_pods)
         st["generate_counts"] = startup.generate_counts(on_pods)
         st["on_sources"] = sorted(on_api) + sorted(on_pods)
-    if report.plain_baseline(result) and (off_api or off_pods):
+    if plain and (off_api or off_pods):
         st["vllm_off"] = startup.parse_vllm([x for logs in (off_api, off_pods) for v in logs.values() for x in v])
         st["off_sources"] = sorted(off_api) + sorted(off_pods)
+    miss_api = _saved_api_logs(log_dir, "on_miss")
+    if miss_api:
+        st["semi_p_miss"] = startup.restore_report(miss_api, {})
+    matched_api = _saved_api_logs(log_dir, "off_matched")
+    if matched_api:
+        st["vllm_matched"] = startup.parse_vllm([x for v in matched_api.values() for x in v])
     unknown = {v: u for v, u in (st.pop("unknown", None) or {}).items()
                if (st.get(startup.REPORT_FIELDS[v][0]) or {}).get(u["field"]) is None}
     if unknown:

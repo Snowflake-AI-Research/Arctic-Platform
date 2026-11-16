@@ -325,7 +325,7 @@ key to ready, or vLLM's engine init). A total still missing is listed under
 
 `<out_dir>/<name>-<UTC time>.md` and `.json` per model, plus `summary-<UTC time>.md`
 for a multi-model run. Every log the run read is saved in
-`<out_dir>/<name>-<UTC time>-logs/` (`semi_p-*` and `plain-*`), so a report can be
+`<out_dir>/<name>-<UTC time>-logs/` (`<variant>-*`, e.g. `on_hit-sub-job.log`), so a report can be
 rebuilt offline after the jobs are gone, for example once GPU pod logs are at hand:
 
 ```bash
