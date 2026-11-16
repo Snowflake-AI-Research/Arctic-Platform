@@ -155,8 +155,29 @@ def _get_cu():
     return _cu_bindings
 
 
+def _proc_is_zombie(pid, proc="/proc"):
+    """Whether ``/proc/<pid>/stat`` reports state ``Z``: exited, not yet reaped.
+
+    ``comm`` (field 2) can contain spaces and parens, so parse after the last
+    ')': index 0 is then field 3, the state.  A pid that is gone, or a stat
+    that does not parse, is not a zombie.
+    """
+    try:
+        with open(f"{proc}/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except (OSError, IndexError):
+        return False
+
+
 def _get_descendant_pids(pid):
-    """Return PIDs of all descendant processes, leaves first (bottom-up)."""
+    """Return PIDs of all live descendant processes, leaves first (bottom-up).
+
+    Zombies are left out.  A dead child holds no CUDA state, nothing to
+    signal and no fds, and ``cuCheckpointProcessLock`` on one fails with
+    CUDA_ERROR_NOT_INITIALIZED -- which is how a helper the vLLM child forked
+    and never waited on failed a TP=8 cuda_checkpoint.  The child only reaps
+    such strays later, in prepare_criu_dump.
+    """
     import psutil
     try:
         proc = psutil.Process(pid)
@@ -165,6 +186,8 @@ def _get_descendant_pids(pid):
     children = proc.children(recursive=True)
     filtered = []
     for c in children:
+        if _proc_is_zombie(c.pid):
+            continue
         try:
             if "resource_tracker" in " ".join(c.cmdline()):
                 continue
