@@ -201,9 +201,8 @@ def test_packed_cache_bound_to_kernel_blocks_matches_upstream_zeroer():
 
 
 @pytest.mark.parametrize("blocks_before_tail", [40, 41])
-def test_resend_hits_at_the_replay_boundary_when_block_sizes_differ(blocks_before_tail):
-    # Mamba and attention blocks of A tokens, a drafter window group of 2A, so
-    # hits land on the 2A scheduler grid; vLLM's default sparse retention.
+@pytest.mark.parametrize("scheduler_blocks", [1, 2, 3])
+def test_resend_hits_at_the_replay_boundary_when_block_sizes_differ(blocks_before_tail, scheduler_blocks):
     from vllm.sampling_params import SamplingParams
     from vllm.utils.hashing import sha256
     from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -218,6 +217,7 @@ def test_resend_hits_at_the_replay_boundary_when_block_sizes_differ(blocks_befor
     apply_hybrid_state_fixes()
     init_none_hash(sha256)
     A, budget, num_spec = 16, 96, 7
+    scheduler_block_size = scheduler_blocks * A
     prompt = list(range(1000, 1000 + A * blocks_before_tail + 5))
     f32 = torch.float32
     manager = KVCacheManager(
@@ -232,19 +232,19 @@ def test_resend_hits_at_the_replay_boundary_when_block_sizes_differ(blocks_befor
                     block_size=A, shapes=((1, 1),), dtypes=(f32,),
                     mamba_cache_mode="align", num_speculative_blocks=num_spec)),
                 KVCacheGroupSpec(["draft"], SlidingWindowSpec(
-                    block_size=2 * A, num_kv_heads=1, head_size=1, dtype=f32,
+                    block_size=scheduler_block_size, num_kv_heads=1, head_size=1, dtype=f32,
                     sliding_window=4 * A)),
             ],
         ),
         max_model_len=8192,
-        scheduler_block_size=2 * A,
+        scheduler_block_size=scheduler_block_size,
         hash_block_size=A,
         enable_caching=True,
         use_eagle=False,
     )
     scheduler = SimpleNamespace(
         _orig_mamba_block_aligned_split=lambda *args: Scheduler._orig_mamba_block_aligned_split(scheduler, *args),
-        block_size=2 * A,
+        block_size=scheduler_block_size,
         cache_config=SimpleNamespace(block_size=A),
         hash_block_size=A,
         use_eagle_block_drop=False,
@@ -278,5 +278,5 @@ def test_resend_hits_at_the_replay_boundary_when_block_sizes_differ(blocks_befor
         manager.new_step_starts()
         return hit
 
-    replay_boundary = (len(prompt) - 1) // (2 * A) * (2 * A)
+    replay_boundary = (len(prompt) - 1) // scheduler_block_size * scheduler_block_size
     assert [send(f"send{i}") for i in range(3)] == [0, replay_boundary, replay_boundary]

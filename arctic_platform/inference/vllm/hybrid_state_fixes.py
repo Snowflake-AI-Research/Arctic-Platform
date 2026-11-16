@@ -286,8 +286,7 @@ class SchedulerPatch(ArcticPatch[Scheduler]):
         start = (request.num_computed_tokens + num_new_local_computed_tokens
                  + num_external_computed_tokens)
         end = start + num_new_tokens
-        # Where a resend's hit lands. A final chunk that spans it exported
-        # it as an internal checkpoint, so only earlier chunks stop there.
+        # Final chunks spanning this boundary export it as an internal checkpoint.
         replay_boundary = get_mamba_prefill_checkpoint_position(
             request.num_tokens,
             self.block_size,
