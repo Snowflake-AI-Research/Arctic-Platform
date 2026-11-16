@@ -122,6 +122,14 @@ class _RecordingScheduler:
         self.events.append(f"scheduler.cancel_worker_inflight:{index}")
 
 
+def _failing(events, name, index):
+    async def call():
+        events.append(f"{name}:{index}")
+        raise RuntimeError(f"{name} failed")
+
+    return _RemoteMethod(call)
+
+
 def _recording_pool(events, *replay_results):
     pool = ReplicaPool()
     pool._workers = [
@@ -262,7 +270,34 @@ def test_router_replay_preserves_preexisting_scheduler_pause():
         await pool.send_router_replay()
 
         assert pool._scheduler.paused
-        assert events == ["scheduler.pause", "send_router_replay:0"]
+        assert events == [
+            "scheduler.pause",
+            "freeze_generation:0",
+            "send_router_replay:0",
+        ]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("resume_fails", [False, True])
+def test_router_replay_freeze_failure_reopens_scheduling_only_after_every_resume(
+    resume_fails,
+):
+    async def run():
+        events = []
+        pool = _recording_pool(events, {"status": "ok"}, {"status": "ok"})
+        pool._workers[1].freeze_generation = _failing(events, "freeze_generation", 1)
+        if resume_fails:
+            pool._workers[1].resume_generation = _failing(
+                events, "resume_generation", 1
+            )
+
+        error = "Failed to resume" if resume_fails else "Failed to pause"
+        with pytest.raises(RuntimeError, match=error):
+            await pool.send_router_replay()
+
+        assert pool._scheduler.paused is resume_fails
+        assert not any(event.startswith("send_router_replay") for event in events)
 
     asyncio.run(run())
 
