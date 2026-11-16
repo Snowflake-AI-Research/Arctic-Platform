@@ -1549,10 +1549,11 @@ class ReplicaPool:
                     raise
             finally:
                 if replay_send is None or replay_send.done():
-                    if generation_frozen:
-                        await self._resume_generation_after_weight_sync()
-                    if not scheduler_was_paused:
-                        scheduler.resume()
+                    try:
+                        await self._resume_workers()
+                    finally:
+                        if not scheduler_was_paused:
+                            scheduler.resume()
 
         return {
             "n_replicas": len(self._workers),
