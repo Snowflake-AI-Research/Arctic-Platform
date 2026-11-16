@@ -19,21 +19,18 @@ This package exists for one reason: ensure ``bird`` / ``bird_sql`` are
 registered with ``skyrl_gym`` on both the SkyRL driver and inside each Ray
 worker that ``skyrl_gym.make()``-s an env.
 
-Registration itself lives upstream — importing ``integrations.arctic_rl.envs``
-runs it. This shim gives us a recipe-local module whose *import* triggers that
-side-effect, without the recipe launcher ever having to name anything in
-``$SKYRL_HOME/integrations/arctic_rl/examples/``.
+Registration itself lives upstream in ``integrations.arctic_rl.envs``. This
+shim does not import that package: its ``__init__`` also imports the trainer,
+which initializes CUDA. Ray actors import this module from ``sitecustomize``
+before Ray sets ``CUDA_VISIBLE_DEVICES``, so registration is by entry-point
+string only.
 
 How the side-effect lands in workers:
 
-1. The recipe launcher passes ``trainer.override_entrypoint=arctic_rl.entrypoint``.
-2. SkyRL's ``main_base`` imports that module on the driver, which imports this
-   package (here), which imports upstream ``integrations.arctic_rl.envs`` for
-   its ``register()`` side-effects.
-3. ``arctic_rl.entrypoint`` re-binds Arctic RL's ``@ray.remote`` worker task
-   to our package, so the worker re-imports ``arctic_rl.entrypoint`` (and
-   therefore this ``__init__.py``) when it deserializes the task — running the
-   same registration in the worker's address space.
+1. ``fsdp_bird_entry`` and ``sitecustomize`` import this package.
+2. That registers ``bird`` and ``bird_sql`` without importing
+   ``integrations.arctic_rl``.
+3. ``skyrl_gym.make`` loads ``BirdEnv`` later, after Ray has assigned a GPU.
 
 The actual Arctic RL × SkyRL machinery (config/trainer/generator) is *not*
 vendored — it lives in the user's SkyRL checkout at
@@ -42,14 +39,10 @@ vendored — it lives in the user's SkyRL checkout at
 importable side-by-side.
 """
 
-import integrations.arctic_rl.envs as _envs  # noqa: F401  register bird / bird_sql
-
-# The BIRD parquet's per-row ``env_class`` column is ``bird_sql`` (from the
-# preprocess_bird.py output), but upstream only registers the ``bird`` id.
-# Alias ``bird_sql`` -> ``BirdEnv`` so ``skyrl_gym.make("bird_sql", ...)`` works
-# without touching the parquet or the upstream registration.
 from skyrl_gym.envs.registration import register as _register
 from skyrl_gym.envs.registration import registry as _registry
 
-if "bird_sql" not in _registry:
-    _register(id="bird_sql", entry_point="integrations.arctic_rl.envs.bird:BirdEnv")
+# Entry-point strings only. Importing ``integrations.arctic_rl`` initializes CUDA.
+for _id in ("bird", "bird_sql"):
+    if _id not in _registry:
+        _register(id=_id, entry_point="integrations.arctic_rl.envs.bird:BirdEnv")
