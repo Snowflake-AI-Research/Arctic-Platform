@@ -305,7 +305,7 @@ after restore (`rebind_log`), and the TP ranks moved to `/dev/null` and back
 Verified 2026-10-02 at TP=1 and TP=2 on Qwen3-8B (job `8fa62701`): child and
 rank lines before and after the restore in `kubectl logs`, outputs matching,
 `files.img` naming no log file. Verified at scale 2026-10-03 on image
-`dev_20261003_191750_7f806d170f8`: eight TP=1 replicas sharing one pod log
+`<image-tag>`: eight TP=1 replicas sharing one pod log
 through dump and cross-pod restore, TP=8 GLM-5.3 and Flash-Next, and both
 nodes of an `n_gpus=16` job. No `EPIPE`, and lines from different replicas do
 not interleave mid-line (pipe writes up to 4 KiB are atomic).

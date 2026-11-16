@@ -35,8 +35,8 @@ For each model file under onboarding/models/, at its published size:
 Jobs start as GPUs allow within ``max_gpus``, always leaving ``reserve_gpus``
 free. Every job is appended to ``<out_dir>/<image_tag>/jobs.jsonl``; SIGINT,
 SIGTERM and SIGHUP cancel every job still held. Results go to
-``<out_dir>/<image_tag>/summary.json``. Afterwards, point each model's entry in
-onboarding/models/backends.json at ``image_tag``.
+``<out_dir>/<image_tag>/summary.json``. Onboard the models with
+``debug_image_tag`` set to the same image.
 """
 
 from __future__ import annotations

@@ -18,6 +18,7 @@ import zlib
 import pytest
 
 from arctic_platform.inference.semi_persistence.onboarding import jobs
+from arctic_platform.inference.semi_persistence.onboarding import onboard
 from arctic_platform.inference.semi_persistence.onboarding import perf
 from arctic_platform.inference.semi_persistence.onboarding import report
 from arctic_platform.inference.semi_persistence.onboarding import rereport
@@ -84,7 +85,7 @@ def test_replicas_and_model_file_validation(tmp_path):
 
 
 def _shipped_model_paths():
-    return [p for p in sorted(jobs.MODELS_DIR.glob("*.json")) if p != jobs.BACKENDS_FILE]
+    return sorted(jobs.MODELS_DIR.glob("*.json"))
 
 
 def test_shipped_model_files_load():
@@ -94,20 +95,11 @@ def test_shipped_model_files_load():
         assert spec.n_gpus % spec.tensor_parallel_size == 0
 
 
-def test_every_shipped_model_has_a_backend():
-    for path in _shipped_model_paths():
-        assert jobs.resolve_image_tag(jobs.load_model(str(path))).startswith(("dev_", "release_"))
-
-
-def test_resolve_image_tag(tmp_path):
-    spec = jobs.load_model("qwen36-35b-a3b-tp1")
-    backends = tmp_path / "backends.json"
-    backends.write_text('{"qwen36-35b-a3b-tp1": {"image_tag": "dev_A"}}')
-    assert jobs.resolve_image_tag(spec, backends_file=backends) == "dev_A"
-    assert jobs.resolve_image_tag(spec, "dev_B", backends_file=backends) == "dev_B"
-    backends.write_text("{}")
-    with pytest.raises(ValueError, match="no image_tag"):
-        jobs.resolve_image_tag(spec, backends_file=backends)
+def test_onboard_requires_the_backend_image(monkeypatch, tmp_path):
+    monkeypatch.setattr(onboard, "make_client", lambda *a, **k: type("C", (), {"poll_backoff_multiplier": 2.0})())
+    with pytest.raises(SystemExit, match="debug_image_tag"):
+        onboard.Runner({"config": "x", "out_dir": str(tmp_path)})
+    assert onboard.Runner({"config": "x", "out_dir": str(tmp_path), "debug_image_tag": "dev_A"}).image_tag == "dev_A"
 
 
 RESTORE_LOG = [
@@ -372,7 +364,7 @@ def test_footprint_counts_whole_nodes(monkeypatch, tmp_path):
     from arctic_platform.inference.semi_persistence.onboarding import onboard
 
     monkeypatch.setattr(onboard, "make_client", lambda *a, **k: type("C", (), {"poll_backoff_multiplier": 2.0})())
-    runner = onboard.Runner({"config": "x", "out_dir": str(tmp_path)})
+    runner = onboard.Runner({"config": "x", "out_dir": str(tmp_path), "debug_image_tag": "dev_A"})
     assert runner.footprint(_spec(tp=2, n_gpus=8)) == (56, 7)  # 16 + 16 + 8 + 16 GPUs, 2 + 2 + 1 + 2 nodes
     assert runner.footprint(_spec(tp=1, n_gpus=1)) == (3, 3)   # three 1-GPU jobs, one node each
     assert runner.footprint(_spec(tp=16, n_gpus=16)) == (48, 6)  # off_matched skipped: 16 x 3

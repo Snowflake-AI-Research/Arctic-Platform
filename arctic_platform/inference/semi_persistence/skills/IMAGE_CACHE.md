@@ -317,7 +317,7 @@ differing compiled extension aborts from inside CRIU with no up-front check.
 Inside a container these mappings come from two places, and the distinction
 decides how portable an image is: the **container image** (deterministic given
 the digest — the successful run was
-`dss-backend:dev_20260916_235834_7af90823e27 @sha256:9af620dc…`) and
+`dss-backend:<image-tag> @sha256:<digest>`) and
 **host-injected driver libraries**, which follow the node. So the container
 image digest is certainly part of the cache key; whether the node's driver
 version must be too is *not yet measured*. `scripts/imgdiff.py <image_dir>`
@@ -399,8 +399,8 @@ the image does *not* ship (see §5 constraint 2).
 
 **The digest term also partitions by GPU architecture, for free.** The gateway
 resolves a job's `image_tag` to a hardware-specific variant — `-h` for Hopper,
-so `dev_20260917_184643_435d85eab89` runs as
-`dev_20260917_184643_435d85eab89-h` — and that variant has its own digest. So
+so `<image-tag>` runs as
+`<image-tag>-h` — and that variant has its own digest. So
 the same config on an H200 and on a B200 lands on different `env12` values and
 cannot share a directory, which is what you want: different compiled kernels,
 and `cuCheckpointProcessRestore` could not migrate between them regardless. No
@@ -1109,7 +1109,7 @@ the hash); deletion propagates to every node within 300 s via
 
 ## 11. Several replicas per pod: measured end to end, 2026-10-03
 
-Image `dev_20261003_191750_7f806d170f8-h` (`env12` = `1d9e2753e70c`; pod
+Image `<image-tag>-h` (`env12` = `1d9e2753e70c`; pod
 digest `sha256:ec0a643973c4…`, driver 580.159.03). Each model was dumped by an
 `n_gpus=8` job whose spec set only `semi_p: true`, published from its dump pod
 with `semip_publish.py /data-fast/image-cache_neutrino/<cfg12>_<env12>`, and

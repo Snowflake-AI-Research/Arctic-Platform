@@ -15,7 +15,7 @@
 
 """Onboard models for semi-persistence: semi_p checked against plain vLLM.
 
-    python -m arctic_platform.inference.semi_persistence.onboarding.onboard config=CONN.json models=qwen36-35b-a3b-tp1
+    python -m arctic_platform.inference.semi_persistence.onboarding.onboard config=CONN.json debug_image_tag=TAG models=qwen36-35b-a3b-tp1
 
 Per model, up to four jobs on the same backend image:
 
@@ -54,8 +54,11 @@ models, they run concurrently within ``max_gpus``, largest first.
 Arguments (``key=value``):
   config           connection file (required)
   models           comma-separated model names under onboarding/models/, or paths
-  debug_image_tag  backend image for every job, instead of each model's entry in
-                   onboarding/models/backends.json
+  debug_image_tag  backend image for every job (required): the one the models'
+                   semi_p images were published on. A published image only
+                   restores on the backend it was dumped on, and the cluster
+                   default backend may not run semi_p at all (it would then
+                   serve plain without saying so)
   variants         subset of on_hit,off_default,on_miss,off_matched that includes
                    on_hit (default all), e.g. on_hit; on_hit,off_matched;
                    on_hit,off_default
@@ -134,7 +137,6 @@ from arctic_platform.inference.semi_persistence.onboarding.jobs import build_var
 from arctic_platform.inference.semi_persistence.onboarding.jobs import load_model
 from arctic_platform.inference.semi_persistence.onboarding.jobs import plain_baseline
 from arctic_platform.inference.semi_persistence.onboarding.jobs import plan_variants
-from arctic_platform.inference.semi_persistence.onboarding.jobs import resolve_image_tag
 from arctic_platform.inference.semi_persistence.onboarding.jobs import copies_for
 from arctic_platform.inference.semi_persistence.onboarding.jobs import timeline
 from arctic_platform.inference.semi_persistence.onboarding.jobs import wait_until_running
@@ -211,7 +213,9 @@ class Runner:
         if "config" not in args:
             raise SystemExit("config=CONNECTION_FILE is required")
         self.config = args["config"]
-        self.image_tag_override = args.get("debug_image_tag") or None
+        if not args.get("debug_image_tag"):
+            raise SystemExit("debug_image_tag=TAG is required: the backend image the models were published on")
+        self.image_tag = args["debug_image_tag"]
         self.variants = [v for v in (args.get("variants") or ",".join(VARIANTS)).split(",") if v]
         self.checks = set((args.get("checks") or "correctness,perf").split(","))
         self.require_restore = as_bool(args.get("require_restore", "true"))
@@ -303,7 +307,7 @@ class Runner:
     def run_one(self, spec: ModelSpec, capacity_checked: bool = False) -> dict:
         copies = copies_for(spec, self.copies)
         variants, skipped = plan_variants(spec, list(self.attach) if self.attach else self.variants)
-        image_tag = resolve_image_tag(spec, self.image_tag_override)
+        image_tag = self.image_tag
         result: dict[str, Any] = {
             "model": {"name": spec.name, "model_name": spec.sub_job["model_name"], "n_gpus": spec.n_gpus,
                       "tensor_parallel_size": spec.tensor_parallel_size, "replicas": spec.replicas,
@@ -604,11 +608,7 @@ def main(argv: list[str]) -> int:
         raise SystemExit("models=NAME[,NAME...] is required")
     if runner.attach and len(specs) != 1:
         raise SystemExit("attaching to running jobs works for one model only")
-    for spec in specs:
-        try:
-            logger.info("%s: backend image %s", spec.name, resolve_image_tag(spec, runner.image_tag_override))
-        except ValueError as exc:
-            raise SystemExit(str(exc)) from exc
+    logger.info("backend image %s", runner.image_tag)
     started = utc_now()
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, runner.abort)

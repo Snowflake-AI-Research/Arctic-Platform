@@ -170,7 +170,7 @@ DSS side, `dss/ray_dss/models.py` on `InferenceConfig` — on the
 | `extra_env.SEMIP_UNPRIVILEGED` | `1` | Capability level of the dump; recorded in `meta.json` as `unprivileged` |
 
 **A job needs only `semi_p: true`** (since 2026-10-03, image
-`dev_20261003_191750_7f806d170f8`). The three defaults live in
+`<image-tag>`). The three defaults live in
 `server/semip_engine.py` (`_DEFAULT_IMAGE_CACHE`, `_DEFAULT_IMAGE_SOURCE`, and
 `os.environ.setdefault("SEMIP_UNPRIVILEGED", "1")` at the top of
 `restore_and_wrap`); setting any of them in `extra_env` still overrides it.

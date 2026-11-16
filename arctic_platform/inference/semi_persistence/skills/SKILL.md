@@ -144,8 +144,8 @@ semi_persistence/
                  (except imgdiff.py / pidcheck.py, which only need crit + root)
   reproduce/     example_full.py: the saved -> up sweep across TP1/2/4/8
   onboarding/    the model onboarding suite (semi_p vs plain jobs through the
-                 Cortex Training API), publish.py, and the root model configs
-                 with backends.json; see onboarding/README.md
+                 Cortex Training API), publish.py, and the root model configs;
+                 see onboarding/README.md
   skills/        this skill (SKILL.md + reference.md) and every design doc
 ```
 

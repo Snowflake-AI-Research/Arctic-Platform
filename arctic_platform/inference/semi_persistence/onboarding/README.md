@@ -104,28 +104,26 @@ backend applies when it supports it. The report says whether it did; if not,
 
 ```bash
 # One model
-python -m arctic_platform.inference.semi_persistence.onboarding.onboard config=connection.json \
+python -m arctic_platform.inference.semi_persistence.onboarding.onboard config=connection.json debug_image_tag=TAG \
     models=qwen36-35b-a3b-tp1 miss_image_cache=SCRATCH_ROOT
 
 # Several models: run concurrently within max_gpus, largest first
-python -m arctic_platform.inference.semi_persistence.onboarding.onboard config=connection.json \
+python -m arctic_platform.inference.semi_persistence.onboarding.onboard config=connection.json debug_image_tag=TAG \
     models=glm53-tp16,glm53-tp8,qwen38-flash-next-tp8 max_gpus=96
 
 # Re-run the checks against jobs that are already running (kept afterwards)
-python -m arctic_platform.inference.semi_persistence.onboarding.onboard config=connection.json models=qwen38-27b-tp1x8 \
+python -m arctic_platform.inference.semi_persistence.onboarding.onboard config=connection.json debug_image_tag=TAG models=qwen38-27b-tp1x8 \
     job_on_hit=JOB job_off_default=JOB [job_on_miss=JOB job_off_matched=JOB]
 ```
 
-Each model's jobs run on the backend image listed for it in
-`models/backends.json`, the image its semi_p images are published on; a
-model with no entry stops the run before anything is submitted.
-`debug_image_tag` overrides the file for every model. Either way the suite sets
-`CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS=1` for you.
+Every job runs on `debug_image_tag`, the backend image the models' semi_p
+images were published on: a published image only restores on the backend it
+was dumped on. The suite sets `CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS=1` for you.
 
 | Argument | Default | Meaning |
 |---|---|---|
 | `models` | required | Comma-separated names under `models/`, or paths to model files |
-| `debug_image_tag` | the model's entry in `backends.json` | Backend image for every job |
+| `debug_image_tag` | required | Backend image for every job |
 | `variants` | all four | Subset of `on_hit,off_default,on_miss,off_matched` that includes `on_hit` (see [Variant sets](#variant-sets)) |
 | `copies` | 2 for whole-node configs, else 1 | Perf pair size, as a multiple of the published `n_gpus` |
 | `miss_image_cache` | none | Local image-cache root for `on_miss`; a per-run subdirectory is used, so a copy left by an earlier job cannot turn the miss into a hit |
@@ -207,8 +205,8 @@ compressed skeleton pages, `raw` otherwise), `raw_bytes`, `stored_bytes`,
 `ratio`, `compressed_files`, `zero_frames`, `hash_compress_s` and `upload_s`
 (none from a publisher older than compression; see
 `skills/IMAGE_CACHE.md` §9). Publishing ends with the upload: `onboard` is the
-one that waits for the nodes to verify the image. Then point the models' entries in
-`models/backends.json` at the image.
+one that waits for the nodes to verify the image. Then onboard the models with
+`debug_image_tag` set to the same image.
 
 ## Model files
 

@@ -27,12 +27,7 @@ from dataclasses import field
 from pathlib import Path
 from typing import Any
 
-# BACKENDS_FILE: the backend image each model's semi_p images are published on. A
-# published image only restores on the backend it was dumped on, and the cluster
-# default backend may not run semi_p at all (it would then serve plain without
-# saying so).
 MODELS_DIR = Path(__file__).resolve().parent / "models"
-BACKENDS_FILE = MODELS_DIR / "backends.json"
 
 logger = logging.getLogger(__name__)
 
@@ -130,19 +125,6 @@ def load_model(ref: str) -> ModelSpec:
         copies=raw.get("copies"),
         path=str(path),
     )
-
-
-def resolve_image_tag(spec: ModelSpec, override: str | None = None, backends_file: Path | str = BACKENDS_FILE) -> str:
-    """The backend image for ``spec``: ``override`` when given, else the model's
-    entry in ``backends_file``. Raises when the model has no entry."""
-    if override:
-        return override
-    path = Path(backends_file).expanduser()
-    backends = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    tag = (backends.get(spec.name) or {}).get("image_tag")
-    if not tag:
-        raise ValueError(f"{spec.name}: no image_tag in {path}; add one or pass debug_image_tag=")
-    return tag
 
 
 def copies_for(spec: ModelSpec, override: int | None = None, gpus_per_node: int = GPUS_PER_NODE) -> int:
