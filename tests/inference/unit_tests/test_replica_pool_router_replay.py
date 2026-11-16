@@ -81,16 +81,33 @@ class _RecordingWorker:
         self.events = events
         self.index = index
         self.replay_result = replay_result
+        self.engine_paused = False
+        self.asleep = False
         self.send_router_replay = _RemoteMethod(self._send_router_replay)
-        self.freeze_generation = _RemoteMethod(self._record("freeze_generation"))
-        self.resume_generation = _RemoteMethod(self._record("resume_generation"))
+        self.freeze_generation = _RemoteMethod(self._freeze_generation)
+        self.resume_generation = _RemoteMethod(self._resume_generation)
+        self.sleep = _RemoteMethod(self._sleep)
+        self.wake_up = _RemoteMethod(self._wake_up)
 
-    def _record(self, name):
-        async def call():
-            self.events.append(f"{name}:{self.index}")
-            return {"status": "ok"}
+    async def _freeze_generation(self):
+        self.events.append(f"freeze_generation:{self.index}")
+        if self.asleep or self.engine_paused:
+            return {"status": "skipped"}
+        self.engine_paused = True
+        return {"status": "frozen"}
 
-        return call
+    async def _resume_generation(self):
+        self.events.append(f"resume_generation:{self.index}")
+        self.engine_paused = False
+        return {"status": "resumed"}
+
+    async def _sleep(self, level):
+        self.asleep = True
+        return {"status": "sleeping"}
+
+    async def _wake_up(self, tags):
+        self.asleep = False
+        return {"status": "ready"}
 
     async def _send_router_replay(self):
         self.events.append(f"send_router_replay:{self.index}")
@@ -123,7 +140,7 @@ class _RecordingScheduler:
 
 
 def _failing(events, name, index):
-    async def call():
+    async def call(**_):
         events.append(f"{name}:{index}")
         raise RuntimeError(f"{name} failed")
 
@@ -199,7 +216,7 @@ def _scheduler_pool(
     )
     worker.acknowledge_stream.remote = AsyncMock(return_value=True)
     worker.abort_stream.remote = AsyncMock(return_value={"status": "aborted"})
-    worker.freeze_generation.remote = AsyncMock(return_value={"status": "paused"})
+    worker.freeze_generation.remote = AsyncMock(return_value={"status": "frozen"})
     worker.resume_generation.remote = AsyncMock(return_value={"status": "resumed"})
 
     pool = ReplicaPool()
@@ -260,44 +277,86 @@ def test_router_replay_pauses_freezes_sends_and_resumes(
     asyncio.run(run())
 
 
-def test_router_replay_preserves_preexisting_scheduler_pause():
+@pytest.mark.parametrize(
+    "engines_paused",
+    [(False, False), (True, True), (False, True)],
+    ids=["running", "paused", "mixed"],
+)
+def test_router_replay_on_paused_pool_resumes_only_engines_it_froze(engines_paused):
     async def run():
         events = []
-        pool = _recording_pool(events, {"status": "ok"})
-        pool._scheduler.pause()
-        events.clear()
+        pool = _recording_pool(events, {"status": "ok"}, {"status": "ok"})
+        for worker, paused in zip(pool._workers, engines_paused):
+            worker.engine_paused = paused
+        pool._scheduler.paused = True
 
         await pool.send_router_replay()
 
-        assert pool._scheduler.paused
         assert events == [
             "scheduler.pause",
             "freeze_generation:0",
+            "freeze_generation:1",
             "send_router_replay:0",
+            "send_router_replay:1",
+            *[
+                f"resume_generation:{i}"
+                for i, paused in enumerate(engines_paused)
+                if not paused
+            ],
         ]
+        assert tuple(worker.engine_paused for worker in pool._workers) == engines_paused
+        assert pool._scheduler.paused
 
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("resume_fails", [False, True])
-def test_router_replay_freeze_failure_reopens_scheduling_only_after_every_resume(
-    resume_fails,
+def test_router_replay_after_partial_sleep_failure_leaves_no_engine_frozen():
+    async def run():
+        events = []
+        pool = _recording_pool(events, {"status": "ok"}, {"status": "ok"})
+        pool._workers[1].sleep = _failing(events, "sleep", 1)
+
+        await pool.sleep()
+        await pool.send_router_replay()
+
+        assert "send_router_replay:1" in events
+        assert pool._scheduler.paused
+        await pool.wake_up()
+        assert not pool._scheduler.paused
+        assert not any(worker.engine_paused for worker in pool._workers)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("freeze_fails", "resume_fails", "error"),
+    [
+        (True, False, r"Failed to freeze inference workers \[1\]"),
+        (True, True, r"Failed to resume inference workers \[1\]"),
+        (False, True, r"Failed to resume inference workers \[1\]"),
+    ],
+)
+def test_router_replay_failure_never_reopens_scheduling_onto_a_frozen_engine(
+    freeze_fails, resume_fails, error,
 ):
     async def run():
         events = []
         pool = _recording_pool(events, {"status": "ok"}, {"status": "ok"})
-        pool._workers[1].freeze_generation = _failing(events, "freeze_generation", 1)
+        if freeze_fails:
+            pool._workers[1].freeze_generation = _failing(events, "freeze_generation", 1)
         if resume_fails:
             pool._workers[1].resume_generation = _failing(
                 events, "resume_generation", 1
             )
 
-        error = "Failed to resume" if resume_fails else "Failed to pause"
         with pytest.raises(RuntimeError, match=error):
             await pool.send_router_replay()
 
+        assert {"resume_generation:0", "resume_generation:1"} <= set(events)
+        assert not pool._workers[0].engine_paused
         assert pool._scheduler.paused is resume_fails
-        assert not any(event.startswith("send_router_replay") for event in events)
+        sent = any(event.startswith("send_router_replay") for event in events)
+        assert sent is not freeze_fails
 
     asyncio.run(run())
 
@@ -480,7 +539,7 @@ def test_router_replay_cancellation_during_freeze_resumes_after_it_settles():
             freeze_started.set()
             await freeze_release.wait()
             events.append("freeze_generation:0")
-            return {"status": "ok"}
+            return {"status": "frozen"}
 
         pool._workers[0].freeze_generation = _RemoteMethod(freeze_generation)
         replay = asyncio.create_task(pool.send_router_replay())

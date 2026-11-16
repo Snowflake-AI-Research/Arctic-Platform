@@ -1349,42 +1349,39 @@ class ReplicaPool:
         clear_cache = clear_cache or (
             self.config.clear_cache_on_weight_sync and pause_mode == "keep"
         )
-        try:
-            await self._pause_workers(
-                "pause_generation", mode=pause_mode, clear_cache=clear_cache
-            )
-        except RuntimeError:
-            await asyncio.gather(
-                *[worker.resume_generation.remote() for worker in self._workers],
-                return_exceptions=True,
-            )
-            raise
-        return clear_cache
-
-    async def _pause_workers(self, method: str, **kwargs: Any) -> None:
         pause_results = await asyncio.gather(
             *[
-                getattr(worker, method).remote(**kwargs)
+                worker.pause_generation.remote(
+                    mode=pause_mode,
+                    clear_cache=clear_cache,
+                )
                 for worker in self._workers
             ],
             return_exceptions=True,
         )
         failed_workers = _failed_worker_indices(pause_results)
         if failed_workers:
+            await asyncio.gather(
+                *[worker.resume_generation.remote() for worker in self._workers],
+                return_exceptions=True,
+            )
             raise RuntimeError(
                 f"Failed to pause inference workers {failed_workers}: "
                 f"{_worker_error_messages(pause_results, failed_workers)}"
             )
+        return clear_cache
 
-    async def _resume_workers(self) -> None:
+    async def _resume_workers(self, indices: list[int] | None = None) -> None:
+        if indices is None:
+            indices = list(range(len(self._workers)))
         resume_results = await asyncio.gather(
-            *[worker.resume_generation.remote() for worker in self._workers],
+            *[self._workers[i].resume_generation.remote() for i in indices],
             return_exceptions=True,
         )
         failed_workers = _failed_worker_indices(resume_results)
         if failed_workers:
             raise RuntimeError(
-                f"Failed to resume inference workers {failed_workers}: "
+                f"Failed to resume inference workers {[indices[i] for i in failed_workers]}: "
                 f"{_worker_error_messages(resume_results, failed_workers)}"
             )
 
@@ -1548,23 +1545,36 @@ class ReplicaPool:
         }
 
     async def _send_router_replay_frozen(self, scheduler: Scheduler) -> list[Any]:
-        # An already-paused scheduler belongs to a sleeping pool or to one a
-        # failed weight sync or resume left paused. Some engines may still be
-        # running, so freeze anyway, but resume nothing afterwards.
+        # A scheduler or engine that was already paused stays paused: it
+        # belongs to a sleeping pool or a failed weight sync, resume or sleep.
         owns_pause = not scheduler.paused
         scheduler.pause()
+        # Keep mode holds in-flight requests in place so no engine step runs
+        # on the sampling GPUs during the send.
+        freezes = await asyncio.gather(
+            *[worker.freeze_generation.remote() for worker in self._workers],
+            return_exceptions=True,
+        )
+        failed = _failed_worker_indices(freezes)
+        # A failed freeze may still have paused its engine.
+        frozen = [
+            i for i, result in enumerate(freezes)
+            if i in failed or result.get("status") == "frozen"
+        ]
         try:
-            # Keep mode holds in-flight requests in place so no engine step
-            # runs on the sampling GPUs during the send.
-            await self._pause_workers("freeze_generation")
+            if failed:
+                raise RuntimeError(
+                    f"Failed to freeze inference workers {failed}: "
+                    f"{_worker_error_messages(freezes, failed)}"
+                )
             return await asyncio.gather(
                 *[worker.send_router_replay.remote() for worker in self._workers],
                 return_exceptions=True,
             )
         finally:
+            # Scheduling reopens only once every frozen engine has resumed.
+            await self._resume_workers(frozen)
             if owns_pause:
-                # Scheduling reopens only once every worker has resumed.
-                await self._resume_workers()
                 scheduler.resume()
 
     async def discard_router_replay(self, sample_ids: list[str]) -> dict[str, Any]:
