@@ -25,7 +25,8 @@ for the life of the engine.
 from __future__ import annotations
 
 import numbers
-from typing import Any, Callable
+from typing import Any
+from typing import Callable
 
 import torch
 
@@ -67,8 +68,7 @@ def mark_unpacked_cycle_broken(engine: Any) -> None:
 def assert_unpacked_cycle_intact(engine: Any) -> None:
     if getattr(engine, _CYCLE_BROKEN, False):
         raise RuntimeError(
-            "unpacked gradient-accumulation cycle was interrupted; "
-            "this engine cannot accept another forward or step"
+            "unpacked gradient-accumulation cycle was interrupted; this engine cannot accept another forward or step"
         )
 
 
@@ -82,10 +82,7 @@ def assert_ready_for_final_step(engine: Any) -> None:
         return
     if not engine.is_gradient_accumulation_boundary():
         micro_steps = getattr(engine, "micro_steps", None)
-        raise RuntimeError(
-            "step() is not at a gradient-accumulation boundary "
-            f"(micro_steps={micro_steps})"
-        )
+        raise RuntimeError(f"step() is not at a gradient-accumulation boundary (micro_steps={micro_steps})")
 
 
 def _batch_fits_gas(batch_data: Any, gas: int) -> bool:
@@ -122,9 +119,7 @@ def _require_aligned_cycle(engine: Any, loop_count: int, *, backward: bool) -> N
     if not backward:
         return
     if getattr(engine, "_is_gradient_accumulation_boundary", None) is not None:
-        raise RuntimeError(
-            "unpacked gradient accumulation requires the DeepSpeed boundary override to be unset"
-        )
+        raise RuntimeError("unpacked gradient accumulation requires the DeepSpeed boundary override to be unset")
     if not _managed_gradient_accumulation(engine):
         return
     gas = int(engine.gradient_accumulation_steps())
@@ -136,8 +131,7 @@ def _require_aligned_cycle(engine: Any, loop_count: int, *, backward: bool) -> N
     micro_steps = int(getattr(engine, "micro_steps", 0))
     if micro_steps % gas != 0:
         raise RuntimeError(
-            "unpacked forward is not at an accumulation-cycle boundary: "
-            f"micro_steps={micro_steps} gas={gas}"
+            f"unpacked forward is not at an accumulation-cycle boundary: micro_steps={micro_steps} gas={gas}"
         )
 
 
@@ -209,13 +203,9 @@ def run_unpacked_gas(
     _require_aligned_cycle(engine, loop_count, backward=backward)
     fits = _batch_fits_gas(batch_data, loop_count)
     if backward and not _every_rank_fits(engine, fits):
-        raise RuntimeError(
-            f"unpacked loop requires at least {loop_count} rows on every rank"
-        )
+        raise RuntimeError(f"unpacked loop requires at least {loop_count} rows on every rank")
     if not fits:
-        raise RuntimeError(
-            f"unpacked loop requires at least {loop_count} rows on every rank"
-        )
+        raise RuntimeError(f"unpacked loop requires at least {loop_count} rows on every rank")
 
     if isinstance(batch_data, list):
         micro_batches = batch_data
@@ -257,6 +247,7 @@ def run_unpacked_gas(
 
     outputs: list[dict] = []
     stepped = False
+    backward_started = False
     try:
         for index, micro_batch in enumerate(micro_batches):
             if prepare_call is not None:
@@ -280,6 +271,7 @@ def run_unpacked_gas(
             if before_backward is not None and backward:
                 before_backward(index, result)
             if backward and loss_reduction is not None:
+                backward_started = True
                 apply_packed_loss_reduction(
                     engine,
                     result.pop("loss_tensor"),
@@ -287,15 +279,11 @@ def run_unpacked_gas(
                     backward=True,
                 )
             outputs.append(result)
-            if (
-                backward
-                and _managed_gradient_accumulation(engine)
-                and index < len(micro_batches) - 1
-            ):
+            if backward and _managed_gradient_accumulation(engine) and index < len(micro_batches) - 1:
                 take_step()
                 stepped = True
     except Exception:
-        if backward and (stepped or not _managed_gradient_accumulation(engine)):
+        if backward_started or stepped:
             mark_unpacked_cycle_broken(engine)
         raise
 
@@ -312,14 +300,10 @@ def _scheduled_source_payloads(calls: Any) -> list[Any]:
     expected = list(range(len(source_payloads)))
     actual = sorted(source_payloads)
     if actual != expected:
-        raise ValueError(
-            "scheduled payload source indexes must be contiguous from zero; "
-            f"got {actual}"
-        )
+        raise ValueError(f"scheduled payload source indexes must be contiguous from zero; got {actual}")
     if sorted(non_padding_sources) != expected:
         raise ValueError(
-            "every scheduled payload source requires one non-padding call; "
-            f"got {sorted(non_padding_sources)}"
+            f"every scheduled payload source requires one non-padding call; got {sorted(non_padding_sources)}"
         )
     return [source_payloads[index] for index in expected]
 
@@ -353,10 +337,7 @@ def run_payload_schedule(
         loss_object = resolve_loss(first.processing["loss_fn"])
     loss_reduction = resolve_packed_loss_reduction(
         first.processing,
-        [
-            {**payload.meta_data, **payload.batch_data}
-            for payload in source_payloads
-        ],
+        [{**payload.meta_data, **payload.batch_data} for payload in source_payloads],
         loss_object=loss_object,
     )
 
@@ -371,13 +352,12 @@ def run_payload_schedule(
 
     outputs: list[dict] = []
     stepped = False
+    backward_started = False
     validated_sources: set[int] = set()
     try:
         for index, call in enumerate(calls):
             payload = call.payload
-            pipeline_backward: bool | str = (
-                "loss_only" if backward and loss_reduction is not None else backward
-            )
+            pipeline_backward: bool | str = "loss_only" if backward and loss_reduction is not None else backward
             result = run_pipeline(
                 engine=engine,
                 args=payload.args,
@@ -394,24 +374,19 @@ def run_payload_schedule(
             if before_backward is not None and backward:
                 before_backward(index, result)
             if backward and loss_reduction is not None:
+                backward_started = True
                 apply_packed_loss_reduction(
                     engine,
                     result.pop("loss_tensor"),
-                    0.0
-                    if call.is_padding
-                    else loss_reduction.loss_scales[call.source_index],
+                    0.0 if call.is_padding else loss_reduction.loss_scales[call.source_index],
                     backward=True,
                 )
             outputs.append(result)
-            if (
-                backward
-                and _managed_gradient_accumulation(engine)
-                and index < len(calls) - 1
-            ):
+            if backward and _managed_gradient_accumulation(engine) and index < len(calls) - 1:
                 take_step()
                 stepped = True
     except Exception:
-        if backward and (stepped or not _managed_gradient_accumulation(engine)):
+        if backward_started or stepped:
             mark_unpacked_cycle_broken(engine)
         raise
     return outputs, loss_reduction

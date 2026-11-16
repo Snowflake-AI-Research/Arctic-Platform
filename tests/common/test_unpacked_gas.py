@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from arctic_platform.common.unpacked_gas import assert_ready_for_final_step
+from arctic_platform.common.unpacked_gas import assert_unpacked_cycle_intact
 from arctic_platform.common.unpacked_gas import run_unpacked_gas
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import set_seed
@@ -149,6 +150,34 @@ def test_a_failure_after_a_between_chunk_step_marks_the_cycle_broken(monkeypatch
         assert "interrupted" in str(err)
     else:
         raise AssertionError("a broken cycle was treated as ready")
+
+
+def test_unmanaged_forward_failure_does_not_mark_the_cycle_broken(monkeypatch):
+    import arctic_platform.rl.processors as processors
+
+    def fake_run_pipeline(engine, args, batch, meta, processing, **kwargs):
+        del engine, args, batch, meta, processing, kwargs
+        raise RuntimeError("forward oom")
+
+    monkeypatch.setattr(processors, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(processors, "resolve_packed_loss_reduction", lambda *args, **kwargs: None)
+    engine = _Engine(gas=1, managed=False)
+    try:
+        run_unpacked_gas(
+            engine,
+            loop_count=1,
+            batch_data={"input_ids": torch.tensor([[0]])},
+            meta_data={},
+            processing={},
+            backward=True,
+            device="cpu",
+        )
+    except RuntimeError as err:
+        assert "forward oom" in str(err)
+    else:
+        raise AssertionError("the forward failure was swallowed")
+    assert_unpacked_cycle_intact(engine)
+    assert_ready_for_final_step(engine)
 
 
 def test_forward_only_does_not_step(monkeypatch):
@@ -290,9 +319,7 @@ def test_scheduled_payloads_apply_source_scales_and_zero_padding(monkeypatch):
     monkeypatch.setattr(
         processors,
         "apply_packed_loss_reduction",
-        lambda engine, loss_tensor, scale, *, backward: applied.append(
-            (float(loss_tensor), scale, backward)
-        ),
+        lambda engine, loss_tensor, scale, *, backward: applied.append((float(loss_tensor), scale, backward)),
     )
     validations = []
 
@@ -392,9 +419,7 @@ def test_payload_execution_parity_matrix(monkeypatch, managed, gas, zorro):
     )
 
     assert seen == [(float(index), zorro, "loss_only") for index in range(1, gas + 1)]
-    assert engine.backward_losses == pytest.approx(
-        [float(index) / gas for index in range(1, gas + 1)]
-    )
+    assert engine.backward_losses == pytest.approx([float(index) / gas for index in range(1, gas + 1)])
     assert result["avg_loss"] == pytest.approx(sum(range(1, gas + 1)))
     assert engine.steps == (gas - 1 if managed else 0)
     assert_ready_for_final_step(engine)
@@ -462,9 +487,7 @@ def test_packed_schedule_matches_unpacked_reduction_and_zeroes_padding(monkeypat
         [
             ScheduledAPPayload(packed_payloads[0], source_index=0),
             ScheduledAPPayload(packed_payloads[1], source_index=1),
-            ScheduledAPPayload(
-                packed_payloads[1], source_index=1, is_padding=True
-            ),
+            ScheduledAPPayload(packed_payloads[1], source_index=1, is_padding=True),
         ],
         backward=True,
         device="cpu",

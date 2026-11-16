@@ -1211,8 +1211,34 @@ class TestCortexSharedHelper:
         loss_mask = out["context"]["loss_mask"]
         assert sent[1][loss_mask[1]].tolist() == pytest.approx([-0.7, -0.8])
         assert sent[0][loss_mask[0]].tolist() == pytest.approx([-0.1, -0.2])
-        # The batch's own ``old_log_probs`` are still dropped.
+        # The explicit keyword wins over the batch's own ``old_log_probs``.
         assert "old_log_probs" not in out["kwargs"]
+
+    def test_batch_old_log_probs_shift_into_the_predict_next_frame(self):
+        """Token-aligned ``old_log_probs`` become ``old_log_probs_shifted``."""
+        import torch
+
+        from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+
+        ids = torch.tensor([[1, 2, 3, 4]])
+        attn = torch.tensor([[1, 1, 1, 1]])
+        resp_mask = torch.tensor([[0, 0, 1, 1]])
+        old = torch.tensor([[0.0, 0.0, -0.1, -0.2]])
+        out = to_cortex_fwd_bwd_payload(
+            {
+                "batch": {
+                    "input_ids": ids,
+                    "attention_mask": attn,
+                    "advantages": resp_mask.to(torch.float32),
+                    "response_mask": resp_mask,
+                    "old_log_probs": old,
+                },
+                "meta": {},
+            },
+            response_aligned=True,
+        )
+        assert torch.allclose(out["context"]["old_log_probs_shifted"], torch.tensor([[0.0, -0.1, -0.2, 0.0]]))
+        assert "old_log_probs" not in out["context"]
 
     def test_already_aligned_batch_is_passed_through(self):
         """An already-conformant batch must not pay for
@@ -1797,11 +1823,13 @@ class TestCortexZorroVerlGrpo:
 
     def test_rejects_sequence_aggregation(self):
         from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
+        from arctic_platform.integrations.verl.grpo_loss import _verl_grpo_validation_callback
 
         request = self._skyrl_zorro_request()
         request["meta"]["actor_config"]["loss_agg_mode"] = "seq-mean-token-mean"
+        out = to_cortex_fwd_bwd_payload(request, processing=self.SKYRL_PROCESSING)
         with pytest.raises(ValueError, match="loss_agg_mode='token-mean', got 'seq-mean-token-mean'"):
-            to_cortex_fwd_bwd_payload(request, processing=self.SKYRL_PROCESSING)
+            _verl_grpo_validation_callback({**out["context"], "zorro_train_enable": True}, {})
 
     def test_requires_the_old_policy_snapshot(self):
         from arctic_platform.integrations._cortex_shared import to_cortex_fwd_bwd_payload
@@ -1845,7 +1873,11 @@ class TestCortexUnpackedVerlGrpo:
         assert out["processing"]["loss_fn"] == "grpo"
         assert out["processing"]["post"] == ["compute_logprobs"]
         context = out["context"]
-        assert "old_log_probs" not in context and "old_log_probs_shifted" not in context
+        assert "old_log_probs" not in context
+        assert torch.allclose(
+            context["old_log_probs_shifted"],
+            torch.tensor([[0.0, -1.0, -2.0, 0.0, 0.0], [0.0, 0.0, -0.5, 0.0, 0.0]]),
+        )
         assert "response_mask" not in context
         assert "prompts" not in out["kwargs"]
         # Row 0 left-aligned, then loss_mask / advantages shifted one column left.
@@ -1966,10 +1998,22 @@ class TestCortexUnpackedVerlGrpo:
             self._payload(request, packed=False)
 
     def test_unpacked_job_rejects_sequence_aggregation(self):
+        from arctic_platform.integrations.verl.grpo_loss import _verl_grpo_validation_callback
+
         request = self._skyrl_request()
         request["meta"]["actor_config"]["loss_agg_mode"] = "seq-mean-token-mean"
+        out = self._payload(request, packed=False)
+        import torch
+
         with pytest.raises(ValueError, match="loss_agg_mode='token-mean', got 'seq-mean-token-mean'"):
-            self._payload(request, packed=False)
+            _verl_grpo_validation_callback(
+                {
+                    **out["context"],
+                    "response_mask": torch.ones(3, dtype=torch.bool),
+                    "actor_config": {"loss_agg_mode": "seq-mean-token-mean"},
+                },
+                {},
+            )
 
     def test_zorro_request_on_a_packed_job_raises(self):
         request = TestCortexZorroVerlGrpo._skyrl_zorro_request()
@@ -2013,10 +2057,10 @@ class TestCortexUnpackedVerlGrpo:
 
     @pytest.mark.parametrize(("worker", "loss_fn"), [({"pack": False}, "verl_grpo"), (None, "grpo"), ({}, "grpo")])
     def test_shim_payload_follows_the_job_it_creates(self, worker, loss_fn):
+        import torch
+
         from arctic_platform.client import CortexConfig
         from arctic_platform.integrations._cortex_dispatch import _CortexClientShim
-
-        import torch
 
         seen = {}
 
@@ -2069,10 +2113,17 @@ class TestCortexZorroLossAggregation:
     @pytest.mark.parametrize("source", ["actor_config", "processing"])
     @pytest.mark.parametrize("mode", ["seq-mean-token-mean", "seq-mean-token-sum", "prompt-mean"])
     def test_zorro_rejects_sequence_aggregation(self, source, mode):
+        import torch
+
+        from arctic_platform.rl.processors.grpo import _require_sequence_boundaries
+
         meta = {"actor_config": {"loss_agg_mode": mode}} if source == "actor_config" else {}
         processing = {"config": {"loss_agg_mode": mode}} if source == "processing" else None
-        with pytest.raises(ValueError, match=f"loss_agg_mode='token-mean', got '{mode}'"):
-            TestCortexActorConfig._payload(meta, processing, zorro=True)
+        out = TestCortexActorConfig._payload(meta, processing, zorro=True)
+        config = dict(out["processing"]["config"])
+        config.setdefault("loss_agg_mode", mode)
+        with pytest.raises(ValueError, match="1-D buffer with no cu_seqlens"):
+            _require_sequence_boundaries({"loss_mask": torch.ones(3, dtype=torch.bool)}, config)
 
     def test_explicit_token_mean_rescues_a_sequence_actor_config(self):
         out = TestCortexActorConfig._payload(

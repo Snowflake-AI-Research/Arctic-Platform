@@ -120,6 +120,10 @@ class CortexConfig(BaseSettings):
         validation_alias=AliasChoices("job_comment", "ARCTIC_CORTEX_JOB_COMMENT", "CORTEX_JOB_COMMENT"),
         description="cortex: comment stored on the job at create time.",
     )
+    image_tag: str | None = Field(
+        None,
+        description="Internal testing only; sent as debug.job.image_tag. Also ARCTIC_CORTEX_IMAGE_TAG.",
+    )
     # The server reclaims a job nobody is using, so a client that is killed
     # outright still releases its GPUs. None keeps the server default (30 min).
     idle_timeout_seconds: int | None = Field(

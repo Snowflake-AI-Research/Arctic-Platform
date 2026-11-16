@@ -550,10 +550,7 @@ def job_create_payload(sub_job_configs: list[dict], config: CortexConfig) -> dic
         value = getattr(config, key)
         if value is not None:
             payload[key] = value
-    # Development-only. ARCTIC_CORTEX_IMAGE_TAG selects a dev image; leave it unset for a normal launch.
-    import os
-
-    tag = os.environ.get("ARCTIC_CORTEX_IMAGE_TAG", "").strip()
+    tag = (config.image_tag or "").strip()
     if tag:
         payload["debug"] = {"job": {"image_tag": tag}}
     return payload
@@ -755,7 +752,7 @@ class CortexTransport(Transport):
                 reason = job.get("reason") or "(no reason)"
                 sub_states = ", ".join(
                     f"{_short(sj.get('job_type', ''), 'job_type_')}={_short(sj.get('status'))}"
-                    for sj in (job.get("sub_jobs") or [])
+                    for sj in job.get("sub_jobs") or []
                 )
                 detail = f" reason={reason!r}"
                 if sub_states:

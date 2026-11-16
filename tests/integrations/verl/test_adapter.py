@@ -594,6 +594,11 @@ def test_cortex_update_on_a_packed_job_is_rewritten_to_grpo(verl_stub) -> None:
     sent = wrapper._client.fwd_bwds[0]
     assert sent["processing"]["loss_fn"] == "grpo"
     assert "old_log_probs" not in sent["context"]
+    # Token-aligned snapshot at columns 2,3, then shifted into predict-next.
+    assert torch.allclose(
+        sent["context"]["old_log_probs_shifted"],
+        torch.tensor([[0.0, -0.1, -0.2, 0.0], [0.0, -0.3, -0.4, 0.0]]),
+    )
 
 
 def test_cortex_update_refuses_rollout_correction_weights(verl_stub) -> None:

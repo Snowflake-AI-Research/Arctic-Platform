@@ -40,6 +40,30 @@ from arctic_platform.rl.processors.base_loss import REQUIRES_TOKEN_LOGPROBS
 from arctic_platform.rl.processors.pipeline import register_loss_fn
 
 
+def _verl_grpo_validation_callback(context: dict, config: dict) -> None:
+    """Reject sequence aggregation unless each row is its own sequence.
+
+    This loss reduces ``dim=-1`` and does not read ``cu_seqlens``, so a 1-D
+    packed buffer or a ZoRRo-flattened row is one sequence.
+    """
+    actor = context.get("actor_config") if isinstance(context.get("actor_config"), dict) else {}
+    mode = config.get("loss_agg_mode", actor.get("loss_agg_mode", "token-mean"))
+    if mode in (None, "token-mean"):
+        return
+    if context.get("zorro_train_enable"):
+        raise ValueError(
+            f"verl_grpo supports only loss_agg_mode='token-mean', got {mode!r}: "
+            "ZoRRo flattens responses, so a sequence mean would be over the shard"
+        )
+    mask = context.get("response_mask", context.get("loss_mask"))
+    if torch.is_tensor(mask) and mask.ndim >= 2 and int(mask.shape[0]) > 1:
+        return
+    raise ValueError(
+        f"verl_grpo supports only loss_agg_mode='token-mean', got {mode!r}: "
+        "this call has no per-sequence rows (verl_grpo does not read cu_seqlens)"
+    )
+
+
 def mask_and_pad_for_log_probs(tensor: torch.Tensor, batch: dict) -> torch.Tensor:
     """Place per-token logprobs at their response positions in the packed [total_nnz]
     buffer, applying the legacy predict-next shift (padded[i] = values[i-1]) inside
@@ -414,7 +438,7 @@ class VerlPolicyConfig:
         self.loss_mode = policy_loss_config_dict.get("loss_mode", "vanilla")
 
 
-@register_loss_fn("verl_grpo")
+@register_loss_fn("verl_grpo", validation_callback=_verl_grpo_validation_callback)
 @declare_loss_capabilities(REQUIRES_TOKEN_LOGPROBS)
 def verl_grpo_loss(model_outputs: dict, batch: dict, meta: dict, config: dict, device: str):
     actor_config = meta.get("actor_config", {})
@@ -424,6 +448,7 @@ def verl_grpo_loss(model_outputs: dict, batch: dict, meta: dict, config: dict, d
     # print(f"_verl_grpo_loss: {verl_policy_config=}")
 
     log_probs = model_outputs["logprobs"].squeeze()
+    _verl_grpo_validation_callback({**batch, **meta}, config)
     entropy = model_outputs.get("entropy", None)
     if entropy is not None:
         entropy = entropy.squeeze()

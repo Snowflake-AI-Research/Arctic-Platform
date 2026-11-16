@@ -176,8 +176,11 @@ this package's packing pipeline from `pack_meta["S"]`. When none is supplied,
 it divides by the longest packed segment, after summing each segment's length
 over sequence-parallel ranks. Earlier releases divided packed input by the
 packed row's token count. Without `global_batch_size`, all three divide by the
-number of sequences with policy tokens instead of by one. Unpacked `[B, S]`
-input is unchanged.
+number of sequences with policy tokens instead of by one. Padded `[B, S]`
+input that `run_pipeline` unpads now gets `cu_seqlens` from the row lengths
+and `packed_loss_scale_factor` equal to the padded row width `S`, so
+`seq-mean-*` is per-row and `seq-mean-token-sum-norm` divides by `S`.
+Already-packed `[1, T]` input that arrives with `cu_seqlens` is unchanged.
 
 With `sequence_loss_weights`, `loss_agg_mode="prompt-mean"` computes
 `dp_size * sum(sequence_weight * sequence_loss_sum / sequence_token_count)`,
