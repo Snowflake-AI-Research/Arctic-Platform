@@ -582,7 +582,7 @@ def restored(monkeypatch):
     calls = []
     inst = _Inst()
 
-    def restore_engine(engine_kwargs, agents):
+    def restore_engine(engine_kwargs, agents, past_the_copy=None):
         calls.append((engine_kwargs, agents))
         return _handle(inst, agents or ())
 
@@ -651,7 +651,9 @@ def test_the_renderer_is_built_while_the_engine_restores(
         rendering.set()
         return ("prebuilt", vllm_config)
 
-    def restore_engine(engine_kwargs, agents):
+    def restore_engine(engine_kwargs, agents, past_the_copy=None):
+        assert not rendering.wait(0.2), "the renderer started beside the copy"
+        past_the_copy()
         assert rendering.wait(5), "the restore ran before the renderer started"
         return _handle(inst)
 
@@ -722,7 +724,7 @@ def test_a_failed_input_processor_build_keeps_the_renderer(
 
 
 def test_a_failed_restore_still_raises_after_the_renderer(asyncllm, monkeypatch):
-    def restore_engine(engine_kwargs, agents):
+    def restore_engine(engine_kwargs, agents, past_the_copy=None):
         raise RuntimeError("criu restore failed")
 
     monkeypatch.setitem(sys.modules, _ENGINE_NAME, types.SimpleNamespace(

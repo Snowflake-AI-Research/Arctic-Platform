@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 import time
 from typing import Any
 
@@ -63,19 +64,31 @@ async def restore_and_attach(engine_kwargs: dict[str, Any], agents: Any,
     reasoner = getattr(vllm_config.structured_outputs_config, "reasoning_parser", None)
     if reasoner and not kwargs.get("reasoning_parser"):
         kwargs["reasoning_parser"] = reasoner
-    building = asyncio.ensure_future(asyncio.to_thread(_build_inputs, vllm_config))
+    # The build waits until the restore is past its copy from the mirror: it
+    # runs Python bytecode for seconds (15 s for gemma-3-4b-it), and beside it
+    # the copy's GIL-bound syscalls crawled -- an 11 s copy of a skeleton that
+    # takes 0.6 s alone. The restore's steps after that run in the child.
+    past_the_copy = threading.Event()
+    building = asyncio.ensure_future(
+        asyncio.to_thread(_build_inputs, vllm_config, past_the_copy))
     try:
-        handle = await asyncio.to_thread(restore_engine, kwargs, agents)
+        handle = await asyncio.to_thread(restore_engine, kwargs, agents,
+                                         past_the_copy=past_the_copy.set)
     finally:
+        past_the_copy.set()
         renderer, input_processor, render_s = await building
     return await attach(handle, vllm_config, renderer, render_s, input_processor)
 
 
-def _build_inputs(vllm_config: Any) -> tuple[Any, Any, float | None]:
+def _build_inputs(vllm_config: Any, after: threading.Event | None = None
+                  ) -> tuple[Any, Any, float | None]:
     """The front end's renderer (tokenizer and multimodal processor) and input
     processor (which sizes a multimodal model's encoder cache), built while
     the engine restores, and how long that took. A part that fails to build
-    is None, and the ``AsyncLLM`` then builds its own."""
+    is None, and the ``AsyncLLM`` then builds its own. Starts once ``after``
+    is set."""
+    if after is not None:
+        after.wait()
     t0 = time.perf_counter()
     try:
         renderer = renderer_from_config(vllm_config)

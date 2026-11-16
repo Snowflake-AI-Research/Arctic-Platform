@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import stat
 import sys
 
@@ -253,6 +254,65 @@ def test_materialize_copies_from_the_mirror(tmp_path, caplog):
     source = _published(tmp_path, model_dir)
     line = _materialized_line(caplog, source, model_dir)
     assert " range(s) over " in line and "pages:" not in line
+
+
+def test_the_materialized_line_says_how_long_the_pre_checks_took(tmp_path,
+                                                                 caplog):
+    model_dir = _fresh_model_dir(str(tmp_path))
+    source = _published(tmp_path, model_dir)
+    line = _materialized_line(caplog, source, model_dir)
+    assert re.search(r"MB/s\) after \d+\.\d\ds of pre-checks;", line)
+
+
+def test_materialize_runs_under_a_short_switch_interval(tmp_path, monkeypatch):
+    """Pre-checks and gather both run under the short interval, and the
+    process's own comes back afterwards."""
+    model_dir = _fresh_model_dir(str(tmp_path))
+    source = _published(tmp_path, model_dir)
+    seen = {}
+    real_gather, real_walk = sg.gather, se._newest_mtime
+
+    def gather(*a, **k):
+        seen["gather"] = sys.getswitchinterval()
+        return real_gather(*a, **k)
+
+    def walk(*a, **k):
+        seen["walk"] = sys.getswitchinterval()
+        return real_walk(*a, **k)
+
+    monkeypatch.setattr(sg, "gather", gather)
+    monkeypatch.setattr(se, "_newest_mtime", walk)
+    before = sys.getswitchinterval()
+    assert se._materialize_from_source(
+        source, model_dir, _weight_root(source), _weight_hash_of(source))
+    assert seen == pytest.approx({"gather": se._MATERIALIZE_SWITCH_INTERVAL_S,
+                                  "walk": se._MATERIALIZE_SWITCH_INTERVAL_S})
+    assert sys.getswitchinterval() == before
+
+
+def test_the_switch_interval_comes_back_after_a_raise_and_when_nested():
+    before = sys.getswitchinterval()
+    with pytest.raises(RuntimeError):
+        with se._gil_priority():
+            with se._gil_priority():
+                assert sys.getswitchinterval() == pytest.approx(
+                    se._MATERIALIZE_SWITCH_INTERVAL_S)
+            assert sys.getswitchinterval() == pytest.approx(
+                se._MATERIALIZE_SWITCH_INTERVAL_S)
+            raise RuntimeError("copy failed")
+    assert sys.getswitchinterval() == before
+
+
+def test_a_shorter_switch_interval_is_left_alone():
+    before = sys.getswitchinterval()
+    sys.setswitchinterval(se._MATERIALIZE_SWITCH_INTERVAL_S / 2)
+    shorter = sys.getswitchinterval()
+    try:
+        with se._gil_priority():
+            assert sys.getswitchinterval() == shorter
+        assert sys.getswitchinterval() == shorter
+    finally:
+        sys.setswitchinterval(before)
 
 
 def test_materialize_without_a_manifest_still_copies(tmp_path, caplog):

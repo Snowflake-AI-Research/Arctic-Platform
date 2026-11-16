@@ -256,6 +256,15 @@ _COPY_SUBDIRS = (_COMPILATION_DIR, _IMAGE_DIR)
 # the daemon's manifest, which every verified mirror directory carries.
 _DAEMON_MANIFEST = "_neutrino_manifest.json"
 
+# The GIL switch interval a materialize runs under. Its pre-checks and gather
+# are thousands of short syscalls, each of which hands the GIL back and must
+# wait to retake it; beside a thread running Python bytecode that wait is up
+# to the default 5 ms every time. Measured on QA6, the verification walk of
+# gemma-3-4b-it's 463 files went from 2 ms to 4.2 s beside one busy thread,
+# and in a local run a compressed gather went from 0.42 s to 32 s; at 0.1 ms
+# they took 0.14 s and 1.2 s.
+_MATERIALIZE_SWITCH_INTERVAL_S = 1e-4
+
 # Written by _semip_save_weights beside the shards it indexes; TP>1 fans out
 # into rank<N>/ subdirectories with one of these each.
 _WEIGHTS_MANIFEST = "weights_meta.json"
@@ -1535,6 +1544,38 @@ def _dir_bytes(root: str) -> tuple[int, int]:
     return files, total
 
 
+_SWITCH_LOCK = threading.Lock()
+_SWITCH_STATE = {"depth": 0, "saved": None}
+
+
+@contextlib.contextmanager
+def _gil_priority():
+    """Run the body under ``_MATERIALIZE_SWITCH_INTERVAL_S``, then put it back.
+
+    The interval is process-wide, so overlapping bodies share one saved value
+    and the last to leave restores it.
+    """
+    with _SWITCH_LOCK:
+        if _SWITCH_STATE["depth"] == 0:
+            saved = sys.getswitchinterval()
+            # setswitchinterval truncates to whole microseconds, so a value
+            # that is already short enough is not written back at all.
+            _SWITCH_STATE["saved"] = (
+                saved if saved > _MATERIALIZE_SWITCH_INTERVAL_S else None)
+            if _SWITCH_STATE["saved"] is not None:
+                sys.setswitchinterval(_MATERIALIZE_SWITCH_INTERVAL_S)
+        _SWITCH_STATE["depth"] += 1
+    try:
+        yield
+    finally:
+        with _SWITCH_LOCK:
+            _SWITCH_STATE["depth"] -= 1
+            if (_SWITCH_STATE["depth"] == 0
+                    and _SWITCH_STATE["saved"] is not None):
+                sys.setswitchinterval(_SWITCH_STATE["saved"])
+
+
+@_gil_priority()
 def _materialize_from_source(source_dir: str | None, model_dir: str,
                              weight_root: str | None = None,
                              weight_hash: str | None = None, *,
@@ -1581,6 +1622,7 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
     """
     if not source_dir:
         return False
+    t_checks = time.perf_counter()
     if not os.path.isdir(source_dir):
         if strict:
             raise RuntimeError(
@@ -1687,6 +1729,7 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
 
     incoming = os.path.join(model_dir, _INCOMING_NAME)
     t0 = time.perf_counter()
+    checks_s = t0 - t_checks
     files = total = 0
     gathered = None
     try:
@@ -1764,9 +1807,9 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
                 f"written, decode {gathered.decode_cpu_s:.1f} core-s")
     logger.info(
         "semi_p: materialized %s from %s: %d file(s), %.2f GiB in %.1fs "
-        "(%.0f MB/s); weights stay on the mirror%s",
+        "(%.0f MB/s) after %.2fs of pre-checks; weights stay on the mirror%s",
         model_dir, source_dir, files, total / 2**30, elapsed,
-        total / 1e6 / elapsed if elapsed > 0 else 0.0, how)
+        total / 1e6 / elapsed if elapsed > 0 else 0.0, checks_s, how)
     return True
 
 
@@ -3152,11 +3195,21 @@ def _tee_tree_to_ray() -> None:
 
 
 def restore_engine(engine_kwargs: dict[str, Any],
-                   agents: list[Any] | None = None) -> RestoredEngine:
+                   agents: list[Any] | None = None, *,
+                   past_the_copy: Any = None) -> RestoredEngine:
     """Bring a semi-p engine up and return its ``RestoredEngine`` (blocking).
 
     Intended to be called via ``asyncio.to_thread`` from the worker. The
     caller hands the result to a front end, which then owns it.
+
+    ``past_the_copy``, if given, is called with no arguments once this process
+    is done copying from the mirror -- the image is local, or the miss is
+    going to a dump -- and before the restore itself. The front end starts its
+    renderer build there rather than beside the copy, because the build runs
+    Python bytecode for seconds and the copy is GIL-bound (see
+    ``_MATERIALIZE_SWITCH_INTERVAL_S``); the restore's steps run in the child
+    and leave this process waiting. It may be called more than once, and is
+    not called if this raises first.
 
     ``agents`` are the ``SemipNodeAgent`` handles for the other pods when this
     engine's TP group spans pods; ``None`` or empty is the single-pod case,
@@ -3220,9 +3273,10 @@ def restore_engine(engine_kwargs: dict[str, Any],
     gpus = _resolve_physical_gpus()
     _check_tp_matches_gpus(vllm_config, gpus, paths.nnodes)
 
+    past_the_copy = past_the_copy or (lambda: None)
     if agents:
         return _multinode_restore_and_wrap(
-            engine_kwargs, vllm_config, paths, gpus, agents)
+            engine_kwargs, vllm_config, paths, gpus, agents, past_the_copy)
 
     # Resolved before the lock and re-used after it: the published tree is
     # read-only, so listing it twice could only produce the same answer at extra
@@ -3254,11 +3308,13 @@ def restore_engine(engine_kwargs: dict[str, Any],
             elif not _dump_publish_requested():
                 raise _miss_error(model_dir, skeleton_dir)
             else:
+                past_the_copy()
                 _dump(vllm_config, model_dir, gpus,
                       image_ref=paths.image_ref,
                       driver_version=paths.driver_version)
                 after = "dump we just took"
                 dumped = True
+    past_the_copy()
 
     # Nothing is cleaned up here on the miss path: _worker_criu_save rmtree's
     # image/ before writing, and _semip_save_weights does the same for its rank
@@ -3277,7 +3333,9 @@ def restore_engine(engine_kwargs: dict[str, Any],
 def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
                                 vllm_config: dict[str, Any],
                                 paths: _ImagePaths, gpus: list[int],
-                                agents: list[Any]) -> RestoredEngine:
+                                agents: list[Any],
+                                past_the_copy: Any = lambda: None
+                                ) -> RestoredEngine:
     """``restore_engine`` for an engine whose TP group spans pods.
 
     Same shape as the single-pod path -- hit, else materialize, else dump if
@@ -3311,6 +3369,7 @@ def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
                     raise _miss_error(key_dir,
                                       _resolve_published_skeleton(paths)[0])
                 else:
+                    past_the_copy()
                     _dump_multinode(
                         vllm_config, paths, gpus, agents,
                         master_port=_pick_master_port(),
@@ -3325,6 +3384,7 @@ def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
                         "semi_p: after a multi-node dump the node-partitions still do "
                         "not agree on a dump_id; refusing to restore a set "
                         "that would deadlock in its first collective")
+    past_the_copy()
 
     skeleton_dir, weight_hash = _resolve_published_skeleton(paths)
     weights_dir = _weights_dir_for_restore(

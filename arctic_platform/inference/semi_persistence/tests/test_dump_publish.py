@@ -168,6 +168,60 @@ def test_a_materialized_copy_needs_no_flag_and_publishes_nothing(engine,
     assert calls == {"dump": 0, "restore": 1, "publish": []}
 
 
+def _journal(monkeypatch, *, materialized=False):
+    """Record the order of materialize, dump, restore and ``past_the_copy``."""
+    events = []
+
+    def materialize(*a, **k):
+        events.append("materialize")
+        return materialized
+
+    def dump(*a, **k):
+        events.append("dump")
+
+    def restore(*a, **k):
+        events.append("restore")
+        return "engine"
+
+    monkeypatch.setattr(se, "_materialize_from_source", materialize)
+    monkeypatch.setattr(se, "_dump", dump)
+    monkeypatch.setattr(se, "_restore_with_port_retry", restore)
+    return events, lambda: events.append("past the copy")
+
+
+def test_past_the_copy_follows_the_materialize_and_precedes_the_restore(
+        engine, monkeypatch):
+    events, signal = _journal(monkeypatch, materialized=True)
+    assert se.restore_engine({}, past_the_copy=signal) == "engine"
+    assert events == ["materialize", "past the copy", "restore"]
+
+
+def test_past_the_copy_precedes_a_dump(engine, monkeypatch):
+    monkeypatch.setenv(se._DUMP_PUBLISH_ENV, "1")
+    events, signal = _journal(monkeypatch)
+    se.restore_engine({}, past_the_copy=signal)
+    assert events[:3] == ["materialize", "past the copy", "dump"]
+    assert events[-1] == "restore"
+
+
+def test_past_the_copy_comes_at_once_on_a_local_hit(engine, monkeypatch):
+    _, paths = engine
+    image = os.path.join(paths.model_dir, se._IMAGE_DIR)
+    os.makedirs(image)
+    with open(os.path.join(image, "meta.json"), "w") as handle:
+        handle.write("{}")
+    events, signal = _journal(monkeypatch)
+    se.restore_engine({}, past_the_copy=signal)
+    assert events == ["past the copy", "restore"]
+
+
+def test_a_refused_miss_never_signals_past_the_copy(engine, monkeypatch):
+    events, signal = _journal(monkeypatch)
+    with pytest.raises(RuntimeError, match="semi_p to false"):
+        se.restore_engine({}, past_the_copy=signal)
+    assert events == ["materialize"]
+
+
 def test_a_failed_restore_after_the_dump_publishes_nothing(engine, monkeypatch):
     calls, _ = engine
     monkeypatch.setenv(se._DUMP_PUBLISH_ENV, "1")
