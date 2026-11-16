@@ -115,7 +115,7 @@ dss/ray_dss/jobs/gpu/sampling.py  kwargs["semi_p"] = True          (coordinator,
 arctic_inference/server/worker.py InferenceWorker.initialize       (GPU pod)
   |                                pops semi_p* before AsyncEngineArgs
   v
-arctic_platform/inference/server/semip_asyncllm.py  restore_and_attach(...)
+arctic_platform/inference/server/semip_frontend.py  restore_and_attach(...)
   |                                pins scheduler limits, stats, reasoner
   v
 arctic_platform/inference/server/semip_engine.py  restore_engine(...)
@@ -126,7 +126,7 @@ semi_persistence.Instance         criu_restore -> ... -> up
   v
 $SEMIP_IMAGE_CACHE/<cfg12>_<env12>[/replica<K>]  image/ + weight/ + compilation/
   |
-  v  (back in semip_asyncllm.attach)
+  v  (back in semip_frontend.attach)
 vllm_child serve_core             EngineCore -> ZMQ-served engine core
   |
   v
@@ -266,7 +266,7 @@ semi_p_agents = engine_kwargs.pop("semi_p_agents", None)
 vllm_config = engine_args.create_engine_config()
 ...
 if semi_p:
-    from arctic_platform.inference.server.semip_asyncllm import restore_and_attach
+    from arctic_platform.inference.server.semip_frontend import restore_and_attach
     self.llm = await restore_and_attach(engine_kwargs, semi_p_agents, vllm_config)
 else:
     self.llm = AsyncLLM.from_vllm_config(vllm_config, stat_loggers=[RingStatLogger])
@@ -334,7 +334,7 @@ Three modules under `arctic_platform/inference/server/` split the work:
   > the image once it has restored; without the flag it raises, telling the
   > user to set `semi_p` to false or add the flag. See SKILL.md, "A miss fails
   > the job unless it sets `SEMIP_DUMP_PUBLISH=1`".
-- `semip_asyncllm.restore_and_attach(engine_kwargs, agents, vllm_config)` —
+- `semip_frontend.restore_and_attach(engine_kwargs, agents, vllm_config)` —
   pins into the kwargs what the child's `LLM()` would otherwise resolve
   differently from the worker's `vllm_config` (`max_num_seqs`,
   `max_num_batched_tokens`, `disable_log_stats=False`, and the chat reasoner
@@ -344,7 +344,7 @@ Three modules under `arctic_platform/inference/server/` split the work:
   client_addresses=...)`. On any failure it tears the restored engine down,
   since nothing else owns it yet. It logs `semi_p: front end attached in
   X.XXs (serve_core X.XXs, AsyncLLM X.XXs)`.
-- `semip_frontend` — vLLM-free, so the tests need no GPU: the mixin
+- Also in `semip_frontend`, tested against fake vLLM modules: the mixin
   (sleep, wake, weight-sync bookkeeping, a watch that fails the front end's
   requests if the child dies, `close`), `_teardown`, and the config
   comparison.

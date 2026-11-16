@@ -1,11 +1,10 @@
 """Unit tests for the semi-p ``AsyncLLM`` front end and its attach.
 
-``server/semip_frontend.py`` imports no vLLM, so it is loaded from its file and
-driven against fakes: ``_SemiPAsyncLLMMixin`` over a fake ``AsyncLLM`` base, a
-fake ``Instance`` that journals the commands it is sent, and a real
-subprocess for the death watch. ``server/semip_asyncllm.py`` does import
-vLLM; its ``restore_and_attach`` and ``attach`` are loaded with fake vLLM
-modules in ``sys.modules``.
+``server/semip_frontend.py`` is loaded from its file against fake vLLM modules
+in ``sys.modules`` and driven against fakes: ``_SemiPAsyncLLMMixin`` over a
+fake ``AsyncLLM`` base, a fake ``Instance`` that journals the commands it is
+sent, a real subprocess for the death watch, and, for ``restore_and_attach``
+and ``attach``, fake vLLM classes that record how they were built.
 
 What none of this covers is the real ZMQ handshake between ``AsyncLLM`` and
 the child's core, which needs vLLM and a GPU pod.
@@ -36,17 +35,46 @@ from test_image_cache_key import _PKG, se  # noqa: E402
 
 _SERVER = os.path.join(os.path.dirname(_PKG), "server")
 _CHILD = os.path.join(_PKG, "vllm_child.py")
-_FRONTEND_NAME = "arctic_platform.inference.server.semip_frontend"
 _ENGINE_NAME = "arctic_platform.inference.server.semip_engine"
 
 
-def _load_semip_frontend():
-    """semip_frontend.py from its file; it imports only the standard library."""
+def _fake_vllm_modules():
+    """The vLLM and metrics modules semip_frontend.py imports, as empty fakes."""
+    names = ("vllm", "vllm.utils", "vllm.utils.network_utils", "vllm.v1",
+             "vllm.v1.engine", "vllm.v1.engine.async_llm",
+             "vllm.v1.engine.input_processor", "vllm.renderers",
+             "arctic_platform.inference.server.metrics")
+    mods = {name: types.ModuleType(name) for name in names}
+    mods["vllm.v1.engine"].async_llm = mods["vllm.v1.engine.async_llm"]
+    mods["vllm.v1.engine.async_llm"].AsyncLLM = object
+    mods["vllm.renderers"].renderer_from_config = None
+    mods["vllm.utils.network_utils"].get_open_zmq_ipc_path = None
+    mods["vllm.v1.engine.input_processor"].InputProcessor = None
+    mods["arctic_platform.inference.server.metrics"].RingStatLogger = None
+    return mods
+
+
+def _exec_semip_frontend(name):
     spec = importlib.util.spec_from_file_location(
-        "semip_frontend_under_test", os.path.join(_SERVER, "semip_frontend.py"))
+        name, os.path.join(_SERVER, "semip_frontend.py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_semip_frontend():
+    """semip_frontend.py from its file, with fake vLLM modules only while it loads."""
+    mods = _fake_vllm_modules()
+    saved = {name: sys.modules.get(name) for name in mods}
+    sys.modules.update(mods)
+    try:
+        return _exec_semip_frontend("semip_frontend_under_test")
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 fe = _load_semip_frontend()
@@ -481,20 +509,9 @@ def _own_input_processor(vllm_config, renderer):
 
 @pytest.fixture
 def asyncllm(monkeypatch):
-    """semip_asyncllm.py, loaded against fake vLLM and metrics modules."""
+    """semip_frontend.py, loaded against fake vLLM classes that record their builds."""
     paths = iter(f"ipc:///tmp/semip-test-{i}" for i in range(100))
-    mods = {
-        "vllm": types.ModuleType("vllm"),
-        "vllm.utils": types.ModuleType("vllm.utils"),
-        "vllm.utils.network_utils": types.ModuleType("vllm.utils.network_utils"),
-        "vllm.v1": types.ModuleType("vllm.v1"),
-        "vllm.v1.engine": types.ModuleType("vllm.v1.engine"),
-        "vllm.v1.engine.async_llm": types.ModuleType("vllm.v1.engine.async_llm"),
-        "vllm.v1.engine.input_processor": types.ModuleType("vllm.v1.engine.input_processor"),
-        "vllm.renderers": types.ModuleType("vllm.renderers"),
-        "arctic_platform.inference.server.metrics":
-            types.ModuleType("arctic_platform.inference.server.metrics"),
-    }
+    mods = _fake_vllm_modules()
     mods["vllm.utils.network_utils"].get_open_zmq_ipc_path = lambda: next(paths)
     mods["vllm.v1.engine.async_llm"].AsyncLLM = _FakeVllmAsyncLLM
     mods["vllm.v1.engine.async_llm"].renderer_from_config = _own_renderer
@@ -503,19 +520,13 @@ def asyncllm(monkeypatch):
     mods["vllm.v1.engine.input_processor"].InputProcessor = (
         lambda cfg, renderer: ("prebuilt input processor", renderer))
     mods["arctic_platform.inference.server.metrics"].RingStatLogger = _RING
-    mods["vllm.v1.engine"].async_llm = mods["vllm.v1.engine.async_llm"]
     for name, mod in mods.items():
         monkeypatch.setitem(sys.modules, name, mod)
-    monkeypatch.setitem(sys.modules, _FRONTEND_NAME, fe)
     _FakeVllmAsyncLLM.built = []
     _FakeVllmAsyncLLM.renderers = []
     _FakeVllmAsyncLLM.input_processors = []
     _FakeVllmAsyncLLM.fail = None
-    spec = importlib.util.spec_from_file_location(
-        "semip_asyncllm_under_test", os.path.join(_SERVER, "semip_asyncllm.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return _exec_semip_frontend("semip_frontend_attach_under_test")
 
 
 def _handle(inst, agents=()):
@@ -744,11 +755,6 @@ def _imported(path, anywhere=False):
     return names
 
 
-def test_semip_frontend_imports_no_vllm_at_module_scope():
-    names = _imported(os.path.join(_SERVER, "semip_frontend.py"))
-    assert not [n for n in names if n.split(".")[0] in ("vllm", "torch", "ray")]
-
-
-def test_semip_engine_never_imports_the_asyncllm_front_end():
+def test_semip_engine_never_imports_the_front_end():
     names = _imported(os.path.join(_SERVER, "semip_engine.py"), anywhere=True)
-    assert not [n for n in names if "semip_asyncllm" in n]
+    assert not [n for n in names if "semip_frontend" in n]

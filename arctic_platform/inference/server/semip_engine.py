@@ -4,7 +4,7 @@
 When a job sets ``semi_p: true`` we instead **restore a pre-warmed CRIU image**
 via ``arctic_platform.inference.semi_persistence.Instance``. ``restore_engine``
 does that and returns a ``RestoredEngine`` handle; the ``AsyncLLM`` front end
-that serves it is in ``semip_asyncllm.py`` and ``semip_frontend.py``.
+that serves it is in ``semip_frontend.py``.
 
 The vLLM engine itself lives out-of-process inside the ``Instance``'s vLLM
 child; every call here forwards over the ``Instance`` queue/pipe and blocks, so
