@@ -28,11 +28,18 @@ def test_routed_expert_capture_accepts_decode_context_parallelism():
     assert config.parallel_config.decode_context_parallel_size == 8
 
 
-def test_routed_expert_capture_still_refuses_prefill_context_parallelism():
+@pytest.mark.parametrize(
+    "parallel, message",
+    [
+        ({"prefill_context_parallel_size": 2}, "context parallelism"),
+        ({"pipeline_parallel_size": 2}, "pipeline parallelism"),
+    ],
+)
+def test_routed_expert_capture_preserves_other_parallelism_refusals(parallel, message):
     ensure_router_replay_vllm_patches()
-    config = _capture_config(decode_context_parallel_size=2, prefill_context_parallel_size=2)
+    config = _capture_config(decode_context_parallel_size=2, **parallel)
 
-    with pytest.raises(ValueError, match="context parallelism"):
+    with pytest.raises(ValueError, match=message):
         VllmConfig._verify_aux_output_compatibility(config)
 
     assert config.parallel_config.decode_context_parallel_size == 2

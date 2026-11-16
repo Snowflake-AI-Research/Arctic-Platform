@@ -102,14 +102,7 @@ def patch_scheduler_check_stop() -> None:
 
 
 def patch_aux_output_allow_dcp() -> None:
-    """Allow routed-expert capture with decode context parallelism (DCP).
-
-    vLLM refuses capture with DCP or PCP > 1. DCP shards only the attention KV
-    cache: every rank of the group runs the MoE layers on every scheduled token,
-    so the output rank captures the same rows as at DCP 1, and the capture store
-    already sizes its blocks with the DCP-scaled scheduler block size. PCP splits
-    tokens across ranks and stays refused.
-    """
+    """DCP shards attention KV, not captured token rows; PCP still splits rows."""
     from vllm.config import VllmConfig
 
     original = VllmConfig._verify_aux_output_compatibility
