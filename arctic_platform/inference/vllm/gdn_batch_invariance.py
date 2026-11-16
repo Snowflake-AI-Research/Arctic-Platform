@@ -21,6 +21,9 @@ vendored FLA ops, and the gated RMSNorm's rows-per-block tiling. Pinning both
 makes a token's result independent of how many tokens share the call, which
 is what the ``vllm_aligned`` trainer forward relies on. The trainer calls
 :func:`pin_gdn_kernels` too, so both processes run the same tile configs.
+A decoded token also takes fused kernels only when no prefill shares its step
+(packed recurrent decode, and the fused CUDA speculative decode with its norm);
+vLLM's own switches turn both off, so it runs the kernels a mixed step runs.
 """
 
 import os
@@ -87,5 +90,8 @@ def ensure_gdn_batch_invariance() -> None:
     from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
 
     GDNAttentionBackend.supports_batch_invariance = classmethod(lambda cls: True)
+    # Read by each GDN layer's __init__, so this must run before the model is built.
+    os.environ.setdefault("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "0")
+    os.environ.setdefault("VLLM_GDN_DECODE_KERNEL", "triton")
     pin_gdn_kernels()
     _APPLIED = True
