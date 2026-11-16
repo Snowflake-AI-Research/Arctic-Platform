@@ -1373,7 +1373,7 @@ class ReplicaPool:
                 f"{_worker_error_messages(pause_results, failed_workers)}"
             )
 
-    async def _resume_generation_after_weight_sync(self) -> None:
+    async def _resume_workers(self) -> None:
         resume_results = await asyncio.gather(
             *[worker.resume_generation.remote() for worker in self._workers],
             return_exceptions=True,
