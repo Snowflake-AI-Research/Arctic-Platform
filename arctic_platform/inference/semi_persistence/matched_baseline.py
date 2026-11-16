@@ -39,7 +39,10 @@ COLLECTIVE_ENV = {
     "VLLM_ALLREDUCE_USE_FLASHINFER": "0",
 }
 # ... and defaulted, so extra_env can still override it.
-COLLECTIVE_ENV_DEFAULTS = {"SEMIP_SUPPRESS_FI_AR_WORKSPACE": "1"}
+COLLECTIVE_ENV_DEFAULTS = {
+    "SEMIP_SUPPRESS_FI_AR_WORKSPACE": "1",
+    "SEMIP_SUPPRESS_INKLING2_AR_WORKSPACE": "1",
+}
 PASS_CONFIG = {"fuse_allreduce_rms": False}
 WORKER_CLS = "_semip_worker.SemipGPUWorker"
 SEMIP_DIR = os.path.dirname(os.path.abspath(__file__))

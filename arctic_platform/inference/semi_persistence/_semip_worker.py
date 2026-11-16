@@ -33,6 +33,8 @@ for rebind instead of dropping them for a recapture.
 
 ``load_model`` moves large pinned host parameters into mappings semi_p can
 empty at the dump (``host_weights``), before anything captures their address.
+Before the model is built it refuses Inkling2's multicast all-reduce workspace
+(``SEMIP_SUPPRESS_INKLING2_AR_WORKSPACE``, defaulted on by ``vllm_child``).
 
 Both hooks return whatever the base class returns, so this stays agnostic to
 the ``compile_or_warm_up_model`` return type (a float on older vLLM, a
@@ -98,9 +100,31 @@ class SemipGPUWorker(Worker):
         return result
 
     def load_model(self, *args, **kwargs):
+        refusing = self._semip_refuse_inkling2_ar()
         result = super().load_model(*args, **kwargs)
+        if refusing:
+            import ca_graph_rebind
+            state = ca_graph_rebind.inkling2_ar_refusal_state()
+            print(f"[inkling2-ar] rank={self.rank} refused={state['refused']}",
+                  flush=True)
         self._semip_thin_pinned_params()
         return result
+
+    def _semip_refuse_inkling2_ar(self):
+        """Keep Inkling2's model-owned multicast all-reduce workspace out of
+        the image (``ca_graph_rebind.install_inkling2_ar_refusal``). Before
+        ``super().load_model``, which is where the model builds it. True when
+        the refusal is in place."""
+        try:
+            import ca_graph_rebind
+        except Exception as exc:  # noqa: BLE001
+            print(f"[inkling2-ar] ca_graph_rebind unavailable: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            return False
+        info = ca_graph_rebind.install_inkling2_ar_refusal()
+        print(f"[inkling2-ar] rank={self.rank} active={info['active']} "
+              f"suppress={info['suppress']} err={info['err']}", flush=True)
+        return info["active"]
 
     def _semip_thin_pinned_params(self):
         """Rehome the large pinned host parameters (``host_weights``) and say

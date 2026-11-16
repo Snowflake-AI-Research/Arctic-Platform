@@ -351,6 +351,73 @@ def restore_fi_ar_workspace_probe() -> None:
     _fiar_probe["suppress"] = False
 
 
+_ink2_ar = {"active": False, "orig": None, "refused": 0}
+
+_INK2_AR_SUPPRESS_ENV = "SEMIP_SUPPRESS_INKLING2_AR_WORKSPACE"
+
+
+def install_inkling2_ar_refusal() -> dict:
+    """Refuse Inkling2's fused all-reduce workspace, so its model runs the
+    stock TP all-reduce.
+
+    The ``snowflake-eng/inkling-2`` vLLM fork builds it in the model's
+    ``__init__`` (``Inkling2AllReduceWorkspace.create``): FlashInfer
+    ``SymmDeviceMemory`` multicast Lamport buffers that the model owns, outside
+    every communicator, so ``_run_communicator_checkpoint_hook`` never sees it.
+    It is the memory ``install_fi_ar_workspace_probe`` keeps out of the image:
+    ``cuCheckpointProcess*`` cannot carry it and ``cuMulticastAddDevice`` fails
+    in a restored process. ``create`` returning None is the fork's own
+    fallback (no multicast, no FlashInfer, TP not in 2/4/8): the model then
+    also builds no ``SeqParallel`` buffers, and every sublayer reduces through
+    ``tensor_model_parallel_all_reduce``, i.e. CustomAllreduce, which the
+    rebind covers.
+
+    Never withdrawn: the model is built once, and the image restores that
+    instance. On a vLLM without Inkling2 this is a reported no-op.
+    """
+    import inspect
+    import os
+    out = {"active": False, "suppress": False, "refused": _ink2_ar["refused"], "err": None}
+    if _ink2_ar["active"]:
+        out["active"] = out["suppress"] = True
+        return out
+    if os.environ.get(_INK2_AR_SUPPRESS_ENV, "") in ("", "0"):
+        return out
+    out["suppress"] = True
+    try:
+        from vllm.models.inkling2.ops import allreduce as ink2_ar
+        workspace_cls = ink2_ar.Inkling2AllReduceWorkspace
+    except Exception as exc:  # noqa: BLE001 - only the inkling-2 fork has it
+        out["err"] = f"{type(exc).__name__}: {exc}"
+        return out
+    orig = inspect.getattr_static(workspace_cls, "create")
+
+    def _refuse(cls, group, hidden_size):
+        _ink2_ar["refused"] += 1
+        return None
+
+    _ink2_ar["orig"] = orig
+    _ink2_ar["active"] = True
+    workspace_cls.create = classmethod(_refuse)
+    out["active"] = True
+    return out
+
+
+def inkling2_ar_refusal_state() -> dict:
+    return {"active": _ink2_ar["active"], "refused": _ink2_ar["refused"]}
+
+
+def restore_inkling2_ar_refusal() -> None:
+    if not _ink2_ar["active"]:
+        return
+    try:
+        from vllm.models.inkling2.ops import allreduce as ink2_ar
+        ink2_ar.Inkling2AllReduceWorkspace.create = _ink2_ar["orig"]
+    except Exception:  # noqa: BLE001
+        pass
+    _ink2_ar.update(active=False, orig=None, refused=0)
+
+
 _fc = {"active": False, "orig": None}
 
 

@@ -4732,6 +4732,10 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                     # workspace back. Put SEMIP_SUPPRESS_FI_AR_WORKSPACE=0 in
                     # the payload's extra_env to get the old behaviour.
                     os.environ.setdefault("SEMIP_SUPPRESS_FI_AR_WORKSPACE", "1")
+                    # The same multicast memory, owned by the model rather than
+                    # a communicator: the inkling-2 vLLM fork's fused
+                    # all-reduce workspace, refused in `SemipGPUWorker.load_model`.
+                    os.environ.setdefault("SEMIP_SUPPRESS_INKLING2_AR_WORKSPACE", "1")
 
                 # Per-model env vars: vllm_config["_env"] is a reserved
                 # mapping applied to os.environ before vLLM is imported,
