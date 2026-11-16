@@ -1520,14 +1520,11 @@ class ReplicaPool:
 
             scheduler_was_paused = scheduler.paused
             scheduler.pause()
-            generation_frozen = False
             replay_send: asyncio.Future | None = None
             try:
-                # Hold in-flight requests in place (vLLM keep mode) rather than
-                # draining them: no engine step runs on the sampling GPUs during
-                # the send, and the send does not wait for the longest decode.
+                # Keep mode holds in-flight requests in place so no engine step
+                # runs on the sampling GPUs during the send.
                 await self._pause_workers("freeze_generation")
-                generation_frozen = True
                 replay_send = asyncio.gather(
                     *[
                         worker.send_router_replay.remote()
@@ -1748,7 +1745,7 @@ class ReplicaPool:
                 can_restore_scheduling = update_succeeded or not weight_update_started
                 if effective_strategy == "pause":
                     if generation_paused and update_succeeded:
-                        await self._resume_generation_after_weight_sync()
+                        await self._resume_workers()
                     if scheduler_paused and (update_succeeded or not generation_paused):
                         if not scheduler_was_paused:
                             self._scheduler.resume()
@@ -1871,7 +1868,7 @@ class ReplicaPool:
                 can_restore_scheduling = update_succeeded or not weight_update_started
                 if effective_strategy == "pause":
                     if generation_paused and update_succeeded:
-                        await self._resume_generation_after_weight_sync()
+                        await self._resume_workers()
                     if scheduler_paused and (update_succeeded or not generation_paused):
                         if not scheduler_was_paused:
                             self._scheduler.resume()
