@@ -16,6 +16,7 @@
 import os
 import sys
 import types
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -23,6 +24,12 @@ import torch
 from arctic_platform.inference.vllm import gdn_batch_invariance
 
 DECODE_ENV = {"VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": "0", "VLLM_GDN_DECODE_KERNEL": "triton"}
+
+
+@pytest.fixture(autouse=True)
+def isolated_environment():
+    with patch.dict(os.environ):
+        yield
 
 
 class _Autotuner:

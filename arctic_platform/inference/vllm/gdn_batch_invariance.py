@@ -15,16 +15,11 @@
 
 """Opt-in: let GatedDeltaNet hybrids run under ``VLLM_BATCH_INVARIANT=1``.
 
-vLLM refuses batch-invariant mode for the GDN backend. Its kernels are
-row-local except for two shape-dependent choices: Triton autotuning in the
-vendored FLA ops, and the gated RMSNorm's rows-per-block tiling. Pinning both
-makes a token's result independent of how many tokens share the call, which
-is what the ``vllm_aligned`` trainer forward relies on. The trainer calls
-:func:`pin_gdn_kernels` too, so both processes run the same tile configs.
-A decoded token also takes fused kernels only when no prefill shares its step
-(packed recurrent decode, and the fused CUDA speculative decode with its norm);
-vLLM's own switches turn both off. Its convolution runs ``causal_conv1d_update``
-alone and ``causal_conv1d_fn`` beside a prefill, which compute a row alike.
+Pin FLA autotuning and gated RMSNorm tiling; the trainer also calls
+:func:`pin_gdn_kernels` to use the same tile configs. Default decode away from
+packed recurrent and fused CUDA speculative paths that depend on co-batching.
+Convolution dispatch and speculative/non-speculative row reclassification remain
+unchanged; these patches alone do not establish end-to-end batch invariance.
 """
 
 import os
