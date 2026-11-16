@@ -756,7 +756,7 @@ for 6.4 GB of savings.
 
 ### How the two are copied
 
-One path, `server/semip_gather.py`: a parallel local copy from this node's
+One path, `semi_persistence/materialize.py`: a parallel local copy from this node's
 mirror into `<model_dir>/.incoming/`. The files of `compilation/` and `image/`
 are planned from the daemon's `_neutrino_manifest.json` (a source with no
 manifest, one placed by hand, is listed by walking it), every file is

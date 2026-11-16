@@ -250,7 +250,7 @@ _INCOMING_NAME = ".incoming"
 # publisher's SKELETON_DIRS, whose order is only its upload order.
 _COPY_SUBDIRS = (_COMPILATION_DIR, _IMAGE_DIR)
 
-# How those directories are copied: semip_gather's parallel ranged copy from
+# How those directories are copied: semi_persistence/materialize.py's parallel ranged copy from
 # the mirror with O_DIRECT writes, ~4 s for GLM-5.3's 79 GB where copytree
 # takes ~20, which also decodes a compressed skeleton's pages. It plans from
 # the daemon's manifest, which every verified mirror directory carries.
@@ -1741,22 +1741,22 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
         # By name rather than `from ... import`: the tests load this module
         # from its file, without the package, and register the gather in
         # sys.modules the same way.
-        semip_gather = importlib.import_module(
-            "arctic_platform.inference.server.semip_gather")
-        fmt = semip_gather.compression_format(verified_dir or source_dir)
-        if fmt > semip_gather.FORMAT:
+        materialize = importlib.import_module(
+            "arctic_platform.inference.semi_persistence.materialize")
+        fmt = materialize.compression_format(verified_dir or source_dir)
+        if fmt > materialize.FORMAT:
             # Every replica reads the same manifest, so even strict is a miss.
             logger.warning(
                 "semi_p: %s: skeleton format %d is newer than this engine, "
                 "which reads format %d; cold-starting", source_dir, fmt,
-                semip_gather.FORMAT)
+                materialize.FORMAT)
             return False
         # The gather keeps the mirror's modes, which is necessary but not
         # sufficient: CRIU re-validates the recorded mode of every path it
         # re-maps, and the source is downstream of S3, which carries no POSIX
         # mode -- so these bytes arrive already flattened to the mirroring
         # daemon's umask. _apply_recorded_modes repairs that after the flip.
-        gathered = semip_gather.gather(
+        gathered = materialize.gather(
             source_dir, verified_dir or source_dir, incoming, _COPY_SUBDIRS)
         files, total = _dir_bytes(incoming)
 

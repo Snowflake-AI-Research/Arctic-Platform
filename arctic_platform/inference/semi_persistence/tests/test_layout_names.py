@@ -41,7 +41,7 @@ _PKG = os.path.dirname(_HERE)                      # .../semi_persistence
 _INFERENCE = os.path.dirname(_PKG)                 # .../arctic_platform/inference
 
 _ENGINE = os.path.join(_INFERENCE, "server", "semip_engine.py")
-_GATHER = os.path.join(_INFERENCE, "server", "semip_gather.py")
+_MATERIALIZE = os.path.join(_INFERENCE, "semi_persistence", "materialize.py")
 _PUBLISH = os.path.join(_PKG, "scripts", "semip_publish.py")
 _INSTANCE = os.path.join(_PKG, "instance.py")
 _CHILD = os.path.join(_PKG, "vllm_child.py")
@@ -295,7 +295,7 @@ def test_the_gather_reads_the_compressed_format_the_publisher_writes():
     materialize's plan, and on the format number reads every skeleton as one
     from a newer engine: a miss on every node, with nothing above WARNING.
     """
-    gather = _literals(_GATHER)
+    gather = _literals(_MATERIALIZE)
     publish = _literals(_PUBLISH)
     for pub, gat in (("COMPRESSED_SUFFIX", "COMPRESSED_SUFFIX"),
                      ("COMPRESSION_INDEX", "INDEX_NAME"),

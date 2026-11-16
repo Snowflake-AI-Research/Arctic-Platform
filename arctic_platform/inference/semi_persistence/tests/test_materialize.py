@@ -1,6 +1,6 @@
 """Unit tests for materializing a published skeleton from the node's mirror.
 
-``server/semip_gather.py`` imports only the standard library, so it is loaded
+``semi_persistence/materialize.py`` imports only the standard library, so it is loaded
 from its file (by ``test_image_cache_key``, under the name the engine imports)
 and driven against a temporary mirror. Compressed skeletons have their own
 tests in ``test_semip_compress.py``; these cover the raw copy every skeleton
@@ -9,7 +9,7 @@ goes through.
 Run from the package directory::
 
     cd arctic_platform/inference/semi_persistence
-    python -m pytest tests/test_semip_gather.py -v
+    python -m pytest tests/test_materialize.py -v
 """
 from __future__ import annotations
 
@@ -26,17 +26,17 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from test_image_cache_key import (  # noqa: E402
-    _fake_published, _fresh_model_dir, _weight_hash_of, _weight_root, se, sg)
+    _fake_published, _fresh_model_dir, _weight_hash_of, _weight_root, se, mat)
 
 _BIG = 300 * 1024 + 17
 
 
 @pytest.fixture(autouse=True)
 def _knobs(monkeypatch):
-    for name in (sg.CHUNK_ENV, sg.THREADS_ENV, sg.VERIFY_ENV, sg.DIRECT_ENV):
+    for name in (mat.CHUNK_ENV, mat.THREADS_ENV, mat.VERIFY_ENV, mat.DIRECT_ENV):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv(sg.CHUNK_ENV, "64Ki")
-    monkeypatch.setenv(sg.THREADS_ENV, "8")
+    monkeypatch.setenv(mat.CHUNK_ENV, "64Ki")
+    monkeypatch.setenv(mat.THREADS_ENV, "8")
 
 
 def _write_manifest(verified_dir: str) -> None:
@@ -45,13 +45,13 @@ def _write_manifest(verified_dir: str) -> None:
         for name in names:
             path = os.path.join(dirpath, name)
             rel = os.path.relpath(path, verified_dir)
-            if rel in (se._VERIFIED_MARKER, sg._MANIFEST):
+            if rel in (se._VERIFIED_MARKER, mat._MANIFEST):
                 continue
             with open(path, "rb") as handle:
                 digest = hashlib.sha256(handle.read()).hexdigest()
             entries.append({"path": rel, "size_bytes": os.path.getsize(path),
                             "sha256": digest})
-    with open(os.path.join(verified_dir, sg._MANIFEST), "w") as handle:
+    with open(os.path.join(verified_dir, mat._MANIFEST), "w") as handle:
         json.dump({"files": entries}, handle)
 
 
@@ -81,7 +81,7 @@ def _tree(root):
 
 
 def _gather(source, incoming, verified=None):
-    return sg.gather(source, verified or source, incoming, se._COPY_SUBDIRS)
+    return mat.gather(source, verified or source, incoming, se._COPY_SUBDIRS)
 
 
 def _same_subdirs(source, incoming):
@@ -109,7 +109,7 @@ def test_plan_takes_one_replicas_subdirs_from_the_key_manifest(tmp_path):
         (key / rel).parent.mkdir(parents=True, exist_ok=True)
         (key / rel).write_bytes(b"x")
     _write_manifest(str(key))
-    files = sg.plan(str(key / "replica1"), str(key), "/inc", se._COPY_SUBDIRS)
+    files = mat.plan(str(key / "replica1"), str(key), "/inc", se._COPY_SUBDIRS)
     assert sorted(f.dest for f in files) == ["/inc/compilation/c",
                                              "/inc/image/a b"]
     assert all(f.src.startswith(str(key / "replica1")) for f in files)
@@ -118,8 +118,8 @@ def test_plan_takes_one_replicas_subdirs_from_the_key_manifest(tmp_path):
 
 def test_plan_without_a_manifest_lists_the_files_as_they_are(tmp_path):
     source = _published(tmp_path, str(tmp_path / "cache" / "k"))
-    os.remove(os.path.join(source, sg._MANIFEST))
-    files = sg.plan(source, source, "/inc", se._COPY_SUBDIRS)
+    os.remove(os.path.join(source, mat._MANIFEST))
+    files = mat.plan(source, source, "/inc", se._COPY_SUBDIRS)
     assert sorted(os.path.relpath(f.dest, "/inc") for f in files) == sorted(
         os.path.relpath(os.path.join(d, n), source)
         for sub in se._COPY_SUBDIRS
@@ -129,36 +129,36 @@ def test_plan_without_a_manifest_lists_the_files_as_they_are(tmp_path):
 
 def test_plan_refuses_compressed_pages_without_a_manifest(tmp_path):
     source = _published(tmp_path, str(tmp_path / "cache" / "k"))
-    os.remove(os.path.join(source, sg._MANIFEST))
-    open(os.path.join(source, "image", sg.INDEX_NAME), "w").close()
+    os.remove(os.path.join(source, mat._MANIFEST))
+    open(os.path.join(source, "image", mat.INDEX_NAME), "w").close()
     with pytest.raises(RuntimeError, match="no _neutrino_manifest.json"):
-        sg.plan(source, source, "/inc", se._COPY_SUBDIRS)
+        mat.plan(source, source, "/inc", se._COPY_SUBDIRS)
 
 
 def test_ranges_are_cut_by_chunk_largest_first():
-    big = sg._File("s", "d", 10, "")
-    small = sg._File("s2", "d2", 3, "")
-    out = sg._ranges([small, big], 4)
+    big = mat._File("s", "d", 10, "")
+    small = mat._File("s2", "d2", 3, "")
+    out = mat._ranges([small, big], 4)
     assert [(r.file.size, r.start, r.end) for r in out] == [
         (10, 0, 4), (10, 4, 8), (3, 0, 3), (10, 8, 10)]
 
 
 def test_chunk_accepts_binary_suffixes(monkeypatch):
-    monkeypatch.setenv(sg.CHUNK_ENV, "64Ki")
-    assert sg._env_int(sg.CHUNK_ENV, 1, sg._parse_bytes) == 65536
-    monkeypatch.setenv(sg.CHUNK_ENV, "lots")
-    assert sg._env_int(sg.CHUNK_ENV, 7, sg._parse_bytes) == 7
+    monkeypatch.setenv(mat.CHUNK_ENV, "64Ki")
+    assert mat._env_int(mat.CHUNK_ENV, 1, mat._parse_bytes) == 65536
+    monkeypatch.setenv(mat.CHUNK_ENV, "lots")
+    assert mat._env_int(mat.CHUNK_ENV, 7, mat._parse_bytes) == 7
 
 
 def test_engine_and_gather_name_the_same_manifest():
-    assert se._DAEMON_MANIFEST == sg._MANIFEST
+    assert se._DAEMON_MANIFEST == mat._MANIFEST
 
 
 def test_direct_writes_only_aligned_heads(tmp_path, monkeypatch):
     """O_DIRECT gets whole blocks at block offsets; the file's tail does not."""
     dest = tmp_path / "f"
-    dest.write_bytes(bytes(3 * sg._ALIGN + 100))
-    out = sg._Writer(str(dest), direct=False)
+    dest.write_bytes(bytes(3 * mat._ALIGN + 100))
+    out = mat._Writer(str(dest), direct=False)
     out.dfd = os.open(dest, os.O_WRONLY)
     calls = []
     real = os.pwrite
@@ -167,16 +167,16 @@ def test_direct_writes_only_aligned_heads(tmp_path, monkeypatch):
         calls.append(("direct" if fd == out.dfd else "plain", len(view), offset))
         return real(fd, view, offset)
 
-    monkeypatch.setattr(sg.os, "pwrite", pwrite)
-    data = os.urandom(2 * sg._ALIGN + 100)
-    out.write(memoryview(data), sg._ALIGN)
+    monkeypatch.setattr(mat.os, "pwrite", pwrite)
+    data = os.urandom(2 * mat._ALIGN + 100)
+    out.write(memoryview(data), mat._ALIGN)
     out.write(memoryview(data[:10]), 7)
     out.close()
-    assert calls == [("direct", 2 * sg._ALIGN, sg._ALIGN),
-                     ("plain", 100, 3 * sg._ALIGN),
+    assert calls == [("direct", 2 * mat._ALIGN, mat._ALIGN),
+                     ("plain", 100, 3 * mat._ALIGN),
                      ("plain", 10, 7)]
     body = dest.read_bytes()
-    assert body[sg._ALIGN:] == data and body[7:17] == data[:10]
+    assert body[mat._ALIGN:] == data and body[7:17] == data[:10]
 
 
 # --------------------------------------------------------------------------
@@ -198,13 +198,13 @@ def test_gather_matches_the_mirror(tmp_path):
 
 def test_every_chunk_is_its_own_range(tmp_path, monkeypatch):
     source = _published(tmp_path, str(tmp_path / "cache" / "k"))
-    monkeypatch.setenv(sg.CHUNK_ENV, "1000")
+    monkeypatch.setenv(mat.CHUNK_ENV, "1000")
     incoming = str(tmp_path / "incoming")
     stats = _gather(source, incoming)
     _same_subdirs(source, incoming)
     # 1000 rounds up to one 4 KiB block per range.
     assert stats.ranges == sum(
-        -(-os.path.getsize(os.path.join(d, n)) // sg._ALIGN)
+        -(-os.path.getsize(os.path.join(d, n)) // mat._ALIGN)
         for sub in se._COPY_SUBDIRS
         for d, _, names in os.walk(os.path.join(source, sub)) for n in names)
 
@@ -221,15 +221,15 @@ def test_only_sha256_sees_wrong_bytes_of_the_right_size(tmp_path, monkeypatch):
     source = _published(tmp_path, str(tmp_path / "cache" / "k"))
     _overwrite(os.path.join(source, "image", "pages-1.img"), 100, b"\xff" * 8)
     _gather(source, str(tmp_path / "size"))
-    monkeypatch.setenv(sg.VERIFY_ENV, "sha256")
+    monkeypatch.setenv(mat.VERIFY_ENV, "sha256")
     with pytest.raises(RuntimeError, match="fail their manifest sha256"):
         _gather(source, str(tmp_path / "sha256"))
 
 
 def test_sha256_needs_a_manifest(tmp_path, monkeypatch):
     source = _published(tmp_path, str(tmp_path / "cache" / "k"))
-    os.remove(os.path.join(source, sg._MANIFEST))
-    monkeypatch.setenv(sg.VERIFY_ENV, "sha256")
+    os.remove(os.path.join(source, mat._MANIFEST))
+    monkeypatch.setenv(mat.VERIFY_ENV, "sha256")
     with pytest.raises(RuntimeError, match="no manifest sha256"):
         _gather(source, str(tmp_path / "incoming"))
 
@@ -270,7 +270,7 @@ def test_materialize_runs_under_a_short_switch_interval(tmp_path, monkeypatch):
     model_dir = _fresh_model_dir(str(tmp_path))
     source = _published(tmp_path, model_dir)
     seen = {}
-    real_gather, real_walk = sg.gather, se._newest_mtime
+    real_gather, real_walk = mat.gather, se._newest_mtime
 
     def gather(*a, **k):
         seen["gather"] = sys.getswitchinterval()
@@ -280,7 +280,7 @@ def test_materialize_runs_under_a_short_switch_interval(tmp_path, monkeypatch):
         seen["walk"] = sys.getswitchinterval()
         return real_walk(*a, **k)
 
-    monkeypatch.setattr(sg, "gather", gather)
+    monkeypatch.setattr(mat, "gather", gather)
     monkeypatch.setattr(se, "_newest_mtime", walk)
     before = sys.getswitchinterval()
     assert se._materialize_from_source(
@@ -318,7 +318,7 @@ def test_a_shorter_switch_interval_is_left_alone():
 def test_materialize_without_a_manifest_still_copies(tmp_path, caplog):
     model_dir = _fresh_model_dir(str(tmp_path))
     source = _published(tmp_path, model_dir)
-    os.remove(os.path.join(source, sg._MANIFEST))
+    os.remove(os.path.join(source, mat._MANIFEST))
     assert " range(s) over " in _materialized_line(caplog, source, model_dir)
 
 
@@ -334,7 +334,7 @@ def test_a_failed_gather_is_a_cold_start_unless_strict(tmp_path, monkeypatch):
     model_dir = _fresh_model_dir(str(tmp_path))
     source = _published(tmp_path, model_dir)
     _overwrite(os.path.join(source, "image", "pages-1.img"), 0, b"\0" * 8)
-    monkeypatch.setenv(sg.VERIFY_ENV, "sha256")
+    monkeypatch.setenv(mat.VERIFY_ENV, "sha256")
     args = (source, model_dir, _weight_root(source), _weight_hash_of(source))
     assert se._materialize_from_source(*args) is False
     assert not os.path.exists(os.path.join(model_dir, "image", "meta.json"))

@@ -1,7 +1,7 @@
 """Compressed skeleton pages: publish, node mirror, decompressing gather.
 
 ``semip_publish.py`` compresses a dump's ``image/pages-<N>.img`` files into
-``.zst`` frames at publish; ``semip_gather.py`` decodes them back when a node
+``.zst`` frames at publish; ``materialize.py`` decodes them back when a node
 materializes the skeleton. Both are stdlib-only (libzstd through ctypes), so
 the round trip runs here for real: a bucket stand-in performs every ``aws s3
 cp`` the publisher issues into a local directory, that directory is the node's
@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from test_image_cache_key import BASE_CONFIG, KEY, SLUG, se  # noqa: E402
 from test_publish_layout import _Bucket, sp  # noqa: E402
-from test_semip_gather import sg  # noqa: E402
+from test_materialize import mat  # noqa: E402
 
 if sp._load_zstd()[0] is None:
     pytest.skip("libzstd is not loadable here", allow_module_level=True)
@@ -204,7 +204,7 @@ def _mirror(bucket: _FileBucket, key: str) -> str:
 
 
 def _manifest(source: str) -> dict:
-    with open(os.path.join(source, sg._MANIFEST)) as handle:
+    with open(os.path.join(source, mat._MANIFEST)) as handle:
         return json.load(handle)
 
 
@@ -252,11 +252,11 @@ def _untouched(target: str) -> None:
 
 @pytest.fixture(autouse=True)
 def _defaults(monkeypatch):
-    for name in (sg.VERIFY_ENV, sg.THREADS_ENV, sg.DIRECT_ENV,
+    for name in (mat.VERIFY_ENV, mat.THREADS_ENV, mat.DIRECT_ENV,
                  sp.COMPRESS_ENV):
         monkeypatch.delenv(name, raising=False)
     # Two frames per range, so files span several ranges and threads.
-    monkeypatch.setenv(sg.CHUNK_ENV, "2Mi")
+    monkeypatch.setenv(mat.CHUNK_ENV, "2Mi")
 
 
 @pytest.fixture
@@ -320,7 +320,7 @@ def test_the_format_marker_and_index(published):
     dumped, _, source, _, _ = published
     manifest = _manifest(source)
     block = manifest["compression"]
-    assert block["format"] == sp.COMPRESSION_FORMAT == sg.FORMAT
+    assert block["format"] == sp.COMPRESSION_FORMAT == mat.FORMAT
     assert block["codec"] == "zstd" and block["level"] == 1
     assert block["frame_bytes"] == F and block["index"] == sp.COMPRESSION_INDEX
     assert block["stored_total_bytes"] == manifest["total_bytes"]
@@ -525,7 +525,7 @@ def test_a_compressed_skeleton_restores_byte_for_byte(published, caplog):
         assert _materialize(source, target)
     _restored_like_the_dump(dumped, target)
     image = set(os.listdir(os.path.join(target, "image")))
-    assert not any(n.endswith(sg.COMPRESSED_SUFFIX) for n in image)
+    assert not any(n.endswith(mat.COMPRESSED_SUFFIX) for n in image)
     assert sp.COMPRESSION_INDEX not in image
     line = _materialized_line(caplog)
     assert "; pages: " in line and "GiB stored -> " in line
@@ -535,13 +535,13 @@ def test_a_compressed_skeleton_restores_byte_for_byte(published, caplog):
 def test_zero_frames_are_never_written(published, monkeypatch):
     dumped, target, source, _, _ = published
     writes = []
-    real = sg._Writer.write
+    real = mat._Writer.write
 
     def spy(self, view, offset):
         writes.append((os.fstat(self.fd).st_ino, offset, len(view)))
         return real(self, view, offset)
 
-    monkeypatch.setattr(sg._Writer, "write", spy)
+    monkeypatch.setattr(mat._Writer, "write", spy)
     assert _materialize(source, target)
     _restored_like_the_dump(dumped, target)
     inode = {name: os.stat(os.path.join(target, "image", name)).st_ino
@@ -564,7 +564,7 @@ def test_every_file_is_reserved_at_its_full_raw_size(published, monkeypatch):
         reserved[os.fstat(fd).st_ino] = (offset, length)
         os.ftruncate(fd, offset + length)
 
-    monkeypatch.setattr(sg.os, "posix_fallocate", fallocate, raising=False)
+    monkeypatch.setattr(mat.os, "posix_fallocate", fallocate, raising=False)
     assert _materialize(source, target)
     _restored_like_the_dump(dumped, target)
     for n in (1, 2, 3, 4):
@@ -575,7 +575,7 @@ def test_every_file_is_reserved_at_its_full_raw_size(published, monkeypatch):
 def test_gather_stats_account_for_every_raw_byte(published):
     dumped, target, source, _, _ = published
     incoming = os.path.join(target, "inc")
-    stats = sg.gather(source, source, incoming, se._COPY_SUBDIRS)
+    stats = mat.gather(source, source, incoming, se._COPY_SUBDIRS)
     zero = 6 * F
     nonzero = sum(len(PAGES[f"pages-{n}.img"]) for n in (1, 2, 3, 4)) - zero
     assert stats.compressed_files == 4
@@ -589,7 +589,7 @@ def test_gather_stats_account_for_every_raw_byte(published):
 
 def test_sha256_mode_checks_the_raw_hash(published, monkeypatch):
     dumped, target, source, _, _ = published
-    monkeypatch.setenv(sg.VERIFY_ENV, "sha256")
+    monkeypatch.setenv(mat.VERIFY_ENV, "sha256")
     assert _materialize(source, target)
     _restored_like_the_dump(dumped, target)
 
@@ -613,7 +613,7 @@ def _wrong_raw_hash(source: str) -> None:
         for row in doc["files"]:
             if row["path"] == "image/pages-2.img.zst":
                 row["raw_sha256"] = "0" * 64
-    _rewrite(source, sg._MANIFEST, edit)
+    _rewrite(source, mat._MANIFEST, edit)
 
 
 @pytest.mark.parametrize("damage,verify", [
@@ -625,7 +625,7 @@ def test_damage_fails_before_the_flip(published, monkeypatch, damage, verify):
     _, target, source, _, _ = published
     damage(source)
     if verify:
-        monkeypatch.setenv(sg.VERIFY_ENV, verify)
+        monkeypatch.setenv(mat.VERIFY_ENV, verify)
     assert _materialize(source, target) is False
     _untouched(target)
     with pytest.raises(RuntimeError, match="materializing"):
@@ -637,7 +637,7 @@ def test_a_corrupt_frame_names_the_file_frame_and_offset(published):
     _, target, source, _, _ = published
     _flip_a_byte(source)
     with pytest.raises(RuntimeError) as err:
-        sg.gather(source, source, os.path.join(target, "inc"),
+        mat.gather(source, source, os.path.join(target, "inc"),
                   se._COPY_SUBDIRS)
     assert "pages-2.img.zst: frame " in str(err.value)
     assert "raw offset" in str(err.value)
@@ -659,7 +659,7 @@ def test_without_libzstd_a_compressed_skeleton_is_a_miss(published,
         raise RuntimeError("this skeleton is compressed and libzstd cannot be "
                            "loaded (test)")
 
-    monkeypatch.setattr(sg, "_load_zstd", missing)
+    monkeypatch.setattr(mat, "_load_zstd", missing)
     assert _materialize(source, target) is False
     _untouched(target)
 
@@ -711,12 +711,12 @@ def _missing_entry(doc):
 
 
 @pytest.mark.parametrize("path,edit,message", [
-    (sg._MANIFEST, _drop_index_row, "but not its index"),
-    (sg._MANIFEST, _drop_block, "no 'compression' block"),
-    (sg._MANIFEST, _block_only, "no compressed rows"),
-    (sg._MANIFEST, _list_raw_too, "both raw and compressed"),
-    (sg._MANIFEST, _odd_frames, "unusable 'compression' block"),
-    (sg._MANIFEST, _wrong_raw_size, "disagrees with its manifest row"),
+    (mat._MANIFEST, _drop_index_row, "but not its index"),
+    (mat._MANIFEST, _drop_block, "no 'compression' block"),
+    (mat._MANIFEST, _block_only, "no compressed rows"),
+    (mat._MANIFEST, _list_raw_too, "both raw and compressed"),
+    (mat._MANIFEST, _odd_frames, "unusable 'compression' block"),
+    (mat._MANIFEST, _wrong_raw_size, "disagrees with its manifest row"),
     (f"image/{sp.COMPRESSION_INDEX}", _short_frame_table,
      "disagrees with its manifest row"),
     (f"image/{sp.COMPRESSION_INDEX}", _frame_sum,
@@ -728,7 +728,7 @@ def test_plan_refuses_an_inconsistent_skeleton(published, path, edit, message):
     _, target, source, _, _ = published
     _rewrite(source, path, edit)
     with pytest.raises(RuntimeError, match=message):
-        sg.plan(source, source, os.path.join(target, "inc"),
+        mat.plan(source, source, os.path.join(target, "inc"),
                 se._COPY_SUBDIRS)
     assert _materialize(source, target) is False
     _untouched(target)
@@ -737,10 +737,10 @@ def test_plan_refuses_an_inconsistent_skeleton(published, path, edit, message):
 def test_a_newer_format_is_a_miss_before_any_copy(published, monkeypatch,
                                                   caplog):
     _, target, source, _, _ = published
-    _rewrite(source, sg._MANIFEST,
+    _rewrite(source, mat._MANIFEST,
              lambda doc: doc["compression"].update(format=2))
     called = []
-    monkeypatch.setattr(sg, "gather", lambda *a, **k: called.append(a))
+    monkeypatch.setattr(mat, "gather", lambda *a, **k: called.append(a))
     with caplog.at_level(logging.INFO, logger=se.logger.name):
         assert _materialize(source, target, strict=True) is False
     assert not called
@@ -753,7 +753,7 @@ def test_a_compressed_skeleton_without_a_manifest_is_a_miss(published,
                                                             caplog):
     """Without the manifest there is no frame table: never copy the .zst."""
     _, target, source, _, _ = published
-    os.remove(os.path.join(source, sg._MANIFEST))
+    os.remove(os.path.join(source, mat._MANIFEST))
     with caplog.at_level(logging.INFO, logger=se.logger.name):
         assert _materialize(source, target) is False
     _untouched(target)
@@ -784,9 +784,9 @@ def test_the_stock_cli_decodes_a_stored_file(published):
 def test_the_ranges_skip_zero_frames_and_go_largest_first():
     zero = bytes([1, 0, 0, 1, 0, 0, 0, 0, 0, 1])
     offsets = list(range(0, 11))
-    f = sg._File("s", "d", 10 * F - 7, "", sg._Frames(F, offsets, zero))
-    raw = sg._File("r", "rd", 3, "")
-    out = sg._ranges([raw, f], 4 * F)
+    f = mat._File("s", "d", 10 * F - 7, "", mat._Frames(F, offsets, zero))
+    raw = mat._File("r", "rd", 3, "")
+    out = mat._ranges([raw, f], 4 * F)
     assert [(r.start // F, -(-r.end // F)) for r in out[:-1]] == [
         (4, 8), (1, 3), (8, 9)]
     assert out[-1].file is raw and out[-1].end == 3

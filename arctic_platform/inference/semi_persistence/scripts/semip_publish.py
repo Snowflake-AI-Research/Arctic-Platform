@@ -183,7 +183,7 @@ _RENDEZVOUS_TIMEOUT_S = 3600.0
 # the engine rebuilds. Each such image directory gets a COMPRESSION_INDEX with
 # the frame table, published as an ordinary raw row; a top-level
 # "compression" block in the skeleton manifest marks the format. The
-# spellings are pinned to semip_gather's by tests/test_layout_names.py.
+# spellings are pinned to materialize.py's by tests/test_layout_names.py.
 #
 # On unless SEMIP_PUBLISH_COMPRESS=0. The engine reads both formats.
 COMPRESS_ENV = "SEMIP_PUBLISH_COMPRESS"
