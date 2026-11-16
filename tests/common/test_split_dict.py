@@ -52,7 +52,7 @@ class TestSplitDictRemainder(TestCasePlus):
                 "attention_mask": torch.ones(4, 2, dtype=torch.long),
                 "rollout_is_weights": weights,
             },
-            "meta": {},
+            "meta": {"balance_batch": False},
             "processing": {"loss_fn": "verl_grpo"},
         }
         shards, _ = _split_batch(envelope, num_workers=2)
@@ -67,7 +67,12 @@ class TestSplitDictRemainder(TestCasePlus):
                 "input_ids": torch.arange(8).view(4, 2),
                 "attention_mask": torch.ones(4, 2, dtype=torch.long),
             },
-            "meta": {"rollout_is_weights": weights, "advantages": advantages, "dp_size": 2},
+            "meta": {
+                "rollout_is_weights": weights,
+                "advantages": advantages,
+                "dp_size": 2,
+                "balance_batch": False,
+            },
             "processing": {"loss_fn": "ap_grpo"},
         }
         shards, _ = _split_batch(envelope, num_workers=2)
@@ -77,6 +82,21 @@ class TestSplitDictRemainder(TestCasePlus):
         self.assertEqual(shards[0]["batch"]["rollout_is_weights"].tolist(), [0.0, 1.0])
         self.assertEqual(shards[1]["batch"]["rollout_is_weights"].tolist(), [2.0, 3.0])
         self.assertEqual(shards[0]["batch"]["advantages"].tolist(), [[0.0, 1.0], [2.0, 3.0]])
+
+    def test_sample_length_balance_pairs_a_long_row_with_a_short_one(self):
+        mask = torch.tensor(
+            [[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0, 0, 0], [1, 1, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0]],
+            dtype=torch.long,
+        )
+        envelope = {
+            "batch": {"input_ids": torch.arange(32).view(4, 8), "attention_mask": mask},
+            "meta": {},
+            "processing": {"loss_fn": "verl_grpo"},
+        }
+        shards, reorder = _split_batch(envelope, num_workers=2)
+        self.assertEqual(reorder, [0, 3, 1, 2])
+        self.assertEqual(shards[0]["batch"]["input_ids"][:, 0].tolist(), [0, 24])
+        self.assertEqual(shards[1]["batch"]["input_ids"][:, 0].tolist(), [8, 16])
 
     def test_none_rollout_is_weights_stays_in_meta(self):
         """SkyRL overlay sends rollout_is_weights=None; promoting it 500s the worker."""
@@ -112,6 +132,7 @@ class TestSplitDictRemainder(TestCasePlus):
                 "loss_mask": loss_mask,
                 "prompt_group_ids": torch.tensor([7, 7, 8, 8]),
                 "max_prompt_len": 3,
+                "balance_batch": False,
             },
             "processing": {"loss_fn": "ap_grpo"},
         }
@@ -119,11 +140,11 @@ class TestSplitDictRemainder(TestCasePlus):
         self.assertIn("advantages", batch_data)
         self.assertIn("loss_mask", batch_data)
         self.assertIn("prompt_group_ids", batch_data)
-        self.assertEqual(meta_data, {"max_prompt_len": 3})
+        self.assertEqual(meta_data, {"max_prompt_len": 3, "balance_batch": False})
         shards, _ = _split_batch(envelope, num_workers=2)
         self.assertEqual(shards[0]["batch"]["prompt_group_ids"].tolist(), [7, 7])
         self.assertEqual(shards[1]["batch"]["prompt_group_ids"].tolist(), [8, 8])
-        self.assertEqual(shards[0]["meta"], {"max_prompt_len": 3, "dp_size": 2})
+        self.assertEqual(shards[0]["meta"], {"max_prompt_len": 3, "balance_batch": False, "dp_size": 2})
 
     def test_zero_dim_temperature_replicates_across_dp(self):
         envelope = {
