@@ -23,7 +23,8 @@ is what the ``vllm_aligned`` trainer forward relies on. The trainer calls
 :func:`pin_gdn_kernels` too, so both processes run the same tile configs.
 A decoded token also takes fused kernels only when no prefill shares its step
 (packed recurrent decode, and the fused CUDA speculative decode with its norm);
-vLLM's own switches turn both off, so it runs the kernels a mixed step runs.
+vLLM's own switches turn both off. Its convolution runs ``causal_conv1d_update``
+alone and ``causal_conv1d_fn`` beside a prefill, which compute a row alike.
 """
 
 import os

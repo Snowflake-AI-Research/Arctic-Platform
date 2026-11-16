@@ -96,7 +96,7 @@ def test_patch_is_opt_in(fake_modules, monkeypatch):
     assert {name: os.environ[name] for name in DECODE_ENV} == DECODE_ENV
 
 
-def test_a_decoded_token_takes_the_same_gdn_kernels_with_or_without_a_prefill_in_its_step(monkeypatch):
+def test_a_decoded_token_reaches_the_same_recurrent_kernel_with_or_without_a_prefill_in_its_step(monkeypatch):
     """vLLM's GDN core, its kernels recorded: decodes alone and beside a prefill reach one recurrent kernel."""
     import vllm.envs as envs
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
