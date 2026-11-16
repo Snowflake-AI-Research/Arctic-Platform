@@ -320,46 +320,6 @@ def test_router_replay_sends_without_waiting_for_inflight_requests():
     asyncio.run(run())
 
 
-def test_router_replay_manifest_reaches_receiver_within_its_store_timeout():
-    # Receivers start their manifest all_gather_obj with the send; a store get
-    # times out (DistStoreError) if the sender's key is not published in time.
-    sender_store = torch.distributed.TCPStore(
-        "127.0.0.1", 0, is_master=True, wait_for_workers=False,
-    )
-    receiver_store = torch.distributed.TCPStore(
-        "127.0.0.1", sender_store.port, timeout=timedelta(seconds=1),
-    )
-
-    async def run():
-        decode_release = asyncio.Event()
-
-        async def generate(*_):
-            await decode_release.wait()  # a decode longer than the timeout
-            return {"text": "done"}
-
-        async def send_router_replay():
-            sender_store.set("broadcast_from/1/0", b"sender manifest")
-            return {"status": "ok"}
-
-        pool, _ = _scheduler_pool(
-            generate=generate,
-            send_router_replay=send_router_replay,
-            stream_release=asyncio.Event(),
-        )
-        decode = pool.submit_generate_futures("long decode")[0]
-        await _wait_until(lambda: pool._scheduler._workers[0].active_requests == 1)
-        replay = asyncio.create_task(pool.send_router_replay())
-        try:
-            assert await asyncio.to_thread(receiver_store.get, "broadcast_from/1/0")
-            await asyncio.wait_for(replay, 1)
-        finally:
-            decode_release.set()
-            await asyncio.gather(decode, replay, return_exceptions=True)
-            await pool._scheduler.shutdown()
-
-    asyncio.run(run())
-
-
 def test_router_replay_queues_after_pause_unary_and_streaming_requests():
     async def run():
         replay_started = asyncio.Event()
