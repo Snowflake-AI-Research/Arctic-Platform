@@ -2560,6 +2560,16 @@ _DUMP_REAP_TIMEOUT_S = 60.0
 # been SIGKILLed, so anything still alive is wedged rather than slow.
 _ORPHAN_SWEEP_TIMEOUT_S = 10.0
 
+# Teardown's bound, longer than the dump's.  There the tree is SIGKILLed with
+# its CUDA contexts still live, and a rank stays alive until the driver has
+# torn its context down: on an Inkling-2-Small TP=8 engine, 7 of 8 ranks
+# outlived a 5 s sweep.  They then outlived the worker too, went to a PID 1
+# that never reaps, and held the restored leader's sid, so the same image
+# could not be restored in that pod again ("Can't fork for <pid>: File
+# exists").  The sweep returns as soon as the last one is reaped, so a tree
+# that goes down quickly pays nothing for the longer bound.
+_TEARDOWN_SWEEP_TIMEOUT_S = 60.0
+
 # prctl(2).  Absent from the stdlib; Linux 3.4+, and needs no privilege.
 _PR_SET_CHILD_SUBREAPER = 36
 
@@ -2632,9 +2642,10 @@ def _reap_orphaned_descendants(log, timeout_s=_ORPHAN_SWEEP_TIMEOUT_S):
     leader's -- and the last one frees it.
 
     Runs until ``waitpid`` reports no children left, since that is the only
-    answer that means the tree is fully collected.  Bounded, because by the
-    time this runs the tree has been SIGKILLed: a task still alive is wedged,
-    and must not strand a dump whose image is already on disk.
+    answer that means the tree is fully collected.  Bounded so a wedged task
+    cannot strand the caller -- a dump whose image is already on disk, or a
+    teardown -- and the caller picks the bound: see
+    ``_TEARDOWN_SWEEP_TIMEOUT_S`` for why teardown waits longer.
 
     Returns the pids reaped.  Never raises.
     """
@@ -2653,10 +2664,15 @@ def _reap_orphaned_descendants(log, timeout_s=_ORPHAN_SWEEP_TIMEOUT_S):
             # its way down.  Poll rather than block: WNOHANG is the whole
             # point, so a wedged task costs the deadline and nothing more.
             if time.monotonic() - t0 >= timeout_s:
+                # Named, with their states, because these are the tasks that
+                # will hold recorded ids if PID 1 does not reap them: a D
+                # here is a rank still inside the driver.
+                left = ", ".join(f"{p}:{s}" for p, s in
+                                 _proc_children(os.getpid())) or "?"
                 log.warning(
-                    "  orphan sweep gave up after %.0fs with a live "
-                    "descendant left; it may still reference recorded ids",
-                    timeout_s)
+                    "  orphan sweep gave up after %.1fs (reaped %d) with "
+                    "live descendant(s) left: %s; they may still reference "
+                    "recorded ids", time.monotonic() - t0, len(reaped), left)
                 break
             time.sleep(0.02)
             continue
@@ -2665,8 +2681,33 @@ def _reap_orphaned_descendants(log, timeout_s=_ORPHAN_SWEEP_TIMEOUT_S):
         shown = ", ".join(str(p) for p in reaped[:12])
         if len(reaped) > 12:
             shown += ", ..."
-        log.info("  reaped %d orphaned descendant(s): %s", len(reaped), shown)
+        log.info("  reaped %d orphaned descendant(s) in %.1fs: %s",
+                 len(reaped), time.monotonic() - t0, shown)
     return reaped
+
+
+def _proc_children(ppid, proc="/proc"):
+    """``(pid, state)`` of every task whose parent is *ppid*, sorted by pid.
+
+    Read from field 4 (ppid) and field 3 (state) of each ``/proc/<pid>/stat``,
+    parsed after the last ')' since ``comm`` can contain parens.
+    """
+    kids = []
+    try:
+        entries = os.listdir(proc)
+    except OSError:
+        return kids
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"{proc}/{entry}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            if int(fields[1]) == ppid:
+                kids.append((int(entry), fields[0]))
+        except (OSError, IndexError, ValueError):
+            continue                   # exited while we walked it
+    return sorted(kids)
 
 
 # ---------------------------------------------------------------------------
@@ -2892,9 +2933,8 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
             # Collect them while we still can: once this worker exits they go
             # to PID 1, and if it does not reap they hold their ids, and the
             # ids naming their group and session, for the life of the pod.
-            # Shorter bound than the dump's: teardown latency is visible to
-            # the orchestrator, and the tree has already been SIGKILLed.
-            _reap_orphaned_descendants(log, timeout_s=5.0)
+            # Instance._reset waits out this bound before it kills us.
+            _reap_orphaned_descendants(log, timeout_s=_TEARDOWN_SWEEP_TIMEOUT_S)
             break
 
         if cmd == "exit":
@@ -2910,7 +2950,7 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
                     child_proc.join(timeout=5)
             _kill_pidns_holder(ns_holder, log)
             ns_holder = None
-            _reap_orphaned_descendants(log, timeout_s=5.0)
+            _reap_orphaned_descendants(log, timeout_s=_TEARDOWN_SWEEP_TIMEOUT_S)
             result_queue.put(("exit", 0.0, None, {}))
             break
 

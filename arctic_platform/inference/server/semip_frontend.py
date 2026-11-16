@@ -47,7 +47,8 @@ def _teardown(inst: Any, agents: list[Any]) -> None:
             # holding the entire GPU. That is exactly what a restored tree
             # does: criu_restore sets child_proc=None, so worker_loop's
             # force-kill branch is skipped and this handler is the only
-            # thing that reaps it. Bounded by the worker's own 30s/5s joins.
+            # thing that reaps it. Bounded by the worker's own 30s/5s joins
+            # and its orphan sweep (worker._TEARDOWN_SWEEP_TIMEOUT_S).
             inst.wait()
         except Exception:  # pragma: no cover - best effort
             logger.warning("semi_p: teardown failed", exc_info=True)

@@ -40,7 +40,7 @@ import torch.multiprocessing as mp
 import mq_plane
 import semip_logging
 from demuxer import Demuxer
-from worker import worker_loop
+from worker import _TEARDOWN_SWEEP_TIMEOUT_S, worker_loop
 
 _spawn_ctx = mp.get_context("spawn")
 
@@ -248,7 +248,11 @@ class Instance:
     def _reset(self):
         """Reset instance to created state after teardown completes."""
         if self._worker is not None:
-            self._worker.join(timeout=10)
+            # The teardown result arrives before the worker's orphan sweep,
+            # so outlast its bound: killed mid-sweep, the worker hands the
+            # tree's stragglers to a PID 1 that may never reap them.  It
+            # exits as soon as the sweep ends, so this is a bound, not a wait.
+            self._worker.join(timeout=_TEARDOWN_SWEEP_TIMEOUT_S + 10)
             if self._worker.is_alive():
                 self.log.warning("worker still alive after join, force-killing")
                 try:
