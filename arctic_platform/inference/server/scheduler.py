@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Hashable
 
 import ray
+from vllm.v1.engine.exceptions import EngineDeadError
 from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
 from arctic_platform.inference.server.token_prompts import is_token_tensor
@@ -42,6 +43,7 @@ class _Request:
     sticky: bool = False
     worker_idx: int | None = None
     created_at: float = field(default_factory=time.time)
+    rerouted: bool = False
 
 
 @dataclass
@@ -493,10 +495,13 @@ class Scheduler:
             req.future.set_exception(exc)
             return True
         ws.inflight.add(future)
-        future.add_done_callback(functools.partial(self._done, req, ws, time.time()))
+        future.add_done_callback(functools.partial(self._done, req, ws, ws.handle, time.time()))
         return True
 
-    def _done(self, req: _Request, ws: WorkerState, submitted_time: float, future: asyncio.Future) -> None:
+    def _done(
+        self, req: _Request, ws: WorkerState, handle: ray.actor.ActorHandle, submitted_time: float,
+        future: asyncio.Future,
+    ) -> None:
         ws.inflight.discard(future)
         ws.active_requests -= 1
         if future.cancelled():
@@ -506,7 +511,16 @@ class Scheduler:
                 "Worker %d generate failed for request %d: %s: %s",
                 req.worker_idx, req.id, type(error).__name__, error, exc_info=error,
             )
-        if error is not None:
+        dead = (error is not None and not self._stopped
+                and isinstance(error, (ray.exceptions.ActorDiedError, EngineDeadError)))
+        # A late failure from an old actor must not quarantine its replacement.
+        if dead and ws.handle is handle:
+            ws.quarantine()
+        # Re-route once: a request that itself kills engines must not walk through every replica.
+        if dead and not req.rerouted and not all(w.quarantined for w in self._workers):
+            req.rerouted = True
+            self._waiting.appendleft(req)
+        elif error is not None:
             if not req.future.done():
                 req.future.set_exception(error)
         else:
