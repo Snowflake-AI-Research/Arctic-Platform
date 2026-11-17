@@ -24,7 +24,7 @@ live in the [project README](../README.md).
 | Doc | Contents |
 |-----|----------|
 | [**SFT**](sft.md) | Supervised fine-tuning — CPU client, wire batch, `sft` vs `sft_ce`, config |
-| [**RL**](rl.md) | Reinforcement learning — engines, client API, ZoRRo Train / Inference, integrations |
+| [**RL**](rl.md) | Reinforcement learning — engines, client API, ZoRRo, prompt-deduplicated packets, integrations |
 | [**Common**](common.md) | Shared server infra — HTTP CLI, jobs/endpoints, DeepSpeed worker, metrics, env |
 
 ## Quick paths

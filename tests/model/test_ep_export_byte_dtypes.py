@@ -15,8 +15,10 @@
 
 """EP export gathers every dtype as exact bytes, including ones the backend has no type for (e8m0, packed fp4)."""
 
+import gc
 import os
 import tempfile
+import weakref
 from datetime import timedelta
 
 import pytest
@@ -62,26 +64,37 @@ def _worker(rank: int, rendezvous: str, gather_bytes: int, out_dir: str) -> None
     dist.init_process_group(
         "gloo", init_method=rendezvous, rank=rank, world_size=_WORLD, timeout=timedelta(seconds=120)
     )
-    integration._EXPORT_GATHER_BYTES = gather_bytes
-    ds_groups._EXPERT_PARALLEL_GROUP[f"ep_size_{_WORLD}"] = dist.group.WORLD
-    model = _Model(rank)
-    for parameter in model.parameters():
-        parameter.group_name = f"ep_size_{_WORLD}"
-        parameter.allreduce = False
+    group_ref = weakref.ref(dist.group.WORLD)
+    group_name = f"ep_size_{_WORLD}"
+    previous_gather_bytes = integration._EXPORT_GATHER_BYTES
+    try:
+        integration._EXPORT_GATHER_BYTES = gather_bytes
+        ds_groups._EXPERT_PARALLEL_GROUP[group_name] = dist.group.WORLD
+        model = _Model(rank)
+        for parameter in model.parameters():
+            parameter.group_name = group_name
+            parameter.allreduce = False
 
-    exported = dict(integration.build_iter_full_hf_weights(model)(include_skipped=True))
-    if rank == 0:
-        shards = [_Model(r).model.layers[0].mlp.experts for r in range(_WORLD)]
-        assert sorted(exported) == sorted(f"model.layers.0.mlp.experts.{name}_scale" for name in _DTYPES)
-        for name in _DTYPES:
-            expected = torch.cat([getattr(shard, f"{name}_scale").data.view(torch.uint8) for shard in shards])
-            actual = exported[f"model.layers.0.mlp.experts.{name}_scale"]
-            assert actual.dtype == getattr(torch, name), name
-            assert torch.equal(actual.view(torch.uint8), expected), name
-        open(os.path.join(out_dir, "ok"), "w").close()
-    else:
-        assert exported == {}
-    dist.destroy_process_group()
+        exported = dict(integration.build_iter_full_hf_weights(model)(include_skipped=True))
+        if rank == 0:
+            shards = [_Model(r).model.layers[0].mlp.experts for r in range(_WORLD)]
+            assert sorted(exported) == sorted(f"model.layers.0.mlp.experts.{name}_scale" for name in _DTYPES)
+            for name in _DTYPES:
+                expected = torch.cat([getattr(shard, f"{name}_scale").data.view(torch.uint8) for shard in shards])
+                actual = exported[f"model.layers.0.mlp.experts.{name}_scale"]
+                assert actual.dtype == getattr(torch, name), name
+                assert torch.equal(actual.view(torch.uint8), expected), name
+            open(os.path.join(out_dir, "ok"), "w").close()
+        else:
+            assert exported == {}
+    finally:
+        # Otherwise DeepSpeed retains Gloo's threads until interpreter shutdown.
+        ds_groups._EXPERT_PARALLEL_GROUP.pop(group_name, None)
+        dist.destroy_process_group()
+        integration._EXPORT_GATHER_BYTES = previous_gather_bytes
+    # An active exception traceback can still retain the iterator's local group.
+    gc.collect()
+    assert group_ref() is None, "the test-owned Gloo group must be released before interpreter shutdown"
 
 
 @pytest.mark.parametrize("gather_bytes", [1 << 30, 2 * _COLS * _WORLD], ids=["one_gather", "row_slices"])
@@ -89,3 +102,41 @@ def test_ep_export_gathers_backend_unsupported_dtypes_as_bytes(gather_bytes: int
     with tempfile.TemporaryDirectory() as tmp:
         mp.spawn(_worker, args=(f"file://{tmp}/rendezvous", gather_bytes, tmp), nprocs=_WORLD, join=True)
         assert os.path.exists(os.path.join(tmp, "ok"))
+
+
+def _failed_export_worker(rank: int, rendezvous: str, failure_stage: str) -> None:
+    import deepspeed.utils.groups as ds_groups
+
+    import arctic_platform.model.implementations.moe.deepspeed_integration as integration
+
+    group_refs = []
+    previous_gather_bytes = integration._EXPORT_GATHER_BYTES
+
+    def fail_export(_model):
+        group_refs.append(weakref.ref(dist.group.WORLD))
+        raise RuntimeError("injected export failure")
+
+    def fail_gather(_tensor, ep_group, **_kwargs):
+        group_refs.append(weakref.ref(ep_group))
+        raise RuntimeError("injected export failure")
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        if failure_stage == "build":
+            monkeypatch.setattr(integration, "build_iter_full_hf_weights", fail_export)
+        else:
+            monkeypatch.setattr(integration, "_gather_ep_weight_to_cpu", fail_gather)
+        with pytest.raises(RuntimeError, match="injected export failure"):
+            _worker(rank, rendezvous, 32, "")
+
+    assert not dist.is_initialized()
+    assert f"ep_size_{_WORLD}" not in ds_groups._EXPERT_PARALLEL_GROUP
+    assert integration._EXPORT_GATHER_BYTES == previous_gather_bytes
+    gc.collect()
+    assert len(group_refs) == 1
+    assert group_refs[0]() is None, "release the group after the export exception traceback is released"
+
+
+@pytest.mark.parametrize("failure_stage", ["build", "gather"])
+def test_ep_export_releases_the_process_group_when_export_fails(failure_stage: str) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        mp.spawn(_failed_export_worker, args=(f"file://{tmp}/rendezvous", failure_stage), nprocs=_WORLD, join=True)

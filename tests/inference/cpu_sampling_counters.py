@@ -37,7 +37,7 @@ class SamplingCounterContract(unittest.TestCase):
             return actor.drain_metrics()
 
         handle = NS(drain_metrics=NS(remote=drain), set_replica_id=NS(remote=lambda _: None))
-        sched = scheduler.Scheduler([handle], dynamic_concurrency=False)
+        sched = scheduler.Scheduler([handle], capacity=1024)
         stats = NS(kv_cache_usage=.5, num_running_reqs=1, num_waiting_reqs=0,
                    spec_decoding_stats=NS(num_drafts=2, num_draft_tokens=6, num_accepted_tokens=3))
         iteration = NS(num_preempted_reqs=1, num_generation_tokens=4,
@@ -49,7 +49,6 @@ class SamplingCounterContract(unittest.TestCase):
         payload = asyncio.run(sched.drain_metrics())
         replica = payload['replicas'][0]
         self.assertEqual(len(replica['snapshots']), 1)
-        self.assertEqual(replica['snapshots'][0]['max_concurrency'], 64)
         totals = replica['engine_totals']
         self.assertEqual({k: v for k, v in totals.items() if k != 'started_at'},
                          dict(num_preempted_reqs=4, num_drafts=6,
@@ -98,11 +97,13 @@ class SamplingCounterContract(unittest.TestCase):
         async def generate(prompt, sampling_params):
             return replies.pop(0)
 
-        handle = NS(generate=NS(remote=generate), set_replica_id=NS(remote=lambda _: None))
-        sched = scheduler.Scheduler([handle], dynamic_concurrency=False)
+        def remote(*args):
+            return NS(as_future=lambda: asyncio.ensure_future(generate(*args)))
+
+        handle = NS(generate=NS(remote=remote), set_replica_id=NS(remote=lambda _: None))
+        sched = scheduler.Scheduler([handle], capacity=1024)
 
         async def run():
-            sched._ensure_background_tasks = lambda: None
             for _ in range(2):
                 await sched.submit([1, 2, 3], {})
                 await asyncio.sleep(0)

@@ -202,6 +202,15 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             self.speculative_config = arctic_speculative_config
             self.num_spec_tokens = getattr(self.speculative_config,
                                            "num_speculative_tokens", 0)
+            self.prev_num_spec_tokens = self.num_spec_tokens
+            self.use_async_spec_decode = (
+                self.use_async_scheduling and self.num_spec_tokens > 0
+            )
+            draft_config = self.speculative_config.draft_model_config
+            self.effective_drafter_max_model_len = (
+                draft_config.max_model_len if draft_config is not None
+                else self.max_model_len
+            )
             self.uniform_decode_query_len = 1 + self.num_spec_tokens
 
             if not hasattr(self, "draft_token_ids_cpu") or self.draft_token_ids_cpu is None:
@@ -234,7 +243,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 else:
                     raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
-                self.rejection_sampler = RejectionSampler(self.sampler)
+                self.rejection_sampler = RejectionSampler(
+                    self.sampler, self.speculative_config, self.device
+                )
 
         if (self.speculative_config is not None and
                 getattr(self.speculative_config, "enable_suffix_decoding", False)):
@@ -1367,7 +1378,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             sampler_output.sampled_token_ids, scheduler_output)
 
         self._draft_token_ids = None
+        self._draft_probs = None
+        self._draft_prob_req_ids = None
         self._draft_token_req_ids = None
+        self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(

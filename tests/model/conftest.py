@@ -35,9 +35,7 @@ def build_tiny_glm_sparse_model(*, kv_lora_rank=4, with_linear_attention=False):
     from arctic_platform.model.implementations.glm53.context_parallel import apply_context_parallelism
 
     hidden_size = 256 if with_linear_attention else 16
-    layer_types = (
-        ["deepseek_sparse_attention", "linear_attention"] if with_linear_attention else ["deepseek_sparse_attention"]
-    )
+    layer_types = ["indexed_attention", "linear_attention"] if with_linear_attention else ["indexed_attention"]
     config = configuration.Glm5NextTextConfig(
         vocab_size=64,
         pad_token_id=0,
