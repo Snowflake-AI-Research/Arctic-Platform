@@ -1069,7 +1069,7 @@ class InferenceWorker(StreamingWorkerMixin):
                 )
                 self._register_router_replay_shm(attempt_kwargs, vllm_config, model_id)
                 if semi_p:
-                    from arctic_platform.inference.server.semip_asyncllm import restore_and_attach
+                    from arctic_platform.inference.server.semip_frontend import restore_and_attach
                     self.llm = await restore_and_attach(engine_kwargs, semi_p_agents, vllm_config)
                 else:
                     self.llm = AsyncLLM.from_vllm_config(
