@@ -213,5 +213,9 @@ def _combine(op: Callable[[List[Any]], Any], values: List[Any]) -> Any:
     if kind == "list":
         if any(len(value) != len(values[0]) for value in values):
             raise ValueError("ranks logged lists of different lengths")
-        return [_combine(op, list(column)) for column in zip(*values, strict=True)]
+        columns = (list(column) for column in zip(*values, strict=True))
+        if all(_value_kind(item) == "scalar" for item in values[0]):
+            # Recursing per element re-checks every rank's every element: seconds for a few hundred ranks' vectors.
+            return [op(column) for column in columns]
+        return [_combine(op, column) for column in columns]
     return op(values)
