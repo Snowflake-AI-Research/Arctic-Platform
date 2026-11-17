@@ -28,8 +28,8 @@ zero-fills, as ``top_k`` tokens on expert 0. These statistics keep their own per
   1.0 by construction.
 
 Totals are taken on every ``call_stride``-th router call only. Scheduled padding calls and activation-checkpoint
-reruns are not counted. Forward-only calls, including reference logprobs, are included; ``post_step`` publishes
-local totals with ``Reduce.SUM`` so the driver ``merge_metrics`` sums across ranks (no callback-owned collective).
+reruns are not counted. Forward-only calls, including reference logprobs, are included; ``post_step`` reduces
+one packed tensor across all ranks and publishes the totals from rank 0.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from typing import Any
 from typing import Mapping
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from arctic_platform.common.callbacks import MetricsCallback
@@ -53,12 +54,7 @@ _TOTALS = ("sampled_tokens", "entropy_sum", "replayed_tokens", "replay_agreement
 
 
 class RouterStatsCallback(MetricsCallback):
-    """Installs forward hooks on every token-choice router and logs local totals at ``post_step``.
-
-    Each rank logs its own totals with ``Reduce.SUM``. The driver merges via ``merge_metrics``; there is no
-    callback-owned ``all_reduce``. Homogeneous EP/SP is assumed: every enabled rank hooks the same routers.
-    ``on_error`` drops this rank's partial totals (DSS broadcasts ``on_error`` so siblings reset too).
-    """
+    """Every EP/SP rank hooks the same routers, which see disjoint tokens before expert dispatch."""
 
     def __init__(self, training_config: Mapping[str, Any]) -> None:
         super().__init__(training_config)
@@ -77,7 +73,9 @@ class RouterStatsCallback(MetricsCallback):
                 continue
             if router.top_k < 2:
                 raise ValueError(f"router_stats cannot read {name}: a top-1 replay pad row looks like expert 0")
-            totals = torch.zeros(router.num_experts + len(_TOTALS), device=router.gate.weight.device)
+            totals = torch.zeros(
+                router.num_experts + len(_TOTALS), dtype=torch.float32, device=router.gate.weight.device
+            )
             router.register_forward_hook(self._hook(len(self._layers), totals), with_kwargs=True)
             self._layers.append((name, totals))
             self._calls.append(0)
@@ -101,9 +99,24 @@ class RouterStatsCallback(MetricsCallback):
         self._counting = True
 
     def post_step(self, trainer: Trainer) -> None:
-        report = self._report()
-        if report:
-            self.log("router_stats", report, reduce=Reduce.SUM)
+        packed = torch.cat([totals for _, totals in self._layers])
+        # WORLD includes the sequence shards and expert ranks, not just the optimizer's replica group.
+        dist.all_reduce(packed)
+        for _, totals in self._layers:
+            totals.zero_()
+        if trainer.rank != 0:
+            return
+        rows = packed.cpu().numpy()
+        offset, width = 0, len(_TOTALS)
+        report = {}
+        for name, totals in self._layers:
+            row = rows[offset : offset + totals.numel()]
+            report[name] = {
+                "tokens_per_expert": row[:-width],
+                **dict(zip(_TOTALS, map(float, row[-width:]), strict=True)),
+            }
+            offset += totals.numel()
+        self.log("router_stats", report, reduce=Reduce.RANK0)
 
     def on_error(self, trainer: Trainer, stage: str, exc: BaseException) -> None:
         # fwd_bwd / forward_only can leave partial totals; clear those so a retry
@@ -120,21 +133,6 @@ class RouterStatsCallback(MetricsCallback):
         self._calls = [0 for _ in self._calls]
         for _, totals in self._layers:
             totals.zero_()
-
-    def _report(self) -> dict[str, dict]:
-        """Local per-router totals for this rank; the driver sums them with ``Reduce.SUM``."""
-        if not self._layers:
-            return {}
-        width = len(_TOTALS)
-        report: dict[str, dict] = {}
-        for name, totals in self._layers:
-            row = totals.detach().cpu().tolist()
-            report[name] = {
-                "tokens_per_expert": row[:-width],
-                **dict(zip(_TOTALS, row[-width:])),
-            }
-            totals.zero_()
-        return report
 
     def _hook(self, layer: int, totals: torch.Tensor):
         @torch.compiler.disable
