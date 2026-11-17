@@ -1200,3 +1200,25 @@ def test_load_batched_holds_one_rebuilt_oversized_tensor_at_a_time(monkeypatch):
 
     assert loaded == 4
     assert peaks == [8, 6, 6]
+
+
+def test_receiver_rebuilds_for_a_changed_bucket(monkeypatch):
+    from arctic_platform.inference.server.weight_sync import broadcast
+
+    class Engine:
+        def __init__(self, **kwargs):
+            self.bucket_size = kwargs["bucket_size"]
+            self.destroyed = False
+
+        def destroy(self):
+            self.destroyed = True
+
+    monkeypatch.setattr(broadcast, "BroadcastNCCLEngine", Engine)
+    extension = WeightSyncExtension()
+    extension.device = torch.device("cpu")
+    first = extension._get_or_create_broadcast_engine("localhost", 1234, 1, 3, 64)
+    assert extension._get_or_create_broadcast_engine("localhost", 1234, 1, 3, 64) is first
+    second = extension._get_or_create_broadcast_engine("localhost", 1234, 1, 3, 128)
+    assert second.bucket_size == 128
+    assert second is not first
+    assert first.destroyed
