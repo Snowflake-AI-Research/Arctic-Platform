@@ -1727,6 +1727,16 @@ class InferenceWorker(StreamingWorkerMixin):
         )
         return {"status": "paused", "mode": mode, "clear_cache": clear_cache}
 
+    async def freeze_generation(self) -> dict[str, Any]:
+        """Hold in-flight requests in place; unlike pause_generation, streams stay open
+        and new ones queue. An engine that is already paused is left to its pauser."""
+        if self.state != WorkerLifecycleState.READY or self.llm is None:
+            return {"status": "skipped", "reason": f"state={self.state.value}"}
+        if await self.llm.is_paused():
+            return {"status": "skipped", "reason": "already paused"}
+        await self.llm.pause_generation(mode="keep", clear_cache=False)
+        return {"status": "frozen"}
+
     async def resume_generation(self) -> dict[str, Any]:
         if self.state != WorkerLifecycleState.READY or self.llm is None:
             return {"status": "skipped", "reason": f"state={self.state.value}"}
