@@ -22,6 +22,7 @@ pack there and merges it in first.
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 import torch
@@ -36,6 +37,8 @@ from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
+
+logger = logging.getLogger(__name__)
 
 
 class DFlash2Options(BaseModel):
@@ -141,6 +144,7 @@ def load_dflash2(ctx: LoaderContext) -> LoadedModel:
     # makes the draft read the fine-tune's hidden states, not the base's.
     adapter_dir = checkpoint_peft_adapter_dir(ctx.spec.model_path_or_name)
     if adapter_dir is not None:
+        logger.info("Merging the LoRA adapter pack at %s into the target %s", adapter_dir, ctx.spec.model_path_or_name)
         target = merge_target_adapter(target, adapter_dir)
     model = build_online_model(
         target,

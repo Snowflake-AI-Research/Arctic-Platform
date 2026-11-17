@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import shutil
 
 import pytest
@@ -35,7 +36,10 @@ from arctic_platform.model import build_model
 from arctic_platform.model.implementations.dflash2.online import DFlash2OnlineModel
 from arctic_platform.model.implementations.dflash2.online import build_online_model
 from arctic_platform.model.implementations.dflash2.online import trainable_row_mask
+from arctic_platform.model.implementations.dflash2.specforge.algorithms.common import dflash_family_model
+from arctic_platform.model.loaders import dflash2 as dflash2_loader
 from arctic_platform.rl.processors.dflash2 import _supervised_token_weight
+from arctic_platform.testing_utils import torch_assert_equal
 
 VOCAB = 64
 HIDDEN = 32
@@ -114,19 +118,28 @@ def online(target):
     return make_online(target).train()
 
 
-@pytest.fixture
-def seen_by_specforge(online, monkeypatch):
-    """Record the ``(input_ids, loss_mask)`` batch that SpecForge's ``OnlineDFlashModel`` is called with."""
+def spy_on_specforge(model, monkeypatch):
+    """Record the batch that SpecForge's ``OnlineDFlashModel`` is called with.
+
+    The record holds ``input_ids``, ``loss_mask`` and ``target_last_hidden_states`` (``None`` when not passed), and stays
+    empty until the model is called.
+    """
     seen = {}
-    original = online.online_model.forward
+    original = model.online_model.forward
 
     def spy(input_ids, hidden_states, loss_mask, **kwargs):
         seen["input_ids"] = input_ids.clone()
         seen["loss_mask"] = loss_mask.clone()
+        seen["target_last_hidden_states"] = kwargs.get("target_last_hidden_states")
         return original(input_ids, hidden_states, loss_mask, **kwargs)
 
-    monkeypatch.setattr(online.online_model, "forward", spy)
+    monkeypatch.setattr(model.online_model, "forward", spy)
     return seen
+
+
+@pytest.fixture
+def seen_by_specforge(online, monkeypatch):
+    return spy_on_specforge(online, monkeypatch)
 
 
 @pytest.mark.parametrize(
@@ -189,6 +202,65 @@ def test_forward_trains_only_the_draft(online):
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in online.draft.parameters())
     assert all(p.grad is None for p in online.target.parameters())
     assert not any(p.requires_grad for p in online.target.parameters())
+
+
+def teacher_terms(terms):
+    return {name: pair for name, pair in terms.items() if name.startswith("dflash/teacher/")}
+
+
+def test_forward_reports_teacher_terms_for_a_window_with_a_skipped_row(target, monkeypatch):
+    online = make_online(target, teacher_metrics=True).train()
+    seen = spy_on_specforge(online, monkeypatch)
+    rows = (PROMPT_THEN_TWO_TOKEN_RESPONSE, PROMPT_THEN_ONE_TOKEN_RESPONSE, LONGER_ROW_WITH_TWO_TOKEN_RESPONSE)
+
+    out = online(**packed_window(*rows))
+
+    top_k = DRAFT_CONFIG["dflash_config"]["selector_top_k"]
+    terms = teacher_terms(out["dflash2_terms"])
+    assert terms.keys() == {
+        "dflash/teacher/unary_overlap_chain_length",
+        "dflash/teacher/unary_distribution_overlap",
+        "dflash/teacher/unary_top1_agreement",
+        f"dflash/teacher/unary_top{top_k}_mass",
+    }
+    for name, (numerator, denominator) in terms.items():
+        assert torch.isfinite(numerator) and torch.isfinite(denominator), name
+        assert denominator > 0, name  # computed over supervised positions, not an empty reduction
+
+    # The target's final hidden states reach SpecForge in the order of the rows it trains on: the skipped row, which
+    # the target is never run on for the teacher, does not shift the rows after it.
+    kept_rows = (rows[0], rows[2])
+    given = seen["target_last_hidden_states"]
+    assert given.shape[0] == len(kept_rows)
+    assert given.shape[1] == seen["input_ids"].shape[1]
+    for index, (row_ids, _) in enumerate(kept_rows):
+        _, last_hidden = online.target_features(torch.tensor([row_ids]))
+        torch_assert_equal(given[index, : len(row_ids)], last_hidden[0])
+        assert given[index, len(row_ids) :].abs().sum() == 0  # right padding, as for the ids
+
+
+@pytest.mark.parametrize(
+    "teacher_metrics, collect_detailed_metrics",
+    [
+        (False, True),  # the default: the teacher metrics are off
+        (True, False),  # they are a detailed diagnostic
+        (False, False),
+    ],
+)
+def test_forward_skips_the_teacher_terms_unless_they_are_both_enabled_and_collected(
+    target, monkeypatch, teacher_metrics, collect_detailed_metrics
+):
+    online = make_online(target, teacher_metrics=teacher_metrics).train()
+    seen = spy_on_specforge(online, monkeypatch)
+
+    out = online(
+        **packed_window(PROMPT_THEN_TWO_TOKEN_RESPONSE, PROMPT_THEN_THREE_TOKEN_RESPONSE),
+        collect_detailed_metrics=collect_detailed_metrics,
+    )
+
+    assert torch.isfinite(out["loss"])
+    assert seen["target_last_hidden_states"] is None
+    assert teacher_terms(out["dflash2_terms"]) == {}
 
 
 def test_forward_returns_a_connected_zero_when_no_row_can_form_a_block(online):
@@ -397,6 +469,97 @@ def test_loader_rejects_generic_model_patches(target_dir, patch):
         build_model(loader_spec(target_dir, patches=Patches(**{patch: True})))
 
 
+def train_step(target_dir, **loader_options):
+    """``(loss, draft grad norm, terms)`` of one packed-window forward and backward of the loader's model."""
+    model = build_model(loader_spec(target_dir, loader_options=loader_options)).model.train()
+
+    out = model(**packed_window(PROMPT_THEN_TWO_TOKEN_RESPONSE, PROMPT_THEN_THREE_TOKEN_RESPONSE))
+    out["loss"].backward()
+
+    grad_norm = torch.sqrt(sum(p.grad.float().pow(2).sum() for p in model.draft.parameters() if p.grad is not None))
+    return out["loss"].detach(), grad_norm, out["dflash2_terms"]
+
+
+@pytest.mark.parametrize("lk_loss_type", [None, "alpha", "lambda", "tv"])
+def test_loader_trains_under_each_lk_objective(target_dir, lk_loss_type):
+    loss, grad_norm, terms = train_step(target_dir, lk_loss_type=lk_loss_type)
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(grad_norm) and grad_norm > 0
+    # The objective that reached SpecForge names its loss term: cross entropy by default, else an LK objective.
+    assert ("lk_loss" in terms) == (lk_loss_type is not None)
+    assert ("ce_loss" in terms) == (lk_loss_type is None)
+    assert ("objective/lk_kl_weight" in terms) == (lk_loss_type == "lambda")
+
+
+def test_lk_alpha_is_the_cross_entropy_objective(target_dir):
+    cross_entropy_loss, cross_entropy_grad_norm, _ = train_step(target_dir)
+
+    alpha_loss, alpha_grad_norm, _ = train_step(target_dir, lk_loss_type="alpha")
+
+    torch_assert_equal(alpha_loss, cross_entropy_loss)
+    torch_assert_equal(alpha_grad_norm, cross_entropy_grad_norm)
+
+
+def test_lk_lambda_weights_cross_entropy_by_kl_scale_and_kl_decay(target_dir):
+    """The cross entropy weight is ``kl_scale * exp(-kl_decay * acceptance)``, so 0 leaves TV and 1 leaves CE."""
+    cross_entropy_loss, cross_entropy_grad_norm, _ = train_step(target_dir)
+    tv_loss, tv_grad_norm, _ = train_step(target_dir, lk_loss_type="tv")
+    assert tv_loss != cross_entropy_loss  # the two ends differ, so the checks below tell them apart
+
+    no_weight_loss, no_weight_grad_norm, _ = train_step(target_dir, lk_loss_type="lambda", kl_scale=0.0)
+    full_weight_loss, full_weight_grad_norm, _ = train_step(target_dir, lk_loss_type="lambda", kl_decay=0.0)
+
+    torch_assert_equal(no_weight_loss, tv_loss)
+    torch_assert_equal(no_weight_grad_norm, tv_grad_norm)
+    torch_assert_equal(full_weight_loss, cross_entropy_loss)
+    torch_assert_equal(full_weight_grad_norm, cross_entropy_grad_norm)
+
+
+def test_loader_rejects_an_unknown_lk_loss_type(target_dir):
+    with pytest.raises((ValidationError, ValueError), match="lk_loss_type"):
+        build_model(loader_spec(target_dir, loader_options={"lk_loss_type": "kl"}))
+
+
+@pytest.mark.parametrize("option", ["kl_scale", "kl_decay"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_loader_rejects_an_lk_weight_that_is_not_finite(target_dir, option, value):
+    with pytest.raises((ValidationError, ValueError), match=option):
+        build_model(loader_spec(target_dir, loader_options={option: value}))
+
+
+def test_loader_projects_every_anchor_block_at_once_for_a_zero_objective_chunk(target_dir, monkeypatch):
+    """``objective_chunk_blocks=0`` is one unchunked projection, which must train exactly like the chunked default."""
+    chunk_sizes = []
+    reduce_in_chunks = dflash_family_model.checkpointed_chunk_reduce
+
+    def record_chunk_size(*tensors, chunk_size, **kwargs):
+        chunk_sizes.append(chunk_size)
+        return reduce_in_chunks(*tensors, chunk_size=chunk_size, **kwargs)
+
+    monkeypatch.setattr(dflash_family_model, "checkpointed_chunk_reduce", record_chunk_size)
+
+    chunked_loss, chunked_grad_norm, chunked_terms = train_step(target_dir, teacher_metrics=True)
+    assert set(chunk_sizes) == {128}
+    assert teacher_terms(chunked_terms)  # the teacher terms are part of what is compared
+
+    chunk_sizes.clear()
+    loss, grad_norm, terms = train_step(target_dir, teacher_metrics=True, objective_chunk_blocks=0)
+
+    assert set(chunk_sizes) == {0}
+    torch_assert_equal(loss, chunked_loss)
+    torch_assert_equal(grad_norm, chunked_grad_norm)
+    assert terms.keys() == chunked_terms.keys()
+    for name, (numerator, denominator) in terms.items():
+        torch_assert_equal(numerator, chunked_terms[name][0], msg=name)
+        torch_assert_equal(denominator, chunked_terms[name][1], msg=name)
+
+
+def test_loader_rejects_a_negative_objective_chunk(target_dir):
+    with pytest.raises((ValidationError, ValueError), match="objective_chunk_blocks"):
+        build_model(loader_spec(target_dir, loader_options={"objective_chunk_blocks": -1}))
+
+
 @pytest.fixture
 def lora_fine_tune(target, tmp_path):
     """``(adapter dir, the fine-tune as base + unmerged adapter)`` of a LoRA fine-tune of ``target``."""
@@ -428,6 +591,16 @@ def test_loader_trains_a_packed_window_through_a_lora_fine_tune(target_dir, lora
         hidden_states = tuned(input_ids=input_ids, output_hidden_states=True).hidden_states
     expected = torch.cat([hidden_states[i + 1] for i in model.draft.target_layer_ids], dim=-1)
     torch.testing.assert_close(model.target_context(input_ids), expected)
+
+
+def test_loader_logs_the_adapter_pack_it_merges(target_dir, lora_fine_tune, caplog):
+    adapter_dir, _ = lora_fine_tune
+    shutil.copytree(adapter_dir, target_dir / PEFT_ADAPTER_DIRNAME)
+
+    with caplog.at_level(logging.INFO, logger=dflash2_loader.__name__):
+        build_model(loader_spec(target_dir))
+
+    assert str(target_dir / PEFT_ADAPTER_DIRNAME) in caplog.text
 
 
 @pytest.mark.parametrize("parallelism", [dict(sequence_parallel=2), dict(expert_parallel=2)])
