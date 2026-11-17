@@ -156,7 +156,7 @@ class RouterStatsCallback(MetricsCallback):
 
                 picks = torch.arange(min(offset, len(x)), len(x), self._stride, device=x.device)
                 sampled = real.index_select(0, picks).to(totals.dtype)
-                logits = router.gate(x.index_select(0, picks)).to(torch.float32)
+                logits = router.gate_logits(x.index_select(0, picks)).to(torch.float32)
                 log_scores = F.logsigmoid(logits) if router.score_func == "sigmoid" else logits
                 log_probs = log_scores.log_softmax(-1)
                 entropy = -(log_probs.exp() * log_probs).sum(-1)

@@ -149,6 +149,21 @@ def test_replaying_the_routers_own_near_tied_choices_agrees_fully(score_func, bi
     assert stats["replay_agreement_sum"] == stats["replayed_tokens"] == len(x)
 
 
+def test_a_router_with_fp32_logits_agrees_with_its_own_routing():
+    """The statistics read the gate as routing does: fp32 logits from bf16 operands when ``fp32_logits`` is set."""
+    torch.manual_seed(0)
+    model = torch.nn.Module()
+    model.add_module("router", TokenChoiceTopKRouter(64, 64, 8, "sigmoid", True, 1.0, fp32_logits=True).bfloat16())
+    x, bias = torch.randn(256, 64, dtype=torch.bfloat16), torch.zeros(64)
+    selected = model.router(x, bias)[1]
+    hooked = RouterStatsCallback(_training_config(stride=1))
+    hooked.post_init(SimpleNamespace(model=model))
+    model.router(x, bias, routed_experts=selected)
+
+    stats = _reported(hooked)
+    assert stats["replay_agreement_sum"] == stats["replayed_tokens"] == len(x)
+
+
 def test_fresh_replay_rows_do_not_inflate_replay_agreement():
     """ROUTER_REPLAY_FRESH rows become the router's own top-k in output[1]; agreement must ignore them."""
     model, hooked, trainer = _hooked(stride=1)
