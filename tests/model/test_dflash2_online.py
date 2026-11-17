@@ -39,6 +39,7 @@ from arctic_platform.model.implementations.dflash2.online import trainable_row_m
 from arctic_platform.model.implementations.dflash2.specforge.algorithms.common import dflash_family_model
 from arctic_platform.model.loaders import dflash2 as dflash2_loader
 from arctic_platform.rl.processors.dflash2 import _supervised_token_weight
+from arctic_platform.testing_utils import torch_assert_close
 from arctic_platform.testing_utils import torch_assert_equal
 
 VOCAB = 64
@@ -528,31 +529,52 @@ def test_loader_rejects_an_lk_weight_that_is_not_finite(target_dir, option, valu
         build_model(loader_spec(target_dir, loader_options={option: value}))
 
 
-def test_loader_projects_every_anchor_block_at_once_for_a_zero_objective_chunk(target_dir, monkeypatch):
-    """``objective_chunk_blocks=0`` is one unchunked projection, which must train exactly like the chunked default."""
-    chunk_sizes = []
+@pytest.fixture
+def reductions(monkeypatch):
+    """``(chunk_size, number of anchor blocks)`` of every chunked reduction SpecForge runs, in order."""
+    calls = []
     reduce_in_chunks = dflash_family_model.checkpointed_chunk_reduce
 
-    def record_chunk_size(*tensors, chunk_size, **kwargs):
-        chunk_sizes.append(chunk_size)
-        return reduce_in_chunks(*tensors, chunk_size=chunk_size, **kwargs)
+    def record(function, *tensors, chunk_size, dim=0, **kwargs):
+        blocks = next(tensor for tensor in tensors if tensor is not None).shape[dim]
+        calls.append((chunk_size, blocks))
+        return reduce_in_chunks(function, *tensors, chunk_size=chunk_size, dim=dim, **kwargs)
 
-    monkeypatch.setattr(dflash_family_model, "checkpointed_chunk_reduce", record_chunk_size)
+    monkeypatch.setattr(dflash_family_model, "checkpointed_chunk_reduce", record)
+    return calls
 
-    chunked_loss, chunked_grad_norm, chunked_terms = train_step(target_dir, teacher_metrics=True)
-    assert set(chunk_sizes) == {128}
-    assert teacher_terms(chunked_terms)  # the teacher terms are part of what is compared
 
-    chunk_sizes.clear()
+@pytest.mark.parametrize(
+    "chunk_blocks, multi_chunk, atol",
+    [
+        (128, False, 0.0),  # every block in one chunk: the same sums as the unchunked path
+        # One block per chunk: a real multi-chunk reduction. It sums in another order, so fp32 rounding differs. An
+        # ulp of the largest term (about 16) is 2e-6, while a dropped or doubled chunk moves the loss by O(1).
+        (1, True, 1e-5),
+    ],
+)
+def test_loader_trains_an_unchunked_objective_like_a_chunked_one(
+    target_dir, reductions, chunk_blocks, multi_chunk, atol
+):
+    """``objective_chunk_blocks=0`` projects every anchor block at once, and must agree with a chunked objective."""
     loss, grad_norm, terms = train_step(target_dir, teacher_metrics=True, objective_chunk_blocks=0)
+    assert teacher_terms(terms)  # the teacher terms are part of what is compared
+    assert {chunk_size for chunk_size, _ in reductions} == {0}
+    reductions.clear()
 
-    assert set(chunk_sizes) == {0}
-    torch_assert_equal(loss, chunked_loss)
-    torch_assert_equal(grad_norm, chunked_grad_norm)
-    assert terms.keys() == chunked_terms.keys()
+    chunked_loss, chunked_grad_norm, chunked_terms = train_step(
+        target_dir, teacher_metrics=True, objective_chunk_blocks=chunk_blocks
+    )
+
+    assert {chunk_size for chunk_size, _ in reductions} == {chunk_blocks}
+    # More blocks than the chunk size means more than one chunk; the window must keep this case multi-chunk.
+    assert all((blocks > chunk_blocks) == multi_chunk for _, blocks in reductions)
+    torch_assert_close(chunked_loss, loss, rtol=0.0, atol=atol)
+    torch_assert_close(chunked_grad_norm, grad_norm, rtol=0.0, atol=atol)
+    assert chunked_terms.keys() == terms.keys()
     for name, (numerator, denominator) in terms.items():
-        torch_assert_equal(numerator, chunked_terms[name][0], msg=name)
-        torch_assert_equal(denominator, chunked_terms[name][1], msg=name)
+        torch_assert_close(chunked_terms[name][0], numerator, rtol=0.0, atol=atol, msg=name)
+        torch_assert_close(chunked_terms[name][1], denominator, rtol=0.0, atol=atol, msg=name)
 
 
 def test_loader_rejects_a_negative_objective_chunk(target_dir):
