@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model files, the semi_p / plain job bodies built from them, and job status tracking."""
+"""Model configs from the model catalog, the semi_p / plain job bodies built from them, and job status tracking."""
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
+import subprocess
 import threading
 import time
 from copy import deepcopy
@@ -27,7 +29,10 @@ from dataclasses import field
 from pathlib import Path
 from typing import Any
 
-MODELS_DIR = Path(__file__).resolve().parent / "models"
+# Where catalog entries are read from when no local checkout is given.
+CATALOG_REPO = "snowflakedb/cortex-training"
+CATALOG_BRANCH = "main"
+CATALOG_DIR = "model-catalog/models"
 
 logger = logging.getLogger(__name__)
 
@@ -105,25 +110,67 @@ class ModelSpec:
         return int(self.inference_config["max_seq_len"])
 
 
-def load_model(ref: str) -> ModelSpec:
-    """Load ``models/<ref>.json``, or ``ref`` itself when it is a path."""
+def catalog_name(rel: str) -> str:
+    """A model's name from its catalog path: glm-5.3/standard/h200-inference-full -> glm-5.3-standard-full."""
+    parts = rel.removesuffix(".json").strip("/").split("/")
+    parts[-1] = parts[-1].removeprefix("h200-inference-")
+    return "-".join(parts)
+
+
+@functools.lru_cache(maxsize=None)
+def _fetch_catalog_entry(rel: str) -> str:
+    """A catalog entry from CATALOG_REPO at CATALOG_BRANCH, through the gh CLI and its login."""
+    api = f"repos/{CATALOG_REPO}/contents/{CATALOG_DIR}/{rel}?ref={CATALOG_BRANCH}"
+    try:
+        out = subprocess.run(["gh", "api", "-H", "Accept: application/vnd.github.raw", api],
+                             capture_output=True, text=True, check=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        detail = getattr(exc, "stderr", "") or exc
+        raise ValueError(f"could not read {CATALOG_REPO}:{CATALOG_DIR}/{rel} at {CATALOG_BRANCH} ({detail}); "
+                         "pass catalog=PATH to a local checkout of the catalog's models/ directory") from exc
+    return out.stdout
+
+
+def load_model(ref: str, catalog: str | None = None) -> ModelSpec:
+    """The job config ``ref`` names.
+
+    ``ref`` is a path to a JSON file, or a catalog entry's path under the model
+    catalog's ``models/`` directory (``glm-5.3/standard/h200-inference-full``),
+    read from ``catalog``, a local checkout of that directory, or else from
+    CATALOG_REPO at CATALOG_BRANCH. A catalog entry holds its one sampling
+    sub-job under ``sub_job_configs``; a model file holds it under ``sub_job``
+    and may add ``name``, ``thresholds``, ``perf``, ``correctness`` and
+    ``copies``.
+    """
     path = Path(ref).expanduser()
-    if not path.exists():
-        path = MODELS_DIR / (ref if ref.endswith(".json") else f"{ref}.json")
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    if path.exists():
+        rel, source, text = "/".join(path.parts[-3:]), str(path), path.read_text(encoding="utf-8")
+    else:
+        rel = ref if ref.endswith(".json") else f"{ref}.json"
+        if catalog:
+            local = Path(catalog).expanduser() / rel
+            source, text = str(local), local.read_text(encoding="utf-8")
+        else:
+            source, text = f"{CATALOG_REPO}@{CATALOG_BRANCH}:{CATALOG_DIR}/{rel}", _fetch_catalog_entry(rel)
+    raw = json.loads(text)
+    if "sub_job_configs" in raw:
+        subs = raw["sub_job_configs"]
+        if len(subs) != 1:
+            raise ValueError(f"{source}: expected one sub-job in sub_job_configs, found {len(subs)}")
+        raw = {"name": catalog_name(rel), "sub_job": subs[0]}
     sub_job = raw["sub_job"]
     if sub_job.get("job_type") != "sampling":
-        raise ValueError(f"{path}: sub_job.job_type must be 'sampling'")
+        raise ValueError(f"{source}: sub_job.job_type must be 'sampling'")
     if "semi_p" in sub_job.get("inference_config", {}):
-        raise ValueError(f"{path}: leave inference_config.semi_p out; the suite sets it per job")
+        raise ValueError(f"{source}: leave inference_config.semi_p out; the suite sets it per job")
     return ModelSpec(
-        name=raw.get("name", path.stem),
+        name=raw.get("name", Path(source).stem),
         sub_job=sub_job,
         thresholds=raw.get("thresholds", {}),
         perf=raw.get("perf", {}),
         correctness=raw.get("correctness", {}),
         copies=raw.get("copies"),
-        path=str(path),
+        path=source,
     )
 
 

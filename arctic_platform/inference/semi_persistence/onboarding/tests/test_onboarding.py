@@ -11,9 +11,11 @@ import base64
 import json
 import re
 import signal
+import subprocess
 import threading
 import time
 import zlib
+from pathlib import Path
 
 import pytest
 
@@ -84,15 +86,51 @@ def test_replicas_and_model_file_validation(tmp_path):
         jobs.load_model(str(path))
 
 
-def _shipped_model_paths():
-    return sorted(jobs.MODELS_DIR.glob("*.json"))
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
-def test_shipped_model_files_load():
-    for path in _shipped_model_paths():
-        spec = jobs.load_model(str(path))
-        assert spec.name == path.stem
-        assert spec.n_gpus % spec.tensor_parallel_size == 0
+def _catalog_entry(tmp_path, rel, sub_jobs):
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"hardware": "H200", "sub_job_configs": sub_jobs}))
+    return path
+
+
+def test_catalog_entries_load_from_a_local_checkout(tmp_path):
+    sub = _spec(tp=8).sub_job
+    _catalog_entry(tmp_path, "glm-5.3/standard/h200-inference-full.json", [sub])
+    spec = jobs.load_model("glm-5.3/standard/h200-inference-full", catalog=str(tmp_path))
+    assert spec.name == "glm-5.3-standard-full" and spec.sub_job == sub and spec.tensor_parallel_size == 8
+    by_path = jobs.load_model(str(tmp_path / "glm-5.3/standard/h200-inference-full.json"))
+    assert by_path.name == "glm-5.3-standard-full" and by_path.sub_job == sub
+
+
+def test_catalog_entries_come_from_github_without_a_checkout(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, json.dumps({"sub_job_configs": [_spec().sub_job]}), "")
+
+    jobs._fetch_catalog_entry.cache_clear()
+    monkeypatch.setattr(jobs.subprocess, "run", fake_run)
+    assert jobs.load_model("qwen3-8b/standard/h200-inference-lora").name == "qwen3-8b-standard-lora"
+    assert calls[0][:2] == ["gh", "api"]
+    assert calls[0][-1] == (f"repos/{jobs.CATALOG_REPO}/contents/{jobs.CATALOG_DIR}/"
+                            f"qwen3-8b/standard/h200-inference-lora.json?ref={jobs.CATALOG_BRANCH}")
+    jobs._fetch_catalog_entry.cache_clear()
+
+
+def test_a_catalog_entry_with_several_sub_jobs_is_refused(tmp_path):
+    _catalog_entry(tmp_path, "m/standard/h200-inference-full.json", [_spec().sub_job] * 2)
+    with pytest.raises(ValueError, match="one sub-job"):
+        jobs.load_model("m/standard/h200-inference-full", catalog=str(tmp_path))
+
+
+def test_model_files_load():
+    spec = jobs.load_model(str(FIXTURES / "qwen36-35b-a3b-tp1.json"))
+    assert spec.name == "qwen36-35b-a3b-tp1"
+    assert spec.n_gpus % spec.tensor_parallel_size == 0
 
 
 def test_onboard_requires_the_backend_image(monkeypatch, tmp_path):
@@ -837,7 +875,7 @@ def _publisher(monkeypatch, tmp_path, service):
     monkeypatch.setattr(publish, "make_client", lambda _config: service)
     monkeypatch.setattr(publish.time, "sleep", service.sleep)
     monkeypatch.delenv("CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS", raising=False)
-    return publish.Publisher({"config": "conn.json", "image_tag": "dev_X", "models": "qwen36-35b-a3b-tp1",
+    return publish.Publisher({"config": "conn.json", "image_tag": "dev_X", "models": str(FIXTURES / "qwen36-35b-a3b-tp1.json"),
                               "out_dir": str(tmp_path)})
 
 

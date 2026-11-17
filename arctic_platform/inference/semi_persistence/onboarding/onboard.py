@@ -15,7 +15,7 @@
 
 """Onboard models for semi-persistence: semi_p checked against plain vLLM.
 
-    python -m arctic_platform.inference.semi_persistence.onboarding.onboard config=CONN.json debug_image_tag=TAG models=qwen36-35b-a3b-tp1
+    python -m arctic_platform.inference.semi_persistence.onboarding.onboard config=CONN.json debug_image_tag=TAG models=glm-5.3/standard/h200-inference-full
 
 Per model, up to four jobs on the same backend image:
 
@@ -53,7 +53,10 @@ models, they run concurrently within ``max_gpus``, largest first.
 
 Arguments (``key=value``):
   config           connection file (required)
-  models           comma-separated model names under onboarding/models/, or paths
+  models           comma-separated model catalog entries (e.g.
+                   glm-5.3/standard/h200-inference-full), or paths to JSON files
+  catalog          local checkout of the model catalog's models/ directory;
+                   default: read the entries from cortex-training main on GitHub
   debug_image_tag  backend image for every job (required): the one the models'
                    semi_p images were published on. A published image only
                    restores on the backend it was dumped on, and the cluster
@@ -603,7 +606,7 @@ def main(argv: list[str]) -> int:
         logging.getLogger(noisy).setLevel(logging.WARNING)
     args = parse_kv_args(argv)
     runner = Runner(args)
-    specs = [load_model(m) for m in (args.get("models") or "").split(",") if m]
+    specs = [load_model(m, args.get("catalog")) for m in (args.get("models") or "").split(",") if m]
     if not specs:
         raise SystemExit("models=NAME[,NAME...] is required")
     if runner.attach and len(specs) != 1:

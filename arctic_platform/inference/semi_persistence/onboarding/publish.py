@@ -16,10 +16,12 @@
 """Dump and publish semi_p images for a backend image, one job per model config.
 
     python -m arctic_platform.inference.semi_persistence.onboarding.publish \\
-        config=CONN.json image_tag=TAG models=a,b,c [max_gpus=40] [reserve_gpus=8] \\
-        [out_dir=onboarding_reports/publish] [timeout_s=7200]
+        config=CONN.json image_tag=TAG models=a,b,c [catalog=PATH] [max_gpus=40] \\
+        [reserve_gpus=8] [out_dir=onboarding_reports/publish] [timeout_s=7200]
 
-For each model file under onboarding/models/, at its published size:
+``models`` are model catalog entries (``glm-5.3/standard/h200-inference-full``)
+or paths to JSON files; see ``jobs.load_model`` for ``catalog``. For each, at
+its published size:
 
   1. submit the sampling job with semi_p on, SEMIP_DUMP_PUBLISH=1, pinned to
      ``image_tag``;
@@ -145,7 +147,9 @@ class Publisher:
             if not args.get(key):
                 raise SystemExit(f"{key}= is required")
         self.image_tag = args["image_tag"]
-        self.models = [m for m in args["models"].split(",") if m]
+        specs = [load_model(m, args.get("catalog")) for m in args["models"].split(",") if m]
+        self.specs = {spec.name: spec for spec in specs}
+        self.models = list(self.specs)
         self.max_gpus = int(args.get("max_gpus", "40"))
         self.reserve = int(args.get("reserve_gpus", "8"))
         self.timeout_s = float(args.get("timeout_s", "7200"))
@@ -240,7 +244,7 @@ class Publisher:
                 "key_dir": started.group(1)}
 
     def prepare(self, name: str) -> dict:
-        spec = load_model(name)
+        spec = self.specs[name]
         res: dict[str, Any] = {"model": name, "model_name": spec.sub_job["model_name"],
                                "n_gpus": spec.n_gpus, "started_at": utc()}
         job_id = self.client.create_job_from_body(publish_body(spec, self.image_tag))["job_id"]
@@ -269,7 +273,7 @@ class Publisher:
         return res
 
     def run(self) -> None:
-        queue = sorted(self.models, key=lambda m: load_model(m).n_gpus, reverse=True)
+        queue = sorted(self.models, key=lambda m: self.specs[m].n_gpus, reverse=True)
         running: dict[threading.Thread, int] = {}
 
         def work(name: str) -> None:
@@ -284,7 +288,7 @@ class Publisher:
             used = sum(running.values())
             started = False
             for name in list(queue):
-                need = load_model(name).n_gpus
+                need = self.specs[name].n_gpus
                 if used + need > self.max_gpus:
                     continue
                 free = int(self.client.get_capacity().get("available_gpus", 0))

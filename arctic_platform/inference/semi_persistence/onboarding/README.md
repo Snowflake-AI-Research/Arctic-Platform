@@ -86,8 +86,8 @@ backend applies when it supports it. The report says whether it did; if not,
   checkout), a connection file (cortex-training's
   `examples/config/connection.json.template`), and the commands run from the
   arctic-platform repository root.
-- **The model's semi_p image must already be published** for the exact config in
-  the model file and for the backend image under test (see
+- **The model's semi_p image must already be published** for the exact config
+  (the catalog entry or model file) and for the backend image under test (see
   [Publishing images](#publishing-images)). The config fields that key the image
   (model, `max_seq_len`, `n_gpus`, every `vllm_config` field) must match the job
   that dumped it. A semi_p job that finds no image fails, telling you to set
@@ -105,14 +105,14 @@ backend applies when it supports it. The report says whether it did; if not,
 ```bash
 # One model
 python -m arctic_platform.inference.semi_persistence.onboarding.onboard config=connection.json debug_image_tag=TAG \
-    models=qwen36-35b-a3b-tp1 miss_image_cache=SCRATCH_ROOT
+    models=qwen3.6-35b-a3b/standard/h200-inference-full miss_image_cache=SCRATCH_ROOT
 
 # Several models: run concurrently within max_gpus, largest first
 python -m arctic_platform.inference.semi_persistence.onboarding.onboard config=connection.json debug_image_tag=TAG \
-    models=glm53-tp16,glm53-tp8,qwen38-flash-next-tp8 max_gpus=96
+    models=glm-5.3/standard/h200-inference-full,glm-5.3/long/h200-inference-full max_gpus=96
 
 # Re-run the checks against jobs that are already running (kept afterwards)
-python -m arctic_platform.inference.semi_persistence.onboarding.onboard config=connection.json debug_image_tag=TAG models=qwen38-27b-tp1x8 \
+python -m arctic_platform.inference.semi_persistence.onboarding.onboard config=connection.json debug_image_tag=TAG models=qwen3.8-27b/standard/h200-inference-full \
     job_on_hit=JOB job_off_default=JOB [job_on_miss=JOB job_off_matched=JOB]
 ```
 
@@ -122,7 +122,8 @@ was dumped on. The suite sets `CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS=1` for you.
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `models` | required | Comma-separated names under `models/`, or paths to model files |
+| `models` | required | Comma-separated model catalog entries (`glm-5.3/standard/h200-inference-full`), or paths to model files |
+| `catalog` | cortex-training main on GitHub | Local checkout of the catalog's `models/` directory to read the entries from |
 | `debug_image_tag` | required | Backend image for every job |
 | `variants` | all four | Subset of `on_hit,off_default,on_miss,off_matched` that includes `on_hit` (see [Variant sets](#variant-sets)) |
 | `copies` | 2 for whole-node configs, else 1 | Perf pair size, as a multiple of the published `n_gpus` |
@@ -188,7 +189,8 @@ To publish every config for a new backend image:
 
 ```bash
 python -m arctic_platform.inference.semi_persistence.onboarding.publish config=connection.json \
-    image_tag=dev_... models=glm53-tp16,qwen38-27b-tp1x8 [max_gpus=40] [reserve_gpus=8]
+    image_tag=TAG models=glm-5.3/standard/h200-inference-full,qwen3.8-27b/standard/h200-inference-full \
+    [catalog=PATH] [max_gpus=40] [reserve_gpus=8]
 ```
 
 It submits one job per model with the flag, waits for the engine's
@@ -208,10 +210,19 @@ compressed skeleton pages, `raw` otherwise), `raw_bytes`, `stored_bytes`,
 one that waits for the nodes to verify the image. Then onboard the models with
 `debug_image_tag` set to the same image.
 
-## Model files
+## Model configs
 
-`models/<name>.json` holds the sampling sub-job exactly as published, without
-`semi_p` (the suite sets it per job), plus optional overrides:
+Configs come from the model catalog (`model-catalog/models/` in cortex-training):
+`models=glm-5.3/standard/h200-inference-full` reads that entry from main on
+GitHub through the `gh` CLI, or from `catalog=PATH`, a local checkout of that
+directory. An entry's one sampling sub-job is used as published, and the model
+is named after its path (`glm-5.3-standard-full`). A published skeleton only
+matches the exact config it was dumped from, so onboard from the catalog entries
+jobs are submitted with.
+
+For a config outside the catalog, or to override thresholds, pass the path of a
+model file instead: the sampling sub-job without `semi_p` (the suite sets it
+per job), plus optional overrides:
 
 ```json
 {
@@ -349,7 +360,7 @@ rebuild it by hand:
 python -m arctic_platform.inference.semi_persistence.onboarding.book reports=onboarding_reports [out=ONBOARDING.md]
 ```
 
-It contains no job ids, so it can be committed alongside the model files.
+It contains no job ids, so it can be committed.
 
 The verdict is:
 
