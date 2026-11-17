@@ -388,6 +388,17 @@ def test_cpu_optimizer_log_names_the_selected_implementation(monkeypatch, caplog
     assert f"using optimizer='{expected}'" in caplog.text
 
 
+def test_build_training_optimizer_decays_only_nonbias_matrices():
+    model = torch.nn.Module()
+    for name, shape in (("matrix", (2, 3)), ("matrix_bias", (2, 3)), ("gain", (3,)), ("offset", ())):
+        model.register_parameter(name, torch.nn.Parameter(torch.ones(shape)))
+    optimizer = build_training_optimizer(
+        model, OptimizerSettings(name="torch_adamw", weight_decay=0.1), _ZERO2, fused=False
+    )
+    decayed = {id(param) for group in optimizer.param_groups if group["weight_decay"] for param in group["params"]}
+    assert decayed == {id(model.matrix)}
+
+
 def test_build_training_optimizer_disables_decay_on_every_qwen38_norm():
     pytest.importorskip("transformers.models.qwen4_exp")
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
@@ -517,7 +528,7 @@ def test_parameters_kept_in_fp32_get_their_own_optimizer_groups(monkeypatch):
 def test_build_training_optimizer_keeps_flattened_weights_16_byte_aligned():
     model = torch.nn.Module()
     model.first = torch.nn.Linear(16, 16, bias=False)
-    model.scale = torch.nn.Parameter(torch.ones(3))  # 3 elements, in the same group as the weights
+    model.scale = torch.nn.Parameter(torch.ones(1, 3))  # 3 elements, in the same group as the weights
     model.second = torch.nn.Linear(16, 16, bias=False)
 
     optimizer = build_training_optimizer(model, OptimizerSettings(name="torch_adamw"), _ZERO2, fused=False)
@@ -535,7 +546,7 @@ def test_build_training_optimizer_aligns_each_kept_fp32_group():
         def __init__(self):
             super().__init__()
             self.first = torch.nn.Linear(16, 16, bias=False, dtype=torch.bfloat16)
-            self.odd = torch.nn.Parameter(torch.ones(3, dtype=torch.bfloat16))
+            self.odd = torch.nn.Parameter(torch.ones(1, 3, dtype=torch.bfloat16))
             self.second = torch.nn.Linear(16, 16, bias=False, dtype=torch.bfloat16)
             self.scale = torch.nn.Parameter(torch.ones(3))
             self.base = torch.nn.Parameter(torch.ones(24))
