@@ -41,7 +41,7 @@ jobs:
           BASE=$(sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+).*"/\1/p' pyproject.toml)
           IFS=. read -r MAJOR MINOR PATCH <<< "$BASE"
           case "$BUMP" in
-            rc)    LAST=$(git tag -l "v${BASE}rc*" | sed "s/^v${BASE}rc//" | sort -n | tail -1)
+            rc)    LAST=$(git tag -l "v${BASE}rc*" | sed -nE "s/^v${BASE}rc([0-9]+)(\.post[0-9]+)?$/\1/p" | sort -n | tail -1)
                    TAG="v${BASE}rc$(( ${LAST:-0} + 1 ))" ;;
             patch) TAG="v$BASE" ;;
             minor) TAG="v$MAJOR.$((MINOR + 1)).0" ;;
