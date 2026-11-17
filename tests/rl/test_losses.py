@@ -912,9 +912,10 @@ class TestMigratedGrpo(TestCasePlus):
         ``metric_loss_count`` and ``apply_behavioral_is_correction`` are deliberately absent: older PrimeRL builds
         sent them, no GRPO loss reads them, and the plain losses reject them as unknown keys.
         """
-        values = torch.tensor([[-1.0, -1.0]])
+        # Two rows: a bare [1, T] row without cu_seqlens is the flattened ZoRRo shape that seq-mean must reject.
+        values = torch.full((2, 2), -1.0)
         context = {
-            "input_ids": torch.ones((1, 2), dtype=torch.long),
+            "input_ids": torch.ones((2, 2), dtype=torch.long),
             "old_log_probs_shifted": values,
             "advantages": torch.ones_like(values),
             "loss_mask": torch.ones_like(values, dtype=torch.bool),

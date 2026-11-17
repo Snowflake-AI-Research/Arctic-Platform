@@ -180,6 +180,38 @@ def test_unmanaged_forward_failure_does_not_mark_the_cycle_broken(monkeypatch):
     assert_ready_for_final_step(engine)
 
 
+def test_failure_after_a_direct_backward_marks_the_unmanaged_cycle_broken(monkeypatch):
+    """No reduction: run_pipeline backs up inside the call. A later failure must poison the cycle."""
+    import arctic_platform.rl.processors as processors
+
+    def fake_run_pipeline(engine, args, batch, meta, processing, **kwargs):
+        del engine, args, meta, processing
+        if int(batch["input_ids"][0]) == 0:
+            kwargs["on_backward_start"]()
+            return {"avg_loss": 1.0, "metrics": {}}
+        raise RuntimeError("second forward failed")
+
+    monkeypatch.setattr(processors, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(processors, "resolve_packed_loss_reduction", lambda *args, **kwargs: None)
+    engine = _Engine(gas=1, managed=False)
+    try:
+        run_unpacked_gas(
+            engine,
+            loop_count=2,
+            batch_data={"input_ids": torch.tensor([[0], [1]])},
+            meta_data={},
+            processing={},
+            backward=True,
+            device="cpu",
+        )
+    except RuntimeError as err:
+        assert "second forward failed" in str(err)
+    else:
+        raise AssertionError("the second forward failure was swallowed")
+    with pytest.raises(RuntimeError, match="interrupted"):
+        assert_ready_for_final_step(engine)
+
+
 def test_forward_only_does_not_step(monkeypatch):
     import arctic_platform.rl.processors as processors
 

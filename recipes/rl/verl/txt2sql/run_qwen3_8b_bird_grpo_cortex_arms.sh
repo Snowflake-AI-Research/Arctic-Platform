@@ -12,7 +12,8 @@
 #   verl-8b-cortex-nozorro-packed  0          1          true           true    (opt-in)
 #
 # The packed arm is not verl_grpo: a packed Cortex job rewrites the request to
-# grpo with pi_old = the live policy, so it is only in ARMS when asked for.
+# grpo and sends the token-aligned old_log_probs as old_log_probs_shifted, so it
+# is only in ARMS when asked for.
 # NOZORRO_MICRO_BSZ / ZORRO_MICRO_BSZ override the micro-batch columns.
 # Writes logs under OUT and never removes anything.
 set -uo pipefail

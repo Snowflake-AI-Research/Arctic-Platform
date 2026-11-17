@@ -54,6 +54,7 @@ from __future__ import annotations
 import math
 from numbers import Real
 from typing import Any
+from typing import Callable
 
 import torch
 
@@ -448,6 +449,7 @@ def run_pipeline(
     return_tensors: bool = False,
     validate_loss_callback: bool = True,
     loss_object: BaseLoss | None = None,
+    on_backward_start: Callable[[], None] | None = None,
 ) -> dict:
     global c
     """Execute forward, post-processors, and optionally loss + backward.
@@ -483,6 +485,10 @@ def run_pipeline(
     loss_object
         Optional pre-resolved objective shared with packed reduction and every
         callback in this worker execution. The pipeline resolves it when omitted.
+    on_backward_start
+        Called immediately before ``engine.backward`` runs for ``backward=True``.
+        Callers use it to tell a forward or loss failure, which leaves the
+        accumulation cycle intact, from a failure once backward has begun.
 
     Returns
     -------
@@ -698,6 +704,8 @@ def run_pipeline(
                 # 43.9×, residual ~1.46× = pg_loss aggregation convention).
                 # Pass `scale_wrt_gas=False` so DS leaves our pre-normalized
                 # loss alone.
+                if on_backward_start is not None:
+                    on_backward_start()
                 engine.backward(loss, scale_wrt_gas=False)
 
             timers.stop_and_print_elapsed(tname)

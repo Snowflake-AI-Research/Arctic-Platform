@@ -248,6 +248,11 @@ def run_unpacked_gas(
     outputs: list[dict] = []
     stepped = False
     backward_started = False
+
+    def note_backward_started() -> None:
+        nonlocal backward_started
+        backward_started = True
+
     try:
         for index, micro_batch in enumerate(micro_batches):
             if prepare_call is not None:
@@ -267,6 +272,7 @@ def run_unpacked_gas(
                 backward=pipeline_backward,
                 return_tensors=return_tensors,
                 loss_object=loss_object,
+                on_backward_start=note_backward_started,
             )
             if before_backward is not None and backward:
                 before_backward(index, result)
@@ -354,6 +360,11 @@ def run_payload_schedule(
     stepped = False
     backward_started = False
     validated_sources: set[int] = set()
+
+    def note_backward_started() -> None:
+        nonlocal backward_started
+        backward_started = True
+
     try:
         for index, call in enumerate(calls):
             payload = call.payload
@@ -369,6 +380,7 @@ def run_payload_schedule(
                 return_tensors=return_tensors,
                 validate_loss_callback=call.source_index not in validated_sources,
                 loss_object=loss_object,
+                on_backward_start=note_backward_started,
             )
             validated_sources.add(call.source_index)
             if before_backward is not None and backward:

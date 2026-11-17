@@ -2122,8 +2122,10 @@ class TestCortexZorroLossAggregation:
         out = TestCortexActorConfig._payload(meta, processing, zorro=True)
         config = dict(out["processing"]["config"])
         config.setdefault("loss_agg_mode", mode)
-        with pytest.raises(ValueError, match="1-D buffer with no cu_seqlens"):
+        with pytest.raises(ValueError, match="buffer with no cu_seqlens"):
             _require_sequence_boundaries({"loss_mask": torch.ones(3, dtype=torch.bool)}, config)
+        with pytest.raises(ValueError, match="buffer with no cu_seqlens"):
+            _require_sequence_boundaries({"loss_mask": torch.ones(1, 3, dtype=torch.bool)}, config)
 
     def test_explicit_token_mean_rescues_a_sequence_actor_config(self):
         out = TestCortexActorConfig._payload(
@@ -2136,6 +2138,19 @@ class TestCortexZorroLossAggregation:
     def test_non_zorro_keeps_sequence_aggregation(self):
         out = TestCortexActorConfig._payload({"actor_config": {"loss_agg_mode": "seq-mean-token-mean"}})
         assert out["processing"]["config"]["loss_agg_mode"] == "seq-mean-token-mean"
+
+    def test_sequence_boundaries_accept_rows_or_cu_seqlens(self):
+        import torch
+
+        from arctic_platform.rl.processors.grpo import _require_sequence_boundaries
+
+        config = {"loss_agg_mode": "seq-mean-token-mean"}
+        _require_sequence_boundaries({"loss_mask": torch.ones(2, 3, dtype=torch.bool)}, config)
+        _require_sequence_boundaries(
+            {"loss_mask": torch.ones(1, 3, dtype=torch.bool), "cu_seqlens": torch.tensor([0, 3])},
+            config,
+        )
+        _require_sequence_boundaries({"loss_mask": torch.ones(3, dtype=torch.bool)}, {"loss_agg_mode": "token-mean"})
 
 
 class TestCortexShimSaveWeightsFailsLoud:

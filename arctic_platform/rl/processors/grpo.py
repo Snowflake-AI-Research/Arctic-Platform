@@ -1498,11 +1498,13 @@ def _require_sequence_boundaries(context: dict, config: dict) -> None:
     mask = context.get("loss_mask")
     if not torch.is_tensor(mask):
         mask = context.get("response_mask")
-    if torch.is_tensor(mask) and mask.ndim >= 2:
+    # Padded [B, S] batches always get cu_seqlens in run_pipeline, so a 2-D mask
+    # without them has B > 1 rows. A single [1, T] row is the ZoRRo flattening.
+    if torch.is_tensor(mask) and mask.ndim >= 2 and int(mask.shape[0]) > 1:
         return
     raise ValueError(
-        f"loss_agg_mode={mode!r} needs per-sequence boundaries (cu_seqlens or [B, S] rows). "
-        "This call is a 1-D buffer with no cu_seqlens, so a sequence mean would be over the shard."
+        f"loss_agg_mode={mode!r} needs per-sequence boundaries (cu_seqlens or [B, S] rows with B > 1). "
+        "This call is a flattened 1-D or [1, T] buffer with no cu_seqlens, so a sequence mean would be over the shard."
     )
 
 

@@ -30,7 +30,8 @@
 #   PACK            true|false. Sent as ds_worker_config.pack. false (default) runs
 #                   the unpacked verl_grpo path with the fwd_no_grad old log-probs.
 #                   true asks Cortex for a packed job, where the request is rewritten
-#                   to grpo and pi_old is the live policy (ratio 1). ZoRRo never packs.
+#                   to grpo and the token-aligned old_log_probs become old_log_probs_shifted.
+#                   ZoRRo never packs.
 #
 # Required env:
 #   ARCTIC_CORTEX_IMAGE_TAG   optional; pins debug.job.image_tag via CortexConfig.

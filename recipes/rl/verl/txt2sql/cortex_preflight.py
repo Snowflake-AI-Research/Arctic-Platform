@@ -14,10 +14,10 @@
 # limitations under the License.
 """Driver checks run_qwen3_8b_bird_grpo_cortex.sh makes before any Cortex job exists.
 
-Reads AP_ROOT, VERL_HOME and EXPECTED_IMAGE_TAG from the environment. Never prints the PAT.
+Reads AP_ROOT and VERL_HOME from the environment. EXPECTED_IMAGE_TAG is optional;
+when set, ARCTIC_CORTEX_IMAGE_TAG must equal it. Never prints the PAT.
 """
 
-import inspect
 import os
 import sys
 
@@ -25,7 +25,7 @@ import sys
 def main() -> None:
     ap_root = os.path.realpath(os.environ["AP_ROOT"])
     verl_home = os.path.realpath(os.environ["VERL_HOME"])
-    expected_tag = os.environ["EXPECTED_IMAGE_TAG"]
+    expected_tag = (os.environ.get("EXPECTED_IMAGE_TAG") or "").strip()
 
     import arctic_platform
     import verl
@@ -43,18 +43,30 @@ def main() -> None:
     from arctic_platform.client.transports.cortex import job_create_payload
     from arctic_platform.integrations.verl.adapter import ArcticRLClientWrapper
 
-    if "ARCTIC_CORTEX_IMAGE_TAG" not in inspect.getsource(job_create_payload):
-        sys.exit("job_create_payload has no ARCTIC_CORTEX_IMAGE_TAG hook; the job would run the release image")
-    if os.environ.get("ARCTIC_CORTEX_IMAGE_TAG") != expected_tag:
+    env_tag = (os.environ.get("ARCTIC_CORTEX_IMAGE_TAG") or "").strip()
+    config = CortexConfig()
+    # Behavioral check: the env tag must reach the job body as debug.job.image_tag.
+    if (config.image_tag or "").strip() != env_tag:
+        sys.exit("CortexConfig does not read ARCTIC_CORTEX_IMAGE_TAG")
+    sent_tag = job_create_payload([], config).get("debug", {}).get("job", {}).get("image_tag")
+    if env_tag and sent_tag != env_tag:
+        sys.exit(f"job_create_payload does not send ARCTIC_CORTEX_IMAGE_TAG={env_tag}")
+    if not env_tag and sent_tag is not None:
+        sys.exit("job_create_payload sends an image tag although ARCTIC_CORTEX_IMAGE_TAG is unset")
+    if expected_tag and env_tag != expected_tag:
         sys.exit(f"ARCTIC_CORTEX_IMAGE_TAG is not {expected_tag}")
+    if not env_tag:
+        print("ARCTIC_CORTEX_IMAGE_TAG unset: the job uses the account's default image")
     if cortex_job_packs({"pack": False}) is not False:
         sys.exit("pack=false still packs")
     if cortex_job_packs({"zorro_train_enable": True, "pack": True}) is not False:
         sys.exit("ZoRRo still packs")
     if not hasattr(ArcticRLClientWrapper, "_send_cortex_update_actor"):
         sys.exit("the verl adapter has no Cortex backend")
-    config = CortexConfig()
-    print(f"cortex host={config.host} database={config.database} schema={config.schema_} pat_set={config.pat is not None}")
+    print(
+        f"cortex host={config.host} database={config.database} schema={config.schema_}"
+        f" pat_set={config.pat is not None}"
+    )
     print("preflight ok: image hook, pack rules, Cortex adapter")
 
 
