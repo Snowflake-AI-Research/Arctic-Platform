@@ -246,6 +246,7 @@ def test_on_error_keeps_earlier_successful_fwd_bwd_totals_in_the_same_step():
     callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
     model.router(first)
     callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+    callback.post_fwd_bwd(trainer, {})
 
     callback.pre_fwd_bwd(trainer)
     callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
@@ -264,6 +265,7 @@ def test_on_error_during_step_keeps_completed_fwd_bwd_totals():
     callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
     model.router(x)
     callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+    callback.post_fwd_bwd(trainer, {})
 
     callback.on_error(trainer, "step", RuntimeError("optimizer blew up"))
     callback.post_step(trainer)
@@ -271,6 +273,43 @@ def test_on_error_during_step_keeps_completed_fwd_bwd_totals():
     _reduce, report = callback.pending["router_stats"]
     assert report["router"]["sampled_tokens"] == pytest.approx(float(len(x)))
 
+
+def test_on_error_without_pre_after_post_step_leaves_zero_totals():
+    """A broadcast on_error after a finished step must not revive the prior snapshot."""
+    model, callback, trainer = _hooked(stride=1)
+    x = torch.randn(4, DIM)
+    callback.pre_fwd_bwd(trainer)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(x)
+    callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+    callback.post_fwd_bwd(trainer, {})
+    callback.post_step(trainer)
+    callback.pending.clear()
+
+    callback.on_error(trainer, "fwd_bwd", RuntimeError("peer failed before pre_fwd_bwd"))
+    callback.post_step(trainer)
+
+    _reduce, report = callback.pending["router_stats"]
+    assert report["router"]["sampled_tokens"] == 0.0
+    assert report["router"]["tokens_per_expert"] == [0.0] * EXPERTS
+
+
+def test_on_error_without_pre_after_successful_fwd_keeps_earlier_totals():
+    """Rank that never took pre_* for the failing request must not wipe earlier totals."""
+    model, callback, trainer = _hooked(stride=1)
+    first = torch.randn(4, DIM)
+
+    callback.pre_fwd_bwd(trainer)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(first)
+    callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+    callback.post_fwd_bwd(trainer, {})
+
+    callback.on_error(trainer, "fwd_bwd", RuntimeError("peer failed before this rank's pre_fwd_bwd"))
+    callback.post_step(trainer)
+
+    _reduce, report = callback.pending["router_stats"]
+    assert report["router"]["sampled_tokens"] == pytest.approx(float(len(first)))
 
 @pytest.mark.parametrize(
     "config",

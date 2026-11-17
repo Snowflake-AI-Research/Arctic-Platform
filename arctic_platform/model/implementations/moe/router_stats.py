@@ -61,6 +61,8 @@ class RouterStatsCallback(MetricsCallback):
     ``pre_fwd_bwd`` / ``pre_fwd_only`` snapshot the step's totals so a failed request can restore them.
     ``on_error`` for those stages restores the snapshot (DSS broadcasts ``on_error`` so siblings match);
     earlier successful forwards in the same accumulation window keep counting toward ``/step``.
+    Successful ``post_fwd_bwd`` / ``post_fwd_only`` / ``post_step`` drop the snapshot so a late
+    ``on_error`` on a rank that never took a pre-hook for the failing request cannot revive stale totals.
     """
 
     def __init__(self, training_config: Mapping[str, Any]) -> None:
@@ -105,6 +107,12 @@ class RouterStatsCallback(MetricsCallback):
     def pre_fwd_only_microbatch(self, trainer: Trainer, is_padding: bool) -> None:
         self._counting = not is_padding
 
+    def post_fwd_bwd(self, trainer: Trainer, result: dict) -> None:
+        self._clear_snapshot()
+
+    def post_fwd_only(self, trainer: Trainer, result: dict) -> None:
+        self._clear_snapshot()
+
     def post_fwd_bwd_microbatch(self, trainer: Trainer, is_padding: bool) -> None:
         self._counting = True
 
@@ -115,12 +123,14 @@ class RouterStatsCallback(MetricsCallback):
         report = self._report()
         if report:
             self.log("router_stats", report, reduce=Reduce.SUM)
+        self._clear_snapshot()
 
     def on_error(self, trainer: Trainer, stage: str, exc: BaseException) -> None:
         # A failed fwd_bwd / forward_only can leave partial totals for this request. Restore the
         # pre-request snapshot so earlier successful forwards in the same step still publish at
         # post_step, and a retry of this request does not double-count. Step failures keep the
-        # completed totals as-is.
+        # completed totals as-is. No snapshot means this rank never took pre_* for the failing
+        # request — leave totals alone (do not revive an earlier request's snapshot).
         if stage in {"fwd_bwd", "forward_only"}:
             self._restore_totals()
         else:
@@ -131,15 +141,20 @@ class RouterStatsCallback(MetricsCallback):
         self._saved_calls = list(self._calls)
         self._saved_totals = [totals.detach().clone() for _, totals in self._layers]
 
+    def _clear_snapshot(self) -> None:
+        """Drop the pre-request snapshot after success so late ``on_error`` cannot restore it."""
+        self._saved_calls = None
+        self._saved_totals = None
+
     def _restore_totals(self) -> None:
         """Drop this request's partials; keep earlier requests in the same step."""
         self._counting = True
         if self._saved_calls is None or self._saved_totals is None:
-            self._reset()
             return
         self._calls = list(self._saved_calls)
         for (_, totals), saved in zip(self._layers, self._saved_totals):
             totals.copy_(saved)
+        self._clear_snapshot()
 
     def _reset(self) -> None:
         """Drop all totals and count the next router call."""
@@ -147,8 +162,7 @@ class RouterStatsCallback(MetricsCallback):
         self._calls = [0 for _ in self._calls]
         for _, totals in self._layers:
             totals.zero_()
-        self._saved_calls = None
-        self._saved_totals = None
+        self._clear_snapshot()
 
     def _report(self) -> dict[str, dict]:
         """Local per-router totals for this rank; the driver sums them with ``Reduce.SUM``."""
