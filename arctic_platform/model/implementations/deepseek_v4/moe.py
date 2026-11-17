@@ -21,6 +21,7 @@ from arctic_platform.model.implementations.moe.layers.moe import TokenChoiceTopK
 from arctic_platform.model.implementations.moe.layers.moe import _maybe_to_local
 from arctic_platform.model.implementations.moe.layers.moe import _run_experts_for_loop_impl
 from arctic_platform.model.implementations.moe.layers.moe import _run_experts_grouped_mm_impl
+from arctic_platform.model.implementations.moe.routing_weights import apply_routing_weights
 
 _MXFP4_BLOCK = 32
 
@@ -127,12 +128,16 @@ class Mxfp4GroupedExperts(nn.Module):
     def init_weights(self, init_std: float) -> None:
         del init_std
 
-    def forward(self, x: Tensor, num_tokens_per_expert: Tensor) -> Tensor:
+    def forward(self, x: Tensor, num_tokens_per_expert: Tensor, scores: Tensor | None = None) -> Tensor:
+        """``scores`` is one routing weight per row, applied after the experts.
+
+        Expert-parallel dispatch still owes those weights. Combine then only sums.
+        """
         if not uses_dispatch_ep(self.ep_comm_backend):
             raise NotImplementedError(
                 f"EP comm backend must be one of {DISPATCH_EP_BACKENDS}, got {self.ep_comm_backend!r}."
             )
-        return _Mxfp4ExpertsFn.apply(
+        output = _Mxfp4ExpertsFn.apply(
             x,
             _maybe_to_local(self.w1),
             _maybe_to_local(self.w1_scale_inv),
@@ -144,6 +149,9 @@ class Mxfp4GroupedExperts(nn.Module):
             self.swiglu_limit,
             self.use_grouped_mm,
         )
+        if scores is None:
+            return output
+        return apply_routing_weights(output, scores)
 
 
 def _mxfp4_scale(num_experts: int, rows: int, cols: int) -> nn.Parameter:

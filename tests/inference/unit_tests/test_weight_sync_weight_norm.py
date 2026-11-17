@@ -72,6 +72,7 @@ if "vllm" not in sys.modules:
 
 import arctic_platform.inference.server.weight_sync.utils as weight_sync_utils
 from arctic_platform.inference.server.weight_sync.receiver import WeightSyncExtension
+from vllm.model_executor.models.utils import WeightsMapper
 
 
 class _Model(nn.Module):
@@ -364,6 +365,28 @@ def test_nccl_batched_sync_reports_a_skipped_source(tp_world_size, cpu_cuda):
     assert result["recv_l2_sq"] == 32.5
     assert result["applied_source_l2_sq"] == 30.0
     assert result["skipped_source_count"] == 1
+
+
+def test_nccl_batched_sync_counts_a_source_once_per_shard_it_is_loaded_into(tp_world_size, cpu_cuda):
+    """Gemma 4 ``attention_k_eq_v`` loads K into both the K and V shards, so the destination holds K twice."""
+    tp_world_size["value"] = 2
+    model = _LoadingModel()
+    model.language_model = nn.Module()
+    model.language_model.hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_stacked={
+            "layers.0.self_attn.q_proj.": ("layers.0.self_attn.qkv_proj.", "q"),
+            "layers.0.self_attn.k_proj.": ("layers.0.self_attn.qkv_proj.", ["k", "v"]),
+        }
+    )
+    weights = [
+        ("model.language_model.layers.0.self_attn.q_proj.weight", torch.tensor([1.0, 2.0])),
+        ("model.language_model.layers.0.self_attn.k_proj.weight", torch.tensor([3.0, 4.0])),
+    ]
+
+    result = _nccl_sync(_extension(model), _Engine(weights))
+
+    assert result["recv_l2_sq"] == 30.0
+    assert result["applied_source_l2_sq"] == 5.0 + 2 * 25.0
 
 
 def test_nccl_fp8_sync_reports_the_trainers_bf16_checksum(tp_world_size, cpu_cuda):

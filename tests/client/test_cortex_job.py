@@ -145,3 +145,15 @@ def test_shutdown_cancels_once(server):
     client.shutdown()
     client.shutdown()
     assert server.cancels == 1
+
+
+@pytest.mark.parametrize("status", ["JOB_STATE_TERMINATED", "TERMINATED", "JOB_STATE_FAILED", "CANCELLED"])
+def test_waiting_on_a_job_that_ended_raises_its_reason(server, monkeypatch, status):
+    async def send(self, method: str, url: str, **kwargs):
+        return {"status": status, "reason": "idle_timeout", "sub_jobs": []} if method == "GET" else {"job_id": JOB}
+
+    monkeypatch.setattr(CortexTransport, "_send", send)
+    transport = CortexTransport(_backend(job_ready_timeout=5))
+    transport.start(_config())
+    with pytest.raises(RuntimeError, match="reached terminal state .*idle_timeout"):
+        transport.wait_until_ready()

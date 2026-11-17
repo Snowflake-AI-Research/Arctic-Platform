@@ -59,17 +59,31 @@ def convert_hf_layer_to_prime(
     state_dict: dict[str, Tensor],
     layer_idx: int,
 ) -> dict[str, Tensor]:
-    _concatenate_ple_shards(state_dict)
     if layer_idx < 0:
+        _concatenate_ple_shards(state_dict)
         return state_dict
 
     prefix = _layer_prefix(layer_idx)
+    experts = _indexed_expert_keys(state_dict, prefix)
     fp8_keys = [name for name in state_dict if name.startswith(f"{prefix}.") and "weight_scale_inv" in name]
     if fp8_keys:
         raise NotImplementedError(
             "Qwen3.8-Flash-Next native-FP8 training is not implemented; use Qwen/Qwen3.8-Flash-Next. Found "
             + ", ".join(fp8_keys[:3])
         )
+
+    if experts:
+        stacked = {
+            f"{prefix}.mlp.experts.{prime_name}": torch.stack(
+                [state_dict[experts[index][hf_name]] for index in range(len(experts))]
+            )
+            for hf_name, prime_name in (("gate_proj", "w1"), ("down_proj", "w2"), ("up_proj", "w3"))
+        }
+        for projections in experts.values():
+            for name in projections.values():
+                state_dict.pop(name)
+        state_dict.update(stacked)
+    _concatenate_ple_shards(state_dict)
 
     gate_up_key = f"{prefix}.mlp.experts.gate_up_proj"
     down_key = f"{prefix}.mlp.experts.down_proj"
@@ -135,8 +149,11 @@ def convert_prime_layer_to_hf(
 
 
 def convert_hf_to_prime(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    layers = _layer_indices(state_dict)
+    for layer_idx in layers:
+        _indexed_expert_keys(state_dict, _layer_prefix(layer_idx))
     _concatenate_ple_shards(state_dict)
-    for layer_idx in _layer_indices(state_dict):
+    for layer_idx in layers:
         convert_hf_layer_to_prime(state_dict, layer_idx)
     return state_dict
 
@@ -145,3 +162,31 @@ def convert_prime_to_hf(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
     for layer_idx in _layer_indices(state_dict):
         convert_prime_layer_to_hf(state_dict, layer_idx)
     return state_dict
+
+
+def _indexed_expert_keys(state_dict: dict[str, Tensor], prefix: str) -> dict[int, dict[str, str]]:
+    pattern = re.compile(rf"^{re.escape(prefix)}\.mlp\.experts\.(\d+)\.(gate_proj|down_proj|up_proj)\.weight$")
+    experts: dict[int, dict[str, str]] = {}
+    for name in state_dict:
+        match = pattern.match(name)
+        if match is not None:
+            projections = experts.setdefault(int(match.group(1)), {})
+            projection = match.group(2)
+            if projection in projections:
+                raise ValueError(f"Duplicate Qwen3.8 expert projection for {prefix}: {name}")
+            projections[projection] = name
+    if not experts:
+        return experts
+    if any(
+        f"{prefix}.mlp.experts.{projection}" in state_dict
+        for projection in ("gate_up_proj", "down_proj", "w1", "w2", "w3")
+    ):
+        raise ValueError(f"Mixed Qwen3.8 expert layouts for {prefix}")
+    indices = sorted(experts)
+    if indices != list(range(len(indices))):
+        raise KeyError(f"Non-contiguous Qwen3.8 experts for {prefix}: {indices}")
+    for index, projections in experts.items():
+        missing = {"gate_proj", "down_proj", "up_proj"} - projections.keys()
+        if missing:
+            raise KeyError(f"Incomplete Qwen3.8 expert {prefix}.{index}: missing {sorted(missing)}")
+    return experts

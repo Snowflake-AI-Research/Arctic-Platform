@@ -116,3 +116,14 @@ def test_model_config_accepts_clear_cache_on_weight_sync_opt_out():
     assert config.clear_cache_on_weight_sync is False
     assert "clear_cache_on_weight_sync" not in config.to_engine_kwargs()
     assert "clear_cache_on_weight_sync" not in config.model_dump()
+
+
+def test_model_config_refuses_unknown_top_level_key_instead_of_dropping_it():
+    ModelConfig = _model_config_cls()
+
+    # A real vLLM engine argument, but not a ModelConfig field: it must be refused, not silently left out of the engine.
+    with pytest.raises(ValueError, match="mamba_ssm_cache_dtype"):
+        ModelConfig(model="m", mamba_ssm_cache_dtype="float32")
+
+    config = ModelConfig(model="m", extra_engine_kwargs={"mamba_ssm_cache_dtype": "float32"})
+    assert config.to_engine_kwargs()["mamba_ssm_cache_dtype"] == "float32"

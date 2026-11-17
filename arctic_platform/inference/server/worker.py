@@ -19,6 +19,8 @@ from uuid import uuid4
 
 import ray
 
+from arctic_platform.debug.weight_sync import maybe_collect_broadcast_verification
+
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
 from arctic_platform.inference.server.chat import ChatModel, resolve_chat_model
 from arctic_platform.inference.server.metrics import RingStatLogger, get_collector
@@ -46,6 +48,8 @@ logger = logging.getLogger("arctic_platform.inference.server")
 _UNEXPECTED_KWARG_RE = re.compile(r"unexpected keyword argument '([^']+)'")
 _SAMPLE_ID_PARAM_KEY = "dss_sample_id"
 _REPLAY_ID_PARAM_KEY = "dss_router_replay_id"
+# The same trajectory's previous capture, read from extra_args, which a server without this key leaves unused.
+_REPLAY_PREFIX_ID_PARAM_KEY = "dss_router_replay_prefix_id"
 _ROUTER_REPLAY_MARKER_KEY = "router_replay"
 _ROUTER_REPLAY_RETURN_INFO_PARAM_KEY = "dss_return_back_router_info"
 _ROUTER_REPLAY_STOP_TOKEN_SEQUENCES_PARAM_KEY = "dss_stop_token_sequences"
@@ -644,6 +648,7 @@ def _result_from_output(
     cache_tx: Any = None,
     sample_id: str | None = None,
     replay_id: str | None = None,
+    prefix_replay_id: str | None = None,
     request_id: str | None = None,
     replica_label: str | None = None,
     return_back_router_info: bool = False,
@@ -704,6 +709,7 @@ def _result_from_output(
         cache_tx=cache_tx,
         sample_id=sample_id,
         replay_id=replay_id,
+        prefix_replay_id=prefix_replay_id,
         request_id=request_id,
         replica_label=replica_label,
         return_back_router_info=return_back_router_info,
@@ -718,6 +724,7 @@ def _maybe_cache_routed_experts(
     cache_tx: Any,
     sample_id: str | None,
     replay_id: str | None,
+    prefix_replay_id: str | None,
     request_id: str | None,
     replica_label: str | None,
     return_back_router_info: bool,
@@ -742,6 +749,24 @@ def _maybe_cache_routed_experts(
             f"capture_len={capture_len} expected_capture_len={expected_capture_len} "
             f"capture_shape={list(routed.shape)}"
         )
+    # This request re-prefills the prefix capture's positions; keep the routes the earlier request sampled with.
+    prefix_len = 0
+    if prefix_replay_id is not None:
+        try:
+            prefix = cache_tx.get(prefix_replay_id)
+        except KeyError:  # another replica served the earlier request, or the cache evicted it
+            prefix = None
+        if prefix is not None:
+            if prefix.shape[0] >= prompt_len or tuple(prefix.shape[1:]) != tuple(routed.shape[1:]):
+                raise ValueError(
+                    "router-replay prefix capture must end inside the prompt, with the same layer/top-k shape "
+                    f"trajectory_id={sample_id!r} replay_id={replay_id!r} prefix_replay_id={prefix_replay_id!r} "
+                    f"prefix_shape={list(prefix.shape)} prompt_len={prompt_len} capture_shape={list(routed.shape)}"
+                )
+            import torch
+
+            prefix_len = int(prefix.shape[0])
+            routed = torch.cat([prefix, torch.as_tensor(routed[prefix_len:]).to(prefix.device, prefix.dtype)])
     cache_key = replay_id or sample_id
     if replay_id is not None and replay_id.startswith("rr1:"):
         cache_tx.put_new(cache_key, routed)
@@ -756,6 +781,7 @@ def _maybe_cache_routed_experts(
         "prompt_len": prompt_len,
         "generation_len": generation_len,
         "capture_len": capture_len,
+        "prefix_len": prefix_len,
     }
     if return_back_router_info:
         tensor = routed.detach().cpu() if hasattr(routed, "detach") else routed
@@ -876,6 +902,7 @@ class InferenceWorker(StreamingWorkerMixin):
         self._active_lora_int_id: int | None = None
         self._active_lora_name: str | None = None
         self._active_lora_is_3d: bool = False
+        self._served_checkpoint_lora_dir: tempfile.TemporaryDirectory | None = None
 
     def _active_lora_request(self) -> Any | None:
         """LoRARequest for the synced adapter, or None (base serving).
@@ -1103,17 +1130,48 @@ class InferenceWorker(StreamingWorkerMixin):
         request = LoRARequest(
             lora_name="default",
             lora_int_id=1,
-            lora_path=lora_path,
+            lora_path=await self._served_checkpoint_lora_path(lora_path),
             load_inplace=True,
             is_3d_lora_weight=is_3d,
         )
         added = await self.llm.add_lora(request)
         if not added:
             raise RuntimeError(f"vLLM failed to load LoRA adapter from {lora_path}")
+        # vLLM only checks leaf names on load; a module that matches no served layer is silently dropped.
+        unbound_per_rank = await self.llm.collective_rpc("unbound_lora_modules", args=(1,))
+        never_bound = set.intersection(*(set(names) for names in unbound_per_rank)) if unbound_per_rank else set()
+        if never_bound:
+            raise RuntimeError(
+                f"LoRA adapter {lora_path} has {len(never_bound)} module(s) that match no served module, "
+                f"e.g. {sorted(never_bound)[:3]}"
+            )
         self._active_lora_int_id = 1
         self._active_lora_name = "default"
         self._active_lora_is_3d = is_3d
         logger.info("Loaded checkpoint LoRA adapter from %s (3d=%s)", lora_path, is_3d)
+
+    async def _served_checkpoint_lora_path(self, lora_path: str) -> str:
+        """``lora_path``, or a copy whose tensor names use the served module tree (as LoRA weight sync remaps them)."""
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+
+        weights_path = os.path.join(lora_path, "adapter_model.safetensors")
+        if not os.path.isfile(weights_path):
+            return lora_path
+        with safe_open(weights_path, framework="pt") as handle:
+            names = list(handle.keys())
+            served = (await self.llm.collective_rpc("served_lora_names", args=(names,)))[0]
+            if served == names:
+                return lora_path
+            tensors = {served_name: handle.get_tensor(name) for name, served_name in zip(names, served)}
+            metadata = handle.metadata()
+        # vLLM may reload the adapter from this path after an LRU eviction, so it lives as long as the worker.
+        self._served_checkpoint_lora_dir = tempfile.TemporaryDirectory(prefix="arctic-checkpoint-lora-")
+        served_dir = self._served_checkpoint_lora_dir.name
+        shutil.copy(os.path.join(lora_path, "adapter_config.json"), served_dir)
+        save_file(tensors, os.path.join(served_dir, "adapter_model.safetensors"), metadata=metadata)
+        logger.info("Remapped checkpoint LoRA adapter %s to served module names under %s", lora_path, served_dir)
+        return served_dir
 
     def _maybe_init_reasoning_parser(self, reasoning_parser_name: str | None) -> None:
         if not reasoning_parser_name:
@@ -1350,6 +1408,7 @@ class InferenceWorker(StreamingWorkerMixin):
         return_action_masks = bool(sampling_params.pop(_RETURN_ACTION_MASKS_PARAM_KEY, False))
         extra_args = dict(sampling_params.get("extra_args", None) or {})
         extra_args.pop(_RETURN_ACTION_MASKS_PARAM_KEY, None)
+        prefix_replay_id = extra_args.pop(_REPLAY_PREFIX_ID_PARAM_KEY, None)
         if extra_args:
             sampling_params["extra_args"] = extra_args
         else:
@@ -1362,6 +1421,8 @@ class InferenceWorker(StreamingWorkerMixin):
             replay_id = str(replay_id)
         if replay_id is not None and sample_id is None:
             raise ValueError(f"{_REPLAY_ID_PARAM_KEY} requires {_SAMPLE_ID_PARAM_KEY}")
+        if prefix_replay_id is not None and replay_id is None:
+            raise ValueError(f"{_REPLAY_PREFIX_ID_PARAM_KEY} requires {_REPLAY_ID_PARAM_KEY}")
         return_back_router_info = bool(
             sampling_params.pop(_ROUTER_REPLAY_RETURN_INFO_PARAM_KEY, False)
         )
@@ -1407,6 +1468,7 @@ class InferenceWorker(StreamingWorkerMixin):
             cache_tx=self._router_replay_tx,
             sample_id=sample_id,
             replay_id=replay_id,
+            prefix_replay_id=prefix_replay_id,
             request_id=request_id,
             replica_label=self._replica_label,
             return_back_router_info=return_back_router_info,
@@ -1453,22 +1515,6 @@ class InferenceWorker(StreamingWorkerMixin):
 
     def get_state(self) -> str:
         return self.state.value
-
-    def get_stats(self) -> dict[str, Any]:
-        """Return the latest scheduler stats, plus liveness metadata.
-
-        Used by the per-replica concurrency-adjust loop in
-        :class:`arctic_platform.inference.server.scheduler.Scheduler`. The keys
-        ``gpu_cache_usage`` / ``num_requests_running`` /
-        ``num_requests_waiting`` are read by the scheduler to drive the
-        ``utilization_based_concurrency`` heuristic.
-        """
-        latest = get_collector().latest()
-        return {
-            "state": self.state.value,
-            "pid": os.getpid(),
-            **latest,
-        }
 
     def drain_metrics(self) -> dict[str, Any]:
         """Drain snapshots and return lifetime counters without resetting them."""
@@ -1764,6 +1810,7 @@ class InferenceWorker(StreamingWorkerMixin):
             args=(master_addr, master_port, rank_offset, world_size,
                   bucket_size, engine_only, weight_format),
         )
+        results = maybe_collect_broadcast_verification(results, engine_only=engine_only, llm=self.llm, rank_offset=rank_offset)
         if not results:
             return {}
         from arctic_platform.inference import envs
@@ -1813,6 +1860,7 @@ class InferenceWorker(StreamingWorkerMixin):
                   lora_int_id, lora_name, lora_config, bucket_size,
                   engine_only, staging, evict_first),
         )
+        results = maybe_collect_broadcast_verification(results, engine_only=engine_only, llm=self.llm, rank_offset=rank_offset)
         if not engine_only:
             self._active_lora_int_id = lora_int_id
             self._active_lora_name = lora_name

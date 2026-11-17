@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
+import threading
 
 from arctic_platform.client.config import ArcticClientConfig
 from arctic_platform.client.config import JobId
@@ -35,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 # The server answers generate inline, so it has no request to poll or cancel.
 _UNSUPPORTED_OPS = frozenset({"generate-stream", "request-status", "cancel-request"})
+# Cancel in-flight ops, then wait for the loop thread to exit, before close().
+_LOOP_SHUTDOWN_TIMEOUT_S = 30
 
 
 class OnPremTransport(Transport):
@@ -42,8 +46,9 @@ class OnPremTransport(Transport):
     ``ArcticRLRayServer`` wrapper (typed async ops) that snapshots workers at
     construction, so the wrapper is built after jobs are initialized.
 
-    `call` resolves ``op -> method`` and forwards the request unchanged; async
-    callers use `acall`, which awaits the actor coroutine on the caller's loop.
+    `call` and `acall` both submit the actor coroutine to the private loop.
+    `call` blocks on that future. `acall` awaits it, so a server
+    ``asyncio.Lock`` is only used from that one loop.
 
     Reconnect: when handed an existing ``server_state`` actor (plus reconnect
     job ids on the config) the transport reattaches to the already-running
@@ -56,8 +61,22 @@ class OnPremTransport(Transport):
         self._reconnect = server_state is not None
         self._state = server_state
         self._server = None  # ArcticRLRayServer, built once jobs exist
-        # One long-lived loop for every sync op instead of asyncio.run() per call.
+        # One long-lived loop, driven by its OWN thread, for every op. TRL's AsyncGRPOTrainer calls in from two
+        # threads concurrently -- the background rollout worker (generate / engine_old_log_probs) and the main
+        # trainer thread (forward_backward, weight_sync) -- so a per-caller `run_until_complete` on a shared loop
+        # races and raises "This event loop is already running". Running the loop in a dedicated thread and
+        # submitting via `run_coroutine_threadsafe` makes dispatch safe for any number of caller threads.
+        #
+        # Training RPCs on this loop await under ``ArcticRLRayServer._training_op_lock`` (#104).
+        # A blocking gather on the loop thread stalls generate for the whole step.
         self._loop = asyncio.new_event_loop()
+        self._loop_thread = self._start_loop_thread(self._loop)
+
+    @staticmethod
+    def _start_loop_thread(loop: asyncio.AbstractEventLoop) -> threading.Thread:
+        thread = threading.Thread(target=loop.run_forever, name="ray-transport-loop", daemon=True)
+        thread.start()
+        return thread
 
     # The whole client (this transport included) is cloudpickled when verl hands
     # a reconnected backend to the ArcticLLMServer Ray actor. An event loop is not
@@ -67,11 +86,13 @@ class OnPremTransport(Transport):
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
         state.pop("_loop", None)
+        state.pop("_loop_thread", None)
         return state
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
         self._loop = asyncio.new_event_loop()
+        self._loop_thread = self._start_loop_thread(self._loop)
 
     def initialize(self, client_config: ArcticClientConfig) -> JobHandles:
         if not self._reconnect:
@@ -130,39 +151,73 @@ class OnPremTransport(Transport):
         args = (request.body,) if request.job_id is None else (request.job_id, request.body)
         return method, args
 
-    def _run_on_loop(self, coro):
-        """Run ``coro`` on the private loop.
+    def _submit(self, coro) -> concurrent.futures.Future:
+        """Schedule ``coro`` on the private loop.
 
-        Sync callers (``ArcticRLClient``, destroy from a non-async thread) use
-        ``run_until_complete`` directly. Async callers (``AsyncArcticRLClient.shutdown``
-        invoked under verl's ``asyncio.run``) already have a running loop in this
-        thread, so nesting ``run_until_complete`` raises; hop to a worker thread.
+        Blocking on the returned future from the loop thread deadlocks: the
+        loop cannot run ``coro`` until this call returns. ``acall`` awaits the
+        future from the caller's loop instead of blocking this thread.
         """
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return self._loop.run_until_complete(coro)
-        import concurrent.futures
+        if threading.current_thread() is self._loop_thread:
+            coro.close()
+            raise RuntimeError(
+                "OnPremTransport._submit was called from the transport loop thread; "
+                "waiting on that future would deadlock. Await the server method on this loop instead."
+            )
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(self._loop.run_until_complete, coro).result()
+    def _run_on_loop(self, coro):
+        """Block until ``coro`` finishes on the private loop."""
+        return self._submit(coro).result()
+
+    def _cancel_pending(self) -> None:
+        """Cancel tasks still on the private loop, then wait until they finish."""
+        loop = self._loop
+
+        async def _cancel() -> None:
+            current = asyncio.current_task()
+            pending = [task for task in asyncio.all_tasks(loop) if task is not current]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        try:
+            self._submit(_cancel()).result(timeout=_LOOP_SHUTDOWN_TIMEOUT_S)
+        except concurrent.futures.TimeoutError:
+            logger.warning("in-flight Ray transport ops were still running at shutdown", exc_info=True)
 
     def call(self, request: Request) -> dict:
         method, args = self._resolve(request)
-        return self._run_on_loop(method(*args))
+        return self._submit(method(*args)).result()
 
     async def acall(self, request: Request) -> dict:
         method, args = self._resolve(request)
-        return await method(*args)
+        return await asyncio.wrap_future(self._submit(method(*args)))
 
     def shutdown(self) -> None:
         # In reconnect mode the jobs/server are owned by the driver process;
         # a reattached transport must not tear them down. Handles are cleared
         # after destroy so a second call (transport + client guard) is a no-op.
+        if threading.current_thread() is self._loop_thread:
+            raise RuntimeError("OnPremTransport.shutdown cannot run on the transport loop thread")
         if not self._reconnect:
             for job_type in JOB_TYPES:
                 job_id = getattr(self.jobs, job_type)
                 if job_id is not None:
                     self._run_on_loop(self._server.destroy(job_id, job_type))
             self.jobs = JobHandles()
-        self._loop.close()
+        # Cancel in-flight ops before stopping, and close the loop only after its
+        # thread has actually exited. close() on a still-running loop raises.
+        thread = self._loop_thread
+        if thread.is_alive():
+            self._cancel_pending()
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            thread.join(timeout=_LOOP_SHUTDOWN_TIMEOUT_S)
+            if thread.is_alive():
+                raise RuntimeError(
+                    "Ray transport loop thread did not exit within "
+                    f"{_LOOP_SHUTDOWN_TIMEOUT_S:.0f}s; refusing to close a running event loop"
+                )
+        if not self._loop.is_closed():
+            self._loop.close()

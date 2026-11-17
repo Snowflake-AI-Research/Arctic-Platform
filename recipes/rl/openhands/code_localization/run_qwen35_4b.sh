@@ -10,7 +10,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AP_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
-ARCTIC_PLATFORM_SPEC="${ARCTIC_PLATFORM_SPEC:-${AP_ROOT}[rl,cortex]}"
+# [sft] carries the RL client's DeepSpeed/liger imports. Sampling runs on Cortex,
+# so [rl] would only add the in-tree sampler (vLLM, kvcached), which does not
+# build without torch preinstalled.
+ARCTIC_PLATFORM_SPEC="${ARCTIC_PLATFORM_SPEC:-${AP_ROOT}[sft,cortex]}"
 OPENHANDS_REV="${OPENHANDS_REV:-85ecfd9333d2d2cc4404dd460fd38868d9b978e2}"
 OPENHANDS_SPEC="openhands-sdk @ git+https://github.com/OpenHands/software-agent-sdk.git@${OPENHANDS_REV}#subdirectory=openhands-sdk"
 OPENHANDS_TOOLS_SPEC="openhands-tools @ git+https://github.com/OpenHands/software-agent-sdk.git@${OPENHANDS_REV}#subdirectory=openhands-tools"
@@ -73,9 +76,8 @@ try:
     cfg = CortexConfig()
 except ValidationError:
     sys.exit(
-        "ERROR: no Cortex connection. Either run\n"
-        "         cortex-training login <config.json>\n"
-        "       or export ARCTIC_CORTEX_HOST, _DATABASE, _SCHEMA, and _PAT."
+        "ERROR: no Cortex connection. Export ARCTIC_CORTEX_HOST, _DATABASE, _SCHEMA, and _PAT\n"
+        "       (the host, database, schema, and pat from your cortex-training config JSON)."
     )
 print(cfg.base_url or f"{cfg.host} {cfg.database}.{cfg.schema_}")
 PY

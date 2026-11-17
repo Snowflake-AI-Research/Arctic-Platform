@@ -31,11 +31,11 @@ from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
-import torch.distributed.nn as dist_nn
 from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
 from torch.nn.attention.flex_attention import flex_attention
 
+from arctic_platform.model.implementations.gpu.sp.collectives import gather_sequence
 from arctic_platform.model.implementations.gpu.vllm_rounding import rope_rotary_slice_fp32
 
 _BACKEND = "qsa_flex"
@@ -48,12 +48,6 @@ def _cp_info(module) -> tuple[object | None, int, int]:
     if group is None:
         return None, 0, 1
     return group, dist.get_rank(group), dist.get_world_size(group)
-
-
-def _gather_sequence(tensor: torch.Tensor, group) -> torch.Tensor:
-    if group is None or dist.get_world_size(group) == 1:
-        return tensor
-    return torch.cat(dist_nn.all_gather(tensor.contiguous(), group=group), dim=1)
 
 
 @torch.no_grad()
@@ -598,8 +592,8 @@ def _qsa_attention_forward(
     if past_key_values is not None and past_key_values.get_seq_length() > 0:
         raise NotImplementedError("Qwen3.8 QSA FlexAttention cache decoding is handled by the inference backend")
     cp_group, _, _ = _cp_info(self)
-    key_states = _gather_sequence(key_states.transpose(1, 2), cp_group)
-    value_states = _gather_sequence(value_states.transpose(1, 2), cp_group)
+    key_states = gather_sequence(key_states.transpose(1, 2), cp_group)
+    value_states = gather_sequence(value_states.transpose(1, 2), cp_group)
     attention_output = flex_sparse_gqa_attention(
         query_states.transpose(1, 2),
         key_states,

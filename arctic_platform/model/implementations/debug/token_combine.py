@@ -14,9 +14,9 @@
 # limitations under the License.
 """Folding a token's expert rows onto one row in an order the program fixes, rather than the hardware's.
 
-The production fold is one atomic per row, in ``models.moe.token_combine``, and its order is whatever order the
-device delivers the rows in. The fold here removes that dependence, at the cost of a device synchronization and
-a padded layout, and ``debug.full_determinism`` is what selects it.
+The production fold in ``models.moe.token_combine`` sums each token's rows sequentially in stable input order.
+The fold here uses a fixed-width padded reduction instead, at the cost of a device synchronization and a padded
+layout, and ``debug.full_determinism`` is what selects it.
 
 :func:`maybe_use_fixed_order_row_sum` is how it gets selected, and it is the only thing outside this package
 that a model loader calls. It replaces the shared production symbol in the modules that fold rows, so no combine
@@ -180,9 +180,8 @@ def maybe_use_fixed_order_row_sum(model: torch.nn.Module, training_config: Mappi
     """Install the fixed-order fold for this model if the run asked for it, and change nothing if it did not.
 
     The entry point a model loader calls once the model is built, and the only place the flag is read. A run
-    that did not ask returns 0 with the production fold still in place, and keeps the delivery-order dependence
-    :func:`fixed_order_sum_rows_by_token` describes. A run that did pays a device synchronization and a padded
-    layout at every combine, which is why no production step carries it.
+    that did not ask returns 0 with the production sequential fold still in place. A run that did pays a device
+    synchronization and a padded layout at every combine.
 
     Returns the number of modules now folding through the fixed order, and raises if that is none: the request
     was granted or it was refused, never silently dropped.
@@ -195,7 +194,6 @@ def maybe_use_fixed_order_row_sum(model: torch.nn.Module, training_config: Mappi
     if rebound == 0:
         raise RuntimeError(
             "full determinism was requested but no module was found folding rows through "
-            "models.moe.token_combine.sum_rows_by_token, so the combine would have kept its delivery-order "
-            "dependence while the run reported itself deterministic"
+            "models.moe.token_combine.sum_rows_by_token, so the requested padded fold was not installed"
         )
     return rebound

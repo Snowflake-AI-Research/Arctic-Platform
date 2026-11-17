@@ -321,6 +321,28 @@ def test_mxfp4_experts_match_dequantized_bf16_and_train_only_activations():
     assert experts.w1.grad is None
 
 
+def test_mxfp4_experts_apply_the_routing_scores_dispatch_still_owes():
+    from arctic_platform.model.implementations.deepseek_v4.moe import Mxfp4GroupedExperts
+
+    torch.manual_seed(0)
+    experts = Mxfp4GroupedExperts(dim=64, hidden_dim=64, num_experts=2, swiglu_limit=10.0)
+    with torch.no_grad():
+        for name in ("w1", "w2", "w3"):
+            weight = getattr(experts, name)
+            weight.copy_(torch.randint(-7, 8, weight.shape, dtype=torch.int8))
+            getattr(experts, f"{name}_scale_inv").fill_(1.0)
+    x = torch.randn(4, 64, requires_grad=True)
+    counts = torch.tensor([2, 2], dtype=torch.int32)
+    scores = torch.tensor([0.25, 1.5, -0.5, 0.0], requires_grad=True)
+    with torch.no_grad():
+        plain = experts(x, counts)
+    weighted = experts(x, counts, scores)
+    torch.testing.assert_close(weighted, plain * scores.reshape(-1, 1))
+    weighted.sum().backward()
+    assert x.grad is not None and scores.grad is not None
+    assert experts.w1.grad is None
+
+
 def test_sqrtsoftplus_scores_match_softplus_sqrt():
     if not torch.cuda.is_available():
         pytest.skip("router histc on integer indices is CUDA-only")

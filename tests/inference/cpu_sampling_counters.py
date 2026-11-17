@@ -11,9 +11,11 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 for name in ('vllm', 'vllm.config', 'vllm.v1', 'vllm.v1.metrics',
-             'vllm.v1.metrics.loggers', 'vllm.v1.metrics.stats', 'ray'):
+             'vllm.v1.metrics.loggers', 'vllm.v1.metrics.stats',
+             'vllm.v1.engine', 'vllm.v1.engine.exceptions', 'ray'):
     sys.modules[name] = types.ModuleType(name)
 sys.modules['vllm.config'].VllmConfig = object
+sys.modules['vllm.v1.engine.exceptions'].EngineDeadError = type('EngineDeadError', (Exception,), {})
 sys.modules['vllm.v1.metrics.loggers'].StatLoggerBase = object
 for name in ('SchedulerStats', 'IterationStats', 'MultiModalCacheStats'):
     setattr(sys.modules['vllm.v1.metrics.stats'], name, object)
@@ -37,7 +39,7 @@ class SamplingCounterContract(unittest.TestCase):
             return actor.drain_metrics()
 
         handle = NS(drain_metrics=NS(remote=drain), set_replica_id=NS(remote=lambda _: None))
-        sched = scheduler.Scheduler([handle], dynamic_concurrency=False)
+        sched = scheduler.Scheduler([handle], capacity=1024)
         stats = NS(kv_cache_usage=.5, num_running_reqs=1, num_waiting_reqs=0,
                    spec_decoding_stats=NS(num_drafts=2, num_draft_tokens=6, num_accepted_tokens=3))
         iteration = NS(num_preempted_reqs=1, num_generation_tokens=4,
@@ -49,7 +51,6 @@ class SamplingCounterContract(unittest.TestCase):
         payload = asyncio.run(sched.drain_metrics())
         replica = payload['replicas'][0]
         self.assertEqual(len(replica['snapshots']), 1)
-        self.assertEqual(replica['snapshots'][0]['max_concurrency'], 64)
         totals = replica['engine_totals']
         self.assertEqual({k: v for k, v in totals.items() if k != 'started_at'},
                          dict(num_preempted_reqs=4, num_drafts=6,

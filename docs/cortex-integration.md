@@ -16,31 +16,63 @@ skips DeepSpeed, `transformers`, Ray and vLLM.
 
 ## Supported training regime
 
-Cortex sub-jobs expose training + sampling + weight-sync but no `/forward`
-sub-job, no disk-shared weight reload, and no colocation lifecycle. That
-constrains what runs correctly here:
+Cortex sub-jobs expose training + sampling + weight-sync. Policy log-probs
+use the training `forward` operation. There is no reference forward, no
+disk-shared weight reload, and no colocation lifecycle. That constrains what
+runs correctly here:
 
-* **Single-epoch on-policy GRPO only.** With `context.old_log_probs_shifted`
-  absent, the server-side GRPO loss defaults `old_log_probs =
-  logprobs.detach()`, restoring π_old ≡ π_new. Multi-epoch PPO needs the
-  rollout-time snapshot, which this backend cannot provide.
+* **`fwd_no_grad` returns the server logprobs in the caller's columns.**
+  A non-ZoRRo response is full width `[B, S]`, and column `t` is the log
+  probability of token `t + 1`, the same predict-next frame as the on-prem
+  forward. SkyRL shifts that onto the token itself. Rows are left-aligned on
+  the way out, because the packer rejects leading padding, and the response
+  is scattered back onto the caller's columns. Padding comes back as `0`.
+  The last real column is the roll-wrap value, and the loss mask there is 0.
+  A ZoRRo response stays in the client layout and scores each response token
+  itself, with `0` on the prompt columns. The logprobs come back under
+  `batch["logprobs"]` and `batch["log_probs"]`. A width other than the
+  caller's `attention_mask` raises.
+* **Log-prob calls keep arrival order.** `to_cortex_fwd_payload` stamps
+  `balance_batch` false and does not send `prompt_group_ids`.
+* **Non-ZoRRo clipping stays inert.** That training request drops
+  `old_log_probs`, so the server re-derives π_old from the live forward.
+  The returned logprobs are the caller's snapshot; they are not sent back
+  as `old_log_probs_shifted`.
+* **ZoRRo training sends that snapshot.** `fwd_bwd` places it on
+  `context.old_log_probs_shifted`, in the caller's columns and unshifted,
+  because ZoRRo log-probs sit on the response token they score. There is
+  still no reference forward, so a multi-epoch update against a frozen
+  policy is not available.
 * **No KL-to-reference.** There are no reference log-probs to build the term
   from, so `use_kl_loss` / `use_kl_in_reward` must be off. Asking for them
   raises from `_CortexClientShim.fwd_no_grad` rather than substituting zeros,
   which would reduce the KL to a function of the current policy alone.
-* **Clipping is inert, and `approx_kl` reads 0.0.** π_old is re-derived per
-  `fwd_bwd` rather than snapshotted. With one optimizer step per collected
-  batch — which is what SkyRL's Arctic trainer does, `policy_mini_batch_size`
-  being only the gradient-accumulation chunk — the policy cannot move within a
-  step, so π_old ≡ π_new holds exactly and the ratio is 1. That makes this
-  single-update on-policy GRPO rather than a broken approximation, but a recipe
-  that needs clipping to take several updates per batch cannot run here.
 * **Weight sync via NCCL only.** `save_weights` (SkyRL's disk-based reload)
   raises; use `sync_weights()` or `save_checkpoint()`.
 * **`wake_*` / `sleep_*` are no-ops.** Cortex sub-jobs are always awake; the
   transport short-circuits these ops.
 
 ## Operational limits
+
+### Router-replay Wire Contract
+
+**Replay coordination belongs to DSSST1 frame metadata, not the model batch.** For both `forward` and `forward-backward`, serialize `router_replay` next to `response_options` in the frame metadata. Keep tensor inputs and per-row `rr_sample_ids`, `rr_replay_meta` and `rr_discard` in the model payload. Chunk envelopes wrap that completed frame without changing its metadata.
+
+```python
+frame = wire.dumps(
+    batch,
+    metadata=dict(
+        response_options=dict(format="dssst1", delivery="chunked"),
+        router_replay=dict(sampling_job_id="zone-sampling-id", identity_version=1),
+    ),
+)
+```
+
+**The transport translates public sampler IDs using successful bootstrap responses.** `bootstrap-router-replay` accepts public source and target sub-job IDs and returns `sampling_job_id`. The transport caches that zone sampler ID under the pair `(public_training_id, public_sampling_id)`. For subsequent `forward` and `forward-backward` requests, only that matching pair is translated; other pairs, other operations and the caller's original request remain unchanged. A request without a cached mapping retains its supplied ID rather than guessing another sampler.
+
+**The consuming zone implements this contract.** Its [metadata reader](https://github.com/snowflake-eng/dss-platform/blob/c4e35f9403972f66404e1dc2ca6bb535fea1d92e/dss/ray_dss/zones/api_v0.py#L995) extracts `router_replay.sampling_job_id`; its [forward/backward handler](https://github.com/snowflake-eng/dss-platform/blob/c4e35f9403972f66404e1dc2ca6bb535fea1d92e/dss/ray_dss/zones/api_v0.py#L2529) resolves the zone pair from that metadata, and its [bootstrap response](https://github.com/snowflake-eng/dss-platform/blob/c4e35f9403972f66404e1dc2ca6bb535fea1d92e/dss/ray_dss/zones/api_v0.py#L3343) returns the sampler ID. `tests/client/test_cortex_sampler_identity.py` decodes transmitted single and multi-chunk frames after bootstrap and checks the zone-visible sampler ID. `tests/client/test_cortex_forward.py` verifies frame metadata, per-row replay fields and input immutability.
+
+### Resource And Delivery Limits
 
 * **8 GPUs per account.** The GSM8K recipe asks for 4 training + 4 sampling,
   which is exactly the cap, so two runs cannot coexist.
@@ -96,6 +128,13 @@ constrains what runs correctly here:
 * **Recipe** —
   [`recipes/rl/skyrl/simple_gsm8k_cortex/`](../recipes/rl/skyrl/simple_gsm8k_cortex/README.md),
   SkyRL GRPO on GSM8K, with a measured reference curve.
+* **TRL recipe** —
+  [`recipes/rl/trl/gsm8k_cortex/`](../recipes/rl/trl/gsm8k_cortex/README.md),
+  TRL `AsyncGRPOTrainer` on GSM8K. The driver is CPU-only and ZoRRo is off.
+  Trainer-π_old issues a real `/forward`. Logged `kl` is the per-step Schulman
+  approximation. The pre-upstream-TRL 250-step reference run averaged `5.9e-4`
+  for its first 20 steps and `1.8e-2` for its last 20; revalidate those values
+  after changing the pinned TRL version.
 
 ## Env vars
 

@@ -19,9 +19,22 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parents[3]
 for _rel in ("recipes/rl/harbor", "recipes/rl/openhands/code_localization"):
     _p = str(_ROOT / _rel)
     if _p in sys.path:
         sys.path.remove(_p)
     sys.path.insert(0, _p)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sandbox_sweep(monkeypatch):
+    """Keep sandboxes that fake creates register away from the exit-time sweep, which would call the real service."""
+    try:
+        from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+    except ImportError:
+        return
+    monkeypatch.setattr(sf_env, "_LIVE_SANDBOXES", {})
+    monkeypatch.setattr(sf_env, "_sweep_at_exit", True)

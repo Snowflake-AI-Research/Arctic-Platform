@@ -96,7 +96,7 @@ def _config(attn_implementation, **overrides):
         num_experts_per_tok=1,
         hc_count=2,
         hc_lowrank=4,
-        layer_types=["qwen_sparse_attention"],
+        layer_types=["indexed_attention"],
         indexer_n_heads=1,
         indexer_kv_heads=1,
         indexer_head_dim=4,

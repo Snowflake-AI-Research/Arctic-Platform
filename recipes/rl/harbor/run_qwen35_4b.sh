@@ -5,10 +5,10 @@
 #   1. TRAIN_HARBOR_TASKS=/path/to/train_harbor_tasks
 #   2. EVAL_HARBOR_TASKS=/path/to/eval_harbor_tasks  (defaults to TRAIN_HARBOR_TASKS)
 # plus where the tasks run:
-#   - HARBOR_ENV=snowflake (default; Snowflake Cortex Sandboxes), docker, modal, daytona, ...
-#     or host, which runs tasks on this machine and also needs HARBOR_ALLOW_HOST_EXEC=1
-#   - HARBOR_ENV_KWARGS='{"image_repo": "DB.SCHEMA.REPO", "connection": "MY_CONN", "role": "MY_ROLE"}'
-#     (a JSON object passed to the environment, like `harbor run --ek`)
+#   - HARBOR_ENV=snowflake (default; Snowflake Cortex Sandboxes), or host, which runs tasks on
+#     this machine and also needs HARBOR_ALLOW_HOST_EXEC=1
+#   - HARBOR_ENV_KWARGS='{"base_image": "sandbox-base", "connection": "MY_CONN", "role": "MY_ROLE"}'
+#     (a JSON object passed to the environment, like `harbor run --ek`; see README.md)
 # and optionally:
 #   - HARBOR_SKILL=/path/to/skill_or_skills_dir
 #   - HARBOR_AGENT=harbor_rl.agent:OpenHandsHarborAgent (or your own driver-side Harbor BaseAgent; installed agents are refused)
@@ -103,9 +103,8 @@ try:
     cfg = CortexConfig()
 except ValidationError:
     sys.exit(
-        "ERROR: no Cortex connection. Either run\n"
-        "         cortex-training login <config.json>\n"
-        "       or export ARCTIC_CORTEX_HOST, _DATABASE, _SCHEMA, and _PAT."
+        "ERROR: no Cortex connection. Export ARCTIC_CORTEX_HOST, _DATABASE, _SCHEMA, and _PAT\n"
+        "       (the host, database, schema, and pat from your cortex-training config JSON)."
     )
 print(cfg.base_url or f"{cfg.host} {cfg.database}.{cfg.schema_}")
 PY
@@ -144,6 +143,8 @@ stop_driver() {
 
 trap stop_driver INT TERM
 
+# data.dataloader.num_workers=0: SkyRL's default of 8 loader processes holds about
+# 1 GB of driver memory each, to read a few parquet rows per step.
 cd "${SKYRL_HOME}"
 uv run --isolated --extra skyrl-train \
     --with "${ARCTIC_PLATFORM_SPEC}" \
@@ -172,6 +173,7 @@ uv run --isolated --extra skyrl-train \
     trainer.policy.model.path="${MODEL}" \
     data.train_data="['${TRAIN_FILES}']" \
     data.val_data="['${VAL_FILES}']" \
+    data.dataloader.num_workers=0 \
     trainer.placement.colocate_all=false \
     trainer.placement.policy_num_nodes=1 \
     trainer.placement.policy_num_gpus_per_node="${NUM_TRAIN_GPUS}" \
