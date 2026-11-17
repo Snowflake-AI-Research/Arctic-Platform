@@ -180,6 +180,48 @@ def test_splitting_refuses_to_lower_a_call_count():
         split_groups_to_count([[0], [1]], [4, 4], 1)
 
 
+def test_costliest_first_runs_the_long_call_before_the_short_one():
+    """Row order and cost disagree here, so only a cost order puts the long call first.
+
+    Call ``k`` waits for the slowest shard's ``k``-th call. Two shards whose rows arrive short-first would run
+    their short calls together and then their long ones only if both sort the same way, so the order has to be
+    by cost and not by which row happened to come first.
+    """
+    from arctic_platform.common.packing import costliest_first
+
+    assert costliest_first([[0], [1]], [2, 8], 9) == [[1], [0]]
+    assert costliest_first([[0], [1], [2]], [3, 9, 1], 10) == [[1], [0], [2]]
+
+
+def test_costliest_first_scores_attention_not_only_tokens():
+    """Equal token counts, unequal attention: the one long row costs more than two half-length rows.
+
+    Both calls carry 10 tokens, so a token-only key would tie them and keep row order. The ``len**2`` term is what
+    puts the single 10-token row ahead of the 5 + 5 pair.
+    """
+    from arctic_platform.common.packing import costliest_first
+
+    assert costliest_first([[0, 1], [2]], [5, 5, 10], 10) == [[2], [0, 1]]
+
+
+def test_costliest_first_keeps_row_order_among_equal_costs_and_rows_within_a_call():
+    """Ties fall back to the first row, and each call's rows stay ascending, so every rank derives one plan."""
+    from arctic_platform.common.packing import costliest_first
+
+    assert costliest_first([[1], [0]], [4, 4], 9) == [[0], [1]]
+    assert costliest_first([[3, 0], [2, 1]], [2, 3, 4, 5], 16) == [[0, 3], [1, 2]]
+    groups = [[0, 2], [1], [3]]
+    ordered = costliest_first(groups, [4, 7, 1, 2], 9)
+    assert sorted(ordered) == sorted(groups)
+
+
+def test_costliest_first_refuses_a_non_positive_budget():
+    from arctic_platform.common.packing import costliest_first
+
+    with pytest.raises(ValueError, match="must be positive"):
+        costliest_first([[0]], [4], 0)
+
+
 def test_window_cu_seqlens_are_the_row_boundaries_when_nothing_is_sharded():
     _packed_call, metadata = _packed([3, 2])
 

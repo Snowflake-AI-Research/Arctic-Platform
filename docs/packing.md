@@ -21,6 +21,8 @@ Every training path needs this, and all of them have to agree on where a row beg
 
 `split_groups_to_count(groups, valid_lengths, target_count)` raises a plan to a given number of calls by splitting its widest groups; `token_budget_microbatch_groups(batch, max_tokens_per_mb, min_groups)` is a batch-level convenience that reads the lengths off a batch and applies both, used by tests rather than by dispatch.
 
+Both return groups in ascending row order. `costliest_first(groups, valid_lengths, max_tokens_per_mb)` turns a plan into an execution order: costliest call first, scored as tokens plus `sum(len**2) / max_tokens_per_mb`, ties kept in first-row order. Each call ends at a collective that spans DP shards, so call `k` costs the slowest shard's `k`-th call; ordering every shard by cost lines those calls up, where row order pairs one shard's long call with another's short one. Apply it after `split_groups_to_count`, which re-sorts by row. A shard short of the call count pads by repeating its last call, which is then its cheapest.
+
 Sequence parallelism runs this same table with `shard_count = sp_size`. The DSS `docs/sequence_parallelism.md` covers the schedule that drives it.
 
 Invariants to preserve:

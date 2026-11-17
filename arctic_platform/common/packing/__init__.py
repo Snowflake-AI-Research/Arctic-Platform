@@ -31,6 +31,7 @@ The contract, in the order the pieces get used:
    ``split_groups_to_count`` raises a plan to a required number of calls. Both read only the rows' token counts,
    so every rank derives the same plan from the same shard without communicating.
    ``token_budget_microbatch_groups(batch, max_tokens_per_mb, min_groups)`` applies the pair to a whole batch.
+   ``costliest_first`` reorders a plan's calls by estimated cost, so call ``k`` lines up across DP shards.
 2. ``pack_microbatch(data)`` turns that group's valid tokens into one ``[1, T, ...]`` model call plus a
    ``PackMetadata`` recording where each row lives. Padding is gone: ``T`` is the sum of the rows' real lengths.
 3. ``pad_packed_microbatch(packed, metadata, multiple)`` right-pads ``T`` to a multiple, which a token-axis split
@@ -57,6 +58,7 @@ from .groups import batch_num_rows
 from .groups import batch_position_ids
 from .groups import batch_seqlen
 from .groups import batch_tensor
+from .groups import costliest_first
 from .groups import select_rows
 from .groups import shard_valid_lengths
 from .groups import singleton_microbatch_groups
@@ -93,6 +95,7 @@ __all__ = [
     "batch_position_ids",
     "batch_seqlen",
     "batch_tensor",
+    "costliest_first",
     "map_batch_values",
     "pack_microbatch",
     "packed_token_index",
