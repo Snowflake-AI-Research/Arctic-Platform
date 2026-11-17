@@ -294,10 +294,29 @@ def test_on_error_without_pre_after_post_step_leaves_zero_totals():
     assert report["router"]["tokens_per_expert"] == [0.0] * EXPERTS
 
 
-def test_on_error_without_pre_after_successful_fwd_keeps_earlier_totals():
-    """Rank that never took pre_* for the failing request must not wipe earlier totals."""
+def test_on_error_after_successful_fwd_restores_pre_request_totals():
+    """Sibling that finished the failing request must still drop that request on broadcast."""
+    model, callback, trainer = _hooked(stride=1)
+    x = torch.randn(4, DIM)
+
+    callback.pre_fwd_bwd(trainer)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(x)
+    callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+    callback.post_fwd_bwd(trainer, {})
+
+    callback.on_error(trainer, "fwd_bwd", RuntimeError("peer failed mid-fwd"))
+    callback.post_step(trainer)
+
+    _reduce, report = callback.pending["router_stats"]
+    assert report["router"]["sampled_tokens"] == 0.0
+    assert report["router"]["tokens_per_expert"] == [0.0] * EXPERTS
+
+
+def test_on_error_after_successful_fwd_keeps_earlier_request_only():
     model, callback, trainer = _hooked(stride=1)
     first = torch.randn(4, DIM)
+    second = torch.randn(6, DIM)
 
     callback.pre_fwd_bwd(trainer)
     callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
@@ -305,11 +324,57 @@ def test_on_error_without_pre_after_successful_fwd_keeps_earlier_totals():
     callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
     callback.post_fwd_bwd(trainer, {})
 
-    callback.on_error(trainer, "fwd_bwd", RuntimeError("peer failed before this rank's pre_fwd_bwd"))
+    callback.pre_fwd_bwd(trainer)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(second)
+    callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+    callback.post_fwd_bwd(trainer, {})
+
+    callback.on_error(trainer, "fwd_bwd", RuntimeError("peer failed after this rank finished"))
     callback.post_step(trainer)
 
     _reduce, report = callback.pending["router_stats"]
     assert report["router"]["sampled_tokens"] == pytest.approx(float(len(first)))
+
+
+def test_broadcast_on_error_then_retry_matches_single_request_totals():
+    """Failing and succeeding ranks must agree after on_error + retry of the same request."""
+    fail_model, fail_cb, fail_trainer = _hooked(stride=1)
+    ok_model, ok_cb, ok_trainer = _hooked(stride=1)
+    batch = torch.randn(4, DIM)
+    retry = torch.randn(4, DIM)
+
+    for model, cb, trainer in (
+        (fail_model, fail_cb, fail_trainer),
+        (ok_model, ok_cb, ok_trainer),
+    ):
+        cb.pre_fwd_bwd(trainer)
+        cb.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+        model.router(batch)
+
+    ok_cb.post_fwd_bwd_microbatch(ok_trainer, is_padding=False)
+    ok_cb.post_fwd_bwd(ok_trainer, {})
+
+    fail_cb.on_error(fail_trainer, "fwd_bwd", RuntimeError("rank0 blew up"))
+    ok_cb.on_error(ok_trainer, "fwd_bwd", RuntimeError("peer failure during fwd_bwd"))
+
+    for model, cb, trainer in (
+        (fail_model, fail_cb, fail_trainer),
+        (ok_model, ok_cb, ok_trainer),
+    ):
+        cb.pre_fwd_bwd(trainer)
+        cb.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+        model.router(retry)
+        cb.post_fwd_bwd_microbatch(trainer, is_padding=False)
+        cb.post_fwd_bwd(trainer, {})
+        cb.post_step(trainer)
+
+    fail_report = fail_cb.pending["router_stats"][1]["router"]
+    ok_report = ok_cb.pending["router_stats"][1]["router"]
+    assert fail_report["sampled_tokens"] == pytest.approx(float(len(retry)))
+    assert ok_report["sampled_tokens"] == pytest.approx(float(len(retry)))
+    assert fail_report["sampled_tokens"] == ok_report["sampled_tokens"]
+    assert fail_report["tokens_per_expert"] == ok_report["tokens_per_expert"]
 
 @pytest.mark.parametrize(
     "config",

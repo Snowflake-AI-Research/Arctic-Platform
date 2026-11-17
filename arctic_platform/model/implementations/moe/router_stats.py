@@ -59,10 +59,11 @@ class RouterStatsCallback(MetricsCallback):
     callback-owned ``all_reduce``. Homogeneous EP/SP is assumed: every enabled rank hooks the same routers.
 
     ``pre_fwd_bwd`` / ``pre_fwd_only`` snapshot the step's totals so a failed request can restore them.
-    ``on_error`` for those stages restores the snapshot (DSS broadcasts ``on_error`` so siblings match);
-    earlier successful forwards in the same accumulation window keep counting toward ``/step``.
-    Successful ``post_fwd_bwd`` / ``post_fwd_only`` / ``post_step`` drop the snapshot so a late
-    ``on_error`` on a rank that never took a pre-hook for the failing request cannot revive stale totals.
+    ``on_error`` for those stages restores the snapshot (DSS broadcasts ``on_error`` so siblings match,
+    including a rank that already ran ``post_fwd_*`` for the same request); earlier successful forwards
+    in the same accumulation window keep counting toward ``/step``. The snapshot is kept after a
+    successful ``post_fwd_*`` and cleared only at ``post_step`` (after publish) so a late ``on_error``
+    cannot revive totals into the next step.
     """
 
     def __init__(self, training_config: Mapping[str, Any]) -> None:
@@ -107,12 +108,6 @@ class RouterStatsCallback(MetricsCallback):
     def pre_fwd_only_microbatch(self, trainer: Trainer, is_padding: bool) -> None:
         self._counting = not is_padding
 
-    def post_fwd_bwd(self, trainer: Trainer, result: dict) -> None:
-        self._clear_snapshot()
-
-    def post_fwd_only(self, trainer: Trainer, result: dict) -> None:
-        self._clear_snapshot()
-
     def post_fwd_bwd_microbatch(self, trainer: Trainer, is_padding: bool) -> None:
         self._counting = True
 
@@ -128,9 +123,9 @@ class RouterStatsCallback(MetricsCallback):
     def on_error(self, trainer: Trainer, stage: str, exc: BaseException) -> None:
         # A failed fwd_bwd / forward_only can leave partial totals for this request. Restore the
         # pre-request snapshot so earlier successful forwards in the same step still publish at
-        # post_step, and a retry of this request does not double-count. Step failures keep the
-        # completed totals as-is. No snapshot means this rank never took pre_* for the failing
-        # request — leave totals alone (do not revive an earlier request's snapshot).
+        # post_step, and a retry of this request does not double-count — including on a sibling
+        # that already ran post_fwd_* (snapshot is kept until post_step). Step failures keep the
+        # completed totals as-is. No snapshot (e.g. after post_step) leaves totals alone.
         if stage in {"fwd_bwd", "forward_only"}:
             self._restore_totals()
         else:
@@ -142,7 +137,7 @@ class RouterStatsCallback(MetricsCallback):
         self._saved_totals = [totals.detach().clone() for _, totals in self._layers]
 
     def _clear_snapshot(self) -> None:
-        """Drop the pre-request snapshot after success so late ``on_error`` cannot restore it."""
+        """Drop the pre-request snapshot after ``post_step`` so it cannot revive into the next step."""
         self._saved_calls = None
         self._saved_totals = None
 
