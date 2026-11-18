@@ -28,6 +28,7 @@ tensors on the same side, and the checkpoint's weights bring that to -2.01e-04 w
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import hashlib
 import json
@@ -507,6 +508,45 @@ def _load_reduced_pretrained(model_class, source: str, cfg, num_layers: int, ori
     return model
 
 
+@contextlib.contextmanager
+def _fp8_partial_blocks_on_declared_grid(block_size):
+    """Decode a block-FP8 weight that ends in a partial block on the checkpoint's declared block grid.
+
+    Transformers 5.20's Fp8Dequantize derives the block from the scale grid (rows // scale_rows) and refuses a
+    weight that grid does not divide. GLM-5.3 stores kv_a_proj_with_mqa (576 x 6144, 128 x 128 blocks) with
+    ceil(576 / 128) = 5 scale rows, so its fixture failed to load. Arctic Platform decodes such a weight with the
+    declared block and pads the last one (model/implementations/fp8.py dequantize_from_fp8_blockwise, which
+    BlockFp8Linear uses for GLM-5.3's frozen FP8 projections); this does the same, in the same fp32 product, for the
+    weights Transformers refuses. Every other weight keeps Transformers' own decode.
+    """
+    import torch
+    from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+
+    original = Fp8Dequantize._dequantize_one
+    square = isinstance(block_size, (list, tuple)) and len(block_size) == 2 and block_size[0] == block_size[1]
+    # The loader hands the op the FP8 codes already cast to the load dtype (bf16 here, exact for e4m3); packed FP4
+    # codes are not floating point (int8) or are their own dtype, and keep Transformers' decode.
+    packed = {torch.int8, getattr(torch, "float4_e2m1fn_x2", torch.int8)}
+
+    def dequantize_one(self, quantized, scales, output_dtype=None):
+        codes = quantized.is_floating_point() and quantized.dtype not in packed
+        if square and codes and scales.ndim == quantized.ndim >= 2:
+            rows, cols = quantized.shape[-2:]
+            block = int(block_size[0])
+            ceil_grid = (-(-rows // block), -(-cols // block))
+            if tuple(scales.shape[-2:]) == ceil_grid and (rows % block or cols % block):
+                from arctic_platform.model.implementations.fp8 import dequantize_from_fp8_blockwise
+
+                return dequantize_from_fp8_blockwise(quantized, scales, block, dtype=output_dtype or torch.bfloat16)
+        return original(self, quantized, scales, output_dtype=output_dtype)
+
+    Fp8Dequantize._dequantize_one = dequantize_one
+    try:
+        yield
+    finally:
+        Fp8Dequantize._dequantize_one = original
+
+
 def materialize_pretrained(
     source: str, dest: str, num_layers: int, vision_depth: int = 2, force: bool = False
 ) -> ModelSpec:
@@ -540,16 +580,22 @@ def materialize_pretrained(
     if force or not (dest_path / "config.json").exists():
         dest_path.mkdir(parents=True, exist_ok=True)
         cls = getattr(transformers, cfg.architectures[0])
-        model = _load_reduced_pretrained(
-            cls,
-            source,
-            cfg,
-            num_layers,
-            original_layers,
-            dtype=torch.bfloat16,
-            trust_remote_code=True,
-            **load_options,
+        decode = (
+            _fp8_partial_blocks_on_declared_grid(quantization.get("weight_block_size"))
+            if quantization is not None
+            else contextlib.nullcontext()
         )
+        with decode:
+            model = _load_reduced_pretrained(
+                cls,
+                source,
+                cfg,
+                num_layers,
+                original_layers,
+                dtype=torch.bfloat16,
+                trust_remote_code=True,
+                **load_options,
+            )
         if quantization is not None:
             if (
                 getattr(model, "hf_quantizer", None) is not None

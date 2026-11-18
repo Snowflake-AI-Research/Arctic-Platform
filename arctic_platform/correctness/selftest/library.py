@@ -21112,6 +21112,28 @@ def test_onboarding_reduce_config_keeps_every_type_of_a_pattern_without_blocks(m
         synth_model.reduce_config("unused", 4)
 
 
+def test_onboarding_fp8_fixture_decodes_a_partial_block_on_the_declared_grid() -> None:
+    """GLM-5.3's kv_a_proj_with_mqa is 576 rows of 128 x 128 blocks: five scale rows, the last block partial."""
+    from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+
+    generator = torch.Generator().manual_seed(0)
+    weight = torch.randn(576, 256, generator=generator).to(torch.float8_e4m3fn)
+    scales = torch.rand(5, 2, generator=generator) + 0.5
+    expected = (weight.float() * scales.repeat_interleave(128, 0)[:576].repeat_interleave(128, 1)).to(torch.bfloat16)
+    decoder = Fp8Dequantize(None)
+    with pytest.raises(ValueError, match=r"Weight shape \(576, 256\) not divisible by scale grid \(5, 2\)"):
+        decoder._dequantize_one(weight, scales, output_dtype=torch.bfloat16)
+    with synth_model._fp8_partial_blocks_on_declared_grid([128, 128]):
+        decoded = decoder._dequantize_one(weight, scales, output_dtype=torch.bfloat16)
+        # Transformers' loader hands the op the codes already cast to the load dtype.
+        cast = decoder._dequantize_one(weight.to(torch.bfloat16), scales, output_dtype=torch.bfloat16)
+        whole = decoder._dequantize_one(weight[:512], scales[:4], output_dtype=torch.bfloat16)
+    assert decoded.dtype == torch.bfloat16 and torch.equal(decoded, expected) and torch.equal(cast, expected)
+    assert torch.equal(whole, expected[:512])
+    with pytest.raises(ValueError, match="not divisible by scale grid"):
+        decoder._dequantize_one(weight, scales, output_dtype=torch.bfloat16)
+
+
 def test_onboarding_reduced_nemotron_h_config_is_read_by_both_engines(monkeypatch, tmp_path: Path) -> None:
     """Nemotron-3-Nano's remote config gives way to the Transformers class; the fixture keeps the checkpoint names."""
     from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import (
