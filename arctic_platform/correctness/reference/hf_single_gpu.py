@@ -383,6 +383,43 @@ def reference_row_groups(
     return row_groups(lengths, row_length, token_budget)
 
 
+def accumulator_device(model, gradient_device, accum_dtype) -> "torch.device":
+    """Hold the float32 accumulator on the gradients' GPU when it fits there, else on the CPU.
+
+    Chosen once, after the first microbatch's backward, when that microbatch's activations are released: the GPU
+    when it can hold the whole trainable set's accumulator plus twice the activation peak the microbatch measured
+    (later microbatches have the same rows, but MoE routing moves their peak). A host accumulator costs a pageable
+    copy, a host-side widening and a host addition of every gradient after every microbatch: 98% of a 9.7B-parameter
+    full-FT reference's time, its GPU near idle. A fixture that only fits beside a host accumulator keeps it.
+    """
+    import torch
+
+    if gradient_device.type != "cuda":
+        return torch.device("cpu")
+    itemsize = torch.empty((), dtype=accum_dtype).element_size()
+    need = itemsize * sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    free, _ = torch.cuda.mem_get_info(gradient_device)
+    allocated = torch.cuda.memory_allocated(gradient_device)
+    obtainable = free + torch.cuda.memory_reserved(gradient_device) - allocated
+    transient = torch.cuda.max_memory_allocated(gradient_device) - allocated
+    return gradient_device if need + 2 * transient <= obtainable else torch.device("cpu")
+
+
+def drain_gradient(accumulator: Dict[str, "torch.Tensor"], name: str, gradient, accum_dtype, device) -> None:
+    """Add one gradient into its accumulator, which lives on ``device``.
+
+    On the gradient's own device the mixed-dtype ``add_`` widens the bfloat16 operand inside the kernel: the same
+    exact widening and the same correctly rounded float32 addition as the host path, without a temporary.
+    """
+    gradient = gradient.detach()
+    if name not in accumulator:
+        accumulator[name] = gradient.to(device=device, dtype=accum_dtype)
+    elif accumulator[name].device == gradient.device:
+        accumulator[name].add_(gradient)
+    else:
+        accumulator[name].add_(gradient.to(device=accumulator[name].device, dtype=accum_dtype))
+
+
 def _forward_backward(
     engine: ReferenceEngine,
     batch,
@@ -437,6 +474,8 @@ def _forward_backward(
     # float32 unless a caller is deliberately measuring what a narrower accumulator costs.
     accum_dtype = accumulate_dtype or torch.float32
     accumulator: Dict[str, "torch.Tensor"] = {}
+    # The CPU until the first microbatch's backward chooses (accumulator_device).
+    device_for_accumulator = None
     total_loss = 0.0
 
     lengths = [seq_len] * int(input_ids.shape[0])
@@ -508,23 +547,22 @@ def _forward_backward(
                 # parameter's bfloat16 buffer would round each addition. The production chunked LM head has
                 # one autograd invocation and is drained once below instead.
                 if head_name is not None and head.weight.grad is not None:
-                    if head_name not in accumulator:
-                        accumulator[head_name] = head.weight.grad.detach().to(device="cpu", dtype=accum_dtype)
-                    else:
-                        accumulator[head_name].add_(head.weight.grad.detach().to(device="cpu", dtype=accum_dtype))
+                    drain_gradient(
+                        accumulator, head_name, head.weight.grad, accum_dtype, device_for_accumulator or "cpu"
+                    )
                     head.weight.grad = None
 
         hidden.backward(detached.grad)
+        if device_for_accumulator is None:
+            device_for_accumulator = accumulator_device(model, head.weight.device, accum_dtype)
+            for name in accumulator:
+                accumulator[name] = accumulator[name].to(device_for_accumulator)
 
         # Drain bfloat16 gradients into the float32 accumulator after every microbatch, so the running sum
         # never lives in the parameter dtype.
         for name, param in model.named_parameters():
-            if param.grad is None:
-                continue
-            if name not in accumulator:
-                accumulator[name] = param.grad.detach().to(device="cpu", dtype=accum_dtype)
-            else:
-                accumulator[name].add_(param.grad.detach().to(device="cpu", dtype=accum_dtype))
+            if param.grad is not None:
+                drain_gradient(accumulator, name, param.grad, accum_dtype, device_for_accumulator)
         model.zero_grad(set_to_none=True)
 
     return ForwardBackwardResult(
@@ -548,9 +586,8 @@ def forward_backward(engine: ReferenceEngine, batch, **options) -> ForwardBackwa
 def gradient_norms(gradients: Dict[str, "torch.Tensor"], device: str) -> Dict[str, float]:
     """One L2 norm per accumulated gradient.
 
-    Keeping the request-wide accumulator on CPU prevents it from competing with the longest sequence
-    activation graph. One completed tensor at a time moves back to CUDA so norm reduction semantics still
-    match the GPU-side Arctic Platform metric.
+    A host accumulator (one the GPU had no room for, accumulator_device) moves back to CUDA one completed tensor
+    at a time, so norm reduction semantics still match the GPU-side Arctic Platform metric.
     """
     import torch
 

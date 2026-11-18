@@ -8864,6 +8864,42 @@ def test_reference_loss_applies_final_logit_softcapping(chunked):
     assert loss(None) == pytest.approx(uncapped, rel=1e-4)
 
 
+def test_reference_accumulator_moves_to_the_gpu_only_with_room_and_drains_the_host_path_bits(monkeypatch):
+    """A 9.7B-parameter full-FT reference spent 98% of its time draining every gradient into a host accumulator.
+
+    The accumulator now sits on the gradients' GPU when that holds it plus twice the microbatch's activation peak, and
+    a same-device drain gives the host path's bits: exact widening, then one correctly rounded float32 addition.
+    """
+    model = torch.nn.Linear(256, 4, bias=False)  # 1,024 trainable float32 elements: a 4,096-byte accumulator
+    gib = 1024**3
+    stats = {"free": 10 * gib, "reserved": 2 * gib, "allocated": gib, "peak": gib + 512}
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (stats["free"], 80 * gib))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: stats["reserved"])
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: stats["allocated"])
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: stats["peak"])
+    cuda, cpu = torch.device("cuda", 0), torch.device("cpu")
+    assert hf_single_gpu.accumulator_device(model, cuda, torch.float32) == cuda
+    stats.update(free=0, reserved=gib + 4096 + 2 * 512 - 1)
+    assert hf_single_gpu.accumulator_device(model, cuda, torch.float32) == cpu
+    stats["reserved"] += 1
+    assert hf_single_gpu.accumulator_device(model, cuda, torch.float32) == cuda
+    model.weight.requires_grad_(False)
+    stats["reserved"] = gib + 2 * 512
+    assert hf_single_gpu.accumulator_device(model, cuda, torch.float32) == cuda
+    assert hf_single_gpu.accumulator_device(model, cpu, torch.float32) == cpu
+
+    generator = torch.Generator().manual_seed(0)
+    scales = 2.0 ** torch.randint(-140, 100, (8, 4096), generator=generator).float()  # subnormal through large
+    gradients = (torch.randn(8, 4096, generator=generator) * scales).bfloat16()
+    drained, host = {}, None
+    for gradient in gradients:
+        hf_single_gpu.drain_gradient(drained, "w", gradient, torch.float32, cpu)
+        widened = gradient.to(device="cpu", dtype=torch.float32)  # the host drain this replaces
+        host = widened if host is None else host.add_(widened)
+    assert drained["w"].dtype == torch.float32
+    assert torch.equal(drained["w"].view(torch.int32), host.view(torch.int32))
+
+
 def test_reference_routes_attention_wider_than_flash_attention_3_to_sdpa(monkeypatch):
     """Gemma 4's full-attention layers are 512 wide and FlashAttention 3 stops at 256; its sliding ones stay on it."""
     from transformers.integrations import sdpa_attention
