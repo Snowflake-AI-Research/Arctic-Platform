@@ -1221,12 +1221,15 @@ def _training_client_config(session: GatewaySession, payload: dict) -> ArcticCli
     n_gpus = int(tc.pop("n_gpus"))
     max_seq_len = int(tc.pop("max_seq_len", 8192))
     ds = deepcopy(tc.pop("ds_config", {}))
+    # A training config's train_batch_size is the rows per step DSS reports, never DeepSpeed's batch: DSS builds that
+    # as micro x GAS x (n_gpus // sp_size) and lets only ds_config override it (dss jobs/gpu/training.py
+    # _build_ds_config). A Cortex job keeps it where DSS reads it; DeepSpeed's batch comes from ds_config alone.
     train_batch_size = tc.pop("train_batch_size", None)
+    if train_batch_size is not None and isinstance(getattr(session, "backend", None), CortexConfig):
+        tc["train_batch_size"] = train_batch_size
     gradient_clipping = tc.pop("gradient_clipping", None)
     optimizer = tc.pop("optimizer", None)
     peft = tc.pop("peft_config", None)
-    if train_batch_size is not None:
-        ds.setdefault("train_batch_size", train_batch_size)
     if gradient_clipping is not None:
         ds.setdefault("gradient_clipping", gradient_clipping)
     if optimizer is not None:

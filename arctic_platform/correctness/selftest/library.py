@@ -23924,6 +23924,35 @@ def test_driver_reviewed_training_preserves_explicit_format_without_mutating_pay
     assert payload == before
 
 
+@pytest.mark.parametrize("backend", ["cortex", "onprem"])
+def test_driver_reviewed_training_batch_stays_rows_per_step_not_the_deepspeed_batch(tmp_path, backend):
+    """qwen3-1.7b's catalog file trains 32 rows per step on 8 GPUs; DSS builds DeepSpeed's batch as micro x GAS x DP."""
+    from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
+    from arctic_platform.common.deepspeed_engine import build_deepspeed_config
+
+    training = {
+        "n_gpus": 8,
+        "sp_size": 2,
+        "train_batch_size": 32,
+        "ds_config": {"zero_optimization": {"stage": 1}, "bf16": {"enabled": True}},
+    }
+    payload = build_payload(training, "model", 42)
+    if backend == "cortex":
+        session = GatewaySession(tmp_path, 8, CortexConfig(base_url="http://unused"))
+        sub = ap_driver._training_client_config(session, payload).to_cortex()[-1]["training_config"]
+        assert sub["train_batch_size"] == 32
+        ds_config = sub["ds_config"]
+    else:
+        job = _training_client_config(SimpleNamespace(workdir=tmp_path), payload).to_onprem("training")
+        assert "train_batch_size" not in job.get("ds_worker_config", {})
+        ds_config = job["ds_config"]
+    assert "train_batch_size" not in ds_config
+    # The target's own DeepSpeed config (dss jobs/gpu/training.py _build_ds_config): 1 x 1 x (8 // 2).
+    resolved = build_deepspeed_config(TrainingEngineSpec(world_size=8, sequence_parallel=2, ds_overrides=ds_config))
+    assert resolved["train_batch_size"] == 4
+    assert payload["training_config"]["train_batch_size"] == 32
+
+
 def test_driver_reviewed_rejects_unsupported_format_before_gateway_runtime(monkeypatch):
     cfg = load_config(_driver_reviewed_config)
     payload = deepcopy(cfg.sub_job)
