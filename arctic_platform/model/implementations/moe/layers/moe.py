@@ -1588,12 +1588,12 @@ class NemotronHRouter(nn.Module):
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
             top_scores = top_scores / denominator
 
-        num_tokens_per_expert = torch.histc(
-            selected_experts_indices.reshape(-1).float(),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
-        )
+        # Counted with integers: CUDA has no deterministic histc for floating-point input, so a float histc stopped
+        # every Nemotron-H step under torch.use_deterministic_algorithms. bincount over the expert ids gives the same
+        # counts on CPU and CUDA, kept in float32 like histc's.
+        num_tokens_per_expert = torch.bincount(
+            selected_experts_indices.reshape(-1), minlength=self.num_experts
+        ).to(torch.float32)
 
         return top_scores, selected_experts_indices, num_tokens_per_expert
 
