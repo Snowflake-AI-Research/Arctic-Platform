@@ -258,6 +258,33 @@ def test_on_error_keeps_earlier_successful_fwd_bwd_totals_in_the_same_step():
     assert report["router"]["sampled_tokens"] == pytest.approx(float(len(first)))
 
 
+def test_on_error_after_failed_snapshot_keeps_earlier_request_totals():
+    class BrokenTotals:
+        def detach(self):
+            return self
+
+        def clone(self):
+            raise RuntimeError("snapshot failed")
+
+    model, callback, trainer = _hooked(stride=1)
+    first = torch.randn(4, DIM)
+    callback.pre_fwd_bwd(trainer)
+    model.router(first)
+    callback.post_fwd_bwd(trainer, {})
+
+    callback._layers.append(("broken", BrokenTotals()))
+    callback._calls.append(0)
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        callback.pre_fwd_bwd(trainer)
+    callback.on_error(trainer, "fwd_bwd", RuntimeError("pre_fwd_bwd was quarantined"))
+    callback._layers.pop()
+    callback._calls.pop()
+
+    callback.post_step(trainer)
+    _reduce, report = callback.pending["router_stats"]
+    assert report["router"]["sampled_tokens"] == pytest.approx(float(len(first)))
+
+
 def test_on_error_during_step_keeps_completed_fwd_bwd_totals():
     model, callback, trainer = _hooked(stride=1)
     x = torch.randn(4, DIM)

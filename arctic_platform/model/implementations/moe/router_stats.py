@@ -133,6 +133,7 @@ class RouterStatsCallback(MetricsCallback):
 
     def _snapshot_totals(self) -> None:
         """Remember totals before this request so ``on_error`` can drop only its partials."""
+        self._clear_snapshot()
         self._saved_calls = list(self._calls)
         self._saved_totals = [totals.detach().clone() for _, totals in self._layers]
 
