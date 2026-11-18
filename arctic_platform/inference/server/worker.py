@@ -1530,6 +1530,9 @@ class InferenceWorker(StreamingWorkerMixin):
             "action_mask_replay_cache": action_mask_replay_cache_stats(),
         }
 
+    def num_waiting_reqs(self) -> int:
+        return get_collector().num_waiting_reqs
+
     def set_replica_id(self, replica_id: int) -> None:
         """Tell this worker its position in the replica pool so that the
         snapshots it emits carry a stable replica identifier."""
