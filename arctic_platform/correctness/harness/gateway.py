@@ -66,12 +66,14 @@ from arctic_platform.correctness.harness.config import ReviewedTrainingConfig
 from arctic_platform.correctness.harness.config import TestSpec
 from arctic_platform.correctness.harness.config import correctness_microbatch_tokens
 from arctic_platform.correctness.harness.config import hash_directory
+from arctic_platform.correctness.harness.config import sft_loss_from_logprobs
 from arctic_platform.correctness.harness.cortex import TOKENIZER_JSON_SIDECARS
 from arctic_platform.correctness.harness.cortex import Checkpoint
 from arctic_platform.correctness.harness.cortex import CorrectnessClient as ArcticClient
 from arctic_platform.correctness.harness.cortex import CorrectnessClient as RLClient
 from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
 from arctic_platform.correctness.harness.cortex import UnsafeCleanupError
+from arctic_platform.correctness.harness.sft import IGNORE_INDEX
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.storage import _ds_ssh
 from arctic_platform.correctness.harness.storage import correctness_environment
@@ -1304,8 +1306,13 @@ def running_job(session: GatewaySession, payload: dict) -> Iterator[ArcticJob]:
                 raise UnsafeCleanupError("client shutdown failed; inspect owned resources before retrying") from exc
 
 
-def cortex_training_body(body: dict) -> dict:
-    """Lower the correctness SFT batch into the Cortex zone's tensor RPC contract."""
+def cortex_training_body(body: dict, *, loss_from_logprobs: bool = False) -> dict:
+    """Lower the correctness SFT batch into the Cortex zone's tensor RPC contract.
+
+    With ``loss_from_logprobs`` (``config.sft_loss_from_logprobs``) the batch is sent the way cortex-training sends
+    SFT: a ``loss_mask`` over the prediction-aligned labels and ``causal_cross_entropy``, which DSS computes from
+    per-token logprobs over the request-wide weight sum, the reference's denominator.
+    """
     import torch
 
     if "batch" not in body:
@@ -1325,10 +1332,21 @@ def cortex_training_body(body: dict) -> dict:
         if set(processing) != {"loss_fn"}:
             raise ValueError("Cortex SFT does not support request-level processing options; use --backend onprem")
         processing = {}
+    context = dict(body.get("meta") or {})
+    if loss_from_logprobs and "labels" in tensors and not processing:
+        if context != {"labels_are_shifted": True}:
+            raise ValueError("a logprob SFT loss needs prediction-aligned labels and no other request metadata")
+        labels = tensors.pop("labels")
+        loss_mask = labels != IGNORE_INDEX
+        # DSS makes the targets itself, the next input token, so they must be the labels the request weights.
+        if not torch.equal(labels[loss_mask], tensors["input_ids"].roll(-1, dims=-1)[loss_mask]):
+            raise ValueError("a logprob SFT loss needs labels that are the next input token where they count")
+        context = {"input_ids": tensors["input_ids"], "loss_mask": loss_mask.to(torch.float32)}
+        processing = {"loss_fn": "causal_cross_entropy", "post": ["compute_logprobs"], "config": {}}
     lowered = {
         "args": (),
         "kwargs": tensors,
-        "context": dict(body.get("meta") or {}),
+        "context": context,
     }
     # No processing dictionary selects supervised dispatch; a dictionary selects the RL pipeline.
     if processing:
@@ -1336,9 +1354,15 @@ def cortex_training_body(body: dict) -> dict:
     return lowered
 
 
+def _loss_from_logprobs(client_config) -> bool:
+    training = getattr(client_config, "training", None)
+    return training is not None and sft_loss_from_logprobs(training.ds_worker_config or {})
+
+
 def training_body(job: ArcticJob, body: dict) -> dict:
-    if isinstance(getattr(getattr(job.client, "config", None), "backend", None), CortexConfig):
-        return cortex_training_body(body)
+    config = getattr(job.client, "config", None)
+    if isinstance(getattr(config, "backend", None), CortexConfig):
+        return cortex_training_body(body, loss_from_logprobs=_loss_from_logprobs(config))
     return body
 
 
@@ -1966,7 +1990,9 @@ class HostedTrainingJob:
     local_gateway: bool = False
 
     def fwd_bwd_step(self, body: dict, *, learning_rate: float) -> float:
-        result = self.client.fwd_bwd(cortex_training_body(body))
+        result = self.client.fwd_bwd(
+            cortex_training_body(body, loss_from_logprobs=_loss_from_logprobs(self.client.config))
+        )
         loss = result.get("avg_loss", (result.get("metrics") or {}).get("loss"))
         if loss is None:
             raise RuntimeError(f"forward-backward on job {self.job_id} returned no avg_loss")

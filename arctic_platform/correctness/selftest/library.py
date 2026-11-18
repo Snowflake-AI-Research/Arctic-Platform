@@ -26463,6 +26463,21 @@ def test_sft_request_labels_follow_the_convention_of_the_providers_dispatch(prov
     assert body["meta"] == ({"labels_are_shifted": True} if prediction_aligned else {})
 
 
+def test_sft_request_without_a_model_loss_head_asks_dss_for_the_logprob_loss() -> None:
+    from arctic_platform.correctness.harness.config import sft_loss_from_logprobs
+
+    unfused = {"model_provider": "arctic", "model_options": {"lm_head": {"cross_entropy": False}}}
+    assert sft_loss_from_logprobs(unfused)
+    assert not sft_loss_from_logprobs({"model_provider": "arctic"})
+    assert not sft_loss_from_logprobs({"model_provider": "huggingface"})
+    batch = batches.build_synthetic_batch("small", 2, 32, 128)
+    lowered = ap_driver.cortex_training_body(ap_driver.pack(batch, model_provider="arctic"), loss_from_logprobs=True)
+    assert lowered["processing"] == {"loss_fn": "causal_cross_entropy", "post": ["compute_logprobs"], "config": {}}
+    assert "labels" not in lowered["kwargs"]
+    assert torch.equal(lowered["context"]["input_ids"], batch.input_ids)
+    assert torch.equal(lowered["context"]["loss_mask"], (batch.shifted_labels() != -100).float())
+
+
 def test_inference_checkpoint_loss_forward_request_attends_to_prompts_and_masks_only_padding() -> None:
     batch = gsm8k.build_batch("validation", _inference_checkpoint_loss_ROWS, pad_id=0)
     attention_mask = inference_rl_check.pack_logit_aligned(batch)["batch"]["attention_mask"]

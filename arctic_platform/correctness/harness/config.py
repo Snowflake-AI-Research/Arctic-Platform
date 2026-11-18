@@ -54,6 +54,31 @@ MOE_MODEL_PROVIDERS = frozenset({"arctic", "prime_rl"})
 MOE_DEFAULT_FUSED_CROSS_ENTROPY = "liger"
 
 
+def fused_cross_entropy_of(training: Dict[str, Any]) -> bool | str:
+    """The loss backend the product model builder applies for a sub-job's ``training_config``."""
+    prime_rl = training.get("prime_rl")
+    effective = {**training, **prime_rl} if isinstance(prime_rl, dict) else training
+    if effective.get("model_provider") not in MOE_MODEL_PROVIDERS:
+        return effective.get("fused_cross_entropy", False)
+    if "fused_cross_entropy" in effective:
+        return effective["fused_cross_entropy"]
+    # DSS takes ``model_options.lm_head.cross_entropy`` as the ``prime_rl.fused_cross_entropy`` it replaces.
+    options = training.get("model_options") or {}
+    lm_head = options.get("lm_head") or {}
+    if "lm_head.cross_entropy" in options:
+        return options["lm_head.cross_entropy"]
+    return lm_head.get("cross_entropy", MOE_DEFAULT_FUSED_CROSS_ENTROPY)
+
+
+def sft_loss_from_logprobs(training: Dict[str, Any]) -> bool:
+    """Whether DSS must compute an SFT request's loss from per-token logprobs.
+
+    A MoE model returns a loss only from its fused cross-entropy head. Without one (every expert-parallel catalog
+    recipe turns it off, since RL needs per-token logprobs) a plain SFT request gets logits and no loss.
+    """
+    return training.get("model_provider") in MOE_MODEL_PROVIDERS and not fused_cross_entropy_of(training)
+
+
 def reference_calibration_worker_count(
     workers: int | None = None, *, runs: int = DEFAULT_REFERENCE_CALIBRATION_RUNS
 ) -> int:
@@ -345,17 +370,7 @@ class LoadedConfig:
     @property
     def fused_cross_entropy(self) -> bool | str:
         """Resolve the loss backend the selected product model builder applies."""
-        training = self.effective_training
-        if training.get("model_provider") not in MOE_MODEL_PROVIDERS:
-            return training.get("fused_cross_entropy", False)
-        if "fused_cross_entropy" in training:
-            return training["fused_cross_entropy"]
-        # DSS takes ``model_options.lm_head.cross_entropy`` as the ``prime_rl.fused_cross_entropy`` it replaces.
-        options = self.training.get("model_options") or {}
-        lm_head = options.get("lm_head") or {}
-        if "lm_head.cross_entropy" in options:
-            return options["lm_head.cross_entropy"]
-        return lm_head.get("cross_entropy", MOE_DEFAULT_FUSED_CROSS_ENTROPY)
+        return fused_cross_entropy_of(self.training)
 
     @property
     def lm_head_token_chunk_size(self) -> int | None:
