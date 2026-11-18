@@ -4806,8 +4806,18 @@ def test_native_optimizer_scope_ordinary_capture_remains_callback_free(
     assert state.verified == [] and "scope-enter" not in state.events
     assert len(state.captures) == 2
     for _, kwargs in state.captures:
-        assert kwargs["expected_dp_world_size"] == state.cfg.dp_size
         assert "native_layout_supplier" not in kwargs and "native_layout_supplier_source" not in kwargs
+
+
+def test_native_optimizer_scope_ordinary_sp_capture_expects_one_optimizer_shard_per_rank(
+    _native_optimizer_scope_runner,
+):
+    """ZeRO partitions over the sequence-data-parallel group: an SP16 job on 16 GPUs saves 16 optimizer shards."""
+    state = _native_optimizer_scope_runner
+    results = state.run(native_optimizer_scope=None, native_optimizer_scope_source=None)
+    assert all(result.outcome is Outcome.PASS for result in results)
+    assert state.cfg.dp_size == 1 and state.cfg.n_gpus == 16
+    assert [kwargs["expected_dp_world_size"] for _, kwargs in state.captures] == [16, 16]
 
 
 @pytest.mark.parametrize(

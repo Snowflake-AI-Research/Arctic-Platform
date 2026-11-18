@@ -735,7 +735,10 @@ def execute(
                     body,
                     learning_rate=OPTIMIZER_LEARNING_RATE,
                     output_dir=tmp / "optimizer" / "ap" / arm.name,
-                    expected_dp_world_size=cfg.n_gpus if supplier is not None else cfg.dp_size,
+                    # ZeRO partitions the optimizer over the sequence-data-parallel group, every rank under SP, and
+                    # saves one shard per rank (DeepSpeed engine.py: dp_process_group=seq_data_parallel_group,
+                    # checkpoint dp_world_size=seq_dp_world_size).
+                    expected_dp_world_size=cfg.n_gpus,
                     optimizer_config=optimizer_config,
                     **{"local_checkpoint": True} if local_cortex_fixture else {},
                     **(
