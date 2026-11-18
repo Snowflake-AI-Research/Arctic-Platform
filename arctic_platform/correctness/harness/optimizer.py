@@ -1959,6 +1959,23 @@ def _native_sources(layout: dict) -> None:
                 raise ValueError("native producer source drift")
 
 
+def _native_master_dtype(config: dict) -> torch.dtype:
+    """The dtype of a native checkpoint's masters and Adam moments, as DeepSpeed selects it for BF16 training.
+
+    DeepSpeedZeroOptimizer keeps single_partition_of_fp32_groups in BF16 only under bf16_master_weights_and_grads and
+    in FP32 otherwise (base_optimizer.py _configure_master_weights), and its Adam moments in BF16 only under
+    bf16_optimizer_states, which requires BF16 masters. The reference steps masters and moments at one precision
+    (LoadedConfig.optimizer_dtype), so only the matched recipes are admitted.
+    """
+    bf16 = config.get("bf16")
+    if not isinstance(bf16, dict) or bf16.get("enabled") is not True:
+        raise ValueError("native route requires BF16 training")
+    low = [bf16.get(key, False) for key in ("bf16_master_weights_and_grads", "bf16_optimizer_states")]
+    if any(type(value) is not bool for value in low) or low[0] != low[1]:
+        raise ValueError("native route requires BF16 masters and states or FP32 masters and states")
+    return torch.bfloat16 if low[0] else torch.float32
+
+
 def _native_layout(layout: dict) -> dict:
     if not isinstance(layout, dict):
         raise ValueError("native layout must be a dictionary")
@@ -2000,11 +2017,7 @@ def _native_layout(layout: dict) -> dict:
     zero = config.get("zero_optimization") if isinstance(config, dict) else None
     if not isinstance(zero, dict) or type(zero.get("stage")) is not int or zero["stage"] != 2:
         raise ValueError("native layout requires ZeRO2 ds_config")
-    bf16 = config.get("bf16")
-    if not isinstance(bf16, dict) or any(
-        bf16.get(key) is not True for key in ("enabled", "bf16_master_weights_and_grads", "bf16_optimizer_states")
-    ):
-        raise ValueError("native route requires the original BF16 master/state recipe")
+    _native_master_dtype(config)
     tp = config.get("tensor_parallel", {})
     if tp and (not isinstance(tp, dict) or tp.get("tp_size", 1) != 1):
         raise ValueError("native tensor parallel checkpoints are unsupported")
@@ -3391,6 +3404,7 @@ def _snapshot(
     native = expected_native_layout
     if native is not None and dense_shards:
         raise ValueError("native EP captures do not take node-shard layouts")
+    native_dtype = None if native is None else _native_master_dtype(native["ds_config"])
     experts, input_hashes, expert_files = None, None, []
     if native is None:
         model_file, optim_files = _checkpoint_files(root)
@@ -3618,7 +3632,7 @@ def _snapshot(
             # DeepSpeedZeroOptimizer's state_dict removes master padding but retains full nonelastic Adam state
             # partitions; BF16_Optimizer's keeps both whole.
             length = master.numel() if whole_partitions else master.numel() + padding
-            vector_check = _fp32_vector if native is None else _bf16_vector
+            vector_check = _bf16_vector if native_dtype == torch.bfloat16 else _fp32_vector
             vector_check(master, master.numel(), "optimizer master partition")
             if native is not None and not bool(torch.isfinite(master).all()):
                 raise ValueError("nonfinite native optimizer master")
@@ -3698,8 +3712,9 @@ def _snapshot(
         for index, shape_group in enumerate(shapes):
             if groups[0][index].get("moe"):
                 for name in shape_group:
-                    actual = _parameter(snapshot, index, name, "fp32_master")
+                    # DeepSpeed rounds each master to the BF16 parameter the sidefile holds (a no-op for BF16).
                     expected = torch.cat([shard[name] for shard in experts], dim=expert_shard_dim(name))
+                    actual = _parameter(snapshot, index, name, "fp32_master").to(expected.dtype)
                     if not torch.equal(actual, expected):
                         raise ValueError("expert optimizer master/sidefile ownership mismatch")
         if _native_input_hashes(root) != input_hashes:
@@ -3710,9 +3725,10 @@ def _snapshot(
 def _parameter(snapshot: _Snapshot, group_index: int, name: str, key: str) -> torch.Tensor:
     shape = snapshot.shapes[group_index][name]
     routes = [list(range(len(snapshot.shards)))] if snapshot.rank_routes is None else snapshot.rank_routes[group_index]
+    native = snapshot.native_layout
+    dtype = torch.float32 if native is None else _native_master_dtype(native["ds_config"])
     values = []
     for route in routes:
-        dtype = torch.float32 if snapshot.native_layout is None else torch.bfloat16
         result = torch.empty(math.prod(shape), dtype=dtype)
         offset = 0
         for rank in route:
@@ -3774,8 +3790,8 @@ def decode_optimizer_capture(
     Input roots may contain one checkpoint tag plus metadata/export receipts. Output must be new.
     The manifest retains the actual post-step counter; the existing single-step comparison requires step 1.
     Native layouts must come from the owner's selected runtime and ordered process groups. Source hashes
-    protect those supplied bytes, not their runtime provenance. BF16 moments remain BF16; updates are the
-    FP32 difference of the actual saved BF16 masters, never of model sidefiles.
+    protect those supplied bytes, not their runtime provenance. Moments keep their saved BF16 or FP32 dtype; updates
+    are the FP32 difference of the actual saved masters, never of model sidefiles.
     """
     output_dir = require_data_fast_path(output_dir, label="optimizer artifact output")
     before_dir, after_dir = Path(before_dir), Path(after_dir)
@@ -3912,11 +3928,12 @@ def decode_optimizer_capture(
                 if after.groups[0][index].get("moe")
                 for name in shapes
             }
+            dtype = str(_native_master_dtype(native["ds_config"])).removeprefix("torch.")
             provenance.update(
                 {
                     "native_layout": native,
-                    "source_dtypes": {"master": "bfloat16", "exp_avg": "bfloat16", "exp_avg_sq": "bfloat16"},
-                    "parameter_update_recipe": "FP32 difference of saved BF16 optimizer masters",
+                    "source_dtypes": dict.fromkeys(("master", "exp_avg", "exp_avg_sq"), dtype),
+                    "parameter_update_recipe": f"FP32 difference of saved {dtype} optimizer masters",
                     "expert_sidefiles_are_master_sources": False,
                     "frozen_expert_parameters": sorted(set(after.expert_shards[0]) - active_experts),
                     "runtime_provenance_is_caller_owned": True,

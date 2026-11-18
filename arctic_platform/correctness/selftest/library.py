@@ -11457,17 +11457,14 @@ def test_native_optimizer_owner_split_cli_guarded_forwarding(
         )
 
 
-def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, sp=None, train_experts=True):
+def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, sp=None, train_experts=True, dtype=torch.bfloat16):
     sp = ep if sp is None else sp
-    config = {
-        "zero_optimization": {"stage": 2},
-        "bf16": {
-            "enabled": True,
-            "bf16_master_weights_and_grads": True,
-            "bf16_optimizer_states": True,
-        },
-        "optimizer": {"type": "AdamW"},
-    }
+    bf16 = {"enabled": True}
+    if dtype == torch.bfloat16:
+        bf16.update(bf16_master_weights_and_grads=True, bf16_optimizer_states=True)
+    config = {"zero_optimization": {"stage": 2}, "bf16": bf16, "optimizer": {"type": "AdamW"}}
+    # FP32 masters carry bits below BF16's precision; the BF16 parameters (module, sidefiles) are their rounding.
+    update = 0.25 if dtype == torch.bfloat16 else 0.25 + 2.0**-12
     # Deliberately reversed EP ownership; the decoder must use the supplied actual order.
     routes = [[ep - 1 - rank + replica * ep for replica in range(world // ep)] for rank in range(ep)]
     expert_name = "model.layers.0.mlp.experts.w2"
@@ -11496,9 +11493,12 @@ def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, sp=None, train_experts=True
     for root, step in zip(roots, (0, 1)):
         tag = root / f"global_step{step}"
         tag.mkdir(parents=True)
-        dense = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16) + step * 0.25
-        expert_values = [torch.full((1, 5), 4.0 + rank + step * 0.25, dtype=torch.bfloat16) for rank in range(ep)]
-        module = {"dense.weight": dense, expert_name: expert_values[layout["model_ep_rank"]]}
+        dense = torch.tensor([1.0, 2.0, 3.0], dtype=dtype) + step * update
+        expert_values = [torch.full((1, 5), 4.0 + rank + step * update, dtype=dtype) for rank in range(ep)]
+        module = {
+            "dense.weight": dense.to(torch.bfloat16),
+            expert_name: expert_values[layout["model_ep_rank"]].to(torch.bfloat16),
+        }
         torch.save(
             {
                 "module": module,
@@ -11511,7 +11511,7 @@ def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, sp=None, train_experts=True
             tag / "mp_rank_00_model_states.pt",
         )
         for rank, value in enumerate(expert_values):
-            torch.save({expert_name: value}, tag / f"experts_ep_rank_{rank:03d}.pt")
+            torch.save({expert_name: value.to(torch.bfloat16)}, tag / f"experts_ep_rank_{rank:03d}.pt")
         for rank in range(world):
             masters, mappings, paddings, states, groups, counts = [], [], [], {}, [], []
             for index, shape_group in enumerate(shapes):
@@ -11540,7 +11540,7 @@ def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, sp=None, train_experts=True
                     group["name"] = "native-experts"
                 groups.append(group)
                 if step:
-                    vector = torch.zeros(length, dtype=torch.bfloat16)
+                    vector = torch.zeros(length, dtype=dtype)
                     vector[:valid] = 1 if index == 0 else ep_rank + 2
                     states[index] = {"step": step, "exp_avg": vector, "exp_avg_sq": vector * 2}
             torch.save(
@@ -11557,9 +11557,9 @@ def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, sp=None, train_experts=True
                 },
                 tag / f"bf16_zero_pp_rank_{rank}_mp_rank_{layout['optimizer_mp_ranks'][rank]:02d}_optim_states.pt",
             )
-    expected["dense.weight"] = torch.full((3,), 0.25)
+    expected["dense.weight"] = torch.full((3,), update)
     if train_experts:
-        expected[expert_name] = torch.full((ep, 5), 0.25)
+        expected[expert_name] = torch.full((ep, 5), update)
     return SimpleNamespace(before=roots[0], after=roots[1], layout=layout, expected=expected, expert_name=expert_name)
 
 
@@ -12053,6 +12053,38 @@ def test_native_ep_optimizer_refuses_an_ep_size_deepspeed_cannot_lay_out(tmp_pat
     pair = _native_ep_bf16_pair(tmp_path, world=8, ep=2, sp=1)
     with pytest.raises(ValueError, match="unsupported native EP/SP topology"):
         decoder._native_layout({**pair.layout, "ep_size": ep})
+
+
+# GLM-5.3-Flash-BF16 and Qwen3-30B-A3B full files set ds_config.bf16 = {"enabled": true}: FP32 masters and moments.
+@pytest.mark.parametrize("world,ep,sp", [(8, 8, 8), (8, 2, 1)])
+def test_native_ep_optimizer_decodes_fp32_masters_and_states(tmp_path, world, ep, sp):
+    pair = _native_ep_bf16_pair(tmp_path, world=world, ep=ep, sp=sp, dtype=torch.float32)
+    manifest = json.loads(_native_ep_bf16_decode(pair, tmp_path / "out").read_text())
+    assert manifest["source_dtypes"] == dict.fromkeys(("master", "exp_avg", "exp_avg_sq"), "float32")
+    assert sorted(entry["name"] for entry in manifest["parameters"]) == sorted(pair.expected)
+    for entry in manifest["parameters"]:
+        tensors = torch.load(tmp_path / "out" / entry["file"], weights_only=True)
+        # The sub-BF16 bits of the update come from the FP32 masters, not from the BF16 parameters.
+        assert torch.equal(tensors["parameter_update"], pair.expected[entry["name"]])
+        assert tensors["exp_avg"].dtype == tensors["exp_avg_sq"].dtype == torch.float32
+        if entry["name"] == pair.expert_name:
+            assert torch.equal(tensors["exp_avg"][:, 0], torch.arange(2, ep + 2, dtype=torch.float32))
+
+
+@pytest.mark.parametrize(
+    "bf16",
+    [
+        {"enabled": True, "bf16_master_weights_and_grads": True},
+        {"enabled": True, "bf16_optimizer_states": True},
+        {"enabled": True, "bf16_master_weights_and_grads": "true", "bf16_optimizer_states": "true"},
+        {"enabled": False},
+    ],
+)
+def test_native_ep_optimizer_refuses_mixed_or_non_bf16_training_precision(tmp_path, bf16):
+    pair = _native_ep_bf16_pair(tmp_path, dtype=torch.float32)
+    layout = {**pair.layout, "ds_config": {**pair.layout["ds_config"], "bf16": bf16}}
+    with pytest.raises(ValueError, match="native route requires BF16"):
+        decoder._native_layout(layout)
 
 
 def test_native_ep_bf16_optimizer_frozen_experts_do_not_become_optimizer_records(tmp_path):
