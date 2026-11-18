@@ -21095,6 +21095,23 @@ def test_onboarding_reduce_config_still_rejects_partial_selected_block(monkeypat
     assert len(text.layer_types) == 45
 
 
+def test_onboarding_reduce_config_keeps_every_type_of_a_pattern_without_blocks(monkeypatch) -> None:
+    """Nemotron-H's hybrid pattern repeats no block; its "period" 48 is its first four types recurring at the end."""
+    names = {"M": "linear_attention", "E": "moe", "*": "full_attention"}
+    pattern = [names[c] for c in "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"]
+    assert (len(pattern), synth_model.detect_block_period(pattern)) == (52, 48)
+
+    def source(*args, **kwargs):
+        return SimpleNamespace(num_hidden_layers=52, layer_types=list(pattern))
+
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", source)
+    reduced, original, period = synth_model.reduce_config("unused", 6)
+    assert (reduced.num_hidden_layers, reduced.layer_types, original) == (6, pattern[:6], 52)
+    assert MODULE._model_shape("unused") == (52, 48, 6)
+    with pytest.raises(ValueError, match="num_layers=4 keeps no full_attention layer"):
+        synth_model.reduce_config("unused", 4)
+
+
 def test_onboarding_model_shape_accepts_source_ending_mid_block(monkeypatch) -> None:
     config = SimpleNamespace(
         text_config=SimpleNamespace(

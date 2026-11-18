@@ -187,8 +187,18 @@ def reduce_config(source: str, num_layers: int, vision_depth: int = 2):
     text = getattr(cfg, "text_config", cfg)
     original = int(text.num_hidden_layers)
 
-    period = detect_block_period(list(getattr(text, "layer_types", []))) if hasattr(text, "layer_types") else 1
-    if period > 1 and num_layers % period != 0:
+    layer_types = list(getattr(text, "layer_types", [])) if hasattr(text, "layer_types") else []
+    period = detect_block_period(layer_types) if layer_types else 1
+    if 2 * period > original:
+        # No block repeats: Nemotron-H's 52-layer hybrid pattern "MEMEM*EMEMEM*..." has a "period" of 48 only because
+        # its last four types are its first four. Without blocks, the reduced model has to keep every layer type.
+        missing = sorted(set(layer_types) - set(layer_types[:num_layers]))
+        if missing:
+            raise ValueError(
+                f"num_layers={num_layers} keeps no {', '.join(missing)} layer; the source's {original}-layer "
+                "pattern repeats no block, so a reduced model must keep every layer type"
+            )
+    elif period > 1 and num_layers % period != 0:
         raise ValueError(
             f"num_layers={num_layers} must be a multiple of the block period {period}; a partial block "
             "would drop a layer type from the comparison entirely"
