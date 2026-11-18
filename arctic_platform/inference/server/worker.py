@@ -683,7 +683,7 @@ def _result_from_output(
         # Same-host engine timestamps are monotonic; unset phases are 0.0.
         offset = time.time() - time.monotonic()
         for key in ("queued_ts", "scheduled_ts", "first_token_ts", "last_token_ts"):
-            if (value := getattr(stats, key)) > 0:
+            if (value := getattr(stats, key, 0.0)) > 0:
                 result[key] = value + offset
 
     spec = getattr(choice, "spec_decode_metrics", None)
