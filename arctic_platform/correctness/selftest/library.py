@@ -20569,6 +20569,38 @@ def test_onboarding_block_period_accepts_trailing_partial_block(layer_types, exp
     assert synth_model.detect_block_period(layer_types) == expected
 
 
+def test_onboarding_reduce_config_keeps_gemma4_per_layer_head_shapes(monkeypatch, tmp_path: Path) -> None:
+    """Gemma 4's full-attention head_dim and KV heads are per-layer attributes in Transformers 5.20."""
+    from transformers import Gemma4Config
+
+    pattern = ["sliding_attention"] * 5 + ["full_attention"]
+    config = Gemma4Config(
+        text_config={
+            "num_hidden_layers": 12,
+            "layer_types": pattern * 2,
+            "head_dim": 256,
+            "global_head_dim": 512,
+            "num_key_value_heads": 16,
+            "num_global_key_value_heads": 4,
+            "attention_k_eq_v": True,
+        },
+        vision_config={"num_hidden_layers": 2},
+    )
+    with pytest.raises(Exception, match="'head_dim' is a per-layer attribute"):
+        config.text_config.head_dim
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: config)
+
+    reduced, original, period = synth_model.reduce_config("unused", 6)
+
+    text = reduced.text_config
+    assert (original, period, text.num_hidden_layers, text.layer_types) == (12, 6, 6, pattern)
+    shapes = [(layer.head_dim, layer.num_key_value_heads) for layer in text.per_layer_config]
+    assert shapes == [(256, 16)] * 5 + [(512, 4)]
+    reduced.save_pretrained(tmp_path)
+    reloaded = Gemma4Config.from_pretrained(tmp_path).text_config
+    assert [(layer.head_dim, layer.num_key_value_heads) for layer in reloaded.per_layer_config] == shapes
+
+
 def test_onboarding_reduce_config_keeps_complete_block_from_partial_source(monkeypatch) -> None:
     text = SimpleNamespace(
         num_hidden_layers=45,
@@ -23831,6 +23863,7 @@ _SELFTEST_GROUPS = {
         "test_gradient_calibration_requires_distinct_frozen_arms",
         "test_onboarding_renderer_gate_metadata_uses_the_computed_safety_factor",
         "test_onboarding_block_period_accepts_trailing_partial_block",
+        "test_onboarding_reduce_config_keeps_gemma4_per_layer_head_shapes",
         "test_onboarding_reduce_config_keeps_complete_block_from_partial_source",
         "test_onboarding_reduce_config_still_rejects_partial_selected_block",
         "test_onboarding_model_shape_accepts_source_ending_mid_block",

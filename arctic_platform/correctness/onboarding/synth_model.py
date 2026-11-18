@@ -195,8 +195,17 @@ def reduce_config(source: str, num_layers: int, vision_depth: int = 2):
         )
 
     text.num_hidden_layers = num_layers
+    # Transformers 5.20 holds an attribute that varies by layer (Gemma 4's head_dim and num_key_value_heads, larger on
+    # its full-attention layers) only in per_layer_config, keyed by layer index, and raises on the global read; keep
+    # the kept layers' values there.
+    per_layer = text.per_layer_attributes if getattr(text, "is_heterogeneous", False) else set()
+    if per_layer:
+        text.per_layer_config = {
+            index: {attr: getattr(text.per_layer_config[index], attr) for attr in (*per_layer, "skip")}
+            for index in range(num_layers)
+        }
     for attr in dir(text):
-        if attr.startswith("_"):
+        if attr.startswith("_") or attr in per_layer:
             continue
         value = getattr(text, attr, None)
         if isinstance(value, list) and len(value) == original:
