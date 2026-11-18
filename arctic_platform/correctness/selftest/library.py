@@ -8599,6 +8599,41 @@ def test_reference_execution_witness_records_actual_configurations_and_selected_
     assert witness["effective_configurations"]["model"]["config"]["num_hidden_layers"] == 4
 
 
+def test_reference_routes_attention_wider_than_flash_attention_3_to_sdpa(monkeypatch):
+    """Gemma 4's full-attention layers are 512 wide and FlashAttention 3 stops at 256; its sliding ones stay on it."""
+    from transformers.integrations import sdpa_attention
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    calls = []
+
+    def flash(module, query, key, value, attention_mask, **kwargs):
+        calls.append(("flash", query.shape[-1], kwargs.get("sliding_window")))
+        return "flash", None
+
+    def sdpa(module, query, key, value, attention_mask, **kwargs):
+        backends = (torch.backends.cuda.mem_efficient_sdp_enabled(), torch.backends.cuda.math_sdp_enabled())
+        calls.append(("sdpa", query.shape[-1], attention_mask, kwargs.get("scaling"), backends))
+        return "sdpa", None
+
+    monkeypatch.setattr(ALL_ATTENTION_FUNCTIONS, "_local_mapping", {"flash_attention_3": flash})
+    monkeypatch.setattr(sdpa_attention, "sdpa_attention_forward", sdpa)
+    hf_single_gpu.route_wide_heads_to_sdpa()
+    hf_single_gpu.route_wide_heads_to_sdpa()
+    attention = ALL_ATTENTION_FUNCTIONS["flash_attention_3"]
+    module = SimpleNamespace(is_causal=True)
+
+    def tensors(width):
+        return torch.zeros(1, 2, 4, width), torch.zeros(1, 1, 4, width), torch.zeros(1, 1, 4, width)
+
+    assert attention(module, *tensors(256), None, sliding_window=1024)[0] == "flash"
+    assert attention(module, *tensors(512), None, sliding_window=None, scaling=1.0)[0] == "sdpa"
+    assert calls == [("flash", 256, 1024), ("sdpa", 512, None, 1.0, (True, False))]
+    with pytest.raises(ValueError, match="head-512 SDPA covers unpadded causal attention only; this call has sliding"):
+        attention(module, *tensors(512), None, sliding_window=1024)
+    with pytest.raises(ValueError, match="this call has an attention mask"):
+        attention(module, *tensors(512), torch.ones(1, 4, dtype=torch.bool))
+
+
 def test_reference_execution_witness_records_a_non_finite_config_value(_reference_execution_engine):
     """Nemotron-H's Mamba-2 time_step_limit is (0.0, inf), which strict JSON cannot spell."""
     engine = _reference_execution_engine

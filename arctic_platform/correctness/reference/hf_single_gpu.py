@@ -188,6 +188,49 @@ def row_groups(lengths: List[int], seq_len: int, token_budget: int) -> List[List
     return groups
 
 
+# FlashAttention 3's largest head size ("FlashAttention forward only supports head dimension at most 256").
+FLASH_ATTENTION_3_MAX_HEAD_DIM = 256
+
+
+def route_wide_heads_to_sdpa() -> None:
+    """Run the attention calls FlashAttention 3 cannot, head sizes above 256, on torch's memory-efficient SDPA.
+
+    Gemma 4's sliding layers are 256 wide and its full-attention layers 512. The target splits them the same way:
+    DSS's heterogeneous Ulysses keeps the 256-wide layers on FlashAttention and sends the 512-wide ones to Arctic
+    Platform's TileLang head-512 kernel (dss/ray_dss/jobs/gpu/sp/heterogeneous_ulysses.py _wide_head_attention_forward,
+    arctic_platform/model/attention_hd512.py). The reference takes SDPA's memory-efficient kernel for them, an
+    independent implementation with the same contract (bf16 operands, fp32 accumulation and softmax), and never its
+    math backend. Calls of 256 or less reach FlashAttention 3 unchanged.
+    """
+    from torch.nn.attention import SDPBackend
+    from torch.nn.attention import sdpa_kernel
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    flash = ALL_ATTENTION_FUNCTIONS["flash_attention_3"]
+    if getattr(flash, "routes_wide_heads_to_sdpa", False):
+        return
+
+    def attention(module, query, key, value, attention_mask, **kwargs):
+        if query.shape[-1] <= FLASH_ATTENTION_3_MAX_HEAD_DIM:
+            return flash(module, query, key, value, attention_mask, **kwargs)
+        unsupported = [
+            name
+            for name in ("sliding_window", "softcap", "cu_seq_lens_q", "cu_seq_lens_k")
+            if kwargs.get(name) is not None
+        ]
+        if attention_mask is not None or unsupported or not getattr(module, "is_causal", True):
+            raise ValueError(
+                f"the reference's head-{query.shape[-1]} SDPA covers unpadded causal attention only; this call has "
+                f"{'an attention mask' if attention_mask is not None else ', '.join(unsupported) or 'no causal mask'}"
+            )
+        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+            return sdpa_attention_forward(module, query, key, value, None, **kwargs)
+
+    attention.routes_wide_heads_to_sdpa = True
+    ALL_ATTENTION_FUNCTIONS["flash_attention_3"] = attention
+
+
 def build_engine(
     model_path: str,
     *,
@@ -222,6 +265,8 @@ def build_engine(
         torch.cuda.manual_seed_all(seed)
 
     torch_dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
+    if attn_implementation == "flash_attention_3":
+        route_wide_heads_to_sdpa()
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     cls = getattr(transformers, cfg.architectures[0])
     if getattr(cfg, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}:
