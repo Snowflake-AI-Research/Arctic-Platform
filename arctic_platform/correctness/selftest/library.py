@@ -816,6 +816,35 @@ def test_ap_correctness_environment_accepts_legacy_alias_with_ap_precedence(monk
 
 
 @pytest.mark.parametrize(
+    ("configured", "ports", "expected"),
+    [(None, ["7878", "7878"], 7878), ("2222", [], 2222), (None, ["7878", "22"], None)],
+)
+def test_allocation_ssh_port_follows_the_allocation_transport(monkeypatch, configured, ports, expected):
+    # The strict transport ignores the SSH configuration (-F /dev/null); its default port is the one ds_ssh uses.
+    from arctic_platform.correctness.harness import engine_admission
+
+    monkeypatch.delenv("DSS_CORRECTNESS_SSH_PORT", raising=False)
+    if configured is None:
+        monkeypatch.delenv("AP_CORRECTNESS_SSH_PORT", raising=False)
+    else:
+        monkeypatch.setenv("AP_CORRECTNESS_SSH_PORT", configured)
+    outputs = iter(ports)
+
+    def resolve(argv, **_):
+        return subprocess.CompletedProcess(argv, 0, f"user u\nport {next(outputs)}\n", "")
+
+    run = Mock(side_effect=resolve)
+    monkeypatch.setattr(engine_admission.subprocess, "run", run)
+    if expected is None:
+        with pytest.raises(ValueError, match="SSH ports"):
+            engine_admission._allocation_ssh_port(["head", "peer"])
+    else:
+        assert engine_admission._allocation_ssh_port(["head", "peer"]) == expected
+    resolved = [call.args[0] for call in run.call_args_list]
+    assert resolved == [["ssh", "-G", "--", host] for host in ["head", "peer"][: len(ports)]]
+
+
+@pytest.mark.parametrize(
     ("environment", "expected"),
     [
         ([b"AP_CORRECTNESS_GATEWAY_OWNER=token"], True),
