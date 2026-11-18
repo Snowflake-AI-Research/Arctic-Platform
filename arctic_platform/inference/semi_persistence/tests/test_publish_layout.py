@@ -114,6 +114,7 @@ class _Bucket:
         self.manifests: dict[str, dict] = {}
         self.staged: dict[str, dict[str, dict]] = {}
         self.cleared: list[str] = []
+        self.queries: list[tuple[str, ...]] = []
 
     def stage_put(self, bucket, key, name, obj, scratch):
         self.staged.setdefault(key, {})[name] = json.loads(json.dumps(obj))
@@ -145,6 +146,21 @@ class _Bucket:
     def published(self, bucket: str, key: str) -> bool:
         return f"s3://{bucket}/{key}" in self.sentinels
 
+    def aws_out(self, *args: str):
+        """The listing and reads the drift check makes, from what was written."""
+        self.queries.append(args)
+        if args[:3] == ("s3", "ls", "--recursive"):
+            root = args[-1]
+            lines = [f"2026-11-13 12:{i // 60:02d}:{i % 60:02d}  100 "
+                     f"{dest[len('s3://bkt/'):]}/{sp.MANIFEST_FILENAME}"
+                     for i, dest in enumerate(self.manifests)
+                     if dest.startswith(root)]
+            return 0, "\n".join(lines)
+        if args[:2] == ("s3", "cp") and args[-1] == "-":
+            manifest = self.manifests.get(args[-2].rsplit("/", 1)[0])
+            return (1, "") if manifest is None else (0, json.dumps(manifest))
+        return 1, ""
+
     def replica_count(self, bucket: str, key: str):
         manifest = self.manifests.get(f"s3://{bucket}/{key}")
         return None if manifest is None else manifest.get("replicas", 1)
@@ -160,8 +176,9 @@ def _with_bucket(body):
     originals = (sp._aws, sp._published, sp._skeleton_referrers, sp.image_digest,
                  sp._published_replica_count, sp._published_node_count,
                  sp._stage_put, sp._stage_list, sp._stage_clear,
-                 sp._RENDEZVOUS_POLL_S)
+                 sp._RENDEZVOUS_POLL_S, sp._aws_out)
     sp._aws = bucket.aws
+    sp._aws_out = bucket.aws_out
     sp._published = bucket.published
     sp._skeleton_referrers = lambda *a, **k: []
     sp.image_digest = lambda: ("abc", "dss@sha256:abc")
@@ -177,7 +194,7 @@ def _with_bucket(body):
         (sp._aws, sp._published, sp._skeleton_referrers,
          sp.image_digest, sp._published_replica_count,
          sp._published_node_count, sp._stage_put, sp._stage_list,
-         sp._stage_clear, sp._RENDEZVOUS_POLL_S) = originals
+         sp._stage_clear, sp._RENDEZVOUS_POLL_S, sp._aws_out) = originals
 
 
 # --------------------------------------------------------------------------
@@ -634,6 +651,84 @@ def test_unpublishing_a_skeleton_leaves_the_weights_alone():
 
 
 # --------------------------------------------------------------------------
+# A new weight set that is a published one with a few shards changed
+# --------------------------------------------------------------------------
+
+def _publish_quietly(model_dir, **kw):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        key = sp.publish(sp.Path(model_dir), "bkt", "image-cache", **kw)
+    return key, out.getvalue()
+
+
+def test_a_weight_set_one_shard_per_rank_off_a_published_one_warns():
+    def body(tmp):
+        def run(bucket):
+            first, _ = _publish_quietly(_model_dir(tmp, ENV_A, tp=2))
+            second, log = _publish_quietly(
+                _model_dir(tmp, ENV_B, tp=2, weights_text="other-bytes"))
+            old, new = first.rsplit("_", 1)[1], second.rsplit("_", 1)[1]
+            assert old != new
+            assert f"WARNING: weight set {new} is the published {old}" in log, log
+            assert "2 of 4 file(s)" in log, log
+            assert "rank0/shard_0000.bin" in log and "rank1/shard_0000.bin" in log
+            assert "weights_meta.json" not in log, log
+            assert "_WEIGHT_LIKE_PATH" in log, log
+            assert any(s.endswith(f"/{sp.WEIGHT_DIR}/{new}")
+                       for s in bucket.sentinels), "published anyway"
+        _with_bucket(run)
+    _in_tmp(body)
+
+
+def test_unrelated_weight_sets_do_not_warn():
+    def body(tmp):
+        def run(bucket):
+            _publish_quietly(_model_dir(tmp, ENV_A, tp=2))
+            _, log = _publish_quietly(_model_dir(tmp, ENV_B, tp=4))
+            assert "WARNING" not in log, log
+            md = _model_dir(tmp, "0" * 12, tp=2, weights_text="other-bytes")
+            for rank in range(2):
+                _write(os.path.join(md, sp.WEIGHT_DIR, f"rank{rank}",
+                                    "weights_meta.json"), '{"other": 1}')
+            _, log = _publish_quietly(md)
+            assert "WARNING" not in log, log
+        _with_bucket(run)
+    _in_tmp(body)
+
+
+def test_a_failing_drift_check_does_not_stop_the_publish():
+    def body(tmp):
+        def run(bucket):
+            _publish_quietly(_model_dir(tmp, ENV_A, tp=2))
+
+            def broken(*args):
+                raise FileNotFoundError("aws")
+
+            for i, aws_out in enumerate((lambda *a: (255, ""), broken)):
+                sp._aws_out = aws_out
+                key, log = _publish_quietly(
+                    _model_dir(tmp, ENV_B, tp=2, weights_text=f"other-{i}"))
+                assert "weight drift check skipped" in log, log
+                assert any(s.endswith(f"/{sp.SKELETON_DIR}/{key}")
+                           for s in bucket.sentinels), "published anyway"
+        _with_bucket(run)
+    _in_tmp(body)
+
+
+def test_a_published_hash_or_a_dry_run_reads_no_manifests():
+    def body(tmp):
+        def run(bucket):
+            _publish_quietly(_model_dir(tmp, ENV_A))
+            bucket.queries.clear()
+            _publish_quietly(_model_dir(tmp, ENV_B))
+            _publish_quietly(_model_dir(tmp, ENV_B, weights_text="new"),
+                             dry_run=True)
+            assert not bucket.queries, bucket.queries
+        _with_bucket(run)
+    _in_tmp(body)
+
+
+# --------------------------------------------------------------------------
 # Several replicas in one pod: reconstructed and deduplicated at publish time
 # --------------------------------------------------------------------------
 
@@ -851,6 +946,28 @@ def test_the_sentinels_follow_every_pods_uploads():
             assert max(uploads) < min(sentinels)
             assert f"/{sp.WEIGHT_DIR}/" in dests[sentinels[0]]
             assert f"/{sp.SKELETON_DIR}/" in dests[sentinels[1]]
+        _with_bucket(run)
+    _in_tmp(body)
+
+
+def test_node_0_alone_warns_of_a_pod_spanning_near_duplicate():
+    def body(tmp):
+        def run(bucket):
+            _, errors = _publish_pods([_node_pod(tmp, "pod-a", 0),
+                                       _node_pod(tmp, "pod-b", 1)])
+            assert not errors, errors
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                _, errors = _publish_pods(
+                    [_node_pod(tmp, "pod-c", 0, dump_id="1" * 32,
+                               weights_text="other-bytes"),
+                     _node_pod(tmp, "pod-d", 1, dump_id="1" * 32,
+                               weights_text="other-bytes")])
+            assert not errors, errors
+            log = out.getvalue()
+            assert log.count("WARNING: weight set") == 1, log
+            assert "4 of 8 file(s)" in log, log
+            assert all(f"rank{r}/shard_0000.bin" in log for r in range(4)), log
         _with_bucket(run)
     _in_tmp(body)
 
