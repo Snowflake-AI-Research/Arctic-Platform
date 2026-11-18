@@ -933,6 +933,18 @@ def test_config_gpu_attention_deepseek_v41_requires_its_loader_attention(tmp_pat
         validate_against_host(load_config(path), available_gpus=8, check_gpu_type=False)
 
 
+@pytest.mark.parametrize("model", ["zai-org/GLM-5.3", "zai-org/GLM-5.3-BF16"])
+def test_reference_attention_applies_glm53_indexer_top_k_through_sdpa(tmp_path: Path, model: str) -> None:
+    """Transformers' GLM-MoE-DSA masks to the indexer's top-k only on eager / SDPA; FlashAttention attends densely."""
+    path = _config_gpu_attention_write_config(tmp_path, "h200", None)
+    raw = json.loads(path.read_text())
+    raw["model_name"] = model
+    path.write_text(json.dumps(raw))
+    config = load_config(path)
+    assert config.attention_implementation == "flash_attention_3"
+    assert config.reference_attention_implementation == "sdpa"
+
+
 # Flash 256k source recipes.
 
 

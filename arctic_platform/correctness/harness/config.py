@@ -313,9 +313,16 @@ MODEL_ATTENTION_IMPLEMENTATIONS = {
     "deepseek-ai/DeepSeek-V4.1-Flash-1017": "eager",
     "PrimeIntellect/DeepSeek-V4.1-Flash-bf16": "eager",
 }
+# References whose attention has to differ from the target's name to compute the same function. The Transformers
+# GLM-MoE-DSA attention applies its indexer's top-k only as the eager / SDPA mask and hands the indices to FlashMLA
+# otherwise, so on flash_attention_3 it attends densely; GLM-5.3's target attends sparsely over the same top-k
+# whatever its attn_implementation (Arctic Platform's glm52 sparse MLA, model/implementations/glm52/models/
+# glm_moe_dsa/sparse_mla_attention.py).
 MODEL_REFERENCE_ATTENTION_IMPLEMENTATIONS = {
     "zai-org/GLM-5.3-Flash": "sdpa",
     "zai-org/GLM-5.3-Flash-BF16": "sdpa",
+    "zai-org/GLM-5.3": "sdpa",
+    "zai-org/GLM-5.3-BF16": "sdpa",
 }
 
 
