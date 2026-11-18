@@ -74,7 +74,7 @@ class SamplingCounterContract(unittest.TestCase):
     def test_phase_timestamps_reach_results_and_non_streaming_records(self):
         choice = NS(text='x', token_ids=[42], finish_reason='stop', logprobs=None,
                     spec_decode_metrics=None)
-        stats = NS(queued_ts=10., scheduled_ts=10.25, first_token_ts=11.5, last_token_ts=0.)
+        stats = NS(queued_ts=10., scheduled_ts=10.25, first_token_ts=11.5, last_token_ts=12.)
         output = NS(outputs=[choice], prompt_token_ids=[41], num_cached_tokens=0,
                     prompt_logprobs=None, metrics=stats)
 
@@ -90,14 +90,17 @@ class SamplingCounterContract(unittest.TestCase):
         async def run():
             for output.metrics in (stats, None):
                 result = json.loads(json.dumps(await sched.submit([41], {})))
-                expected = dict(queued_ts=999_990., scheduled_ts=999_990.25,
-                                first_token_ts=999_991.5) if output.metrics else {}
+                expected = dict(queued_ts=999_990., scheduled_ts=999_990.25, first_token_ts=999_991.5,
+                                last_token_ts=999_992.) if output.metrics else {}
                 self.assertEqual({k: v for k, v in result.items() if k.endswith('_ts')}, expected)
-            return [r.first_delta_time for r in sched._request_records.drain()]
+            return sched._request_records.drain()
 
-        with patch.object(worker.time, 'time', return_value=1_000_000.), \
-                patch.object(worker.time, 'monotonic', return_value=20.):
-            self.assertEqual(asyncio.run(run()), [999_991.5, None])
+        # Only the worker's clock is faked, so it disagrees with the scheduler's as on two hosts.
+        with patch.object(worker, 'time', NS(time=lambda: 1_000_000., monotonic=lambda: 20.)):
+            stamped, unstamped = asyncio.run(run())
+        self.assertAlmostEqual(stamped.completion_time - stamped.first_delta_time, .5, places=5)
+        self.assertLess(abs(stamped.first_delta_time - stamped.arrival_time), 60)
+        self.assertIsNone(unstamped.first_delta_time)
 
 
 if __name__ == '__main__':

@@ -518,16 +518,20 @@ class Scheduler:
         if not req.future.done():
             req.future.set_result(result)
         if isinstance(result, dict):
+            completion_time = time.time()
+            first, last = result.get("first_token_ts"), result.get("last_token_ts")
             self._request_records.push(RequestRecord(
                 request_id=req.id,
                 replica_id=req.worker_idx,
                 arrival_time=req.created_at,
                 submitted_time=submitted_time,
-                completion_time=time.time(),
+                completion_time=completion_time,
                 prompt_len=int(result.get("prompt_len", 0) or 0),
                 generation_len=int(result.get("generation_len", 0) or 0),
                 prefix_cache_len=int(result.get("prefix_cache_len", 0) or 0),
-                first_delta_time=result.get("first_token_ts"),
+                # The stamps are on the worker host's clock; only their difference is used here, so the
+                # record stays on this host's clock like arrival_time and completion_time.
+                first_delta_time=completion_time - (last - first) if first and last else None,
             ))
 
     # ------------------------------------------------------------------

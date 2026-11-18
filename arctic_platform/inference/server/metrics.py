@@ -9,8 +9,10 @@ Two record types:
 
   * :class:`RequestRecord` — emitted by the :class:`Scheduler` once per
     generation call. Captures the assigned replica, the arrival /
-    submission / completion wall-clock timestamps, and the prompt /
-    generation / prefix-cache token counts read off the worker's reply.
+    submission / completion wall-clock timestamps, the time the first
+    output token reached the scheduler (``first_delta_time``), and the
+    prompt / generation / prefix-cache token counts read off the worker's
+    reply. All four timestamps are on the scheduler host's clock.
 
 The collectors are bounded ring buffers; ``drain()`` returns the buffered
 items and clears the buffer. Consumers (the API ``/metrics`` route, the
@@ -65,6 +67,10 @@ class RequestRecord:
     generation_len: int
     prefix_cache_len: int
     streaming: bool = False
+    # First output token, scheduler wall-clock; includes the hop back from the worker.
+    # Streaming: when the first delta arrived. Non-streaming: completion_time minus the
+    # engine's first-to-last-token span (result's last_token_ts - first_token_ts).
+    # None when the result carries no engine timestamps.
     first_delta_time: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
