@@ -269,7 +269,8 @@ class ActivationOffloadManager:
             if slot.cpu is not None and slot.pinned_entry is not None:
                 self.stats.stale_pinned_recycled += 1
                 self.stats.stale_pinned_recycled_bytes += slot.nbytes
-                self._cache_pinned(slot, slot.d2h_event)
+                # A prefetched slot's H2D may still be reading the buffer, and it waited on the D2H, so its event covers both.
+                self._cache_pinned(slot, slot.d2h_event if slot.h2d_event is None else slot.h2d_event)
                 slot.cpu = None
         self._slots.clear()
         self._order.clear()
