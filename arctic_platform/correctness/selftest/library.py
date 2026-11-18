@@ -10034,6 +10034,30 @@ def _ap_driver_optimizer_capture_initializer(monkeypatch):
     return optimizer_capture._optimizer_capture_worker_class()()
 
 
+def test_build_payload_maps_recipe_layer_settings_onto_the_fixture_layers(tmp_path):
+    # A 47-layer recipe's per-layer settings on a 4-layer fixture keep the kept layers they name, at fixture indices.
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    kept = [0, 12, 30, 46]  # read from the fixture's own record, not assumed to be its first layers
+    config = {"text_config": {"num_hidden_layers": 4, "source_layer_indices": kept}}
+    (fixture / "config.json").write_text(json.dumps(config))
+    recipe = [layer for layer in range(47) if layer != 12]
+    placement = {"ep_size": 2, "layers": {str(layer): [1, 0] for layer in range(3, 47)}}
+    training = {
+        "ac_config": {"mode": "full", "layers": recipe},
+        "model_options": {"checkpointing.layers": recipe, "moe": {"expert_placement": placement}},
+    }
+    tc = build_payload(training, str(fixture), 42)["training_config"]
+    assert tc["ac_config"]["layers"] == [0, 2, 3]
+    assert tc["model_options"]["checkpointing.layers"] == [0, 2, 3]
+    assert tc["model_options"]["moe"]["expert_placement"]["layers"] == {"1": [1, 0], "2": [1, 0], "3": [1, 0]}
+    assert training["ac_config"]["layers"] == recipe
+    # A fixture without the record cannot take a list that names layers past its own.
+    (fixture / "config.json").write_text(json.dumps({"num_hidden_layers": 4}))
+    with pytest.raises(ValueError, match="rebuild the reduced fixture"):
+        build_payload(training, str(fixture), 42)
+
+
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "optimizer"])
 def test_ap_driver_optimizer_capture_initialize_uses_current_client_job_config(
     _ap_driver_optimizer_capture_initializer, tmp_path, enabled

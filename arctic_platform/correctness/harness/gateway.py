@@ -58,6 +58,7 @@ from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client.requests import log_probs_request
+from arctic_platform.correctness.harness.config import FIXTURE_SOURCE_LAYERS
 from arctic_platform.correctness.harness.config import MOE_MODEL_PROVIDERS
 from arctic_platform.correctness.harness.config import LoadedConfig
 from arctic_platform.correctness.harness.config import ReviewedClientConfig
@@ -1387,6 +1388,67 @@ def _max_tokens_per_mb_of(training_config: dict) -> int:
     return int((training_config.get("mb_spec") or {}).get("max_tokens_per_mb") or DEFAULT_MAX_TOKENS_PER_MB)
 
 
+def _recipe_layer_settings(tc: dict) -> list[tuple[dict, str]]:
+    """The (container, key) of every recipe setting that names layers by index: lists and expert-placement maps."""
+    settings = []
+    ac = tc.get("ac_config")
+    if isinstance(ac, dict) and isinstance(ac.get("layers"), list):
+        settings.append((ac, "layers"))
+    options = tc.get("model_options")
+    if isinstance(options, dict):
+        checkpointing = options.get("checkpointing")
+        if isinstance(checkpointing, dict) and isinstance(checkpointing.get("layers"), list):
+            settings.append((checkpointing, "layers"))
+        if isinstance(options.get("checkpointing.layers"), list):
+            settings.append((options, "checkpointing.layers"))
+        moe = options.get("moe")
+        nested = moe.get("expert_placement") if isinstance(moe, dict) else None
+        for placement in (nested, options.get("moe.expert_placement")):
+            if isinstance(placement, dict) and isinstance(placement.get("layers"), dict):
+                settings.append((placement, "layers"))
+    return settings
+
+
+def lower_recipe_layers(tc: dict, model_path: str) -> None:
+    """Map the recipe's per-layer settings, named by source layer index, onto a reduced fixture's own layers.
+
+    Arctic Platform refuses a listed layer the model does not have (ac_config.check_layers_exist, the expert
+    placement's MoE layers) rather than silently doing less. A fixture keeps some of the source's layers and records
+    which (FIXTURE_SOURCE_LAYERS); a setting keeps the kept layers it names, at their fixture index, so the fixture
+    recomputes or places exactly the kept layers the recipe does. Any other model is left as is.
+    """
+    settings = _recipe_layer_settings(tc)
+    config_path = Path(model_path) / "config.json"
+    if not settings or not config_path.is_file():
+        return
+    config = json.loads(config_path.read_text())
+    text = config.get("text_config", config)
+    kept = text.get(FIXTURE_SOURCE_LAYERS)
+    if kept is None:
+        layers = text.get("num_hidden_layers")
+        named = {int(i) for container, key in settings for i in container[key]}
+        if isinstance(layers, int) and any(i >= layers for i in named):
+            raise ValueError(
+                f"{config_path.parent} records no {FIXTURE_SOURCE_LAYERS}, so the recipe's layer settings cannot be "
+                "mapped onto it; rebuild the reduced fixture"
+            )
+        return
+    if (
+        not isinstance(kept, list)
+        or any(type(i) is not int or i < 0 for i in kept)
+        or len(set(kept)) != len(kept)
+        or len(kept) != text.get("num_hidden_layers")
+    ):
+        raise ValueError(f"{config_path} {FIXTURE_SOURCE_LAYERS} must list each kept layer's source index once")
+    for container, key in settings:
+        value = container[key]
+        if isinstance(value, list):
+            container[key] = [index for index, source in enumerate(kept) if source in value]
+        else:
+            rows = {int(layer): row for layer, row in value.items()}
+            container[key] = {str(index): rows[source] for index, source in enumerate(kept) if source in rows}
+
+
 def build_payload(
     training_config: dict,
     model_path: str,
@@ -1398,8 +1460,11 @@ def build_payload(
     determinism: str = "best-effort",
     gradient_norms_per_param: bool = True,
     weight_format: Optional[str] = None,
+    fixture_root: Optional[str] = None,
 ) -> dict:
     tc = json.loads(json.dumps(training_config))
+    # A published fixture is named by its stage path; its local tree (fixture_root) holds the same config.json.
+    lower_recipe_layers(tc, fixture_root or model_path)
     options = tc.get("model_options") or {}
     lm_head_options = options.get("lm_head") or {}
     canonical_chunk = "lm_head.token_chunk_size" in options or "token_chunk_size" in lm_head_options

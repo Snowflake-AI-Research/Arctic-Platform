@@ -42,6 +42,7 @@ from typing import Tuple
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 
+from ..harness.config import FIXTURE_SOURCE_LAYERS
 from ..harness.config import ModelSpec
 from ..harness.config import hash_directory
 
@@ -247,6 +248,9 @@ def reduce_config(source: str, num_layers: int, vision_depth: int = 2):
             setattr(text, attr, list(value[:num_layers]))
 
     drop_prediction_layers(text)
+    # Recipes name layers by their source index (ac_config.layers, an expert placement); the target payload maps them
+    # onto the kept layers through this record (harness.gateway.lower_recipe_layers).
+    setattr(text, FIXTURE_SOURCE_LAYERS, list(range(num_layers)))
 
     if hasattr(cfg, "vision_config") and vision_depth is not None:
         cfg.vision_config.depth = vision_depth

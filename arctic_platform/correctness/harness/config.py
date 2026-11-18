@@ -49,6 +49,9 @@ MAX_LOCAL_REFERENCE_CALIBRATION_WORKERS = 8
 # Arctic's client still translates a native config's ``prime_rl`` to ``arctic`` on the wire, so configs carry either
 # name. Catalog recipes spell it ``arctic``.
 MOE_MODEL_PROVIDERS = frozenset({"arctic", "prime_rl"})
+# A reduced fixture's text config lists, in its own layer order, the source layer index of each layer it keeps.
+FIXTURE_SOURCE_LAYERS = "source_layer_indices"
+
 # The fused cross-entropy the MoE loaders install when a config names none (Arctic Platform's
 # ``effective_fused_cross_entropy``).
 MOE_DEFAULT_FUSED_CROSS_ENTROPY = "liger"

@@ -698,6 +698,7 @@ def execute(
             optimizer_state_output_dir=optimizer_state_output_dir,
             gradient_norms_per_param=collect_gradient_norms,
             weight_format=cfg.sub_job.get("weight_format"),
+            fixture_root=reference_model_path,
         )
         if first_two_payload:
             validate_reduced_fixture_support(payload, spec, published_fixture)
