@@ -1371,15 +1371,17 @@ class ReplicaPool:
             )
         return clear_cache
 
-    async def _resume_generation_after_weight_sync(self) -> None:
+    async def _resume_workers(self, indices: list[int] | None = None) -> None:
+        if indices is None:
+            indices = list(range(len(self._workers)))
         resume_results = await asyncio.gather(
-            *[worker.resume_generation.remote() for worker in self._workers],
+            *[self._workers[i].resume_generation.remote() for i in indices],
             return_exceptions=True,
         )
         failed_workers = _failed_worker_indices(resume_results)
         if failed_workers:
             raise RuntimeError(
-                f"Failed to resume inference workers {failed_workers}: "
+                f"Failed to resume inference workers {[indices[i] for i in failed_workers]}: "
                 f"{_worker_error_messages(resume_results, failed_workers)}"
             )
 
@@ -1516,36 +1518,21 @@ class ReplicaPool:
             if scheduler is None:
                 raise RuntimeError("ReplicaPool not initialized")
 
-            scheduler_was_paused = scheduler.paused
-            scheduler.pause()
-            replay_send: asyncio.Future | None = None
+            replay_send = asyncio.ensure_future(
+                self._send_router_replay_frozen(scheduler)
+            )
             try:
-                await scheduler.drain()
-                replay_send = asyncio.gather(
-                    *[
-                        worker.send_router_replay.remote()
-                        for worker in self._workers
-                    ],
-                    return_exceptions=True,
-                )
-                try:
-                    results = await asyncio.shield(replay_send)
-                except asyncio.CancelledError:
-                    # Ray actor work continues after the local await is
-                    # cancelled. Keep the lifecycle lock and scheduler pause
-                    # until every started collective has reached a known state.
-                    while not replay_send.done():
-                        try:
-                            await asyncio.shield(replay_send)
-                        except asyncio.CancelledError:
-                            continue
-                    raise
-            finally:
-                if (
-                    not scheduler_was_paused
-                    and (replay_send is None or replay_send.done())
-                ):
-                    scheduler.resume()
+                results = await asyncio.shield(replay_send)
+            except asyncio.CancelledError:
+                # Ray actor work continues after the local await is
+                # cancelled. Keep the lifecycle lock until the freeze, send
+                # and resume have all reached a known state.
+                while not replay_send.done():
+                    try:
+                        await asyncio.shield(replay_send)
+                    except asyncio.CancelledError:
+                        continue
+                raise
 
         return {
             "n_replicas": len(self._workers),
@@ -1556,6 +1543,39 @@ class ReplicaPool:
                 for result in results
             ],
         }
+
+    async def _send_router_replay_frozen(self, scheduler: Scheduler) -> list[Any]:
+        # A scheduler or engine that was already paused stays paused: it
+        # belongs to a sleeping pool or a failed weight sync, resume or sleep.
+        owns_pause = not scheduler.paused
+        scheduler.pause()
+        # Keep mode holds in-flight requests in place so no engine step runs
+        # on the sampling GPUs during the send.
+        freezes = await asyncio.gather(
+            *[worker.freeze_generation.remote() for worker in self._workers],
+            return_exceptions=True,
+        )
+        failed = _failed_worker_indices(freezes)
+        # A failed freeze may still have paused its engine.
+        frozen = [
+            i for i, result in enumerate(freezes)
+            if i in failed or result.get("status") == "frozen"
+        ]
+        try:
+            if failed:
+                raise RuntimeError(
+                    f"Failed to freeze inference workers {failed}: "
+                    f"{_worker_error_messages(freezes, failed)}"
+                )
+            return await asyncio.gather(
+                *[worker.send_router_replay.remote() for worker in self._workers],
+                return_exceptions=True,
+            )
+        finally:
+            # Scheduling reopens only once every frozen engine has resumed.
+            await self._resume_workers(frozen)
+            if owns_pause:
+                scheduler.resume()
 
     async def discard_router_replay(self, sample_ids: list[str]) -> dict[str, Any]:
         if self._workers is None:
@@ -1740,7 +1760,7 @@ class ReplicaPool:
                 can_restore_scheduling = update_succeeded or not weight_update_started
                 if effective_strategy == "pause":
                     if generation_paused and update_succeeded:
-                        await self._resume_generation_after_weight_sync()
+                        await self._resume_workers()
                     if scheduler_paused and (update_succeeded or not generation_paused):
                         if not scheduler_was_paused:
                             self._scheduler.resume()
@@ -1863,7 +1883,7 @@ class ReplicaPool:
                 can_restore_scheduling = update_succeeded or not weight_update_started
                 if effective_strategy == "pause":
                     if generation_paused and update_succeeded:
-                        await self._resume_generation_after_weight_sync()
+                        await self._resume_workers()
                     if scheduler_paused and (update_succeeded or not generation_paused):
                         if not scheduler_was_paused:
                             self._scheduler.resume()
