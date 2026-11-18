@@ -1318,11 +1318,12 @@ class ReplicaPool:
         payload["drained_at"] = time.time()
         return payload
 
-    async def num_waiting_reqs(self) -> list[int | None]:
+    async def num_waiting_reqs(self, model_id: str | None = None) -> list[int | None]:
         """vLLM's waiting-queue length on each replica, as of its latest engine step.
 
         None for a replica whose call failed.
         """
+        self._check_model_id(model_id)
         results = await asyncio.gather(
             *(w.num_waiting_reqs.remote() for w in self._workers), return_exceptions=True,
         )
