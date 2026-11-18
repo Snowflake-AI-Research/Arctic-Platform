@@ -1512,6 +1512,20 @@ def dense_shard_gradient_norms(model, layouts: dict) -> dict[str, float]:
     return norms
 
 
+def participating_parameters(model) -> dict:
+    """The trainable parameters that can take part in a step, by name.
+
+    A zero-element parameter holds nothing to train and never receives a gradient: Arctic Platform's non-gated experts
+    (Nemotron-H's LatentMoE) keep an empty w3 only so their weight signature matches the gated experts'
+    (model/implementations/moe/layers/moe.py NonGatedGroupedExperts), and the Transformers model has no counterpart.
+    """
+    return {
+        name: parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.numel() > 0
+    }
+
+
 class ParticipationCapture:
     """Observe actual autograd use; zero storage and Adam moments are not evidence.
 
@@ -1522,7 +1536,7 @@ class ParticipationCapture:
 
     def __init__(self, model, *, decoder=None, head=None):
         self.model = model
-        self.parameters = {name: parameter for name, parameter in model.named_parameters() if parameter.requires_grad}
+        self.parameters = participating_parameters(model)
         self.shapes = {name: list(parameter.shape) for name, parameter in self.parameters.items()}
         self.dense_shards = _dense_shard_layouts(model)
         self.inventory = {name: shape for name, shape in self.shapes.items() if name not in self.dense_shards}
@@ -1625,7 +1639,7 @@ class ParticipationCapture:
         return record
 
     def result(self) -> dict:
-        current = {name: parameter for name, parameter in self.model.named_parameters() if parameter.requires_grad}
+        current = participating_parameters(self.model)
         if set(current) != set(self.parameters) or any(
             current[name] is not parameter or list(parameter.shape) != self.shapes[name]
             for name, parameter in self.parameters.items()

@@ -1176,6 +1176,27 @@ def test_participation_observes_autograd_and_integer_outputs_without_inventing_z
             validate_participation(capture.result())
 
 
+def test_participation_exempts_zero_element_parameters():
+    """Arctic Platform's non-gated experts keep an empty w3 placeholder, which no step can give a gradient."""
+    import torch
+
+    from arctic_platform.correctness.harness.optimizer import ParticipationCapture
+    from arctic_platform.correctness.harness.optimizer import validate_participation
+
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Linear(3, 3, bias=False)
+    model.head = torch.nn.Linear(3, 3, bias=False)
+    model.experts = torch.nn.Module()
+    model.experts.w1 = torch.nn.Parameter(torch.ones(2, 3, 3))
+    model.experts.w3 = torch.nn.Parameter(torch.empty(0))
+    with ParticipationCapture(model, decoder=model.decoder, head=model.head) as capture:
+        value = torch.ones(2, 3)
+        (model.head(model.decoder(value)).sum() + torch.einsum("eij,bj->", model.experts.w1, value)).backward()
+        entries = validate_participation(capture.result())
+    assert sorted(entries) == ["decoder.weight", "experts.w1", "head.weight"]
+    assert {entry["state"] for entry in entries.values()} == {"active"}
+
+
 def test_participation_gemma_image_modules_are_inactive_only_when_a_text_step_never_calls_them():
     """Gemma 3 and 4 hold their image modules beside the language model; a text-only step never calls them."""
     from copy import deepcopy
