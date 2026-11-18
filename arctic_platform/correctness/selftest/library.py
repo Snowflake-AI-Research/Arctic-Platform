@@ -29461,6 +29461,53 @@ def test_remaining_selected_later_float32_regression_reaches_spec_without_first_
     assert _remaining_selected_later_identity(config) == before
 
 
+def test_gateway_runtime_admits_ranks_in_the_zone_servers_order(monkeypatch, tmp_path):
+    # A hostfile whose peers are not in host order: the zone server ranks the head first, then the peers by host.
+    from arctic_platform.correctness.harness import engine_admission
+
+    hosts = ["10.4.171.69", "10.4.165.36", "10.4.162.78", "10.4.163.67"]
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("".join(f"{host} slots=8\n" for host in hosts))
+    receipt = {"host": "node", "boot_id": "b", "python": "p", "python_sha256": "s", "sources": {}}
+    allocation = {
+        "nodes": [{"host": host, "slots": 8} for host in hosts],
+        "hostfile_sha256": hashlib.sha256(hostfile.read_bytes()).hexdigest(),
+        "runtime_receipts": {host: receipt for host in hosts},
+        "ssh": {},
+    }
+    monkeypatch.setenv(engine_admission.RUNTIME_ADMISSION_ENV, json.dumps(allocation))
+    training = SimpleNamespace(sp=SimpleNamespace(sp_size_of=lambda training_config: 1))
+    monkeypatch.setitem(sys.modules, "dss.ray_dss.jobs.gpu", SimpleNamespace(training=training))
+    stage_info = SimpleNamespace(strip_stage_info_from_job_config=lambda config: config)
+    monkeypatch.setitem(sys.modules, "dss.ray_dss.stage_info", stage_info)
+    monkeypatch.setattr(engine_admission, "runtime_request_from_config", lambda cfg: None)
+    monkeypatch.setattr(engine_admission, "_final_engine_payload", lambda cfg: {})
+    receipts = {host: dict(receipt) for host in hosts}
+    monkeypatch.setattr(engine_admission, "_allocation_runtime_receipts", lambda request, path, ssh: receipts)
+    nodes = [SimpleNamespace(host=host, gpu_ids=list(range(8)), is_head=i == 0) for i, host in enumerate(hosts)]
+    zone = SimpleNamespace(zone_id="zone", nodes=nodes)
+    config = SimpleNamespace(
+        job_id="child",
+        num_gpus=32,
+        training_config=SimpleNamespace(debug={}),
+        to_engine_dict=lambda job_id: {"training_config": {}},
+    )
+
+    async def original(zone, config, job_id):
+        return "created"
+
+    service = SimpleNamespace(_create_job_v0=original)
+
+    async def create():
+        with engine_admission.gateway_runtime_scope(service, hostfile):
+            assert await service._create_job_v0(zone, config, "child") == "created"
+
+    asyncio.run(create())
+    admitted = config.training_config.debug[engine_admission.RUNTIME_ADMISSION_KEY]["ranks"]
+    order = ["10.4.171.69", "10.4.162.78", "10.4.163.67", "10.4.165.36"]
+    assert admitted == [(host, gpu) for host in order for gpu in range(8)]
+
+
 @pytest.mark.parametrize("debug", [None, {}, {"correctness_first_two": False}])
 def test_remaining_checkpoint_unmarked_training_bypasses_first_two_runtime_capture(monkeypatch, tmp_path, debug):
     from arctic_platform.correctness.harness import engine_admission

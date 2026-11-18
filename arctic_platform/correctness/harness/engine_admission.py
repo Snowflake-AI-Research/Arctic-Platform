@@ -470,7 +470,12 @@ def gateway_runtime_scope(gateway, hostfile: Path, *, first_two_only: bool = Fal
         from dss.ray_dss.jobs.gpu import training
         from dss.ray_dss.stage_info import strip_stage_info_from_job_config
 
-        ranks = [(node.host, gpu) for node in zone.nodes for gpu in node.gpu_ids]
+        # Admit the ranks in the order the target uses them. The zone server lays out its ranks from ray.nodes(), the
+        # head first and then the peers by host (dss zones/server_head.py, _worker_sort_key: "Stable host order with
+        # the head first so EP/TP ranks match across jobs"), not in the hostfile's order, and the participation
+        # coordinator compares that placement with this admission in order.
+        nodes = sorted(zone.nodes, key=lambda node: (0 if node.is_head else 1, node.host))
+        ranks = [(node.host, gpu) for node in nodes for gpu in node.gpu_ids]
         slots = {node["host"]: node["slots"] for node in allocation["nodes"]}
         if (
             config.job_id != job_id
