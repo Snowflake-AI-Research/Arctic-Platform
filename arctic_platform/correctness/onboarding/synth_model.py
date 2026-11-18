@@ -174,6 +174,32 @@ def detect_block_period(layer_types: List[str]) -> int:
     return n
 
 
+def load_source_config(source: str):
+    """The source's config as read by the Transformers class its ``architectures[0]`` names.
+
+    That class is what both the fixture and the reference are built from, but ``AutoConfig`` with
+    ``trust_remote_code`` prefers a checkpoint's own ``auto_map`` code to it. Neither engine runs that code:
+    Arctic Platform reads the config without remote code (DSS passes ``trust_remote_code`` only when a job sets it,
+    and the expert-parallel loaders default it to false). Nemotron-3-Nano ships a configuration_nemotron_h.py whose
+    layer list is a property over a fixed 52-character ``hybrid_override_pattern``, so a reduced remote config kept
+    the pattern's first layers whatever the depth, under names ("mamba") the Transformers NemotronH model has no
+    mixer for, and lists no ``layer_types``. The fixture is written without the remote code, so its ``auto_map``
+    goes too.
+    """
+    import transformers
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(source, trust_remote_code=True)
+    architectures = getattr(cfg, "architectures", None) or [None]
+    model_class = getattr(transformers, architectures[0] or "", None)
+    config_class = getattr(model_class, "config_class", None)
+    if isinstance(config_class, type) and not isinstance(cfg, config_class):
+        cfg = config_class.from_pretrained(source)
+        if hasattr(cfg, "auto_map"):
+            delattr(cfg, "auto_map")
+    return cfg
+
+
 def reduce_config(source: str, num_layers: int, vision_depth: int = 2):
     """Rewrite the model config to ``num_layers``, truncating every entry correlated with the layer count.
 
@@ -181,9 +207,7 @@ def reduce_config(source: str, num_layers: int, vision_depth: int = 2):
     layer count is truncated alongside it. That catches per-layer type lists without naming them, which is
     what lets this work on an architecture the harness has not seen.
     """
-    from transformers import AutoConfig
-
-    cfg = AutoConfig.from_pretrained(source, trust_remote_code=True)
+    cfg = load_source_config(source)
     text = getattr(cfg, "text_config", cfg)
     original = int(text.num_hidden_layers)
 
@@ -334,9 +358,7 @@ def size_for_single_gpu(
     reference's own microbatch token budget, and the margin in ``budget_gib`` covers them. CPU table and
     accumulator capacity, buffer residency and optimizer peak memory are not admitted by this selection.
     """
-    from transformers import AutoConfig
-
-    probe = AutoConfig.from_pretrained(source, trust_remote_code=True)
+    probe = load_source_config(source)
     text = getattr(probe, "text_config", probe)
     full = int(text.num_hidden_layers)
     period = detect_block_period(list(getattr(text, "layer_types", []))) or 1
@@ -423,6 +445,31 @@ def _save_reduced_pretrained(model, dest_path: Path) -> None:
             model.generation_config = generation
     if preserve_legacy_defaults:
         generation.to_json_file(dest_path / "generation_config.json", use_diff=True, keys_to_pop=["compile_config"])
+    _write_checkpoint_layer_fields(dest_path)
+
+
+# Layer fields a reduced config.json keeps in its checkpoint's form. Transformers 5.20 reads Nemotron-H's "mamba" and
+# "attention" as "linear_attention" and "full_attention" (configuration_utils.remap_legacy_layer_types) and saves the
+# new names, and its num_hidden_layers is a property over the list, which it does not save. Arctic Platform registers
+# its own NemotronHConfig for nemotron_h (model/implementations/qwen35/models/__init__.py), which keeps
+# layers_block_type as written, and builds each layer from BLOCK_TYPE_MAP's "mamba", "moe" and "attention"
+# (nemotron_h/modeling_nemotron_h.py _build_layer); the suite reads the fixture's depth from config.json
+# (harness/cortex.py describe_fixture). The checkpoint's names and its num_hidden_layers load in both.
+_CHECKPOINT_LAYER_TYPE_NAMES = {
+    "nemotron_h": ("layers_block_type", {"linear_attention": "mamba", "full_attention": "attention"}),
+}
+
+
+def _write_checkpoint_layer_fields(dest_path: Path) -> None:
+    path = dest_path / "config.json"
+    config = json.loads(path.read_text())
+    text = config.get("text_config", config)
+    field, names = _CHECKPOINT_LAYER_TYPE_NAMES.get(text.get("model_type"), (None, None))
+    if field is None:
+        return
+    text[field] = [names.get(name, name) for name in text[field]]
+    text["num_hidden_layers"] = len(text[field])
+    path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
 
 def _load_reduced_pretrained(model_class, source: str, cfg, num_layers: int, original_layers: int, **options):

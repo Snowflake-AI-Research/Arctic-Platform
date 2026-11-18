@@ -21112,6 +21112,58 @@ def test_onboarding_reduce_config_keeps_every_type_of_a_pattern_without_blocks(m
         synth_model.reduce_config("unused", 4)
 
 
+def test_onboarding_reduced_nemotron_h_config_is_read_by_both_engines(monkeypatch, tmp_path: Path) -> None:
+    """Nemotron-3-Nano's remote config gives way to the Transformers class; the fixture keeps the checkpoint names."""
+    from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import (
+        NemotronHConfig as ArcticNemotronHConfig,
+    )
+    from arctic_platform.model.implementations.nemotron_h.modeling_nemotron_h import BLOCK_TYPE_MAP
+
+    pattern = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+    source = tmp_path / "source"
+    source.mkdir()
+    remote = {
+        "architectures": ["NemotronHForCausalLM"],
+        "auto_map": {"AutoConfig": "configuration_nemotron_h.NemotronHConfig"},
+        "model_type": "nemotron_h",
+        "num_hidden_layers": 52,
+        "hybrid_override_pattern": pattern,
+        "hidden_size": 64,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "mamba_num_heads": 4,
+        "mamba_head_dim": 16,
+        "n_groups": 2,
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 2,
+        "vocab_size": 128,
+    }
+    (source / "config.json").write_text(json.dumps(remote))
+    # The checkpoint's configuration_nemotron_h.py: its layer list is a property over the 52-character pattern.
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: SimpleNamespace(**remote))
+
+    reduced, original, _ = synth_model.reduce_config(str(source), 6)
+    assert isinstance(reduced, transformers.NemotronHConfig) and not hasattr(reduced, "auto_map")
+    kept = ["linear_attention", "moe", "linear_attention", "moe", "linear_attention", "full_attention"]
+    assert (original, reduced.layers_block_type) == (52, kept)
+    assert MODULE._model_shape(str(source)) == (52, 48, 6)
+
+    fixture = tmp_path / "fixture"
+
+    def save(path, **kwargs):
+        reduced.save_pretrained(path)
+
+    synth_model._save_reduced_pretrained(SimpleNamespace(generation_config=None, save_pretrained=save), fixture)
+    written = json.loads((fixture / "config.json").read_text())
+    assert "auto_map" not in written and written["num_hidden_layers"] == 6
+    assert written["layers_block_type"] == ["mamba", "moe", "mamba", "moe", "mamba", "attention"]
+    target = ArcticNemotronHConfig.from_pretrained(fixture)
+    assert target.layers_block_type == written["layers_block_type"]
+    assert set(target.layers_block_type) <= set(BLOCK_TYPE_MAP)
+    assert transformers.NemotronHConfig.from_pretrained(fixture).layers_block_type == kept
+
+
 def test_onboarding_model_shape_accepts_source_ending_mid_block(monkeypatch) -> None:
     config = SimpleNamespace(
         text_config=SimpleNamespace(

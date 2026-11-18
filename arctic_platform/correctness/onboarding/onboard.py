@@ -962,11 +962,10 @@ def _model_shape(source_checkpoint: str) -> tuple[int, int, int]:
     layers. It deliberately does not search for the largest single-GPU model: onboarding needs a stable,
     representative regression fixture, not the maximum memory load.
     """
-    from transformers import AutoConfig
-
     from arctic_platform.correctness.onboarding.synth_model import detect_block_period
+    from arctic_platform.correctness.onboarding.synth_model import load_source_config
 
-    config = AutoConfig.from_pretrained(source_checkpoint, trust_remote_code=True)
+    config = load_source_config(source_checkpoint)
     text_config = getattr(config, "text_config", config)
     full_layers = int(text_config.num_hidden_layers)
     layer_types = list(getattr(text_config, "layer_types", []))
