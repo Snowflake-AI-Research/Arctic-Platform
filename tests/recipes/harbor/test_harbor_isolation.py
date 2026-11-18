@@ -843,6 +843,76 @@ def test_sandbox_is_terminated_and_its_slot_released_when_start_fails(tmp_path, 
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("dockerfile", [True, False], ids=["dockerfile", "prebuilt"])
+def test_an_images_env_is_set_on_each_command_not_at_create(tmp_path, monkeypatch, dockerfile):
+    pytest.importorskip("snowflake.sandbox")
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    image_env = dict(PATH="/usr/local/bin:/usr/bin:/bin", PYTHON_SHA256="abc", LANG="C.UTF-8")
+    create_env: list[dict] = []
+    exec_envs: list[dict] = []
+
+    class FakeRegistry:
+        async def ensure_image(self, ref, force_build=False):
+            return "/db/schema/repo/image:tag"
+
+        async def image_config(self, image):
+            return {"Env": [f"{k}={v}" for k, v in image_env.items()]}
+
+    class FakeSandbox:
+        id = "sb-1"
+        name = "harbor-1"
+
+        async def terminate(self) -> None:
+            pass
+
+    class FakeAsyncSandbox:
+        @staticmethod
+        async def create(*, env, **kwargs):
+            create_env.append(dict(env or {}))
+            return FakeSandbox()
+
+    async def fake_get_config(connection, role):
+        return SimpleNamespace(resolve_pat=lambda: "token")
+
+    def fake_argv(command, exec_id, *, env=None, **kwargs):
+        exec_envs.append(dict(env or {}))
+        return ["true"]
+
+    async def fake_stream(sandbox, argv, budget):
+        return "HARBOR_CAN_SWITCH_UID=1", "", 0
+
+    monkeypatch.setattr(sf_env, "AsyncSandbox", FakeAsyncSandbox)
+    monkeypatch.setattr(sf_env, "get_config", fake_get_config)
+    monkeypatch.setattr(sf_env, "get_registry", lambda *args, **kwargs: FakeRegistry())
+    monkeypatch.setattr(sf_env, "build_exec_argv", fake_argv)
+    monkeypatch.setattr(sf_env.SnowflakeSandboxEnvironment, "_read_exec_stream", staticmethod(fake_stream))
+    monkeypatch.setattr(sf_env, "_LIVE_SANDBOXES", {})
+    (tmp_path / "environment").mkdir()
+    (tmp_path / "environment" / "Dockerfile").write_text("FROM ghcr.io/o/image@sha256:abc\nRUN true\n")
+    (tmp_path / "trial").mkdir()
+    env = sf_env.SnowflakeSandboxEnvironment(
+        environment_dir=tmp_path / "environment",
+        environment_name="task",
+        session_id="session",
+        trial_paths=TrialPaths(trial_dir=tmp_path / "trial"),
+        task_env_config=EnvironmentConfig(),
+        image_repo="DB.SCHEMA.REPO",
+        **({} if dockerfile else dict(prebuilt_image="ghcr.io/o/image:tag")),
+    )
+    monkeypatch.setattr(env, "upload_dir", lambda *args, **kwargs: asyncio.sleep(0))
+
+    async def run() -> None:
+        await env.start(force_build=False)
+        exec_envs.clear()
+        await env.exec("python3 --version")
+        await env.stop(delete=True)
+
+    asyncio.run(run())
+    assert create_env == [{}]
+    assert image_env.items() <= exec_envs[-1].items()
+
+
 # -- The agent runs inside the selected Harbor environment -------------------
 
 
