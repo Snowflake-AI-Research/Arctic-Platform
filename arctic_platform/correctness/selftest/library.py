@@ -9113,6 +9113,65 @@ def native_runtime_worker(native_scope_training_actor):
     return build
 
 
+@pytest.mark.parametrize("override", ["participation", "participation-actor", "foreign"])
+def test_native_runtime_sources_pin_the_producer_save_beneath_the_participation_worker(override):
+    """Every first-step job's worker is a participation_worker_class subclass; its own save wraps DSS's."""
+
+    class ProducerWorker:
+        def save(self, stage_info, path=None, checkpoint_type="resumable"):
+            return "saved"
+
+    class Checkpointer:
+        def save_resumable(self):
+            return None
+
+        def save_adapters(self):
+            return None
+
+    class Optimizer:
+        def state_dict(self):
+            return {}
+
+        def backward(self):
+            return None
+
+    class Engine:
+        def save_checkpoint(self):
+            return None
+
+    if override.startswith("participation"):
+        worker_class = capture.participation_worker_class(ProducerWorker)
+        if override == "participation-actor":
+            # The worker is Ray's actor subclass, sent to each worker by value.
+            ray = pytest.importorskip("ray")
+            cloudpickle = pytest.importorskip("ray.cloudpickle")
+            worker_class = ray.remote(num_cpus=1, num_gpus=0)(worker_class).__ray_metadata__.modified_class
+            worker_class = cloudpickle.loads(cloudpickle.dumps(worker_class))
+            assert "save" in vars(worker_class) and worker_class.__bases__[0].__name__ == "ParticipationWorker"
+    else:
+        # Any other save above the producer's, here one from another file, is still refused.
+        worker_class = type("ForeignSaveWorker", (ProducerWorker,), {"save": capture._native_worker_save})
+    worker = worker_class.__new__(worker_class)
+    worker._checkpointer = Checkpointer()
+    worker._engine = Engine()
+    worker._engine.optimizer = Optimizer()
+    sources = {
+        "training": _callback_source_descriptor(ProducerWorker.save),
+        "expert_checkpointer": _callback_source_descriptor(Checkpointer.save_resumable),
+        "base_checkpointer": _callback_source_descriptor(Checkpointer.save_adapters),
+        "engine": _callback_source_descriptor(Engine.save_checkpoint),
+        "zero": _callback_source_descriptor(Optimizer.state_dict),
+        "zero_base": _callback_source_descriptor(Optimizer.backward),
+    }
+    if override.startswith("participation"):
+        selected = capture._native_callback_origin(worker_class.save)
+        assert inspect.getsourcefile(selected) == inspect.getsourcefile(capture.participation_worker_class)
+        capture._native_runtime_sources(worker, sources)
+    else:
+        with pytest.raises(ValueError, match="native selected source origin mismatch: training"):
+            capture._native_runtime_sources(worker, sources)
+
+
 def test_native_runtime_sources_rejects_producer_hash_drift(native_runtime_worker):
     worker, sources = native_runtime_worker(inherited=True, serialized=True)
     sources["training"] = {**sources["training"], "sha256": "0" * 64}

@@ -1213,6 +1213,35 @@ def participation_worker_class(
     return ParticipationWorker
 
 
+_PARTICIPATION_SAVE_CODE = participation_worker_class(object).save.__code__
+
+
+def _native_worker_save(worker_class):
+    """The producer's worker save, which the native collector pins to DSS's training module.
+
+    Every first-step correctness job runs ``participation_worker_class`` workers (lora.install_manager), whose save
+    only wraps the producer's save in ``node_local_model_state_writer``, as the collector's own save hook does; the
+    producer's save is the next one in the MRO. The worker class is Ray's actor subclass of it, whose save is Ray's
+    wrapper (unwrapped by ``_native_callback_origin``), and Ray sends the closure-defined class to each worker by
+    value with copies of its code objects, so the participation save is recognized by code equality, which ignores
+    the file and qualified name, plus both.
+    """
+    save = worker_class.save
+    origin = _native_callback_origin(save)
+    code = getattr(origin, "__code__", None)
+    if not (
+        code == _PARTICIPATION_SAVE_CODE
+        and code.co_filename == _PARTICIPATION_SAVE_CODE.co_filename
+        and code.co_qualname == _PARTICIPATION_SAVE_CODE.co_qualname
+    ):
+        return save
+    definers = [cls for cls in worker_class.__mro__ if "save" in vars(cls)]
+    owners = [index for index, cls in enumerate(definers) if vars(cls)["save"] is origin]
+    if len(owners) != 1 or owners[0] + 1 >= len(definers):
+        raise ValueError("native participation worker has no producer save beneath it")
+    return vars(definers[owners[0] + 1])["save"]
+
+
 def participation_step_class(coordinator_base):
     """Attach the merged step-1 participation inventory to the step response of ``coordinator_base``.
 
@@ -1942,7 +1971,7 @@ def _native_runtime_sources(worker, sources: dict) -> None:
     checkpointer, engine = worker._checkpointer, worker._engine
     zero = engine.optimizer
     selected = {
-        "training": type(worker).save,
+        "training": _native_worker_save(type(worker)),
         "expert_checkpointer": type(checkpointer).save_resumable,
         "base_checkpointer": type(checkpointer).save_adapters,
         "engine": type(engine).save_checkpoint,
