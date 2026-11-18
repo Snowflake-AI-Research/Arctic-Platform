@@ -156,6 +156,8 @@ class WorkerMetricsCollector:
         self.min_interval_s = max(0.0, min_interval_s)
         self._snapshots = _BoundedDeque(max_items=max_snapshots)
         self._last_record_time: float = 0.0
+        # vLLM's waiting-queue length at the latest step, not throttled by min_interval_s.
+        self.num_waiting_reqs = 0
         # Lifetime counters since engine start, summed over every step.
         # Speculative-decoding fields are also exposed via spec_decoding_totals().
         self._spec_lock = threading.Lock()
@@ -174,6 +176,7 @@ class WorkerMetricsCollector:
                 self._totals.num_preempted_reqs += iteration_stats.num_preempted_reqs
         if scheduler_stats is None:
             return
+        self.num_waiting_reqs = int(scheduler_stats.num_waiting_reqs)
         spec = scheduler_stats.spec_decoding_stats
         if spec is not None:
             with self._spec_lock:

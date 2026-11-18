@@ -1318,6 +1318,16 @@ class ReplicaPool:
         payload["drained_at"] = time.time()
         return payload
 
+    async def num_waiting_reqs(self) -> list[int | None]:
+        """vLLM's waiting-queue length on each replica, as of its latest engine step.
+
+        None for a replica whose call failed.
+        """
+        results = await asyncio.gather(
+            *(w.num_waiting_reqs.remote() for w in self._workers), return_exceptions=True,
+        )
+        return [None if isinstance(r, BaseException) else r for r in results]
+
     # ------------------------------------------------------------------
     # Weight sync
     # ------------------------------------------------------------------
