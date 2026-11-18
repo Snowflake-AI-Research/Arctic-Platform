@@ -6468,14 +6468,15 @@ def _gateway_scratch_launch_transport(tmp_path, monkeypatch):
 
     def start(command, **kwargs):
         state.starts.append((command, kwargs))
-        script = base64.b64decode(command[-1].split()[1]).decode()
+        local = command[:2] == [sys.executable, "-c"]
+        script = command[-1] if local else base64.b64decode(command[-1].split()[1]).decode()
         load = next(
             node
             for node in ast.walk(ast.parse(script))
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "loads"
         )
         request = json.loads(ast.literal_eval(load.args[0]))
-        for host in ("synthetic-head", "synthetic-peer"):
+        for host in ("synthetic-head",) if local else ("synthetic-head", "synthetic-peer"):
             if state.damage == "missing" and host == "synthetic-peer":
                 continue
             row = {
@@ -6536,6 +6537,53 @@ def test_gateway_scratch_launch_collects_every_member_and_publishes_terminal_rec
     assert state.starts[0][1]["start_new_session"]
     saved = json.loads(next(directory.glob("scratch-preparation-*.json")).read_text())
     assert saved == result and Path(result["transport_log"]).is_file()
+
+
+def test_gateway_scratch_single_local_node_uses_python_without_ds_ssh(
+    _gateway_scratch_launch_transport,
+    monkeypatch,
+):
+    state, directory, hostfile, root = _gateway_scratch_launch_transport
+    hostfile.write_text("synthetic-head slots=8\n")
+    monkeypatch.setattr(ap_driver.socket, "gethostname", lambda: "synthetic-head")
+    monkeypatch.setattr(ap_driver, "_ds_ssh", lambda: pytest.fail("local scratch must not use ds_ssh"))
+    result = ap_driver._prepare_gateway_scratch(directory, hostfile)
+    assert result["ok"] and result["path"] == str(root)
+    assert set(result["nodes"]) == {"synthetic-head"}
+    command, options = state.starts[0]
+    assert command[:2] == [sys.executable, "-c"]
+    assert options["start_new_session"]
+    assert "synthetic-head: CORRECTNESS_GATEWAY_SCRATCH " in command[-1]
+    assert json.loads(next(directory.glob("scratch-preparation-*.json")).read_text()) == result
+
+
+def test_gateway_scratch_single_remote_node_still_uses_ds_ssh(
+    _gateway_scratch_launch_transport,
+    monkeypatch,
+):
+    state, directory, hostfile, _ = _gateway_scratch_launch_transport
+    hostfile.write_text("synthetic-head slots=8\n")
+    state.damage = "missing"
+    monkeypatch.setattr(ap_driver.socket, "gethostname", lambda: "outside-allocation")
+    result = ap_driver._prepare_gateway_scratch(directory, hostfile)
+    assert result["ok"]
+    assert state.starts[0][0][:3] == ["/held/runtime/ds_ssh", "-f", str(hostfile)]
+
+
+@pytest.mark.parametrize("damage", ["token", "uid", "node-error", "transport", "duplicate"])
+def test_gateway_scratch_single_local_node_keeps_receipt_validation(
+    _gateway_scratch_launch_transport,
+    monkeypatch,
+    damage,
+):
+    state, directory, hostfile, _ = _gateway_scratch_launch_transport
+    hostfile.write_text("synthetic-head slots=8\n")
+    monkeypatch.setattr(ap_driver.socket, "gethostname", lambda: "synthetic-head")
+    state.damage = damage
+    with pytest.raises(ValueError):
+        ap_driver._prepare_gateway_scratch(directory, hostfile)
+    saved = json.loads(next(directory.glob("scratch-preparation-*.json")).read_text())
+    assert not saved["ok"] and saved["error"]
 
 
 @pytest.mark.parametrize(
@@ -23378,6 +23426,9 @@ _SELFTEST_GROUPS = {
         "test_reference_progress_never_counts_failed_workers_as_success",
         "test_reference_progress_reports_slow_parallel_wave_without_eta",
         "test_gateway_scratch_launch_collects_every_member_and_publishes_terminal_receipts",
+        "test_gateway_scratch_single_local_node_uses_python_without_ds_ssh",
+        "test_gateway_scratch_single_remote_node_still_uses_ds_ssh",
+        "test_gateway_scratch_single_local_node_keeps_receipt_validation",
         "test_gateway_scratch_launch_rejects_partial_or_unauthenticated_fanout_with_saved_raw_evidence",
         "test_gateway_scratch_launch_prepares_before_gateway_and_restores_original_environment",
         "test_gateway_scratch_cleanup_escalates_only_owned_transport_group_and_waits",

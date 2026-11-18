@@ -566,24 +566,31 @@ def _prepare_gateway_scratch(directory: Path, hostfile: Path, *, allocation_memb
         source = Path(__file__).resolve()
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
         import_roots = list(dict.fromkeys([str(source.parents[3]), *sys.path]))
+        local_host = socket.gethostname()
+        local_only = hosts == {local_host}
+        receipt_prefix = f"{local_host}: {marker}" if local_only else marker
         script = (
             f"import hashlib, json, sys\nfrom pathlib import Path\nsys.path[:] = {import_roots!r}\nsource ="
             f" Path({str(source)!r})\nassert hashlib.sha256(source.read_bytes()).hexdigest() == {digest!r}, 'scratch"
             " source differs'\nfrom arctic_platform.correctness.harness import gateway as module\nassert"
             " Path(module.__file__).resolve() == source, 'scratch import differs'\nassert"
             f" hashlib.sha256(source.read_bytes()).hexdigest() == {digest!r}, 'scratch source changed'\nreceipt ="
-            f" module._gateway_scratch_node(json.loads({json.dumps(request)!r}))\nprint({marker!r} +"
+            f" module._gateway_scratch_node(json.loads({json.dumps(request)!r}))\nprint({receipt_prefix!r} +"
             " json.dumps(receipt), flush=True)\n"
         )
-        encoded = base64.b64encode(script.encode()).decode()
+        if local_only:
+            command = [sys.executable, "-c", script]
+        else:
+            encoded = base64.b64encode(script.encode()).decode()
+            command = [
+                _ds_ssh(),
+                "-f",
+                str(hostfile),
+                f"echo {encoded} | base64 -d | {shlex.quote(sys.executable)} -",
+            ]
         with raw_path.open("xb") as stream:
             process = subprocess.Popen(
-                [
-                    _ds_ssh(),
-                    "-f",
-                    str(hostfile),
-                    f"echo {encoded} | base64 -d | {shlex.quote(sys.executable)} -",
-                ],
+                command,
                 stdout=stream,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
