@@ -3484,7 +3484,8 @@ def _snapshot(
                     reason = f"sidefile layout is {value.layout}, expected {torch.strided}"
                 elif value.ndim < 1:
                     reason = "sidefile tensor is scalar"
-                elif value.numel() == 0:
+                elif value.numel() == 0 and not (isinstance(reference, torch.Tensor) and reference.numel() == 0):
+                    # Arctic's non-gated experts keep an empty w3 placeholder in the module, saved with the experts.
                     reason = f"sidefile tensor is empty with shape {tuple(value.shape)}"
                 elif not isinstance(reference, torch.Tensor):
                     reason = f"module value is {type(reference).__name__}, not a tensor"

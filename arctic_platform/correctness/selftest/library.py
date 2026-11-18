@@ -12094,6 +12094,28 @@ def test_native_ep_bf16_optimizer_frozen_experts_do_not_become_optimizer_records
     assert manifest["frozen_expert_parameters"] == [pair.expert_name]
 
 
+def test_native_ep_optimizer_admits_the_empty_w3_placeholder_of_non_gated_experts(tmp_path):
+    """Nemotron-H's NonGatedGroupedExperts keep w3 as an empty parameter; DSS saves it with the experts."""
+    pair = _native_ep_bf16_pair(tmp_path)
+    placeholder = "model.layers.0.mlp.experts.w3"
+    for root in (pair.before, pair.after):
+        tag = next(root.iterdir())
+        model = torch.load(tag / "mp_rank_00_model_states.pt", weights_only=False)
+        model["module"][placeholder] = torch.empty(0, dtype=torch.bfloat16)
+        torch.save(model, tag / "mp_rank_00_model_states.pt")
+        for path in sorted(tag.glob("experts_ep_rank_*.pt")):
+            sidefile = torch.load(path, weights_only=True)
+            torch.save({**sidefile, placeholder: torch.empty(0, dtype=torch.bfloat16)}, path)
+    manifest = json.loads(_native_ep_bf16_decode(pair, tmp_path / "out").read_text())
+    assert sorted(entry["name"] for entry in manifest["parameters"]) == sorted(pair.expected)
+    assert manifest["frozen_expert_parameters"] == [placeholder]
+    # An expert the module holds whole still may not arrive empty.
+    path = next(pair.after.iterdir()) / "experts_ep_rank_000.pt"
+    torch.save({**torch.load(path, weights_only=True), pair.expert_name: torch.empty(0, dtype=torch.bfloat16)}, path)
+    with pytest.raises(ValueError, match="sidefile tensor is empty"):
+        _native_ep_bf16_decode(pair, tmp_path / "refused")
+
+
 def test_native_ep_bf16_optimizer_wrong_ep_order_cannot_relabel_valid_weights(tmp_path):
     pair = _native_ep_bf16_pair(tmp_path)
     routes = pair.layout["expert_data_parallel_groups"]["native-experts"]
