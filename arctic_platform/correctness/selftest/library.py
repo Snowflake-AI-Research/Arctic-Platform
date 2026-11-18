@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import base64
 import builtins
 import contextlib
 import copy
@@ -3870,6 +3871,21 @@ def test_onboarding_allocation_prerequisites_require_every_host_response(tmp_pat
     command = run.call_args.args[0]
     assert command[1:3] == ["-f", str(hostfile)]
     assert sys.executable in command[-1] and "base64 -d" in command[-1]
+
+
+def test_onboarding_allocation_prerequisites_carry_import_roots(tmp_path, monkeypatch):
+    # An SSH login environment has no PYTHONPATH: the remote script must set the suite's import roots itself.
+    hostfile = tmp_path / "hosts"
+    hostfile.write_text("10.0.0.1 slots=4\n")
+    result = {"host": "node", "python": sys.executable, "gpu_count": 4, "versions": {}, "errors": []}
+    output = f"10.0.0.1: CORRECTNESS_PREREQUISITES {json.dumps(result)}\n"
+    run = Mock(return_value=subprocess.CompletedProcess([], 0, output, ""))
+    monkeypatch.setattr(preflight.subprocess, "run", run)
+    preflight.allocation_onboarding_prerequisites({}, hostfile)
+    script = base64.b64decode(run.call_args.args[0][-1].split()[1]).decode()
+    root = str(Path(preflight.__file__).resolve().parents[3])
+    assert script.index("sys.path[:] = ") < script.index("from arctic_platform")
+    assert repr(root) in script
 
 
 @pytest.mark.usefixtures("_operator_api_catalog")

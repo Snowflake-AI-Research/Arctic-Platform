@@ -311,8 +311,11 @@ def allocation_onboarding_prerequisites(request: dict, hostfile: Path) -> dict[s
     if not entries or len(hosts) != len(entries):
         raise ValueError("onboarding preflight requires a nonempty hostfile with unique hosts")
     marker = "CORRECTNESS_PREREQUISITES "
+    # SSH login environments need not carry this process's PYTHONPATH (the checkpoint store and gateway scratch
+    # probes pass their import roots the same way).
+    import_roots = list(dict.fromkeys([str(Path(__file__).resolve().parents[3]), *sys.path]))
     script = (
-        "import json\n"
+        f"import json, sys\nsys.path[:] = {import_roots!r}\n"
         "from arctic_platform.correctness.harness.storage import onboarding_node_prerequisites\n"
         f"result = onboarding_node_prerequisites(json.loads({json.dumps(request)!r}))\n"
         f"print({marker!r} + json.dumps(result), flush=True)\n"
