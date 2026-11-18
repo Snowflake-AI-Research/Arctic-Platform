@@ -559,8 +559,19 @@ def shared_adapter_identity(path: str | Path, peft_config: dict | None = None) -
     return _read_adapter(path, peft_config)[1]
 
 
-def generate_adapter(model_path: str | Path, peft_config: dict, destination: str | Path, *, seed: int = 42) -> Path:
-    """Recreate upstream-default CPU factors without loading base-model weight tensors."""
+def generate_adapter(
+    model_path: str | Path,
+    peft_config: dict,
+    destination: str | Path,
+    *,
+    seed: int = 42,
+    huggingface_loader: bool = False,
+) -> Path:
+    """Recreate upstream-default CPU factors without loading base-model weight tensors.
+
+    The factors are named for the model the target trains: ``AutoModelForCausalLM``'s class on DSS's huggingface
+    route (``huggingface_loader``, as the HF reference builds it), otherwise the class ``architectures[0]`` names.
+    """
     import peft
     import safetensors
     import torch
@@ -574,7 +585,11 @@ def generate_adapter(model_path: str | Path, peft_config: dict, destination: str
         raise ValueError("shared adapter seed must be a nonnegative integer")
     root = require_data_fast_path(destination, label="generated PEFT adapter")
     model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    model_class = getattr(transformers, model_config.architectures[0])
+    model_class = (
+        transformers.AutoModelForCausalLM.from_config
+        if huggingface_loader
+        else getattr(transformers, model_config.architectures[0])
+    )
     config = {key: value for key, value in topology.items() if key not in {"peft_type", "target_parameters"}}
     # The base architecture lives on meta; only A/B factors ever allocate real storage.
     with torch.random.fork_rng(devices=[]):

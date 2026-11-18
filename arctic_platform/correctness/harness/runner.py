@@ -794,7 +794,11 @@ def execute(
             ):
                 raise ValueError("shared PEFT adapter initialization requires the on-prem correctness worker")
             peft_adapter = generate_adapter(
-                reference_model_path, cfg.training["peft_config"], tmp / "initial-adapter", seed=SEED
+                reference_model_path,
+                cfg.training["peft_config"],
+                tmp / "initial-adapter",
+                seed=SEED,
+                huggingface_loader=cfg.huggingface_loader,
             )
             shared_adapter_identity = adapter_identity(peft_adapter, cfg.training["peft_config"])
         reference_adapter_path = peft_adapter

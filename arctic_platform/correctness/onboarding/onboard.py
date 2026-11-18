@@ -1360,7 +1360,11 @@ def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = 
         if key not in generated:
             # The runner generates the regression adapter with SEED; its identity binds the recorded references.
             generated[key] = generate_adapter(
-                model_path, config.training["peft_config"], correctness_workdir("shared-peft-") / "adapter", seed=SEED
+                model_path,
+                config.training["peft_config"],
+                correctness_workdir("shared-peft-") / "adapter",
+                seed=SEED,
+                huggingface_loader=config.huggingface_loader,
             )
         args._generated_shared_adapters = generated
         identity = adapter_identity(generated[key], config.training["peft_config"])
