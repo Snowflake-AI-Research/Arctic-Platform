@@ -97,6 +97,39 @@ _SHARED_NAMES = {
 }
 
 
+# Arctic Platform's Nemotron-H names each block's mixer after its type (mamba, self_attn, mlp) and keeps its own MoE
+# names, where the Transformers model calls every mixer "mixer". These are Arctic Platform's own renames
+# (nemotron_h/converting_nemotron_h.py: convert_prime_layer_to_hf, and the embeddings / norm_f renames), over names
+# without container segments; the non-gated experts' w1 and w2 are the up and down projections. Only a model with
+# Mamba-2 mixers ("layers.N.mamba.") is renamed, so every other family keeps its names.
+_NEMOTRON_H_MAMBA = re.compile(r"^layers\.\d+\.mamba\.")
+_NEMOTRON_H_RENAMES = (
+    (re.compile(r"^embed_tokens\.weight$"), "embeddings.weight"),
+    (re.compile(r"^norm\.weight$"), "norm_f.weight"),
+    (re.compile(r"^(layers\.\d+)\.(?:mamba|self_attn)\."), r"\1.mixer."),
+    (re.compile(r"^(layers\.\d+)\.mlp\.router\.gate$"), r"\1.mixer.gate.weight"),
+    (re.compile(r"^(layers\.\d+)\.mlp\.experts\.w1$"), r"\1.mixer.experts.up_proj"),
+    (re.compile(r"^(layers\.\d+)\.mlp\.experts\.w2$"), r"\1.mixer.experts.down_proj"),
+    (re.compile(r"^(layers\.\d+)\.mlp\.shared_expert\."), r"\1.mixer.shared_experts."),
+    (re.compile(r"^(layers\.\d+)\.mlp\.(fc[12]_latent_proj)\."), r"\1.mixer.\2."),
+)
+
+
+def _nemotron_h_names(keys: Iterable[str]) -> Dict[str, str]:
+    """Transformers names for Arctic Platform's Nemotron-H names (normalized), or nothing for another family."""
+    keys = list(keys)
+    if not any(_NEMOTRON_H_MAMBA.match(key) for key in keys):
+        return {}
+    renamed = {}
+    for key in keys:
+        for pattern, replacement in _NEMOTRON_H_RENAMES:
+            name, count = pattern.subn(replacement, key)
+            if count:
+                renamed[key] = name
+                break
+    return renamed
+
+
 @dataclass
 class _Entry:
     originals: List[str]
@@ -173,8 +206,13 @@ def _canonical_ap(values: Dict[str, float]) -> Dict[str, _Entry]:
             [original for entry in entries for original in entry.originals],
             math.sqrt(math.fsum(entry.value**2 for entry in entries)),
         )
+    renamed = _nemotron_h_names(source)
 
     for key, entry in source.items():
+        if key in renamed:
+            _insert(canonical, renamed[key], entry.originals[0], entry.value)
+            canonical[renamed[key]].originals.extend(entry.originals[1:])
+            continue
         match = _ROUTED_EXPERT.match(key)
         if match:
             weight = match.group("weight")
@@ -238,9 +276,14 @@ def canonical_ap_tensor_groups(names: Iterable[str]) -> Dict[str, CanonicalTenso
         else:
             canonical[key] = CanonicalTensorGroup(pieces, block_diagonal=True)
 
+    renamed = _nemotron_h_names(normalize(original) for original in names)
+
     for original in names:
         key = normalize(original)
         if key in claimed:
+            continue
+        if key in renamed:
+            canonical[renamed[key]] = CanonicalTensorGroup((key,))
             continue
         match = _ROUTED_EXPERT.match(key)
         if match:

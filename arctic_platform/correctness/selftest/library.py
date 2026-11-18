@@ -1176,6 +1176,49 @@ def test_participation_observes_autograd_and_integer_outputs_without_inventing_z
             validate_participation(capture.result())
 
 
+def test_nemotron_h_target_names_pair_with_the_transformers_model():
+    """Arctic Platform's Nemotron-H names its mixers mamba / self_attn / mlp; Transformers calls each one mixer."""
+    from arctic_platform.correctness.harness.optimizer import align
+    from arctic_platform.correctness.harness.optimizer import canonical_ap_tensor_groups
+
+    target = [
+        "model.embed_tokens.weight",
+        "model.layers.0.norm.weight",
+        "model.layers.0._checkpoint_wrapped_module.mamba.A_log",
+        "model.layers.0.mamba.in_proj.weight",
+        "model.layers.1.mlp.router.gate",
+        "model.layers.1.mlp.experts.w1",
+        "model.layers.1.mlp.experts.w2",
+        "model.layers.1.mlp.shared_expert.up_proj.weight",
+        "model.layers.5.self_attn.q_proj.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+    ]
+    reference = [
+        "model.embeddings.weight",
+        "model.layers.0.norm.weight",
+        "model.layers.0.mixer.A_log",
+        "model.layers.0.mixer.in_proj.weight",
+        "model.layers.1.mixer.gate.weight",
+        "model.layers.1.mixer.experts.up_proj",
+        "model.layers.1.mixer.experts.down_proj",
+        "model.layers.1.mixer.shared_experts.up_proj.weight",
+        "model.layers.5.mixer.q_proj.weight",
+        "model.norm_f.weight",
+        "lm_head.weight",
+    ]
+    pairs, target_only, reference_only = align(
+        {name: float(index) for index, name in enumerate(target)},
+        {name: float(index) for index, name in enumerate(reference)},
+    )
+    assert (target_only, reference_only) == ([], [])
+    assert all(ap == ref for _, ap, ref in pairs) and len(pairs) == len(target)
+    assert sorted(canonical_ap_tensor_groups(target)) == sorted(name.removeprefix("model.") for name in reference)
+    # A family without Mamba-2 mixers keeps its attention and embedding names.
+    dense = ["model.embed_tokens.weight", "model.layers.0.self_attn.q_proj.weight"]
+    assert sorted(canonical_ap_tensor_groups(dense)) == ["embed_tokens.weight", "layers.0.self_attn.q_proj.weight"]
+
+
 def test_participation_exempts_zero_element_parameters():
     """Arctic Platform's non-gated experts keep an empty w3 placeholder, which no step can give a gradient."""
     import torch
