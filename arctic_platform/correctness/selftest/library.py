@@ -14669,6 +14669,86 @@ def test_arctic_gated_expert_lora_pairs_with_the_hf_fused_factors_and_their_shap
     ] == {"shape": [16, 16], "state": "active"}
 
 
+def test_nemotron_h_expert_lora_installs_and_pairs_with_the_transformers_mixer_factors(tmp_path, monkeypatch):
+    """The catalog's Nemotron-3-Nano long LoRA: Arctic's mlp.experts w1 / w2 hold Transformers' mixer.experts."""
+    from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import NemotronHConfig
+    from arctic_platform.model.implementations.nemotron_h.modeling_nemotron_h import NemotronHForCausalLM
+    from arctic_platform.model.patches.peft import apply_peft
+
+    monkeypatch.setattr(storage, "_DATA_FAST_ROOT", tmp_path)
+    recipe = {**_EXPERT_LORA_RECIPE, "target_parameters": ["experts.w1", "experts.w2"]}
+    dims = dict(
+        vocab_size=32,
+        hidden_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        mamba_num_heads=2,
+        mamba_head_dim=8,
+        n_groups=1,
+        ssm_state_size=4,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=8,
+        moe_shared_expert_intermediate_size=8,
+        intermediate_size=8,
+        max_position_embeddings=32,
+        architectures=["NemotronHForCausalLM"],
+    )
+    source = tmp_path / "config-only-nemotron-h"
+    transformers.NemotronHConfig(**dims, layers_block_type=["mamba", "moe", "attention"]).save_pretrained(source)
+    path = shared.generate_adapter(source, recipe, tmp_path / "generated", seed=42)
+    pack = load_file(str(path / "adapter_model.safetensors"))
+    with torch.no_grad():
+        for index, (name, tensor) in enumerate(sorted(pack.items())):
+            tensor.copy_(torch.arange(tensor.numel(), dtype=tensor.dtype).reshape(tensor.shape) + 1000 * index)
+    save_file(pack, str(path / "adapter_model.safetensors"), metadata={"format": "pt"})
+    identity = shared.shared_adapter_identity(path, recipe)
+    records = {record["parameter"]: record for record in identity["generation"]["expert_parameters"]}
+    assert (records["up_proj"]["projections"], records["down_proj"]["projections"]) == (["w1"], ["w2"])
+
+    # The fixture's config.json, as the target reads it (synth_model._save_reduced_pretrained).
+    arctic = tmp_path / "arctic"
+    arctic.mkdir()
+    written = json.loads((source / "config.json").read_text())
+    (arctic / "config.json").write_text(json.dumps({**written, "layers_block_type": ["mamba", "moe", "attention"]}))
+    with torch.random.fork_rng(devices=[]):
+        model = apply_peft(
+            NemotronHForCausalLM(NemotronHConfig.from_pretrained(arctic)).float(), {**recipe, "task_type": "CAUSAL_LM"}
+        )
+    native_adapter.initialize_native_adapter(model, path, identity)
+    installed = native_adapter._adapter_parameters(model)
+    root = "base_model.model.model.layers"
+    pairs = {
+        f"{root}.1.mlp.experts.base_layer": f"{root}.1.mixer.experts.base_layer",  # w1: up_proj, innermost
+        f"{root}.1.mlp.experts": f"{root}.1.mixer.experts",  # w2: down_proj
+        f"{root}.1.mlp.shared_expert.up_proj": f"{root}.1.mixer.shared_experts.up_proj",
+        f"{root}.1.mlp.shared_expert.down_proj": f"{root}.1.mixer.shared_experts.down_proj",
+        **{f"{root}.2.self_attn.{p}_proj": f"{root}.2.mixer.{p}_proj" for p in "qkvo"},
+    }
+    expected = {
+        f"{ap}.{factor}.weight": f"{hf}.{factor}.weight" for ap, hf in pairs.items() for factor in ("lora_A", "lora_B")
+    }
+    assert sorted(installed) == sorted(expected)
+    for name, reference in expected.items():
+        torch.testing.assert_close(installed[name], pack[reference], rtol=0, atol=0)
+
+    # The target's LoRA gradients and optimizer states (no Mamba-2 parameter among them) pair with the reference's.
+    trained = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
+    target = {name: float(index) for index, name in enumerate(trained)}
+    reference = {
+        expected[name.replace(".default.", ".")].removesuffix(".weight") + ".default.weight": value
+        for name, value in target.items()
+    }
+    matched, only_target, only_reference = align(target, reference)
+    assert (len(matched), only_target, only_reference) == (len(target), [], [])
+    assert all(ap == ref for _, ap, ref in matched)
+    assert sorted(canonical_ap_tensor_groups(trained)) == sorted(optimizer_capture.normalize(n) for n in reference)
+    # Another family's decoder layer holds its attention and its MLP together: its LoRA keeps its names.
+    other = ["layers.0.self_attn.q_proj.lora_A.default.weight", "layers.0.mlp.experts.lora_A.default.weight"]
+    assert sorted(canonical_ap_tensor_groups(other)) == sorted(optimizer_capture.normalize(n) for n in other)
+
+
 def test_expert_parallel_lora_b_participation_widens_its_expert_columns():
     name = "model.layers.0.mlp.experts.lora_B.default.weight"
     evidence = {

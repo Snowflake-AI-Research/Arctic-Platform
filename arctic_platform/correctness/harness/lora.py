@@ -49,6 +49,8 @@ from typing import Iterable
 from typing import Mapping
 
 from arctic_platform.common.peft import normalize_lora_peft_config
+from arctic_platform.correctness.harness.optimizer import nemotron_h_reference_names
+from arctic_platform.correctness.harness.optimizer import normalize
 from arctic_platform.correctness.harness.optimizer import participation_step_class as first_two_step_class
 from arctic_platform.correctness.harness.optimizer import participation_worker_class as first_two_worker_class
 from arctic_platform.correctness.harness.optimizer import select_participation_coordinator
@@ -992,13 +994,15 @@ def _adapter_parameters(model) -> dict:
     return parameters
 
 
-def native_expert_factors(model, state: dict, records: list[dict]) -> dict:
+def native_expert_factors(model, state: dict, records: list[dict], reference_names: dict | None = None) -> dict:
     """The pack's expert factors as the target's per-weight ones, for the experts this rank holds.
 
     The pack holds each Hugging Face expert parameter's factors in PEFT's ParamWrapper layout: lora_A ``[E * r, in]``
     (expert-major rows), lora_B ``[out, r * E]`` (rank-major columns); a fused parameter's blocks follow
     ``projections``. The target's ParamWrapper on Arctic's ``w1``/``w2``/``w3`` takes block ``b`` of that parameter,
     and under expert parallelism the contiguous experts its EP rank holds (``Shard(0)``), in the same layout.
+    ``reference_names`` (a family Arctic Platform names apart, see ``nemotron_h_reference_names``) pairs each target
+    factor with its Transformers name, by which the target's experts container finds the HF one.
     """
     import torch.distributed as dist
     from peft.tuners.lora.layer import ParamWrapper
@@ -1019,7 +1023,14 @@ def native_expert_factors(model, state: dict, records: list[dict]) -> dict:
         while container.endswith(".base_layer"):
             container = container.removesuffix(".base_layer")
         weight = module.parameter_name
-        matches = [record for record in by_module.get(container, []) if weight in record["projections"]]
+        held = by_module.get(container, [])
+        if reference_names:
+            # Arctic Platform's Nemotron-H mlp.experts is the Transformers model's mixer.experts.
+            reference = reference_names[f"{prefix}.lora_A.weight"].removesuffix(".lora_A.weight")
+            while reference.endswith(".base_layer"):
+                reference = reference.removesuffix(".base_layer")
+            held = [record for record in records if normalize(record["module"]) == reference]
+        matches = [record for record in held if weight in record["projections"]]
         if len(matches) != 1:
             raise ValueError(f"shared adapter holds no Hugging Face expert factors for {container}.{weight}")
         record = matches[0]
@@ -1061,6 +1072,24 @@ def native_expert_factors(model, state: dict, records: list[dict]) -> dict:
     return result
 
 
+def _target_named_factors(state: dict, reference_names: dict) -> dict:
+    """The pack's factors under the target's names, each found by its Transformers name (``reference_names``).
+
+    A factor already under a target name (an expert factor ``native_expert_factors`` cut) keeps it; one no target name
+    pairs with keeps its own, which the coverage check then refuses.
+    """
+    by_reference = {reference: name for name, reference in reference_names.items()}
+    if len(by_reference) != len(reference_names):
+        raise ValueError("target LoRA factors share a Transformers name")
+    result = {}
+    for name, tensor in state.items():
+        target = name if name in reference_names else by_reference.get(normalize(name), name)
+        if target in result:
+            raise ValueError(f"shared adapter factors collide on the target's {target}")
+        result[target] = tensor
+    return result
+
+
 def initialize_native_adapter(model, path: str | Path, expected_identity: dict) -> None:
     """Transactionally copy exact native factors before optimizer construction."""
     import torch
@@ -1077,8 +1106,13 @@ def initialize_native_adapter(model, path: str | Path, expected_identity: dict) 
     current = _adapter_parameters(model)
     before = _tensor_identity(current)
     admitted = {canonical_name(name): tensor for name, tensor in state.items()}
+    # The pack holds the Transformers model's names; Arctic Platform's Nemotron-H names its mixers apart.
+    reference_names = nemotron_h_reference_names(current)
     if "expert_parameters" in (identity.get("generation") or {}):
-        admitted = native_expert_factors(model, admitted, identity["generation"]["expert_parameters"])
+        admitted = native_expert_factors(model, admitted, identity["generation"]["expert_parameters"], reference_names)
+    if reference_names:
+        admitted = _target_named_factors(admitted, reference_names)
+    if "expert_parameters" in (identity.get("generation") or {}) or reference_names:
         expected = _tensor_identity(admitted)
     else:
         expected = identity["tensors"]
