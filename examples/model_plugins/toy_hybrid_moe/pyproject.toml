@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "toy-hybrid-moe-plugin"
+version = "0.1.0"
+description = "Example Arctic Platform model plugin: hybrid attention/recurrence layers with mixture-of-experts MLPs"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+# Every dependency must already be in the plugin's runtime release; arctic_platform supplies torch and pydantic,
+# the runtime supplies transformers and vLLM.
+dependencies = []
+
+[project.entry-points."arctic_platform.model_plugins"]
+toy_hybrid_moe = "toy_hybrid_moe:PLUGIN"
+
+[project.entry-points."vllm.general_plugins"]
+toy_hybrid_moe = "toy_hybrid_moe.vllm_model:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["toy_hybrid_moe"]

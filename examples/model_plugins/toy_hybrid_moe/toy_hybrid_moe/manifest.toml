@@ -1,0 +1,33 @@
+# ToyHybridMoE plugin manifest. The platform reads this before importing any plugin code.
+name = "custom/example/toy-hybrid-moe"
+version = "0.1.0"
+contract = "1.0"
+runtime_release = "runtime-2026.11"
+hf_model_types = ["toy_hybrid_moe"]
+
+[layer_types]
+full_attention = "platform:attention"   # the platform's attention core, sequence-parallel and fused on GPU
+linear_attention = "plugin"             # the gated recurrence, new to the platform: parallel.GatedRecurrenceMixer
+
+[capabilities]
+training = true
+sampling = true
+packing = true
+sequence_parallel = true
+expert_parallel = true
+max_expert_parallel = 4
+router_replay = true
+peft = false
+
+[sampler]
+vllm_architecture = "ToyHybridMoEForCausalLM"
+vllm_plugin = "toy_hybrid_moe.vllm_model:register"
+tensor_parallel = true
+speculative_decoding = false
+prefix_caching = false
+enforce_eager = true
+
+[profiles.h200-training-full]
+n_gpus = 8
+sp_size = 2
+ep_size = 4
