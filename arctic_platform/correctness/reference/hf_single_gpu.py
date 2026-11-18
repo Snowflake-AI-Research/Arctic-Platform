@@ -110,6 +110,10 @@ class ReferenceEngine:
     hidden_size: int
     head_name: Optional[str]
     device: str
+    # Gemma's final_logit_softcapping, which the Transformers forward applies to the logits and the target's chunked
+    # head too (arctic_platform/model/implementations/gpu/lm_head.py _final_logit_softcapping); the loss paths below
+    # project the head themselves, so they apply it.
+    softcap: Optional[float] = None
 
 
 def execution_witness(engine: ReferenceEngine, *, requested_attention: str) -> dict:
@@ -296,6 +300,8 @@ def build_engine(
     model.train()
 
     head = model.get_output_embeddings()
+    text_cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
+    softcap = getattr(text_cfg, "final_logit_softcapping", None)
     # Chunked cross-entropy calls F.linear against head.weight rather than the head module, so a bias would
     # be dropped silently instead of being added to every logit.
     if getattr(head, "bias", None) is not None:
@@ -310,6 +316,7 @@ def build_engine(
         # differs between architectures.
         head_name=next((n for n, q in model.named_parameters() if q is head.weight), None),
         device=device,
+        softcap=float(softcap) if softcap else None,
     )
 
 
@@ -407,6 +414,8 @@ def _forward_backward(
     if fused_cross_entropy:
         if fused_cross_entropy not in {True, "liger"}:
             raise ValueError(f"reference does not support fused_cross_entropy={fused_cross_entropy!r}")
+        if engine.softcap is not None:
+            raise ValueError("the reference's Liger fused cross-entropy does not apply final_logit_softcapping")
         if lm_head_token_chunk_size is not None:
             raise ValueError("fused cross-entropy and chunked LM-head logprobs are mutually exclusive")
         fused_ce = _build_liger_fused_cross_entropy(fp32_lm_head=fp32_lm_head)
@@ -459,6 +468,7 @@ def _forward_backward(
                 token_chunk_size=lm_head_token_chunk_size,
                 vocab_chunk_size=lm_head_vocab_chunk_size,
                 fp32_lm_head=fp32_lm_head,
+                softcap=engine.softcap,
             )
             valid = labels_mb != IGNORE_INDEX
             loss = -torch.where(valid, logprobs.float(), 0.0).sum() / active_tokens
@@ -486,6 +496,8 @@ def _forward_backward(
                     logits = F.linear(chunk_hidden.float(), head.weight.float())
                 else:
                     logits = F.linear(chunk_hidden, head.weight).float()
+                if engine.softcap is not None:
+                    logits = torch.tanh(logits / engine.softcap) * engine.softcap
                 loss = (
                     F.cross_entropy(logits, chunk_labels, ignore_index=IGNORE_INDEX, reduction="sum") / active_tokens
                 )

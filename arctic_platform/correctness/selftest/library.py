@@ -8634,6 +8634,55 @@ def test_reference_execution_witness_records_actual_configurations_and_selected_
     assert witness["effective_configurations"]["model"]["config"]["num_hidden_layers"] == 4
 
 
+@pytest.mark.parametrize("chunked", [False, True])
+def test_reference_loss_applies_final_logit_softcapping(chunked):
+    """Gemma 4 caps its logits at final_logit_softcapping = 30; the reference's own head projection has to as well."""
+    import torch.nn.functional as F
+
+    torch.manual_seed(0)
+
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(16, 8)
+
+        def forward(self, input_ids, use_cache=False):
+            return SimpleNamespace(last_hidden_state=self.embed(input_ids) * 40)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = Decoder()
+            self.head = torch.nn.Linear(8, 16, bias=False)
+
+    model = Model()
+    input_ids = torch.randint(0, 16, (1, 12))
+    labels = torch.roll(input_ids, -1, dims=1)
+    labels[0, -1] = hf_single_gpu.IGNORE_INDEX
+    batch = SimpleNamespace(input_ids=input_ids, shifted_labels=lambda: labels)
+
+    def loss(softcap):
+        engine = hf_single_gpu.ReferenceEngine(
+            model=model,
+            decoder=model.decoder,
+            head=model.head,
+            hidden_size=8,
+            head_name="head.weight",
+            device="cpu",
+            softcap=softcap,
+        )
+        return hf_single_gpu._forward_backward(engine, batch, lm_head_token_chunk_size=4 if chunked else None).loss
+
+    with torch.no_grad():
+        logits = F.linear(model.decoder(input_ids).last_hidden_state, model.head.weight).float()[0]
+    capped = torch.tanh(logits / 30.0) * 30.0
+    expected = F.cross_entropy(capped, labels[0], ignore_index=hf_single_gpu.IGNORE_INDEX).item()
+    uncapped = F.cross_entropy(logits, labels[0], ignore_index=hf_single_gpu.IGNORE_INDEX).item()
+    assert abs(expected - uncapped) > 1.0
+    assert loss(30.0) == pytest.approx(expected, rel=1e-4)
+    assert loss(None) == pytest.approx(uncapped, rel=1e-4)
+
+
 def test_reference_routes_attention_wider_than_flash_attention_3_to_sdpa(monkeypatch):
     """Gemma 4's full-attention layers are 512 wide and FlashAttention 3 stops at 256; its sliding ones stay on it."""
     from transformers.integrations import sdpa_attention
