@@ -19645,6 +19645,59 @@ def test_bounded_step_new_counter_advances_once_and_manifest_is_published_last(
     assert not (_optimizer_reference_fast_output / ".manifest.json.tmp").exists()
 
 
+@pytest.mark.parametrize("master", ["float32", "bfloat16"])
+@pytest.mark.parametrize("clipping", [None, 0.35])
+@pytest.mark.parametrize("consume", [False, True])
+def test_bounded_step_steps_a_parameter_over_the_slice_limit_in_slices_with_the_whole_step_artifacts(
+    monkeypatch, _optimizer_reference_fast_output, master, clipping, consume
+):
+    model = _BoundedStepModel(torch.bfloat16)
+    gradients = _bounded_step_gradients(model)
+    expected_norm, expected_manifest, expected = _bounded_step_whole_parameter_oracle(
+        model, gradients, master_dtype=getattr(torch, master), clipping=clipping
+    )
+    original_build = optimizer_step.build_adamw
+    stepped = []
+
+    def build(named_masters, config, *, learning_rate):
+        name, master_slice = named_masters[0]
+        assert master_slice.dtype == getattr(torch, master)
+        stepped.append((name, tuple(master_slice.shape)))
+        return original_build(named_masters, config, learning_rate=learning_rate)
+
+    monkeypatch.setattr(optimizer_step, "build_adamw", build)
+    # The 5 x 3 weight steps as whole rows, two at a time; the parameters within the limit step whole.
+    monkeypatch.setattr(optimizer_step, "STEP_SLICE_ELEMENTS", 6)
+    artifact = run_adamw_step(
+        model,
+        gradients,
+        copy.deepcopy(_BOUNDED_STEP_CONFIG),
+        learning_rate=_BOUNDED_STEP_LR,
+        gradient_clipping=clipping,
+        optimizer_dtype=master,
+        output_dir=_optimizer_reference_fast_output,
+        consume_gradients=consume,
+    )
+    assert stepped == [
+        ("weight", (2, 3)),
+        ("weight", (2, 3)),
+        ("weight", (1, 3)),
+        ("bias", (3,)),
+        ("scalar", ()),
+        ("norm.weight", (3,)),
+        ("norm.bias", (3,)),
+    ]
+    assert artifact.gradient_norm_before_clip == expected_norm
+    assert json.loads(artifact.manifest_path.read_text()) == expected_manifest
+    for entry in expected_manifest["parameters"]:
+        actual = torch.load(artifact.manifest_path.parent / entry["file"], weights_only=True)
+        assert actual.keys() == expected[entry["name"]].keys()
+        for key, value in actual.items():
+            target = expected[entry["name"]][key]
+            assert (value.dtype, value.shape, value.stride()) == (target.dtype, target.shape, target.stride())
+            assert torch.equal(value, target), (entry["name"], key)
+
+
 # Consuming reference gradients after complete global clipping preflight.
 
 

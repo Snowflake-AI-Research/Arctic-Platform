@@ -29,6 +29,10 @@ from arctic_platform.correctness.harness.storage import require_data_fast_path
 
 NO_DECAY_NAMES = ("bias", "layer_norm.weight", "layernorm.weight", "norm.weight", "ln_f.weight")
 ADAMW_NAMES = {"adam", "adamw", "fusedadam", "fused_adam", "torch_adamw", "deepspeed_cpu_adam"}
+# The device holds one slice of a parameter's master, gradient and moments at a time, at most this many elements
+# (1 GiB of FP32 each), and the host gathers the slices' updates and moments. Adam is elementwise, so the result
+# equals the whole tensor's step; only the device footprint is bounded.
+STEP_SLICE_ELEMENTS = 1 << 28
 
 
 @dataclass
@@ -86,6 +90,14 @@ def build_adamw(named_masters, optimizer_config: dict, *, learning_rate: float):
     return torch.optim.AdamW(groups, foreach=False, fused=False, **kwargs)
 
 
+def _step_slices(source, limit: int) -> list:
+    """The whole tensor when it fits in ``limit`` elements, else whole leading-index slices of at most that."""
+    if source.numel() <= limit:
+        return [...]
+    rows = max(1, limit // (source.numel() // source.shape[0]))
+    return [slice(start, start + rows) for start in range(0, source.shape[0], rows)]
+
+
 def _write_adamw_parameter(
     name,
     source,
@@ -99,50 +111,60 @@ def _write_adamw_parameter(
     path,
     consume_gradients,
 ):
-    master = initial_master = optimizer = state = tensors = None
+    gradient = gradients.pop(name) if consume_gradients else gradients[name]
+    slices = _step_slices(source, STEP_SLICE_ELEMENTS)
+    tensors = {}
     try:
-        master = torch.nn.Parameter(source.detach().to(dtype).clone(), requires_grad=True)
-        # Initialization precision conversion is not part of the optimizer update.
-        initial_master = master.detach().float().clone()
-        gradient = gradients.pop(name) if consume_gradients else gradients[name]
-        master.grad = gradient.detach().to(device=master.device, dtype=dtype).clone()
-        del gradient
-        if coefficient is not None:
-            if foreach_clip:
-                torch._foreach_mul_([master.grad], coefficient)
-            else:
-                master.grad.mul_(coefficient)
-        optimizer = build_adamw([(name, master)], optimizer_config, learning_rate=learning_rate)
-        optimizer.step()
-        master.grad = None
-        state = optimizer.state[master]
-        tensors = {
-            "parameter_update": master.detach().float().sub(initial_master).cpu(),
-            "exp_avg": state["exp_avg"].detach().cpu(),
-            "exp_avg_sq": state["exp_avg_sq"].detach().cpu(),
-        }
+        for position, index in enumerate(slices, start=1):
+            master = initial_master = optimizer = state = None
+            try:
+                master = torch.nn.Parameter(source.detach()[index].to(dtype).clone(), requires_grad=True)
+                # Initialization precision conversion is not part of the optimizer update.
+                initial_master = master.detach().float().clone()
+                master.grad = gradient.detach()[index].to(device=master.device, dtype=dtype).clone()
+                if position == len(slices):
+                    del gradient
+                if coefficient is not None:
+                    if foreach_clip:
+                        torch._foreach_mul_([master.grad], coefficient)
+                    else:
+                        master.grad.mul_(coefficient)
+                optimizer = build_adamw([(name, master)], optimizer_config, learning_rate=learning_rate)
+                optimizer.step()
+                master.grad = None
+                state = optimizer.state[master]
+                if not tensors:
+                    # Host copies in the layout the whole-tensor step's copies had.
+                    tensors.update(
+                        parameter_update=torch.empty_like(source.detach(), dtype=torch.float32, device="cpu"),
+                        exp_avg=torch.empty_like(source.detach(), dtype=dtype, device="cpu"),
+                        exp_avg_sq=torch.empty_like(source.detach(), dtype=dtype, device="cpu"),
+                    )
+                tensors["parameter_update"][index].copy_(master.detach().float().sub(initial_master))
+                tensors["exp_avg"][index].copy_(state["exp_avg"].detach())
+                tensors["exp_avg_sq"][index].copy_(state["exp_avg_sq"].detach())
+            finally:
+                if master is not None:
+                    master.grad = None
+                if state is not None:
+                    state.clear()
+                if optimizer is not None:
+                    optimizer.state.clear()
+                    for group in optimizer.param_groups:
+                        group["params"].clear()
+                    optimizer.param_groups.clear()
+                master = initial_master = optimizer = state = None
         torch.save(tensors, path)
         return {
             "name": name,
             "file": path.name,
-            "shape": list(master.shape),
+            "shape": list(source.shape),
             "parameter_update_norm": float(torch.linalg.vector_norm(tensors["parameter_update"])),
             "exp_avg_norm": float(torch.linalg.vector_norm(tensors["exp_avg"])),
             "exp_avg_sq_norm": float(torch.linalg.vector_norm(tensors["exp_avg_sq"])),
         }
     finally:
-        if master is not None:
-            master.grad = None
-        if state is not None:
-            state.clear()
-        if optimizer is not None:
-            optimizer.state.clear()
-            for group in optimizer.param_groups:
-                group["params"].clear()
-            optimizer.param_groups.clear()
-        if tensors is not None:
-            tensors.clear()
-        master = initial_master = optimizer = state = tensors = None
+        tensors.clear()
 
 
 def run_adamw_step(
