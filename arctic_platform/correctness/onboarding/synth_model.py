@@ -202,9 +202,37 @@ def reduce_config(source: str, num_layers: int, vision_depth: int = 2):
         if isinstance(value, list) and len(value) == original:
             setattr(text, attr, list(value[:num_layers]))
 
+    drop_prediction_layers(text)
+
     if hasattr(cfg, "vision_config") and vision_depth is not None:
         cfg.vision_config.depth = vision_depth
     return cfg, original, period
+
+
+# The MoE text configs that declare multi-token-prediction layers, and the field that counts them.
+_PREDICTION_LAYER_COUNTS = {
+    "qwen3_5_moe_text": "mtp_num_hidden_layers",
+    "qwen4_exp_text": "mtp_num_hidden_layers",
+    "glm5_next_text": "num_nextn_predict_layers",
+}
+
+
+def drop_prediction_layers(text) -> None:
+    """Declare no multi-token-prediction layers in a reduced text config.
+
+    The Hugging Face models build no MTP layers and skip the checkpoint's MTP weights, and Arctic Platform's
+    training models build none either, so a fixture saved from the Hugging Face model has no MTP weights. Keeping
+    the source's MTP count would declare layers neither engine has, which the fixture admission refuses as
+    omitted weights; zero describes the model both engines train.
+    """
+    count_name = _PREDICTION_LAYER_COUNTS.get(getattr(text, "model_type", None))
+    if count_name is None or not getattr(text, count_name, 0):
+        return
+    setattr(text, count_name, 0)
+    nested = getattr(text, "mtp", None)
+    if isinstance(nested, dict) and "num_hidden_layers" in nested:
+        # Qwen3.8-Flash-Next also describes its MTP stack in an ``mtp`` block.
+        setattr(text, "mtp", {**nested, "num_hidden_layers": 0, "layer_types": []})
 
 
 def _meta_model(cfg):

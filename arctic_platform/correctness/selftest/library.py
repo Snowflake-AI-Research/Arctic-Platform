@@ -26478,6 +26478,20 @@ def test_sft_request_without_a_model_loss_head_asks_dss_for_the_logprob_loss() -
     assert torch.equal(lowered["context"]["loss_mask"], (batch.shifted_labels() != -100).float())
 
 
+def test_reduced_fixture_config_declares_no_prediction_layers() -> None:
+    text = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        mtp_num_hidden_layers=1,
+        mtp={"hybrid": True, "num_hidden_layers": 1, "layer_types": ["full_attention"]},
+    )
+    synth_model.drop_prediction_layers(text)
+    assert text.mtp_num_hidden_layers == 0
+    assert text.mtp == {"hybrid": True, "num_hidden_layers": 0, "layer_types": []}
+    glm = SimpleNamespace(model_type="glm5_next_text", num_nextn_predict_layers=1)
+    synth_model.drop_prediction_layers(glm)
+    assert glm.num_nextn_predict_layers == 0
+
+
 def test_inference_checkpoint_loss_forward_request_attends_to_prompts_and_masks_only_padding() -> None:
     batch = gsm8k.build_batch("validation", _inference_checkpoint_loss_ROWS, pad_id=0)
     attention_mask = inference_rl_check.pack_logit_aligned(batch)["batch"]["attention_mask"]
