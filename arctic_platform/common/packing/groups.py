@@ -220,7 +220,9 @@ def token_budget_microbatch_groups(
     """Token-budget row groups for one shard, in the order they will be executed.
 
     ``min_groups`` raises the group count to a request-wide schedule, splitting groups rather than adding calls
-    that do no work; a shard with too few rows to reach it comes back short.
+    that do no work; a shard with too few rows to reach it comes back short. The last step is
+    ``costliest_first``, so a test that compares this plan to dispatch is comparing execution order, not row
+    order.
     """
     valid_lengths = shard_valid_lengths(batch)
     n_rows = len(valid_lengths)
@@ -230,6 +232,7 @@ def token_budget_microbatch_groups(
     groups = token_budget_groups(valid_lengths, max_tokens_per_mb)
     if min_groups > len(groups):
         groups = split_groups_to_count(groups, valid_lengths, min_groups)
+    groups = costliest_first(groups, valid_lengths, max_tokens_per_mb)
 
     covered = sorted(int(row) for group in groups for row in group)
     if covered != list(range(n_rows)):

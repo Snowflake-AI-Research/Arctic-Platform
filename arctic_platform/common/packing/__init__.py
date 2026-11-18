@@ -30,7 +30,8 @@ The contract, in the order the pieces get used:
 1. ``token_budget_groups(valid_lengths, max_tokens_per_mb)`` decides which rows share a model call, and
    ``split_groups_to_count`` raises a plan to a required number of calls. Both read only the rows' token counts,
    so every rank derives the same plan from the same shard without communicating.
-   ``token_budget_microbatch_groups(batch, max_tokens_per_mb, min_groups)`` applies the pair to a whole batch.
+   ``token_budget_microbatch_groups(batch, max_tokens_per_mb, min_groups)`` applies the pair to a whole batch,
+   then ``costliest_first``.
    ``costliest_first`` reorders a plan's calls by estimated cost, so call ``k`` lines up across DP shards.
 2. ``pack_microbatch(data)`` turns that group's valid tokens into one ``[1, T, ...]`` model call plus a
    ``PackMetadata`` recording where each row lives. Padding is gone: ``T`` is the sum of the rows' real lengths.

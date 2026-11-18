@@ -23,6 +23,7 @@ from arctic_platform.common.packing import PackMetadata
 from arctic_platform.common.packing import pack_microbatch
 from arctic_platform.common.packing import pad_packed_microbatch
 from arctic_platform.common.packing import token_budget_groups
+from arctic_platform.common.packing import token_budget_microbatch_groups
 from arctic_platform.common.packing import token_shard
 from arctic_platform.common.packing import token_validity_mask
 from arctic_platform.common.packing import token_window
@@ -210,9 +211,8 @@ def test_costliest_first_keeps_row_order_among_equal_costs_and_rows_within_a_cal
 
     assert costliest_first([[1], [0]], [4, 4], 9) == [[0], [1]]
     assert costliest_first([[3, 0], [2, 1]], [2, 3, 4, 5], 16) == [[0, 3], [1, 2]]
-    groups = [[0, 2], [1], [3]]
-    ordered = costliest_first(groups, [4, 7, 1, 2], 9)
-    assert sorted(ordered) == sorted(groups)
+    # Lengths 4, 7, 1, 2 under budget 9: the 7-token call, then 4+1, then 2.
+    assert costliest_first([[0, 2], [1], [3]], [4, 7, 1, 2], 9) == [[1], [0, 2], [3]]
 
 
 def test_costliest_first_refuses_a_non_positive_budget():
@@ -220,6 +220,19 @@ def test_costliest_first_refuses_a_non_positive_budget():
 
     with pytest.raises(ValueError, match="must be positive"):
         costliest_first([[0]], [4], 0)
+
+
+def test_token_budget_microbatch_groups_runs_costliest_first():
+    """The batch helper ends in execution order, so a dispatch oracle is not comparing against row order.
+
+    Rows of 2 and 8 tokens under a 9-token budget cannot share a call. Grouping returns ``[[0], [1]]``; the
+    helper must then put the 8-token call first.
+    """
+    attention_mask = torch.zeros(2, 8, dtype=torch.long)
+    attention_mask[0, :2] = 1
+    attention_mask[1, :8] = 1
+    batch = {"input_ids": torch.zeros(2, 8, dtype=torch.long), "attention_mask": attention_mask}
+    assert token_budget_microbatch_groups(batch, 9) == [[1], [0]]
 
 
 def test_window_cu_seqlens_are_the_row_boundaries_when_nothing_is_sharded():
