@@ -3273,6 +3273,7 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     from arctic_platform.correctness.harness.sft import SEED
     from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
     from arctic_platform.correctness.harness.sft import save
+    from arctic_platform.correctness.harness.sft import trained_token_ids
 
     config = load_config(args.config)
     spec = TestSpec.read(args.test_spec)
@@ -3283,7 +3284,14 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
         raise ValueError("the existing spec has no gas1 case")
     model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     vocab_size = getattr(model_config, "text_config", model_config).vocab_size
-    batch = build_batch(gas1.name, gas1.global_batch_size, gas1.max_seq_len, vocab_size, seed=SEED)
+    batch = build_batch(
+        gas1.name,
+        gas1.global_batch_size,
+        gas1.max_seq_len,
+        vocab_size,
+        seed=SEED,
+        token_ids=trained_token_ids(str(model_path), vocab_size),
+    )
     batch_path = args.output_dir / "optimizer-calibration-batch.pt"
     save(batch, batch_path)
     training = config.effective_training

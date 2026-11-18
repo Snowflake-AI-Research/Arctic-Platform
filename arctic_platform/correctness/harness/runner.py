@@ -56,6 +56,7 @@ from arctic_platform.correctness.harness.gateway import validate_reduced_fixture
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
 from arctic_platform.correctness.harness.sft import save
+from arctic_platform.correctness.harness.sft import trained_token_ids
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 from arctic_platform.correctness.reference.process_determinism import CUBLAS_WORKSPACE
@@ -633,9 +634,15 @@ def execute(
     attn_impl = attn or cfg.attention_implementation
     batch_paths: Dict[str, Path] = {}
     arm_specs: List[ArmSpec] = []
+    token_ids = trained_token_ids(reference_model_path, vocab_size)
     for definition in arm_defs:
         batch = build_batch(
-            definition.name, definition.global_batch_size, definition.max_seq_len, vocab_size, seed=SEED
+            definition.name,
+            definition.global_batch_size,
+            definition.max_seq_len,
+            vocab_size,
+            seed=SEED,
+            token_ids=token_ids,
         )
         path = tmp / f"batch-{definition.name}.pt"
         save(batch, path)

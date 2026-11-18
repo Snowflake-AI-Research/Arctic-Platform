@@ -667,6 +667,26 @@ def test_arms_smaller_microbatch_budget_is_preserved() -> None:
     assert correctness_microbatch_tokens(10240) == 10240
 
 
+def test_arms_synthetic_ids_skip_the_checkpoints_untrained_embedding_rows(tmp_path: Path) -> None:
+    vocab = 64
+    rows = torch.randn(vocab, 16, generator=torch.Generator().manual_seed(0))
+    rows = rows / rows.pow(2).mean(dim=1, keepdim=True).sqrt()  # every row at RMS 1, the median
+    scale = torch.ones(vocab, 1)
+    scale[[0, 17, 63]] = 1e-7  # untrained: near zero
+    scale[9] = 0.4  # below half the median
+    scale[5] = 0.6  # above it
+    # The output head has as many rows; only the input embedding decides.
+    save_file(
+        {"model.embed_tokens.weight": (rows * scale).bfloat16(), "lm_head.weight": torch.zeros(vocab, 16).bfloat16()},
+        tmp_path / "model.safetensors",
+    )
+    token_ids = batches.trained_token_ids(str(tmp_path), vocab)
+    assert token_ids.tolist() == [i for i in range(vocab) if i not in (0, 9, 17, 63)]
+    batch = batches.build_synthetic_batch("gas1", 4, 512, vocab, token_ids=token_ids)
+    # The batch never draws an untrained id, and every trained id stays drawable.
+    assert sorted(batch.input_ids.unique().tolist()) == token_ids.tolist()
+
+
 # Config gpu attention.
 
 
@@ -18166,6 +18186,8 @@ def test_cortex_fixture_gradient_runner_loads_prepared_reference_and_routes_only
 
     monkeypatch.setattr(runner, "run_reference", lambda *a, **k: pytest.fail("regression must not run HF"))
     monkeypatch.setattr(reference_records, "load_record", reference)
+    # The receipt's fixture holds placeholder weight bytes: draw the batch over the whole vocabulary.
+    monkeypatch.setattr(runner, "trained_token_ids", lambda *a: None)
     monkeypatch.setattr(runner, "gateway", remote_gateway)
     monkeypatch.setattr(runner, "running_job", remote_job)
     monkeypatch.setattr(runner, "fwd_bwd_step", lambda *a, **k: {})
