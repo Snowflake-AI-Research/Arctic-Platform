@@ -196,11 +196,16 @@ def build_engine(
     seed: int = 0,
     matmul_precision: str = "highest",
     device: str = "cuda",
+    huggingface_loader: bool = False,
 ) -> ReferenceEngine:
     """Load the checkpoint, apply the config's PEFT, and leave the model ready to forward-backward.
 
     Separate from the request path because a multi-step run builds one engine and drives it many times.
     Loading per step would restart every trajectory from the checkpoint.
+
+    ``huggingface_loader`` builds the class the target's huggingface loader builds, ``AutoModelForCausalLM``'s for
+    the checkpoint (``LoadedConfig.huggingface_loader``), so both train the same parameters; otherwise the class
+    ``architectures[0]`` names.
     """
     import torch
     import transformers
@@ -224,6 +229,8 @@ def build_engine(
             cls, model_path, dtype=torch_dtype, attn_implementation=attn_implementation, device=device
         )
     else:
+        if huggingface_loader:
+            cls = transformers.AutoModelForCausalLM
         model = cls.from_pretrained(model_path, dtype=torch_dtype, attn_implementation=attn_implementation).to(device)
     if peft_adapter_path:
         from peft import PeftModel
@@ -518,6 +525,7 @@ def run(
     gradient_clipping: float | None = None,
     optimizer_dtype: str = "float32",
     optimizer_output_dir: str | None = None,
+    huggingface_loader: bool = False,
 ) -> ReferenceResult:
     """Forward-backward the whole request and return one L2 gradient norm per parameter."""
     if optimizer_output_dir is not None:
@@ -533,6 +541,7 @@ def run(
         seed=seed,
         matmul_precision=matmul_precision,
         device=device,
+        huggingface_loader=huggingface_loader,
     )
     model = engine.model
     reference_execution = execution_witness(engine, requested_attention=attn_implementation)

@@ -179,6 +179,7 @@ def run_reference(
     optimizer_output_dir: Path | None = None,
     cuda_device: int | None = None,
     deterministic: bool = True,
+    huggingface_loader: bool = False,
 ) -> dict:
     """Invoke the reference as a subprocess so the node is clean before the gateway starts."""
     out_path = Path(out_path)
@@ -214,6 +215,8 @@ def run_reference(
     if peft_adapter_path is not None:
         cmd += ["--peft-adapter", str(peft_adapter_path)]
     cmd += ["--matmul-precision", matmul_precision]
+    if huggingface_loader:
+        cmd.append("--huggingface-loader")
     if lm_head_token_chunk_size is not None:
         cmd += [
             "--lm-head-token-chunk",
@@ -854,6 +857,7 @@ def execute(
                 optimizer_output_dir=optimizer_output_dir,
                 cuda_device=cuda_device,
                 deterministic=deterministic,
+                huggingface_loader=cfg.huggingface_loader,
             )
             if (
                 reference_adapter_path is not None

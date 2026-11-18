@@ -20150,6 +20150,76 @@ def test_onboarding_renderer_reads_nested_prime_rl_chunk_size(tmp_path: Path) ->
     assert "lm_head_token_chunk_size=8192" in rendered
 
 
+def test_reference_builds_the_huggingface_loader_class_of_a_composite_qwen35_checkpoint(tmp_path: Path) -> None:
+    """DSS's huggingface route trains Qwen3.5 as AutoModelForCausalLM's text-only class; so does the reference."""
+    import torch
+    from transformers import Qwen3_5Config
+    from transformers import Qwen3_5ForConditionalGeneration
+
+    from arctic_platform.correctness.harness.optimizer import normalize
+    from arctic_platform.correctness.reference.hf_single_gpu import build_engine
+
+    text = {
+        "vocab_size": 64,
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 8,
+        "layer_types": ["linear_attention", "full_attention"],
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 2,
+        "linear_key_head_dim": 8,
+        "linear_value_head_dim": 8,
+        "tie_word_embeddings": True,
+    }
+    vision = {
+        "depth": 1,
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_heads": 2,
+        "out_hidden_size": 16,
+        "patch_size": 2,
+        "temporal_patch_size": 1,
+        "spatial_merge_size": 1,
+        "num_position_embeddings": 16,
+    }
+    config = Qwen3_5Config(text_config=text, vision_config=vision, tie_word_embeddings=True)
+    config.architectures = ["Qwen3_5ForConditionalGeneration"]
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        Qwen3_5ForConditionalGeneration(config).save_pretrained(tmp_path / "qwen35")
+    precision = torch.get_float32_matmul_precision()
+    try:
+        composite, causal = (
+            build_engine(str(tmp_path / "qwen35"), device="cpu", huggingface_loader=loader) for loader in (False, True)
+        )
+    finally:
+        torch.set_float32_matmul_precision(precision)
+
+    def trainable(engine):
+        parameters = engine.model.named_parameters()
+        return {normalize(name): parameter for name, parameter in parameters if parameter.requires_grad}
+
+    assert type(composite.model).__name__ == "Qwen3_5ForConditionalGeneration"
+    assert type(causal.model).__name__ == "Qwen3_5ForCausalLM"
+    vision_names = {name for name in trainable(composite) if name.startswith("visual.")}
+    assert vision_names and not any(name.startswith("visual.") for name in trainable(causal))
+    assert set(trainable(causal)) == set(trainable(composite)) - vision_names
+    assert all(torch.equal(parameter, trainable(composite)[name]) for name, parameter in trainable(causal).items())
+    cfg = LoadedConfig(config_id="x", path=Path("x"), sub_job={"training_config": {"n_gpus": 8}})
+    assert cfg.huggingface_loader
+    cfg.sub_job["training_config"]["ep_size"] = 1
+    assert cfg.huggingface_loader
+    cfg.sub_job["training_config"]["ep_size"] = 8
+    assert not cfg.huggingface_loader
+
+
+def test_onboarding_renderer_passes_the_target_loader_to_reference(tmp_path: Path) -> None:
+    assert "huggingface_loader=True" in _onboarding_render_config(tmp_path, None)
+
+
 def test_onboarding_renderer_passes_peft_config_to_reference(tmp_path: Path) -> None:
     rendered = _onboarding_render_config(
         tmp_path, None, {"peft_type": "Lora", "r": 32, "target_modules": ["q_proj", "v_proj"]}
@@ -21049,6 +21119,7 @@ def test_onboarding_storage_optimizer_calibration_allocates_fresh_root_and_clean
         reference_attention_implementation="sdpa",
         lm_head_token_chunk_size=None,
         optimizer_dtype="fp32",
+        huggingface_loader=True,
     )
     spec = SimpleNamespace(
         config_checksum="checksum",
@@ -21100,6 +21171,7 @@ def test_onboarding_storage_optimizer_calibration_allocates_fresh_root_and_clean
 
     def reference(*positional, **kwargs):
         assert kwargs["attn"] == "sdpa"
+        assert kwargs["huggingface_loader"] is True
         destination = kwargs["optimizer_output_dir"]
         assert destination.parent.parent in created
         if fail_reference:

@@ -1195,6 +1195,7 @@ def _probe_worker(args: argparse.Namespace) -> int:
             seed=SEED,
             lm_head_token_chunk_size=config.lm_head_token_chunk_size,
             lm_head_vocab_chunk_size=training.get("fused_lm_head_vocab_chunk_size", 8192),
+            huggingface_loader=config.huggingface_loader,
         )
         payload.update(
             status="fit",
@@ -3282,6 +3283,7 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
             optimizer_output_dir=run_dir / "states",
             cuda_device=run_index % lanes,
             deterministic=False,
+            huggingface_loader=config.huggingface_loader,
         )
         return run_index, time.monotonic() - started, result
 

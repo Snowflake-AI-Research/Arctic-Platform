@@ -97,7 +97,8 @@ def render(args: argparse.Namespace) -> str:
         " matmul_precision=__MATMUL_PRECISION__,\n            peft_config=__PEFT_CONFIG__,\n           "
         " peft_adapter_path=__PEFT_ADAPTER_PATH__,\n            seed=SEED,\n           "
         " lm_head_token_chunk_size=__TOKEN_CHUNK__,\n            lm_head_vocab_chunk_size=__VOCAB_CHUNK__,\n          "
-        "  deterministic=False,\n            cuda_device=index % lanes,\n        )\n        return index,"
+        "  deterministic=False,\n            cuda_device=index % lanes,\n           "
+        " huggingface_loader=__HUGGINGFACE_LOADER__,\n        )\n        return index,"
         " time.monotonic() - started, result\n\n    ranges = []\n    arm_measurements = {}\n    for arm in arms:\n    "
         '    arm_name = arm["name"]\n        batch = build_batch(arm_name, arm["global_batch_size"],'
         ' arm["max_seq_len"], inner.vocab_size, seed=SEED)\n        batch_path = tensor_dir / f"batch-{arm_name}.pt"\n'
@@ -184,6 +185,7 @@ def render(args: argparse.Namespace) -> str:
         "__PEFT_ADAPTER_PATH__": repr(str(peft_adapter_path)) if peft_adapter_path else "None",
         "__TOKEN_CHUNK__": repr(token_chunk),
         "__VOCAB_CHUNK__": str(vocab_chunk),
+        "__HUGGINGFACE_LOADER__": repr(config.huggingface_loader),
     }
     for key, value in replacements.items():
         template = template.replace(key, value)

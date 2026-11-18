@@ -521,6 +521,17 @@ class LoadedConfig:
         return MODEL_REFERENCE_ATTENTION_IMPLEMENTATIONS.get(self.model_name, target)
 
     @property
+    def huggingface_loader(self) -> bool:
+        """Whether DSS builds this job's model with Arctic Platform's huggingface loader.
+
+        DSS takes its MoE route only for ``ep_size`` above one (``model_options.moe_route``); every other training
+        job loads ``AutoModelForCausalLM.from_pretrained`` (Arctic Platform ``model/loaders/huggingface.py``). For a
+        composite vision-language checkpoint that class can be text-only: Qwen3.5's is ``Qwen3_5ForCausalLM``, which
+        builds no vision tower, while ``architectures[0]`` names ``Qwen3_5ForConditionalGeneration``.
+        """
+        return int(self.training.get("ep_size") or 1) <= 1
+
+    @property
     def max_seq_len(self) -> int:
         """The padded row width the config declares, or the one the training engine would supply for it.
 
