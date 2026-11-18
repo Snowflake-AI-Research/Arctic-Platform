@@ -12464,6 +12464,45 @@ def test_dense_collection_new_boundary_real_pipe_reaps_both_owned_children(tmp_p
             os.killpg(child.pid, 0)
 
 
+@pytest.mark.parametrize("named", [True, False])
+def test_local_allocation_validates_the_hostfile_the_admission_read(tmp_path, monkeypatch, named):
+    # The owned admission reads DSS_GATEWAY_HOSTFILE when it is set; so does the live allocation check.
+    from arctic_platform.correctness.harness import inference as transfer
+
+    hostfile = tmp_path / "hostfile"
+    content = "10.0.0.1 slots=8\n10.0.0.2 slots=8\n"
+    hostfile.write_text(content)
+    monkeypatch.setattr(transfer, "_LOCAL_HOSTFILE", tmp_path / "job-hostfile")  # no /job/hostfile on this allocation
+    monkeypatch.setattr(transfer, "_validate_local_node", lambda node, deadline: None)
+    monkeypatch.delenv("ARCTIC_HOSTFILE", raising=False)
+    if named:
+        monkeypatch.setenv("DSS_GATEWAY_HOSTFILE", str(hostfile))
+    else:
+        monkeypatch.delenv("DSS_GATEWAY_HOSTFILE", raising=False)
+    nodes = [
+        {
+            "host": host,
+            "hostname": f"node{index}",
+            "slots": 8,
+            "boot_id": "1" * 36,
+            "python": sys.executable,
+            "python_sha256": "2" * 64,
+        }
+        for index, host in enumerate(("10.0.0.1", "10.0.0.2"))
+    ]
+    admission = {
+        "allocation_id": "same-job",
+        "nodes": nodes,
+        "hostfile_content": content,
+        "hostfile_sha256": hashlib.sha256(hostfile.read_bytes()).hexdigest(),
+    }
+    if named:
+        assert transfer._validate_local_allocation(admission, time.monotonic() + 30) == nodes
+    else:
+        with pytest.raises(FileNotFoundError):
+            transfer._validate_local_allocation(admission, time.monotonic() + 30)
+
+
 @pytest.mark.parametrize("mutation", ["valid", "boot", "width", "order", "hash", "content", "duplicate"])
 def test_dense_collection_new_boundary_real_validator_requires_exact_hostfile_and_complete16(
     tmp_path,

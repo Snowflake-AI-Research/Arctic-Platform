@@ -974,9 +974,16 @@ def _local_manifest(root, deadline, fingerprints=None):
     return manifest
 
 
+def _local_hostfile_path() -> Path:
+    """The allocation hostfile the owned admission read: DSS_GATEWAY_HOSTFILE or ARCTIC_HOSTFILE when set (the
+    gateway's _allocation_hostfile order), else the prescribed /job/hostfile link."""
+    value = os.environ.get("DSS_GATEWAY_HOSTFILE") or os.environ.get("ARCTIC_HOSTFILE")
+    return Path(value) if value else _LOCAL_HOSTFILE
+
+
 def _local_hostfile_identity():
     """Permit only the allocation's prescribed link, not arbitrary file aliases."""
-    hostfile = _LOCAL_HOSTFILE
+    hostfile = _local_hostfile_path()
     original = hostfile.lstat()
     link = None
     target = hostfile

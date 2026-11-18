@@ -3985,12 +3985,12 @@ def _dense_node_admission(request, deadline):
         raise ValueError("dense checkpoint ordered head snapshot members differ from admitted nodes")
     transfer._validate_local_node(request["node"], deadline)
     try:
-        transfer._LOCAL_HOSTFILE.lstat()
+        transfer._local_hostfile_path().lstat()
     except FileNotFoundError:
         if request["node"] == nodes[0]:
             raise ValueError("dense checkpoint head hostfile is required") from None
         identity = {
-            "path": str(transfer._LOCAL_HOSTFILE),
+            "path": str(transfer._local_hostfile_path()),
             "absent": True,
             "hostfile_sha256": admission["hostfile_sha256"],
         }
