@@ -3443,6 +3443,48 @@ def test_incremental_onboarding_explicit_checks_preserve_each_others_success(_in
     assert all(result["status"] == "onboarded" for result in results.values())
 
 
+def test_incremental_onboarding_explicit_checks_prepare_the_combined_run_records(_incremental_onboarding, monkeypatch):
+    """`onboard --test` of each check leaves the with-optimizer records a run selecting both checks reads."""
+    state = _incremental_onboarding
+    parent = state.onboard._parent
+
+    def resolving_parent(child):
+        # The onboarding parent resolves the source checkpoint into the request it is handed.
+        child.source_checkpoint = state.config.model_name
+        return parent(child)
+
+    monkeypatch.setattr(state.onboard, "_parent", resolving_parent)
+    summary_path = state.args.test_spec.with_suffix(".onboarding.json")
+    state.args.test_id = "single-step-grads"
+    assert state.onboard.run(state.args) == 0
+    assert state.prepared == []
+    state.args.source_checkpoint = None
+
+    def fail(child):
+        raise RuntimeError("reference preparation failed")
+
+    monkeypatch.setattr(state.onboard, "_prepare_references", fail)
+    state.args.test_id = "single-step-optimizer"
+    assert state.onboard.run(state.args) == 1
+    assert json.loads(summary_path.read_text())["combined_reference_error"] == "reference preparation failed"
+    state.args.source_checkpoint = None
+    monkeypatch.setattr(
+        state.onboard, "_prepare_references", lambda child: state.prepared.append(child.reference_tests) or 0
+    )
+    state.executed.clear()
+    # Repeating the command retries the combined records without onboarding the check again.
+    assert state.onboard.run(state.args) == 0
+    assert state.executed == []
+    assert state.prepared == [["single-step-grads", "single-step-optimizer"]]
+    summary = json.loads(summary_path.read_text())
+    assert summary["combined_reference_error"] is None
+    assert all(result["status"] == "onboarded" for result in summary["results"].values())
+    for test_id in ("single-step-grads", "single-step-optimizer"):
+        state.args.test_id = test_id
+        assert state.onboard.run(state.args) == 0
+    assert state.executed == [] and len(state.prepared) == 1
+
+
 @pytest.mark.parametrize("change", ["config", "model", "gate", "options", "missing-spec", "corrupt-summary"])
 def test_incremental_onboarding_changed_workload_is_not_skipped(_incremental_onboarding, monkeypatch, change):
     state = _incremental_onboarding
