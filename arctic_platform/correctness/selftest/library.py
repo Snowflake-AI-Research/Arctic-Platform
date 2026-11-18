@@ -910,6 +910,29 @@ def test_config_gpu_attention_flash_next_rejects_generic_h200_attention(tmp_path
         validate_against_host(load_config(path), available_gpus=8, check_gpu_type=False)
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "deepseek-ai/DeepSeek-V4.1-Flash",
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "PrimeIntellect/DeepSeek-V4.1-Flash-bf16",
+    ],
+)
+def test_config_gpu_attention_deepseek_v41_requires_its_loader_attention(tmp_path: Path, model: str) -> None:
+    """DeepSeek-V4.1's catalog files select "eager", the only name Arctic Platform's DeepSeek-V4.1 loader accepts."""
+    path = _config_gpu_attention_write_config(tmp_path, "h200", "eager", n_gpus=8)
+    raw = json.loads(path.read_text())
+    raw["model_name"] = model
+    path.write_text(json.dumps(raw))
+    config = load_config(path)
+    validate_against_host(config, available_gpus=8, check_gpu_type=False)
+    assert (config.attention_implementation, config.reference_attention_implementation) == ("eager", "eager")
+    raw["training"]["ds_worker_config"]["attn_implementation"] = "flash_attention_3"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match=f"{model} requires attn_implementation='eager'"):
+        validate_against_host(load_config(path), available_gpus=8, check_gpu_type=False)
+
+
 # Flash 256k source recipes.
 
 

@@ -302,10 +302,16 @@ GPU_ATTENTION_IMPLEMENTATIONS = {
     "b200": "flash_attention_4",
     "b300": "flash_attention_4",
 }
+# Models whose attention is not the accelerator's FlashAttention, by the backend the target's loader requires. DeepSeek
+# V4.1's sparse attention is a fused kernel inside the model: Arctic Platform's loader requires "eager"
+# (model/loaders/deepseek_v41.py DEEPSEEK_V41_ATTN_BACKEND) and refuses any other name.
 MODEL_ATTENTION_IMPLEMENTATIONS = {
     "Qwen/Qwen3.8-Flash-Next": "qsa_flex",
     "zai-org/GLM-5.3-Flash": "sparse_mla",
     "zai-org/GLM-5.3-Flash-BF16": "sparse_mla",
+    "deepseek-ai/DeepSeek-V4.1-Flash": "eager",
+    "deepseek-ai/DeepSeek-V4.1-Flash-1017": "eager",
+    "PrimeIntellect/DeepSeek-V4.1-Flash-bf16": "eager",
 }
 MODEL_REFERENCE_ATTENTION_IMPLEMENTATIONS = {
     "zai-org/GLM-5.3-Flash": "sdpa",
