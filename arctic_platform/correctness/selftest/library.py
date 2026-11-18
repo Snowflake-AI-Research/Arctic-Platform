@@ -1141,6 +1141,48 @@ def test_participation_observes_autograd_and_integer_outputs_without_inventing_z
             validate_participation(capture.result())
 
 
+def test_participation_gemma_image_modules_are_inactive_only_when_a_text_step_never_calls_them():
+    """Gemma 3 and 4 hold their image modules beside the language model; a text-only step never calls them."""
+    from copy import deepcopy
+
+    import torch
+
+    from arctic_platform.correctness.harness.optimizer import ParticipationCapture
+    from arctic_platform.correctness.harness.optimizer import validate_participation
+
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    for name in ("vision_tower", "multi_modal_projector", "embed_vision", "language_model", "audio_encoder"):
+        setattr(model.model, name, torch.nn.Linear(3, 3, bias=False))
+    model.lm_head = torch.nn.Linear(3, 3, bias=False)
+    decoder = model.model.language_model
+    value = torch.ones(2, 3)
+    image = ("vision_tower", "multi_modal_projector", "embed_vision")
+    with ParticipationCapture(model, decoder=decoder, head=model.lm_head) as capture:
+        model.lm_head(decoder(value)).sum().backward()
+        record = capture.result()
+    entries = record["parameters"]
+    assert {name: entries[f"model.{name}.weight"]["state"] for name in image} == dict.fromkeys(image, "inactive")
+    assert entries["model.language_model.weight"]["state"] == entries["lm_head.weight"]["state"] == "active"
+    # A module outside the image set is not excused by never running.
+    assert entries["model.audio_encoder.weight"]["state"] == "missing"
+    with pytest.raises(ValueError, match="unexpected missing gradient for model.audio_encoder.weight"):
+        validate_participation(record)
+    del entries["model.audio_encoder.weight"]
+    validate_participation(record)
+    forged = deepcopy(record)
+    forged["parameters"]["model.vision_tower.weight"]["evidence"]["module"] = "model.audio_encoder"
+    with pytest.raises(ValueError, match="invalid independent evidence"):
+        validate_participation(forged)
+    model.zero_grad(set_to_none=True)
+    # An image step calls the tower, so nothing excuses a tower parameter that then misses its gradient.
+    with ParticipationCapture(model, decoder=decoder, head=model.lm_head) as capture:
+        model.model.vision_tower(value)
+        model.lm_head(decoder(value)).sum().backward()
+        record = capture.result()
+    assert record["parameters"]["model.vision_tower.weight"]["state"] == "missing"
+
+
 def test_config_tolerance_calibrated_gate_rounds_up_and_has_a_one_millithreshold_floor():
     floor = Tolerance(absolute=0.001, computed_gate=0.0004)
     rounded = Tolerance(absolute=0.002, computed_gate=0.0012)
@@ -23207,6 +23249,7 @@ _SELFTEST_GROUPS = {
         "test_flash_recipe_glm_rejects_generic_h200_attention",
         "test_participation_requires_complete_matching_inventory_and_independent_inactivity",
         "test_participation_observes_autograd_and_integer_outputs_without_inventing_zero_gradients",
+        "test_participation_gemma_image_modules_are_inactive_only_when_a_text_step_never_calls_them",
         "test_config_tolerance_calibrated_gate_rounds_up_and_has_a_one_millithreshold_floor",
         "test_names_qwen35_moe_norms_align_across_fused_and_prime_layouts",
         "test_names_equal_checkpoint_aliases_collapse_without_losing_coverage",

@@ -1129,6 +1129,11 @@ def expert_parallel_width(parameter) -> int:
 
 
 PARTICIPATION_SCHEMA = "trainable-parameter-participation-v1"
+# The image modules of the composite checkpoints the catalog trains on text, named as children of the base model:
+# Qwen's ``visual``, Gemma 3's ``vision_tower`` and ``multi_modal_projector``, Gemma 4's ``vision_tower`` and
+# ``embed_vision``. The Hugging Face base model calls them only for pixel inputs, so a text-only step leaves them
+# without a gradient. They count as inactive only with a forward hook's proof that no call reached them.
+TEXT_DECODER_BYPASS_MODULES = frozenset({"visual", "vision_tower", "multi_modal_projector", "embed_vision"})
 
 
 def validate_participation(record: dict) -> dict:
@@ -1158,7 +1163,7 @@ def validate_participation(record: dict) -> dict:
                     type(evidence.get("calls")) is int
                     and evidence["calls"] == 0
                     and evidence.get("outside_decoder_and_head") is True
-                    and normalize(evidence["module"]) == "visual"
+                    and normalize(evidence["module"]) in TEXT_DECODER_BYPASS_MODULES
                 )
             elif kind == "integer-selector":
                 valid = (
@@ -1391,7 +1396,7 @@ class ParticipationCapture:
             kind = None
             if type(module).__name__ == "Glm5NextTextIndexer":
                 kind = "integer-selector"
-            elif reachable is not None and normalize(name) == "visual":
+            elif reachable is not None and normalize(name) in TEXT_DECODER_BYPASS_MODULES:
                 kind = "text-decoder-bypass"
             if kind is None:
                 continue
