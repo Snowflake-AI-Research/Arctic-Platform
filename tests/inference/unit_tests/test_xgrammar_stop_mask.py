@@ -19,7 +19,7 @@ def _install_fix(monkeypatch, *, stop_accepted):
     monkeypatch.setattr(
         stop_mask,
         "require_supported_vllm_version",
-        lambda _feature: "0.32.0",
+        lambda _feature: "0.33.0",
     )
     stop_mask.ensure_xgrammar_stop_mask_fix()
 

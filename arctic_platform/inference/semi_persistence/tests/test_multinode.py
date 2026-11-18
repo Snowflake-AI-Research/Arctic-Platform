@@ -240,16 +240,19 @@ def test_the_drop_precedes_destroy_nccl():
 
 
 def test_the_drop_is_gated_on_nnodes_not_on_tp():
-    """A single-node TP=8 dump keeps its graphs and rebinds them, which is
-    faster (2 s against 19 s at TP=4) and is what every current deployment
-    does. The gate is the node boundary, not the GPU count: two TP=8 replicas
-    across two nodes are still two single-node engines."""
+    """The unconditional drop is gated on the node boundary, not the GPU
+    count: two TP=8 replicas across two nodes are still two single-node
+    engines. A single-node TP=8 dump keeps its graphs and rebinds them, which
+    is faster (2 s against 19 s at TP=4), unless its NCCL census finds a
+    graph holding NCCL kernels (``tests/test_nccl_graph_gate.py``)."""
     src = open(_INSTANCE).read()
     seg = ast.get_source_segment(
         src, _function(_tree(_INSTANCE), "cuda_checkpoint", cls="Instance"))
     assert "if self.nnodes > 1:" in seg, (
         "the drop must be gated on nnodes, not on n_gpus or "
         "tensor_parallel_size")
+    assert '"drop_graphs_if_nccl"' in seg, (
+        "a single-node dump must still ask whether its graphs hold NCCL")
 
 
 def test_rebind_refuses_to_run_across_nodes():

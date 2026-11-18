@@ -42,8 +42,9 @@ weight_sync:
 # Training-side settings: ZoRRO, logits, determinism, and the DeepSpeed training/log-prob engine config.
 train:
 
-  # Zorro-group load balancer: when True the server reorganizes the global batch across workers (reorg_global_batch) for balanced routing; read unconditionally from per-call meta (`load_balancer`), independent of zorro_train.enable.
-  load_balancer: True
+  # Rank assignment: sample-length LPT normally, prompt-group length after
+  # ZoRRo packing. False preserves arrival order.
+  balance_batch: True
 
   # ZoRRO training path. Server reads these flat (`zorro_train_<key>`) from ds_worker_config and per-call meta.
   zorro_train:

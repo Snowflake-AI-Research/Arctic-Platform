@@ -12,6 +12,7 @@ from typing import cast
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from ..config import DISPATCH_EP_BACKENDS
 from ..config import EPCommBackend
@@ -44,6 +45,57 @@ def _unwrap_experts(experts: nn.Module) -> nn.Module:
     while hasattr(experts, "base_layer"):
         experts = experts.base_layer
     return experts
+
+
+class _ChunkGradTotal:
+    total: torch.Tensor | None = None
+
+
+class _ReleaseChunkGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, param, acc):
+        ctx.acc, ctx.dtype = acc, param.dtype
+        ctx.set_materialize_grads(False)
+        return param.view_as(param)
+
+    @staticmethod
+    def backward(ctx, _grad):
+        total, ctx.acc.total = ctx.acc.total, None
+        return (None if total is None else total.to(ctx.dtype)), None
+
+
+class _AddChunkGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, root, acc):
+        ctx.acc = acc
+        return root.view_as(root)
+
+    @staticmethod
+    def backward(ctx, grad):
+        acc = ctx.acc
+        acc.total = grad.float() if acc.total is None else acc.total.add_(grad)
+        return None, None
+
+
+def _experts_per_chunk(experts: nn.Module, num_chunks: int):
+    """``experts`` for each of ``num_chunks`` chunks of one call, summing their weight gradients in fp32.
+
+    Autograd adds the gradients of a tensor used several times in that tensor's dtype, so experts run once per chunk
+    would sum their weight gradients in bf16 before ZeRO's fp32 accumulation sees them. Each chunk reads views whose
+    backward adds into an fp32 total; a root view per weight, which backward reaches after every chunk that
+    contributed, hands the weight the total once.
+    """
+    trainable = {name: p for name, p in experts.named_parameters() if p.requires_grad}
+    if num_chunks == 1 or not trainable or not torch.is_grad_enabled():
+        return lambda: experts
+    accs = {name: _ChunkGradTotal() for name in trainable}
+    roots = {name: _ReleaseChunkGrad.apply(p, accs[name]) for name, p in trainable.items()}
+
+    def chunk_experts():
+        views = {name: _AddChunkGrad.apply(root, accs[name]) for name, root in roots.items()}
+        return lambda *args, **kwargs: torch.func.functional_call(experts, views, args, kwargs)
+
+    return chunk_experts
 
 
 def _packed_expert_linear(
@@ -764,6 +816,8 @@ class MoE(nn.Module):
         self.experts.set_ep_comm_backend(self.ep_comm_backend)
         # Set by full activation checkpointing (see CombineReplay); the EP backends replay the combine on recompute.
         self.combine_replay: CombineReplay | None = None
+        self.sync_combine_per_chunk = False
+        self.checkpoint_dispatch_chunks = False
         self.use_sonicmoe = moe_args.use_sonicmoe
         self.router = TokenChoiceTopKRouter(
             dim=dim,
@@ -829,8 +883,9 @@ class MoE(nn.Module):
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
         scores: torch.Tensor | None = None,
+        experts: nn.Module | None = None,
     ) -> torch.Tensor:
-        return self.experts(x, num_tokens_per_expert, scores)
+        return (self.experts if experts is None else experts)(x, num_tokens_per_expert, scores)
 
     def _run_routed_experts(
         self,
@@ -886,6 +941,12 @@ class MoE(nn.Module):
             and sonic_routed_experts_applicable(experts)
         )
         combine_kwargs = {}
+        checkpoint_chunks = (
+            self.checkpoint_dispatch_chunks
+            and self.deepep_token_chunk_size is not None
+            and torch.is_grad_enabled()
+            and self.combine_replay is None
+        )
         if self.combine_replay is not None and self.ep_comm_backend in ("uccl", "deepep"):
             self.combine_replay.start()
             combine_kwargs["replay"] = self.combine_replay
@@ -903,13 +964,18 @@ class MoE(nn.Module):
         def run_pending_chunk(pending_state):
             if use_sonic:
                 hidden_states, indices, scores = ep_comm.finalize_dispatch_rows(pending_state)
-                routed = self.experts(hidden_states, None, scores, expert_indices=indices)
+                routed = chunk_experts()(hidden_states, None, scores, expert_indices=indices)
                 return ep_comm.combine_rows(routed, pending_state, **combine_kwargs)
             hidden_states, num_tokens_per_expert, dispatch_state = finalize_dispatch_tokens(pending_state)
             # Routing weights still owed after the experts are applied by them, which can fold them into the
             # down projection; combine then only sums.
             scores = dispatch_state.permuted_scores
-            routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert, scores)
+            call_experts = chunk_experts()
+            routed_output = (
+                call_experts(hidden_states, num_tokens_per_expert, scores)
+                if checkpoint_chunks
+                else self._run_local_routed_experts(hidden_states, num_tokens_per_expert, scores, call_experts)
+            )
             # Keep combine outside the checkpointed routed-expert region so
             # selective AC only recomputes local expert matmuls.
             return combine_tokens(routed_output, replace(dispatch_state, permuted_scores=None), **combine_kwargs)
@@ -931,16 +997,45 @@ class MoE(nn.Module):
 
         chunk_bounds = [(start, min(start + chunk_size, x.shape[0])) for start in range(0, x.shape[0], chunk_size)]
         chunk_bounds += [(0, 1)] * (num_chunks - len(chunk_bounds))
+        chunk_experts = _experts_per_chunk(self.experts, num_chunks)
 
-        pending_state = dispatch_chunk(*chunk_bounds[0])
         routed_outputs: list[torch.Tensor] = []
+        if checkpoint_chunks:
 
-        for chunk_start, chunk_end in chunk_bounds[1:]:
-            next_pending_state = dispatch_chunk(chunk_start, chunk_end)
+            def run_chunk(hidden, indices, scores):
+                pending = dispatch_tokens_async(
+                    hidden,
+                    indices,
+                    scores,
+                    num_experts=experts.num_experts,
+                    group=group,
+                    score_before_experts=self.score_before_experts,
+                )
+                output = run_pending_chunk(pending)
+                sync_combine()
+                return output
+
+            for start, end in chunk_bounds:
+                # Complete recompute on every rank so all collective handles are consumed.
+                routed_outputs.append(
+                    checkpoint(
+                        run_chunk,
+                        x[start:end],
+                        selected_experts_indices[start:end],
+                        top_scores[start:end],
+                        use_reentrant=False,
+                        early_stop=False,
+                    )
+                )
+        else:
+            pending_state = dispatch_chunk(*chunk_bounds[0])
+            for chunk_start, chunk_end in chunk_bounds[1:]:
+                next_pending_state = dispatch_chunk(chunk_start, chunk_end)
+                routed_outputs.append(run_pending_chunk(pending_state))
+                if self.sync_combine_per_chunk:
+                    sync_combine()
+                pending_state = next_pending_state
             routed_outputs.append(run_pending_chunk(pending_state))
-            pending_state = next_pending_state
-
-        routed_outputs.append(run_pending_chunk(pending_state))
 
         shared_output = self.shared_expert(x) if self.shared_expert is not None else None
         sync_combine()
@@ -1047,6 +1142,8 @@ def install_combine_replay(block: nn.Module) -> None:
     """
     for module in block.modules():
         if isinstance(module, MoE):
+            if module.ep_comm_backend == "nccl":
+                raise ValueError("NCCL expert dispatch requires combine_replay=False")
             module.combine_replay = CombineReplay()
 
 
@@ -1305,8 +1402,9 @@ class LatentMoE(nn.Module):
         self,
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
+        experts: nn.Module | None = None,
     ) -> torch.Tensor:
-        return self.experts(x, num_tokens_per_expert)
+        return (self.experts if experts is None else experts)(x, num_tokens_per_expert)
 
     def _run_routed_experts(
         self,
@@ -1360,9 +1458,11 @@ class LatentMoE(nn.Module):
                 score_before_experts=False,
             )
 
+        chunk_experts = _experts_per_chunk(self.experts, -(-latent_x.shape[0] // chunk_size))
+
         def run_pending_chunk(pending_state):
             hidden_states, num_tokens_per_expert, dispatch_state = finalize_dispatch_tokens(pending_state)
-            routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert)
+            routed_output = self._run_local_routed_experts(hidden_states, num_tokens_per_expert, chunk_experts())
             return combine_tokens(routed_output, dispatch_state)
 
         pending_state = dispatch_chunk(0, chunk_size)

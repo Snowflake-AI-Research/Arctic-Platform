@@ -199,6 +199,8 @@ class NCCLEngine:
                 del weight, w, w_bytes  # a gathered export allocates its next tensor while we hold this one
                 continue
 
+            element_size = w.element_size()
+            offset = (offset + element_size - 1) // element_size * element_size
             entry = {
                 "name": name,
                 "shape": list(weight.shape),
@@ -331,6 +333,8 @@ class NCCLEngine:
                 tensor_offset = int(tm.get("tensor_offset", 0))
                 tensor_nbytes = int(tm.get("tensor_nbytes", chunk_nbytes))
                 if tensor_offset == 0 and tensor_nbytes == chunk_nbytes:
+                    if chunk.storage_offset() % dtype.itemsize:
+                        chunk = chunk.clone()
                     yield tm["name"], chunk.view(dtype).reshape(shape)
                     continue
 

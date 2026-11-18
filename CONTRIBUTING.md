@@ -54,6 +54,14 @@ there are two types of tests: CPU-based and GPU-based. GPU-based tests are
 guarded by `@require_torch_gpu` and automatically skip when no GPU is
 available, so the full suite is safe to run anywhere.
 
+Install both the training and testing dependencies before running the full suite, even on a CPU-only machine. The `dev` extra includes testing and formatting tools but does not include the training stack:
+
+```bash
+pip install -e ".[sft,dev]"
+```
+
+The `testing` extra supplies the Tinker SDK, Harbor and its agent dependencies, and pytest plugins. Installing individual test packages with `--no-deps` leaves the integration tests incomplete. Training tests also require Torch 2.9 or later, PEFT 0.21.2, Liger 0.8.5 or later, and the supported Transformers version declared in `pyproject.toml`; an older existing training environment needs to be updated. This setup does not install vLLM or enable GPU tests on a CPU-only runner.
+
 To run all tests (CPU and GPU):
 ```bash
 make test
