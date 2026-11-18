@@ -1598,6 +1598,26 @@ def participating_parameters(model) -> dict:
     }
 
 
+def _integer_only(value) -> bool:
+    """An integer selector's output: integer tensors (or a nonempty tuple/list of them) that carry no autograd."""
+    if isinstance(value, torch.Tensor):
+        return not value.is_floating_point() and not value.is_complex() and not value.requires_grad
+    if isinstance(value, (tuple, list)):
+        return bool(value) and all(_integer_only(item) for item in value)
+    return False
+
+
+class _GlobalPatch:
+    """A module-global function replaced for one capture; ``remove`` puts the original back, as for the hooks."""
+
+    def __init__(self, module, name, replacement, original):
+        self.module, self.name, self.replacement, self.original = module, name, replacement, original
+
+    def remove(self):
+        if getattr(self.module, self.name, None) is self.replacement:
+            setattr(self.module, self.name, self.original)
+
+
 class ParticipationCapture:
     """Observe actual autograd use; zero storage and Adam moments are not evidence.
 
@@ -1619,6 +1639,7 @@ class ParticipationCapture:
         self.candidates = {}
         self.source_digests = {}
         self.forwards = []
+        self.global_patches = []
         try:
             self._arm(model, decoder=decoder, head=head)
         except BaseException:
@@ -1649,6 +1670,7 @@ class ParticipationCapture:
                         value.register_hook(self._member_backward_hook(member_name))
 
             self.handles.append(model.get_submodule(layout.module).register_forward_pre_hook(observe_members))
+        selectors = {}
         for name, module in model.named_modules():
             kind = None
             if type(module).__name__ == "Glm5NextTextIndexer":
@@ -1680,19 +1702,46 @@ class ParticipationCapture:
 
             def observe(_module, _inputs, output, *, evidence=evidence):
                 evidence["calls"] += 1
-
-                def integer_only(value):
-                    if isinstance(value, torch.Tensor):
-                        return not value.is_floating_point() and not value.is_complex() and not value.requires_grad
-                    if isinstance(value, (tuple, list)):
-                        return bool(value) and all(integer_only(item) for item in value)
-                    return False
-
-                evidence["integer_outputs_only"] &= integer_only(output)
+                evidence["integer_outputs_only"] &= _integer_only(output)
 
             self.handles.append(module.register_forward_hook(observe))
+            if kind == "integer-selector":
+                selectors[id(module)] = evidence
             for parameter_name in names:
                 self.candidates[parameter_name] = evidence
+        if selectors:
+            self._observe_context_parallel_selection(selectors)
+
+    def _observe_context_parallel_selection(self, selectors):
+        """Count the context-parallel DSA attention's index selection toward the indexer it reads.
+
+        Under sequence parallelism Arctic's GLM-5.2/5.3 attention (glm53.context_parallel._sparse_attention_forward)
+        selects its top-k through ``_select_sparse_indices(self.indexer, ...)``, which reads the indexer's parameters
+        without calling the module, so the module's hook sees no call. Such a call counts toward the indexer module it
+        receives, under the hook's rule: every output an integer tensor without autograd.
+        """
+        try:
+            from arctic_platform.model.implementations.glm53 import context_parallel
+        except ImportError:
+            return
+        original = context_parallel._select_sparse_indices
+        source = inspect.getsourcefile(inspect.unwrap(original))
+        if source is not None and source not in self.source_digests:
+            self.source_digests[source] = hashlib.sha256(Path(source).read_bytes()).hexdigest()
+
+        def select(indexer, *args, **kwargs):
+            output = original(indexer, *args, **kwargs)
+            evidence = selectors.get(id(indexer))
+            if evidence is not None:
+                evidence["calls"] += 1
+                evidence["integer_outputs_only"] &= _integer_only(output)
+            return output
+
+        # The attention looks the function up in its module's globals at call time.
+        context_parallel._select_sparse_indices = select
+        patch = _GlobalPatch(context_parallel, "_select_sparse_indices", select, original)
+        self.handles.append(patch)
+        self.global_patches.append(patch)
 
     def _backward_hook(self, name):
         def record(gradient):
@@ -1725,6 +1774,8 @@ class ParticipationCapture:
             for module, forward in self.forwards
         ):
             raise ValueError("participation forward implementation changed during capture")
+        if any(getattr(patch.module, patch.name, None) is not patch.replacement for patch in self.global_patches):
+            raise ValueError("participation selection implementation changed during capture")
         entries = {}
         for name, shape in self.inventory.items():
             evidence = self.candidates.get(name)

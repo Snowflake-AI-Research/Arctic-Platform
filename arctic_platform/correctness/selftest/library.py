@@ -1226,6 +1226,48 @@ def test_participation_observes_autograd_and_integer_outputs_without_inventing_z
             validate_participation(capture.result())
 
 
+@pytest.mark.parametrize("selection", ["integer", "float", "requires-grad"])
+def test_participation_counts_the_context_parallel_index_selection(monkeypatch, selection):
+    # Arctic's context-parallel DSA attention selects through _select_sparse_indices(self.indexer, ...) and never
+    # calls the indexer module: the call counts toward that indexer only when every output is integer, without grad.
+    from arctic_platform.correctness.harness.optimizer import PARTICIPATION_SCHEMA
+    from arctic_platform.correctness.harness.optimizer import ParticipationCapture
+    from arctic_platform.correctness.harness.optimizer import validate_participation
+    from arctic_platform.model.implementations.glm53 import context_parallel
+
+    class Glm5NextTextIndexer(torch.nn.Linear):
+        def forward(self, value):
+            raise AssertionError("the context-parallel path reads the indexer without calling it")
+
+    def select(indexer, value):
+        scores = torch.nn.functional.linear(value.detach(), indexer.weight).detach()
+        if selection == "integer":
+            return scores.argmax(dim=-1).to(torch.int32)
+        return scores.requires_grad_() if selection == "requires-grad" else scores
+
+    monkeypatch.setattr(context_parallel, "_select_sparse_indices", select)
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Linear(3, 3, bias=False)
+    model.head = torch.nn.Linear(3, 3, bias=False)
+    model.indexer = Glm5NextTextIndexer(3, 3, bias=False)
+    model.unused = Glm5NextTextIndexer(3, 3, bias=False)  # an indexer neither path reaches
+    with ParticipationCapture(model, decoder=model.decoder, head=model.head) as capture:
+        value = torch.ones(2, 3, requires_grad=True)
+        context_parallel._select_sparse_indices(model.indexer, value)
+        model.head(model.decoder(value)).sum().backward()
+        entries = capture.result()["parameters"]
+    assert context_parallel._select_sparse_indices is select
+    assert entries["decoder.weight"]["state"] == entries["head.weight"]["state"] == "active"
+    assert entries["unused.weight"]["state"] == "missing"
+    if selection == "integer":
+        assert entries["indexer.weight"]["state"] == "inactive"
+        assert entries["indexer.weight"]["evidence"]["calls"] == 1
+        inactive = {"indexer.weight": entries["indexer.weight"]}
+        validate_participation({"schema": PARTICIPATION_SCHEMA, "parameters": inactive})
+    else:
+        assert entries["indexer.weight"] == {"shape": [3, 3], "state": "missing", "evidence": None}
+
+
 def test_nemotron_h_target_names_pair_with_the_transformers_model():
     """Arctic Platform's Nemotron-H names its mixers mamba / self_attn / mlp; Transformers calls each one mixer."""
     from arctic_platform.correctness.harness.optimizer import align
