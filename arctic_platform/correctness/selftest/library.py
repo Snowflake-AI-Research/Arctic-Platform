@@ -1183,6 +1183,80 @@ def test_participation_gemma_image_modules_are_inactive_only_when_a_text_step_ne
     assert record["parameters"]["model.vision_tower.weight"]["state"] == "missing"
 
 
+@contextlib.contextmanager
+def _single_rank_gloo(tmp_path):
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        raise RuntimeError("a process group is already initialized in this selftest process")
+    dist.init_process_group("gloo", store=dist.FileStore(str(tmp_path / "store"), 1), rank=0, world_size=1)
+    try:
+        yield dist.group.WORLD
+    finally:
+        dist.destroy_process_group()
+
+
+def _dense_shard_model(seed: int):
+    import torch
+
+    torch.manual_seed(seed)
+    model = torch.nn.Module()
+    model.embed = torch.nn.Embedding(16, 4)
+    model.layer = torch.nn.Module()
+    model.layer.q = torch.nn.Linear(4, 4)
+    model.layer.unused = torch.nn.Linear(4, 4, bias=False)  # trainable, never called
+    model.layer.forward = lambda value: model.layer.q(value)
+    model.head = torch.nn.Linear(4, 16, bias=False)
+    return model
+
+
+def _dense_shard_step(model):
+    import torch
+
+    ids = torch.tensor([[1, 2, 3, 5]])
+    torch.nn.functional.cross_entropy(model.head(model.layer(model.embed(ids)))[0], ids[0]).backward()
+
+
+def test_participation_and_gradient_norms_name_the_parameters_node_shards_hold(tmp_path):
+    """Arctic's patches.dense_shard holds a layer's weights as flat node shards: the inventory and the gradient
+    norms name the original parameters, never the shards, and a member nobody used still misses its gradient."""
+    import torch
+
+    from arctic_platform.correctness.harness.optimizer import ParticipationCapture
+    from arctic_platform.correctness.harness.optimizer import dense_shard_gradient_norms
+    from arctic_platform.correctness.harness.optimizer import dense_shard_record
+    from arctic_platform.model.implementations.moe import dense_shard
+
+    whole = _dense_shard_model(0)
+    _dense_shard_step(whole)
+    expected = {
+        name: float(torch.linalg.vector_norm(p.grad)) for name, p in whole.named_parameters() if p.grad is not None
+    }
+    model = _dense_shard_model(0)
+    with _single_rank_gloo(tmp_path) as group:
+        slots, names = dense_shard._parameter_slots(model)
+        dense_shard.shard_module(model.layer, group, "ep_size_1", slots, names)
+        layouts = dense_shard.dense_shard_layouts(model)
+        assert sorted(layouts) == ["layer.dense_shard.shard_0", "layer.dense_shard.shard_1"]
+        with ParticipationCapture(model, decoder=model.layer, head=model.head) as capture:
+            _dense_shard_step(model)
+            entries = capture.result()["parameters"]
+        norms = dense_shard_gradient_norms(model, layouts)
+        record = dense_shard_record(layouts)
+    members = ["layer.q.bias", "layer.q.weight", "layer.unused.weight"]
+    assert sorted(entries) == sorted(["embed.weight", "head.weight", *members])
+    assert {name: entries[name]["shape"] for name in members} == {
+        "layer.q.bias": [4],
+        "layer.q.weight": [4, 4],
+        "layer.unused.weight": [4, 4],
+    }
+    assert [entries[name]["state"] for name in members] == ["active", "active", "missing"]
+    assert sorted(norms) == members and norms["layer.unused.weight"] == 0
+    for name in ("layer.q.bias", "layer.q.weight"):
+        assert norms[name] == pytest.approx(expected[name], rel=1e-6)
+    assert sorted(member["name"] for shard in record.values() for member in shard["members"]) == members
+
+
 def test_config_tolerance_calibrated_gate_rounds_up_and_has_a_one_millithreshold_floor():
     floor = Tolerance(absolute=0.001, computed_gate=0.0004)
     rounded = Tolerance(absolute=0.002, computed_gate=0.0012)
@@ -12336,6 +12410,167 @@ def _automatic_participation_receipts(tmp_path, shapes, world_size):
         }
         for rank in range(world_size)
     ]
+
+
+def _dense_shard_checkpoint_pair(tmp_path, *, world_size, group_size):
+    """ZeRO-2 checkpoints of one replicated parameter and one node shard (Arctic's patches.dense_shard): shard ``p``
+    of each node group is partitioned over the ranks at position ``p`` of every group, as an ep_size_<g> group."""
+    members = [("layer.q.weight", [2, 3], 0), ("layer.mix", [3], 8)]
+    total, nodes = 8 * group_size, world_size // group_size
+    size = total // group_size
+    record = {
+        "layer.dense_shard.shard_0": {
+            "group_size": group_size,
+            "total": total,
+            "members": [
+                {"name": name, "shape": shape, "offset": offset, "numel": math.prod(shape)}
+                for name, shape, offset in members
+            ],
+        }
+    }
+    shapes = [
+        OrderedDict([("norm.weight", torch.Size([5]))]),
+        OrderedDict([("layer.dense_shard.shard_0", torch.Size([size]))]),
+    ]
+    flat = {"norm.weight": torch.arange(5.0) + 1, "layer.dense_shard.shard_0": torch.zeros(total)}
+    moments = {name: torch.arange(value.numel(), dtype=torch.float32) + 1 for name, value in flat.items()}
+    expected = {"norm.weight": {"exp_avg": moments["norm.weight"], "exp_avg_sq": moments["norm.weight"] + 1}}
+    for name, shape, offset in members:
+        numel = math.prod(shape)
+        flat["layer.dense_shard.shard_0"][offset : offset + numel] = torch.arange(numel) + 10.0 + offset
+        moment = moments["layer.dense_shard.shard_0"][offset : offset + numel].reshape(shape)
+        expected[name] = {"exp_avg": moment, "exp_avg_sq": moment + 1}
+    config = {
+        "zero_optimization": {"stage": 2},
+        "bf16": {"enabled": True},
+        "optimizer": {"type": "AdamW", "params": {**_cortex_optimizer_decode_OPTIMIZER, "lr": 2e-05}},
+    }
+    roots = (tmp_path / "before", tmp_path / "after")
+    for root, step in zip(roots, (0, 1)):
+        tag = root / f"global_step{step}"
+        tag.mkdir(parents=True)
+        module = {name: torch.zeros(shape, dtype=torch.bfloat16) for name, shape, _ in members}
+        module["norm.weight"] = flat["norm.weight"].to(torch.bfloat16)
+        torch.save(
+            {
+                "module": module,
+                "param_shapes": shapes,
+                "global_steps": step,
+                "dp_world_size": world_size,
+                "mp_world_size": 1,
+                "ds_config": config,
+                "shared_params": {},
+            },
+            tag / "mp_rank_00_model_states.pt",
+        )
+        (tag / "dense_shard_layout.json").write_text(
+            json.dumps({"group_size": group_size, "shards": {"layer.dense_shard.shard_0": size}})
+        )
+        for rank in range(world_size):
+            masters, mappings, paddings, counts, states, groups = [], [], [], [], {}, []
+            for index, group in enumerate(shapes):
+                ((name, _),) = group.items()
+                if index == 0:
+                    vector, moment, partition, parts = flat[name], moments[name], rank, world_size
+                else:  # this rank's node shard, partitioned over its expert-DP group
+                    position = rank % group_size
+                    vector = flat[name][position * size : (position + 1) * size]
+                    moment = moments[name][position * size : (position + 1) * size]
+                    partition, parts = rank // group_size, nodes
+                length = math.ceil(vector.numel() / (2 * parts)) * 2
+                start = partition * length
+                valid = max(0, min(length, vector.numel() - start))
+                masters.append(vector[start : start + valid].clone() + (0.0001 if step else 0))
+                paddings.append(length - valid)
+                counts.append(parts)
+                mappings.append(
+                    OrderedDict([(name, fragment_address(numel=valid, start=0))]) if valid else OrderedDict()
+                )
+                param_id = 17 + index * 13
+                groups.append(
+                    {
+                        "params": [param_id],
+                        "betas": (0.9, 0.999),
+                        "lr": _cortex_optimizer_decode_LR if step else 0.001,
+                        "eps": 1e-08,
+                        "weight_decay": 0.0,
+                        "bias_correction": True,
+                        "step": 0,
+                        **({"moe": True, "name": f"ep_size_{group_size}"} if index else {}),
+                    }
+                )
+                if step:
+                    state = {"step": torch.tensor(1.0)}
+                    for key, shift in (("exp_avg", 0), ("exp_avg_sq", 1)):
+                        values = torch.zeros(length)
+                        values[:valid] = moment[start : start + valid] + shift
+                        state[key] = values
+                    states[param_id] = state
+            torch.save(
+                {
+                    "ds_config": config,
+                    "ds_version": "synthetic",
+                    "optimizer_state_dict": {
+                        "zero_stage": ZeroStageEnum.gradients,
+                        "base_optimizer_state": {"state": states, "param_groups": groups},
+                        "single_partition_of_fp32_groups": masters,
+                        "param_slice_mappings": mappings,
+                        "partition_count": counts,
+                        "group_paddings": paddings,
+                        "param_alignment_paddings": [[0] for _ in shapes],
+                        "loss_scaler": LossScaler(1.0),
+                        "dynamic_loss_scale": False,
+                        "overflow": False,
+                        "clip_grad": 1.0,
+                        "ds_version": "synthetic",
+                    },
+                },
+                tag / f"bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt",
+            )
+    inventory = {"norm.weight": [5], **{name: shape for name, shape, _ in members}}
+    receipts = _automatic_participation_receipts(tmp_path, inventory, world_size)
+    for receipt in receipts:
+        receipt["dense_shards"] = deepcopy(record)
+    return SimpleNamespace(before=roots[0], after=roots[1], expected=expected, receipts=receipts)
+
+
+@pytest.mark.parametrize("world_size, group_size", [(2, 2), (4, 2), (8, 8)])
+def test_cortex_optimizer_decode_names_the_parameters_node_shards_hold(tmp_path, world_size, group_size):
+    """Arctic's patches.dense_shard (Qwen3.8-27B, Gemma 4 full FT): ZeRO holds each node shard's FP32 master and
+    moments over its expert-DP group, partition_count world / g; the decode rebuilds the flat layout from the routes
+    and names the original parameters."""
+    pair = _dense_shard_checkpoint_pair(tmp_path, world_size=world_size, group_size=group_size)
+    manifest = decoder.decode_optimizer_capture(
+        pair.before,
+        pair.after,
+        tmp_path / "out",
+        expected_optimizer_config=_cortex_optimizer_decode_OPTIMIZER,
+        expected_learning_rate=_cortex_optimizer_decode_LR,
+        participation_receipts=pair.receipts,
+        expected_participation_job_id="child",
+    )
+    metadata = json.loads(manifest.read_text())
+    assert [entry["name"] for entry in metadata["parameters"]] == ["norm.weight", "layer.q.weight", "layer.mix"]
+    assert sorted(metadata["participation"]["parameters"]) == ["layer.mix", "layer.q.weight", "norm.weight"]
+    for entry in metadata["parameters"]:
+        tensor = torch.load(manifest.parent / entry["file"], weights_only=True)
+        for key, value in pair.expected[entry["name"]].items():
+            assert torch.equal(tensor[key], value), (entry["name"], key)
+        assert tensor["parameter_update"].shape == pair.expected[entry["name"]]["exp_avg"].shape
+        assert torch.allclose(tensor["parameter_update"], torch.full_like(tensor["parameter_update"], 1e-4), atol=1e-6)
+    # Without the worker's layout the flat shards name nothing; a layout the checkpoint disagrees with is refused.
+    with pytest.raises(ValueError, match="requires the participation receipts' shard layout"):
+        decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "bare")
+    for receipt in pair.receipts:
+        receipt["dense_shards"]["layer.dense_shard.shard_0"]["total"] *= 2
+    with pytest.raises(ValueError, match="layout differs"):
+        decoder.decode_optimizer_capture(
+            pair.before,
+            pair.after,
+            tmp_path / "other",
+            participation_receipts=pair.receipts,
+            expected_participation_job_id="child",
+        )
 
 
 @pytest.mark.parametrize(
@@ -23819,6 +24054,7 @@ _SELFTEST_GROUPS = {
         "test_cortex_optimizer_capture_runner_public_cortex_capture_keeps_fixture_budget_gradient_and_cleanup",
         "test_cortex_optimizer_capture_runner_onprem_preserves_local_optimizer_capture",
         "test_cortex_optimizer_decode_decode_named_fp32_update_moments_and_padding",
+        "test_cortex_optimizer_decode_names_the_parameters_node_shards_hold",
         "test_cortex_optimizer_decode_decode_uses_actual_state_step_and_group_lr_not_legacy_or_config_defaults",
         "test_cortex_optimizer_decode_decode_rejects_invalid_optimizer_schema",
         "test_cortex_optimizer_decode_decode_requires_exactly_one_engine_step",

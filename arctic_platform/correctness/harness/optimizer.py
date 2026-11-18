@@ -971,7 +971,8 @@ class WorkerParticipation:
         self.capture = ParticipationCapture(model, decoder=decoder, head=head)
         try:
             self.expert_widths = {
-                name: expert_parallel_width(parameter) for name, parameter in self.capture.parameters.items()
+                name: expert_parallel_width(self.capture.parameters[name]) if name in self.capture.parameters else 1
+                for name in self.capture.inventory
             }
             self.before = self.evidence()
         except BaseException:
@@ -999,6 +1000,7 @@ class WorkerParticipation:
             "before": deepcopy(self.before),
             "after": self.evidence(),
             "expert_parallel_widths": dict(self.expert_widths),
+            "dense_shards": dense_shard_record(self.capture.dense_shards),
         }
 
     def close(self):
@@ -1050,6 +1052,8 @@ def merge_worker_receipts(receipts, *, job_id, world_size):
                 )
             ):
                 raise ValueError("participation worker inventory is incomplete")
+    if any(receipt.get("dense_shards", {}) != receipts[0].get("dense_shards", {}) for receipt in receipts):
+        raise ValueError("participation node-shard layouts differ across ranks")
     shapes = {name: entry["shape"] for name, entry in receipts[0]["before"]["participation"]["parameters"].items()}
     widths = receipts[0].get("expert_parallel_widths")
     if (
@@ -1128,6 +1132,28 @@ def participation_worker_class(
 
         def correctness_participation_receipt(self):
             return deepcopy(self._correctness_participation_receipt)
+
+        def _per_parameter_gradient_norm_metrics(self):
+            # The native metric names node shards (Arctic's patches.dense_shard), whose rank-0 slice it measures;
+            # the inventory names the original parameters they hold.
+            metrics = super()._per_parameter_gradient_norm_metrics()
+            if not self._gradient_norms_per_param:
+                return metrics
+            model = self._engine.module if hasattr(self._engine, "module") else self._engine
+            layouts = _dense_shard_layouts(model)
+            if not layouts:
+                return metrics
+            norms = dense_shard_gradient_norms(model, layouts)
+            if self.rank != 0:
+                return metrics
+            native = metrics["gradient_norms_per_param"]
+            return {
+                **metrics,
+                "gradient_norms_per_param": {
+                    **{name: value for name, value in native.items() if name not in layouts},
+                    **norms,
+                },
+            }
 
         def save(self, stage_info, path=None, checkpoint_type="resumable"):
             if checkpoint_type != "resumable":
@@ -1427,13 +1453,81 @@ def merge_rank_participation(before: list[dict], after: list[dict], shapes: dict
     return record, witnesses
 
 
+def _dense_shard_layouts(model) -> dict:
+    """Arctic's ``dense_shard_layouts(model)``, empty for a model without node shards. The training stack's module is
+    imported only for a model that has them: importing ``arctic_platform.model`` loads the debug hooks, which the suite
+    must run without, and an engine without ``patches.dense_shard`` has no such module."""
+    if all(getattr(module, "_ap_dense_shards", None) is None for module in model.modules()):
+        return {}
+    from arctic_platform.model.implementations.moe.dense_shard import dense_shard_layouts
+
+    return dense_shard_layouts(model)
+
+
+def dense_shard_record(layouts: dict) -> dict:
+    """Arctic's ``dense_shard_layouts`` as plain data: each node shard's group size, flat length and members."""
+    return {
+        name: {
+            "group_size": layout.group_size,
+            "total": layout.total,
+            "members": [
+                {"name": member.name, "shape": list(member.shape), "offset": member.offset, "numel": member.numel}
+                for member in layout.members
+            ],
+        }
+        for name, layout in sorted(layouts.items())
+    }
+
+
+def dense_shard_gradient_norms(model, layouts: dict) -> dict[str, float]:
+    """The reduced gradient's L2 norm of each original parameter a node shard holds, by its name.
+
+    A shard's gradient (``safe_get_full_grad``: collective over ZeRO's partition group) is this rank's slice of the
+    flat layout; each member's sum of squares over the slice is summed over the node group (collective). Every rank
+    walks the shards in the same order.
+    """
+    from deepspeed.utils import safe_get_full_grad
+
+    parameters = dict(model.named_parameters())
+    norms = {}
+    for name in sorted(layouts):
+        layout, shard = layouts[name], parameters[name]
+        gradient = safe_get_full_grad(shard)
+        size = layout.total // layout.group_size
+        low = layout.rank * size
+        squares = torch.zeros(len(layout.members) + 1, dtype=torch.float64, device=shard.device)
+        if gradient is not None:
+            flat = gradient.detach().reshape(-1)
+            squares[-1] = 1
+            for index, member in enumerate(layout.members):
+                first, last = max(low, member.offset), min(low + size, member.offset + member.numel)
+                if first < last:
+                    squares[index] = torch.linalg.vector_norm(flat[first - low : last - low].float()).double() ** 2
+        dist.all_reduce(squares, group=layout.group)
+        if squares[-1] == 0:
+            continue  # no rank holds a gradient for this shard, as for a parameter without one
+        if squares[-1] != layout.group_size:
+            raise RuntimeError(f"node shard {name} has a gradient on only some ranks of its group")
+        norms.update((member.name, math.sqrt(float(value))) for member, value in zip(layout.members, squares[:-1]))
+    return norms
+
+
 class ParticipationCapture:
-    """Observe actual autograd use; zero storage and Adam moments are not evidence."""
+    """Observe actual autograd use; zero storage and Adam moments are not evidence.
+
+    A model with node shards (Arctic's ``patches.dense_shard``) trains the original parameters through them: the
+    inventory lists those under their own names and shapes, never the shards, and a member is active when the gathered
+    value its module's call put in its owner receives a gradient.
+    """
 
     def __init__(self, model, *, decoder=None, head=None):
         self.model = model
         self.parameters = {name: parameter for name, parameter in model.named_parameters() if parameter.requires_grad}
         self.shapes = {name: list(parameter.shape) for name, parameter in self.parameters.items()}
+        self.dense_shards = _dense_shard_layouts(model)
+        self.inventory = {name: shape for name, shape in self.shapes.items() if name not in self.dense_shards}
+        for layout in self.dense_shards.values():
+            self.inventory.update((member.name, list(member.shape)) for member in layout.members)
         self.active = set()
         self.handles = []
         self.candidates = {}
@@ -1455,6 +1549,20 @@ class ParticipationCapture:
         )
         for name, parameter in self.parameters.items():
             self.handles.append(parameter.register_hook(self._backward_hook(name)))
+        for layout in self.dense_shards.values():
+            members = []
+            for member in layout.members:
+                owner, _, leaf = member.name.rpartition(".")
+                members.append((member.name, model.get_submodule(owner), leaf))
+
+            def observe_members(_module, _inputs, *, members=members):
+                # After the module's gather pre-hook (prepended): the gathered values are in their owners' slots.
+                for member_name, owner, leaf in members:
+                    value = owner._parameters.get(leaf)
+                    if isinstance(value, torch.Tensor) and value.requires_grad:
+                        value.register_hook(self._member_backward_hook(member_name))
+
+            self.handles.append(model.get_submodule(layout.module).register_forward_pre_hook(observe_members))
         for name, module in model.named_modules():
             kind = None
             if type(module).__name__ == "Glm5NextTextIndexer":
@@ -1507,6 +1615,15 @@ class ParticipationCapture:
 
         return record
 
+    def _member_backward_hook(self, name):
+        # A gathered value is one output of the gather; autograd calls its hook with None when it got no gradient.
+        def record(gradient):
+            if gradient is not None:
+                self.active.add(name)
+            return gradient
+
+        return record
+
     def result(self) -> dict:
         current = {name: parameter for name, parameter in self.model.named_parameters() if parameter.requires_grad}
         if set(current) != set(self.parameters) or any(
@@ -1523,7 +1640,7 @@ class ParticipationCapture:
         ):
             raise ValueError("participation forward implementation changed during capture")
         entries = {}
-        for name, parameter in self.parameters.items():
+        for name, shape in self.inventory.items():
             evidence = self.candidates.get(name)
             justified = evidence is not None and (
                 (evidence["kind"] == "text-decoder-bypass" and evidence["calls"] == 0)
@@ -1534,7 +1651,7 @@ class ParticipationCapture:
                 )
             )
             entries[name] = {
-                "shape": list(parameter.shape),
+                "shape": list(shape),
                 "state": "active" if name in self.active else "inactive" if justified else "missing",
                 "evidence": dict(evidence) if justified and name not in self.active else None,
             }
@@ -3086,14 +3203,52 @@ def _native_checkpoint_parameter_names(parameters: dict, description: str) -> di
     return names
 
 
+def _dense_shard_routes(dense_shards: dict | None, shapes: list[dict], world_size: int, root: Path) -> dict:
+    """The ZeRO groups of node shards (``dense_shard_record``), each with its ordered expert-DP routes: shard ``r`` of
+    a node group (consecutive blocks of ``g`` ranks) is partitioned over the ranks at position ``r`` of every block,
+    so route ``r`` rebuilds it and the routes in order rebuild the flat layout."""
+    sidefile = next(root.rglob("dense_shard_layout.json"), None)  # dss's record of the shards it saved
+    if not dense_shards:
+        if sidefile is not None:
+            raise ValueError("node-shard checkpoint requires the participation receipts' shard layout")
+        return {}
+    sizes = {record["group_size"] for record in dense_shards.values()}
+    group_size = sizes.pop() if len(sizes) == 1 else None
+    if group_size is None or group_size < 1 or world_size % group_size:
+        raise ValueError("node shards require one group size that divides the DP world size")
+    if sidefile is not None:
+        saved = json.loads(sidefile.read_text())
+        expected = {name: record["total"] // group_size for name, record in dense_shards.items()}
+        if saved != {"group_size": group_size, "shards": expected}:
+            raise ValueError("checkpoint node-shard layout differs from the participation receipts'")
+    routes = [[block + position for block in range(0, world_size, group_size)] for position in range(group_size)]
+    groups = {}
+    for index, group in enumerate(shapes):
+        sharded = [name in dense_shards for name in group]
+        if any(sharded) and not all(sharded):
+            raise ValueError("optimizer group mixes node shards and replicated parameters")
+        if any(sharded):
+            for name, shape in group.items():
+                record = dense_shards[name]
+                if record["total"] % group_size or tuple(shape) != (record["total"] // group_size,):
+                    raise ValueError(f"node shard {name} shape differs from its layout")
+            groups[index] = routes
+    if set(dense_shards) != {name for index in groups for name in shapes[index]}:
+        raise ValueError("node-shard layout names shards the checkpoint does not hold")
+    return groups
+
+
 def _snapshot(
     root: Path,
     *,
     expected_optimizer_config: dict | None,
     expected_learning_rate: float | None,
     expected_native_layout: dict | None = None,
+    dense_shards: dict | None = None,
 ) -> _Snapshot:
     native = expected_native_layout
+    if native is not None and dense_shards:
+        raise ValueError("native EP captures do not take node-shard layouts")
     experts, input_hashes, expert_files = None, None, []
     if native is None:
         model_file, optim_files = _checkpoint_files(root)
@@ -3193,6 +3348,7 @@ def _snapshot(
         shapes.append(entries)
     # The BF16 module payload is not a master-weight source and is no longer needed.
     del model, module
+    dense_routes = _dense_shard_routes(dense_shards, shapes, world_size, root) if native is None else {}
     shards = []
     groups = []
     partition_sizes = []
@@ -3217,7 +3373,11 @@ def _snapshot(
         if optimizer.get("overflow"):
             raise ValueError("overflowed optimizer checkpoint is unsupported")
         counts = _sequence(optimizer.get("partition_count"), count, "partition_count")
-        if native is None and any(_integer(value, "partition_count") != world_size for value in counts):
+        if native is None and any(
+            _integer(value, "partition_count") != world_size
+            for index, value in enumerate(counts)
+            if index not in dense_routes
+        ):
             raise ValueError("missing DP ranks or expert parallel partition_count")
         paddings = _sequence(optimizer.get("group_paddings"), count, "group_paddings")
         masters = _sequence(optimizer.get("single_partition_of_fp32_groups"), count, "FP32 master groups")
@@ -3234,9 +3394,21 @@ def _snapshot(
         param_groups = _sequence(base.get("param_groups"), count, "base optimizer param_groups")
         ids = []
         for index, group in enumerate(param_groups):
-            if not isinstance(group, dict) or (native is None and group.get("moe")) or group.get("amsgrad"):
+            if (
+                not isinstance(group, dict)
+                or (native is None and group.get("moe") and index not in dense_routes)
+                or group.get("amsgrad")
+            ):
                 raise ValueError("unsupported optimizer param group (EP or AMSGrad)")
-            if native is None:
+            if index in dense_routes:
+                # Arctic tags node shards as expert-parallel parameters of the node's group (ep_size_<g>).
+                if group.get("moe") is not True or group.get("name") != f"ep_size_{len(dense_routes[index])}":
+                    raise ValueError("node-shard optimizer group is not its node's expert-parallel group")
+                route = next(route for route in dense_routes[index] if rank in route)
+                partition_rank, group_world = route.index(rank), len(route)
+                if _integer(counts[index], "partition_count") != group_world:
+                    raise ValueError("node-shard optimizer partition_count disagrees with its expert-DP group")
+            elif native is None:
                 partition_rank, group_world = rank, world_size
             else:
                 expert_group = group.get("moe", False)
@@ -3282,7 +3454,7 @@ def _snapshot(
                 raise ValueError("optimizer learning rate mismatch")
             if rank:
                 keys = ("betas", "eps", "weight_decay", "bias_correction", "lr")
-                if native is not None:
+                if native is not None or dense_routes:
                     keys += ("moe", "name")
                 for key in keys:
                     if group.get(key) != groups[0][index].get(key):
@@ -3347,9 +3519,11 @@ def _snapshot(
             raise ValueError("unexpected optimizer state groups")
         shards.append(optimizer)
         groups.append(param_groups)
+    if dense_routes:
+        rank_routes = [dense_routes.get(index, [list(range(world_size))]) for index in range(count)]
     for index, shape_group in enumerate(shapes):
         total = sum(math.prod(shape) for shape in shape_group.values())
-        partitions = world_size if native is None else len(rank_routes[index][0])
+        partitions = world_size if native is None and not dense_routes else len(rank_routes[index][0])
         if total > partitions * partition_sizes[index]:
             raise ValueError("missing FP32 parameter partitions")
     snapshot = _Snapshot(
@@ -3359,7 +3533,7 @@ def _snapshot(
         groups,
         partition_sizes,
         native,
-        rank_routes if native is not None else None,
+        rank_routes if native is not None or dense_routes else None,
         experts,
         input_hashes,
     )
@@ -3409,6 +3583,27 @@ def _parameter(snapshot: _Snapshot, group_index: int, name: str, key: str) -> to
     return values[0] if len(values) == 1 else torch.cat(values, dim=expert_shard_dim(name))
 
 
+def _decoded_parameters(after: _Snapshot, dense_shards: dict):
+    """``(name, read)`` for each parameter the checkpoints hold, ``read(snapshot, key)`` its tensor; a
+    node shard yields the original parameters it holds, each read out of the shard's rebuilt flat layout."""
+    for group_index, shapes in enumerate(after.shapes):
+        for name in shapes:
+            if name not in dense_shards:
+                yield name, lambda snapshot, key, name=name, index=group_index: _parameter(snapshot, index, name, key)
+                continue
+            cache = {}  # the shard's rebuilt states, while its members are read (one shard at a time)
+
+            def flat(snapshot, key, *, name=name, index=group_index, cache=cache):
+                if (id(snapshot), key) not in cache:
+                    cache[(id(snapshot), key)] = _parameter(snapshot, index, name, key)
+                return cache[(id(snapshot), key)]
+
+            for member in dense_shards[name]["members"]:
+                yield member["name"], lambda snapshot, key, flat=flat, member=member: (
+                    flat(snapshot, key).narrow(0, member["offset"], member["numel"]).reshape(member["shape"]).clone()
+                )
+
+
 def decode_optimizer_capture(
     before_dir: Path,
     after_dir: Path,
@@ -3441,6 +3636,11 @@ def decode_optimizer_capture(
         if output_dir.resolve().is_relative_to(source.resolve()):
             raise ValueError("optimizer artifact output must be outside checkpoint inputs")
     options = {} if native is None else {"expected_native_layout": native}
+    # Node shards (Arctic's patches.dense_shard) hold the original parameters in flat layouts that only the training
+    # worker knows; its participation receipts carry them.
+    dense_shards = (participation_receipts or [{}])[0].get("dense_shards") or {}
+    if dense_shards:
+        options["dense_shards"] = dense_shards
     before = _snapshot(
         before_dir, expected_optimizer_config=expected_optimizer_config, expected_learning_rate=None, **options
     )
@@ -3482,7 +3682,9 @@ def decode_optimizer_capture(
             for filename, digest in receipt["after"]["participation_sources"].items():
                 if hashlib.sha256(Path(filename).read_bytes()).hexdigest() != digest:
                     raise ValueError("participation capture source drift")
-        shapes = {name: shape for group in after.shapes for name, shape in group.items()}
+        shapes = {name: shape for group in after.shapes for name, shape in group.items() if name not in dense_shards}
+        for record in dense_shards.values():
+            shapes.update((member["name"], tuple(member["shape"])) for member in record["members"])
         participation, inactive_weights = merge_rank_participation(
             [receipt["before"] for receipt in participation_receipts],
             [receipt["after"] for receipt in participation_receipts],
@@ -3515,32 +3717,31 @@ def decode_optimizer_capture(
     output_dir.mkdir(parents=True)
     try:
         entries = []
-        for group_index, shapes in enumerate(after.shapes):
-            for name, shape in shapes.items():
-                master_before = _parameter(before, group_index, name, "fp32_master")
-                master_after = _parameter(after, group_index, name, "fp32_master")
-                if name in inactive_weights:
+        for name, read in _decoded_parameters(after, dense_shards):
+            master_before = read(before, "fp32_master")
+            master_after = read(after, "fp32_master")
+            if name in inactive_weights:
 
-                    inactive_weights[name]["master"] = {
-                        "before": weight_identity(master_before),
-                        "after": weight_identity(master_after),
-                    }
-                if native is not None:
-                    master_before, master_after = master_before.float(), master_after.float()
-                master_after.sub_(master_before)
-                if not bool(torch.isfinite(master_after).all()):
-                    raise ValueError(f"nonfinite {name}::parameter_update")
-                filename = f"{len(entries):06d}.pt"
-                torch.save(
-                    {
-                        "parameter_update": master_after,
-                        "exp_avg": _parameter(after, group_index, name, "exp_avg"),
-                        "exp_avg_sq": _parameter(after, group_index, name, "exp_avg_sq"),
-                    },
-                    output_dir / filename,
-                )
-                entries.append({"name": name, "file": filename, "shape": list(master_after.shape)})
-                del master_before, master_after
+                inactive_weights[name]["master"] = {
+                    "before": weight_identity(master_before),
+                    "after": weight_identity(master_after),
+                }
+            if native is not None:
+                master_before, master_after = master_before.float(), master_after.float()
+            master_after.sub_(master_before)
+            if not bool(torch.isfinite(master_after).all()):
+                raise ValueError(f"nonfinite {name}::parameter_update")
+            filename = f"{len(entries):06d}.pt"
+            torch.save(
+                {
+                    "parameter_update": master_after,
+                    "exp_avg": read(after, "exp_avg"),
+                    "exp_avg_sq": read(after, "exp_avg_sq"),
+                },
+                output_dir / filename,
+            )
+            entries.append({"name": name, "file": filename, "shape": list(master_after.shape)})
+            del master_before, master_after
         manifest = output_dir / "manifest.json"
         provenance = {}
         if participation is not None:
