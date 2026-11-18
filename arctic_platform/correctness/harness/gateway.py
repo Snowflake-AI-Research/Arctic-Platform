@@ -58,6 +58,7 @@ from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client.requests import log_probs_request
+from arctic_platform.correctness.harness.config import MOE_MODEL_PROVIDERS
 from arctic_platform.correctness.harness.config import LoadedConfig
 from arctic_platform.correctness.harness.config import ReviewedClientConfig
 from arctic_platform.correctness.harness.config import ReviewedSamplingConfig
@@ -1442,7 +1443,9 @@ def build_payload(
 
 
 def _labels_for_provider(batch, model_provider: str):
-    return batch.shifted_labels() if model_provider == "prime_rl" else batch.labels
+    # DSS forwards a MoE-provider request's SFT labels to the model unshifted, as prediction-aligned targets
+    # (labels[s] is the token at s + 1), and shifts the other providers' model-style labels at dispatch.
+    return batch.shifted_labels() if model_provider in MOE_MODEL_PROVIDERS else batch.labels
 
 
 def _attention_mask_from_position_ids(position_ids):
@@ -1480,7 +1483,7 @@ def pack(
     *,
     model_provider: str = "huggingface",
 ) -> dict:
-    labels_are_shifted = model_provider == "prime_rl"
+    labels_are_shifted = model_provider in MOE_MODEL_PROVIDERS
     return _batch_body(
         batch,
         _labels_for_provider(batch, model_provider),
@@ -1602,7 +1605,7 @@ class GatewayTransport:
             spec is not None
             and type(spec.model.seed) is int
             and spec.model.seed == 0
-            and self.payload["training_config"].get("model_provider") == "prime_rl"
+            and self.payload["training_config"].get("model_provider") in MOE_MODEL_PROVIDERS
         ):
             if self.payload["model_name"] != spec.model.cache_path:
                 raise ValueError("local reduced fixture path differs from the reviewed spec")
@@ -1806,7 +1809,7 @@ def validate_reduced_fixture_support(payload: dict, spec: TestSpec | None, publi
         raise ValueError("prime_rl.debug must be a configuration object")
     if "reduced_fixture_mtp" in options:
         raise ValueError("reduced fixture MTP descriptors require unavailable native loader hooks")
-    if published_fixture is None or training.get("model_provider") != "prime_rl":
+    if published_fixture is None or training.get("model_provider") not in MOE_MODEL_PROVIDERS:
         return
     if spec is None:
         raise ValueError("published fixture requires its reviewed spec")
@@ -1869,7 +1872,7 @@ def validate_reduced_fixture_support(payload: dict, spec: TestSpec | None, publi
         if count == 0:
             return
         raise ValueError(
-            f"Reduced pretrained prime_rl fixture {model_type} with {count_name}={count} requires native"
+            f"Reduced pretrained MoE-provider fixture {model_type} with {count_name}={count} requires native"
             " prediction-weight loading and authentication unavailable on unchanged main; this correctness-only"
             " package cannot authorize omitted MTP weights"
         )
@@ -2470,7 +2473,7 @@ def minimum_context_parallel_row_tokens(cfg, model_path: str) -> int:
             "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k",
             "qwen3.8-flash-next-h200-train-rl-32gpus-sp16-256k",
         )
-        or cfg.training.get("model_provider") != "prime_rl"
+        or cfg.training.get("model_provider") not in MOE_MODEL_PROVIDERS
         or cfg.sp_size <= 1
     ):
         return 0

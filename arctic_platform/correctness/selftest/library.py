@@ -25888,6 +25888,24 @@ def test_e2e_sft_train_validate_reference_fused_cross_entropy_matches_product_se
     assert cfg({"model_provider": "huggingface"}).fused_cross_entropy is False
 
 
+def test_e2e_sft_train_validate_reference_fused_cross_entropy_reads_the_arctic_provider_model_options(
+    tmp_path,
+) -> None:
+    from arctic_platform.correctness.harness.config import LoadedConfig
+
+    def cfg(training):
+        training = {"model_provider": "arctic", **training}
+        return LoadedConfig(
+            "example", tmp_path / "example.config", {"model_name": "example", "training_config": training}
+        )
+
+    # DSS's spellings of the MoE loaders' setting: the prime_rl block entry and its model_options alias.
+    assert cfg({}).fused_cross_entropy == "liger"
+    assert cfg({"prime_rl": {"fused_cross_entropy": False}}).fused_cross_entropy is False
+    assert cfg({"model_options": {"lm_head": {"cross_entropy": False}}}).fused_cross_entropy is False
+    assert cfg({"model_options": {"lm_head.cross_entropy": True}}).fused_cross_entropy is True
+
+
 @pytest.mark.parametrize("name", ["AdamW", "FusedAdam", "torch_adamw"])
 def test_e2e_sft_train_validate_reference_uses_independent_unfused_pytorch_adamw(
     name,
@@ -26431,6 +26449,18 @@ def test_inference_checkpoint_loss_forward_request_asks_for_per_token_logprobs()
     body = inference_rl_check.pack_logit_aligned(batch)
     assert body["processing"]["return_logprobs"] is True
     assert body["meta"]["labels_are_shifted"] is True
+
+
+@pytest.mark.parametrize(
+    ("provider", "prediction_aligned"), [("arctic", True), ("prime_rl", True), ("huggingface", False)]
+)
+def test_sft_request_labels_follow_the_convention_of_the_providers_dispatch(provider, prediction_aligned) -> None:
+    # DSS forwards an "arctic" (formerly "prime_rl") request's labels unshifted and shifts the others at dispatch.
+    batch = batches.build_synthetic_batch("small", 2, 32, 128)
+    body = ap_driver.pack(batch, model_provider=provider)
+    expected = batch.shifted_labels() if prediction_aligned else batch.labels
+    assert torch.equal(body["batch"]["labels"], expected)
+    assert body["meta"] == ({"labels_are_shifted": True} if prediction_aligned else {})
 
 
 def test_inference_checkpoint_loss_forward_request_attends_to_prompts_and_masks_only_padding() -> None:

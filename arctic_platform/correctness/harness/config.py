@@ -45,6 +45,13 @@ from arctic_platform.client.config import TrainingConfig
 
 DEFAULT_REFERENCE_CALIBRATION_RUNS = 8
 MAX_LOCAL_REFERENCE_CALIBRATION_WORKERS = 8
+# The MoE (native-loader) model provider. DSS renamed it from ``prime_rl`` to ``arctic`` (dss-platform #606), and
+# Arctic's client still translates a native config's ``prime_rl`` to ``arctic`` on the wire, so configs carry either
+# name. Catalog recipes spell it ``arctic``.
+MOE_MODEL_PROVIDERS = frozenset({"arctic", "prime_rl"})
+# The fused cross-entropy the MoE loaders install when a config names none (Arctic Platform's
+# ``effective_fused_cross_entropy``).
+MOE_DEFAULT_FUSED_CROSS_ENTROPY = "liger"
 
 
 def reference_calibration_worker_count(
@@ -339,9 +346,16 @@ class LoadedConfig:
     def fused_cross_entropy(self) -> bool | str:
         """Resolve the loss backend the selected product model builder applies."""
         training = self.effective_training
-        if training.get("model_provider") == "prime_rl":
-            return training.get("fused_cross_entropy", "liger")
-        return training.get("fused_cross_entropy", False)
+        if training.get("model_provider") not in MOE_MODEL_PROVIDERS:
+            return training.get("fused_cross_entropy", False)
+        if "fused_cross_entropy" in training:
+            return training["fused_cross_entropy"]
+        # DSS takes ``model_options.lm_head.cross_entropy`` as the ``prime_rl.fused_cross_entropy`` it replaces.
+        options = self.training.get("model_options") or {}
+        lm_head = options.get("lm_head") or {}
+        if "lm_head.cross_entropy" in options:
+            return options["lm_head.cross_entropy"]
+        return lm_head.get("cross_entropy", MOE_DEFAULT_FUSED_CROSS_ENTROPY)
 
     @property
     def lm_head_token_chunk_size(self) -> int | None:

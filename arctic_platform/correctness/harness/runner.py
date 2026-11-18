@@ -64,6 +64,7 @@ from ..models import validate_local_full_model
 from ..reference.model_features import uses_mixer_packing
 from . import report as console
 from .config import DEFAULT_REFERENCE_CALIBRATION_RUNS
+from .config import MOE_MODEL_PROVIDERS
 from .config import ArmDefinition
 from .config import ArmSpec
 from .config import LoadedConfig
@@ -1346,8 +1347,12 @@ def materialize_ap_peft_adapter(
             raise ValueError("GLM adapter initialization requires its configured local Cortex gateway")
         backend = cfg.native.backend
         require_local_cortex_gateway(backend)
-        if cfg.training.get("model_provider") != "prime_rl" or cfg.sp_size != 8 or cfg.training.get("ep_size") != 8:
-            raise ValueError("GLM adapter initialization requires the reviewed PrimeRL/SP8/EP8 route")
+        if (
+            cfg.training.get("model_provider") not in MOE_MODEL_PROVIDERS
+            or cfg.sp_size != 8
+            or cfg.training.get("ep_size") != 8
+        ):
+            raise ValueError("GLM adapter initialization requires the reviewed MoE-provider/SP8/EP8 route")
     workdir.mkdir(parents=True, exist_ok=True)
     gateway_dir = workdir / "gateway"
     gateway_dir.mkdir(parents=True, exist_ok=True)
