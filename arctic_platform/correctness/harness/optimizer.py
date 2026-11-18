@@ -3178,12 +3178,14 @@ def _bf16_vector(value, length: int, description: str) -> torch.Tensor:
     return value
 
 
-def _config(config, description: str) -> None:
+def _config(config, description: str) -> int:
+    """Validate a dense checkpoint's ds_config and return its ZeRO stage (1 or 2)."""
     if not isinstance(config, dict):
         raise ValueError(f"{description} requires ds_config")
     zero = config.get("zero_optimization", {})
-    if not isinstance(zero, dict) or _integer(zero.get("stage"), "configured ZeRO stage") != 2:
-        raise ValueError("only dense ZeRO2 checkpoints are supported")
+    stage = _integer(zero.get("stage"), "configured ZeRO stage") if isinstance(zero, dict) else None
+    if stage not in (1, 2):
+        raise ValueError("only dense ZeRO1/ZeRO2 checkpoints are supported")
     optimizer = config.get("optimizer")
     if (
         not isinstance(optimizer, dict)
@@ -3204,6 +3206,7 @@ def _config(config, description: str) -> None:
     tp = config.get("tensor_parallel", {})
     if tp and (not isinstance(tp, dict) or tp.get("tp_size", 1) != 1):
         raise ValueError("tensor parallel checkpoints are unsupported")
+    return stage
 
 
 def _checkpoint_files(root: Path) -> tuple[Path, list[Path]]:
@@ -3416,12 +3419,20 @@ def _snapshot(
         optimizer = state.get("optimizer_state_dict")
         if not isinstance(optimizer, dict):
             raise ValueError("checkpoint requires optimizer_state_dict")
-        if _integer(optimizer.get("zero_stage"), "ZeRO stage") != 2:
-            raise ValueError("only dense ZeRO2 checkpoints are supported")
         if native is None:
-            _config(model_config, "model checkpoint")
-            _config(state.get("ds_config"), "optimizer checkpoint")
+            stage = _config(model_config, "model checkpoint")
+            if _config(state.get("ds_config"), "optimizer checkpoint") != stage:
+                raise ValueError("model and optimizer checkpoints differ in ZeRO stage")
         else:
+            stage = 2
+        # At ZeRO stage 1 with BF16 parameters, FP32 gradient accumulation and no CPU offload DeepSpeed trains with
+        # BF16_Optimizer (engine.py _do_optimizer_sanity_check), whose state_dict names no zero_stage and keeps each
+        # FP32 partition whole, its alignment padding recorded on the last rank (bf16_optimizer.py state_dict). Every
+        # other dense ZeRO1/ZeRO2 engine uses DeepSpeedZeroOptimizer, which names its stage and strips the padding.
+        whole_partitions = stage == 1 and "zero_stage" not in optimizer
+        if not whole_partitions and (saved := _integer(optimizer.get("zero_stage"), "ZeRO stage")) != stage:
+            raise ValueError(f"ZeRO{saved} optimizer checkpoint under a ZeRO{stage} ds_config")
+        if native is not None:
             if state.get("ds_config") != model_config:
                 raise ValueError("native optimizer ds_config mismatch")
             optimizer_type = model_config.get("optimizer", {}).get("type")
@@ -3522,10 +3533,11 @@ def _snapshot(
             if not isinstance(master, torch.Tensor):
                 raise ValueError("FP32 master groups must contain tensors")
             padding = _integer(paddings[index], "group padding")
-            # ZeRO2 state_dict removes master padding but retains full nonelastic Adam state partitions.
-            length = master.numel() + padding
+            # DeepSpeedZeroOptimizer's state_dict removes master padding but retains full nonelastic Adam state
+            # partitions; BF16_Optimizer's keeps both whole.
+            length = master.numel() if whole_partitions else master.numel() + padding
             vector_check = _fp32_vector if native is None else _bf16_vector
-            vector_check(master, length - padding, "optimizer master partition")
+            vector_check(master, master.numel(), "optimizer master partition")
             if native is not None and not bool(torch.isfinite(master).all()):
                 raise ValueError("nonfinite native optimizer master")
             if rank == 0:
@@ -3535,11 +3547,14 @@ def _snapshot(
             if length != partition_sizes[index]:
                 raise ValueError("inconsistent FP32 partition sizes")
             total = sum(math.prod(shape) for shape in shapes[index].values())
-            wanted_length = max(0, min(length, total - partition_rank * length))
-            if padding != length - wanted_length:
-                raise ValueError("FP32 partition padding/parameter shape mismatch")
-            if master.numel() != wanted_length:
-                raise ValueError("FP32 partition padding/parameter shape mismatch")
+            if whole_partitions:
+                wanted_padding = group_world * length - total if partition_rank == group_world - 1 else 0
+                if padding != wanted_padding:
+                    raise ValueError("FP32 partition padding/parameter shape mismatch")
+            else:
+                wanted_length = max(0, min(length, total - partition_rank * length))
+                if padding != length - wanted_length or master.numel() != wanted_length:
+                    raise ValueError("FP32 partition padding/parameter shape mismatch")
             group_state = base["state"].get(param_id, {})
             if not isinstance(group_state, dict):
                 raise ValueError("invalid Adam optimizer state")

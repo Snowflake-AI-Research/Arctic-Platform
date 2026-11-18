@@ -9610,13 +9610,16 @@ _cortex_optimizer_decode_OPTIMIZER = {"name": "AdamW", "betas": [0.9, 0.999], "e
 _cortex_optimizer_decode_LR = 0.01
 
 
-def _cortex_optimizer_decode_pair(tmp_path, *, world_size=2, before_step=0, prefix="bf16_", lazy_baseline=True):
+def _cortex_optimizer_decode_pair(
+    tmp_path, *, world_size=2, before_step=0, prefix="bf16_", lazy_baseline=True, bf16_optimizer=False
+):
+    """A ZeRO2 before/after checkpoint pair; ``bf16_optimizer`` writes ZeRO1's BF16_Optimizer files instead."""
     shapes = [
         OrderedDict([("layer.weight", torch.Size([2, 3])), ("layer.bias", torch.Size([3]))]),
         OrderedDict([("layer.norm.weight", torch.Size([5]))]),
     ]
     config = {
-        "zero_optimization": {"stage": 2},
+        "zero_optimization": {"stage": 1 if bf16_optimizer else 2},
         "bf16": {"enabled": True},
         "optimizer": {"type": "AdamW", "params": {**_cortex_optimizer_decode_OPTIMIZER, "lr": 2e-05}},
     }
@@ -9660,8 +9663,13 @@ def _cortex_optimizer_decode_pair(tmp_path, *, world_size=2, before_step=0, pref
                 valid = max(0, min(length, total - start))
                 values = [baseline[name].flatten() + (0.0001 if post else 0) for name in group]
                 vector = torch.cat(values)
-                masters.append(vector[start : start + valid].clone())
-                paddings.append(length - valid)
+                if bf16_optimizer:
+                    # bf16_optimizer.py: whole FP32 partitions; the group's alignment padding on the last rank.
+                    masters.append(torch.cat([vector, torch.zeros(world_size * length - total)])[start:end].clone())
+                    paddings.append(world_size * length - total if rank == world_size - 1 else 0)
+                else:
+                    masters.append(vector[start : start + valid].clone())
+                    paddings.append(length - valid)
                 mapping = OrderedDict()
                 offset = 0
                 for name, shape in group.items():
@@ -9692,25 +9700,26 @@ def _cortex_optimizer_decode_pair(tmp_path, *, world_size=2, before_step=0, pref
                         partition[:valid].copy_(full[start : start + valid] if post else torch.zeros(valid))
                         state[key] = partition
                     states[param_id] = state
+            optimizer_state = {
+                "zero_stage": ZeroStageEnum.gradients,
+                "base_optimizer_state": {"state": states, "param_groups": groups},
+                "single_partition_of_fp32_groups": masters,
+                "param_slice_mappings": mappings,
+                "partition_count": [world_size] * len(shapes),
+                "group_paddings": paddings,
+                "param_alignment_paddings": [[0] * len(group) for group in shapes],
+                "loss_scaler": LossScaler(1.0),
+                "dynamic_loss_scale": False,
+                "overflow": False,
+                "clip_grad": 1.0,
+                "ds_version": "synthetic",
+            }
+            if bf16_optimizer:
+                # BF16_Optimizer.state_dict's keys.
+                for key in ("zero_stage", "param_alignment_paddings", "loss_scaler", "dynamic_loss_scale", "overflow"):
+                    optimizer_state.pop(key)
             torch.save(
-                {
-                    "ds_config": config,
-                    "ds_version": "synthetic",
-                    "optimizer_state_dict": {
-                        "zero_stage": ZeroStageEnum.gradients,
-                        "base_optimizer_state": {"state": states, "param_groups": groups},
-                        "single_partition_of_fp32_groups": masters,
-                        "param_slice_mappings": mappings,
-                        "partition_count": [world_size] * len(shapes),
-                        "group_paddings": paddings,
-                        "param_alignment_paddings": [[0] * len(group) for group in shapes],
-                        "loss_scaler": LossScaler(1.0),
-                        "dynamic_loss_scale": False,
-                        "overflow": False,
-                        "clip_grad": 1.0,
-                        "ds_version": "synthetic",
-                    },
-                },
+                {"ds_config": config, "ds_version": "synthetic", "optimizer_state_dict": optimizer_state},
                 tag / f"{prefix}zero_pp_rank_{rank}_mp_rank_00_optim_states.pt",
             )
     return SimpleNamespace(before=before_root, after=after_root, expected=expected, baseline=baseline)
@@ -9768,6 +9777,53 @@ def test_cortex_optimizer_decode_decode_named_fp32_update_moments_and_padding(tm
     assert len(comparison.deltas) == 3 * len(pair.expected)
     assert all((item.delta_norm == 0 for item in comparison.deltas if item.state in ("exp_avg", "exp_avg_sq")))
     assert not comparison.only_ap and (not comparison.only_reference)
+
+
+@pytest.mark.parametrize("world_size", [1, 2, 4, 12])
+def test_cortex_optimizer_decode_reads_zero1_bf16_optimizer_whole_partitions(tmp_path, world_size):
+    """qwen3-1.7b's ZeRO1 file trains with BF16_Optimizer, whose checkpoint names no zero_stage."""
+    pair = _cortex_optimizer_decode_pair(tmp_path, world_size=world_size, bf16_optimizer=True)
+    manifest = decoder.decode_optimizer_capture(
+        pair.before,
+        pair.after,
+        tmp_path / "out",
+        expected_optimizer_config=_cortex_optimizer_decode_OPTIMIZER,
+        expected_learning_rate=_cortex_optimizer_decode_LR,
+    )
+    metadata = json.loads(manifest.read_text())
+    assert [item["name"] for item in metadata["parameters"]] == list(pair.expected)
+    for entry in metadata["parameters"]:
+        tensor = torch.load(manifest.parent / entry["file"], weights_only=True)
+        for key, expected in pair.expected[entry["name"]].items():
+            assert torch.equal(tensor[key], expected)
+
+
+@pytest.mark.parametrize(
+    "mutation,error",
+    [("zero2-config", "ZeRO stage"), ("padding-elsewhere", "padding"), ("stripped-master", "partition sizes")],
+)
+def test_cortex_optimizer_decode_rejects_bf16_optimizer_files_unlike_deepspeeds(tmp_path, mutation, error):
+    pair = _cortex_optimizer_decode_pair(tmp_path, world_size=2, bf16_optimizer=True)
+
+    def edit(state):
+        if mutation == "zero2-config":
+            state["ds_config"]["zero_optimization"]["stage"] = 2
+        elif mutation == "padding-elsewhere":
+            state["optimizer_state_dict"]["group_paddings"] = [3, 0]
+        else:
+            # A DeepSpeedZeroOptimizer-style master, stripped of the padding BF16_Optimizer keeps.
+            masters = state["optimizer_state_dict"]["single_partition_of_fp32_groups"]
+            masters[0] = masters[0][:3].clone()
+
+    if mutation == "zero2-config":
+        paths = list(pair.after.rglob("*.pt"))
+    else:
+        paths = [_cortex_optimizer_decode_optim(pair.after, 0 if mutation == "padding-elsewhere" else 1)]
+    for path in paths:
+        _cortex_optimizer_decode_rewrite(path, edit)
+    with pytest.raises(ValueError, match=error):
+        decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
 
 
 def test_cortex_optimizer_decode_decode_uses_actual_state_step_and_group_lr_not_legacy_or_config_defaults(tmp_path):
