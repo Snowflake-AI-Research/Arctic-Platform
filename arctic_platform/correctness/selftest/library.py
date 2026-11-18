@@ -8599,6 +8599,16 @@ def test_reference_execution_witness_records_actual_configurations_and_selected_
     assert witness["effective_configurations"]["model"]["config"]["num_hidden_layers"] == 4
 
 
+def test_reference_execution_witness_records_a_non_finite_config_value(_reference_execution_engine):
+    """Nemotron-H's Mamba-2 time_step_limit is (0.0, inf), which strict JSON cannot spell."""
+    engine = _reference_execution_engine
+    engine.model.config.values["time_step_limit"] = (0.0, float("inf"))
+    witness = hf_single_gpu.execution_witness(engine, requested_attention="flash_attention_3")
+    assert witness["effective_configurations"]["model"]["config"]["time_step_limit"] == [0.0, "Infinity"]
+    assert json.loads(json.dumps(witness, allow_nan=False)) == witness
+    assert hf_single_gpu.execution_witness(engine, requested_attention="flash_attention_3") == witness
+
+
 @pytest.mark.parametrize("change", [None, "config", "forward", "source"])
 def test_reference_execution_witness_survives_run_and_rejects_execution_changes(
     _reference_execution_engine, monkeypatch, tmp_path, change

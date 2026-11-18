@@ -156,7 +156,9 @@ def execution_witness(engine: ReferenceEngine, *, requested_attention: str) -> d
             "config": cfg.to_dict(),
             "attention_implementation": getattr(cfg, "_attn_implementation", None),
         }
-        return json.loads(json.dumps(value, sort_keys=True, allow_nan=False))
+        # A Mamba-2 config bounds its time step by time_step_limit = (0.0, inf) (Nemotron-H); a non-finite value is
+        # recorded by its JSON extension name ("Infinity") so the witness stays strict JSON.
+        return json.loads(json.dumps(value, sort_keys=True), parse_constant=str)
 
     configurations = {"model": configuration(engine.model), "decoder": configuration(engine.decoder)}
     return {
