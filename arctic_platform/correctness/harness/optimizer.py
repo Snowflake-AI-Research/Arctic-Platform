@@ -1970,7 +1970,9 @@ def _native_layout(layout: dict) -> dict:
         if type(layout.get(key)) is not int or layout[key] < 1:
             raise ValueError(f"native layout requires a positive {key}")
     world, ep, sp = (layout[key] for key in ("world_size", "ep_size", "sp_size"))
-    if ep not in (8, 16) or world % ep or world % sp or layout["model_mp_world_size"] not in (1, sp):
+    # DeepSpeed's _create_expert_and_data_parallel and Arctic's SP expert topologies place any EP degree that divides
+    # the world: each expert shard's world // ep replicas form its expert-DP group, the route read below.
+    if ep < 2 or world % ep or world % sp or layout["model_mp_world_size"] not in (1, sp):
         raise ValueError("unsupported native EP/SP topology")
     if type(layout.get("model_ep_rank")) is not int or not 0 <= layout["model_ep_rank"] < ep:
         raise ValueError("native layout requires the model writer's actual EP rank")

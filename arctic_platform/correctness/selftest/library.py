@@ -11457,7 +11457,8 @@ def test_native_optimizer_owner_split_cli_guarded_forwarding(
         )
 
 
-def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, train_experts=True):
+def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, sp=None, train_experts=True):
+    sp = ep if sp is None else sp
     config = {
         "zero_optimization": {"stage": 2},
         "bf16": {
@@ -11482,10 +11483,10 @@ def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, train_experts=True):
         "schema": "native-ep-zero2-layout-v1",
         "world_size": world,
         "ep_size": ep,
-        "sp_size": ep,
-        "model_mp_world_size": ep,
+        "sp_size": sp,
+        "model_mp_world_size": sp,
         "model_ep_rank": ep - 1,
-        "optimizer_mp_ranks": [rank % ep for rank in range(world)],
+        "optimizer_mp_ranks": [rank % sp for rank in range(world)],
         "expert_data_parallel_groups": {"native-experts": routes} if train_experts else {},
         "ds_config": config,
         "source_files": sources,
@@ -11504,7 +11505,7 @@ def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, train_experts=True):
                 "param_shapes": shapes,
                 "global_steps": step,
                 "dp_world_size": world,
-                "mp_world_size": ep,
+                "mp_world_size": sp,
                 "ds_config": config,
             },
             tag / "mp_rank_00_model_states.pt",
@@ -12031,6 +12032,27 @@ def test_native_ep_bf16_optimizer_reconstructs_actual_ordered_groups_without_sid
         assert tensors["exp_avg"].dtype == tensors["exp_avg_sq"].dtype == torch.bfloat16
         if entry["name"] == pair.expert_name:
             assert torch.equal(tensors["exp_avg"][:, 0], torch.arange(2, ep + 2, dtype=torch.bfloat16))
+
+
+# The catalog's EP files: GLM-5.3-Flash standard LoRA (4 GPUs, SP4, EP4), Qwen3-30B-A3B standard (8 GPUs, EP2),
+# Qwen3.6-35B-A3B standard (EP4), Nemotron long LoRA (SP4, EP2) and GLM-5.3-Flash-BF16 standard full (32, SP8, EP32).
+@pytest.mark.parametrize("world,ep,sp", [(4, 4, 4), (8, 2, 1), (8, 4, 1), (8, 2, 4), (32, 32, 8)])
+def test_native_ep_optimizer_admits_every_ep_size_deepspeed_lays_out(tmp_path, world, ep, sp):
+    pair = _native_ep_bf16_pair(tmp_path, world=world, ep=ep, sp=sp)
+    manifest = json.loads(_native_ep_bf16_decode(pair, tmp_path / "out").read_text())
+    assert sorted(entry["name"] for entry in manifest["parameters"]) == sorted(pair.expected)
+    for entry in manifest["parameters"]:
+        tensors = torch.load(tmp_path / "out" / entry["file"], weights_only=True)
+        assert torch.equal(tensors["parameter_update"], pair.expected[entry["name"]])
+        if entry["name"] == pair.expert_name:
+            assert torch.equal(tensors["exp_avg"][:, 0], torch.arange(2, ep + 2, dtype=torch.bfloat16))
+
+
+@pytest.mark.parametrize("ep", [1, 3])
+def test_native_ep_optimizer_refuses_an_ep_size_deepspeed_cannot_lay_out(tmp_path, ep):
+    pair = _native_ep_bf16_pair(tmp_path, world=8, ep=2, sp=1)
+    with pytest.raises(ValueError, match="unsupported native EP/SP topology"):
+        decoder._native_layout({**pair.layout, "ep_size": ep})
 
 
 def test_native_ep_bf16_optimizer_frozen_experts_do_not_become_optimizer_records(tmp_path):
