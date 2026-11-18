@@ -13648,6 +13648,207 @@ def test_generated_adapter_dependency_recipe_drift_invalidates_admitted_identity
         shared.shared_initialize_adapter(_model(), path, admitted)
 
 
+_EXPERT_LORA_RECIPE = {
+    "peft_type": "Lora",
+    "r": 2,
+    "lora_alpha": 4,
+    "lora_dropout": 0.0,
+    "bias": "none",
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    "target_parameters": ["experts.w1", "experts.w2", "experts.w3"],
+}
+_EXPERT_LORA_DIMS = dict(
+    vocab_size=32,
+    hidden_size=16,
+    intermediate_size=32,
+    num_hidden_layers=1,
+    num_attention_heads=2,
+    num_key_value_heads=2,
+    head_dim=8,
+    max_position_embeddings=32,
+    num_experts=4,
+    num_experts_per_tok=2,
+    moe_intermediate_size=8,
+)
+
+
+@pytest.fixture
+def expert_lora_pack(tmp_path, monkeypatch):
+    """The catalog's Qwen3-30B-A3B standard LoRA shape on a config-only Qwen3-MoE base, its pack generated."""
+    monkeypatch.setattr(storage, "_DATA_FAST_ROOT", tmp_path)
+    source = tmp_path / "config-only-moe"
+    transformers.Qwen3MoeConfig(**_EXPERT_LORA_DIMS, architectures=["Qwen3MoeForCausalLM"]).save_pretrained(source)
+    path = shared.generate_adapter(source, _EXPERT_LORA_RECIPE, tmp_path / "generated", seed=42)
+    identity = shared.shared_adapter_identity(path, _EXPERT_LORA_RECIPE)
+    return SimpleNamespace(path=path, source=source, identity=identity)
+
+
+def _arctic_expert_lora_model(experts=4):
+    from arctic_platform.model.implementations.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from arctic_platform.model.implementations.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+    from arctic_platform.model.patches.peft import apply_peft
+
+    with torch.random.fork_rng(devices=[]):
+        model = Qwen3MoeForCausalLM(
+            Qwen3MoeConfig(**_EXPERT_LORA_DIMS, use_grouped_mm=False, attn_implementation="sdpa")
+        ).float()
+        if experts != _EXPERT_LORA_DIMS["num_experts"]:
+            # An expert-parallel rank's local shard, as PEFT sizes the factors after placement.
+            for module in model.modules():
+                for name in ("w1", "w2", "w3"):
+                    parameter = getattr(module, name, None)
+                    if isinstance(parameter, torch.nn.Parameter) and parameter.dim() == 3:
+                        setattr(module, name, torch.nn.Parameter(parameter.data[:experts].clone()))
+        return apply_peft(model, {**_EXPERT_LORA_RECIPE, "task_type": "CAUSAL_LM"})
+
+
+def test_shared_adapter_admits_peft_reloaded_set_target_parameters_and_fused_expert_patterns(expert_lora_pack):
+    # PEFT's Transformers 5 MoE conversion holds target_parameters as a set and targets gate_up_proj at 2r.
+    config = json.loads((expert_lora_pack.path / "adapter_config.json").read_text())
+    reloaded = {**config, "target_parameters": set(config["target_parameters"])}
+    assert shared._topology(reloaded) == expert_lora_pack.identity["peft_config"]
+    assert expert_lora_pack.identity["peft_config"]["rank_pattern"] == {r".*\.gate_up_proj": 4}
+    for field, value in (("rank_pattern", {r".*\.gate_up_proj": 3}), ("alpha_pattern", {r".*\.q_proj": 8})):
+        with pytest.raises(ValueError, match="fused expert parameters"):
+            shared._topology({**config, field: value})
+
+
+def test_generated_expert_adapter_holds_arctic_expert_weights_in_the_hf_fused_parameters(expert_lora_pack):
+    generation = expert_lora_pack.identity["generation"]
+    assert generation["training_peft_config"] == shared._topology(_EXPERT_LORA_RECIPE)
+    assert generation["peft_config"] == expert_lora_pack.identity["peft_config"]
+    records = {record["parameter"]: record for record in generation["expert_parameters"]}
+    assert records["gate_up_proj"]["projections"] == ["w1", "w3"] and records["gate_up_proj"]["rank"] == 4
+    assert records["down_proj"]["projections"] == ["w2"] and records["down_proj"]["rank"] == 2
+    shapes = {entry["name"]: entry["shape"] for entry in expert_lora_pack.identity["tensors"]}
+    prefix = records["gate_up_proj"]["name"]
+    assert shapes[f"{prefix}.lora_A.weight"] == [4 * 4, 16] and shapes[f"{prefix}.lora_B.weight"] == [16, 4 * 4]
+    with pytest.raises(ValueError, match="targeted together"):
+        shared.generate_adapter(
+            expert_lora_pack.source,
+            {**_EXPERT_LORA_RECIPE, "target_modules": ["q_proj"], "target_parameters": ["experts.w1", "experts.w2"]},
+            expert_lora_pack.path.parent / "partial",
+        )
+
+
+@pytest.mark.parametrize("ep_rank", [None, 0, 1])
+def test_native_expert_factors_install_each_arctic_weight_block_for_its_ep_rank(
+    expert_lora_pack, monkeypatch, ep_rank
+):
+    from arctic_platform.model.implementations.moe.distributed import expert_parallel
+
+    pack = load_file(str(expert_lora_pack.path / "adapter_model.safetensors"))
+    with torch.no_grad():
+        for name, tensor in pack.items():
+            if ".lora_A." in name:
+                tensor.copy_(torch.arange(tensor.numel(), dtype=tensor.dtype).reshape(tensor.shape))
+    save_file(pack, str(expert_lora_pack.path / "adapter_model.safetensors"), metadata={"format": "pt"})
+    identity = shared.shared_adapter_identity(expert_lora_pack.path, _EXPERT_LORA_RECIPE)
+    local = 4 if ep_rank is None else 2
+    if ep_rank is not None:
+        monkeypatch.setattr(expert_parallel, "get_ep_group", lambda experts: "ep-group")
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: ep_rank)
+    model = _arctic_expert_lora_model(local)
+    native_adapter.initialize_native_adapter(model, expert_lora_pack.path, identity)
+    installed = native_adapter._adapter_parameters(model)
+    experts = slice(0, 4) if ep_rank is None else slice(2 * ep_rank, 2 * ep_rank + 2)
+    fused = pack["base_model.model.model.layers.0.mlp.experts.base_layer.lora_A.weight"].reshape(4, 4, 16)
+    root = "base_model.model.model.layers.0.mlp.experts"
+    # Arctic nests w1 (innermost), w2, w3 (outermost); w1 takes the fused rank rows 0..r, w3 rows r..2r.
+    torch.testing.assert_close(
+        installed[f"{root}.base_layer.base_layer.lora_A.weight"], fused[experts, :2].reshape(-1, 16), rtol=0, atol=0
+    )
+    torch.testing.assert_close(installed[f"{root}.lora_A.weight"], fused[experts, 2:].reshape(-1, 16), rtol=0, atol=0)
+    down = pack[f"{root}.lora_A.weight"].reshape(4, 2, 8)
+    torch.testing.assert_close(
+        installed[f"{root}.base_layer.lora_A.weight"], down[experts].reshape(-1, 8), rtol=0, atol=0
+    )
+    assert installed[f"{root}.base_layer.base_layer.lora_B.weight"].shape == (8, 2 * local)
+
+
+def test_reference_fused_expert_lora_b_trains_only_its_per_weight_blocks(expert_lora_pack):
+    torch.manual_seed(0)
+    config = transformers.Qwen3MoeConfig(**_EXPERT_LORA_DIMS, architectures=["Qwen3MoeForCausalLM"])
+    base = transformers.Qwen3MoeForCausalLM(config).float()
+    with torch.no_grad():
+        for parameter in base.parameters():
+            parameter.normal_(std=0.2)
+    model = peft.PeftModel.from_pretrained(base, str(expert_lora_pack.path), is_trainable=True)
+    shared.shared_initialize_adapter(model, expert_lora_pack.path, expert_lora_pack.identity)
+    ids = torch.randint(0, 32, (2, 8))
+    model(input_ids=ids, labels=ids).loss.backward()
+    grad = model.get_submodule("base_model.model.model.layers.0.mlp.experts.base_layer").lora_B["default"].weight.grad
+    blocks = grad.reshape(16, 4, 4)
+    assert bool(blocks[:8, :2].count_nonzero()) and bool(blocks[8:, 2:].count_nonzero())
+    assert not blocks[:8, 2:].count_nonzero() and not blocks[8:, :2].count_nonzero()
+
+
+def test_arctic_gated_expert_lora_pairs_with_the_hf_fused_factors_and_their_shapes():
+    root = "base_model.model.model.layers.0.mlp.experts"
+    ap = {
+        f"{root}.base_layer.base_layer.lora_B.default.weight": 3.0,  # w1
+        f"{root}.base_layer.lora_B.default.weight": 5.0,  # w2
+        f"{root}.lora_B.default.weight": 4.0,  # w3
+    }
+    reference = {f"{root}.base_layer.lora_B.default.weight": 5.0, f"{root}.lora_B.default.weight": 5.0}
+    pairs, only_ap, only_reference = align(ap, reference)
+    assert not only_ap and not only_reference
+    assert pairs == [
+        ("layers.0.mlp.experts.base_layer.lora_B.default.weight", 5.0, 5.0),
+        ("layers.0.mlp.experts.lora_B.default.weight", 5.0, 5.0),
+    ]
+    groups = canonical_ap_tensor_groups([*ap, *(name.replace("lora_B", "lora_A") for name in ap)])
+    assert groups["layers.0.mlp.experts.base_layer.lora_B.default.weight"].block_diagonal
+    assert groups["layers.0.mlp.experts.base_layer.lora_A.default.weight"].concatenate_dim == 0
+    record = {
+        "schema": optimizer_capture.PARTICIPATION_SCHEMA,
+        "parameters": {
+            f"{root}.base_layer.base_layer.lora_B.default.weight": {"shape": [8, 8], "state": "active"},
+            f"{root}.base_layer.lora_B.default.weight": {"shape": [16, 8], "state": "active"},
+            f"{root}.lora_B.default.weight": {"shape": [8, 8], "state": "active"},
+        },
+    }
+    assert optimizer_capture.canonical_participation(record, backend="ap")[
+        "layers.0.mlp.experts.base_layer.lora_B.default.weight"
+    ] == {"shape": [16, 16], "state": "active"}
+
+
+def test_expert_parallel_lora_b_participation_widens_its_expert_columns():
+    name = "model.layers.0.mlp.experts.lora_B.default.weight"
+    evidence = {
+        "participation": {
+            "schema": optimizer_capture.PARTICIPATION_SCHEMA,
+            "parameters": {
+                name: {"shape": [8, 4], "state": "missing"},
+                "model.layers.0.mlp.experts.lora_A.default.weight": {"shape": [4, 16], "state": "missing"},
+            },
+        }
+    }
+    after = copy.deepcopy(evidence)
+    for entry in after["participation"]["parameters"].values():
+        entry["state"] = "active"
+    shapes = {key: value["shape"] for key, value in evidence["participation"]["parameters"].items()}
+    record, _ = optimizer_capture.merge_rank_participation(
+        [evidence, evidence], [after, after], shapes, {key: [0, 0] for key in shapes}
+    )
+    assert record["parameters"][name]["shape"] == [8, 8]
+    assert record["parameters"]["model.layers.0.mlp.experts.lora_A.default.weight"]["shape"] == [8, 16]
+
+
+def test_optimizer_norms_treat_a_fused_expert_lora_b_as_its_block_diagonal(tmp_path):
+    from arctic_platform.correctness.checks import optimizer_state
+
+    entries = {}
+    for name, value in (("w1", 1.0), ("w3", 2.0)):
+        entries[name] = tmp_path / f"{name}.pt"
+        torch.save({state: torch.full((2, 3), value) for state in optimizer_capture.STATE_KEYS}, entries[name])
+    group = optimizer_capture.CanonicalTensorGroup(("w1", "w3"), block_diagonal=True)
+    tensors = optimizer_state._load_norm_group(entries, group)
+    assert tensors["exp_avg"].shape == (4, 6)
+    assert float(tensors["exp_avg"].sum()) == 6.0 + 12.0
+
+
 @pytest.fixture
 def worker_adapter_transfer(generated_adapter_config, tmp_path, monkeypatch):
     from arctic_platform import common
@@ -23286,6 +23487,7 @@ _SELFTEST_FIXTURES = (
     "dense_allocation_runner_case",
     "adapter_pack",
     "generated_adapter_config",
+    "expert_lora_pack",
     "worker_adapter_transfer",
     "native_original_adapter",
     "gateway_optional_adapter_control",

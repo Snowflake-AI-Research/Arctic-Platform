@@ -29,6 +29,7 @@ import json
 import logging
 import math
 import os
+import re
 import select
 import shlex
 import signal
@@ -451,6 +452,36 @@ _ORIGINAL_ADAPTER_FILES = (*_ADAPTER_FILES, "initialization.json")
 _NATIVE_ADAPTER_SCOPE_LOCK = threading.Lock()
 
 
+def _fused_expert_patterns(config: dict, target_parameters: list[str]) -> dict:
+    """Admit only the rank/alpha patterns PEFT writes for a fused expert parameter, and return them.
+
+    Transformers 5 fuses an MoE's gate and up projections into one ``gate_up_proj`` parameter; PEFT's
+    ``_convert_peft_config_moe`` then targets it at ``n * r`` with ``alpha_pattern`` ``n * lora_alpha`` under the key
+    ``.*\\.gate_up_proj``, so the fused factors keep each projection's scaling. Any other pattern stays unsupported.
+    """
+    ranks, alphas = config.get("rank_pattern") or {}, config.get("alpha_pattern") or {}
+    if not ranks and not alphas:
+        return {}
+    rank, alpha = config.get("r", 8), config.get("lora_alpha", 8)
+    leaves = {target.rpartition(".")[2] for target in target_parameters}
+    if (
+        not isinstance(ranks, dict)
+        or not isinstance(alphas, dict)
+        or set(ranks) != set(alphas)
+        or any(
+            key not in {rf".*\.{re.escape(leaf)}" for leaf in leaves}
+            or type(ranks[key]) is not int
+            or type(alphas[key]) is not int
+            or ranks[key] % rank
+            or ranks[key] // rank < 2
+            or alphas[key] != ranks[key] // rank * alpha
+            for key in ranks
+        )
+    ):
+        raise ValueError("shared adapter supports rank_pattern and alpha_pattern only for fused expert parameters")
+    return {"rank_pattern": dict(sorted(ranks.items())), "alpha_pattern": dict(sorted(alphas.items()))}
+
+
 def _topology(config: dict) -> dict:
     if config.get("peft_type") not in {"Lora", "LORA"}:
         raise ValueError("shared adapter must be a standard LoRA adapter")
@@ -459,8 +490,6 @@ def _topology(config: dict) -> dict:
         "use_dora",
         "use_rslora",
         "lora_bias",
-        "rank_pattern",
-        "alpha_pattern",
         "fan_in_fan_out",
         "layer_replication",
         "layers_to_transform",
@@ -479,10 +508,94 @@ def _topology(config: dict) -> dict:
         selected["target_modules"] = sorted(selected["target_modules"])
     if selected.get("target_parameters") is None:
         selected["target_parameters"] = []
+    elif isinstance(selected["target_parameters"], (set, frozenset)):
+        # PEFT's Transformers 5 MoE conversion stores target_parameters as a set, on save and on reload.
+        selected["target_parameters"] = sorted(selected["target_parameters"])
     topology = normalize_lora_peft_config(selected)
-    if topology["target_parameters"]:
-        raise ValueError("shared adapter currently supports dense target_modules only")
-    return topology
+    return {**topology, **_fused_expert_patterns(config, topology["target_parameters"])}
+
+
+# Arctic's GroupedExperts hold an MoE's routed experts as w1, w2, w3 (gate, down, up; a non-gated MLP has up as w1 and
+# no w3), registered in that order. Hugging Face holds them per class: fused gate_up_proj (gate rows, then up rows) and
+# down_proj, or a non-gated up_proj and down_proj. Each entry: the HF expert parameter -> the Arctic weights it holds,
+# in block order. ``_canonical_ap`` (harness/optimizer.py) pairs the full-weight gradients the same way.
+_GATED_EXPERTS = {"gate_up_proj": ("w1", "w3"), "down_proj": ("w2",)}
+_NONGATED_EXPERTS = {"up_proj": ("w1",), "down_proj": ("w2",)}
+_EXPERT_LAYOUTS = (_GATED_EXPERTS, _NONGATED_EXPERTS)
+
+
+def _expert_layout(module) -> dict | None:
+    """The layout of the expert stacks (3-D parameters) a Hugging Face experts container holds, if it is one."""
+    present = {name for name, value in module.named_parameters(recurse=False) if value.dim() == 3}
+    return next((layout for layout in _EXPERT_LAYOUTS if present == set(layout)), None)
+
+
+def _hf_expert_targets(model, topology: dict) -> tuple[list[str], dict, dict]:
+    """Name the Hugging Face parameters that hold the recipe's Arctic expert ``target_parameters``.
+
+    The recipe's ``target_parameters`` (``experts.w1`` ...) name Arctic's GroupedExperts weights, which the Hugging
+    Face class does not have. Each one maps to the HF parameter holding it; a fused parameter is targeted at ``n * r``,
+    as PEFT's own Transformers 5 conversion does, so that its block-diagonal factors are the per-weight LoRAs the
+    target trains.
+    """
+    targets = {}
+    for target in topology["target_parameters"]:
+        container, _, weight = target.rpartition(".")
+        if not container or weight not in {"w1", "w2", "w3"}:
+            raise ValueError(f"shared adapter supports Arctic expert target_parameters only, got {target!r}")
+        targets.setdefault(container, set()).add(weight)
+    hf_targets, ranks, alphas = set(), {}, {}
+    for container, weights in targets.items():
+        layouts = [
+            _expert_layout(module)
+            for name, module in model.named_modules()
+            if name == container or name.endswith(f".{container}")
+        ]
+        if not layouts or any(layout is None or layout is not layouts[0] for layout in layouts):
+            raise ValueError(f"shared adapter found no Hugging Face expert stacks for target_parameters {container}")
+        for parameter, held in layouts[0].items():
+            if not weights.intersection(held):
+                continue
+            if not weights.issuperset(held):
+                raise ValueError(
+                    f"shared adapter needs {sorted(held)} targeted together: Hugging Face fuses them into {parameter}"
+                )
+            hf_targets.add(f"{container}.{parameter}")
+            if len(held) > 1:
+                ranks[rf".*\.{re.escape(parameter)}"] = topology["r"] * len(held)
+                alphas[rf".*\.{re.escape(parameter)}"] = topology["lora_alpha"] * len(held)
+        if weights - {weight for layout in layouts[0].values() for weight in layout}:
+            raise ValueError(f"shared adapter cannot map {container} weights {sorted(weights)} to Hugging Face")
+    return sorted(hf_targets), ranks, alphas
+
+
+def _expert_parameter_records(model) -> list[dict]:
+    """Which Hugging Face expert parameter each generated ParamWrapper's factors adapt, and its fused layout."""
+    from peft.tuners.lora.layer import ParamWrapper
+
+    records = []
+    for name, module in model.named_modules():
+        if not isinstance(module, ParamWrapper):
+            continue
+        prefix = canonical_name(f"{name}.lora_A.default.weight").removesuffix(".lora_A.weight")
+        container = prefix
+        while container.endswith(".base_layer"):
+            container = container.removesuffix(".base_layer")
+        layout = _expert_layout(module.get_base_layer())
+        if layout is None or module.parameter_name not in layout or getattr(module, "num_experts", 1) <= 1:
+            raise ValueError(f"shared adapter target parameter {name}.{module.parameter_name} is not an expert stack")
+        records.append(
+            {
+                "name": prefix,
+                "module": container,
+                "parameter": module.parameter_name,
+                "projections": list(layout[module.parameter_name]),
+                "experts": int(module.num_experts),
+                "rank": int(module.r["default"]),
+                "lora_alpha": int(module.lora_alpha["default"]),
+            }
+        )
+    return sorted(records, key=lambda record: record["name"])
 
 
 def _tensor_identity(state: dict) -> list[dict]:
@@ -538,7 +651,9 @@ def _read_adapter(path: str | Path, peft_config: dict | None = None) -> tuple[di
     config_bytes = (root / "adapter_config.json").read_bytes()
     tensor_bytes = (root / "adapter_model.safetensors").read_bytes()
     topology = _topology(json.loads(config_bytes))
-    if peft_config is not None and topology != _topology(peft_config):
+    recipe_path = root / "correctness_recipe.json"
+    generation = json.loads(recipe_path.read_bytes()) if recipe_path.exists() else None
+    if peft_config is not None and training_topology(topology, generation) != _topology(peft_config):
         raise ValueError("shared adapter topology differs from the training configuration")
     state = load(tensor_bytes)
     identity = {
@@ -548,10 +663,16 @@ def _read_adapter(path: str | Path, peft_config: dict | None = None) -> tuple[di
         "adapter_model_sha256": hashlib.sha256(tensor_bytes).hexdigest(),
         "tensors": _tensor_identity(state),
     }
-    recipe_path = root / "correctness_recipe.json"
-    if recipe_path.exists():
-        identity["generation"] = json.loads(recipe_path.read_bytes())
+    if generation is not None:
+        identity["generation"] = generation
     return state, identity
+
+
+def training_topology(topology: dict, generation: dict | None) -> dict:
+    """The topology the target trains: the pack's own, unless the pack holds Arctic expert LoRAs in HF parameters."""
+    if isinstance(generation, dict) and "training_peft_config" in generation:
+        return generation["training_peft_config"]
+    return topology
 
 
 def shared_adapter_identity(path: str | Path, peft_config: dict | None = None) -> dict:
@@ -595,7 +716,16 @@ def generate_adapter(
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(seed)
         with torch.device("meta"):
-            model = peft.get_peft_model(model_class(model_config).to(dtype=torch.float32), peft.LoraConfig(**config))
+            base = model_class(model_config).to(dtype=torch.float32)
+            if topology["target_parameters"]:
+                # Arctic's expert weights, by the Hugging Face parameters that hold them (see _hf_expert_targets).
+                hf_targets, ranks, alphas = _hf_expert_targets(base, topology)
+                config.update(
+                    target_parameters=hf_targets,
+                    rank_pattern={**topology.get("rank_pattern", {}), **ranks},
+                    alpha_pattern={**topology.get("alpha_pattern", {}), **alphas},
+                )
+            model = peft.get_peft_model(base, peft.LoraConfig(**config))
         factors = []
         for module in model.modules():
             if isinstance(module, peft.tuners.lora.layer.LoraLayer):
@@ -615,6 +745,8 @@ def generate_adapter(
     serialized["base_model_name_or_path"] = ""
     if isinstance(serialized.get("target_modules"), list):
         serialized["target_modules"] = sorted(serialized["target_modules"])
+    if isinstance(serialized.get("target_parameters"), list):
+        serialized["target_parameters"] = sorted(serialized["target_parameters"])
     config_path.write_text(json.dumps(serialized, sort_keys=True, indent=2) + "\n")
     recipe = {
         "schema": "upstream-default-lora-v1",
@@ -628,6 +760,13 @@ def generate_adapter(
             "safetensors": safetensors.__version__,
         },
     }
+    if topology["target_parameters"]:
+        # The pack holds the HF parameters' factors; the target trains the recipe's Arctic expert weights.
+        recipe.update(
+            peft_config=_topology(serialized),
+            training_peft_config=topology,
+            expert_parameters=_expert_parameter_records(model),
+        )
     (root / "correctness_recipe.json").write_text(json.dumps(recipe, sort_keys=True, indent=2) + "\n")
     shared_adapter_identity(root, peft_config)
     return root
@@ -727,8 +866,60 @@ def shared_initialize_adapter(model, path: str | Path, expected_identity: dict) 
         raise ValueError(f"shared adapter load returned unexpected keys: {result.unexpected_keys}")
     if _tensor_identity(get_peft_model_state_dict(model, adapter_name="default")) != expected:
         raise ValueError("shared adapter target tensors differ after loading")
+    constrain_fused_expert_factors(model, identity.get("generation"))
     if shared_adapter_identity(path) != expected_identity:
         raise ValueError("shared adapter changed during loading")
+
+
+def _block_diagonal_mask(record: dict, shape):
+    """Ones on a fused lora_B's per-weight blocks, ``[out, rank, experts]`` in PEFT's ParamWrapper layout."""
+    import torch
+
+    blocks, experts, rank = len(record["projections"]), record["experts"], record["rank"]
+    out = shape[0]
+    if shape[1] != rank * experts or out % blocks or rank % blocks:
+        raise ValueError(f"fused expert factor {record['name']} has an unexpected lora_B shape {tuple(shape)}")
+    mask = torch.zeros(out, rank, experts)
+    for block in range(blocks):
+        rows, ranks = slice(block * out // blocks, (block + 1) * out // blocks), slice(
+            block * rank // blocks, (block + 1) * rank // blocks
+        )
+        mask[rows, ranks] = 1
+    return mask.reshape(shape)
+
+
+def constrain_fused_expert_factors(model, generation: dict | None) -> int:
+    """Train a fused expert parameter's LoRA as the per-weight LoRAs the target trains.
+
+    The target trains one rank-``r`` LoRA per Arctic expert weight (w1 and w3 apart). Hugging Face's fused
+    ``gate_up_proj`` takes one rank-``2r`` LoRA whose ``lora_B`` is block-diagonal for those two: equal at the shared
+    initialization (B is zero), but its off-diagonal blocks get gradients the target's factors do not have. Masking
+    them keeps them at zero through AdamW, so the reference's fused factors stay exactly the target's two.
+    """
+    from peft.tuners.lora.layer import ParamWrapper
+
+    records = {
+        record["name"]: record
+        for record in (generation or {}).get("expert_parameters", [])
+        if len(record["projections"]) > 1
+    }
+    constrained = set()
+    for name, module in model.named_modules():
+        if not isinstance(module, ParamWrapper):
+            continue
+        prefix = canonical_name(f"{name}.lora_A.default.weight").removesuffix(".lora_A.weight")
+        record = records.get(prefix)
+        if record is None:
+            continue
+        weight = module.lora_B["default"].weight
+        mask = _block_diagonal_mask(record, weight.shape).to(device=weight.device, dtype=weight.dtype)
+        if bool((weight.detach() * (1 - mask)).count_nonzero()):
+            raise ValueError(f"fused expert factor {prefix} is not block-diagonal")
+        weight.register_hook(lambda grad, mask=mask: grad * mask.to(device=grad.device, dtype=grad.dtype))
+        constrained.add(prefix)
+    if constrained != set(records):
+        raise ValueError(f"fused expert factors not found in the model: {sorted(set(records) - constrained)}")
+    return len(constrained)
 
 
 @contextlib.contextmanager
@@ -801,6 +992,75 @@ def _adapter_parameters(model) -> dict:
     return parameters
 
 
+def native_expert_factors(model, state: dict, records: list[dict]) -> dict:
+    """The pack's expert factors as the target's per-weight ones, for the experts this rank holds.
+
+    The pack holds each Hugging Face expert parameter's factors in PEFT's ParamWrapper layout: lora_A ``[E * r, in]``
+    (expert-major rows), lora_B ``[out, r * E]`` (rank-major columns); a fused parameter's blocks follow
+    ``projections``. The target's ParamWrapper on Arctic's ``w1``/``w2``/``w3`` takes block ``b`` of that parameter,
+    and under expert parallelism the contiguous experts its EP rank holds (``Shard(0)``), in the same layout.
+    """
+    import torch.distributed as dist
+    from peft.tuners.lora.layer import ParamWrapper
+
+    by_module = {}
+    for record in records:
+        by_module.setdefault(record["module"], []).append(record)
+    pack_names = {f"{record['name']}.{factor}.weight" for record in records for factor in ("lora_A", "lora_B")}
+    if not pack_names <= set(state):
+        raise ValueError("shared adapter is missing recorded expert factors")
+    result = {name: tensor for name, tensor in state.items() if name not in pack_names}
+    consumed = set()
+    for name, module in model.named_modules():
+        if not isinstance(module, ParamWrapper):
+            continue
+        prefix = canonical_name(f"{name}.lora_A.default.weight").removesuffix(".lora_A.weight")
+        container = prefix
+        while container.endswith(".base_layer"):
+            container = container.removesuffix(".base_layer")
+        weight = module.parameter_name
+        matches = [record for record in by_module.get(container, []) if weight in record["projections"]]
+        if len(matches) != 1:
+            raise ValueError(f"shared adapter holds no Hugging Face expert factors for {container}.{weight}")
+        record = matches[0]
+        blocks, block = len(record["projections"]), record["projections"].index(weight)
+        experts, rank = record["experts"], record["rank"] // blocks
+        if (
+            record["rank"] % blocks
+            or module.r["default"] != rank
+            or record["lora_alpha"] != module.lora_alpha["default"] * blocks
+        ):
+            raise ValueError(f"{prefix}: target expert LoRA rank or alpha differs from the shared adapter")
+        lora_a, lora_b = state[f"{record['name']}.lora_A.weight"], state[f"{record['name']}.lora_B.weight"]
+        if bool((lora_b * (1 - _block_diagonal_mask(record, lora_b.shape))).count_nonzero()):
+            raise ValueError(f"shared adapter factor {record['name']} is not block-diagonal")
+        rows = lora_b.shape[0] // blocks
+        weight_a = lora_a.reshape(experts, record["rank"], -1)[:, block * rank : (block + 1) * rank]
+        weight_b = lora_b.reshape(lora_b.shape[0], record["rank"], experts)[
+            block * rows : (block + 1) * rows, block * rank : (block + 1) * rank
+        ]
+        target = module.lora_A["default"].weight
+        local = target.shape[0] // rank
+        if local != experts:
+            if hasattr(target, "_arl_expert_slot"):
+                raise ValueError(f"{prefix}: shared adapter does not place experts by slot")
+            from arctic_platform.model.implementations.moe.distributed.expert_parallel import get_ep_group
+
+            group = get_ep_group(module.get_base_layer())
+            if dist.get_world_size(group=group) * local != experts:
+                raise ValueError(f"{prefix}: expert-parallel shard of {local} experts does not tile {experts}")
+            start = dist.get_rank(group=group) * local
+            weight_a, weight_b = weight_a[start : start + local], weight_b[:, :, start : start + local]
+        if f"{prefix}.lora_A.weight" in result or (record["name"], weight) in consumed:
+            raise ValueError(f"{prefix}: target expert LoRA factors collide")
+        result[f"{prefix}.lora_A.weight"] = weight_a.reshape(local * rank, -1).contiguous()
+        result[f"{prefix}.lora_B.weight"] = weight_b.reshape(rows, rank * local).contiguous()
+        consumed.add((record["name"], weight))
+    if consumed != {(record["name"], projection) for record in records for projection in record["projections"]}:
+        raise ValueError("shared adapter expert factors do not cover the target's expert weights")
+    return result
+
+
 def initialize_native_adapter(model, path: str | Path, expected_identity: dict) -> None:
     """Transactionally copy exact native factors before optimizer construction."""
     import torch
@@ -809,19 +1069,25 @@ def initialize_native_adapter(model, path: str | Path, expected_identity: dict) 
     if identity != expected_identity:
         raise ValueError("shared adapter changed after reference admission")
     configs = getattr(model, "peft_config", {})
-    if set(configs) != {"default"} or _topology(configs["default"].to_dict()) != identity["peft_config"]:
+    if set(configs) != {"default"} or _topology(configs["default"].to_dict()) != training_topology(
+        identity["peft_config"], identity.get("generation")
+    ):
         raise ValueError("target PEFT topology differs from the shared adapter")
     # Checkpoint wrappers strip state-dict paths but retain registered parameter paths.
     current = _adapter_parameters(model)
     before = _tensor_identity(current)
-    expected = identity["tensors"]
+    admitted = {canonical_name(name): tensor for name, tensor in state.items()}
+    if "expert_parameters" in (identity.get("generation") or {}):
+        admitted = native_expert_factors(model, admitted, identity["generation"]["expert_parameters"])
+        expected = _tensor_identity(admitted)
+    else:
+        expected = identity["tensors"]
     if [{key: entry[key] for key in ("name", "shape", "dtype")} for entry in before] != [
         {key: entry[key] for key in ("name", "shape", "dtype")} for entry in expected
     ]:
         raise ValueError("shared adapter target tensor coverage, shapes or dtypes differ")
     if shared_adapter_identity(path) != expected_identity:
         raise ValueError("shared adapter changed before loading")
-    admitted = {canonical_name(name): tensor for name, tensor in state.items()}
     originals = {name: parameter.detach().clone() for name, parameter in current.items()}
     try:
         with torch.no_grad():
@@ -978,7 +1244,10 @@ def _verify_shared_identity(identity: dict) -> None:
         not isinstance(identity, dict)
         or identity.get("schema") != "shared-peft-adapter-v1"
         or not isinstance(generation, dict)
-        or set(generation) != {"schema", "seed", "initializer", "peft_config", "dependencies"}
+        or set(generation) - {"training_peft_config", "expert_parameters"}
+        != {"schema", "seed", "initializer", "peft_config", "dependencies"}
+        or ("training_peft_config" in generation) != ("expert_parameters" in generation)
+        or ("expert_parameters" in generation and not isinstance(generation["expert_parameters"], list))
         or generation["schema"] != "upstream-default-lora-v1"
         or type(generation["seed"]) is not int
         or generation["seed"] < 0

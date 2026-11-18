@@ -85,6 +85,11 @@ _SHARED_EXPERT = re.compile(
     r"^(?P<layer>(?:.*\.)?layers\.\d+)\.(?:mlp\.)?(?:qwen_)?shared_expert\.(?P<weight>w[123])\.weight$"
 )
 _BARE_SHARED_EXPERT = re.compile(r"^(?P<layer>(?:.*\.)?layers\.\d+)\.mlp\.shared_expert\.(?P<weight>w[123])$")
+# PEFT target_parameters LoRA on a routed-experts container: one ParamWrapper per targeted parameter, nested in the
+# container's parameter registration order, so the first one is the innermost (the most ``base_layer`` segments).
+_EXPERT_LORA = re.compile(
+    r"^(?P<prefix>.*\.experts)(?P<nest>(?:\.base_layer)*)\.(?P<factor>lora_[AB])\.default\.weight$"
+)
 _SHARED_NAMES = {
     "w1": "gate_proj.weight",
     "w2": "down_proj.weight",
@@ -96,6 +101,30 @@ _SHARED_NAMES = {
 class _Entry:
     originals: List[str]
     value: float
+
+
+def _gated_expert_lora(keys: Iterable[str]) -> Dict[str, Tuple[str, ...]]:
+    """Hugging Face names for the LoRA factors Arctic puts on a gated routed-experts container.
+
+    Arctic's GroupedExperts register w1, w2, w3, so their LoRAs nest as w1 (two ``base_layer`` segments), w2 (one), w3
+    (none). Hugging Face fuses w1 and w3 into ``gate_up_proj``, registered before ``down_proj``: its LoRA is the
+    container's ``base_layer`` one, the block-diagonal pair of w1's and w3's (harness/lora.py
+    ``constrain_fused_expert_factors``), and down_proj's is the outer one. A non-gated container (w1, w2: Hugging Face
+    up_proj, down_proj) nests the same on both sides and keeps its names.
+    """
+    depths: Dict[Tuple[str, str], Dict[int, str]] = {}
+    for key in keys:
+        match = _EXPERT_LORA.match(key)
+        if match:
+            depth = match.group("nest").count(".base_layer")
+            depths.setdefault((match.group("prefix"), match.group("factor")), {})[depth] = key
+    mapping = {}
+    for (prefix, factor), by_depth in depths.items():
+        if set(by_depth) != {0, 1, 2}:
+            continue
+        mapping[f"{prefix}.base_layer.{factor}.default.weight"] = (by_depth[2], by_depth[0])
+        mapping[f"{prefix}.{factor}.default.weight"] = (by_depth[1],)
+    return mapping
 
 
 def normalize(name: str) -> str:
@@ -138,6 +167,12 @@ def _canonical_ap(values: Dict[str, float]) -> Dict[str, _Entry]:
     source = _normalized(values)
     canonical: Dict[str, _Entry] = {}
     routed: Dict[str, Dict[str, _Entry]] = {}
+    for key, pieces in _gated_expert_lora(source).items():
+        entries = [source.pop(piece) for piece in pieces]
+        canonical[key] = _Entry(
+            [original for entry in entries for original in entry.originals],
+            math.sqrt(math.fsum(entry.value**2 for entry in entries)),
+        )
 
     for key, entry in source.items():
         match = _ROUTED_EXPERT.match(key)
@@ -183,15 +218,30 @@ class CanonicalTensorGroup:
 
     originals: Tuple[str, ...]
     concatenate_dim: Optional[int] = None
+    # A fused expert parameter's lora_B: the pieces are its diagonal blocks, zero elsewhere.
+    block_diagonal: bool = False
 
 
 def canonical_ap_tensor_groups(names: Iterable[str]) -> Dict[str, CanonicalTensorGroup]:
     """Group Arctic Platform tensor names by their Hugging Face parameter representation."""
     canonical: Dict[str, CanonicalTensorGroup] = {}
     routed: Dict[str, Dict[str, str]] = {}
+    names = list(names)
+    fused = _gated_expert_lora(normalize(name) for name in names)
+    claimed = {piece for pieces in fused.values() for piece in pieces}
+    for key, pieces in fused.items():
+        if len(pieces) == 1:
+            canonical[key] = CanonicalTensorGroup(pieces)
+        elif ".lora_A." in key:
+            # lora_A stacks the two weights' rank rows: [E * 2r, in].
+            canonical[key] = CanonicalTensorGroup(pieces, concatenate_dim=0)
+        else:
+            canonical[key] = CanonicalTensorGroup(pieces, block_diagonal=True)
 
     for original in names:
         key = normalize(original)
+        if key in claimed:
+            continue
         match = _ROUTED_EXPERT.match(key)
         if match:
             weight = match.group("weight")
@@ -483,7 +533,7 @@ def _optimizer_capture_worker_class() -> Any:
 
             return self._optimizer_collective_check(merge)
 
-        def _globalize_expert_optimizer_tensor(self, param: Any, tensor: torch.Tensor) -> torch.Tensor:
+        def _globalize_expert_optimizer_tensor(self, name: str, param: Any, tensor: torch.Tensor) -> torch.Tensor:
             group_name = getattr(param, "group_name", None)
             if group_name is None or getattr(param, "allreduce", True) is not False or tensor.dim() < 2:
                 return tensor
@@ -494,7 +544,7 @@ def _optimizer_capture_worker_class() -> Any:
             ep_group = ds_groups._get_expert_parallel_group(group_name)
             shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_group))]
             dist.all_gather(shards, local, group=ep_group)
-            return torch.cat(shards, dim=0)
+            return torch.cat(shards, dim=expert_shard_dim(name))
 
         def _optimizer_step_values(self) -> list[int]:
             values: set[int] = set()
@@ -574,7 +624,7 @@ def _optimizer_capture_worker_class() -> Any:
                         raise RuntimeError(f"optimizer-state capture found no FP32 master for {name}")
 
                 self._optimizer_collective_check(validate_master)
-                full_parameter = self._globalize_expert_optimizer_tensor(param, full_parameter)
+                full_parameter = self._globalize_expert_optimizer_tensor(name, param, full_parameter)
                 gradient = (
                     accumulated_gradients.get(id(param))
                     if accumulated_gradients is not None
@@ -594,7 +644,7 @@ def _optimizer_capture_worker_class() -> Any:
 
                 self._optimizer_collective_check(validate_gradient)
                 if gradient is not None:
-                    gradient = self._globalize_expert_optimizer_tensor(param, gradient)
+                    gradient = self._globalize_expert_optimizer_tensor(name, param, gradient)
                 exp_avg, exp_avg_sq = self._full_adam_moments(param)
 
                 def validate_moments():
@@ -603,8 +653,8 @@ def _optimizer_capture_worker_class() -> Any:
 
                 self._optimizer_collective_check(validate_moments)
                 if exp_avg is not None:
-                    exp_avg = self._globalize_expert_optimizer_tensor(param, exp_avg)
-                    exp_avg_sq = self._globalize_expert_optimizer_tensor(param, exp_avg_sq)
+                    exp_avg = self._globalize_expert_optimizer_tensor(name, param, exp_avg)
+                    exp_avg_sq = self._globalize_expert_optimizer_tensor(name, param, exp_avg_sq)
 
                 def save_before():
                     torch.save(
@@ -675,11 +725,11 @@ def _optimizer_capture_worker_class() -> Any:
                         raise RuntimeError(f"active optimizer parameter {name} has no post-step Adam moments")
 
                 self._optimizer_collective_check(validate_moments)
-                full_parameter = self._globalize_expert_optimizer_tensor(param, full_parameter)
+                full_parameter = self._globalize_expert_optimizer_tensor(name, param, full_parameter)
                 if exp_avg is not None:
-                    exp_avg = self._globalize_expert_optimizer_tensor(param, exp_avg)
+                    exp_avg = self._globalize_expert_optimizer_tensor(name, param, exp_avg)
                 if exp_avg_sq is not None:
-                    exp_avg_sq = self._globalize_expert_optimizer_tensor(param, exp_avg_sq)
+                    exp_avg_sq = self._globalize_expert_optimizer_tensor(name, param, exp_avg_sq)
 
                 def save_after():
                     before = torch.load(before_dir / f"{index:06d}.pt", map_location="cpu", weights_only=True)
@@ -1128,6 +1178,15 @@ def expert_parallel_width(parameter) -> int:
     return torch.distributed.get_world_size(group=groups._get_expert_parallel_group(group_name))
 
 
+def expert_shard_dim(name: str) -> int:
+    """The axis expert parallelism splits a parameter on.
+
+    An expert stack and an expert lora_A (``[E * r, in]``) hold their experts along dim 0; an expert lora_B
+    (``[out, r * E]``, PEFT's ParamWrapper layout) holds them along its columns.
+    """
+    return -1 if ".lora_B." in name else 0
+
+
 PARTICIPATION_SCHEMA = "trainable-parameter-participation-v1"
 # The image modules of the composite checkpoints the catalog trains on text, named as children of the base model:
 # Qwen's ``visual``, Gemma 3's ``vision_tower`` and ``multi_modal_projector``, Gemma 4's ``vision_tower`` and
@@ -1208,7 +1267,11 @@ def canonical_participation(record: dict, *, backend: str) -> dict:
         if len({entry["state"] for entry in pieces}) != 1:
             raise ValueError(f"participation disagreement within fused parameter {name}")
         shape = list(pieces[0]["shape"])
-        if group and group.concatenate_dim is not None:
+        if group and group.block_diagonal:
+            if any(len(entry["shape"]) != 2 for entry in pieces):
+                raise ValueError(f"participation fused shape mismatch for {name}")
+            shape = [sum(entry["shape"][dimension] for entry in pieces) for dimension in (0, 1)]
+        elif group and group.concatenate_dim is not None:
             dimension = group.concatenate_dim
             if any(
                 len(entry["shape"]) != len(shape)
@@ -1340,7 +1403,7 @@ def merge_rank_participation(before: list[dict], after: list[dict], shapes: dict
         if len(routes[name]) > 1:
             if not global_shape:
                 raise ValueError("expert participation requires a nonscalar parameter")
-            global_shape[0] *= len(routes[name])
+            global_shape[expert_shard_dim(name)] *= len(routes[name])
         if any(entry["state"] == "active" for entry in observed):
             entries[name] = {"shape": global_shape, "state": "active", "evidence": None}
             continue
@@ -3308,7 +3371,7 @@ def _snapshot(
             if groups[0][index].get("moe"):
                 for name in shape_group:
                     actual = _parameter(snapshot, index, name, "fp32_master")
-                    expected = torch.cat([shard[name] for shard in experts], dim=0)
+                    expected = torch.cat([shard[name] for shard in experts], dim=expert_shard_dim(name))
                     if not torch.equal(actual, expected):
                         raise ValueError("expert optimizer master/sidefile ownership mismatch")
         if _native_input_hashes(root) != input_hashes:
@@ -3343,7 +3406,7 @@ def _parameter(snapshot: _Snapshot, group_index: int, name: str, key: str) -> to
         if offset != result.numel():
             raise ValueError(f"incomplete reconstruction for {name}::{key}")
         values.append(result.reshape(shape))
-    return values[0] if len(values) == 1 else torch.cat(values, dim=0)
+    return values[0] if len(values) == 1 else torch.cat(values, dim=expert_shard_dim(name))
 
 
 def decode_optimizer_capture(
