@@ -3,12 +3,13 @@
 
 """Warn when returned routed experts differ from the routes a request computed.
 
-vLLM 0.32 returns a request's routed experts from its auxiliary-output store
-for every keyed block below the step's end, including blocks the request just
-recomputed because its KV prefix hit stopped short of them. The store keeps the
-first payload published for a key, so those positions return an earlier
+vLLM returns a request's routed experts from its auxiliary-output store for
+every keyed block below the step's end, including blocks the request recomputed
+because its KV prefix hit stopped short of them, e.g. when EAGLE-style
+speculative decoding drops the newest prefix block. A store entry that is still
+referenced keeps its first payload, so those positions can return another
 request's routes. This logs, once per request, how many recomputed positions
-came back with routes other than the ones this request computed. Outputs are
+came back with routes other than the ones the request computed. Outputs are
 unchanged.
 """
 

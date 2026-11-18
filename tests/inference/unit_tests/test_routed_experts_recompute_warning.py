@@ -1,4 +1,4 @@
-"""The real vLLM 0.32 routed-experts worker connector on CPU; only the GPU capture snapshot is stubbed."""
+"""The real vLLM routed-experts worker connector on CPU; only the GPU capture snapshot is stubbed."""
 
 import logging
 from threading import Lock
@@ -60,9 +60,9 @@ def connector(caplog):
     connector._pending_outputs = []
     connector._lock = Lock()
     connector._max_concurrent_batches = 1
-    # An earlier request stores routes 1 for blocks a, b and c.
+    # An earlier request stores routes 1 for blocks a, b and c. It stays live, so its keys stay
+    # referenced, as they also do while vLLM keeps a finished request's KV blocks cached.
     step(connector, "earlier", 0, np.full(12, 1), block_hashes("a", "b", "c"))
-    connector.begin_step(AuxOutputConnectorMetadata(0, {}, {}, ("earlier",)))
     caplog.set_level(logging.WARNING, logger=routed_experts_recompute_warning.__name__)
     yield connector
     connector.close()
