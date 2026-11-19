@@ -220,6 +220,7 @@ PLUGIN = ModelPlugin(
 | Routing | `routed_experts` and `routing` map a decoder layer index to `[T_local, top_k]` expert ids for each expert layer. |
 | No distributed code | The model MUST NOT call `torch.distributed`. Use the collectives the API provides. |
 | Structure from config | Layer count and layer kinds MUST come from the config, so one plugin serves every size of the family. |
+| Recomputable layers | Each decoder layer MUST give the same result when it is run again in backward (§7.8). |
 
 ### 7.3 Sequence-mixing layers and mixers
 
@@ -342,16 +343,40 @@ them so both compute the same function. Your router MUST:
 On the sampler, routing is captured automatically when your vLLM model routes through vLLM's `RoutedExperts`
 layer. A custom vLLM router MUST feed vLLM's routed-experts capture, or the manifest MUST declare `router_replay = false`.
 
-### 7.8 Weights and checkpoints
+### 7.8 Activation checkpointing
 
-The canonical on-disk format is a Hugging Face directory: `config.json`, with your `model_type` and architecture,
-plus `model.safetensors` under Hugging Face names. Users bring weights in this format and receive checkpoints in it.
+To fit long sequences, the platform checkpoints every decoder layer (`model.model.layers[i]`): it keeps only the
+layer's inputs and runs the layer again during backward. Your layers therefore run twice per step.
 
-- `convert_layer_to_hf(state, layer_idx, config)` receives one decoder layer's full tensors under trainer names and returns them under checkpoint names. It MAY rename, split, stack and reshape. `convert_layer_to_prime` is its exact inverse.
-- The platform gathers ZeRO and expert shards before calling your converter, so converters always see full tensors.
+- A layer's forward MUST be a function of its inputs and weights. Recompute reruns the sequence and expert collectives, which is supported.
+- Side effects, such as counting tokens per expert or updating running statistics, MUST run only on the first pass: guard them with `if not in_recompute()`.
+- Randomness, such as dropout, MUST draw the same values on recompute. PyTorch's checkpoint restores the RNG state for you.
+
+The `activation_checkpointing` conformance tier compares outputs, gradients **and buffers** with and without
+checkpointing, so a side effect that runs twice fails it.
+
+### 7.9 Weights and checkpoints
+
+The canonical on-disk format is a Hugging Face directory. Users bring weights in this format and receive checkpoints
+in it.
+
+| File | Requirement |
+|---|---|
+| `config.json` | `model_type` in the manifest's `hf_model_types`; `architectures[0]` equal to `sampler.vllm_architecture`; loads with your `config_class.from_pretrained`. |
+| `model.safetensors`, or `model-0000k-of-0000n.safetensors` plus `model.safetensors.index.json` | Tensors under Hugging Face names. Large models MUST be sharded; the index maps every tensor to its file. |
+| `tokenizer.json`, `tokenizer_config.json`, special-token files | MUST load with `AutoTokenizer.from_pretrained(path, trust_remote_code=False)`, define an EOS token, and have no more tokens than the model's vocabulary. A chat model SHOULD carry its `chat_template`; the sampler and chat endpoints use it. |
+| `generation_config.json` | Optional default sampling settings. |
+
+Conversion and loading:
+
+- `convert_layer_to_hf(state, layer_idx, config)` receives one decoder layer's full tensors under trainer names and returns them under checkpoint names. It MAY rename, split, stack and reshape. `convert_layer_to_prime` is its exact inverse. Both receive the config, because reshaping often needs head counts the tensors don't carry.
+- The platform loads a checkpoint **one decoder layer at a time**, reading only that layer's tensors from disk, so converters see one layer and peak extra memory is one layer. Every trainer tensor MUST be set and no checkpoint tensor may be left over.
+- The platform gathers ZeRO and expert shards before calling your converter on export, so converters always see full tensors.
+- Checkpoints the platform writes carry a **plugin stamp** in their safetensors metadata (`arctic_plugin`, `arctic_plugin_version`, `arctic_plugin_contract`). A checkpoint stamped by a different plugin is refused at load. A different version of the same plugin loads and is logged.
+- **Dtypes.** Store weights in the dtype you want served, usually bf16. The trainer computes in the job's dtype and keeps fp32 master weights in the optimizer. Parameters that must stay fp32, such as norms or gates you rely on for parity, are cast by your model code, not by the checkpoint.
 - Mark trainer-only state, such as statistics or optimizer helpers the sampler never reads, with `skip_weight_sync(module_or_parameter)`. It stays in checkpoints and is left out of the weight sync. Mark a module rather than a buffer: moving a model between devices replaces buffer objects.
 
-### 7.9 RL step and weight sync
+### 7.10 RL step and weight sync
 
 ```mermaid
 sequenceDiagram
@@ -375,7 +400,7 @@ tensors one at a time, write them into its tensor-parallel shards through each p
 the names of the parameters it wrote. We recommend a pure function mapping a Hugging Face name to its vLLM
 destination, as in `sampler_names.py`, which CPU tests can check against the trainer's stream.
 
-### 7.10 The sampler (vLLM) model
+### 7.11 The sampler (vLLM) model
 
 | Requirement | Detail |
 |---|---|
@@ -409,9 +434,10 @@ Every job is checked before GPUs are allocated. All failing reasons are reported
 
 ```mermaid
 flowchart LR
-    S["static"] --> R["reference parity"] --> K["packing"] --> W["checkpoint and sync"] --> L["RL step"] --> Q["router replay"]
-    Q --> P["SP · EP · SP+EP<br/>(gloo ranks)"]
-    P --> G1["sampler log-prob parity<br/>(GPU, vLLM)"] --> G2["real-weights step<br/>(GPU)"]
+    S["static"] --> R["reference parity"] --> K["packing"] --> A["activation<br/>checkpointing"] --> W["checkpoint and sync"]
+    W --> L["RL step"] --> Q["router replay"] --> P["SP · EP · SP+EP<br/>(gloo ranks)"]
+    P --> D["weights directory<br/>(real weights, meta device)"]
+    D --> G1["sampler log-prob parity<br/>(GPU, vLLM)"] --> G2["real-weights step<br/>(GPU)"]
     classDef gpu stroke-dasharray: 4 3
     class G1,G2 gpu
 ```
@@ -427,10 +453,12 @@ python -m arctic_platform.model_plugin.conformance --plugin your_model:PLUGIN --
 | static | The manifest is on contract, mixers resolve, and the fixture model binds to its config | Undeclared layer types, missing mixers, modules the config does not account for |
 | reference parity | Model logits on each unpacked row equal `reference_forward` within `reference` | Wrong math |
 | packing | Packed rows give the same logits **and gradients** as each row run alone | State leaking across row boundaries |
-| checkpoint and sync | Save → reload reproduces logits exactly; the sampler stream equals the checkpoint minus skipped tensors | Lossy or asymmetric converters, missing tensors |
+| activation checkpointing | With every decoder layer checkpointed, logits, gradients and buffers are unchanged | Side effects that run twice, non-recomputable layers |
+| checkpoint and sync | Single-file and sharded save → reload reproduce logits exactly; the checkpoint carries this plugin's stamp; the sampler stream equals the checkpoint minus skipped tensors | Lossy or asymmetric converters, broken sharding, missing tensors |
 | RL step | A GRPO step (the platform's `grpo_loss`) on packed rows equals the same step on padded rows, for loss and every gradient | Masking and packing bugs in the training path |
 | router replay | Replaying captured routing reproduces logits exactly; all-`ROUTER_REPLAY_FRESH` does too; forcing other experts changes the output | A router that ignores replay |
-| SP, EP, SP+EP | On 2+ gloo ranks, sharded logits and every gradient equal the unsharded model's | Wrong head slicing, global vs local boundaries, wrong expert offsets, missing gradient paths |
+| SP, EP, SP+EP | On 2+ gloo ranks, sharded logits and every gradient equal the unsharded model's. Under EP, the exported weight stream equals the unsharded model's. SP+EP runs with activation checkpointing on. | Wrong head slicing, global vs local boundaries, wrong expert offsets, missing gradient paths, expert shards exported out of order, collectives that break under recompute |
+| weights directory (`--weights`) | Your real weights directory has a matching config, every tensor with the model's name and shape (checked on the meta device, so no GPU or full load), and a tokenizer that loads without remote code | Truncated or mismatched checkpoints, missing index shards, tokenizer problems |
 | sampler log-prob parity (GPU) | After a weight sync, sampler log-probs match trainer log-probs within the calibrated tolerance | Wrong vLLM name map, fused-shard order, sampler numerics |
 | real-weights step (GPU) | One training step on your real weights and declared profile, save, and reload | Memory and scale issues the tiny fixture hides |
 
@@ -462,7 +490,34 @@ A failing tier prints its name and the first mismatch, for example
 
 ---
 
-## 10. Runtime constraints
+## 10. Testing locally
+
+Everything before the GPU tiers runs on a laptop with only `arctic_platform`, PyTorch, transformers and safetensors
+installed. Sequence and expert parallelism run as separate CPU processes over gloo.
+
+```mermaid
+flowchart LR
+    A["Write plugin<br/>+ tiny fixture"] --> B["CPU tiers<br/>conformance --spec"]
+    B --> C["Your real weights<br/>conformance --weights DIR"]
+    C --> D["Submit wheel + weights"]
+    D --> E["Service: GPU tiers<br/>sampler parity, real-weights step"]
+    B -.->|fix| A
+    C -.->|fix| A
+```
+
+| Step | Command | Needs |
+|---|---|---|
+| 1. Contract and math on a tiny model | `python -m arctic_platform.model_plugin.conformance --plugin your_model:PLUGIN --spec conformance.toml` | CPU only; under a minute for a tiny fixture |
+| 2. Your real weights, structurally | the same command with `--weights /path/to/hf_dir` | CPU only: tensor shapes are read from safetensors headers and checked on the meta device, so a 100B+ checkpoint needs no GPU and is not loaded into memory |
+| 3. Unit tests for your own code | `pytest` against your package, for example converters and the `sampler_names` mapping (the repository's `tests/model_plugin` shows how) | CPU only |
+| 4. Sampler and scale | submit; the service runs the GPU tiers and reports them like the CPU tiers | Service GPUs |
+
+We recommend a pure Hugging Face-name → vLLM-parameter function, as in the example's `sampler_names.py`, so step 3
+can prove every tensor the trainer streams has exactly one destination before any GPU is involved.
+
+---
+
+## 11. Runtime constraints
 
 | Rule | Why |
 |---|---|
@@ -474,7 +529,7 @@ A failing tier prints its name and the first mismatch, for example
 
 ---
 
-## 11. Versioning and support
+## 12. Versioning and support
 
 - **Contract.** The platform supports plugins whose `contract` has its major version. Minor versions add optional fields and hooks only. A major version change is announced in advance, with a migration guide.
 - **Runtime release.** A plugin is admitted against one runtime release and keeps running on it while that release is supported. Moving to a newer release re-runs conformance.
@@ -483,7 +538,7 @@ A failing tier prints its name and the first mismatch, for example
 
 ---
 
-## 12. Not in scope for contract 1.0
+## 13. Not in scope for contract 1.0
 
 - Tensor parallelism in the trainer. Training parallelism is ZeRO data parallelism, sequence parallelism and expert parallelism.
 - Pipeline parallelism, multimodal encoders, and custom optimizers or loss functions inside the plugin.
@@ -493,7 +548,7 @@ A failing tier prints its name and the first mismatch, for example
 
 ---
 
-## 13. Worked example: ToyHybridMoE
+## 14. Worked example: ToyHybridMoE
 
 [`examples/model_plugins/toy_hybrid_moe`](../../examples/model_plugins/toy_hybrid_moe/) is a complete plugin that
 touches every part of this contract. The architecture is new to the platform:
@@ -529,24 +584,32 @@ flowchart TB
 Its CPU conformance run:
 
 ```text
-static               PASS
-reference_parity     PASS
-packing              PASS
-checkpoint_and_sync  PASS
-rl_step              PASS
-router_replay        PASS
-sp2                  PASS
-ep2                  PASS
-sp2+ep2              PASS
+static                    PASS
+reference_parity          PASS
+packing                   PASS
+activation_checkpointing  PASS
+checkpoint_and_sync       PASS
+rl_step                   PASS
+router_replay             PASS
+sp2                       PASS
+ep2                       PASS
+sp2+ep2                   PASS
 ```
 
-The test suite also feeds conformance deliberately broken variants and checks that each one is rejected by the
-right tier: a recurrence that ignores row boundaries, a router that ignores replay, a lossy converter, an SP rank
-slicing the wrong heads, and EP ranks that forget their expert offset.
+The test suite also feeds conformance deliberately broken variants and checks that the right tier rejects each one:
+
+- a recurrence that ignores row boundaries;
+- statistics counted again on recompute;
+- a router that ignores replay;
+- a lossy converter;
+- an SP rank slicing the wrong heads;
+- EP ranks that forget their expert offset;
+- weights directories with a missing tokenizer, a mismatched config or a foreign `model_type`;
+- a checkpoint stamped by another plugin.
 
 ---
 
-## 14. Sign-off checklist
+## 15. Sign-off checklist
 
 **Plugin author**
 
@@ -554,6 +617,8 @@ slicing the wrong heads, and EP ranks that forget their expert offset.
 - [ ] Every value in the config's `layer_types` is in the manifest, and every sequence-mixing module sets `ap_layer_type`.
 - [ ] Cores restart at row boundaries and slice per-head parameters by `shard`.
 - [ ] Expert weights are stacked on dim 0, and the router honours `routed_experts` and `ROUTER_REPLAY_FRESH`.
+- [ ] Decoder layers are recomputable; side effects are guarded with `in_recompute()`.
+- [ ] The weights directory passes `--weights`: matching config, sharded safetensors with an index, and a tokenizer with EOS and a chat template.
 - [ ] The converters are exact inverses, and trainer-only state is marked `skip_weight_sync`.
 - [ ] The vLLM `load_weights` accepts Hugging Face-named full tensors and returns the parameters it wrote.
 - [ ] `reference_forward` is independent of the trainer code.
@@ -569,9 +634,10 @@ slicing the wrong heads, and EP ranks that forget their expert offset.
 
 ---
 
-## 15. Open questions for review
+## 16. Open questions for review
 
 1. Should a plugin be allowed to use the platform's GPU MoE layer directly through the API, so customers get DeepEP dispatch without writing an `ExpertLayer`?
 2. Which GPU tolerance policy suits RL customers best for sampler log-prob parity: a fixed bound, or calibration against a known-good model of similar size?
 3. Should `peft` (LoRA) get its own conformance tier in 1.0, including expert LoRA?
 4. Is a per-plugin `max_sequence_length` or memory profile needed in the manifest for admission, beyond `profiles`?
+5. Should the plugin kit ship a local GPU smoke test (load in vLLM, sync weights, compare trainer and sampler log-probs) and let Arctic Platform's on-prem trainer run plugin models, so customers can test the GPU tiers before submitting?

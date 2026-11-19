@@ -31,6 +31,7 @@ from arctic_platform.model_plugin import AttentionModule
 from arctic_platform.model_plugin import HeadShard
 from arctic_platform.model_plugin import combine_tokens
 from arctic_platform.model_plugin import gather_tokens
+from arctic_platform.model_plugin import in_recompute
 from arctic_platform.model_plugin import skip_weight_sync
 from arctic_platform.model_plugin.attention import segment_ids
 
@@ -209,7 +210,7 @@ class ToyMoE(nn.Module):
         selected = own if routed is None else torch.where(routed == ROUTER_REPLAY_FRESH, own, routed.to(own.dtype))
         weights = scores.gather(1, selected)
         weights = weights / weights.sum(-1, keepdim=True) * self.scale
-        if self.training:
+        if self.training and not in_recompute():
             with torch.no_grad():
                 self.stats.tokens_per_expert += torch.bincount(selected.flatten(), minlength=self.num_experts)
         out = self._routed(tokens, selected, weights) + self.shared_expert(tokens)

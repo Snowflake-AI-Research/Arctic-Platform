@@ -36,6 +36,7 @@ from toy_hybrid_moe.sampler_names import sampler_target
 from arctic_platform.model_plugin import conformance
 from arctic_platform.model_plugin.weights import CHECKPOINT_FILE
 from arctic_platform.model_plugin.weights import iter_hf_weights
+from arctic_platform.model_plugin.weights import load_hf_checkpoint
 from arctic_platform.model_plugin.weights import save_hf_checkpoint
 from arctic_platform.testing_utils import TestCasePlus
 
@@ -51,6 +52,7 @@ SPEC = conformance.load_conformance_spec(TOY_PLUGIN_ROOT / "conformance.toml")
         conformance.check_static,
         conformance.check_reference_parity,
         conformance.check_packing,
+        conformance.check_activation_checkpointing,
         conformance.check_router_replay,
         conformance.check_checkpoint_and_sync,
         conformance.check_rl_step,
@@ -72,6 +74,7 @@ def test_run_conformance_reports_every_tier():
         ("static", True),
         ("reference_parity", True),
         ("packing", True),
+        ("activation_checkpointing", True),
         ("checkpoint_and_sync", True),
         ("rl_step", True),
         ("router_replay", True),
@@ -117,6 +120,12 @@ def test_router_that_ignores_replay_fails_router_replay():
             conformance.check_router_replay(PLUGIN, SPEC)
 
 
+def test_side_effect_repeated_on_recompute_fails_activation_checkpointing():
+    with patch.object(modeling, "in_recompute", lambda: False):
+        with pytest.raises(AssertionError, match="tokens_per_expert after recompute"):
+            conformance.check_activation_checkpointing(PLUGIN, SPEC)
+
+
 def test_lossy_export_fails_checkpoint():
     real = PLUGIN.convert_layer_to_hf
 
@@ -160,7 +169,57 @@ def test_sampler_stream_maps_onto_the_vllm_model():
         sampler_target("model.layers.1.mlp.stats.tokens_per_expert")
 
 
+def _save_tokenizer(path: Path, vocab_size: int) -> None:
+    from tokenizers import Tokenizer
+    from tokenizers import models
+    from tokenizers import pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    vocab = {f"t{i}": i for i in range(vocab_size - 2)} | {"<unk>": vocab_size - 2, "</s>": vocab_size - 1}
+    tokenizer = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="<unk>", eos_token="</s>").save_pretrained(path)
+
+
 class TestCheckpointLayout(TestCasePlus):
+    def _weights_directory(self, **config_overrides) -> Path:
+        torch.manual_seed(0)
+        config = ToyHybridMoEConfig(**(SPEC.fixture | config_overrides))
+        path = Path(self.get_auto_remove_tmp_dir_str())
+        save_hf_checkpoint(PLUGIN.build_model(config), PLUGIN, config, path, max_shard_bytes=8192)
+        _save_tokenizer(path, config.vocab_size)
+        return path
+
+    def test_weights_directory_check_passes_on_a_complete_directory(self):
+        PLUGIN.register()
+        conformance.check_weights_directory(PLUGIN, self._weights_directory())
+
+    def test_weights_directory_check_rejects(self):
+        PLUGIN.register()
+        path = self._weights_directory()
+        (path / "tokenizer.json").unlink()
+        with self.assertRaisesRegex(AssertionError, "tokenizer does not load"):
+            conformance.check_weights_directory(PLUGIN, path)
+
+        path = self._weights_directory()
+        config = json.loads((path / "config.json").read_text())
+        (path / "config.json").write_text(json.dumps(config | {"num_experts": 8}))
+        with self.assertRaisesRegex(AssertionError, "tensor problems"):
+            conformance.check_weights_directory(PLUGIN, path)
+
+        path = self._weights_directory()
+        (path / "config.json").write_text(json.dumps(config | {"model_type": "qwen3"}))
+        with self.assertRaisesRegex(AssertionError, "model_type 'qwen3'"):
+            conformance.check_weights_directory(PLUGIN, path)
+
+    def test_checkpoint_from_another_plugin_is_refused(self):
+        path = self._weights_directory()
+        other = dataclasses.replace(
+            PLUGIN, manifest=PLUGIN.manifest.model_copy(update=dict(name="custom/other/model"))
+        )
+        with self.assertRaisesRegex(ValueError, "was written by plugin custom/example/toy-hybrid-moe"):
+            load_hf_checkpoint(other, path)
+
     def test_checkpoint_uses_hugging_face_names(self):
         torch.manual_seed(0)
         config = ToyHybridMoEConfig(**SPEC.fixture)

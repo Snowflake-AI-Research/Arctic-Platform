@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import sys
 import tempfile
 import tomllib
@@ -55,8 +56,15 @@ from arctic_platform.model_plugin.host import token_logprobs
 from arctic_platform.model_plugin.parallel import shard_sequence
 from arctic_platform.model_plugin.plugin import ModelPlugin
 from arctic_platform.model_plugin.plugin import load_plugin
+from arctic_platform.model_plugin.recompute import apply_activation_checkpointing
+from arctic_platform.model_plugin.weights import INDEX_FILE
+from arctic_platform.model_plugin.weights import STAMP_PLUGIN
+from arctic_platform.model_plugin.weights import checkpoint_files
+from arctic_platform.model_plugin.weights import checkpoint_stamp
 from arctic_platform.model_plugin.weights import iter_hf_weights
+from arctic_platform.model_plugin.weights import layer_index
 from arctic_platform.model_plugin.weights import load_hf_checkpoint
+from arctic_platform.model_plugin.weights import read_stamp
 from arctic_platform.model_plugin.weights import save_hf_checkpoint
 from arctic_platform.model_plugin.weights import weight_sync_skipped
 
@@ -206,15 +214,20 @@ def check_checkpoint_and_sync(plugin: ModelPlugin, spec: ConformanceSpec) -> Non
     trainer-only tensors."""
     config, model = build_fixture(plugin, spec)
     input_ids, position_ids = pack_sequences(fixture_sequences(config, spec))
-    with torch.no_grad(), tempfile.TemporaryDirectory() as path:
-        save_hf_checkpoint(model, plugin, config, path)
-        _, reloaded = load_hf_checkpoint(plugin, path)
-        _assert_close(
-            _logits(forward(reloaded, input_ids, position_ids)),
-            _logits(forward(model, input_ids, position_ids)),
-            0.0,
-            "reloaded checkpoint",
-        )
+    stamp = {key: value for key, value in checkpoint_stamp(plugin).items() if key.startswith("arctic_plugin")}
+    with torch.no_grad():
+        expected = _logits(forward(model, input_ids, position_ids))
+        for max_shard_bytes in (None, 4096):
+            with tempfile.TemporaryDirectory() as path:
+                save_hf_checkpoint(model, plugin, config, path, max_shard_bytes=max_shard_bytes)
+                files = set(checkpoint_files(path).values())
+                if max_shard_bytes is not None and (len(files) < 2 or not (Path(path) / INDEX_FILE).is_file()):
+                    raise AssertionError("a sharded save must write several files and an index")
+                if read_stamp(path) != stamp:
+                    raise AssertionError(f"checkpoint stamp {read_stamp(path)} does not name this plugin {stamp}")
+                _, reloaded = load_hf_checkpoint(plugin, path)
+                what = "reloaded checkpoint" + ("" if max_shard_bytes is None else " (sharded)")
+                _assert_close(_logits(forward(reloaded, input_ids, position_ids)), expected, 0.0, what)
     checkpoint = dict(iter_hf_weights(model, plugin, for_sampler=False))
     stream = dict(iter_hf_weights(model, plugin, for_sampler=True))
     skipped = weight_sync_skipped(model)
@@ -226,6 +239,94 @@ def check_checkpoint_and_sync(plugin: ModelPlugin, spec: ConformanceSpec) -> Non
         raise AssertionError(f"sampler stream drops {sorted(set(checkpoint) - set(stream))} with nothing marked skip")
     for name, tensor in stream.items():
         _assert_close(tensor, checkpoint[name], 0.0, f"stream tensor {name}")
+
+
+def check_activation_checkpointing(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
+    """Recomputing checkpointed decoder layers changes no output, gradient or buffer: side effects run once."""
+    config, model = build_fixture(plugin, spec)
+    checkpointed = copy.deepcopy(model)
+    apply_activation_checkpointing(checkpointed)
+    input_ids, position_ids = pack_sequences(fixture_sequences(config, spec))
+    labels = next_token_labels(input_ids, position_ids)
+    logits = {}
+    for name, candidate in (("plain", model), ("checkpointed", checkpointed)):
+        logits[name] = _logits(forward(candidate, input_ids, position_ids))
+        _token_loss(logits[name], labels).backward()
+    _assert_close(logits["checkpointed"].detach(), logits["plain"].detach(), 0.0, "checkpointed logits")
+    expected = _grads(model)
+    for name, grad in _grads(checkpointed).items():
+        _assert_close(grad, expected[name], 0.0, f"recomputed grad {name}")
+    buffers = dict(model.named_buffers())
+    for name, buffer in checkpointed.named_buffers():
+        _assert_close(buffer, buffers[name], 0.0, f"buffer {name} after recompute")
+
+
+def check_weights_directory(plugin: ModelPlugin, path: str | Path) -> None:
+    """A real weights directory is servable: config, every tensor's name and shape, and the tokenizer.
+
+    Shapes are checked on the meta device, so this runs on a laptop even for a large model.
+    """
+    from safetensors import safe_open
+    from transformers import AutoTokenizer
+
+    path = Path(path)
+    raw = json.loads((path / "config.json").read_text())
+    if raw.get("model_type") not in plugin.manifest.hf_model_types:
+        raise AssertionError(
+            f"config.json model_type {raw.get('model_type')!r} is not in {plugin.manifest.hf_model_types}"
+        )
+    sampler = plugin.manifest.sampler
+    architecture = (raw.get("architectures") or [None])[0]
+    if sampler is not None and architecture != sampler.vllm_architecture:
+        raise AssertionError(f"config.json architectures[0] {architecture!r} is not {sampler.vllm_architecture!r}")
+    stamp = read_stamp(path)
+    if STAMP_PLUGIN in stamp and stamp[STAMP_PLUGIN] != plugin.manifest.name:
+        raise AssertionError(f"checkpoint was written by plugin {stamp[STAMP_PLUGIN]}")
+
+    config = plugin.config_class.from_pretrained(path)
+    plugin.parallelism(config)
+    with torch.device("meta"):
+        expected = {name: tuple(tensor.shape) for name, tensor in plugin.build_model(config).state_dict().items()}
+    files = checkpoint_files(path)
+    for file in set(files.values()):
+        if not file.is_file():
+            raise AssertionError(f"the checkpoint index names {file.name}, which is missing")
+    by_layer: dict[int, dict[str, torch.Tensor]] = {}
+    for file in set(files.values()):
+        with safe_open(str(file), framework="pt") as f:
+            for name in f.keys():
+                shape = f.get_slice(name).get_shape()
+                by_layer.setdefault(layer_index(name), {})[name] = torch.empty(shape, device="meta")
+    found: dict[str, tuple[int, ...]] = {}
+    problems: list[str] = []
+    for index, layer in sorted(by_layer.items()):
+        if index >= 0 and plugin.convert_layer_to_prime is not None:
+            try:
+                layer = plugin.convert_layer_to_prime(layer, index, config)
+            except ValueError as error:  # the converter's own shape and index checks
+                problems.append(f"layer {index} does not convert: {error}")
+                continue
+        found.update({name: tuple(tensor.shape) for name, tensor in layer.items()})
+    if len(problems) > 0:
+        raise AssertionError(f"{len(problems)} tensor problems, first: {problems[:5]}")
+    problems += [f"missing {name}" for name in sorted(set(expected) - set(found))]
+    problems += [f"unexpected {name}" for name in sorted(set(found) - set(expected))]
+    problems += [
+        f"{name}: checkpoint {found[name]} vs model {expected[name]}"
+        for name in sorted(set(found) & set(expected))
+        if found[name] != expected[name]
+    ]
+    if len(problems) > 0:
+        raise AssertionError(f"{len(problems)} tensor problems, first: {problems[:5]}")
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=False)
+    except Exception as error:
+        raise AssertionError(f"the tokenizer does not load without remote code: {error}") from error
+    if tokenizer.eos_token_id is None:
+        raise AssertionError("the tokenizer defines no EOS token")
+    if len(tokenizer) > config.vocab_size:
+        raise AssertionError(f"the tokenizer has {len(tokenizer)} tokens but the model only {config.vocab_size}")
 
 
 def check_rl_step(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
@@ -301,6 +402,9 @@ def _parallel_checks(plugin: ModelPlugin, spec: ConformanceSpec, mode: str, rank
     sp_group = group if mode in ("sp", "sp+ep") else None
     ep_group = group if mode in ("ep", "sp+ep") else None
     prepare_model(model, plugin, config, sp_group=sp_group, ep_group=ep_group)
+    if mode == "sp+ep":
+        # The production layout: recompute then reruns the sequence and expert collectives inside backward.
+        apply_activation_checkpointing(model)
     expert_names = {
         f"{path}.{name}"
         for path, module in model.named_modules()
@@ -335,6 +439,14 @@ def _parallel_checks(plugin: ModelPlugin, spec: ConformanceSpec, mode: str, rank
             dist.all_reduce(grad, group=group)
         _assert_close(grad, reference, atol, f"{mode} grad {name}")
 
+    if ep_group is not None:
+        exported = dict(iter_hf_weights(model, plugin, for_sampler=True, ep_group=ep_group))
+        unsharded = dict(iter_hf_weights(baseline, plugin, for_sampler=True))
+        if set(exported) != set(unsharded):
+            raise AssertionError(f"{mode} export names differ: {sorted(set(exported) ^ set(unsharded))[:5]}")
+        for name, tensor in unsharded.items():
+            _assert_close(exported[name], tensor, 0.0, f"{mode} exported {name}")
+
 
 def check_parallel(plugin_target: str, spec: ConformanceSpec, mode: str, size: int) -> None:
     """Run ``mode`` ('sp', 'ep' or 'sp+ep') on ``size`` gloo ranks and compare with the unsharded model."""
@@ -353,7 +465,8 @@ def check_parallel(plugin_target: str, spec: ConformanceSpec, mode: str, size: i
         )
 
 
-def run_conformance(plugin_target: str, spec: ConformanceSpec) -> list[TierResult]:
+def run_conformance(plugin_target: str, spec: ConformanceSpec, weights: str | Path | None = None) -> list[TierResult]:
+    """Every applicable CPU tier; with ``weights``, also check that real weights directory."""
     plugin = load_plugin(plugin_target)
     capabilities = plugin.manifest.capabilities
     config, _ = build_fixture(plugin, spec)
@@ -362,9 +475,12 @@ def run_conformance(plugin_target: str, spec: ConformanceSpec) -> list[TierResul
         ("static", lambda: check_static(plugin, spec)),
         ("reference_parity", lambda: check_reference_parity(plugin, spec)),
         ("packing", lambda: check_packing(plugin, spec)),
+        ("activation_checkpointing", lambda: check_activation_checkpointing(plugin, spec)),
         ("checkpoint_and_sync", lambda: check_checkpoint_and_sync(plugin, spec)),
         ("rl_step", lambda: check_rl_step(plugin, spec)),
     ]
+    if weights is not None:
+        tiers.append(("weights_directory", partial(check_weights_directory, plugin, weights)))
     if capabilities.router_replay and has_experts:
         tiers.append(("router_replay", lambda: check_router_replay(plugin, spec)))
     if capabilities.sequence_parallel:
@@ -390,8 +506,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--plugin", required=True, help="'module:attribute' of the ModelPlugin")
     parser.add_argument("--spec", required=True, help="path to the plugin's conformance.toml")
+    parser.add_argument("--weights", help="a real Hugging Face weights directory to check (shapes only, no GPU)")
     args = parser.parse_args(argv)
-    results = run_conformance(args.plugin, load_conformance_spec(args.spec))
+    results = run_conformance(args.plugin, load_conformance_spec(args.spec), weights=args.weights)
     width = max(len(result.tier) for result in results)
     for result in results:
         print(f"{result.tier:<{width}}  {'PASS' if result.passed else 'FAIL'}  {result.detail}")

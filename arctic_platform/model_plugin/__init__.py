@@ -45,6 +45,8 @@ from arctic_platform.model_plugin.plugin import ParallelismInfo
 from arctic_platform.model_plugin.plugin import discover_plugins
 from arctic_platform.model_plugin.plugin import load_plugin
 from arctic_platform.model_plugin.plugin import plugin_for_model_type
+from arctic_platform.model_plugin.recompute import apply_activation_checkpointing
+from arctic_platform.model_plugin.recompute import in_recompute
 from arctic_platform.model_plugin.weights import skip_weight_sync
 
 __all__ = [
@@ -65,10 +67,12 @@ __all__ = [
     "PluginManifest",
     "ROUTER_REPLAY_FRESH",
     "SamplerSpec",
+    "apply_activation_checkpointing",
     "check_job_request",
     "combine_tokens",
     "discover_plugins",
     "gather_tokens",
+    "in_recompute",
     "load_manifest",
     "load_plugin",
     "plugin_for_model_type",

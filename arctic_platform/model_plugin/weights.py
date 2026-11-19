@@ -17,9 +17,12 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from collections.abc import Iterable
 from collections.abc import Iterator
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 from typing import TypeVar
@@ -34,6 +37,12 @@ from arctic_platform.model_plugin.plugin import ModelPlugin
 # The platform's existing marker; the weight sync skips any tensor that carries it.
 SKIP_WEIGHT_SYNC_ATTR = "_dss_skip_weight_sync"
 CHECKPOINT_FILE = "model.safetensors"
+INDEX_FILE = "model.safetensors.index.json"
+STAMP_PLUGIN = "arctic_plugin"
+STAMP_VERSION = "arctic_plugin_version"
+STAMP_CONTRACT = "arctic_plugin_contract"
+
+logger = logging.getLogger(__name__)
 
 _LAYER = re.compile(r"^model\.layers\.(\d+)\.")
 
@@ -102,36 +111,149 @@ def iter_hf_weights(
         yield from layer.items()
 
 
+def _load_layers(model: nn.Module, plugin: ModelPlugin, layers: Iterable[tuple[int, dict[str, torch.Tensor]]]) -> None:
+    """Load one decoder layer at a time, so peak extra memory is one layer. Every trainer tensor must be set."""
+    expected = set(model.state_dict())
+    loaded: set[str] = set()
+    for index, layer in layers:
+        if index >= 0 and plugin.convert_layer_to_prime is not None:
+            layer = plugin.convert_layer_to_prime(layer, index, model.config)
+        unexpected = set(layer) - expected
+        if len(unexpected) > 0:
+            raise ValueError(f"checkpoint tensors match no trainer tensor: {sorted(unexpected)}")
+        model.load_state_dict(layer, strict=False)
+        loaded.update(layer)
+    missing = expected - loaded
+    if len(missing) > 0:
+        raise ValueError(f"checkpoint does not set trainer tensors: {sorted(missing)}")
+
+
 def load_hf_weights(model: nn.Module, plugin: ModelPlugin, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
-    """Load Hugging Face-named tensors into a freshly built, unsharded trainer model. Every parameter must be set."""
+    """Load Hugging Face-named tensors into a freshly built, unsharded trainer model. Every tensor must be set."""
     groups: dict[int, dict[str, torch.Tensor]] = {}
     for name, tensor in weights:
         groups.setdefault(layer_index(name), {})[name] = tensor
-    state: dict[str, torch.Tensor] = {}
-    for index, layer in groups.items():
-        if index >= 0 and plugin.convert_layer_to_prime is not None:
-            layer = plugin.convert_layer_to_prime(layer, index, model.config)
-        state.update(layer)
-    model.load_state_dict(state, strict=True)
+    _load_layers(model, plugin, groups.items())
 
 
-def save_hf_checkpoint(model: nn.Module, plugin: ModelPlugin, config: Any, path: str | Path, *, ep_group=None) -> None:
+def checkpoint_stamp(plugin: ModelPlugin) -> dict[str, str]:
+    """Safetensors metadata recording which plugin wrote a checkpoint."""
+    manifest = plugin.manifest
+    return {
+        "format": "pt",
+        STAMP_PLUGIN: manifest.name,
+        STAMP_VERSION: manifest.version,
+        STAMP_CONTRACT: manifest.contract,
+    }
+
+
+def _shards(weights: dict[str, torch.Tensor], max_shard_bytes: int | None) -> list[dict[str, torch.Tensor]]:
+    shards: list[dict[str, torch.Tensor]] = [{}]
+    size = 0
+    for name, tensor in weights.items():
+        nbytes = tensor.numel() * tensor.element_size()
+        if max_shard_bytes is not None and len(shards[-1]) > 0 and size + nbytes > max_shard_bytes:
+            shards.append({})
+            size = 0
+        shards[-1][name] = tensor
+        size += nbytes
+    return shards
+
+
+def save_hf_checkpoint(
+    model: nn.Module,
+    plugin: ModelPlugin,
+    config: Any,
+    path: str | Path,
+    *,
+    ep_group=None,
+    max_shard_bytes: int | None = None,
+) -> None:
+    """Write ``config.json`` and safetensors under Hugging Face names, split into shards of at most
+    ``max_shard_bytes`` with a ``model.safetensors.index.json``, each stamped with the plugin that wrote it."""
     from safetensors.torch import save_file
 
     weights = {
         name: tensor.contiguous()
         for name, tensor in iter_hf_weights(model, plugin, for_sampler=False, ep_group=ep_group)
     }
-    if ep_group is None or dist.get_rank(ep_group) == 0:
-        Path(path).mkdir(parents=True, exist_ok=True)
-        config.save_pretrained(path)
-        save_file(weights, str(Path(path) / CHECKPOINT_FILE))
+    if ep_group is not None and dist.get_rank(ep_group) != 0:
+        return
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    config.save_pretrained(path)
+    stamp = checkpoint_stamp(plugin)
+    shards = _shards(weights, max_shard_bytes)
+    if len(shards) == 1:
+        save_file(shards[0], str(path / CHECKPOINT_FILE), metadata=stamp)
+        return
+    weight_map = {}
+    for number, shard in enumerate(shards, start=1):
+        file_name = f"model-{number:05d}-of-{len(shards):05d}.safetensors"
+        save_file(shard, str(path / file_name), metadata=stamp)
+        weight_map.update(dict.fromkeys(shard, file_name))
+    total = sum(tensor.numel() * tensor.element_size() for tensor in weights.values())
+    index = {"metadata": {"total_size": total, **stamp}, "weight_map": weight_map}
+    (path / INDEX_FILE).write_text(json.dumps(index, indent=2) + "\n")
+
+
+def checkpoint_files(path: str | Path) -> dict[str, Path]:
+    """The file holding each tensor of a single-file or sharded Hugging Face checkpoint."""
+    from safetensors import safe_open
+
+    path = Path(path)
+    if (path / INDEX_FILE).is_file():
+        weight_map = json.loads((path / INDEX_FILE).read_text())["weight_map"]
+        return {name: path / file_name for name, file_name in weight_map.items()}
+    single = path / CHECKPOINT_FILE
+    if not single.is_file():
+        raise FileNotFoundError(f"{path} has neither {CHECKPOINT_FILE} nor {INDEX_FILE}")
+    with safe_open(str(single), framework="pt") as f:
+        return dict.fromkeys(f.keys(), single)
+
+
+def read_stamp(path: str | Path) -> dict[str, str]:
+    """The plugin stamp of a checkpoint, or ``{}`` if it was not written by a plugin."""
+    from safetensors import safe_open
+
+    first = next(iter(sorted(set(checkpoint_files(path).values()))))
+    with safe_open(str(first), framework="pt") as f:
+        metadata = f.metadata() or {}
+    return {key: value for key, value in metadata.items() if key.startswith("arctic_plugin")}
+
+
+def iter_checkpoint_layers(path: str | Path) -> Iterator[tuple[int, dict[str, torch.Tensor]]]:
+    """A checkpoint's tensors one decoder layer at a time, reading only that layer from disk."""
+    from safetensors import safe_open
+
+    by_layer: dict[int, dict[str, Path]] = {}
+    for name, file in checkpoint_files(path).items():
+        by_layer.setdefault(layer_index(name), {})[name] = file
+    with ExitStack() as stack:
+        handles: dict[Path, Any] = {}
+        for index in sorted(by_layer, key=lambda i: (i < 0, i)):
+            layer = {}
+            for name, file in by_layer[index].items():
+                if file not in handles:
+                    handles[file] = stack.enter_context(safe_open(str(file), framework="pt"))
+                layer[name] = handles[file].get_tensor(name)
+            yield index, layer
 
 
 def load_hf_checkpoint(plugin: ModelPlugin, path: str | Path) -> tuple[Any, nn.Module]:
-    from safetensors.torch import load_file
-
+    """Build the trainer model from ``config.json`` and load the checkpoint into it layer by layer."""
+    stamp = read_stamp(path)
+    if STAMP_PLUGIN in stamp and stamp[STAMP_PLUGIN] != plugin.manifest.name:
+        raise ValueError(f"{path} was written by plugin {stamp[STAMP_PLUGIN]}, not {plugin.manifest.name}")
+    if stamp.get(STAMP_VERSION, plugin.manifest.version) != plugin.manifest.version:
+        logger.info(
+            "loading %s, written by %s %s, with version %s",
+            path,
+            stamp[STAMP_PLUGIN],
+            stamp[STAMP_VERSION],
+            plugin.manifest.version,
+        )
     config = plugin.config_class.from_pretrained(path)
     model = plugin.build_model(config)
-    load_hf_weights(model, plugin, load_file(str(Path(path) / CHECKPOINT_FILE)).items())
+    _load_layers(model, plugin, iter_checkpoint_layers(path))
     return config, model
