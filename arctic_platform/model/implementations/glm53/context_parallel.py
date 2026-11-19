@@ -709,6 +709,45 @@ def _report_convolution_fallback(error: str) -> None:
     get_logger().info("GLM53_KDA_CONVOLUTION_FALLBACK causal_conv1d unavailable (%s); using unfused F.conv1d", error)
 
 
+# FLA's KDA, l2norm and gated-norm kernels GLM-5.3-Flash's linear attention runs (chunk_kda, the fused o_norm).
+_FLA_KDA_MODULES = ("fla.ops.kda", "fla.modules.l2norm", "fla.modules.fused_norm_gate")
+
+
+def pin_fla_autotuning() -> int:
+    """Give every autotuned FLA kernel one config chosen without timing: the first its pruning keeps for the shape.
+
+    Triton autotunes these kernels by benchmarking each config on its first call, and several of them round
+    differently per config (the cumsum's block size, l2norm's and the gated norm's warps, chunk_kda's intra-chunk
+    head blocking), so which config wins -- a margin under 1% on H200 -- picks the bits. FLA also writes the winner to
+    Triton's disk cache, so the first job on a node runs its own pick and later jobs replay whichever was written.
+    For ``debug.full_determinism`` only. Returns the number of kernels pinned.
+    """
+    import importlib
+    import sys
+    import types
+
+    from triton.runtime.autotuner import Autotuner
+
+    def first_pruned(tuner, kwargs):
+        return type(tuner).prune_configs(tuner, kwargs)[:1]
+
+    for name in _FLA_KDA_MODULES:
+        importlib.import_module(name)
+    pinned = 0
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name == "fla" or name.startswith("fla.")):
+            continue
+        for value in list(vars(module).values()):
+            tuner = value
+            while not isinstance(tuner, Autotuner) and hasattr(tuner, "fn"):
+                tuner = tuner.fn
+            if isinstance(tuner, Autotuner) and "prune_configs" not in vars(tuner):
+                tuner.prune_configs = types.MethodType(first_pruned, tuner)
+                tuner.cache.clear()
+                pinned += 1
+    return pinned
+
+
 def _kda_beta(self, hidden_states: torch.Tensor) -> torch.Tensor:
     logits = self.b_proj(hidden_states)
     return torch.sigmoid(logits.float() if getattr(self, "_fp32_parity", True) else logits)

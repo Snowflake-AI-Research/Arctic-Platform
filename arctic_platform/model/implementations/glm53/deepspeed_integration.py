@@ -33,6 +33,7 @@ from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
 from .context_parallel import SPARSE_MLA_BACKENDS
 from .context_parallel import apply_context_parallelism
+from .context_parallel import pin_fla_autotuning
 
 
 def _build_model_config(
@@ -125,6 +126,9 @@ def load_glm5_next_model(
     # Every rank, before the checkpoint load: a node whose FlashInfer cache lacks the indexer's top-k builds it now
     # (~10 minutes) while the others wait on the CPU, not in a step's collective.
     prepare_flashinfer_top_k()
+    if torch.are_deterministic_algorithms_enabled():
+        # debug.full_determinism: KDA's kernels take a fixed config, not the fastest of a timed benchmark.
+        pin_fla_autotuning()
     model = qwen_ds._load_moe_model(
         _adapter(),
         load_glm5_next_model_for_deepspeed,
