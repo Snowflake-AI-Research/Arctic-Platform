@@ -696,7 +696,9 @@ def execute(
             weight_format=cfg.sub_job.get("weight_format"),
         )
         if published_fixture is not None and published_fixture.get("text_config_overrides"):
-            payload["training_config"]["text_config_overrides"] = deepcopy(published_fixture["text_config_overrides"])
+            from arctic_platform.correctness.harness.cortex import apply_server_reduction
+
+            apply_server_reduction(payload["training_config"], published_fixture["text_config_overrides"])
         if first_two_payload:
             validate_reduced_fixture_support(payload, spec, published_fixture)
             payload["training_config"]["debug"]["correctness_first_two"] = True

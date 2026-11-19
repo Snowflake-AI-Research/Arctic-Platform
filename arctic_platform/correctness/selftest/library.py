@@ -22944,6 +22944,20 @@ def test_client_backends_server_reduced_fixture_binds_overrides_to_the_spec(tmp_
         cortex_module.load_fixture(receipt, spec)
 
 
+def test_client_backends_server_reduction_follows_the_loader_route():
+    from arctic_platform.correctness.harness.cortex import apply_server_reduction
+
+    dense = {"ep_size": 1}
+    apply_server_reduction(dense, {"num_hidden_layers": 4})
+    assert dense == {"ep_size": 1, "text_config_overrides": {"num_hidden_layers": 4}}
+    moe = {"ep_size": 4, "prime_rl": {"debug": {"gradient_norms_per_param": True}}}
+    apply_server_reduction(moe, {"num_hidden_layers": 4, "layer_types": ["full_attention"] * 4})
+    assert moe["prime_rl"] == {"debug": {"gradient_norms_per_param": True, "num_layers": 4}}
+    assert "text_config_overrides" not in moe
+    with pytest.raises(ValueError, match="can only cut layers"):
+        apply_server_reduction({"ep_size": 4}, {"num_hidden_layers": 4, "num_experts": 8})
+
+
 @pytest.mark.usefixtures("_client_backends_no_network")
 @pytest.mark.parametrize("check", ["single-step-grads", "single-step-optimizer"])
 def test_client_backends_cortex_refuses_checks_requiring_local_model_identity(tmp_path, monkeypatch, check):
@@ -23831,6 +23845,7 @@ _SELFTEST_GROUPS = {
         "test_client_backends_cortex_transport_sends_hardware_and_lists_durable_checkpoints",
         "test_client_backends_cortex_transport_pins_hosted_image_tag",
         "test_client_backends_server_reduced_fixture_binds_overrides_to_the_spec",
+        "test_client_backends_server_reduction_follows_the_loader_route",
         "test_client_backends_cortex_refuses_checks_requiring_local_model_identity",
         "test_client_backends_cortex_report_does_not_claim_the_reduced_fixture_was_measured",
         "test_driver_reviewed_training_preserves_explicit_format_without_mutating_payload",

@@ -435,6 +435,24 @@ def server_reduced_overrides(spec: TestSpec) -> dict:
     return {key: value for key, value in after.items() if before.get(key) != value}
 
 
+def apply_server_reduction(training: dict, overrides: dict) -> None:
+    """Ask the server for the reduced model through the route its loader reads.
+
+    Dense loaders apply ``text_config_overrides``. The expert-parallel loaders refuse them and instead truncate the
+    stack through ``prime_rl.debug.num_layers``, which also trims ``layer_types``, so only a layer cut fits there.
+    """
+    if (training.get("ep_size") or 1) <= 1:
+        training["text_config_overrides"] = deepcopy(overrides)
+        return
+    layers = overrides.get("num_hidden_layers")
+    other = sorted(set(overrides) - {"num_hidden_layers", "layer_types"})
+    if type(layers) is not int or other:
+        raise ValueError(f"an expert-parallel server-reduced fixture can only cut layers; it also changes {other}")
+    prime = dict(training.get("prime_rl") or {})
+    prime["debug"] = {**(prime.get("debug") or {}), "num_layers": layers}
+    training["prime_rl"] = prime
+
+
 def describe_server_reduced_fixture(spec: TestSpec) -> dict:
     overrides = server_reduced_overrides(spec)
     digest = hashlib.sha256(
