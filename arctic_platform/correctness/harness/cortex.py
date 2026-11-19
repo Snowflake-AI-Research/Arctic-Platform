@@ -412,8 +412,54 @@ def validate_publication(publication: dict, binding: dict) -> dict:
     return {"stage_path": stage_path, "files": publication["files"]}
 
 
+SERVER_REDUCED = "server-reduced"
+
+
+def server_reduced_overrides(spec: TestSpec) -> dict:
+    """The text-config changes that turn the source checkpoint into the reviewed reduced model.
+
+    The server applies these at load time (``training_config.text_config_overrides``), so a hosted job trains
+    the same truncated stack without a separately published copy. Only text-config edits can travel this way.
+    """
+    from transformers import AutoConfig
+
+    from arctic_platform.correctness.onboarding.synth_model import reduce_config
+
+    source = spec.model.source_checkpoint
+    original = AutoConfig.from_pretrained(source, trust_remote_code=True)
+    reduced, _, _ = reduce_config(source, spec.model.num_hidden_layers, spec.model.vision_depth)
+    if hasattr(reduced, "vision_config") and reduced.vision_config.to_dict() != original.vision_config.to_dict():
+        raise ValueError("server-reduced fixtures cannot reduce a vision tower through text_config_overrides")
+    before = getattr(original, "text_config", original).to_dict()
+    after = getattr(reduced, "text_config", reduced).to_dict()
+    return {key: value for key, value in after.items() if before.get(key) != value}
+
+
+def describe_server_reduced_fixture(spec: TestSpec) -> dict:
+    overrides = server_reduced_overrides(spec)
+    digest = hashlib.sha256(
+        json.dumps([spec.model.source_checkpoint, overrides], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "schema_version": 1,
+        "kind": SERVER_REDUCED,
+        "config_id": spec.config_id,
+        "reference_path": spec.model.cache_path,
+        "reviewed_hash": spec.model.content_hash,
+        "model_name": spec.model.source_checkpoint,
+        "text_config_overrides": overrides,
+        "fixture_sha256": digest,
+        "publication": {"stage_path": f"server-reduced:{spec.model.source_checkpoint}"},
+    }
+
+
 def load_fixture(receipt: Path, spec: TestSpec) -> dict:
     binding = json.loads(Path(receipt).read_text())
+    if binding.get("kind") == SERVER_REDUCED:
+        expected = describe_server_reduced_fixture(spec)
+        if any(binding.get(key) != expected[key] for key in ("schema_version", "config_id", "model_name")):
+            raise ValueError("server-reduced binding does not match the reviewed spec")
+        return expected
     publication = binding.get("publication")
     if not isinstance(publication, dict):
         raise ValueError("fixture binding has no successful publication receipt")

@@ -695,6 +695,8 @@ def execute(
             gradient_norms_per_param=collect_gradient_norms,
             weight_format=cfg.sub_job.get("weight_format"),
         )
+        if published_fixture is not None and published_fixture.get("text_config_overrides"):
+            payload["training_config"]["text_config_overrides"] = deepcopy(published_fixture["text_config_overrides"])
         if first_two_payload:
             validate_reduced_fixture_support(payload, spec, published_fixture)
             payload["training_config"]["debug"]["correctness_first_two"] = True
