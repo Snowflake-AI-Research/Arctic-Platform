@@ -16,7 +16,31 @@
 import sys
 from pathlib import Path
 
-# The example plugin is a separate distribution; the tests import it from the source tree.
-TOY_PLUGIN_ROOT = Path(__file__).resolve().parents[2] / "examples" / "model_plugins" / "toy_hybrid_moe"
-if str(TOY_PLUGIN_ROOT) not in sys.path:
-    sys.path.insert(0, str(TOY_PLUGIN_ROOT))
+import pytest
+import torch.distributed as dist
+
+# The example plugins are separate distributions; the tests import them from the source tree.
+EXAMPLES = Path(__file__).resolve().parents[2] / "examples" / "model_plugins"
+TOY_PLUGIN_ROOT = EXAMPLES / "toy_hybrid_moe"
+OLMO2_PLUGIN_ROOT = EXAMPLES / "olmo2"
+for root in (TOY_PLUGIN_ROOT, OLMO2_PLUGIN_ROOT):
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+
+@pytest.fixture(scope="module")
+def without_session_process_group():
+    """Take down the root conftest's single-rank NCCL group while a module spawns NCCL ranks, and restore it after.
+
+    With that group alive in the pytest process, ranks spawned after a CUDA tier hang in NCCL communicator setup.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        yield
+        return
+    from tests.conftest import _setup_dist
+
+    dist.destroy_process_group()
+    try:
+        yield
+    finally:
+        _setup_dist()

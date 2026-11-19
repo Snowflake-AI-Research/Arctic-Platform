@@ -43,8 +43,8 @@ from arctic_platform.model_plugin import StackedMoEModule
 from arctic_platform.model_plugin import choose_experts
 from arctic_platform.model_plugin import in_recompute
 from arctic_platform.model_plugin import mark
-from arctic_platform.model_plugin.attention import segment_ids
-from arctic_platform.model_plugin.attention import segment_of
+from arctic_platform.model_plugin import segment_ids
+from arctic_platform.model_plugin import segment_of
 
 from .config import FULL_ATTENTION
 from .config import GATED_RECURRENCE

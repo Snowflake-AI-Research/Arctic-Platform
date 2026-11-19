@@ -32,7 +32,6 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from toy_hybrid_moe import PLUGIN
 
 from arctic_platform.model_plugin import cast_model
@@ -41,6 +40,7 @@ from arctic_platform.model_plugin.host import forward
 from arctic_platform.model_plugin.host import next_token_labels
 from arctic_platform.model_plugin.host import pack_sequences
 from arctic_platform.model_plugin.host import prepare_model
+from arctic_platform.model_plugin.launch import spawn_ranks
 from arctic_platform.model_plugin.parallel import shard_sequence
 from arctic_platform.model_plugin.recompute import apply_activation_checkpointing
 from arctic_platform.model_plugin.weights import iter_hf_weights
@@ -53,6 +53,8 @@ from arctic_platform.testing_utils import reserve_free_port
 from .conftest import TOY_PLUGIN_ROOT
 
 TARGET = "toy_hybrid_moe:PLUGIN"
+
+pytestmark = pytest.mark.usefixtures("without_session_process_group")
 
 # Every head count and the expert count divide by 8; 32 tokens give each of 8 SP ranks 4 tokens, at least the
 # convolution halo of 2, and rows of 13, 9 and 10 tokens cross shard boundaries at every SP degree.
@@ -237,7 +239,7 @@ def _run(world, sp, ep, dtype=torch.float32, checkpointing=False):
     if torch.cuda.device_count() < world:
         pytest.skip(f"needs {world} GPUs")
     port = reserve_free_port(get_unique_port_number() + 1, span=7)
-    mp.spawn(_worker, args=(world, sp, ep, port, dtype, checkpointing), nprocs=world, join=True)
+    spawn_ranks(_worker, args=(world, sp, ep, port, dtype, checkpointing), nprocs=world, timeout=300)
 
 
 SINGLE_PROCESS_TIERS = [

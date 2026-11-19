@@ -25,7 +25,9 @@ log-probability parity and a real-weights step), which need the training runtime
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
+import importlib.util
 import json
 import sys
 import tempfile
@@ -41,7 +43,6 @@ from typing import Literal
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
@@ -58,6 +59,7 @@ from arctic_platform.model_plugin.host import next_token_labels
 from arctic_platform.model_plugin.host import pack_sequences
 from arctic_platform.model_plugin.host import prepare_model
 from arctic_platform.model_plugin.host import token_logprobs
+from arctic_platform.model_plugin.launch import spawn_ranks
 from arctic_platform.model_plugin.marks import cast_model
 from arctic_platform.model_plugin.marks import tensor_marks
 from arctic_platform.model_plugin.marks import weight_sync_skipped
@@ -191,8 +193,45 @@ def _grads(model: nn.Module) -> dict[str, torch.Tensor]:
     return {name: param.grad.detach().clone() for name, param in model.named_parameters() if param.grad is not None}
 
 
+PUBLIC_API = "arctic_platform.model_plugin"
+
+
+def _plugin_sources(plugin: ModelPlugin) -> list[Path]:
+    """The source files of the package (or single module) that defines the plugin's model."""
+    top = plugin.build_model.__module__.split(".")[0]
+    found = importlib.util.find_spec(top)
+    if found is None:
+        return []
+    if found.submodule_search_locations:
+        return sorted(path for root in found.submodule_search_locations for path in Path(root).rglob("*.py"))
+    return [Path(found.origin)] if found.origin and found.origin.endswith(".py") else []
+
+
+def private_imports(plugin: ModelPlugin) -> list[str]:
+    """Every import of the platform other than its public API, ``arctic_platform.model_plugin`` itself, as
+    ``file:line: module``. Only the package root is supported across releases; its submodules may change."""
+    found = []
+    for path in _plugin_sources(plugin):
+        for node in ast.walk(ast.parse(path.read_text(), str(path))):
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module is not None:
+                modules = [node.module]
+            elif isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            else:
+                continue
+            for module in modules:
+                if module.split(".")[0] == "arctic_platform" and module != PUBLIC_API:
+                    found.append(f"{path}:{node.lineno}: {module}")
+    return found
+
+
 def check_static(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
     plugin.manifest.check_contract()
+    private = private_imports(plugin)
+    if len(private) > 0:
+        raise AssertionError(
+            f"import the platform only from {PUBLIC_API}; these imports use other modules: " + "; ".join(private)
+        )
     config, model = build_fixture(plugin, spec)
     info = plugin.parallelism(config)
     bind_layers(model, plugin, info)
@@ -597,11 +636,11 @@ def check_parallel(plugin_target: str, spec: ConformanceSpec, mode: str, size: i
 
     On CPU the ranks are gloo processes; with ``device="cuda"`` each rank drives its own GPU over NCCL.
     """
-    device_type = torch.device(device).type
-    if device_type == "cuda" and torch.cuda.device_count() < size:
+    kind = torch.device(device).type
+    if kind == "cuda" and torch.cuda.device_count() < size:
         raise TierSkipped(f"needs {size} GPUs, found {torch.cuda.device_count()}")
     with tempfile.TemporaryDirectory() as directory:
-        mp.spawn(
+        spawn_ranks(
             _parallel_worker,
             args=(
                 size,
@@ -610,7 +649,7 @@ def check_parallel(plugin_target: str, spec: ConformanceSpec, mode: str, size: i
                 spec.model_dump_json(),
                 mode,
                 list(sys.path),
-                device_type,
+                kind,
             ),
             nprocs=size,
         )

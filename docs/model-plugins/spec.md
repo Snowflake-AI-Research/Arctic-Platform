@@ -5,11 +5,15 @@
 | Status | **Draft for review and sign-off.** Interfaces may change until contract 1.0 is frozen. |
 | Contract version | 1.1 (draft) |
 | Reference implementation | [`arctic_platform/model_plugin/`](../../arctic_platform/model_plugin/) |
-| Example plugin | [`examples/model_plugins/toy_hybrid_moe/`](../../examples/model_plugins/toy_hybrid_moe/) |
+| Example plugins | [`examples/model_plugins/olmo2/`](../../examples/model_plugins/olmo2/): the minimal dense plugin, the template to start from (§3)<br/>[`examples/model_plugins/toy_hybrid_moe/`](../../examples/model_plugins/toy_hybrid_moe/): every part of the contract (§14) |
 
 This document specifies how you bring a **new model architecture** to Cortex Training as a Python package, a
 *model plugin*, and train it with supervised fine-tuning or reinforcement learning on the service's GPUs. It covers
 what you write, what the platform does with it, the checks your plugin must pass, and what each side commits to.
+
+**Cortex Training** is the managed service. It trains with **Arctic Platform** (`arctic_platform`), whose
+`arctic_platform.model_plugin` package is the API this document describes. "The platform" means both: the library
+your plugin calls, and the service that runs it.
 
 The key words **MUST**, **MUST NOT**, **SHOULD** and **MAY** are used as in RFC 2119.
 
@@ -27,9 +31,168 @@ single-GPU PyTorch: full attention heads, full experts, no `torch.distributed`. 
 
 Your plugin must pass a **conformance suite** before the service admits it. You can run every CPU tier on a laptop.
 
+A dense model that transformers and vLLM already implement needs about 200 lines and no vLLM code: start with the
+quickstart (§3). New layer types, mixture of experts, checkpoint conversion and custom vLLM models add to that
+path; §7 specifies each.
+
 ---
 
-## 2. Who owns what
+## 2. Concepts
+
+**The plugin**
+
+| Term | Meaning |
+|---|---|
+| **Manifest** | `manifest.toml` in your package: what the plugin declares about itself (layer types, capabilities, sampler). The platform reads it before importing any of your code (§6). |
+| **Plugin object** | The `ModelPlugin` your package exports: the manifest plus the Python objects the platform calls, such as `build_model` and `parallelism` (§7.1). |
+| **Trainer model** | Your PyTorch model, built by `build_model(config, options)`. It returns hidden states; the platform computes logits and losses (§7.2). |
+| **Sampler** | The vLLM engine that generates tokens during RL, running either vLLM's built-in model for your architecture or a vLLM model you write (§7.11). |
+| **Hook** | A method or attribute on your own modules that the platform calls or reads, such as `mix` or `route`. Each is declared as a protocol in `arctic_platform.model_plugin.interfaces` (§7). Hook names the platform reserves start with `ap_` (Arctic Platform): `ap_layer_type`, `ap_init_buffers`. |
+| **Public API** | `arctic_platform.model_plugin` itself. Import only from it; its submodules may change between releases, and the `static` tier refuses imports from them. |
+| **Trainer names, checkpoint names** | Trainer names are your model's `state_dict` names, with decoder layer `i` under `model.layers.<i>.`. Checkpoint names are the Hugging Face checkpoint's. When they differ, `convert_layer_to_hf` and `convert_layer_to_prime` convert between them ("prime" is the trainer's layout, named after the PrimeRL layout the platform's built-in models use) (§7.9). |
+| **Fixture** | A tiny config, in `conformance.toml`, that conformance builds your model from: every layer and MLP kind, a few hidden units (§9). |
+| **Tier** | One conformance check, such as `reference_parity` or `sp2`, reported as `PASS`, `FAIL` or `SKIP` (§9). |
+| **Runtime release** | The frozen set of CUDA, PyTorch, DeepSpeed, transformers, vLLM and Triton versions your plugin runs against. |
+
+**Model structure**
+
+| Term | Meaning |
+|---|---|
+| **Layer type** | The kind of sequence mixing a decoder layer does, named in the config's `layer_types` list (or the same for every layer): for example `full_attention` or `linear_attention`. |
+| **Sub-layer** | A sequence-mixing module inside a layer, such as a short convolution on attention values, with a type of its own (§7.3). |
+| **Core (`mix`)** | The part of a sequence-mixing layer that mixes information *across tokens*. It always sees whole rows. Projections before and after it work token by token. |
+| **Mixer** | The object that integrates one layer type with the platform: it claims the layer's modules and decides how their core runs under sequence parallelism, its **policy** (§7.3). |
+| **Packed batch** | Several sequences concatenated into one row (`[1, T]`). `position_ids` restart at 0 at each row start. |
+| **`cu_seqlens`** | Cumulative row boundaries of the **full, unsharded** packed batch, for example `[0, 5, 8, 16]` for rows of 5, 3 and 8 tokens. |
+
+**Parallelism and RL**
+
+| Term | Meaning |
+|---|---|
+| **Sequence parallelism (SP)** | Each of `sp` ranks holds `T/sp` consecutive tokens. By default cores exchange sequence for heads so each rank computes whole rows for `1/sp` of the heads (the head-parallel policy). |
+| **Head shard** | Which heads a core computes on this rank (`HeadShard(rank, size)`); `FULL_SHARD` when unsharded. |
+| **Halo, sequence window** | A policy for cores that read only a few earlier tokens, such as short convolutions: each rank borrows the previous rank's last tokens, the **halo**. `SequenceWindow(start, halo)` says which global positions the core sees; `FULL_WINDOW` when unsharded. |
+| **Expert parallelism (EP)** | Each of `ep` ranks holds `num_experts/ep` routed experts (`ExpertShard`) and computes them for all tokens of the group. |
+| **Router replay** | In RL, the trainer reuses the expert choices the sampler made for each token, so both compute the same function (§7.7). |
+| **Weight sync** | After each optimizer step, the trainer streams its full weights under checkpoint names to the sampler (§7.10). |
+| **Prefix caching, align mode** | vLLM reuses the cached state of a shared prompt prefix. For layers with recurrent state it does so in **align mode**: it keeps one state per cache block and copies states between blocks itself (§7.7). |
+| **Meta-device build** | The platform builds your model on PyTorch's `meta` device, which allocates no memory, then allocates it and loads weights (§7.2). |
+
+---
+
+## 3. Quickstart: a dense plugin
+
+[`examples/model_plugins/olmo2`](../../examples/model_plugins/olmo2/) brings
+[OLMo-2](https://huggingface.co/allenai/OLMo-2-1124-7B) to the platform. OLMo-2 is a dense decoder: Llama-like,
+with norms on queries and keys and after each block. The platform has no built-in implementation of it, while
+transformers and vLLM both do. Copy it to start a dense plugin. It is five files:
+
+| File | What it holds |
+|---|---|
+| `olmo2_plugin/manifest.toml` | One layer type, on the platform's attention core; vLLM's built-in architecture |
+| `olmo2_plugin/modeling.py` | The trainer model |
+| `olmo2_plugin/reference.py` | The conformance oracle |
+| `olmo2_plugin/__init__.py` | The plugin object |
+| `conformance.toml` | The tiny fixture conformance runs |
+
+**1. Declare the plugin** (§6). Every decoder layer is attention on the platform's core, and the sampler is vLLM's
+built-in model, so there is no `vllm_plugin`:
+
+```toml
+name = "custom/example/olmo2"
+version = "0.1.0"
+contract = "1.1"
+runtime_release = "runtime-2026.11"
+hf_model_types = ["olmo2"]
+
+[layer_types]
+full_attention = "platform:attention"
+
+[capabilities]
+training = true
+sampling = true
+sequence_parallel = true
+
+[sampler]
+vllm_architecture = "Olmo2ForCausalLM"
+tensor_parallel = true
+prefix_caching = true
+```
+
+**2. Write the trainer model** (§7.2, §7.3). Plain PyTorch. The attention block subclasses `AttentionModule`, computes
+q, k and v, and calls the platform's core, `self.mix`. The model returns hidden states. Name modules as the Hugging
+Face checkpoint does (`model.layers.<i>.self_attn.q_proj`, …): the checkpoint then loads with no converter, and vLLM's
+built-in model loads the weight sync as is.
+
+```python
+class Olmo2Attention(AttentionModule):
+    ap_layer_type = "full_attention"
+
+    def forward(self, x, position_ids, cu_seqlens):
+        q = self.q_norm(self.q_proj(x)).view(1, x.shape[1], self.num_heads, self.head_dim)
+        ...
+        return self.o_proj(self.mix(q, k, v, cu_seqlens=cu_seqlens).flatten(-2))
+
+
+class Olmo2ForCausalLM(nn.Module, CausalLM):
+    def forward(self, input_ids, position_ids, *, cu_seqlens):
+        h = self.model.embed_tokens(input_ids)
+        for layer in self.model.layers:
+            h = layer(h, position_ids, cu_seqlens)
+        return self.model.norm(h)
+```
+
+**3. Give conformance an oracle** (§9). Any independent implementation works. When transformers implements the
+architecture, it is the natural one: `reference.py` loads the trainer's weights into transformers'
+`Olmo2ForCausalLM` and returns its logits.
+
+**4. Export the plugin object** (§7.1). A dense model needs five fields:
+
+```python
+PLUGIN = ModelPlugin(
+    manifest=load_manifest(Path(__file__).with_name("manifest.toml")),
+    config_class=Olmo2Config,             # transformers' own config class
+    build_model=Olmo2ForCausalLM,
+    parallelism=parallelism,              # every layer is attention, with these head counts
+    reference_forward=reference_forward,
+    validate=validate,                    # optional: refuse config features the model does not implement
+)
+```
+
+**5. Run conformance** (§9, §10), on CPU:
+
+```bash
+python -m arctic_platform.model_plugin.conformance --plugin olmo2_plugin:PLUGIN --spec conformance.toml
+```
+
+```text
+static                    PASS
+reference_parity          PASS
+packing                   PASS
+logprob_chunking          PASS
+activation_checkpointing  PASS
+meta_build                PASS
+dtype_marks               PASS
+checkpoint_and_sync       PASS
+rl_step                   PASS
+sp2                       PASS
+```
+
+The dense plugin leaves out everything else: no mixers, no expert layer, no converters, no options, no vLLM model.
+Add each one only when the model needs it:
+
+| Your model has | Add | Spec | In the toy example |
+|---|---|---|---|
+| A sequence mixer that is not attention (recurrence, state space, convolution) | A core `mix` and a `Mixer` | §7.3, §7.5 | `ToyRecurrence`, `ToyShortConv` |
+| Mixture of experts | `route`, `experts_core` and an `ExpertLayer` | §7.6, §7.7 | `ToyMoE`, `ToyExpertLayer` |
+| Trainer tensors laid out differently from the checkpoint | `convert_layer_to_hf` and `convert_layer_to_prime` | §7.9 | `weights.py` |
+| An architecture vLLM does not implement | A vLLM model and its entry point | §7.10, §7.11 | `vllm_model.py` |
+| An output transform, such as logit softcapping | `compute_logits` | §7.2 | `ToyHybridMoEForCausalLM` |
+| Job-time choices, such as a kernel | `options` and `validate` | §7.1 | `options.py` |
+
+---
+
+## 4. Who owns what
 
 ```mermaid
 flowchart TB
@@ -39,12 +202,12 @@ flowchart TB
         T["Trainer model + config<br/>plain single-GPU PyTorch"]
         X["Mixers for new layer types<br/>Expert layer for MoE"]
         W["Weight converters<br/>trainer ⇄ Hugging Face names"]
-        V["vLLM model<br/>(sampling plugins)"]
+        V["vLLM model<br/>(if vLLM has none)"]
         R["Reference forward + conformance.toml"]
     end
     subgraph platform["Platform (Snowflake)"]
         direction TB
-        A["Plugin API, contract 1.0<br/>arctic_platform.model_plugin"]
+        A["Plugin API, contract 1.1<br/>arctic_platform.model_plugin"]
         P["Attention core · packing · sequence and expert parallelism collectives"]
         D["DeepSpeed ZeRO training · losses · checkpoints"]
         S["vLLM sampling · weight sync · router replay transport"]
@@ -56,37 +219,16 @@ flowchart TB
 
 | Area | You (plugin author) | Platform |
 |---|---|---|
-| Model math | The trainer model, its config and a slow reference implementation | Nothing. The platform never changes your math. |
+| Model math | The trainer model, its config and a reference implementation | Nothing. The platform never changes your math. |
 | Attention | Q/K/V and output projections, positional encoding | The attention core (`AttentionModule.mix`), its GPU kernels and its sequence parallelism |
-| New layer types | A sequence-mixing core (`mix`), and a `Mixer`: the policy for sharding it (default head-parallel, or your own, such as halo exchange) | The groups, and the collectives policies are built from |
-| Mixture of experts | Routing and `experts_core` over stacked expert weights; an `ExpertLayer` naming them | Sharding experts, token exchange around `experts_core`, DeepSpeed gradient grouping, router-replay transport |
+| New layer types | A core (`mix`), and a mixer: the policy for sharding it (default head-parallel, or your own, such as a halo exchange) | The groups, and the collectives policies are built from |
+| Mixture of experts | Routing and `experts_core` over stacked expert weights; an expert layer naming them | Sharding experts, token exchange around `experts_core`, DeepSpeed gradient grouping, router-replay transport |
 | Data layout | Respect packed-row boundaries (`cu_seqlens`) | Packing rows, computing boundaries, splitting sequences across ranks |
-| Weights | Converters between trainer and Hugging Face names | Gathering ZeRO and expert shards, checkpoints, streaming weights to the sampler |
-| Sampling | A vLLM model that loads Hugging Face-named weights | Running vLLM, sizing caches, weight-sync transport |
+| Weights | Converters between trainer and checkpoint names, if they differ | Gathering ZeRO and expert shards, checkpoints, streaming weights to the sampler |
+| Sampling | vLLM's built-in model, or a vLLM model that loads checkpoint-named weights | Running vLLM, sizing caches, weight-sync transport |
 | Quality | A reference forward and conformance tolerances | Running conformance at registration, admission checks on every job |
 
----
-
-## 3. Concepts
-
-| Term | Meaning |
-|---|---|
-| **Layer type** | The kind of sequence-mixing a decoder layer does, named in the config's `layer_types` list: for example `full_attention` or `linear_attention`. |
-| **Mixer** | The object that integrates one layer type with the platform: it claims the layer's modules and makes them sequence-parallel. |
-| **Core (`mix`)** | The part of a sequence-mixing layer that mixes information *across tokens*. It always sees whole rows. Projections before and after it work token by token. |
-| **Packed batch** | Several sequences concatenated into one row (`[1, T]`). `position_ids` restart at 0 at each row start. |
-| **`cu_seqlens`** | Cumulative row boundaries of the **full, unsharded** packed batch, for example `[0, 5, 8, 16]` for rows of 5, 3 and 8 tokens. |
-| **Sequence parallelism (SP)** | Each of `sp` ranks holds `T/sp` consecutive tokens. Cores exchange sequence for heads so each rank computes whole rows for `1/sp` of the heads. |
-| **Head shard** | Which heads a core computes on this rank (`HeadShard(rank, size)`); `FULL_SHARD` when unsharded. |
-| **Sequence window** | Which global token positions a core sees under a halo policy (`SequenceWindow(start, halo)`); `FULL_WINDOW` when unsharded. |
-| **Expert parallelism (EP)** | Each of `ep` ranks holds `num_experts/ep` routed experts (`ExpertShard`) and computes them for all tokens of the group. |
-| **Router replay** | In RL, the trainer reuses the expert choices the sampler made for each token, so both compute the same function. |
-| **Weight sync** | After each optimizer step, the trainer streams its full weights under Hugging Face names to the sampler. |
-| **Runtime release** | The frozen set of CUDA, PyTorch, DeepSpeed, transformers, vLLM and Triton versions your plugin runs against. |
-
----
-
-## 4. Lifecycle
+### 4.1 Lifecycle
 
 ```mermaid
 flowchart LR
@@ -117,20 +259,21 @@ your-plugin/
 └── your_model/
     ├── __init__.py             # PLUGIN = ModelPlugin(...)
     ├── manifest.toml           # §6
-    ├── config.py               # a transformers PretrainedConfig subclass
     ├── modeling.py             # trainer model
+    ├── reference.py            # independent forward for conformance
+    │                           # optional, as the model needs them:
+    ├── config.py               # a transformers PretrainedConfig subclass, if transformers has none
     ├── parallel.py             # mixers, expert layer, parallelism(config)
     ├── weights.py              # convert_layer_to_hf / convert_layer_to_prime
-    ├── reference.py            # slow, independent forward for conformance
-    ├── sampler_names.py        # Hugging Face name → vLLM parameter (sampling plugins)
-    └── vllm_model.py           # vLLM model (sampling plugins)
+    ├── sampler_names.py        # checkpoint name → vLLM parameter, for your own vLLM model
+    └── vllm_model.py           # vLLM model, if vLLM has none for the architecture
 ```
 
 ```toml
 [project.entry-points."arctic_platform.model_plugins"]
 your_model = "your_model:PLUGIN"
 
-[project.entry-points."vllm.general_plugins"]          # sampling plugins only
+[project.entry-points."vllm.general_plugins"]          # only with your own vLLM model
 your_model = "your_model.vllm_model:register"
 ```
 
@@ -138,7 +281,8 @@ your_model = "your_model.vllm_model:register"
 
 ## 6. Manifest
 
-The manifest is read **before** any of your code runs. Unknown keys are rejected.
+The manifest is read **before** any of your code runs. Unknown keys are rejected. The quickstart's manifest (§3) is
+all a dense model needs; the one below uses every table, and each is explained where the feature is specified.
 
 ```toml
 name = "custom/acme/acme-hybrid"        # custom/<org>/<model>, lowercase
@@ -195,7 +339,7 @@ max_num_seqs = 64
 |---|---|
 | `name` | MUST match `custom/<org>/<model>`. Unique per account. |
 | `contract` | MUST have the same major version as the platform's contract. A different major version is refused. |
-| `layer_types` | MUST list every value in your config's `layer_types`. Values are `platform:attention`, `plugin`, or `none` for decoder layers with no sequence mixer (an MLP or MoE block only; transformers calls such a layer `moe`). |
+| `layer_types` | MUST list every value in your config's `layer_types`. Values are `platform:attention`, `plugin`, or `none` for decoder layers with no sequence mixer (an MLP or MoE block only). The toy example names that layer type `moe`, as transformers does; it is unrelated to the toy's `mlp_types` value `moe`. |
 | `capabilities` | A job that needs an undeclared capability is rejected at admission. Declare only what passes conformance. |
 | `max_expert_parallel` | Only with `expert_parallel = true`. |
 | `sublayer_types` | MUST list every sub-layer type in `ParallelismInfo.sublayers`. Names MUST NOT repeat `layer_types`. |
@@ -558,12 +702,18 @@ sequenceDiagram
     Note over S: load_weights(hf_name, tensor)<br/>→ your fused / sharded parameters
 ```
 
-Your vLLM model's `load_weights` is the weight-sync entry point. It MUST accept full, unsharded Hugging Face-named
+With vLLM's built-in model for your architecture, the weight sync needs nothing from you: the trainer streams
+checkpoint names, which the built-in `load_weights` already loads (the OLMo-2 example). With your own vLLM model, its
+`load_weights` is the weight-sync entry point. It MUST accept full, unsharded Hugging Face-named
 tensors one at a time, write them into its tensor-parallel shards through each parameter's `weight_loader`, and return
 the names of the parameters it wrote. We recommend a pure function mapping a Hugging Face name to its vLLM
 destination, as in `sampler_names.py`, which CPU tests can check against the trainer's stream.
 
 ### 7.11 The sampler (vLLM) model
+
+**Built-in models.** If vLLM already implements your architecture, set `sampler.vllm_architecture` to its class name
+and leave out `vllm_plugin` and `vllm_model.py`. Your checkpoint names MUST then be the ones that implementation
+loads, normally the Hugging Face checkpoint's. The rest of this section applies to a vLLM model you write.
 
 | Requirement | Detail |
 |---|---|
@@ -627,7 +777,7 @@ device, so allocate its tensors on the input's device.
 
 | Tier | Passes when | Catches |
 |---|---|---|
-| static | The manifest is on contract, mixers resolve, and the fixture model binds to its config | Undeclared layer types, missing mixers, modules the config does not account for |
+| static | The manifest is on contract, the plugin imports the platform only from `arctic_platform.model_plugin`, mixers resolve, and the fixture model binds to its config | Imports of platform internals, undeclared layer types, missing mixers, modules the config does not account for |
 | reference parity | Model logits on each unpacked row equal `reference_forward` within `reference` | Wrong math |
 | packing | Packed rows give the same logits **and gradients** as each row run alone | State leaking across row boundaries |
 | log-prob chunking | Log-probs computed `logprob_chunk` tokens at a time, through `compute_logits`, equal one pass over the row, values and gradients, within `chunking` | A `compute_logits` that is not token-wise, chunk-boundary bugs |
@@ -733,7 +883,10 @@ can prove every tensor the trainer streams has exactly one destination before an
 
 ---
 
-## 14. Worked example: ToyHybridMoE
+## 14. Worked examples
+
+[`examples/model_plugins/olmo2`](../../examples/model_plugins/olmo2/), the minimal dense plugin, is walked through in
+the quickstart (§3). This section covers the other example.
 
 [`examples/model_plugins/toy_hybrid_moe`](../../examples/model_plugins/toy_hybrid_moe/) is a complete plugin that
 touches every part of this contract. The architecture is new to the platform:
@@ -820,6 +973,7 @@ The test suite also feeds conformance deliberately broken variants and checks th
 - [ ] Every non-checkpointed buffer is recomputed by its module's `ap_init_buffers()`.
 - [ ] The vLLM `load_weights` accepts Hugging Face-named full tensors and returns the parameters it wrote.
 - [ ] `reference_forward` is independent of the trainer code.
+- [ ] The plugin imports the platform only from `arctic_platform.model_plugin`.
 - [ ] All CPU tiers pass locally; tolerances are `rtol = 0` with justified `atol`.
 - [ ] Dependencies are within the runtime release; there are no native extensions and no monkeypatching.
 

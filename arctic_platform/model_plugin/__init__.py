@@ -25,6 +25,8 @@ from arctic_platform.model_plugin.admission import AdmissionError
 from arctic_platform.model_plugin.admission import JobRequest
 from arctic_platform.model_plugin.admission import check_job_request
 from arctic_platform.model_plugin.attention import AttentionModule
+from arctic_platform.model_plugin.attention import segment_ids
+from arctic_platform.model_plugin.attention import segment_of
 from arctic_platform.model_plugin.attention import varlen_causal_attention
 from arctic_platform.model_plugin.build import build
 from arctic_platform.model_plugin.build import init_buffers
@@ -128,6 +130,8 @@ __all__ = [
     "sampler_launch",
     "SamplerLaunch",
     "SamplerSpec",
+    "segment_ids",
+    "segment_of",
     "sequence_start",
     "SequenceMixingModule",
     "SequenceWindow",

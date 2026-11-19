@@ -33,11 +33,14 @@ from arctic_platform.model_plugin import PluginManifest
 from arctic_platform.model_plugin import SequenceMixingModule
 from arctic_platform.model_plugin import StackedMoEModule
 from arctic_platform.model_plugin import check_job_request
+from arctic_platform.model_plugin import conformance
 from arctic_platform.model_plugin import discover_plugins
 from arctic_platform.model_plugin import plugin as plugin_module
 from arctic_platform.model_plugin import plugin_for_model_type
 from arctic_platform.model_plugin.host import bind_layers
 from arctic_platform.testing_utils import set_seed
+
+from .conftest import TOY_PLUGIN_ROOT
 
 
 def _manifest(**overrides) -> dict:
@@ -347,3 +350,22 @@ def test_admission_checks_a_profiles_defaults_too():
             ToyHybridMoEConfig(),
             JobRequest(job_type="sampling", profile="wide"),
         )
+
+
+def test_static_tier_refuses_platform_imports_outside_the_public_api(tmp_path, monkeypatch):
+    package = tmp_path / "private_import_plugin"
+    package.mkdir()
+    (package / "__init__.py").write_text("from .modeling import build\n")
+    (package / "modeling.py").write_text(
+        "from arctic_platform.model_plugin import ModelPlugin\n"
+        "from arctic_platform.model_plugin.attention import segment_ids\n"
+        "from toy_hybrid_moe.modeling import ToyHybridMoEForCausalLM\n"
+        "def build(config, options):\n"
+        "    return ToyHybridMoEForCausalLM(config, options)\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    from private_import_plugin import build
+
+    plugin = dataclasses.replace(PLUGIN, build_model=build)
+    with pytest.raises(AssertionError, match=r"modeling\.py:2: arctic_platform\.model_plugin\.attention"):
+        conformance.check_static(plugin, conformance.load_conformance_spec(TOY_PLUGIN_ROOT / "conformance.toml"))
