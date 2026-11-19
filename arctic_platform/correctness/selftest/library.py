@@ -14845,6 +14845,197 @@ def test_qwen3_5_moe_reference_actual_build_engine_family_dispatch(monkeypatch, 
         assert loads == [{"dtype": torch.bfloat16, "attn_implementation": "sdpa"}]
 
 
+# Nemotron-H's reference: the sampler's unfloored Mamba-2 time step.
+
+
+def _nemotron_h_reference_model():
+    """A tiny Transformers NemotronHForCausalLM with one Mamba-2 layer. Heads 0 and 1, gated-norm group 0, have
+    softplus(dt_bias) of 6e-6 and 1.7e-5, under Transformers' 1e-3 dt floor at every token, and no D skip, as
+    Nemotron-3-Nano layer 0's floored heads (D 0.00-0.02, five of them in one group); heads 2 and 3 are above it. The
+    projections are O(1), so the scan, not the D skip, carries the output."""
+    from transformers.models.nemotron_h import modeling_nemotron_h as nemotron_h
+    from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
+
+    cfg = NemotronHConfig(
+        vocab_size=32,
+        hidden_size=32,
+        layers_block_type=["mamba"],
+        mamba_num_heads=4,
+        mamba_head_dim=8,
+        n_groups=2,
+        ssm_state_size=8,
+        chunk_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        intermediate_size=32,
+        moe_intermediate_size=16,
+        moe_shared_expert_intermediate_size=16,
+        n_routed_experts=2,
+        pad_token_id=0,
+    )
+    torch.manual_seed(0)
+    model = nemotron_h.NemotronHForCausalLM(cfg)
+    mixer = model.get_decoder().layers[0].mixer
+    with torch.no_grad():
+        mixer.in_proj.weight.normal_(0.0, cfg.hidden_size**-0.5)
+        mixer.conv1d.weight.normal_(0.0, 0.3)
+        mixer.dt_bias.copy_(torch.tensor([-12.0, -11.0, 0.5, 2.0]))
+        mixer.A_log.uniform_(-1.0, 1.0)
+        mixer.D.copy_(torch.tensor([0.0, 0.0, 1.0, -0.5]))
+        mixer.norm.weight.uniform_(0.5, 1.5)
+    return model.float()
+
+
+def _nemotron_h_reference_cpu_kernels(monkeypatch):
+    """Transformers' own PyTorch paths for the Mamba-2 mixer (the installed causal_conv1d / mamba_ssm need CUDA); the
+    fused training kernel's fallback returns None, which sends the mixer down its chunk-scan path."""
+    from transformers.models.nemotron_h import modeling_nemotron_h as nemotron_h
+
+    for name in ("causal_conv1d_fn", "mamba2_chunk_scan", "mamba2_split_conv1d_scan_combined"):
+        function = getattr(nemotron_h, name)
+        while hasattr(function, "__wrapped__"):
+            function = function.__wrapped__
+        monkeypatch.setattr(nemotron_h, name, function)
+
+
+def _nemotron_h_reference_mixer_float64(mixer, hidden_states, dt_bias, dt_floor):
+    """The Mamba-2 mixer token by token in float64: conv1d + SiLU, dt = softplus(dt + dt_bias) raised to ``dt_floor``,
+    the recurrence with the D skip, the gated group RMSNorm, out_proj. ``dt_bias`` is passed in so its gradient can be
+    taken."""
+    import torch.nn.functional as F
+
+    p = {name: parameter.detach().double() for name, parameter in mixer.named_parameters()}
+    heads, head_dim, groups, state = mixer.num_heads, mixer.head_dim, mixer.n_groups, mixer.ssm_state_size
+    dim, length = heads * head_dim, hidden_states.shape[0]
+    z, xBC, dt = (hidden_states @ p["in_proj.weight"].t()).split([dim, mixer.conv_dim, heads], dim=-1)
+    width = p["conv1d.weight"].shape[-1]
+    xBC = F.conv1d(xBC.t()[None], p["conv1d.weight"], p["conv1d.bias"], padding=width - 1, groups=mixer.conv_dim)
+    x, B, C = F.silu(xBC[0, :, :length]).t().split([dim, groups * state, groups * state], dim=-1)
+    dt = F.softplus(dt + dt_bias).clamp(min=dt_floor)
+    A = -torch.exp(p["A_log"])
+    group = torch.arange(heads) // (heads // groups)
+    h = torch.zeros(heads, head_dim, state, dtype=torch.float64)
+    ys = []
+    for t in range(length):
+        xt, Bt, Ct = x[t].view(heads, head_dim), B[t].view(groups, state)[group], C[t].view(groups, state)[group]
+        h = h * torch.exp(A * dt[t])[:, None, None] + dt[t][:, None, None] * xt[:, :, None] * Bt[:, None, :]
+        ys.append(torch.einsum("hpn,hn->hp", h, Ct) + p["D"][:, None] * xt)
+    y = (torch.stack(ys).reshape(length, dim) * F.silu(z)).view(length, groups, dim // groups)
+    y = (y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + mixer.norm.variance_epsilon)).view(length, dim)
+    return (y * p["norm.weight"]) @ p["out_proj.weight"].t()
+
+
+def _nemotron_h_reference_load(model):
+    from arctic_platform.correctness.reference.nemotron_h_reference import load_nemotron_h_reference
+
+    calls = []
+
+    def from_pretrained(path, **kwargs):
+        calls.append((path, kwargs))
+        return model
+
+    loaded = load_nemotron_h_reference(
+        SimpleNamespace(from_pretrained=from_pretrained),
+        "fixture",
+        dtype=torch.float32,
+        attn_implementation="sdpa",
+        device="cpu",
+    )
+    assert loaded is model
+    assert calls == [("fixture", {"dtype": torch.float32, "attn_implementation": "sdpa"})]
+    return model
+
+
+def test_nemotron_h_reference_follows_the_samplers_unfloored_time_step(monkeypatch):
+    """Transformers' Nemotron-H raises every Mamba-2 time step to config.time_step_min (time_step_limit = (1e-3, inf),
+    models/nemotron_h/modeling_nemotron_h.py:414); vLLM 0.33 serves softplus(dt + dt_bias) unfloored (dt_limit=(0.0,
+    inf), mamba_mixer2.py:704 and :883), as the checkpoint's own code does. On Nemotron-3-Nano's layer 0 that is 12.7% of
+    (token, head) pairs, and the layer's output moves by 6.3%. The loaded reference runs the unfloored recurrence (the
+    output and dt_bias's gradient match a float64 token-by-token mixer at dt = softplus(dt + dt_bias)), while
+    Transformers' own mixer matches the floored one and gives the floored heads no dt_bias gradient at all."""
+    _nemotron_h_reference_cpu_kernels(monkeypatch)
+    stock = _nemotron_h_reference_model()
+    reference = _nemotron_h_reference_load(_nemotron_h_reference_model())
+    stock_mixer, mixer = (m.get_decoder().layers[0].mixer for m in (stock, reference))
+    assert stock_mixer.time_step_limit == (stock.config.time_step_min, float("inf")) == (1e-3, float("inf"))
+    assert mixer.time_step_limit == (0.0, float("inf"))
+    torch.manual_seed(1)
+    hidden = torch.randn(1, 40, stock.config.hidden_size)  # 40 tokens: the chunk scan pads its last chunk
+    dy = torch.randn(1, 40, stock.config.hidden_size)
+    outputs = {}
+    for name, m in (("stock", stock_mixer), ("reference", mixer)):
+        m.train()
+        m.zero_grad(set_to_none=True)
+        out = m(hidden)
+        out.backward(dy)
+        outputs[name] = (out.detach().double()[0], m.dt_bias.grad.double())
+    for floor in (0.0, 1e-3):
+        dt_bias = mixer.dt_bias.detach().double().requires_grad_()
+        exact = _nemotron_h_reference_mixer_float64(mixer, hidden[0].double(), dt_bias, floor)
+        exact.backward(dy[0].double())
+        outputs[floor] = (exact.detach(), dt_bias.grad)
+
+    def rel(a, b):
+        return ((a - b).norm() / b.norm()).item()
+
+    assert rel(outputs["reference"][0], outputs[0.0][0]) < 1e-5  # FP32 chunk scan against float64
+    assert rel(outputs["reference"][1], outputs[0.0][1]) < 1e-4
+    assert rel(outputs["stock"][0], outputs[1e-3][0]) < 1e-5  # Transformers' own mixer is the floored recurrence
+    assert rel(outputs["stock"][0], outputs[0.0][0]) > 1e-2
+    assert torch.all(outputs["stock"][1][:2] == 0) and torch.all(outputs[0.0][1][:2].abs() > 0)
+
+
+def test_nemotron_h_reference_refuses_a_model_without_mamba_mixers():
+    from arctic_platform.correctness.reference.nemotron_h_reference import unfloor_time_step
+
+    with pytest.raises(ValueError, match="no NemotronHMamba2Mixer"):
+        unfloor_time_step(nn.Sequential(nn.Linear(2, 2)))
+
+
+@pytest.mark.parametrize("model_type", ["nemotron_h", "llama"])
+@pytest.mark.parametrize("huggingface_loader", [False, True])
+def test_nemotron_h_reference_actual_build_engine_family_dispatch(monkeypatch, model_type, huggingface_loader):
+    model = _qwen4_reference_TinyQwen4()
+    cfg = SimpleNamespace(model_type=model_type, architectures=["Tiny"], hidden_size=2)
+    tiny, auto, loads = SimpleNamespace(), SimpleNamespace(), []
+
+    def from_pretrained(path, **kwargs):
+        loads.append(kwargs)
+        return model
+
+    tiny.from_pretrained = auto.from_pretrained = from_pretrained
+
+    def load_nemotron_h_reference(model_class, path, **kwargs):
+        loads.append(("aligned", model_class, path, kwargs))
+        return model
+
+    monkeypatch.setattr(hf_single_gpu, "load_nemotron_h_reference", load_nemotron_h_reference)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoConfig=SimpleNamespace(from_pretrained=lambda *args, **kwargs: cfg),
+            AutoModelForCausalLM=auto,
+            Tiny=tiny,
+        ),
+    )
+    engine = build_engine("fixture", attn_implementation="sdpa", device="cpu", huggingface_loader=huggingface_loader)
+    assert engine.model is model
+    if model_type == "nemotron_h":
+        expected = auto if huggingface_loader else tiny
+        assert loads == [
+            (
+                "aligned",
+                expected,
+                "fixture",
+                {"dtype": torch.bfloat16, "attn_implementation": "sdpa", "device": "cpu"},
+            )
+        ]
+    else:
+        assert loads == [{"dtype": torch.bfloat16, "attn_implementation": "sdpa"}]
+
+
 # Sft.
 
 

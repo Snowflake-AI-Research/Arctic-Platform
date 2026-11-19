@@ -55,6 +55,8 @@ import torch
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 from arctic_platform.correctness.reference.glm5_next_reference import GLM5_NEXT_MODEL_TYPES
 from arctic_platform.correctness.reference.glm5_next_reference import load_glm5_next_reference
+from arctic_platform.correctness.reference.nemotron_h_reference import NEMOTRON_H_MODEL_TYPES
+from arctic_platform.correctness.reference.nemotron_h_reference import load_nemotron_h_reference
 from arctic_platform.correctness.reference.qwen3_5_moe_reference import QWEN3_5_MOE_MODEL_TYPES
 from arctic_platform.correctness.reference.qwen3_5_moe_reference import load_qwen3_5_moe_reference
 
@@ -297,6 +299,15 @@ def build_engine(
     elif getattr(cfg, "model_type", None) in QWEN3_5_MOE_MODEL_TYPES:
         # Qwen3.5-MoE at the sampler's precision (FP32 residual norms, gated norm, beta, RoPE and routing weights).
         model = load_qwen3_5_moe_reference(
+            transformers.AutoModelForCausalLM if huggingface_loader else cls,
+            model_path,
+            dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            device=device,
+        )
+    elif getattr(cfg, "model_type", None) in NEMOTRON_H_MODEL_TYPES:
+        # Nemotron-H with the sampler's unfloored Mamba-2 time step (Transformers floors dt at time_step_min).
+        model = load_nemotron_h_reference(
             transformers.AutoModelForCausalLM if huggingface_loader else cls,
             model_path,
             dtype=torch_dtype,
