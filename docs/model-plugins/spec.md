@@ -58,8 +58,8 @@ flowchart TB
 |---|---|---|
 | Model math | The trainer model, its config and a slow reference implementation | Nothing. The platform never changes your math. |
 | Attention | Q/K/V and output projections, positional encoding | The attention core (`AttentionModule.mix`), its GPU kernels and its sequence parallelism |
-| New layer types | A sequence-mixing core (`mix`) and a `Mixer` that declares how it can be sharded | The head/sequence exchange around your core |
-| Mixture of experts | Routing math and expert weights in the stacked layout; an `ExpertLayer` | Token exchange across the expert-parallel group, DeepSpeed gradient grouping, router-replay transport |
+| New layer types | A sequence-mixing core (`mix`), and a `Mixer`: the policy for sharding it (default head-parallel, or your own, such as halo exchange) | The groups, and the collectives policies are built from |
+| Mixture of experts | Routing and `experts_core` over stacked expert weights; an `ExpertLayer` naming them | Sharding experts, token exchange around `experts_core`, DeepSpeed gradient grouping, router-replay transport |
 | Data layout | Respect packed-row boundaries (`cu_seqlens`) | Packing rows, computing boundaries, splitting sequences across ranks |
 | Weights | Converters between trainer and Hugging Face names | Gathering ZeRO and expert shards, checkpoints, streaming weights to the sampler |
 | Sampling | A vLLM model that loads Hugging Face-named weights | Running vLLM, sizing caches, weight-sync transport |
@@ -78,7 +78,8 @@ flowchart TB
 | **`cu_seqlens`** | Cumulative row boundaries of the **full, unsharded** packed batch, for example `[0, 5, 8, 16]` for rows of 5, 3 and 8 tokens. |
 | **Sequence parallelism (SP)** | Each of `sp` ranks holds `T/sp` consecutive tokens. Cores exchange sequence for heads so each rank computes whole rows for `1/sp` of the heads. |
 | **Head shard** | Which heads a core computes on this rank (`HeadShard(rank, size)`); `FULL_SHARD` when unsharded. |
-| **Expert parallelism (EP)** | Each of `ep` ranks holds `num_experts/ep` routed experts and computes them for all tokens of the group. |
+| **Sequence window** | Which global token positions a core sees under a halo policy (`SequenceWindow(start, halo)`); `FULL_WINDOW` when unsharded. |
+| **Expert parallelism (EP)** | Each of `ep` ranks holds `num_experts/ep` routed experts (`ExpertShard`) and computes them for all tokens of the group. |
 | **Router replay** | In RL, the trainer reuses the expert choices the sampler made for each token, so both compute the same function. |
 | **Weight sync** | After each optimizer step, the trainer streams its full weights under Hugging Face names to the sampler. |
 | **Runtime release** | The frozen set of CUDA, PyTorch, DeepSpeed, transformers, vLLM and Triton versions your plugin runs against. |
@@ -149,6 +150,7 @@ hf_model_types = ["acme_hybrid"]         # config.json "model_type" values this 
 [layer_types]                            # every value used in your config's layer_types
 full_attention = "platform:attention"    # the platform's attention core
 linear_attention = "plugin"              # your mixer, PLUGIN.mixers["linear_attention"]
+conv = "plugin"                          # another plugin mixer, with its own sharding policy
 
 [capabilities]
 training = true
@@ -249,16 +251,32 @@ flowchart LR
 with `q` shaped `[1, T, H, D]` and `k`/`v` shaped `[1, T, H_kv, D]`. You MUST NOT override `mix`: the platform owns the
 core, its kernels and its parallelism.
 
-**New layer types** (`"plugin"`). Your module exposes
-`mix(*tensors, cu_seqlens, shard=FULL_SHARD) -> tensor`, taking and returning head-major `[1, T, H_i, D_i]`
-tensors. The core:
+**New layer types** (`"plugin"`). Your module exposes `mix(*tensors, cu_seqlens, shard) -> tensor`, and you
+register a `Mixer` for the layer type. The split of work is deliberate:
 
-- MUST restart all state (convolutions, recurrences, caches) at every boundary in `cu_seqlens`.
-- MUST compute only the heads `shard.local(num_heads)` selects, slicing its per-head parameters to match.
-- MUST NOT read tokens outside the tensors it is given, or assume it holds the first heads.
+| | Owns |
+|---|---|
+| Your module's `mix` | The math: what the layer computes across tokens |
+| Your `Mixer` | The **policy**: whether a sequence-parallel degree is legal, and how to spread `mix` over a group |
+| The platform | The group, and the collectives a policy uses (`head_parallel`, `previous_tokens`, `sequence_start`) |
 
-Your mixer is usually a `HeadParallelMixer` subclass naming your module class. It checks that every head count in
-`ParallelismInfo.heads[layer_type]` divides by the SP degree. Override `validate_sp` for extra constraints.
+Whatever the policy, `mix`:
+
+- MUST restart all state (convolutions, recurrences, caches) at every boundary in `cu_seqlens`, which always describes the full, unsharded batch.
+- MUST compute exactly what `shard` describes, slicing per-head parameters or offsetting positions to match.
+- MUST NOT read tokens outside the tensors it is given, or assume it holds the first heads or the first tokens.
+
+The `shard` argument's type is set by the layer's policy. Two policies ship today:
+
+| Policy | Use it when | `mix` receives | `shard` | Mixer to register |
+|---|---|---|---|---|
+| **Head-parallel** (default) | Heads are independent inside the core: attention, recurrences, state-space layers | All `T` tokens of `1/sp` of the heads, head-major `[1, T, H_i/sp, D_i]` | `HeadShard(rank, size)`; slice per-head parameters with `shard.local(num_heads)` | `HeadParallelMixer` subclass naming your module class. It checks every head count in `ParallelismInfo.heads[layer_type]` divides by `sp_size`. |
+| **Halo** (custom) | The core reads a short, fixed window of earlier tokens: short and causal convolutions | Its own `T/sp` tokens plus a halo of the previous rank's last tokens, `[1, halo + T/sp, C]` | `SequenceWindow(start, halo)`: the tensors cover global positions `[start - halo, start + T/sp)`. `mix` returns outputs for all of them; the mixer keeps the non-halo part. | Your own `Mixer`. Its `apply_sequence_parallel` wraps `mix` using `previous_tokens` and `sequence_start`; its `validate_sp` has no head constraint. |
+
+Halo exchange moves only `halo` tokens per rank instead of every activation twice, and never splits channels, so any
+sequence-parallel degree works as long as each shard holds at least `halo` tokens. The example's `ShortConvMixer`
+is a complete implementation in about 15 lines. Other policies, such as gathering the full sequence for a core whose
+heads interact, are written the same way.
 
 ### 7.4 Parallelism info
 
@@ -296,36 +314,85 @@ sequenceDiagram
 Requirements: every head count your core exchanges MUST divide by `sp_size`, which admission checks. The packed
 length MUST divide by `sp_size`; the platform pads to make it so.
 
+A halo policy instead keeps every rank on its own tokens and borrows only the tokens its window reaches back to:
+
+```mermaid
+sequenceDiagram
+    participant R0 as Rank 0 (tokens 0..T/2)
+    participant R1 as Rank 1 (tokens T/2..T)
+    Note over R0,R1: project: token-wise, local tokens
+    R0->>R1: previous_tokens: my last K-1 tokens
+    Note over R0: mix: tokens 0..T/2,<br/>shard = SequenceWindow(0, 0)
+    Note over R1: mix: halo + tokens T/2..T,<br/>shard = SequenceWindow(T/2, K-1)
+    Note over R1: keep outputs T/2..T, drop the halo's
+    Note over R0,R1: finish: token-wise, local tokens
+```
+
+In backward, the gradient of the borrowed tokens flows back to the rank that owns them.
+
 ### 7.6 Mixture of experts and expert parallelism
 
-Store routed expert weights **stacked with the expert index as dim 0**, in the platform MoE layout: `w1` (gate)
-and `w3` (up) `[E, I, D]`, `w2` (down) `[E, D, I]`. Implement an `ExpertLayer`:
+MoE follows the same split as mixers: your module owns the math, your `ExpertLayer` declares the policy, and the
+platform moves tokens. Model code never calls a collective and never tracks which experts it holds.
 
-| Method | Contract |
-|---|---|
-| `is_instance(module)` | Claims your MoE modules. Their count MUST match `ParallelismInfo.moe_layers`. |
-| `num_experts(module)` | Routed experts in the unsharded module. |
-| `expert_parameters(module)` | `{relative_name: parameter}` for every stacked expert tensor. |
-| `apply_expert_parallel(module, group)` | Keep this rank's contiguous block of experts (`shard_experts`), record your offset, and route the group's tokens with `gather_tokens` / `combine_tokens`. |
+Your MoE module MUST:
+
+- have a `num_experts` attribute, and store routed expert weights **stacked with the expert index as dim 0** in the platform MoE layout: `w1` (gate) and `w3` (up) `[E, I, D]`, `w2` (down) `[E, D, I]`;
+- route token by token in its forward, then call `self.experts_core(tokens, selected, weights)` and add any shared expert;
+- implement `experts_core(tokens [N, D], selected [N, top_k], weights [N, top_k], *, shard: ExpertShard | None = None) -> [N, D]`: the summed contribution of the experts `shard` holds, where local expert `i` is global expert `shard.start + i`. With `shard=None` it holds them all.
+
+```python
+def forward(self, x, routed=None):
+    tokens = x.reshape(-1, x.shape[-1])
+    selected, weights = self.route(tokens, routed)            # token-wise; honours router replay
+    out = self.experts_core(tokens, selected, weights) + self.shared_expert(tokens)
+    return out.view_as(x), selected
+
+def experts_core(self, tokens, selected, weights, *, shard=None):
+    shard = shard or ExpertShard.full(self.num_experts)
+    out = torch.zeros_like(tokens)
+    for local in range(shard.per_rank):                        # only the experts this rank holds
+        rows, slots = (selected == shard.start + local).nonzero(as_tuple=True)
+        ...                                                    # expert `local` on tokens[rows], weighted
+    return out
+```
+
+Register a `StackedExpertLayer` naming the module class and its stacked tensors:
+
+```python
+class AcmeExpertLayer(StackedExpertLayer):
+    module_class = AcmeMoE
+    expert_names = ("experts.w1", "experts.w2", "experts.w3")
+```
+
+Under expert parallelism the platform keeps each rank's block of experts, then wraps `experts_core`:
 
 ```mermaid
 flowchart LR
     subgraph r0["Rank 0: experts 0,1"]
-        T0["my tokens + routing"] --> G0["gather_tokens"]
-        G0 --> E0["experts 0,1 on<br/>all group tokens"] --> C0["combine_tokens"] --> Y0["my outputs"]
+        T0["route my tokens"] --> G0["platform: gather"]
+        G0 --> E0["experts_core<br/>shard = experts 0,1<br/>all group tokens"] --> C0["platform: combine"] --> Y0["my outputs"]
     end
     subgraph r1["Rank 1: experts 2,3"]
-        T1["my tokens + routing"] --> G1["gather_tokens"]
-        G1 --> E1["experts 2,3 on<br/>all group tokens"] --> C1["combine_tokens"] --> Y1["my outputs"]
+        T1["route my tokens"] --> G1["platform: gather"]
+        G1 --> E1["experts_core<br/>shard = experts 2,3<br/>all group tokens"] --> C1["platform: combine"] --> Y1["my outputs"]
     end
-    G0 -.-|all-gather| G1
+    G0 -.-|tokens, ids, weights| G1
     C0 -.-|sum, keep own rows| C1
 ```
 
+| `ExpertLayer` member | Called by | `StackedExpertLayer` does |
+|---|---|---|
+| `is_instance(module)` | Binding | `isinstance(module, module_class)`. The count MUST match `ParallelismInfo.moe_layers`. |
+| `num_experts(module)` | `prepare_model`, before sharding | `module.num_experts` |
+| `expert_parameters(module)` | `prepare_model`, before and after sharding | The tensors in `expert_names` |
+| `apply_expert_parallel(module, group)` | `prepare_model` | `expert_parallel(...)`: shard the stacked tensors and wrap `experts_core` |
+
 After `apply_expert_parallel`, the platform verifies each expert tensor holds `num_experts / ep` experts and tags it
-so DeepSpeed reduces its gradients over the expert-data-parallel group. Routing, shared experts and any router bias
-stay replicated. `gather_tokens` needs equal token counts on every rank of the group, which the platform guarantees
-by padding.
+so DeepSpeed reduces its gradients over the expert-data-parallel group, and so export gathers it back. Routing,
+shared experts and any router bias stay replicated. Write your own `ExpertLayer` only for a different dispatch
+policy; the platform can likewise replace the token exchange behind `experts_core`, for example with DeepEP's
+all-to-all on GPU, without changing your model code.
 
 On GPU the platform's own MoE layer, with DeepEP/UCCL dispatch, grouped GEMM and SonicMoE kernels, uses the same
 stacked layout and router-replay semantics. A plugin whose routing it can express SHOULD use it. The example plugin
@@ -457,7 +524,7 @@ python -m arctic_platform.model_plugin.conformance --plugin your_model:PLUGIN --
 | checkpoint and sync | Single-file and sharded save → reload reproduce logits exactly; the checkpoint carries this plugin's stamp; the sampler stream equals the checkpoint minus skipped tensors | Lossy or asymmetric converters, broken sharding, missing tensors |
 | RL step | A GRPO step (the platform's `grpo_loss`) on packed rows equals the same step on padded rows, for loss and every gradient | Masking and packing bugs in the training path |
 | router replay | Replaying captured routing reproduces logits exactly; all-`ROUTER_REPLAY_FRESH` does too; forcing other experts changes the output | A router that ignores replay |
-| SP, EP, SP+EP | On 2+ gloo ranks, sharded logits and every gradient equal the unsharded model's. Under EP, the exported weight stream equals the unsharded model's. SP+EP runs with activation checkpointing on. | Wrong head slicing, global vs local boundaries, wrong expert offsets, missing gradient paths, expert shards exported out of order, collectives that break under recompute |
+| SP, EP, SP+EP | On 2+ gloo ranks, sharded logits and every gradient equal the unsharded model's. Under EP, the exported weight stream equals the unsharded model's. SP+EP runs with activation checkpointing on. | Wrong head slicing, a missing or wrong halo, global vs local boundaries, wrong expert offsets, missing gradient paths, expert shards exported out of order, collectives that break under recompute |
 | weights directory (`--weights`) | Your real weights directory has a matching config, every tensor with the model's name and shape (checked on the meta device, so no GPU or full load), and a tokenizer that loads without remote code | Truncated or mismatched checkpoints, missing index shards, tokenizer problems |
 | sampler log-prob parity (GPU) | After a weight sync, sampler log-probs match trainer log-probs within the calibrated tolerance | Wrong vLLM name map, fused-shard order, sampler numerics |
 | real-weights step (GPU) | One training step on your real weights and declared profile, save, and reload | Memory and scale issues the tiny fixture hides |
@@ -468,14 +535,15 @@ plugin at registration and recorded with the admitted version.
 
 ```toml
 seed = 0
-sequence_lengths = [5, 3, 8]   # packed rows; the total must divide by every sp size
+sequence_lengths = [5, 6, 5]   # packed rows; the total must divide by every sp size, and a row must cross each
+                               # shard boundary so state carried from the previous rank is exercised
 sp_sizes = [2]
 ep_sizes = [2]
 
 [fixture]                      # kwargs for your config class: tiny, but with every layer and MLP kind
 vocab_size = 64
 hidden_size = 32
-layer_types = ["linear_attention", "full_attention", "linear_attention", "full_attention"]
+layer_types = ["linear_attention", "full_attention", "conv", "full_attention"]
 mlp_types = ["dense", "moe", "moe", "dense"]
 
 [tolerances]
@@ -560,8 +628,9 @@ flowchart TB
         direction LR
         N1["RMSNorm"] --> MX{"layer_types[i]"}
         MX -->|full_attention| AT["ToyAttention<br/>GQA + RoPE, platform core"]
-        MX -->|linear_attention| RC["ToyRecurrence<br/>conv + gated recurrence, plugin core"]
-        AT & RC --> N2["RMSNorm"] --> MP{"mlp_types[i]"}
+        MX -->|linear_attention| RC["ToyRecurrence<br/>gated recurrence,<br/>head-parallel policy"]
+        MX -->|conv| SC["ToyShortConv<br/>gated short conv,<br/>halo policy"]
+        AT & RC & SC --> N2["RMSNorm"] --> MP{"mlp_types[i]"}
         MP -->|dense| DM["SwiGLU MLP"]
         MP -->|moe| MO["ToyMoE<br/>top-k softmax, stacked experts,<br/>shared expert, router replay"]
     end
@@ -573,8 +642,9 @@ flowchart TB
 | Manifest, capabilities, sampler | `toy_hybrid_moe/manifest.toml` |
 | Config-driven structure | `config.py` (`layer_types`, `mlp_types`) |
 | Platform attention | `modeling.ToyAttention(AttentionModule)` |
-| New layer type and its SP | `modeling.ToyRecurrence.mix` (row restarts, head slicing); `parallel.GatedRecurrenceMixer` |
-| MoE, EP and router replay | `modeling.ToyMoE`; `parallel.ToyExpertLayer` |
+| New layer type, default policy | `modeling.ToyRecurrence.mix` (row restarts, head slicing); `parallel.GatedRecurrenceMixer` |
+| New layer type, custom policy | `modeling.ToyShortConv.mix` (global positions from `SequenceWindow`); `parallel.ShortConvMixer` (halo exchange) |
+| MoE, EP and router replay | `modeling.ToyMoE` (`route`, `experts_core`); `parallel.ToyExpertLayer` (a `StackedExpertLayer`) |
 | Trainer-only state | `modeling.LoadStats`, marked with `skip_weight_sync` |
 | Hugging Face conversion | `weights.py`: per-expert keys, `mlp.gate`, `Conv1d` layout |
 | Reference oracle | `reference.py`: explicit attention, loops, per-token experts |
@@ -602,8 +672,10 @@ The test suite also feeds conformance deliberately broken variants and checks th
 - statistics counted again on recompute;
 - a router that ignores replay;
 - a lossy converter;
+- a convolution that ignores row boundaries;
 - an SP rank slicing the wrong heads;
-- EP ranks that forget their expert offset;
+- a halo mixer that never borrows the previous rank's tokens;
+- an `experts_core` that treats its local experts as experts 0 onward;
 - weights directories with a missing tokenizer, a mismatched config or a foreign `model_type`;
 - a checkpoint stamped by another plugin.
 
@@ -615,8 +687,9 @@ The test suite also feeds conformance deliberately broken variants and checks th
 
 - [ ] The manifest declares only capabilities that pass conformance.
 - [ ] Every value in the config's `layer_types` is in the manifest, and every sequence-mixing module sets `ap_layer_type`.
-- [ ] Cores restart at row boundaries and slice per-head parameters by `shard`.
-- [ ] Expert weights are stacked on dim 0, and the router honours `routed_experts` and `ROUTER_REPLAY_FRESH`.
+- [ ] Cores restart at row boundaries and compute exactly what `shard` describes: heads for head-parallel, global positions for halo.
+- [ ] Every plugin layer type has a mixer whose policy fits its core; custom policies use only the platform's collectives.
+- [ ] Expert weights are stacked on dim 0, `experts_core` offsets by `shard.start`, and the router honours `routed_experts` and `ROUTER_REPLAY_FRESH`.
 - [ ] Decoder layers are recomputable; side effects are guarded with `in_recompute()`.
 - [ ] The weights directory passes `--weights`: matching config, sharded safetensors with an index, and a tokenizer with EOS and a chat template.
 - [ ] The converters are exact inverses, and trainer-only state is marked `skip_weight_sync`.
@@ -636,7 +709,7 @@ The test suite also feeds conformance deliberately broken variants and checks th
 
 ## 16. Open questions for review
 
-1. Should a plugin be allowed to use the platform's GPU MoE layer directly through the API, so customers get DeepEP dispatch without writing an `ExpertLayer`?
+1. Should a plugin be allowed to use the platform's GPU MoE layer directly through the API, so customers get its grouped GEMM and SonicMoE kernels as well as DeepEP dispatch behind `experts_core`?
 2. Which GPU tolerance policy suits RL customers best for sampler log-prob parity: a fixed bound, or calibration against a known-good model of similar size?
 3. Should `peft` (LoRA) get its own conformance tier in 1.0, including expert LoRA?
 4. Is a per-plugin `max_sequence_length` or memory profile needed in the manifest for admission, beyond `profiles`?

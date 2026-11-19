@@ -23,6 +23,7 @@ FULL_ATTENTION = "full_attention"
 # transformers validates layer_types against its known kinds, and vLLM counts a hybrid model's stateful layers by
 # the name "linear_attention" when it sizes their caches, so the recurrence uses that name.
 GATED_RECURRENCE = "linear_attention"
+SHORT_CONV = "conv"
 DENSE = "dense"
 MOE = "moe"
 
@@ -44,6 +45,7 @@ class ToyHybridMoEConfig(PretrainedConfig):
         recurrence_heads: int = 4,
         recurrence_head_dim: int = 8,
         conv_kernel: int = 3,
+        conv_channels: int = 32,
         intermediate_size: int = 64,
         num_experts: int = 4,
         num_experts_per_tok: int = 2,
@@ -53,11 +55,12 @@ class ToyHybridMoEConfig(PretrainedConfig):
         rms_norm_eps: float = 1e-6,
         **kwargs,
     ):
-        layer_types = list(layer_types or [GATED_RECURRENCE, FULL_ATTENTION, GATED_RECURRENCE, FULL_ATTENTION])
+        layer_types = list(layer_types or [GATED_RECURRENCE, FULL_ATTENTION, SHORT_CONV, FULL_ATTENTION])
         mlp_types = list(mlp_types or [DENSE, MOE, MOE, DENSE])
         if len(layer_types) != len(mlp_types):
             raise ValueError(f"{len(layer_types)} layer_types but {len(mlp_types)} mlp_types")
-        unknown = (set(layer_types) - {FULL_ATTENTION, GATED_RECURRENCE}) | (set(mlp_types) - {DENSE, MOE})
+        kinds = {FULL_ATTENTION, GATED_RECURRENCE, SHORT_CONV}
+        unknown = (set(layer_types) - kinds) | (set(mlp_types) - {DENSE, MOE})
         if len(unknown) > 0:
             raise ValueError(f"unknown layer or mlp types: {sorted(unknown)}")
         if num_attention_heads % num_key_value_heads != 0:
@@ -77,6 +80,7 @@ class ToyHybridMoEConfig(PretrainedConfig):
         self.recurrence_heads = recurrence_heads
         self.recurrence_head_dim = recurrence_head_dim
         self.conv_kernel = conv_kernel
+        self.conv_channels = conv_channels
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok

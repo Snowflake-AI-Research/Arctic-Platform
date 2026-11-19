@@ -1,14 +1,15 @@
 # Conformance fixture for ToyHybridMoE: a tiny fp32 model that still has every layer kind.
 seed = 0
-# Three packed rows of unequal length; 16 tokens split evenly across 2 sequence-parallel ranks.
-sequence_lengths = [5, 3, 8]
+# Three packed rows of unequal length; 16 tokens split evenly across 2 sequence-parallel ranks, with the middle
+# row crossing the shard boundary at token 8 so state from the previous rank is exercised.
+sequence_lengths = [5, 6, 5]
 sp_sizes = [2]
 ep_sizes = [2]
 
 [fixture]
 vocab_size = 64
 hidden_size = 32
-layer_types = ["linear_attention", "full_attention", "linear_attention", "full_attention"]
+layer_types = ["linear_attention", "full_attention", "conv", "full_attention"]
 mlp_types = ["dense", "moe", "moe", "dense"]
 num_attention_heads = 4
 num_key_value_heads = 2

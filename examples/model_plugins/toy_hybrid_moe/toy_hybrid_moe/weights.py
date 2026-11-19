@@ -47,6 +47,8 @@ def convert_layer_to_hf(
         elif name.endswith(".recurrence.conv_weight"):
             heads, head_dim, kernel = tensor.shape
             out[name.replace(".conv_weight", ".conv1d.weight")] = tensor.reshape(heads * head_dim, 1, kernel)
+        elif name.endswith(".conv.conv_weight"):
+            out[name.replace(".conv_weight", ".conv1d.weight")] = tensor.unsqueeze(1)
         else:
             out[name] = tensor
     return out
@@ -71,6 +73,13 @@ def convert_layer_to_prime(
                     f"{name}: expected Conv1d weight {(shape[0] * shape[1], 1, shape[2])}, got {tuple(tensor.shape)}"
                 )
             out[name.replace(".conv1d.weight", ".conv_weight")] = tensor.reshape(shape)
+        elif name.endswith(".conv.conv1d.weight"):
+            if tuple(tensor.shape) != (config.conv_channels, 1, config.conv_kernel):
+                raise ValueError(
+                    f"{name}: expected Conv1d weight {(config.conv_channels, 1, config.conv_kernel)}, "
+                    f"got {tuple(tensor.shape)}"
+                )
+            out[name.replace(".conv1d.weight", ".conv_weight")] = tensor.squeeze(1)
         else:
             out[name] = tensor
     for (prefix, trainer_name), by_index in experts.items():

@@ -35,6 +35,8 @@ _FUSED: tuple[tuple[str, str, str | int], ...] = (
     (".mlp.up_proj.weight", ".mlp.gate_up_proj.weight", 1),
     (".recurrence.in_proj.weight", ".recurrence.in_gate_proj.weight", 0),
     (".recurrence.gate_proj.weight", ".recurrence.in_gate_proj.weight", 1),
+    (".conv.in_proj.weight", ".conv.in_gate_proj.weight", 0),
+    (".conv.gate_proj.weight", ".conv.in_gate_proj.weight", 1),
 )
 _EXPERT = re.compile(r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$")
 _EXPERT_SHARD = {"gate_proj": ("w13_weight", "w1"), "up_proj": ("w13_weight", "w3"), "down_proj": ("w2_weight", "w2")}

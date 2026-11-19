@@ -48,6 +48,21 @@ class HeadShard:
 FULL_SHARD = HeadShard()
 
 
+@dataclass(frozen=True)
+class SequenceWindow:
+    """The tokens a sequence-parallel core sees: global positions ``[start - halo, start + local length)``.
+
+    ``start`` is the global position of this rank's first token; the ``halo`` tokens before it were borrowed
+    from the previous rank. Unsharded, both are 0.
+    """
+
+    start: int = 0
+    halo: int = 0
+
+
+FULL_WINDOW = SequenceWindow()
+
+
 def group_size(group) -> int:
     return 1 if group is None else dist.get_world_size(group)
 
@@ -94,6 +109,44 @@ def head_parallel(module: nn.Module, group) -> None:
         return heads_to_seq(group, core(*local, cu_seqlens=cu_seqlens, shard=shard))
 
     setattr(module, "mix", mix)
+
+
+class _GatherStack(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, group, tensor):
+        ctx.group = group
+        ctx.rank = group_rank(group)
+        parts = [torch.empty_like(tensor) for _ in range(group_size(group))]
+        dist.all_gather(parts, tensor.contiguous(), group=group)
+        return torch.stack(parts)
+
+    @staticmethod
+    def backward(ctx, grad):
+        grad = grad.contiguous()
+        dist.all_reduce(grad, group=ctx.group)
+        return None, grad[ctx.rank]
+
+
+def sequence_start(group, local_length: int) -> int:
+    """Global position of this rank's first token when a sequence is split into equal contiguous shards."""
+    return group_rank(group) * local_length
+
+
+def previous_tokens(group, tensor: torch.Tensor, count: int, dim: int = 1) -> torch.Tensor:
+    """The last ``count`` tokens of the previous rank's shard along ``dim``; empty on the first rank.
+
+    Gradients flow back to the rank that owns those tokens. Every rank of ``group`` must call it.
+    """
+    size = group_size(group)
+    if size == 1 or count == 0:
+        return tensor.narrow(dim, 0, 0)
+    if tensor.size(dim) < count:
+        raise ValueError(f"a {tensor.size(dim)}-token shard cannot supply a {count}-token halo")
+    tails = _GatherStack.apply(group, tensor.narrow(dim, tensor.size(dim) - count, count))
+    rank = group_rank(group)
+    # The first rank keeps an empty slice of the gathered tails, not a fresh tensor, so its backward still joins
+    # the gradient all-reduce the other ranks wait on.
+    return tails[rank - 1] if rank > 0 else tails[0].narrow(dim, 0, 0)
 
 
 def shard_sequence(tensor: torch.Tensor, group, dim: int = 1) -> torch.Tensor:

@@ -4,8 +4,9 @@ A tiny architecture that is new to the platform and touches every part of the
 [model plugin contract](../../../docs/model-plugins/spec.md):
 
 - attention layers on the platform's attention core;
-- a gated linear recurrence as a plugin-supplied layer type, with its own sequence parallelism;
-- dense and mixture-of-experts MLPs, with expert parallelism and router replay;
+- a gated linear recurrence as a plugin layer type on the default, head-parallel sequence-parallel policy;
+- a gated short convolution as a plugin layer type with its own policy, a halo exchange with the previous rank;
+- dense and mixture-of-experts MLPs, with expert parallelism and router replay; the MoE code never moves tokens;
 - trainer-only state left out of the weight sync;
 - Hugging Face checkpoint conversion that renames and reshapes;
 - a vLLM model for sampling.

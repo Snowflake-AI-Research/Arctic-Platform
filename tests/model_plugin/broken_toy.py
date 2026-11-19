@@ -21,12 +21,17 @@ Importable by name so conformance's spawned gloo workers can load them like any 
 import dataclasses
 
 from toy_hybrid_moe import PLUGIN
+from toy_hybrid_moe.config import SHORT_CONV
 from toy_hybrid_moe.modeling import ToyHybridMoEForCausalLM
+from toy_hybrid_moe.modeling import ToyMoE
 from toy_hybrid_moe.modeling import ToyRecurrence
-from toy_hybrid_moe.parallel import ToyExpertLayer
+from toy_hybrid_moe.parallel import ShortConvMixer
 
 from arctic_platform.model_plugin import FULL_SHARD
+from arctic_platform.model_plugin import ExpertShard
 from arctic_platform.model_plugin import HeadShard
+from arctic_platform.model_plugin import SequenceWindow
+from arctic_platform.model_plugin import sequence_start
 
 
 class FirstHeadsRecurrence(ToyRecurrence):
@@ -36,21 +41,38 @@ class FirstHeadsRecurrence(ToyRecurrence):
         return super().mix(u, g, cu_seqlens=cu_seqlens, shard=HeadShard(0, shard.size))
 
 
-def _build_first_heads(config):
-    model = ToyHybridMoEForCausalLM(config)
-    for module in model.modules():
-        if type(module) is ToyRecurrence:
-            module.__class__ = FirstHeadsRecurrence
-    return model
+class FirstExpertsMoE(ToyMoE):
+    """Computes its local experts as if they were always experts 0.., whatever its shard."""
+
+    def experts_core(self, tokens, selected, weights, *, shard=None):
+        if shard is not None:
+            shard = ExpertShard(0, shard.size, shard.num_experts)
+        return super().experts_core(tokens, selected, weights, shard=shard)
 
 
-class NoOffsetExpertLayer(ToyExpertLayer):
-    """Shards the experts but leaves every rank thinking it holds experts 0..E/ep-1."""
+def _builder(original: type, broken: type):
+    def build(config):
+        model = ToyHybridMoEForCausalLM(config)
+        for module in model.modules():
+            if type(module) is original:
+                module.__class__ = broken
+        return model
 
-    def apply_expert_parallel(self, module, group):
-        super().apply_expert_parallel(module, group)
-        module.expert_offset = 0
+    return build
 
 
-WRONG_HEAD_SLICE = dataclasses.replace(PLUGIN, build_model=_build_first_heads)
-NO_EXPERT_OFFSET = dataclasses.replace(PLUGIN, expert_layer=NoOffsetExpertLayer())
+class NoHaloMixer(ShortConvMixer):
+    """Shards the convolution by sequence but never borrows the previous rank's tokens."""
+
+    def apply_sequence_parallel(self, module, group):
+        core = module.mix
+
+        def mix(u, *, cu_seqlens, shard=None):
+            return core(u, cu_seqlens=cu_seqlens, shard=SequenceWindow(start=sequence_start(group, u.shape[1])))
+
+        setattr(module, "mix", mix)
+
+
+WRONG_HEAD_SLICE = dataclasses.replace(PLUGIN, build_model=_builder(ToyRecurrence, FirstHeadsRecurrence))
+WRONG_EXPERT_SLICE = dataclasses.replace(PLUGIN, build_model=_builder(ToyMoE, FirstExpertsMoE))
+NO_HALO = dataclasses.replace(PLUGIN, mixers=dict(PLUGIN.mixers, **{SHORT_CONV: NoHaloMixer()}))

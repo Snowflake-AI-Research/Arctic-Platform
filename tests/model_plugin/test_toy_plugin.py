@@ -88,12 +88,13 @@ def test_new_layer_count_and_pattern_needs_no_code_change():
                 SPEC.fixture,
                 layer_types=[
                     "full_attention",
+                    "conv",
                     "linear_attention",
-                    "linear_attention",
+                    "conv",
                     "full_attention",
                     "linear_attention",
                 ],
-                mlp_types=["moe", "dense", "moe", "moe", "dense"],
+                mlp_types=["moe", "dense", "moe", "moe", "dense", "moe"],
                 sliding_window=4,
             )
         )
@@ -109,6 +110,17 @@ def test_recurrence_that_ignores_row_boundaries_fails_packing():
         return real_mix(self, u, g, cu_seqlens=torch.tensor([0, u.shape[1]], dtype=cu_seqlens.dtype), shard=shard)
 
     with patch.object(modeling.ToyRecurrence, "mix", one_row):
+        with pytest.raises(AssertionError, match="packed vs alone"):
+            conformance.check_packing(PLUGIN, SPEC)
+
+
+def test_convolution_that_ignores_row_boundaries_fails_packing():
+    real_mix = modeling.ToyShortConv.mix
+
+    def one_row(self, u, *, cu_seqlens, shard=modeling.FULL_WINDOW):
+        return real_mix(self, u, cu_seqlens=torch.tensor([0, 10**6], dtype=cu_seqlens.dtype), shard=shard)
+
+    with patch.object(modeling.ToyShortConv, "mix", one_row):
         with pytest.raises(AssertionError, match="packed vs alone"):
             conformance.check_packing(PLUGIN, SPEC)
 
@@ -140,8 +152,10 @@ def test_lossy_export_fails_checkpoint():
     "target, mode",
     [
         ("tests.model_plugin.broken_toy:WRONG_HEAD_SLICE", "sp"),
-        ("tests.model_plugin.broken_toy:NO_EXPERT_OFFSET", "ep"),
+        ("tests.model_plugin.broken_toy:NO_HALO", "sp"),
+        ("tests.model_plugin.broken_toy:WRONG_EXPERT_SLICE", "ep"),
     ],
+    ids=["head-parallel-slice", "halo-missing", "expert-slice"],
 )
 def test_parallelism_bug_fails_parallel_tier(target, mode):
     with pytest.raises(Exception, match=f"{mode} (logits|grad)"):
@@ -161,6 +175,7 @@ def test_sampler_stream_maps_onto_the_vllm_model():
         shards[target.param].add((target.shard, target.expert))
     experts = range(config.num_experts)
     assert shards["model.layers.0.recurrence.in_gate_proj.weight"] == {(0, None), (1, None)}
+    assert shards["model.layers.2.conv.in_gate_proj.weight"] == {(0, None), (1, None)}
     assert shards["model.layers.1.self_attn.qkv_proj.weight"] == {("q", None), ("k", None), ("v", None)}
     assert shards["model.layers.1.mlp.experts.w13_weight"] == {(s, e) for s in ("w1", "w3") for e in experts}
     assert shards["model.layers.1.mlp.experts.w2_weight"] == {("w2", e) for e in experts}

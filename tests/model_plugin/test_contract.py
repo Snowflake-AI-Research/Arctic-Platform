@@ -43,7 +43,11 @@ def _manifest(**overrides) -> dict:
 
 def test_toy_manifest_is_valid_and_on_contract():
     PLUGIN.manifest.check_contract()
-    assert PLUGIN.manifest.layer_types == {"full_attention": "platform:attention", "linear_attention": "plugin"}
+    assert PLUGIN.manifest.layer_types == {
+        "full_attention": "platform:attention",
+        "linear_attention": "plugin",
+        "conv": "plugin",
+    }
 
 
 @pytest.mark.parametrize(
@@ -60,6 +64,14 @@ def test_toy_manifest_is_valid_and_on_contract():
 def test_manifest_rejects(overrides, message):
     with pytest.raises(ValidationError, match=message.replace("[", r"\[")):
         PluginManifest.model_validate(_manifest(**overrides))
+
+
+def test_conformance_spec_needs_a_row_across_every_shard_boundary():
+    from arctic_platform.model_plugin.conformance import ConformanceSpec
+
+    with pytest.raises(ValidationError, match="must cross a shard boundary"):
+        ConformanceSpec(fixture={}, sequence_lengths=[5, 3, 8], sp_sizes=[2])
+    ConformanceSpec(fixture={}, sequence_lengths=[5, 6, 5], sp_sizes=[2])
 
 
 def test_contract_major_version_mismatch_is_refused():
@@ -81,6 +93,7 @@ def test_binding_follows_the_config_whatever_the_layer_count():
     for layer_types, mlp_types in [
         (["full_attention"], ["moe"]),
         (["linear_attention"] * 3 + ["full_attention"] * 3, ["dense", "moe"] * 3),
+        (["conv", "conv", "full_attention", "linear_attention", "conv"], ["moe"] * 5),
     ]:
         config = ToyHybridMoEConfig(layer_types=layer_types, mlp_types=mlp_types)
         model = ToyHybridMoEForCausalLM(config)

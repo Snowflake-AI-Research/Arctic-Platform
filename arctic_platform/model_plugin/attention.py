@@ -25,10 +25,14 @@ from arctic_platform.model_plugin.parallel import FULL_SHARD
 from arctic_platform.model_plugin.parallel import HeadShard
 
 
+def segment_of(cu_seqlens: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    """The packed-row index of each global token position."""
+    return torch.bucketize(positions, cu_seqlens[1:].to(device=positions.device, dtype=positions.dtype), right=True)
+
+
 def segment_ids(cu_seqlens: torch.Tensor, length: int) -> torch.Tensor:
-    """The packed-row index of each of ``length`` tokens."""
-    positions = torch.arange(length, device=cu_seqlens.device)
-    return torch.bucketize(positions, cu_seqlens[1:].to(positions.dtype), right=True)
+    """The packed-row index of each of the first ``length`` tokens."""
+    return segment_of(cu_seqlens, torch.arange(length, device=cu_seqlens.device))
 
 
 def varlen_causal_attention(

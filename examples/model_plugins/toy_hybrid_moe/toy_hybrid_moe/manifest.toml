@@ -7,7 +7,8 @@ hf_model_types = ["toy_hybrid_moe"]
 
 [layer_types]
 full_attention = "platform:attention"   # the platform's attention core, sequence-parallel and fused on GPU
-linear_attention = "plugin"             # the gated recurrence, new to the platform: parallel.GatedRecurrenceMixer
+linear_attention = "plugin"             # gated recurrence: parallel.GatedRecurrenceMixer (head-parallel policy)
+conv = "plugin"                         # short convolution: parallel.ShortConvMixer (halo-exchange policy)
 
 [capabilities]
 training = true

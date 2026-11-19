@@ -85,7 +85,7 @@ class ConformanceSpec(BaseModel):
 
     fixture: dict[str, Any]
     seed: int = 0
-    sequence_lengths: list[int] = Field(default_factory=lambda: [5, 3, 8], min_length=2)
+    sequence_lengths: list[int] = Field(default_factory=lambda: [5, 6, 5], min_length=2)
     sp_sizes: list[int] = Field(default_factory=lambda: [2])
     ep_sizes: list[int] = Field(default_factory=lambda: [2])
     tolerances: Tolerances = Field(default_factory=Tolerances)
@@ -93,9 +93,15 @@ class ConformanceSpec(BaseModel):
     @model_validator(mode="after")
     def _check(self) -> ConformanceSpec:
         total = sum(self.sequence_lengths)
+        row_starts = {sum(self.sequence_lengths[:i]) for i in range(len(self.sequence_lengths))}
         for size in self.sp_sizes:
             if total % size != 0:
                 raise ValueError(f"total sequence length {total} must be divisible by every sp size, not {size}")
+            # A row that starts on a shard boundary never needs its predecessor shard's tokens, which would let a
+            # mixer that ignores state from the previous rank pass.
+            shard_starts = {rank * total // size for rank in range(1, size)}
+            if shard_starts <= row_starts:
+                raise ValueError(f"with sp size {size}, at least one row must cross a shard boundary")
         return self
 
 

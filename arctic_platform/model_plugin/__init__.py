@@ -26,6 +26,9 @@ from arctic_platform.model_plugin.attention import AttentionModule
 from arctic_platform.model_plugin.attention import varlen_causal_attention
 from arctic_platform.model_plugin.experts import ROUTER_REPLAY_FRESH
 from arctic_platform.model_plugin.experts import ExpertLayer
+from arctic_platform.model_plugin.experts import ExpertShard
+from arctic_platform.model_plugin.experts import StackedExpertLayer
+from arctic_platform.model_plugin.experts import expert_parallel
 from arctic_platform.model_plugin.experts import shard_experts
 from arctic_platform.model_plugin.manifest import CONTRACT_VERSION
 from arctic_platform.model_plugin.manifest import Capabilities
@@ -36,9 +39,13 @@ from arctic_platform.model_plugin.mixers import AttentionMixer
 from arctic_platform.model_plugin.mixers import HeadParallelMixer
 from arctic_platform.model_plugin.mixers import Mixer
 from arctic_platform.model_plugin.parallel import FULL_SHARD
+from arctic_platform.model_plugin.parallel import FULL_WINDOW
 from arctic_platform.model_plugin.parallel import HeadShard
+from arctic_platform.model_plugin.parallel import SequenceWindow
 from arctic_platform.model_plugin.parallel import combine_tokens
 from arctic_platform.model_plugin.parallel import gather_tokens
+from arctic_platform.model_plugin.parallel import previous_tokens
+from arctic_platform.model_plugin.parallel import sequence_start
 from arctic_platform.model_plugin.plugin import ENTRY_POINT_GROUP
 from arctic_platform.model_plugin.plugin import ModelPlugin
 from arctic_platform.model_plugin.plugin import ParallelismInfo
@@ -51,32 +58,39 @@ from arctic_platform.model_plugin.weights import skip_weight_sync
 
 __all__ = [
     "AdmissionError",
+    "apply_activation_checkpointing",
     "AttentionMixer",
     "AttentionModule",
-    "CONTRACT_VERSION",
     "Capabilities",
+    "check_job_request",
+    "combine_tokens",
+    "CONTRACT_VERSION",
+    "discover_plugins",
     "ENTRY_POINT_GROUP",
+    "expert_parallel",
     "ExpertLayer",
+    "ExpertShard",
     "FULL_SHARD",
+    "FULL_WINDOW",
+    "gather_tokens",
     "HeadParallelMixer",
     "HeadShard",
+    "in_recompute",
     "JobRequest",
+    "load_manifest",
+    "load_plugin",
     "Mixer",
     "ModelPlugin",
     "ParallelismInfo",
+    "plugin_for_model_type",
     "PluginManifest",
+    "previous_tokens",
     "ROUTER_REPLAY_FRESH",
     "SamplerSpec",
-    "apply_activation_checkpointing",
-    "check_job_request",
-    "combine_tokens",
-    "discover_plugins",
-    "gather_tokens",
-    "in_recompute",
-    "load_manifest",
-    "load_plugin",
-    "plugin_for_model_type",
+    "sequence_start",
+    "SequenceWindow",
     "shard_experts",
     "skip_weight_sync",
+    "StackedExpertLayer",
     "varlen_causal_attention",
 ]

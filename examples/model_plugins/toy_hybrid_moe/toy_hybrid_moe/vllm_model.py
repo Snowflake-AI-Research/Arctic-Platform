@@ -19,10 +19,12 @@ Written against vLLM 0.33's model interfaces and loaded through the ``vllm.gener
 a GPU and vLLM, so the CPU conformance tiers do not run it; the service's sampler tier compares its log-probs with
 the trainer's after a weight sync.
 
-Tensor parallelism shards attention and recurrence heads and the MLP intermediate dimension. The recurrence is a
-vLLM stateful ("mamba-like") layer: vLLM allocates a convolution state and a recurrent state per request, and
-:class:`ToyRecurrenceVLLM` reads and updates them in place. It is not registered as a custom op, so the manifest
-sets ``enforce_eager``.
+Tensor parallelism shards attention and recurrence heads, convolution channels and the MLP intermediate dimension.
+The recurrence and the short convolution are vLLM stateful ("mamba-like") layers: vLLM allocates a convolution state
+and a recurrent state per request in one layout shared by both, and each layer reads and updates them in place. They
+are not registered as custom ops, so the manifest sets ``enforce_eager``. vLLM sizes these caches by counting the
+stateful entries of ``layer_types``; that it counts ``conv`` as well as ``linear_attention`` for this model is part of
+what the sampler tier verifies.
 """
 
 from __future__ import annotations
@@ -62,6 +64,7 @@ except ImportError:
 
 from .config import FULL_ATTENTION
 from .config import MOE
+from .config import SHORT_CONV
 from .sampler_names import TRAINER_ONLY
 from .sampler_names import sampler_target
 
@@ -123,28 +126,20 @@ class ToyAttentionVLLM(nn.Module):
         return out
 
 
-class ToyRecurrenceVLLM(MambaBase, nn.Module):
-    """The gated recurrence with vLLM-owned per-request state: the last ``kernel - 1`` inputs and the state ``h``."""
+def _state_shapes(config, tp: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Every stateful layer shares one state layout: a convolution history and a recurrent state."""
+    heads = config.recurrence_heads // tp
+    return ((config.conv_kernel - 1, heads * config.recurrence_head_dim), (heads, config.recurrence_head_dim))
+
+
+class _StatefulLayer(MambaBase, nn.Module):
+    """vLLM bookkeeping shared by the stateful layers: registration, state layout and the metadata backend."""
 
     def __init__(self, config, prefix: str):
         super().__init__()
-        tp = get_tensor_model_parallel_world_size()
-        self.heads = config.recurrence_heads // tp
-        self.head_dim = config.recurrence_head_dim
-        self.kernel = config.conv_kernel
+        self.tp = get_tensor_model_parallel_world_size()
+        self.config = config
         self.prefix = prefix
-        width = config.recurrence_heads * config.recurrence_head_dim
-        self.in_gate_proj = MergedColumnParallelLinear(
-            config.hidden_size, [width, width], bias=False, prefix=f"{prefix}.in_gate_proj"
-        )
-        self.z_proj = ColumnParallelLinear(config.hidden_size, width, bias=False, prefix=f"{prefix}.z_proj")
-        self.out_proj = RowParallelLinear(width, config.hidden_size, bias=False, prefix=f"{prefix}.out_proj")
-        # A ColumnParallelLinear shards the Conv1d weight [channels, 1, kernel] by channel, as vLLM's mamba layers do.
-        self.conv1d = ColumnParallelLinear(self.kernel, width, bias=False, prefix=f"{prefix}.conv1d")
-        self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
-        self.decay_bias = nn.Parameter(torch.empty(self.heads))
-        set_weight_attrs(self.decay_bias, {"weight_loader": sharded_weight_loader(0)})
-        self.norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
         context = get_current_vllm_config().compilation_config.static_forward_context
         if prefix in context:
@@ -162,20 +157,98 @@ class ToyRecurrenceVLLM(MambaBase, nn.Module):
         return (torch.float32, torch.float32)
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        return ((self.kernel - 1, self.heads * self.head_dim), (self.heads, self.head_dim))
+        return _state_shapes(self.config, self.tp)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _metadata(self):
         forward_context = get_forward_context()
         metadata = forward_context.attn_metadata
         if isinstance(metadata, dict):
             metadata = metadata.get(self.prefix)
+        return metadata, forward_context.virtual_engine
+
+    @staticmethod
+    def _requests(metadata):
+        """``(begin, end, slot, resumes)`` for each request: its tokens, its state slot, and whether it has state."""
+        starts = metadata.query_start_loc.tolist()
+        context_lens = (metadata.seq_lens - (metadata.query_start_loc[1:] - metadata.query_start_loc[:-1])).tolist()
+        for request, slot in enumerate(metadata.state_indices_tensor.tolist()):
+            yield starts[request], starts[request + 1], slot, context_lens[request] > 0
+
+
+def _conv_weight(width: int, kernel: int, prefix: str) -> ColumnParallelLinear:
+    # A ColumnParallelLinear shards the Conv1d weight [channels, 1, kernel] by channel, as vLLM's mamba layers do.
+    conv1d = ColumnParallelLinear(kernel, width, bias=False, prefix=f"{prefix}.conv1d")
+    conv1d.weight.data = conv1d.weight.data.unsqueeze(1)
+    return conv1d
+
+
+class ToyShortConvVLLM(_StatefulLayer):
+    """The gated short convolution; its state is the last ``kernel - 1`` inputs, kept in the shared layout."""
+
+    def __init__(self, config, prefix: str):
+        super().__init__(config, prefix)
+        if config.conv_channels != config.recurrence_heads * config.recurrence_head_dim:
+            raise ValueError(
+                "this vLLM model keeps one state layout, so conv_channels must equal the recurrence width"
+            )
+        self.kernel = config.conv_kernel
+        self.in_gate_proj = MergedColumnParallelLinear(
+            config.hidden_size, [config.conv_channels] * 2, bias=False, prefix=f"{prefix}.in_gate_proj"
+        )
+        self.out_proj = RowParallelLinear(
+            config.conv_channels, config.hidden_size, bias=False, prefix=f"{prefix}.out_proj"
+        )
+        self.conv1d = _conv_weight(config.conv_channels, self.kernel, prefix)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        metadata, engine = self._metadata()
+        projected, _ = self.in_gate_proj(x)
+        u, gate = projected.float().chunk(2, dim=-1)
+        conv = torch.zeros_like(u)
+        if metadata is not None:
+            conv_state, _ = self.kv_cache[engine]
+            weight = self.conv1d.weight[:, 0, :].float()
+            for begin, end, slot, resumes in self._requests(metadata):
+                history = (
+                    conv_state[slot].float() if resumes else torch.zeros_like(conv_state[slot], dtype=torch.float32)
+                )
+                for t in range(begin, end):
+                    window = torch.cat((history, u[t : t + 1]), dim=0)
+                    conv[t] = (window.T * weight).sum(-1)
+                    history = window[1:]
+                conv_state[slot] = history.to(conv_state.dtype)
+        out, _ = self.out_proj((conv * F.silu(gate)).to(x.dtype))
+        return out
+
+
+class ToyRecurrenceVLLM(_StatefulLayer):
+    """The gated recurrence with vLLM-owned per-request state: the last ``kernel - 1`` inputs and the state ``h``."""
+
+    def __init__(self, config, prefix: str):
+        super().__init__(config, prefix)
+        self.heads = config.recurrence_heads // self.tp
+        self.head_dim = config.recurrence_head_dim
+        self.kernel = config.conv_kernel
+        width = config.recurrence_heads * config.recurrence_head_dim
+        self.in_gate_proj = MergedColumnParallelLinear(
+            config.hidden_size, [width, width], bias=False, prefix=f"{prefix}.in_gate_proj"
+        )
+        self.z_proj = ColumnParallelLinear(config.hidden_size, width, bias=False, prefix=f"{prefix}.z_proj")
+        self.out_proj = RowParallelLinear(width, config.hidden_size, bias=False, prefix=f"{prefix}.out_proj")
+        self.conv1d = _conv_weight(width, self.kernel, prefix)
+        self.decay_bias = nn.Parameter(torch.empty(self.heads))
+        set_weight_attrs(self.decay_bias, {"weight_loader": sharded_weight_loader(0)})
+        self.norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        metadata, engine = self._metadata()
         projected, _ = self.in_gate_proj(x)
         u, g = projected.float().chunk(2, dim=-1)
         z, _ = self.z_proj(x)
         if metadata is None:  # the profiling run before caches exist
             h = torch.zeros_like(u)
         else:
-            conv_state, state = self.kv_cache[forward_context.virtual_engine]
+            conv_state, state = self.kv_cache[engine]
             h = self._run(u, g, metadata, conv_state, state)
         h = self.norm(h.view(-1, self.heads, self.head_dim).to(x.dtype))
         out, _ = self.out_proj((h * F.silu(z.view(-1, self.heads, self.head_dim))).flatten(1))
@@ -186,21 +259,9 @@ class ToyRecurrenceVLLM(MambaBase, nn.Module):
         weight = self.conv1d.weight[:, 0, :].float()
         decay = torch.sigmoid(g.view(-1, self.heads, self.head_dim) + self.decay_bias.float()[None, :, None])
         out = torch.empty_like(u)
-        starts = metadata.query_start_loc.tolist()
-        slots = metadata.state_indices_tensor.tolist()
-        context_lens = (metadata.seq_lens - (metadata.query_start_loc[1:] - metadata.query_start_loc[:-1])).tolist()
-        for request, slot in enumerate(slots):
-            begin, end = starts[request], starts[request + 1]
-            history = (
-                conv_state[slot].float()
-                if context_lens[request] > 0
-                else torch.zeros_like(conv_state[slot], dtype=torch.float32)
-            )
-            h = (
-                state[slot].float()
-                if context_lens[request] > 0
-                else torch.zeros_like(state[slot], dtype=torch.float32)
-            )
+        for begin, end, slot, resumes in self._requests(metadata):
+            history = conv_state[slot].float() if resumes else torch.zeros_like(conv_state[slot], dtype=torch.float32)
+            h = state[slot].float() if resumes else torch.zeros_like(state[slot], dtype=torch.float32)
             for t in range(begin, end):
                 window = torch.cat((history, u[t : t + 1]), dim=0)
                 c = F.silu((window.T * weight).sum(-1)).view(self.heads, self.head_dim)
@@ -253,11 +314,13 @@ class _SwiGLU(nn.Module):
 class _DecoderLayer(nn.Module):
     def __init__(self, config, cache_config, index: int, prefix: str):
         super().__init__()
-        self.is_attention = config.layer_types[index] == FULL_ATTENTION
+        self.kind = config.layer_types[index]
         self.input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        if self.is_attention:
+        if self.kind == FULL_ATTENTION:
             self.self_attn = ToyAttentionVLLM(config, cache_config, f"{prefix}.self_attn")
+        elif self.kind == SHORT_CONV:
+            self.conv = ToyShortConvVLLM(config, f"{prefix}.conv")
         else:
             self.recurrence = ToyRecurrenceVLLM(config, f"{prefix}.recurrence")
         if config.mlp_types[index] == MOE:
@@ -267,7 +330,10 @@ class _DecoderLayer(nn.Module):
 
     def forward(self, positions: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
         x = self.input_norm(h)
-        h = h + (self.self_attn(positions, x) if self.is_attention else self.recurrence(x))
+        if self.kind == FULL_ATTENTION:
+            h = h + self.self_attn(positions, x)
+        else:
+            h = h + (self.conv(x) if self.kind == SHORT_CONV else self.recurrence(x))
         return h + self.mlp(self.post_norm(h))
 
 
@@ -298,10 +364,7 @@ class ToyHybridMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        config = vllm_config.model_config.hf_config
-        tp = vllm_config.parallel_config.tensor_parallel_size
-        heads = config.recurrence_heads // tp
-        return ((config.conv_kernel - 1, heads * config.recurrence_head_dim), (heads, config.recurrence_head_dim))
+        return _state_shapes(vllm_config.model_config.hf_config, vllm_config.parallel_config.tensor_parallel_size)
 
     def forward(
         self,

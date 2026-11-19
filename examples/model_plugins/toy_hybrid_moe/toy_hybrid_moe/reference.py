@@ -30,6 +30,7 @@ from torch import nn
 
 from .config import FULL_ATTENTION
 from .config import MOE
+from .config import SHORT_CONV
 
 
 def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -79,6 +80,17 @@ def reference_forward(model: nn.Module, input_ids: torch.Tensor) -> torch.Tensor
                     allowed &= ~torch.ones(length, length, dtype=torch.bool).tril(-cfg.sliding_window)
                 mixed[:, head] = torch.softmax(scores.masked_fill(~allowed, float("-inf")), dim=-1) @ v[:, kv]
             h = h + mixed.reshape(length, -1) @ p[pre + "self_attn.o_proj.weight"].T
+        elif cfg.layer_types[i] == SHORT_CONV:
+            u = x @ p[pre + "conv.in_proj.weight"].T
+            gate = x @ p[pre + "conv.gate_proj.weight"].T
+            weight = p[pre + "conv.conv_weight"]
+            conv = torch.zeros_like(u)
+            for t in range(length):
+                for tap in range(cfg.conv_kernel):
+                    source = t - (cfg.conv_kernel - 1 - tap)
+                    if source >= 0:
+                        conv[t] += weight[:, tap] * u[source]
+            h = h + (conv * F.silu(gate)) @ p[pre + "conv.out_proj.weight"].T
         else:
             heads, dim, kernel = cfg.recurrence_heads, cfg.recurrence_head_dim, cfg.conv_kernel
             u = (x @ p[pre + "recurrence.in_proj.weight"].T).view(length, heads, dim)

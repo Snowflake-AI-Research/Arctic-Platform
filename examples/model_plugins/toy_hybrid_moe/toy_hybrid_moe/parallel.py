@@ -13,24 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""How ToyHybridMoE tells the platform about its layers: the recurrence mixer, the expert layer, and its shape."""
+"""How ToyHybridMoE tells the platform about its layers: two mixers, the expert layer, and its shape.
+
+The two plugin mixers show both kinds of sequence-parallel policy. The recurrence uses the platform's default,
+the head-parallel exchange. The short convolution brings its own: a halo exchange with the previous rank.
+"""
 
 from __future__ import annotations
 
+import torch
 from torch import nn
 
 from arctic_platform.model_plugin import HeadParallelMixer
 from arctic_platform.model_plugin import ParallelismInfo
-from arctic_platform.model_plugin import shard_experts
-from arctic_platform.model_plugin.parallel import group_rank
-from arctic_platform.model_plugin.parallel import group_size
+from arctic_platform.model_plugin import SequenceWindow
+from arctic_platform.model_plugin import StackedExpertLayer
+from arctic_platform.model_plugin import previous_tokens
+from arctic_platform.model_plugin import sequence_start
 
 from .config import FULL_ATTENTION
 from .config import GATED_RECURRENCE
 from .config import MOE
+from .config import SHORT_CONV
 from .config import ToyHybridMoEConfig
 from .modeling import ToyMoE
 from .modeling import ToyRecurrence
+from .modeling import ToyShortConv
 
 
 class GatedRecurrenceMixer(HeadParallelMixer):
@@ -47,24 +55,42 @@ class GatedRecurrenceMixer(HeadParallelMixer):
         super().__init__(GATED_RECURRENCE)
 
 
-class ToyExpertLayer:
-    """Expert parallelism for :class:`ToyMoE`: each rank keeps a contiguous block of experts."""
+class ShortConvMixer:
+    """Sequence parallelism for :class:`ToyShortConv` by halo exchange: a policy of its own.
 
-    names = ("w1", "w2", "w3")
+    A causal convolution of width K reads only the K - 1 tokens before each output. So rather than the
+    head-parallel exchange, which moves every activation to another rank and back, each rank borrows the last
+    K - 1 tokens of the previous rank's shard, runs ``mix`` on that halo plus its own tokens, and keeps its own
+    outputs. Channels are never split, so any sequence-parallel degree works as long as a shard holds at least
+    K - 1 tokens.
+    """
+
+    layer_type = SHORT_CONV
 
     def is_instance(self, module: nn.Module) -> bool:
-        return isinstance(module, ToyMoE)
+        return isinstance(module, ToyShortConv)
 
-    def num_experts(self, module: nn.Module) -> int:
-        return module.num_experts
+    def validate_sp(self, info: ParallelismInfo, sp_size: int) -> None:
+        """No head constraint: the shard-length constraint is checked when the halo is exchanged."""
 
-    def expert_parameters(self, module: nn.Module) -> dict[str, nn.Parameter]:
-        return {f"experts.{name}": getattr(module.experts, name) for name in self.names}
+    def apply_sequence_parallel(self, module: nn.Module, group) -> None:
+        core = module.mix
+        halo = module.kernel - 1
 
-    def apply_expert_parallel(self, module: nn.Module, group) -> None:
-        shard_experts(module.experts, list(self.names), group)
-        module.ep_group = group
-        module.expert_offset = group_rank(group) * (module.num_experts // group_size(group))
+        def mix(u: torch.Tensor, *, cu_seqlens: torch.Tensor, shard: SequenceWindow | None = None) -> torch.Tensor:
+            before = previous_tokens(group, u, halo)
+            window = SequenceWindow(start=sequence_start(group, u.shape[1]), halo=before.shape[1])
+            out = core(torch.cat([before, u], dim=1), cu_seqlens=cu_seqlens, shard=window)
+            return out[:, window.halo :]
+
+        setattr(module, "mix", mix)
+
+
+class ToyExpertLayer(StackedExpertLayer):
+    """Expert parallelism for :class:`ToyMoE`: the platform shards the stacked experts and wraps ``experts_core``."""
+
+    module_class = ToyMoE
+    expert_names = ("experts.w1", "experts.w2", "experts.w3")
 
 
 def parallelism(config: ToyHybridMoEConfig) -> ParallelismInfo:

@@ -26,18 +26,21 @@ import torch.nn.functional as F
 from torch import nn
 
 from arctic_platform.model_plugin import FULL_SHARD
+from arctic_platform.model_plugin import FULL_WINDOW
 from arctic_platform.model_plugin import ROUTER_REPLAY_FRESH
 from arctic_platform.model_plugin import AttentionModule
+from arctic_platform.model_plugin import ExpertShard
 from arctic_platform.model_plugin import HeadShard
-from arctic_platform.model_plugin import combine_tokens
-from arctic_platform.model_plugin import gather_tokens
+from arctic_platform.model_plugin import SequenceWindow
 from arctic_platform.model_plugin import in_recompute
 from arctic_platform.model_plugin import skip_weight_sync
 from arctic_platform.model_plugin.attention import segment_ids
+from arctic_platform.model_plugin.attention import segment_of
 
 from .config import FULL_ATTENTION
 from .config import GATED_RECURRENCE
 from .config import MOE
+from .config import SHORT_CONV
 from .config import ToyHybridMoEConfig
 
 
@@ -186,9 +189,10 @@ class LoadStats(nn.Module):
 class ToyMoE(nn.Module):
     """Softmax top-k routing with renormalized weights, routed experts plus one shared expert.
 
-    ``routed`` replays expert ids captured by the sampler; an id of ``ROUTER_REPLAY_FRESH`` falls back to this
-    router's own choice. Under expert parallelism ``ep_group`` is set and this rank holds experts
-    ``[expert_offset, expert_offset + local experts)``.
+    ``route`` and the shared expert work token by token. ``experts_core`` is the only part that touches routed
+    experts: it computes the experts ``shard`` holds for whatever tokens it is given. Under expert parallelism the
+    platform shards ``experts.w1/w2/w3`` and wraps ``experts_core`` so it sees the whole group's tokens; this code
+    does not change.
     """
 
     def __init__(self, config: ToyHybridMoEConfig):
@@ -200,57 +204,99 @@ class ToyMoE(nn.Module):
         self.experts = ToyExperts(self.num_experts, config.hidden_size, config.moe_intermediate_size)
         self.shared_expert = DenseMLP(config.hidden_size, config.moe_intermediate_size * config.num_shared_experts)
         self.stats = skip_weight_sync(LoadStats(self.num_experts))
-        self.ep_group = None
-        self.expert_offset = 0
 
     def forward(self, x: torch.Tensor, routed: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         tokens = x.reshape(-1, x.shape[-1])
+        selected, weights = self.route(tokens, routed)
+        if self.training and not in_recompute():
+            with torch.no_grad():
+                self.stats.tokens_per_expert += torch.bincount(selected.flatten(), minlength=self.num_experts)
+        out = self.experts_core(tokens, selected, weights) + self.shared_expert(tokens)
+        return out.view_as(x), selected
+
+    def route(self, tokens: torch.Tensor, routed: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Expert ids ``[N, top_k]`` and gate weights. ``routed`` replays captured ids; ``ROUTER_REPLAY_FRESH``
+        entries take this router's own choice."""
         scores = torch.softmax(self.router(tokens).float(), dim=-1)
         own = torch.topk(scores.detach(), self.top_k, dim=-1).indices
         selected = own if routed is None else torch.where(routed == ROUTER_REPLAY_FRESH, own, routed.to(own.dtype))
         weights = scores.gather(1, selected)
-        weights = weights / weights.sum(-1, keepdim=True) * self.scale
-        if self.training and not in_recompute():
-            with torch.no_grad():
-                self.stats.tokens_per_expert += torch.bincount(selected.flatten(), minlength=self.num_experts)
-        out = self._routed(tokens, selected, weights) + self.shared_expert(tokens)
-        return out.view_as(x), selected
+        return selected, weights / weights.sum(-1, keepdim=True) * self.scale
 
-    def _routed(self, tokens: torch.Tensor, selected: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        group = self.ep_group
-        all_tokens = gather_tokens(group, tokens)
-        all_selected = gather_tokens(group, selected)
-        all_weights = gather_tokens(group, weights)
-        partial = torch.zeros_like(all_tokens)
-        for local in range(self.experts.w1.shape[0]):
-            rows, slots = (all_selected == self.expert_offset + local).nonzero(as_tuple=True)
+    def experts_core(
+        self, tokens: torch.Tensor, selected: torch.Tensor, weights: torch.Tensor, *, shard: ExpertShard | None = None
+    ) -> torch.Tensor:
+        """Sum over each token's chosen experts that ``shard`` holds; local expert ``i`` is ``shard.start + i``."""
+        shard = shard or ExpertShard.full(self.num_experts)
+        out = torch.zeros_like(tokens)
+        for local in range(shard.per_rank):
+            rows, slots = (selected == shard.start + local).nonzero(as_tuple=True)
             if rows.numel() == 0:
                 continue
-            x = all_tokens[rows]
+            x = tokens[rows]
             hidden = F.silu(x @ self.experts.w1[local].T) * (x @ self.experts.w3[local].T)
-            out = (hidden @ self.experts.w2[local].T) * all_weights[rows, slots, None].to(x.dtype)
-            partial = partial.index_add(0, rows, out)
-        return combine_tokens(group, partial)
+            contribution = (hidden @ self.experts.w2[local].T) * weights[rows, slots, None].to(x.dtype)
+            out = out.index_add(0, rows, contribution)
+        return out
+
+
+class ToyShortConv(nn.Module):
+    """A gated short convolution: ``out_proj(conv(in_proj(x)) * silu(gate_proj(x)))``, causal over ``conv_kernel``.
+
+    ``mix`` is the only cross-token code. It sees the tokens ``shard`` describes, global positions
+    ``[start - halo, start + local)``, restarts at every row boundary in ``cu_seqlens``, and returns outputs for
+    all of them; its mixer keeps the non-halo part. Channels are never split.
+    """
+
+    ap_layer_type = SHORT_CONV
+
+    def __init__(self, config: ToyHybridMoEConfig):
+        super().__init__()
+        self.channels = config.conv_channels
+        self.kernel = config.conv_kernel
+        self.in_proj = nn.Linear(config.hidden_size, self.channels, bias=False)
+        self.gate_proj = nn.Linear(config.hidden_size, self.channels, bias=False)
+        self.out_proj = nn.Linear(self.channels, config.hidden_size, bias=False)
+        self.conv_weight = nn.Parameter(torch.randn(self.channels, self.kernel) / self.kernel)
+
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        return self.out_proj(self.mix(self.in_proj(x), cu_seqlens=cu_seqlens) * F.silu(self.gate_proj(x)))
+
+    def mix(self, u: torch.Tensor, *, cu_seqlens: torch.Tensor, shard: SequenceWindow = FULL_WINDOW) -> torch.Tensor:
+        length = u.shape[1]
+        positions = torch.arange(length, device=u.device) + shard.start - shard.halo
+        rows = segment_of(cu_seqlens, positions)
+        out = torch.zeros_like(u)
+        for lag in range(self.kernel):
+            shifted = F.pad(u, (0, 0, lag, 0))[:, :length]
+            same_row = torch.zeros(length, dtype=torch.bool, device=u.device)
+            same_row[lag:] = rows[lag:] == rows[: length - lag]
+            out = out + shifted * self.conv_weight[:, self.kernel - 1 - lag] * same_row[None, :, None]
+        return out
+
+
+_MIXER_ATTRIBUTE = {FULL_ATTENTION: "self_attn", GATED_RECURRENCE: "recurrence", SHORT_CONV: "conv"}
+_MIXER_CLASS: dict[str, type[nn.Module]] = {
+    FULL_ATTENTION: ToyAttention,
+    GATED_RECURRENCE: ToyRecurrence,
+    SHORT_CONV: ToyShortConv,
+}
 
 
 class ToyDecoderLayer(nn.Module):
     def __init__(self, config: ToyHybridMoEConfig, layer_idx: int):
         super().__init__()
-        self.is_attention = config.layer_types[layer_idx] == FULL_ATTENTION
+        self.mixer_name = _MIXER_ATTRIBUTE[config.layer_types[layer_idx]]
         self.is_moe = config.mlp_types[layer_idx] == MOE
         self.input_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        if self.is_attention:
-            self.self_attn = ToyAttention(config)
-        else:
-            self.recurrence = ToyRecurrence(config)
+        setattr(self, self.mixer_name, _MIXER_CLASS[config.layer_types[layer_idx]](config))
         self.mlp = ToyMoE(config) if self.is_moe else DenseMLP(config.hidden_size, config.intermediate_size)
 
     def forward(
         self, h: torch.Tensor, position_ids: torch.Tensor, cu_seqlens: torch.Tensor, routed: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        mixer = self.self_attn if self.is_attention else self.recurrence
-        h = h + mixer(self.input_norm(h), position_ids, cu_seqlens)
+        h = h + getattr(self, self.mixer_name)(self.input_norm(h), position_ids, cu_seqlens)
         if not self.is_moe:
             return h + self.mlp(self.post_norm(h)), None
         out, selected = self.mlp(self.post_norm(h), routed)
