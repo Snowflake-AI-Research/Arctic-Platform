@@ -39,7 +39,12 @@ _FUSED: tuple[tuple[str, str, str | int], ...] = (
     (".conv.gate_proj.weight", ".conv.in_gate_proj.weight", 1),
 )
 _EXPERT = re.compile(r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$")
-_EXPERT_SHARD = {"gate_proj": ("w13_weight", "w1"), "up_proj": ("w13_weight", "w3"), "down_proj": ("w2_weight", "w2")}
+# vLLM 0.33's fused MoE keeps its stacked expert weights in a ``routed_experts`` submodule.
+_EXPERT_SHARD = {
+    "gate_proj": ("routed_experts.w13_weight", "w1"),
+    "up_proj": ("routed_experts.w13_weight", "w3"),
+    "down_proj": ("routed_experts.w2_weight", "w2"),
+}
 TRAINER_ONLY = re.compile(r"\.mlp\.stats\.")
 
 

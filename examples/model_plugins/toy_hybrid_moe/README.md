@@ -20,3 +20,5 @@ PYTHONPATH=examples/model_plugins/toy_hybrid_moe \
 ```
 
 `vllm_model.py` needs a GPU and the vLLM version of the runtime release, so it is not part of the CPU tiers.
+`tests/model_plugin/test_toy_plugin_vllm.py` checks it against the trainer on GPUs: prompt and decode log-probs,
+weight sync and routed experts, at tensor parallelism 1 and 2.

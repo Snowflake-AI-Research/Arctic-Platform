@@ -189,8 +189,10 @@ def test_sampler_stream_maps_onto_the_vllm_model():
     assert shards["model.layers.0.recurrence.in_gate_proj.weight"] == {(0, None), (1, None)}
     assert shards["model.layers.2.conv.in_gate_proj.weight"] == {(0, None), (1, None)}
     assert shards["model.layers.1.self_attn.qkv_proj.weight"] == {("q", None), ("k", None), ("v", None)}
-    assert shards["model.layers.1.mlp.experts.w13_weight"] == {(s, e) for s in ("w1", "w3") for e in experts}
-    assert shards["model.layers.1.mlp.experts.w2_weight"] == {("w2", e) for e in experts}
+    assert shards["model.layers.1.mlp.experts.routed_experts.w13_weight"] == {
+        (s, e) for s in ("w1", "w3") for e in experts
+    }
+    assert shards["model.layers.1.mlp.experts.routed_experts.w2_weight"] == {("w2", e) for e in experts}
     assert shards["model.layers.0.mlp.gate_up_proj.weight"] == {(0, None), (1, None)}
     with pytest.raises(ValueError, match="trainer-only"):
         sampler_target("model.layers.1.mlp.stats.tokens_per_expert")

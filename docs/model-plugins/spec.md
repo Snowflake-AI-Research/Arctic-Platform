@@ -185,10 +185,9 @@ ep_size = 8
 | `max_expert_parallel` | Only with `expert_parallel = true`. |
 | `sampler` | Present exactly when `capabilities.sampling = true`. |
 
-**Layer type names.** Use names that transformers and vLLM recognise. transformers 5.x validates `layer_types` against
-its known kinds (`full_attention`, `sliding_attention`, `linear_attention`, `conv` and others). vLLM counts a hybrid
-model's stateful layers by the name `linear_attention` when it sizes their caches. A recurrent or state-space layer
-SHOULD therefore be named `linear_attention`.
+**Layer type names.** Use names that transformers recognises: transformers 5.x validates `layer_types` against its
+known kinds (`full_attention`, `sliding_attention`, `linear_attention`, `conv` and others). vLLM 0.33 sizes a hybrid
+model's state caches from each stateful layer's own `MambaBase` state spec, not from these names.
 
 ---
 
@@ -409,8 +408,10 @@ them so both compute the same function. Your router MUST:
 - route a token whose id is `ROUTER_REPLAY_FRESH` (`-1`) with its own choice, which happens when a capture is missing;
 - return the experts it used when `return_routing=True`.
 
-On the sampler, routing is captured automatically when your vLLM model routes through vLLM's `RoutedExperts`
-layer. A custom vLLM router MUST feed vLLM's routed-experts capture, or the manifest MUST declare `router_replay = false`.
+On the sampler, routing is captured automatically when your vLLM model routes its experts through vLLM's fused MoE
+layer (`FusedMoEFactory`). A custom vLLM router MUST feed vLLM's routed-experts capture, or the manifest MUST declare
+`router_replay = false`. vLLM 0.33 captures routing only with its V2 model runner and prefix caching on; for a model
+with stateful layers that means "align"-mode state caching, which those layers must then support (§16).
 
 ### 7.8 Activation checkpointing
 
@@ -721,4 +722,5 @@ The test suite also feeds conformance deliberately broken variants and checks th
 2. Which GPU tolerance policy suits RL customers best for sampler log-prob parity: a fixed bound, or calibration against a known-good model of similar size?
 3. Should `peft` (LoRA) get its own conformance tier in 1.0, including expert LoRA?
 4. Is a per-plugin `max_sequence_length` or memory profile needed in the manifest for admission, beyond `profiles`?
-5. Should the plugin kit ship a local GPU smoke test (load in vLLM, sync weights, compare trainer and sampler log-probs) and let Arctic Platform's on-prem trainer run plugin models, so customers can test the GPU tiers before submitting?
+5. vLLM 0.33 records routed experts only with prefix caching on, so a hybrid plugin's stateful vLLM layers must support "align"-mode state caching to offer router replay on generated tokens. Should admission reject `router_replay` unless `sampler.prefix_caching = true`, or should the platform capture routing another way?
+6. Should the plugin kit ship a local GPU smoke test (load in vLLM, sync weights, compare trainer and sampler log-probs) and let Arctic Platform's on-prem trainer run plugin models, so customers can test the GPU tiers before submitting?
