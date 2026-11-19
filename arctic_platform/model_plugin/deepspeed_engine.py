@@ -39,6 +39,7 @@ from typing import Any
 from torch import nn
 
 from arctic_platform.model_plugin.host import LayerBinding
+from arctic_platform.model_plugin.marks import optimizer_groups
 
 
 @contextmanager
@@ -79,9 +80,10 @@ def initialize_deepspeed(
 
     Under expert parallelism the expert-parallel group must be one DeepSpeed registered
     (``deepspeed.utils.groups._create_expert_and_data_parallel``), so that its expert-data-parallel group exists.
-    Without a client ``optimizer``, the parameters (all of the model's, or ``model_parameters`` given as named
-    param-group dicts) are split into DeepSpeed's MoE and non-MoE optimizer groups here; a client optimizer must
-    already be built over such groups
+    Without a client ``optimizer``, the parameter groups are the model's :func:`optimizer_groups` (``decay``, at the
+    optimizer's own weight decay, and ``no_decay``, from the plugin's marks; frozen parameters left out),
+    or ``model_parameters`` given as named param-group dicts, and are split into DeepSpeed's MoE and non-MoE
+    optimizer groups here; a client optimizer must already be built over such groups
     (``deepspeed.moe.utils.split_params_into_different_moe_groups_for_optimizer``).
     """
     import deepspeed
@@ -89,6 +91,12 @@ def initialize_deepspeed(
     from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer
     from deepspeed.utils import groups
 
+    from arctic_platform.model.implementations.fp8 import preserve_fp8_params_through_ds_cast
+
+    # DeepSpeed casts the model to bf16/fp16; the platform's guard keeps fp32-marked parameters out of that cast.
+    preserve_fp8_params_through_ds_cast(model)
+    if optimizer is None and model_parameters is None:
+        model_parameters = optimizer_groups(model)
     group_names = {param.group_name for param in model.parameters() if is_moe_param(param)}
     if len(group_names) == 0:
         return deepspeed.initialize(
@@ -103,8 +111,6 @@ def initialize_deepspeed(
             "prepare_model"
         )
     if optimizer is None:
-        if model_parameters is None:
-            model_parameters = {"params": list(model.parameters()), "name": "dense"}
         model_parameters = split_params_into_different_moe_groups_for_optimizer(model_parameters)
 
     with _declared_moe_layers(model, [binding.info.num_experts] * len(binding.experts)):

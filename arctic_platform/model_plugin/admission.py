@@ -17,7 +17,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
 from typing import Literal
 
@@ -32,16 +34,32 @@ class AdmissionError(ValueError):
 
 @dataclass(frozen=True)
 class JobRequest:
-    """The parallelism and features one sub-job asks for."""
+    """The parallelism and features one sub-job asks for.
+
+    ``options`` are the plugin's job-time options. ``inference`` is the job's sampler engine config: the tunables
+    (``tensor_parallel_size``, ``max_num_seqs``, ``gpu_memory_utilization``, kernel flags, ``max_model_len``) and
+    any feature it turns on (``enable_prefix_caching``, ``speculative_config``). ``profile`` names a manifest
+    profile whose ``inference`` table supplies defaults.
+    """
 
     job_type: Literal["training", "sampling"] = "training"
     sp_size: int = 1
     ep_size: int = 1
     peft: bool = False
     router_replay: bool = False
-    sampler_tensor_parallel: int = 1
-    speculative_decoding: bool = False
-    prefix_caching: bool = False
+    options: Mapping[str, Any] = field(default_factory=dict)
+    inference: Mapping[str, Any] = field(default_factory=dict)
+    profile: str | None = None
+
+
+# Requirements that are not vLLM engine arguments, so only the manifest sets them.
+MANIFEST_ONLY = ("model_runner", "chat_parser")
+
+
+def inference_settings(plugin: ModelPlugin, request: JobRequest) -> dict[str, Any]:
+    """The sampler settings a job asks for: its profile's ``inference`` defaults, overridden by its own."""
+    profile = plugin.manifest.profiles[request.profile] if request.profile is not None else {}
+    return {**profile.get("inference", {}), **request.inference}
 
 
 def check_job_request(plugin: ModelPlugin, config: Any, request: JobRequest) -> None:
@@ -61,7 +79,8 @@ def check_job_request(plugin: ModelPlugin, config: Any, request: JobRequest) -> 
             reasons.append("the plugin does not declare sequence_parallel")
         else:
             mixers = plugin.layer_mixers()
-            for layer_type in sorted(set(info.layer_types)):
+            sublayer_types = {layer_type for layer_type, count in info.sublayers.items() if count > 0}
+            for layer_type in sorted(set(info.layer_types) | sublayer_types):
                 try:
                     mixers[layer_type].validate_sp(info, request.sp_size)
                 except ValueError as error:
@@ -82,13 +101,30 @@ def check_job_request(plugin: ModelPlugin, config: Any, request: JobRequest) -> 
     if request.router_replay and (not capabilities.router_replay or len(info.moe_layers) == 0):
         reasons.append("router replay needs capabilities.router_replay and a model config with expert layers")
 
-    if request.job_type == "sampling" and sampler is not None:
-        if request.sampler_tensor_parallel > 1 and not sampler.tensor_parallel:
+    if request.profile is not None and request.profile not in plugin.manifest.profiles:
+        reasons.append(f"the plugin has no profile {request.profile!r}")
+    elif request.job_type == "sampling" and sampler is not None:
+        inference = inference_settings(plugin, request)
+        if int(inference.get("tensor_parallel_size", 1)) > 1 and not sampler.tensor_parallel:
             reasons.append("the sampler does not declare tensor_parallel")
-        if request.speculative_decoding and not sampler.speculative_decoding:
+        if inference.get("speculative_config") is not None and not sampler.speculative_decoding:
             reasons.append("the sampler does not declare speculative_decoding")
-        if request.prefix_caching and not sampler.prefix_caching:
+        if inference.get("enable_prefix_caching") and not sampler.prefix_caching:
             reasons.append("the sampler does not declare prefix_caching")
+        for name in MANIFEST_ONLY:
+            if name in inference:
+                reasons.append(f"{name} is set only by the plugin's manifest")
+        for name, required in sampler.requirements().items():
+            if name not in MANIFEST_ONLY and name in inference and inference[name] != required:
+                reasons.append(f"the job sets {name}={inference[name]!r}, but the plugin requires {required!r}")
+
+    try:
+        options = plugin.parse_options(request.options)
+    except ValueError as error:
+        reasons.append(str(error))
+    else:
+        if plugin.validate is not None:
+            reasons.extend(plugin.validate(request, config, options))
 
     if len(reasons) > 0:
         raise AdmissionError(reasons)

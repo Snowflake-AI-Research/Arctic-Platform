@@ -49,13 +49,18 @@ from pydantic import model_validator
 from torch import nn
 
 from arctic_platform.common.packing import IGNORE_INDEX
+from arctic_platform.model_plugin.build import build
 from arctic_platform.model_plugin.experts import ROUTER_REPLAY_FRESH
 from arctic_platform.model_plugin.host import bind_layers
+from arctic_platform.model_plugin.host import compute_logits
 from arctic_platform.model_plugin.host import forward
 from arctic_platform.model_plugin.host import next_token_labels
 from arctic_platform.model_plugin.host import pack_sequences
 from arctic_platform.model_plugin.host import prepare_model
 from arctic_platform.model_plugin.host import token_logprobs
+from arctic_platform.model_plugin.marks import cast_model
+from arctic_platform.model_plugin.marks import tensor_marks
+from arctic_platform.model_plugin.marks import weight_sync_skipped
 from arctic_platform.model_plugin.parallel import shard_sequence
 from arctic_platform.model_plugin.plugin import ModelPlugin
 from arctic_platform.model_plugin.plugin import load_plugin
@@ -69,7 +74,6 @@ from arctic_platform.model_plugin.weights import layer_index
 from arctic_platform.model_plugin.weights import load_hf_checkpoint
 from arctic_platform.model_plugin.weights import read_stamp
 from arctic_platform.model_plugin.weights import save_hf_checkpoint
-from arctic_platform.model_plugin.weights import weight_sync_skipped
 
 
 class Tolerances(BaseModel):
@@ -79,6 +83,14 @@ class Tolerances(BaseModel):
 
     reference: float = Field(1e-5, ge=0)
     packing: float = Field(1e-5, ge=0)
+    chunking: float = Field(
+        1e-6,
+        ge=0,
+        description=(
+            "Chunking reorders the sum behind the output projection's gradient, and short chunks can take a "
+            "different GEMM kernel, so fp32 results agree to rounding, not bitwise."
+        ),
+    )
     parallel: float = Field(1e-5, ge=0)
     rl_step: float = Field(1e-5, ge=0)
 
@@ -87,7 +99,9 @@ class ConformanceSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     fixture: dict[str, Any]
+    options: dict[str, Any] = Field(default_factory=dict, description="The plugin's job options for the fixture.")
     seed: int = 0
+    logprob_chunk: int = Field(4, ge=1, description="Tokens per log-probability chunk; small, so rows span chunks.")
     sequence_lengths: list[int] = Field(default_factory=lambda: [5, 6, 5], min_length=2)
     sp_sizes: list[int] = Field(default_factory=lambda: [2])
     ep_sizes: list[int] = Field(default_factory=lambda: [2])
@@ -134,7 +148,7 @@ class TierResult:
 def build_fixture(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "cpu") -> tuple[Any, nn.Module]:
     torch.manual_seed(spec.seed)
     config = plugin.config_class(**spec.fixture)
-    return config, plugin.build_model(config).float().to(device)
+    return config, cast_model(build(plugin, config, spec.options), torch.float32).to(device)
 
 
 def fixture_sequences(
@@ -148,8 +162,13 @@ def fixture_sequences(
     ]
 
 
-def _logits(output) -> torch.Tensor:
+def _hidden(output) -> torch.Tensor:
     return output[0] if isinstance(output, tuple) else output
+
+
+def _logits(model: nn.Module, output) -> torch.Tensor:
+    """Full logits of a forward's hidden states: the fixture is tiny, so they fit."""
+    return compute_logits(model, _hidden(output))
 
 
 def _assert_close(actual: torch.Tensor, expected: torch.Tensor, atol: float, what: str) -> None:
@@ -158,10 +177,9 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor, atol: float, wha
         raise AssertionError(f"{what}: shapes {tuple(actual.shape)} vs {tuple(expected.shape)}, max |diff| {diff}")
 
 
-def _token_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    return torch.nn.functional.cross_entropy(
-        logits.float().reshape(-1, logits.shape[-1]), labels.reshape(-1), ignore_index=IGNORE_INDEX, reduction="sum"
-    )
+def _token_loss(model: nn.Module, output, labels: torch.Tensor, spec: ConformanceSpec) -> torch.Tensor:
+    """Summed negative log-likelihood through the platform's chunked log-probabilities."""
+    return -token_logprobs(model, _hidden(output), labels, chunk_size=spec.logprob_chunk).sum()
 
 
 def _grads(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -184,7 +202,7 @@ def check_reference_parity(plugin: ModelPlugin, spec: ConformanceSpec, device: D
     with torch.no_grad():
         for index, sequence in enumerate(fixture_sequences(config, spec, device=device)):
             input_ids, position_ids = pack_sequences([sequence])
-            actual = _logits(forward(model, input_ids, position_ids))
+            actual = _logits(model, forward(model, input_ids, position_ids))
             expected = plugin.reference_forward(model, sequence)
             _assert_close(actual[0], expected, spec.tolerances.reference, f"sequence {index} vs reference")
 
@@ -196,14 +214,16 @@ def check_packing(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "
     separate = copy.deepcopy(model)
 
     input_ids, position_ids = pack_sequences(sequences)
-    packed_logits = _logits(forward(model, input_ids, position_ids))
-    _token_loss(packed_logits, next_token_labels(input_ids, position_ids)).backward()
+    packed = forward(model, input_ids, position_ids)
+    packed_logits = _logits(model, packed)
+    _token_loss(model, packed, next_token_labels(input_ids, position_ids), spec).backward()
 
     start = 0
     for index, sequence in enumerate(sequences):
         row_ids, row_positions = pack_sequences([sequence])
-        row_logits = _logits(forward(separate, row_ids, row_positions))
-        _token_loss(row_logits, next_token_labels(row_ids, row_positions)).backward()
+        row = forward(separate, row_ids, row_positions)
+        row_logits = _logits(separate, row)
+        _token_loss(separate, row, next_token_labels(row_ids, row_positions), spec).backward()
         _assert_close(
             packed_logits[:, start : start + len(sequence)].detach(),
             row_logits.detach(),
@@ -216,21 +236,86 @@ def check_packing(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "
         _assert_close(grad, expected[name], spec.tolerances.packing, f"grad {name} packed vs rows")
 
 
+def check_logprob_chunking(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "cpu") -> None:
+    """Log-probabilities computed ``logprob_chunk`` tokens at a time, recomputed in backward, equal one pass over
+    the whole row: values and every gradient, through the model's own ``compute_logits``."""
+    config, chunked = build_fixture(plugin, spec, device)
+    whole = copy.deepcopy(chunked)
+    input_ids, position_ids = pack_sequences(fixture_sequences(config, spec, device=device))
+    labels = next_token_labels(input_ids, position_ids)
+    if spec.logprob_chunk >= input_ids.shape[1]:
+        raise AssertionError(
+            f"logprob_chunk {spec.logprob_chunk} must be shorter than the {input_ids.shape[1]}-token fixture"
+        )
+    values = {}
+    for name, model, chunk in (("chunked", chunked, spec.logprob_chunk), ("whole", whole, input_ids.shape[1])):
+        values[name] = token_logprobs(model, forward(model, input_ids, position_ids), labels, chunk_size=chunk)
+        values[name].sum().backward()
+    _assert_close(values["chunked"].detach(), values["whole"].detach(), spec.tolerances.chunking, "chunked log-probs")
+    expected = _grads(whole)
+    for name, grad in _grads(chunked).items():
+        _assert_close(grad, expected[name], spec.tolerances.chunking, f"chunked grad {name}")
+
+
+def check_meta_build(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "cpu") -> None:
+    """Built on the meta device, allocated with ``to_empty``, re-initialized with ``ap_init_buffers`` and loaded from
+    a checkpoint, the model equals one built normally: every buffer, checkpointed or not, and the logits."""
+    config, model = build_fixture(plugin, spec, device)
+    input_ids, position_ids = pack_sequences(fixture_sequences(config, spec, device=device))
+    with tempfile.TemporaryDirectory() as path:
+        save_hf_checkpoint(model, plugin, config, path)
+        _, loaded = load_hf_checkpoint(plugin, path, options=spec.options, device=device)
+    buffers = dict(loaded.named_buffers())
+    for name, buffer in model.named_buffers():
+        try:
+            _assert_close(buffers[name], buffer, 0.0, f"buffer {name}")
+        except AssertionError as error:
+            raise AssertionError(f"{error} after a meta-device build: does its module implement ap_init_buffers?")
+    with torch.no_grad():
+        expected = _logits(model, forward(model, input_ids, position_ids))
+        _assert_close(_logits(loaded, forward(loaded, input_ids, position_ids)), expected, 0.0, "meta-built logits")
+
+
+def check_dtype_marks(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "cpu") -> None:
+    """Under a bf16 build, tensors marked ``dtype="fp32"`` stay fp32 and the rest are bf16; a checkpoint, written
+    from the same stream the sampler receives, carries those mixed dtypes and reloads every tensor exactly."""
+    config, model = build_fixture(plugin, spec, device)
+    cast_model(model, torch.bfloat16)
+    marks = tensor_marks(model)
+    tensors = dict(model.named_parameters()) | dict(model.named_buffers())
+    for name, tensor in tensors.items():
+        if tensor.is_floating_point():
+            expected = torch.float32 if marks[name].dtype == "fp32" else torch.bfloat16
+            if tensor.dtype != expected:
+                raise AssertionError(f"{name} is {tensor.dtype} under a bf16 build, expected {expected}")
+    with tempfile.TemporaryDirectory() as path:
+        save_hf_checkpoint(model, plugin, config, path)
+        _, loaded = load_hf_checkpoint(plugin, path, options=spec.options, device=device)
+    reloaded = loaded.state_dict()
+    for name, tensor in model.state_dict().items():
+        if reloaded[name].dtype != tensor.dtype:
+            raise AssertionError(f"{name} reloads as {reloaded[name].dtype}, saved as {tensor.dtype}")
+        _assert_close(reloaded[name], tensor, 0.0, f"reloaded {name}")
+
+
 def check_router_replay(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "cpu") -> None:
     """Replaying captured routing reproduces the forward, fresh ids fall back to the gate, and replay is honoured."""
     config, model = build_fixture(plugin, spec, device)
     info = plugin.parallelism(config)
     input_ids, position_ids = pack_sequences(fixture_sequences(config, spec, device=device))
     with torch.no_grad():
-        logits, routing = forward(model, input_ids, position_ids, return_routing=True)
+        hidden, routing = forward(model, input_ids, position_ids, return_routing=True)
+        logits = _logits(model, hidden)
         if set(routing) != set(info.moe_layers):
             raise AssertionError(f"routing covers layers {sorted(routing)}, config declares {list(info.moe_layers)}")
-        replayed = _logits(forward(model, input_ids, position_ids, routed_experts=routing))
+        replayed = _logits(model, forward(model, input_ids, position_ids, routed_experts=routing))
         _assert_close(replayed, logits, 0.0, "replayed captured routing")
         fresh = {layer: torch.full_like(route, ROUTER_REPLAY_FRESH) for layer, route in routing.items()}
-        _assert_close(_logits(forward(model, input_ids, position_ids, routed_experts=fresh)), logits, 0.0, "fresh")
+        _assert_close(
+            _logits(model, forward(model, input_ids, position_ids, routed_experts=fresh)), logits, 0.0, "fresh"
+        )
         shifted = {layer: (route + 1) % info.num_experts for layer, route in routing.items()}
-        moved = _logits(forward(model, input_ids, position_ids, routed_experts=shifted))
+        moved = _logits(model, forward(model, input_ids, position_ids, routed_experts=shifted))
         if (moved - logits).abs().max().item() == 0.0:
             raise AssertionError("forcing different experts did not change the output: routed_experts is ignored")
 
@@ -242,7 +327,7 @@ def check_checkpoint_and_sync(plugin: ModelPlugin, spec: ConformanceSpec, device
     input_ids, position_ids = pack_sequences(fixture_sequences(config, spec, device=device))
     stamp = {key: value for key, value in checkpoint_stamp(plugin).items() if key.startswith("arctic_plugin")}
     with torch.no_grad():
-        expected = _logits(forward(model, input_ids, position_ids))
+        expected = _logits(model, forward(model, input_ids, position_ids))
         for max_shard_bytes in (None, 4096):
             with tempfile.TemporaryDirectory() as path:
                 save_hf_checkpoint(model, plugin, config, path, max_shard_bytes=max_shard_bytes)
@@ -251,10 +336,9 @@ def check_checkpoint_and_sync(plugin: ModelPlugin, spec: ConformanceSpec, device
                     raise AssertionError("a sharded save must write several files and an index")
                 if read_stamp(path) != stamp:
                     raise AssertionError(f"checkpoint stamp {read_stamp(path)} does not name this plugin {stamp}")
-                _, reloaded = load_hf_checkpoint(plugin, path)
-                reloaded = reloaded.to(device)
+                _, reloaded = load_hf_checkpoint(plugin, path, options=spec.options, device=device)
                 what = "reloaded checkpoint" + ("" if max_shard_bytes is None else " (sharded)")
-                _assert_close(_logits(forward(reloaded, input_ids, position_ids)), expected, 0.0, what)
+                _assert_close(_logits(reloaded, forward(reloaded, input_ids, position_ids)), expected, 0.0, what)
     checkpoint = dict(iter_hf_weights(model, plugin, for_sampler=False))
     stream = dict(iter_hf_weights(model, plugin, for_sampler=True))
     skipped = weight_sync_skipped(model)
@@ -277,8 +361,9 @@ def check_activation_checkpointing(plugin: ModelPlugin, spec: ConformanceSpec, d
     labels = next_token_labels(input_ids, position_ids)
     logits = {}
     for name, candidate in (("plain", model), ("checkpointed", checkpointed)):
-        logits[name] = _logits(forward(candidate, input_ids, position_ids))
-        _token_loss(logits[name], labels).backward()
+        output = forward(candidate, input_ids, position_ids)
+        logits[name] = _logits(candidate, output)
+        _token_loss(candidate, output, labels, spec).backward()
     _assert_close(logits["checkpointed"].detach(), logits["plain"].detach(), 0.0, "checkpointed logits")
     expected = _grads(model)
     for name, grad in _grads(checkpointed).items():
@@ -312,8 +397,7 @@ def check_weights_directory(plugin: ModelPlugin, path: str | Path) -> None:
 
     config = plugin.config_class.from_pretrained(path)
     plugin.parallelism(config)
-    with torch.device("meta"):
-        expected = {name: tuple(tensor.shape) for name, tensor in plugin.build_model(config).state_dict().items()}
+    expected = {name: tuple(tensor.shape) for name, tensor in build(plugin, config, meta=True).state_dict().items()}
     files = checkpoint_files(path)
     for file in set(files.values()):
         if not file.is_file():
@@ -370,7 +454,7 @@ def check_rl_step(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "
 
     input_ids, position_ids = pack_sequences(sequences)
     labels = next_token_labels(input_ids, position_ids)
-    packed = token_logprobs(_logits(forward(model, input_ids, position_ids)), labels)
+    packed = token_logprobs(model, forward(model, input_ids, position_ids), labels, chunk_size=spec.logprob_chunk)
     advantages = torch.randn(packed.shape, generator=generator).to(device)
     old = packed.detach() + 0.01 * torch.randn(packed.shape, generator=generator).to(device)
     mask = labels != IGNORE_INDEX
@@ -393,7 +477,8 @@ def check_rl_step(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "
     for row, sequence in enumerate(sequences):
         row_ids, row_positions = pack_sequences([sequence])
         row_labels = next_token_labels(row_ids, row_positions)
-        rows_logprobs.append(token_logprobs(_logits(forward(padded_model, row_ids, row_positions)), row_labels)[0])
+        hidden = forward(padded_model, row_ids, row_positions)
+        rows_logprobs.append(token_logprobs(padded_model, hidden, row_labels, chunk_size=spec.logprob_chunk)[0])
         stop = start + len(sequence)
         padded_old[row, : len(sequence)] = old[0, start:stop]
         padded_advantages[row, : len(sequence)] = advantages[0, start:stop]
@@ -463,10 +548,12 @@ def _parallel_checks(
     input_ids, position_ids = pack_sequences(sequences)
     labels = next_token_labels(input_ids, position_ids)
 
-    baseline_logits = _logits(forward(baseline, input_ids, position_ids))
-    _token_loss(baseline_logits, labels).backward()
-    logits = _logits(forward(model, input_ids, position_ids, sp_group=sp_group))
-    _token_loss(logits, shard_sequence(labels, sp_group)).backward()
+    unsharded = forward(baseline, input_ids, position_ids)
+    baseline_logits = _logits(baseline, unsharded)
+    _token_loss(baseline, unsharded, labels, spec).backward()
+    output = forward(model, input_ids, position_ids, sp_group=sp_group)
+    logits = _logits(model, output)
+    _token_loss(model, output, shard_sequence(labels, sp_group), spec).backward()
     _assert_close(logits.detach(), shard_sequence(baseline_logits.detach(), sp_group), atol, f"{mode} logits")
 
     sharded = expert_names if ep_group is not None else set()
@@ -530,7 +617,10 @@ def run_conformance(
         ("static", lambda: check_static(plugin, spec)),
         ("reference_parity", lambda: check_reference_parity(plugin, spec, device)),
         ("packing", lambda: check_packing(plugin, spec, device)),
+        ("logprob_chunking", lambda: check_logprob_chunking(plugin, spec, device)),
         ("activation_checkpointing", lambda: check_activation_checkpointing(plugin, spec, device)),
+        ("meta_build", lambda: check_meta_build(plugin, spec, device)),
+        ("dtype_marks", lambda: check_dtype_marks(plugin, spec, device)),
         ("checkpoint_and_sync", lambda: check_checkpoint_and_sync(plugin, spec, device)),
         ("rl_step", lambda: check_rl_step(plugin, spec, device)),
     ]

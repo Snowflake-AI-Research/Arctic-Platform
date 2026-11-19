@@ -31,6 +31,7 @@ from typing import runtime_checkable
 import torch
 from torch import nn
 
+from arctic_platform.model_plugin.marks import MARKS_ATTR
 from arctic_platform.model_plugin.parallel import combine_tokens
 from arctic_platform.model_plugin.parallel import gather_tokens
 from arctic_platform.model_plugin.parallel import group_rank
@@ -98,6 +99,8 @@ def shard_experts(module: nn.Module, names: list[str], group) -> None:
         per_rank = full.shape[0] // size
         local = nn.Parameter(full.detach()[rank * per_rank : (rank + 1) * per_rank].clone())
         local.requires_grad_(full.requires_grad)
+        if hasattr(full, MARKS_ATTR):
+            setattr(local, MARKS_ATTR, getattr(full, MARKS_ATTR))
         setattr(owner, attribute, local)
 
 

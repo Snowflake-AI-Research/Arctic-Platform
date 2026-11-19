@@ -35,6 +35,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from toy_hybrid_moe import PLUGIN
 
+from arctic_platform.model_plugin import cast_model
 from arctic_platform.model_plugin import conformance
 from arctic_platform.model_plugin.host import forward
 from arctic_platform.model_plugin.host import next_token_labels
@@ -160,7 +161,7 @@ def _check(rank, world, sp, ep, device, dtype, checkpointing):
     replicas, replica = world // sp, rank // sp
 
     config, baseline = conformance.build_fixture(PLUGIN, spec, device)
-    baseline = baseline.to(dtype)
+    baseline = cast_model(baseline, dtype)
     model = copy.deepcopy(baseline)
     prepare_model(model, PLUGIN, config, sp_group=sp_group, ep_group=ep_group)
     if checkpointing:
@@ -170,19 +171,22 @@ def _check(rank, world, sp, ep, device, dtype, checkpointing):
     reference_logits, reference_routing = None, None
     for other in range(replicas):
         input_ids, position_ids, labels = _packed(config, spec, other, device)
-        logits, routing = forward(baseline, input_ids, position_ids, return_routing=True)
-        conformance._token_loss(logits, labels).backward()
+        output = forward(baseline, input_ids, position_ids, return_routing=True)
+        conformance._token_loss(baseline, output, labels, spec).backward()
         if other == replica:
-            reference_logits, reference_routing = logits.detach(), routing
+            reference_logits, reference_routing = conformance._logits(baseline, output).detach(), output[1]
 
     input_ids, position_ids, labels = _packed(config, spec, replica, device)
-    logits = forward(model, input_ids, position_ids, sp_group=sp_group)
-    conformance._token_loss(logits, shard_sequence(labels, sp_group)).backward()
+    output = forward(model, input_ids, position_ids, sp_group=sp_group)
+    conformance._token_loss(model, output, shard_sequence(labels, sp_group), spec).backward()
+    logits = conformance._logits(model, output)
     where = f"world={world} sp={sp} ep={ep} {dtype} ac={checkpointing} rank {rank}"
     _close(logits.detach(), shard_sequence(reference_logits, sp_group), atol, f"{where}: logits")
 
     with torch.no_grad():
-        replayed = forward(model, input_ids, position_ids, sp_group=sp_group, routed_experts=reference_routing)
+        replayed = conformance._logits(
+            model, forward(model, input_ids, position_ids, sp_group=sp_group, routed_experts=reference_routing)
+        )
     _close(replayed, shard_sequence(reference_logits, sp_group), atol, f"{where}: replayed routing")
 
     experts = {

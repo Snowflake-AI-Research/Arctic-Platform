@@ -33,7 +33,7 @@ from arctic_platform.model_plugin import ExpertShard
 from arctic_platform.model_plugin import HeadShard
 from arctic_platform.model_plugin import SequenceWindow
 from arctic_platform.model_plugin import in_recompute
-from arctic_platform.model_plugin import skip_weight_sync
+from arctic_platform.model_plugin import mark
 from arctic_platform.model_plugin.attention import segment_ids
 from arctic_platform.model_plugin.attention import segment_of
 
@@ -41,7 +41,9 @@ from .config import FULL_ATTENTION
 from .config import GATED_RECURRENCE
 from .config import MOE
 from .config import SHORT_CONV
+from .config import VALUE_CONV
 from .config import ToyHybridMoEConfig
+from .options import ToyOptions
 
 
 class RMSNorm(nn.Module):
@@ -60,14 +62,78 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-second, first), dim=-1)
 
 
-def apply_rope(x: torch.Tensor, position_ids: torch.Tensor, theta: float) -> torch.Tensor:
-    """Rotary embedding of ``[1, T, H, D]`` at each token's position within its packed row."""
-    dim = x.shape[-1]
-    inv_freq = theta ** (-torch.arange(0, dim, 2, dtype=torch.float32, device=x.device) / dim)
-    angles = position_ids[0].float()[:, None] * inv_freq[None, :]
-    cos = torch.cat((angles.cos(), angles.cos()), dim=-1)[None, :, None, :]
-    sin = torch.cat((angles.sin(), angles.sin()), dim=-1)[None, :, None, :]
-    return (x.float() * cos + rotate_half(x.float()) * sin).to(x.dtype)
+class RotaryEmbedding(nn.Module):
+    """Rotary embedding at each token's position within its packed row.
+
+    ``inv_freq`` is computed, not checkpointed: under a meta-device build ``ap_init_buffers`` recomputes it, and the
+    module is marked fp32 so a bf16 build does not round the frequencies.
+    """
+
+    def __init__(self, dim: int, theta: float):
+        super().__init__()
+        self.dim, self.theta = dim, theta
+        self.register_buffer("inv_freq", self._inv_freq(None), persistent=False)
+        mark(self, dtype="fp32")
+
+    def _inv_freq(self, device) -> torch.Tensor:
+        return self.theta ** (-torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
+
+    def ap_init_buffers(self) -> None:
+        self.inv_freq = self._inv_freq(self.inv_freq.device)
+
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        """``x`` is ``[1, T, H, D]``."""
+        angles = position_ids[0].float()[:, None] * self.inv_freq[None, :]
+        cos = torch.cat((angles.cos(), angles.cos()), dim=-1)[None, :, None, :]
+        sin = torch.cat((angles.sin(), angles.sin()), dim=-1)[None, :, None, :]
+        return (x.float() * cos + rotate_half(x.float()) * sin).to(x.dtype)
+
+
+def causal_short_conv(
+    u: torch.Tensor, weight: torch.Tensor, cu_seqlens: torch.Tensor, shard: SequenceWindow, kernel: str = "loop"
+) -> torch.Tensor:
+    """Depthwise causal convolution of ``u`` ``[1, L, C]`` with ``weight`` ``[C, K]``, restarting at every row in
+    ``cu_seqlens``. ``u`` covers global positions ``[shard.start - shard.halo, shard.start - shard.halo + L)``.
+
+    ``kernel="fused"`` runs each row through one ``conv1d``; it needs whole rows, so it has no halo support.
+    """
+    length, taps = u.shape[1], weight.shape[1]
+    if kernel == "fused":
+        if shard != FULL_WINDOW:
+            raise ValueError("the fused short convolution runs whole rows and cannot run on a sequence shard")
+        bounds = cu_seqlens.tolist()
+        rows = [u[0, start:end].T.unsqueeze(0) for start, end in zip(bounds[:-1], bounds[1:])]
+        out = [F.conv1d(F.pad(row, (taps - 1, 0)), weight.unsqueeze(1), groups=weight.shape[0])[0].T for row in rows]
+        return torch.cat(out).unsqueeze(0)
+    positions = torch.arange(length, device=u.device) + shard.start - shard.halo
+    rows = segment_of(cu_seqlens, positions)
+    out = torch.zeros_like(u)
+    for lag in range(taps):
+        shifted = F.pad(u, (0, 0, lag, 0))[:, :length]
+        same_row = torch.zeros(length, dtype=torch.bool, device=u.device)
+        same_row[lag:] = rows[lag:] == rows[: length - lag]
+        out = out + shifted * weight[:, taps - 1 - lag] * same_row[None, :, None]
+    return out
+
+
+class ToyValueConv(nn.Module):
+    """A short causal convolution on attention values: a sequence-mixing sub-layer inside the attention block.
+
+    Its mixer (``parallel.ShortConvMixer``) uses the halo policy, like the short-convolution layer type.
+    """
+
+    ap_layer_type = VALUE_CONV
+
+    def __init__(self, channels: int, kernel: int, impl: str):
+        super().__init__()
+        self.kernel, self.impl = kernel, impl
+        self.conv_weight = nn.Parameter(torch.randn(channels, kernel) / kernel)
+
+    def forward(self, v: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        return self.mix(v.flatten(-2), cu_seqlens=cu_seqlens).view_as(v)
+
+    def mix(self, u: torch.Tensor, *, cu_seqlens: torch.Tensor, shard: SequenceWindow = FULL_WINDOW) -> torch.Tensor:
+        return causal_short_conv(u, self.conv_weight, cu_seqlens, shard, self.impl)
 
 
 class ToyAttention(AttentionModule):
@@ -75,13 +141,18 @@ class ToyAttention(AttentionModule):
 
     ap_layer_type = FULL_ATTENTION
 
-    def __init__(self, config: ToyHybridMoEConfig):
+    def __init__(self, config: ToyHybridMoEConfig, options: ToyOptions):
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.sliding_window = config.sliding_window
-        self.rope_theta = config.rope_theta
+        self.rotary = RotaryEmbedding(self.head_dim, config.rope_theta)
+        self.v_conv = (
+            ToyValueConv(self.num_kv_heads * self.head_dim, config.conv_kernel, options.short_conv_kernel)
+            if config.attention_value_conv
+            else None
+        )
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
@@ -92,8 +163,10 @@ class ToyAttention(AttentionModule):
         q = self.q_proj(x).view(1, length, self.num_heads, self.head_dim)
         k = self.k_proj(x).view(1, length, self.num_kv_heads, self.head_dim)
         v = self.v_proj(x).view(1, length, self.num_kv_heads, self.head_dim)
-        q = apply_rope(q, position_ids, self.rope_theta)
-        k = apply_rope(k, position_ids, self.rope_theta)
+        q = self.rotary(q, position_ids)
+        k = self.rotary(k, position_ids)
+        if self.v_conv is not None:
+            v = self.v_conv(v, cu_seqlens)
         return self.o_proj(self.mix(q, k, v, cu_seqlens=cu_seqlens).flatten(-2))
 
 
@@ -107,7 +180,7 @@ class ToyRecurrence(nn.Module):
 
     ap_layer_type = GATED_RECURRENCE
 
-    def __init__(self, config: ToyHybridMoEConfig):
+    def __init__(self, config: ToyHybridMoEConfig, options: ToyOptions):
         super().__init__()
         self.num_heads = config.recurrence_heads
         self.head_dim = config.recurrence_head_dim
@@ -184,6 +257,8 @@ class LoadStats(nn.Module):
     def __init__(self, num_experts: int):
         super().__init__()
         self.register_buffer("tokens_per_expert", torch.zeros(num_experts))
+        # Counts must not round in a bf16 build, and the sampler never reads them.
+        mark(self, dtype="fp32", weight_sync=False)
 
 
 class ToyMoE(nn.Module):
@@ -200,10 +275,11 @@ class ToyMoE(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.scale = config.routed_scaling_factor
-        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
+        # The router stays fp32 in a bf16 build, so near-tied experts are chosen as in fp32.
+        self.router = mark(nn.Linear(config.hidden_size, self.num_experts, bias=False), dtype="fp32")
         self.experts = ToyExperts(self.num_experts, config.hidden_size, config.moe_intermediate_size)
         self.shared_expert = DenseMLP(config.hidden_size, config.moe_intermediate_size * config.num_shared_experts)
-        self.stats = skip_weight_sync(LoadStats(self.num_experts))
+        self.stats = LoadStats(self.num_experts)
 
     def forward(self, x: torch.Tensor, routed: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         tokens = x.reshape(-1, x.shape[-1])
@@ -217,7 +293,7 @@ class ToyMoE(nn.Module):
     def route(self, tokens: torch.Tensor, routed: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         """Expert ids ``[N, top_k]`` and gate weights. ``routed`` replays captured ids; ``ROUTER_REPLAY_FRESH``
         entries take this router's own choice."""
-        scores = torch.softmax(self.router(tokens).float(), dim=-1)
+        scores = torch.softmax(self.router(tokens.float()), dim=-1)
         own = torch.topk(scores.detach(), self.top_k, dim=-1).indices
         selected = own if routed is None else torch.where(routed == ROUTER_REPLAY_FRESH, own, routed.to(own.dtype))
         weights = scores.gather(1, selected)
@@ -250,10 +326,11 @@ class ToyShortConv(nn.Module):
 
     ap_layer_type = SHORT_CONV
 
-    def __init__(self, config: ToyHybridMoEConfig):
+    def __init__(self, config: ToyHybridMoEConfig, options: ToyOptions):
         super().__init__()
         self.channels = config.conv_channels
         self.kernel = config.conv_kernel
+        self.impl = options.short_conv_kernel
         self.in_proj = nn.Linear(config.hidden_size, self.channels, bias=False)
         self.gate_proj = nn.Linear(config.hidden_size, self.channels, bias=False)
         self.out_proj = nn.Linear(self.channels, config.hidden_size, bias=False)
@@ -263,16 +340,7 @@ class ToyShortConv(nn.Module):
         return self.out_proj(self.mix(self.in_proj(x), cu_seqlens=cu_seqlens) * F.silu(self.gate_proj(x)))
 
     def mix(self, u: torch.Tensor, *, cu_seqlens: torch.Tensor, shard: SequenceWindow = FULL_WINDOW) -> torch.Tensor:
-        length = u.shape[1]
-        positions = torch.arange(length, device=u.device) + shard.start - shard.halo
-        rows = segment_of(cu_seqlens, positions)
-        out = torch.zeros_like(u)
-        for lag in range(self.kernel):
-            shifted = F.pad(u, (0, 0, lag, 0))[:, :length]
-            same_row = torch.zeros(length, dtype=torch.bool, device=u.device)
-            same_row[lag:] = rows[lag:] == rows[: length - lag]
-            out = out + shifted * self.conv_weight[:, self.kernel - 1 - lag] * same_row[None, :, None]
-        return out
+        return causal_short_conv(u, self.conv_weight, cu_seqlens, shard, self.impl)
 
 
 _MIXER_ATTRIBUTE = {FULL_ATTENTION: "self_attn", GATED_RECURRENCE: "recurrence", SHORT_CONV: "conv"}
@@ -284,13 +352,13 @@ _MIXER_CLASS: dict[str, type[nn.Module]] = {
 
 
 class ToyDecoderLayer(nn.Module):
-    def __init__(self, config: ToyHybridMoEConfig, layer_idx: int):
+    def __init__(self, config: ToyHybridMoEConfig, options: ToyOptions, layer_idx: int):
         super().__init__()
         self.mixer_name = _MIXER_ATTRIBUTE[config.layer_types[layer_idx]]
         self.is_moe = config.mlp_types[layer_idx] == MOE
         self.input_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        setattr(self, self.mixer_name, _MIXER_CLASS[config.layer_types[layer_idx]](config))
+        setattr(self, self.mixer_name, _MIXER_CLASS[config.layer_types[layer_idx]](config, options))
         self.mlp = ToyMoE(config) if self.is_moe else DenseMLP(config.hidden_size, config.intermediate_size)
 
     def forward(
@@ -304,18 +372,21 @@ class ToyDecoderLayer(nn.Module):
 
 
 class ToyHybridMoEModel(nn.Module):
-    def __init__(self, config: ToyHybridMoEConfig):
+    def __init__(self, config: ToyHybridMoEConfig, options: ToyOptions):
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(ToyDecoderLayer(config, i) for i in range(config.num_hidden_layers))
+        self.layers = nn.ModuleList(ToyDecoderLayer(config, options, i) for i in range(config.num_hidden_layers))
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
 
 class ToyHybridMoEForCausalLM(nn.Module):
-    def __init__(self, config: ToyHybridMoEConfig):
+    """Returns final hidden states; the platform turns them into log-probabilities chunk by chunk through
+    :meth:`compute_logits`."""
+
+    def __init__(self, config: ToyHybridMoEConfig, options: ToyOptions | None = None):
         super().__init__()
         self.config = config
-        self.model = ToyHybridMoEModel(config)
+        self.model = ToyHybridMoEModel(config, options or ToyOptions())
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(
@@ -334,5 +405,10 @@ class ToyHybridMoEForCausalLM(nn.Module):
             h, selected = layer(h, position_ids, cu_seqlens, routed_experts.get(index))
             if selected is not None:
                 routing[index] = selected
-        logits = self.lm_head(self.model.norm(h))
-        return (logits, routing) if return_routing else logits
+        hidden = self.model.norm(h)
+        return (hidden, routing) if return_routing else hidden
+
+    def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        logits = self.lm_head(hidden)
+        cap = self.config.final_logit_softcapping
+        return logits if cap is None else cap * torch.tanh(logits / cap)

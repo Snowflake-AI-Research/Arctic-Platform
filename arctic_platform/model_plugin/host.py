@@ -28,10 +28,12 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from arctic_platform.common.packing import IGNORE_INDEX
 from arctic_platform.common.packing import cu_seqlens_from_position_ids
 from arctic_platform.model_plugin.experts import EXPERT_PARALLEL_SIZE_ATTR
+from arctic_platform.model_plugin.marks import apply_marks
 from arctic_platform.model_plugin.mixers import Mixer
 from arctic_platform.model_plugin.parallel import group_size
 from arctic_platform.model_plugin.parallel import shard_sequence
@@ -51,11 +53,12 @@ class LayerBinding:
 def bind_layers(model: nn.Module, plugin: ModelPlugin, info: ParallelismInfo) -> LayerBinding:
     """Bind every module that declares ``ap_layer_type`` to its layer type's mixer, and find the expert layers.
 
-    The bound modules must match the config's ``layer_types`` exactly, and the expert layers its ``moe_layers``:
-    a layer the platform cannot account for fails here, before a job starts.
+    The bound modules must match the config's ``layer_types`` and ``sublayers`` exactly, and the expert layers its
+    ``moe_layers``: a layer the platform cannot account for fails here, before a job starts.
     """
     mixers = plugin.layer_mixers()
-    unknown = set(info.layer_types) - set(mixers)
+    sublayer_types = set(plugin.manifest.sublayer_types)
+    unknown = (set(info.layer_types) - set(plugin.manifest.layer_types)) | (set(info.sublayers) - sublayer_types)
     if len(unknown) > 0:
         raise ValueError(f"config uses layer types the manifest does not declare: {sorted(unknown)}")
     binding = LayerBinding(info=info)
@@ -70,7 +73,7 @@ def bind_layers(model: nn.Module, plugin: ModelPlugin, info: ParallelismInfo) ->
             raise ValueError(f"{path} declares layer type {layer_type!r} but its mixer does not accept it")
         binding.mixers[path] = (layer_type, mixer)
     bound = Counter(layer_type for layer_type, _ in binding.mixers.values())
-    expected = Counter(info.layer_types)
+    expected = Counter(info.layer_types) + Counter(info.sublayers)
     if bound != expected:
         raise ValueError(f"model has sequence-mixing modules {dict(bound)} but its config declares {dict(expected)}")
     if plugin.expert_layer is not None:
@@ -133,6 +136,7 @@ def prepare_model(
                 setattr(param, "allreduce", False)
                 setattr(param, "group_name", ep_group_name)
                 setattr(param, EXPERT_PARALLEL_SIZE_ATTR, ep_size)
+    apply_marks(model)  # after expert sharding, which replaces the expert parameters
     return binding
 
 
@@ -154,7 +158,11 @@ def forward(
     routed_experts: dict[int, torch.Tensor] | None = None,
     return_routing: bool = False,
 ):
-    """Run a packed ``[1, T]`` batch, passing each rank its sequence shard and the full sequence's boundaries."""
+    """Run a packed ``[1, T]`` batch, passing each rank its sequence shard and the full sequence's boundaries.
+
+    Returns the model's final hidden states ``[1, T_local, D]``, with the routing when ``return_routing``; turn them
+    into log-probabilities with :func:`token_logprobs`, or into logits with :func:`compute_logits`.
+    """
     cu_seqlens = cu_seqlens_from_position_ids(position_ids)
     local_routes = None
     if routed_experts is not None:
@@ -178,8 +186,38 @@ def next_token_labels(input_ids: torch.Tensor, position_ids: torch.Tensor) -> to
     return labels.masked_fill(row_end, IGNORE_INDEX)
 
 
-def token_logprobs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Per-token log-probabilities of ``labels``; zero where a label is ``IGNORE_INDEX``."""
+# Tokens per chunk when turning hidden states into log-probabilities: the full logits of a 256K-token row over a
+# 152K vocabulary would take ~159 GB in fp32.
+DEFAULT_LOGPROB_CHUNK = 4096
+
+
+def compute_logits(model: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
+    """Logits of ``hidden`` ``[..., D]``: the model's ``compute_logits`` if it defines one (output scaling, logit
+    softcapping), else ``lm_head(hidden)``."""
+    override = getattr(model, "compute_logits", None)
+    return override(hidden) if override is not None else model.lm_head(hidden)
+
+
+def _chunk_logprobs(model: nn.Module, hidden: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     valid = labels != IGNORE_INDEX
-    picked = torch.log_softmax(logits.float(), dim=-1).gather(-1, labels.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+    logits = compute_logits(model, hidden).float()
+    picked = torch.log_softmax(logits, dim=-1).gather(-1, labels.clamp(min=0).unsqueeze(-1)).squeeze(-1)
     return picked * valid
+
+
+def token_logprobs(
+    model: nn.Module, hidden: torch.Tensor, labels: torch.Tensor, *, chunk_size: int = DEFAULT_LOGPROB_CHUNK
+) -> torch.Tensor:
+    """Per-token log-probabilities ``[1, T]`` of ``labels`` from hidden states ``[1, T, D]``; zero where a label is
+    ``IGNORE_INDEX``.
+
+    Logits are computed ``chunk_size`` tokens at a time and recomputed in backward, so at most one chunk's logits
+    exist at once, in forward or backward.
+    """
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    if hidden.shape[1] <= chunk_size:
+        return _chunk_logprobs(model, hidden, labels)
+    # One split, so backward assembles the hidden-state gradient once instead of zero-filling it per chunk.
+    chunks = zip(hidden.split(chunk_size, dim=1), labels.split(chunk_size, dim=1))
+    return torch.cat([checkpoint(_chunk_logprobs, model, h, y, use_reentrant=False) for h, y in chunks], dim=1)

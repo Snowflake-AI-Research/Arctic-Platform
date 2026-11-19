@@ -63,6 +63,7 @@ CONFIG = dict(
     num_experts_per_tok=2,
     moe_intermediate_size=128,
     max_position_embeddings=1024,
+    final_logit_softcapping=30.0,  # applied by the trainer's compute_logits and by vLLM's logits processor
 )
 PROMPTS = [[(7 * i + 3 * j) % 500 + 2 for j in range(length)] for i, length in enumerate([17, 5, 40, 9])]
 DECODE_TOKENS = 12
@@ -85,7 +86,8 @@ def _trainer_logprobs(model, sequences: list[list[int]]) -> list[torch.Tensor]:
     rows = [torch.tensor(sequence, device="cuda") for sequence in sequences]
     input_ids, position_ids = pack_sequences(rows)
     with torch.no_grad():
-        logprobs = token_logprobs(forward(model, input_ids, position_ids), next_token_labels(input_ids, position_ids))
+        labels = next_token_labels(input_ids, position_ids)
+        logprobs = token_logprobs(model, forward(model, input_ids, position_ids), labels)
     out, start = [], 0
     for row in rows:
         out.append(logprobs[0, start : start + len(row) - 1].cpu())

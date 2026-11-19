@@ -64,7 +64,8 @@ def _keeps_source_dtype(tensor, fp8_dtypes) -> bool:
 
 def _remark_keep_fp32(model) -> int:
     """Re-apply the keep-FP32 marker, by name, to block scales and to the FP32
-    parameters the model family keeps out of the bf16 cast.
+    parameters the model family keeps out of the bf16 cast, and count the FP32
+    parameters already marked (a model plugin's ``mark(..., dtype="fp32")``).
 
     The marker is an attribute on the parameter object, so a rebuild between
     construction and ``deepspeed.initialize`` drops it.
@@ -76,7 +77,7 @@ def _remark_keep_fp32(model) -> int:
     for name, param in model.named_parameters():
         if param.dtype != torch.float32:
             continue
-        if name.endswith("_scale_inv") or (family_keeps is not None and family_keeps(name)):
+        if keeps_fp32(param) or name.endswith("_scale_inv") or (family_keeps is not None and family_keeps(name)):
             mark_keep_fp32(param)
             marked += 1
     return marked

@@ -47,7 +47,7 @@ def convert_layer_to_hf(
         elif name.endswith(".recurrence.conv_weight"):
             heads, head_dim, kernel = tensor.shape
             out[name.replace(".conv_weight", ".conv1d.weight")] = tensor.reshape(heads * head_dim, 1, kernel)
-        elif name.endswith(".conv.conv_weight"):
+        elif name.endswith((".conv.conv_weight", ".v_conv.conv_weight")):
             out[name.replace(".conv_weight", ".conv1d.weight")] = tensor.unsqueeze(1)
         else:
             out[name] = tensor
@@ -73,11 +73,15 @@ def convert_layer_to_prime(
                     f"{name}: expected Conv1d weight {(shape[0] * shape[1], 1, shape[2])}, got {tuple(tensor.shape)}"
                 )
             out[name.replace(".conv1d.weight", ".conv_weight")] = tensor.reshape(shape)
-        elif name.endswith(".conv.conv1d.weight"):
-            if tuple(tensor.shape) != (config.conv_channels, 1, config.conv_kernel):
+        elif name.endswith((".conv.conv1d.weight", ".v_conv.conv1d.weight")):
+            channels = (
+                config.conv_channels
+                if name.endswith(".conv.conv1d.weight")
+                else config.num_key_value_heads * config.head_dim
+            )
+            if tuple(tensor.shape) != (channels, 1, config.conv_kernel):
                 raise ValueError(
-                    f"{name}: expected Conv1d weight {(config.conv_channels, 1, config.conv_kernel)}, "
-                    f"got {tuple(tensor.shape)}"
+                    f"{name}: expected Conv1d weight {(channels, 1, config.conv_kernel)}, got {tuple(tensor.shape)}"
                 )
             out[name.replace(".conv1d.weight", ".conv_weight")] = tensor.squeeze(1)
         else:

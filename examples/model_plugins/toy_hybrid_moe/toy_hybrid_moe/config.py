@@ -24,6 +24,7 @@ FULL_ATTENTION = "full_attention"
 # the name "linear_attention" when it sizes their caches, so the recurrence uses that name.
 GATED_RECURRENCE = "linear_attention"
 SHORT_CONV = "conv"
+VALUE_CONV = "value_conv"
 DENSE = "dense"
 MOE = "moe"
 
@@ -53,6 +54,8 @@ class ToyHybridMoEConfig(PretrainedConfig):
         num_shared_experts: int = 1,
         routed_scaling_factor: float = 1.0,
         rms_norm_eps: float = 1e-6,
+        attention_value_conv: bool = False,
+        final_logit_softcapping: float | None = None,
         **kwargs,
     ):
         layer_types = list(layer_types or [GATED_RECURRENCE, FULL_ATTENTION, SHORT_CONV, FULL_ATTENTION])
@@ -88,6 +91,10 @@ class ToyHybridMoEConfig(PretrainedConfig):
         self.num_shared_experts = num_shared_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.rms_norm_eps = rms_norm_eps
+        # A short causal convolution on every attention layer's values: a sequence-mixing sub-layer.
+        self.attention_value_conv = attention_value_conv
+        # Logits become cap * tanh(logits / cap); None leaves them as they are.
+        self.final_logit_softcapping = final_logit_softcapping
         kwargs.setdefault("architectures", ["ToyHybridMoEForCausalLM"])
         kwargs.setdefault("tie_word_embeddings", False)
         super().__init__(**kwargs)

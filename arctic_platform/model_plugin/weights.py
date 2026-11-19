@@ -25,17 +25,17 @@ from collections.abc import Iterator
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
-from typing import TypeVar
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
+from arctic_platform.model_plugin.build import build
+from arctic_platform.model_plugin.build import materialize
 from arctic_platform.model_plugin.experts import EXPERT_PARALLEL_SIZE_ATTR
+from arctic_platform.model_plugin.marks import weight_sync_skipped
 from arctic_platform.model_plugin.plugin import ModelPlugin
 
-# The platform's existing marker; the weight sync skips any tensor that carries it.
-SKIP_WEIGHT_SYNC_ATTR = "_dss_skip_weight_sync"
 CHECKPOINT_FILE = "model.safetensors"
 INDEX_FILE = "model.safetensors.index.json"
 STAMP_PLUGIN = "arctic_plugin"
@@ -45,31 +45,6 @@ STAMP_CONTRACT = "arctic_plugin_contract"
 logger = logging.getLogger(__name__)
 
 _LAYER = re.compile(r"^model\.layers\.(\d+)\.")
-
-T = TypeVar("T", torch.Tensor, nn.Module)
-
-
-def skip_weight_sync(obj: T) -> T:
-    """Keep a parameter, or every tensor of a module, in checkpoints but out of the weight sync.
-
-    Use it for trainer-only state the sampler never reads. Mark a module rather than a buffer: moving a model
-    between devices or dtypes replaces buffer objects, and a marker set on the old object would be lost.
-    """
-    setattr(obj, SKIP_WEIGHT_SYNC_ATTR, True)
-    return obj
-
-
-def weight_sync_skipped(model: nn.Module) -> set[str]:
-    """Names of the trainer state tensors the weight sync leaves out."""
-    skipped = {
-        name
-        for name, tensor in model.state_dict(keep_vars=True).items()
-        if getattr(tensor, SKIP_WEIGHT_SYNC_ATTR, False)
-    }
-    for path, module in model.named_modules():
-        if getattr(module, SKIP_WEIGHT_SYNC_ATTR, False):
-            skipped.update(f"{path}.{name}" for name in module.state_dict())
-    return skipped
 
 
 def layer_index(name: str) -> int:
@@ -96,7 +71,8 @@ def iter_hf_weights(
     """Full tensors under Hugging Face names, one decoder layer at a time.
 
     Expert-parallel shards are gathered first, so every rank of ``ep_group`` must iterate. ``for_sampler`` drops
-    tensors marked with :func:`skip_weight_sync`.
+    tensors marked ``weight_sync=False``. Every tensor keeps its own dtype, so an fp32-marked tensor of a bf16 model
+    streams, and is saved, as fp32.
     """
     skipped = weight_sync_skipped(model) if for_sampler else set()
     groups: dict[int, dict[str, torch.Tensor]] = {}
@@ -268,12 +244,15 @@ def checkpoint_dtype(path: str | Path) -> torch.dtype | None:
     return max(elements, key=elements.__getitem__) if len(elements) > 0 else None
 
 
-def load_hf_checkpoint(plugin: ModelPlugin, path: str | Path) -> tuple[Any, nn.Module]:
-    """Build the trainer model from ``config.json`` in the dtype the checkpoint stores, and load the checkpoint into
-    it layer by layer.
+def load_hf_checkpoint(
+    plugin: ModelPlugin, path: str | Path, *, options: Any = None, device: str | torch.device = "cpu"
+) -> tuple[Any, nn.Module]:
+    """Build the trainer model from ``config.json`` on the meta device, allocate it on ``device`` in the dtype the
+        checkpoint stores, and load the checkpoint into it layer by layer. Building on the meta device is what the
+    platform does at scale; this helper then allocates the whole model on ``device``.
 
-    Building in the stored dtype makes a save and reload exact: loading bf16 tensors into an fp32 model would
-    compute in fp32 and change the logits. Parameters a model keeps in fp32 are cast by its own code (spec §7.9).
+        Building in the stored dtype makes a save and reload exact: loading bf16 tensors into an fp32 model would
+        compute in fp32 and change the logits. Tensors marked ``dtype="fp32"`` stay fp32, as they were saved.
     """
     stamp = read_stamp(path)
     if STAMP_PLUGIN in stamp and stamp[STAMP_PLUGIN] != plugin.manifest.name:
@@ -287,9 +266,6 @@ def load_hf_checkpoint(plugin: ModelPlugin, path: str | Path) -> tuple[Any, nn.M
             plugin.manifest.version,
         )
     config = plugin.config_class.from_pretrained(path)
-    model = plugin.build_model(config)
-    dtype = checkpoint_dtype(path)
-    if dtype is not None:
-        model = model.to(dtype)
+    model = materialize(build(plugin, config, options, meta=True), device, checkpoint_dtype(path))
     _load_layers(model, plugin, iter_checkpoint_layers(path))
     return config, model

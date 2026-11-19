@@ -35,10 +35,12 @@ from .config import FULL_ATTENTION
 from .config import GATED_RECURRENCE
 from .config import MOE
 from .config import SHORT_CONV
+from .config import VALUE_CONV
 from .config import ToyHybridMoEConfig
 from .modeling import ToyMoE
 from .modeling import ToyRecurrence
 from .modeling import ToyShortConv
+from .options import ToyOptions
 
 
 class GatedRecurrenceMixer(HeadParallelMixer):
@@ -56,7 +58,8 @@ class GatedRecurrenceMixer(HeadParallelMixer):
 
 
 class ShortConvMixer:
-    """Sequence parallelism for :class:`ToyShortConv` by halo exchange: a policy of its own.
+    """Sequence parallelism for a short causal convolution by halo exchange: a policy of its own. Used for the
+    :class:`ToyShortConv` layer type and the :class:`ToyValueConv` sub-layer.
 
     A causal convolution of width K reads only the K - 1 tokens before each output. So rather than the
     head-parallel exchange, which moves every activation to another rank and back, each rank borrows the last
@@ -65,10 +68,11 @@ class ShortConvMixer:
     K - 1 tokens.
     """
 
-    layer_type = SHORT_CONV
+    def __init__(self, layer_type: str = SHORT_CONV, module_class: type[nn.Module] = ToyShortConv):
+        self.layer_type, self.module_class = layer_type, module_class
 
     def is_instance(self, module: nn.Module) -> bool:
-        return isinstance(module, ToyShortConv)
+        return isinstance(module, self.module_class)
 
     def validate_sp(self, info: ParallelismInfo, sp_size: int) -> None:
         """No head constraint: the shard-length constraint is checked when the halo is exchanged."""
@@ -94,8 +98,10 @@ class ToyExpertLayer(StackedExpertLayer):
 
 
 def parallelism(config: ToyHybridMoEConfig) -> ParallelismInfo:
+    attention_layers = config.layer_types.count(FULL_ATTENTION)
     return ParallelismInfo(
         layer_types=tuple(config.layer_types),
+        sublayers={VALUE_CONV: attention_layers} if config.attention_value_conv else {},
         heads={
             FULL_ATTENTION: (config.num_attention_heads, config.num_key_value_heads),
             GATED_RECURRENCE: (config.recurrence_heads,),
@@ -104,3 +110,14 @@ def parallelism(config: ToyHybridMoEConfig) -> ParallelismInfo:
         num_experts=config.num_experts,
         top_k=config.num_experts_per_tok,
     )
+
+
+def validate(request, config: ToyHybridMoEConfig, options: ToyOptions) -> list[str]:
+    """Constraints admission cannot read from the manifest: they depend on the options or the config."""
+    reasons = []
+    uses_short_conv = SHORT_CONV in config.layer_types or config.attention_value_conv
+    if options.short_conv_kernel == "fused" and uses_short_conv and request.sp_size > 1:
+        reasons.append("short_conv_kernel='fused' runs whole rows, so it cannot run with sequence parallelism")
+    if request.job_type == "sampling" and config.attention_value_conv:
+        reasons.append("the vLLM model does not implement attention_value_conv")
+    return reasons

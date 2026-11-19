@@ -22,6 +22,7 @@ import dataclasses
 
 from toy_hybrid_moe import PLUGIN
 from toy_hybrid_moe.config import SHORT_CONV
+from toy_hybrid_moe.modeling import RotaryEmbedding
 from toy_hybrid_moe.modeling import ToyHybridMoEForCausalLM
 from toy_hybrid_moe.modeling import ToyMoE
 from toy_hybrid_moe.modeling import ToyRecurrence
@@ -50,9 +51,15 @@ class FirstExpertsMoE(ToyMoE):
         return super().experts_core(tokens, selected, weights, shard=shard)
 
 
+class StaleRotary(RotaryEmbedding):
+    """Computes its frequencies in ``__init__`` only: under a meta-device build they stay uninitialized memory."""
+
+    ap_init_buffers = None
+
+
 def _builder(original: type, broken: type):
-    def build(config):
-        model = ToyHybridMoEForCausalLM(config)
+    def build(config, options):
+        model = ToyHybridMoEForCausalLM(config, options)
         for module in model.modules():
             if type(module) is original:
                 module.__class__ = broken
@@ -73,6 +80,7 @@ class NoHaloMixer(ShortConvMixer):
         setattr(module, "mix", mix)
 
 
+NO_BUFFER_INIT = dataclasses.replace(PLUGIN, build_model=_builder(RotaryEmbedding, StaleRotary))
 WRONG_HEAD_SLICE = dataclasses.replace(PLUGIN, build_model=_builder(ToyRecurrence, FirstHeadsRecurrence))
 WRONG_EXPERT_SLICE = dataclasses.replace(PLUGIN, build_model=_builder(ToyMoE, FirstExpertsMoE))
 NO_HALO = dataclasses.replace(PLUGIN, mixers=dict(PLUGIN.mixers, **{SHORT_CONV: NoHaloMixer()}))

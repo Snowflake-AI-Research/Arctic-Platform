@@ -368,10 +368,12 @@ class ToyHybridMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
+        if config.attention_value_conv:
+            raise NotImplementedError("the vLLM model does not implement attention_value_conv")
         self.config = config
         self.model = _Model(config, vllm_config.cache_config, "model")
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix="lm_head")
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = LogitsProcessor(config.vocab_size, soft_cap=config.final_logit_softcapping)
 
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig) -> tuple[torch.dtype, torch.dtype]:

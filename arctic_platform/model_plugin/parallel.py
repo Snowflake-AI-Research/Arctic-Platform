@@ -149,6 +149,36 @@ def previous_tokens(group, tensor: torch.Tensor, count: int, dim: int = 1) -> to
     return tails[rank - 1] if rank > 0 else tails[0].narrow(dim, 0, 0)
 
 
+class _GatherSequence(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, group, tensor, dim):
+        ctx.group, ctx.dim = group, dim
+        parts = [torch.empty_like(tensor) for _ in range(group_size(group))]
+        dist.all_gather(parts, tensor.contiguous(), group=group)
+        return torch.cat(parts, dim=dim)
+
+    @staticmethod
+    def backward(ctx, grad):
+        # Reduce-scatter in fp32: a bf16 activation's gradient is rounded once, after the sum, as it would be
+        # unsharded (a bf16 ring would round every partial sum).
+        parts = torch.stack(grad.float().chunk(group_size(ctx.group), dim=ctx.dim))
+        mine = parts.new_empty(parts.shape[1:])
+        dist.reduce_scatter_tensor(mine, parts.flatten(0, 1), group=ctx.group)
+        return None, mine.to(grad.dtype), None
+
+
+def gather_sequence(group, tensor: torch.Tensor, dim: int = 1) -> torch.Tensor:
+    """Every rank's sequence shard of ``tensor``, concatenated in rank order along ``dim``: the whole sequence.
+
+    For a policy whose core needs the whole sequence on every rank. In backward, each rank's gradient for the whole
+    sequence is summed in fp32 and this rank's slice returned. Shards must have equal length; every rank of
+    ``group`` must call it.
+    """
+    if group_size(group) == 1:
+        return tensor
+    return _GatherSequence.apply(group, tensor, dim)
+
+
 def shard_sequence(tensor: torch.Tensor, group, dim: int = 1) -> torch.Tensor:
     """This rank's contiguous sequence shard."""
     size = group_size(group)

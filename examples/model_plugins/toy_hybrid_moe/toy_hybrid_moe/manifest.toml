@@ -1,7 +1,7 @@
 # ToyHybridMoE plugin manifest. The platform reads this before importing any plugin code.
 name = "custom/example/toy-hybrid-moe"
 version = "0.1.0"
-contract = "1.0"
+contract = "1.1"
 runtime_release = "runtime-2026.11"
 hf_model_types = ["toy_hybrid_moe"]
 
@@ -9,6 +9,9 @@ hf_model_types = ["toy_hybrid_moe"]
 full_attention = "platform:attention"   # the platform's attention core, sequence-parallel and fused on GPU
 linear_attention = "plugin"             # gated recurrence: parallel.GatedRecurrenceMixer (head-parallel policy)
 conv = "plugin"                         # short convolution: parallel.ShortConvMixer (halo-exchange policy)
+
+[sublayer_types]
+value_conv = "plugin"                   # short convolution on attention values, inside attention layers (halo policy)
 
 [capabilities]
 training = true

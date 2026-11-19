@@ -52,6 +52,17 @@ def _rope(x: torch.Tensor, theta: float) -> torch.Tensor:
     return out
 
 
+def _causal_conv(u: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``u`` is ``[L, C]``, ``weight`` ``[C, K]``; output ``t`` sums ``weight[:, tap] * u[t - (K - 1 - tap)]``."""
+    conv = torch.zeros_like(u)
+    for t in range(u.shape[0]):
+        for tap in range(weight.shape[1]):
+            source = t - (weight.shape[1] - 1 - tap)
+            if source >= 0:
+                conv[t] += weight[:, tap] * u[source]
+    return conv
+
+
 def _swiglu(x: torch.Tensor, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor) -> torch.Tensor:
     return (F.silu(x @ gate.T) * (x @ up.T)) @ down.T
 
@@ -70,7 +81,10 @@ def reference_forward(model: nn.Module, input_ids: torch.Tensor) -> torch.Tensor
             heads, kv_heads, dim = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
             q = _rope((x @ p[pre + "self_attn.q_proj.weight"].T).view(length, heads, dim), cfg.rope_theta)
             k = _rope((x @ p[pre + "self_attn.k_proj.weight"].T).view(length, kv_heads, dim), cfg.rope_theta)
-            v = (x @ p[pre + "self_attn.v_proj.weight"].T).view(length, kv_heads, dim)
+            v = x @ p[pre + "self_attn.v_proj.weight"].T
+            if cfg.attention_value_conv:
+                v = _causal_conv(v, p[pre + "self_attn.v_conv.conv_weight"])
+            v = v.view(length, kv_heads, dim)
             mixed = torch.zeros(length, heads, dim, dtype=h.dtype, device=h.device)
             for head in range(heads):
                 kv = head // (heads // kv_heads)
@@ -83,13 +97,7 @@ def reference_forward(model: nn.Module, input_ids: torch.Tensor) -> torch.Tensor
         elif cfg.layer_types[i] == SHORT_CONV:
             u = x @ p[pre + "conv.in_proj.weight"].T
             gate = x @ p[pre + "conv.gate_proj.weight"].T
-            weight = p[pre + "conv.conv_weight"]
-            conv = torch.zeros_like(u)
-            for t in range(length):
-                for tap in range(cfg.conv_kernel):
-                    source = t - (cfg.conv_kernel - 1 - tap)
-                    if source >= 0:
-                        conv[t] += weight[:, tap] * u[source]
+            conv = _causal_conv(u, p[pre + "conv.conv_weight"])
             h = h + (conv * F.silu(gate)) @ p[pre + "conv.out_proj.weight"].T
         else:
             heads, dim, kernel = cfg.recurrence_heads, cfg.recurrence_head_dim, cfg.conv_kernel
@@ -140,4 +148,7 @@ def reference_forward(model: nn.Module, input_ids: torch.Tensor) -> torch.Tensor
                 x, p[pre + "mlp.gate_proj.weight"], p[pre + "mlp.up_proj.weight"], p[pre + "mlp.down_proj.weight"]
             )
         h = h + out
-    return (_rms(h, p["model.norm.weight"], eps) @ p["lm_head.weight"].T).float()
+    logits = _rms(h, p["model.norm.weight"], eps) @ p["lm_head.weight"].T
+    if cfg.final_logit_softcapping is not None:
+        logits = cfg.final_logit_softcapping * torch.tanh(logits / cfg.final_logit_softcapping)
+    return logits.float()

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Status | **Draft for review and sign-off.** Interfaces may change until contract 1.0 is frozen. |
-| Contract version | 1.0 (draft) |
+| Contract version | 1.1 (draft) |
 | Reference implementation | [`arctic_platform/model_plugin/`](../../arctic_platform/model_plugin/) |
 | Example plugin | [`examples/model_plugins/toy_hybrid_moe/`](../../examples/model_plugins/toy_hybrid_moe/) |
 
@@ -143,7 +143,7 @@ The manifest is read **before** any of your code runs. Unknown keys are rejected
 ```toml
 name = "custom/acme/acme-hybrid"        # custom/<org>/<model>, lowercase
 version = "0.3.1"
-contract = "1.0"                         # must share the platform's major version
+contract = "1.1"                         # must share the platform's major version
 runtime_release = "runtime-2026.11"
 hf_model_types = ["acme_hybrid"]         # config.json "model_type" values this plugin serves
 
@@ -151,6 +151,9 @@ hf_model_types = ["acme_hybrid"]         # config.json "model_type" values this 
 full_attention = "platform:attention"    # the platform's attention core
 linear_attention = "plugin"              # your mixer, PLUGIN.mixers["linear_attention"]
 conv = "plugin"                          # another plugin mixer, with its own sharding policy
+
+[sublayer_types]                         # sequence-mixing modules inside layers (§7.3); same values
+value_conv = "plugin"
 
 [capabilities]
 training = true
@@ -169,11 +172,18 @@ tensor_parallel = true
 speculative_decoding = false
 prefix_caching = false
 enforce_eager = true                     # required if a stateful layer is not a registered vLLM custom op
+tokenizer_mode = "auto"                  # optional requirements: tokenizer_mode, reasoning_parser,
+reasoning_parser = "acme"                # tool_call_parser, model_runner ("v1" or "v2"), and
+chat_parser = "acme_hybrid.chat:AcmeChatParser"   # chat_parser ("module:Class")
 
 [profiles.h200-training-full]            # recommended settings, shown to users of the model
 n_gpus = 16
 sp_size = 4
 ep_size = 8
+
+[profiles.h200-training-full.inference]  # suggested sampler tunables; the job's inference config overrides them
+tensor_parallel_size = 2
+max_num_seqs = 64
 ```
 
 | Field | Rule |
@@ -183,7 +193,9 @@ ep_size = 8
 | `layer_types` | MUST list every value in your config's `layer_types`. Values are `platform:attention` or `plugin`. |
 | `capabilities` | A job that needs an undeclared capability is rejected at admission. Declare only what passes conformance. |
 | `max_expert_parallel` | Only with `expert_parallel = true`. |
-| `sampler` | Present exactly when `capabilities.sampling = true`. |
+| `sublayer_types` | MUST list every sub-layer type in `ParallelismInfo.sublayers`. Names MUST NOT repeat `layer_types`. |
+| `sampler` | Present exactly when `capabilities.sampling = true`. Its requirements are typed fields; there is no way to set environment variables. |
+| `profiles.*.inference` | Tunables only (`tensor_parallel_size`, `max_num_seqs`, `gpu_memory_utilization`, kernel flags, `max_model_len`); a `[sampler]` requirement there is refused. |
 
 **Layer type names.** Use names that transformers recognises: transformers 5.x validates `layer_types` against its
 known kinds (`full_attention`, `sliding_attention`, `linear_attention`, `conv` and others). vLLM 0.33 sizes a hybrid
@@ -207,8 +219,16 @@ PLUGIN = ModelPlugin(
     convert_layer_to_prime=convert_layer_to_prime,
     reference_forward=reference_forward,
     register=register_config,               # e.g. AutoConfig.register(...)
+    options=AcmeOptions,                    # pydantic model of job-time options; None if there are none
+    validate=validate,                      # (request, config, options) -> reasons the job cannot run
 )
 ```
+
+**Options** are job-time choices that never change the checkpoint, such as a kernel. A job's options are validated
+against `options` (an unknown option is refused) and passed to `build_model(config, options)`. **`validate`**
+returns the reasons a job cannot run for constraints the manifest cannot express, typically ones that depend on an
+option or the config ("`short_conv_kernel = "fused"` cannot run with sequence parallelism"). Admission reports them
+with its own reasons, before any GPU is allocated.
 
 ### 7.2 The trainer model
 
@@ -216,7 +236,9 @@ PLUGIN = ModelPlugin(
 |---|---|
 | Config | The model MUST keep its config as `model.config`. |
 | Names | Decoder layer `i`'s parameters and buffers MUST be under `model.layers.<i>.`. Embeddings, final norm and head live outside. |
-| Forward | `model(input_ids, position_ids, *, cu_seqlens, routed_experts=None, return_routing=False)` returns logits `[1, T_local, vocab]`, or `(logits, routing)` when `return_routing`. |
+| Forward | `model(input_ids, position_ids, *, cu_seqlens, routed_experts=None, return_routing=False)` returns the final hidden states `[1, T_local, D]`, or `(hidden, routing)` when `return_routing`. |
+| Logits | The platform turns hidden states into log-probabilities a chunk of tokens at a time, recomputing each chunk in backward: full logits of a 256K-token row over a 152K vocabulary would take ~159 GB. It calls `model.compute_logits(hidden_chunk)` if defined, else `model.lm_head(hidden_chunk)`. Override it for output transforms such as muP output scaling or logit softcapping. |
+| Meta-device build | The platform builds the model on the meta device and allocates it with `to_empty`. A module whose buffers are not in the checkpoint (a rotary `inv_freq`, counters) MUST implement `ap_init_buffers()`, which recomputes them; the platform calls it on every module after `to_empty`. |
 | Inputs | `input_ids` and `position_ids` are this rank's `[1, T_local]` shard of a packed batch. `cu_seqlens` describes the full batch. |
 | Routing | `routed_experts` and `routing` map a decoder layer index to `[T_local, top_k]` expert ids for each expert layer. |
 | No distributed code | The model MUST NOT call `torch.distributed`. Use the collectives the API provides. |
@@ -228,6 +250,10 @@ PLUGIN = ModelPlugin(
 Every sequence-mixing module MUST set `ap_layer_type` to its entry in the config's `layer_types`. The platform binds
 each such module to that layer type's mixer, then checks the counts against the config. A module the config doesn't
 account for, or a config entry with no module, fails registration, not your training run.
+
+**Sub-layers.** A layer can contain further sequence-mixing modules, such as short convolutions on attention keys and
+values. Give each its own type in the manifest's `[sublayer_types]`, set `ap_layer_type` to it, register a mixer for it
+as for a layer type, and count them by type in `ParallelismInfo.sublayers`. Binding checks both counts.
 
 Each sequence-mixing layer is split in three parts, and only the middle one sees other tokens:
 
@@ -257,7 +283,7 @@ register a `Mixer` for the layer type. The split of work is deliberate:
 |---|---|
 | Your module's `mix` | The math: what the layer computes across tokens |
 | Your `Mixer` | The **policy**: whether a sequence-parallel degree is legal, and how to spread `mix` over a group |
-| The platform | The group, and the collectives a policy uses (`head_parallel`, `previous_tokens`, `sequence_start`) |
+| The platform | The group, and the collectives a policy uses (`head_parallel`, `previous_tokens`, `sequence_start`, `gather_sequence`) |
 
 Whatever the policy, `mix`:
 
@@ -272,6 +298,9 @@ The `shard` argument's type is set by the layer's policy. Two policies ship toda
 | **Head-parallel** (default) | Heads are independent inside the core: attention, recurrences, state-space layers | All `T` tokens of `1/sp` of the heads, head-major `[1, T, H_i/sp, D_i]` | `HeadShard(rank, size)`; slice per-head parameters with `shard.local(num_heads)` | `HeadParallelMixer` subclass naming your module class. It checks every head count in `ParallelismInfo.heads[layer_type]` divides by `sp_size`. |
 | **Halo** (custom) | The core reads a short, fixed window of earlier tokens: short and causal convolutions | Its own `T/sp` tokens plus a halo of the previous rank's last tokens, `[1, halo + T/sp, C]` | `SequenceWindow(start, halo)`: the tensors cover global positions `[start - halo, start + T/sp)`. `mix` returns outputs for all of them; the mixer keeps the non-halo part. | Your own `Mixer`. Its `apply_sequence_parallel` wraps `mix` using `previous_tokens` and `sequence_start`; its `validate_sp` has no head constraint. |
 
+A core whose positions interact across the whole sequence can use `gather_sequence(group, tensor)`: every rank gets the
+whole sequence, and in backward each rank's gradient for it is summed in fp32 and sliced back to its owner.
+
 Halo exchange moves only `halo` tokens per rank instead of every activation twice, and never splits channels, so any
 sequence-parallel degree works as long as each shard holds at least `halo` tokens. The example's `ShortConvMixer`
 is a complete implementation in about 15 lines. Other policies, such as gathering the full sequence for a core whose
@@ -283,6 +312,7 @@ heads interact, are written the same way.
 def parallelism(config) -> ParallelismInfo:
     return ParallelismInfo(
         layer_types=tuple(config.layer_types),                      # one per decoder layer
+        sublayers={"value_conv": config.layer_types.count("full_attention")},  # sub-layer modules by type
         heads={"full_attention": (config.num_attention_heads, config.num_key_value_heads),
                "linear_attention": (config.linear_num_heads,)},     # every head count a core exchanges
         moe_layers=tuple(i for i, kind in enumerate(config.mlp_types) if kind == "moe"),
@@ -443,8 +473,20 @@ Conversion and loading:
 - The platform loads a checkpoint **one decoder layer at a time**, reading only that layer's tensors from disk, so converters see one layer and peak extra memory is one layer. Every trainer tensor MUST be set and no checkpoint tensor may be left over.
 - The platform gathers ZeRO and expert shards before calling your converter on export, so converters always see full tensors.
 - Checkpoints the platform writes carry a **plugin stamp** in their safetensors metadata (`arctic_plugin`, `arctic_plugin_version`, `arctic_plugin_contract`). A checkpoint stamped by a different plugin is refused at load. A different version of the same plugin loads and is logged.
-- **Dtypes.** Store weights in the dtype you want served, usually bf16. The platform builds your model in the dtype that holds most of a checkpoint's elements before loading it, so a save and reload is exact. The trainer computes in the job's dtype and keeps fp32 master weights in the optimizer. Parameters that must stay fp32, such as norms or gates you rely on for parity, are cast by your model code, not by the checkpoint.
-- Mark trainer-only state, such as statistics or optimizer helpers the sampler never reads, with `skip_weight_sync(module_or_parameter)`. It stays in checkpoints and is left out of the weight sync. Mark a module rather than a buffer: moving a model between devices replaces buffer objects.
+- **Dtypes.** Store weights in the dtype you want served, usually bf16. The platform builds your model in the dtype that holds most of a checkpoint's elements before loading it, so a save and reload is exact. The trainer computes in the job's dtype and keeps fp32 master weights in the optimizer. Tensors that must stay fp32, such as routers or statistics, are marked `dtype="fp32"` (below); checkpoints and the weight stream then carry mixed dtypes.
+
+**Marks.** `mark(tensor_or_module, **properties)` is the one way to tell the platform how to treat a tensor. A mark on a
+module applies to all its tensors; a deeper module's, then the tensor's own, overrides it. Prefer marking modules: the
+platform carries a tensor's own mark through its build, load and expert sharding, but not through tensors your code
+replaces, and moving a model between devices replaces buffer objects.
+
+| Property | Effect | Read when |
+|---|---|---|
+| `dtype="fp32"` | Stays fp32 when the model is cast to bf16 (feeds the platform's keep-fp32 flag) | Casting the model's dtype |
+| `weight_sync=False` | Kept in checkpoints, left out of the stream to the sampler. `skip_weight_sync(x)` is an alias. | Streaming weights |
+| `weight_decay` | Whether the optimizer's weight decay applies; by default to parameters with two or more dimensions | Building optimizer groups |
+| `lora_target=True` | Modules only: gets LoRA adapters, named for vLLM through your Hugging Face-to-vLLM name map. Recorded now; plugin LoRA is not supported yet (§13). | Setting up LoRA |
+| `frozen=True` | Not trained | Building optimizer groups |
 
 ### 7.10 RL step and weight sync
 
@@ -460,7 +502,7 @@ sequenceDiagram
     Note over T: your model under SP/EP,<br/>platform loss (e.g. GRPO)
     U->>T: optimizer step
     U->>T: sync weights
-    T->>T: gather ZeRO + expert shards per layer,<br/>convert_layer_to_hf, drop skip_weight_sync
+    T->>T: gather ZeRO + expert shards per layer,<br/>convert_layer_to_hf, drop weight_sync=False
     T->>S: (hf_name, full tensor) stream over NCCL
     Note over S: load_weights(hf_name, tensor)<br/>→ your fused / sharded parameters
 ```
@@ -496,7 +538,15 @@ Every job is checked before GPUs are allocated. All failing reasons are reported
 | `ep_size > 1` | `expert_parallel` not declared, the config has no expert layers, `num_experts % ep_size != 0`, or `ep_size > max_expert_parallel` |
 | `peft` | `peft` not declared |
 | `router_replay` | `router_replay` not declared, or the config has no expert layers |
-| Sampler `tensor_parallel > 1`, speculative decoding, prefix caching | The matching `[sampler]` flag is not set |
+| `options` | An option the plugin does not declare, a value its options model rejects, or a reason from the plugin's `validate` |
+| Sampler `tensor_parallel_size > 1`, `speculative_config`, `enable_prefix_caching` in the job's inference config | The matching `[sampler]` flag is not set |
+| Any `[sampler]` requirement in the job's inference config | Its value differs from the manifest's |
+
+**Launching the sampler.** Engine settings are the job's profile's `inference` defaults, overridden by the job's
+inference config (admission checks the two together), with the `[sampler]` requirements applied last
+(`sampler_launch`). `model_runner` and `chat_parser` are set only by the manifest. Prefix caching is on only when
+`[sampler] prefix_caching = true`: vLLM turns it on by default, and for a model with stateful layers that silently
+switches state caching to a mode those layers may not implement.
 
 ---
 
@@ -504,7 +554,7 @@ Every job is checked before GPUs are allocated. All failing reasons are reported
 
 ```mermaid
 flowchart LR
-    S["static"] --> R["reference parity"] --> K["packing"] --> A["activation<br/>checkpointing"] --> W["checkpoint and sync"]
+    S["static"] --> R["reference parity"] --> K["packing · log-prob<br/>chunking"] --> A["activation<br/>checkpointing"] --> M["meta build ·<br/>dtype marks"] --> W["checkpoint and sync"]
     W --> L["RL step"] --> Q["router replay"] --> P["SP · EP · SP+EP<br/>(gloo ranks)"]
     P --> D["weights directory<br/>(real weights, meta device)"]
     D --> G1["sampler log-prob parity<br/>(GPU, vLLM)"] --> G2["real-weights step<br/>(GPU)"]
@@ -528,7 +578,10 @@ device, so allocate its tensors on the input's device.
 | static | The manifest is on contract, mixers resolve, and the fixture model binds to its config | Undeclared layer types, missing mixers, modules the config does not account for |
 | reference parity | Model logits on each unpacked row equal `reference_forward` within `reference` | Wrong math |
 | packing | Packed rows give the same logits **and gradients** as each row run alone | State leaking across row boundaries |
+| log-prob chunking | Log-probs computed `logprob_chunk` tokens at a time, through `compute_logits`, equal one pass over the row, values and gradients, within `chunking` | A `compute_logits` that is not token-wise, chunk-boundary bugs |
 | activation checkpointing | With every decoder layer checkpointed, logits, gradients and buffers are unchanged | Side effects that run twice, non-recomputable layers |
+| meta build | Built on the meta device, `to_empty`, `ap_init_buffers` and loaded from a checkpoint, every buffer and the logits equal a normal build exactly | Non-checkpointed buffers left uninitialized |
+| dtype marks | Under a bf16 build, `dtype="fp32"` tensors stay fp32 and the rest are bf16; the weight stream and a checkpoint carry the mixed dtypes and reload exactly | Marks lost on cast, dtype-unsafe export or load |
 | checkpoint and sync | Single-file and sharded save → reload reproduce logits exactly; the checkpoint carries this plugin's stamp; the sampler stream equals the checkpoint minus skipped tensors | Lossy or asymmetric converters, broken sharding, missing tensors |
 | RL step | A GRPO step (the platform's `grpo_loss`) on packed rows equals the same step on padded rows, for loss and every gradient | Masking and packing bugs in the training path |
 | router replay | Replaying captured routing reproduces logits exactly; all-`ROUTER_REPLAY_FRESH` does too; forcing other experts changes the output | A router that ignores replay |
@@ -547,6 +600,8 @@ sequence_lengths = [5, 6, 5]   # packed rows; the total must divide by every sp 
                                # shard boundary so state carried from the previous rank is exercised
 sp_sizes = [2]
 ep_sizes = [2]
+logprob_chunk = 4              # tokens per log-prob chunk: short, so rows span several chunks
+# options = { kernel = "fast" }  # the plugin's job options for the fixture, if any
 
 [fixture]                      # kwargs for your config class: tiny, but with every layer and MLP kind
 vocab_size = 64
@@ -559,6 +614,7 @@ reference = 1e-5
 packing = 1e-5
 parallel = 1e-5
 rl_step = 1e-5
+chunking = 1e-6                # chunking reorders the output projection's gradient sum: fp32 rounding, not bitwise
 ```
 
 A failing tier prints its name and the first mismatch, for example
@@ -608,7 +664,7 @@ can prove every tensor the trainer streams has exactly one destination before an
 
 ## 12. Versioning and support
 
-- **Contract.** The platform supports plugins whose `contract` has its major version. Minor versions add optional fields and hooks only. A major version change is announced in advance, with a migration guide.
+- **Contract.** The platform supports plugins whose `contract` has its major version. Once 1.x is frozen, minor versions add optional fields and hooks only, and a major version change is announced in advance, with a migration guide. Until then, draft revisions may change interfaces: draft 1.1 makes the forward return hidden states (`compute_logits`), and adds the meta-device build (`ap_init_buffers`), `mark`, plugin options, sub-layers and typed sampler requirements.
 - **Runtime release.** A plugin is admitted against one runtime release and keeps running on it while that release is supported. Moving to a newer release re-runs conformance.
 - **Support window.** The number of runtime releases supported in parallel, and their deprecation notice, will be fixed before contract 1.0.
 - **Failure attribution.** A job that fails inside plugin code is reported as a plugin failure with the stack trace. Failures in platform code are the platform's. Conformance results define the supported envelope: a configuration outside the declared capabilities is rejected, not attempted.
@@ -654,7 +710,9 @@ flowchart TB
 | New layer type, default policy | `modeling.ToyRecurrence.mix` (row restarts, head slicing); `parallel.GatedRecurrenceMixer` |
 | New layer type, custom policy | `modeling.ToyShortConv.mix` (global positions from `SequenceWindow`); `parallel.ShortConvMixer` (halo exchange) |
 | MoE, EP and router replay | `modeling.ToyMoE` (`route`, `experts_core`); `parallel.ToyExpertLayer` (a `StackedExpertLayer`) |
-| Trainer-only state | `modeling.LoadStats`, marked with `skip_weight_sync` |
+| Marks, meta-device build | `modeling.LoadStats` (`dtype="fp32"`, `weight_sync=False`); `modeling.RotaryEmbedding` (`dtype="fp32"`, `ap_init_buffers`); the fp32 router |
+| Output transform | `ToyHybridMoEForCausalLM.compute_logits` (optional logit softcapping) |
+| Sub-layer, options | `modeling.ToyValueConv` (`[sublayer_types] value_conv`); `options.ToyOptions` and `parallel.validate` |
 | Hugging Face conversion | `weights.py`: per-expert keys, `mlp.gate`, `Conv1d` layout |
 | Reference oracle | `reference.py`: explicit attention, loops, per-token experts |
 | Sampler | `vllm_model.py`, `sampler_names.py` |
@@ -666,7 +724,10 @@ Its CPU conformance run:
 static                    PASS
 reference_parity          PASS
 packing                   PASS
+logprob_chunking          PASS
 activation_checkpointing  PASS
+meta_build                PASS
+dtype_marks               PASS
 checkpoint_and_sync       PASS
 rl_step                   PASS
 router_replay             PASS
@@ -679,6 +740,7 @@ The test suite also feeds conformance deliberately broken variants and checks th
 
 - a recurrence that ignores row boundaries;
 - statistics counted again on recompute;
+- rotary frequencies not recomputed after a meta-device build;
 - a router that ignores replay;
 - a lossy converter;
 - a convolution that ignores row boundaries;
@@ -701,7 +763,9 @@ The test suite also feeds conformance deliberately broken variants and checks th
 - [ ] Expert weights are stacked on dim 0, `experts_core` offsets by `shard.start`, and the router honours `routed_experts` and `ROUTER_REPLAY_FRESH`.
 - [ ] Decoder layers are recomputable; side effects are guarded with `in_recompute()`.
 - [ ] The weights directory passes `--weights`: matching config, sharded safetensors with an index, and a tokenizer with EOS and a chat template.
-- [ ] The converters are exact inverses, and trainer-only state is marked `skip_weight_sync`.
+- [ ] The converters are exact inverses, and trainer-only state is marked `weight_sync=False`.
+- [ ] The forward returns hidden states; any output transform is in `compute_logits`.
+- [ ] Every non-checkpointed buffer is recomputed by its module's `ap_init_buffers()`.
 - [ ] The vLLM `load_weights` accepts Hugging Face-named full tensors and returns the parameters it wrote.
 - [ ] `reference_forward` is independent of the trainer code.
 - [ ] All CPU tiers pass locally; tolerances are `rtol = 0` with justified `atol`.

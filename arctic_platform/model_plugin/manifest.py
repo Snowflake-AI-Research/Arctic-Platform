@@ -20,13 +20,14 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 from typing import Any
+from typing import Literal
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import model_validator
 
-CONTRACT_VERSION = "1.0"
+CONTRACT_VERSION = "1.1"
 
 PLATFORM_ATTENTION = "platform:attention"
 PLUGIN_MIXER = "plugin"
@@ -55,8 +56,21 @@ class Capabilities(BaseModel):
         return self
 
 
+# Sampler settings the manifest may require. A job's inference config may not set them to anything else; every
+# other engine setting (tensor_parallel_size, max_num_seqs, gpu_memory_utilization, kernel flags, max_model_len)
+# is the job's to tune. There is deliberately no way to set raw environment variables.
+SAMPLER_REQUIREMENTS = (
+    "tokenizer_mode",
+    "reasoning_parser",
+    "tool_call_parser",
+    "model_runner",
+    "enforce_eager",
+    "chat_parser",
+)
+
+
 class SamplerSpec(BaseModel):
-    """How the sampler (vLLM) serves this architecture."""
+    """How the sampler (vLLM) serves this architecture: its capabilities, and the settings it requires."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -64,16 +78,32 @@ class SamplerSpec(BaseModel):
     vllm_plugin: str | None = Field(None, description="'module:function' that registers the vLLM model class.")
     tensor_parallel: bool = False
     speculative_decoding: bool = False
-    prefix_caching: bool = False
+    prefix_caching: bool = Field(
+        False, description="The sampler is correct with prefix caching on; off, the platform launches it off."
+    )
     enforce_eager: bool = Field(
         False, description="Run without CUDA graphs: required when a stateful layer is not a registered custom op."
     )
+    tokenizer_mode: str | None = None
+    reasoning_parser: str | None = None
+    tool_call_parser: str | None = None
+    model_runner: Literal["v1", "v2"] | None = Field(None, description="The vLLM model runner the model needs.")
+    chat_parser: str | None = Field(None, description="'module:Class' that parses this model's chat output.")
 
     @model_validator(mode="after")
     def _check(self) -> SamplerSpec:
-        if self.vllm_plugin is not None and ":" not in self.vllm_plugin:
-            raise ValueError(f"vllm_plugin must be 'module:function', got {self.vllm_plugin!r}")
+        for name in ("vllm_plugin", "chat_parser"):
+            value = getattr(self, name)
+            if value is not None and ":" not in value:
+                raise ValueError(f"{name} must be 'module:attribute', got {value!r}")
         return self
+
+    def requirements(self) -> dict[str, Any]:
+        """The engine settings this sampler requires, by name; ``enforce_eager`` only when it is required."""
+        required = {name: getattr(self, name) for name in SAMPLER_REQUIREMENTS if getattr(self, name) is not None}
+        if not self.enforce_eager:
+            required.pop("enforce_eager")
+        return required
 
 
 class PluginManifest(BaseModel):
@@ -85,16 +115,28 @@ class PluginManifest(BaseModel):
     runtime_release: str
     hf_model_types: list[str] = Field(min_length=1)
     layer_types: dict[str, str] = Field(min_length=1)
+    sublayer_types: dict[str, str] = Field(default_factory=dict)
     capabilities: Capabilities = Field(default_factory=Capabilities)
     sampler: SamplerSpec | None = None
     profiles: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _check(self) -> PluginManifest:
-        for layer_type, source in self.layer_types.items():
-            if source not in (PLATFORM_ATTENTION, PLUGIN_MIXER):
+        for table, entries in (("layer_types", self.layer_types), ("sublayer_types", self.sublayer_types)):
+            for layer_type, source in entries.items():
+                if source not in (PLATFORM_ATTENTION, PLUGIN_MIXER):
+                    raise ValueError(
+                        f"{table}[{layer_type!r}] must be {PLATFORM_ATTENTION!r} or {PLUGIN_MIXER!r}, got {source!r}"
+                    )
+        shared = set(self.layer_types) & set(self.sublayer_types)
+        if len(shared) > 0:
+            raise ValueError(f"types {sorted(shared)} are in both layer_types and sublayer_types")
+        for name, profile in self.profiles.items():
+            inference = profile.get("inference", {})
+            overridden = set(inference) & set(SAMPLER_REQUIREMENTS)
+            if len(overridden) > 0:
                 raise ValueError(
-                    f"layer_types[{layer_type!r}] must be {PLATFORM_ATTENTION!r} or {PLUGIN_MIXER!r}, got {source!r}"
+                    f"profile {name!r} sets sampler requirements {sorted(overridden)}; set them in [sampler]"
                 )
         if self.capabilities.sampling and self.sampler is None:
             raise ValueError("capabilities.sampling = true requires a [sampler] table")

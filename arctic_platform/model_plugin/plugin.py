@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable
+from collections.abc import Iterable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
@@ -26,6 +27,7 @@ from importlib.metadata import entry_points
 from typing import Any
 
 import torch
+from pydantic import BaseModel
 from torch import nn
 
 from arctic_platform.model_plugin.experts import ExpertLayer
@@ -38,19 +40,23 @@ ENTRY_POINT_GROUP = "arctic_platform.model_plugins"
 
 LayerConverter = Callable[[dict[str, torch.Tensor], int, Any], dict[str, torch.Tensor]]
 ReferenceForward = Callable[[nn.Module, torch.Tensor], torch.Tensor]
+# validate(request, config, options) -> the reasons this job cannot run; ``request`` is an admission.JobRequest.
+Validator = Callable[[Any, Any, Any], Iterable[str]]
 
 
 @dataclass(frozen=True)
 class ParallelismInfo:
     """What the platform needs to know about one model config to plan and validate parallelism.
 
-    ``layer_types`` has one entry per decoder layer, in order. ``heads`` maps a layer type to the head count of
-    every tensor its core exchanges under sequence parallelism (attention: query and key/value heads).
-    ``moe_layers`` lists the decoder layers with an expert block, each with ``num_experts`` routed experts and
-    ``top_k`` experts per token.
+    ``layer_types`` has one entry per decoder layer, in order. ``sublayers`` counts the sequence-mixing modules
+    inside layers, such as a short convolution on attention values, by sub-layer type. ``heads`` maps a layer or
+    sub-layer type to the head count of every tensor its core exchanges under head-parallel sequence parallelism
+    (attention: query and key/value heads). ``moe_layers`` lists the decoder layers with an expert block, each with
+    ``num_experts`` routed experts and ``top_k`` experts per token.
     """
 
     layer_types: tuple[str, ...]
+    sublayers: Mapping[str, int] = field(default_factory=dict)
     heads: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
     moe_layers: tuple[int, ...] = ()
     num_experts: int = 0
@@ -72,11 +78,17 @@ class ModelPlugin:
     between the trainer's tensors and the Hugging Face checkpoint's; leave them unset when the two already match.
     ``reference_forward(model, input_ids)`` is a slow, independent implementation of one unpacked sequence that
     conformance compares the model against.
+
+    ``options`` is the pydantic model of the job-time options the plugin accepts, such as a kernel choice; options
+    never change the checkpoint. ``build_model(config, options)`` receives the parsed options, or ``None`` when the
+    plugin declares none.
+    ``validate(request, config, options)`` returns the reasons a job cannot run, for constraints the manifest cannot
+    express (for example, an option that rules out sequence parallelism); admission reports them with its own.
     """
 
     manifest: PluginManifest
     config_class: Any
-    build_model: Callable[[Any], nn.Module]
+    build_model: Callable[[Any, Any], nn.Module]
     parallelism: Callable[[Any], ParallelismInfo]
     mixers: Mapping[str, Mixer] = field(default_factory=dict)
     expert_layer: ExpertLayer | None = None
@@ -84,11 +96,27 @@ class ModelPlugin:
     convert_layer_to_prime: LayerConverter | None = None
     reference_forward: ReferenceForward | None = None
     register: Callable[[], None] | None = None
+    options: type[BaseModel] | None = None
+    validate: Validator | None = None
+
+    def parse_options(self, options: Mapping[str, Any] | None = None) -> BaseModel | None:
+        """A job's options as the plugin's options model. Unknown options are refused even if the options model would
+        ignore them."""
+        options = dict(options or {})
+        if self.options is None:
+            if len(options) > 0:
+                raise ValueError(f"{self.manifest.name} takes no options, got {sorted(options)}")
+            return None
+        unknown = set(options) - set(self.options.model_fields)
+        if len(unknown) > 0:
+            raise ValueError(f"{self.manifest.name} has no options {sorted(unknown)}")
+        return self.options.model_validate(options)
 
     def layer_mixers(self) -> dict[str, Mixer]:
-        """The mixer for every layer type in the manifest: the platform's for attention, the plugin's otherwise."""
+        """The mixer for every layer and sub-layer type in the manifest: the platform's for attention, the plugin's
+        otherwise."""
         resolved: dict[str, Mixer] = {}
-        for layer_type, source in self.manifest.layer_types.items():
+        for layer_type, source in (self.manifest.layer_types | self.manifest.sublayer_types).items():
             if source == PLATFORM_ATTENTION:
                 resolved[layer_type] = AttentionMixer(layer_type)
                 continue

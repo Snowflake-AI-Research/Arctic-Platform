@@ -33,9 +33,13 @@ from toy_hybrid_moe import modeling
 from toy_hybrid_moe.config import ToyHybridMoEConfig
 from toy_hybrid_moe.sampler_names import sampler_target
 
+from arctic_platform.model_plugin import cast_model
 from arctic_platform.model_plugin import conformance
+from arctic_platform.model_plugin import gather_sequence
 from arctic_platform.model_plugin.host import forward
+from arctic_platform.model_plugin.host import next_token_labels
 from arctic_platform.model_plugin.host import pack_sequences
+from arctic_platform.model_plugin.host import token_logprobs
 from arctic_platform.model_plugin.weights import CHECKPOINT_FILE
 from arctic_platform.model_plugin.weights import iter_hf_weights
 from arctic_platform.model_plugin.weights import load_hf_checkpoint
@@ -54,7 +58,10 @@ SPEC = conformance.load_conformance_spec(TOY_PLUGIN_ROOT / "conformance.toml")
         conformance.check_static,
         conformance.check_reference_parity,
         conformance.check_packing,
+        conformance.check_logprob_chunking,
         conformance.check_activation_checkpointing,
+        conformance.check_meta_build,
+        conformance.check_dtype_marks,
         conformance.check_router_replay,
         conformance.check_checkpoint_and_sync,
         conformance.check_rl_step,
@@ -76,7 +83,10 @@ def test_run_conformance_reports_every_tier():
         ("static", "PASS"),
         ("reference_parity", "PASS"),
         ("packing", "PASS"),
+        ("logprob_chunking", "PASS"),
         ("activation_checkpointing", "PASS"),
+        ("meta_build", "PASS"),
+        ("dtype_marks", "PASS"),
         ("checkpoint_and_sync", "PASS"),
         ("rl_step", "PASS"),
         ("router_replay", "PASS"),
@@ -113,6 +123,58 @@ def test_new_layer_count_and_pattern_needs_no_code_change():
     )
     for check in (conformance.check_static, conformance.check_reference_parity, conformance.check_packing):
         check(PLUGIN, spec)
+
+
+def test_logprobs_go_through_the_models_softcapping_compute_logits():
+    config, model = conformance.build_fixture(PLUGIN, SPEC)
+    assert config.final_logit_softcapping == 2.0
+    input_ids, position_ids = pack_sequences(conformance.fixture_sequences(config, SPEC))
+    labels = next_token_labels(input_ids, position_ids)
+    with torch.no_grad():
+        hidden = forward(model, input_ids, position_ids)
+        capped = 2.0 * torch.tanh(model.lm_head(hidden) / 2.0)
+        expected = torch.log_softmax(capped, -1).gather(-1, labels.clamp(min=0)[..., None])[..., 0] * (labels >= 0)
+        for chunk in (3, 1000):
+            torch.testing.assert_close(
+                token_logprobs(model, hidden, labels, chunk_size=chunk), expected, rtol=0, atol=1e-6
+            )
+
+
+def test_fused_kernel_option_matches_the_reference():
+    spec = SPEC.model_copy(update=dict(options=dict(short_conv_kernel="fused")))
+    for check in (conformance.check_reference_parity, conformance.check_packing):
+        check(PLUGIN, spec)
+
+
+def test_buffers_not_reinitialized_fail_meta_build():
+    from .broken_toy import NO_BUFFER_INIT
+
+    with pytest.raises(AssertionError, match="does its module implement ap_init_buffers"):
+        conformance.check_meta_build(NO_BUFFER_INIT, SPEC)
+
+
+def _gather_worker(rank, init_file):
+    torch.distributed.init_process_group("gloo", init_method=f"file://{init_file}", world_size=2, rank=rank)
+    try:
+        torch.manual_seed(0)
+        full = torch.randn(1, 6, 3, dtype=torch.bfloat16)
+        weight = torch.randn(1, 6, 3)
+        mine = slice(rank * 3, (rank + 1) * 3)
+        # A core that needs the whole sequence (a cumulative sum); each rank keeps only its own outputs.
+        local = full[:, mine].clone().requires_grad_()
+        whole = gather_sequence(torch.distributed.group.WORLD, local).float().cumsum(dim=1)
+        (whole[:, mine] * weight[:, mine]).sum().backward()
+        reference = full.float().requires_grad_()
+        (reference.cumsum(dim=1) * weight).sum().backward()
+        # Summed in fp32 across ranks and rounded to bf16 once: within one bf16 rounding of the fp32 gradient.
+        assert local.grad.dtype == torch.bfloat16
+        torch.testing.assert_close(local.grad.float(), reference.grad[:, mine], rtol=2**-8, atol=0)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_gather_sequence_gives_each_rank_its_slice_of_the_whole_sequence_gradient(tmp_path):
+    torch.multiprocessing.spawn(_gather_worker, args=(str(tmp_path / "rendezvous"),), nprocs=2)
 
 
 def test_recurrence_that_ignores_row_boundaries_fails_packing():
@@ -252,11 +314,13 @@ class TestCheckpointLayout(TestCasePlus):
     def test_bf16_checkpoint_reloads_in_bf16_exactly(self):
         torch.manual_seed(0)
         config = ToyHybridMoEConfig(**SPEC.fixture)
-        model = PLUGIN.build_model(config).to(torch.bfloat16)
+        model = cast_model(PLUGIN.build_model(config), torch.bfloat16)
         path = Path(self.get_auto_remove_tmp_dir_str())
         save_hf_checkpoint(model, PLUGIN, config, path)
         _, reloaded = load_hf_checkpoint(PLUGIN, path)
-        self.assertEqual({p.dtype for p in reloaded.parameters()}, {torch.bfloat16})
+        dtypes = {name: p.dtype for name, p in reloaded.named_parameters()}
+        self.assertEqual(dtypes, {name: p.dtype for name, p in model.named_parameters()})
+        self.assertEqual(dtypes["model.layers.1.mlp.router.weight"], torch.float32)  # marked fp32
         input_ids, position_ids = pack_sequences(conformance.fixture_sequences(config, SPEC))
         with torch.no_grad():
             expected = forward(model, input_ids, position_ids)

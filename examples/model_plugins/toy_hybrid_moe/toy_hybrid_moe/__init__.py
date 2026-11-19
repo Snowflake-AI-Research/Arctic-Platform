@@ -22,12 +22,16 @@ from arctic_platform.model_plugin import load_manifest
 
 from .config import GATED_RECURRENCE
 from .config import SHORT_CONV
+from .config import VALUE_CONV
 from .config import ToyHybridMoEConfig
 from .modeling import ToyHybridMoEForCausalLM
+from .modeling import ToyValueConv
+from .options import ToyOptions
 from .parallel import GatedRecurrenceMixer
 from .parallel import ShortConvMixer
 from .parallel import ToyExpertLayer
 from .parallel import parallelism
+from .parallel import validate
 from .reference import reference_forward
 from .weights import convert_layer_to_hf
 from .weights import convert_layer_to_prime
@@ -44,10 +48,16 @@ PLUGIN = ModelPlugin(
     config_class=ToyHybridMoEConfig,
     build_model=ToyHybridMoEForCausalLM,
     parallelism=parallelism,
-    mixers={GATED_RECURRENCE: GatedRecurrenceMixer(), SHORT_CONV: ShortConvMixer()},
+    mixers={
+        GATED_RECURRENCE: GatedRecurrenceMixer(),
+        SHORT_CONV: ShortConvMixer(),
+        VALUE_CONV: ShortConvMixer(VALUE_CONV, ToyValueConv),
+    },
     expert_layer=ToyExpertLayer(),
     convert_layer_to_hf=convert_layer_to_hf,
     convert_layer_to_prime=convert_layer_to_prime,
     reference_forward=reference_forward,
     register=_register,
+    options=ToyOptions,
+    validate=validate,
 )

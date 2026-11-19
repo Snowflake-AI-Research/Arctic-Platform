@@ -56,9 +56,12 @@ def _rows(config, spec, rank, device):
     return input_ids, position_ids, next_token_labels(input_ids, position_ids)
 
 
-def _loss(model, rows):
+def _loss(model, rows, spec):
+    """``model`` is the plain model or its DeepSpeed engine; logits come from the plain model's head."""
     input_ids, position_ids, labels = rows
-    return conformance._token_loss(conformance._logits(forward(model, input_ids, position_ids)), labels)
+    return conformance._token_loss(
+        getattr(model, "module", model), forward(model, input_ids, position_ids), labels, spec
+    )
 
 
 def _worker(rank, port, stage, case):
@@ -95,12 +98,23 @@ def _worker(rank, port, stage, case):
             with pytest.raises(AssertionError, match="MoE not supported with Stage 3"):
                 initialize_deepspeed(model, binding, config=ds_config)
             return
+        if case == "bf16":
+            engine, *_ = initialize_deepspeed(model, binding, config=ds_config | dict(bf16=dict(enabled=True)))
+            router = engine.module.get_parameter("model.layers.1.mlp.router.weight")
+            assert router.dtype == torch.float32, "the fp32-marked router was cast"
+            assert engine.module.get_parameter("model.layers.1.mlp.experts.w1").dtype == torch.bfloat16
+            before = router.detach().clone()
+            engine.backward(_loss(engine, _rows(config, spec, rank, device), spec))
+            engine.step()
+            assert router.dtype == torch.float32, "the router left fp32 in the optimizer step"
+            assert not torch.equal(router.detach(), before), "the fp32 router did not train"
+            return
         engine, *_ = initialize_deepspeed(model, binding, config=ds_config)
-        engine.backward(_loss(engine, _rows(config, spec, rank, device)))
+        engine.backward(_loss(engine, _rows(config, spec, rank, device), spec))
         engine.step()
 
         reference = torch.optim.SGD(baseline.parameters(), lr=LR)
-        (sum(_loss(baseline, _rows(config, spec, other, device)) for other in range(WORLD)) / WORLD).backward()
+        (sum(_loss(baseline, _rows(config, spec, other, device), spec) for other in range(WORLD)) / WORLD).backward()
         reference.step()
 
         expected = dict(baseline.named_parameters())
@@ -142,3 +156,10 @@ def test_zero3_with_expert_parallelism_is_refused():
 @pytest.mark.integration
 def test_expert_group_deepspeed_did_not_register_is_refused():
     _run(0, "unregistered")
+
+
+@require_deepspeed
+@require_torch_multi_gpu
+@pytest.mark.integration
+def test_fp32_marks_survive_deepspeeds_bf16_cast():
+    _run(1, "bf16")
