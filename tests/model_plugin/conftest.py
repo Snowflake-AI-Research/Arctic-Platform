@@ -23,7 +23,8 @@ import torch.distributed as dist
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples" / "model_plugins"
 TOY_PLUGIN_ROOT = EXAMPLES / "toy_hybrid_moe"
 OLMO2_PLUGIN_ROOT = EXAMPLES / "olmo2"
-for root in (TOY_PLUGIN_ROOT, OLMO2_PLUGIN_ROOT):
+OLMOE_PLUGIN_ROOT = EXAMPLES / "olmoe"
+for root in (TOY_PLUGIN_ROOT, OLMO2_PLUGIN_ROOT, OLMOE_PLUGIN_ROOT):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 

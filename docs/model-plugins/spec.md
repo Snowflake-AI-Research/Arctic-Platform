@@ -5,7 +5,7 @@
 | Status | **Draft for review and sign-off.** Interfaces may change until contract 1.0 is frozen. |
 | Contract version | 1.1 (draft) |
 | Reference implementation | [`arctic_platform/model_plugin/`](../../arctic_platform/model_plugin/) |
-| Example plugins | [`examples/model_plugins/olmo2/`](../../examples/model_plugins/olmo2/): the minimal dense plugin, the template to start from (§3)<br/>[`examples/model_plugins/toy_hybrid_moe/`](../../examples/model_plugins/toy_hybrid_moe/): every part of the contract (§14) |
+| Example plugins | [`examples/model_plugins/olmo2/`](../../examples/model_plugins/olmo2/): the minimal dense plugin, the template to start from (§3)<br/>[`examples/model_plugins/olmoe/`](../../examples/model_plugins/olmoe/): the same plus mixture of experts, expert parallelism, router replay and converters (§14)<br/>[`examples/model_plugins/toy_hybrid_moe/`](../../examples/model_plugins/toy_hybrid_moe/): every part of the contract, including new layer types and a custom vLLM model (§14) |
 
 This document specifies how you bring a **new model architecture** to Cortex Training as a Python package, a
 *model plugin*, and train it with supervised fine-tuning or reinforcement learning on the service's GPUs. It covers
@@ -181,14 +181,14 @@ sp2                       PASS
 The dense plugin leaves out everything else: no mixers, no expert layer, no converters, no options, no vLLM model.
 Add each one only when the model needs it:
 
-| Your model has | Add | Spec | In the toy example |
+| Your model has | Add | Spec | Example |
 |---|---|---|---|
-| A sequence mixer that is not attention (recurrence, state space, convolution) | A core `mix` and a `Mixer` | §7.3, §7.5 | `ToyRecurrence`, `ToyShortConv` |
-| Mixture of experts | `route`, `experts_core` and an `ExpertLayer` | §7.6, §7.7 | `ToyMoE`, `ToyExpertLayer` |
-| Trainer tensors laid out differently from the checkpoint | `convert_layer_to_hf` and `convert_layer_to_prime` | §7.9 | `weights.py` |
-| An architecture vLLM does not implement | A vLLM model and its entry point | §7.10, §7.11 | `vllm_model.py` |
-| An output transform, such as logit softcapping | `compute_logits` | §7.2 | `ToyHybridMoEForCausalLM` |
-| Job-time choices, such as a kernel | `options` and `validate` | §7.1 | `options.py` |
+| Mixture of experts, with expert parallelism and router replay | `route`, `experts_core` and an expert layer | §7.6, §7.7 | `olmoe`: `OlmoeSparseMoeBlock`, `StackedExpertLayer` |
+| Trainer tensors laid out differently from the checkpoint, such as stacked experts | `convert_layer_to_hf` and `convert_layer_to_prime` | §7.9 | `olmoe`: `weights.py` |
+| A sequence mixer that is not attention (recurrence, state space, convolution) | A core `mix` and a mixer | §7.3, §7.5 | `toy_hybrid_moe`: `ToyRecurrence`, `ToyShortConv` |
+| An architecture vLLM does not implement | A vLLM model and its entry point | §7.10, §7.11 | `toy_hybrid_moe`: `vllm_model.py` |
+| An output transform, such as logit softcapping | `compute_logits` | §7.2 | `toy_hybrid_moe`: `ToyHybridMoEForCausalLM` |
+| Job-time choices, such as a kernel | `options` and `validate` | §7.1 | `toy_hybrid_moe`: `options.py` |
 
 ---
 
@@ -908,7 +908,27 @@ can prove every tensor the trainer streams has exactly one destination before an
 ## 14. Worked examples
 
 [`examples/model_plugins/olmo2`](../../examples/model_plugins/olmo2/), the minimal dense plugin, is walked through in
-the quickstart (§3). This section covers the other example.
+the quickstart (§3).
+
+### 14.1 OLMoE: mixture of experts on vLLM's built-in model
+
+[`examples/model_plugins/olmoe`](../../examples/model_plugins/olmoe/) is the OLMo-2 plugin plus mixture of experts.
+[OLMoE](https://huggingface.co/allenai/OLMoE-1B-7B-0924) routes each token to the top 8 of 64 experts by softmax
+probability, in every layer; the platform has no implementation of it, and vLLM serves it with its built-in
+`OlmoeForCausalLM`. Against the dense path it adds:
+
+| Contract part | Where it lives |
+|---|---|
+| Routing the platform can replay (§7.7) | `OlmoeSparseMoeBlock.route(tokens, routed=None)`, which picks experts with `choose_experts(scores, top_k, routed)` |
+| Experts the platform can shard (§7.6) | `OlmoeSparseMoeBlock.experts_core`, over experts stacked on dim 0; `StackedExpertLayer(OlmoeSparseMoeBlock, ("experts.w1", "experts.w2", "experts.w3"))` in the plugin object |
+| Expert layers in the parallelism info | `moe_layers`, `num_experts` and `top_k` in `parallelism(config)` |
+| Converters (§7.9) | `weights.py`: stacked trainer experts to the checkpoint's `mlp.experts.<e>.{gate,up,down}_proj` and back |
+| Router replay on the sampler | Nothing: vLLM's built-in model routes through its fused MoE layer, which records routed experts. The manifest declares `router_replay` and the `prefix_caching` it requires. |
+| Reference | Transformers' `OlmoeForCausalLM`, loaded through `convert_layer_to_hf`, so the reference checks the converters' meaning too |
+
+It passes every CPU tier, `router_replay`, `ep2` and `sp2+ep2` included.
+
+### 14.2 ToyHybridMoE: every part of the contract
 
 [`examples/model_plugins/toy_hybrid_moe`](../../examples/model_plugins/toy_hybrid_moe/) is a complete plugin that
 touches every part of this contract. The architecture is new to the platform:

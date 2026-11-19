@@ -53,4 +53,4 @@ repos:
         name: mypy (model plugin interfaces)
         additional_dependencies: [pydantic]
         args: [--ignore-missing-imports, --follow-imports=silent]
-        files: ^(arctic_platform/model_plugin/interfaces\.py|examples/model_plugins/toy_hybrid_moe/toy_hybrid_moe/(modeling|parallel)\.py|examples/model_plugins/olmo2/olmo2_plugin/modeling\.py)$
+        files: ^(arctic_platform/model_plugin/interfaces\.py|examples/model_plugins/toy_hybrid_moe/toy_hybrid_moe/(modeling|parallel)\.py|examples/model_plugins/olmo2/olmo2_plugin/modeling\.py|examples/model_plugins/olmoe/olmoe_plugin/modeling\.py)$
