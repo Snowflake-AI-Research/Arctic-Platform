@@ -70,7 +70,13 @@ from .sampler_names import sampler_target
 
 
 def register() -> None:
+    from transformers import AutoConfig
     from vllm import ModelRegistry
+
+    from .config import ToyHybridMoEConfig
+
+    # The sampler process never calls PLUGIN.register, so the config type must be registered here too.
+    AutoConfig.register(ToyHybridMoEConfig.model_type, ToyHybridMoEConfig, exist_ok=True)
 
     ModelRegistry.register_model("ToyHybridMoEForCausalLM", "toy_hybrid_moe.vllm_model:ToyHybridMoEForCausalLM")
 

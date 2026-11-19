@@ -240,8 +240,41 @@ def iter_checkpoint_layers(path: str | Path) -> Iterator[tuple[int, dict[str, to
             yield index, layer
 
 
+_SAFETENSORS_FLOAT_DTYPES = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+}
+
+
+def checkpoint_dtype(path: str | Path) -> torch.dtype | None:
+    """The floating dtype holding most of a checkpoint's elements, read from safetensors headers; ``None`` if the
+    checkpoint has no floating tensors."""
+    from safetensors import safe_open
+
+    elements: dict[torch.dtype, int] = {}
+    by_file: dict[Path, list[str]] = {}
+    for name, file in checkpoint_files(path).items():
+        by_file.setdefault(file, []).append(name)
+    for file, names in by_file.items():
+        with safe_open(str(file), framework="pt") as f:
+            for name in names:
+                tensor = f.get_slice(name)
+                dtype = _SAFETENSORS_FLOAT_DTYPES.get(tensor.get_dtype())
+                if dtype is not None:
+                    shape = tensor.get_shape()
+                    elements[dtype] = elements.get(dtype, 0) + (torch.Size(shape).numel())
+    return max(elements, key=elements.__getitem__) if len(elements) > 0 else None
+
+
 def load_hf_checkpoint(plugin: ModelPlugin, path: str | Path) -> tuple[Any, nn.Module]:
-    """Build the trainer model from ``config.json`` and load the checkpoint into it layer by layer."""
+    """Build the trainer model from ``config.json`` in the dtype the checkpoint stores, and load the checkpoint into
+    it layer by layer.
+
+    Building in the stored dtype makes a save and reload exact: loading bf16 tensors into an fp32 model would
+    compute in fp32 and change the logits. Parameters a model keeps in fp32 are cast by its own code (spec §7.9).
+    """
     stamp = read_stamp(path)
     if STAMP_PLUGIN in stamp and stamp[STAMP_PLUGIN] != plugin.manifest.name:
         raise ValueError(f"{path} was written by plugin {stamp[STAMP_PLUGIN]}, not {plugin.manifest.name}")
@@ -255,5 +288,8 @@ def load_hf_checkpoint(plugin: ModelPlugin, path: str | Path) -> tuple[Any, nn.M
         )
     config = plugin.config_class.from_pretrained(path)
     model = plugin.build_model(config)
+    dtype = checkpoint_dtype(path)
+    if dtype is not None:
+        model = model.to(dtype)
     _load_layers(model, plugin, iter_checkpoint_layers(path))
     return config, model

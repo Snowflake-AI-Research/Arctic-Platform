@@ -16,8 +16,10 @@
 """Plugin conformance: the checks a model plugin must pass before the training service admits it.
 
 Every CPU tier here runs locally with ``python -m arctic_platform.model_plugin.conformance --plugin pkg:PLUGIN
---spec conformance.toml``. The service reruns them at registration on the plugin's fixture, then runs the GPU
-tiers (sampler log-probability parity and a real-weights step), which need the training runtime and vLLM.
+--spec conformance.toml``; ``--device cuda`` runs the same tiers on GPUs, with the parallel tiers over NCCL. The
+``rl_step`` tier uses the platform's GRPO loss, so it needs ``arctic-platform[rl]`` and is skipped without it. The
+service reruns every tier at registration on the plugin's fixture, then runs the GPU tiers (sampler
+log-probability parity and a real-weights step), which need the training runtime and vLLM.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from datetime import timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any
+from typing import Literal
 
 import torch
 import torch.distributed as dist
@@ -110,22 +113,39 @@ def load_conformance_spec(path: str | Path) -> ConformanceSpec:
         return ConformanceSpec.model_validate(tomllib.load(f))
 
 
+Device = str | torch.device
+
+
+class TierSkipped(Exception):
+    """A tier that cannot run in this environment; the service, which has the full runtime, always runs it."""
+
+
 @dataclass
 class TierResult:
     tier: str
-    passed: bool
+    status: Literal["PASS", "FAIL", "SKIP"]
     detail: str = ""
 
+    @property
+    def passed(self) -> bool:
+        return self.status == "PASS"
 
-def build_fixture(plugin: ModelPlugin, spec: ConformanceSpec) -> tuple[Any, nn.Module]:
+
+def build_fixture(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "cpu") -> tuple[Any, nn.Module]:
     torch.manual_seed(spec.seed)
     config = plugin.config_class(**spec.fixture)
-    return config, plugin.build_model(config).float()
+    return config, plugin.build_model(config).float().to(device)
 
 
-def fixture_sequences(config: Any, spec: ConformanceSpec, offset: int = 0) -> list[torch.Tensor]:
+def fixture_sequences(
+    config: Any, spec: ConformanceSpec, offset: int = 0, device: Device = "cpu"
+) -> list[torch.Tensor]:
+    """The fixture's rows, drawn on CPU so they are the same on every device."""
     generator = torch.Generator().manual_seed(spec.seed + 1000 + offset)
-    return [torch.randint(0, config.vocab_size, (length,), generator=generator) for length in spec.sequence_lengths]
+    return [
+        torch.randint(0, config.vocab_size, (length,), generator=generator).to(device)
+        for length in spec.sequence_lengths
+    ]
 
 
 def _logits(output) -> torch.Tensor:
@@ -157,22 +177,22 @@ def check_static(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
         raise AssertionError("the config has expert layers but the plugin has no expert_layer")
 
 
-def check_reference_parity(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
+def check_reference_parity(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "cpu") -> None:
     if plugin.reference_forward is None:
         raise AssertionError("the plugin supplies no reference_forward")
-    config, model = build_fixture(plugin, spec)
+    config, model = build_fixture(plugin, spec, device)
     with torch.no_grad():
-        for index, sequence in enumerate(fixture_sequences(config, spec)):
+        for index, sequence in enumerate(fixture_sequences(config, spec, device=device)):
             input_ids, position_ids = pack_sequences([sequence])
             actual = _logits(forward(model, input_ids, position_ids))
             expected = plugin.reference_forward(model, sequence)
             _assert_close(actual[0], expected, spec.tolerances.reference, f"sequence {index} vs reference")
 
 
-def check_packing(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
+def check_packing(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "cpu") -> None:
     """Packed rows give the logits, loss and gradients of the same rows run one at a time."""
-    config, model = build_fixture(plugin, spec)
-    sequences = fixture_sequences(config, spec)
+    config, model = build_fixture(plugin, spec, device)
+    sequences = fixture_sequences(config, spec, device=device)
     separate = copy.deepcopy(model)
 
     input_ids, position_ids = pack_sequences(sequences)
@@ -196,11 +216,11 @@ def check_packing(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
         _assert_close(grad, expected[name], spec.tolerances.packing, f"grad {name} packed vs rows")
 
 
-def check_router_replay(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
+def check_router_replay(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "cpu") -> None:
     """Replaying captured routing reproduces the forward, fresh ids fall back to the gate, and replay is honoured."""
-    config, model = build_fixture(plugin, spec)
+    config, model = build_fixture(plugin, spec, device)
     info = plugin.parallelism(config)
-    input_ids, position_ids = pack_sequences(fixture_sequences(config, spec))
+    input_ids, position_ids = pack_sequences(fixture_sequences(config, spec, device=device))
     with torch.no_grad():
         logits, routing = forward(model, input_ids, position_ids, return_routing=True)
         if set(routing) != set(info.moe_layers):
@@ -215,11 +235,11 @@ def check_router_replay(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
             raise AssertionError("forcing different experts did not change the output: routed_experts is ignored")
 
 
-def check_checkpoint_and_sync(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
+def check_checkpoint_and_sync(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "cpu") -> None:
     """A saved Hugging Face checkpoint reloads to the same model, and the sampler stream is the checkpoint minus
     trainer-only tensors."""
-    config, model = build_fixture(plugin, spec)
-    input_ids, position_ids = pack_sequences(fixture_sequences(config, spec))
+    config, model = build_fixture(plugin, spec, device)
+    input_ids, position_ids = pack_sequences(fixture_sequences(config, spec, device=device))
     stamp = {key: value for key, value in checkpoint_stamp(plugin).items() if key.startswith("arctic_plugin")}
     with torch.no_grad():
         expected = _logits(forward(model, input_ids, position_ids))
@@ -232,6 +252,7 @@ def check_checkpoint_and_sync(plugin: ModelPlugin, spec: ConformanceSpec) -> Non
                 if read_stamp(path) != stamp:
                     raise AssertionError(f"checkpoint stamp {read_stamp(path)} does not name this plugin {stamp}")
                 _, reloaded = load_hf_checkpoint(plugin, path)
+                reloaded = reloaded.to(device)
                 what = "reloaded checkpoint" + ("" if max_shard_bytes is None else " (sharded)")
                 _assert_close(_logits(forward(reloaded, input_ids, position_ids)), expected, 0.0, what)
     checkpoint = dict(iter_hf_weights(model, plugin, for_sampler=False))
@@ -247,12 +268,12 @@ def check_checkpoint_and_sync(plugin: ModelPlugin, spec: ConformanceSpec) -> Non
         _assert_close(tensor, checkpoint[name], 0.0, f"stream tensor {name}")
 
 
-def check_activation_checkpointing(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
+def check_activation_checkpointing(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "cpu") -> None:
     """Recomputing checkpointed decoder layers changes no output, gradient or buffer: side effects run once."""
-    config, model = build_fixture(plugin, spec)
+    config, model = build_fixture(plugin, spec, device)
     checkpointed = copy.deepcopy(model)
     apply_activation_checkpointing(checkpointed)
-    input_ids, position_ids = pack_sequences(fixture_sequences(config, spec))
+    input_ids, position_ids = pack_sequences(fixture_sequences(config, spec, device=device))
     labels = next_token_labels(input_ids, position_ids)
     logits = {}
     for name, candidate in (("plain", model), ("checkpointed", checkpointed)):
@@ -335,31 +356,38 @@ def check_weights_directory(plugin: ModelPlugin, path: str | Path) -> None:
         raise AssertionError(f"the tokenizer has {len(tokenizer)} tokens but the model only {config.vocab_size}")
 
 
-def check_rl_step(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
+def check_rl_step(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "cpu") -> None:
     """A GRPO step on packed rows matches the same step on padded rows: loss and every gradient."""
-    from arctic_platform.rl.processors.grpo import grpo_loss
+    try:
+        from arctic_platform.rl.processors.grpo import grpo_loss
+    except ImportError as error:
+        raise TierSkipped(f"needs the platform's GRPO loss: {error}") from error
 
-    config, model = build_fixture(plugin, spec)
+    config, model = build_fixture(plugin, spec, device)
     padded_model = copy.deepcopy(model)
-    sequences = fixture_sequences(config, spec)
+    sequences = fixture_sequences(config, spec, device=device)
     generator = torch.Generator().manual_seed(spec.seed + 7)
 
     input_ids, position_ids = pack_sequences(sequences)
     labels = next_token_labels(input_ids, position_ids)
     packed = token_logprobs(_logits(forward(model, input_ids, position_ids)), labels)
-    advantages = torch.randn(packed.shape, generator=generator)
-    old = packed.detach() + 0.01 * torch.randn(packed.shape, generator=generator)
+    advantages = torch.randn(packed.shape, generator=generator).to(device)
+    old = packed.detach() + 0.01 * torch.randn(packed.shape, generator=generator).to(device)
     mask = labels != IGNORE_INDEX
     packed_loss, _ = grpo_loss(
-        dict(logprobs=packed), dict(old_log_probs_shifted=old, advantages=advantages, loss_mask=mask), {}, {}, "cpu"
+        dict(logprobs=packed),
+        dict(old_log_probs_shifted=old, advantages=advantages, loss_mask=mask),
+        {},
+        {},
+        str(device),
     )
     packed_loss.backward()
 
     width = max(len(sequence) for sequence in sequences)
     rows = len(sequences)
-    padded_old = torch.zeros(rows, width)
-    padded_advantages = torch.zeros(rows, width)
-    padded_mask = torch.zeros(rows, width, dtype=torch.bool)
+    padded_old = torch.zeros(rows, width, device=device)
+    padded_advantages = torch.zeros(rows, width, device=device)
+    padded_mask = torch.zeros(rows, width, dtype=torch.bool, device=device)
     rows_logprobs = []
     start = 0
     for row, sequence in enumerate(sequences):
@@ -377,7 +405,7 @@ def check_rl_step(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
         dict(old_log_probs_shifted=padded_old, advantages=padded_advantages, loss_mask=padded_mask),
         {},
         {},
-        "cpu",
+        str(device),
     )
     padded_loss.backward()
     _assert_close(packed_loss.detach(), padded_loss.detach(), spec.tolerances.rl_step, "GRPO loss packed vs padded")
@@ -386,24 +414,36 @@ def check_rl_step(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
         _assert_close(grad, expected[name], spec.tolerances.rl_step, f"GRPO grad {name}")
 
 
-def _parallel_worker(rank: int, size: int, init_file: str, target: str, spec_json: str, mode: str, path: list[str]):
+def _parallel_worker(
+    rank: int, size: int, init_file: str, target: str, spec_json: str, mode: str, path: list[str], device_type: str
+):
     sys.path[:] = path
     torch.set_num_threads(1)
+    device = torch.device(device_type, rank) if device_type == "cuda" else torch.device(device_type)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     dist.init_process_group(
-        "gloo", init_method=f"file://{init_file}", world_size=size, rank=rank, timeout=timedelta(seconds=120)
+        "nccl" if device.type == "cuda" else "gloo",
+        init_method=f"file://{init_file}",
+        world_size=size,
+        rank=rank,
+        timeout=timedelta(seconds=120),
+        device_id=device if device.type == "cuda" else None,
     )
     try:
         plugin = load_plugin(target)
         spec = ConformanceSpec.model_validate_json(spec_json)
-        _parallel_checks(plugin, spec, mode, rank, size)
+        _parallel_checks(plugin, spec, mode, rank, size, device)
     finally:
         dist.destroy_process_group()
 
 
-def _parallel_checks(plugin: ModelPlugin, spec: ConformanceSpec, mode: str, rank: int, size: int) -> None:
+def _parallel_checks(
+    plugin: ModelPlugin, spec: ConformanceSpec, mode: str, rank: int, size: int, device: Device = "cpu"
+) -> None:
     group = dist.group.WORLD
     atol = spec.tolerances.parallel
-    config, baseline = build_fixture(plugin, spec)
+    config, baseline = build_fixture(plugin, spec, device)
     model = copy.deepcopy(baseline)
     sp_group = group if mode in ("sp", "sp+ep") else None
     ep_group = group if mode in ("ep", "sp+ep") else None
@@ -419,7 +459,7 @@ def _parallel_checks(plugin: ModelPlugin, spec: ConformanceSpec, mode: str, rank
     }
 
     # Sequence-parallel ranks hold shards of the same rows; pure expert parallelism gives each rank its own rows.
-    sequences = fixture_sequences(config, spec, offset=rank if mode == "ep" else 0)
+    sequences = fixture_sequences(config, spec, offset=rank if mode == "ep" else 0, device=device)
     input_ids, position_ids = pack_sequences(sequences)
     labels = next_token_labels(input_ids, position_ids)
 
@@ -454,8 +494,14 @@ def _parallel_checks(plugin: ModelPlugin, spec: ConformanceSpec, mode: str, rank
             _assert_close(exported[name], tensor, 0.0, f"{mode} exported {name}")
 
 
-def check_parallel(plugin_target: str, spec: ConformanceSpec, mode: str, size: int) -> None:
-    """Run ``mode`` ('sp', 'ep' or 'sp+ep') on ``size`` gloo ranks and compare with the unsharded model."""
+def check_parallel(plugin_target: str, spec: ConformanceSpec, mode: str, size: int, device: Device = "cpu") -> None:
+    """Run ``mode`` ('sp', 'ep' or 'sp+ep') on ``size`` ranks and compare with the unsharded model.
+
+    On CPU the ranks are gloo processes; with ``device="cuda"`` each rank drives its own GPU over NCCL.
+    """
+    device_type = torch.device(device).type
+    if device_type == "cuda" and torch.cuda.device_count() < size:
+        raise TierSkipped(f"needs {size} GPUs, found {torch.cuda.device_count()}")
     with tempfile.TemporaryDirectory() as directory:
         mp.spawn(
             _parallel_worker,
@@ -466,45 +512,57 @@ def check_parallel(plugin_target: str, spec: ConformanceSpec, mode: str, size: i
                 spec.model_dump_json(),
                 mode,
                 list(sys.path),
+                device_type,
             ),
             nprocs=size,
         )
 
 
-def run_conformance(plugin_target: str, spec: ConformanceSpec, weights: str | Path | None = None) -> list[TierResult]:
-    """Every applicable CPU tier; with ``weights``, also check that real weights directory."""
+def run_conformance(
+    plugin_target: str, spec: ConformanceSpec, weights: str | Path | None = None, device: Device = "cpu"
+) -> list[TierResult]:
+    """Every applicable tier on ``device``; with ``weights``, also check that real weights directory."""
     plugin = load_plugin(plugin_target)
     capabilities = plugin.manifest.capabilities
     config, _ = build_fixture(plugin, spec)
     has_experts = len(plugin.parallelism(config).moe_layers) > 0
     tiers: list[tuple[str, Callable[[], None]]] = [
         ("static", lambda: check_static(plugin, spec)),
-        ("reference_parity", lambda: check_reference_parity(plugin, spec)),
-        ("packing", lambda: check_packing(plugin, spec)),
-        ("activation_checkpointing", lambda: check_activation_checkpointing(plugin, spec)),
-        ("checkpoint_and_sync", lambda: check_checkpoint_and_sync(plugin, spec)),
-        ("rl_step", lambda: check_rl_step(plugin, spec)),
+        ("reference_parity", lambda: check_reference_parity(plugin, spec, device)),
+        ("packing", lambda: check_packing(plugin, spec, device)),
+        ("activation_checkpointing", lambda: check_activation_checkpointing(plugin, spec, device)),
+        ("checkpoint_and_sync", lambda: check_checkpoint_and_sync(plugin, spec, device)),
+        ("rl_step", lambda: check_rl_step(plugin, spec, device)),
     ]
     if weights is not None:
         tiers.append(("weights_directory", partial(check_weights_directory, plugin, weights)))
     if capabilities.router_replay and has_experts:
-        tiers.append(("router_replay", lambda: check_router_replay(plugin, spec)))
+        tiers.append(("router_replay", lambda: check_router_replay(plugin, spec, device)))
     if capabilities.sequence_parallel:
-        tiers += [(f"sp{size}", partial(check_parallel, plugin_target, spec, "sp", size)) for size in spec.sp_sizes]
+        tiers += [
+            (f"sp{size}", partial(check_parallel, plugin_target, spec, "sp", size, device)) for size in spec.sp_sizes
+        ]
     if capabilities.expert_parallel and has_experts:
-        tiers += [(f"ep{size}", partial(check_parallel, plugin_target, spec, "ep", size)) for size in spec.ep_sizes]
+        tiers += [
+            (f"ep{size}", partial(check_parallel, plugin_target, spec, "ep", size, device)) for size in spec.ep_sizes
+        ]
     if capabilities.sequence_parallel and capabilities.expert_parallel and has_experts:
         both = sorted(set(spec.sp_sizes) & set(spec.ep_sizes))
-        tiers += [(f"sp{size}+ep{size}", partial(check_parallel, plugin_target, spec, "sp+ep", size)) for size in both]
+        tiers += [
+            (f"sp{size}+ep{size}", partial(check_parallel, plugin_target, spec, "sp+ep", size, device))
+            for size in both
+        ]
 
     results = []
     for name, check in tiers:
         try:
             check()
-            results.append(TierResult(name, True))
+            results.append(TierResult(name, "PASS"))
+        except TierSkipped as skipped:
+            results.append(TierResult(name, "SKIP", str(skipped)))
         except Exception as error:  # a failing tier is reported, then the next tier runs
             detail = "".join(traceback.format_exception_only(type(error), error)).strip()
-            results.append(TierResult(name, False, detail))
+            results.append(TierResult(name, "FAIL", detail))
     return results
 
 
@@ -513,12 +571,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--plugin", required=True, help="'module:attribute' of the ModelPlugin")
     parser.add_argument("--spec", required=True, help="path to the plugin's conformance.toml")
     parser.add_argument("--weights", help="a real Hugging Face weights directory to check (shapes only, no GPU)")
+    parser.add_argument("--device", default="cpu", help="'cpu' (gloo ranks) or 'cuda' (one GPU per rank, NCCL)")
     args = parser.parse_args(argv)
-    results = run_conformance(args.plugin, load_conformance_spec(args.spec), weights=args.weights)
+    results = run_conformance(args.plugin, load_conformance_spec(args.spec), weights=args.weights, device=args.device)
     width = max(len(result.tier) for result in results)
     for result in results:
-        print(f"{result.tier:<{width}}  {'PASS' if result.passed else 'FAIL'}  {result.detail}")
-    return 0 if all(result.passed for result in results) else 1
+        print(f"{result.tier:<{width}}  {result.status}  {result.detail}")
+    return 1 if any(result.status == "FAIL" for result in results) else 0
 
 
 if __name__ == "__main__":

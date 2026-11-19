@@ -89,9 +89,14 @@ def prepare_model(
     *,
     sp_group=None,
     ep_group=None,
-    ep_group_name: str = "expert_parallel",
+    ep_group_name: str | None = None,
 ) -> LayerBinding:
-    """Bind the model's layers and apply the requested sequence and expert parallelism."""
+    """Bind the model's layers and apply the requested sequence and expert parallelism.
+
+    Expert parameters are tagged for DeepSpeed's expert-data-parallel gradient reduction under ``ep_group_name``,
+    by default ``ep_size_<ep>``, the name DeepSpeed registers an expert-parallel degree under. Run the model under
+    DeepSpeed with :func:`~arctic_platform.model_plugin.deepspeed_engine.initialize_deepspeed`.
+    """
     info = plugin.parallelism(config)
     binding = bind_layers(model, plugin, info)
     modules = dict(model.named_modules())
@@ -110,6 +115,9 @@ def prepare_model(
         expert_layer = plugin.expert_layer
         if expert_layer is None or not plugin.manifest.capabilities.expert_parallel:
             raise ValueError(f"{plugin.manifest.name} does not declare expert_parallel")
+        # DeepSpeed's registry key for an expert-parallel degree (arctic_platform.model.parallel.groups.ep_group_name,
+        # not imported so this module stays free of DeepSpeed).
+        ep_group_name = ep_group_name or f"ep_size_{ep_size}"
         for path in binding.experts:
             module = modules[path]
             num_experts = expert_layer.num_experts(module)
@@ -129,9 +137,11 @@ def prepare_model(
 
 
 def pack_sequences(sequences: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-    """``input_ids`` and ``position_ids``, each ``[1, total]``, with positions restarting at 0 for every row."""
+    """``input_ids`` and ``position_ids``, each ``[1, total]`` on the sequences' device, with positions restarting at
+    0 for every row."""
     input_ids = torch.cat(sequences).unsqueeze(0)
-    position_ids = torch.cat([torch.arange(len(sequence)) for sequence in sequences]).unsqueeze(0)
+    position_ids = torch.cat([torch.arange(len(sequence), device=sequence.device) for sequence in sequences])
+    position_ids = position_ids.unsqueeze(0)
     return input_ids, position_ids
 
 

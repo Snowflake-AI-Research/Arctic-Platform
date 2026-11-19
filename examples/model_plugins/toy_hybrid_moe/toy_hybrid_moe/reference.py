@@ -71,13 +71,13 @@ def reference_forward(model: nn.Module, input_ids: torch.Tensor) -> torch.Tensor
             q = _rope((x @ p[pre + "self_attn.q_proj.weight"].T).view(length, heads, dim), cfg.rope_theta)
             k = _rope((x @ p[pre + "self_attn.k_proj.weight"].T).view(length, kv_heads, dim), cfg.rope_theta)
             v = (x @ p[pre + "self_attn.v_proj.weight"].T).view(length, kv_heads, dim)
-            mixed = torch.zeros(length, heads, dim, dtype=h.dtype)
+            mixed = torch.zeros(length, heads, dim, dtype=h.dtype, device=h.device)
             for head in range(heads):
                 kv = head // (heads // kv_heads)
                 scores = (q[:, head] @ k[:, kv].T) / math.sqrt(dim)
-                allowed = torch.ones(length, length, dtype=torch.bool).tril()
+                allowed = torch.ones(length, length, dtype=torch.bool, device=h.device).tril()
                 if cfg.sliding_window is not None:
-                    allowed &= ~torch.ones(length, length, dtype=torch.bool).tril(-cfg.sliding_window)
+                    allowed &= ~torch.ones(length, length, dtype=torch.bool, device=h.device).tril(-cfg.sliding_window)
                 mixed[:, head] = torch.softmax(scores.masked_fill(~allowed, float("-inf")), dim=-1) @ v[:, kv]
             h = h + mixed.reshape(length, -1) @ p[pre + "self_attn.o_proj.weight"].T
         elif cfg.layer_types[i] == SHORT_CONV:
@@ -104,7 +104,7 @@ def reference_forward(model: nn.Module, input_ids: torch.Tensor) -> torch.Tensor
                     if source >= 0:
                         conv[t] += weight[:, :, tap] * u[source]
             conv = F.silu(conv)
-            state = torch.zeros(heads, dim, dtype=h.dtype)
+            state = torch.zeros(heads, dim, dtype=h.dtype, device=h.device)
             outputs = torch.zeros_like(u)
             for t in range(length):
                 a = torch.sigmoid(g[t] + bias[:, None])

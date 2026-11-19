@@ -34,6 +34,8 @@ from toy_hybrid_moe.config import ToyHybridMoEConfig
 from toy_hybrid_moe.sampler_names import sampler_target
 
 from arctic_platform.model_plugin import conformance
+from arctic_platform.model_plugin.host import forward
+from arctic_platform.model_plugin.host import pack_sequences
 from arctic_platform.model_plugin.weights import CHECKPOINT_FILE
 from arctic_platform.model_plugin.weights import iter_hf_weights
 from arctic_platform.model_plugin.weights import load_hf_checkpoint
@@ -70,15 +72,25 @@ def test_parallel_tier(mode):
 
 def test_run_conformance_reports_every_tier():
     results = conformance.run_conformance(TARGET, SPEC.model_copy(update=dict(sp_sizes=[], ep_sizes=[])))
-    assert [(result.tier, result.passed) for result in results] == [
-        ("static", True),
-        ("reference_parity", True),
-        ("packing", True),
-        ("activation_checkpointing", True),
-        ("checkpoint_and_sync", True),
-        ("rl_step", True),
-        ("router_replay", True),
+    assert [(result.tier, result.status) for result in results] == [
+        ("static", "PASS"),
+        ("reference_parity", "PASS"),
+        ("packing", "PASS"),
+        ("activation_checkpointing", "PASS"),
+        ("checkpoint_and_sync", "PASS"),
+        ("rl_step", "PASS"),
+        ("router_replay", "PASS"),
     ]
+
+
+def test_rl_step_is_skipped_without_the_training_stack():
+    # Importing the platform's GRPO loss needs arctic-platform[rl]; a plugin author's laptop may not have it.
+    with patch.dict("sys.modules", {"arctic_platform.rl.processors.grpo": None}):
+        results = conformance.run_conformance(TARGET, SPEC.model_copy(update=dict(sp_sizes=[], ep_sizes=[])))
+    statuses = {result.tier: result.status for result in results}
+    assert statuses["rl_step"] == "SKIP"
+    assert all(status == "PASS" for tier, status in statuses.items() if tier != "rl_step")
+    assert conformance.main(["--plugin", TARGET, "--spec", str(TOY_PLUGIN_ROOT / "conformance.toml")]) == 0
 
 
 def test_new_layer_count_and_pattern_needs_no_code_change():
@@ -234,6 +246,20 @@ class TestCheckpointLayout(TestCasePlus):
         )
         with self.assertRaisesRegex(ValueError, "was written by plugin custom/example/toy-hybrid-moe"):
             load_hf_checkpoint(other, path)
+
+    def test_bf16_checkpoint_reloads_in_bf16_exactly(self):
+        torch.manual_seed(0)
+        config = ToyHybridMoEConfig(**SPEC.fixture)
+        model = PLUGIN.build_model(config).to(torch.bfloat16)
+        path = Path(self.get_auto_remove_tmp_dir_str())
+        save_hf_checkpoint(model, PLUGIN, config, path)
+        _, reloaded = load_hf_checkpoint(PLUGIN, path)
+        self.assertEqual({p.dtype for p in reloaded.parameters()}, {torch.bfloat16})
+        input_ids, position_ids = pack_sequences(conformance.fixture_sequences(config, SPEC))
+        with torch.no_grad():
+            expected = forward(model, input_ids, position_ids)
+            actual = forward(reloaded, input_ids, position_ids)
+        self.assertEqual((actual.float() - expected.float()).abs().max().item(), 0.0)
 
     def test_checkpoint_uses_hugging_face_names(self):
         torch.manual_seed(0)

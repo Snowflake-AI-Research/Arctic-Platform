@@ -16,7 +16,9 @@
 """Model plugin contract (draft v1): bring a new model architecture to the training service as a Python package.
 
 The specification is ``docs/model-plugins/spec.md``. This package needs only torch and pydantic, so a plugin can be
-developed and its CPU conformance tiers run without the GPU training stack.
+developed and its CPU conformance tiers run without the GPU training stack; the ``rl_step`` tier, which uses the
+platform's GRPO loss, is skipped unless ``arctic-platform[rl]`` is installed. DeepSpeed is imported only by
+:func:`initialize_deepspeed`.
 """
 
 from arctic_platform.model_plugin.admission import AdmissionError
@@ -24,6 +26,7 @@ from arctic_platform.model_plugin.admission import JobRequest
 from arctic_platform.model_plugin.admission import check_job_request
 from arctic_platform.model_plugin.attention import AttentionModule
 from arctic_platform.model_plugin.attention import varlen_causal_attention
+from arctic_platform.model_plugin.deepspeed_engine import initialize_deepspeed
 from arctic_platform.model_plugin.experts import ROUTER_REPLAY_FRESH
 from arctic_platform.model_plugin.experts import ExpertLayer
 from arctic_platform.model_plugin.experts import ExpertShard
@@ -76,6 +79,7 @@ __all__ = [
     "HeadParallelMixer",
     "HeadShard",
     "in_recompute",
+    "initialize_deepspeed",
     "JobRequest",
     "load_manifest",
     "load_plugin",

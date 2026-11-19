@@ -389,7 +389,9 @@ flowchart LR
 | `apply_expert_parallel(module, group)` | `prepare_model` | `expert_parallel(...)`: shard the stacked tensors and wrap `experts_core` |
 
 After `apply_expert_parallel`, the platform verifies each expert tensor holds `num_experts / ep` experts and tags it
-so DeepSpeed reduces its gradients over the expert-data-parallel group, and so export gathers it back. Routing,
+so DeepSpeed reduces its gradients over the expert-data-parallel group, and so export gathers it back. DeepSpeed
+recognises only its own MoE module class, so the platform declares your expert layers to it when it builds the
+training engine (`initialize_deepspeed`); ZeRO-3 is not supported together with expert parallelism. Routing,
 shared experts and any router bias stay replicated. Write your own `ExpertLayer` only for a different dispatch
 policy; the platform can likewise replace the token exchange behind `experts_core`, for example with DeepEP's
 all-to-all on GPU, without changing your model code.
@@ -440,7 +442,7 @@ Conversion and loading:
 - The platform loads a checkpoint **one decoder layer at a time**, reading only that layer's tensors from disk, so converters see one layer and peak extra memory is one layer. Every trainer tensor MUST be set and no checkpoint tensor may be left over.
 - The platform gathers ZeRO and expert shards before calling your converter on export, so converters always see full tensors.
 - Checkpoints the platform writes carry a **plugin stamp** in their safetensors metadata (`arctic_plugin`, `arctic_plugin_version`, `arctic_plugin_contract`). A checkpoint stamped by a different plugin is refused at load. A different version of the same plugin loads and is logged.
-- **Dtypes.** Store weights in the dtype you want served, usually bf16. The trainer computes in the job's dtype and keeps fp32 master weights in the optimizer. Parameters that must stay fp32, such as norms or gates you rely on for parity, are cast by your model code, not by the checkpoint.
+- **Dtypes.** Store weights in the dtype you want served, usually bf16. The platform builds your model in the dtype that holds most of a checkpoint's elements before loading it, so a save and reload is exact. The trainer computes in the job's dtype and keeps fp32 master weights in the optimizer. Parameters that must stay fp32, such as norms or gates you rely on for parity, are cast by your model code, not by the checkpoint.
 - Mark trainer-only state, such as statistics or optimizer helpers the sampler never reads, with `skip_weight_sync(module_or_parameter)`. It stays in checkpoints and is left out of the weight sync. Mark a module rather than a buffer: moving a model between devices replaces buffer objects.
 
 ### 7.10 RL step and weight sync
@@ -509,11 +511,16 @@ flowchart LR
     class G1,G2 gpu
 ```
 
-Run every CPU tier locally:
+Run every CPU tier locally, or add `--device cuda` to run the same tiers on GPUs (the parallel tiers then use one
+GPU per rank over NCCL):
 
 ```bash
 python -m arctic_platform.model_plugin.conformance --plugin your_model:PLUGIN --spec conformance.toml
 ```
+
+Each tier reports `PASS`, `FAIL` or `SKIP`. The `rl_step` tier uses the platform's GRPO loss and is skipped
+unless `arctic-platform[rl]` is installed; the service always runs it. `reference_forward` runs on the fixture's
+device, so allocate its tensors on the input's device.
 
 | Tier | Passes when | Catches |
 |---|---|---|
@@ -561,7 +568,8 @@ A failing tier prints its name and the first mismatch, for example
 ## 10. Testing locally
 
 Everything before the GPU tiers runs on a laptop with only `arctic_platform`, PyTorch, transformers and safetensors
-installed. Sequence and expert parallelism run as separate CPU processes over gloo.
+installed, except the `rl_step` tier, which needs `arctic-platform[rl]` and is skipped without it. Sequence and
+expert parallelism run as separate CPU processes over gloo.
 
 ```mermaid
 flowchart LR
