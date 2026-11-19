@@ -29,6 +29,7 @@ import ast
 import copy
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 import tomllib
@@ -59,6 +60,7 @@ from arctic_platform.model_plugin.host import next_token_labels
 from arctic_platform.model_plugin.host import pack_sequences
 from arctic_platform.model_plugin.host import prepare_model
 from arctic_platform.model_plugin.host import token_logprobs
+from arctic_platform.model_plugin.launch import DEFAULT_TIMEOUT
 from arctic_platform.model_plugin.launch import spawn_ranks
 from arctic_platform.model_plugin.marks import cast_model
 from arctic_platform.model_plugin.marks import tensor_marks
@@ -140,18 +142,113 @@ class TierSkipped(Exception):
 
 @dataclass
 class TierResult:
+    """One tier's outcome. A failure carries the error, where in plugin code it was raised (``file:line in function``,
+    empty when a comparison failed rather than plugin code), what the tier checks, and the full traceback."""
+
     tier: str
     status: Literal["PASS", "FAIL", "SKIP"]
     detail: str = ""
+    location: str = ""
+    hint: str = ""
+    traceback: str = ""
 
     @property
     def passed(self) -> bool:
         return self.status == "PASS"
 
 
+# What each tier checks and what usually fails it, printed under a failure (spec section 9 has the full table).
+TIER_HINTS = {
+    "load": (
+        "the plugin imports, and its fixture config and model build; usually an import error or a fixture key"
+        " the config class does not take"
+    ),
+    "static": (
+        "the manifest is on contract, imports use only arctic_platform.model_plugin, and every module binds"
+        " to the config; usually an undeclared layer type, a missing mixer or hook, or a module count that disagrees"
+        " with ParallelismInfo"
+    ),
+    "reference_parity": (
+        "the model's logits on each row equal reference_forward's; usually wrong math in the model or the reference"
+    ),
+    "packing": (
+        "packed rows give the logits and gradients of each row alone; usually state that leaks across"
+        " cu_seqlens boundaries"
+    ),
+    "logprob_chunking": "chunked log-probs equal one pass; usually a compute_logits that is not token-wise",
+    "activation_checkpointing": (
+        "recomputing layers changes no output, gradient or buffer; usually a side effect not guarded by in_recompute()"
+    ),
+    "meta_build": "a meta-device build equals a normal one; usually a computed buffer with no ap_init_buffers()",
+    "dtype_marks": "fp32-marked tensors stay fp32 under bf16; usually a tensor replaced after marking",
+    "checkpoint_and_sync": (
+        "save and reload is exact and the sampler stream matches; usually converters that are not exact inverses"
+    ),
+    "rl_step": "a GRPO step on packed rows equals padded rows; usually masking or row-boundary bugs",
+    "router_replay": "replayed routing reproduces the output; usually a route() that ignores routed",
+    "weights_directory": (
+        "the real weights directory matches the model; usually missing shards, a mismatched config or tokenizer"
+    ),
+    "sp": (
+        "sequence-parallel ranks match the unsharded model; usually a core that ignores its shard (heads or"
+        " SequenceWindow) or global cu_seqlens"
+    ),
+    "ep": "expert-parallel ranks match the unsharded model; usually experts_core not offsetting by shard.start",
+}
+
+
+def _hint(tier: str) -> str:
+    if tier in TIER_HINTS:
+        return TIER_HINTS[tier]
+    return " and ".join(TIER_HINTS[mode] for mode in ("sp", "ep") if mode in tier)
+
+
+_PLATFORM_DIR = str(Path(__file__).resolve().parents[1])
+_FRAME = re.compile(r'File "(?P<file>[^"]+)", line (?P<line>\d+), in (?P<function>\S+)')
+
+
+def _is_plugin_file(path: str) -> bool:
+    resolved = str(Path(path).resolve())
+    return not resolved.startswith(_PLATFORM_DIR) and "site-packages" not in resolved and "/lib/python" not in resolved
+
+
+def _plugin_location(frames: list[tuple[str, int, str]]) -> str:
+    """The innermost frame in plugin code, as ``file:line in function``."""
+    for path, line, function in reversed(frames):
+        if _is_plugin_file(path):
+            return f"{path}:{line} in {function}"
+    return ""
+
+
+def _failure(tier: str, error: BaseException) -> TierResult:
+    full = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    rank_traceback = re.search(r"-- Process (\d+) terminated with the following error:\n(.*)", str(error), re.S)
+    if rank_traceback is not None:  # a spawned rank failed: report that rank's error and frames, not the spawn's
+        rank, text = rank_traceback.groups()
+        lines = [line for line in text.strip().splitlines() if line.strip()]
+        frames = [(m["file"], int(m["line"]), m["function"]) for m in map(_FRAME.search, lines) if m is not None]
+        return TierResult(tier, "FAIL", f"rank {rank}: {lines[-1]}", _plugin_location(frames), _hint(tier), full)
+    frames = [(frame.filename, frame.lineno or 0, frame.name) for frame in traceback.extract_tb(error.__traceback__)]
+    detail = "".join(traceback.format_exception_only(type(error), error)).strip()
+    return TierResult(tier, "FAIL", detail, _plugin_location(frames), _hint(tier), full)
+
+
+def _check_fixture_keys(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
+    """Refuse fixture keys the config class does not define: a transformers config stores any keyword as an
+    attribute, so a misspelt key would otherwise build a different model without a word."""
+    try:
+        defined = set(vars(plugin.config_class()))
+    except Exception:  # a config class with required arguments: nothing to compare against
+        return
+    unknown = sorted(set(spec.fixture) - defined)
+    if len(unknown) > 0:
+        raise ValueError(f"[fixture] sets {unknown}, which {plugin.config_class.__name__} does not define")
+
+
 def build_fixture(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "cpu") -> tuple[Any, nn.Module]:
     """The fixture config and model, prepared as the platform runs it (routing installed, no parallelism)."""
     torch.manual_seed(spec.seed)
+    _check_fixture_keys(plugin, spec)
     config = plugin.config_class(**spec.fixture)
     model = cast_model(build(plugin, config, spec.options), torch.float32).to(device)
     prepare_model(model, plugin, config)
@@ -235,6 +332,10 @@ def check_static(plugin: ModelPlugin, spec: ConformanceSpec) -> None:
     config, model = build_fixture(plugin, spec)
     info = plugin.parallelism(config)
     bind_layers(model, plugin, info)
+    if plugin.manifest.capabilities.sequence_parallel:  # here, rather than inside the sp tiers' ranks
+        for mixer in plugin.layer_mixers().values():
+            for size in spec.sp_sizes:
+                mixer.validate_sp(info, size)
     if info.moe_layers and plugin.expert_layer is None:
         raise AssertionError("the config has expert layers but the plugin has no expert_layer")
 
@@ -631,7 +732,14 @@ def _parallel_checks(
             _assert_close(exported[name], tensor, 0.0, f"{mode} exported {name}")
 
 
-def check_parallel(plugin_target: str, spec: ConformanceSpec, mode: str, size: int, device: Device = "cpu") -> None:
+def check_parallel(
+    plugin_target: str,
+    spec: ConformanceSpec,
+    mode: str,
+    size: int,
+    device: Device = "cpu",
+    timeout: float = DEFAULT_TIMEOUT,
+) -> None:
     """Run ``mode`` ('sp', 'ep' or 'sp+ep') on ``size`` ranks and compare with the unsharded model.
 
     On CPU the ranks are gloo processes; with ``device="cuda"`` each rank drives its own GPU over NCCL.
@@ -652,17 +760,22 @@ def check_parallel(plugin_target: str, spec: ConformanceSpec, mode: str, size: i
                 kind,
             ),
             nprocs=size,
+            timeout=timeout,
         )
 
 
-def run_conformance(
-    plugin_target: str, spec: ConformanceSpec, weights: str | Path | None = None, device: Device = "cpu"
-) -> list[TierResult]:
-    """Every applicable tier on ``device``; with ``weights``, also check that real weights directory."""
-    plugin = load_plugin(plugin_target)
+def _tiers(
+    plugin_target: str,
+    plugin: ModelPlugin,
+    config: Any,
+    spec: ConformanceSpec,
+    weights,
+    device: Device,
+    timeout: float,
+) -> list[tuple[str, Callable[[], None]]]:
     capabilities = plugin.manifest.capabilities
-    config, _ = build_fixture(plugin, spec)
     has_experts = len(plugin.parallelism(config).moe_layers) > 0
+    parallel = partial(check_parallel, plugin_target, spec, device=device, timeout=timeout)
     tiers: list[tuple[str, Callable[[], None]]] = [
         ("static", lambda: check_static(plugin, spec)),
         ("reference_parity", lambda: check_reference_parity(plugin, spec, device)),
@@ -679,19 +792,38 @@ def run_conformance(
     if capabilities.router_replay and has_experts:
         tiers.append(("router_replay", lambda: check_router_replay(plugin, spec, device)))
     if capabilities.sequence_parallel:
-        tiers += [
-            (f"sp{size}", partial(check_parallel, plugin_target, spec, "sp", size, device)) for size in spec.sp_sizes
-        ]
+        tiers += [(f"sp{size}", partial(parallel, "sp", size)) for size in spec.sp_sizes]
     if capabilities.expert_parallel and has_experts:
-        tiers += [
-            (f"ep{size}", partial(check_parallel, plugin_target, spec, "ep", size, device)) for size in spec.ep_sizes
-        ]
+        tiers += [(f"ep{size}", partial(parallel, "ep", size)) for size in spec.ep_sizes]
     if capabilities.sequence_parallel and capabilities.expert_parallel and has_experts:
         both = sorted(set(spec.sp_sizes) & set(spec.ep_sizes))
-        tiers += [
-            (f"sp{size}+ep{size}", partial(check_parallel, plugin_target, spec, "sp+ep", size, device))
-            for size in both
-        ]
+        tiers += [(f"sp{size}+ep{size}", partial(parallel, "sp+ep", size)) for size in both]
+    return tiers
+
+
+def run_conformance(
+    plugin_target: str,
+    spec: ConformanceSpec,
+    weights: str | Path | None = None,
+    device: Device = "cpu",
+    *,
+    only: list[str] | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> list[TierResult]:
+    """Every applicable tier on ``device``, or the ``only`` ones; with ``weights``, also check that real weights
+    directory. A plugin that cannot be loaded or built reports one failing ``load`` tier. Parallel tiers fail after
+    ``timeout`` seconds."""
+    try:
+        plugin = load_plugin(plugin_target)
+        config, _ = build_fixture(plugin, spec)
+        tiers = _tiers(plugin_target, plugin, config, spec, weights, device, timeout)
+    except Exception as error:
+        return [_failure("load", error)]
+    if only is not None:
+        unknown = sorted(set(only) - {name for name, _ in tiers})
+        if len(unknown) > 0:
+            raise ValueError(f"no tiers {unknown} for this plugin; it has {[name for name, _ in tiers]}")
+        tiers = [(name, check) for name, check in tiers if name in only]
 
     results = []
     for name, check in tiers:
@@ -701,9 +833,34 @@ def run_conformance(
         except TierSkipped as skipped:
             results.append(TierResult(name, "SKIP", str(skipped)))
         except Exception as error:  # a failing tier is reported, then the next tier runs
-            detail = "".join(traceback.format_exception_only(type(error), error)).strip()
-            results.append(TierResult(name, "FAIL", detail))
+            results.append(_failure(name, error))
     return results
+
+
+def list_tiers(plugin_target: str, spec: ConformanceSpec, weights=None, device: Device = "cpu") -> list[str]:
+    plugin = load_plugin(plugin_target)
+    config = plugin.config_class(**spec.fixture)
+    return [name for name, _ in _tiers(plugin_target, plugin, config, spec, weights, device, DEFAULT_TIMEOUT)]
+
+
+def format_results(results: list[TierResult], *, show_traceback: bool = False) -> str:
+    """The text report: one line per tier, and under a failure where it was raised and what the tier checks."""
+    width = max(len(result.tier) for result in results)
+    indent = " " * (width + 8)
+    lines = []
+    for result in results:
+        lines.append(f"{result.tier:<{width}}  {result.status}  {result.detail}".rstrip())
+        if result.status != "FAIL":
+            continue
+        if result.location:
+            lines.append(f"{indent}at {result.location}")
+        if result.hint:
+            lines.append(f"{indent}checks: {result.hint}")
+        if show_traceback and result.traceback:
+            lines += [f"{indent}{line}" for line in result.traceback.rstrip().splitlines()]
+    counts = {status: sum(result.status == status for result in results) for status in ("PASS", "FAIL", "SKIP")}
+    lines.append(f"{counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped")
+    return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -712,11 +869,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--spec", required=True, help="path to the plugin's conformance.toml")
     parser.add_argument("--weights", help="a real Hugging Face weights directory to check (shapes only, no GPU)")
     parser.add_argument("--device", default="cpu", help="'cpu' (gloo ranks) or 'cuda' (one GPU per rank, NCCL)")
+    parser.add_argument("--tier", action="append", help="run only this tier; repeat for several (see --list-tiers)")
+    parser.add_argument("--list-tiers", action="store_true", help="print the tiers this plugin has, then exit")
+    parser.add_argument("--json", action="store_true", help="print results as JSON, one object per tier")
+    parser.add_argument("--traceback", action="store_true", help="print the full traceback under each failure")
+    parser.add_argument(
+        "--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds before a parallel tier's ranks are killed"
+    )
     args = parser.parse_args(argv)
-    results = run_conformance(args.plugin, load_conformance_spec(args.spec), weights=args.weights, device=args.device)
-    width = max(len(result.tier) for result in results)
-    for result in results:
-        print(f"{result.tier:<{width}}  {result.status}  {result.detail}")
+    spec = load_conformance_spec(args.spec)
+    if args.list_tiers:
+        print("\n".join(list_tiers(args.plugin, spec, args.weights, args.device)))
+        return 0
+    results = run_conformance(
+        args.plugin, spec, weights=args.weights, device=args.device, only=args.tier, timeout=args.timeout
+    )
+    if args.json:
+        print(json.dumps([vars(result) for result in results], indent=2))
+    else:
+        print(format_results(results, show_traceback=args.traceback))
     return 1 if any(result.status == "FAIL" for result in results) else 0
 
 

@@ -369,3 +369,40 @@ def test_static_tier_refuses_platform_imports_outside_the_public_api(tmp_path, m
     plugin = dataclasses.replace(PLUGIN, build_model=build)
     with pytest.raises(AssertionError, match=r"modeling\.py:2: arctic_platform\.model_plugin\.attention"):
         conformance.check_static(plugin, conformance.load_conformance_spec(TOY_PLUGIN_ROOT / "conformance.toml"))
+
+
+def _toy_spec():
+    return conformance.load_conformance_spec(TOY_PLUGIN_ROOT / "conformance.toml")
+
+
+def test_conformance_reports_a_plugin_that_does_not_build_as_a_failing_load_tier():
+    spec = _toy_spec()
+    spec = spec.model_copy(update=dict(fixture=dict(spec.fixture, num_hiden_layers=2)))
+    [result] = conformance.run_conformance("toy_hybrid_moe:PLUGIN", spec)
+    assert (result.tier, result.status) == ("load", "FAIL")
+    assert "['num_hiden_layers'], which ToyHybridMoEConfig does not define" in result.detail
+
+
+def test_static_tier_names_a_head_parallel_layer_type_without_head_counts():
+    def no_heads(config):
+        return dataclasses.replace(PLUGIN.parallelism(config), heads={})
+
+    with pytest.raises(ValueError, match="ParallelismInfo.heads has no entry for it"):
+        conformance.check_static(dataclasses.replace(PLUGIN, parallelism=no_heads), _toy_spec())
+
+
+def _plugin_code_that_fails():
+    raise RuntimeError("shapes cannot be multiplied")
+
+
+def test_a_failure_reports_where_plugin_code_raised_and_what_the_tier_checks():
+    try:
+        _plugin_code_that_fails()
+    except RuntimeError as error:
+        result = conformance._failure("packing", error)
+    assert result.location.endswith(
+        f"test_contract.py:{_plugin_code_that_fails.__code__.co_firstlineno + 1} in _plugin_code_that_fails"
+    )
+    report = conformance.format_results([conformance.TierResult("static", "PASS"), result])
+    assert "RuntimeError: shapes cannot be multiplied" in report and "checks: packed rows" in report
+    assert report.endswith("1 passed, 1 failed, 0 skipped")

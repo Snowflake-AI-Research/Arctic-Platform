@@ -68,7 +68,12 @@ class HeadParallelMixer:
         return isinstance(module, self.module_class)
 
     def validate_sp(self, info: ParallelismInfo, sp_size: int) -> None:
-        for heads in info.heads.get(self.layer_type, ()):
+        if self.layer_type not in info.heads:
+            raise ValueError(
+                f"layer type {self.layer_type!r} is head-parallel, but ParallelismInfo.heads has no entry for it: list"
+                " the head count of every tensor its core exchanges, e.g. (num_attention_heads, num_key_value_heads)"
+            )
+        for heads in info.heads[self.layer_type]:
             if heads % sp_size != 0:
                 raise ValueError(
                     f"layer type {self.layer_type!r} has {heads} heads, not divisible by sp_size {sp_size}"

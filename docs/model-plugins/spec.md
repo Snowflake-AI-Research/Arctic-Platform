@@ -777,7 +777,8 @@ device, so allocate its tensors on the input's device.
 
 | Tier | Passes when | Catches |
 |---|---|---|
-| static | The manifest is on contract, the plugin imports the platform only from `arctic_platform.model_plugin`, mixers resolve, and the fixture model binds to its config | Imports of platform internals, undeclared layer types, missing mixers, modules the config does not account for |
+| load | The plugin imports, and its fixture config (only keys the config class defines) and model build | Import errors, misspelt fixture keys |
+| static | The manifest is on contract, the plugin imports the platform only from `arctic_platform.model_plugin`, mixers resolve, the fixture model binds to its config, and every head-parallel layer type has head counts that divide by each `sp_sizes` entry | Imports of platform internals, undeclared layer types, missing mixers, modules the config does not account for, missing `ParallelismInfo.heads` |
 | reference parity | Model logits on each unpacked row equal `reference_forward` within `reference` | Wrong math |
 | packing | Packed rows give the same logits **and gradients** as each row run alone | State leaking across row boundaries |
 | log-prob chunking | Log-probs computed `logprob_chunk` tokens at a time, through `compute_logits`, equal one pass over the row, values and gradients, within `chunking` | A `compute_logits` that is not token-wise, chunk-boundary bugs |
@@ -819,8 +820,29 @@ rl_step = 1e-5
 chunking = 1e-6                # chunking reorders the output projection's gradient sum: fp32 rounding, not bitwise
 ```
 
-A failing tier prints its name and the first mismatch, for example
-`sp2  FAIL  sp logits: shapes (1, 8, 64) vs (1, 8, 64), max |diff| 0.41`.
+Each failing tier prints its error. Under it, the report says where in your code the error was raised, when it was
+raised there rather than by a failed comparison, and what the tier checks, with the usual causes. A failure in one of
+a parallel tier's ranks names the rank. A plugin that does not import, or whose fixture does not build, reports one
+failing `load` tier, and a fixture key the config class does not define fails it, so a misspelt key cannot quietly
+build a different model.
+
+```text
+reference_parity  FAIL  RuntimeError: mat1 and mat2 shapes cannot be multiplied (320x1 and 64x32)
+                        at olmo2_plugin/modeling.py:118 in forward
+                        checks: the model's logits on each row equal reference_forward's; usually wrong math in the model or the reference
+sp2               FAIL  rank 1: AssertionError: sp logits: shapes (1, 8, 64) vs (1, 8, 64), max |diff| 0.29
+                        checks: sequence-parallel ranks match the unsharded model; usually a core that ignores its shard (heads or SequenceWindow) or global cu_seqlens
+8 passed, 2 failed, 0 skipped
+```
+
+| Flag | Effect |
+|---|---|
+| `--tier NAME` | Run only that tier; repeat for several. `--list-tiers` prints the tiers your plugin has. |
+| `--traceback` | Print the full traceback under each failure. |
+| `--json` | Print one JSON object per tier (`tier`, `status`, `detail`, `location`, `hint`, `traceback`), for scripts and coding agents. |
+| `--timeout SECONDS` | Kill a parallel tier's ranks after this long and fail the tier; default 600. |
+| `--weights DIR` | Also check a real weights directory (§10). |
+| `--device cuda` | Run the tiers on GPUs; parallel tiers use one GPU per rank over NCCL. |
 
 ---
 
