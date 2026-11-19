@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from arctic_platform.correctness.reference.qwen4_exp_precision import apply_sampler_precision
+
 
 @dataclass(frozen=True)
 class Qwen4ParameterPolicy:
@@ -62,7 +64,12 @@ def qwen4_parameter_policy(model) -> Qwen4ParameterPolicy:
 
 
 def load_qwen4_reference(model_class, model_path, *, dtype, attn_implementation, device):
-    """Keep only the frozen n-gram table on CPU, without accelerator reload hooks."""
+    """Keep only the frozen n-gram table on CPU, without accelerator reload hooks, at the sampler's precision.
+
+    ``apply_sampler_precision`` evaluates the hyper-connection mix and combine, the GatedDeltaNet beta and output norm,
+    and the QSA rotary embedding and output gate in FP32 with one rounding, as vLLM's Qwen4Exp does
+    (``qwen4_exp_precision``).
+    """
     if attn_implementation == "qsa_flex":
         # Upstream SDPA consumes its own QSA-selected mask, not dense causal attention.
         attn_implementation = "sdpa"
@@ -85,6 +92,7 @@ def load_qwen4_reference(model_class, model_path, *, dtype, attn_implementation,
     for parameter in model.parameters():
         if id(parameter) in policy.frozen_parameter_ids:
             parameter.requires_grad_(False)
+    apply_sampler_precision(model)
 
     # Module.to uses _apply too, but would also allocate the 95 GiB frozen table on CUDA.
     model._apply(lambda tensor: tensor if id(tensor) in policy.cpu_parameter_ids else tensor.to(device=device))

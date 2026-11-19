@@ -203,6 +203,8 @@ from arctic_platform.correctness.onboarding import synth_model
 from arctic_platform.correctness.reference import hf_single_gpu
 from arctic_platform.correctness.reference import optimizer_step
 from arctic_platform.correctness.reference import process_determinism
+from arctic_platform.correctness.reference import qwen4_exp_precision
+from arctic_platform.correctness.reference import qwen4_reference
 from arctic_platform.correctness.reference.adamw_trajectory import AdamWTrajectory
 from arctic_platform.correctness.reference.glm5_next_reference import load_glm5_next_reference
 from arctic_platform.correctness.reference.hf_single_gpu import build_engine
@@ -14008,9 +14010,17 @@ def _qwen4_reference_loader(model, info=None):
     return (SimpleNamespace(from_pretrained=from_pretrained), calls)
 
 
+def _qwen4_reference_precision_calls(monkeypatch):
+    """Record ``apply_sampler_precision``: the stand-in model has none of Qwen4Exp's modules for it to patch."""
+    calls = []
+    monkeypatch.setattr(qwen4_reference, "apply_sampler_precision", calls.append)
+    return calls
+
+
 @pytest.mark.parametrize("attention,expected", [("qsa_flex", "sdpa"), ("sdpa", "sdpa"), ("eager", "eager")])
-def test_qwen4_reference_upstream_backend_and_cpu_checkpoint_load(attention, expected):
+def test_qwen4_reference_upstream_backend_and_cpu_checkpoint_load(attention, expected, monkeypatch):
     model = _qwen4_reference_TinyQwen4()
+    precision = _qwen4_reference_precision_calls(monkeypatch)
     cls, calls = _qwen4_reference_loader(model)
     result = load_qwen4_reference(
         cls,
@@ -14035,6 +14045,7 @@ def test_qwen4_reference_upstream_backend_and_cpu_checkpoint_load(attention, exp
     assert not layer.self_attn.indexer.weight.requires_grad
     assert layer.ple.key_proj.weight.requires_grad
     assert layer.self_attn.q_proj.weight.requires_grad
+    assert precision == [model]
 
 
 def test_qwen4_reference_table_never_reaches_accelerator_placement(monkeypatch):
@@ -14052,6 +14063,7 @@ def test_qwen4_reference_table_never_reaches_accelerator_placement(monkeypatch):
             return original_to(tensor, device="cpu")
         return original_to(tensor, *args, **kwargs)
 
+    precision = _qwen4_reference_precision_calls(monkeypatch)
     monkeypatch.setattr(torch.Tensor, "to", to)
     cls, _ = _qwen4_reference_loader(model)
     load_qwen4_reference(
@@ -14061,6 +14073,7 @@ def test_qwen4_reference_table_never_reaches_accelerator_placement(monkeypatch):
         attn_implementation="qsa_flex",
         device="cuda",
     )
+    assert precision == [model]
     assert parameter_ids <= set(moved)
     assert id(model.layers[0].positions) in moved
     assert model.layers[0].ple.ple_embedding.ngram_embedding.weight is table
@@ -14104,6 +14117,7 @@ def test_qwen4_reference_missing_layer_period_rejected(missing):
 @pytest.mark.parametrize("model_type", ["qwen4_exp", "qwen4_exp_text", "qwen3"])
 def test_qwen4_reference_actual_build_engine_family_dispatch(monkeypatch, model_type):
     model = _qwen4_reference_TinyQwen4()
+    precision = _qwen4_reference_precision_calls(monkeypatch)
     calls = []
     cfg = SimpleNamespace(model_type=model_type, architectures=["Tiny"], hidden_size=2)
 
@@ -14128,9 +14142,219 @@ def test_qwen4_reference_actual_build_engine_family_dispatch(monkeypatch, model_
         assert calls[0]["attn_implementation"] == "sdpa"
         assert calls[0]["output_loading_info"] is True
         assert not model.layers[0].ple.ple_embedding.ngram_embedding.weight.requires_grad
+        assert precision == [model]
     else:
         assert calls[0] == {"dtype": torch.bfloat16, "attn_implementation": "qsa_flex"}
         assert model.layers[0].ple.ple_embedding.ngram_embedding.weight.requires_grad
+        assert precision == []
+
+
+# Qwen3.8-Flash-Next reference precision.
+
+
+def _qwen4_exp_precision_model(monkeypatch, dtype):
+    """A two-layer Qwen3.8 (GatedDeltaNet with PLE, then QSA) with random weights, on CPU in ``dtype``."""
+    from transformers import Qwen4ExpForCausalLM
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as qwen4_exp
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+
+    # The hub wrappers resolve to the CUDA causal-conv1d and fla kernels; their torch implementations run on CPU.
+    for name in ("causal_conv1d_fn", "torch_chunk_gated_delta_rule"):
+        monkeypatch.setattr(qwen4_exp, name, getattr(qwen4_exp, name).__wrapped__)
+    cfg = Qwen4ExpTextConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        layer_types=["linear_attention", "indexed_attention"],
+        hc_count=4,
+        hc_lowrank=8,
+        ple_layer_ids=[1],
+        ple_embed_dim=32,
+        ngram_size=3,
+        heads_per_ngram=2,
+        ngram_vocab_size_base=31,
+        make_ngram_vocab_size_divisible_by=8,
+        eos_token_id=3,
+        pad_token_id=0,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,
+        indexer_n_heads=2,
+        indexer_kv_heads=1,
+        indexer_head_dim=16,
+        indexer_budget=256,
+        indexer_compress_ratio=4,
+        output_gate_type="sigmoid",
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.5,
+            "mrope_section": [2, 1, 1],
+            "mrope_interleaved": True,
+        },
+        attn_implementation="sdpa",
+    )
+    cfg._experts_implementation = "eager"
+    torch.manual_seed(0)
+    model = Qwen4ExpForCausalLM(cfg)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if not name.endswith("A_log"):
+                parameter.normal_(0, 0.3 if parameter.ndim == 1 or "conv1d" in name else 0.1)
+    return model.to(dtype), cfg
+
+
+def test_qwen4_exp_reference_loader_applies_the_samplers_precision(monkeypatch):
+    """load_qwen4_reference patches every hyper connection (two per layer and the final mixer), decoder layer,
+    GatedDeltaNet beta projection and output norm, and QSA attention of the model it loads."""
+    model, _ = _qwen4_exp_precision_model(monkeypatch, torch.bfloat16)
+    cls, _ = _qwen4_reference_loader(model)
+    loaded = load_qwen4_reference(cls, "fixture", dtype=torch.bfloat16, attn_implementation="qsa_flex", device="cpu")
+    assert loaded is model
+    text = model.model
+    hyper_connections = [text.hyper_connection_mixer] + [
+        site for layer in text.layers for site in (layer.attn_hyper_connection, layer.mlp_hyper_connection)
+    ]
+    assert all(site.forward.__func__ is qwen4_exp_precision._gated_residual_forward for site in hyper_connections)
+    assert all(layer.forward.__func__ is qwen4_exp_precision._decoder_layer_forward for layer in text.layers)
+    gated_delta_net, attention = text.layers[0].linear_attn, text.layers[1].self_attn
+    assert gated_delta_net.norm.forward.__func__ is qwen4_exp_precision._rms_norm_gated_forward
+    assert gated_delta_net.in_proj_b(torch.randn(2, 32).bfloat16()).dtype == torch.float32
+    assert attention.forward.__func__ is qwen4_exp_precision._attention_forward
+    assert not text.layers[0].ple.ple_embedding.ngram_embedding.weight.requires_grad
+    with pytest.raises(ValueError, match="hyper-connection layout"):
+        qwen4_exp_precision.apply_sampler_precision(nn.Sequential(nn.Linear(2, 2)))
+
+
+def test_qwen4_exp_reference_precision_keeps_the_fp64_math(monkeypatch):
+    """The patched forwards change only where rounding happens: in FP64 the loss and every gradient are Transformers'.
+
+    Transformers' RMSNorms and its torch delta rule compute in FP32 even for an FP64 model, so the two forwards' last-bit
+    differences become FP32 ulps there: about 1e-7 of each gradient, where a changed formula would move it by O(1)."""
+    model, cfg = _qwen4_exp_precision_model(monkeypatch, torch.float64)
+    aligned = deepcopy(model)
+    qwen4_exp_precision.apply_sampler_precision(aligned)
+    ids = torch.randint(4, cfg.vocab_size, (2, 24), generator=torch.Generator().manual_seed(1))
+    ids[0, 9] = cfg.eos_token_id
+    results = []
+    for candidate in (model, aligned):
+        loss = candidate(input_ids=ids, labels=ids, use_cache=False).loss
+        loss.backward()
+        results.append(
+            (loss.detach(), {name: p.grad for name, p in candidate.named_parameters() if p.grad is not None})
+        )
+    (loss, grads), (aligned_loss, aligned_grads) = results
+    assert torch.allclose(aligned_loss, loss, rtol=1e-9, atol=0)
+    assert aligned_grads.keys() == grads.keys()
+    for name, grad in grads.items():
+        assert (aligned_grads[name] - grad).norm() <= 1e-5 * grad.norm(), name
+
+
+def test_qwen4_exp_reference_follows_the_samplers_fp32_hyper_connections_beta_gated_norm_rope_and_output_gate(
+    monkeypatch,
+):
+    """Qwen3.8-Flash-Next's HF reference must round where vLLM's Qwen4Exp does: the hyper-connection SiLU, gated mix
+    and combine, the GatedDeltaNet beta and output norm, and the QSA rotary embedding and output gate each run in FP32
+    and round once (vLLM hc_silu / hc_gate_mix / hc_combine, fused_post_conv_prep, RMSNormGated, qsa_prepare and the
+    QSA kernel's gate epilogue), where Transformers rounds every intermediate to BF16."""
+    import torch.nn.functional as F
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as qwen4_exp
+
+    stock, cfg = _qwen4_exp_precision_model(monkeypatch, torch.bfloat16)
+    model = deepcopy(stock)
+    qwen4_exp_precision.apply_sampler_precision(model)
+    # Copies for the output-gate check below; the combine check replaces the layers' sublayers.
+    attention = deepcopy(model.model.layers[1].self_attn)
+    stock_attention = deepcopy(stock.model.layers[1].self_attn)
+    one_rounding = _glm5_next_reference_one_rounding
+    generator = torch.Generator().manual_seed(2)
+    hc, hidden = cfg.hc_count, cfg.hidden_size
+
+    def randn(*shape, scale=1.0):
+        return (torch.randn(*shape, generator=generator, dtype=torch.float64) * scale).bfloat16()
+
+    # The hyper-connection mix: silu(down(n) / hc) rounded once, then mean_s(sigmoid(up(.))_s * n_s) rounded once.
+    site, stock_site = model.model.layers[0].attn_hyper_connection, stock.model.layers[0].attn_hyper_connection
+    streams = randn(2, 16, hc * hidden, scale=2.0)
+    normed = site.hc_norm(streams)
+    lowrank = F.silu(site.input_mix_weight_down(normed).double() / hc).bfloat16()
+    gate = site.input_mix_weight_up(lowrank).double().unflatten(-1, (hc, hidden))
+    exact = (torch.sigmoid(gate) * normed.double().unflatten(-1, (hc, hidden))).mean(-2)
+    mixed, hyper_input, injection_weights = site(streams)
+    assert hyper_input is streams
+    assert one_rounding(mixed, exact) == 0
+    assert one_rounding(stock_site(streams)[0], exact) > 0
+    exact_weights = 2 * torch.sigmoid(site.block_inject_weight(normed).double() / hc)
+    assert injection_weights.dtype == torch.float32
+    assert torch.allclose(injection_weights.double(), exact_weights, rtol=1e-6, atol=0)
+
+    # Both combines X + y * 2 * sigmoid(l / hc) in FP32, rounded once, through the decoder layer.
+    attention_out, mlp_out = randn(2, 16, hidden), randn(2, 16, hidden)
+    for candidate in (model, stock):
+        layer = candidate.model.layers[1]
+        layer.self_attn = _glm5_next_reference_Fixed(attention_out, None)
+        layer.mlp = _glm5_next_reference_Fixed(mlp_out)
+
+    def combine(site, x, y):
+        weights = 2 * torch.sigmoid(site.block_inject_weight(site.hc_norm(x)).double() / hc)
+        exact = x.double().unflatten(-1, (hc, hidden)) + y.double().unsqueeze(-2) * weights.unsqueeze(-1)
+        return exact.flatten(-2)
+
+    layer = model.model.layers[1]
+    middle = combine(layer.attn_hyper_connection, streams, attention_out)
+    exact_out = combine(layer.mlp_hyper_connection, middle.bfloat16(), mlp_out)
+    out = layer(streams, position_embeddings=None)
+    assert out.dtype == torch.bfloat16
+    assert one_rounding(out, exact_out) == 0
+    assert one_rounding(stock.model.layers[1](streams, position_embeddings=None), exact_out) > 0
+
+    # The GatedDeltaNet beta gate: the sigmoid sees FP32 logits.
+    gated_delta_net = model.model.layers[0].linear_attn
+    assert gated_delta_net.in_proj_b(randn(4, hidden)).dtype == torch.float32
+    assert stock.model.layers[0].linear_attn.in_proj_b(randn(4, hidden)).dtype == torch.bfloat16
+
+    # The GatedDeltaNet output norm rmsnorm(x) * w * sigmoid(z): FP32 statistics, weight and gate, one rounding.
+    norm = gated_delta_net.norm
+    core, z = randn(64, cfg.linear_value_head_dim), randn(64, cfg.linear_value_head_dim, scale=2.0)
+    x = core.double()
+    exact = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon) * norm.weight.double()
+    exact = exact * torch.sigmoid(z.double())
+    assert one_rounding(norm(core, z), exact) == 0
+    assert one_rounding(qwen4_exp.Qwen4ExpTextRMSNormGated.forward(norm, core, z), exact) > 0
+
+    # QSA RoPE on the normalized BF16 heads against BF16 cos/sin, in FP32 and rounded once; the rest pass through.
+    heads = randn(2, 2, 16, cfg.head_dim)
+    positions = torch.arange(16).view(1, 1, -1).expand(3, 2, -1)
+    cos, sin = model.model.rotary_emb(heads, positions)
+    rotary = cos.shape[-1]
+    assert cos.dtype == torch.bfloat16 and rotary < cfg.head_dim
+    exact = qwen4_exp.apply_rotary_pos_emb(heads.double(), cos=cos.double(), sin=sin.double())
+    rotated = qwen4_exp_precision.fp32_rotary(heads, cos, sin)
+    assert one_rounding(rotated[..., :rotary], exact[..., :rotary]) == 0
+    assert torch.equal(rotated[..., rotary:], heads[..., rotary:])
+    assert one_rounding(qwen4_exp.apply_rotary_pos_emb(heads, cos=cos, sin=sin)[..., :rotary], exact[..., :rotary]) > 0
+
+    # The QSA sigmoid output gate: BF16 attention output times an FP32 sigmoid, one rounding. The attention kernel
+    # returns a fixed output and o_proj is dropped, so each forward returns its gated product.
+    core_attention = randn(2, 16, cfg.num_attention_heads, cfg.head_dim)
+    for module in (attention, stock_attention):
+        module.o_proj = nn.Identity()
+        module.config._attn_implementation = "eager"
+    monkeypatch.setattr(qwen4_exp, "eager_attention_forward", lambda *args, **kwargs: (core_attention, None))
+    hidden_states = randn(2, 16, hidden)
+    mask = torch.ones(16, 16, dtype=torch.bool).tril().expand(2, 1, 16, 16)
+    _, gate = torch.chunk(attention.q_proj(hidden_states).view(2, 16, -1, cfg.head_dim * 2), 2, dim=-1)
+    exact = core_attention.double().reshape(2, 16, -1) * torch.sigmoid(gate.reshape(2, 16, -1).double())
+    assert one_rounding(attention(hidden_states, (cos, sin), mask)[0], exact) == 0
+    assert one_rounding(stock_attention(hidden_states, (cos, sin), mask)[0], exact) > 0
 
 
 # GLM-5.3-Flash reference precision.

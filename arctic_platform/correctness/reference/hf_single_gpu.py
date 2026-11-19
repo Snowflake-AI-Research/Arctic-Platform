@@ -278,6 +278,8 @@ def build_engine(
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     cls = getattr(transformers, cfg.architectures[0])
     if getattr(cfg, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}:
+        # Qwen3.8-Flash-Next at the sampler's precision (FP32 hyper-connection mix and combine, GatedDeltaNet beta and
+        # output norm, QSA RoPE and output gate; reference/qwen4_exp_precision.py).
         from arctic_platform.correctness.reference.qwen4_reference import load_qwen4_reference
 
         model = load_qwen4_reference(
