@@ -673,6 +673,13 @@ def _result_from_output(
         "generation_len": len(choice.token_ids),
         "prefix_cache_len": int(num_cached) if num_cached is not None else 0,
     }
+    stats = getattr(final_output, "metrics", None)
+    if stats is not None:
+        # Same-host engine timestamps are monotonic; unset phases are 0.0.
+        offset = time.time() - time.monotonic()
+        for key in ("queued_ts", "scheduled_ts", "first_token_ts", "last_token_ts"):
+            if (value := getattr(stats, key)) > 0:
+                result[key] = value + offset
 
     spec = getattr(choice, "spec_decode_metrics", None)
     if spec is not None:
