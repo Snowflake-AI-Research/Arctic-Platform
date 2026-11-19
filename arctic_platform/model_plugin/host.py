@@ -83,7 +83,8 @@ def bind_layers(model: nn.Module, plugin: ModelPlugin, info: ParallelismInfo) ->
             raise ValueError(f"{path} declares layer type {layer_type!r} but its mixer does not accept it")
         binding.mixers[path] = (layer_type, mixer)
     bound = Counter(layer_type for layer_type, _ in binding.mixers.values())
-    expected = Counter(info.layer_types) + Counter(info.sublayers)
+    mixed = [layer_type for layer_type in info.layer_types if layer_type in mixers]  # "none" types have no module
+    expected = Counter(mixed) + Counter(info.sublayers)
     if bound != expected:
         raise ValueError(f"model has sequence-mixing modules {dict(bound)} but its config declares {dict(expected)}")
     if plugin.expert_layer is not None:

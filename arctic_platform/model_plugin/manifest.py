@@ -32,6 +32,7 @@ CONTRACT_VERSION = "1.1"
 
 PLATFORM_ATTENTION = "platform:attention"
 PLUGIN_MIXER = "plugin"
+NO_MIXER = "none"  # a layer type whose decoder layers have no sequence-mixing module (an MLP or MoE block only)
 
 
 class Capabilities(BaseModel):
@@ -108,9 +109,25 @@ class SamplerSpec(BaseModel):
 
 
 class CheckpointSpec(BaseModel):
-    """Checkpoint tensors the trainer does not use, such as multi-token-prediction heads or a vision tower."""
+    """How the plugin's Hugging Face checkpoints name their tensors, and which ones the trainer does not use."""
 
     model_config = ConfigDict(extra="forbid")
+
+    dtype: Literal["bfloat16", "float16", "float32"] | None = Field(
+        None,
+        description=(
+            "The dtype the trainer builds, trains and exports the model in. Required when the source "
+            "checkpoint stores quantized tensors (FP8, packed MXFP4), which the plugin's converter dequantizes; by "
+            "default, the floating dtype holding most of the checkpoint's elements."
+        ),
+    )
+    layer_pattern: str = Field(
+        r"^model\.layers\.(\d+)\.",
+        description=(
+            "Regex whose one group is the decoder-layer index of a checkpoint tensor name. Tensors that do not "
+            "match are outside decoder layers (layer -1)."
+        ),
+    )
 
     passthrough: list[str] = Field(
         default_factory=list,
@@ -122,12 +139,23 @@ class CheckpointSpec(BaseModel):
 
     @model_validator(mode="after")
     def _check(self) -> CheckpointSpec:
+        try:
+            groups = re.compile(self.layer_pattern).groups
+        except re.error as error:
+            raise ValueError(f"layer_pattern {self.layer_pattern!r} is not a regex: {error}") from error
+        if groups != 1:
+            raise ValueError(f"layer_pattern must have exactly one group, the layer index; it has {groups}")
         for pattern in self.passthrough:
             try:
                 re.compile(pattern)
             except re.error as error:
                 raise ValueError(f"passthrough pattern {pattern!r} is not a regex: {error}") from error
         return self
+
+    def layer_of(self, name: str) -> int:
+        """The decoder layer a checkpoint tensor belongs to, or -1 outside decoder layers."""
+        match = re.match(self.layer_pattern, name)
+        return int(match.group(1)) if match else -1
 
     def is_passthrough(self, name: str) -> bool:
         return any(re.match(pattern, name) for pattern in self.passthrough)
@@ -150,12 +178,13 @@ class PluginManifest(BaseModel):
 
     @model_validator(mode="after")
     def _check(self) -> PluginManifest:
-        for table, entries in (("layer_types", self.layer_types), ("sublayer_types", self.sublayer_types)):
+        for table, entries, allowed in (
+            ("layer_types", self.layer_types, (PLATFORM_ATTENTION, PLUGIN_MIXER, NO_MIXER)),
+            ("sublayer_types", self.sublayer_types, (PLATFORM_ATTENTION, PLUGIN_MIXER)),
+        ):
             for layer_type, source in entries.items():
-                if source not in (PLATFORM_ATTENTION, PLUGIN_MIXER):
-                    raise ValueError(
-                        f"{table}[{layer_type!r}] must be {PLATFORM_ATTENTION!r} or {PLUGIN_MIXER!r}, got {source!r}"
-                    )
+                if source not in allowed:
+                    raise ValueError(f"{table}[{layer_type!r}] must be one of {list(allowed)}, got {source!r}")
         shared = set(self.layer_types) & set(self.sublayer_types)
         if len(shared) > 0:
             raise ValueError(f"types {sorted(shared)} are in both layer_types and sublayer_types")

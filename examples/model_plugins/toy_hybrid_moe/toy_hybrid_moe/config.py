@@ -27,6 +27,8 @@ SHORT_CONV = "conv"
 VALUE_CONV = "value_conv"
 DENSE = "dense"
 MOE = "moe"
+# transformers' layer type for a decoder layer with no sequence mixer, only its MLP or MoE (same spelling as MOE).
+MLP_ONLY = MOE
 
 
 class ToyHybridMoEConfig(PretrainedConfig):
@@ -62,7 +64,7 @@ class ToyHybridMoEConfig(PretrainedConfig):
         mlp_types = list(mlp_types or [DENSE, MOE, MOE, DENSE])
         if len(layer_types) != len(mlp_types):
             raise ValueError(f"{len(layer_types)} layer_types but {len(mlp_types)} mlp_types")
-        kinds = {FULL_ATTENTION, GATED_RECURRENCE, SHORT_CONV}
+        kinds = {FULL_ATTENTION, GATED_RECURRENCE, SHORT_CONV, MLP_ONLY}
         unknown = (set(layer_types) - kinds) | (set(mlp_types) - {DENSE, MOE})
         if len(unknown) > 0:
             raise ValueError(f"unknown layer or mlp types: {sorted(unknown)}")

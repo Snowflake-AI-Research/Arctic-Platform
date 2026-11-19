@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Mapping
@@ -31,6 +32,7 @@ from pydantic import BaseModel
 from torch import nn
 
 from arctic_platform.model_plugin.experts import ExpertLayer
+from arctic_platform.model_plugin.manifest import NO_MIXER
 from arctic_platform.model_plugin.manifest import PLATFORM_ATTENTION
 from arctic_platform.model_plugin.manifest import PluginManifest
 from arctic_platform.model_plugin.mixers import AttentionMixer
@@ -84,6 +86,7 @@ class ModelPlugin:
     plugin declares none.
     ``validate(request, config, options)`` returns the reasons a job cannot run, for constraints the manifest cannot
     express (for example, an option that rules out sequence parallelism); admission reports them with its own.
+    ``passthrough(config)`` returns pass-through patterns that depend on the config, added to the manifest's.
     """
 
     manifest: PluginManifest
@@ -98,6 +101,13 @@ class ModelPlugin:
     register: Callable[[], None] | None = None
     options: type[BaseModel] | None = None
     validate: Validator | None = None
+    passthrough: Callable[[Any], Iterable[str]] | None = None
+
+    def is_passthrough(self, name: str, config: Any) -> bool:
+        """Whether checkpoint tensor ``name`` is passed through: the manifest's patterns, plus any this plugin
+        derives from ``config`` (for example MTP layers stored after the last decoder layer)."""
+        derived = self.passthrough(config) if self.passthrough is not None else ()
+        return self.manifest.checkpoint.is_passthrough(name) or any(re.match(pattern, name) for pattern in derived)
 
     def parse_options(self, options: Mapping[str, Any] | None = None) -> BaseModel | None:
         """A job's options as the plugin's options model. Unknown options are refused even if the options model would
@@ -117,6 +127,8 @@ class ModelPlugin:
         otherwise."""
         resolved: dict[str, Mixer] = {}
         for layer_type, source in (self.manifest.layer_types | self.manifest.sublayer_types).items():
+            if source == NO_MIXER:
+                continue
             if source == PLATFORM_ATTENTION:
                 resolved[layer_type] = AttentionMixer(layer_type)
                 continue

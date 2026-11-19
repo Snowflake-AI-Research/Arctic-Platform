@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .config import FULL_ATTENTION
+from .config import MLP_ONLY
 from .config import MOE
 from .config import SHORT_CONV
 
@@ -77,7 +78,9 @@ def reference_forward(model: nn.Module, input_ids: torch.Tensor) -> torch.Tensor
     for i in range(cfg.num_hidden_layers):
         pre = f"model.layers.{i}."
         x = _rms(h, p[pre + "input_norm.weight"], eps)
-        if cfg.layer_types[i] == FULL_ATTENTION:
+        if cfg.layer_types[i] == MLP_ONLY:
+            pass
+        elif cfg.layer_types[i] == FULL_ATTENTION:
             heads, kv_heads, dim = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
             q = _rope((x @ p[pre + "self_attn.q_proj.weight"].T).view(length, heads, dim), cfg.rope_theta)
             k = _rope((x @ p[pre + "self_attn.k_proj.weight"].T).view(length, kv_heads, dim), cfg.rope_theta)

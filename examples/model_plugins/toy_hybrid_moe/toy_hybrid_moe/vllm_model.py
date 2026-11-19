@@ -63,6 +63,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from .config import FULL_ATTENTION
+from .config import MLP_ONLY
 from .config import MOE
 from .config import SHORT_CONV
 from .config import ToyHybridMoEConfig
@@ -332,7 +333,9 @@ class _DecoderLayer(nn.Module):
         self.kind = config.layer_types[index]
         self.input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        if self.kind == FULL_ATTENTION:
+        if self.kind == MLP_ONLY:
+            pass
+        elif self.kind == FULL_ATTENTION:
             self.self_attn = ToyAttentionVLLM(config, cache_config, f"{prefix}.self_attn")
         elif self.kind == SHORT_CONV:
             self.conv = ToyShortConvVLLM(config, f"{prefix}.conv")
@@ -347,7 +350,7 @@ class _DecoderLayer(nn.Module):
         x = self.input_norm(h)
         if self.kind == FULL_ATTENTION:
             h = h + self.self_attn(positions, x)
-        else:
+        elif self.kind != MLP_ONLY:
             h = h + (self.conv(x) if self.kind == SHORT_CONV else self.recurrence(x))
         return h + self.mlp(self.post_norm(h))
 

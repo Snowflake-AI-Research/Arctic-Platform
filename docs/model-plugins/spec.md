@@ -177,7 +177,9 @@ reasoning_parser = "acme"                # tool_call_parser, model_runner ("v1" 
 chat_parser = "acme_hybrid.chat:AcmeChatParser"   # chat_parser ("module:Class")
 
 [checkpoint]
+layer_pattern = "^model\\.language_model\\.layers\\.(\\d+)\\."   # how checkpoint names give a decoder layer (§7.9)
 passthrough = ["mtp\\.", "model\\.visual\\."]  # tensors kept in checkpoints but not loaded (§7.9)
+dtype = "bfloat16"                       # train and export dtype; required for an FP8 source checkpoint
 
 [profiles.h200-training-full]            # recommended settings, shown to users of the model
 n_gpus = 16
@@ -193,12 +195,14 @@ max_num_seqs = 64
 |---|---|
 | `name` | MUST match `custom/<org>/<model>`. Unique per account. |
 | `contract` | MUST have the same major version as the platform's contract. A different major version is refused. |
-| `layer_types` | MUST list every value in your config's `layer_types`. Values are `platform:attention` or `plugin`. |
+| `layer_types` | MUST list every value in your config's `layer_types`. Values are `platform:attention`, `plugin`, or `none` for decoder layers with no sequence mixer (an MLP or MoE block only; transformers calls such a layer `moe`). |
 | `capabilities` | A job that needs an undeclared capability is rejected at admission. Declare only what passes conformance. |
 | `max_expert_parallel` | Only with `expert_parallel = true`. |
 | `sublayer_types` | MUST list every sub-layer type in `ParallelismInfo.sublayers`. Names MUST NOT repeat `layer_types`. |
 | `sampler` | Present exactly when `capabilities.sampling = true`. Its requirements are typed fields; there is no way to set environment variables. |
+| `checkpoint.layer_pattern` | Regex whose one group is a checkpoint tensor's decoder-layer index; default `^model\.layers\.(\d+)\.`. |
 | `checkpoint.passthrough` | Regexes, matched at the start of a tensor name, for checkpoint tensors the trainer does not load (§7.9). |
+| `checkpoint.dtype` | The dtype the model trains and exports in; required when the source checkpoint is quantized (§7.9). |
 | `profiles.*.inference` | Tunables only (`tensor_parallel_size`, `max_num_seqs`, `gpu_memory_utilization`, kernel flags, `max_model_len`); a `[sampler]` requirement there is refused. |
 
 **Layer type names.** Use names that transformers recognises: transformers 5.x validates `layer_types` against its
@@ -225,6 +229,7 @@ PLUGIN = ModelPlugin(
     register=register_config,               # e.g. AutoConfig.register(...)
     options=AcmeOptions,                    # pydantic model of job-time options; None if there are none
     validate=validate,                      # (request, config, options) -> reasons the job cannot run
+    passthrough=passthrough,                # config -> extra pass-through patterns (optional, §7.9)
 )
 ```
 
@@ -294,6 +299,7 @@ Whatever the policy, `mix`:
 - MUST restart all state (convolutions, recurrences, caches) at every boundary in `cu_seqlens`, which always describes the full, unsharded batch.
 - MUST compute exactly what `shard` describes, slicing per-head parameters or offsetting positions to match.
 - MUST NOT read tokens outside the tensors it is given, or assume it holds the first heads or the first tokens.
+- MAY return `(output, *extras)` and MAY take keyword `**state`: the policy exchanges only the positional tensors and `output`, and passes `state` in and `extras` out as computed. Use them for state one layer produces and later layers reuse, such as compressed keys or a sparse-attention top-k; carry it between layers in your model code, as layer outputs and inputs, so activation checkpointing saves and recomputes it correctly. State and extras are in the policy's own shard layout (under head-parallel, this rank's heads over the whole sequence), so the producing and consuming layers MUST use the same policy. A reduction across all heads, such as a top-k over every indexer head, cannot be computed from one rank's heads: give such layers a local-query or gather policy (`gather_sequence`).
 
 The `shard` argument's type is set by the layer's policy. Two policies ship today:
 
@@ -370,7 +376,7 @@ platform moves tokens. Model code never calls a collective and never tracks whic
 
 Your MoE module MUST:
 
-- have a `num_experts` attribute, and store routed expert weights **stacked with the expert index as dim 0** in the platform MoE layout: `w1` (gate) and `w3` (up) `[E, I, D]`, `w2` (down) `[E, D, I]`;
+- have a `num_experts` attribute, and store routed expert weights **stacked with the expert index as dim 0**, named in `StackedExpertLayer.expert_names`. The platform MoE layout is `w1` (gate) and `w3` (up) `[E, I, D]`, `w2` (down) `[E, D, I]`; a gateless expert (for example relu²) has only `w1` and `w2`;
 - route through one method, `route(tokens, routed=None, ...) -> (selected [N, top_k], ...)`, called once per forward on all of the layer's local tokens; it picks experts with `choose_experts(scores, top_k, routed)` and returns the selection first. Extra arguments are passed through (for example `input_ids` for a hash-routed layer); `routed` is the platform's to supply. Its forward calls `self.route(tokens)`, then `self.experts_core(tokens, selected, weights)`, and adds any shared expert;
 - be the only expert layer in its decoder layer;
 - implement `experts_core(tokens [N, D], selected [N, top_k], weights [N, top_k], *, shard: ExpertShard | None = None) -> [N, D]`: the summed contribution of the experts `shard` holds, where local expert `i` is global expert `shard.start + i`. With `shard=None` it holds them all.
@@ -451,8 +457,14 @@ has no `route(tokens, routed=None)`.
 
 On the sampler, routing is captured automatically when your vLLM model routes its experts through vLLM's fused MoE
 layer (`FusedMoEFactory`). A custom vLLM router MUST feed vLLM's routed-experts capture, or the manifest MUST declare
-`router_replay = false`. vLLM 0.33 captures routing only with its V2 model runner and prefix caching on; for a model
-with stateful layers that means "align"-mode state caching, which those layers must then support (§16).
+`router_replay = false`. vLLM 0.33 captures routing only with its V2 model runner and prefix caching on, so a sampler
+that offers router replay MUST declare `prefix_caching = true` and pass the sampler tier with it; the platform then
+launches router-replay jobs with both. For stateful layers, prefix caching means "align"-mode state caching: vLLM keeps
+state per block and copies it between blocks itself, so a layer reads and writes only each request's current block
+(`state_indices[:, 0]`) and resumes when `has_initial_states_p` is set. Without prefill checkpoints
+(`MambaBase.get_prefill_checkpoint_alignment`), a prompt that shares only part of a cached prompt resumes only from a
+state vLLM saved within the shared part, at a block boundary it wrote when its own chunk ended; with none, the prompt is
+recomputed.
 
 ### 7.8 Activation checkpointing
 
@@ -481,12 +493,14 @@ in it.
 
 Conversion and loading:
 
-- `convert_layer_to_hf(state, layer_idx, config)` receives one decoder layer's full tensors under trainer names and returns them under checkpoint names. It MAY rename, split, stack and reshape. `convert_layer_to_prime` is its exact inverse. Both receive the config, because reshaping often needs head counts the tensors don't carry.
+- `convert_layer_to_hf(state, layer_idx, config)` receives one decoder layer's full tensors under trainer names and returns them under checkpoint names. It MAY rename, split, stack and reshape. `convert_layer_to_prime` is its exact inverse. Both receive the config, because reshaping often needs head counts the tensors don't carry. Both are also called with `layer_idx = -1` for the tensors outside decoder layers (embeddings, final norm, head); don't index per-layer config lists with it, since Python reads `-1` as the last layer.
+- **Checkpoint naming.** Trainer names are always `model.layers.<i>.…`. Checkpoint names are your converters' choice; the manifest's `[checkpoint] layer_pattern` tells the platform which decoder layer a checkpoint tensor belongs to, for checkpoints such as `model.language_model.layers.<i>.…`, `backbone.layers.<i>.…` or prefix-less `layers.<i>.…`. Loading refuses names that look like decoder-layer tensors (`layers.<n>.`) but match no layer, since a wrong pattern would otherwise load the whole model as one group.
+- **Quantized source checkpoints.** A checkpoint that stores FP8 (or uint8-packed, such as MXFP4) tensors loads only with `[checkpoint] dtype` declared: `convert_layer_to_prime` dequantizes each layer, consuming its scale tensors, and the model trains and exports in that dtype. Exports never carry `quantization_config`. The trainer does not keep quantized weights (frozen FP8 bases are out of scope with LoRA, §13).
 - The platform loads a checkpoint **one decoder layer at a time**, reading only that layer's tensors from disk, so converters see one layer and peak extra memory is one layer. Every trainer tensor MUST be set and no checkpoint tensor may be left over.
 - The platform gathers ZeRO and expert shards before calling your converter on export, so converters always see full tensors.
-- **Pass-through tensors.** Checkpoint tensors your trainer does not use, such as multi-token-prediction heads or a vision tower when training text, are declared as regexes in the manifest's `[checkpoint] passthrough` (matched at the start of the name). They are not loaded, do not count toward the checkpoint's dtype, are copied unchanged into every exported checkpoint, and never reach the sampler. Any other checkpoint tensor the model does not account for is still refused.
+- **Pass-through tensors.** Checkpoint tensors your trainer does not use, such as multi-token-prediction heads or a vision tower when training text, are declared as regexes in the manifest's `[checkpoint] passthrough` (matched at the start of the name). They are not loaded, do not count toward the checkpoint's dtype, are copied unchanged into every exported checkpoint, and never reach the sampler. Patterns that depend on the config, such as MTP layers stored after the last decoder layer at `model.layers.{num_hidden_layers + k}`, come from the plugin's `passthrough(config)`. Any other checkpoint tensor the model does not account for is still refused.
 - Checkpoints the platform writes carry a **plugin stamp** in their safetensors metadata (`arctic_plugin`, `arctic_plugin_version`, `arctic_plugin_contract`). A checkpoint stamped by a different plugin is refused at load. A different version of the same plugin loads and is logged.
-- **Dtypes.** Store weights in the dtype you want served, usually bf16. The platform builds your model in the dtype that holds most of a checkpoint's elements before loading it, so a save and reload is exact. The trainer computes in the job's dtype and keeps fp32 master weights in the optimizer. Tensors that must stay fp32, such as routers or statistics, are marked `dtype="fp32"` (below); checkpoints and the weight stream then carry mixed dtypes.
+- **Dtypes.** Store weights in the dtype you want served, usually bf16. The platform builds your model in `[checkpoint] dtype` if declared, else in the dtype that holds most of a checkpoint's elements, before loading it, so a save and reload is exact. The trainer computes in the job's dtype and keeps fp32 master weights in the optimizer. Tensors that must stay fp32, such as routers or statistics, are marked `dtype="fp32"` (below); checkpoints and the weight stream then carry mixed dtypes.
 
 **Marks.** `mark(tensor_or_module, **properties)` is the one way to tell the platform how to treat a tensor. A mark on a
 module applies to all its tensors; a deeper module's, then the tensor's own, overrides it. Prefer marking modules: the
@@ -554,6 +568,7 @@ Every job is checked before GPUs are allocated. All failing reasons are reported
 | `options` | An option the plugin does not declare, a value its options model rejects, or a reason from the plugin's `validate` |
 | Sampler `tensor_parallel_size > 1`, `speculative_config`, `enable_prefix_caching` in the job's inference config | The matching `[sampler]` flag is not set |
 | Any `[sampler]` requirement in the job's inference config | Its value differs from the manifest's |
+| Sampling with `router_replay` | The sampler does not declare `prefix_caching`, the job turns prefix caching off, or the sampler requires the V1 model runner |
 
 **Launching the sampler.** Engine settings are the job's profile's `inference` defaults, overridden by the job's
 inference config (admission checks the two together), with the `[sampler]` requirements applied last
@@ -677,7 +692,7 @@ can prove every tensor the trainer streams has exactly one destination before an
 
 ## 12. Versioning and support
 
-- **Contract.** The platform supports plugins whose `contract` has its major version. Once 1.x is frozen, minor versions add optional fields and hooks only, and a major version change is announced in advance, with a migration guide. Until then, draft revisions may change interfaces: draft 1.1 makes the forward return hidden states (`compute_logits`) and moves routing out of model code (`route`, `choose_experts`), and adds the meta-device build (`ap_init_buffers`), `mark`, plugin options, sub-layers, typed sampler requirements and pass-through checkpoint tensors.
+- **Contract.** The platform supports plugins whose `contract` has its major version. Once 1.x is frozen, minor versions add optional fields and hooks only, and a major version change is announced in advance, with a migration guide. Until then, draft revisions may change interfaces: draft 1.1 makes the forward return hidden states (`compute_logits`) and moves routing out of model code (`route`, `choose_experts`), and adds the meta-device build (`ap_init_buffers`), `mark`, plugin options, sub-layers, `mix` extras for cross-layer state, mixer-less layer types, typed sampler requirements, checkpoint naming, quantized source checkpoints and pass-through checkpoint tensors.
 - **Runtime release.** A plugin is admitted against one runtime release and keeps running on it while that release is supported. Moving to a newer release re-runs conformance.
 - **Support window.** The number of runtime releases supported in parallel, and their deprecation notice, will be fixed before contract 1.0.
 - **Failure attribution.** A job that fails inside plugin code is reported as a plugin failure with the stack trace. Failures in platform code are the platform's. Conformance results define the supported envelope: a configuration outside the declared capabilities is rejected, not attempted.
@@ -799,5 +814,5 @@ The test suite also feeds conformance deliberately broken variants and checks th
 2. Which GPU tolerance policy suits RL customers best for sampler log-prob parity: a fixed bound, or calibration against a known-good model of similar size?
 3. Should `peft` (LoRA) get its own conformance tier in 1.0, including expert LoRA?
 4. Is a per-plugin `max_sequence_length` or memory profile needed in the manifest for admission, beyond `profiles`?
-5. vLLM 0.33 records routed experts only with prefix caching on, so a hybrid plugin's stateful vLLM layers must support "align"-mode state caching to offer router replay on generated tokens. Should admission reject `router_replay` unless `sampler.prefix_caching = true`, or should the platform capture routing another way?
+5. Should the contract ask stateful sampler layers for prefill checkpoints (`MambaBase.get_prefill_checkpoint_alignment`), so prompts that share only part of a cached prompt hit the cache (§7.7)?
 6. Should the plugin kit ship a local GPU smoke test (load in vLLM, sync weights, compare trainer and sampler log-probs) and let Arctic Platform's on-prem trainer run plugin models, so customers can test the GPU tiers before submitting?

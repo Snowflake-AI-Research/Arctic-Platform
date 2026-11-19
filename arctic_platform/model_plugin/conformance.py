@@ -67,12 +67,14 @@ from arctic_platform.model_plugin.plugin import load_plugin
 from arctic_platform.model_plugin.recompute import apply_activation_checkpointing
 from arctic_platform.model_plugin.weights import INDEX_FILE
 from arctic_platform.model_plugin.weights import STAMP_PLUGIN
+from arctic_platform.model_plugin.weights import _check_layer_pattern
+from arctic_platform.model_plugin.weights import _safetensors_dtype
 from arctic_platform.model_plugin.weights import checkpoint_files
 from arctic_platform.model_plugin.weights import checkpoint_stamp
 from arctic_platform.model_plugin.weights import iter_hf_weights
-from arctic_platform.model_plugin.weights import layer_index
 from arctic_platform.model_plugin.weights import load_hf_checkpoint
 from arctic_platform.model_plugin.weights import read_stamp
+from arctic_platform.model_plugin.weights import require_declared_dtype
 from arctic_platform.model_plugin.weights import save_hf_checkpoint
 
 
@@ -409,14 +411,18 @@ def check_weights_directory(plugin: ModelPlugin, path: str | Path) -> None:
     for file in set(files.values()):
         with safe_open(str(file), framework="pt") as f:
             for name in f.keys():
-                if plugin.manifest.checkpoint.is_passthrough(name):
+                if plugin.is_passthrough(name, config):
                     continue
-                shape = f.get_slice(name).get_shape()
-                by_layer.setdefault(layer_index(name), {})[name] = torch.empty(shape, device="meta")
+                header = f.get_slice(name)
+                layer = plugin.manifest.checkpoint.layer_of(name)
+                tensor = torch.empty(header.get_shape(), dtype=_safetensors_dtype(header.get_dtype()), device="meta")
+                by_layer.setdefault(layer, {})[name] = tensor
+    require_declared_dtype(plugin, path, {name for name in files if plugin.is_passthrough(name, config)})
+    _check_layer_pattern(by_layer.get(-1, {}))
     found: dict[str, tuple[int, ...]] = {}
     problems: list[str] = []
     for index, layer in sorted(by_layer.items()):
-        if index >= 0 and plugin.convert_layer_to_prime is not None:
+        if plugin.convert_layer_to_prime is not None:
             try:
                 layer = plugin.convert_layer_to_prime(layer, index, config)
             except ValueError as error:  # the converter's own shape and index checks

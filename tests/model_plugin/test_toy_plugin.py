@@ -283,6 +283,64 @@ def test_preparing_twice_wraps_routing_once():
     assert sorted(routing) == [1, 2]
 
 
+def test_layers_with_no_sequence_mixer_bind_and_parallelize():
+    spec = SPEC.model_copy(
+        update=dict(fixture=dict(SPEC.fixture, layer_types=["linear_attention", "moe", "conv", "full_attention"]))
+    )
+    for check in (conformance.check_static, conformance.check_reference_parity, conformance.check_packing):
+        check(PLUGIN, spec)
+    for mode in ("sp", "ep"):
+        conformance.check_parallel(TARGET, spec, mode, 2)
+
+
+class _Producer(torch.nn.Module):
+    """A core that also returns per-head state for a later layer: each head's mean over the whole sequence."""
+
+    def mix(self, u, *, cu_seqlens, shard=modeling.FULL_SHARD):
+        return u * 2, u.mean(dim=(0, 1, 3))
+
+
+class _Consumer(torch.nn.Module):
+    """A core that scales each head it holds by the producer's state for that head."""
+
+    def mix(self, u, *, cu_seqlens, shard=modeling.FULL_SHARD, head_means):
+        return u * head_means[None, None, :, None]
+
+
+def _layers(u, producer, consumer, cu_seqlens):
+    out, head_means = producer.mix(u, cu_seqlens=cu_seqlens)
+    return consumer.mix(out, cu_seqlens=cu_seqlens, head_means=head_means)
+
+
+def _state_worker(rank, init_file):
+    torch.distributed.init_process_group("gloo", init_method=f"file://{init_file}", world_size=2, rank=rank)
+    try:
+        from arctic_platform.model_plugin.parallel import head_parallel
+
+        torch.manual_seed(0)
+        full = torch.randn(1, 8, 4, 3)  # [1, T, H, D]
+        cu_seqlens = torch.tensor([0, 5, 8])
+        reference = full.clone().requires_grad_()
+        expected = _layers(reference, _Producer(), _Consumer(), cu_seqlens)
+        expected.square().sum().backward()
+
+        producer, consumer = _Producer(), _Consumer()
+        head_parallel(producer, torch.distributed.group.WORLD)
+        head_parallel(consumer, torch.distributed.group.WORLD)
+        mine = slice(rank * 4, (rank + 1) * 4)
+        local = full[:, mine].clone().requires_grad_()
+        out = _layers(local, producer, consumer, cu_seqlens)  # the state stays head-sharded between the layers
+        out.square().sum().backward()
+        assert torch.allclose(out, expected[:, mine])
+        assert torch.allclose(local.grad, reference.grad[:, mine])
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_head_parallel_layers_hand_state_to_later_layers(tmp_path):
+    torch.multiprocessing.spawn(_state_worker, args=(str(tmp_path / "rendezvous"),), nprocs=2)
+
+
 def test_recurrence_that_ignores_row_boundaries_fails_packing():
     real_mix = modeling.ToyRecurrence.mix
 
@@ -460,6 +518,124 @@ class TestCheckpointLayout(TestCasePlus):
         save_hf_checkpoint(model, plugin, config, exported)
         copied = load_file(str(exported / CHECKPOINT_FILE))["model.visual.patch.weight"]
         self.assertTrue(torch.equal(copied, extra["model.visual.patch.weight"]))
+
+    def test_checkpoints_may_name_layers_and_top_level_tensors_their_own_way(self):
+        from arctic_platform.model_plugin.manifest import CheckpointSpec
+
+        def to_hf(state, index, config):  # a VLM-style layout: everything but the head under model.language_model.
+            return {
+                name.replace("model.", "model.language_model.", 1): t
+                for name, t in PLUGIN.convert_layer_to_hf(state, index, config).items()
+            }
+
+        def to_prime(state, index, config):
+            return PLUGIN.convert_layer_to_prime(
+                {name.replace("model.language_model.", "model.", 1): t for name, t in state.items()}, index, config
+            )
+
+        seen: set[int] = set()
+
+        def recording_to_prime(state, index, config):
+            seen.add(index)
+            return to_prime(state, index, config)
+
+        # Without the pattern, the layer-looking names would load as one group outside every layer: refused.
+        unpatterned = dataclasses.replace(PLUGIN, convert_layer_to_hf=to_hf, convert_layer_to_prime=to_prime)
+        with self.assertRaisesRegex(ValueError, "do not match \\[checkpoint\\] layer_pattern"):
+            conformance.check_checkpoint_and_sync(unpatterned, SPEC)
+        checkpoint = CheckpointSpec(layer_pattern=r"^model\.language_model\.layers\.(\d+)\.")
+        plugin = dataclasses.replace(
+            PLUGIN,
+            manifest=PLUGIN.manifest.model_copy(update=dict(checkpoint=checkpoint)),
+            convert_layer_to_hf=to_hf,
+            convert_layer_to_prime=recording_to_prime,
+        )
+        conformance.check_checkpoint_and_sync(plugin, SPEC)
+        self.assertEqual(seen, {-1, *range(len(SPEC.fixture["layer_types"]))})  # loaded one decoder layer at a time
+        torch.manual_seed(0)
+        config = ToyHybridMoEConfig(**SPEC.fixture)
+        path = Path(self.get_auto_remove_tmp_dir_str())
+        save_hf_checkpoint(PLUGIN.build_model(config), plugin, config, path, max_shard_bytes=8192)
+        _save_tokenizer(path, config.vocab_size)
+        names = set(json.loads((path / "model.safetensors.index.json").read_text())["weight_map"])
+        self.assertIn("model.language_model.embed_tokens.weight", names)  # converted outside decoder layers too
+        self.assertIn("model.language_model.layers.1.mlp.gate.weight", names)
+        PLUGIN.register()
+        conformance.check_weights_directory(plugin, path)
+
+    def test_passthrough_patterns_can_depend_on_the_config(self):
+        from safetensors.torch import load_file
+        from safetensors.torch import save_file
+
+        torch.manual_seed(0)
+        config = ToyHybridMoEConfig(**SPEC.fixture)
+        source = Path(self.get_auto_remove_tmp_dir_str())
+        save_hf_checkpoint(PLUGIN.build_model(config), PLUGIN, config, source)
+        # An MTP layer stored right after the last decoder layer, as GLM checkpoints do.
+        mtp = {f"model.layers.{config.num_hidden_layers}.eh_proj.weight": torch.randn(4, 4)}
+        save_file(load_file(str(source / CHECKPOINT_FILE)) | mtp, str(source / CHECKPOINT_FILE))
+        with self.assertRaisesRegex(ValueError, "match no trainer tensor"):
+            load_hf_checkpoint(PLUGIN, source)
+        plugin = dataclasses.replace(PLUGIN, passthrough=lambda cfg: [rf"model\.layers\.{cfg.num_hidden_layers}\."])
+        _, model = load_hf_checkpoint(plugin, source)
+        exported = Path(self.get_auto_remove_tmp_dir_str())
+        save_hf_checkpoint(model, plugin, config, exported)
+        self.assertTrue(
+            torch.equal(load_file(str(exported / CHECKPOINT_FILE))[next(iter(mtp))], next(iter(mtp.values())))
+        )
+
+    def test_quantized_source_checkpoints_load_dequantized_and_export_unquantized(self):
+        from safetensors.torch import load_file
+        from safetensors.torch import save_file
+
+        from arctic_platform.model_plugin.manifest import CheckpointSpec
+
+        torch.manual_seed(0)
+        config = ToyHybridMoEConfig(**SPEC.fixture)
+        source = Path(self.get_auto_remove_tmp_dir_str())
+        save_hf_checkpoint(PLUGIN.build_model(config), PLUGIN, config, source)
+        # Quantize every projection to FP8 with a per-tensor scale, as an FP8 release would ship it.
+        tensors, dequantized = load_file(str(source / CHECKPOINT_FILE)), {}
+        for name in [n for n in tensors if n.endswith("_proj.weight")]:
+            scale = tensors[name].abs().amax() / 448.0
+            tensors[name] = (tensors[name] / scale).to(torch.float8_e4m3fn)
+            tensors[name.replace(".weight", ".weight_scale_inv")] = scale.reshape(1)
+            dequantized[name] = tensors[name].float() * scale
+        save_file(tensors, str(source / CHECKPOINT_FILE))
+        raw = json.loads((source / "config.json").read_text())
+        (source / "config.json").write_text(json.dumps(raw | {"quantization_config": {"quant_method": "fp8"}}))
+
+        def dequantize(state, index, config):
+            out = {}
+            for name, tensor in state.items():
+                if name.endswith("_scale_inv"):
+                    continue
+                if tensor.dtype == torch.float8_e4m3fn:
+                    tensor = tensor.float() * state[name.replace(".weight", ".weight_scale_inv")]
+                out[name] = tensor
+            return PLUGIN.convert_layer_to_prime(out, index, config)
+
+        with self.assertRaisesRegex(ValueError, "stores quantized tensors"):
+            load_hf_checkpoint(PLUGIN, source)
+        _save_tokenizer(source, config.vocab_size)
+        PLUGIN.register()
+        with self.assertRaisesRegex(ValueError, "stores quantized tensors"):
+            conformance.check_weights_directory(dataclasses.replace(PLUGIN, convert_layer_to_prime=dequantize), source)
+        manifest = PLUGIN.manifest.model_copy(update=dict(checkpoint=CheckpointSpec(dtype="bfloat16")))
+        plugin = dataclasses.replace(PLUGIN, manifest=manifest, convert_layer_to_prime=dequantize)
+        _, model = load_hf_checkpoint(plugin, source)
+        self.assertEqual(model.lm_head.weight.dtype, torch.bfloat16)
+        hf = dict(iter_hf_weights(model, plugin, for_sampler=False))
+        name = "model.layers.0.recurrence.out_proj.weight"
+        self.assertTrue(torch.equal(hf[name], dequantized[name].to(torch.bfloat16)))
+
+        exported = Path(self.get_auto_remove_tmp_dir_str())
+        save_hf_checkpoint(model, plugin, model.config, exported)
+        written = load_file(str(exported / CHECKPOINT_FILE))
+        self.assertFalse([n for n in written if n.endswith("_scale_inv")])
+        self.assertNotIn(torch.float8_e4m3fn, {t.dtype for t in written.values()})
+        self.assertNotIn("quantization_config", json.loads((exported / "config.json").read_text()))
+        conformance.check_weights_directory(plugin, source)  # FP8 shapes checked in their stored dtype
 
     def test_checkpoint_from_another_plugin_is_refused(self):
         path = self._weights_directory()

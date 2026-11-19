@@ -47,6 +47,7 @@ def test_toy_manifest_is_valid_and_on_contract():
         "full_attention": "platform:attention",
         "linear_attention": "plugin",
         "conv": "plugin",
+        "moe": "none",
     }
     assert PLUGIN.manifest.sublayer_types == {"value_conv": "plugin"}
 
@@ -55,12 +56,17 @@ def test_toy_manifest_is_valid_and_on_contract():
     "overrides, message",
     [
         (dict(name="toy-hybrid-moe"), "String should match pattern"),
-        (dict(layer_types={"full_attention": "vendor:attention"}), "must be 'platform:attention' or 'plugin'"),
+        (dict(layer_types={"full_attention": "vendor:attention"}), "must be one of"),
         (dict(sampler=None), "requires a [sampler] table"),
         (dict(capabilities=dict(expert_parallel=False, max_expert_parallel=2)), "requires expert_parallel"),
         (dict(capabilities=dict(training=False, sampling=False)), "training, sampling or both"),
         (dict(unknown_key=1), "Extra inputs are not permitted"),
         (dict(sublayer_types={"conv": "plugin"}), "in both layer_types and sublayer_types"),
+        (dict(sublayer_types={"k_conv": "none"}), "must be one of"),
+        (
+            dict(checkpoint=dict(layer_pattern=r"^model\.layers\."), sampler=PLUGIN.manifest.sampler.model_dump()),
+            "exactly one group",
+        ),
         (dict(profiles={"p": {"inference": {"tokenizer_mode": "slow"}}}), "sets sampler requirements"),
         (dict(sampler=dict(vllm_architecture="A", env={"X": "1"})), "Extra inputs are not permitted"),
     ],
@@ -138,8 +144,8 @@ def test_admission_accepts_what_the_manifest_and_config_support():
         (JobRequest(ep_size=8), "exceeds max_expert_parallel 4"),
         (JobRequest(peft=True), "does not declare peft"),
         (
-            JobRequest(job_type="sampling", inference=dict(enable_prefix_caching=True)),
-            "does not declare prefix_caching",
+            JobRequest(job_type="sampling", router_replay=True, inference=dict(enable_prefix_caching=0)),
+            "needs prefix caching on",
         ),
         (JobRequest(job_type="sampling", inference=dict(enforce_eager=False)), "the plugin requires True"),
         (JobRequest(job_type="sampling", inference=dict(model_runner="v2")), "set only by the plugin's manifest"),
@@ -200,7 +206,9 @@ def test_sampler_launch_applies_requirements_and_the_prefix_caching_rule():
 
     manifest = PLUGIN.manifest.model_copy(
         update=dict(
-            sampler=PLUGIN.manifest.sampler.model_copy(update=dict(model_runner="v2", reasoning_parser="toy")),
+            sampler=PLUGIN.manifest.sampler.model_copy(
+                update=dict(model_runner="v2", reasoning_parser="toy", prefix_caching=False)
+            ),
             profiles={"small": {"inference": {"max_num_seqs": 4, "tensor_parallel_size": 2}}},
         )
     )
@@ -217,7 +225,19 @@ def test_sampler_launch_applies_requirements_and_the_prefix_caching_rule():
     )
     assert launch.env == {"VLLM_USE_V2_MODEL_RUNNER": "1"}
     # vLLM turns prefix caching on by default; a sampler that does not declare it is launched with it off.
-    assert sampler_launch(PLUGIN, JobRequest(job_type="sampling")).engine_args["enable_prefix_caching"] is False
+    replay = sampler_launch(PLUGIN, JobRequest(job_type="sampling", router_replay=True))
+    assert replay.engine_args["enable_prefix_caching"] is True and replay.engine_args["enable_return_routed_experts"]
+    assert replay.env == {"VLLM_USE_V2_MODEL_RUNNER": "1"}
+
+
+def test_router_replay_capture_needs_a_sampler_that_declares_prefix_caching():
+    sampler = PLUGIN.manifest.sampler.model_copy(update=dict(prefix_caching=False))
+    plugin = dataclasses.replace(PLUGIN, manifest=PLUGIN.manifest.model_copy(update=dict(sampler=sampler)))
+    config = ToyHybridMoEConfig()
+    with pytest.raises(AdmissionError, match="router replay capture needs prefix caching"):
+        check_job_request(plugin, config, JobRequest(job_type="sampling", router_replay=True))
+    with pytest.raises(AdmissionError, match="does not declare prefix_caching"):
+        check_job_request(plugin, config, JobRequest(job_type="sampling", inference=dict(enable_prefix_caching=True)))
 
 
 def test_marks_resolve_outer_to_inner_and_feed_the_platform_attributes():

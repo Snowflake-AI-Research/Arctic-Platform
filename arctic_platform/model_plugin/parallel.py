@@ -96,7 +96,9 @@ def heads_to_seq(group, tensor: torch.Tensor) -> torch.Tensor:
 def head_parallel(module: nn.Module, group) -> None:
     """Run ``module.mix`` head-parallel across ``group``.
 
-    ``mix(*tensors, cu_seqlens, shard)`` takes head-major ``[1, T, H_i, D_i]`` tensors and returns one. After this
+    ``mix(*tensors, cu_seqlens, shard, **state)`` takes head-major ``[1, T, H_i, D_i]`` tensors and returns one, or
+    ``(output, *extras)``. ``state`` (from an earlier layer) goes in and ``extras`` (for later layers) come out
+    unexchanged: both describe this rank's heads over the whole sequence. After this
     call each rank passes its sequence shard; the wrapper exchanges it for the full sequence of ``1/sp`` of the
     heads, calls the original ``mix`` with that rank's :class:`HeadShard`, and exchanges the result back.
     ``cu_seqlens`` must already describe the full, unsharded sequence.
@@ -104,9 +106,12 @@ def head_parallel(module: nn.Module, group) -> None:
     core: Callable[..., torch.Tensor] = getattr(module, "mix")
     shard = HeadShard(group_rank(group), group_size(group))
 
-    def mix(*tensors: torch.Tensor, cu_seqlens: torch.Tensor, shard: HeadShard = shard) -> torch.Tensor:
+    def mix(*tensors: torch.Tensor, cu_seqlens: torch.Tensor, shard: HeadShard = shard, **state):
         local = [seq_to_heads(group, tensor) for tensor in tensors]
-        return heads_to_seq(group, core(*local, cu_seqlens=cu_seqlens, shard=shard))
+        out = core(*local, cu_seqlens=cu_seqlens, shard=shard, **state)
+        if isinstance(out, tuple):  # (output, *extras): state for later layers, like ``state``, is not exchanged
+            return (heads_to_seq(group, out[0]), *out[1:])
+        return heads_to_seq(group, out)
 
     setattr(module, "mix", mix)
 

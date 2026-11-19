@@ -23,10 +23,11 @@ same weights:
 - after a weight sync of new weights through ``load_weights``, prompt log-probs of the new weights;
 - the experts vLLM routed each prompt token to, which router replay feeds back to the trainer.
 
-vLLM 0.33 records routed experts only with its V2 model runner and prefix caching on, which for a hybrid model
-means "align"-mode state caching that this plugin's stateful layers do not implement (its manifest declares
-``prefix_caching = false``). The routing check therefore runs its own engine with both on, on prompts that never hit
-the cache, and checks prompt tokens only: a prefill does not depend on cached state.
+With prefix caching on, vLLM caches a hybrid model's state per 16-token block ("align" mode) and copies it between
+blocks itself, so the stateful layers read and write only each request's current block. A separate engine checks that
+prefix-cache hits resume the state correctly, over prompts spanning several blocks and decodes crossing block
+boundaries. vLLM 0.33 records routed experts only with its V2 model runner and prefix caching on, so the routing check
+uses such an engine, over prompt and generated tokens.
 """
 
 import os
@@ -157,35 +158,93 @@ def served(request, tmp_path_factory):
     torch.cuda.empty_cache()
 
 
-@pytest.fixture(scope="module")
-def capturing(tmp_path_factory):
-    """A tensor-parallel-1 engine that records routed experts, on the same weights as the trainer model."""
+def _engine(tmp_path_factory, name: str, env: dict[str, str], **engine_args):
+    """A trainer model and a vLLM engine serving its checkpoint with ``engine_args``, under environment ``env``."""
     from toy_hybrid_moe import PLUGIN
     from vllm import LLM
 
     from .test_toy_plugin import _save_tokenizer
 
     config, model = _trainer(seed=0)
-    path = Path(tmp_path_factory.mktemp("toy-capture"))
+    path = Path(tmp_path_factory.mktemp(name))
     save_hf_checkpoint(model, PLUGIN, config, path)
     _save_tokenizer(path, config.vocab_size)
-    previous = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    previous = {key: os.environ.get(key) for key in env}
+    os.environ.update(env)
     try:
-        llm = LLM(
-            model=str(path),
-            dtype="float32",
-            enforce_eager=True,
-            gpu_memory_utilization=0.15,
-            max_model_len=256,
-            enable_return_routed_experts=True,
-            enable_prefix_caching=True,
-        )
+        llm = LLM(model=str(path), dtype="float32", enforce_eager=True, gpu_memory_utilization=0.15, **engine_args)
     finally:
-        if previous is None:
-            os.environ.pop("VLLM_USE_V2_MODEL_RUNNER")
-        else:
-            os.environ["VLLM_USE_V2_MODEL_RUNNER"] = previous
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key)
+            else:
+                os.environ[key] = value
+    return config, model, llm
+
+
+@pytest.fixture(scope="module", params=[1, 2], ids=["tp1", "tp2"])
+def caching(request, tmp_path_factory):
+    """An engine with prefix caching on, which vLLM runs in align mode for this hybrid model."""
+    if torch.cuda.device_count() < request.param:
+        pytest.skip(f"needs {request.param} GPUs")
+    # The V2 model runner, as router-replay jobs run it (vLLM 0.33 records routed experts only there).
+    config, model, llm = _engine(
+        tmp_path_factory,
+        f"toy-cache-tp{request.param}",
+        {"VLLM_USE_V2_MODEL_RUNNER": "1"},
+        tensor_parallel_size=request.param,
+        max_model_len=256,
+        enable_prefix_caching=True,
+    )
+    yield config, model, llm
+    del llm
+    torch.cuda.empty_cache()
+
+
+def _generated_logprobs(llm, prompts, tokens: int):
+    from vllm import SamplingParams
+
+    outputs = llm.generate(
+        [{"prompt_token_ids": prompt} for prompt in prompts],
+        SamplingParams(max_tokens=tokens, min_tokens=tokens, temperature=0, logprobs=0),
+        use_tqdm=False,
+    )
+    return outputs, [
+        torch.tensor([entry[token].logprob for entry, token in zip(out.outputs[0].logprobs, out.outputs[0].token_ids)])
+        for out in outputs
+    ]
+
+
+@require_torch_gpu
+def test_prefix_cache_hits_resume_recurrent_and_convolution_state(caching):
+    _, model, llm = caching
+    base = [(11 * j) % 500 + 2 for j in range(50)]  # three full 16-token blocks and a partial one
+    _generated_logprobs(llm, [base], 4)  # fills the cache
+    prompts = [base, base[:35] + [(7 * j) % 500 + 2 for j in range(15)], base + [(5 * j) % 500 + 2 for j in range(20)]]
+    outputs, sampled = _generated_logprobs(llm, prompts, 20)  # decodes cross block boundaries
+    # The repeat and the extension resume from the state cached at the warm prompt's last full block (token 48). The
+    # prompt diverging at token 35 has no saved state at token 32 to resume from: the layers write no prefill
+    # checkpoints (MambaBase.get_prefill_checkpoint_alignment), so it is recomputed, and must still be right.
+    cached = [out.num_cached_tokens for out in outputs]
+    assert cached[0] >= 48 and cached[2] >= 48, cached
+    sequences = [prompt + list(out.outputs[0].token_ids) for prompt, out in zip(prompts, outputs)]
+    expected = _trainer_logprobs(model, sequences)
+    for index, (prompt, got) in enumerate(zip(prompts, sampled)):
+        _close(got, expected[index][len(prompt) - 1 :], f"cached prompt {index}")
+
+
+@pytest.fixture(scope="module")
+def capturing(tmp_path_factory):
+    """A tensor-parallel-1 engine that records routed experts, on the same weights as the trainer model. vLLM 0.33
+    records them only with its V2 model runner and prefix caching on."""
+    config, model, llm = _engine(
+        tmp_path_factory,
+        "toy-capture",
+        {"VLLM_USE_V2_MODEL_RUNNER": "1"},
+        max_model_len=256,
+        enable_return_routed_experts=True,
+        enable_prefix_caching=True,
+    )
     yield config, model, llm
     del llm
     torch.cuda.empty_cache()
@@ -223,13 +282,15 @@ def test_routed_experts_match_trainer_routing(capturing):
     config, model, llm = capturing
     outputs = llm.generate(
         [{"prompt_token_ids": prompt} for prompt in PROMPTS],
-        SamplingParams(max_tokens=1, temperature=0),
+        SamplingParams(max_tokens=DECODE_TOKENS, min_tokens=DECODE_TOKENS, temperature=0),
         use_tqdm=False,
     )
     moe_layers = [index for index, kind in enumerate(config.mlp_types) if kind == "moe"]
     for index, (prompt, out) in enumerate(zip(PROMPTS, outputs)):
-        captured = torch.as_tensor(out.outputs[0].routed_experts)[: len(prompt)]
-        input_ids, position_ids = pack_sequences([torch.tensor(prompt, device="cuda")])
+        # The last generated token is sampled but never run through the model, so it has no routing.
+        sequence = prompt + list(out.outputs[0].token_ids)[:-1]
+        captured = torch.as_tensor(out.outputs[0].routed_experts)[: len(sequence)]
+        input_ids, position_ids = pack_sequences([torch.tensor(sequence, device="cuda")])
         with torch.no_grad():
             _, routing = forward(model, input_ids, position_ids, return_routing=True)
         for layer in moe_layers:

@@ -353,10 +353,11 @@ _MIXER_CLASS: dict[str, type[nn.Module]] = {
 class ToyDecoderLayer(nn.Module):
     def __init__(self, config: ToyHybridMoEConfig, options: ToyOptions, layer_idx: int):
         super().__init__()
-        self.mixer_name = _MIXER_ATTRIBUTE[config.layer_types[layer_idx]]
+        self.mixer_name = _MIXER_ATTRIBUTE.get(config.layer_types[layer_idx])  # None for an MLP-only layer
         self.input_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        setattr(self, self.mixer_name, _MIXER_CLASS[config.layer_types[layer_idx]](config, options))
+        if self.mixer_name is not None:
+            setattr(self, self.mixer_name, _MIXER_CLASS[config.layer_types[layer_idx]](config, options))
         self.mlp = (
             ToyMoE(config)
             if config.mlp_types[layer_idx] == MOE
@@ -364,7 +365,8 @@ class ToyDecoderLayer(nn.Module):
         )
 
     def forward(self, h: torch.Tensor, position_ids: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
-        h = h + getattr(self, self.mixer_name)(self.input_norm(h), position_ids, cu_seqlens)
+        if self.mixer_name is not None:
+            h = h + getattr(self, self.mixer_name)(self.input_norm(h), position_ids, cu_seqlens)
         return h + self.mlp(self.post_norm(h))
 
 

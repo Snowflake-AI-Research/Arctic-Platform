@@ -41,7 +41,8 @@ def sampler_launch(plugin: ModelPlugin, request: JobRequest) -> SamplerLaunch:
 
     Prefix caching is on only when the manifest declares the sampler correct with it, because vLLM turns it on by
     default, and for a model with stateful layers that silently switches state caching to a mode those layers may
-    not implement.
+    not implement. A router-replay job also records routed experts, which vLLM 0.33 does only with prefix caching and
+    its V2 model runner (admission checks both are allowed).
     """
     sampler = plugin.manifest.sampler
     if sampler is None:
@@ -52,5 +53,8 @@ def sampler_launch(plugin: ModelPlugin, request: JobRequest) -> SamplerLaunch:
     chat_parser = requirements.pop("chat_parser", None)
     args.update(requirements)
     args["enable_prefix_caching"] = sampler.prefix_caching and bool(args.get("enable_prefix_caching", True))
+    if request.router_replay:  # vLLM 0.33 records routed experts only with prefix caching and its V2 model runner
+        args["enable_return_routed_experts"] = True
+        model_runner = "v2"
     env = {} if model_runner is None else {"VLLM_USE_V2_MODEL_RUNNER": "1" if model_runner == "v2" else "0"}
     return SamplerLaunch(engine_args=args, env=env, chat_parser=chat_parser)

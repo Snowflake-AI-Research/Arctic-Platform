@@ -80,7 +80,11 @@ def check_job_request(plugin: ModelPlugin, config: Any, request: JobRequest) -> 
         else:
             mixers = plugin.layer_mixers()
             sublayer_types = {layer_type for layer_type, count in info.sublayers.items() if count > 0}
-            for layer_type in sorted(set(info.layer_types) | sublayer_types):
+            declared = plugin.manifest.layer_types | plugin.manifest.sublayer_types
+            used = set(info.layer_types) | sublayer_types
+            for layer_type in sorted(used - set(declared)):
+                reasons.append(f"the config uses layer type {layer_type!r}, which the manifest does not declare")
+            for layer_type in sorted(used & set(mixers)):  # "none" layer types have no mixer to validate
                 try:
                     mixers[layer_type].validate_sp(info, request.sp_size)
                 except ValueError as error:
@@ -111,6 +115,14 @@ def check_job_request(plugin: ModelPlugin, config: Any, request: JobRequest) -> 
             reasons.append("the sampler does not declare speculative_decoding")
         if inference.get("enable_prefix_caching") and not sampler.prefix_caching:
             reasons.append("the sampler does not declare prefix_caching")
+        if request.router_replay:
+            # vLLM 0.33 records routed experts only with prefix caching on and its V2 model runner.
+            if not sampler.prefix_caching or not inference.get("enable_prefix_caching", True):
+                reasons.append(
+                    "router replay capture needs prefix caching on, and a sampler that declares prefix_caching"
+                )
+            if sampler.model_runner == "v1":
+                reasons.append("router replay capture needs vLLM's V2 model runner; the sampler requires v1")
         for name in MANIFEST_ONLY:
             if name in inference:
                 reasons.append(f"{name} is set only by the plugin's manifest")

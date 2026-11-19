@@ -9,6 +9,7 @@ hf_model_types = ["toy_hybrid_moe"]
 full_attention = "platform:attention"   # the platform's attention core, sequence-parallel and fused on GPU
 linear_attention = "plugin"             # gated recurrence: parallel.GatedRecurrenceMixer (head-parallel policy)
 conv = "plugin"                         # short convolution: parallel.ShortConvMixer (halo-exchange policy)
+moe = "none"                            # decoder layers with no sequence mixer, only an MLP or MoE block
 
 [sublayer_types]
 value_conv = "plugin"                   # short convolution on attention values, inside attention layers (halo policy)
@@ -28,7 +29,7 @@ vllm_architecture = "ToyHybridMoEForCausalLM"
 vllm_plugin = "toy_hybrid_moe.vllm_model:register"
 tensor_parallel = true
 speculative_decoding = false
-prefix_caching = false
+prefix_caching = true                    # stateful layers resume from vLLM's per-block state (align mode)
 enforce_eager = true
 
 [profiles.h200-training-full]

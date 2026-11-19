@@ -33,6 +33,7 @@ from torch import nn
 from arctic_platform.model_plugin.build import build
 from arctic_platform.model_plugin.build import materialize
 from arctic_platform.model_plugin.experts import EXPERT_PARALLEL_SIZE_ATTR
+from arctic_platform.model_plugin.manifest import CheckpointSpec
 from arctic_platform.model_plugin.marks import weight_sync_skipped
 from arctic_platform.model_plugin.plugin import ModelPlugin
 
@@ -46,7 +47,10 @@ STAMP_CONTRACT = "arctic_plugin_contract"
 
 logger = logging.getLogger(__name__)
 
-_LAYER = re.compile(r"^model\.layers\.(\d+)\.")
+# Trainer names always follow the default checkpoint naming, model.layers.<i>.
+_LAYER = re.compile(CheckpointSpec.model_fields["layer_pattern"].default)
+# A checkpoint name that looks like it belongs to a decoder layer.
+_LOOKS_LAYERED = re.compile(r"(^|\.)layers\.\d+\.")
 
 
 def layer_index(name: str) -> int:
@@ -84,7 +88,7 @@ def iter_hf_weights(
         groups.setdefault(layer_index(name), {})[name] = _full_tensor(tensor, ep_group)
     for index in sorted(groups, key=lambda i: (i < 0, i)):
         layer = groups[index]
-        if index >= 0 and plugin.convert_layer_to_hf is not None:
+        if plugin.convert_layer_to_hf is not None:  # index -1: tensors outside decoder layers
             layer = plugin.convert_layer_to_hf(layer, index, model.config)
         yield from layer.items()
 
@@ -94,7 +98,7 @@ def _load_layers(model: nn.Module, plugin: ModelPlugin, layers: Iterable[tuple[i
     expected = set(model.state_dict())
     loaded: set[str] = set()
     for index, layer in layers:
-        if index >= 0 and plugin.convert_layer_to_prime is not None:
+        if plugin.convert_layer_to_prime is not None:
             layer = plugin.convert_layer_to_prime(layer, index, model.config)
         unexpected = set(layer) - expected
         if len(unexpected) > 0:
@@ -110,7 +114,7 @@ def load_hf_weights(model: nn.Module, plugin: ModelPlugin, weights: Iterable[tup
     """Load Hugging Face-named tensors into a freshly built, unsharded trainer model. Every tensor must be set."""
     groups: dict[int, dict[str, torch.Tensor]] = {}
     for name, tensor in weights:
-        groups.setdefault(layer_index(name), {})[name] = tensor
+        groups.setdefault(plugin.manifest.checkpoint.layer_of(name), {})[name] = tensor
     _load_layers(model, plugin, groups.items())
 
 
@@ -123,6 +127,21 @@ def checkpoint_stamp(plugin: ModelPlugin) -> dict[str, str]:
         STAMP_VERSION: manifest.version,
         STAMP_CONTRACT: manifest.contract,
     }
+
+
+def _safetensors_dtype(name: str) -> torch.dtype:
+    """A safetensors header dtype as a torch dtype, for meta-device shape checks."""
+    return {
+        "F8_E4M3": torch.float8_e4m3fn,
+        "F8_E5M2": torch.float8_e5m2,
+        "F8_E8M0": torch.float8_e8m0fnu,
+        "U8": torch.uint8,
+        "I8": torch.int8,
+        "I32": torch.int32,
+        "I64": torch.int64,
+        "BOOL": torch.bool,
+        **_SAFETENSORS_FLOAT_DTYPES,
+    }.get(name, torch.float32)
 
 
 def _shards(weights: dict[str, torch.Tensor], max_shard_bytes: int | None) -> list[dict[str, torch.Tensor]]:
@@ -217,15 +236,17 @@ def read_stamp(path: str | Path) -> dict[str, str]:
 
 
 def iter_checkpoint_layers(
-    path: str | Path, skip: set[str] = frozenset()
+    path: str | Path, layer_of, skip: set[str] = frozenset()
 ) -> Iterator[tuple[int, dict[str, torch.Tensor]]]:
-    """A checkpoint's tensors one decoder layer at a time, reading only that layer from disk, except ``skip``."""
+    """A checkpoint's tensors one decoder layer at a time, reading only that layer from disk, except ``skip``.
+    ``layer_of(name)`` gives a checkpoint name's decoder layer, or -1."""
     from safetensors import safe_open
 
     by_layer: dict[int, dict[str, Path]] = {}
     for name, file in checkpoint_files(path).items():
         if name not in skip:
-            by_layer.setdefault(layer_index(name), {})[name] = file
+            by_layer.setdefault(layer_of(name), {})[name] = file
+    _check_layer_pattern(by_layer.get(-1, {}))
     with ExitStack() as stack:
         handles: dict[Path, Any] = {}
         for index in sorted(by_layer, key=lambda i: (i < 0, i)):
@@ -237,12 +258,51 @@ def iter_checkpoint_layers(
             yield index, layer
 
 
+# Safetensors dtypes of quantized storage: FP8 codes and FP8 scales (MXFP4 packs its codes in uint8 with E8M0 scales).
+_QUANTIZED_DTYPES = {"F8_E4M3", "F8_E5M2", "F8_E8M0"}
+
 _SAFETENSORS_FLOAT_DTYPES = {
     "F64": torch.float64,
     "F32": torch.float32,
     "F16": torch.float16,
     "BF16": torch.bfloat16,
 }
+
+
+def _check_layer_pattern(outside: Iterable[str]) -> None:
+    """Refuse decoder-layer-looking names outside every decoder layer: a layer_pattern that does not match the
+    checkpoint would otherwise load the whole model as one group, and the converter would see no layer index."""
+    layered = sorted(name for name in outside if _LOOKS_LAYERED.search(name))
+    if len(layered) > 0:
+        raise ValueError(
+            f"checkpoint tensors {layered[:3]} look like decoder-layer tensors but do not match [checkpoint] "
+            "layer_pattern; declare the checkpoint's layer naming, or pass them through"
+        )
+
+
+def require_declared_dtype(plugin: ModelPlugin, path: str | Path, skip: set[str]) -> None:
+    """Refuse a quantized source checkpoint unless the manifest declares the dtype to train in."""
+    if plugin.manifest.checkpoint.dtype is not None:
+        return
+    quantized = _quantized_tensors(path, skip)
+    if len(quantized) > 0:
+        raise ValueError(
+            f"{path} stores quantized tensors ({quantized[:3]}...); declare [checkpoint] dtype for the model to "
+            "train in, and dequantize them in convert_layer_to_prime"
+        )
+
+
+def _quantized_tensors(path: str | Path, skip: set[str]) -> list[str]:
+    from safetensors import safe_open
+
+    found, by_file = [], {}
+    for name, file in checkpoint_files(path).items():
+        if name not in skip:
+            by_file.setdefault(file, []).append(name)
+    for file, names in by_file.items():
+        with safe_open(str(file), framework="pt") as f:
+            found += [name for name in names if f.get_slice(name).get_dtype() in _QUANTIZED_DTYPES]
+    return found
 
 
 def checkpoint_dtype(path: str | Path, skip: set[str] = frozenset()) -> torch.dtype | None:
@@ -289,12 +349,17 @@ def load_hf_checkpoint(
         )
     config = plugin.config_class.from_pretrained(path)
     passthrough = {
-        name: str(file)
-        for name, file in checkpoint_files(path).items()
-        if plugin.manifest.checkpoint.is_passthrough(name)
+        name: str(file) for name, file in checkpoint_files(path).items() if plugin.is_passthrough(name, config)
     }
-    dtype = checkpoint_dtype(path, skip=set(passthrough))  # a large pass-through tower must not set the model's dtype
+    require_declared_dtype(plugin, path, set(passthrough))
+    declared = plugin.manifest.checkpoint.dtype
+    if declared is not None:
+        # The trainer holds dequantized weights, so the config must not claim quantized ones (exports included).
+        config.__dict__.pop("quantization_config", None)
+    # A large pass-through tower must not set the model's dtype.
+    dtype = getattr(torch, declared) if declared is not None else checkpoint_dtype(path, skip=set(passthrough))
     model = materialize(build(plugin, config, options, meta=True), device, dtype)
-    _load_layers(model, plugin, iter_checkpoint_layers(path, skip=set(passthrough)))
+    layers = iter_checkpoint_layers(path, plugin.manifest.checkpoint.layer_of, skip=set(passthrough))
+    _load_layers(model, plugin, layers)
     setattr(model, PASSTHROUGH_ATTR, passthrough)
     return config, model
