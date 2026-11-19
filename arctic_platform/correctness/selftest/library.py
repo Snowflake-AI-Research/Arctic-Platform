@@ -1375,6 +1375,149 @@ def test_participation_gemma_image_modules_are_inactive_only_when_a_text_step_ne
     assert record["parameters"]["model.vision_tower.weight"]["state"] == "missing"
 
 
+def _composite_decoder_model():
+    """The shape of Arctic Platform's Qwen3.5-MoE: get_decoder() is the body that holds visual and language_model."""
+    import torch
+
+    class Tower(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.patch_embed = torch.nn.Module()
+            self.patch_embed.proj = torch.nn.Linear(3, 3, bias=False)
+            self.merger = torch.nn.Linear(3, 3, bias=False)
+
+        def forward(self, pixels):
+            return self.merger(self.patch_embed.proj(pixels))
+
+    class LanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = torch.nn.Linear(3, 3, bias=False)
+            self.unused = torch.nn.Linear(3, 3, bias=False)
+
+        def forward(self, value):
+            return self.layer(value)
+
+    class CausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.visual = Tower()
+            self.model.language_model = LanguageModel()
+            self.lm_head = torch.nn.Linear(3, 3, bias=False)
+
+        def get_decoder(self):
+            return self.model
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+        def forward(self, value):
+            return self.lm_head(self.model.language_model(value))
+
+    torch.manual_seed(0)
+    return CausalLM()
+
+
+def test_participation_composite_decoder_excuses_only_its_uncalled_vision_tower():
+    """Arctic Platform's Qwen3.5-MoE (the qwen3_5_moe loader, Qwen3.6-35B-A3B) returns its composite body from
+    get_decoder(), so the decoder's parameters include the vision tower's. A text-only step never calls the tower: it
+    is inactive on every rank, and the decoder's own parameters and any tower parameter it shares keep the check."""
+    from types import SimpleNamespace
+
+    import torch
+    from transformers import Qwen3_5MoeConfig
+
+    from arctic_platform.correctness.harness.optimizer import ParticipationCapture
+    from arctic_platform.correctness.harness.optimizer import WorkerParticipation
+    from arctic_platform.correctness.harness.optimizer import merge_worker_receipts
+    from arctic_platform.correctness.harness.optimizer import validate_participation
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeForCausalLM,
+    )
+
+    # The class the qwen3_5_moe loader builds for a composite checkpoint, without weights: the capture arms every
+    # tower parameter, and only those, with the forward-hook evidence.
+    text = dict(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_conv_kernel_dim=2,
+        moe_intermediate_size=8,
+        shared_expert_intermediate_size=8,
+        num_experts=4,
+        num_experts_per_tok=2,
+        layer_types=["linear_attention", "full_attention"],
+        pad_token_id=0,
+    )
+    vision = dict(depth=1, hidden_size=16, num_heads=2, intermediate_size=16, out_hidden_size=16)
+    config = Qwen3_5MoeConfig(text_config=text, vision_config=vision)
+    config.use_grouped_mm = False
+    config._attn_implementation = "sdpa"
+    with torch.device("meta"):
+        arctic = Qwen3_5MoeForCausalLM(config)
+    decoder = arctic.get_decoder()
+    assert decoder.visual is arctic.model.visual and decoder.language_model is arctic.model.language_model
+    tower = {name for name, parameter in arctic.named_parameters() if name.startswith("model.visual.")}
+    with ParticipationCapture(arctic, decoder=decoder, head=arctic.get_output_embeddings()) as capture:
+        assert tower and set(capture.candidates) == tower
+        assert {capture.candidates[name]["kind"] for name in tower} == {"text-decoder-bypass"}
+        assert {capture.candidates[name]["module"] for name in tower} == {"model.visual"}
+
+    # The participation worker resolves the decoder and head as on the target; two ranks, one text-only step.
+    receipts = []
+    for rank in range(2):
+        model = _composite_decoder_model()
+        del model.model.language_model.unused
+        worker = SimpleNamespace(_engine=SimpleNamespace(module=model, global_steps=0), rank=rank, job_id="cpu-child")
+        participation = WorkerParticipation(worker)
+        try:
+            model(torch.ones(2, 3)).sum().backward()
+            worker._engine.global_steps = 1
+            receipts.append(participation.finish())
+        finally:
+            participation.close()
+    merged = merge_worker_receipts(receipts, job_id="cpu-child", world_size=2)["parameters"]
+    for name in ("model.visual.patch_embed.proj.weight", "model.visual.merger.weight"):
+        assert merged[name]["state"] == "inactive"
+        assert merged[name]["evidence"]["module"] == "model.visual" and merged[name]["evidence"]["calls"] == 0
+    assert merged["model.language_model.layer.weight"]["state"] == merged["lm_head.weight"]["state"] == "active"
+
+    def step(model, *, call_tower=False):
+        with ParticipationCapture(model, decoder=model.get_decoder(), head=model.get_output_embeddings()) as capture:
+            value = torch.ones(2, 3)
+            if call_tower:
+                model.model.visual(value).detach()
+            model(value).sum().backward()
+            return capture.result()
+
+    # A decoder parameter without a gradient is never excused, the composite's tower beside it notwithstanding.
+    record = step(_composite_decoder_model())
+    assert record["parameters"]["model.visual.merger.weight"]["state"] == "inactive"
+    with pytest.raises(ValueError, match="unexpected missing gradient for model.language_model.unused.weight"):
+        validate_participation(record)
+    # A tower parameter the language model also holds makes the tower part of the text path.
+    tied = _composite_decoder_model()
+    tied.model.language_model.unused.weight = tied.model.visual.merger.weight
+    assert step(tied)["parameters"]["model.visual.patch_embed.proj.weight"]["state"] == "missing"
+    # So does the tower module registered inside the language model under another name.
+    nested = _composite_decoder_model()
+    del nested.model.language_model.unused
+    nested.model.language_model.vision = nested.model.visual
+    assert step(nested)["parameters"]["model.visual.patch_embed.proj.weight"]["state"] == "missing"
+    # A tower the step calls is not excused by its missing gradient.
+    called = _composite_decoder_model()
+    del called.model.language_model.unused
+    assert step(called, call_tower=True)["parameters"]["model.visual.merger.weight"]["state"] == "missing"
+
+
 @contextlib.contextmanager
 def _single_rank_gloo(tmp_path):
     import torch.distributed as dist
@@ -24828,6 +24971,7 @@ _SELFTEST_GROUPS = {
         "test_participation_requires_complete_matching_inventory_and_independent_inactivity",
         "test_participation_observes_autograd_and_integer_outputs_without_inventing_zero_gradients",
         "test_participation_gemma_image_modules_are_inactive_only_when_a_text_step_never_calls_them",
+        "test_participation_composite_decoder_excuses_only_its_uncalled_vision_tower",
         "test_config_tolerance_calibrated_gate_rounds_up_and_has_a_one_millithreshold_floor",
         "test_names_qwen35_moe_norms_align_across_fused_and_prime_layouts",
         "test_names_equal_checkpoint_aliases_collapse_without_losing_coverage",

@@ -1314,7 +1314,8 @@ PARTICIPATION_SCHEMA = "trainable-parameter-participation-v1"
 # The image modules of the composite checkpoints the catalog trains on text, named as children of the base model:
 # Qwen's ``visual``, Gemma 3's ``vision_tower`` and ``multi_modal_projector``, Gemma 4's ``vision_tower`` and
 # ``embed_vision``. The Hugging Face base model calls them only for pixel inputs, so a text-only step leaves them
-# without a gradient. They count as inactive only with a forward hook's proof that no call reached them.
+# without a gradient. They count as inactive only with a forward hook's proof that no call reached them and when no
+# parameter of theirs is one the decoder or head holds elsewhere (_text_path_parameters).
 TEXT_DECODER_BYPASS_MODULES = frozenset({"visual", "vision_tower", "multi_modal_projector", "embed_vision"})
 
 
@@ -1623,6 +1624,47 @@ def participating_parameters(model) -> dict:
     }
 
 
+def _text_path_parameters(model, roots) -> set[int]:
+    """The ids of the parameters the decoder and head hold, apart from the image modules a composite decoder holds.
+
+    Hugging Face's ``get_decoder()`` returns the language model, beside which the image modules sit. Arctic Platform's
+    Qwen3.5-MoE returns its composite body instead (``Qwen3_5MoeVLMModel``: ``visual`` and ``language_model``), whose
+    parameters include every tower parameter. The walk follows every registered path of the model's module tree, not
+    only the first one per module, and leaves out below a root only a path that ``_arm`` takes for an image module
+    (normalized to one of TEXT_DECODER_BYPASS_MODULES), never a root itself. A parameter that any other module of the
+    decoder or head also holds, tied or shared, therefore stays a decoder parameter. A root the walk does not reach
+    counts with all its parameters.
+    """
+    roots = {id(root): root for root in roots}
+    held, reached, expanded = set(), set(), set()
+    stack = [("", model, False)]  # (normalized path, module, below a root)
+    while stack:
+        name, module, inside = stack.pop()
+        if id(module) in roots:
+            inside = True
+            reached.add(id(module))
+        elif inside and name in TEXT_DECODER_BYPASS_MODULES:
+            continue
+        if inside and name:
+            # Below a path naming more than containers, no path normalizes to an image module's one-segment name.
+            held.update(id(parameter) for parameter in module.parameters())
+            continue
+        if (id(module), inside, bool(name)) in expanded:
+            continue
+        expanded.add((id(module), inside, bool(name)))
+        if inside:
+            held.update(id(parameter) for parameter in module._parameters.values() if parameter is not None)
+        stack.extend(
+            (normalize(f"{name}.{child_name}" if name else child_name), child, inside)
+            for child_name, child in module._modules.items()
+            if child is not None
+        )
+    for key, root in roots.items():
+        if key not in reached:
+            held.update(id(parameter) for parameter in root.parameters())
+    return held
+
+
 def _integer_only(value) -> bool:
     """An integer selector's output: integer tensors (or a nonempty tuple/list of them) that carry no autograd."""
     if isinstance(value, torch.Tensor):
@@ -1674,11 +1716,7 @@ class ParticipationCapture:
     def _arm(self, model, *, decoder, head):
         import torch
 
-        reachable = (
-            {id(parameter) for module in (decoder, head) for parameter in module.parameters()}
-            if decoder is not None and head is not None
-            else None
-        )
+        reachable = _text_path_parameters(model, (decoder, head)) if decoder is not None and head is not None else None
         for name, parameter in self.parameters.items():
             self.handles.append(parameter.register_hook(self._backward_hook(name)))
         for layout in self.dense_shards.values():
