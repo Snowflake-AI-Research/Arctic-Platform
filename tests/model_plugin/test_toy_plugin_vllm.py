@@ -39,6 +39,7 @@ import torch
 from arctic_platform.model_plugin.host import forward
 from arctic_platform.model_plugin.host import next_token_labels
 from arctic_platform.model_plugin.host import pack_sequences
+from arctic_platform.model_plugin.host import prepare_model
 from arctic_platform.model_plugin.host import token_logprobs
 from arctic_platform.model_plugin.weights import iter_hf_weights
 from arctic_platform.model_plugin.weights import save_hf_checkpoint
@@ -78,7 +79,9 @@ def _trainer(seed: int):
 
     torch.manual_seed(seed)
     config = ToyHybridMoEConfig(**CONFIG)
-    return config, PLUGIN.build_model(config).float().cuda().eval()
+    model = PLUGIN.build_model(config, None).float().cuda().eval()
+    prepare_model(model, PLUGIN, config)  # installs the platform's routing, which the routing check reads back
+    return config, model
 
 
 def _trainer_logprobs(model, sequences: list[list[int]]) -> list[torch.Tensor]:

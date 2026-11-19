@@ -78,6 +78,9 @@ class ExpertLayer(Protocol):
     modules that follow the ``experts_core`` contract; write your own only for a different dispatch policy.
     """
 
+    route_method: str
+    """The module method that routes tokens, ``route(tokens, routed=None) -> (selected, ...)``."""
+
     def is_instance(self, module: nn.Module) -> bool: ...
 
     def num_experts(self, module: nn.Module) -> int: ...
@@ -134,6 +137,7 @@ class StackedExpertLayer:
 
     module_class: type[nn.Module] = nn.Module
     expert_names: tuple[str, ...] = ()
+    route_method: str = "route"
 
     def __init__(self, module_class: type[nn.Module] | None = None, expert_names: tuple[str, ...] | None = None):
         if module_class is not None:

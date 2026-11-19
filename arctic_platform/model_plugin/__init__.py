@@ -69,6 +69,7 @@ from arctic_platform.model_plugin.plugin import load_plugin
 from arctic_platform.model_plugin.plugin import plugin_for_model_type
 from arctic_platform.model_plugin.recompute import apply_activation_checkpointing
 from arctic_platform.model_plugin.recompute import in_recompute
+from arctic_platform.model_plugin.routing import choose_experts
 from arctic_platform.model_plugin.sampler import SamplerLaunch
 from arctic_platform.model_plugin.sampler import sampler_launch
 
@@ -81,6 +82,7 @@ __all__ = [
     "Capabilities",
     "cast_model",
     "check_job_request",
+    "choose_experts",
     "combine_tokens",
     "compute_logits",
     "CONTRACT_VERSION",

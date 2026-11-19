@@ -146,9 +146,12 @@ class TierResult:
 
 
 def build_fixture(plugin: ModelPlugin, spec: ConformanceSpec, device: Device = "cpu") -> tuple[Any, nn.Module]:
+    """The fixture config and model, prepared as the platform runs it (routing installed, no parallelism)."""
     torch.manual_seed(spec.seed)
     config = plugin.config_class(**spec.fixture)
-    return config, cast_model(build(plugin, config, spec.options), torch.float32).to(device)
+    model = cast_model(build(plugin, config, spec.options), torch.float32).to(device)
+    prepare_model(model, plugin, config)
+    return config, model
 
 
 def fixture_sequences(
@@ -406,6 +409,8 @@ def check_weights_directory(plugin: ModelPlugin, path: str | Path) -> None:
     for file in set(files.values()):
         with safe_open(str(file), framework="pt") as f:
             for name in f.keys():
+                if plugin.manifest.checkpoint.is_passthrough(name):
+                    continue
                 shape = f.get_slice(name).get_shape()
                 by_layer.setdefault(layer_index(name), {})[name] = torch.empty(shape, device="meta")
     found: dict[str, tuple[int, ...]] = {}

@@ -21,6 +21,7 @@ order inside its DeepSpeed workers.
 
 from __future__ import annotations
 
+import inspect
 from collections import Counter
 from dataclasses import dataclass
 from dataclasses import field
@@ -39,15 +40,24 @@ from arctic_platform.model_plugin.parallel import group_size
 from arctic_platform.model_plugin.parallel import shard_sequence
 from arctic_platform.model_plugin.plugin import ModelPlugin
 from arctic_platform.model_plugin.plugin import ParallelismInfo
+from arctic_platform.model_plugin.routing import ROUTING_TAPE_ATTR
+from arctic_platform.model_plugin.routing import RoutingTape
+from arctic_platform.model_plugin.routing import install_routing
+from arctic_platform.model_plugin.weights import layer_index
 
 
 @dataclass
 class LayerBinding:
-    """Which mixer runs each sequence-mixing module, and which modules are expert layers."""
+    """Which mixer runs each sequence-mixing module, and which modules are expert layers (path -> decoder layer)."""
 
     info: ParallelismInfo
     mixers: dict[str, tuple[str, Mixer]] = field(default_factory=dict)
-    experts: list[str] = field(default_factory=list)
+    experts: dict[str, int] = field(default_factory=dict)
+
+
+def _accepts_routed(method) -> bool:
+    parameters = inspect.signature(method).parameters.values()
+    return any(p.name == "routed" or p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters)
 
 
 def bind_layers(model: nn.Module, plugin: ModelPlugin, info: ParallelismInfo) -> LayerBinding:
@@ -77,10 +87,23 @@ def bind_layers(model: nn.Module, plugin: ModelPlugin, info: ParallelismInfo) ->
     if bound != expected:
         raise ValueError(f"model has sequence-mixing modules {dict(bound)} but its config declares {dict(expected)}")
     if plugin.expert_layer is not None:
-        binding.experts = [path for path, module in model.named_modules() if plugin.expert_layer.is_instance(module)]
-    if len(binding.experts) != len(info.moe_layers):
+        method = getattr(plugin.expert_layer, "route_method", "route")
+        for path, module in model.named_modules():
+            if not plugin.expert_layer.is_instance(module):
+                continue
+            route = getattr(module, method, None)
+            if route is None or not _accepts_routed(route):
+                raise ValueError(
+                    f"{type(module).__name__} has no {method}(tokens, routed=None); MoE modules must route through it"
+                    " so the platform can replay and recompute routing"
+                )
+            binding.experts[path] = layer_index(f"{path}.")
+            if binding.experts[path] < 0:
+                raise ValueError(f"expert layer {path} is not inside a decoder layer model.layers.<i>")
+    if sorted(binding.experts.values()) != sorted(info.moe_layers):
         raise ValueError(
-            f"model has {len(binding.experts)} expert layers but its config declares {len(info.moe_layers)}"
+            f"model has expert layers in decoder layers {sorted(binding.experts.values())} but its config declares"
+            f" {list(info.moe_layers)}"
         )
     return binding
 
@@ -94,7 +117,8 @@ def prepare_model(
     ep_group=None,
     ep_group_name: str | None = None,
 ) -> LayerBinding:
-    """Bind the model's layers and apply the requested sequence and expert parallelism.
+    """Bind the model's layers, install platform routing on its expert layers, and apply the requested sequence and
+    expert parallelism. Call it on every model the platform runs, with or without parallelism.
 
     Expert parameters are tagged for DeepSpeed's expert-data-parallel gradient reduction under ``ep_group_name``,
     by default ``ep_size_<ep>``, the name DeepSpeed registers an expert-parallel degree under. Run the model under
@@ -103,6 +127,10 @@ def prepare_model(
     info = plugin.parallelism(config)
     binding = bind_layers(model, plugin, info)
     modules = dict(model.named_modules())
+    tape = getattr(model, ROUTING_TAPE_ATTR, None) or RoutingTape()
+    setattr(model, ROUTING_TAPE_ATTR, tape)
+    for path, index in binding.experts.items():
+        install_routing(modules[path], index, tape, getattr(plugin.expert_layer, "route_method", "route"))
 
     sp_size = group_size(sp_group)
     if sp_size > 1:
@@ -160,20 +188,27 @@ def forward(
 ):
     """Run a packed ``[1, T]`` batch, passing each rank its sequence shard and the full sequence's boundaries.
 
-    Returns the model's final hidden states ``[1, T_local, D]``, with the routing when ``return_routing``; turn them
-    into log-probabilities with :func:`token_logprobs`, or into logits with :func:`compute_logits`.
+    ``routed_experts`` maps a decoder layer to the sampler's ``[T, top_k]`` expert ids, replayed by that layer's
+    router (``ROUTER_REPLAY_FRESH`` entries route freshly). Returns the model's final hidden states
+    ``[1, T_local, D]``, and with ``return_routing`` also the ``[T_local, top_k]`` experts each expert layer chose;
+    turn hidden states into log-probabilities with :func:`token_logprobs`, or into logits with :func:`compute_logits`.
     """
+    tape = getattr(getattr(model, "module", model), ROUTING_TAPE_ATTR, None)
+    if tape is None and (routed_experts is not None or return_routing):
+        raise ValueError("routing replay and readout need a model prepared with prepare_model")
     cu_seqlens = cu_seqlens_from_position_ids(position_ids)
-    local_routes = None
-    if routed_experts is not None:
-        local_routes = {layer: shard_sequence(route, sp_group, dim=0) for layer, route in routed_experts.items()}
-    return model(
-        shard_sequence(input_ids, sp_group),
-        shard_sequence(position_ids, sp_group),
-        cu_seqlens=cu_seqlens,
-        routed_experts=local_routes,
-        return_routing=return_routing,
-    )
+    if tape is not None:
+        tape.replay = {layer: shard_sequence(ids, sp_group, dim=0) for layer, ids in (routed_experts or {}).items()}
+        tape.readout = {}
+    try:
+        hidden = model(
+            shard_sequence(input_ids, sp_group), shard_sequence(position_ids, sp_group), cu_seqlens=cu_seqlens
+        )
+        routing = tape.readout if tape is not None else None
+    finally:
+        if tape is not None:
+            tape.replay, tape.readout = {}, None
+    return (hidden, routing) if return_routing else hidden
 
 
 def next_token_labels(input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:

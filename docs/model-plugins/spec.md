@@ -176,6 +176,9 @@ tokenizer_mode = "auto"                  # optional requirements: tokenizer_mode
 reasoning_parser = "acme"                # tool_call_parser, model_runner ("v1" or "v2"), and
 chat_parser = "acme_hybrid.chat:AcmeChatParser"   # chat_parser ("module:Class")
 
+[checkpoint]
+passthrough = ["mtp\\.", "model\\.visual\\."]  # tensors kept in checkpoints but not loaded (§7.9)
+
 [profiles.h200-training-full]            # recommended settings, shown to users of the model
 n_gpus = 16
 sp_size = 4
@@ -195,6 +198,7 @@ max_num_seqs = 64
 | `max_expert_parallel` | Only with `expert_parallel = true`. |
 | `sublayer_types` | MUST list every sub-layer type in `ParallelismInfo.sublayers`. Names MUST NOT repeat `layer_types`. |
 | `sampler` | Present exactly when `capabilities.sampling = true`. Its requirements are typed fields; there is no way to set environment variables. |
+| `checkpoint.passthrough` | Regexes, matched at the start of a tensor name, for checkpoint tensors the trainer does not load (§7.9). |
 | `profiles.*.inference` | Tunables only (`tensor_parallel_size`, `max_num_seqs`, `gpu_memory_utilization`, kernel flags, `max_model_len`); a `[sampler]` requirement there is refused. |
 
 **Layer type names.** Use names that transformers recognises: transformers 5.x validates `layer_types` against its
@@ -236,11 +240,11 @@ with its own reasons, before any GPU is allocated.
 |---|---|
 | Config | The model MUST keep its config as `model.config`. |
 | Names | Decoder layer `i`'s parameters and buffers MUST be under `model.layers.<i>.`. Embeddings, final norm and head live outside. |
-| Forward | `model(input_ids, position_ids, *, cu_seqlens, routed_experts=None, return_routing=False)` returns the final hidden states `[1, T_local, D]`, or `(hidden, routing)` when `return_routing`. |
+| Forward | `model(input_ids, position_ids, *, cu_seqlens)` returns the final hidden states `[1, T_local, D]`. |
 | Logits | The platform turns hidden states into log-probabilities a chunk of tokens at a time, recomputing each chunk in backward: full logits of a 256K-token row over a 152K vocabulary would take ~159 GB. It calls `model.compute_logits(hidden_chunk)` if defined, else `model.lm_head(hidden_chunk)`. Override it for output transforms such as muP output scaling or logit softcapping. |
 | Meta-device build | The platform builds the model on the meta device and allocates it with `to_empty`. A module whose buffers are not in the checkpoint (a rotary `inv_freq`, counters) MUST implement `ap_init_buffers()`, which recomputes them; the platform calls it on every module after `to_empty`. |
 | Inputs | `input_ids` and `position_ids` are this rank's `[1, T_local]` shard of a packed batch. `cu_seqlens` describes the full batch. |
-| Routing | `routed_experts` and `routing` map a decoder layer index to `[T_local, top_k]` expert ids for each expert layer. |
+| Routing | Model code never carries routing. Each MoE module routes through its `route` method (§7.6); the platform replays and collects routing there, by decoder-layer index. |
 | No distributed code | The model MUST NOT call `torch.distributed`. Use the collectives the API provides. |
 | Structure from config | Layer count and layer kinds MUST come from the config, so one plugin serves every size of the family. |
 | Recomputable layers | Each decoder layer MUST give the same result when it is run again in backward (§7.8). |
@@ -367,15 +371,22 @@ platform moves tokens. Model code never calls a collective and never tracks whic
 Your MoE module MUST:
 
 - have a `num_experts` attribute, and store routed expert weights **stacked with the expert index as dim 0** in the platform MoE layout: `w1` (gate) and `w3` (up) `[E, I, D]`, `w2` (down) `[E, D, I]`;
-- route token by token in its forward, then call `self.experts_core(tokens, selected, weights)` and add any shared expert;
+- route through one method, `route(tokens, routed=None, ...) -> (selected [N, top_k], ...)`, called once per forward on all of the layer's local tokens; it picks experts with `choose_experts(scores, top_k, routed)` and returns the selection first. Extra arguments are passed through (for example `input_ids` for a hash-routed layer); `routed` is the platform's to supply. Its forward calls `self.route(tokens)`, then `self.experts_core(tokens, selected, weights)`, and adds any shared expert;
+- be the only expert layer in its decoder layer;
 - implement `experts_core(tokens [N, D], selected [N, top_k], weights [N, top_k], *, shard: ExpertShard | None = None) -> [N, D]`: the summed contribution of the experts `shard` holds, where local expert `i` is global expert `shard.start + i`. With `shard=None` it holds them all.
 
 ```python
-def forward(self, x, routed=None):
+def forward(self, x):
     tokens = x.reshape(-1, x.shape[-1])
-    selected, weights = self.route(tokens, routed)            # token-wise; honours router replay
+    selected, weights = self.route(tokens)                    # the platform supplies `routed` when replaying
     out = self.experts_core(tokens, selected, weights) + self.shared_expert(tokens)
-    return out.view_as(x), selected
+    return out.view_as(x)
+
+def route(self, tokens, routed=None):
+    scores = torch.softmax(self.gate(tokens.float()), dim=-1)
+    selected = choose_experts(scores, self.top_k, routed)      # replayed ids win; -1 entries route freshly
+    weights = scores.gather(1, selected)
+    return selected, weights / weights.sum(-1, keepdim=True)
 
 def experts_core(self, tokens, selected, weights, *, shard=None):
     shard = shard or ExpertShard.full(self.num_experts)
@@ -432,11 +443,11 @@ carries its own small MoE so that it runs on CPU.
 ### 7.7 Router replay
 
 During RL the sampler records, for every token and expert layer, the experts it chose. The trainer then replays
-them so both compute the same function. Your router MUST:
-
-- use `routed_experts[layer]` when given, gathering the gate weights of those experts instead of choosing its own;
-- route a token whose id is `ROUTER_REPLAY_FRESH` (`-1`) with its own choice, which happens when a capture is missing;
-- return the experts it used when `return_routing=True`.
+them so both compute the same function. The platform wraps each MoE module's `route` method
+(`StackedExpertLayer.route_method`, default `"route"`) and passes the sampler's ids for that layer as `routed`; a
+token whose id is `ROUTER_REPLAY_FRESH` (`-1`, no capture) is routed by the module's own choice. `choose_experts`
+implements both. The platform also reads back the experts every layer chose. Binding fails if a claimed MoE module
+has no `route(tokens, routed=None)`.
 
 On the sampler, routing is captured automatically when your vLLM model routes its experts through vLLM's fused MoE
 layer (`FusedMoEFactory`). A custom vLLM router MUST feed vLLM's routed-experts capture, or the manifest MUST declare
@@ -451,6 +462,7 @@ layer's inputs and runs the layer again during backward. Your layers therefore r
 - A layer's forward MUST be a function of its inputs and weights. Recompute reruns the sequence and expert collectives, which is supported.
 - Side effects, such as counting tokens per expert or updating running statistics, MUST run only on the first pass: guard them with `if not in_recompute()`.
 - Randomness, such as dropout, MUST draw the same values on recompute. PyTorch's checkpoint restores the RNG state for you.
+- **Routing is replayed, not recomputed.** Nondeterministic kernels (split-K matmuls, all-to-all reductions) can perturb router scores in the last bits, so a recomputed `topk` could pick other experts: a `CheckpointError`, or silently wrong gradients. The platform records the experts each `route` call chose in that checkpointed call's own frame and passes them as `routed` on its recompute, so pending forwards and gradient accumulation never consume another forward's routing. This covers SFT, RL without replay, and fresh (`-1`) tokens.
 
 The `activation_checkpointing` conformance tier compares outputs, gradients **and buffers** with and without
 checkpointing, so a side effect that runs twice fails it.
@@ -472,6 +484,7 @@ Conversion and loading:
 - `convert_layer_to_hf(state, layer_idx, config)` receives one decoder layer's full tensors under trainer names and returns them under checkpoint names. It MAY rename, split, stack and reshape. `convert_layer_to_prime` is its exact inverse. Both receive the config, because reshaping often needs head counts the tensors don't carry.
 - The platform loads a checkpoint **one decoder layer at a time**, reading only that layer's tensors from disk, so converters see one layer and peak extra memory is one layer. Every trainer tensor MUST be set and no checkpoint tensor may be left over.
 - The platform gathers ZeRO and expert shards before calling your converter on export, so converters always see full tensors.
+- **Pass-through tensors.** Checkpoint tensors your trainer does not use, such as multi-token-prediction heads or a vision tower when training text, are declared as regexes in the manifest's `[checkpoint] passthrough` (matched at the start of the name). They are not loaded, do not count toward the checkpoint's dtype, are copied unchanged into every exported checkpoint, and never reach the sampler. Any other checkpoint tensor the model does not account for is still refused.
 - Checkpoints the platform writes carry a **plugin stamp** in their safetensors metadata (`arctic_plugin`, `arctic_plugin_version`, `arctic_plugin_contract`). A checkpoint stamped by a different plugin is refused at load. A different version of the same plugin loads and is logged.
 - **Dtypes.** Store weights in the dtype you want served, usually bf16. The platform builds your model in the dtype that holds most of a checkpoint's elements before loading it, so a save and reload is exact. The trainer computes in the job's dtype and keeps fp32 master weights in the optimizer. Tensors that must stay fp32, such as routers or statistics, are marked `dtype="fp32"` (below); checkpoints and the weight stream then carry mixed dtypes.
 
@@ -664,7 +677,7 @@ can prove every tensor the trainer streams has exactly one destination before an
 
 ## 12. Versioning and support
 
-- **Contract.** The platform supports plugins whose `contract` has its major version. Once 1.x is frozen, minor versions add optional fields and hooks only, and a major version change is announced in advance, with a migration guide. Until then, draft revisions may change interfaces: draft 1.1 makes the forward return hidden states (`compute_logits`), and adds the meta-device build (`ap_init_buffers`), `mark`, plugin options, sub-layers and typed sampler requirements.
+- **Contract.** The platform supports plugins whose `contract` has its major version. Once 1.x is frozen, minor versions add optional fields and hooks only, and a major version change is announced in advance, with a migration guide. Until then, draft revisions may change interfaces: draft 1.1 makes the forward return hidden states (`compute_logits`) and moves routing out of model code (`route`, `choose_experts`), and adds the meta-device build (`ap_init_buffers`), `mark`, plugin options, sub-layers, typed sampler requirements and pass-through checkpoint tensors.
 - **Runtime release.** A plugin is admitted against one runtime release and keeps running on it while that release is supported. Moving to a newer release re-runs conformance.
 - **Support window.** The number of runtime releases supported in parallel, and their deprecation notice, will be fixed before contract 1.0.
 - **Failure attribution.** A job that fails inside plugin code is reported as a plugin failure with the stack trace. Failures in platform code are the platform's. Conformance results define the supported envelope: a configuration outside the declared capabilities is rejected, not attempted.
@@ -709,7 +722,7 @@ flowchart TB
 | Platform attention | `modeling.ToyAttention(AttentionModule)` |
 | New layer type, default policy | `modeling.ToyRecurrence.mix` (row restarts, head slicing); `parallel.GatedRecurrenceMixer` |
 | New layer type, custom policy | `modeling.ToyShortConv.mix` (global positions from `SequenceWindow`); `parallel.ShortConvMixer` (halo exchange) |
-| MoE, EP and router replay | `modeling.ToyMoE` (`route`, `experts_core`); `parallel.ToyExpertLayer` (a `StackedExpertLayer`) |
+| MoE, EP and router replay | `modeling.ToyMoE` (`route` with `choose_experts`, `experts_core`); `parallel.ToyExpertLayer` (a `StackedExpertLayer`) |
 | Marks, meta-device build | `modeling.LoadStats` (`dtype="fp32"`, `weight_sync=False`); `modeling.RotaryEmbedding` (`dtype="fp32"`, `ap_init_buffers`); the fp32 router |
 | Output transform | `ToyHybridMoEForCausalLM.compute_logits` (optional logit softcapping) |
 | Sub-layer, options | `modeling.ToyValueConv` (`[sublayer_types] value_conv`); `options.ToyOptions` and `parallel.validate` |
@@ -760,7 +773,7 @@ The test suite also feeds conformance deliberately broken variants and checks th
 - [ ] Every value in the config's `layer_types` is in the manifest, and every sequence-mixing module sets `ap_layer_type`.
 - [ ] Cores restart at row boundaries and compute exactly what `shard` describes: heads for head-parallel, global positions for halo.
 - [ ] Every plugin layer type has a mixer whose policy fits its core; custom policies use only the platform's collectives.
-- [ ] Expert weights are stacked on dim 0, `experts_core` offsets by `shard.start`, and the router honours `routed_experts` and `ROUTER_REPLAY_FRESH`.
+- [ ] Expert weights are stacked on dim 0, `experts_core` offsets by `shard.start`, and routing goes through `route(tokens, routed=None)` with `choose_experts`.
 - [ ] Decoder layers are recomputable; side effects are guarded with `in_recompute()`.
 - [ ] The weights directory passes `--weights`: matching config, sharded safetensors with an index, and a tokenizer with EOS and a chat template.
 - [ ] The converters are exact inverses, and trainer-only state is marked `weight_sync=False`.

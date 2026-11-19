@@ -27,11 +27,11 @@ from torch import nn
 
 from arctic_platform.model_plugin import FULL_SHARD
 from arctic_platform.model_plugin import FULL_WINDOW
-from arctic_platform.model_plugin import ROUTER_REPLAY_FRESH
 from arctic_platform.model_plugin import AttentionModule
 from arctic_platform.model_plugin import ExpertShard
 from arctic_platform.model_plugin import HeadShard
 from arctic_platform.model_plugin import SequenceWindow
+from arctic_platform.model_plugin import choose_experts
 from arctic_platform.model_plugin import in_recompute
 from arctic_platform.model_plugin import mark
 from arctic_platform.model_plugin.attention import segment_ids
@@ -281,21 +281,20 @@ class ToyMoE(nn.Module):
         self.shared_expert = DenseMLP(config.hidden_size, config.moe_intermediate_size * config.num_shared_experts)
         self.stats = LoadStats(self.num_experts)
 
-    def forward(self, x: torch.Tensor, routed: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         tokens = x.reshape(-1, x.shape[-1])
-        selected, weights = self.route(tokens, routed)
+        selected, weights = self.route(tokens)
         if self.training and not in_recompute():
             with torch.no_grad():
                 self.stats.tokens_per_expert += torch.bincount(selected.flatten(), minlength=self.num_experts)
         out = self.experts_core(tokens, selected, weights) + self.shared_expert(tokens)
-        return out.view_as(x), selected
+        return out.view_as(x)
 
-    def route(self, tokens: torch.Tensor, routed: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
-        """Expert ids ``[N, top_k]`` and gate weights. ``routed`` replays captured ids; ``ROUTER_REPLAY_FRESH``
-        entries take this router's own choice."""
+    def route(self, tokens: torch.Tensor, routed: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Expert ids ``[N, top_k]`` and gate weights. The platform passes ``routed`` to replay routing (the
+        sampler's, or this forward's own on recompute); :func:`choose_experts` honours it."""
         scores = torch.softmax(self.router(tokens.float()), dim=-1)
-        own = torch.topk(scores.detach(), self.top_k, dim=-1).indices
-        selected = own if routed is None else torch.where(routed == ROUTER_REPLAY_FRESH, own, routed.to(own.dtype))
+        selected = choose_experts(scores, self.top_k, routed)
         weights = scores.gather(1, selected)
         return selected, weights / weights.sum(-1, keepdim=True) * self.scale
 
@@ -355,20 +354,18 @@ class ToyDecoderLayer(nn.Module):
     def __init__(self, config: ToyHybridMoEConfig, options: ToyOptions, layer_idx: int):
         super().__init__()
         self.mixer_name = _MIXER_ATTRIBUTE[config.layer_types[layer_idx]]
-        self.is_moe = config.mlp_types[layer_idx] == MOE
         self.input_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         setattr(self, self.mixer_name, _MIXER_CLASS[config.layer_types[layer_idx]](config, options))
-        self.mlp = ToyMoE(config) if self.is_moe else DenseMLP(config.hidden_size, config.intermediate_size)
+        self.mlp = (
+            ToyMoE(config)
+            if config.mlp_types[layer_idx] == MOE
+            else DenseMLP(config.hidden_size, config.intermediate_size)
+        )
 
-    def forward(
-        self, h: torch.Tensor, position_ids: torch.Tensor, cu_seqlens: torch.Tensor, routed: torch.Tensor | None
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def forward(self, h: torch.Tensor, position_ids: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
         h = h + getattr(self, self.mixer_name)(self.input_norm(h), position_ids, cu_seqlens)
-        if not self.is_moe:
-            return h + self.mlp(self.post_norm(h)), None
-        out, selected = self.mlp(self.post_norm(h), routed)
-        return h + out, selected
+        return h + self.mlp(self.post_norm(h))
 
 
 class ToyHybridMoEModel(nn.Module):
@@ -395,18 +392,11 @@ class ToyHybridMoEForCausalLM(nn.Module):
         position_ids: torch.Tensor,
         *,
         cu_seqlens: torch.Tensor,
-        routed_experts: dict[int, torch.Tensor] | None = None,
-        return_routing: bool = False,
-    ):
-        routed_experts = routed_experts or {}
+    ) -> torch.Tensor:
         h = self.model.embed_tokens(input_ids)
-        routing: dict[int, torch.Tensor] = {}
-        for index, layer in enumerate(self.model.layers):
-            h, selected = layer(h, position_ids, cu_seqlens, routed_experts.get(index))
-            if selected is not None:
-                routing[index] = selected
-        hidden = self.model.norm(h)
-        return (hidden, routing) if return_routing else hidden
+        for layer in self.model.layers:
+            h = layer(h, position_ids, cu_seqlens)
+        return self.model.norm(h)
 
     def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         logits = self.lm_head(hidden)

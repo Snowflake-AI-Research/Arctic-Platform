@@ -36,6 +36,8 @@ from arctic_platform.model_plugin.experts import EXPERT_PARALLEL_SIZE_ATTR
 from arctic_platform.model_plugin.marks import weight_sync_skipped
 from arctic_platform.model_plugin.plugin import ModelPlugin
 
+# On a loaded model: the checkpoint file holding each pass-through tensor, to copy into every export.
+PASSTHROUGH_ATTR = "_ap_passthrough"
 CHECKPOINT_FILE = "model.safetensors"
 INDEX_FILE = "model.safetensors.index.json"
 STAMP_PLUGIN = "arctic_plugin"
@@ -155,22 +157,38 @@ def save_hf_checkpoint(
     }
     if ep_group is not None and dist.get_rank(ep_group) != 0:
         return
+    # Read before writing anything, so exporting over the source directory is safe.
+    weights.update(_read_tensors(getattr(model, PASSTHROUGH_ATTR, {})))
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     config.save_pretrained(path)
     stamp = checkpoint_stamp(plugin)
     shards = _shards(weights, max_shard_bytes)
+    weight_map = {}
     if len(shards) == 1:
         save_file(shards[0], str(path / CHECKPOINT_FILE), metadata=stamp)
-        return
-    weight_map = {}
-    for number, shard in enumerate(shards, start=1):
-        file_name = f"model-{number:05d}-of-{len(shards):05d}.safetensors"
-        save_file(shard, str(path / file_name), metadata=stamp)
-        weight_map.update(dict.fromkeys(shard, file_name))
-    total = sum(tensor.numel() * tensor.element_size() for tensor in weights.values())
-    index = {"metadata": {"total_size": total, **stamp}, "weight_map": weight_map}
-    (path / INDEX_FILE).write_text(json.dumps(index, indent=2) + "\n")
+        weight_map = dict.fromkeys(shards[0], CHECKPOINT_FILE)
+    else:
+        for number, shard in enumerate(shards, start=1):
+            file_name = f"model-{number:05d}-of-{len(shards):05d}.safetensors"
+            save_file(shard, str(path / file_name), metadata=stamp)
+            weight_map.update(dict.fromkeys(shard, file_name))
+        total = sum(tensor.numel() * tensor.element_size() for tensor in weights.values())
+        index = {"metadata": {"total_size": total, **stamp}, "weight_map": weight_map}
+        (path / INDEX_FILE).write_text(json.dumps(index, indent=2) + "\n")
+    # Later exports copy pass-through tensors from this one, so the source checkpoint need not outlive the run.
+    passthrough = getattr(model, PASSTHROUGH_ATTR, {})
+    setattr(model, PASSTHROUGH_ATTR, {name: str(path / weight_map[name]) for name in passthrough})
+
+
+def _read_tensors(files: dict[str, str]) -> dict[str, torch.Tensor]:
+    from safetensors import safe_open
+
+    tensors = {}
+    for file in sorted(set(files.values())):
+        with safe_open(file, framework="pt") as f:
+            tensors.update({name: f.get_tensor(name) for name, source in files.items() if source == file})
+    return tensors
 
 
 def checkpoint_files(path: str | Path) -> dict[str, Path]:
@@ -198,13 +216,16 @@ def read_stamp(path: str | Path) -> dict[str, str]:
     return {key: value for key, value in metadata.items() if key.startswith("arctic_plugin")}
 
 
-def iter_checkpoint_layers(path: str | Path) -> Iterator[tuple[int, dict[str, torch.Tensor]]]:
-    """A checkpoint's tensors one decoder layer at a time, reading only that layer from disk."""
+def iter_checkpoint_layers(
+    path: str | Path, skip: set[str] = frozenset()
+) -> Iterator[tuple[int, dict[str, torch.Tensor]]]:
+    """A checkpoint's tensors one decoder layer at a time, reading only that layer from disk, except ``skip``."""
     from safetensors import safe_open
 
     by_layer: dict[int, dict[str, Path]] = {}
     for name, file in checkpoint_files(path).items():
-        by_layer.setdefault(layer_index(name), {})[name] = file
+        if name not in skip:
+            by_layer.setdefault(layer_index(name), {})[name] = file
     with ExitStack() as stack:
         handles: dict[Path, Any] = {}
         for index in sorted(by_layer, key=lambda i: (i < 0, i)):
@@ -224,7 +245,7 @@ _SAFETENSORS_FLOAT_DTYPES = {
 }
 
 
-def checkpoint_dtype(path: str | Path) -> torch.dtype | None:
+def checkpoint_dtype(path: str | Path, skip: set[str] = frozenset()) -> torch.dtype | None:
     """The floating dtype holding most of a checkpoint's elements, read from safetensors headers; ``None`` if the
     checkpoint has no floating tensors."""
     from safetensors import safe_open
@@ -232,7 +253,8 @@ def checkpoint_dtype(path: str | Path) -> torch.dtype | None:
     elements: dict[torch.dtype, int] = {}
     by_file: dict[Path, list[str]] = {}
     for name, file in checkpoint_files(path).items():
-        by_file.setdefault(file, []).append(name)
+        if name not in skip:
+            by_file.setdefault(file, []).append(name)
     for file, names in by_file.items():
         with safe_open(str(file), framework="pt") as f:
             for name in names:
@@ -266,6 +288,13 @@ def load_hf_checkpoint(
             plugin.manifest.version,
         )
     config = plugin.config_class.from_pretrained(path)
-    model = materialize(build(plugin, config, options, meta=True), device, checkpoint_dtype(path))
-    _load_layers(model, plugin, iter_checkpoint_layers(path))
+    passthrough = {
+        name: str(file)
+        for name, file in checkpoint_files(path).items()
+        if plugin.manifest.checkpoint.is_passthrough(name)
+    }
+    dtype = checkpoint_dtype(path, skip=set(passthrough))  # a large pass-through tower must not set the model's dtype
+    model = materialize(build(plugin, config, options, meta=True), device, dtype)
+    _load_layers(model, plugin, iter_checkpoint_layers(path, skip=set(passthrough)))
+    setattr(model, PASSTHROUGH_ATTR, passthrough)
     return config, model

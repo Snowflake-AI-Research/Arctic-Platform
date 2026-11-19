@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -106,6 +107,32 @@ class SamplerSpec(BaseModel):
         return required
 
 
+class CheckpointSpec(BaseModel):
+    """Checkpoint tensors the trainer does not use, such as multi-token-prediction heads or a vision tower."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    passthrough: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Regexes matched at the start of a tensor name. Matching tensors are not loaded, are copied "
+            "unchanged into every exported checkpoint, and never reach the sampler."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> CheckpointSpec:
+        for pattern in self.passthrough:
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise ValueError(f"passthrough pattern {pattern!r} is not a regex: {error}") from error
+        return self
+
+    def is_passthrough(self, name: str) -> bool:
+        return any(re.match(pattern, name) for pattern in self.passthrough)
+
+
 class PluginManifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -118,6 +145,7 @@ class PluginManifest(BaseModel):
     sublayer_types: dict[str, str] = Field(default_factory=dict)
     capabilities: Capabilities = Field(default_factory=Capabilities)
     sampler: SamplerSpec | None = None
+    checkpoint: CheckpointSpec = Field(default_factory=CheckpointSpec)
     profiles: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     @model_validator(mode="after")

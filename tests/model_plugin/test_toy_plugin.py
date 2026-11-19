@@ -19,8 +19,10 @@ Single-process tiers run in the test process. Sequence and expert parallelism sp
 compare logits and every gradient with the unsharded model.
 """
 
+import copy
 import dataclasses
 import json
+import shutil
 from collections import defaultdict
 from pathlib import Path
 from unittest.mock import patch
@@ -177,6 +179,110 @@ def test_gather_sequence_gives_each_rank_its_slice_of_the_whole_sequence_gradien
     torch.multiprocessing.spawn(_gather_worker, args=(str(tmp_path / "rendezvous"),), nprocs=2)
 
 
+def test_choose_experts_replays_ids_and_routes_fresh_ones_itself():
+    from arctic_platform.model_plugin import ROUTER_REPLAY_FRESH
+    from arctic_platform.model_plugin import choose_experts
+
+    scores = torch.tensor([[0.1, 0.5, 0.4], [0.7, 0.2, 0.1]])
+    assert choose_experts(scores, 1).tolist() == [[1], [0]]
+    assert choose_experts(scores, 1, torch.tensor([[2], [ROUTER_REPLAY_FRESH]])).tolist() == [[2], [0]]
+    assert choose_experts(scores, 1, bias=torch.tensor([0.0, 0.0, 1.0])).tolist() == [[2], [2]]
+
+
+class _JitteryRecomputeMoE(modeling.ToyMoE):
+    """Picks other experts when recomputed, as last-bit noise from nondeterministic kernels can make it do."""
+
+    def route(self, tokens, routed=None):
+        scores = torch.softmax(self.router(tokens.float()), dim=-1)
+        flip = torch.linspace(1.0, 0.0, self.num_experts) if modeling.in_recompute() else None
+        selected = modeling.choose_experts(scores, self.top_k, routed, bias=flip)
+        weights = scores.gather(1, selected)
+        return selected, weights / weights.sum(-1, keepdim=True) * self.scale
+
+
+def _jittery_plugin():
+    def build(config, options):
+        model = modeling.ToyHybridMoEForCausalLM(config, options)
+        for module in model.modules():
+            if type(module) is modeling.ToyMoE:
+                module.__class__ = _JitteryRecomputeMoE
+        return model
+
+    return dataclasses.replace(PLUGIN, build_model=build)
+
+
+def test_recompute_replays_its_forwards_routing_even_if_the_router_would_choose_otherwise():
+    plugin = _jittery_plugin()
+    conformance.check_activation_checkpointing(plugin, SPEC)  # the platform's routing is installed: passes
+
+    # The same model without platform routing recomputes with other experts: other per-expert token counts, so
+    # the recompute saves other tensors than its forward.
+    torch.manual_seed(SPEC.seed)
+    config = ToyHybridMoEConfig(**SPEC.fixture)
+    model = plugin.build_model(config, None)
+    conformance.apply_activation_checkpointing(model)
+    input_ids, position_ids = pack_sequences(conformance.fixture_sequences(config, SPEC))
+    loss = conformance._token_loss(
+        model, forward(model, input_ids, position_ids), next_token_labels(input_ids, position_ids), SPEC
+    )
+    with pytest.raises(torch.utils.checkpoint.CheckpointError, match="different number of tensors"):
+        loss.backward()
+
+
+def test_pending_forwards_recompute_with_their_own_routing():
+    config, checkpointed = conformance.build_fixture(PLUGIN, SPEC)
+    plain = copy.deepcopy(checkpointed)
+    conformance.apply_activation_checkpointing(checkpointed)
+    input_ids, position_ids = pack_sequences(conformance.fixture_sequences(config, SPEC))
+    labels = next_token_labels(input_ids, position_ids)
+    with torch.no_grad():
+        _, routing = forward(plain, input_ids, position_ids, return_routing=True)
+    shifted = {layer: (ids + 1) % config.num_experts for layer, ids in routing.items()}
+    # Two forwards with different routing, then one backward, as with pending forwards or gradient accumulation.
+    for model in (plain, checkpointed):
+        losses = [
+            conformance._token_loss(
+                model, forward(model, input_ids, position_ids, routed_experts=replay), labels, SPEC
+            )
+            for replay in (routing, shifted)
+        ]
+        # Back-propagate the first forward first: a per-layer stack instead of per-frame captures would replay the
+        # second forward's routing into it.
+        losses[0].backward()
+        losses[1].backward()
+    expected = conformance._grads(plain)
+    for name, grad in conformance._grads(checkpointed).items():
+        torch.testing.assert_close(grad, expected[name], rtol=0, atol=1e-6)
+
+
+def test_moe_without_a_route_method_fails_binding():
+    class NoRoute(modeling.ToyMoE):
+        route = None
+
+    config = ToyHybridMoEConfig(**SPEC.fixture)
+    model = modeling.ToyHybridMoEForCausalLM(config)
+    model.model.layers[1].mlp.__class__ = NoRoute
+    with pytest.raises(ValueError, match=r"NoRoute has no route\(tokens, routed=None\); MoE modules must route"):
+        conformance.prepare_model(model, PLUGIN, config)
+
+    class NoRoutedParameter(modeling.ToyMoE):
+        def route(self, tokens):
+            return super().route(tokens)
+
+    model.model.layers[1].mlp.__class__ = NoRoutedParameter
+    with pytest.raises(ValueError, match="NoRoutedParameter has no route"):
+        conformance.prepare_model(model, PLUGIN, config)
+
+
+def test_preparing_twice_wraps_routing_once():
+    config, model = conformance.build_fixture(PLUGIN, SPEC)  # prepared once already
+    conformance.prepare_model(model, PLUGIN, config)
+    input_ids, position_ids = pack_sequences(conformance.fixture_sequences(config, SPEC))
+    with torch.no_grad():
+        _, routing = forward(model, input_ids, position_ids, return_routing=True)  # a double wrap would raise
+    assert sorted(routing) == [1, 2]
+
+
 def test_recurrence_that_ignores_row_boundaries_fails_packing():
     real_mix = modeling.ToyRecurrence.mix
 
@@ -200,8 +306,8 @@ def test_convolution_that_ignores_row_boundaries_fails_packing():
 
 
 def test_router_that_ignores_replay_fails_router_replay():
-    real_forward = modeling.ToyMoE.forward
-    with patch.object(modeling.ToyMoE, "forward", lambda self, x, routed=None: real_forward(self, x, None)):
+    real_route = modeling.ToyMoE.route
+    with patch.object(modeling.ToyMoE, "route", lambda self, tokens, routed=None: real_route(self, tokens)):
         with pytest.raises(AssertionError, match="routed_experts is ignored"):
             conformance.check_router_replay(PLUGIN, SPEC)
 
@@ -302,6 +408,58 @@ class TestCheckpointLayout(TestCasePlus):
         (path / "config.json").write_text(json.dumps(config | {"model_type": "qwen3"}))
         with self.assertRaisesRegex(AssertionError, "model_type 'qwen3'"):
             conformance.check_weights_directory(PLUGIN, path)
+
+    def test_passthrough_tensors_are_kept_out_of_the_model_and_copied_into_every_export(self):
+        from safetensors.torch import load_file
+        from safetensors.torch import save_file
+
+        from arctic_platform.model_plugin.manifest import CheckpointSpec
+
+        torch.manual_seed(0)
+        config = ToyHybridMoEConfig(**SPEC.fixture)
+        source = Path(self.get_auto_remove_tmp_dir_str())
+        save_hf_checkpoint(
+            cast_model(PLUGIN.build_model(config), torch.bfloat16), PLUGIN, config, source, max_shard_bytes=8192
+        )
+        _save_tokenizer(source, config.vocab_size)
+        # An MTP head and a vision tower the trainer does not use; the tower is fp32 and outweighs the bf16 model.
+        extra = {
+            "mtp.0.proj.weight": torch.randn(8, 8, dtype=torch.bfloat16),
+            "model.visual.patch.weight": torch.randn(1000, 1000),
+        }
+        save_file(extra, str(source / "extra.safetensors"))
+        index = json.loads((source / "model.safetensors.index.json").read_text())
+        index["weight_map"].update(dict.fromkeys(extra, "extra.safetensors"))
+        (source / "model.safetensors.index.json").write_text(json.dumps(index))
+
+        with self.assertRaisesRegex(ValueError, "match no trainer tensor"):
+            load_hf_checkpoint(PLUGIN, source)
+        plugin = dataclasses.replace(
+            PLUGIN,
+            manifest=PLUGIN.manifest.model_copy(
+                update=dict(checkpoint=CheckpointSpec(passthrough=[r"mtp\.", r"model\.visual\."]))
+            ),
+        )
+        _, model = load_hf_checkpoint(plugin, source)
+        self.assertEqual(model.lm_head.weight.dtype, torch.bfloat16)  # the pass-through tower did not set the dtype
+        self.assertFalse(set(extra) & set(model.state_dict()))
+        self.assertFalse(set(extra) & {name for name, _ in iter_hf_weights(model, plugin, for_sampler=True)})
+
+        exported = Path(self.get_auto_remove_tmp_dir_str())
+        save_hf_checkpoint(model, plugin, config, exported, max_shard_bytes=8192)
+        tensors = {}
+        for file in exported.glob("*.safetensors"):
+            tensors.update(load_file(str(file)))
+        for name, tensor in extra.items():
+            self.assertEqual(tensors[name].dtype, tensor.dtype)
+            self.assertTrue(torch.equal(tensors[name], tensor))
+        PLUGIN.register()
+        conformance.check_weights_directory(plugin, source)
+        # Later exports copy from the latest export: the source may be rotated away, or overwritten in place.
+        shutil.rmtree(source)
+        save_hf_checkpoint(model, plugin, config, exported)
+        copied = load_file(str(exported / CHECKPOINT_FILE))["model.visual.patch.weight"]
+        self.assertTrue(torch.equal(copied, extra["model.visual.patch.weight"]))
 
     def test_checkpoint_from_another_plugin_is_refused(self):
         path = self._weights_directory()
