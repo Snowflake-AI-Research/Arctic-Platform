@@ -14250,6 +14250,314 @@ def test_glm5_next_reference_follows_the_samplers_fp32_mhc_remix_parameters_beta
     assert _glm5_next_reference_one_rounding(transformers_out, exact_out) > 0
 
 
+# Qwen3.5-MoE reference precision.
+
+
+def _qwen3_5_moe_reference_config(layer_types=("linear_attention", "full_attention")):
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+
+    cfg = Qwen3_5MoeTextConfig(
+        vocab_size=32,
+        hidden_size=64,
+        num_hidden_layers=len(layer_types),
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        layer_types=list(layer_types),
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        num_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        shared_expert_intermediate_size=48,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.25,
+            "mrope_section": [2, 1, 1],
+            "mrope_interleaved": True,
+        },
+        pad_token_id=0,
+    )
+    cfg._attn_implementation = "sdpa"
+    return cfg
+
+
+def _qwen3_5_moe_reference_model(dtype, layer_types=("linear_attention", "full_attention")):
+    """A tiny Qwen3_5MoeForCausalLM with every parameter random, including the norm weights."""
+    from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen3_5_moe
+
+    torch.manual_seed(0)
+    model = qwen3_5_moe.Qwen3_5MoeForCausalLM(_qwen3_5_moe_reference_config(layer_types))
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if name.endswith("linear_attn.norm.weight"):
+                parameter.uniform_(0.5, 1.5)
+            elif "norm" in name:
+                parameter.uniform_(-0.5, 0.5)
+            elif name.endswith(("A_log", "dt_bias")):
+                parameter.uniform_(-1.0, 1.0)
+            elif "embed_tokens" in name:
+                parameter.normal_(0.0, 1.0)
+            else:
+                parameter.normal_(0.0, 0.05)
+    return model.to(dtype)
+
+
+def _qwen3_5_moe_reference_cpu_kernels(monkeypatch):
+    """The CPU stand-ins for Dao's causal_conv1d (FP32 accumulation and SiLU, one rounding) and fla's chunk rule (its
+    PyTorch fallback), so the GatedDeltaNet runs without CUDA."""
+    import torch.nn.functional as F
+    from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen3_5_moe
+
+    def causal_conv1d(hidden_states, weight, bias=None, activation=None, **_kwargs):
+        length = hidden_states.shape[-1]
+        out = F.conv1d(
+            hidden_states.float(),
+            weight.float().unsqueeze(1),
+            None if bias is None else bias.float(),
+            padding=weight.shape[-1] - 1,
+            groups=hidden_states.shape[1],
+        )[..., :length]
+        return (F.silu(out) if activation is not None else out).to(hidden_states.dtype)
+
+    chunk_rule = qwen3_5_moe.torch_chunk_gated_delta_rule
+    while hasattr(chunk_rule, "__wrapped__"):
+        chunk_rule = chunk_rule.__wrapped__
+    monkeypatch.setattr(qwen3_5_moe, "causal_conv1d_fn", causal_conv1d)
+    monkeypatch.setattr(qwen3_5_moe, "torch_chunk_gated_delta_rule", chunk_rule)
+
+
+def _qwen3_5_moe_reference_load(model):
+    from arctic_platform.correctness.reference.qwen3_5_moe_reference import load_qwen3_5_moe_reference
+
+    calls = []
+
+    def from_pretrained(path, **kwargs):
+        calls.append((path, kwargs))
+        return model
+
+    loaded = load_qwen3_5_moe_reference(
+        SimpleNamespace(from_pretrained=from_pretrained),
+        "fixture",
+        dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+        device="cpu",
+    )
+    assert loaded is model
+    assert calls == [("fixture", {"dtype": torch.bfloat16, "attn_implementation": "sdpa"})]
+    return model
+
+
+class _qwen3_5_moe_reference_Fixed(nn.Module):
+    """A sublayer that records its input and returns a fixed output."""
+
+    def __init__(self, output):
+        super().__init__()
+        self.output = output
+        self.inputs = []
+
+    def forward(self, hidden_states, *args, **kwargs):
+        self.inputs.append(hidden_states)
+        return (self.output, None) if kwargs.get("position_embeddings") is not None else self.output
+
+
+def test_qwen3_5_moe_reference_follows_the_samplers_fp32_residual_norms_gated_norm_beta_rope_and_routing_weights(
+    monkeypatch,
+):
+    """Qwen3.6-35B-A3B full fine-tuning failed single-step-grads on layers.2.linear_attn.in_proj_z / conv1d and
+    layers.3.self_attn.q_proj / v_proj by 1-3e-3 relative (gate 3e-3 absolute). Transformers' Qwen3_5Moe normalizes
+    the BF16-rounded residual sum, rounds the GatedDeltaNet output norm three times, takes the beta sigmoid in BF16,
+    rotates q/k in BF16 and rounds the routing weights to BF16; vLLM 0.33 and the target do each in FP32 with one
+    rounding. The reference has to load and run the model the sampler's way."""
+    import torch.nn.functional as F
+    from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen3_5_moe
+
+    from arctic_platform.correctness.reference.qwen3_5_moe_reference import fp32_rope
+
+    model = _qwen3_5_moe_reference_load(_qwen3_5_moe_reference_model(torch.bfloat16))
+    text = model.model
+    gdn_layer, attention_layer = text.layers
+    gdn, attention, moe = gdn_layer.linear_attn, attention_layer.self_attn, attention_layer.mlp
+    torch.manual_seed(1)
+    tokens = torch.randn(1, 96, 64).bfloat16()
+
+    # The GatedDeltaNet output norm rmsnorm(x) * w * silu(z): FP32, one rounding.
+    x, z = torch.randn(384, 16).bfloat16(), torch.randn(384, 16).bfloat16()
+    exact = x.double() * torch.rsqrt(x.double().pow(2).mean(-1, keepdim=True) + gdn.norm.variance_epsilon)
+    exact = exact * gdn.norm.weight.double() * F.silu(z.double())
+    assert _glm5_next_reference_one_rounding(gdn.norm(x, z), exact) == 0
+    assert _glm5_next_reference_one_rounding(qwen3_5_moe.Qwen3_5MoeRMSNormGated.forward(gdn.norm, x, z), exact) > 0
+
+    # The beta gate: sigmoid over the projection's logits widened to FP32.
+    assert gdn.in_proj_b(tokens).dtype == torch.float32
+
+    # q/k: the normed value rotated in FP32 against the BF16 cos/sin, rounded once.
+    positions = torch.arange(96).view(1, 1, -1).expand(3, 1, -1)
+    cos, sin = text.rotary_emb(tokens, positions)
+    assert cos.dtype == torch.bfloat16
+    seen = []
+
+    def capture(module, query, key, value, attention_mask, **kwargs):
+        seen.append((query, key))
+        return torch.zeros_like(query).transpose(1, 2), None
+
+    monkeypatch.setattr(attention.config, "_attn_implementation", "eager")
+    monkeypatch.setattr(qwen3_5_moe, "eager_attention_forward", capture)
+    query, _ = torch.chunk(attention.q_proj(tokens).view(1, 96, -1, 64), 2, dim=-1)
+    normed = attention.q_norm(query).transpose(1, 2)
+    rotary = cos.shape[-1]
+
+    def exact_rope(value):
+        value = value.double()
+        half = rotary // 2
+        turned = torch.cat((-value[..., half:rotary], value[..., :half]), dim=-1)
+        rotated = value[..., :rotary] * cos.unsqueeze(1).double() + turned * sin.unsqueeze(1).double()
+        return torch.cat((rotated, value[..., rotary:]), dim=-1)
+
+    attention(tokens, (cos, sin), None)
+    qwen3_5_moe.Qwen3_5MoeAttention.forward(attention, tokens, (cos, sin), None)
+    (aligned_query, _), (transformers_query, _) = seen
+    assert torch.equal(aligned_query, fp32_rope(normed, cos, sin))
+    assert _glm5_next_reference_one_rounding(aligned_query, exact_rope(normed)) == 0
+    assert _glm5_next_reference_one_rounding(transformers_query, exact_rope(normed)) > 0
+
+    # Routing: FP32 renormalized top-k weights; each expert row weighted and the top-k summed in FP32, rounded once.
+    flat = tokens.reshape(-1, 64)
+    _, weights, chosen = moe.gate(flat)
+    assert weights.dtype == torch.float32
+    rows = [moe.experts(flat, chosen[:, k : k + 1], torch.ones(flat.shape[0], 1)) for k in range(chosen.shape[1])]
+    # vLLM's moe_sum: each weighted row in FP32, the top-k accumulated in FP32, one rounding.
+    fp32_sum = sum(row.float() * weights[:, k : k + 1] for k, row in enumerate(rows)).bfloat16()
+    assert torch.equal(moe.experts(flat, chosen, weights), fp32_sum)
+    _, transformers_weights, _ = qwen3_5_moe.Qwen3_5MoeTopKRouter.forward(moe.gate, flat)
+    assert transformers_weights.dtype == torch.bfloat16
+    assert not torch.equal(moe.experts(flat, chosen, transformers_weights), fp32_sum)
+
+    # The residual: each sum formed in FP32 and normalized unrounded; the stream keeps it rounded.
+    attention_out, mlp_out = torch.randn(1, 96, 64).bfloat16(), torch.randn(1, 96, 64).bfloat16()
+    gdn_layer.linear_attn = _qwen3_5_moe_reference_Fixed(attention_out)
+    gdn_layer.mlp = _qwen3_5_moe_reference_Fixed(mlp_out)
+
+    def exact_norm(norm, value):
+        value = value.double()
+        normed = value * torch.rsqrt(value.pow(2).mean(-1, keepdim=True) + norm.eps)
+        return normed * (1.0 + norm.weight.double())
+
+    summed = tokens.double() + attention_out.double()
+    out = gdn_layer(tokens, position_embeddings=(cos, sin))
+    assert out.dtype == torch.float32
+    assert torch.equal(out, summed.bfloat16().float() + mlp_out.float())
+    assert (
+        _glm5_next_reference_one_rounding(
+            gdn_layer.mlp.inputs[0], exact_norm(gdn_layer.post_attention_layernorm, summed)
+        )
+        == 0
+    )
+    qwen3_5_moe.Qwen3_5MoeDecoderLayer.forward(gdn_layer, tokens, (cos, sin))
+    assert (
+        _glm5_next_reference_one_rounding(
+            gdn_layer.mlp.inputs[1], exact_norm(gdn_layer.post_attention_layernorm, summed)
+        )
+        > 0
+    )
+    # The next layer's input norm and the final norm normalize the FP32 sum and round once.
+    assert (
+        _glm5_next_reference_one_rounding(
+            attention_layer.input_layernorm(out), exact_norm(attention_layer.input_layernorm, out)
+        )
+        == 0
+    )
+    assert _glm5_next_reference_one_rounding(text.norm(out), exact_norm(text.norm, out)) == 0
+
+
+def test_qwen3_5_moe_reference_changes_no_fp32_math(monkeypatch):
+    """At FP32 the alignment is only roundings: the patched model's output and gradients equal Transformers'."""
+    _qwen3_5_moe_reference_cpu_kernels(monkeypatch)
+    from arctic_platform.correctness.reference.qwen3_5_moe_reference import apply_sampler_precision
+
+    layer_types = ("linear_attention", "linear_attention", "full_attention")
+    transformers_model = _qwen3_5_moe_reference_model(torch.float32, layer_types)
+    aligned = copy.deepcopy(transformers_model)
+    counts = apply_sampler_precision(aligned, torch.float32)
+    assert counts == {
+        "decoder_layers": 3,
+        "residual_norms": 7,
+        "gated_norms": 2,
+        "beta_projections": 2,
+        "attention_layers": 1,
+        "routers": 3,
+    }
+    ids = torch.randint(1, 32, (1, 160), generator=torch.Generator().manual_seed(2))
+    upstream = torch.randn(1, 160, 64, generator=torch.Generator().manual_seed(3))
+    results = []
+    for model in (transformers_model, aligned):
+        out = model.model(input_ids=ids).last_hidden_state
+        (out * upstream).sum().backward()
+        results.append((out.detach(), {name: p.grad for name, p in model.named_parameters() if p.grad is not None}))
+    (out, grads), (aligned_out, aligned_grads) = results
+    assert aligned_out.dtype == torch.float32
+    torch.testing.assert_close(aligned_out, out, rtol=1e-5, atol=1e-6)
+    assert grads.keys() == aligned_grads.keys()
+    for name, grad in grads.items():
+        torch.testing.assert_close(aligned_grads[name], grad, rtol=1e-4, atol=1e-6, msg=name)
+
+
+def test_qwen3_5_moe_reference_rejects_experts_that_round_the_topk_sum():
+    from arctic_platform.correctness.reference.qwen3_5_moe_reference import apply_sampler_precision
+
+    model = _qwen3_5_moe_reference_model(torch.bfloat16)
+    model.set_experts_implementation("eager")
+    with pytest.raises(ValueError, match="weight and sum the top-k in FP32"):
+        apply_sampler_precision(model, torch.bfloat16)
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5"])
+@pytest.mark.parametrize("huggingface_loader", [False, True])
+def test_qwen3_5_moe_reference_actual_build_engine_family_dispatch(monkeypatch, model_type, huggingface_loader):
+    model = _qwen4_reference_TinyQwen4()
+    cfg = SimpleNamespace(model_type=model_type, architectures=["Tiny"], hidden_size=2)
+    tiny, auto, loads = SimpleNamespace(), SimpleNamespace(), []
+
+    def from_pretrained(path, **kwargs):
+        loads.append(kwargs)
+        return model
+
+    tiny.from_pretrained = auto.from_pretrained = from_pretrained
+
+    def load_qwen3_5_moe_reference(model_class, path, **kwargs):
+        loads.append(("aligned", model_class, path, kwargs))
+        return model
+
+    monkeypatch.setattr(hf_single_gpu, "load_qwen3_5_moe_reference", load_qwen3_5_moe_reference)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoConfig=SimpleNamespace(from_pretrained=lambda *args, **kwargs: cfg),
+            AutoModelForCausalLM=auto,
+            Tiny=tiny,
+        ),
+    )
+    engine = build_engine("fixture", attn_implementation="sdpa", device="cpu", huggingface_loader=huggingface_loader)
+    assert engine.model is model
+    if model_type.startswith("qwen3_5_moe"):
+        expected = auto if huggingface_loader else tiny
+        assert loads == [
+            (
+                "aligned",
+                expected,
+                "fixture",
+                {"dtype": torch.bfloat16, "attn_implementation": "sdpa", "device": "cpu"},
+            )
+        ]
+    else:
+        assert loads == [{"dtype": torch.bfloat16, "attn_implementation": "sdpa"}]
+
+
 # Sft.
 
 
