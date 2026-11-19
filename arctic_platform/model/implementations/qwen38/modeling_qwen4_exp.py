@@ -386,6 +386,12 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
     Qwen4ExpForConditionalGeneration,
     PreTrainedModelPrimeRL,
 ):
+    # The sampler's adapter pack (weight_export.save_peft_adapters) carries the routed experts' LoRA one expert at a
+    # time, as vLLM's Qwen4Exp (a Qwen3-Next FusedMoE) maps it (experts.{e}.gate_proj / down_proj / up_proj): PEFT's
+    # 3-D layout nests one wrapper per expert parameter, and vLLM reads only two of the three (experts.base_layer as
+    # gate_up, experts as down).
+    vllm_lora_expert_projections = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+
     def __init__(self, config, **_kwargs):
         if getattr(config, "quantization_config", None):
             raise NotImplementedError(
