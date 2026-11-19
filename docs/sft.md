@@ -97,7 +97,7 @@ permissive because RL needs both exemptions.
 | `fwd_no_grad(batch, processing=None)` | Forward + loss, no backward (eval). Same `metrics` shape as `fwd_bwd`. Narrower than the base, which also takes `reference_model` for the log-prob engine an SFT run never allocates. |
 | `step(learning_rate=None)` | One optimizer update. LR is normally server-authoritative (set at engine init from `ds_config` + scheduler); an unset value is omitted from the wire. Returns optimizer `metrics` (at least `grad_norm`). |
 | `train_step(batch, processing=None)` | `fwd_bwd` + `step` with one merged `metrics` dict (same contract as RL `update_actor`: step first, then fwd_bwd keys win). |
-| `save_checkpoint(path=..., step=..., export_hf=...)` | Save (inherited unchanged from `ArcticClient`, so pass these by keyword). `path` overrides the job's `checkpoint_path` when given. |
+| `save_checkpoint(path=..., step=..., export_hf=..., stage_info=...)` | Save (inherited unchanged from `ArcticClient`, so pass these by keyword). `path` overrides the job's `checkpoint_path` when given. `stage_info` also uploads the checkpoint to that stage; a DSS zone refuses the save with HTTP 400 when its `cred_expiry_time_ms` is less than `DSS_CHECKPOINT_MIN_CREDENTIAL_LIFETIME_SECONDS` (default 1800 s) away, so pass credentials with at least that long left. `0` means the expiry is unknown and is never refused. |
 | `load_checkpoint(path=None, step=None)` | Restore weights/optimizer/LR/step. |
 | `generate(prompts, ...)` / `sync_weights()` | Sampling ops; require `sampling_gpus > 0`. |
 | `reconnect_config()` | Config that reattaches to these jobs (job ids set). |
