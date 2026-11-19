@@ -64,9 +64,14 @@ from arctic_platform.client.transports.cortex import _SendPolicy
 from arctic_platform.correctness.harness.config import ReviewedClientConfig
 from arctic_platform.correctness.harness.config import TestSpec
 from arctic_platform.correctness.harness.config import hash_directory
+from arctic_platform.correctness.harness.storage import correctness_environment
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 
 # Transport
+
+# Pins hosted jobs to one dss-backend base tag through the create-job debug options; the account must
+# have Neutrino debug options enabled.
+IMAGE_TAG_ENV = "AP_CORRECTNESS_IMAGE_TAG"
 
 
 class UnsafeCleanupError(RuntimeError):
@@ -889,6 +894,11 @@ class CorrectnessCortexTransport(CortexTransport):
                 payload["sub_job_configs"] = configs
             if getattr(self, "hardware", None) is not None:
                 payload["hardware"] = self.hardware
+            image_tag = correctness_environment(IMAGE_TAG_ENV)
+            if image_tag and not self._is_local_gateway():
+                debug = dict(payload.get("debug") or {})
+                debug["job"] = {**(debug.get("job") or {}), "image_tag": image_tag}
+                payload["debug"] = debug
             kwargs["json"] = payload
             if self._is_local_gateway():
                 local_roles = [sub.get("job_type") for sub in payload["sub_job_configs"]]

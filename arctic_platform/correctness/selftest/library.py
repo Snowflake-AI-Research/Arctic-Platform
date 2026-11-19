@@ -22897,6 +22897,31 @@ def test_client_backends_cortex_transport_sends_hardware_and_lists_durable_check
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
+def test_client_backends_cortex_transport_pins_hosted_image_tag(monkeypatch):
+    monkeypatch.setenv("AP_CORRECTNESS_IMAGE_TAG", "release_20261118_085208_e711fa00000")
+    transport = CorrectnessCortexTransport(CortexConfig(base_url="http://cortex.test"))
+    calls = []
+
+    async def send(self, method, path, *, policy=_DEFAULT, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"job_id": "parent"}
+
+    monkeypatch.setattr(CortexTransport, "_send", send)
+    monkeypatch.setattr(transport, "_wait_running", lambda: None)
+    monkeypatch.setattr(transport, "_capture_sub_jobs", lambda: {"training": "parent:training:0"})
+    config = CortexTrainingConfig(model_name="model", training_gpus=8, backend=transport.config, hardware="H200")
+    try:
+        transport.initialize(client_config=config)
+        assert calls[0][2]["json"] == {
+            "sub_job_configs": config.to_cortex(),
+            "hardware": "H200",
+            "debug": {"job": {"image_tag": "release_20261118_085208_e711fa00000"}},
+        }
+    finally:
+        transport.shutdown()
+
+
+@pytest.mark.usefixtures("_client_backends_no_network")
 @pytest.mark.parametrize("check", ["single-step-grads", "single-step-optimizer"])
 def test_client_backends_cortex_refuses_checks_requiring_local_model_identity(tmp_path, monkeypatch, check):
     cfg = SimpleNamespace(
@@ -23781,6 +23806,7 @@ _SELFTEST_GROUPS = {
         "test_client_backends_remote_run_never_probes_local_allocation",
         "test_client_backends_onprem_refuses_cortex_checkpoint_identity",
         "test_client_backends_cortex_transport_sends_hardware_and_lists_durable_checkpoints",
+        "test_client_backends_cortex_transport_pins_hosted_image_tag",
         "test_client_backends_cortex_refuses_checks_requiring_local_model_identity",
         "test_client_backends_cortex_report_does_not_claim_the_reduced_fixture_was_measured",
         "test_driver_reviewed_training_preserves_explicit_format_without_mutating_payload",
