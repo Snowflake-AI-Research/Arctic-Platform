@@ -48,6 +48,30 @@ def _nemotron_h_mamba2_mixer_cls():
     return NemotronHMamba2Mixer
 
 
+# The Mamba-2 time step's limits as vLLM serves Nemotron-H: MambaMixer2 passes dt_limit=(0.0, inf) on both prefill
+# paths (vllm model_executor/layers/mamba/mamba_mixer2.py:704, :883) and its decode kernel applies none
+# (ops/mamba_ssm.py:405-420), as the checkpoint's own code does (config.time_step_limit, (0, inf) by default).
+SAMPLER_TIME_STEP_LIMIT = (0.0, float("inf"))
+
+
+def build_mamba2_mixer(config: NemotronHConfig, layer_idx: int):
+    """Transformers' NemotronHMamba2Mixer with the sampler's time step: dt = softplus(dt + dt_bias), unfloored.
+
+    The mixer inherits Zamba2's ``time_step_limit = (config.time_step_min, inf)`` (transformers models/zamba2/
+    modeling_zamba2.py:669), which would floor dt at 1e-3 on every path that reads it: ``_varlen_mamba_forward``,
+    ``cp_mamba.fused_mamba_mixer`` and ``cp_mamba.mamba_cp_forward``, and the mixer's own forward
+    (modeling_zamba2.py:737, :849). time_step_min only bounds dt_bias's initialization. A mixer without
+    ``time_step_limit`` is refused: a Transformers that reads its limit from elsewhere could bring the floor back."""
+    mixer = _nemotron_h_mamba2_mixer_cls()(config, layer_idx=layer_idx)
+    if not hasattr(mixer, "time_step_limit"):
+        raise ValueError(
+            f"{type(mixer).__module__}.{type(mixer).__qualname__} has no time_step_limit: cannot give it the sampler's "
+            "unfloored dt (0, inf); check where this Transformers bounds the Mamba-2 time step"
+        )
+    mixer.time_step_limit = SAMPLER_TIME_STEP_LIMIT
+    return mixer
+
+
 def _patch_mamba2_use_triton_ssd():
     """Patch NemotronHMamba2Mixer to use mamba_ssm Triton SSD kernels.
 
@@ -159,22 +183,21 @@ def _patch_mamba2_use_triton_ssd():
         return self.out_proj(scan_output)
 
     fused = fused_mamba_available()
+    mixer_cls = _nemotron_h_mamba2_mixer_cls()
+    # The mixer's own forward from before this patch (Transformers 5.20: Zamba2MambaMixer.forward, its kernels or torch
+    # fallbacks with time_step_limit as dt_limit), for calls without packed rows. It has no cuda_kernels_forward /
+    # torch_forward any more, which this fallback used to call.
+    stock_forward = getattr(mixer_cls, "_arl_stock_forward", mixer_cls.forward)
 
     def _patched_forward(self, hidden_states, cache_params=None, attention_mask=None, cu_seqlens=None):
         if cu_seqlens is not None and cache_params is None and "cuda" in self.in_proj.weight.device.type:
             if fused:
                 return _fused_varlen_mamba_forward(self, hidden_states, cu_seqlens)
             return _varlen_mamba_forward(self, hidden_states, cu_seqlens)
-        if "cuda" in self.in_proj.weight.device.type:
-            # Disable fused training path (needs causal_conv1d CUDA extension)
-            orig = self.use_mem_eff_path
-            self.use_mem_eff_path = False
-            result = self.cuda_kernels_forward(hidden_states, cache_params, attention_mask)
-            self.use_mem_eff_path = orig
-            return result
-        return self.torch_forward(hidden_states, cache_params, attention_mask)
+        return stock_forward(self, hidden_states, cache_params=cache_params, attention_mask=attention_mask)
 
-    _nemotron_h_mamba2_mixer_cls().forward = _patched_forward
+    mixer_cls._arl_stock_forward = stock_forward
+    mixer_cls.forward = _patched_forward
     _patch_applied = True
     logger.info(
         "Patched NemotronHMamba2Mixer: Triton SSD kernels + varlen (cu_seqlens) support"
@@ -227,7 +250,7 @@ class NemotronHMambaLayer(GradientCheckpointingLayer):
         _patch_mamba2_use_triton_ssd()
         _ensure_zamba2_compat(config)
         self.norm = RMSNorm(RMSNormConfig(hidden_size=config.hidden_size, eps=config.layer_norm_epsilon))
-        self.mamba = _nemotron_h_mamba2_mixer_cls()(config, layer_idx=layer_idx)
+        self.mamba = build_mamba2_mixer(config, layer_idx)
         # The chunked scan is this layer's core kernel for ac_config.core_replay (gpu/core_replay.py).
         self.mamba._arl_keeps_core = True
         self.mlp = None  # No MoE in this layer type

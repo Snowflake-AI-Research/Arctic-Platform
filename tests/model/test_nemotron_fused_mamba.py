@@ -40,7 +40,7 @@ def _fused_or_skip():
 def _mixer(heads=8, groups=2):
     from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import NemotronHConfig
     from arctic_platform.model.implementations.nemotron_h.modeling_nemotron_h import _ensure_zamba2_compat
-    from arctic_platform.model.implementations.nemotron_h.modeling_nemotron_h import _nemotron_h_mamba2_mixer_cls
+    from arctic_platform.model.implementations.nemotron_h.modeling_nemotron_h import build_mamba2_mixer
 
     config = NemotronHConfig(
         hidden_size=256,
@@ -60,7 +60,7 @@ def _mixer(heads=8, groups=2):
     )
     _ensure_zamba2_compat(config)
     torch.manual_seed(0)
-    mixer = _nemotron_h_mamba2_mixer_cls()(config, layer_idx=0)
+    mixer = build_mamba2_mixer(config, 0)
     with torch.no_grad():
         mixer.A_log.uniform_(-1, 1)
         mixer.dt_bias.uniform_(-3, -1)
@@ -115,10 +115,10 @@ def test_context_parallel_fused_forward_matches_the_per_op_path():
 VARLEN_CU = [0, 700, 701, 1900, 3072]
 VARLEN_ACTIVE = [700, 1, 600, 1000]
 # Bounds against float64, per gradient: |norm(grad) / norm(float64 grad) - 1| and norm(grad - float64 grad) /
-# norm(float64 grad). Over 10 seeds on an H200, BF16 rounding put conv1d's relative errors at 3.9e-3 to 4.8e-3 (fused)
-# and 5.2e-3 to 6.1e-3 (per-op) and every weight's norm ratio within 6e-4; the per-head scalars (dt_bias, A_log, D) sum
-# fewer terms (ratios to 5.3e-3, errors to 1.1e-2). So a 1% conv-weight error fails: a 1% scale moves the ratio by
-# 1e-2, a 1% error in a random direction puts the error at 1.1e-2 or more.
+# norm(float64 grad). Over 10 seeds on an H200 (at the sampler's unfloored dt), BF16 rounding put conv1d.weight's
+# relative errors at 4.4e-3 to 4.7e-3 (fused) and 5.7e-3 to 6.2e-3 (per-op) and every weight's norm ratio within 7e-4;
+# the per-head scalars (dt_bias, A_log, D) sum fewer terms (ratios to 6.1e-3, errors to 9.8e-3). So a 1% conv-weight
+# error fails: a 1% scale moves the ratio by 1e-2, a 1% error in a random direction puts the error at 1.1e-2 or more.
 RATIO_TOL = {"dt_bias": 1e-2, "A_log": 1e-2, "D": 1e-2}
 RATIO_TOL_DEFAULT = 3e-3
 REL_TOL = {"conv1d.weight": 9e-3, "conv1d.bias": 9e-3}
@@ -127,18 +127,19 @@ REL_TOL_DEFAULT = 2e-2
 
 def _layer0_like_mixer(seed, hidden_size=512):
     """Nemotron-3-Nano's mixer shapes (64 heads of 64, 8 groups of 128 states, width-4 conv, 128-token chunks) in the
-    regimes its layer 0 puts the kernels in: dt under the 1e-3 floor on 6 heads and past the softplus threshold of 20
-    on 4, A down to -1800 where dt is small, D of 26 on 4 heads.
+    regimes its layer 0 puts the kernels in: dt under 1e-3 at every token on 6 heads (where Transformers' mixer would
+    floor it; the training mixer, build_mamba2_mixer, runs the sampler's unfloored dt) and crossing 1e-3 from token to
+    token on 2, past the softplus threshold of 20 on 4, A down to -1800 where dt is small, D of 26 on 4 heads.
 
     The rest is kept well conditioned, so that the bounds measure the mixer rather than the layer: each head's decay
     per token (dt * |A|) within 1e-2 to 2.5, its gain sqrt(dt / |A|) under 3, small conv biases. Random layers with
-    O(1) conv biases (layer 0's reach 25.5), heads whose dt crosses the floor from token to token, or long high-gain
-    memories let BF16 rounding of the forward alone move conv1d's gradients by 5-100% on both paths alike (a float64
-    emulation of the BF16 rounding points shows it). The trained layer on its real input does not.
+    O(1) conv biases (layer 0's reach 25.5), long high-gain memories, or (with a dt floor) heads whose dt crosses it
+    from token to token let BF16 rounding of the forward alone move conv1d's gradients by 5-100% on both paths alike (a
+    float64 emulation of the BF16 rounding points shows it). The trained layer on its real input does not.
     """
     from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import NemotronHConfig
     from arctic_platform.model.implementations.nemotron_h.modeling_nemotron_h import _ensure_zamba2_compat
-    from arctic_platform.model.implementations.nemotron_h.modeling_nemotron_h import _nemotron_h_mamba2_mixer_cls
+    from arctic_platform.model.implementations.nemotron_h.modeling_nemotron_h import build_mamba2_mixer
 
     config = NemotronHConfig(
         hidden_size=hidden_size,
@@ -157,7 +158,7 @@ def _layer0_like_mixer(seed, hidden_size=512):
         num_experts_per_tok=2,
     )
     _ensure_zamba2_compat(config)
-    mixer = _nemotron_h_mamba2_mixer_cls()(config, layer_idx=0)
+    mixer = build_mamba2_mixer(config, 0)
     gen = torch.Generator().manual_seed(seed)
 
     def uniform(n, low, high):
@@ -166,9 +167,10 @@ def _layer0_like_mixer(seed, hidden_size=512):
     heads, channels = mixer.num_heads, mixer.conv_dim
     dt_bias = uniform(heads, math.log(0.02), math.log(21.0)).exp().expm1().log()  # softplus(dt_bias) from 0.02 to 21
     which = torch.randperm(heads, generator=gen)
-    dt_bias[which[:6]] = uniform(6, -12.0, -10.0)  # dt under the 1e-3 floor at every token
-    dt_bias[which[6:10]] = uniform(4, 20.5, 21.25)  # past softplus's threshold of 20
-    dt = F.softplus(dt_bias).clamp(min=1e-3)
+    dt_bias[which[:6]] = uniform(6, -12.0, -10.0)  # dt of 6e-6 to 4.5e-5, under 1e-3 at every token
+    dt_bias[which[6:8]] = uniform(2, -7.5, -6.5)  # dt around 1e-3, crossing it from token to token
+    dt_bias[which[8:12]] = uniform(4, 20.5, 21.25)  # past softplus's threshold of 20
+    dt = F.softplus(dt_bias).clamp(min=1e-3)  # A from the decay at 1e-3 for the smallest dt: A to -1800 there
     decay = uniform(heads, math.log(1e-2), math.log(2.5)).exp()
     A = torch.maximum(decay / dt, dt / 9.0).clamp(max=1800.0)
     D = uniform(heads, -1.0, 4.0)
@@ -223,15 +225,14 @@ def _ssd(X, A, B, C, chunk):
 
 def _float64_mixer(mixer, hidden, cu):
     """The mixer in float64 torch ops, one document at a time: in_proj, causal conv1d and SiLU, the scan with the D
-    skip (softplus(dt + dt_bias) floored at time_step_limit[0]), the gated group RMSNorm, out_proj. Returns the input,
-    the parameters and the output, all float64 leaves / results for backward."""
+    skip at the sampler's time step (vLLM's MambaMixer2: softplus(dt + dt_bias), never floored), the gated group
+    RMSNorm, out_proj. Returns the input, the parameters and the output, all float64 leaves / results for backward."""
     p = {n: q.detach().double().requires_grad_() for n, q in mixer.named_parameters()}
     x_in = hidden.detach()[0].double().requires_grad_()
     heads, head_dim, groups, state = mixer.num_heads, mixer.head_dim, mixer.n_groups, mixer.ssm_state_size
     dim, width, chunk = heads * head_dim, p["conv1d.weight"].shape[-1], mixer.chunk_size
     z, xBC, dt_raw = (x_in @ p["in_proj.weight"].t()).split([dim, mixer.conv_dim, heads], dim=-1)
     A = -torch.exp(p["A_log"])
-    dt_min = mixer.time_step_limit[0]
     group = torch.arange(heads, device=x_in.device) // (heads // groups)
     outs = []
     for s, e in zip(cu[:-1], cu[1:]):
@@ -241,7 +242,6 @@ def _float64_mixer(mixer, hidden, cu):
         x, B, C = F.silu(conv[0, :, : e - s]).t().split([dim, groups * state, groups * state], dim=-1)
         dt = dt_raw[s:e] + p["dt_bias"]
         dt = torch.where(dt <= 20.0, F.softplus(dt), dt)
-        dt = torch.where(dt < dt_min, torch.full_like(dt, dt_min), dt)
         x = x.reshape(e - s, heads, head_dim)
         B, C = (t.reshape(e - s, groups, state)[:, group] for t in (B, C))
         pad = -(e - s) % chunk
@@ -257,6 +257,8 @@ def varlen_gradient_errors(seed):
     """Per varlen path and per gradient (parameters and the input): (norm ratio, relative error) against float64, at
     one fixed upstream gradient."""
     mixer = _layer0_like_mixer(seed)
+    assert mixer.time_step_limit == (0.0, float("inf"))  # the sampler's, as built for training
+    assert (F.softplus(mixer.dt_bias.float()) < 1e-3).sum() >= 6  # heads Transformers' 1e-3 floor would raise
     gen = torch.Generator(device="cuda").manual_seed(seed)
     total = VARLEN_CU[-1]
     hidden = torch.randn(1, total, mixer.hidden_size, device="cuda", generator=gen).bfloat16()
@@ -287,9 +289,10 @@ def varlen_gradient_errors(seed):
 @pytest.mark.parametrize("seed", [0, 1])
 def test_varlen_gradients_match_float64(seed):
     """Both non-CP varlen paths (one packed call, seq_idx boundaries) on layer-0-like parameters: every gradient's norm
-    and error against float64's within its bounds, at one fixed upstream gradient. The correctness suite's
-    whole-model gaps on these tensors (Nemotron-3-Nano layer 0's dt_bias, A_log, D, conv1d) move with the upstream
-    gradient, which BF16 rounding anywhere above layer 0 changes; at a fixed one the mixer itself is checked."""
+    and error against float64's at the sampler's unfloored dt within its bounds, at one fixed upstream gradient, with
+    8 heads' dt under 1e-3 at some or every token. The correctness suite's whole-model gaps on these tensors
+    (Nemotron-3-Nano layer 0's dt_bias, A_log, D, conv1d) move with the upstream gradient, which BF16 rounding anywhere
+    above layer 0 changes; at a fixed one the mixer itself is checked."""
     _fused_or_skip()
     errors = varlen_gradient_errors(seed)
     for path, per_tensor in errors.items():
