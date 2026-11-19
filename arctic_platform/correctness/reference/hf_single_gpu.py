@@ -53,6 +53,8 @@ from typing import Optional
 import torch
 
 from arctic_platform.correctness.harness.storage import require_data_fast_path
+from arctic_platform.correctness.reference.glm5_next_reference import GLM5_NEXT_MODEL_TYPES
+from arctic_platform.correctness.reference.glm5_next_reference import load_glm5_next_reference
 
 IGNORE_INDEX = -100
 
@@ -278,6 +280,15 @@ def build_engine(
 
         model = load_qwen4_reference(
             cls, model_path, dtype=torch_dtype, attn_implementation=attn_implementation, device=device
+        )
+    elif getattr(cfg, "model_type", None) in GLM5_NEXT_MODEL_TYPES:
+        # GLM-5.3-Flash at the sampler's precision (FP32 mHC remix and base/scale, KDA beta, one-rounding norms).
+        model = load_glm5_next_reference(
+            transformers.AutoModelForCausalLM if huggingface_loader else cls,
+            model_path,
+            dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            device=device,
         )
     else:
         if huggingface_loader:

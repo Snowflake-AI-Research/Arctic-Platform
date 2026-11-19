@@ -204,6 +204,7 @@ from arctic_platform.correctness.reference import hf_single_gpu
 from arctic_platform.correctness.reference import optimizer_step
 from arctic_platform.correctness.reference import process_determinism
 from arctic_platform.correctness.reference.adamw_trajectory import AdamWTrajectory
+from arctic_platform.correctness.reference.glm5_next_reference import load_glm5_next_reference
 from arctic_platform.correctness.reference.hf_single_gpu import build_engine
 from arctic_platform.correctness.reference.hf_single_gpu import fixed_row_groups
 from arctic_platform.correctness.reference.hf_single_gpu import mixer_boundaries
@@ -13987,6 +13988,123 @@ def test_qwen4_reference_actual_build_engine_family_dispatch(monkeypatch, model_
     else:
         assert calls[0] == {"dtype": torch.bfloat16, "attn_implementation": "qsa_flex"}
         assert model.layers[0].ple.ple_embedding.ngram_embedding.weight.requires_grad
+
+
+# GLM-5.3-Flash reference precision.
+
+
+class _glm5_next_reference_Fixed(nn.Module):
+    """A sublayer or hyper-connection site that returns fixed outputs, so a decoder layer's forward is its remixes."""
+
+    def __init__(self, *outputs):
+        super().__init__()
+        self.outputs = outputs
+
+    def forward(self, *args, **kwargs):
+        return self.outputs if len(self.outputs) > 1 else self.outputs[0]
+
+
+def _glm5_next_reference_one_rounding(computed, exact):
+    """Elements of ``computed`` (bf16) more than a rounding of ``exact`` (float64) away from it."""
+    spacing = torch.finfo(torch.bfloat16).eps * torch.exp2(torch.floor(torch.log2(exact.abs().clamp_min(1e-30))))
+    return int(((computed.double() - exact).abs() > 0.5 * spacing * (1 + 1e-4) + 1e-30).sum())
+
+
+def test_glm5_next_reference_follows_the_samplers_fp32_mhc_remix_parameters_beta_and_norms():
+    """GLM-5.3-Flash-BF16 full fine-tuning failed single-step-grads on layers.3.attn_hc.scale / ffn_hc.scale by
+    4-6e-3 (gate 3e-3): Transformers remixes the hyper-connection streams in BF16, holds hc base/scale in BF16, takes
+    the KDA beta sigmoid in BF16 and rounds every RMSNorm twice, where vLLM's GLM-5.3-Flash and the target do each in
+    FP32 with one rounding. The reference has to load and run the model the sampler's way."""
+    from transformers.models.glm5_next import modeling_glm5_next as glm5_next
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
+
+    cfg = Glm5NextTextConfig(
+        vocab_size=32,
+        hidden_size=64,
+        intermediate_size=96,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        layer_types=["linear_attention"],
+        mlp_layer_types=["dense"],
+        linear_head_dim=16,
+        linear_num_heads=4,
+        hc_mult=4,
+        pad_token_id=0,
+    )
+    original_keep = glm5_next.Glm5NextPreTrainedModel._keep_in_fp32_modules_strict
+    loads = []
+
+    def from_pretrained(path, **kwargs):
+        # A BF16 load keeps in FP32 what _keep_in_fp32_modules_strict names when the load starts.
+        keep = list(glm5_next.Glm5NextPreTrainedModel._keep_in_fp32_modules_strict)
+        loads.append((path, kwargs, keep))
+        torch.manual_seed(0)
+        model = nn.Module()
+        model.layers = nn.ModuleList([glm5_next.Glm5NextTextDecoderLayer(cfg, 0)])
+        model.norm = glm5_next.Glm5NextTextRMSNorm(cfg.hidden_size)
+        with torch.no_grad():
+            model.norm.weight.uniform_(0.5, 1.5)
+        for name, parameter in model.named_parameters():
+            if not any(kept in name for kept in keep):
+                parameter.data = parameter.data.to(kwargs["dtype"])
+        return model
+
+    model = load_glm5_next_reference(
+        SimpleNamespace(from_pretrained=from_pretrained),
+        "fixture",
+        dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+        device="cpu",
+    )
+    assert [(path, kwargs) for path, kwargs, _ in loads] == [
+        ("fixture", {"dtype": torch.bfloat16, "attn_implementation": "sdpa"})
+    ]
+    assert {"attn_hc.base", "attn_hc.scale", "ffn_hc.base", "ffn_hc.scale"} <= set(loads[0][2])
+    assert glm5_next.Glm5NextPreTrainedModel._keep_in_fp32_modules_strict is original_keep
+    layer = model.layers[0]
+    for site in (layer.attn_hc, layer.ffn_hc):
+        assert site.base.dtype == site.scale.dtype == torch.float32
+        assert site.fn.dtype == torch.bfloat16
+
+    torch.manual_seed(1)
+    tokens = torch.randn(2, 8, cfg.hidden_size).bfloat16()
+    # The KDA beta gate: sigmoid over the projection's logits widened to FP32.
+    assert layer.self_attn.b_proj(tokens).dtype == torch.float32
+    # RMSNorm: FP32 statistics and weight, one rounding.
+    x = tokens.double()
+    exact = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + model.norm.variance_epsilon) * model.norm.weight.double()
+    assert _glm5_next_reference_one_rounding(model.norm(tokens), exact) == 0
+    assert _glm5_next_reference_one_rounding(glm5_next.Glm5NextTextRMSNorm.forward(model.norm, tokens), exact) > 0
+
+    # Both remixes post * y + comb^T @ streams in FP32, rounded once.
+    def site():
+        post = 2 * torch.rand(2, 8, 4)
+        comb = torch.softmax(torch.randn(2, 8, 4, 4), dim=-1)
+        return post, comb, torch.randn(2, 8, cfg.hidden_size).bfloat16()
+
+    (post1, comb1, collapsed1), (post2, comb2, collapsed2) = site(), site()
+    attention_out = torch.randn(2, 8, cfg.hidden_size).bfloat16()
+    mlp_out = torch.randn(2, 8, cfg.hidden_size).bfloat16()
+    layer.attn_hc = _glm5_next_reference_Fixed(post1, comb1, collapsed1)
+    layer.ffn_hc = _glm5_next_reference_Fixed(post2, comb2, collapsed2)
+    layer.self_attn = _glm5_next_reference_Fixed(attention_out)
+    layer.mlp = _glm5_next_reference_Fixed(mlp_out)
+    streams = torch.randn(2, 8, 4, cfg.hidden_size).bfloat16()
+
+    def remix(post, comb, y, residual):
+        exact = post.double().unsqueeze(-1) * y.double().unsqueeze(-2) + torch.einsum(
+            "...ij,...ih->...jh", comb.double(), residual.double()
+        )
+        return exact.to(torch.bfloat16), exact
+
+    middle, exact_middle = remix(post1, comb1, attention_out, streams)
+    _, exact_out = remix(post2, comb2, mlp_out, middle)
+    out, _ = layer(streams)
+    assert out.dtype == torch.bfloat16
+    assert _glm5_next_reference_one_rounding(out, exact_out) == 0
+    transformers_out, _ = glm5_next.Glm5NextTextDecoderLayer.forward(layer, streams)
+    assert _glm5_next_reference_one_rounding(transformers_out, exact_out) > 0
 
 
 # Sft.
