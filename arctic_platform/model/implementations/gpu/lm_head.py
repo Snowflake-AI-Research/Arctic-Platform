@@ -619,6 +619,7 @@ def chunked_lm_head_logprobs(
     action_masks=None,
     group_token_ids=None,
     softcap: float | None = None,
+    fused_head: bool = True,
 ):
     """Per-token and optional grouped log probabilities via tiled matmuls.
 
@@ -626,6 +627,9 @@ def chunked_lm_head_logprobs(
     a 1-D token axis. When ``group_token_ids`` is present, returns
     ``(logprobs [B,S], group_log_probs [B,S,M+1])``. ``softcap`` applies
     Gemma's ``final_logit_softcapping`` to the logits before temperature.
+    ``fused_head=False`` keeps the tiled composition for calls the fused CUDA
+    head would take (:func:`_fused_head_applies`): the correctness suite's
+    reference must not share the target's kernel.
     """
     import torch
 
@@ -661,7 +665,7 @@ def chunked_lm_head_logprobs(
 
     inv_temperature = inv_temperature_for_tokens(temperature, batch_size, seq_len, hidden_states.device)
 
-    if _fused_head_applies(
+    if fused_head and _fused_head_applies(
         hidden_flat,
         weight,
         bias=bias,

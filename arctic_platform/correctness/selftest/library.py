@@ -9052,6 +9052,69 @@ def test_reference_loss_applies_final_logit_softcapping(chunked):
     assert loss(None) == pytest.approx(uncapped, rel=1e-4)
 
 
+def test_reference_head_is_the_tiled_composition_never_the_targets_fused_cuda_head(monkeypatch):
+    """The reference projects its head through Arctic's chunked_lm_head_logprobs, which sends 16-bit CUDA calls to the
+    target's fused CUDA head. Sharing that kernel, the reference carried its error (a grad_hidden 0.025% under
+    float64's at a 248,320-entry vocabulary), and against a target running the same head the check could not see it.
+    Both reference routes, forward-backward and the positional log-probs, keep the tiled composition for a call the
+    fused head would take, and return the composition's own numbers."""
+    from arctic_platform.correctness.reference import sft_trajectory
+    from arctic_platform.model.implementations.gpu import lm_head
+
+    torch.manual_seed(0)
+
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(16, 8)
+
+        def forward(self, input_ids, use_cache=False):
+            return SimpleNamespace(last_hidden_state=self.embed(input_ids))
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = Decoder()
+            self.head = torch.nn.Linear(8, 16, bias=False)
+
+    model = Model().bfloat16()
+    input_ids = torch.randint(0, 16, (2, 12))
+    labels = torch.roll(input_ids, -1, dims=1)
+    labels[:, -1] = hf_single_gpu.IGNORE_INDEX
+    batch = SimpleNamespace(input_ids=input_ids, shifted_labels=lambda: labels)
+    engine = hf_single_gpu.ReferenceEngine(
+        model=model, decoder=model.decoder, head=model.head, hidden_size=8, head_name="head.weight", device="cpu"
+    )
+    chunks = dict(lm_head_token_chunk_size=4, lm_head_vocab_chunk_size=8)
+
+    def reference():
+        result = hf_single_gpu._forward_backward(engine, batch, **chunks)
+        return result.loss, result.gradients, sft_trajectory.positional_logprobs(engine, batch, **chunks)
+
+    composition = reference()  # the fused head never applies on the CPU
+
+    class FusedHead:
+        @staticmethod
+        def apply(*args):
+            raise AssertionError("ran the target's fused CUDA head")
+
+    # From here on every call qualifies for the fused head, as a BF16 call on CUDA does, and the target's takes it.
+    monkeypatch.setattr(lm_head, "_fused_head_applies", lambda *args, **kwargs: True)
+    monkeypatch.setattr(lm_head, "_get_fused_chunked_logprob_fn", lambda: FusedHead)
+    hidden = model.decoder(input_ids).last_hidden_state.detach()
+    with pytest.raises(AssertionError, match="fused CUDA head"):
+        lm_head.chunked_lm_head_logprobs(
+            hidden, model.head.weight, labels, token_chunk_size=4, vocab_chunk_size=8, fp32_lm_head=False
+        )
+
+    loss, gradients, logprobs = reference()
+    assert loss == composition[0]
+    assert gradients.keys() == composition[1].keys()
+    for name, gradient in gradients.items():
+        assert torch.equal(gradient, composition[1][name]), name
+    assert torch.equal(logprobs, composition[2])
+
+
 def test_reference_accumulator_moves_to_the_gpu_only_with_room_and_drains_the_host_path_bits(monkeypatch):
     """A 9.7B-parameter full-FT reference spent 98% of its time draining every gradient into a host accumulator.
 

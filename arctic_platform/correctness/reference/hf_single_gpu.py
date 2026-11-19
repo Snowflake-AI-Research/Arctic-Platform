@@ -523,6 +523,8 @@ def _forward_backward(
         flat_labels = labels_mb.reshape(-1)
 
         if lm_head_token_chunk_size is not None:
+            # The tiled composition (upstream's head), never the target's fused CUDA head: a reference that runs the
+            # target's kernel carries its error, and the target-vs-reference check cannot see it.
             logprobs = chunked_lm_head_logprobs(
                 detached,
                 head.weight,
@@ -532,6 +534,7 @@ def _forward_backward(
                 vocab_chunk_size=lm_head_vocab_chunk_size,
                 fp32_lm_head=fp32_lm_head,
                 softcap=engine.softcap,
+                fused_head=False,
             )
             valid = labels_mb != IGNORE_INDEX
             loss = -torch.where(valid, logprobs.float(), 0.0).sum() / active_tokens
