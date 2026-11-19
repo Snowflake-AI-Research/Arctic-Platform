@@ -45,6 +45,7 @@ from arctic_platform.model_plugin.parallel import shard_sequence
 from arctic_platform.model_plugin.recompute import apply_activation_checkpointing
 from arctic_platform.model_plugin.weights import iter_hf_weights
 from arctic_platform.testing_utils import get_unique_port_number
+from arctic_platform.testing_utils import parse_flag_from_env
 from arctic_platform.testing_utils import require_torch_gpu
 from arctic_platform.testing_utils import require_torch_multi_gpu
 from arctic_platform.testing_utils import reserve_free_port
@@ -84,6 +85,20 @@ CASES = [
     (8, 2, 8),
     (8, 8, 8),
 ]
+
+# One layout of each kind runs by default: pure SP, pure EP, equal SP and EP, ep > sp, sp > ep. The rest of the
+# matrix runs with AP_FULL_LAYOUT_MATRIX=1, for changes to the parallel code itself.
+FULL_LAYOUT_MATRIX = parse_flag_from_env("AP_FULL_LAYOUT_MATRIX")
+DEFAULT_CASES = {(2, 2, 1), (2, 1, 2), (4, 2, 2), (8, 2, 4), (8, 4, 2)}
+
+
+def _layouts(cases, default=DEFAULT_CASES):
+    """``cases`` as parameters; outside ``default`` they skip unless AP_FULL_LAYOUT_MATRIX is set."""
+    skip = pytest.mark.skipif(not FULL_LAYOUT_MATRIX, reason="set AP_FULL_LAYOUT_MATRIX=1 to run every layout")
+    return [
+        pytest.param(w, s, e, id=f"w{w}-sp{s}-ep{e}", marks=() if (w, s, e) in default else skip) for w, s, e in cases
+    ]
+
 
 TOLERANCE = {torch.float32: 1e-5, torch.bfloat16: 5e-2}
 
@@ -253,22 +268,20 @@ def test_parallel_tier_over_nccl(mode):
 
 @require_torch_multi_gpu
 @pytest.mark.integration
-@pytest.mark.parametrize("world, sp, ep", CASES, ids=[f"w{w}-sp{s}-ep{e}" for w, s, e in CASES])
+@pytest.mark.parametrize("world, sp, ep", _layouts(CASES))
 def test_sp_ep_layouts_match_unsharded(world, sp, ep):
     _run(world, sp, ep)
 
 
 @require_torch_multi_gpu
 @pytest.mark.integration
-@pytest.mark.parametrize(
-    "world, sp, ep", [(4, 2, 2), (8, 2, 4), (8, 4, 2)], ids=["w4-sp2-ep2", "w8-sp2-ep4", "w8-sp4-ep2"]
-)
+@pytest.mark.parametrize("world, sp, ep", _layouts([(4, 2, 2), (8, 2, 4), (8, 4, 2)], default={(4, 2, 2)}))
 def test_sp_ep_layouts_with_activation_checkpointing(world, sp, ep):
     _run(world, sp, ep, checkpointing=True)
 
 
 @require_torch_multi_gpu
 @pytest.mark.integration
-@pytest.mark.parametrize("world, sp, ep", [(4, 2, 2), (8, 2, 4)], ids=["w4-sp2-ep2", "w8-sp2-ep4"])
+@pytest.mark.parametrize("world, sp, ep", _layouts([(4, 2, 2), (8, 2, 4)], default={(4, 2, 2)}))
 def test_sp_ep_layouts_bf16(world, sp, ep):
     _run(world, sp, ep, dtype=torch.bfloat16, checkpointing=True)

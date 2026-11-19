@@ -18,7 +18,7 @@
 At scale the platform builds the model on the meta device, which costs no memory, then allocates it with
 ``to_empty`` and fills it from the checkpoint (ZeRO then partitions it). A buffer computed in ``__init__`` and not checkpointed
 (a rotary ``inv_freq``, a counter) would be left as uninitialized memory, so a module with such buffers implements
-``ap_init_buffers()``, which :func:`materialize` calls on every module after ``to_empty``.
+``ap_init_buffers()`` (:class:`~arctic_platform.model_plugin.interfaces.InitializesBuffers`), which :func:`materialize` calls on every module after ``to_empty``.
 """
 
 from __future__ import annotations
@@ -29,12 +29,11 @@ from typing import Any
 import torch
 from torch import nn
 
+from arctic_platform.model_plugin.interfaces import InitializesBuffers
 from arctic_platform.model_plugin.marks import MARKS_ATTR
 from arctic_platform.model_plugin.marks import apply_marks
 from arctic_platform.model_plugin.marks import cast_model
 from arctic_platform.model_plugin.plugin import ModelPlugin
-
-INIT_BUFFERS_METHOD = "ap_init_buffers"
 
 
 def build(plugin: ModelPlugin, config: Any, options: Any = None, *, meta: bool = False) -> nn.Module:
@@ -48,11 +47,11 @@ def build(plugin: ModelPlugin, config: Any, options: Any = None, *, meta: bool =
 
 
 def init_buffers(model: nn.Module) -> None:
-    """Call ``ap_init_buffers()`` on every module that defines it."""
+    """Call ``ap_init_buffers()`` on every :class:`InitializesBuffers` module."""
     for module in model.modules():
-        initialize = getattr(module, INIT_BUFFERS_METHOD, None)
-        if initialize is not None:
-            initialize()
+        # callable(): a subclass opts out with ``ap_init_buffers = None`` but still inherits the protocol.
+        if isinstance(module, InitializesBuffers) and callable(module.ap_init_buffers):
+            module.ap_init_buffers()
 
 
 def materialize(model: nn.Module, device: str | torch.device, dtype: torch.dtype | None = None) -> nn.Module:

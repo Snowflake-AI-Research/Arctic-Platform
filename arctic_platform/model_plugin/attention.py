@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from arctic_platform.model_plugin.interfaces import SequenceMixingModule
 from arctic_platform.model_plugin.parallel import FULL_SHARD
 from arctic_platform.model_plugin.parallel import HeadShard
 
@@ -63,7 +64,7 @@ def varlen_causal_attention(
     return out.transpose(1, 2)
 
 
-class AttentionModule(nn.Module):
+class AttentionModule(nn.Module, SequenceMixingModule):
     """Base class for a plugin's full-attention block.
 
     A subclass sets ``ap_layer_type``, ``num_heads``, ``num_kv_heads``, ``head_dim`` and optionally

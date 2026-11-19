@@ -32,9 +32,9 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import torch
-from torch import nn
 
 from arctic_platform.model_plugin.experts import ROUTER_REPLAY_FRESH
+from arctic_platform.model_plugin.interfaces import RoutedModule
 from arctic_platform.model_plugin.recompute import active_frames
 
 ROUTING_TAPE_ATTR = "_ap_routing_tape"
@@ -92,31 +92,31 @@ class RoutingTape:
         return out
 
 
-_ROUTED_CLASSES: dict[tuple[type, str], type] = {}
+_ROUTED_CLASSES: dict[type, type] = {}
 
 
-def _routed_class(cls: type, method: str) -> type:
-    """``cls`` with ``method`` routed through the module's tape. A subclass rather than an instance attribute, so a
+def _routed_class(cls: type) -> type:
+    """``cls`` with ``route`` routed through the module's tape. A subclass rather than an instance attribute, so a
     deep copy of the model routes through its own weights."""
-    key = (cls, method)
-    if key not in _ROUTED_CLASSES:
+    if cls not in _ROUTED_CLASSES:
 
         def route(self, *args, **kwargs):
             kwargs.pop("routed", None)  # the platform decides what is replayed
             layer, tape = getattr(self, _ROUTING_ATTR)
-            original = getattr(cls, method)  # looked up per call, so the class's current method runs
+            original = cls.route  # looked up per call, so the class's current method runs
             return tape.route(layer, lambda ids: original(self, *args, routed=ids, **kwargs))
 
-        attributes = {method: route, "__qualname__": cls.__qualname__, "_ap_routed": True}
-        _ROUTED_CLASSES[key] = type(cls.__name__, (cls,), attributes)
-    return _ROUTED_CLASSES[key]
+        attributes = {"route": route, "__qualname__": cls.__qualname__, "_ap_routed": True}
+        _ROUTED_CLASSES[cls] = type(cls.__name__, (cls,), attributes)
+    return _ROUTED_CLASSES[cls]
 
 
-def install_routing(module: nn.Module, layer_index: int, tape: RoutingTape, method: str = "route") -> None:
-    """Route ``module.<method>`` through ``tape`` as decoder layer ``layer_index``. Installing again rebinds.
+def install_routing(module: RoutedModule, layer_index: int, tape: RoutingTape) -> None:
+    """Route ``module.route`` (:class:`~arctic_platform.model_plugin.interfaces.RoutedModule`) through ``tape`` as
+    decoder layer ``layer_index``. Installing again rebinds.
 
     The module's class is swapped for a routed subclass (deep copies route through their own weights); a prepared
     model therefore cannot be pickled whole. Save it as a checkpoint."""
     setattr(module, _ROUTING_ATTR, (layer_index, tape))
     if not getattr(type(module), "_ap_routed", False):  # inherited by anything that subclasses it later
-        module.__class__ = _routed_class(type(module), method)
+        module.__class__ = _routed_class(type(module))

@@ -40,6 +40,7 @@ from .config import ToyHybridMoEConfig
 from .modeling import ToyMoE
 from .modeling import ToyRecurrence
 from .modeling import ToyShortConv
+from .modeling import ToyValueConv
 from .options import ToyOptions
 
 
@@ -78,6 +79,8 @@ class ShortConvMixer:
         """No head constraint: the shard-length constraint is checked when the halo is exchanged."""
 
     def apply_sequence_parallel(self, module: nn.Module, group) -> None:
+        if not isinstance(module, (ToyShortConv, ToyValueConv)):
+            raise TypeError(f"ShortConvMixer runs short convolutions, not {type(module).__name__}")
         core = module.mix
         halo = module.kernel - 1
 

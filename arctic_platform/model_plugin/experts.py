@@ -23,9 +23,10 @@ moves tokens itself.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from typing import Protocol
+from typing import cast
 from typing import runtime_checkable
 
 import torch
@@ -36,6 +37,9 @@ from arctic_platform.model_plugin.parallel import combine_tokens
 from arctic_platform.model_plugin.parallel import gather_tokens
 from arctic_platform.model_plugin.parallel import group_rank
 from arctic_platform.model_plugin.parallel import group_size
+
+if TYPE_CHECKING:
+    from arctic_platform.model_plugin.interfaces import StackedMoEModule
 
 # Must equal ROUTER_REPLAY_FRESH in arctic_platform.model.implementations.moe.layers.moe, which the platform's own
 # MoE layer reads: a replayed token with this id is routed by the trainer's own gate.
@@ -74,12 +78,10 @@ class ExpertShard:
 class ExpertLayer(Protocol):
     """A plugin's mixture-of-experts integration: which tensors are experts, and how they are sharded.
 
-    Expert weights are stacked with the expert index as dim 0. :class:`StackedExpertLayer` implements this for
+    The modules it claims MUST be :class:`~arctic_platform.model_plugin.interfaces.RoutedModule`. Expert weights are
+    stacked with the expert index as dim 0. :class:`StackedExpertLayer` implements this for
     modules that follow the ``experts_core`` contract; write your own only for a different dispatch policy.
     """
-
-    route_method: str
-    """The module method that routes tokens, ``route(tokens, routed=None) -> (selected, ...)``."""
 
     def is_instance(self, module: nn.Module) -> bool: ...
 
@@ -107,7 +109,7 @@ def shard_experts(module: nn.Module, names: list[str], group) -> None:
         setattr(owner, attribute, local)
 
 
-def expert_parallel(module: nn.Module, group, names: list[str], num_experts: int) -> None:
+def expert_parallel(module: StackedMoEModule, group, names: list[str], num_experts: int) -> None:
     """Shard ``module``'s stacked experts and run its ``experts_core`` expert-parallel across ``group``.
 
     Each rank keeps its block of experts. The wrapped core receives every rank's tokens, expert ids and gate
@@ -115,8 +117,8 @@ def expert_parallel(module: nn.Module, group, names: list[str], num_experts: int
     are summed back to the rank that owns each token.
     """
     shard = ExpertShard(group_rank(group), group_size(group), num_experts)
-    shard_experts(module, names, group)
-    core: Callable[..., torch.Tensor] = getattr(module, "experts_core")
+    shard_experts(cast(nn.Module, module), names, group)
+    core = module.experts_core
 
     def experts_core(
         tokens: torch.Tensor, selected: torch.Tensor, weights: torch.Tensor, *, shard: ExpertShard = shard
@@ -126,18 +128,18 @@ def expert_parallel(module: nn.Module, group, names: list[str], num_experts: int
         )
         return combine_tokens(group, partial)
 
-    setattr(module, "experts_core", experts_core)
+    setattr(module, "experts_core", experts_core)  # on the instance: this module's experts, this group
 
 
 class StackedExpertLayer:
-    """An expert layer for MoE modules with a ``num_experts`` attribute, stacked experts and an ``experts_core``.
+    """An expert layer for :class:`~arctic_platform.model_plugin.interfaces.StackedMoEModule` modules: a
+    ``num_experts`` attribute, experts stacked on dim 0, and an ``experts_core``.
 
     ``expert_names`` are the stacked expert tensors relative to the module, for example ``("experts.w1", ...)``.
     """
 
     module_class: type[nn.Module] = nn.Module
     expert_names: tuple[str, ...] = ()
-    route_method: str = "route"
 
     def __init__(self, module_class: type[nn.Module] | None = None, expert_names: tuple[str, ...] | None = None):
         if module_class is not None:
@@ -151,10 +153,10 @@ class StackedExpertLayer:
         return isinstance(module, self.module_class)
 
     def num_experts(self, module: nn.Module) -> int:
-        return int(getattr(module, "num_experts"))
+        return int(cast("StackedMoEModule", module).num_experts)
 
     def expert_parameters(self, module: nn.Module) -> dict[str, nn.Parameter]:
         return {name: module.get_parameter(name) for name in self.expert_names}
 
     def apply_expert_parallel(self, module: nn.Module, group) -> None:
-        expert_parallel(module, group, list(self.expert_names), self.num_experts(module))
+        expert_parallel(cast("StackedMoEModule", module), group, list(self.expert_names), self.num_experts(module))

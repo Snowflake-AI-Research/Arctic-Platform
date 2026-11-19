@@ -19,11 +19,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 from typing import Protocol
+from typing import cast
 from typing import runtime_checkable
 
 from torch import nn
 
 from arctic_platform.model_plugin.attention import AttentionModule
+from arctic_platform.model_plugin.interfaces import SequenceMixingModule
 from arctic_platform.model_plugin.parallel import head_parallel
 
 if TYPE_CHECKING:
@@ -73,7 +75,7 @@ class HeadParallelMixer:
                 )
 
     def apply_sequence_parallel(self, module: nn.Module, group) -> None:
-        head_parallel(module, group)
+        head_parallel(cast(SequenceMixingModule, module), group)
 
 
 class AttentionMixer(HeadParallelMixer):

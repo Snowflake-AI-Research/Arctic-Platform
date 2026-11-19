@@ -73,17 +73,19 @@ class ParallelismInfo:
 class ModelPlugin:
     """Everything a model package hands the platform. Export one instance and name it in the package's entry point.
 
-    ``build_model(config)`` returns the trainer model. It keeps ``config`` as ``model.config``, names decoder layer
-    ``i``'s state ``model.layers.<i>.*``, and its forward is
-    ``model(input_ids, position_ids, *, cu_seqlens, routed_experts=None, return_routing=False)``.
+    ``build_model(config, options)`` returns the trainer model, an ``nn.Module`` that is a
+    :class:`~arctic_platform.model_plugin.interfaces.CausalLM`: it keeps ``config`` as ``model.config``, names decoder
+    layer ``i``'s state ``model.layers.<i>.*``, and its forward ``model(input_ids, position_ids, *, cu_seqlens)``
+    returns the final hidden states. :mod:`~arctic_platform.model_plugin.interfaces` lists every hook the platform
+    calls on the model's modules.
     ``convert_layer_to_hf(state, layer_idx, config)`` / ``convert_layer_to_prime`` translate one decoder layer
     between the trainer's tensors and the Hugging Face checkpoint's; leave them unset when the two already match.
     ``reference_forward(model, input_ids)`` is a slow, independent implementation of one unpacked sequence that
     conformance compares the model against.
 
     ``options`` is the pydantic model of the job-time options the plugin accepts, such as a kernel choice; options
-    never change the checkpoint. ``build_model(config, options)`` receives the parsed options, or ``None`` when the
-    plugin declares none.
+    never change the checkpoint. ``build_model`` receives the parsed options, or ``None`` when the plugin declares
+    none.
     ``validate(request, config, options)`` returns the reasons a job cannot run, for constraints the manifest cannot
     express (for example, an option that rules out sequence parallelism); admission reports them with its own.
     ``passthrough(config)`` returns pass-through patterns that depend on the config, added to the manifest's.

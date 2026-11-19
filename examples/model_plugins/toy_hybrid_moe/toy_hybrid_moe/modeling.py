@@ -17,6 +17,10 @@
 
 Plain single-device PyTorch. Nothing here calls ``torch.distributed``: the platform makes the sequence-mixing cores
 sequence-parallel through ``mix`` and shards the experts through the plugin's expert layer.
+
+Every module the platform calls into lists the role it plays as a base after ``nn.Module`` (the protocols in
+``arctic_platform.model_plugin.interfaces``): ``CausalLM``, ``ComputesLogits``, ``InitializesBuffers``,
+``SequenceMixingModule`` and ``StackedMoEModule``. The other modules are plain PyTorch the platform never calls.
 """
 
 from __future__ import annotations
@@ -28,9 +32,14 @@ from torch import nn
 from arctic_platform.model_plugin import FULL_SHARD
 from arctic_platform.model_plugin import FULL_WINDOW
 from arctic_platform.model_plugin import AttentionModule
+from arctic_platform.model_plugin import CausalLM
+from arctic_platform.model_plugin import ComputesLogits
 from arctic_platform.model_plugin import ExpertShard
 from arctic_platform.model_plugin import HeadShard
+from arctic_platform.model_plugin import InitializesBuffers
+from arctic_platform.model_plugin import SequenceMixingModule
 from arctic_platform.model_plugin import SequenceWindow
+from arctic_platform.model_plugin import StackedMoEModule
 from arctic_platform.model_plugin import choose_experts
 from arctic_platform.model_plugin import in_recompute
 from arctic_platform.model_plugin import mark
@@ -62,12 +71,14 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-second, first), dim=-1)
 
 
-class RotaryEmbedding(nn.Module):
+class RotaryEmbedding(nn.Module, InitializesBuffers):
     """Rotary embedding at each token's position within its packed row.
 
     ``inv_freq`` is computed, not checkpointed: under a meta-device build ``ap_init_buffers`` recomputes it, and the
     module is marked fp32 so a bf16 build does not round the frequencies.
     """
+
+    inv_freq: torch.Tensor
 
     def __init__(self, dim: int, theta: float):
         super().__init__()
@@ -102,9 +113,11 @@ def causal_short_conv(
         if shard != FULL_WINDOW:
             raise ValueError("the fused short convolution runs whole rows and cannot run on a sequence shard")
         bounds = cu_seqlens.tolist()
-        rows = [u[0, start:end].T.unsqueeze(0) for start, end in zip(bounds[:-1], bounds[1:])]
-        out = [F.conv1d(F.pad(row, (taps - 1, 0)), weight.unsqueeze(1), groups=weight.shape[0])[0].T for row in rows]
-        return torch.cat(out).unsqueeze(0)
+        whole_rows = [u[0, start:end].T.unsqueeze(0) for start, end in zip(bounds[:-1], bounds[1:])]
+        convolved = [
+            F.conv1d(F.pad(row, (taps - 1, 0)), weight.unsqueeze(1), groups=weight.shape[0])[0].T for row in whole_rows
+        ]
+        return torch.cat(convolved).unsqueeze(0)
     positions = torch.arange(length, device=u.device) + shard.start - shard.halo
     rows = segment_of(cu_seqlens, positions)
     out = torch.zeros_like(u)
@@ -116,7 +129,7 @@ def causal_short_conv(
     return out
 
 
-class ToyValueConv(nn.Module):
+class ToyValueConv(nn.Module, SequenceMixingModule):
     """A short causal convolution on attention values: a sequence-mixing sub-layer inside the attention block.
 
     Its mixer (``parallel.ShortConvMixer``) uses the halo policy, like the short-convolution layer type.
@@ -170,7 +183,7 @@ class ToyAttention(AttentionModule):
         return self.o_proj(self.mix(q, k, v, cu_seqlens=cu_seqlens).flatten(-2))
 
 
-class ToyRecurrence(nn.Module):
+class ToyRecurrence(nn.Module, SequenceMixingModule):
     """A gated linear recurrence: a short causal convolution, then ``h_t = a_t * h_{t-1} + (1 - a_t) * c_t``.
 
     ``project`` and ``finish`` work token by token. ``mix`` is the sequence-mixing core: it sees whole packed rows,
@@ -254,6 +267,8 @@ class ToyExperts(nn.Module):
 class LoadStats(nn.Module):
     """Tokens routed to each expert so far: trainer-only bookkeeping, checkpointed but never sent to the sampler."""
 
+    tokens_per_expert: torch.Tensor
+
     def __init__(self, num_experts: int):
         super().__init__()
         self.register_buffer("tokens_per_expert", torch.zeros(num_experts))
@@ -261,7 +276,7 @@ class LoadStats(nn.Module):
         mark(self, dtype="fp32", weight_sync=False)
 
 
-class ToyMoE(nn.Module):
+class ToyMoE(nn.Module, StackedMoEModule):
     """Softmax top-k routing with renormalized weights, routed experts plus one shared expert.
 
     ``route`` and the shared expert work token by token. ``experts_core`` is the only part that touches routed
@@ -315,7 +330,7 @@ class ToyMoE(nn.Module):
         return out
 
 
-class ToyShortConv(nn.Module):
+class ToyShortConv(nn.Module, SequenceMixingModule):
     """A gated short convolution: ``out_proj(conv(in_proj(x)) * silu(gate_proj(x)))``, causal over ``conv_kernel``.
 
     ``mix`` is the only cross-token code. It sees the tokens ``shard`` describes, global positions
@@ -378,7 +393,7 @@ class ToyHybridMoEModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
 
-class ToyHybridMoEForCausalLM(nn.Module):
+class ToyHybridMoEForCausalLM(nn.Module, CausalLM, ComputesLogits):
     """Returns final hidden states; the platform turns them into log-probabilities chunk by chunk through
     :meth:`compute_logits`."""
 

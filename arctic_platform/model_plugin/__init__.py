@@ -38,6 +38,12 @@ from arctic_platform.model_plugin.experts import expert_parallel
 from arctic_platform.model_plugin.experts import shard_experts
 from arctic_platform.model_plugin.host import compute_logits
 from arctic_platform.model_plugin.host import token_logprobs
+from arctic_platform.model_plugin.interfaces import CausalLM
+from arctic_platform.model_plugin.interfaces import ComputesLogits
+from arctic_platform.model_plugin.interfaces import InitializesBuffers
+from arctic_platform.model_plugin.interfaces import RoutedModule
+from arctic_platform.model_plugin.interfaces import SequenceMixingModule
+from arctic_platform.model_plugin.interfaces import StackedMoEModule
 from arctic_platform.model_plugin.manifest import CONTRACT_VERSION
 from arctic_platform.model_plugin.manifest import Capabilities
 from arctic_platform.model_plugin.manifest import PluginManifest
@@ -80,11 +86,13 @@ __all__ = [
     "AttentionModule",
     "build",
     "Capabilities",
+    "CausalLM",
     "cast_model",
     "check_job_request",
     "choose_experts",
     "combine_tokens",
     "compute_logits",
+    "ComputesLogits",
     "CONTRACT_VERSION",
     "discover_plugins",
     "ENTRY_POINT_GROUP",
@@ -100,6 +108,7 @@ __all__ = [
     "in_recompute",
     "init_buffers",
     "initialize_deepspeed",
+    "InitializesBuffers",
     "JobRequest",
     "load_manifest",
     "load_plugin",
@@ -114,15 +123,18 @@ __all__ = [
     "plugin_for_model_type",
     "PluginManifest",
     "previous_tokens",
+    "RoutedModule",
     "ROUTER_REPLAY_FRESH",
     "sampler_launch",
     "SamplerLaunch",
     "SamplerSpec",
     "sequence_start",
+    "SequenceMixingModule",
     "SequenceWindow",
     "shard_experts",
     "skip_weight_sync",
     "StackedExpertLayer",
+    "StackedMoEModule",
     "token_logprobs",
     "varlen_causal_attention",
 ]

@@ -22,13 +22,15 @@ through :func:`gather_tokens` / :func:`combine_tokens`.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-from torch import nn
 from torch.distributed.nn.functional import all_to_all as _differentiable_all_to_all
+
+if TYPE_CHECKING:
+    from arctic_platform.model_plugin.interfaces import SequenceMixingModule
 
 
 @dataclass(frozen=True)
@@ -93,7 +95,7 @@ def heads_to_seq(group, tensor: torch.Tensor) -> torch.Tensor:
     return _swap_dims(group, tensor, scatter_dim=1, gather_dim=2)
 
 
-def head_parallel(module: nn.Module, group) -> None:
+def head_parallel(module: SequenceMixingModule, group) -> None:
     """Run ``module.mix`` head-parallel across ``group``.
 
     ``mix(*tensors, cu_seqlens, shard, **state)`` takes head-major ``[1, T, H_i, D_i]`` tensors and returns one, or
@@ -103,7 +105,7 @@ def head_parallel(module: nn.Module, group) -> None:
     heads, calls the original ``mix`` with that rank's :class:`HeadShard`, and exchanges the result back.
     ``cu_seqlens`` must already describe the full, unsharded sequence.
     """
-    core: Callable[..., torch.Tensor] = getattr(module, "mix")
+    core = module.mix
     shard = HeadShard(group_rank(group), group_size(group))
 
     def mix(*tensors: torch.Tensor, cu_seqlens: torch.Tensor, shard: HeadShard = shard, **state):
@@ -113,7 +115,7 @@ def head_parallel(module: nn.Module, group) -> None:
             return (heads_to_seq(group, out[0]), *out[1:])
         return heads_to_seq(group, out)
 
-    setattr(module, "mix", mix)
+    setattr(module, "mix", mix)  # on the instance: this module, this group
 
 
 class _GatherStack(torch.autograd.Function):

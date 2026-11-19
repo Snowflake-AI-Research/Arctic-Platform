@@ -213,13 +213,36 @@ model's state caches from each stateful layer's own `MambaBase` state spec, not 
 
 ## 7. The Python contract
 
+A plugin hands the platform two kinds of code: **objects** it passes in the `ModelPlugin` (§7.1), and **hooks**,
+methods and attributes on its own modules that the platform calls. Each hook is declared once, as a `typing.Protocol`
+in `arctic_platform.model_plugin.interfaces`, with its full signature and obligations in the docstring:
+
+| Your module | Protocol | Hooks | Required | Section |
+|---|---|---|---|---|
+| The trainer model | `CausalLM` | `config`, `lm_head`, `forward(input_ids, position_ids, *, cu_seqlens)` | Always | §7.2 |
+| The trainer model | `ComputesLogits` | `compute_logits(hidden)` | For an output transform | §7.2 |
+| A module with computed buffers | `InitializesBuffers` | `ap_init_buffers()` | If it has non-checkpointed buffers | §7.2 |
+| A layer or sub-layer with a mixer | `SequenceMixingModule` | `ap_layer_type`, `mix(*tensors, cu_seqlens, shard)` | Every one; `AttentionModule` supplies `mix` | §7.3 |
+| An MoE block | `RoutedModule` | `route(tokens, routed=None)` | Every expert layer | §7.6, §7.7 |
+| An MoE block with stacked experts | `StackedMoEModule` | `num_experts`, `experts_core(tokens, selected, weights, *, shard)` | With `StackedExpertLayer` | §7.6 |
+
+List the protocols a module implements as bases after `nn.Module`, as the example does:
+
+```python
+class AcmeMoE(nn.Module, StackedMoEModule): ...
+class AcmeForCausalLM(nn.Module, CausalLM, ComputesLogits): ...
+```
+
+The platform checks hooks by structure at runtime, so inheriting is optional. Inherit anyway: the class declares its
+role to readers, and mypy and your IDE check each hook's signature against the protocol.
+
 ### 7.1 The plugin object
 
 ```python
 PLUGIN = ModelPlugin(
     manifest=load_manifest(Path(__file__).with_name("manifest.toml")),
     config_class=AcmeHybridConfig,          # transformers.PretrainedConfig subclass
-    build_model=AcmeHybridForCausalLM,      # config -> trainer model
+    build_model=AcmeHybridForCausalLM,      # (config, options) -> trainer model, a CausalLM
     parallelism=parallelism,                # config -> ParallelismInfo
     mixers={"linear_attention": AcmeRecurrenceMixer()},
     expert_layer=AcmeExpertLayer(),         # None for dense models
@@ -285,8 +308,9 @@ flowchart LR
 with `q` shaped `[1, T, H, D]` and `k`/`v` shaped `[1, T, H_kv, D]`. You MUST NOT override `mix`: the platform owns the
 core, its kernels and its parallelism.
 
-**New layer types** (`"plugin"`). Your module exposes `mix(*tensors, cu_seqlens, shard) -> tensor`, and you
-register a `Mixer` for the layer type. The split of work is deliberate:
+**New layer types** (`"plugin"`). Your module is a `SequenceMixingModule`: it exposes
+`mix(*tensors, cu_seqlens, shard) -> tensor`, with a default for `shard` (`FULL_SHARD` or `FULL_WINDOW`), and always
+calls it as `self.mix(...)`, since the platform replaces it on the instance. You register a `Mixer` for the layer type. The split of work is deliberate:
 
 | | Owns |
 |---|---|
@@ -374,7 +398,7 @@ In backward, the gradient of the borrowed tokens flows back to the rank that own
 MoE follows the same split as mixers: your module owns the math, your `ExpertLayer` declares the policy, and the
 platform moves tokens. Model code never calls a collective and never tracks which experts it holds.
 
-Your MoE module MUST:
+Your MoE module MUST be a `StackedMoEModule` (or, with your own `ExpertLayer`, at least a `RoutedModule`):
 
 - have a `num_experts` attribute, and store routed expert weights **stacked with the expert index as dim 0**, named in `StackedExpertLayer.expert_names`. The platform MoE layout is `w1` (gate) and `w3` (up) `[E, I, D]`, `w2` (down) `[E, D, I]`; a gateless expert (for example relu²) has only `w1` and `w2`;
 - route through one method, `route(tokens, routed=None, ...) -> (selected [N, top_k], ...)`, called once per forward on all of the layer's local tokens; it picks experts with `choose_experts(scores, top_k, routed)` and returns the selection first. Extra arguments are passed through (for example `input_ids` for a hash-routed layer); `routed` is the platform's to supply. Its forward calls `self.route(tokens)`, then `self.experts_core(tokens, selected, weights)`, and adds any shared expert;
@@ -450,7 +474,7 @@ carries its own small MoE so that it runs on CPU.
 
 During RL the sampler records, for every token and expert layer, the experts it chose. The trainer then replays
 them so both compute the same function. The platform wraps each MoE module's `route` method
-(`StackedExpertLayer.route_method`, default `"route"`) and passes the sampler's ids for that layer as `routed`; a
+(`RoutedModule`) and passes the sampler's ids for that layer as `routed`; a
 token whose id is `ROUTER_REPLAY_FRESH` (`-1`, no capture) is routed by the module's own choice. `choose_experts`
 implements both. The platform also reads back the experts every layer chose. Binding fails if a claimed MoE module
 has no `route(tokens, routed=None)`.

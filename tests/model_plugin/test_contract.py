@@ -25,8 +25,13 @@ from toy_hybrid_moe.config import ToyHybridMoEConfig
 from toy_hybrid_moe.modeling import ToyHybridMoEForCausalLM
 
 from arctic_platform.model_plugin import AdmissionError
+from arctic_platform.model_plugin import CausalLM
+from arctic_platform.model_plugin import ComputesLogits
+from arctic_platform.model_plugin import InitializesBuffers
 from arctic_platform.model_plugin import JobRequest
 from arctic_platform.model_plugin import PluginManifest
+from arctic_platform.model_plugin import SequenceMixingModule
+from arctic_platform.model_plugin import StackedMoEModule
 from arctic_platform.model_plugin import check_job_request
 from arctic_platform.model_plugin import discover_plugins
 from arctic_platform.model_plugin import plugin as plugin_module
@@ -122,6 +127,30 @@ def test_binding_rejects_modules_the_config_does_not_account_for():
     model = ToyHybridMoEForCausalLM(config)
     model.model.layers[1].self_attn.ap_layer_type = "sliding_attention"
     with pytest.raises(ValueError, match="which the manifest does not declare"):
+        bind_layers(model, PLUGIN, PLUGIN.parallelism(config))
+
+
+def test_toy_modules_implement_the_interfaces_they_declare():
+    config = ToyHybridMoEConfig()
+    model = ToyHybridMoEForCausalLM(config)
+    assert isinstance(model, CausalLM) and isinstance(model, ComputesLogits)
+    roles = {
+        SequenceMixingModule: sum(isinstance(module, SequenceMixingModule) for module in model.modules()),
+        StackedMoEModule: sum(isinstance(module, StackedMoEModule) for module in model.modules()),
+        InitializesBuffers: sum(isinstance(module, InitializesBuffers) for module in model.modules()),
+    }
+    info = PLUGIN.parallelism(config)
+    mixed = [layer_type for layer_type in info.layer_types if layer_type in PLUGIN.layer_mixers()]
+    assert roles[SequenceMixingModule] == len(mixed) + sum(info.sublayers.values())
+    assert roles[StackedMoEModule] == len(info.moe_layers)
+    assert roles[InitializesBuffers] > 0
+
+
+def test_binding_rejects_a_layer_type_on_a_module_without_mix():
+    config = ToyHybridMoEConfig()
+    model = ToyHybridMoEForCausalLM(config)
+    model.model.layers[0].input_norm.ap_layer_type = config.layer_types[0]
+    with pytest.raises(ValueError, match=r"input_norm declares layer type .* but has no mix\(\)"):
         bind_layers(model, PLUGIN, PLUGIN.parallelism(config))
 
 

@@ -102,7 +102,16 @@ def test_rl_step_is_skipped_without_the_training_stack():
     statuses = {result.tier: result.status for result in results}
     assert statuses["rl_step"] == "SKIP"
     assert all(status == "PASS" for tier, status in statuses.items() if tier != "rl_step")
-    assert conformance.main(["--plugin", TARGET, "--spec", str(TOY_PLUGIN_ROOT / "conformance.toml")]) == 0
+
+
+def test_conformance_cli_reports_and_exits_zero(tmp_path, capsys):
+    # Parallel tiers are covered by test_parallel_tier; the CLI check needs only the single-process ones.
+    spec = (TOY_PLUGIN_ROOT / "conformance.toml").read_text()
+    spec = spec.replace("sp_sizes = [2]", "sp_sizes = []").replace("ep_sizes = [2]", "ep_sizes = []")
+    (tmp_path / "conformance.toml").write_text(spec)
+    assert conformance.main(["--plugin", TARGET, "--spec", str(tmp_path / "conformance.toml")]) == 0
+    out = capsys.readouterr().out
+    assert "reference_parity" in out and "FAIL" not in out
 
 
 def test_new_layer_count_and_pattern_needs_no_code_change():
@@ -289,8 +298,7 @@ def test_layers_with_no_sequence_mixer_bind_and_parallelize():
     )
     for check in (conformance.check_static, conformance.check_reference_parity, conformance.check_packing):
         check(PLUGIN, spec)
-    for mode in ("sp", "ep"):
-        conformance.check_parallel(TARGET, spec, mode, 2)
+    conformance.check_parallel(TARGET, spec, "sp+ep", 2)  # one spawn covers both: the gloo ranks are the slow part
 
 
 class _Producer(torch.nn.Module):

@@ -34,6 +34,9 @@ from torch.utils.checkpoint import checkpoint
 from arctic_platform.common.packing import IGNORE_INDEX
 from arctic_platform.common.packing import cu_seqlens_from_position_ids
 from arctic_platform.model_plugin.experts import EXPERT_PARALLEL_SIZE_ATTR
+from arctic_platform.model_plugin.interfaces import ComputesLogits
+from arctic_platform.model_plugin.interfaces import RoutedModule
+from arctic_platform.model_plugin.interfaces import SequenceMixingModule
 from arctic_platform.model_plugin.marks import apply_marks
 from arctic_platform.model_plugin.mixers import Mixer
 from arctic_platform.model_plugin.parallel import group_size
@@ -55,8 +58,15 @@ class LayerBinding:
     experts: dict[str, int] = field(default_factory=dict)
 
 
-def _accepts_routed(method) -> bool:
-    parameters = inspect.signature(method).parameters.values()
+def _has_mix(module: nn.Module) -> bool:
+    return isinstance(module, SequenceMixingModule) and callable(module.mix)
+
+
+def _accepts_routed(module: RoutedModule) -> bool:
+    """Whether ``module.route`` is a method taking ``routed``, which a runtime protocol check does not cover."""
+    if not callable(module.route):
+        return False
+    parameters = inspect.signature(module.route).parameters.values()
     return any(p.name == "routed" or p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters)
 
 
@@ -79,6 +89,10 @@ def bind_layers(model: nn.Module, plugin: ModelPlugin, info: ParallelismInfo) ->
         mixer = mixers.get(layer_type)
         if mixer is None:
             raise ValueError(f"{path} declares layer type {layer_type!r}, which the manifest does not declare")
+        if not _has_mix(module):
+            raise ValueError(
+                f"{path} declares layer type {layer_type!r} but has no mix(); see interfaces.SequenceMixingModule"
+            )
         if not mixer.is_instance(module):
             raise ValueError(f"{path} declares layer type {layer_type!r} but its mixer does not accept it")
         binding.mixers[path] = (layer_type, mixer)
@@ -88,15 +102,13 @@ def bind_layers(model: nn.Module, plugin: ModelPlugin, info: ParallelismInfo) ->
     if bound != expected:
         raise ValueError(f"model has sequence-mixing modules {dict(bound)} but its config declares {dict(expected)}")
     if plugin.expert_layer is not None:
-        method = getattr(plugin.expert_layer, "route_method", "route")
         for path, module in model.named_modules():
             if not plugin.expert_layer.is_instance(module):
                 continue
-            route = getattr(module, method, None)
-            if route is None or not _accepts_routed(route):
+            if not isinstance(module, RoutedModule) or not _accepts_routed(module):
                 raise ValueError(
-                    f"{type(module).__name__} has no {method}(tokens, routed=None); MoE modules must route through it"
-                    " so the platform can replay and recompute routing"
+                    f"{type(module).__name__} has no route(tokens, routed=None); MoE modules must route through it"
+                    " so the platform can replay and recompute routing (see interfaces.RoutedModule)"
                 )
             binding.experts[path] = layer_index(f"{path}.")
             if binding.experts[path] < 0:
@@ -131,7 +143,7 @@ def prepare_model(
     tape = getattr(model, ROUTING_TAPE_ATTR, None) or RoutingTape()
     setattr(model, ROUTING_TAPE_ATTR, tape)
     for path, index in binding.experts.items():
-        install_routing(modules[path], index, tape, getattr(plugin.expert_layer, "route_method", "route"))
+        install_routing(modules[path], index, tape)
 
     sp_size = group_size(sp_group)
     if sp_size > 1:
@@ -228,10 +240,11 @@ DEFAULT_LOGPROB_CHUNK = 4096
 
 
 def compute_logits(model: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
-    """Logits of ``hidden`` ``[..., D]``: the model's ``compute_logits`` if it defines one (output scaling, logit
-    softcapping), else ``lm_head(hidden)``."""
-    override = getattr(model, "compute_logits", None)
-    return override(hidden) if override is not None else model.lm_head(hidden)
+    """Logits of ``hidden`` ``[..., D]``: the model's ``compute_logits`` if it is :class:`ComputesLogits` (output
+    scaling, logit softcapping), else ``lm_head(hidden)``."""
+    if isinstance(model, ComputesLogits):
+        return model.compute_logits(hidden)
+    return model.lm_head(hidden)
 
 
 def _chunk_logprobs(model: nn.Module, hidden: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
