@@ -99,6 +99,21 @@ def test_conversion_of_selected_sizes_lists_only_those(tmp_path):
         convert_to_safetensors(tmp_path / "vendor", tmp_path / "again", sizes=("large",))
 
 
+def test_weights_dir_replaces_the_model_directory(tmp_path):
+    reference = write_snapshot(tmp_path / "baked")
+    (tmp_path / "declared").mkdir()
+    (tmp_path / "declared" / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+    spec = ModelSpec(
+        model_path_or_name=str(tmp_path / "declared"),
+        dtype="float32",
+        loader="tabular",
+        loader_options={"task": "classification", "weights_dir": str(tmp_path / "baked")},
+    )
+    model = build_model(spec).model
+    for name, value in reference.state_dict().items():
+        torch_assert_equal(model.state_dict()[name], value, msg=name)
+
+
 def test_rejects_a_config_of_another_model_type(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama"}))
     with pytest.raises(ValueError, match="kumo_tabular"):

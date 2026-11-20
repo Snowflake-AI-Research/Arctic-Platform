@@ -55,6 +55,9 @@ class TabularOptions(BaseModel):
 
     task: Literal["classification", "regression"]
     size: Literal["small", "medium", "large"] = "small"
+    # A directory in the model's layout to load instead of ``model_path_or_name``, for example a snapshot baked
+    # into the image. The job's model directory is then not read.
+    weights_dir: str | None = None
 
 
 def _validate_spec(spec: ModelSpec) -> None:
@@ -148,5 +151,6 @@ def convert_to_safetensors(
 def load_tabular(ctx: LoaderContext) -> LoadedModel:
     options = TabularOptions.model_validate(ctx.spec.loader_options)
     model = build_network(options)
-    model.load_state_dict(read_state_dict(weights_file(ctx.spec.model_path_or_name, options)), strict=True)
+    model_dir = options.weights_dir or ctx.spec.model_path_or_name
+    model.load_state_dict(read_state_dict(weights_file(model_dir, options)), strict=True)
     return LoadedModel(model=model.to(getattr(torch, ctx.spec.dtype)))
