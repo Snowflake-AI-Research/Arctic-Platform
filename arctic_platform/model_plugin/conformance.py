@@ -673,6 +673,9 @@ def _parallel_worker(
         plugin = load_plugin(target)
         spec = ConformanceSpec.model_validate_json(spec_json)
         _parallel_checks(plugin, spec, mode, rank, size, device)
+        # Every rank finishes before any tears down: a rank that exits while its peer's gloo threads still talk to it
+        # can abort that peer at exit ("terminate called without an active exception").
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 
