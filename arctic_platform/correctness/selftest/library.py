@@ -2807,6 +2807,7 @@ def test_operator_onboarding_uses_imported_config_before_preparation(tmp_path, m
 def _onboarding_prerequisites(tmp_path, monkeypatch):
     from arctic_platform.correctness.harness import config as config_module
     from arctic_platform.correctness.harness import registry
+    from arctic_platform.correctness.models import original
     from arctic_platform.correctness.onboarding import onboard
 
     args = execution.parse_args(["onboard", "--config", str(tmp_path / "model.json")])
@@ -2845,6 +2846,7 @@ def _onboarding_prerequisites(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(config_module, "load_config", lambda *a: config)
     monkeypatch.setattr(registry, "registered_tests", lambda: tests)
+    monkeypatch.setattr(original, "onboard_original_model", lambda *a, **kw: None)
     monkeypatch.setattr(ap_driver, "_allocation_hostfile", lambda: None)
     calls = []
     result = {
@@ -19317,7 +19319,11 @@ def test_full_model_e2e_selection_preserves_other_modes(monkeypatch, tmp_path, e
 
 
 def test_full_model_e2e_retry_normalizes_automatic_and_explicit_selection(_incremental_onboarding, monkeypatch):
+    from arctic_platform.correctness.models import original
+
     state = _incremental_onboarding
+    monkeypatch.setattr(original, "_admission_path", lambda *a: state.args.test_spec)
+    monkeypatch.setattr(original, "validate_local_full_model", lambda *a, **kw: None)
     state.args.test_id = "e2e-sft-train-validate"
     state.tests[state.args.test_id] = SimpleNamespace(
         test_id=state.args.test_id,
@@ -19462,7 +19468,7 @@ def test_original_missing_admission_never_substitutes_fixture():
 
     cfg = SimpleNamespace(model_name="unadmitted/model", config_id="unit")
     spec = SimpleNamespace(model=SimpleNamespace(source_checkpoint=cfg.model_name))
-    with pytest.raises(ValueError, match="unadmitted/model.*add model admission.*not a full-model substitute"):
+    with pytest.raises(ValueError, match="unadmitted/model.*run full-model onboarding.*not a full-model substitute"):
         original._original_model(cfg, spec)
 
 
@@ -19475,6 +19481,403 @@ def test_original_qwen_small_model_pin():
     assert metadata.revision == "c1899de289a04d12100db370d81485cdf75e47ca"
     assert metadata.weights_sha256 is not None
     assert metadata.tensor_count == 311
+
+
+def _automatic_original_case(tmp_path, monkeypatch, *, indexed=False, local=False):
+    from huggingface_hub import snapshot_download
+    from safetensors.torch import save_file
+    from transformers import Qwen3Config
+    from transformers import Qwen3ForCausalLM
+
+    from arctic_platform.correctness.models import original
+
+    cache = tmp_path / "hub"
+    root = cache / "models--unit--fresh" / "snapshots" / ("b" * 40)
+    root.mkdir(parents=True)
+    model_config = Qwen3Config(
+        vocab_size=4,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        tie_word_embeddings=False,
+        architectures=["Qwen3ForCausalLM"],
+    )
+    model_config._attn_implementation = "eager"
+    model = Qwen3ForCausalLM(model_config)
+    model_config.save_pretrained(root)
+    (root / "tokenizer_config.json").write_text("{}")
+    (root / "tokenizer.json").write_text("{}")
+    tensors = {name: value.to(torch.bfloat16).contiguous() for name, value in model.state_dict().items()}
+    if indexed:
+        mapping = {}
+        for index, shard in enumerate(("alpha.safetensors", "beta.safetensors")):
+            contents = {name: tensor for i, (name, tensor) in enumerate(tensors.items()) if i % 2 == index}
+            save_file(contents, str(root / shard))
+            mapping.update({name: shard for name in contents})
+        (root / "model.safetensors.index.json").write_text(json.dumps({"weight_map": mapping}))
+    else:
+        save_file(tensors, str(root / "model.safetensors"))
+    recipe = tmp_path / "configs" / "fresh" / "standard" / "h200-training-full.json"
+    recipe.parent.mkdir(parents=True)
+    cfg = LoadedConfig(
+        config_id="fresh-standard-h200-training-full",
+        path=recipe,
+        sub_job={
+            "job_type": "training",
+            "model_name": str(root) if local else "unit/fresh",
+            "training_config": {"n_gpus": 1},
+        },
+    )
+    recipe.write_text(json.dumps({"sub_job_configs": [cfg.sub_job]}))
+    spec = SimpleNamespace(model=SimpleNamespace(source_checkpoint=cfg.model_name))
+    monkeypatch.setattr(original, "require_data_fast_path", lambda path, **kw: Path(path).resolve())
+    monkeypatch.setattr(original.storage, "require_git_records_dir", lambda path: Path(path).resolve())
+
+    def resolve(model, **kwargs):
+        assert model == cfg.model_name
+        assert kwargs["local_files_only"] is True
+        assert kwargs["cache_dir"] == str(cache)
+        assert kwargs["revision"] in (None, "b" * 40)
+        return str(root)
+
+    monkeypatch.setattr(sys.modules[snapshot_download.__module__], "snapshot_download", resolve)
+    monkeypatch.setattr("huggingface_hub.snapshot_download", resolve)
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache))
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("DSS_ALLOW_REMOTE_MODELS", "1")
+    return original, cfg, spec, root, tmp_path / "references"
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+@pytest.mark.parametrize("local", [False, True])
+def test_automatic_original_onboarding_and_read_only_regression(tmp_path, monkeypatch, indexed, local):
+    original, cfg, spec, root, records = _automatic_original_case(tmp_path, monkeypatch, indexed=indexed, local=local)
+    backend = CortexConfig(base_url="http://127.0.0.1:1")
+    path = original.onboard_original_model(backend, cfg, records_dir=records)
+    assert path == records / "fresh/standard/h200-training-full/original-model.json"
+    record = json.loads(path.read_text())
+    from safetensors import safe_open
+
+    with safe_open(root / ("alpha.safetensors" if indexed else "model.safetensors"), framework="pt") as stream:
+        count = len(stream.keys())
+    if indexed:
+        with safe_open(root / "beta.safetensors", framework="pt") as stream:
+            count += len(stream.keys())
+    assert record["checkpoint"]["tensor_count"] == count
+    assert record["checkpoint"]["shard_count"] == (2 if indexed else 1)
+    assert record["revision"] == (None if local else "b" * 40)
+    assert len(path.read_bytes()) < 4096
+    before = path.read_bytes(), path.stat().st_mtime_ns
+    assert original.onboard_original_model(backend, cfg, records_dir=records) == path
+    assert original.validate_local_full_model(backend, cfg, spec, records_dir=records) == root
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+    spec.model.source_checkpoint = str(root)
+    assert original.validate_local_full_model(backend, cfg, spec, records_dir=records) == root
+    spec.model.source_checkpoint = str(tmp_path / "reduced")
+    with pytest.raises(ValueError, match="different source"):
+        original.validate_local_full_model(backend, cfg, spec, records_dir=records)
+
+
+@pytest.mark.parametrize(
+    "damage", ["config", "tokenizer", "weights", "recipe", "record", "missing", "extra", "symlink"]
+)
+def test_automatic_original_identity_changes_are_not_silently_accepted(tmp_path, monkeypatch, damage):
+    from safetensors.torch import load_file
+    from safetensors.torch import save_file
+
+    original, cfg, spec, root, records = _automatic_original_case(tmp_path, monkeypatch)
+    backend = CortexConfig(base_url="http://127.0.0.1:1")
+    path = original.onboard_original_model(backend, cfg, records_dir=records)
+    before = path.read_bytes()
+    if damage == "config":
+        (root / "config.json").write_text('{"num_hidden_layers":2}')
+    elif damage == "tokenizer":
+        (root / "tokenizer.json").write_text('{"changed":true}')
+    elif damage == "weights":
+        tensors = load_file(root / "model.safetensors")
+        tensors["lm_head.weight"].add_(1)
+        save_file(tensors, str(root / "model.safetensors"))
+    elif damage == "recipe":
+        cfg.sub_job["seed"] = 999
+    elif damage == "record":
+        path.write_text('{"schema":"original-model-v1","schema":"broken"}')
+    elif damage == "missing":
+        (root / "model.safetensors").unlink()
+    elif damage == "extra":
+        save_file({"extra": torch.zeros(1)}, str(root / "unindexed.safetensors"))
+    else:
+        external = tmp_path / "outside-tokenizer.json"
+        external.write_text("{}")
+        (root / "tokenizer.json").unlink()
+        (root / "tokenizer.json").symlink_to(external)
+    for operation in (
+        lambda: original.validate_local_full_model(backend, cfg, spec, records_dir=records),
+        lambda: original.onboard_original_model(backend, cfg, records_dir=records),
+    ):
+        with pytest.raises(ValueError):
+            operation()
+    if damage != "record":
+        assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("damage", ["unsafe", "wrong_keys", "duplicate", "empty"])
+def test_automatic_original_rejects_invalid_index_without_publishing(tmp_path, monkeypatch, damage):
+    from safetensors.torch import save_file
+
+    original, cfg, _, root, records = _automatic_original_case(tmp_path, monkeypatch, indexed=True)
+    path = root / "model.safetensors.index.json"
+    index = json.loads(path.read_text())
+    if damage == "unsafe":
+        index["weight_map"]["model.layers.0.self_attn.q_proj.weight"] = "../alpha.safetensors"
+    elif damage == "wrong_keys":
+        index["weight_map"]["other"] = index["weight_map"].pop("model.layers.0.self_attn.q_proj.weight")
+    elif damage == "duplicate":
+        save_file({"model.layers.0.self_attn.q_proj.weight": torch.zeros(1)}, str(root / "beta.safetensors"))
+    else:
+        index["weight_map"] = {}
+    path.write_text(json.dumps(index))
+    with pytest.raises(ValueError):
+        original.onboard_original_model(CortexConfig(base_url="http://127.0.0.1:1"), cfg, records_dir=records)
+    assert not list(records.rglob("original-model.json"))
+
+
+def test_automatic_original_normalizes_transformers_layer_count(tmp_path, monkeypatch):
+    from safetensors.torch import save_file
+    from transformers import GPT2Config
+    from transformers import GPT2LMHeadModel
+
+    original, cfg, spec, root, records = _automatic_original_case(tmp_path, monkeypatch)
+    model_config = GPT2Config(
+        n_layer=1, n_embd=8, n_head=2, n_positions=16, vocab_size=4, architectures=["GPT2LMHeadModel"]
+    )
+    model_config._attn_implementation = "eager"
+    model = GPT2LMHeadModel(model_config)
+    model_config.save_pretrained(root)
+    tensors = {name: value.clone() for name, value in model.state_dict().items() if name != "lm_head.weight"}
+    save_file(tensors, str(root / "model.safetensors"))
+    backend = CortexConfig(base_url="http://127.0.0.1:1")
+    path = original.onboard_original_model(backend, cfg, records_dir=records)
+    assert json.loads(path.read_text())["checkpoint"]["num_hidden_layers"] == 1
+    assert original.validate_local_full_model(backend, cfg, spec, records_dir=records) == root
+
+
+def test_automatic_original_can_resolve_default_causal_architecture(tmp_path, monkeypatch):
+    original, cfg, spec, root, records = _automatic_original_case(tmp_path, monkeypatch)
+    config_path = root / "config.json"
+    config = json.loads(config_path.read_text())
+    config.pop("architectures")
+    config_path.write_text(json.dumps(config))
+    backend = CortexConfig(base_url="http://127.0.0.1:1")
+    original.onboard_original_model(backend, cfg, records_dir=records)
+    assert original.validate_local_full_model(backend, cfg, spec, records_dir=records) == root
+
+
+def test_automatic_original_keeps_reviewed_schema_pins(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    from arctic_platform.correctness.onboarding import synth_model
+
+    original, cfg, spec, root, records = _automatic_original_case(tmp_path, monkeypatch)
+    identity = original._checkpoint_identity(root, root.parents[2])
+    metadata = replace(
+        original.ORIGINAL_MODELS["Qwen/Qwen3-0.6B"],
+        model_name=cfg.model_name,
+        revision="b" * 40,
+        config_sha256=identity["files"]["config.json"]["sha256"],
+        weights_sha256=identity["files"]["model.safetensors"]["sha256"],
+        schema_sha256=identity["tensor_schema_sha256"],
+    )
+    monkeypatch.setattr(original, "ORIGINAL_MODELS", {cfg.model_name: metadata})
+    monkeypatch.setattr(synth_model, "_meta_model", lambda *a: pytest.fail("reviewed schema re-instantiated"))
+    backend = CortexConfig(base_url="http://127.0.0.1:1")
+    original.onboard_original_model(backend, cfg, records_dir=records)
+    assert original.validate_local_full_model(backend, cfg, spec, records_dir=records) == root
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+@pytest.mark.parametrize("damage", ["layer", "tensor", "shape"])
+def test_automatic_original_requires_complete_configured_schema(tmp_path, monkeypatch, indexed, damage):
+    from safetensors.torch import load_file
+    from safetensors.torch import save_file
+
+    original, cfg, _, root, records = _automatic_original_case(tmp_path, monkeypatch, indexed=indexed)
+    if damage == "layer":
+        config_path = root / "config.json"
+        config = json.loads(config_path.read_text())
+        config["num_hidden_layers"] = 2
+        config["layer_types"] *= 2
+        config_path.write_text(json.dumps(config))
+    else:
+        name = "model.layers.0.self_attn.q_proj.weight"
+        index_path = root / "model.safetensors.index.json"
+        index = json.loads(index_path.read_text()) if indexed else None
+        shard = index["weight_map"][name] if indexed else "model.safetensors"
+        tensors = load_file(root / shard)
+        if damage == "tensor":
+            del tensors[name]
+            if indexed:
+                del index["weight_map"][name]
+                index_path.write_text(json.dumps(index))
+        else:
+            tensors[name] = tensors[name][:-1].contiguous()
+        save_file(tensors, str(root / shard))
+    with pytest.raises(ValueError, match="missing configured tensors|shape differs"):
+        original.onboard_original_model(CortexConfig(base_url="http://127.0.0.1:1"), cfg, records_dir=records)
+    assert not list(records.rglob("original-model.json"))
+
+
+def test_automatic_original_regression_never_creates_admission(tmp_path, monkeypatch):
+    original, cfg, spec, _, records = _automatic_original_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download", lambda *a, **kw: pytest.fail("regression resolved an unpinned source")
+    )
+    with pytest.raises(ValueError, match="run full-model onboarding"):
+        original.validate_local_full_model(CortexConfig(base_url="http://127.0.0.1:1"), cfg, spec, records_dir=records)
+    assert not records.exists()
+
+
+def test_automatic_original_allows_only_cache_contained_hf_links(tmp_path, monkeypatch):
+    original, cfg, spec, root, records = _automatic_original_case(tmp_path, monkeypatch)
+    blob = root.parents[2] / "blobs" / "tokenizer"
+    blob.parent.mkdir()
+    (root / "tokenizer.json").rename(blob)
+    (root / "tokenizer.json").symlink_to(blob)
+    backend = CortexConfig(base_url="http://127.0.0.1:1")
+    original.onboard_original_model(backend, cfg, records_dir=records)
+    assert original.validate_local_full_model(backend, cfg, spec, records_dir=records) == root
+
+
+def test_automatic_original_detects_concurrent_source_change(tmp_path, monkeypatch):
+    original, cfg, _, root, records = _automatic_original_case(tmp_path, monkeypatch)
+    digest = original.hashlib.file_digest
+
+    def changed(stream, algorithm):
+        result = digest(stream, algorithm)
+        if stream.name.endswith("model.safetensors"):
+            (root / "tokenizer.json").write_text('{"changed":true}')
+        return result
+
+    monkeypatch.setattr(original.hashlib, "file_digest", changed)
+    with pytest.raises(ValueError, match="changed during"):
+        original.onboard_original_model(CortexConfig(base_url="http://127.0.0.1:1"), cfg, records_dir=records)
+    assert not list(records.rglob("original-model.json"))
+
+
+def test_automatic_original_preflight_registers_full_model_only(tmp_path, monkeypatch):
+    from arctic_platform.correctness.models import original
+
+    args = execution.parse_args(
+        ["onboard", "--config", str(tmp_path / "recipe.json"), "--test", "e2e-sft-train-validate"]
+    )
+    args._prerequisites_checked = True
+    config = SimpleNamespace(is_rl=False, training={}, sub_job={"dtype": "float32"})
+    calls = []
+    monkeypatch.setattr(original, "onboard_original_model", lambda backend, cfg, **kw: calls.append((cfg, kw)))
+    onboard._onboarding_preflight(args, config, [args.test_id])
+    assert calls == [(config, {"records_dir": args.reference_records_dir})]
+    calls.clear()
+    args.local_cortex_fixture = True
+    args.local_gateway_full_model = False
+    onboard._onboarding_preflight(args, config, [args.test_id])
+    assert not calls
+
+
+def test_automatic_original_identity_survives_reference_set_replacement(
+    tmp_path, monkeypatch, _reference_records_ctx, _reference_records_identity
+):
+    original, cfg, _, _, root = _automatic_original_case(tmp_path, monkeypatch)
+    cfg.config_id = _reference_records_ctx.config_id
+    _reference_records_ctx.cfg = cfg
+    path = original.onboard_original_model(CortexConfig(base_url="http://127.0.0.1:1"), cfg, records_dir=root)
+    before = path.read_bytes()
+    for generation in ("old", "current"):
+        entries = _reference_records_set(_reference_records_identity, generation=generation)
+        _publish_reference_set(_reference_records_ctx, entries)
+        assert path.read_bytes() == before
+
+
+def test_automatic_original_failed_publication_leaves_no_partial_record(tmp_path, monkeypatch):
+    original, cfg, _, _, root = _automatic_original_case(tmp_path, monkeypatch)
+
+    def failed(*args):
+        raise OSError("publication failed")
+
+    monkeypatch.setattr(original.os, "replace", failed)
+    with pytest.raises(OSError, match="publication failed"):
+        original.onboard_original_model(CortexConfig(base_url="http://127.0.0.1:1"), cfg, records_dir=root)
+    assert not list(root.rglob("original-model.json"))
+    assert not list(root.rglob(".original-model-*"))
+
+
+def test_automatic_original_runner_forwards_the_custom_reference_root(tmp_path, monkeypatch):
+    config_path, spec_path = _synthetic_config_spec(tmp_path / "fixture")
+    cfg = load_config(config_path)
+    spec = Spec.read(spec_path)
+    custom = tmp_path / "custom-references"
+
+    def validate(backend, actual_cfg, actual_spec, *, records_dir):
+        assert actual_cfg.config_id == cfg.config_id and actual_spec is spec
+        assert config_checksum(actual_cfg) == config_checksum(cfg)
+        assert records_dir == custom
+        raise RuntimeError("forwarded reference root")
+
+    monkeypatch.setattr(runner, "validate_local_full_model", validate)
+    with pytest.raises(RuntimeError, match="forwarded reference root"):
+        runner.execute(
+            cfg,
+            spec,
+            [],
+            vocab_size=4,
+            select=["e2e-sft-train-validate"],
+            client_backend=CortexConfig(base_url="http://127.0.0.1:1"),
+            local_gateway_full_model=True,
+            reference_records_dir=custom,
+        )
+
+
+@pytest.mark.parametrize("damage", [None, "missing", "changed", "records-root"])
+def test_automatic_original_completed_retry_requires_selected_identity(tmp_path, monkeypatch, damage):
+    from arctic_platform.correctness.harness import config as config_module
+
+    original, cfg, _, root, records = _automatic_original_case(tmp_path, monkeypatch)
+    backend = CortexConfig(base_url="http://127.0.0.1:1")
+    path = original.onboard_original_model(backend, cfg, records_dir=records)
+    _, spec_path = _synthetic_config_spec(tmp_path / "fixture")
+    spec = Spec.read(spec_path)
+    spec.config_id = cfg.config_id
+    spec.config_checksum = config_checksum(cfg)
+    spec.model.source_checkpoint = cfg.model_name
+    spec.applicable_tests.append("e2e-sft-train-validate")
+    spec.write(spec_path)
+    args = execution.parse_args(["onboard", "--config", str(cfg.path), "--test", "e2e-sft-train-validate"])
+    args.test_spec = spec_path
+    args.reference_records_dir = records
+    execution._configure_e2e_model(args, cfg, [args.test_id])
+    value = json.loads(spec.to_json())
+    saved = {
+        "status": "onboarded",
+        "exit_code": 0,
+        "spec_identity": onboard._onboarding_spec_identity(value, args.test_id),
+        "options": onboard._onboarding_options(args),
+        "runtime_identity": onboard._onboarding_runtime_identity(onboard._onboarding_runtime_sources()),
+    }
+    summary = {"results": {args.test_id: saved}}
+    monkeypatch.setattr(config_module, "load_config", lambda *a: cfg)
+    if damage == "missing":
+        path.unlink()
+    elif damage == "changed":
+        (root / "tokenizer.json").write_text('{"changed":true}')
+    elif damage == "records-root":
+        args.reference_records_dir = tmp_path / "other-references"
+    before = path.read_bytes() if path.exists() else None
+    assert onboard._completed_onboarding(args, value, summary, args.test_id) == (saved if damage is None else None)
+    assert (path.read_bytes() if path.exists() else None) == before
+    if damage == "missing":
+        original.onboard_original_model(backend, cfg, records_dir=records)
+        assert onboard._completed_onboarding(args, value, summary, args.test_id) == saved
 
 
 # Helper storage.
