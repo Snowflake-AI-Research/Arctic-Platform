@@ -17,10 +17,13 @@ num_key_value_heads = 2
 max_position_embeddings = 64
 tie_word_embeddings = true
 
-# fp32 against a float64 reference: differences are fp32 rounding (~1e-7 relative).
+# fp32 against a float64 reference: differences are fp32 rounding (~1e-7 relative). Gradients are compared absolutely,
+# and the tied embedding's reaches ~25 (small embedding weights feed an RMSNorm, which scales their gradient by ~50):
+# fp32 rounds there at ~2e-6, and reordered sums differ by ~1.5e-5 on some CPUs. Tiers that compare gradients allow
+# 1e-4, far under the 0.3 and more that a missing row restart or a wrong channel slice gives.
 [tolerances]
 reference = 1e-5
-packing = 1e-5
-parallel = 1e-5
-rl_step = 1e-5
+packing = 1e-4
+parallel = 1e-4
+rl_step = 1e-4
 chunking = 1e-6
