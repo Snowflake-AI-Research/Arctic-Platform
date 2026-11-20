@@ -22,6 +22,10 @@ vLLM release:
   speculative rows
 * https://github.com/vllm-project/vllm/pull/56524: reallocated Mamba state
   blocks are not zeroed
+
+``SchedulerPatch`` has no upstream fix yet: without fine-grained hits, a
+prefill stops on the Mamba block grid but hits land on the coarser scheduler
+block grid, so the replay boundary's state is never saved.
 """
 
 from itertools import product as iprod
@@ -32,11 +36,16 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import (
     MambaManager,
     SingleTypeKVCacheManager,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    MambaSpec,
+    get_mamba_prefill_checkpoint_position,
+)
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
 from arctic_platform.inference.patching import ArcticPatch
@@ -258,6 +267,38 @@ class KVBlockZeroerPatch(ArcticPatch[KVBlockZeroer]):
         )
 
 
+class SchedulerPatch(ArcticPatch[Scheduler]):
+
+    _orig_mamba_block_aligned_split = Scheduler._mamba_block_aligned_split
+
+    def _mamba_block_aligned_split(
+        self,
+        request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        num_new_tokens = self._orig_mamba_block_aligned_split(
+            request, num_new_tokens, num_new_local_computed_tokens,
+            num_external_computed_tokens)
+        if self.mamba_partial_cache_hit:
+            return num_new_tokens
+        start = (request.num_computed_tokens + num_new_local_computed_tokens
+                 + num_external_computed_tokens)
+        end = start + num_new_tokens
+        # Final chunks spanning this boundary export it as an internal checkpoint.
+        replay_boundary = get_mamba_prefill_checkpoint_position(
+            request.num_tokens,
+            self.block_size,
+            self.use_eagle_block_drop,
+            num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
+        )
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start < replay_boundary < end < prefill_end:
+            return replay_boundary - start
+        return num_new_tokens
+
+
 _PATCHED = False
 
 
@@ -270,4 +311,5 @@ def apply_hybrid_state_fixes() -> None:
     SingleTypeKVCacheManagerPatch.apply_patch()
     MambaManagerPatch.apply_patch()
     KVBlockZeroerPatch.apply_patch()
+    SchedulerPatch.apply_patch()
     _PATCHED = True
