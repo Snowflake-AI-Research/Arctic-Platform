@@ -33,7 +33,9 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import itertools
 import logging
+import weakref
 from dataclasses import dataclass
 from dataclasses import fields
 from typing import Dict
@@ -195,6 +197,8 @@ class ActivationOffloadManager:
         self._order_index: Dict[int, int] = {}
         self._next_id = 0
         self._active_depth = 0
+        self._models: weakref.WeakSet[torch.nn.Module] = weakref.WeakSet()
+        self._persistent_storages: set[tuple[torch.device, int]] = set()
         self._pinned_cache_stats = _PinnedCacheStats()
         self.pinned_cache = _PinnedStagingCache(self._pinned_cache_stats)
         self.stats = _OffloadStats()
@@ -287,6 +291,13 @@ class ActivationOffloadManager:
         """
         if self._active_depth == 0:
             self.reset_pending()
+            # ZeRO can rebind parameter storage after installation; views of resident weights save no GPU memory.
+            self._persistent_storages = {
+                (tensor.device, tensor.untyped_storage().data_ptr())
+                for model in self._models
+                for tensor in itertools.chain(model.parameters(), model.buffers())
+                if tensor.device.type == "cuda" and tensor.layout == torch.strided and tensor.numel() > 0
+            }
         self._active_depth += 1
         try:
             with self.hooks_ctx():
@@ -343,6 +354,8 @@ class ActivationOffloadManager:
 
     def _eligible(self, tensor: torch.Tensor) -> bool:
         if not (self.enabled and tensor.device.type == "cuda") or isinstance(tensor, torch.nn.Parameter):
+            return False
+        if (tensor.device, tensor.untyped_storage().data_ptr()) in self._persistent_storages:
             return False
         if tensor.numel() * tensor.element_size() < self.tensor_size_threshold:
             self.stats.passed_small += 1
@@ -529,6 +542,7 @@ def install_activation_offload(
         manager = attached_manager or ActivationOffloadManager()
     setattr(model, _MANAGER_ATTR, manager)
     manager.configure(config=resolved)
+    manager._models.add(model)
     if getattr(model, _INSTALLED_ATTR, False):
         return manager
     original_forward = model.forward
