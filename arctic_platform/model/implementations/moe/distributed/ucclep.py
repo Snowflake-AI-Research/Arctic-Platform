@@ -262,6 +262,8 @@ def get_buffer(group: ProcessGroup, hidden_bytes: int) -> Buffer:
         or _buffer.num_nvl_bytes < num_nvl_bytes
         or _buffer.num_rdma_bytes < num_rdma_bytes
     ):
+        # Allocated outside PyTorch's caching allocator, which may hold all free device memory (see deepep.py).
+        torch.cuda.empty_cache()
         _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
 
     return _buffer
