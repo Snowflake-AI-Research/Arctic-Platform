@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib
 import json
 import types
 from unittest.mock import Mock
@@ -724,6 +725,285 @@ def test_glm53_nope_sparse_mla_matches_reference_through_the_kernels():
     assert rel(kv.grad[:, :keys], kv_ref.grad[:, :keys]) < 1e-2
 
 
+@pytest.mark.parametrize("target_format", ["prime", "hf"])
+def test_glm53_streaming_checkpoint_matches_whole_state_conversion(tmp_path, monkeypatch, target_format):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.glm53 import modeling_glm5_next
+    from arctic_platform.model.implementations.moe.weights import load_state_dict
+
+    set_seed(0)
+    model_class = modeling_glm5_next.Glm5NextForConditionalGenerationPrimeRL
+    original = dict(model_class(_tiny_config()).state_dict())
+    # Native expert tensors are allocated empty; conversion needs finite, distinct fixture values.
+    original = {
+        name: torch.arange(weight.numel(), dtype=weight.dtype).reshape(weight.shape) + index
+        for index, (name, weight) in enumerate(original.items())
+    }
+    if target_format == "prime":
+        original = model_class.convert_to_hf(original)
+    expected = getattr(model_class, f"convert_to_{target_format}")(
+        {name: tensor.clone() for name, tensor in original.items()}
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    names = tuple(original)
+    for shard_index in range(2):
+        save_file(
+            {name: original[name].clone().contiguous() for name in names[shard_index::2]},
+            source / f"model-{shard_index}.safetensors",
+        )
+
+    observed_groups = []
+    convert = getattr(model_class, f"convert_to_{target_format}")
+
+    def observe_group(cls, state):
+        observed_groups.append(tuple(state))
+        return convert(state)
+
+    monkeypatch.setattr(model_class, f"convert_to_{target_format}", classmethod(observe_group))
+    destination = tmp_path / "converted"
+    getattr(model_class, f"convert_to_{target_format}_checkpoint")(source, destination)
+
+    converted = load_state_dict(destination)
+    assert converted.keys() == expected.keys()
+    for name, weight in expected.items():
+        torch_assert_equal(converted[name], weight)
+    assert len(observed_groups) > 4
+    for group in observed_groups:
+        layer_prefixes = {name.split(".", 4)[3] for name in group if name.startswith("model.language_model.layers.")}
+        assert len(layer_prefixes) <= 1
+        if not layer_prefixes:
+            assert len(group) == 1
+    index = json.loads((destination / "model.safetensors.index.json").read_text())
+    assert index["weight_map"].keys() == expected.keys()
+
+
+@pytest.mark.parametrize("groups", [[["a"]], [["a", "b"], ["b"]], [["a", "b"], []], [["a", "b", "c"]]])
+def test_checkpoint_conversion_rejects_invalid_dependency_groups(tmp_path, groups):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe.weights import convert_safetensor_checkpoint
+
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file({"a": torch.tensor([1.0]), "b": torch.tensor([2.0])}, source / "model.safetensors")
+    destination = tmp_path / "converted"
+    calls = []
+
+    with pytest.raises(ValueError, match="cover every source tensor exactly once"):
+        convert_safetensor_checkpoint(source, destination, calls.append, lambda names: groups)
+
+    assert not destination.exists()
+    assert calls == []
+
+
+@pytest.mark.parametrize("failure", ["empty", "overlapping"])
+def test_checkpoint_conversion_rejects_invalid_converted_groups(tmp_path, failure):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe.weights import convert_safetensor_checkpoint
+
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file({"a": torch.tensor([1.0]), "b": torch.tensor([2.0])}, source / "model.safetensors")
+    destination = tmp_path / "converted"
+
+    def convert(state):
+        tensor = next(iter(state.values()))
+        state.clear()
+        if failure == "overlapping":
+            state["output"] = tensor
+
+    with pytest.raises(ValueError, match="empty or overlapping groups"):
+        convert_safetensor_checkpoint(source, destination, convert, lambda names: [(name,) for name in names])
+
+    assert not (destination / "model.safetensors.index.json").exists()
+
+
+@pytest.mark.parametrize("failure", ["empty-source", "duplicate-source"])
+def test_checkpoint_conversion_rejects_invalid_source(tmp_path, failure):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe.weights import convert_safetensor_checkpoint
+
+    source = tmp_path / "source"
+    source.mkdir()
+    if failure == "duplicate-source":
+        for index in range(2):
+            save_file({"a": torch.tensor([1.0])}, source / f"model-{index}.safetensors")
+    destination = tmp_path / "converted"
+    message = "No safetensors weights" if failure == "empty-source" else "Duplicate checkpoint tensor"
+
+    with pytest.raises(ValueError, match=message):
+        convert_safetensor_checkpoint(source, destination, lambda state: None, lambda names: [names])
+
+    assert not destination.exists()
+
+
+def test_checkpoint_conversion_shard_failure_never_publishes_index(tmp_path, monkeypatch):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe import weights
+
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file({"a": torch.tensor([1.0]), "b": torch.tensor([2.0])}, source / "model.safetensors")
+    destination = tmp_path / "converted"
+    calls = []
+
+    def save(state, path, **kwargs):
+        calls.append(path)
+        if len(calls) == 2:
+            raise OSError("storage full")
+        save_file(state, path, **kwargs)
+
+    monkeypatch.setattr(weights, "save_file", save)
+    with pytest.raises(OSError, match="storage full"):
+        weights.convert_safetensor_checkpoint(
+            source, destination, lambda state: None, lambda names: [(name,) for name in names]
+        )
+
+    assert len(calls) == 2
+    assert calls[0].is_file()
+    assert not (destination / "model.safetensors.index.json").exists()
+
+
+def test_checkpoint_conversion_uses_source_index_and_converter_return(tmp_path):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe.weights import convert_safetensor_checkpoint
+    from arctic_platform.model.implementations.moe.weights import load_state_dict
+    from arctic_platform.model.implementations.moe.weights import load_state_dict_keys
+
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file({"a": torch.tensor([1.0]), "unindexed": torch.tensor([3.0])}, source / "indexed.safetensors")
+    save_file({"a": torch.tensor([99.0])}, source / "stray.safetensors")
+    (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"a": "indexed.safetensors"}}))
+    assert load_state_dict_keys(source) == ["a"]
+    original = load_state_dict(source)
+    assert set(original) == {"a"}
+    torch_assert_equal(original["a"], torch.tensor([1.0]))
+    destination = tmp_path / "converted"
+    convert_safetensor_checkpoint(source, destination, lambda state: {"b": state["a"] + 1}, lambda names: [names])
+    converted = load_state_dict(destination)
+    assert set(converted) == {"b"}
+    torch_assert_equal(converted["b"], torch.tensor([2.0]))
+
+
+def test_unindexed_checkpoint_readers_keep_last_file_wins_on_duplicate_names(tmp_path):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe import weights
+
+    save_file({"a": torch.tensor([1.0]), "first-only": torch.zeros(1)}, tmp_path / "consolidated.safetensors")
+    save_file({"a": torch.tensor([2.0]), "last-only": torch.ones(1)}, tmp_path / "model.safetensors")
+    assert set(weights.load_state_dict_keys(tmp_path)) == {"a", "first-only", "last-only"}
+    loaded = weights.load_state_dict(tmp_path)
+    assert set(loaded) == {"a", "first-only", "last-only"}
+    torch_assert_equal(loaded["a"], torch.tensor([2.0]))
+    with pytest.raises(ValueError, match="Duplicate checkpoint tensor: a"):
+        weights.convert_safetensor_checkpoint(
+            tmp_path, tmp_path / "converted", lambda state: state, lambda names: [names]
+        )
+
+
+@pytest.mark.parametrize("index", [{}, {"weight_map": []}, {"weight_map": {"a": "../outside.safetensors"}}])
+def test_checkpoint_readers_reject_invalid_source_index(tmp_path, index):
+    from arctic_platform.model.implementations.moe import weights
+
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+    readers = [
+        weights.load_state_dict_keys,
+        weights.load_state_dict,
+        lambda source: weights.convert_safetensor_checkpoint(
+            source, source / "converted", lambda state: state, lambda names: [names]
+        ),
+    ]
+    for reader in readers:
+        with pytest.raises(ValueError, match="Checkpoint"):
+            reader(tmp_path)
+
+
+def test_checkpoint_readers_accept_hub_symlinks_outside_snapshot(tmp_path):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe import weights
+
+    blob = tmp_path / "blobs" / "hash"
+    blob.parent.mkdir()
+    save_file({"a": torch.tensor([1.0])}, blob)
+    source = tmp_path / "snapshots" / "revision"
+    source.mkdir(parents=True)
+    (source / "shard.safetensors").symlink_to(blob)
+    (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"a": "shard.safetensors"}}))
+    assert weights.load_state_dict_keys(source) == ["a"]
+    torch_assert_equal(weights.load_state_dict(source)["a"], torch.tensor([1.0]))
+    converted = tmp_path / "converted"
+    weights.convert_safetensor_checkpoint(source, converted, lambda state: state, lambda names: [names])
+    torch_assert_equal(weights.load_state_dict(converted)["a"], torch.tensor([1.0]))
+
+
+@pytest.mark.parametrize("builder_family", ["qwen35", "glm52"])
+@pytest.mark.parametrize("scope", ["node-local", "shared"])
+@pytest.mark.parametrize("converter_api", ["checkpoint", "stream"])
+def test_glm53_load_selects_streaming_checkpoint_converter(
+    tmp_path, monkeypatch, builder_family, scope, converter_api
+):
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+    from arctic_platform.model.implementations.moe.weights import load_state_dict
+
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{builder_family}.model_builder")
+    model = Glm5NextForConditionalGenerationPrimeRL(_tiny_config())
+    state = {
+        name: torch.arange(weight.numel(), dtype=weight.dtype).reshape(weight.shape)
+        for name, weight in model.state_dict().items()
+    }
+    source = tmp_path / "source"
+    source.mkdir()
+    hf = model.convert_to_hf({name: weight.clone() for name, weight in state.items()})
+    save_file({name: weight.clone().contiguous() for name, weight in hf.items()}, source / "model.safetensors")
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(hf, "model.safetensors")})
+    )
+    save_file({"stray.weight": torch.ones(1)}, source / "stray.safetensors")
+    cache = tmp_path / "prime"
+    monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: cache)
+    # This test selects the streamed fallback; supported direct loading is covered separately.
+    monkeypatch.setattr(builder, "supports_direct_hf_loading", lambda model: False)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", scope)
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "streamed-load-test")
+    monkeypatch.setattr(builder, "get_world", lambda: SimpleNamespace(rank=0, local_rank=0, is_master=True))
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    monkeypatch.setattr(builder, "dcp_load", lambda *args, **kwargs: None)
+    monkeypatch.setattr(builder, "_move_buffers_to_cuda", lambda *args: None)
+    if builder_family == "glm52":
+        monkeypatch.setattr(builder, "_init_buffers_post_meta", lambda *args: None)
+    monkeypatch.setattr(builder, "HuggingFaceStorageReader", lambda **kwargs: None)
+
+    def refuse_bulk_load(*args):
+        raise AssertionError("GLM5-next conversion must not bulk-load the checkpoint")
+
+    monkeypatch.setattr(builder, "load_state_dict", refuse_bulk_load)
+    if converter_api == "stream":
+        convert_checkpoint = model.convert_to_prime_checkpoint
+        monkeypatch.setattr(model, "stream_convert_to_prime", convert_checkpoint, raising=False)
+        monkeypatch.setattr(model, "convert_to_prime_checkpoint", refuse_bulk_load)
+    config = SimpleNamespace(
+        name=str(source), debug=SimpleNamespace(random_init=False), dequantize_checkpoint=False, fsdp_cpu_offload=True
+    )
+    builder.load_dcp_from_hf(model, config, SimpleNamespace())
+    converted = load_state_dict(cache)
+    assert set(converted) == set(state)
+    for name, weight in state.items():
+        torch_assert_equal(converted[name], weight)
+
+
 @pytest.mark.parametrize("suffix", ["", ".weight"])
 def test_glm53_packed_hf_experts_convert_without_losing_weights(suffix):
     prefix = "model.language_model.layers.3.mlp"
@@ -856,3 +1136,80 @@ def test_glm53_packed_hf_fp8_rejects_missing_scales(missing_projection):
 
     with pytest.raises(ValueError, match="missing its scale"):
         convert_hf_layer_to_prime(state, 3)
+
+
+@pytest.mark.parametrize("builder_family", ["qwen35", "glm52"])
+def test_shared_conversion_cache_failure_stops_both_loaders_before_barrier(tmp_path, monkeypatch, builder_family):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    builder = importlib.import_module(f"arctic_platform.model.implementations.{builder_family}.model_builder")
+    models = [Glm5NextForConditionalGenerationPrimeRL(_tiny_config()) for _ in range(2)]
+    source = tmp_path / "source"
+    source.mkdir()
+    hf_name = "model.language_model.layers.3.mlp.experts.0.gate_proj.weight"
+    save_file({hf_name: torch.ones(8, 16)}, source / "model.safetensors")
+    (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {hf_name: "model.safetensors"}}))
+    cache = tmp_path / "prime"
+    local = threading.local()
+    converting, reader_observed_lock = threading.Event(), threading.Event()
+    barriers = {0: 0, 1: 0}
+    original_marker = conversion_cache._read_cache_marker
+    original_wait = conversion_cache.wait_for_conversion_cache
+
+    def read_marker(path):
+        marker = original_marker(path)
+        if path.name.endswith(".in-progress") and marker.get("attempt_id") is not None:
+            reader_observed_lock.set()
+        return marker
+
+    def fail_conversion(source, destination):
+        converting.set()
+        assert reader_observed_lock.wait(3), "reader must observe the active writer's attempt marker"
+        raise OSError("injected shared conversion failure")
+
+    def barrier():
+        barriers[local.rank] += 1
+
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", "shared")
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", "shared-failure-test")
+    monkeypatch.setattr(builder, "resolve_conversion_cache_path", lambda *args: cache)
+    monkeypatch.setattr(builder, "supports_direct_hf_loading", lambda model: False)
+    monkeypatch.setattr(
+        builder, "get_world", lambda: SimpleNamespace(rank=local.rank, local_rank=0, is_master=local.rank == 0)
+    )
+    monkeypatch.setattr(torch.distributed, "barrier", barrier)
+    monkeypatch.setattr(conversion_cache, "_read_cache_marker", read_marker)
+    monkeypatch.setattr(
+        builder,
+        "wait_for_conversion_cache",
+        lambda path, **kwargs: original_wait(path, timeout=3, poll_interval=0.01, **kwargs),
+    )
+    monkeypatch.setattr(models[0], "convert_to_prime_checkpoint", fail_conversion)
+    monkeypatch.setattr(
+        builder, "dcp_load", lambda *args, **kwargs: pytest.fail("failed conversion must not reach DCP")
+    )
+    config = SimpleNamespace(
+        name=str(source), debug=SimpleNamespace(random_init=False), dequantize_checkpoint=False, fsdp_cpu_offload=True
+    )
+
+    def load(rank):
+        local.rank = rank
+        builder.load_dcp_from_hf(models[rank], config, SimpleNamespace())
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        writer = executor.submit(load, 0)
+        assert converting.wait(3)
+        reader = executor.submit(load, 1)
+        with pytest.raises(OSError, match="injected shared conversion failure"):
+            writer.result(timeout=5)
+        with pytest.raises(RuntimeError, match="writer failed"):
+            reader.result(timeout=5)
+    assert barriers == {0: 1, 1: 1}, "both ranks passed only the pre-conversion barrier"
+    assert not cache.exists()
