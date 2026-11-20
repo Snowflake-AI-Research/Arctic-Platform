@@ -1,8 +1,9 @@
-"""Safetensors state-dict helpers for the carved-out Qwen3.5 load path.
+"""Safetensors state-dict helpers for the carved-out MoE load paths (qwen35, glm52).
 
 Slimmed from prime-rl's ``trainer/weights.py``: keeps only the key-scan, load,
 and save helpers used by ``load_dcp_from_hf`` for the one-time HF->Prime
-conversion cache. The distributed gather / LoRA helpers are dropped.
+conversion cache, and the process group its DCP load plans over. The
+distributed gather / LoRA helpers are dropped.
 """
 
 import json
@@ -20,6 +21,20 @@ from transformers.utils import WEIGHTS_INDEX_NAME
 from transformers.utils import WEIGHTS_NAME
 
 from .logging_utils import get_logger
+
+_DCP_PLANNING_GROUP = None
+
+
+def dcp_planning_group():
+    """A gloo group for DCP's load planning, whose collectives exchange only Python objects. Over the NCCL world group
+    they hung or failed the model load on 8-node EFA jobs: ranks stuck in different planning collectives
+    (``scatter_object_list`` against ``all_gather_object``), and one run's scatter raised NCCL "unhandled system
+    error". On gloo they run over the host network, apart from the NCCL communicators. Created once, by every rank
+    (``new_group`` is collective over the world)."""
+    global _DCP_PLANNING_GROUP
+    if _DCP_PLANNING_GROUP is None:
+        _DCP_PLANNING_GROUP = torch.distributed.new_group(backend="gloo")
+    return _DCP_PLANNING_GROUP
 
 
 def get_max_layer_num(state_dict: dict[str, Tensor], layer_prefix: str = "model.layers.") -> int:

@@ -6,6 +6,8 @@ from arctic_platform.inference.vllm import hybrid_state_fixes
 from arctic_platform.inference.vllm import kv_group_size
 from arctic_platform.inference.vllm import mamba_completion_refresh
 from arctic_platform.inference.vllm import mrope_yarn
+from arctic_platform.inference.vllm import pp_kv_cache_groups
+from arctic_platform.inference.vllm import pp_routed_experts
 from arctic_platform.inference.vllm import required_patches
 from arctic_platform.inference.vllm import router_replay
 from arctic_platform.inference.vllm import spec_decode_grammar
@@ -19,6 +21,16 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         router_replay,
         "ensure_router_replay_vllm_patches",
         lambda: calls.append("router"),
+    )
+    monkeypatch.setattr(
+        pp_routed_experts,
+        "ensure_pp_routed_experts",
+        lambda: calls.append("pp_routed_experts"),
+    )
+    monkeypatch.setattr(
+        pp_kv_cache_groups,
+        "ensure_pp_kv_cache_groups_fix",
+        lambda: calls.append("pp_kv_cache_groups"),
     )
     monkeypatch.setattr(
         xgrammar_stop_mask,
@@ -77,6 +89,8 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
 
     assert calls == [
         "router",
+        "pp_routed_experts",
+        "pp_kv_cache_groups",
         "xgrammar",
         "dense_prompt_logprobs",
         "spec_decode_grammar",

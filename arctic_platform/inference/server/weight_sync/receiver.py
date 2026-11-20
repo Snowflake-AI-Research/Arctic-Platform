@@ -12,6 +12,8 @@ weight tensors via NCCL.  Loading strategies for the base model:
   - **direct** (BF16, TP=1, fallback): bucket receive + copy into param views
   - **fp8**: bucket receive + FP8 in-place quantization
   - **batched**: bucket receive + model.load_weights for TP slicing
+  - **reload**: HF-named tensors into an online-quantized model, through
+    vLLM's layerwise reload (re-quantized as at load)
 
 Spec (drafter) weight sync defaults to the **hotswap** strategy (continue
 serving while syncing) because the drafter model is small enough that sync
@@ -24,7 +26,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
+from collections.abc import Callable
 
 import torch
 
@@ -168,6 +172,49 @@ def _loaded_copies(mappers: list, name: str) -> int:
     for mapper in mappers:
         copies *= max(1, sum(1 for _ in mapper.apply([(name, torch.empty(0))])))
     return copies
+
+
+def _quantizes_online(model) -> bool:
+    """Whether ``model`` quantized its BF16 checkpoint while loading it (``--quantization fp8``; vLLM's
+    ``_has_online_quant``): its quantized layers keep no BF16 parameter a received tensor could be written into."""
+    return any(
+        getattr(getattr(module, "quant_method", None), "uses_meta_device", False)
+        for module in model.modules()
+    )
+
+
+# How vLLM's expert mapping names one checkpoint expert tensor: ``experts.<id>.<proj>.``.
+_CHECKPOINT_EXPERT = re.compile(r"experts\.\d+\.[^.]+\.")
+
+
+def _remote_expert_filter(model) -> Callable[[str], bool]:
+    """``name -> True`` for a checkpoint-named routed-expert tensor that no expert slot of this EP rank holds.
+
+    ``get_expert_mapping`` lists, for each checkpoint expert tensor, the physical slots it loads into (several under
+    EPLB redundancy); a slot is held here when its ``RoutedExperts`` maps it to a local expert.
+    """
+    get_mapping = getattr(model, "get_expert_mapping", None)
+    if get_mapping is None:
+        return lambda name: False
+    slots: dict[str, list[tuple[str, int]]] = {}
+    for param_name, weight_name, expert_id, _ in get_mapping():
+        slots.setdefault(weight_name, []).append((param_name, expert_id))
+    modules = dict(model.named_modules())
+    mapper = getattr(model, "hf_to_vllm_mapper", None)
+
+    def remote(name: str) -> bool:
+        if mapper is not None:
+            name = next(iter(mapper.apply([(name, None)])), (name,))[0]
+        match = _CHECKPOINT_EXPERT.search(name)
+        if match is None or match.group(0) not in slots:
+            return False
+        for param_name, expert_id in slots[match.group(0)]:
+            experts = modules.get(name.replace(match.group(0), param_name).rpartition(".")[0])
+            if experts is None or experts._map_global_expert_id_to_local_expert_id(expert_id) != -1:
+                return False
+        return True
+
+    return remote
 
 
 def _loaded_destination_names(
@@ -734,6 +781,8 @@ class WeightSyncExtension:
         Returns the received count, all-byte and applied-source squared-L2
         norms, canonical destination mapping, and skipped source names.
         """
+        from vllm.model_executor.models.utils import is_pp_missing_parameter
+
         from arctic_platform.inference.server.weight_sync.utils import (
             _ShardAwareFusedWriter,
         )
@@ -745,6 +794,7 @@ class WeightSyncExtension:
         loaded = 0
         source_to_destinations: dict[str, list[str]] = {}
         skipped_source_names: list[str] = []
+        other_stage_sources = 0
         param_names = {pname for pname, _ in model.named_parameters()}
         recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
         applied_source_l2_sq = torch.zeros(
@@ -768,13 +818,29 @@ class WeightSyncExtension:
                 else:
                     destinations = sorted(set(loaded_names or ()))
             destinations = _canonicalize_destinations(destinations, param_names)
-            if destinations:
-                source_to_destinations[name] = destinations
+            # Under pipeline parallelism every rank receives every tensor. A tensor whose destinations all lie in
+            # another stage's layers (vLLM's PPMissingLayer here, though load_weights may still name them) is
+            # that stage's to apply: neither applied nor skipped on this rank.
+            here = [
+                destination
+                for destination in destinations
+                if destination in param_names or not is_pp_missing_parameter(destination, model)
+            ]
+            if destinations and not here:
+                other_stage_sources += 1
+            elif here:
+                source_to_destinations[name] = here
                 applied_source_l2_sq.add_(source_l2_sq * copies)
             else:
                 skipped_source_names.append(name)
             loaded += 1
             del tensor  # a rebuilt oversized tensor must not outlive its load
+        if other_stage_sources:
+            logger.info(
+                "Weight sync left %d/%d received source tensor(s) to the other pipeline stage(s)",
+                other_stage_sources,
+                loaded,
+            )
         if skipped_source_names:
             logger.warning(
                 "Weight sync skipped %d/%d received source tensor(s) because "
@@ -789,6 +855,40 @@ class WeightSyncExtension:
             source_to_destinations,
             skipped_source_names,
         )
+
+    def _load_reload(self, model, engine) -> tuple[int, float]:
+        """HF-named sync into an online-quantized model: vLLM's layerwise reload.
+
+        Online quantization loads the BF16 checkpoint and quantizes each layer once all its tensors arrived. The
+        reload puts those BF16 parameters back on meta, collects the received tensors per layer and reruns the
+        layer's quantization (a TP-sharded weight's scale from the whole weight, the MoE backend's layout) into the
+        original storage, so the sampler holds what loading the trained checkpoint would give it. It rewrites every
+        tensor of a layer it reloads: the trainer must send all of them.
+
+        The reload holds each tensor until its layer is complete, while the engine reuses the views it yields, so each
+        is cloned. Experts another EP rank holds are left out, or the last rank would hold every rank's experts of a
+        layer. ``load_weights`` runs once: DeepSeek-V4.1's finalizes its mHC broadcast weights on every call, reading
+        layer 0 while it is still on meta.
+        """
+        from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
+        from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
+
+        remote = _remote_expert_filter(model)
+        loaded = 0
+        recv_l2_sq = torch.zeros((), dtype=torch.float64, device=self.device)
+
+        def received():
+            nonlocal loaded
+            for name, tensor in engine.receive_weights():
+                recv_l2_sq.add_(_tensor_l2_sq(tensor))
+                loaded += 1
+                if not remote(name):
+                    yield name, tensor.clone()
+
+        initialize_layerwise_reload(model)
+        model.load_weights(received())
+        finalize_layerwise_reload(model, self.model_config)
+        return loaded, recv_l2_sq.item()
 
     # ------------------------------------------------------------------
     # Broadcast-mode weight sync (single world_size > 2 NCCL group)
@@ -881,7 +981,10 @@ class WeightSyncExtension:
         applied_source_l2_sq: float | None = None
         source_to_destinations: dict[str, list[str]] | None = None
         skipped_source_names: list[str] | None = None
-        if weight_format == "hf":
+        if weight_format == "hf" and _quantizes_online(model):
+            path = "reload"
+            loaded, recv_l2_sq = self._load_reload(model, engine)
+        elif weight_format == "hf":
             path = "batched"
             with maybe_observe_broadcast_load(self, model, engine) as verifier:
                 (
