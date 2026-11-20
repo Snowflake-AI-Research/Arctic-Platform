@@ -49,6 +49,13 @@ SWITCHES = {
         True,
         False,
     ),
+    "shard_frozen_dense": (
+        "moe.frozen_shard",
+        "frozen_dense_sharding_requested",
+        "ARL_SHARD_FROZEN_DENSE",
+        True,
+        False,
+    ),
     "w4a8_experts": ("kernels.w4a8", "w4a8_experts_requested", "ARL_W4A8_EXPERTS", True, False),
     "w8a8_experts": ("kernels.fp8_grouped_w8a8", "w8a8_experts_requested", "ARL_W8A8_EXPERTS", True, False),
     "ultraep_spares": ("moe.ultraep_replicas", "ultraep_spares", "ARL_ULTRAEP_SPARES", 2, 0),
@@ -250,6 +257,7 @@ def test_every_moe_loader_takes_the_fields_unset_by_default(options_cls):
     options = options_cls()
     assert (options.ultraep_spares, options.ultraep_ipc_symm) == (None, None)
     assert (options.expert_replicas, options.expert_replicas_ema, options.expert_placement) == (None, None, None)
+    assert (options.frozen_expert_offload, options.shard_frozen_dense, options.w4a8_experts) == (None, None, None)
     options = options_cls(ultraep_spares=2, ultraep_ipc_symm=True)
     assert (options.ultraep_spares, options.ultraep_ipc_symm) == (2, True)
     assert options_cls(expert_replicas=2, expert_replicas_ema=1.0).expert_replicas == 2
