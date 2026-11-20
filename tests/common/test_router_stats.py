@@ -403,6 +403,7 @@ def test_broadcast_on_error_then_retry_matches_single_request_totals():
     assert fail_report["sampled_tokens"] == ok_report["sampled_tokens"]
     assert fail_report["tokens_per_expert"] == ok_report["tokens_per_expert"]
 
+
 @pytest.mark.parametrize(
     "config",
     [
