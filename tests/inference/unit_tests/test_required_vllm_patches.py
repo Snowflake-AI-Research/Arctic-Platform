@@ -7,6 +7,7 @@ from arctic_platform.inference.vllm import kv_group_size
 from arctic_platform.inference.vllm import mamba_completion_refresh
 from arctic_platform.inference.vllm import mrope_yarn
 from arctic_platform.inference.vllm import required_patches
+from arctic_platform.inference.vllm import routed_experts_recompute_warning
 from arctic_platform.inference.vllm import router_replay
 from arctic_platform.inference.vllm import spec_decode_grammar
 from arctic_platform.inference.vllm import tp_spec_decode_sync
@@ -72,6 +73,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "ensure_deepseek_v41_lora",
         lambda: calls.append("deepseek_v41_lora"),
     )
+    monkeypatch.setattr(
+        routed_experts_recompute_warning,
+        "ensure_routed_experts_recompute_warning",
+        lambda: calls.append("routed_experts_recompute_warning"),
+    )
 
     required_patches.apply_required_vllm_patches()
 
@@ -88,4 +94,5 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "mrope_yarn",
         "mamba_completion_refresh",
         "deepseek_v41_lora",
+        "routed_experts_recompute_warning",
     ]
