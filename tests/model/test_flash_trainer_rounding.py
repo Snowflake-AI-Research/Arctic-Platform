@@ -470,26 +470,40 @@ def test_flash_moe_weights_the_down_projection_accumulator_before_rounding(
 @pytest.mark.parametrize(
     "device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"))]
 )
-def test_expert_swiglu_and_its_gradients_round_once(device, limit):
-    """The experts' ``silu(gate) * up`` and its gate and up gradients are their fp64 values from the same bf16
-    inputs, rounded once. Composed in bf16, ``silu(gate)`` and, in backward, ``grad * up`` were rounded first."""
+def test_expert_swiglu_preserves_forward_and_widens_gate_gradient(device, limit):
     from arctic_platform.model.implementations.moe.layers.moe import _apply_swiglu
 
-    torch.manual_seed(0)
-    gate, up = (3 * torch.randn(2, 256, 512)).bfloat16().to(device)  # |x| > 10 at about 0.1 % of values
-    grad = torch.randn(256, 512).bfloat16().to(device)
-    actual_gate, actual_up = gate.clone().requires_grad_(), up.clone().requires_grad_()
-    output = _apply_swiglu(actual_gate, actual_up, limit)
+    # Element zero distinguishes both placements of the rounding; the rest exercise the clamp boundaries.
+    gate = torch.tensor([0.21875, 10, 11, -1], dtype=torch.bfloat16, device=device, requires_grad=True)
+    up = torch.tensor([1.15625, -10, 10, 11], dtype=torch.bfloat16, device=device, requires_grad=True)
+    grad = torch.full_like(up, 1.4375)
+    output = _apply_swiglu(gate, up, limit)
     output.backward(grad)
 
-    gate64, up64 = gate.double().requires_grad_(), up.double().requires_grad_()
-    clamped_gate, clamped_up = gate64, up64
+    clamped_gate, clamped_up = gate.detach(), up.detach()
     if limit is not None:
-        clamped_gate, clamped_up = gate64.clamp(max=limit), up64.clamp(min=-limit, max=limit)
-    reference = torch.nn.functional.silu(clamped_gate) * clamped_up
-    reference.backward(grad.double())
-    for actual, expected in ((output, reference), (actual_gate.grad, gate64.grad), (actual_up.grad, up64.grad)):
-        _assert_rounded_once(actual.detach().cpu(), expected.detach().cpu())
+        clamped_gate, clamped_up = clamped_gate.clamp(max=limit), clamped_up.clamp(-limit, limit)
+    silu = torch.nn.functional.silu(clamped_gate.double()).bfloat16()
+    expected_up = grad * silu
+    sig = clamped_gate.double().sigmoid()
+    expected_gate = grad.double() * clamped_up * sig * (1 + clamped_gate * (1 - sig))
+    if limit is not None:
+        expected_gate *= gate.detach() <= limit
+        expected_up *= up.detach().abs() <= limit
+    assert torch.equal(output, silu * clamped_up)
+    assert torch.equal(up.grad, expected_up)
+    assert torch.equal(gate.grad, expected_gate.bfloat16())
+
+
+def test_expert_swiglu_up_gradient_retains_its_dependence_on_gate():
+    from arctic_platform.model.implementations.moe.layers.moe import _apply_swiglu
+
+    gate = torch.tensor([0.21875, 2], dtype=torch.bfloat16, requires_grad=True)
+    up = torch.tensor(1.15625, dtype=torch.bfloat16, requires_grad=True)
+    (up_grad,) = torch.autograd.grad(_apply_swiglu(gate, up, None).sum(), up, create_graph=True)
+    (mixed,) = torch.autograd.grad(up_grad, gate)
+    (expected,) = torch.autograd.grad(torch.nn.functional.silu(gate).sum(), gate)
+    assert torch.equal(mixed, expected)
 
 
 def test_weighted_down_projection_backward_is_that_of_the_bf16_gemm_then_weighting():
