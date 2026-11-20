@@ -114,9 +114,29 @@ def skip_share_if_router_disagree(
 class PackedLayout:
     """One packed model call. Segments ``[0, num_roots)`` are roots; later segments continue a parent.
 
-    ``src_row`` / ``src_col`` gather from one client cell per packed token. ``row_index`` maps each
-    client ``[B, S]`` cell onto a packed position (shared prefix cells point at the root). Pre-pack
-    width ``S`` is ``packed_loss_scale_factor``.
+    Construct with :meth:`build`. Do not infer these boundaries from ``position_ids == 0``.
+
+    Attributes:
+        cu_seqlens: Int32 ``[num_segments + 1]`` exclusive prefix sums of packed query tokens.
+            Attention segments, not loss rows. ``cu_seqlens[s]:cu_seqlens[s+1]`` is segment ``s``.
+        parent: Int64 ``[num_segments]``. ``parent[s] == -1`` for a root; otherwise the root
+            segment index this continuation attends into.
+        num_roots: Count of root segments. They occupy ``[0, num_roots)`` in segment order.
+        position_ids: Int64 ``[T]`` client RoPE positions for packed tokens (not regenerated
+            ``arange``). ``T`` is ``cu_seqlens[-1]``.
+        row_index: Int64 ``[B, S]``. Packed token index for each client cell, or ``-1`` if the
+            cell is padding. Shared-prefix cells on every row of a group point at the root.
+        src_row: Int64 ``[T]``. Client batch row gathered for each packed token (one source
+            row per token; the first row of a shared group for the root).
+        src_col: Int64 ``[T]``. Client column gathered for each packed token (valid-token
+            columns, so left padding is skipped).
+        logical_row: Int64 ``[T]``. Client row that owns this packed token for later loss
+            reduction. Today this matches ``src_row`` (the root is attributed to the group's
+            first row). Not ``layout.cu_seqlens``.
+        packed_loss_scale_factor: Pre-pack width ``S`` (including padding). Seq-mean-token-sum-norm
+            uses this, not packed ``T``.
+        conv_kernel_size: Optional GatedDeltaNet conv width for a later ``conv_carry`` guard.
+            Unused by full attention.
     """
 
     cu_seqlens: Tensor
@@ -141,6 +161,28 @@ class PackedLayout:
         input_ids: Tensor | None = None,
         routed_experts: Tensor | None = None,
     ) -> "PackedLayout":
+        """Build a layout from a padded ``[B, S]`` micro-batch.
+
+        Args:
+            attention_mask: ``[B, S]`` 1 on valid tokens, 0 on pad. ``shared`` counts valid
+                tokens, not raw columns.
+            groups: Partition of batch rows. Each inner sequence is one prompt group. A
+                singleton is packed as its own root (no sharing). A split group that still
+                has two or more rows shares one root; a one-row fragment is a full root.
+            shared: One integer per group: how many **valid** tokens to store once as the
+                root. ``0`` means no sharing. Must be ``<`` each row's valid length so a
+                continuation remains. Typical full-attn value is ``prompt_len - 1``.
+            position_ids: Optional ``[B, S]`` client positions. Packed positions are gathered
+                from these. If omitted, valid tokens in each row get ``0 .. length-1``.
+            conv_kernel_size: Optional conv width stored on the layout for GDN. Ignored here.
+            input_ids: ``[B, S]`` token ids. Required when any group shares (``shared > 0``
+                and at least two rows). The first ``shared[i]`` valid tokens must match.
+            routed_experts: Optional ``[B, S, ...]`` router-replay ids. Groups whose valid
+                prefix disagrees are not shared (``shared`` for that group becomes 0).
+
+        Returns:
+            A layout whose packed width is the sum of root tokens plus continuation tokens.
+        """
         if attention_mask.ndim != 2:
             raise ValueError(f"attention_mask must be [B, S], got {tuple(attention_mask.shape)}")
         if len(groups) != len(shared):
