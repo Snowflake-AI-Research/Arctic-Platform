@@ -81,8 +81,8 @@ class TestGrpoNonfiniteLogprobs(TestCase):
         reduction = resolve_loss("grpo").packed_reduction_callback(batches, config, "grpo")
         combined_loss, combined_grad, combined = run_loss(values, [1, 1, 1], config)
         parts = [run_loss(values, mask, config) for mask in masks]
-        split_loss = sum(w * loss for w, (loss, _, _) in zip(reduction.loss_scales, parts))
-        split_grad = sum(w * grad for w, (_, grad, _) in zip(reduction.loss_scales, parts))
+        split_loss = sum(w * loss for w, (loss, _, _) in zip(reduction.loss_scales, parts, strict=True))
+        split_grad = sum(w * grad for w, (_, grad, _) in zip(reduction.loss_scales, parts, strict=True))
         # Summing two weighted float32 losses changes the reduction order.
         torch_assert_close(split_loss, combined_loss, rtol=0, atol=1e-7)
         torch_assert_close(split_grad, combined_grad, rtol=0, atol=1e-7)
