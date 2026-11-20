@@ -7,6 +7,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from arctic_platform.common.packing.layout import get_stashed_layout
+from arctic_platform.common.packing.layout import prefix_varlen_args
+
 from .norms import RMSNorm, RMSNormConfig
 from .rotary_emb import apply_rotary_pos_emb
 
@@ -24,7 +27,8 @@ except ImportError:
 
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_4_varlen_func
-except ImportError:
+# Some flash_attn builds raise AttributeError, not ImportError, while importing ``flash_attn.cute``.
+except (ImportError, AttributeError):
     flash_attn_4_varlen_func = None  # type: ignore
 
 
@@ -94,6 +98,9 @@ class FlashAttention(nn.Module):
 
     def _compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens, max_seqlen):
         """Run the flash attention kernel. q/k/v are [total_tokens, heads, dim]."""
+        k, v, cu_seqlens, cu_seqlens_k, max_seqlen, max_seqlen_k = prefix_varlen_args(
+            k, v, cu_seqlens, max_seqlen, get_stashed_layout(self)
+        )
         kwargs: dict = {"causal": True}
         sliding_window = getattr(self, "sliding_window", None)
         if sliding_window is not None:
@@ -102,10 +109,10 @@ class FlashAttention(nn.Module):
             # FA4's flash_attn_varlen_func has qv as the 4th positional arg,
             # so cu_seqlens must be passed as keyword args to avoid misalignment.
             kwargs["cu_seqlens_q"] = cu_seqlens
-            kwargs["cu_seqlens_k"] = cu_seqlens
+            kwargs["cu_seqlens_k"] = cu_seqlens_k
             out = self._flash_attn_call(q, k, v, **kwargs)
         else:
-            out = self._flash_attn_call(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, **kwargs)
+            out = self._flash_attn_call(q, k, v, cu_seqlens, cu_seqlens_k, max_seqlen, max_seqlen_k, **kwargs)
         if isinstance(out, tuple):
             out = out[0]
         return out
@@ -259,6 +266,9 @@ class SDPAAttention(nn.Module):
     ) -> torch.Tensor:
         key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
         value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
+        layout = get_stashed_layout(self)
+        if layout is not None and layout.has_sharing:
+            raise ValueError("prefix sharing requires FlashAttention; SDPA has no prefix-continuation path in this PR")
         out = F.scaled_dot_product_attention(query_states, key_states, value_states, is_causal=True)
         out = out.transpose(1, 2).contiguous()
         return out.view(out.shape[0], out.shape[1], -1)

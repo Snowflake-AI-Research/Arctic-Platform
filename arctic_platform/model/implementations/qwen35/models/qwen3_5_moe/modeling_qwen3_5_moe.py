@@ -16,6 +16,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 from transformers.utils import logging
 
+from arctic_platform.common.packing.layout import require_no_prefix_sharing
 from arctic_platform.model.implementations.debug.determinism import resolve_flash_attention_determinism
 from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
 from arctic_platform.model.implementations.fp8 import make_linear
@@ -875,6 +876,7 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if self.config._attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
+            require_no_prefix_sharing("Qwen3.5-MoE segment boundaries")
             flat_position_ids = position_ids.view(-1)
             # Segment lengths from boundary indices (where position_ids resets to 0), not position values, so
             # an SP shard carrying global-offset positions still yields local cu_seqlens. Same as the

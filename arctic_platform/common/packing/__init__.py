@@ -65,6 +65,17 @@ from .groups import split_microbatches
 from .groups import token_budget_groups
 from .groups import token_budget_microbatch_groups
 from .groups import token_validity_mask
+from .layout import PackedLayout
+from .layout import active_layout_requires_token_mean
+from .layout import pack_with_layout
+from .layout import require_identical_prefixes
+from .layout import require_no_prefix_sharing
+from .layout import require_prefix_continuation
+from .layout import require_router_replay_decision
+from .layout import require_token_mean_if_sharing
+from .layout import shared_prefix_length
+from .layout import skip_share_if_router_disagree
+from .layout import using_layout
 from .pack import IGNORE_INDEX
 from .pack import ROW_BROADCAST_KEYS
 from .pack import PackMetadata
@@ -86,6 +97,7 @@ __all__ = [
     "cu_seqlens_from_position_ids",
     "IGNORE_INDEX",
     "MicrobatchSplit",
+    "PackedLayout",
     "PackMetadata",
     "ROW_BROADCAST_KEYS",
     "batch_input_ids",
@@ -95,6 +107,16 @@ __all__ = [
     "batch_tensor",
     "map_batch_values",
     "pack_microbatch",
+    "pack_with_layout",
+    "require_no_prefix_sharing",
+    "require_prefix_continuation",
+    "require_router_replay_decision",
+    "require_token_mean_if_sharing",
+    "shared_prefix_length",
+    "skip_share_if_router_disagree",
+    "using_layout",
+    "active_layout_requires_token_mean",
+    "require_identical_prefixes",
     "packed_token_index",
     "pad_packed_microbatch",
     "select_rows",

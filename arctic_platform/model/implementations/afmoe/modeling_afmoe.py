@@ -18,6 +18,8 @@ from transformers.modeling_outputs import (
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
+from arctic_platform.common.packing.layout import get_stashed_layout
+from arctic_platform.common.packing.layout import prefix_varlen_args
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
 from arctic_platform.model.implementations.layers.mlp import MLP, MLPConfig
@@ -155,6 +157,9 @@ class AfmoeSDPAAttention(AfmoeAttentionBase):
         attention_mask: torch.Tensor | None = None,
         dropout_p: float = 0.0,
     ) -> torch.Tensor:
+        layout = get_stashed_layout(self)
+        if layout is not None and layout.has_sharing:
+            raise ValueError("prefix sharing requires FlashAttention; SDPA has no prefix-continuation path in this PR")
         return F.scaled_dot_product_attention(
             query_states,
             key_states,
@@ -206,13 +211,16 @@ class AfmoeFlashAttention(AfmoeAttentionBase):
 
     def _compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens, max_seqlen):
         """Run the flash attention kernel. q/k/v are [total_tokens, heads, dim]."""
+        k, v, cu_seqlens, cu_seqlens_k, max_seqlen, max_seqlen_k = prefix_varlen_args(
+            k, v, cu_seqlens, max_seqlen, get_stashed_layout(self)
+        )
         kwargs: dict = {"causal": True}
         if self.sliding_window is not None:
             kwargs["window_size"] = (self.sliding_window - 1, 0)
         if self._flash_attn_version == 4:
             # FA4 inserts ``qv`` as its fourth positional argument, so sequence metadata must be keyword-only.
             kwargs["cu_seqlens_q"] = cu_seqlens
-            kwargs["cu_seqlens_k"] = cu_seqlens
+            kwargs["cu_seqlens_k"] = cu_seqlens_k
             out = self._flash_attn_call(q, k, v, **kwargs)
         else:
             out = self._flash_attn_call(
@@ -220,9 +228,9 @@ class AfmoeFlashAttention(AfmoeAttentionBase):
                 k,
                 v,
                 cu_seqlens,
-                cu_seqlens,
+                cu_seqlens_k,
                 max_seqlen,
-                max_seqlen,
+                max_seqlen_k,
                 **kwargs,
             )
         if isinstance(out, tuple):
