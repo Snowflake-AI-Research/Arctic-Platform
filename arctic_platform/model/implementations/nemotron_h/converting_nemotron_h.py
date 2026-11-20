@@ -15,10 +15,17 @@ Global renames:
   - HF: backbone.norm_f.weight <-> PrimeRL: model.norm.weight
   - HF uses "backbone." prefix, PrimeRL uses "model." prefix
   - HF mtp.* keys (multi-token prediction) are dropped during conversion
+
+A nemotron_h_omni (Nemotron 3.5 VL) checkpoint nests the same layout under ``language_model.``
+(``language_model.backbone.*``, ``language_model.lm_head.*``, ``language_model.mtp.*``) beside its
+vision tower (``vision_model.*``) and projector (``mlp1.*``, ``vision_projector.*``).
 """
 
 import torch
 from torch import Tensor
+
+OMNI_LANGUAGE_MODEL_PREFIX = "language_model."
+_OMNI_LANGUAGE_MODEL_ROOTS = (f"{OMNI_LANGUAGE_MODEL_PREFIX}backbone.", f"{OMNI_LANGUAGE_MODEL_PREFIX}lm_head.")
 
 
 def _rename_keys(state_dict: dict[str, Tensor], old_prefix: str, new_prefix: str):
@@ -27,6 +34,22 @@ def _rename_keys(state_dict: dict[str, Tensor], old_prefix: str, new_prefix: str
     for key in keys_to_rename:
         new_key = new_prefix + key[len(old_prefix) :]
         state_dict[new_key] = state_dict.pop(key)
+
+
+def is_omni_language_model_tensor(name: str) -> bool:
+    """Whether a nemotron_h_omni checkpoint tensor belongs to the trained language model (not MTP)."""
+    return name.startswith(_OMNI_LANGUAGE_MODEL_ROOTS)
+
+
+def strip_omni_prefix(state_dict: dict[str, Tensor]) -> None:
+    """``language_model.backbone.*`` -> ``backbone.*`` and ``language_model.lm_head.*`` -> ``lm_head.*`` in-place."""
+    _rename_keys(state_dict, OMNI_LANGUAGE_MODEL_PREFIX, "")
+
+
+def add_omni_prefix(state_dict: dict[str, Tensor]) -> None:
+    """Nest every HF NemotronH key under ``language_model.`` in-place."""
+    for key in list(state_dict):
+        state_dict[OMNI_LANGUAGE_MODEL_PREFIX + key] = state_dict.pop(key)
 
 
 def convert_hf_layer_to_prime(state_dict: dict[str, Tensor], layer_idx: int, layer_type: str):

@@ -116,7 +116,7 @@ architecture gets chat mode without engine kwargs:
 | `GptOssForCausalLM` | gpt-oss | `openai_gptoss` / `openai` | no | `minimal` becomes `low`, `xhigh` and `max` become `high` | GPU (gpt-oss-20b), QA6 |
 | `MiniMaxM2ForCausalLM` | MiniMax-M2, M2.1 | `minimax_m2` / `minimax_m2` | no | as is (ignored) | not yet |
 | `AfmoeForCausalLM` | Arcee Trinity (Large-Preview; see below) | none / `hermes` | yes (never thinks) | as is (ignored) | not yet |
-| `NemotronHForCausalLM` | Nemotron 3 Nano, Super | `nemotron_v3` / `qwen3_coder` | yes | as is (ignored) | not yet |
+| `NemotronHForCausalLM`, `NemotronH_Omni_Reasoning_V3` | Nemotron 3 Nano, Super; Nemotron 3.5 Super VL | `nemotron_v3` / `qwen3_coder` | yes | as is (ignored) | not yet |
 
 "Verified" is how far each family has been run: GPU is `test_gpu_chat.py`
 (Qwen3-0.6B, plus gpt-oss-20b for JSON output); QA6 is DSS's OpenAI chat
