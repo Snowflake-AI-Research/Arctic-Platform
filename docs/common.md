@@ -191,6 +191,8 @@ With `colocate=True`:
 | `RAY_PORT` / `RAY_DASHBOARD_PORT` | Ray head |
 | `ARL_LOG_DP_SHARD_TOKENS` | Debug per-DP token stats |
 | `ARCTIC_INFERENCE_ENABLED` | Set when `arctic_inference_config` is present |
+| `ARCTIC_EXPERT_CHECKPOINT_SYNC_BYTES` | Bytes written between sync/page-cache eviction operations for AP rank-local expert shards; default `16777216` (16 MiB), `0` syncs only at completion. DeepSpeed owns dense/optimizer-file durability. |
+| `ARCTIC_EXPERT_CHECKPOINT_VERIFY` | `1` (default) reads every AP expert tensor back and checks its SHA-256 digest, adding a full shard read per saving rank. `0` skips full digest verification but retains ZIP-offset, tensor metadata, and first/last-byte checks. Only `0` and `1` are accepted. |
 | `NCCL_TOPO_FILE` | Stale inherited `/proc/self/fd/*` values are dropped in the worker (avoids OFI topology deadlock) |
 
 ## Gotchas
