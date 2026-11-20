@@ -181,6 +181,9 @@ def _build_iter_full_vllm_weights(model: nn.Module):
             for name, param in by_layer[layer_idx]:
                 if hasattr(param, "group_name") and getattr(param, "allreduce", True) is False:
                     ep_pg = ds_groups._get_expert_parallel_group(param.group_name)
+                    # Only the master's EP replica can reach the export; the others would gather for nothing.
+                    if 0 not in dist.get_process_group_ranks(ep_pg):
+                        continue
                     local = param.data.contiguous()
                     shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_pg))]
                     dist.all_gather(shards, local, group=ep_pg)
