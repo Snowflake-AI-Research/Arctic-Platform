@@ -166,6 +166,22 @@ def test_qwen3_5_moe_vllm_export_non_master_waits_after_every_all_gather(monkeyp
     assert events == [("all_gather", (4, 2)), ("wait", (4, 2)), ("all_gather", (3, 2)), ("wait", (3, 2))]
 
 
+@pytest.mark.parametrize("family", ["generic", "qwen3_5_moe"])
+def test_vllm_export_skips_expert_groups_without_the_master(monkeypatch, events, family):
+    if family == "generic":
+        build, cls = vllm_weights.build_iter_full_vllm_weights, _ExportableModel
+    else:
+        qwen35 = pytest.importorskip("arctic_platform.model.implementations.qwen35.deepspeed_integration")
+        build, cls = qwen35._build_iter_full_vllm_weights, Qwen3_5MoeForExportTest
+    _set_rank(monkeypatch, 2)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [2, 3])
+
+    assert list(build(_model((4, 2), (3, 2), cls=cls))()) == []
+
+    # Only rank 0 consumes the export, so a replica group without it runs no collective.
+    assert events == []
+
+
 def test_lora_export_non_master_waits_after_every_ep_all_gather(monkeypatch, events):
     _set_rank(monkeypatch, 1)
 

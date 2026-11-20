@@ -236,6 +236,9 @@ def build_iter_full_vllm_weights(model: nn.Module):
                     and getattr(tensor, "allreduce", True) is False
                 ):
                     ep_pg = ds_groups._get_expert_parallel_group(tensor.group_name)
+                    # Only the master's EP replica can reach the export; the others would gather for nothing.
+                    if 0 not in dist.get_process_group_ranks(ep_pg):
+                        continue
                     local = tensor.data.contiguous()
                     shards = [
                         torch.empty_like(local)
