@@ -1024,6 +1024,44 @@ def test_agent_phase_commands_never_see_the_rollout_key(tmp_path, monkeypatch):
     assert _ForwardingAgent.seen == ["absent,absent"]
 
 
+def test_verifier_env_reaches_the_verifier_and_resolves_from_the_driver(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARBOR_ALLOW_HOST_EXEC", "1")
+    monkeypatch.setenv("JUDGE_SCORE_SOURCE", "0.75")
+    monkeypatch.setattr(_ForwardingAgent, "seen", [])
+    task = _task(tmp_path)
+    (task / "tests" / "test.sh").write_text(
+        '#!/usr/bin/env bash\nmkdir -p /logs/verifier\necho "${JUDGE_SCORE:-0}" > /logs/verifier/reward.txt\n',
+        encoding="utf-8",
+    )
+    out = asyncio.run(
+        run_harbor_trial(
+            task_dir=task,
+            trials_dir=tmp_path / "trials",
+            trial_name="trial",
+            agent=f"{__name__}:_ForwardingAgent",
+            env="host",
+            model_name="openai/test-model",
+            base_url="http://127.0.0.1:1/v1",
+            api_key=_ROLLOUT_KEY,
+            verifier_env={"JUDGE_SCORE": "${JUDGE_SCORE_SOURCE}"},
+        )
+    )
+    assert out["exception"] is None, out["exception"]
+    assert out["reward"] == 0.75
+
+
+def test_harbor_verifier_env_must_be_a_json_object_of_strings(monkeypatch):
+    from harbor_rl.entrypoint import harbor_verifier_env
+
+    monkeypatch.delenv("HARBOR_VERIFIER_ENV", raising=False)
+    assert harbor_verifier_env() == {}
+    monkeypatch.setenv("HARBOR_VERIFIER_ENV", json.dumps({"OPENAI_API_KEY": "${ARCTIC_CORTEX_PAT}"}))
+    assert harbor_verifier_env() == {"OPENAI_API_KEY": "${ARCTIC_CORTEX_PAT}"}
+    monkeypatch.setenv("HARBOR_VERIFIER_ENV", json.dumps({"JUDGE_CONCURRENCY": 4}))
+    with pytest.raises(ValueError, match="JSON object of strings"):
+        harbor_verifier_env()
+
+
 class _UnstartableEnvironment(HostEnvironment):
     async def start(self, force_build: bool) -> None:
         raise RuntimeError("pushing image: unexpected status code 444")
