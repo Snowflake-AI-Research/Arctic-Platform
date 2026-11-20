@@ -12,56 +12,67 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The fused GLM-5.3-Flash mHC remix adds in vLLM ``mhc_post``'s FP32 order: ``post * y`` first, then each stream.
-
-Runs the Triton kernel under ``TRITON_INTERPRET=1`` on CPU in a child process (the flag must be set before the
-kernel module is imported).
-"""
+"""The fused mHC remix accumulates four residual streams in sampler order."""
 
 from __future__ import annotations
 
-import json
-import os
 import subprocess
 import sys
-import textwrap
+from pathlib import Path
+from runpy import run_path
 
 import pytest
+import torch
 
-_CHILD = textwrap.dedent(
-    """
-    import json
-    import torch
-    from arctic_platform.model.implementations.glm53.hyper_connections import mix_streams
-
-    torch.manual_seed(0)
-    tokens, hidden = 3, 40
-    # BF16 values held in FP32 storage, so the kernel's output is its FP32 sum before any final cast.
-    streams = torch.randn(1, tokens, 4, hidden).bfloat16().float()
-    streams[0, 0] = torch.tensor([2.0**-22, -4.0, 0.0, 0.0])[:, None]  # products 2**-24, -1, 0, 0
-    sublayer_out = torch.randn(1, tokens, hidden).bfloat16().float()
-    sublayer_out[0, 0] = 1.0
-    post = torch.rand(1, tokens, 4) * 2
-    post[0, 0] = 1.0
-    comb = torch.softmax(torch.randn(1, tokens, 4, 4), dim=2)
-    comb[0, 0] = 0.25
-    fused = mix_streams(post, comb, sublayer_out, streams)
-    reference = post.unsqueeze(-1) * sublayer_out.unsqueeze(-2)
-    for weights, stream in zip(comb.unbind(-2), streams.unbind(-2)):
-        # Product and sum rounded separately, as the interpreter does (a CPU addcmul_ may fuse them).
-        reference = reference + weights.unsqueeze(-1) * stream.unsqueeze(-2)
-    print(json.dumps({
-        "cancellation_token": fused[0, 0, 0, 0].item(),
-        "differing_elements": int((fused != reference).sum()),
-    }))
-    """
-)
+import arctic_platform
+from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import require_torch_gpu
+from arctic_platform.testing_utils import torch_assert_equal
 
 
-def test_fused_mix_adds_post_times_output_first_then_each_stream_in_order():
-    pytest.importorskip("triton")
-    env = {**os.environ, "TRITON_INTERPRET": "1"}
-    child = subprocess.run([sys.executable, "-c", _CHILD], env=env, capture_output=True, text=True)
-    assert child.returncode == 0, child.stderr
-    result = json.loads(child.stdout.strip().splitlines()[-1])
-    assert result == {"cancellation_token": 0.0, "differing_elements": 0}  # (1 + 2**-24) - 1 rounds to 0 in FP32
+def _check_mix_order(mix_streams, device):
+    # For output stream zero, (1 + 2**-24) - 1 rounds to zero. The first three channels cover each adjacent pair.
+    small = 2.0**-22
+    streams = torch.tensor(
+        [[small, 0, 0, 1], [-4, small, 0, 2], [0, -4, small, 3], [0, 0, -4, 4]], dtype=torch.bfloat16, device=device
+    )
+    sublayer_out = torch.full((4,), 2.0, dtype=streams.dtype, device=device)
+    post = torch.tensor([0.5, 1.0, 1.5, 1.75], device=device)
+    comb = torch.tensor([[2, 4, 1, 1], [2, 2, 2, 2], [2, 1, 2, 3], [2, 1, 3, 2]], device=device) / 8
+    reference = post[:, None] * sublayer_out
+    for weights, stream in zip(comb, streams, strict=True):
+        reference += weights[:, None] * stream
+    actual = mix_streams(post[None, None], comb[None, None], sublayer_out[None, None], streams[None, None])
+    torch_assert_equal(actual[0, 0], reference.to(streams.dtype))
+
+
+class TestMixOrder(TestCasePlus):
+    def test_interpreted_mix_order(self):
+        pytest.importorskip("triton")
+        # Triton's own reduction helpers are decorated when it is first imported.
+        env = self.get_env()
+        env["TRITON_INTERPRET"] = "1"
+        subprocess.run([sys.executable, self.test_file_path], env=env, check=True)
+
+    @require_torch_gpu
+    def test_cuda_mix_order(self):
+        from arctic_platform.model.implementations.glm53.hyper_connections import mix_streams
+
+        _check_mix_order(mix_streams, "cuda")
+        weights = torch.tensor([0.4, 0.3, 0.2, 0.1], dtype=torch.float32, device="cuda")
+        post = weights.expand(1, 16, -1)
+        comb = torch.stack([weights.roll(i) for i in range(4)]).expand(1, 16, -1, -1)
+        sublayer_out = torch.full((1, 16, 256), 1.125, dtype=torch.bfloat16, device="cuda")
+        streams = torch.zeros((1, 16, 4, 256), dtype=torch.bfloat16, device="cuda")
+        streams[:, :, 0] = -1.125
+        # Only the first product rounds before the FMA. Rounding its opposite first would flip the residual's sign.
+        rounded_stream = -1.125 * weights
+        expected = (1.125 * weights.double() + rounded_stream.double()).to(streams.dtype)
+        actual = mix_streams(post, comb, sublayer_out, streams)
+        torch_assert_equal(actual, expected[None, None, :, None].expand_as(actual))
+
+
+if __name__ == "__main__":
+    # Load the kernel directly so the CPU case can run without the model package's training dependencies.
+    path = Path(arctic_platform.__file__).parent / "model/implementations/glm53/hyper_connections.py"
+    _check_mix_order(run_path(str(path))["mix_streams"], "cpu")
