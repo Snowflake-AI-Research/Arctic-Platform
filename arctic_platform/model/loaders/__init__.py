@@ -23,3 +23,4 @@ from arctic_platform.model.loaders import glm_moe_dsa  # noqa: F401
 from arctic_platform.model.loaders import huggingface  # noqa: F401
 from arctic_platform.model.loaders import inkling  # noqa: F401
 from arctic_platform.model.loaders import qwen3_5_moe  # noqa: F401
+from arctic_platform.model.loaders import tabular  # noqa: F401

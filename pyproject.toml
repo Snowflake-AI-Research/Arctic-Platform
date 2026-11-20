@@ -101,6 +101,7 @@ all = [
     "arctic_platform[prime-rl]",
     "arctic_platform[sonicmoe]",
     "arctic_platform[harbor]",
+    "arctic_platform[tabular]",
 ]
 
 dev = [
@@ -197,6 +198,12 @@ sft = [
     "torch>=2.9",  # checkpoint(early_stop=...) and CPU grouped matrix multiplication
     # Keep training and sampling on the verified release allowed by vLLM 0.33.
     "transformers==5.20.2",
+]
+
+# Tabular foundation models (the ``tabular`` loader): NVIDIA Kumo Tabular. sdm imports pyarrow at module load.
+tabular = [
+    "pyarrow",
+    "structured-data-models>=0.2.1",
 ]
 
 # Sampling stack that lives in arctic_platform.inference. Not referenced by

@@ -130,6 +130,10 @@ from .stats_tracker import record_timing
 from .stats_tracker import scalar
 from .stats_tracker import scope
 from .stats_tracker import stat
+
+# Tabular in-context-learning losses (importing registers tabular_cross_entropy / tabular_pinball)
+from .tabular import TabularCrossEntropyLoss
+from .tabular import TabularPinballLoss
 from .verl_grpo import verl_grpo_loss
 
 # Signed weighted log-likelihood (importing registers weighted_cross_entropy)
@@ -221,6 +225,8 @@ __all__ = [
     "cortex_grpo_loss",
     "cortex_grpo_mixed_v1_loss",
     "DFlash2Loss",
+    "TabularCrossEntropyLoss",
+    "TabularPinballLoss",
     "cortex_grpo_echo_v1_loss",
     "weighted_logprob_sum",
     "sft_loss",
