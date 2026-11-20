@@ -182,6 +182,9 @@ class Lfm2Model(nn.Module):
     def __init__(self, config: Lfm2Config):
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        # As transformers initializes it. The checkpoint replaces it; with tied embeddings it is also the output head,
+        # and PyTorch's default N(0, 1) would give the fixture logits of about 40, where fp32 rounds at about 4e-6.
+        nn.init.normal_(self.embed_tokens.weight, std=config.initializer_range)
         self.layers = nn.ModuleList(Lfm2DecoderLayer(config, i) for i in range(config.num_hidden_layers))
         self.embedding_norm = RMSNorm(config.hidden_size, config.norm_eps)  # the final norm, despite its name
 
