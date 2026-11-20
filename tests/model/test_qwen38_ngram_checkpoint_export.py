@@ -21,6 +21,7 @@ import os
 import tempfile
 import weakref
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +30,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
+
+from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import torch_assert_equal
 
 pytest.importorskip("transformers.models.qwen4_exp")
 pytest.importorskip("deepspeed")
@@ -206,3 +211,154 @@ def test_ngram_table_export_is_exact_and_rank_memory_is_bounded() -> None:
     report = ", ".join(f"rank {rank} {value:.2f}" for rank, value in enumerate(transient))
     # Each rank keeps one EP-sized piece; rank 0 additionally keeps the exported table.
     assert max(transient) <= 1.1 / (_EP * _EP), f"transient memory in tables: {report}"
+
+
+def _checkpoint_roundtrip_worker(rank: int, rendezvous: str, directory: str, fault: str) -> None:
+    import deepspeed
+    import deepspeed.utils.groups as ds_groups
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from arctic_platform.model import iter_model_weights
+    from arctic_platform.model.implementations.moe.deepspeed_integration import apply_ep_with_mesh
+    from arctic_platform.model.implementations.moe.deepspeed_integration import convert_dtensors_to_local
+    from arctic_platform.model.implementations.moe.deepspeed_integration import tag_expert_params_for_deepspeed
+    from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
+    from arctic_platform.model.implementations.moe.weights import hf_export_param_name
+    from arctic_platform.model.implementations.moe.weights import load_state_dict
+    from arctic_platform.model.implementations.qwen35.mtp_weights import _configured_names
+    from arctic_platform.model.implementations.qwen35.mtp_weights import capture_mtp_weights
+    from arctic_platform.model.implementations.qwen38.deepspeed_integration import _adapter
+    from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpForConditionalGenerationPrimeRL
+    from arctic_platform.model.weight_export import WeightExportContract
+    from arctic_platform.model.weight_export import register_weight_export
+    from arctic_platform.model.weight_export import save_exported_state_dict
+
+    set_seed(0)
+    config = _config()
+    config.text_config.ngram_vocab_size_base = 29
+    config.text_config.split_ngram_parts = 3
+    config.text_config.mtp_num_hidden_layers = 1
+    model = Qwen4ExpForConditionalGenerationPrimeRL(config)
+    # Bare routed-expert modules defer initialization to the loader; use finite exact checkpoint values.
+    with torch.no_grad():
+        for index, parameter in enumerate(model.parameters()):
+            values = torch.arange(parameter.numel(), dtype=parameter.dtype).reshape(parameter.shape)
+            parameter.copy_(values.remainder(97).div(97) + index / 1000)
+    original_state = {name: value.detach().clone() for name, value in model.state_dict().items()}
+    source_state = model.convert_to_hf(
+        {
+            hf_export_param_name(name): value.detach().clone()
+            for name, value in named_weight_sync_tensors(model, include_export_buffers=True)
+            if hf_export_param_name(name) is not None
+        }
+    )
+    # Build canonical shards independently of the exporter under test, including unequal row counts.
+    for name in list(source_state):
+        if name.endswith(".ple.ple_embedding.ngram_embedding.weight"):
+            table = source_state.pop(name)
+            quotient, remainder = divmod(table.shape[0], 3)
+            offset = 0
+            for index in range(3):
+                rows = quotient + (index < remainder)
+                source_state[f"{name.removesuffix('.weight')}.shard_{index}.weight"] = table[
+                    offset : offset + rows
+                ].clone()
+                offset += rows
+    sidecar = {
+        name: (
+            (torch.arange(6, dtype=torch.float32).reshape(2, 3) + index).to(
+                (torch.float32, torch.bfloat16, torch.float16)[index % 3]
+            )
+        )
+        for index, name in enumerate(sorted(_configured_names(model)))
+    }
+    source_state.update(sidecar)
+    source = Path(directory) / "source"
+    destination = Path(directory) / "exported"
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    deepspeed.init_distributed(dist_backend="gloo", auto_mpi_discovery=False)
+    try:
+        if rank == 0:
+            save_exported_state_dict(dict(source_state), str(source))
+            config.save_pretrained(source)
+        dist.barrier()
+        capture_mtp_weights(model, source if rank == 0 else Path(directory) / "absent-on-peer")
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("ep",))
+        apply_ep_with_mesh(model, SimpleNamespace(ep_comm_backend="deepep"), mesh)
+        convert_dtensors_to_local(model)
+        ds_groups._EXPERT_PARALLEL_GROUP["ep_size_2"] = mesh.get_group()
+        tag_expert_params_for_deepspeed(model, "ep_size_2")
+        contract = WeightExportContract(hf=_adapter().hf_weight_export)
+        register_weight_export(model, contract)
+        synced = dict(iter_model_weights(model, "hf", is_master=rank == 0, is_zero3=False))
+        assert not set(synced) & set(sidecar)
+        if rank == 0 and fault == "source-removed":
+            for shard in source.glob("*.safetensors"):
+                shard.unlink()
+        dist.barrier()
+        try:
+            exported = dict(iter_model_weights(model, "hf", is_master=rank == 0, is_zero3=False, include_skipped=True))
+        except RuntimeError as error:
+            assert fault == "source-removed", str(error)
+            message = str(error)
+        else:
+            assert fault == "none", "changed source was accepted"
+            message = None
+            if rank == 0:
+                assert set(exported) == set(source_state), {
+                    "missing": sorted(set(source_state) - set(exported)),
+                    "extra": sorted(set(exported) - set(source_state)),
+                }
+                for name, wanted in source_state.items():
+                    assert exported[name].shape == wanted.shape and exported[name].dtype == wanted.dtype, name
+                    torch_assert_equal(exported[name], wanted, msg=name)
+                save_exported_state_dict(dict(exported), str(destination))
+                config.save_pretrained(destination)
+            else:
+                assert exported == {}
+        statuses = [None, None]
+        dist.all_gather_object(statuses, message)
+        assert statuses[0] == statuses[1], statuses
+        if fault != "none":
+            assert message is not None
+            return
+        dist.barrier()
+        # Reload canonical HF shards through the real family converter into a real tiny Qwen3.8 module.
+        saved = load_state_dict(destination)
+        restored = Qwen4ExpForConditionalGenerationPrimeRL(config)
+        result = restored.load_state_dict(restored.convert_to_prime(dict(saved)), strict=False)
+        assert result.missing_keys == []
+        assert set(result.unexpected_keys) == set(sidecar)
+        for name, wanted in original_state.items():
+            torch_assert_equal(restored.state_dict()[name], wanted)
+        capture_mtp_weights(restored, destination if rank == 0 else Path(directory) / "absent-on-peer")
+        register_weight_export(restored, contract)
+        reexported = dict(
+            iter_model_weights(restored, "hf", is_master=rank == 0, is_zero3=False, include_skipped=True)
+        )
+        if rank == 0:
+            assert set(reexported) == set(source_state)
+            for name, wanted in source_state.items():
+                torch_assert_equal(reexported[name], wanted)
+        else:
+            assert reexported == {}
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+class TestQwen38CheckpointRoundtrip(TestCasePlus):
+    def _run(self, fault):
+        directory = self.get_auto_remove_tmp_dir()
+        mp.spawn(
+            _checkpoint_roundtrip_worker,
+            args=(f"file://{directory}/rendezvous", str(directory), fault),
+            nprocs=2,
+            join=True,
+        )
+
+    def test_registered_exporter_preserves_shards_and_mtp_across_reload(self):
+        self._run("none")
+
+    def test_removed_source_fails_on_both_real_ranks(self):
+        self._run("source-removed")
