@@ -152,7 +152,7 @@ class CallbackRunner:
                 getattr(cb, hook)(trainer, *args)
             except Exception:
                 logger.exception(
-                    "%s.%s failed; dropping its metrics this step",
+                    "%s.%s failed; quarantining for the rest of this step",
                     type(cb).__name__,
                     hook,
                 )
