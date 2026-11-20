@@ -2052,6 +2052,21 @@ def test_the_snowflake_sandbox_can_replay_the_recipes_task_dockerfile(tmp_path):
     assert any("git clone" in str(step) for step in plan.steps)
 
 
+def test_a_comment_before_from_is_ignored(tmp_path):
+    from arctic_platform.integrations.harbor.snowflake_sandbox.dockerfile_replay import plan_from_dockerfile
+
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "# Base: https://example.com/sandbox/Dockerfile\n\nFROM python:3.12-slim\n\nCOPY documents/"
+        " /workspace/documents/\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "documents").mkdir()
+    plan = plan_from_dockerfile(dockerfile)
+    assert plan.base_image == "python:3.12-slim"
+    assert len(plan.steps) == 1
+
+
 def test_the_harbor_extra_is_pinned_and_installed_by_the_launcher():
     import tomllib
 
