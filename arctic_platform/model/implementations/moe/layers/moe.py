@@ -161,6 +161,26 @@ class MoEArgs:
     swiglu_limit: float | None = None
 
 
+class _ExpertSwiGLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate, up):
+        silu = F.silu(gate)
+        ctx.save_for_backward(gate, up, silu)
+        return silu * up
+
+    @staticmethod
+    def backward(ctx, grad):
+        gate, up, silu = ctx.saved_tensors
+        if torch.is_grad_enabled():
+            silu = F.silu(gate)
+        elif gate.is_cuda and gate.shape == up.shape and not torch.compiler.is_compiling():
+            from arctic_platform.model.implementations.kernels.fused_swiglu import swiglu_backward
+
+            return swiglu_backward(gate, up, grad, limit=None, silu=silu)
+        grad_gate = torch.ops.aten.silu_backward(grad.float() * up.float(), gate.float())
+        return grad_gate.to(gate.dtype), grad * silu
+
+
 def _apply_swiglu(
     gate: torch.Tensor,
     up: torch.Tensor,
@@ -169,6 +189,9 @@ def _apply_swiglu(
     if limit is not None:
         gate = gate.clamp(max=limit)
         up = up.clamp(min=-limit, max=limit)
+    # Keep the rounded SiLU used by the forward and up gradient, but form the gate gradient in FP32.
+    if gate.dtype == up.dtype == torch.bfloat16:
+        return _ExpertSwiGLU.apply(gate, up)
     return F.silu(gate) * up
 
 

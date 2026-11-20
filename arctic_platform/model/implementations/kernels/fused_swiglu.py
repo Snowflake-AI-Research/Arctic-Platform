@@ -40,7 +40,7 @@ def _swiglu_fwd_kernel(gate_ptr, up_ptr, out_ptr, n, limit, HAS_LIMIT: tl.conste
 
 @triton.jit
 def _swiglu_bwd_kernel(
-    gate_ptr, up_ptr, grad_ptr, dgate_ptr, dup_ptr, n, limit, HAS_LIMIT: tl.constexpr, BLOCK: tl.constexpr
+    gate_ptr, up_ptr, silu_ptr, grad_ptr, dgate_ptr, dup_ptr, n, limit, HAS_LIMIT: tl.constexpr, BLOCK: tl.constexpr
 ):
     offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
@@ -54,7 +54,10 @@ def _swiglu_bwd_kernel(
         u = tl.minimum(tl.maximum(u, -limit), limit)
     s = tl.sigmoid(g)
     dg = dh * u * s * (1.0 + g * (1.0 - s))
-    du = dh * g * s
+    if silu_ptr is None:
+        du = dh * g * s
+    else:
+        du = dh * tl.load(silu_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     if HAS_LIMIT:
         dg = tl.where(pass_g, dg, 0.0)
         du = tl.where(pass_u, du, 0.0)
@@ -79,23 +82,31 @@ class _SwiGLUFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         gate, up = ctx.saved_tensors
-        grad = grad.contiguous()
-        dgate, dup = torch.empty_like(gate), torch.empty_like(up)
-        n = gate.numel()
-        if n:
-            limit = ctx.limit
-            _swiglu_bwd_kernel[(triton.cdiv(n, _BLOCK),)](
-                gate,
-                up,
-                grad,
-                dgate,
-                dup,
-                n,
-                0.0 if limit is None else float(limit),
-                HAS_LIMIT=limit is not None,
-                BLOCK=_BLOCK,
-            )
+        dgate, dup = swiglu_backward(gate, up, grad, ctx.limit)
         return dgate, dup, None
+
+
+def swiglu_backward(
+    gate: torch.Tensor, up: torch.Tensor, grad: torch.Tensor, limit: float | None, *, silu: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pass the saved activation when the forward rounded SiLU before multiplying by up."""
+    gate, up = gate.contiguous(), up.contiguous()
+    dgate, dup = torch.empty_like(gate), torch.empty_like(up)
+    n = gate.numel()
+    if n:
+        _swiglu_bwd_kernel[(triton.cdiv(n, _BLOCK),)](
+            gate,
+            up,
+            None if silu is None else silu.contiguous(),
+            grad.contiguous(),
+            dgate,
+            dup,
+            n,
+            0.0 if limit is None else float(limit),
+            HAS_LIMIT=limit is not None,
+            BLOCK=_BLOCK,
+        )
+    return dgate, dup
 
 
 def fused_swiglu(gate: torch.Tensor, up: torch.Tensor, limit: float | None) -> torch.Tensor:
