@@ -80,6 +80,7 @@ from arctic_platform.model_plugin.weights import load_hf_checkpoint
 from arctic_platform.model_plugin.weights import read_stamp
 from arctic_platform.model_plugin.weights import require_declared_dtype
 from arctic_platform.model_plugin.weights import save_hf_checkpoint
+from arctic_platform.model_plugin.weights import tied_aliases
 
 
 class Tolerances(BaseModel):
@@ -542,7 +543,9 @@ def check_weights_directory(plugin: ModelPlugin, path: str | Path) -> None:
 
     config = plugin.config_class.from_pretrained(path)
     plugin.parallelism(config)
-    expected = {name: tuple(tensor.shape) for name, tensor in build(plugin, config, meta=True).state_dict().items()}
+    meta_model = build(plugin, config, meta=True)
+    aliases = tied_aliases(meta_model)
+    expected = {name: tuple(t.shape) for name, t in meta_model.state_dict().items() if name not in aliases}
     files = checkpoint_files(path)
     for file in set(files.values()):
         if not file.is_file():
@@ -568,7 +571,7 @@ def check_weights_directory(plugin: ModelPlugin, path: str | Path) -> None:
             except ValueError as error:  # the converter's own shape and index checks
                 problems.append(f"layer {index} does not convert: {error}")
                 continue
-        found.update({name: tuple(tensor.shape) for name, tensor in layer.items()})
+        found.update({aliases.get(name, name): tuple(tensor.shape) for name, tensor in layer.items()})
     if len(problems) > 0:
         raise AssertionError(f"{len(problems)} tensor problems, first: {problems[:5]}")
     problems += [f"missing {name}" for name in sorted(set(expected) - set(found))]

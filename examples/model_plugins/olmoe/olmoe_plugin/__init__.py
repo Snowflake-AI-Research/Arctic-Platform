@@ -56,8 +56,9 @@ def validate(request, config: OlmoeConfig, options: None) -> list[str]:
         reasons.append("clip_qkv is not supported")
     if config.tie_word_embeddings:
         reasons.append("tied input and output embeddings are not supported")
-    if config.rope_scaling is not None:
-        reasons.append(f"rope_scaling {config.rope_scaling} is not supported")
+    rope_type = config.rope_parameters.get("rope_type", "default")
+    if rope_type != "default":
+        reasons.append(f"rope_type {rope_type!r} is not supported, only default rotary embedding")
     if config.attention_bias:
         reasons.append("attention biases are not supported")
     return reasons

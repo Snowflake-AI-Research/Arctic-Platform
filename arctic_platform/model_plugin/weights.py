@@ -59,6 +59,19 @@ def layer_index(name: str) -> int:
     return int(match.group(1)) if match else -1
 
 
+def tied_aliases(model: nn.Module) -> dict[str, str]:
+    """Every later name of a tied parameter, mapped to its first name: ``{"lm_head.weight": "model.embed_tokens.weight"}``
+    for tied embeddings. Checkpoints carry a tied tensor once, under its first name, as Hugging Face's do."""
+    first: dict[int, str] = {}
+    aliases = {}
+    for name, param in model.named_parameters(remove_duplicate=False):
+        if id(param) in first:
+            aliases[name] = first[id(param)]
+        else:
+            first[id(param)] = name
+    return aliases
+
+
 def _full_tensor(tensor: torch.Tensor, ep_group) -> torch.Tensor:
     ep_size = getattr(tensor, EXPERT_PARALLEL_SIZE_ATTR, 1)
     tensor = tensor.detach()
@@ -80,7 +93,7 @@ def iter_hf_weights(
     tensors marked ``weight_sync=False``. Every tensor keeps its own dtype, so an fp32-marked tensor of a bf16 model
     streams, and is saved, as fp32.
     """
-    skipped = weight_sync_skipped(model) if for_sampler else set()
+    skipped = (weight_sync_skipped(model) if for_sampler else set()) | set(tied_aliases(model))
     groups: dict[int, dict[str, torch.Tensor]] = {}
     for name, tensor in model.state_dict(keep_vars=True).items():
         if name in skipped:
@@ -94,8 +107,10 @@ def iter_hf_weights(
 
 
 def _load_layers(model: nn.Module, plugin: ModelPlugin, layers: Iterable[tuple[int, dict[str, torch.Tensor]]]) -> None:
-    """Load one decoder layer at a time, so peak extra memory is one layer. Every trainer tensor must be set."""
+    """Load one decoder layer at a time, so peak extra memory is one layer. Every trainer tensor must be set; a tied
+    tensor is set by any of its names."""
     expected = set(model.state_dict())
+    aliases = tied_aliases(model)
     loaded: set[str] = set()
     for index, layer in layers:
         if plugin.convert_layer_to_prime is not None:
@@ -104,8 +119,8 @@ def _load_layers(model: nn.Module, plugin: ModelPlugin, layers: Iterable[tuple[i
         if len(unexpected) > 0:
             raise ValueError(f"checkpoint tensors match no trainer tensor: {sorted(unexpected)}")
         model.load_state_dict(layer, strict=False)
-        loaded.update(layer)
-    missing = expected - loaded
+        loaded.update(aliases.get(name, name) for name in layer)
+    missing = expected - set(aliases) - loaded
     if len(missing) > 0:
         raise ValueError(f"checkpoint does not set trainer tensors: {sorted(missing)}")
 

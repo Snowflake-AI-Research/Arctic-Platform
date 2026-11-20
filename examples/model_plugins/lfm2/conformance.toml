@@ -1,0 +1,26 @@
+# Conformance fixture for LFM2: a tiny fp32 Lfm2Config with both layer kinds and tied embeddings.
+seed = 0
+# Three packed rows of unequal length; 16 tokens split evenly across 2 sequence-parallel ranks, with the middle
+# row crossing the shard boundary at token 8, so a convolution that reads across rows or shards is caught.
+sequence_lengths = [5, 6, 5]
+sp_sizes = [2]
+
+[fixture]
+vocab_size = 64
+hidden_size = 32
+intermediate_size = 64
+block_multiple_of = 16
+num_hidden_layers = 4
+layer_types = ["conv", "full_attention", "conv", "full_attention"]
+num_attention_heads = 4
+num_key_value_heads = 2
+max_position_embeddings = 64
+tie_word_embeddings = true
+
+# fp32 against a float64 reference: differences are fp32 rounding (~1e-7 relative).
+[tolerances]
+reference = 1e-5
+packing = 1e-5
+parallel = 1e-5
+rl_step = 1e-5
+chunking = 1e-6

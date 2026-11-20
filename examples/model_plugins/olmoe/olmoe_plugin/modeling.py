@@ -94,7 +94,7 @@ class OlmoeAttention(AttentionModule):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
         self.q_norm = RMSNorm(self.num_heads * self.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(self.num_kv_heads * self.head_dim, config.rms_norm_eps)
-        self.rotary = RotaryEmbedding(self.head_dim, config.rope_theta)
+        self.rotary = RotaryEmbedding(self.head_dim, config.rope_parameters["rope_theta"])
 
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
         length = x.shape[1]

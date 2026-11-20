@@ -5,7 +5,10 @@
 | Status | **Draft for review and sign-off.** Interfaces may change until contract 1.0 is frozen. |
 | Contract version | 1.1 (draft) |
 | Reference implementation | [`arctic_platform/model_plugin/`](../../arctic_platform/model_plugin/) |
-| Example plugins | [`examples/model_plugins/olmo2/`](../../examples/model_plugins/olmo2/): the minimal dense plugin, the template to start from (§3)<br/>[`examples/model_plugins/olmoe/`](../../examples/model_plugins/olmoe/): the same plus mixture of experts, expert parallelism, router replay and converters (§14)<br/>[`examples/model_plugins/toy_hybrid_moe/`](../../examples/model_plugins/toy_hybrid_moe/): every part of the contract, including new layer types and a custom vLLM model (§14) |
+| Example plugins | [`examples/model_plugins/olmo2/`](../../examples/model_plugins/olmo2/): the minimal dense plugin, the template to start from (§3)<br/>[`examples/model_plugins/olmoe/`](../../examples/model_plugins/olmoe/): the same plus mixture of experts, expert parallelism, router replay and converters (§14.1)<br/>[`examples/model_plugins/lfm2/`](../../examples/model_plugins/lfm2/): a new layer type, a gated short convolution, and tied embeddings (§14.2)<br/>[`examples/model_plugins/gpt_oss/`](../../examples/model_plugins/gpt_oss/): mixture of experts with the plugin's own attention core, learned sinks (§14.3)<br/>[`examples/model_plugins/toy_hybrid_moe/`](../../examples/model_plugins/toy_hybrid_moe/): every part of the contract, including new layer types and a custom vLLM model (§14.4) |
+
+These examples, and the trainer models they implement, are new to the platform. All but the toy are served by vLLM's
+built-in models.
 
 This document specifies how you bring a **new model architecture** to Cortex Training as a Python package, a
 *model plugin*, and train it with supervised fine-tuning or reinforcement learning on the service's GPUs. It covers
@@ -185,7 +188,9 @@ Add each one only when the model needs it:
 |---|---|---|---|
 | Mixture of experts, with expert parallelism and router replay | `route`, `experts_core` and an expert layer | §7.6, §7.7 | `olmoe`: `OlmoeSparseMoeBlock`, `StackedExpertLayer` |
 | Trainer tensors laid out differently from the checkpoint, such as stacked experts | `convert_layer_to_hf` and `convert_layer_to_prime` | §7.9 | `olmoe`: `weights.py` |
-| A sequence mixer that is not attention (recurrence, state space, convolution) | A core `mix` and a mixer | §7.3, §7.5 | `toy_hybrid_moe`: `ToyRecurrence`, `ToyShortConv` |
+| A sequence mixer that is not attention (recurrence, state space, convolution) | A core `mix` and a mixer | §7.3, §7.5 | `lfm2`: `Lfm2ShortConv`; `toy_hybrid_moe`: `ToyRecurrence`, `ToyShortConv` (halo policy) |
+| An attention variant the platform's core does not cover, such as learned sinks | Its own core `mix`, on the head-parallel policy | §7.3 | `gpt_oss`: `GptOssAttention` |
+| Tied input and output embeddings | Share the weight in `build_model`; checkpoints store it once | §7.9 | `lfm2` |
 | An architecture vLLM does not implement | A vLLM model and its entry point | §7.10, §7.11 | `toy_hybrid_moe`: `vllm_model.py` |
 | An output transform, such as logit softcapping | `compute_logits` | §7.2 | `toy_hybrid_moe`: `ToyHybridMoEForCausalLM` |
 | Job-time choices, such as a kernel | `options` and `validate` | §7.1 | `toy_hybrid_moe`: `options.py` |
@@ -666,6 +671,7 @@ Conversion and loading:
 - **Quantized source checkpoints.** A checkpoint that stores FP8 (or uint8-packed, such as MXFP4) tensors loads only with `[checkpoint] dtype` declared: `convert_layer_to_prime` dequantizes each layer, consuming its scale tensors, and the model trains and exports in that dtype. Exports never carry `quantization_config`. The trainer does not keep quantized weights (frozen FP8 bases are out of scope with LoRA, §13).
 - The platform loads a checkpoint **one decoder layer at a time**, reading only that layer's tensors from disk, so converters see one layer and peak extra memory is one layer. Every trainer tensor MUST be set and no checkpoint tensor may be left over.
 - The platform gathers ZeRO and expert shards before calling your converter on export, so converters always see full tensors.
+- **Tied tensors.** A parameter registered under several names, such as an `lm_head.weight` tied to `model.embed_tokens.weight`, is one tensor: checkpoints and the weight stream carry it once, under its first name, as Hugging Face's tied checkpoints do, and loading accepts a checkpoint that sets it under any of its names.
 - **Pass-through tensors.** Checkpoint tensors your trainer does not use, such as multi-token-prediction heads or a vision tower when training text, are declared as regexes in the manifest's `[checkpoint] passthrough` (matched at the start of the name). They are not loaded, do not count toward the checkpoint's dtype, are copied unchanged into every exported checkpoint, and never reach the sampler. Patterns that depend on the config, such as MTP layers stored after the last decoder layer at `model.layers.{num_hidden_layers + k}`, come from the plugin's `passthrough(config)`. Any other checkpoint tensor the model does not account for is still refused.
 - Checkpoints the platform writes carry a **plugin stamp** in their safetensors metadata (`arctic_plugin`, `arctic_plugin_version`, `arctic_plugin_contract`). A checkpoint stamped by a different plugin is refused at load. A different version of the same plugin loads and is logged.
 - **Dtypes.** Store weights in the dtype you want served, usually bf16. The platform builds your model in `[checkpoint] dtype` if declared, else in the dtype that holds most of a checkpoint's elements, before loading it, so a save and reload is exact. The trainer computes in the job's dtype and keeps fp32 master weights in the optimizer. Tensors that must stay fp32, such as routers or statistics, are marked `dtype="fp32"` (below); checkpoints and the weight stream then carry mixed dtypes.
@@ -928,7 +934,35 @@ probability, in every layer; the platform has no implementation of it, and vLLM 
 
 It passes every CPU tier, `router_replay`, `ep2` and `sp2+ep2` included.
 
-### 14.2 ToyHybridMoE: every part of the contract
+### 14.2 LFM2: a new layer type on vLLM's built-in model
+
+[`examples/model_plugins/lfm2`](../../examples/model_plugins/lfm2/) brings [LFM2](https://huggingface.co/LiquidAI/LFM2-1.2B),
+a dense hybrid of gated short-convolution and attention layers. Its convolution is a layer type the platform has
+never seen:
+
+| Contract part | Where it lives |
+|---|---|
+| New layer type (§7.3) | `[layer_types] conv = "plugin"`; `Lfm2ShortConv` sets `ap_layer_type = "conv"` |
+| Its core | `Lfm2ShortConv.mix`: depthwise causal convolution over whole rows, restarting at each `cu_seqlens` boundary, for the channels `shard` holds |
+| Its policy (§7.5) | The platform's `HeadParallelMixer`, with each channel as a "head" and the channel count in `ParallelismInfo.heads`; a halo exchange (the toy's `ShortConvMixer`) moves less data |
+| Tied embeddings (§7.9) | `lm_head.weight` is `model.embed_tokens.weight`. Checkpoints store the tensor once, under its first name; loading accepts either name. |
+
+### 14.3 gpt-oss: mixture of experts with its own attention core
+
+[`examples/model_plugins/gpt_oss`](../../examples/model_plugins/gpt_oss/) brings
+[gpt-oss](https://huggingface.co/openai/gpt-oss-20b). Its attention has a learned sink per head, which the
+platform's attention core does not have:
+
+| Contract part | Where it lives |
+|---|---|
+| An attention variant as a plugin layer type (§7.3) | `[layer_types] sliding_attention` and `full_attention` = `"plugin"`; `GptOssAttention.mix` computes sink attention, with a sliding window on `sliding_attention` layers |
+| Per-head parameters under sequence parallelism (§7.5) | `mix` slices `sinks` with `shard.local(num_heads)` |
+| Experts in the checkpoint's own layout (§7.6) | `mlp.experts.gate_up_proj` `[E, D, 2I]`, already stacked: `StackedExpertLayer` shards it and its biases, and no converter is needed |
+| Routing (§7.7) | `route`: top-k by router logit, softmax over the chosen logits, through `choose_experts` |
+
+Released gpt-oss checkpoints store experts in MXFP4; the example loads bf16 checkpoints (dequantize first).
+
+### 14.4 ToyHybridMoE: every part of the contract
 
 [`examples/model_plugins/toy_hybrid_moe`](../../examples/model_plugins/toy_hybrid_moe/) is a complete plugin that
 touches every part of this contract. The architecture is new to the platform:
