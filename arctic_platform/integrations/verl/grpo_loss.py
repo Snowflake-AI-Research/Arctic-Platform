@@ -163,6 +163,9 @@ def agg_loss(
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
+    from arctic_platform.common.packing.layout import active_layout_requires_token_mean
+
+    active_layout_requires_token_mean(loss_agg_mode)
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
             if dp_size > 1:

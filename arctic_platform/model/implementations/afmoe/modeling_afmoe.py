@@ -155,6 +155,11 @@ class AfmoeSDPAAttention(AfmoeAttentionBase):
         attention_mask: torch.Tensor | None = None,
         dropout_p: float = 0.0,
     ) -> torch.Tensor:
+        from arctic_platform.common.packing.layout import get_stashed_layout
+
+        layout = get_stashed_layout(self)
+        if layout is not None and layout.has_sharing:
+            raise ValueError("prefix sharing requires FlashAttention; SDPA has no prefix-continuation path in this PR")
         return F.scaled_dot_product_attention(
             query_states,
             key_states,
@@ -206,13 +211,21 @@ class AfmoeFlashAttention(AfmoeAttentionBase):
 
     def _compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens, max_seqlen):
         """Run the flash attention kernel. q/k/v are [total_tokens, heads, dim]."""
+        from arctic_platform.common.packing.layout import apply_prefix_kv
+        from arctic_platform.common.packing.layout import get_stashed_layout
+
+        layout = get_stashed_layout(self)
+        if layout is not None:
+            cu_seqlens = layout.cu_seqlens.to(device=q.device, dtype=torch.int32)
+            max_seqlen = layout.max_len_q
+        k, v, cu_seqlens_k, max_seqlen_k = apply_prefix_kv(k, v, cu_seqlens, max_seqlen, layout)
         kwargs: dict = {"causal": True}
         if self.sliding_window is not None:
             kwargs["window_size"] = (self.sliding_window - 1, 0)
         if self._flash_attn_version == 4:
             # FA4 inserts ``qv`` as its fourth positional argument, so sequence metadata must be keyword-only.
             kwargs["cu_seqlens_q"] = cu_seqlens
-            kwargs["cu_seqlens_k"] = cu_seqlens
+            kwargs["cu_seqlens_k"] = cu_seqlens_k
             out = self._flash_attn_call(q, k, v, **kwargs)
         else:
             out = self._flash_attn_call(
@@ -220,9 +233,9 @@ class AfmoeFlashAttention(AfmoeAttentionBase):
                 k,
                 v,
                 cu_seqlens,
-                cu_seqlens,
+                cu_seqlens_k,
                 max_seqlen,
-                max_seqlen,
+                max_seqlen_k,
                 **kwargs,
             )
         if isinstance(out, tuple):

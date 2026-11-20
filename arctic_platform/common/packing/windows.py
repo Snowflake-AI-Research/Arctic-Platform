@@ -108,6 +108,12 @@ def cu_seqlens_from_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
     Padding appended by ``pad_packed_microbatch`` carries position 0, so each pad token reads as its own
     single-token segment rather than extending the row it follows.
     """
+    from .layout import get_active_packed_layout
+
+    layout = get_active_packed_layout()
+    if layout is not None:
+        # Never rebuild segments from position_ids==0 while a layout is stashed.
+        return layout.cu_seqlens.to(device=position_ids.device, dtype=torch.int32)
     if not torch.is_tensor(position_ids) or position_ids.ndim < 1:
         raise ValueError(f"position_ids must be a tensor with at least one dimension, got {position_ids!r}")
     flat = position_ids[0] if position_ids.ndim == 3 else position_ids

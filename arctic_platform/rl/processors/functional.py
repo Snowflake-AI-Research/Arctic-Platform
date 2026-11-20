@@ -282,6 +282,7 @@ def agg_loss(
     prompt_token_counts: Optional[torch.Tensor] = None,
     sequence_loss_weights: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    prefix_sharing: bool = False,
 ) -> torch.Tensor:
     """Aggregate a per-token loss matrix into a scalar.
 
@@ -312,6 +313,9 @@ def agg_loss(
     DeepSpeed's DP gradient averaging. Under sequence parallelism, packed
     segment boundaries must cover each token window with one segment per row.
     """
+    from arctic_platform.common.packing.layout import active_layout_requires_token_mean
+
+    active_layout_requires_token_mean(loss_agg_mode, prefix_sharing)
     _validate_loss_denominators(batch_num_tokens, global_batch_size)
     if loss_scale_factor is not None and (
         isinstance(loss_scale_factor, bool) or not isinstance(loss_scale_factor, Integral) or loss_scale_factor < 1
