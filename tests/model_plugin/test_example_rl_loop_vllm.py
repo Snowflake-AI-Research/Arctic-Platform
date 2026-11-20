@@ -62,9 +62,9 @@ LR = 1e-3
 # sampler by bf16 rounding, ~0.06 here. Every training step must move the log-probs by more than this, or a sampler
 # that missed a weight sync could still pass.
 LOGPROB_ATOL = {"float32": 5e-3, "bfloat16": 0.1}
-# vLLM 0.33's built-in OLMoE returns NaN log-probs in float32 for batches beyond a few tokens (eager or not, with or
-# without routed-expert capture), and is right in bf16, the dtype samplers serve in.
-SAMPLER_DTYPE = {"olmoe": "bfloat16"}
+# vLLM 0.33's built-in models return NaN log-probs in float32 now and then (OLMoE in every batch beyond a few tokens,
+# OLMo-2 intermittently), and are right in bf16, the dtype samplers serve in. The toy's own vLLM model runs float32.
+SAMPLER_DTYPE = {"olmo2": "bfloat16", "olmoe": "bfloat16", "lfm2": "bfloat16", "gpt_oss": "bfloat16"}
 
 _COMMON = dict(
     vocab_size=512, hidden_size=256, num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=512

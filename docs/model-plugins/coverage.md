@@ -56,7 +56,7 @@ A **plugin extension** is a hook worth adding to the contract; a **platform capa
 | Production wiring | No loader or training-service path uses the plugin API yet. Every verdict here is about the contract, not a running job. | all | Comes first |
 | Fused attention behind the platform core | AttentionModule.mix is a reference SDPA with a dense T x T mask (4 GiB per layer at 64K tokens); FlashAttention varlen and sliding window are not swapped in. | all attention families | Promised by spec §7.3 |
 | Fast expert parallelism | DeepEP/UCCL dispatch and a grouped-GEMM or SonicMoE experts core behind StackedExpertLayer. Today EP is all-gather plus all-reduce. | all MoE families | Spec §16 Q1 |
-| Sharded checkpoint load | Each rank reads only its expert slice. Today every rank allocates the full model first, which rules out models above about 60B. | `glm4_moe`, `minimax_m2`, qwen3_moe 235B, afmoe Large |  |
+| Sharded checkpoint load | Each rank reads only its expert slice. At survey time every rank allocated the full model first, which ruled out models above about 60B. | `glm4_moe`, `minimax_m2`, qwen3_moe 235B, afmoe Large | Addressed after the survey: `load_sharded_hf_checkpoint` allocates only each rank's experts (EP) or ZeRO-3 partition (dense); the per-model rows below predate it |
 | KV-head replication in SP | Allow sp above the KV-head count in the platform attention mixer. | `qwen3_moe`, `afmoe`, `qwen35` |  |
 | Platform attention variants | Sparse MLA, DeepSeek V4 sparse attention and FP8 indexers as platform-owned kernels a plugin can call. | `deepseek_v4`, `deepseek_v41`, `glm52`, `glm53` |  |
 | Triton kernels for recurrent layers | Causal convolution and Mamba2 SSD without precompiled wheels. | `qwen35`, `nemotron_h`, `glm53` |  |

@@ -17,7 +17,9 @@
 
 ``check_rl_training`` runs the steps on four GPUs (two data-parallel replicas of two sequence-parallel ranks, with
 two-way expert parallelism and router replay for mixture-of-experts models) and compares the loss and every
-parameter with the unsharded model after each step.
+parameter with the unsharded model after each step. The trained model is loaded from a checkpoint with only each
+rank's share allocated: its experts under expert parallelism, its ZeRO-3 partition for dense models, which also run
+under ZeRO-3.
 """
 
 import pytest
@@ -46,3 +48,5 @@ def test_example_trains_under_deepspeed_with_sp_and_ep(example):
     sp = spec.sp_sizes[0] if capabilities.sequence_parallel and spec.sp_sizes else 1
     ep = spec.ep_sizes[0] if capabilities.expert_parallel and has_experts and spec.ep_sizes else 1
     conformance.check_rl_training(target, spec, sp, ep, timeout=300)
+    if not has_experts:  # dense models also load and train under ZeRO-3, partitioned across the ranks
+        conformance.check_rl_training(target, spec, sp, stage=3, timeout=300)

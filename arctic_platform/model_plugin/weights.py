@@ -107,15 +107,34 @@ def iter_hf_weights(
         yield from layer.items()
 
 
-def _load_layers(model: nn.Module, plugin: ModelPlugin, layers: Iterable[tuple[int, dict[str, torch.Tensor]]]) -> None:
+def _local_experts(model: nn.Module, layer: dict[str, torch.Tensor], ep_group) -> dict[str, torch.Tensor]:
+    """``layer`` with each expert-parallel tensor cut to this rank's block of experts (dim 0)."""
+    if ep_group is None:
+        return layer
+    rank = dist.get_rank(ep_group)
+    params = dict(model.named_parameters())
+    out = {}
+    for name, tensor in layer.items():
+        size = getattr(params.get(name), EXPERT_PARALLEL_SIZE_ATTR, 1)
+        if size > 1:
+            per_rank = tensor.shape[0] // size
+            tensor = tensor[rank * per_rank : (rank + 1) * per_rank]
+        out[name] = tensor
+    return out
+
+
+def _load_layers(
+    model: nn.Module, plugin: ModelPlugin, layers: Iterable[tuple[int, dict[str, torch.Tensor]]], ep_group=None
+) -> None:
     """Load one decoder layer at a time, so peak extra memory is one layer. Every trainer tensor must be set; a tied
-    tensor is set by any of its names."""
+    tensor is set by any of its names. With ``ep_group``, expert tensors are cut to this rank's experts first."""
     expected = set(model.state_dict())
     aliases = tied_aliases(model)
     loaded: set[str] = set()
     for index, layer in layers:
         if plugin.convert_layer_to_prime is not None:
             layer = plugin.convert_layer_to_prime(layer, index, model.config)
+        layer = _local_experts(model, layer, ep_group)
         unexpected = set(layer) - expected
         if len(unexpected) > 0:
             raise ValueError(f"checkpoint tensors match no trainer tensor: {sorted(unexpected)}")
@@ -349,16 +368,91 @@ def checkpoint_dtype(path: str | Path, skip: set[str] = frozenset()) -> torch.dt
     return max(elements, key=elements.__getitem__) if len(elements) > 0 else None
 
 
-def load_hf_checkpoint(
-    plugin: ModelPlugin, path: str | Path, *, options: Any = None, device: str | torch.device = "cpu"
-) -> tuple[Any, nn.Module]:
-    """Build the trainer model from ``config.json`` on the meta device, allocate it on ``device`` in the dtype the
-        checkpoint stores, and load the checkpoint into it layer by layer. Building on the meta device is what the
-    platform does at scale; this helper then allocates the whole model on ``device``.
+def load_sharded_hf_checkpoint(
+    plugin: ModelPlugin,
+    path: str | Path,
+    *,
+    sp_group=None,
+    ep_group=None,
+    ep_group_name: str | None = None,
+    zero3_config: dict | None = None,
+    options: Any = None,
+    device: str | torch.device = "cpu",
+):
+    """Load a checkpoint into a model prepared for ``sp_group`` and ``ep_group``, allocating only this rank's share.
 
-        Building in the stored dtype makes a save and reload exact: loading bf16 tensors into an fp32 model would
-        compute in fp32 and change the logits. Tensors marked ``dtype="fp32"`` stay fp32, as they were saved.
+    With expert parallelism, the model is built on the meta device and prepared there
+    (:func:`~arctic_platform.model_plugin.host.prepare_model` shards its experts), so allocating it costs this rank's
+    experts plus the replicated weights, not the whole model; each expert tensor is cut to this rank's block before
+    it is loaded. With ``zero3_config``, a DeepSpeed config with ZeRO stage 3, the model is built under
+    ``deepspeed.zero.Init``, which partitions every parameter across the ranks as it is created, and each tensor is
+    loaded into its partitions. DeepSpeed does not support ZeRO-3 with mixture of experts, so the two are exclusive.
+
+    The checkpoint is read one decoder layer at a time. Returns ``(config, model, binding)``; every rank must call it.
     """
+    from arctic_platform.model_plugin.host import prepare_model
+
+    if zero3_config is not None:
+        if ep_group is not None:
+            raise ValueError(
+                "ZeRO-3 cannot partition an expert-parallel model: DeepSpeed does not support MoE with it"
+            )
+        return _load_zero3(plugin, path, sp_group=sp_group, zero3_config=zero3_config, options=options, device=device)
+    config, model, dtype, passthrough = _checkpoint_model(plugin, path, options)
+    binding = prepare_model(model, plugin, config, sp_group=sp_group, ep_group=ep_group, ep_group_name=ep_group_name)
+    model = materialize(model, device, dtype)
+    layers = iter_checkpoint_layers(path, plugin.manifest.checkpoint.layer_of, skip=set(passthrough))
+    _load_layers(model, plugin, layers, ep_group=ep_group)
+    setattr(model, PASSTHROUGH_ATTR, passthrough)
+    return config, model, binding
+
+
+def _load_zero3(plugin: ModelPlugin, path: str | Path, *, sp_group, zero3_config: dict, options: Any, device):
+    import deepspeed
+
+    from arctic_platform.model_plugin.host import prepare_model
+    from arctic_platform.model_plugin.marks import tensor_marks
+
+    config, _, dtype, passthrough = _checkpoint_model(plugin, path, options)
+    with torch.device(device), deepspeed.zero.Init(config_dict_or_path=zero3_config, dtype=dtype):
+        model = build(plugin, config, options)
+    marks = tensor_marks(model)
+    fp32 = sorted(name for name, _ in model.named_parameters() if marks[name].dtype == "fp32")
+    if dtype != torch.float32 and len(fp32) > 0:
+        raise ValueError(
+            f"ZeRO-3 casts every parameter to {dtype}; fp32-marked parameters are not supported: {fp32[:3]}"
+        )
+    binding = prepare_model(model, plugin, config, sp_group=sp_group)
+    expected = set(model.state_dict())
+    aliases = tied_aliases(model)
+    tensors = dict(model.named_parameters()) | dict(model.named_buffers())
+    loaded: set[str] = set()
+    is_writer = dist.get_rank() == 0
+    for index, layer in iter_checkpoint_layers(path, plugin.manifest.checkpoint.layer_of, skip=set(passthrough)):
+        if plugin.convert_layer_to_prime is not None:
+            layer = plugin.convert_layer_to_prime(layer, index, config)
+        unexpected = set(layer) - expected
+        if len(unexpected) > 0:
+            raise ValueError(f"checkpoint tensors match no trainer tensor: {sorted(unexpected)}")
+        for name in sorted(layer):  # every rank in the same order: gathering is a collective
+            target = tensors[aliases.get(name, name)]
+            if hasattr(target, "ds_id"):  # a ZeRO-3 parameter: gather it, write it on one rank, re-partition
+                with deepspeed.zero.GatheredParameters([target], modifier_rank=0):
+                    if is_writer:
+                        target.data.copy_(layer[name])
+            else:
+                target.data.copy_(layer[name])
+            loaded.add(aliases.get(name, name))
+    missing = expected - set(aliases) - loaded
+    if len(missing) > 0:
+        raise ValueError(f"checkpoint does not set trainer tensors: {sorted(missing)}")
+    setattr(model, PASSTHROUGH_ATTR, passthrough)
+    return config, model, binding
+
+
+def _checkpoint_model(plugin: ModelPlugin, path: str | Path, options: Any):
+    """The checkpoint's config, its model built on the meta device, the dtype to allocate it in, and its pass-through
+    tensors."""
     stamp = read_stamp(path)
     if STAMP_PLUGIN in stamp and stamp[STAMP_PLUGIN] != plugin.manifest.name:
         raise ValueError(f"{path} was written by plugin {stamp[STAMP_PLUGIN]}, not {plugin.manifest.name}")
@@ -381,7 +475,22 @@ def load_hf_checkpoint(
         config.__dict__.pop("quantization_config", None)
     # A large pass-through tower must not set the model's dtype.
     dtype = getattr(torch, declared) if declared is not None else checkpoint_dtype(path, skip=set(passthrough))
-    model = materialize(build(plugin, config, options, meta=True), device, dtype)
+    return config, build(plugin, config, options, meta=True), dtype, passthrough
+
+
+def load_hf_checkpoint(
+    plugin: ModelPlugin, path: str | Path, *, options: Any = None, device: str | torch.device = "cpu"
+) -> tuple[Any, nn.Module]:
+    """Build the trainer model from ``config.json`` on the meta device, allocate it on ``device`` in the dtype the
+        checkpoint stores, and load the checkpoint into it layer by layer. Building on the meta device is what the
+    platform does at scale; this helper then allocates the whole model on ``device``. For models that do not fit on
+    one device, :func:`load_sharded_hf_checkpoint` allocates only each rank's share.
+
+        Building in the stored dtype makes a save and reload exact: loading bf16 tensors into an fp32 model would
+        compute in fp32 and change the logits. Tensors marked ``dtype="fp32"`` stay fp32, as they were saved.
+    """
+    config, model, dtype, passthrough = _checkpoint_model(plugin, path, options)
+    model = materialize(model, device, dtype)
     layers = iter_checkpoint_layers(path, plugin.manifest.checkpoint.layer_of, skip=set(passthrough))
     _load_layers(model, plugin, layers)
     setattr(model, PASSTHROUGH_ATTR, passthrough)

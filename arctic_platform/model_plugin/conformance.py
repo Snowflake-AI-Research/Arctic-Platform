@@ -78,6 +78,7 @@ from arctic_platform.model_plugin.weights import checkpoint_files
 from arctic_platform.model_plugin.weights import checkpoint_stamp
 from arctic_platform.model_plugin.weights import iter_hf_weights
 from arctic_platform.model_plugin.weights import load_hf_checkpoint
+from arctic_platform.model_plugin.weights import load_sharded_hf_checkpoint
 from arctic_platform.model_plugin.weights import read_stamp
 from arctic_platform.model_plugin.weights import require_declared_dtype
 from arctic_platform.model_plugin.weights import save_hf_checkpoint
@@ -738,6 +739,20 @@ def _parallel_checks(
         for name, tensor in unsharded.items():
             _assert_close(exported[name], tensor, 0.0, f"{mode} exported {name}")
 
+        # A sharded load allocates only this rank's experts, and gives exactly the model prepare_model sharded.
+        with tempfile.TemporaryDirectory() as path:
+            save_hf_checkpoint(baseline, plugin, config, path)
+            _, loaded, _ = load_sharded_hf_checkpoint(
+                plugin, path, sp_group=sp_group, ep_group=ep_group, options=spec.options, device=device
+            )
+        expected_params = dict(model.named_parameters())
+        for name, param in loaded.named_parameters():
+            _assert_close(param.detach(), expected_params[name].detach(), 0.0, f"{mode} sharded load {name}")
+        for name in expert_names:
+            local, full = loaded.get_parameter(name), baseline.get_parameter(name)
+            if local.shape[0] * size != full.shape[0]:
+                raise AssertionError(f"{mode} sharded load allocated {tuple(local.shape)} of {name}, not 1/{size}")
+
 
 def check_parallel(
     plugin_target: str,
@@ -798,7 +813,16 @@ def _grpo(logprobs, old, advantages, mask, num_tokens: int, dp_size: int, device
 
 
 def _training_worker(
-    rank: int, world: int, sp: int, ep: int, steps: int, init_file: str, target: str, spec_json: str, path: list[str]
+    rank: int,
+    world: int,
+    sp: int,
+    ep: int,
+    stage: int,
+    steps: int,
+    init_file: str,
+    target: str,
+    spec_json: str,
+    path: list[str],
 ) -> None:
     sys.path[:] = path
     import deepspeed
@@ -822,7 +846,6 @@ def _training_worker(
         spec = ConformanceSpec.model_validate_json(spec_json)
         atol = spec.tolerances.parallel
         config, reference = build_fixture(plugin, spec, device)
-        model = copy.deepcopy(reference)
         sp_group = None
         for start in range(0, world, sp):  # every rank creates every group, in the same order
             group = dist.new_group(list(range(start, start + sp)))
@@ -832,15 +855,31 @@ def _training_worker(
         if ep > 1:
             groups._create_expert_and_data_parallel(ep)
             ep_group = groups._get_expert_parallel_group(f"ep_size_{ep}")
-        binding = prepare_model(model, plugin, config, sp_group=sp_group if sp > 1 else None, ep_group=ep_group)
-        apply_activation_checkpointing(model)  # the production layout: recompute reruns the collectives
         ds_config = dict(
             train_micro_batch_size_per_gpu=1,
-            zero_optimization=dict(stage=1),
+            zero_optimization=dict(stage=stage),
             optimizer=dict(type="AdamW", params=dict(lr=TRAINING_LR, weight_decay=0.0, torch_adam=True)),
             gradient_clipping=0.0,
             zero_allow_untested_optimizer=True,
         )
+        # The trained model comes from a checkpoint of the reference, through the sharded load: each rank allocates
+        # only its experts (EP) or its partition of every parameter (ZeRO-3).
+        with tempfile.TemporaryDirectory() as checkpoint:
+            save_hf_checkpoint(reference, plugin, config, checkpoint)
+            _, model, binding = load_sharded_hf_checkpoint(
+                plugin,
+                checkpoint,
+                sp_group=sp_group if sp > 1 else None,
+                ep_group=ep_group,
+                zero3_config=ds_config if stage == 3 else None,
+                options=spec.options,
+                device=device,
+            )
+        if stage == 3:  # each rank holds only its partition of every parameter
+            for name, param in model.named_parameters():
+                if not hasattr(param, "ds_id") or param.ds_tensor.numel() > -(-param.ds_numel // world):
+                    raise AssertionError(f"ZeRO-3 load left {name} unpartitioned on rank {rank}")
+        apply_activation_checkpointing(model)  # the production layout: recompute reruns the collectives
         engine, *_ = initialize_deepspeed(model, binding, config=ds_config)
         optimizer = torch.optim.AdamW(reference.parameters(), lr=TRAINING_LR, weight_decay=0.0)
         replicas, replica = world // sp, rank // sp
@@ -899,7 +938,8 @@ def _training_worker(
                 if getattr(param, "allreduce", True) is False:  # this rank's block of experts
                     per_rank = target_param.shape[0] // ep
                     target_param = target_param[ep_rank * per_rank : (ep_rank + 1) * per_rank]
-                _assert_close(param.detach(), target_param, atol, f"rank {rank} {name} after step {step}")
+                with deepspeed.zero.GatheredParameters([param], enabled=hasattr(param, "ds_id")):
+                    _assert_close(param.detach(), target_param, atol, f"rank {rank} {name} after step {step}")
         dist.barrier()
     finally:
         dist.destroy_process_group()
@@ -912,11 +952,13 @@ def check_rl_training(
     ep: int = 1,
     world: int = 4,
     steps: int = 3,
+    stage: int = 1,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> None:
-    """``steps`` GRPO steps under DeepSpeed (ZeRO-1, AdamW) on ``world`` GPUs, ``world / sp`` data-parallel
+    """``steps`` GRPO steps under DeepSpeed (ZeRO ``stage``, AdamW) on ``world`` GPUs, ``world / sp`` data-parallel
     replicas of ``sp`` sequence-parallel ranks, with ``ep``-way expert parallelism and activation checkpointing,
-    replaying the unsharded model's routing. After every step the loss and every parameter must equal the same steps
+    replaying the unsharded model's routing. The trained model is loaded from a checkpoint with
+    :func:`~arctic_platform.model_plugin.weights.load_sharded_hf_checkpoint`, so each rank allocates only its share. After every step the loss and every parameter must equal the same steps
     of the unsharded model on all replicas' rows: optimizer state, gradient reduction over data, sequence and
     expert-data parallelism, and router replay over several steps."""
     try:
@@ -936,6 +978,7 @@ def check_rl_training(
                 world,
                 sp,
                 ep,
+                stage,
                 steps,
                 str(Path(directory) / "rendezvous"),
                 plugin_target,
@@ -985,6 +1028,10 @@ def _tiers(
         sp = spec.sp_sizes[0] if capabilities.sequence_parallel and spec.sp_sizes else 1
         ep = spec.ep_sizes[0] if capabilities.expert_parallel and has_experts and spec.ep_sizes else 1
         tiers.append(("rl_training", partial(check_rl_training, plugin_target, spec, sp, ep, timeout=timeout)))
+        if not has_experts:  # DeepSpeed does not support ZeRO-3 with mixture of experts
+            tiers.append(
+                ("rl_training_zero3", partial(check_rl_training, plugin_target, spec, sp, stage=3, timeout=timeout))
+            )
     return tiers
 
 

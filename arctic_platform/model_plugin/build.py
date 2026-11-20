@@ -30,7 +30,6 @@ import torch
 from torch import nn
 
 from arctic_platform.model_plugin.interfaces import InitializesBuffers
-from arctic_platform.model_plugin.marks import MARKS_ATTR
 from arctic_platform.model_plugin.marks import apply_marks
 from arctic_platform.model_plugin.marks import cast_model
 from arctic_platform.model_plugin.plugin import ModelPlugin
@@ -58,15 +57,16 @@ def materialize(model: nn.Module, device: str | torch.device, dtype: torch.dtype
     """Allocate a meta-device model on ``device`` (contents uninitialized until loaded), recompute its
     non-checkpointed buffers, and cast it to ``dtype`` keeping fp32-marked tensors; returns the model.
 
-    ``to_empty`` replaces parameter objects, giving each name of a tied parameter its own; ties are restored and
-    marks set on a tensor itself are carried over by name."""
+    ``to_empty`` replaces parameter objects, giving each name of a tied parameter its own; ties are restored, and
+    attributes set on a tensor itself (marks, and the expert-parallel tags :func:`prepare_model` sets on a model
+    prepared on the meta device) are carried over by name."""
     aliases: dict[int, list[str]] = {}
     for name, param in model.named_parameters(remove_duplicate=False):
         aliases.setdefault(id(param), []).append(name)
-    own_marks = {
-        name: getattr(tensor, MARKS_ATTR)
+    own_attributes = {
+        name: dict(vars(tensor))
         for name, tensor in [*model.named_parameters(), *model.named_buffers()]
-        if hasattr(tensor, MARKS_ATTR)
+        if vars(tensor)
     }
     model.to_empty(device=device)
     for first, *others in aliases.values():
@@ -74,8 +74,8 @@ def materialize(model: nn.Module, device: str | torch.device, dtype: torch.dtype
             owner, _, attribute = name.rpartition(".")
             setattr(model.get_submodule(owner), attribute, model.get_parameter(first))
     for name, tensor in [*model.named_parameters(), *model.named_buffers()]:
-        if name in own_marks:
-            setattr(tensor, MARKS_ATTR, own_marks[name])
+        for attribute, value in own_attributes.get(name, {}).items():
+            setattr(tensor, attribute, value)
     init_buffers(model)
     if dtype is not None:
         cast_model(model, dtype)
