@@ -17,11 +17,13 @@
 
     python -m arctic_platform.inference.semi_persistence.onboarding.publish \\
         config=CONN.json image_tag=TAG models=a,b,c [catalog=PATH] [max_gpus=40] \\
-        [reserve_gpus=8] [out_dir=onboarding_reports/publish] [timeout_s=7200]
+        [reserve_gpus=8] [out_dir=onboarding_reports/publish] [timeout_s=7200] \\
+        [model_bucket=NAME]
 
 ``models`` are model catalog entries (``glm-5.3/standard/h200-inference-full``)
-or paths to JSON files; see ``jobs.load_model`` for ``catalog``. For each, at
-its published size:
+or paths to JSON files; see ``jobs.load_model`` for ``catalog``. ``model_bucket``
+is the cluster's model bucket, set as each job's MODEL_BUCKET for the engine to
+publish to (default: the engine's, QA6's). For each, at its published size:
 
   1. submit the sampling job with semi_p on, SEMIP_DUMP_PUBLISH=1, pinned to
      ``image_tag``;
@@ -60,6 +62,7 @@ from typing import Any
 from arctic_platform.inference.semi_persistence.onboarding.client import enable_debug_options
 from arctic_platform.inference.semi_persistence.onboarding.client import make_client
 from arctic_platform.inference.semi_persistence.onboarding.common import parse_kv_args
+from arctic_platform.inference.semi_persistence.onboarding.jobs import MODEL_BUCKET_ENV
 from arctic_platform.inference.semi_persistence.onboarding.jobs import TERMINAL
 from arctic_platform.inference.semi_persistence.onboarding.jobs import ModelSpec
 from arctic_platform.inference.semi_persistence.onboarding.jobs import load_model
@@ -87,13 +90,16 @@ def utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def publish_body(spec: ModelSpec, image_tag: str) -> dict:
-    """The model's sub-job with semi_p on and a miss allowed to dump and publish."""
+def publish_body(spec: ModelSpec, image_tag: str, model_bucket: str | None = None) -> dict:
+    """The model's sub-job with semi_p on and a miss allowed to dump and publish,
+    to ``model_bucket`` if given."""
     sub = deepcopy(spec.sub_job)
     ic = sub["inference_config"]
     ic["semi_p"] = True
     vc = ic.setdefault("vllm_config", {})
     vc["extra_env"] = {**(vc.get("extra_env") or {}), **DUMP_PUBLISH_ENV}
+    if model_bucket:
+        vc["extra_env"][MODEL_BUCKET_ENV] = model_bucket
     return {"sub_job_configs": [sub], "debug": {"job": {"image_tag": image_tag}}}
 
 
@@ -153,6 +159,7 @@ class Publisher:
         self.max_gpus = int(args.get("max_gpus", "40"))
         self.reserve = int(args.get("reserve_gpus", "8"))
         self.timeout_s = float(args.get("timeout_s", "7200"))
+        self.model_bucket = args.get("model_bucket") or None
         self.out = Path(args.get("out_dir", "onboarding_reports/publish")).expanduser() / self.image_tag
         self.out.mkdir(parents=True, exist_ok=True)
         enable_debug_options()
@@ -247,7 +254,7 @@ class Publisher:
         spec = self.specs[name]
         res: dict[str, Any] = {"model": name, "model_name": spec.sub_job["model_name"],
                                "n_gpus": spec.n_gpus, "started_at": utc()}
-        job_id = self.client.create_job_from_body(publish_body(spec, self.image_tag))["job_id"]
+        job_id = self.client.create_job_from_body(publish_body(spec, self.image_tag, self.model_bucket))["job_id"]
         res["job_id"] = job_id
         with self.lock:
             self.live[job_id] = name

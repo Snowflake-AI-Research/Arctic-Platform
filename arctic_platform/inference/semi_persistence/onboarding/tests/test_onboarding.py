@@ -64,6 +64,23 @@ def test_variant_bodies_differ_only_in_what_each_variant_needs():
         "sub_job_configs"][0]["inference_config"]["vllm_config"]["extra_env"]
 
 
+@pytest.mark.parametrize("extra_vc", [{}, {"extra_env": {"A": "1"}}])
+def test_model_bucket_is_added_to_every_variant_and_nothing_else(extra_vc):
+    spec = _spec(tp=2, **extra_vc)
+    plain = jobs.build_variant_bodies(spec, "TAG", list(jobs.VARIANTS), copies=2, miss_image_cache="/scratch/run1")
+    for unset in (None, ""):
+        assert jobs.build_variant_bodies(spec, "TAG", list(jobs.VARIANTS), copies=2,
+                                         miss_image_cache="/scratch/run1", model_bucket=unset) == plain
+    bodies = jobs.build_variant_bodies(spec, "TAG", list(jobs.VARIANTS), copies=2, miss_image_cache="/scratch/run1",
+                                       model_bucket="prod-bucket")
+    for variant, body in bodies.items():
+        env = body["sub_job_configs"][0]["inference_config"]["vllm_config"].pop("extra_env")
+        want = plain[variant]["sub_job_configs"][0]["inference_config"]["vllm_config"].pop("extra_env", {})
+        assert env == {**want, "MODEL_BUCKET": "prod-bucket"}
+        assert body == plain[variant]
+    assert spec.sub_job["inference_config"]["vllm_config"] == {"tensor_parallel_size": 2, **extra_vc}
+
+
 def test_plan_variants_skips_what_cannot_differ_or_be_matched():
     assert jobs.plan_variants(_spec(tp=2)) == (list(jobs.VARIANTS), {})
     variants, skipped = jobs.plan_variants(_spec(tp=1, n_gpus=1))
@@ -517,6 +534,18 @@ def test_a_job_that_is_up_is_served_and_cancelled_without_waiting_for_the_others
     assert all(t["running_to_cancelled_s"] >= 0 for t in result["startup"]["timelines"].values())
 
 
+@pytest.mark.parametrize("args,bucket", [({}, None), ({"model_bucket": "prod-bucket"}, "prod-bucket")])
+def test_onboard_submits_model_bucket_as_every_jobs_model_bucket(monkeypatch, tmp_path, args, bucket):
+    cluster = _Cluster()
+    bodies = []
+    submit = cluster.create_job_from_body
+    cluster.create_job_from_body = lambda body: bodies.append(body) or submit(body)
+    _runner(monkeypatch, tmp_path, cluster, **args).run_one(_spec(tp=2, n_gpus=8))
+    assert len(bodies) == len(jobs.VARIANTS)
+    envs = [b["sub_job_configs"][0]["inference_config"]["vllm_config"].get("extra_env") or {} for b in bodies]
+    assert [env.get("MODEL_BUCKET") for env in envs] == [bucket] * len(bodies)
+
+
 def test_checks_from_stored_answers_match_sending_every_request_to_every_job(monkeypatch, tmp_path):
     import hashlib
 
@@ -747,6 +776,11 @@ def test_publish_body_asks_a_miss_to_dump_and_publish():
     assert ic["vllm_config"]["extra_env"] == {"A": "1", "SEMIP_DUMP_PUBLISH": "1"}
     assert "semi_p" not in spec.sub_job["inference_config"]
     assert spec.sub_job["inference_config"]["vllm_config"]["extra_env"] == {"A": "1"}
+    assert publish.publish_body(spec, "dev_X", None) == body == publish.publish_body(spec, "dev_X", "")
+    bucketed = publish.publish_body(spec, "dev_X", "prod-bucket")
+    assert bucketed["sub_job_configs"][0]["inference_config"]["vllm_config"]["extra_env"] == {
+        "A": "1", "SEMIP_DUMP_PUBLISH": "1", "MODEL_BUCKET": "prod-bucket"}
+    assert spec.sub_job["inference_config"]["vllm_config"]["extra_env"] == {"A": "1"}
 
 
 _KEY = "/data-fast/image-cache_neutrino/aaaaaaaaaaaa_bbbbbbbbbbbb"
@@ -869,14 +903,25 @@ class _PublishJob:
         raise self._conflict()
 
 
-def _publisher(monkeypatch, tmp_path, service):
+def _publisher(monkeypatch, tmp_path, service, **args):
     from arctic_platform.inference.semi_persistence.onboarding import publish
 
     monkeypatch.setattr(publish, "make_client", lambda _config: service)
     monkeypatch.setattr(publish.time, "sleep", service.sleep)
     monkeypatch.delenv("CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS", raising=False)
     return publish.Publisher({"config": "conn.json", "image_tag": "dev_X", "models": str(FIXTURES / "qwen36-35b-a3b-tp1.json"),
-                              "out_dir": str(tmp_path)})
+                              "out_dir": str(tmp_path), **args})
+
+
+@pytest.mark.parametrize("args,bucket", [({}, None), ({"model_bucket": "prod-bucket"}, "prod-bucket")])
+def test_publish_submits_model_bucket_as_the_jobs_model_bucket(monkeypatch, tmp_path, args, bucket):
+    service = _PublishJob([_DUMPED + _PUBLISHED])
+    bodies = []
+    service.create_job_from_body = lambda body: bodies.append(body) or {"job_id": "job-1"}
+    publisher = _publisher(monkeypatch, tmp_path, service, **args)
+    publisher.prepare("qwen36-35b-a3b-tp1")
+    env = bodies[0]["sub_job_configs"][0]["inference_config"]["vllm_config"]["extra_env"]
+    assert env.get("MODEL_BUCKET") == bucket and env["SEMIP_DUMP_PUBLISH"] == "1"
 
 
 def test_publish_reads_the_newest_lines_when_the_tail_stalls(monkeypatch, tmp_path):

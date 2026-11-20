@@ -59,6 +59,9 @@ MATCH_APPLIED_MARKER = "SEMIP_MATCH_COLLECTIVES=1: plain engine matched"
 # flag lets the miss cold-start and dump. With the mirror off the engine never
 # publishes, so a forced miss cannot add a second skeleton for a published key.
 MISS_ENV = {"SEMIP_IMAGE_SOURCE": "", "SEMIP_DUMP_PUBLISH": "1"}
+# The bucket a semi_p engine publishes to (QA6's when unset). The device-manager
+# pod's environment does not carry the cluster's, so a job elsewhere sets it.
+MODEL_BUCKET_ENV = "MODEL_BUCKET"
 
 VARIANTS = ("on_hit", "off_default", "on_miss", "off_matched")
 PERF_VARIANTS = ("on_hit", "off_default", "off_matched")
@@ -215,12 +218,13 @@ def plain_baseline(variants: Any) -> str | None:
 
 
 def build_variant_bodies(spec: ModelSpec, image_tag: str | None, variants: list[str], copies: int = 1,
-                         miss_image_cache: str | None = None) -> dict[str, dict]:
+                         miss_image_cache: str | None = None,
+                         model_bucket: str | None = None) -> dict[str, dict]:
     """A create-job body per variant. The perf jobs (on_hit, off_default and
     off_matched, which splits the perf gap into settings and semi_p) run
     ``copies`` x the published layout; on_miss, correctness only, runs it as
     published. Every body is the model file's sub-job plus only what its
-    variant needs."""
+    variant needs, and ``model_bucket``, if given, as every job's MODEL_BUCKET."""
     bodies = {}
     for variant in variants:
         sub = deepcopy(spec.sub_job)
@@ -238,6 +242,8 @@ def build_variant_bodies(spec: ModelSpec, image_tag: str | None, variants: list[
             engine = vc.setdefault("extra_engine_kwargs", {})
             compilation = engine.setdefault("compilation_config", {})
             compilation["pass_config"] = {**(compilation.get("pass_config") or {}), **MATCHED_PASS_CONFIG}
+        if model_bucket:
+            vc["extra_env"] = {**(vc.get("extra_env") or {}), MODEL_BUCKET_ENV: model_bucket}
         body: dict[str, Any] = {"sub_job_configs": [sub]}
         if image_tag:
             body["debug"] = {"job": {"image_tag": image_tag}}

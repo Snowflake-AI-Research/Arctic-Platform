@@ -128,6 +128,7 @@ was dumped on. The suite sets `CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS=1` for you.
 | `variants` | all four | Subset of `on_hit,off_default,on_miss,off_matched` that includes `on_hit` (see [Variant sets](#variant-sets)) |
 | `copies` | 2 for whole-node configs, else 1 | Perf pair size, as a multiple of the published `n_gpus` |
 | `miss_image_cache` | none | Local image-cache root for `on_miss`; a per-run subdirectory is used, so a copy left by an earlier job cannot turn the miss into a hit |
+| `model_bucket` | the engine's (QA6's) | The cluster's model bucket, set as every job's `MODEL_BUCKET` for a semi_p engine to publish to; needed off QA6, since the device-manager pod's environment does not carry it |
 | `checks` | `correctness,perf` | Run a subset |
 | `require_restore` | `true` | Stop if `on_hit` cold-starts |
 | `max_gpus` | free GPUs at start, minus `reserve_gpus` | GPU budget for concurrent models |
@@ -176,7 +177,8 @@ python -m arctic_platform.inference.semi_persistence.onboarding.cleanup config=c
 A semi_p job that misses (no image on the node, none published) fails unless
 its `vllm_config.extra_env` sets `SEMIP_DUMP_PUBLISH=1`. With it, the engine
 cold-starts, dumps, restores and serves, then publishes the image to the
-cluster's model bucket in the background; the `neutrino-model-cache` DaemonSet
+model bucket in the background (`MODEL_BUCKET` from the same `extra_env`, else
+QA6's `neutrino-sfc-or-dev-meta-k8s-2`); the `neutrino-model-cache` DaemonSet
 puts it on every node within minutes. The engine does not publish when the
 mirror is off (`SEMIP_IMAGE_SOURCE=""`) or when the key is published already,
 and at TP>1 it publishes only a whole-node pod (8 GPUs). At TP=1 every pod size
@@ -190,9 +192,11 @@ To publish every config for a new backend image:
 ```bash
 python -m arctic_platform.inference.semi_persistence.onboarding.publish config=connection.json \
     image_tag=TAG models=glm-5.3/standard/h200-inference-full,qwen3.8-27b/standard/h200-inference-full \
-    [catalog=PATH] [max_gpus=40] [reserve_gpus=8]
+    [catalog=PATH] [max_gpus=40] [reserve_gpus=8] [model_bucket=NAME]
 ```
 
+Off QA6, pass `model_bucket=` the cluster's model bucket (the one its
+`neutrino-model-cache` DaemonSet reads); it is set as each job's `MODEL_BUCKET`.
 It submits one job per model with the flag, waits for the engine's
 `semi_p: published` line in the sub-job log (or a restore from an image that is
 published already), saves the log and cancels the job. If the job ends first

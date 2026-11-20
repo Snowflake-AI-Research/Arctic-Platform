@@ -104,10 +104,12 @@ _UNPRIVILEGED_ENV = "SEMIP_UNPRIVILEGED"
 # plain-engine fallback, and a dump nobody publishes is lost with the pod.
 _DUMP_PUBLISH_ENV = "SEMIP_DUMP_PUBLISH"
 
-# The model bucket the publisher uploads to. It is per cluster and the
-# device-manager pod's environment does not carry it (only the model-cache
-# DaemonSet's does), so it is pinned to the one cluster semi_p runs on.
-_PUBLISH_BUCKET = "neutrino-sfc-or-dev-meta-k8s-2"
+# The model bucket the publisher uploads to, from MODEL_BUCKET. It is per
+# cluster and the device-manager pod's environment does not carry it (only the
+# model-cache DaemonSet's does), so a job on another cluster sets it through
+# vllm_config.extra_env; unset, it is QA6's bucket.
+_PUBLISH_BUCKET_ENV = "MODEL_BUCKET"
+_DEFAULT_PUBLISH_BUCKET = "neutrino-sfc-or-dev-meta-k8s-2"
 _PUBLISHER = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "semi_persistence", "scripts", "semip_publish.py")
@@ -3057,8 +3059,13 @@ def _publish_ready_marker(key_dir: str, slot: int) -> str:
                         f"{_REPLICA_DIR_PREFIX}{slot}.ready")
 
 
+def _publish_bucket() -> str:
+    return ((os.environ.get(_PUBLISH_BUCKET_ENV) or "").strip()
+            or _DEFAULT_PUBLISH_BUCKET)
+
+
 def _publish_command(key_dir: str) -> list[str]:
-    return [sys.executable, _PUBLISHER, key_dir, "--bucket", _PUBLISH_BUCKET,
+    return [sys.executable, _PUBLISHER, key_dir, "--bucket", _publish_bucket(),
             "--hash-workers", str(_PUBLISH_HASH_WORKERS),
             "--nice", str(_PUBLISH_NICE)]
 
@@ -3081,7 +3088,7 @@ def _run_publisher(key_dir: str) -> int:
                        "publishing with its default", exc_info=True)
     command = _publish_command(key_dir)
     logger.info("semi_p: publishing %s to s3://%s (log %s): %s",
-                key_dir, _PUBLISH_BUCKET, log_path, " ".join(command))
+                key_dir, _publish_bucket(), log_path, " ".join(command))
     t0 = time.perf_counter()
     with open(log_path, "w") as log:
         rc = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,

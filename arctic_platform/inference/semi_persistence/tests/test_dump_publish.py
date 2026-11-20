@@ -272,12 +272,38 @@ def test_only_a_whole_node_or_a_tp1_pod_is_published(tmp_path, count, world,
     if not published:
         assert "whole node" in reason
 
-def test_publish_command_names_the_script_and_the_bucket():
+def test_publish_command_names_the_script_and_the_bucket(monkeypatch):
+    monkeypatch.setenv("MODEL_BUCKET", "neutrino-sfc-or-prod-meta-k8s-2")
     command = se._publish_command("/data-fast/image-cache_neutrino/k")
     assert os.path.isfile(command[1])
     assert command[2] == "/data-fast/image-cache_neutrino/k"
-    assert command[command.index("--bucket") + 1] == se._PUBLISH_BUCKET
+    assert command[command.index("--bucket") + 1] == "neutrino-sfc-or-prod-meta-k8s-2"
     assert command[command.index("--nice") + 1] == str(se._PUBLISH_NICE)
+
+
+@pytest.mark.parametrize("value", [None, "", "  "])
+def test_publish_bucket_defaults_to_qa6s_without_model_bucket(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("MODEL_BUCKET", raising=False)
+    else:
+        monkeypatch.setenv("MODEL_BUCKET", value)
+    command = se._publish_command("/data-fast/image-cache_neutrino/k")
+    assert command[command.index("--bucket") + 1] == "neutrino-sfc-or-dev-meta-k8s-2"
+
+
+def test_publishing_logs_the_bucket_it_uploads_to(publish_dir, monkeypatch, caplog):
+    monkeypatch.setenv("MODEL_BUCKET", "neutrino-sfc-or-prod-meta-k8s-2")
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(se.subprocess, "run", run)
+    with caplog.at_level("INFO"):
+        assert se._run_publisher("/data-fast/image-cache_neutrino/k") == 0
+    assert commands[-1][commands[-1].index("--bucket") + 1] == "neutrino-sfc-or-prod-meta-k8s-2"
+    assert "to s3://neutrino-sfc-or-prod-meta-k8s-2 " in caplog.text
 
 
 def _record_publishes(monkeypatch):

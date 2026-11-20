@@ -69,6 +69,9 @@ Arguments (``key=value``):
                    for a whole-node config, 1 otherwise, or the model file's)
   miss_image_cache local image-cache root for on_miss, unique per run, so a copy
                    left on the node by an earlier job cannot turn it into a hit
+  model_bucket     the cluster's model bucket, set as every job's MODEL_BUCKET
+                   for a semi_p engine to publish to (default: the engine's,
+                   QA6's)
   checks           comma-separated subset of correctness,perf (default both)
   require_restore  stop when on_hit cold-starts (default true)
   max_gpus         GPU budget for concurrent models (default: free GPUs now
@@ -229,6 +232,7 @@ class Runner:
         self.verify_timeout_s = float(args.get("verify_timeout_s", "3600"))
         self.copies = int(args["copies"]) if args.get("copies") else None
         self.miss_image_cache = args.get("miss_image_cache") or None
+        self.model_bucket = args.get("model_bucket") or None
         self.max_gpus = int(args["max_gpus"]) if args.get("max_gpus") else None
         self.max_nodes = int(args["max_nodes"]) if args.get("max_nodes") else None
         self.reserve_gpus = int(args.get("reserve_gpus", "0"))
@@ -326,7 +330,7 @@ class Runner:
         try:
             miss_cache = (f"{self.miss_image_cache.rstrip('/')}/{report.stem(result)}"
                           if self.miss_image_cache else None)
-            bodies = build_variant_bodies(spec, image_tag, variants, copies, miss_cache)
+            bodies = build_variant_bodies(spec, image_tag, variants, copies, miss_cache, self.model_bucket)
             if not attached and "on_hit" in variants:
                 summary = Path(self.publish_dir).expanduser() / image_tag / "summary.json"
                 result["published_image"] = verify.wait_verified(
