@@ -1,4 +1,4 @@
-"""Apply expert routing weights without retaining an FP32 activation copy."""
+"""Apply routing weights to expert rows or to their down-projection accumulators."""
 
 from __future__ import annotations
 
@@ -65,11 +65,12 @@ def _rows(t: torch.Tensor) -> torch.Tensor:
     return t if t.stride(-1) == 1 else t.contiguous()
 
 
-def _routing_weights_backward(hidden_states, scores, grad_output, need_hidden, need_scores):
+def _routing_weights_backward(hidden_states, scores, grad_output, grad_hidden_dtype, need_scores):
+    need_hidden = grad_hidden_dtype is not None
     # Double backward (create_graph) needs differentiable ops, so it keeps the PyTorch path.
     if _fused(hidden_states, scores, grad_output) and not torch.is_grad_enabled() and hidden_states.shape[0]:
         x, go = _rows(hidden_states), _rows(grad_output)
-        grad_hidden = torch.empty(x.shape, dtype=hidden_states.dtype, device=x.device) if need_hidden else None
+        grad_hidden = torch.empty(x.shape, dtype=grad_hidden_dtype, device=x.device) if need_hidden else None
         grad_scores = torch.empty(x.shape[0], dtype=torch.float32, device=x.device) if need_scores else None
         hidden_stride = 0
         if need_hidden:
@@ -96,7 +97,7 @@ def _routing_weights_backward(hidden_states, scores, grad_output, need_hidden, n
     grad_output_fp32 = grad_output.float()
     grad_hidden = grad_scores = None
     if need_hidden:
-        grad_hidden = (grad_output_fp32 * scores.float().reshape(-1, 1)).to(hidden_states.dtype)
+        grad_hidden = (grad_output_fp32 * scores.float().reshape(-1, 1)).to(grad_hidden_dtype)
     if need_scores:
         # Recompute the cast at use rather than saving it for every routed chunk.
         grad_scores = (grad_output_fp32 * hidden_states.float()).sum(dim=1).reshape(scores.shape).to(scores.dtype)
@@ -124,8 +125,11 @@ class _ApplyRoutingWeights(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         hidden_states, scores = ctx.saved_tensors
-        need_hidden, need_scores = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
-        return (*_routing_weights_backward(hidden_states, scores, grad_output, need_hidden, need_scores), None)
+        grad_hidden_dtype = hidden_states.dtype if ctx.needs_input_grad[0] else None
+        grad_hidden, grad_scores = _routing_weights_backward(
+            hidden_states, scores, grad_output, grad_hidden_dtype, ctx.needs_input_grad[1]
+        )
+        return grad_hidden, grad_scores, None
 
 
 def apply_routing_weights(
@@ -145,20 +149,18 @@ class _WeightedDownProjection(torch.autograd.Function):
         counts = torch.diff(offsets, prepend=offsets.new_zeros(1)).tolist()
         ctx.rows = sum(counts)
         out = hidden.new_empty(hidden.shape[0], weight.shape[1])
-        # The score gradient is the FP32 accumulator the forward weighted, not its BF16 rounding.
-        unweighted = torch.empty(out.shape, dtype=torch.float32, device=out.device) if ctx.needs_input_grad[3] else None
+        unweighted = torch.empty_like(out, dtype=torch.float32) if ctx.needs_input_grad[3] else None
         start = 0
         # Explicit float() operands alone do not keep the product in FP32 under bf16 autocast.
         with torch.autocast(device_type=hidden.device.type, enabled=False):
             for expert, count in enumerate(counts):
                 span = slice(start, start + count)
+                target = unweighted[span] if unweighted is not None else None
                 # torch._grouped_mm has no FP32 output for BF16 inputs; mm's out_dtype is CUDA-only.
                 if hidden.is_cuda:
-                    acc = torch.mm(hidden[span], weight[expert].t(), out_dtype=torch.float32)
+                    acc = torch.mm(hidden[span], weight[expert].t(), out_dtype=torch.float32, out=target)
                 else:
-                    acc = hidden[span].float() @ weight[expert].float().t()
-                if unweighted is not None:
-                    unweighted[span] = acc
+                    acc = torch.mm(hidden[span].float(), weight[expert].float().t(), out=target)
                 torch.mul(acc, scores[span, None], out=out[span])
                 del acc
                 start += count
@@ -176,11 +178,9 @@ class _WeightedDownProjection(torch.autograd.Function):
             unweighted if ctx.needs_input_grad[3] else grad_output,
             scores,
             grad_output,
-            ctx.needs_input_grad[0] or ctx.needs_input_grad[1],
+            hidden.dtype if any(ctx.needs_input_grad[:2]) else None,
             ctx.needs_input_grad[3],
         )
-        if weighted is not None:
-            weighted = weighted.to(hidden.dtype)  # FP32 from the FP32 accumulator above; one rounding either way
         grad_hidden = grad_weight = None
         if ctx.needs_input_grad[0]:
             grad_hidden = torch._grouped_mm(weighted, weight, offs=offsets)
@@ -197,7 +197,7 @@ def weighted_down_projection(
 
     This is vLLM's fused MoE epilogue: the second GEMM's FP32 accumulator times the routing weight, one cast.
     ``hidden`` holds each expert's rows in turn, ``offsets`` is the cumulative row count per expert (int32) and
-    ``weight`` is ``[experts, out, in]``. Rows past ``offsets[-1]`` are zero. The FP32 accumulator exists for one
-    expert's rows at a time.
+    ``weight`` is ``[experts, out, in]``. Rows past ``offsets[-1]`` are zero. When scores need gradients, backward
+    uses the FP32 projection saved for all rows. Otherwise each expert's accumulator is temporary.
     """
     return _WeightedDownProjection.apply(hidden, weight, offsets, scores)
