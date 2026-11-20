@@ -166,10 +166,19 @@ def _apply_swiglu(
     up: torch.Tensor,
     limit: float | None,
 ) -> torch.Tensor:
+    """``silu(min(gate, limit)) * clamp(up, -limit, limit)`` and both input gradients in FP32, each rounded once.
+
+    Composed in the activation dtype, ``silu(gate)`` and, in backward, ``grad * up`` were stored in BF16 before
+    their next multiply. On CUDA the fused kernel also saves only ``gate`` and ``up`` for backward.
+    """
+    if gate.is_cuda and not torch.compiler.is_compiling():
+        from arctic_platform.model.implementations.kernels.fused_swiglu import fused_swiglu
+
+        return fused_swiglu(gate, up, limit)
     if limit is not None:
         gate = gate.clamp(max=limit)
         up = up.clamp(min=-limit, max=limit)
-    return F.silu(gate) * up
+    return (F.silu(gate.float()) * up.float()).to(gate.dtype)
 
 
 # can be used as dense FFN layer or shared experts in MoE layers
