@@ -22897,6 +22897,68 @@ def test_client_backends_cortex_transport_sends_hardware_and_lists_durable_check
 
 
 @pytest.mark.usefixtures("_client_backends_no_network")
+def test_client_backends_cortex_transport_pins_hosted_image_tag(monkeypatch):
+    monkeypatch.setenv("AP_CORRECTNESS_IMAGE_TAG", "release_20261118_085208_e711fa00000")
+    transport = CorrectnessCortexTransport(CortexConfig(base_url="http://cortex.test"))
+    calls = []
+
+    async def send(self, method, path, *, policy=_DEFAULT, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"job_id": "parent"}
+
+    monkeypatch.setattr(CortexTransport, "_send", send)
+    monkeypatch.setattr(transport, "_wait_running", lambda: None)
+    monkeypatch.setattr(transport, "_capture_sub_jobs", lambda: {"training": "parent:training:0"})
+    config = CortexTrainingConfig(model_name="model", training_gpus=8, backend=transport.config, hardware="H200")
+    try:
+        transport.initialize(client_config=config)
+        assert calls[0][2]["json"] == {
+            "sub_job_configs": config.to_cortex(),
+            "hardware": "H200",
+            "debug": {"job": {"image_tag": "release_20261118_085208_e711fa00000"}},
+        }
+    finally:
+        transport.shutdown()
+
+
+def test_client_backends_server_reduced_fixture_binds_overrides_to_the_spec(tmp_path, monkeypatch):
+    from arctic_platform.correctness.harness import cortex as cortex_module
+
+    spec = SimpleNamespace(
+        config_id="unit",
+        model=SimpleNamespace(source_checkpoint="org/model", cache_path="/data-fast/m-4L", content_hash="abc"),
+    )
+    monkeypatch.setattr(cortex_module, "server_reduced_overrides", lambda _spec: {"num_hidden_layers": 4})
+    receipt = tmp_path / "binding.json"
+    receipt.write_text(
+        json.dumps({"schema_version": 1, "kind": "server-reduced", "config_id": "unit", "model_name": "org/model"})
+    )
+    binding = cortex_module.load_fixture(receipt, spec)
+    assert binding["model_name"] == "org/model"
+    assert binding["text_config_overrides"] == {"num_hidden_layers": 4}
+    assert binding["reviewed_hash"] == "abc" and binding["fixture_sha256"]
+    receipt.write_text(
+        json.dumps({"schema_version": 1, "kind": "server-reduced", "config_id": "other", "model_name": "org/model"})
+    )
+    with pytest.raises(ValueError, match="does not match the reviewed spec"):
+        cortex_module.load_fixture(receipt, spec)
+
+
+def test_client_backends_server_reduction_follows_the_loader_route():
+    from arctic_platform.correctness.harness.cortex import apply_server_reduction
+
+    dense = {"ep_size": 1}
+    apply_server_reduction(dense, {"num_hidden_layers": 4})
+    assert dense == {"ep_size": 1, "text_config_overrides": {"num_hidden_layers": 4}}
+    moe = {"ep_size": 4, "prime_rl": {"debug": {"gradient_norms_per_param": True}}}
+    apply_server_reduction(moe, {"num_hidden_layers": 4, "layer_types": ["full_attention"] * 4})
+    assert moe["prime_rl"] == {"debug": {"gradient_norms_per_param": True, "num_layers": 4}}
+    assert "text_config_overrides" not in moe
+    with pytest.raises(ValueError, match="can only cut layers"):
+        apply_server_reduction({"ep_size": 4}, {"num_hidden_layers": 4, "num_experts": 8})
+
+
+@pytest.mark.usefixtures("_client_backends_no_network")
 @pytest.mark.parametrize("check", ["single-step-grads", "single-step-optimizer"])
 def test_client_backends_cortex_refuses_checks_requiring_local_model_identity(tmp_path, monkeypatch, check):
     cfg = SimpleNamespace(
@@ -23781,6 +23843,9 @@ _SELFTEST_GROUPS = {
         "test_client_backends_remote_run_never_probes_local_allocation",
         "test_client_backends_onprem_refuses_cortex_checkpoint_identity",
         "test_client_backends_cortex_transport_sends_hardware_and_lists_durable_checkpoints",
+        "test_client_backends_cortex_transport_pins_hosted_image_tag",
+        "test_client_backends_server_reduced_fixture_binds_overrides_to_the_spec",
+        "test_client_backends_server_reduction_follows_the_loader_route",
         "test_client_backends_cortex_refuses_checks_requiring_local_model_identity",
         "test_client_backends_cortex_report_does_not_claim_the_reduced_fixture_was_measured",
         "test_driver_reviewed_training_preserves_explicit_format_without_mutating_payload",

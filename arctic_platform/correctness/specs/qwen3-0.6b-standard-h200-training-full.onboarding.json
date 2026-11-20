@@ -1,0 +1,116 @@
+{
+  "combined_reference_elapsed_seconds": 23.32544218422845,
+  "combined_reference_error": null,
+  "config": "/code/users/shulin/work/ap-qa6/Arctic-Platform/arctic_platform/correctness/configs/qwen3-0.6b/standard/h200-training-full.json",
+  "config_id": "qwen3-0.6b-standard-h200-training-full",
+  "results": {
+    "checkpoint-resume-loss": {
+      "elapsed_seconds": 1429.569301316049,
+      "exit_code": 0,
+      "log": "/data-fast/q06-logs/onboard-all-a5/onboarding-q4x6yov8/checkpoint-resume-loss/test.log",
+      "options": {
+        "backend": "cortex",
+        "base_url": null,
+        "checkpoint_training_gpus": null,
+        "dense_checkpoint_allocation": null,
+        "dense_checkpoint_allocation_sha256": null,
+        "gpu_pool": null,
+        "host": null,
+        "inference_export_allocation": null,
+        "inference_export_allocation_sha256": null,
+        "inference_initial_model_dir": null,
+        "inference_sampling_topology": null,
+        "local_gateway_full_model": false,
+        "peft_adapter": null,
+        "reference_token_budget": null,
+        "reviewed_gate": null,
+        "source_checkpoint": null,
+        "tokens": null
+      },
+      "output_dir": "/data-fast/tmp/correctness.KcHnu99n/config-onboarding-0hiiz8ab/checkpoint-resume-loss",
+      "runtime_identity": "0a7d415a5ae85896613d1b338e7a58ee53a7c08068618654daf28e3d45def5c5",
+      "spec_identity": "a277e7fb97b7a9003271b87093be077467286cbd34b885a2c861f3a73b42cf31",
+      "status": "onboarded"
+    },
+    "e2e-sft-train-validate": {
+      "elapsed_seconds": 3.240459941793233,
+      "exit_code": 1,
+      "log": "/data-fast/q06-logs/onboard-all-a5/onboarding-q4x6yov8/e2e-sft-train-validate/test.log",
+      "reason": "ModuleNotFoundError: No module named 'pyarrow'\nComplete log: /data-fast/q06-logs/onboard-all-a5/onboarding-q4x6yov8/e2e-sft-train-validate/test.log",
+      "status": "failed"
+    },
+    "inference-checkpoint-loss": {
+      "elapsed_seconds": 0.09584040381014347,
+      "exit_code": 1,
+      "log": "/data-fast/q06-logs/onboard-all-a5/onboarding-q4x6yov8/inference-checkpoint-loss/test.log",
+      "reason": "ValueError: Cortex onboarding requires a local reference-free RL fixed-gate check or a local full-model supervised inference/e2e check, pinned initial-model inference, or an explicit local Cortex fixture\nComplete log: /data-fast/q06-logs/onboard-all-a5/onboarding-q4x6yov8/inference-checkpoint-loss/test.log",
+      "status": "failed"
+    },
+    "rl-router-replay": {
+      "reason": "rl-router-replay requires a reinforcement-learning config",
+      "status": "inapplicable"
+    },
+    "rl-weight-sync": {
+      "reason": "rl-weight-sync requires a reinforcement-learning config",
+      "status": "inapplicable"
+    },
+    "single-step-grads": {
+      "elapsed_seconds": 259.3117721839808,
+      "exit_code": 0,
+      "log": "/data-fast/q06-logs/onboard-all-a5/onboarding-q4x6yov8/single-step-grads/test.log",
+      "options": {
+        "backend": "cortex",
+        "base_url": null,
+        "checkpoint_training_gpus": null,
+        "dense_checkpoint_allocation": null,
+        "dense_checkpoint_allocation_sha256": null,
+        "gpu_pool": null,
+        "host": null,
+        "inference_export_allocation": null,
+        "inference_export_allocation_sha256": null,
+        "inference_initial_model_dir": null,
+        "inference_sampling_topology": null,
+        "local_gateway_full_model": false,
+        "peft_adapter": null,
+        "reference_token_budget": null,
+        "reviewed_gate": null,
+        "source_checkpoint": null,
+        "tokens": null
+      },
+      "output_dir": "/data-fast/tmp/correctness.KcHnu99n/config-onboarding-0hiiz8ab/single-step-grads",
+      "runtime_identity": "0a7d415a5ae85896613d1b338e7a58ee53a7c08068618654daf28e3d45def5c5",
+      "spec_identity": "a6cf8b5f1138205921db7a1687bf195eeeafe94b9c4ce81cf867551e34389a19",
+      "status": "onboarded"
+    },
+    "single-step-optimizer": {
+      "elapsed_seconds": 329.0506147672422,
+      "exit_code": 0,
+      "log": "/data-fast/q06-logs/onboard-all-a5/onboarding-q4x6yov8/single-step-optimizer/test.log",
+      "options": {
+        "backend": "cortex",
+        "base_url": null,
+        "checkpoint_training_gpus": null,
+        "dense_checkpoint_allocation": null,
+        "dense_checkpoint_allocation_sha256": null,
+        "gpu_pool": null,
+        "host": null,
+        "inference_export_allocation": null,
+        "inference_export_allocation_sha256": null,
+        "inference_initial_model_dir": null,
+        "inference_sampling_topology": null,
+        "local_gateway_full_model": false,
+        "peft_adapter": null,
+        "reference_token_budget": null,
+        "reviewed_gate": null,
+        "source_checkpoint": null,
+        "tokens": null
+      },
+      "output_dir": "/data-fast/tmp/correctness.KcHnu99n/config-onboarding-0hiiz8ab/single-step-optimizer",
+      "runtime_identity": "0a7d415a5ae85896613d1b338e7a58ee53a7c08068618654daf28e3d45def5c5",
+      "spec_identity": "eef01346567c59f17ea12d95dc3c706282251fa1caacfacf54dfd53c12e42d89",
+      "status": "onboarded"
+    }
+  },
+  "skipped_tests": [],
+  "test_spec": "/code/users/shulin/work/ap-qa6/Arctic-Platform/arctic_platform/correctness/specs/qwen3-0.6b-standard-h200-training-full.json"
+}
