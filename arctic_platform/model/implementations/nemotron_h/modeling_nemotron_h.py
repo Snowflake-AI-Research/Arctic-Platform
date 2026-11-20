@@ -407,6 +407,9 @@ class NemotronHPreTrainedModel(PreTrainedModelPrimeRL):
     _supports_flash_attn = True
     _supports_sdpa = True
     _can_compile_fullgraph = False
+    # As Transformers' NemotronH (modeling_nemotron_h.py:1008-1010): a load in BF16, and DeepSpeed's mixed-precision
+    # cast (data_types.keep_in_fp32_modules "auto", deepspeed/runtime/keep_in_fp32.py), keep the routing bias in FP32.
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
     # LoRA weight sync and the sampler's adapter pack (weight_export.py) name tensors after vLLM's modules.
     vllm_lora_name = staticmethod(vllm_lora_name)
     # vLLM serves the non-gated experts' LoRA one expert at a time (up_proj, down_proj): the PEFT 3-D expert format

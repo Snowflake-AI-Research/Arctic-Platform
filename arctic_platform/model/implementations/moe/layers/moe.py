@@ -1548,6 +1548,10 @@ class NemotronHRouter(nn.Module):
     and bias correction for load balancing.
     """
 
+    # Exported with the checkpoint (an HF weights-only save), as the checkpoint ships it; a weight sync leaves it to
+    # the sampler's own load (moe/vllm_weights.py named_weight_sync_tensors).
+    _dss_weight_export_buffers = frozenset({"e_score_correction_bias"})
+
     def __init__(
         self,
         dim: int,
@@ -1559,7 +1563,10 @@ class NemotronHRouter(nn.Module):
     ):
         super().__init__()
         self.gate = nn.Parameter(torch.empty(num_experts, dim))
-        self.register_buffer("e_score_correction_bias", torch.zeros(num_experts))
+        # FP32 whatever the model's dtype, as vLLM (models/nemotron_h.py:167-168) and Transformers
+        # (_keep_in_fp32_modules_strict) keep it: the checkpoint's biases sit near 57 about 0.01 apart, where BF16
+        # values are 0.25 apart.
+        self.register_buffer("e_score_correction_bias", torch.zeros(num_experts, dtype=torch.float32))
         self.num_experts = num_experts
         self.top_k = top_k
         self.n_group = n_group
