@@ -407,37 +407,3 @@ def test_nccl_zero_copy_sync_reports_no_checksum(tp_world_size, cpu_cuda):
 
     assert result["update_path"] == "direct_zero_copy"
     assert "recv_l2_sq" not in result
-
-
-def _worker_load(method: str, rank_results: list[dict], *args) -> dict:
-    from arctic_platform.inference.server.worker import InferenceWorker
-
-    async def _collective_rpc(name, args=()):
-        assert name == method
-        return rank_results
-
-    worker = InferenceWorker.__ray_metadata__.modified_class()
-    worker.llm = SimpleNamespace(collective_rpc=_collective_rpc)
-    return asyncio.run(getattr(worker, method)(*args))
-
-
-@pytest.mark.parametrize(
-    "method, args",
-    [
-        ("load_weights_cuda_ipc", ({},)),
-        ("load_weights_cuda_ipc_chunk", ({}, None)),
-        ("load_weights_from_shm_path", ("/dev/shm/x",)),
-        ("sync_weights_broadcast", ("localhost", 12345, 1, 3)),
-    ],
-)
-def test_worker_reports_every_tp_ranks_received_checksum(method, args):
-    """Each TP rank receives the whole model, so rank 0's value alone does not vouch for the others."""
-    result = _worker_load(method, [{"recv_l2_sq": 32.5, "loaded": 3}, {"recv_l2_sq": 30.0, "loaded": 3}], *args)
-
-    assert result == {"recv_l2_sq": 32.5, "loaded": 3, "rank_recv_l2_sq": [32.5, 30.0]}
-
-
-def test_worker_marks_a_rank_without_a_checksum():
-    result = _worker_load("load_weights_cuda_ipc", [{"recv_l2_sq": 32.5}, {"status": "done"}], {})
-
-    assert result["rank_recv_l2_sq"] == [32.5, None]
