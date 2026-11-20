@@ -1121,9 +1121,7 @@ def _grpo_loss(
     # statistics (its exp(0 - old) is not a ratio) and count it, so a run sees it instead of training around it.
     loss_mask = input_data["loss_mask"]
     nonfinite_trainable = (loss_mask != 0) & ~input_data["teacher_policy_finite"]
-    nonfinite_trainable_count = int(nonfinite_trainable.sum())
-    if nonfinite_trainable_count:
-        input_data["loss_mask"] = torch.where(nonfinite_trainable, torch.zeros_like(loss_mask), loss_mask)
+    input_data["loss_mask"] = torch.where(nonfinite_trainable, torch.zeros_like(loss_mask), loss_mask)
 
     if values["teacher_tau"] > 0.0:
         teacher_log_probs = input_data["teacher_log_probs"]
@@ -1167,7 +1165,7 @@ def _grpo_loss(
         loss_scale_factor=context.get("packed_loss_scale_factor"),
         **values,
     )
-    metrics["grpo_nonfinite_logprob_token_count"] = float(nonfinite_trainable_count)
+    metrics["grpo_nonfinite_logprob_token_count"] = float(nonfinite_trainable.sum())
     return loss, metrics
 
 
