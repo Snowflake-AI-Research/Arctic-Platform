@@ -233,6 +233,13 @@ objective. An explicit `false` of `ratio_stats` or of `ratio_mask_rebalance`
 with no other ratio control is inert: no echo, no metrics and no
 `use_cispo_loss` requirement.
 
+Every GRPO variant reports `grpo_nonfinite_logprob_token_count`, the number of
+requested policy positions with a NaN or infinite trainer log-probability.
+The count sums across microbatches and ranks. Such positions contribute zero to
+the policy numerator and are excluded from ratio statistics. Loss normalization
+retains their original weight in the denominator. Padding contributes zero to
+the count. An active `nll_mask` position still requires a finite log-probability.
+
 Whenever ratio controls are active (any ratio-control key, or
 `ratio_stats=True`, or `ratio_mask_rebalance=True`), the loss also reports four
 additive signed-mass metrics,
