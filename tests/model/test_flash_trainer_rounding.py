@@ -27,6 +27,8 @@ import pytest
 import torch
 
 from arctic_platform.model import loader as loader_mod
+from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import torch_assert_equal
 from tests.model.test_glm5_next import _tiny_config as _glm_tiny_config
 
 
@@ -466,24 +468,44 @@ def test_flash_moe_weights_the_down_projection_accumulator_before_rounding(
     assert layer.experts.w2.grad.abs().sum() > 0
 
 
-def test_weighted_down_projection_backward_is_that_of_the_bf16_gemm_then_weighting():
+def test_weighted_down_projection_backward_uses_bf16_gemm_and_fp32_score_dot():
     from arctic_platform.model.implementations.moe.routing_weights import apply_routing_weights
     from arctic_platform.model.implementations.moe.routing_weights import weighted_down_projection
 
-    torch.manual_seed(0)
-    offsets = torch.tensor([37, 37, 96], dtype=torch.int32)  # the second expert has no rows
-    inputs = [torch.randn(96, 32).bfloat16(), torch.randn(3, 48, 32).bfloat16(), 2.5 * torch.rand(96)]
+    set_seed(0)
+    counts = (37, 0, 59)
+    offsets = torch.tensor(counts).cumsum(0, dtype=torch.int32)
+    hidden = torch.randn(96, 32).bfloat16().requires_grad_()
+    weight = torch.randn(3, 48, 32).bfloat16().requires_grad_()
+    scores = (2.5 * torch.rand(96)).requires_grad_()
     grad = torch.randn(96, 48).bfloat16()
-    gradients = []
-    for weighted_first in (True, False):
-        hidden, weight, scores = (tensor.clone().requires_grad_(True) for tensor in inputs)
-        if weighted_first:
-            output = weighted_down_projection(hidden, weight, offsets, scores)
-        else:
-            output = apply_routing_weights(torch._grouped_mm(hidden, weight.transpose(-2, -1), offs=offsets), scores)
-        gradients.append(torch.autograd.grad(output, (hidden, weight, scores), grad))
-    for actual, expected in zip(*gradients, strict=True):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    baseline = apply_routing_weights(torch._grouped_mm(hidden, weight.transpose(-2, -1), offs=offsets), scores)
+    expected_hidden, expected_weight = torch.autograd.grad(baseline, (hidden, weight), grad)
+    projected = torch.cat(
+        [x.float() @ w.float().T for x, w in zip(hidden.detach().split(counts), weight.detach(), strict=True)]
+    )
+    output = weighted_down_projection(hidden, weight, offsets, scores)
+    grad_hidden, grad_weight, grad_scores = torch.autograd.grad(output, (hidden, weight, scores), grad)
+    torch_assert_equal(grad_hidden, expected_hidden)
+    torch_assert_equal(grad_weight, expected_weight)
+    torch_assert_equal(grad_scores, (grad.float() * projected).sum(dim=1))
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"])
+def test_weighted_down_projection_score_gradient_uses_the_fp32_accumulator(device):
+    """Only the routed row contributes to the score gradient, including the low bits of its projection."""
+    from arctic_platform.model.implementations.moe.routing_weights import weighted_down_projection
+
+    hidden = torch.ones(2, 2, device=device, dtype=torch.bfloat16)
+    weight = hidden.new_tensor([[[1.0, 1 / 256]]])
+    scores = torch.tensor([0.75, 0.75], device=device, requires_grad=True)
+    offsets = torch.tensor([1], device=device, dtype=torch.int32)
+    output = weighted_down_projection(hidden, weight, offsets, scores)
+    (grad_scores,) = torch.autograd.grad(output.float().sum(), scores)
+    expected = scores.new_tensor([1 + 2**-8, 0.0])
+    torch_assert_equal(output[:, 0], (expected * scores.detach()).bfloat16())
+    torch_assert_equal(grad_scores, expected)
 
 
 def test_weighted_down_projection_keeps_the_fp32_accumulator_under_autocast():
