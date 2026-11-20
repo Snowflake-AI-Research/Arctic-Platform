@@ -145,7 +145,8 @@ class _WeightedDownProjection(torch.autograd.Function):
         counts = torch.diff(offsets, prepend=offsets.new_zeros(1)).tolist()
         ctx.rows = sum(counts)
         out = hidden.new_empty(hidden.shape[0], weight.shape[1])
-        unweighted = torch.empty_like(out) if ctx.needs_input_grad[3] else None
+        # The score gradient is the FP32 accumulator the forward weighted, not its BF16 rounding.
+        unweighted = torch.empty(out.shape, dtype=torch.float32, device=out.device) if ctx.needs_input_grad[3] else None
         start = 0
         # Explicit float() operands alone do not keep the product in FP32 under bf16 autocast.
         with torch.autocast(device_type=hidden.device.type, enabled=False):
@@ -170,7 +171,7 @@ class _WeightedDownProjection(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         hidden, weight, offsets, scores, unweighted = ctx.saved_tensors
-        # The BF16 grouped GEMM followed by apply_routing_weights has this backward, on the same saved tensors.
+        # Hidden and weight gradients are those of the BF16 grouped GEMM followed by apply_routing_weights.
         weighted, grad_scores = _routing_weights_backward(
             unweighted if ctx.needs_input_grad[3] else grad_output,
             scores,
@@ -178,6 +179,8 @@ class _WeightedDownProjection(torch.autograd.Function):
             ctx.needs_input_grad[0] or ctx.needs_input_grad[1],
             ctx.needs_input_grad[3],
         )
+        if weighted is not None:
+            weighted = weighted.to(hidden.dtype)  # FP32 from the FP32 accumulator above; one rounding either way
         grad_hidden = grad_weight = None
         if ctx.needs_input_grad[0]:
             grad_hidden = torch._grouped_mm(weighted, weight, offs=offsets)

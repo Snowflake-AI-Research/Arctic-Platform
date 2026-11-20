@@ -467,6 +467,7 @@ def test_flash_moe_weights_the_down_projection_accumulator_before_rounding(
 
 
 def test_weighted_down_projection_backward_is_that_of_the_bf16_gemm_then_weighting():
+    """Hidden and weight gradients match the BF16 path; the score gradient is the FP32 accumulator's (next test)."""
     from arctic_platform.model.implementations.moe.routing_weights import apply_routing_weights
     from arctic_platform.model.implementations.moe.routing_weights import weighted_down_projection
 
@@ -482,8 +483,21 @@ def test_weighted_down_projection_backward_is_that_of_the_bf16_gemm_then_weighti
         else:
             output = apply_routing_weights(torch._grouped_mm(hidden, weight.transpose(-2, -1), offs=offsets), scores)
         gradients.append(torch.autograd.grad(output, (hidden, weight, scores), grad))
-    for actual, expected in zip(*gradients, strict=True):
+    for actual, expected in zip(gradients[0][:2], gradients[1][:2], strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_weighted_down_projection_score_gradient_uses_the_fp32_accumulator():
+    """The forward weights the FP32 accumulator, so d(out)/d(score) is that accumulator, not its BF16 rounding."""
+    from arctic_platform.model.implementations.moe.routing_weights import weighted_down_projection
+
+    hidden = torch.tensor([[1.0, 1.0]], dtype=torch.bfloat16)
+    weight = torch.tensor([[[1.0, 1 / 256]]], dtype=torch.bfloat16)  # one row: 1 + 2**-8, not a BF16 value
+    scores = torch.tensor([0.75], requires_grad=True)
+    output = weighted_down_projection(hidden, weight, torch.tensor([1], dtype=torch.int32), scores)
+    (grad_scores,) = torch.autograd.grad(output.float().sum(), scores)
+    assert output.item() == 0.75390625  # 0.75 * (1 + 2**-8), rounded once
+    assert grad_scores.item() == 1 + 2**-8
 
 
 def test_weighted_down_projection_keeps_the_fp32_accumulator_under_autocast():
