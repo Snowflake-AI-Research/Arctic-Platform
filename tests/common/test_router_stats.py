@@ -41,6 +41,7 @@ def cpu_histc(monkeypatch):
     """The router histograms integer expert ids, which ``torch.histc`` supports only on CUDA."""
     histc = torch.histc
     monkeypatch.setattr(torch, "histc", lambda ids, **kwargs: histc(ids.float(), **kwargs))
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor: None)
 
 
 def _training_config(stride: int = 1, call_stride: int = 1) -> dict:
@@ -51,15 +52,16 @@ def _hooked(stride: int, call_stride: int = 1):
     torch.manual_seed(0)
     model = torch.nn.Module()
     model.add_module("router", TokenChoiceTopKRouter(DIM, EXPERTS, TOP_K, "softmax", route_norm=True, route_scale=1.0))
-    trainer = SimpleNamespace(model=model)
+    trainer = SimpleNamespace(model=model, rank=0)
     callback = RouterStatsCallback(_training_config(stride, call_stride))
     callback.post_init(trainer)
     return model, callback, trainer
 
 
 def _reported(callback: RouterStatsCallback) -> dict:
-    """Driver-merged shape after one rank logs local totals with ``Reduce.SUM``."""
-    merged = merge_metrics([{"router_stats": (Reduce.SUM, callback._report())}])
+    callback.post_step(SimpleNamespace(rank=0))
+    merged = merge_metrics([callback.pending])
+    callback.pending.clear()
     return merged["router_stats"]["router"]
 
 
@@ -76,22 +78,39 @@ def test_a_step_counts_each_routed_token_once_and_skips_replay_pad_rows():
     assert stats["tokens_per_expert"] == pytest.approx([1.0, 2.0, 2.0, 1.0])
     assert stats["sampled_tokens"] == stats["replayed_tokens"] == pytest.approx(3.0)
     own = torch.topk(torch.softmax(model.router.gate(x[:3]), -1), TOP_K).indices
-    agreement = sum(len(set(o.tolist()) & set(r.tolist())) / TOP_K for o, r in zip(own, replayed[:3]))
+    agreement = sum(len(set(o.tolist()) & set(r.tolist())) / TOP_K for o, r in zip(own, replayed[:3], strict=True))
     assert stats["replay_agreement_sum"] == pytest.approx(agreement)
-    assert _reported(hooked)["tokens_per_expert"] == [0.0] * EXPERTS, "a report must reset the per-step totals"
+    assert not _reported(hooked)["tokens_per_expert"].any(), "a report must reset the per-step totals"
 
 
-def test_driver_sums_local_totals_across_ranks():
-    model, hooked, _trainer = _hooked(stride=1)
-    model.router(torch.randn(4, DIM))
-    local = hooked._report()
-    merged = merge_metrics(
-        [
-            {"router_stats": (Reduce.SUM, local)},
-            {"router_stats": (Reduce.SUM, local)},
-        ]
+@pytest.mark.parametrize("rank", [0, 1])
+def test_one_collective_reduces_every_layer_before_only_rank_zero_reports(rank, monkeypatch):
+    model = torch.nn.ModuleDict(
+        {
+            name: TokenChoiceTopKRouter(DIM, experts, TOP_K, "softmax", True, 1.0)
+            for name, experts in (("router", 4), ("other", 6))
+        }
     )
-    assert merged["router_stats"]["router"]["sampled_tokens"] == pytest.approx(2.0 * local["router"]["sampled_tokens"])
+    trainer = SimpleNamespace(model=model, rank=rank)
+    hooked = RouterStatsCallback(_training_config(stride=1))
+    hooked.post_init(trainer)
+    for router in model.values():
+        router(torch.randn(4, DIM))
+    local = torch.cat([totals.clone() for _, totals in hooked._layers])
+    calls = []
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor: (calls.append(tensor), tensor.add_(local)))
+    hooked.post_step(trainer)
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0], 2 * local, rtol=0, atol=0)
+    assert all(not totals.any() for _, totals in hooked._layers)
+    assert bool(hooked.pending) == (rank == 0)
+    if rank == 0:
+        reports = merge_metrics([hooked.pending, {}])["router_stats"]
+        for name, router in model.items():
+            report = reports[name]
+            assert report["sampled_tokens"] == 8.0
+            assert report["tokens_per_expert"].shape == (router.num_experts,)
+            assert report["tokens_per_expert"].dtype.name == "float32"
 
 
 @pytest.mark.parametrize("padding_calls", [0, 1])
@@ -149,6 +168,21 @@ def test_replaying_the_routers_own_near_tied_choices_agrees_fully(score_func, bi
     assert stats["replay_agreement_sum"] == stats["replayed_tokens"] == len(x)
 
 
+def test_a_router_with_fp32_logits_agrees_with_its_own_routing():
+    """The statistics read the gate as routing does: fp32 logits from bf16 operands when ``fp32_logits`` is set."""
+    torch.manual_seed(0)
+    model = torch.nn.Module()
+    model.add_module("router", TokenChoiceTopKRouter(64, 64, 8, "sigmoid", True, 1.0, fp32_logits=True).bfloat16())
+    x, bias = torch.randn(256, 64, dtype=torch.bfloat16), torch.zeros(64)
+    selected = model.router(x, bias)[1]
+    hooked = RouterStatsCallback(_training_config(stride=1))
+    hooked.post_init(SimpleNamespace(model=model))
+    model.router(x, bias, routed_experts=selected)
+
+    stats = _reported(hooked)
+    assert stats["replay_agreement_sum"] == stats["replayed_tokens"] == len(x)
+
+
 def test_fresh_replay_rows_do_not_inflate_replay_agreement():
     """ROUTER_REPLAY_FRESH rows become the router's own top-k in output[1]; agreement must ignore them."""
     model, hooked, trainer = _hooked(stride=1)
@@ -164,7 +198,7 @@ def test_fresh_replay_rows_do_not_inflate_replay_agreement():
     assert stats["sampled_tokens"] == pytest.approx(4.0)
     assert stats["replayed_tokens"] == pytest.approx(2.0), "only the non-FRESH rows count as replayed"
     own = torch.topk(torch.softmax(model.router.gate(x[:2]), -1), TOP_K).indices
-    agreement = sum(len(set(o.tolist()) & set(r.tolist())) / TOP_K for o, r in zip(own, wrong[:2]))
+    agreement = sum(len(set(o.tolist()) & set(r.tolist())) / TOP_K for o, r in zip(own, wrong[:2], strict=True))
     assert stats["replay_agreement_sum"] == pytest.approx(agreement)
     assert stats["replay_agreement_sum"] < stats["replayed_tokens"], "wrong replay must not look perfect"
 
@@ -203,7 +237,7 @@ def test_microbatch_hooks_forward_to_counting(hook):
     callback.post_step(trainer)
 
     reduce, report = callback.pending["router_stats"]
-    assert reduce is Reduce.SUM
+    assert reduce is Reduce.RANK0
     assert report["router"]["sampled_tokens"] == pytest.approx(float(len(x)))
     assert report["router"]["replayed_tokens"] == 0.0, "padding call must not double count"
 
@@ -233,7 +267,7 @@ def test_on_error_drops_partial_totals():
 
     _reduce, report = callback.pending["router_stats"]
     assert report["router"]["sampled_tokens"] == 0.0
-    assert report["router"]["tokens_per_expert"] == [0.0] * EXPERTS
+    assert not report["router"]["tokens_per_expert"].any()
 
 
 def test_on_error_during_step_keeps_completed_fwd_bwd_totals():
