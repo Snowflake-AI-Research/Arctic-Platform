@@ -32,6 +32,7 @@ import torch.distributed as dist
 from deepspeed.accelerator import get_accelerator
 
 from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
+from arctic_platform.common.deepspeed_engine import apply_default_grad_accum_dtype
 from arctic_platform.common.deepspeed_engine import build_deepspeed_config
 from arctic_platform.common.deepspeed_engine import initialize_training_engine
 from arctic_platform.common.ray_cluster import primary_ip
@@ -47,6 +48,10 @@ from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.common.weight_checksum import tensor_l2_sq
+from arctic_platform.debug.training import maybe_cleanup_router_replay_on_failure
+from arctic_platform.debug.training import maybe_configure_router_replay_trace
+from arctic_platform.debug.training import maybe_finish_router_replay_after_destroy
+from arctic_platform.debug.weight_sync import maybe_configure_broadcast_training
 from arctic_platform.model import build_model
 from arctic_platform.model import ds_worker_dense_model_spec
 from arctic_platform.model import ds_worker_moe_model_spec
@@ -111,6 +116,7 @@ class DeepSpeedWorker:
     def get_ip(self) -> str:
         return self.my_addr
 
+    @maybe_cleanup_router_replay_on_failure(runtime=True)
     def initialize(self, master_addr: str, job_config: dict) -> bool:
         self.master_addr = master_addr
         os.environ.update(
@@ -216,6 +222,8 @@ class DeepSpeedWorker:
             )
         else:
             # Forward-only/log-prob remains a separate no-optimizer contract.
+            ds_config = maybe_configure_broadcast_training(ds_config)
+            ds_config = maybe_configure_router_replay_trace(ds_config, model, self.rank)
             self.engine, _, _, _ = deepspeed.initialize(model=model, config=ds_config)
         self._device = get_accelerator().device_name(self.engine.local_rank)
 
@@ -321,13 +329,7 @@ class DeepSpeedWorker:
         )
         ds_config.setdefault("torch_autocast", {"enabled": True, "dtype": "bfloat16"})
         ds_config.setdefault("communication_data_type", "fp32")
-        # DeepSpeed accumulates in the model dtype when ``grad_accum_dtype`` is unset, so the FP32 default belongs to
-        # the key, not the block: a supplied ``data_types`` without it still accumulates in FP32. ``None`` is how
-        # DeepSpeed spells unset. A new block is built so a caller's shared ``data_types`` dict is never mutated.
-        data_types = dict(ds_config.get("data_types") or {})
-        if data_types.get("grad_accum_dtype") is None:
-            data_types["grad_accum_dtype"] = "fp32"
-        ds_config["data_types"] = data_types
+        apply_default_grad_accum_dtype(ds_config)
 
         return ds_config
 
@@ -1248,6 +1250,7 @@ class DeepSpeedWorker:
         logger.info("Rank %d empty_cache: %.0f MB GPU remaining", self.rank, mem_mb)
         return {"gpu_mb": mem_mb}
 
+    @maybe_finish_router_replay_after_destroy
     def destroy(self) -> bool:
         if self._weight_sender is not None:
             self._weight_sender.destroy()

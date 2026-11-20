@@ -39,6 +39,20 @@ def _write_config(path, payload):
     return str(path)
 
 
+def test_moe_spec_preserves_config_read_error(monkeypatch):
+    from arctic_platform.model import moe_spec
+
+    error = PermissionError("cannot read model config")
+
+    def unreadable_config(model_name):
+        raise error
+
+    monkeypatch.setattr(moe_spec, "hf_text_model_type", unreadable_config)
+    with pytest.raises(PermissionError) as caught:
+        moe_model_spec(model_name="unreadable-model", ep_size=8)
+    assert caught.value is error
+
+
 def test_text_model_type_reads_a_nested_glm_config(tmp_path):
     checkpoint = _write_config(
         tmp_path / "glm",
