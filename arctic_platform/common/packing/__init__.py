@@ -66,16 +66,16 @@ from .groups import token_budget_groups
 from .groups import token_budget_microbatch_groups
 from .groups import token_validity_mask
 from .layout import PackedLayout
-from .layout import MOE_SHARED_TOKEN_COUNT
+from .layout import active_layout_requires_token_mean
 from .layout import pack_with_layout
+from .layout import require_identical_prefixes
+from .layout import require_no_prefix_sharing
 from .layout import require_prefix_continuation
+from .layout import require_router_replay_decision
 from .layout import require_token_mean_if_sharing
 from .layout import shared_prefix_length
 from .layout import skip_share_if_router_disagree
-from .layout import stash_layout
 from .layout import using_layout
-from .layout import active_layout_requires_token_mean
-from .layout import require_identical_prefixes
 from .pack import IGNORE_INDEX
 from .pack import ROW_BROADCAST_KEYS
 from .pack import PackMetadata
@@ -96,7 +96,6 @@ __all__ = [
     "DROP",
     "cu_seqlens_from_position_ids",
     "IGNORE_INDEX",
-    "MOE_SHARED_TOKEN_COUNT",
     "MicrobatchSplit",
     "PackedLayout",
     "PackMetadata",
@@ -109,11 +108,12 @@ __all__ = [
     "map_batch_values",
     "pack_microbatch",
     "pack_with_layout",
+    "require_no_prefix_sharing",
     "require_prefix_continuation",
+    "require_router_replay_decision",
     "require_token_mean_if_sharing",
     "shared_prefix_length",
     "skip_share_if_router_disagree",
-    "stash_layout",
     "using_layout",
     "active_layout_requires_token_mean",
     "require_identical_prefixes",

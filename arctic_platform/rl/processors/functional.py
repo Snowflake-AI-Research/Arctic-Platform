@@ -32,6 +32,8 @@ import torch.distributed as dist
 import torch.distributed.nn.functional as dist_autograd
 from deepspeed.utils import groups
 
+from arctic_platform.common.packing.layout import active_layout_requires_token_mean
+
 _GLOBAL_LOSS_SCALE_KEYS = ("dp_size", "batch_num_tokens", "global_batch_size")
 
 
@@ -313,8 +315,6 @@ def agg_loss(
     DeepSpeed's DP gradient averaging. Under sequence parallelism, packed
     segment boundaries must cover each token window with one segment per row.
     """
-    from arctic_platform.common.packing.layout import active_layout_requires_token_mean
-
     active_layout_requires_token_mean(loss_agg_mode, prefix_sharing)
     _validate_loss_denominators(batch_num_tokens, global_batch_size)
     if loss_scale_factor is not None and (

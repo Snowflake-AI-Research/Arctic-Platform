@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from arctic_platform.common.packing.layout import require_no_prefix_sharing
+
 
 def get_cu_seqlens_from_position_ids(position_ids: torch.Tensor) -> tuple[torch.Tensor, int]:
     """Build local-relative cumulative sequence lengths from packed position ids.
@@ -11,6 +13,7 @@ def get_cu_seqlens_from_position_ids(position_ids: torch.Tensor) -> tuple[torch.
     position id, so cumulative offsets must be anchored to the local tensor rather
     than to the absolute position id value.
     """
+    require_no_prefix_sharing("DeepSeek V4 get_cu_seqlens_from_position_ids")
     flat_position_ids = position_ids.reshape(-1)
     total_tokens = flat_position_ids.numel()
     assert total_tokens > 0, "Cannot build cu_seqlens for an empty position_ids tensor"

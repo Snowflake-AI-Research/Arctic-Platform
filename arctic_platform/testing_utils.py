@@ -266,6 +266,53 @@ def make_tied_lm_head_model(hidden_size: int, vocab_size: int, device: str = "cu
     return SimpleNamespace(lm_head=lm_head, config=SimpleNamespace(vocab_size=vocab_size))
 
 
+def flash_attn_varlen_reference(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+    causal=True,
+    window_size=(-1, -1),
+    softmax_scale=None,
+    **unused,
+):
+    """Pure-torch stand-in for ``flash_attn_varlen_func`` on CPU: ``[T, H, D]`` in, ``[Tq, H, D]`` out.
+
+    Follows flash-attn >= 2.1 semantics: the causal mask is aligned bottom-right when a segment has more
+    keys than queries, ``window_size=(left, right)`` bounds keys to ``[i - left, i + right]`` around query
+    ``i``'s aligned position (``right`` is ignored when causal), and fewer K/V heads than Q heads is GQA.
+    """
+    scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+    cu_q = [int(x) for x in cu_seqlens_q.tolist()]
+    cu_k = [int(x) for x in cu_seqlens_k.tolist()]
+    left, right = window_size if window_size is not None else (-1, -1)
+    out = []
+    for s in range(len(cu_q) - 1):
+        qs = q[cu_q[s] : cu_q[s + 1]]
+        ks = k[cu_k[s] : cu_k[s + 1]]
+        vs = v[cu_k[s] : cu_k[s + 1]]
+        groups = qs.shape[1] // ks.shape[1]
+        ks = ks.repeat_interleave(groups, dim=1)
+        vs = vs.repeat_interleave(groups, dim=1)
+        len_q, len_k = qs.shape[0], ks.shape[0]
+        query_pos = torch.arange(len_q, device=q.device)[:, None] + (len_k - len_q)
+        key_pos = torch.arange(len_k, device=q.device)[None, :]
+        allowed = torch.ones(len_q, len_k, dtype=torch.bool, device=q.device)
+        if causal:
+            allowed &= key_pos <= query_pos
+        elif right >= 0:
+            allowed &= key_pos <= query_pos + right
+        if left >= 0:
+            allowed &= key_pos >= query_pos - left
+        scores = torch.einsum("qhd,khd->hqk", qs, ks) * scale
+        scores = scores.masked_fill(~allowed, float("-inf"))
+        out.append(torch.einsum("hqk,khd->qhd", scores.softmax(dim=-1), vs))
+    return torch.cat(out, dim=0)
+
+
 def torch_assert_equal(actual, expected, **kwargs):
     """
     Compare two tensors or non-tensor numbers for their equality.

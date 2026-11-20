@@ -7,8 +7,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from arctic_platform.common.packing.layout import apply_prefix_kv
 from arctic_platform.common.packing.layout import get_stashed_layout
+from arctic_platform.common.packing.layout import prefix_varlen_args
 
 from .norms import RMSNorm, RMSNormConfig
 from .rotary_emb import apply_rotary_pos_emb
@@ -27,6 +27,7 @@ except ImportError:
 
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_4_varlen_func
+# Some flash_attn builds raise AttributeError, not ImportError, while importing ``flash_attn.cute``.
 except (ImportError, AttributeError):
     flash_attn_4_varlen_func = None  # type: ignore
 
@@ -97,11 +98,9 @@ class FlashAttention(nn.Module):
 
     def _compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens, max_seqlen):
         """Run the flash attention kernel. q/k/v are [total_tokens, heads, dim]."""
-        layout = get_stashed_layout(self)
-        if layout is not None:
-            cu_seqlens = layout.cu_seqlens.to(device=q.device, dtype=torch.int32)
-            max_seqlen = layout.max_len_q
-        k, v, cu_seqlens_k, max_seqlen_k = apply_prefix_kv(k, v, cu_seqlens, max_seqlen, layout)
+        k, v, cu_seqlens, cu_seqlens_k, max_seqlen, max_seqlen_k = prefix_varlen_args(
+            k, v, cu_seqlens, max_seqlen, get_stashed_layout(self)
+        )
         kwargs: dict = {"causal": True}
         sliding_window = getattr(self, "sliding_window", None)
         if sliding_window is not None:

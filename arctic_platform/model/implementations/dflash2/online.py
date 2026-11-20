@@ -36,6 +36,8 @@ from typing import Optional
 import torch
 from torch import nn
 
+from arctic_platform.common.packing.layout import require_no_prefix_sharing
+
 from .config import build_draft_config
 from .specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 from .specforge.export.checkpoint_io import apply_legacy_rope_scaling
@@ -48,6 +50,7 @@ DRAFT_WEIGHTS = "model.safetensors"
 
 def row_spans(position_ids: torch.Tensor) -> list[tuple[int, int]]:
     """Row boundaries of a packed ``[1, T]`` window: a new row starts wherever ``position_ids`` is 0."""
+    require_no_prefix_sharing("DFlash2 row_spans")
     flat = position_ids.reshape(-1)
     starts = (flat == 0).nonzero(as_tuple=False).reshape(-1).tolist()
     if not starts or starts[0] != 0:

@@ -35,6 +35,7 @@ from typing import Optional
 
 import torch
 
+from arctic_platform.common.packing.layout import active_layout_requires_token_mean
 from arctic_platform.common.registry import declare_loss_capabilities
 from arctic_platform.rl.processors.base_loss import REQUIRES_TOKEN_LOGPROBS
 from arctic_platform.rl.processors.pipeline import register_loss_fn
@@ -163,8 +164,6 @@ def agg_loss(
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
-    from arctic_platform.common.packing.layout import active_layout_requires_token_mean
-
     active_layout_requires_token_mean(loss_agg_mode)
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:

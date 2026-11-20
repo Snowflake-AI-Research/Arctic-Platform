@@ -18,6 +18,8 @@ from transformers.modeling_outputs import (
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
+from arctic_platform.common.packing.layout import get_stashed_layout
+from arctic_platform.common.packing.layout import prefix_varlen_args
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
 from arctic_platform.model.implementations.layers.mlp import MLP, MLPConfig
@@ -155,8 +157,6 @@ class AfmoeSDPAAttention(AfmoeAttentionBase):
         attention_mask: torch.Tensor | None = None,
         dropout_p: float = 0.0,
     ) -> torch.Tensor:
-        from arctic_platform.common.packing.layout import get_stashed_layout
-
         layout = get_stashed_layout(self)
         if layout is not None and layout.has_sharing:
             raise ValueError("prefix sharing requires FlashAttention; SDPA has no prefix-continuation path in this PR")
@@ -211,14 +211,9 @@ class AfmoeFlashAttention(AfmoeAttentionBase):
 
     def _compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens, max_seqlen):
         """Run the flash attention kernel. q/k/v are [total_tokens, heads, dim]."""
-        from arctic_platform.common.packing.layout import apply_prefix_kv
-        from arctic_platform.common.packing.layout import get_stashed_layout
-
-        layout = get_stashed_layout(self)
-        if layout is not None:
-            cu_seqlens = layout.cu_seqlens.to(device=q.device, dtype=torch.int32)
-            max_seqlen = layout.max_len_q
-        k, v, cu_seqlens_k, max_seqlen_k = apply_prefix_kv(k, v, cu_seqlens, max_seqlen, layout)
+        k, v, cu_seqlens, cu_seqlens_k, max_seqlen, max_seqlen_k = prefix_varlen_args(
+            k, v, cu_seqlens, max_seqlen, get_stashed_layout(self)
+        )
         kwargs: dict = {"causal": True}
         if self.sliding_window is not None:
             kwargs["window_size"] = (self.sliding_window - 1, 0)
