@@ -6,6 +6,7 @@ conversion cache. The distributed gather / LoRA helpers are dropped.
 """
 
 import json
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Literal
 
@@ -34,24 +35,113 @@ def get_max_layer_num(state_dict: dict[str, Tensor], layer_prefix: str = "model.
     return max_num + 1
 
 
+def _group_tensor_locations(locations: dict[str, Path]) -> dict[Path, list[str]]:
+    by_shard: dict[Path, list[str]] = {}
+    for name, path in locations.items():
+        by_shard.setdefault(path, []).append(name)
+    return by_shard
+
+
+def _checkpoint_tensor_locations(source_dir: Path, *, strict_duplicates: bool = False) -> dict[str, Path]:
+    """Follow the index when present; otherwise retain readers' sorted, last-file-wins behavior."""
+    locations: dict[str, Path] = {}
+    index_path = source_dir / SAFE_WEIGHTS_INDEX_NAME
+    indexed = index_path.is_file()
+    if indexed:
+        with index_path.open(encoding="utf-8") as stream:
+            index = json.load(stream)
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict) or len(weight_map) == 0:
+            raise ValueError(f"Checkpoint index requires a nonempty weight_map: {index_path}")
+        for name, filename in weight_map.items():
+            if not isinstance(name, str) or not isinstance(filename, str):
+                raise ValueError(f"Checkpoint index tensor names and shard paths must be strings: {index_path}")
+            path = source_dir / filename
+            # Hub snapshots link shards into ../../blobs; constrain index names, not symlink targets.
+            if Path(filename).is_absolute() or ".." in Path(filename).parts:
+                raise ValueError(f"Checkpoint shard path must stay inside its source directory: {filename}")
+            locations[name] = path
+        by_shard = _group_tensor_locations(locations)
+        shard_paths = sorted(by_shard)
+    else:
+        shard_paths = sorted(source_dir.glob("*.safetensors"))
+    for shard_path in shard_paths:
+        with safe_open(shard_path, framework="pt", device="cpu") as shard:
+            if indexed:
+                missing = set(by_shard[shard_path]) - set(shard.keys())
+                if len(missing) > 0:
+                    raise ValueError(f"Indexed checkpoint tensors missing from {shard_path}: {sorted(missing)}")
+            else:
+                for name in shard.keys():
+                    if strict_duplicates and name in locations:
+                        raise ValueError(f"Duplicate checkpoint tensor: {name}")
+                    locations[name] = shard_path
+    return locations
+
+
 def load_state_dict_keys(save_dir: Path) -> list[str]:
-    """Load only the key names from safetensor files without reading tensor data."""
-    keys: list[str] = []
-    for safetensor_path in save_dir.glob("*.safetensors"):
-        with safe_open(safetensor_path, framework="pt", device="cpu") as f:
-            keys.extend(f.keys())
-    return keys
+    """Read the indexed tensor inventory without reading tensor data."""
+    return list(_checkpoint_tensor_locations(save_dir))
 
 
 def load_state_dict(save_dir: Path) -> dict[str, Tensor]:
     """Load a state dict from a local directory with safetensor files."""
-    safetensors_paths = list(save_dir.glob("*.safetensors"))
+    locations = _checkpoint_tensor_locations(save_dir)
     state_dict = {}
-    for safetensor_path in safetensors_paths:
+    for safetensor_path, names in sorted(_group_tensor_locations(locations).items()):
         with safe_open(safetensor_path, framework="pt", device="cpu") as f:
-            for key in f.keys():
+            for key in names:
                 state_dict[key] = f.get_tensor(key)
     return state_dict
+
+
+def convert_safetensor_checkpoint(
+    source_dir: Path,
+    save_dir: Path,
+    convert_fn: Callable[[dict[str, Tensor]], dict[str, Tensor] | None],
+    partition_fn: Callable[[tuple[str, ...]], Iterable[Iterable[str]]],
+) -> None:
+    """Convert complete dependency groups, retaining only one group in memory."""
+    locations = _checkpoint_tensor_locations(source_dir, strict_duplicates=True)
+    if not locations:
+        raise ValueError(f"No safetensors weights in {source_dir}")
+    groups = [tuple(group) for group in partition_fn(tuple(locations))]
+    names = [name for group in groups for name in group]
+    if any(not group for group in groups) or len(names) != len(set(names)) or set(names) != set(locations):
+        raise ValueError("Checkpoint conversion groups must cover every source tensor exactly once")
+
+    save_dir.mkdir(parents=True, exist_ok=False)
+    weight_map: dict[str, str] = {}
+    total_size = 0
+    for group_index, group in enumerate(groups):
+        state: dict[str, Tensor] = {}
+        by_shard: dict[Path, list[str]] = {}
+        for name in group:
+            by_shard.setdefault(locations[name], []).append(name)
+        for shard_path, selected in by_shard.items():
+            with safe_open(shard_path, framework="pt", device="cpu") as shard:
+                for name in selected:
+                    state[name] = shard.get_tensor(name)
+        converted = convert_fn(state)
+        if converted is not None:
+            state = converted
+        if not state or set(state).intersection(weight_map):
+            raise ValueError("Checkpoint conversion produced empty or overlapping groups")
+        split = split_torch_state_dict_into_shards(
+            state, filename_pattern=f"model-group{group_index:05d}{{suffix}}.safetensors"
+        )
+        for filename, tensor_names in split.filename_to_tensors.items():
+            output = {name: state.pop(name).contiguous() for name in tensor_names}
+            save_file(output, save_dir / filename, metadata={"format": "pt"})
+            del output
+        weight_map.update(split.tensor_to_filename)
+        total_size += split.metadata["total_size"]
+        del state
+
+    # The root index is the cache's completion marker; never publish a partial conversion.
+    with (save_dir / SAFE_WEIGHTS_INDEX_NAME).open("x", encoding="utf-8") as stream:
+        json.dump({"metadata": {"total_size": total_size}, "weight_map": weight_map}, stream, indent=2, sort_keys=True)
+        stream.write("\n")
 
 
 def save_state_dict(
