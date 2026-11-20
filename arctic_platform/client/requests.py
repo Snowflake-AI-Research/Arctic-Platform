@@ -138,7 +138,8 @@ def save_checkpoint_request(
     stage_info: dict | None = None,
 ) -> Request:
     # Cortex: checkpoint_id/checkpoint_type. On-prem SFT also accepts
-    # path/step/export_hf/save_total_limit/stage_info.
+    # path/step/export_hf/save_total_limit/stage_info. A DSS zone refuses a
+    # stage_info credential that expires within its save floor (see docs/sft.md).
     body = {
         "checkpoint_id": checkpoint_id,
         "checkpoint_type": checkpoint_type,
