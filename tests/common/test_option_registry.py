@@ -41,13 +41,14 @@ from arctic_platform.common.option_registry import settle
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
 
-# The real registry: the 23 keys with where they run and their goal, and the registered loaders.
+# The real registry: the keys with where they run and their goal, and the registered loaders.
 EXPECTED_KEYS = {
     "checkpointing.mode": ("trainer", "memory"),
     "checkpointing.freq": ("trainer", "memory"),
     "checkpointing.targets": ("trainer", "memory"),
     "checkpointing.offload": ("trainer", "memory"),
     "tiled_mlp.token_chunk_size": ("trainer", "memory"),
+    "tiled_remat.token_budget": ("trainer", "memory"),
     "lm_head.fp32": ("both", "parity"),
     "lm_head.token_chunk_size": ("trainer", "memory"),
     "lm_head.vocab_chunk_size": ("trainer", "memory"),
@@ -535,7 +536,7 @@ class TestCommandLine(TestCasePlus):
     def test_check_passes_on_real_data(self):
         out = self._run("check")
         assert len(out) == 1
-        assert out[0].startswith("check passed: 25 options x 10 profiles = 250 cells, ")
+        assert out[0].startswith("check passed: 26 options x 10 profiles = 260 cells, ")
 
     def test_matrix_write_reproduces_committed_file(self):
         tmp_dir = Path(self.get_auto_remove_tmp_dir())

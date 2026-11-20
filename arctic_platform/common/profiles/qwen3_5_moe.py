@@ -49,6 +49,7 @@ def register(registry: Registry) -> None:
             "numerics.fp32_parity",
         ],
         unsupported={
+            "tiled_remat.token_budget": "packed mixer tiling is only on the huggingface SFT path",
             "numerics.fp32_residual": "this loader has no fp32_residual option; only huggingface has one",
             "numerics.fp32_routed_weighting": "no fp32_routed_weighting option; see glm5_next, qwen4_exp",
             "lm_head.vocab_chunk_size": "no equivalent option",

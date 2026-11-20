@@ -307,7 +307,10 @@ def run_sft_pipeline(
     Dense batches pass ``input_ids`` + ``attention_mask`` + ``labels``.
     Packed batches (Axolotl ``sample_packing``) additionally carry
     ``position_ids`` with per-document resets; those are forwarded so HF FA2
-    can run varlen attention instead of a dense padded rectangle. No GRPO
+    can run varlen attention instead of a dense padded rectangle. A packed
+    module that has ``linear_attn`` layers also gets a forward pre-hook that
+    derives ``cu_seq_lens_q/k``, ``max_length_q/k`` and ``seq_idx`` from those
+    ``position_ids`` (``common/utils/packed_gdn.py``). No GRPO
     packing/unpad pipeline — SFT stays on the plain HF causal-LM surface.
     """
     from arctic_platform import sft_profile
@@ -340,6 +343,15 @@ def run_sft_pipeline(
         model_kwargs["output_hidden_states"] = True
         model_kwargs["logits_to_keep"] = 1
     packed = _batch_is_packed(batch, meta)
+    if packed:
+        # Qwen3.5 linear_attn resets recurrent state at cu_seq_lens_q and stops the short conv at
+        # seq_idx. Neither is derived from position_ids. Install once; the helper no-ops without
+        # linear_attn and when the hook is already present.
+        hf_model = getattr(engine, "module", engine)
+        if hasattr(hf_model, "register_forward_pre_hook"):
+            from arctic_platform.common.utils.packed_gdn import install_packed_gdn_boundaries
+
+            install_packed_gdn_boundaries(hf_model)
     pr0(
         f"run_sft_pipeline: {model_kwargs['input_ids'].shape=} {backward=} "
         f"{loss_fn_name=} {packed=} {logits_opt=} keys={sorted(model_kwargs)}"

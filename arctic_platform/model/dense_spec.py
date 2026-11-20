@@ -89,6 +89,8 @@ def dense_model_spec(
         }
     tiled_mlp_token_chunk_size = training_options.get("tiled_mlp_token_chunk_size")
     tiled_mlp = {"token_chunk_size": tiled_mlp_token_chunk_size} if tiled_mlp_token_chunk_size is not None else None
+    tiled_remat_token_budget = training_options.get("tiled_remat_token_budget")
+    tiled_remat = {"token_budget": tiled_remat_token_budget} if tiled_remat_token_budget is not None else None
     return ModelSpec(
         model_path_or_name=model_path,
         dtype=dtype,
@@ -101,6 +103,7 @@ def dense_model_spec(
             activation_offload=activation_offload,
             compile=training_options.get("compile"),
             tiled_mlp=tiled_mlp,
+            tiled_remat=tiled_remat,
             lm_head=lm_head,
             peft=training_options.get("peft_config"),
             **({"zorro_train": zorro_train} if zorro_train is not None else {}),
