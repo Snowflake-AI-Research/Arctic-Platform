@@ -325,10 +325,12 @@ class NemotronHMoELayer(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         cu_seqlens: torch.LongTensor | None = None,
         max_seqlen: int | None = None,
+        routed_experts: torch.LongTensor | None = None,
     ) -> torch.Tensor:
+        """``routed_experts``: this layer's replayed experts, ``(batch, seq, num_experts_per_tok)``."""
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, routed_experts=routed_experts)
         return residual + hidden_states
 
 
@@ -574,7 +576,13 @@ class NemotronHModel(NemotronHPreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        routed_experts: Optional[torch.LongTensor] = None,
     ) -> BaseModelOutputWithPast:
+        """
+        routed_experts (`torch.LongTensor` of shape `(batch_size, sequence_length, num_hidden_layers, num_experts_per_tok)`, *optional*):
+            Routed experts for each token in the sequence, indexed by the absolute layer index as vLLM captures them
+            (only the MoE layers' slices are read). Only used for router replay.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -592,12 +600,22 @@ class NemotronHModel(NemotronHPreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids) if self.rotary_emb is not None else None
 
-        for decoder_layer in self.layers:
+        if routed_experts is not None and routed_experts.shape[2] != len(self.layers):
+            raise ValueError(
+                f"routed_experts holds {routed_experts.shape[2]} layers, the model {len(self.layers)}: the captured "
+                "routing must index every decoder layer, as vLLM's routed-experts capture does"
+            )
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            # Only the MoE layers route; the others take no routed_experts.
+            layer_kwargs = {}
+            if routed_experts is not None and self.config.layers_block_type[layer_idx] == "moe":
+                layer_kwargs["routed_experts"] = routed_experts[:, :, layer_idx, :]
             hidden_states = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                **layer_kwargs,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -626,8 +644,13 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         logits_to_keep: int = 0,
         temperature: Optional[torch.Tensor] = None,
+        routed_experts: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> PrimeLmOutput:
+        r"""
+        routed_experts (`torch.LongTensor` of shape `(batch_size, sequence_length, num_hidden_layers, num_experts_per_tok)`, *optional*):
+            Routed experts for each token in the sequence. Only used for router replay.
+        """
         if position_ids is None:
             if inputs_embeds is not None:
                 position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
@@ -639,6 +662,7 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
+            routed_experts=routed_experts,
         )
 
         hidden_states = outputs.last_hidden_state

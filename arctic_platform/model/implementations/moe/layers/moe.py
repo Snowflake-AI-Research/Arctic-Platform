@@ -1567,9 +1567,37 @@ class NemotronHRouter(nn.Module):
         self.norm_topk_prob = norm_topk_prob
 
     def forward(
-        self, x: torch.Tensor, expert_bias: torch.Tensor | None = None
+        self, x: torch.Tensor, expert_bias: torch.Tensor | None = None, routed_experts: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``routed_experts`` (``[tokens, top_k]``, router replay): select exactly these experts, weighted by this
+        gate's own unbiased scores, as vLLM weights the experts it picked (vllm model_executor/layers/fused_moe/router/
+        grouped_topk_router.py:148-158). Without it the gate selects by ``scores + e_score_correction_bias`` (+
+        ``expert_bias``)."""
+        assert routed_experts is None or routed_experts.shape[-1] == self.top_k, (
+            f"routed_experts shape: {tuple(routed_experts.shape)}, top_k: {self.top_k}"
+        )
         scores = F.linear(x.float(), self.gate.float()).sigmoid()
+        if routed_experts is not None:
+            selected_experts_indices = routed_experts
+        else:
+            selected_experts_indices = self._select(scores, expert_bias)
+        top_scores = scores.gather(1, selected_experts_indices)
+
+        if self.norm_topk_prob:
+            denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
+            top_scores = top_scores / denominator
+
+        # Counted with integers: CUDA has no deterministic histc for floating-point input, so a float histc stopped
+        # every Nemotron-H step under torch.use_deterministic_algorithms. bincount over the expert ids gives the same
+        # counts on CPU and CUDA, kept in float32 like histc's.
+        num_tokens_per_expert = torch.bincount(
+            selected_experts_indices.reshape(-1), minlength=self.num_experts
+        ).to(torch.float32)
+
+        return top_scores, selected_experts_indices, num_tokens_per_expert
+
+    def _select(self, scores: torch.Tensor, expert_bias: torch.Tensor | None) -> torch.Tensor:
+        """The gate's own top-k: by ``scores + e_score_correction_bias`` (+ ``expert_bias``), within the top groups."""
         scores_for_choice = scores + self.e_score_correction_bias
 
         if expert_bias is not None:
@@ -1592,21 +1620,7 @@ class NemotronHRouter(nn.Module):
             )
             scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
 
-        selected_experts_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
-        top_scores = scores.gather(1, selected_experts_indices)
-
-        if self.norm_topk_prob:
-            denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
-            top_scores = top_scores / denominator
-
-        # Counted with integers: CUDA has no deterministic histc for floating-point input, so a float histc stopped
-        # every Nemotron-H step under torch.use_deterministic_algorithms. bincount over the expert ids gives the same
-        # counts on CPU and CUDA, kept in float32 like histc's.
-        num_tokens_per_expert = torch.bincount(
-            selected_experts_indices.reshape(-1), minlength=self.num_experts
-        ).to(torch.float32)
-
-        return top_scores, selected_experts_indices, num_tokens_per_expert
+        return torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
 
     def init_weights(self, init_std: float):
         nn.init.trunc_normal_(self.gate, mean=0.0, std=init_std)
@@ -1844,10 +1858,17 @@ class LatentMoE(nn.Module):
         return shared_output + routed_output
 
     def forward(self, x: torch.Tensor, routed_experts: torch.Tensor | None = None) -> torch.Tensor:
+        """``routed_experts`` (``(bs, slen, top_k)``, router replay): the experts each token runs, as the sampler
+        picked them; the router weights them by its own scores."""
         bs, slen, dim = x.shape
         x_flat = x.view(-1, dim)
+        if routed_experts is not None:
+            # The layer's slice of the [bs, slen, layers, top_k] capture is not contiguous.
+            routed_experts = routed_experts.reshape(-1, routed_experts.shape[-1])
 
-        top_scores, selected_experts_indices, num_tokens_per_expert = self.router(x_flat, self.expert_bias)
+        top_scores, selected_experts_indices, num_tokens_per_expert = self.router(
+            x_flat, self.expert_bias, routed_experts=routed_experts
+        )
 
         with torch.no_grad():
             self.tokens_per_expert.add_(num_tokens_per_expert)
