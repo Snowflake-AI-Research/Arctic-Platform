@@ -16,11 +16,11 @@
 """A missing trainer log-prob is counted at policy positions and excluded from policy math."""
 
 import math
+from unittest import TestCase
 
 import torch
 
 from arctic_platform.rl.processors import resolve_loss
-from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import torch_assert_close
 from arctic_platform.testing_utils import torch_assert_equal
 
@@ -40,7 +40,7 @@ def run_loss(logprobs, mask, config, *, name="grpo", **context):
     return loss.detach(), values.grad, metrics
 
 
-class TestGrpoNonfiniteLogprobs(TestCasePlus):
+class TestGrpoNonfiniteLogprobs(TestCase):
     def test_policy_metrics_and_gradient_match_an_explicit_mask(self):
         cispo = {"use_cispo_loss": True, "is_weight_clip_max": 5.0, "ratio_mask_bounds_pos": [0.2, 5.0]}
         global_scale = {**cispo, "batch_num_tokens": 2, "dp_size": 1}
