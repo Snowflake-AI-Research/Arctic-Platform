@@ -171,6 +171,67 @@ def _model_in_mode(mode: str, dtype: torch.dtype = torch.bfloat16) -> nn.Module:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "loader_options",
+    [{}, {"fp32_parity": False}, {"fp32_residual": True}],
+    ids=["fp32-parity", "stock-residuals", "fp32-residuals"],
+)
+def test_shared_loader_numerics_matches_previous_composition_and_real_load(tmp_path, loader_options):
+    from arctic_platform.model.loaders.huggingface import HuggingfaceOptions
+    from arctic_platform.model.loaders.huggingface import apply_loader_numerics
+    from arctic_platform.model.loaders.huggingface import load_huggingface
+
+    options = HuggingfaceOptions.model_validate(loader_options)
+    _tiny_model().save_pretrained(tmp_path)
+    # Reload the baseline too: from_pretrained reconstructs nonpersistent rotary buffers in fp32.
+    expected = modeling_qwen3_5.Qwen3_5ForCausalLM.from_pretrained(
+        tmp_path, dtype=torch.bfloat16, attn_implementation="sdpa"
+    ).train()
+    direct = copy.deepcopy(expected)
+    _rounded_norms(expected)
+    if options.fp32_parity:
+        _patched(expected, fp32_residual=options.fp32_residual)
+    apply_loader_numerics(direct, options, sequence_parallel=False)
+    # Applying the public composition twice must not accumulate forward wrappers or change parameter names.
+    apply_loader_numerics(direct, options, sequence_parallel=False)
+    loaded = load_huggingface(
+        LoaderContext(
+            spec=ModelSpec(
+                model_path_or_name=str(tmp_path),
+                loader="huggingface",
+                dtype="bfloat16",
+                attn_implementation="sdpa",
+                loader_options=loader_options,
+            )
+        )
+    ).model.train()
+    expected_output, expected_grads = _forward_backward(expected)
+    for model in (direct, loaded):
+        assert model.state_dict().keys() == expected.state_dict().keys()
+        for name, tensor in model.state_dict().items():
+            torch_assert_equal(tensor, expected.state_dict()[name], msg=name)
+        output, grads = _forward_backward(model)
+        _assert_same_run(output, grads, expected_output, expected_grads)
+
+
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_shared_loader_numerics_passes_sequence_parallel_policy(monkeypatch, sequence_parallel):
+    from arctic_platform.model.loaders.huggingface import HuggingfaceOptions
+    from arctic_platform.model.loaders.huggingface import apply_loader_numerics
+
+    calls = []
+    native = hf_dense_parity.apply_fp32_parity
+
+    def record(model, **kwargs):
+        calls.append(kwargs)
+        return native(model, **kwargs)
+
+    monkeypatch.setattr(hf_dense_parity, "apply_fp32_parity", record)
+    model = _tiny_model()
+    apply_loader_numerics(model, HuggingfaceOptions(fp32_residual=True), sequence_parallel=sequence_parallel)
+    assert calls == [{"sequence_parallel": sequence_parallel, "fp32_residual": True}]
+
+
 def test_stock_source_is_the_verified_source():
     # The source hashes are the contract; any transformers release whose source matches passes.
     hf_dense_parity.check_stock_classes()

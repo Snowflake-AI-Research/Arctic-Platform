@@ -18,6 +18,7 @@ Run from the package directory::
 from __future__ import annotations
 
 import ast
+import dataclasses
 import enum
 import os
 import queue
@@ -80,6 +81,15 @@ class _ShutdownState(enum.IntEnum):
     REQUESTED = 1
 
 
+@dataclasses.dataclass
+class _ZmqAddresses:
+    inputs: list
+    outputs: list
+    coordinator_input: str | None = None
+    coordinator_output: str | None = None
+    frontend_stats_publish_address: str | None = None
+
+
 class _FakeEngineCoreProc:
     """Stands in for ``EngineCoreProc``: socket threads that just record."""
 
@@ -87,6 +97,8 @@ class _FakeEngineCoreProc:
 
     def process_input_sockets(self, addresses, coord, identity, ready):
         self.socket_calls.append(("input", list(addresses), coord, identity))
+        # vLLM 0.33's ready response reads these before setting ready.
+        self.addresses.coordinator_input, self.addresses.coordinator_output
         if not self.fail_input_thread:
             ready.set()
 
@@ -101,10 +113,13 @@ def fake_vllm(monkeypatch):
     core = types.ModuleType("vllm.v1.engine.core")
     core.EngineCoreProc = _FakeEngineCoreProc
     core.EngineShutdownState = _ShutdownState
+    utils = types.ModuleType("vllm.v1.engine.utils")
+    utils.EngineZmqAddresses = _ZmqAddresses
     for name, mod in (("vllm", types.ModuleType("vllm")),
                       ("vllm.v1", types.ModuleType("vllm.v1")),
                       ("vllm.v1.engine", engine),
-                      ("vllm.v1.engine.core", core)):
+                      ("vllm.v1.engine.core", core),
+                      ("vllm.v1.engine.utils", utils)):
         monkeypatch.setitem(sys.modules, name, mod)
     _FakeEngineCoreProc.fail_input_thread = False
     return core
@@ -202,6 +217,9 @@ def test_serve_core_swaps_class_and_sets_proc_state(child, fake_vllm):
     assert core.last_counts == (0, 0)
     assert core.process_input_queue_block is False
     assert core.enable_fault_tolerance is False
+    assert core.reject_new_requests is False
+    assert core.addresses == _ZmqAddresses(inputs=["ipc:///tmp/in"],
+                                           outputs=["ipc:///tmp/out"])
     assert summary == child["_semip_core_summary"](core.vllm_config)
 
     core.output_thread.join(timeout=5)
@@ -209,6 +227,39 @@ def test_serve_core_swaps_class_and_sets_proc_state(child, fake_vllm):
         ("input", ["ipc:///tmp/in"], None, b"\x00\x00"),
         ("output", ["ipc:///tmp/out"], None, 0),
     ]
+
+
+def _self_assigns(fn):
+    out = set()
+    for n in ast.walk(fn):
+        targets = (n.targets if isinstance(n, ast.Assign)
+                   else [n.target] if isinstance(n, (ast.AnnAssign, ast.AugAssign))
+                   else [])
+        for t in targets:
+            for a in ast.walk(t):
+                if (isinstance(a, ast.Attribute) and isinstance(a.value, ast.Name)
+                        and a.value.id == "self"):
+                    out.add(a.attr)
+    return out
+
+
+def test_serve_core_sets_every_field_the_installed_engine_core_proc_does():
+    vllm_core = pytest.importorskip("vllm.v1.engine.core")
+    import inspect
+    import textwrap
+    init = ast.parse(textwrap.dedent(
+        inspect.getsource(vllm_core.EngineCoreProc.__init__))).body[0]
+    serve = next(n for n in _tree().body
+                 if isinstance(n, ast.FunctionDef) and n.name == "_semip_serve_core")
+    ours = {t.attr for n in ast.walk(serve) if isinstance(n, ast.Assign)
+            for t in n.targets
+            if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
+            and t.value.id == "core"}
+    # ft_sentinel exists only with fault tolerance, which serve_core turns off.
+    missing = _self_assigns(init) - ours - {"ft_sentinel"}
+    assert not missing, (
+        f"EngineCoreProc.__init__ sets {sorted(missing)}, which _semip_serve_core "
+        "does not; the restored core raises AttributeError when vLLM reads them")
 
 
 def test_executor_failure_reaches_the_input_queue(child, fake_vllm):

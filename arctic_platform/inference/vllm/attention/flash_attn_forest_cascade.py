@@ -18,8 +18,8 @@ import vllm.envs as envs
 from vllm.model_executor.layers.attention import Attention
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
-    is_quantized_kv_cache,
 )
+from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
