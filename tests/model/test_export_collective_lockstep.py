@@ -173,12 +173,13 @@ def test_vllm_export_skips_expert_groups_without_the_master(monkeypatch, events,
     else:
         qwen35 = pytest.importorskip("arctic_platform.model.implementations.qwen35.deepspeed_integration")
         build, cls = qwen35._build_iter_full_vllm_weights, Qwen3_5MoeForExportTest
-    _set_rank(monkeypatch, 2)
-    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [2, 3])
+    model = _model((4, 2), (3, 2), cls=cls)
+    _set_rank(monkeypatch, 1)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 4 if group is None else 2)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [1, 3])
+    monkeypatch.setattr(torch, "empty_like", lambda tensor: pytest.fail("allocated an unused expert shard"))
 
-    assert list(build(_model((4, 2), (3, 2), cls=cls))()) == []
-
-    # Only rank 0 consumes the export, so a replica group without it runs no collective.
+    assert list(build(model)()) == []
     assert events == []
 
 
