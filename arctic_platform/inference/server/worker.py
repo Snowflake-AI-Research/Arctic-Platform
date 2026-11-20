@@ -1816,8 +1816,9 @@ class InferenceWorker(StreamingWorkerMixin):
 
         When ``envs.ARCTIC_INFERENCE_DUMP_PARAM_L2`` is set (opt-in, default off),
         each TP rank's full-model and loaded-destination L2 maps are gathered
-        here (only rank 0's dict escapes ``collective_rpc``). Mapping and skip
-        artifacts remain on the rank-0 result for TP1 trace validation.
+        here. Every rank's ``recv_l2_sq`` is returned as ``rank_recv_l2_sq``.
+        Mapping and skip artifacts remain on the rank-0 result for TP1 trace
+        validation.
         """
         results = await self.llm.collective_rpc(
             "sync_weights_broadcast",
@@ -1828,10 +1829,10 @@ class InferenceWorker(StreamingWorkerMixin):
             return {}
         from arctic_platform.inference import envs
         if not envs.ARCTIC_INFERENCE_DUMP_PARAM_L2:
-            return results[0]
+            return _with_rank_recv_l2_sq(results)
         # Verification path only: preserve the original full-model trace and
         # gather the loaded-only trace under a distinct field.
-        head = dict(results[0])
+        head = _with_rank_recv_l2_sq(results)
         head["all_rank_param_l2"] = [
             (r.get("param_l2") if isinstance(r, dict) else None) for r in results
         ]

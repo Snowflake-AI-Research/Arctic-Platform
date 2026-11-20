@@ -427,6 +427,7 @@ def _worker_load(method: str, rank_results: list[dict], *args) -> dict:
         ("load_weights_cuda_ipc", ({},)),
         ("load_weights_cuda_ipc_chunk", ({}, None)),
         ("load_weights_from_shm_path", ("/dev/shm/x",)),
+        ("sync_weights_broadcast", ("localhost", 12345, 1, 3)),
     ],
 )
 def test_worker_reports_every_tp_ranks_received_checksum(method, args):
