@@ -15,8 +15,8 @@
 
 """Profile of the default ``huggingface`` loader.
 
-Its options are ``Patches`` and ``ModelSpec`` fields, and the loader's own ``loader_options.fp32_parity`` and
-``loader_options.fp32_residual``.
+Its options are ``Patches`` and ``ModelSpec`` fields, and the loader's own ``loader_options.fp32_parity``,
+``loader_options.fp32_residual`` and ``loader_options.vllm_aligned``.
 
 The loader reads ``ModelSpec.dtype`` too, but ``numerics.optimization_dtype`` is unsupported here: on this route
 the job sets that dtype, and the key would have no effect.
@@ -32,6 +32,9 @@ beta gate.
 ``numerics.fp32_residual`` maps to ``loader_options.fp32_residual``, which is off by default, experimental, and
 accepted only with ``fp32_parity`` on. It keeps the residual stream of the patched dense forward in fp32 between
 decoder layers, so under full activation checkpointing each boundary after the first holds an fp32 residual.
+
+``numerics.vllm_aligned`` maps to ``loader_options.vllm_aligned``, which is off by default and experimental. It runs
+the dense Qwen3 family through vLLM's batch-invariant kernels, so its logprobs equal a matching sampler's bitwise.
 """
 
 from __future__ import annotations
@@ -53,6 +56,7 @@ def register(registry: Registry) -> None:
             "lm_head.vocab_chunk_size",
             "numerics.fp32_parity",
             "numerics.fp32_residual",
+            "numerics.vllm_aligned",
             "liger",
             "attention.backend",
             "compile.fullgraph",

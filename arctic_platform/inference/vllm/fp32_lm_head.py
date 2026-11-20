@@ -58,6 +58,7 @@ import os
 from dataclasses import dataclass
 
 import torch
+from vllm import envs
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -130,6 +131,12 @@ def _fp32_linear(
     """
     if (hidden_states.is_cuda and hidden_states.dtype == weight.dtype
             and weight.dtype in (torch.bfloat16, torch.float16)):
+        if bias is None and envs.VLLM_BATCH_INVARIANT:
+            # cuBLAS picks its algorithm by batch size, which batch-invariant
+            # mode does not override for an fp32 output.
+            from arctic_platform.inference.vllm.batch_invariant_fp32_logits import linear_fp32_out
+
+            return linear_fp32_out(hidden_states, weight)
         # An on-the-fly fp32 weight is 4 * vocab * hidden / TP bytes per call.
         logits = torch.mm(hidden_states.reshape(-1, hidden_states.shape[-1]),
                           weight.t(), out_dtype=torch.float32)

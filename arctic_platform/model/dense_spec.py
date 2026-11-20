@@ -26,7 +26,13 @@ from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.config import ParallelismConfig
 from arctic_platform.model.config import Patches
 
-_LOADER_OPTION_KEYS_IN_TRAINING = ("fp32_parity", "fp32_residual")
+_LOADER_OPTION_KEYS_IN_TRAINING = (
+    "fp32_parity",
+    "fp32_residual",
+    "vllm_aligned",
+    "vllm_aligned_tensor_parallel",
+    "vllm_aligned_prefill_chunk",
+)
 _ZORRO_TRAIN_KEYS = (
     "response_len",
     "max_token_len",
@@ -122,8 +128,8 @@ def ds_worker_dense_model_spec(
 
     Only the flat config's own names are mapped here: gradient checkpointing is
     ``enable_gradient_checkpointing`` and defaults on, Liger is either
-    ``model_provider="liger"`` or ``use_liger``, ``fp32_parity`` and
-    ``fp32_residual`` are loader options, and ``zorro_train_enable`` selects the
+    ``model_provider="liger"`` or ``use_liger``, ``fp32_parity``,
+    ``fp32_residual`` and ``vllm_aligned`` are loader options, and ``zorro_train_enable`` selects the
     ZoRRo Train keys.
     """
     cfg = ds_worker_config or {}
