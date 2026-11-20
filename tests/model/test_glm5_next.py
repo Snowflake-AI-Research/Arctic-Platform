@@ -724,6 +724,196 @@ def test_glm53_nope_sparse_mla_matches_reference_through_the_kernels():
     assert rel(kv.grad[:, :keys], kv_ref.grad[:, :keys]) < 1e-2
 
 
+def _auxiliary_model(count=1):
+    model = torch.nn.Module()
+    model.config = _tiny_config()
+    text = model.config.text_config
+    text.num_hidden_layers = 2
+    text.num_nextn_predict_layers = count
+    text.layer_types = text.layer_types[-2:]
+    text.mlp_layer_types = text.mlp_layer_types[-2:]
+    text.indexer_types = text.indexer_types[-2:]
+    return model
+
+
+def _auxiliary_payload():
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    prefix = "model.language_model.layers.2."
+    names = auxiliary_weights._required_layer_names(_auxiliary_model().config, prefix, set())
+    tensors = {name: torch.ones(2, dtype=torch.bfloat16) for name in names}
+    tensors[prefix + "enorm.weight"] = torch.ones(4, dtype=torch.float32)
+    tensors[prefix + "mlp.experts.0.down_proj.weight"] = torch.ones(4, 4).to(torch.float8_e4m3fn)
+    tensors[prefix + "mlp.experts.0.down_proj.weight_scale_inv"] = torch.ones(1, 1, dtype=torch.float32)
+    return tensors
+
+
+def _auxiliary_checkpoint(tmp_path):
+    from safetensors.torch import save_file
+
+    prefix = "model.language_model.layers.2."
+    tensors = _auxiliary_payload()
+    tensors["model.language_model.layers.0.input_layernorm.weight"] = torch.zeros(4, dtype=torch.bfloat16)
+    save_file(tensors, tmp_path / "model-00001.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(tensors, "model-00001.safetensors")})
+    )
+    return {name: tensor for name, tensor in tensors.items() if name.startswith(prefix)}
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_glm53_capture_rejects_missing_non_auxiliary_prediction_tensor(tmp_path, monkeypatch, indexed):
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    tensors = _auxiliary_payload()
+    missing = "model.language_model.layers.2.self_attn.o_proj.weight"
+    assert missing in tensors
+    tensors.pop(missing)
+    save_file(tensors, tmp_path / "model.safetensors")
+    if indexed:
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(dict(weight_map=dict.fromkeys(tensors, "model.safetensors")))
+        )
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: False)
+    model = _auxiliary_model()
+    auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+    with pytest.raises(RuntimeError, match="incomplete.*o_proj"):
+        auxiliary_weights.validate_preserved_auxiliary_weights(model)
+
+
+def test_glm53_captures_auxiliary_mixed_dtypes_without_trainables(tmp_path, monkeypatch):
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    original = _auxiliary_checkpoint(tmp_path)
+    model = _auxiliary_model()
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.Tensor, "clone", lambda *args, **kwargs: pytest.fail("inactive layer cloned"))
+    auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+    records = getattr(model, auxiliary_weights.STATE_ATTRIBUTE)[2]
+    assert all(not isinstance(record, torch.Tensor) and not hasattr(record, "tensor") for record in records)
+    exported = dict(auxiliary_weights.iter_preserved_auxiliary_weights(model))
+    assert set(exported) == set(original)
+    assert not dict(model.named_parameters()) and not dict(model.named_buffers())
+    for name, value in exported.items():
+        assert value.dtype == original[name].dtype
+        torch_assert_equal(value.view(torch.uint8), original[name].view(torch.uint8))
+        assert value.device.type == "cpu"
+
+
+def test_glm53_auxiliary_capture_rejects_missing_and_changed_shards(tmp_path, monkeypatch):
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    _auxiliary_checkpoint(tmp_path)
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: False)
+    index = tmp_path / "model.safetensors.index.json"
+    mapping = json.loads(index.read_text())
+    mapping["weight_map"]["model.language_model.layers.2.enorm.weight"] = "missing.safetensors"
+    index.write_text(json.dumps(mapping))
+    model = _auxiliary_model()
+    auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+    with pytest.raises(RuntimeError, match="Cannot preserve"):
+        auxiliary_weights.validate_preserved_auxiliary_weights(model)
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_glm53_lazy_auxiliary_export_requires_immutable_source(tmp_path, monkeypatch, indexed):
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    original = _auxiliary_checkpoint(tmp_path)
+    index = tmp_path / "model.safetensors.index.json"
+    if not indexed:
+        index.rename(tmp_path / "unused-index.json")
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: False)
+    model = _auxiliary_model()
+    auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+    assert set(dict(auxiliary_weights.iter_preserved_auxiliary_weights(model))) == set(original)
+    shard = tmp_path / "model-00001.safetensors"
+    with shard.open("ab") as stream:
+        stream.write(b"changed")
+    with pytest.raises(RuntimeError, match="shard changed"):
+        list(auxiliary_weights.iter_preserved_auxiliary_weights(model))
+
+
+def test_glm53_auxiliary_source_failure_reaches_peers(tmp_path, monkeypatch):
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    observed = []
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(auxiliary_weights.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(auxiliary_weights.dist, "broadcast_object_list", lambda value, src: observed.append(value[0]))
+    model = _auxiliary_model()
+    auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+    with pytest.raises(RuntimeError, match="Cannot preserve"):
+        auxiliary_weights.validate_preserved_auxiliary_weights(model)
+    assert observed and observed[0] is not None
+
+
+def test_glm53_auxiliary_capture_nonmaster_never_opens_source(tmp_path, monkeypatch):
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+
+    model = _auxiliary_model()
+    monkeypatch.setattr(auxiliary_weights.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(auxiliary_weights.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(auxiliary_weights.dist, "broadcast_object_list", lambda value, src: None)
+    monkeypatch.setattr(auxiliary_weights, "_capture", lambda *args: pytest.fail("nonmaster read"))
+    auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+    assert not hasattr(model, auxiliary_weights.STATE_ATTRIBUTE)
+
+
+@pytest.mark.parametrize("include_skipped,rank", [(False, 0), (True, 0), (True, 1)])
+def test_glm53_full_hf_export_auxiliary_scope(monkeypatch, include_skipped, rank):
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm
+
+    model = _auxiliary_model()
+    ordinary = torch.ones(4)
+    auxiliary = torch.ones(4, dtype=torch.bfloat16)
+    monkeypatch.setattr(
+        glm.qwen_ds,
+        "_build_iter_full_hf_weights",
+        lambda model: lambda **kwargs: iter([("trained.weight", ordinary)]),
+    )
+    monkeypatch.setattr(glm.torch.distributed, "get_rank", lambda: rank)
+    monkeypatch.setattr(glm.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(glm.torch.distributed, "broadcast_object_list", lambda value, src: None)
+    monkeypatch.setattr(glm, "iter_preserved_auxiliary_weights", lambda model: iter([("inactive.weight", auxiliary)]))
+    monkeypatch.setattr(glm, "validate_preserved_auxiliary_weights", lambda model: None)
+    exported = dict(glm._build_iter_full_hf_weights_with_auxiliary(model)(include_skipped=include_skipped))
+    assert exported["trained.weight"] is ordinary
+    assert ("inactive.weight" in exported) == (include_skipped and rank == 0)
+    assert glm._adapter().hf_weight_export is glm._build_iter_full_hf_weights_with_auxiliary
+
+
+def test_glm53_full_hf_export_rejects_live_auxiliary_collision(monkeypatch):
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm
+
+    value = torch.ones(4)
+
+    def ordinary(**kwargs):
+        yield "trained.weight", value
+        yield "inactive.weight", value
+
+    ordinary.weight_names = lambda **kwargs: frozenset({"trained.weight", "inactive.weight"})
+    monkeypatch.setattr(glm.qwen_ds, "_build_iter_full_hf_weights", lambda model: ordinary)
+    monkeypatch.setattr(glm.torch.distributed, "get_rank", lambda: 0)
+    sidecar_reads = []
+
+    def sidecar(model):
+        sidecar_reads.append(model)
+        yield "inactive.weight", value
+
+    monkeypatch.setattr(glm, "iter_preserved_auxiliary_weights", sidecar)
+    monkeypatch.setattr(glm, "validate_preserved_auxiliary_weights", lambda model: None)
+    monkeypatch.setattr(glm, "preserved_auxiliary_names", lambda model: ("inactive.weight",))
+    yielded = []
+    with pytest.raises(RuntimeError, match="collides"):
+        for name, tensor in glm._build_iter_full_hf_weights_with_auxiliary(_auxiliary_model())(include_skipped=True):
+            yielded.append(name)
+    assert yielded == []
+    assert sidecar_reads == []
+
+
 @pytest.mark.parametrize("suffix", ["", ".weight"])
 def test_glm53_packed_hf_experts_convert_without_losing_weights(suffix):
     prefix = "model.language_model.layers.3.mlp"

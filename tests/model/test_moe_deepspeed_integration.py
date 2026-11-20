@@ -352,6 +352,7 @@ def test_hf_export_delegates_only_master_replica_to_cpu_gather(monkeypatch, rank
     monkeypatch.setitem(sys.modules, "deepspeed", deepspeed_module)
     monkeypatch.setitem(sys.modules, "deepspeed.utils", utils_module)
     monkeypatch.setitem(sys.modules, "deepspeed.utils.groups", groups_module)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
     monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda ep_group: group_ranks)
     calls = []
@@ -379,6 +380,62 @@ def test_hf_export_delegates_only_master_replica_to_cpu_gather(monkeypatch, rank
     assert ep_group is group
     assert is_master is True
     assert max_gather_bytes == 64 * 1024 * 1024
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("skip_owner", ["parameter", "module"])
+def test_hf_export_checkpoint_only_ep_weights_use_bounded_cpu_gather(monkeypatch, rank, skip_owner):
+    import deepspeed.utils.groups as groups
+
+    class ExportableModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.expert = nn.Parameter(torch.arange(6, dtype=torch.float32).reshape(2, 3))
+            self.expert.group_name = "ep_size_2"
+            self.expert.allreduce = False
+            owner = self.expert if skip_owner == "parameter" else self
+            owner._dss_skip_weight_sync = True
+
+        @staticmethod
+        def convert_layer_to_hf(layer_state, layer_index):
+            return layer_state
+
+    group = object()
+    monkeypatch.setattr(groups, "_get_expert_parallel_group", lambda name: group)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda ep_group: [0, 1])
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    calls = []
+
+    def gather(local, outputs, *, dst, group):
+        calls.append(local.numel())
+        assert dst == 0
+        if rank == 0:
+            assert len(outputs) == 2
+            for output in outputs:
+                output.copy_(local)
+        else:
+            assert outputs is None
+
+    monkeypatch.setattr(torch.distributed, "gather", gather)
+    monkeypatch.setattr(
+        common,
+        "_gather_ep_weight_to_cpu",
+        lambda *args, **kwargs: pytest.fail("checkpoint-only weights must use the rank-0 gather"),
+    )
+    model = ExportableModel()
+    exporter = common.build_iter_full_hf_weights(model)
+    assert dict(exporter()) == {}
+    assert calls == []
+    exported = dict(exporter(include_skipped=True))
+    assert calls
+    if rank == 0:
+        assert set(exported) == {"expert"}
+        assert exported["expert"].device.type == "cpu"
+        assert torch.equal(exported["expert"], torch.cat([model.expert.detach()] * 2))
+    else:
+        assert exported == {}
 
 
 def _gloo_ep_weight_gather_worker(rank, world_size, init_method):
