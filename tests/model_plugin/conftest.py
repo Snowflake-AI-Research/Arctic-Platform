@@ -26,6 +26,14 @@ OLMO2_PLUGIN_ROOT = EXAMPLES / "olmo2"
 OLMOE_PLUGIN_ROOT = EXAMPLES / "olmoe"
 LFM2_PLUGIN_ROOT = EXAMPLES / "lfm2"
 GPT_OSS_PLUGIN_ROOT = EXAMPLES / "gpt_oss"
+# Every example plugin, by name: its 'module:attribute' target and its source root.
+EXAMPLES = {
+    "olmo2": ("olmo2_plugin:PLUGIN", OLMO2_PLUGIN_ROOT),
+    "olmoe": ("olmoe_plugin:PLUGIN", OLMOE_PLUGIN_ROOT),
+    "lfm2": ("lfm2_plugin:PLUGIN", LFM2_PLUGIN_ROOT),
+    "gpt_oss": ("gpt_oss_plugin:PLUGIN", GPT_OSS_PLUGIN_ROOT),
+    "toy_hybrid_moe": ("toy_hybrid_moe:PLUGIN", TOY_PLUGIN_ROOT),
+}
 for root in (TOY_PLUGIN_ROOT, OLMO2_PLUGIN_ROOT, OLMOE_PLUGIN_ROOT, LFM2_PLUGIN_ROOT, GPT_OSS_PLUGIN_ROOT):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))

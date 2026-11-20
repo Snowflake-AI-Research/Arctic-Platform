@@ -29,6 +29,7 @@ import ast
 import copy
 import importlib.util
 import json
+import os
 import re
 import sys
 import tempfile
@@ -770,6 +771,182 @@ def check_parallel(
         )
 
 
+TRAINING_LR = 1e-3
+
+
+def _training_batch(config: Any, spec: ConformanceSpec, replicas: int, step: int, device):
+    """Every data-parallel replica's packed rows for one step, packed together, with GRPO inputs drawn on CPU so
+    every rank draws the same: per-token advantages and a seed for the sampler's log-prob noise."""
+    rows = [
+        fixture_sequences(config, spec, offset=1000 * step + replica, device=device) for replica in range(replicas)
+    ]
+    lengths = [sum(len(sequence) for sequence in replica) for replica in rows]
+    input_ids, position_ids = pack_sequences([sequence for replica in rows for sequence in replica])
+    labels = next_token_labels(input_ids, position_ids)
+    generator = torch.Generator().manual_seed(spec.seed + 31 * step)
+    advantages = torch.randn(labels.shape, generator=generator).to(device)
+    noise = 0.01 * torch.randn(labels.shape, generator=generator).to(device)
+    return input_ids, position_ids, labels, advantages, noise, lengths
+
+
+def _grpo(logprobs, old, advantages, mask, num_tokens: int, dp_size: int, device):
+    from arctic_platform.rl.processors.grpo import grpo_loss
+
+    batch = dict(old_log_probs_shifted=old, advantages=advantages, loss_mask=mask)
+    config = dict(batch_num_tokens=num_tokens, dp_size=dp_size)
+    return grpo_loss(dict(logprobs=logprobs), batch, {}, config, str(device))[0]
+
+
+def _training_worker(
+    rank: int, world: int, sp: int, ep: int, steps: int, init_file: str, target: str, spec_json: str, path: list[str]
+) -> None:
+    sys.path[:] = path
+    import deepspeed
+    from deepspeed.utils import groups
+
+    from arctic_platform.model_plugin.deepspeed_engine import initialize_deepspeed
+
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE=str(world))  # DeepSpeed reads them
+    deepspeed.init_distributed(
+        "nccl",
+        auto_mpi_discovery=False,
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world,
+        timeout=timedelta(seconds=300),
+    )
+    try:
+        plugin = load_plugin(target)
+        spec = ConformanceSpec.model_validate_json(spec_json)
+        atol = spec.tolerances.parallel
+        config, reference = build_fixture(plugin, spec, device)
+        model = copy.deepcopy(reference)
+        sp_group = None
+        for start in range(0, world, sp):  # every rank creates every group, in the same order
+            group = dist.new_group(list(range(start, start + sp)))
+            if start <= rank < start + sp:
+                sp_group = group
+        ep_group = None
+        if ep > 1:
+            groups._create_expert_and_data_parallel(ep)
+            ep_group = groups._get_expert_parallel_group(f"ep_size_{ep}")
+        binding = prepare_model(model, plugin, config, sp_group=sp_group if sp > 1 else None, ep_group=ep_group)
+        apply_activation_checkpointing(model)  # the production layout: recompute reruns the collectives
+        ds_config = dict(
+            train_micro_batch_size_per_gpu=1,
+            zero_optimization=dict(stage=1),
+            optimizer=dict(type="AdamW", params=dict(lr=TRAINING_LR, weight_decay=0.0, torch_adam=True)),
+            gradient_clipping=0.0,
+            zero_allow_untested_optimizer=True,
+        )
+        engine, *_ = initialize_deepspeed(model, binding, config=ds_config)
+        optimizer = torch.optim.AdamW(reference.parameters(), lr=TRAINING_LR, weight_decay=0.0)
+        replicas, replica = world // sp, rank // sp
+        local_sp = sp_group if sp > 1 else None
+        has_experts = len(binding.experts) > 0
+        for step in range(steps):
+            input_ids, position_ids, labels, advantages, noise, lengths = _training_batch(
+                config, spec, replicas, step, device
+            )
+            mask = labels != IGNORE_INDEX
+            num_tokens = int(mask.sum())
+
+            # The unsharded reference trains on every replica's rows at once. Its routing stands in for the
+            # sampler's: the sharded model replays it (router replay), so both route every token alike.
+            if has_experts:
+                hidden, routing = forward(reference, input_ids, position_ids, return_routing=True)
+            else:
+                hidden, routing = forward(reference, input_ids, position_ids), None
+            logprobs = token_logprobs(reference, hidden, labels, chunk_size=spec.logprob_chunk)
+            old = logprobs.detach() + noise  # the sampler's log-probs, slightly off the trainer's
+            reference_loss = _grpo(logprobs, old, advantages, mask, num_tokens, 1, device)
+            reference_loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # This rank's replica, sharded across its sequence-parallel group.
+            start, stop = sum(lengths[:replica]), sum(lengths[: replica + 1])
+            mine = slice(start, stop)
+            routed = None if routing is None else {layer: ids[mine] for layer, ids in routing.items()}
+            hidden = forward(
+                engine, input_ids[:, mine], position_ids[:, mine], sp_group=local_sp, routed_experts=routed
+            )
+            shard = partial(shard_sequence, group=local_sp)
+            logprobs = token_logprobs(engine.module, hidden, shard(labels[:, mine]), chunk_size=spec.logprob_chunk)
+            # DeepSpeed averages gradients over all ranks: the global token count and dp_size = world make the sum
+            # over ranks the reference's token mean.
+            loss = _grpo(
+                logprobs,
+                shard(old[:, mine]),
+                shard(advantages[:, mine]),
+                shard(mask[:, mine]),
+                num_tokens,
+                world,
+                device,
+            )
+            engine.backward(loss)
+            engine.step()
+
+            total = loss.detach().clone()
+            dist.all_reduce(total)
+            _assert_close(total / world, reference_loss.detach(), atol, f"step {step} loss")
+            ep_rank = groups._get_expert_parallel_rank(f"ep_size_{ep}") if ep > 1 else 0
+            expected = dict(reference.named_parameters())
+            for name, param in engine.module.named_parameters():
+                target_param = expected[name].detach()
+                if getattr(param, "allreduce", True) is False:  # this rank's block of experts
+                    per_rank = target_param.shape[0] // ep
+                    target_param = target_param[ep_rank * per_rank : (ep_rank + 1) * per_rank]
+                _assert_close(param.detach(), target_param, atol, f"rank {rank} {name} after step {step}")
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def check_rl_training(
+    plugin_target: str,
+    spec: ConformanceSpec,
+    sp: int,
+    ep: int = 1,
+    world: int = 4,
+    steps: int = 3,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> None:
+    """``steps`` GRPO steps under DeepSpeed (ZeRO-1, AdamW) on ``world`` GPUs, ``world / sp`` data-parallel
+    replicas of ``sp`` sequence-parallel ranks, with ``ep``-way expert parallelism and activation checkpointing,
+    replaying the unsharded model's routing. After every step the loss and every parameter must equal the same steps
+    of the unsharded model on all replicas' rows: optimizer state, gradient reduction over data, sequence and
+    expert-data parallelism, and router replay over several steps."""
+    try:
+        import deepspeed  # noqa: F401
+
+        from arctic_platform.rl.processors.grpo import grpo_loss  # noqa: F401
+    except ImportError as error:
+        raise TierSkipped(f"needs DeepSpeed and the platform's GRPO loss: {error}") from error
+    if torch.cuda.device_count() < world:
+        raise TierSkipped(f"needs {world} GPUs, found {torch.cuda.device_count()}")
+    if world % sp != 0 or world % ep != 0:
+        raise ValueError(f"world {world} must divide by sp {sp} and ep {ep}")
+    with tempfile.TemporaryDirectory() as directory:
+        spawn_ranks(
+            _training_worker,
+            args=(
+                world,
+                sp,
+                ep,
+                steps,
+                str(Path(directory) / "rendezvous"),
+                plugin_target,
+                spec.model_dump_json(),
+                list(sys.path),
+            ),
+            nprocs=world,
+            timeout=timeout,
+        )
+
+
 def _tiers(
     plugin_target: str,
     plugin: ModelPlugin,
@@ -804,6 +981,10 @@ def _tiers(
     if capabilities.sequence_parallel and capabilities.expert_parallel and has_experts:
         both = sorted(set(spec.sp_sizes) & set(spec.ep_sizes))
         tiers += [(f"sp{size}+ep{size}", partial(parallel, "sp+ep", size)) for size in both]
+    if torch.device(device).type == "cuda":
+        sp = spec.sp_sizes[0] if capabilities.sequence_parallel and spec.sp_sizes else 1
+        ep = spec.ep_sizes[0] if capabilities.expert_parallel and has_experts and spec.ep_sizes else 1
+        tiers.append(("rl_training", partial(check_rl_training, plugin_target, spec, sp, ep, timeout=timeout)))
     return tiers
 
 

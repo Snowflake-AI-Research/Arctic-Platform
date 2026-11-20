@@ -708,6 +708,9 @@ sequenceDiagram
     Note over S: load_weights(hf_name, tensor)<br/>→ your fused / sharded parameters
 ```
 
+After every weight sync the platform resets the sampler's prefix cache: cached prefixes hold keys, values and
+states computed with the old weights.
+
 With vLLM's built-in model for your architecture, the weight sync needs nothing from you: the trainer streams
 checkpoint names, which the built-in `load_weights` already loads (the OLMo-2 example). With your own vLLM model, its
 `load_weights` is the weight-sync entry point. It MUST accept full, unsharded Hugging Face-named
@@ -795,6 +798,7 @@ device, so allocate its tensors on the input's device.
 | RL step | A GRPO step (the platform's `grpo_loss`) on packed rows equals the same step on padded rows, for loss and every gradient | Masking and packing bugs in the training path |
 | router replay | Replaying captured routing reproduces logits exactly; all-`ROUTER_REPLAY_FRESH` does too; forcing other experts changes the output | A router that ignores replay |
 | SP, EP, SP+EP | On 2+ gloo ranks, sharded logits and every gradient equal the unsharded model's. Under EP, the exported weight stream equals the unsharded model's. SP+EP runs with activation checkpointing on. | Wrong head slicing, a missing or wrong halo, global vs local boundaries, wrong expert offsets, missing gradient paths, expert shards exported out of order, collectives that break under recompute |
+| RL training (`--device cuda`, 4 GPUs, DeepSpeed) | Three GRPO steps under DeepSpeed ZeRO-1 with AdamW, on two data-parallel replicas of `sp_sizes[0]` sequence-parallel ranks, with `ep_sizes[0]`-way expert parallelism, activation checkpointing and router replay: after every step the loss and every parameter equal the same steps of the unsharded model | Wrong gradient scaling across data, sequence and expert parallelism, optimizer state on sharded experts, router replay that drifts over steps |
 | weights directory (`--weights`) | Your real weights directory has a matching config, every tensor with the model's name and shape (checked on the meta device, so no GPU or full load), and a tokenizer that loads without remote code | Truncated or mismatched checkpoints, missing index shards, tokenizer problems |
 | sampler log-prob parity (GPU) | After a weight sync, sampler log-probs match trainer log-probs within the calibrated tolerance | Wrong vLLM name map, fused-shard order, sampler numerics |
 | real-weights step (GPU) | One training step on your real weights and declared profile, save, and reload | Memory and scale issues the tiny fixture hides |

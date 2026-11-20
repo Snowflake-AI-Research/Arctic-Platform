@@ -53,6 +53,10 @@ def validate(request, config: Lfm2Config, options: None) -> list[str]:
     reasons = []
     if config.conv_bias:
         reasons.append("conv_bias is not supported")
+    for name in ("conv_dim", "block_dim"):  # released checkpoints carry them; this model uses hidden_size for both
+        value = getattr(config, name, config.hidden_size)
+        if value != config.hidden_size:
+            reasons.append(f"{name} {value} differs from hidden_size {config.hidden_size}")
     rope_type = config.rope_parameters.get("rope_type", "default")
     if rope_type != "default":
         reasons.append(f"rope_type {rope_type!r} is not supported, only default rotary embedding")

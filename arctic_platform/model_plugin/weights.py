@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -182,7 +183,10 @@ def save_hf_checkpoint(
     max_shard_bytes: int | None = None,
 ) -> None:
     """Write ``config.json`` and safetensors under Hugging Face names, split into shards of at most
-    ``max_shard_bytes`` with a ``model.safetensors.index.json``, each stamped with the plugin that wrote it."""
+    ``max_shard_bytes`` with a ``model.safetensors.index.json``, each stamped with the plugin that wrote it.
+
+    ``config.json``'s ``architectures`` is the manifest's ``sampler.vllm_architecture``, which vLLM resolves the model
+    class from; a config built in code, rather than loaded from a checkpoint, has none."""
     from safetensors.torch import save_file
 
     weights = {
@@ -195,6 +199,10 @@ def save_hf_checkpoint(
     weights.update(_read_tensors(getattr(model, PASSTHROUGH_ATTR, {})))
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
+    sampler = plugin.manifest.sampler
+    if sampler is not None and not getattr(config, "architectures", None):
+        config = copy.copy(config)
+        config.architectures = [sampler.vllm_architecture]
     config.save_pretrained(path)
     stamp = checkpoint_stamp(plugin)
     shards = _shards(weights, max_shard_bytes)
