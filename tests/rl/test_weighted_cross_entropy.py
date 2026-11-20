@@ -452,7 +452,11 @@ class TestShardingWithRows(TestCasePlus):
         request = _request()
         frame = {
             "kwargs": {"input_ids": request["input_ids"], "attention_mask": request["attention_mask"]},
-            "context": {"loss_mask": request["loss_mask"], WEIGHTS_KEY: request["weights"]},
+            "context": {
+                "loss_mask": request["loss_mask"],
+                WEIGHTS_KEY: request["weights"],
+                "balance_batch": False,
+            },
             "processing": {"loss_fn": _LOSS, "post": ["compute_logprobs"], "config": {}},
         }
         shards, _ = ray_split_batch(frame, 2)

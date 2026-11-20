@@ -57,7 +57,7 @@ from arctic_platform.testing_utils import require_torch_multi_gpu
 from arctic_platform.testing_utils import torch_assert_close
 
 # Model + fake-data geometry this test owns and passes into the rl_harness builders. batch_size = num_unique_prompts
-# * rollout_n must exceed the training world size so the ZoRRO load balancer (reorg_global_batch) runs bin-packing.
+# * rollout_n must exceed the training world size so the ZoRRO load balancer (assign_balanced_batch) runs bin-packing.
 model_name = "Qwen/Qwen3-0.6B"
 attn_implementation = "flash_attention_2"
 num_unique_prompts = 2
@@ -144,7 +144,7 @@ class TestTrainEngine(TestCasePlus):
         the worker's per-microbatch loop (inter-microbatch ``engine.step()``, ``combine_metric_microbatches`` /
         ``merge_dict_shards``) that the single-microbatch ``test_train_engine`` cells never reach. The 8-row batch
         (4 prompt groups vs 2 ranks) also drives the ZoRRO load balancer's multi-group-per-bin packing
-        (``reorg_global_batch``). Asserts finite losses + a strictly-positive grad_norm.
+        (``assign_balanced_batch``). Asserts finite losses + a strictly-positive grad_norm.
         """
         skip_if_unsupported(training_gpus, sampling_gpus, log_prob_gpus)
         batch, _, _ = make_fake_batch(model_name, 4, rollout_n, prompt_len, response_len)
