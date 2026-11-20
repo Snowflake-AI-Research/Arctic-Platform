@@ -23,6 +23,8 @@ from transformers.models.glm5_next.modeling_glm5_next import Glm5NextForConditio
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextDecoderLayer
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextMoE
 
+from arctic_platform.inference.vllm.glm5next_indexer_replay import pool_rows
+from arctic_platform.inference.vllm.glm5next_indexer_replay import sparse_layers
 from arctic_platform.model.implementations.fp8 import BlockFp8Linear
 from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
@@ -134,6 +136,14 @@ class Glm5NextTextDecoderLayerPrimeRL(Glm5NextTextDecoderLayer):
                 **kwargs,
             )
         else:
+            if routed_experts is not None and routed_experts.shape[2] != self._replay_layers:
+                rows = self._indexer_pool_rows
+                if rows is None or routed_experts.shape[2] != self._replay_layers_with_pools:
+                    raise ValueError(
+                        f"routed_experts carries {routed_experts.shape[2]} rows per token; this model expects "
+                        f"{self._replay_layers}, or {self._replay_layers_with_pools} with sparse-attention selections"
+                    )
+                kwargs["indexer_pools"] = routed_experts[:, :, rows].flatten(2)
             hidden_states, _, topk_indices = self.self_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -171,10 +181,19 @@ class Glm5NextForConditionalGenerationPrimeRL(
         super().__init__(config)
         text_config = config.text_config
         fp32_parity = getattr(config, "fp32_parity", True)
+        sparse, rows, num_layers = sparse_layers(text_config), pool_rows(text_config), text_config.num_hidden_layers
         for layer_idx, layer in enumerate(self.model.language_model.layers):
             layer.__class__ = Glm5NextTextDecoderLayerPrimeRL
             layer._replay_layer_idx = layer_idx
             layer._fp32_parity = fp32_parity
+            # The sampler's selected pools ride the routed-experts capture past the decoder layers (see
+            # glm5next_indexer_replay); a capture without them leaves each layer to select for itself.
+            layer._replay_layers = num_layers
+            layer._replay_layers_with_pools = num_layers + len(sparse) * (rows or 0)
+            layer._indexer_pool_rows = None
+            if layer_idx in sparse and rows is not None:
+                first = num_layers + sparse.index(layer_idx) * rows
+                layer._indexer_pool_rows = slice(first, first + rows)
             if not isinstance(layer.mlp, Glm5NextTextMoE):
                 continue
             layer.mlp = MoE(
