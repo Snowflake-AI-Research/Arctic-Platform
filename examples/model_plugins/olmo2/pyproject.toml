@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "olmo2-plugin"
+version = "0.1.0"
+description = "Example Arctic Platform model plugin: OLMo-2, a dense model served by vLLM's built-in implementation"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+# Every dependency must already be in the plugin's runtime release; arctic_platform supplies torch and pydantic,
+# the runtime supplies transformers and vLLM.
+dependencies = []
+
+[project.entry-points."arctic_platform.model_plugins"]
+olmo2 = "olmo2_plugin:PLUGIN"
+
+[tool.hatch.build.targets.wheel]
+packages = ["olmo2_plugin"]

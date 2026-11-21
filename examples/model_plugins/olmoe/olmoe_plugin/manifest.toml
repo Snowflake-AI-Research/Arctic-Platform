@@ -1,0 +1,22 @@
+# OLMoE plugin manifest. The platform reads this before importing any plugin code.
+name = "custom/example/olmoe"
+version = "0.1.0"
+contract = "1.1"
+runtime_release = "runtime-2026.11"
+hf_model_types = ["olmoe"]
+
+[layer_types]
+full_attention = "platform:attention"   # every decoder layer; its MLP is the expert block
+
+[capabilities]
+training = true
+sampling = true
+packing = true
+sequence_parallel = true
+expert_parallel = true
+router_replay = true                    # the trainer replays the experts the sampler chose
+
+[sampler]
+vllm_architecture = "OlmoeForCausalLM"  # vLLM's built-in model; its fused MoE layer records routed experts
+tensor_parallel = true
+prefix_caching = true                   # required for router replay, and exact for attention-only models

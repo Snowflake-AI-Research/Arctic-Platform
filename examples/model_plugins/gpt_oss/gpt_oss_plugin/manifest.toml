@@ -1,0 +1,23 @@
+# gpt-oss plugin manifest. The platform reads this before importing any plugin code.
+name = "custom/example/gpt-oss"
+version = "0.1.0"
+contract = "1.1"
+runtime_release = "runtime-2026.11"
+hf_model_types = ["gpt_oss"]
+
+[layer_types]
+sliding_attention = "plugin"            # sink attention with a sliding window: GptOssAttention.mix, head-parallel
+full_attention = "plugin"               # the same core, unwindowed: the platform's attention core has no sinks
+
+[capabilities]
+training = true
+sampling = true
+packing = true
+sequence_parallel = true
+expert_parallel = true
+router_replay = true
+
+[sampler]
+vllm_architecture = "GptOssForCausalLM" # vLLM's built-in model; its fused MoE layer records routed experts
+tensor_parallel = true
+prefix_caching = true                   # required for router replay
