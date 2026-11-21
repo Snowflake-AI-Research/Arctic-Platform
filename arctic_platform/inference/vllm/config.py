@@ -152,6 +152,15 @@ def ensure_dflash_max_position_patch() -> None:
     SpeculativeConfig.__post_init__ = post_init
     SpeculativeConfigPatch._orig_post_init = post_init
 
+    # vLLM 0.32 can load the plugin after it receives an already constructed config.
+    if not hasattr(SpeculativeConfig, "needs_eagle_block_drop"):
+        original_drop = SpeculativeConfig.use_eagle_block_drop
+
+        def use_eagle_block_drop(self: SpeculativeConfig) -> bool:
+            return not self.use_dflash() and original_drop(self)
+
+        SpeculativeConfig.use_eagle_block_drop = use_eagle_block_drop
+
     from vllm.model_executor.layers.rotary_embedding import YaRNScalingRotaryEmbedding
     from vllm.model_executor.models import qwen3_dflash
 
