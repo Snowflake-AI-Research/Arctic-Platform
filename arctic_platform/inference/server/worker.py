@@ -11,6 +11,7 @@ import stat
 import sys
 import tempfile
 import time
+import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from enum import Enum
@@ -727,16 +728,17 @@ def _result_from_output(
     return result
 
 
-def _forced_route_blocks(vllm_config: Any) -> tuple[int, int]:
-    """(block size, blocks): how far below the end of its previous request a continuation's prefix-cache hit stops,
-    at most; speculative decoding that drops the trailing cached block adds one block."""
-    spec = vllm_config.speculative_config
-    return vllm_config.cache_config.block_size, 2 if spec is not None and spec.use_eagle_block_drop() else 1
+def _cached_prefix(cache_tx: Any, prefix_replay_id: str | None) -> Any:
+    if cache_tx is not None and prefix_replay_id is not None:
+        try:
+            return cache_tx.get(prefix_replay_id)
+        except KeyError:  # evicted or served by another replica
+            pass
+    return None
 
 
 def _forced_route_tail(prefix: Any, block_size: int, blocks: int) -> dict[str, Any]:
-    """The prefix capture's rows from the lowest block boundary the hit can stop at: fewer than
-    ``blocks * block_size`` rows, whatever the prefix length."""
+    """Send the trailing partial block and, when requested, the preceding block."""
     start = max(prefix.shape[0] // block_size - blocks + 1, 0) * block_size
     rows = prefix[start:].cpu().numpy()
     return {"start": start, "dtype": rows.dtype.str, "rows": rows.tobytes()}
@@ -911,7 +913,7 @@ class InferenceWorker(StreamingWorkerMixin):
         # Chat parsers for this engine's model; None when chat is unsupported.
         self._chat_model: ChatModel | None = None
         self._router_replay_tx: Any = None
-        self._forced_routes = False  # every engine worker can re-prefill under stored routes
+        self._forced_route_blocks: tuple[int, int] | None = None
         self._router_replay_tx_on_host = False
         self._router_replay_staging_bytes: int | None = None
         self._router_replay_group: Any = None
@@ -1293,8 +1295,9 @@ class InferenceWorker(StreamingWorkerMixin):
         return bool(parser.is_reasoning_end(prompt_ids))
 
     async def _init_forced_routes(self) -> None:
-        reasons = set(await self.llm.collective_rpc("forced_routes_unsupported")) - {None}
-        self._forced_routes = not reasons
+        workers = await self.llm.collective_rpc("forced_route_blocks")
+        reasons = {result for result in workers if isinstance(result, str)}
+        self._forced_route_blocks = None if reasons else tuple(workers[0])
         if reasons:
             logger.warning(
                 "Router replay: re-prefilled prefix positions keep the engine's own routes, as before, because %s",
@@ -1458,16 +1461,14 @@ class InferenceWorker(StreamingWorkerMixin):
             raise ValueError(f"{_REPLAY_ID_PARAM_KEY} requires {_SAMPLE_ID_PARAM_KEY}")
         if prefix_replay_id is not None and replay_id is None:
             raise ValueError(f"{_REPLAY_PREFIX_ID_PARAM_KEY} requires {_REPLAY_ID_PARAM_KEY}")
-        prefix = None
-        if prefix_replay_id is not None and self._router_replay_tx is not None:
-            try:
-                prefix = self._router_replay_tx.get(prefix_replay_id)
-            except KeyError:  # another replica served the earlier request, or the cache evicted it
-                pass
-        if prefix is not None and self._forced_routes:
-            # The engine re-prefills these positions under the stored routes, so the splice below keeps what it ran.
-            tail = _forced_route_tail(prefix, *_forced_route_blocks(self.llm.vllm_config))
-            sampling_params["extra_args"] = {**(sampling_params.get("extra_args") or {}), FORCED_ROUTES_KEY: tail}
+        submitted_prefix = None
+        if self._forced_route_blocks is not None:
+            prefix = _cached_prefix(self._router_replay_tx, prefix_replay_id)
+            if prefix is not None:
+                tail = _forced_route_tail(prefix, *self._forced_route_blocks)
+                sampling_params["extra_args"] = {**(sampling_params.get("extra_args") or {}), FORCED_ROUTES_KEY: tail}
+                submitted_prefix = weakref.ref(prefix)
+            del prefix  # TX eviction must free the full capture while the request is in flight.
         return_back_router_info = bool(
             sampling_params.pop(_ROUTER_REPLAY_RETURN_INFO_PARAM_KEY, False)
         )
@@ -1507,6 +1508,10 @@ class InferenceWorker(StreamingWorkerMixin):
             reasoning_ended=reasoning_ended,
             lora_request=self._active_lora_request(),
         )
+        if self._forced_route_blocks is None:
+            prefix = _cached_prefix(self._router_replay_tx, prefix_replay_id)
+        else:
+            prefix = submitted_prefix() if submitted_prefix is not None else None
         result = _result_from_output(
             final_output,
             return_sampled_logprobs_only=return_sampled_logprobs_only,

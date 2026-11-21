@@ -13,20 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run a continuation's re-prefilled positions under the routes its previous request stored (Model Runner V2).
-
-A request naming its previous capture (``dss_router_replay_prefix_id``) gets that capture back over the positions it
-covers. Its prefix-cache hit stops at a block boundary (one block lower when speculative decoding drops the trailing
-block), so the engine recomputes the capture's last positions with its own router, which can pick different experts
-than the request that first computed them. The returned routes and the state the rest of the request is sampled on
-then disagree.
-
-The server sends those stored rows with the request (``FORCED_ROUTES_KEY``). Each step, the runner marks the batch
-rows that compute a stored position, and every MoE router takes the stored experts there, weighted as the trainer's
-replay weights them. The capture then records the routes the forward used, so the returned capture is the stored one
-by construction. Positions without a stored row route as before. An engine whose routers stored rows cannot reach
-(``unsupported``) installs nothing and reports why; the server then sends no rows and warns once.
-"""
+"""Replay the stored experts on the part of a continuation's bounded tail that Model Runner V2 recomputes."""
 
 from __future__ import annotations
 
@@ -40,34 +27,12 @@ import torch.nn.functional as F
 #: ``[layers, top_k]`` expert ids. Bytes because vLLM's msgpack decodes an ``Any`` field's ndarray to a bare list.
 FORCED_ROUTES_KEY = "dss_router_replay_forced_routes"
 
-_APPLIED_ATTR = "_arctic_forced_routes"
-
 # The trainer's score functions (TokenChoiceTopKRouter.forward), applied to float32 logits.
 _SCORES = {
     "sigmoid": torch.sigmoid,
     "softmax": lambda logits: F.softmax(logits, dim=1),
     "sqrtsoftplus": lambda logits: F.softplus(logits).sqrt(),
 }
-
-
-def _router_scales() -> dict[type, bool]:
-    """Routers whose weights gather their scores; True when the router applies routed_scaling_factor itself."""
-    from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import FusedTopKBiasRouter
-    from vllm.model_executor.layers.fused_moe.router.fused_topk_router import FusedTopKRouter
-    from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import GroupedTopKRouter
-
-    return {GroupedTopKRouter: True, FusedTopKBiasRouter: True, FusedTopKRouter: False}
-
-
-def replay_weights(router: Any, router_logits: torch.Tensor, ids: torch.Tensor, scaled: bool) -> torch.Tensor:
-    """The weights the trainer's replay gives ``ids`` (``TokenChoiceTopKRouter.forward`` with ``routed_experts``).
-
-    The scale is the router's own: a router that leaves routed_scaling_factor to the MoE output gets 1 here too.
-    """
-    weights = _SCORES[router.scoring_func](router_logits.float()).gather(1, ids.long())
-    if router.renormalize:
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-    return weights * router.routed_scaling_factor if scaled else weights
 
 
 class ForcedRoutes:
@@ -78,13 +43,16 @@ class ForcedRoutes:
         self.ids = torch.zeros((max_num_tokens, num_layers, top_k), dtype=torch.int32, device=device)
         self.mask = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
 
-    def add(self, req_id: str, sampling_params: Any) -> None:
-        # Pooling requests carry no sampling params.
-        if sampling_params is None or FORCED_ROUTES_KEY not in (sampling_params.extra_args or {}):
+    def add(self, request: Any) -> None:
+        forced = (request.sampling_params.extra_args or {}).get(FORCED_ROUTES_KEY)
+        # Public vLLM xargs accept scalars and lists. Only the server emits a mapping with binary rows.
+        if not isinstance(forced, dict) or not isinstance(forced.get("rows"), bytes):
             return
-        forced = sampling_params.extra_args[FORCED_ROUTES_KEY]
         rows = np.frombuffer(forced["rows"], dtype=forced["dtype"]).reshape(-1, *self.ids.shape[1:])
-        self.rows[req_id] = (int(forced["start"]), rows)
+        start = forced["start"]
+        # The frontend rejects a capture reaching the end of the effective prompt; never execute its rows.
+        if start + len(rows) < request.prompt_len:
+            self.rows[request.req_id] = (start, rows)
 
     def fill(self, req_ids: list[str], query_start_loc: np.ndarray, num_computed: np.ndarray, num_rows: int) -> None:
         """Mark the batch rows that compute a stored position, with the same boundaries the routed-experts capture
@@ -107,7 +75,9 @@ class ForcedRoutes:
 
 def bind_router(router: Any, layer_id: int, forced: ForcedRoutes) -> None:
     """Route ``forced``'s masked rows to their stored experts. Graph-safe: no host branch reads the mask."""
-    scaled = _router_scales()[type(router)]
+    # FusedTopKRouter leaves any scaling to the MoE output.
+    scale = getattr(router, "routed_scaling_factor", 1.0)
+    score = _SCORES[router.scoring_func]
     compute = type(router)._compute_routing.__get__(router)
 
     def _compute_routing(hidden_states, router_logits, indices_type, *, input_ids=None):
@@ -115,7 +85,11 @@ def bind_router(router: Any, layer_id: int, forced: ForcedRoutes) -> None:
         n = ids.shape[0]
         mask = forced.mask[:n, None]
         stored = forced.ids[:n, layer_id].to(ids.dtype)
-        stored_weights = replay_weights(router, router_logits, stored, scaled).to(weights.dtype)
+        stored_weights = score(router_logits.float()).gather(1, stored.long())
+        if router.renormalize:
+            stored_weights = stored_weights / (stored_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        if scale != 1.0:
+            stored_weights = stored_weights * scale
         return torch.where(mask, stored_weights, weights), torch.where(mask, stored, ids)
 
     router._compute_routing = _compute_routing
@@ -124,20 +98,29 @@ def bind_router(router: Any, layer_id: int, forced: ForcedRoutes) -> None:
 def unsupported(runner: Any) -> str | None:
     """Why stored rows cannot reach every MoE router of ``runner.model``, or None when they can."""
     from vllm.model_executor.layers.fused_moe.layer import MoERunner
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCaptureSource
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import FusedTopKBiasRouter
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_router import FusedTopKRouter
+    from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import GroupedTopKRouter
 
     parallel = runner.vllm_config.parallel_config
     if parallel.data_parallel_size > 1:
         return "data_parallel_size > 1: the router sees other DP ranks' tokens (as with sequence-parallel MoE and DBO)"
-    if parallel.prefill_context_parallel_size > 1:
-        return "prefill_context_parallel_size > 1 partitions the batch"
-    supported = _router_scales()
+    if runner.vllm_config.num_prefill_lookahead_tokens > 1:
+        return "multi-module MTP can re-prefill positions before the bounded tail"
+    supported = (GroupedTopKRouter, FusedTopKBiasRouter, FusedTopKRouter)
     for module in runner.model.modules():
+        if isinstance(module, RoutedExpertsCaptureSource):
+            return f"layer {module.layer_id} captures routes directly, outside the MoE router"
         if not isinstance(module, MoERunner):
             continue
         if module._quant_method.is_monolithic:
             return f"layer {module.layer_id} runs a monolithic MoE kernel, which routes inside the kernel"
-        if type(module.router) not in supported or module.router.scoring_func not in _SCORES:
-            return f"layer {module.layer_id}'s router {type(module.router).__name__} is not one this hook weights"
+        router = module.router
+        if type(router) not in supported or router.scoring_func not in _SCORES:
+            return f"layer {module.layer_id}'s router {type(router).__name__} is not one this hook weights"
+        if getattr(router, "num_fused_shared_experts", 0):
+            return f"layer {module.layer_id}'s fused shared experts add slots outside the captured top-k"
     return None
 
 
@@ -154,11 +137,11 @@ def install(runner: Any) -> ForcedRoutes:
 
 
 def patch_model_runner(runner_cls: Any) -> None:
-    if getattr(runner_cls.prepare_inputs, _APPLIED_ATTR, False):
+    if getattr(runner_cls.prepare_inputs, "_arctic_forced_routes", False):
         return
     # Until initialize_kv_cache installs the hook on an engine that captures routes, or records why it cannot.
     runner_cls._forced_routes = None
-    runner_cls._forced_routes_unsupported = None
+    runner_cls._forced_routes_unsupported = "routed-experts capture is disabled"
     original_initialize_kv_cache = runner_cls.initialize_kv_cache
     original_add_requests = runner_cls.add_requests
     original_remove_request = runner_cls._remove_request
@@ -167,8 +150,16 @@ def patch_model_runner(runner_cls: Any) -> None:
     def initialize_kv_cache(self, *args, **kwargs):
         result = original_initialize_kv_cache(self, *args, **kwargs)
         if self.aux_output_connector is not None:
-            # All routers or none: the server sends rows only when every worker reports None here.
             self._forced_routes_unsupported = unsupported(self)
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            if tp_size > 1:
+                from vllm.distributed.parallel_state import get_tp_group
+
+                reasons: list[str | None] = [None] * tp_size
+                torch.distributed.all_gather_object(
+                    reasons, self._forced_routes_unsupported, group=get_tp_group().cpu_group
+                )
+                self._forced_routes_unsupported = next((reason for reason in reasons if reason is not None), None)
             if self._forced_routes_unsupported is None:
                 self._forced_routes = install(self)
         return result
@@ -177,7 +168,7 @@ def patch_model_runner(runner_cls: Any) -> None:
         original_add_requests(self, scheduler_output)
         if self._forced_routes is not None:
             for new_req_data in scheduler_output.scheduled_new_reqs:
-                self._forced_routes.add(new_req_data.req_id, new_req_data.sampling_params)
+                self._forced_routes.add(new_req_data)
 
     def _remove_request(self, req_id):
         if self._forced_routes is not None:
@@ -195,20 +186,22 @@ def patch_model_runner(runner_cls: Any) -> None:
             )
         return input_batch
 
-    for name, fn, orig in (
-        ("initialize_kv_cache", initialize_kv_cache, original_initialize_kv_cache),
-        ("add_requests", add_requests, original_add_requests),
-        ("_remove_request", _remove_request, original_remove_request),
-        ("prepare_inputs", prepare_inputs, original_prepare_inputs),
-    ):
-        setattr(fn, _APPLIED_ATTR, True)
-        fn._orig = orig
-        setattr(runner_cls, name, fn)
+    prepare_inputs._arctic_forced_routes = True
+    runner_cls.initialize_kv_cache = initialize_kv_cache
+    runner_cls.add_requests = add_requests
+    runner_cls._remove_request = _remove_request
+    runner_cls.prepare_inputs = prepare_inputs
 
 
-def forced_routes_unsupported(worker: Any) -> str | None:
-    """Worker RPC: why this worker runs without the hook, or None when it can force stored routes."""
-    return getattr(worker.model_runner, "_forced_routes_unsupported", "the engine runs Model Runner V1")
+def forced_route_blocks(worker: Any) -> tuple[int, int] | str:
+    """Report the engine core's resolved cache-hit geometry, or why this worker cannot force routes."""
+    runner = worker.model_runner
+    reason = getattr(runner, "_forced_routes_unsupported", "the engine runs Model Runner V1")
+    if reason is not None:
+        return reason
+    spec = runner.vllm_config.speculative_config
+    blocks = 2 if spec is not None and spec.use_eagle_block_drop() else 1
+    return runner.kv_cache_config.cache_hit_alignment_tokens, blocks
 
 
 def ensure_forced_routes_patch() -> None:
@@ -216,4 +209,4 @@ def ensure_forced_routes_patch() -> None:
     from vllm.v1.worker.gpu_worker import Worker
 
     patch_model_runner(GPUModelRunner)
-    Worker.forced_routes_unsupported = forced_routes_unsupported
+    Worker.forced_route_blocks = forced_route_blocks
