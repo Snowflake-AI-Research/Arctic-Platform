@@ -23,6 +23,7 @@ import pytest
 import torch
 from pydantic import ValidationError
 
+from arctic_platform.common.callbacks import CallbackRunner
 from arctic_platform.common.callbacks import Reduce
 from arctic_platform.common.callbacks import merge_metrics
 from arctic_platform.model.implementations.debug.config import router_stats_strides
@@ -222,9 +223,10 @@ def test_padding_does_not_suppress_the_next_router_call():
     assert report["router"]["sampled_tokens"] == pytest.approx(float(len(x)))
 
 
-def test_on_error_drops_partial_totals():
+def test_on_error_drops_partial_totals_from_the_failed_request():
     model, callback, trainer = _hooked(stride=1)
     x = torch.randn(4, DIM)
+    callback.pre_fwd_bwd(trainer)
     callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
     model.router(x)
 
@@ -236,18 +238,171 @@ def test_on_error_drops_partial_totals():
     assert report["router"]["tokens_per_expert"] == [0.0] * EXPERTS
 
 
+def test_on_error_keeps_earlier_successful_fwd_bwd_totals_in_the_same_step():
+    model, callback, trainer = _hooked(stride=1)
+    first = torch.randn(4, DIM)
+    second = torch.randn(6, DIM)
+
+    callback.pre_fwd_bwd(trainer)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(first)
+    callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+    callback.post_fwd_bwd(trainer, {})
+
+    callback.pre_fwd_bwd(trainer)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(second)
+    callback.on_error(trainer, "fwd_bwd", RuntimeError("second request failed"))
+
+    callback.post_step(trainer)
+    _reduce, report = callback.pending["router_stats"]
+    assert report["router"]["sampled_tokens"] == pytest.approx(float(len(first)))
+
+
+def test_on_error_after_failed_snapshot_keeps_earlier_request_totals():
+    class BrokenTotals:
+        def detach(self):
+            return self
+
+        def clone(self):
+            raise RuntimeError("snapshot failed")
+
+    model, callback, trainer = _hooked(stride=1)
+    first = torch.randn(4, DIM)
+    callback.pre_fwd_bwd(trainer)
+    model.router(first)
+    callback.post_fwd_bwd(trainer, {})
+
+    callback._layers.append(("broken", BrokenTotals()))
+    callback._calls.append(0)
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        callback.pre_fwd_bwd(trainer)
+    callback.on_error(trainer, "fwd_bwd", RuntimeError("pre_fwd_bwd was quarantined"))
+    callback._layers.pop()
+    callback._calls.pop()
+
+    callback.post_step(trainer)
+    _reduce, report = callback.pending["router_stats"]
+    assert report["router"]["sampled_tokens"] == pytest.approx(float(len(first)))
+
+
 def test_on_error_during_step_keeps_completed_fwd_bwd_totals():
     model, callback, trainer = _hooked(stride=1)
     x = torch.randn(4, DIM)
+    callback.pre_fwd_bwd(trainer)
     callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
     model.router(x)
     callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+    callback.post_fwd_bwd(trainer, {})
 
     callback.on_error(trainer, "step", RuntimeError("optimizer blew up"))
     callback.post_step(trainer)
 
     _reduce, report = callback.pending["router_stats"]
     assert report["router"]["sampled_tokens"] == pytest.approx(float(len(x)))
+
+
+def test_on_error_without_pre_after_post_step_leaves_zero_totals():
+    """A broadcast on_error after a finished step must not revive the prior snapshot."""
+    model, callback, trainer = _hooked(stride=1)
+    x = torch.randn(4, DIM)
+    callback.pre_fwd_bwd(trainer)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(x)
+    callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+    callback.post_fwd_bwd(trainer, {})
+    callback.post_step(trainer)
+    callback.pending.clear()
+
+    callback.on_error(trainer, "fwd_bwd", RuntimeError("peer failed before pre_fwd_bwd"))
+    callback.post_step(trainer)
+
+    _reduce, report = callback.pending["router_stats"]
+    assert report["router"]["sampled_tokens"] == 0.0
+    assert report["router"]["tokens_per_expert"] == [0.0] * EXPERTS
+
+
+def test_on_error_after_successful_fwd_restores_pre_request_totals():
+    """Sibling that finished the failing request must still drop that request on broadcast."""
+    model, callback, trainer = _hooked(stride=1)
+    x = torch.randn(4, DIM)
+
+    callback.pre_fwd_bwd(trainer)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(x)
+    callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+    callback.post_fwd_bwd(trainer, {})
+
+    callback.on_error(trainer, "fwd_bwd", RuntimeError("peer failed mid-fwd"))
+    callback.post_step(trainer)
+
+    _reduce, report = callback.pending["router_stats"]
+    assert report["router"]["sampled_tokens"] == 0.0
+    assert report["router"]["tokens_per_expert"] == [0.0] * EXPERTS
+
+
+def test_on_error_after_successful_fwd_keeps_earlier_request_only():
+    model, callback, trainer = _hooked(stride=1)
+    first = torch.randn(4, DIM)
+    second = torch.randn(6, DIM)
+
+    callback.pre_fwd_bwd(trainer)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(first)
+    callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+    callback.post_fwd_bwd(trainer, {})
+
+    callback.pre_fwd_bwd(trainer)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(second)
+    callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+    callback.post_fwd_bwd(trainer, {})
+
+    callback.on_error(trainer, "fwd_bwd", RuntimeError("peer failed after this rank finished"))
+    callback.post_step(trainer)
+
+    _reduce, report = callback.pending["router_stats"]
+    assert report["router"]["sampled_tokens"] == pytest.approx(float(len(first)))
+
+
+def test_broadcast_on_error_then_retry_matches_single_request_totals():
+    """Failing and succeeding ranks must agree after on_error + retry of the same request."""
+    fail_model, fail_cb, fail_trainer = _hooked(stride=1)
+    ok_model, ok_cb, ok_trainer = _hooked(stride=1)
+    batch = torch.randn(4, DIM)
+    retry = torch.randn(4, DIM)
+
+    for model, cb, trainer in (
+        (fail_model, fail_cb, fail_trainer),
+        (ok_model, ok_cb, ok_trainer),
+    ):
+        cb.pre_fwd_bwd(trainer)
+        cb.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+        model.router(batch)
+
+    ok_cb.post_fwd_bwd_microbatch(ok_trainer, is_padding=False)
+    ok_cb.post_fwd_bwd(ok_trainer, {})
+
+    fail_cb.on_error(fail_trainer, "fwd_bwd", RuntimeError("rank0 blew up"))
+    ok_cb.on_error(ok_trainer, "fwd_bwd", RuntimeError("peer failure during fwd_bwd"))
+
+    for model, cb, trainer in (
+        (fail_model, fail_cb, fail_trainer),
+        (ok_model, ok_cb, ok_trainer),
+    ):
+        cb.pre_fwd_bwd(trainer)
+        cb.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+        model.router(retry)
+        cb.post_fwd_bwd_microbatch(trainer, is_padding=False)
+        cb.post_fwd_bwd(trainer, {})
+        cb.post_step(trainer)
+
+    fail_report = fail_cb.pending["router_stats"][1]["router"]
+    ok_report = ok_cb.pending["router_stats"][1]["router"]
+    assert fail_report["sampled_tokens"] == pytest.approx(float(len(retry)))
+    assert ok_report["sampled_tokens"] == pytest.approx(float(len(retry)))
+    assert fail_report["sampled_tokens"] == ok_report["sampled_tokens"]
+    assert fail_report["tokens_per_expert"] == ok_report["tokens_per_expert"]
 
 
 @pytest.mark.parametrize(
@@ -305,3 +460,76 @@ def test_loader_debug_options_reject_router_stats_strides():
         DebugModelOptions(router_stats_sample_stride=4)
     with pytest.raises(ValidationError, match="router_stats_call_stride"):
         GlmMoeDsaDebugOptions(router_stats_call_stride=2)
+
+
+def test_quarantine_disables_hooks_so_next_step_counts_only_new_tokens():
+    """Mike's repro: quarantine in pre_fwd_bwd, pad tokens, next step publishes 5 not 8."""
+
+    class _BoomOnce(RouterStatsCallback):
+        def __init__(self, training_config):
+            super().__init__(training_config)
+            self._boom = True
+
+        def pre_fwd_bwd(self, trainer):
+            if self._boom:
+                self._boom = False
+                raise RuntimeError("pre_fwd_bwd boom")
+            super().pre_fwd_bwd(trainer)
+
+    torch.manual_seed(0)
+    model = torch.nn.Module()
+    model.add_module("router", TokenChoiceTopKRouter(DIM, EXPERTS, TOP_K, "softmax", route_norm=True, route_scale=1.0))
+    trainer = SimpleNamespace(model=model)
+    runner = CallbackRunner([_BoomOnce], _training_config(stride=1), rank=0)
+    runner.run("post_init", trainer)
+    cb = runner.callbacks[0]
+
+    runner.run("pre_fwd_bwd", trainer)
+    assert cb in runner._failed
+    assert cb._disabled
+    model.router(torch.randn(3, DIM))  # would have leaked without on_quarantine
+    assert runner.flush() == {}
+    assert runner.last_dropped == frozenset({"router_stats"})
+
+    runner.run("pre_fwd_bwd", trainer)
+    runner.run("pre_fwd_bwd_microbatch", trainer, False)
+    model.router(torch.randn(5, DIM))
+    runner.run("post_fwd_bwd_microbatch", trainer, False)
+    runner.run("post_step", trainer)
+    metrics = runner.flush()
+    assert metrics["router_stats"][1]["router"]["sampled_tokens"] == pytest.approx(5.0)
+
+
+def test_post_init_mixed_top_k_raises_through_runner():
+    torch.manual_seed(0)
+    model = torch.nn.Module()
+    model.add_module("router0", TokenChoiceTopKRouter(DIM, EXPERTS, 2, "softmax", route_norm=True, route_scale=1.0))
+    model.add_module("router1", TokenChoiceTopKRouter(DIM, EXPERTS, 1, "softmax", route_norm=True, route_scale=1.0))
+    trainer = SimpleNamespace(model=model)
+    runner = CallbackRunner([RouterStatsCallback], _training_config(stride=1), rank=0)
+    with pytest.raises(ValueError, match="top-1"):
+        runner.run("post_init", trainer)
+    assert runner._failed == set()
+    assert runner.callbacks[0]._layers == []
+
+
+def test_on_error_mismatched_stage_is_noop():
+    model, callback, trainer = _hooked(stride=1)
+    first = torch.randn(4, DIM)
+    callback.pre_fwd_bwd(trainer)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(first)
+    callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+    callback.post_fwd_bwd(trainer, {})
+
+    # Interleaved forward_only overwrites the snapshot stage.
+    second = torch.randn(6, DIM)
+    callback.pre_fwd_only(trainer)
+    callback.pre_fwd_only_microbatch(trainer, is_padding=False)
+    model.router(second)
+
+    callback.on_error(trainer, "fwd_bwd", RuntimeError("stale fwd_bwd broadcast"))
+    callback.post_step(trainer)
+    _reduce, report = callback.pending["router_stats"]
+    # Mismatch left both requests' totals; restore did not run.
+    assert report["router"]["sampled_tokens"] == pytest.approx(float(len(first) + len(second)))

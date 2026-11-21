@@ -72,9 +72,13 @@ class _Metrics(MetricsCallback):
     def enabled(cls, training_config):
         return True
 
+    def metric_names(self):
+        return frozenset({"x"})
+
 
 class _OtherMetrics(_Metrics):
-    pass
+    def metric_names(self):
+        return frozenset({"x"})
 
 
 class _RankZeroMetrics(_Metrics):
@@ -164,6 +168,145 @@ class TestCallbackRunner(unittest.TestCase):
         # Must not raise even though _ErroringOnError.on_error itself raises.
         runner.on_error(_Trainer(rank=0), "step", exc)
         self.assertEqual(runner.callbacks[0].pending, {})
+        # on_error failure quarantines that callback; flush still clears quarantine.
+        self.assertIn(runner.callbacks[1], runner._failed)
+        runner.flush()
+        self.assertEqual(runner._failed, set())
+
+    def test_run_quarantines_a_failing_callback_and_keeps_siblings(self):
+        class _Boom(MetricsCallback):
+            @classmethod
+            def enabled(cls, training_config):
+                return True
+
+            def metric_names(self):
+                return frozenset({"boom"})
+
+            def post_step(self, trainer):
+                raise RuntimeError("post-step boom")
+
+        class _Ok(MetricsCallback):
+            @classmethod
+            def enabled(cls, training_config):
+                return True
+
+            def metric_names(self):
+                return frozenset({"ok"})
+
+            def post_step(self, trainer):
+                self.log("ok", 1, reduce=Reduce.SUM)
+
+        runner = CallbackRunner([_Boom, _Ok], {}, rank=0)
+        runner.run("post_step", _Trainer(rank=0))
+        self.assertEqual(runner.flush(), {"ok": (Reduce.SUM, 1)})
+        self.assertEqual(runner.last_dropped, frozenset({"boom"}))
+        # Quarantine clears at flush so the next step can retry the callback.
+        self.assertEqual(runner._failed, set())
+
+    def test_quarantined_callback_is_skipped_on_later_hooks_until_flush(self):
+        class _Boom(Callback):
+            def __init__(self, training_config):
+                self.calls = []
+
+            @classmethod
+            def enabled(cls, training_config):
+                return True
+
+            def pre_step(self, trainer):
+                self.calls.append("pre_step")
+                raise RuntimeError("pre-step boom")
+
+            def post_step(self, trainer):
+                self.calls.append("post_step")
+
+        runner = CallbackRunner([_Boom], {}, rank=0)
+        runner.run("pre_step", _Trainer(rank=0))
+        runner.run("post_step", _Trainer(rank=0))
+        self.assertEqual(runner.callbacks[0].calls, ["pre_step"])
+        runner.flush()
+        runner.run("post_step", _Trainer(rank=0))
+        self.assertEqual(runner.callbacks[0].calls, ["pre_step", "post_step"])
+
+    def test_post_init_raise_propagates_without_quarantine(self):
+        class _Boom(Callback):
+            @classmethod
+            def enabled(cls, training_config):
+                return True
+
+            def post_init(self, trainer):
+                raise ValueError("bad config")
+
+        runner = CallbackRunner([_Boom], {}, rank=0)
+        with self.assertRaisesRegex(ValueError, "bad config"):
+            runner.run("post_init", _Trainer(rank=0))
+        self.assertEqual(runner._failed, set())
+
+    def test_on_quarantine_is_invoked_once_and_on_error_keeps_quarantine(self):
+        class _Boom(Callback):
+            def __init__(self, training_config):
+                self.calls = []
+                self.quarantines = 0
+
+            @classmethod
+            def enabled(cls, training_config):
+                return True
+
+            def pre_step(self, trainer):
+                self.calls.append("pre_step")
+                raise RuntimeError("pre-step boom")
+
+            def post_step(self, trainer):
+                self.calls.append("post_step")
+
+            def on_quarantine(self, trainer):
+                self.quarantines += 1
+
+            def on_error(self, trainer, stage, exc):
+                self.calls.append("on_error")
+
+        runner = CallbackRunner([_Boom], {}, rank=0)
+        trainer = _Trainer(rank=0)
+        runner.run("pre_step", trainer)
+        self.assertEqual(runner.callbacks[0].quarantines, 1)
+        runner.on_error(trainer, "step", RuntimeError("peer"))
+        # Quarantined callbacks are skipped on on_error; quarantine survives.
+        self.assertEqual(runner.callbacks[0].calls, ["pre_step"])
+        self.assertIn(runner.callbacks[0], runner._failed)
+        runner.flush()
+        self.assertEqual(runner._failed, set())
+
+    def test_asymmetric_quarantine_drops_metric_on_merge(self):
+        class _Stats(MetricsCallback):
+            @classmethod
+            def enabled(cls, training_config):
+                return True
+
+            def metric_names(self):
+                return frozenset({"router_stats"})
+
+            def post_step(self, trainer):
+                self.log("router_stats", {"router": {"sampled_tokens": 5.0}}, reduce=Reduce.SUM)
+
+        class _BoomStats(_Stats):
+            def pre_fwd_bwd(self, trainer):
+                raise RuntimeError("snapshot boom")
+
+        healthy = CallbackRunner([_Stats], {}, rank=0)
+        failed = CallbackRunner([_BoomStats], {}, rank=1)
+        trainer = _Trainer(rank=0)
+        healthy.run("post_step", trainer)
+        failed.run("pre_fwd_bwd", trainer)
+        failed.run("post_step", trainer)
+        healthy_metrics = healthy.flush()
+        failed_metrics = failed.flush()
+        self.assertEqual(healthy.last_dropped, frozenset())
+        self.assertEqual(failed.last_dropped, frozenset({"router_stats"}))
+        merged = merge_metrics(
+            [healthy_metrics, failed_metrics],
+            dropped_per_rank=[healthy.last_dropped, failed.last_dropped],
+        )
+        self.assertNotIn("router_stats", merged)
+        self.assertEqual(merged, {})
 
 
 class TestMergeMetrics(unittest.TestCase):
@@ -234,6 +377,17 @@ class TestMergeMetrics(unittest.TestCase):
         ]
         with self.assertRaises(ValueError):
             merge_metrics(per_rank)
+
+    def test_dropped_per_rank_strips_before_equality_check(self):
+        per_rank = [
+            {"keep": (Reduce.SUM, 1), "router_stats": (Reduce.SUM, {"sampled_tokens": 5.0})},
+            {"keep": (Reduce.SUM, 2)},
+        ]
+        merged = merge_metrics(
+            per_rank,
+            dropped_per_rank=[frozenset(), frozenset({"router_stats"})],
+        )
+        self.assertEqual(merged, {"keep": 3})
 
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ local totals with ``Reduce.SUM`` so the driver ``merge_metrics`` sums across ran
 
 from __future__ import annotations
 
+from typing import AbstractSet
 from typing import Any
 from typing import Mapping
 
@@ -50,6 +51,7 @@ from arctic_platform.model.recompute import in_recompute
 from arctic_platform.model.recompute import install_recompute_detector
 
 _TOTALS = ("sampled_tokens", "entropy_sum", "replayed_tokens", "replay_agreement_sum")
+_METRIC_NAMES = frozenset({"router_stats"})
 
 
 class RouterStatsCallback(MetricsCallback):
@@ -57,36 +59,60 @@ class RouterStatsCallback(MetricsCallback):
 
     Each rank logs its own totals with ``Reduce.SUM``. The driver merges via ``merge_metrics``; there is no
     callback-owned ``all_reduce``. Homogeneous EP/SP is assumed: every enabled rank hooks the same routers.
-    ``on_error`` drops this rank's partial totals (DSS broadcasts ``on_error`` so siblings reset too).
+
+    ``pre_fwd_bwd`` / ``pre_fwd_only`` snapshot the step's totals (tagged with stage) so a failed request can
+    restore them. ``on_error`` restores only when ``stage`` matches the saved snapshot; a mismatched stage is
+    a no-op. See the ``on_error`` contract on ``arctic_platform.common.callbacks.Callback``. The snapshot is
+    kept after a successful ``post_fwd_*`` and cleared only at ``post_step`` (after publish) or on restore so
+    a late ``on_error`` cannot revive totals into the next step.
     """
 
     def __init__(self, training_config: Mapping[str, Any]) -> None:
         super().__init__(training_config)
         self._stride, self._call_stride = router_stats_strides(training_config)
         self._counting = True
+        self._disabled = False
         self._layers: list[tuple[str, torch.Tensor]] = []
         self._calls: list[int] = []
+        self._saved_calls: list[int] | None = None
+        self._saved_totals: list[torch.Tensor] | None = None
+        self._saved_stage: str | None = None
 
     @classmethod
     def enabled(cls, training_config: Mapping[str, Any]) -> bool:
         return bool(router_stats_strides(training_config)[0])
 
+    def metric_names(self) -> AbstractSet[str]:
+        return _METRIC_NAMES
+
     def post_init(self, trainer: Trainer) -> None:
-        for name, router in trainer.model.named_modules():
-            if self._stride == 0 or not isinstance(router, TokenChoiceTopKRouter):
-                continue
+        routers = [
+            (name, router)
+            for name, router in trainer.model.named_modules()
+            if self._stride > 0 and isinstance(router, TokenChoiceTopKRouter)
+        ]
+        for name, router in routers:
             if router.top_k < 2:
                 raise ValueError(f"router_stats cannot read {name}: a top-1 replay pad row looks like expert 0")
-            totals = torch.zeros(router.num_experts + len(_TOTALS), device=router.gate.weight.device)
-            router.register_forward_hook(self._hook(len(self._layers), totals), with_kwargs=True)
-            self._layers.append((name, totals))
-            self._calls.append(0)
-        if self._stride > 0 and not self._layers:
+        if self._stride > 0 and not routers:
             raise ValueError(
                 "router_stats_sample_stride > 0 but the model has no TokenChoiceTopKRouter; "
                 "disable the stride or use a MoE model that exposes that router"
             )
+        for name, router in routers:
+            totals = torch.zeros(router.num_experts + len(_TOTALS), device=router.gate.weight.device)
+            router.register_forward_hook(self._hook(len(self._layers), totals), with_kwargs=True)
+            self._layers.append((name, totals))
+            self._calls.append(0)
         install_recompute_detector()
+
+    def pre_fwd_bwd(self, trainer: Trainer) -> None:
+        self._disabled = False
+        self._snapshot_totals("fwd_bwd")
+
+    def pre_fwd_only(self, trainer: Trainer) -> None:
+        self._disabled = False
+        self._snapshot_totals("forward_only")
 
     def pre_fwd_bwd_microbatch(self, trainer: Trainer, is_padding: bool) -> None:
         self._counting = not is_padding
@@ -104,22 +130,58 @@ class RouterStatsCallback(MetricsCallback):
         report = self._report()
         if report:
             self.log("router_stats", report, reduce=Reduce.SUM)
+        self._clear_snapshot()
 
     def on_error(self, trainer: Trainer, stage: str, exc: BaseException) -> None:
-        # fwd_bwd / forward_only can leave partial totals; clear those so a retry
-        # does not double-count. step failures must keep the completed fwd_bwd
-        # totals so a step-only retry still publishes them via post_step.
+        # A failed fwd_bwd / forward_only can leave partial totals for this request. Restore the
+        # pre-request snapshot only when the stage matches so an interleaved sibling stage cannot
+        # wipe a later success. Step failures keep the completed totals as-is. No matching snapshot
+        # leaves totals alone.
         if stage in {"fwd_bwd", "forward_only"}:
-            self._reset()
+            if self._saved_stage == stage:
+                self._restore_totals()
         else:
             self._counting = True
 
+    def on_quarantine(self, trainer: Trainer) -> None:
+        """Stop accumulation for the rest of this step; hooks stay installed for the next step."""
+        self._disabled = True
+        self._counting = True
+        for _, totals in self._layers:
+            totals.zero_()
+        self.pending.clear()
+        self._clear_snapshot()
+
+    def _snapshot_totals(self, stage: str) -> None:
+        """Remember totals before this request so ``on_error`` can drop only its partials."""
+        self._clear_snapshot()
+        self._saved_stage = stage
+        self._saved_calls = list(self._calls)
+        self._saved_totals = [totals.detach().clone() for _, totals in self._layers]
+
+    def _clear_snapshot(self) -> None:
+        """Drop the pre-request snapshot after ``post_step`` / restore / quarantine."""
+        self._saved_calls = None
+        self._saved_totals = None
+        self._saved_stage = None
+
+    def _restore_totals(self) -> None:
+        """Drop this request's partials; keep earlier requests in the same step."""
+        self._counting = True
+        if self._saved_calls is None or self._saved_totals is None:
+            return
+        self._calls = list(self._saved_calls)
+        for (_, totals), saved in zip(self._layers, self._saved_totals):
+            totals.copy_(saved)
+        self._clear_snapshot()
+
     def _reset(self) -> None:
-        """Drop partial totals and count the next router call."""
+        """Drop all totals and count the next router call."""
         self._counting = True
         self._calls = [0 for _ in self._calls]
         for _, totals in self._layers:
             totals.zero_()
+        self._clear_snapshot()
 
     def _report(self) -> dict[str, dict]:
         """Local per-router totals for this rank; the driver sums them with ``Reduce.SUM``."""
@@ -139,7 +201,7 @@ class RouterStatsCallback(MetricsCallback):
     def _hook(self, layer: int, totals: torch.Tensor):
         @torch.compiler.disable
         def accumulate(router: TokenChoiceTopKRouter, args, kwargs, output) -> None:
-            if not self._counting or in_recompute():
+            if self._disabled or not self._counting or in_recompute():
                 return
             call, self._calls[layer] = self._calls[layer], self._calls[layer] + 1
             if call % self._call_stride:
