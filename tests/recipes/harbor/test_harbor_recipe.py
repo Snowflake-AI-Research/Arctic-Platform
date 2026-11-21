@@ -179,6 +179,61 @@ def test_harbor_trial_adapter_and_grader(tmp_path: Path, monkeypatch: pytest.Mon
     assert grade.exhausted is False
 
 
+def _rollout_request(task_dir: Path, phase: str) -> RolloutRequest:
+    return RolloutRequest(
+        env_extra=dict(instance_id="sample-task", harbor_task_dir=str(task_dir)),
+        trajectory_id=SimpleNamespace(repetition_id=0),
+        routing_key=f"step1-{phase}-0_0",
+        base_url="http://127.0.0.1:9999/v1",
+        api_key="secret",
+        phase=phase,
+        global_step=1,
+    )
+
+
+def test_eval_rollouts_get_the_eval_verifier_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    task_dir = _make_sample_harbor_task(tmp_path, "sample-task")
+    seen: dict[str, dict] = {}
+
+    async def fake_run_harbor_trial(task_dir: Path, trials_dir: Path, trial_name: str, **kwargs):
+        seen[kwargs["agent_kwargs"]["training_phase"]] = kwargs["verifier_env"]
+        return dict(reward=1.0, reward_detail={}, exhausted=False, messages=[], exception=None)
+
+    monkeypatch.setattr("arctic_platform.integrations.harbor.adapter.run_harbor_trial", fake_run_harbor_trial)
+    adapter = HarborTrialAdapter(
+        "openai/m",
+        agent="harbor_rl.agent:OpenHandsHarborAgent",
+        trials_root=str(tmp_path / "trials"),
+        verifier_env=dict(REWARDKIT_JUDGE="openai/train-judge", JUDGE_CONCURRENCY="8"),
+        eval_verifier_env=dict(REWARDKIT_JUDGE="openai/eval-judge"),
+    )
+    for phase in ("train", "eval"):
+        rid = adapter.submit(_rollout_request(task_dir, phase))
+        while adapter.get_status(rid) == "running":
+            pass
+    assert seen["train"] == dict(REWARDKIT_JUDGE="openai/train-judge", JUDGE_CONCURRENCY="8")
+    assert seen["eval"] == dict(REWARDKIT_JUDGE="openai/eval-judge", JUDGE_CONCURRENCY="8")
+
+
+def test_errored_rollout_is_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    task_dir = _make_sample_harbor_task(tmp_path, "sample-task")
+
+    async def fake_run_harbor_trial(task_dir: Path, trials_dir: Path, trial_name: str, **kwargs):
+        raise RuntimeError("RewardFileNotFoundError: No reward file found\nTraceback ...")
+
+    monkeypatch.setattr("arctic_platform.integrations.harbor.adapter.run_harbor_trial", fake_run_harbor_trial)
+    adapter = HarborTrialAdapter("openai/m", agent="harbor_rl.agent:OpenHandsHarborAgent", trials_root=str(tmp_path))
+    with caplog.at_level("WARNING", logger="arctic_platform.integrations.harbor.adapter"):
+        rid = adapter.submit(_rollout_request(task_dir, "eval"))
+        while adapter.get_status(rid) == "running":
+            pass
+    assert adapter.get_status(rid) == "errored"
+    assert "step1-eval-0_0 errored: RuntimeError: RewardFileNotFoundError: No reward file found" in caplog.text
+    assert "Traceback" not in caplog.text
+
+
 def test_rewrite_harbor_paths(tmp_path: Path) -> None:
     root = tmp_path / "trial"
     src = "pytest /tests/test_outputs.py && cat /app/res.txt > /logs/verifier/reward.txt"

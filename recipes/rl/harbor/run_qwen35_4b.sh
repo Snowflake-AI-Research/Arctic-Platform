@@ -12,7 +12,9 @@
 # and optionally:
 #   - HARBOR_SKILL=/path/to/skill_or_skills_dir
 #   - HARBOR_VERIFIER_ENV='{"KEY": "value or ${VAR}"}' (added to every task's verifier env, like `harbor run --ve`)
+#   - HARBOR_EVAL_VERIFIER_ENV='{...}' (merged over HARBOR_VERIFIER_ENV for eval rollouts, e.g. a different judge)
 #   - HARBOR_AGENT=harbor_rl.agent:OpenHandsHarborAgent (or your own driver-side Harbor BaseAgent; installed agents are refused)
+#   - HARBOR_AGENT_WITH='pkg @ url' (packages that agent needs on the driver, one uv --with spec per line)
 
 set -euo pipefail
 
@@ -126,6 +128,7 @@ export HARBOR_AGENT="${HARBOR_AGENT:-harbor_rl.agent:OpenHandsHarborAgent}"
 export HARBOR_ENV="${HARBOR_ENV:-snowflake}"
 export HARBOR_ENV_KWARGS="${HARBOR_ENV_KWARGS:-}"
 export HARBOR_VERIFIER_ENV="${HARBOR_VERIFIER_ENV:-}"
+export HARBOR_EVAL_VERIFIER_ENV="${HARBOR_EVAL_VERIFIER_ENV:-}"
 export HARBOR_SKILL="${HARBOR_SKILL:-}"
 export ARCTIC_CORTEX_JOB_COMMENT="${ARCTIC_CORTEX_JOB_COMMENT:-harbor rl ${MODEL} ${NUM_TRAIN_GPUS}+${NUM_SAMPLING_ENGINES}}"
 
@@ -145,6 +148,12 @@ stop_driver() {
 
 trap stop_driver INT TERM
 
+# HARBOR_AGENT_WITH: one uv --with spec per line, for the packages a custom HARBOR_AGENT imports.
+AGENT_WITH=()
+while IFS= read -r spec; do
+    [[ -n "${spec// }" ]] && AGENT_WITH+=(--with "${spec}")
+done <<< "${HARBOR_AGENT_WITH:-}"
+
 # data.dataloader.num_workers=0: SkyRL's default of 8 loader processes holds about
 # 1 GB of driver memory each, to read a few parquet rows per step.
 cd "${SKYRL_HOME}"
@@ -154,6 +163,7 @@ uv run --isolated --extra skyrl-train \
     --with "${OPENHANDS_TOOLS_SPEC}" \
     --with "${OPENHANDS_WORKSPACE_SPEC}" \
     --with jinja2 \
+    "${AGENT_WITH[@]}" \
     -- python -m skyrl.train.entrypoints.main_base \
     trainer.override_entrypoint=harbor_rl.entrypoint \
     trainer.arctic_rl.colocate=false \

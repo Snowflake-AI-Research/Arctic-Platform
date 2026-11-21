@@ -62,14 +62,17 @@ def harbor_env_kwargs() -> dict[str, Any]:
     return kwargs
 
 
-def harbor_verifier_env() -> dict[str, str]:
-    """``HARBOR_VERIFIER_ENV`` (a JSON object of strings), added to every task's verifier env like ``harbor run --ve``."""
-    raw = os.environ.get("HARBOR_VERIFIER_ENV", "").strip()
+def harbor_verifier_env(var: str = "HARBOR_VERIFIER_ENV") -> dict[str, str]:
+    """``$var`` (a JSON object of strings), added to every task's verifier env like ``harbor run --ve``.
+
+    ``HARBOR_EVAL_VERIFIER_ENV`` is merged over ``HARBOR_VERIFIER_ENV`` for eval rollouts only.
+    """
+    raw = os.environ.get(var, "").strip()
     if not raw:
         return {}
     env = json.loads(raw)
     if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
-        raise ValueError("HARBOR_VERIFIER_ENV must be a JSON object of strings")
+        raise ValueError(f"{var} must be a JSON object of strings")
     return env
 
 
@@ -136,6 +139,7 @@ def _experiment_cls():
                 skills=skills,
                 env_kwargs=harbor_env_kwargs(),
                 verifier_env=harbor_verifier_env(),
+                eval_verifier_env=harbor_verifier_env("HARBOR_EVAL_VERIFIER_ENV"),
                 prepare_task_fn=_prepare_task_fn(),
             )
             self.harbor_adapter = adapter
