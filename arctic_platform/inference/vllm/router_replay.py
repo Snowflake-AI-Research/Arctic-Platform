@@ -104,8 +104,10 @@ def patch_scheduler_check_stop() -> None:
 def ensure_router_replay_vllm_patches() -> None:
     _check_supported_vllm_version()
 
+    from arctic_platform.inference.vllm.forced_routes import ensure_forced_routes_patch
     from vllm.v1.core.sched import scheduler as scheduler_mod
 
+    ensure_forced_routes_patch()
     if getattr(scheduler_mod.check_stop, "_arctic_router_replay_patch", False):
         return
     patch_scheduler_check_stop()

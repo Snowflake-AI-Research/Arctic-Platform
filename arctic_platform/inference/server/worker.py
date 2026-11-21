@@ -11,6 +11,7 @@ import stat
 import sys
 import tempfile
 import time
+import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from enum import Enum
@@ -31,6 +32,7 @@ from arctic_platform.inference.vllm.dense_prompt_logprobs import (
     stage_sampling_params as _stage_dense_prompt_logprobs,
     take_dense as _take_dense_prompt_logprobs,
 )
+from arctic_platform.inference.vllm.forced_routes import FORCED_ROUTES_KEY, tail_rows
 from arctic_platform.inference.vllm.spec_decode_grammar import (
     ensure_spec_decode_grammar_fix,
 )
@@ -649,6 +651,8 @@ def _result_from_output(
     sample_id: str | None = None,
     replay_id: str | None = None,
     prefix_replay_id: str | None = None,
+    prefix: Any = None,
+    prefix_start: int = 0,
     request_id: str | None = None,
     replica_label: str | None = None,
     return_back_router_info: bool = False,
@@ -717,11 +721,29 @@ def _result_from_output(
         sample_id=sample_id,
         replay_id=replay_id,
         prefix_replay_id=prefix_replay_id,
+        prefix=prefix,
+        prefix_start=prefix_start,
         request_id=request_id,
         replica_label=replica_label,
         return_back_router_info=return_back_router_info,
     )
     return result
+
+
+def _cached_prefix(cache_tx: Any, prefix_replay_id: str | None) -> Any:
+    if cache_tx is not None and prefix_replay_id is not None:
+        try:
+            return cache_tx.get(prefix_replay_id)
+        except KeyError:  # evicted or served by another replica
+            pass
+    return None
+
+
+def _forced_route_tail(prefix: Any, block_size: int, blocks: int) -> dict[str, Any]:
+    """Send the trailing partial block and, when requested, the preceding block."""
+    start = max(prefix.shape[0] // block_size - blocks + 1, 0) * block_size
+    rows = prefix[start:].cpu().numpy()
+    return {"start": start, "dtype": rows.dtype.str, "rows": rows.tobytes()}
 
 
 def _maybe_cache_routed_experts(
@@ -732,6 +754,8 @@ def _maybe_cache_routed_experts(
     sample_id: str | None,
     replay_id: str | None,
     prefix_replay_id: str | None,
+    prefix: Any,
+    prefix_start: int,
     request_id: str | None,
     replica_label: str | None,
     return_back_router_info: bool,
@@ -758,22 +782,19 @@ def _maybe_cache_routed_experts(
         )
     # This request re-prefills the prefix capture's positions; keep the routes the earlier request sampled with.
     prefix_len = 0
-    if prefix_replay_id is not None:
-        try:
-            prefix = cache_tx.get(prefix_replay_id)
-        except KeyError:  # another replica served the earlier request, or the cache evicted it
-            prefix = None
-        if prefix is not None:
-            if prefix.shape[0] >= prompt_len or tuple(prefix.shape[1:]) != tuple(routed.shape[1:]):
-                raise ValueError(
-                    "router-replay prefix capture must end inside the prompt, with the same layer/top-k shape "
-                    f"trajectory_id={sample_id!r} replay_id={replay_id!r} prefix_replay_id={prefix_replay_id!r} "
-                    f"prefix_shape={list(prefix.shape)} prompt_len={prompt_len} capture_shape={list(routed.shape)}"
-                )
-            import torch
+    if prefix is not None:
+        end = prefix_start + prefix.shape[0]
+        if end >= prompt_len or tuple(prefix.shape[1:]) != tuple(routed.shape[1:]):
+            raise ValueError(
+                "router-replay prefix capture must end inside the prompt, with the same layer/top-k shape "
+                f"trajectory_id={sample_id!r} replay_id={replay_id!r} prefix_replay_id={prefix_replay_id!r} "
+                f"prefix_shape={list(prefix.shape)} prompt_len={prompt_len} capture_shape={list(routed.shape)}"
+            )
+        import torch
 
-            prefix_len = int(prefix.shape[0])
-            routed = torch.cat([prefix, torch.as_tensor(routed[prefix_len:]).to(prefix.device, prefix.dtype)])
+        prefix_len = end if prefix_start == 0 else 0
+        routed = torch.as_tensor(routed)
+        routed = torch.cat((routed[:prefix_start].to(prefix), prefix, routed[end:].to(prefix)))
     cache_key = replay_id or sample_id
     if replay_id is not None and replay_id.startswith("rr1:"):
         cache_tx.put_new(cache_key, routed)
@@ -897,6 +918,7 @@ class InferenceWorker(StreamingWorkerMixin):
         # Chat parsers for this engine's model; None when chat is unsupported.
         self._chat_model: ChatModel | None = None
         self._router_replay_tx: Any = None
+        self._forced_route_blocks: tuple[int, int] | None = None
         self._router_replay_tx_on_host = False
         self._router_replay_staging_bytes: int | None = None
         self._router_replay_group: Any = None
@@ -1110,6 +1132,8 @@ class InferenceWorker(StreamingWorkerMixin):
             finally:
                 _end_engine_startup_capture(startup_error_dir)
         self._maybe_init_router_replay_tx(engine_kwargs, router_replay_engine_kwargs)
+        if engine_kwargs.get("enable_return_routed_experts"):
+            await self._init_forced_routes()
         # The live grammar now always masks the sampler's stop set, so replay
         # mirrors it unconditionally. get_tokenizer() raises under
         # skip_tokenizer_init, and such an engine cannot compile a grammar to
@@ -1275,6 +1299,16 @@ class InferenceWorker(StreamingWorkerMixin):
             return None
         return bool(parser.is_reasoning_end(prompt_ids))
 
+    async def _init_forced_routes(self) -> None:
+        workers = await self.llm.collective_rpc("forced_route_blocks")
+        reasons = {result for result in workers if isinstance(result, str)}
+        self._forced_route_blocks = None if reasons else tuple(workers[0])
+        if reasons:
+            logger.warning(
+                "Router replay: re-prefilled prefix positions keep the engine's own routes, as before, because %s",
+                "; ".join(sorted(reasons)),
+            )
+
     def _maybe_init_router_replay_tx(
         self,
         engine_kwargs: dict[str, Any],
@@ -1415,6 +1449,8 @@ class InferenceWorker(StreamingWorkerMixin):
         return_action_masks = bool(sampling_params.pop(_RETURN_ACTION_MASKS_PARAM_KEY, False))
         extra_args = dict(sampling_params.get("extra_args", None) or {})
         extra_args.pop(_RETURN_ACTION_MASKS_PARAM_KEY, None)
+        if FORCED_ROUTES_KEY in extra_args:  # an out-of-range expert id there would fault the engine's gather
+            raise ValueError(f"{FORCED_ROUTES_KEY} is set by the server from {_REPLAY_PREFIX_ID_PARAM_KEY}")
         prefix_replay_id = extra_args.pop(_REPLAY_PREFIX_ID_PARAM_KEY, None)
         if extra_args:
             sampling_params["extra_args"] = extra_args
@@ -1430,6 +1466,15 @@ class InferenceWorker(StreamingWorkerMixin):
             raise ValueError(f"{_REPLAY_ID_PARAM_KEY} requires {_SAMPLE_ID_PARAM_KEY}")
         if prefix_replay_id is not None and replay_id is None:
             raise ValueError(f"{_REPLAY_PREFIX_ID_PARAM_KEY} requires {_REPLAY_ID_PARAM_KEY}")
+        submitted_prefix = None
+        if self._forced_route_blocks is not None:
+            prefix = _cached_prefix(self._router_replay_tx, prefix_replay_id)
+            if prefix is not None:
+                shape_per_token = tuple(prefix.shape[1:])
+                tail = _forced_route_tail(prefix, *self._forced_route_blocks)
+                sampling_params["extra_args"] = {**(sampling_params.get("extra_args") or {}), FORCED_ROUTES_KEY: tail}
+                submitted_prefix = weakref.ref(prefix)
+            del prefix  # TX eviction must free the full capture while the request is in flight.
         return_back_router_info = bool(
             sampling_params.pop(_ROUTER_REPLAY_RETURN_INFO_PARAM_KEY, False)
         )
@@ -1469,6 +1514,16 @@ class InferenceWorker(StreamingWorkerMixin):
             reasoning_ended=reasoning_ended,
             lora_request=self._active_lora_request(),
         )
+        prefix_start = 0
+        if self._forced_route_blocks is None:
+            prefix = _cached_prefix(self._router_replay_tx, prefix_replay_id)
+        else:
+            prefix = submitted_prefix() if submitted_prefix is not None else None
+            if submitted_prefix is not None and prefix is None:
+                import torch
+
+                prefix_start = tail["start"]
+                prefix = torch.from_numpy(tail_rows(tail, shape_per_token).copy())
         result = _result_from_output(
             final_output,
             return_sampled_logprobs_only=return_sampled_logprobs_only,
@@ -1476,6 +1531,8 @@ class InferenceWorker(StreamingWorkerMixin):
             sample_id=sample_id,
             replay_id=replay_id,
             prefix_replay_id=prefix_replay_id,
+            prefix=prefix,
+            prefix_start=prefix_start,
             request_id=request_id,
             replica_label=self._replica_label,
             return_back_router_info=return_back_router_info,

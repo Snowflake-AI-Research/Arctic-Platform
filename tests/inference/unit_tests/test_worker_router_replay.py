@@ -1,4 +1,5 @@
 import asyncio
+import weakref
 from types import SimpleNamespace
 
 import numpy as np
@@ -16,6 +17,7 @@ from arctic_platform.inference.server.worker import (
     _pop_router_replay_engine_kwargs,
     _result_from_output,
 )
+from arctic_platform.inference.vllm.forced_routes import FORCED_ROUTES_KEY
 
 
 class _Cache:
@@ -154,6 +156,8 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
     cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
     worker = InferenceWorker.__ray_metadata__.modified_class()
     worker.state, worker._router_replay_tx, worker._replica_label = WorkerLifecycleState.READY, cache, "replica-a"
+    # Hits stop on 2-token blocks, one block lower under speculative decoding.
+    worker._forced_route_blocks = (2, 2)
     engine_params = []
 
     def generate(prompt, tokens, routes, replay_id, **extra_args):
@@ -184,21 +188,54 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
     assert cached("rr1:turn-2") == [10, 11, 12, 13, 24, 25, 26]
     assert (turn1["prefix_len"], turn2["prefix_len"], turn2["capture_len"]) == (0, 4, 7)
     assert cached("rr1:turn-1") == [10, 11, 12, 13]  # read, never released: the caller owns its captures
-    assert engine_params[-1].extra_args is None  # the key never reaches vLLM
+    # The prefix id never reaches vLLM; the stored rows from the lowest block boundary the hit can stop at do.
+    assert engine_params[-1].extra_args == {
+        FORCED_ROUTES_KEY: {"start": 2, "dtype": "|u1", "rows": bytes([12, 12, 13, 13])}
+    }
 
     # Another replica served the previous request: the capture stays as the engine computed it.
     elsewhere = generate(
         [1, 2, 3, 4, 5], [6], [10, 11, 32, 33, 34], "rr1:turn-3", dss_router_replay_prefix_id="rr1:other"
     )
     assert elsewhere["prefix_len"] == 0 and cached("rr1:turn-3") == [10, 11, 32, 33, 34]
+    assert engine_params[-1].extra_args is None
 
     # A prefix capture must end before the prompt does; the request is refused before anything is cached.
     with pytest.raises(ValueError, match="must end inside the prompt"):
         generate([1, 2, 3, 4, 5, 6], [7], [0] * 6, "rr1:turn-4", dss_router_replay_prefix_id="rr1:turn-2")
     assert "rr1:turn-4" not in cache and "rr1:turn-2" in cache
+    # Only the server sets the stored rows a request runs under.
+    with pytest.raises(ValueError, match="is set by the server"):
+        generate([1, 2], [3], [0, 0], "rr1:turn-5", **{FORCED_ROUTES_KEY: {}})
     prefix_only = dict(max_tokens=1, extra_args=dict(dss_router_replay_prefix_id="rr1:turn-2"))
     with pytest.raises(ValueError, match="dss_router_replay_prefix_id requires dss_router_replay_id"):
         asyncio.run(worker.generate([1], prefix_only))
+
+
+@pytest.mark.parametrize("blocks", [(2, 1), None], ids=["replay", "fallback"])
+def test_discard_during_generation_releases_the_prefix_and_preserves_splice_timing(blocks):
+    cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
+    cache.put("previous", torch.ones(3, 1, 1, dtype=torch.uint8))
+    previous = weakref.ref(cache.get("previous"))
+    worker = InferenceWorker.__ray_metadata__.modified_class()
+    worker.state, worker._router_replay_tx, worker._forced_route_blocks = WorkerLifecycleState.READY, cache, blocks
+
+    async def complete(_prompt, params, _request_id, **_kwargs):
+        assert (FORCED_ROUTES_KEY in (params.extra_args or {})) == (blocks is not None)
+        cache.discard(["previous"])
+        assert previous() is None
+        cache.put("previous", torch.full((3, 1, 1), 2, dtype=torch.uint8))
+        choice = SimpleNamespace(text="", token_ids=[5], finish_reason="length", logprobs=None)
+        return SimpleNamespace(outputs=[choice], prompt_token_ids=[1, 2, 3, 4], prompt_logprobs=None,
+                               routed_experts=np.zeros((4, 1, 1), np.uint8))
+
+    worker._generate_once = complete
+    params = dict(max_tokens=1, dss_sample_id="next", dss_router_replay_id="rr1:next",
+                  extra_args=dict(dss_router_replay_prefix_id="previous"))
+    result = asyncio.run(worker.generate([1, 2, 3, 4], params))
+    assert result["router_replay"]["prefix_len"] == (3 if blocks is None else 0)
+    # The engine's shared auxiliary store supplied zeros. Only the submitted tail has surviving ID evidence.
+    assert cache.get("rr1:next")[:, 0, 0].tolist() == ([2, 2, 2, 0] if blocks is None else [0, 0, 1, 0])
 
 
 def test_router_replay_cache_device_is_popped_and_validated_before_engine_start():
