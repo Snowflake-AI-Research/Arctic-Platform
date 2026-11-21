@@ -31,6 +31,7 @@ from arctic_platform.inference.vllm.dense_prompt_logprobs import (
     stage_sampling_params as _stage_dense_prompt_logprobs,
     take_dense as _take_dense_prompt_logprobs,
 )
+from arctic_platform.inference.vllm.forced_routes import FORCED_ROUTES_KEY
 from arctic_platform.inference.vllm.spec_decode_grammar import (
     ensure_spec_decode_grammar_fix,
 )
@@ -649,6 +650,7 @@ def _result_from_output(
     sample_id: str | None = None,
     replay_id: str | None = None,
     prefix_replay_id: str | None = None,
+    prefix: Any = None,
     request_id: str | None = None,
     replica_label: str | None = None,
     return_back_router_info: bool = False,
@@ -717,11 +719,27 @@ def _result_from_output(
         sample_id=sample_id,
         replay_id=replay_id,
         prefix_replay_id=prefix_replay_id,
+        prefix=prefix,
         request_id=request_id,
         replica_label=replica_label,
         return_back_router_info=return_back_router_info,
     )
     return result
+
+
+def _forced_route_blocks(vllm_config: Any) -> tuple[int, int]:
+    """(block size, blocks): how far below the end of its previous request a continuation's prefix-cache hit stops,
+    at most; speculative decoding that drops the trailing cached block adds one block."""
+    spec = vllm_config.speculative_config
+    return vllm_config.cache_config.block_size, 2 if spec is not None and spec.use_eagle_block_drop() else 1
+
+
+def _forced_route_tail(prefix: Any, block_size: int, blocks: int) -> dict[str, Any]:
+    """The prefix capture's rows from the lowest block boundary the hit can stop at: fewer than
+    ``blocks * block_size`` rows, whatever the prefix length."""
+    start = max(prefix.shape[0] // block_size - blocks + 1, 0) * block_size
+    rows = prefix[start:].cpu().numpy()
+    return {"start": start, "dtype": rows.dtype.str, "rows": rows.tobytes()}
 
 
 def _maybe_cache_routed_experts(
@@ -732,6 +750,7 @@ def _maybe_cache_routed_experts(
     sample_id: str | None,
     replay_id: str | None,
     prefix_replay_id: str | None,
+    prefix: Any,
     request_id: str | None,
     replica_label: str | None,
     return_back_router_info: bool,
@@ -758,22 +777,17 @@ def _maybe_cache_routed_experts(
         )
     # This request re-prefills the prefix capture's positions; keep the routes the earlier request sampled with.
     prefix_len = 0
-    if prefix_replay_id is not None:
-        try:
-            prefix = cache_tx.get(prefix_replay_id)
-        except KeyError:  # another replica served the earlier request, or the cache evicted it
-            prefix = None
-        if prefix is not None:
-            if prefix.shape[0] >= prompt_len or tuple(prefix.shape[1:]) != tuple(routed.shape[1:]):
-                raise ValueError(
-                    "router-replay prefix capture must end inside the prompt, with the same layer/top-k shape "
-                    f"trajectory_id={sample_id!r} replay_id={replay_id!r} prefix_replay_id={prefix_replay_id!r} "
-                    f"prefix_shape={list(prefix.shape)} prompt_len={prompt_len} capture_shape={list(routed.shape)}"
-                )
-            import torch
+    if prefix is not None:
+        if prefix.shape[0] >= prompt_len or tuple(prefix.shape[1:]) != tuple(routed.shape[1:]):
+            raise ValueError(
+                "router-replay prefix capture must end inside the prompt, with the same layer/top-k shape "
+                f"trajectory_id={sample_id!r} replay_id={replay_id!r} prefix_replay_id={prefix_replay_id!r} "
+                f"prefix_shape={list(prefix.shape)} prompt_len={prompt_len} capture_shape={list(routed.shape)}"
+            )
+        import torch
 
-            prefix_len = int(prefix.shape[0])
-            routed = torch.cat([prefix, torch.as_tensor(routed[prefix_len:]).to(prefix.device, prefix.dtype)])
+        prefix_len = int(prefix.shape[0])
+        routed = torch.cat([prefix, torch.as_tensor(routed[prefix_len:]).to(prefix.device, prefix.dtype)])
     cache_key = replay_id or sample_id
     if replay_id is not None and replay_id.startswith("rr1:"):
         cache_tx.put_new(cache_key, routed)
@@ -1415,6 +1429,8 @@ class InferenceWorker(StreamingWorkerMixin):
         return_action_masks = bool(sampling_params.pop(_RETURN_ACTION_MASKS_PARAM_KEY, False))
         extra_args = dict(sampling_params.get("extra_args", None) or {})
         extra_args.pop(_RETURN_ACTION_MASKS_PARAM_KEY, None)
+        if FORCED_ROUTES_KEY in extra_args:  # an out-of-range expert id there would fault the engine's gather
+            raise ValueError(f"{FORCED_ROUTES_KEY} is set by the server from {_REPLAY_PREFIX_ID_PARAM_KEY}")
         prefix_replay_id = extra_args.pop(_REPLAY_PREFIX_ID_PARAM_KEY, None)
         if extra_args:
             sampling_params["extra_args"] = extra_args
@@ -1430,6 +1446,16 @@ class InferenceWorker(StreamingWorkerMixin):
             raise ValueError(f"{_REPLAY_ID_PARAM_KEY} requires {_SAMPLE_ID_PARAM_KEY}")
         if prefix_replay_id is not None and replay_id is None:
             raise ValueError(f"{_REPLAY_PREFIX_ID_PARAM_KEY} requires {_REPLAY_ID_PARAM_KEY}")
+        prefix = None
+        if prefix_replay_id is not None and self._router_replay_tx is not None:
+            try:
+                prefix = self._router_replay_tx.get(prefix_replay_id)
+            except KeyError:  # another replica served the earlier request, or the cache evicted it
+                pass
+        if prefix is not None:
+            # The engine re-prefills these positions under the stored routes, so the splice below keeps what it ran.
+            tail = _forced_route_tail(prefix, *_forced_route_blocks(self.llm.vllm_config))
+            sampling_params["extra_args"] = {**(sampling_params.get("extra_args") or {}), FORCED_ROUTES_KEY: tail}
         return_back_router_info = bool(
             sampling_params.pop(_ROUTER_REPLAY_RETURN_INFO_PARAM_KEY, False)
         )
@@ -1476,6 +1502,7 @@ class InferenceWorker(StreamingWorkerMixin):
             sample_id=sample_id,
             replay_id=replay_id,
             prefix_replay_id=prefix_replay_id,
+            prefix=prefix,
             request_id=request_id,
             replica_label=self._replica_label,
             return_back_router_info=return_back_router_info,

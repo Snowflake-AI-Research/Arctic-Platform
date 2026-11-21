@@ -16,6 +16,7 @@ from arctic_platform.inference.server.worker import (
     _pop_router_replay_engine_kwargs,
     _result_from_output,
 )
+from arctic_platform.inference.vllm.forced_routes import FORCED_ROUTES_KEY
 
 
 class _Cache:
@@ -154,6 +155,10 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
     cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
     worker = InferenceWorker.__ray_metadata__.modified_class()
     worker.state, worker._router_replay_tx, worker._replica_label = WorkerLifecycleState.READY, cache, "replica-a"
+    # Hits stop on 2-token blocks, one block lower under speculative decoding.
+    spec = SimpleNamespace(use_eagle_block_drop=lambda: True)
+    cache_config = SimpleNamespace(block_size=2)
+    worker.llm = SimpleNamespace(vllm_config=SimpleNamespace(cache_config=cache_config, speculative_config=spec))
     engine_params = []
 
     def generate(prompt, tokens, routes, replay_id, **extra_args):
@@ -184,18 +189,25 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
     assert cached("rr1:turn-2") == [10, 11, 12, 13, 24, 25, 26]
     assert (turn1["prefix_len"], turn2["prefix_len"], turn2["capture_len"]) == (0, 4, 7)
     assert cached("rr1:turn-1") == [10, 11, 12, 13]  # read, never released: the caller owns its captures
-    assert engine_params[-1].extra_args is None  # the key never reaches vLLM
+    # The prefix id never reaches vLLM; the stored rows from the lowest block boundary the hit can stop at do.
+    assert engine_params[-1].extra_args == {
+        FORCED_ROUTES_KEY: {"start": 2, "dtype": "|u1", "rows": bytes([12, 12, 13, 13])}
+    }
 
     # Another replica served the previous request: the capture stays as the engine computed it.
     elsewhere = generate(
         [1, 2, 3, 4, 5], [6], [10, 11, 32, 33, 34], "rr1:turn-3", dss_router_replay_prefix_id="rr1:other"
     )
     assert elsewhere["prefix_len"] == 0 and cached("rr1:turn-3") == [10, 11, 32, 33, 34]
+    assert engine_params[-1].extra_args is None
 
     # A prefix capture must end before the prompt does; the request is refused before anything is cached.
     with pytest.raises(ValueError, match="must end inside the prompt"):
         generate([1, 2, 3, 4, 5, 6], [7], [0] * 6, "rr1:turn-4", dss_router_replay_prefix_id="rr1:turn-2")
     assert "rr1:turn-4" not in cache and "rr1:turn-2" in cache
+    # Only the server sets the stored rows a request runs under.
+    with pytest.raises(ValueError, match="is set by the server"):
+        generate([1, 2], [3], [0, 0], "rr1:turn-5", **{FORCED_ROUTES_KEY: {}})
     prefix_only = dict(max_tokens=1, extra_args=dict(dss_router_replay_prefix_id="rr1:turn-2"))
     with pytest.raises(ValueError, match="dss_router_replay_prefix_id requires dss_router_replay_id"):
         asyncio.run(worker.generate([1], prefix_only))
