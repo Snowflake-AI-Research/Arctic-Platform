@@ -24,7 +24,7 @@ E, K, D = 16, 4, 8  # experts, top-k, hidden width
 
 
 def _router(bias):
-    # GLM-5.3-Flash's routing: one group, sigmoid scores, a correction bias, renormalised, scaled.
+    # Grouped top-k with one group: sigmoid scores, a correction bias, renormalised, scaled.
     return GroupedTopKRouter(
         top_k=K, global_num_experts=E, num_expert_group=1, topk_group=1, renormalize=True,
         scoring_func="sigmoid", routed_scaling_factor=2.5, e_score_correction_bias=bias,
