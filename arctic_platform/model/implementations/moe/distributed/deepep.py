@@ -231,6 +231,9 @@ def get_buffer(group: ProcessGroup, hidden_bytes: int) -> Buffer:
         or _buffer.num_nvl_bytes < num_nvl_bytes
         or _buffer.num_rdma_bytes < num_rdma_bytes
     ):
+        # DeepEP allocates outside PyTorch's caching allocator, which may hold all free device memory (the first
+        # dispatch can come after the load's peak, with a frozen-offloaded model's experts still resident).
+        torch.cuda.empty_cache()
         _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
 
     return _buffer
