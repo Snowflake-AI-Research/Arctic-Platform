@@ -1,5 +1,17 @@
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """PackedLayout: gather pack/unpack, sharing-off vs pack_microbatch, prefix attention, lifetime, gates.
 
@@ -296,8 +308,11 @@ def test_token_mean_required_when_sharing():
 
 def test_agg_loss_rejects_seq_mean_under_sharing_layout():
     # rl.processors must load before the verl module, which it imports back.
+    # isort: off
     from arctic_platform.rl.processors.functional import agg_loss
     from arctic_platform.integrations.verl.grpo_loss import agg_loss as verl_agg_loss
+
+    # isort: on
 
     loss_mat, loss_mask = torch.ones(2, 3), torch.ones(2, 3)
     with pytest.raises(ValueError, match="token-mean"):

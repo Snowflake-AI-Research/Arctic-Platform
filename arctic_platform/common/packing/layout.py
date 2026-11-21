@@ -548,7 +548,9 @@ def _hf_prefix_attention(model: torch.nn.Module) -> Iterator[None]:
         raise ValueError("prefix sharing on Hugging Face attention needs transformers' AttentionInterface") from exc
     local = getattr(registry, "_local_mapping", None)
     if not isinstance(local, dict):
-        raise ValueError("transformers' AttentionInterface has no per-instance mapping; cannot scope the prefix wrapper")
+        raise ValueError(
+            "transformers' AttentionInterface has no per-instance mapping; cannot scope the prefix wrapper"
+        )
     for module in hf_modules:
         if getattr(sys.modules.get(type(module).__module__), "ALL_ATTENTION_FUNCTIONS", None) is not registry:
             raise ValueError(f"{type(module).__name__} does not dispatch through transformers.ALL_ATTENTION_FUNCTIONS")
