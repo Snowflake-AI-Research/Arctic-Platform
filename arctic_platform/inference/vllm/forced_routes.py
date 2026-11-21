@@ -161,15 +161,11 @@ def install(runner: Any) -> ForcedRoutes:
 def patch_model_runner(runner_cls: Any) -> None:
     if getattr(runner_cls.prepare_inputs, _APPLIED_ATTR, False):
         return
-    original_init = runner_cls.__init__
+    runner_cls._forced_routes = None  # until initialize_kv_cache installs it on an engine that captures routes
     original_initialize_kv_cache = runner_cls.initialize_kv_cache
     original_add_requests = runner_cls.add_requests
     original_remove_request = runner_cls._remove_request
     original_prepare_inputs = runner_cls.prepare_inputs
-
-    def __init__(self, *args, **kwargs):
-        self._forced_routes = None
-        original_init(self, *args, **kwargs)
 
     def initialize_kv_cache(self, *args, **kwargs):
         result = original_initialize_kv_cache(self, *args, **kwargs)
@@ -200,7 +196,6 @@ def patch_model_runner(runner_cls: Any) -> None:
         return input_batch
 
     for name, fn, orig in (
-        ("__init__", __init__, original_init),
         ("initialize_kv_cache", initialize_kv_cache, original_initialize_kv_cache),
         ("add_requests", add_requests, original_add_requests),
         ("_remove_request", _remove_request, original_remove_request),
