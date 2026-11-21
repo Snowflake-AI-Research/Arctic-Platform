@@ -88,8 +88,6 @@ class ForcedRoutes:
     def fill(self, req_ids: list[str], query_start_loc: np.ndarray, num_computed: np.ndarray, num_rows: int) -> None:
         """Mark the batch rows that compute a stored position, with the same boundaries the routed-experts capture
         uses (``AuxOutputWorkerConnector.prepare_output``); every other row up to ``num_rows`` is cleared."""
-        from vllm.utils.torch_utils import async_tensor_h2d
-
         mask = np.zeros(num_rows, dtype=np.bool_)
         for i, req_id in enumerate(req_ids):
             if req_id not in self.rows:
@@ -101,8 +99,9 @@ class ForcedRoutes:
             if lo < hi:
                 at = int(query_start_loc[i]) + lo - first
                 mask[at : at + hi - lo] = True
-                async_tensor_h2d(rows[lo - start : hi - start].astype(np.int32), out=self.ids[at : at + hi - lo])
-        async_tensor_h2d(mask, out=self.mask[:num_rows])
+                stored = torch.from_numpy(rows[lo - start : hi - start].astype(np.int32))
+                self.ids[at : at + hi - lo].copy_(stored, non_blocking=True)
+        self.mask[:num_rows].copy_(torch.from_numpy(mask), non_blocking=True)
 
 
 def bind_router(router: Any, layer_id: int, forced: ForcedRoutes) -> None:

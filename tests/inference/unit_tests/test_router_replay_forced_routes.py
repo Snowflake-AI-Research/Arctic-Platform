@@ -23,12 +23,6 @@ from arctic_platform.inference.vllm.forced_routes import ForcedRoutes, bind_rout
 E, K, D = 16, 4, 8  # experts, top-k, hidden width
 
 
-@pytest.fixture(autouse=True)
-def _no_pinned_staging(monkeypatch):
-    # CPU test images have no driver to pin host memory with.
-    monkeypatch.setattr("vllm.utils.torch_utils.is_pin_memory_available", lambda: False)
-
-
 def _router(bias):
     # GLM-5.3-Flash's routing: one group, sigmoid scores, a correction bias, renormalised, scaled.
     return GroupedTopKRouter(
