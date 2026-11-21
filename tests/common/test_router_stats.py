@@ -23,6 +23,7 @@ import pytest
 import torch
 from pydantic import ValidationError
 
+from arctic_platform.common.callbacks import CallbackRunner
 from arctic_platform.common.callbacks import Reduce
 from arctic_platform.common.callbacks import merge_metrics
 from arctic_platform.model.implementations.debug.config import router_stats_strides
@@ -459,3 +460,76 @@ def test_loader_debug_options_reject_router_stats_strides():
         DebugModelOptions(router_stats_sample_stride=4)
     with pytest.raises(ValidationError, match="router_stats_call_stride"):
         GlmMoeDsaDebugOptions(router_stats_call_stride=2)
+
+
+def test_quarantine_disables_hooks_so_next_step_counts_only_new_tokens():
+    """Mike's repro: quarantine in pre_fwd_bwd, pad tokens, next step publishes 5 not 8."""
+
+    class _BoomOnce(RouterStatsCallback):
+        def __init__(self, training_config):
+            super().__init__(training_config)
+            self._boom = True
+
+        def pre_fwd_bwd(self, trainer):
+            if self._boom:
+                self._boom = False
+                raise RuntimeError("pre_fwd_bwd boom")
+            super().pre_fwd_bwd(trainer)
+
+    torch.manual_seed(0)
+    model = torch.nn.Module()
+    model.add_module("router", TokenChoiceTopKRouter(DIM, EXPERTS, TOP_K, "softmax", route_norm=True, route_scale=1.0))
+    trainer = SimpleNamespace(model=model)
+    runner = CallbackRunner([_BoomOnce], _training_config(stride=1), rank=0)
+    runner.run("post_init", trainer)
+    cb = runner.callbacks[0]
+
+    runner.run("pre_fwd_bwd", trainer)
+    assert cb in runner._failed
+    assert cb._disabled
+    model.router(torch.randn(3, DIM))  # would have leaked without on_quarantine
+    assert runner.flush() == {}
+    assert runner.last_dropped == frozenset({"router_stats"})
+
+    runner.run("pre_fwd_bwd", trainer)
+    runner.run("pre_fwd_bwd_microbatch", trainer, False)
+    model.router(torch.randn(5, DIM))
+    runner.run("post_fwd_bwd_microbatch", trainer, False)
+    runner.run("post_step", trainer)
+    metrics = runner.flush()
+    assert metrics["router_stats"][1]["router"]["sampled_tokens"] == pytest.approx(5.0)
+
+
+def test_post_init_mixed_top_k_raises_through_runner():
+    torch.manual_seed(0)
+    model = torch.nn.Module()
+    model.add_module("router0", TokenChoiceTopKRouter(DIM, EXPERTS, 2, "softmax", route_norm=True, route_scale=1.0))
+    model.add_module("router1", TokenChoiceTopKRouter(DIM, EXPERTS, 1, "softmax", route_norm=True, route_scale=1.0))
+    trainer = SimpleNamespace(model=model)
+    runner = CallbackRunner([RouterStatsCallback], _training_config(stride=1), rank=0)
+    with pytest.raises(ValueError, match="top-1"):
+        runner.run("post_init", trainer)
+    assert runner._failed == set()
+    assert runner.callbacks[0]._layers == []
+
+
+def test_on_error_mismatched_stage_is_noop():
+    model, callback, trainer = _hooked(stride=1)
+    first = torch.randn(4, DIM)
+    callback.pre_fwd_bwd(trainer)
+    callback.pre_fwd_bwd_microbatch(trainer, is_padding=False)
+    model.router(first)
+    callback.post_fwd_bwd_microbatch(trainer, is_padding=False)
+    callback.post_fwd_bwd(trainer, {})
+
+    # Interleaved forward_only overwrites the snapshot stage.
+    second = torch.randn(6, DIM)
+    callback.pre_fwd_only(trainer)
+    callback.pre_fwd_only_microbatch(trainer, is_padding=False)
+    model.router(second)
+
+    callback.on_error(trainer, "fwd_bwd", RuntimeError("stale fwd_bwd broadcast"))
+    callback.post_step(trainer)
+    _reduce, report = callback.pending["router_stats"]
+    # Mismatch left both requests' totals; restore did not run.
+    assert report["router"]["sampled_tokens"] == pytest.approx(float(len(first) + len(second)))
