@@ -188,6 +188,9 @@ def plan_from_dockerfile(
         name = ins["instruction"]
         value = str(ins.get("value", "")).strip()
 
+        if name == "COMMENT":
+            continue
+
         if name == "ARG":
             active_args = global_args if plan is None else stage_args
             scope = {**global_args, **caller_args} if plan is None else {**stage_args, **plan.env}

@@ -408,6 +408,9 @@ class Driver:
             models[mid] = await pool.drain_metrics()
         return {"models": models}
 
+    async def num_waiting_reqs(self, model_id: str | None = None) -> list[int | None]:
+        return await self._get_pool(model_id).num_waiting_reqs()
+
 
 # Swap backend and reuse the app — no endpoint duplication.
 api.backend = Driver()

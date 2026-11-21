@@ -16,25 +16,37 @@ skips DeepSpeed, `transformers`, Ray and vLLM.
 
 ## Supported training regime
 
-Cortex sub-jobs expose training + sampling + weight-sync but no `/forward`
-sub-job, no disk-shared weight reload, and no colocation lifecycle. That
-constrains what runs correctly here:
+Cortex sub-jobs expose training + sampling + weight-sync. Policy log-probs
+use the training `forward` operation. There is no reference forward, no
+disk-shared weight reload, and no colocation lifecycle. That constrains what
+runs correctly here:
 
-* **Single-epoch on-policy GRPO only.** With `context.old_log_probs_shifted`
-  absent, the server-side GRPO loss defaults `old_log_probs =
-  logprobs.detach()`, restoring π_old ≡ π_new. Multi-epoch PPO needs the
-  rollout-time snapshot, which this backend cannot provide.
+* **`fwd_no_grad` returns the server logprobs in the caller's columns.**
+  A non-ZoRRo response is full width `[B, S]`, and column `t` is the log
+  probability of token `t + 1`, the same predict-next frame as the on-prem
+  forward. SkyRL shifts that onto the token itself. Rows are left-aligned on
+  the way out, because the packer rejects leading padding, and the response
+  is scattered back onto the caller's columns. Padding comes back as `0`.
+  The last real column is the roll-wrap value, and the loss mask there is 0.
+  A ZoRRo response stays in the client layout and scores each response token
+  itself, with `0` on the prompt columns. The logprobs come back under
+  `batch["logprobs"]` and `batch["log_probs"]`. A width other than the
+  caller's `attention_mask` raises.
+* **Log-prob calls keep arrival order.** `to_cortex_fwd_payload` stamps
+  `balance_batch` false and does not send `prompt_group_ids`.
+* **Non-ZoRRo clipping stays inert.** That training request drops
+  `old_log_probs`, so the server re-derives π_old from the live forward.
+  The returned logprobs are the caller's snapshot; they are not sent back
+  as `old_log_probs_shifted`.
+* **ZoRRo training sends that snapshot.** `fwd_bwd` places it on
+  `context.old_log_probs_shifted`, in the caller's columns and unshifted,
+  because ZoRRo log-probs sit on the response token they score. There is
+  still no reference forward, so a multi-epoch update against a frozen
+  policy is not available.
 * **No KL-to-reference.** There are no reference log-probs to build the term
   from, so `use_kl_loss` / `use_kl_in_reward` must be off. Asking for them
   raises from `_CortexClientShim.fwd_no_grad` rather than substituting zeros,
   which would reduce the KL to a function of the current policy alone.
-* **Clipping is inert, and `approx_kl` reads 0.0.** π_old is re-derived per
-  `fwd_bwd` rather than snapshotted. With one optimizer step per collected
-  batch — which is what SkyRL's Arctic trainer does, `policy_mini_batch_size`
-  being only the gradient-accumulation chunk — the policy cannot move within a
-  step, so π_old ≡ π_new holds exactly and the ratio is 1. That makes this
-  single-update on-policy GRPO rather than a broken approximation, but a recipe
-  that needs clipping to take several updates per batch cannot run here.
 * **Weight sync via NCCL only.** `save_weights` (SkyRL's disk-based reload)
   raises; use `sync_weights()` or `save_checkpoint()`.
 * **`wake_*` / `sleep_*` are no-ops.** Cortex sub-jobs are always awake; the
