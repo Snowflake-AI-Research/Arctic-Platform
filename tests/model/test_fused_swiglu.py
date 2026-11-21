@@ -30,6 +30,7 @@ def _reference(gate, up, limit):
 @pytest.mark.parametrize("limit", [None, 10.0, 1.5])
 def test_fused_swiglu_matches_reference_forward_and_backward(limit):
     from arctic_platform.model.implementations.kernels.fused_swiglu import fused_swiglu
+    from arctic_platform.model.implementations.kernels.fused_swiglu import packed_swiglu
 
     torch.manual_seed(0)
     gate = (torch.randn(3001, 512, device="cuda") * 4).double()
@@ -46,15 +47,21 @@ def test_fused_swiglu_matches_reference_forward_and_backward(limit):
     g64, u64 = gate.clone().requires_grad_(), up.clone().requires_grad_()
     _reference(g64, u64, limit).backward(grad)
 
-    g, u = gate.bfloat16().requires_grad_(), up.bfloat16().requires_grad_()
-    out = fused_swiglu(g, u, limit)
-    out.backward(grad.bfloat16())
     expected = _reference(gate.bfloat16().double(), up.bfloat16().double(), limit)
-    torch.testing.assert_close(out.double(), expected, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(g.grad.double(), g64.grad, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(u.grad.double(), u64.grad, rtol=2e-2, atol=2e-2)
-    if limit is not None:
-        assert (g.grad[0, :4] == 0).all() and (u.grad[0, :4] == 0).all()
+
+    g, u = gate.bfloat16().requires_grad_(), up.bfloat16().requires_grad_()
+    packed = torch.cat([gate, up], dim=1).bfloat16().requires_grad_()
+    for out, grads in (
+        (fused_swiglu(g, u, limit), lambda: (g.grad, u.grad)),
+        (packed_swiglu(packed, limit), lambda: packed.grad.chunk(2, dim=1)),
+    ):
+        out.backward(grad.bfloat16())
+        dg, du = grads()
+        torch.testing.assert_close(out.double(), expected, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(dg.double(), g64.grad, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(du.double(), u64.grad, rtol=2e-2, atol=2e-2)
+        if limit is not None:
+            assert (dg[0, :4] == 0).all() and (du[0, :4] == 0).all()
 
 
 def test_grouped_expert_lora_rows_matches_padded_lora():
