@@ -234,7 +234,8 @@ def test_discard_during_generation_releases_the_prefix_and_preserves_splice_timi
                   extra_args=dict(dss_router_replay_prefix_id="previous"))
     result = asyncio.run(worker.generate([1, 2, 3, 4], params))
     assert result["router_replay"]["prefix_len"] == (3 if blocks is None else 0)
-    assert cache.get("rr1:next")[:, 0, 0].tolist() == ([2, 2, 2, 0] if blocks is None else [0] * 4)
+    # The engine's shared auxiliary store supplied zeros. Only the submitted tail has surviving ID evidence.
+    assert cache.get("rr1:next")[:, 0, 0].tolist() == ([2, 2, 2, 0] if blocks is None else [0, 0, 1, 0])
 
 
 def test_router_replay_cache_device_is_popped_and_validated_before_engine_start():

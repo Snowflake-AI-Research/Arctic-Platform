@@ -35,6 +35,10 @@ _SCORES = {
 }
 
 
+def tail_rows(payload: dict[str, Any], shape_per_token: tuple[int, ...]) -> np.ndarray:
+    return np.frombuffer(payload["rows"], dtype=payload["dtype"]).reshape(-1, *shape_per_token)
+
+
 class ForcedRoutes:
     """One worker's stored rows per request, and the forced ids and mask of the step being run."""
 
@@ -48,7 +52,7 @@ class ForcedRoutes:
         # Public vLLM xargs accept scalars and lists. Only the server emits a mapping with binary rows.
         if not isinstance(forced, dict) or not isinstance(forced.get("rows"), bytes):
             return
-        rows = np.frombuffer(forced["rows"], dtype=forced["dtype"]).reshape(-1, *self.ids.shape[1:])
+        rows = tail_rows(forced, self.ids.shape[1:])
         start = forced["start"]
         # The frontend rejects a capture reaching the end of the effective prompt; never execute its rows.
         if start + len(rows) < request.prompt_len:
