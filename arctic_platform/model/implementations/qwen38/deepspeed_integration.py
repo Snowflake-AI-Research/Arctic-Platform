@@ -123,6 +123,17 @@ def load_qwen4_exp_model(
 ) -> nn.Module:
     """Load Qwen3.8-Flash-Next. Weight sync stays on the Hugging Face iterator."""
     _validate_parallelism(sp_size, sp_group)
+    from arctic_platform.model.implementations.kernels.flashinfer_top_k import prepare_flashinfer_top_k
+
+    # Every rank, before the checkpoint load: a node whose FlashInfer cache lacks the indexer's top-k builds it now
+    # (~10 minutes) while the others wait on the CPU, not in a step's collective.
+    prepare_flashinfer_top_k()
+    from .host_table import configure as configure_host_table
+    from .host_table import hold_host_tables
+    from .host_table import host_table_enabled
+
+    # Read by the n-gram embedding's first forward, after the checkpoint load.
+    configure_host_table(getattr(options, "ngram_table_on_host", None))
     model = qwen_ds._load_moe_model(
         _adapter(),
         load_qwen4_exp_model_for_deepspeed,
@@ -138,4 +149,9 @@ def load_qwen4_exp_model(
         device_mesh_type=DeviceMesh,
     )
     qwen_ds.maybe_apply_row_invariant_projections(model, options.model_dump())
+    if host_table_enabled():
+        from .modeling_qwen4_exp import EPShardedEmbedding
+
+        # A table that moved keeps an empty parameter: its checkpoint and its export see the host rows instead.
+        hold_host_tables(model, [m for m in model.modules() if isinstance(m, EPShardedEmbedding)])
     return model

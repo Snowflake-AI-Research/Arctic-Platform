@@ -40,6 +40,7 @@ from arctic_platform.model.implementations.moe.layers.moe import FeedForward
 from arctic_platform.model.implementations.moe.layers.moe import MoE
 from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
 
+from . import host_table
 from . import hyper_connection
 from .converting_qwen4_exp import convert_hf_layer_to_prime
 from .converting_qwen4_exp import convert_hf_to_prime
@@ -62,10 +63,16 @@ class EPShardedEmbedding(nn.Embedding):
         rows_per_rank, remainder = divmod(self.num_embeddings, world_size)
         local_rows = rows_per_rank + int(rank < remainder)
         start = rank * rows_per_rank + min(rank, remainder)
-        if self.weight.shape[0] != local_rows:
+        if host_table.host_table_enabled() and getattr(self, "_host_weight", None) is None:
+            # Moved on first use, after the checkpoint is loaded and DeepSpeed has placed the module.
+            self._host_weight = host_table.move_to_host(self.weight.detach())
+            self.weight.data = self.weight.data.new_empty((0, self.embedding_dim))
+        table = getattr(self, "_host_weight", None)
+        shard_rows = (table if table is not None else self.weight).shape[0]
+        if shard_rows != local_rows:
             raise RuntimeError(
                 "Qwen3.8 PLE embedding shard has an unexpected shape: "
-                f"rank={rank}, expected={local_rows}, actual={self.weight.shape[0]}"
+                f"rank={rank}, expected={local_rows}, actual={shard_rows}"
             )
 
         input_shape = input.shape
@@ -105,7 +112,10 @@ class EPShardedEmbedding(nn.Embedding):
             input_split_sizes=send_counts,
             group=self._ep_group,
         )
-        local_output = F.embedding(recv_ids - start, self.weight)
+        if table is not None:
+            local_output = host_table.gather_rows(table, recv_ids - start)
+        else:
+            local_output = F.embedding(recv_ids - start, self.weight)
         sorted_output = torch.empty(
             (flat_input.numel(), self.embedding_dim),
             dtype=local_output.dtype,
@@ -376,6 +386,12 @@ class Qwen4ExpForConditionalGenerationPrimeRL(
     Qwen4ExpForConditionalGeneration,
     PreTrainedModelPrimeRL,
 ):
+    # The sampler's adapter pack (weight_export.save_peft_adapters) carries the routed experts' LoRA one expert at a
+    # time, as vLLM's Qwen4Exp (a Qwen3-Next FusedMoE) maps it (experts.{e}.gate_proj / down_proj / up_proj): PEFT's
+    # 3-D layout nests one wrapper per expert parameter, and vLLM reads only two of the three (experts.base_layer as
+    # gate_up, experts as down).
+    vllm_lora_expert_projections = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+
     def __init__(self, config, **_kwargs):
         if getattr(config, "quantization_config", None):
             raise NotImplementedError(
