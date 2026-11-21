@@ -183,6 +183,7 @@ def init(inst: Instance, gpu=0):
 | `attach()` | Allocates the per-rank CPU buffer sized to that rank's `named_parameters()` | Also what puts real `pinned_cpu_bytes` / `max_pinned_bytes_per_worker` on the handle |
 | `stage()` | GPU params -> that buffer | |
 | `save_weights()` | Buffer -> `<model_dir>/weights` (flat at TP1, `weights/rank<N>/` at TP>1) | After `stage`, before `detach`, or there is nothing to write |
+| `release_host_weights()` | Empties the host-resident parameters' mappings (DeepSeek's Engram tables) so the image holds none of their pages; no-op elsewhere. Not in the scripts: `semip_engine._dump` and `example_full` call it | After `save_weights`, which wrote their bytes, and before `cuda_checkpoint`, which must find nothing registered. See [`instance_DESIGN.md`](instance_DESIGN.md) *Host-Resident Parameters* |
 | `detach()` | Frees the CPU buffer | Keeps the image small. Also zeroes both pinned counters (`_apply_result`), which is why every image records `pinned_cpu_bytes: 0` and why the restore must `attach().wait()` before planning |
 | `sleep()` | `llm.sleep(level=2)` — frees weight and KV memory | |
 | `cuda_checkpoint()` | `cuCheckpointProcess`; CUDA state to host | At TP>1 inserts `destroy_nccl()` itself |
@@ -279,7 +280,7 @@ the dump differently:
           flush=True)
 
     print("\n== saved -> up ==", flush=True)
-    inst.save_weights().detach().wait()
+    inst.save_weights().release_host_weights().detach().wait()
 ```
 
 It stages *before* generating, and it calls `repin()` — `cudaHostRegister` on

@@ -155,8 +155,29 @@ def _get_cu():
     return _cu_bindings
 
 
+def _proc_is_zombie(pid, proc="/proc"):
+    """Whether ``/proc/<pid>/stat`` reports state ``Z``: exited, not yet reaped.
+
+    ``comm`` (field 2) can contain spaces and parens, so parse after the last
+    ')': index 0 is then field 3, the state.  A pid that is gone, or a stat
+    that does not parse, is not a zombie.
+    """
+    try:
+        with open(f"{proc}/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except (OSError, IndexError):
+        return False
+
+
 def _get_descendant_pids(pid):
-    """Return PIDs of all descendant processes, leaves first (bottom-up)."""
+    """Return PIDs of all live descendant processes, leaves first (bottom-up).
+
+    Zombies are left out.  A dead child holds no CUDA state, nothing to
+    signal and no fds, and ``cuCheckpointProcessLock`` on one fails with
+    CUDA_ERROR_NOT_INITIALIZED -- which is how a helper the vLLM child forked
+    and never waited on failed a TP=8 cuda_checkpoint.  The child only reaps
+    such strays later, in prepare_criu_dump.
+    """
     import psutil
     try:
         proc = psutil.Process(pid)
@@ -165,6 +186,8 @@ def _get_descendant_pids(pid):
     children = proc.children(recursive=True)
     filtered = []
     for c in children:
+        if _proc_is_zombie(c.pid):
+            continue
         try:
             if "resource_tracker" in " ".join(c.cmdline()):
                 continue
@@ -519,6 +542,10 @@ def _is_userspace_spin(pid):
     yield loop never ends. Measured 2026-09-22 across 29 restores: that
     inequality predicted quiescence failure every time, 29 for 29.
 
+    TP workers now install ``spin_clock`` before the dump, which times that
+    loop on the wall clock, so images dumped since then restore idle. This
+    stays for images dumped before it.
+
     Conservative on error. If either file cannot be read the answer is False,
     which keeps the old behaviour of failing the restore.
     """
@@ -729,6 +756,56 @@ def _dump_slot():
             os.close(fd)
 
 
+# criu's own default for --ghost-limit (DEFAULT_GHOST_LIMIT in cr_options.h).
+_CRIU_DEFAULT_GHOST_LIMIT = 1 << 20
+# tmpfs may back a file with 2 MiB huge pages, so its st_blocks can run past
+# the last mapped 4 KiB page up to the next 2 MiB boundary.
+_GHOST_LIMIT_ALIGN = 2 << 20
+
+
+def _shm_ghost_limit(pids, proc="/proc"):
+    """The ``--ghost-limit`` that lets criu carry every deleted ``/dev/shm``
+    file *pids* still map.
+
+    prepare_criu_dump unlinks the tree's ``sem.*`` and each rank its ``psm_*``
+    while the mappings stay, and criu stores a deleted file that is mapped
+    ``MAP_SHARED`` as a ghost file inside the image -- the only form that
+    restores on another pod, since nothing else keeps a copy.  criu refuses a
+    ghost whose allocated size (``st_blocks * 512``) exceeds the limit, 1 MiB
+    by default ("Can't dump ghost file ... increase limit").  vLLM's response
+    rings are ten 24 MiB chunks each, and their allocated part grows with the
+    largest message a rank has sent: with router replay, rank 0's outputs
+    carry every token's routed experts and pass 1 MiB.
+
+    No file can have more allocated than its mapped extent, rounded up to a
+    huge page, so the largest extent bounds every ghost these unlinks create.
+    criu copies a ghost by SEEK_DATA, so the image carries only what is
+    allocated, not the extent.
+    """
+    extent = 0
+    for pid in pids:
+        try:
+            with open(f"{proc}/{pid}/maps") as handle:
+                for line in handle:
+                    parts = line.split(None, 5)
+                    if len(parts) < 6:
+                        continue
+                    path = parts[5].strip()
+                    if not (path.startswith("/dev/shm/")
+                            and path.endswith("(deleted)")):
+                        continue
+                    try:
+                        start, end = (int(x, 16) for x in parts[0].split("-"))
+                        offset = int(parts[2], 16)
+                    except ValueError:
+                        continue
+                    extent = max(extent, offset + end - start)
+        except OSError:
+            continue
+    extent = -(-extent // _GHOST_LIMIT_ALIGN) * _GHOST_LIMIT_ALIGN
+    return max(_CRIU_DEFAULT_GHOST_LIMIT, extent)
+
+
 def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
                       meta_extra=None):
     """Dump the vLLM child process tree to disk via CRIU (destructive).
@@ -769,7 +846,8 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
     # live one back with --inherit-fd under this name.
     stdout_resource = _resolve_fd_resource(child_pid, 1)
     stray_stdio = []
-    for scan_pid in _get_descendant_pids(child_pid) + [child_pid]:
+    tree_pids = _get_descendant_pids(child_pid) + [child_pid]
+    for scan_pid in tree_pids:
         proc_fd_dir = f"/proc/{scan_pid}/fd"
         try:
             fd_names = os.listdir(proc_fd_dir)
@@ -838,6 +916,7 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
         "--tcp-close",
         "--ext-unix-sk",
         "--link-remap",
+        "--ghost-limit", str(_shm_ghost_limit(tree_pids)),
         "--libdir", empty_libdir,
         "-v4",
     ]
@@ -1940,6 +2019,12 @@ def _worker_criu_load_lowcap(image_dir, new_pipe_fd):
 # Child thread -- communicates with the vLLM child process via pipe
 # ---------------------------------------------------------------------------
 
+# The commands between the last forward pass and the checkpoint that decide
+# whether the image can restore: a failure in any of them refuses the dump,
+# and the graph drop they report goes into meta.json.
+_NCCL_TEARDOWN_CMDS = ("drop_graphs", "drop_graphs_if_nccl", "destroy_nccl")
+
+
 def _child_thread(instance_id, gpus, child_pid, pipe,
                   child_queue, result_queue, completed_counter,
                   initial_state="alive", capture_gpu_uuids=None,
@@ -2057,6 +2142,14 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
     # engine that did not sleep still holds its weights and KV cache, so a
     # checkpoint would capture all of it; refuse instead.
     sleep_error = None
+    # Set by a failed graph drop or NCCL teardown.  A comm whose abort never
+    # finished still holds peer memory, which checkpoints and then fails
+    # cuda_restore with CUresult=801; refuse instead.
+    nccl_error = None
+    # What the child did with its graphs before destroy_nccl (its
+    # ``graph_drop`` reply), recorded into meta.json so the restore knows
+    # whether to rebind or recapture.
+    graph_drop = None
 
     while True:
         cmd, kwargs = _get_next_command()
@@ -2080,6 +2173,13 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
                       cmd, sleep_error)
             _emit_result(cmd, 0.0,
                          f"refused: the engine failed to sleep ({sleep_error})", {})
+            continue
+
+        if cmd in ("cuda_checkpoint", "criu_dump") and nccl_error is not None:
+            log.error("<<< %s FAILED (NCCL teardown failed: %s)",
+                      cmd, nccl_error)
+            _emit_result(cmd, 0.0,
+                         f"refused: NCCL teardown failed ({nccl_error})", {})
             continue
 
         if cmd == "cuda_checkpoint":
@@ -2279,9 +2379,12 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
                             f"{len(_bad)} inet socket(s) would go into a "
                             f"multi-node image: {_bad}")
 
+                meta_extra = dict(kwargs.get("meta_extra") or {})
+                if graph_drop:
+                    meta_extra.update(graph_drop)
                 meta = _worker_criu_save(
                     child_pid, image_dir, child_pipe_fd, pipe_resource, gpus,
-                    meta_extra=kwargs.get("meta_extra"),
+                    meta_extra=meta_extra,
                 )
                 info["image_dir"] = image_dir
                 info["meta"] = meta
@@ -2397,9 +2500,15 @@ def _child_thread(instance_id, gpus, child_pid, pipe,
             break
         # Track child pause state so `_drain_pipe_generates` can no-op
         # for the duration of the pause/save/restore/resume cycle.
-        _result_cmd, _, _result_error, _ = result
+        _result_cmd, _, _result_error, _result_info = result
         if _result_cmd == "sleep":
             sleep_error = _result_error
+        if _result_cmd in _NCCL_TEARDOWN_CMDS:
+            if _result_error is not None:
+                nccl_error = f"{_result_cmd}: {_result_error}"
+            elif isinstance(_result_info, dict) and _result_info.get(
+                    "graph_drop"):
+                graph_drop = dict(_result_info["graph_drop"])
         if _result_error is None:
             if _result_cmd == "pause":
                 _worker_paused = True
@@ -2450,6 +2559,16 @@ _DUMP_REAP_TIMEOUT_S = 60.0
 # The sweep's own bound, far shorter: by the time it runs the tree has already
 # been SIGKILLed, so anything still alive is wedged rather than slow.
 _ORPHAN_SWEEP_TIMEOUT_S = 10.0
+
+# Teardown's bound, longer than the dump's.  There the tree is SIGKILLed with
+# its CUDA contexts still live, and a rank stays alive until the driver has
+# torn its context down: on an Inkling-2-Small TP=8 engine, 7 of 8 ranks
+# outlived a 5 s sweep.  They then outlived the worker too, went to a PID 1
+# that never reaps, and held the restored leader's sid, so the same image
+# could not be restored in that pod again ("Can't fork for <pid>: File
+# exists").  The sweep returns as soon as the last one is reaped, so a tree
+# that goes down quickly pays nothing for the longer bound.
+_TEARDOWN_SWEEP_TIMEOUT_S = 60.0
 
 # prctl(2).  Absent from the stdlib; Linux 3.4+, and needs no privilege.
 _PR_SET_CHILD_SUBREAPER = 36
@@ -2523,9 +2642,10 @@ def _reap_orphaned_descendants(log, timeout_s=_ORPHAN_SWEEP_TIMEOUT_S):
     leader's -- and the last one frees it.
 
     Runs until ``waitpid`` reports no children left, since that is the only
-    answer that means the tree is fully collected.  Bounded, because by the
-    time this runs the tree has been SIGKILLed: a task still alive is wedged,
-    and must not strand a dump whose image is already on disk.
+    answer that means the tree is fully collected.  Bounded so a wedged task
+    cannot strand the caller -- a dump whose image is already on disk, or a
+    teardown -- and the caller picks the bound: see
+    ``_TEARDOWN_SWEEP_TIMEOUT_S`` for why teardown waits longer.
 
     Returns the pids reaped.  Never raises.
     """
@@ -2544,10 +2664,15 @@ def _reap_orphaned_descendants(log, timeout_s=_ORPHAN_SWEEP_TIMEOUT_S):
             # its way down.  Poll rather than block: WNOHANG is the whole
             # point, so a wedged task costs the deadline and nothing more.
             if time.monotonic() - t0 >= timeout_s:
+                # Named, with their states, because these are the tasks that
+                # will hold recorded ids if PID 1 does not reap them: a D
+                # here is a rank still inside the driver.
+                left = ", ".join(f"{p}:{s}" for p, s in
+                                 _proc_children(os.getpid())) or "?"
                 log.warning(
-                    "  orphan sweep gave up after %.0fs with a live "
-                    "descendant left; it may still reference recorded ids",
-                    timeout_s)
+                    "  orphan sweep gave up after %.1fs (reaped %d) with "
+                    "live descendant(s) left: %s; they may still reference "
+                    "recorded ids", time.monotonic() - t0, len(reaped), left)
                 break
             time.sleep(0.02)
             continue
@@ -2556,8 +2681,33 @@ def _reap_orphaned_descendants(log, timeout_s=_ORPHAN_SWEEP_TIMEOUT_S):
         shown = ", ".join(str(p) for p in reaped[:12])
         if len(reaped) > 12:
             shown += ", ..."
-        log.info("  reaped %d orphaned descendant(s): %s", len(reaped), shown)
+        log.info("  reaped %d orphaned descendant(s) in %.1fs: %s",
+                 len(reaped), time.monotonic() - t0, shown)
     return reaped
+
+
+def _proc_children(ppid, proc="/proc"):
+    """``(pid, state)`` of every task whose parent is *ppid*, sorted by pid.
+
+    Read from field 4 (ppid) and field 3 (state) of each ``/proc/<pid>/stat``,
+    parsed after the last ')' since ``comm`` can contain parens.
+    """
+    kids = []
+    try:
+        entries = os.listdir(proc)
+    except OSError:
+        return kids
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"{proc}/{entry}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            if int(fields[1]) == ppid:
+                kids.append((int(entry), fields[0]))
+        except (OSError, IndexError, ValueError):
+            continue                   # exited while we walked it
+    return sorted(kids)
 
 
 # ---------------------------------------------------------------------------
@@ -2783,9 +2933,8 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
             # Collect them while we still can: once this worker exits they go
             # to PID 1, and if it does not reap they hold their ids, and the
             # ids naming their group and session, for the life of the pod.
-            # Shorter bound than the dump's: teardown latency is visible to
-            # the orchestrator, and the tree has already been SIGKILLed.
-            _reap_orphaned_descendants(log, timeout_s=5.0)
+            # Instance._reset waits out this bound before it kills us.
+            _reap_orphaned_descendants(log, timeout_s=_TEARDOWN_SWEEP_TIMEOUT_S)
             break
 
         if cmd == "exit":
@@ -2801,7 +2950,7 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
                     child_proc.join(timeout=5)
             _kill_pidns_holder(ns_holder, log)
             ns_holder = None
-            _reap_orphaned_descendants(log, timeout_s=5.0)
+            _reap_orphaned_descendants(log, timeout_s=_TEARDOWN_SWEEP_TIMEOUT_S)
             result_queue.put(("exit", 0.0, None, {}))
             break
 
