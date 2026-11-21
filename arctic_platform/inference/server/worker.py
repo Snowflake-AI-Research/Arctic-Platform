@@ -1125,7 +1125,7 @@ class InferenceWorker(StreamingWorkerMixin):
             finally:
                 _end_engine_startup_capture(startup_error_dir)
         self._maybe_init_router_replay_tx(engine_kwargs, router_replay_engine_kwargs)
-        if self._router_replay_tx is not None:
+        if engine_kwargs.get("enable_return_routed_experts"):
             await self._init_forced_routes()
         # The live grammar now always masks the sampler's stop set, so replay
         # mirrors it unconditionally. get_tokenizer() raises under
