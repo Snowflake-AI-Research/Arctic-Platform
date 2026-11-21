@@ -24,6 +24,7 @@ import torch
 from pydantic import ValidationError
 
 from arctic_platform.common.callbacks import CallbackRunner
+from arctic_platform.common.callbacks import InvalidMetric
 from arctic_platform.common.callbacks import Reduce
 from arctic_platform.common.callbacks import merge_metrics
 from arctic_platform.model.implementations.debug.config import router_stats_strides
@@ -61,7 +62,7 @@ def _hooked(stride: int, call_stride: int = 1):
 def _reported(callback: RouterStatsCallback) -> dict:
     """Driver-merged shape after one rank logs local totals with ``Reduce.SUM``."""
     merged = merge_metrics([{"router_stats": (Reduce.SUM, callback._report())}])
-    return merged["router_stats"]["router"]
+    return merged.values["router_stats"]["router"]
 
 
 def test_a_step_counts_each_routed_token_once_and_skips_replay_pad_rows():
@@ -92,7 +93,9 @@ def test_driver_sums_local_totals_across_ranks():
             {"router_stats": (Reduce.SUM, local)},
         ]
     )
-    assert merged["router_stats"]["router"]["sampled_tokens"] == pytest.approx(2.0 * local["router"]["sampled_tokens"])
+    assert merged.values["router_stats"]["router"]["sampled_tokens"] == pytest.approx(
+        2.0 * local["router"]["sampled_tokens"]
+    )
 
 
 @pytest.mark.parametrize("padding_calls", [0, 1])
@@ -422,7 +425,7 @@ def test_strides_reject_invalid_values_with_validation_error(config):
 def test_post_step_logs_even_an_all_zero_report():
     _model, callback, trainer = _hooked(stride=1)
     callback.post_step(trainer)
-    assert "router_stats" in callback.pending, "report() returns per-router zeros, which is still truthy"
+    assert "router_stats" in callback.pending, "declared metrics must be logged every step"
 
 
 def test_public_facade_exports_the_callback_and_stride_schema():
@@ -488,8 +491,7 @@ def test_quarantine_disables_hooks_so_next_step_counts_only_new_tokens():
     assert cb in runner._failed
     assert cb._disabled
     model.router(torch.randn(3, DIM))  # would have leaked without on_quarantine
-    assert runner.flush() == {}
-    assert runner.last_dropped == frozenset({"router_stats"})
+    assert runner.flush() == {"router_stats": (Reduce.SUM, InvalidMetric.QUARANTINED)}
 
     runner.run("pre_fwd_bwd", trainer)
     runner.run("pre_fwd_bwd_microbatch", trainer, False)

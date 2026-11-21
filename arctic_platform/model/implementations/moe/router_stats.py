@@ -34,8 +34,8 @@ local totals with ``Reduce.SUM`` so the driver ``merge_metrics`` sums across ran
 
 from __future__ import annotations
 
-from typing import AbstractSet
 from typing import Any
+from typing import ClassVar
 from typing import Mapping
 
 import torch
@@ -51,7 +51,6 @@ from arctic_platform.model.recompute import in_recompute
 from arctic_platform.model.recompute import install_recompute_detector
 
 _TOTALS = ("sampled_tokens", "entropy_sum", "replayed_tokens", "replay_agreement_sum")
-_METRIC_NAMES = frozenset({"router_stats"})
 
 
 class RouterStatsCallback(MetricsCallback):
@@ -67,6 +66,8 @@ class RouterStatsCallback(MetricsCallback):
     a late ``on_error`` cannot revive totals into the next step.
     """
 
+    metric_specs: ClassVar[Mapping[str, Reduce]] = {"router_stats": Reduce.SUM}
+
     def __init__(self, training_config: Mapping[str, Any]) -> None:
         super().__init__(training_config)
         self._stride, self._call_stride = router_stats_strides(training_config)
@@ -81,9 +82,6 @@ class RouterStatsCallback(MetricsCallback):
     @classmethod
     def enabled(cls, training_config: Mapping[str, Any]) -> bool:
         return bool(router_stats_strides(training_config)[0])
-
-    def metric_names(self) -> AbstractSet[str]:
-        return _METRIC_NAMES
 
     def post_init(self, trainer: Trainer) -> None:
         routers = [
@@ -127,9 +125,7 @@ class RouterStatsCallback(MetricsCallback):
         self._counting = True
 
     def post_step(self, trainer: Trainer) -> None:
-        report = self._report()
-        if report:
-            self.log("router_stats", report, reduce=Reduce.SUM)
+        self.log("router_stats", self._report())
         self._clear_snapshot()
 
     def on_error(self, trainer: Trainer, stage: str, exc: BaseException) -> None:
