@@ -372,6 +372,11 @@ class ArcticClientConfig(BaseModel):
             )
         if provider:
             training["model_provider"] = provider
+        sp_size = _cortex_sp_size(ds, worker)
+        if sp_size > 1:
+            if self.training_gpus % sp_size:
+                raise ValueError(f"sp_size {sp_size} must divide training_gpus {self.training_gpus}.")
+            training["sp_size"] = sp_size
         if "model_options" in worker:
             training["model_options"] = deepcopy(worker["model_options"])
         if worker.get("use_liger"):
@@ -413,6 +418,21 @@ class ArcticClientConfig(BaseModel):
         if self.seed is not None:
             sub["seed"] = self.seed
         return sub
+
+
+def _cortex_sp_size(ds: dict, worker: dict) -> int:
+    """Sequence-parallel degree. Cortex reads it only from ``training_config.sp_size``.
+
+    Integrations set it as DeepSpeed's ``ds_config.sequence_parallel_size`` (and size the
+    batch for it) or as ``ds_worker_config.sp_size``.
+    """
+    values = {int(v) for v in (ds.get("sequence_parallel_size"), worker.get("sp_size")) if v is not None}
+    if len(values) > 1:
+        raise ValueError(
+            f"ds_config.sequence_parallel_size ({ds.get('sequence_parallel_size')}) and "
+            f"ds_worker_config.sp_size ({worker.get('sp_size')}) disagree."
+        )
+    return values.pop() if values else 1
 
 
 def _neutrino_optimizer(ds_optimizer: Any) -> dict[str, Any] | None:

@@ -727,6 +727,35 @@ class TestCortexModelOptions:
         assert "prime_rl" not in training
 
 
+class TestCortexSequenceParallel:
+    """Cortex reads the SP degree only from ``training_config.sp_size``."""
+
+    @staticmethod
+    def _training(training: dict) -> dict:
+        cfg = ArcticClientConfig(model_name="m", training_gpus=4, training=training)
+        return cfg._cortex_training_sub_job()["training_config"]
+
+    def test_ds_config_sequence_parallel_size_is_forwarded(self):
+        training = self._training({"ds_config": {"sequence_parallel_size": 4, "train_batch_size": 8}})
+        assert training["sp_size"] == 4
+        assert training["ds_config"]["sequence_parallel_size"] == 4
+
+    def test_worker_sp_size_is_forwarded(self):
+        assert self._training({"ds_worker_config": {"sp_size": 2}})["sp_size"] == 2
+
+    def test_sp_of_one_adds_nothing(self):
+        assert "sp_size" not in self._training({"ds_config": {"sequence_parallel_size": 1}})
+        assert "sp_size" not in self._training({})
+
+    def test_disagreeing_values_raise(self):
+        with pytest.raises(ValueError, match="disagree"):
+            self._training({"ds_config": {"sequence_parallel_size": 4}, "ds_worker_config": {"sp_size": 2}})
+
+    def test_sp_must_divide_the_training_gpus(self):
+        with pytest.raises(ValueError, match="must divide"):
+            self._training({"ds_config": {"sequence_parallel_size": 3}})
+
+
 class TestCortexNoopOffload:
     """``to_cortex`` drops ``offload_*: {device: none}`` from the forwarded
     ds_config. Cortex builds the optimizer from the lifted typed ``optimizer``

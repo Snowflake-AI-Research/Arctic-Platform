@@ -81,6 +81,17 @@ ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_3}"
 WEIGHT_SYNC_BACKEND="${WEIGHT_SYNC_BACKEND:-nccl}"
 mkdir -p "${CKPT_DIR}"
 
+# Sequence parallelism splits each training sequence over SP_SIZE GPUs. By default each GPU
+# holds up to 65536 tokens of it, rounded up to a divisor of NUM_TRAIN_GPUS.
+if [[ -z "${SP_SIZE:-}" ]]; then
+    SP_SIZE=$(( (MAX_CONTEXT_LENGTH + 65535) / 65536 ))
+    while (( SP_SIZE < NUM_TRAIN_GPUS && NUM_TRAIN_GPUS % SP_SIZE )); do SP_SIZE=$(( SP_SIZE + 1 )); done
+fi
+if (( SP_SIZE > NUM_TRAIN_GPUS || NUM_TRAIN_GPUS % SP_SIZE )); then
+    echo "ERROR: SP_SIZE=${SP_SIZE} must divide NUM_TRAIN_GPUS=${NUM_TRAIN_GPUS}; raise NUM_TRAIN_GPUS for ${MAX_CONTEXT_LENGTH} tokens." >&2
+    exit 1
+fi
+
 # Cortex returns a logprob and an entropy per token, about 18 bytes, and caps
 # a response at 128 MiB. It reports an overrun only after provisioning the GPUs
 # and running a full step, so check here. 8 x 8 sequences at 32768 tokens is
@@ -160,6 +171,7 @@ uv run --isolated --extra skyrl-train \
     trainer.arctic_rl.use_zorro=false \
     trainer.arctic_rl.use_liger=false \
     trainer.arctic_rl.zero_stage=2 \
+    trainer.arctic_rl.ulysses_sequence_parallel_size="${SP_SIZE}" \
     trainer.arctic_rl.attn_implementation="${ATTN_IMPLEMENTATION}" \
     trainer.arctic_rl.vllm_max_model_len="${MAX_CONTEXT_LENGTH}" \
     trainer.arctic_rl.startup_timeout="${STARTUP_TIMEOUT}" \
