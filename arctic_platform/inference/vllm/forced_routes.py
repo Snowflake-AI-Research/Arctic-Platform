@@ -24,7 +24,8 @@ then disagree.
 The server sends those stored rows with the request (``FORCED_ROUTES_KEY``). Each step, the runner marks the batch
 rows that compute a stored position, and every MoE router takes the stored experts there, weighted as the trainer's
 replay weights them. The capture then records the routes the forward used, so the returned capture is the stored one
-by construction. Positions without a stored row route as before.
+by construction. Positions without a stored row route as before. An engine whose routers stored rows cannot reach
+(``unsupported``) installs nothing and reports why; the server then sends no rows and warns once.
 """
 
 from __future__ import annotations
@@ -120,48 +121,44 @@ def bind_router(router: Any, layer_id: int, forced: ForcedRoutes) -> None:
     router._compute_routing = _compute_routing
 
 
-def install(runner: Any) -> ForcedRoutes:
-    """Bind every MoE router of ``runner.model``, or refuse the engine if a stored row could not reach the router."""
+def unsupported(runner: Any) -> str | None:
+    """Why stored rows cannot reach every MoE router of ``runner.model``, or None when they can."""
     from vllm.model_executor.layers.fused_moe.layer import MoERunner
 
     parallel = runner.vllm_config.parallel_config
-    fix = "or start the engine without enable_return_routed_experts"
     if parallel.data_parallel_size > 1:
-        raise ValueError(
-            "Router replay forces stored routes by batch row, but with data_parallel_size > 1 the router sees "
-            f"tokens from other DP ranks (and sequence-parallel MoE or DBO splits them): serve with DP 1 {fix}."
-        )
+        return "data_parallel_size > 1: the router sees other DP ranks' tokens (as with sequence-parallel MoE and DBO)"
     if parallel.prefill_context_parallel_size > 1:
-        raise ValueError(
-            "Router replay forces stored routes by batch row, but prefill context parallel partitions the batch: "
-            f"serve with prefill_context_parallel_size 1 {fix}."
-        )
-    capturer = runner.aux_output_connector._capturer
-    forced = ForcedRoutes(capturer.device_buffer.shape[0], *capturer.shape_per_token, runner.device)
+        return "prefill_context_parallel_size > 1 partitions the batch"
     supported = _router_scales()
     for module in runner.model.modules():
         if not isinstance(module, MoERunner):
             continue
-        router = module.router
         if module._quant_method.is_monolithic:
-            unsupported = "monolithic MoE kernel, which routes inside the kernel"
-        elif type(router) not in supported or router.scoring_func not in _SCORES:
-            unsupported = f"router {type(router).__name__}"
-        else:
-            bind_router(router, module.layer_id, forced)
-            continue
-        raise ValueError(
-            f"Router replay cannot force stored routes through layer {module.layer_id}'s {unsupported}; it needs a "
-            f"modular MoE kernel and a {'/'.join(sorted(c.__name__ for c in supported))} router scoring with "
-            f"{'/'.join(sorted(_SCORES))}: choose such a moe_backend {fix}."
-        )
+            return f"layer {module.layer_id} runs a monolithic MoE kernel, which routes inside the kernel"
+        if type(module.router) not in supported or module.router.scoring_func not in _SCORES:
+            return f"layer {module.layer_id}'s router {type(module.router).__name__} is not one this hook weights"
+    return None
+
+
+def install(runner: Any) -> ForcedRoutes:
+    """Bind every MoE router of ``runner.model``; call only when ``unsupported(runner)`` is None."""
+    from vllm.model_executor.layers.fused_moe.layer import MoERunner
+
+    capturer = runner.aux_output_connector._capturer
+    forced = ForcedRoutes(capturer.device_buffer.shape[0], *capturer.shape_per_token, runner.device)
+    for module in runner.model.modules():
+        if isinstance(module, MoERunner):
+            bind_router(module.router, module.layer_id, forced)
     return forced
 
 
 def patch_model_runner(runner_cls: Any) -> None:
     if getattr(runner_cls.prepare_inputs, _APPLIED_ATTR, False):
         return
-    runner_cls._forced_routes = None  # until initialize_kv_cache installs it on an engine that captures routes
+    # Until initialize_kv_cache installs the hook on an engine that captures routes, or records why it cannot.
+    runner_cls._forced_routes = None
+    runner_cls._forced_routes_unsupported = None
     original_initialize_kv_cache = runner_cls.initialize_kv_cache
     original_add_requests = runner_cls.add_requests
     original_remove_request = runner_cls._remove_request
@@ -170,7 +167,10 @@ def patch_model_runner(runner_cls: Any) -> None:
     def initialize_kv_cache(self, *args, **kwargs):
         result = original_initialize_kv_cache(self, *args, **kwargs)
         if self.aux_output_connector is not None:
-            self._forced_routes = install(self)
+            # All routers or none: the server sends rows only when every worker reports None here.
+            self._forced_routes_unsupported = unsupported(self)
+            if self._forced_routes_unsupported is None:
+                self._forced_routes = install(self)
         return result
 
     def add_requests(self, scheduler_output):
@@ -206,7 +206,14 @@ def patch_model_runner(runner_cls: Any) -> None:
         setattr(runner_cls, name, fn)
 
 
+def forced_routes_unsupported(worker: Any) -> str | None:
+    """Worker RPC: why this worker runs without the hook, or None when it can force stored routes."""
+    return getattr(worker.model_runner, "_forced_routes_unsupported", "the engine runs Model Runner V1")
+
+
 def ensure_forced_routes_patch() -> None:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+    from vllm.v1.worker.gpu_worker import Worker
 
     patch_model_runner(GPUModelRunner)
+    Worker.forced_routes_unsupported = forced_routes_unsupported

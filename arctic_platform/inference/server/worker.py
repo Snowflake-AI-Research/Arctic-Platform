@@ -911,6 +911,7 @@ class InferenceWorker(StreamingWorkerMixin):
         # Chat parsers for this engine's model; None when chat is unsupported.
         self._chat_model: ChatModel | None = None
         self._router_replay_tx: Any = None
+        self._forced_routes = False  # every engine worker can re-prefill under stored routes
         self._router_replay_tx_on_host = False
         self._router_replay_staging_bytes: int | None = None
         self._router_replay_group: Any = None
@@ -1124,6 +1125,8 @@ class InferenceWorker(StreamingWorkerMixin):
             finally:
                 _end_engine_startup_capture(startup_error_dir)
         self._maybe_init_router_replay_tx(engine_kwargs, router_replay_engine_kwargs)
+        if self._router_replay_tx is not None:
+            await self._init_forced_routes()
         # The live grammar now always masks the sampler's stop set, so replay
         # mirrors it unconditionally. get_tokenizer() raises under
         # skip_tokenizer_init, and such an engine cannot compile a grammar to
@@ -1289,6 +1292,15 @@ class InferenceWorker(StreamingWorkerMixin):
             return None
         return bool(parser.is_reasoning_end(prompt_ids))
 
+    async def _init_forced_routes(self) -> None:
+        reasons = set(await self.llm.collective_rpc("forced_routes_unsupported")) - {None}
+        self._forced_routes = not reasons
+        if reasons:
+            logger.warning(
+                "Router replay: re-prefilled prefix positions keep the engine's own routes, as before, because %s",
+                "; ".join(sorted(reasons)),
+            )
+
     def _maybe_init_router_replay_tx(
         self,
         engine_kwargs: dict[str, Any],
@@ -1452,7 +1464,7 @@ class InferenceWorker(StreamingWorkerMixin):
                 prefix = self._router_replay_tx.get(prefix_replay_id)
             except KeyError:  # another replica served the earlier request, or the cache evicted it
                 pass
-        if prefix is not None:
+        if prefix is not None and self._forced_routes:
             # The engine re-prefills these positions under the stored routes, so the splice below keeps what it ran.
             tail = _forced_route_tail(prefix, *_forced_route_blocks(self.llm.vllm_config))
             sampling_params["extra_args"] = {**(sampling_params.get("extra_args") or {}), FORCED_ROUTES_KEY: tail}

@@ -159,6 +159,7 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
     spec = SimpleNamespace(use_eagle_block_drop=lambda: True)
     cache_config = SimpleNamespace(block_size=2)
     worker.llm = SimpleNamespace(vllm_config=SimpleNamespace(cache_config=cache_config, speculative_config=spec))
+    worker._forced_routes = True  # every engine worker can re-prefill under stored routes
     engine_params = []
 
     def generate(prompt, tokens, routes, replay_id, **extra_args):
