@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import statistics
 from dataclasses import dataclass
@@ -106,12 +107,67 @@ def row_lengths(rows: int, max_len: int, seed: int, min_frac: float = 0.15) -> L
     return [int(x) for x in lengths]
 
 
-def build_synthetic_batch(name: str, rows: int, max_len: int, vocab_size: int, seed: int = SEED) -> Batch:
-    """One arm, with labels in HuggingFace convention and pad positions masked out."""
+# Uniform ids over the whole vocabulary hit embedding rows the checkpoint never trained (reserved and padding ids, rare
+# tokens left near zero). Such a row puts the first decoder layer's RMSNorms in their epsilon-dominated regime, which
+# multiplies that one position's gradient a thousandfold and makes it hinge on BF16 kernel choices. Qwen3-30B-A3B's row
+# 127572 (RMS 6.6e-7 against a median of 0.021) held 99.98% of the gas1 embedding gradient's squared norm, and the HF
+# reference alone put that norm 8% below FP32 with FlashAttention 3 and 9% above it with SDPA. Ids drawn from the rows
+# whose RMS is at least half the median's keep every gradient norm within 1% of FP32 under either kernel.
+TRAINED_ROW_RMS_FRACTION = 0.5
+_INPUT_EMBEDDING_SUFFIXES = ("embed_tokens.weight", "embeddings.weight", "word_embeddings.weight", "wte.weight")
+_INPUT_EMBEDDING_NAMES = ("embed.weight",)  # DeepSeek-V4.1's own layout
+
+
+@functools.lru_cache(maxsize=4)
+def trained_token_ids(model_path: str, vocab_size: int):
+    """The ids whose input-embedding row in the checkpoint at ``model_path`` has at least ``TRAINED_ROW_RMS_FRACTION``
+    of the median row RMS, as a sorted int64 tensor: the ids ``build_synthetic_batch`` draws from. ``None`` (every id)
+    for a directory without safetensors weights, which has no trained rows to tell apart."""
+    import json
+
+    from safetensors import safe_open
+
+    root = Path(model_path)
+    index = root / "model.safetensors.index.json"
+    if index.is_file():
+        weight_map = json.loads(index.read_text())["weight_map"]
+    else:
+        weight_map = {}
+        for path in sorted(root.glob("*.safetensors")):
+            with safe_open(path, "pt") as handle:
+                weight_map.update(dict.fromkeys(handle.keys(), path.name))
+    if not weight_map:
+        return None
+    found = []
+    for name, file in sorted(weight_map.items()):
+        if name.endswith(_INPUT_EMBEDDING_SUFFIXES) or name in _INPUT_EMBEDDING_NAMES:
+            with safe_open(root / file, "pt") as handle:
+                shape = handle.get_slice(name).get_shape()
+            if len(shape) == 2 and shape[0] == vocab_size:
+                found.append((name, file))
+    if len(found) != 1:
+        raise ValueError(
+            f"{model_path}: expected one [{vocab_size}, hidden] input embedding among the safetensors, found "
+            f"{[name for name, _ in found]}"
+        )
+    name, file = found[0]
+    with safe_open(root / file, "pt") as handle:
+        rms = handle.get_tensor(name).float().pow(2).mean(dim=1).sqrt()
+    return (rms >= TRAINED_ROW_RMS_FRACTION * rms.median()).nonzero().flatten()
+
+
+def build_synthetic_batch(
+    name: str, rows: int, max_len: int, vocab_size: int, seed: int = SEED, token_ids=None
+) -> Batch:
+    """One arm, with labels in HuggingFace convention and pad positions masked out. Ids are uniform over
+    ``token_ids`` (``trained_token_ids`` of the checkpoint under test) when given, else over the vocabulary."""
     import torch
 
     gen = torch.Generator(device="cpu").manual_seed(seed)
-    input_ids = torch.randint(0, vocab_size, (rows, max_len), generator=gen)
+    if token_ids is None:
+        input_ids = torch.randint(0, vocab_size, (rows, max_len), generator=gen)
+    else:
+        input_ids = token_ids[torch.randint(0, token_ids.numel(), (rows, max_len), generator=gen)]
     # HuggingFace convention: labels[b, s] is the token at position s, not the one predicted from it. The
     # shift to logit alignment belongs to whoever consumes the batch, and both engines apply it identically.
     labels = torch.full((rows, max_len), IGNORE_INDEX, dtype=torch.long)

@@ -962,11 +962,10 @@ def _model_shape(source_checkpoint: str) -> tuple[int, int, int]:
     layers. It deliberately does not search for the largest single-GPU model: onboarding needs a stable,
     representative regression fixture, not the maximum memory load.
     """
-    from transformers import AutoConfig
-
     from arctic_platform.correctness.onboarding.synth_model import detect_block_period
+    from arctic_platform.correctness.onboarding.synth_model import load_source_config
 
-    config = AutoConfig.from_pretrained(source_checkpoint, trust_remote_code=True)
+    config = load_source_config(source_checkpoint)
     text_config = getattr(config, "text_config", config)
     full_layers = int(text_config.num_hidden_layers)
     layer_types = list(getattr(text_config, "layer_types", []))
@@ -1195,6 +1194,7 @@ def _probe_worker(args: argparse.Namespace) -> int:
             seed=SEED,
             lm_head_token_chunk_size=config.lm_head_token_chunk_size,
             lm_head_vocab_chunk_size=training.get("fused_lm_head_vocab_chunk_size", 8192),
+            huggingface_loader=config.huggingface_loader,
         )
         payload.update(
             status="fit",
@@ -1359,7 +1359,11 @@ def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = 
         if key not in generated:
             # The runner generates the regression adapter with SEED; its identity binds the recorded references.
             generated[key] = generate_adapter(
-                model_path, config.training["peft_config"], correctness_workdir("shared-peft-") / "adapter", seed=SEED
+                model_path,
+                config.training["peft_config"],
+                correctness_workdir("shared-peft-") / "adapter",
+                seed=SEED,
+                huggingface_loader=config.huggingface_loader,
             )
         args._generated_shared_adapters = generated
         identity = adapter_identity(generated[key], config.training["peft_config"])
@@ -2814,7 +2818,9 @@ def run(args: argparse.Namespace) -> int:
                 encoding="utf-8",
             )
             print(f"Report: {report}", flush=True)
-        return 0
+        return _combined_references_after_explicit_check(args, config, spec_path, onboarded=False)
+    # The request as given: _parent resolves options such as source_checkpoint in place.
+    request = argparse.Namespace(**vars(args))
     with _onboarding_test_log(args) as test_log, _onboarding_test_time(args, args.test_id):
         try:
             options = _onboarding_options(args)
@@ -2859,7 +2865,72 @@ def run(args: argparse.Namespace) -> int:
     _save_onboarding_summary(
         args, config, spec_path, {**summary.get("results", {}), args.test_id: result}, skipped_tests=[]
     )
+    if code == 0:
+        code = _combined_references_after_explicit_check(request, config, spec_path, onboarded=True)
     return code
+
+
+def _prepare_combined_references(
+    args: argparse.Namespace, spec_path: Path, references: list[str], output: Path | None
+) -> tuple[str | None, str | None]:
+    """Prepare the HF records a regression selecting all of ``references`` reads: (error, unsafe cleanup)."""
+    from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
+
+    if output is None:
+        output = Path(args.output_dir) if args.output_dir is not None else correctness_workdir("config-onboarding-")
+    preparation = argparse.Namespace(
+        **{
+            **vars(args),
+            "test_id": references[0],
+            "test_spec": spec_path,
+            "reference_tests": references,
+            "output_dir": output / "combined-references",
+        }
+    )
+    preparation_error = unsafe_cleanup = None
+    with _onboarding_test_time(args, "combined reference preparation"):
+        try:
+            _prepare_references(preparation)
+        except UnsafeCleanupError as exc:
+            unsafe_cleanup = str(exc)
+            preparation_error = f"unsafe worker cleanup: {exc}"
+            traceback.print_exc()
+            _onboarding_failure(f"combined reference preparation: {preparation_error}")
+        except Exception as exc:
+            preparation_error = str(exc)
+            traceback.print_exc()
+            _onboarding_failure(f"combined reference preparation: {exc}")
+    return preparation_error, unsafe_cleanup
+
+
+def _combined_references_after_explicit_check(
+    args: argparse.Namespace, config, spec_path: Path, *, onboarded: bool
+) -> int:
+    """Leave an explicit first-step onboarding with the records a regression of both checks reads.
+
+    Such a regression measures each case once for both checks, so its single-step-grads record has the optimizer
+    identity (``with-optimizer/``), which neither single-check onboarding writes. Default-all onboarding prepares it
+    after the second check; an explicit onboarding of either check prepares it once the other one is onboarded too,
+    and retries it after a recorded failure, so per-check and default-all onboarding leave the same records.
+    """
+    spec, summary = _onboarding_state(args, config, spec_path)
+    references = [
+        test_id for test_id in CALIBRATED_TEST_IDS if _completed_onboarding(args, spec, summary, test_id) is not None
+    ]
+    if args.test_id not in references or len(references) < 2:
+        return 0
+    if not onboarded and summary.get("combined_reference_error") is None:
+        return 0
+    error, _ = _prepare_combined_references(args, spec_path, references, None)
+    _save_onboarding_summary(
+        args,
+        config,
+        spec_path,
+        summary.get("results", {}),
+        combined_reference_error=error,
+        combined_reference_elapsed_seconds=args._onboarding_times.get("combined reference preparation"),
+    )
+    return int(error is not None)
 
 
 def _onboard_configuration(args: argparse.Namespace) -> int:
@@ -3005,32 +3076,7 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
         and len(references) > 1
         and (any(test_id in references for test_id in queue) or preparation_error)
     ):
-        if output is None:
-            output = (
-                Path(args.output_dir) if args.output_dir is not None else correctness_workdir("config-onboarding-")
-            )
-        preparation = argparse.Namespace(
-            **{
-                **vars(args),
-                "test_id": references[0],
-                "test_spec": spec_path,
-                "reference_tests": references,
-                "output_dir": output / "combined-references",
-            }
-        )
-        preparation_error = None
-        with _onboarding_test_time(args, "combined reference preparation"):
-            try:
-                _prepare_references(preparation)
-            except UnsafeCleanupError as exc:
-                unsafe_cleanup = str(exc)
-                preparation_error = f"unsafe worker cleanup: {exc}"
-                traceback.print_exc()
-                _onboarding_failure(f"combined reference preparation: {preparation_error}")
-            except Exception as exc:
-                preparation_error = str(exc)
-                traceback.print_exc()
-                _onboarding_failure(f"combined reference preparation: {exc}")
+        preparation_error, unsafe_cleanup = _prepare_combined_references(args, spec_path, references, output)
     summary = _save_onboarding_summary(
         args,
         config,
@@ -3227,6 +3273,7 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
     from arctic_platform.correctness.harness.sft import SEED
     from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
     from arctic_platform.correctness.harness.sft import save
+    from arctic_platform.correctness.harness.sft import trained_token_ids
 
     config = load_config(args.config)
     spec = TestSpec.read(args.test_spec)
@@ -3237,7 +3284,14 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
         raise ValueError("the existing spec has no gas1 case")
     model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     vocab_size = getattr(model_config, "text_config", model_config).vocab_size
-    batch = build_batch(gas1.name, gas1.global_batch_size, gas1.max_seq_len, vocab_size, seed=SEED)
+    batch = build_batch(
+        gas1.name,
+        gas1.global_batch_size,
+        gas1.max_seq_len,
+        vocab_size,
+        seed=SEED,
+        token_ids=trained_token_ids(str(model_path), vocab_size),
+    )
     batch_path = args.output_dir / "optimizer-calibration-batch.pt"
     save(batch, batch_path)
     training = config.effective_training
@@ -3282,6 +3336,7 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
             optimizer_output_dir=run_dir / "states",
             cuda_device=run_index % lanes,
             deterministic=False,
+            huggingface_loader=config.huggingface_loader,
         )
         return run_index, time.monotonic() - started, result
 

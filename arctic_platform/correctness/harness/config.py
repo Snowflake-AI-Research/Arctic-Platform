@@ -45,6 +45,41 @@ from arctic_platform.client.config import TrainingConfig
 
 DEFAULT_REFERENCE_CALIBRATION_RUNS = 8
 MAX_LOCAL_REFERENCE_CALIBRATION_WORKERS = 8
+# The MoE (native-loader) model provider. DSS renamed it from ``prime_rl`` to ``arctic`` (dss-platform #606), and
+# Arctic's client still translates a native config's ``prime_rl`` to ``arctic`` on the wire, so configs carry either
+# name. Catalog recipes spell it ``arctic``.
+MOE_MODEL_PROVIDERS = frozenset({"arctic", "prime_rl"})
+# A reduced fixture's text config lists, in its own layer order, the source layer index of each layer it keeps.
+FIXTURE_SOURCE_LAYERS = "source_layer_indices"
+
+# The fused cross-entropy the MoE loaders install when a config names none (Arctic Platform's
+# ``effective_fused_cross_entropy``).
+MOE_DEFAULT_FUSED_CROSS_ENTROPY = "liger"
+
+
+def fused_cross_entropy_of(training: Dict[str, Any]) -> bool | str:
+    """The loss backend the product model builder applies for a sub-job's ``training_config``."""
+    prime_rl = training.get("prime_rl")
+    effective = {**training, **prime_rl} if isinstance(prime_rl, dict) else training
+    if effective.get("model_provider") not in MOE_MODEL_PROVIDERS:
+        return effective.get("fused_cross_entropy", False)
+    if "fused_cross_entropy" in effective:
+        return effective["fused_cross_entropy"]
+    # DSS takes ``model_options.lm_head.cross_entropy`` as the ``prime_rl.fused_cross_entropy`` it replaces.
+    options = training.get("model_options") or {}
+    lm_head = options.get("lm_head") or {}
+    if "lm_head.cross_entropy" in options:
+        return options["lm_head.cross_entropy"]
+    return lm_head.get("cross_entropy", MOE_DEFAULT_FUSED_CROSS_ENTROPY)
+
+
+def sft_loss_from_logprobs(training: Dict[str, Any]) -> bool:
+    """Whether DSS must compute an SFT request's loss from per-token logprobs.
+
+    A MoE model returns a loss only from its fused cross-entropy head. Without one (every expert-parallel catalog
+    recipe turns it off, since RL needs per-token logprobs) a plain SFT request gets logits and no loss.
+    """
+    return training.get("model_provider") in MOE_MODEL_PROVIDERS and not fused_cross_entropy_of(training)
 
 
 def reference_calibration_worker_count(
@@ -270,14 +305,27 @@ GPU_ATTENTION_IMPLEMENTATIONS = {
     "b200": "flash_attention_4",
     "b300": "flash_attention_4",
 }
+# Models whose attention is not the accelerator's FlashAttention, by the backend the target's loader requires. DeepSeek
+# V4.1's sparse attention is a fused kernel inside the model: Arctic Platform's loader requires "eager"
+# (model/loaders/deepseek_v41.py DEEPSEEK_V41_ATTN_BACKEND) and refuses any other name.
 MODEL_ATTENTION_IMPLEMENTATIONS = {
     "Qwen/Qwen3.8-Flash-Next": "qsa_flex",
     "zai-org/GLM-5.3-Flash": "sparse_mla",
     "zai-org/GLM-5.3-Flash-BF16": "sparse_mla",
+    "deepseek-ai/DeepSeek-V4.1-Flash": "eager",
+    "deepseek-ai/DeepSeek-V4.1-Flash-1017": "eager",
+    "PrimeIntellect/DeepSeek-V4.1-Flash-bf16": "eager",
 }
+# References whose attention has to differ from the target's name to compute the same function. The Transformers
+# GLM-MoE-DSA attention applies its indexer's top-k only as the eager / SDPA mask and hands the indices to FlashMLA
+# otherwise, so on flash_attention_3 it attends densely; GLM-5.3's target attends sparsely over the same top-k
+# whatever its attn_implementation (Arctic Platform's glm52 sparse MLA, model/implementations/glm52/models/
+# glm_moe_dsa/sparse_mla_attention.py).
 MODEL_REFERENCE_ATTENTION_IMPLEMENTATIONS = {
     "zai-org/GLM-5.3-Flash": "sdpa",
     "zai-org/GLM-5.3-Flash-BF16": "sdpa",
+    "zai-org/GLM-5.3": "sdpa",
+    "zai-org/GLM-5.3-BF16": "sdpa",
 }
 
 
@@ -338,10 +386,7 @@ class LoadedConfig:
     @property
     def fused_cross_entropy(self) -> bool | str:
         """Resolve the loss backend the selected product model builder applies."""
-        training = self.effective_training
-        if training.get("model_provider") == "prime_rl":
-            return training.get("fused_cross_entropy", "liger")
-        return training.get("fused_cross_entropy", False)
+        return fused_cross_entropy_of(self.training)
 
     @property
     def lm_head_token_chunk_size(self) -> int | None:
@@ -490,6 +535,17 @@ class LoadedConfig:
         """Use upstream GLM's top-k SDPA mask without changing AP's sparse-MLA target."""
         target = self.attention_implementation
         return MODEL_REFERENCE_ATTENTION_IMPLEMENTATIONS.get(self.model_name, target)
+
+    @property
+    def huggingface_loader(self) -> bool:
+        """Whether DSS builds this job's model with Arctic Platform's huggingface loader.
+
+        DSS takes its MoE route only for ``ep_size`` above one (``model_options.moe_route``); every other training
+        job loads ``AutoModelForCausalLM.from_pretrained`` (Arctic Platform ``model/loaders/huggingface.py``). For a
+        composite vision-language checkpoint that class can be text-only: Qwen3.5's is ``Qwen3_5ForCausalLM``, which
+        builds no vision tower, while ``architectures[0]`` names ``Qwen3_5ForConditionalGeneration``.
+        """
+        return int(self.training.get("ep_size") or 1) <= 1
 
     @property
     def max_seq_len(self) -> int:

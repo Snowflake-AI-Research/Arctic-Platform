@@ -141,6 +141,10 @@ def _load_norm_group(entries: Dict[str, Path], group: CanonicalTensorGroup) -> D
                 raise ValueError(f"optimizer artifact for {name}::{state} is not finite in float32")
             values[state] = value
         artifacts.append(values)
+    if group.block_diagonal:
+        if any(artifact[state].dim() != 2 for artifact in artifacts for state in STATE_KEYS):
+            raise ValueError(f"optimizer artifact block-diagonal shape mismatch for {group.originals}")
+        return {state: torch.block_diag(*(artifact[state] for artifact in artifacts)) for state in STATE_KEYS}
     if group.concatenate_dim is None:
         return artifacts[0]
     try:
@@ -312,7 +316,12 @@ def _load_tensor_group(
         if any(state not in artifact for artifact in artifacts):
             raise ValueError(f"optimizer artifact for {group.originals[0]} is missing {state}")
         values = [artifact[state].to(device=device, dtype=torch.float32) for artifact in artifacts]
-        tensors[state] = values[0] if group.concatenate_dim is None else torch.cat(values, dim=group.concatenate_dim)
+        if group.block_diagonal:
+            tensors[state] = torch.block_diag(*values)
+        else:
+            tensors[state] = (
+                values[0] if group.concatenate_dim is None else torch.cat(values, dim=group.concatenate_dim)
+            )
     return tensors
 
 

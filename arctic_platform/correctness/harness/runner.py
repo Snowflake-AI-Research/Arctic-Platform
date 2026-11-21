@@ -56,6 +56,7 @@ from arctic_platform.correctness.harness.gateway import validate_reduced_fixture
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
 from arctic_platform.correctness.harness.sft import save
+from arctic_platform.correctness.harness.sft import trained_token_ids
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 from arctic_platform.correctness.reference.process_determinism import CUBLAS_WORKSPACE
@@ -64,6 +65,7 @@ from ..models import validate_local_full_model
 from ..reference.model_features import uses_mixer_packing
 from . import report as console
 from .config import DEFAULT_REFERENCE_CALIBRATION_RUNS
+from .config import MOE_MODEL_PROVIDERS
 from .config import ArmDefinition
 from .config import ArmSpec
 from .config import LoadedConfig
@@ -178,6 +180,7 @@ def run_reference(
     optimizer_output_dir: Path | None = None,
     cuda_device: int | None = None,
     deterministic: bool = True,
+    huggingface_loader: bool = False,
 ) -> dict:
     """Invoke the reference as a subprocess so the node is clean before the gateway starts."""
     out_path = Path(out_path)
@@ -213,6 +216,8 @@ def run_reference(
     if peft_adapter_path is not None:
         cmd += ["--peft-adapter", str(peft_adapter_path)]
     cmd += ["--matmul-precision", matmul_precision]
+    if huggingface_loader:
+        cmd.append("--huggingface-loader")
     if lm_head_token_chunk_size is not None:
         cmd += [
             "--lm-head-token-chunk",
@@ -629,9 +634,15 @@ def execute(
     attn_impl = attn or cfg.attention_implementation
     batch_paths: Dict[str, Path] = {}
     arm_specs: List[ArmSpec] = []
+    token_ids = trained_token_ids(reference_model_path, vocab_size)
     for definition in arm_defs:
         batch = build_batch(
-            definition.name, definition.global_batch_size, definition.max_seq_len, vocab_size, seed=SEED
+            definition.name,
+            definition.global_batch_size,
+            definition.max_seq_len,
+            vocab_size,
+            seed=SEED,
+            token_ids=token_ids,
         )
         path = tmp / f"batch-{definition.name}.pt"
         save(batch, path)
@@ -694,6 +705,7 @@ def execute(
             optimizer_state_output_dir=optimizer_state_output_dir,
             gradient_norms_per_param=collect_gradient_norms,
             weight_format=cfg.sub_job.get("weight_format"),
+            fixture_root=reference_model_path,
         )
         if first_two_payload:
             validate_reduced_fixture_support(payload, spec, published_fixture)
@@ -730,7 +742,10 @@ def execute(
                     body,
                     learning_rate=OPTIMIZER_LEARNING_RATE,
                     output_dir=tmp / "optimizer" / "ap" / arm.name,
-                    expected_dp_world_size=cfg.n_gpus if supplier is not None else cfg.dp_size,
+                    # ZeRO partitions the optimizer over the sequence-data-parallel group, every rank under SP, and
+                    # saves one shard per rank (DeepSpeed engine.py: dp_process_group=seq_data_parallel_group,
+                    # checkpoint dp_world_size=seq_dp_world_size).
+                    expected_dp_world_size=cfg.n_gpus,
                     optimizer_config=optimizer_config,
                     **{"local_checkpoint": True} if local_cortex_fixture else {},
                     **(
@@ -790,7 +805,11 @@ def execute(
             ):
                 raise ValueError("shared PEFT adapter initialization requires the on-prem correctness worker")
             peft_adapter = generate_adapter(
-                reference_model_path, cfg.training["peft_config"], tmp / "initial-adapter", seed=SEED
+                reference_model_path,
+                cfg.training["peft_config"],
+                tmp / "initial-adapter",
+                seed=SEED,
+                huggingface_loader=cfg.huggingface_loader,
             )
             shared_adapter_identity = adapter_identity(peft_adapter, cfg.training["peft_config"])
         reference_adapter_path = peft_adapter
@@ -853,6 +872,7 @@ def execute(
                 optimizer_output_dir=optimizer_output_dir,
                 cuda_device=cuda_device,
                 deterministic=deterministic,
+                huggingface_loader=cfg.huggingface_loader,
             )
             if (
                 reference_adapter_path is not None
@@ -1346,8 +1366,12 @@ def materialize_ap_peft_adapter(
             raise ValueError("GLM adapter initialization requires its configured local Cortex gateway")
         backend = cfg.native.backend
         require_local_cortex_gateway(backend)
-        if cfg.training.get("model_provider") != "prime_rl" or cfg.sp_size != 8 or cfg.training.get("ep_size") != 8:
-            raise ValueError("GLM adapter initialization requires the reviewed PrimeRL/SP8/EP8 route")
+        if (
+            cfg.training.get("model_provider") not in MOE_MODEL_PROVIDERS
+            or cfg.sp_size != 8
+            or cfg.training.get("ep_size") != 8
+        ):
+            raise ValueError("GLM adapter initialization requires the reviewed MoE-provider/SP8/EP8 route")
     workdir.mkdir(parents=True, exist_ok=True)
     gateway_dir = workdir / "gateway"
     gateway_dir.mkdir(parents=True, exist_ok=True)

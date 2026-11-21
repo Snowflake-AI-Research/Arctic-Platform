@@ -111,6 +111,7 @@ def positional_logprobs(
             hidden = engine.decoder(input_ids=ids_mb, use_cache=False, **mixer_kwargs).last_hidden_state
 
             if lm_head_token_chunk_size is not None:
+                # The tiled composition, never the target's fused CUDA head (see hf_single_gpu._forward_backward).
                 values = chunked_lm_head_logprobs(
                     hidden,
                     engine.head.weight,
@@ -119,6 +120,7 @@ def positional_logprobs(
                     token_chunk_size=lm_head_token_chunk_size,
                     vocab_chunk_size=lm_head_vocab_chunk_size,
                     fp32_lm_head=fp32_lm_head,
+                    fused_head=False,
                 ).float()
             else:
                 flat_hidden = hidden.reshape(-1, engine.hidden_size)

@@ -28,6 +28,7 @@ tensors on the same side, and the checkpoint's weights bring that to -2.01e-04 w
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import hashlib
 import json
@@ -41,6 +42,7 @@ from typing import Tuple
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 
+from ..harness.config import FIXTURE_SOURCE_LAYERS
 from ..harness.config import ModelSpec
 from ..harness.config import hash_directory
 
@@ -174,6 +176,32 @@ def detect_block_period(layer_types: List[str]) -> int:
     return n
 
 
+def load_source_config(source: str):
+    """The source's config as read by the Transformers class its ``architectures[0]`` names.
+
+    That class is what both the fixture and the reference are built from, but ``AutoConfig`` with
+    ``trust_remote_code`` prefers a checkpoint's own ``auto_map`` code to it. Neither engine runs that code:
+    Arctic Platform reads the config without remote code (DSS passes ``trust_remote_code`` only when a job sets it,
+    and the expert-parallel loaders default it to false). Nemotron-3-Nano ships a configuration_nemotron_h.py whose
+    layer list is a property over a fixed 52-character ``hybrid_override_pattern``, so a reduced remote config kept
+    the pattern's first layers whatever the depth, under names ("mamba") the Transformers NemotronH model has no
+    mixer for, and lists no ``layer_types``. The fixture is written without the remote code, so its ``auto_map``
+    goes too.
+    """
+    import transformers
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(source, trust_remote_code=True)
+    architectures = getattr(cfg, "architectures", None) or [None]
+    model_class = getattr(transformers, architectures[0] or "", None)
+    config_class = getattr(model_class, "config_class", None)
+    if isinstance(config_class, type) and not isinstance(cfg, config_class):
+        cfg = config_class.from_pretrained(source)
+        if hasattr(cfg, "auto_map"):
+            delattr(cfg, "auto_map")
+    return cfg
+
+
 def reduce_config(source: str, num_layers: int, vision_depth: int = 2):
     """Rewrite the model config to ``num_layers``, truncating every entry correlated with the layer count.
 
@@ -181,30 +209,78 @@ def reduce_config(source: str, num_layers: int, vision_depth: int = 2):
     layer count is truncated alongside it. That catches per-layer type lists without naming them, which is
     what lets this work on an architecture the harness has not seen.
     """
-    from transformers import AutoConfig
-
-    cfg = AutoConfig.from_pretrained(source, trust_remote_code=True)
+    cfg = load_source_config(source)
     text = getattr(cfg, "text_config", cfg)
     original = int(text.num_hidden_layers)
 
-    period = detect_block_period(list(getattr(text, "layer_types", []))) if hasattr(text, "layer_types") else 1
-    if period > 1 and num_layers % period != 0:
+    layer_types = list(getattr(text, "layer_types", [])) if hasattr(text, "layer_types") else []
+    period = detect_block_period(layer_types) if layer_types else 1
+    if 2 * period > original:
+        # No block repeats: Nemotron-H's 52-layer hybrid pattern "MEMEM*EMEMEM*..." has a "period" of 48 only because
+        # its last four types are its first four. Without blocks, the reduced model has to keep every layer type.
+        missing = sorted(set(layer_types) - set(layer_types[:num_layers]))
+        if missing:
+            raise ValueError(
+                f"num_layers={num_layers} keeps no {', '.join(missing)} layer; the source's {original}-layer "
+                "pattern repeats no block, so a reduced model must keep every layer type"
+            )
+    elif period > 1 and num_layers % period != 0:
         raise ValueError(
             f"num_layers={num_layers} must be a multiple of the block period {period}; a partial block "
             "would drop a layer type from the comparison entirely"
         )
 
     text.num_hidden_layers = num_layers
+    # Transformers 5.20 holds an attribute that varies by layer (Gemma 4's head_dim and num_key_value_heads, larger on
+    # its full-attention layers) only in per_layer_config, keyed by layer index, and raises on the global read; keep
+    # the kept layers' values there.
+    per_layer = text.per_layer_attributes if getattr(text, "is_heterogeneous", False) else set()
+    if per_layer:
+        text.per_layer_config = {
+            index: {attr: getattr(text.per_layer_config[index], attr) for attr in (*per_layer, "skip")}
+            for index in range(num_layers)
+        }
     for attr in dir(text):
-        if attr.startswith("_"):
+        if attr.startswith("_") or attr in per_layer:
             continue
         value = getattr(text, attr, None)
         if isinstance(value, list) and len(value) == original:
             setattr(text, attr, list(value[:num_layers]))
 
+    drop_prediction_layers(text)
+    # Recipes name layers by their source index (ac_config.layers, an expert placement); the target payload maps them
+    # onto the kept layers through this record (harness.gateway.lower_recipe_layers).
+    setattr(text, FIXTURE_SOURCE_LAYERS, list(range(num_layers)))
+
     if hasattr(cfg, "vision_config") and vision_depth is not None:
         cfg.vision_config.depth = vision_depth
     return cfg, original, period
+
+
+# The MoE text configs that declare multi-token-prediction layers, and the field that counts them.
+_PREDICTION_LAYER_COUNTS = {
+    "qwen3_5_moe_text": "mtp_num_hidden_layers",
+    "qwen4_exp_text": "mtp_num_hidden_layers",
+    "glm5_next_text": "num_nextn_predict_layers",
+}
+
+
+def drop_prediction_layers(text) -> None:
+    """Declare no multi-token-prediction layers in a reduced text config.
+
+    The Hugging Face models build no MTP layers and skip the checkpoint's MTP weights, and Arctic Platform's
+    training models build none either, so a fixture saved from the Hugging Face model has no MTP weights. Keeping
+    the source's MTP count would declare layers neither engine has, which the fixture admission refuses as
+    omitted weights; zero describes the model both engines train.
+    """
+    count_name = _PREDICTION_LAYER_COUNTS.get(getattr(text, "model_type", None))
+    if count_name is None or not getattr(text, count_name, 0):
+        return
+    setattr(text, count_name, 0)
+    nested = getattr(text, "mtp", None)
+    if isinstance(nested, dict) and "num_hidden_layers" in nested:
+        # Qwen3.8-Flash-Next also describes its MTP stack in an ``mtp`` block.
+        setattr(text, "mtp", {**nested, "num_hidden_layers": 0, "layer_types": []})
 
 
 def _meta_model(cfg):
@@ -287,9 +363,7 @@ def size_for_single_gpu(
     reference's own microbatch token budget, and the margin in ``budget_gib`` covers them. CPU table and
     accumulator capacity, buffer residency and optimizer peak memory are not admitted by this selection.
     """
-    from transformers import AutoConfig
-
-    probe = AutoConfig.from_pretrained(source, trust_remote_code=True)
+    probe = load_source_config(source)
     text = getattr(probe, "text_config", probe)
     full = int(text.num_hidden_layers)
     period = detect_block_period(list(getattr(text, "layer_types", []))) or 1
@@ -376,6 +450,31 @@ def _save_reduced_pretrained(model, dest_path: Path) -> None:
             model.generation_config = generation
     if preserve_legacy_defaults:
         generation.to_json_file(dest_path / "generation_config.json", use_diff=True, keys_to_pop=["compile_config"])
+    _write_checkpoint_layer_fields(dest_path)
+
+
+# Layer fields a reduced config.json keeps in its checkpoint's form. Transformers 5.20 reads Nemotron-H's "mamba" and
+# "attention" as "linear_attention" and "full_attention" (configuration_utils.remap_legacy_layer_types) and saves the
+# new names, and its num_hidden_layers is a property over the list, which it does not save. Arctic Platform registers
+# its own NemotronHConfig for nemotron_h (model/implementations/qwen35/models/__init__.py), which keeps
+# layers_block_type as written, and builds each layer from BLOCK_TYPE_MAP's "mamba", "moe" and "attention"
+# (nemotron_h/modeling_nemotron_h.py _build_layer); the suite reads the fixture's depth from config.json
+# (harness/cortex.py describe_fixture). The checkpoint's names and its num_hidden_layers load in both.
+_CHECKPOINT_LAYER_TYPE_NAMES = {
+    "nemotron_h": ("layers_block_type", {"linear_attention": "mamba", "full_attention": "attention"}),
+}
+
+
+def _write_checkpoint_layer_fields(dest_path: Path) -> None:
+    path = dest_path / "config.json"
+    config = json.loads(path.read_text())
+    text = config.get("text_config", config)
+    field, names = _CHECKPOINT_LAYER_TYPE_NAMES.get(text.get("model_type"), (None, None))
+    if field is None:
+        return
+    text[field] = [names.get(name, name) for name in text[field]]
+    text["num_hidden_layers"] = len(text[field])
+    path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
 
 def _load_reduced_pretrained(model_class, source: str, cfg, num_layers: int, original_layers: int, **options):
@@ -413,6 +512,45 @@ def _load_reduced_pretrained(model_class, source: str, cfg, num_layers: int, ori
     return model
 
 
+@contextlib.contextmanager
+def _fp8_partial_blocks_on_declared_grid(block_size):
+    """Decode a block-FP8 weight that ends in a partial block on the checkpoint's declared block grid.
+
+    Transformers 5.20's Fp8Dequantize derives the block from the scale grid (rows // scale_rows) and refuses a
+    weight that grid does not divide. GLM-5.3 stores kv_a_proj_with_mqa (576 x 6144, 128 x 128 blocks) with
+    ceil(576 / 128) = 5 scale rows, so its fixture failed to load. Arctic Platform decodes such a weight with the
+    declared block and pads the last one (model/implementations/fp8.py dequantize_from_fp8_blockwise, which
+    BlockFp8Linear uses for GLM-5.3's frozen FP8 projections); this does the same, in the same fp32 product, for the
+    weights Transformers refuses. Every other weight keeps Transformers' own decode.
+    """
+    import torch
+    from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+
+    original = Fp8Dequantize._dequantize_one
+    square = isinstance(block_size, (list, tuple)) and len(block_size) == 2 and block_size[0] == block_size[1]
+    # The loader hands the op the FP8 codes already cast to the load dtype (bf16 here, exact for e4m3); packed FP4
+    # codes are not floating point (int8) or are their own dtype, and keep Transformers' decode.
+    packed = {torch.int8, getattr(torch, "float4_e2m1fn_x2", torch.int8)}
+
+    def dequantize_one(self, quantized, scales, output_dtype=None):
+        codes = quantized.is_floating_point() and quantized.dtype not in packed
+        if square and codes and scales.ndim == quantized.ndim >= 2:
+            rows, cols = quantized.shape[-2:]
+            block = int(block_size[0])
+            ceil_grid = (-(-rows // block), -(-cols // block))
+            if tuple(scales.shape[-2:]) == ceil_grid and (rows % block or cols % block):
+                from arctic_platform.model.implementations.fp8 import dequantize_from_fp8_blockwise
+
+                return dequantize_from_fp8_blockwise(quantized, scales, block, dtype=output_dtype or torch.bfloat16)
+        return original(self, quantized, scales, output_dtype=output_dtype)
+
+    Fp8Dequantize._dequantize_one = dequantize_one
+    try:
+        yield
+    finally:
+        Fp8Dequantize._dequantize_one = original
+
+
 def materialize_pretrained(
     source: str, dest: str, num_layers: int, vision_depth: int = 2, force: bool = False
 ) -> ModelSpec:
@@ -446,16 +584,22 @@ def materialize_pretrained(
     if force or not (dest_path / "config.json").exists():
         dest_path.mkdir(parents=True, exist_ok=True)
         cls = getattr(transformers, cfg.architectures[0])
-        model = _load_reduced_pretrained(
-            cls,
-            source,
-            cfg,
-            num_layers,
-            original_layers,
-            dtype=torch.bfloat16,
-            trust_remote_code=True,
-            **load_options,
+        decode = (
+            _fp8_partial_blocks_on_declared_grid(quantization.get("weight_block_size"))
+            if quantization is not None
+            else contextlib.nullcontext()
         )
+        with decode:
+            model = _load_reduced_pretrained(
+                cls,
+                source,
+                cfg,
+                num_layers,
+                original_layers,
+                dtype=torch.bfloat16,
+                trust_remote_code=True,
+                **load_options,
+            )
         if quantization is not None:
             if (
                 getattr(model, "hf_quantizer", None) is not None

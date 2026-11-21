@@ -360,3 +360,68 @@ def test_sharded_bf16_weights_train_as_replicated_ones():
         if swap:
             # Some groups split into slices (3 and 4 groups without the swap), all their state off the GPU.
             assert len(r["groups"][0]) > 3 and len(r["groups"][1]) > 4 and r["offloaded"] == (1.0, 1.0), r
+
+
+def _layout_worker(rank: int, port: int, results) -> None:
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2)
+    try:
+        set_seed(0)
+        model = nn.Module()
+        model.embed = nn.Embedding(VOCAB, 16)
+        model.block = _Block(16)
+        whole = {name: p.detach().clone() for name, p in model.named_parameters()}
+        slots, names = dense_shard._parameter_slots(model)
+        dense_shard.shard_module(model.block, dist.group.WORLD, "ep_size_2", slots, names)
+        layouts = dense_shard.dense_shard_layouts(model)
+        rebuilt = {}
+        for name, layout in layouts.items():
+            shard = dict(model.named_parameters())[name].detach()
+            full = torch.empty(layout.total, dtype=shard.dtype)
+            dist.all_gather_into_tensor(full, shard)
+            assert full[layout.rank * shard.numel() : (layout.rank + 1) * shard.numel()].equal(shard)
+            for member in layout.members:
+                rebuilt[member.name] = full[member.offset : member.offset + member.numel].view(member.shape)
+        results[rank] = {
+            "shards": sorted(layouts),
+            "modules": sorted({layout.module for layout in layouts.values()}),
+            "groups": sorted({(layout.group_size, layout.rank) for layout in layouts.values()}),
+            "members": sorted(rebuilt),
+            "equal": all(rebuilt[name].equal(whole[name]) for name in rebuilt),
+            "unsharded": dense_shard.dense_shard_layouts(_Block(16)) == {},
+            # Named from the model asked: a wrapper's prefix, the block's own names.
+            "wrapped": (
+                sorted(
+                    member.name
+                    for layout in dense_shard.dense_shard_layouts(nn.ModuleDict({"inner": model})).values()
+                    for member in layout.members
+                )
+                == sorted(f"inner.{name}" for name in rebuilt)
+            ),
+            "block": (
+                sorted(dense_shard.dense_shard_layouts(model.block)) == ["dense_shard.shard_0", "dense_shard.shard_1"]
+            ),
+        }
+    finally:
+        dist.destroy_process_group()
+
+
+def test_dense_shard_layouts_name_each_shards_members_and_their_place():
+    """A tensor shaped like a shard reads by the original parameters; the expert and the embedding stay whole."""
+    from arctic_platform.testing_utils import get_unique_port_number
+    from arctic_platform.testing_utils import reserve_free_port
+
+    port = reserve_free_port(get_unique_port_number() + 11, span=5, reuse_addr=True)
+    with mp.Manager() as manager:
+        results = manager.dict()
+        mp.spawn(_layout_worker, args=(port, results), nprocs=2, join=True)
+        results = dict(results)
+    members = ["block.down.weight", "block.indexer.weight", "block.mix", "block.norm.weight", "block.q.bias"]
+    members += ["block.q.weight", "block.up.weight"]
+    for rank, result in results.items():
+        # One dtype, two weight-decay classes (the norm and the bias are exempt).
+        assert result["shards"] == ["block.dense_shard.shard_0", "block.dense_shard.shard_1"], result
+        assert result["modules"] == ["block"] and result["groups"] == [(2, rank)], result
+        assert result["members"] == members and result["equal"] and result["unsharded"], result
+        assert result["wrapped"] and result["block"], result

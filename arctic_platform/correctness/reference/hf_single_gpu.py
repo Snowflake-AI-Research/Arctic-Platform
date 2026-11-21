@@ -53,6 +53,12 @@ from typing import Optional
 import torch
 
 from arctic_platform.correctness.harness.storage import require_data_fast_path
+from arctic_platform.correctness.reference.glm5_next_reference import GLM5_NEXT_MODEL_TYPES
+from arctic_platform.correctness.reference.glm5_next_reference import load_glm5_next_reference
+from arctic_platform.correctness.reference.nemotron_h_reference import NEMOTRON_H_MODEL_TYPES
+from arctic_platform.correctness.reference.nemotron_h_reference import load_nemotron_h_reference
+from arctic_platform.correctness.reference.qwen3_5_moe_reference import QWEN3_5_MOE_MODEL_TYPES
+from arctic_platform.correctness.reference.qwen3_5_moe_reference import load_qwen3_5_moe_reference
 
 IGNORE_INDEX = -100
 
@@ -110,6 +116,10 @@ class ReferenceEngine:
     hidden_size: int
     head_name: Optional[str]
     device: str
+    # Gemma's final_logit_softcapping, which the Transformers forward applies to the logits and the target's chunked
+    # head too (arctic_platform/model/implementations/gpu/lm_head.py _final_logit_softcapping); the loss paths below
+    # project the head themselves, so they apply it.
+    softcap: Optional[float] = None
 
 
 def execution_witness(engine: ReferenceEngine, *, requested_attention: str) -> dict:
@@ -156,7 +166,9 @@ def execution_witness(engine: ReferenceEngine, *, requested_attention: str) -> d
             "config": cfg.to_dict(),
             "attention_implementation": getattr(cfg, "_attn_implementation", None),
         }
-        return json.loads(json.dumps(value, sort_keys=True, allow_nan=False))
+        # A Mamba-2 config bounds its time step by time_step_limit = (0.0, inf) (Nemotron-H); a non-finite value is
+        # recorded by its JSON extension name ("Infinity") so the witness stays strict JSON.
+        return json.loads(json.dumps(value, sort_keys=True), parse_constant=str)
 
     configurations = {"model": configuration(engine.model), "decoder": configuration(engine.decoder)}
     return {
@@ -186,6 +198,49 @@ def row_groups(lengths: List[int], seq_len: int, token_budget: int) -> List[List
     return groups
 
 
+# FlashAttention 3's largest head size ("FlashAttention forward only supports head dimension at most 256").
+FLASH_ATTENTION_3_MAX_HEAD_DIM = 256
+
+
+def route_wide_heads_to_sdpa() -> None:
+    """Run the attention calls FlashAttention 3 cannot, head sizes above 256, on torch's memory-efficient SDPA.
+
+    Gemma 4's sliding layers are 256 wide and its full-attention layers 512. The target splits them the same way:
+    DSS's heterogeneous Ulysses keeps the 256-wide layers on FlashAttention and sends the 512-wide ones to Arctic
+    Platform's TileLang head-512 kernel (dss/ray_dss/jobs/gpu/sp/heterogeneous_ulysses.py _wide_head_attention_forward,
+    arctic_platform/model/attention_hd512.py). The reference takes SDPA's memory-efficient kernel for them, an
+    independent implementation with the same contract (bf16 operands, fp32 accumulation and softmax), and never its
+    math backend. Calls of 256 or less reach FlashAttention 3 unchanged.
+    """
+    from torch.nn.attention import SDPBackend
+    from torch.nn.attention import sdpa_kernel
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    flash = ALL_ATTENTION_FUNCTIONS["flash_attention_3"]
+    if getattr(flash, "routes_wide_heads_to_sdpa", False):
+        return
+
+    def attention(module, query, key, value, attention_mask, **kwargs):
+        if query.shape[-1] <= FLASH_ATTENTION_3_MAX_HEAD_DIM:
+            return flash(module, query, key, value, attention_mask, **kwargs)
+        unsupported = [
+            name
+            for name in ("sliding_window", "softcap", "cu_seq_lens_q", "cu_seq_lens_k")
+            if kwargs.get(name) is not None
+        ]
+        if attention_mask is not None or unsupported or not getattr(module, "is_causal", True):
+            raise ValueError(
+                f"the reference's head-{query.shape[-1]} SDPA covers unpadded causal attention only; this call has "
+                f"{'an attention mask' if attention_mask is not None else ', '.join(unsupported) or 'no causal mask'}"
+            )
+        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
+            return sdpa_attention_forward(module, query, key, value, None, **kwargs)
+
+    attention.routes_wide_heads_to_sdpa = True
+    ALL_ATTENTION_FUNCTIONS["flash_attention_3"] = attention
+
+
 def build_engine(
     model_path: str,
     *,
@@ -196,11 +251,16 @@ def build_engine(
     seed: int = 0,
     matmul_precision: str = "highest",
     device: str = "cuda",
+    huggingface_loader: bool = False,
 ) -> ReferenceEngine:
     """Load the checkpoint, apply the config's PEFT, and leave the model ready to forward-backward.
 
     Separate from the request path because a multi-step run builds one engine and drives it many times.
     Loading per step would restart every trajectory from the checkpoint.
+
+    ``huggingface_loader`` builds the class the target's huggingface loader builds, ``AutoModelForCausalLM``'s for
+    the checkpoint (``LoadedConfig.huggingface_loader``), so both train the same parameters; otherwise the class
+    ``architectures[0]`` names.
     """
     import torch
     import transformers
@@ -215,15 +275,48 @@ def build_engine(
         torch.cuda.manual_seed_all(seed)
 
     torch_dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
+    if attn_implementation == "flash_attention_3":
+        route_wide_heads_to_sdpa()
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     cls = getattr(transformers, cfg.architectures[0])
     if getattr(cfg, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}:
+        # Qwen3.8-Flash-Next at the sampler's precision (FP32 hyper-connection mix and combine, GatedDeltaNet beta and
+        # output norm, QSA RoPE and output gate; reference/qwen4_exp_precision.py).
         from arctic_platform.correctness.reference.qwen4_reference import load_qwen4_reference
 
         model = load_qwen4_reference(
             cls, model_path, dtype=torch_dtype, attn_implementation=attn_implementation, device=device
         )
+    elif getattr(cfg, "model_type", None) in GLM5_NEXT_MODEL_TYPES:
+        # GLM-5.3-Flash at the sampler's precision (FP32 mHC remix and base/scale, KDA beta, one-rounding norms).
+        model = load_glm5_next_reference(
+            transformers.AutoModelForCausalLM if huggingface_loader else cls,
+            model_path,
+            dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            device=device,
+        )
+    elif getattr(cfg, "model_type", None) in QWEN3_5_MOE_MODEL_TYPES:
+        # Qwen3.5-MoE at the sampler's precision (FP32 residual norms, gated norm, beta, RoPE and routing weights).
+        model = load_qwen3_5_moe_reference(
+            transformers.AutoModelForCausalLM if huggingface_loader else cls,
+            model_path,
+            dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            device=device,
+        )
+    elif getattr(cfg, "model_type", None) in NEMOTRON_H_MODEL_TYPES:
+        # Nemotron-H with the sampler's unfloored Mamba-2 time step (Transformers floors dt at time_step_min).
+        model = load_nemotron_h_reference(
+            transformers.AutoModelForCausalLM if huggingface_loader else cls,
+            model_path,
+            dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            device=device,
+        )
     else:
+        if huggingface_loader:
+            cls = transformers.AutoModelForCausalLM
         model = cls.from_pretrained(model_path, dtype=torch_dtype, attn_implementation=attn_implementation).to(device)
     if peft_adapter_path:
         from peft import PeftModel
@@ -242,6 +335,8 @@ def build_engine(
     model.train()
 
     head = model.get_output_embeddings()
+    text_cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
+    softcap = getattr(text_cfg, "final_logit_softcapping", None)
     # Chunked cross-entropy calls F.linear against head.weight rather than the head module, so a bias would
     # be dropped silently instead of being added to every logit.
     if getattr(head, "bias", None) is not None:
@@ -256,6 +351,7 @@ def build_engine(
         # differs between architectures.
         head_name=next((n for n, q in model.named_parameters() if q is head.weight), None),
         device=device,
+        softcap=float(softcap) if softcap else None,
     )
 
 
@@ -322,6 +418,43 @@ def reference_row_groups(
     return row_groups(lengths, row_length, token_budget)
 
 
+def accumulator_device(model, gradient_device, accum_dtype) -> "torch.device":
+    """Hold the float32 accumulator on the gradients' GPU when it fits there, else on the CPU.
+
+    Chosen once, after the first microbatch's backward, when that microbatch's activations are released: the GPU
+    when it can hold the whole trainable set's accumulator plus twice the activation peak the microbatch measured
+    (later microbatches have the same rows, but MoE routing moves their peak). A host accumulator costs a pageable
+    copy, a host-side widening and a host addition of every gradient after every microbatch: 98% of a 9.7B-parameter
+    full-FT reference's time, its GPU near idle. A fixture that only fits beside a host accumulator keeps it.
+    """
+    import torch
+
+    if gradient_device.type != "cuda":
+        return torch.device("cpu")
+    itemsize = torch.empty((), dtype=accum_dtype).element_size()
+    need = itemsize * sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    free, _ = torch.cuda.mem_get_info(gradient_device)
+    allocated = torch.cuda.memory_allocated(gradient_device)
+    obtainable = free + torch.cuda.memory_reserved(gradient_device) - allocated
+    transient = torch.cuda.max_memory_allocated(gradient_device) - allocated
+    return gradient_device if need + 2 * transient <= obtainable else torch.device("cpu")
+
+
+def drain_gradient(accumulator: Dict[str, "torch.Tensor"], name: str, gradient, accum_dtype, device) -> None:
+    """Add one gradient into its accumulator, which lives on ``device``.
+
+    On the gradient's own device the mixed-dtype ``add_`` widens the bfloat16 operand inside the kernel: the same
+    exact widening and the same correctly rounded float32 addition as the host path, without a temporary.
+    """
+    gradient = gradient.detach()
+    if name not in accumulator:
+        accumulator[name] = gradient.to(device=device, dtype=accum_dtype)
+    elif accumulator[name].device == gradient.device:
+        accumulator[name].add_(gradient)
+    else:
+        accumulator[name].add_(gradient.to(device=accumulator[name].device, dtype=accum_dtype))
+
+
 def _forward_backward(
     engine: ReferenceEngine,
     batch,
@@ -353,6 +486,8 @@ def _forward_backward(
     if fused_cross_entropy:
         if fused_cross_entropy not in {True, "liger"}:
             raise ValueError(f"reference does not support fused_cross_entropy={fused_cross_entropy!r}")
+        if engine.softcap is not None:
+            raise ValueError("the reference's Liger fused cross-entropy does not apply final_logit_softcapping")
         if lm_head_token_chunk_size is not None:
             raise ValueError("fused cross-entropy and chunked LM-head logprobs are mutually exclusive")
         fused_ce = _build_liger_fused_cross_entropy(fp32_lm_head=fp32_lm_head)
@@ -374,6 +509,8 @@ def _forward_backward(
     # float32 unless a caller is deliberately measuring what a narrower accumulator costs.
     accum_dtype = accumulate_dtype or torch.float32
     accumulator: Dict[str, "torch.Tensor"] = {}
+    # The CPU until the first microbatch's backward chooses (accumulator_device).
+    device_for_accumulator = None
     total_loss = 0.0
 
     lengths = [seq_len] * int(input_ids.shape[0])
@@ -397,6 +534,8 @@ def _forward_backward(
         flat_labels = labels_mb.reshape(-1)
 
         if lm_head_token_chunk_size is not None:
+            # The tiled composition (upstream's head), never the target's fused CUDA head: a reference that runs the
+            # target's kernel carries its error, and the target-vs-reference check cannot see it.
             logprobs = chunked_lm_head_logprobs(
                 detached,
                 head.weight,
@@ -405,6 +544,8 @@ def _forward_backward(
                 token_chunk_size=lm_head_token_chunk_size,
                 vocab_chunk_size=lm_head_vocab_chunk_size,
                 fp32_lm_head=fp32_lm_head,
+                softcap=engine.softcap,
+                fused_head=False,
             )
             valid = labels_mb != IGNORE_INDEX
             loss = -torch.where(valid, logprobs.float(), 0.0).sum() / active_tokens
@@ -432,6 +573,8 @@ def _forward_backward(
                     logits = F.linear(chunk_hidden.float(), head.weight.float())
                 else:
                     logits = F.linear(chunk_hidden, head.weight).float()
+                if engine.softcap is not None:
+                    logits = torch.tanh(logits / engine.softcap) * engine.softcap
                 loss = (
                     F.cross_entropy(logits, chunk_labels, ignore_index=IGNORE_INDEX, reduction="sum") / active_tokens
                 )
@@ -442,23 +585,22 @@ def _forward_backward(
                 # parameter's bfloat16 buffer would round each addition. The production chunked LM head has
                 # one autograd invocation and is drained once below instead.
                 if head_name is not None and head.weight.grad is not None:
-                    if head_name not in accumulator:
-                        accumulator[head_name] = head.weight.grad.detach().to(device="cpu", dtype=accum_dtype)
-                    else:
-                        accumulator[head_name].add_(head.weight.grad.detach().to(device="cpu", dtype=accum_dtype))
+                    drain_gradient(
+                        accumulator, head_name, head.weight.grad, accum_dtype, device_for_accumulator or "cpu"
+                    )
                     head.weight.grad = None
 
         hidden.backward(detached.grad)
+        if device_for_accumulator is None:
+            device_for_accumulator = accumulator_device(model, head.weight.device, accum_dtype)
+            for name in accumulator:
+                accumulator[name] = accumulator[name].to(device_for_accumulator)
 
         # Drain bfloat16 gradients into the float32 accumulator after every microbatch, so the running sum
         # never lives in the parameter dtype.
         for name, param in model.named_parameters():
-            if param.grad is None:
-                continue
-            if name not in accumulator:
-                accumulator[name] = param.grad.detach().to(device="cpu", dtype=accum_dtype)
-            else:
-                accumulator[name].add_(param.grad.detach().to(device="cpu", dtype=accum_dtype))
+            if param.grad is not None:
+                drain_gradient(accumulator, name, param.grad, accum_dtype, device_for_accumulator)
         model.zero_grad(set_to_none=True)
 
     return ForwardBackwardResult(
@@ -482,9 +624,8 @@ def forward_backward(engine: ReferenceEngine, batch, **options) -> ForwardBackwa
 def gradient_norms(gradients: Dict[str, "torch.Tensor"], device: str) -> Dict[str, float]:
     """One L2 norm per accumulated gradient.
 
-    Keeping the request-wide accumulator on CPU prevents it from competing with the longest sequence
-    activation graph. One completed tensor at a time moves back to CUDA so norm reduction semantics still
-    match the GPU-side Arctic Platform metric.
+    A host accumulator (one the GPU had no room for, accumulator_device) moves back to CUDA one completed tensor
+    at a time, so norm reduction semantics still match the GPU-side Arctic Platform metric.
     """
     import torch
 
@@ -518,6 +659,7 @@ def run(
     gradient_clipping: float | None = None,
     optimizer_dtype: str = "float32",
     optimizer_output_dir: str | None = None,
+    huggingface_loader: bool = False,
 ) -> ReferenceResult:
     """Forward-backward the whole request and return one L2 gradient norm per parameter."""
     if optimizer_output_dir is not None:
@@ -533,6 +675,7 @@ def run(
         seed=seed,
         matmul_precision=matmul_precision,
         device=device,
+        huggingface_loader=huggingface_loader,
     )
     model = engine.model
     reference_execution = execution_witness(engine, requested_attention=attn_implementation)

@@ -418,6 +418,12 @@ def _get_sequence_chunked_logprob_fn():
     return SequenceChunkedLogProbFn
 
 
+# Width of the vocabulary tiles the fused head sums its hidden gradient over (K = vocabulary there). One BF16 GEMM over
+# a whole 248,320-entry vocabulary comes out about 2.5e-4 smaller in norm than float64 on H200, and the shrink grows
+# with K; 8192-wide tiles with FP32 output, summed in FP32, stay within 1e-5.
+_HIDDEN_GRAD_VOCAB_TILE = 8192
+
+
 @functools.lru_cache(maxsize=None)
 def _get_fused_chunked_logprob_fn():
     """Build (and cache) the CUDA chunked head: one whole-vocabulary GEMM per token chunk and one fused pass over
@@ -434,8 +440,9 @@ def _get_fused_chunked_logprob_fn():
         Each chunk's ``[tokens, vocab]`` logits come from one GEMM in the head's dtype (FP32 accumulation, rounded
         once, as each vocabulary tile of the composition is); forward reads them once for the target log-probability
         and backward recomputes them, overwrites them with their gradient in that dtype and feeds them to the two
-        gradient GEMMs. The hidden gradient is one GEMM over the whole vocabulary (rounded once), and the weight
-        gradient is accumulated across token chunks in FP32 and rounded once. A frozen weight (LoRA) skips its GEMM.
+        gradient GEMMs. The hidden gradient is summed over ``_HIDDEN_GRAD_VOCAB_TILE``-wide vocabulary tiles in FP32
+        and rounded once, and the weight gradient is accumulated across token chunks in FP32 and rounded once. A
+        frozen weight (LoRA) skips its GEMM.
         """
 
         @staticmethod
@@ -476,6 +483,7 @@ def _get_fused_chunked_logprob_fn():
             grad_weight = torch.zeros(weight.shape, device=weight.device, dtype=torch.float32) if need_weight else None
             chunk = max(1, min(token_chunk_size, n_tokens))
             logits = torch.empty(chunk, vocab_size, device=hidden.device, dtype=hidden.dtype)
+            hidden_sum = logits.new_empty((chunk, hidden.shape[1]), dtype=torch.float32) if need_hidden else None
             for start in range(0, n_tokens, token_chunk_size):
                 end = min(start + token_chunk_size, n_tokens)
                 hidden_chunk = hidden[start:end]
@@ -489,7 +497,11 @@ def _get_fused_chunked_logprob_fn():
                     others_minus_target[start:end],
                 )
                 if need_hidden:
-                    torch.mm(tile, weight, out=grad_hidden[start:end])
+                    acc = hidden_sum[: end - start].zero_()
+                    for vocab_start in range(0, vocab_size, _HIDDEN_GRAD_VOCAB_TILE):
+                        cols = slice(vocab_start, vocab_start + _HIDDEN_GRAD_VOCAB_TILE)
+                        torch.addmm(acc, tile[:, cols], weight[cols], out_dtype=torch.float32, out=acc)
+                    grad_hidden[start:end].copy_(acc)
                 if need_weight:
                     torch.addmm(grad_weight, tile.t(), hidden_chunk, out_dtype=torch.float32, out=grad_weight)
             return (
@@ -607,6 +619,7 @@ def chunked_lm_head_logprobs(
     action_masks=None,
     group_token_ids=None,
     softcap: float | None = None,
+    fused_head: bool = True,
 ):
     """Per-token and optional grouped log probabilities via tiled matmuls.
 
@@ -614,6 +627,9 @@ def chunked_lm_head_logprobs(
     a 1-D token axis. When ``group_token_ids`` is present, returns
     ``(logprobs [B,S], group_log_probs [B,S,M+1])``. ``softcap`` applies
     Gemma's ``final_logit_softcapping`` to the logits before temperature.
+    ``fused_head=False`` keeps the tiled composition for calls the fused CUDA
+    head would take (:func:`_fused_head_applies`): the correctness suite's
+    reference must not share the target's kernel.
     """
     import torch
 
@@ -649,7 +665,7 @@ def chunked_lm_head_logprobs(
 
     inv_temperature = inv_temperature_for_tokens(temperature, batch_size, seq_len, hidden_states.device)
 
-    if _fused_head_applies(
+    if fused_head and _fused_head_applies(
         hidden_flat,
         weight,
         bias=bias,

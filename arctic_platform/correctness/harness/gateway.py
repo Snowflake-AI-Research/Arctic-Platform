@@ -58,6 +58,8 @@ from arctic_platform.client import ArcticClientConfig
 from arctic_platform.client import CortexConfig
 from arctic_platform.client import OnPremConfig
 from arctic_platform.client.requests import log_probs_request
+from arctic_platform.correctness.harness.config import FIXTURE_SOURCE_LAYERS
+from arctic_platform.correctness.harness.config import MOE_MODEL_PROVIDERS
 from arctic_platform.correctness.harness.config import LoadedConfig
 from arctic_platform.correctness.harness.config import ReviewedClientConfig
 from arctic_platform.correctness.harness.config import ReviewedSamplingConfig
@@ -65,12 +67,14 @@ from arctic_platform.correctness.harness.config import ReviewedTrainingConfig
 from arctic_platform.correctness.harness.config import TestSpec
 from arctic_platform.correctness.harness.config import correctness_microbatch_tokens
 from arctic_platform.correctness.harness.config import hash_directory
+from arctic_platform.correctness.harness.config import sft_loss_from_logprobs
 from arctic_platform.correctness.harness.cortex import TOKENIZER_JSON_SIDECARS
 from arctic_platform.correctness.harness.cortex import Checkpoint
 from arctic_platform.correctness.harness.cortex import CorrectnessClient as ArcticClient
 from arctic_platform.correctness.harness.cortex import CorrectnessClient as RLClient
 from arctic_platform.correctness.harness.cortex import CortexTrainingConfig
 from arctic_platform.correctness.harness.cortex import UnsafeCleanupError
+from arctic_platform.correctness.harness.sft import IGNORE_INDEX
 from arctic_platform.correctness.harness.sft import SEED
 from arctic_platform.correctness.harness.storage import _ds_ssh
 from arctic_platform.correctness.harness.storage import correctness_environment
@@ -1217,12 +1221,15 @@ def _training_client_config(session: GatewaySession, payload: dict) -> ArcticCli
     n_gpus = int(tc.pop("n_gpus"))
     max_seq_len = int(tc.pop("max_seq_len", 8192))
     ds = deepcopy(tc.pop("ds_config", {}))
+    # A training config's train_batch_size is the rows per step DSS reports, never DeepSpeed's batch: DSS builds that
+    # as micro x GAS x (n_gpus // sp_size) and lets only ds_config override it (dss jobs/gpu/training.py
+    # _build_ds_config). A Cortex job keeps it where DSS reads it; DeepSpeed's batch comes from ds_config alone.
     train_batch_size = tc.pop("train_batch_size", None)
+    if train_batch_size is not None and isinstance(getattr(session, "backend", None), CortexConfig):
+        tc["train_batch_size"] = train_batch_size
     gradient_clipping = tc.pop("gradient_clipping", None)
     optimizer = tc.pop("optimizer", None)
     peft = tc.pop("peft_config", None)
-    if train_batch_size is not None:
-        ds.setdefault("train_batch_size", train_batch_size)
     if gradient_clipping is not None:
         ds.setdefault("gradient_clipping", gradient_clipping)
     if optimizer is not None:
@@ -1303,8 +1310,13 @@ def running_job(session: GatewaySession, payload: dict) -> Iterator[ArcticJob]:
                 raise UnsafeCleanupError("client shutdown failed; inspect owned resources before retrying") from exc
 
 
-def cortex_training_body(body: dict) -> dict:
-    """Lower the correctness SFT batch into the Cortex zone's tensor RPC contract."""
+def cortex_training_body(body: dict, *, loss_from_logprobs: bool = False) -> dict:
+    """Lower the correctness SFT batch into the Cortex zone's tensor RPC contract.
+
+    With ``loss_from_logprobs`` (``config.sft_loss_from_logprobs``) the batch is sent the way cortex-training sends
+    SFT: a ``loss_mask`` over the prediction-aligned labels and ``causal_cross_entropy``, which DSS computes from
+    per-token logprobs over the request-wide weight sum, the reference's denominator.
+    """
     import torch
 
     if "batch" not in body:
@@ -1324,10 +1336,21 @@ def cortex_training_body(body: dict) -> dict:
         if set(processing) != {"loss_fn"}:
             raise ValueError("Cortex SFT does not support request-level processing options; use --backend onprem")
         processing = {}
+    context = dict(body.get("meta") or {})
+    if loss_from_logprobs and "labels" in tensors and not processing:
+        if context != {"labels_are_shifted": True}:
+            raise ValueError("a logprob SFT loss needs prediction-aligned labels and no other request metadata")
+        labels = tensors.pop("labels")
+        loss_mask = labels != IGNORE_INDEX
+        # DSS makes the targets itself, the next input token, so they must be the labels the request weights.
+        if not torch.equal(labels[loss_mask], tensors["input_ids"].roll(-1, dims=-1)[loss_mask]):
+            raise ValueError("a logprob SFT loss needs labels that are the next input token where they count")
+        context = {"input_ids": tensors["input_ids"], "loss_mask": loss_mask.to(torch.float32)}
+        processing = {"loss_fn": "causal_cross_entropy", "post": ["compute_logprobs"], "config": {}}
     lowered = {
         "args": (),
         "kwargs": tensors,
-        "context": dict(body.get("meta") or {}),
+        "context": context,
     }
     # No processing dictionary selects supervised dispatch; a dictionary selects the RL pipeline.
     if processing:
@@ -1335,9 +1358,15 @@ def cortex_training_body(body: dict) -> dict:
     return lowered
 
 
+def _loss_from_logprobs(client_config) -> bool:
+    training = getattr(client_config, "training", None)
+    return training is not None and sft_loss_from_logprobs(training.ds_worker_config or {})
+
+
 def training_body(job: ArcticJob, body: dict) -> dict:
-    if isinstance(getattr(getattr(job.client, "config", None), "backend", None), CortexConfig):
-        return cortex_training_body(body)
+    config = getattr(job.client, "config", None)
+    if isinstance(getattr(config, "backend", None), CortexConfig):
+        return cortex_training_body(body, loss_from_logprobs=_loss_from_logprobs(config))
     return body
 
 
@@ -1362,6 +1391,67 @@ def _max_tokens_per_mb_of(training_config: dict) -> int:
     return int((training_config.get("mb_spec") or {}).get("max_tokens_per_mb") or DEFAULT_MAX_TOKENS_PER_MB)
 
 
+def _recipe_layer_settings(tc: dict) -> list[tuple[dict, str]]:
+    """The (container, key) of every recipe setting that names layers by index: lists and expert-placement maps."""
+    settings = []
+    ac = tc.get("ac_config")
+    if isinstance(ac, dict) and isinstance(ac.get("layers"), list):
+        settings.append((ac, "layers"))
+    options = tc.get("model_options")
+    if isinstance(options, dict):
+        checkpointing = options.get("checkpointing")
+        if isinstance(checkpointing, dict) and isinstance(checkpointing.get("layers"), list):
+            settings.append((checkpointing, "layers"))
+        if isinstance(options.get("checkpointing.layers"), list):
+            settings.append((options, "checkpointing.layers"))
+        moe = options.get("moe")
+        nested = moe.get("expert_placement") if isinstance(moe, dict) else None
+        for placement in (nested, options.get("moe.expert_placement")):
+            if isinstance(placement, dict) and isinstance(placement.get("layers"), dict):
+                settings.append((placement, "layers"))
+    return settings
+
+
+def lower_recipe_layers(tc: dict, model_path: str) -> None:
+    """Map the recipe's per-layer settings, named by source layer index, onto a reduced fixture's own layers.
+
+    Arctic Platform refuses a listed layer the model does not have (ac_config.check_layers_exist, the expert
+    placement's MoE layers) rather than silently doing less. A fixture keeps some of the source's layers and records
+    which (FIXTURE_SOURCE_LAYERS); a setting keeps the kept layers it names, at their fixture index, so the fixture
+    recomputes or places exactly the kept layers the recipe does. Any other model is left as is.
+    """
+    settings = _recipe_layer_settings(tc)
+    config_path = Path(model_path) / "config.json"
+    if not settings or not config_path.is_file():
+        return
+    config = json.loads(config_path.read_text())
+    text = config.get("text_config", config)
+    kept = text.get(FIXTURE_SOURCE_LAYERS)
+    if kept is None:
+        layers = text.get("num_hidden_layers")
+        named = {int(i) for container, key in settings for i in container[key]}
+        if isinstance(layers, int) and any(i >= layers for i in named):
+            raise ValueError(
+                f"{config_path.parent} records no {FIXTURE_SOURCE_LAYERS}, so the recipe's layer settings cannot be "
+                "mapped onto it; rebuild the reduced fixture"
+            )
+        return
+    if (
+        not isinstance(kept, list)
+        or any(type(i) is not int or i < 0 for i in kept)
+        or len(set(kept)) != len(kept)
+        or len(kept) != text.get("num_hidden_layers")
+    ):
+        raise ValueError(f"{config_path} {FIXTURE_SOURCE_LAYERS} must list each kept layer's source index once")
+    for container, key in settings:
+        value = container[key]
+        if isinstance(value, list):
+            container[key] = [index for index, source in enumerate(kept) if source in value]
+        else:
+            rows = {int(layer): row for layer, row in value.items()}
+            container[key] = {str(index): rows[source] for index, source in enumerate(kept) if source in rows}
+
+
 def build_payload(
     training_config: dict,
     model_path: str,
@@ -1373,8 +1463,11 @@ def build_payload(
     determinism: str = "best-effort",
     gradient_norms_per_param: bool = True,
     weight_format: Optional[str] = None,
+    fixture_root: Optional[str] = None,
 ) -> dict:
     tc = json.loads(json.dumps(training_config))
+    # A published fixture is named by its stage path; its local tree (fixture_root) holds the same config.json.
+    lower_recipe_layers(tc, fixture_root or model_path)
     options = tc.get("model_options") or {}
     lm_head_options = options.get("lm_head") or {}
     canonical_chunk = "lm_head.token_chunk_size" in options or "token_chunk_size" in lm_head_options
@@ -1442,7 +1535,9 @@ def build_payload(
 
 
 def _labels_for_provider(batch, model_provider: str):
-    return batch.shifted_labels() if model_provider == "prime_rl" else batch.labels
+    # DSS forwards a MoE-provider request's SFT labels to the model unshifted, as prediction-aligned targets
+    # (labels[s] is the token at s + 1), and shifts the other providers' model-style labels at dispatch.
+    return batch.shifted_labels() if model_provider in MOE_MODEL_PROVIDERS else batch.labels
 
 
 def _attention_mask_from_position_ids(position_ids):
@@ -1480,7 +1575,7 @@ def pack(
     *,
     model_provider: str = "huggingface",
 ) -> dict:
-    labels_are_shifted = model_provider == "prime_rl"
+    labels_are_shifted = model_provider in MOE_MODEL_PROVIDERS
     return _batch_body(
         batch,
         _labels_for_provider(batch, model_provider),
@@ -1602,7 +1697,7 @@ class GatewayTransport:
             spec is not None
             and type(spec.model.seed) is int
             and spec.model.seed == 0
-            and self.payload["training_config"].get("model_provider") == "prime_rl"
+            and self.payload["training_config"].get("model_provider") in MOE_MODEL_PROVIDERS
         ):
             if self.payload["model_name"] != spec.model.cache_path:
                 raise ValueError("local reduced fixture path differs from the reviewed spec")
@@ -1806,7 +1901,7 @@ def validate_reduced_fixture_support(payload: dict, spec: TestSpec | None, publi
         raise ValueError("prime_rl.debug must be a configuration object")
     if "reduced_fixture_mtp" in options:
         raise ValueError("reduced fixture MTP descriptors require unavailable native loader hooks")
-    if published_fixture is None or training.get("model_provider") != "prime_rl":
+    if published_fixture is None or training.get("model_provider") not in MOE_MODEL_PROVIDERS:
         return
     if spec is None:
         raise ValueError("published fixture requires its reviewed spec")
@@ -1869,7 +1964,7 @@ def validate_reduced_fixture_support(payload: dict, spec: TestSpec | None, publi
         if count == 0:
             return
         raise ValueError(
-            f"Reduced pretrained prime_rl fixture {model_type} with {count_name}={count} requires native"
+            f"Reduced pretrained MoE-provider fixture {model_type} with {count_name}={count} requires native"
             " prediction-weight loading and authentication unavailable on unchanged main; this correctness-only"
             " package cannot authorize omitted MTP weights"
         )
@@ -1963,7 +2058,9 @@ class HostedTrainingJob:
     local_gateway: bool = False
 
     def fwd_bwd_step(self, body: dict, *, learning_rate: float) -> float:
-        result = self.client.fwd_bwd(cortex_training_body(body))
+        result = self.client.fwd_bwd(
+            cortex_training_body(body, loss_from_logprobs=_loss_from_logprobs(self.client.config))
+        )
         loss = result.get("avg_loss", (result.get("metrics") or {}).get("loss"))
         if loss is None:
             raise RuntimeError(f"forward-backward on job {self.job_id} returned no avg_loss")
@@ -2470,7 +2567,7 @@ def minimum_context_parallel_row_tokens(cfg, model_path: str) -> int:
             "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k",
             "qwen3.8-flash-next-h200-train-rl-32gpus-sp16-256k",
         )
-        or cfg.training.get("model_provider") != "prime_rl"
+        or cfg.training.get("model_provider") not in MOE_MODEL_PROVIDERS
         or cfg.sp_size <= 1
     ):
         return 0

@@ -156,11 +156,35 @@ def _runtime_admission_receipt(request: dict) -> dict:
     }
 
 
-def _existing_allocation_transport() -> dict:
+def _allocation_ssh_port(hosts: list[str] | None) -> int:
+    """AP_CORRECTNESS_SSH_PORT, else the one port the allocation's own ds_ssh transport reaches every host on.
+
+    The strict transport runs ssh with -F /dev/null, so it cannot take the port from the SSH configuration that ds_ssh
+    (pdsh) uses; ssh -G resolves only that port, and host keys still come from the pinned known_hosts. Without hosts
+    the default stays 22.
+    """
+    configured = correctness_environment("AP_CORRECTNESS_SSH_PORT")
+    if configured is not None:
+        return int(configured)
+    if not hosts:
+        return 22
+    ports = set()
+    for host in hosts:
+        done = subprocess.run(["ssh", "-G", "--", host], capture_output=True, text=True, timeout=30)
+        port = next((line.split()[1] for line in done.stdout.splitlines() if line.startswith("port ")), None)
+        if done.returncode or port is None:
+            raise ValueError(f"cannot resolve the SSH port of allocation host {host}: {done.stderr.strip()[-500:]}")
+        ports.add(int(port))
+    if len(ports) != 1:
+        raise ValueError(f"allocation hosts resolve SSH ports {sorted(ports)}; set AP_CORRECTNESS_SSH_PORT")
+    return ports.pop()
+
+
+def _existing_allocation_transport(hosts: list[str] | None = None) -> dict:
     from .inference import _held_ssh_trust
 
     trust = Path(correctness_environment("AP_CORRECTNESS_SSH_KNOWN_HOSTS", str(Path.home() / ".ssh/known_hosts")))
-    port = int(correctness_environment("AP_CORRECTNESS_SSH_PORT", "22"))
+    port = _allocation_ssh_port(hosts)
     transport = {
         "port": port,
         "known_hosts": str(trust),
@@ -194,7 +218,7 @@ def _allocation_runtime_receipts(request: dict, hostfile: Path, transport: dict 
         f"print({marker!r} + json.dumps(receipt), flush=True)\n"
     )
     encoded = base64.b64encode(script.encode()).decode()
-    transport = transport or _existing_allocation_transport()
+    transport = transport or _existing_allocation_transport([entry.host for entry in entries])
     nodes = [{"host": entry.host} for entry in entries]
     admission = {"ssh": transport, "nodes": nodes}
     expected_digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
@@ -260,7 +284,7 @@ def owned_allocation_admission(config) -> dict:
     entries = parse_hostfile(hostfile)
     client = training_client_config(config, CortexConfig(base_url="http://127.0.0.1:1"))
     request = {"payload": client.to_cortex()[0], "n_gpus": config.n_gpus, "sp_size": config.sp_size}
-    transport = _existing_allocation_transport()
+    transport = _existing_allocation_transport([entry.host for entry in entries])
     receipts = _allocation_runtime_receipts(request, hostfile, transport)
     if hostfile.read_bytes() != raw:
         raise ValueError("allocation hostfile changed during runtime verification")
@@ -446,7 +470,12 @@ def gateway_runtime_scope(gateway, hostfile: Path, *, first_two_only: bool = Fal
         from dss.ray_dss.jobs.gpu import training
         from dss.ray_dss.stage_info import strip_stage_info_from_job_config
 
-        ranks = [(node.host, gpu) for node in zone.nodes for gpu in node.gpu_ids]
+        # Admit the ranks in the order the target uses them. The zone server lays out its ranks from ray.nodes(), the
+        # head first and then the peers by host (dss zones/server_head.py, _worker_sort_key: "Stable host order with
+        # the head first so EP/TP ranks match across jobs"), not in the hostfile's order, and the participation
+        # coordinator compares that placement with this admission in order.
+        nodes = sorted(zone.nodes, key=lambda node: (0 if node.is_head else 1, node.host))
+        ranks = [(node.host, gpu) for node in nodes for gpu in node.gpu_ids]
         slots = {node["host"]: node["slots"] for node in allocation["nodes"]}
         if (
             config.job_id != job_id

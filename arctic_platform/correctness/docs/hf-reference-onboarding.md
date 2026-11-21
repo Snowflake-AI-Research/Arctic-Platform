@@ -107,7 +107,7 @@ tiny-qwen3-129m/standard/h200-training-full--fp32/single-step-optimizer/gas4.jso
 
 **Compact records contain the generation recipe and content hashes, not adapter tensors.** Identity binds the dependency versions, topology, tensor shapes/dtypes and exact values. Regression reconstructs adapter factors and requires matching prepared references; it never runs HF again to accommodate a mismatch. Only explicit onboarding measures references.
 
-**The correctness-owned local gateway transfers verified adapter bytes through Ray's allocation-local object store.** Workers do not open an adapter path on the head node or assume `/data-fast` is shared. Base-model files and installed code still require supported per-node distribution. Optional `--peft-adapter` overrides automatic generation for reference preparation. Dense `target_modules` with default initialization are supported; expert `target_parameters` and advanced initializers fail explicitly. The old deterministic SAVE0 execution path is retired.
+**The correctness-owned local gateway transfers verified adapter bytes through Ray's allocation-local object store.** Workers do not open an adapter path on the head node or assume `/data-fast` is shared. Base-model files and installed code still require supported per-node distribution. Optional `--peft-adapter` overrides automatic generation for reference preparation. Dense `target_modules` and Arctic routed-expert `target_parameters` with default initialization are supported; other `target_parameters` and advanced initializers fail explicitly. The old deterministic SAVE0 execution path is retired.
 
 ## Run Regression
 

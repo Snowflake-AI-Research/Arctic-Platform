@@ -54,6 +54,10 @@ rank 0 over its node, the other nodes take no part, and the unit's whole weights
 gathered. The exported tensors are the unsharded model's, bit for bit, under the same names. A family builder that
 reads ``model.named_parameters()`` instead is refused.
 
+``dense_shard_layouts(model)`` names each shard's members and their place in its flat layout, so a tensor shaped like
+a shard (its gradient, its FP32 master or Adam moments, on the rank or in a ZeRO checkpoint) reads by the original
+parameters, and their gathered values can be found in their owners during the module's calls.
+
 ``state_dict`` and ``load_state_dict`` hold the original parameters whole, under their own names, and never the shards:
 the state dict is the unsharded model's, and loads into a model sharded over any group size or into an unsharded one.
 Taking it all-gathers each module's shards over its node in turn into host memory (collective); loading writes each
@@ -106,6 +110,59 @@ def dense_sharding_requested() -> bool:
 
 def is_dense_shard(param: torch.Tensor) -> bool:
     return bool(getattr(param, DENSE_SHARD_ATTR, False))
+
+
+@dataclass(frozen=True)
+class DenseShardMember:
+    """One original parameter in a node shard's flat layout: its name in the model before sharding (the first path to
+    an owner), its shape, and where its elements sit in the layout."""
+
+    name: str
+    shape: tuple[int, ...]
+    offset: int
+    numel: int
+
+
+@dataclass(frozen=True)
+class DenseShardLayout:
+    """The flat layout of one node shard. Rank ``rank`` of ``group`` (``group_size`` ranks) holds elements
+    ``[rank * total // group_size, (rank + 1) * total // group_size)`` as its shard, and any tensor shaped like the
+    shard (its gradient, its FP32 master, its Adam moments) lays the members out the same way; elements no member
+    covers (alignment, padding) are zero. ``module`` gathers the members around its calls (their gathered values are
+    in their owners' ``_parameters`` then)."""
+
+    module: str
+    members: tuple[DenseShardMember, ...]
+    total: int
+    group: dist.ProcessGroup
+    group_size: int
+    rank: int
+
+
+def dense_shard_layouts(model: nn.Module) -> dict[str, DenseShardLayout]:
+    """Each node shard under ``model`` by its name in ``model.named_parameters()``, with the original parameters it
+    holds, each named by its first path from ``model`` to an owner, as ``model.named_parameters()`` named it before
+    sharding. Empty for a model without node shards. Local: no collective."""
+    names = {id(param): name for name, param in model.named_parameters()}
+    module_names = {id(module): name for name, module in model.named_modules()}
+
+    def member_name(member: _Member) -> str:
+        owner, attribute = member.slots[0]
+        return f"{module_names[id(owner)]}.{attribute}" if module_names[id(owner)] else attribute
+
+    layouts = {}
+    for module_name, module in model.named_modules():
+        sharded = getattr(module, "_ap_dense_shards", None)
+        if sharded is None:
+            continue
+        for bucket in sharded.buckets:
+            members = tuple(
+                DenseShardMember(member_name(m), tuple(m.shape), m.offset, m.numel) for m in bucket.members
+            )
+            layouts[names[id(bucket.shard)]] = DenseShardLayout(
+                module_name, members, bucket.total, sharded.group, sharded.world, sharded.rank
+            )
+    return layouts
 
 
 @dataclass(frozen=True, eq=False)

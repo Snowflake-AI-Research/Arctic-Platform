@@ -85,6 +85,11 @@ _SHARED_EXPERT = re.compile(
     r"^(?P<layer>(?:.*\.)?layers\.\d+)\.(?:mlp\.)?(?:qwen_)?shared_expert\.(?P<weight>w[123])\.weight$"
 )
 _BARE_SHARED_EXPERT = re.compile(r"^(?P<layer>(?:.*\.)?layers\.\d+)\.mlp\.shared_expert\.(?P<weight>w[123])$")
+# PEFT target_parameters LoRA on a routed-experts container: one ParamWrapper per targeted parameter, nested in the
+# container's parameter registration order, so the first one is the innermost (the most ``base_layer`` segments).
+_EXPERT_LORA = re.compile(
+    r"^(?P<prefix>.*\.experts)(?P<nest>(?:\.base_layer)*)\.(?P<factor>lora_[AB])\.default\.weight$"
+)
 _SHARED_NAMES = {
     "w1": "gate_proj.weight",
     "w2": "down_proj.weight",
@@ -92,10 +97,92 @@ _SHARED_NAMES = {
 }
 
 
+# Arctic Platform's Nemotron-H names each block's mixer after its type (mamba, self_attn, mlp) and keeps its own MoE
+# names, where the Transformers model calls every mixer "mixer". These are Arctic Platform's own renames
+# (nemotron_h/converting_nemotron_h.py: convert_prime_layer_to_hf, and the embeddings / norm_f renames), over names
+# without container segments; the non-gated experts' w1 and w2 are the up and down projections. Their target_parameters
+# LoRAs nest alike on both sides (w1 / up_proj innermost), so only the container is renamed. Only a Nemotron-H model is
+# renamed (_is_nemotron_h), so every other family keeps its names.
+_NEMOTRON_H_BLOCK = re.compile(r"^layers\.(?P<layer>\d+)\.(?P<block>mamba|self_attn|mlp)\.")
+_NEMOTRON_H_RENAMES = (
+    (re.compile(r"^embed_tokens\.weight$"), "embeddings.weight"),
+    (re.compile(r"^norm\.weight$"), "norm_f.weight"),
+    (re.compile(r"^(layers\.\d+)\.(?:mamba|self_attn)\."), r"\1.mixer."),
+    (re.compile(r"^(layers\.\d+)\.mlp\.router\.gate$"), r"\1.mixer.gate.weight"),
+    (re.compile(r"^(layers\.\d+)\.mlp\.experts\.w1$"), r"\1.mixer.experts.up_proj"),
+    (re.compile(r"^(layers\.\d+)\.mlp\.experts\.w2$"), r"\1.mixer.experts.down_proj"),
+    (re.compile(r"^(layers\.\d+)\.mlp\.experts\.(?=(?:base_layer\.)*lora_[AB]\.)"), r"\1.mixer.experts."),
+    (re.compile(r"^(layers\.\d+)\.mlp\.shared_expert\."), r"\1.mixer.shared_experts."),
+    (re.compile(r"^(layers\.\d+)\.mlp\.(fc[12]_latent_proj)\."), r"\1.mixer.\2."),
+)
+
+
+def _is_nemotron_h(keys: Iterable[str]) -> bool:
+    """Whether normalized names are Arctic Platform's Nemotron-H's.
+
+    A model with Mamba-2 mixers is. A LoRA inventory trains no Mamba-2 parameter, but Nemotron-H's layers each hold
+    one mixer (attention in some, the MoE in others), where every other family's decoder layer holds its self_attn
+    and its mlp together.
+    """
+    blocks: Dict[str, set] = {}
+    for key in keys:
+        match = _NEMOTRON_H_BLOCK.match(key)
+        if match:
+            blocks.setdefault(match.group("layer"), set()).add(match.group("block"))
+    kinds = set().union(*blocks.values())
+    return "mamba" in kinds or (kinds == {"self_attn", "mlp"} and all(len(held) == 1 for held in blocks.values()))
+
+
+def _nemotron_h_names(keys: Iterable[str]) -> Dict[str, str]:
+    """Transformers names for Arctic Platform's Nemotron-H names (normalized), or nothing for another family."""
+    keys = list(keys)
+    if not _is_nemotron_h(keys):
+        return {}
+    renamed = {}
+    for key in keys:
+        for pattern, replacement in _NEMOTRON_H_RENAMES:
+            name, count = pattern.subn(replacement, key)
+            if count:
+                renamed[key] = name
+                break
+    return renamed
+
+
+def nemotron_h_reference_names(names: Iterable[str]) -> Dict[str, str]:
+    """Each raw Arctic Platform Nemotron-H name's Transformers name (normalized), or nothing for another family."""
+    normalized = {name: normalize(name) for name in names}
+    renamed = _nemotron_h_names(normalized.values())
+    return {name: renamed.get(key, key) for name, key in normalized.items()} if renamed else {}
+
+
 @dataclass
 class _Entry:
     originals: List[str]
     value: float
+
+
+def _gated_expert_lora(keys: Iterable[str]) -> Dict[str, Tuple[str, ...]]:
+    """Hugging Face names for the LoRA factors Arctic puts on a gated routed-experts container.
+
+    Arctic's GroupedExperts register w1, w2, w3, so their LoRAs nest as w1 (two ``base_layer`` segments), w2 (one), w3
+    (none). Hugging Face fuses w1 and w3 into ``gate_up_proj``, registered before ``down_proj``: its LoRA is the
+    container's ``base_layer`` one, the block-diagonal pair of w1's and w3's (harness/lora.py
+    ``constrain_fused_expert_factors``), and down_proj's is the outer one. A non-gated container (w1, w2: Hugging Face
+    up_proj, down_proj) nests the same on both sides and keeps its names.
+    """
+    depths: Dict[Tuple[str, str], Dict[int, str]] = {}
+    for key in keys:
+        match = _EXPERT_LORA.match(key)
+        if match:
+            depth = match.group("nest").count(".base_layer")
+            depths.setdefault((match.group("prefix"), match.group("factor")), {})[depth] = key
+    mapping = {}
+    for (prefix, factor), by_depth in depths.items():
+        if set(by_depth) != {0, 1, 2}:
+            continue
+        mapping[f"{prefix}.base_layer.{factor}.default.weight"] = (by_depth[2], by_depth[0])
+        mapping[f"{prefix}.{factor}.default.weight"] = (by_depth[1],)
+    return mapping
 
 
 def normalize(name: str) -> str:
@@ -138,8 +225,19 @@ def _canonical_ap(values: Dict[str, float]) -> Dict[str, _Entry]:
     source = _normalized(values)
     canonical: Dict[str, _Entry] = {}
     routed: Dict[str, Dict[str, _Entry]] = {}
+    for key, pieces in _gated_expert_lora(source).items():
+        entries = [source.pop(piece) for piece in pieces]
+        canonical[key] = _Entry(
+            [original for entry in entries for original in entry.originals],
+            math.sqrt(math.fsum(entry.value**2 for entry in entries)),
+        )
+    renamed = _nemotron_h_names(source)
 
     for key, entry in source.items():
+        if key in renamed:
+            _insert(canonical, renamed[key], entry.originals[0], entry.value)
+            canonical[renamed[key]].originals.extend(entry.originals[1:])
+            continue
         match = _ROUTED_EXPERT.match(key)
         if match:
             weight = match.group("weight")
@@ -183,15 +281,35 @@ class CanonicalTensorGroup:
 
     originals: Tuple[str, ...]
     concatenate_dim: Optional[int] = None
+    # A fused expert parameter's lora_B: the pieces are its diagonal blocks, zero elsewhere.
+    block_diagonal: bool = False
 
 
 def canonical_ap_tensor_groups(names: Iterable[str]) -> Dict[str, CanonicalTensorGroup]:
     """Group Arctic Platform tensor names by their Hugging Face parameter representation."""
     canonical: Dict[str, CanonicalTensorGroup] = {}
     routed: Dict[str, Dict[str, str]] = {}
+    names = list(names)
+    fused = _gated_expert_lora(normalize(name) for name in names)
+    claimed = {piece for pieces in fused.values() for piece in pieces}
+    for key, pieces in fused.items():
+        if len(pieces) == 1:
+            canonical[key] = CanonicalTensorGroup(pieces)
+        elif ".lora_A." in key:
+            # lora_A stacks the two weights' rank rows: [E * 2r, in].
+            canonical[key] = CanonicalTensorGroup(pieces, concatenate_dim=0)
+        else:
+            canonical[key] = CanonicalTensorGroup(pieces, block_diagonal=True)
+
+    renamed = _nemotron_h_names(normalize(original) for original in names)
 
     for original in names:
         key = normalize(original)
+        if key in claimed:
+            continue
+        if key in renamed:
+            canonical[renamed[key]] = CanonicalTensorGroup((key,))
+            continue
         match = _ROUTED_EXPERT.match(key)
         if match:
             weight = match.group("weight")
@@ -483,7 +601,7 @@ def _optimizer_capture_worker_class() -> Any:
 
             return self._optimizer_collective_check(merge)
 
-        def _globalize_expert_optimizer_tensor(self, param: Any, tensor: torch.Tensor) -> torch.Tensor:
+        def _globalize_expert_optimizer_tensor(self, name: str, param: Any, tensor: torch.Tensor) -> torch.Tensor:
             group_name = getattr(param, "group_name", None)
             if group_name is None or getattr(param, "allreduce", True) is not False or tensor.dim() < 2:
                 return tensor
@@ -494,7 +612,7 @@ def _optimizer_capture_worker_class() -> Any:
             ep_group = ds_groups._get_expert_parallel_group(group_name)
             shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=ep_group))]
             dist.all_gather(shards, local, group=ep_group)
-            return torch.cat(shards, dim=0)
+            return torch.cat(shards, dim=expert_shard_dim(name))
 
         def _optimizer_step_values(self) -> list[int]:
             values: set[int] = set()
@@ -574,7 +692,7 @@ def _optimizer_capture_worker_class() -> Any:
                         raise RuntimeError(f"optimizer-state capture found no FP32 master for {name}")
 
                 self._optimizer_collective_check(validate_master)
-                full_parameter = self._globalize_expert_optimizer_tensor(param, full_parameter)
+                full_parameter = self._globalize_expert_optimizer_tensor(name, param, full_parameter)
                 gradient = (
                     accumulated_gradients.get(id(param))
                     if accumulated_gradients is not None
@@ -594,7 +712,7 @@ def _optimizer_capture_worker_class() -> Any:
 
                 self._optimizer_collective_check(validate_gradient)
                 if gradient is not None:
-                    gradient = self._globalize_expert_optimizer_tensor(param, gradient)
+                    gradient = self._globalize_expert_optimizer_tensor(name, param, gradient)
                 exp_avg, exp_avg_sq = self._full_adam_moments(param)
 
                 def validate_moments():
@@ -603,8 +721,8 @@ def _optimizer_capture_worker_class() -> Any:
 
                 self._optimizer_collective_check(validate_moments)
                 if exp_avg is not None:
-                    exp_avg = self._globalize_expert_optimizer_tensor(param, exp_avg)
-                    exp_avg_sq = self._globalize_expert_optimizer_tensor(param, exp_avg_sq)
+                    exp_avg = self._globalize_expert_optimizer_tensor(name, param, exp_avg)
+                    exp_avg_sq = self._globalize_expert_optimizer_tensor(name, param, exp_avg_sq)
 
                 def save_before():
                     torch.save(
@@ -675,11 +793,11 @@ def _optimizer_capture_worker_class() -> Any:
                         raise RuntimeError(f"active optimizer parameter {name} has no post-step Adam moments")
 
                 self._optimizer_collective_check(validate_moments)
-                full_parameter = self._globalize_expert_optimizer_tensor(param, full_parameter)
+                full_parameter = self._globalize_expert_optimizer_tensor(name, param, full_parameter)
                 if exp_avg is not None:
-                    exp_avg = self._globalize_expert_optimizer_tensor(param, exp_avg)
+                    exp_avg = self._globalize_expert_optimizer_tensor(name, param, exp_avg)
                 if exp_avg_sq is not None:
-                    exp_avg_sq = self._globalize_expert_optimizer_tensor(param, exp_avg_sq)
+                    exp_avg_sq = self._globalize_expert_optimizer_tensor(name, param, exp_avg_sq)
 
                 def save_after():
                     before = torch.load(before_dir / f"{index:06d}.pt", map_location="cpu", weights_only=True)
@@ -921,7 +1039,8 @@ class WorkerParticipation:
         self.capture = ParticipationCapture(model, decoder=decoder, head=head)
         try:
             self.expert_widths = {
-                name: expert_parallel_width(parameter) for name, parameter in self.capture.parameters.items()
+                name: expert_parallel_width(self.capture.parameters[name]) if name in self.capture.parameters else 1
+                for name in self.capture.inventory
             }
             self.before = self.evidence()
         except BaseException:
@@ -949,6 +1068,7 @@ class WorkerParticipation:
             "before": deepcopy(self.before),
             "after": self.evidence(),
             "expert_parallel_widths": dict(self.expert_widths),
+            "dense_shards": dense_shard_record(self.capture.dense_shards),
         }
 
     def close(self):
@@ -1000,6 +1120,8 @@ def merge_worker_receipts(receipts, *, job_id, world_size):
                 )
             ):
                 raise ValueError("participation worker inventory is incomplete")
+    if any(receipt.get("dense_shards", {}) != receipts[0].get("dense_shards", {}) for receipt in receipts):
+        raise ValueError("participation node-shard layouts differ across ranks")
     shapes = {name: entry["shape"] for name, entry in receipts[0]["before"]["participation"]["parameters"].items()}
     widths = receipts[0].get("expert_parallel_widths")
     if (
@@ -1079,6 +1201,28 @@ def participation_worker_class(
         def correctness_participation_receipt(self):
             return deepcopy(self._correctness_participation_receipt)
 
+        def _per_parameter_gradient_norm_metrics(self):
+            # The native metric names node shards (Arctic's patches.dense_shard), whose rank-0 slice it measures;
+            # the inventory names the original parameters they hold.
+            metrics = super()._per_parameter_gradient_norm_metrics()
+            if not self._gradient_norms_per_param:
+                return metrics
+            model = self._engine.module if hasattr(self._engine, "module") else self._engine
+            layouts = _dense_shard_layouts(model)
+            if not layouts:
+                return metrics
+            norms = dense_shard_gradient_norms(model, layouts)
+            if self.rank != 0:
+                return metrics
+            native = metrics["gradient_norms_per_param"]
+            return {
+                **metrics,
+                "gradient_norms_per_param": {
+                    **{name: value for name, value in native.items() if name not in layouts},
+                    **norms,
+                },
+            }
+
         def save(self, stage_info, path=None, checkpoint_type="resumable"):
             if checkpoint_type != "resumable":
                 return super().save(stage_info, path=path, checkpoint_type=checkpoint_type)
@@ -1092,6 +1236,35 @@ def participation_worker_class(
             return super().destroy(remove_checkpoint_scratch=remove_checkpoint_scratch)
 
     return ParticipationWorker
+
+
+_PARTICIPATION_SAVE_CODE = participation_worker_class(object).save.__code__
+
+
+def _native_worker_save(worker_class):
+    """The producer's worker save, which the native collector pins to DSS's training module.
+
+    Every first-step correctness job runs ``participation_worker_class`` workers (lora.install_manager), whose save
+    only wraps the producer's save in ``node_local_model_state_writer``, as the collector's own save hook does; the
+    producer's save is the next one in the MRO. The worker class is Ray's actor subclass of it, whose save is Ray's
+    wrapper (unwrapped by ``_native_callback_origin``), and Ray sends the closure-defined class to each worker by
+    value with copies of its code objects, so the participation save is recognized by code equality, which ignores
+    the file and qualified name, plus both.
+    """
+    save = worker_class.save
+    origin = _native_callback_origin(save)
+    code = getattr(origin, "__code__", None)
+    if not (
+        code == _PARTICIPATION_SAVE_CODE
+        and code.co_filename == _PARTICIPATION_SAVE_CODE.co_filename
+        and code.co_qualname == _PARTICIPATION_SAVE_CODE.co_qualname
+    ):
+        return save
+    definers = [cls for cls in worker_class.__mro__ if "save" in vars(cls)]
+    owners = [index for index, cls in enumerate(definers) if vars(cls)["save"] is origin]
+    if len(owners) != 1 or owners[0] + 1 >= len(definers):
+        raise ValueError("native participation worker has no producer save beneath it")
+    return vars(definers[owners[0] + 1])["save"]
 
 
 def participation_step_class(coordinator_base):
@@ -1128,7 +1301,22 @@ def expert_parallel_width(parameter) -> int:
     return torch.distributed.get_world_size(group=groups._get_expert_parallel_group(group_name))
 
 
+def expert_shard_dim(name: str) -> int:
+    """The axis expert parallelism splits a parameter on.
+
+    An expert stack and an expert lora_A (``[E * r, in]``) hold their experts along dim 0; an expert lora_B
+    (``[out, r * E]``, PEFT's ParamWrapper layout) holds them along its columns.
+    """
+    return -1 if ".lora_B." in name else 0
+
+
 PARTICIPATION_SCHEMA = "trainable-parameter-participation-v1"
+# The image modules of the composite checkpoints the catalog trains on text, named as children of the base model:
+# Qwen's ``visual``, Gemma 3's ``vision_tower`` and ``multi_modal_projector``, Gemma 4's ``vision_tower`` and
+# ``embed_vision``. The Hugging Face base model calls them only for pixel inputs, so a text-only step leaves them
+# without a gradient. They count as inactive only with a forward hook's proof that no call reached them and when no
+# parameter of theirs is one the decoder or head holds elsewhere (_text_path_parameters).
+TEXT_DECODER_BYPASS_MODULES = frozenset({"visual", "vision_tower", "multi_modal_projector", "embed_vision"})
 
 
 def validate_participation(record: dict) -> dict:
@@ -1158,7 +1346,7 @@ def validate_participation(record: dict) -> dict:
                     type(evidence.get("calls")) is int
                     and evidence["calls"] == 0
                     and evidence.get("outside_decoder_and_head") is True
-                    and normalize(evidence["module"]) == "visual"
+                    and normalize(evidence["module"]) in TEXT_DECODER_BYPASS_MODULES
                 )
             elif kind == "integer-selector":
                 valid = (
@@ -1203,7 +1391,11 @@ def canonical_participation(record: dict, *, backend: str) -> dict:
         if len({entry["state"] for entry in pieces}) != 1:
             raise ValueError(f"participation disagreement within fused parameter {name}")
         shape = list(pieces[0]["shape"])
-        if group and group.concatenate_dim is not None:
+        if group and group.block_diagonal:
+            if any(len(entry["shape"]) != 2 for entry in pieces):
+                raise ValueError(f"participation fused shape mismatch for {name}")
+            shape = [sum(entry["shape"][dimension] for entry in pieces) for dimension in (0, 1)]
+        elif group and group.concatenate_dim is not None:
             dimension = group.concatenate_dim
             if any(
                 len(entry["shape"]) != len(shape)
@@ -1335,7 +1527,7 @@ def merge_rank_participation(before: list[dict], after: list[dict], shapes: dict
         if len(routes[name]) > 1:
             if not global_shape:
                 raise ValueError("expert participation requires a nonscalar parameter")
-            global_shape[0] *= len(routes[name])
+            global_shape[expert_shard_dim(name)] *= len(routes[name])
         if any(entry["state"] == "active" for entry in observed):
             entries[name] = {"shape": global_shape, "state": "active", "evidence": None}
             continue
@@ -1359,18 +1551,162 @@ def merge_rank_participation(before: list[dict], after: list[dict], shapes: dict
     return record, witnesses
 
 
+def _dense_shard_layouts(model) -> dict:
+    """Arctic's ``dense_shard_layouts(model)``, empty for a model without node shards. The training stack's module is
+    imported only for a model that has them: importing ``arctic_platform.model`` loads the debug hooks, which the suite
+    must run without, and an engine without ``patches.dense_shard`` has no such module."""
+    if all(getattr(module, "_ap_dense_shards", None) is None for module in model.modules()):
+        return {}
+    from arctic_platform.model.implementations.moe.dense_shard import dense_shard_layouts
+
+    return dense_shard_layouts(model)
+
+
+def dense_shard_record(layouts: dict) -> dict:
+    """Arctic's ``dense_shard_layouts`` as plain data: each node shard's group size, flat length and members."""
+    return {
+        name: {
+            "group_size": layout.group_size,
+            "total": layout.total,
+            "members": [
+                {"name": member.name, "shape": list(member.shape), "offset": member.offset, "numel": member.numel}
+                for member in layout.members
+            ],
+        }
+        for name, layout in sorted(layouts.items())
+    }
+
+
+def dense_shard_gradient_norms(model, layouts: dict) -> dict[str, float]:
+    """The reduced gradient's L2 norm of each original parameter a node shard holds, by its name.
+
+    A shard's gradient (``safe_get_full_grad``: collective over ZeRO's partition group) is this rank's slice of the
+    flat layout; each member's sum of squares over the slice is summed over the node group (collective). Every rank
+    walks the shards in the same order.
+    """
+    from deepspeed.utils import safe_get_full_grad
+
+    parameters = dict(model.named_parameters())
+    norms = {}
+    for name in sorted(layouts):
+        layout, shard = layouts[name], parameters[name]
+        gradient = safe_get_full_grad(shard)
+        size = layout.total // layout.group_size
+        low = layout.rank * size
+        squares = torch.zeros(len(layout.members) + 1, dtype=torch.float64, device=shard.device)
+        if gradient is not None:
+            flat = gradient.detach().reshape(-1)
+            squares[-1] = 1
+            for index, member in enumerate(layout.members):
+                first, last = max(low, member.offset), min(low + size, member.offset + member.numel)
+                if first < last:
+                    squares[index] = torch.linalg.vector_norm(flat[first - low : last - low].float()).double() ** 2
+        dist.all_reduce(squares, group=layout.group)
+        if squares[-1] == 0:
+            continue  # no rank holds a gradient for this shard, as for a parameter without one
+        if squares[-1] != layout.group_size:
+            raise RuntimeError(f"node shard {name} has a gradient on only some ranks of its group")
+        norms.update((member.name, math.sqrt(float(value))) for member, value in zip(layout.members, squares[:-1]))
+    return norms
+
+
+def participating_parameters(model) -> dict:
+    """The trainable parameters that can take part in a step, by name.
+
+    A zero-element parameter holds nothing to train and never receives a gradient: Arctic Platform's non-gated experts
+    (Nemotron-H's LatentMoE) keep an empty w3 only so their weight signature matches the gated experts'
+    (model/implementations/moe/layers/moe.py NonGatedGroupedExperts), and the Transformers model has no counterpart.
+    """
+    return {
+        name: parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.numel() > 0
+    }
+
+
+def _text_path_parameters(model, roots) -> set[int]:
+    """The ids of the parameters the decoder and head hold, apart from the image modules a composite decoder holds.
+
+    Hugging Face's ``get_decoder()`` returns the language model, beside which the image modules sit. Arctic Platform's
+    Qwen3.5-MoE returns its composite body instead (``Qwen3_5MoeVLMModel``: ``visual`` and ``language_model``), whose
+    parameters include every tower parameter. The walk follows every registered path of the model's module tree, not
+    only the first one per module, and leaves out below a root only a path that ``_arm`` takes for an image module
+    (normalized to one of TEXT_DECODER_BYPASS_MODULES), never a root itself. A parameter that any other module of the
+    decoder or head also holds, tied or shared, therefore stays a decoder parameter. A root the walk does not reach
+    counts with all its parameters.
+    """
+    roots = {id(root): root for root in roots}
+    held, reached, expanded = set(), set(), set()
+    stack = [("", model, False)]  # (normalized path, module, below a root)
+    while stack:
+        name, module, inside = stack.pop()
+        if id(module) in roots:
+            inside = True
+            reached.add(id(module))
+        elif inside and name in TEXT_DECODER_BYPASS_MODULES:
+            continue
+        if inside and name:
+            # Below a path naming more than containers, no path normalizes to an image module's one-segment name.
+            held.update(id(parameter) for parameter in module.parameters())
+            continue
+        if (id(module), inside, bool(name)) in expanded:
+            continue
+        expanded.add((id(module), inside, bool(name)))
+        if inside:
+            held.update(id(parameter) for parameter in module._parameters.values() if parameter is not None)
+        stack.extend(
+            (normalize(f"{name}.{child_name}" if name else child_name), child, inside)
+            for child_name, child in module._modules.items()
+            if child is not None
+        )
+    for key, root in roots.items():
+        if key not in reached:
+            held.update(id(parameter) for parameter in root.parameters())
+    return held
+
+
+def _integer_only(value) -> bool:
+    """An integer selector's output: integer tensors (or a nonempty tuple/list of them) that carry no autograd."""
+    if isinstance(value, torch.Tensor):
+        return not value.is_floating_point() and not value.is_complex() and not value.requires_grad
+    if isinstance(value, (tuple, list)):
+        return bool(value) and all(_integer_only(item) for item in value)
+    return False
+
+
+class _GlobalPatch:
+    """A module-global function replaced for one capture; ``remove`` puts the original back, as for the hooks."""
+
+    def __init__(self, module, name, replacement, original):
+        self.module, self.name, self.replacement, self.original = module, name, replacement, original
+
+    def remove(self):
+        if getattr(self.module, self.name, None) is self.replacement:
+            setattr(self.module, self.name, self.original)
+
+
 class ParticipationCapture:
-    """Observe actual autograd use; zero storage and Adam moments are not evidence."""
+    """Observe actual autograd use; zero storage and Adam moments are not evidence.
+
+    A model with node shards (Arctic's ``patches.dense_shard``) trains the original parameters through them: the
+    inventory lists those under their own names and shapes, never the shards, and a member is active when the gathered
+    value its module's call put in its owner receives a gradient.
+    """
 
     def __init__(self, model, *, decoder=None, head=None):
         self.model = model
-        self.parameters = {name: parameter for name, parameter in model.named_parameters() if parameter.requires_grad}
+        self.parameters = participating_parameters(model)
         self.shapes = {name: list(parameter.shape) for name, parameter in self.parameters.items()}
+        self.dense_shards = _dense_shard_layouts(model)
+        self.inventory = {name: shape for name, shape in self.shapes.items() if name not in self.dense_shards}
+        for layout in self.dense_shards.values():
+            self.inventory.update((member.name, list(member.shape)) for member in layout.members)
         self.active = set()
         self.handles = []
         self.candidates = {}
         self.source_digests = {}
         self.forwards = []
+        self.global_patches = []
         try:
             self._arm(model, decoder=decoder, head=head)
         except BaseException:
@@ -1380,18 +1716,29 @@ class ParticipationCapture:
     def _arm(self, model, *, decoder, head):
         import torch
 
-        reachable = (
-            {id(parameter) for module in (decoder, head) for parameter in module.parameters()}
-            if decoder is not None and head is not None
-            else None
-        )
+        reachable = _text_path_parameters(model, (decoder, head)) if decoder is not None and head is not None else None
         for name, parameter in self.parameters.items():
             self.handles.append(parameter.register_hook(self._backward_hook(name)))
+        for layout in self.dense_shards.values():
+            members = []
+            for member in layout.members:
+                owner, _, leaf = member.name.rpartition(".")
+                members.append((member.name, model.get_submodule(owner), leaf))
+
+            def observe_members(_module, _inputs, *, members=members):
+                # After the module's gather pre-hook (prepended): the gathered values are in their owners' slots.
+                for member_name, owner, leaf in members:
+                    value = owner._parameters.get(leaf)
+                    if isinstance(value, torch.Tensor) and value.requires_grad:
+                        value.register_hook(self._member_backward_hook(member_name))
+
+            self.handles.append(model.get_submodule(layout.module).register_forward_pre_hook(observe_members))
+        selectors = {}
         for name, module in model.named_modules():
             kind = None
             if type(module).__name__ == "Glm5NextTextIndexer":
                 kind = "integer-selector"
-            elif reachable is not None and normalize(name) == "visual":
+            elif reachable is not None and normalize(name) in TEXT_DECODER_BYPASS_MODULES:
                 kind = "text-decoder-bypass"
             if kind is None:
                 continue
@@ -1418,19 +1765,46 @@ class ParticipationCapture:
 
             def observe(_module, _inputs, output, *, evidence=evidence):
                 evidence["calls"] += 1
-
-                def integer_only(value):
-                    if isinstance(value, torch.Tensor):
-                        return not value.is_floating_point() and not value.is_complex() and not value.requires_grad
-                    if isinstance(value, (tuple, list)):
-                        return bool(value) and all(integer_only(item) for item in value)
-                    return False
-
-                evidence["integer_outputs_only"] &= integer_only(output)
+                evidence["integer_outputs_only"] &= _integer_only(output)
 
             self.handles.append(module.register_forward_hook(observe))
+            if kind == "integer-selector":
+                selectors[id(module)] = evidence
             for parameter_name in names:
                 self.candidates[parameter_name] = evidence
+        if selectors:
+            self._observe_context_parallel_selection(selectors)
+
+    def _observe_context_parallel_selection(self, selectors):
+        """Count the context-parallel DSA attention's index selection toward the indexer it reads.
+
+        Under sequence parallelism Arctic's GLM-5.2/5.3 attention (glm53.context_parallel._sparse_attention_forward)
+        selects its top-k through ``_select_sparse_indices(self.indexer, ...)``, which reads the indexer's parameters
+        without calling the module, so the module's hook sees no call. Such a call counts toward the indexer module it
+        receives, under the hook's rule: every output an integer tensor without autograd.
+        """
+        try:
+            from arctic_platform.model.implementations.glm53 import context_parallel
+        except ImportError:
+            return
+        original = context_parallel._select_sparse_indices
+        source = inspect.getsourcefile(inspect.unwrap(original))
+        if source is not None and source not in self.source_digests:
+            self.source_digests[source] = hashlib.sha256(Path(source).read_bytes()).hexdigest()
+
+        def select(indexer, *args, **kwargs):
+            output = original(indexer, *args, **kwargs)
+            evidence = selectors.get(id(indexer))
+            if evidence is not None:
+                evidence["calls"] += 1
+                evidence["integer_outputs_only"] &= _integer_only(output)
+            return output
+
+        # The attention looks the function up in its module's globals at call time.
+        context_parallel._select_sparse_indices = select
+        patch = _GlobalPatch(context_parallel, "_select_sparse_indices", select, original)
+        self.handles.append(patch)
+        self.global_patches.append(patch)
 
     def _backward_hook(self, name):
         def record(gradient):
@@ -1439,8 +1813,17 @@ class ParticipationCapture:
 
         return record
 
+    def _member_backward_hook(self, name):
+        # A gathered value is one output of the gather; autograd calls its hook with None when it got no gradient.
+        def record(gradient):
+            if gradient is not None:
+                self.active.add(name)
+            return gradient
+
+        return record
+
     def result(self) -> dict:
-        current = {name: parameter for name, parameter in self.model.named_parameters() if parameter.requires_grad}
+        current = participating_parameters(self.model)
         if set(current) != set(self.parameters) or any(
             current[name] is not parameter or list(parameter.shape) != self.shapes[name]
             for name, parameter in self.parameters.items()
@@ -1454,8 +1837,10 @@ class ParticipationCapture:
             for module, forward in self.forwards
         ):
             raise ValueError("participation forward implementation changed during capture")
+        if any(getattr(patch.module, patch.name, None) is not patch.replacement for patch in self.global_patches):
+            raise ValueError("participation selection implementation changed during capture")
         entries = {}
-        for name, parameter in self.parameters.items():
+        for name, shape in self.inventory.items():
             evidence = self.candidates.get(name)
             justified = evidence is not None and (
                 (evidence["kind"] == "text-decoder-bypass" and evidence["calls"] == 0)
@@ -1466,7 +1851,7 @@ class ParticipationCapture:
                 )
             )
             entries[name] = {
-                "shape": list(parameter.shape),
+                "shape": list(shape),
                 "state": "active" if name in self.active else "inactive" if justified else "missing",
                 "evidence": dict(evidence) if justified and name not in self.active else None,
             }
@@ -1637,6 +2022,23 @@ def _native_sources(layout: dict) -> None:
                 raise ValueError("native producer source drift")
 
 
+def _native_master_dtype(config: dict) -> torch.dtype:
+    """The dtype of a native checkpoint's masters and Adam moments, as DeepSpeed selects it for BF16 training.
+
+    DeepSpeedZeroOptimizer keeps single_partition_of_fp32_groups in BF16 only under bf16_master_weights_and_grads and
+    in FP32 otherwise (base_optimizer.py _configure_master_weights), and its Adam moments in BF16 only under
+    bf16_optimizer_states, which requires BF16 masters. The reference steps masters and moments at one precision
+    (LoadedConfig.optimizer_dtype), so only the matched recipes are admitted.
+    """
+    bf16 = config.get("bf16")
+    if not isinstance(bf16, dict) or bf16.get("enabled") is not True:
+        raise ValueError("native route requires BF16 training")
+    low = [bf16.get(key, False) for key in ("bf16_master_weights_and_grads", "bf16_optimizer_states")]
+    if any(type(value) is not bool for value in low) or low[0] != low[1]:
+        raise ValueError("native route requires BF16 masters and states or FP32 masters and states")
+    return torch.bfloat16 if low[0] else torch.float32
+
+
 def _native_layout(layout: dict) -> dict:
     if not isinstance(layout, dict):
         raise ValueError("native layout must be a dictionary")
@@ -1648,7 +2050,9 @@ def _native_layout(layout: dict) -> dict:
         if type(layout.get(key)) is not int or layout[key] < 1:
             raise ValueError(f"native layout requires a positive {key}")
     world, ep, sp = (layout[key] for key in ("world_size", "ep_size", "sp_size"))
-    if ep not in (8, 16) or world % ep or world % sp or layout["model_mp_world_size"] not in (1, sp):
+    # DeepSpeed's _create_expert_and_data_parallel and Arctic's SP expert topologies place any EP degree that divides
+    # the world: each expert shard's world // ep replicas form its expert-DP group, the route read below.
+    if ep < 2 or world % ep or world % sp or layout["model_mp_world_size"] not in (1, sp):
         raise ValueError("unsupported native EP/SP topology")
     if type(layout.get("model_ep_rank")) is not int or not 0 <= layout["model_ep_rank"] < ep:
         raise ValueError("native layout requires the model writer's actual EP rank")
@@ -1676,11 +2080,7 @@ def _native_layout(layout: dict) -> dict:
     zero = config.get("zero_optimization") if isinstance(config, dict) else None
     if not isinstance(zero, dict) or type(zero.get("stage")) is not int or zero["stage"] != 2:
         raise ValueError("native layout requires ZeRO2 ds_config")
-    bf16 = config.get("bf16")
-    if not isinstance(bf16, dict) or any(
-        bf16.get(key) is not True for key in ("enabled", "bf16_master_weights_and_grads", "bf16_optimizer_states")
-    ):
-        raise ValueError("native route requires the original BF16 master/state recipe")
+    _native_master_dtype(config)
     tp = config.get("tensor_parallel", {})
     if tp and (not isinstance(tp, dict) or tp.get("tp_size", 1) != 1):
         raise ValueError("native tensor parallel checkpoints are unsupported")
@@ -1700,7 +2100,7 @@ def _native_runtime_sources(worker, sources: dict) -> None:
     checkpointer, engine = worker._checkpointer, worker._engine
     zero = engine.optimizer
     selected = {
-        "training": type(worker).save,
+        "training": _native_worker_save(type(worker)),
         "expert_checkpointer": type(checkpointer).save_resumable,
         "base_checkpointer": type(checkpointer).save_adapters,
         "engine": type(engine).save_checkpoint,
@@ -2936,12 +3336,14 @@ def _bf16_vector(value, length: int, description: str) -> torch.Tensor:
     return value
 
 
-def _config(config, description: str) -> None:
+def _config(config, description: str) -> int:
+    """Validate a dense checkpoint's ds_config and return its ZeRO stage (1 or 2)."""
     if not isinstance(config, dict):
         raise ValueError(f"{description} requires ds_config")
     zero = config.get("zero_optimization", {})
-    if not isinstance(zero, dict) or _integer(zero.get("stage"), "configured ZeRO stage") != 2:
-        raise ValueError("only dense ZeRO2 checkpoints are supported")
+    stage = _integer(zero.get("stage"), "configured ZeRO stage") if isinstance(zero, dict) else None
+    if stage not in (1, 2):
+        raise ValueError("only dense ZeRO1/ZeRO2 checkpoints are supported")
     optimizer = config.get("optimizer")
     if (
         not isinstance(optimizer, dict)
@@ -2962,6 +3364,7 @@ def _config(config, description: str) -> None:
     tp = config.get("tensor_parallel", {})
     if tp and (not isinstance(tp, dict) or tp.get("tp_size", 1) != 1):
         raise ValueError("tensor parallel checkpoints are unsupported")
+    return stage
 
 
 def _checkpoint_files(root: Path) -> tuple[Path, list[Path]]:
@@ -3018,14 +3421,53 @@ def _native_checkpoint_parameter_names(parameters: dict, description: str) -> di
     return names
 
 
+def _dense_shard_routes(dense_shards: dict | None, shapes: list[dict], world_size: int, root: Path) -> dict:
+    """The ZeRO groups of node shards (``dense_shard_record``), each with its ordered expert-DP routes: shard ``r`` of
+    a node group (consecutive blocks of ``g`` ranks) is partitioned over the ranks at position ``r`` of every block,
+    so route ``r`` rebuilds it and the routes in order rebuild the flat layout."""
+    sidefile = next(root.rglob("dense_shard_layout.json"), None)  # dss's record of the shards it saved
+    if not dense_shards:
+        if sidefile is not None:
+            raise ValueError("node-shard checkpoint requires the participation receipts' shard layout")
+        return {}
+    sizes = {record["group_size"] for record in dense_shards.values()}
+    group_size = sizes.pop() if len(sizes) == 1 else None
+    if group_size is None or group_size < 1 or world_size % group_size:
+        raise ValueError("node shards require one group size that divides the DP world size")
+    if sidefile is not None:
+        saved = json.loads(sidefile.read_text())
+        expected = {name: record["total"] // group_size for name, record in dense_shards.items()}
+        if saved != {"group_size": group_size, "shards": expected}:
+            raise ValueError("checkpoint node-shard layout differs from the participation receipts'")
+    routes = [[block + position for block in range(0, world_size, group_size)] for position in range(group_size)]
+    groups = {}
+    for index, group in enumerate(shapes):
+        sharded = [name in dense_shards for name in group]
+        if any(sharded) and not all(sharded):
+            raise ValueError("optimizer group mixes node shards and replicated parameters")
+        if any(sharded):
+            for name, shape in group.items():
+                record = dense_shards[name]
+                if record["total"] % group_size or tuple(shape) != (record["total"] // group_size,):
+                    raise ValueError(f"node shard {name} shape differs from its layout")
+            groups[index] = routes
+    if set(dense_shards) != {name for index in groups for name in shapes[index]}:
+        raise ValueError("node-shard layout names shards the checkpoint does not hold")
+    return groups
+
+
 def _snapshot(
     root: Path,
     *,
     expected_optimizer_config: dict | None,
     expected_learning_rate: float | None,
     expected_native_layout: dict | None = None,
+    dense_shards: dict | None = None,
 ) -> _Snapshot:
     native = expected_native_layout
+    if native is not None and dense_shards:
+        raise ValueError("native EP captures do not take node-shard layouts")
+    native_dtype = None if native is None else _native_master_dtype(native["ds_config"])
     experts, input_hashes, expert_files = None, None, []
     if native is None:
         model_file, optim_files = _checkpoint_files(root)
@@ -3080,7 +3522,8 @@ def _snapshot(
                     reason = f"sidefile layout is {value.layout}, expected {torch.strided}"
                 elif value.ndim < 1:
                     reason = "sidefile tensor is scalar"
-                elif value.numel() == 0:
+                elif value.numel() == 0 and not (isinstance(reference, torch.Tensor) and reference.numel() == 0):
+                    # Arctic's non-gated experts keep an empty w3 placeholder in the module, saved with the experts.
                     reason = f"sidefile tensor is empty with shape {tuple(value.shape)}"
                 elif not isinstance(reference, torch.Tensor):
                     reason = f"module value is {type(reference).__name__}, not a tensor"
@@ -3125,6 +3568,7 @@ def _snapshot(
         shapes.append(entries)
     # The BF16 module payload is not a master-weight source and is no longer needed.
     del model, module
+    dense_routes = _dense_shard_routes(dense_shards, shapes, world_size, root) if native is None else {}
     shards = []
     groups = []
     partition_sizes = []
@@ -3135,12 +3579,20 @@ def _snapshot(
         optimizer = state.get("optimizer_state_dict")
         if not isinstance(optimizer, dict):
             raise ValueError("checkpoint requires optimizer_state_dict")
-        if _integer(optimizer.get("zero_stage"), "ZeRO stage") != 2:
-            raise ValueError("only dense ZeRO2 checkpoints are supported")
         if native is None:
-            _config(model_config, "model checkpoint")
-            _config(state.get("ds_config"), "optimizer checkpoint")
+            stage = _config(model_config, "model checkpoint")
+            if _config(state.get("ds_config"), "optimizer checkpoint") != stage:
+                raise ValueError("model and optimizer checkpoints differ in ZeRO stage")
         else:
+            stage = 2
+        # At ZeRO stage 1 with BF16 parameters, FP32 gradient accumulation and no CPU offload DeepSpeed trains with
+        # BF16_Optimizer (engine.py _do_optimizer_sanity_check), whose state_dict names no zero_stage and keeps each
+        # FP32 partition whole, its alignment padding recorded on the last rank (bf16_optimizer.py state_dict). Every
+        # other dense ZeRO1/ZeRO2 engine uses DeepSpeedZeroOptimizer, which names its stage and strips the padding.
+        whole_partitions = stage == 1 and "zero_stage" not in optimizer
+        if not whole_partitions and (saved := _integer(optimizer.get("zero_stage"), "ZeRO stage")) != stage:
+            raise ValueError(f"ZeRO{saved} optimizer checkpoint under a ZeRO{stage} ds_config")
+        if native is not None:
             if state.get("ds_config") != model_config:
                 raise ValueError("native optimizer ds_config mismatch")
             optimizer_type = model_config.get("optimizer", {}).get("type")
@@ -3149,7 +3601,11 @@ def _snapshot(
         if optimizer.get("overflow"):
             raise ValueError("overflowed optimizer checkpoint is unsupported")
         counts = _sequence(optimizer.get("partition_count"), count, "partition_count")
-        if native is None and any(_integer(value, "partition_count") != world_size for value in counts):
+        if native is None and any(
+            _integer(value, "partition_count") != world_size
+            for index, value in enumerate(counts)
+            if index not in dense_routes
+        ):
             raise ValueError("missing DP ranks or expert parallel partition_count")
         paddings = _sequence(optimizer.get("group_paddings"), count, "group_paddings")
         masters = _sequence(optimizer.get("single_partition_of_fp32_groups"), count, "FP32 master groups")
@@ -3166,9 +3622,21 @@ def _snapshot(
         param_groups = _sequence(base.get("param_groups"), count, "base optimizer param_groups")
         ids = []
         for index, group in enumerate(param_groups):
-            if not isinstance(group, dict) or (native is None and group.get("moe")) or group.get("amsgrad"):
+            if (
+                not isinstance(group, dict)
+                or (native is None and group.get("moe") and index not in dense_routes)
+                or group.get("amsgrad")
+            ):
                 raise ValueError("unsupported optimizer param group (EP or AMSGrad)")
-            if native is None:
+            if index in dense_routes:
+                # Arctic tags node shards as expert-parallel parameters of the node's group (ep_size_<g>).
+                if group.get("moe") is not True or group.get("name") != f"ep_size_{len(dense_routes[index])}":
+                    raise ValueError("node-shard optimizer group is not its node's expert-parallel group")
+                route = next(route for route in dense_routes[index] if rank in route)
+                partition_rank, group_world = route.index(rank), len(route)
+                if _integer(counts[index], "partition_count") != group_world:
+                    raise ValueError("node-shard optimizer partition_count disagrees with its expert-DP group")
+            elif native is None:
                 partition_rank, group_world = rank, world_size
             else:
                 expert_group = group.get("moe", False)
@@ -3214,7 +3682,7 @@ def _snapshot(
                 raise ValueError("optimizer learning rate mismatch")
             if rank:
                 keys = ("betas", "eps", "weight_decay", "bias_correction", "lr")
-                if native is not None:
+                if native is not None or dense_routes:
                     keys += ("moe", "name")
                 for key in keys:
                     if group.get(key) != groups[0][index].get(key):
@@ -3225,10 +3693,11 @@ def _snapshot(
             if not isinstance(master, torch.Tensor):
                 raise ValueError("FP32 master groups must contain tensors")
             padding = _integer(paddings[index], "group padding")
-            # ZeRO2 state_dict removes master padding but retains full nonelastic Adam state partitions.
-            length = master.numel() + padding
-            vector_check = _fp32_vector if native is None else _bf16_vector
-            vector_check(master, length - padding, "optimizer master partition")
+            # DeepSpeedZeroOptimizer's state_dict removes master padding but retains full nonelastic Adam state
+            # partitions; BF16_Optimizer's keeps both whole.
+            length = master.numel() if whole_partitions else master.numel() + padding
+            vector_check = _bf16_vector if native_dtype == torch.bfloat16 else _fp32_vector
+            vector_check(master, master.numel(), "optimizer master partition")
             if native is not None and not bool(torch.isfinite(master).all()):
                 raise ValueError("nonfinite native optimizer master")
             if rank == 0:
@@ -3238,11 +3707,14 @@ def _snapshot(
             if length != partition_sizes[index]:
                 raise ValueError("inconsistent FP32 partition sizes")
             total = sum(math.prod(shape) for shape in shapes[index].values())
-            wanted_length = max(0, min(length, total - partition_rank * length))
-            if padding != length - wanted_length:
-                raise ValueError("FP32 partition padding/parameter shape mismatch")
-            if master.numel() != wanted_length:
-                raise ValueError("FP32 partition padding/parameter shape mismatch")
+            if whole_partitions:
+                wanted_padding = group_world * length - total if partition_rank == group_world - 1 else 0
+                if padding != wanted_padding:
+                    raise ValueError("FP32 partition padding/parameter shape mismatch")
+            else:
+                wanted_length = max(0, min(length, total - partition_rank * length))
+                if padding != length - wanted_length or master.numel() != wanted_length:
+                    raise ValueError("FP32 partition padding/parameter shape mismatch")
             group_state = base["state"].get(param_id, {})
             if not isinstance(group_state, dict):
                 raise ValueError("invalid Adam optimizer state")
@@ -3279,9 +3751,11 @@ def _snapshot(
             raise ValueError("unexpected optimizer state groups")
         shards.append(optimizer)
         groups.append(param_groups)
+    if dense_routes:
+        rank_routes = [dense_routes.get(index, [list(range(world_size))]) for index in range(count)]
     for index, shape_group in enumerate(shapes):
         total = sum(math.prod(shape) for shape in shape_group.values())
-        partitions = world_size if native is None else len(rank_routes[index][0])
+        partitions = world_size if native is None and not dense_routes else len(rank_routes[index][0])
         if total > partitions * partition_sizes[index]:
             raise ValueError("missing FP32 parameter partitions")
     snapshot = _Snapshot(
@@ -3291,7 +3765,7 @@ def _snapshot(
         groups,
         partition_sizes,
         native,
-        rank_routes if native is not None else None,
+        rank_routes if native is not None or dense_routes else None,
         experts,
         input_hashes,
     )
@@ -3302,8 +3776,9 @@ def _snapshot(
         for index, shape_group in enumerate(shapes):
             if groups[0][index].get("moe"):
                 for name in shape_group:
-                    actual = _parameter(snapshot, index, name, "fp32_master")
-                    expected = torch.cat([shard[name] for shard in experts], dim=0)
+                    # DeepSpeed rounds each master to the BF16 parameter the sidefile holds (a no-op for BF16).
+                    expected = torch.cat([shard[name] for shard in experts], dim=expert_shard_dim(name))
+                    actual = _parameter(snapshot, index, name, "fp32_master").to(expected.dtype)
                     if not torch.equal(actual, expected):
                         raise ValueError("expert optimizer master/sidefile ownership mismatch")
         if _native_input_hashes(root) != input_hashes:
@@ -3314,9 +3789,10 @@ def _snapshot(
 def _parameter(snapshot: _Snapshot, group_index: int, name: str, key: str) -> torch.Tensor:
     shape = snapshot.shapes[group_index][name]
     routes = [list(range(len(snapshot.shards)))] if snapshot.rank_routes is None else snapshot.rank_routes[group_index]
+    native = snapshot.native_layout
+    dtype = torch.float32 if native is None else _native_master_dtype(native["ds_config"])
     values = []
     for route in routes:
-        dtype = torch.float32 if snapshot.native_layout is None else torch.bfloat16
         result = torch.empty(math.prod(shape), dtype=dtype)
         offset = 0
         for rank in route:
@@ -3338,7 +3814,28 @@ def _parameter(snapshot: _Snapshot, group_index: int, name: str, key: str) -> to
         if offset != result.numel():
             raise ValueError(f"incomplete reconstruction for {name}::{key}")
         values.append(result.reshape(shape))
-    return values[0] if len(values) == 1 else torch.cat(values, dim=0)
+    return values[0] if len(values) == 1 else torch.cat(values, dim=expert_shard_dim(name))
+
+
+def _decoded_parameters(after: _Snapshot, dense_shards: dict):
+    """``(name, read)`` for each parameter the checkpoints hold, ``read(snapshot, key)`` its tensor; a
+    node shard yields the original parameters it holds, each read out of the shard's rebuilt flat layout."""
+    for group_index, shapes in enumerate(after.shapes):
+        for name in shapes:
+            if name not in dense_shards:
+                yield name, lambda snapshot, key, name=name, index=group_index: _parameter(snapshot, index, name, key)
+                continue
+            cache = {}  # the shard's rebuilt states, while its members are read (one shard at a time)
+
+            def flat(snapshot, key, *, name=name, index=group_index, cache=cache):
+                if (id(snapshot), key) not in cache:
+                    cache[(id(snapshot), key)] = _parameter(snapshot, index, name, key)
+                return cache[(id(snapshot), key)]
+
+            for member in dense_shards[name]["members"]:
+                yield member["name"], lambda snapshot, key, flat=flat, member=member: (
+                    flat(snapshot, key).narrow(0, member["offset"], member["numel"]).reshape(member["shape"]).clone()
+                )
 
 
 def decode_optimizer_capture(
@@ -3357,8 +3854,8 @@ def decode_optimizer_capture(
     Input roots may contain one checkpoint tag plus metadata/export receipts. Output must be new.
     The manifest retains the actual post-step counter; the existing single-step comparison requires step 1.
     Native layouts must come from the owner's selected runtime and ordered process groups. Source hashes
-    protect those supplied bytes, not their runtime provenance. BF16 moments remain BF16; updates are the
-    FP32 difference of the actual saved BF16 masters, never of model sidefiles.
+    protect those supplied bytes, not their runtime provenance. Moments keep their saved BF16 or FP32 dtype; updates
+    are the FP32 difference of the actual saved masters, never of model sidefiles.
     """
     output_dir = require_data_fast_path(output_dir, label="optimizer artifact output")
     before_dir, after_dir = Path(before_dir), Path(after_dir)
@@ -3373,6 +3870,11 @@ def decode_optimizer_capture(
         if output_dir.resolve().is_relative_to(source.resolve()):
             raise ValueError("optimizer artifact output must be outside checkpoint inputs")
     options = {} if native is None else {"expected_native_layout": native}
+    # Node shards (Arctic's patches.dense_shard) hold the original parameters in flat layouts that only the training
+    # worker knows; its participation receipts carry them.
+    dense_shards = (participation_receipts or [{}])[0].get("dense_shards") or {}
+    if dense_shards:
+        options["dense_shards"] = dense_shards
     before = _snapshot(
         before_dir, expected_optimizer_config=expected_optimizer_config, expected_learning_rate=None, **options
     )
@@ -3414,7 +3916,9 @@ def decode_optimizer_capture(
             for filename, digest in receipt["after"]["participation_sources"].items():
                 if hashlib.sha256(Path(filename).read_bytes()).hexdigest() != digest:
                     raise ValueError("participation capture source drift")
-        shapes = {name: shape for group in after.shapes for name, shape in group.items()}
+        shapes = {name: shape for group in after.shapes for name, shape in group.items() if name not in dense_shards}
+        for record in dense_shards.values():
+            shapes.update((member["name"], tuple(member["shape"])) for member in record["members"])
         participation, inactive_weights = merge_rank_participation(
             [receipt["before"] for receipt in participation_receipts],
             [receipt["after"] for receipt in participation_receipts],
@@ -3447,32 +3951,31 @@ def decode_optimizer_capture(
     output_dir.mkdir(parents=True)
     try:
         entries = []
-        for group_index, shapes in enumerate(after.shapes):
-            for name, shape in shapes.items():
-                master_before = _parameter(before, group_index, name, "fp32_master")
-                master_after = _parameter(after, group_index, name, "fp32_master")
-                if name in inactive_weights:
+        for name, read in _decoded_parameters(after, dense_shards):
+            master_before = read(before, "fp32_master")
+            master_after = read(after, "fp32_master")
+            if name in inactive_weights:
 
-                    inactive_weights[name]["master"] = {
-                        "before": weight_identity(master_before),
-                        "after": weight_identity(master_after),
-                    }
-                if native is not None:
-                    master_before, master_after = master_before.float(), master_after.float()
-                master_after.sub_(master_before)
-                if not bool(torch.isfinite(master_after).all()):
-                    raise ValueError(f"nonfinite {name}::parameter_update")
-                filename = f"{len(entries):06d}.pt"
-                torch.save(
-                    {
-                        "parameter_update": master_after,
-                        "exp_avg": _parameter(after, group_index, name, "exp_avg"),
-                        "exp_avg_sq": _parameter(after, group_index, name, "exp_avg_sq"),
-                    },
-                    output_dir / filename,
-                )
-                entries.append({"name": name, "file": filename, "shape": list(master_after.shape)})
-                del master_before, master_after
+                inactive_weights[name]["master"] = {
+                    "before": weight_identity(master_before),
+                    "after": weight_identity(master_after),
+                }
+            if native is not None:
+                master_before, master_after = master_before.float(), master_after.float()
+            master_after.sub_(master_before)
+            if not bool(torch.isfinite(master_after).all()):
+                raise ValueError(f"nonfinite {name}::parameter_update")
+            filename = f"{len(entries):06d}.pt"
+            torch.save(
+                {
+                    "parameter_update": master_after,
+                    "exp_avg": read(after, "exp_avg"),
+                    "exp_avg_sq": read(after, "exp_avg_sq"),
+                },
+                output_dir / filename,
+            )
+            entries.append({"name": name, "file": filename, "shape": list(master_after.shape)})
+            del master_before, master_after
         manifest = output_dir / "manifest.json"
         provenance = {}
         if participation is not None:
@@ -3489,11 +3992,12 @@ def decode_optimizer_capture(
                 if after.groups[0][index].get("moe")
                 for name in shapes
             }
+            dtype = str(_native_master_dtype(native["ds_config"])).removeprefix("torch.")
             provenance.update(
                 {
                     "native_layout": native,
-                    "source_dtypes": {"master": "bfloat16", "exp_avg": "bfloat16", "exp_avg_sq": "bfloat16"},
-                    "parameter_update_recipe": "FP32 difference of saved BF16 optimizer masters",
+                    "source_dtypes": dict.fromkeys(("master", "exp_avg", "exp_avg_sq"), dtype),
+                    "parameter_update_recipe": f"FP32 difference of saved {dtype} optimizer masters",
                     "expert_sidefiles_are_master_sources": False,
                     "frozen_expert_parameters": sorted(set(after.expert_shards[0]) - active_experts),
                     "runtime_provenance_is_caller_owned": True,
@@ -3615,12 +4119,12 @@ def _dense_node_admission(request, deadline):
         raise ValueError("dense checkpoint ordered head snapshot members differ from admitted nodes")
     transfer._validate_local_node(request["node"], deadline)
     try:
-        transfer._LOCAL_HOSTFILE.lstat()
+        transfer._local_hostfile_path().lstat()
     except FileNotFoundError:
         if request["node"] == nodes[0]:
             raise ValueError("dense checkpoint head hostfile is required") from None
         identity = {
-            "path": str(transfer._LOCAL_HOSTFILE),
+            "path": str(transfer._local_hostfile_path()),
             "absent": True,
             "hostfile_sha256": admission["hostfile_sha256"],
         }

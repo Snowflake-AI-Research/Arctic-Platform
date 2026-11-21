@@ -48,6 +48,7 @@ def render(args: argparse.Namespace) -> str:
         " AutoConfig\nfrom arctic_platform.correctness.harness.report import reference_progress\n\nfrom"
         " arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch\nfrom"
         " arctic_platform.correctness.harness.sft import save as save_batch\nfrom"
+        " arctic_platform.correctness.harness.sft import trained_token_ids\nfrom"
         " arctic_platform.correctness.harness.runner import run_reference\nfrom"
         " arctic_platform.correctness.harness.sft import SEED\nfrom arctic_platform.correctness.harness.config import"
         " hash_directory\nfrom arctic_platform.correctness.onboarding.synth_model import materialize_pretrained\nfrom"
@@ -97,15 +98,16 @@ def render(args: argparse.Namespace) -> str:
         " matmul_precision=__MATMUL_PRECISION__,\n            peft_config=__PEFT_CONFIG__,\n           "
         " peft_adapter_path=__PEFT_ADAPTER_PATH__,\n            seed=SEED,\n           "
         " lm_head_token_chunk_size=__TOKEN_CHUNK__,\n            lm_head_vocab_chunk_size=__VOCAB_CHUNK__,\n          "
-        "  deterministic=False,\n            cuda_device=index % lanes,\n        )\n        return index,"
-        " time.monotonic() - started, result\n\n    ranges = []\n    arm_measurements = {}\n    for arm in arms:\n    "
-        '    arm_name = arm["name"]\n        batch = build_batch(arm_name, arm["global_batch_size"],'
-        ' arm["max_seq_len"], inner.vocab_size, seed=SEED)\n        batch_path = tensor_dir / f"batch-{arm_name}.pt"\n'
-        '        save_batch(batch, batch_path)\n        run_dir = OUTPUT.parent / "calibration-runs" / arm_name\n     '
-        "   run_dir.mkdir(parents=True, exist_ok=True)\n        completed = {}\n        for start in range(0, RUNS,"
-        " lanes):\n            with ThreadPoolExecutor(max_workers=lanes) as pool:\n                futures ="
-        " {pool.submit(one_run, index, batch_path, run_dir): index\n                           for index in"
-        " range(start, min(start + lanes, RUNS))}\n                for _, (index, elapsed, result) in"
+        "  deterministic=False,\n            cuda_device=index % lanes,\n           "
+        " huggingface_loader=__HUGGINGFACE_LOADER__,\n        )\n        return index, time.monotonic() - started,"
+        ' result\n\n    ranges = []\n    arm_measurements = {}\n    for arm in arms:\n        arm_name = arm["name"]\n'
+        '        batch = build_batch(arm_name, arm["global_batch_size"], arm["max_seq_len"], inner.vocab_size,'
+        " seed=SEED, token_ids=trained_token_ids(MODEL_PATH, inner.vocab_size))\n        batch_path = tensor_dir /"
+        ' f"batch-{arm_name}.pt"\n        save_batch(batch, batch_path)\n        run_dir = OUTPUT.parent /'
+        ' "calibration-runs" / arm_name\n        run_dir.mkdir(parents=True, exist_ok=True)\n        completed = {}\n '
+        "       for start in range(0, RUNS, lanes):\n            with ThreadPoolExecutor(max_workers=lanes) as pool:\n"
+        "                futures = {pool.submit(one_run, index, batch_path, run_dir): index\n                         "
+        "  for index in range(start, min(start + lanes, RUNS))}\n                for _, (index, elapsed, result) in"
         ' reference_progress(\n                    futures, label=f"Finding tolerance {arm_name}", total=RUNS,'
         " completed=len(completed)\n                ):\n                    completed[index] = result\n               "
         '     print(f"HF calibration done: arm={arm_name}, run={index}, "\n                         '
@@ -184,6 +186,7 @@ def render(args: argparse.Namespace) -> str:
         "__PEFT_ADAPTER_PATH__": repr(str(peft_adapter_path)) if peft_adapter_path else "None",
         "__TOKEN_CHUNK__": repr(token_chunk),
         "__VOCAB_CHUNK__": str(vocab_chunk),
+        "__HUGGINGFACE_LOADER__": repr(config.huggingface_loader),
     }
     for key, value in replacements.items():
         template = template.replace(key, value)

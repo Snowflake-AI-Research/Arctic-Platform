@@ -79,6 +79,11 @@ def main() -> None:
     parser.add_argument("--optimizer-dtype", choices=("float32", "bfloat16"), default="float32")
     parser.add_argument("--optimizer-output-dir")
     parser.add_argument(
+        "--huggingface-loader",
+        action="store_true",
+        help="build AutoModelForCausalLM's class for the checkpoint, as the target's huggingface loader does",
+    )
+    parser.add_argument(
         "--deterministic",
         action="store_true",
         help=(
@@ -121,6 +126,7 @@ def main() -> None:
         gradient_clipping=args.gradient_clipping,
         optimizer_dtype=args.optimizer_dtype,
         optimizer_output_dir=args.optimizer_output_dir,
+        huggingface_loader=args.huggingface_loader,
     )
     Path(args.out).write_text(
         json.dumps(

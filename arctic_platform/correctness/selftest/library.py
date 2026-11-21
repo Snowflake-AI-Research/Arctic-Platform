@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import base64
 import builtins
 import contextlib
 import copy
@@ -202,7 +203,10 @@ from arctic_platform.correctness.onboarding import synth_model
 from arctic_platform.correctness.reference import hf_single_gpu
 from arctic_platform.correctness.reference import optimizer_step
 from arctic_platform.correctness.reference import process_determinism
+from arctic_platform.correctness.reference import qwen4_exp_precision
+from arctic_platform.correctness.reference import qwen4_reference
 from arctic_platform.correctness.reference.adamw_trajectory import AdamWTrajectory
+from arctic_platform.correctness.reference.glm5_next_reference import load_glm5_next_reference
 from arctic_platform.correctness.reference.hf_single_gpu import build_engine
 from arctic_platform.correctness.reference.hf_single_gpu import fixed_row_groups
 from arctic_platform.correctness.reference.hf_single_gpu import mixer_boundaries
@@ -666,6 +670,26 @@ def test_arms_smaller_microbatch_budget_is_preserved() -> None:
     assert correctness_microbatch_tokens(10240) == 10240
 
 
+def test_arms_synthetic_ids_skip_the_checkpoints_untrained_embedding_rows(tmp_path: Path) -> None:
+    vocab = 64
+    rows = torch.randn(vocab, 16, generator=torch.Generator().manual_seed(0))
+    rows = rows / rows.pow(2).mean(dim=1, keepdim=True).sqrt()  # every row at RMS 1, the median
+    scale = torch.ones(vocab, 1)
+    scale[[0, 17, 63]] = 1e-7  # untrained: near zero
+    scale[9] = 0.4  # below half the median
+    scale[5] = 0.6  # above it
+    # The output head has as many rows; only the input embedding decides.
+    save_file(
+        {"model.embed_tokens.weight": (rows * scale).bfloat16(), "lm_head.weight": torch.zeros(vocab, 16).bfloat16()},
+        tmp_path / "model.safetensors",
+    )
+    token_ids = batches.trained_token_ids(str(tmp_path), vocab)
+    assert token_ids.tolist() == [i for i in range(vocab) if i not in (0, 9, 17, 63)]
+    batch = batches.build_synthetic_batch("gas1", 4, 512, vocab, token_ids=token_ids)
+    # The batch never draws an untrained id, and every trained id stays drawable.
+    assert sorted(batch.input_ids.unique().tolist()) == token_ids.tolist()
+
+
 # Config gpu attention.
 
 
@@ -815,6 +839,35 @@ def test_ap_correctness_environment_accepts_legacy_alias_with_ap_precedence(monk
 
 
 @pytest.mark.parametrize(
+    ("configured", "ports", "expected"),
+    [(None, ["7878", "7878"], 7878), ("2222", [], 2222), (None, ["7878", "22"], None)],
+)
+def test_allocation_ssh_port_follows_the_allocation_transport(monkeypatch, configured, ports, expected):
+    # The strict transport ignores the SSH configuration (-F /dev/null); its default port is the one ds_ssh uses.
+    from arctic_platform.correctness.harness import engine_admission
+
+    monkeypatch.delenv("DSS_CORRECTNESS_SSH_PORT", raising=False)
+    if configured is None:
+        monkeypatch.delenv("AP_CORRECTNESS_SSH_PORT", raising=False)
+    else:
+        monkeypatch.setenv("AP_CORRECTNESS_SSH_PORT", configured)
+    outputs = iter(ports)
+
+    def resolve(argv, **_):
+        return subprocess.CompletedProcess(argv, 0, f"user u\nport {next(outputs)}\n", "")
+
+    run = Mock(side_effect=resolve)
+    monkeypatch.setattr(engine_admission.subprocess, "run", run)
+    if expected is None:
+        with pytest.raises(ValueError, match="SSH ports"):
+            engine_admission._allocation_ssh_port(["head", "peer"])
+    else:
+        assert engine_admission._allocation_ssh_port(["head", "peer"]) == expected
+    resolved = [call.args[0] for call in run.call_args_list]
+    assert resolved == [["ssh", "-G", "--", host] for host in ["head", "peer"][: len(ports)]]
+
+
+@pytest.mark.parametrize(
     ("environment", "expected"),
     [
         ([b"AP_CORRECTNESS_GATEWAY_OWNER=token"], True),
@@ -908,6 +961,41 @@ def test_config_gpu_attention_flash_next_rejects_generic_h200_attention(tmp_path
     path.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="Qwen/Qwen3.8-Flash-Next requires attn_implementation='qsa_flex'"):
         validate_against_host(load_config(path), available_gpus=8, check_gpu_type=False)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "deepseek-ai/DeepSeek-V4.1-Flash",
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "PrimeIntellect/DeepSeek-V4.1-Flash-bf16",
+    ],
+)
+def test_config_gpu_attention_deepseek_v41_requires_its_loader_attention(tmp_path: Path, model: str) -> None:
+    """DeepSeek-V4.1's catalog files select "eager", the only name Arctic Platform's DeepSeek-V4.1 loader accepts."""
+    path = _config_gpu_attention_write_config(tmp_path, "h200", "eager", n_gpus=8)
+    raw = json.loads(path.read_text())
+    raw["model_name"] = model
+    path.write_text(json.dumps(raw))
+    config = load_config(path)
+    validate_against_host(config, available_gpus=8, check_gpu_type=False)
+    assert (config.attention_implementation, config.reference_attention_implementation) == ("eager", "eager")
+    raw["training"]["ds_worker_config"]["attn_implementation"] = "flash_attention_3"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match=f"{model} requires attn_implementation='eager'"):
+        validate_against_host(load_config(path), available_gpus=8, check_gpu_type=False)
+
+
+@pytest.mark.parametrize("model", ["zai-org/GLM-5.3", "zai-org/GLM-5.3-BF16"])
+def test_reference_attention_applies_glm53_indexer_top_k_through_sdpa(tmp_path: Path, model: str) -> None:
+    """Transformers' GLM-MoE-DSA masks to the indexer's top-k only on eager / SDPA; FlashAttention attends densely."""
+    path = _config_gpu_attention_write_config(tmp_path, "h200", None)
+    raw = json.loads(path.read_text())
+    raw["model_name"] = model
+    path.write_text(json.dumps(raw))
+    config = load_config(path)
+    assert config.attention_implementation == "flash_attention_3"
+    assert config.reference_attention_implementation == "sdpa"
 
 
 # Flash 256k source recipes.
@@ -1139,6 +1227,371 @@ def test_participation_observes_autograd_and_integer_outputs_without_inventing_z
         model.head(model.decoder(value)).sum().backward()
         with pytest.raises(ValueError, match="unexpected missing gradient"):
             validate_participation(capture.result())
+
+
+@pytest.mark.parametrize("selection", ["integer", "float", "requires-grad"])
+def test_participation_counts_the_context_parallel_index_selection(monkeypatch, selection):
+    # Arctic's context-parallel DSA attention selects through _select_sparse_indices(self.indexer, ...) and never
+    # calls the indexer module: the call counts toward that indexer only when every output is integer, without grad.
+    from arctic_platform.correctness.harness.optimizer import PARTICIPATION_SCHEMA
+    from arctic_platform.correctness.harness.optimizer import ParticipationCapture
+    from arctic_platform.correctness.harness.optimizer import validate_participation
+    from arctic_platform.model.implementations.glm53 import context_parallel
+
+    class Glm5NextTextIndexer(torch.nn.Linear):
+        def forward(self, value):
+            raise AssertionError("the context-parallel path reads the indexer without calling it")
+
+    def select(indexer, value):
+        scores = torch.nn.functional.linear(value.detach(), indexer.weight).detach()
+        if selection == "integer":
+            return scores.argmax(dim=-1).to(torch.int32)
+        return scores.requires_grad_() if selection == "requires-grad" else scores
+
+    monkeypatch.setattr(context_parallel, "_select_sparse_indices", select)
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Linear(3, 3, bias=False)
+    model.head = torch.nn.Linear(3, 3, bias=False)
+    model.indexer = Glm5NextTextIndexer(3, 3, bias=False)
+    model.unused = Glm5NextTextIndexer(3, 3, bias=False)  # an indexer neither path reaches
+    with ParticipationCapture(model, decoder=model.decoder, head=model.head) as capture:
+        value = torch.ones(2, 3, requires_grad=True)
+        context_parallel._select_sparse_indices(model.indexer, value)
+        model.head(model.decoder(value)).sum().backward()
+        entries = capture.result()["parameters"]
+    assert context_parallel._select_sparse_indices is select
+    assert entries["decoder.weight"]["state"] == entries["head.weight"]["state"] == "active"
+    assert entries["unused.weight"]["state"] == "missing"
+    if selection == "integer":
+        assert entries["indexer.weight"]["state"] == "inactive"
+        assert entries["indexer.weight"]["evidence"]["calls"] == 1
+        inactive = {"indexer.weight": entries["indexer.weight"]}
+        validate_participation({"schema": PARTICIPATION_SCHEMA, "parameters": inactive})
+    else:
+        assert entries["indexer.weight"] == {"shape": [3, 3], "state": "missing", "evidence": None}
+
+
+def test_nemotron_h_target_names_pair_with_the_transformers_model():
+    """Arctic Platform's Nemotron-H names its mixers mamba / self_attn / mlp; Transformers calls each one mixer."""
+    from arctic_platform.correctness.harness.optimizer import align
+    from arctic_platform.correctness.harness.optimizer import canonical_ap_tensor_groups
+
+    target = [
+        "model.embed_tokens.weight",
+        "model.layers.0.norm.weight",
+        "model.layers.0._checkpoint_wrapped_module.mamba.A_log",
+        "model.layers.0.mamba.in_proj.weight",
+        "model.layers.1.mlp.router.gate",
+        "model.layers.1.mlp.experts.w1",
+        "model.layers.1.mlp.experts.w2",
+        "model.layers.1.mlp.shared_expert.up_proj.weight",
+        "model.layers.5.self_attn.q_proj.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+    ]
+    reference = [
+        "model.embeddings.weight",
+        "model.layers.0.norm.weight",
+        "model.layers.0.mixer.A_log",
+        "model.layers.0.mixer.in_proj.weight",
+        "model.layers.1.mixer.gate.weight",
+        "model.layers.1.mixer.experts.up_proj",
+        "model.layers.1.mixer.experts.down_proj",
+        "model.layers.1.mixer.shared_experts.up_proj.weight",
+        "model.layers.5.mixer.q_proj.weight",
+        "model.norm_f.weight",
+        "lm_head.weight",
+    ]
+    pairs, target_only, reference_only = align(
+        {name: float(index) for index, name in enumerate(target)},
+        {name: float(index) for index, name in enumerate(reference)},
+    )
+    assert (target_only, reference_only) == ([], [])
+    assert all(ap == ref for _, ap, ref in pairs) and len(pairs) == len(target)
+    assert sorted(canonical_ap_tensor_groups(target)) == sorted(name.removeprefix("model.") for name in reference)
+    # A family without Mamba-2 mixers keeps its attention and embedding names.
+    dense = ["model.embed_tokens.weight", "model.layers.0.self_attn.q_proj.weight"]
+    assert sorted(canonical_ap_tensor_groups(dense)) == ["embed_tokens.weight", "layers.0.self_attn.q_proj.weight"]
+
+
+def test_participation_exempts_zero_element_parameters():
+    """Arctic Platform's non-gated experts keep an empty w3 placeholder, which no step can give a gradient."""
+    import torch
+
+    from arctic_platform.correctness.harness.optimizer import ParticipationCapture
+    from arctic_platform.correctness.harness.optimizer import validate_participation
+
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Linear(3, 3, bias=False)
+    model.head = torch.nn.Linear(3, 3, bias=False)
+    model.experts = torch.nn.Module()
+    model.experts.w1 = torch.nn.Parameter(torch.ones(2, 3, 3))
+    model.experts.w3 = torch.nn.Parameter(torch.empty(0))
+    with ParticipationCapture(model, decoder=model.decoder, head=model.head) as capture:
+        value = torch.ones(2, 3)
+        (model.head(model.decoder(value)).sum() + torch.einsum("eij,bj->", model.experts.w1, value)).backward()
+        entries = validate_participation(capture.result())
+    assert sorted(entries) == ["decoder.weight", "experts.w1", "head.weight"]
+    assert {entry["state"] for entry in entries.values()} == {"active"}
+
+
+def test_participation_gemma_image_modules_are_inactive_only_when_a_text_step_never_calls_them():
+    """Gemma 3 and 4 hold their image modules beside the language model; a text-only step never calls them."""
+    from copy import deepcopy
+
+    import torch
+
+    from arctic_platform.correctness.harness.optimizer import ParticipationCapture
+    from arctic_platform.correctness.harness.optimizer import validate_participation
+
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    for name in ("vision_tower", "multi_modal_projector", "embed_vision", "language_model", "audio_encoder"):
+        setattr(model.model, name, torch.nn.Linear(3, 3, bias=False))
+    model.lm_head = torch.nn.Linear(3, 3, bias=False)
+    decoder = model.model.language_model
+    value = torch.ones(2, 3)
+    image = ("vision_tower", "multi_modal_projector", "embed_vision")
+    with ParticipationCapture(model, decoder=decoder, head=model.lm_head) as capture:
+        model.lm_head(decoder(value)).sum().backward()
+        record = capture.result()
+    entries = record["parameters"]
+    assert {name: entries[f"model.{name}.weight"]["state"] for name in image} == dict.fromkeys(image, "inactive")
+    assert entries["model.language_model.weight"]["state"] == entries["lm_head.weight"]["state"] == "active"
+    # A module outside the image set is not excused by never running.
+    assert entries["model.audio_encoder.weight"]["state"] == "missing"
+    with pytest.raises(ValueError, match="unexpected missing gradient for model.audio_encoder.weight"):
+        validate_participation(record)
+    del entries["model.audio_encoder.weight"]
+    validate_participation(record)
+    forged = deepcopy(record)
+    forged["parameters"]["model.vision_tower.weight"]["evidence"]["module"] = "model.audio_encoder"
+    with pytest.raises(ValueError, match="invalid independent evidence"):
+        validate_participation(forged)
+    model.zero_grad(set_to_none=True)
+    # An image step calls the tower, so nothing excuses a tower parameter that then misses its gradient.
+    with ParticipationCapture(model, decoder=decoder, head=model.lm_head) as capture:
+        model.model.vision_tower(value)
+        model.lm_head(decoder(value)).sum().backward()
+        record = capture.result()
+    assert record["parameters"]["model.vision_tower.weight"]["state"] == "missing"
+
+
+def _composite_decoder_model():
+    """The shape of Arctic Platform's Qwen3.5-MoE: get_decoder() is the body that holds visual and language_model."""
+    import torch
+
+    class Tower(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.patch_embed = torch.nn.Module()
+            self.patch_embed.proj = torch.nn.Linear(3, 3, bias=False)
+            self.merger = torch.nn.Linear(3, 3, bias=False)
+
+        def forward(self, pixels):
+            return self.merger(self.patch_embed.proj(pixels))
+
+    class LanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = torch.nn.Linear(3, 3, bias=False)
+            self.unused = torch.nn.Linear(3, 3, bias=False)
+
+        def forward(self, value):
+            return self.layer(value)
+
+    class CausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.visual = Tower()
+            self.model.language_model = LanguageModel()
+            self.lm_head = torch.nn.Linear(3, 3, bias=False)
+
+        def get_decoder(self):
+            return self.model
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+        def forward(self, value):
+            return self.lm_head(self.model.language_model(value))
+
+    torch.manual_seed(0)
+    return CausalLM()
+
+
+def test_participation_composite_decoder_excuses_only_its_uncalled_vision_tower():
+    """Arctic Platform's Qwen3.5-MoE (the qwen3_5_moe loader, Qwen3.6-35B-A3B) returns its composite body from
+    get_decoder(), so the decoder's parameters include the vision tower's. A text-only step never calls the tower: it
+    is inactive on every rank, and the decoder's own parameters and any tower parameter it shares keep the check."""
+    from types import SimpleNamespace
+
+    import torch
+    from transformers import Qwen3_5MoeConfig
+
+    from arctic_platform.correctness.harness.optimizer import ParticipationCapture
+    from arctic_platform.correctness.harness.optimizer import WorkerParticipation
+    from arctic_platform.correctness.harness.optimizer import merge_worker_receipts
+    from arctic_platform.correctness.harness.optimizer import validate_participation
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeForCausalLM,
+    )
+
+    # The class the qwen3_5_moe loader builds for a composite checkpoint, without weights: the capture arms every
+    # tower parameter, and only those, with the forward-hook evidence.
+    text = dict(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_conv_kernel_dim=2,
+        moe_intermediate_size=8,
+        shared_expert_intermediate_size=8,
+        num_experts=4,
+        num_experts_per_tok=2,
+        layer_types=["linear_attention", "full_attention"],
+        pad_token_id=0,
+    )
+    vision = dict(depth=1, hidden_size=16, num_heads=2, intermediate_size=16, out_hidden_size=16)
+    config = Qwen3_5MoeConfig(text_config=text, vision_config=vision)
+    config.use_grouped_mm = False
+    config._attn_implementation = "sdpa"
+    with torch.device("meta"):
+        arctic = Qwen3_5MoeForCausalLM(config)
+    decoder = arctic.get_decoder()
+    assert decoder.visual is arctic.model.visual and decoder.language_model is arctic.model.language_model
+    tower = {name for name, parameter in arctic.named_parameters() if name.startswith("model.visual.")}
+    with ParticipationCapture(arctic, decoder=decoder, head=arctic.get_output_embeddings()) as capture:
+        assert tower and set(capture.candidates) == tower
+        assert {capture.candidates[name]["kind"] for name in tower} == {"text-decoder-bypass"}
+        assert {capture.candidates[name]["module"] for name in tower} == {"model.visual"}
+
+    # The participation worker resolves the decoder and head as on the target; two ranks, one text-only step.
+    receipts = []
+    for rank in range(2):
+        model = _composite_decoder_model()
+        del model.model.language_model.unused
+        worker = SimpleNamespace(_engine=SimpleNamespace(module=model, global_steps=0), rank=rank, job_id="cpu-child")
+        participation = WorkerParticipation(worker)
+        try:
+            model(torch.ones(2, 3)).sum().backward()
+            worker._engine.global_steps = 1
+            receipts.append(participation.finish())
+        finally:
+            participation.close()
+    merged = merge_worker_receipts(receipts, job_id="cpu-child", world_size=2)["parameters"]
+    for name in ("model.visual.patch_embed.proj.weight", "model.visual.merger.weight"):
+        assert merged[name]["state"] == "inactive"
+        assert merged[name]["evidence"]["module"] == "model.visual" and merged[name]["evidence"]["calls"] == 0
+    assert merged["model.language_model.layer.weight"]["state"] == merged["lm_head.weight"]["state"] == "active"
+
+    def step(model, *, call_tower=False):
+        with ParticipationCapture(model, decoder=model.get_decoder(), head=model.get_output_embeddings()) as capture:
+            value = torch.ones(2, 3)
+            if call_tower:
+                model.model.visual(value).detach()
+            model(value).sum().backward()
+            return capture.result()
+
+    # A decoder parameter without a gradient is never excused, the composite's tower beside it notwithstanding.
+    record = step(_composite_decoder_model())
+    assert record["parameters"]["model.visual.merger.weight"]["state"] == "inactive"
+    with pytest.raises(ValueError, match="unexpected missing gradient for model.language_model.unused.weight"):
+        validate_participation(record)
+    # A tower parameter the language model also holds makes the tower part of the text path.
+    tied = _composite_decoder_model()
+    tied.model.language_model.unused.weight = tied.model.visual.merger.weight
+    assert step(tied)["parameters"]["model.visual.patch_embed.proj.weight"]["state"] == "missing"
+    # So does the tower module registered inside the language model under another name.
+    nested = _composite_decoder_model()
+    del nested.model.language_model.unused
+    nested.model.language_model.vision = nested.model.visual
+    assert step(nested)["parameters"]["model.visual.patch_embed.proj.weight"]["state"] == "missing"
+    # A tower the step calls is not excused by its missing gradient.
+    called = _composite_decoder_model()
+    del called.model.language_model.unused
+    assert step(called, call_tower=True)["parameters"]["model.visual.merger.weight"]["state"] == "missing"
+
+
+@contextlib.contextmanager
+def _single_rank_gloo(tmp_path):
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        raise RuntimeError("a process group is already initialized in this selftest process")
+    dist.init_process_group("gloo", store=dist.FileStore(str(tmp_path / "store"), 1), rank=0, world_size=1)
+    try:
+        yield dist.group.WORLD
+    finally:
+        dist.destroy_process_group()
+
+
+def _dense_shard_model(seed: int):
+    import torch
+
+    torch.manual_seed(seed)
+    model = torch.nn.Module()
+    model.embed = torch.nn.Embedding(16, 4)
+    model.layer = torch.nn.Module()
+    model.layer.q = torch.nn.Linear(4, 4)
+    model.layer.unused = torch.nn.Linear(4, 4, bias=False)  # trainable, never called
+    model.layer.forward = lambda value: model.layer.q(value)
+    model.head = torch.nn.Linear(4, 16, bias=False)
+    return model
+
+
+def _dense_shard_step(model):
+    import torch
+
+    ids = torch.tensor([[1, 2, 3, 5]])
+    torch.nn.functional.cross_entropy(model.head(model.layer(model.embed(ids)))[0], ids[0]).backward()
+
+
+def test_participation_and_gradient_norms_name_the_parameters_node_shards_hold(tmp_path):
+    """Arctic's patches.dense_shard holds a layer's weights as flat node shards: the inventory and the gradient
+    norms name the original parameters, never the shards, and a member nobody used still misses its gradient."""
+    import torch
+
+    from arctic_platform.correctness.harness.optimizer import ParticipationCapture
+    from arctic_platform.correctness.harness.optimizer import dense_shard_gradient_norms
+    from arctic_platform.correctness.harness.optimizer import dense_shard_record
+    from arctic_platform.model.implementations.moe import dense_shard
+
+    whole = _dense_shard_model(0)
+    _dense_shard_step(whole)
+    expected = {
+        name: float(torch.linalg.vector_norm(p.grad)) for name, p in whole.named_parameters() if p.grad is not None
+    }
+    model = _dense_shard_model(0)
+    with _single_rank_gloo(tmp_path) as group:
+        slots, names = dense_shard._parameter_slots(model)
+        dense_shard.shard_module(model.layer, group, "ep_size_1", slots, names)
+        layouts = dense_shard.dense_shard_layouts(model)
+        assert sorted(layouts) == ["layer.dense_shard.shard_0", "layer.dense_shard.shard_1"]
+        with ParticipationCapture(model, decoder=model.layer, head=model.head) as capture:
+            _dense_shard_step(model)
+            entries = capture.result()["parameters"]
+        norms = dense_shard_gradient_norms(model, layouts)
+        record = dense_shard_record(layouts)
+    members = ["layer.q.bias", "layer.q.weight", "layer.unused.weight"]
+    assert sorted(entries) == sorted(["embed.weight", "head.weight", *members])
+    assert {name: entries[name]["shape"] for name in members} == {
+        "layer.q.bias": [4],
+        "layer.q.weight": [4, 4],
+        "layer.unused.weight": [4, 4],
+    }
+    assert [entries[name]["state"] for name in members] == ["active", "active", "missing"]
+    assert sorted(norms) == members and norms["layer.unused.weight"] == 0
+    for name in ("layer.q.bias", "layer.q.weight"):
+        assert norms[name] == pytest.approx(expected[name], rel=1e-6)
+    assert sorted(member["name"] for shard in record.values() for member in shard["members"]) == members
 
 
 def test_config_tolerance_calibrated_gate_rounds_up_and_has_a_one_millithreshold_floor():
@@ -3198,6 +3651,48 @@ def test_incremental_onboarding_explicit_checks_preserve_each_others_success(_in
     assert all(result["status"] == "onboarded" for result in results.values())
 
 
+def test_incremental_onboarding_explicit_checks_prepare_the_combined_run_records(_incremental_onboarding, monkeypatch):
+    """`onboard --test` of each check leaves the with-optimizer records a run selecting both checks reads."""
+    state = _incremental_onboarding
+    parent = state.onboard._parent
+
+    def resolving_parent(child):
+        # The onboarding parent resolves the source checkpoint into the request it is handed.
+        child.source_checkpoint = state.config.model_name
+        return parent(child)
+
+    monkeypatch.setattr(state.onboard, "_parent", resolving_parent)
+    summary_path = state.args.test_spec.with_suffix(".onboarding.json")
+    state.args.test_id = "single-step-grads"
+    assert state.onboard.run(state.args) == 0
+    assert state.prepared == []
+    state.args.source_checkpoint = None
+
+    def fail(child):
+        raise RuntimeError("reference preparation failed")
+
+    monkeypatch.setattr(state.onboard, "_prepare_references", fail)
+    state.args.test_id = "single-step-optimizer"
+    assert state.onboard.run(state.args) == 1
+    assert json.loads(summary_path.read_text())["combined_reference_error"] == "reference preparation failed"
+    state.args.source_checkpoint = None
+    monkeypatch.setattr(
+        state.onboard, "_prepare_references", lambda child: state.prepared.append(child.reference_tests) or 0
+    )
+    state.executed.clear()
+    # Repeating the command retries the combined records without onboarding the check again.
+    assert state.onboard.run(state.args) == 0
+    assert state.executed == []
+    assert state.prepared == [["single-step-grads", "single-step-optimizer"]]
+    summary = json.loads(summary_path.read_text())
+    assert summary["combined_reference_error"] is None
+    assert all(result["status"] == "onboarded" for result in summary["results"].values())
+    for test_id in ("single-step-grads", "single-step-optimizer"):
+        state.args.test_id = test_id
+        assert state.onboard.run(state.args) == 0
+    assert state.executed == [] and len(state.prepared) == 1
+
+
 @pytest.mark.parametrize("change", ["config", "model", "gate", "options", "missing-spec", "corrupt-summary"])
 def test_incremental_onboarding_changed_workload_is_not_skipped(_incremental_onboarding, monkeypatch, change):
     state = _incremental_onboarding
@@ -3655,6 +4150,21 @@ def test_onboarding_allocation_prerequisites_require_every_host_response(tmp_pat
     command = run.call_args.args[0]
     assert command[1:3] == ["-f", str(hostfile)]
     assert sys.executable in command[-1] and "base64 -d" in command[-1]
+
+
+def test_onboarding_allocation_prerequisites_carry_import_roots(tmp_path, monkeypatch):
+    # An SSH login environment has no PYTHONPATH: the remote script must set the suite's import roots itself.
+    hostfile = tmp_path / "hosts"
+    hostfile.write_text("10.0.0.1 slots=4\n")
+    result = {"host": "node", "python": sys.executable, "gpu_count": 4, "versions": {}, "errors": []}
+    output = f"10.0.0.1: CORRECTNESS_PREREQUISITES {json.dumps(result)}\n"
+    run = Mock(return_value=subprocess.CompletedProcess([], 0, output, ""))
+    monkeypatch.setattr(preflight.subprocess, "run", run)
+    preflight.allocation_onboarding_prerequisites({}, hostfile)
+    script = base64.b64decode(run.call_args.args[0][-1].split()[1]).decode()
+    root = str(Path(preflight.__file__).resolve().parents[3])
+    assert script.index("sys.path[:] = ") < script.index("from arctic_platform")
+    assert repr(root) in script
 
 
 @pytest.mark.usefixtures("_operator_api_catalog")
@@ -4546,8 +5056,18 @@ def test_native_optimizer_scope_ordinary_capture_remains_callback_free(
     assert state.verified == [] and "scope-enter" not in state.events
     assert len(state.captures) == 2
     for _, kwargs in state.captures:
-        assert kwargs["expected_dp_world_size"] == state.cfg.dp_size
         assert "native_layout_supplier" not in kwargs and "native_layout_supplier_source" not in kwargs
+
+
+def test_native_optimizer_scope_ordinary_sp_capture_expects_one_optimizer_shard_per_rank(
+    _native_optimizer_scope_runner,
+):
+    """ZeRO partitions over the sequence-data-parallel group: an SP16 job on 16 GPUs saves 16 optimizer shards."""
+    state = _native_optimizer_scope_runner
+    results = state.run(native_optimizer_scope=None, native_optimizer_scope_source=None)
+    assert all(result.outcome is Outcome.PASS for result in results)
+    assert state.cfg.dp_size == 1 and state.cfg.n_gpus == 16
+    assert [kwargs["expected_dp_world_size"] for _, kwargs in state.captures] == [16, 16]
 
 
 @pytest.mark.parametrize(
@@ -8483,6 +9003,199 @@ def test_reference_execution_witness_records_actual_configurations_and_selected_
     assert witness["effective_configurations"]["model"]["config"]["num_hidden_layers"] == 4
 
 
+@pytest.mark.parametrize("chunked", [False, True])
+def test_reference_loss_applies_final_logit_softcapping(chunked):
+    """Gemma 4 caps its logits at final_logit_softcapping = 30; the reference's own head projection has to as well."""
+    import torch.nn.functional as F
+
+    torch.manual_seed(0)
+
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(16, 8)
+
+        def forward(self, input_ids, use_cache=False):
+            return SimpleNamespace(last_hidden_state=self.embed(input_ids) * 40)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = Decoder()
+            self.head = torch.nn.Linear(8, 16, bias=False)
+
+    model = Model()
+    input_ids = torch.randint(0, 16, (1, 12))
+    labels = torch.roll(input_ids, -1, dims=1)
+    labels[0, -1] = hf_single_gpu.IGNORE_INDEX
+    batch = SimpleNamespace(input_ids=input_ids, shifted_labels=lambda: labels)
+
+    def loss(softcap):
+        engine = hf_single_gpu.ReferenceEngine(
+            model=model,
+            decoder=model.decoder,
+            head=model.head,
+            hidden_size=8,
+            head_name="head.weight",
+            device="cpu",
+            softcap=softcap,
+        )
+        return hf_single_gpu._forward_backward(engine, batch, lm_head_token_chunk_size=4 if chunked else None).loss
+
+    with torch.no_grad():
+        logits = F.linear(model.decoder(input_ids).last_hidden_state, model.head.weight).float()[0]
+    capped = torch.tanh(logits / 30.0) * 30.0
+    expected = F.cross_entropy(capped, labels[0], ignore_index=hf_single_gpu.IGNORE_INDEX).item()
+    uncapped = F.cross_entropy(logits, labels[0], ignore_index=hf_single_gpu.IGNORE_INDEX).item()
+    assert abs(expected - uncapped) > 1.0
+    assert loss(30.0) == pytest.approx(expected, rel=1e-4)
+    assert loss(None) == pytest.approx(uncapped, rel=1e-4)
+
+
+def test_reference_head_is_the_tiled_composition_never_the_targets_fused_cuda_head(monkeypatch):
+    """The reference projects its head through Arctic's chunked_lm_head_logprobs, which sends 16-bit CUDA calls to the
+    target's fused CUDA head. Sharing that kernel, the reference carried its error (a grad_hidden 0.025% under
+    float64's at a 248,320-entry vocabulary), and against a target running the same head the check could not see it.
+    Both reference routes, forward-backward and the positional log-probs, keep the tiled composition for a call the
+    fused head would take, and return the composition's own numbers."""
+    from arctic_platform.correctness.reference import sft_trajectory
+    from arctic_platform.model.implementations.gpu import lm_head
+
+    torch.manual_seed(0)
+
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(16, 8)
+
+        def forward(self, input_ids, use_cache=False):
+            return SimpleNamespace(last_hidden_state=self.embed(input_ids))
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = Decoder()
+            self.head = torch.nn.Linear(8, 16, bias=False)
+
+    model = Model().bfloat16()
+    input_ids = torch.randint(0, 16, (2, 12))
+    labels = torch.roll(input_ids, -1, dims=1)
+    labels[:, -1] = hf_single_gpu.IGNORE_INDEX
+    batch = SimpleNamespace(input_ids=input_ids, shifted_labels=lambda: labels)
+    engine = hf_single_gpu.ReferenceEngine(
+        model=model, decoder=model.decoder, head=model.head, hidden_size=8, head_name="head.weight", device="cpu"
+    )
+    chunks = dict(lm_head_token_chunk_size=4, lm_head_vocab_chunk_size=8)
+
+    def reference():
+        result = hf_single_gpu._forward_backward(engine, batch, **chunks)
+        return result.loss, result.gradients, sft_trajectory.positional_logprobs(engine, batch, **chunks)
+
+    composition = reference()  # the fused head never applies on the CPU
+
+    class FusedHead:
+        @staticmethod
+        def apply(*args):
+            raise AssertionError("ran the target's fused CUDA head")
+
+    # From here on every call qualifies for the fused head, as a BF16 call on CUDA does, and the target's takes it.
+    monkeypatch.setattr(lm_head, "_fused_head_applies", lambda *args, **kwargs: True)
+    monkeypatch.setattr(lm_head, "_get_fused_chunked_logprob_fn", lambda: FusedHead)
+    hidden = model.decoder(input_ids).last_hidden_state.detach()
+    with pytest.raises(AssertionError, match="fused CUDA head"):
+        lm_head.chunked_lm_head_logprobs(
+            hidden, model.head.weight, labels, token_chunk_size=4, vocab_chunk_size=8, fp32_lm_head=False
+        )
+
+    loss, gradients, logprobs = reference()
+    assert loss == composition[0]
+    assert gradients.keys() == composition[1].keys()
+    for name, gradient in gradients.items():
+        assert torch.equal(gradient, composition[1][name]), name
+    assert torch.equal(logprobs, composition[2])
+
+
+def test_reference_accumulator_moves_to_the_gpu_only_with_room_and_drains_the_host_path_bits(monkeypatch):
+    """A 9.7B-parameter full-FT reference spent 98% of its time draining every gradient into a host accumulator.
+
+    The accumulator now sits on the gradients' GPU when that holds it plus twice the microbatch's activation peak, and
+    a same-device drain gives the host path's bits: exact widening, then one correctly rounded float32 addition.
+    """
+    model = torch.nn.Linear(256, 4, bias=False)  # 1,024 trainable float32 elements: a 4,096-byte accumulator
+    gib = 1024**3
+    stats = {"free": 10 * gib, "reserved": 2 * gib, "allocated": gib, "peak": gib + 512}
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (stats["free"], 80 * gib))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: stats["reserved"])
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: stats["allocated"])
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: stats["peak"])
+    cuda, cpu = torch.device("cuda", 0), torch.device("cpu")
+    assert hf_single_gpu.accumulator_device(model, cuda, torch.float32) == cuda
+    stats.update(free=0, reserved=gib + 4096 + 2 * 512 - 1)
+    assert hf_single_gpu.accumulator_device(model, cuda, torch.float32) == cpu
+    stats["reserved"] += 1
+    assert hf_single_gpu.accumulator_device(model, cuda, torch.float32) == cuda
+    model.weight.requires_grad_(False)
+    stats["reserved"] = gib + 2 * 512
+    assert hf_single_gpu.accumulator_device(model, cuda, torch.float32) == cuda
+    assert hf_single_gpu.accumulator_device(model, cpu, torch.float32) == cpu
+
+    generator = torch.Generator().manual_seed(0)
+    scales = 2.0 ** torch.randint(-140, 100, (8, 4096), generator=generator).float()  # subnormal through large
+    gradients = (torch.randn(8, 4096, generator=generator) * scales).bfloat16()
+    drained, host = {}, None
+    for gradient in gradients:
+        hf_single_gpu.drain_gradient(drained, "w", gradient, torch.float32, cpu)
+        widened = gradient.to(device="cpu", dtype=torch.float32)  # the host drain this replaces
+        host = widened if host is None else host.add_(widened)
+    assert drained["w"].dtype == torch.float32
+    assert torch.equal(drained["w"].view(torch.int32), host.view(torch.int32))
+
+
+def test_reference_routes_attention_wider_than_flash_attention_3_to_sdpa(monkeypatch):
+    """Gemma 4's full-attention layers are 512 wide and FlashAttention 3 stops at 256; its sliding ones stay on it."""
+    from transformers.integrations import sdpa_attention
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    calls = []
+
+    def flash(module, query, key, value, attention_mask, **kwargs):
+        calls.append(("flash", query.shape[-1], kwargs.get("sliding_window")))
+        return "flash", None
+
+    def sdpa(module, query, key, value, attention_mask, **kwargs):
+        backends = (torch.backends.cuda.mem_efficient_sdp_enabled(), torch.backends.cuda.math_sdp_enabled())
+        calls.append(("sdpa", query.shape[-1], attention_mask, kwargs.get("scaling"), backends))
+        return "sdpa", None
+
+    monkeypatch.setattr(ALL_ATTENTION_FUNCTIONS, "_local_mapping", {"flash_attention_3": flash})
+    monkeypatch.setattr(sdpa_attention, "sdpa_attention_forward", sdpa)
+    hf_single_gpu.route_wide_heads_to_sdpa()
+    hf_single_gpu.route_wide_heads_to_sdpa()
+    attention = ALL_ATTENTION_FUNCTIONS["flash_attention_3"]
+    module = SimpleNamespace(is_causal=True)
+
+    def tensors(width):
+        return torch.zeros(1, 2, 4, width), torch.zeros(1, 1, 4, width), torch.zeros(1, 1, 4, width)
+
+    assert attention(module, *tensors(256), None, sliding_window=1024)[0] == "flash"
+    assert attention(module, *tensors(512), None, sliding_window=None, scaling=1.0)[0] == "sdpa"
+    assert calls == [("flash", 256, 1024), ("sdpa", 512, None, 1.0, (True, False))]
+    with pytest.raises(ValueError, match="head-512 SDPA covers unpadded causal attention only; this call has sliding"):
+        attention(module, *tensors(512), None, sliding_window=1024)
+    with pytest.raises(ValueError, match="this call has an attention mask"):
+        attention(module, *tensors(512), torch.ones(1, 4, dtype=torch.bool))
+
+
+def test_reference_execution_witness_records_a_non_finite_config_value(_reference_execution_engine):
+    """Nemotron-H's Mamba-2 time_step_limit is (0.0, inf), which strict JSON cannot spell."""
+    engine = _reference_execution_engine
+    engine.model.config.values["time_step_limit"] = (0.0, float("inf"))
+    witness = hf_single_gpu.execution_witness(engine, requested_attention="flash_attention_3")
+    assert witness["effective_configurations"]["model"]["config"]["time_step_limit"] == [0.0, "Infinity"]
+    assert json.loads(json.dumps(witness, allow_nan=False)) == witness
+    assert hf_single_gpu.execution_witness(engine, requested_attention="flash_attention_3") == witness
+
+
 @pytest.mark.parametrize("change", [None, "config", "forward", "source"])
 def test_reference_execution_witness_survives_run_and_rejects_execution_changes(
     _reference_execution_engine, monkeypatch, tmp_path, change
@@ -8705,6 +9418,65 @@ def native_runtime_worker(native_scope_training_actor):
         return worker, sources
 
     return build
+
+
+@pytest.mark.parametrize("override", ["participation", "participation-actor", "foreign"])
+def test_native_runtime_sources_pin_the_producer_save_beneath_the_participation_worker(override):
+    """Every first-step job's worker is a participation_worker_class subclass; its own save wraps DSS's."""
+
+    class ProducerWorker:
+        def save(self, stage_info, path=None, checkpoint_type="resumable"):
+            return "saved"
+
+    class Checkpointer:
+        def save_resumable(self):
+            return None
+
+        def save_adapters(self):
+            return None
+
+    class Optimizer:
+        def state_dict(self):
+            return {}
+
+        def backward(self):
+            return None
+
+    class Engine:
+        def save_checkpoint(self):
+            return None
+
+    if override.startswith("participation"):
+        worker_class = capture.participation_worker_class(ProducerWorker)
+        if override == "participation-actor":
+            # The worker is Ray's actor subclass, sent to each worker by value.
+            ray = pytest.importorskip("ray")
+            cloudpickle = pytest.importorskip("ray.cloudpickle")
+            worker_class = ray.remote(num_cpus=1, num_gpus=0)(worker_class).__ray_metadata__.modified_class
+            worker_class = cloudpickle.loads(cloudpickle.dumps(worker_class))
+            assert "save" in vars(worker_class) and worker_class.__bases__[0].__name__ == "ParticipationWorker"
+    else:
+        # Any other save above the producer's, here one from another file, is still refused.
+        worker_class = type("ForeignSaveWorker", (ProducerWorker,), {"save": capture._native_worker_save})
+    worker = worker_class.__new__(worker_class)
+    worker._checkpointer = Checkpointer()
+    worker._engine = Engine()
+    worker._engine.optimizer = Optimizer()
+    sources = {
+        "training": _callback_source_descriptor(ProducerWorker.save),
+        "expert_checkpointer": _callback_source_descriptor(Checkpointer.save_resumable),
+        "base_checkpointer": _callback_source_descriptor(Checkpointer.save_adapters),
+        "engine": _callback_source_descriptor(Engine.save_checkpoint),
+        "zero": _callback_source_descriptor(Optimizer.state_dict),
+        "zero_base": _callback_source_descriptor(Optimizer.backward),
+    }
+    if override.startswith("participation"):
+        selected = capture._native_callback_origin(worker_class.save)
+        assert inspect.getsourcefile(selected) == inspect.getsourcefile(capture.participation_worker_class)
+        capture._native_runtime_sources(worker, sources)
+    else:
+        with pytest.raises(ValueError, match="native selected source origin mismatch: training"):
+            capture._native_runtime_sources(worker, sources)
 
 
 def test_native_runtime_sources_rejects_producer_hash_drift(native_runtime_worker):
@@ -9256,13 +10028,16 @@ _cortex_optimizer_decode_OPTIMIZER = {"name": "AdamW", "betas": [0.9, 0.999], "e
 _cortex_optimizer_decode_LR = 0.01
 
 
-def _cortex_optimizer_decode_pair(tmp_path, *, world_size=2, before_step=0, prefix="bf16_", lazy_baseline=True):
+def _cortex_optimizer_decode_pair(
+    tmp_path, *, world_size=2, before_step=0, prefix="bf16_", lazy_baseline=True, bf16_optimizer=False
+):
+    """A ZeRO2 before/after checkpoint pair; ``bf16_optimizer`` writes ZeRO1's BF16_Optimizer files instead."""
     shapes = [
         OrderedDict([("layer.weight", torch.Size([2, 3])), ("layer.bias", torch.Size([3]))]),
         OrderedDict([("layer.norm.weight", torch.Size([5]))]),
     ]
     config = {
-        "zero_optimization": {"stage": 2},
+        "zero_optimization": {"stage": 1 if bf16_optimizer else 2},
         "bf16": {"enabled": True},
         "optimizer": {"type": "AdamW", "params": {**_cortex_optimizer_decode_OPTIMIZER, "lr": 2e-05}},
     }
@@ -9306,8 +10081,13 @@ def _cortex_optimizer_decode_pair(tmp_path, *, world_size=2, before_step=0, pref
                 valid = max(0, min(length, total - start))
                 values = [baseline[name].flatten() + (0.0001 if post else 0) for name in group]
                 vector = torch.cat(values)
-                masters.append(vector[start : start + valid].clone())
-                paddings.append(length - valid)
+                if bf16_optimizer:
+                    # bf16_optimizer.py: whole FP32 partitions; the group's alignment padding on the last rank.
+                    masters.append(torch.cat([vector, torch.zeros(world_size * length - total)])[start:end].clone())
+                    paddings.append(world_size * length - total if rank == world_size - 1 else 0)
+                else:
+                    masters.append(vector[start : start + valid].clone())
+                    paddings.append(length - valid)
                 mapping = OrderedDict()
                 offset = 0
                 for name, shape in group.items():
@@ -9338,25 +10118,26 @@ def _cortex_optimizer_decode_pair(tmp_path, *, world_size=2, before_step=0, pref
                         partition[:valid].copy_(full[start : start + valid] if post else torch.zeros(valid))
                         state[key] = partition
                     states[param_id] = state
+            optimizer_state = {
+                "zero_stage": ZeroStageEnum.gradients,
+                "base_optimizer_state": {"state": states, "param_groups": groups},
+                "single_partition_of_fp32_groups": masters,
+                "param_slice_mappings": mappings,
+                "partition_count": [world_size] * len(shapes),
+                "group_paddings": paddings,
+                "param_alignment_paddings": [[0] * len(group) for group in shapes],
+                "loss_scaler": LossScaler(1.0),
+                "dynamic_loss_scale": False,
+                "overflow": False,
+                "clip_grad": 1.0,
+                "ds_version": "synthetic",
+            }
+            if bf16_optimizer:
+                # BF16_Optimizer.state_dict's keys.
+                for key in ("zero_stage", "param_alignment_paddings", "loss_scaler", "dynamic_loss_scale", "overflow"):
+                    optimizer_state.pop(key)
             torch.save(
-                {
-                    "ds_config": config,
-                    "ds_version": "synthetic",
-                    "optimizer_state_dict": {
-                        "zero_stage": ZeroStageEnum.gradients,
-                        "base_optimizer_state": {"state": states, "param_groups": groups},
-                        "single_partition_of_fp32_groups": masters,
-                        "param_slice_mappings": mappings,
-                        "partition_count": [world_size] * len(shapes),
-                        "group_paddings": paddings,
-                        "param_alignment_paddings": [[0] * len(group) for group in shapes],
-                        "loss_scaler": LossScaler(1.0),
-                        "dynamic_loss_scale": False,
-                        "overflow": False,
-                        "clip_grad": 1.0,
-                        "ds_version": "synthetic",
-                    },
-                },
+                {"ds_config": config, "ds_version": "synthetic", "optimizer_state_dict": optimizer_state},
                 tag / f"{prefix}zero_pp_rank_{rank}_mp_rank_00_optim_states.pt",
             )
     return SimpleNamespace(before=before_root, after=after_root, expected=expected, baseline=baseline)
@@ -9414,6 +10195,53 @@ def test_cortex_optimizer_decode_decode_named_fp32_update_moments_and_padding(tm
     assert len(comparison.deltas) == 3 * len(pair.expected)
     assert all((item.delta_norm == 0 for item in comparison.deltas if item.state in ("exp_avg", "exp_avg_sq")))
     assert not comparison.only_ap and (not comparison.only_reference)
+
+
+@pytest.mark.parametrize("world_size", [1, 2, 4, 12])
+def test_cortex_optimizer_decode_reads_zero1_bf16_optimizer_whole_partitions(tmp_path, world_size):
+    """qwen3-1.7b's ZeRO1 file trains with BF16_Optimizer, whose checkpoint names no zero_stage."""
+    pair = _cortex_optimizer_decode_pair(tmp_path, world_size=world_size, bf16_optimizer=True)
+    manifest = decoder.decode_optimizer_capture(
+        pair.before,
+        pair.after,
+        tmp_path / "out",
+        expected_optimizer_config=_cortex_optimizer_decode_OPTIMIZER,
+        expected_learning_rate=_cortex_optimizer_decode_LR,
+    )
+    metadata = json.loads(manifest.read_text())
+    assert [item["name"] for item in metadata["parameters"]] == list(pair.expected)
+    for entry in metadata["parameters"]:
+        tensor = torch.load(manifest.parent / entry["file"], weights_only=True)
+        for key, expected in pair.expected[entry["name"]].items():
+            assert torch.equal(tensor[key], expected)
+
+
+@pytest.mark.parametrize(
+    "mutation,error",
+    [("zero2-config", "ZeRO stage"), ("padding-elsewhere", "padding"), ("stripped-master", "partition sizes")],
+)
+def test_cortex_optimizer_decode_rejects_bf16_optimizer_files_unlike_deepspeeds(tmp_path, mutation, error):
+    pair = _cortex_optimizer_decode_pair(tmp_path, world_size=2, bf16_optimizer=True)
+
+    def edit(state):
+        if mutation == "zero2-config":
+            state["ds_config"]["zero_optimization"]["stage"] = 2
+        elif mutation == "padding-elsewhere":
+            state["optimizer_state_dict"]["group_paddings"] = [3, 0]
+        else:
+            # A DeepSpeedZeroOptimizer-style master, stripped of the padding BF16_Optimizer keeps.
+            masters = state["optimizer_state_dict"]["single_partition_of_fp32_groups"]
+            masters[0] = masters[0][:3].clone()
+
+    if mutation == "zero2-config":
+        paths = list(pair.after.rglob("*.pt"))
+    else:
+        paths = [_cortex_optimizer_decode_optim(pair.after, 0 if mutation == "padding-elsewhere" else 1)]
+    for path in paths:
+        _cortex_optimizer_decode_rewrite(path, edit)
+    with pytest.raises(ValueError, match=error):
+        decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
 
 
 def test_cortex_optimizer_decode_decode_uses_actual_state_step_and_group_lr_not_legacy_or_config_defaults(tmp_path):
@@ -9678,6 +10506,30 @@ def _ap_driver_optimizer_capture_initializer(monkeypatch):
     monkeypatch.setattr(common_package, "deepspeed_worker", worker_module, raising=False)
     monkeypatch.setattr(optimizer_capture, "_OPTIMIZER_CAPTURE_WORKER", None)
     return optimizer_capture._optimizer_capture_worker_class()()
+
+
+def test_build_payload_maps_recipe_layer_settings_onto_the_fixture_layers(tmp_path):
+    # A 47-layer recipe's per-layer settings on a 4-layer fixture keep the kept layers they name, at fixture indices.
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    kept = [0, 12, 30, 46]  # read from the fixture's own record, not assumed to be its first layers
+    config = {"text_config": {"num_hidden_layers": 4, "source_layer_indices": kept}}
+    (fixture / "config.json").write_text(json.dumps(config))
+    recipe = [layer for layer in range(47) if layer != 12]
+    placement = {"ep_size": 2, "layers": {str(layer): [1, 0] for layer in range(3, 47)}}
+    training = {
+        "ac_config": {"mode": "full", "layers": recipe},
+        "model_options": {"checkpointing.layers": recipe, "moe": {"expert_placement": placement}},
+    }
+    tc = build_payload(training, str(fixture), 42)["training_config"]
+    assert tc["ac_config"]["layers"] == [0, 2, 3]
+    assert tc["model_options"]["checkpointing.layers"] == [0, 2, 3]
+    assert tc["model_options"]["moe"]["expert_placement"]["layers"] == {"1": [1, 0], "2": [1, 0], "3": [1, 0]}
+    assert training["ac_config"]["layers"] == recipe
+    # A fixture without the record cannot take a list that names layers past its own.
+    (fixture / "config.json").write_text(json.dumps({"num_hidden_layers": 4}))
+    with pytest.raises(ValueError, match="rebuild the reduced fixture"):
+        build_payload(training, str(fixture), 42)
 
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "optimizer"])
@@ -10814,16 +11666,14 @@ def test_native_optimizer_owner_split_cli_guarded_forwarding(
         )
 
 
-def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, train_experts=True):
-    config = {
-        "zero_optimization": {"stage": 2},
-        "bf16": {
-            "enabled": True,
-            "bf16_master_weights_and_grads": True,
-            "bf16_optimizer_states": True,
-        },
-        "optimizer": {"type": "AdamW"},
-    }
+def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, sp=None, train_experts=True, dtype=torch.bfloat16):
+    sp = ep if sp is None else sp
+    bf16 = {"enabled": True}
+    if dtype == torch.bfloat16:
+        bf16.update(bf16_master_weights_and_grads=True, bf16_optimizer_states=True)
+    config = {"zero_optimization": {"stage": 2}, "bf16": bf16, "optimizer": {"type": "AdamW"}}
+    # FP32 masters carry bits below BF16's precision; the BF16 parameters (module, sidefiles) are their rounding.
+    update = 0.25 if dtype == torch.bfloat16 else 0.25 + 2.0**-12
     # Deliberately reversed EP ownership; the decoder must use the supplied actual order.
     routes = [[ep - 1 - rank + replica * ep for replica in range(world // ep)] for rank in range(ep)]
     expert_name = "model.layers.0.mlp.experts.w2"
@@ -10839,10 +11689,10 @@ def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, train_experts=True):
         "schema": "native-ep-zero2-layout-v1",
         "world_size": world,
         "ep_size": ep,
-        "sp_size": ep,
-        "model_mp_world_size": ep,
+        "sp_size": sp,
+        "model_mp_world_size": sp,
         "model_ep_rank": ep - 1,
-        "optimizer_mp_ranks": [rank % ep for rank in range(world)],
+        "optimizer_mp_ranks": [rank % sp for rank in range(world)],
         "expert_data_parallel_groups": {"native-experts": routes} if train_experts else {},
         "ds_config": config,
         "source_files": sources,
@@ -10852,22 +11702,25 @@ def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, train_experts=True):
     for root, step in zip(roots, (0, 1)):
         tag = root / f"global_step{step}"
         tag.mkdir(parents=True)
-        dense = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16) + step * 0.25
-        expert_values = [torch.full((1, 5), 4.0 + rank + step * 0.25, dtype=torch.bfloat16) for rank in range(ep)]
-        module = {"dense.weight": dense, expert_name: expert_values[layout["model_ep_rank"]]}
+        dense = torch.tensor([1.0, 2.0, 3.0], dtype=dtype) + step * update
+        expert_values = [torch.full((1, 5), 4.0 + rank + step * update, dtype=dtype) for rank in range(ep)]
+        module = {
+            "dense.weight": dense.to(torch.bfloat16),
+            expert_name: expert_values[layout["model_ep_rank"]].to(torch.bfloat16),
+        }
         torch.save(
             {
                 "module": module,
                 "param_shapes": shapes,
                 "global_steps": step,
                 "dp_world_size": world,
-                "mp_world_size": ep,
+                "mp_world_size": sp,
                 "ds_config": config,
             },
             tag / "mp_rank_00_model_states.pt",
         )
         for rank, value in enumerate(expert_values):
-            torch.save({expert_name: value}, tag / f"experts_ep_rank_{rank:03d}.pt")
+            torch.save({expert_name: value.to(torch.bfloat16)}, tag / f"experts_ep_rank_{rank:03d}.pt")
         for rank in range(world):
             masters, mappings, paddings, states, groups, counts = [], [], [], {}, [], []
             for index, shape_group in enumerate(shapes):
@@ -10896,7 +11749,7 @@ def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, train_experts=True):
                     group["name"] = "native-experts"
                 groups.append(group)
                 if step:
-                    vector = torch.zeros(length, dtype=torch.bfloat16)
+                    vector = torch.zeros(length, dtype=dtype)
                     vector[:valid] = 1 if index == 0 else ep_rank + 2
                     states[index] = {"step": step, "exp_avg": vector, "exp_avg_sq": vector * 2}
             torch.save(
@@ -10913,9 +11766,9 @@ def _native_ep_bf16_pair(tmp_path, *, world=8, ep=8, train_experts=True):
                 },
                 tag / f"bf16_zero_pp_rank_{rank}_mp_rank_{layout['optimizer_mp_ranks'][rank]:02d}_optim_states.pt",
             )
-    expected["dense.weight"] = torch.full((3,), 0.25)
+    expected["dense.weight"] = torch.full((3,), update)
     if train_experts:
-        expected[expert_name] = torch.full((ep, 5), 0.25)
+        expected[expert_name] = torch.full((ep, 5), update)
     return SimpleNamespace(before=roots[0], after=roots[1], layout=layout, expected=expected, expert_name=expert_name)
 
 
@@ -11390,11 +12243,86 @@ def test_native_ep_bf16_optimizer_reconstructs_actual_ordered_groups_without_sid
             assert torch.equal(tensors["exp_avg"][:, 0], torch.arange(2, ep + 2, dtype=torch.bfloat16))
 
 
+# The catalog's EP files: GLM-5.3-Flash standard LoRA (4 GPUs, SP4, EP4), Qwen3-30B-A3B standard (8 GPUs, EP2),
+# Qwen3.6-35B-A3B standard (EP4), Nemotron long LoRA (SP4, EP2) and GLM-5.3-Flash-BF16 standard full (32, SP8, EP32).
+@pytest.mark.parametrize("world,ep,sp", [(4, 4, 4), (8, 2, 1), (8, 4, 1), (8, 2, 4), (32, 32, 8)])
+def test_native_ep_optimizer_admits_every_ep_size_deepspeed_lays_out(tmp_path, world, ep, sp):
+    pair = _native_ep_bf16_pair(tmp_path, world=world, ep=ep, sp=sp)
+    manifest = json.loads(_native_ep_bf16_decode(pair, tmp_path / "out").read_text())
+    assert sorted(entry["name"] for entry in manifest["parameters"]) == sorted(pair.expected)
+    for entry in manifest["parameters"]:
+        tensors = torch.load(tmp_path / "out" / entry["file"], weights_only=True)
+        assert torch.equal(tensors["parameter_update"], pair.expected[entry["name"]])
+        if entry["name"] == pair.expert_name:
+            assert torch.equal(tensors["exp_avg"][:, 0], torch.arange(2, ep + 2, dtype=torch.bfloat16))
+
+
+@pytest.mark.parametrize("ep", [1, 3])
+def test_native_ep_optimizer_refuses_an_ep_size_deepspeed_cannot_lay_out(tmp_path, ep):
+    pair = _native_ep_bf16_pair(tmp_path, world=8, ep=2, sp=1)
+    with pytest.raises(ValueError, match="unsupported native EP/SP topology"):
+        decoder._native_layout({**pair.layout, "ep_size": ep})
+
+
+# GLM-5.3-Flash-BF16 and Qwen3-30B-A3B full files set ds_config.bf16 = {"enabled": true}: FP32 masters and moments.
+@pytest.mark.parametrize("world,ep,sp", [(8, 8, 8), (8, 2, 1)])
+def test_native_ep_optimizer_decodes_fp32_masters_and_states(tmp_path, world, ep, sp):
+    pair = _native_ep_bf16_pair(tmp_path, world=world, ep=ep, sp=sp, dtype=torch.float32)
+    manifest = json.loads(_native_ep_bf16_decode(pair, tmp_path / "out").read_text())
+    assert manifest["source_dtypes"] == dict.fromkeys(("master", "exp_avg", "exp_avg_sq"), "float32")
+    assert sorted(entry["name"] for entry in manifest["parameters"]) == sorted(pair.expected)
+    for entry in manifest["parameters"]:
+        tensors = torch.load(tmp_path / "out" / entry["file"], weights_only=True)
+        # The sub-BF16 bits of the update come from the FP32 masters, not from the BF16 parameters.
+        assert torch.equal(tensors["parameter_update"], pair.expected[entry["name"]])
+        assert tensors["exp_avg"].dtype == tensors["exp_avg_sq"].dtype == torch.float32
+        if entry["name"] == pair.expert_name:
+            assert torch.equal(tensors["exp_avg"][:, 0], torch.arange(2, ep + 2, dtype=torch.float32))
+
+
+@pytest.mark.parametrize(
+    "bf16",
+    [
+        {"enabled": True, "bf16_master_weights_and_grads": True},
+        {"enabled": True, "bf16_optimizer_states": True},
+        {"enabled": True, "bf16_master_weights_and_grads": "true", "bf16_optimizer_states": "true"},
+        {"enabled": False},
+    ],
+)
+def test_native_ep_optimizer_refuses_mixed_or_non_bf16_training_precision(tmp_path, bf16):
+    pair = _native_ep_bf16_pair(tmp_path, dtype=torch.float32)
+    layout = {**pair.layout, "ds_config": {**pair.layout["ds_config"], "bf16": bf16}}
+    with pytest.raises(ValueError, match="native route requires BF16"):
+        decoder._native_layout(layout)
+
+
 def test_native_ep_bf16_optimizer_frozen_experts_do_not_become_optimizer_records(tmp_path):
     pair = _native_ep_bf16_pair(tmp_path, train_experts=False)
     manifest = json.loads(_native_ep_bf16_decode(pair, tmp_path / "out").read_text())
     assert [entry["name"] for entry in manifest["parameters"]] == ["dense.weight"]
     assert manifest["frozen_expert_parameters"] == [pair.expert_name]
+
+
+def test_native_ep_optimizer_admits_the_empty_w3_placeholder_of_non_gated_experts(tmp_path):
+    """Nemotron-H's NonGatedGroupedExperts keep w3 as an empty parameter; DSS saves it with the experts."""
+    pair = _native_ep_bf16_pair(tmp_path)
+    placeholder = "model.layers.0.mlp.experts.w3"
+    for root in (pair.before, pair.after):
+        tag = next(root.iterdir())
+        model = torch.load(tag / "mp_rank_00_model_states.pt", weights_only=False)
+        model["module"][placeholder] = torch.empty(0, dtype=torch.bfloat16)
+        torch.save(model, tag / "mp_rank_00_model_states.pt")
+        for path in sorted(tag.glob("experts_ep_rank_*.pt")):
+            sidefile = torch.load(path, weights_only=True)
+            torch.save({**sidefile, placeholder: torch.empty(0, dtype=torch.bfloat16)}, path)
+    manifest = json.loads(_native_ep_bf16_decode(pair, tmp_path / "out").read_text())
+    assert sorted(entry["name"] for entry in manifest["parameters"]) == sorted(pair.expected)
+    assert manifest["frozen_expert_parameters"] == [placeholder]
+    # An expert the module holds whole still may not arrive empty.
+    path = next(pair.after.iterdir()) / "experts_ep_rank_000.pt"
+    torch.save({**torch.load(path, weights_only=True), pair.expert_name: torch.empty(0, dtype=torch.bfloat16)}, path)
+    with pytest.raises(ValueError, match="sidefile tensor is empty"):
+        _native_ep_bf16_decode(pair, tmp_path / "refused")
 
 
 def test_native_ep_bf16_optimizer_wrong_ep_order_cannot_relabel_valid_weights(tmp_path):
@@ -11919,6 +12847,45 @@ def test_dense_collection_new_boundary_real_pipe_reaps_both_owned_children(tmp_p
             os.killpg(child.pid, 0)
 
 
+@pytest.mark.parametrize("named", [True, False])
+def test_local_allocation_validates_the_hostfile_the_admission_read(tmp_path, monkeypatch, named):
+    # The owned admission reads DSS_GATEWAY_HOSTFILE when it is set; so does the live allocation check.
+    from arctic_platform.correctness.harness import inference as transfer
+
+    hostfile = tmp_path / "hostfile"
+    content = "10.0.0.1 slots=8\n10.0.0.2 slots=8\n"
+    hostfile.write_text(content)
+    monkeypatch.setattr(transfer, "_LOCAL_HOSTFILE", tmp_path / "job-hostfile")  # no /job/hostfile on this allocation
+    monkeypatch.setattr(transfer, "_validate_local_node", lambda node, deadline: None)
+    monkeypatch.delenv("ARCTIC_HOSTFILE", raising=False)
+    if named:
+        monkeypatch.setenv("DSS_GATEWAY_HOSTFILE", str(hostfile))
+    else:
+        monkeypatch.delenv("DSS_GATEWAY_HOSTFILE", raising=False)
+    nodes = [
+        {
+            "host": host,
+            "hostname": f"node{index}",
+            "slots": 8,
+            "boot_id": "1" * 36,
+            "python": sys.executable,
+            "python_sha256": "2" * 64,
+        }
+        for index, host in enumerate(("10.0.0.1", "10.0.0.2"))
+    ]
+    admission = {
+        "allocation_id": "same-job",
+        "nodes": nodes,
+        "hostfile_content": content,
+        "hostfile_sha256": hashlib.sha256(hostfile.read_bytes()).hexdigest(),
+    }
+    if named:
+        assert transfer._validate_local_allocation(admission, time.monotonic() + 30) == nodes
+    else:
+        with pytest.raises(FileNotFoundError):
+            transfer._validate_local_allocation(admission, time.monotonic() + 30)
+
+
 @pytest.mark.parametrize("mutation", ["valid", "boot", "width", "order", "hash", "content", "duplicate"])
 def test_dense_collection_new_boundary_real_validator_requires_exact_hostfile_and_complete16(
     tmp_path,
@@ -12294,6 +13261,167 @@ def _automatic_participation_receipts(tmp_path, shapes, world_size):
         }
         for rank in range(world_size)
     ]
+
+
+def _dense_shard_checkpoint_pair(tmp_path, *, world_size, group_size):
+    """ZeRO-2 checkpoints of one replicated parameter and one node shard (Arctic's patches.dense_shard): shard ``p``
+    of each node group is partitioned over the ranks at position ``p`` of every group, as an ep_size_<g> group."""
+    members = [("layer.q.weight", [2, 3], 0), ("layer.mix", [3], 8)]
+    total, nodes = 8 * group_size, world_size // group_size
+    size = total // group_size
+    record = {
+        "layer.dense_shard.shard_0": {
+            "group_size": group_size,
+            "total": total,
+            "members": [
+                {"name": name, "shape": shape, "offset": offset, "numel": math.prod(shape)}
+                for name, shape, offset in members
+            ],
+        }
+    }
+    shapes = [
+        OrderedDict([("norm.weight", torch.Size([5]))]),
+        OrderedDict([("layer.dense_shard.shard_0", torch.Size([size]))]),
+    ]
+    flat = {"norm.weight": torch.arange(5.0) + 1, "layer.dense_shard.shard_0": torch.zeros(total)}
+    moments = {name: torch.arange(value.numel(), dtype=torch.float32) + 1 for name, value in flat.items()}
+    expected = {"norm.weight": {"exp_avg": moments["norm.weight"], "exp_avg_sq": moments["norm.weight"] + 1}}
+    for name, shape, offset in members:
+        numel = math.prod(shape)
+        flat["layer.dense_shard.shard_0"][offset : offset + numel] = torch.arange(numel) + 10.0 + offset
+        moment = moments["layer.dense_shard.shard_0"][offset : offset + numel].reshape(shape)
+        expected[name] = {"exp_avg": moment, "exp_avg_sq": moment + 1}
+    config = {
+        "zero_optimization": {"stage": 2},
+        "bf16": {"enabled": True},
+        "optimizer": {"type": "AdamW", "params": {**_cortex_optimizer_decode_OPTIMIZER, "lr": 2e-05}},
+    }
+    roots = (tmp_path / "before", tmp_path / "after")
+    for root, step in zip(roots, (0, 1)):
+        tag = root / f"global_step{step}"
+        tag.mkdir(parents=True)
+        module = {name: torch.zeros(shape, dtype=torch.bfloat16) for name, shape, _ in members}
+        module["norm.weight"] = flat["norm.weight"].to(torch.bfloat16)
+        torch.save(
+            {
+                "module": module,
+                "param_shapes": shapes,
+                "global_steps": step,
+                "dp_world_size": world_size,
+                "mp_world_size": 1,
+                "ds_config": config,
+                "shared_params": {},
+            },
+            tag / "mp_rank_00_model_states.pt",
+        )
+        (tag / "dense_shard_layout.json").write_text(
+            json.dumps({"group_size": group_size, "shards": {"layer.dense_shard.shard_0": size}})
+        )
+        for rank in range(world_size):
+            masters, mappings, paddings, counts, states, groups = [], [], [], [], {}, []
+            for index, group in enumerate(shapes):
+                ((name, _),) = group.items()
+                if index == 0:
+                    vector, moment, partition, parts = flat[name], moments[name], rank, world_size
+                else:  # this rank's node shard, partitioned over its expert-DP group
+                    position = rank % group_size
+                    vector = flat[name][position * size : (position + 1) * size]
+                    moment = moments[name][position * size : (position + 1) * size]
+                    partition, parts = rank // group_size, nodes
+                length = math.ceil(vector.numel() / (2 * parts)) * 2
+                start = partition * length
+                valid = max(0, min(length, vector.numel() - start))
+                masters.append(vector[start : start + valid].clone() + (0.0001 if step else 0))
+                paddings.append(length - valid)
+                counts.append(parts)
+                mappings.append(
+                    OrderedDict([(name, fragment_address(numel=valid, start=0))]) if valid else OrderedDict()
+                )
+                param_id = 17 + index * 13
+                groups.append(
+                    {
+                        "params": [param_id],
+                        "betas": (0.9, 0.999),
+                        "lr": _cortex_optimizer_decode_LR if step else 0.001,
+                        "eps": 1e-08,
+                        "weight_decay": 0.0,
+                        "bias_correction": True,
+                        "step": 0,
+                        **({"moe": True, "name": f"ep_size_{group_size}"} if index else {}),
+                    }
+                )
+                if step:
+                    state = {"step": torch.tensor(1.0)}
+                    for key, shift in (("exp_avg", 0), ("exp_avg_sq", 1)):
+                        values = torch.zeros(length)
+                        values[:valid] = moment[start : start + valid] + shift
+                        state[key] = values
+                    states[param_id] = state
+            torch.save(
+                {
+                    "ds_config": config,
+                    "ds_version": "synthetic",
+                    "optimizer_state_dict": {
+                        "zero_stage": ZeroStageEnum.gradients,
+                        "base_optimizer_state": {"state": states, "param_groups": groups},
+                        "single_partition_of_fp32_groups": masters,
+                        "param_slice_mappings": mappings,
+                        "partition_count": counts,
+                        "group_paddings": paddings,
+                        "param_alignment_paddings": [[0] for _ in shapes],
+                        "loss_scaler": LossScaler(1.0),
+                        "dynamic_loss_scale": False,
+                        "overflow": False,
+                        "clip_grad": 1.0,
+                        "ds_version": "synthetic",
+                    },
+                },
+                tag / f"bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt",
+            )
+    inventory = {"norm.weight": [5], **{name: shape for name, shape, _ in members}}
+    receipts = _automatic_participation_receipts(tmp_path, inventory, world_size)
+    for receipt in receipts:
+        receipt["dense_shards"] = deepcopy(record)
+    return SimpleNamespace(before=roots[0], after=roots[1], expected=expected, receipts=receipts)
+
+
+@pytest.mark.parametrize("world_size, group_size", [(2, 2), (4, 2), (8, 8)])
+def test_cortex_optimizer_decode_names_the_parameters_node_shards_hold(tmp_path, world_size, group_size):
+    """Arctic's patches.dense_shard (Qwen3.8-27B, Gemma 4 full FT): ZeRO holds each node shard's FP32 master and
+    moments over its expert-DP group, partition_count world / g; the decode rebuilds the flat layout from the routes
+    and names the original parameters."""
+    pair = _dense_shard_checkpoint_pair(tmp_path, world_size=world_size, group_size=group_size)
+    manifest = decoder.decode_optimizer_capture(
+        pair.before,
+        pair.after,
+        tmp_path / "out",
+        expected_optimizer_config=_cortex_optimizer_decode_OPTIMIZER,
+        expected_learning_rate=_cortex_optimizer_decode_LR,
+        participation_receipts=pair.receipts,
+        expected_participation_job_id="child",
+    )
+    metadata = json.loads(manifest.read_text())
+    assert [entry["name"] for entry in metadata["parameters"]] == ["norm.weight", "layer.q.weight", "layer.mix"]
+    assert sorted(metadata["participation"]["parameters"]) == ["layer.mix", "layer.q.weight", "norm.weight"]
+    for entry in metadata["parameters"]:
+        tensor = torch.load(manifest.parent / entry["file"], weights_only=True)
+        for key, value in pair.expected[entry["name"]].items():
+            assert torch.equal(tensor[key], value), (entry["name"], key)
+        assert tensor["parameter_update"].shape == pair.expected[entry["name"]]["exp_avg"].shape
+        assert torch.allclose(tensor["parameter_update"], torch.full_like(tensor["parameter_update"], 1e-4), atol=1e-6)
+    # Without the worker's layout the flat shards name nothing; a layout the checkpoint disagrees with is refused.
+    with pytest.raises(ValueError, match="requires the participation receipts' shard layout"):
+        decoder.decode_optimizer_capture(pair.before, pair.after, tmp_path / "bare")
+    for receipt in pair.receipts:
+        receipt["dense_shards"]["layer.dense_shard.shard_0"]["total"] *= 2
+    with pytest.raises(ValueError, match="layout differs"):
+        decoder.decode_optimizer_capture(
+            pair.before,
+            pair.after,
+            tmp_path / "other",
+            participation_receipts=pair.receipts,
+            expected_participation_job_id="child",
+        )
 
 
 @pytest.mark.parametrize(
@@ -12892,10 +14020,10 @@ def test_onboarding_generated_shared_adapter_matches_runner_adapter(tmp_path, mo
         architectures=["Qwen3ForCausalLM"],
     ).save_pretrained(source)
     peft_config = {"peft_type": "Lora", "r": 4, "lora_alpha": 8, "target_modules": ["q_proj", "v_proj"]}
-    config = SimpleNamespace(training={"peft_config": peft_config})
+    config = SimpleNamespace(training={"peft_config": peft_config}, huggingface_loader=True)
     onboarded = onboard._shared_adapter(argparse.Namespace(peft_adapter=None), config, source)
     regression = deterministic_lora.generate_adapter(
-        source, peft_config, root / "runner" / "initial-adapter", seed=runner.SEED
+        source, peft_config, root / "runner" / "initial-adapter", seed=runner.SEED, huggingface_loader=True
     )
     expected = deterministic_lora.shared_adapter_identity(regression, peft_config)
     actual = deterministic_lora.shared_adapter_identity(onboarded, peft_config)
@@ -12945,9 +14073,17 @@ def _qwen4_reference_loader(model, info=None):
     return (SimpleNamespace(from_pretrained=from_pretrained), calls)
 
 
+def _qwen4_reference_precision_calls(monkeypatch):
+    """Record ``apply_sampler_precision``: the stand-in model has none of Qwen4Exp's modules for it to patch."""
+    calls = []
+    monkeypatch.setattr(qwen4_reference, "apply_sampler_precision", calls.append)
+    return calls
+
+
 @pytest.mark.parametrize("attention,expected", [("qsa_flex", "sdpa"), ("sdpa", "sdpa"), ("eager", "eager")])
-def test_qwen4_reference_upstream_backend_and_cpu_checkpoint_load(attention, expected):
+def test_qwen4_reference_upstream_backend_and_cpu_checkpoint_load(attention, expected, monkeypatch):
     model = _qwen4_reference_TinyQwen4()
+    precision = _qwen4_reference_precision_calls(monkeypatch)
     cls, calls = _qwen4_reference_loader(model)
     result = load_qwen4_reference(
         cls,
@@ -12972,6 +14108,7 @@ def test_qwen4_reference_upstream_backend_and_cpu_checkpoint_load(attention, exp
     assert not layer.self_attn.indexer.weight.requires_grad
     assert layer.ple.key_proj.weight.requires_grad
     assert layer.self_attn.q_proj.weight.requires_grad
+    assert precision == [model]
 
 
 def test_qwen4_reference_table_never_reaches_accelerator_placement(monkeypatch):
@@ -12989,6 +14126,7 @@ def test_qwen4_reference_table_never_reaches_accelerator_placement(monkeypatch):
             return original_to(tensor, device="cpu")
         return original_to(tensor, *args, **kwargs)
 
+    precision = _qwen4_reference_precision_calls(monkeypatch)
     monkeypatch.setattr(torch.Tensor, "to", to)
     cls, _ = _qwen4_reference_loader(model)
     load_qwen4_reference(
@@ -12998,6 +14136,7 @@ def test_qwen4_reference_table_never_reaches_accelerator_placement(monkeypatch):
         attn_implementation="qsa_flex",
         device="cuda",
     )
+    assert precision == [model]
     assert parameter_ids <= set(moved)
     assert id(model.layers[0].positions) in moved
     assert model.layers[0].ple.ple_embedding.ngram_embedding.weight is table
@@ -13041,6 +14180,7 @@ def test_qwen4_reference_missing_layer_period_rejected(missing):
 @pytest.mark.parametrize("model_type", ["qwen4_exp", "qwen4_exp_text", "qwen3"])
 def test_qwen4_reference_actual_build_engine_family_dispatch(monkeypatch, model_type):
     model = _qwen4_reference_TinyQwen4()
+    precision = _qwen4_reference_precision_calls(monkeypatch)
     calls = []
     cfg = SimpleNamespace(model_type=model_type, architectures=["Tiny"], hidden_size=2)
 
@@ -13065,9 +14205,835 @@ def test_qwen4_reference_actual_build_engine_family_dispatch(monkeypatch, model_
         assert calls[0]["attn_implementation"] == "sdpa"
         assert calls[0]["output_loading_info"] is True
         assert not model.layers[0].ple.ple_embedding.ngram_embedding.weight.requires_grad
+        assert precision == [model]
     else:
         assert calls[0] == {"dtype": torch.bfloat16, "attn_implementation": "qsa_flex"}
         assert model.layers[0].ple.ple_embedding.ngram_embedding.weight.requires_grad
+        assert precision == []
+
+
+# Qwen3.8-Flash-Next reference precision.
+
+
+def _qwen4_exp_precision_model(monkeypatch, dtype):
+    """A two-layer Qwen3.8 (GatedDeltaNet with PLE, then QSA) with random weights, on CPU in ``dtype``."""
+    from transformers import Qwen4ExpForCausalLM
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as qwen4_exp
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+
+    # The hub wrappers resolve to the CUDA causal-conv1d and fla kernels; their torch implementations run on CPU.
+    for name in ("causal_conv1d_fn", "torch_chunk_gated_delta_rule"):
+        monkeypatch.setattr(qwen4_exp, name, getattr(qwen4_exp, name).__wrapped__)
+    cfg = Qwen4ExpTextConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        layer_types=["linear_attention", "indexed_attention"],
+        hc_count=4,
+        hc_lowrank=8,
+        ple_layer_ids=[1],
+        ple_embed_dim=32,
+        ngram_size=3,
+        heads_per_ngram=2,
+        ngram_vocab_size_base=31,
+        make_ngram_vocab_size_divisible_by=8,
+        eos_token_id=3,
+        pad_token_id=0,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,
+        indexer_n_heads=2,
+        indexer_kv_heads=1,
+        indexer_head_dim=16,
+        indexer_budget=256,
+        indexer_compress_ratio=4,
+        output_gate_type="sigmoid",
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.5,
+            "mrope_section": [2, 1, 1],
+            "mrope_interleaved": True,
+        },
+        attn_implementation="sdpa",
+    )
+    cfg._experts_implementation = "eager"
+    torch.manual_seed(0)
+    model = Qwen4ExpForCausalLM(cfg)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if not name.endswith("A_log"):
+                parameter.normal_(0, 0.3 if parameter.ndim == 1 or "conv1d" in name else 0.1)
+    return model.to(dtype), cfg
+
+
+def test_qwen4_exp_reference_loader_applies_the_samplers_precision(monkeypatch):
+    """load_qwen4_reference patches every hyper connection (two per layer and the final mixer), decoder layer,
+    GatedDeltaNet beta projection and output norm, and QSA attention of the model it loads."""
+    model, _ = _qwen4_exp_precision_model(monkeypatch, torch.bfloat16)
+    cls, _ = _qwen4_reference_loader(model)
+    loaded = load_qwen4_reference(cls, "fixture", dtype=torch.bfloat16, attn_implementation="qsa_flex", device="cpu")
+    assert loaded is model
+    text = model.model
+    hyper_connections = [text.hyper_connection_mixer] + [
+        site for layer in text.layers for site in (layer.attn_hyper_connection, layer.mlp_hyper_connection)
+    ]
+    assert all(site.forward.__func__ is qwen4_exp_precision._gated_residual_forward for site in hyper_connections)
+    assert all(layer.forward.__func__ is qwen4_exp_precision._decoder_layer_forward for layer in text.layers)
+    gated_delta_net, attention = text.layers[0].linear_attn, text.layers[1].self_attn
+    assert gated_delta_net.norm.forward.__func__ is qwen4_exp_precision._rms_norm_gated_forward
+    assert gated_delta_net.in_proj_b(torch.randn(2, 32).bfloat16()).dtype == torch.float32
+    assert attention.forward.__func__ is qwen4_exp_precision._attention_forward
+    assert not text.layers[0].ple.ple_embedding.ngram_embedding.weight.requires_grad
+    with pytest.raises(ValueError, match="hyper-connection layout"):
+        qwen4_exp_precision.apply_sampler_precision(nn.Sequential(nn.Linear(2, 2)))
+
+
+def test_qwen4_exp_reference_precision_keeps_the_fp64_math(monkeypatch):
+    """The patched forwards change only where rounding happens: in FP64 the loss and every gradient are Transformers'.
+
+    Transformers' RMSNorms and its torch delta rule compute in FP32 even for an FP64 model, so the two forwards' last-bit
+    differences become FP32 ulps there: about 1e-7 of each gradient, where a changed formula would move it by O(1)."""
+    model, cfg = _qwen4_exp_precision_model(monkeypatch, torch.float64)
+    aligned = deepcopy(model)
+    qwen4_exp_precision.apply_sampler_precision(aligned)
+    ids = torch.randint(4, cfg.vocab_size, (2, 24), generator=torch.Generator().manual_seed(1))
+    ids[0, 9] = cfg.eos_token_id
+    results = []
+    for candidate in (model, aligned):
+        loss = candidate(input_ids=ids, labels=ids, use_cache=False).loss
+        loss.backward()
+        results.append(
+            (loss.detach(), {name: p.grad for name, p in candidate.named_parameters() if p.grad is not None})
+        )
+    (loss, grads), (aligned_loss, aligned_grads) = results
+    assert torch.allclose(aligned_loss, loss, rtol=1e-9, atol=0)
+    assert aligned_grads.keys() == grads.keys()
+    for name, grad in grads.items():
+        assert (aligned_grads[name] - grad).norm() <= 1e-5 * grad.norm(), name
+
+
+def test_qwen4_exp_reference_follows_the_samplers_fp32_hyper_connections_beta_gated_norm_rope_and_output_gate(
+    monkeypatch,
+):
+    """Qwen3.8-Flash-Next's HF reference must round where vLLM's Qwen4Exp does: the hyper-connection SiLU, gated mix
+    and combine, the GatedDeltaNet beta and output norm, and the QSA rotary embedding and output gate each run in FP32
+    and round once (vLLM hc_silu / hc_gate_mix / hc_combine, fused_post_conv_prep, RMSNormGated, qsa_prepare and the
+    QSA kernel's gate epilogue), where Transformers rounds every intermediate to BF16."""
+    import torch.nn.functional as F
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as qwen4_exp
+
+    stock, cfg = _qwen4_exp_precision_model(monkeypatch, torch.bfloat16)
+    model = deepcopy(stock)
+    qwen4_exp_precision.apply_sampler_precision(model)
+    # Copies for the output-gate check below; the combine check replaces the layers' sublayers.
+    attention = deepcopy(model.model.layers[1].self_attn)
+    stock_attention = deepcopy(stock.model.layers[1].self_attn)
+    one_rounding = _glm5_next_reference_one_rounding
+    generator = torch.Generator().manual_seed(2)
+    hc, hidden = cfg.hc_count, cfg.hidden_size
+
+    def randn(*shape, scale=1.0):
+        return (torch.randn(*shape, generator=generator, dtype=torch.float64) * scale).bfloat16()
+
+    # The hyper-connection mix: silu(down(n) / hc) rounded once, then mean_s(sigmoid(up(.))_s * n_s) rounded once.
+    site, stock_site = model.model.layers[0].attn_hyper_connection, stock.model.layers[0].attn_hyper_connection
+    streams = randn(2, 16, hc * hidden, scale=2.0)
+    normed = site.hc_norm(streams)
+    lowrank = F.silu(site.input_mix_weight_down(normed).double() / hc).bfloat16()
+    gate = site.input_mix_weight_up(lowrank).double().unflatten(-1, (hc, hidden))
+    exact = (torch.sigmoid(gate) * normed.double().unflatten(-1, (hc, hidden))).mean(-2)
+    mixed, hyper_input, injection_weights = site(streams)
+    assert hyper_input is streams
+    assert one_rounding(mixed, exact) == 0
+    assert one_rounding(stock_site(streams)[0], exact) > 0
+    exact_weights = 2 * torch.sigmoid(site.block_inject_weight(normed).double() / hc)
+    assert injection_weights.dtype == torch.float32
+    assert torch.allclose(injection_weights.double(), exact_weights, rtol=1e-6, atol=0)
+
+    # Both combines X + y * 2 * sigmoid(l / hc) in FP32, rounded once, through the decoder layer.
+    attention_out, mlp_out = randn(2, 16, hidden), randn(2, 16, hidden)
+    for candidate in (model, stock):
+        layer = candidate.model.layers[1]
+        layer.self_attn = _glm5_next_reference_Fixed(attention_out, None)
+        layer.mlp = _glm5_next_reference_Fixed(mlp_out)
+
+    def combine(site, x, y):
+        weights = 2 * torch.sigmoid(site.block_inject_weight(site.hc_norm(x)).double() / hc)
+        exact = x.double().unflatten(-1, (hc, hidden)) + y.double().unsqueeze(-2) * weights.unsqueeze(-1)
+        return exact.flatten(-2)
+
+    layer = model.model.layers[1]
+    middle = combine(layer.attn_hyper_connection, streams, attention_out)
+    exact_out = combine(layer.mlp_hyper_connection, middle.bfloat16(), mlp_out)
+    out = layer(streams, position_embeddings=None)
+    assert out.dtype == torch.bfloat16
+    assert one_rounding(out, exact_out) == 0
+    assert one_rounding(stock.model.layers[1](streams, position_embeddings=None), exact_out) > 0
+
+    # The GatedDeltaNet beta gate: the sigmoid sees FP32 logits.
+    gated_delta_net = model.model.layers[0].linear_attn
+    assert gated_delta_net.in_proj_b(randn(4, hidden)).dtype == torch.float32
+    assert stock.model.layers[0].linear_attn.in_proj_b(randn(4, hidden)).dtype == torch.bfloat16
+
+    # The GatedDeltaNet output norm rmsnorm(x) * w * sigmoid(z): FP32 statistics, weight and gate, one rounding.
+    norm = gated_delta_net.norm
+    core, z = randn(64, cfg.linear_value_head_dim), randn(64, cfg.linear_value_head_dim, scale=2.0)
+    x = core.double()
+    exact = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon) * norm.weight.double()
+    exact = exact * torch.sigmoid(z.double())
+    assert one_rounding(norm(core, z), exact) == 0
+    assert one_rounding(qwen4_exp.Qwen4ExpTextRMSNormGated.forward(norm, core, z), exact) > 0
+
+    # QSA RoPE on the normalized BF16 heads against BF16 cos/sin, in FP32 and rounded once; the rest pass through.
+    heads = randn(2, 2, 16, cfg.head_dim)
+    positions = torch.arange(16).view(1, 1, -1).expand(3, 2, -1)
+    cos, sin = model.model.rotary_emb(heads, positions)
+    rotary = cos.shape[-1]
+    assert cos.dtype == torch.bfloat16 and rotary < cfg.head_dim
+    exact = qwen4_exp.apply_rotary_pos_emb(heads.double(), cos=cos.double(), sin=sin.double())
+    rotated = qwen4_exp_precision.fp32_rotary(heads, cos, sin)
+    assert one_rounding(rotated[..., :rotary], exact[..., :rotary]) == 0
+    assert torch.equal(rotated[..., rotary:], heads[..., rotary:])
+    assert one_rounding(qwen4_exp.apply_rotary_pos_emb(heads, cos=cos, sin=sin)[..., :rotary], exact[..., :rotary]) > 0
+
+    # The QSA sigmoid output gate: BF16 attention output times an FP32 sigmoid, one rounding. The attention kernel
+    # returns a fixed output and o_proj is dropped, so each forward returns its gated product.
+    core_attention = randn(2, 16, cfg.num_attention_heads, cfg.head_dim)
+    for module in (attention, stock_attention):
+        module.o_proj = nn.Identity()
+        module.config._attn_implementation = "eager"
+    monkeypatch.setattr(qwen4_exp, "eager_attention_forward", lambda *args, **kwargs: (core_attention, None))
+    hidden_states = randn(2, 16, hidden)
+    mask = torch.ones(16, 16, dtype=torch.bool).tril().expand(2, 1, 16, 16)
+    _, gate = torch.chunk(attention.q_proj(hidden_states).view(2, 16, -1, cfg.head_dim * 2), 2, dim=-1)
+    exact = core_attention.double().reshape(2, 16, -1) * torch.sigmoid(gate.reshape(2, 16, -1).double())
+    assert one_rounding(attention(hidden_states, (cos, sin), mask)[0], exact) == 0
+    assert one_rounding(stock_attention(hidden_states, (cos, sin), mask)[0], exact) > 0
+
+
+# GLM-5.3-Flash reference precision.
+
+
+class _glm5_next_reference_Fixed(nn.Module):
+    """A sublayer or hyper-connection site that returns fixed outputs, so a decoder layer's forward is its remixes."""
+
+    def __init__(self, *outputs):
+        super().__init__()
+        self.outputs = outputs
+
+    def forward(self, *args, **kwargs):
+        return self.outputs if len(self.outputs) > 1 else self.outputs[0]
+
+
+def _glm5_next_reference_one_rounding(computed, exact):
+    """Elements of ``computed`` (bf16) more than a rounding of ``exact`` (float64) away from it."""
+    spacing = torch.finfo(torch.bfloat16).eps * torch.exp2(torch.floor(torch.log2(exact.abs().clamp_min(1e-30))))
+    return int(((computed.double() - exact).abs() > 0.5 * spacing * (1 + 1e-4) + 1e-30).sum())
+
+
+def test_glm5_next_reference_follows_the_samplers_fp32_mhc_remix_parameters_beta_and_norms():
+    """GLM-5.3-Flash-BF16 full fine-tuning failed single-step-grads on layers.3.attn_hc.scale / ffn_hc.scale by
+    4-6e-3 (gate 3e-3): Transformers remixes the hyper-connection streams in BF16, holds hc base/scale in BF16, takes
+    the KDA beta sigmoid in BF16 and rounds every RMSNorm twice, where vLLM's GLM-5.3-Flash and the target do each in
+    FP32 with one rounding. The reference has to load and run the model the sampler's way."""
+    from transformers.models.glm5_next import modeling_glm5_next as glm5_next
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
+
+    cfg = Glm5NextTextConfig(
+        vocab_size=32,
+        hidden_size=64,
+        intermediate_size=96,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        layer_types=["linear_attention"],
+        mlp_layer_types=["dense"],
+        linear_head_dim=16,
+        linear_num_heads=4,
+        hc_mult=4,
+        pad_token_id=0,
+    )
+    original_keep = glm5_next.Glm5NextPreTrainedModel._keep_in_fp32_modules_strict
+    loads = []
+
+    def from_pretrained(path, **kwargs):
+        # A BF16 load keeps in FP32 what _keep_in_fp32_modules_strict names when the load starts.
+        keep = list(glm5_next.Glm5NextPreTrainedModel._keep_in_fp32_modules_strict)
+        loads.append((path, kwargs, keep))
+        torch.manual_seed(0)
+        model = nn.Module()
+        model.layers = nn.ModuleList([glm5_next.Glm5NextTextDecoderLayer(cfg, 0)])
+        model.norm = glm5_next.Glm5NextTextRMSNorm(cfg.hidden_size)
+        with torch.no_grad():
+            model.norm.weight.uniform_(0.5, 1.5)
+        for name, parameter in model.named_parameters():
+            if not any(kept in name for kept in keep):
+                parameter.data = parameter.data.to(kwargs["dtype"])
+        return model
+
+    model = load_glm5_next_reference(
+        SimpleNamespace(from_pretrained=from_pretrained),
+        "fixture",
+        dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+        device="cpu",
+    )
+    assert [(path, kwargs) for path, kwargs, _ in loads] == [
+        ("fixture", {"dtype": torch.bfloat16, "attn_implementation": "sdpa"})
+    ]
+    assert {"attn_hc.base", "attn_hc.scale", "ffn_hc.base", "ffn_hc.scale"} <= set(loads[0][2])
+    assert glm5_next.Glm5NextPreTrainedModel._keep_in_fp32_modules_strict is original_keep
+    layer = model.layers[0]
+    for site in (layer.attn_hc, layer.ffn_hc):
+        assert site.base.dtype == site.scale.dtype == torch.float32
+        assert site.fn.dtype == torch.bfloat16
+
+    torch.manual_seed(1)
+    tokens = torch.randn(2, 8, cfg.hidden_size).bfloat16()
+    # The KDA beta gate: sigmoid over the projection's logits widened to FP32.
+    assert layer.self_attn.b_proj(tokens).dtype == torch.float32
+    # RMSNorm: FP32 statistics and weight, one rounding.
+    x = tokens.double()
+    exact = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + model.norm.variance_epsilon) * model.norm.weight.double()
+    assert _glm5_next_reference_one_rounding(model.norm(tokens), exact) == 0
+    assert _glm5_next_reference_one_rounding(glm5_next.Glm5NextTextRMSNorm.forward(model.norm, tokens), exact) > 0
+
+    # Both remixes post * y + comb^T @ streams in FP32, rounded once.
+    def site():
+        post = 2 * torch.rand(2, 8, 4)
+        comb = torch.softmax(torch.randn(2, 8, 4, 4), dim=-1)
+        return post, comb, torch.randn(2, 8, cfg.hidden_size).bfloat16()
+
+    (post1, comb1, collapsed1), (post2, comb2, collapsed2) = site(), site()
+    attention_out = torch.randn(2, 8, cfg.hidden_size).bfloat16()
+    mlp_out = torch.randn(2, 8, cfg.hidden_size).bfloat16()
+    layer.attn_hc = _glm5_next_reference_Fixed(post1, comb1, collapsed1)
+    layer.ffn_hc = _glm5_next_reference_Fixed(post2, comb2, collapsed2)
+    layer.self_attn = _glm5_next_reference_Fixed(attention_out)
+    layer.mlp = _glm5_next_reference_Fixed(mlp_out)
+    streams = torch.randn(2, 8, 4, cfg.hidden_size).bfloat16()
+
+    def remix(post, comb, y, residual):
+        exact = post.double().unsqueeze(-1) * y.double().unsqueeze(-2) + torch.einsum(
+            "...ij,...ih->...jh", comb.double(), residual.double()
+        )
+        return exact.to(torch.bfloat16), exact
+
+    middle, exact_middle = remix(post1, comb1, attention_out, streams)
+    _, exact_out = remix(post2, comb2, mlp_out, middle)
+    out, _ = layer(streams)
+    assert out.dtype == torch.bfloat16
+    assert _glm5_next_reference_one_rounding(out, exact_out) == 0
+    transformers_out, _ = glm5_next.Glm5NextTextDecoderLayer.forward(layer, streams)
+    assert _glm5_next_reference_one_rounding(transformers_out, exact_out) > 0
+
+
+# Qwen3.5-MoE reference precision.
+
+
+def _qwen3_5_moe_reference_config(layer_types=("linear_attention", "full_attention")):
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+
+    cfg = Qwen3_5MoeTextConfig(
+        vocab_size=32,
+        hidden_size=64,
+        num_hidden_layers=len(layer_types),
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        layer_types=list(layer_types),
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        num_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        shared_expert_intermediate_size=48,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.25,
+            "mrope_section": [2, 1, 1],
+            "mrope_interleaved": True,
+        },
+        pad_token_id=0,
+    )
+    cfg._attn_implementation = "sdpa"
+    return cfg
+
+
+def _qwen3_5_moe_reference_model(dtype, layer_types=("linear_attention", "full_attention")):
+    """A tiny Qwen3_5MoeForCausalLM with every parameter random, including the norm weights."""
+    from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen3_5_moe
+
+    torch.manual_seed(0)
+    model = qwen3_5_moe.Qwen3_5MoeForCausalLM(_qwen3_5_moe_reference_config(layer_types))
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if name.endswith("linear_attn.norm.weight"):
+                parameter.uniform_(0.5, 1.5)
+            elif "norm" in name:
+                parameter.uniform_(-0.5, 0.5)
+            elif name.endswith(("A_log", "dt_bias")):
+                parameter.uniform_(-1.0, 1.0)
+            elif "embed_tokens" in name:
+                parameter.normal_(0.0, 1.0)
+            else:
+                parameter.normal_(0.0, 0.05)
+    return model.to(dtype)
+
+
+def _qwen3_5_moe_reference_cpu_kernels(monkeypatch):
+    """The CPU stand-ins for Dao's causal_conv1d (FP32 accumulation and SiLU, one rounding) and fla's chunk rule (its
+    PyTorch fallback), so the GatedDeltaNet runs without CUDA."""
+    import torch.nn.functional as F
+    from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen3_5_moe
+
+    def causal_conv1d(hidden_states, weight, bias=None, activation=None, **_kwargs):
+        length = hidden_states.shape[-1]
+        out = F.conv1d(
+            hidden_states.float(),
+            weight.float().unsqueeze(1),
+            None if bias is None else bias.float(),
+            padding=weight.shape[-1] - 1,
+            groups=hidden_states.shape[1],
+        )[..., :length]
+        return (F.silu(out) if activation is not None else out).to(hidden_states.dtype)
+
+    chunk_rule = qwen3_5_moe.torch_chunk_gated_delta_rule
+    while hasattr(chunk_rule, "__wrapped__"):
+        chunk_rule = chunk_rule.__wrapped__
+    monkeypatch.setattr(qwen3_5_moe, "causal_conv1d_fn", causal_conv1d)
+    monkeypatch.setattr(qwen3_5_moe, "torch_chunk_gated_delta_rule", chunk_rule)
+
+
+def _qwen3_5_moe_reference_load(model):
+    from arctic_platform.correctness.reference.qwen3_5_moe_reference import load_qwen3_5_moe_reference
+
+    calls = []
+
+    def from_pretrained(path, **kwargs):
+        calls.append((path, kwargs))
+        return model
+
+    loaded = load_qwen3_5_moe_reference(
+        SimpleNamespace(from_pretrained=from_pretrained),
+        "fixture",
+        dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+        device="cpu",
+    )
+    assert loaded is model
+    assert calls == [("fixture", {"dtype": torch.bfloat16, "attn_implementation": "sdpa"})]
+    return model
+
+
+class _qwen3_5_moe_reference_Fixed(nn.Module):
+    """A sublayer that records its input and returns a fixed output."""
+
+    def __init__(self, output):
+        super().__init__()
+        self.output = output
+        self.inputs = []
+
+    def forward(self, hidden_states, *args, **kwargs):
+        self.inputs.append(hidden_states)
+        return (self.output, None) if kwargs.get("position_embeddings") is not None else self.output
+
+
+def test_qwen3_5_moe_reference_follows_the_samplers_fp32_residual_norms_gated_norm_beta_rope_and_routing_weights(
+    monkeypatch,
+):
+    """Qwen3.6-35B-A3B full fine-tuning failed single-step-grads on layers.2.linear_attn.in_proj_z / conv1d and
+    layers.3.self_attn.q_proj / v_proj by 1-3e-3 relative (gate 3e-3 absolute). Transformers' Qwen3_5Moe normalizes
+    the BF16-rounded residual sum, rounds the GatedDeltaNet output norm three times, takes the beta sigmoid in BF16,
+    rotates q/k in BF16 and rounds the routing weights to BF16; vLLM 0.33 and the target do each in FP32 with one
+    rounding. The reference has to load and run the model the sampler's way."""
+    import torch.nn.functional as F
+    from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen3_5_moe
+
+    from arctic_platform.correctness.reference.qwen3_5_moe_reference import fp32_rope
+
+    model = _qwen3_5_moe_reference_load(_qwen3_5_moe_reference_model(torch.bfloat16))
+    text = model.model
+    gdn_layer, attention_layer = text.layers
+    gdn, attention, moe = gdn_layer.linear_attn, attention_layer.self_attn, attention_layer.mlp
+    torch.manual_seed(1)
+    tokens = torch.randn(1, 96, 64).bfloat16()
+
+    # The GatedDeltaNet output norm rmsnorm(x) * w * silu(z): FP32, one rounding.
+    x, z = torch.randn(384, 16).bfloat16(), torch.randn(384, 16).bfloat16()
+    exact = x.double() * torch.rsqrt(x.double().pow(2).mean(-1, keepdim=True) + gdn.norm.variance_epsilon)
+    exact = exact * gdn.norm.weight.double() * F.silu(z.double())
+    assert _glm5_next_reference_one_rounding(gdn.norm(x, z), exact) == 0
+    assert _glm5_next_reference_one_rounding(qwen3_5_moe.Qwen3_5MoeRMSNormGated.forward(gdn.norm, x, z), exact) > 0
+
+    # The beta gate: sigmoid over the projection's logits widened to FP32.
+    assert gdn.in_proj_b(tokens).dtype == torch.float32
+
+    # q/k: the normed value rotated in FP32 against the BF16 cos/sin, rounded once.
+    positions = torch.arange(96).view(1, 1, -1).expand(3, 1, -1)
+    cos, sin = text.rotary_emb(tokens, positions)
+    assert cos.dtype == torch.bfloat16
+    seen = []
+
+    def capture(module, query, key, value, attention_mask, **kwargs):
+        seen.append((query, key))
+        return torch.zeros_like(query).transpose(1, 2), None
+
+    monkeypatch.setattr(attention.config, "_attn_implementation", "eager")
+    monkeypatch.setattr(qwen3_5_moe, "eager_attention_forward", capture)
+    query, _ = torch.chunk(attention.q_proj(tokens).view(1, 96, -1, 64), 2, dim=-1)
+    normed = attention.q_norm(query).transpose(1, 2)
+    rotary = cos.shape[-1]
+
+    def exact_rope(value):
+        value = value.double()
+        half = rotary // 2
+        turned = torch.cat((-value[..., half:rotary], value[..., :half]), dim=-1)
+        rotated = value[..., :rotary] * cos.unsqueeze(1).double() + turned * sin.unsqueeze(1).double()
+        return torch.cat((rotated, value[..., rotary:]), dim=-1)
+
+    attention(tokens, (cos, sin), None)
+    qwen3_5_moe.Qwen3_5MoeAttention.forward(attention, tokens, (cos, sin), None)
+    (aligned_query, _), (transformers_query, _) = seen
+    assert torch.equal(aligned_query, fp32_rope(normed, cos, sin))
+    assert _glm5_next_reference_one_rounding(aligned_query, exact_rope(normed)) == 0
+    assert _glm5_next_reference_one_rounding(transformers_query, exact_rope(normed)) > 0
+
+    # Routing: FP32 renormalized top-k weights; each expert row weighted and the top-k summed in FP32, rounded once.
+    flat = tokens.reshape(-1, 64)
+    _, weights, chosen = moe.gate(flat)
+    assert weights.dtype == torch.float32
+    rows = [moe.experts(flat, chosen[:, k : k + 1], torch.ones(flat.shape[0], 1)) for k in range(chosen.shape[1])]
+    # vLLM's moe_sum: each weighted row in FP32, the top-k accumulated in FP32, one rounding.
+    fp32_sum = sum(row.float() * weights[:, k : k + 1] for k, row in enumerate(rows)).bfloat16()
+    assert torch.equal(moe.experts(flat, chosen, weights), fp32_sum)
+    _, transformers_weights, _ = qwen3_5_moe.Qwen3_5MoeTopKRouter.forward(moe.gate, flat)
+    assert transformers_weights.dtype == torch.bfloat16
+    assert not torch.equal(moe.experts(flat, chosen, transformers_weights), fp32_sum)
+
+    # The residual: each sum formed in FP32 and normalized unrounded; the stream keeps it rounded.
+    attention_out, mlp_out = torch.randn(1, 96, 64).bfloat16(), torch.randn(1, 96, 64).bfloat16()
+    gdn_layer.linear_attn = _qwen3_5_moe_reference_Fixed(attention_out)
+    gdn_layer.mlp = _qwen3_5_moe_reference_Fixed(mlp_out)
+
+    def exact_norm(norm, value):
+        value = value.double()
+        normed = value * torch.rsqrt(value.pow(2).mean(-1, keepdim=True) + norm.eps)
+        return normed * (1.0 + norm.weight.double())
+
+    summed = tokens.double() + attention_out.double()
+    out = gdn_layer(tokens, position_embeddings=(cos, sin))
+    assert out.dtype == torch.float32
+    assert torch.equal(out, summed.bfloat16().float() + mlp_out.float())
+    assert (
+        _glm5_next_reference_one_rounding(
+            gdn_layer.mlp.inputs[0], exact_norm(gdn_layer.post_attention_layernorm, summed)
+        )
+        == 0
+    )
+    qwen3_5_moe.Qwen3_5MoeDecoderLayer.forward(gdn_layer, tokens, (cos, sin))
+    assert (
+        _glm5_next_reference_one_rounding(
+            gdn_layer.mlp.inputs[1], exact_norm(gdn_layer.post_attention_layernorm, summed)
+        )
+        > 0
+    )
+    # The next layer's input norm and the final norm normalize the FP32 sum and round once.
+    assert (
+        _glm5_next_reference_one_rounding(
+            attention_layer.input_layernorm(out), exact_norm(attention_layer.input_layernorm, out)
+        )
+        == 0
+    )
+    assert _glm5_next_reference_one_rounding(text.norm(out), exact_norm(text.norm, out)) == 0
+
+
+def test_qwen3_5_moe_reference_changes_no_fp32_math(monkeypatch):
+    """At FP32 the alignment is only roundings: the patched model's output and gradients equal Transformers'."""
+    _qwen3_5_moe_reference_cpu_kernels(monkeypatch)
+    from arctic_platform.correctness.reference.qwen3_5_moe_reference import apply_sampler_precision
+
+    layer_types = ("linear_attention", "linear_attention", "full_attention")
+    transformers_model = _qwen3_5_moe_reference_model(torch.float32, layer_types)
+    aligned = copy.deepcopy(transformers_model)
+    counts = apply_sampler_precision(aligned, torch.float32)
+    assert counts == {
+        "decoder_layers": 3,
+        "residual_norms": 7,
+        "gated_norms": 2,
+        "beta_projections": 2,
+        "attention_layers": 1,
+        "routers": 3,
+    }
+    ids = torch.randint(1, 32, (1, 160), generator=torch.Generator().manual_seed(2))
+    upstream = torch.randn(1, 160, 64, generator=torch.Generator().manual_seed(3))
+    results = []
+    for model in (transformers_model, aligned):
+        out = model.model(input_ids=ids).last_hidden_state
+        (out * upstream).sum().backward()
+        results.append((out.detach(), {name: p.grad for name, p in model.named_parameters() if p.grad is not None}))
+    (out, grads), (aligned_out, aligned_grads) = results
+    assert aligned_out.dtype == torch.float32
+    torch.testing.assert_close(aligned_out, out, rtol=1e-5, atol=1e-6)
+    assert grads.keys() == aligned_grads.keys()
+    for name, grad in grads.items():
+        torch.testing.assert_close(aligned_grads[name], grad, rtol=1e-4, atol=1e-6, msg=name)
+
+
+def test_qwen3_5_moe_reference_rejects_experts_that_round_the_topk_sum():
+    from arctic_platform.correctness.reference.qwen3_5_moe_reference import apply_sampler_precision
+
+    model = _qwen3_5_moe_reference_model(torch.bfloat16)
+    model.set_experts_implementation("eager")
+    with pytest.raises(ValueError, match="weight and sum the top-k in FP32"):
+        apply_sampler_precision(model, torch.bfloat16)
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5"])
+@pytest.mark.parametrize("huggingface_loader", [False, True])
+def test_qwen3_5_moe_reference_actual_build_engine_family_dispatch(monkeypatch, model_type, huggingface_loader):
+    model = _qwen4_reference_TinyQwen4()
+    cfg = SimpleNamespace(model_type=model_type, architectures=["Tiny"], hidden_size=2)
+    tiny, auto, loads = SimpleNamespace(), SimpleNamespace(), []
+
+    def from_pretrained(path, **kwargs):
+        loads.append(kwargs)
+        return model
+
+    tiny.from_pretrained = auto.from_pretrained = from_pretrained
+
+    def load_qwen3_5_moe_reference(model_class, path, **kwargs):
+        loads.append(("aligned", model_class, path, kwargs))
+        return model
+
+    monkeypatch.setattr(hf_single_gpu, "load_qwen3_5_moe_reference", load_qwen3_5_moe_reference)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoConfig=SimpleNamespace(from_pretrained=lambda *args, **kwargs: cfg),
+            AutoModelForCausalLM=auto,
+            Tiny=tiny,
+        ),
+    )
+    engine = build_engine("fixture", attn_implementation="sdpa", device="cpu", huggingface_loader=huggingface_loader)
+    assert engine.model is model
+    if model_type.startswith("qwen3_5_moe"):
+        expected = auto if huggingface_loader else tiny
+        assert loads == [
+            (
+                "aligned",
+                expected,
+                "fixture",
+                {"dtype": torch.bfloat16, "attn_implementation": "sdpa", "device": "cpu"},
+            )
+        ]
+    else:
+        assert loads == [{"dtype": torch.bfloat16, "attn_implementation": "sdpa"}]
+
+
+# Nemotron-H's reference: the sampler's unfloored Mamba-2 time step.
+
+
+def _nemotron_h_reference_model():
+    """A tiny Transformers NemotronHForCausalLM with one Mamba-2 layer. Heads 0 and 1, gated-norm group 0, have
+    softplus(dt_bias) of 6e-6 and 1.7e-5, under Transformers' 1e-3 dt floor at every token, and no D skip, as
+    Nemotron-3-Nano layer 0's floored heads (D 0.00-0.02, five of them in one group); heads 2 and 3 are above it. The
+    projections are O(1), so the scan, not the D skip, carries the output."""
+    from transformers.models.nemotron_h import modeling_nemotron_h as nemotron_h
+    from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
+
+    cfg = NemotronHConfig(
+        vocab_size=32,
+        hidden_size=32,
+        layers_block_type=["mamba"],
+        mamba_num_heads=4,
+        mamba_head_dim=8,
+        n_groups=2,
+        ssm_state_size=8,
+        chunk_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        intermediate_size=32,
+        moe_intermediate_size=16,
+        moe_shared_expert_intermediate_size=16,
+        n_routed_experts=2,
+        pad_token_id=0,
+    )
+    torch.manual_seed(0)
+    model = nemotron_h.NemotronHForCausalLM(cfg)
+    mixer = model.get_decoder().layers[0].mixer
+    with torch.no_grad():
+        mixer.in_proj.weight.normal_(0.0, cfg.hidden_size**-0.5)
+        mixer.conv1d.weight.normal_(0.0, 0.3)
+        mixer.dt_bias.copy_(torch.tensor([-12.0, -11.0, 0.5, 2.0]))
+        mixer.A_log.uniform_(-1.0, 1.0)
+        mixer.D.copy_(torch.tensor([0.0, 0.0, 1.0, -0.5]))
+        mixer.norm.weight.uniform_(0.5, 1.5)
+    return model.float()
+
+
+def _nemotron_h_reference_cpu_kernels(monkeypatch):
+    """Transformers' own PyTorch paths for the Mamba-2 mixer (the installed causal_conv1d / mamba_ssm need CUDA); the
+    fused training kernel's fallback returns None, which sends the mixer down its chunk-scan path."""
+    from transformers.models.nemotron_h import modeling_nemotron_h as nemotron_h
+
+    for name in ("causal_conv1d_fn", "mamba2_chunk_scan", "mamba2_split_conv1d_scan_combined"):
+        function = getattr(nemotron_h, name)
+        while hasattr(function, "__wrapped__"):
+            function = function.__wrapped__
+        monkeypatch.setattr(nemotron_h, name, function)
+
+
+def _nemotron_h_reference_mixer_float64(mixer, hidden_states, dt_bias, dt_floor):
+    """The Mamba-2 mixer token by token in float64: conv1d + SiLU, dt = softplus(dt + dt_bias) raised to ``dt_floor``,
+    the recurrence with the D skip, the gated group RMSNorm, out_proj. ``dt_bias`` is passed in so its gradient can be
+    taken."""
+    import torch.nn.functional as F
+
+    p = {name: parameter.detach().double() for name, parameter in mixer.named_parameters()}
+    heads, head_dim, groups, state = mixer.num_heads, mixer.head_dim, mixer.n_groups, mixer.ssm_state_size
+    dim, length = heads * head_dim, hidden_states.shape[0]
+    z, xBC, dt = (hidden_states @ p["in_proj.weight"].t()).split([dim, mixer.conv_dim, heads], dim=-1)
+    width = p["conv1d.weight"].shape[-1]
+    xBC = F.conv1d(xBC.t()[None], p["conv1d.weight"], p["conv1d.bias"], padding=width - 1, groups=mixer.conv_dim)
+    x, B, C = F.silu(xBC[0, :, :length]).t().split([dim, groups * state, groups * state], dim=-1)
+    dt = F.softplus(dt + dt_bias).clamp(min=dt_floor)
+    A = -torch.exp(p["A_log"])
+    group = torch.arange(heads) // (heads // groups)
+    h = torch.zeros(heads, head_dim, state, dtype=torch.float64)
+    ys = []
+    for t in range(length):
+        xt, Bt, Ct = x[t].view(heads, head_dim), B[t].view(groups, state)[group], C[t].view(groups, state)[group]
+        h = h * torch.exp(A * dt[t])[:, None, None] + dt[t][:, None, None] * xt[:, :, None] * Bt[:, None, :]
+        ys.append(torch.einsum("hpn,hn->hp", h, Ct) + p["D"][:, None] * xt)
+    y = (torch.stack(ys).reshape(length, dim) * F.silu(z)).view(length, groups, dim // groups)
+    y = (y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + mixer.norm.variance_epsilon)).view(length, dim)
+    return (y * p["norm.weight"]) @ p["out_proj.weight"].t()
+
+
+def _nemotron_h_reference_load(model):
+    from arctic_platform.correctness.reference.nemotron_h_reference import load_nemotron_h_reference
+
+    calls = []
+
+    def from_pretrained(path, **kwargs):
+        calls.append((path, kwargs))
+        return model
+
+    loaded = load_nemotron_h_reference(
+        SimpleNamespace(from_pretrained=from_pretrained),
+        "fixture",
+        dtype=torch.float32,
+        attn_implementation="sdpa",
+        device="cpu",
+    )
+    assert loaded is model
+    assert calls == [("fixture", {"dtype": torch.float32, "attn_implementation": "sdpa"})]
+    return model
+
+
+def test_nemotron_h_reference_follows_the_samplers_unfloored_time_step(monkeypatch):
+    """Transformers' Nemotron-H raises every Mamba-2 time step to config.time_step_min (time_step_limit = (1e-3, inf),
+    models/nemotron_h/modeling_nemotron_h.py:414); vLLM 0.33 serves softplus(dt + dt_bias) unfloored (dt_limit=(0.0,
+    inf), mamba_mixer2.py:704 and :883), as the checkpoint's own code does. On Nemotron-3-Nano's layer 0 that is 12.7% of
+    (token, head) pairs, and the layer's output moves by 6.3%. The loaded reference runs the unfloored recurrence (the
+    output and dt_bias's gradient match a float64 token-by-token mixer at dt = softplus(dt + dt_bias)), while
+    Transformers' own mixer matches the floored one and gives the floored heads no dt_bias gradient at all."""
+    _nemotron_h_reference_cpu_kernels(monkeypatch)
+    stock = _nemotron_h_reference_model()
+    reference = _nemotron_h_reference_load(_nemotron_h_reference_model())
+    stock_mixer, mixer = (m.get_decoder().layers[0].mixer for m in (stock, reference))
+    assert stock_mixer.time_step_limit == (stock.config.time_step_min, float("inf")) == (1e-3, float("inf"))
+    assert mixer.time_step_limit == (0.0, float("inf"))
+    torch.manual_seed(1)
+    hidden = torch.randn(1, 40, stock.config.hidden_size)  # 40 tokens: the chunk scan pads its last chunk
+    dy = torch.randn(1, 40, stock.config.hidden_size)
+    outputs = {}
+    for name, m in (("stock", stock_mixer), ("reference", mixer)):
+        m.train()
+        m.zero_grad(set_to_none=True)
+        out = m(hidden)
+        out.backward(dy)
+        outputs[name] = (out.detach().double()[0], m.dt_bias.grad.double())
+    for floor in (0.0, 1e-3):
+        dt_bias = mixer.dt_bias.detach().double().requires_grad_()
+        exact = _nemotron_h_reference_mixer_float64(mixer, hidden[0].double(), dt_bias, floor)
+        exact.backward(dy[0].double())
+        outputs[floor] = (exact.detach(), dt_bias.grad)
+
+    def rel(a, b):
+        return ((a - b).norm() / b.norm()).item()
+
+    assert rel(outputs["reference"][0], outputs[0.0][0]) < 1e-5  # FP32 chunk scan against float64
+    assert rel(outputs["reference"][1], outputs[0.0][1]) < 1e-4
+    assert rel(outputs["stock"][0], outputs[1e-3][0]) < 1e-5  # Transformers' own mixer is the floored recurrence
+    assert rel(outputs["stock"][0], outputs[0.0][0]) > 1e-2
+    assert torch.all(outputs["stock"][1][:2] == 0) and torch.all(outputs[0.0][1][:2].abs() > 0)
+
+
+def test_nemotron_h_reference_refuses_a_model_without_mamba_mixers():
+    from arctic_platform.correctness.reference.nemotron_h_reference import unfloor_time_step
+
+    with pytest.raises(ValueError, match="no NemotronHMamba2Mixer"):
+        unfloor_time_step(nn.Sequential(nn.Linear(2, 2)))
+
+
+@pytest.mark.parametrize("model_type", ["nemotron_h", "llama"])
+@pytest.mark.parametrize("huggingface_loader", [False, True])
+def test_nemotron_h_reference_actual_build_engine_family_dispatch(monkeypatch, model_type, huggingface_loader):
+    model = _qwen4_reference_TinyQwen4()
+    cfg = SimpleNamespace(model_type=model_type, architectures=["Tiny"], hidden_size=2)
+    tiny, auto, loads = SimpleNamespace(), SimpleNamespace(), []
+
+    def from_pretrained(path, **kwargs):
+        loads.append(kwargs)
+        return model
+
+    tiny.from_pretrained = auto.from_pretrained = from_pretrained
+
+    def load_nemotron_h_reference(model_class, path, **kwargs):
+        loads.append(("aligned", model_class, path, kwargs))
+        return model
+
+    monkeypatch.setattr(hf_single_gpu, "load_nemotron_h_reference", load_nemotron_h_reference)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoConfig=SimpleNamespace(from_pretrained=lambda *args, **kwargs: cfg),
+            AutoModelForCausalLM=auto,
+            Tiny=tiny,
+        ),
+    )
+    engine = build_engine("fixture", attn_implementation="sdpa", device="cpu", huggingface_loader=huggingface_loader)
+    assert engine.model is model
+    if model_type == "nemotron_h":
+        expected = auto if huggingface_loader else tiny
+        assert loads == [
+            (
+                "aligned",
+                expected,
+                "fixture",
+                {"dtype": torch.bfloat16, "attn_implementation": "sdpa", "device": "cpu"},
+            )
+        ]
+    else:
+        assert loads == [{"dtype": torch.bfloat16, "attn_implementation": "sdpa"}]
 
 
 # Sft.
@@ -13606,6 +15572,287 @@ def test_generated_adapter_dependency_recipe_drift_invalidates_admitted_identity
         shared.shared_initialize_adapter(_model(), path, admitted)
 
 
+_EXPERT_LORA_RECIPE = {
+    "peft_type": "Lora",
+    "r": 2,
+    "lora_alpha": 4,
+    "lora_dropout": 0.0,
+    "bias": "none",
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    "target_parameters": ["experts.w1", "experts.w2", "experts.w3"],
+}
+_EXPERT_LORA_DIMS = dict(
+    vocab_size=32,
+    hidden_size=16,
+    intermediate_size=32,
+    num_hidden_layers=1,
+    num_attention_heads=2,
+    num_key_value_heads=2,
+    head_dim=8,
+    max_position_embeddings=32,
+    num_experts=4,
+    num_experts_per_tok=2,
+    moe_intermediate_size=8,
+)
+
+
+@pytest.fixture
+def expert_lora_pack(tmp_path, monkeypatch):
+    """The catalog's Qwen3-30B-A3B standard LoRA shape on a config-only Qwen3-MoE base, its pack generated."""
+    monkeypatch.setattr(storage, "_DATA_FAST_ROOT", tmp_path)
+    source = tmp_path / "config-only-moe"
+    transformers.Qwen3MoeConfig(**_EXPERT_LORA_DIMS, architectures=["Qwen3MoeForCausalLM"]).save_pretrained(source)
+    path = shared.generate_adapter(source, _EXPERT_LORA_RECIPE, tmp_path / "generated", seed=42)
+    identity = shared.shared_adapter_identity(path, _EXPERT_LORA_RECIPE)
+    return SimpleNamespace(path=path, source=source, identity=identity)
+
+
+def _arctic_expert_lora_model(experts=4):
+    from arctic_platform.model.implementations.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+    from arctic_platform.model.implementations.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+    from arctic_platform.model.patches.peft import apply_peft
+
+    with torch.random.fork_rng(devices=[]):
+        model = Qwen3MoeForCausalLM(
+            Qwen3MoeConfig(**_EXPERT_LORA_DIMS, use_grouped_mm=False, attn_implementation="sdpa")
+        ).float()
+        if experts != _EXPERT_LORA_DIMS["num_experts"]:
+            # An expert-parallel rank's local shard, as PEFT sizes the factors after placement.
+            for module in model.modules():
+                for name in ("w1", "w2", "w3"):
+                    parameter = getattr(module, name, None)
+                    if isinstance(parameter, torch.nn.Parameter) and parameter.dim() == 3:
+                        setattr(module, name, torch.nn.Parameter(parameter.data[:experts].clone()))
+        return apply_peft(model, {**_EXPERT_LORA_RECIPE, "task_type": "CAUSAL_LM"})
+
+
+def test_shared_adapter_admits_peft_reloaded_set_target_parameters_and_fused_expert_patterns(expert_lora_pack):
+    # PEFT's Transformers 5 MoE conversion holds target_parameters as a set and targets gate_up_proj at 2r.
+    config = json.loads((expert_lora_pack.path / "adapter_config.json").read_text())
+    reloaded = {**config, "target_parameters": set(config["target_parameters"])}
+    assert shared._topology(reloaded) == expert_lora_pack.identity["peft_config"]
+    assert expert_lora_pack.identity["peft_config"]["rank_pattern"] == {r".*\.gate_up_proj": 4}
+    for field, value in (("rank_pattern", {r".*\.gate_up_proj": 3}), ("alpha_pattern", {r".*\.q_proj": 8})):
+        with pytest.raises(ValueError, match="fused expert parameters"):
+            shared._topology({**config, field: value})
+
+
+def test_generated_expert_adapter_holds_arctic_expert_weights_in_the_hf_fused_parameters(expert_lora_pack):
+    generation = expert_lora_pack.identity["generation"]
+    assert generation["training_peft_config"] == shared._topology(_EXPERT_LORA_RECIPE)
+    assert generation["peft_config"] == expert_lora_pack.identity["peft_config"]
+    records = {record["parameter"]: record for record in generation["expert_parameters"]}
+    assert records["gate_up_proj"]["projections"] == ["w1", "w3"] and records["gate_up_proj"]["rank"] == 4
+    assert records["down_proj"]["projections"] == ["w2"] and records["down_proj"]["rank"] == 2
+    shapes = {entry["name"]: entry["shape"] for entry in expert_lora_pack.identity["tensors"]}
+    prefix = records["gate_up_proj"]["name"]
+    assert shapes[f"{prefix}.lora_A.weight"] == [4 * 4, 16] and shapes[f"{prefix}.lora_B.weight"] == [16, 4 * 4]
+    with pytest.raises(ValueError, match="targeted together"):
+        shared.generate_adapter(
+            expert_lora_pack.source,
+            {**_EXPERT_LORA_RECIPE, "target_modules": ["q_proj"], "target_parameters": ["experts.w1", "experts.w2"]},
+            expert_lora_pack.path.parent / "partial",
+        )
+
+
+@pytest.mark.parametrize("ep_rank", [None, 0, 1])
+def test_native_expert_factors_install_each_arctic_weight_block_for_its_ep_rank(
+    expert_lora_pack, monkeypatch, ep_rank
+):
+    from arctic_platform.model.implementations.moe.distributed import expert_parallel
+
+    pack = load_file(str(expert_lora_pack.path / "adapter_model.safetensors"))
+    with torch.no_grad():
+        for name, tensor in pack.items():
+            if ".lora_A." in name:
+                tensor.copy_(torch.arange(tensor.numel(), dtype=tensor.dtype).reshape(tensor.shape))
+    save_file(pack, str(expert_lora_pack.path / "adapter_model.safetensors"), metadata={"format": "pt"})
+    identity = shared.shared_adapter_identity(expert_lora_pack.path, _EXPERT_LORA_RECIPE)
+    local = 4 if ep_rank is None else 2
+    if ep_rank is not None:
+        monkeypatch.setattr(expert_parallel, "get_ep_group", lambda experts: "ep-group")
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: ep_rank)
+    model = _arctic_expert_lora_model(local)
+    native_adapter.initialize_native_adapter(model, expert_lora_pack.path, identity)
+    installed = native_adapter._adapter_parameters(model)
+    experts = slice(0, 4) if ep_rank is None else slice(2 * ep_rank, 2 * ep_rank + 2)
+    fused = pack["base_model.model.model.layers.0.mlp.experts.base_layer.lora_A.weight"].reshape(4, 4, 16)
+    root = "base_model.model.model.layers.0.mlp.experts"
+    # Arctic nests w1 (innermost), w2, w3 (outermost); w1 takes the fused rank rows 0..r, w3 rows r..2r.
+    torch.testing.assert_close(
+        installed[f"{root}.base_layer.base_layer.lora_A.weight"], fused[experts, :2].reshape(-1, 16), rtol=0, atol=0
+    )
+    torch.testing.assert_close(installed[f"{root}.lora_A.weight"], fused[experts, 2:].reshape(-1, 16), rtol=0, atol=0)
+    down = pack[f"{root}.lora_A.weight"].reshape(4, 2, 8)
+    torch.testing.assert_close(
+        installed[f"{root}.base_layer.lora_A.weight"], down[experts].reshape(-1, 8), rtol=0, atol=0
+    )
+    assert installed[f"{root}.base_layer.base_layer.lora_B.weight"].shape == (8, 2 * local)
+
+
+def test_reference_fused_expert_lora_b_trains_only_its_per_weight_blocks(expert_lora_pack):
+    torch.manual_seed(0)
+    config = transformers.Qwen3MoeConfig(**_EXPERT_LORA_DIMS, architectures=["Qwen3MoeForCausalLM"])
+    base = transformers.Qwen3MoeForCausalLM(config).float()
+    with torch.no_grad():
+        for parameter in base.parameters():
+            parameter.normal_(std=0.2)
+    model = peft.PeftModel.from_pretrained(base, str(expert_lora_pack.path), is_trainable=True)
+    shared.shared_initialize_adapter(model, expert_lora_pack.path, expert_lora_pack.identity)
+    ids = torch.randint(0, 32, (2, 8))
+    model(input_ids=ids, labels=ids).loss.backward()
+    grad = model.get_submodule("base_model.model.model.layers.0.mlp.experts.base_layer").lora_B["default"].weight.grad
+    blocks = grad.reshape(16, 4, 4)
+    assert bool(blocks[:8, :2].count_nonzero()) and bool(blocks[8:, 2:].count_nonzero())
+    assert not blocks[:8, 2:].count_nonzero() and not blocks[8:, :2].count_nonzero()
+
+
+def test_arctic_gated_expert_lora_pairs_with_the_hf_fused_factors_and_their_shapes():
+    root = "base_model.model.model.layers.0.mlp.experts"
+    ap = {
+        f"{root}.base_layer.base_layer.lora_B.default.weight": 3.0,  # w1
+        f"{root}.base_layer.lora_B.default.weight": 5.0,  # w2
+        f"{root}.lora_B.default.weight": 4.0,  # w3
+    }
+    reference = {f"{root}.base_layer.lora_B.default.weight": 5.0, f"{root}.lora_B.default.weight": 5.0}
+    pairs, only_ap, only_reference = align(ap, reference)
+    assert not only_ap and not only_reference
+    assert pairs == [
+        ("layers.0.mlp.experts.base_layer.lora_B.default.weight", 5.0, 5.0),
+        ("layers.0.mlp.experts.lora_B.default.weight", 5.0, 5.0),
+    ]
+    groups = canonical_ap_tensor_groups([*ap, *(name.replace("lora_B", "lora_A") for name in ap)])
+    assert groups["layers.0.mlp.experts.base_layer.lora_B.default.weight"].block_diagonal
+    assert groups["layers.0.mlp.experts.base_layer.lora_A.default.weight"].concatenate_dim == 0
+    record = {
+        "schema": optimizer_capture.PARTICIPATION_SCHEMA,
+        "parameters": {
+            f"{root}.base_layer.base_layer.lora_B.default.weight": {"shape": [8, 8], "state": "active"},
+            f"{root}.base_layer.lora_B.default.weight": {"shape": [16, 8], "state": "active"},
+            f"{root}.lora_B.default.weight": {"shape": [8, 8], "state": "active"},
+        },
+    }
+    assert optimizer_capture.canonical_participation(record, backend="ap")[
+        "layers.0.mlp.experts.base_layer.lora_B.default.weight"
+    ] == {"shape": [16, 16], "state": "active"}
+
+
+def test_nemotron_h_expert_lora_installs_and_pairs_with_the_transformers_mixer_factors(tmp_path, monkeypatch):
+    """The catalog's Nemotron-3-Nano long LoRA: Arctic's mlp.experts w1 / w2 hold Transformers' mixer.experts."""
+    from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import NemotronHConfig
+    from arctic_platform.model.implementations.nemotron_h.modeling_nemotron_h import NemotronHForCausalLM
+    from arctic_platform.model.patches.peft import apply_peft
+
+    monkeypatch.setattr(storage, "_DATA_FAST_ROOT", tmp_path)
+    recipe = {**_EXPERT_LORA_RECIPE, "target_parameters": ["experts.w1", "experts.w2"]}
+    dims = dict(
+        vocab_size=32,
+        hidden_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        mamba_num_heads=2,
+        mamba_head_dim=8,
+        n_groups=1,
+        ssm_state_size=4,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=8,
+        moe_shared_expert_intermediate_size=8,
+        intermediate_size=8,
+        max_position_embeddings=32,
+        architectures=["NemotronHForCausalLM"],
+    )
+    source = tmp_path / "config-only-nemotron-h"
+    transformers.NemotronHConfig(**dims, layers_block_type=["mamba", "moe", "attention"]).save_pretrained(source)
+    path = shared.generate_adapter(source, recipe, tmp_path / "generated", seed=42)
+    pack = load_file(str(path / "adapter_model.safetensors"))
+    with torch.no_grad():
+        for index, (name, tensor) in enumerate(sorted(pack.items())):
+            tensor.copy_(torch.arange(tensor.numel(), dtype=tensor.dtype).reshape(tensor.shape) + 1000 * index)
+    save_file(pack, str(path / "adapter_model.safetensors"), metadata={"format": "pt"})
+    identity = shared.shared_adapter_identity(path, recipe)
+    records = {record["parameter"]: record for record in identity["generation"]["expert_parameters"]}
+    assert (records["up_proj"]["projections"], records["down_proj"]["projections"]) == (["w1"], ["w2"])
+
+    # The fixture's config.json, as the target reads it (synth_model._save_reduced_pretrained).
+    arctic = tmp_path / "arctic"
+    arctic.mkdir()
+    written = json.loads((source / "config.json").read_text())
+    (arctic / "config.json").write_text(json.dumps({**written, "layers_block_type": ["mamba", "moe", "attention"]}))
+    with torch.random.fork_rng(devices=[]):
+        model = apply_peft(
+            NemotronHForCausalLM(NemotronHConfig.from_pretrained(arctic)).float(), {**recipe, "task_type": "CAUSAL_LM"}
+        )
+    native_adapter.initialize_native_adapter(model, path, identity)
+    installed = native_adapter._adapter_parameters(model)
+    root = "base_model.model.model.layers"
+    pairs = {
+        f"{root}.1.mlp.experts.base_layer": f"{root}.1.mixer.experts.base_layer",  # w1: up_proj, innermost
+        f"{root}.1.mlp.experts": f"{root}.1.mixer.experts",  # w2: down_proj
+        f"{root}.1.mlp.shared_expert.up_proj": f"{root}.1.mixer.shared_experts.up_proj",
+        f"{root}.1.mlp.shared_expert.down_proj": f"{root}.1.mixer.shared_experts.down_proj",
+        **{f"{root}.2.self_attn.{p}_proj": f"{root}.2.mixer.{p}_proj" for p in "qkvo"},
+    }
+    expected = {
+        f"{ap}.{factor}.weight": f"{hf}.{factor}.weight" for ap, hf in pairs.items() for factor in ("lora_A", "lora_B")
+    }
+    assert sorted(installed) == sorted(expected)
+    for name, reference in expected.items():
+        torch.testing.assert_close(installed[name], pack[reference], rtol=0, atol=0)
+
+    # The target's LoRA gradients and optimizer states (no Mamba-2 parameter among them) pair with the reference's.
+    trained = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
+    target = {name: float(index) for index, name in enumerate(trained)}
+    reference = {
+        expected[name.replace(".default.", ".")].removesuffix(".weight") + ".default.weight": value
+        for name, value in target.items()
+    }
+    matched, only_target, only_reference = align(target, reference)
+    assert (len(matched), only_target, only_reference) == (len(target), [], [])
+    assert all(ap == ref for _, ap, ref in matched)
+    assert sorted(canonical_ap_tensor_groups(trained)) == sorted(optimizer_capture.normalize(n) for n in reference)
+    # Another family's decoder layer holds its attention and its MLP together: its LoRA keeps its names.
+    other = ["layers.0.self_attn.q_proj.lora_A.default.weight", "layers.0.mlp.experts.lora_A.default.weight"]
+    assert sorted(canonical_ap_tensor_groups(other)) == sorted(optimizer_capture.normalize(n) for n in other)
+
+
+def test_expert_parallel_lora_b_participation_widens_its_expert_columns():
+    name = "model.layers.0.mlp.experts.lora_B.default.weight"
+    evidence = {
+        "participation": {
+            "schema": optimizer_capture.PARTICIPATION_SCHEMA,
+            "parameters": {
+                name: {"shape": [8, 4], "state": "missing"},
+                "model.layers.0.mlp.experts.lora_A.default.weight": {"shape": [4, 16], "state": "missing"},
+            },
+        }
+    }
+    after = copy.deepcopy(evidence)
+    for entry in after["participation"]["parameters"].values():
+        entry["state"] = "active"
+    shapes = {key: value["shape"] for key, value in evidence["participation"]["parameters"].items()}
+    record, _ = optimizer_capture.merge_rank_participation(
+        [evidence, evidence], [after, after], shapes, {key: [0, 0] for key in shapes}
+    )
+    assert record["parameters"][name]["shape"] == [8, 8]
+    assert record["parameters"]["model.layers.0.mlp.experts.lora_A.default.weight"]["shape"] == [8, 16]
+
+
+def test_optimizer_norms_treat_a_fused_expert_lora_b_as_its_block_diagonal(tmp_path):
+    from arctic_platform.correctness.checks import optimizer_state
+
+    entries = {}
+    for name, value in (("w1", 1.0), ("w3", 2.0)):
+        entries[name] = tmp_path / f"{name}.pt"
+        torch.save({state: torch.full((2, 3), value) for state in optimizer_capture.STATE_KEYS}, entries[name])
+    group = optimizer_capture.CanonicalTensorGroup(("w1", "w3"), block_diagonal=True)
+    tensors = optimizer_state._load_norm_group(entries, group)
+    assert tensors["exp_avg"].shape == (4, 6)
+    assert float(tensors["exp_avg"].sum()) == 6.0 + 12.0
+
+
 @pytest.fixture
 def worker_adapter_transfer(generated_adapter_config, tmp_path, monkeypatch):
     from arctic_platform import common
@@ -13698,11 +15945,11 @@ def test_shared_adapter_autogenerated_runner_uses_one_real_pack_for_both_arms(
     generated = []
     payloads = []
 
-    def generate(model_path, config, destination, *, seed):
+    def generate(model_path, config, destination, *, seed, huggingface_loader):
         assert model_path == str(source.path)
-        assert config == source.config and seed == runner.SEED
+        assert config == source.config and seed == runner.SEED and huggingface_loader is True
         assert destination == tmp_path / "run" / "initial-adapter"
-        path = original_generate(model_path, config, destination, seed=seed)
+        path = original_generate(model_path, config, destination, seed=seed, huggingface_loader=huggingface_loader)
         generated.append(path)
         return path
 
@@ -13745,15 +15992,15 @@ def test_shared_adapter_generated_onboard_cache_reuses_exact_pack_and_refuses_mu
     from arctic_platform.correctness.onboarding import onboard
 
     source = generated_adapter_config
-    config = SimpleNamespace(training={"peft_config": copy.deepcopy(source.config)})
+    config = SimpleNamespace(training={"peft_config": copy.deepcopy(source.config)}, huggingface_loader=True)
     args = SimpleNamespace(peft_adapter=None)
     monkeypatch.setenv(storage.CORRECTNESS_TMPDIR_ENV, str(tmp_path / "onboard-cache"))
     original_generate = shared.generate_adapter
     generated = []
 
-    def generate(model_path, peft_config, destination, *, seed):
-        assert model_path == source.path and peft_config == source.config
-        path = original_generate(model_path, peft_config, destination, seed=seed)
+    def generate(model_path, peft_config, destination, *, seed, huggingface_loader):
+        assert model_path == source.path and peft_config == source.config and huggingface_loader is True
+        path = original_generate(model_path, peft_config, destination, seed=seed, huggingface_loader=True)
         generated.append(path)
         return path
 
@@ -17220,6 +19467,8 @@ def test_cortex_fixture_gradient_runner_loads_prepared_reference_and_routes_only
 
     monkeypatch.setattr(runner, "run_reference", lambda *a, **k: pytest.fail("regression must not run HF"))
     monkeypatch.setattr(reference_records, "load_record", reference)
+    # The receipt's fixture holds placeholder weight bytes: draw the batch over the whole vocabulary.
+    monkeypatch.setattr(runner, "trained_token_ids", lambda *a: None)
     monkeypatch.setattr(runner, "gateway", remote_gateway)
     monkeypatch.setattr(runner, "running_job", remote_job)
     monkeypatch.setattr(runner, "fwd_bwd_step", lambda *a, **k: {})
@@ -18639,6 +20888,59 @@ def test_bounded_step_new_counter_advances_once_and_manifest_is_published_last(
     assert steps == [1.0] * 5
     assert json.loads(artifact.manifest_path.read_text())["step"] == 1
     assert not (_optimizer_reference_fast_output / ".manifest.json.tmp").exists()
+
+
+@pytest.mark.parametrize("master", ["float32", "bfloat16"])
+@pytest.mark.parametrize("clipping", [None, 0.35])
+@pytest.mark.parametrize("consume", [False, True])
+def test_bounded_step_steps_a_parameter_over_the_slice_limit_in_slices_with_the_whole_step_artifacts(
+    monkeypatch, _optimizer_reference_fast_output, master, clipping, consume
+):
+    model = _BoundedStepModel(torch.bfloat16)
+    gradients = _bounded_step_gradients(model)
+    expected_norm, expected_manifest, expected = _bounded_step_whole_parameter_oracle(
+        model, gradients, master_dtype=getattr(torch, master), clipping=clipping
+    )
+    original_build = optimizer_step.build_adamw
+    stepped = []
+
+    def build(named_masters, config, *, learning_rate):
+        name, master_slice = named_masters[0]
+        assert master_slice.dtype == getattr(torch, master)
+        stepped.append((name, tuple(master_slice.shape)))
+        return original_build(named_masters, config, learning_rate=learning_rate)
+
+    monkeypatch.setattr(optimizer_step, "build_adamw", build)
+    # The 5 x 3 weight steps as whole rows, two at a time; the parameters within the limit step whole.
+    monkeypatch.setattr(optimizer_step, "STEP_SLICE_ELEMENTS", 6)
+    artifact = run_adamw_step(
+        model,
+        gradients,
+        copy.deepcopy(_BOUNDED_STEP_CONFIG),
+        learning_rate=_BOUNDED_STEP_LR,
+        gradient_clipping=clipping,
+        optimizer_dtype=master,
+        output_dir=_optimizer_reference_fast_output,
+        consume_gradients=consume,
+    )
+    assert stepped == [
+        ("weight", (2, 3)),
+        ("weight", (2, 3)),
+        ("weight", (1, 3)),
+        ("bias", (3,)),
+        ("scalar", ()),
+        ("norm.weight", (3,)),
+        ("norm.bias", (3,)),
+    ]
+    assert artifact.gradient_norm_before_clip == expected_norm
+    assert json.loads(artifact.manifest_path.read_text()) == expected_manifest
+    for entry in expected_manifest["parameters"]:
+        actual = torch.load(artifact.manifest_path.parent / entry["file"], weights_only=True)
+        assert actual.keys() == expected[entry["name"]].keys()
+        for key, value in actual.items():
+            target = expected[entry["name"]][key]
+            assert (value.dtype, value.shape, value.stride()) == (target.dtype, target.shape, target.stride())
+            assert torch.equal(value, target), (entry["name"], key)
 
 
 # Consuming reference gradients after complete global clipping preflight.
@@ -20108,6 +22410,98 @@ def test_onboarding_renderer_reads_nested_prime_rl_chunk_size(tmp_path: Path) ->
     assert "lm_head_token_chunk_size=8192" in rendered
 
 
+def test_reference_builds_the_huggingface_loader_class_of_a_composite_qwen35_checkpoint(tmp_path: Path) -> None:
+    """DSS's huggingface route trains Qwen3.5 as AutoModelForCausalLM's text-only class; so does the reference."""
+    import torch
+    from transformers import Qwen3_5Config
+    from transformers import Qwen3_5ForConditionalGeneration
+
+    from arctic_platform.correctness.harness.optimizer import normalize
+    from arctic_platform.correctness.reference.hf_single_gpu import build_engine
+
+    text = {
+        "vocab_size": 64,
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 8,
+        "layer_types": ["linear_attention", "full_attention"],
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 2,
+        "linear_key_head_dim": 8,
+        "linear_value_head_dim": 8,
+        "tie_word_embeddings": True,
+    }
+    vision = {
+        "depth": 1,
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_heads": 2,
+        "out_hidden_size": 16,
+        "patch_size": 2,
+        "temporal_patch_size": 1,
+        "spatial_merge_size": 1,
+        "num_position_embeddings": 16,
+    }
+    config = Qwen3_5Config(text_config=text, vision_config=vision, tie_word_embeddings=True)
+    config.architectures = ["Qwen3_5ForConditionalGeneration"]
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        Qwen3_5ForConditionalGeneration(config).save_pretrained(tmp_path / "qwen35")
+    precision = torch.get_float32_matmul_precision()
+    try:
+        composite, causal = (
+            build_engine(str(tmp_path / "qwen35"), device="cpu", huggingface_loader=loader) for loader in (False, True)
+        )
+    finally:
+        torch.set_float32_matmul_precision(precision)
+
+    def trainable(engine):
+        parameters = engine.model.named_parameters()
+        return {normalize(name): parameter for name, parameter in parameters if parameter.requires_grad}
+
+    assert type(composite.model).__name__ == "Qwen3_5ForConditionalGeneration"
+    assert type(causal.model).__name__ == "Qwen3_5ForCausalLM"
+    vision_names = {name for name in trainable(composite) if name.startswith("visual.")}
+    assert vision_names and not any(name.startswith("visual.") for name in trainable(causal))
+    assert set(trainable(causal)) == set(trainable(composite)) - vision_names
+    assert all(torch.equal(parameter, trainable(composite)[name]) for name, parameter in trainable(causal).items())
+    # The shared LoRA factors are named for the same class, so the reference and the target both install them.
+    from safetensors.torch import load_file
+
+    from arctic_platform.correctness.harness.lora import generate_adapter
+
+    peft_config = {"peft_type": "LORA", "r": 2, "lora_alpha": 2, "target_modules": ["q_proj", "o_proj"]}
+    adapter = generate_adapter(tmp_path / "qwen35", peft_config, tmp_path / "adapter", huggingface_loader=True)
+    names = set(load_file(str(adapter / "adapter_model.safetensors")))
+    assert names and all(name.startswith("base_model.model.model.layers.") for name in names)
+    try:
+        lora = build_engine(
+            str(tmp_path / "qwen35"),
+            device="cpu",
+            peft_config=peft_config,
+            peft_adapter_path=str(adapter),
+            huggingface_loader=True,
+        )
+    finally:
+        torch.set_float32_matmul_precision(precision)
+    assert {name for name, parameter in lora.model.named_parameters() if parameter.requires_grad} == {
+        name.removesuffix(".weight") + ".default.weight" for name in names
+    }
+    cfg = LoadedConfig(config_id="x", path=Path("x"), sub_job={"training_config": {"n_gpus": 8}})
+    assert cfg.huggingface_loader
+    cfg.sub_job["training_config"]["ep_size"] = 1
+    assert cfg.huggingface_loader
+    cfg.sub_job["training_config"]["ep_size"] = 8
+    assert not cfg.huggingface_loader
+
+
+def test_onboarding_renderer_passes_the_target_loader_to_reference(tmp_path: Path) -> None:
+    assert "huggingface_loader=True" in _onboarding_render_config(tmp_path, None)
+
+
 def test_onboarding_renderer_passes_peft_config_to_reference(tmp_path: Path) -> None:
     rendered = _onboarding_render_config(
         tmp_path, None, {"peft_type": "Lora", "r": 32, "target_modules": ["q_proj", "v_proj"]}
@@ -20457,6 +22851,38 @@ def test_onboarding_block_period_accepts_trailing_partial_block(layer_types, exp
     assert synth_model.detect_block_period(layer_types) == expected
 
 
+def test_onboarding_reduce_config_keeps_gemma4_per_layer_head_shapes(monkeypatch, tmp_path: Path) -> None:
+    """Gemma 4's full-attention head_dim and KV heads are per-layer attributes in Transformers 5.20."""
+    from transformers import Gemma4Config
+
+    pattern = ["sliding_attention"] * 5 + ["full_attention"]
+    config = Gemma4Config(
+        text_config={
+            "num_hidden_layers": 12,
+            "layer_types": pattern * 2,
+            "head_dim": 256,
+            "global_head_dim": 512,
+            "num_key_value_heads": 16,
+            "num_global_key_value_heads": 4,
+            "attention_k_eq_v": True,
+        },
+        vision_config={"num_hidden_layers": 2},
+    )
+    with pytest.raises(Exception, match="'head_dim' is a per-layer attribute"):
+        config.text_config.head_dim
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: config)
+
+    reduced, original, period = synth_model.reduce_config("unused", 6)
+
+    text = reduced.text_config
+    assert (original, period, text.num_hidden_layers, text.layer_types) == (12, 6, 6, pattern)
+    shapes = [(layer.head_dim, layer.num_key_value_heads) for layer in text.per_layer_config]
+    assert shapes == [(256, 16)] * 5 + [(512, 4)]
+    reduced.save_pretrained(tmp_path)
+    reloaded = Gemma4Config.from_pretrained(tmp_path).text_config
+    assert [(layer.head_dim, layer.num_key_value_heads) for layer in reloaded.per_layer_config] == shapes
+
+
 def test_onboarding_reduce_config_keeps_complete_block_from_partial_source(monkeypatch) -> None:
     text = SimpleNamespace(
         num_hidden_layers=45,
@@ -20491,6 +22917,97 @@ def test_onboarding_reduce_config_still_rejects_partial_selected_block(monkeypat
         synth_model.reduce_config("unused", layers)
     assert text.num_hidden_layers == 45
     assert len(text.layer_types) == 45
+
+
+def test_onboarding_reduce_config_keeps_every_type_of_a_pattern_without_blocks(monkeypatch) -> None:
+    """Nemotron-H's hybrid pattern repeats no block; its "period" 48 is its first four types recurring at the end."""
+    names = {"M": "linear_attention", "E": "moe", "*": "full_attention"}
+    pattern = [names[c] for c in "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"]
+    assert (len(pattern), synth_model.detect_block_period(pattern)) == (52, 48)
+
+    def source(*args, **kwargs):
+        return SimpleNamespace(num_hidden_layers=52, layer_types=list(pattern))
+
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", source)
+    reduced, original, period = synth_model.reduce_config("unused", 6)
+    assert (reduced.num_hidden_layers, reduced.layer_types, original) == (6, pattern[:6], 52)
+    assert MODULE._model_shape("unused") == (52, 48, 6)
+    with pytest.raises(ValueError, match="num_layers=4 keeps no full_attention layer"):
+        synth_model.reduce_config("unused", 4)
+
+
+def test_onboarding_fp8_fixture_decodes_a_partial_block_on_the_declared_grid() -> None:
+    """GLM-5.3's kv_a_proj_with_mqa is 576 rows of 128 x 128 blocks: five scale rows, the last block partial."""
+    from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+
+    generator = torch.Generator().manual_seed(0)
+    weight = torch.randn(576, 256, generator=generator).to(torch.float8_e4m3fn)
+    scales = torch.rand(5, 2, generator=generator) + 0.5
+    expected = (weight.float() * scales.repeat_interleave(128, 0)[:576].repeat_interleave(128, 1)).to(torch.bfloat16)
+    decoder = Fp8Dequantize(None)
+    with pytest.raises(ValueError, match=r"Weight shape \(576, 256\) not divisible by scale grid \(5, 2\)"):
+        decoder._dequantize_one(weight, scales, output_dtype=torch.bfloat16)
+    with synth_model._fp8_partial_blocks_on_declared_grid([128, 128]):
+        decoded = decoder._dequantize_one(weight, scales, output_dtype=torch.bfloat16)
+        # Transformers' loader hands the op the codes already cast to the load dtype.
+        cast = decoder._dequantize_one(weight.to(torch.bfloat16), scales, output_dtype=torch.bfloat16)
+        whole = decoder._dequantize_one(weight[:512], scales[:4], output_dtype=torch.bfloat16)
+    assert decoded.dtype == torch.bfloat16 and torch.equal(decoded, expected) and torch.equal(cast, expected)
+    assert torch.equal(whole, expected[:512])
+    with pytest.raises(ValueError, match="not divisible by scale grid"):
+        decoder._dequantize_one(weight, scales, output_dtype=torch.bfloat16)
+
+
+def test_onboarding_reduced_nemotron_h_config_is_read_by_both_engines(monkeypatch, tmp_path: Path) -> None:
+    """Nemotron-3-Nano's remote config gives way to the Transformers class; the fixture keeps the checkpoint names."""
+    from arctic_platform.model.implementations.nemotron_h.configuration_nemotron_h import (
+        NemotronHConfig as ArcticNemotronHConfig,
+    )
+    from arctic_platform.model.implementations.nemotron_h.modeling_nemotron_h import BLOCK_TYPE_MAP
+
+    pattern = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+    source = tmp_path / "source"
+    source.mkdir()
+    remote = {
+        "architectures": ["NemotronHForCausalLM"],
+        "auto_map": {"AutoConfig": "configuration_nemotron_h.NemotronHConfig"},
+        "model_type": "nemotron_h",
+        "num_hidden_layers": 52,
+        "hybrid_override_pattern": pattern,
+        "hidden_size": 64,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "mamba_num_heads": 4,
+        "mamba_head_dim": 16,
+        "n_groups": 2,
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 2,
+        "vocab_size": 128,
+    }
+    (source / "config.json").write_text(json.dumps(remote))
+    # The checkpoint's configuration_nemotron_h.py: its layer list is a property over the 52-character pattern.
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: SimpleNamespace(**remote))
+
+    reduced, original, _ = synth_model.reduce_config(str(source), 6)
+    assert isinstance(reduced, transformers.NemotronHConfig) and not hasattr(reduced, "auto_map")
+    kept = ["linear_attention", "moe", "linear_attention", "moe", "linear_attention", "full_attention"]
+    assert (original, reduced.layers_block_type) == (52, kept)
+    assert MODULE._model_shape(str(source)) == (52, 48, 6)
+
+    fixture = tmp_path / "fixture"
+
+    def save(path, **kwargs):
+        reduced.save_pretrained(path)
+
+    synth_model._save_reduced_pretrained(SimpleNamespace(generation_config=None, save_pretrained=save), fixture)
+    written = json.loads((fixture / "config.json").read_text())
+    assert "auto_map" not in written and written["num_hidden_layers"] == 6
+    assert written["layers_block_type"] == ["mamba", "moe", "mamba", "moe", "mamba", "attention"]
+    target = ArcticNemotronHConfig.from_pretrained(fixture)
+    assert target.layers_block_type == written["layers_block_type"]
+    assert set(target.layers_block_type) <= set(BLOCK_TYPE_MAP)
+    assert transformers.NemotronHConfig.from_pretrained(fixture).layers_block_type == kept
 
 
 def test_onboarding_model_shape_accepts_source_ending_mid_block(monkeypatch) -> None:
@@ -21007,6 +23524,7 @@ def test_onboarding_storage_optimizer_calibration_allocates_fresh_root_and_clean
         reference_attention_implementation="sdpa",
         lm_head_token_chunk_size=None,
         optimizer_dtype="fp32",
+        huggingface_loader=True,
     )
     spec = SimpleNamespace(
         config_checksum="checksum",
@@ -21058,6 +23576,7 @@ def test_onboarding_storage_optimizer_calibration_allocates_fresh_root_and_clean
 
     def reference(*positional, **kwargs):
         assert kwargs["attn"] == "sdpa"
+        assert kwargs["huggingface_loader"] is True
         destination = kwargs["optimizer_output_dir"]
         assert destination.parent.parent in created
         if fail_reference:
@@ -22967,6 +25486,35 @@ def test_driver_reviewed_training_preserves_explicit_format_without_mutating_pay
     assert payload == before
 
 
+@pytest.mark.parametrize("backend", ["cortex", "onprem"])
+def test_driver_reviewed_training_batch_stays_rows_per_step_not_the_deepspeed_batch(tmp_path, backend):
+    """qwen3-1.7b's catalog file trains 32 rows per step on 8 GPUs; DSS builds DeepSpeed's batch as micro x GAS x DP."""
+    from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
+    from arctic_platform.common.deepspeed_engine import build_deepspeed_config
+
+    training = {
+        "n_gpus": 8,
+        "sp_size": 2,
+        "train_batch_size": 32,
+        "ds_config": {"zero_optimization": {"stage": 1}, "bf16": {"enabled": True}},
+    }
+    payload = build_payload(training, "model", 42)
+    if backend == "cortex":
+        session = GatewaySession(tmp_path, 8, CortexConfig(base_url="http://unused"))
+        sub = ap_driver._training_client_config(session, payload).to_cortex()[-1]["training_config"]
+        assert sub["train_batch_size"] == 32
+        ds_config = sub["ds_config"]
+    else:
+        job = _training_client_config(SimpleNamespace(workdir=tmp_path), payload).to_onprem("training")
+        assert "train_batch_size" not in job.get("ds_worker_config", {})
+        ds_config = job["ds_config"]
+    assert "train_batch_size" not in ds_config
+    # The target's own DeepSpeed config (dss jobs/gpu/training.py _build_ds_config): 1 x 1 x (8 // 2).
+    resolved = build_deepspeed_config(TrainingEngineSpec(world_size=8, sequence_parallel=2, ds_overrides=ds_config))
+    assert resolved["train_batch_size"] == 4
+    assert payload["training_config"]["train_batch_size"] == 32
+
+
 def test_driver_reviewed_rejects_unsupported_format_before_gateway_runtime(monkeypatch):
     cfg = load_config(_driver_reviewed_config)
     payload = deepcopy(cfg.sub_job)
@@ -23118,6 +25666,7 @@ _SELFTEST_FIXTURES = (
     "dense_allocation_runner_case",
     "adapter_pack",
     "generated_adapter_config",
+    "expert_lora_pack",
     "worker_adapter_transfer",
     "native_original_adapter",
     "gateway_optional_adapter_control",
@@ -23207,6 +25756,8 @@ _SELFTEST_GROUPS = {
         "test_flash_recipe_glm_rejects_generic_h200_attention",
         "test_participation_requires_complete_matching_inventory_and_independent_inactivity",
         "test_participation_observes_autograd_and_integer_outputs_without_inventing_zero_gradients",
+        "test_participation_gemma_image_modules_are_inactive_only_when_a_text_step_never_calls_them",
+        "test_participation_composite_decoder_excuses_only_its_uncalled_vision_tower",
         "test_config_tolerance_calibrated_gate_rounds_up_and_has_a_one_millithreshold_floor",
         "test_names_qwen35_moe_norms_align_across_fused_and_prime_layouts",
         "test_names_equal_checkpoint_aliases_collapse_without_losing_coverage",
@@ -23448,6 +25999,7 @@ _SELFTEST_GROUPS = {
         "test_cortex_optimizer_capture_runner_public_cortex_capture_keeps_fixture_budget_gradient_and_cleanup",
         "test_cortex_optimizer_capture_runner_onprem_preserves_local_optimizer_capture",
         "test_cortex_optimizer_decode_decode_named_fp32_update_moments_and_padding",
+        "test_cortex_optimizer_decode_names_the_parameters_node_shards_hold",
         "test_cortex_optimizer_decode_decode_uses_actual_state_step_and_group_lr_not_legacy_or_config_defaults",
         "test_cortex_optimizer_decode_decode_rejects_invalid_optimizer_schema",
         "test_cortex_optimizer_decode_decode_requires_exactly_one_engine_step",
@@ -23716,6 +26268,7 @@ _SELFTEST_GROUPS = {
         "test_gradient_calibration_requires_distinct_frozen_arms",
         "test_onboarding_renderer_gate_metadata_uses_the_computed_safety_factor",
         "test_onboarding_block_period_accepts_trailing_partial_block",
+        "test_onboarding_reduce_config_keeps_gemma4_per_layer_head_shapes",
         "test_onboarding_reduce_config_keeps_complete_block_from_partial_source",
         "test_onboarding_reduce_config_still_rejects_partial_selected_block",
         "test_onboarding_model_shape_accepts_source_ending_mid_block",
@@ -25888,6 +28441,24 @@ def test_e2e_sft_train_validate_reference_fused_cross_entropy_matches_product_se
     assert cfg({"model_provider": "huggingface"}).fused_cross_entropy is False
 
 
+def test_e2e_sft_train_validate_reference_fused_cross_entropy_reads_the_arctic_provider_model_options(
+    tmp_path,
+) -> None:
+    from arctic_platform.correctness.harness.config import LoadedConfig
+
+    def cfg(training):
+        training = {"model_provider": "arctic", **training}
+        return LoadedConfig(
+            "example", tmp_path / "example.config", {"model_name": "example", "training_config": training}
+        )
+
+    # DSS's spellings of the MoE loaders' setting: the prime_rl block entry and its model_options alias.
+    assert cfg({}).fused_cross_entropy == "liger"
+    assert cfg({"prime_rl": {"fused_cross_entropy": False}}).fused_cross_entropy is False
+    assert cfg({"model_options": {"lm_head": {"cross_entropy": False}}}).fused_cross_entropy is False
+    assert cfg({"model_options": {"lm_head.cross_entropy": True}}).fused_cross_entropy is True
+
+
 @pytest.mark.parametrize("name", ["AdamW", "FusedAdam", "torch_adamw"])
 def test_e2e_sft_train_validate_reference_uses_independent_unfused_pytorch_adamw(
     name,
@@ -26431,6 +29002,47 @@ def test_inference_checkpoint_loss_forward_request_asks_for_per_token_logprobs()
     body = inference_rl_check.pack_logit_aligned(batch)
     assert body["processing"]["return_logprobs"] is True
     assert body["meta"]["labels_are_shifted"] is True
+
+
+@pytest.mark.parametrize(
+    ("provider", "prediction_aligned"), [("arctic", True), ("prime_rl", True), ("huggingface", False)]
+)
+def test_sft_request_labels_follow_the_convention_of_the_providers_dispatch(provider, prediction_aligned) -> None:
+    # DSS forwards an "arctic" (formerly "prime_rl") request's labels unshifted and shifts the others at dispatch.
+    batch = batches.build_synthetic_batch("small", 2, 32, 128)
+    body = ap_driver.pack(batch, model_provider=provider)
+    expected = batch.shifted_labels() if prediction_aligned else batch.labels
+    assert torch.equal(body["batch"]["labels"], expected)
+    assert body["meta"] == ({"labels_are_shifted": True} if prediction_aligned else {})
+
+
+def test_sft_request_without_a_model_loss_head_asks_dss_for_the_logprob_loss() -> None:
+    from arctic_platform.correctness.harness.config import sft_loss_from_logprobs
+
+    unfused = {"model_provider": "arctic", "model_options": {"lm_head": {"cross_entropy": False}}}
+    assert sft_loss_from_logprobs(unfused)
+    assert not sft_loss_from_logprobs({"model_provider": "arctic"})
+    assert not sft_loss_from_logprobs({"model_provider": "huggingface"})
+    batch = batches.build_synthetic_batch("small", 2, 32, 128)
+    lowered = ap_driver.cortex_training_body(ap_driver.pack(batch, model_provider="arctic"), loss_from_logprobs=True)
+    assert lowered["processing"] == {"loss_fn": "causal_cross_entropy", "post": ["compute_logprobs"], "config": {}}
+    assert "labels" not in lowered["kwargs"]
+    assert torch.equal(lowered["context"]["input_ids"], batch.input_ids)
+    assert torch.equal(lowered["context"]["loss_mask"], (batch.shifted_labels() != -100).float())
+
+
+def test_reduced_fixture_config_declares_no_prediction_layers() -> None:
+    text = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        mtp_num_hidden_layers=1,
+        mtp={"hybrid": True, "num_hidden_layers": 1, "layer_types": ["full_attention"]},
+    )
+    synth_model.drop_prediction_layers(text)
+    assert text.mtp_num_hidden_layers == 0
+    assert text.mtp == {"hybrid": True, "num_hidden_layers": 0, "layer_types": []}
+    glm = SimpleNamespace(model_type="glm5_next_text", num_nextn_predict_layers=1)
+    synth_model.drop_prediction_layers(glm)
+    assert glm.num_nextn_predict_layers == 0
 
 
 def test_inference_checkpoint_loss_forward_request_attends_to_prompts_and_masks_only_padding() -> None:
@@ -28093,6 +30705,53 @@ def test_remaining_selected_later_float32_regression_reaches_spec_without_first_
     assert execution._run_configs(args, executor=forbidden) == 0
     assert calls == ["spec"]
     assert _remaining_selected_later_identity(config) == before
+
+
+def test_gateway_runtime_admits_ranks_in_the_zone_servers_order(monkeypatch, tmp_path):
+    # A hostfile whose peers are not in host order: the zone server ranks the head first, then the peers by host.
+    from arctic_platform.correctness.harness import engine_admission
+
+    hosts = ["10.4.171.69", "10.4.165.36", "10.4.162.78", "10.4.163.67"]
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("".join(f"{host} slots=8\n" for host in hosts))
+    receipt = {"host": "node", "boot_id": "b", "python": "p", "python_sha256": "s", "sources": {}}
+    allocation = {
+        "nodes": [{"host": host, "slots": 8} for host in hosts],
+        "hostfile_sha256": hashlib.sha256(hostfile.read_bytes()).hexdigest(),
+        "runtime_receipts": {host: receipt for host in hosts},
+        "ssh": {},
+    }
+    monkeypatch.setenv(engine_admission.RUNTIME_ADMISSION_ENV, json.dumps(allocation))
+    training = SimpleNamespace(sp=SimpleNamespace(sp_size_of=lambda training_config: 1))
+    monkeypatch.setitem(sys.modules, "dss.ray_dss.jobs.gpu", SimpleNamespace(training=training))
+    stage_info = SimpleNamespace(strip_stage_info_from_job_config=lambda config: config)
+    monkeypatch.setitem(sys.modules, "dss.ray_dss.stage_info", stage_info)
+    monkeypatch.setattr(engine_admission, "runtime_request_from_config", lambda cfg: None)
+    monkeypatch.setattr(engine_admission, "_final_engine_payload", lambda cfg: {})
+    receipts = {host: dict(receipt) for host in hosts}
+    monkeypatch.setattr(engine_admission, "_allocation_runtime_receipts", lambda request, path, ssh: receipts)
+    nodes = [SimpleNamespace(host=host, gpu_ids=list(range(8)), is_head=i == 0) for i, host in enumerate(hosts)]
+    zone = SimpleNamespace(zone_id="zone", nodes=nodes)
+    config = SimpleNamespace(
+        job_id="child",
+        num_gpus=32,
+        training_config=SimpleNamespace(debug={}),
+        to_engine_dict=lambda job_id: {"training_config": {}},
+    )
+
+    async def original(zone, config, job_id):
+        return "created"
+
+    service = SimpleNamespace(_create_job_v0=original)
+
+    async def create():
+        with engine_admission.gateway_runtime_scope(service, hostfile):
+            assert await service._create_job_v0(zone, config, "child") == "created"
+
+    asyncio.run(create())
+    admitted = config.training_config.debug[engine_admission.RUNTIME_ADMISSION_KEY]["ranks"]
+    order = ["10.4.171.69", "10.4.162.78", "10.4.163.67", "10.4.165.36"]
+    assert admitted == [(host, gpu) for host in order for gpu in range(8)]
 
 
 @pytest.mark.parametrize("debug", [None, {}, {"correctness_first_two": False}])

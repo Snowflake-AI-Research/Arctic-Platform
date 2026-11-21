@@ -576,7 +576,7 @@ async def test_gateway_runtime_scope_loads_stage_info_only_for_admitted_training
         return "created"
 
     service = SimpleNamespace(_create_job_v0=original)
-    zone = SimpleNamespace(nodes=[SimpleNamespace(host="worker", gpu_ids=[0])], zone_id="zone")
+    zone = SimpleNamespace(nodes=[SimpleNamespace(host="worker", gpu_ids=[0], is_head=True)], zone_id="zone")
     with engine_admission.gateway_runtime_scope(service, hostfile):
         assert await service._create_job_v0(zone, config, "child") == "created"
     assert stripped == calls == [config]
