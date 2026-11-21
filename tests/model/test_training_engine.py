@@ -42,13 +42,13 @@ def _spec(**kwargs) -> TrainingEngineSpec:
     return TrainingEngineSpec(**kwargs)
 
 
-def test_bfloat16_job_reduces_gradients_in_float32_with_bf16_masters():
+def test_bfloat16_job_defaults_to_float32_masters_and_states():
     ds_config = build_deepspeed_config(_spec())
 
     assert ds_config["bf16"] == {
         "enabled": True,
-        "bf16_master_weights_and_grads": True,
-        "bf16_optimizer_states": True,
+        "bf16_master_weights_and_grads": False,
+        "bf16_optimizer_states": False,
     }
     assert ds_config["fp16"] == {"enabled": False}
     assert ds_config["communication_data_type"] == "fp32"
@@ -69,12 +69,13 @@ def test_float32_job_disables_reduced_precision_and_leaves_the_reduction_unset()
     assert ds_config["communication_data_type"] is None
 
 
-def test_fp32_masters_disable_bf16_master_weights():
-    ds_config = build_deepspeed_config(_spec(fp32_masters=True))
+@pytest.mark.parametrize("fp32_masters", [True, False])
+def test_explicit_master_precision_is_preserved(fp32_masters):
+    ds_config = build_deepspeed_config(_spec(fp32_masters=fp32_masters))
 
     assert ds_config["bf16"]["enabled"] is True
-    assert ds_config["bf16"]["bf16_master_weights_and_grads"] is False
-    assert ds_config["bf16"]["bf16_optimizer_states"] is False
+    assert ds_config["bf16"]["bf16_master_weights_and_grads"] is (not fp32_masters)
+    assert ds_config["bf16"]["bf16_optimizer_states"] is (not fp32_masters)
 
 
 def test_sequence_parallel_shrinks_the_data_parallel_batch():

@@ -83,6 +83,10 @@ at save).
 | `sleep_training` / `wake_training` | training | Offload / reload |
 | `sleep_log_prob` / `wake_log_prob` | log_prob | Sleep / wake |
 
+`TrainingEngineSpec` defaults to FP32 master weights and optimizer states for BF16 models.
+Explicit `fp32_masters=False` retains BF16 masters and states; `ds_overrides` retains its existing precedence.
+The FP32 default increases optimizer memory use without changing the model dtype.
+
 ## DeepSpeed worker
 
 `DeepSpeedWorker` is a single-GPU Ray actor
