@@ -198,3 +198,96 @@ def test_sonic_routed_experts_carry_peft_expert_lora():
     assert rel(sonic_out, grouped_out) < 1e-2
     for got, want in zip(sonic_grads, grouped_grads):
         assert rel(got, want) < 2e-2
+
+
+def _relu2_reference(x, idx, scores, w1, w2):
+    """FP32 sum over each token's local experts of score * down(relu(up(x))^2) (Nemotron-H's non-gated experts)."""
+    out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+    xf = x.float()
+    for k in range(idx.shape[1]):
+        for e in idx[:, k].unique().tolist():
+            if e < 0:
+                continue
+            rows = idx[:, k] == e
+            h = torch.relu(xf[rows] @ w1[e].float().T).square()
+            out[rows] += scores[rows, k, None].float() * (h @ w2[e].float().T)
+    return out
+
+
+def test_sonic_relu2_experts_match_fp32_reference():
+    _require_sonicmoe()
+    from arctic_platform.model.implementations.kernels.sonic_experts import sonic_relu2_experts_applicable
+    from arctic_platform.model.implementations.moe.layers.moe import NonGatedGroupedExperts
+
+    torch.manual_seed(0)
+    tokens, topk, experts, hidden, inter = 3000, 6, 8, 512, 384
+    module = NonGatedGroupedExperts(hidden, inter, experts, use_grouped_mm=True).cuda().bfloat16()
+    with torch.no_grad():
+        for w in (module.w1, module.w2):
+            w.normal_(std=0.05)
+    assert sonic_relu2_experts_applicable(module)
+    idx = torch.randint(0, experts, (tokens, topk), device="cuda")
+    idx = torch.where(torch.rand(tokens, topk, device="cuda") < 0.3, -1, idx)
+    idx[0] = -1  # a token with no local expert
+    scores = torch.rand(tokens, topk, device="cuda").requires_grad_(True)
+    x = torch.randn(tokens, hidden, device="cuda").bfloat16().requires_grad_(True)
+    dy = torch.randn(tokens, hidden, device="cuda").bfloat16()
+
+    out = module(x, None, scores, expert_indices=idx)
+    got = torch.autograd.grad(out, (x, scores, module.w1, module.w2), dy)
+
+    ref_w = [w.detach().float().requires_grad_(True) for w in (module.w1, module.w2)]
+    xr = x.detach().float().requires_grad_(True)
+    sr = scores.detach().clone().requires_grad_(True)
+    ref = _relu2_reference(xr, idx, sr, *ref_w)
+    want = torch.autograd.grad(ref, (xr, sr, *ref_w), dy.float())
+
+    def rel(a, b):
+        return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+    assert rel(out, ref) < 1e-2
+    assert torch.all(out[0] == 0)
+    assert rel(got[0], want[0]) < 1e-2
+    assert rel(got[1][idx >= 0], want[1][idx >= 0]) < 1e-2
+    for g, w in zip(got[2:], want[2:]):
+        assert rel(g, w) < 2e-2
+
+
+class _SpareCopies:
+    """Stands in for the online replicas' _ReplicaCall: spare slots holding copies of the first experts."""
+
+    def __init__(self, spares):
+        self.spares = spares
+
+    def extend(self, *weights):
+        return tuple(torch.cat([w, w[: self.spares]], dim=0) for w in weights)
+
+
+def test_relu2_experts_route_spare_slots_to_their_owners_weights():
+    """Rows sent to a spare slot see the copied expert's weights, on the SonicMoE path."""
+    _require_sonicmoe()
+    from arctic_platform.model.implementations.moe.layers.moe import NonGatedGroupedExperts
+
+    torch.manual_seed(0)
+    tokens, topk, experts, spares, hidden, inter = 1500, 2, 4, 2, 256, 384
+    module = NonGatedGroupedExperts(hidden, inter, experts, use_grouped_mm=True)
+    module.set_ep_comm_backend("deepep")
+    module = module.cuda().bfloat16()
+    with torch.no_grad():
+        for w in (module.w1, module.w2):
+            w.normal_(std=0.05)
+    idx = torch.randint(0, experts, (tokens, topk), device="cuda")
+    on_spare = torch.where(idx < spares, idx + experts, idx)  # experts 0, 1 served by their spare copies 4, 5
+    scores = torch.rand(tokens, topk, device="cuda")
+    x = torch.randn(tokens, hidden, device="cuda").bfloat16()
+
+    def run(indices, replicas):
+        module._arl_replica_call = replicas
+        try:
+            return module(x, None, scores, expert_indices=indices)
+        finally:
+            module._arl_replica_call = None
+
+    torch.testing.assert_close(
+        run(on_spare, _SpareCopies(spares)).float(), run(idx, None).float(), rtol=2e-2, atol=2e-3
+    )

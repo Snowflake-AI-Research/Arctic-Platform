@@ -77,3 +77,33 @@ def test_pack_fused_expert_loras_noop_without_experts():
     model = SimpleNamespace(loras={"model.layers.0.self_attn.o_proj": object()})
     assert pack(model) == 0
     assert list(model.loras) == ["model.layers.0.self_attn.o_proj"]
+
+
+def _stacked_lora(torch, name, num_experts, rank, in_dim, out_dim):
+    from vllm.lora.lora_weights import LoRALayerWeights
+
+    return LoRALayerWeights(
+        name,
+        rank,
+        16,
+        torch.ones(num_experts, rank, in_dim),
+        torch.ones(num_experts, out_dim, rank),
+    )
+
+
+def test_pack_fused_expert_loras_non_gated_reuses_w1_for_the_third_slot():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("vllm")
+
+    pack = _pack_fused_expert_loras()
+    num_experts, rank, hidden, intermediate = 4, 8, 16, 32
+    up = _stacked_lora(torch, "model.layers.1.mlp.experts.w1", num_experts, rank, hidden, intermediate)
+    down = _stacked_lora(torch, "model.layers.1.mlp.experts.w2", num_experts, rank, intermediate, hidden)
+    model = SimpleNamespace(loras={up.module_name: up, down.module_name: down})
+
+    assert pack(model, non_gated=True) == 1
+    packed = model.loras["model.layers.1.mlp.experts"]
+    assert list(model.loras) == ["model.layers.1.mlp.experts"]
+    assert packed.lora_a[0] is up.lora_a and packed.lora_b[0] is up.lora_b
+    assert packed.lora_a[1] is down.lora_a and packed.lora_b[1] is down.lora_b
+    assert packed.lora_a[2] is up.lora_a

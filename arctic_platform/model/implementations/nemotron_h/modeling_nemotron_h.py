@@ -6,6 +6,7 @@ Hybrid Mamba-Transformer-MoE architecture with three distinct layer types:
 - Attention layers (using shared FlashAttention/SDPA from prime-rl)
 """
 
+import re
 from typing import Optional
 
 import torch
@@ -18,7 +19,12 @@ from transformers.utils import auto_docstring, logging
 
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.layers.attn import ATTN_IMPL2CLASS, AttentionConfig
+from arctic_platform.model.implementations.gpu.core_replay import keep_core
+from arctic_platform.model.implementations.layers.cp_mamba import fused_mamba_available
+from arctic_platform.model.implementations.layers.cp_mamba import fused_mamba_mixer
 from arctic_platform.model.implementations.layers.cp_mamba import mamba_cp_forward
+from arctic_platform.model.implementations.layers.cp_mamba import mamba_cp_forward_fused
+from arctic_platform.model.implementations.layers.cp_mamba import packed_seq_idx
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
 from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, NemotronHRouter, NonGatedGroupedExperts
 from arctic_platform.model.implementations.layers.rms_norm import RMSNorm, RMSNormConfig
@@ -40,6 +46,30 @@ def _nemotron_h_mamba2_mixer_cls():
     from transformers.models.nemotron_h.modular_nemotron_h import NemotronHMamba2Mixer
 
     return NemotronHMamba2Mixer
+
+
+# The Mamba-2 time step's limits as vLLM serves Nemotron-H: MambaMixer2 passes dt_limit=(0.0, inf) on both prefill
+# paths (vllm model_executor/layers/mamba/mamba_mixer2.py:704, :883) and its decode kernel applies none
+# (ops/mamba_ssm.py:405-420), as the checkpoint's own code does (config.time_step_limit, (0, inf) by default).
+SAMPLER_TIME_STEP_LIMIT = (0.0, float("inf"))
+
+
+def build_mamba2_mixer(config: NemotronHConfig, layer_idx: int):
+    """Transformers' NemotronHMamba2Mixer with the sampler's time step: dt = softplus(dt + dt_bias), unfloored.
+
+    The mixer inherits Zamba2's ``time_step_limit = (config.time_step_min, inf)`` (transformers models/zamba2/
+    modeling_zamba2.py:669), which would floor dt at 1e-3 on every path that reads it: ``_varlen_mamba_forward``,
+    ``cp_mamba.fused_mamba_mixer`` and ``cp_mamba.mamba_cp_forward``, and the mixer's own forward
+    (modeling_zamba2.py:737, :849). time_step_min only bounds dt_bias's initialization. A mixer without
+    ``time_step_limit`` is refused: a Transformers that reads its limit from elsewhere could bring the floor back."""
+    mixer = _nemotron_h_mamba2_mixer_cls()(config, layer_idx=layer_idx)
+    if not hasattr(mixer, "time_step_limit"):
+        raise ValueError(
+            f"{type(mixer).__module__}.{type(mixer).__qualname__} has no time_step_limit: cannot give it the sampler's "
+            "unfloored dt (0, inf); check where this Transformers bounds the Mamba-2 time step"
+        )
+    mixer.time_step_limit = SAMPLER_TIME_STEP_LIMIT
+    return mixer
 
 
 def _patch_mamba2_use_triton_ssd():
@@ -124,7 +154,9 @@ def _patch_mamba2_use_triton_ssd():
                 seq_idx[s:e] = i
         seq_idx = seq_idx.unsqueeze(0)  # (1, L)
 
-        scan_output = _mamba_chunk_scan_combined(
+        scan_output = keep_core(
+            getattr(self, "_arl_core_replay", None),
+            _mamba_chunk_scan_combined,
             hidden_states.view(batch_size, seq_len, -1, self.head_dim),
             time_step,
             A,
@@ -143,21 +175,34 @@ def _patch_mamba2_use_triton_ssd():
         scan_output = self.norm(scan_output, gate)
         return self.out_proj(scan_output)
 
+    def _fused_varlen_mamba_forward(self, hidden_states, cu_seqlens):
+        """in_proj -> mamba_ssm's fused conv + scan + gated norm (``fused_mamba_mixer``) -> out_proj."""
+        batch_size, seq_len, _ = hidden_states.shape
+        assert batch_size == 1, "varlen mamba expects batch_size=1 (packed)"
+        scan_output = fused_mamba_mixer(self, self.in_proj(hidden_states), packed_seq_idx(cu_seqlens, seq_len))
+        return self.out_proj(scan_output)
+
+    fused = fused_mamba_available()
+    mixer_cls = _nemotron_h_mamba2_mixer_cls()
+    # The mixer's own forward from before this patch (Transformers 5.20: Zamba2MambaMixer.forward, its kernels or torch
+    # fallbacks with time_step_limit as dt_limit), for calls without packed rows. It has no cuda_kernels_forward /
+    # torch_forward any more, which this fallback used to call.
+    stock_forward = getattr(mixer_cls, "_arl_stock_forward", mixer_cls.forward)
+
     def _patched_forward(self, hidden_states, cache_params=None, attention_mask=None, cu_seqlens=None):
         if cu_seqlens is not None and cache_params is None and "cuda" in self.in_proj.weight.device.type:
+            if fused:
+                return _fused_varlen_mamba_forward(self, hidden_states, cu_seqlens)
             return _varlen_mamba_forward(self, hidden_states, cu_seqlens)
-        if "cuda" in self.in_proj.weight.device.type:
-            # Disable fused training path (needs causal_conv1d CUDA extension)
-            orig = self.use_mem_eff_path
-            self.use_mem_eff_path = False
-            result = self.cuda_kernels_forward(hidden_states, cache_params, attention_mask)
-            self.use_mem_eff_path = orig
-            return result
-        return self.torch_forward(hidden_states, cache_params, attention_mask)
+        return stock_forward(self, hidden_states, cache_params=cache_params, attention_mask=attention_mask)
 
-    _nemotron_h_mamba2_mixer_cls().forward = _patched_forward
+    mixer_cls._arl_stock_forward = stock_forward
+    mixer_cls.forward = _patched_forward
     _patch_applied = True
-    logger.info("Patched NemotronHMamba2Mixer: Triton SSD kernels + varlen (cu_seqlens) support")
+    logger.info(
+        "Patched NemotronHMamba2Mixer: Triton SSD kernels + varlen (cu_seqlens) support"
+        + (" (fused conv1d + scan + gated norm)" if fused else "")
+    )
 
 
 def _ensure_zamba2_compat(config: NemotronHConfig):
@@ -205,7 +250,9 @@ class NemotronHMambaLayer(GradientCheckpointingLayer):
         _patch_mamba2_use_triton_ssd()
         _ensure_zamba2_compat(config)
         self.norm = RMSNorm(RMSNormConfig(hidden_size=config.hidden_size, eps=config.layer_norm_epsilon))
-        self.mamba = _nemotron_h_mamba2_mixer_cls()(config, layer_idx=layer_idx)
+        self.mamba = build_mamba2_mixer(config, layer_idx)
+        # The chunked scan is this layer's core kernel for ac_config.core_replay (gpu/core_replay.py).
+        self.mamba._arl_keeps_core = True
         self.mlp = None  # No MoE in this layer type
 
     def set_context_parallel_attributes(self, cp_group: dist.ProcessGroup, cp_rank: int, cp_world_size: int) -> None:
@@ -236,7 +283,8 @@ class NemotronHMambaLayer(GradientCheckpointingLayer):
         if self.cp_enabled:
             # Global boundaries. The cu_seqlens argument is this rank's shard, which does not
             # index the sequence gathered by the context-parallel all-to-all.
-            hidden_states = mamba_cp_forward(
+            cp_forward = mamba_cp_forward_fused if fused_mamba_available() else mamba_cp_forward
+            hidden_states = cp_forward(
                 self.mamba,
                 hidden_states,
                 self._cp_group,
@@ -277,10 +325,12 @@ class NemotronHMoELayer(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         cu_seqlens: torch.LongTensor | None = None,
         max_seqlen: int | None = None,
+        routed_experts: torch.LongTensor | None = None,
     ) -> torch.Tensor:
+        """``routed_experts``: this layer's replayed experts, ``(batch, seq, num_experts_per_tok)``."""
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, routed_experts=routed_experts)
         return residual + hidden_states
 
 
@@ -336,6 +386,18 @@ def _build_layer(config: NemotronHConfig, layer_idx: int):
     return cls(config)
 
 
+# A block's mixer in prime-rl's tree (self_attn, mamba, mlp, and the MoE's shared expert).
+_PRIME_MIXER = re.compile(r"((?:^|\.)layers\.\d+)\.(self_attn|mamba|mlp\.shared_expert|mlp)\.")
+
+
+def vllm_lora_name(name: str) -> str:
+    """A LoRA tensor's name in vLLM's Nemotron-H module tree, where every block's mixer is ``mixer`` (attention,
+    Mamba-2 and MoE alike) and the MoE's shared expert is ``mixer.shared_experts``."""
+    return _PRIME_MIXER.sub(
+        lambda m: f"{m.group(1)}.mixer.{'shared_experts.' if m.group(2) == 'mlp.shared_expert' else ''}", name
+    )
+
+
 @auto_docstring
 class NemotronHPreTrainedModel(PreTrainedModelPrimeRL):
     config: NemotronHConfig
@@ -345,6 +407,14 @@ class NemotronHPreTrainedModel(PreTrainedModelPrimeRL):
     _supports_flash_attn = True
     _supports_sdpa = True
     _can_compile_fullgraph = False
+    # As Transformers' NemotronH (modeling_nemotron_h.py:1008-1010): a load in BF16, and DeepSpeed's mixed-precision
+    # cast (data_types.keep_in_fp32_modules "auto", deepspeed/runtime/keep_in_fp32.py), keep the routing bias in FP32.
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
+    # LoRA weight sync and the sampler's adapter pack (weight_export.py) name tensors after vLLM's modules.
+    vllm_lora_name = staticmethod(vllm_lora_name)
+    # vLLM serves the non-gated experts' LoRA one expert at a time (up_proj, down_proj): the PEFT 3-D expert format
+    # it also reads assumes a gated gate_up and would split w1 in halves.
+    vllm_lora_expert_projections = {"w1": "up_proj", "w2": "down_proj"}
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -509,7 +579,13 @@ class NemotronHModel(NemotronHPreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        routed_experts: Optional[torch.LongTensor] = None,
     ) -> BaseModelOutputWithPast:
+        """
+        routed_experts (`torch.LongTensor` of shape `(batch_size, sequence_length, num_hidden_layers, num_experts_per_tok)`, *optional*):
+            Routed experts for each token in the sequence, indexed by the absolute layer index as vLLM captures them
+            (only the MoE layers' slices are read). Only used for router replay.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -527,12 +603,22 @@ class NemotronHModel(NemotronHPreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids) if self.rotary_emb is not None else None
 
-        for decoder_layer in self.layers:
+        if routed_experts is not None and routed_experts.shape[2] != len(self.layers):
+            raise ValueError(
+                f"routed_experts holds {routed_experts.shape[2]} layers, the model {len(self.layers)}: the captured "
+                "routing must index every decoder layer, as vLLM's routed-experts capture does"
+            )
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            # Only the MoE layers route; the others take no routed_experts.
+            layer_kwargs = {}
+            if routed_experts is not None and self.config.layers_block_type[layer_idx] == "moe":
+                layer_kwargs["routed_experts"] = routed_experts[:, :, layer_idx, :]
             hidden_states = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                **layer_kwargs,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -561,8 +647,13 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
         labels: Optional[torch.LongTensor] = None,
         logits_to_keep: int = 0,
         temperature: Optional[torch.Tensor] = None,
+        routed_experts: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> PrimeLmOutput:
+        r"""
+        routed_experts (`torch.LongTensor` of shape `(batch_size, sequence_length, num_hidden_layers, num_experts_per_tok)`, *optional*):
+            Routed experts for each token in the sequence. Only used for router replay.
+        """
         if position_ids is None:
             if inputs_embeds is not None:
                 position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
@@ -574,6 +665,7 @@ class NemotronHForCausalLM(NemotronHPreTrainedModel, GenerationMixin):
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
+            routed_experts=routed_experts,
         )
 
         hidden_states = outputs.last_hidden_state

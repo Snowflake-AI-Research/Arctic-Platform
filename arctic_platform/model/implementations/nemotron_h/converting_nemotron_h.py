@@ -50,14 +50,9 @@ def _convert_hf_moe_layer_to_prime(state_dict: dict[str, Tensor], prefix: str):
     if f"{mixer}gate.weight" in state_dict:
         state_dict[f"{mlp}router.gate"] = state_dict.pop(f"{mixer}gate.weight")
     if f"{mixer}gate.e_score_correction_bias" in state_dict:
-        bias = state_dict.pop(f"{mixer}gate.e_score_correction_bias")
-        # Shift by per-row min so values land in a range bf16 can represent without
-        # collapsing. NemotronH biases sit ~57 with ~0.04 inter-expert spread, well
-        # under bf16's ~0.4 step at that magnitude. topk(scores + bias) is invariant
-        # to a constant shift of bias, and the returned routing weights are gathered
-        # from raw sigmoid scores (not biased), so this does not change routing math.
-        bias = bias - bias.min()
-        state_dict[f"{mlp}router.e_score_correction_bias"] = bias
+        # As the checkpoint holds it: the router keeps it in FP32 and adds it to the FP32 scores as vLLM does
+        # (scores + bias near 57), so the selection is vLLM's to the last bit.
+        state_dict[f"{mlp}router.e_score_correction_bias"] = state_dict.pop(f"{mixer}gate.e_score_correction_bias")
 
     # Experts: check if stored as individual weights (experts.{i}.up_proj.weight)
     # or fused 3D tensors (experts.up_proj)
