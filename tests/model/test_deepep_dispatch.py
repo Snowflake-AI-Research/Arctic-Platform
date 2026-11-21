@@ -188,3 +188,34 @@ def test_abandoned_dispatch_through_registered_cuda_op(monkeypatch):
         assert key not in deepep._handle_cache
         assert key not in deepep._pending_dispatch_events
     assert events == ["wait", "wait"]
+
+
+def test_the_dispatch_layout_is_allocated_on_the_comm_stream_and_awaited(monkeypatch):
+    # Allocated on the current stream, the layout's deterministic-mode fill raced DeepEP's layout kernel.
+    ep = _load_ep(monkeypatch, "deepep")
+    calls = []
+    event = SimpleNamespace(current_stream_wait=lambda: calls.append("wait"))
+
+    def layout(**kwargs):
+        calls.append(kwargs)
+        return (*[torch.zeros(1)] * 4, event)
+
+    monkeypatch.setattr(ep, "get_buffer", lambda group, hidden_bytes: SimpleNamespace(get_dispatch_layout=layout))
+    monkeypatch.setattr(ep, "_new_event_overlap", lambda: "previous")
+
+    class _Stop(Exception):
+        pass
+
+    def stop(*args):
+        calls.append("dispatch")
+        raise _Stop
+
+    monkeypatch.setattr(torch.ops, "ap_deepep", SimpleNamespace(dispatch=stop), raising=False)
+    with pytest.raises(_Stop):
+        ep.dispatch_tokens_async(torch.ones(2, 4), torch.zeros(2, 1, dtype=torch.int64), torch.ones(2, 1), 4, None)
+    assert {k: calls[0][k] for k in ("previous_event", "async_finish", "allocate_on_comm_stream")} == {
+        "previous_event": "previous",
+        "async_finish": True,
+        "allocate_on_comm_stream": True,
+    }
+    assert calls[1:] == ["wait", "dispatch"]
