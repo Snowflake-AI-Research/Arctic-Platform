@@ -37,4 +37,6 @@ def _no_real_sandbox_sweep(monkeypatch):
     except ImportError:
         return
     monkeypatch.setattr(sf_env, "_LIVE_SANDBOXES", {})
+    monkeypatch.setattr(sf_env, "_STOPPED_SANDBOXES", {})
+    monkeypatch.setattr(sf_env, "_last_reap", float("-inf"))
     monkeypatch.setattr(sf_env, "_sweep_at_exit", True)
