@@ -147,6 +147,8 @@ def ensure_dflash_max_position_patch() -> None:
                 self.draft_model_config.hf_config,
                 self.target_model_config.max_model_len + self.num_speculative_tokens,
             )
+            # DFlash draft KV reads only the target hidden state, so the EAGLE trailing-block drop does not apply.
+            self.disable_eagle_block_drop = True
         return result
 
     SpeculativeConfig.__post_init__ = post_init
