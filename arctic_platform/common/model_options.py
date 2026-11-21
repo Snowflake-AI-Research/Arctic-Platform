@@ -154,6 +154,40 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "moe.ultraep_spares",
+        runs_in="trainer",
+        goal="speed",
+        why=(
+            "Spare expert slots per GPU that UltraEP fills, in every MoE call, with copies of that call's hottest"
+            " experts inside the owner's NVLink domain: trained BF16 experts (full fine-tuning), or frozen block-FP8"
+            " or MXFP4 experts with their LoRA. 0 turns it off."
+        ),
+        source="`loader_options.ultraep_spares`",
+        registry=registry,
+    )
+    register_option(
+        "moe.ultraep_ipc_symm",
+        runs_in="trainer",
+        goal="robustness",
+        why=(
+            "Map UltraEP's peer buffers through CUDA IPC handles: torch symmetric memory refuses ranks that each see"
+            " only their own GPU, as DSS runs them."
+        ),
+        source="`loader_options.ultraep_ipc_symm`; `ULTRA_EP_IPC_SYMM` when unset",
+        registry=registry,
+    )
+    register_option(
+        "moe.expert_replicas",
+        runs_in="trainer",
+        goal="speed",
+        why=(
+            "Spare expert slots per GPU for online replicas of the hottest BF16 experts, replanned every micro-batch"
+            " from the routed counts. 0 turns them off."
+        ),
+        source="`loader_options.expert_replicas`",
+        registry=registry,
+    )
+    register_option(
         "moe.w8a8_experts",
         runs_in="trainer",
         goal="speed",
