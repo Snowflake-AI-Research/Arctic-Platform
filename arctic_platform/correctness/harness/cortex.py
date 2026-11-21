@@ -64,9 +64,14 @@ from arctic_platform.client.transports.cortex import _SendPolicy
 from arctic_platform.correctness.harness.config import ReviewedClientConfig
 from arctic_platform.correctness.harness.config import TestSpec
 from arctic_platform.correctness.harness.config import hash_directory
+from arctic_platform.correctness.harness.storage import correctness_environment
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 
 # Transport
+
+# Pins hosted jobs to one dss-backend base tag through the create-job debug options; the account must
+# have Neutrino debug options enabled.
+IMAGE_TAG_ENV = "AP_CORRECTNESS_IMAGE_TAG"
 
 
 class UnsafeCleanupError(RuntimeError):
@@ -407,8 +412,72 @@ def validate_publication(publication: dict, binding: dict) -> dict:
     return {"stage_path": stage_path, "files": publication["files"]}
 
 
+SERVER_REDUCED = "server-reduced"
+
+
+def server_reduced_overrides(spec: TestSpec) -> dict:
+    """The text-config changes that turn the source checkpoint into the reviewed reduced model.
+
+    The server applies these at load time (``training_config.text_config_overrides``), so a hosted job trains
+    the same truncated stack without a separately published copy. Only text-config edits can travel this way.
+    """
+    from transformers import AutoConfig
+
+    from arctic_platform.correctness.onboarding.synth_model import reduce_config
+
+    source = spec.model.source_checkpoint
+    original = AutoConfig.from_pretrained(source, trust_remote_code=True)
+    reduced, _, _ = reduce_config(source, spec.model.num_hidden_layers, spec.model.vision_depth)
+    if hasattr(reduced, "vision_config") and reduced.vision_config.to_dict() != original.vision_config.to_dict():
+        raise ValueError("server-reduced fixtures cannot reduce a vision tower through text_config_overrides")
+    before = getattr(original, "text_config", original).to_dict()
+    after = getattr(reduced, "text_config", reduced).to_dict()
+    return {key: value for key, value in after.items() if before.get(key) != value}
+
+
+def apply_server_reduction(training: dict, overrides: dict) -> None:
+    """Ask the server for the reduced model through the route its loader reads.
+
+    Dense loaders apply ``text_config_overrides``. The expert-parallel loaders refuse them and instead truncate the
+    stack through ``prime_rl.debug.num_layers``, which also trims ``layer_types``, so only a layer cut fits there.
+    """
+    if (training.get("ep_size") or 1) <= 1:
+        training["text_config_overrides"] = deepcopy(overrides)
+        return
+    layers = overrides.get("num_hidden_layers")
+    other = sorted(set(overrides) - {"num_hidden_layers", "layer_types"})
+    if type(layers) is not int or other:
+        raise ValueError(f"an expert-parallel server-reduced fixture can only cut layers; it also changes {other}")
+    prime = dict(training.get("prime_rl") or {})
+    prime["debug"] = {**(prime.get("debug") or {}), "num_layers": layers}
+    training["prime_rl"] = prime
+
+
+def describe_server_reduced_fixture(spec: TestSpec) -> dict:
+    overrides = server_reduced_overrides(spec)
+    digest = hashlib.sha256(
+        json.dumps([spec.model.source_checkpoint, overrides], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "schema_version": 1,
+        "kind": SERVER_REDUCED,
+        "config_id": spec.config_id,
+        "reference_path": spec.model.cache_path,
+        "reviewed_hash": spec.model.content_hash,
+        "model_name": spec.model.source_checkpoint,
+        "text_config_overrides": overrides,
+        "fixture_sha256": digest,
+        "publication": {"stage_path": f"server-reduced:{spec.model.source_checkpoint}"},
+    }
+
+
 def load_fixture(receipt: Path, spec: TestSpec) -> dict:
     binding = json.loads(Path(receipt).read_text())
+    if binding.get("kind") == SERVER_REDUCED:
+        expected = describe_server_reduced_fixture(spec)
+        if any(binding.get(key) != expected[key] for key in ("schema_version", "config_id", "model_name")):
+            raise ValueError("server-reduced binding does not match the reviewed spec")
+        return expected
     publication = binding.get("publication")
     if not isinstance(publication, dict):
         raise ValueError("fixture binding has no successful publication receipt")
@@ -889,6 +958,11 @@ class CorrectnessCortexTransport(CortexTransport):
                 payload["sub_job_configs"] = configs
             if getattr(self, "hardware", None) is not None:
                 payload["hardware"] = self.hardware
+            image_tag = correctness_environment(IMAGE_TAG_ENV)
+            if image_tag and not self._is_local_gateway():
+                debug = dict(payload.get("debug") or {})
+                debug["job"] = {**(debug.get("job") or {}), "image_tag": image_tag}
+                payload["debug"] = debug
             kwargs["json"] = payload
             if self._is_local_gateway():
                 local_roles = [sub.get("job_type") for sub in payload["sub_job_configs"]]

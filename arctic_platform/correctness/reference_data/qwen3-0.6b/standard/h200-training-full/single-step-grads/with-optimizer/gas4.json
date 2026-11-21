@@ -1,0 +1,749 @@
+{
+  "identity": {
+    "check_id": "single-step-grads",
+    "config_checksum": "62a26f0ba16f017e0963717d65edd89a950f648d19df98767df2bf1e7f10fe31",
+    "config_id": "qwen3-0.6b-standard-h200-training-full",
+    "criterion": "gradient-l2-norm-v1",
+    "dependencies": {
+      "flash-attn": null,
+      "liger-kernel": "0.8.5",
+      "peft": "0.21.2",
+      "safetensors": "0.8.0",
+      "torch": "2.14.0+cu130",
+      "transformers": "5.20.2"
+    },
+    "gate": {
+      "absolute": 0.029,
+      "calibration_runs": 8,
+      "computed_gate": 0.02877044677734375,
+      "minimum_gate": 0.001,
+      "multiplier": 4.0,
+      "raw_max_same_tensor_range": 0.0071926116943359375,
+      "rounding_quantum": 0.001,
+      "status": "calibrated from 8 nondeterministic reference executions per specification arm; 4x rounded upward in 1e-3 units",
+      "worst_tensor": "model.embed_tokens.weight"
+    },
+    "gpu_family": "h200",
+    "parameter_name_map": {},
+    "python": "3.12.3",
+    "recipe": {
+      "attention": "flash_attention_3",
+      "ce_chunk": 2048,
+      "initialization": "external-model",
+      "model": {
+        "assets": {
+          "config.json": {
+            "sha256": "c269f74b6b71e3ca61312128f1bcb4a8477086e54f213ccc78318f09531eef7f",
+            "size": 888
+          },
+          "generation_config.json": {
+            "sha256": "be1b8099dc8a86b9fa09e0104e99938e98c533ac189c9a4eb8e6124cf87ff146",
+            "size": 214
+          },
+          "merges.txt": {
+            "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+            "size": 1671853
+          },
+          "model.safetensors": {
+            "sha256": "047d50be61061bfcf77800b1753d44b5b6ccf5965b4b5319f089b270e9d23481",
+            "size": 437019712
+          },
+          "tokenizer.json": {
+            "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+            "size": 11422654
+          },
+          "tokenizer_config.json": {
+            "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+            "size": 9732
+          }
+        },
+        "sha256": "aef37c5b91bbefd8303bcf60ff9f474c95a5179817638a2b25c8dd614e9de4c5"
+      },
+      "optimizer": {
+        "config": {
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "eps": 1e-08,
+          "lr": 2e-05,
+          "name": "AdamW",
+          "weight_decay": 0
+        },
+        "dtype": "float32",
+        "gradient_clipping": 1,
+        "learning_rate": 0.01
+      },
+      "synthetic_inputs": {
+        "batch": {
+          "active_tokens": 66498,
+          "name": "gas4",
+          "tensors": {
+            "input_ids": {
+              "dtype": "torch.int64",
+              "sha256": "8b390c7f0ef91a84d6734e0292e9034ede8f82fec3f2d383ae54109dc20024b3",
+              "shape": [
+                4,
+                32768
+              ]
+            },
+            "labels": {
+              "dtype": "torch.int64",
+              "sha256": "03216292dd4f82e87745aae2357e56717f489bf3288a78919c2433dd47ad7833",
+              "shape": [
+                4,
+                32768
+              ]
+            },
+            "position_ids": {
+              "dtype": "torch.int64",
+              "sha256": "c4b35e5f8efe1d322fa145ce35cd79d863358ceff8e21177aa0db3b762a2ace4",
+              "shape": [
+                4,
+                32768
+              ]
+            }
+          }
+        },
+        "max_seq_len": 32768,
+        "rows": 4,
+        "seed": 1234,
+        "version": "private-cpu-generator-v1",
+        "vocab_size": 151936
+      },
+      "token_budget": 10240,
+      "training": {
+        "deterministic": true,
+        "fp32_lm_head": false,
+        "fused_cross_entropy": false,
+        "lm_head_token_chunk_size": 8192,
+        "lm_head_vocab_chunk_size": 8192,
+        "matmul_precision": "highest",
+        "mixer_packing": false,
+        "peft_config": null
+      }
+    },
+    "reference_sources": {
+      "harness/optimizer.py": {
+        "sha256": "2edfed4cafadf6a3a17cd40104034d6dc36ca939620a209186b03e6694d83445",
+        "size": 225157
+      },
+      "harness/sft.py": {
+        "sha256": "e7d50b8591e47f6966fce730f32176984f16f8043b9b3ad9e969a9f23b771e7c",
+        "size": 19836
+      },
+      "reference/__init__.py": {
+        "sha256": "230f7960387fb7399cab0a345b2e447f0004ade981cd735efa711172960697d4",
+        "size": 686
+      },
+      "reference/__main__.py": {
+        "sha256": "4ecb074197d7c68ae7dde0bf1a49db7745872b23e02b94957005bf1b0f49d5fe",
+        "size": 5770
+      },
+      "reference/adamw_trajectory.py": {
+        "sha256": "bc2aa1cb63d5847ff210ef451e76cb568d7066e0e1968b1f1f9f568f64244e39",
+        "size": 11105
+      },
+      "reference/hf_single_gpu.py": {
+        "sha256": "d2d3418dc43cfcb8a6a08edddb461337a998af7e77255df93d1b8e56416b0ffa",
+        "size": 25600
+      },
+      "reference/model_features.py": {
+        "sha256": "6a002c4f2091062271ea94685b5caf062312c4a407f14b6725bad295d489b379",
+        "size": 1298
+      },
+      "reference/optimizer_step.py": {
+        "sha256": "cff202e4e629b32e517f690d3ec23f5a2e0275a1648d2d143957bb70264037a5",
+        "size": 11370
+      },
+      "reference/process_determinism.py": {
+        "sha256": "ea00114631e809957630f2286376f3495dc1a98df0733fa17f261f47dd05502c",
+        "size": 4031
+      },
+      "reference/qwen4_reference.py": {
+        "sha256": "9e2249b3cd70d70e8346d285453794b81966f9bdbdc528c652181265742ee86c",
+        "size": 4123
+      },
+      "reference/sft_trajectory.py": {
+        "sha256": "2d37b7d28952d6c96d000b8f4985b62c5e263ce4221d1e0d29ae4bb0e4ed9ba3",
+        "size": 14885
+      }
+    },
+    "schema": 1
+  },
+  "measurements": {
+    "active_tokens": 66498,
+    "grad_norms": {
+      "model.embed_tokens.weight": 11.550359725952148,
+      "model.layers.0.input_layernorm.weight": 2.1334941387176514,
+      "model.layers.0.mlp.down_proj.weight": 6.626951217651367,
+      "model.layers.0.mlp.gate_proj.weight": 3.085890054702759,
+      "model.layers.0.mlp.up_proj.weight": 7.187131881713867,
+      "model.layers.0.post_attention_layernorm.weight": 0.4436154067516327,
+      "model.layers.0.self_attn.k_norm.weight": 0.16393829882144928,
+      "model.layers.0.self_attn.k_proj.weight": 3.678222179412842,
+      "model.layers.0.self_attn.o_proj.weight": 12.253594398498535,
+      "model.layers.0.self_attn.q_norm.weight": 4.484554290771484,
+      "model.layers.0.self_attn.q_proj.weight": 1.9292062520980835,
+      "model.layers.0.self_attn.v_proj.weight": 29.468856811523438,
+      "model.layers.1.input_layernorm.weight": 1.064048409461975,
+      "model.layers.1.mlp.down_proj.weight": 10.991881370544434,
+      "model.layers.1.mlp.gate_proj.weight": 6.651398658752441,
+      "model.layers.1.mlp.up_proj.weight": 20.297651290893555,
+      "model.layers.1.post_attention_layernorm.weight": 0.2973778247833252,
+      "model.layers.1.self_attn.k_norm.weight": 0.20536600053310394,
+      "model.layers.1.self_attn.k_proj.weight": 4.6986918449401855,
+      "model.layers.1.self_attn.o_proj.weight": 7.874137878417969,
+      "model.layers.1.self_attn.q_norm.weight": 0.331220418214798,
+      "model.layers.1.self_attn.q_proj.weight": 4.297931671142578,
+      "model.layers.1.self_attn.v_proj.weight": 10.309622764587402,
+      "model.layers.2.input_layernorm.weight": 1.1808290481567383,
+      "model.layers.2.mlp.down_proj.weight": 46.314125061035156,
+      "model.layers.2.mlp.gate_proj.weight": 7.919392108917236,
+      "model.layers.2.mlp.up_proj.weight": 18.19968032836914,
+      "model.layers.2.post_attention_layernorm.weight": 0.3411514163017273,
+      "model.layers.2.self_attn.k_norm.weight": 0.1610189974308014,
+      "model.layers.2.self_attn.k_proj.weight": 3.510756015777588,
+      "model.layers.2.self_attn.o_proj.weight": 9.923694610595703,
+      "model.layers.2.self_attn.q_norm.weight": 0.47349607944488525,
+      "model.layers.2.self_attn.q_proj.weight": 5.641692638397217,
+      "model.layers.2.self_attn.v_proj.weight": 16.670276641845703,
+      "model.layers.3.input_layernorm.weight": 2.559034585952759,
+      "model.layers.3.mlp.down_proj.weight": 12.650028228759766,
+      "model.layers.3.mlp.gate_proj.weight": 7.798324108123779,
+      "model.layers.3.mlp.up_proj.weight": 16.334800720214844,
+      "model.layers.3.post_attention_layernorm.weight": 0.3017418384552002,
+      "model.layers.3.self_attn.k_norm.weight": 0.7359610795974731,
+      "model.layers.3.self_attn.k_proj.weight": 15.622693061828613,
+      "model.layers.3.self_attn.o_proj.weight": 12.894142150878906,
+      "model.layers.3.self_attn.q_norm.weight": 1.8546829223632812,
+      "model.layers.3.self_attn.q_proj.weight": 7.335972309112549,
+      "model.layers.3.self_attn.v_proj.weight": 23.414539337158203,
+      "model.norm.weight": 0.8309669494628906
+    },
+    "loss": 20.456511974334717,
+    "microbatches": 4,
+    "optimizer_gradient_norm": 80.98809814453125,
+    "participation": {
+      "parameters": {
+        "model.embed_tokens.weight": {
+          "evidence": null,
+          "shape": [
+            151936,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.0.input_layernorm.weight": {
+          "evidence": null,
+          "shape": [
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.0.mlp.down_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            3072
+          ],
+          "state": "active"
+        },
+        "model.layers.0.mlp.gate_proj.weight": {
+          "evidence": null,
+          "shape": [
+            3072,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.0.mlp.up_proj.weight": {
+          "evidence": null,
+          "shape": [
+            3072,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.0.post_attention_layernorm.weight": {
+          "evidence": null,
+          "shape": [
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.0.self_attn.k_norm.weight": {
+          "evidence": null,
+          "shape": [
+            128
+          ],
+          "state": "active"
+        },
+        "model.layers.0.self_attn.k_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.0.self_attn.o_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            2048
+          ],
+          "state": "active"
+        },
+        "model.layers.0.self_attn.q_norm.weight": {
+          "evidence": null,
+          "shape": [
+            128
+          ],
+          "state": "active"
+        },
+        "model.layers.0.self_attn.q_proj.weight": {
+          "evidence": null,
+          "shape": [
+            2048,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.0.self_attn.v_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.1.input_layernorm.weight": {
+          "evidence": null,
+          "shape": [
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.1.mlp.down_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            3072
+          ],
+          "state": "active"
+        },
+        "model.layers.1.mlp.gate_proj.weight": {
+          "evidence": null,
+          "shape": [
+            3072,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.1.mlp.up_proj.weight": {
+          "evidence": null,
+          "shape": [
+            3072,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.1.post_attention_layernorm.weight": {
+          "evidence": null,
+          "shape": [
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.1.self_attn.k_norm.weight": {
+          "evidence": null,
+          "shape": [
+            128
+          ],
+          "state": "active"
+        },
+        "model.layers.1.self_attn.k_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.1.self_attn.o_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            2048
+          ],
+          "state": "active"
+        },
+        "model.layers.1.self_attn.q_norm.weight": {
+          "evidence": null,
+          "shape": [
+            128
+          ],
+          "state": "active"
+        },
+        "model.layers.1.self_attn.q_proj.weight": {
+          "evidence": null,
+          "shape": [
+            2048,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.1.self_attn.v_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.2.input_layernorm.weight": {
+          "evidence": null,
+          "shape": [
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.2.mlp.down_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            3072
+          ],
+          "state": "active"
+        },
+        "model.layers.2.mlp.gate_proj.weight": {
+          "evidence": null,
+          "shape": [
+            3072,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.2.mlp.up_proj.weight": {
+          "evidence": null,
+          "shape": [
+            3072,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.2.post_attention_layernorm.weight": {
+          "evidence": null,
+          "shape": [
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.2.self_attn.k_norm.weight": {
+          "evidence": null,
+          "shape": [
+            128
+          ],
+          "state": "active"
+        },
+        "model.layers.2.self_attn.k_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.2.self_attn.o_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            2048
+          ],
+          "state": "active"
+        },
+        "model.layers.2.self_attn.q_norm.weight": {
+          "evidence": null,
+          "shape": [
+            128
+          ],
+          "state": "active"
+        },
+        "model.layers.2.self_attn.q_proj.weight": {
+          "evidence": null,
+          "shape": [
+            2048,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.2.self_attn.v_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.3.input_layernorm.weight": {
+          "evidence": null,
+          "shape": [
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.3.mlp.down_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            3072
+          ],
+          "state": "active"
+        },
+        "model.layers.3.mlp.gate_proj.weight": {
+          "evidence": null,
+          "shape": [
+            3072,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.3.mlp.up_proj.weight": {
+          "evidence": null,
+          "shape": [
+            3072,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.3.post_attention_layernorm.weight": {
+          "evidence": null,
+          "shape": [
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.3.self_attn.k_norm.weight": {
+          "evidence": null,
+          "shape": [
+            128
+          ],
+          "state": "active"
+        },
+        "model.layers.3.self_attn.k_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.3.self_attn.o_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            2048
+          ],
+          "state": "active"
+        },
+        "model.layers.3.self_attn.q_norm.weight": {
+          "evidence": null,
+          "shape": [
+            128
+          ],
+          "state": "active"
+        },
+        "model.layers.3.self_attn.q_proj.weight": {
+          "evidence": null,
+          "shape": [
+            2048,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.layers.3.self_attn.v_proj.weight": {
+          "evidence": null,
+          "shape": [
+            1024,
+            1024
+          ],
+          "state": "active"
+        },
+        "model.norm.weight": {
+          "evidence": null,
+          "shape": [
+            1024
+          ],
+          "state": "active"
+        }
+      },
+      "schema": "trainable-parameter-participation-v1"
+    },
+    "peak_gib": 4.464422702789307,
+    "reference_execution": {
+      "effective_configurations": {
+        "decoder": {
+          "attention_implementation": "flash_attention_3",
+          "config": {
+            "_name_or_path": "/data-fast/base-models/synthetic/Qwen3-0.6B-4L",
+            "architectures": [
+              "Qwen3ForCausalLM"
+            ],
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "bos_token_id": 151643,
+            "chunk_size_feed_forward": 0,
+            "dtype": "bfloat16",
+            "eos_token_id": 151645,
+            "head_dim": 128,
+            "hidden_act": "silu",
+            "hidden_size": 1024,
+            "id2label": {
+              "0": "LABEL_0",
+              "1": "LABEL_1"
+            },
+            "initializer_range": 0.02,
+            "intermediate_size": 3072,
+            "is_encoder_decoder": false,
+            "label2id": {
+              "LABEL_0": 0,
+              "LABEL_1": 1
+            },
+            "layer_types": [
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention"
+            ],
+            "max_position_embeddings": 40960,
+            "max_window_layers": 28,
+            "model_type": "qwen3",
+            "num_attention_heads": 16,
+            "num_hidden_layers": 4,
+            "num_key_value_heads": 8,
+            "output_attentions": false,
+            "output_hidden_states": false,
+            "pad_token_id": null,
+            "problem_type": null,
+            "return_dict": true,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {
+              "rope_theta": 1000000,
+              "rope_type": "default"
+            },
+            "sliding_window": null,
+            "tie_word_embeddings": true,
+            "transformers_version": "5.20.2",
+            "use_cache": true,
+            "use_sliding_window": false,
+            "vocab_size": 151936
+          }
+        },
+        "model": {
+          "attention_implementation": "flash_attention_3",
+          "config": {
+            "_name_or_path": "/data-fast/base-models/synthetic/Qwen3-0.6B-4L",
+            "architectures": [
+              "Qwen3ForCausalLM"
+            ],
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "bos_token_id": 151643,
+            "chunk_size_feed_forward": 0,
+            "dtype": "bfloat16",
+            "eos_token_id": 151645,
+            "head_dim": 128,
+            "hidden_act": "silu",
+            "hidden_size": 1024,
+            "id2label": {
+              "0": "LABEL_0",
+              "1": "LABEL_1"
+            },
+            "initializer_range": 0.02,
+            "intermediate_size": 3072,
+            "is_encoder_decoder": false,
+            "label2id": {
+              "LABEL_0": 0,
+              "LABEL_1": 1
+            },
+            "layer_types": [
+              "full_attention",
+              "full_attention",
+              "full_attention",
+              "full_attention"
+            ],
+            "max_position_embeddings": 40960,
+            "max_window_layers": 28,
+            "model_type": "qwen3",
+            "num_attention_heads": 16,
+            "num_hidden_layers": 4,
+            "num_key_value_heads": 8,
+            "output_attentions": false,
+            "output_hidden_states": false,
+            "pad_token_id": null,
+            "problem_type": null,
+            "return_dict": true,
+            "rms_norm_eps": 1e-06,
+            "rope_parameters": {
+              "rope_theta": 1000000,
+              "rope_type": "default"
+            },
+            "sliding_window": null,
+            "tie_word_embeddings": true,
+            "transformers_version": "5.20.2",
+            "use_cache": true,
+            "use_sliding_window": false,
+            "vocab_size": 151936
+          }
+        }
+      },
+      "effective_configurations_sha256": "75859cdf09b074bc8d77e16d4782204d8054685c0878e65fb31d343c15f8f93e",
+      "implementations": {
+        "decoder": {
+          "class": {
+            "module": "transformers.models.qwen3.modeling_qwen3",
+            "qualname": "Qwen3Model",
+            "source": {
+              "sha256": "ca9535e36ea4e689c76d7d753b91aec9ea00da837fbf223c8ea4c01a3b50cac0",
+              "size": 22034
+            }
+          },
+          "forward": {
+            "module": "transformers.models.qwen3.modeling_qwen3",
+            "python_code_sha256": "1215478b118f08b77dc4eceaf0360bc7affadf5c6125a0046237b06f2e3f4d8b",
+            "qualname": "Qwen3Model.forward",
+            "source": {
+              "sha256": "222da9314771386b9666d15b242074ffc22dd440f74ce864137b793e1c2cfcda",
+              "size": 43695
+            }
+          }
+        },
+        "model": {
+          "class": {
+            "module": "transformers.models.qwen3.modeling_qwen3",
+            "qualname": "Qwen3ForCausalLM",
+            "source": {
+              "sha256": "ca9535e36ea4e689c76d7d753b91aec9ea00da837fbf223c8ea4c01a3b50cac0",
+              "size": 22034
+            }
+          },
+          "forward": {
+            "module": "transformers.models.qwen3.modeling_qwen3",
+            "python_code_sha256": "27a16522151f4cb52544cc4778d6c3673981b69b1612c1570f6bccd586d9ec1b",
+            "qualname": "Qwen3ForCausalLM.forward",
+            "source": {
+              "sha256": "222da9314771386b9666d15b242074ffc22dd440f74ce864137b793e1c2cfcda",
+              "size": 43695
+            }
+          }
+        }
+      },
+      "requested_attention": "flash_attention_3",
+      "schema": "hf-reference-execution-v1"
+    },
+    "skipped_no_grad": []
+  },
+  "payload_sha256": "5ab0bd7da95fe49802395bf1916ed5838e3c2030e33f1f428ba91ea5e251e536",
+  "schema": 1
+}
