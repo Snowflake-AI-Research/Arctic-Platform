@@ -916,6 +916,10 @@ def test_an_images_env_is_set_on_each_command_not_at_create(tmp_path, monkeypatc
 # -- The agent runs inside the selected Harbor environment -------------------
 
 
+# A script step that answers with the error ChatCompletionsProxy returns for a prompt longer than the context.
+CONTEXT_OVERFLOW = "__context_overflow__"
+
+
 class _ScriptedLLM(BaseHTTPRequestHandler):
     """An OpenAI-compatible endpoint that replays ``script`` as tool calls."""
 
@@ -937,8 +941,24 @@ class _ScriptedLLM(BaseHTTPRequestHandler):
             type(self).blocked.set()
             type(self).release.wait(30)
         name, args = self.script[min(len(self.calls) - 1, len(self.script) - 1)]
+        if name == CONTEXT_OVERFLOW:
+            self._reply(
+                400,
+                dict(
+                    error=dict(
+                        message=(
+                            "This model's maximum context length is 32768 tokens. "
+                            "However, your request has 40000 input tokens."
+                        ),
+                        type="BadRequestError",
+                        code=400,
+                    )
+                ),
+            )
+            return
         call = dict(id=f"call{len(self.calls)}", type="function", function=dict(name=name, arguments=json.dumps(args)))
-        out = json.dumps(
+        self._reply(
+            200,
             dict(
                 id="x",
                 object="chat.completion",
@@ -954,9 +974,12 @@ class _ScriptedLLM(BaseHTTPRequestHandler):
                     )
                 ],
                 usage=dict(prompt_tokens=1, completion_tokens=1, total_tokens=2),
-            )
-        ).encode()
-        self.send_response(200)
+            ),
+        )
+
+    def _reply(self, status: int, body: dict) -> None:
+        out = json.dumps(body).encode()
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out)))
         self.end_headers()
@@ -1021,6 +1044,51 @@ def test_agent_commands_run_in_the_harbor_environment_the_verifier_grades(tmp_pa
     assert set(llm.auth) == {f"Bearer {_ROLLOUT_KEY}"}
     tools = {t["function"]["name"] for t in llm.calls[0]["tools"]}
     assert "terminal" in tools and "file_editor" not in tools
+
+
+def test_a_conversation_that_outgrows_the_context_is_graded_not_dropped(tmp_path, monkeypatch, scripted_llm):
+    llm, base_url = scripted_llm
+    llm.script = [
+        ("terminal", dict(command="cd /app && echo hello > output.txt")),
+        (CONTEXT_OVERFLOW, {}),
+    ]
+    monkeypatch.setenv("HARBOR_ALLOW_HOST_EXEC", "1")
+    monkeypatch.delenv("OPENHANDS_TOOLS", raising=False)
+
+    out = asyncio.run(
+        run_harbor_trial(
+            task_dir=_task(tmp_path),
+            trials_dir=tmp_path / "trials",
+            trial_name="trial",
+            agent="harbor_rl.agent:OpenHandsHarborAgent",
+            env="host",
+            model_name="openai/test-model",
+            base_url=base_url,
+            api_key=_ROLLOUT_KEY,
+            agent_kwargs=dict(max_turns=5, instance={}),
+        )
+    )
+
+    assert out["exception"] is None
+    assert out["reward"] == 1.0
+    assert len(llm.calls) == 2
+
+
+def test_only_a_context_overflow_ends_a_conversation_without_an_error():
+    pytest.importorskip("openhands.sdk")
+    from harbor_rl.agent import _context_window_exceeded
+    from openhands.sdk.conversation.exceptions import ConversationRunError
+    from openhands.sdk.llm.exceptions import LLMContextWindowExceedError
+
+    def run_error(cause: Exception) -> ConversationRunError:
+        try:
+            raise ConversationRunError("conversation", cause) from cause
+        except ConversationRunError as exc:
+            return exc
+
+    assert _context_window_exceeded(run_error(LLMContextWindowExceedError()))
+    assert not _context_window_exceeded(run_error(RuntimeError("the model endpoint is down")))
+    assert not _context_window_exceeded(RuntimeError("the model endpoint is down"))
 
 
 def test_consecutive_general_harbor_rollouts_in_one_process_all_run(tmp_path, monkeypatch, scripted_llm):

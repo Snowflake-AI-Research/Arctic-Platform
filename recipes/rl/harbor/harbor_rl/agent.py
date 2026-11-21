@@ -262,6 +262,16 @@ class ConversationStop:
             threading.Thread(target=conversation.pause, name="harbor-pause", daemon=True).start()
 
 
+def _context_window_exceeded(exc: BaseException | None) -> bool:
+    from openhands.sdk.llm.exceptions import LLMContextWindowExceedError
+
+    while exc is not None:
+        if isinstance(exc, LLMContextWindowExceedError):
+            return True
+        exc = exc.__cause__
+    return False
+
+
 def _is_json_object(text: Any) -> bool:
     try:
         return isinstance(json.loads(text), dict)
@@ -397,7 +407,14 @@ def _converse(
     try:
         if stop.attach(conversation):
             conversation.send_message(user_prompt)
-            conversation.run()
+            try:
+                conversation.run()
+            except Exception as exc:
+                # A conversation that outgrows the context ends like one that runs out of turns, and the
+                # verifier grades its workspace. Raised, it would leave the trial without a verifier
+                # result, and the rollout would be dropped as an error.
+                if not _context_window_exceeded(exc):
+                    raise
         events = list(conversation.state.events)
     finally:
         try:
