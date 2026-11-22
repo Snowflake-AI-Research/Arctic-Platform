@@ -1245,3 +1245,173 @@ def test_cli_helpers():
     assert log_text({"_raw": "r"}) == "r"
     assert log_text({"msg": "m", "message": "n"}) == "m"
     assert log_text("plain") == "plain"
+
+
+def _job_body(model="org/A", max_seq_len=32768, n_gpus=8, tp=8, semi_p=True, lora=False, **extra):
+    ic = {"max_seq_len": max_seq_len, "n_gpus": n_gpus, "vllm_config": {"tensor_parallel_size": tp}}
+    if lora:
+        ic["peft_config"] = {"max_loras": 4, "max_lora_rank": 64}
+    if semi_p is not None:
+        ic["semi_p"] = semi_p
+    return {"hardware": "H200", "sub_job_configs": [{"job_type": "sampling", "model_name": model, "dtype": "bfloat16",
+                                                     "seed": 42, "inference_config": ic}], **extra}
+
+
+def _job_line(*args, **kwargs):
+    return json.dumps(_job_body(*args, **kwargs))
+
+
+def _write_jsonl(tmp_path, lines):
+    path = tmp_path / "jobs.jsonl"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_a_jsonl_file_loads_one_semi_p_job_body_per_line(tmp_path):
+    path = _write_jsonl(tmp_path, [_job_line("Qwen/Qwen3-0.6B", n_gpus=1, tp=1), "", "  ",
+                                   _job_line("zai-org/GLM-5.3", max_seq_len=720896, lora=True)])
+    a, b = jobs.load_models(str(path))
+    assert [(s.name, s.n_gpus, s.copies, s.path) for s in (a, b)] == [
+        ("qwen3-0.6b-32k-full", 1, None, f"{path}:1"), ("glm-5.3-704k-lora", 8, None, f"{path}:4")]
+    want = _job_body("Qwen/Qwen3-0.6B", n_gpus=1, tp=1, semi_p=None)["sub_job_configs"][0]
+    assert a.sub_job == want and "semi_p" not in b.inference_config and b.inference_config["peft_config"]
+    assert (a.thresholds, a.perf, a.correctness) == ({}, {}, {})
+    model_file = str(FIXTURES / "qwen36-35b-a3b-tp1.json")
+    assert jobs.load_models(model_file) == [jobs.load_model(model_file)]
+
+
+def test_a_jsonl_job_is_submitted_with_semi_p_set_per_variant(tmp_path):
+    from arctic_platform.inference.semi_persistence.onboarding import publish
+
+    spec, = jobs.load_models(str(_write_jsonl(tmp_path, [_job_line(tp=2, n_gpus=8)])))
+    bodies = jobs.build_variant_bodies(spec, "T", ["on_hit", "off_default"], model_bucket="b")
+    assert bodies["on_hit"]["sub_job_configs"][0]["inference_config"]["semi_p"] is True
+    assert bodies["off_default"]["sub_job_configs"][0]["inference_config"]["semi_p"] is False
+    pub = publish.publish_body(spec, "T", "b")["sub_job_configs"][0]["inference_config"]
+    assert pub["semi_p"] is True
+    assert pub["vllm_config"]["extra_env"] == {"SEMIP_DUMP_PUBLISH": "1", "MODEL_BUCKET": "b"}
+
+
+@pytest.mark.parametrize("sub_job,label", [
+    ({"model_name": "Qwen/Qwen3-0.6B", "inference_config": {"max_seq_len": 32768}}, "qwen3-0.6b-32k-full"),
+    ({"model_name": "zai-org/GLM-5.3", "inference_config": {"max_seq_len": 720896}}, "glm-5.3-704k-full"),
+    ({"model_name": "Qwen/Qwen3-8B", "inference_config": {"max_seq_len": 32768, "peft_config": {"max_loras": 4}}},
+     "qwen3-8b-32k-lora"),
+    ({"model_name": "Qwen/Qwen3-8B", "inference_config": {"max_seq_len": 32768, "peft_config": {}}},
+     "qwen3-8b-32k-full"),
+    ({"model_name": "/models/My Model_v2/", "inference_config": {"max_seq_len": 4000}}, "my-model_v2-4000-full"),
+    ({"model_name": "Bare", "inference_config": {"max_seq_len": 40960}}, "bare-40k-full"),
+])
+def test_job_labels_come_from_the_model_context_and_lora(sub_job, label):
+    assert jobs.job_label(sub_job) == label
+
+
+def test_colliding_labels_get_a_suffix_in_file_order(tmp_path):
+    path = _write_jsonl(tmp_path, [_job_line(tp=8), _job_line(tp=4), _job_line(lora=True), _job_line(tp=2)])
+    assert [s.name for s in jobs.load_models(str(path))] == [
+        "a-32k-full", "a-32k-full-2", "a-32k-lora", "a-32k-full-3"]
+
+
+@pytest.mark.parametrize("lines,error", [
+    ([_job_line(), _job_line("org/B"), json.dumps(_job_body(), indent=None, separators=(",", ":"))],
+     r"jobs.jsonl:3: the same job as line 1"),
+    ([_job_line(), '{"hardware": "H200", '], r"jobs.jsonl:2: not JSON"),
+    ([_job_line(semi_p=None)], r"jobs.jsonl:1: inference_config.semi_p must be true .*found missing"),
+    (["", _job_line(semi_p=False)], r"jobs.jsonl:2: inference_config.semi_p must be true .*found False"),
+    ([_job_line(semi_p="true")], r"jobs.jsonl:1: inference_config.semi_p must be true .*found 'true'"),
+    ([json.dumps({"hardware": "H200", "sub_job_configs": _job_body()["sub_job_configs"] * 2})],
+     r"jobs.jsonl:1: expected one sub-job in sub_job_configs, found 2"),
+    ([json.dumps({"hardware": "H200", "sub_job_configs": []})], r"jobs.jsonl:1: expected one sub-job .*found 0"),
+    ([_job_line().replace('"sampling"', '"training"')],
+     r"jobs.jsonl:1: sub_job_configs\[0\].job_type must be 'sampling'"),
+    ([json.dumps({"sub_job_configs": [{"job_type": "sampling", "model_name": "m"}]})],
+     r"jobs.jsonl:1: sub_job_configs\[0\] has no inference_config"),
+    ([json.dumps({"name": "a", "sub_job": _job_body()["sub_job_configs"][0]})],
+     r"jobs.jsonl:1: expected a semi_p job body"),
+    ([_job_line(name="a", source="x")], r"jobs.jsonl:1: unexpected field\(s\) name, source"),
+    (["[1, 2]"], r"jobs.jsonl:1: expected a semi_p job body"),
+    ([json.dumps({"sub_job_configs": [{"job_type": "sampling", "inference_config": {"semi_p": True}}]})],
+     r"jobs.jsonl:1: cannot label the job"),
+    (["", ""], r"jobs.jsonl: no job configs"),
+])
+def test_a_bad_jsonl_line_is_reported_by_its_line_number(tmp_path, lines, error):
+    with pytest.raises(ValueError, match=error):
+        jobs.load_models(str(_write_jsonl(tmp_path, lines)))
+
+
+def test_catalog_entries_and_model_files_still_refuse_semi_p(tmp_path):
+    _catalog_entry(tmp_path, "m/standard/h200-inference-full.json", _job_body()["sub_job_configs"])
+    with pytest.raises(ValueError, match="leave inference_config.semi_p out"):
+        jobs.load_models("m/standard/h200-inference-full", catalog=str(tmp_path))
+
+
+def test_publish_and_onboard_take_a_jsonl_file_among_their_models(monkeypatch, tmp_path):
+    path = _write_jsonl(tmp_path, [_job_line("org/A"), _job_line("org/B", n_gpus=1, tp=1)])
+    models = f"{path},{FIXTURES / 'qwen36-35b-a3b-tp1.json'}"
+    names = ["a-32k-full", "b-32k-full", "qwen36-35b-a3b-tp1"]
+    assert _publisher(monkeypatch, tmp_path, _PublishJob([]), models=models).models == names
+    seen = []
+    monkeypatch.setattr(onboard, "make_client", lambda *a, **k: type("C", (), {"poll_backoff_multiplier": 2.0})())
+    monkeypatch.setattr(onboard.Runner, "run_many", lambda self, specs: seen.extend(specs) or [])
+    monkeypatch.setattr(onboard.report, "write_summary", lambda *a: tmp_path / "summary.md")
+    monkeypatch.setattr(onboard.book, "write", lambda *a: tmp_path / "ONBOARDING.md")
+    onboard.main(["config=x", "debug_image_tag=T", f"models={models}", f"out_dir={tmp_path}"])
+    assert [s.name for s in seen] == names
+
+
+def test_rereport_rereads_a_jsonl_lines_defaults(tmp_path):
+    path = _write_jsonl(tmp_path, [_job_line("org/A"), _job_line("org/B")])
+    saved = {"thresholds": {"ttft_ratio_max": 9.0}}
+    assert rereport._current_thresholds({"model": {"name": "b-32k-full", "file": f"{path}:2"}}, saved) == {}
+    assert rereport._current_thresholds({"model": {"name": "gone", "file": f"{path}:9"}}, saved) == saved["thresholds"]
+
+
+def test_checks_take_a_subset_or_none():
+    assert onboard.parse_checks(None) == onboard.parse_checks("") == {"correctness", "perf"}
+    assert onboard.parse_checks("perf") == {"perf"} and onboard.parse_checks("none") == set()
+    for bad in ("perf,corectness", ",", "none,perf"):
+        with pytest.raises(SystemExit, match="checks="):
+            onboard.parse_checks(bad)
+
+
+def test_on_hit_with_no_checks_only_restores_and_reports_start_up(monkeypatch, tmp_path):
+    cluster = _NoDefaultCluster()
+    result = _runner(monkeypatch, tmp_path, cluster, variants="on_hit", checks="none").run_one(_spec(tp=2, n_gpus=8))
+    assert report.verdict(result) == ("PASS", []) and cluster.n == 0 and cluster.cancelled == ["job-on_hit"]
+    assert "correctness" not in result and "perf" not in result and "perf_note" not in result
+    assert result["startup"]["semi_p"]["restored"] and result["startup"]["on_timeline"]["submit_to_running_s"] >= 0
+    assert "## Start-up" in report.markdown(result) and "## Correctness" not in report.markdown(result)
+
+
+def test_on_hit_with_no_checks_still_fails_a_cold_start(monkeypatch, tmp_path):
+    cluster = _NoDefaultCluster()
+    cluster.logs = {**cluster.logs, "on_hit": _MISS_LOG}
+    result = _runner(monkeypatch, tmp_path, cluster, variants="on_hit", checks="none").run_one(_spec(tp=2, n_gpus=8))
+    assert report.verdict(result)[0] == "FAIL" and "cold-started" in result["error"]
+
+
+def test_wait_verified_reads_the_nodes_from_the_given_context():
+    from arctic_platform.inference.semi_persistence.onboarding import verify
+
+    calls = []
+    kubectl = _fake_kubectl(ready_after=0)
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return kubectl(argv, **kwargs)
+
+    verify.wait_verified(["image-cache/M/skeleton/k"], 600, "m", run=run, sleep=lambda _s: None, clock=lambda: 0.0)
+    assert all(argv[:3] == ["kubectl", "--request-timeout=30s", "get"] for argv in calls)
+    calls.clear()
+    verify.wait_verified(["image-cache/M/skeleton/k"], 600, "m", run=run, sleep=lambda _s: None, clock=lambda: 0.0,
+                         context="sfc-or-prod-meta-k8s-2")
+    assert calls and all(argv[:3] == ["kubectl", "--context=sfc-or-prod-meta-k8s-2", "--request-timeout=30s"]
+                         for argv in calls)
+
+
+@pytest.mark.parametrize("args,context", [({}, None), ({"kube_context": "ctx-2"}, "ctx-2")])
+def test_onboard_checks_the_node_cache_on_its_kube_context(monkeypatch, tmp_path, args, context):
+    seen = []
+    monkeypatch.setattr(onboard.verify, "wait_verified", lambda *a, **k: seen.append(k) or "verified on 1/1 nodes")
+    _runner(monkeypatch, tmp_path, _NoDefaultCluster(), variants="on_hit", checks="none", **args).run_one(_spec())
+    assert seen == [{"context": context}]

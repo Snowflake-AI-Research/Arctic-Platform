@@ -20,8 +20,9 @@
         [reserve_gpus=8] [out_dir=onboarding_reports/publish] [timeout_s=7200] \\
         [model_bucket=NAME]
 
-``models`` are model catalog entries (``glm-5.3/standard/h200-inference-full``)
-or paths to JSON files; see ``jobs.load_model`` for ``catalog``. ``model_bucket``
+``models`` are model catalog entries (``glm-5.3/standard/h200-inference-full``),
+paths to JSON files, or paths to ``.jsonl`` files of one semi_p job body per
+line (``jobs.load_models``); see ``jobs.load_model`` for ``catalog``. ``model_bucket``
 is the cluster's model bucket, set as each job's MODEL_BUCKET for the engine to
 publish to (default: the engine's, QA6's). For each, at its published size:
 
@@ -65,7 +66,7 @@ from arctic_platform.inference.semi_persistence.onboarding.common import parse_k
 from arctic_platform.inference.semi_persistence.onboarding.jobs import MODEL_BUCKET_ENV
 from arctic_platform.inference.semi_persistence.onboarding.jobs import TERMINAL
 from arctic_platform.inference.semi_persistence.onboarding.jobs import ModelSpec
-from arctic_platform.inference.semi_persistence.onboarding.jobs import load_model
+from arctic_platform.inference.semi_persistence.onboarding.jobs import load_models
 from arctic_platform.inference.semi_persistence.onboarding.jobs import normalize_status
 from arctic_platform.inference.semi_persistence.onboarding.startup import follow_sub_job_log
 from arctic_platform.inference.semi_persistence.onboarding.startup import merge_lines
@@ -153,7 +154,7 @@ class Publisher:
             if not args.get(key):
                 raise SystemExit(f"{key}= is required")
         self.image_tag = args["image_tag"]
-        specs = [load_model(m, args.get("catalog")) for m in args["models"].split(",") if m]
+        specs = [s for m in args["models"].split(",") if m for s in load_models(m, args.get("catalog"))]
         self.specs = {spec.name: spec for spec in specs}
         self.models = list(self.specs)
         self.max_gpus = int(args.get("max_gpus", "40"))

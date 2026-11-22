@@ -20,6 +20,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import re
 import subprocess
 import threading
 import time
@@ -161,13 +162,18 @@ def load_model(ref: str, catalog: str | None = None) -> ModelSpec:
         if len(subs) != 1:
             raise ValueError(f"{source}: expected one sub-job in sub_job_configs, found {len(subs)}")
         raw = {"name": catalog_name(rel), "sub_job": subs[0]}
+    return _model_file(raw, source, Path(source).stem)
+
+
+def _model_file(raw: dict, source: str, default_name: str) -> ModelSpec:
+    """A model file's ``ModelSpec``, its sub-job checked."""
     sub_job = raw["sub_job"]
     if sub_job.get("job_type") != "sampling":
         raise ValueError(f"{source}: sub_job.job_type must be 'sampling'")
     if "semi_p" in sub_job.get("inference_config", {}):
         raise ValueError(f"{source}: leave inference_config.semi_p out; the suite sets it per job")
     return ModelSpec(
-        name=raw.get("name", Path(source).stem),
+        name=raw.get("name", default_name),
         sub_job=sub_job,
         thresholds=raw.get("thresholds", {}),
         perf=raw.get("perf", {}),
@@ -175,6 +181,89 @@ def load_model(ref: str, catalog: str | None = None) -> ModelSpec:
         copies=raw.get("copies"),
         path=source,
     )
+
+
+JOB_BODY_KEYS = ("hardware", "sub_job_configs")
+
+
+def seq_label(max_seq_len: int) -> str:
+    """``max_seq_len`` for a label: 32768 -> 32k, 720896 -> 704k, else the number."""
+    return f"{max_seq_len // 1024}k" if max_seq_len % 1024 == 0 else str(max_seq_len)
+
+
+def job_label(sub_job: dict) -> str:
+    """A semi_p job's label from its sub-job: model basename, context, full or
+    lora (``peft_config`` set), e.g. ``qwen3-0.6b-32k-full``."""
+    ic = sub_job["inference_config"]
+    base = re.sub(r"[^a-z0-9._-]+", "-", str(sub_job["model_name"]).rstrip("/").rsplit("/", 1)[-1].lower()).strip("-")
+    return f"{base or 'model'}-{seq_label(int(ic['max_seq_len']))}-{'lora' if ic.get('peft_config') else 'full'}"
+
+
+def _job_body_line(raw: Any, source: str) -> dict:
+    """The sampling sub-job of one ``.jsonl`` line, a job body as submitted for a
+    semi_p job, with ``semi_p`` taken out (the suite sets it per job)."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("sub_job_configs"), list):
+        raise ValueError(f"{source}: expected a semi_p job body, "
+                         '{"hardware": ..., "sub_job_configs": [one sampling sub-job]}')
+    extra = sorted(set(raw) - set(JOB_BODY_KEYS))
+    if extra:
+        raise ValueError(f"{source}: unexpected field(s) {', '.join(extra)}; a line holds only "
+                         f"{' and '.join(JOB_BODY_KEYS)}")
+    subs = raw["sub_job_configs"]
+    if len(subs) != 1:
+        raise ValueError(f"{source}: expected one sub-job in sub_job_configs, found {len(subs)}")
+    sub = deepcopy(subs[0])
+    if not isinstance(sub, dict) or sub.get("job_type") != "sampling":
+        raise ValueError(f"{source}: sub_job_configs[0].job_type must be 'sampling'")
+    ic = sub.get("inference_config")
+    if not isinstance(ic, dict):
+        raise ValueError(f"{source}: sub_job_configs[0] has no inference_config")
+    if ic.get("semi_p") is not True:
+        found = "missing" if "semi_p" not in ic else f"{ic['semi_p']!r}"
+        raise ValueError(f"{source}: inference_config.semi_p must be true (the line is the semi_p job "
+                         f"as submitted), found {found}")
+    del ic["semi_p"]
+    return sub
+
+
+def load_models(ref: str, catalog: str | None = None) -> list[ModelSpec]:
+    """The job configs ``ref`` names: for a ``.jsonl`` file, one per non-blank
+    line, each a semi_p job body exactly as a user submits it (a catalog entry's
+    ``{"hardware", "sub_job_configs": [one sampling sub-job]}`` with
+    ``inference_config.semi_p: true``), labelled by ``job_label`` with -2, -3, ...
+    appended in file order to a label already taken; else
+    ``[load_model(ref, catalog)]``."""
+    path = Path(ref).expanduser()
+    if not (ref.endswith(".jsonl") and path.is_file()):
+        return [load_model(ref, catalog)]
+    specs: dict[str, ModelSpec] = {}
+    bodies: dict[str, int] = {}
+    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        source = f"{path}:{n}"
+        try:
+            raw = json.loads(line)
+        except ValueError as exc:
+            raise ValueError(f"{source}: not JSON ({exc})") from exc
+        sub = _job_body_line(raw, source)
+        canonical = json.dumps(raw, sort_keys=True)
+        if canonical in bodies:
+            raise ValueError(f"{source}: the same job as line {bodies[canonical]}")
+        bodies[canonical] = n
+        try:
+            label = job_label(sub)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{source}: cannot label the job (needs model_name and "
+                             f"inference_config.max_seq_len): {exc!r}") from exc
+        name, k = label, 1
+        while name in specs:
+            k += 1
+            name = f"{label}-{k}"
+        specs[name] = _model_file({"name": name, "sub_job": sub}, source, name)
+    if not specs:
+        raise ValueError(f"{path}: no job configs")
+    return list(specs.values())
 
 
 def copies_for(spec: ModelSpec, override: int | None = None, gpus_per_node: int = GPUS_PER_NODE) -> int:

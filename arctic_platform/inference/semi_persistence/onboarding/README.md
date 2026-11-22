@@ -122,14 +122,14 @@ was dumped on. The suite sets `CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS=1` for you.
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `models` | required | Comma-separated model catalog entries (`glm-5.3/standard/h200-inference-full`), or paths to model files |
+| `models` | required | Comma-separated model catalog entries (`glm-5.3/standard/h200-inference-full`), paths to model files, or paths to `.jsonl` files of semi_p job bodies (see [Model configs](#model-configs)) |
 | `catalog` | cortex-training main on GitHub | Local checkout of the catalog's `models/` directory to read the entries from |
 | `debug_image_tag` | required | Backend image for every job |
 | `variants` | all four | Subset of `on_hit,off_default,on_miss,off_matched` that includes `on_hit` (see [Variant sets](#variant-sets)) |
 | `copies` | 2 for whole-node configs, else 1 | Perf pair size, as a multiple of the published `n_gpus` |
 | `miss_image_cache` | none | Local image-cache root for `on_miss`; a per-run subdirectory is used, so a copy left by an earlier job cannot turn the miss into a hit |
 | `model_bucket` | the engine's (QA6's) | The cluster's model bucket, set as every job's `MODEL_BUCKET` for a semi_p engine to publish to; needed off QA6, since the device-manager pod's environment does not carry it |
-| `checks` | `correctness,perf` | Run a subset |
+| `checks` | `correctness,perf` | Run a subset, or `none`: with `variants=on_hit`, only the restore (under `require_restore` the run fails unless `on_hit` restored) and the start-up report |
 | `require_restore` | `true` | Stop if `on_hit` cold-starts |
 | `max_gpus` | free GPUs at start, minus `reserve_gpus` | GPU budget for concurrent models |
 | `max_nodes` | none | Node budget; each job counts as whole nodes, so a 1-GPU job costs one |
@@ -143,6 +143,7 @@ was dumped on. The suite sets `CORTEX_TRAINING_ENABLE_DEBUG_OPTIONS=1` for you.
 | `log_wait_s` | `90` | How long to keep re-reading a served job's log, before cancelling it, until it shows the job's start-up total |
 | `publish_dir` | `<out_dir>/publish` | Where `publish` wrote `<image_tag>/summary.json` |
 | `verify_timeout_s` | `3600` | How long to wait for the published image to be verified on every node |
+| `kube_context` | the current one | kubeconfig context the nodes are read from (`kubectl --context`) |
 
 A restore refuses a published skeleton or weights that its node has not yet
 verified, and the node cache verifies them on each node some minutes after the
@@ -214,6 +215,30 @@ compressed skeleton pages, `raw` otherwise), `raw_bytes`, `stored_bytes`,
 one that waits for the nodes to verify the image. Then onboard the models with
 `debug_image_tag` set to the same image.
 
+### Publish and test a job list (the semip-publish Jenkins job)
+
+`semip_job` runs publish, then optionally onboard, for a `.jsonl` of jobs (see
+[Model configs](#model-configs)) on GitHub, on one cluster:
+
+```bash
+python -m arctic_platform.inference.semi_persistence.onboarding.semip_job cluster=qa6 \
+    image_tag=release_20261119_163502_6ed8c6d2361-h max_gpus=16 tests=functional,correctness \
+    configs=https://github.com/OWNER/cortex-training/blob/REF/model-catalog/semip_models/jobs.jsonl \
+    connection=qa6.config [dry_run=true] [out_dir=semip_job]
+```
+
+`cluster` (`qa6` or `prod`) sets `model_bucket` and the kubeconfig context the
+node cache is checked on (`kube_context=`, passed as `kubectl --context`; the
+kubeconfig's current context is not changed). `configs` is a blob link at a
+commit or a branch, resolved to its commit, fetched and recorded in
+`<out_dir>/configs.json`. `tests` maps to onboard: `functional` is
+`variants=on_hit checks=none`, `correctness` and `performance` add
+`off_default` and `checks=correctness` / `perf`; all with `require_restore=true`.
+Both tools get `max_gpus` with `reserve_gpus=0`. `dry_run=true` parses every
+line and writes `plan.txt` / `plan.json` with the exact commands, and submits
+nothing; a run writes `result.md` / `result.json` and fails if a job did not
+publish or a requested test failed or could not fit `max_gpus`.
+
 ## Model configs
 
 Configs come from the model catalog (`model-catalog/models/` in cortex-training):
@@ -241,6 +266,22 @@ per job), plus optional overrides:
   "correctness": {"greedy_prompts": 8, "max_tokens": 48, "logprob_atol": 0.001}
 }
 ```
+
+A `.jsonl` file holds one job per non-blank line, each exactly the body a user
+submits for a semi_p job: a catalog entry on one line with `"semi_p": true` in
+its `inference_config`, so any line can be submitted as is and restores.
+
+```json
+{"hardware":"H200","sub_job_configs":[{"job_type":"sampling","model_name":"Qwen/Qwen3-0.6B","dtype":"bfloat16","seed":42,"inference_config":{"max_seq_len":32768,"n_gpus":1,"vllm_config":{"tensor_parallel_size":1,"gpu_memory_utilization":0.8},"semi_p":true}}]}
+```
+
+A line must hold only `hardware` and `sub_job_configs`, with one sampling
+sub-job and `semi_p` exactly `true`; an error names the line. The suite takes
+`semi_p` out and sets it per job, as for a catalog entry. Each job is labelled
+from its sub-job, `<model basename>-<max_seq_len>-<full|lora>` (`lora` when
+`peft_config` is set; `max_seq_len` in units of 1024, `32768` is `32k`):
+`qwen3-0.6b-32k-full`. A label already taken gets `-2`, `-3`, ... in file
+order; a line repeating an earlier one is refused.
 
 Replicas are `n_gpus / (tensor_parallel_size x pipeline_parallel_size)`.
 

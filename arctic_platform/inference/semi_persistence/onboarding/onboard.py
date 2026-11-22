@@ -54,7 +54,9 @@ models, they run concurrently within ``max_gpus``, largest first.
 Arguments (``key=value``):
   config           connection file (required)
   models           comma-separated model catalog entries (e.g.
-                   glm-5.3/standard/h200-inference-full), or paths to JSON files
+                   glm-5.3/standard/h200-inference-full), paths to JSON files, or
+                   paths to .jsonl files of one semi_p job body per line (see
+                   jobs.load_models)
   catalog          local checkout of the model catalog's models/ directory;
                    default: read the entries from cortex-training main on GitHub
   debug_image_tag  backend image for every job (required): the one the models'
@@ -72,7 +74,9 @@ Arguments (``key=value``):
   model_bucket     the cluster's model bucket, set as every job's MODEL_BUCKET
                    for a semi_p engine to publish to (default: the engine's,
                    QA6's)
-  checks           comma-separated subset of correctness,perf (default both)
+  checks           comma-separated subset of correctness,perf (default both), or
+                   none: with variants=on_hit, only the restore and start-up
+                   (with require_restore, the run fails unless on_hit restored)
   require_restore  stop when on_hit cold-starts (default true)
   max_gpus         GPU budget for concurrent models (default: free GPUs now
                    minus reserve_gpus)
@@ -94,6 +98,8 @@ Arguments (``key=value``):
                    model's skeleton and weights (default <out_dir>/publish)
   verify_timeout_s how long to wait for them to be verified on every node
                    (default 3600)
+  kube_context     kubeconfig context that check reads the nodes from (default:
+                   the current one)
   pre_cancel_hook  shell command run for each job just before it is cancelled,
                    with {job_id}, {variant} and {miss_image_cache} (the on_miss
                    job's cache directory, else empty) filled in; e.g. to delete
@@ -140,7 +146,7 @@ from arctic_platform.inference.semi_persistence.onboarding.jobs import VARIANTS
 from arctic_platform.inference.semi_persistence.onboarding.jobs import JobTracker
 from arctic_platform.inference.semi_persistence.onboarding.jobs import ModelSpec
 from arctic_platform.inference.semi_persistence.onboarding.jobs import build_variant_bodies
-from arctic_platform.inference.semi_persistence.onboarding.jobs import load_model
+from arctic_platform.inference.semi_persistence.onboarding.jobs import load_models
 from arctic_platform.inference.semi_persistence.onboarding.jobs import plain_baseline
 from arctic_platform.inference.semi_persistence.onboarding.jobs import plan_variants
 from arctic_platform.inference.semi_persistence.onboarding.jobs import copies_for
@@ -150,6 +156,8 @@ from arctic_platform.inference.semi_persistence.onboarding.client import enable_
 from arctic_platform.inference.semi_persistence.onboarding.client import make_client
 
 logger = logging.getLogger(__name__)
+
+CHECKS = ("correctness", "perf")
 
 
 def perf_sides(variants: Any) -> dict[str, str]:
@@ -167,6 +175,26 @@ def perf_sides(variants: Any) -> dict[str, str]:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def parse_checks(value: str | None) -> set[str]:
+    """``checks=``: a subset of correctness,perf (default both), or ``none``."""
+    if (value or "").strip() == "none":
+        return set()
+    checks = {c for c in (value or "correctness,perf").split(",") if c}
+    if not checks or checks - set(CHECKS):
+        raise SystemExit(f"checks= takes a subset of {','.join(CHECKS)} or none, got {value!r}")
+    return checks
+
+
+def footprint(spec: ModelSpec, variants: list[str], copies: int | None = None,
+              gpus_per_node: int = GPUS_PER_NODE) -> tuple[int, int]:
+    """``(GPUs, nodes)`` all of one model's jobs hold together. A job counts as
+    whole nodes, since a node it shares is not one another job can use whole."""
+    planned, _ = plan_variants(spec, variants)
+    n = copies_for(spec, copies)
+    gpus = [spec.n_gpus * (n if v in PERF_VARIANTS else 1) for v in planned]
+    return sum(gpus), sum(-(-g // gpus_per_node) for g in gpus)
 
 
 def job_replicas(spec: ModelSpec, copies: int, variants: list[str]) -> dict[str, int]:
@@ -223,13 +251,14 @@ class Runner:
             raise SystemExit("debug_image_tag=TAG is required: the backend image the models were published on")
         self.image_tag = args["debug_image_tag"]
         self.variants = [v for v in (args.get("variants") or ",".join(VARIANTS)).split(",") if v]
-        self.checks = set((args.get("checks") or "correctness,perf").split(","))
+        self.checks = parse_checks(args.get("checks"))
         self.require_restore = as_bool(args.get("require_restore", "true"))
         self.keep_jobs = as_bool(args.get("keep_jobs", "false"))
         self.out_dir = args.get("out_dir", "onboarding_reports")
         self.timeout_s = float(args.get("timeout_s", "3600"))
         self.publish_dir = args.get("publish_dir") or str(Path(self.out_dir) / "publish")
         self.verify_timeout_s = float(args.get("verify_timeout_s", "3600"))
+        self.kube_context = args.get("kube_context") or None
         self.copies = int(args["copies"]) if args.get("copies") else None
         self.miss_image_cache = args.get("miss_image_cache") or None
         self.model_bucket = args.get("model_bucket") or None
@@ -263,12 +292,7 @@ class Runner:
         return client
 
     def footprint(self, spec: ModelSpec) -> tuple[int, int]:
-        """``(GPUs, nodes)`` all of one model's jobs hold together. A job counts as
-        whole nodes, since a node it shares is not one another job can use whole."""
-        variants, _ = plan_variants(spec, self.variants)
-        copies = copies_for(spec, self.copies)
-        gpus = [spec.n_gpus * (copies if v in PERF_VARIANTS else 1) for v in variants]
-        return sum(gpus), sum(-(-g // self.gpus_per_node) for g in gpus)
+        return footprint(spec, self.variants, self.copies, self.gpus_per_node)
 
     def wait_for_capacity(self, gpus: int, name: str) -> None:
         """Block until ``gpus`` are free with ``reserve_gpus`` still left over."""
@@ -334,7 +358,8 @@ class Runner:
             if not attached and "on_hit" in variants:
                 summary = Path(self.publish_dir).expanduser() / image_tag / "summary.json"
                 result["published_image"] = verify.wait_verified(
-                    verify.published_dirs(summary, spec.name), self.verify_timeout_s, spec.name)
+                    verify.published_dirs(summary, spec.name), self.verify_timeout_s, spec.name,
+                    context=self.kube_context)
                 checked = not result["published_image"].startswith("not checked")
                 logger.log(logging.INFO if checked else logging.WARNING, "%s: published image %s",
                            spec.name, result["published_image"])
@@ -610,7 +635,7 @@ def main(argv: list[str]) -> int:
         logging.getLogger(noisy).setLevel(logging.WARNING)
     args = parse_kv_args(argv)
     runner = Runner(args)
-    specs = [load_model(m, args.get("catalog")) for m in (args.get("models") or "").split(",") if m]
+    specs = [s for m in (args.get("models") or "").split(",") if m for s in load_models(m, args.get("catalog"))]
     if not specs:
         raise SystemExit("models=NAME[,NAME...] is required")
     if runner.attach and len(specs) != 1:

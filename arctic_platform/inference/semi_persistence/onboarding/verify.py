@@ -20,7 +20,8 @@ each directory to every node and stamps ``model.neutrino.snowflake.com/<dir>=rea
 on a node once it has digest-checked every file there. A restore refuses a
 directory its node has not verified, so a test waits for the labels first.
 The label rules and the node pools are semip_publish.py's; the labels are read
-with ``kubectl``, so this needs a kubeconfig for the cluster.
+with ``kubectl``, so this needs a kubeconfig for the cluster (its current
+context, or the one ``context`` names).
 """
 
 from __future__ import annotations
@@ -60,13 +61,16 @@ def published_dirs(summary_path: Path, model: str) -> list[str]:
     return [f"{root}/{pub.SKELETON_DIR}/{entry['skeleton']}", f"{root}/{pub.WEIGHT_DIR}/{entry['weight_hash']}"]
 
 
-def node_counts(dirs: list[str], run: Callable = subprocess.run) -> tuple[dict[str, int], int]:
-    """``({dir: nodes that verified it}, cache nodes)``."""
+def node_counts(dirs: list[str], run: Callable = subprocess.run,
+                context: str | None = None) -> tuple[dict[str, int], int]:
+    """``({dir: nodes that verified it}, cache nodes)``, from kubeconfig context
+    ``context`` (default: the current one)."""
     pub = _publisher()
     pools = f"workergroup in ({','.join(pub._CACHE_NODE_POOLS)})"
+    kubectl = ["kubectl", *([f"--context={context}"] if context else []), "--request-timeout=30s"]
 
     def count(selector: str) -> int:
-        out = run(["kubectl", "--request-timeout=30s", "get", "nodes", "-l", selector, "-o", "name"],
+        out = run([*kubectl, "get", "nodes", "-l", selector, "-o", "name"],
                   capture_output=True, text=True, check=True).stdout
         return len(out.split())
 
@@ -77,9 +81,10 @@ def node_counts(dirs: list[str], run: Callable = subprocess.run) -> tuple[dict[s
 
 def wait_verified(dirs: list[str], timeout_s: float, name: str, poll_s: float = 20.0,
                   run: Callable = subprocess.run, sleep: Callable = time.sleep,
-                  clock: Callable = time.monotonic) -> str:
-    """Block until every directory is verified on every cache node; return a note
-    for the report. Raises when ``timeout_s`` passes first."""
+                  clock: Callable = time.monotonic, context: str | None = None) -> str:
+    """Block until every directory is verified on every cache node of kubeconfig
+    context ``context`` (default: the current one); return a note for the report.
+    Raises when ``timeout_s`` passes first."""
     if not dirs:
         return "not checked: the publish summary records no skeleton for this config and image"
     if run is subprocess.run and not shutil.which("kubectl"):
@@ -88,7 +93,7 @@ def wait_verified(dirs: list[str], timeout_s: float, name: str, poll_s: float = 
     last = None
     while True:
         try:
-            ready, total = node_counts(dirs, run)
+            ready, total = node_counts(dirs, run, context)
         except (OSError, subprocess.CalledProcessError) as exc:
             return f"not checked: kubectl failed ({exc})"
         if total and all(n == total for n in ready.values()):

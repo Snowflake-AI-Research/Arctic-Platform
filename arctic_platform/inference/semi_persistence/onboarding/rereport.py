@@ -79,7 +79,11 @@ def _pod_logs(paths: list[str], job_id: str | None) -> dict[str, list[str]]:
 def _current_thresholds(result: dict, pf: dict) -> dict:
     """The model file's thresholds over today's defaults; the saved ones if the file is gone."""
     try:
-        return jobs.load_model(result["model"].get("file") or result["model"]["name"]).thresholds
+        ref = result["model"].get("file") or result["model"]["name"]
+        jsonl, _, line = ref.rpartition(":")
+        if jsonl.endswith(".jsonl") and line.isdigit():
+            return {s.name: s for s in jobs.load_models(jsonl)}[result["model"]["name"]].thresholds
+        return jobs.load_model(ref).thresholds
     except (OSError, KeyError, ValueError):
         return pf.get("thresholds") or {}
 
