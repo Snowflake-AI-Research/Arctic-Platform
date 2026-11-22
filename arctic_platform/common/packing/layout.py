@@ -55,12 +55,13 @@ gathers K/V itself. Hugging Face flash attention gets the gather from a wrapper 
 context only; the wrapper passes modules with an unshared stash through and refuses
 already-gathered K/V.
 
-Only flash-attn 2 (>= 2.1, installed as ``flash_attn``) has been checked on GPU against an
-unshared run, so a sharing layout refuses FA3 / FA4 ``FlashAttention`` and any Hugging Face
-implementation other than ``flash_attention_2``. Mixers are found by class name and by a
-direct ``Conv1d`` child; any that is not one of the flash attentions above (Mamba / SSM,
-GatedDeltaNet, short convolutions) refuses a sharing layout, because it would restart its
-state at each continuation instead of carrying the root's.
+Only flash-attn 2 (>= 2.1, the ``flash_attn`` package) and FA3 (the ``flash_attn_3``
+package) have been checked on GPU against an unshared run, so a sharing layout refuses FA4
+``FlashAttention`` and Hugging Face implementations other than ``flash_attention_2`` /
+``flash_attention_3``, and needs the kernel each mixer calls installed. Mixers are found by
+class name and by a direct ``Conv1d`` child; any that is not one of the flash attentions
+above (Mamba / SSM, GatedDeltaNet, short convolutions) refuses a sharing layout, because it
+would restart its state at each continuation instead of carrying the root's.
 
 Not supported inside :func:`using_layout` until the GatedDeltaNet and executor PRs define
 them: sequence parallelism (SP >= 2, a shard's ``position_ids`` do not cover the layout)
@@ -657,7 +658,7 @@ def using_layout(model: torch.nn.Module, layout: PackedLayout | None) -> Iterato
     if layout is not None and layout.has_sharing:
         require_prefix_continuation(model)
         require_router_replay_decision(model, layout)
-        require_bottom_right_causal_flash()
+        require_bottom_right_causal_flash(model)
     previous_stash = [(module, module.__dict__.get(LAYOUT_ATTR, _MISSING)) for module in model.modules()]
     with ExitStack() as stack:
         stack.enter_context(_owning_thread())
@@ -722,30 +723,46 @@ def prefix_varlen_args(
     return k.index_select(0, idx), v.index_select(0, idx), cu_q, cu_k, layout.max_len_q, layout.max_len_k
 
 
-def _installed_flash_attn_version() -> tuple[int, int] | None:
+def _installed_version(distribution: str) -> tuple[int, int] | None:
     from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version
 
     try:
-        raw = version("flash_attn")
+        raw = version(distribution)
     except PackageNotFoundError:
         return None
     match = re.match(r"(\d+)\.(\d+)", raw)
     if match is None:
-        raise ValueError(f"cannot parse the installed flash_attn version {raw!r}")
+        raise ValueError(f"cannot parse the installed {distribution} version {raw!r}")
     return int(match.group(1)), int(match.group(2))
 
 
-def require_bottom_right_causal_flash() -> None:
-    """flash-attn < 2.1 aligns the causal mask top-left when a segment has more keys than queries."""
-    installed = _installed_flash_attn_version()
-    if installed is None:
-        raise ValueError("prefix sharing needs the flash_attn package (>= 2.1); it is not installed")
-    if installed < (2, 1):
-        raise ValueError(
-            "prefix sharing needs flash-attn >= 2.1 (bottom-right causal alignment); found"
-            f" {installed[0]}.{installed[1]}"
-        )
+# Flash kernel generation -> (distribution, oldest version that aligns causal masks bottom-right when a
+# segment has more keys than queries). flash-attn < 2.1 aligns them top-left; FA3 is bottom-right throughout.
+_FLASH_KERNELS = {2: ("flash_attn", (2, 1)), 3: ("flash_attn_3", (3, 0))}
+_HF_FLASH_KERNELS = {"flash_attention_2": 2, "flash_attention_3": 3}
+
+
+def _flash_kernel(module: torch.nn.Module) -> int:
+    if type(module) in _NATIVE_PREFIX_ATTENTION:
+        return getattr(module, "_flash_attn_version", 2)
+    return _HF_FLASH_KERNELS[module.config._attn_implementation]
+
+
+def require_bottom_right_causal_flash(model: torch.nn.Module) -> None:
+    """Every flash kernel ``model``'s mixers call must be installed and align the causal mask bottom-right."""
+    for kernel in sorted({_flash_kernel(module) for module in sequence_mixers(model)}):
+        distribution, oldest = _FLASH_KERNELS[kernel]
+        installed = _installed_version(distribution)
+        if installed is None:
+            raise ValueError(
+                f"prefix sharing needs the {distribution} package (>= {oldest[0]}.{oldest[1]}); it is not installed"
+            )
+        if installed < oldest:
+            raise ValueError(
+                f"prefix sharing needs {distribution} >= {oldest[0]}.{oldest[1]} (bottom-right causal alignment);"
+                f" found {installed[0]}.{installed[1]}"
+            )
 
 
 def _hf_prefix_attention_fn(orig: Callable) -> Callable:
@@ -868,14 +885,14 @@ def _prefix_continuation_blocker(module: torch.nn.Module) -> str | None:
     name = type(module).__name__
     if type(module) in _NATIVE_PREFIX_ATTENTION:
         version = getattr(module, "_flash_attn_version", 2)
-        if version != 2:
-            return f"{name} (flash-attn {version}; only flash-attn 2 is verified for prefix continuation)"
+        if version not in _FLASH_KERNELS:
+            return f"{name} (flash-attn {version}; only flash-attn 2 and 3 are verified for prefix continuation)"
         return None
     if name not in _HF_PREFIX_ATTENTION:
         return f"{name} (no prefix-continuation path)"
     impl = getattr(getattr(module, "config", None), "_attn_implementation", None)
-    if impl != "flash_attention_2":
-        return f"{name} (attn_implementation={impl!r}, needs flash_attention_2)"
+    if impl not in _HF_FLASH_KERNELS:
+        return f"{name} (attn_implementation={impl!r}, needs flash_attention_2 or flash_attention_3)"
     if getattr(module, "sliding_window", None) is not None:
         return f"{name} (Hugging Face sliding window)"
     return None

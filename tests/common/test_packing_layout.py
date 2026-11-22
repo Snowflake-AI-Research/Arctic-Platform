@@ -61,8 +61,8 @@ F64_ATOL = 1e-12
 
 @pytest.fixture(autouse=True)
 def _reference_flash_attn(monkeypatch):
-    """The reference kernel stands in for flash-attn 2.8 here, installed or not."""
-    monkeypatch.setattr(layout_module, "_installed_flash_attn_version", lambda: (2, 8))
+    """The reference kernel stands in for flash-attn 2.8 and FA3 here, installed or not."""
+    monkeypatch.setattr(layout_module, "_installed_version", {"flash_attn": (2, 8), "flash_attn_3": (3, 0)}.get)
 
 
 @register_native_prefix_attention
@@ -600,15 +600,17 @@ def test_require_prefix_continuation_rejects_unsupported_mixers():
         require_prefix_continuation(Qwen3Attention(sliding_window=4))
     with pytest.raises(ValueError, match="Qwen2Attention"):
         require_prefix_continuation(Qwen2Attention())
-    with pytest.raises(ValueError, match="needs flash_attention_2"):
-        require_prefix_continuation(Qwen3Attention(impl="flash_attention_3"))
+    require_prefix_continuation(Qwen3Attention(impl="flash_attention_3"))
+    with pytest.raises(ValueError, match="needs flash_attention_2 or flash_attention_3"):
+        require_prefix_continuation(Qwen3Attention(impl="kernels-community/flash-attn"))
     with pytest.raises(ValueError, match="no sequence mixers"):
         require_prefix_continuation(nn.Linear(1, 1))
 
-    fa3 = FlashAttention()
-    fa3._flash_attn_version = 3
-    with pytest.raises(ValueError, match="flash-attn 3"):
-        require_prefix_continuation(fa3)
+    fa3, fa4 = FlashAttention(), FlashAttention()
+    fa3._flash_attn_version, fa4._flash_attn_version = 3, 4
+    require_prefix_continuation(fa3)
+    with pytest.raises(ValueError, match="flash-attn 4"):
+        require_prefix_continuation(fa4)
 
 
 def test_sharing_refuses_state_space_and_conv_mixers():
@@ -642,23 +644,40 @@ def test_sharing_refuses_state_space_and_conv_mixers():
 def test_sharing_refuses_top_left_causal_flash_attn(monkeypatch):
     batch, layout = _shared_layout()
     unshared = PackedLayout.build(batch["attention_mask"], *unshared_groups(2), batch["position_ids"])
-    monkeypatch.setattr(layout_module, "_installed_flash_attn_version", lambda: (2, 0))
-    with pytest.raises(ValueError, match="flash-attn >= 2.1"):
+    fa3 = FlashAttention()
+    fa3._flash_attn_version = 3
+
+    def installed(**versions):
+        monkeypatch.setattr(layout_module, "_installed_version", versions.get)
+
+    installed(flash_attn=(2, 0), flash_attn_3=(3, 0))
+    with pytest.raises(ValueError, match="flash_attn >= 2.1"):
         with using_layout(FlashAttention(), layout):
             pass
     assert get_active_packed_layout() is None
     with using_layout(FlashAttention(), unshared):
         pass
-    monkeypatch.setattr(layout_module, "_installed_flash_attn_version", lambda: None)
-    with pytest.raises(ValueError, match="not installed"):
-        with using_layout(FlashAttention(), layout):
-            pass
-    with using_layout(FlashAttention(), unshared):
+    with using_layout(fa3, layout):
         pass
-    for installed in ((2, 1), (2, 8)):
-        monkeypatch.setattr(layout_module, "_installed_flash_attn_version", lambda: installed)
+
+    installed()
+    with pytest.raises(ValueError, match="flash_attn package .* not installed"):
         with using_layout(FlashAttention(), layout):
             pass
+    with pytest.raises(ValueError, match="flash_attn_3 package .* not installed"):
+        with using_layout(fa3, layout):
+            pass
+    for model in (FlashAttention(), fa3):
+        with using_layout(model, unshared):
+            pass
+
+    for version in ((2, 1), (2, 8)):
+        installed(flash_attn=version)
+        with using_layout(FlashAttention(), layout):
+            pass
+    installed(flash_attn_3=(3, 0))
+    with using_layout(fa3, layout):
+        pass
 
 
 def test_using_layout_validates_before_stashing():

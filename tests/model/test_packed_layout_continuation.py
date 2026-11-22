@@ -67,8 +67,8 @@ SHARED_GRAD_ATOL = 1e-7
 
 @pytest.fixture(autouse=True)
 def _reference_flash_attn(monkeypatch):
-    """The reference kernel stands in for flash-attn 2.8 here, installed or not."""
-    monkeypatch.setattr(layout_module, "_installed_flash_attn_version", lambda: (2, 8))
+    """The reference kernel stands in for flash-attn 2.8 and FA3 here, installed or not."""
+    monkeypatch.setattr(layout_module, "_installed_version", {"flash_attn": (2, 8), "flash_attn_3": (3, 0)}.get)
 
 
 def _batch():
