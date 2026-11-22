@@ -1358,12 +1358,16 @@ def test_load_batched_never_holds_a_whole_fused_moe_tensor(monkeypatch, bucket_s
     assert allocated.peak - row - checksum < 1024  # and a few scalars
 
 
-def test_shadow_verifier_receives_fused_experts_whole():
-    from arctic_platform.debug.weight_sync import maybe_bind_broadcast_loader
-    from arctic_platform.inference.server.weight_sync.utils import _ShardAwareFusedWriter
+def test_shadow_verifier_receives_fused_experts_whole(monkeypatch):
+    from arctic_platform.debug import weight_sync as evidence
 
-    writer = _ShardAwareFusedWriter(_MoEModel(4, 4, 6, tp=2, rank=0, gated=True), torch.device("cpu"))
-    name = "model.layers.0.mlp.experts.w13_weight"
-    assert writer.loads_row_blocks(name)
-    maybe_bind_broadcast_loader(SimpleNamespace(sources={}), writer)
-    assert not writer.loads_row_blocks(name)
+    monkeypatch.setenv(evidence.VERIFY_ENV, "1")
+    weights = _moe_weights(4, 4, 6, gated=True)
+    model = _MoEModel(4, 4, 6, tp=2, rank=0, gated=True)
+    receiver = _bucketed_receiver(monkeypatch, weights, 101)
+    worker = SimpleNamespace(device=torch.device("cpu"))
+    with evidence.maybe_observe_broadcast_load(worker, model, receiver) as verifier:
+        WeightSyncExtension._load_batched(worker, model, receiver)
+    assert verifier.finish()["received"] == {
+        name: {**evidence.tensor_manifest(value), "destinations": [name]} for name, value in weights
+    }
