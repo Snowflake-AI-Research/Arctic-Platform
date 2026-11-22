@@ -229,7 +229,9 @@ python -m arctic_platform.inference.semi_persistence.onboarding.semip_job cluste
 
 `cluster` (`qa6` or `prod`) sets `model_bucket` and the kubeconfig context the
 node cache is checked on (`kube_context=`, passed as `kubectl --context`; the
-kubeconfig's current context is not changed). `configs` is a blob link at a
+kubeconfig's current context is not changed). `image_tag` is a `release_*` tag
+with its `-h|a|b` suffix; qa6 also takes `dev_*` tags, which only the dev
+registries carry. `configs` is a blob link at a
 commit or a branch, resolved to its commit, fetched and recorded in
 `<out_dir>/configs.json`. `tests` maps to onboard: `functional` is
 `variants=on_hit checks=none`, `correctness` and `performance` add

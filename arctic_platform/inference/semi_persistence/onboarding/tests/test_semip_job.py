@@ -189,6 +189,20 @@ def test_bad_image_tags_are_refused(tag):
         semip_job.parse_image_tag(tag)
 
 
+@pytest.mark.parametrize("tag", ["dev_20261115_234921_a2c56b581ba", "dev_20261119_104717_fa54ebda6cb-b"])
+def test_dev_image_tags_only_on_qa6(tag):
+    assert semip_job.parse_image_tag(tag, "qa6") == tag
+    with pytest.raises(SystemExit, match="only qa6 can pull"):
+        semip_job.parse_image_tag(tag, "prod")
+
+
+@pytest.mark.parametrize("tag", ["dev_2026111_234921_a2c56b581ba", "dev_20261115_234921_a2c56b581ba-c",
+                                 "dev_20261115_234921_a2c56b581bax"])
+def test_bad_dev_image_tags_are_refused_on_qa6(tag):
+    with pytest.raises(SystemExit, match="must look like"):
+        semip_job.parse_image_tag(tag, "qa6")
+
+
 def test_max_gpus_is_a_positive_integer():
     assert semip_job.parse_max_gpus("16") == 16 and semip_job.parse_max_gpus("1") == 1
     for bad in ("", None, "0", "-8", "8.0", "016", "x", "1e3"):

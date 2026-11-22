@@ -25,8 +25,9 @@ The driver behind the semip-publish Jenkins job; it runs the same anywhere.
   cluster      qa6 or prod: the kubeconfig context the node cache is checked on,
                the model bucket images are published to, and which connection
                file is used by default
-  image_tag    the dss-backend image (release_<date>_<time>_<11 hex>-h|a|b):
-               publish's image_tag and onboard's debug_image_tag
+  image_tag    the dss-backend image (release_<date>_<time>_<11 hex>-h|a|b, or on
+               qa6 also dev_<date>_<time>_<11 hex>[-h|a|b]): publish's image_tag
+               and onboard's debug_image_tag
   configs      a github.com blob link to a .jsonl under model-catalog/semip_models/
                in an <owner>/cortex-training repo, at a commit or a branch
                (resolved to its commit): one semi_p job body per line, exactly
@@ -113,6 +114,8 @@ CLUSTERS = {
 }
 CONNECTION_ENV = "SEMIP_CONNECTION"
 IMAGE_TAG = re.compile(r"^release_\d{8}_\d{6}_[0-9a-f]{11}-[hab]$")
+# dev_* images are pushed to the dev registries only, so prod cannot pull them.
+DEV_IMAGE_TAG = re.compile(r"^dev_\d{8}_\d{6}_[0-9a-f]{11}(-[hab])?$")
 TESTS = ("functional", "correctness", "performance")
 CONFIGS_REPO = "cortex-training"
 CONFIGS_DIR = "model-catalog/semip_models/"
@@ -144,10 +147,15 @@ def parse_cluster(value: str | None) -> str:
     return value
 
 
-def parse_image_tag(value: str | None) -> str:
-    if not IMAGE_TAG.match(value or ""):
-        raise SystemExit(f"image_tag= must look like release_20261119_163502_6ed8c6d2361-h, got {value!r}")
-    return value
+def parse_image_tag(value: str | None, cluster: str = "prod") -> str:
+    if IMAGE_TAG.match(value or ""):
+        return value
+    if DEV_IMAGE_TAG.match(value or ""):
+        if cluster == "qa6":
+            return value
+        raise SystemExit(f"image_tag={value} is a dev_* image, which only qa6 can pull; use a release_* tag on {cluster}")
+    raise SystemExit("image_tag= must look like release_20261119_163502_6ed8c6d2361-h "
+                     f"(or dev_20261115_234921_a2c56b581ba on qa6), got {value!r}")
 
 
 def parse_max_gpus(value: str | None) -> int:
@@ -285,7 +293,7 @@ def write_jsonl(specs: list[ModelSpec], path: Path, lines: dict[str, str]) -> Pa
 class SemipJob:
     def __init__(self, args: dict[str, str], get: Callable = http_get):
         self.cluster = parse_cluster(args.get("cluster"))
-        self.image_tag = parse_image_tag(args.get("image_tag"))
+        self.image_tag = parse_image_tag(args.get("image_tag"), self.cluster)
         self.max_gpus = parse_max_gpus(args.get("max_gpus"))
         self.tests = parse_tests(args.get("tests"))
         self.dry_run = as_bool(args.get("dry_run") or "false")
