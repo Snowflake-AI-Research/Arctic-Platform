@@ -44,7 +44,8 @@ def _row_blocks(
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Yield the whole rows completed by ``chunk``, the bytes of a tensor from ``tensor_offset`` on.
 
-    ``row`` is one row of that tensor; it holds the bytes of a row split across two chunks.
+    ``row`` is one row of that tensor: a row split across two chunks, or not aligned to the element size, is
+    assembled there and yielded from there.
     """
     row_bytes = row.view(-1).view(torch.uint8)
     while chunk.numel():
@@ -54,7 +55,6 @@ def _row_blocks(
             size = whole_bytes
             yield name, chunk[:size].view(row.dtype).reshape(-1, *row.shape)
         else:
-            # Split rows and misaligned whole rows share the same aligned scratch storage.
             size = min(row.nbytes - filled, chunk.numel())
             row_bytes[filled:filled + size].copy_(chunk[:size], non_blocking=True)
             if filled + size == row.nbytes:
@@ -312,8 +312,9 @@ class NCCLEngine:
 
         A tensor larger than the bucket arrives in chunks and is rebuilt whole,
         unless ``in_row_blocks(name)`` is true: then each chunk is yielded as it
-        arrives, as a block of whole leading-dimension rows that follows the
-        previous block, and only a row split across two chunks is buffered.
+        arrives, as blocks of whole leading-dimension rows, each following the
+        previous one; only one row is ever buffered, and it is refilled on the
+        current stream after its yield.
         """
         assert not self.is_sender, "Only non-zero ranks can receive"
         self.ensure_staging_buffers()
