@@ -125,22 +125,25 @@ def test_glm53_sp_boundaries_from_positions_require_each_row_to_restart_at_zero(
     from arctic_platform.model.implementations.glm53 import context_parallel as cp
 
     backbone = torch.nn.Module()
-    backbone.forward = lambda input_ids=None, position_ids=None: None
-    backbone._cp_world_size, backbone._cp_group = 16, None
+    backbone.forward = lambda **kwargs: None
+    backbone._cp_world_size, backbone._cp_group = 2, None
     layer = torch.nn.Module()
     cp._wrap_backbone_forward(backbone, [layer])
 
-    def run(rows):
-        # Rows packed into 16 tokens across 16 ranks; the 11 padding tokens carry position 0.
-        positions = torch.tensor([sum(rows, []) + [0] * 11])
-        monkeypatch.setattr(cp, "_gather_sequence_no_grad", lambda tensor, group: positions)
-        backbone(input_ids=torch.ones(1, 1, dtype=torch.long), position_ids=positions[:, :1])
+    def run(positions):
+        # Rank 1 of 2: its half of the call, and the whole call back from the all-gather.
+        gathered = torch.tensor([positions])
+        local = gathered[:, len(positions) // 2 :]
+        monkeypatch.setattr(cp, "_gather_sequence_no_grad", lambda tensor, group: gathered)
+        backbone(input_ids=torch.ones_like(local), position_ids=local)
         return getattr(layer, cp._GLOBAL_CU_SEQLENS).tolist()
 
-    assert run([[0, 1], [0, 1, 2]]) == [0, 2, 5, *range(6, 17)]
-    # A second row whose positions start at 1 would otherwise merge into the first: [0, 4, 5, ...].
-    with pytest.raises(ValueError, match="restart at 0"):
-        run([[0, 1], [1, 2, 3]])
+    assert run([0, 1, 0, 1, 2, 0]) == [0, 2, 5, 6]
+    assert run([0, 2, 2, 0]) == [0, 3, 4]
+    # Rows [0, 1] | [1, 2] merge into [0, 3, 4]; rows [0, 1] | [1, 2] | [0] | [2] into [0, 3, 6], full length.
+    for positions in ([0, 1, 1, 2], [0, 1, 1, 2, 0, 2]):
+        with pytest.raises(ValueError, match="restart at 0"):
+            run(positions)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="packed KDA kernels require CUDA")

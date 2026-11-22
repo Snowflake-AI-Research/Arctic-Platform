@@ -931,13 +931,15 @@ def _wrap_backbone_forward(backbone: nn.Module, parallel_modules: list[nn.Module
                     device=input_tensor.device,
                 )
             )
-            # Positions encode the boundaries only if every packed row restarts at 0; a row starting elsewhere
-            # merges into the row before it, and the rebuilt rows no longer cover the sequence.
-            if int(cu_seqlens[-1]) != global_sequence_length:
-                raise ValueError(
-                    "GLM-5.3 rebuilds packed boundaries from position_ids, which must restart at 0 at every packed "
-                    f"row; the rebuilt rows cover {int(cu_seqlens[-1])} of {global_sequence_length} tokens"
-                )
+            if global_position_ids is not None and global_position_ids.ndim == 2:
+                # Positions encode the boundaries only if each packed row restarts at 0 and ends at its length - 1;
+                # otherwise the rows rebuilt from them disagree with where the zeros are.
+                starts = torch.nonzero(global_position_ids.reshape(-1) == 0).reshape(-1).to(cu_seqlens.dtype)
+                if not torch.equal(cu_seqlens, F.pad(starts, (0, 1), value=global_sequence_length)):
+                    raise ValueError(
+                        "GLM-5.3 packed position_ids must restart at 0 for each row and end at its length - 1; "
+                        "supply cu_seq_lens_q for other layouts"
+                    )
         cu_seqlens = _normalize_cu_seqlens(
             cu_seqlens,
             sequence_length=global_sequence_length,
