@@ -53,13 +53,17 @@ def _cache_computed_tail(manager: FullAttentionManager, request: Request, cachea
     if boundary < request.num_prompt_tokens or boundary % manager.block_size == 0:
         return
     block = manager.req_to_blocks[request.request_id][boundary // manager.block_size]
-    manager.block_pool.cache_partial_block(
-        request=request,
-        block=block,
-        num_tokens=boundary,
-        kv_cache_group_id=manager.kv_cache_group_id,
-        block_size=manager.block_size,
-    )
+    # Promotion replaces the shorter primary. Reinsert it as an alias for prompt resends.
+    previous = block.block_hash_num_tokens
+    boundaries = (boundary, previous) if previous is not None and previous < boundary else (boundary,)
+    for length in boundaries:
+        manager.block_pool.cache_partial_block(
+            request=request,
+            block=block,
+            num_tokens=length,
+            kv_cache_group_id=manager.kv_cache_group_id,
+            block_size=manager.block_size,
+        )
 
 
 _PATCHED = False

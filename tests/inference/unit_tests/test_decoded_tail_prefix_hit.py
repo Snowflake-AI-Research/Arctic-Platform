@@ -87,9 +87,7 @@ def _scheduler(manager, dcp):
     return scheduler
 
 
-@pytest.mark.parametrize("dcp", [1, 8])
-@pytest.mark.parametrize("prompt_len, output_len", [(130, 206), (300, 37), (257, 300), (100, 5)])
-def test_continuation_reuses_the_last_computed_boundary(dcp, prompt_len, output_len):
+def _finish(dcp, prompt_len, output_len):
     manager = _cache(dcp)
     scheduler = _scheduler(manager, dcp)
     first = _request("first", list(range(prompt_len)))
@@ -114,7 +112,13 @@ def test_continuation_reuses_the_last_computed_boundary(dcp, prompt_len, output_
     assert scheduler._handle_stopped_request(first)
     manager.free(first)
     manager.new_step_starts()
+    return manager, first
 
+
+@pytest.mark.parametrize("dcp", [1, 8])
+@pytest.mark.parametrize("prompt_len, output_len", [(130, 206), (300, 37), (257, 300), (100, 5)])
+def test_continuation_reuses_the_last_computed_boundary(dcp, prompt_len, output_len):
+    manager, first = _finish(dcp, prompt_len, output_len)
     computed = prompt_len + output_len - 1
     boundary = computed // BLOCK * BLOCK
     if first.num_tokens % BLOCK == 0:
@@ -131,6 +135,21 @@ def test_continuation_reuses_the_last_computed_boundary(dcp, prompt_len, output_
         assert destination is not source
         assert (source.block_id, destination.block_id) in [(copy.src_block_id, copy.dst_block_id) for copy in copies]
         manager.block_pool.free_blocks(retained)
+
+
+def test_prompt_and_decoded_hashes_share_one_evictable_block():
+    manager, first = _finish(dcp=8, prompt_len=300, output_len=37)
+    resend = _request("resend", list(first.prompt_token_ids))
+    continuation = _request("continuation", list(first.all_token_ids))
+    prompt_blocks, prompt_hit, _ = manager.get_computed_blocks(resend)
+    tail_blocks, tail_hit, _ = manager.get_computed_blocks(continuation)
+    assert (prompt_hit, tail_hit) == (288, 336)
+    block = prompt_blocks.blocks[0][-1]
+    assert tail_blocks.blocks[0][-1] is block
+
+    manager.evict_blocks({block.block_id})
+    for hit in (prompt_hit, tail_hit):
+        assert manager.block_pool.get_cached_block(first.block_hashes[hit // BLOCK - 1], [0]) is None
 
 
 def test_failed_remote_load_does_not_publish_allocated_slots():
