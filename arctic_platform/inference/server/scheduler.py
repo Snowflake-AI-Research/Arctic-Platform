@@ -513,11 +513,13 @@ class Scheduler:
             )
         dead = (error is not None and not self._stopped
                 and isinstance(error, (ray.exceptions.ActorDiedError, EngineDeadError)))
-        # A late failure from an old actor must not quarantine its replacement.
-        if dead and ws.handle is handle:
+        # A late failure from an old actor must not quarantine its replacement. The last replica in rotation stays
+        # there, so that requests fail fast instead of waiting for a replacement.
+        if dead and ws.handle is handle and any(not w.quarantined for w in self._workers if w is not ws):
             ws.quarantine()
-        # Re-route once: a request that itself kills engines must not walk through every replica.
-        if dead and not req.rerouted and not all(w.quarantined for w in self._workers):
+        # Re-route once, away from the failed actor: a request that itself kills engines must not walk through
+        # every replica.
+        if dead and not req.rerouted and (ws.quarantined or ws.handle is not handle):
             req.rerouted = True
             self._waiting.appendleft(req)
         elif error is not None:

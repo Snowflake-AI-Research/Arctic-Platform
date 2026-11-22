@@ -58,16 +58,17 @@ async def test_requests_routed_to_a_dead_replica_finish_on_a_live_one(death):
 
 
 @pytest.mark.parametrize("death", DEATHS, ids=lambda d: d.__name__)
-async def test_all_dead_replicas_fail_inflight_requests_and_waiting_requests_use_a_replacement(death):
-    scheduler = Scheduler([_worker(death), _worker(death)], capacity=64)
+async def test_when_every_replica_died_the_last_stays_in_rotation_and_requests_fail_fast(death):
+    workers = [_worker(death), _worker(death)]
+    scheduler = Scheduler(workers, capacity=64)
     futures = [scheduler.submit(f"p{i}", {}) for i in range(4)]
     results = await asyncio.wait_for(asyncio.gather(*futures, return_exceptions=True), timeout=1)
     assert all(isinstance(result, death) for result in results)
-    later = scheduler.submit("later", {})
-    assert not later.done()
-    scheduler.update_worker_handle(0, _worker())
-    scheduler.mark_worker_available(0)
-    assert await asyncio.wait_for(later, timeout=1) == {"text": "later"}
+    [last] = [i for i, ws in enumerate(scheduler._workers) if not ws.quarantined]
+    calls = workers[last].generate.remote.call_count
+    with pytest.raises(death):
+        await asyncio.wait_for(scheduler.submit("later", {}), timeout=1)
+    assert workers[last].generate.remote.call_count == calls + 1
 
 
 async def test_a_request_that_kills_every_engine_is_rerouted_only_once():
