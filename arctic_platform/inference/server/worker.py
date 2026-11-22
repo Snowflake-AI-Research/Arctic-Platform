@@ -1821,7 +1821,8 @@ class InferenceWorker(StreamingWorkerMixin):
         """Receive + load weights on all TP workers via NCCL broadcast (rank 0 = trainer).
 
         The result is TP rank 0's, plus ``rank_memory``: every rank's ``mem_*`` and
-        ``device_*`` figures, since each rank receives and loads the whole model.
+        ``device_*`` figures in TP-rank order, since each rank receives and loads
+        the whole model.
 
         When ``envs.ARCTIC_INFERENCE_DUMP_PARAM_L2`` is set (opt-in, default off),
         each TP rank's full-model and loaded-destination L2 maps are gathered
