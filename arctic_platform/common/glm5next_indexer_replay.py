@@ -22,8 +22,6 @@ SPARSE_LAYER_TYPES = ("deepseek_sparse_attention", "indexed_attention")
 
 def pool_rows(text_config) -> int | None:
     """Capture rows per sparse-attention layer; None when the selected pools do not fill whole rows."""
-    if text_config.index_topk is None:
-        return None
     pools = text_config.index_topk // text_config.index_kpool
     rows, remainder = divmod(pools, text_config.num_experts_per_tok)
     return None if remainder else rows

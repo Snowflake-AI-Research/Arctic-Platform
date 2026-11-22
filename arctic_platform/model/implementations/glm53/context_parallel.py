@@ -618,14 +618,14 @@ def _sparse_attention_forward(
     kv_pass_full = gather_sequence(kv_pass, self._cp_group)
     k_position_full = gather_sequence(k_position, self._cp_group)
 
-    global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
-    if global_cu_seqlens is None and (self.indexer is not None or indexer_pools is not None):
-        global_cu_seqlens = torch.tensor(
-            [0, kv_pass_full.shape[1]],
-            dtype=torch.int32,
-            device=hidden_states.device,
-        )
     if self.indexer is not None:
+        global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
+        if global_cu_seqlens is None:
+            global_cu_seqlens = torch.tensor(
+                [0, local_length * self._cp_world_size],
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
         topk_indices = _select_sparse_indices(
             self.indexer,
             hidden_states,
@@ -635,18 +635,18 @@ def _sparse_attention_forward(
             cp_group=self._cp_group,
             cp_rank=self._cp_rank,
         )
+        if indexer_pools is not None:
+            topk_indices = _replayed_sparse_indices(
+                indexer_pools,
+                topk_indices,
+                global_cu_seqlens,
+                self._cp_rank * local_length,
+                self.indexer.index_kpool,
+            )
     elif prev_topk_indices is None:
         raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
     else:
         topk_indices = prev_topk_indices
-    if indexer_pools is not None:
-        topk_indices = _replayed_sparse_indices(
-            indexer_pools,
-            topk_indices,
-            global_cu_seqlens,
-            self._cp_rank * local_length,
-            self.config.index_kpool,
-        )
 
     # The absorbed path reads the weight rather than calling the module, so a LoRA delta has to be added here.
     kv_b_weight = compute_weight(self.kv_b_proj).view(

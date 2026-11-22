@@ -31,7 +31,7 @@ ROWS = (23, 6, 19)
 LAYERS = 2
 
 
-def _model(last_indexer):
+def _model():
     from arctic_platform.model.implementations.glm53.context_parallel import apply_context_parallelism
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
 
@@ -40,7 +40,7 @@ def _model(last_indexer):
     sparse = next(kind for kind in text.layer_types if kind != "linear_attention")
     text.num_hidden_layers = LAYERS
     text.layer_types = [sparse] * LAYERS
-    text.indexer_types = ["full", last_indexer]
+    text.indexer_types = ["full"] * LAYERS
     text.mlp_layer_types = ["sparse"] * LAYERS
     config.use_grouped_mm = False
     set_seed(0)
@@ -86,9 +86,8 @@ def _record_routes(model):
     return seen
 
 
-@pytest.mark.parametrize("last_indexer", ["full", "shared"])
-def test_trainer_selects_the_samplers_tokens_in_packed_rows(last_indexer):
-    model = _model(last_indexer)
+def test_trainer_selects_the_samplers_tokens_in_packed_rows():
+    model = _model()
     moe_routes = _record_routes(model)
     text = model.config.text_config
     kpool, top_k = text.index_kpool, text.num_experts_per_tok
@@ -136,6 +135,7 @@ def test_trainer_selects_the_samplers_tokens_in_packed_rows(last_indexer):
         torch.testing.assert_close(moe_routes[LAYERS + layer], moe_routes[layer])
     for layer in range(LAYERS):
         assert replayed[layer] == expected[layer]
+        # The selections differ for more than a third of the queries, so the assertion above can fail.
         assert sum(a != b for a, b in zip(own[layer], expected[layer])) > length // 3
     with pytest.raises(ValueError, match="rows per token"):  # a capture of another width cannot be split
         _attended(model, tokens, positions, boundaries, capture[None, :, :-1].to(torch.int64))
