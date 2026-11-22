@@ -1,6 +1,7 @@
 from arctic_platform.inference.vllm import config
 from arctic_platform.inference.vllm import deepseek_v41_lora
 from arctic_platform.inference.vllm import dense_prompt_logprobs
+from arctic_platform.inference.vllm import flashmla_sparse_dcp
 from arctic_platform.inference.vllm import glm5next_lora
 from arctic_platform.inference.vllm import hybrid_state_fixes
 from arctic_platform.inference.vllm import kv_group_size
@@ -72,6 +73,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "ensure_deepseek_v41_lora",
         lambda: calls.append("deepseek_v41_lora"),
     )
+    monkeypatch.setattr(
+        flashmla_sparse_dcp,
+        "ensure_flashmla_sparse_bf16_dcp",
+        lambda: calls.append("flashmla_sparse_bf16_dcp"),
+    )
 
     required_patches.apply_required_vllm_patches()
 
@@ -88,4 +94,5 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "mrope_yarn",
         "mamba_completion_refresh",
         "deepseek_v41_lora",
+        "flashmla_sparse_bf16_dcp",
     ]
