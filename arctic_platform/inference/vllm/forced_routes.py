@@ -35,46 +35,50 @@ _SCORES = {
 }
 
 
-def tail_rows(payload: dict[str, Any], shape_per_token: tuple[int, ...]) -> np.ndarray:
-    return np.frombuffer(payload["rows"], dtype=payload["dtype"]).reshape(-1, *shape_per_token)
-
-
 class ForcedRoutes:
-    """One worker's stored rows per request, and the forced ids and mask of the step being run."""
+    """One worker's stored rows by request index, and the forced ids and mask of the step being run."""
 
-    def __init__(self, max_num_tokens: int, num_layers: int, top_k: int, device: torch.device) -> None:
-        self.rows: dict[str, tuple[int, np.ndarray]] = {}
+    def __init__(self, max_num_reqs: int, max_num_tokens: int, num_layers: int, top_k: int, device: torch.device):
+        # Stored positions [start, end) by request index, as Model Runner V2's RequestState holds per-request state.
+        self.start = np.zeros(max_num_reqs, dtype=np.int64)
+        self.end = np.zeros(max_num_reqs, dtype=np.int64)
+        self.rows: dict[int, np.ndarray] = {}
         self.ids = torch.zeros((max_num_tokens, num_layers, top_k), dtype=torch.int32, device=device)
         self.mask = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
+        self.forcing = False
 
-    def add(self, request: Any) -> None:
+    def add(self, req_index: int, request: Any) -> None:
         forced = (request.sampling_params.extra_args or {}).get(FORCED_ROUTES_KEY)
-        # Public vLLM xargs accept scalars and lists. Only the server emits a mapping with binary rows.
-        if not isinstance(forced, dict) or not isinstance(forced.get("rows"), bytes):
+        if not isinstance(forced, dict):  # vLLM's own API passes only scalars and lists here
             return
-        rows = tail_rows(forced, self.ids.shape[1:])
-        start = forced["start"]
-        # The frontend rejects a capture reaching the end of the effective prompt; never execute its rows.
-        if start + len(rows) < request.prompt_len:
-            self.rows[request.req_id] = (start, rows)
+        rows = np.frombuffer(forced["rows"], dtype=forced["dtype"]).reshape(-1, *self.ids.shape[1:])
+        # The splice refuses a capture that reaches the end of the prompt; never force a decoded position.
+        if forced["start"] + len(rows) < request.prompt_len:
+            self.start[req_index], self.end[req_index] = forced["start"], forced["start"] + len(rows)
+            self.rows[req_index] = rows
 
-    def fill(self, req_ids: list[str], query_start_loc: np.ndarray, num_computed: np.ndarray, num_rows: int) -> None:
-        """Mark the batch rows that compute a stored position, with the same boundaries the routed-experts capture
-        uses (``AuxOutputWorkerConnector.prepare_output``); every other row up to ``num_rows`` is cleared."""
-        mask = np.zeros(num_rows, dtype=np.bool_)
-        for i, req_id in enumerate(req_ids):
-            if req_id not in self.rows:
-                continue
-            start, rows = self.rows[req_id]
-            first = int(num_computed[i])
-            lo = max(first, start)
-            hi = min(first + int(query_start_loc[i + 1] - query_start_loc[i]), start + len(rows))
-            if lo < hi:
-                at = int(query_start_loc[i]) + lo - first
-                mask[at : at + hi - lo] = True
-                stored = torch.from_numpy(rows[lo - start : hi - start].astype(np.int32))
-                self.ids[at : at + hi - lo].copy_(stored, non_blocking=True)
-        self.mask[:num_rows].copy_(torch.from_numpy(mask), non_blocking=True)
+    def remove(self, req_index: int) -> None:
+        self.end[req_index] = 0
+        self.rows.pop(req_index, None)
+
+    def fill(self, idx_mapping: np.ndarray, query_start_loc: np.ndarray, num_computed: np.ndarray) -> None:
+        """Mark the batch rows that compute a stored position, with the boundaries the routed-experts capture uses
+        (``AuxOutputWorkerConnector.prepare_output``), after clearing the rows the previous step marked."""
+        if self.forcing:
+            self.mask.zero_()
+            self.forcing = False
+        if not self.rows:
+            return
+        start, end = self.start[idx_mapping], self.end[idx_mapping]
+        qsl = query_start_loc[: len(idx_mapping) + 1]
+        lo = np.maximum(num_computed, start)
+        hi = np.minimum(num_computed + np.diff(qsl), end)
+        for i in np.flatnonzero(lo < hi):  # only the requests recomputing stored positions in this step
+            at = qsl[i] + lo[i] - num_computed[i]
+            stored = self.rows[idx_mapping[i]][lo[i] - start[i] : hi[i] - start[i]]
+            self.ids[at : at + len(stored)].copy_(torch.from_numpy(stored.astype(np.int32)), non_blocking=True)
+            self.mask[at : at + len(stored)] = True
+            self.forcing = True
 
 
 def bind_router(router: Any, layer_id: int, forced: ForcedRoutes) -> None:
@@ -133,7 +137,9 @@ def install(runner: Any) -> ForcedRoutes:
     from vllm.model_executor.layers.fused_moe.layer import MoERunner
 
     capturer = runner.aux_output_connector._capturer
-    forced = ForcedRoutes(capturer.device_buffer.shape[0], *capturer.shape_per_token, runner.device)
+    forced = ForcedRoutes(
+        runner.max_num_reqs, capturer.device_buffer.shape[0], *capturer.shape_per_token, runner.device
+    )
     for module in runner.model.modules():
         if isinstance(module, MoERunner):
             bind_router(module.router, module.layer_id, forced)
@@ -153,17 +159,9 @@ def patch_model_runner(runner_cls: Any) -> None:
 
     def initialize_kv_cache(self, *args, **kwargs):
         result = original_initialize_kv_cache(self, *args, **kwargs)
+        # Ranks share one config, so they agree; the server sends rows only when every rank reports None.
         if self.aux_output_connector is not None:
             self._forced_routes_unsupported = unsupported(self)
-            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-            if tp_size > 1:
-                from vllm.distributed.parallel_state import get_tp_group
-
-                reasons: list[str | None] = [None] * tp_size
-                torch.distributed.all_gather_object(
-                    reasons, self._forced_routes_unsupported, group=get_tp_group().cpu_group
-                )
-                self._forced_routes_unsupported = next((reason for reason in reasons if reason is not None), None)
             if self._forced_routes_unsupported is None:
                 self._forced_routes = install(self)
         return result
@@ -172,21 +170,19 @@ def patch_model_runner(runner_cls: Any) -> None:
         original_add_requests(self, scheduler_output)
         if self._forced_routes is not None:
             for new_req_data in scheduler_output.scheduled_new_reqs:
-                self._forced_routes.add(new_req_data)
+                self._forced_routes.add(self.req_states.req_id_to_index[new_req_data.req_id], new_req_data)
 
     def _remove_request(self, req_id):
-        if self._forced_routes is not None:
-            self._forced_routes.rows.pop(req_id, None)
+        # add_requests removes each new request id first, before it holds an index.
+        if self._forced_routes is not None and req_id in self.req_states.req_id_to_index:
+            self._forced_routes.remove(self.req_states.req_id_to_index[req_id])
         return original_remove_request(self, req_id)
 
     def prepare_inputs(self, *args, **kwargs):
         input_batch = original_prepare_inputs(self, *args, **kwargs)
         if self._forced_routes is not None:
             self._forced_routes.fill(
-                input_batch.req_ids,
-                input_batch.query_start_loc_np,
-                input_batch.num_computed_tokens_np,
-                input_batch.num_tokens_after_padding,
+                input_batch.idx_mapping_np, input_batch.query_start_loc_np, input_batch.num_computed_tokens_np
             )
         return input_batch
 

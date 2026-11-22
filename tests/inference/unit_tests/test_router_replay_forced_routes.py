@@ -2,10 +2,8 @@
 
 import asyncio
 from copy import copy
-from datetime import timedelta
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -62,10 +60,11 @@ def test_masked_rows_take_the_stored_experts_with_the_trainers_replay_weights(mo
 
         monkeypatch.setattr(type(plain), "_compute_routing", cpu_topk)
     hooked = copy(plain)
-    forced = ForcedRoutes(max_num_tokens=8, num_layers=2, top_k=K, device=torch.device("cpu"))
-    forced.rows["req"] = (11, np.stack([np.zeros((3, K), np.uint16), stored.numpy().astype(np.uint16)], axis=1))
+    forced = ForcedRoutes(max_num_reqs=1, max_num_tokens=8, num_layers=2, top_k=K, device=torch.device("cpu"))
+    forced.start[0], forced.end[0] = 11, 14
+    forced.rows[0] = np.stack([np.zeros((3, K), np.uint16), stored.numpy().astype(np.uint16)], axis=1)
     # The request computes positions 10-15 in batch rows 0-5; its stored rows cover positions 11-13 (rows 1-3).
-    forced.fill(["req"], np.array([0, 6]), np.array([10]), num_rows=6)
+    forced.fill(np.array([0]), np.array([0, 6]), np.array([10]))
     bind_router(hooked, layer_id=1, forced=forced)
     captured = []
     hooked.set_capture_fn(captured.append)
@@ -111,10 +110,11 @@ class _MoERunner(MoERunner):
 class _V2Runner:
     """The Model Runner V2 methods ``patch_model_runner`` wraps, reduced to their request bookkeeping."""
 
-    def __init__(self, model, data_parallel_size=1, num_prefill_lookahead_tokens=1, tensor_parallel_size=1):
+    def __init__(self, model, data_parallel_size=1, num_prefill_lookahead_tokens=1):
         self.model, self.device, self.aux_output_connector = model, torch.device("cpu"), None
-        parallel = SimpleNamespace(data_parallel_size=data_parallel_size, tensor_parallel_size=tensor_parallel_size)
+        parallel = SimpleNamespace(data_parallel_size=data_parallel_size)
         self.vllm_config = SimpleNamespace(parallel_config=parallel, num_prefill_lookahead_tokens=num_prefill_lookahead_tokens)
+        self.max_num_reqs, self.req_states, self.pooling_runner = 8, SimpleNamespace(req_id_to_index={}), None
 
     def initialize_kv_cache(self):
         capturer = SimpleNamespace(device_buffer=torch.zeros(64, L, K), shape_per_token=(L, K))
@@ -123,12 +123,16 @@ class _V2Runner:
     def add_requests(self, scheduler_output):
         for new_req_data in scheduler_output.scheduled_new_reqs:
             self._remove_request(new_req_data.req_id)
+            taken = set(self.req_states.req_id_to_index.values())
+            self.req_states.req_id_to_index[new_req_data.req_id] = min(set(range(self.max_num_reqs)) - taken)
 
     def _remove_request(self, req_id):
-        return True
+        return self.req_states.req_id_to_index.pop(req_id, None) is not None
 
-    def prepare_inputs(self, input_batch):
-        return input_batch
+    def prepare_inputs(self, req_ids, query_start_loc_np, num_computed_tokens_np):
+        index = self.req_states.req_id_to_index
+        return SimpleNamespace(idx_mapping_np=np.array([index[r] for r in req_ids]),
+                               query_start_loc_np=query_start_loc_np, num_computed_tokens_np=num_computed_tokens_np)
 
 
 forced_routes.patch_model_runner(_V2Runner)
@@ -138,7 +142,6 @@ def test_tail_intersects_only_recomputed_prompt_positions():
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
     runner = _V2Runner(torch.nn.ModuleList([_MoERunner(0, _router(None))]))
-    runner.pooling_runner = None
     runner.initialize_kv_cache()
     rows = np.broadcast_to(np.arange(4, 8, dtype=np.uint8)[:, None, None], (4, L, K))
     params = SamplingParams(extra_args={forced_routes.FORCED_ROUTES_KEY: {
@@ -147,19 +150,17 @@ def test_tail_intersects_only_recomputed_prompt_positions():
     reqs = [SimpleNamespace(req_id=name, prompt_len=n, sampling_params=params)
             for name, n in [("early", 10), ("late", 10), ("full", 10), ("short", 7)]]
     runner.add_requests(SimpleNamespace(scheduled_new_reqs=reqs))
-    runner.prepare_inputs(SimpleNamespace(
-        req_ids=[r.req_id for r in reqs], query_start_loc_np=np.array([0, 7, 11, 13, 16]),
-        num_computed_tokens_np=np.array([2, 6, 8, 4]), num_tokens_after_padding=20))
+    runner.prepare_inputs([r.req_id for r in reqs], np.array([0, 7, 11, 13, 16, 16]), np.array([2, 6, 8, 4]))
     state = runner._forced_routes
     assert state.mask.nonzero().flatten().tolist() == [2, 3, 4, 5, 7, 8]
     assert state.ids[state.mask, 0, 0].tolist() == [4, 5, 6, 7, 6, 7]
+    late = runner.req_states.req_id_to_index["late"]
     GPUModelRunner.finish_requests(runner, SimpleNamespace(finished_req_ids=set(), preempted_req_ids={"late"}))
-    assert "late" not in state.rows
+    assert late not in state.rows and len(state.rows) == 2  # early and full keep theirs; short never had any
     runner.add_requests(SimpleNamespace(scheduled_new_reqs=[reqs[1]]))  # V2 resubmits the request after preemption.
     for first, masked in [(4, [0, 1, 2, 3]), (10, []), (11, [])]:
         # Re-prefill, verify four positions, then verify again after rejecting the last three.
-        runner.prepare_inputs(SimpleNamespace(req_ids=["late"], query_start_loc_np=np.array([0, 4]),
-                                             num_computed_tokens_np=np.array([first]), num_tokens_after_padding=4))
+        runner.prepare_inputs(["late"], np.array([0, 4]), np.array([first]))
         assert state.mask[:4].nonzero().flatten().tolist() == masked
 
 
@@ -168,7 +169,6 @@ def test_compiled_router_observes_request_removal_and_reused_padded_rows():
 
     router = _router(None)
     runner = _V2Runner(torch.nn.ModuleList([_MoERunner(0, router)]))
-    runner.pooling_runner = None
     runner.initialize_kv_cache()
     state = runner._forced_routes
     logits = torch.arange(E, dtype=torch.float32).expand(3, -1)
@@ -181,17 +181,14 @@ def test_compiled_router_observes_request_removal_and_reused_padded_rows():
     req = SimpleNamespace(req_id="reused", prompt_len=4, sampling_params=SamplingParams(
         extra_args={forced_routes.FORCED_ROUTES_KEY: payload}))
     runner.add_requests(SimpleNamespace(scheduled_new_reqs=[req]))
-    batch = SimpleNamespace(req_ids=[req.req_id], query_start_loc_np=np.array([0, 3]),
-                            num_computed_tokens_np=np.array([0]), num_tokens_after_padding=3)
-    runner.prepare_inputs(batch)
+    runner.prepare_inputs([req.req_id], np.array([0, 3]), np.array([0]))
     assert torch.equal(route(logits, logits)[1], torch.arange(K).expand(3, -1))
     GPUModelRunner.finish_requests(runner, SimpleNamespace(finished_req_ids={req.req_id}, preempted_req_ids=set()))
     assert not state.rows
 
     req.sampling_params = SamplingParams()
     runner.add_requests(SimpleNamespace(scheduled_new_reqs=[req]))
-    batch.query_start_loc_np[1] = 1  # the next two formerly forced rows are now graph padding
-    runner.prepare_inputs(batch)
+    runner.prepare_inputs([req.req_id], np.array([0, 1]), np.array([0]))  # the two formerly forced rows now pad
     assert not state.mask[:3].any()
     assert all(torch.equal(a, b) for a, b in zip(route(logits, logits), plain))
 
@@ -256,9 +253,7 @@ class _ToyEngine:
         counts = [n for _, n in batch]
         qsl = np.concatenate([[0], np.cumsum(counts)])
         num_rows = int(qsl[-1]) + PAD
-        self.runner.prepare_inputs(SimpleNamespace(
-            req_ids=[r.id for r, _ in batch], query_start_loc_np=qsl,
-            num_computed_tokens_np=np.array([r.computed for r, _ in batch]), num_tokens_after_padding=num_rows))
+        self.runner.prepare_inputs([r.id for r, _ in batch], qsl, np.array([r.computed for r, _ in batch]))
         forced = self.runner._forced_routes
         mask = forced.mask[:num_rows] if forced is not None else torch.zeros(num_rows, dtype=torch.bool)
         plain = []
@@ -310,15 +305,13 @@ def _two_turns(engine):
     worker.state, worker._router_replay_tx, worker._replica_label = WorkerLifecycleState.READY, cache, "replica-a"
     spec = SimpleNamespace(use_eagle_block_drop=lambda: BLOCKS == 2)
     engine.runner.vllm_config.speculative_config = spec
+    # The scheduler's hit alignment, which only the engine workers know (the front end sees the smallest group).
     engine.runner.kv_cache_config = SimpleNamespace(cache_hit_alignment_tokens=B)
-    # The front end sees the smallest group; the scheduler hits on the groups' common boundary.
-    cache_config = SimpleNamespace(block_size=B // 2)
 
     async def collective_rpc(method):  # two TP ranks, each reporting through the worker RPC
         return [getattr(forced_routes, method)(SimpleNamespace(model_runner=engine.runner))] * 2
 
-    worker.llm = SimpleNamespace(vllm_config=SimpleNamespace(cache_config=cache_config, speculative_config=spec),
-                                 collective_rpc=collective_rpc)
+    worker.llm = SimpleNamespace(collective_rpc=collective_rpc)
     asyncio.run(worker._init_forced_routes())
     worker._generate_once = engine.generate_once
     prompts = {"a1": [1, 2, 3, 4, 5, 6], "b1": list(range(20, 29)), "c": list(range(40, 47))}
@@ -371,29 +364,6 @@ def test_a_continuation_recomputes_the_tail_of_its_previous_capture_under_the_st
     # The tails ran in chunks, and in one step together.
     assert any({ran["a2"].id, ran["b2"].id} <= step.keys() for step in engine.forced_steps)
     assert sum(ran["a2"].id in step for step in engine.forced_steps) >= 2
-
-
-def _check_tp_install(rank, rendezvous):
-    from vllm.distributed import parallel_state
-
-    dist = torch.distributed
-    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
-        with patch.object(parallel_state, "get_tp_group", return_value=SimpleNamespace(cpu_group=dist.group.WORLD)):
-            for mixed in (False, True):
-                router = _router(None)
-                runner = _V2Runner(_MoERunner(0, router, monolithic=mixed and rank == 1), tensor_parallel_size=2)
-                runner.initialize_kv_cache()
-                assert (runner._forced_routes is None) == mixed
-                assert ("_compute_routing" in vars(router)) == (not mixed)
-                if mixed:
-                    assert "monolithic" in runner._forced_routes_unsupported
-    finally:
-        dist.destroy_process_group()
-
-
-def test_tp_workers_agree_before_binding_any_router(tmp_path):
-    torch.multiprocessing.spawn(_check_tp_install, args=((tmp_path / "tp-start").as_uri(),), nprocs=2)
 
 
 def test_an_engine_stored_rows_cannot_reach_starts_unhooked_and_routes_as_before(caplog):
