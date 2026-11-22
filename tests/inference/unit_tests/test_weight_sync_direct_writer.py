@@ -1136,47 +1136,48 @@ def test_worker_gathers_full_and_loaded_parameter_traces(monkeypatch):
 
 
 def test_broadcast_sync_reports_every_rank_memory(monkeypatch):
-    """Each TP rank receives and loads the whole model, so the reply carries every rank's GPU memory."""
+    """One broadcast reply preserves both ranks' peaks and retained memory from this load."""
     from arctic_platform.inference.server.worker import InferenceWorker
 
-    rank = {"value": 0}
+    extension = WeightSyncExtension()
+    extension.model_runner = SimpleNamespace(model=nn.Linear(1, 1, bias=False))
+    extension.model_config = SimpleNamespace(quantization=None)
+    extension._get_or_create_broadcast_engine = lambda *args: object()
     parallel_state = types.ModuleType("vllm.distributed.parallel_state")
     parallel_state.get_tensor_model_parallel_world_size = lambda: 2
-    parallel_state.get_world_group = lambda: SimpleNamespace(rank=rank["value"])
+    parallel_state.get_world_group = lambda: SimpleNamespace(rank=extension.device.index)
     monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", parallel_state)
-    gpus = [dict(allocated=100, reserved=120, free=900) for _ in range(2)]
-    for gpu in gpus:
-        gpu.update(peak=gpu["allocated"], peak_reserved=gpu["reserved"])
-    for name, key in (("memory_allocated", "allocated"), ("max_memory_allocated", "peak"),
+
+    gpus = [SimpleNamespace(allocated=100, reserved=120, peak=500, peak_reserved=600) for _ in range(2)]
+
+    def reset(device):
+        gpu = gpus[device.index]
+        gpu.peak, gpu.peak_reserved = gpu.allocated, gpu.reserved
+
+    for api, attr in (("memory_allocated", "allocated"), ("max_memory_allocated", "peak"),
                       ("memory_reserved", "reserved"), ("max_memory_reserved", "peak_reserved")):
-        monkeypatch.setattr(torch.cuda, name, lambda device, key=key: gpus[rank["value"]][key])
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (gpus[rank["value"]]["free"], 1000))
-    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
+        monkeypatch.setattr(torch.cuda, api, lambda device, attr=attr: getattr(gpus[device.index], attr))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (1000 - 80 - gpus[device.index].reserved, 1000))
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", reset)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
 
     def load(model, engine):
-        # The load allocates a transient, frees it, and the caching allocator keeps it reserved.
-        gpu, transient = gpus[rank["value"]], 10 * (rank["value"] + 1)
-        gpu.update(peak=gpu["allocated"] + transient, reserved=gpu["reserved"] + transient, free=gpu["free"] - transient)
-        gpu["peak_reserved"] = gpu["reserved"]
+        rank = extension.device.index
+        gpu, transient = gpus[rank], 10 * (rank + 1)
+        gpu.peak = max(gpu.peak, gpu.allocated + transient)
+        gpu.peak_reserved = max(gpu.peak_reserved, gpu.reserved + transient)
+        gpu.allocated += 1
+        gpu.reserved += transient // 2
         return 1, 4.0, 4.0, {"source.weight": ["weight"]}, []
 
-    model = nn.Linear(1, 1, bias=False)
-    extension = SimpleNamespace(
-        device=torch.device("cpu"),
-        model_runner=SimpleNamespace(model=model),
-        model_config=SimpleNamespace(quantization=None),
-        _get_or_create_broadcast_engine=lambda *args: object(),
-        _load_batched=load,
-    )
-    extension._build_result = lambda *args: WeightSyncExtension._build_result(extension, *args)
+    extension._load_batched = load
 
     class FakeLLM:
         async def collective_rpc(self, method, args):
             results = []
-            for tp_rank in range(2):
-                rank["value"] = tp_rank
-                results.append(getattr(WeightSyncExtension, method)(extension, *args))
+            for rank in range(2):
+                extension.device = torch.device("cpu", rank)
+                results.append(getattr(extension, method)(*args))
             return results
 
     worker_class = InferenceWorker.__ray_metadata__.modified_class
@@ -1188,14 +1189,15 @@ def test_broadcast_sync_reports_every_rank_memory(monkeypatch):
 
     assert result["rank_memory"] == [
         {
-            "mem_before_bytes": 100, "mem_peak_bytes": 100 + transient, "mem_after_bytes": 100,
+            "mem_before_bytes": 100, "mem_peak_bytes": 100 + transient, "mem_after_bytes": 101,
             "mem_extra_bytes": transient, "mem_reserved_before_bytes": 120,
-            "mem_reserved_peak_bytes": 120 + transient, "mem_reserved_after_bytes": 120 + transient,
-            "device_free_before_bytes": 900, "device_free_after_bytes": 900 - transient, "device_total_bytes": 1000,
+            "mem_reserved_peak_bytes": 120 + transient, "mem_reserved_after_bytes": 120 + transient // 2,
+            "device_free_before_bytes": 800, "device_free_after_bytes": 800 - transient // 2, "device_total_bytes": 1000,
         }
         for transient in (10, 20)
     ]
-    assert result["mem_extra_bytes"] == 10
+    rank_zero = result["rank_memory"][0]
+    assert {key: result[key] for key in rank_zero} == rank_zero
 
 
 def test_load_batched_holds_one_rebuilt_oversized_tensor_at_a_time(monkeypatch):
