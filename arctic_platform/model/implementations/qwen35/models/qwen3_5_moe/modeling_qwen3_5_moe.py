@@ -30,6 +30,9 @@ from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutp
 from arctic_platform.model.implementations.moe.layers.moe import FeedForward
 from arctic_platform.model.implementations.moe.layers.moe import MoE
 from arctic_platform.model.implementations.moe.layers.moe import MoEArgs
+from arctic_platform.model.implementations.moe.mrope import mrope_cos_sin
+from arctic_platform.model.implementations.moe.mrope import mrope_position_ids as compute_mrope_position_ids
+from arctic_platform.model.implementations.moe.mrope import mrope_section
 
 from ..base import PreTrainedModelPrimeRL
 from ..layers.rotary_emb import RotaryEmbedding
@@ -867,7 +870,10 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         routed_experts: Optional[torch.LongTensor] = None,
+        mrope_position_ids: Optional[torch.LongTensor] = None,
     ) -> MoeModelOutputWithPast:
+        """``position_ids`` are text positions and delimit packed sequences. ``mrope_position_ids`` (``[3, B, S]``),
+        when given, are the temporal, height and width positions the rotary embedding uses instead."""
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -893,7 +899,16 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             cu_seqlens = None
 
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        if mrope_position_ids is None:
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        else:
+            position_embeddings = mrope_cos_sin(
+                self.rotary_emb.inv_freq,
+                self.rotary_emb.attention_scaling,
+                mrope_position_ids,
+                mrope_section(self.config),
+                hidden_states.dtype,
+            )
 
         # With fp32_parity the residual is threaded between layers so that every residual add, including the last
         # one, happens in fp32 inside a norm. Without it every layer returns a residual of None.
@@ -965,6 +980,14 @@ class Qwen3_5MoeVLMModel(nn.Module):
         routed_experts: torch.LongTensor | None = None,
         **kwargs,
     ) -> MoeModelOutputWithPast:
+        videos = sorted(key for key in ("pixel_values_videos", "video_grid_thw") if kwargs.get(key) is not None)
+        if videos:
+            raise NotImplementedError(f"Qwen3.5-MoE training does not take video inputs yet (got {videos})")
+        if (pixel_values is None) != (image_grid_thw is None):
+            raise ValueError("pixel_values and image_grid_thw must be passed together")
+        if pixel_values is not None and input_ids is None:
+            raise ValueError("image inputs need input_ids to locate the image tokens")
+
         if inputs_embeds is None:
             inputs_embeds = self.language_model.embed_tokens(input_ids)
 
@@ -974,16 +997,33 @@ class Qwen3_5MoeVLMModel(nn.Module):
             image_embeds = vision_output.pooler_output.to(inputs_embeds.device, inputs_embeds.dtype)
 
             image_mask = input_ids == self.config.image_token_id
+            image_tokens = int(image_mask.sum())
+            if image_tokens != image_embeds.shape[0]:
+                raise ValueError(
+                    f"input_ids hold {image_tokens} image tokens but the images encode to {image_embeds.shape[0]}"
+                )
             image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if position_ids is None:
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
 
+        # Text-only rows rotate identically under 1-D RoPE, so M-RoPE positions are only built for images.
+        mrope_position_ids = None
+        if image_grid_thw is not None:
+            mrope_position_ids = compute_mrope_position_ids(
+                input_ids,
+                position_ids,
+                image_grid_thw,
+                image_token_id=self.config.image_token_id,
+                spatial_merge_size=self.config.vision_config.spatial_merge_size,
+            )
+
         return self.language_model(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             routed_experts=routed_experts,
+            mrope_position_ids=mrope_position_ids,
         )
 
 
