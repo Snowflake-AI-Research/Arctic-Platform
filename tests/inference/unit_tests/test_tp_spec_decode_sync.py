@@ -162,7 +162,8 @@ def test_vllm_model_runner_v2_matches_what_the_patch_assumes():
         "return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected"
         in src
     )
-    assert "self.speculator = init_speculator(" in inspect.getsource(GPUModelRunner.__init__)
+    original_init = getattr(GPUModelRunner.__init__, "_orig", GPUModelRunner.__init__)
+    assert "self.speculator = init_speculator(" in inspect.getsource(original_init)
     assert src.count("self.speculator.propose(") == 2
     assert "self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens" in src
     assert {"sampled_token_ids", "num_sampled", "num_rejected"} <= set(

@@ -1244,7 +1244,7 @@ def through_driver(script, prompt, params):
     async def run():
         actor = ChatWorker.remote(script)
         pool = ReplicaPool()
-        pool._scheduler = Scheduler([actor], dynamic_concurrency=False)
+        pool._scheduler = Scheduler([actor], capacity=1024)
         driver = Driver()
         driver._pools["model"] = pool
         try:
@@ -1302,12 +1302,12 @@ def _stub_vllm_chat_modules(monkeypatch):
     class VLLMClientError(Exception):
         pass
 
+    class ChatTemplateResolutionError(VLLMClientError):
+        pass
+
     modules = {
         "jinja2": {"TemplateError": type("TemplateError", (Exception,), {})},
         "vllm.entrypoints": {},
-        "vllm.renderers.chat_utils": {
-            "ChatTemplateResolutionError": type("ChatTemplateResolutionError", (ValueError,), {})
-        },
         "vllm.entrypoints.openai": {},
         "vllm.entrypoints.openai.chat_completion": {},
         "vllm.entrypoints.openai.chat_completion.protocol": {
@@ -1326,6 +1326,12 @@ def _stub_vllm_chat_modules(monkeypatch):
             setattr(module, key, value)
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setattr(sys.modules["vllm.exceptions"], "VLLMClientError", VLLMClientError, raising=False)
+    monkeypatch.setattr(
+        sys.modules["vllm.exceptions"],
+        "ChatTemplateResolutionError",
+        ChatTemplateResolutionError,
+        raising=False,
+    )
 
 
 def _engine_whose_renderer_raises(error):
@@ -1482,7 +1488,7 @@ def test_model_without_a_chat_template_is_chat_unsupported(monkeypatch, caplog):
     import sys
 
     _stub_vllm_chat_modules(monkeypatch)
-    error = sys.modules["vllm.renderers.chat_utils"].ChatTemplateResolutionError
+    error = sys.modules["vllm.exceptions"].ChatTemplateResolutionError
     engine = _engine_whose_renderer_raises(error("you must provide a chat template"))
 
     async def run_twice():
@@ -1676,7 +1682,7 @@ def chat_support_driver(supports):
     actors = [ray.remote(num_cpus=0)(ChatSupportWorker).remote(s) for s in supports]
     pool = ReplicaPool()
     pool._workers = list(actors)
-    pool._scheduler = Scheduler(actors, dynamic_concurrency=False)
+    pool._scheduler = Scheduler(actors, capacity=1024)
     driver = Driver()
     driver._pools["model"] = pool
     return driver, pool, actors
