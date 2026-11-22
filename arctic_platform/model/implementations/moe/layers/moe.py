@@ -1243,6 +1243,8 @@ class NemotronHRouter(nn.Module):
     and bias correction for load balancing.
     """
 
+    _dss_weight_export_buffers = frozenset({"e_score_correction_bias"})
+
     def __init__(
         self,
         dim: int,
@@ -1260,11 +1262,14 @@ class NemotronHRouter(nn.Module):
         self.n_group = n_group
         self.topk_group = topk_group
         self.norm_topk_prob = norm_topk_prob
+        # Off unless the caller opts in via enable_fresh_replay_routing(); otherwise replay stays gather-only.
+        self.fresh_replay_routing = False
 
-    def forward(
-        self, x: torch.Tensor, expert_bias: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        scores = F.linear(x.float(), self.gate.float()).sigmoid()
+    def enable_fresh_replay_routing(self) -> None:
+        """Route ``ROUTER_REPLAY_FRESH`` tokens in ``routed_experts`` with this router's own gate."""
+        self.fresh_replay_routing = True
+
+    def _select_experts(self, scores: torch.Tensor, expert_bias: torch.Tensor | None) -> torch.Tensor:
         scores_for_choice = scores + self.e_score_correction_bias
 
         if expert_bias is not None:
@@ -1287,7 +1292,25 @@ class NemotronHRouter(nn.Module):
             )
             scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
 
-        selected_experts_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+        return torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+
+    def forward(
+        self, x: torch.Tensor, expert_bias: torch.Tensor | None = None, routed_experts: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert (
+            routed_experts is None or routed_experts.shape[-1] == self.top_k
+        ), f"routed_experts shape: {routed_experts.shape}, top_k: {self.top_k}"
+        scores = F.linear(x.float(), self.gate.float()).sigmoid()
+
+        if routed_experts is not None and self.fresh_replay_routing:
+            # The gate's own choice is made off the autograd graph so replayed and fresh tokens save the same
+            # tensors, which the activation-checkpoint recompute relies on.
+            own_experts = self._select_experts(scores.detach(), expert_bias)
+            selected_experts_indices = torch.where(routed_experts == ROUTER_REPLAY_FRESH, own_experts, routed_experts)
+        elif routed_experts is not None:
+            selected_experts_indices = routed_experts
+        else:
+            selected_experts_indices = self._select_experts(scores, expert_bias)
         top_scores = scores.gather(1, selected_experts_indices)
 
         if self.norm_topk_prob:
@@ -1484,10 +1507,21 @@ class LatentMoE(nn.Module):
         return shared_output + routed_output
 
     def forward(self, x: torch.Tensor, routed_experts: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor with shape ``(bs, slen, dim)``.
+            routed_experts (torch.Tensor | None, optional): Optional tensor with shape ``(bs, slen, top_k)``.
+                Tokens set to ``ROUTER_REPLAY_FRESH`` are routed by the gate when the router opted into fresh
+                routing; the rest are replayed.
+        """
         bs, slen, dim = x.shape
         x_flat = x.view(-1, dim)
+        if routed_experts is not None:
+            routed_experts = routed_experts.reshape(-1, routed_experts.shape[-1])
 
-        top_scores, selected_experts_indices, num_tokens_per_expert = self.router(x_flat, self.expert_bias)
+        top_scores, selected_experts_indices, num_tokens_per_expert = self.router(
+            x_flat, self.expert_bias, routed_experts=routed_experts
+        )
 
         with torch.no_grad():
             self.tokens_per_expert.add_(num_tokens_per_expert)
