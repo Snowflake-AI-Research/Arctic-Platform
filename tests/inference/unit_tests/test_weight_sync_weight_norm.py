@@ -238,6 +238,7 @@ def cpu_cuda(monkeypatch):
     """The load paths' CUDA bookkeeping, served on CPU with one fake GPU."""
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device=None: None)
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device=None: 0)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (0, 0))
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device=None: 0)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
