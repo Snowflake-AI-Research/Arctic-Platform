@@ -366,16 +366,21 @@ class TestStickyPlacement:
             workers = [_Worker(), _Worker()]
             sch = Scheduler(workers, capacity=8)
             await _three_keys_between_turns_on_0_one_mid_turn_on_1(sch, workers)
-            # Worker 0 has no request in flight, but its three keys come back for their next turns.
+            # Strict has no affinity without a routing key or prefix routing.
+            unkeyed = sch.submit("unkeyed", {}, strict=True)
+            assert len(workers[0].calls) == 4
+            workers[0].calls[-1].set_result({})
+            await unkeyed
             sch.submit("e turn 1", {}, routing_key="e")
             assert sch._keys["e"] == 1
+            assert sch._workers[0].live_keys() == 3
             sch.submit("a turn 2", {}, routing_key="a")
-            assert len(workers[0].calls) == 4
+            assert len(workers[0].calls) == 5
             await sch.shutdown()
 
         asyncio.run(run())
 
-    def test_key_idle_past_the_window_stops_counting(self, monkeypatch):
+    def test_key_stops_counting_at_idle_deadline(self, monkeypatch):
         clock = [1000.0]
         monkeypatch.setattr(scheduler_module, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
 
@@ -383,14 +388,18 @@ class TestStickyPlacement:
             workers = [_Worker(), _Worker()]
             sch = Scheduler(workers, capacity=8)
             await _three_keys_between_turns_on_0_one_mid_turn_on_1(sch, workers)
-            clock[0] += scheduler_module._KEY_IDLE_S + 1
+            sch.submit("before expiry", {}, routing_key="before")
+            assert sch._keys["before"] == 1
+            clock[0] += scheduler_module._KEY_IDLE_S
             sch.submit("e turn 1", {}, routing_key="e")
             assert sch._keys["e"] == 0
             await sch.shutdown()
 
         asyncio.run(run())
 
-    def test_burst_of_new_keys_spreads_evenly(self):
+    def test_burst_of_new_keys_spreads_evenly(self, monkeypatch):
+        monkeypatch.setattr(scheduler_module.random, "randrange", lambda n: 0)
+
         async def run() -> None:
             workers = [_Worker() for _ in range(4)]
             sch = Scheduler(workers, capacity=64)

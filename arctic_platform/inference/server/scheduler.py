@@ -68,7 +68,7 @@ class WorkerState:
     def live_keys(self) -> int:
         """Sticky keys with a request here, or whose last one here ended under ``_KEY_IDLE_S`` seconds ago."""
         cutoff = time.monotonic() - _KEY_IDLE_S
-        while self.idle_keys and next(iter(self.idle_keys.values())) < cutoff:
+        while self.idle_keys and next(iter(self.idle_keys.values())) <= cutoff:
             self.idle_keys.popitem(last=False)
         return len(self.busy_keys) + len(self.idle_keys)
 
@@ -115,16 +115,13 @@ def _compute_prefix_hash(prompt: Any) -> int:
 class Scheduler:
     """Routes each request to a worker, letting each engine queue a backlog of its own.
 
-    A request with no key goes to the less loaded of two random workers. A
-    keyed one goes to the worker its key was first given, chosen that way then,
-    except that a sticky key is first given the worker holding the fewest live
-    sticky keys; a prefix-hash key spills while its worker holds ``capacity``
-    requests and another has room, and a sticky one never spills. A worker
-    takes up to ``_BACKLOG * capacity`` generate requests, never fewer than
-    ``capacity``, and short of the worker actor's Ray slots by
-    ``_CONTROL_SLOTS``. Past that, or while paused, requests wait here in order
-    and go to the first worker that frees up; a sticky one waits on its own
-    worker's queue.
+    New sticky keys go to the worker holding the fewest live sticky keys.
+    Unkeyed requests and new non-sticky prefix keys use the less loaded of two
+    random workers. A sticky key waits on its worker. A non-sticky prefix
+    key can spill when its worker holds ``capacity`` requests.
+    Each worker accepts up to ``_BACKLOG * capacity`` generate requests,
+    capped to reserve ``_CONTROL_SLOTS`` but never below ``capacity``.
+    Excess requests and requests submitted while paused wait here.
     """
 
     def __init__(
@@ -190,9 +187,8 @@ class Scheduler:
             prompt: Text, ``list[int]``, or a 1-D integer CPU tensor of token
                 ids; a tensor is sent to the worker as is.
             routing_key: Optional opaque string used as the affinity key. The
-                first request for a key goes to the least-loaded worker and
-                later ones stay on that worker, so turn N+1 of a multi-turn
-                rollout reuses turn N's KV cache and router-replay capture.
+                first request goes to the worker holding the fewest live sticky
+                keys. Later turns reuse that worker's KV cache and router-replay capture.
             strict: Keep a prompt-hash keyed request on its worker under load
                 too; a routing key already does.
         """
@@ -444,7 +440,7 @@ class Scheduler:
         self._next_id += 1
         return _Request(
             id=self._next_id - 1, prompt=prompt, sampling_params=sampling_params, future=future,
-            key=key, sticky=routing_key is not None or strict,
+            key=key, sticky=routing_key is not None or (strict and key is not None),
         )
 
     def _take(self, req: _Request, stream: bool = False) -> WorkerState | None:
@@ -512,12 +508,8 @@ class Scheduler:
         return min(candidates, key=lambda k: self._workers[k].active_requests, default=None)
 
     def _fewest_keys(self, stream: bool) -> int | None:
-        """The worker holding the fewest live sticky keys that can take a request, the less loaded on a tie.
-
-        A sticky key's context grows on its first worker for the key's whole life, so placing it by the requests in
-        flight at one instant piles keys onto whichever workers' keys are between requests.
-        """
-        candidates = [k for k, ws in enumerate(self._workers) if ws.schedulable and self._has_room(ws, stream)]
+        """Count sticky keys between turns as well as those in flight."""
+        candidates = (k for k, ws in enumerate(self._workers) if ws.schedulable and self._has_room(ws, stream))
         return min(candidates, key=lambda k: (self._workers[k].live_keys(), self._workers[k].active_requests),
                    default=None)
 

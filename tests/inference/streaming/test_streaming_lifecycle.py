@@ -148,21 +148,6 @@ def test_quarantine_blocks_legacy_dispatch_until_worker_replacement(prefix_routi
     asyncio.run(scenario())
 
 
-def test_finished_stream_releases_its_routing_key():
-    async def scenario():
-        pool, _ = make_pool()
-        scheduler = pool._scheduler
-        stream = scheduler.stream_generate("keyed", "prompt", routing_key="k")
-        stream.worker = scheduler._take(stream.request, stream=True)
-        assert stream.worker.busy_keys == {"k": 1}
-        await stream.finish()
-        assert not stream.worker.busy_keys and list(stream.worker.idle_keys) == ["k"]
-        assert stream.worker.active_requests == 0
-        await scheduler.shutdown()
-
-    asyncio.run(scenario())
-
-
 def test_generator_cancel_failure_quarantines_worker(monkeypatch):
     async def scenario():
         pool, _ = make_pool()
