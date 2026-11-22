@@ -121,6 +121,28 @@ def test_glm53_rejects_malformed_packed_boundaries(boundaries):
         )
 
 
+def test_glm53_sp_boundaries_from_positions_require_each_row_to_restart_at_zero(monkeypatch):
+    from arctic_platform.model.implementations.glm53 import context_parallel as cp
+
+    backbone = torch.nn.Module()
+    backbone.forward = lambda input_ids=None, position_ids=None: None
+    backbone._cp_world_size, backbone._cp_group = 16, None
+    layer = torch.nn.Module()
+    cp._wrap_backbone_forward(backbone, [layer])
+
+    def run(rows):
+        # Rows packed into 16 tokens across 16 ranks; the 11 padding tokens carry position 0.
+        positions = torch.tensor([sum(rows, []) + [0] * 11])
+        monkeypatch.setattr(cp, "_gather_sequence_no_grad", lambda tensor, group: positions)
+        backbone(input_ids=torch.ones(1, 1, dtype=torch.long), position_ids=positions[:, :1])
+        return getattr(layer, cp._GLOBAL_CU_SEQLENS).tolist()
+
+    assert run([[0, 1], [0, 1, 2]]) == [0, 2, 5, *range(6, 17)]
+    # A second row whose positions start at 1 would otherwise merge into the first: [0, 4, 5, ...].
+    with pytest.raises(ValueError, match="restart at 0"):
+        run([[0, 1], [1, 2, 3]])
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="packed KDA kernels require CUDA")
 def test_glm53_sp1_packed_kda_outputs_and_gradients_match_isolated_row(tiny_glm_sparse_model):
     torch.manual_seed(23)
