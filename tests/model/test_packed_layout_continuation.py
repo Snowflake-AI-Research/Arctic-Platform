@@ -18,10 +18,14 @@
 The flash kernels are replaced by ``flash_attn_varlen_reference`` (pure torch, bottom-right causal), so these
 tests check the wiring -- which K/V each continuation sees, which segments the model uses, what the layout
 stash does across checkpoint recompute -- not the CUDA kernels. Kernel numerics are the on-prem gate's job.
+Hugging Face models run transformers' own ``flash_attention_forward``; only the kernels it imports are swapped.
 
 Each model call runs three ways on one batch: prefix sharing on, a sharing-off layout, and every row on its own.
 Response log-probs and every parameter gradient must agree in float64; disabling the prefix gather must not.
 """
+
+import functools
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -251,43 +255,74 @@ def test_ap_sdpa_is_rejected_under_sharing():
         pass
 
 
-def _hf_flash_reference(
-    module,
-    query,
-    key,
-    value,
-    attention_mask,
-    dropout=0.0,
-    scaling=None,
-    sliding_window=None,
-    cu_seq_lens_q=None,
-    cu_seq_lens_k=None,
-    max_length_q=None,
-    max_length_k=None,
-    position_ids=None,
-    **kwargs,
-):
-    """CPU stand-in for transformers' ``flash_attention_forward`` on packed ``[1, H, T, D]`` inputs."""
-    assert attention_mask is None
-    q, k, v = (t.transpose(1, 2).reshape(-1, t.shape[1], t.shape[-1]) for t in (query, key, value))
-    if cu_seq_lens_q is None:
-        # transformers' own packed-sequence inference: a segment starts wherever position_ids is 0.
-        starts = (position_ids.reshape(-1) == 0).nonzero().flatten()
-        cu_seq_lens_q = cu_seq_lens_k = torch.cat([starts, starts.new_tensor([q.shape[0]])]).to(torch.int32)
-    window = (-1, -1) if sliding_window is None else (sliding_window - 1, sliding_window - 1)
+def _reference_flash_fn(q, k, v, causal=True, softmax_scale=None, window_size=(-1, -1), **unused):
+    """Dense ``[B, S, H, D]`` flash call: each batch row is one segment of the varlen reference."""
+    batch_size, len_q, len_k = q.shape[0], q.shape[1], k.shape[1]
+    cu_q = torch.arange(0, (batch_size + 1) * len_q, len_q, dtype=torch.int32)
+    cu_k = torch.arange(0, (batch_size + 1) * len_k, len_k, dtype=torch.int32)
     out = flash_attn_varlen_reference(
-        q, k, v, cu_seq_lens_q, cu_seq_lens_k, causal=module.is_causal, window_size=window, softmax_scale=scaling
+        q.flatten(0, 1),
+        k.flatten(0, 1),
+        v.flatten(0, 1),
+        cu_q,
+        cu_k,
+        causal=causal,
+        window_size=window_size,
+        softmax_scale=softmax_scale,
     )
-    return out.view(query.shape[0], -1, *out.shape[-2:]), None
+    return out.view(q.shape)
+
+
+def _flatten(items):
+    for item in items:
+        if isinstance(item, tuple):
+            yield from _flatten(item)
+        else:
+            yield item
 
 
 @pytest.fixture
-def hf_flash_reference():
-    """Point transformers' ``flash_attention_2`` entry at the CPU reference for one test, then remove it."""
+def hf_flash_reference(monkeypatch):
+    """Run transformers' own ``flash_attention_forward`` with only the flash kernels swapped for the CPU reference.
+
+    transformers caches the kernels it imports in ``modeling_flash_attention_utils`` globals (4.57:
+    ``_flash_fn`` .. ``_process_flash_kwargs_fn``; 5.x also ``_loaded_implementation`` and the paged
+    entries). Seeding that cache keeps its kwarg routing -- ``cu_seq_lens_*`` / ``max_length_*`` to the varlen
+    kernel, segment inference from ``position_ids``, the window mapping -- on the path under test. Each varlen
+    kernel call's keyword arguments plus its K/V token count are recorded in ``calls``.
+    """
+    from transformers import modeling_flash_attention_utils as fa_utils
+    from transformers.integrations.flash_attention import flash_attention_forward
+
+    needed = ("lazy_import_flash_attention", "_lazy_define_process_function", "_pad_input", "_unpad_input")
+    missing = [name for name in needed if not hasattr(fa_utils, name)]
+    if missing:
+        pytest.skip(f"transformers.modeling_flash_attention_utils has no {missing}; kernel cache layout changed")
+    calls = []
+
+    # ``wraps`` keeps the reference's signature, which transformers inspects to pick the kwargs it forwards.
+    @functools.wraps(flash_attn_varlen_reference)
+    def varlen(q, k, v, *args, **kwargs):
+        calls.append({**kwargs, "k_tokens": k.shape[0]})
+        return flash_attn_varlen_reference(q, k, v, *args, **kwargs)
+
+    cache = {
+        "_flash_fn": _reference_flash_fn,
+        "_flash_varlen_fn": varlen,
+        "_pad_fn": fa_utils._pad_input,
+        "_unpad_fn": fa_utils._unpad_input,
+        "_process_flash_kwargs_fn": fa_utils._lazy_define_process_function(varlen),
+        "_flash_with_kvcache_fn": None,
+        "_process_with_kvcache_kwargs_fn": dict,
+        "_loaded_implementation": "flash_attention_2",
+    }
+    for name, value in cache.items():
+        monkeypatch.setattr(fa_utils, name, value, raising=False)
+    if varlen not in list(_flatten(fa_utils.lazy_import_flash_attention("flash_attention_2"))):
+        pytest.skip("transformers' lazy_import_flash_attention ignores the seeded kernel cache")
+    assert ALL_ATTENTION_FUNCTIONS["flash_attention_2"] is flash_attention_forward
     assert "flash_attention_2" not in ALL_ATTENTION_FUNCTIONS._local_mapping
-    ALL_ATTENTION_FUNCTIONS["flash_attention_2"] = _hf_flash_reference
-    yield
-    del ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
+    return SimpleNamespace(forward=flash_attention_forward, calls=calls)
 
 
 def _hf_config(cls, **kwargs):
@@ -306,13 +341,14 @@ def _hf_config(cls, **kwargs):
     return config
 
 
-def _hf_model(cls, config, gradient_checkpointing=False):
+def _hf_model(cls, config, use_reentrant=None):
+    """``use_reentrant=None`` leaves gradient checkpointing off; transformers 4.x defaults it to ``True``, 5.x to ``False``."""
     set_seed(0)
     model = cls(config).double()
     # Built as sdpa (transformers refuses flash on a CPU-only host), then dispatched to the flash entry.
     model.config._attn_implementation = "flash_attention_2"
-    if gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+    if use_reentrant is not None:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": use_reentrant})
     model.train()
     return model
 
@@ -321,16 +357,39 @@ def _hf_logits(model, input_ids, position_ids):
     return model(input_ids=input_ids, position_ids=position_ids, use_cache=False).logits[0]
 
 
-@pytest.mark.parametrize("gradient_checkpointing", [False, True])
-def test_hf_qwen3_share_on_matches_share_off_and_rows(hf_flash_reference, gradient_checkpointing):
+@pytest.mark.parametrize("use_reentrant", [None, False, True], ids=["no_checkpoint", "non_reentrant", "reentrant"])
+def test_hf_qwen3_share_on_matches_share_off_and_rows(hf_flash_reference, use_reentrant):
     set_seed(2)
     batch, groups, scored = _batch()
     shared, unshared = _layouts(batch, groups)
-    model = _hf_model(Qwen3ForCausalLM, _hf_config(Qwen3Config), gradient_checkpointing)
+    model = _hf_model(Qwen3ForCausalLM, _hf_config(Qwen3Config), use_reentrant)
     rows = _run(model, _hf_logits, batch, scored)
     _assert_runs_match(_run(model, _hf_logits, batch, scored, unshared), rows)
     _assert_runs_match(_run(model, _hf_logits, batch, scored, shared), rows, SHARED_GRAD_ATOL)
-    assert ALL_ATTENTION_FUNCTIONS["flash_attention_2"] is _hf_flash_reference
+    assert ALL_ATTENTION_FUNCTIONS["flash_attention_2"] is hf_flash_reference.forward
+
+
+def test_hf_flash_forward_hands_layout_segments_to_varlen_kernel(hf_flash_reference):
+    batch, groups, _ = _batch()
+    shared, unshared = _layouts(batch, groups)
+    model = _hf_model(Qwen3ForCausalLM, _hf_config(Qwen3Config))
+    layers = model.config.num_hidden_layers
+    for layout in (shared, unshared):
+        hf_flash_reference.calls.clear()
+        packed = pack_with_layout(batch, layout)
+        with using_layout(model, layout):
+            _hf_logits(model, packed["input_ids"], packed["position_ids"])
+        # Share-on: the wrapper's cu_seq_lens / max_length kwargs. Share-off: transformers' own inference from
+        # position_ids, which matches the unshared layout because every row restarts at position 0.
+        assert len(hf_flash_reference.calls) == layers
+        for call in hf_flash_reference.calls:
+            assert call["cu_seqlens_q"].tolist() == layout.cu_seqlens.tolist()
+            assert call["cu_seqlens_k"].tolist() == layout.cu_seqlens_k.tolist()
+            assert int(call["max_seqlen_q"]) == layout.max_len_q
+            assert int(call["max_seqlen_k"]) == layout.max_len_k
+            assert call["k_tokens"] == layout.kv_index.numel()
+            assert call["causal"] is True
+    assert shared.kv_index.numel() > shared.num_tokens
 
 
 def test_hf_registry_wrapper_is_scoped_and_not_stacked(hf_flash_reference):
@@ -343,13 +402,13 @@ def test_hf_registry_wrapper_is_scoped_and_not_stacked(hf_flash_reference):
     expected = _hf_logits(model, packed["input_ids"], packed["position_ids"]).detach()
     with using_layout(model, shared):
         wrapper = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
-        assert wrapper is not _hf_flash_reference
+        assert wrapper is not hf_flash_reference.forward
         with using_layout(model, shared):
             assert ALL_ATTENTION_FUNCTIONS["flash_attention_2"] is wrapper
             nested = _hf_logits(model, packed["input_ids"], packed["position_ids"]).detach()
         # A model without a stash in the same process still runs plain flash attention.
         other_out = _hf_logits(other, packed["input_ids"], packed["position_ids"]).detach()
-    assert ALL_ATTENTION_FUNCTIONS["flash_attention_2"] is _hf_flash_reference
+    assert ALL_ATTENTION_FUNCTIONS["flash_attention_2"] is hf_flash_reference.forward
     with using_layout(model, shared):
         once = _hf_logits(model, packed["input_ids"], packed["position_ids"]).detach()
     torch_assert_equal(nested, once)
@@ -380,7 +439,7 @@ def test_hf_sliding_window_fails_closed(hf_flash_reference):
         with using_layout(model, shared):
             pass
     attention.sliding_window = None
-    wrapper = _hf_prefix_attention_fn(_hf_flash_reference)
+    wrapper = _hf_prefix_attention_fn(hf_flash_reference.forward)
     q = torch.zeros(1, 4, shared.num_tokens, HEAD_DIM, dtype=torch.float64)
     k = torch.zeros(1, 2, shared.num_tokens, HEAD_DIM, dtype=torch.float64)
     with using_layout(model, shared):
@@ -431,3 +490,37 @@ def test_position_id_boundary_helpers_fail_closed_under_sharing():
     with using_layout(_ap_attention(), unshared):
         for helper in helpers:
             helper(pack_with_layout(batch, unshared)["position_ids"])
+
+
+class _PastSegmentGuard(Exception):
+    pass
+
+
+def test_qwen3_5_moe_segment_boundaries_fail_closed_under_sharing():
+    try:
+        from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeModel,
+        )
+    except Exception as exc:
+        pytest.skip(f"Qwen3.5-MoE model unavailable: {exc}")
+
+    def stop(*args, **kwargs):
+        raise _PastSegmentGuard
+
+    # Only the code up to rotary embeddings runs: config, embedding, then the position_ids == 0 segment split.
+    fake = SimpleNamespace(
+        config=SimpleNamespace(_attn_implementation="flash_attention_2"),
+        embed_tokens=lambda ids: torch.zeros(*ids.shape, 4),
+        rotary_emb=stop,
+    )
+    batch, groups, _ = _batch()
+    shared, unshared = _layouts(batch, groups)
+    cases = (
+        (shared, ValueError, "Qwen3.5-MoE segment boundaries.*position_ids == 0"),
+        (unshared, _PastSegmentGuard, ""),
+    )
+    for layout, expected, match in cases:
+        packed = pack_with_layout(batch, layout)
+        with using_layout(_ap_attention(), layout):
+            with pytest.raises(expected, match=match):
+                Qwen3_5MoeModel.forward(fake, input_ids=packed["input_ids"], position_ids=packed["position_ids"])
