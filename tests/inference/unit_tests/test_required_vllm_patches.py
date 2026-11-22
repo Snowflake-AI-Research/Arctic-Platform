@@ -1,4 +1,5 @@
 from arctic_platform.inference.vllm import config
+from arctic_platform.inference.vllm import decoded_tail_prefix_hit
 from arctic_platform.inference.vllm import deepseek_v41_lora
 from arctic_platform.inference.vllm import dense_prompt_logprobs
 from arctic_platform.inference.vllm import glm5next_lora
@@ -72,6 +73,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "ensure_deepseek_v41_lora",
         lambda: calls.append("deepseek_v41_lora"),
     )
+    monkeypatch.setattr(
+        decoded_tail_prefix_hit,
+        "ensure_decoded_tail_prefix_hit",
+        lambda: calls.append("decoded_tail_prefix_hit"),
+    )
 
     required_patches.apply_required_vllm_patches()
 
@@ -88,4 +94,5 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "mrope_yarn",
         "mamba_completion_refresh",
         "deepseek_v41_lora",
+        "decoded_tail_prefix_hit",
     ]
