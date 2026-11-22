@@ -20,6 +20,7 @@ from transformers.utils import TransformersKwargs
 
 from arctic_platform.common.packing.layout import get_stashed_layout
 from arctic_platform.common.packing.layout import prefix_varlen_args
+from arctic_platform.common.packing.layout import register_native_prefix_attention
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
 from arctic_platform.model.implementations.layers.mlp import MLP, MLPConfig
@@ -192,6 +193,7 @@ class AfmoeSDPAAttention(AfmoeAttentionBase):
         return self.output_proj(attn_output, gate_states), None
 
 
+@register_native_prefix_attention
 class AfmoeFlashAttention(AfmoeAttentionBase):
     """AFMoE attention using Flash Attention varlen functions."""
 

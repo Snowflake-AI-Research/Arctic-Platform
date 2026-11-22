@@ -21,35 +21,63 @@ attention segments, not loss rows. Until the loss-alignment PR, sharing-on is
 token-mean only.
 
 Lifetime: :func:`using_layout` is the only way to activate a layout. It must wrap forward,
-loss, and backward of one model call. Activation checkpointing re-runs forward inside
-backward, and that recompute reads the same stash; a backward outside the context
-recomputes without the prefix gather. Entering with a sharing layout validates every
+loss, and backward of one model call. Entering with a sharing layout validates every
 sequence mixer (:func:`require_prefix_continuation`) and the router-replay decision for
 MoE models, and raises before anything runs. Calling it per model call is the caller's
 job. Training does not use this API yet: that is deliberate until the executor PR
 (``plan_calls`` / ``execute_calls``). PR1 users are the CPU tests and the on-prem GPU gate.
 
+Hold the context through backward. Activation checkpointing re-runs forward inside
+backward and that recompute reads the same stash. If the context has exited by then,
+non-reentrant checkpointing (``use_reentrant=False``) raises ``CheckpointError``, but
+reentrant checkpointing (``use_reentrant=True``, which ``transformers<5``
+``gradient_checkpointing_enable()`` picks by default) recomputes without the prefix gather
+and returns finite, wrong gradients. :meth:`PackedLayout.unpack` hooks backward and raises
+if its layout's context is gone, which catches that case only when the loss flows through
+``unpack``. Prefer ``use_reentrant=False``.
+
+One thread per process. Contexts nest, but only on the thread that entered the outermost
+one; another thread entering while any context is active raises. The active-layout stack
+and the Hugging Face registry override are process globals. Reads are not thread-checked:
+autograd runs backward, and checkpoint recompute, on its own device threads.
+
+Every model that runs while a context is active needs its own :func:`using_layout` (an
+unshared layout is fine). Arctic-Platform attention with no stash raises while any context
+is active, because ``cu_seqlens_from_position_ids`` would hand it another call's segments;
+Hugging Face attention with no stash raises while a sharing context is active. With nested
+contexts the loss and position-id guards fire if any layout in the stack shares, and
+``cu_seqlens_from_position_ids`` raises when the stack holds more than one layout, since it
+cannot tell which call it is serving.
+
 Attention reads the layout stashed on its own module. Arctic-Platform ``FlashAttention``
 gathers K/V itself. Hugging Face flash attention gets the gather from a wrapper that
 ``using_layout`` puts on ``transformers``' attention registry for the duration of the
-context only; the wrapper is a pass-through for modules without a sharing stash and
-refuses already-gathered K/V. Code with no module at hand (``cu_seqlens_from_position_ids``
-and the loss guards) reads the active layout, which the context also restores on exit.
+context only; the wrapper passes modules with an unshared stash through and refuses
+already-gathered K/V.
 
-MoE policy: a shared root token goes through the router and experts once per call, so
-``tokens_per_expert``, expert-bias updates, and load-balance / aux statistics count it once,
-not once per row. Expert and router weight gradients still match an unshared run (the root
-receives the sum of every row's gradient), but any term that depends on token counts does
-not; share-on vs share-off is not an all-parameter match when such terms are active.
-With router replay, groups whose replayed ids disagree on the prefix are not shared.
+Not supported inside :func:`using_layout` until the GatedDeltaNet and executor PRs define
+them: sequence parallelism (SP >= 2, a shard's ``position_ids`` do not cover the layout)
+and padded calls (``pad_packed_microbatch``). Both fail the packed-token-count checks in
+``cu_seqlens_from_position_ids`` and :func:`prefix_varlen_args`.
+
+MoE policy (documentation only; nothing here adjusts token counts): a shared root token goes
+through the router and experts once per call, so ``tokens_per_expert``, expert-bias updates,
+and load-balance / aux statistics count it once, not once per row. Expert and router weight
+gradients still match an unshared run (the root receives the sum of every row's gradient),
+but any term that depends on token counts does not; share-on vs share-off is not an
+all-parameter match when such terms are active. With router replay, groups whose replayed
+ids disagree on the prefix are not shared.
 """
 
 from __future__ import annotations
 
+import re
 import sys
+import threading
 from contextlib import ExitStack
 from contextlib import contextmanager
 from dataclasses import dataclass
+from dataclasses import field
 from dataclasses import replace
 from functools import cached_property
 from typing import Any
@@ -57,17 +85,20 @@ from typing import Callable
 from typing import Dict
 from typing import Iterator
 from typing import Sequence
+from typing import TypeVar
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from .pack import ROW_BROADCAST_KEYS
 from .walk import DROP
 from .walk import map_batch_values
 
 LAYOUT_ATTR = "_arctic_packed_layout"
 _HF_PREFIX_MARK = "_arctic_prefix_attention"
 _MISSING = object()
+_ModuleType = TypeVar("_ModuleType", bound=type)
 
 
 def shared_prefix_length(first_weighted: int, chunk: int | None = None) -> int:
@@ -90,16 +121,13 @@ def require_token_mean_if_sharing(sharing: bool, loss_agg_mode: str) -> None:
 
 
 def active_layout_requires_token_mean(loss_agg_mode: str, prefix_sharing: bool = False) -> None:
-    """Enforce token-mean from the active layout so callers cannot forget ``prefix_sharing=True``."""
-    layout = get_active_packed_layout()
-    sharing = prefix_sharing or (layout is not None and layout.has_sharing)
-    require_token_mean_if_sharing(sharing, loss_agg_mode)
+    """Enforce token-mean from the active layouts so callers cannot forget ``prefix_sharing=True``."""
+    require_token_mean_if_sharing(prefix_sharing or prefix_sharing_active(), loss_agg_mode)
 
 
 def require_no_prefix_sharing(what: str) -> None:
-    """Raise if a sharing layout is active: ``what`` infers segments from ``position_ids == 0``."""
-    layout = get_active_packed_layout()
-    if layout is not None and layout.has_sharing:
+    """Raise if any active layout shares: ``what`` infers segments from ``position_ids == 0``."""
+    if prefix_sharing_active():
         raise ValueError(
             f"{what} infers segments from position_ids == 0, which splits a continuation from its root "
             "under prefix sharing; read the active PackedLayout instead"
@@ -118,8 +146,13 @@ def require_identical_prefixes(
     groups: Sequence[Sequence[int]],
     shared: Sequence[int],
     attention_mask: Tensor,
+    position_ids: Tensor | None = None,
 ) -> None:
-    """``shared[i]`` is a count of valid tokens, not raw columns."""
+    """``shared[i]`` is a count of valid tokens, not raw columns.
+
+    With ``position_ids`` the shared tokens must also sit at the same positions in every row: the
+    root is gathered from one row, so every row's continuation attends to that row's RoPE.
+    """
     for rows, n in zip(groups, shared):
         if n <= 0 or len(rows) < 2:
             continue
@@ -127,6 +160,15 @@ def require_identical_prefixes(
         for row in rows[1:]:
             if not torch.equal(_valid_prefix(input_ids, attention_mask, row, n), first):
                 raise ValueError(f"prompt group {list(rows)} is not token-identical on the first {n} valid tokens")
+        if position_ids is None:
+            continue
+        first = _valid_prefix(position_ids, attention_mask, rows[0], n)
+        for row in rows[1:]:
+            if not torch.equal(_valid_prefix(position_ids, attention_mask, row, n), first):
+                raise ValueError(
+                    f"prompt group {list(rows)} has different position_ids on the first {n} valid tokens; "
+                    f"the shared root would give row {row} the positions of row {rows[0]}"
+                )
 
 
 def skip_share_if_router_disagree(
@@ -146,13 +188,14 @@ def skip_share_if_router_disagree(
     return out
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class PackedLayout:
     """One packed model call. Segments ``[0, num_roots)`` are roots; later segments continue a parent.
 
     Construct with :meth:`build`; activate with :func:`using_layout`. Do not infer these
     boundaries from ``position_ids == 0``. All index tensors are built on CPU; move them
-    with :meth:`to`.
+    with :meth:`to`. Sequence-parallel shards and padded calls cannot use a layout yet (see
+    the module docstring).
 
     Attributes:
         cu_seqlens: Int32 ``[num_segments + 1]`` exclusive prefix sums of packed query tokens.
@@ -177,9 +220,12 @@ class PackedLayout:
             uses this, not packed ``T``.
         router_replay: ``True`` if :meth:`build` checked router-replay ids, ``False`` if the
             caller declared there is no replay in this job, ``None`` if neither was stated.
-            :func:`using_layout` refuses a sharing layout with ``None`` on an MoE model.
+            :func:`using_layout` refuses a sharing layout with ``None`` on an MoE model, and
+            :func:`pack_with_layout` checks it against the batch's ``routed_experts``.
         conv_kernel_size: Optional GatedDeltaNet conv width for a later ``conv_carry`` guard.
             Unused by full attention.
+        origin: Identity shared by a layout and its :meth:`to` copies, so backward can tell
+            whether this layout's context is still active.
     """
 
     cu_seqlens: Tensor
@@ -193,6 +239,7 @@ class PackedLayout:
     packed_loss_scale_factor: int
     router_replay: bool | None = None
     conv_kernel_size: int | None = None
+    origin: object = field(default_factory=object, repr=False)
 
     @classmethod
     def build(
@@ -212,14 +259,18 @@ class PackedLayout:
 
         Args:
             attention_mask: ``[B, S]`` 1 on valid tokens, 0 on pad. ``shared`` counts valid
-                tokens, not raw columns.
+                tokens, not raw columns. Every row needs at least one valid token: an all-pad
+                row would be an empty segment, which flash-attn rejects.
             groups: Partition of batch rows. Each inner sequence is one prompt group and gets at
                 most one root. A singleton is packed as its own root (no sharing).
             shared: One integer per group: how many **valid** tokens to store once as the
                 root. ``0`` means no sharing. Must be ``<`` each row's valid length so a
                 continuation remains. Typical full-attn value is ``prompt_len - 1``.
             position_ids: Optional ``[B, S]`` client positions. Packed positions are gathered
-                from these. If omitted, valid tokens in each row get ``0 .. length-1``.
+                from these. If omitted, valid tokens in each row get ``0 .. length-1``. In a
+                sharing group the first ``shared[i]`` valid positions must be equal in every
+                row (e.g. ``cumsum(mask) - 1``, not column indices under uneven left padding),
+                because the root's positions come from one row.
             conv_kernel_size: Optional conv width stored on the layout for GDN. Ignored here.
             input_ids: ``[B, S]`` token ids. Required when any group shares (``shared > 0``
                 and at least two rows). The first ``shared[i]`` valid tokens must match.
@@ -232,6 +283,10 @@ class PackedLayout:
 
         Returns:
             A layout whose packed width is the sum of root tokens plus continuation tokens.
+
+        Raises:
+            ValueError: on a malformed partition, an all-pad row, or a sharing group whose
+                valid prefix differs across rows in ``input_ids`` or ``position_ids``.
         """
         if attention_mask.ndim != 2:
             raise ValueError(f"attention_mask must be [B, S], got {tuple(attention_mask.shape)}")
@@ -248,6 +303,19 @@ class PackedLayout:
         covered = [row for rows in groups for row in rows]
         if sorted(covered) != list(range(batch_size)):
             raise ValueError("groups must partition the batch rows")
+        bool_mask = attention_mask.bool()
+        cols = [bool_mask[row].nonzero(as_tuple=False).flatten() for row in range(batch_size)]
+        empty = [row for row, col in enumerate(cols) if col.numel() == 0]
+        if empty:
+            raise ValueError(
+                f"rows {empty} have no valid tokens; flash-attn rejects empty sequences, so drop them before packing"
+            )
+        if position_ids is not None:
+            if tuple(position_ids.shape) != (batch_size, sequence_length):
+                raise ValueError(
+                    f"position_ids must be [B, S]={batch_size, sequence_length}, got {tuple(position_ids.shape)}"
+                )
+            position_ids = position_ids.cpu()
         if routed_experts is not None:
             if tuple(routed_experts.shape[:2]) != (batch_size, sequence_length):
                 raise ValueError(f"routed_experts must be [B, S, ...], got {tuple(routed_experts.shape)}")
@@ -256,14 +324,11 @@ class PackedLayout:
         if sharing:
             if input_ids is None:
                 raise ValueError("input_ids are required when sharing a prefix")
-            require_identical_prefixes(input_ids.cpu(), groups, shared, attention_mask)
-        bool_mask = attention_mask.bool()
-        cols = [bool_mask[row].nonzero(as_tuple=False).flatten() for row in range(batch_size)]
+            require_identical_prefixes(input_ids.cpu(), groups, shared, attention_mask, position_ids)
         if position_ids is None:
             position_ids = torch.zeros_like(attention_mask, dtype=torch.long)
             for row, col in enumerate(cols):
                 position_ids[row, col] = torch.arange(col.numel())
-        position_ids = position_ids.cpu()
 
         roots: list[tuple[int, int, int, int]] = []  # src_row, start, end, parent
         conts: list[tuple[int, int, int, int]] = []
@@ -321,7 +386,7 @@ class PackedLayout:
     def has_sharing(self) -> bool:
         return self.num_roots < self.num_segments
 
-    @property
+    @cached_property
     def num_tokens(self) -> int:
         return int(self.cu_seqlens[-1])
 
@@ -375,17 +440,31 @@ class PackedLayout:
             raise ValueError(f"pack expects [B, S, ...], got {tuple(rows.shape)}")
         return rows[self.src_row.to(rows.device), self.src_col.to(rows.device)]
 
-    def _tokens_first(self, packed: Tensor) -> Tensor:
-        """Accept ``[T, ...]`` or ``[1, T, ...]``. ``[T, ...]`` wins when both read the same (``T == 1``)."""
-        if packed.ndim >= 1 and packed.shape[0] == self.num_tokens:
-            return packed
-        if packed.ndim >= 2 and packed.shape[0] == 1 and packed.shape[1] == self.num_tokens:
+    def _tokens_first(self, packed: Tensor, batched: bool | None) -> Tensor:
+        tokens = self.num_tokens
+        reads_batched = packed.ndim >= 2 and packed.shape[0] == 1 and packed.shape[1] == tokens
+        reads_tokens = packed.ndim >= 1 and packed.shape[0] == tokens
+        if batched is None:
+            # With T == 1 a [1, 1, ...] tensor reads both ways; model outputs are [1, T, ...], so that wins.
+            batched = reads_batched
+        if batched and reads_batched:
             return packed.squeeze(0)
-        raise ValueError(f"expected [T, ...] or [1, T, ...] with T={self.num_tokens}, got {tuple(packed.shape)}")
+        if not batched and reads_tokens:
+            return packed
+        expected = "[1, T, ...]" if batched else "[T, ...] or [1, T, ...]"
+        raise ValueError(f"expected {expected} with T={tokens}, got {tuple(packed.shape)}")
 
-    def unpack(self, packed: Tensor, pad_value: float = 0.0) -> Tensor:
-        """Scatter packed ``[T, ...]`` (or ``[1, T, ...]``) back to ``[B, S, ...]`` via ``row_index``."""
-        packed = self._tokens_first(packed)
+    def unpack(self, packed: Tensor, pad_value: float = 0.0, batched: bool | None = None) -> Tensor:
+        """Scatter packed ``[T, ...]`` (or ``[1, T, ...]``) back to ``[B, S, ...]`` via ``row_index``.
+
+        ``batched=None`` reads a leading ``[1, T]`` as a batch dimension, including ``[1, 1, ...]``
+        when ``T == 1``; pass ``batched=False`` for a ``[T, ...]`` tensor whose second dim is ``T``
+        or ``1`` by coincidence. With a sharing layout and a tensor that requires grad, backward
+        raises if this layout's :func:`using_layout` has exited (see the module docstring).
+        """
+        packed = self._tokens_first(packed, batched)
+        if self.has_sharing and packed.requires_grad and torch.is_grad_enabled():
+            packed.register_hook(_require_context_at_backward(self.origin))
         batch_size, sequence_length = self.row_index.shape
         trailing = tuple(packed.shape[1:])
         out = packed.new_full((batch_size, sequence_length, *trailing), pad_value)
@@ -411,23 +490,66 @@ def unshared_groups(batch_size: int) -> tuple[list[list[int]], list[int]]:
 
 
 def pack_with_layout(data: Dict[str, Any], layout: PackedLayout) -> Dict[str, Any]:
-    """Pack ``[B, S, ...]`` leaves with ``layout``; drop ``attention_mask`` like ``pack_microbatch``."""
+    """Pack ``[B, S, ...]`` leaves with ``layout``; drop ``attention_mask`` like ``pack_microbatch``.
+
+    ``ROW_BROADCAST_KEYS`` leaves sent as ``[B]`` become ``[1, T]`` by each packed token's
+    ``logical_row``, as ``pack_microbatch`` does; a shared root token takes its source row's
+    value, which reaches no loss as long as shared positions carry no loss weight
+    (:meth:`PackedLayout.require_unweighted_shared`). A batch's
+    ``routed_experts`` must agree with ``layout.router_replay`` and, when replayed, with the
+    layout's shared cells.
+    """
     batch_size, sequence_length = layout.row_index.shape
+    routed: list[Tensor] = []
 
     def packed_value(key: str, value: Any) -> Any:
         if key == "attention_mask":
             return DROP
+        if key == "routed_experts" and torch.is_tensor(value):
+            routed.append(value)
+        if key in ROW_BROADCAST_KEYS and torch.is_tensor(value) and tuple(value.shape) == (batch_size,):
+            return value[layout.logical_row.to(value.device)].unsqueeze(0)
         if torch.is_tensor(value) and value.ndim >= 2 and tuple(value.shape[:2]) == (batch_size, sequence_length):
             packed = layout.pack(value)
             return packed.unsqueeze(0)
         return value
 
     packed = map_batch_values(data, packed_value)
+    _require_routed_experts_match(layout, routed)
     packed["position_ids"] = layout.position_ids.unsqueeze(0)
     return packed
 
 
-_ACTIVE_LAYOUT: PackedLayout | None = None
+def _require_routed_experts_match(layout: PackedLayout, routed: Sequence[Tensor]) -> None:
+    if not routed:
+        if layout.router_replay:
+            raise ValueError("the layout was built with routed_experts but the batch carries none")
+        return
+    if layout.router_replay is False:
+        raise ValueError("the batch carries routed_experts but the layout was built with router_replay=False")
+    if layout.router_replay is None and layout.has_sharing:
+        raise ValueError(
+            "the batch carries routed_experts but PackedLayout.build was not given them, so groups whose "
+            "replayed routes disagree on the prefix were not checked"
+        )
+    for value in routed:
+        if tuple(value.shape[:2]) != tuple(layout.row_index.shape):
+            raise ValueError(
+                f"routed_experts must be [B, S, ...]={tuple(layout.row_index.shape)}, got {tuple(value.shape)}"
+            )
+        row_index = layout.row_index.to(value.device)
+        valid = row_index >= 0
+        if not torch.equal(layout.pack(value)[row_index[valid]], value[valid]):
+            raise ValueError(
+                "the batch's routed_experts disagree on a shared prefix cell with those the layout was built from"
+            )
+
+
+# Innermost last. Process-global: read from autograd threads, written only by the owning thread.
+_ACTIVE_LAYOUTS: list[PackedLayout | None] = []
+_CONTEXT_LOCK = threading.Lock()
+_CONTEXT_OWNER: int | None = None
+_CONTEXT_DEPTH = 0
 
 
 def get_stashed_layout(module: torch.nn.Module) -> PackedLayout | None:
@@ -436,7 +558,62 @@ def get_stashed_layout(module: torch.nn.Module) -> PackedLayout | None:
 
 def get_active_packed_layout() -> PackedLayout | None:
     """Layout of the innermost :func:`using_layout`, for code that has no module to read."""
-    return _ACTIVE_LAYOUT
+    return _ACTIVE_LAYOUTS[-1] if _ACTIVE_LAYOUTS else None
+
+
+def prefix_sharing_active() -> bool:
+    """``True`` if any active :func:`using_layout`, not just the innermost, shares a prefix."""
+    return any(layout is not None and layout.has_sharing for layout in _ACTIVE_LAYOUTS)
+
+
+def layout_for_position_ids() -> PackedLayout | None:
+    """The layout whose segments replace boundaries read from ``position_ids``, or ``None`` to read them.
+
+    The caller has no module, so it cannot tell which context's model it serves. One layout
+    (possibly entered more than once) is unambiguous. With several, any choice can hand one
+    model's segments to another model's mixers, and the packed-token-count check only catches
+    that when the widths differ, so this raises instead.
+    """
+    if not _ACTIVE_LAYOUTS:
+        return None
+    if any(layout is not _ACTIVE_LAYOUTS[0] for layout in _ACTIVE_LAYOUTS):
+        raise ValueError(
+            "nested using_layout contexts with different layouts are active, so segments cannot be "
+            "read from position_ids for an unknown caller; run each model call in its own, non-nested context"
+        )
+    return _ACTIVE_LAYOUTS[0]
+
+
+def _require_context_at_backward(origin: object) -> Callable[[Tensor], None]:
+    def check(grad: Tensor) -> None:
+        if not any(layout is not None and layout.origin is origin for layout in _ACTIVE_LAYOUTS):
+            raise RuntimeError(
+                "backward of a prefix-sharing call ran after its using_layout exited; hold the context "
+                "through backward (activation-checkpoint recompute would run without the prefix gather)"
+            )
+
+    return check
+
+
+@contextmanager
+def _owning_thread() -> Iterator[None]:
+    global _CONTEXT_OWNER, _CONTEXT_DEPTH
+    me = threading.get_ident()
+    with _CONTEXT_LOCK:
+        if _CONTEXT_DEPTH and _CONTEXT_OWNER != me:
+            raise RuntimeError(
+                f"using_layout is already active on thread {_CONTEXT_OWNER}; PackedLayout contexts are "
+                "process-global, so only one thread may hold them at a time"
+            )
+        _CONTEXT_OWNER = me
+        _CONTEXT_DEPTH += 1
+    try:
+        yield
+    finally:
+        with _CONTEXT_LOCK:
+            _CONTEXT_DEPTH -= 1
+            if not _CONTEXT_DEPTH:
+                _CONTEXT_OWNER = None
 
 
 @contextmanager
@@ -444,31 +621,49 @@ def using_layout(model: torch.nn.Module, layout: PackedLayout | None) -> Iterato
     """Stash ``layout`` on every submodule of ``model`` for one forward + loss + backward.
 
     With a sharing layout this first raises unless every sequence mixer supports prefix
-    continuation and, for MoE models, the router-replay decision is explicit. On exit
-    (including on an exception) each module's previous stash, the previous active layout,
-    and any Hugging Face attention registry entry are restored, so contexts nest.
+    continuation, the router-replay decision is explicit for MoE models, and any installed
+    flash-attn 2 aligns causal masks bottom-right. On exit (including on an exception) each
+    module's previous stash, the active-layout stack, and any Hugging Face attention registry
+    entry are restored, so contexts nest on one thread; another thread entering while a
+    context is active raises.
+
+    Keep the context open through backward. With activation checkpointing, recompute after
+    exit raises ``CheckpointError`` for ``use_reentrant=False`` and silently drops the prefix
+    gather for ``use_reentrant=True`` (``transformers<5`` ``gradient_checkpointing_enable()``
+    default); :meth:`PackedLayout.unpack` raises on the latter only if the loss flows through it.
     """
-    global _ACTIVE_LAYOUT
     if layout is not None and layout.has_sharing:
         require_prefix_continuation(model)
         require_router_replay_decision(model, layout)
-    previous_active = _ACTIVE_LAYOUT
+        require_bottom_right_causal_flash()
     previous_stash = [(module, module.__dict__.get(LAYOUT_ATTR, _MISSING)) for module in model.modules()]
     with ExitStack() as stack:
+        stack.enter_context(_owning_thread())
         if layout is not None and layout.has_sharing:
             stack.enter_context(_hf_prefix_attention(model))
+        pushed = False
         try:
             for module, _ in previous_stash:
                 setattr(module, LAYOUT_ATTR, layout)
-            _ACTIVE_LAYOUT = layout
+            _ACTIVE_LAYOUTS.append(layout)
+            pushed = True
             yield layout
         finally:
-            _ACTIVE_LAYOUT = previous_active
+            if pushed:
+                _ACTIVE_LAYOUTS.pop()
             for module, previous in previous_stash:
                 if previous is _MISSING:
                     module.__dict__.pop(LAYOUT_ATTR, None)
                 else:
                     setattr(module, LAYOUT_ATTR, previous)
+
+
+def _unstashed_error(name: str) -> ValueError:
+    return ValueError(
+        f"{name} ran with no PackedLayout stashed while a using_layout context is active in this process; "
+        "the active layout's segments may have reached it through cu_seqlens_from_position_ids. Wrap this "
+        "model in its own using_layout (an unshared layout is fine)"
+    )
 
 
 def prefix_varlen_args(
@@ -480,17 +675,22 @@ def prefix_varlen_args(
 ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, int | None, int | None]:
     """Return ``k, v, cu_q, cu_k, max_q, max_k`` for one varlen call over ``[T, H, D]`` K/V.
 
-    Without a layout this is the caller's own ``cu_seqlens``. With one, segments come from the
-    layout, and under sharing each continuation's K/V is its parent root followed by itself.
+    ``layout`` is the caller's own stash. Without one this is the caller's own ``cu_seqlens``,
+    unless some context is active: then those segments may be another call's, so this raises.
+    With one, segments come from the layout, and under sharing each continuation's K/V is its
+    parent root followed by itself.
     """
     if layout is None:
+        if any(active is not None for active in _ACTIVE_LAYOUTS):
+            raise _unstashed_error("attention")
         return k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen
     if k.ndim != 3:
         raise ValueError(f"prefix K/V gather expects [T, H, D], got {tuple(k.shape)}")
     if k.shape[0] != layout.num_tokens or v.shape[0] != layout.num_tokens:
         raise ValueError(
             f"layout expects {layout.num_tokens} packed K/V tokens, got {k.shape[0]} / {v.shape[0]} "
-            "(already gathered, or padded past the layout)"
+            "(already gathered, or a sequence-parallel shard or padded call, which using_layout does not "
+            "support until the GatedDeltaNet / executor PRs)"
         )
     cu_q = layout.cu_seqlens.to(device=k.device, dtype=torch.int32)
     if not layout.has_sharing:
@@ -500,20 +700,46 @@ def prefix_varlen_args(
     return k.index_select(0, idx), v.index_select(0, idx), cu_q, cu_k, layout.max_len_q, layout.max_len_k
 
 
+def _installed_flash_attn_version() -> tuple[int, int] | None:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version
+
+    try:
+        raw = version("flash_attn")
+    except PackageNotFoundError:
+        return None
+    match = re.match(r"(\d+)\.(\d+)", raw)
+    if match is None:
+        raise ValueError(f"cannot parse the installed flash_attn version {raw!r}")
+    return int(match.group(1)), int(match.group(2))
+
+
+def require_bottom_right_causal_flash() -> None:
+    """flash-attn < 2.1 aligns the causal mask top-left when a segment has more keys than queries."""
+    installed = _installed_flash_attn_version()
+    if installed is not None and installed < (2, 1):
+        raise ValueError(
+            "prefix sharing needs flash-attn >= 2.1 (bottom-right causal alignment); found"
+            f" {installed[0]}.{installed[1]}"
+        )
+
+
 def _hf_prefix_attention_fn(orig: Callable) -> Callable:
     """Wrap a Hugging Face flash attention function with the prefix K/V gather of the caller's stash."""
 
     def prefix_attention(module, query, key, value, attention_mask, *args, **kwargs):
         layout = get_stashed_layout(module)
+        name = type(module).__name__
+        if layout is None and prefix_sharing_active():
+            raise _unstashed_error(name)
         if layout is None or not layout.has_sharing:
             return orig(module, query, key, value, attention_mask, *args, **kwargs)
-        name = type(module).__name__
         if args:
             raise ValueError(f"{name}: prefix sharing expects keyword arguments after attention_mask")
         if attention_mask is not None:
             raise ValueError(f"{name}: prefix sharing requires a packed flash call with attention_mask=None")
         if kwargs.get("sliding_window") is not None:
-            # transformers widens the window to (w-1, w-1) once K is longer than w; not a causal prefix window.
+            # The window path through transformers' flash kwargs is unverified for prefix continuation.
             raise ValueError(f"{name}: Hugging Face sliding-window attention is not supported under prefix sharing")
         if query.ndim != 4 or query.shape[0] != 1:
             raise ValueError(f"{name}: prefix sharing expects packed [1, H, T, D] queries, got {tuple(query.shape)}")
@@ -574,10 +800,19 @@ def _hf_prefix_attention(model: torch.nn.Module) -> Iterator[None]:
 
 
 _HF_PREFIX_ATTENTION = {"Qwen3Attention", "Qwen3MoeAttention"}
-_NATIVE_FLASH = {"FlashAttention", "AfmoeFlashAttention"}
+_NATIVE_PREFIX_ATTENTION: set[type] = set()
 _SEQUENCE_MIXER_NEEDLES = ("Attention", "DeltaNet", "GatedDelta", "LinearAttention", "KDA")
 _MOE_NAME_NEEDLES = ("MoE", "Moe")
 _MOE_CONFIG_KEYS = ("num_experts", "num_local_experts", "n_routed_experts")
+
+
+def register_native_prefix_attention(cls: _ModuleType) -> _ModuleType:
+    """Accept ``cls`` as a mixer that runs :func:`prefix_varlen_args` on its own stash.
+
+    Matched by exact type: a subclass may override the kernel call and must register itself.
+    """
+    _NATIVE_PREFIX_ATTENTION.add(cls)
+    return cls
 
 
 def sequence_mixers(model: torch.nn.Module) -> list[torch.nn.Module]:
@@ -592,7 +827,7 @@ def sequence_mixers(model: torch.nn.Module) -> list[torch.nn.Module]:
 def _prefix_continuation_blocker(module: torch.nn.Module) -> str | None:
     """Why ``module`` cannot run prefix continuation, or ``None`` if it can."""
     name = type(module).__name__
-    if name in _NATIVE_FLASH:
+    if type(module) in _NATIVE_PREFIX_ATTENTION:
         return None
     if name not in _HF_PREFIX_ATTENTION:
         return f"{name} (no prefix-continuation path)"

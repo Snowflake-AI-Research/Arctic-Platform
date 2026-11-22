@@ -21,6 +21,8 @@ Arctic-Platform and Hugging Face attention modules.
 """
 
 import sys
+import threading
+from contextlib import ExitStack
 
 import pytest
 import torch
@@ -31,6 +33,7 @@ from torch.utils.checkpoint import checkpoint
 from arctic_platform.common.packing import IGNORE_INDEX
 from arctic_platform.common.packing import PackedLayout
 from arctic_platform.common.packing import cu_seqlens_from_position_ids
+from arctic_platform.common.packing import layout as layout_module
 from arctic_platform.common.packing import pack_microbatch
 from arctic_platform.common.packing import pack_with_layout
 from arctic_platform.common.packing import require_identical_prefixes
@@ -45,6 +48,7 @@ from arctic_platform.common.packing.layout import active_layout_requires_token_m
 from arctic_platform.common.packing.layout import get_active_packed_layout
 from arctic_platform.common.packing.layout import get_stashed_layout
 from arctic_platform.common.packing.layout import prefix_varlen_args
+from arctic_platform.common.packing.layout import register_native_prefix_attention
 from arctic_platform.common.packing.layout import unshared_groups
 from arctic_platform.testing_utils import flash_attn_varlen_reference
 from arctic_platform.testing_utils import set_seed
@@ -55,6 +59,7 @@ from arctic_platform.testing_utils import torch_assert_equal
 F64_ATOL = 1e-12
 
 
+@register_native_prefix_attention
 class FlashAttention(nn.Module):
     """Minimal varlen attention under the name the mixer allowlist accepts for Arctic-Platform flash attention."""
 
@@ -134,6 +139,54 @@ def test_sharing_off_matches_pack_microbatch():
     torch_assert_equal(layout.cu_seqlens, metadata.cu_seqlens)
 
 
+def test_row_broadcast_keys_match_pack_microbatch():
+    batch = _rows([3, 2, 4], pad=5)
+    batch["sampler_kl_weights"] = torch.tensor([0.5, 2.0, 3.0])
+    batch["context"] = {"sampler_kl_weights": torch.tensor([1.0, 4.0, 9.0]), "labels": batch["labels"]}
+    layout = PackedLayout.build(batch["attention_mask"], *unshared_groups(3), batch["position_ids"])
+    packed_layout = pack_with_layout(batch, layout)
+    packed_base, _ = pack_microbatch(batch)
+    assert packed_layout.keys() == packed_base.keys()
+    for key in ("sampler_kl_weights", "labels", "input_ids"):
+        torch_assert_equal(packed_layout[key], packed_base[key], msg=key)
+    for key in ("sampler_kl_weights", "labels"):
+        torch_assert_equal(packed_layout["context"][key], packed_base["context"][key], msg=key)
+    assert packed_layout["sampler_kl_weights"].shape == (1, layout.num_tokens)
+
+
+def test_row_broadcast_keys_follow_logical_row_under_sharing():
+    batch, layout = _shared_layout(lengths=(5, 4))
+    batch["sampler_kl_weights"] = torch.tensor([0.5, 2.0])
+    packed = pack_with_layout(batch, layout)
+    # Root (3 tokens, gathered from row 0), row 0's continuation (2), row 1's continuation (1).
+    torch_assert_equal(packed["sampler_kl_weights"], torch.tensor([[0.5, 0.5, 0.5, 0.5, 0.5, 2.0]]))
+    torch_assert_equal(packed["sampler_kl_weights"][0], batch["sampler_kl_weights"][layout.logical_row])
+
+
+def test_pack_with_layout_checks_routed_experts_against_router_replay():
+    routed = torch.arange(16).view(2, 4, 2)
+    routed[1, :3] = routed[0, :3]
+    batch, replayed = _shared_layout(routed_experts=routed)
+    packed = pack_with_layout({**batch, "routed_experts": routed}, replayed)
+    torch_assert_equal(packed["routed_experts"][0], replayed.pack(routed))
+    with pytest.raises(ValueError, match="carries none"):
+        pack_with_layout(batch, replayed)
+    other = routed.clone()
+    other[1, 0] += 1
+    with pytest.raises(ValueError, match="disagree on a shared prefix cell"):
+        pack_with_layout({**batch, "routed_experts": other}, replayed)
+
+    _, opted_out = _shared_layout(router_replay=False)
+    pack_with_layout(batch, opted_out)
+    with pytest.raises(ValueError, match="router_replay=False"):
+        pack_with_layout({**batch, "context": {"routed_experts": routed}}, opted_out)
+    _, unstated = _shared_layout()
+    with pytest.raises(ValueError, match="were not checked"):
+        pack_with_layout({**batch, "routed_experts": routed}, unstated)
+    unshared = PackedLayout.build(batch["attention_mask"], *unshared_groups(2), batch["position_ids"])
+    pack_with_layout({**batch, "routed_experts": routed}, unshared)
+
+
 def test_left_padding_is_dropped_on_pack():
     batch = _rows([3, 2], pad=3, left_pad=2)
     groups, shared = unshared_groups(2)
@@ -173,6 +226,27 @@ def test_unpack_accepts_batch_dim_and_single_token():
     one = PackedLayout.build(torch.ones(1, 1, dtype=torch.long), [[0]], [0])
     logits = torch.arange(6.0).view(1, 6)  # [T=1, V=6], not [1, T=6]
     torch_assert_equal(one.unpack(logits), logits.view(1, 1, 6))
+    # [1, 1, V] with T == 1 reads as a model output [1, T, V] unless told it is [T, 1, V].
+    batched = logits.view(1, 1, 6)
+    torch_assert_equal(one.unpack(batched), logits.view(1, 1, 6))
+    torch_assert_equal(one.unpack(batched, batched=False), logits.view(1, 1, 1, 6))
+    with pytest.raises(ValueError, match=r"\[1, T, \.\.\.\]"):
+        one.unpack(logits, batched=True)
+    torch_assert_equal(layout.unpack(packed, batched=False), layout.unpack(packed))
+
+
+def test_build_rejects_all_pad_row():
+    mask = torch.tensor([[1, 1, 1], [0, 0, 0]])
+    with pytest.raises(ValueError, match=r"rows \[1\] have no valid tokens"):
+        PackedLayout.build(mask, *unshared_groups(2))
+
+
+def test_layout_compares_by_identity():
+    _, layout = _shared_layout()
+    moved = layout.to("cpu")
+    assert layout == layout and layout != moved
+    assert len({layout, moved}) == 2
+    assert moved.origin is layout.origin
 
 
 def test_pack_gathers_from_one_source_row():
@@ -249,6 +323,42 @@ def test_left_padding_does_not_treat_pad_as_prefix():
     batch = _rows([4, 4], pad=4, left_pad=2)
     with pytest.raises(ValueError, match="not token-identical"):
         PackedLayout.build(batch["attention_mask"], [[0, 1]], [3], batch["position_ids"], input_ids=batch["input_ids"])
+
+
+def _build_shared(batch, shared=3):
+    return PackedLayout.build(
+        batch["attention_mask"], [[0, 1]], [shared], batch["position_ids"], input_ids=batch["input_ids"]
+    )
+
+
+def test_prefix_positions_must_match_across_rows():
+    batch, _ = _shared_layout(lengths=(5, 4))
+    _build_shared(batch)
+    require_identical_prefixes(batch["input_ids"], [[0, 1]], [3], batch["attention_mask"], batch["position_ids"])
+
+    # Right padding: row 1's positions start at 1, so the root would carry row 0's RoPE for both rows.
+    offset = {**batch, "position_ids": batch["position_ids"].clone()}
+    offset["position_ids"][1, :4] += 1
+    with pytest.raises(ValueError, match="different position_ids"):
+        _build_shared(offset)
+    # Only the shared prefix has to agree.
+    offset["position_ids"][1, :3] -= 1
+    _build_shared(offset)
+
+    # Right-aligned rows with column positions arange(S): equal ids, positions 1.. vs 2..
+    mask = torch.tensor([[0, 1, 1, 1, 1], [0, 0, 1, 1, 1]])
+    ids = torch.tensor([[0, 7, 8, 9, 5], [0, 0, 7, 8, 9]])
+    columns = torch.arange(5).expand(2, -1)
+    with pytest.raises(ValueError, match="different position_ids"):
+        PackedLayout.build(mask, [[0, 1]], [2], columns, input_ids=ids)
+    # The same rows with valid-token positions (cumsum - 1, the dummy-batch convention) share.
+    valid_positions = (mask.cumsum(1) - 1).clamp(min=0) * mask
+    layout = PackedLayout.build(mask, [[0, 1]], [2], valid_positions, input_ids=ids)
+    torch_assert_equal(layout.position_ids, torch.tensor([0, 1, 2, 3, 2]))
+    # Left padding with equal positions shares.
+    left = _rows([4, 4], pad=4, left_pad=2)
+    left["input_ids"][1] = left["input_ids"][0]
+    assert _build_shared(left).has_sharing
 
 
 def test_two_groups_get_one_root_each():
@@ -333,11 +443,90 @@ def test_cu_seqlens_from_position_ids_uses_active_layout():
     assert cu_seqlens_from_position_ids(packed["position_ids"]).tolist() != layout.cu_seqlens.tolist()
     with using_layout(FlashAttention(), layout):
         torch_assert_equal(cu_seqlens_from_position_ids(packed["position_ids"]), layout.cu_seqlens)
-        with pytest.raises(ValueError, match="5 packed tokens"):
+        with pytest.raises(ValueError, match="5 packed tokens.*SP >= 2.*pad_packed_microbatch"):
             cu_seqlens_from_position_ids(torch.zeros(1, 8, dtype=torch.long))
         with pytest.raises(ValueError, match="position_ids == 0"):
             require_no_prefix_sharing("helper")
     require_no_prefix_sharing("helper")
+
+
+def test_nested_unshared_context_keeps_sharing_guards():
+    batch, outer = _shared_layout()
+    packed = pack_with_layout(batch, outer)
+    inner = PackedLayout.build(batch["attention_mask"], *unshared_groups(2), batch["position_ids"])
+    model, other = FlashAttention(), FlashAttention()
+    with using_layout(model, outer):
+        with using_layout(model, outer):
+            torch_assert_equal(cu_seqlens_from_position_ids(packed["position_ids"]), outer.cu_seqlens)
+        with using_layout(other, inner):
+            assert get_active_packed_layout() is inner
+            with pytest.raises(ValueError, match="position_ids == 0"):
+                require_no_prefix_sharing("helper")
+            with pytest.raises(ValueError, match="token-mean"):
+                active_layout_requires_token_mean("seq-mean-token-sum")
+            # Either layout's segments could be the wrong call's, so neither is returned.
+            with pytest.raises(ValueError, match="nested using_layout contexts"):
+                cu_seqlens_from_position_ids(packed["position_ids"])
+        with using_layout(other, None):
+            with pytest.raises(ValueError, match="nested using_layout contexts"):
+                cu_seqlens_from_position_ids(packed["position_ids"])
+    with using_layout(other, inner):
+        require_no_prefix_sharing("helper")
+        active_layout_requires_token_mean("seq-mean-token-sum")
+        torch_assert_equal(cu_seqlens_from_position_ids(torch.zeros(1, 8, dtype=torch.long)), inner.cu_seqlens)
+
+
+def test_unstashed_attention_refuses_to_run_inside_another_context():
+    set_seed(4)
+    x, mask, layout, unshared = _attention_batch()
+    model, other = FlashAttention().double(), FlashAttention().double()
+    hidden = unshared.pack(x)
+    segments = (unshared.cu_seqlens, unshared.max_len_q)
+    expected = other(hidden, *segments)
+    for active in (layout, unshared):
+        with using_layout(model, active):
+            with pytest.raises(ValueError, match="no PackedLayout stashed"):
+                other(hidden, *segments)
+            # Wrapped in its own unshared layout, the other model runs as it does on its own.
+            with using_layout(other, unshared):
+                torch_assert_equal(other(hidden, *segments), expected)
+    torch_assert_equal(other(hidden, *segments), expected)
+
+
+def test_using_layout_is_owned_by_one_thread():
+    _, layout = _shared_layout()
+    model = FlashAttention()
+    entered, release = threading.Event(), threading.Event()
+    seen = {}
+
+    def hold():
+        with using_layout(model, layout):
+            entered.set()
+            release.wait(timeout=30)
+
+    def read():
+        seen["active"] = get_active_packed_layout()
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    try:
+        assert entered.wait(timeout=30)
+        with pytest.raises(RuntimeError, match="already active on thread"):
+            with using_layout(FlashAttention(), None):
+                pass
+        assert get_active_packed_layout() is layout
+        # Reads are not thread-checked: autograd runs backward on its own threads.
+        reader = threading.Thread(target=read)
+        reader.start()
+        reader.join(timeout=30)
+        assert seen["active"] is layout
+    finally:
+        release.set()
+        holder.join(timeout=30)
+    assert get_active_packed_layout() is None
+    with using_layout(model, layout):
+        with using_layout(model, layout):
+            assert get_active_packed_layout() is layout
 
 
 def test_require_prefix_continuation_rejects_unsupported_mixers():
@@ -353,6 +542,14 @@ def test_require_prefix_continuation_rejects_unsupported_mixers():
     require_prefix_continuation(FlashAttention())
     with pytest.raises(ValueError, match="Qwen3NextGatedDeltaNet"):
         require_prefix_continuation(Model())
+
+    # Native mixers are matched by registered type, not by class name, and not by subclass.
+    unregistered = type("FlashAttention", (nn.Module,), {})
+    with pytest.raises(ValueError, match="FlashAttention .no prefix-continuation path"):
+        require_prefix_continuation(unregistered())
+    subclass = type("FlashAttentionVariant", (FlashAttention,), {})
+    with pytest.raises(ValueError, match="FlashAttentionVariant"):
+        require_prefix_continuation(subclass())
 
     class Cfg:
         _attn_implementation = "flash_attention_2"
@@ -376,6 +573,22 @@ def test_require_prefix_continuation_rejects_unsupported_mixers():
         require_prefix_continuation(Qwen2Attention())
     with pytest.raises(ValueError, match="no sequence mixers"):
         require_prefix_continuation(nn.Linear(1, 1))
+
+
+def test_sharing_refuses_top_left_causal_flash_attn(monkeypatch):
+    batch, layout = _shared_layout()
+    unshared = PackedLayout.build(batch["attention_mask"], *unshared_groups(2), batch["position_ids"])
+    monkeypatch.setattr(layout_module, "_installed_flash_attn_version", lambda: (2, 0))
+    with pytest.raises(ValueError, match="flash-attn >= 2.1"):
+        with using_layout(FlashAttention(), layout):
+            pass
+    assert get_active_packed_layout() is None
+    with using_layout(FlashAttention(), unshared):
+        pass
+    for installed in (None, (2, 1), (3, 0)):
+        monkeypatch.setattr(layout_module, "_installed_flash_attn_version", lambda: installed)
+        with using_layout(FlashAttention(), layout):
+            pass
 
 
 def test_using_layout_validates_before_stashing():
@@ -461,9 +674,10 @@ def _continuation_weights(x, mask, layout):
 
 
 def _grads(module, x, loss_fn):
+    """``loss_fn(module, x, backward=True)`` runs its own backward, inside any layout context it opens."""
     module.zero_grad()
     x = x.clone().requires_grad_(True)
-    loss_fn(module, x).backward()
+    loss_fn(module, x, backward=True)
     return x.grad, {name: p.grad.clone() for name, p in module.named_parameters()}
 
 
@@ -473,21 +687,27 @@ def test_prefix_attention_matches_per_row_forward_and_backward():
     module = FlashAttention().double()
     weights = _continuation_weights(x, mask, layout)
 
-    def shared_loss(m, h):
+    def shared_loss(m, h, backward=False):
         with using_layout(m, layout):
             out = layout.unpack(m(layout.pack(h)))
-            return (out * weights).sum(), out
+            loss = (out * weights).sum()
+            if backward:
+                loss.backward()
+        return loss, out
 
-    def row_loss(m, h):
+    def row_loss(m, h, backward=False):
         out = _per_row(m, h, mask)
-        return (out * weights).sum(), out
+        loss = (out * weights).sum()
+        if backward:
+            loss.backward()
+        return loss, out
 
     (_, out_shared), (_, out_rows) = shared_loss(module, x), row_loss(module, x)
     valid = mask.bool()
     torch_assert_close(out_shared[valid], out_rows[valid], rtol=0, atol=F64_ATOL)
 
-    x_grad, p_grad = _grads(module, x, lambda m, h: shared_loss(m, h)[0])
-    x_grad_ref, p_grad_ref = _grads(module, x, lambda m, h: row_loss(m, h)[0])
+    x_grad, p_grad = _grads(module, x, shared_loss)
+    x_grad_ref, p_grad_ref = _grads(module, x, row_loss)
     for name in p_grad:
         torch_assert_close(p_grad[name], p_grad_ref[name], rtol=0, atol=F64_ATOL, msg=name)
     # The root is gathered from row 0, so it holds the sum of both rows' prefix gradients; row 1's prefix gets none.
@@ -526,38 +746,58 @@ def test_sliding_window_prefix_matches_per_row():
     torch_assert_close(out[mask.bool()], _per_row(module, x, mask)[mask.bool()], rtol=0, atol=F64_ATOL)
 
 
-def test_checkpoint_recompute_under_layout_matches_no_checkpoint():
+def _checkpoint_grads(module, x, layout, weights, use_reentrant, through_unpack=True, exit_before_backward=False):
+    """Input and parameter grads of a weighted loss over ``module``'s output; ``use_reentrant=None`` skips checkpointing."""
+    segments = (layout.cu_seqlens, layout.max_len_q)
+    packed_weights = layout.pack(weights)
+    module.zero_grad()
+    h = x.clone().requires_grad_(True)
+    with ExitStack() as stack:
+        stack.enter_context(using_layout(module, layout))
+        packed = layout.pack(h)
+        if use_reentrant is None:
+            out = module(packed, *segments)
+        else:
+            out = checkpoint(module, packed, *segments, use_reentrant=use_reentrant)
+        loss = (layout.unpack(out) * weights).sum() if through_unpack else (out * packed_weights).sum()
+        if exit_before_backward:
+            stack.close()
+        loss.backward()
+    return [h.grad] + [p.grad.clone() for p in module.parameters()]
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_checkpoint_recompute_under_layout_matches_no_checkpoint(use_reentrant):
     set_seed(2)
     x, mask, layout, _ = _attention_batch()
     module = FlashAttention().double()
     weights = _continuation_weights(x, mask, layout)
+    expected = _checkpoint_grads(module, x, layout, weights, use_reentrant=None)
+    for through_unpack in (True, False):
+        got = _checkpoint_grads(module, x, layout, weights, use_reentrant, through_unpack)
+        for g, want in zip(got, expected):
+            torch_assert_equal(g, want)
 
-    segments = (layout.cu_seqlens, layout.max_len_q)
+    # Backward after the context exits recomputes without the prefix gather. The hook unpack puts on
+    # backward refuses that before any recompute runs, whichever checkpoint flavor is in use.
+    with pytest.raises(RuntimeError, match="after its using_layout exited"):
+        _checkpoint_grads(module, x, layout, weights, use_reentrant, exit_before_backward=True)
 
-    def loss(m, h, use_checkpoint):
-        with using_layout(m, layout):
-            packed = layout.pack(h)
-            out = checkpoint(m, packed, *segments, use_reentrant=False) if use_checkpoint else m(packed, *segments)
-            loss = (layout.unpack(out) * weights).sum()
-            loss.backward()
-        return loss
 
-    module.zero_grad()
-    h = x.clone().requires_grad_(True)
-    loss(module, h, use_checkpoint=False)
-    expected = [h.grad] + [p.grad.clone() for p in module.parameters()]
-    module.zero_grad()
-    h = x.clone().requires_grad_(True)
-    loss(module, h, use_checkpoint=True)
-    for got, want in zip([h.grad] + [p.grad for p in module.parameters()], expected):
-        torch_assert_equal(got, want)
-
-    # Backward after the context exits recomputes without the gather; checkpoint refuses the mismatch.
-    h = x.clone().requires_grad_(True)
-    with using_layout(module, layout):
-        out = checkpoint(module, layout.pack(h), *segments, use_reentrant=False)
+def test_checkpoint_after_context_exit_without_unpack():
+    """With the loss off ``unpack``, nothing hooks backward: pin what each checkpoint flavor then does."""
+    set_seed(2)
+    x, mask, layout, _ = _attention_batch()
+    module = FlashAttention().double()
+    weights = _continuation_weights(x, mask, layout)
+    expected = _checkpoint_grads(module, x, layout, weights, use_reentrant=None)
+    exited = {"through_unpack": False, "exit_before_backward": True}
     with pytest.raises(CheckpointError):
-        (layout.unpack(out) * weights).sum().backward()
+        _checkpoint_grads(module, x, layout, weights, use_reentrant=False, **exited)
+    # Reentrant recompute silently attends without the root: finite grads that do not match.
+    got = _checkpoint_grads(module, x, layout, weights, use_reentrant=True, **exited)
+    assert all(torch.isfinite(g).all() for g in got)
+    assert max((g - want).abs().max().item() for g, want in zip(got, expected)) > 1e-3
 
 
 def test_share_off_layout_matches_pack_microbatch_attention():

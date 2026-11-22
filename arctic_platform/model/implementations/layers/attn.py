@@ -9,6 +9,7 @@ from torch import nn
 
 from arctic_platform.common.packing.layout import get_stashed_layout
 from arctic_platform.common.packing.layout import prefix_varlen_args
+from arctic_platform.common.packing.layout import register_native_prefix_attention
 
 from .norms import RMSNorm, RMSNormConfig
 from .rotary_emb import apply_rotary_pos_emb
@@ -50,6 +51,7 @@ class AttentionConfig:
 # Otherwise, do ABC or something to make the signatures match
 
 
+@register_native_prefix_attention
 class FlashAttention(nn.Module):
     """Flash Attention"""
 

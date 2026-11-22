@@ -244,6 +244,25 @@ def test_ap_stack_checkpoint_recompute_matches():
         torch_assert_equal(recomputed[1][name], plain[1][name], msg=name)
 
 
+def test_ap_stack_needs_its_own_unnested_context():
+    set_seed(1)
+    batch, groups, _ = _batch()
+    shared, unshared = _layouts(batch, groups)
+    model, other = _ap_stack(), _ap_stack()
+    packed = pack_with_layout(batch, shared)
+    packed_off = pack_with_layout(batch, unshared)
+    with using_layout(model, shared):
+        # Same width as the active layout, so its segments reach other's attention, which has no stash.
+        with pytest.raises(ValueError, match="no PackedLayout stashed"):
+            other(packed["input_ids"], packed["position_ids"])
+        # The model-stack segment helper cannot tell which of two nested layouts it serves.
+        with using_layout(other, unshared):
+            with pytest.raises(ValueError, match="nested using_layout contexts"):
+                other(packed_off["input_ids"], packed_off["position_ids"])
+    with using_layout(other, unshared):
+        other(packed_off["input_ids"], packed_off["position_ids"])
+
+
 def test_ap_sdpa_is_rejected_under_sharing():
     batch, groups, _ = _batch()
     shared, unshared = _layouts(batch, groups)
@@ -395,24 +414,30 @@ def test_hf_flash_forward_hands_layout_segments_to_varlen_kernel(hf_flash_refere
 def test_hf_registry_wrapper_is_scoped_and_not_stacked(hf_flash_reference):
     set_seed(2)
     batch, groups, scored = _batch()
-    shared, _ = _layouts(batch, groups)
+    shared, unshared = _layouts(batch, groups)
     model = _hf_model(Qwen3ForCausalLM, _hf_config(Qwen3Config))
     other = _hf_model(Qwen3ForCausalLM, _hf_config(Qwen3Config))
     packed = pack_with_layout(batch, shared)
+    packed_off = pack_with_layout(batch, unshared)
     expected = _hf_logits(model, packed["input_ids"], packed["position_ids"]).detach()
+    other_expected = _hf_logits(other, packed_off["input_ids"], packed_off["position_ids"]).detach()
     with using_layout(model, shared):
         wrapper = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
         assert wrapper is not hf_flash_reference.forward
         with using_layout(model, shared):
             assert ALL_ATTENTION_FUNCTIONS["flash_attention_2"] is wrapper
             nested = _hf_logits(model, packed["input_ids"], packed["position_ids"]).detach()
-        # A model without a stash in the same process still runs plain flash attention.
-        other_out = _hf_logits(other, packed["input_ids"], packed["position_ids"]).detach()
+        # A model with no stash of its own refuses to run inside another model's sharing context ...
+        with pytest.raises(ValueError, match="no PackedLayout stashed"):
+            _hf_logits(other, packed_off["input_ids"], packed_off["position_ids"])
+        # ... and runs as it does on its own once wrapped in its own unshared layout.
+        with using_layout(other, unshared):
+            other_out = _hf_logits(other, packed_off["input_ids"], packed_off["position_ids"]).detach()
     assert ALL_ATTENTION_FUNCTIONS["flash_attention_2"] is hf_flash_reference.forward
     with using_layout(model, shared):
         once = _hf_logits(model, packed["input_ids"], packed["position_ids"]).detach()
     torch_assert_equal(nested, once)
-    torch_assert_equal(other_out, expected)
+    torch_assert_equal(other_out, other_expected)
     assert (once - expected).abs().max() > 1e-3
 
 
