@@ -53,6 +53,7 @@ class WorkerState:
     available: bool = True
     streaming_requests: int = 0
     quarantined: bool = False
+    death: type[Exception] | None = None
     # Futures of the generate calls running on this worker.
     inflight: set = field(default_factory=set)
     # Sticky requests waiting for this worker to free up.
@@ -319,6 +320,7 @@ class Scheduler:
         self._check_idx(idx)
         self._workers[idx].handle = new_handle
         self._workers[idx].quarantined = False
+        self._workers[idx].death = None
         try:
             new_handle.set_replica_id.remote(idx)
         except Exception:
@@ -348,6 +350,8 @@ class Scheduler:
         ws = self._workers.pop()
         self._waiting.extendleft(reversed(ws.waiting))
         ws.waiting.clear()
+        if self._waiting and self._pool_error() is not None:
+            self._drain()
 
     async def shutdown(self) -> None:
         self._stopped = True
@@ -483,10 +487,19 @@ class Scheduler:
         candidates = [k for k, ws in enumerate(self._workers) if can_take(ws)]
         return min(candidates, key=lambda k: self._workers[k].active_requests, default=None)
 
+    def _pool_error(self) -> type[Exception] | None:
+        """A confirmed generate death to report when quarantine covers the whole pool."""
+        if any(not w.quarantined for w in self._workers):
+            return None
+        return next((w.death for w in self._workers if w.death is not None), None)
+
     def _dispatch(self, req: _Request) -> bool:
         """Send ``req`` to a worker, failing it if the send raises, or False while none can take it."""
         ws = self._take(req)
         if ws is None:
+            if not self._paused and (death := self._pool_error()) is not None:
+                req.future.set_exception(death())
+                return True
             return False
         try:
             future = ws.handle.generate.remote(req.prompt, req.sampling_params).as_future()
@@ -504,6 +517,7 @@ class Scheduler:
     ) -> None:
         ws.inflight.discard(future)
         ws.active_requests -= 1
+        death = None
         if future.cancelled():
             error: BaseException | None = RuntimeError("Request cancelled for weight update")
         elif (error := future.exception()) is not None:
@@ -511,15 +525,15 @@ class Scheduler:
                 "Worker %d generate failed for request %d: %s: %s",
                 req.worker_idx, req.id, type(error).__name__, error, exc_info=error,
             )
-        dead = (error is not None and not self._stopped
-                and isinstance(error, (ray.exceptions.ActorDiedError, EngineDeadError)))
-        # A late failure from an old actor must not quarantine its replacement. The last replica in rotation stays
-        # there, so that requests fail fast instead of waiting for a replacement.
-        if dead and ws.handle is handle and any(not w.quarantined for w in self._workers if w is not ws):
+            if not self._stopped:
+                death_types = (EngineDeadError, ray.exceptions.ActorDiedError)
+                death = next((cls for cls in death_types if isinstance(error, cls)), None)
+        # A late failure from an old actor must not quarantine its replacement.
+        if death and ws.handle is handle:
+            ws.death = death
             ws.quarantine()
-        # Re-route once, away from the failed actor: a request that itself kills engines must not walk through
-        # every replica.
-        if dead and not req.rerouted and (ws.quarantined or ws.handle is not handle):
+        # Re-route once: a request that itself kills engines must not walk through every replica.
+        if death and not req.rerouted and any(not w.quarantined for w in self._workers):
             req.rerouted = True
             self._waiting.appendleft(req)
         elif error is not None:

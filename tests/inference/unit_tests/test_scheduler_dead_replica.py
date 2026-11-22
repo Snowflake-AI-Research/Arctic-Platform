@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,23 +24,15 @@ import ray
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from arctic_platform.inference.server.scheduler import Scheduler
+from arctic_platform.inference.server.testing import RemoteMock
 
 DEATHS = [ray.exceptions.ActorDiedError, EngineDeadError]
 pytestmark = pytest.mark.asyncio
 
 
-def _remote(generate):
-    return lambda *args: SimpleNamespace(as_future=lambda: asyncio.ensure_future(generate(*args)))
-
-
 def _worker(death: type[Exception] | None = None) -> MagicMock:
-    async def generate(prompt, params):
-        if death is not None:
-            raise death()
-        return {"text": prompt}
-
     worker = MagicMock()
-    worker.generate.remote.side_effect = _remote(generate)
+    worker.generate.remote = RemoteMock(side_effect=death or (lambda prompt, params: {"text": prompt}))
     return worker
 
 
@@ -52,23 +43,26 @@ async def test_requests_routed_to_a_dead_replica_finish_on_a_live_one(death):
     futures = [scheduler.submit(f"p{i}", {}, routing_key="group") for i in range(4)]
     assert len(scheduler._workers[0].waiting) == 2
     assert await asyncio.wait_for(asyncio.gather(*futures), timeout=1) == [{"text": f"p{i}"} for i in range(4)]
-    assert await scheduler.submit("next", {}, routing_key="group") == {"text": "next"}
+    assert await asyncio.wait_for(scheduler.submit("next", {}, routing_key="group"), 1) == {"text": "next"}
     assert [scheduler.is_worker_available(i) for i in range(2)] == [False, True]
     assert all(ws.active_requests == 0 and not ws.inflight for ws in scheduler._workers)
+    scheduler.mark_worker_unavailable(1)
+    queued = scheduler.submit("during scale-down", {})
+    assert not queued.done()
+    scheduler.remove_last_worker()
+    with pytest.raises(death):
+        queued.result()
 
 
 @pytest.mark.parametrize("death", DEATHS, ids=lambda d: d.__name__)
-async def test_when_every_replica_died_the_last_stays_in_rotation_and_requests_fail_fast(death):
-    workers = [_worker(death), _worker(death)]
-    scheduler = Scheduler(workers, capacity=64)
+async def test_dead_pool_fails_current_and_later_requests(death):
+    scheduler = Scheduler([_worker(death), _worker(death)], capacity=64)
     futures = [scheduler.submit(f"p{i}", {}) for i in range(4)]
     results = await asyncio.wait_for(asyncio.gather(*futures, return_exceptions=True), timeout=1)
     assert all(isinstance(result, death) for result in results)
-    [last] = [i for i, ws in enumerate(scheduler._workers) if not ws.quarantined]
-    calls = workers[last].generate.remote.call_count
+    assert not any(scheduler.is_worker_available(i) for i in range(2))
     with pytest.raises(death):
-        await asyncio.wait_for(scheduler.submit("later", {}), timeout=1)
-    assert workers[last].generate.remote.call_count == calls + 1
+        scheduler.submit("later", {}).result()
 
 
 async def test_a_request_that_kills_every_engine_is_rerouted_only_once():
@@ -81,21 +75,12 @@ async def test_a_request_that_kills_every_engine_is_rerouted_only_once():
 
 
 async def test_late_death_does_not_quarantine_a_replacement():
-    started, replaced = asyncio.Event(), asyncio.Event()
-
-    async def generate(prompt, params):
-        started.set()
-        await replaced.wait()
-        raise EngineDeadError()
-
-    old = _worker()
-    old.generate.remote.side_effect = _remote(generate)
-    scheduler = Scheduler([old], capacity=64)
+    scheduler = Scheduler([_worker(EngineDeadError)], capacity=64)
     future = scheduler.submit("p", {})
-    await started.wait()
+    # Replace the handle before the old RPC's completion callback can run.
+    scheduler.add_worker(_worker())
     scheduler.mark_worker_unavailable(0)
     scheduler.update_worker_handle(0, _worker())
     scheduler.mark_worker_available(0)
-    replaced.set()
     assert await asyncio.wait_for(future, timeout=1) == {"text": "p"}
     assert scheduler.is_worker_available(0)

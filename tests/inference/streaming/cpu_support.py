@@ -42,7 +42,8 @@ def load_library():
     ):
         sys.modules.setdefault(name, types.ModuleType(name))
     sys.modules["vllm.config"].VllmConfig = object
-    sys.modules["vllm.v1.engine.exceptions"].EngineDeadError = type("EngineDeadError", (Exception,), {})
+    engine_errors = vars(sys.modules["vllm.v1.engine.exceptions"])
+    engine_errors.setdefault("EngineDeadError", type("EngineDeadError", (Exception,), {}))
     sys.modules["vllm.exceptions"].VLLMValidationError = VLLMValidationError
     sys.modules["vllm.v1.metrics.loggers"].StatLoggerBase = object
     for name in ("IterationStats", "SchedulerStats", "MultiModalCacheStats"):
