@@ -212,13 +212,17 @@ class CallbackRunner:
         """Every declared metric, as logged or ``InvalidMetric.QUARANTINED``. Runs after
         ``engine.step()``, so it must not raise."""
         flushed: Dict[str, Entry] = {}
-        for cb in self._metrics:
-            failed = cb in self._failed
+        failed = [cb for cb in self._metrics if cb in self._failed]
+        ok = [cb for cb in self._metrics if cb not in self._failed]
+        for cb in failed:
             for name, reduce in cb.metric_specs.items():
-                entry = None if failed else cb.pending.get(name)
+                flushed[name] = (reduce, InvalidMetric.QUARANTINED)
+            cb.pending.clear()
+        for cb in ok:
+            for name, reduce in cb.metric_specs.items():
+                entry = cb.pending.get(name)
                 if entry is None:
-                    if not failed:
-                        logger.error("%s did not log declared metric %r this step", type(cb).__name__, name)
+                    logger.error("%s did not log declared metric %r this step", type(cb).__name__, name)
                     entry = (reduce, InvalidMetric.QUARANTINED)
                 flushed[name] = entry
             cb.pending.clear()
