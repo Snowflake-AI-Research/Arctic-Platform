@@ -9,8 +9,10 @@ Two record types:
 
   * :class:`RequestRecord` — emitted by the :class:`Scheduler` once per
     generation call. Captures the assigned replica, the arrival /
-    submission / completion wall-clock timestamps, and the prompt /
-    generation / prefix-cache token counts read off the worker's reply.
+    submission / completion wall-clock timestamps, the time the first
+    output token reached the scheduler (``first_delta_time``), and the
+    prompt / generation / prefix-cache token counts read off the worker's
+    reply. All four timestamps are on the scheduler host's clock.
 
 The collectors are bounded ring buffers; ``drain()`` returns the buffered
 items and clears the buffer. Consumers (the API ``/metrics`` route, the
@@ -65,6 +67,10 @@ class RequestRecord:
     generation_len: int
     prefix_cache_len: int
     streaming: bool = False
+    # First output token, scheduler wall-clock; includes the hop back from the worker.
+    # Streaming: when the first delta arrived. Non-streaming: completion_time minus the
+    # engine's first-to-last-token span (result's last_token_ts - first_token_ts).
+    # None when the result carries no engine timestamps.
     first_delta_time: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -156,6 +162,8 @@ class WorkerMetricsCollector:
         self.min_interval_s = max(0.0, min_interval_s)
         self._snapshots = _BoundedDeque(max_items=max_snapshots)
         self._last_record_time: float = 0.0
+        # vLLM's waiting-queue length at the latest step, not throttled by min_interval_s.
+        self.num_waiting_reqs = 0
         # Lifetime counters since engine start, summed over every step.
         # Speculative-decoding fields are also exposed via spec_decoding_totals().
         self._spec_lock = threading.Lock()
@@ -174,6 +182,7 @@ class WorkerMetricsCollector:
                 self._totals.num_preempted_reqs += iteration_stats.num_preempted_reqs
         if scheduler_stats is None:
             return
+        self.num_waiting_reqs = int(scheduler_stats.num_waiting_reqs)
         spec = scheduler_stats.spec_decoding_stats
         if spec is not None:
             with self._spec_lock:
