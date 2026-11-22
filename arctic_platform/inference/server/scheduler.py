@@ -115,13 +115,16 @@ def _compute_prefix_hash(prompt: Any) -> int:
 class Scheduler:
     """Routes each request to a worker, letting each engine queue a backlog of its own.
 
-    New sticky keys go to the worker holding the fewest live sticky keys.
-    Unkeyed requests and new non-sticky prefix keys use the less loaded of two
-    random workers. A sticky key waits on its worker. A non-sticky prefix
-    key can spill when its worker holds ``capacity`` requests.
-    Each worker accepts up to ``_BACKLOG * capacity`` generate requests,
-    capped to reserve ``_CONTROL_SLOTS`` but never below ``capacity``.
-    Excess requests and requests submitted while paused wait here.
+    A request with no key goes to the less loaded of two random workers. A
+    keyed one goes to the worker its key was first given, chosen that way then,
+    except that a sticky key is first given the worker holding the fewest live
+    sticky keys; a prefix-hash key spills while its worker holds ``capacity``
+    requests and another has room, and a sticky one never spills. A worker
+    takes up to ``_BACKLOG * capacity`` generate requests, never fewer than
+    ``capacity``, and short of the worker actor's Ray slots by
+    ``_CONTROL_SLOTS``. Past that, or while paused, requests wait here in order
+    and go to the first worker that frees up; a sticky one waits on its own
+    worker's queue.
     """
 
     def __init__(
@@ -508,7 +511,10 @@ class Scheduler:
         return min(candidates, key=lambda k: self._workers[k].active_requests, default=None)
 
     def _fewest_keys(self, stream: bool) -> int | None:
-        """Count sticky keys between turns as well as those in flight."""
+        """The worker holding the fewest live sticky keys that can take a request, the less loaded on a tie.
+
+        A key between turns counts: its context stays cached on that worker and grows there with each turn.
+        """
         candidates = (k for k, ws in enumerate(self._workers) if ws.schedulable and self._has_room(ws, stream))
         return min(candidates, key=lambda k: (self._workers[k].live_keys(), self._workers[k].active_requests),
                    default=None)
