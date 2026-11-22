@@ -874,12 +874,21 @@ def test_fused_writer_feeds_nongated_w13_as_w1_only():
     assert calls == ["w1", "w1"]
 
 
+@pytest.fixture
+def cpu_memory_before(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (0, 0))
+
+
 @pytest.mark.parametrize(
     ("quantization", "weight_format", "applicable"),
     [(None, "hf", True), ("fp8", "vllm", False)],
 )
 def test_broadcast_reports_loaded_validation_applicability(
     monkeypatch,
+    cpu_memory_before,
     quantization,
     weight_format,
     applicable,
@@ -892,9 +901,6 @@ def test_broadcast_reports_loaded_validation_applicability(
         "vllm.distributed.parallel_state",
         parallel_state,
     )
-    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (0, 0))
 
     model = nn.Linear(1, 1, bias=False)
     model.weight.data.fill_(2.0)
@@ -932,7 +938,7 @@ def test_broadcast_reports_loaded_validation_applicability(
     assert ("applied_source_l2_sq" in result) is applicable
 
 
-def test_broadcast_distinguishes_full_and_loaded_parameter_traces(monkeypatch):
+def test_broadcast_distinguishes_full_and_loaded_parameter_traces(monkeypatch, cpu_memory_before):
     parallel_state = types.ModuleType("vllm.distributed.parallel_state")
     parallel_state.get_tensor_model_parallel_world_size = lambda: 1
     parallel_state.get_world_group = lambda: SimpleNamespace(rank=0)
@@ -941,9 +947,6 @@ def test_broadcast_distinguishes_full_and_loaded_parameter_traces(monkeypatch):
         "vllm.distributed.parallel_state",
         parallel_state,
     )
-    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (0, 0))
     monkeypatch.setenv("ARCTIC_INFERENCE_DUMP_PARAM_L2", "1")
 
     model = nn.Linear(1, 1)
@@ -1019,14 +1022,13 @@ def _run_sync_entry_point(entry_point, extension, tmp_path):
         ("load_weights_from_shm_path", "drafter"),
     ],
 )
-def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, tmp_path, entry_point, draft_attribute):
+def test_sync_refreshes_glm5next_cached_weight_copies(
+    monkeypatch, cpu_memory_before, tmp_path, entry_point, draft_attribute
+):
     parallel_state = types.ModuleType("vllm.distributed.parallel_state")
     parallel_state.get_tensor_model_parallel_world_size = lambda: 2
     parallel_state.get_world_group = lambda: SimpleNamespace(rank=0)
     monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", parallel_state)
-    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (0, 0))
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: SimpleNamespace(uuid="gpu0"))
