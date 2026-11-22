@@ -48,6 +48,8 @@ class FakeEngine:
         self.active = set()
         self.aborted = []
         self.gate = asyncio.Event()
+        self.running = asyncio.Event()
+        self.running.set()
         self.calls = []
         self.model_config = SimpleNamespace(max_model_len=131072)
 
@@ -97,6 +99,7 @@ class FakeEngine:
             room = self.model_config.max_model_len - len(FAKE_PROMPT_TOKEN_IDS)
             limit = min(params["max_tokens"], room)
             for step in range(limit):
+                await self.running.wait()
                 if step == 1 and prompt == "blocked":
                     await self.gate.wait()
                 if step == 1 and prompt == "failure":
@@ -133,6 +136,19 @@ class FakeEngine:
     async def abort(self, request_id):
         self.aborted.append(request_id)
 
+    # Keep-mode pause: queued and in-flight requests wait for resume.
+    async def is_paused(self):
+        return not self.running.is_set()
+
+    async def pause_generation(self, mode, clear_cache):
+        self.running.clear()
+
+    async def resume_generation(self):
+        self.running.set()
+
+    async def collective_rpc(self, method):
+        return []
+
 
 @ray.remote(num_cpus=0, max_concurrency=16)
 class FakeEngineWorker:
@@ -147,6 +163,7 @@ class FakeEngineWorker:
         self.worker._stream_sampling_params = lambda params: params
         self.registration_gate = asyncio.Event()
         self.registration_started = asyncio.Event()
+        self.registration_done = asyncio.Event()
         self.delay_registration = False
         self.legacy_gate = asyncio.Event()
         self.legacy_calls = 0
@@ -179,7 +196,22 @@ class FakeEngineWorker:
         self.registration_started.set()
         if self.delay_registration:
             await self.registration_gate.wait()
-        return self.worker.start_stream(*args)
+        try:
+            return self.worker.start_stream(*args)
+        finally:
+            self.registration_done.set()
+
+    async def freeze_generation(self):
+        return await self.worker.freeze_generation()
+
+    async def resume_generation(self):
+        return await self.worker.resume_generation()
+
+    async def send_router_replay(self):
+        # Land the delayed registration while the engine is frozen.
+        self.registration_gate.set()
+        await self.registration_done.wait()
+        return {"status": "sent", "engine_paused": await self.worker.llm.is_paused()}
 
     def delay_start(self):
         self.delay_registration = True
@@ -790,6 +822,29 @@ def test_abort_during_registration():
         with pytest.raises(StreamError):
             await reader
         assert (await actor.stats.remote())["active"] == 0
+
+    asyncio.run(exercise(check))
+
+
+def test_registration_landing_during_router_replay_freeze_is_queued():
+    async def check(driver, pool, actor):
+        pool._workers = [actor]
+        await actor.delay_start.remote()
+
+        async def collect():
+            return [
+                event
+                async for event in driver.stream_generate(
+                    "model", "boundary", "normal", {"max_tokens": 3}
+                )
+            ]
+
+        reader = asyncio.create_task(collect())
+        await actor.wait_registration.remote()
+        result = await pool.send_router_replay()
+
+        assert result["workers"] == [{"status": "sent", "engine_paused": True}]
+        assert (await reader)[-1]["type"] == "completed"
 
     asyncio.run(exercise(check))
 
