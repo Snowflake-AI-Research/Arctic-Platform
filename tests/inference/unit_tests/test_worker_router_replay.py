@@ -191,6 +191,12 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
     assert engine_params[-1].extra_args == {
         FORCED_ROUTES_KEY: {"start": 2, "dtype": "|u1", "rows": bytes([12, 12, 13, 13])}
     }
+    # A capture ending on a block boundary, without the drop, is a hit the continuation can take whole: no rows.
+    worker._forced_route_blocks = (2, 1)
+    aligned = generate(
+        [1, 2, 3, 4, 5], [6], [20, 21, 22, 23, 24], "rr1:aligned", dss_router_replay_prefix_id="rr1:turn-1"
+    )
+    assert engine_params[-1].extra_args is None and aligned["prefix_len"] == 4
 
     # Another replica served the previous request: the capture stays as the engine computed it.
     elsewhere = generate(

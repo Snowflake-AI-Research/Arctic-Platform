@@ -17,11 +17,14 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.input_batch import InputBatch
 
 #: ``SamplingParams.extra_args`` key: ``{"start": first position, "dtype": numpy dtype str, "rows": bytes}``, rows of
 #: ``[layers, top_k]`` expert ids. Bytes because vLLM's msgpack decodes an ``Any`` field's ndarray to a bare list.
@@ -61,16 +64,18 @@ class ForcedRoutes:
         self.end[req_index] = 0
         self.rows.pop(req_index, None)
 
-    def fill(self, idx_mapping: np.ndarray, query_start_loc: np.ndarray, num_computed: np.ndarray) -> None:
+    def fill(self, batch: InputBatch) -> None:
         """Mark the batch rows that compute a stored position, with the boundaries the routed-experts capture uses
         (``AuxOutputWorkerConnector.prepare_output``), after clearing the rows the previous step marked."""
         if self.forcing:
             self.mask.zero_()
             self.forcing = False
-        if not self.rows:
+        if not self.rows or not batch.has_prefill:
             return
+        idx_mapping = batch.idx_mapping_np
+        num_computed = batch.num_computed_tokens_np
         start, end = self.start[idx_mapping], self.end[idx_mapping]
-        qsl = query_start_loc[: len(idx_mapping) + 1]
+        qsl = batch.query_start_loc_np[: len(idx_mapping) + 1]
         lo = np.maximum(num_computed, start)
         hi = np.minimum(num_computed + np.diff(qsl), end)
         for i in np.flatnonzero(lo < hi):  # only the requests recomputing stored positions in this step
@@ -151,7 +156,6 @@ def patch_model_runner(runner_cls: Any) -> None:
         return
     # Until initialize_kv_cache installs the hook on an engine that captures routes, or records why it cannot.
     runner_cls._forced_routes = None
-    runner_cls._forced_routes_unsupported = "routed-experts capture is disabled"
     original_initialize_kv_cache = runner_cls.initialize_kv_cache
     original_add_requests = runner_cls.add_requests
     original_remove_request = runner_cls._remove_request
@@ -181,9 +185,7 @@ def patch_model_runner(runner_cls: Any) -> None:
     def prepare_inputs(self, *args, **kwargs):
         input_batch = original_prepare_inputs(self, *args, **kwargs)
         if self._forced_routes is not None:
-            self._forced_routes.fill(
-                input_batch.idx_mapping_np, input_batch.query_start_loc_np, input_batch.num_computed_tokens_np
-            )
+            self._forced_routes.fill(input_batch)
         return input_batch
 
     prepare_inputs._arctic_forced_routes = True
@@ -196,7 +198,7 @@ def patch_model_runner(runner_cls: Any) -> None:
 def forced_route_blocks(worker: Any) -> tuple[int, int] | str:
     """Report the engine core's resolved cache-hit geometry, or why this worker cannot force routes."""
     runner = worker.model_runner
-    reason = getattr(runner, "_forced_routes_unsupported", "the engine runs Model Runner V1")
+    reason = getattr(runner, "_forced_routes_unsupported", "this runner has no routed-experts capture hook")
     if reason is not None:
         return reason
     spec = runner.vllm_config.speculative_config

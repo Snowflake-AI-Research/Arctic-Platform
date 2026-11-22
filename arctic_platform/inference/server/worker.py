@@ -725,9 +725,11 @@ def _result_from_output(
     return result
 
 
-def _forced_route_tail(prefix: Any, block_size: int, blocks: int) -> dict[str, Any]:
-    """Send the trailing partial block and, when requested, the preceding block."""
+def _forced_route_tail(prefix: Any, block_size: int, blocks: int) -> dict[str, Any] | None:
+    """The trailing partial block and, when requested, the preceding block; None when a hit can cover the capture."""
     start = max(prefix.shape[0] // block_size - blocks + 1, 0) * block_size
+    if start == prefix.shape[0]:
+        return None
     rows = prefix[start:].cpu().numpy()
     return {"start": start, "dtype": rows.dtype.str, "rows": rows.tobytes()}
 
@@ -1453,13 +1455,13 @@ class InferenceWorker(StreamingWorkerMixin):
             raise ValueError(f"{_REPLAY_ID_PARAM_KEY} requires {_SAMPLE_ID_PARAM_KEY}")
         if prefix_replay_id is not None and replay_id is None:
             raise ValueError(f"{_REPLAY_PREFIX_ID_PARAM_KEY} requires {_REPLAY_ID_PARAM_KEY}")
-        if self._forced_route_blocks is not None and prefix_replay_id is not None:
+        if prefix_replay_id is not None and self._forced_route_blocks is not None:
             # The splice reads the capture again at completion, so nothing holds it while the request runs.
             try:
                 tail = _forced_route_tail(self._router_replay_tx.get(prefix_replay_id), *self._forced_route_blocks)
             except KeyError:  # another replica served the earlier request, or the cache evicted it
-                pass
-            else:
+                tail = None
+            if tail is not None:
                 sampling_params["extra_args"] = {**sampling_params.get("extra_args", {}), FORCED_ROUTES_KEY: tail}
         return_back_router_info = bool(
             sampling_params.pop(_ROUTER_REPLAY_RETURN_INFO_PARAM_KEY, False)

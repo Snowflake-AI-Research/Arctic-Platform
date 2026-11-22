@@ -64,7 +64,8 @@ def test_masked_rows_take_the_stored_experts_with_the_trainers_replay_weights(mo
     forced.start[0], forced.end[0] = 11, 14
     forced.rows[0] = np.stack([np.zeros((3, K), np.uint16), stored.numpy().astype(np.uint16)], axis=1)
     # The request computes positions 10-15 in batch rows 0-5; its stored rows cover positions 11-13 (rows 1-3).
-    forced.fill(np.array([0]), np.array([0, 6]), np.array([10]))
+    forced.fill(SimpleNamespace(has_prefill=True, idx_mapping_np=np.array([0]),
+                                query_start_loc_np=np.array([0, 6]), num_computed_tokens_np=np.array([10])))
     bind_router(hooked, layer_id=1, forced=forced)
     captured = []
     hooked.set_capture_fn(captured.append)
@@ -129,9 +130,9 @@ class _V2Runner:
     def _remove_request(self, req_id):
         return self.req_states.req_id_to_index.pop(req_id, None) is not None
 
-    def prepare_inputs(self, req_ids, query_start_loc_np, num_computed_tokens_np):
+    def prepare_inputs(self, req_ids, query_start_loc_np, num_computed_tokens_np, has_prefill=True):
         index = self.req_states.req_id_to_index
-        return SimpleNamespace(idx_mapping_np=np.array([index[r] for r in req_ids]),
+        return SimpleNamespace(has_prefill=has_prefill, idx_mapping_np=np.array([index[r] for r in req_ids]),
                                query_start_loc_np=query_start_loc_np, num_computed_tokens_np=num_computed_tokens_np)
 
 
@@ -149,7 +150,7 @@ def test_tail_intersects_only_recomputed_prompt_positions():
     # Hit before, inside or beyond [4,8); the last request's effective prompt is too short to contain the capture.
     reqs = [SimpleNamespace(req_id=name, prompt_len=n, sampling_params=params)
             for name, n in [("early", 10), ("late", 10), ("full", 10), ("short", 7)]]
-    runner.add_requests(SimpleNamespace(scheduled_new_reqs=reqs))
+    runner.add_requests(SimpleNamespace(scheduled_new_reqs=reqs[::-1]))
     runner.prepare_inputs([r.req_id for r in reqs], np.array([0, 7, 11, 13, 16, 16]), np.array([2, 6, 8, 4]))
     state = runner._forced_routes
     assert state.mask.nonzero().flatten().tolist() == [2, 3, 4, 5, 7, 8]
@@ -160,7 +161,7 @@ def test_tail_intersects_only_recomputed_prompt_positions():
     runner.add_requests(SimpleNamespace(scheduled_new_reqs=[reqs[1]]))  # V2 resubmits the request after preemption.
     for first, masked in [(4, [0, 1, 2, 3]), (10, []), (11, [])]:
         # Re-prefill, verify four positions, then verify again after rejecting the last three.
-        runner.prepare_inputs(["late"], np.array([0, 4]), np.array([first]))
+        runner.prepare_inputs(["late"], np.array([0, 4]), np.array([first]), has_prefill=first < 10)
         assert state.mask[:4].nonzero().flatten().tolist() == masked
 
 
@@ -211,7 +212,7 @@ class _ToyEngine:
             router.set_capture_fn(partial(self.captured.__setitem__, i))
         self.cache, self.requests, self.submitted = [], [], 0  # cache: (tokens, routes the KV was built with)
         self.finished = {}  # prompt -> finished request
-        self.forced_steps, self.plain_routes, self.unforced_rows_changed, self.params = [], {}, 0, []
+        self.forced_steps, self.params = [], []
 
     async def generate_once(self, prompt_input, params, request_id, **_):
         # The request crosses into the engine core as vLLM serializes it.
@@ -256,7 +257,6 @@ class _ToyEngine:
         self.runner.prepare_inputs([r.id for r, _ in batch], qsl, np.array([r.computed for r, _ in batch]))
         forced = self.runner._forced_routes
         mask = forced.mask[:num_rows] if forced is not None else torch.zeros(num_rows, dtype=torch.bool)
-        plain = []
         for layer in range(L):
             logits = torch.zeros(num_rows, E)
             for (r, n), at in zip(batch, qsl):
@@ -267,16 +267,14 @@ class _ToyEngine:
             hidden = torch.zeros(num_rows, D)
             weights, ids = self.routers[layer].select_experts(hidden, logits)
             plain_weights, plain_ids = self.plain[layer].select_experts(hidden, logits)
-            changed = ~mask & ((ids != plain_ids).any(1) | (weights != plain_weights).any(1))
-            self.unforced_rows_changed += int(changed.sum())
+            assert torch.equal(ids[~mask], plain_ids[~mask])
+            assert torch.equal(weights[~mask], plain_weights[~mask])
             assert torch.equal(self.captured[layer], ids)
-            plain.append(plain_ids)
         self.forced_steps.append({})
+        captured = torch.stack(self.captured, 1).numpy()
         for (r, n), at in zip(batch, qsl):
             rows = slice(int(at), int(at) + n)
-            r.used[r.computed : r.computed + n] = torch.stack([c[rows] for c in self.captured], 1).numpy()
-            for i, pos in enumerate(range(r.computed, r.computed + n)):
-                self.plain_routes[(r.id, pos)] = torch.stack([p[int(at) + i] for p in plain]).numpy()
+            r.used[r.computed : r.computed + n] = captured[rows]
             forced = mask[rows].nonzero().flatten() + r.computed
             if len(forced):
                 self.forced_steps[-1][r.id] = forced.tolist()
@@ -308,8 +306,8 @@ def _two_turns(engine):
     # The scheduler's hit alignment, which only the engine workers know (the front end sees the smallest group).
     engine.runner.kv_cache_config = SimpleNamespace(cache_hit_alignment_tokens=B)
 
-    async def collective_rpc(method):  # two TP ranks, each reporting through the worker RPC
-        return [getattr(forced_routes, method)(SimpleNamespace(model_runner=engine.runner))] * 2
+    async def collective_rpc(method):
+        return [getattr(forced_routes, method)(SimpleNamespace(model_runner=engine.runner))]
 
     worker.llm = SimpleNamespace(collective_rpc=collective_rpc)
     asyncio.run(worker._init_forced_routes())
@@ -341,10 +339,6 @@ def test_a_continuation_recomputes_the_tail_of_its_previous_capture_under_the_st
     # b1's ends at 12 and b2's hit stops at 8: positions 8-11.
     tails = {"a2": ("a1", range(4, 10)), "b2": ("b1", range(8, 12))}
 
-    # The engine's own router picks other experts at some of those positions, so this test can fail.
-    assert any((engine.plain_routes[(ran[name].id, p)] != returned[prev][p]).any()
-               for name, (prev, positions) in tails.items() for p in positions)
-
     # The forward routed every recomputed stored position as stored.
     tail = [(name, p) for name, (_, positions) in tails.items() for p in positions]
     tail_mismatch = sum((ran[name].used[p] != returned[tails[name][0]][p]).any() for name, p in tail)
@@ -356,10 +350,9 @@ def test_a_continuation_recomputes_the_tail_of_its_previous_capture_under_the_st
 
     # Exactly those positions ran under stored routes; every other row is routed as an unpatched router routes it, the
     # request without a prefix id included.
-    forced = {name: sorted(p for step in engine.forced_steps for p in step.get(ran[name].id, [])) for name in tails}
-    assert forced == {name: list(positions) for name, (_, positions) in tails.items()}
-    assert engine.unforced_rows_changed == 0
-    assert all((returned["c"][p] == engine.plain_routes[(ran["c"].id, p)]).all() for p in range(len(returned["c"])))
+    for name, request in ran.items():
+        positions = [p for step in engine.forced_steps for p in step.get(request.id, [])]
+        assert positions == (list(tails[name][1]) if name in tails else [])
 
     # The tails ran in chunks, and in one step together.
     assert any({ran["a2"].id, ran["b2"].id} <= step.keys() for step in engine.forced_steps)
@@ -399,7 +392,7 @@ def test_an_engine_stored_rows_cannot_reach_starts_unhooked_and_routes_as_before
     warnings = [r.getMessage() for r in caplog.records if "re-prefilled prefix positions" in r.getMessage()]
     assert len(warnings) == 1 and "data_parallel_size > 1" in warnings[0]
     assert not any(forced_routes.FORCED_ROUTES_KEY in (p.extra_args or {}) for p in engine.params)
-    assert not any(engine.forced_steps) and engine.unforced_rows_changed == 0
+    assert not any(engine.forced_steps)
     for name, prev in (("a2", "a1"), ("b2", "b1")):
         n = len(returned[prev])
         assert (returned[name][:n] == returned[prev]).all() and (returned[name][n:] == ran[name].used[n:]).all()
