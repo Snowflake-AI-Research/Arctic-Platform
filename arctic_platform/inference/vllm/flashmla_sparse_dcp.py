@@ -22,7 +22,8 @@ only: its bf16 path refuses DCP > 1 at construction and, past that, converts
 each token's top-k positions through the full-sequence slot rule. Here the
 bf16 path keeps the top-k positions this rank stores, as the fp8 path does,
 attends them with the same bf16 kernel, and returns the kernel's log-sum-exp.
-DCP = 1 is unchanged.
+A token whose selection this rank holds none of gets the kernel's zero output
+and +inf log-sum-exp, which the DCP merge weighs zero. DCP = 1 is unchanged.
 """
 
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
@@ -67,10 +68,6 @@ class FlashMLASparseBf16DcpPatch(ArcticPatch[FlashMLASparseImpl]):
             return_valid_counts=True,
         )
         out, lse = self._bf16_flash_mla_kernel(q, kv_rows, local_topk, local_count, actual_num_heads)
-        # (0, -inf) drops this rank from the merge of a token whose selection it holds none of.
-        empty = local_count == 0
-        out.masked_fill_(empty.view(-1, 1, 1), 0.0)
-        lse.masked_fill_(empty.view(-1, 1), float("-inf"))
         return out.contiguous(), lse
 
 
