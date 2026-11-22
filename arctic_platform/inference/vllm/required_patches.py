@@ -18,6 +18,7 @@
 
 def apply_required_vllm_patches() -> None:
     from arctic_platform.inference.vllm.config import ensure_dflash_max_position_patch
+    from arctic_platform.inference.vllm.decoded_tail_prefix_hit import ensure_decoded_tail_prefix_hit
     from arctic_platform.inference.vllm.deepseek_v41_lora import ensure_deepseek_v41_lora
     from arctic_platform.inference.vllm.dense_prompt_logprobs import ensure_dense_prompt_logprobs_patch
     from arctic_platform.inference.vllm.glm5next_lora import ensure_glm5next_lora
@@ -42,3 +43,4 @@ def apply_required_vllm_patches() -> None:
     ensure_mrope_yarn_fix()
     ensure_mamba_completion_refresh()
     ensure_deepseek_v41_lora()
+    ensure_decoded_tail_prefix_hit()
