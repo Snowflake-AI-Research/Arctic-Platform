@@ -109,7 +109,7 @@ class _Engine:
     def __init__(self, value):
         self.value = value
 
-    def receive_weights(self):
+    def receive_weights(self, in_row_blocks=None):
         yield "weight", self.value
 
 
@@ -140,7 +140,10 @@ def test_native_tensor_writes_survive_removing_observations(receiver, monkeypatc
         def destination_name(self, name):
             return "weight" if path == "fused" else None
 
-        def feed(self, name, tensor):
+        def loads_row_blocks(self, name):
+            return False
+
+        def feed(self, name, tensor, first_row=0):
             writes.append((name, tensor))
             self.model.weight.copy_(tensor)
 

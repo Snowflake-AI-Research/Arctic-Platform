@@ -1358,6 +1358,8 @@ def maybe_bind_broadcast_loader(verifier, writer):
         verify_sources(verifier.sources)
         verifier.sources.update(source_files(type(writer)))
         verify_sources(verifier.sources)
+        # Shadow evidence is per whole received tensor, so none arrives in expert row blocks.
+        writer.loads_row_blocks = lambda name: False
 
 
 _BROADCAST_LOAD_VERIFIER: ContextVar[ShadowVerifier | None] = ContextVar("broadcast_load_verifier", default=None)
