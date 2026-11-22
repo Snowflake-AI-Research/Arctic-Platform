@@ -55,6 +55,13 @@ gathers K/V itself. Hugging Face flash attention gets the gather from a wrapper 
 context only; the wrapper passes modules with an unshared stash through and refuses
 already-gathered K/V.
 
+Only flash-attn 2 (>= 2.1, installed as ``flash_attn``) has been checked on GPU against an
+unshared run, so a sharing layout refuses FA3 / FA4 ``FlashAttention`` and any Hugging Face
+implementation other than ``flash_attention_2``. Mixers are found by class name and by a
+direct ``Conv1d`` child; any that is not one of the flash attentions above (Mamba / SSM,
+GatedDeltaNet, short convolutions) refuses a sharing layout, because it would restart its
+state at each continuation instead of carrying the root's.
+
 Not supported inside :func:`using_layout` until the GatedDeltaNet and executor PRs define
 them: sequence parallelism (SP >= 2, a shard's ``position_ids`` do not cover the layout)
 and padded calls (``pad_packed_microbatch``). Both fail the packed-token-count checks in
@@ -91,11 +98,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from .pack import IGNORE_INDEX
 from .pack import ROW_BROADCAST_KEYS
 from .walk import DROP
 from .walk import map_batch_values
 
 LAYOUT_ATTR = "_arctic_packed_layout"
+# Per-token loss masks the providers in this stack send; nonzero marks a cell the loss reads.
+LOSS_WEIGHT_KEYS = frozenset({"loss_mask", "response_mask"})
 _HF_PREFIX_MARK = "_arctic_prefix_attention"
 _MISSING = object()
 _ModuleType = TypeVar("_ModuleType", bound=type)
@@ -494,19 +504,28 @@ def pack_with_layout(data: Dict[str, Any], layout: PackedLayout) -> Dict[str, An
 
     ``ROW_BROADCAST_KEYS`` leaves sent as ``[B]`` become ``[1, T]`` by each packed token's
     ``logical_row``, as ``pack_microbatch`` does; a shared root token takes its source row's
-    value, which reaches no loss as long as shared positions carry no loss weight
-    (:meth:`PackedLayout.require_unweighted_shared`). A batch's
+    value, which reaches no loss as long as shared positions carry no loss weight. A loss
+    computed on packed tokens would count a weighted root once instead of once per row, so
+    ``[B, S]`` ``LOSS_WEIGHT_KEYS`` leaves (or ``labels != IGNORE_INDEX`` when none is sent)
+    must be zero on shared cells (:meth:`PackedLayout.require_unweighted_shared`). A batch's
     ``routed_experts`` must agree with ``layout.router_replay`` and, when replayed, with the
     layout's shared cells.
     """
     batch_size, sequence_length = layout.row_index.shape
     routed: list[Tensor] = []
+    weights: list[Tensor] = []
+    labels: list[Tensor] = []
 
     def packed_value(key: str, value: Any) -> Any:
         if key == "attention_mask":
             return DROP
         if key == "routed_experts" and torch.is_tensor(value):
             routed.append(value)
+        if torch.is_tensor(value) and tuple(value.shape) == (batch_size, sequence_length):
+            if key in LOSS_WEIGHT_KEYS:
+                weights.append(value)
+            elif key == "labels":
+                labels.append(value != IGNORE_INDEX)
         if key in ROW_BROADCAST_KEYS and torch.is_tensor(value) and tuple(value.shape) == (batch_size,):
             return value[layout.logical_row.to(value.device)].unsqueeze(0)
         if torch.is_tensor(value) and value.ndim >= 2 and tuple(value.shape[:2]) == (batch_size, sequence_length):
@@ -516,6 +535,9 @@ def pack_with_layout(data: Dict[str, Any], layout: PackedLayout) -> Dict[str, An
 
     packed = map_batch_values(data, packed_value)
     _require_routed_experts_match(layout, routed)
+    if layout.has_sharing:
+        for value in weights or labels:
+            layout.require_unweighted_shared(value)
     packed["position_ids"] = layout.position_ids.unsqueeze(0)
     return packed
 
@@ -717,7 +739,9 @@ def _installed_flash_attn_version() -> tuple[int, int] | None:
 def require_bottom_right_causal_flash() -> None:
     """flash-attn < 2.1 aligns the causal mask top-left when a segment has more keys than queries."""
     installed = _installed_flash_attn_version()
-    if installed is not None and installed < (2, 1):
+    if installed is None:
+        raise ValueError("prefix sharing needs the flash_attn package (>= 2.1); it is not installed")
+    if installed < (2, 1):
         raise ValueError(
             "prefix sharing needs flash-attn >= 2.1 (bottom-right causal alignment); found"
             f" {installed[0]}.{installed[1]}"
@@ -801,7 +825,18 @@ def _hf_prefix_attention(model: torch.nn.Module) -> Iterator[None]:
 
 _HF_PREFIX_ATTENTION = {"Qwen3Attention", "Qwen3MoeAttention"}
 _NATIVE_PREFIX_ATTENTION: set[type] = set()
-_SEQUENCE_MIXER_NEEDLES = ("Attention", "DeltaNet", "GatedDelta", "LinearAttention", "KDA")
+_SEQUENCE_MIXER_NEEDLES = (
+    "Attention",
+    "DeltaNet",
+    "GatedDelta",
+    "LinearAttention",
+    "KDA",
+    "Mamba",
+    "SSM",
+    "Mixer",
+    "Convolution",
+    "ShortConv",
+)
 _MOE_NAME_NEEDLES = ("MoE", "Moe")
 _MOE_CONFIG_KEYS = ("num_experts", "num_local_experts", "n_routed_experts")
 
@@ -815,25 +850,32 @@ def register_native_prefix_attention(cls: _ModuleType) -> _ModuleType:
     return cls
 
 
+def _is_sequence_mixer(module: torch.nn.Module) -> bool:
+    name = type(module).__name__
+    if any(needle in name for needle in _SEQUENCE_MIXER_NEEDLES):
+        return True
+    # A causal Conv1d over tokens (Mamba, GatedDeltaNet, short-conv mixers) carries state past a segment start,
+    # whatever its parent is called.
+    return any(isinstance(child, torch.nn.Conv1d) for child in module.children())
+
+
 def sequence_mixers(model: torch.nn.Module) -> list[torch.nn.Module]:
-    found = []
-    for module in model.modules():
-        name = type(module).__name__
-        if any(needle in name for needle in _SEQUENCE_MIXER_NEEDLES):
-            found.append(module)
-    return found
+    return [module for module in model.modules() if _is_sequence_mixer(module)]
 
 
 def _prefix_continuation_blocker(module: torch.nn.Module) -> str | None:
     """Why ``module`` cannot run prefix continuation, or ``None`` if it can."""
     name = type(module).__name__
     if type(module) in _NATIVE_PREFIX_ATTENTION:
+        version = getattr(module, "_flash_attn_version", 2)
+        if version != 2:
+            return f"{name} (flash-attn {version}; only flash-attn 2 is verified for prefix continuation)"
         return None
     if name not in _HF_PREFIX_ATTENTION:
         return f"{name} (no prefix-continuation path)"
     impl = getattr(getattr(module, "config", None), "_attn_implementation", None)
-    if not (isinstance(impl, str) and impl.startswith("flash")):
-        return f"{name} (attn_implementation={impl!r}, needs flash)"
+    if impl != "flash_attention_2":
+        return f"{name} (attn_implementation={impl!r}, needs flash_attention_2)"
     if getattr(module, "sliding_window", None) is not None:
         return f"{name} (Hugging Face sliding window)"
     return None

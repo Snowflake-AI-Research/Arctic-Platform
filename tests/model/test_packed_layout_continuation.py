@@ -38,6 +38,7 @@ from transformers import Qwen3MoeForCausalLM
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from arctic_platform.common.packing import PackedLayout
+from arctic_platform.common.packing import layout as layout_module
 from arctic_platform.common.packing import pack_with_layout
 from arctic_platform.common.packing import using_layout
 from arctic_platform.common.packing.layout import _hf_prefix_attention_fn
@@ -62,6 +63,12 @@ F64_ATOL = 1e-10
 # gradient, which sums every row's contribution before that cast, is rounded to float32 once instead of once per
 # row: |diff| <= 2**-24 * |grad|, and grads here are <= 0.5. Dropping the gather is off by > 1e-3.
 SHARED_GRAD_ATOL = 1e-7
+
+
+@pytest.fixture(autouse=True)
+def _reference_flash_attn(monkeypatch):
+    """The reference kernel stands in for flash-attn 2.8 here, installed or not."""
+    monkeypatch.setattr(layout_module, "_installed_flash_attn_version", lambda: (2, 8))
 
 
 def _batch():
@@ -118,7 +125,7 @@ def _run(model, logits_fn, batch, scored, layout=None):
         logprobs = _response_logprobs(logits_rows, batch, scored)
         (-logprobs.mean()).backward()
     else:
-        packed = pack_with_layout(batch, layout)
+        packed = pack_with_layout({**batch, "loss_mask": scored}, layout)
         with using_layout(model, layout):
             logits = logits_fn(model, packed["input_ids"], packed["position_ids"])
             logprobs = _response_logprobs(layout.unpack(logits), batch, scored)

@@ -59,6 +59,12 @@ from arctic_platform.testing_utils import torch_assert_equal
 F64_ATOL = 1e-12
 
 
+@pytest.fixture(autouse=True)
+def _reference_flash_attn(monkeypatch):
+    """The reference kernel stands in for flash-attn 2.8 here, installed or not."""
+    monkeypatch.setattr(layout_module, "_installed_flash_attn_version", lambda: (2, 8))
+
+
 @register_native_prefix_attention
 class FlashAttention(nn.Module):
     """Minimal varlen attention under the name the mixer allowlist accepts for Arctic-Platform flash attention."""
@@ -117,6 +123,7 @@ def _shared_layout(lengths=(4, 4), shared=3, **build_kwargs):
     batch = _rows(list(lengths))
     for row in range(1, len(lengths)):
         batch["input_ids"][row, :shared] = batch["input_ids"][0, :shared]
+    batch["labels"][:, :shared] = IGNORE_INDEX
     layout = PackedLayout.build(
         batch["attention_mask"],
         [list(range(len(lengths)))],
@@ -382,6 +389,28 @@ def test_require_unweighted_shared():
         layout.require_unweighted_shared(weights)
 
 
+def test_pack_with_layout_refuses_loss_weight_on_shared_cells():
+    batch, layout = _shared_layout(lengths=(5, 4))
+    loss_mask = torch.zeros(2, 5, dtype=torch.long)
+    loss_mask[:, 3:] = batch["attention_mask"][:, 3:]
+    pack_with_layout({**batch, "loss_mask": loss_mask}, layout)
+    for key in ("loss_mask", "response_mask"):
+        weighted = loss_mask.clone()
+        weighted[1, 0] = 1
+        with pytest.raises(ValueError, match="shared prefix"):
+            pack_with_layout({**batch, "context": {key: weighted}}, layout)
+
+    # labels are the weight only when no mask is sent: a provider may keep prompt labels and mask them out.
+    labeled = batch["labels"].clone()
+    labeled[1, 0] = 7
+    with pytest.raises(ValueError, match="shared prefix"):
+        pack_with_layout({**batch, "labels": labeled}, layout)
+    pack_with_layout({**batch, "labels": labeled, "loss_mask": loss_mask}, layout)
+
+    unshared = PackedLayout.build(batch["attention_mask"], *unshared_groups(2), batch["position_ids"])
+    pack_with_layout({**batch, "labels": labeled, "loss_mask": torch.ones(2, 5, dtype=torch.long)}, unshared)
+
+
 def test_router_replay_must_be_explicit_for_moe():
     _, unstated = _shared_layout()
     assert unstated.router_replay is None
@@ -571,8 +600,43 @@ def test_require_prefix_continuation_rejects_unsupported_mixers():
         require_prefix_continuation(Qwen3Attention(sliding_window=4))
     with pytest.raises(ValueError, match="Qwen2Attention"):
         require_prefix_continuation(Qwen2Attention())
+    with pytest.raises(ValueError, match="needs flash_attention_2"):
+        require_prefix_continuation(Qwen3Attention(impl="flash_attention_3"))
     with pytest.raises(ValueError, match="no sequence mixers"):
         require_prefix_continuation(nn.Linear(1, 1))
+
+    fa3 = FlashAttention()
+    fa3._flash_attn_version = 3
+    with pytest.raises(ValueError, match="flash-attn 3"):
+        require_prefix_continuation(fa3)
+
+
+def test_sharing_refuses_state_space_and_conv_mixers():
+    """Nemotron-H's Mamba-2 layers sit next to registered flash attention; their names carry no attention needle."""
+    _, shared = _shared_layout()
+    unshared = PackedLayout.build(torch.ones(2, 4, dtype=torch.long), *unshared_groups(2))
+
+    def hybrid(mixer_name, **attrs):
+        mixer = type(mixer_name, (nn.Module,), {})()
+        for name, value in attrs.items():
+            setattr(mixer, name, value)
+        model = nn.Module()
+        model.attn = FlashAttention()
+        model.mixer = mixer
+        return model
+
+    models = {
+        "NemotronHMambaLayer": hybrid("NemotronHMambaLayer"),
+        "NemotronHMamba2Mixer": hybrid("NemotronHMamba2Mixer"),
+        "CausalTokenBlock": hybrid("CausalTokenBlock", conv1d=nn.Conv1d(4, 4, 3, groups=4)),
+    }
+    for name, model in models.items():
+        with pytest.raises(ValueError, match=name):
+            with using_layout(model, shared):
+                pass
+        assert get_active_packed_layout() is None
+        with using_layout(model, unshared):
+            pass
 
 
 def test_sharing_refuses_top_left_causal_flash_attn(monkeypatch):
@@ -585,7 +649,13 @@ def test_sharing_refuses_top_left_causal_flash_attn(monkeypatch):
     assert get_active_packed_layout() is None
     with using_layout(FlashAttention(), unshared):
         pass
-    for installed in (None, (2, 1), (3, 0)):
+    monkeypatch.setattr(layout_module, "_installed_flash_attn_version", lambda: None)
+    with pytest.raises(ValueError, match="not installed"):
+        with using_layout(FlashAttention(), layout):
+            pass
+    with using_layout(FlashAttention(), unshared):
+        pass
+    for installed in ((2, 1), (2, 8)):
         monkeypatch.setattr(layout_module, "_installed_flash_attn_version", lambda: installed)
         with using_layout(FlashAttention(), layout):
             pass
