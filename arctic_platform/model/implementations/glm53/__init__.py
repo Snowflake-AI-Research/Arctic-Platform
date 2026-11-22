@@ -14,6 +14,9 @@
 # limitations under the License.
 """GLM-5.3-Flash PrimeRL integration."""
 
+GLM53_ATTN_BACKEND = "sparse_mla"
+SPARSE_MLA_BACKENDS = ("sparse_mla", "flashinfer", "flashmla")
+
 
 def __getattr__(name: str):
     if name == "Glm5NextForConditionalGenerationPrimeRL":

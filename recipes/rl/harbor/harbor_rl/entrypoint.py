@@ -62,6 +62,17 @@ def harbor_env_kwargs() -> dict[str, Any]:
     return kwargs
 
 
+def harbor_verifier_env() -> dict[str, str]:
+    """``HARBOR_VERIFIER_ENV`` (a JSON object of strings), added to every task's verifier env like ``harbor run --ve``."""
+    raw = os.environ.get("HARBOR_VERIFIER_ENV", "").strip()
+    if not raw:
+        return {}
+    env = json.loads(raw)
+    if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+        raise ValueError("HARBOR_VERIFIER_ENV must be a JSON object of strings")
+    return env
+
+
 def _prepare_task_fn() -> Any:
     return functools.partial(materialize_harbor_task_from_row, reward_file=Path(localization_reward_module.__file__))
 
@@ -124,6 +135,7 @@ def _experiment_cls():
                 max_turns=max_turns,
                 skills=skills,
                 env_kwargs=harbor_env_kwargs(),
+                verifier_env=harbor_verifier_env(),
                 prepare_task_fn=_prepare_task_fn(),
             )
             self.harbor_adapter = adapter
@@ -261,6 +273,7 @@ def main() -> None:
             cfg.data.train_data[0],
             env=resolve_env(os.environ.get("HARBOR_ENV") or DEFAULT_HARBOR_ENV),
             env_kwargs=harbor_env_kwargs(),
+            verifier_env=harbor_verifier_env(),
             rollouts=int(cfg.trainer.train_batch_size) * int(cfg.generator.n_samples_per_prompt),
             prepare_task_fn=_prepare_task_fn(),
         )

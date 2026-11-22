@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for prefix-affinity routing in the scheduler."""
+"""Tests for affinity routing in the scheduler."""
 from __future__ import annotations
 
 import asyncio
@@ -23,12 +23,7 @@ import pytest
 
 from arctic_platform.inference.server.scheduler import (
     Scheduler,
-    WorkerState,
-    _Request,
     _compute_prefix_hash,
-    least_loaded_routing,
-    prefix_affinity_routing,
-    strict_affinity_routing,
 )
 
 
@@ -36,29 +31,15 @@ from arctic_platform.inference.server.scheduler import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_workers(n: int, concurrency: int = 64) -> list[WorkerState]:
-    return [
-        WorkerState(handle=MagicMock(), concurrency_limit=concurrency)
-        for _ in range(n)
-    ]
+def _scheduler(n: int, capacity: int = 64, prefix_routing: bool = True) -> Scheduler:
+    return Scheduler([MagicMock() for _ in range(n)], capacity, prefix_routing=prefix_routing)
 
 
-def _make_request(
-    prompt: str | list[int] = "hello",
-    prefix_hash: int | None = None,
-    routing_key: str | None = None,
-) -> _Request:
-    loop = asyncio.new_event_loop()
-    future = loop.create_future()
-    loop.close()
-    return _Request(
-        id=0,
-        prompt=prompt,
-        sampling_params={},
-        future=future,
-        prefix_hash=prefix_hash,
-        routing_key=routing_key,
-    )
+def _route(sch: Scheduler, prompt="hello", routing_key=None, strict=False) -> int | None:
+    """Route one request and count it against its worker, as ``_take`` does."""
+    req = sch._request(prompt, {}, None, routing_key, strict)
+    ws = sch._take(req)
+    return None if ws is None else req.worker_idx
 
 
 # ---------------------------------------------------------------------------
@@ -74,166 +55,71 @@ class TestComputePrefixHash:
 
     def test_full_hash_differs_with_different_suffix(self):
         base = "A" * 100
-        a = base + "X"
-        b = base + "Y"
-        assert _compute_prefix_hash(a) != _compute_prefix_hash(b)
+        assert _compute_prefix_hash(base + "X") != _compute_prefix_hash(base + "Y")
 
     def test_different_prefix_different_hash(self):
         assert _compute_prefix_hash("hello world") != _compute_prefix_hash("goodbye world")
 
     def test_token_full_hash_differs_with_different_suffix(self):
         base = list(range(100))
-        a = base + [999]
-        b = base + [888]
-        assert _compute_prefix_hash(a) != _compute_prefix_hash(b)
+        assert _compute_prefix_hash(base + [999]) != _compute_prefix_hash(base + [888])
 
     def test_empty_string(self):
-        h = _compute_prefix_hash("")
-        assert isinstance(h, int)
-
-    def test_single_char(self):
-        h = _compute_prefix_hash("x")
-        assert isinstance(h, int)
+        assert isinstance(_compute_prefix_hash(""), int)
 
     def test_single_token(self):
-        h = _compute_prefix_hash([42])
-        assert isinstance(h, int)
+        assert isinstance(_compute_prefix_hash([42]), int)
 
 
 # ---------------------------------------------------------------------------
-# prefix_affinity_routing
+# Scheduler._route
 # ---------------------------------------------------------------------------
 
-class TestPrefixAffinityRouting:
-    def test_same_hash_routes_to_same_worker(self):
-        """Requests with the same prefix_hash should land on the same worker."""
-        workers = _make_workers(4)
-        r1 = _make_request(prefix_hash=42)
-        r2 = _make_request(prefix_hash=42)
-        assert prefix_affinity_routing(r1, workers) == prefix_affinity_routing(r2, workers)
-
-    def test_different_hash_can_route_differently(self):
-        """Different hashes should (with enough workers) spread across workers."""
-        workers = _make_workers(8)
-        destinations = set()
-        for h in range(100):
-            r = _make_request(prefix_hash=h)
-            destinations.add(prefix_affinity_routing(r, workers))
-        assert len(destinations) > 1
-
-    def test_no_hash_falls_back_to_least_loaded(self):
-        """When prefix_hash is None, behavior matches least_loaded_routing."""
-        workers = _make_workers(4)
-        workers[0].active_requests = 10
-        r = _make_request(prefix_hash=None)
-        idx = prefix_affinity_routing(r, workers)
-        expected = least_loaded_routing(r, workers)
-        assert idx == expected
-
-    def test_overloaded_preferred_spills_to_next(self):
-        """When the preferred worker exceeds load threshold, the next in
-        the hash ring is selected."""
-        workers = _make_workers(4, concurrency=100)
-        r = _make_request(prefix_hash=0)
-        preferred = prefix_affinity_routing(r, workers)
-
-        workers[preferred].active_requests = 90
-        second = prefix_affinity_routing(r, workers)
-        assert second != preferred
-
-    def test_all_overloaded_falls_back_to_least_loaded(self):
-        """When every candidate is above the load threshold, fall back to
-        least_loaded_routing."""
-        workers = _make_workers(3, concurrency=100)
-        for ws in workers:
-            ws.active_requests = 95
-        workers[1].active_requests = 86
-
-        r = _make_request(prefix_hash=7)
-        idx = prefix_affinity_routing(r, workers)
-        expected = least_loaded_routing(r, workers)
-        assert idx == expected
-
-    def test_no_available_workers_falls_back(self):
-        """When all workers are unavailable, falls back to least_loaded_routing
-        which itself falls back to all workers."""
-        workers = _make_workers(2)
-        for ws in workers:
-            ws.available = False
-        r = _make_request(prefix_hash=5)
-        idx = prefix_affinity_routing(r, workers)
-        expected = least_loaded_routing(r, workers)
-        assert idx == expected
-
-    def test_single_worker(self):
-        workers = _make_workers(1)
-        r = _make_request(prefix_hash=99)
-        assert prefix_affinity_routing(r, workers) == 0
+class TestRoute:
+    def test_unkeyed_goes_to_least_loaded(self):
+        sch = _scheduler(2, prefix_routing=False)
+        sch._workers[0].active_requests = 5
+        sch._workers[1].active_requests = 2
+        assert _route(sch, "a") == 1
 
     def test_grpo_group_colocates(self):
-        """Simulate GRPO: 8 identical prompts should all pick the same worker."""
-        workers = _make_workers(4)
+        sch = _scheduler(4)
         prompt = "System: You are a math tutor.\nUser: Solve x+2=5"
-        h = _compute_prefix_hash(prompt)
-        indices = [
-            prefix_affinity_routing(_make_request(prefix_hash=h), workers)
-            for _ in range(8)
-        ]
-        assert len(set(indices)) == 1
+        assert len({_route(sch, prompt) for _ in range(8)}) == 1
 
-    def test_different_groups_spread(self):
-        """Different GRPO groups (different prompts) should spread."""
-        workers = _make_workers(8)
-        targets = set()
-        for i in range(20):
-            prompt = f"System prompt variant {i}. User: question"
-            h = _compute_prefix_hash(prompt)
-            idx = prefix_affinity_routing(_make_request(prefix_hash=h), workers)
-            targets.add(idx)
-        assert len(targets) > 1
+    def test_different_prompts_spread(self):
+        sch = _scheduler(8)
+        assert len({_route(sch, f"System prompt variant {i}") for i in range(20)}) > 1
 
+    def test_prefix_key_spills_at_capacity(self):
+        sch = _scheduler(2, capacity=2)
+        first = _route(sch, "p")
+        assert _route(sch, "p") == first
+        assert _route(sch, "p") != first
 
-# ---------------------------------------------------------------------------
-# strict_affinity_routing
-# ---------------------------------------------------------------------------
+    def test_strict_prefix_key_never_spills(self):
+        sch = _scheduler(2, capacity=1)
+        first = _route(sch, "p", strict=True)
+        # Past its worker's backlog it waits (None) rather than spill.
+        assert [_route(sch, "p", strict=True) for _ in range(3)] == [first, None, None]
 
-class TestStrictAffinityRouting:
-    def test_same_hash_routes_to_same_worker(self):
-        workers = _make_workers(4)
-        r1 = _make_request(prefix_hash=42)
-        r2 = _make_request(prefix_hash=42)
-        assert strict_affinity_routing(r1, workers) == strict_affinity_routing(r2, workers)
+    def test_routing_key_never_spills(self):
+        sch = _scheduler(2, capacity=1, prefix_routing=False)
+        first = _route(sch, "turn-1", routing_key="g")
+        assert _route(sch, "turn-2 very different prompt", routing_key="g") == first
 
-    def test_overloaded_preferred_does_not_spill(self):
-        """Strict mode pins to the keyed worker even when it's overloaded —
-        the scheduler's outer back-off loop is responsible for waiting, not
-        the routing function."""
-        workers = _make_workers(4, concurrency=100)
-        r = _make_request(prefix_hash=0)
-        preferred = strict_affinity_routing(r, workers)
-        workers[preferred].active_requests = 95  # past prefix's 85% threshold
-        assert strict_affinity_routing(r, workers) == preferred
+    def test_unavailable_worker_is_reassigned(self):
+        sch = _scheduler(3)
+        first = _route(sch, routing_key="g")
+        sch._workers[first].available = False
+        again = _route(sch, routing_key="g")
+        assert again != first
+        assert _route(sch, routing_key="g") == again
 
-    def test_strict_and_soft_agree_when_underloaded(self):
-        """When the preferred worker is below the load threshold, strict and
-        prefix_affinity should pick the same worker."""
-        workers = _make_workers(4)
-        for h in range(20):
-            r = _make_request(prefix_hash=h)
-            assert strict_affinity_routing(r, workers) == prefix_affinity_routing(r, workers)
-
-    def test_no_hash_falls_back_to_least_loaded(self):
-        workers = _make_workers(3)
-        workers[0].active_requests = 5
-        r = _make_request(prefix_hash=None)
-        assert strict_affinity_routing(r, workers) == least_loaded_routing(r, workers)
-
-    def test_no_available_workers_falls_back(self):
-        workers = _make_workers(2)
-        for ws in workers:
-            ws.available = False
-        r = _make_request(prefix_hash=5)
-        assert strict_affinity_routing(r, workers) == least_loaded_routing(r, workers)
+    def test_paused_routes_nothing(self):
+        sch = _scheduler(2)
+        sch.pause()
+        assert _route(sch, "p") is None
 
 
 # ---------------------------------------------------------------------------
@@ -242,149 +128,89 @@ class TestStrictAffinityRouting:
 
 
 def _capture_requests(sch: Scheduler) -> list:
-    """Replace _process_request with a no-op capture so we can inspect the
-    _Request objects submit() builds, without racing real worker dispatch."""
+    """Replace _dispatch with a capture so we can inspect the
+    _Request objects submit() builds, without real worker dispatch."""
     captured: list = []
 
-    async def fake_process(req):
+    def fake_dispatch(req):
         captured.append(req)
+        return True
 
-    sch._process_request = fake_process  # type: ignore[method-assign]
+    sch._dispatch = fake_dispatch  # type: ignore[method-assign]
     return captured
 
 
 class TestSchedulerRoutingKey:
-    def test_replica_pool_defaults_to_static_concurrency_128(self):
+    def test_replica_pool_scheduler_capacity_is_max_num_seqs(self):
         from arctic_platform.inference.server.replica_pool import ReplicaPool
 
-        pool = ReplicaPool()
-        scheduler = pool._make_scheduler([MagicMock(), MagicMock()])
-        assert [ws.concurrency_limit for ws in scheduler._workers] == [128, 128]
+        scheduler = ReplicaPool()._make_scheduler([MagicMock(), MagicMock()], 256)
+        assert scheduler._capacity == 256
+        assert scheduler._prefix_routing is True
 
-    def test_replica_pool_uses_configured_initial_concurrency(self, monkeypatch):
-        from arctic_platform.inference.server.replica_pool import ReplicaPool
-
-        monkeypatch.setenv("ARCTIC_WORKER_CONCURRENCY_LIMIT", "32")
-        pool = ReplicaPool()
-        scheduler = pool._make_scheduler([MagicMock(), MagicMock()])
-        assert [ws.concurrency_limit for ws in scheduler._workers] == [32, 32]
-
-    def test_dynamic_concurrency_is_disabled_by_default(self):
+    def test_shutdown_fails_waiting_requests(self):
         async def run() -> None:
-            workers = [MagicMock()]
-            sch = Scheduler(workers)
-            try:
-                sch._ensure_background_tasks()
-                assert sch._poll_task is None
-                assert sch._adjust_task is None
-            finally:
-                await sch.shutdown()
-
-        asyncio.run(run())
-
-    def test_dynamic_concurrency_can_be_enabled(self):
-        async def run() -> None:
-            workers = [MagicMock()]
-            sch = Scheduler(workers, dynamic_concurrency=True)
-            try:
-                sch._ensure_background_tasks()
-                assert sch._poll_task is not None
-                assert sch._adjust_task is not None
-            finally:
-                await sch.shutdown()
-
-        asyncio.run(run())
-
-    def test_shutdown_unblocks_paused_waiters(self):
-        async def run() -> None:
-            workers = [MagicMock()]
-            sch = Scheduler(workers)
+            sch = _scheduler(1)
             sch.pause()
-            waiter = asyncio.create_task(sch._pause_event.wait())
+            future = sch.submit("p", {})
             await asyncio.sleep(0)
-            assert not waiter.done()
+            assert not future.done()
             await sch.shutdown()
-            await asyncio.wait_for(waiter, timeout=1.0)
+            with pytest.raises(RuntimeError, match="stopped"):
+                await asyncio.wait_for(future, 1.0)
 
         asyncio.run(run())
 
     def test_routing_key_replaces_prompt_hash(self):
-        """Two prompts with different content but the same routing_key must
-        produce equal prefix_hash values, so they hash to the same worker."""
-
         async def run() -> None:
-            workers = [MagicMock() for _ in range(2)]
-            sch = Scheduler(workers, enable_prefix_hash=True)
-            try:
-                captured = _capture_requests(sch)
-                sch.submit("turn-1 prompt", {}, routing_key="g42")
-                sch.submit("turn-2 very different prompt", {}, routing_key="g42")
-                await asyncio.sleep(0)  # let create_task run capture
-                assert len(captured) == 2
-                assert captured[0].prefix_hash == captured[1].prefix_hash == hash("g42")
-                # And critically, the prompt-derived hash differs — proving
-                # routing_key overrode the prompt hash.
-                assert _compute_prefix_hash("turn-1 prompt") != \
-                       _compute_prefix_hash("turn-2 very different prompt")
-            finally:
-                await sch.shutdown()
+            sch = _scheduler(2)
+            captured = _capture_requests(sch)
+            sch.submit("turn-1 prompt", {}, routing_key="g42")
+            sch.submit("turn-2 very different prompt", {}, routing_key="g42")
+            await asyncio.sleep(0)
+            assert [(r.key, r.sticky) for r in captured] == [("g42", True), ("g42", True)]
+            await sch.shutdown()
 
         asyncio.run(run())
 
     def test_no_routing_key_uses_prompt_hash(self):
         async def run() -> None:
-            workers = [MagicMock() for _ in range(2)]
-            sch = Scheduler(workers, enable_prefix_hash=True)
-            try:
-                captured = _capture_requests(sch)
-                sch.submit("abc", {})
-                await asyncio.sleep(0)
-                assert captured[0].prefix_hash == _compute_prefix_hash("abc")
-                assert captured[0].strict is False
-            finally:
-                await sch.shutdown()
+            sch = _scheduler(2)
+            captured = _capture_requests(sch)
+            sch.submit("abc", {})
+            await asyncio.sleep(0)
+            assert captured[0].key == _compute_prefix_hash("abc")
+            assert captured[0].sticky is False
+            await sch.shutdown()
 
         asyncio.run(run())
 
-    def test_strict_flag_propagates_to_request(self):
+    def test_no_key_without_prefix_routing(self):
         async def run() -> None:
-            workers = [MagicMock() for _ in range(2)]
-            sch = Scheduler(workers)
-            try:
-                captured = _capture_requests(sch)
-                sch.submit("p", {}, routing_key="k", strict=True)
-                await asyncio.sleep(0)
-                assert captured[0].strict is True
-                assert captured[0].prefix_hash == hash("k")
-            finally:
-                await sch.shutdown()
+            sch = _scheduler(2, prefix_routing=False)
+            captured = _capture_requests(sch)
+            sch.submit("abc", {})
+            await asyncio.sleep(0)
+            assert captured[0].key is None
+            await sch.shutdown()
 
         asyncio.run(run())
 
-    def test_per_request_keys_produce_independent_hashes(self):
-        """Different routing keys on different prompts each produce their own
-        prefix_hash so the scheduler can spread them across replicas."""
-
+    def test_strict_flag_makes_request_sticky(self):
         async def run() -> None:
-            workers = [MagicMock() for _ in range(2)]
-            sch = Scheduler(workers)
-            try:
-                captured = _capture_requests(sch)
-                for prompt, key in zip(["a", "b", "c"], ["k0", "k1", "k0"]):
-                    sch.submit(prompt, {}, routing_key=key)
-                await asyncio.sleep(0)
-                assert [r.prefix_hash for r in captured] == [
-                    hash("k0"), hash("k1"), hash("k0"),
-                ]
-            finally:
-                await sch.shutdown()
+            sch = _scheduler(2)
+            captured = _capture_requests(sch)
+            sch.submit("p", {}, strict=True)
+            await asyncio.sleep(0)
+            assert captured[0].sticky is True
+            assert captured[0].key == _compute_prefix_hash("p")
+            await sch.shutdown()
 
         asyncio.run(run())
 
     def test_submit_batch_accepts_per_prompt_sampling_params(self):
         async def run() -> None:
-            workers = [MagicMock() for _ in range(2)]
-            sch = Scheduler(workers)
+            sch = _scheduler(2)
             submitted = []
 
             def fake_submit(prompt, sampling_params, routing_key=None, strict=False):
@@ -394,15 +220,13 @@ class TestSchedulerRoutingKey:
                 return future
 
             sch.submit = fake_submit  # type: ignore[method-assign]
-            try:
-                result = await sch.submit_batch(
-                    ["a", "b"],
-                    [{"max_tokens": 1}, None],
-                    routing_key=["k0", None],
-                    strict=True,
-                )
-            finally:
-                await sch.shutdown()
+            result = await sch.submit_batch(
+                ["a", "b"],
+                [{"max_tokens": 1}, None],
+                routing_key=["k0", None],
+                strict=True,
+            )
+            await sch.shutdown()
 
             assert result == [{"text": "a"}, {"text": "b"}]
             assert submitted == [
@@ -412,55 +236,98 @@ class TestSchedulerRoutingKey:
 
         asyncio.run(run())
 
-    def test_group_affinity_is_enabled_by_default(self):
-        workers = [MagicMock() for _ in range(2)]
-        sch = Scheduler(workers)
-        try:
-            assert sch._group_affinity_enabled is True
-        finally:
-            asyncio.run(sch.shutdown())
 
-    def test_group_affinity_assigns_key_to_least_loaded_worker_once(self):
-        workers = [MagicMock() for _ in range(3)]
-        sch = Scheduler(workers)
-        try:
-            sch._workers[0].active_requests = 10
-            req = _make_request(prefix_hash=hash("group"), routing_key="group")
+# ---------------------------------------------------------------------------
+# Dispatch and the waiting queues
+# ---------------------------------------------------------------------------
 
-            assigned = sch._group_affinity_routing(req)
-            assert assigned == 1
+class _Worker:
+    """A worker handle whose generate calls finish when the test resolves them."""
 
-            sch._workers[1].active_requests = sch._workers[1].concurrency_limit
-            assert sch._group_affinity_routing(req) == assigned
-        finally:
-            asyncio.run(sch.shutdown())
+    def __init__(self) -> None:
+        self.calls: list[asyncio.Future] = []
+        self.generate = MagicMock()
+        self.generate.remote = self._remote
 
-    def test_group_affinity_spreads_idle_new_keys(self):
-        workers = [MagicMock() for _ in range(3)]
-        sch = Scheduler(workers)
-        try:
-            assigned = [
-                sch._group_affinity_routing(
-                    _make_request(prefix_hash=hash(f"group-{idx}"), routing_key=f"group-{idx}")
-                )
-                for idx in range(6)
-            ]
+    def _remote(self, prompt, sampling_params):
+        future = asyncio.get_running_loop().create_future()
+        self.calls.append(future)
+        return MagicMock(as_future=lambda: future)
 
-            assert assigned == [0, 1, 2, 0, 1, 2]
-        finally:
-            asyncio.run(sch.shutdown())
 
-    def test_group_affinity_reassigns_unavailable_worker(self):
-        workers = [MagicMock() for _ in range(3)]
-        sch = Scheduler(workers)
-        try:
-            req = _make_request(prefix_hash=hash("group"), routing_key="group")
-            assigned = sch._group_affinity_routing(req)
+async def _settle() -> None:
+    for _ in range(3):
+        await asyncio.sleep(0)
 
-            sch._workers[assigned].available = False
-            reassigned = sch._group_affinity_routing(req)
 
-            assert reassigned != assigned
-            assert sch._workers[reassigned].available
-        finally:
-            asyncio.run(sch.shutdown())
+class TestDispatch:
+    def test_completion_sends_next_waiting_request_to_freed_worker(self):
+        async def run() -> None:
+            workers = [_Worker(), _Worker()]
+            sch = Scheduler(workers, capacity=1)  # backlog 2 per worker
+            futures = [sch.submit(f"p{i}", {}) for i in range(5)]
+            assert [len(w.calls) for w in workers] == [2, 2]
+            workers[1].calls[0].set_result({"text": "done"})
+            await _settle()
+            assert sum(f.done() for f in futures) == 1
+            assert [len(w.calls) for w in workers] == [2, 3]
+            await sch.shutdown()
+
+        asyncio.run(run())
+
+    def test_sticky_request_on_full_worker_does_not_block_others(self):
+        async def run() -> None:
+            workers = [_Worker(), _Worker()]
+            sch = Scheduler(workers, capacity=1)
+            for _ in range(3):
+                sch.submit("turn", {}, routing_key="k")
+            hot = sch._keys["k"]
+            cold = 1 - hot
+            assert len(workers[hot].calls) == 2 and len(sch._workers[hot].waiting) == 1
+            sch.submit("other", {})
+            assert len(workers[cold].calls) == 1
+            workers[hot].calls[0].set_result({"text": "done"})
+            await _settle()
+            assert len(workers[hot].calls) == 3 and not sch._workers[hot].waiting
+            await sch.shutdown()
+
+        asyncio.run(run())
+
+    def test_send_that_raises_fails_only_that_request(self):
+        async def run() -> None:
+            worker = _Worker()
+            worker.generate.remote = MagicMock(side_effect=RuntimeError("send failed"))
+            sch = Scheduler([worker], capacity=4)
+            with pytest.raises(RuntimeError, match="send failed"):
+                await asyncio.wait_for(sch.submit("p", {}), 1.0)
+            assert sch._workers[0].active_requests == 0
+            await sch.shutdown()
+
+        asyncio.run(run())
+
+    def test_failed_generate_fails_the_request(self):
+        async def run() -> None:
+            worker = _Worker()
+            sch = Scheduler([worker], capacity=4)
+            future = sch.submit("p", {})
+            worker.calls[0].set_exception(ValueError("engine error"))
+            with pytest.raises(ValueError, match="engine error"):
+                await asyncio.wait_for(future, 1.0)
+            assert sch._workers[0].active_requests == 0
+            await sch.shutdown()
+
+        asyncio.run(run())
+
+    def test_cancel_worker_inflight_fails_its_requests(self):
+        async def run() -> None:
+            worker = _Worker()
+            sch = Scheduler([worker], capacity=4)
+            futures = [sch.submit(f"p{i}", {}) for i in range(2)]
+            assert sch.cancel_worker_inflight(0) == 2
+            for future in futures:
+                with pytest.raises(RuntimeError, match="cancelled for weight update"):
+                    await asyncio.wait_for(future, 1.0)
+            assert sch._workers[0].active_requests == 0
+            await sch.shutdown()
+
+        asyncio.run(run())

@@ -47,6 +47,14 @@ Each rollout runs in its own sandbox (`HARBOR_ENV=snowflake`, the default). `HAR
 - `base_image`: the image each task's `environment/Dockerfile` is replayed on, in place of its `FROM` image. The sandbox catalog image `sandbox-base` is Chainguard Linux with Python 3.11, pip, git, and `apk`, but no `apt-get`, so the Dockerfile's steps must work there. Replay handles one `FROM` stage with `RUN`, `COPY` and `ADD` of local files, `ENV`, `ARG`, `WORKDIR`, `USER`, and `ENTRYPOINT`. It refuses `RUN` flags, `COPY --from`, `ADD` from a URL or of an archive, and `SHELL`, and docker-compose tasks aren't supported.
 - `egress_eai`: a comma-separated list of external access integrations the sandboxes may use. Without one, sandboxes reach Snowflake and public package registries but not GitHub or other hosts.
 
+`HARBOR_VERIFIER_ENV` is a JSON object of strings added to every task's `[verifier.env]`, like `harbor run --ve`. A `${VAR}` value is filled in from the driver's environment when each rollout is graded, so a key can be referenced without writing it into the config. For example, tasks graded by `harbor-rewardkit` can use Claude on Cortex through its OpenAI-compatible endpoint. Sandboxes reach your account's host without an `egress_eai`; `LITELLM_LOCAL_MODEL_COST_MAP` keeps the judge from trying to download its price list from GitHub, which they can't reach:
+
+```bash
+export HARBOR_VERIFIER_ENV='{"REWARDKIT_JUDGE": "openai/claude-sonnet-4-6",
+  "OPENAI_API_BASE": "https://<account host>/api/v2/cortex/v1", "OPENAI_API_KEY": "${ARCTIC_CORTEX_PAT}",
+  "LITELLM_LOCAL_MODEL_COST_MAP": "True"}'
+```
+
 A run makes one pass over the training tasks, so it trains for at most (number of tasks) / `BATCH_SIZE` steps, whatever `trainer.max_training_steps` says, and then ends with `Training done!`: 100 tasks at the default 8 per step give 12 steps. Append `trainer.epochs=N` to pass over them `N` times.
 
 To stop a run, press Ctrl-C or send the launcher `SIGTERM`. The driver cancels its Cortex jobs at once, then takes up to 2 minutes to stop the rollouts in flight and terminate their sandboxes. A driver killed with `kill -9` can't cancel them: they keep their GPUs until the server reclaims them after 30 idle minutes, unless you cancel them first with `cortex-training cancel`.
@@ -146,6 +154,7 @@ Every harness setting, sandbox backend, model, and RL hyperparameter in `recipes
 | **Agent system prompt** | `OPENHANDS_SYSTEM_PROMPT_FILE` | built-in prompt | `~/prompts/custom_agent.j2` |
 | **Harbor agent class** | `HARBOR_AGENT` | `harbor_rl.agent:OpenHandsHarborAgent` | `my_pkg:MyAgent` (a driver-side `BaseAgent`; see [Where Rollouts Run](#where-rollouts-run)) |
 | **Harbor environment (`--env`)** | `HARBOR_ENV` / `HARBOR_ENV_KWARGS` | `snowflake` / — | `host` (trusted tasks only) |
+| **Verifier env (`--ve`)** | `HARBOR_VERIFIER_ENV` | — | `{"JUDGE_CONCURRENCY": "4"}` |
 | **Base model** | `MODEL` | `Qwen/Qwen3.5-4B` | — |
 | **GPU allocation (train / sample)** | `NUM_TRAIN_GPUS` / `NUM_SAMPLING_ENGINES` | `4` / `4` | `8` / `8` |
 | **Rollout concurrency** | `BATCH_SIZE` $\times$ `N_ROLLOUTS` | `8` $\times$ `8` (`64`/step) | `16` $\times$ `8` (`128`/step) |
