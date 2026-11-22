@@ -653,6 +653,7 @@ def _result_from_output(
     request_id: str | None = None,
     replica_label: str | None = None,
     return_back_router_info: bool = False,
+    forced_route_start: int | None = None,
 ) -> dict[str, Any]:
     if not final_output or not final_output.outputs:
         return {
@@ -721,13 +722,15 @@ def _result_from_output(
         request_id=request_id,
         replica_label=replica_label,
         return_back_router_info=return_back_router_info,
+        forced_route_start=forced_route_start,
     )
     return result
 
 
-def _forced_route_tail(prefix: Any, block_size: int, blocks: int) -> dict[str, Any] | None:
-    """The trailing partial block and, when requested, the preceding block; None when a hit can cover the capture."""
-    start = max(prefix.shape[0] // block_size - blocks + 1, 0) * block_size
+def _forced_route_rows(prefix: Any, block_size: int, blocks: int, whole: bool) -> dict[str, Any] | None:
+    """Every stored row when ``whole`` (no KV left to hit), else the trailing partial block and, when requested, the
+    preceding block; None when a hit can cover the capture."""
+    start = 0 if whole else max(prefix.shape[0] // block_size - blocks + 1, 0) * block_size
     if start == prefix.shape[0]:
         return None
     rows = prefix[start:].cpu().numpy()
@@ -745,6 +748,7 @@ def _maybe_cache_routed_experts(
     request_id: str | None,
     replica_label: str | None,
     return_back_router_info: bool,
+    forced_route_start: int | None = None,
 ) -> None:
     if cache_tx is None or sample_id is None:
         return
@@ -784,6 +788,12 @@ def _maybe_cache_routed_experts(
 
             prefix_len = int(prefix.shape[0])
             routed = torch.cat([prefix, torch.as_tensor(routed[prefix_len:]).to(prefix.device, prefix.dtype)])
+    # Spliced positions the engine recomputed without the stored ids (a hit below the rows it was sent): later tokens
+    # read state the record does not describe there.
+    hit = int(result["prefix_cache_len"])
+    rerouted_end = prefix_len if forced_route_start is None else min(forced_route_start, prefix_len)
+    # A preempted request re-executes its own positions afresh, and vLLM keeps the routes it already emitted.
+    stats = getattr(final_output, "metrics", None)  # None when the engine logs no request stats
     cache_key = replay_id or sample_id
     if replay_id is not None and replay_id.startswith("rr1:"):
         cache_tx.put_new(cache_key, routed)
@@ -799,6 +809,8 @@ def _maybe_cache_routed_experts(
         "generation_len": generation_len,
         "capture_len": capture_len,
         "prefix_len": prefix_len,
+        "rerouted_ranges": [[hit, rerouted_end]] if hit < rerouted_end else [],
+        "preemptions": None if stats is None else stats.num_preemptions,
     }
     if return_back_router_info:
         tensor = routed.detach().cpu() if hasattr(routed, "detach") else routed
@@ -908,6 +920,8 @@ class InferenceWorker(StreamingWorkerMixin):
         self._chat_model: ChatModel | None = None
         self._router_replay_tx: Any = None
         self._forced_route_blocks: tuple[int, int] | None = None
+        # time.monotonic() after the last call that may have emptied the engine's prefix cache.
+        self._prefix_cache_reset_at = 0.0
         self._router_replay_tx_on_host = False
         self._router_replay_staging_bytes: int | None = None
         self._router_replay_group: Any = None
@@ -1455,14 +1469,18 @@ class InferenceWorker(StreamingWorkerMixin):
             raise ValueError(f"{_REPLAY_ID_PARAM_KEY} requires {_SAMPLE_ID_PARAM_KEY}")
         if prefix_replay_id is not None and replay_id is None:
             raise ValueError(f"{_REPLAY_PREFIX_ID_PARAM_KEY} requires {_REPLAY_ID_PARAM_KEY}")
+        forced = None
         if prefix_replay_id is not None and self._forced_route_blocks is not None:
             # The splice reads the capture again at completion, so nothing holds it while the request runs.
             try:
-                tail = _forced_route_tail(self._router_replay_tx.get(prefix_replay_id), *self._forced_route_blocks)
+                prefix = self._router_replay_tx.get(prefix_replay_id)
+                # A reset since the capture was stored left none of its KV to hit: every stored row may be recomputed.
+                whole = self._router_replay_tx.created_at(prefix_replay_id) < self._prefix_cache_reset_at
+                forced = _forced_route_rows(prefix, *self._forced_route_blocks, whole)
             except KeyError:  # another replica served the earlier request, or the cache evicted it
-                tail = None
-            if tail is not None:
-                sampling_params["extra_args"] = {**sampling_params.get("extra_args", {}), FORCED_ROUTES_KEY: tail}
+                pass
+            if forced is not None:
+                sampling_params["extra_args"] = {**sampling_params.get("extra_args", {}), FORCED_ROUTES_KEY: forced}
         return_back_router_info = bool(
             sampling_params.pop(_ROUTER_REPLAY_RETURN_INFO_PARAM_KEY, False)
         )
@@ -1512,6 +1530,7 @@ class InferenceWorker(StreamingWorkerMixin):
             request_id=request_id,
             replica_label=self._replica_label,
             return_back_router_info=return_back_router_info,
+            forced_route_start=None if forced is None else forced["start"],
         )
         if self._return_reasoning_content:
             self._apply_reasoning_parser(result, reasoning_ended=reasoning_ended)
@@ -1678,6 +1697,7 @@ class InferenceWorker(StreamingWorkerMixin):
         ):
             raise RuntimeError(f"Cannot sleep: worker state is {self.state.value}")
         await self.llm.collective_rpc("sleep", kwargs={"level": level})
+        self._prefix_cache_reset_at = time.monotonic()
         self.state = WorkerLifecycleState.SLEEPING
         logger.info("Worker %d sleeping (level=%d)", os.getpid(), level)
         return {"status": "sleeping", "level": level}
@@ -1761,6 +1781,8 @@ class InferenceWorker(StreamingWorkerMixin):
         if self.state != WorkerLifecycleState.READY or self.llm is None:
             return {"status": "skipped", "reason": f"state={self.state.value}"}
         await self.llm.pause_generation(mode=mode, clear_cache=clear_cache)
+        if clear_cache:
+            self._prefix_cache_reset_at = time.monotonic()
         self._stream_engine_paused = True
         logger.info(
             "Worker %d pause_generation(mode=%s, clear_cache=%s)",
@@ -1806,6 +1828,7 @@ class InferenceWorker(StreamingWorkerMixin):
         while True:
             attempts += 1
             reset_ok = bool(await self.llm.reset_prefix_cache())
+            self._prefix_cache_reset_at = time.monotonic()
             logger.info(
                 "Worker %d reset prefix cache: ok=%s attempts=%d",
                 os.getpid(),

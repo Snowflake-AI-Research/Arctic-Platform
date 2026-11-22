@@ -215,6 +215,11 @@ class _RouterReplayCacheBase:
             self._last_touched[sample_id] = time.monotonic()
             return tensor
 
+    def created_at(self, sample_id: str) -> float:
+        """``time.monotonic()`` when the entry was first stored; raises KeyError if absent."""
+        with self._lock:
+            return self._created_at[sample_id]
+
     def discard(self, sample_ids: Iterable[str]) -> int:
         """Remove listed sample_ids (missing ids ignored); return count removed.
 

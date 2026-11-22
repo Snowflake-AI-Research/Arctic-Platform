@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Replay the stored experts on the part of a continuation's bounded tail that Model Runner V2 recomputes."""
+"""Replay the stored experts on the positions of a continuation's sent rows that Model Runner V2 recomputes."""
 
 from __future__ import annotations
 
@@ -84,6 +84,9 @@ class ForcedRoutes:
             self.ids[at : at + len(stored)].copy_(torch.from_numpy(stored.astype(np.int32)), non_blocking=True)
             self.mask[at : at + len(stored)] = True
             self.forcing = True
+        # Prefill has passed these stored rows; a preempted request is added again with them.
+        for i in np.flatnonzero((end > 0) & (num_computed + np.diff(qsl) >= end)):
+            self.remove(idx_mapping[i])
 
 
 def bind_router(router: Any, layer_id: int, forced: ForcedRoutes) -> None:

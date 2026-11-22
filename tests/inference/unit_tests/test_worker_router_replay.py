@@ -17,6 +17,7 @@ from arctic_platform.inference.server.worker import (
     _result_from_output,
 )
 from arctic_platform.inference.vllm.forced_routes import FORCED_ROUTES_KEY
+from vllm.v1.metrics.stats import RequestStateStats
 
 
 class _Cache:
@@ -159,7 +160,7 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
     worker._forced_route_blocks = (2, 2)
     engine_params = []
 
-    def generate(prompt, tokens, routes, replay_id, **extra_args):
+    def generate(prompt, tokens, routes, replay_id, *, metrics=None, **extra_args):
         async def fake_generate_once(_prompt, params, _request_id, **_kwargs):
             engine_params.append(params)
             # vLLM returns one numpy row per captured position.
@@ -171,6 +172,7 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
                 num_cached_tokens=0,
                 prompt_logprobs=None,
                 routed_experts=routed,
+                metrics=metrics,
             )
 
         worker._generate_once = fake_generate_once
@@ -186,6 +188,8 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
     )
     assert cached("rr1:turn-2") == [10, 11, 12, 13, 24, 25, 26]
     assert (turn1["prefix_len"], turn2["prefix_len"], turn2["capture_len"]) == (0, 4, 7)
+    # Nothing was cached, so rows 0-1 ran on the engine's own routes under stored ones; no stats, no preemption count.
+    assert (turn2["rerouted_ranges"], turn2["preemptions"]) == ([[0, 2]], None)
     assert cached("rr1:turn-1") == [10, 11, 12, 13]  # read, never released: the caller owns its captures
     # The prefix id never reaches vLLM; the stored rows from the lowest block boundary the hit can stop at do.
     assert engine_params[-1].extra_args == {
@@ -197,6 +201,21 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
         [1, 2, 3, 4, 5], [6], [20, 21, 22, 23, 24], "rr1:aligned", dss_router_replay_prefix_id="rr1:turn-1"
     )
     assert engine_params[-1].extra_args is None and aligned["prefix_len"] == 4
+    assert aligned["rerouted_ranges"] == [[0, 4]]
+    # After the engine's prefix cache is reset, no KV of the capture is left to hit: every stored row is sent.
+    async def reset_prefix_cache():
+        return True
+
+    worker.llm = SimpleNamespace(reset_prefix_cache=reset_prefix_cache)
+    asyncio.run(worker.reset_prefix_cache())
+    after_reset = generate(
+        [1, 2, 3, 4, 5], [6], [20, 21, 22, 23, 24], "rr1:after-reset", dss_router_replay_prefix_id="rr1:turn-1",
+        metrics=RequestStateStats(num_preemptions=1),
+    )
+    assert engine_params[-1].extra_args == {
+        FORCED_ROUTES_KEY: {"start": 0, "dtype": "|u1", "rows": bytes([10, 10, 11, 11, 12, 12, 13, 13])}
+    }
+    assert (after_reset["rerouted_ranges"], after_reset["preemptions"]) == ([], 1)
 
     # Another replica served the previous request: the capture stays as the engine computed it.
     elsewhere = generate(
