@@ -56,14 +56,6 @@ class FlashMoeOptions(GenericMoeOptions):
             "forward plus backward takes 16-19% longer. FP8 experts reject it."
         ),
     )
-    row_invariant_projections: bool = Field(
-        False,
-        description=(
-            "Pad each covered projection call shorter than its row target to that target, so a token's projection "
-            "does not depend on how many rows share the call (debug/row_invariant_projection.py). Independent of "
-            "debug.full_determinism, and installs nothing else."
-        ),
-    )
 
 
 class _FlashLoadOptions(Qwen3_5MoeOptions):

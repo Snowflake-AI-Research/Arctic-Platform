@@ -388,11 +388,7 @@ def is_row_count_dependent(module: torch.nn.Module) -> bool:
 def row_invariant_projections_requested(training_config: Mapping[str, Any]) -> bool:
     """Whether this run asked for row-invariant projections.
 
-    The pad runs every covered projection at a taller row count than its call asked for, on every call. What it
-    buys -- a token's result not moving with the height of the batch it arrived in -- is requested by the loader
-    option ``row_invariant_projections`` on its own, or with everything else ``debug.full_determinism`` installs.
-    A step that asks for neither keeps the projection it had, and stays exposed to the deviation
-    ``docs/determinism.md`` measures.
+    The loader option enables the pad on its own. Full determinism also enables it.
     """
     return bool(training_config.get("row_invariant_projections", False)) or full_determinism_enabled(training_config)
 

@@ -780,12 +780,7 @@ def test_a_padded_router_sends_every_token_to_the_same_experts_at_every_row_coun
     )
 
 
-def test_the_pad_is_requested_only_by_a_determinism_run():
-    """A production recipe keeps the projection it had; the pad follows ``debug.full_determinism``.
-
-    The pad costs a taller call on every covered projection, so which runs pay for it is a decision worth
-    pinning here rather than leaving to a branch in the model loader.
-    """
+def test_without_a_loader_override_the_pad_follows_full_determinism():
     assert row_invariant_projections_requested({}) is False
     assert row_invariant_projections_requested({"debug": {}}) is False
     assert row_invariant_projections_requested({"debug": {"full_determinism": False}}) is False
@@ -810,21 +805,33 @@ def test_the_entry_point_patches_only_when_the_run_asked():
     assert "forward" in asked[0].__dict__
 
 
-def test_the_pad_is_a_loader_option_of_its_own_and_makes_a_packed_row_match_it_alone():
-    """``row_invariant_projections`` installs the pad without ``debug.full_determinism``, so without the fixed-order
-    expert combination that flag also installs, and a row then projects to the same bits alone and packed.
-    """
-    from arctic_platform.model.implementations.debug.determinism import full_determinism_enabled
-    from arctic_platform.model.loaders.flash_moe import FlashMoeOptions
+@pytest.mark.parametrize("loader", ["glm5_next", "generic_moe"])
+def test_the_pad_is_a_loader_option_of_its_own_and_makes_a_packed_row_match_it_alone(loader):
+    from arctic_platform.model.config import ModelSpec
+    from arctic_platform.model.config import ParallelismConfig
+    from arctic_platform.model.implementations.debug.token_combine import maybe_use_fixed_order_row_sum
     from arctic_platform.model.loaders.flash_moe import _FlashLoadOptions
+    from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+    from arctic_platform.testing_utils import set_seed
+    from arctic_platform.testing_utils import torch_assert_equal
 
-    FlashMoeOptions.model_validate({"row_invariant_projections": True})
-    options = _FlashLoadOptions.model_validate({"row_invariant_projections": True}).model_dump()
-    assert not full_determinism_enabled(options)
+    spec = ModelSpec(
+        loader=loader,
+        model_path_or_name="unused",
+        dtype="bfloat16",
+        parallelism=ParallelismConfig(expert_parallel=2),
+        loader_options={"row_invariant_projections": True},
+    )
+    schema = _FlashLoadOptions if loader == "glm5_next" else Qwen3_5MoeOptions
+    options = schema.model_validate(spec.loader_options).model_dump()
 
-    torch.manual_seed(0)
+    set_seed(0)
     projection = torch.nn.Linear(4096, 1024)
-    assert maybe_apply_row_invariant_projections(torch.nn.Sequential(projection), options, verify=False) == 1
+    assert maybe_use_fixed_order_row_sum(projection, options) == 0
+    patched = maybe_apply_row_invariant_projections(
+        projection, options, workspace_config=MEASURED_WORKSPACE, verify=False
+    )
+    assert patched == 1
     rows = torch.randn(3, 4096)
     with torch.no_grad():
-        assert torch.equal(projection(rows), projection(torch.cat([torch.randn(4, 4096), rows]))[4:])
+        torch_assert_equal(projection(rows[:1]).view(torch.int32), projection(rows)[:1].view(torch.int32))
