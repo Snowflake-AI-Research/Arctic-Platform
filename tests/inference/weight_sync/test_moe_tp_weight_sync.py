@@ -80,7 +80,7 @@ class _FakeBroadcastEngine:
     def __init__(self, items):
         self._items = items
 
-    def receive_weights(self):
+    def receive_weights(self, in_row_blocks=None):
         for name, tensor in self._items:
             yield name, tensor
 

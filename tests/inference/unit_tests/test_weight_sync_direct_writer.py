@@ -276,7 +276,7 @@ class _FakeEngine:
     def __init__(self, items):
         self._items = items
 
-    def receive_weights(self):
+    def receive_weights(self, in_row_blocks=None):
         yield from self._items
 
 
@@ -1197,3 +1197,164 @@ def test_load_batched_holds_one_rebuilt_oversized_tensor_at_a_time(monkeypatch):
 
     assert loaded == 4
     assert peaks == [8, 6, 6]
+
+
+class _TensorParallelExperts(nn.Module):
+    """One tensor-parallel rank of a fused MoE layer whose ``weight_loader`` does what vLLM's per-expert loader does:
+    narrow this rank's slice of one expert's w1, w3 or w2 and copy it into that expert's slot."""
+
+    def __init__(self, experts, inter, hidden, *, tp, rank, gated):
+        super().__init__()
+        self.tp, self.rank = tp, rank
+        self.moe_config = SimpleNamespace(is_act_and_mul=gated)
+        w13_rows = (2 if gated else 1) * inter // tp
+        self.w13_weight = nn.Parameter(torch.zeros(experts, w13_rows, hidden, dtype=torch.bfloat16))
+        self.w2_weight = nn.Parameter(torch.zeros(experts, hidden, inter // tp, dtype=torch.bfloat16))
+
+    def _map_global_expert_id_to_local_expert_id(self, expert_id):
+        return expert_id
+
+    def weight_loader(self, param, loaded, weight_name, shard_id, expert_id, return_success=False):
+        dim = 1 if shard_id == "w2" else 0
+        size = loaded.shape[dim] // self.tp
+        target = param.data[expert_id]
+        if shard_id != "w2":
+            target = target.narrow(0, size if shard_id == "w3" else 0, size)
+        target.copy_(loaded.narrow(dim, self.rank * size, size))
+        return True
+
+
+class _MoEModel(nn.Module):
+    def __init__(self, experts, inter, hidden, *, tp, rank, gated):
+        super().__init__()
+        self.embed = nn.Parameter(torch.zeros(12, hidden, dtype=torch.bfloat16))
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([nn.Module()])
+        self.model.layers[0].mlp = nn.Module()
+        experts = _TensorParallelExperts(experts, inter, hidden, tp=tp, rank=rank, gated=gated)
+        self.model.layers[0].mlp.experts = experts
+
+    def load_weights(self, weights):
+        for name, tensor in weights:
+            self.get_parameter(name).data.copy_(tensor)
+        return {name for name, _ in weights}
+
+
+def _bucketed_receiver(monkeypatch, weights, bucket_size):
+    """A receiving ``NCCLEngine`` fed, bucket by bucket, what the real sender packed from ``weights``."""
+    from arctic_platform.inference.server.weight_sync.engine import NCCLEngine
+
+    class Stream:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(torch.cuda, "Event", Stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: Stream())
+    engines = []
+    for is_sender in (True, False):
+        engine = NCCLEngine.__new__(NCCLEngine)
+        engine.is_sender, engine.device, engine.bucket_size = is_sender, torch.device("cpu"), bucket_size
+        engine._port, engine._nccl_stream = 0, Stream()
+        engine._data_bufs = [torch.zeros(bucket_size, dtype=torch.uint8) for _ in range(2)]
+        engines.append(engine)
+    sender, receiver = engines
+    buckets = []
+    sender._flush_bucket_send = lambda idx, meta, *, is_last, prev_idx: buckets.append(
+        (dict(tensors=[dict(entry) for entry in meta], is_last=is_last), sender._data_bufs[idx].clone())
+    )
+    sender.send_weights(weights)
+    metas = {}
+
+    def recv_pair(idx, stream):
+        metas[idx], data = buckets.pop(0)
+        receiver._data_bufs[idx].copy_(data)
+
+    receiver._recv_pair = recv_pair
+    receiver._parse_meta = metas.__getitem__
+    return receiver
+
+
+def _moe_weights(experts, inter, hidden, *, gated):
+    generator = torch.Generator().manual_seed(0)
+    shapes = {
+        "embed": (12, hidden),
+        "model.layers.0.mlp.experts.w13_weight": (experts, (2 if gated else 1) * inter, hidden),
+        "model.layers.0.mlp.experts.w2_weight": (experts, hidden, inter),
+    }
+    return [(name, torch.randn(shape, generator=generator).to(torch.bfloat16)) for name, shape in shapes.items()]
+
+
+@pytest.mark.parametrize("gated", [True, False])
+@pytest.mark.parametrize("rank", [0, 1])
+# bf16 [4, 8, 6] w13 is 4 rows of 96 B and [4, 6, 4] w2 4 rows of 48 B: chunks end on rows (96), mid-row (100),
+# mid-element (101), several chunks per row (7), or the bucket holds every tensor whole (1024).
+@pytest.mark.parametrize("bucket_size", [96, 100, 101, 7, 1024])
+def test_load_batched_places_fused_experts_received_in_row_blocks_exactly(monkeypatch, bucket_size, rank, gated):
+    experts, inter, hidden, tp = 4, 4, 6, 2
+    weights = _moe_weights(experts, inter, hidden, gated=gated)
+    model = _MoEModel(experts, inter, hidden, tp=tp, rank=rank, gated=gated)
+
+    loaded, recv_l2_sq, applied_l2_sq, mappings, skipped = WeightSyncExtension._load_batched(
+        SimpleNamespace(device=torch.device("cpu")), model, _bucketed_receiver(monkeypatch, weights, bucket_size)
+    )
+
+    embed, w13, w2 = (tensor for _, tensor in weights)
+    halves = w13.chunk(2, dim=1) if gated else (w13,)
+    expected_w13 = torch.cat([half.chunk(tp, dim=1)[rank] for half in halves], dim=1)
+    layer = model.model.layers[0].mlp.experts
+    assert torch.equal(model.embed, embed)
+    assert torch.equal(layer.w13_weight, expected_w13)
+    assert torch.equal(layer.w2_weight, w2.chunk(tp, dim=2)[rank])
+    assert loaded == 3 and skipped == []
+    assert sorted(mappings) == sorted(name for name, _ in weights)
+    whole = sum(_tensor_l2_sq(tensor) for _, tensor in weights).item()
+    assert recv_l2_sq == pytest.approx(whole, rel=1e-12) and applied_l2_sq == pytest.approx(whole, rel=1e-12)
+
+
+def test_load_batched_never_holds_a_whole_fused_moe_tensor(monkeypatch):
+    """No rank allocates a fused MoE tensor larger than the bucket: it is loaded as its chunks arrive.
+
+    GLM-5.3-Flash's [288, 4096, 4096] w13 is 9 GiB above a 2 GiB bucket; rebuilding it whole costs every sampler
+    rank 9 GiB at each sync while the rank keeps 1/TP of it. Here a 6 MiB bucket splits 4 MiB expert rows, so one
+    row is buffered; the checksum squares at most 2**20 elements in float64 at a time.
+    """
+    import weakref
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_leaves
+
+    class PeakAllocatedBytes(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.live = self.peak = 0
+            self.tracked: set[int] = set()
+
+        def _release(self, key, nbytes):
+            self.tracked.discard(key)
+            self.live -= nbytes
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            inputs = {id(t.untyped_storage()) for t in tree_leaves((args, kwargs)) if isinstance(t, torch.Tensor)}
+            for tensor in tree_leaves(out):
+                if isinstance(tensor, torch.Tensor) and id(tensor.untyped_storage()) not in inputs | self.tracked:
+                    storage = tensor.untyped_storage()
+                    self.tracked.add(id(storage))
+                    self.live += storage.nbytes()
+                    self.peak = max(self.peak, self.live)
+                    weakref.finalize(storage, self._release, id(storage), storage.nbytes())
+            return out
+
+    experts, inter, hidden = 16, 512, 2048
+    weights = _moe_weights(experts, inter, hidden, gated=True)
+    model = _MoEModel(experts, inter, hidden, tp=8, rank=3, gated=True)
+    receiver = _bucketed_receiver(monkeypatch, weights, 6 << 20)
+    w13 = weights[1][1]
+
+    with PeakAllocatedBytes() as allocated:
+        WeightSyncExtension._load_batched(SimpleNamespace(device=torch.device("cpu")), model, receiver)
+
+    row, checksum = w13[0].nbytes, 2 * 8 * (1 << 20)  # one buffered expert row; a float64 copy and square
+    assert w13.nbytes == 16 * row == 64 << 20
+    assert allocated.peak - row - checksum < 1024  # and a few scalars
+

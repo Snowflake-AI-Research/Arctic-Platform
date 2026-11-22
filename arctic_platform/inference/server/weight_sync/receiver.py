@@ -676,9 +676,11 @@ class WeightSyncExtension:
     ) -> tuple[int, float, float, dict[str, list[str]], list[str]]:
         """Batched path for TP>1 models (including FP8+TP>1) and HF-named sync.
 
-        Each received tensor is a full (un-sharded) weight.  Most params are
-        handed to ``model.load_weights``, which does TP slicing, HF ->
-        vLLM-internal name/shape conversion, and quantization.
+        Each received tensor is a full (un-sharded) weight, except that a fused
+        MoE tensor larger than the bucket arrives in consecutive blocks of whole
+        experts, so no rank allocates it whole.  Most params are handed to
+        ``model.load_weights``, which does TP slicing, HF -> vLLM-internal
+        name/shape conversion, and quantization.
 
         The vLLM-*fused* families that ``model.load_weights`` cannot place when
         fed already-fused names (Gated DeltaNet ``in_proj_qkvz``/``in_proj_ba``
@@ -696,7 +698,6 @@ class WeightSyncExtension:
 
         writer = _ShardAwareFusedWriter(model, self.device)
         duplicating_mappers = _shard_duplicating_mappers(model)
-        loaded = 0
         source_to_destinations: dict[str, list[str]] = {}
         skipped_source_names: list[str] = []
         param_names = {pname for pname, _ in model.named_parameters()}
@@ -704,13 +705,16 @@ class WeightSyncExtension:
         applied_source_l2_sq = torch.zeros(
             (), dtype=torch.float64, device=self.device
         )
-        for name, tensor in engine.receive_weights():
+        rows_received: dict[str, int] = {}
+        for name, tensor in engine.receive_weights(writer.loads_row_blocks):
             source_l2_sq = _tensor_l2_sq(tensor)
             recv_l2_sq.add_(source_l2_sq)
             destination = writer.destination_name(name)
             copies = 1
             if destination is not None:
-                writer.feed(name, tensor)
+                first_row = rows_received.get(name, 0)
+                rows_received[name] = first_row + tensor.shape[0]
+                writer.feed(name, tensor, first_row)
                 destinations = [destination]
             else:
                 copies = _loaded_copies(duplicating_mappers, name)
@@ -725,8 +729,8 @@ class WeightSyncExtension:
                 applied_source_l2_sq.add_(source_l2_sq * copies)
             else:
                 skipped_source_names.append(name)
-            loaded += 1
             del tensor  # a rebuilt oversized tensor must not outlive its load
+        loaded = len(source_to_destinations) + len(skipped_source_names)
         if skipped_source_names:
             logger.warning(
                 "Weight sync skipped %d/%d received source tensor(s) because "

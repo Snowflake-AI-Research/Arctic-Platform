@@ -729,8 +729,16 @@ class _ShardAwareFusedWriter:
         handler = self._handler_for(name)
         return handler["destination"] if handler is not None else None
 
-    def feed(self, name: str, tensor: torch.Tensor) -> bool:
+    def loads_row_blocks(self, name: str) -> bool:
+        """Whether :meth:`feed` can take *name* in blocks of whole experts (see ``first_row``)."""
+        handler = self._handler_for(name)
+        return handler is not None and handler["family"] in ("moe_w13", "moe_w2")
+
+    def feed(self, name: str, tensor: torch.Tensor, first_row: int = 0) -> bool:
         """Load one received *full* (un-sharded) fused tensor into its param.
+
+        A fused MoE tensor may instead come in blocks of whole experts, *tensor*
+        holding experts ``first_row`` onward.
 
         Returns ``True`` if this writer handled *name* (a fused family), or
         ``False`` if the caller should fall back to ``model.load_weights``.
@@ -780,28 +788,28 @@ class _ShardAwareFusedWriter:
             gated = True if moe_config is None else bool(
                 getattr(moe_config, "is_act_and_mul", True)
             )
-            for expert_id in range(tensor.shape[0]):
+            for expert_id, expert in enumerate(tensor, start=first_row):
                 if gated:
-                    inter = tensor.shape[1] // 2
+                    inter = expert.shape[0] // 2
                     module.weight_loader(
-                        param, tensor[expert_id, :inter, :],
+                        param, expert[:inter, :],
                         "w13_weight", "w1", expert_id, return_success=True,
                     )
                     module.weight_loader(
-                        param, tensor[expert_id, inter:, :],
+                        param, expert[inter:, :],
                         "w13_weight", "w3", expert_id, return_success=True,
                     )
                 else:
                     module.weight_loader(
-                        param, tensor[expert_id],
+                        param, expert,
                         "w13_weight", "w1", expert_id, return_success=True,
                     )
             return True
 
         if family == "moe_w2":
-            for expert_id in range(tensor.shape[0]):
+            for expert_id, expert in enumerate(tensor, start=first_row):
                 module.weight_loader(
-                    param, tensor[expert_id],
+                    param, expert,
                     "w2_weight", "w2", expert_id, return_success=True,
                 )
             return True

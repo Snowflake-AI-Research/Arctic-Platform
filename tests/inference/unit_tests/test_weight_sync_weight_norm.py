@@ -325,7 +325,7 @@ class _Engine:
     def __init__(self, weights):
         self._weights = weights
 
-    def receive_weights(self):
+    def receive_weights(self, in_row_blocks=None):
         yield from self._weights
 
 
