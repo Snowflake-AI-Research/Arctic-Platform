@@ -19,6 +19,8 @@ from uuid import uuid4
 
 import ray
 
+from arctic_platform.debug.weight_sync import maybe_collect_broadcast_verification
+
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
 from arctic_platform.inference.server.chat import ChatModel, resolve_chat_model
 from arctic_platform.inference.server.metrics import RingStatLogger, get_collector
@@ -676,6 +678,13 @@ def _result_from_output(
         "generation_len": len(choice.token_ids),
         "prefix_cache_len": int(num_cached) if num_cached is not None else 0,
     }
+    stats = getattr(final_output, "metrics", None)
+    if stats is not None:
+        # Same-host engine timestamps are monotonic; unset phases are 0.0.
+        offset = time.time() - time.monotonic()
+        for key in ("queued_ts", "scheduled_ts", "first_token_ts", "last_token_ts"):
+            if (value := getattr(stats, key)) > 0:
+                result[key] = value + offset
 
     spec = getattr(choice, "spec_decode_metrics", None)
     if spec is not None:
@@ -1067,7 +1076,7 @@ class InferenceWorker(StreamingWorkerMixin):
                 )
                 self._register_router_replay_shm(attempt_kwargs, vllm_config, model_id)
                 if semi_p:
-                    from arctic_platform.inference.server.semip_asyncllm import restore_and_attach
+                    from arctic_platform.inference.server.semip_frontend import restore_and_attach
                     self.llm = await restore_and_attach(engine_kwargs, semi_p_agents, vllm_config)
                 else:
                     self.llm = AsyncLLM.from_vllm_config(
@@ -1514,22 +1523,6 @@ class InferenceWorker(StreamingWorkerMixin):
     def get_state(self) -> str:
         return self.state.value
 
-    def get_stats(self) -> dict[str, Any]:
-        """Return the latest scheduler stats, plus liveness metadata.
-
-        Used by the per-replica concurrency-adjust loop in
-        :class:`arctic_platform.inference.server.scheduler.Scheduler`. The keys
-        ``gpu_cache_usage`` / ``num_requests_running`` /
-        ``num_requests_waiting`` are read by the scheduler to drive the
-        ``utilization_based_concurrency`` heuristic.
-        """
-        latest = get_collector().latest()
-        return {
-            "state": self.state.value,
-            "pid": os.getpid(),
-            **latest,
-        }
-
     def drain_metrics(self) -> dict[str, Any]:
         """Drain snapshots and return lifetime counters without resetting them."""
         from arctic_platform.inference.server.action_mask_replay import (
@@ -1543,6 +1536,9 @@ class InferenceWorker(StreamingWorkerMixin):
             "spec_decoding": get_collector().spec_decoding_totals(),
             "action_mask_replay_cache": action_mask_replay_cache_stats(),
         }
+
+    def num_waiting_reqs(self) -> int:
+        return get_collector().num_waiting_reqs
 
     def set_replica_id(self, replica_id: int) -> None:
         """Tell this worker its position in the replica pool so that the
@@ -1741,6 +1737,16 @@ class InferenceWorker(StreamingWorkerMixin):
         )
         return {"status": "paused", "mode": mode, "clear_cache": clear_cache}
 
+    async def freeze_generation(self) -> dict[str, Any]:
+        """Hold in-flight requests in place; unlike pause_generation, streams stay open
+        and new ones queue. An engine that is already paused is left to its pauser."""
+        if self.state != WorkerLifecycleState.READY or self.llm is None:
+            return {"status": "skipped", "reason": f"state={self.state.value}"}
+        if await self.llm.is_paused():
+            return {"status": "skipped", "reason": "already paused"}
+        await self.llm.pause_generation(mode="keep", clear_cache=False)
+        return {"status": "frozen"}
+
     async def resume_generation(self) -> dict[str, Any]:
         if self.state != WorkerLifecycleState.READY or self.llm is None:
             return {"status": "skipped", "reason": f"state={self.state.value}"}
@@ -1824,6 +1830,7 @@ class InferenceWorker(StreamingWorkerMixin):
             args=(master_addr, master_port, rank_offset, world_size,
                   bucket_size, engine_only, weight_format),
         )
+        results = maybe_collect_broadcast_verification(results, engine_only=engine_only, llm=self.llm, rank_offset=rank_offset)
         if not results:
             return {}
         from arctic_platform.inference import envs
@@ -1873,6 +1880,7 @@ class InferenceWorker(StreamingWorkerMixin):
                   lora_int_id, lora_name, lora_config, bucket_size,
                   engine_only, staging, evict_first),
         )
+        results = maybe_collect_broadcast_verification(results, engine_only=engine_only, llm=self.llm, rank_offset=rank_offset)
         if not engine_only:
             self._active_lora_int_id = lora_int_id
             self._active_lora_name = lora_name

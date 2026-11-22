@@ -18,13 +18,19 @@
 Each cell runs ``concurrency`` closed-loop threads, each sending single-prompt
 greedy requests with ``ignore_eos`` so every request generates exactly
 ``output`` tokens. Prompts are token ids varied per request, so prefix caching
-and prefix-affinity routing cannot favour one side. Cells alternate between the
-two jobs so drift over the run affects both alike.
+and prefix-affinity routing cannot favour one side.
 
 A semi_p generate returns its result in one piece, so streaming time-to-first-
 token is not observable from the client. TTFT is measured instead as the server
 latency of a ``max_tokens=1`` request, and TPOT as the extra server latency per
 token of a long request over that, on both jobs the same way.
+
+Each job is measured on its own as soon as it runs (``measure``), so it can be
+cancelled without waiting for the other to start, and the comparison is made
+from the stored measurements afterwards (``combine``). A grid cell over the
+latency limit counts up to ``remeasure`` repeats on every side; a job measured
+before the semi_p / plain pair is complete measures them all, since it cannot
+tell yet which cells will need them.
 
 Throughput is gated on the engine, not the client. Every request costs a
 submit, a poll and a status fetch through the API (~250 ms against a 0.1-0.5 s
@@ -154,72 +160,127 @@ def _compare(rows: list[dict], lat: dict, sa: str, sb: str) -> dict:
     }
 
 
-def run(make_client: Callable[[], Any], pair: Pair, settings: dict | None = None,
-        thresholds: dict | None = None, matched: str | None = None) -> dict:
-    """Gate semi_p (``pair.on``) against stock plain (``pair.off``). With a
-    ``matched`` job (plain with semi_p's collective setup) on the same grid, the
-    gap also splits into the cost of those settings (matched / stock) and the
-    cost of semi_p itself (semi_p / matched), and a check semi_p fails only
-    against stock plain passes (``_pass_on_matched``)."""
+def measurements_used(on: list[dict], off: list[dict], limit: float, remeasure: int) -> int | None:
+    """How many measurements of a grid cell count: the first, and one more while
+    the median semi_p / plain server p50 so far is over ``limit``, up to
+    ``remeasure`` more. None while ``on`` or ``off`` holds too few to tell."""
+    n = 1
+    while n <= remeasure:
+        if len(on) < n or len(off) < n:
+            return None
+        if ratio(_median_p50(on[:n]), _median_p50(off[:n])) <= limit:
+            return n
+        n += 1
+    return n
+
+
+def _median_p50(cells: list[dict]) -> float:
+    return sorted(cells, key=lambda c: c["server_p50"])[(len(cells) - 1) // 2]["server_p50"]
+
+
+def measure(make_client: Callable[[], Any], job_id: str, replicas: int, max_seq_len: int,
+            settings: dict | None = None, thresholds: dict | None = None, side: str = "on",
+            grids: dict[str, dict] | None = None, stop: threading.Event | None = None) -> dict | None:
+    """Everything perf measures on one job, alone, so it can be cancelled before
+    the jobs it is compared with are up: the grid, then the concurrency-1
+    latency cells. The grid is measured once, then up to ``remeasure`` more
+    times with fresh prompts. ``grids`` (side -> cell -> measurements) is shared
+    by the jobs of one run and filled in as they go: a repeat is skipped once
+    the semi_p and plain measurements there show ``combine`` will not use it,
+    and taken while they cannot tell yet. None if ``stop`` is set first."""
     cfg = {**DEFAULTS, **(settings or {})}
     th = {**THRESHOLD_DEFAULTS, **(thresholds or {})}
-    shapes = fit_shapes(cfg["shapes"], pair.max_seq_len)
-    levels = [int(c) for c in cfg.get("concurrency") or concurrency_levels(pair.replicas)]
-
-    sides = [("on", pair.on), ("off", pair.off)] + ([("matched", matched)] if matched else [])
-
-    def measure(c: int, p: int, o: int, salt: int) -> dict:
-        return {side: cell(make_client, job, c, p, o, int(cfg["requests_per_thread"]), salt,
-                           int(cfg["min_requests"]))
-                for side, job in sides}
-
-    rows = []
-    for ci, c in enumerate(levels):
-        for si, (p, o) in enumerate(shapes):
-            row = measure(c, p, o, ci * 100 + si)
-            repeats = [row]
-            for attempt in range(1, int(cfg["remeasure"]) + 1):
-                if ratio(row["on"]["server_p50"], row["off"]["server_p50"]) <= th["latency_ratio_max"]:
-                    break
-                # Fresh salts, so the prefix cache does not speed up the repeat.
-                repeats.append(measure(c, p, o, attempt * 10_000 + ci * 100 + si))
-                row = _median_cell(repeats, [side for side, _ in sides])
-            if len(repeats) > 1:
-                row["remeasured"] = [{side: m[side]["server_p50"] for side, _ in sides} for m in repeats]
-                logger.info("c=%-3d %3d/%-3d over the latency limit, measured %d times; server p50 on %s off %s",
-                            c, p, o, len(repeats), [f"{m['on']:.3f}" for m in row["remeasured"]],
-                            [f"{m['off']:.3f}" for m in row["remeasured"]])
-            row["latency_ratio"] = ratio(row["on"]["server_p50"], row["off"]["server_p50"])
-            row["throughput_ratio"] = ratio(row["on"]["tok_s"], row["off"]["tok_s"])
-            row["engine_throughput_ratio"] = ratio(engine_tok_s(row["on"]), engine_tok_s(row["off"]))
-            rows.append(row)
-            m = row.get("matched")
-            logger.info("c=%-3d %3d/%-3d server p50 on %.3fs off %.3fs%s  engine tok/s ratio %.2f  "
-                        "client tok/s on %.0f off %.0f%s (%.2f)",
-                        c, p, o, row["on"]["server_p50"], row["off"]["server_p50"],
-                        f" matched {m['server_p50']:.3f}s" if m else "", row["engine_throughput_ratio"],
-                        row["on"]["tok_s"], row["off"]["tok_s"], f" matched {m['tok_s']:.0f}" if m else "",
-                        row["throughput_ratio"])
+    shapes = fit_shapes(cfg["shapes"], max_seq_len)
+    levels = [int(c) for c in cfg.get("concurrency") or concurrency_levels(replicas)]
+    grids = {} if grids is None else grids
+    grid: dict[tuple, list[dict]] = grids.setdefault(side, {})
+    remeasure = int(cfg["remeasure"])
+    for attempt in range(remeasure + 1):
+        for ci, c in enumerate(levels):
+            for si, (p, o) in enumerate(shapes):
+                if stop is not None and stop.is_set():
+                    return None
+                key = (c, p, o)
+                cells = grid.setdefault(key, [])
+                if attempt:
+                    used = measurements_used(grids.get("on", {}).get(key, []), grids.get("off", {}).get(key, []),
+                                             th["latency_ratio_max"], remeasure)
+                    if len(cells) < attempt or (used is not None and used <= attempt):
+                        continue
+                # Fresh salts, so the prefix cache does not speed up a repeat.
+                cells.append(cell(make_client, job_id, c, p, o, int(cfg["requests_per_thread"]),
+                                  attempt * 10_000 + ci * 100 + si, int(cfg["min_requests"])))
 
     n = int(cfg["latency_samples"])
-    short = min(16, pair.max_seq_len // 4)
-    long_prompt = max(short, min(1024, pair.max_seq_len // 2))
-    tpot_tokens = max(8, min(128, pair.max_seq_len - short - 8))
-    latency: dict[str, dict] = {}
-    for side, job in sides:
-        first = cell(make_client, job, 1, short, 1, n, 900, n)
-        first_long = cell(make_client, job, 1, long_prompt, 1, n, 901, n) if long_prompt > short else first
-        decode = cell(make_client, job, 1, short, tpot_tokens, n, 902, n)
-        latency[side] = {
-            "ttft_short_s": first["server_p50"], "ttft_long_s": first_long["server_p50"],
-            "tpot_s": (decode["server_p50"] - first["server_p50"]) / (tpot_tokens - 1),
-            "prompt_short": short, "prompt_long": long_prompt, "tpot_tokens": tpot_tokens,
-            "errors": first["errors"] + first_long["errors"] + decode["errors"],
-        }
+    short = min(16, max_seq_len // 4)
+    long_prompt = max(short, min(1024, max_seq_len // 2))
+    tpot_tokens = max(8, min(128, max_seq_len - short - 8))
+    if stop is not None and stop.is_set():
+        return None
+    first = cell(make_client, job_id, 1, short, 1, n, 900, n)
+    first_long = cell(make_client, job_id, 1, long_prompt, 1, n, 901, n) if long_prompt > short else first
+    decode = cell(make_client, job_id, 1, short, tpot_tokens, n, 902, n)
+    latency = {
+        "ttft_short_s": first["server_p50"], "ttft_long_s": first_long["server_p50"],
+        "tpot_s": (decode["server_p50"] - first["server_p50"]) / (tpot_tokens - 1),
+        "prompt_short": short, "prompt_long": long_prompt, "tpot_tokens": tpot_tokens,
+        "errors": first["errors"] + first_long["errors"] + decode["errors"],
+    }
+    logger.info("%s job %s: perf measured (%d grid cells)", side, job_id, sum(len(v) for v in grid.values()))
+    return {"grid": grid, "latency": latency}
 
-    overhead = {side: median([r[side]["client_p50"] - r[side]["server_p50"] for r in rows]) for side, _ in sides}
+
+def combine(measured: dict[str, dict], replicas: int, settings: dict | None = None,
+            thresholds: dict | None = None) -> dict:
+    """Gate semi_p (``measured["on"]``, from ``measure``) against stock plain
+    (``"off"``). A grid cell over the latency limit counts its repeats and keeps
+    each side's median (``measurements_used``). With a ``"matched"`` job (plain
+    with semi_p's collective setup), the gap also splits into the cost of those
+    settings (matched / stock) and the cost of semi_p itself (semi_p / matched),
+    and a check semi_p fails only against stock plain passes (``_pass_on_matched``)."""
+    cfg = {**DEFAULTS, **(settings or {})}
+    th = {**THRESHOLD_DEFAULTS, **(thresholds or {})}
+    sides = [s for s in ("on", "off", "matched") if s in measured]
+    grids = {s: measured[s]["grid"] for s in sides}
+    rows = []
+    for key in grids["on"]:
+        c, p, o = key
+        n = measurements_used(grids["on"][key], grids["off"][key], th["latency_ratio_max"], int(cfg["remeasure"]))
+        n = min([n or 1] + [len(grids[s][key]) for s in sides])
+        repeats = [{s: grids[s][key][i] for s in sides} for i in range(n)]
+        row = _median_cell(repeats, sides)
+        if n > 1:
+            row["remeasured"] = [{s: m[s]["server_p50"] for s in sides} for m in repeats]
+            logger.info("c=%-3d %3d/%-3d over the latency limit, measured %d times; server p50 on %s off %s",
+                        c, p, o, n, [f"{m['on']:.3f}" for m in row["remeasured"]],
+                        [f"{m['off']:.3f}" for m in row["remeasured"]])
+        row["latency_ratio"] = ratio(row["on"]["server_p50"], row["off"]["server_p50"])
+        row["throughput_ratio"] = ratio(row["on"]["tok_s"], row["off"]["tok_s"])
+        row["engine_throughput_ratio"] = ratio(engine_tok_s(row["on"]), engine_tok_s(row["off"]))
+        rows.append(row)
+        m = row.get("matched")
+        logger.info("c=%-3d %3d/%-3d server p50 on %.3fs off %.3fs%s  engine tok/s ratio %.2f  "
+                    "client tok/s on %.0f off %.0f%s (%.2f)",
+                    c, p, o, row["on"]["server_p50"], row["off"]["server_p50"],
+                    f" matched {m['server_p50']:.3f}s" if m else "", row["engine_throughput_ratio"],
+                    row["on"]["tok_s"], row["off"]["tok_s"], f" matched {m['tok_s']:.0f}" if m else "",
+                    row["throughput_ratio"])
+
+    latency = {s: measured[s]["latency"] for s in sides}
+    overhead = {s: median([r[s]["client_p50"] - r[s]["server_p50"] for r in rows]) for s in sides}
     return {"rows": rows, "latency": latency, "client_overhead_s": overhead,
-            **score(rows, latency, pair.replicas, th)}
+            **score(rows, latency, replicas, th)}
+
+
+def run(make_client: Callable[[], Any], pair: Pair, settings: dict | None = None,
+        thresholds: dict | None = None, matched: str | None = None) -> dict:
+    """Measure stock plain (``pair.off``), semi_p (``pair.on``) and any ``matched``
+    job one after another, then ``combine``."""
+    jobs = [("off", pair.off), ("on", pair.on)] + ([("matched", matched)] if matched else [])
+    grids: dict[str, dict] = {}
+    measured = {side: measure(make_client, job, pair.replicas, pair.max_seq_len, settings, thresholds, side, grids)
+                for side, job in jobs}
+    return combine(measured, pair.replicas, settings, thresholds)
 
 
 def _median_cell(repeats: list[dict], sides: list[str]) -> dict:

@@ -62,6 +62,19 @@ def conversion_cache_ready(path: Path) -> bool:
     return all((path / str(shard)).is_file() for shard in set(weight_map.values()))
 
 
+def resolve_ready_conversion_cache_path(config, source_path: Path, fmt: str) -> Path | None:
+    """Use a prepared cache only when every rank can read its local copy."""
+    import torch.distributed as dist
+
+    path = resolve_conversion_cache_path(config, source_path, fmt)
+    ready = conversion_cache_ready(path)
+    if dist.is_initialized():
+        readiness = [None] * dist.get_world_size()
+        dist.all_gather_object(readiness, ready)
+        ready = all(readiness)
+    return path if ready else None
+
+
 def conversion_cache_is_node_local(path: Path) -> bool:
     scope = os.environ.get(WEIGHT_CONVERSION_CACHE_SCOPE_ENV, "auto").lower()
     if scope in {"node", "node-local", "local"}:
@@ -110,6 +123,8 @@ def _write_conversion_cache(
     if stream_convert_fn is not None:
         try:
             stream_convert_fn(source_path, tmp_path)
+            if not conversion_cache_ready(tmp_path):
+                raise RuntimeError(f"Weight conversion did not publish a complete checkpoint: {tmp_path}")
             os.replace(tmp_path, snapshot_path)
             committed = True
         finally:
@@ -133,6 +148,8 @@ def _write_conversion_cache(
         save_state_dict_fn(snapshot_state_dict, tmp_path)
         t_save = time.perf_counter()
         del snapshot_state_dict
+        if not conversion_cache_ready(tmp_path):
+            raise RuntimeError(f"Weight conversion did not publish a complete checkpoint: {tmp_path}")
         os.replace(tmp_path, snapshot_path)
         committed = True
     finally:
