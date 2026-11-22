@@ -142,5 +142,5 @@ def test_bf16_sparse_mla_dcp_ranks_merge_to_the_single_rank_output(monkeypatch, 
     lses = torch.stack(lses)
     merged = _dcp_merge(outs, lses)
 
-    assert torch.isinf(lses[1:, -1]).all(), "the last token's selection lives on rank 0 only"
     torch.testing.assert_close(merged, expected.float(), atol=2e-2, rtol=2e-2)
+    assert torch.isinf(lses[1:, -1]).all(), "the last token's selection lives on rank 0 only"
