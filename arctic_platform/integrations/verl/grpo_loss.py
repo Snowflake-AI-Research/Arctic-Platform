@@ -205,6 +205,10 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     global_batch_info: dict[str, Any] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    clip_ratio: float = 0.2,
+    clip_ratio_low: float | None = None,
+    clip_ratio_high: float | None = None,
+    clip_ratio_c: float | None = 3.0,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -227,21 +231,19 @@ def compute_policy_loss_vanilla(
             config for the actor.
         rollout_log_probs: `(torch.Tensor)`:
             log probabilities of actions under the rollout policy, shape (batch_size, response_length).
+        clip_ratio (float): PPO clip ε (https://arxiv.org/abs/1707.06347); fallback for unset low/high.
+        clip_ratio_low (float, optional): lower clip ε; ``None`` uses ``clip_ratio``.
+        clip_ratio_high (float, optional): upper clip ε; ``None`` uses ``clip_ratio``.
+        clip_ratio_c (float, optional): dual-clip lower bound (https://arxiv.org/pdf/1912.09729); ``None`` uses 3.0.
     """
-
-    # TODO: add config support
-    # assert config is not None
-    # assert not isinstance(config, AlgoConfig)
-    # clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
-    # clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
-    # clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
-    # clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
-    #     "clip_ratio_c", 3.0
-    # )
-    clip_ratio = 0.2
-    clip_ratio_low = 0.2
-    clip_ratio_high = 0.2
-    clip_ratio_c = 3.0
+    if clip_ratio is None:
+        clip_ratio = 0.2
+    if clip_ratio_low is None:
+        clip_ratio_low = clip_ratio
+    if clip_ratio_high is None:
+        clip_ratio_high = clip_ratio
+    if clip_ratio_c is None:
+        clip_ratio_c = 3.0
 
     cliprange = clip_ratio
     cliprange_low = clip_ratio_low
@@ -456,6 +458,10 @@ def verl_grpo_loss(model_outputs: dict, batch: dict, meta: dict, config: dict, d
         loss_agg_mode=loss_agg_mode,
         global_batch_info=global_batch_info,
         rollout_is_weights=rollout_is_weights,
+        clip_ratio=verl_policy_config.clip_ratio,
+        clip_ratio_low=verl_policy_config.clip_ratio_low,
+        clip_ratio_high=verl_policy_config.clip_ratio_high,
+        clip_ratio_c=verl_policy_config.clip_ratio_c,
     )
 
     # ``pg_metrics`` already contains paired ``actor/pg_loss.sum`` /
