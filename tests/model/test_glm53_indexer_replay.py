@@ -22,9 +22,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from arctic_platform.inference.vllm.glm5next_indexer_replay import capture_pools
-from arctic_platform.inference.vllm.glm5next_indexer_replay import pool_rows
-from arctic_platform.inference.vllm.glm5next_indexer_replay import sparse_layers
+from arctic_platform.common.glm5next_indexer_replay import capture_pools
+from arctic_platform.common.glm5next_indexer_replay import pool_rows
 from arctic_platform.testing_utils import set_seed
 from tests.model.test_glm5_next import _tiny_config
 
@@ -32,7 +31,7 @@ ROWS = (23, 6, 19)
 LAYERS = 2
 
 
-def _model():
+def _model(last_indexer):
     from arctic_platform.model.implementations.glm53.context_parallel import apply_context_parallelism
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
 
@@ -41,7 +40,7 @@ def _model():
     sparse = next(kind for kind in text.layer_types if kind != "linear_attention")
     text.num_hidden_layers = LAYERS
     text.layer_types = [sparse] * LAYERS
-    text.indexer_types = ["full"] * LAYERS
+    text.indexer_types = ["full", last_indexer]
     text.mlp_layer_types = ["sparse"] * LAYERS
     config.use_grouped_mm = False
     set_seed(0)
@@ -55,7 +54,6 @@ def _model():
 
 
 def _attended(model, tokens, positions, boundaries, routed_experts):
-    """The token indices each sparse-attention layer hands to the sparse-MLA kernel."""
     from arctic_platform.model.implementations.glm53 import context_parallel as cp
 
     seen, pad = [], cp._pad_sparse_indices
@@ -88,8 +86,9 @@ def _record_routes(model):
     return seen
 
 
-def test_trainer_selects_the_samplers_tokens_in_packed_rows():
-    model = _model()
+@pytest.mark.parametrize("last_indexer", ["full", "shared"])
+def test_trainer_selects_the_samplers_tokens_in_packed_rows(last_indexer):
+    model = _model(last_indexer)
     moe_routes = _record_routes(model)
     text = model.config.text_config
     kpool, top_k = text.index_kpool, text.num_experts_per_tok
@@ -110,7 +109,7 @@ def test_trainer_selects_the_samplers_tokens_in_packed_rows():
     expected = [[] for _ in range(LAYERS)]
     generator = torch.Generator().manual_seed(2)
     for start, n in zip(boundaries[:-1].tolist(), ROWS):
-        for layer, layer_idx in enumerate(sparse_layers(text)):
+        for layer in range(LAYERS):
             buffer = torch.full((n, select * kpool + kpool - 1), -1, dtype=torch.int32)
             for t in range(n):
                 visible = (t + 1) // kpool
@@ -127,14 +126,16 @@ def test_trainer_selects_the_samplers_tokens_in_packed_rows():
 
             capture_pools(write, text.num_hidden_layers + layer * rows, buffer, text.index_topk, kpool, top_k)
     # The cache narrows the capture to uint16 and the trainer widens the replay window to int64, as for routes.
-    replayed = _attended(model, tokens, positions, boundaries, capture.to(torch.uint16).to(torch.int64)[None])
+    window = capture.to(torch.uint16).to(torch.int64)[None]
+    for pos, fill in ((18, 0), (20, -1)):  # outside the capture, and a fresh row
+        window[:, pos, LAYERS : LAYERS + rows] = fill
+        expected[0][pos] = own[0][pos]  # the first layer sees the same input in both forwards
+    replayed = _attended(model, tokens, positions, boundaries, window)
 
-    assert len(replayed) == LAYERS
     for layer in range(LAYERS):  # the pool rows leave each layer's expert routes as they were
         torch.testing.assert_close(moe_routes[LAYERS + layer], moe_routes[layer])
     for layer in range(LAYERS):
         assert replayed[layer] == expected[layer]
-        # The two selections differ for most sparse queries, so the assertion above can fail.
         assert sum(a != b for a, b in zip(own[layer], expected[layer])) > length // 3
     with pytest.raises(ValueError, match="rows per token"):  # a capture of another width cannot be split
         _attended(model, tokens, positions, boundaries, capture[None, :, :-1].to(torch.int64))

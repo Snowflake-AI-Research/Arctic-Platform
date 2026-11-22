@@ -23,8 +23,8 @@ from transformers.models.glm5_next.modeling_glm5_next import Glm5NextForConditio
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextDecoderLayer
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextMoE
 
-from arctic_platform.inference.vllm.glm5next_indexer_replay import pool_rows
-from arctic_platform.inference.vllm.glm5next_indexer_replay import sparse_layers
+from arctic_platform.common.glm5next_indexer_replay import pool_rows
+from arctic_platform.common.glm5next_indexer_replay import sparse_layers
 from arctic_platform.model.implementations.fp8 import BlockFp8Linear
 from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
@@ -186,8 +186,6 @@ class Glm5NextForConditionalGenerationPrimeRL(
             layer.__class__ = Glm5NextTextDecoderLayerPrimeRL
             layer._replay_layer_idx = layer_idx
             layer._fp32_parity = fp32_parity
-            # The sampler's selected pools ride the routed-experts capture past the decoder layers (see
-            # glm5next_indexer_replay); a capture without them leaves each layer to select for itself.
             layer._replay_layers = num_layers
             layer._replay_layers_with_pools = num_layers + len(sparse) * (rows or 0)
             layer._indexer_pool_rows = None

@@ -562,24 +562,21 @@ def _replayed_sparse_indices(
     query_offset: int,
     kpool: int,
 ) -> torch.Tensor:
-    """``own`` with each query that has replayed pools attending to exactly those pools plus its tail.
-
-    ``pools`` is ``[1, queries, index_topk // kpool]``: the pool ids the sampler's indexer selected for each local query,
-    relative to the query's packed row, ``-1`` where it selected none; a query with no pool id keeps ``own``.
-    """
+    """Expand one-based pool IDs within each packed row. Zero-filled and fresh (-1) queries keep their own selection."""
     # Token indices are int32 like ``own`` and ``global_cu_seqlens``: pool ids stay below 2**16, packed rows below 2**31.
     positions = query_offset + torch.arange(pools.shape[1], dtype=own.dtype, device=own.device)
     start = global_cu_seqlens[torch.searchsorted(global_cu_seqlens, positions, right=True) - 1]
     seen = positions - start + 1
-    pools = pools[0].to(device=own.device, dtype=own.dtype)
+    pools = pools[0].to(device=own.device, dtype=own.dtype) - 1
     # A pool counts only once its last token is visible, so a replayed selection stays causal by construction.
     pools = pools.masked_fill(pools >= torch.div(seen, kpool, rounding_mode="floor")[:, None], -1)
     offsets = torch.arange(kpool, dtype=own.dtype, device=own.device)
     tokens = torch.where(pools[..., None] >= 0, (start[:, None] + pools * kpool)[..., None] + offsets, -1)
     tail_count = seen % kpool
     tail = ((seen - tail_count + start)[:, None] + offsets[:-1]).masked_fill(offsets[:-1] >= tail_count[:, None], -1)
-    replayed = torch.cat([tokens.flatten(1), tail], dim=1)[:, : own.shape[-1]]
-    replayed = F.pad(replayed, (0, own.shape[-1] - replayed.shape[-1]), value=-1)
+    replayed = torch.cat([tokens.flatten(1), tail], dim=1)
+    if replayed.shape[-1] != own.shape[-1]:
+        replayed = F.pad(replayed, (0, own.shape[-1] - replayed.shape[-1]), value=-1)
     return torch.where((pools >= 0).any(-1)[None, :, None], replayed[None], own)
 
 
@@ -621,14 +618,14 @@ def _sparse_attention_forward(
     kv_pass_full = gather_sequence(kv_pass, self._cp_group)
     k_position_full = gather_sequence(k_position, self._cp_group)
 
+    global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
+    if global_cu_seqlens is None and (self.indexer is not None or indexer_pools is not None):
+        global_cu_seqlens = torch.tensor(
+            [0, kv_pass_full.shape[1]],
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
     if self.indexer is not None:
-        global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS, None)
-        if global_cu_seqlens is None:
-            global_cu_seqlens = torch.tensor(
-                [0, local_length * self._cp_world_size],
-                dtype=torch.int32,
-                device=hidden_states.device,
-            )
         topk_indices = _select_sparse_indices(
             self.indexer,
             hidden_states,
@@ -638,18 +635,18 @@ def _sparse_attention_forward(
             cp_group=self._cp_group,
             cp_rank=self._cp_rank,
         )
-        if indexer_pools is not None:
-            topk_indices = _replayed_sparse_indices(
-                indexer_pools,
-                topk_indices,
-                global_cu_seqlens,
-                self._cp_rank * local_length,
-                self.indexer.index_kpool,
-            )
     elif prev_topk_indices is None:
         raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
     else:
         topk_indices = prev_topk_indices
+    if indexer_pools is not None:
+        topk_indices = _replayed_sparse_indices(
+            indexer_pools,
+            topk_indices,
+            global_cu_seqlens,
+            self._cp_rank * local_length,
+            self.config.index_kpool,
+        )
 
     # The absorbed path reads the weight rather than calling the module, so a LoRA delta has to be added here.
     kv_b_weight = compute_weight(self.kv_b_proj).view(
