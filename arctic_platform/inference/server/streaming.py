@@ -1416,7 +1416,7 @@ class ClientStream(AsyncIterator):
             return
         self.closed = True
         if self.worker is not None:
-            self.worker.active_requests = max(0, self.worker.active_requests - 1)
+            self.worker.release(self.request)
             self.worker.streaming_requests = max(0, self.worker.streaming_requests - 1)
         if self.usage is not None and self.error is None:
             from arctic_platform.inference.server.metrics import RequestRecord

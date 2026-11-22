@@ -7,7 +7,7 @@ import logging
 import os
 import random
 import time
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Hashable
 
@@ -28,6 +28,8 @@ _BACKLOG = 2
 WORKER_MAX_CONCURRENCY = 4096
 # Slots the generate backlog leaves free for streams and control calls such as health checks and weight sync.
 _CONTROL_SLOTS = 4 * MAX_WORKER_STREAMS
+# Seconds a sticky key still counts against its worker after its last request ends, to span a tool call between turns.
+_KEY_IDLE_S = 120
 
 
 @dataclass
@@ -55,10 +57,36 @@ class WorkerState:
     inflight: set = field(default_factory=set)
     # Sticky requests waiting for this worker to free up.
     waiting: deque = field(default_factory=deque)
+    # Requests in flight here per sticky key, and when each other key's last request here ended, oldest first.
+    busy_keys: Counter = field(default_factory=Counter)
+    idle_keys: OrderedDict = field(default_factory=OrderedDict)
 
     @property
     def schedulable(self) -> bool:
         return self.available and not self.quarantined
+
+    def live_keys(self) -> int:
+        """Sticky keys with a request here, or whose last one here ended under ``_KEY_IDLE_S`` seconds ago."""
+        cutoff = time.monotonic() - _KEY_IDLE_S
+        while self.idle_keys and next(iter(self.idle_keys.values())) < cutoff:
+            self.idle_keys.popitem(last=False)
+        return len(self.busy_keys) + len(self.idle_keys)
+
+    def take(self, req: _Request) -> None:
+        """Count ``req`` against this worker."""
+        self.active_requests += 1
+        if req.sticky:
+            self.idle_keys.pop(req.key, None)
+            self.busy_keys[req.key] += 1
+
+    def release(self, req: _Request) -> None:
+        """Stop counting ``req`` against this worker."""
+        self.active_requests -= 1
+        if req.sticky:
+            self.busy_keys[req.key] -= 1
+            if not self.busy_keys[req.key]:
+                del self.busy_keys[req.key]
+                self.idle_keys[req.key] = time.monotonic()
 
     def quarantine(self) -> None:
         self.quarantined = True
@@ -88,13 +116,15 @@ class Scheduler:
     """Routes each request to a worker, letting each engine queue a backlog of its own.
 
     A request with no key goes to the less loaded of two random workers. A
-    keyed one goes to the worker its key was first given, chosen that way then;
-    a prefix-hash key spills while its worker holds ``capacity`` requests and
-    another has room, and a sticky one never spills. A worker takes up to
-    ``_BACKLOG * capacity`` generate requests, never fewer than ``capacity``,
-    and short of the worker actor's Ray slots by ``_CONTROL_SLOTS``. Past that,
-    or while paused, requests wait here in order and go to the first worker
-    that frees up; a sticky one waits on its own worker's queue.
+    keyed one goes to the worker its key was first given, chosen that way then,
+    except that a sticky key is first given the worker holding the fewest live
+    sticky keys; a prefix-hash key spills while its worker holds ``capacity``
+    requests and another has room, and a sticky one never spills. A worker
+    takes up to ``_BACKLOG * capacity`` generate requests, never fewer than
+    ``capacity``, and short of the worker actor's Ray slots by
+    ``_CONTROL_SLOTS``. Past that, or while paused, requests wait here in order
+    and go to the first worker that frees up; a sticky one waits on its own
+    worker's queue.
     """
 
     def __init__(
@@ -425,7 +455,7 @@ class Scheduler:
         if idx is None:
             return None
         ws = self._workers[idx]
-        ws.active_requests += 1
+        ws.take(req)
         if stream:
             ws.streaming_requests += 1
         req.worker_idx = idx
@@ -441,7 +471,7 @@ class Scheduler:
     def _route(self, req: _Request, stream: bool) -> int | None:
         idx = self._keys.get(req.key) if req.key is not None else None
         if idx is None or idx >= len(self._workers) or not self._workers[idx].schedulable:
-            idx = self._least_loaded(stream)
+            idx = self._fewest_keys(stream) if req.sticky else self._least_loaded(stream)
             if idx is not None and req.key is not None:
                 self._keys[req.key] = idx
                 if len(self._keys) > _MAX_KEYS:
@@ -481,6 +511,16 @@ class Scheduler:
         candidates = [k for k, ws in enumerate(self._workers) if can_take(ws)]
         return min(candidates, key=lambda k: self._workers[k].active_requests, default=None)
 
+    def _fewest_keys(self, stream: bool) -> int | None:
+        """The worker holding the fewest live sticky keys that can take a request, the less loaded on a tie.
+
+        A sticky key's context grows on its first worker for the key's whole life, so placing it by the requests in
+        flight at one instant piles keys onto whichever workers' keys are between requests.
+        """
+        candidates = [k for k, ws in enumerate(self._workers) if ws.schedulable and self._has_room(ws, stream)]
+        return min(candidates, key=lambda k: (self._workers[k].live_keys(), self._workers[k].active_requests),
+                   default=None)
+
     def _dispatch(self, req: _Request) -> bool:
         """Send ``req`` to a worker, failing it if the send raises, or False while none can take it."""
         ws = self._take(req)
@@ -489,7 +529,7 @@ class Scheduler:
         try:
             future = ws.handle.generate.remote(req.prompt, req.sampling_params).as_future()
         except Exception as exc:
-            ws.active_requests -= 1
+            ws.release(req)
             req.future.set_exception(exc)
             return True
         ws.inflight.add(future)
@@ -498,7 +538,7 @@ class Scheduler:
 
     def _done(self, req: _Request, ws: WorkerState, submitted_time: float, future: asyncio.Future) -> None:
         ws.inflight.discard(future)
-        ws.active_requests -= 1
+        ws.release(req)
         if future.cancelled():
             error: BaseException | None = RuntimeError("Request cancelled for weight update")
         elif (error := future.exception()) is not None:
