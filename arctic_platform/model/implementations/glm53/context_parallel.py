@@ -567,19 +567,19 @@ def _replayed_sparse_indices(
     ``pools`` is ``[1, queries, index_topk // kpool]``: the pool ids the sampler's indexer selected for each local query,
     relative to the query's packed row, ``-1`` where it selected none; a query with no pool id keeps ``own``.
     """
-    positions = query_offset + torch.arange(pools.shape[1], device=own.device)
-    boundaries = global_cu_seqlens.long()
-    start = boundaries[torch.searchsorted(boundaries, positions, right=True) - 1]
+    # Token indices are int32 like ``own`` and ``global_cu_seqlens``: pool ids stay below 2**16, packed rows below 2**31.
+    positions = query_offset + torch.arange(pools.shape[1], dtype=own.dtype, device=own.device)
+    start = global_cu_seqlens[torch.searchsorted(global_cu_seqlens, positions, right=True) - 1]
     seen = positions - start + 1
-    pools = pools[0].to(device=own.device, dtype=torch.long)
+    pools = pools[0].to(device=own.device, dtype=own.dtype)
     # A pool counts only once its last token is visible, so a replayed selection stays causal by construction.
     pools = pools.masked_fill(pools >= torch.div(seen, kpool, rounding_mode="floor")[:, None], -1)
-    offsets = torch.arange(kpool, device=own.device)
-    tokens = torch.where(pools[..., None] >= 0, start[:, None, None] + pools[..., None] * kpool + offsets, -1)
+    offsets = torch.arange(kpool, dtype=own.dtype, device=own.device)
+    tokens = torch.where(pools[..., None] >= 0, (start[:, None] + pools * kpool)[..., None] + offsets, -1)
     tail_count = seen % kpool
     tail = ((seen - tail_count + start)[:, None] + offsets[:-1]).masked_fill(offsets[:-1] >= tail_count[:, None], -1)
     replayed = torch.cat([tokens.flatten(1), tail], dim=1)[:, : own.shape[-1]]
-    replayed = F.pad(replayed, (0, own.shape[-1] - replayed.shape[-1]), value=-1).to(own.dtype)
+    replayed = F.pad(replayed, (0, own.shape[-1] - replayed.shape[-1]), value=-1)
     return torch.where((pools >= 0).any(-1)[None, :, None], replayed[None], own)
 
 
