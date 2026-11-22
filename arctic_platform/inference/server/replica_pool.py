@@ -1769,20 +1769,19 @@ class ReplicaPool:
             finally:
                 self._updating_workers.clear()
                 can_restore_scheduling = update_succeeded or not weight_update_started
-                # Awake and already paused means a failed sync left it paused; this success recovers it.
-                reopen = not scheduler_was_paused or (update_succeeded and not self._sleeping)
                 if effective_strategy == "pause":
                     if generation_paused and update_succeeded:
                         await self._resume_workers()
                     if scheduler_paused and (update_succeeded or not generation_paused):
-                        if reopen:
+                        # Paused while awake: a failed sync left it closed, and this full reload recovers it.
+                        if not scheduler_was_paused or (update_succeeded and not self._sleeping):
                             self._scheduler.resume()
                     elif scheduler_paused:
                         logger.error(
                             "Weight sync failed after vLLM generation was paused; "
                             "leaving scheduler and workers paused for operator recovery."
                         )
-                elif scheduler_paused and can_restore_scheduling and reopen:
+                elif scheduler_paused and can_restore_scheduling and not scheduler_was_paused:
                     self._scheduler.resume()
                 if skipped_workers and can_restore_scheduling:
                     for index in available_workers:
@@ -1820,6 +1819,7 @@ class ReplicaPool:
         fail_label: str,
         log_extra: str = "",
         extra_response: dict[str, Any] | None = None,
+        reloads_weights: bool = False,
     ) -> dict[str, Any]:
         """Shared pause/resume lifecycle for broadcast weight syncs.
 
@@ -1894,20 +1894,19 @@ class ReplicaPool:
             finally:
                 self._updating_workers.clear()
                 can_restore_scheduling = update_succeeded or not weight_update_started
-                # Awake and already paused means a failed sync left it paused; this success recovers it.
-                reopen = not scheduler_was_paused or (update_succeeded and not self._sleeping)
                 if effective_strategy == "pause":
                     if generation_paused and update_succeeded:
                         await self._resume_workers()
                     if scheduler_paused and (update_succeeded or not generation_paused):
-                        if reopen:
+                        # Paused while awake: a failed sync left it closed, and a full reload recovers it.
+                        if not scheduler_was_paused or (update_succeeded and reloads_weights and not self._sleeping):
                             self._scheduler.resume()
                     elif scheduler_paused:
                         logger.error(
                             f"{fail_label} failed after vLLM generation was paused; "
                             "leaving scheduler and workers paused for operator recovery."
                         )
-                elif scheduler_paused and can_restore_scheduling and reopen:
+                elif scheduler_paused and can_restore_scheduling and not scheduler_was_paused:
                     self._scheduler.resume()
                 if skipped_workers and can_restore_scheduling:
                     for index in available_workers:
@@ -1970,6 +1969,7 @@ class ReplicaPool:
             engine_only=engine_only,
             model_id=model_id,
             fail_label="Broadcast weight sync",
+            reloads_weights=True,
         )
 
     async def sync_lora_weights_broadcast(

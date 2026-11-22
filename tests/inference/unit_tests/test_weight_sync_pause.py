@@ -424,7 +424,8 @@ def test_initialize_logs_clear_cache_on_weight_sync(value, caplog):
 
 
 @pytest.mark.parametrize("path", ["sync_weights", "sync_weights_broadcast"])
-def test_successful_retry_reopens_admission_a_failed_pause_sync_left_closed(path):
+@pytest.mark.parametrize("retry", ["full", "lora", "drain"])
+def test_only_a_full_pause_reload_reopens_admission_a_failed_sync_left_closed(path, retry):
     async def run():
         pool = _pool([])
         replies = iter([{"status": "failed"}, {"status": "done", "params_loaded": 1}])
@@ -436,8 +437,9 @@ def test_successful_retry_reopens_admission_a_failed_pause_sync_left_closed(path
         with pytest.raises(RuntimeError, match="failed on workers"):
             await _run_sync(pool, path, strategy="pause", pause_mode="keep")
         assert pool._scheduler.paused
-        await _run_sync(pool, path, strategy="pause", pause_mode="keep")
-        assert not pool._scheduler.paused
+        follow_up = "sync_lora_weights_broadcast" if retry == "lora" else path
+        await _run_sync(pool, follow_up, strategy="drain" if retry == "drain" else "pause", pause_mode="keep")
+        assert pool._scheduler.paused is (retry != "full")
 
     asyncio.run(run())
 
