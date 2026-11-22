@@ -13,47 +13,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Keep a finished request's decoded tokens reachable at prefix-hash granularity.
+"""Expose the final computed attention prefix to hybrid cache lookups.
 
-When a full-attention cache block spans several hash blocks (decode context
-parallelism multiplies the block by the DCP size), a prefix hit inside the
-block exists only as a partial prefix-cache entry. vLLM registers one at the
-prompt's last hash boundary, so a follow-up request that resends a finished
-request's prompt and output re-prefills every decoded token past the last
-full block. When the request is freed, its last computed hash boundary is
-registered too, so the follow-up hits there, as it does when the block equals
-the hash block.
+Decode context parallelism can make an attention block span several prefix
+hashes. At generation completion, register the last reusable interior hash so
+a continuation can share the block when its other cache groups also hit.
 """
 
-from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.request import Request
 
 from arctic_platform.inference.patching import ArcticPatch
 
 
-class KVCacheManagerDecodedTailPatch(ArcticPatch[KVCacheManager]):
+class SchedulerDecodedTailPatch(ArcticPatch[Scheduler]):
+    _orig_handle_stopped_request = Scheduler._handle_stopped_request
 
-    _orig_free = KVCacheManager.free
+    def _handle_stopped_request(self, request: Request) -> bool:
+        # Resumable stop handling can rewind the counters before returning.
+        settled = min(request.num_computed_tokens - request.num_in_flight_tokens, request.num_tokens - 1)
+        finished = self._orig_handle_stopped_request(request)
+        coordinator = self.kv_cache_manager.coordinator
+        if finished and coordinator.enable_partial_hash_hits:
+            for manager in coordinator.single_type_managers:
+                if (
+                    type(manager) is FullAttentionManager
+                    and manager.enable_caching
+                    and manager.kv_cache_spec.prefix_cacheable
+                ):
+                    cacheable = coordinator.get_num_cacheable_tokens(settled, manager.kv_cache_group_id)
+                    _cache_computed_tail(manager, request, cacheable)
+        return finished
 
-    def free(self, request) -> None:
-        if self.enable_caching:
-            for manager in self.coordinator.single_type_managers:
-                if type(manager) is FullAttentionManager and manager.kv_cache_spec.prefix_cacheable:
-                    _cache_computed_tail(manager, request)
-        self._orig_free(request)
 
-
-def _cache_computed_tail(manager: FullAttentionManager, request) -> None:
-    hash_block_size = manager.block_pool.hash_block_size
-    boundary = min(request.num_computed_tokens, len(request.block_hashes) * hash_block_size)
-    boundary -= boundary % hash_block_size
-    blocks = manager.req_to_blocks.get(request.request_id, ())
-    # A boundary on a block edge is already cached as that full block.
-    if boundary == 0 or boundary % manager.block_size == 0 or boundary // manager.block_size >= len(blocks):
+def _cache_computed_tail(manager: FullAttentionManager, request: Request, cacheable: int) -> None:
+    hash_size = manager.block_pool.hash_block_size
+    boundary = min(cacheable // hash_size, len(request.block_hashes)) * hash_size
+    if boundary < request.num_prompt_tokens or boundary % manager.block_size == 0:
         return
+    block = manager.req_to_blocks[request.request_id][boundary // manager.block_size]
     manager.block_pool.cache_partial_block(
         request=request,
-        block=blocks[boundary // manager.block_size],
+        block=block,
         num_tokens=boundary,
         kv_cache_group_id=manager.kv_cache_group_id,
         block_size=manager.block_size,
@@ -66,5 +68,5 @@ _PATCHED = False
 def ensure_decoded_tail_prefix_hit() -> None:
     global _PATCHED
     if not _PATCHED:
-        KVCacheManagerDecodedTailPatch.apply_patch()
+        SchedulerDecodedTailPatch.apply_patch()
         _PATCHED = True
