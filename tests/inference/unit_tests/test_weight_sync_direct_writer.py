@@ -1314,13 +1314,9 @@ def test_load_batched_places_fused_experts_received_in_row_blocks_exactly(monkey
     assert recv_l2_sq == pytest.approx(whole, rel=1e-12) and applied_l2_sq == pytest.approx(whole, rel=1e-12)
 
 
-def test_load_batched_never_holds_a_whole_fused_moe_tensor(monkeypatch):
-    """No rank allocates a fused MoE tensor larger than the bucket: it is loaded as its chunks arrive.
-
-    GLM-5.3-Flash's [288, 4096, 4096] w13 is 9 GiB above a 2 GiB bucket; rebuilding it whole costs every sampler
-    rank 9 GiB at each sync while the rank keeps 1/TP of it. Here a 6 MiB bucket splits 4 MiB expert rows, so one
-    row is buffered; the checksum squares at most 2**20 elements in float64 at a time.
-    """
+@pytest.mark.parametrize("bucket_size", [6 << 20, (12 << 20) + 1])
+def test_load_batched_never_holds_a_whole_fused_moe_tensor(monkeypatch, bucket_size):
+    """Measure live CPU tensor storage allocated during loading, including misaligned blocks of full rows."""
     import weakref
 
     from torch.utils._python_dispatch import TorchDispatchMode
@@ -1351,7 +1347,7 @@ def test_load_batched_never_holds_a_whole_fused_moe_tensor(monkeypatch):
     experts, inter, hidden = 16, 512, 2048
     weights = _moe_weights(experts, inter, hidden, gated=True)
     model = _MoEModel(experts, inter, hidden, tp=8, rank=3, gated=True)
-    receiver = _bucketed_receiver(monkeypatch, weights, 6 << 20)
+    receiver = _bucketed_receiver(monkeypatch, weights, bucket_size)
     w13 = weights[1][1]
 
     with PeakAllocatedBytes() as allocated:

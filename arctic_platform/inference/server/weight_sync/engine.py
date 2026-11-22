@@ -47,20 +47,20 @@ def _row_blocks(
     ``row`` is one row of that tensor; it holds the bytes of a row split across two chunks.
     """
     row_bytes = row.view(-1).view(torch.uint8)
-    filled = tensor_offset % row.nbytes
-    start = 0
-    if filled:
-        start = min(row.nbytes - filled, chunk.numel())
-        row_bytes[filled:filled + start].copy_(chunk[:start], non_blocking=True)
-        if filled + start == row.nbytes:
-            yield name, row.unsqueeze(0)
-    end = start + (chunk.numel() - start) // row.nbytes * row.nbytes
-    if end > start:
-        block = chunk[start:end]
-        if block.storage_offset() % row.element_size():  # a bucket size that is not a multiple of the element size
-            block = block.clone()
-        yield name, block.view(row.dtype).reshape(-1, *row.shape)
-    row_bytes[:chunk.numel() - end].copy_(chunk[end:], non_blocking=True)
+    while chunk.numel():
+        filled = tensor_offset % row.nbytes
+        whole_bytes = chunk.numel() // row.nbytes * row.nbytes
+        if not filled and whole_bytes and chunk.storage_offset() % row.element_size() == 0:
+            size = whole_bytes
+            yield name, chunk[:size].view(row.dtype).reshape(-1, *row.shape)
+        else:
+            # Split rows and misaligned whole rows share the same aligned scratch storage.
+            size = min(row.nbytes - filled, chunk.numel())
+            row_bytes[filled:filled + size].copy_(chunk[:size], non_blocking=True)
+            if filled + size == row.nbytes:
+                yield name, row.unsqueeze(0)
+        chunk = chunk[size:]
+        tensor_offset += size
 
 
 class NCCLEngine:
