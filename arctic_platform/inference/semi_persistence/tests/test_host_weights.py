@@ -580,7 +580,7 @@ def _source(path, name):
 def test_the_dump_releases_after_save_weights_and_before_the_checkpoint(fn):
     src = _source(_ENGINE, fn)
     order = [src.index(s) for s in ("inst.save_weights(", "inst.release_host_weights()",
-                                    "inst.detach()", "inst.cuda_checkpoint()")]
+                                    "inst.detach()", "inst.cuda_checkpoint(")]
     assert order == sorted(order)
 
 

@@ -901,6 +901,21 @@ def _semip_free_double_buffer(worker):
     return 2 * db["half_bytes"]
 
 
+def _semip_gpu_mem(worker):
+    """This rank's GPU memory as the driver and torch's allocator see it.
+
+    Queries only: no synchronize and no empty_cache, so asking changes nothing
+    about what a later checkpoint captures.  ``used`` is the driver's view of
+    the whole device (every context on it), the other two are torch's.
+    """
+    device = getattr(worker, "device", None)
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    return {"rank": getattr(worker, "rank", "?"),
+            "used": int(total_bytes - free_bytes), "total": int(total_bytes),
+            "reserved": int(torch.cuda.memory_reserved(device)),
+            "allocated": int(torch.cuda.memory_allocated(device))}
+
+
 def _semip_plan_load_weights(worker, max_buffer_bytes=None, buffer_bytes=None,
                              buffer_threads=None):
     buf = worker._semip_buf
@@ -5924,6 +5939,25 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None,
                                               "graphs_dropped_reason",
                                               "graph_nccl_nodes")})
                 info["graph_drop"] = dict(_GRAPH_DROP)
+
+            elif cmd == "gpu_mem":
+                # Log-only, so it never fails: a reading that cannot be taken
+                # must not turn into an error on the dump it describes.
+                phase = kwargs.get("phase") or "?"
+                try:
+                    if llm is None:
+                        raise RuntimeError("no engine in this process")
+                    rows = llm.collective_rpc(_semip_gpu_mem)
+                    for r in rows:
+                        log.info("semi_p: gpu-mem %s rank=%s used=%.3f "
+                                 "reserved=%.3f allocated=%.3f total=%.3f GiB",
+                                 phase, r["rank"], r["used"] / 2**30,
+                                 r["reserved"] / 2**30, r["allocated"] / 2**30,
+                                 r["total"] / 2**30)
+                    info["gpu_mem"] = rows
+                except Exception as e:  # noqa: BLE001 - see above
+                    log.warning("semi_p: gpu-mem %s unavailable: %s: %s",
+                                phase, type(e).__name__, e)
 
             elif cmd == "save_weights":
                 if llm is None:

@@ -471,7 +471,19 @@ class Instance:
         self._log("resume")
         return self._send("resume")
 
-    def cuda_checkpoint(self):
+    def gpu_mem(self, phase):
+        """Log every rank's GPU memory under the label *phase*.
+
+        Log-only: the child queries the driver and torch's allocator and
+        reports what it could not read as a warning, never as a failure.
+        """
+        self._log(f"gpu_mem({phase})")
+        return self._send("gpu_mem", phase=phase)
+
+    def cuda_checkpoint(self, gpu_mem_phase=None):
+        """``gpu_mem_phase`` logs every rank's GPU memory under that label
+        immediately before the checkpoint -- after the TP>1 NCCL teardown below,
+        so the reading is what the checkpoint captures."""
         self._log("cuda_checkpoint")
         # TP>1: tear down NCCL (CRIU cannot restore live communicators /
         # CustomAllreduce IPC) before the CUDA checkpoint, using the
@@ -498,6 +510,8 @@ class Instance:
             else:
                 self._send("drop_graphs_if_nccl")
             self._send("destroy_nccl")
+        if gpu_mem_phase is not None:
+            self.gpu_mem(gpu_mem_phase)
         return self._send("cuda_checkpoint")
 
     def reinit_nccl(self, master_addr=None, port=None, ifname=None):

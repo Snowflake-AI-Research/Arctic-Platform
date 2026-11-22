@@ -302,6 +302,20 @@ _NVRM_VERSION_RE = re.compile(r"NVRM version:.*?(\d+\.\d+(?:\.\d+)?)")
 _DUMP_PROMPT = "Hi, can you introduce yourself?"
 _DUMP_SAMPLING = {"max_tokens": 32, "temperature": 0.0, "ignore_eos": True}
 
+# The A/B switch for that generation: whether what it leaves on the GPU makes
+# the checkpoint, and so the image and its cuda_restore, larger. On unless set
+# to one of _DUMP_WARMUP_OFF; an image dumped without it records
+# ``dump_warmup: false`` in meta.json.
+_DUMP_WARMUP_ENV = "SEMIP_DUMP_WARMUP"
+_DUMP_WARMUP_OFF = ("0", "false", "off")
+
+# Set to 1 to count the all-zero frames of a fresh dump's pages files, the
+# publisher's FRAME_BYTES frames, which a dump that is not published never
+# reports. Off by default because it reads the whole image.
+_DUMP_ZERO_SCAN_ENV = "SEMIP_DUMP_ZERO_SCAN"
+_ZERO_SCAN_FRAME_BYTES = 1 << 20
+_PAGES_FILE_RE = re.compile(r"pages-\d+\.img")
+
 # Guards one model_dir against two jobs dumping into it at once. Dot-prefixed so
 # it cannot collide with image/, weight/ or compilation/, the three names
 # Instance derives from model_dir; and it lives in model_dir rather than /tmp
@@ -2369,6 +2383,88 @@ def _discard_image(model_dir: str) -> None:
                    "dumps again", meta_path)
 
 
+def _dump_warmup_enabled() -> bool:
+    """Whether the dump runs its warm-up generation (``SEMIP_DUMP_WARMUP``)."""
+    value = (os.environ.get(_DUMP_WARMUP_ENV) or "").strip().lower()
+    return value not in _DUMP_WARMUP_OFF
+
+
+def _dump_warmup(inst: Any) -> bool:
+    """Run the pre-dump generation unless ``SEMIP_DUMP_WARMUP`` turns it off,
+    logging every rank's GPU memory either side of it. Returns whether it ran."""
+    inst.gpu_mem("init")
+    raw = os.environ.get(_DUMP_WARMUP_ENV)
+    if _dump_warmup_enabled():
+        logger.info("semi_p: pre-dump warm-up generate kept (%s=%s)",
+                    _DUMP_WARMUP_ENV, "unset" if raw is None else raw)
+        inst.generate([_DUMP_PROMPT], _DUMP_SAMPLING)
+        ran = True
+    else:
+        logger.info("semi_p: pre-dump warm-up generate skipped (%s=%s)",
+                    _DUMP_WARMUP_ENV, raw)
+        ran = False
+    inst.gpu_mem("post-warmup")
+    return ran
+
+
+def _count_zero_frames(path: str) -> int:
+    """All-zero ``_ZERO_SCAN_FRAME_BYTES`` frames of one file, the last one
+    shorter, as the publisher counts them."""
+    zero = bytes(_ZERO_SCAN_FRAME_BYTES)
+    buf = bytearray(8 * _ZERO_SCAN_FRAME_BYTES)
+    view = memoryview(buf)
+    zeros = 0
+    with open(path, "rb", buffering=0) as handle:
+        while True:
+            got = 0
+            while got < len(buf):
+                n = handle.readinto(view[got:])
+                if not n:
+                    break
+                got += n
+            if not got:
+                return zeros
+            for start in range(0, got, _ZERO_SCAN_FRAME_BYTES):
+                n = min(_ZERO_SCAN_FRAME_BYTES, got - start)
+                if buf.startswith(zero if n == len(zero) else zero[:n], start,
+                                  start + n):
+                    zeros += 1
+            if got < len(buf):
+                return zeros
+
+
+def _log_image_stats(model_dir: str) -> None:
+    """Log the size of the image a dump just wrote. Best effort: it only
+    reports, so a failure costs the line and nothing else."""
+    image = os.path.join(model_dir, _IMAGE_DIR)
+    try:
+        total = n_files = pages = n_pages = 0
+        pages_paths = []
+        for root, _dirs, names in os.walk(image):
+            for name in names:
+                path = os.path.join(root, name)
+                size = os.lstat(path).st_size
+                total += size
+                n_files += 1
+                if root == image and _PAGES_FILE_RE.fullmatch(name) and size:
+                    pages += size
+                    n_pages += 1
+                    pages_paths.append(path)
+        zero_frames = "not scanned"
+        if (os.environ.get(_DUMP_ZERO_SCAN_ENV) or "").strip() == "1":
+            t0 = time.perf_counter()
+            zeros = sum(_count_zero_frames(p) for p in pages_paths)
+            zero_frames = (f"{zeros} ({zeros * _ZERO_SCAN_FRAME_BYTES / 2**30:.3f}"
+                           f" GiB, scanned in {time.perf_counter() - t0:.1f}s)")
+        logger.info("semi_p: dump image model_dir=%s raw=%.3f GiB in %d file(s), "
+                    "pages=%.3f GiB in %d pages file(s), zero_frames=%s",
+                    model_dir, total / 2**30, n_files, pages / 2**30, n_pages,
+                    zero_frames)
+    except Exception:  # noqa: BLE001
+        logger.warning("semi_p: could not size the image in %s", image,
+                       exc_info=True)
+
+
 def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
           image_ref: str, driver_version: str) -> None:
     """Cold-start vLLM, capture an image into ``model_dir``, and destroy it.
@@ -2420,7 +2516,7 @@ def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
     inst = Instance(vllm_config, model_dir)
     try:
         inst.init(gpus=gpus)
-        inst.generate([_DUMP_PROMPT], _DUMP_SAMPLING)
+        warmed = _dump_warmup(inst)
         inst.attach()
         inst.stage()
         inst.save_weights()
@@ -2431,11 +2527,13 @@ def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
         # holds its weights and KV cache, and dumping it anyway writes an
         # image tens of times larger that later jobs restore as a hit.
         inst.wait()
-        inst.cuda_checkpoint()  # TP>1: destroy_nccl inside
+        inst.gpu_mem("post-sleep")
+        inst.cuda_checkpoint(gpu_mem_phase="pre-checkpoint")  # TP>1: destroy_nccl inside
         inst.criu_dump(meta_extra={"image_ref": image_ref,
                                    "driver_version": driver_version,
                                    "pid_floor": pid_floor,
                                    "unprivileged": _unprivileged_mode(),
+                                   **({} if warmed else {"dump_warmup": False}),
                                    **_host_weights_meta(inst)})
         inst.wait()             # criu_dump destroys the child
     except BaseException:
@@ -2454,6 +2552,7 @@ def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
     _record_env_files(model_dir)
     logger.info("semi_p: dump complete model_dir=%s in %.1fs",
                 model_dir, time.perf_counter() - t0)
+    _log_image_stats(model_dir)
 
 
 def _host_weights_meta(inst: Any) -> dict[str, Any]:
@@ -2529,6 +2628,7 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
     _check_gpu_placement(meta, gpus, model_dir)
     recapture = _graphs_dropped(meta)
 
+    t0 = time.perf_counter()
     logger.info("semi_p: restoring image model_dir=%s (dumped on %s) onto "
                 "physical GPU(s) %s", model_dir, meta.get("gpus"), gpus)
     if recapture:
@@ -2572,7 +2672,8 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
             logger.warning("semi_p: teardown after a failed restore also failed",
                            exc_info=True)
         raise
-    logger.info("semi_p: restore complete model_dir=%s gpus=%s", model_dir, gpus)
+    logger.info("semi_p: restore complete model_dir=%s gpus=%s in %.1fs",
+                model_dir, gpus, time.perf_counter() - t0)
     return RestoredEngine(inst)
 
 
@@ -2744,7 +2845,10 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
                 f"semi_p: the node-partitions run different {_UNPRIVILEGED_ENV} modes "
                 f"({modes}); each fixes the capability level its image "
                 "records, so they could never restore under one mode")
-        inst.generate([_DUMP_PROMPT], _DUMP_SAMPLING)
+        warmed = _dump_warmup(inst)
+        if not warmed:
+            for k in per_node:
+                per_node[k]["dump_warmup"] = False
         inst.attach()
         inst.stage()
         inst.save_weights(weights_dir=weights_dir)
@@ -2752,10 +2856,11 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
         inst.detach()
         inst.sleep()
         inst.wait()             # a failed sleep is never checkpointed; see _dump
+        inst.gpu_mem("post-sleep")
         inst.arm_mq_park(ranks=list(range(local)))
         # Drops the graphs and tears NCCL down across every rank, including the
         # agents'. Theirs must follow, not lead.
-        inst.cuda_checkpoint()
+        inst.cuda_checkpoint(gpu_mem_phase="pre-checkpoint")
         inst.wait()
         ray.get([agent.cuda_checkpoint.remote() for agent in agents])
         # Issued before the leader's dump so the wait inside them overlaps it.
@@ -2782,6 +2887,7 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
     _record_env_files(model_dir)
     logger.info("semi_p: multi-node dump complete in %.1fs, dump_id=%s",
                 time.perf_counter() - t0, dump_id)
+    _log_image_stats(model_dir)
 
 
 def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
@@ -2812,6 +2918,7 @@ def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
     leader_ip = _leader_ip()
     remote_ranks = [r for k in range(1, nnodes) for r in _node_ranks(k, local)]
     local_ranks = list(range(local))
+    t0 = time.perf_counter()
     logger.info("semi_p: multi-node restore of %s (%s), dump_id=%s, leader %s",
                 model_dir, after, meta.get("dump_id"), leader_ip)
 
@@ -2881,8 +2988,8 @@ def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
                 logger.warning("semi_p: agent teardown after a failed "
                                "multi-node restore also failed", exc_info=True)
         raise
-    logger.info("semi_p: multi-node restore complete model_dir=%s gpus=%s",
-                model_dir, gpus)
+    logger.info("semi_p: multi-node restore complete model_dir=%s gpus=%s in %.1fs",
+                model_dir, gpus, time.perf_counter() - t0)
     return RestoredEngine(inst, agents=tuple(agents))
 
 
