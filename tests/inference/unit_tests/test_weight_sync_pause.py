@@ -177,6 +177,7 @@ def _pool(
     pool._lock = asyncio.Lock()
     pool._updating_workers = set()
     pool._synced_lora_name = None
+    pool._sleeping = False
     return pool
 
 
@@ -420,3 +421,34 @@ def test_initialize_logs_clear_cache_on_weight_sync(value, caplog):
 
     asyncio.run(run())
     assert f"clear_cache_on_weight_sync={value}" in caplog.text
+
+
+@pytest.mark.parametrize("path", ["sync_weights", "sync_weights_broadcast"])
+def test_successful_retry_reopens_admission_a_failed_pause_sync_left_closed(path):
+    async def run():
+        pool = _pool([])
+        replies = iter([{"status": "failed"}, {"status": "done", "params_loaded": 1}])
+
+        async def receive(*args, **kwargs):
+            return next(replies)
+
+        setattr(pool._workers[0], path, _RemoteMethod(receive))
+        with pytest.raises(RuntimeError, match="failed on workers"):
+            await _run_sync(pool, path, strategy="pause", pause_mode="keep")
+        assert pool._scheduler.paused
+        await _run_sync(pool, path, strategy="pause", pause_mode="keep")
+        assert not pool._scheduler.paused
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("path", ["sync_weights", "sync_weights_broadcast"])
+def test_sync_into_a_sleeping_pool_keeps_admission_closed(path):
+    async def run():
+        pool = _pool([])
+        pool._sleeping = True
+        pool._scheduler.paused = True
+        await _run_sync(pool, path, strategy="pause", pause_mode="keep")
+        assert pool._scheduler.paused
+
+    asyncio.run(run())
