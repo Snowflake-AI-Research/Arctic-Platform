@@ -84,6 +84,14 @@ class Qwen3_5MoeOptions(BaseModel):
         None, description="Dir for the one-time HF<->Prime weight-conversion cache."
     )
     ac_config: ActivationCheckpointConfig | None = Field(None, description="Activation checkpointing config.")
+    row_invariant_projections: bool = Field(
+        False,
+        description=(
+            "Pad each covered projection call shorter than its row target to that target, so a token's projection "
+            "does not depend on how many rows share the call (debug/row_invariant_projection.py). Independent of "
+            "debug.full_determinism, and installs nothing else."
+        ),
+    )
     debug: DebugModelOptions | None = Field(None, description="Test-only tiny-model overrides.")
 
     @model_validator(mode="after")
