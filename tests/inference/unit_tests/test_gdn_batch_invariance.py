@@ -23,7 +23,7 @@ import torch
 
 from arctic_platform.inference.vllm import gdn_batch_invariance
 
-DECODE_ENV = {"VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": "0", "VLLM_GDN_DECODE_KERNEL": "triton"}
+DECODE_OVERRIDES = {"VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": "1", "VLLM_GDN_DECODE_KERNEL": "cuda"}
 
 
 @pytest.fixture(autouse=True)
@@ -89,22 +89,23 @@ def test_pin_keeps_one_config_through_wrappers_and_one_row_per_block(fake_module
 
 def test_patch_is_opt_in(fake_modules, monkeypatch):
     kernels, _, backend = fake_modules
-    for name in (gdn_batch_invariance.ENV_VAR, *DECODE_ENV):
+    for name in (gdn_batch_invariance.ENV_VAR, *DECODE_OVERRIDES):
         monkeypatch.delenv(name, raising=False)
     gdn_batch_invariance.ensure_gdn_batch_invariance()
     assert backend.supports_batch_invariance() is False
     assert all(len(kernel.fn.configs) == 3 for kernel in kernels.values())
-    assert not set(DECODE_ENV) & set(os.environ)
+    assert DECODE_OVERRIDES.keys().isdisjoint(os.environ)
 
+    for name, value in DECODE_OVERRIDES.items():
+        monkeypatch.setenv(name, value)
     monkeypatch.setenv(gdn_batch_invariance.ENV_VAR, "1")
     gdn_batch_invariance.ensure_gdn_batch_invariance()
     assert backend.supports_batch_invariance() is True
     assert all(kernel.fn.configs == ["a"] for kernel in kernels.values())
-    assert {name: os.environ[name] for name in DECODE_ENV} == DECODE_ENV
+    assert {name: os.environ[name] for name in DECODE_OVERRIDES} == DECODE_OVERRIDES
 
 
-def test_a_decoded_token_reaches_the_same_recurrent_kernel_with_or_without_a_prefill_in_its_step(monkeypatch):
-    """vLLM's GDN core, its kernels recorded: decodes alone and beside a prefill reach one recurrent kernel."""
+def test_qwen_decode_recurrent_rows_and_slots_with_and_without_prefill(monkeypatch):
     import vllm.envs as envs
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
     from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
@@ -113,7 +114,7 @@ def test_a_decoded_token_reaches_the_same_recurrent_kernel_with_or_without_a_pre
     monkeypatch.setattr(GDNAttentionBackend, "supports_batch_invariance", None)
     monkeypatch.setattr(gdn_batch_invariance, "pin_gdn_kernels", lambda: 0)
     monkeypatch.setattr(gdn_batch_invariance, "_APPLIED", False)
-    for name in DECODE_ENV:
+    for name in DECODE_OVERRIDES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(gdn_batch_invariance.ENV_VAR, "1")
     gdn_batch_invariance.ensure_gdn_batch_invariance()
@@ -122,24 +123,22 @@ def test_a_decoded_token_reaches_the_same_recurrent_kernel_with_or_without_a_pre
     conv_dim = 3 * heads * dim
     calls = []
 
-    def recurrent(name):
-        def kernel(**kw):
-            tokens = kw["a"].shape[0]  # one per decoded sequence
-            calls.append((name, kw["a"].clone(), kw["ssm_state_indices"][:tokens].clone()))
-            return torch.zeros(1, tokens, heads, dim), None
-
-        return kernel
+    def recurrent(**kw):
+        offsets = kw["cu_seqlens"]
+        calls.append((kw["a"], offsets, kw["ssm_state_indices"][: offsets.numel() - 1]))
+        return torch.zeros(1, kw["a"].shape[0], heads, dim), None
 
     def chunk(q, **kw):
-        calls.append(("chunk", None, None))
         return torch.zeros(1, q.shape[1], heads, dim), torch.zeros(kw["initial_state"].shape)
 
     def post_conv_prep(conv_output, a, b, **kw):
         q, k, v = conv_output.view(-1, 3, heads, dim).unbind(1)
         return q, k, v, a, b
 
-    monkeypatch.setattr(gdn, "fused_sigmoid_gating_delta_rule_update", recurrent("recurrent"))
-    monkeypatch.setattr(gdn, "fused_recurrent_gated_delta_rule_packed_decode", recurrent("packed_recurrent"))
+    monkeypatch.setattr(gdn, "fused_sigmoid_gating_delta_rule_update", recurrent)
+    monkeypatch.setattr(
+        gdn, "fused_recurrent_gated_delta_rule_packed_decode", lambda **kw: pytest.fail("packed decode selected")
+    )
     monkeypatch.setattr(gdn, "causal_conv1d_update", lambda x, *args, **kw: x)
     monkeypatch.setattr(gdn, "causal_conv1d_fn", lambda x, *args, **kw: x)
     monkeypatch.setattr(gdn, "fused_post_conv_prep", post_conv_prep)
@@ -173,15 +172,13 @@ def test_a_decoded_token_reaches_the_same_recurrent_kernel_with_or_without_a_pre
         prefill_state_indices=torch.tensor([6]), prefill_has_initial_state=torch.tensor([False]),
     )  # fmt: skip
 
-    def decode_kernels(md, tokens):
+    for md in (alone, shared):
         calls.clear()
         context.attn_metadata = {"gdn": md}
+        tokens = md.num_actual_tokens
         cls._forward_core(layer, qkv[:tokens], b[:tokens], a[:tokens], torch.zeros(tokens, heads, dim))
-        return [call for call in calls if call[0] != "chunk"]
-
-    [(alone_kernel, alone_a, alone_slots)] = decode_kernels(alone, decodes)
-    [(shared_kernel, shared_a, shared_slots)] = decode_kernels(shared, decodes + prefill)
-    assert alone_kernel == shared_kernel == "recurrent"
-    assert torch.equal(alone_a, a[:decodes]) and torch.equal(shared_a, a[:decodes])
-    assert torch.equal(alone_slots, shared_slots)
-    assert envs.VLLM_GDN_DECODE_KERNEL == "triton"  # so no layer enables the fused CUDA speculative decode
+        [(rows, offsets, state_slots)] = calls
+        assert torch.equal(rows, a[:decodes])
+        assert torch.equal(offsets, alone.non_spec_query_start_loc)
+        assert torch.equal(state_slots, alone.non_spec_state_indices_tensor)
+    assert envs.VLLM_GDN_DECODE_KERNEL == "triton"
