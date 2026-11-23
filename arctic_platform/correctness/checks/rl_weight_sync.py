@@ -87,18 +87,7 @@ VERIFY_ENV = "ARCTIC_INFERENCE_WEIGHT_SYNC_VERIFY"
 _MANIFEST_FIELDS = ("shape", "dtype", "numel", "sha256")
 
 
-@correctness_test(
-    TEST_ID,
-    title="Weight sync delivers every trained element to the sampling zone unchanged",
-    criterion=(
-        "after one RL step, every tensor the training zone sends reaches every sampling rank with identical "
-        "bytes and element count, the trainer sends every element it holds, and every sampler parameter is "
-        "written, element for element, with what it received, or, for a frozen table the trainer does not send, "
-        "matches the trainer's copy in every checkpoint shard"
-    ),
-    compares_to_reference=False,
-    workload_modes=("rl",),
-)
+@correctness_test(TEST_ID)
 def run(ctx) -> List[TestResult]:
     try:
         return [_run(ctx)]
