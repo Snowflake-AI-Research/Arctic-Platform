@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Hashable
 
 import ray
+import torch
 from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
 from arctic_platform.inference.server.token_prompts import is_token_tensor
@@ -22,6 +23,8 @@ logger = logging.getLogger("arctic_platform.inference.server")
 
 _LOG_AFFINITY = os.environ.get("ARCTIC_LOG_AFFINITY", "") == "1"
 _MAX_KEYS = 500_000
+# Token ids kept across all conversations (int32, 256 MiB); the least recently used conversation goes first.
+_MAX_CONVERSATION_TOKENS = 1 << 26
 # Requests a worker may hold, as a multiple of capacity, before the rest wait here for whichever worker frees first.
 _BACKLOG = 2
 # Ray max_concurrency of each worker actor. Every call it serves takes a slot, generate or control alike.
@@ -42,6 +45,12 @@ class _Request:
     sticky: bool = False
     worker_idx: int | None = None
     created_at: float = field(default_factory=time.time)
+    # Routing key under which the completed turn (prompt + sampled ids) is kept, for ``conversation``.
+    conversation_key: str | None = None
+
+
+class ConversationNotFound(LookupError):
+    """No conversation is kept for the routing key (never started, or evicted): send the full prompt."""
 
 
 @dataclass
@@ -112,6 +121,8 @@ class Scheduler:
         self._backlog = max(capacity, min(_BACKLOG * capacity, WORKER_MAX_CONCURRENCY - _CONTROL_SLOTS))
         self._prefix_routing = prefix_routing
         self._keys: OrderedDict[Hashable, int] = OrderedDict()
+        self._conversations: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self._conversation_tokens = 0
         # Requests no worker could take yet, dispatched in order by `_drain`.
         self._waiting: deque[_Request] = deque()
         self._next_id = 0
@@ -153,6 +164,7 @@ class Scheduler:
         sampling_params: dict[str, Any],
         routing_key: str | None = None,
         strict: bool = False,
+        conversation: str | None = None,
     ) -> asyncio.Future:
         """Submit a single prompt for generation.
 
@@ -165,13 +177,43 @@ class Scheduler:
                 rollout reuses turn N's KV cache and router-replay capture.
             strict: Keep a prompt-hash keyed request on its worker under load
                 too; a routing key already does.
+            conversation: ``"start"`` keeps this token-id prompt plus its sampled ids under ``routing_key`` once
+                it completes; ``"append"`` sends only the ids after the kept ones, and keeps the result in turn.
+                ``"append"`` raises ``ConversationNotFound`` when nothing is kept for the key.
         """
         if self._stopped:
             raise RuntimeError("Scheduler is stopped")
+        if conversation is not None:
+            prompt = self._conversation_prompt(prompt, sampling_params, routing_key, conversation)
         future = asyncio.get_running_loop().create_future()
-        self._waiting.append(self._request(prompt, sampling_params, future, routing_key, strict))
+        req = self._request(prompt, sampling_params, future, routing_key, strict)
+        req.conversation_key = routing_key if conversation is not None else None
+        self._waiting.append(req)
         self._drain()
         return future
+
+    def _conversation_prompt(self, prompt, sampling_params, routing_key, conversation) -> torch.Tensor:
+        if conversation not in ("start", "append"):
+            raise ValueError(f"conversation must be 'start' or 'append', got {conversation!r}")
+        if routing_key is None or isinstance(prompt, (str, ChatPrompt)) or sampling_params.get("n", 1) != 1:
+            raise ValueError("a conversation needs a routing_key, a token-id prompt and one sample")
+        ids = torch.as_tensor(prompt, dtype=torch.int32).reshape(-1)
+        if conversation == "start":
+            return ids
+        kept = self._conversations.get(routing_key)
+        if kept is None:
+            raise ConversationNotFound(f"no conversation is kept for routing key {routing_key!r}; send the full prompt")
+        self._conversations.move_to_end(routing_key)
+        return torch.cat((kept, ids))
+
+    def _keep_conversation(self, key: str, prompt: torch.Tensor, token_ids: list[int]) -> None:
+        kept = torch.cat((prompt, torch.as_tensor(token_ids, dtype=torch.int32)))
+        previous = self._conversations.pop(key, None)
+        self._conversation_tokens += kept.numel() - (0 if previous is None else previous.numel())
+        self._conversations[key] = kept
+        while self._conversation_tokens > _MAX_CONVERSATION_TOKENS:
+            _, evicted = self._conversations.popitem(last=False)
+            self._conversation_tokens -= evicted.numel()
 
     def stream_generate(self, request_id, prompt, sampling_params=None, *, limits=None, routing_key=None, strict=False):
         if self._stopped:
@@ -229,6 +271,7 @@ class Scheduler:
         sampling_params: dict[str, Any] | list[dict[str, Any] | None],
         routing_key: str | list[str | None] | None = None,
         strict: bool = False,
+        conversation: str | None = None,
     ) -> list[dict[str, Any]]:
         if isinstance(routing_key, list):
             if len(routing_key) != len(prompts):
@@ -249,7 +292,7 @@ class Scheduler:
         else:
             params_list = [sampling_params] * len(prompts)
         futures = [
-            self.submit(prompt, params, routing_key=key, strict=strict)
+            self.submit(prompt, params, routing_key=key, strict=strict, conversation=conversation)
             for prompt, params, key in zip(prompts, params_list, keys)
         ]
         return list(await asyncio.gather(*futures))
@@ -515,6 +558,8 @@ class Scheduler:
         self._drain()
 
     def _finish(self, req: _Request, submitted_time: float, result: Any) -> None:
+        if req.conversation_key is not None:
+            self._keep_conversation(req.conversation_key, req.prompt, result["token_ids"])
         if not req.future.done():
             req.future.set_result(result)
         if isinstance(result, dict):

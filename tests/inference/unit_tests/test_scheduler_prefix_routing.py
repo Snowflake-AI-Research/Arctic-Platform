@@ -213,7 +213,7 @@ class TestSchedulerRoutingKey:
             sch = _scheduler(2)
             submitted = []
 
-            def fake_submit(prompt, sampling_params, routing_key=None, strict=False):
+            def fake_submit(prompt, sampling_params, routing_key=None, strict=False, conversation=None):
                 submitted.append((prompt, sampling_params, routing_key, strict))
                 future = asyncio.get_running_loop().create_future()
                 future.set_result({"text": prompt})
