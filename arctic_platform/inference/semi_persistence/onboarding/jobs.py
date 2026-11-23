@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model files, the semi_p / plain job bodies built from them, and job status tracking."""
+"""Model configs from the model catalog, the semi_p / plain job bodies built from them, and job status tracking."""
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
+import subprocess
+import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass
@@ -26,12 +29,10 @@ from dataclasses import field
 from pathlib import Path
 from typing import Any
 
-# BACKENDS_FILE: the backend image each model's semi_p images are published on. A
-# published image only restores on the backend it was dumped on, and the cluster
-# default backend may not run semi_p at all (it would then serve plain without
-# saying so).
-MODELS_DIR = Path(__file__).resolve().parent / "models"
-BACKENDS_FILE = MODELS_DIR / "backends.json"
+# Where catalog entries are read from when no local checkout is given.
+CATALOG_REPO = "snowflakedb/cortex-training"
+CATALOG_BRANCH = "main"
+CATALOG_DIR = "model-catalog/models"
 
 logger = logging.getLogger(__name__)
 
@@ -109,39 +110,68 @@ class ModelSpec:
         return int(self.inference_config["max_seq_len"])
 
 
-def load_model(ref: str) -> ModelSpec:
-    """Load ``models/<ref>.json``, or ``ref`` itself when it is a path."""
+def catalog_name(rel: str) -> str:
+    """A model's name from its catalog path: glm-5.3/standard/h200-inference-full -> glm-5.3-standard-full."""
+    parts = rel.removesuffix(".json").strip("/").split("/")
+    parts[-1] = parts[-1].removeprefix("h200-inference-")
+    return "-".join(parts)
+
+
+@functools.lru_cache(maxsize=None)
+def _fetch_catalog_entry(rel: str) -> str:
+    """A catalog entry from CATALOG_REPO at CATALOG_BRANCH, through the gh CLI and its login."""
+    api = f"repos/{CATALOG_REPO}/contents/{CATALOG_DIR}/{rel}?ref={CATALOG_BRANCH}"
+    try:
+        out = subprocess.run(["gh", "api", "-H", "Accept: application/vnd.github.raw", api],
+                             capture_output=True, text=True, check=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        detail = getattr(exc, "stderr", "") or exc
+        raise ValueError(f"could not read {CATALOG_REPO}:{CATALOG_DIR}/{rel} at {CATALOG_BRANCH} ({detail}); "
+                         "pass catalog=PATH to a local checkout of the catalog's models/ directory") from exc
+    return out.stdout
+
+
+def load_model(ref: str, catalog: str | None = None) -> ModelSpec:
+    """The job config ``ref`` names.
+
+    ``ref`` is a path to a JSON file, or a catalog entry's path under the model
+    catalog's ``models/`` directory (``glm-5.3/standard/h200-inference-full``),
+    read from ``catalog``, a local checkout of that directory, or else from
+    CATALOG_REPO at CATALOG_BRANCH. A catalog entry holds its one sampling
+    sub-job under ``sub_job_configs``; a model file holds it under ``sub_job``
+    and may add ``name``, ``thresholds``, ``perf``, ``correctness`` and
+    ``copies``.
+    """
     path = Path(ref).expanduser()
-    if not path.exists():
-        path = MODELS_DIR / (ref if ref.endswith(".json") else f"{ref}.json")
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    if path.exists():
+        rel, source, text = "/".join(path.parts[-3:]), str(path), path.read_text(encoding="utf-8")
+    else:
+        rel = ref if ref.endswith(".json") else f"{ref}.json"
+        if catalog:
+            local = Path(catalog).expanduser() / rel
+            source, text = str(local), local.read_text(encoding="utf-8")
+        else:
+            source, text = f"{CATALOG_REPO}@{CATALOG_BRANCH}:{CATALOG_DIR}/{rel}", _fetch_catalog_entry(rel)
+    raw = json.loads(text)
+    if "sub_job_configs" in raw:
+        subs = raw["sub_job_configs"]
+        if len(subs) != 1:
+            raise ValueError(f"{source}: expected one sub-job in sub_job_configs, found {len(subs)}")
+        raw = {"name": catalog_name(rel), "sub_job": subs[0]}
     sub_job = raw["sub_job"]
     if sub_job.get("job_type") != "sampling":
-        raise ValueError(f"{path}: sub_job.job_type must be 'sampling'")
+        raise ValueError(f"{source}: sub_job.job_type must be 'sampling'")
     if "semi_p" in sub_job.get("inference_config", {}):
-        raise ValueError(f"{path}: leave inference_config.semi_p out; the suite sets it per job")
+        raise ValueError(f"{source}: leave inference_config.semi_p out; the suite sets it per job")
     return ModelSpec(
-        name=raw.get("name", path.stem),
+        name=raw.get("name", Path(source).stem),
         sub_job=sub_job,
         thresholds=raw.get("thresholds", {}),
         perf=raw.get("perf", {}),
         correctness=raw.get("correctness", {}),
         copies=raw.get("copies"),
-        path=str(path),
+        path=source,
     )
-
-
-def resolve_image_tag(spec: ModelSpec, override: str | None = None, backends_file: Path | str = BACKENDS_FILE) -> str:
-    """The backend image for ``spec``: ``override`` when given, else the model's
-    entry in ``backends_file``. Raises when the model has no entry."""
-    if override:
-        return override
-    path = Path(backends_file).expanduser()
-    backends = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    tag = (backends.get(spec.name) or {}).get("image_tag")
-    if not tag:
-        raise ValueError(f"{spec.name}: no image_tag in {path}; add one or pass debug_image_tag=")
-    return tag
 
 
 def copies_for(spec: ModelSpec, override: int | None = None, gpus_per_node: int = GPUS_PER_NODE) -> int:
@@ -160,19 +190,28 @@ def pod_spanning(spec: ModelSpec, gpus_per_node: int = GPUS_PER_NODE) -> bool:
 
 
 def plan_variants(spec: ModelSpec, wanted: list[str] | None = None) -> tuple[list[str], dict[str, str]]:
-    """The jobs to run and, for any dropped, why. ``off_matched`` equals
-    ``off_default`` below TP 2, and cannot be matched for a pod-spanning engine."""
+    """The jobs to run and, for any dropped, why. Any set that includes the
+    reference ``on_hit`` runs. ``off_matched`` equals ``off_default`` below TP 2,
+    and cannot be matched for a pod-spanning engine."""
     wanted = list(wanted or VARIANTS)
     unknown = [v for v in wanted if v not in VARIANTS]
-    if unknown or "on_hit" not in wanted or "off_default" not in wanted:
-        raise ValueError(f"variants must include on_hit and off_default and come from {VARIANTS}, got {wanted}")
+    if unknown or "on_hit" not in wanted:
+        raise ValueError(f"variants must include on_hit and come from {VARIANTS}, got {wanted}")
     skipped = {}
     if "off_matched" in wanted:
         if spec.tensor_parallel_size < 2:
             skipped["off_matched"] = "TP=1: semi_p changes no collective setting, so it equals off_default"
+            if "off_default" not in wanted:
+                skipped["off_matched"] += " (add off_default for a plain baseline)"
         elif pod_spanning(spec):
             skipped["off_matched"] = "pod-spanning engine: its NCCL network pinning cannot be matched on plain workers"
     return [v for v in VARIANTS if v in wanted and v not in skipped], skipped
+
+
+def plain_baseline(variants: Any) -> str | None:
+    """The plain job semi_p's perf and start-up are compared with: off_default,
+    else off_matched, else None (no plain job in the run)."""
+    return next((v for v in ("off_default", "off_matched") if v in variants), None)
 
 
 def build_variant_bodies(spec: ModelSpec, image_tag: str | None, variants: list[str], copies: int = 1,
@@ -213,13 +252,14 @@ def normalize_status(status: Any) -> str:
 
 @dataclass
 class JobTracker:
-    """A job's id and the wall-clock time each status was first seen."""
+    """A job's id, the wall-clock time each status was first seen, and when the suite cancelled it."""
 
     label: str
     job_id: str
     submitted_at: float
     transitions: dict = field(default_factory=dict)
     reason: str = ""
+    cancelled_at: float | None = None
 
     @property
     def status(self) -> str:
@@ -233,27 +273,28 @@ class JobTracker:
         return status
 
 
-def wait_running(client: Any, trackers: list[JobTracker], timeout_s: float, interval_s: float = 5.0) -> None:
-    """Poll every tracker until all are running; raise if one fails or time runs out."""
-    deadline = time.time() + timeout_s
-    pending = list(trackers)
-    while pending:
-        for tracker in list(pending):
-            status = tracker.poll(client)
-            if status == "running":
-                logger.info("%s job %s is running", tracker.label, tracker.job_id)
-                pending.remove(tracker)
-            elif status in TERMINAL:
-                raise RuntimeError(f"{tracker.label} job {tracker.job_id} ended {status}: {tracker.reason}")
-        if pending:
-            if time.time() > deadline:
-                names = ", ".join(f"{t.label}={t.status}" for t in pending)
-                raise TimeoutError(f"jobs not running after {timeout_s:.0f}s ({names})")
-            time.sleep(interval_s)
+def wait_until_running(client: Any, tracker: JobTracker, deadline: float, interval_s: float = 5.0,
+                       stop: threading.Event | None = None) -> bool:
+    """Poll one tracker until it is running (True) or ``stop`` is set (False);
+    raise if it ends or is not running by ``deadline`` (a ``time.time()``)."""
+    stop = stop or threading.Event()
+    while True:
+        status = tracker.poll(client)
+        if status == "running":
+            logger.info("%s job %s is running", tracker.label, tracker.job_id)
+            return True
+        if status in TERMINAL:
+            raise RuntimeError(f"{tracker.label} job {tracker.job_id} ended {status}: {tracker.reason}")
+        if time.time() > deadline:
+            raise TimeoutError(f"{tracker.label} job {tracker.job_id} not running "
+                               f"{time.time() - tracker.submitted_at:.0f}s after submission ({status})")
+        if stop.wait(interval_s):
+            return False
 
 
 def timeline(tracker: JobTracker) -> dict:
-    """Seconds from submission to each status, and the placement/start-up split."""
+    """Seconds from submission to each status, the placement/start-up split,
+    and how long the job ran before the suite cancelled it."""
     out = {status: round(t - tracker.submitted_at, 1) for status, t in tracker.transitions.items()}
     running = tracker.transitions.get("running")
     initializing = tracker.transitions.get("initializing")
@@ -261,4 +302,6 @@ def timeline(tracker: JobTracker) -> dict:
         out["submit_to_running_s"] = round(running - tracker.submitted_at, 1)
         if initializing is not None:
             out["initializing_to_running_s"] = round(running - initializing, 1)
+        if tracker.cancelled_at is not None:
+            out["running_to_cancelled_s"] = round(tracker.cancelled_at - running, 1)
     return out
