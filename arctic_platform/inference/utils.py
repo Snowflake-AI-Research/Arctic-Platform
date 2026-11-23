@@ -37,6 +37,11 @@ def get_runtime_vllm_version() -> str:
     return version
 
 
+def _public_vllm_version(version: str) -> str:
+    # PEP 440 local labels ("+...") identify the build, not the vLLM release.
+    return version.split("+", 1)[0]
+
+
 def require_supported_vllm_version(
     feature: str = "ArcticInference",
     *,
@@ -44,7 +49,7 @@ def require_supported_vllm_version(
 ) -> str:
     if version is None:
         version = get_runtime_vllm_version()
-    if version not in SUPPORTED_VLLM_VERSIONS:
+    if _public_vllm_version(version) not in SUPPORTED_VLLM_VERSIONS:
         supported = ", ".join(f"v{item}" for item in SUPPORTED_VLLM_VERSIONS)
         raise RuntimeError(
             f"{feature} supports vLLM {supported} only; found "
