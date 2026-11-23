@@ -74,17 +74,7 @@ GATE_MINIMUM = Decimal("0.001")
 RECORDED_ITERATIONS = (CHECKPOINT_ITERATION, ITERATIONS)
 
 
-@correctness_test(
-    TEST_ID,
-    title="Loss agreement between an uninterrupted run and a checkpoint-and-resume run",
-    criterion=(
-        "the loss at the checkpoint iteration and at the final iteration agree between the two runs "
-        "within the absolute gate onboarding measured for this config"
-    ),
-    compares_to_reference=False,
-    # Both Cortex create-time checkpoint initialization and on-prem runtime load are supported.
-    requires_hosted_control_plane=False,
-)
+@correctness_test(TEST_ID)
 def run(ctx) -> List[TestResult]:
     """Each case runs its three jobs through the same unmodified training configuration.
 
