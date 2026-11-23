@@ -466,6 +466,75 @@ def test_flash_moe_weights_the_down_projection_accumulator_before_rounding(
     assert layer.experts.w2.grad.abs().sum() > 0
 
 
+class _OwnerDispatch(_OneRankDispatch):
+    """Expert parallelism over ``owners`` ranks of equal expert blocks, in one process. Each owner folds its rows of a
+    token with ``sum_rows_by_token`` (fp32, rounded to BF16), as deepep/ucclep ``combine_tokens`` do, and the combine
+    adds the owners' BF16 subtotals in fp32 and rounds once, as the DeepEP/UCCL combine kernel does."""
+
+    def __init__(self, owners):
+        super().__init__()
+        self.owners, self.indices = owners, []
+
+    def dispatch_tokens_async(self, hidden, indices, scores, num_experts, group, *, score_before_experts):
+        self.indices.append(indices)
+        return super().dispatch_tokens_async(hidden, indices, scores, num_experts, group, score_before_experts=False)
+
+    def combine_tokens(self, rows, state):
+        assert state.permuted_scores is None  # the experts weighted the rows
+        self.received.append(SimpleNamespace(rows=rows, counts=state.counts))
+        owner = torch.repeat_interleave(torch.arange(len(state.counts)), state.counts) * self.owners // len(state.counts)
+        subtotals = [
+            _fp32_sum_rows_by_token(rows[owner == o], state.permuted_indices[owner == o], state.num_recv_tokens)
+            for o in range(self.owners)
+        ]
+        return torch.stack(subtotals).float().sum(0).to(rows.dtype)
+
+
+def _fp32_sum_rows_by_token(rows, token_indices, num_tokens):
+    """``sum_rows_by_token`` as CUDA's ``embedding_bag`` computes it: fp32 sums rounded once. CPU ``embedding_bag``
+    rounds BF16 bags differently, so the test substitutes this."""
+    return torch.zeros(num_tokens, rows.shape[1]).index_add_(0, token_indices, rows.float()).to(rows.dtype)
+
+
+@pytest.mark.parametrize("fp32_routed_weighting", [True, False])
+def test_flash_moe_sums_a_tokens_expert_rows_once_under_expert_parallelism(monkeypatch, fp32_routed_weighting):
+    """With fp32_routed_weighting, the MoE output under expert parallelism is what vLLM's fused MoE kernel computes on
+    a rank that holds whole experts: the token's weighted BF16 expert rows summed once, in fp32 (``moe_sum``), then
+    the shared expert added. Four expert owners of two experts each, top 4 of 8. Without the option the combine adds
+    each owner's BF16 subtotal, which rounds a token's rows more than once."""
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
+    from arctic_platform.model.implementations.moe.distributed import expert_parallel
+    from arctic_platform.model.implementations.moe.layers import moe
+
+    config = _glm_tiny_config()
+    config.text_config.n_routed_experts, config.text_config.num_experts_per_tok = 8, 4
+    config.use_grouped_mm, config.fp32_routed_weighting = False, fp32_routed_weighting
+    torch.manual_seed(0)
+    model = Glm5NextForConditionalGenerationPrimeRL(config)
+    layer = next(module for module in model.modules() if isinstance(module, moe.MoE)).to(torch.bfloat16)
+    with torch.no_grad():
+        for parameter in layer.parameters():
+            parameter.normal_(std=0.5)
+    dispatch, shared = _OwnerDispatch(owners=4), []
+    histc = torch.histc
+    monkeypatch.setattr(torch, "histc", lambda values, *args, **kwargs: histc(values.float(), *args, **kwargs))
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(expert_parallel, "get_ep_group", lambda experts: None)
+    monkeypatch.setattr(moe, "get_ep_comm_module", lambda backend: dispatch)
+    monkeypatch.setattr(moe, "sum_rows_by_token", _fp32_sum_rows_by_token, raising=False)
+    layer.shared_expert.register_forward_hook(lambda module, args, output: shared.append(output))
+
+    with torch.no_grad():
+        output = layer(torch.randn(1, 512, config.text_config.hidden_size).to(torch.bfloat16))[0]
+    (received,), (indices,) = dispatch.received, dispatch.indices
+    routes = indices.reshape(len(output), 4)
+    # Rows arrive grouped by expert, each expert's rows in token order: name each row's token from the routes.
+    tokens = torch.cat([(routes == expert).any(-1).nonzero()[:, 0] for expert in range(len(received.counts))])
+    routed = torch.zeros(output.shape, dtype=torch.float64).index_add_(0, tokens, received.rows.double())
+    expected = (shared[0].float() + routed.to(torch.bfloat16).float()).to(torch.bfloat16)
+    assert torch.equal(output, expected) is fp32_routed_weighting
+
+
 def test_weighted_down_projection_backward_is_that_of_the_bf16_gemm_then_weighting():
     from arctic_platform.model.implementations.moe.routing_weights import apply_routing_weights
     from arctic_platform.model.implementations.moe.routing_weights import weighted_down_projection

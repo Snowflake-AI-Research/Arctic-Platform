@@ -23,6 +23,8 @@ from ...kernels.sonic_experts import sonic_routed_experts
 from ...kernels.sonic_experts import sonic_routed_experts_applicable
 from ..routing_weights import apply_routing_weights
 from ..routing_weights import weighted_down_projection
+from ..token_combine import gather_token_rows
+from ..token_combine import sum_rows_by_token
 
 # ``routed_experts`` value marking a token with no captured routing: a caller that tolerates missing captures
 # (such as a trainer replaying sampler routing) sets it, and an opted-in router selects that token's experts with
@@ -146,8 +148,9 @@ class MoEArgs:
     route_scale: float = 1.0
     score_before_experts: bool = True
     fp32_router_logits: bool = False
-    # BF16 experts multiply each row's FP32 down-projection accumulator by its routing weight and round once, as
-    # vLLM's fused MoE kernel does; False rounds the expert output, then weights it.
+    # BF16 experts multiply each row's FP32 down-projection accumulator by its routing weight and round once, and
+    # expert parallelism sums a token's rows once, in fp32, as vLLM's fused MoE kernel does; False rounds the expert
+    # output, then weights it, and the combine adds each expert owner's BF16 subtotal.
     fp32_routed_weighting: bool = False
 
     # token-choice
@@ -951,15 +954,32 @@ class MoE(nn.Module):
             self.combine_replay.start()
             combine_kwargs["replay"] = self.combine_replay
 
-        def dispatch_chunk(start: int, end: int):
+        top_k = selected_experts_indices.shape[-1]
+
+        def dispatch(hidden, indices, scores):
+            if self.fp32_routed_weighting:
+                # One row per routed slot: no expert owner or combine forwarder adds two of a token's expert rows
+                # in BF16, and fold_slots sums them once, in fp32, as vLLM's moe_sum does.
+                slots = torch.arange(hidden.shape[0], device=hidden.device).repeat_interleave(top_k)
+                hidden = gather_token_rows(hidden, slots)
+                indices, scores = indices.reshape(-1, 1), scores.reshape(-1, 1)
             return dispatch_tokens_async(
-                x[start:end],
-                selected_experts_indices[start:end],
-                top_scores[start:end],
+                hidden,
+                indices,
+                scores,
                 num_experts=experts.num_experts,
                 group=group,
                 score_before_experts=self.score_before_experts,
             )
+
+        def fold_slots(rows):
+            if not self.fp32_routed_weighting:
+                return rows
+            tokens = rows.shape[0] // top_k
+            return sum_rows_by_token(rows, torch.arange(tokens, device=rows.device).repeat_interleave(top_k), tokens)
+
+        def dispatch_chunk(start: int, end: int):
+            return dispatch(x[start:end], selected_experts_indices[start:end], top_scores[start:end])
 
         def run_pending_chunk(pending_state):
             if use_sonic:
@@ -978,7 +998,9 @@ class MoE(nn.Module):
             )
             # Keep combine outside the checkpointed routed-expert region so
             # selective AC only recomputes local expert matmuls.
-            return combine_tokens(routed_output, replace(dispatch_state, permuted_scores=None), **combine_kwargs)
+            return fold_slots(
+                combine_tokens(routed_output, replace(dispatch_state, permuted_scores=None), **combine_kwargs)
+            )
 
         # dispatch/combine are collectives over the EP group: every rank must issue the
         # same number of calls in both forward and backward or heavier ranks hang on
@@ -1003,14 +1025,7 @@ class MoE(nn.Module):
         if checkpoint_chunks:
 
             def run_chunk(hidden, indices, scores):
-                pending = dispatch_tokens_async(
-                    hidden,
-                    indices,
-                    scores,
-                    num_experts=experts.num_experts,
-                    group=group,
-                    score_before_experts=self.score_before_experts,
-                )
+                pending = dispatch(hidden, indices, scores)
                 output = run_pending_chunk(pending)
                 sync_combine()
                 return output
