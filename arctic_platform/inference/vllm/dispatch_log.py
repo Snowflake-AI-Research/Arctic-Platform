@@ -13,39 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opt-in: log the batch class and kernel path of every linear-attention metadata build.
+"""Log the batch counts of each GDN metadata build and the prefill backend of its first layer.
 
-A hybrid model's linear-attention layers choose kernels from the step's batch: when any non-speculative row is a
-prefill, every non-speculative row, decodes included, runs the chunked prefill kernel; otherwise decodes run the
-recurrent kernel, and speculative rows their own path. Which path a token took is not visible in its outputs. With
-``ARCTIC_INFERENCE_LOG_DISPATCH=1`` each build logs one line naming it.
+Which kernel a linear-attention row runs depends on the counts of the step it shares: GLM-5.3's KDA layers, for
+example, run every non-speculative row through the chunked prefill kernel whenever the step holds a prefill.
 """
 
 import logging
 
-logger = logging.getLogger(__name__)
+# vLLM configures its own logger hierarchy at INFO; an ``arctic_platform`` logger inherits the root WARNING level.
+logger = logging.getLogger("vllm.v1.attention.backends.gdn_attn")
 
 _APPLIED = False
 
 
 def describe(builder, metadata) -> str:
-    """One line: the build's layer group, its batch class and the path its non-speculative rows take."""
+    """One line: the build's layer group, its first layer's class and KDA prefill backend, and the batch counts."""
     first_layer = builder.layer_names[0]
     layer = builder.vllm_config.compilation_config.static_forward_context[first_layer]
-    # KDA layers resolve their own prefill kernel; GDN layers use the builder's.
-    prefill_backend = getattr(layer, "kda_prefill_backend", builder.gdn_prefill_backend)
-    if metadata.num_prefills > 0:
-        path = f"chunked:{prefill_backend}"
-    elif metadata.num_decodes > 0:
-        path = "recurrent"
-    else:
-        path = "none"
+    # GLM-5.3's KDA layers keep the prefill kernel they resolved at construction; other layers choose theirs in code.
+    backend = getattr(layer, "kda_prefill_backend", None)
     return (
         f"linear-attention dispatch group={first_layer} layer={type(layer).__name__} "
-        f"prefills={metadata.num_prefills} prefill_tokens={metadata.num_prefill_tokens} "
+        + (f"kda_prefill_backend={backend} " if backend is not None else "")
+        + f"prefills={metadata.num_prefills} prefill_tokens={metadata.num_prefill_tokens} "
         f"decodes={metadata.num_decodes} decode_tokens={metadata.num_decode_tokens} "
-        f"spec_decodes={metadata.num_spec_decodes} spec_decode_tokens={metadata.num_spec_decode_tokens} "
-        f"non_spec_path={path}"
+        f"spec_decodes={metadata.num_spec_decodes} spec_decode_tokens={metadata.num_spec_decode_tokens}"
     )
 
 

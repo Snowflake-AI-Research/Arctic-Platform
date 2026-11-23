@@ -64,9 +64,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (worker.py) and the collector (receiver.py) agree.
     "ARCTIC_INFERENCE_DUMP_PARAM_L2":
     lambda: os.getenv("ARCTIC_INFERENCE_DUMP_PARAM_L2", "0") == "1",
-    # Kernel-path diagnostic (default off). When "1", every linear-attention
-    # metadata build logs the step's batch class and the kernel path its rows
-    # take (``arctic_platform.inference.vllm.dispatch_log``).
+    # Log each GDN metadata build's batch counts and its first layer's prefill backend.
     "ARCTIC_INFERENCE_LOG_DISPATCH":
     lambda: os.getenv("ARCTIC_INFERENCE_LOG_DISPATCH", "0") == "1",
 }
