@@ -4,7 +4,7 @@ import pytest
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.config.kv_transfer import KVTransferConfig
 
-from arctic_platform.inference.vllm.plugin import arctic_inference_plugin
+from arctic_platform.inference.vllm.required_patches import apply_required_vllm_patches
 
 
 def _capture_config(**parallel):
@@ -21,9 +21,8 @@ def _capture_config(**parallel):
     )
 
 
-def test_routed_expert_capture_with_decode_context_parallelism(monkeypatch):
-    monkeypatch.setenv("ARCTIC_INFERENCE_ENABLED", "0")
-    arctic_inference_plugin()
+def test_routed_expert_capture_with_decode_context_parallelism():
+    apply_required_vllm_patches()
     config = _capture_config(decode_context_parallel_size=8)
     VllmConfig._verify_aux_output_compatibility(config)
     assert config.parallel_config.decode_context_parallel_size == 8
