@@ -1888,6 +1888,7 @@ class InferenceWorker(StreamingWorkerMixin):
             self._active_lora_is_3d = bool(
                 results[0].get("is_3d_lora_weight", False) if results else False
             )
+            return _with_rank_recv_l2_sq(results)
         return results[0] if results else {}
 
     @stream_lifecycle_change
