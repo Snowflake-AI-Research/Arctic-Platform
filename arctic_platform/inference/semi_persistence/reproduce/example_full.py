@@ -64,7 +64,7 @@ def run_one(label, model_id, tp, util, gpus, extra):
           flush=True)
 
     print("\n== saved -> up ==", flush=True)
-    inst.save_weights().detach().wait()
+    inst.save_weights().release_host_weights().detach().wait()
 
     t0 = time.perf_counter()
     inst.sleep().wait()
@@ -98,7 +98,7 @@ def run_one(label, model_id, tp, util, gpus, extra):
     t1 = time.perf_counter()
     times["reinit_nccl"] = t1 - t0
 
-    inst.attach().load_weights().wait()
+    inst.attach().load_weights().refill_host_weights().wait()
 
     t0 = time.perf_counter()
     inst.wake_up_weights().wait()

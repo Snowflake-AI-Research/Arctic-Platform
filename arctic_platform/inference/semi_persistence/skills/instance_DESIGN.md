@@ -178,6 +178,7 @@ primitives must be:
 | `plan_restore_weights()` | Self-compute the budget from `max_pinned_bytes_per_worker` (the per-GPU shard, not the TP-aggregate) and walk each worker's `index` once to build a chunk plan (each chunk packs whole params under the budget).  Cache the plan on the worker for the next `restore_weights()`.  If the worker's buffer is pageable, also form a small pinned double buffer there (`SEMIP_PINNED_BUFFER_BYTES` split into two halves; `SEMIP_PINNED_BUFFER_BYTES=0` forms none). | Instance + Worker |
 | `restore_weights()`      | Pure execution against the cached chunk plan: per chunk, copy a slice of that worker's buffer to a single reused GPU staging buffer (half by half through the double buffer if the plan formed one), then scatter into `main.named_parameters()` and (if present) `drafter.model.named_parameters()` in place using the namespaced index.  Falls back to a single chunk if no plan was cached.  Frees the staging buffer and calls `empty_cache()` before returning. | Worker |
 | `save_weights()` / `load_weights()` | Write / read each worker's buffer as shards plus a `weights_meta.json` manifest.  Flat `weights/` at TP=1, per-rank `weights/rank{R}/` at TP>1. | Worker |
+| `release_host_weights()` / `refill_host_weights()` | Empty the host-resident parameters' mappings after `save_weights()`, and read them back from the shards after `load_weights()`.  See *Host-Resident Parameters*. | Worker |
 | `wake_up_weights()`     | Re-allocate weight tensors on GPU (main + drafter).  The arctic patch's disk reload of the main model is suppressed via `_skip_main_reload_on_wake`; both main and drafter parameters are populated by the subsequent `restore_weights()` from the worker's buffer.  Drafter `named_buffers()` are restored here from the per-sleep CPU snapshot. | Child |
 | `wake_up_kv_cache()`    | Re-allocate KV cache on GPU.                                 | Child                                      |
 | `generate(prompts, sp)` | Submit inference to the engine.  Assigns a unique `req_id`; result stored in `generate_results[req_id]` and `last_generate_result`. | Child (async engine loop) |
@@ -289,6 +290,15 @@ entry's `.data` (contiguous, viewed as uint8) into its own buffer at
 the recorded offset.  This captures weights in vLLM's post-processed
 internal format (e.g. Marlin-packed for GPTQ, cutlass layout for FP8,
 plain tensors for BF16) for both models in a single sweep.
+
+Parameters are not always all of the weights.  vLLM's triton_kernels
+MXFP4 MoE backends (gpt-oss on sm90) delete the expert Parameters in
+`process_weights_after_loading` and keep the swizzled experts as plain
+attributes, so the table also carries every storage in the cumem
+"weights" pool that a module reaches through its attributes and no
+parameter, buffer or LoRA slot owns, keyed `"main:s:<path>"` /
+`"drafter:s:<path>"` as a flat uint8 view.  These follow all parameters,
+so a model without any keeps its layout and weight hash.
 
 `named_buffers()` are intentionally not staged.  Main buffers ride
 stock vLLM's `_sleep_saved_buffers` snapshot; drafter buffers ride
@@ -404,6 +414,91 @@ KV cache is not yet allocated when `restore_weights` runs (it is
 `wake_up_kv_cache`'s job afterwards), so the `allotment - pinned`
 slack is fully usable for the staging buffer.  No NVML calls happen
 at runtime past the per-instance `init` snapshot.
+
+## Host-Resident Parameters
+
+A few parameters live in pinned host memory rather than on the GPU, and
+their kernels read them through their UVA address.  In the catalog that
+is only DeepSeek-V4.1-Flash's Engram n-gram tables,
+`layers.{1,14}.engram.embed_tokens.{weight,weight_scale_inv}`, 23.6 GiB
+per rank.  Like every parameter they were already in the weight set and
+`restore_weights` rewrote them from it, but CRIU stored them a second
+time: torch's pinned allocator rounds each up to a power of two, so every
+rank carried 33 GiB of driver memfds, about 280 GB of a ~400 GB DeepSeek
+skeleton.  Being pinned, they were also memory `cuCheckpointProcessRestore`
+has to re-map (see *Why separate attach / repin / unpin*).
+`host_weights.py` keeps them out of the image.
+
+**Which parameters qualify.**  A main or drafter parameter that is on
+the CPU, `is_pinned()`, at least 256 MiB, the whole of its storage, in an
+anonymous mapping (not a named file in `/proc/self/maps`; torch's pinned
+blocks are driver memfds), and overlapped by no other tensor the model
+reaches: parameters, buffers, and a breadth-first walk of module
+attributes.  The walk is what skips a cached UVA view, such as
+Qwen3.8-Flash-Next's eagerly built `_uva_weight`, which stays in the image
+as before.  A CPU parameter of at least 256 MiB that fails a check is
+logged as skipped, with the reason.
+
+**Load.**  `SemipGPUWorker.load_model` runs `host_weights.rehome` after
+vLLM's load and before `determine_available_memory`'s profiling capture,
+the first thing to bake a parameter's address into a graph.  One at a
+time, each parameter is copied into a private anonymous mapping semi_p
+owns, registered with `cudaHostRegister`, and checked for device pointer
+== host pointer: FULL CUDA graphs capture Engram's lookup kernel with that
+pointer as an argument, so the table must never move.  `param.data` then
+points at the mapping, torch's block goes back to the driver, and a
+checksum of the contents is recorded.  A parameter that cannot be
+registered at its own address stays where it was.  TP=1 has no worker
+hook and is unchanged.
+
+**Dump.**  `attach` leaves these entries out of the host copy, so
+`stage`, the chunk plan, `restore_weights` and the staging budget skip
+them, and `save_weights` writes them straight from their mappings.
+`release_host_weights` follows `save_weights`.  Each entry is checksummed
+and unregistered; one whose checksum is still the load-time one has its
+pages dropped (`MADV_DONTNEED`) and its mapping made `PROT_NONE`, so CRIU
+stores an empty mapping at the same address.  One that changed since load
+keeps its pages and rides the image as before, named in a WARNING.  Either
+way nothing is registered when `cuda_checkpoint` runs.
+
+**Restore.**  `refill_host_weights` follows `load_weights` and precedes
+`wake_up_weights`.  It reads each released entry's byte range out of the
+shards into its mapping, registers it again, and checks the address and
+the checksum.  It raises on an entry missing from `weights_meta.json` or
+sized differently there, shards that do not cover it, a short read, a
+failed registration (memlock limit) or a wrong checksum.  The child in an
+image dumped before these commands existed answers `unknown command`;
+serving never pairs the two, because new code means a new backend image
+and so a new `env12`.
+
+**The guard.**  While any entry is unregistered, released or unpinned,
+the child refuses `generate`, `wake_up_kv_cache`, `rebind_graphs`,
+`recapture_graphs`, `serve_core` and `resume`: the kernels would read an
+empty `PROT_NONE` address.  `unpin` / `repin` unregister and register the
+mappings as well, without dropping their pages, so the orchestrator's
+`unpin() -> ... -> repin()` sequences need no new step and keep the
+tables in the image.
+
+**What does not change.**  The weight set: names, offsets and bytes are
+the same, so the weight hash is too (DeepSeek's `072bf5f66d38`).
+
+**Weight sync.**  Updating these parameters is not supported.  Every sync
+of base weights ends with each rehomed parameter checking its storage and
+checksum, and a sync that wrote one fails.  `SEMIP_THIN_PINNED_PARAMS=0`
+leaves every parameter where vLLM put it, which is the old behaviour.
+
+**`meta.json`** gains `host_weights` when the dump released anything:
+`entries` (rank 0's `[name, nbytes]`), `bytes_per_rank` (bytes released
+per rank), `kept` (`[rank, name]` of entries that stayed in the image)
+and `released: true`.  It is a record only; the refill works from the
+worker state inside the image.
+
+**Multi-node.**  Both commands are leader `collective_rpc`s that reach
+every rank on every node.  `_dump_multinode` releases after
+`save_weights`, before any node's `cuda_checkpoint`; `_restore_multinode`
+refills after `load_weights`, each rank from its own `weight/rank{R}`.
+Only node 0's `meta.json` carries `host_weights`.  No Engram model runs
+across nodes today.
 
 ## Pause and Resume
 
