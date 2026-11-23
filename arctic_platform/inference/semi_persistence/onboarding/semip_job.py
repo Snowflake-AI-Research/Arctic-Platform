@@ -18,7 +18,7 @@
     python -m arctic_platform.inference.semi_persistence.onboarding.semip_job \\
         cluster=qa6|prod image_tag=TAG configs=URL max_gpus=N \\
         [tests=functional,correctness,performance] [dry_run=false] [out_dir=semip_job] \\
-        [connection=CONN.json] [kube_context=CTX]
+        [connection=CONN.json] [kube_context=CTX] [env_hash=ENV12]
 
 The driver behind the semip-publish Jenkins job; it runs the same anywhere.
 
@@ -41,6 +41,8 @@ The driver behind the semip-publish Jenkins job; it runs the same anywhere.
   connection   Cortex Training connection file (default $SEMIP_CONNECTION_QA6 /
                $SEMIP_CONNECTION_PROD for the cluster, else $SEMIP_CONNECTION)
   kube_context default: the cluster's
+  env_hash     dry run only: the env12 that image_tag's skeleton keys carry, to
+               tell a skeleton of this image from one of another
 
 ``configs`` is fetched from raw.githubusercontent.com at the resolved commit
 (GitHub's API resolves a branch; ``GITHUB_TOKEN``, if set, authenticates both)
@@ -64,6 +66,13 @@ status and test verdicts. Exits non-zero if a config did not publish, a
 requested test failed, or a config's tests could not run (they need more than
 ``max_gpus``). SIGINT, SIGTERM and SIGHUP are passed on to publish or onboard,
 which cancel their jobs.
+
+A dry run also computes each job's cfg12 offline (``keys``) and, when kubectl
+reaches the cluster's context, reads the node labels once to report which of
+those skeletons the model-cache nodes have verified: per env12, on how many of
+them. ``existing`` is ``none`` when publish would dump; with ``env_hash`` a
+skeleton is marked as this image's or another image's, and without it the env
+is unconfirmed. Without kubectl the lookup is skipped with a note.
 """
 
 from __future__ import annotations
@@ -87,6 +96,7 @@ from datetime import timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from arctic_platform.inference.semi_persistence.onboarding import keys
 from arctic_platform.inference.semi_persistence.onboarding import report
 from arctic_platform.inference.semi_persistence.onboarding.client import load_connection
 from arctic_platform.inference.semi_persistence.onboarding.common import as_bool
@@ -120,7 +130,10 @@ TESTS = ("functional", "correctness", "performance")
 CONFIGS_REPO = "cortex-training"
 CONFIGS_DIR = "model-catalog/semip_models/"
 COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+ENV_HASH = re.compile(r"^[0-9a-f]{12}$")
 PUBLISHED = ("published", "already")
+# An env12 shown only this far is taken as env_hash's when no weight hash can confirm it.
+ENV_PREFIX_CHARS = 6
 
 
 @dataclass(frozen=True)
@@ -162,6 +175,14 @@ def parse_max_gpus(value: str | None) -> int:
     if not re.fullmatch(r"[1-9][0-9]*", (value or "").strip()):
         raise SystemExit(f"max_gpus= must be a positive integer, got {value!r}")
     return int(value)
+
+
+def parse_env_hash(value: str | None) -> str | None:
+    if not value:
+        return None
+    if not ENV_HASH.match(value):
+        raise SystemExit(f"env_hash= must be the 12 lowercase hex digits of a skeleton key's env12, got {value!r}")
+    return value
 
 
 def parse_tests(value: str | None) -> list[str]:
@@ -290,14 +311,83 @@ def write_jsonl(specs: list[ModelSpec], path: Path, lines: dict[str, str]) -> Pa
     return path
 
 
+class NodesUnavailable(Exception):
+    """The node labels could not be read; the message says why."""
+
+
+def cluster_nodes(context: str, run: Callable = subprocess.run) -> list[dict]:
+    """Every node of kubeconfig context ``context``, from one ``kubectl get nodes``."""
+    if not shutil.which("kubectl"):
+        raise NodesUnavailable("kubectl is not on PATH")
+    argv = ["kubectl", f"--context={context}", "--request-timeout=30s", "get", "nodes", "-o", "json"]
+    try:
+        proc = run(argv, capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise NodesUnavailable(f"kubectl failed: {exc}") from None
+    if proc.returncode:
+        why = (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[-1]
+        raise NodesUnavailable(f"kubectl --context={context} get nodes failed: {why[:200]}")
+    try:
+        return json.loads(proc.stdout)["items"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise NodesUnavailable(f"kubectl get nodes returned no node list ({exc!r})") from None
+
+
+def env_text(found: keys.Found) -> str:
+    if found.env_exact:
+        return found.env[:10]
+    return f"{found.env}.." if found.env else "env ?"
+
+
+def match_of(found: keys.Found, env_hash: str | None, weights_known: bool) -> str:
+    """Whether a skeleton is image ``env_hash``'s: ``exists``, ``exists for another image``,
+    ``unconfirmed`` (its label shows too little of env12), or ``env unconfirmed`` (no env_hash)."""
+    if not env_hash:
+        return "env unconfirmed"
+    if found.env_exact or not env_hash.startswith(found.env):
+        return "exists" if found.env == env_hash else "exists for another image"
+    if weights_known:
+        # The label was checked against env_hash with every weight hash shown on the nodes.
+        return "exists for another image"
+    return "exists" if len(found.env) >= ENV_PREFIX_CHARS else "unconfirmed"
+
+
+def skeleton_status(found: list[keys.Found], matches: list[str], nodes: int, env_hash: str | None) -> str:
+    """``restore`` (this image's skeleton is on every node), ``partial``, ``dump`` or
+    ``unknown``; without ``env_hash`` any env counts as this image's."""
+    targets = [f for f, m in zip(found, matches) if m in ("exists", "env unconfirmed")]
+    best = max((f.nodes for f in targets), default=0)
+    if nodes and best == nodes:
+        return "restore"
+    if best:
+        return "partial"
+    return "unknown" if "unconfirmed" in matches else "dump"
+
+
+def existing_text(found: list[keys.Found], nodes: int, env_hash: str | None, matches: list[str]) -> str:
+    if not found:
+        return "none"
+    if not env_hash:
+        parts = [f"{env_text(f)}: {f.nodes}/{nodes} nodes" for f in found]
+        return ", ".join(parts) + (" (env unconfirmed)" if len(found) == 1 else "")
+    mine = [f"{env_text(f)}: {f.nodes}/{nodes} nodes ({m})" for f, m in zip(found, matches) if m != "exists for another image"]
+    other = [f"{env_text(f)} {f.nodes}/{nodes}" for f, m in zip(found, matches) if m == "exists for another image"]
+    parts = [", ".join(mine)] if mine else []
+    if other:
+        parts.append(f"exists for another image: {', '.join(other)}")
+    return "; ".join(parts)
+
+
 class SemipJob:
-    def __init__(self, args: dict[str, str], get: Callable = http_get):
+    def __init__(self, args: dict[str, str], get: Callable = http_get, nodes: Callable | None = None):
         self.cluster = parse_cluster(args.get("cluster"))
         self.image_tag = parse_image_tag(args.get("image_tag"), self.cluster)
         self.max_gpus = parse_max_gpus(args.get("max_gpus"))
         self.tests = parse_tests(args.get("tests"))
         self.dry_run = as_bool(args.get("dry_run") or "false")
         self.configs = parse_configs_url(args.get("configs"))
+        self.env_hash = parse_env_hash(args.get("env_hash"))
+        self.nodes = nodes or cluster_nodes
         self.kube_context = args.get("kube_context") or CLUSTERS[self.cluster].kube_context
         self.model_bucket = CLUSTERS[self.cluster].model_bucket
         self.connection = connection_path(args, self.cluster)
@@ -362,12 +452,14 @@ class SemipJob:
                 self.warnings.append(f"{len(too_big)} of {len(specs)} config(s) need more than max_gpus="
                                      f"{self.max_gpus} for their tests; they are published but not tested, "
                                      "and the run fails")
+        skeletons = self.skeletons(specs, plan) if self.dry_run else {}
         for s in specs:
             entry = {"name": s.name, "line": line_number(s), "model_name": s.sub_job.get("model_name"),
                      "max_seq_len": s.max_seq_len, "n_gpus": s.n_gpus, "tensor_parallel_size": s.tensor_parallel_size}
             if self.options:
                 gpus, nodes = footprint(s, self.options["variants"].split(","))
                 entry.update(test_gpus=gpus, test_nodes=nodes, onboard=too_big.get(s.name, "yes"))
+            entry.update(skeletons.get(s.name, {}))
             plan["jobs"].append(entry)
         plan["warnings"] = self.warnings
         (self.out / "plan.json").write_text(json.dumps(plan, indent=1) + "\n")
@@ -376,6 +468,77 @@ class SemipJob:
         for line in text.splitlines():
             logger.info("%s", line)
         return plan
+
+    def skeletons(self, specs: list[ModelSpec], plan: dict) -> dict[str, dict]:
+        """Each job's cfg12 and the skeletons the node cache verified for it, by job;
+        sets ``plan["node_cache"]``. Reads the node labels once, if kubectl can."""
+        keyings = {s.name: keys.keying(s.sub_job, json.loads(self.lines[s.name]).get("hardware")) for s in specs}
+        try:
+            cache = keys.NodeCache(self.nodes(self.kube_context), self.env_hash)
+            note = None
+        except NodesUnavailable as exc:
+            cache, note = None, f"not checked: {exc}"
+            logger.info("node cache %s", note)
+        lookups: dict[str, dict] = {}
+        chosen: dict[str, set] = {}
+        for s in specs:
+            k = keyings[s.name]
+            if k.cfg12:
+                lookups[s.name] = {k.reasoning_parser: cache.lookup(k.slug, k.cfg12)} if cache else {}
+            elif k.candidates and cache:
+                lookups[s.name] = {r: cache.lookup(k.slug, c) for r, c in k.candidates.items()}
+                hit = [r for r, lk in lookups[s.name].items() if lk.found]
+                if len(hit) == 1:
+                    chosen.setdefault(s.sub_job.get("model_name"), set()).add(hit[0])
+        # One checkpoint, one reasoner: what the labels show for a model holds for all its jobs.
+        reasoner = {m: next(iter(rs)) for m, rs in chosen.items() if len(rs) == 1}
+        out: dict[str, dict] = {}
+        counts = {"restore": 0, "partial": 0, "dump": 0, "unknown": 0, "other_image": 0}
+        for s in specs:
+            k = keyings[s.name]
+            entry: dict[str, Any] = {"slug": k.slug, "cfg12": k.cfg12, "reasoning_parser": k.reasoning_parser,
+                                     "reasoning_parser_from": "job" if k.cfg12 else None}
+            if k.reason:
+                entry["cfg12_note"] = k.reason
+            lk = lookups.get(s.name, {})
+            if not k.cfg12 and k.candidates:
+                entry["cfg12_candidates"] = {r or "none": c for r, c in k.candidates.items()}
+                r = reasoner.get(s.sub_job.get("model_name"), "?")
+                if r != "?":
+                    entry.update(cfg12=k.candidates[r], reasoning_parser=r, reasoning_parser_from="node labels")
+                    lk = {r: lk[r]}
+                else:
+                    entry["cfg12_note"] = ("the job names no reasoning_parser, so cfg12 depends on the one chat "
+                                           "pairs with the checkpoint's architecture; "
+                                           + ("no candidate is on the nodes" if cache else "the node labels tell which"))
+            if cache is None:
+                entry.update(skeleton="not checked", existing=[], existing_text="not checked")
+                out[s.name] = entry
+                continue
+            found = [f for result in lk.values() for f in result.found]
+            unreadable = max((result.unreadable for result in lk.values()), default=0)
+            weights_known = bool(cache.weights(k.slug))
+            pairs = sorted(((f, match_of(f, self.env_hash, weights_known)) for f in found),
+                           key=lambda p: (p[1] != "exists", -p[0].nodes, p[0].env))
+            found, matches = [f for f, _ in pairs], [m for _, m in pairs]
+            status = skeleton_status(found, matches, cache.nodes, self.env_hash)
+            if k.reason:
+                status, text = "unknown", f"? ({k.reason})"
+            elif not found and unreadable:
+                status, text = "unknown", f"? ({unreadable} skeleton label(s) of {k.slug} cut before cfg12)"
+            else:
+                text = existing_text(found, cache.nodes, self.env_hash, matches)
+            counts[status] += 1
+            counts["other_image"] += status == "dump" and "exists for another image" in matches
+            entry.update(skeleton=status, existing_text=text,
+                         existing=[{"env": f.env, "env_exact": f.env_exact, "nodes": f.nodes, "of": cache.nodes,
+                                    "match": m} for f, m in zip(found, matches)])
+            out[s.name] = entry
+        plan["node_cache"] = {"checked": cache is not None, "note": note, "kube_context": self.kube_context,
+                              "env_hash": self.env_hash, "nodes": cache.nodes if cache else None,
+                              "env_candidates": sorted(cache.envs) if cache else [],
+                              "summary": counts if cache else None}
+        return out
 
     def run(self, specs: list[ModelSpec], run_child: Callable | None = None) -> int:
         """Publish, then onboard what published and fits; write and log the result."""
@@ -436,18 +599,45 @@ def plan_text(plan: dict) -> str:
         + (f" -> onboard variants={onboard['variants']} checks={onboard['checks']}" if onboard else ""),
         f"max_gpus    {plan['max_gpus']} (reserve_gpus=0)",
         f"connection  {plan['connection'] or '-'}",
+    ]
+    cache = plan.get("node_cache")
+    if cache:
+        lines.append("node cache  " + (cache["note"] or f"{cache['nodes']} model-cache node(s) on {cache['kube_context']}, "
+                                       + (f"env_hash {cache['env_hash']}" if cache["env_hash"] else "no env_hash")))
+    lines += [
         "",
-        "| line | job | model_name | max_seq_len | n_gpus | TP |" + (" test GPUs | onboard |" if onboard else ""),
-        "|---|---|---|---|---|---|" + ("---|---|" if onboard else ""),
+        "| line | job | model_name | max_seq_len | n_gpus | TP |" + (" cfg12 | existing |" if cache else "")
+        + (" test GPUs | onboard |" if onboard else ""),
+        "|---|---|---|---|---|---|" + ("---|---|" if cache else "") + ("---|---|" if onboard else ""),
     ]
     for j in plan["jobs"]:
         lines.append(f"| {j['line']} | {j['name']} | {j['model_name']} | {j['max_seq_len']} | {j['n_gpus']} "
-                     f"| {j['tensor_parallel_size']} |" + (f" {j['test_gpus']} | {j['onboard']} |" if onboard else ""))
+                     f"| {j['tensor_parallel_size']} |"
+                     + (f" {j['cfg12'] or '?'} | {j['existing_text'].replace('|', '/')} |" if cache else "")
+                     + (f" {j['test_gpus']} | {j['onboard']} |" if onboard else ""))
+    if cache:
+        lines += ["", skeleton_summary(cache)]
+        if any(not j["cfg12"] and "cfg12_candidates" in j for j in plan["jobs"]):
+            lines.append("cfg12 ?: the job names no reasoning_parser and the node labels did not show which one chat "
+                         "adds for the checkpoint (plan.json lists the candidates)")
     lines += ["", f"publish: {plan['commands']['publish']}"]
     if "onboard" in plan["commands"]:
         lines.append(f"onboard: {plan['commands']['onboard']}")
     lines += [f"WARNING: {w}" for w in plan["warnings"]]
     return "\n".join(lines)
+
+
+def skeleton_summary(cache: dict) -> str:
+    counts = cache["summary"]
+    if counts is None:
+        return f"skeletons: not checked ({cache['note'].removeprefix('not checked: ')})"
+    text = (f"skeletons: {counts['restore']} will restore (all nodes), {counts['partial']} exist but not on "
+            f"all nodes, {counts['dump']} will dump")
+    if counts["other_image"]:
+        text += f" ({counts['other_image']} of them exist for another image)"
+    if counts["unknown"]:
+        text += f", {counts['unknown']} unknown"
+    return text + ("" if cache["env_hash"] else " (env unconfirmed: pass env_hash= to match this image)")
 
 
 def onboard_reports(out_dir: Path, since: str) -> dict[str, dict]:
@@ -538,9 +728,10 @@ def child_process(argv: list[str]) -> int:
     return code
 
 
-def main(argv: list[str], get: Callable = http_get, run_child: Callable | None = None) -> int:
+def main(argv: list[str], get: Callable = http_get, run_child: Callable | None = None,
+         nodes: Callable | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    job = SemipJob(parse_kv_args(argv), get)
+    job = SemipJob(parse_kv_args(argv), get, nodes)
     try:
         specs = job.fetch()
     except ValueError as exc:

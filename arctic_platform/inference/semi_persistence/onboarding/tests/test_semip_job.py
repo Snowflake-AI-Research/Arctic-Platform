@@ -24,6 +24,7 @@ import urllib.error
 
 import pytest
 
+from arctic_platform.inference.semi_persistence.onboarding import keys
 from arctic_platform.inference.semi_persistence.onboarding import onboard
 from arctic_platform.inference.semi_persistence.onboarding import publish
 from arctic_platform.inference.semi_persistence.onboarding import semip_job
@@ -65,6 +66,15 @@ class _GitHub:
         if url == f"https://raw.githubusercontent.com/{OWNER}/cortex-training/{SHA}/model-catalog/semip_models/jobs.jsonl":
             return self.text.encode()
         raise ValueError(f"GET {url}: HTTP 404 Not Found")
+
+
+@pytest.fixture(autouse=True)
+def no_cluster(monkeypatch):
+    """No test reads a real cluster's nodes: dry runs see no kubectl unless a test passes ``nodes=``."""
+    def unavailable(context):
+        raise semip_job.NodesUnavailable("kubectl is not on PATH")
+
+    monkeypatch.setattr(semip_job, "cluster_nodes", unavailable)
 
 
 @pytest.fixture
@@ -261,7 +271,11 @@ def test_a_dry_run_records_the_configs_and_the_plan_and_submits_nothing(monkeypa
     assert any("2 of 3 config(s) need more than max_gpus=16" in w for w in plan["warnings"])
     text = (out / "plan.txt").read_text()
     assert f"@{SHA} model-catalog/semip_models/jobs.jsonl (requested ref mert/semip-jobs-sample)" in text
-    assert f"| 4 | {ONE} | org/one | 32768 | 1 | 1 | 2 | yes |" in text
+    assert f"| 4 | {ONE} | org/one | 32768 | 1 | 1 | ? | not checked | 2 | yes |" in text
+    assert "node cache  not checked: kubectl is not on PATH" in text
+    assert "skeletons: not checked (kubectl is not on PATH)" in text
+    assert plan["node_cache"]["checked"] is False and plan["jobs"][2]["skeleton"] == "not checked"
+    assert set(plan["jobs"][2]["cfg12_candidates"]) == {"none", *keys.CHAT_REASONERS[1:]}
     assert f"publish: {pub}" in text and f"onboard: {onb}" in text
     assert "SECRET-PAT" not in text + json.dumps(plan) + capsys.readouterr().err
 
@@ -377,8 +391,14 @@ def test_a_publish_only_run_passes_when_every_config_published(monkeypatch, tmp_
         summary.write_text(json.dumps({n: {"status": "published"} for n in (BIG, NODE, ONE)}))
         return 0
 
-    assert semip_job.main(_args(tmp_path, connection), get=_GitHub(), run_child=run_child) == 0
+    def nodes(context):
+        raise AssertionError("a run that is not a dry run read the node labels")
+
+    assert semip_job.main(_args(tmp_path, connection), get=_GitHub(), run_child=run_child, nodes=nodes) == 0
     assert json.loads((tmp_path / "out" / "result.json").read_text())["failed"] == []
+    plan = json.loads((tmp_path / "out" / "plan.json").read_text())
+    assert "node_cache" not in plan and all("cfg12" not in j for j in plan["jobs"])
+    assert "| line | job | model_name | max_seq_len | n_gpus | TP |\n" in (tmp_path / "out" / "plan.txt").read_text()
 
 
 def test_a_missing_publish_summary_fails_every_config(monkeypatch, tmp_path, connection):

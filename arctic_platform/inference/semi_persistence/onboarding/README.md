@@ -224,7 +224,7 @@ one that waits for the nodes to verify the image. Then onboard the models with
 python -m arctic_platform.inference.semi_persistence.onboarding.semip_job cluster=qa6 \
     image_tag=release_20261119_163502_6ed8c6d2361-h max_gpus=16 tests=functional,correctness \
     configs=https://github.com/OWNER/cortex-training/blob/REF/model-catalog/semip_models/jobs.jsonl \
-    connection=qa6.config [dry_run=true] [out_dir=semip_job]
+    connection=qa6.config [dry_run=true] [env_hash=ENV12] [out_dir=semip_job]
 ```
 
 `cluster` (`qa6` or `prod`) sets `model_bucket` and the kubeconfig context the
@@ -240,6 +240,23 @@ Both tools get `max_gpus` with `reserve_gpus=0`. `dry_run=true` parses every
 line and writes `plan.txt` / `plan.json` with the exact commands, and submits
 nothing; a run writes `result.md` / `result.json` and fails if a job did not
 publish or a requested test failed or could not fit `max_gpus`.
+
+A dry run also says, per job, which skeleton publish would produce and whether
+the node cache has it. `cfg12` is computed offline from the job body (`keys.py`
+replays dss, `ModelConfig`, the worker and the engine; `tests/test_keys.py`
+holds it to published keys). With `kubectl` able to reach the cluster's context,
+the node labels are read once, and `existing` lists each env12 with a skeleton
+of that model and cfg12 and on how many model-cache nodes it is verified
+(`fc37441c0c: 16/16 nodes`), or `none` when publish would dump. Pass
+`env_hash=` (the image's env12) to mark which one is this image's
+(`exists` / `exists for another image`); without it the env is unconfirmed.
+The plan ends with `skeletons: X will restore (all nodes), Y exist but not on
+all nodes, Z will dump`. Without `kubectl` (as in Jenkins today) the lookup is
+skipped with a note. Two things stay `?`: a job that names no
+`reasoning_parser` gets one chat picks by the checkpoint's architecture, which
+only a matching label reveals, and labels cut by the 63-character limit before
+cfg12 (long model names such as `NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`) cannot
+be read.
 
 ## Model configs
 
