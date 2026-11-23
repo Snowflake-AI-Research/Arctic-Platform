@@ -121,6 +121,31 @@ def test_glm53_rejects_malformed_packed_boundaries(boundaries):
         )
 
 
+def test_glm53_sp_boundaries_from_positions_require_each_row_to_restart_at_zero(monkeypatch):
+    from arctic_platform.model.implementations.glm53 import context_parallel as cp
+
+    backbone = torch.nn.Module()
+    backbone.forward = lambda **kwargs: None
+    backbone._cp_world_size, backbone._cp_group = 2, None
+    layer = torch.nn.Module()
+    cp._wrap_backbone_forward(backbone, [layer])
+
+    def run(positions):
+        # Rank 1 of 2: its half of the call, and the whole call back from the all-gather.
+        gathered = torch.tensor([positions])
+        local = gathered[:, len(positions) // 2 :]
+        monkeypatch.setattr(cp, "_gather_sequence_no_grad", lambda tensor, group: gathered)
+        backbone(input_ids=torch.ones_like(local), position_ids=local)
+        return getattr(layer, cp._GLOBAL_CU_SEQLENS).tolist()
+
+    assert run([0, 1, 0, 1, 2, 0]) == [0, 2, 5, 6]
+    assert run([0, 2, 2, 0]) == [0, 3, 4]
+    # Rows [0, 1] | [1, 2] merge into [0, 3, 4]; rows [0, 1] | [1, 2] | [0] | [2] into [0, 3, 6], full length.
+    for positions in ([0, 1, 1, 2], [0, 1, 1, 2, 0, 2]):
+        with pytest.raises(ValueError, match="restart at 0"):
+            run(positions)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="packed KDA kernels require CUDA")
 def test_glm53_sp1_packed_kda_outputs_and_gradients_match_isolated_row(tiny_glm_sparse_model):
     torch.manual_seed(23)
