@@ -271,7 +271,6 @@ def test_action_mask_cache_stats_reach_scheduler_metrics(monkeypatch):
     scheduler._workers = [
         SimpleNamespace(handle=SimpleNamespace(drain_metrics=DrainRemote()))
     ]
-    scheduler._concurrency_history = []
     scheduler._request_records = SimpleNamespace(drain=lambda: [])
 
     metrics = asyncio.run(scheduler.drain_metrics())

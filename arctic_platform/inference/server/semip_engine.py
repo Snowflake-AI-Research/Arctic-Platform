@@ -4,7 +4,7 @@
 When a job sets ``semi_p: true`` we instead **restore a pre-warmed CRIU image**
 via ``arctic_platform.inference.semi_persistence.Instance``. ``restore_engine``
 does that and returns a ``RestoredEngine`` handle; the ``AsyncLLM`` front end
-that serves it is in ``semip_asyncllm.py`` and ``semip_frontend.py``.
+that serves it is in ``semip_frontend.py``.
 
 The vLLM engine itself lives out-of-process inside the ``Instance``'s vLLM
 child; every call here forwards over the ``Instance`` queue/pipe and blocks, so
@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import glob
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -111,6 +112,8 @@ _PUBLISHER = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "semi_persistence", "scripts", "semip_publish.py")
 _PUBLISH_HASH_WORKERS = 32
+# The publisher hashes and compresses beside the job it publishes for.
+_PUBLISH_NICE = 10
 # Outside the image cache, so nothing here is ever uploaded. Each replica of a
 # pod marks itself ready here once its dump has restored; slot 0 publishes the
 # pod's key when every slot has.
@@ -246,6 +249,21 @@ _INCOMING_NAME = ".incoming"
 # which is why this order is spelled out here rather than reusing the
 # publisher's SKELETON_DIRS, whose order is only its upload order.
 _COPY_SUBDIRS = (_COMPILATION_DIR, _IMAGE_DIR)
+
+# How those directories are copied: semi_persistence/materialize.py's parallel ranged copy from
+# the mirror with O_DIRECT writes, ~4 s for GLM-5.3's 79 GB where copytree
+# takes ~20, which also decodes a compressed skeleton's pages. It plans from
+# the daemon's manifest, which every verified mirror directory carries.
+_DAEMON_MANIFEST = "_neutrino_manifest.json"
+
+# The GIL switch interval a materialize runs under. Its pre-checks and gather
+# are thousands of short syscalls, each of which hands the GIL back and must
+# wait to retake it; beside a thread running Python bytecode that wait is up
+# to the default 5 ms every time. Measured on QA6, the verification walk of
+# gemma-3-4b-it's 463 files went from 2 ms to 4.2 s beside one busy thread,
+# and in a local run a compressed gather went from 0.42 s to 32 s; at 0.1 ms
+# they took 0.14 s and 1.2 s.
+_MATERIALIZE_SWITCH_INTERVAL_S = 1e-4
 
 # Written by _semip_save_weights beside the shards it indexes; TP>1 fans out
 # into rank<N>/ subdirectories with one of these each.
@@ -950,10 +968,7 @@ def _resolve_model_dir(vllm_config: dict[str, Any],
     if nnodes > 1:
         model_dir = os.path.join(model_dir, f"{_NODE_DIR_PREFIX}{node_rank}")
 
-    raw_source = os.environ.get(_IMAGE_SOURCE_ENV)
-    if raw_source is None:
-        raw_source = _DEFAULT_IMAGE_SOURCE
-    source_root = raw_source.strip().rstrip("/")
+    source_root = _image_source_root()
     if source_root == root:
         # The mirror is read-only and the cache is written to, so one path
         # cannot be both. Copying a directory onto itself would at best waste
@@ -997,6 +1012,14 @@ def _resolve_model_dir(vllm_config: dict[str, Any],
     return _ImagePaths(model_dir, key, skeleton_root, weight_root,
                        image_ref, driver, slot, count, key_dir, nnodes,
                        node_rank)
+
+
+def _image_source_root() -> str:
+    """The mirror root, or "" when the job turned the mirror off."""
+    raw_source = os.environ.get(_IMAGE_SOURCE_ENV)
+    if raw_source is None:
+        raw_source = _DEFAULT_IMAGE_SOURCE
+    return raw_source.strip().rstrip("/")
 
 
 def _model_slug(model: Any) -> str:
@@ -1254,6 +1277,11 @@ def _check_env_files(meta: dict[str, Any], model_dir: str, *,
 
     scope = "under" if under_model_dir else "outside"
     if missing:
+        # /dev/shm segments are hundreds of the absences on any TP image, and the
+        # dump unlinks them so CRIU carries them as ghosts; anything else is the
+        # likelier cause of a "Can't open file", so it goes first in the
+        # truncated report.
+        missing.sort(key=lambda p: p.startswith("/dev/shm/"))
         logger.warning(
             "semi_p: %d of %d mapping(s) %s %s are absent (%s); not fatal on "
             "its own -- CRIU re-validates size, and a ghosted or recreated "
@@ -1269,7 +1297,7 @@ def _check_env_files(meta: dict[str, Any], model_dir: str, *,
             " ..." if len(mismatched) > _ENV_FILES_REPORT else "")
     else:
         logger.info("semi_p: %d mapping(s) %s %s match the image",
-                    checked, scope, model_dir)
+                    checked - len(missing), scope, model_dir)
     return mismatched
 
 
@@ -1281,7 +1309,7 @@ def _apply_recorded_modes(meta: dict[str, Any], scope: str) -> int:
     when it was dumped has to be 0755 again when it is re-opened. Copying
     preserves mode faithfully, but the mirror is downstream of S3, which has no
     POSIX mode at all -- so what a materialize copies is already flattened to
-    0644 and there is nothing left for ``copy2`` to preserve. The recorded mode
+    0644 and there is nothing left for the copy to preserve. The recorded mode
     from ``_record_env_files`` is the only place the original survives.
 
     ``scope`` is the subtree a materialize just put in place, and it is a
@@ -1516,6 +1544,38 @@ def _dir_bytes(root: str) -> tuple[int, int]:
     return files, total
 
 
+_SWITCH_LOCK = threading.Lock()
+_SWITCH_STATE = {"depth": 0, "saved": None}
+
+
+@contextlib.contextmanager
+def _gil_priority():
+    """Run the body under ``_MATERIALIZE_SWITCH_INTERVAL_S``, then put it back.
+
+    The interval is process-wide, so overlapping bodies share one saved value
+    and the last to leave restores it.
+    """
+    with _SWITCH_LOCK:
+        if _SWITCH_STATE["depth"] == 0:
+            saved = sys.getswitchinterval()
+            # setswitchinterval truncates to whole microseconds, so a value
+            # that is already short enough is not written back at all.
+            _SWITCH_STATE["saved"] = (
+                saved if saved > _MATERIALIZE_SWITCH_INTERVAL_S else None)
+            if _SWITCH_STATE["saved"] is not None:
+                sys.setswitchinterval(_MATERIALIZE_SWITCH_INTERVAL_S)
+        _SWITCH_STATE["depth"] += 1
+    try:
+        yield
+    finally:
+        with _SWITCH_LOCK:
+            _SWITCH_STATE["depth"] -= 1
+            if (_SWITCH_STATE["depth"] == 0
+                    and _SWITCH_STATE["saved"] is not None):
+                sys.setswitchinterval(_SWITCH_STATE["saved"])
+
+
+@_gil_priority()
 def _materialize_from_source(source_dir: str | None, model_dir: str,
                              weight_root: str | None = None,
                              weight_hash: str | None = None, *,
@@ -1562,6 +1622,7 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
     """
     if not source_dir:
         return False
+    t_checks = time.perf_counter()
     if not os.path.isdir(source_dir):
         if strict:
             raise RuntimeError(
@@ -1668,22 +1729,35 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
 
     incoming = os.path.join(model_dir, _INCOMING_NAME)
     t0 = time.perf_counter()
+    checks_s = t0 - t_checks
     files = total = 0
+    gathered = None
     try:
         shutil.rmtree(incoming, ignore_errors=True)
         for sub in _COPY_SUBDIRS:
             src = os.path.join(source_dir, sub)
             if not os.path.isdir(src):
                 raise RuntimeError(f"{src} is missing from the published image")
-            # copytree defaults to copy2, which preserves mode. Necessary but
-            # not sufficient: CRIU re-validates the recorded mode of every path
-            # it re-maps, and `src` is downstream of S3, which carries no POSIX
-            # mode -- so these bytes arrive already flattened to the mirroring
-            # daemon's umask and there is nothing left here to preserve.
-            # _apply_recorded_modes repairs that after the flip. Do not shell
-            # out to `cp -a` instead -- it implies -p, tries to chown as a
-            # non-root user, and returns non-zero after copying fine.
-            shutil.copytree(src, os.path.join(incoming, sub))
+        # By name rather than `from ... import`: the tests load this module
+        # from its file, without the package, and register the gather in
+        # sys.modules the same way.
+        materialize = importlib.import_module(
+            "arctic_platform.inference.semi_persistence.materialize")
+        fmt = materialize.compression_format(verified_dir or source_dir)
+        if fmt > materialize.FORMAT:
+            # Every replica reads the same manifest, so even strict is a miss.
+            logger.warning(
+                "semi_p: %s: skeleton format %d is newer than this engine, "
+                "which reads format %d; cold-starting", source_dir, fmt,
+                materialize.FORMAT)
+            return False
+        # The gather keeps the mirror's modes, which is necessary but not
+        # sufficient: CRIU re-validates the recorded mode of every path it
+        # re-maps, and the source is downstream of S3, which carries no POSIX
+        # mode -- so these bytes arrive already flattened to the mirroring
+        # daemon's umask. _apply_recorded_modes repairs that after the flip.
+        gathered = materialize.gather(
+            source_dir, verified_dir or source_dir, incoming, _COPY_SUBDIRS)
         files, total = _dir_bytes(incoming)
 
         for sub in _COPY_SUBDIRS:
@@ -1722,11 +1796,20 @@ def _materialize_from_source(source_dir: str | None, model_dir: str,
         shutil.rmtree(incoming, ignore_errors=True)
 
     elapsed = time.perf_counter() - t0
+    how = (f"; {gathered.ranges} range(s) over {gathered.flows} flow(s)"
+           f"{', O_DIRECT' if gathered.direct else ''}")
+    if gathered.compressed_files:
+        raw = gathered.written_bytes + gathered.zero_bytes
+        how += (f"; pages: {gathered.stored_bytes / 2**30:.2f} GiB stored -> "
+                f"{raw / 2**30:.2f} GiB raw in {gathered.compressed_files} "
+                f"file(s), {gathered.zero_bytes / 2**30:.2f} GiB zero frames "
+                f"left unwritten, {gathered.written_bytes / 2**30:.2f} GiB "
+                f"written, decode {gathered.decode_cpu_s:.1f} core-s")
     logger.info(
         "semi_p: materialized %s from %s: %d file(s), %.2f GiB in %.1fs "
-        "(%.0f MB/s); weights stay on the mirror",
+        "(%.0f MB/s) after %.2fs of pre-checks; weights stay on the mirror%s",
         model_dir, source_dir, files, total / 2**30, elapsed,
-        total / 1e6 / elapsed if elapsed > 0 else 0.0)
+        total / 1e6 / elapsed if elapsed > 0 else 0.0, checks_s, how)
     return True
 
 
@@ -2292,8 +2375,9 @@ def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
     whose images this adapter has restored repeatedly. It needs **no TP branch**:
     ``cuda_checkpoint()`` inserts ``destroy_nccl()`` itself when
     ``tensor_parallel_size > 1``, so unlike the restore side -- where the caller
-    must add ``reinit_nccl()`` and ``rebind_graphs()`` by hand -- there is
-    nothing here a TP1 test hides.
+    must add ``reinit_nccl()`` and ``rebind_graphs()`` (``recapture_graphs()``
+    when the dump dropped the graphs) by hand -- there is nothing here a TP1
+    test hides.
     See ``semi_persistence/skills/tp_DESIGN.md`` Section 2.
 
     The ordering is a contract rather than a style: ``save_weights()`` sits
@@ -2338,6 +2422,7 @@ def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
         inst.attach()
         inst.stage()
         inst.save_weights()
+        inst.release_host_weights()
         inst.detach()
         inst.sleep()
         # Checked before the checkpoint: an engine that failed to sleep still
@@ -2348,7 +2433,8 @@ def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
         inst.criu_dump(meta_extra={"image_ref": image_ref,
                                    "driver_version": driver_version,
                                    "pid_floor": pid_floor,
-                                   "unprivileged": _unprivileged_mode()})
+                                   "unprivileged": _unprivileged_mode(),
+                                   **_host_weights_meta(inst)})
         inst.wait()             # criu_dump destroys the child
     except BaseException:
         _discard_image(model_dir)
@@ -2366,6 +2452,14 @@ def _dump(vllm_config: dict[str, Any], model_dir: str, gpus: list[int], *,
     _record_env_files(model_dir)
     logger.info("semi_p: dump complete model_dir=%s in %.1fs",
                 model_dir, time.perf_counter() - t0)
+
+
+def _host_weights_meta(inst: Any) -> dict[str, Any]:
+    """``{"host_weights": ...}`` for ``meta.json`` when the dump released any
+    host-resident parameter (``release_host_weights``), else nothing.  A record
+    of what the image left out; the restore reads it from the image itself."""
+    released = inst.last_info.get("release_host_weights") or {}
+    return {"host_weights": released["host_weights"]} if released.get("host_weights") else {}
 
 
 def _unprivileged_mode() -> bool:
@@ -2388,6 +2482,15 @@ def _unprivileged_mismatch(meta: dict[str, Any]) -> str | None:
             f"{'1' if recorded else '0'} but this process runs with "
             f"{os.environ.get(_UNPRIVILEGED_ENV)!r}; its recorded capability "
             f"level only restores under the same mode")
+
+
+def _graphs_dropped(meta: dict[str, Any]) -> bool:
+    """Whether the dump destroyed the image's CUDA graphs before ``destroy_nccl``.
+
+    Such an image has nothing to rebind and must recapture. Images that predate
+    the field kept their graphs; the multi-node restore recaptures regardless.
+    """
+    return bool(meta.get("graphs_dropped"))
 
 
 def _restore(model_dir: str, engine_kwargs: dict[str, Any],
@@ -2422,9 +2525,16 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
     _check_device_visibility(meta, model_dir)
     gpus = _dump_placement(meta, gpus, model_dir)
     _check_gpu_placement(meta, gpus, model_dir)
+    recapture = _graphs_dropped(meta)
 
     logger.info("semi_p: restoring image model_dir=%s (dumped on %s) onto "
                 "physical GPU(s) %s", model_dir, meta.get("gpus"), gpus)
+    if recapture:
+        logger.info("semi_p: the dump dropped this image's CUDA graphs (%s; "
+                    "NCCL kernel nodes per rank %s), so the restore "
+                    "recaptures them instead of rebinding",
+                    meta.get("graphs_dropped_reason"),
+                    meta.get("graph_nccl_nodes"))
     inst = Instance(baked, model_dir)
 
     # Serving restore, following reproduce/example_full.py. The wait()
@@ -2438,12 +2548,16 @@ def _restore(model_dir: str, engine_kwargs: dict[str, Any],
         inst.cuda_restore(gpus=gpus).wait()
         inst.reinit_nccl().wait()
         inst.attach().load_weights(weights_dir=weights_dir).wait()
+        inst.refill_host_weights(weights_dir=weights_dir).wait()
         inst.wake_up_weights().wait()
         _check_staging_budget(inst, model_dir)
         inst.plan_restore_weights().wait()
         inst.restore_weights().wait()
         inst.wake_up_kv_cache().wait()
-        inst.rebind_graphs().wait()
+        if recapture:
+            inst.recapture_graphs().wait()
+        else:
+            inst.rebind_graphs().wait()
     except BaseException:
         # Do not leak the Instance's worker process (or a partially restored
         # tree) when the restore fails. This matters more than it looks:
@@ -2632,6 +2746,7 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
         inst.attach()
         inst.stage()
         inst.save_weights(weights_dir=weights_dir)
+        inst.release_host_weights()
         inst.detach()
         inst.sleep()
         inst.wait()             # a failed sleep is never checkpointed; see _dump
@@ -2644,7 +2759,7 @@ def _dump_multinode(vllm_config: dict[str, Any], paths: _ImagePaths,
         # Issued before the leader's dump so the wait inside them overlaps it.
         dumping = [agent.criu_dump.remote(_meta(k + 1))
                    for k, agent in enumerate(agents)]
-        inst.criu_dump(meta_extra=_meta(0))
+        inst.criu_dump(meta_extra={**_meta(0), **_host_weights_meta(inst)})
         inst.wait()
         ray.get(dumping)
     except BaseException:
@@ -2742,6 +2857,7 @@ def _restore_multinode(engine_kwargs: dict[str, Any], paths: _ImagePaths,
         inst.reinit_nccl(master_addr=leader_ip,
                          ifname=_multinode_ifname()).wait()
         inst.attach().load_weights(weights_dir=weights_dir).wait()
+        inst.refill_host_weights(weights_dir=weights_dir).wait()
         inst.wake_up_weights().wait()
         _check_staging_budget(inst, model_dir)
         inst.plan_restore_weights().wait()
@@ -2943,7 +3059,8 @@ def _publish_ready_marker(key_dir: str, slot: int) -> str:
 
 def _publish_command(key_dir: str) -> list[str]:
     return [sys.executable, _PUBLISHER, key_dir, "--bucket", _PUBLISH_BUCKET,
-            "--hash-workers", str(_PUBLISH_HASH_WORKERS)]
+            "--hash-workers", str(_PUBLISH_HASH_WORKERS),
+            "--nice", str(_PUBLISH_NICE)]
 
 
 def _run_publisher(key_dir: str) -> int:
@@ -3078,11 +3195,21 @@ def _tee_tree_to_ray() -> None:
 
 
 def restore_engine(engine_kwargs: dict[str, Any],
-                   agents: list[Any] | None = None) -> RestoredEngine:
+                   agents: list[Any] | None = None, *,
+                   past_the_copy: Any = None) -> RestoredEngine:
     """Bring a semi-p engine up and return its ``RestoredEngine`` (blocking).
 
     Intended to be called via ``asyncio.to_thread`` from the worker. The
     caller hands the result to a front end, which then owns it.
+
+    ``past_the_copy``, if given, is called with no arguments once this process
+    is done copying from the mirror -- the image is local, or the miss is
+    going to a dump -- and before the restore itself. The front end starts its
+    renderer build there rather than beside the copy, because the build runs
+    Python bytecode for seconds and the copy is GIL-bound (see
+    ``_MATERIALIZE_SWITCH_INTERVAL_S``); the restore's steps run in the child
+    and leave this process waiting. It may be called more than once, and is
+    not called if this raises first.
 
     ``agents`` are the ``SemipNodeAgent`` handles for the other pods when this
     engine's TP group spans pods; ``None`` or empty is the single-pod case,
@@ -3146,9 +3273,10 @@ def restore_engine(engine_kwargs: dict[str, Any],
     gpus = _resolve_physical_gpus()
     _check_tp_matches_gpus(vllm_config, gpus, paths.nnodes)
 
+    past_the_copy = past_the_copy or (lambda: None)
     if agents:
         return _multinode_restore_and_wrap(
-            engine_kwargs, vllm_config, paths, gpus, agents)
+            engine_kwargs, vllm_config, paths, gpus, agents, past_the_copy)
 
     # Resolved before the lock and re-used after it: the published tree is
     # read-only, so listing it twice could only produce the same answer at extra
@@ -3180,11 +3308,13 @@ def restore_engine(engine_kwargs: dict[str, Any],
             elif not _dump_publish_requested():
                 raise _miss_error(model_dir, skeleton_dir)
             else:
+                past_the_copy()
                 _dump(vllm_config, model_dir, gpus,
                       image_ref=paths.image_ref,
                       driver_version=paths.driver_version)
                 after = "dump we just took"
                 dumped = True
+    past_the_copy()
 
     # Nothing is cleaned up here on the miss path: _worker_criu_save rmtree's
     # image/ before writing, and _semip_save_weights does the same for its rank
@@ -3203,7 +3333,9 @@ def restore_engine(engine_kwargs: dict[str, Any],
 def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
                                 vllm_config: dict[str, Any],
                                 paths: _ImagePaths, gpus: list[int],
-                                agents: list[Any]) -> RestoredEngine:
+                                agents: list[Any],
+                                past_the_copy: Any = lambda: None
+                                ) -> RestoredEngine:
     """``restore_engine`` for an engine whose TP group spans pods.
 
     Same shape as the single-pod path -- hit, else materialize, else dump if
@@ -3237,6 +3369,7 @@ def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
                     raise _miss_error(key_dir,
                                       _resolve_published_skeleton(paths)[0])
                 else:
+                    past_the_copy()
                     _dump_multinode(
                         vllm_config, paths, gpus, agents,
                         master_port=_pick_master_port(),
@@ -3251,6 +3384,7 @@ def _multinode_restore_and_wrap(engine_kwargs: dict[str, Any],
                         "semi_p: after a multi-node dump the node-partitions still do "
                         "not agree on a dump_id; refusing to restore a set "
                         "that would deadlock in its first collective")
+    past_the_copy()
 
     skeleton_dir, weight_hash = _resolve_published_skeleton(paths)
     weights_dir = _weights_dir_for_restore(
