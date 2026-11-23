@@ -51,9 +51,10 @@ class FlashMoeOptions(GenericMoeOptions):
         False,
         description=(
             "BF16 experts multiply the down projection's fp32 accumulator by the routing weight and round once, and "
-            "under expert parallelism the source sums those rows in routing-slot order in fp32 and rounds once. It "
-            "runs one fp32-output GEMM per local expert in place of the grouped GEMM (on H200 the routed experts' "
-            "forward plus backward takes 16-19% longer) and exchanges one row per active slot. FP8 experts reject it."
+            "under expert parallelism the source sums those rows in routing-slot order in fp32 and rounds once. "
+            "Each chunk dispatches and combines once per slot and runs a separate fp32-output GEMM per local "
+            "expert for each dispatch. The weighted projection alone took 16-19% longer in an H200 routed-expert "
+            "forward/backward comparison. FP8 experts reject it."
         ),
     )
 

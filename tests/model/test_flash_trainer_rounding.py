@@ -393,7 +393,7 @@ class _OneRankDispatch:
         raise AssertionError("took the SonicMoE path")
 
 
-def _flash_moe(model: str, fp32_routed_weighting: bool, use_grouped_mm: bool):
+def _flash_moe(model: str, fp32_routed_weighting: bool, use_grouped_mm: bool, *, top_k: int | None = None):
     from arctic_platform.model.implementations.moe.layers.moe import MoE
 
     if model == "glm5_next":
@@ -409,6 +409,8 @@ def _flash_moe(model: str, fp32_routed_weighting: bool, use_grouped_mm: bool):
         from tests.model.test_qwen4_exp import _tiny_config as _qwen_tiny_config
 
         config = _qwen_tiny_config()
+    if top_k is not None:
+        config.text_config.num_experts_per_tok = top_k
     config.use_grouped_mm = use_grouped_mm
     config.fp32_routed_weighting = fp32_routed_weighting
     torch.manual_seed(0)
@@ -437,8 +439,7 @@ def test_flash_moe_weights_the_down_projection_accumulator_before_rounding(
 
     def routed_hidden(gate, up, limit):  # the down projection's input; shared experts run after the combine
         output = swiglu(gate, up, limit)
-        if not dispatch.received:
-            hidden.append(output)
+        hidden.append(output)
         return output
 
     histc = torch.histc
@@ -452,15 +453,16 @@ def test_flash_moe_weights_the_down_projection_accumulator_before_rounding(
         monkeypatch.setattr(moe, "sonic_routed_experts_applicable", lambda experts: True)
 
     output = layer(torch.randn(1, 512, layer.experts.w2.shape[1]).to(torch.bfloat16))
-    (received,) = dispatch.received
-    h, w2 = torch.cat(hidden).double(), layer.experts.w2.detach().double()
-    expert = torch.repeat_interleave(torch.arange(len(received.counts)), received.counts)
-    reference = torch.einsum("ri,rhi->rh", h, w2[expert]) * received.scores.detach().double()[:, None]
+    rows = torch.cat([call.rows for call in dispatch.received])
+    scores = torch.cat([call.scores for call in dispatch.received])
+    expert = torch.cat([torch.arange(len(call.counts)).repeat_interleave(call.counts) for call in dispatch.received])
+    h, w2 = torch.cat(hidden)[: len(rows)].double(), layer.experts.w2.detach().double()
+    reference = torch.einsum("ri,rhi->rh", h, w2[expert]) * scores.detach().double()[:, None]
     if fp32_routed_weighting:
-        _assert_rounded_once(received.rows, reference)
+        _assert_rounded_once(rows, reference)
     else:
         with pytest.raises(AssertionError, match="rounded more than once"):
-            _assert_rounded_once(received.rows, reference)
+            _assert_rounded_once(rows, reference)
     output.float().square().sum().backward()
     assert layer.router.gate.weight.grad.abs().sum() > 0
     assert layer.experts.w2.grad.abs().sum() > 0
@@ -474,10 +476,15 @@ class _OwnerDispatch(_OneRankDispatch):
     def __init__(self):
         super().__init__()
         self.pending = []
+        self.dispatch_rows = []
+
+    def dispatch_tokens_async(self, hidden, *args, **kwargs):
+        self.dispatch_rows.append(len(hidden))
+        return super().dispatch_tokens_async(hidden, *args, **kwargs)
 
     def combine_tokens(self, rows, state):
         assert state.permuted_scores is None
-        self.received.append(rows.detach())
+        self.received.append(rows.detach().split(state.counts.tolist()))
         owner = torch.repeat_interleave(torch.arange(4) // 2, state.counts)
         subtotals = [
             torch.zeros(state.num_recv_tokens, rows.shape[1])
@@ -496,33 +503,30 @@ class _OwnerDispatch(_OneRankDispatch):
         self.pending.clear()
 
 
-def _cuda_sum_rows_by_token(rows, token_indices, num_tokens):
-    """``sum_rows_by_token`` as CUDA's ``embedding_bag`` computes it: fp32 sums in row order, rounded once. CPU
-    ``embedding_bag`` rounds BF16 bags differently."""
-    return torch.zeros(num_tokens, rows.shape[1]).index_add_(0, token_indices, rows.float()).to(rows.dtype)
+@pytest.mark.parametrize("checkpoint_chunks", [False, True])
+def test_flash_moe_sums_a_tokens_expert_rows_once_under_expert_parallelism(monkeypatch, checkpoint_chunks):
+    for enabled in (False, True):
+        with monkeypatch.context() as patch:
+            _check_expert_parallel_sum(patch, enabled, checkpoint_chunks)
 
 
-@pytest.mark.parametrize(("fp32_routed_weighting", "checkpoint_chunks"), [(False, False), (True, False), (True, True)])
-def test_flash_moe_sums_a_tokens_expert_rows_once_under_expert_parallelism(
-    monkeypatch, fp32_routed_weighting, checkpoint_chunks
-):
+def _check_expert_parallel_sum(monkeypatch, fp32_routed_weighting, checkpoint_chunks):
     """With fp32_routed_weighting, the expert-parallel MoE output is what vLLM's fused MoE kernel computes on a rank
     holding whole experts: the token's weighted BF16 expert rows summed once in fp32, in slot order (``moe_sum``),
     plus the shared expert. Without it, each expert owner's BF16 subtotal is added. Chunked dispatch with a dummy
     chunk, with and without checkpointed chunks, and a backward pass."""
-    from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
     from arctic_platform.model.implementations.moe.distributed import expert_parallel
     from arctic_platform.model.implementations.moe.layers import moe
 
-    config = _glm_tiny_config()
-    config.text_config.num_experts_per_tok = 4
-    config.use_grouped_mm, config.fp32_routed_weighting = False, fp32_routed_weighting
-    torch.manual_seed(0)
-    model = Glm5NextForConditionalGenerationPrimeRL(config)
-    layer = next(module for module in model.modules() if isinstance(module, moe.MoE)).to(torch.bfloat16)
+    layer = _flash_moe("glm5_next", fp32_routed_weighting, use_grouped_mm=False, top_k=4)
+    # Two large opposite terms and two small terms make fp32 slot order observable in the first output column.
     with torch.no_grad():
-        for parameter in layer.parameters():
-            parameter.normal_(std=0.5)
+        layer.router.gate.weight.zero_()
+        for weight in (layer.experts.w1, layer.experts.w3):
+            weight[:, 0] = weight[0, 0].clone()
+        layer.experts.w2[:, 0].zero_()
+        layer.experts.w2[:, 0, 0] = torch.tensor([1, 1, 2**26, -(2**26)]).to(layer.experts.w2)
+        layer.shared_expert.w2[0].zero_()
     layer.set_deepep_token_chunk_size(7)
     layer.checkpoint_dispatch_chunks = checkpoint_chunks
     dispatch, shared = _OwnerDispatch(), []
@@ -531,19 +535,20 @@ def test_flash_moe_sums_a_tokens_expert_rows_once_under_expert_parallelism(
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda count, **kwargs: count.add_(1))  # one dummy chunk
     monkeypatch.setattr(expert_parallel, "get_ep_group", lambda experts: None)
     monkeypatch.setattr(moe, "get_ep_comm_module", lambda backend: dispatch)
-    monkeypatch.setattr(moe, "sum_rows_by_token", _cuda_sum_rows_by_token, raising=False)
     layer.shared_expert.register_forward_hook(lambda module, args, output: shared.append(output.detach()))
 
-    hidden = torch.randn(1, 17, config.text_config.hidden_size).bfloat16().requires_grad_()
-    routes = torch.tensor([2, 0, 3, 1]).expand(1, hidden.shape[1], 4)
+    hidden = torch.randn(1, 17, layer.experts.w2.shape[1]).bfloat16().requires_grad_()
+    orders = torch.tensor([[2, 0, 3, 1], [2, 3, 0, 1]])
+    routes = orders[torch.arange(hidden.shape[1]) // layer.deepep_token_chunk_size % 2].unsqueeze(0)
     output = layer(hidden, routed_experts=routes)[0]
-    once, by_owner = [], []
-    for rows in dispatch.received:
-        # Each expert sees every token in order, including in the final one-token dummy chunk.
-        e0, e1, e2, e3 = rows.float().reshape(4, -1, output.shape[-1])
-        once.append((e2 + e0 + e3 + e1).bfloat16())
-        by_owner.append(((e0 + e1).bfloat16().float() + (e2 + e3).bfloat16().float()).bfloat16())
-    expected_once, expected_owners = (shared[0] + torch.cat(parts)[: len(output)] for parts in (once, by_owner))
+    assert max(dispatch.dispatch_rows) <= layer.deepep_token_chunk_size
+    # Every expert receives every token in source order. Remove the dummy rows after reconstructing each stream.
+    e0, e1, e2, e3 = (torch.cat(parts)[: len(output)].float() for parts in zip(*dispatch.received, strict=True))
+    interleaved = e2 + e0 + e3 + e1
+    adjacent = e2 + e3 + e0 + e1
+    assert (interleaved[:, 0] != adjacent[:, 0]).any()
+    expected_once = shared[0] + torch.where(routes[0, :, 1:2] == 0, interleaved, adjacent).bfloat16()
+    expected_owners = shared[0] + ((e0 + e1).bfloat16().float() + (e2 + e3).bfloat16().float()).bfloat16()
     assert not torch.equal(expected_once, expected_owners)
     torch.testing.assert_close(output, expected_once if fp32_routed_weighting else expected_owners, rtol=0, atol=0)
     output.sum().backward()

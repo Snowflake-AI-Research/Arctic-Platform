@@ -23,8 +23,6 @@ from ...kernels.sonic_experts import sonic_routed_experts
 from ...kernels.sonic_experts import sonic_routed_experts_applicable
 from ..routing_weights import apply_routing_weights
 from ..routing_weights import weighted_down_projection
-from ..token_combine import gather_token_rows
-from ..token_combine import sum_rows_by_token
 
 # ``routed_experts`` value marking a token with no captured routing: a caller that tolerates missing captures
 # (such as a trainer replaying sampler routing) sets it, and an opted-in router selects that token's experts with
@@ -916,6 +914,8 @@ class MoE(nn.Module):
         x: torch.Tensor,
         selected_experts_indices: torch.Tensor,
         top_scores: torch.Tensor,
+        *,
+        sum_slots: bool = False,
     ) -> torch.Tensor:
         ep_comm = get_ep_comm_module(self.ep_comm_backend)
         combine_tokens = ep_comm.combine_tokens
@@ -952,14 +952,7 @@ class MoE(nn.Module):
             self.combine_replay.start()
             combine_kwargs["replay"] = self.combine_replay
 
-        top_k = selected_experts_indices.shape[-1]
-
         def dispatch(hidden, indices, scores):
-            if self.fp32_routed_weighting:
-                # A single destination per row keeps owner and node reductions from rounding a subtotal.
-                slots = torch.arange(hidden.shape[0], device=hidden.device).repeat_interleave(top_k)
-                hidden = gather_token_rows(hidden, slots)
-                indices, scores = indices.reshape(-1, 1), scores.reshape(-1, 1)
             return dispatch_tokens_async(
                 hidden,
                 indices,
@@ -968,14 +961,6 @@ class MoE(nn.Module):
                 group=group,
                 score_before_experts=self.score_before_experts,
             )
-
-        def finish_chunk(rows):
-            # DeepEP and UCCL return before the communication stream has finished writing these rows.
-            sync_combine()
-            if not self.fp32_routed_weighting:
-                return rows
-            tokens = rows.shape[0] // top_k
-            return sum_rows_by_token(rows, torch.arange(tokens, device=rows.device).repeat_interleave(top_k), tokens)
 
         def dispatch_chunk(start: int, end: int):
             return dispatch(x[start:end], selected_experts_indices[start:end], top_scores[start:end])
@@ -1016,41 +1001,50 @@ class MoE(nn.Module):
 
         chunk_bounds = [(start, min(start + chunk_size, x.shape[0])) for start in range(0, x.shape[0], chunk_size)]
         chunk_bounds += [(0, 1)] * (num_chunks - len(chunk_bounds))
-        chunk_experts = _experts_per_chunk(self.experts, num_chunks)
+        slots = top_scores.shape[1] if sum_slots else 1
+        chunk_experts = _experts_per_chunk(self.experts, num_chunks * slots)
+
+        def combine(hidden, indices, scores):
+            output = run_pending_chunk(dispatch(hidden, indices, scores))
+            sync_combine()
+            return output
+
+        def run_chunk(hidden, indices, scores):
+            if not sum_slots:
+                return combine(hidden, indices, scores)
+            # Accumulate slot gradients in fp32 before returning them to the shared input.
+            source = hidden.float() if hidden.requires_grad else hidden
+            # One column per native call preserves the chunk's dispatch row bound on every rank.
+            outputs = (
+                combine(source.to(hidden.dtype), indices[:, slot : slot + 1], scores[:, slot : slot + 1])
+                for slot in range(slots)
+            )
+            first = next(outputs)
+            return sum(outputs, first.float()).to(first.dtype)
 
         routed_outputs: list[torch.Tensor] = []
-        if checkpoint_chunks:
-
-            def run_chunk(hidden, indices, scores):
-                pending = dispatch(hidden, indices, scores)
-                return finish_chunk(run_pending_chunk(pending))
-
+        if checkpoint_chunks or sum_slots:
             for start, end in chunk_bounds:
+                args = (x[start:end], selected_experts_indices[start:end], top_scores[start:end])
                 # Complete recompute on every rank so all collective handles are consumed.
-                routed_outputs.append(
-                    checkpoint(
-                        run_chunk,
-                        x[start:end],
-                        selected_experts_indices[start:end],
-                        top_scores[start:end],
-                        use_reentrant=False,
-                        early_stop=False,
-                    )
+                output = (
+                    checkpoint(run_chunk, *args, use_reentrant=False, early_stop=False)
+                    if checkpoint_chunks
+                    else run_chunk(*args)
                 )
+                routed_outputs.append(output)
         else:
             pending_state = dispatch_chunk(*chunk_bounds[0])
             for chunk_start, chunk_end in chunk_bounds[1:]:
                 next_pending_state = dispatch_chunk(chunk_start, chunk_end)
-                output = run_pending_chunk(pending_state)
-                if self.sync_combine_per_chunk or self.fp32_routed_weighting:
-                    output = finish_chunk(output)
-                routed_outputs.append(output)
+                routed_outputs.append(run_pending_chunk(pending_state))
+                if self.sync_combine_per_chunk:
+                    sync_combine()
                 pending_state = next_pending_state
-            last_output = run_pending_chunk(pending_state)
+            routed_outputs.append(run_pending_chunk(pending_state))
 
         shared_output = self.shared_expert(x) if self.shared_expert is not None else None
-        if not checkpoint_chunks:
-            routed_outputs.append(finish_chunk(last_output))
+        sync_combine()
         routed_output = routed_outputs[0] if len(routed_outputs) == 1 else torch.cat(routed_outputs, dim=0)
         # Dummy padding chunks append their rows after the real tokens; drop them.
         routed_output = routed_output[: x.shape[0]]
@@ -1097,7 +1091,9 @@ class MoE(nn.Module):
             self.tokens_per_expert.add_(num_tokens_per_expert)
 
         if uses_dispatch_ep(self.ep_comm_backend):
-            routed_output = self._run_deepep_routed_experts(x, selected_experts_indices, top_scores)
+            routed_output = self._run_deepep_routed_experts(
+                x, selected_experts_indices, top_scores, sum_slots=self.fp32_routed_weighting
+            )
             return routed_output.reshape(bs, slen, dim)
 
         # top_scores and token_indices_experts_sorted shape (bs*slen*top_k,)
