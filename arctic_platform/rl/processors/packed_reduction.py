@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import torch
 
 from arctic_platform.common.utils.batch import metric_is_summed
+from arctic_platform.debug.training import maybe_cleanup_router_replay_on_failure
 from arctic_platform.debug.training import maybe_complete_router_replay_call
 
 from .base_loss import BaseLoss
@@ -171,6 +172,7 @@ def resolve_packed_loss_reduction(
     return reduction
 
 
+@maybe_cleanup_router_replay_on_failure(runtime=True)
 def apply_packed_loss_reduction(
     engine,
     loss_tensor: torch.Tensor,

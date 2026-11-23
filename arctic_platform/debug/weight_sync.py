@@ -151,10 +151,10 @@ def verify_sources(pins: dict[str, str]) -> None:
 def maybe_observe_weight_send(worker, weights):
     """Observe a production-owned send without calling the transport."""
     evidence = {}
-    sender = worker._weight_sender
     if not enabled():
         yield evidence
         return
+    sender = worker._weight_sender
     parameters = list(worker.engine.module.named_parameters())
     if any(hasattr(value, "ds_id") for _, value in parameters):
         raise ValueError("weight-sync evidence does not admit post-gather ZeRO3 tensor views")
@@ -1665,7 +1665,6 @@ def maybe_observe_broadcast_send(sender, weights, send):
     if _SEND.get() is not None:
         raise RuntimeError("nested broadcast weight verification is unsupported")
     state = {"trainer_parameters": None, "trainer_inventory": None}
-    token = _SEND.set(state)
     sources = source_files(send, type(sender), maybe_observe_broadcast_send)
     manifest = {}
     wire_buffers = {}
@@ -1705,6 +1704,7 @@ def maybe_observe_broadcast_send(sender, weights, send):
             if tensor_manifest(value) != entry:
                 raise RuntimeError("actually sent broadcast tensor changed during transfer")
 
+    token = _SEND.set(state)
     try:
         verify_sources(sources)
         yield observed(), evidence
@@ -1762,6 +1762,24 @@ def _gather_broadcast_evidence(records, local):
         dist.all_gather_object(records, local, group=group)
     finally:
         dist.destroy_process_group(group)
+
+
+def maybe_cleanup_broadcast_export(function):
+    """Release this generator's evidence even when a non-master export fails or closes."""
+
+    @functools.wraps(function)
+    def observed(model, *args, **kwargs):
+        if not enabled():
+            yield from function(model, *args, **kwargs)
+            return
+        try:
+            yield from function(model, *args, **kwargs)
+        finally:
+            export = _EXPORT.get()
+            if export is not None and export["model"] is model:
+                _EXPORT.set(None)
+
+    return observed
 
 
 def maybe_bind_broadcast_trainer_inventory(model, *, is_master, is_zero3):
@@ -2030,6 +2048,24 @@ def maybe_run_broadcast_load(loader, model, engine, verifier):
     return loader(model, engine, verifier=verifier)
 
 
+_BROADCAST_LOAD_VERIFIER: ContextVar[ShadowVerifier | None] = ContextVar("broadcast_load_verifier", default=None)
+
+
+@contextmanager
+def maybe_observe_broadcast_load(receiver, model, engine):
+    """Scope evidence around a native load without calling or changing that load."""
+    verifier = maybe_begin_broadcast_load(receiver, model, engine)
+    token = _BROADCAST_LOAD_VERIFIER.set(verifier)
+    try:
+        yield verifier
+    finally:
+        _BROADCAST_LOAD_VERIFIER.reset(token)
+
+
+def maybe_current_broadcast_verifier():
+    return _BROADCAST_LOAD_VERIFIER.get()
+
+
 @contextmanager
 def maybe_observe_broadcast_tensor(verifier, loader, name, value):
     if verifier is None:
@@ -2115,11 +2151,8 @@ def maybe_feed_fp8_tensor(verifier, updater, replay, name, value):
 def maybe_broadcast_receiver_result(result, verifier, *, rank):
     if verifier is None:
         return result
-    return {
-        **result,
-        "rank": rank,
-        "weight_sync_verification": {**verifier.finish(), "rank": rank},
-    }
+    result.update(rank=rank, weight_sync_verification={**verifier.finish(), "rank": rank})
+    return result
 
 
 def maybe_retain_weight_sync_failure(verifier, error):
@@ -2239,6 +2272,20 @@ def maybe_build_lora_model(builder, **kwargs):
     return model, evidence
 
 
+@contextmanager
+def maybe_observe_lora_build(tensors):
+    """Capture build evidence while the caller invokes its native builder."""
+    if not enabled():
+        yield None
+        return
+    evidence = _LoRABuildEvidence(received=maybe_lora_received_manifest(tensors))
+    token = _LORA_BUILD_EVIDENCE.set(evidence)
+    try:
+        yield evidence
+    finally:
+        _LORA_BUILD_EVIDENCE.reset(token)
+
+
 def maybe_record_lora_remapping(tensors, prefix, remap):
     evidence = _LORA_BUILD_EVIDENCE.get()
     if evidence is not None:
@@ -2271,10 +2318,13 @@ def maybe_record_built_lora_factors(model, mapper, skip_prefixes):
         evidence.factors[received] = (module, factor, None)
 
 
-def maybe_pack_fused_expert_loras(pack, model):
+@contextmanager
+def maybe_observe_fused_expert_loras(model):
+    """Record packed destinations without performing the production packing."""
     evidence = _LORA_BUILD_EVIDENCE.get()
     if evidence is None:
-        return pack(model)
+        yield
+        return
     projections = {}
     for name in model.loras:
         for slot, projection in enumerate(("w1", "w2", "w3")):
@@ -2283,18 +2333,18 @@ def maybe_pack_fused_expert_loras(pack, model):
                 projections[name] = (name[: -len(f".{projection}")], slot)
             elif name == f"experts.{projection}":
                 projections[name] = ("experts", slot)
-    packed = pack(model)
+    yield
     for received, built in evidence.factors.items():
         if built is not None and built[0] in projections:
             module, slot = projections[built[0]]
             evidence.factors[received] = (module, built[1], slot)
-    return packed
 
 
 def maybe_lora_built_receiver_result(result, evidence, **kwargs):
     if evidence is None:
         return result
-    return maybe_lora_receiver_result(result, evidence.received, evidence.factors, **kwargs)
+    result.update(maybe_lora_receiver_result(result, evidence.received, evidence.factors, **kwargs))
+    return result
 
 
 # Rl Sampler Evidence

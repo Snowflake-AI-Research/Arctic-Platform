@@ -158,10 +158,9 @@ def test_receiver_enabled_shadow_has_exact_destination_evidence(monkeypatch, bat
     receiver.device = torch.device("cpu")
     receiver.parallel_config = SimpleNamespace(enable_expert_parallel=False, pipeline_parallel_size=1)
     engine = _FakeEngine([("weight", torch.tensor([7.0]))])
-    verifier = weight_sync.maybe_begin_broadcast_load(receiver, model, engine)
-
     loader = receiver._load_batched if batched else receiver._load_direct
-    loaded = weight_sync.maybe_run_broadcast_load(loader, model, engine, verifier)
+    with weight_sync.maybe_observe_broadcast_load(receiver, model, engine) as verifier:
+        loaded = loader(model, engine)
     actual = weight_sync.maybe_broadcast_receiver_result({"loaded": loaded[0]}, verifier, rank=2)
     evidence = actual["weight_sync_verification"]
 
@@ -263,7 +262,8 @@ def test_enabled_lora_remap_overwrite_and_packed_slots(monkeypatch):
         weight_sync.maybe_record_lora_remapping(tensors, "", lambda name, prefix: remapped[name])
         model = SimpleNamespace(loras={"layer.experts.w1": SimpleNamespace(lora_a=factor)})
         weight_sync.maybe_record_built_lora_factors(model, None, ("skip",))
-        assert weight_sync.maybe_pack_fused_expert_loras(lambda _: 1, model) == 1
+        with weight_sync.maybe_observe_fused_expert_loras(model):
+            model.loras = {"layer.experts": SimpleNamespace(lora_a=[factor, None, None])}
         return model
 
     model, evidence = weight_sync.maybe_build_lora_model(builder, tensors=tensors)

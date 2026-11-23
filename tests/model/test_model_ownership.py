@@ -24,6 +24,16 @@ _OPTIONAL_DEBUG_DSS_IMPORTS = {
 }
 
 
+_DSS_COMPARISON_ADAPTERS = {
+    "correctness/harness/engine_admission.py",
+    "correctness/harness/gateway.py",
+    "correctness/harness/lora.py",
+    "correctness/harness/native_optimizer.py",
+    "correctness/harness/optimizer.py",
+    "correctness/harness/storage.py",
+}
+
+
 def _dss_imports(tree, functions=()):
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -41,6 +51,18 @@ def _dss_imports(tree, functions=()):
         yield from _dss_imports(node, functions)
 
 
+def _dss_import_violations(source: str, path: Path) -> list[str]:
+    relative = path.as_posix()
+    return [
+        f"{path}:{line}: {module}"
+        for line, functions, module in _dss_imports(ast.parse(source, filename=str(path)))
+        if not (
+            (relative in _DSS_COMPARISON_ADAPTERS and functions)
+            or (relative, functions, module) in _OPTIONAL_DEBUG_DSS_IMPORTS
+        )
+    ]
+
+
 def test_arctic_platform_does_not_import_dss():
     package_root = Path(__file__).resolve().parents[2] / "arctic_platform"
     violations = []
@@ -48,12 +70,11 @@ def test_arctic_platform_does_not_import_dss():
     for path in package_root.rglob("*.py"):
         relative = path.relative_to(package_root).as_posix()
         tree = ast.parse(path.read_text(), filename=str(path))
+        violations.extend(_dss_import_violations(path.read_text(), Path(relative)))
         for line, functions, module in _dss_imports(tree):
             identity = relative, functions, module
             if identity in _OPTIONAL_DEBUG_DSS_IMPORTS:
                 optional.add(identity)
-            else:
-                violations.append(f"{relative}:{line}: {module}")
     assert violations == []
     assert optional == _OPTIONAL_DEBUG_DSS_IMPORTS
 
@@ -72,3 +93,27 @@ def test_ownership_exceptions_do_not_admit_ordinary_or_eager_dss_imports(relativ
     imports = list(_dss_imports(ast.parse(code)))
     assert imports
     assert all((relative, functions, module) not in _OPTIONAL_DEBUG_DSS_IMPORTS for _, functions, module in imports)
+    assert _dss_import_violations(code, Path(relative))
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "model/loader.py",
+        "common/deepspeed_engine.py",
+        "correctness/harness/runner.py",
+        "debug/training.py",
+        *_DSS_COMPARISON_ADAPTERS,
+    ],
+)
+@pytest.mark.parametrize("statement", ["import dss", "from dss.ray_dss.models import JobConfig"])
+@pytest.mark.parametrize("scope", ["module", "function", "async-function"])
+def test_dss_dependency_boundary_requires_a_deferred_correctness_adapter(path, statement, scope):
+    source = (
+        statement
+        if scope == "module"
+        else f"{'async ' if scope == 'async-function' else ''}def load():\n    {statement}"
+    )
+    violations = _dss_import_violations(source, Path(path))
+    permitted = path in _DSS_COMPARISON_ADAPTERS and scope != "module"
+    assert bool(violations) is not permitted
