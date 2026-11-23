@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 
 from arctic_platform.model import ActivationOffloadConfig
+from arctic_platform.model import validate_packed_gated_delta_net_kernels
 from arctic_platform.model.implementations.gpu.lm_head import chunked_lm_head_logprobs
 from arctic_platform.model.implementations.gpu.lm_head import enable_fp32_lm_head
 from arctic_platform.model.implementations.gpu.sp import gated_delta_net
@@ -107,3 +108,32 @@ def test_gated_delta_net_resolves_transformers_5_17_module_level_kernels(monkeyp
         gated_delta_net._resolve_gated_delta_net_kernel(module, "chunk_gated_delta_rule")
         is torch_chunk_gated_delta_rule
     )
+
+
+class _GatedDeltaNetWithKernels(nn.Module):
+    def __init__(self, causal_conv1d_fn, chunk_gated_delta_rule):
+        super().__init__()
+        self.conv_kernel_size = 4
+        self.causal_conv1d_fn = causal_conv1d_fn
+        self.chunk_gated_delta_rule = chunk_gated_delta_rule
+
+
+def test_packed_gated_delta_net_kernels_accept_boundary_aware_kernels():
+    layer = _GatedDeltaNetWithKernels(lambda x, *, seq_idx: x, lambda q, *, cu_seqlens: q)
+
+    validate_packed_gated_delta_net_kernels(nn.Sequential(layer))
+
+
+@pytest.mark.parametrize("missing_kernel", ["causal_conv1d_fn", "chunk_gated_delta_rule"])
+def test_packed_gated_delta_net_kernels_reject_a_fallback_without_boundaries(missing_kernel):
+    kernels = {"causal_conv1d_fn": lambda x, *, seq_idx: x, "chunk_gated_delta_rule": lambda q, *, cu_seqlens: q}
+    kernels[missing_kernel] = lambda *args, **kwargs: None
+    layer = _GatedDeltaNetWithKernels(**kernels)
+
+    with pytest.raises(RuntimeError, match=f"boundary-aware {missing_kernel}"):
+        validate_packed_gated_delta_net_kernels(nn.Sequential(layer))
+
+
+def test_packed_gated_delta_net_kernels_require_a_gated_delta_net_module():
+    with pytest.raises(RuntimeError, match="no compatible packed GatedDeltaNet"):
+        validate_packed_gated_delta_net_kernels(nn.Linear(2, 2))
