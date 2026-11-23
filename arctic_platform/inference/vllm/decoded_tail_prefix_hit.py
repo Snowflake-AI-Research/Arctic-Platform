@@ -17,7 +17,9 @@
 
 Decode context parallelism can make an attention block span several prefix
 hashes. At generation completion, register the last reusable interior hash so
-a continuation can share the block when its other cache groups also hit.
+a continuation can share the block when its other cache groups also hit. With
+routed-expert capture, also retain the routes up to each interior prompt or
+decoded endpoint, so the scheduler's route-availability cap accepts the hit.
 """
 
 from functools import cache
