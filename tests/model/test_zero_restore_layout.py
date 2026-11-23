@@ -105,12 +105,16 @@ def _layout(engine):
 
 
 @require_deepspeed
-@pytest.mark.parametrize("checkpoint_wrapped_layers", [0, 2], ids=["same-module", "more-layers-checkpointed"])
+@pytest.mark.parametrize(
+    ("checkpoint_wrapped_layers", "zero"),
+    [(0, "zero2-offload"), (2, "zero2-offload"), (0, "zero1-bf16-optimizer")],
+    ids=["same-module", "more-layers-checkpointed", "bf16-optimizer"],
+)
 def test_resume_restores_every_parameters_own_master_and_moments(
-    single_rank_group, tmp_path, checkpoint_wrapped_layers
+    single_rank_group, tmp_path, checkpoint_wrapped_layers, zero
 ):
     expected = _train_and_save(_engine(), tmp_path)
-    resumed = _engine(checkpoint_wrapped_layers)
+    resumed = _engine(checkpoint_wrapped_layers, zero=zero)
     resumed.load_checkpoint(tmp_path, tag="step")
 
     for name, state in _optimizer_state(resumed).items():
@@ -171,6 +175,7 @@ def test_restore_checks_the_saved_partitions_deepspeed_reads(monkeypatch, saved_
     from deepspeed.checkpoint.constants import GROUP_PADDINGS
     from deepspeed.checkpoint.constants import PARAM_SLICE_MAPPINGS
     from deepspeed.checkpoint.constants import SINGLE_PARTITION_OF_FP32_GROUPS
+    from deepspeed.checkpoint.constants import ZERO_STAGE
     from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
     from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
     from deepspeed.utils.tensor_fragment import fragment_address
@@ -192,11 +197,14 @@ def test_restore_checks_the_saved_partitions_deepspeed_reads(monkeypatch, saved_
     monkeypatch.setattr(dist, "get_world_size", lambda group=None: current_dp)
 
     def state(mapping, width, padding):
-        return {
+        checkpoint = {
             PARAM_SLICE_MAPPINGS: [mapping],
             SINGLE_PARTITION_OF_FP32_GROUPS: [torch.zeros(width if bf16 else width - padding)],
             GROUP_PADDINGS: [padding],
         }
+        if not bf16:
+            checkpoint[ZERO_STAGE] = 2
+        return checkpoint
 
     if saved_dp == 1:
         saved = [state({"a": fragment_address(5, 0), "b": fragment_address(2, 5)}, 8, 1)]

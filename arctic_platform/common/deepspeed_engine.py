@@ -466,6 +466,7 @@ def _refuse_restoring_another_parameter_layout(zero_optimizer) -> None:
     from deepspeed.checkpoint.constants import PARAM_ALIGNMENT_PADDINGS
     from deepspeed.checkpoint.constants import PARAM_SLICE_MAPPINGS
     from deepspeed.checkpoint.constants import SINGLE_PARTITION_OF_FP32_GROUPS
+    from deepspeed.checkpoint.constants import ZERO_STAGE
     from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
     from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 
@@ -500,7 +501,7 @@ def _refuse_restoring_another_parameter_layout(zero_optimizer) -> None:
                     group_rank = dist.get_rank(group=dp)
                     # ZeRO strips trailing DP padding when saving, while BF16 saves the entire partition.
                     width = saved[0][SINGLE_PARTITION_OF_FP32_GROUPS][group].numel()
-                    if not bf16:
+                    if ZERO_STAGE in saved[0]:
                         width += saved[0][GROUP_PADDINGS][group]
                     lo = group_rank * width
                     if group_rank + 1 < dist.get_world_size(group=dp):
@@ -520,7 +521,7 @@ def _refuse_restoring_another_parameter_layout(zero_optimizer) -> None:
                 # DeepSpeed inserts between-parameter alignment on restore from a legacy compact checkpoint.
                 padding = (
                     zero_optimizer.round_robin_bit16_padding[group]
-                    if PARAM_ALIGNMENT_PADDINGS in saved[0]
+                    if not bf16 and PARAM_ALIGNMENT_PADDINGS in saved[0]
                     else repeat(0)
                 )
                 new = {}
