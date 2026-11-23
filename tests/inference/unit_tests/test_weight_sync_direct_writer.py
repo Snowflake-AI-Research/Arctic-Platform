@@ -91,6 +91,7 @@ if "vllm" not in sys.modules:
 from arctic_platform.inference.server.weight_sync.receiver import (
     WeightSyncExtension,
     _loaded_destination_names,
+    _refresh_cached_weight_copies,
     _model_parameter_l2,
     _tensor_l2_sq,
 )
@@ -1164,6 +1165,32 @@ def test_sync_keeps_flashinfer_cutlass_experts_in_up_gate_order(monkeypatch, tmp
     assert cutlass.data_ptr() == address
     assert torch.equal(layers["triton"].w13_weight, checkpoint)
     assert result["cached_weight_copies_refreshed"] == int(is_act_and_mul)
+
+
+@pytest.mark.parametrize("written_after_load", [False, True])
+def test_verified_load_accepts_the_cutlass_swap_and_still_reports_other_writes(monkeypatch, written_after_load):
+    from arctic_platform.debug import weight_sync as evidence
+
+    backends = _install_cutlass_backend_stubs(monkeypatch)
+    checkpoint = torch.cat([_GATE, _UP], dim=1)
+
+    class Model(nn.ModuleDict):
+        def load_weights(self, weights):
+            for name, value in weights:
+                self.get_parameter(name).data.copy_(value)
+
+    model = Model({"experts": _expert_layer(backends.FLASHINFER_CUTLASS, checkpoint)})
+    verifier = evidence.ShadowVerifier(model, max_shadow_bytes=1 << 20)
+    verifier.load("experts.w13_weight", checkpoint)
+    if written_after_load:
+        model.experts.w13_weight.data[0, 0, 0] += 1
+
+    _refresh_cached_weight_copies(model, verifier)
+
+    record = verifier.finish()
+    assert record["changed_after_verification"] == (["experts.w13_weight"] if written_after_load else [])
+    if not written_after_load:
+        assert torch.equal(model.experts.w13_weight, torch.cat([_UP, _GATE], dim=1))
 
 
 async def _noop_abort_all_streams():

@@ -726,6 +726,19 @@ class ShadowVerifier:
         self.touched.update(live.written | live_pending)
         self._offload_pending(replay_staging())
 
+    def rewrite(self, name, write):
+        """Run the receiver's own in-place ``write`` of loaded parameter ``name`` after verification.
+
+        The bytes it rewrites must still be the verified ones; what it leaves becomes the verified digest, so
+        ``finish`` keeps reporting any other change to them.
+        """
+        digests = self.completed.get(self.storage_keys[name], {})
+        if name in digests and tensor_manifest(self.registered[name]) != digests[name]:
+            self.changed.add(name)
+        write()
+        if name in digests:
+            digests[name] = tensor_manifest(self.registered[name])
+
     def load(self, name, value, *, loader=None):
         """Debug-only convenience for a live load and its private shadow replay."""
         if loader is None:
@@ -1447,6 +1460,13 @@ def maybe_observe_fp8_tensor(verifier, updater, replay, name, value):
     staging = (_fp8_staging(verifier, updater), _fp8_staging(verifier, replay))
     with verifier.observe_load(name, value, loader=replay.feed, staging=staging):
         yield
+
+
+def maybe_rewrite_verified(verifier, name, write):
+    if verifier is None:
+        write()
+    else:
+        verifier.rewrite(name, write)
 
 
 def maybe_broadcast_receiver_result(result, verifier, *, rank):
