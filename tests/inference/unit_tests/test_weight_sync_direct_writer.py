@@ -1185,7 +1185,8 @@ def test_verified_load_accepts_the_cutlass_swap_and_still_reports_other_writes(m
     if written_after_load:
         model.experts.w13_weight.data[0, 0, 0] += 1
 
-    _refresh_cached_weight_copies(model, verifier)
+    with evidence.maybe_scope_broadcast_verifier(verifier):
+        _refresh_cached_weight_copies(model)
 
     record = verifier.finish()
     assert record["changed_after_verification"] == (["experts.w13_weight"] if written_after_load else [])

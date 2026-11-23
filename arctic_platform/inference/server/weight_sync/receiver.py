@@ -41,7 +41,8 @@ from arctic_platform.debug.weight_sync import maybe_observe_broadcast_tensor
 from arctic_platform.debug.weight_sync import maybe_observe_fp8_tensor
 from arctic_platform.debug.weight_sync import maybe_observe_fused_expert_loras
 from arctic_platform.debug.weight_sync import maybe_observe_lora_build
-from arctic_platform.debug.weight_sync import maybe_rewrite_verified
+from arctic_platform.debug.weight_sync import maybe_observe_rewrite
+from arctic_platform.debug.weight_sync import maybe_scope_broadcast_verifier
 from arctic_platform.debug.weight_sync import maybe_record_built_lora_factors
 from arctic_platform.debug.weight_sync import maybe_record_lora_remapping
 from arctic_platform.inference.utils import require_supported_vllm_version
@@ -383,7 +384,7 @@ def _refuse_synced_host_resident_params(model) -> None:
             verify()
 
 
-def _refresh_cached_weight_copies(model, verifier=None) -> int:
+def _refresh_cached_weight_copies(model) -> int:
     """Restore cached weight copies and CUTLASS expert layout after a full-weight load.
 
     ``Glm5NextLinearAttention._forward`` (vLLM 0.31/0.32 ``glm5next/common/kda.py``) concatenates
@@ -392,8 +393,8 @@ def _refresh_cached_weight_copies(model, verifier=None) -> int:
     Copied in place under inference mode: CUDA graphs may hold their addresses, and they are inference tensors.
     FlashInfer CUTLASS experts get the gate/up -> up/gate swap vLLM applies once at load
     (``convert_to_unquantized_kernel_format``) again, since the sync's loaders write gate/up order. The swap
-    is not idempotent, so this runs once after each full-weight load; a verified load (``verifier``) checks the
-    swapped bytes were the loaded ones and records the swap as part of the load.
+    is not idempotent, so this runs once after each full-weight load; a verified load checks the swapped bytes
+    were the loaded ones and records the swap as part of the load.
     Returns how many caches and CUTLASS expert weights were refreshed; a GLM-5.3 sampler reporting 0 after its
     first forward means vLLM renamed them and the refresh no longer applies.
 
@@ -419,8 +420,8 @@ def _refresh_cached_weight_copies(model, verifier=None) -> int:
                 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import swap_w13_to_w31
 
                 if moe_backend == UnquantizedMoeBackend.FLASHINFER_CUTLASS and module.moe_config.is_act_and_mul:
-                    w13 = module.w13_weight
-                    maybe_rewrite_verified(verifier, f"{name}.w13_weight", lambda: w13.copy_(swap_w13_to_w31(w13)))
+                    with maybe_observe_rewrite(f"{name}.w13_weight"):
+                        module.w13_weight.copy_(swap_w13_to_w31(module.w13_weight))
                     refreshed += 1
     return refreshed
 
@@ -929,7 +930,8 @@ class WeightSyncExtension:
                     source_to_destinations,
                     skipped_source_names,
                 ) = self._load_batched(model, engine)
-        refreshed = _refresh_cached_weight_copies(model, verifier)
+        with maybe_scope_broadcast_verifier(verifier):
+            refreshed = _refresh_cached_weight_copies(model)
 
         if (
             loaded_destination_validation_applicable

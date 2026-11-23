@@ -726,8 +726,9 @@ class ShadowVerifier:
         self.touched.update(live.written | live_pending)
         self._offload_pending(replay_staging())
 
-    def rewrite(self, name, write):
-        """Run the receiver's own in-place ``write`` of loaded parameter ``name`` after verification.
+    @contextmanager
+    def rewrite(self, name):
+        """Scope the receiver's own in-place rewrite of loaded parameter ``name`` after verification.
 
         The bytes it rewrites must still be the verified ones; what it leaves becomes the verified digest, so
         ``finish`` keeps reporting any other change to them.
@@ -735,7 +736,7 @@ class ShadowVerifier:
         digests = self.completed.get(self.storage_keys[name], {})
         if name in digests and tensor_manifest(self.registered[name]) != digests[name]:
             self.changed.add(name)
-        write()
+        yield
         if name in digests:
             digests[name] = tensor_manifest(self.registered[name])
 
@@ -1462,11 +1463,24 @@ def maybe_observe_fp8_tensor(verifier, updater, replay, name, value):
         yield
 
 
-def maybe_rewrite_verified(verifier, name, write):
+@contextmanager
+def maybe_scope_broadcast_verifier(verifier):
+    """Make a finished load's verifier current again for the receiver's own writes after that load."""
+    token = _BROADCAST_LOAD_VERIFIER.set(verifier)
+    try:
+        yield
+    finally:
+        _BROADCAST_LOAD_VERIFIER.reset(token)
+
+
+@contextmanager
+def maybe_observe_rewrite(name):
+    verifier = _BROADCAST_LOAD_VERIFIER.get()
     if verifier is None:
-        write()
-    else:
-        verifier.rewrite(name, write)
+        yield
+        return
+    with verifier.rewrite(name):
+        yield
 
 
 def maybe_broadcast_receiver_result(result, verifier, *, rank):
