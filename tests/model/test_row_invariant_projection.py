@@ -805,33 +805,35 @@ def test_the_entry_point_patches_only_when_the_run_asked():
     assert "forward" in asked[0].__dict__
 
 
-@pytest.mark.parametrize("loader", ["glm5_next", "generic_moe"])
-def test_the_pad_is_a_loader_option_of_its_own_and_makes_a_packed_row_match_it_alone(loader):
-    from arctic_platform.model.config import ModelSpec
-    from arctic_platform.model.config import ParallelismConfig
+@pytest.mark.parametrize(
+    "model_type", ["glm5_next", "qwen4_exp", "qwen3_5_moe", "qwen3_moe", "deepseek_v4", "deepseek_v41"]
+)
+def test_standalone_pad_reaches_the_registered_loader(model_type, tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    from arctic_platform.model import build_moe_model
     from arctic_platform.model.implementations.debug.token_combine import maybe_use_fixed_order_row_sum
-    from arctic_platform.model.loaders.flash_moe import _FlashLoadOptions
-    from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration
     from arctic_platform.testing_utils import set_seed
     from arctic_platform.testing_utils import torch_assert_equal
 
-    spec = ModelSpec(
-        loader=loader,
-        model_path_or_name="unused",
-        dtype="bfloat16",
-        parallelism=ParallelismConfig(expert_parallel=2),
-        loader_options={"row_invariant_projections": True},
-    )
-    schema = _FlashLoadOptions if loader == "glm5_next" else Qwen3_5MoeOptions
-    options = schema.model_validate(spec.loader_options).model_dump()
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", MEASURED_WORKSPACE)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr("arctic_platform.model.parallel.groups.expert_parallel_group", lambda size: object())
 
+    def load_projection(*args, options, **kwargs):
+        layer = torch.nn.Linear(4096, 1024)
+        assert maybe_use_fixed_order_row_sum(layer, options.model_dump()) == 0
+        return layer
+
+    monkeypatch.setattr(deepspeed_integration, "_load_moe_model", load_projection)
     set_seed(0)
-    projection = torch.nn.Linear(4096, 1024)
-    assert maybe_use_fixed_order_row_sum(projection, options) == 0
-    patched = maybe_apply_row_invariant_projections(
-        projection, options, workspace_config=MEASURED_WORKSPACE, verify=False
-    )
-    assert patched == 1
-    rows = torch.randn(3, 4096)
+    model = build_moe_model(model_name=str(tmp_path), ep_size=2, loader_options={"row_invariant_projections": True})
+    rows = torch.randn(invariant_row_target(1024, MEASURED_WORKSPACE), 4096)
+    linear = Mock(wraps=torch.nn.functional.linear)
+    monkeypatch.setattr(torch.nn.functional, "linear", linear)
     with torch.no_grad():
-        torch_assert_equal(projection(rows[:1]).view(torch.int32), projection(rows)[:1].view(torch.int32))
+        alone = model(rows[:1])
+        assert linear.call_args.args[0].shape == rows.shape
+        torch_assert_equal(alone.view(torch.int32), model(rows)[:1].view(torch.int32))

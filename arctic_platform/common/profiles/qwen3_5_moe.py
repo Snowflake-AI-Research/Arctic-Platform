@@ -45,6 +45,7 @@ def register(registry: Registry) -> None:
             "moe.comm_token_chunk",
             "attention.backend",
             "numerics.reduce_dtype",
+            "numerics.row_invariant_projections",
             "numerics.optimization_dtype",
             "numerics.fp32_parity",
         ],

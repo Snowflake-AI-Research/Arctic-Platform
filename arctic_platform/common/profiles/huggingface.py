@@ -60,6 +60,7 @@ def register(registry: Registry) -> None:
             "zorro_train",
         ],
         unsupported={
+            "numerics.row_invariant_projections": "this loader does not install the projection pad",
             "checkpointing.mode": (
                 "no equivalent option; `patches.gradient_checkpointing` always recomputes whole layers"
             ),

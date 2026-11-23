@@ -227,6 +227,18 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "numerics.row_invariant_projections",
+        runs_in="trainer",
+        goal="parity",
+        why=(
+            "Pad short standard linear projections to a common row count to avoid row-dependent split-K rounding."
+            " Off by default because the extra projection work grows with workspace size and narrower outputs."
+            " Full determinism also enables the pad."
+        ),
+        source="`loader_options.row_invariant_projections`",
+        registry=registry,
+    )
+    register_option(
         "numerics.optimization_dtype",
         runs_in="trainer",
         goal="parity",

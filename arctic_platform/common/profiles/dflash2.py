@@ -36,6 +36,7 @@ def register(registry: Registry) -> None:
             "numerics.optimization_dtype",
         ],
         unsupported={
+            "numerics.row_invariant_projections": "this loader does not install the projection pad",
             "checkpointing.mode": (
                 "the loader has no activation checkpointing; it rejects `patches.gradient_checkpointing`"
             ),
