@@ -114,12 +114,14 @@ def _build_trial_config(
     skills: list[str] | None = None,
     agent_kwargs: dict[str, Any] | None = None,
     env_kwargs: dict[str, Any] | None = None,
+    verifier_env: dict[str, str] | None = None,
 ) -> Any:
     from harbor.models.environment_type import EnvironmentType
     from harbor.models.trial.config import AgentConfig
     from harbor.models.trial.config import EnvironmentConfig
     from harbor.models.trial.config import TaskConfig
     from harbor.models.trial.config import TrialConfig
+    from harbor.models.trial.config import VerifierConfig
 
     agent_name: str | None = None
     agent_import_path: str | None = None
@@ -163,6 +165,8 @@ def _build_trial_config(
             delete=True,
             kwargs=dict(env_kwargs or {}),
         ),
+        # Merged over the task's [verifier.env]; ${VAR} values resolve from this process's environment.
+        verifier=VerifierConfig(env=dict(verifier_env or {})),
     )
 
 
@@ -179,6 +183,7 @@ async def run_harbor_trial(
     skills: list[str] | None = None,
     agent_kwargs: dict[str, Any] | None = None,
     env_kwargs: dict[str, Any] | None = None,
+    verifier_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run one Harbor ``Trial`` and return its verifier rewards and metadata."""
     from harbor.trial.trial import Trial
@@ -195,6 +200,7 @@ async def run_harbor_trial(
         skills=skills,
         agent_kwargs=agent_kwargs,
         env_kwargs=env_kwargs,
+        verifier_env=verifier_env,
     )
     trial_dir = trials_dir / trial_name
     try:
@@ -321,6 +327,7 @@ class HarborTrialAdapter:
         skills: list[str] | None = None,
         agent_kwargs: dict[str, Any] | None = None,
         env_kwargs: dict[str, Any] | None = None,
+        verifier_env: dict[str, str] | None = None,
         prepare_task_fn: Any | None = None,
         max_concurrency: int = 256,
     ) -> None:
@@ -332,6 +339,7 @@ class HarborTrialAdapter:
         self._skills = list(skills or [])
         self._agent_kwargs = dict(agent_kwargs or {})
         self._env_kwargs = dict(env_kwargs or {})
+        self._verifier_env = dict(verifier_env or {})
         self._prepare_task_fn = prepare_task_fn
         self._max_concurrency = int(max_concurrency)
         self._lock = threading.Lock()
@@ -379,6 +387,7 @@ class HarborTrialAdapter:
             skills=self._skills,
             agent_kwargs=kw,
             env_kwargs=self._env_kwargs,
+            verifier_env=self._verifier_env,
         )
 
     def close(self, timeout_s: float = CLOSE_TIMEOUT_S) -> None:

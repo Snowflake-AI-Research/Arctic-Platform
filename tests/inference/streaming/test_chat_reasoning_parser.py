@@ -461,7 +461,7 @@ def test_a_semi_p_engine_reports_chat_support_as_a_plain_one_does(fake_vllm, mon
         restored.append(engine_kwargs)
         return FakeEngine()
 
-    module = types.ModuleType("arctic_platform.inference.server.semip_asyncllm")
+    module = types.ModuleType("arctic_platform.inference.server.semip_frontend")
     module.restore_and_attach = restore_and_attach
     monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(chat_module, "ChatEngine", lambda llm, model: _ProbedEngine(model))
