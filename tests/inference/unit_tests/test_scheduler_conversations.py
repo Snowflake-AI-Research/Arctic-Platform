@@ -197,7 +197,7 @@ def test_failed_cache_write_reaches_caller_and_dispatches_queued_request(monkeyp
     asyncio.run(run())
 
 
-def test_generate_api_and_pool_carry_the_conversation_to_the_scheduler():
+def test_generate_api_and_pool_carry_the_conversation_to_the_scheduler(monkeypatch):
     from fastapi import HTTPException
 
     from arctic_platform.inference.server import api
@@ -209,7 +209,7 @@ def test_generate_api_and_pool_carry_the_conversation_to_the_scheduler():
         pool._scheduler = Scheduler([worker], capacity=4)
         pool._sleeping = False
         pool._model_id = None
-        api.backend = pool
+        monkeypatch.setattr(api, "backend", pool)
 
         async def generate(**fields):
             return await api.generate_endpoint(api.GenerateRequest(**fields))
