@@ -12,9 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The fused mHC remix accumulates four residual streams in sampler order."""
-
-from __future__ import annotations
+"""The GLM-5.3 mHC remix, fused and eager FP32, adds its terms in the sampler's order."""
 
 import subprocess
 import sys
@@ -59,17 +57,29 @@ class TestMixOrder(TestCasePlus):
         from arctic_platform.model.implementations.glm53.hyper_connections import mix_streams
 
         _check_mix_order(mix_streams, "cuda")
-        weights = torch.tensor([0.4, 0.3, 0.2, 0.1], dtype=torch.float32, device="cuda")
-        post = weights.expand(1, 16, -1)
-        comb = torch.stack([weights.roll(i) for i in range(4)]).expand(1, 16, -1, -1)
-        sublayer_out = torch.full((1, 16, 256), 1.125, dtype=torch.bfloat16, device="cuda")
-        streams = torch.zeros((1, 16, 4, 256), dtype=torch.bfloat16, device="cuda")
-        streams[:, :, 0] = -1.125
-        # Only the first product rounds before the FMA. Rounding its opposite first would flip the residual's sign.
-        rounded_stream = -1.125 * weights
-        expected = (1.125 * weights.double() + rounded_stream.double()).to(streams.dtype)
-        actual = mix_streams(post, comb, sublayer_out, streams)
-        torch_assert_equal(actual, expected[None, None, :, None].expand_as(actual))
+        _check_first_product("cuda")
+
+    def test_eager_mix_order(self):
+        _check_first_product("cpu")
+
+
+def _check_first_product(device):
+    from arctic_platform.model.implementations.glm53.modeling_glm5_next import _remix
+
+    weights = torch.tensor([0.4, 0.3, 0.2, 0.1], dtype=torch.float32, device=device)
+    post = weights.expand(1, 16, -1)
+    comb = torch.stack([weights.roll(i) for i in range(4)]).expand(1, 16, -1, -1)
+    sublayer_out = torch.full((1, 16, 256), 1.125, dtype=torch.bfloat16, device=device)
+    streams = torch.zeros((1, 16, 4, 256), dtype=torch.bfloat16, device=device)
+    streams[:, :, 0] = -1.125
+    # ATen's addcmul can be unfused on CPU. CUDA must produce the correctly rounded FMA.
+    rounded = -1.125 * weights
+    if device == "cpu":
+        expected = rounded.addcmul(weights, torch.full_like(weights, 1.125))
+    else:
+        expected = 1.125 * weights.double() + rounded.double()
+    actual = _remix(False, True, post, comb, sublayer_out, streams)
+    torch_assert_equal(actual, expected.to(streams.dtype)[None, None, :, None].expand_as(actual))
 
 
 if __name__ == "__main__":
