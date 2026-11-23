@@ -104,7 +104,10 @@ class _RouterReplayCacheBase:
 
     A side dict tracks per-entry byte counts for O(1) ``max_bytes`` accounting.
     A single ``threading.Lock`` guards the dicts (vLLM async loop + per-step
-    NCCL task; contention is low). Tensor copy runs outside the lock.
+    NCCL task; contention is low). Tensor copy runs outside the lock, after
+    eviction has reserved the entry's bytes: ``max_bytes`` bounds held plus
+    reserved entry bytes (an overwrite keeps its prior entry until the
+    replacement lands; tensors retained by snapshots are not counted).
     """
 
     def __init__(self, device: torch.device, max_bytes: int) -> None:
@@ -116,6 +119,7 @@ class _RouterReplayCacheBase:
         self._created_at: dict[str, float] = {}
         self._last_touched: dict[str, float] = {}
         self._bytes_in_use: int = 0
+        self._reserved_bytes: int = 0
         self._peak_bytes_in_use: int = 0
         # Lifetime counters for observability.
         self._n_put = 0
@@ -154,19 +158,30 @@ class _RouterReplayCacheBase:
         *,
         replace: bool,
     ) -> None:
-        tensor = self._coerce(value)
-        new_bytes = tensor.element_size() * tensor.numel()
-        new_shape = list(tensor.shape)
+        if isinstance(value, np.ndarray):
+            value = torch.from_numpy(value)
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"router-replay cache.put expects torch.Tensor or np.ndarray, "
+                f"got {type(value).__name__}"
+            )
+        dtype = value.dtype if value.dtype in ROUTER_REPLAY_CACHE_DTYPES else ROUTER_REPLAY_CACHE_DTYPE
+        new_bytes = dtype.itemsize * value.numel()
+        new_shape = list(value.shape)
         now = time.monotonic()
         with self._lock:
             if not replace and self._suppress_put_new_locked(sample_id, now):
                 return
-            if not replace and sample_id in self._data:
-                self._n_duplicate_rejected += 1
-                raise RouterReplayDuplicateError([sample_id])
-            old_bytes = self._sizes.get(sample_id, 0)
+            self._reject_duplicate_locked(sample_id, replace)
+            # Eviction cannot release bytes already reserved for in-flight copies.
+            if new_bytes + self._reserved_bytes > self.max_bytes:
+                raise RouterReplayCacheFull(
+                    f"router-replay cache entry needs {new_bytes} bytes with {self._reserved_bytes} reserved, "
+                    f"exceeding max_bytes ({self.max_bytes}), "
+                    f"on put({sample_id!r}, shape={new_shape}, dtype={dtype})"
+                )
             bytes_before = self._bytes_in_use
-            projected = self._bytes_in_use - old_bytes + new_bytes
+            projected = self._bytes_in_use + self._reserved_bytes - self._sizes.get(sample_id, 0) + new_bytes
             projected_before_eviction = projected
             projected, evictions = self._evict_for_put_locked(
                 sample_id=sample_id,
@@ -178,18 +193,9 @@ class _RouterReplayCacheBase:
                 raise RouterReplayCacheFull(
                     f"router-replay cache would exceed max_bytes "
                     f"({projected} > {self.max_bytes}) on put({sample_id!r}, "
-                    f"shape={list(tensor.shape)}, dtype={tensor.dtype})"
+                    f"shape={new_shape}, dtype={dtype})"
                 )
-            if sample_id in self._data:
-                self._n_overwrite += 1
-            else:
-                self._created_at[sample_id] = now
-            self._data[sample_id] = tensor
-            self._sizes[sample_id] = new_bytes
-            self._last_touched[sample_id] = now
-            self._bytes_in_use = projected
-            self._peak_bytes_in_use = max(self._peak_bytes_in_use, projected)
-            self._n_put += 1
+            self._reserved_bytes += new_bytes
             if evictions:
                 self._log_evictions_locked(
                     evictions,
@@ -199,6 +205,30 @@ class _RouterReplayCacheBase:
                     bytes_before=bytes_before,
                     projected_before_eviction=projected_before_eviction,
                 )
+        try:
+            tensor = self._coerce(value)
+        except BaseException:
+            with self._lock:
+                self._reserved_bytes -= new_bytes
+            raise
+        with self._lock:
+            self._reserved_bytes -= new_bytes
+            self._reject_duplicate_locked(sample_id, replace)
+            if sample_id in self._data:
+                self._n_overwrite += 1
+            else:
+                self._created_at[sample_id] = now
+            self._bytes_in_use += new_bytes - self._sizes.get(sample_id, 0)
+            self._data[sample_id] = tensor
+            self._sizes[sample_id] = new_bytes
+            self._last_touched[sample_id] = now
+            self._peak_bytes_in_use = max(self._peak_bytes_in_use, self._bytes_in_use)
+            self._n_put += 1
+
+    def _reject_duplicate_locked(self, sample_id: str, replace: bool) -> None:
+        if not replace and sample_id in self._data:
+            self._n_duplicate_rejected += 1
+            raise RouterReplayDuplicateError([sample_id])
 
     def pop(self, sample_id: str) -> torch.Tensor:
         """Remove and return the entry; raises KeyError if absent."""
@@ -296,16 +326,7 @@ class _RouterReplayCacheBase:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _coerce(self, value: torch.Tensor | np.ndarray) -> torch.Tensor:
-        if isinstance(value, np.ndarray):
-            t = torch.from_numpy(value)
-        elif isinstance(value, torch.Tensor):
-            t = value
-        else:
-            raise TypeError(
-                f"router-replay cache.put expects torch.Tensor or np.ndarray, "
-                f"got {type(value).__name__}"
-            )
+    def _coerce(self, t: torch.Tensor) -> torch.Tensor:
         source_ptr = t.data_ptr()
         if t.dtype not in ROUTER_REPLAY_CACHE_DTYPES:
             t = t.to(ROUTER_REPLAY_CACHE_DTYPE)

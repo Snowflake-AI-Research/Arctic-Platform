@@ -14,6 +14,7 @@ from arctic_platform.inference.server.router_replay.all2all import (
     _compute_plan,
     _PerRankManifest,
 )
+from arctic_platform.inference.server.router_replay.cache import RouterReplayCacheFull
 
 
 def _tensor(seq_len: int = 4, n_layers: int = 2, top_k: int = 2, base: int = 1) -> torch.Tensor:
@@ -54,6 +55,75 @@ def test_tx_cache_evicts_lru_when_full(monkeypatch):
     assert "sid-2" in cache
     assert cache.stats()["bytes_in_use"] == bytes_one
     assert cache.stats()["n_evicted_lru"] == 1
+
+
+def test_tx_cache_allocates_on_its_device_only_within_max_bytes(monkeypatch):
+    monkeypatch.setenv("ARCTIC_ROUTER_REPLAY_TX_EVICT_MIN_AGE_S", "0")
+    one = _tensor(seq_len=4)
+    bytes_one = one.numel()
+    cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=2 * bytes_one)
+    footprint_at_copy = []
+    coerce = cache._coerce
+
+    def recording_coerce(value):
+        footprint_at_copy.append(cache._bytes_in_use + bytes_one)
+        return coerce(value)
+
+    monkeypatch.setattr(cache, "_coerce", recording_coerce)
+    for sid in ("rr1:a", "rr1:b", "rr1:c"):
+        cache.put_new(sid, one)
+    with pytest.raises(RouterReplayDuplicateError):
+        cache.put_new("rr1:c", one)
+
+    assert len(footprint_at_copy) == 3
+    assert max(footprint_at_copy) <= cache.max_bytes
+    assert cache.stats()["n_evicted_lru"] > 0
+
+
+def test_tx_cache_refuses_an_entry_larger_than_max_bytes_before_evicting(monkeypatch):
+    monkeypatch.setenv("ARCTIC_ROUTER_REPLAY_TX_EVICT_MIN_AGE_S", "0")
+    held = _tensor(seq_len=16)
+    cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=held.numel())
+    cache.put("rr1:held", held)
+
+    with pytest.raises(RouterReplayCacheFull):
+        cache.put("rr1:oversized", _tensor(seq_len=1, n_layers=1, top_k=held.numel() + 1))
+
+    assert "rr1:held" in cache
+    assert cache.stats()["n_evicted_lru"] == 0
+
+
+def test_tx_cache_keeps_held_entries_when_another_copy_reserves_the_space(monkeypatch):
+    monkeypatch.setenv("ARCTIC_ROUTER_REPLAY_TX_EVICT_MIN_AGE_S", "0")
+    value = _tensor()
+    cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=2 * value.numel())
+    cache.put("held", value)
+    coerce = cache._coerce
+
+    def copy_with_another_put(tensor):
+        with pytest.raises(RouterReplayCacheFull):
+            cache.put("too-large-while-copying", torch.cat([value, value]))
+        return coerce(tensor)
+
+    monkeypatch.setattr(cache, "_coerce", copy_with_another_put)
+    cache.put("copying", value)
+    assert set(cache.held_sample_ids()) == {"held", "copying"}
+
+
+def test_tx_cache_failed_copy_releases_its_reserved_bytes(monkeypatch):
+    one = _tensor()
+    cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=one.numel())
+
+    def failing_coerce(value):
+        raise torch.OutOfMemoryError("copy failed")
+
+    monkeypatch.setattr(cache, "_coerce", failing_coerce)
+    with pytest.raises(torch.OutOfMemoryError):
+        cache.put("rr1:a", one)
+    monkeypatch.undo()
+    cache.put("rr1:b", one)
+
+    assert cache.stats()["bytes_in_use"] == one.numel()
 
 
 def test_tx_cache_logs_lru_eviction(monkeypatch, caplog):
