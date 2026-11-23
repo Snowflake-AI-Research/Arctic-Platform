@@ -39,6 +39,8 @@ def _text(content: Any) -> str:
 def chat_body_from_responses(body: dict[str, Any]) -> dict[str, Any]:
     if body.get("previous_response_id") is not None:
         raise ValueError("previous_response_id is not supported; send the whole conversation as input")
+    if body.get("background"):
+        raise ValueError("background mode is not supported; the harness answers each request before returning")
     if body.get("tool_choice") not in (None, "auto", "none"):
         raise ValueError("the harness supports only auto and none for tool_choice")
     if body.get("tools") and body.get("tool_choice") != "none" and body.get("parallel_tool_calls") is False:

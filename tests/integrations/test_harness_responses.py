@@ -159,6 +159,7 @@ def test_aborted_generation_returns_an_error(served, generation):
     [
         dict(input=[dict(type="reasoning", summary=[])]),
         dict(input="hi", previous_response_id="resp_1"),
+        dict(input="hi", background=True),
         dict(input="hi", tools=[dict(type="web_search")]),
         dict(input="hi", stream=True),
         dict(input="hi", tools=[dict(type="function", name="ls")], tool_choice=dict(type="function", name="ls")),
