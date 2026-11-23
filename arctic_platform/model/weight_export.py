@@ -604,7 +604,9 @@ def iter_lora_weights(
     is_master: bool,
     is_zero3: bool,
 ) -> WeightIterator:
-    """Yield vLLM LoRA tensors; every rank participates in EP gathers."""
+    """Yield vLLM LoRA tensors with EP gathers on the master's group."""
+    import torch.distributed as dist
+
     if is_zero3:
         raise NotImplementedError("weight_format='lora' does not support ZeRO-3")
     if not is_peft_model(model):
@@ -624,13 +626,13 @@ def iter_lora_weights(
         lora_rank,
     ) in _iter_param_wrapper_expert_loras(model):
         expert_parameter_ids.add(id(parameter))
+        group = _expert_parallel_group(parameter) if _is_ep_sharded_parameter(parameter) else None
+        if group is not None and 0 not in dist.get_process_group_ranks(group):
+            continue
         prefix = strip_activation_checkpoint_segments(experts_prefix).replace(".base_layer", "")
         label = f"{prefix}.{weight_name}.lora_{kind}"
         local = _reshape_expert_lora_for_ep(parameter.data.contiguous(), kind, lora_rank, label=label)
-        if _is_ep_sharded_parameter(parameter):
-            import torch.distributed as dist
-
-            group = _expert_parallel_group(parameter)
+        if group is not None:
             assert not is_master or dist.get_rank(group=group) == 0
             shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=group))]
             dist.all_gather(shards, local, group=group)
@@ -649,9 +651,9 @@ def iter_lora_weights(
             continue
         export_name = rename(_peft_lora_parameter_to_vllm_name(name))
         if _is_ep_sharded_parameter(parameter):
-            import torch.distributed as dist
-
             group = _expert_parallel_group(parameter)
+            if 0 not in dist.get_process_group_ranks(group):
+                continue
             assert not is_master or dist.get_rank(group=group) == 0
             local = parameter.data.contiguous()
             shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=group))]
