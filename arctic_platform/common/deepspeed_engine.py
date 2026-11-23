@@ -294,6 +294,7 @@ def initialize_training_engine(
     init_kwargs = {"mpu": mpu} if mpu is not None else {}
     if built is not None:
         engine, built, _, _ = deepspeed.initialize(model=model, optimizer=built, config=ds_config, **init_kwargs)
+        _refuse_restoring_another_parameter_layout(built)
     else:
         if ds_config.get("optimizer") is not None:
             init_kwargs["model_parameters"] = model.parameters()
@@ -506,6 +507,90 @@ def _aligned_first(params: list) -> list:
     The sort is stable, so the order within each half is the model's.
     """
     return sorted(params, key=lambda param: param.numel() % 8 != 0)
+
+
+def _refuse_restoring_another_parameter_layout(zero_optimizer) -> None:
+    """Check the parameter slices DeepSpeed restores by position, including repartitioned ZeRO masters."""
+    from itertools import repeat
+    from math import inf
+
+    from deepspeed import comm as dist
+    from deepspeed.checkpoint.constants import GROUP_PADDINGS
+    from deepspeed.checkpoint.constants import PARAM_ALIGNMENT_PADDINGS
+    from deepspeed.checkpoint.constants import PARAM_SLICE_MAPPINGS
+    from deepspeed.checkpoint.constants import SINGLE_PARTITION_OF_FP32_GROUPS
+    from deepspeed.checkpoint.constants import ZERO_STAGE
+    from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+
+    if not isinstance(zero_optimizer, (DeepSpeedZeroOptimizer, BF16_Optimizer)):
+        return
+    load = zero_optimizer._load_legacy_checkpoint
+    bf16 = isinstance(zero_optimizer, BF16_Optimizer)
+    groups = zero_optimizer.bf16_groups if bf16 else zero_optimizer.round_robin_bit16_groups
+
+    def refuse(rank, detail):
+        raise RuntimeError(
+            "This checkpoint's optimizer state was saved with the parameters at other positions in ZeRO's flat "
+            f"buffers (rank {rank}, {detail}), and DeepSpeed restores it by position. Resume with the code that "
+            "saved it, or load the module weights only and start a fresh optimizer."
+        )
+
+    def load_same_layout(state_dict_list, load_optimizer_states=True, load_from_fp32_weights=False):
+        if load_optimizer_states or load_from_fp32_weights:
+            rank = dist.get_rank(group=zero_optimizer.dp_process_group)
+            resized = len(state_dict_list) != dist.get_world_size(group=zero_optimizer.dp_process_group)
+            # With unchanged DP, DeepSpeed can leave every checkpoint but this rank's unread (None).
+            states = state_dict_list if resized else [state_dict_list[rank]]
+            for state in states:
+                count = len(state[PARAM_SLICE_MAPPINGS])
+                if count != len(groups):
+                    refuse(rank, f"{count} parameter groups saved, {len(groups)} now")
+            for group, params in enumerate(groups):
+                saved = zero_optimizer._checkpoint_group_state_dicts(states, group) if resized else states
+                lo, hi = 0, inf
+                if not resized:
+                    dp = zero_optimizer.real_dp_process_group[group]
+                    group_rank = dist.get_rank(group=dp)
+                    # ZeRO strips trailing DP padding when saving, while BF16 saves the entire partition.
+                    width = saved[0][SINGLE_PARTITION_OF_FP32_GROUPS][group].numel()
+                    if ZERO_STAGE in saved[0]:
+                        width += saved[0][GROUP_PADDINGS][group]
+                    lo = group_rank * width
+                    if group_rank + 1 < dist.get_world_size(group=dp):
+                        hi = lo + width
+
+                old = {}
+                offset = lo
+                for state in saved:
+                    for name, at in state[PARAM_SLICE_MAPPINGS][group].items():
+                        name = name.replace("._checkpoint_wrapped_module", "")
+                        start, end = offset + at.start, offset + at.start + at.numel
+                        if name in old and old[name][1] != start:
+                            refuse(rank, f"group {group}: disjoint saved slices of {name}")
+                        old[name] = (old[name][0] if name in old else start, end)
+                    offset += state[SINGLE_PARTITION_OF_FP32_GROUPS][group].numel()
+
+                # DeepSpeed inserts between-parameter alignment on restore from a legacy compact checkpoint.
+                padding = (
+                    zero_optimizer.round_robin_bit16_padding[group]
+                    if not bf16 and PARAM_ALIGNMENT_PADDINGS in saved[0]
+                    else repeat(0)
+                )
+                new = {}
+                start = 0
+                for param, pad in zip(params, padding):
+                    end = start + param.numel()
+                    if max(start, lo) < min(end, hi):
+                        name = zero_optimizer.param_names[param].replace("._checkpoint_wrapped_module", "")
+                        new[name] = (max(start, lo), min(end, hi))
+                    start = end + pad
+                if old != new:
+                    name = next(name for name in {**old, **new} if old.get(name) != new.get(name))
+                    refuse(rank, f"group {group}: {name} saved at {old.get(name)}, now at {new.get(name)}")
+        return load(state_dict_list, load_optimizer_states, load_from_fp32_weights)
+
+    zero_optimizer._load_legacy_checkpoint = load_same_layout
 
 
 def _require_fp32_gradient_reduction(ds_config: dict[str, Any]) -> None:
