@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
@@ -197,3 +198,85 @@ def test_packed_cache_bound_to_kernel_blocks_matches_upstream_zeroer():
             torch.testing.assert_close(actual, reference)
         else:
             assert actual == reference
+
+
+@pytest.mark.parametrize("blocks_before_tail", [40, 41])
+@pytest.mark.parametrize("scheduler_blocks", [1, 2, 3])
+def test_resend_hits_at_the_replay_boundary_when_block_sizes_differ(blocks_before_tail, scheduler_blocks):
+    from vllm.sampling_params import SamplingParams
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
+                                            KVCacheGroupSpec, SlidingWindowSpec)
+    from vllm.v1.request import Request
+
+    from arctic_platform.inference.vllm.hybrid_state_fixes import apply_hybrid_state_fixes
+
+    apply_hybrid_state_fixes()
+    init_none_hash(sha256)
+    A, budget, num_spec = 16, 96, 7
+    scheduler_block_size = scheduler_blocks * A
+    prompt = list(range(1000, 1000 + A * blocks_before_tail + 5))
+    f32 = torch.float32
+    manager = KVCacheManager(
+        KVCacheConfig(
+            num_blocks=4096,
+            kv_cache_tensors=[],
+            prefix_cache_retention_interval=0,
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attn"], FullAttentionSpec(
+                    block_size=A, num_kv_heads=1, head_size=1, dtype=f32)),
+                KVCacheGroupSpec(["gdn"], MambaSpec(
+                    block_size=A, shapes=((1, 1),), dtypes=(f32,),
+                    mamba_cache_mode="align", num_speculative_blocks=num_spec)),
+                KVCacheGroupSpec(["draft"], SlidingWindowSpec(
+                    block_size=scheduler_block_size, num_kv_heads=1, head_size=1, dtype=f32,
+                    sliding_window=4 * A)),
+            ],
+        ),
+        max_model_len=8192,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=A,
+        enable_caching=True,
+        use_eagle=False,
+    )
+    scheduler = SimpleNamespace(
+        _orig_mamba_block_aligned_split=lambda *args: Scheduler._orig_mamba_block_aligned_split(scheduler, *args),
+        block_size=scheduler_block_size,
+        cache_config=SimpleNamespace(block_size=A),
+        hash_block_size=A,
+        use_eagle_block_drop=False,
+        num_hash_lookahead_tokens=0,
+        max_num_scheduled_tokens=budget,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        mamba_partial_cache_hit=False,
+        mamba_shared_prefix_checkpoint=False,
+        mamba_has_prefill_checkpoint_blocks=False,
+        mamba_prefill_checkpoint_alignment=None,
+    )
+
+    def send(request_id):
+        params = SamplingParams(max_tokens=1)
+        params.update_from_generation_config({}, eos_token_id=0)
+        request = Request(request_id=request_id, prompt_token_ids=prompt, mm_features=None,
+                          sampling_params=params, pooling_params=None,
+                          block_hasher=get_request_block_hasher(A, sha256))
+        hit_blocks, hit, *_ = manager.get_computed_blocks(request)
+        local = hit
+        while request.num_computed_tokens < request.num_tokens:
+            n = Scheduler._mamba_block_aligned_split(
+                scheduler, request, min(request.num_tokens - request.num_computed_tokens - local, budget), local)
+            assert manager.allocate_slots(request, n, num_new_computed_tokens=local,
+                                          new_computed_blocks=hit_blocks if local else None,
+                                          num_lookahead_tokens=num_spec) is not None
+            request.num_computed_tokens += local + n
+            local = 0
+            manager.new_step_starts()
+        manager.free(request)
+        manager.new_step_starts()
+        return hit
+
+    replay_boundary = (len(prompt) - 1) // scheduler_block_size * scheduler_block_size
+    assert [send(f"send{i}") for i in range(3)] == [0, replay_boundary, replay_boundary]
