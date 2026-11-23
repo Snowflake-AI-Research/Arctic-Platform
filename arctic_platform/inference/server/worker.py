@@ -1280,14 +1280,7 @@ class InferenceWorker(StreamingWorkerMixin):
         return bool(parser.is_reasoning_end(prompt_ids))
 
     async def _init_forced_routes(self) -> None:
-        try:
-            replies = await self.llm.collective_rpc("forced_route_support")
-        except Exception as error:
-            # vLLM's run_method error, crossing the engine core as a bare Exception: a semi_p engine restored from
-            # a snapshot taken before this worker method existed cannot answer it.
-            if "Method 'forced_route_support' is not implemented." not in str(error):
-                raise
-            replies = ["the engine's workers have no forced_route_support (restored from an older snapshot)"]
+        replies = await self.llm.collective_rpc("forced_route_support")
         reasons = {reason for reason in replies if reason is not None}
         self._force_routes_enabled = not reasons
         if reasons:

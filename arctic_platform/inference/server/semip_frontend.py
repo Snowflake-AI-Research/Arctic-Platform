@@ -180,8 +180,9 @@ class _SemiPAsyncLLMMixin:
     weights into it.
     """
 
-    def _init_semi_p(self, inst: Any, agents: list[Any] | None = None) -> None:
+    def _init_semi_p(self, inst: Any, agents: list[Any] | None, *, forced_route_support_rpc: bool) -> None:
         self._inst = inst
+        self._forced_route_support_rpc = forced_route_support_rpc
         # The other node-partitions of a pod-spanning engine. They hold GPUs and a
         # restored process tree, so they have to come down with this engine;
         # nothing else owns them.
@@ -199,6 +200,8 @@ class _SemiPAsyncLLMMixin:
         if method == "wake_up":
             await self.wake_up()
             return [None]
+        if method == "forced_route_support" and not self._forced_route_support_rpc:
+            return ["the restored snapshot does not advertise forced_route_support"]
         try:
             return await super().collective_rpc(
                 method, timeout=timeout, args=args, kwargs=kwargs)
