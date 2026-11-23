@@ -34,6 +34,7 @@ from pydantic import ConfigDict
 from pydantic import Field
 
 from arctic_platform.common.optimizer import OptimizerSettings
+from arctic_platform.common.optimizer import uses_weight_decay
 from arctic_platform.debug.training import maybe_cleanup_router_replay_on_failure
 from arctic_platform.debug.training import maybe_configure_router_replay_trace
 from arctic_platform.debug.weight_sync import maybe_configure_broadcast_training
@@ -376,8 +377,8 @@ def build_training_optimizer(
             optimizer_name,
         )
     trainable = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
-    decay_params = [param for name, param in trainable if param.ndim >= 2 and "bias" not in name.lower()]
-    no_decay_params = [param for name, param in trainable if param.ndim < 2 or "bias" in name.lower()]
+    decay_params = [param for name, param in trainable if uses_weight_decay(name, param)]
+    no_decay_params = [param for name, param in trainable if not uses_weight_decay(name, param)]
     # ZeRO flattens each group into one buffer of its first parameter's dtype, so
     # parameters kept in FP32 through the bf16 cast need groups of their own.
     param_groups = [

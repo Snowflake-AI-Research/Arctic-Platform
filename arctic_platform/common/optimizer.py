@@ -35,6 +35,11 @@ _NonNegative = Annotated[float, Field(ge=0, strict=True, allow_inf_nan=False)]
 _Beta = Annotated[float, Field(ge=0, lt=1, strict=True, allow_inf_nan=False)]
 
 
+def uses_weight_decay(name: str, param: Any) -> bool:
+    """Weight decay applies to matrices that are not biases; never to 1-D parameters (norm weights, gains, decay rates)."""
+    return param.ndim >= 2 and "bias" not in name.lower()
+
+
 class OptimizerSettings(BaseModel):
     """Optimizer block handed to DeepSpeed.
 

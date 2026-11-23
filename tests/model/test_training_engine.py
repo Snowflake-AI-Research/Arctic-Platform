@@ -1171,3 +1171,15 @@ def test_cpu_adam_checkpoint_hooks_keep_empty_state_and_native_group_validation(
             optimizer.load_state_dict(checkpoint)
     assert not optimizer.state
     assert checkpoint_state.moments == []
+
+
+def test_correctness_reference_decays_what_the_trainer_decays():
+    from arctic_platform.correctness.reference.optimizer_step import build_adamw
+
+    named = [(name, torch.nn.Parameter(torch.ones(shape))) for name, shape in (
+        ("layers.0.mlp.weight", (2, 3)), ("layers.0.mlp.bias", (2,)), ("layers.0.linear_attn.A_log", (3,)),
+        ("layers.0.hc.base", (4,)), ("model.norm.weight", (3,)),
+    )]
+    optimizer = build_adamw(named, {"name": "torch_adamw", "weight_decay": 0.1}, learning_rate=1e-3)
+    decayed = {id(param) for group in optimizer.param_groups if group["weight_decay"] for param in group["params"]}
+    assert decayed == {id(named[0][1])}
