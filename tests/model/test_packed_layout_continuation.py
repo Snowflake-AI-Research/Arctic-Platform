@@ -43,6 +43,9 @@ from arctic_platform.common.packing import pack_with_layout
 from arctic_platform.common.packing import using_layout
 from arctic_platform.common.packing.layout import _hf_prefix_attention_fn
 from arctic_platform.common.packing.layout import unshared_groups
+from arctic_platform.model.implementations.afmoe import modeling_afmoe as afmoe_module
+from arctic_platform.model.implementations.afmoe.modeling_afmoe import AfmoeAttentionConfig
+from arctic_platform.model.implementations.afmoe.modeling_afmoe import AfmoeFlashAttention
 from arctic_platform.model.implementations.layers import attn as attn_module
 from arctic_platform.model.implementations.layers.attn import AttentionConfig
 from arctic_platform.model.implementations.layers.attn import FlashAttention
@@ -163,27 +166,40 @@ def _attention_config(use_qk_norm=True):
     )
 
 
-def _ap_attention(sliding_window=None):
-    module = FlashAttention(_attention_config(), flash_attn_version=2)
+def _ap_attention(sliding_window=None, kind="ap"):
+    """``kind="afmoe"`` builds AFMoE's gated attention, which rotates only its sliding-window (local) layers."""
+    if kind == "afmoe":
+        config = AfmoeAttentionConfig(
+            hidden_size=32,
+            head_dim=HEAD_DIM,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-6,
+            is_local_attention=sliding_window is not None,
+            sliding_window=sliding_window,
+        )
+        module = AfmoeFlashAttention(config, flash_attn_version=2)
+    else:
+        module = FlashAttention(_attention_config(), flash_attn_version=2)
+        if sliding_window is not None:
+            module.sliding_window = sliding_window
     module._flash_attn_call = flash_attn_varlen_reference
-    if sliding_window is not None:
-        module.sliding_window = sliding_window
     return module
 
 
 class APStack(nn.Module):
     """Embedding, Arctic-Platform flash attention + MLP blocks, LM head. Segments come from the model-stack helper."""
 
-    def __init__(self, layers=2, sliding_window=None, use_checkpoint=False):
+    def __init__(self, layers=2, sliding_window=None, use_checkpoint=False, kind="ap"):
         super().__init__()
         self.embed = nn.Embedding(VOCAB, 32)
-        self.attn = nn.ModuleList(_ap_attention(sliding_window) for _ in range(layers))
+        self.attn = nn.ModuleList(_ap_attention(sliding_window, kind) for _ in range(layers))
         self.mlp = nn.ModuleList(nn.Sequential(nn.Linear(32, 64), nn.SiLU(), nn.Linear(64, 32)) for _ in range(layers))
         self.head = nn.Linear(32, VOCAB)
         self.use_checkpoint = use_checkpoint
 
     def _block(self, i, hidden, cos, sin, cu_seqlens, max_seqlen):
-        hidden = hidden + self.attn[i](hidden, (cos, sin), cu_seqlens, max_seqlen)[0]
+        hidden = hidden + self.attn[i](hidden, (cos, sin), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)[0]
         return hidden + self.mlp[i](hidden)
 
     def forward(self, input_ids, position_ids):
@@ -215,29 +231,31 @@ def test_ap_get_cu_seqlens_reads_active_layout():
     assert max_seqlen == shared.max_len_q
 
 
+@pytest.mark.parametrize("kind", ["ap", "afmoe"])
 @pytest.mark.parametrize("sliding_window", [None, 3])
-def test_ap_stack_share_on_matches_share_off_and_rows(sliding_window):
+def test_ap_stack_share_on_matches_share_off_and_rows(sliding_window, kind):
     set_seed(1)
     batch, groups, scored = _batch()
     shared, unshared = _layouts(batch, groups)
-    model = _ap_stack(sliding_window=sliding_window)
+    model = _ap_stack(sliding_window=sliding_window, kind=kind)
     rows = _run(model, _ap_logits, batch, scored)
     _assert_runs_match(_run(model, _ap_logits, batch, scored, unshared), rows)
     _assert_runs_match(_run(model, _ap_logits, batch, scored, shared), rows, SHARED_GRAD_ATOL)
 
 
-def test_ap_stack_without_prefix_gather_does_not_match(monkeypatch):
+@pytest.mark.parametrize("kind", ["ap", "afmoe"])
+def test_ap_stack_without_prefix_gather_does_not_match(monkeypatch, kind):
     set_seed(1)
     batch, groups, scored = _batch()
     shared, _ = _layouts(batch, groups)
-    model = _ap_stack()
+    model = _ap_stack(kind=kind)
     rows = _run(model, _ap_logits, batch, scored)
 
     def no_gather(k, v, cu_seqlens, max_seqlen, layout):
         cu = layout.cu_seqlens.to(torch.int32)
         return k, v, cu, cu, layout.max_len_q, layout.max_len_q
 
-    monkeypatch.setattr(attn_module, "prefix_varlen_args", no_gather)
+    monkeypatch.setattr(attn_module if kind == "ap" else afmoe_module, "prefix_varlen_args", no_gather)
     broken = _run(model, _ap_logits, batch, scored, shared)
     assert (broken[0] - rows[0]).abs().max() > 1e-3
 
@@ -270,6 +288,22 @@ def test_ap_stack_needs_its_own_unnested_context():
                 other(packed_off["input_ids"], packed_off["position_ids"])
     with using_layout(other, unshared):
         other(packed_off["input_ids"], packed_off["position_ids"])
+
+
+def test_fa4_gets_max_seqlen_only_under_sharing(monkeypatch):
+    calls = []
+
+    def fa4(q, k, v, **kwargs):
+        calls.append(kwargs)
+        return q
+
+    monkeypatch.setattr(attn_module, "_FA4_TAKES_MAX_SEQLEN", True)
+    q = torch.zeros(4, 1, 8)
+    cu_q, cu_k = torch.tensor([0, 1, 4]), torch.tensor([0, 3, 6])
+    for sharing in (False, True):
+        attn_module.flash_varlen_call(fa4, 4, q, q, q, cu_q, cu_k, 3, 3, sharing=sharing, causal=True)
+    assert calls[0] == {"causal": True, "cu_seqlens_q": cu_q, "cu_seqlens_k": cu_k}
+    assert calls[1] == {**calls[0], "max_seqlen_q": 3, "max_seqlen_k": 3}
 
 
 def test_ap_sdpa_is_rejected_under_sharing():

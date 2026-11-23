@@ -33,11 +33,41 @@ try:
 except (ImportError, AttributeError):
     flash_attn_4_varlen_func = None  # type: ignore
 
-# The flash_attn 2.8 bundled FA4 has no max_seqlen arguments; flash-attn-4 4.x pads to the packed width without them.
+# The flash_attn 2.8 bundled FA4 has no max_seqlen arguments; flash-attn-4 4.x sizes its work to the packed width
+# without them.
 _FA4_TAKES_MAX_SEQLEN = (
     flash_attn_4_varlen_func is not None
     and "max_seqlen_k" in inspect.signature(flash_attn_4_varlen_func).parameters
 )
+
+
+def flash_varlen_call(
+    call: Callable,
+    version: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    sharing: bool,
+    **kwargs,
+) -> torch.Tensor:
+    """Run ``version``'s varlen kernel ``call`` on [total_tokens, heads, dim] q/k/v; ``sharing`` is a prefix-sharing call."""
+    if version == 4:
+        # FA4's flash_attn_varlen_func has qv as the 4th positional arg,
+        # so cu_seqlens must be passed as keyword args to avoid misalignment.
+        kwargs["cu_seqlens_q"] = cu_seqlens_q
+        kwargs["cu_seqlens_k"] = cu_seqlens_k
+        # max_seqlen is GPU-checked only under prefix sharing; other FA4 calls keep sizing to the packed width.
+        if sharing and _FA4_TAKES_MAX_SEQLEN:
+            kwargs["max_seqlen_q"] = max_seqlen_q
+            kwargs["max_seqlen_k"] = max_seqlen_k
+        out = call(q, k, v, **kwargs)
+    else:
+        out = call(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
+    return out[0] if isinstance(out, tuple) else out
 
 
 @dataclass
@@ -107,27 +137,27 @@ class FlashAttention(nn.Module):
 
     def _compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens, max_seqlen):
         """Run the flash attention kernel. q/k/v are [total_tokens, heads, dim]."""
+        layout = get_stashed_layout(self)
         k, v, cu_seqlens, cu_seqlens_k, max_seqlen, max_seqlen_k = prefix_varlen_args(
-            k, v, cu_seqlens, max_seqlen, get_stashed_layout(self)
+            k, v, cu_seqlens, max_seqlen, layout
         )
         kwargs: dict = {"causal": True}
         sliding_window = getattr(self, "sliding_window", None)
         if sliding_window is not None:
             kwargs["window_size"] = (sliding_window - 1, 0)
-        if self._flash_attn_version == 4:
-            # FA4's flash_attn_varlen_func has qv as the 4th positional arg,
-            # so cu_seqlens must be passed as keyword args to avoid misalignment.
-            kwargs["cu_seqlens_q"] = cu_seqlens
-            kwargs["cu_seqlens_k"] = cu_seqlens_k
-            if _FA4_TAKES_MAX_SEQLEN:
-                kwargs["max_seqlen_q"] = max_seqlen
-                kwargs["max_seqlen_k"] = max_seqlen_k
-            out = self._flash_attn_call(q, k, v, **kwargs)
-        else:
-            out = self._flash_attn_call(q, k, v, cu_seqlens, cu_seqlens_k, max_seqlen, max_seqlen_k, **kwargs)
-        if isinstance(out, tuple):
-            out = out[0]
-        return out
+        return flash_varlen_call(
+            self._flash_attn_call,
+            self._flash_attn_version,
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens_k,
+            max_seqlen,
+            max_seqlen_k,
+            sharing=layout is not None and layout.has_sharing,
+            **kwargs,
+        )
 
     def _attention_core(
         self,

@@ -22,6 +22,10 @@ from arctic_platform.common.packing.layout import get_stashed_layout
 from arctic_platform.common.packing.layout import prefix_varlen_args
 from arctic_platform.common.packing.layout import register_native_prefix_attention
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
+from arctic_platform.model.implementations.layers.attn import flash_attn_3_varlen_func
+from arctic_platform.model.implementations.layers.attn import flash_attn_4_varlen_func
+from arctic_platform.model.implementations.layers.attn import flash_attn_varlen_func
+from arctic_platform.model.implementations.layers.attn import flash_varlen_call
 from arctic_platform.model.implementations.moe.layers.lm_head import PrimeLmOutput
 from arctic_platform.model.implementations.layers.mlp import MLP, MLPConfig
 from arctic_platform.model.implementations.moe.layers.moe import MoE, MoEArgs
@@ -32,21 +36,6 @@ from arctic_platform.model.implementations.layers.rotary_emb import (
     apply_rotary_pos_emb,
 )
 from arctic_platform.model.implementations.layers.sequence import get_cu_seqlens_from_position_ids
-
-try:
-    from flash_attn import flash_attn_varlen_func
-except ImportError:
-    flash_attn_varlen_func = None  # type: ignore
-
-try:
-    from flash_attn_interface import flash_attn_varlen_func as flash_attn_3_varlen_func
-except ImportError:
-    flash_attn_3_varlen_func = None  # type: ignore
-
-try:
-    from flash_attn.cute import flash_attn_varlen_func as flash_attn_4_varlen_func
-except ImportError:
-    flash_attn_4_varlen_func = None  # type: ignore
 
 from .configuration_afmoe import AfmoeConfig
 from .converting_afmoe import (
@@ -213,31 +202,26 @@ class AfmoeFlashAttention(AfmoeAttentionBase):
 
     def _compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens, max_seqlen):
         """Run the flash attention kernel. q/k/v are [total_tokens, heads, dim]."""
+        layout = get_stashed_layout(self)
         k, v, cu_seqlens, cu_seqlens_k, max_seqlen, max_seqlen_k = prefix_varlen_args(
-            k, v, cu_seqlens, max_seqlen, get_stashed_layout(self)
+            k, v, cu_seqlens, max_seqlen, layout
         )
         kwargs: dict = {"causal": True}
         if self.sliding_window is not None:
             kwargs["window_size"] = (self.sliding_window - 1, 0)
-        if self._flash_attn_version == 4:
-            # FA4 inserts ``qv`` as its fourth positional argument, so sequence metadata must be keyword-only.
-            kwargs["cu_seqlens_q"] = cu_seqlens
-            kwargs["cu_seqlens_k"] = cu_seqlens_k
-            out = self._flash_attn_call(q, k, v, **kwargs)
-        else:
-            out = self._flash_attn_call(
-                q,
-                k,
-                v,
-                cu_seqlens,
-                cu_seqlens_k,
-                max_seqlen,
-                max_seqlen_k,
-                **kwargs,
-            )
-        if isinstance(out, tuple):
-            out = out[0]
-        return out
+        return flash_varlen_call(
+            self._flash_attn_call,
+            self._flash_attn_version,
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens_k,
+            max_seqlen,
+            max_seqlen_k,
+            sharing=layout is not None and layout.has_sharing,
+            **kwargs,
+        )
 
     def _attention_core(
         self,
