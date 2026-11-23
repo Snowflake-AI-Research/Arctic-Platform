@@ -1,4 +1,4 @@
-"""A continuation re-prefills the end of its previous request's capture under the routes that capture stored."""
+"""Exercise route replay from continuation admission to the experts used by the forward."""
 
 import asyncio
 from copy import copy
@@ -16,6 +16,8 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import F
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import FusedTopKRouter
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import GroupedTopKRouter
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from arctic_platform.inference.server.router_replay import RouterReplayCacheTX
@@ -60,7 +62,7 @@ def test_masked_rows_take_the_stored_experts_with_the_trainers_replay_weights(mo
 
         monkeypatch.setattr(type(plain), "_compute_routing", cpu_topk)
     hooked = copy(plain)
-    forced = ForcedRoutes(max_num_reqs=1, max_num_tokens=8, num_layers=2, top_k=K, device=torch.device("cpu"))
+    forced = ForcedRoutes(1, (2, K), torch.zeros((8, 2, K), dtype=torch.int32))
     forced.start[0], forced.end[0] = 11, 14
     forced.rows[0] = np.stack([np.zeros((3, K), np.uint16), stored.numpy().astype(np.uint16)], axis=1)
     # The request computes positions 10-15 in batch rows 0-5; its stored rows cover positions 11-13 (rows 1-3).
@@ -81,7 +83,8 @@ def test_masked_rows_take_the_stored_experts_with_the_trainers_replay_weights(mo
     assert torch.equal(captured[0], ids)  # the capture records the routes the forward used
 
     trainer = trainer_moe.TokenChoiceTopKRouter(
-        dim=D, num_experts=E, top_k=K, score_func=score, route_norm=norm, route_scale=1.0 if score == "softmax" else 2.5,
+        dim=D, num_experts=E, top_k=K, score_func=score, route_norm=norm,
+        route_scale=1.0 if score == "softmax" else 2.5,
     ).to(dtype)
     trainer.gate.weight.data.copy_(gate)
     trainer_weights, trainer_ids, _ = trainer(x, expert_bias=bias, routed_experts=ids.long())
@@ -111,14 +114,15 @@ class _MoERunner(MoERunner):
 class _V2Runner:
     """The Model Runner V2 methods ``patch_model_runner`` wraps, reduced to their request bookkeeping."""
 
-    def __init__(self, model, data_parallel_size=1, num_prefill_lookahead_tokens=1):
+    def __init__(self, model, data_parallel_size=1, num_prefill_lookahead_tokens=1, kv_transfer_config=None):
         self.model, self.device, self.aux_output_connector = model, torch.device("cpu"), None
         parallel = SimpleNamespace(data_parallel_size=data_parallel_size)
-        self.vllm_config = SimpleNamespace(parallel_config=parallel, num_prefill_lookahead_tokens=num_prefill_lookahead_tokens)
+        self.vllm_config = SimpleNamespace(parallel_config=parallel, kv_transfer_config=kv_transfer_config,
+                                           num_prefill_lookahead_tokens=num_prefill_lookahead_tokens)
         self.max_num_reqs, self.req_states, self.pooling_runner = 8, SimpleNamespace(req_id_to_index={}), None
 
     def initialize_kv_cache(self):
-        capturer = SimpleNamespace(device_buffer=torch.zeros(64, L, K), shape_per_token=(L, K))
+        capturer = SimpleNamespace(device_buffer=torch.zeros(64, L, K, dtype=torch.int32))
         self.aux_output_connector = SimpleNamespace(_capturer=capturer)
 
     def add_requests(self, scheduler_output):
@@ -147,8 +151,8 @@ def test_tail_intersects_only_recomputed_prompt_positions():
     rows = np.broadcast_to(np.arange(4, 8, dtype=np.uint8)[:, None, None], (4, L, K))
     params = SamplingParams(extra_args={forced_routes.FORCED_ROUTES_KEY: {
         "start": 4, "dtype": rows.dtype.str, "rows": rows.tobytes()}})
-    # Hit before, inside or beyond [4,8); the last request's effective prompt is too short to contain the capture.
-    reqs = [SimpleNamespace(req_id=name, prompt_len=n, sampling_params=params)
+    # The scheduler sends rows to the first three requests only.
+    reqs = [SimpleNamespace(req_id=name, prompt_len=n, sampling_params=params if name != "short" else SamplingParams())
             for name, n in [("early", 10), ("late", 10), ("full", 10), ("short", 7)]]
     runner.add_requests(SimpleNamespace(scheduled_new_reqs=reqs[::-1]))
     runner.prepare_inputs([r.req_id for r in reqs], np.array([0, 7, 8, 10, 13, 13]), np.array([2, 6, 8, 4]))
@@ -200,16 +204,15 @@ class _ToyEngine:
     token-budget scheduler, per-row capture (uint16, as for more than 256 experts), and numerics that differ between
     decode and prefill and with the request's length."""
 
-    def __init__(self, replay_window=0, external_kv=False, **parallel):
+    def __init__(self, replay_window=0, **parallel):
         gen = torch.Generator().manual_seed(0)
         self.logits = torch.randn(L, 64, E, generator=gen)  # by layer and position
         self.decode_shift = 0.5 * torch.randn(L, 64, E, generator=gen)  # a decoded position routes on other numerics
         bias = 0.1 * torch.randn(E, generator=gen)
-        self.routers, self.plain = [_router(bias) for _ in range(L)], [_router(bias) for _ in range(L)]
+        self.routers = [_router(bias) for _ in range(L)]
         self.runner = _V2Runner(torch.nn.ModuleList(_MoERunner(i, r) for i, r in enumerate(self.routers)), **parallel)
         self.runner.initialize_kv_cache()
         self.replay_window = replay_window
-        self.runner.vllm_config.kv_transfer_config = SimpleNamespace() if external_kv else None
         self.captured = [None] * L
         for i, router in enumerate(self.routers):
             router.set_capture_fn(partial(self.captured.__setitem__, i))
@@ -233,6 +236,8 @@ class _ToyEngine:
         request.used[:hit] = source[:hit] if hit else 0
         request.computed = max(0, hit - self.replay_window)
         request.prefill_shift = 0.5 * torch.randn(L, 64, E, generator=torch.Generator().manual_seed(len(prompt)))
+        request.core = Request(request_id, prompt, params, None)
+        request.core.num_computed_tokens = request.computed
         self.requests.append(request)
         self.submitted += 1
         return await request.done
@@ -248,9 +253,8 @@ class _ToyEngine:
                 if n > 0:
                     batch.append((r, n))
                     budget -= n
-            self.runner.add_requests(SimpleNamespace(scheduled_new_reqs=[
-                SimpleNamespace(req_id=r.id, sampling_params=r.params, prompt_len=len(r.prompt))
-                for r, _ in batch if r.id not in added]))
+            admissions = [NewRequestData.from_request(r.core, (), r.prompt) for r, _ in batch if r.id not in added]
+            self.runner.add_requests(SimpleNamespace(scheduled_new_reqs=admissions))
             added.update(r.id for r, _ in batch)
             self._step(batch)
 
@@ -269,10 +273,7 @@ class _ToyEngine:
                 shift = self.decode_shift if r.computed >= len(r.prompt) else r.prefill_shift
                 logits[at : at + n] += shift[layer, positions]
             hidden = torch.zeros(num_rows, D)
-            weights, ids = self.routers[layer].select_experts(hidden, logits)
-            plain_weights, plain_ids = self.plain[layer].select_experts(hidden, logits)
-            assert torch.equal(ids[~mask], plain_ids[~mask])
-            assert torch.equal(weights[~mask], plain_weights[~mask])
+            _, ids = self.routers[layer].select_experts(hidden, logits)
             assert torch.equal(self.captured[layer], ids)
         self.forced_steps.append({})
         captured = torch.stack(self.captured, 1).numpy()
@@ -294,22 +295,17 @@ class _ToyEngine:
         self.cache.append((r.prompt + r.out, r.used))
         self.finished[tuple(r.prompt)] = r
         choice = SimpleNamespace(text="", token_ids=r.out, finish_reason="length", logprobs=None)
+        returned = r.used[r.params.routed_experts_prompt_start :].astype(np.uint16)  # the engine skips the sent prefix
         r.done.set_result(SimpleNamespace(outputs=[choice], prompt_token_ids=r.prompt, num_cached_tokens=r.hit,
-                                          prompt_logprobs=None, routed_experts=r.used.astype(np.uint16)))
+                                          prompt_logprobs=None, routed_experts=returned))
 
 
-def _two_turns(engine, between=None):
-    """Two conversations through ``InferenceWorker.generate`` (each continuation names its first turn), plus a request
-    without a prefix id beside the continuations; ``between(worker)`` runs after the first turns. The server learns at
-    start, as from its engine workers, whether they can force stored routes."""
+def _two_turns(engine, between=None, skip_reads=False):
+    """Run two continuations and one independent request through InferenceWorker.generate."""
     cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
     worker = InferenceWorker.__ray_metadata__.modified_class()
     worker.state, worker._router_replay_tx, worker._replica_label = WorkerLifecycleState.READY, cache, "replica-a"
-    spec = SimpleNamespace(use_eagle_block_drop=lambda: BLOCKS == 2)
-    engine.runner.vllm_config.speculative_config = spec
-    # The scheduler's hit alignment, which only the engine workers know (the front end sees the smallest group).
-    group = SimpleNamespace(kv_cache_spec=SimpleNamespace(prefix_replay_tokens=engine.replay_window))
-    engine.runner.kv_cache_config = SimpleNamespace(cache_hit_alignment_tokens=B, kv_cache_groups=[group])
+    forced_routes.ensure_forced_routes_patch()
 
     async def collective_rpc(method):
         return [getattr(forced_routes, method)(SimpleNamespace(model_runner=engine.runner))]
@@ -327,6 +323,8 @@ def _two_turns(engine, between=None):
         extra_args = {} if prefix is None else {"dss_router_replay_prefix_id": f"rr1:{prefix}"}
         params = dict(max_tokens=max_tokens, dss_sample_id=name, dss_router_replay_id=f"rr1:{name}",
                       extra_args=extra_args)
+        if skip_reads and prefix is not None:
+            params["prompt_logprobs"] = 0
         return worker.generate(prompts[name], params)
 
     async def turns():
@@ -343,82 +341,44 @@ def _two_turns(engine, between=None):
     return returned, {name: engine.finished[tuple(prompt)] for name, prompt in prompts.items()}, markers
 
 
-def test_a_continuation_recomputes_the_tail_of_its_previous_capture_under_the_stored_routes():
-    engine = _ToyEngine()
-    returned, ran, markers = _two_turns(engine)
+@pytest.mark.parametrize("mode,window", [("warm", 0), ("warm", 2), ("reset", 0), ("eviction", 0), ("skip", 0),
+                                       ("lookahead", 0)])
+def test_recomputed_positions_use_the_named_parents_experts(mode, window):
+    engine = _ToyEngine(replay_window=window, num_prefill_lookahead_tokens=3 if mode == "lookahead" else 1)
 
-    # a1's capture ends at 10 and a2's hit stops at 4 (the block at 8 dropped), so positions 4-9 are recomputed;
-    # b1's ends at 12 and b2's hit stops at 8: positions 8-11.
-    tails = {"a2": ("a1", range(4, 10)), "b2": ("b1", range(8, 12))}
+    async def between(worker):
+        if mode == "reset":
+            await worker.reset_prefix_cache()
+        elif mode == "eviction":
+            engine.cache.clear()
 
-    # The forward routed every recomputed stored position as stored.
-    tail = [(name, p) for name, (_, positions) in tails.items() for p in positions]
-    tail_mismatch = sum((ran[name].used[p] != returned[tails[name][0]][p]).any() for name, p in tail)
-    assert tail_mismatch == 0, f"{tail_mismatch} of {len(tail)} recomputed stored positions routed unlike their storage"
-
-    # Every returned capture is the routes the forward used, at every position.
-    capture_mismatch = {name: int((returned[name] != ran[name].used).any(axis=(1, 2)).sum()) for name in ran}
-    assert capture_mismatch == dict.fromkeys(ran, 0), f"positions returned unlike the forward: {capture_mismatch}"
-
-    # Exactly those positions ran under stored routes; every other row is routed as an unpatched router routes it, the
-    # request without a prefix id included.
-    for name, request in ran.items():
-        positions = [p for step in engine.forced_steps for p in step.get(request.id, [])]
-        assert positions == (list(tails[name][1]) if name in tails else [])
-
-    # The tails ran in chunks, and in one step together.
-    assert any({ran["a2"].id, ran["b2"].id} <= step.keys() for step in engine.forced_steps)
-    assert sum(ran["a2"].id in step for step in engine.forced_steps) >= 2
-    assert all(marker["rerouted_ranges"] == [] for marker in markers.values())
+    returned, ran, markers = _two_turns(engine, between=between, skip_reads=mode == "skip")
+    for child, parent, warm_hit in (("a2", "a1", 4), ("b2", "b1", 8)):
+        r = ran[child]
+        hit = 0 if mode in {"reset", "eviction", "skip"} else warm_hit
+        assert r.hit == hit
+        positions = [p for step in engine.forced_steps for p in step.get(r.id, [])]
+        assert positions == list(range(max(0, hit - window), len(returned[parent])))
+        np.testing.assert_array_equal(r.used[:len(returned[parent])], returned[parent])
+    assert all(np.array_equal(returned[name], r.used) for name, r in ran.items())
+    assert not any(ran["c"].id in step for step in engine.forced_steps)
+    if mode == "warm" and window == 0:
+        assert any({ran["a2"].id, ran["b2"].id} <= step.keys() for step in engine.forced_steps)
+        assert sum(ran["a2"].id in step for step in engine.forced_steps) >= 2
 
 
-def _recomputed_unlike_storage(ran, returned, tails):
-    return sorted((name, p) for name, (prev, positions) in tails.items() for p in positions
-                  if (ran[name].used[p] != returned[prev][p]).any())
-
-
-@pytest.mark.parametrize(("dp", "external_kv", "ranges"), [
-    (1, False, [[], []]),
-    (2, False, [[[2, 10]], [[6, 12]]]),
-    (2, True, [None, None]),
-])
-def test_cache_hit_precedes_the_schedulers_window_rewind(dp, external_kv, ranges):
-    engine = _ToyEngine(replay_window=2, external_kv=external_kv, data_parallel_size=dp)
-    returned, ran, markers = _two_turns(engine)
-    assert [ran[name].hit for name in ("a2", "b2")] == [4, 8]
-    assert [markers[name]["rerouted_ranges"] for name in ("a2", "b2")] == ranges
-    assert markers["c"]["rerouted_ranges"] == []
-    rewound = {"a2": ("a1", range(2, 4)), "b2": ("b1", range(6, 8))}
-    assert bool(_recomputed_unlike_storage(ran, returned, rewound)) == (dp > 1)
-
-
-def test_after_a_prefix_cache_reset_a_continuation_recomputes_its_whole_capture_under_the_stored_routes():
-    engine = _ToyEngine()
-    returned, ran, markers = _two_turns(engine, between=lambda worker: worker.reset_prefix_cache())
-
-    # No KV survives the reset, so the continuations recompute every stored position under the stored routes.
-    tails = {"a2": ("a1", range(0, 10)), "b2": ("b1", range(0, 12))}
-    assert {name: ran[name].hit for name in tails} == {"a2": 0, "b2": 0}
-    assert _recomputed_unlike_storage(ran, returned, tails) == []
-    for name, (_, positions) in tails.items():
-        assert [p for step in engine.forced_steps for p in step.get(ran[name].id, [])] == list(positions)
-        assert (returned[name] == ran[name].used).all() and markers[name]["rerouted_ranges"] == []
-
-
-def test_a_hit_below_the_rows_sent_routes_afresh_and_is_reported():
-    async def evict(worker):  # the engine evicts the first turns' KV; the server is not told
-        engine.cache.clear()
-
-    engine = _ToyEngine()
-    returned, ran, markers = _two_turns(engine, between=evict)
-
-    # Positions 4-9 and 8-11 were sent and run as stored; below them the forward routed on its own.
-    sent = {"a2": ("a1", range(4, 10)), "b2": ("b1", range(8, 12))}
-    below = {"a2": ("a1", range(0, 4)), "b2": ("b1", range(0, 8))}
-    assert _recomputed_unlike_storage(ran, returned, sent) == []
-    assert _recomputed_unlike_storage(ran, returned, below)  # the report below is not vacuous
-    assert {name: markers[name]["rerouted_ranges"] for name in sent} == {"a2": [[0, 4]], "b2": [[0, 8]]}
-    assert markers["c"]["rerouted_ranges"] == []
+def test_an_unsupported_engine_keeps_its_own_routes_and_splices_the_parent_as_before(caplog):
+    engine = _ToyEngine(data_parallel_size=2)
+    with caplog.at_level("WARNING"):
+        returned, ran, markers = _two_turns(engine)
+    assert sum("re-prefilled prefix positions" in r.getMessage() for r in caplog.records) == 1
+    assert not any(engine.forced_steps)
+    for child, parent in (("a2", "a1"), ("b2", "b1")):
+        n = len(returned[parent])
+        np.testing.assert_array_equal(returned[child][:n], returned[parent])
+        np.testing.assert_array_equal(returned[child][n:], ran[child].used[n:])
+    assert np.any(ran["a2"].used[4:10] != returned["a1"][4:10])  # the recomputed tail ran on fresh routes
+    assert [markers[name]["prefix_len"] for name in ("a2", "b2", "c")] == [10, 12, 0]
 
 
 def test_a_continuation_whose_capture_is_gone_keeps_the_routes_it_ran():
@@ -428,15 +388,14 @@ def test_a_continuation_whose_capture_is_gone_keeps_the_routes_it_ran():
     engine = _ToyEngine()
     returned, ran, markers = _two_turns(engine, between=drop)
 
-    # Nothing was sent or spliced: the returned record is the forward's own, prefix_len 0 tells the caller its earlier
-    # tokens lost their routes, and no position is reported as running unlike the record.
-    assert not any(forced_routes.FORCED_ROUTES_KEY in (p.extra_args or {}) for p in engine.params)
+    # A missing parent leaves the request tracking only its own accepted rows.
+    assert all(p.extra_args[forced_routes.FORCED_ROUTES_KEY] == {} for p in engine.params)
     for name in ("a2", "b2"):
         assert (returned[name] == ran[name].used).all()
-        assert (markers[name]["prefix_len"], markers[name]["rerouted_ranges"]) == (0, [])
+        assert markers[name]["prefix_len"] == 0
 
 
-def test_an_engine_stored_rows_cannot_reach_starts_unhooked_and_routes_as_before(caplog):
+def test_unsupported_layers_leave_every_router_unhooked():
     def start(routers, monolithic=(), **parallel):
         layers = [_MoERunner(i, r, i in monolithic) for i, r in enumerate(routers)]
         runner = _V2Runner(torch.nn.ModuleList(layers), **parallel)
@@ -446,8 +405,9 @@ def test_an_engine_stored_rows_cannot_reach_starts_unhooked_and_routes_as_before
 
     # Each builds, binds no router (a supported layer 0 included), and says why.
     custom = CustomRoutingRouter(top_k=K, global_num_experts=E, custom_routing_function=None, renormalize=True)
+    retry = SimpleNamespace(kv_load_failure_policy="recompute")
+    assert "rewind an active request" in start([_router(None)], kv_transfer_config=retry)
     assert "data_parallel_size > 1" in start([_router(None)], data_parallel_size=2)
-    assert "multi-module MTP" in start([_router(None)], num_prefill_lookahead_tokens=3)
     assert "layer 1 runs a monolithic MoE kernel" in start([_router(None), _router(None)], monolithic={1})
     assert "layer 1's router CustomRoutingRouter" in start([_router(None), custom])
     shared = FusedTopKBiasRouter(K, E, num_fused_shared_experts=1)
@@ -460,18 +420,3 @@ def test_an_engine_stored_rows_cannot_reach_starts_unhooked_and_routes_as_before
     runner.initialize_kv_cache()
     assert "directly" in runner._forced_routes_unsupported
     assert runner._forced_routes is None and "_compute_routing" not in vars(routable)
-
-    # Requests with and without a prefix id behave as before the hook: no rows reach the engine, every row routes as
-    # an unpatched router, and the splice returns the stored prefix and the engine's own routes after it.
-    engine = _ToyEngine(data_parallel_size=2)
-    with caplog.at_level("WARNING"):
-        returned, ran, markers = _two_turns(engine)
-    warnings = [r.getMessage() for r in caplog.records if "re-prefilled prefix positions" in r.getMessage()]
-    assert len(warnings) == 1 and "data_parallel_size > 1" in warnings[0]
-    assert not any(forced_routes.FORCED_ROUTES_KEY in (p.extra_args or {}) for p in engine.params)
-    assert not any(engine.forced_steps)
-    for name, prev in (("a2", "a1"), ("b2", "b1")):
-        n = len(returned[prev])
-        assert (returned[name][:n] == returned[prev]).all() and (returned[name][n:] == ran[name].used[n:]).all()
-    assert (ran["a2"].used[4:10] != returned["a1"][4:10]).any()  # the tail still ran on the engine's own routes
-    assert {name: markers[name]["rerouted_ranges"] for name in ("a2", "b2")} == {"a2": [[4, 10]], "b2": [[8, 12]]}

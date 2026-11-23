@@ -17,8 +17,12 @@ from arctic_platform.inference.server.worker import (
     _pop_router_replay_engine_kwargs,
     _result_from_output,
 )
-from arctic_platform.inference.vllm.forced_routes import FORCED_ROUTES_KEY
-from vllm.v1.metrics.stats import RequestStateStats
+from arctic_platform.inference.vllm.router_replay import ensure_router_replay_vllm_patches
+from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector, AuxRequestOutput
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.request import Request
+
+FORCED_ROUTES_KEY = "dss_router_replay_forced_routes"
 
 
 class _Cache:
@@ -157,13 +161,14 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
     cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
     worker = InferenceWorker.__ray_metadata__.modified_class()
     worker.state, worker._router_replay_tx, worker._replica_label = WorkerLifecycleState.READY, cache, "replica-a"
-    # Hits stop on 2-token blocks, one block lower under speculative decoding.
-    worker._forced_route_blocks = (2, 2)
+    worker._force_routes_enabled = True
     engine_params = []
 
-    def generate(prompt, tokens, routes, replay_id, *, metrics=None, **extra_args):
+    def generate(prompt, tokens, routes, replay_id, *, during=None, **extra_args):
         async def fake_generate_once(_prompt, params, _request_id, **_kwargs):
             engine_params.append(params)
+            if during:
+                during()
             # vLLM returns one numpy row per captured position.
             routed = np.repeat(np.asarray(routes, dtype=np.uint8).reshape(-1, 1, 1), 2, axis=2)
             choice = SimpleNamespace(text="ok", token_ids=tokens, finish_reason="stop", logprobs=None)
@@ -172,8 +177,7 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
                 prompt_token_ids=prompt,
                 num_cached_tokens=0,
                 prompt_logprobs=None,
-                routed_experts=routed,
-                metrics=metrics,
+                routed_experts=routed[params.routed_experts_prompt_start:],
             )
 
         worker._generate_once = fake_generate_once
@@ -189,41 +193,36 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
     )
     assert cached("rr1:turn-2") == [10, 11, 12, 13, 24, 25, 26]
     assert (turn1["prefix_len"], turn2["prefix_len"], turn2["capture_len"]) == (0, 4, 7)
-    # Nothing was cached, so rows 0-1 ran on the engine's own routes under stored ones; no stats, no preemption count.
-    assert (turn2["rerouted_ranges"], turn2["preemptions"]) == ([[0, 2]], None)
-    assert cached("rr1:turn-1") == [10, 11, 12, 13]  # read, never released: the caller owns its captures
-    # The prefix id never reaches vLLM; the stored rows from the lowest block boundary the hit can stop at do.
+    assert cached("rr1:turn-1") == [10, 11, 12, 13]
     assert engine_params[-1].extra_args == {
-        FORCED_ROUTES_KEY: {"start": 2, "dtype": "|u1", "rows": bytes([12, 12, 13, 13])}
+        FORCED_ROUTES_KEY: {"dtype": "|u1", "rows": bytes([10, 10, 11, 11, 12, 12, 13, 13])}
     }
-    # A capture ending on a block boundary, without the drop, is a hit the continuation can take whole: no rows.
-    worker._forced_route_blocks = (2, 1)
-    aligned = generate(
-        [1, 2, 3, 4, 5], [6], [20, 21, 22, 23, 24], "rr1:aligned", dss_router_replay_prefix_id="rr1:turn-1"
-    )
-    assert engine_params[-1].extra_args is None and aligned["prefix_len"] == 4
-    assert aligned["rerouted_ranges"] == [[0, 4]]
-    # After the engine's prefix cache is reset, no KV of the capture is left to hit: every stored row is sent.
-    async def reset_prefix_cache():
-        return True
-
-    worker.llm = SimpleNamespace(reset_prefix_cache=reset_prefix_cache)
-    asyncio.run(worker.reset_prefix_cache())
-    after_reset = generate(
-        [1, 2, 3, 4, 5], [6], [20, 21, 22, 23, 24], "rr1:after-reset", dss_router_replay_prefix_id="rr1:turn-1",
-        metrics=RequestStateStats(num_preemptions=1),
-    )
-    assert engine_params[-1].extra_args == {
-        FORCED_ROUTES_KEY: {"start": 0, "dtype": "|u1", "rows": bytes([10, 10, 11, 11, 12, 12, 13, 13])}
-    }
-    assert (after_reset["rerouted_ranges"], after_reset["preemptions"]) == ([], 1)
 
     # Another replica served the previous request: the capture stays as the engine computed it.
     elsewhere = generate(
         [1, 2, 3, 4, 5], [6], [10, 11, 32, 33, 34], "rr1:turn-3", dss_router_replay_prefix_id="rr1:other"
     )
     assert elsewhere["prefix_len"] == 0 and cached("rr1:turn-3") == [10, 11, 32, 33, 34]
-    assert engine_params[-1].extra_args is None
+    assert engine_params[-1].extra_args == {FORCED_ROUTES_KEY: {}}
+
+    for change in ("replace", "discard", "insert"):
+        if change != "insert":
+            cache.put("legacy", torch.ones(2, 1, 2, dtype=torch.uint8))
+            original = weakref.ref(cache.get("legacy"))
+
+        def change_parent():
+            if change == "discard":
+                cache.discard(["legacy"])
+            else:
+                cache.put("legacy", torch.full((2, 1, 2), 9, dtype=torch.uint8))
+            if change != "insert":
+                assert original() is None
+
+        marker = generate([1, 2, 3], [4], [1, 2, 3], f"rr1:{change}", during=change_parent,
+                          dss_router_replay_prefix_id="legacy")
+        assert marker["prefix_len"] == (0 if change == "insert" else 2)
+        assert cached(f"rr1:{change}") == ([1, 2, 3] if change == "insert" else [1, 1, 3])
+        cache.discard(["legacy"])
 
     # A prefix capture must end before the prompt does; the request is refused before anything is cached.
     with pytest.raises(ValueError, match="must end inside the prompt"):
@@ -232,104 +231,73 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
     # Only the server sets the stored rows a request runs under.
     with pytest.raises(ValueError, match="is set by the server"):
         generate([1, 2], [3], [0, 0], "rr1:turn-5", **{FORCED_ROUTES_KEY: {}})
+    with pytest.raises(ValueError, match="routed_experts_prompt_start=0"):
+        asyncio.run(worker.generate([1, 2], dict(max_tokens=1, dss_sample_id="partial", routed_experts_prompt_start=1)))
     prefix_only = dict(max_tokens=1, extra_args=dict(dss_router_replay_prefix_id="rr1:turn-2"))
     with pytest.raises(ValueError, match="dss_router_replay_prefix_id requires dss_router_replay_id"):
         asyncio.run(worker.generate([1], prefix_only))
 
 
-def _continuation_worker():
+@pytest.mark.parametrize("has_parent", [False, True], ids=["first-turn", "continuation"])
+def test_resumed_decode_replays_only_the_accepted_rows_past_its_actual_hit(has_parent):
+    ensure_router_replay_vllm_patches()
     worker = InferenceWorker.__ray_metadata__.modified_class()
-    worker.state = WorkerLifecycleState.READY
-    worker._router_replay_tx = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
-    worker._forced_route_blocks = (2, 2)
-    forwards = []
+    worker.state, worker._force_routes_enabled = WorkerLifecycleState.READY, True
+    cache = worker._router_replay_tx = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
+    parent = np.arange(4, dtype=np.uint16).reshape(2, 1, 2) + 260
+    if has_parent:
+        cache.put("parent", parent)
 
-    async def generate(prefix=None, before_reply=None, **sampling):
-        prompt = list(range(4 if prefix is None else 5))
+    async def generate(prompt_input, params, request_id, **kwargs):
+        prompt = prompt_input["prompt_token_ids"]
+        req = Request(request_id, prompt, params, None)
+        connector = object.__new__(AuxOutputSchedulerConnector)
+        req.num_computed_tokens = 2
+        first = NewRequestData.from_request(req, (), prompt)
+        assert not (first.sampling_params.extra_args or {}).get(FORCED_ROUTES_KEY)
+        # The auxiliary connector trims the rejected speculative row before the scheduler records it.
+        rows = np.arange(12, dtype=np.uint16).reshape(6, 1, 2)
+        req.append_output_token_ids([4, 5])
+        start = params.routed_experts_prompt_start
+        assert start == (len(parent) if has_parent else 0)
+        accepted = connector.take_output(req, {request_id: AuxRequestOutput(start, rows[start:5])})
+        np.testing.assert_array_equal(accepted, rows[start:4])
+        req.append_output_token_ids(6)
+        connector.take_output(req, {request_id: AuxRequestOutput(4, rows[4:])})
+        expected = rows[:5].copy()
+        if has_parent:
+            expected[:2] = parent
+        for hit in (4, 0, 5):
+            req.num_computed_tokens = hit
+            resumed = NewRequestData.from_request(req, (), list(req.all_token_ids))
+            forced = (resumed.sampling_params.extra_args or {}).get(FORCED_ROUTES_KEY)
+            if hit == 5:
+                assert not forced
+            else:
+                assert forced and forced["start"] == hit
+                assert forced["rows"] == expected[hit:].tobytes()
+                from arctic_platform.inference.vllm.forced_routes import ForcedRoutes, bind_router
+                from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import GroupedTopKRouter
 
-        async def engine_reply(_prompt, params, _id, **kwargs):
-            rows = np.arange(len(prompt), dtype=np.uint8).reshape(-1, 1, 1)
-            if prefix is not None:
-                rows += 10  # Cold prefill chooses different experts from the parent.
-                forced = (params.extra_args or {}).get(FORCED_ROUTES_KEY)
-                if forced:
-                    stored = np.frombuffer(forced["rows"], dtype=forced["dtype"]).reshape(-1, 1, 1)
-                    rows[forced["start"] : forced["start"] + len(stored)] = stored
-            forwards.append(rows)
-            choice = SimpleNamespace(text="", token_ids=[5], finish_reason="length", logprobs=None)
-            if before_reply:
-                await before_reply()
-            return SimpleNamespace(outputs=[choice], prompt_token_ids=prompt, num_cached_tokens=0,
-                                   prompt_logprobs=None, routed_experts=rows)
+                state = ForcedRoutes(1, (1, 2), torch.zeros(6, 1, 2, dtype=torch.int32))
+                state.add(0, resumed)
+                count = req.num_tokens - hit
+                batch = dict(idx_mapping_np=np.array([0]), num_computed_tokens_np=np.array([hit]))
+                state.fill(SimpleNamespace(has_prefill=True, query_start_loc_np=np.array([0, count]), **batch))
+                router = GroupedTopKRouter(2, 512, 1, 1, True, "sigmoid", 1.0, None)
+                bind_router(router, 0, state)
+                logits = torch.zeros(count, 512)
+                _, ids = router.select_experts(logits, logits)
+                np.testing.assert_array_equal(ids[:-1].numpy(), expected[hit:, 0])
+                assert not state.mask[count - 1]
+        return SimpleNamespace(outputs=[SimpleNamespace(text="", token_ids=[4, 5, 6], finish_reason="length",
+                               logprobs=None)], prompt_token_ids=prompt, prompt_logprobs=None,
+                               routed_experts=expected[start:], num_cached_tokens=2)
 
-        worker._generate_once = engine_reply
-        key = "parent" if prefix is None else "rr1:child"
-        params = dict(max_tokens=1, dss_sample_id=key, dss_router_replay_id=key,
-                      extra_args={} if prefix is None else {"dss_router_replay_prefix_id": prefix}, **sampling)
-        return (await worker.generate(prompt, params))["router_replay"]
-
-    return worker, generate, forwards
-
-
-def test_prompt_logprobs_that_require_a_cold_prefill_use_all_parent_rows():
-    async def run():
-        _, generate, forwards = _continuation_worker()
-        await generate()
-        marker = await generate("parent", prompt_logprobs=0)
-        assert np.array_equal(forwards[0], forwards[1][:4])
-        assert marker["rerouted_ranges"] == []
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("late_parent", [False, True], ids=["during-reset-rpc", "late-parent-reply"])
-def test_reset_overlapping_generation_replays_every_stored_row(late_parent):
-    async def run():
-        worker, generate, forwards = _continuation_worker()
-        cleared, reply = asyncio.Event(), asyncio.Event()
-
-        async def reset():
-            cleared.set()
-            await reply.wait()
-            return True
-
-        worker.llm = SimpleNamespace(reset_prefix_cache=reset)
-        if late_parent:
-            reply.set()
-            await generate(before_reply=worker.reset_prefix_cache)
-            marker = await generate("parent")
-        else:
-            await generate()
-            resetting = asyncio.create_task(worker.reset_prefix_cache())
-            await cleared.wait()
-            child = asyncio.create_task(generate("parent"))
-            await asyncio.sleep(0)  # Admit the continuation before acknowledging the cache clear.
-            reply.set()
-            await resetting
-            marker = await child
-        assert np.array_equal(forwards[0], forwards[1][:4])
-        return marker
-
-    marker = asyncio.run(run())
-    assert marker["prefix_len"] == 4 and marker["rerouted_ranges"] == []
-
-
-def test_a_parent_discarded_during_its_continuation_is_not_held_and_not_spliced():
-    async def run():
-        worker, generate, forwards = _continuation_worker()
-        await generate()
-        cache = worker._router_replay_tx
-        parent = weakref.ref(cache.get("parent"))
-
-        async def change_parent():
-            cache.discard(["parent"])
-            assert parent() is None  # nothing but the cache held the parent while the child ran
-
-        marker = await generate("parent", before_reply=change_parent)
-        assert marker["prefix_len"] == 0
-        assert np.array_equal(cache.get("rr1:child").numpy(), forwards[1])
-
-    asyncio.run(run())
+    worker._generate_once = generate
+    extra_args = {"dss_router_replay_prefix_id": "parent"} if has_parent else {}
+    asyncio.run(worker.generate([1, 2, 3], dict(max_tokens=3, dss_sample_id="child", dss_router_replay_id="child",
+                                                 extra_args=extra_args)))
 
 
 def test_router_replay_cache_device_is_popped_and_validated_before_engine_start():
