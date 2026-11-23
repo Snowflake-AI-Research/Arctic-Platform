@@ -93,6 +93,23 @@ def test_tx_cache_refuses_an_entry_larger_than_max_bytes_before_evicting(monkeyp
     assert cache.stats()["n_evicted_lru"] == 0
 
 
+def test_tx_cache_keeps_held_entries_when_another_copy_reserves_the_space(monkeypatch):
+    monkeypatch.setenv("ARCTIC_ROUTER_REPLAY_TX_EVICT_MIN_AGE_S", "0")
+    value = _tensor()
+    cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=2 * value.numel())
+    cache.put("held", value)
+    coerce = cache._coerce
+
+    def copy_with_another_put(tensor):
+        with pytest.raises(RouterReplayCacheFull):
+            cache.put("too-large-while-copying", torch.cat([value, value]))
+        return coerce(tensor)
+
+    monkeypatch.setattr(cache, "_coerce", copy_with_another_put)
+    cache.put("copying", value)
+    assert set(cache.held_sample_ids()) == {"held", "copying"}
+
+
 def test_tx_cache_failed_copy_releases_its_reserved_bytes(monkeypatch):
     one = _tensor()
     cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=one.numel())

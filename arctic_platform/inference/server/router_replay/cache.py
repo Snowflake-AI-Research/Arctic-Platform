@@ -173,10 +173,11 @@ class _RouterReplayCacheBase:
             if not replace and self._suppress_put_new_locked(sample_id, now):
                 return
             self._reject_duplicate_locked(sample_id, replace)
-            # No eviction can make room for an entry larger than the whole cache; refuse it before evicting any.
-            if new_bytes > self.max_bytes:
+            # Eviction cannot release bytes already reserved for in-flight copies.
+            if new_bytes + self._reserved_bytes > self.max_bytes:
                 raise RouterReplayCacheFull(
-                    f"router-replay cache entry needs {new_bytes} bytes, more than max_bytes ({self.max_bytes}), "
+                    f"router-replay cache entry needs {new_bytes} bytes with {self._reserved_bytes} reserved, "
+                    f"exceeding max_bytes ({self.max_bytes}), "
                     f"on put({sample_id!r}, shape={new_shape}, dtype={dtype})"
                 )
             bytes_before = self._bytes_in_use
