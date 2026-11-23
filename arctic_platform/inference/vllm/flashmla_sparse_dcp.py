@@ -13,20 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Serve a bf16 sparse-MLA KV cache under decode context parallelism (DCP).
+"""Attend to each rank's interleaved bf16 KV shard and return its LSE for the DCP merge."""
 
-Under DCP each rank of the group stores every DCP-size-th token of a request,
-and the attention layer merges the ranks' partial results by their
-log-sum-exp. vLLM's FlashMLA sparse backend does this for its fp8_ds_mla cache
-only: its bf16 path refuses DCP > 1 at construction and, past that, converts
-each token's top-k positions through the full-sequence slot rule. Here the
-bf16 path keeps the top-k positions this rank stores, as the fp8 path does,
-attends them with the same bf16 kernel, and returns the kernel's log-sum-exp.
-A token whose selection this rank holds none of gets the kernel's zero output
-and +inf log-sum-exp, which the DCP merge weighs zero. DCP = 1 is unchanged.
-"""
+from functools import cache
 
-from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseImpl
+from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseBackend, FlashMLASparseImpl
 from vllm.v1.attention.backends.mla.sparse_utils import (
     flat_kv_row_view,
     triton_filter_and_convert_dcp_index,
@@ -35,25 +26,17 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 from arctic_platform.inference.patching import ArcticPatch
 
 
-class FlashMLASparseBf16DcpPatch(ArcticPatch[FlashMLASparseImpl]):
-
-    _orig_init = FlashMLASparseImpl.__init__
-    _orig_forward_bf16_kv = FlashMLASparseImpl._forward_bf16_kv
-
+class _SparseImpl(FlashMLASparseImpl):
     def __init__(self, *args, **kwargs):
-        # The bf16 refusal is the constructor's only reader of this flag.
+        # The upstream bf16 refusal is the only constructor reader. forward_mqa needs the original flag.
         returns_lse = self.need_to_return_lse_for_decode
         self.need_to_return_lse_for_decode = False
-        try:
-            self._orig_init(*args, **kwargs)
-        finally:
-            self.need_to_return_lse_for_decode = returns_lse
+        super().__init__(*args, **kwargs)
+        self.need_to_return_lse_for_decode = returns_lse
 
     def _forward_bf16_kv(self, q, kv_c_and_k_pe_cache, topk_indices, attn_metadata, actual_num_heads):
         if self.dcp_world_size == 1:
-            return self._orig_forward_bf16_kv(
-                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata, actual_num_heads
-            )
+            return super()._forward_bf16_kv(q, kv_c_and_k_pe_cache, topk_indices, attn_metadata, actual_num_heads)
         kv_rows, block_stride_rows = flat_kv_row_view(kv_c_and_k_pe_cache, attn_metadata.block_size)
         local_topk, local_count = triton_filter_and_convert_dcp_index(
             attn_metadata.req_id_per_token[: topk_indices.shape[0]],
@@ -67,15 +50,18 @@ class FlashMLASparseBf16DcpPatch(ArcticPatch[FlashMLASparseImpl]):
             NUM_TOPK_TOKENS=topk_indices.shape[1],
             return_valid_counts=True,
         )
+        # A row selecting none of this rank's tokens gets zero output and +inf LSE, which the DCP merge weighs zero.
         out, lse = self._bf16_flash_mla_kernel(q, kv_rows, local_topk, local_count, actual_num_heads)
         return out.contiguous(), lse
 
 
-_PATCHED = False
+class _FlashMLABackendPatch(ArcticPatch[FlashMLASparseBackend]):
+    # Subclassed, not patched in place: the HY V4 sink impl inherits FlashMLASparseImpl and keeps its DCP refusal.
+    @staticmethod
+    def get_impl_cls():
+        return _SparseImpl
 
 
+@cache
 def ensure_flashmla_sparse_bf16_dcp() -> None:
-    global _PATCHED
-    if not _PATCHED:
-        FlashMLASparseBf16DcpPatch.apply_patch()
-        _PATCHED = True
+    _FlashMLABackendPatch.apply_patch()

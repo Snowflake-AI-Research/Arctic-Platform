@@ -34,6 +34,7 @@ def apply_required_vllm_patches() -> None:
     ensure_router_replay_vllm_patches()
     ensure_xgrammar_stop_mask_fix()
     ensure_dense_prompt_logprobs_patch()
+    ensure_flashmla_sparse_bf16_dcp()
     ensure_spec_decode_grammar_fix()
     apply_hybrid_state_fixes()
     ensure_tp_spec_decode_sync()
@@ -43,4 +44,3 @@ def apply_required_vllm_patches() -> None:
     ensure_mrope_yarn_fix()
     ensure_mamba_completion_refresh()
     ensure_deepseek_v41_lora()
-    ensure_flashmla_sparse_bf16_dcp()
