@@ -14,6 +14,7 @@ from ..token_combine import sum_rows_by_token
 from .combine_replay import CombineReplay
 from .uccl_ep import Buffer
 from .uccl_ep import EventOverlap
+from .uccl_ep.buffer import get_hidden_bytes
 
 _buffer: Buffer | None = None
 _handle_cache: dict[int, tuple | None] = {}
@@ -241,10 +242,6 @@ def configure_num_sms(num_sms: int) -> None:
     internode RDMA channel count (num_channels = num_sms / 2).
     """
     Buffer.set_num_sms(num_sms)
-
-
-def get_hidden_bytes(x: torch.Tensor) -> int:
-    return x.size(1) * max(x.element_size(), 2)
 
 
 def get_buffer(group: ProcessGroup, hidden_bytes: int) -> Buffer:

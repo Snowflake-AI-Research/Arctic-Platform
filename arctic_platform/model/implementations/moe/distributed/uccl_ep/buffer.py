@@ -34,6 +34,10 @@ from .bootstrap import destroy_uccl
 from .bootstrap import initialize_uccl
 
 
+def get_hidden_bytes(x: torch.Tensor) -> int:
+    return x.size(1) * max(x.element_size(), 2)
+
+
 def _record_stream_safe(tensors, stream):
     """``record_stream`` each CUDA tensor; skip ``None`` and recurse one level
     so a ``handle`` tuple can be passed in alongside flat tensors."""
@@ -406,9 +410,10 @@ class Buffer:
         }
         assert num_ranks in config_map, f"Unsupported number of EP ranks: {num_ranks}"
         if num_ranks == 32 and Buffer._is_efa():
-            # 2048 slots hold a channel's per-node stream, at most ceil(tokens / (num_sms / 2)), without wrapping up to
-            # 1024 * num_sms tokens per rank; the normal-mode RDMA buffer must stay within int32 bytes.
-            unwrapped = Config(Buffer.num_sms, 32, 288, 32, 2048)
+            # 2048 slots hold a channel's per-node stream, at most ceil(rows / (num_sms / 2)), without wrapping up to
+            # 1024 * num_sms rows per rank; the normal-mode RDMA buffer must stay within int32 bytes. 128-row writes
+            # keep a full ring within the 16 sequence numbers of the EFA tail update, as 512 / 32 does.
+            unwrapped = Config(Buffer.num_sms, 32, 288, 128, 2048)
             if unwrapped.get_rdma_buffer_size_hint(hidden_bytes, num_ranks) <= (1 << 31) - 1:
                 return unwrapped
         return config_map[num_ranks]
@@ -599,7 +604,7 @@ class Buffer:
         # Default config
         if config is None:
             x_rows = x[0] if isinstance(x, tuple) else x
-            config = self.get_dispatch_config(self.group_size, x_rows.size(1) * max(x_rows.element_size(), 2))
+            config = self.get_dispatch_config(self.group_size, get_hidden_bytes(x_rows))
 
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
