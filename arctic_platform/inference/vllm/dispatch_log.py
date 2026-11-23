@@ -13,33 +13,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Log the batch counts of each GDN metadata build and the prefill backend of its first layer.
+"""Opt-in: log each GDN-family metadata build's batch counts and its first layer's resolved kernel settings.
 
-Which kernel a linear-attention row runs depends on the counts of the step it shares: GLM-5.3's KDA layers, for
-example, run every non-speculative row through the chunked prefill kernel whenever the step holds a prefill.
-"""
+A step's counts choose a linear-attention row's kernel: GLM-5.3's KDA layers, for example, run every non-speculative
+row through the chunked prefill kernel whenever the step holds a prefill."""
 
 import logging
 
 # vLLM configures its own logger hierarchy at INFO; an ``arctic_platform`` logger inherits the root WARNING level.
 logger = logging.getLogger("vllm.v1.attention.backends.gdn_attn")
+# Kernel choices a layer resolves at construction (KDA: GLM-5.3, Kimi; GDN: Qwen); the counts decide the rest.
+_LAYER_FIELDS = ("kda_prefill_backend", "gdn_prefill_backend", "gdn_decode_kernel", "enable_packed_recurrent_decode")
 
 _APPLIED = False
 
 
-def describe(builder, metadata) -> str:
-    """One line: the build's layer group, its first layer's class and KDA prefill backend, and the batch counts."""
-    first_layer = builder.layer_names[0]
-    layer = builder.vllm_config.compilation_config.static_forward_context[first_layer]
-    # GLM-5.3's KDA layers keep the prefill kernel they resolved at construction; other layers choose theirs in code.
-    backend = getattr(layer, "kda_prefill_backend", None)
-    return (
-        f"linear-attention dispatch group={first_layer} layer={type(layer).__name__} "
-        + (f"kda_prefill_backend={backend} " if backend is not None else "")
-        + f"prefills={metadata.num_prefills} prefill_tokens={metadata.num_prefill_tokens} "
-        f"decodes={metadata.num_decodes} decode_tokens={metadata.num_decode_tokens} "
-        f"spec_decodes={metadata.num_spec_decodes} spec_decode_tokens={metadata.num_spec_decode_tokens}"
-    )
+def _logged(build):
+    def logged_build(self, *args, **kwargs):
+        metadata = build(self, *args, **kwargs)
+        first = self.layer_names[0]
+        layer = self.vllm_config.compilation_config.static_forward_context[first]
+        settings = vars(layer)
+        logger.info(
+            "linear-attention dispatch group=%s layer=%s%s prefills=%d prefill_tokens=%d decodes=%d decode_tokens=%d "
+            "spec_decodes=%d spec_decode_tokens=%d",
+            first, type(layer).__name__, "".join(f" {key}={settings[key]}" for key in _LAYER_FIELDS if key in settings),
+            metadata.num_prefills, metadata.num_prefill_tokens, metadata.num_decodes, metadata.num_decode_tokens,
+            metadata.num_spec_decodes, metadata.num_spec_decode_tokens,
+        )
+        return metadata
+
+    return logged_build
 
 
 def ensure_dispatch_log() -> None:
@@ -48,14 +52,10 @@ def ensure_dispatch_log() -> None:
 
     if _APPLIED or not envs.ARCTIC_INFERENCE_LOG_DISPATCH:
         return
+    from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadataBuilder
     from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 
-    build = GDNAttentionMetadataBuilder.build
-
-    def logged_build(self, *args, **kwargs):
-        metadata = build(self, *args, **kwargs)
-        logger.info(describe(self, metadata))
-        return metadata
-
-    GDNAttentionMetadataBuilder.build = logged_build
+    # Kimi-K3's NVIDIA builder replaces build; its ROCm builder calls GDN's, so it logs through it.
+    for cls in (GDNAttentionMetadataBuilder, KimiK3KDAMetadataBuilder):
+        cls.build = _logged(cls.build)
     _APPLIED = True

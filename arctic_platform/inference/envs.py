@@ -64,7 +64,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (worker.py) and the collector (receiver.py) agree.
     "ARCTIC_INFERENCE_DUMP_PARAM_L2":
     lambda: os.getenv("ARCTIC_INFERENCE_DUMP_PARAM_L2", "0") == "1",
-    # Log each GDN metadata build's batch counts and its first layer's prefill backend.
+    # Log GDN metadata counts and the first layer's resolved kernel settings.
     "ARCTIC_INFERENCE_LOG_DISPATCH":
     lambda: os.getenv("ARCTIC_INFERENCE_LOG_DISPATCH", "0") == "1",
 }
