@@ -738,6 +738,62 @@ def test_fp8_updater_requantizes_bf16_and_copies_unquantized_layers(monkeypatch)
     torch.testing.assert_close(model.mlp.down_proj.weight.data, down)
 
 
+class _CachedEngine:
+    def __init__(self, **kwargs):
+        if kwargs["bucket_size"] > 128:
+            raise torch.OutOfMemoryError("replacement bucket allocation failed")
+        self.kwargs = kwargs
+        self.destroyed = False
+
+    def destroy(self):
+        self.destroyed = True
+
+
+def test_receiver_rebuilds_for_a_changed_bucket(monkeypatch):
+    from arctic_platform.inference.server.weight_sync import broadcast
+
+    monkeypatch.setattr(broadcast, "BroadcastNCCLEngine", _CachedEngine)
+    extension = WeightSyncExtension()
+    extension.device = torch.device("cpu")
+    first = extension._get_or_create_broadcast_engine("localhost", 1234, 1, 3, 64)
+    assert extension._get_or_create_broadcast_engine("localhost", 1234, 1, 3, 64) is first
+    second = extension._get_or_create_broadcast_engine("localhost", 1234, 1, 3, 128)
+    assert second.kwargs["bucket_size"] == 128
+    assert second is not first
+    assert first.destroyed
+    with pytest.raises(torch.OutOfMemoryError):
+        extension._get_or_create_broadcast_engine("localhost", 1234, 1, 3, 256)
+    assert not extension._get_or_create_broadcast_engine("localhost", 1234, 1, 3, 128).destroyed
+
+
+@pytest.mark.parametrize("change", [dict(bucket_size=128), dict(reverse=True)])
+def test_point_to_point_receiver_rebuilds_for_a_changed_bucket_or_rendezvous(monkeypatch, change):
+    from arctic_platform.inference.server.weight_sync import engine
+
+    parallel_state = types.ModuleType("vllm.distributed.parallel_state")
+    parallel_state.get_world_group = lambda: SimpleNamespace(rank=0)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", parallel_state)
+    monkeypatch.setattr(engine, "NCCLEngine", _CachedEngine)
+    extension = WeightSyncExtension()
+    extension.device = torch.device("cpu")
+    settings = dict(bucket_size=64, reverse=False)
+
+    def get(**overrides):
+        args = {**settings, **overrides}
+        return extension._get_or_create_engine(
+            "localhost", 1234, args["bucket_size"], args["reverse"], engine_attr="_engine", key_attr="_engine_key"
+        )
+
+    first = get()
+    assert get() is first
+    second = get(**change)
+    assert {key: second.kwargs[key] for key in change} == change
+    assert first.destroyed
+    with pytest.raises(torch.OutOfMemoryError):
+        get(bucket_size=256)
+    assert not get(**change).destroyed
+
+
 def test_fused_writer_reports_canonical_moe_destination():
     class RoutedExperts(nn.Module):
         def __init__(self):
