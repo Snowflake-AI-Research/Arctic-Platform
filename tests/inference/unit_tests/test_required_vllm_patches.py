@@ -1,6 +1,7 @@
 from arctic_platform.inference.vllm import config
 from arctic_platform.inference.vllm import deepseek_v41_lora
 from arctic_platform.inference.vllm import dense_prompt_logprobs
+from arctic_platform.inference.vllm import flashmla_sparse_dcp
 from arctic_platform.inference.vllm import glm5next_lora
 from arctic_platform.inference.vllm import hybrid_state_fixes
 from arctic_platform.inference.vllm import kv_group_size
@@ -29,6 +30,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         dense_prompt_logprobs,
         "ensure_dense_prompt_logprobs_patch",
         lambda: calls.append("dense_prompt_logprobs"),
+    )
+    monkeypatch.setattr(
+        flashmla_sparse_dcp,
+        "ensure_flashmla_sparse_bf16_dcp",
+        lambda: calls.append("flashmla_sparse_bf16_dcp"),
     )
     monkeypatch.setattr(
         spec_decode_grammar,
@@ -79,6 +85,7 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "router",
         "xgrammar",
         "dense_prompt_logprobs",
+        "flashmla_sparse_bf16_dcp",
         "spec_decode_grammar",
         "hybrid_state",
         "tp_spec_decode_sync",
