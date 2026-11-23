@@ -874,12 +874,21 @@ def test_fused_writer_feeds_nongated_w13_as_w1_only():
     assert calls == ["w1", "w1"]
 
 
+@pytest.fixture
+def cpu_memory_before(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (0, 0))
+
+
 @pytest.mark.parametrize(
     ("quantization", "weight_format", "applicable"),
     [(None, "hf", True), ("fp8", "vllm", False)],
 )
 def test_broadcast_reports_loaded_validation_applicability(
     monkeypatch,
+    cpu_memory_before,
     quantization,
     weight_format,
     applicable,
@@ -892,8 +901,6 @@ def test_broadcast_reports_loaded_validation_applicability(
         "vllm.distributed.parallel_state",
         parallel_state,
     )
-    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
 
     model = nn.Linear(1, 1, bias=False)
     model.weight.data.fill_(2.0)
@@ -931,7 +938,7 @@ def test_broadcast_reports_loaded_validation_applicability(
     assert ("applied_source_l2_sq" in result) is applicable
 
 
-def test_broadcast_distinguishes_full_and_loaded_parameter_traces(monkeypatch):
+def test_broadcast_distinguishes_full_and_loaded_parameter_traces(monkeypatch, cpu_memory_before):
     parallel_state = types.ModuleType("vllm.distributed.parallel_state")
     parallel_state.get_tensor_model_parallel_world_size = lambda: 1
     parallel_state.get_world_group = lambda: SimpleNamespace(rank=0)
@@ -940,8 +947,6 @@ def test_broadcast_distinguishes_full_and_loaded_parameter_traces(monkeypatch):
         "vllm.distributed.parallel_state",
         parallel_state,
     )
-    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
     monkeypatch.setenv("ARCTIC_INFERENCE_DUMP_PARAM_L2", "1")
 
     model = nn.Linear(1, 1)
@@ -1016,13 +1021,11 @@ def _run_sync_entry_point(entry_point, extension, tmp_path):
         "load_weights_from_shm_path",
     ],
 )
-def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, tmp_path, entry_point):
+def test_sync_refreshes_glm5next_cached_weight_copies(monkeypatch, cpu_memory_before, tmp_path, entry_point):
     parallel_state = types.ModuleType("vllm.distributed.parallel_state")
     parallel_state.get_tensor_model_parallel_world_size = lambda: 2
     parallel_state.get_world_group = lambda: SimpleNamespace(rank=0)
     monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", parallel_state)
-    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: SimpleNamespace(uuid="gpu0"))
@@ -1130,6 +1133,71 @@ def test_worker_gathers_full_and_loaded_parameter_traces(monkeypatch):
     assert result["all_rank_loaded_param_l2"] == [{"weight": 4.0}]
     assert "param_l2" not in result
     assert "loaded_param_l2" not in result
+
+
+def test_broadcast_sync_reports_every_rank_memory(monkeypatch):
+    """One broadcast reply preserves both ranks' peaks and retained memory from this load."""
+    from arctic_platform.inference.server.worker import InferenceWorker
+
+    extension = WeightSyncExtension()
+    extension.model_runner = SimpleNamespace(model=nn.Linear(1, 1, bias=False))
+    extension.model_config = SimpleNamespace(quantization=None)
+    extension._get_or_create_broadcast_engine = lambda *args: object()
+    parallel_state = types.ModuleType("vllm.distributed.parallel_state")
+    parallel_state.get_tensor_model_parallel_world_size = lambda: 2
+    parallel_state.get_world_group = lambda: SimpleNamespace(rank=extension.device.index)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", parallel_state)
+
+    gpus = [SimpleNamespace(allocated=100, reserved=120, peak=500, peak_reserved=600) for _ in range(2)]
+
+    def reset(device):
+        gpu = gpus[device.index]
+        gpu.peak, gpu.peak_reserved = gpu.allocated, gpu.reserved
+
+    for api, attr in (("memory_allocated", "allocated"), ("max_memory_allocated", "peak"),
+                      ("memory_reserved", "reserved"), ("max_memory_reserved", "peak_reserved")):
+        monkeypatch.setattr(torch.cuda, api, lambda device, attr=attr: getattr(gpus[device.index], attr))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (1000 - 80 - gpus[device.index].reserved, 1000))
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", reset)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+
+    def load(model, engine):
+        rank = extension.device.index
+        gpu, transient = gpus[rank], 10 * (rank + 1)
+        gpu.peak = max(gpu.peak, gpu.allocated + transient)
+        gpu.peak_reserved = max(gpu.peak_reserved, gpu.reserved + transient)
+        gpu.allocated += 1
+        gpu.reserved += transient // 2
+        return 1, 4.0, 4.0, {"source.weight": ["weight"]}, []
+
+    extension._load_batched = load
+
+    class FakeLLM:
+        async def collective_rpc(self, method, args):
+            results = []
+            for rank in range(2):
+                extension.device = torch.device("cpu", rank)
+                results.append(getattr(extension, method)(*args))
+            return results
+
+    worker_class = InferenceWorker.__ray_metadata__.modified_class
+    result = asyncio.run(
+        worker_class.sync_weights_broadcast(
+            SimpleNamespace(llm=FakeLLM(), abort_all_streams=_noop_abort_all_streams), "127.0.0.1", 1234, 1, 3
+        )
+    )
+
+    assert result["rank_memory"] == [
+        {
+            "mem_before_bytes": 100, "mem_peak_bytes": 100 + transient, "mem_after_bytes": 101,
+            "mem_extra_bytes": transient, "mem_reserved_before_bytes": 120,
+            "mem_reserved_peak_bytes": 120 + transient, "mem_reserved_after_bytes": 120 + transient // 2,
+            "device_free_before_bytes": 800, "device_free_after_bytes": 800 - transient // 2, "device_total_bytes": 1000,
+        }
+        for transient in (10, 20)
+    ]
+    rank_zero = result["rank_memory"][0]
+    assert {key: result[key] for key in rank_zero} == rank_zero
 
 
 def test_load_batched_holds_one_rebuilt_oversized_tensor_at_a_time(monkeypatch):
