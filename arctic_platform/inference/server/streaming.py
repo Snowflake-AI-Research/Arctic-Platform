@@ -1233,30 +1233,19 @@ class ClientStream(AsyncIterator):
                     raise StreamError(self.error)
                 if self.scheduler._stopped:
                     raise StreamError("scheduler_stopped")
-                if not self.scheduler._paused and self.scheduler._workers:
-                    index = self.scheduler._select_stream_worker(self.request)
-                    candidate = self.scheduler._workers[index]
-                    if (
-                        candidate.schedulable
-                        and candidate.active_requests < candidate.concurrency_limit
-                        and candidate.streaming_requests < MAX_WORKER_STREAMS
-                    ):
-                        self.worker = candidate
-                        self.submitted_at = time.time()
-                        self.request.worker_idx = index
-                        candidate.active_requests += 1
-                        candidate.streaming_requests += 1
-                        self.registration = asyncio.ensure_future(
-                            candidate.handle.start_stream.remote(
-                                self.attempt_id,
-                                self.request.prompt,
-                                self.params,
-                                self.expires_at - time.monotonic(),
-                                asdict(self.limits),
-                            )
-                        )
-                        break
-                await asyncio.sleep(0.005)
+                self.worker = self.scheduler._take(self.request, stream=True)
+                if self.worker is None:
+                    await self.scheduler._wake.wait()
+            self.submitted_at = time.time()
+            self.registration = asyncio.ensure_future(
+                self.worker.handle.start_stream.remote(
+                    self.attempt_id,
+                    self.request.prompt,
+                    self.params,
+                    self.expires_at - time.monotonic(),
+                    asdict(self.limits),
+                )
+            )
             result = await asyncio.shield(self.registration)
             if result.get("status") == "rejected":
                 self.registration_rejected = True
@@ -1450,6 +1439,8 @@ class ClientStream(AsyncIterator):
         self.scheduler._retire_stream(
             self.request_id, cleanup_unconfirmed=self.cleanup_unconfirmed
         )
+        # Frees a stream slot, and wakes this stream if it is still waiting for one.
+        self.scheduler._notify()
         if asyncio.current_task() is not self.watchdog:
             self.watchdog.cancel()
 
