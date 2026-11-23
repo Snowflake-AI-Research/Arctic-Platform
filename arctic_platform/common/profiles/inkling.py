@@ -25,6 +25,7 @@ def register(registry: Registry) -> None:
         extends="generic_moe",
         supports=["peft", "tiled_mlp.token_chunk_size", "lm_head.fp32", "lm_head.token_chunk_size"],
         unsupported={
+            "numerics.row_invariant_projections": "this loader does not install the projection pad",
             "checkpointing.targets": "only full activation checkpointing is supported",
             "lm_head.cross_entropy": "native Inkling causal LM loss is used",
             "moe.sonicmoe": "routed experts use grouped GEMM or the expert loop",

@@ -249,6 +249,7 @@ def _build_model_config(
         fp32_parity=options.fp32_parity,
         fp32_routed_weighting=getattr(options, "fp32_routed_weighting", False),
         fp32_residual=getattr(options, "fp32_residual", False),
+        fp32_kda=getattr(options, "fp32_kda", False),
         debug=DebugModelConfig(**options.debug.model_dump()) if options.debug is not None else DebugModelConfig(),
     )
 

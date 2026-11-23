@@ -15,11 +15,12 @@
 
 """Profile of the ``glm5_next`` loader (GLM-5.3-Flash).
 
-The loader registers ``FlashMoeOptions`` (``GenericMoeOptions`` plus ``fp32_parity`` and ``fp32_routed_weighting``),
-so it extends the ``generic_moe`` profile and overrides only what differs: it supports ``attention.sparse_mla``
-through ``ModelSpec.attn_implementation``, which the loader requires to name a sparse MLA backend,
-``numerics.fp32_parity``, which rounds the RMSNorms once after the weight multiply, as vLLM does, and
-``numerics.fp32_routed_weighting``, which weights the BF16 experts' fp32 down-projection accumulator before rounding.
+The loader registers ``Glm5NextOptions`` (``GenericMoeOptions`` plus ``fp32_parity``, ``fp32_routed_weighting`` and
+``fp32_kda``), so it extends the ``generic_moe`` profile and overrides only what differs: it supports
+``attention.sparse_mla`` through ``ModelSpec.attn_implementation``, which the loader requires to name a sparse MLA
+backend, ``numerics.fp32_parity``, which rounds the RMSNorms once after the weight multiply, as vLLM does,
+``numerics.fp32_routed_weighting``, which weights the BF16 experts' fp32 down-projection accumulator before rounding,
+and ``numerics.fp32_kda``, which keeps the KDA layers' L2-normalized q and k in fp32 through the recurrence.
 """
 
 from __future__ import annotations
@@ -33,6 +34,11 @@ def register(registry: Registry) -> None:
     register_profile(
         "glm5_next",
         extends="generic_moe",
-        supports=["attention.sparse_mla", "numerics.fp32_parity", "numerics.fp32_routed_weighting"],
+        supports=[
+            "attention.sparse_mla",
+            "numerics.fp32_parity",
+            "numerics.fp32_routed_weighting",
+            "numerics.fp32_kda",
+        ],
         registry=registry,
     )

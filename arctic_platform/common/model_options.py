@@ -229,6 +229,31 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "numerics.fp32_kda",
+        runs_in="trainer",
+        goal="parity",
+        why=(
+            "GLM-5.3-Flash normalizes q and k in fp32 as in vLLM's KDA decode, passes fp32 q, k and v to FLA, and"
+            " casts the chunk output back to v's dtype. For BF16 inputs, the saved q, k, v and chunk matrices each"
+            " take twice the bytes per element. Eligible fp32 matrix products can use TF32 on NVIDIA GPUs."
+        ),
+        remove_when="GPU runs show it does not bring training closer to vLLM, or it is cheap enough for fp32_parity",
+        source="`loader_options.fp32_kda`",
+        registry=registry,
+    )
+    register_option(
+        "numerics.row_invariant_projections",
+        runs_in="trainer",
+        goal="parity",
+        why=(
+            "Pad short standard linear projections to a common row count to avoid row-dependent split-K rounding."
+            " Off by default because the extra projection work grows with workspace size and narrower outputs."
+            " Full determinism also enables the pad."
+        ),
+        source="`loader_options.row_invariant_projections`",
+        registry=registry,
+    )
+    register_option(
         "numerics.optimization_dtype",
         runs_in="trainer",
         goal="parity",

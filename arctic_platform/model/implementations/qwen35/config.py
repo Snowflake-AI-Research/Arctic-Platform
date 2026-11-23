@@ -64,5 +64,7 @@ class ModelConfig:
     fp32_routed_weighting: bool = False
     # Qwen3.8-Flash-Next carries its hyper-connection residual streams in fp32 between blocks.
     fp32_residual: bool = False
+    # GLM-5.3-Flash KDA keeps the L2-normalized q and k in fp32 through the recurrence.
+    fp32_kda: bool = False
 
     debug: DebugModelConfig = field(default_factory=DebugModelConfig)

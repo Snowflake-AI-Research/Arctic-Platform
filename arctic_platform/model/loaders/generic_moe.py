@@ -55,6 +55,7 @@ class GenericMoeOptions(BaseModel):
     deepep_token_chunk_size: int | None = Field(None, gt=0)
     weight_conversion_cache_dir: str | None = None
     ac_config: ActivationCheckpointConfig | None = None
+    row_invariant_projections: bool = Field(False, description="Pad short linear calls to a workspace-derived height.")
     debug: DebugModelOptions | None = None
 
     @model_validator(mode="after")

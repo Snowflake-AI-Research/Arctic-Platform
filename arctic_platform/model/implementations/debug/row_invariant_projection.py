@@ -344,10 +344,7 @@ def row_invariant_linear(
     if rows >= target or rows == 0 or in_features < MIN_DEPENDENT_CONTRACTION:
         return F.linear(input, weight, bias)
     flat = input.reshape(rows, in_features)
-    # Concatenation rather than an in-place write into a zero buffer: backward then slices the pad away by
-    # construction, and the zero rows carry no gradient to the weight because they carry no value to the
-    # output.
-    padded = torch.cat([flat, flat.new_zeros((target - rows, in_features))], dim=0)
+    padded = F.pad(flat, (0, 0, 0, target - rows))
     projected = F.linear(padded, weight, bias)[:rows]
     return projected.reshape(*input.shape[:-1], weight.shape[0])
 
@@ -386,14 +383,8 @@ def is_row_count_dependent(module: torch.nn.Module) -> bool:
 
 
 def row_invariant_projections_requested(training_config: Mapping[str, Any]) -> bool:
-    """Whether this run asked for row-invariant projections.
-
-    The pad runs every covered projection at a taller row count than its call asked for, on every call. What it
-    buys -- a token's result not moving with the height of the batch it arrived in -- is read by a parity
-    comparison, so it follows ``debug.full_determinism`` rather than every run. A production step keeps the
-    projection it had, and stays exposed to the deviation ``docs/determinism.md`` measures.
-    """
-    return full_determinism_enabled(training_config)
+    """Whether the loader option or full determinism requests the pad."""
+    return bool(training_config.get("row_invariant_projections", False)) or full_determinism_enabled(training_config)
 
 
 def maybe_apply_row_invariant_projections(
@@ -505,10 +496,7 @@ def apply_row_invariant_projections(
         )
     if logger is not None and left_exposed:
         logger.info(
-            "Row-invariant projections left %d output width(s) unpatched, so their result still follows the "
-            "row count; each is narrower than %d columns and would need the row target shown: %s",
-            len(left_exposed),
-            MIN_PADDABLE_OUTPUT_WIDTH,
+            "Unpatched linear output widths (N:row target for a standard projection): %s",
             ", ".join(f"N={width}:{target}" for width, target in sorted(left_exposed.items())),
         )
     return patched

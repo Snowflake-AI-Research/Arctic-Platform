@@ -80,9 +80,22 @@ class Qwen38FlashMoeOptions(FlashMoeOptions):
         return self
 
 
+class Glm5NextOptions(FlashMoeOptions):
+    """Validated ``loader_options`` for GLM-5.3-Flash."""
+
+    fp32_kda: bool = Field(
+        False,
+        description=(
+            "Normalize KDA q and k in fp32 as in vLLM's decode, run FLA with fp32 q, k and v, and cast the output "
+            "back to v's dtype. For BF16 inputs this doubles the storage for the saved q, k, v and chunk matrices."
+        ),
+    )
+
+
 class _FlashLoadOptions(Qwen3_5MoeOptions):
     fp32_routed_weighting: bool = False
     fp32_residual: bool = False
+    fp32_kda: bool = False
 
 
 def _matches(family: str):
@@ -180,7 +193,7 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
 @register_loader(
     "glm5_next",
     matches=_matches("glm5_next"),
-    options=FlashMoeOptions,
+    options=Glm5NextOptions,
     validate_spec=_validate_glm5_next,
 )
 def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
