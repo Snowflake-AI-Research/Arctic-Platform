@@ -64,6 +64,7 @@ EXPECTED_KEYS = {
     "numerics.fp32_parity": ("trainer", "parity"),
     "numerics.fp32_residual": ("trainer", "parity"),
     "numerics.fp32_routed_weighting": ("trainer", "parity"),
+    "numerics.fp32_kda": ("trainer", "parity"),
     "numerics.row_invariant_projections": ("trainer", "parity"),
     "numerics.optimization_dtype": ("trainer", "parity"),
     "compile.fullgraph": ("trainer", "speed"),
