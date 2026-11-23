@@ -1814,10 +1814,11 @@ class InferenceWorker(StreamingWorkerMixin):
     ) -> dict[str, Any]:
         """Receive + load weights on all TP workers via NCCL broadcast (rank 0 = trainer).
 
+        A weight load returns each TP rank's ``recv_l2_sq`` in ``rank_recv_l2_sq``.
         When ``envs.ARCTIC_INFERENCE_DUMP_PARAM_L2`` is set (opt-in, default off),
-        each TP rank's full-model and loaded-destination L2 maps are gathered
-        here (only rank 0's dict escapes ``collective_rpc``). Mapping and skip
-        artifacts remain on the rank-0 result for TP1 trace validation.
+        each TP rank's full-model and loaded-destination L2 maps are gathered here.
+        Mapping and skip artifacts remain on the rank-0 result for TP1 trace
+        validation.
         """
         results = await self.llm.collective_rpc(
             "sync_weights_broadcast",
@@ -1827,11 +1828,11 @@ class InferenceWorker(StreamingWorkerMixin):
         if not results:
             return {}
         from arctic_platform.inference import envs
+        head = dict(results[0]) if engine_only else _with_rank_recv_l2_sq(results)
         if not envs.ARCTIC_INFERENCE_DUMP_PARAM_L2:
-            return results[0]
+            return head
         # Verification path only: preserve the original full-model trace and
         # gather the loaded-only trace under a distinct field.
-        head = dict(results[0])
         head["all_rank_param_l2"] = [
             (r.get("param_l2") if isinstance(r, dict) else None) for r in results
         ]
@@ -1879,6 +1880,7 @@ class InferenceWorker(StreamingWorkerMixin):
             self._active_lora_is_3d = bool(
                 results[0].get("is_3d_lora_weight", False) if results else False
             )
+            return _with_rank_recv_l2_sq(results)
         return results[0] if results else {}
 
     @stream_lifecycle_change
