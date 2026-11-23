@@ -82,6 +82,8 @@ def receiver(request, monkeypatch):
     namespace["_FUSED_EXPERT_PROJS"] = ("w1", "w2", "w3")
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda *args: None)
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *args: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *args: 0)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *args: (0, 0))
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     return SimpleNamespace(**namespace)
 
