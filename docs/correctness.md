@@ -1,0 +1,16 @@
+# Correctness
+
+**This branch adds correctness testing without debug instrumentation or production-code changes.** It retains P1's gradient and optimizer checks and their onboarding commands. Required measurement and worker-coverage capture belongs to the correctness harness; production workers, loaders and model implementations are unchanged from main.
+
+**Read [Getting started](../arctic_platform/correctness/docs/getting-started.md) first.** Follow the complete demo from setup and onboarding through regression, troubleshooting, staging and cleanup.
+
+**This branch supports two canonical checks: `single-step-grads` and `single-step-optimizer`.** Run from a prepared allocated head. Supply a native model config to onboarding; the harness selects both applicable checks, creates a reduced-fixture specification, calibrates gates, prepares compact Hugging Face records and validates the target. The default backend is `cortex-training`; the removed `onprem` correctness backend is rejected. The harness does not allocate machines or install the GPU runtime.
+
+**For config import and reference locations, follow the [configuration and reference layout](../arctic_platform/correctness/docs/hf-reference-onboarding.md#configuration-and-reference-layout).** Catalog imports preserve paths below `cortex-training/model-catalog/models/`; noncatalog configs derive a model/sequence/recipe hierarchy. Reference folders mirror config-relative paths without the extension. The `config-layout.json` manifest retains migrated frozen IDs; configs without a manifest entry derive new IDs from their relative paths. Layout migration leaves historical measurement bytes unchanged. Import acceptance, including for sampling-only recipes, is not a numerical onboarding pass.
+
+- [Operator guide](../arctic_platform/correctness/docs/running-tests.md): prerequisites, imported config locations, config/test selection, backend options, reports, and diagnostics.
+- [HF reference onboarding](../arctic_platform/correctness/docs/hf-reference-onboarding.md): config/reference hierarchy, migrated and new IDs, sizing, calibration, compact records, and immutable workload identities.
+- [Code map](../arctic_platform/correctness/docs/code-inventory.md): retained implementation boundaries and Test2 export dependencies.
+- [Correctness skill](../skills/correctness/SKILL.md): agent workflow for harness changes, reference integrity, validation and evidence boundaries; replaces the correctness-specific `AGENTS.md`.
+
+**Regression consumes compatible prepared references and never measures a missing baseline or relaxes a reviewed gate.** Model fixtures and tensor scratch stay on fast storage; small logs, reports and retry checkpoints use `./work/logs`, and regression reports can use `./work/reports`. Hugging Face reuses the source-model cache at `/checkpoint/huggingface`. Compact reference records are generated locally and are not bundled with the package. See the operator guide's separate [Onboarding](../arctic_platform/correctness/docs/running-tests.md#onboarding) and [Running](../arctic_platform/correctness/docs/running-tests.md#running) sections for complete commands.

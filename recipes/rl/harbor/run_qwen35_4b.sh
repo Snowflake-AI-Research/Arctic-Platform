@@ -11,6 +11,7 @@
 #     (a JSON object passed to the environment, like `harbor run --ek`; see README.md)
 # and optionally:
 #   - HARBOR_SKILL=/path/to/skill_or_skills_dir
+#   - HARBOR_VERIFIER_ENV='{"KEY": "value or ${VAR}"}' (added to every task's verifier env, like `harbor run --ve`)
 #   - HARBOR_AGENT=harbor_rl.agent:OpenHandsHarborAgent (or your own driver-side Harbor BaseAgent; installed agents are refused)
 
 set -euo pipefail
@@ -124,6 +125,7 @@ export OPENHANDS_WORKSPACE="${OPENHANDS_WORKSPACE:-/tmp/testbed}"
 export HARBOR_AGENT="${HARBOR_AGENT:-harbor_rl.agent:OpenHandsHarborAgent}"
 export HARBOR_ENV="${HARBOR_ENV:-snowflake}"
 export HARBOR_ENV_KWARGS="${HARBOR_ENV_KWARGS:-}"
+export HARBOR_VERIFIER_ENV="${HARBOR_VERIFIER_ENV:-}"
 export HARBOR_SKILL="${HARBOR_SKILL:-}"
 export ARCTIC_CORTEX_JOB_COMMENT="${ARCTIC_CORTEX_JOB_COMMENT:-harbor rl ${MODEL} ${NUM_TRAIN_GPUS}+${NUM_SAMPLING_ENGINES}}"
 

@@ -20,6 +20,8 @@ from __future__ import annotations
 import torch
 from torch.optim.adamw import adamw
 
+_UPDATE_CHUNK_ELEMENTS = 1024 * 1024
+
 
 class _NonfusedAdamWOps:
     def __init__(self, native_ops):
@@ -46,28 +48,37 @@ class _NonfusedAdamWOps:
     ):
         if not bias_correction:
             raise ValueError("Non-fused CPU AdamW requires bias correction")
+        tensors = (parameter, gradient, exp_avg, exp_avg_sq)
+        chunks = (tensors,)
+        if parameter.numel() > _UPDATE_CHUNK_ELEMENTS and all(
+            value.is_contiguous() and value.shape == parameter.shape for value in tensors
+        ):
+            # ZeRO's flat partitions can be tens of GB. AdamW is elementwise, so
+            # bound gradient casts and denominators without copying optimizer state.
+            chunks = zip(*(value.view(-1).split(_UPDATE_CHUNK_ELEMENTS) for value in tensors))
         # CPUAdam already increments its integer counter; PyTorch increments this
-        # temporary scalar itself. Keep the checkpoint's native counter unchanged.
-        state_step = torch.tensor(step - 1, dtype=torch.float32)
-        adamw(
-            [parameter],
-            [gradient.to(exp_avg.dtype)],
-            [exp_avg],
-            [exp_avg_sq],
-            [],
-            [state_step],
-            amsgrad=False,
-            beta1=beta1,
-            beta2=beta2,
-            lr=lr,
-            weight_decay=weight_decay,
-            eps=eps,
-            maximize=False,
-            foreach=False,
-            capturable=False,
-            differentiable=False,
-            fused=False,
-        )
+        # temporary scalar itself. Each slice needs the same update counter.
+        for parameter_chunk, gradient_chunk, first_moment, second_moment in chunks:
+            state_step = torch.tensor(step - 1, dtype=torch.float32)
+            adamw(
+                [parameter_chunk],
+                [gradient_chunk.to(first_moment.dtype)],
+                [first_moment],
+                [second_moment],
+                [],
+                [state_step],
+                amsgrad=False,
+                beta1=beta1,
+                beta2=beta2,
+                lr=lr,
+                weight_decay=weight_decay,
+                eps=eps,
+                maximize=False,
+                foreach=False,
+                capturable=False,
+                differentiable=False,
+                fused=False,
+            )
 
     def adam_rollback(self, *args, **kwargs):
         raise NotImplementedError("Non-fused CPU AdamW does not support kernel rollback")
