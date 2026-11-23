@@ -42,7 +42,10 @@ if "vllm" not in sys.modules:
     stats_module = types.ModuleType("vllm.v1.metrics.stats")
 
     class VllmConfig:
-        pass
+        def _verify_aux_output_compatibility(self):
+            return None
+
+    VllmConfig._verify_aux_output_compatibility._arctic_allow_dcp = True
 
     class StatLoggerBase:
         pass
