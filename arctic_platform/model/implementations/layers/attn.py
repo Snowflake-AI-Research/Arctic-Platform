@@ -1,4 +1,5 @@
 import functools
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -31,6 +32,12 @@ try:
 # Some flash_attn builds raise AttributeError, not ImportError, while importing ``flash_attn.cute``.
 except (ImportError, AttributeError):
     flash_attn_4_varlen_func = None  # type: ignore
+
+# The flash_attn 2.8 bundled FA4 has no max_seqlen arguments; flash-attn-4 4.x pads to the packed width without them.
+_FA4_TAKES_MAX_SEQLEN = (
+    flash_attn_4_varlen_func is not None
+    and "max_seqlen_k" in inspect.signature(flash_attn_4_varlen_func).parameters
+)
 
 
 @dataclass
@@ -112,6 +119,9 @@ class FlashAttention(nn.Module):
             # so cu_seqlens must be passed as keyword args to avoid misalignment.
             kwargs["cu_seqlens_q"] = cu_seqlens
             kwargs["cu_seqlens_k"] = cu_seqlens_k
+            if _FA4_TAKES_MAX_SEQLEN:
+                kwargs["max_seqlen_q"] = max_seqlen
+                kwargs["max_seqlen_k"] = max_seqlen_k
             out = self._flash_attn_call(q, k, v, **kwargs)
         else:
             out = self._flash_attn_call(q, k, v, cu_seqlens, cu_seqlens_k, max_seqlen, max_seqlen_k, **kwargs)

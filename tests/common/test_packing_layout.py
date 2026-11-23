@@ -61,8 +61,10 @@ F64_ATOL = 1e-12
 
 @pytest.fixture(autouse=True)
 def _reference_flash_attn(monkeypatch):
-    """The reference kernel stands in for flash-attn 2.8 and FA3 here, installed or not."""
-    monkeypatch.setattr(layout_module, "_installed_version", {"flash_attn": (2, 8), "flash_attn_3": (3, 0)}.get)
+    """The reference kernel stands in for flash-attn 2.8, FA3 and FA4 here, installed or not."""
+    monkeypatch.setattr(
+        layout_module, "_installed_version", {"flash_attn": (2, 8), "flash_attn_3": (3, 0), "flash_attn_4": (4, 0)}.get
+    )
 
 
 @register_native_prefix_attention
@@ -600,17 +602,21 @@ def test_require_prefix_continuation_rejects_unsupported_mixers():
         require_prefix_continuation(Qwen3Attention(sliding_window=4))
     with pytest.raises(ValueError, match="Qwen2Attention"):
         require_prefix_continuation(Qwen2Attention())
-    require_prefix_continuation(Qwen3Attention(impl="flash_attention_3"))
-    with pytest.raises(ValueError, match="needs flash_attention_2 or flash_attention_3"):
+    for impl in ("flash_attention_3", "flash_attention_4"):
+        require_prefix_continuation(Qwen3Attention(impl=impl))
+    with pytest.raises(ValueError, match="needs flash_attention_2, flash_attention_3 or flash_attention_4"):
         require_prefix_continuation(Qwen3Attention(impl="kernels-community/flash-attn"))
     with pytest.raises(ValueError, match="no sequence mixers"):
         require_prefix_continuation(nn.Linear(1, 1))
 
-    fa3, fa4 = FlashAttention(), FlashAttention()
-    fa3._flash_attn_version, fa4._flash_attn_version = 3, 4
-    require_prefix_continuation(fa3)
-    with pytest.raises(ValueError, match="flash-attn 4"):
-        require_prefix_continuation(fa4)
+    for version in (3, 4):
+        module = FlashAttention()
+        module._flash_attn_version = version
+        require_prefix_continuation(module)
+    unknown = FlashAttention()
+    unknown._flash_attn_version = 5
+    with pytest.raises(ValueError, match="flash-attn 5"):
+        require_prefix_continuation(unknown)
 
 
 def test_sharing_refuses_state_space_and_conv_mixers():
@@ -677,6 +683,17 @@ def test_sharing_refuses_top_left_causal_flash_attn(monkeypatch):
             pass
     installed(flash_attn_3=(3, 0))
     with using_layout(fa3, layout):
+        pass
+
+    # flash_attn 2.8 bundles an FA4 (flash_attn.cute) with no varlen backward; only the flash-attn-4 package counts.
+    fa4 = FlashAttention()
+    fa4._flash_attn_version = 4
+    installed(flash_attn=(2, 8))
+    with pytest.raises(ValueError, match="flash_attn_4 package .* not installed"):
+        with using_layout(fa4, layout):
+            pass
+    installed(flash_attn_4=(4, 0))
+    with using_layout(fa4, layout):
         pass
 
 

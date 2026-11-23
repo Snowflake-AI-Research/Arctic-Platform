@@ -55,13 +55,15 @@ gathers K/V itself. Hugging Face flash attention gets the gather from a wrapper 
 context only; the wrapper passes modules with an unshared stash through and refuses
 already-gathered K/V.
 
-Only flash-attn 2 (>= 2.1, the ``flash_attn`` package) and FA3 (the ``flash_attn_3``
-package) have been checked on GPU against an unshared run, so a sharing layout refuses FA4
-``FlashAttention`` and Hugging Face implementations other than ``flash_attention_2`` /
-``flash_attention_3``, and needs the kernel each mixer calls installed. Mixers are found by
-class name and by a direct ``Conv1d`` child; any that is not one of the flash attentions
-above (Mamba / SSM, GatedDeltaNet, short convolutions) refuses a sharing layout, because it
-would restart its state at each continuation instead of carrying the root's.
+Only flash-attn 2 (>= 2.1, the ``flash_attn`` package), FA3 (the ``flash_attn_3`` package)
+and FA4 (the ``flash-attn-4`` package, not the copy flash_attn 2.8 bundles, which has no
+varlen backward) have been checked on GPU against an unshared run. A sharing layout refuses
+other ``FlashAttention`` versions and Hugging Face implementations other than
+``flash_attention_2`` / ``_3`` / ``_4``, and needs the kernel each mixer calls installed.
+
+Mixers are found by class name and by a direct ``Conv1d`` child; any that is not one of the
+flash attentions above (Mamba / SSM, GatedDeltaNet, short convolutions) refuses a sharing
+layout, because it would restart its state at each continuation instead of carrying the root's.
 
 Not supported inside :func:`using_layout` until the GatedDeltaNet and executor PRs define
 them: sequence parallelism (SP >= 2, a shard's ``position_ids`` do not cover the layout)
@@ -739,8 +741,9 @@ def _installed_version(distribution: str) -> tuple[int, int] | None:
 
 # Flash kernel generation -> (distribution, oldest version that aligns causal masks bottom-right when a
 # segment has more keys than queries). flash-attn < 2.1 aligns them top-left; FA3 is bottom-right throughout.
-_FLASH_KERNELS = {2: ("flash_attn", (2, 1)), 3: ("flash_attn_3", (3, 0))}
-_HF_FLASH_KERNELS = {"flash_attention_2": 2, "flash_attention_3": 3}
+# FA4 is the flash-attn-4 package: the copy bundled with flash_attn 2.8 has no varlen backward.
+_FLASH_KERNELS = {2: ("flash_attn", (2, 1)), 3: ("flash_attn_3", (3, 0)), 4: ("flash_attn_4", (4, 0))}
+_HF_FLASH_KERNELS = {"flash_attention_2": 2, "flash_attention_3": 3, "flash_attention_4": 4}
 
 
 def _flash_kernel(module: torch.nn.Module) -> int:
@@ -886,13 +889,15 @@ def _prefix_continuation_blocker(module: torch.nn.Module) -> str | None:
     if type(module) in _NATIVE_PREFIX_ATTENTION:
         version = getattr(module, "_flash_attn_version", 2)
         if version not in _FLASH_KERNELS:
-            return f"{name} (flash-attn {version}; only flash-attn 2 and 3 are verified for prefix continuation)"
+            return f"{name} (flash-attn {version}; only flash-attn 2, 3 and 4 are verified for prefix continuation)"
         return None
     if name not in _HF_PREFIX_ATTENTION:
         return f"{name} (no prefix-continuation path)"
     impl = getattr(getattr(module, "config", None), "_attn_implementation", None)
     if impl not in _HF_FLASH_KERNELS:
-        return f"{name} (attn_implementation={impl!r}, needs flash_attention_2 or flash_attention_3)"
+        return (
+            f"{name} (attn_implementation={impl!r}, needs flash_attention_2, flash_attention_3 or flash_attention_4)"
+        )
     if getattr(module, "sliding_window", None) is not None:
         return f"{name} (Hugging Face sliding window)"
     return None
