@@ -108,6 +108,9 @@ class DummyWorker:
             "spec_decoding": {},
         }
 
+    def num_waiting_reqs(self) -> int:
+        return 0
+
     def set_replica_id(self, replica_id: int) -> None:
         return None
 

@@ -6,7 +6,7 @@ its file with each of those imports stubbed. ``tests/inference/`` holds the
 fuller worker tests, which need the real packages.
 
 semi_p builds its config on the plain path and hands it, with the engine
-kwargs, to ``semip_asyncllm.restore_and_attach`` where the plain path builds
+kwargs, to ``semip_frontend.restore_and_attach`` where the plain path builds
 its ``AsyncLLM``; these tests hold the plain path to what it did before.
 
 Run from the package directory::
@@ -132,8 +132,8 @@ def env(monkeypatch):
             "utils", require_supported_vllm_version=noop),
         "arctic_platform.inference.semi_persistence": _module(
             "semi_persistence", matched_baseline=env.matched_baseline()),
-        "arctic_platform.inference.server.semip_asyncllm": _module(
-            "semip_asyncllm", restore_and_attach=env.restore_and_attach),
+        "arctic_platform.inference.server.semip_frontend": _module(
+            "semip_frontend", restore_and_attach=env.restore_and_attach),
         "vllm": _module("vllm"),
         "vllm.plugins": _module("vllm.plugins", load_general_plugins=noop),
         "vllm.v1": _module("vllm.v1"),
