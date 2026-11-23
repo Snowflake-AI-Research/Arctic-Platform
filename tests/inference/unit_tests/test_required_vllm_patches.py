@@ -8,6 +8,7 @@ from arctic_platform.inference.vllm import mamba_completion_refresh
 from arctic_platform.inference.vllm import mrope_yarn
 from arctic_platform.inference.vllm import required_patches
 from arctic_platform.inference.vllm import router_replay
+from arctic_platform.inference.vllm import sparse_topk_order
 from arctic_platform.inference.vllm import spec_decode_grammar
 from arctic_platform.inference.vllm import tp_spec_decode_sync
 from arctic_platform.inference.vllm import xgrammar_stop_mask
@@ -46,6 +47,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         lambda: calls.append("tp_spec_decode_sync"),
     )
     monkeypatch.setattr(
+        sparse_topk_order,
+        "apply_sparse_topk_order_fix",
+        lambda: calls.append("sparse_topk_order"),
+    )
+    monkeypatch.setattr(
         config,
         "ensure_dflash_max_position_patch",
         lambda: calls.append("dflash_max_position"),
@@ -82,6 +88,7 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "spec_decode_grammar",
         "hybrid_state",
         "tp_spec_decode_sync",
+        "sparse_topk_order",
         "glm5next_lora",
         "kv_group_size",
         "dflash_max_position",
