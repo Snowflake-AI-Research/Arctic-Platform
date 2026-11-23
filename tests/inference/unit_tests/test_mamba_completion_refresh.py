@@ -90,6 +90,9 @@ def manager_methods(monkeypatch):
         ("dense_prompt_logprobs", "ensure_dense_prompt_logprobs_patch"),
         ("spec_decode_grammar", "ensure_spec_decode_grammar_fix"),
         ("hybrid_state_fixes", "apply_hybrid_state_fixes"),
+        ("tp_spec_decode_sync", "ensure_tp_spec_decode_sync"),
+        ("glm5next_lora", "ensure_glm5next_lora"),
+        ("deepseek_v41_lora", "ensure_deepseek_v41_lora"),
         ("kv_group_size", "ensure_kv_group_size_patch"),
         ("mrope_yarn", "ensure_mrope_yarn_fix"),
     ]:
