@@ -423,6 +423,24 @@ def _install_lora_adapter(adapter_manager, lora_model, lora_int_id: int) -> tupl
     return added, activated
 
 
+def _refuse_synced_host_resident_params(model) -> None:
+    """Fail the sync if it wrote a parameter semi_p keeps out of its CRIU image.
+
+    semi_p's ``host_weights`` moves large pinned host parameters (DeepSeek-V4.1's
+    Engram tables) into mappings it empties at the dump and refills from the
+    dump-time weight set at every restore, and tags each with
+    ``_semip_verify_unchanged``, which raises if the parameter's storage or
+    contents changed since it was moved.  Updating those tables by weight sync
+    is not supported; ``SEMIP_THIN_PINNED_PARAMS=0`` leaves them where vLLM put
+    them.  Costs one checksum of each tagged parameter (a GPU read over PCIe,
+    about 0.5 s for DeepSeek's 23.6 GiB per rank) and nothing on other models.
+    """
+    for _, param in model.named_parameters():
+        verify = getattr(param, "_semip_verify_unchanged", None)
+        if verify is not None:
+            verify()
+
+
 def _refresh_cached_weight_copies(model) -> int:
     """Rebuild the weight copies vLLM GLM-5.3 caches on its first forward from the synced parameters.
 
@@ -432,7 +450,11 @@ def _refresh_cached_weight_copies(model) -> int:
     Copied in place under inference mode: CUDA graphs may hold their addresses, and they are inference tensors.
     Returns how many caches were refreshed; a GLM-5.3 sampler reporting 0 after its first forward means
     vLLM renamed them and the refresh no longer applies.
+
+    Every sync of base weights ends here, so this is also where one that wrote a semi_p host-resident
+    parameter fails (``_refuse_synced_host_resident_params``).
     """
+    _refuse_synced_host_resident_params(model)
     refreshed = 0
     with torch.inference_mode():
         for module in model.modules():
