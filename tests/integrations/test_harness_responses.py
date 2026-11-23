@@ -42,15 +42,20 @@ class _Tokenizer:
         return [ord(ch) for ch in text]
 
     def decode(self, ids, skip_special_tokens=True):
-        return "text"
+        return "" if ids == [self.eos_token_id] else "text"
 
 
 @pytest.fixture
-def served():
+def generation():
+    return dict(token_ids=[42, 43], finish_reason="stop", prefix_cache_len=3)
+
+
+@pytest.fixture
+def served(generation):
     tokenizer = _Tokenizer()
 
     async def generate(prompt_ids, params, routing_key):
-        return dict(token_ids=[42, 43], finish_reason="stop")
+        return generation
 
     def parser(text):
         return "calling", [dict(id="call_2", type="function", function=dict(name="ls", arguments="{}"))]
@@ -69,11 +74,13 @@ def _post(proxy, body):
         with urllib.request.urlopen(request) as response:
             return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error:
-        return error.code, json.loads(error.read())
+        data = error.read()
+        return error.code, json.loads(data) if error.headers.get_content_type() == "application/json" else data
 
 
-def test_a_responses_request_runs_as_chat_and_returns_items_and_token_ids(served):
+def test_a_responses_request_runs_as_chat_and_returns_items_and_token_ids(served, generation):
     proxy, tokenizer = served
+    generation["reasoning_tokens"] = 1
     tools = [dict(type="function", name="ls", description="list", parameters=dict(type="object"))]
     status, body = _post(
         proxy,
@@ -101,6 +108,50 @@ def test_a_responses_request_runs_as_chat_and_returns_items_and_token_ids(served
     assert (body["output"][1]["call_id"], body["output"][1]["name"]) == ("call_2", "ls")
     assert body["output_token_ids"] == [42, 43]
     assert body["usage"]["input_tokens"] == len(body["prompt_token_ids"]) > 0
+    assert body["usage"]["input_tokens_details"]["cached_tokens"] == 3
+    assert body["usage"]["output_tokens_details"]["reasoning_tokens"] == 1
+    assert body["tools"] == tools and body["tool_choice"] == "auto" and body["parallel_tool_calls"]
+    assert body["instructions"] == "be brief" and body["max_output_tokens"] == 8
+
+
+@pytest.mark.parametrize("empty", [False, True], ids=["tool-result", "eos-only"])
+def test_replaying_output_keeps_the_sampled_ids(served, generation, empty):
+    proxy, _ = served
+    options = {}
+    if empty:
+        generation["token_ids"] = [7]
+    else:
+        options["tools"] = [dict(type="function", name="ls")]
+    history = [dict(role="user", content="hi")]
+    status, first = _post(proxy, dict(input=history, **options))
+    assert status == 200
+    if empty:
+        followup = dict(role="user", content="again")
+    else:
+        followup = dict(
+            type="function_call_output",
+            call_id=first["output"][-1]["call_id"],
+            output=[dict(type="input_text", text="a.py")],
+        )
+    status, second = _post(proxy, dict(input=[*history, *first["output"], followup], **options))
+    prefix = first["prompt_token_ids"] + first["output_token_ids"]
+    assert status == 200 and second["prompt_token_ids"][: len(prefix)] == prefix
+    assert proxy.episodes("k")[-1].extended
+
+
+def test_length_limited_message_is_incomplete(served, generation):
+    proxy, _ = served
+    generation["finish_reason"] = "length"
+    status, body = _post(proxy, dict(input="hi"))
+    assert status == 200 and body["status"] == body["output"][0]["status"] == "incomplete"
+    assert body["incomplete_details"] == dict(reason="max_output_tokens")
+
+
+def test_aborted_generation_returns_an_error(served, generation):
+    proxy, _ = served
+    generation["finish_reason"] = "abort"
+    status, body = _post(proxy, dict(input="hi"))
+    assert status == 502 and body["error"]["message"]
 
 
 @pytest.mark.parametrize(
@@ -110,6 +161,12 @@ def test_a_responses_request_runs_as_chat_and_returns_items_and_token_ids(served
         dict(input="hi", previous_response_id="resp_1"),
         dict(input="hi", tools=[dict(type="web_search")]),
         dict(input="hi", stream=True),
+        dict(input="hi", tools=[dict(type="function", name="ls")], tool_choice=dict(type="function", name="ls")),
+        dict(input="hi", tools=[dict(type="function", name="ls")], tool_choice="required"),
+        dict(input="hi", tools=[dict(type="function", name="ls")], parallel_tool_calls=False),
+        dict(input=[dict(type="function_call_output", call_id="c", output=[dict(type="input_image", file_id="f")])]),
+        dict(input="hi", tools=[dict(type="function", name="ls", strict=True)]),
+        dict(input="hi", text=dict(format=dict(type="json_schema", name="result", schema=dict(type="object")))),
     ],
 )
 def test_requests_chat_cannot_express_are_refused(served, request_body):

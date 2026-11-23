@@ -230,21 +230,21 @@ class ChatCompletionsProxy:
             body = await request.json()
         except json.JSONDecodeError:
             return _error(400, "request body is not valid JSON")
-        completion = await self._complete(request, body)
-        return completion if isinstance(completion, web.Response) else web.json_response(completion)
+        return await self._complete(request, body)
 
     async def _responses(self, request: web.Request) -> web.Response:
         try:
-            chat_body = chat_body_from_responses(await request.json())
+            body = await request.json()
+            chat_body = chat_body_from_responses(body)
         except json.JSONDecodeError:
             return _error(400, "request body is not valid JSON")
         except (KeyError, TypeError, ValueError) as exc:
             return _error(400, f"unsupported Responses request: {exc}")
-        completion = await self._complete(request, chat_body)
-        return completion if isinstance(completion, web.Response) else web.json_response(responses_from_chat(completion))
+        return await self._complete(request, chat_body, responses_request=body)
 
-    async def _complete(self, request: web.Request, body: dict[str, Any]) -> dict[str, Any] | web.Response:
-        """The chat completion for ``body``, or the error response."""
+    async def _complete(
+        self, request: web.Request, body: dict[str, Any], responses_request: dict[str, Any] | None = None
+    ) -> web.Response:
         if body.get("stream"):
             return _error(400, "streaming is not supported")
         if body.get("n", 1) != 1:
@@ -276,6 +276,8 @@ class ChatCompletionsProxy:
                 result = await self._generate_fn(prompt_ids, params, routing_key)
             except Exception as exc:
                 return _error(500, f"Cortex generate failed: {exc}")
+            if responses_request is not None and result.get("finish_reason") == "abort":
+                return _error(502, "Cortex generation was aborted")
 
             response_ids = [int(token) for token in result.get("token_ids") or []]
             text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
@@ -296,7 +298,7 @@ class ChatCompletionsProxy:
         finish_reason = result.get("finish_reason") or "stop"
         if len(tool_calls) > 0 and finish_reason == "stop":
             finish_reason = "tool_calls"
-        return dict(
+        completion = dict(
             id=f"chatcmpl-{uuid.uuid4().hex}",
             object="chat.completion",
             created=int(time.time()),
@@ -317,3 +319,6 @@ class ChatCompletionsProxy:
             ),
             prompt_token_ids=prompt_ids,
         )
+        if responses_request is not None:
+            return web.json_response(responses_from_chat(completion, responses_request, result))
+        return web.json_response(completion)

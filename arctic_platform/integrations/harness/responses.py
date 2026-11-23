@@ -39,6 +39,13 @@ def _text(content: Any) -> str:
 def chat_body_from_responses(body: dict[str, Any]) -> dict[str, Any]:
     if body.get("previous_response_id") is not None:
         raise ValueError("previous_response_id is not supported; send the whole conversation as input")
+    if body.get("tool_choice") not in (None, "auto", "none"):
+        raise ValueError("the harness supports only auto and none for tool_choice")
+    if body.get("tools") and body.get("tool_choice") != "none" and body.get("parallel_tool_calls") is False:
+        raise ValueError("the harness cannot limit the model to one function call")
+    text_format = (body.get("text") or {}).get("format") or {}
+    if text_format.get("type", "text") != "text":
+        raise ValueError("only plain text output is supported")
     messages: list[dict[str, Any]] = []
     if body.get("instructions"):
         messages.append(dict(role="system", content=body["instructions"]))
@@ -55,18 +62,18 @@ def chat_body_from_responses(body: dict[str, Any]) -> dict[str, Any]:
             else:
                 messages.append(dict(role="assistant", content="", tool_calls=[call]))
         elif kind == "function_call_output":
-            messages.append(dict(role="tool", tool_call_id=item["call_id"], content=item["output"]))
+            messages.append(dict(role="tool", tool_call_id=item["call_id"], content=_text(item["output"])))
         else:
             raise ValueError(f"input item type {kind!r} is not supported")
     chat: dict[str, Any] = dict(messages=messages)
     for key in _PASSED_THROUGH:
         if body.get(key) is not None:
             chat[key] = body[key]
-    if isinstance(chat.get("tool_choice"), dict):
-        chat["tool_choice"] = dict(type="function", function=dict(name=chat["tool_choice"]["name"]))
     if body.get("tools"):
         if any(tool["type"] != "function" for tool in body["tools"]):
             raise ValueError("only function tools are supported")
+        if any(tool.get("strict") for tool in body["tools"]):
+            raise ValueError("strict function schemas are not supported")
         chat["tools"] = [
             dict(type="function", function={key: tool[key] for key in ("name", "description", "parameters") if key in tool})
             for tool in body["tools"]
@@ -76,39 +83,53 @@ def chat_body_from_responses(body: dict[str, Any]) -> dict[str, Any]:
     return chat
 
 
-def responses_from_chat(completion: dict[str, Any]) -> dict[str, Any]:
+def responses_from_chat(
+    completion: dict[str, Any], request: dict[str, Any], generation: dict[str, Any]
+) -> dict[str, Any]:
     choice = completion["choices"][0]
     message = choice["message"]
+    reason = {"length": "max_output_tokens", "content_filter": "content_filter"}.get(choice["finish_reason"])
+    status = "incomplete" if reason else "completed"
     output: list[dict[str, Any]] = []
-    if message["content"]:
+    if message["content"] or not message["tool_calls"]:
         output.append(
             dict(
-                type="message", id=f"msg_{uuid.uuid4().hex}", role="assistant", status="completed",
-                content=[dict(type="output_text", text=message["content"], annotations=[])],
+                type="message", id=f"msg_{uuid.uuid4().hex}", role="assistant", status=status,
+                content=[dict(type="output_text", text=message["content"] or "", annotations=[])],
             )
         )
     for call in message["tool_calls"]:
         output.append(
             dict(
                 type="function_call", id=f"fc_{uuid.uuid4().hex}", call_id=call["id"],
-                name=call["function"]["name"], arguments=call["function"]["arguments"], status="completed",
+                name=call["function"]["name"], arguments=call["function"]["arguments"], status=status,
             )
         )
-    truncated = choice["finish_reason"] == "length"
-    usage = completion["usage"]
+    usage = dict(
+        input_tokens=completion["usage"]["prompt_tokens"],
+        output_tokens=completion["usage"]["completion_tokens"],
+        total_tokens=completion["usage"]["total_tokens"],
+    )
+    if generation.get("prefix_cache_len") is not None:
+        usage["input_tokens_details"] = dict(cached_tokens=generation["prefix_cache_len"])
+    if generation.get("reasoning_tokens") is not None:
+        usage["output_tokens_details"] = dict(reasoning_tokens=generation["reasoning_tokens"])
     return dict(
         id=f"resp_{uuid.uuid4().hex}",
         object="response",
         created_at=completion["created"],
         model=completion["model"],
-        status="incomplete" if truncated else "completed",
-        incomplete_details=dict(reason="max_output_tokens") if truncated else None,
+        status=status,
+        incomplete_details=dict(reason=reason) if reason else None,
+        instructions=request.get("instructions"),
+        max_output_tokens=request.get("max_output_tokens"),
+        parallel_tool_calls=request.get("parallel_tool_calls") is not False,
+        tools=request.get("tools") or [],
+        tool_choice=request.get("tool_choice") or "auto",
+        temperature=request.get("temperature"),
+        top_p=request.get("top_p"),
         output=output,
-        usage=dict(
-            input_tokens=usage["prompt_tokens"],
-            output_tokens=usage["completion_tokens"],
-            total_tokens=usage["total_tokens"],
-        ),
+        usage=usage,
         prompt_token_ids=completion["prompt_token_ids"],
         output_token_ids=choice["token_ids"],
     )
