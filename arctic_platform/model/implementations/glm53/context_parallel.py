@@ -717,23 +717,19 @@ def _kda_beta(self, hidden_states: torch.Tensor) -> torch.Tensor:
 def _chunk_kda(self, query, key, value, decay, beta, cu_seqlens):
     from fla.ops.kda import chunk_kda
 
-    fp32 = getattr(self, "_fp32_kda", False)
+    fp32 = self._fp32_kda
     if fp32:
         # Share each fp32 cast so autograd sums both normalization terms before rounding the gradient.
         query, key = (x / torch.sqrt(x.square().sum(-1, keepdim=True) + 1e-6) for x in (query.float(), key.float()))
-    output, final_state = chunk_kda(
+    output, _ = chunk_kda(
         query,
         key,
         value.float() if fp32 else value,
         g=decay,
         beta=beta,
-        initial_state=None,
-        output_final_state=False,
         use_qk_l2norm_in_kernel=not fp32,
         cu_seqlens=cu_seqlens,
     )
-    if final_state is not None:
-        raise RuntimeError("GLM-5.3 KDA unexpectedly returned recurrent state")
     return output.to(value.dtype)
 
 

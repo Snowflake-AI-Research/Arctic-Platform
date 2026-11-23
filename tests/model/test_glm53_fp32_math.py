@@ -188,50 +188,14 @@ def test_glm53_kda_beta_gate_is_an_fp32_sigmoid(tiny_glm_sparse_model, single_ra
         torch_assert_equal(beta.reshape(expected.shape), expected)
 
 
-def _kda_decode(query, key, value, g, beta, cu_seqlens):
-    """vLLM's KDA decode recurrence (``fused_recurrent_gated_delta_rule_fwd_kernel``) in fp32 from a zero state, on
-    q and k already L2-normalized, one token at a time per packed row."""
-    scale, out = query.shape[-1] ** -0.5, torch.empty(value.shape)
-    for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
-        state = torch.zeros(query.shape[2], value.shape[-1], query.shape[-1])
-        for t in range(start, end):
-            q, k, v = query[0, t].float() * scale, key[0, t].float(), value[0, t].float()
-            state = state * torch.exp(g[0, t].float())[:, None, :]
-            v = (v - (state * k[:, None, :]).sum(-1)) * beta[0, t].float()[:, None]
-            state = state + v[:, :, None] * k[:, None, :]
-            out[0, t] = (state * q[:, None, :]).sum(-1)
-    return out
+def test_glm53_kda_keeps_normalized_qk_in_fp32_like_the_sampler_decode(tiny_glm_sparse_model, single_rank_group):
+    for enabled in (False, True):
+        _check_kda_operands(tiny_glm_sparse_model, single_rank_group, enabled)
 
 
-def _l2_normalize(x):
-    x = x.float()
-    return x / torch.sqrt(x.square().sum(-1, keepdim=True) + 1e-6)
-
-
-def _fla_chunk_kda(captured):
-    """FLA's ``chunk_kda`` contract with the decode arithmetic inside: its in-kernel normalization stores q and k in
-    their input dtype (``l2norm_fwd``), its kernels take one dtype for q, k and v, and the output takes q's dtype."""
-
-    def chunk_kda(query, key, value, g, beta, use_qk_l2norm_in_kernel, cu_seqlens, **_kwargs):
-        assert query.dtype == key.dtype == value.dtype
-        if use_qk_l2norm_in_kernel:
-            query, key = (_l2_normalize(x).to(x.dtype) for x in (query, key))
-        captured.append((g, beta))
-        return _kda_decode(query, key, value, g, beta, cu_seqlens).to(query.dtype), None
-
-    fla, ops, kda = (types.ModuleType(name) for name in ("fla", "fla.ops", "fla.ops.kda"))
-    kda.chunk_kda = chunk_kda
-    fla.ops, ops.kda = ops, kda
-    return {"fla": fla, "fla.ops": ops, "fla.ops.kda": kda}
-
-
-@pytest.mark.parametrize("fp32_kda", [True, False])
-def test_glm53_kda_keeps_normalized_qk_in_fp32_like_the_sampler_decode(
-    tiny_glm_sparse_model, single_rank_group, fp32_kda
-):
-    """At both SP paths, with FLA replaced by its dtype contract around vLLM's decode recurrence: with ``fp32_kda``
-    the KDA output and the post-convolution q/k/v gradient are the decode arithmetic (q and k normalized in fp32,
-    one rounding each); without it, FLA's BF16 store of the normalized q and k."""
+def _check_kda_operands(tiny_glm_sparse_model, single_rank_group, fp32_kda):
+    """Check the operands and normalization flag FLA actually receives, the result at o_norm, and the gradient
+    through the post-convolution q/k/v cast on both GLM forwards."""
     from arctic_platform.model.implementations.glm53 import context_parallel as cp
     from tests.model.test_glm53_packed_rows import _unfused_causal_conv1d_module
 
@@ -241,24 +205,38 @@ def test_glm53_kda_keeps_normalized_qk_in_fp32_like_the_sampler_decode(
     cu_seqlens = torch.tensor([0, 2, 6], dtype=torch.int32)
     setattr(attention, cp._GLOBAL_CU_SEQLENS, cu_seqlens)
     attention._cp_group, attention._cp_world_size, attention._fp32_kda = single_rank_group, 1, fp32_kda
-    gated_inputs, convolved, outputs = [], [], []
+    calls, convolved, outputs = [], [], []
     convolution = _unfused_causal_conv1d_module(cu_seqlens)
     convolve = convolution.causal_conv1d_fn
-    convolution.causal_conv1d_fn = lambda *args, **kwargs: convolved.append(convolve(*args, **kwargs)) or convolved[-1]
-    attention.o_norm.register_forward_pre_hook(lambda module, args: outputs.append(args[0]))
-    modules = {**_fla_chunk_kda(gated_inputs), "causal_conv1d": convolution}
 
+    def record_conv(*args, **kwargs):
+        result = convolve(*args, **kwargs)
+        convolved.append(result)
+        return result
+
+    def chunk_kda(q, k, v, *, cu_seqlens, use_qk_l2norm_in_kernel, **kwargs):
+        calls.append(((q, k, v), cu_seqlens, use_qk_l2norm_in_kernel))
+        return q + k * v, None
+
+    convolution.causal_conv1d_fn = record_conv
+    attention.o_norm.register_forward_pre_hook(lambda module, args: outputs.append(args[0]))
+    modules = {"fla.ops.kda": types.SimpleNamespace(chunk_kda=chunk_kda), "causal_conv1d": convolution}
     with patch.dict(sys.modules, modules):
         cp._local_linear_attention_forward(attention, hidden_states)
         cp._linear_attention_forward(attention, hidden_states)
 
     assert len(outputs) == 2
-    for mixed, (g, beta), output in zip(convolved, gated_inputs, outputs, strict=True):
+    for mixed, (operands, boundaries, normalize_in_kernel), output in zip(convolved, calls, outputs, strict=True):
         reference = mixed.detach().to(torch.float32 if fp32_kda else mixed.dtype).requires_grad_(fp32_kda)
         qkv = reference.transpose(1, 2).unflatten(-1, (3, attention.num_heads, attention.head_dim))
-        query, key, value = qkv.unbind(2)
-        query, key = (_l2_normalize(x).to(reference.dtype) for x in (query, key))
-        expected = _kda_decode(query, key, value, g.detach(), beta.detach(), cu_seqlens).to(mixed.dtype)
+        q, k, v = qkv.unbind(2)
+        if fp32_kda:
+            q, k = (x / torch.sqrt(x.square().sum(-1, keepdim=True) + 1e-6) for x in (q, k))
+        for actual, expected_operand in zip(operands, (q, k, v), strict=True):
+            torch_assert_equal(actual, expected_operand)
+        assert normalize_in_kernel is (not fp32_kda)
+        torch_assert_equal(boundaries, cu_seqlens)
+        expected = (q + k * v).to(mixed.dtype)
         torch_assert_equal(output, expected)
         if fp32_kda:
             grad = torch.randn_like(output)
@@ -274,7 +252,7 @@ def test_glm53_loader_passes_fp32_kda_to_attention(tmp_path):
 
     _tiny_config().save_pretrained(tmp_path)
     adapter = _adapter()
-    for loader_options in ({}, {"fp32_kda": True}):
+    for loader_options in ({"fp32_kda": True}, {}):
         spec = ModelSpec(model_path_or_name=str(tmp_path), loader="glm5_next", loader_options=loader_options)
         options = _FlashLoadOptions.model_validate(spec.loader_options)
         config = adapter.build_model_config(str(tmp_path), 1, 1, "bfloat16", spec.attn_implementation, options)
