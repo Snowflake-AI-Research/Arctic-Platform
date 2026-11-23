@@ -609,17 +609,17 @@ def _selection_agreement(
         [
             captured.sum(),
             (captured & (trainer_only + sampler_only > 0)).sum(),
-            trainer_only[captured].sum(),
-            sampler_only[captured].sum(),
+            (trainer_only * captured).sum(),
+            (sampler_only * captured).sum(),
         ]
     )
 
 
 def pop_indexer_selection_agreement(model: nn.Module) -> dict[str, list[int]]:
-    """Each sparse-attention layer's selection agreement summed since the last call, then cleared.
+    """Each replaying indexer's selection agreement summed since the last call, then cleared.
 
     Values are ``_selection_agreement``'s four counts. A forward recomputed for activation checkpointing adds its
-    counts again, so compare ratios across calls, not totals.
+    counts again. Repeating all contributions equally preserves the per-layer ratios.
     """
     agreement = {}
     for name, module in model.named_modules():
@@ -693,7 +693,7 @@ def _sparse_attention_forward(
                 self.indexer.index_kpool,
                 self.indexer.index_topk,
             )
-            previous = self.__dict__.get("_indexer_selection_agreement")
+            previous = getattr(self, "_indexer_selection_agreement", None)
             self._indexer_selection_agreement = agreement if previous is None else previous + agreement
             topk_indices = _replayed_sparse_indices(
                 indexer_pools,

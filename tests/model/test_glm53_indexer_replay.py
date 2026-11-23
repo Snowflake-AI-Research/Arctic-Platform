@@ -194,7 +194,31 @@ def test_trainer_reports_how_far_its_own_selection_is_from_the_samplers():
                 swapped[0][start + t] = {start + p * kpool + o for p in kept for o in range(kpool)}
                 changed += 1
     assert changed > length // 4
-    _attended(model, tokens, positions, boundaries, _capture_of(swapped, text, boundaries, routes, length))
-    first = next(iter(pop_indexer_selection_agreement(model).values()))
-    assert first == [captured, changed, changed, changed]
+    swapped_capture = _capture_of(swapped, text, boundaries, routes, length)
+    model.model.language_model.layers[0].compile(backend="eager")
+    with torch.no_grad():
+        for _ in range(2):
+            model(
+                input_ids=tokens,
+                position_ids=positions,
+                cu_seq_lens_q=boundaries,
+                routed_experts=swapped_capture,
+                use_cache=False,
+            )
+    first = pop_indexer_selection_agreement(model)["model.language_model.layers.0.self_attn"]
+    assert first == [2 * captured, 2 * changed, 2 * changed, 2 * changed]
     assert pop_indexer_selection_agreement(model) == {}
+
+
+def test_selection_agreement_uses_fixed_shape_reductions_on_a_rank_local_capture():
+    from arctic_platform.model.implementations.glm53.context_parallel import _selection_agreement
+
+    # This rank sees positions 6..8 of a packed sequence. Its row starts at 1.
+    boundaries = torch.tensor([0, 1, 9], dtype=torch.int32)
+    own = torch.tensor([[[1, 2, 5, 6, -1], [3, 4, 1, 2, 7], [1, 2, 3, 4, -1]]], dtype=torch.int32)
+    pools = torch.tensor([[[1, 0], [3, 2], [-1, -1]]])
+    args = (pools, own, boundaries)
+    assert _selection_agreement(*args, query_offset=6, kpool=2, topk=4).tolist() == [2, 2, 2, 1]
+    # Meta tensors have no values, so a reduction that needs the number of captured rows will fail here.
+    meta_args = (tensor.to("meta") for tensor in args)
+    assert _selection_agreement(*meta_args, query_offset=6, kpool=2, topk=4).shape == (4,)
