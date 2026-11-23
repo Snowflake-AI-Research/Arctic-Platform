@@ -1167,8 +1167,8 @@ def test_sync_keeps_flashinfer_cutlass_experts_in_up_gate_order(monkeypatch, tmp
     assert result["cached_weight_copies_refreshed"] == int(is_act_and_mul)
 
 
-@pytest.mark.parametrize("written_after_load", [False, True])
-def test_verified_load_accepts_the_cutlass_swap_and_still_reports_other_writes(monkeypatch, written_after_load):
+@pytest.mark.parametrize("other_write", [None, "before_swap", "during_swap"])
+def test_verified_load_accepts_the_cutlass_swap_and_still_reports_other_writes(monkeypatch, other_write):
     from arctic_platform.debug import weight_sync as evidence
 
     backends = _install_cutlass_backend_stubs(monkeypatch)
@@ -1182,15 +1182,25 @@ def test_verified_load_accepts_the_cutlass_swap_and_still_reports_other_writes(m
     model = Model({"experts": _expert_layer(backends.FLASHINFER_CUTLASS, checkpoint)})
     verifier = evidence.ShadowVerifier(model, max_shadow_bytes=1 << 20)
     verifier.load("experts.w13_weight", checkpoint)
-    if written_after_load:
+    if other_write == "before_swap":
         model.experts.w13_weight.data[0, 0, 0] += 1
+    elif other_write == "during_swap":
+        flashinfer_utils = sys.modules["vllm.model_executor.layers.quantization.utils.flashinfer_utils"]
+        swap = flashinfer_utils.swap_w13_to_w31
+
+        def swap_with_extra_write(weight):
+            swapped = swap(weight)
+            swapped[0, 0, 0] += 1
+            return swapped
+
+        monkeypatch.setattr(flashinfer_utils, "swap_w13_to_w31", swap_with_extra_write)
 
     with evidence.maybe_scope_broadcast_verifier(verifier):
         _refresh_cached_weight_copies(model)
 
     record = verifier.finish()
-    assert record["changed_after_verification"] == (["experts.w13_weight"] if written_after_load else [])
-    if not written_after_load:
+    assert record["changed_after_verification"] == (["experts.w13_weight"] if other_write else [])
+    if not other_write:
         assert torch.equal(model.experts.w13_weight, torch.cat([_UP, _GATE], dim=1))
 
 

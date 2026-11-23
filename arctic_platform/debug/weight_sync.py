@@ -76,13 +76,18 @@ def _equal_element_bytes(left, right):
 
 def tensor_manifest(value) -> dict:
     """Hash exact logical tensor bytes without a tensor-sized staging allocation."""
+    return _manifest_from_parts(value, (value,))
+
+
+def _manifest_from_parts(value, parts) -> dict:
     import torch
 
     if value.layout != torch.strided or value.device.type == "meta":
         raise ValueError("weight-sync manifest requires materialized strided tensors")
     digest = hashlib.sha256()
     elements = max(1, _MANIFEST_CHUNK_BYTES // value.element_size())
-    for part in _manifest_chunks(value.detach(), elements):
+    chunks = (chunk for part in parts for chunk in _manifest_chunks(part.detach(), elements))
+    for part in chunks:
         flat = part.contiguous().reshape(-1)
         # A singleton can be contiguous with a nonunit stride, which a dtype view rejects.
         if flat.stride(0) != 1:
@@ -727,18 +732,17 @@ class ShadowVerifier:
         self._offload_pending(replay_staging())
 
     @contextmanager
-    def rewrite(self, name):
-        """Scope the receiver's own in-place rewrite of loaded parameter ``name`` after verification.
-
-        The bytes it rewrites must still be the verified ones; what it leaves becomes the verified digest, so
-        ``finish`` keeps reporting any other change to them.
-        """
+    def observe_cutlass_swap(self, name):
+        """Derive the expected [up, gate] digest from the verified [gate, up] bytes."""
         digests = self.completed.get(self.storage_keys[name], {})
-        if name in digests and tensor_manifest(self.registered[name]) != digests[name]:
-            self.changed.add(name)
-        yield
         if name in digests:
-            digests[name] = tensor_manifest(self.registered[name])
+            value = self.registered[name]
+            if tensor_manifest(value) != digests[name]:
+                self.changed.add(name)
+            # Hash each expert in swapped order without allocating another expert weight.
+            parts = (half for expert in value for half in reversed(expert.chunk(2, dim=-2)))
+            digests[name] = _manifest_from_parts(value, parts)
+        yield
 
     def load(self, name, value, *, loader=None):
         """Debug-only convenience for a live load and its private shadow replay."""
@@ -1474,12 +1478,12 @@ def maybe_scope_broadcast_verifier(verifier):
 
 
 @contextmanager
-def maybe_observe_rewrite(name):
+def maybe_observe_cutlass_swap(name):
     verifier = _BROADCAST_LOAD_VERIFIER.get()
     if verifier is None:
         yield
         return
-    with verifier.rewrite(name):
+    with verifier.observe_cutlass_swap(name):
         yield
 
 

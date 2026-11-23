@@ -38,10 +38,10 @@ from arctic_platform.debug.weight_sync import maybe_current_broadcast_verifier
 from arctic_platform.debug.weight_sync import maybe_lora_built_receiver_result
 from arctic_platform.debug.weight_sync import maybe_observe_broadcast_load
 from arctic_platform.debug.weight_sync import maybe_observe_broadcast_tensor
+from arctic_platform.debug.weight_sync import maybe_observe_cutlass_swap
 from arctic_platform.debug.weight_sync import maybe_observe_fp8_tensor
 from arctic_platform.debug.weight_sync import maybe_observe_fused_expert_loras
 from arctic_platform.debug.weight_sync import maybe_observe_lora_build
-from arctic_platform.debug.weight_sync import maybe_observe_rewrite
 from arctic_platform.debug.weight_sync import maybe_scope_broadcast_verifier
 from arctic_platform.debug.weight_sync import maybe_record_built_lora_factors
 from arctic_platform.debug.weight_sync import maybe_record_lora_remapping
@@ -420,7 +420,7 @@ def _refresh_cached_weight_copies(model) -> int:
                 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import swap_w13_to_w31
 
                 if moe_backend == UnquantizedMoeBackend.FLASHINFER_CUTLASS and module.moe_config.is_act_and_mul:
-                    with maybe_observe_rewrite(f"{name}.w13_weight"):
+                    with maybe_observe_cutlass_swap(f"{name}.w13_weight"):
                         module.w13_weight.copy_(swap_w13_to_w31(module.w13_weight))
                     refreshed += 1
     return refreshed
