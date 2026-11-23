@@ -1,116 +1,78 @@
-import sys
-import types
+"""Interpret vLLM's expansion kernels on CPU with two emission orders for one selection."""
 
 import pytest
 import torch
+from triton.runtime.interpreter import InterpretedFunction
+from vllm.models.glm5next.nvidia import sparse_indexer
+from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer
 
-from arctic_platform.inference.vllm import sparse_topk_order
-
-# GLM-5.3-Flash and Qwen3.8-Flash-Next both select 2048 tokens as 512 groups of 4.
-_POOL = 4
-_GROUPS = 512
-
-
-def _expand_pools_and_append_tail(pool_ids, seq_lens, pool_size):
-    # Torch copy of vLLM 0.32 `_expand_pools_and_append_tail_kernel` (glm5next/nvidia/ops/kpool_compress.py).
-    rows, groups = pool_ids.shape
-    history = (pool_ids.unsqueeze(-1) * pool_size + torch.arange(pool_size)).reshape(rows, groups * pool_size)
-    history = torch.where(pool_ids.repeat_interleave(pool_size, dim=1) >= 0, history, -1)
-    tail_start = seq_lens // pool_size * pool_size
-    offsets = torch.arange(pool_size - 1)
-    tail = torch.where(offsets < (seq_lens - tail_start)[:, None], tail_start[:, None] + offsets, -1)
-    return torch.cat([history, tail], dim=1).to(torch.int32)
+from arctic_platform.inference.vllm.required_patches import apply_required_vllm_patches
 
 
-_QSA_SOURCE = '''
-def _topk(logits, visible_blocks, token_topk, compress_ratio, block_indices, topk_workspace):
-    # Stand-in for cooperative_topk / persistent_topk: the right set, in the order atomic slots hand out.
-    k = token_topk // compress_ratio
-    for row in range(logits.shape[0]):
-        visible = int(visible_blocks[row])
-        if visible <= k:
-            block_indices[row] = torch.where(torch.arange(k) < visible, torch.arange(k), -1)
+def selections():
+    # The long row drops pool 1 of 513; the short row keeps its only complete pool.
+    chosen = torch.cat([torch.tensor([0]), torch.arange(2, 513)])
+    short = torch.full_like(chosen, -1)
+    short[0] = 0
+    for order in (chosen.flip([0]), chosen.roll(1)):
+        yield torch.stack([order, short])
+
+
+def expected_tokens():
+    # Both rows have a partial final pool: two tokens on the long row and one on the short row.
+    return torch.cat([torch.arange(4), torch.arange(8, 2054), torch.tensor([-1])]).int()
+
+
+def interpret(monkeypatch, module, name):
+    monkeypatch.setattr(module, name, InterpretedFunction(getattr(module, name).fn))
+
+
+def test_glm_pool_order(monkeypatch):
+    apply_required_vllm_patches()
+    ops = sparse_indexer.kpool_ops
+    interpret(monkeypatch, ops, "_expand_pools_and_append_tail_kernel")
+    seq_lens = torch.tensor([2054, 5], dtype=torch.int32)
+    short = torch.full((2051,), -1, dtype=torch.int32)
+    short[:4] = torch.arange(4)
+    short[2048] = 4
+    expected = torch.stack([expected_tokens(), short])
+    for selected in selections():
+        torch.testing.assert_close(ops.expand_pools_and_append_tail(selected, seq_lens, 4), expected)
+
+
+@pytest.mark.parametrize("decode", [False, True], ids=["prefill", "decode"])
+def test_qsa_block_order(monkeypatch, decode):
+    apply_required_vllm_patches()
+    ops = qsa_indexer
+    interpret(monkeypatch, ops, "_expand_qsa_indices_kernel")
+    score_kernel = ops._qsa_mqa_paged_uniform_kernel if decode else ops._qsa_mqa_paged_prefill_kernel
+    monkeypatch.setattr(score_kernel, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ops.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 1)
+    monkeypatch.setattr(ops.current_platform, "has_device_capability", lambda cap: decode)
+    monkeypatch.setattr(ops.current_platform, "is_device_capability_family", lambda cap: False)
+    orders = selections()
+
+    def emit(logits, lengths, dst, workspace, k, width):
+        dst.copy_(next(orders))
+
+    monkeypatch.setattr(torch.ops._C, "cooperative_topk" if decode else "persistent_topk", emit, raising=False)
+    positions = torch.tensor([2053, 4], dtype=torch.int32)
+    visible = (positions + 1) // 4
+    q = torch.empty(2, 1, 64)
+    cache = torch.empty(33, 16, 1, 64)
+    pages = torch.arange(33, dtype=torch.int32).expand(2, -1)
+    backing = torch.full((4, 512), -99, dtype=torch.int32)
+    blocks = backing[1:3]
+    out = torch.empty(2, 2052, dtype=torch.int32)
+    short = torch.full((2051,), -1, dtype=torch.int32)
+    short[:5] = torch.arange(5)
+    for _ in range(2):
+        if decode:
+            ops.qsa_select_paged_decode(q, cache, pages, visible, 2048, 4, 1, blocks)
         else:
-            chosen = logits[row, :visible].topk(k).indices
-            block_indices[row] = chosen[torch.randperm(k, generator=topk_workspace)]
-
-
-def qsa_select(logits, visible_blocks, token_topk, compress_ratio, block_indices, generator):
-    # Like qsa_select_paged_decode / _prefill: resolves `_topk` through the module globals.
-    _topk(logits, visible_blocks, token_topk, compress_ratio, block_indices, generator)
-'''
-
-
-@pytest.fixture
-def vllm_ops(monkeypatch):
-    """Stub vLLM leaf modules the patch imports, without vLLM or a GPU."""
-    kpool = types.ModuleType("kpool_compress")
-    kpool.expand_pools_and_append_tail = _expand_pools_and_append_tail
-    qsa = types.ModuleType("qsa_indexer")
-    qsa.torch = torch
-    exec(_QSA_SOURCE, qsa.__dict__)
-    made = {}
-    for name, leaf in {
-        "vllm.models.glm5next.nvidia.ops.kpool_compress": kpool,
-        "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer": qsa,
-    }.items():
-        parts = name.split(".")
-        for i in range(1, len(parts) + 1):
-            prefix = ".".join(parts[:i])
-            if prefix not in made:
-                made[prefix] = leaf if i == len(parts) else types.ModuleType(prefix)
-                monkeypatch.setitem(sys.modules, prefix, made[prefix])
-            if i > 1:
-                setattr(made[".".join(parts[: i - 1])], parts[i - 1], made[prefix])
-    monkeypatch.setattr(sparse_topk_order, "_PATCHED", False)
-    sparse_topk_order.apply_sparse_topk_order_fix()
-    return kpool, qsa
-
-
-def _assert_sorted_rows(ids):
-    for row in ids.tolist():
-        valid = [i for i in row if i >= 0]
-        assert valid == sorted(valid), "selected ids are not ascending"
-
-
-def test_glm_pool_order_no_longer_depends_on_topk_slot_order(vllm_ops):
-    kpool, _ = vllm_ops
-    seq_lens = torch.tensor([4099, 1003], dtype=torch.int32)  # 1024 pools (sparse) and 250 pools (dense)
-    scores = torch.randn(1024, generator=torch.Generator().manual_seed(0))
-    chosen = scores.topk(_GROUPS).indices
-    dense = torch.where(torch.arange(_GROUPS) < 250, torch.arange(_GROUPS), -1)  # vLLM's ordered short-row path
-    runs = []
-    for seed in (1, 2):
-        order = torch.randperm(_GROUPS, generator=torch.Generator().manual_seed(seed))
-        pool_ids = torch.stack([chosen[order], dense]).to(torch.int64)
-        runs.append((pool_ids, kpool.expand_pools_and_append_tail(pool_ids, seq_lens, _POOL)))
-
-    (ids_a, out_a), (ids_b, out_b) = runs
-    assert not torch.equal(ids_a, ids_b)
-    assert torch.equal(out_a, out_b), "same selected set, different key order handed to attention"
-    _assert_sorted_rows(out_a)
-    unpatched = _expand_pools_and_append_tail(ids_a, seq_lens, _POOL)
-    for row in range(2):
-        assert sorted(out_a[row].tolist()) == sorted(unpatched[row].tolist())
-    assert torch.equal(out_a[1], unpatched[1]), "an already ordered dense row must not change"
-
-
-def test_qsa_block_order_no_longer_depends_on_topk_slot_order(vllm_ops):
-    _, qsa = vllm_ops
-    visible = torch.tensor([1024, 300, 513], dtype=torch.int32)
-    logits = torch.randn(3, 1024, generator=torch.Generator().manual_seed(0))
-    runs = []
-    for seed in (1, 2):
-        backing = torch.empty(5, _GROUPS, dtype=torch.int32)
-        qsa.qsa_select(logits, visible, _GROUPS * _POOL, _POOL, backing[1:4], torch.Generator().manual_seed(seed))
-        runs.append(backing[1:4])
-
-    assert torch.equal(runs[0], runs[1]), "same selected set, different key order handed to attention"
-    _assert_sorted_rows(runs[0])
-    for row in range(3):
-        n_valid = min(int(visible[row]), _GROUPS)
-        assert bool((runs[0][row, :n_valid] >= 0).all()), "valid ids must lead: the expand kernel reads that prefix"
-        assert bool((runs[0][row, n_valid:] == -1).all())
-        visible_logits = logits[row, : int(visible[row])]
-        expected = torch.arange(n_valid) if n_valid < _GROUPS else visible_logits.topk(_GROUPS).indices
-        assert set(runs[0][row, :n_valid].tolist()) == set(expected.tolist())
+            starts = torch.tensor([0, 1, 2], dtype=torch.int32)
+            ops.qsa_select_paged_prefill(q, cache, pages, starts, visible, 2048, 4, 1, blocks, 2054)
+        ops.expand_qsa_block_indices(blocks, positions, visible, 4, 2048, out)
+        torch.testing.assert_close(out[:, :-1], torch.stack([expected_tokens(), short]))
+        torch.testing.assert_close(out[:, -1], torch.tensor([2050, 5], dtype=torch.int32))
+        assert (backing[[0, 3]] == -99).all()

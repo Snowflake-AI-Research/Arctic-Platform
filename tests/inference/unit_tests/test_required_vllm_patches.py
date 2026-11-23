@@ -2,13 +2,13 @@ from arctic_platform.inference.vllm import config
 from arctic_platform.inference.vllm import deepseek_v41_lora
 from arctic_platform.inference.vllm import dense_prompt_logprobs
 from arctic_platform.inference.vllm import glm5next_lora
-from arctic_platform.inference.vllm import sparse_topk_order
 from arctic_platform.inference.vllm import hybrid_state_fixes
 from arctic_platform.inference.vllm import kv_group_size
 from arctic_platform.inference.vllm import mamba_completion_refresh
 from arctic_platform.inference.vllm import mrope_yarn
 from arctic_platform.inference.vllm import required_patches
 from arctic_platform.inference.vllm import router_replay
+from arctic_platform.inference.vllm import sparse_topk_order
 from arctic_platform.inference.vllm import spec_decode_grammar
 from arctic_platform.inference.vllm import tp_spec_decode_sync
 from arctic_platform.inference.vllm import xgrammar_stop_mask
@@ -46,7 +46,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "ensure_tp_spec_decode_sync",
         lambda: calls.append("tp_spec_decode_sync"),
     )
-    monkeypatch.setattr(sparse_topk_order, "apply_sparse_topk_order_fix", lambda: calls.append("sparse_topk_order"))
+    monkeypatch.setattr(
+        sparse_topk_order,
+        "apply_sparse_topk_order_fix",
+        lambda: calls.append("sparse_topk_order"),
+    )
     monkeypatch.setattr(
         config,
         "ensure_dflash_max_position_patch",
