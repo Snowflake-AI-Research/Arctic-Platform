@@ -8,6 +8,7 @@ vLLM patch stack so weight sync and router replay can run with
 from __future__ import annotations
 
 import os
+from copy import copy
 
 from arctic_platform.inference.utils import require_supported_vllm_version
 
@@ -109,14 +110,12 @@ def patch_aux_output_allow_dcp() -> None:
     if getattr(original, "_arctic_allow_dcp", False):
         return
 
-    def verify_aux_output_compatibility(self) -> None:
-        parallel_config = self.parallel_config
-        dcp = parallel_config.decode_context_parallel_size
-        parallel_config.decode_context_parallel_size = 1
-        try:
-            original(self)
-        finally:
-            parallel_config.decode_context_parallel_size = dcp
+    def verify_aux_output_compatibility(config: VllmConfig) -> None:
+        if config.aux_output_config.enabled and config.parallel_config.decode_context_parallel_size > 1:
+            config = copy(config)
+            config.parallel_config = copy(config.parallel_config)
+            config.parallel_config.decode_context_parallel_size = 1
+        original(config)
 
     verify_aux_output_compatibility._arctic_allow_dcp = True
     VllmConfig._verify_aux_output_compatibility = verify_aux_output_compatibility
