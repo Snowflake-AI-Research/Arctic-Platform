@@ -200,7 +200,7 @@ class _ToyEngine:
     token-budget scheduler, per-row capture (uint16, as for more than 256 experts), and numerics that differ between
     decode and prefill and with the request's length."""
 
-    def __init__(self, **parallel):
+    def __init__(self, replay_window=0, external_kv=False, **parallel):
         gen = torch.Generator().manual_seed(0)
         self.logits = torch.randn(L, 64, E, generator=gen)  # by layer and position
         self.decode_shift = 0.5 * torch.randn(L, 64, E, generator=gen)  # a decoded position routes on other numerics
@@ -208,6 +208,8 @@ class _ToyEngine:
         self.routers, self.plain = [_router(bias) for _ in range(L)], [_router(bias) for _ in range(L)]
         self.runner = _V2Runner(torch.nn.ModuleList(_MoERunner(i, r) for i, r in enumerate(self.routers)), **parallel)
         self.runner.initialize_kv_cache()
+        self.replay_window = replay_window
+        self.runner.vllm_config.kv_transfer_config = SimpleNamespace() if external_kv else None
         self.captured = [None] * L
         for i, router in enumerate(self.routers):
             router.set_capture_fn(partial(self.captured.__setitem__, i))
@@ -221,7 +223,7 @@ class _ToyEngine:
         self.params.append(params)
         prompt = prompt_input["prompt_token_ids"]
         hit, source = 0, None
-        for tokens, routes in self.cache:
+        for tokens, routes in (() if params.skip_reading_prefix_cache else self.cache):
             common = next((i for i, (a, b) in enumerate(zip(prompt, tokens[: len(routes)])) if a != b), len(routes))
             cached = max(min(common, len(prompt) - 1) // B - (BLOCKS - 1), 0) * B
             if cached > hit:
@@ -229,7 +231,7 @@ class _ToyEngine:
         request = SimpleNamespace(id=request_id, params=params, prompt=prompt, hit=hit, done=asyncio.Future(),
                                   used=np.zeros((len(prompt) + params.max_tokens - 1, L, K), np.uint8), out=[])
         request.used[:hit] = source[:hit] if hit else 0
-        request.computed = hit
+        request.computed = max(0, hit - self.replay_window)
         request.prefill_shift = 0.5 * torch.randn(L, 64, E, generator=torch.Generator().manual_seed(len(prompt)))
         self.requests.append(request)
         self.submitted += 1
@@ -306,7 +308,8 @@ def _two_turns(engine, between=None):
     spec = SimpleNamespace(use_eagle_block_drop=lambda: BLOCKS == 2)
     engine.runner.vllm_config.speculative_config = spec
     # The scheduler's hit alignment, which only the engine workers know (the front end sees the smallest group).
-    engine.runner.kv_cache_config = SimpleNamespace(cache_hit_alignment_tokens=B)
+    group = SimpleNamespace(kv_cache_spec=SimpleNamespace(prefix_replay_tokens=engine.replay_window))
+    engine.runner.kv_cache_config = SimpleNamespace(cache_hit_alignment_tokens=B, kv_cache_groups=[group])
 
     async def collective_rpc(method):
         return [getattr(forced_routes, method)(SimpleNamespace(model_runner=engine.runner))]
@@ -372,6 +375,21 @@ def test_a_continuation_recomputes_the_tail_of_its_previous_capture_under_the_st
 def _recomputed_unlike_storage(ran, returned, tails):
     return sorted((name, p) for name, (prev, positions) in tails.items() for p in positions
                   if (ran[name].used[p] != returned[prev][p]).any())
+
+
+@pytest.mark.parametrize(("dp", "external_kv", "ranges"), [
+    (1, False, [[], []]),
+    (2, False, [[[2, 10]], [[6, 12]]]),
+    (2, True, [None, None]),
+])
+def test_cache_hit_precedes_the_schedulers_window_rewind(dp, external_kv, ranges):
+    engine = _ToyEngine(replay_window=2, external_kv=external_kv, data_parallel_size=dp)
+    returned, ran, markers = _two_turns(engine)
+    assert [ran[name].hit for name in ("a2", "b2")] == [4, 8]
+    assert [markers[name]["rerouted_ranges"] for name in ("a2", "b2")] == ranges
+    assert markers["c"]["rerouted_ranges"] == []
+    rewound = {"a2": ("a1", range(2, 4)), "b2": ("b1", range(6, 8))}
+    assert bool(_recomputed_unlike_storage(ran, returned, rewound)) == (dp > 1)
 
 
 def test_after_a_prefix_cache_reset_a_continuation_recomputes_its_whole_capture_under_the_stored_routes():

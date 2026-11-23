@@ -1,4 +1,5 @@
 import asyncio
+import weakref
 from types import SimpleNamespace
 
 import numpy as np
@@ -234,6 +235,101 @@ def test_a_request_naming_its_previous_capture_keeps_those_routes_on_the_positio
     prefix_only = dict(max_tokens=1, extra_args=dict(dss_router_replay_prefix_id="rr1:turn-2"))
     with pytest.raises(ValueError, match="dss_router_replay_prefix_id requires dss_router_replay_id"):
         asyncio.run(worker.generate([1], prefix_only))
+
+
+def _continuation_worker():
+    worker = InferenceWorker.__ray_metadata__.modified_class()
+    worker.state = WorkerLifecycleState.READY
+    worker._router_replay_tx = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=1 << 20)
+    worker._forced_route_blocks = (2, 2)
+    forwards = []
+
+    async def generate(prefix=None, before_reply=None, **sampling):
+        prompt = list(range(4 if prefix is None else 5))
+
+        async def engine_reply(_prompt, params, _id, **kwargs):
+            rows = np.arange(len(prompt), dtype=np.uint8).reshape(-1, 1, 1)
+            if prefix is not None:
+                rows += 10  # Cold prefill chooses different experts from the parent.
+                forced = (params.extra_args or {}).get(FORCED_ROUTES_KEY)
+                if forced:
+                    stored = np.frombuffer(forced["rows"], dtype=forced["dtype"]).reshape(-1, 1, 1)
+                    rows[forced["start"] : forced["start"] + len(stored)] = stored
+            forwards.append(rows)
+            choice = SimpleNamespace(text="", token_ids=[5], finish_reason="length", logprobs=None)
+            if before_reply:
+                await before_reply()
+            return SimpleNamespace(outputs=[choice], prompt_token_ids=prompt, num_cached_tokens=0,
+                                   prompt_logprobs=None, routed_experts=rows)
+
+        worker._generate_once = engine_reply
+        key = "parent" if prefix is None else "rr1:child"
+        params = dict(max_tokens=1, dss_sample_id=key, dss_router_replay_id=key,
+                      extra_args={} if prefix is None else {"dss_router_replay_prefix_id": prefix}, **sampling)
+        return (await worker.generate(prompt, params))["router_replay"]
+
+    return worker, generate, forwards
+
+
+def test_prompt_logprobs_that_require_a_cold_prefill_use_all_parent_rows():
+    async def run():
+        _, generate, forwards = _continuation_worker()
+        await generate()
+        marker = await generate("parent", prompt_logprobs=0)
+        assert np.array_equal(forwards[0], forwards[1][:4])
+        assert marker["rerouted_ranges"] == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("late_parent", [False, True], ids=["during-reset-rpc", "late-parent-reply"])
+def test_reset_overlapping_generation_replays_every_stored_row(late_parent):
+    async def run():
+        worker, generate, forwards = _continuation_worker()
+        cleared, reply = asyncio.Event(), asyncio.Event()
+
+        async def reset():
+            cleared.set()
+            await reply.wait()
+            return True
+
+        worker.llm = SimpleNamespace(reset_prefix_cache=reset)
+        if late_parent:
+            reply.set()
+            await generate(before_reply=worker.reset_prefix_cache)
+            marker = await generate("parent")
+        else:
+            await generate()
+            resetting = asyncio.create_task(worker.reset_prefix_cache())
+            await cleared.wait()
+            child = asyncio.create_task(generate("parent"))
+            await asyncio.sleep(0)  # Admit the continuation before acknowledging the cache clear.
+            reply.set()
+            await resetting
+            marker = await child
+        assert np.array_equal(forwards[0], forwards[1][:4])
+        return marker
+
+    marker = asyncio.run(run())
+    assert marker["prefix_len"] == 4 and marker["rerouted_ranges"] == []
+
+
+def test_a_parent_discarded_during_its_continuation_is_not_held_and_not_spliced():
+    async def run():
+        worker, generate, forwards = _continuation_worker()
+        await generate()
+        cache = worker._router_replay_tx
+        parent = weakref.ref(cache.get("parent"))
+
+        async def change_parent():
+            cache.discard(["parent"])
+            assert parent() is None  # nothing but the cache held the parent while the child ran
+
+        marker = await generate("parent", before_reply=change_parent)
+        assert marker["prefix_len"] == 0
+        assert np.array_equal(cache.get("rr1:child").numpy(), forwards[1])
+
+    asyncio.run(run())
 
 
 def test_router_replay_cache_device_is_popped_and_validated_before_engine_start():

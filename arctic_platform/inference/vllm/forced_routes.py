@@ -198,15 +198,21 @@ def patch_model_runner(runner_cls: Any) -> None:
     runner_cls.prepare_inputs = prepare_inputs
 
 
-def forced_route_blocks(worker: Any) -> tuple[int, int] | str:
-    """Report the engine core's resolved cache-hit geometry, or why this worker cannot force routes."""
+def forced_route_blocks(worker: Any) -> tuple[tuple[int, int] | str, int | None]:
+    """Return the bounded-send geometry or unsupported reason, and the known local rewind from the reported hit."""
     runner = worker.model_runner
-    reason = getattr(runner, "_forced_routes_unsupported", "this runner has no routed-experts capture hook")
+    if not hasattr(runner, "_forced_routes_unsupported"):
+        return "this runner has no routed-experts capture hook", None
+    window = max((g.kv_cache_spec.prefix_replay_tokens for g in runner.kv_cache_config.kv_cache_groups), default=0)
+    # A connector can restore the window or retry a failed load; the reported hit precedes either decision.
+    local_window = window if runner.vllm_config.kv_transfer_config is None else None
+    reason = runner._forced_routes_unsupported
     if reason is not None:
-        return reason
+        return reason, local_window
+    alignment = runner.kv_cache_config.cache_hit_alignment_tokens
     spec = runner.vllm_config.speculative_config
     blocks = 2 if spec is not None and spec.use_eagle_block_drop() else 1
-    return runner.kv_cache_config.cache_hit_alignment_tokens, blocks
+    return (alignment, blocks + (window + alignment - 1) // alignment), local_window
 
 
 def ensure_forced_routes_patch() -> None:

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from enum import Enum
 from typing import Any
@@ -654,6 +655,7 @@ def _result_from_output(
     replica_label: str | None = None,
     return_back_router_info: bool = False,
     forced_route_start: int | None = None,
+    prefix_replay_window: int | None = 0,
 ) -> dict[str, Any]:
     if not final_output or not final_output.outputs:
         return {
@@ -723,6 +725,10 @@ def _result_from_output(
         replica_label=replica_label,
         return_back_router_info=return_back_router_info,
         forced_route_start=forced_route_start,
+        prefill_start=(
+            max(0, int(num_cached) - prefix_replay_window)
+            if num_cached is not None and prefix_replay_window is not None else None
+        ),
     )
     return result
 
@@ -749,6 +755,7 @@ def _maybe_cache_routed_experts(
     replica_label: str | None,
     return_back_router_info: bool,
     forced_route_start: int | None = None,
+    prefill_start: int | None,
 ) -> None:
     if cache_tx is None or sample_id is None:
         return
@@ -788,10 +795,14 @@ def _maybe_cache_routed_experts(
 
             prefix_len = int(prefix.shape[0])
             routed = torch.cat([prefix, torch.as_tensor(routed[prefix_len:]).to(prefix.device, prefix.dtype)])
-    # Spliced positions the engine recomputed without the stored ids (a hit below the rows it was sent): later tokens
-    # read state the record does not describe there.
-    hit = int(result["prefix_cache_len"])
+    # Spliced positions the engine recomputed without the stored ids (its first prefill started below the rows it was
+    # sent): later tokens read state the record does not describe there. None when that start is unknown (a KV connector).
     rerouted_end = prefix_len if forced_route_start is None else min(forced_route_start, prefix_len)
+    rerouted_ranges = []
+    if rerouted_end and prefill_start is None:
+        rerouted_ranges = None
+    elif prefill_start is not None and prefill_start < rerouted_end:
+        rerouted_ranges = [[prefill_start, rerouted_end]]
     # A preempted request re-executes its own positions afresh, and vLLM keeps the routes it already emitted.
     stats = getattr(final_output, "metrics", None)  # None when the engine logs no request stats
     cache_key = replay_id or sample_id
@@ -809,7 +820,7 @@ def _maybe_cache_routed_experts(
         "generation_len": generation_len,
         "capture_len": capture_len,
         "prefix_len": prefix_len,
-        "rerouted_ranges": [[hit, rerouted_end]] if hit < rerouted_end else [],
+        "rerouted_ranges": rerouted_ranges,
         "preemptions": None if stats is None else stats.num_preemptions,
     }
     if return_back_router_info:
@@ -906,6 +917,9 @@ def _ensure_actor_logging(level: int = logging.INFO) -> str:
 class InferenceWorker(StreamingWorkerMixin):
     """Ray actor that hosts an in-process vLLM AsyncLLM engine."""
 
+    _prefix_replay_window: int | None = 0
+    _prefix_cache_generation = 0
+
     def __init__(self) -> None:
         # First, so that everything below is loggable.  Reported rather than
         # assumed: a StreamHandler here reaches Ray's worker log, which is not
@@ -920,8 +934,8 @@ class InferenceWorker(StreamingWorkerMixin):
         self._chat_model: ChatModel | None = None
         self._router_replay_tx: Any = None
         self._forced_route_blocks: tuple[int, int] | None = None
-        # time.monotonic() after the last call that may have emptied the engine's prefix cache.
-        self._prefix_cache_reset_at = 0.0
+        self._cold_captures: set[str] = set()
+        self._prefix_cache_resets_in_flight = 0
         self._router_replay_tx_on_host = False
         self._router_replay_staging_bytes: int | None = None
         self._router_replay_group: Any = None
@@ -1304,8 +1318,9 @@ class InferenceWorker(StreamingWorkerMixin):
 
     async def _init_forced_routes(self) -> None:
         workers = await self.llm.collective_rpc("forced_route_blocks")
-        reasons = {result for result in workers if isinstance(result, str)}
-        self._forced_route_blocks = None if reasons else tuple(workers[0])
+        reasons = {geometry for geometry, _ in workers if isinstance(geometry, str)}
+        geometry, self._prefix_replay_window = workers[0]
+        self._forced_route_blocks = None if reasons else tuple(geometry)
         if reasons:
             logger.warning(
                 "Router replay: re-prefilled prefix positions keep the engine's own routes, as before, because %s",
@@ -1427,6 +1442,22 @@ class InferenceWorker(StreamingWorkerMixin):
             grammar_stop_token_ids=grammar_stop_token_ids,
         )
 
+    def _send_forced_routes(self, prefix_id: str | None, params: Any) -> int | None:
+        """Attach the named capture's rows this request may recompute; return the first row sent, or None."""
+        if prefix_id is None or self._forced_route_blocks is None:
+            return None
+        try:  # the splice reads the capture again at completion, so nothing holds it while the request runs
+            prefix = self._router_replay_tx.get(prefix_id)
+        except KeyError:  # another replica served the earlier request, or the cache evicted it
+            return None
+        # No KV of the capture is left to hit after a reset that overlapped or followed its request.
+        cold = self._prefix_cache_resets_in_flight or prefix_id in self._cold_captures
+        forced = _forced_route_rows(prefix, *self._forced_route_blocks, whole=cold or params.skip_reading_prefix_cache)
+        if forced is None:
+            return None
+        params.extra_args = {**(params.extra_args or {}), FORCED_ROUTES_KEY: forced}
+        return forced["start"]
+
     async def generate(self, prompt: Any, sampling_params: dict[str, Any]) -> dict[str, Any]:
         """Generate for one prompt: text, ``list[int]``, or a 1-D integer CPU tensor of token ids."""
         if self.state != WorkerLifecycleState.READY:
@@ -1469,18 +1500,6 @@ class InferenceWorker(StreamingWorkerMixin):
             raise ValueError(f"{_REPLAY_ID_PARAM_KEY} requires {_SAMPLE_ID_PARAM_KEY}")
         if prefix_replay_id is not None and replay_id is None:
             raise ValueError(f"{_REPLAY_PREFIX_ID_PARAM_KEY} requires {_REPLAY_ID_PARAM_KEY}")
-        forced = None
-        if prefix_replay_id is not None and self._forced_route_blocks is not None:
-            # The splice reads the capture again at completion, so nothing holds it while the request runs.
-            try:
-                prefix = self._router_replay_tx.get(prefix_replay_id)
-                # A reset since the capture was stored left none of its KV to hit: every stored row may be recomputed.
-                whole = self._router_replay_tx.created_at(prefix_replay_id) < self._prefix_cache_reset_at
-                forced = _forced_route_rows(prefix, *self._forced_route_blocks, whole)
-            except KeyError:  # another replica served the earlier request, or the cache evicted it
-                pass
-            if forced is not None:
-                sampling_params["extra_args"] = {**sampling_params.get("extra_args", {}), FORCED_ROUTES_KEY: forced}
         return_back_router_info = bool(
             sampling_params.pop(_ROUTER_REPLAY_RETURN_INFO_PARAM_KEY, False)
         )
@@ -1502,6 +1521,8 @@ class InferenceWorker(StreamingWorkerMixin):
         _stage_dense_prompt_logprobs(sampling_params)
         _coerce_structured_outputs_params(sampling_params)
         params = SamplingParams(**sampling_params)
+        generation = self._prefix_cache_generation
+        forced_start = self._send_forced_routes(prefix_replay_id, params)
         request_id = str(uuid4())
         effective_prompt, prompt_token_ids, reasoning_ended = self._prefill_think_for_generation(
             prompt,
@@ -1530,8 +1551,15 @@ class InferenceWorker(StreamingWorkerMixin):
             request_id=request_id,
             replica_label=self._replica_label,
             return_back_router_info=return_back_router_info,
-            forced_route_start=None if forced is None else forced["start"],
+            forced_route_start=forced_start,
+            prefix_replay_window=self._prefix_replay_window,
         )
+        if marker := result.get(_ROUTER_REPLAY_MARKER_KEY):
+            # The engine can finish before a reset and deliver the capture after it.
+            if generation == self._prefix_cache_generation:
+                self._cold_captures.discard(marker["replay_id"])
+            else:
+                self._cold_captures.add(marker["replay_id"])
         if self._return_reasoning_content:
             self._apply_reasoning_parser(result, reasoning_ended=reasoning_ended)
         if return_action_masks:
@@ -1684,6 +1712,18 @@ class InferenceWorker(StreamingWorkerMixin):
     # Sleep / Wake
     # ------------------------------------------------------------------
 
+    @contextmanager
+    def _invalidating_prefix_cache(self):
+        """Every capture held, or whose request overlaps the call, has no KV left to hit afterwards."""
+        self._prefix_cache_resets_in_flight += 1
+        try:
+            yield
+        finally:
+            self._prefix_cache_resets_in_flight -= 1
+            self._prefix_cache_generation += 1
+            tx = self._router_replay_tx
+            self._cold_captures = set(tx.held_sample_ids()) if tx is not None else set()
+
     @stream_lifecycle_change
     async def sleep(self, level: int = 1) -> dict[str, Any]:
         """Free GPU memory by offloading weights and/or KV cache.
@@ -1696,8 +1736,8 @@ class InferenceWorker(StreamingWorkerMixin):
             WorkerLifecycleState.WEIGHTS_READY,
         ):
             raise RuntimeError(f"Cannot sleep: worker state is {self.state.value}")
-        await self.llm.collective_rpc("sleep", kwargs={"level": level})
-        self._prefix_cache_reset_at = time.monotonic()
+        with self._invalidating_prefix_cache():
+            await self.llm.collective_rpc("sleep", kwargs={"level": level})
         self.state = WorkerLifecycleState.SLEEPING
         logger.info("Worker %d sleeping (level=%d)", os.getpid(), level)
         return {"status": "sleeping", "level": level}
@@ -1780,9 +1820,8 @@ class InferenceWorker(StreamingWorkerMixin):
             raise ValueError(f"Unknown pause_generation mode: {mode!r}. Use: keep, abort")
         if self.state != WorkerLifecycleState.READY or self.llm is None:
             return {"status": "skipped", "reason": f"state={self.state.value}"}
-        await self.llm.pause_generation(mode=mode, clear_cache=clear_cache)
-        if clear_cache:
-            self._prefix_cache_reset_at = time.monotonic()
+        with self._invalidating_prefix_cache() if clear_cache else nullcontext():
+            await self.llm.pause_generation(mode=mode, clear_cache=clear_cache)
         self._stream_engine_paused = True
         logger.info(
             "Worker %d pause_generation(mode=%s, clear_cache=%s)",
@@ -1827,8 +1866,8 @@ class InferenceWorker(StreamingWorkerMixin):
         attempts = 0
         while True:
             attempts += 1
-            reset_ok = bool(await self.llm.reset_prefix_cache())
-            self._prefix_cache_reset_at = time.monotonic()
+            with self._invalidating_prefix_cache():
+                reset_ok = bool(await self.llm.reset_prefix_cache())
             logger.info(
                 "Worker %d reset prefix cache: ok=%s attempts=%d",
                 os.getpid(),
