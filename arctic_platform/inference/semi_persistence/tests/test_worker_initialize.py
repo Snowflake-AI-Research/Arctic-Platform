@@ -127,6 +127,8 @@ def env(monkeypatch):
         "arctic_platform.inference.vllm.dense_prompt_logprobs": _module(
             "dense", RESULT_KEY="dense", stage_sampling_params=noop,
             take_dense=noop),
+        "arctic_platform.inference.vllm.router_replay": _module(
+            "router_replay", FORCED_ROUTES_KEY="forced_routes"),
         "arctic_platform.inference.vllm.spec_decode_grammar": _module(
             "spec", ensure_spec_decode_grammar_fix=noop),
         "arctic_platform.inference.vllm.startup_error": _module(
