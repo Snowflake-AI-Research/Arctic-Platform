@@ -32,6 +32,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         lambda: calls.append("dense_prompt_logprobs"),
     )
     monkeypatch.setattr(
+        flashmla_sparse_dcp,
+        "ensure_flashmla_sparse_bf16_dcp",
+        lambda: calls.append("flashmla_sparse_bf16_dcp"),
+    )
+    monkeypatch.setattr(
         spec_decode_grammar,
         "ensure_spec_decode_grammar_fix",
         lambda: calls.append("spec_decode_grammar"),
@@ -73,11 +78,6 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "ensure_deepseek_v41_lora",
         lambda: calls.append("deepseek_v41_lora"),
     )
-    monkeypatch.setattr(
-        flashmla_sparse_dcp,
-        "ensure_flashmla_sparse_bf16_dcp",
-        lambda: calls.append("flashmla_sparse_bf16_dcp"),
-    )
 
     required_patches.apply_required_vllm_patches()
 
@@ -85,6 +85,7 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "router",
         "xgrammar",
         "dense_prompt_logprobs",
+        "flashmla_sparse_bf16_dcp",
         "spec_decode_grammar",
         "hybrid_state",
         "tp_spec_decode_sync",
@@ -94,5 +95,4 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "mrope_yarn",
         "mamba_completion_refresh",
         "deepseek_v41_lora",
-        "flashmla_sparse_bf16_dcp",
     ]
