@@ -32,6 +32,7 @@ def apply_required_vllm_patches() -> None:
     from arctic_platform.inference.vllm.xgrammar_stop_mask import ensure_xgrammar_stop_mask_fix
 
     ensure_router_replay_vllm_patches()
+    ensure_decoded_tail_prefix_hit()
     ensure_xgrammar_stop_mask_fix()
     ensure_dense_prompt_logprobs_patch()
     ensure_spec_decode_grammar_fix()
@@ -43,4 +44,3 @@ def apply_required_vllm_patches() -> None:
     ensure_mrope_yarn_fix()
     ensure_mamba_completion_refresh()
     ensure_deepseek_v41_lora()
-    ensure_decoded_tail_prefix_hit()

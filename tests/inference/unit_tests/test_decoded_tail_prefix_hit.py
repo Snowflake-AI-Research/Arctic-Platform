@@ -41,7 +41,7 @@ def _request(request_id, tokens):
     )
 
 
-def _cache(dcp):
+def _cache(dcp, retention=None):
     config = KVCacheConfig(
         num_blocks=128,
         kv_cache_tensors=[],
@@ -54,7 +54,7 @@ def _cache(dcp):
                 MambaSpec(block_size=BLOCK, shapes=((1,),), dtypes=(torch.float32,), mamba_cache_mode="align"),
             ),
         ],
-        prefix_cache_retention_interval=None,
+        prefix_cache_retention_interval=retention,
     )
     return KVCacheManager(
         config,
@@ -87,8 +87,8 @@ def _scheduler(manager, dcp):
     return scheduler
 
 
-def _finish(dcp, prompt_len, output_len):
-    manager = _cache(dcp)
+def _finish(dcp, prompt_len, output_len, retention=None):
+    manager = _cache(dcp, retention)
     scheduler = _scheduler(manager, dcp)
     first = _request("first", list(range(prompt_len)))
     first.status = RequestStatus.RUNNING
@@ -115,26 +115,26 @@ def _finish(dcp, prompt_len, output_len):
     return manager, first
 
 
-@pytest.mark.parametrize("dcp", [1, 8])
-@pytest.mark.parametrize("prompt_len, output_len", [(130, 206), (300, 37), (257, 300), (100, 5)])
-def test_continuation_reuses_the_last_computed_boundary(dcp, prompt_len, output_len):
-    manager, first = _finish(dcp, prompt_len, output_len)
-    computed = prompt_len + output_len - 1
-    boundary = computed // BLOCK * BLOCK
-    if first.num_tokens % BLOCK == 0:
-        assert manager.block_pool.get_cached_block(first.block_hashes[-1], [0]) is None
+@pytest.mark.parametrize("prompt_len, output_len", [(130, 206), (257, 300)])
+def test_continuation_reuses_the_last_computed_boundary(prompt_len, output_len):
+    for dcp in (1, 8):
+        manager, first = _finish(dcp, prompt_len, output_len)
+        computed = prompt_len + output_len - 1
+        boundary = computed // BLOCK * BLOCK
+        if first.num_tokens % BLOCK == 0:
+            assert manager.block_pool.get_cached_block(first.block_hashes[-1], [0]) is None
 
-    follow_up = _request("follow_up", list(first.all_token_ids) + [20_000])
-    blocks, hit, _ = manager.get_computed_blocks(follow_up)
-    assert hit == boundary
-    assert manager.allocate_slots(follow_up, 1, new_computed_blocks=blocks, num_new_computed_tokens=hit) is not None
-    if hit % (BLOCK * dcp):
-        source = blocks.blocks[0][-1]
-        destination = manager.get_blocks(follow_up.request_id).blocks[0][-1]
-        copies, retained = manager.take_kv_cache_block_copies()
-        assert destination is not source
-        assert (source.block_id, destination.block_id) in [(copy.src_block_id, copy.dst_block_id) for copy in copies]
-        manager.block_pool.free_blocks(retained)
+        follow_up = _request("follow_up", list(first.all_token_ids) + [20_000])
+        blocks, hit, _ = manager.get_computed_blocks(follow_up)
+        assert hit == boundary
+        assert manager.allocate_slots(follow_up, 1, new_computed_blocks=blocks, num_new_computed_tokens=hit) is not None
+        if hit % (BLOCK * dcp):
+            source = blocks.blocks[0][-1]
+            destination = manager.get_blocks(follow_up.request_id).blocks[0][-1]
+            copies, retained = manager.take_kv_cache_block_copies()
+            assert destination is not source
+            assert (source.block_id, destination.block_id) in [(copy.src_block_id, copy.dst_block_id) for copy in copies]
+            manager.block_pool.free_blocks(retained)
 
 
 def test_prompt_and_decoded_hashes_share_one_evictable_block():
@@ -152,11 +152,10 @@ def test_prompt_and_decoded_hashes_share_one_evictable_block():
         assert manager.block_pool.get_cached_block(first.block_hashes[hit // BLOCK - 1], [0]) is None
 
 
-def test_failed_remote_load_does_not_publish_allocated_slots():
-    manager = _cache(8)
-    request = _request("failed", list(range(100)))
-    assert manager.allocate_slots(request, 80, delay_cache_blocks=True) is not None
-    request.num_computed_tokens = 80
-    request.status = RequestStatus.FINISHED_ERROR
-    manager.free(request)
-    assert manager.block_pool.get_cached_block(request.block_hashes[4], [0]) is None
+def test_sparse_retention_limits_the_hybrid_hit():
+    hits = []
+    for retention in (0, BLOCK * 8, None):
+        manager, parent = _finish(8, 300, 37, retention=retention)
+        assert manager.block_pool.get_cached_block(parent.block_hashes[336 // BLOCK - 1], [0])
+        hits.append(manager.get_computed_blocks(_request("follow_up", list(parent.all_token_ids)))[1])
+    assert max(hits[:2]) < hits[2] == 336

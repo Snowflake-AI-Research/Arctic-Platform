@@ -20,6 +20,8 @@ hashes. At generation completion, register the last reusable interior hash so
 a continuation can share the block when its other cache groups also hit.
 """
 
+from functools import cache
+
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.request import Request
@@ -37,11 +39,8 @@ class SchedulerDecodedTailPatch(ArcticPatch[Scheduler]):
         coordinator = self.kv_cache_manager.coordinator
         if finished and coordinator.enable_partial_hash_hits:
             for manager in coordinator.single_type_managers:
-                if (
-                    type(manager) is FullAttentionManager
-                    and manager.enable_caching
-                    and manager.kv_cache_spec.prefix_cacheable
-                ):
+                # R-SWA recycles decode gaps and HiSparse publishes only after host writeback.
+                if type(manager) is FullAttentionManager and manager.kv_cache_spec.prefix_cacheable:
                     cacheable = coordinator.get_num_cacheable_tokens(settled, manager.kv_cache_group_id)
                     _cache_computed_tail(manager, request, cacheable)
         return finished
@@ -66,11 +65,6 @@ def _cache_computed_tail(manager: FullAttentionManager, request: Request, cachea
         )
 
 
-_PATCHED = False
-
-
+@cache
 def ensure_decoded_tail_prefix_hit() -> None:
-    global _PATCHED
-    if not _PATCHED:
-        SchedulerDecodedTailPatch.apply_patch()
-        _PATCHED = True
+    SchedulerDecodedTailPatch.apply_patch()

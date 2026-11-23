@@ -22,6 +22,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         lambda: calls.append("router"),
     )
     monkeypatch.setattr(
+        decoded_tail_prefix_hit,
+        "ensure_decoded_tail_prefix_hit",
+        lambda: calls.append("decoded_tail_prefix_hit"),
+    )
+    monkeypatch.setattr(
         xgrammar_stop_mask,
         "ensure_xgrammar_stop_mask_fix",
         lambda: calls.append("xgrammar"),
@@ -73,16 +78,12 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "ensure_deepseek_v41_lora",
         lambda: calls.append("deepseek_v41_lora"),
     )
-    monkeypatch.setattr(
-        decoded_tail_prefix_hit,
-        "ensure_decoded_tail_prefix_hit",
-        lambda: calls.append("decoded_tail_prefix_hit"),
-    )
 
     required_patches.apply_required_vllm_patches()
 
     assert calls == [
         "router",
+        "decoded_tail_prefix_hit",
         "xgrammar",
         "dense_prompt_logprobs",
         "spec_decode_grammar",
@@ -94,5 +95,4 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "mrope_yarn",
         "mamba_completion_refresh",
         "deepseek_v41_lora",
-        "decoded_tail_prefix_hit",
     ]
