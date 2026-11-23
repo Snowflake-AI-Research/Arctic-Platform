@@ -139,3 +139,33 @@ def test_resume_across_a_parameter_order_change_refuses_or_restores_every_parame
         if not all(torch.equal(value, saved) for value, saved in zip(state, expected[name]))
     ]
     assert not wrong, f"{len(wrong)} of {len(expected)} parameters resumed with another one's state: {wrong[:4]}"
+
+
+def _resized_restore(monkeypatch, saved_order):
+    """A masters-only restore of one saved 8-element partition into rank 1 of two 4-element partitions."""
+    from deepspeed import comm as dist
+    from deepspeed.checkpoint.constants import PARAM_SLICE_MAPPINGS
+    from deepspeed.checkpoint.constants import SINGLE_PARTITION_OF_FP32_GROUPS
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+    from deepspeed.utils.tensor_fragment import fragment_address
+
+    zero = DeepSpeedZeroOptimizer.__new__(DeepSpeedZeroOptimizer)
+    restored = []
+    zero._load_legacy_checkpoint = lambda *args: restored.append(args)
+    zero.dp_process_group = None
+    zero.single_partition_of_fp32_groups = [torch.zeros(4)]
+    zero._param_slice_mappings = [{"b": fragment_address(numel=4, start=0)}]
+    saved = {name: fragment_address(numel=4, start=4 * index) for index, name in enumerate(saved_order)}
+    state = [{PARAM_SLICE_MAPPINGS: [saved], SINGLE_PARTITION_OF_FP32_GROUPS: [torch.zeros(8)]}]
+    monkeypatch.setattr(dist, "get_rank", lambda group=None: 1)
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
+    deepspeed_engine._refuse_restoring_another_parameter_layout(zero)
+    zero._load_legacy_checkpoint(state, False, True)
+    return restored
+
+
+@require_deepspeed
+def test_resized_masters_only_restore_compares_positions_in_the_whole_flat_buffer(monkeypatch):
+    assert len(_resized_restore(monkeypatch, ["a", "b"])) == 1
+    with pytest.raises(RuntimeError, match="saved with the parameters at other positions"):
+        _resized_restore(monkeypatch, ["b", "a"])

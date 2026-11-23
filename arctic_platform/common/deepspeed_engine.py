@@ -27,7 +27,6 @@ one engine-construction path.
 from __future__ import annotations
 
 import logging
-from itertools import zip_longest
 from typing import Any
 
 from pydantic import BaseModel
@@ -460,37 +459,66 @@ def _aligned_first(params: list) -> list:
 def _refuse_restoring_another_parameter_layout(zero_optimizer) -> None:
     """Refuse to restore ZeRO-1/2 or BF16-optimizer masters and Adam moments saved with the parameters elsewhere.
 
-    DeepSpeed restores both by position in each group's flat partition, so a checkpoint saved with another parameter
+    DeepSpeed restores both by position in each group's flat buffer, so a checkpoint saved with another parameter
     order (before ``_aligned_first``, for one) loads without error onto other parameters. Every saved partition
-    records each named parameter's address in it (``param_slice_mappings``); the restore goes ahead only when those
-    are the addresses now. Activation-checkpoint wrappers rename parameters without moving them, so their name
-    segment is ignored.
+    records each named parameter's address in it (``param_slice_mappings``); the restore goes ahead only when the
+    saved addresses, placed in the whole flat buffer, are this rank's addresses now. That also covers a resized
+    masters-only restore, which reads every saved partition. Activation-checkpoint wrappers rename parameters
+    without moving them, so their name segment is ignored.
     """
     from deepspeed import comm as dist
     from deepspeed.checkpoint.constants import PARAM_SLICE_MAPPINGS
+    from deepspeed.checkpoint.constants import SINGLE_PARTITION_OF_FP32_GROUPS
     from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
     from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 
     if not isinstance(zero_optimizer, (DeepSpeedZeroOptimizer, BF16_Optimizer)):
         return
     load = zero_optimizer._load_legacy_checkpoint
+    if isinstance(zero_optimizer, BF16_Optimizer):
+        partitions = zero_optimizer.fp32_groups_flat_partition
+    else:
+        partitions = zero_optimizer.single_partition_of_fp32_groups
+
+    def spans(located, lo, hi):
+        """Each parameter's [start, end) pieces within [lo, hi), from (partition offset, mappings) pairs."""
+        result: dict[str, list[list[int]]] = {}
+        for start, end, name in sorted(
+            (offset + at.start, offset + at.start + at.numel, name.replace("._checkpoint_wrapped_module", ""))
+            for offset, mappings in located
+            for name, at in mappings.items()
+        ):
+            start, end = max(lo, start), min(hi, end)
+            if start < end:
+                pieces = result.setdefault(name, [])
+                if pieces and pieces[-1][1] == start:
+                    pieces[-1][1] = end
+                else:
+                    pieces.append([start, end])
+        return result
+
+    def refuse(rank, detail):
+        raise RuntimeError(
+            "This checkpoint's optimizer state was saved with the parameters at other positions in ZeRO's flat "
+            f"buffers (rank {rank}, {detail}), and DeepSpeed restores it by position. Resume with the code that "
+            "saved it, or load the module weights only and start a fresh optimizer."
+        )
 
     def load_same_layout(state_dict_list, load_optimizer_states=True, load_from_fp32_weights=False):
         if load_optimizer_states or load_from_fp32_weights:
             rank = dist.get_rank(group=zero_optimizer.dp_process_group)
-            saved = state_dict_list[rank][PARAM_SLICE_MAPPINGS]
-            for group, maps in enumerate(zip_longest(saved, zero_optimizer._param_slice_mappings, fillvalue={})):
-                old, new = (
-                    {name.replace("._checkpoint_wrapped_module", ""): at for name, at in m.items()} for m in maps
-                )
+            saved = [sd[PARAM_SLICE_MAPPINGS] for sd in state_dict_list]
+            if any(len(groups) != len(partitions) for groups in saved):
+                refuse(rank, f"{len(saved[0])} parameter groups saved, {len(partitions)} now")
+            for group, partition in enumerate(partitions):
+                # Every saved partition but the last is full, so partition k starts at k times the first one's size.
+                saved_width = state_dict_list[0][SINGLE_PARTITION_OF_FP32_GROUPS][group].numel()
+                lo, hi = rank * partition.numel(), (rank + 1) * partition.numel()
+                new = spans([(lo, zero_optimizer._param_slice_mappings[group])], lo, hi)
+                old = spans([(index * saved_width, groups[group]) for index, groups in enumerate(saved)], lo, hi)
                 if old != new:
                     name = next(name for name in {**old, **new} if old.get(name) != new.get(name))
-                    raise RuntimeError(
-                        "This checkpoint's optimizer state was saved with the parameters at other positions in "
-                        f"ZeRO's flat buffers (rank {rank}, group {group}: {name} saved at {old.get(name)}, now at "
-                        f"{new.get(name)}), and DeepSpeed restores it by position. Resume with the code that saved "
-                        "it, or load the module weights only and start a fresh optimizer."
-                    )
+                    refuse(rank, f"group {group}: {name} saved at {old.get(name)}, now at {new.get(name)}")
         return load(state_dict_list, load_optimizer_states, load_from_fp32_weights)
 
     zero_optimizer._load_legacy_checkpoint = load_same_layout
